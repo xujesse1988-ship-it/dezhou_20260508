@@ -209,6 +209,7 @@ Pluribus 的可实现路线可以概括为：
 ## 详细阶段文档
 
 - 阶段 1：规则环境与手牌评估器的量化验证方式，见 [pluribus_stage1_validation.md](./pluribus_stage1_validation.md)。
+- 阶段 1 实施流程（test-first 路径），见 [pluribus_stage1_workflow.md](./pluribus_stage1_workflow.md)。
 - 阶段 2-8：后续按阶段 1 的格式继续拆分，每个阶段单独维护目标、验证方式、通过标准和进入下一阶段的门槛。
 
 ## 参考资料
