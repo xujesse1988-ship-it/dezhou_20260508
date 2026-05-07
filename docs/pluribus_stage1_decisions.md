@@ -33,7 +33,7 @@
 | 编号 | 决策项 | 选定值 |
 |---|---|---|
 | D-010 | 起步布局 | 单 crate 多 module，crate 名 `poker` |
-| D-011 | Module 划分 | `core` / `rules` / `eval` / `history` / `fuzz` / `bench` / `xvalidate` |
+| D-011 | Module 划分 | `core` / `rules` / `eval` / `history` / `error` / `fuzz` / `bench` / `xvalidate`（其中 `error` 仅含公开错误类型 `RuleError` / `HistoryError`，详见 `pluribus_stage1_api.md` §8；`fuzz` / `bench` / `xvalidate` 为测试 / 性能 / 交叉验证模块，不属公开 API）|
 | D-012 | 拆 crate 时机 | C2 完成、API 稳定后再拆为 workspace |
 | D-013 | feature gate | `xvalidate` 模块的 PokerKit 依赖通过 feature 隔离，默认关闭 |
 
@@ -75,12 +75,12 @@
 |---|---|---|
 | D-030 | 桌大小 | 默认 6-max；`TableConfig` 接受 2..=9 用于测试 / fuzz |
 | D-031 | ante | 默认 0；接口字段保留以备未来扩展 |
-| D-032 | 按钮轮转 | **简化方案**：阶段 1 假定不发生中途坐入坐出（join / leave mid-hand），所有 6 个座位在每手内全程在场；按钮每手向左移动一格（即下一手按钮 = 当前按钮左侧第一个座位，模 n_seats）。盲注位由按钮位机械推导：SB = 按钮左 1，BB = 按钮左 2。dead button corner case（短暂缺席导致的悬空盲）不在阶段 1 scope，留待支持坐入坐出时再补 D-032-revM |
+| D-032 | 按钮轮转 | **简化方案**：阶段 1 假定**全程**无玩家坐入坐出 —— 既不允许 mid-hand sit-in/sit-out，也不允许 hand-boundary sit-in/sit-out。所有 `n_seats` 座位从模拟开始到结束全程在场。按钮每手向左移动一格（即下一手按钮 = 当前按钮左侧第一个座位，模 `n_seats`）。盲注位由按钮位机械推导：SB = 按钮左 1，BB = 按钮左 2。dead button / dead blind corner case（短暂缺席导致的悬空盲）不在阶段 1 scope，留待支持坐入坐出时再补 D-032-revM。**该简化对 cross-validation harness 的额外约束见 D-086**。 |
 | D-033 | 短码 all-in 重开规则 | incomplete raise（短码 all-in 加注差额 < 本轮最大有效加注差额）**不重开** raise option |
 | D-034 | min raise（首次） | 首次开局 raise 的最小金额 = BB |
 | D-035 | min raise（链式） | 后续每次 raise 的加注差额 ≥ 本轮已发生的最大有效加注差额 |
 | D-036 | 全员 all-in 跳轮 | 除一名玩家外全员 all-in 后，跳过后续下注轮，直接发完剩余公共牌进入摊牌 |
-| D-037 | showdown 顺序 | `last_aggressor` = 本手内最后一次 **voluntary** bet 或 raise 的玩家。SB / BB / ante 等强制盲注 / 强制下注 **不算** voluntary aggression；preflop limp（call BB）也不算 aggression。若 `last_aggressor` 存在，由其先亮，其余未弃牌玩家从 `last_aggressor` 左侧顺时针轮流；若 `last_aggressor` 不存在（如 BB walk：所有玩家 fold/limp 后 BB check；或全 limp + 全 check 至摊牌），则从 SB 顺时针轮流（SB 已弃则取下一个未弃牌座位）|
+| D-037 | showdown 顺序 | `last_aggressor` = 本手内最后一次 **voluntary** bet 或 raise 的玩家。SB / BB / ante 等强制盲注 / 强制下注 **不算** voluntary aggression；preflop limp（call BB）也不算 aggression。若 `last_aggressor` 存在，由其先亮，其余未弃牌玩家从 `last_aggressor` 起向左依次轮流（每次取下一个未弃牌座位，跳过弃牌者）；若 `last_aggressor` 不存在（典型场景：preflop 多人 limp 进入 flop 后各街全员 check 至 river 摊牌），则从 SB 起向左依次轮流（SB 已弃则取下一个未弃牌座位）。注：**BB walk**（所有非 BB 玩家 preflop 弃牌）不进入 showdown，无 D-037 适用问题；该术语在 D-040 / D-037 内不应被举为 showdown 例子。 |
 | D-038 | side pot 排序 | 按 all-in 金额升序，最低 all-in 形成 main pot，依次形成 side pot |
 | D-039 | odd chip rule | 每个 pot（main pot 与每个 side pot）独立计算零头：先在该 pot 的获胜者集合内均分，余数（< 获胜人数）按"按钮左侧最近"的顺序在该 pot 获胜者集合中依次分配最小单位（1 chip）。不同 pot 之间互不影响；同时存在多个 side pot 时各自独立执行。例：3-way 摊牌，main pot = 301 chips，3 人皆赢 → 各得 100，余 1 chip 给按钮左侧最近的获胜者；同手 side pot = 7 chips，2 人赢 → 各得 3，余 1 chip 给该 side pot 获胜者中按钮左侧最近者（与 main pot 的零头去向独立判断） |
 | D-040 | uncalled bet returned | 最后一个 raise/bet 没有 caller 时，超出"最高被 call 金额"的部分返还 raiser，不进入 pot |
@@ -139,6 +139,7 @@
 | D-083 | 分歧处理 | 默认假设我方 bug；review 后才能记为参考实现差异 |
 | D-084 | 第二参考（可选） | OpenSpiel poker 作为补充 — 阶段 1 不强制接入，C2 完成后视情况补 |
 | D-085 | 交叉验证规模 | B2: 100 手（仅功能正确性）；C2: 100k 手（**最终通过门槛**，零分歧）；E2 后回归: 1M 手（性能 + 稳定性巩固） |
+| D-086 | cross-validation harness 配置约束 | 因 D-032 假定全程无玩家坐入坐出，所有调用 PokerKit（或任何参考实现）的 cross-validation 用例必须把参考实现配置为"全程 `n_seats` 座全部在场、无 sit-in/sit-out、按钮机械每手左移、SB/BB 由按钮位推导"模式。若参考实现默认行为引入空座、dead button 或 dead blind，必须在 harness 中显式禁用，并把使用的参考实现版本号与配置参数记入测试报告。任何因参考实现配置差异导致的分歧不算 D-083 意义上的"我方 bug"，但必须在测试报告中显式列出。 |
 
 ---
 

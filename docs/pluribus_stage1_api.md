@@ -299,13 +299,20 @@ pub struct RecordedAction {
     pub seat: SeatId,
     pub street: Street,
     pub action: Action,            // AllIn 已归一化为 Bet/Raise/Call
-    pub committed_after: ChipAmount, // 该 seat 本轮投入额（动作执行后）
+    pub committed_after: ChipAmount, // 该 seat 在本街（= self.street）的投入总额；语义见下
 }
 ```
 
 **语义**：
 - `actions` 中的 `Action::AllIn` **不应出现**；状态机在写入 hand history 时把 AllIn 归一化为对应的 `Call` / `Bet { to }` / `Raise { to }`，便于无歧义回放。
 - `seq` 字段保证全序，回放时按 `seq` 顺序重放。
+- `committed_after` 取**该动作 apply 完成、本街 `committed_this_round` 尚未被街转换重置之前**的值。换言之：
+    - 对**未触发街转换**的动作：等价于 apply 后 `player.committed_this_round` 的值。
+    - 对**触发街转换**的动作（即本街最后一个动作）：等价于"如果本街不重置，apply 后 `player.committed_this_round` 应有的值"。这恰好等于该动作收尾时该 seat 在本街已贡献给 pot 的累计金额。
+- 上述定义保证 `committed_after` 在回放（含 `replay_to`）时可被独立校验，不依赖于"街转换 reset 是否已发生"的内部时序。
+- 关于 `Action` 各变体的 `committed_after` 取值：
+    - `Action::Fold` / `Action::Check`：`committed_after` = 该 seat 进入本动作前的 `committed_this_round`（本动作不改变投入额）。
+    - `Action::Call` / `Action::Bet { to }` / `Action::Raise { to }`：`committed_after` = `to`。
 
 ### Roundtrip 接口
 
@@ -321,7 +328,7 @@ impl HandHistory {
     /// 终局状态必须与原始记录完全一致（board, hole_cards, payouts）。
     pub fn replay(&self) -> Result<GameState, RuleError>;
 
-    /// 部分回放：回放到第 `action_index` 个动作之后（exclusive）的中间状态。
+    /// 部分回放：应用 `actions[0..action_index]` 后的中间状态（即"前 action_index 个动作已应用"）。
     /// `action_index = 0` 表示"刚发完手牌、未行动"；`action_index = actions.len()` 等同 replay()。
     pub fn replay_to(&self, action_index: usize) -> Result<GameState, RuleError>;
 
@@ -420,18 +427,34 @@ impl<R: rand::RngCore + Send> RngCoreAdapter<R> {
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum RuleError {
-    #[error("illegal action: {reason}")]
-    IllegalAction { reason: String },
     #[error("not the current player's turn")]
     NotPlayerTurn,
     #[error("hand already terminated")]
     HandTerminated,
+    /// 动作种类与当前下注轮状态不匹配。典型情形：本轮已有 bet 时收到 `Bet`（应为 `Raise`）；
+    /// 本轮无 bet 时收到 `Raise` 或 `Call`（应为 `Bet` 或 `Check`）；本轮已有 bet 时收到 `Check`。
+    /// `reason` 为 `&'static str`，限定使用预定义的几种字面量，避免字符串拼接进入热路径。
+    #[error("wrong action for state: {action:?} ({reason})")]
+    WrongActionForState { action: Action, reason: &'static str },
+    /// 前序为 incomplete raise / short all-in，按 D-033 不重开 raise option，
+    /// 但当前玩家尝试 `Raise`（无论是 `Action::Raise` 显式 raise，还是 `AllIn` 归一化后构成 raise）。
+    #[error("raise option not reopened (previous raise was incomplete / short all-in)")]
+    RaiseOptionNotReopened,
+    /// raise 加注差额小于本轮最大有效加注差额（D-035），或首次 bet/raise 小于 BB（D-034）。
+    #[error("min raise violation: required to >= {required:?}, got to = {got:?}")]
+    MinRaiseViolation { required: ChipAmount, got: ChipAmount },
+    /// `to` 字段本身越界：`to <= committed_this_round_before`（动作扣款 ≤ 0），
+    /// 或 `to > committed_this_round_before + stack`（超出剩余筹码）。
     #[error("invalid amount: {0:?}")]
     InvalidAmount(ChipAmount),
-    #[error("min raise violation: required >= {required:?}, got {got:?}")]
-    MinRaiseViolation { required: ChipAmount, got: ChipAmount },
+    /// 玩家剩余 stack 不足以执行该动作的扣款（典型见 `AllIn` 在 `stack == 0` 时被调用）。
     #[error("insufficient stack")]
     InsufficientStack,
+    /// 兜底变体：上述具名变体未覆盖、但实现 / 测试代码确实需要拒绝的情况。
+    /// **新增违规类型时优先升级为具名变体**，不要长期依赖该兜底（测试 agent 在 invariant
+    /// suite 中不应基于 `reason` 字符串内容做断言）。
+    #[error("illegal action: {reason}")]
+    IllegalAction { reason: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -507,20 +530,27 @@ message RecordedAction {
 }
 
 enum ActionKind {
-    FOLD = 0;
-    CHECK = 1;
-    CALL = 2;
-    BET = 3;
-    RAISE = 4;
+    // proto3 默认值哨兵：字段缺失或被截断时静默解码为 0，因此 0 必须保留为
+    // UNSPECIFIED，由 PB-002 在 from_proto 阶段拒绝。任何合法 RecordedAction
+    // 的 kind 不得为此值。
+    ACTION_KIND_UNSPECIFIED = 0;
+    FOLD = 1;
+    CHECK = 2;
+    CALL = 3;
+    BET = 4;
+    RAISE = 5;
     // AllIn 在写入时已归一化为 CALL/BET/RAISE，proto 中不出现
 }
 
 enum Street {
-    PREFLOP = 0;
-    FLOP = 1;
-    TURN = 2;
-    RIVER = 3;
-    SHOWDOWN = 4;
+    // proto3 默认值哨兵，理由同上。任何合法 RecordedAction.street 与顶层
+    // 字段都不得为此值（见 PB-002）。
+    STREET_UNSPECIFIED = 0;
+    PREFLOP = 1;
+    FLOP = 2;
+    TURN = 3;
+    RIVER = 4;
+    SHOWDOWN = 5;
 }
 
 message HoleCards {
@@ -541,9 +571,24 @@ message Payout {
     - `kind == FOLD` → `to` 必须为 `0`；非 0 视为 corrupted。
     - `kind == CHECK` → `to` 必须为 `0`；非 0 视为 corrupted。
     - `kind == CALL` / `BET` / `RAISE` → `to` 必须 `> 0`；为 0 视为 corrupted。
-- PB-002 `from_proto` 在校验阶段必须按 PB-001 检查每条 `RecordedAction`，违反规则时返回 `HistoryError::Corrupted("action {seq}: to field violates kind invariant")`。
+- PB-002 `from_proto` 在校验阶段必须执行下列检查，任一失败即返回 `HistoryError::Corrupted`：
+    - 按 PB-001 检查每条 `RecordedAction.to` 与 `kind` 的一致性，错误信息 `"action {seq}: to field violates kind invariant"`。
+    - 拒绝 `RecordedAction.kind == ACTION_KIND_UNSPECIFIED`，错误信息 `"action {seq}: kind is UNSPECIFIED (proto3 default sentinel — likely missing or corrupted field)"`。
+    - 拒绝 `RecordedAction.street == STREET_UNSPECIFIED`，错误信息 `"action {seq}: street is UNSPECIFIED"`。
+    - 拒绝任何顶层 `Street` 字段（如未来 schema 新增）出现 `STREET_UNSPECIFIED`，错误信息按字段名给出。
 - PB-003 `to_proto()` 输出必须 deterministic：相同 `HandHistory` 在所有平台上产生 byte-equal 字节流。`prost` 默认行为已满足该要求（字段按 tag 升序、map 字段在阶段 1 schema 中不出现）；任何 PR 引入非 deterministic 序列化路径必须 reject。
-- PB-004 `Street` 与 `ActionKind` 枚举值与 Rust 端 `#[repr(u8)]` discriminant 一一对应；任何一侧改 discriminant 必须同步另一侧并 bump `schema_version`。
+- PB-004 proto 端 `Street` / `ActionKind` 与 Rust 端的对应通过 `to_proto` / `from_proto` 中的显式转换函数完成，**不要求 discriminant 数值一致**：proto 端从 1 起始以保留 0 为 `*_UNSPECIFIED` 哨兵，Rust 端 `Street` 仍从 0 起始保持 API 友好。任何一侧增删枚举条目必须同步另一侧并 bump `HandHistory.schema_version`。当前映射表：
+
+  | proto `Street` | Rust `Street` |
+  |---|---|
+  | `STREET_UNSPECIFIED = 0` | （仅出现在 PB-002 拒绝路径，无 Rust 对应） |
+  | `PREFLOP = 1` | `Preflop = 0` |
+  | `FLOP = 2` | `Flop = 1` |
+  | `TURN = 3` | `Turn = 2` |
+  | `RIVER = 4` | `River = 3` |
+  | `SHOWDOWN = 5` | `Showdown = 4` |
+
+  proto `ActionKind` 与 Rust `Action` 的对应：`ACTION_KIND_UNSPECIFIED = 0` 仅出现在 PB-002 拒绝路径；`FOLD = 1` / `CHECK = 2` / `CALL = 3` / `BET = 4` / `RAISE = 5` 分别对应 `Action::Fold` / `Action::Check` / `Action::Call` / `Action::Bet { to }` / `Action::Raise { to }`（`Action::AllIn` 在写入时已归一化为后三者之一，proto 中不出现）。
 
 ---
 
