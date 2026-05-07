@@ -1,0 +1,590 @@
+# 阶段 1 API 契约
+
+## 文档地位
+
+本文档定义阶段 1 所有公开类型与方法的契约。**A1 步骤的代码骨架必须严格匹配本文档**。
+
+- 测试 agent 在 B1 / C1 / D1 / E1 / F1 写测试时，**只依赖**本文档定义的 API。
+- 实现 agent 在 A1 / B2 / C2 / D2 / E2 / F2 写产品代码时，**不得偏离**本文档签名（除非走决策修改流程修改本文档）。
+- 任何在实现过程中发现的 API 不足或歧义，必须先在本文档追加 `API-NNN-revM` 条目，再实施。
+
+所有签名为 Rust 风格。语义说明放在签名后的注释或下方文字。
+
+---
+
+## 1. 基础类型（`module: core`）
+
+### Card / Rank / Suit
+
+```rust
+/// 整数后备的扑克牌。0..52 范围。
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct Card(u8);
+
+#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Debug)]
+#[repr(u8)]
+pub enum Rank {
+    Two = 0, Three, Four, Five, Six, Seven, Eight, Nine, Ten,
+    Jack, Queen, King, Ace, // Ace = 12
+}
+
+impl Rank {
+    /// 从 0..=12 的 u8 值还原 Rank；超出范围返回 None。
+    pub fn from_u8(value: u8) -> Option<Rank>;
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(u8)]
+pub enum Suit {
+    Clubs = 0, Diamonds, Hearts, Spades,
+}
+
+impl Suit {
+    /// 从 0..=3 的 u8 值还原 Suit；超出范围返回 None。
+    pub fn from_u8(value: u8) -> Option<Suit>;
+}
+
+impl Card {
+    /// 构造一张牌。
+    pub const fn new(rank: Rank, suit: Suit) -> Card;
+    pub fn rank(self) -> Rank;
+    pub fn suit(self) -> Suit;
+    /// 0..52 的稳定数值表示。
+    pub fn to_u8(self) -> u8;
+    pub fn from_u8(value: u8) -> Option<Card>;
+}
+```
+
+**语义**：
+- `Card::to_u8` 编码：`rank * 4 + suit`，保证跨平台稳定。
+- 比较 `Rank` 时 `Two < Three < ... < Ace`。
+- `Suit` 不参与强度比较（NLHE 无花色优劣）。
+
+### ChipAmount
+
+```rust
+/// 整数筹码。1 chip = 1/100 BB（见 D-020）。
+#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct ChipAmount(pub u64);
+
+impl ChipAmount {
+    pub const ZERO: ChipAmount = ChipAmount(0);
+    pub const fn new(chips: u64) -> ChipAmount;
+    pub fn as_u64(self) -> u64;
+}
+
+// 标准算术：Add / Sub / AddAssign / SubAssign / Mul<u64> 必须实现，且
+// 仅走整数路径，禁止浮点。Sub / SubAssign 在下溢时 debug 与 release 都 panic
+// （见 D-026b）；需要 saturating 语义的调用方必须显式用 checked_sub。
+```
+
+### Street / Position / SeatId
+
+```rust
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(u8)]
+pub enum Street {
+    Preflop = 0,
+    Flop = 1,
+    Turn = 2,
+    River = 3,
+    Showdown = 4,
+}
+
+/// 6-max 标准位置。仅当桌面 = 6 人时使用此名称；其他桌大小用 SeatId 与按钮相对位置表达。
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum Position {
+    BTN, SB, BB, UTG, MP, CO,
+}
+
+/// 座位号 0..n_seats。按桌面物理座位编号，不随按钮变化。
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct SeatId(pub u8);
+```
+
+### Player
+
+```rust
+#[derive(Clone, Debug)]
+pub struct Player {
+    pub seat: SeatId,
+    pub stack: ChipAmount,            // 当前剩余筹码（不含本街已投入）
+    pub committed_this_round: ChipAmount, // 本下注轮已投入金额
+    pub committed_total: ChipAmount,  // 本手全部下注轮累计已投入金额
+    pub hole_cards: Option<[Card; 2]>,    // None 表示尚未发或已弃
+    pub status: PlayerStatus,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum PlayerStatus {
+    Active,    // 在牌局中、未弃、未 all-in
+    AllIn,
+    Folded,
+    SittingOut, // 阶段 1 不使用，但保留枚举
+}
+```
+
+---
+
+## 2. 动作（`module: rules::action`）
+
+```rust
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum Action {
+    Fold,
+    Check,
+    Call,
+    /// 当前下注轮无前序 bet 时的下注。`to` = 该玩家本轮投入总额（绝对值）。
+    Bet { to: ChipAmount },
+    /// 前序已有 bet 时的加注。`to` = 该玩家本轮投入总额（绝对值）。
+    Raise { to: ChipAmount },
+    /// 全部剩余筹码。状态机内部归一化为 Bet/Raise/Call。
+    AllIn,
+}
+```
+
+**语义**：
+- `Bet { to }` 与 `Raise { to }` 的 `to` 都是该玩家本下注轮投入的**绝对总额**（包含此动作之前已投入的盲注 / call / 之前被加注的额度）。换言之，应用动作后该玩家的 `committed_this_round` 必须严格等于 `to`。
+- 从玩家筹码中实际扣除的金额 = `to - player.committed_this_round_before_action`（即"差额"），不是 `to` 本身。
+- 伪代码：
+
+  ```text
+  fn apply_bet_or_raise(player, to):
+      delta = to - player.committed_this_round   // 必须 > 0
+      assert delta <= player.stack                 // 否则 InsufficientStack
+      player.stack            -= delta
+      player.committed_this_round = to             // 由原本的某值变为 to
+      player.committed_total  += delta
+      pot                     += delta
+  ```
+
+- 完整数值例子（`SB=50, BB=100, 6-max`，preflop 第一次行动）：BTN 起始 stack = 10,000，盲注阶段未投入 → `committed_this_round_before = 0`。BTN 选择 `Raise { to = 300 }`：
+    - `delta = 300 - 0 = 300`
+    - 从 BTN.stack 扣 300 → BTN.stack = 9,700
+    - BTN.committed_this_round = 300
+    - BTN.committed_total = 300
+    - pot 中此前已有 SB(50) + BB(100) = 150；执行后 pot = 450
+    - 注意 `to=300` 是 BTN 本轮投入总额；BTN 之后 SB 想跟注的话，`Call` 对应的实际扣款 = `300 - 50 = 250`（SB 已投 50）。
+- AllIn 是便利变体，状态机执行时根据当前局面归一化为对应的 Bet/Raise/Call。**HandHistory 中存储归一化后的最终动作**（见 §5），保证回放无歧义。
+- `Action::AllIn` 错误路径：玩家 `stack == 0` 时 `apply(AllIn)` 返回 `RuleError::InsufficientStack`；`0 < stack < min_bet_or_raise_delta` 时 `AllIn` 仍然合法（"under min" / incomplete raise，按 D-033 不重开 raise option），归一化为对应的 Bet/Raise/Call，且 `to = committed_this_round_before + stack`。
+
+### LegalActionSet
+
+```rust
+#[derive(Clone, Debug)]
+pub struct LegalActionSet {
+    pub fold: bool,
+    pub check: bool,
+    pub call: Option<ChipAmount>,                  // 跟注所需金额（绝对，不是差额）
+    pub bet_range: Option<(ChipAmount, ChipAmount)>,    // (min_to, max_to)
+    pub raise_range: Option<(ChipAmount, ChipAmount)>,  // (min_to, max_to)
+    pub all_in_amount: Option<ChipAmount>,         // 全 all-in 时的等效 to 值
+}
+```
+
+**语义**：
+- 每条字段独立，`None` 表示该动作不合法。
+- `bet_range` 与 `raise_range` 互斥：本轮无前序 bet 时只能 `bet`，有前序 bet 时只能 `raise`。
+- `min_to` 含 short all-in 不重开 raise 的约束（见 D-033）。
+
+### LegalActionSet 不变量（实现 agent 必须保证、测试 agent 在 invariant suite 中验证）
+
+- LA-001 `check` 与 `call` 互斥：当前下注轮 `committed_this_round` 与 `max_committed_this_round` 相等时只能 `check`（`call = None`）；不等时只能 `call`（`check = false`）。等价表述：`check && call.is_some()` 永远为 false。
+- LA-002 `bet_range` 与 `raise_range` 互斥：本轮 `max_committed_this_round == 0`（无前序 bet）时 `raise_range = None`；`max_committed_this_round > 0` 时 `bet_range = None`。等价表述：`bet_range.is_some() && raise_range.is_some()` 永远为 false。
+- LA-003 `fold` 永远合法（除非 `current_player == None`），即 `current_player().is_some() => fold == true`。
+- LA-004 `call` 与 `check` 至少有一个真：当 `current_player().is_some()` 时，`check || call.is_some()` 必须为 true。
+- LA-005 `bet_range` 的 `min_to` ≥ `BB`（首次开局，对应 D-034）；`raise_range` 的 `min_to` 满足 D-035 链式 min raise 约束。
+- LA-006 `bet_range` / `raise_range` 的 `max_to` ≤ `committed_this_round + stack`（即玩家不可下注超出剩余筹码 + 本轮已投入额）。
+- LA-007 `all_in_amount` 当且仅当 `stack > 0` 时为 `Some`；其值 = `committed_this_round + stack`。
+- LA-008 当 `current_player() == None`（terminal / all-in 跳轮）时，所有字段必须为 `false` / `None`（"空集合"）。
+
+---
+
+## 3. 桌面配置（`module: rules::config`）
+
+```rust
+#[derive(Clone, Debug)]
+pub struct TableConfig {
+    pub n_seats: u8,                       // 2..=9，默认 6
+    pub starting_stacks: Vec<ChipAmount>,  // 长度 = n_seats
+    pub small_blind: ChipAmount,           // 默认 50 chips
+    pub big_blind: ChipAmount,             // 默认 100 chips
+    pub ante: ChipAmount,                  // 默认 0
+    pub button_seat: SeatId,               // 起始按钮位
+}
+
+impl TableConfig {
+    /// 6-max 100BB 的默认配置：6 座、起始 100BB、SB=50、BB=100、ante=0、按钮在座位 0。
+    pub fn default_6max_100bb() -> TableConfig;
+}
+```
+
+---
+
+## 4. 游戏状态（`module: rules::state`）
+
+```rust
+pub struct GameState {
+    /* 内部字段不公开 */
+}
+
+impl GameState {
+    /// 初始化一手新牌。从 RngSource 抽牌、布盲、按钮位由 config 指定。
+    pub fn new(config: &TableConfig, rng: &mut dyn RngSource) -> GameState;
+
+    /// 当前要行动的玩家。手牌结束 / 全员 all-in 跳轮时返回 None。
+    pub fn current_player(&self) -> Option<SeatId>;
+
+    /// 当前合法动作集合。无玩家行动时返回空集合。
+    pub fn legal_actions(&self) -> LegalActionSet;
+
+    /// 应用一个动作。失败时返回错误，状态不改变。
+    pub fn apply(&mut self, action: Action) -> Result<(), RuleError>;
+
+    /// 当前下注街。
+    pub fn street(&self) -> Street;
+
+    /// 当前桌面公共牌（Flop=3, Turn=4, River=5）。
+    pub fn board(&self) -> &[Card];
+
+    /// 当前总 pot（含主池 + 所有 side pot）。
+    pub fn pot(&self) -> ChipAmount;
+
+    /// 当前所有玩家状态快照（按 SeatId 排序）。
+    pub fn players(&self) -> &[Player];
+
+    /// 牌局是否结束（已 showdown 或全员弃牌）。
+    pub fn is_terminal(&self) -> bool;
+
+    /// 终局每个玩家的净收益（正 = 赢、负 = 输）。仅 is_terminal 后有效。
+    pub fn payouts(&self) -> Option<Vec<(SeatId, i64)>>;
+
+    /// 当前 hand history 的引用，可随时序列化或回放。
+    pub fn hand_history(&self) -> &HandHistory;
+}
+```
+
+**关键不变量**（实现 agent 必须保证、测试 agent 应在 invariant suite 中验证）：
+
+- I-001 任意时刻 `sum(player.stack) + pot() = sum(starting_stacks) + sum(antes_collected)`
+- I-002 任意 `Player.stack >= 0`（用 `u64` 表达自然成立，但减法路径必须有下溢检查）
+- I-003 任意一手内不出现重复 Card
+- I-004 每个 betting round 结束时，所有 `Active` 状态玩家的 `committed_this_round` 相等
+- I-005 `apply` 失败时 `GameState` 不变
+- I-006 全员 all-in（除 ≤1 名 Active 外）后 `current_player` 必为 None
+- I-007 终局必有获胜者（pot 必有归属）
+
+---
+
+## 5. Hand history（`module: history`）
+
+### HandHistory 结构
+
+```rust
+#[derive(Clone, Debug)]
+pub struct HandHistory {
+    pub schema_version: u32,           // 当前固定为 1
+    pub config: TableConfig,
+    pub seed: u64,                     // 用于复现的初始 seed
+    pub actions: Vec<RecordedAction>,  // 按发生顺序
+    pub board: Vec<Card>,              // 0..=5 张
+    pub hole_cards: Vec<Option<[Card; 2]>>, // 长度 = n_seats
+    pub final_payouts: Vec<(SeatId, i64)>,  // 净收益
+    pub showdown_order: Vec<SeatId>,        // 摊牌顺序，最后激进者在前
+}
+
+#[derive(Clone, Debug)]
+pub struct RecordedAction {
+    pub seq: u32,                  // 全手内单调递增
+    pub seat: SeatId,
+    pub street: Street,
+    pub action: Action,            // AllIn 已归一化为 Bet/Raise/Call
+    pub committed_after: ChipAmount, // 该 seat 本轮投入额（动作执行后）
+}
+```
+
+**语义**：
+- `actions` 中的 `Action::AllIn` **不应出现**；状态机在写入 hand history 时把 AllIn 归一化为对应的 `Call` / `Bet { to }` / `Raise { to }`，便于无歧义回放。
+- `seq` 字段保证全序，回放时按 `seq` 顺序重放。
+
+### Roundtrip 接口
+
+```rust
+impl HandHistory {
+    /// 序列化为 protobuf 字节（schema_version=1）。
+    pub fn to_proto(&self) -> Vec<u8>;
+
+    /// 从 protobuf 字节反序列化。错误情况见 HistoryError。
+    pub fn from_proto(bytes: &[u8]) -> Result<HandHistory, HistoryError>;
+
+    /// 完整回放：从 seed + actions 重建终局 GameState。
+    /// 终局状态必须与原始记录完全一致（board, hole_cards, payouts）。
+    pub fn replay(&self) -> Result<GameState, RuleError>;
+
+    /// 部分回放：回放到第 `action_index` 个动作之后（exclusive）的中间状态。
+    /// `action_index = 0` 表示"刚发完手牌、未行动"；`action_index = actions.len()` 等同 replay()。
+    pub fn replay_to(&self, action_index: usize) -> Result<GameState, RuleError>;
+
+    /// hand history 的内容指纹。BLAKE3(self.to_proto())。
+    /// 由于 to_proto 是 deterministic（见 §10 PB-003），content_hash 跨平台稳定，
+    /// 适合用于 D-051 跨平台一致性验收与 fuzz roundtrip 比对。
+    pub fn content_hash(&self) -> [u8; 32];
+}
+```
+
+**回放与街转换时序**：
+
+- 公共牌（flop / turn / river）的发牌**不占** `actions` 序列中的位置，不产生 `RecordedAction`。
+- 当一个 betting round 的最后一个动作（如 BB check 结束 preflop）被 `apply` 后：
+    1. 状态机内部在该 `apply` 调用内先把所有玩家的 `committed_this_round` 重置为 0、收入 pot；
+    2. 然后从 deck 抽取下街公共牌追加到 `board`；
+    3. 然后切换 `street` 字段；
+    4. 然后定位下街第一个行动者（postflop = SB 起，preflop = UTG 起）。
+- 因此 `replay_to(k)` 返回的 `GameState` 满足：第 `k` 个动作已应用，若该动作恰为某街最后一个动作，则下街公共牌已发、`street` 已切换、`current_player` 指向下街第一个行动者；若 `k = 0` 则 `street == Preflop`、`board == []`、`current_player` 为 UTG（6-max）。
+- 例：`actions.len() = 8`，第 5 个动作触发 preflop 结束 → `replay_to(5)` 的状态：preflop 5 个动作已应用、flop 3 张已在 `board` 中、`street == Flop`、`current_player` 为 SB 之后第一个 active 玩家。
+
+---
+
+## 6. 评估器（`module: eval`）
+
+```rust
+/// 不透明手牌强度。数值越大越强；同值代表同强度（split pot）。
+#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash, Debug)]
+pub struct HandRank(pub u32);
+
+impl HandRank {
+    pub fn category(self) -> HandCategory;
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum HandCategory {
+    HighCard, OnePair, TwoPair, Trips, Straight, Flush,
+    FullHouse, Quads, StraightFlush, RoyalFlush,
+}
+
+/// 评估器接口。同一 trait 同时支持 5/6/7-card。
+pub trait HandEvaluator: Send + Sync {
+    fn eval5(&self, cards: &[Card; 5]) -> HandRank;
+    fn eval6(&self, cards: &[Card; 6]) -> HandRank;
+    fn eval7(&self, cards: &[Card; 7]) -> HandRank;
+}
+```
+
+**语义**：
+- `eval6` / `eval7` 必须返回所有 5-card 子集中最强的 `HandRank`。
+- 三个接口对相同 5-card 输入必须返回相同 `HandRank`。
+- 同 `HandCategory` 内 `HandRank` 数值可比较；`HandCategory(A) > HandCategory(B)` 时 `eval(A).0 > eval(B).0` 必须成立。
+- 不要求 `HandRank` 数值跨不同 evaluator 实现一致；只要求**同一 evaluator 内部全序稳定**。
+
+---
+
+## 7. 随机源（`module: core::rng`）
+
+```rust
+/// 显式注入的随机源。所有用到随机数的地方都必须接受 &mut dyn RngSource，
+/// 禁止使用全局 rng。
+///
+/// `Send` 约束：阶段 1 多线程模拟（D-054）要求 RngSource 可在线程间转移；
+/// 实现方必须满足 `Send`。`Sync` 不强制（每线程持有独占 rng）。
+pub trait RngSource: Send {
+    fn next_u64(&mut self) -> u64;
+}
+
+/// 标准实现：基于 ChaCha20，seed-determined。
+pub struct ChaCha20Rng { /* opaque */ }
+impl ChaCha20Rng {
+    pub fn from_seed(seed: u64) -> Self;
+}
+impl RngSource for ChaCha20Rng { /* ... */ }
+
+/// 适配器：把任意 `rand::RngCore` 包装成 `RngSource`。
+/// 不使用 blanket impl（会与具名实现冲突，且无法附加 Send 约束）。
+pub struct RngCoreAdapter<R: rand::RngCore + Send>(pub R);
+
+impl<R: rand::RngCore + Send> RngSource for RngCoreAdapter<R> { /* ... */ }
+
+impl<R: rand::RngCore + Send> RngCoreAdapter<R> {
+    pub fn from_rng_core(inner: R) -> Self { RngCoreAdapter(inner) }
+}
+```
+
+**语义**：
+- `from_seed` 必须确定性：相同 seed 在所有平台上产生相同序列（`ChaCha20` 算法保证）。
+- 禁止使用 `OsRng` / `thread_rng()` 等系统熵源进入规则引擎或评估器。
+- 任何 `rand::RngCore` 实现需要包成 `RngCoreAdapter` 才能注入；这避免了 blanket impl 与具名 `ChaCha20Rng` 之间的 conflicting impl，并保证 `Send` 约束。
+
+---
+
+## 8. 错误类型（`module: error`）
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum RuleError {
+    #[error("illegal action: {reason}")]
+    IllegalAction { reason: String },
+    #[error("not the current player's turn")]
+    NotPlayerTurn,
+    #[error("hand already terminated")]
+    HandTerminated,
+    #[error("invalid amount: {0:?}")]
+    InvalidAmount(ChipAmount),
+    #[error("min raise violation: required >= {required:?}, got {got:?}")]
+    MinRaiseViolation { required: ChipAmount, got: ChipAmount },
+    #[error("insufficient stack")]
+    InsufficientStack,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HistoryError {
+    #[error("schema version mismatch: found {found}, supported {supported}")]
+    SchemaVersionMismatch { found: u32, supported: u32 },
+    #[error("corrupted history: {0}")]
+    Corrupted(String),
+    #[error("invalid protobuf: {0}")]
+    InvalidProto(String),
+    #[error("replay diverged at action index {index}: {reason}")]
+    ReplayDiverged { index: usize, reason: String },
+}
+```
+
+---
+
+## 9. 模块导出（顶层 `lib.rs`）
+
+```rust
+pub mod core;
+pub mod rules;
+pub mod eval;
+pub mod history;
+pub mod error;
+
+// 顶层 re-export
+pub use core::{Card, Rank, Suit, ChipAmount, Street, Position, SeatId, Player, PlayerStatus};
+pub use core::rng::{RngSource, ChaCha20Rng, RngCoreAdapter};
+pub use rules::action::{Action, LegalActionSet};
+pub use rules::config::TableConfig;
+pub use rules::state::GameState;
+pub use eval::{HandEvaluator, HandRank, HandCategory};
+pub use history::{HandHistory, RecordedAction};
+pub use error::{RuleError, HistoryError};
+```
+
+---
+
+## 10. proto 定义（`proto/hand_history.proto`）
+
+```proto
+syntax = "proto3";
+package poker.v1;
+
+message HandHistory {
+    uint32 schema_version = 1;     // = 1
+    TableConfig config = 2;
+    uint64 seed = 3;
+    repeated RecordedAction actions = 4;
+    repeated uint32 board = 5;     // 每张牌 = Card.to_u8()
+    repeated HoleCards hole_cards = 6;
+    repeated Payout final_payouts = 7;
+    repeated uint32 showdown_order = 8;
+}
+
+message TableConfig {
+    uint32 n_seats = 1;
+    repeated uint64 starting_stacks = 2;
+    uint64 small_blind = 3;
+    uint64 big_blind = 4;
+    uint64 ante = 5;
+    uint32 button_seat = 6;
+}
+
+message RecordedAction {
+    uint32 seq = 1;
+    uint32 seat = 2;
+    Street street = 3;             // 显式 enum，见下方 Street 定义
+    ActionKind kind = 4;
+    uint64 to = 5;                 // 见下方 to 字段语义
+    uint64 committed_after = 6;
+}
+
+enum ActionKind {
+    FOLD = 0;
+    CHECK = 1;
+    CALL = 2;
+    BET = 3;
+    RAISE = 4;
+    // AllIn 在写入时已归一化为 CALL/BET/RAISE，proto 中不出现
+}
+
+enum Street {
+    PREFLOP = 0;
+    FLOP = 1;
+    TURN = 2;
+    RIVER = 3;
+    SHOWDOWN = 4;
+}
+
+message HoleCards {
+    bool present = 1;
+    uint32 c0 = 2;
+    uint32 c1 = 3;
+}
+
+message Payout {
+    uint32 seat = 1;
+    sint64 amount = 2;
+}
+```
+
+### proto 字段不变量
+
+- PB-001 `RecordedAction.to` 字段语义按 `kind` 区分：
+    - `kind == FOLD` → `to` 必须为 `0`；非 0 视为 corrupted。
+    - `kind == CHECK` → `to` 必须为 `0`；非 0 视为 corrupted。
+    - `kind == CALL` / `BET` / `RAISE` → `to` 必须 `> 0`；为 0 视为 corrupted。
+- PB-002 `from_proto` 在校验阶段必须按 PB-001 检查每条 `RecordedAction`，违反规则时返回 `HistoryError::Corrupted("action {seq}: to field violates kind invariant")`。
+- PB-003 `to_proto()` 输出必须 deterministic：相同 `HandHistory` 在所有平台上产生 byte-equal 字节流。`prost` 默认行为已满足该要求（字段按 tag 升序、map 字段在阶段 1 schema 中不出现）；任何 PR 引入非 deterministic 序列化路径必须 reject。
+- PB-004 `Street` 与 `ActionKind` 枚举值与 Rust 端 `#[repr(u8)]` discriminant 一一对应；任何一侧改 discriminant 必须同步另一侧并 bump `schema_version`。
+
+---
+
+## 11. API 修改流程
+
+- API-100 任何对本文档已定义签名的修改必须在本文档以追加 `API-NNN-revM` 条目记录，**不删除原条目**
+- API-101 修改若影响 protobuf 兼容性，必须 bump `HandHistory.schema_version` 并提供升级器
+- API-102 修改 PR 必须经过决策者 review；测试 agent 与实现 agent 同时被 cc
+
+---
+
+## 12. 与决策文档的对应关系
+
+本文档每个类型 / 字段都可追溯到 `pluribus_stage1_decisions.md` 中的某条 D-NNN 决策。如发现不一致，以 `pluribus_stage1_decisions.md` 为准，本文档同步修正。
+
+| 本文档类型 | 关联决策 |
+|---|---|
+| 整体技术栈选型（语言 / 测试 / proto / pyo3） | D-001 ~ D-008 |
+| Crate 布局与模块边界（§9 模块导出） | D-010 ~ D-013 |
+| `ChipAmount` | D-020 ~ D-026, D-026b |
+| `ChipAmount` Sub 下溢 panic | D-026b |
+| `payouts()` 返回 `i64` / 绝对筹码 `u64` 区分 | D-025b |
+| `TableConfig` 默认值 / `default_6max_100bb` | D-021 ~ D-024, D-022b, D-030, D-031 |
+| `Action::AllIn` 归一化 | D-033, D-042, D-061 ~ D-064 |
+| min-raise 链式 / short all-in 不重开 | D-033 ~ D-035 |
+| 全员 all-in 跳轮（I-006） | D-036 |
+| `payouts()` / odd chip / 摊牌顺序 / side pot / uncalled | D-037 ~ D-041 |
+| `string bet` 禁用（单次 Action 调用） | D-042 |
+| 时间限制接口字段保留 | D-043 |
+| `RngSource` / `ChaCha20Rng` / `RngCoreAdapter` | D-027, D-050 |
+| 跨平台 / 多线程一致性（`content_hash` / deterministic proto） | D-051 ~ D-054 |
+| `HandHistory.schema_version` / proto 路径 / Python 绑定 | D-060 ~ D-066 |
+| `HandEvaluator` 三接口 / `HandRank` / `HandCategory` | D-070 ~ D-075 |
+| 交叉验证规模与参考实现引用 | D-080 ~ D-085 |
+
+---
+
+## 参考资料
+
+- 阶段 1 决策记录：`pluribus_stage1_decisions.md`
+- 阶段 1 验收门槛：`pluribus_stage1_validation.md`
+- 阶段 1 实施流程：`pluribus_stage1_workflow.md`
+- prost：https://github.com/tokio-rs/prost
+- thiserror：https://github.com/dtolnay/thiserror
