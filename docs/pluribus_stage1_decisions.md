@@ -48,12 +48,14 @@
 | D-022 | 默认大盲 | BB = 100 chips |
 | D-022b | `default_6max_100bb` 默认按钮位 | `button_seat = SeatId(0)`；`SeatId(1)` 为 SB、`SeatId(2)` 为 BB（按 D-032 推导） |
 | D-023 | 默认小盲 | SB = 50 chips |
-| D-024 | 默认 ante | 0 chips（接口预留扩展） |
+| D-024 | 默认 ante | 0 chips（接口预留扩展）。语义约定：`TableConfig.starting_stacks` 是发盲注 / ante **之前** 的座位栈；引擎在开手时把盲注 / ante 从对应座位的 `stack` 转入 pot，因此 `sum(stacks) + pot = sum(starting_stacks)` 在牌局任意时刻、任意 apply 前后都必须成立（与 API I-001 一致）。 |
 | D-025 | `ChipAmount` 后备类型 | `u64`（远超 stage 1 上限） |
 | D-025b | 筹码 vs 盈亏的有符号区分 | 绝对筹码量（stack / pot / committed / blind / ante / bet `to`）一律用 `ChipAmount(u64)`；盈亏 / payout（可正可负）一律用 `i64`。`ChipAmount → i64` 转换：值必须 ≤ `i64::MAX`，否则 panic（阶段 1 起始 stack ≤ 100 BB · 100 chips/BB · 9 seats = 90,000，远在 `i64::MAX` 内）。`i64 → ChipAmount` 仅在调用方已证明非负时允许，并显式断言。 |
 | D-026 | 浮点禁用范围 | 规则引擎 / 评估器 / hand history / 抽象映射全程整数；任何 PR 引入 `f32` / `f64` 必须 reject |
 | D-026b | `ChipAmount` Sub 下溢策略 | `ChipAmount` 的 `Sub` / `SubAssign` 在下溢时 **debug 与 release 都 panic**（不使用 saturating，不使用 wrapping）；下溢即视为规则引擎 bug，必须立即终止以便定位。需要 saturating 语义的调用方必须显式用 `checked_sub` 或先比较再相减 |
 | D-027 | RNG 显式注入 | 禁止全局 rng；所有随机调用显式接受 `&mut dyn RngSource` |
+| D-028 | RngSource → deck 发牌协议 | `GameState::new` / `GameState::with_rng` 必须按以下确定性协议发牌，**任何实现偏离视为违反 API 契约**：① 初始化 `deck = [Card::from_u8(0), Card::from_u8(1), ..., Card::from_u8(51)]`（共 52 张，按 `Card::to_u8` 升序）；② Fisher-Yates 洗牌：`for i in 0..51 { let j = i + (rng.next_u64() % ((52 - i) as u64)) as usize; deck.swap(i, j); }`，恰消费 51 次 `next_u64`；③ 发牌索引（`n = config.n_seats`，发牌起点 = SB 即按钮左 1，按 D-029 升 SeatId 方向环绕）：`deck[k]` 为发牌顺序中第 k 个座位的第 1 张底牌（k = 0..n），`deck[n + k]` 为同一座位的第 2 张底牌（k = 0..n），`deck[2n .. 2n+3]` 为 flop（按出现顺序），`deck[2n+3]` 为 turn，`deck[2n+4]` 为 river；④ **不发烧牌**（burn cards），`deck[2n+5..]` 在阶段 1 不被引用。该协议作为公开契约，testers 可基于此构造 stacked `RngSource` 实现来产生指定牌序（B1 fixed scenario 主要使用该路径）。任何修改必须走 D-100 / API-NNN-revM 流程，并 bump `HandHistory.schema_version`（因为相同 seed 将产生不同的 `board` / `hole_cards`，破坏跨版本回放）。 |
+| D-029 | 座位方向约定 | `SeatId(k+1 mod n_seats)` 是 `SeatId(k)` 的左邻。按钮轮转（D-032）、盲注推导（D-022b / D-032）、odd chip 分配（D-039）、showdown 顺序（D-037）、D-028 发牌起点环绕方向中"向左" / "按钮左侧" 均按此理解。该约定与 API §1 `SeatId` 的注释保持一致。 |
 
 **核心数值速查表**：
 
@@ -75,14 +77,14 @@
 |---|---|---|
 | D-030 | 桌大小 | 默认 6-max；`TableConfig` 接受 2..=9 用于测试 / fuzz |
 | D-031 | ante | 默认 0；接口字段保留以备未来扩展 |
-| D-032 | 按钮轮转 | **简化方案**：阶段 1 假定**全程**无玩家坐入坐出 —— 既不允许 mid-hand sit-in/sit-out，也不允许 hand-boundary sit-in/sit-out。所有 `n_seats` 座位从模拟开始到结束全程在场。按钮每手向左移动一格（即下一手按钮 = 当前按钮左侧第一个座位，模 `n_seats`）。盲注位由按钮位机械推导：SB = 按钮左 1，BB = 按钮左 2。dead button / dead blind corner case（短暂缺席导致的悬空盲）不在阶段 1 scope，留待支持坐入坐出时再补 D-032-revM。**该简化对 cross-validation harness 的额外约束见 D-086**。 |
+| D-032 | 按钮轮转 | **简化方案**：阶段 1 假定**全程**无玩家坐入坐出 —— 既不允许 mid-hand sit-in/sit-out，也不允许 hand-boundary sit-in/sit-out。所有 `n_seats` 座位从模拟开始到结束全程在场。按钮每手向左移动一格（即下一手按钮 = 当前按钮左侧第一个座位，模 `n_seats`，方向定义见 D-029）。盲注位由按钮位机械推导：SB = 按钮左 1，BB = 按钮左 2。dead button / dead blind corner case（短暂缺席导致的悬空盲）不在阶段 1 scope，留待支持坐入坐出时再补 D-032-revM。**该简化对 cross-validation harness 的额外约束见 D-086**。**未来扩展占位**：当未来 D-032-revM 引入 sit-in/sit-out 支持时，**默认采用 dead button 规则**（按钮在原座位停留一手，盲注按规则推导），不采用 dead blind。该占位决定先行写入以满足 `pluribus_stage1_validation.md` §1 "dead button / dead blind 规则二选一并显式写出" 的硬性条款；阶段 1 因 sit-in/sit-out 不在 scope，该规则当前无任何代码路径触发，仅在 F3 验收报告中作为"已选定但未启用"列出。`validation.md` §1 末段对应一行注释指向本占位。 |
 | D-033 | 短码 all-in 重开规则 | incomplete raise（短码 all-in 加注差额 < 本轮最大有效加注差额）**不重开** raise option |
 | D-034 | min raise（首次） | 首次开局 raise 的最小金额 = BB |
 | D-035 | min raise（链式） | 后续每次 raise 的加注差额 ≥ 本轮已发生的最大有效加注差额 |
 | D-036 | 全员 all-in 跳轮 | 除一名玩家外全员 all-in 后，跳过后续下注轮，直接发完剩余公共牌进入摊牌 |
 | D-037 | showdown 顺序 | `last_aggressor` = 本手内最后一次 **voluntary** bet 或 raise 的玩家。SB / BB / ante 等强制盲注 / 强制下注 **不算** voluntary aggression；preflop limp（call BB）也不算 aggression。若 `last_aggressor` 存在，由其先亮，其余未弃牌玩家从 `last_aggressor` 起向左依次轮流（每次取下一个未弃牌座位，跳过弃牌者）；若 `last_aggressor` 不存在（典型场景：preflop 多人 limp 进入 flop 后各街全员 check 至 river 摊牌），则从 SB 起向左依次轮流（SB 已弃则取下一个未弃牌座位）。注：**BB walk**（所有非 BB 玩家 preflop 弃牌）不进入 showdown，无 D-037 适用问题；该术语在 D-040 / D-037 内不应被举为 showdown 例子。 |
 | D-038 | side pot 排序 | 按 all-in 金额升序，最低 all-in 形成 main pot，依次形成 side pot |
-| D-039 | odd chip rule | 每个 pot（main pot 与每个 side pot）独立计算零头：先在该 pot 的获胜者集合内均分，余数（< 获胜人数）按"按钮左侧最近"的顺序在该 pot 获胜者集合中依次分配最小单位（1 chip）。不同 pot 之间互不影响；同时存在多个 side pot 时各自独立执行。例：3-way 摊牌，main pot = 301 chips，3 人皆赢 → 各得 100，余 1 chip 给按钮左侧最近的获胜者；同手 side pot = 7 chips，2 人赢 → 各得 3，余 1 chip 给该 side pot 获胜者中按钮左侧最近者（与 main pot 的零头去向独立判断） |
+| D-039 | odd chip rule | 每个 pot（main pot 与每个 side pot）独立计算零头：先在该 pot 的获胜者集合内均分，余数（< 获胜人数）按"按钮左侧最近"的顺序在该 pot 获胜者集合中依次分配最小单位（1 chip）。不同 pot 之间互不影响；同时存在多个 side pot 时各自独立执行。例：3-way 摊牌，main pot = 301 chips，3 人皆赢 → 各得 100，余 1 chip 给按钮左侧最近的获胜者；同手 side pot = 7 chips，2 人赢 → 各得 3，余 1 chip 给该 side pot 获胜者中按钮左侧最近者（与 main pot 的零头去向独立判断）。**Corner case：BTN 自身为获胜者**：环绕计数从 `BTN+1`（按 D-029 即按钮左 1）起、不从 BTN 起；即 BTN **不优先**获得余 chip，仅当所有非 BTN 的获胜座位都已分到、最终环绕回到 BTN 时才落到 BTN。该约定与 PokerKit 等开源参考实现一致。等价表述：余 chip 分配的迭代起点 = 按钮位的下一个座位，逐一遍历 `(BTN+1) mod n`、`(BTN+2) mod n`、…、`(BTN+n-1) mod n`、`BTN`，跳过非该 pot 获胜者，直到余 chip 为 0。 |
 | D-040 | uncalled bet returned | 最后一个 raise/bet 没有 caller 时，超出"最高被 call 金额"的部分返还 raiser，不进入 pot |
 | D-041 | dead money | 弃牌玩家已投入的筹码留在对应级别 pot/side pot，不退还 |
 | D-042 | string bet | 不允许（统一接受单一 Action 调用，不分多步） |

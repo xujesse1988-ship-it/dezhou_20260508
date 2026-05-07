@@ -98,6 +98,10 @@ pub enum Position {
 }
 
 /// 座位号 0..n_seats。按桌面物理座位编号，不随按钮变化。
+///
+/// **方向约定（D-029）**：`SeatId(k+1 mod n_seats)` 是 `SeatId(k)` 的左邻。
+/// 按钮轮转（D-032）、盲注推导（D-022b / D-032）、odd chip 分配（D-039）、
+/// showdown 顺序（D-037）中"向左" / "按钮左侧" 均按此理解。
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct SeatId(pub u8);
 ```
@@ -229,8 +233,20 @@ pub struct GameState {
 }
 
 impl GameState {
-    /// 初始化一手新牌。从 RngSource 抽牌、布盲、按钮位由 config 指定。
-    pub fn new(config: &TableConfig, rng: &mut dyn RngSource) -> GameState;
+    /// 初始化一手新牌（生产路径）。
+    ///
+    /// 内部以 `ChaCha20Rng::from_seed(seed)` 构造 rng，按 D-028 发牌协议抽牌、布盲、
+    /// 按钮位由 config 指定。`HandHistory.seed` 自动记为该 `seed`，`replay()` 即可复现。
+    pub fn new(config: &TableConfig, seed: u64) -> GameState;
+
+    /// 初始化一手新牌（测试 / fuzz 路径）。
+    ///
+    /// 注入自定义 `RngSource`，典型用于 stacked deck（构造指定牌序，参见 D-028）。
+    /// `seed` 仅作为 `HandHistory.seed` 的标签写入，**不参与发牌**；调用方需自负 rng 与 seed
+    /// 的语义一致性 —— 若期望 `replay()` 能复现，则注入的 rng 必须等价于 `ChaCha20Rng::from_seed(seed)`，
+    /// 否则 `replay()` 在底牌 / 公共牌校验阶段会返回 `HistoryError::ReplayDiverged`。
+    /// 推荐：在 fuzz / 单元测试中使用 stacked rng + 固定 sentinel seed（如 `0`），并不要求 replay 复现。
+    pub fn with_rng(config: &TableConfig, seed: u64, rng: &mut dyn RngSource) -> GameState;
 
     /// 当前要行动的玩家。手牌结束 / 全员 all-in 跳轮时返回 None。
     pub fn current_player(&self) -> Option<SeatId>;
@@ -266,7 +282,7 @@ impl GameState {
 
 **关键不变量**（实现 agent 必须保证、测试 agent 应在 invariant suite 中验证）：
 
-- I-001 任意时刻 `sum(player.stack) + pot() = sum(starting_stacks) + sum(antes_collected)`
+- I-001 任意时刻 `sum(player.stack) + pot() = sum(starting_stacks)`。`TableConfig.starting_stacks` 是发盲注 / ante **之前** 的座位栈（D-024）；引擎在开手时把盲注 / ante 从对应座位的 `stack` 转入 pot，转移过程总量守恒，因此本等式在牌局任意时刻、任意街、任意 apply 前后都必须成立。
 - I-002 任意 `Player.stack >= 0`（用 `u64` 表达自然成立，但减法路径必须有下溢检查）
 - I-003 任意一手内不出现重复 Card
 - I-004 每个 betting round 结束时，所有 `Active` 状态玩家的 `committed_this_round` 相等
@@ -350,6 +366,13 @@ impl HandHistory {
 - 因此 `replay_to(k)` 返回的 `GameState` 满足：第 `k` 个动作已应用，若该动作恰为某街最后一个动作，则下街公共牌已发、`street` 已切换、`current_player` 指向下街第一个行动者；若 `k = 0` 则 `street == Preflop`、`board == []`、`current_player` 为 UTG（6-max）。
 - 例：`actions.len() = 8`，第 5 个动作触发 preflop 结束 → `replay_to(5)` 的状态：preflop 5 个动作已应用、flop 3 张已在 `board` 中、`street == Flop`、`current_player` 为 SB 之后第一个 active 玩家。
 
+**全员 all-in 跳轮（D-036）的多街快进时序**：
+
+- 当某个 `apply` 调用结束后剩余 `Active` 玩家 ≤ 1 名（其余皆 `AllIn` 或 `Folded`），状态机在**同一 apply 调用内**连续执行：依次发完所有未发的公共牌（直到 `board.len() == 5`） → 切 `street = Showdown` → 计算 `payouts` → 设 `current_player() = None`、`is_terminal() = true`。
+- 该过程不产生新的 `RecordedAction`（公共牌发牌本就不占 actions 序列）。`HandHistory.actions` 长度只反映触发该跳轮的最后一个玩家动作。
+- `replay_to(k)` 行为：若第 k 个动作触发了"全员 all-in"分支，返回的 `GameState` 已处于 Showdown 状态、5 张 board 已发完、`is_terminal == true`；`replay_to(actions.len())` 在所有情形下都等价于 `replay()`。
+- 与 D-036 / I-006 一致：跳轮的边界判定基于 apply 完成后的 `Active` 计数，不依赖 apply 中的中间状态。
+
 ---
 
 ## 6. 评估器（`module: eval`）
@@ -419,6 +442,7 @@ impl<R: rand::RngCore + Send> RngCoreAdapter<R> {
 - `from_seed` 必须确定性：相同 seed 在所有平台上产生相同序列（`ChaCha20` 算法保证）。
 - 禁止使用 `OsRng` / `thread_rng()` 等系统熵源进入规则引擎或评估器。
 - 任何 `rand::RngCore` 实现需要包成 `RngCoreAdapter` 才能注入；这避免了 blanket impl 与具名 `ChaCha20Rng` 之间的 conflicting impl，并保证 `Send` 约束。
+- **发牌协议（参见决策 D-028）**：`GameState::new` 与 `GameState::with_rng` 调用 `RngSource` 的方式（消费几次 `next_u64`、每次 mod 多少、Fisher-Yates 步长、deck 索引到底牌 / 公共牌的映射）由 D-028 严格定义并作为 API 契约对外公开。这使得测试 / fuzz 代码可以构造 stacked `RngSource` 实现来产生指定牌序（B1 fixed scenario 主要靠这个写），无需依赖任何实现内部细节。`with_rng` 的 stacked 用法不要求传入的 rng 与 `ChaCha20Rng::from_seed(seed)` 一致，但此时 `replay()` 不保证可复现（详见 §4 `with_rng` 注释）。
 
 ---
 
@@ -619,6 +643,8 @@ message Payout {
 | `string bet` 禁用（单次 Action 调用） | D-042 |
 | 时间限制接口字段保留 | D-043 |
 | `RngSource` / `ChaCha20Rng` / `RngCoreAdapter` | D-027, D-050 |
+| `GameState::new(config, seed)` / `with_rng(config, seed, rng)` 发牌协议 | D-028 |
+| `SeatId` 左邻方向约定 | D-029 |
 | 跨平台 / 多线程一致性（`content_hash` / deterministic proto） | D-051 ~ D-054 |
 | `HandHistory.schema_version` / proto 路径 / Python 绑定 | D-060 ~ D-066 |
 | `HandEvaluator` 三接口 / `HandRank` / `HandCategory` | D-070 ~ D-075 |

@@ -24,6 +24,7 @@
 - 全员（除一名）all-in 后必须跳过后续下注轮，直接发完剩余公共牌进入摊牌。
 - showdown 顺序必须固定可复现：最后激进 (last aggressor) 玩家先亮牌；若无激进者按位置顺序亮牌。该顺序写入 hand history。
 - 玩家中途坐下/离开时按钮、SB、BB 的轮转规则必须固定（dead button / dead blind 规则二选一并显式写出），相同 seed 下复现一致。
+    - 阶段 1 简化：D-032 选定全程无 sit-in/sit-out，本条所列 dead button / dead blind 路径在阶段 1 无代码触发。D-032 末段已显式占位声明"未来引入 sit-in/sit-out 时默认采用 dead button"以满足本条文字要求；F3 验收报告需把该占位状态显式列入"已选定但未启用"。
 
 ### 2. 合法动作生成验证
 
