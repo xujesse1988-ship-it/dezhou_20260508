@@ -65,4 +65,15 @@ pub enum HistoryError {
 
     #[error("replay diverged at action index {index}: {reason}")]
     ReplayDiverged { index: usize, reason: String },
+
+    /// 记录的动作序列在 `actions[index]` 处被规则引擎拒绝（典型见 corrupted history、
+    /// 跨版本不兼容残余、或上游写入端 bug）。`source` 携带底层 `RuleError`，可通过
+    /// `std::error::Error::source()` 链式访问；外层 `HistoryError` 表明该错误发生在
+    /// history replay 上下文（API-001-rev1）。
+    #[error("replay action {index} rejected by rule engine")]
+    Rule {
+        index: usize,
+        #[source]
+        source: RuleError,
+    },
 }

@@ -342,11 +342,16 @@ impl HandHistory {
 
     /// 完整回放：从 seed + actions 重建终局 GameState。
     /// 终局状态必须与原始记录完全一致（board, hole_cards, payouts）。
-    pub fn replay(&self) -> Result<GameState, RuleError>;
+    ///
+    /// 错误类型为 `HistoryError`（见 §8 与 §11 API-001-rev1）：
+    /// - 记录的动作序列在某个位置违反规则 → `HistoryError::Rule { index, source }`
+    /// - 重新发牌结果与记录的 `board` / `hole_cards` 不一致 → `HistoryError::ReplayDiverged`
+    pub fn replay(&self) -> Result<GameState, HistoryError>;
 
     /// 部分回放：应用 `actions[0..action_index]` 后的中间状态（即"前 action_index 个动作已应用"）。
     /// `action_index = 0` 表示"刚发完手牌、未行动"；`action_index = actions.len()` 等同 replay()。
-    pub fn replay_to(&self, action_index: usize) -> Result<GameState, RuleError>;
+    /// 错误类型说明见 `replay`。
+    pub fn replay_to(&self, action_index: usize) -> Result<GameState, HistoryError>;
 
     /// hand history 的内容指纹。BLAKE3(self.to_proto())。
     /// 由于 to_proto 是 deterministic（见 §10 PB-003），content_hash 跨平台稳定，
@@ -491,6 +496,16 @@ pub enum HistoryError {
     InvalidProto(String),
     #[error("replay diverged at action index {index}: {reason}")]
     ReplayDiverged { index: usize, reason: String },
+    /// 记录的动作序列在 `actions[index]` 处被规则引擎拒绝（典型见 corrupted
+    /// history、跨版本不兼容残余、或上游写入端 bug）。`source` 携带底层
+    /// `RuleError`，可通过 `std::error::Error::source()` 链式访问；外层
+    /// `HistoryError` 表明该错误发生在 history replay 上下文（API-001-rev1）。
+    #[error("replay action {index} rejected by rule engine")]
+    Rule {
+        index: usize,
+        #[source]
+        source: RuleError,
+    },
 }
 ```
 
@@ -621,6 +636,26 @@ message Payout {
 - API-100 任何对本文档已定义签名的修改必须在本文档以追加 `API-NNN-revM` 条目记录，**不删除原条目**
 - API-101 修改若影响 protobuf 兼容性，必须 bump `HandHistory.schema_version` 并提供升级器
 - API-102 修改 PR 必须经过决策者 review；测试 agent 与实现 agent 同时被 cc
+
+### 修订历史
+
+- **API-001-rev1** (2026-05-07)：`HandHistory::replay` / `HandHistory::replay_to`
+  返回类型由 `Result<GameState, RuleError>` 改为 `Result<GameState, HistoryError>`，
+  并在 `HistoryError` 中新增 `Rule { index, source: RuleError }` 变体包裹底层
+  `RuleError`。
+  - **背景**：原签名与文档中已存在的 `HistoryError::ReplayDiverged` 错误类型分裂
+    —— replay 失败的两种主要语义（动作序列违法 vs 重新发牌结果与记录不一致）
+    被强行拆分到 `RuleError` 与 `HistoryError` 两个根类型，调用方需要分别捕获。
+  - **理由**：replay 失败语义统一属于 history 域（"这条记录不可信任地重建"），
+    而非 live-play 域（`apply` 仍然返回 `RuleError`）。`HistoryError::Rule`
+    通过 `#[source]` 暴露底层 `RuleError`，调用方仍可链式访问根因。
+  - **影响**：
+    - 不影响 protobuf schema（不 bump `HandHistory.schema_version`）。
+    - 不影响 `apply` / `legal_actions` 等 live-play API 签名。
+    - A1 骨架已按本 rev1 实现；B2 起的实现 agent 直接按新签名展开。
+    - B1 / C1 测试 agent 编写 replay 相关断言时，以 `HistoryError` 模式匹配。
+  - **撤销条件**：若后续发现 history 与 rule 错误必须分离传递（如供 CFR 训练
+    时的精细错误分类），可走 API-001-rev2 重拆。
 
 ---
 

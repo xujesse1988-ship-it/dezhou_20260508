@@ -1,7 +1,7 @@
 //! Hand history 与回放（API §5）。
 
 use crate::core::{Card, ChipAmount, SeatId, Street};
-use crate::error::{HistoryError, RuleError};
+use crate::error::HistoryError;
 use crate::rules::action::Action;
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
@@ -60,7 +60,10 @@ impl HandHistory {
     /// 完整回放：从 `seed` + `actions` 重建终局 `GameState`。
     ///
     /// 终局状态必须与原始记录完全一致（`board`, `hole_cards`, `payouts`）。
-    pub fn replay(&self) -> Result<GameState, RuleError> {
+    /// 错误类型为 [`HistoryError`]（API-001-rev1）：
+    /// - 记录动作在某 index 处被规则引擎拒绝 → `HistoryError::Rule { index, source }`
+    /// - 重新发牌结果与记录的 `board` / `hole_cards` 不一致 → `HistoryError::ReplayDiverged`
+    pub fn replay(&self) -> Result<GameState, HistoryError> {
         unimplemented!()
     }
 
@@ -68,8 +71,8 @@ impl HandHistory {
     /// `action_index` 个动作已应用"）。
     ///
     /// `action_index = 0` 表示"刚发完手牌、未行动"；`action_index = actions.len()`
-    /// 等同 [`replay`](Self::replay)。
-    pub fn replay_to(&self, action_index: usize) -> Result<GameState, RuleError> {
+    /// 等同 [`replay`](Self::replay)。错误类型说明见 [`replay`](Self::replay)。
+    pub fn replay_to(&self, action_index: usize) -> Result<GameState, HistoryError> {
         let _ = action_index;
         unimplemented!()
     }
