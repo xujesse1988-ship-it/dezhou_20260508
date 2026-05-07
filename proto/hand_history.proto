@@ -1,0 +1,71 @@
+// Stage 1 hand history schema.
+// 与 docs/pluribus_stage1_api.md §10 严格对应。
+// PB-001..PB-004 不变量见同节。
+//
+// A1：仅落地 .proto 文件作为契约文档来源；prost-build 接入推迟到实际需要
+// to_proto / from_proto 的步骤（B2）。
+
+syntax = "proto3";
+package poker.v1;
+
+message HandHistory {
+    uint32 schema_version = 1;     // = 1
+    TableConfig config = 2;
+    uint64 seed = 3;
+    repeated RecordedAction actions = 4;
+    repeated uint32 board = 5;     // 每张牌 = Card.to_u8()
+    repeated HoleCards hole_cards = 6;
+    repeated Payout final_payouts = 7;
+    repeated uint32 showdown_order = 8;
+}
+
+message TableConfig {
+    uint32 n_seats = 1;
+    repeated uint64 starting_stacks = 2;
+    uint64 small_blind = 3;
+    uint64 big_blind = 4;
+    uint64 ante = 5;
+    uint32 button_seat = 6;
+}
+
+message RecordedAction {
+    uint32 seq = 1;
+    uint32 seat = 2;
+    Street street = 3;             // 显式 enum，见下方 Street 定义
+    ActionKind kind = 4;
+    uint64 to = 5;                 // 见 PB-001 of api §10
+    uint64 committed_after = 6;
+}
+
+enum ActionKind {
+    // proto3 默认值哨兵：字段缺失或被截断时静默解码为 0，因此 0 必须保留为
+    // UNSPECIFIED，由 PB-002 在 from_proto 阶段拒绝。
+    ACTION_KIND_UNSPECIFIED = 0;
+    FOLD = 1;
+    CHECK = 2;
+    CALL = 3;
+    BET = 4;
+    RAISE = 5;
+    // AllIn 在写入时已归一化为 CALL/BET/RAISE，proto 中不出现
+}
+
+enum Street {
+    // proto3 默认值哨兵，理由同上。
+    STREET_UNSPECIFIED = 0;
+    PREFLOP = 1;
+    FLOP = 2;
+    TURN = 3;
+    RIVER = 4;
+    SHOWDOWN = 5;
+}
+
+message HoleCards {
+    bool present = 1;
+    uint32 c0 = 2;
+    uint32 c1 = 3;
+}
+
+message Payout {
+    uint32 seat = 1;
+    sint64 amount = 2;
+}

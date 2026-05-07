@@ -1,0 +1,13 @@
+[package]
+name = "poker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "6-max NLHE poker AI — Pluribus-style stage 1 (rules + evaluator)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+# rand 在 RngCoreAdapter 中作为公开依赖暴露，pin minor 版本（L-4 评审）
+rand = "0.8"
+thiserror = "1.0"
