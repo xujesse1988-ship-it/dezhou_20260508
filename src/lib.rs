@@ -1,8 +1,9 @@
 //! 6-max NLHE poker AI — 阶段 1 crate。
 //!
 //! 此 crate 的公开类型与方法签名严格对应 `docs/pluribus_stage1_api.md`。
-//! 当前阶段 (A1)：所有方法体一律 `unimplemented!()`，**不含任何业务逻辑**。
-//! 业务逻辑由后续步骤（B2 / C2 / D2 / E2 / F2）按 test-first 顺序填入。
+//! 当前阶段 (B2 pass 1)：已落地朴素规则状态机、side pot 结算、手牌评估器、
+//! hand history protobuf roundtrip 与确定性 RNG。后续 C2 / D2 / E2 / F2
+//! 继续补完整覆盖、规模 fuzz、性能 SLO 和兼容性错误路径。
 //!
 //! 模块组织（D-011）：
 //! - [`core`]：基础类型 + 显式注入随机源

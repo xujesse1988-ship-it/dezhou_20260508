@@ -25,6 +25,13 @@ pub struct TableConfig {
 impl TableConfig {
     /// 6-max 100BB 的默认配置：6 座、起始 100BB、SB=50、BB=100、ante=0、按钮在座位 0。
     pub fn default_6max_100bb() -> TableConfig {
-        unimplemented!()
+        TableConfig {
+            n_seats: 6,
+            starting_stacks: vec![ChipAmount::new(10_000); 6],
+            small_blind: ChipAmount::new(50),
+            big_blind: ChipAmount::new(100),
+            ante: ChipAmount::ZERO,
+            button_seat: SeatId(0),
+        }
     }
 }

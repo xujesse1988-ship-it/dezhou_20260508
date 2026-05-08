@@ -224,6 +224,22 @@
     的 `raise_range` 断言、并在 D-086 给 PokerKit 引入显式配置差异碳证
     （D-083 之外的合法分歧来源）。
 
+- **D-039-rev1** (2026-05-08)：B2 PokerKit 0.4.14 cross-validation 将
+  odd chip 余数分配钉为 **PokerKit 默认 chips-pushing divmod 语义**：每个
+  pot 仍独立计算零头，先在该 pot 的获胜者集合内均分；若存在余数，则把该
+  pot 的**全部余数**给按钮左侧顺序中最近的获胜者，而不是逐个分给多个赢家。
+  - **背景**：seed 72 的 5-way preflop all-in 中，3 名玩家平分 50,000
+    chips，余数为 2。PokerKit 0.4.14 将 2 chips 全部分给按钮左侧顺序中
+    第一个赢家；原 D-039 的逐个分配解释会分给前两个赢家，导致
+    `cross_validation_pokerkit_100_random_hands` 出现 1-chip 分歧。
+  - **新规则**：余 chip 分配起点仍为 `(BTN+1) mod n`，按 D-029 向左查找
+    该 pot 的获胜者集合；找到第一个获胜者后，把该 pot 的全部余数加给该
+    座位。不同 pot 之间仍独立执行，因此同一手多个 pot 可以各自把余数给
+    各自的第一个获胜者。
+  - **影响**：`payouts()` 语义改变但公开签名不变；`HandHistory` schema
+    不变，不 bump `schema_version`。`pluribus_stage1_validation.md` §3
+    与实现注释同步改为该语义。
+
 ---
 
 ## 11. 已知未决项（不阻塞 A1）

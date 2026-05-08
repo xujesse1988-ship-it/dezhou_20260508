@@ -204,8 +204,9 @@ pub fn pick_unused_padding(used: &HashSet<u8>, count: usize) -> Vec<Card> {
 /// 一次完整不变量检查。`Ok(())` 表示通过；`Err(reason)` 表示违反。
 ///
 /// 调用约定：`check_all` 接受一个 `&GameState` 和 `expected_starting_total`
-/// （= `sum(TableConfig.starting_stacks) + sum(TableConfig.ante * n_seats)`，
-/// 见 D-024 / I-001）。fuzz 与 cross-validation harness 在每步 `apply` 后调用。
+/// （= `sum(TableConfig.starting_stacks)`，见 D-024 / I-001）。ante 在 D-024
+/// 下从 stack 转入 pot，**总量守恒**，所以这里**不**再额外加 `ante * n_seats`。
+/// fuzz 与 cross-validation harness 在每步 `apply` 后调用。
 ///
 /// **B1 范围**：本检查器在 A1 unimplemented 状态下被 `catch_unwind` 包裹。
 /// B2 起 GameState 落地，所有断言激活。
