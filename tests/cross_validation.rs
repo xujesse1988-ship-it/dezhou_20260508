@@ -1,13 +1,13 @@
-//! B1：PokerKit cross-validation harness 骨架（B 类）。
+//! B1/B2：PokerKit cross-validation harness（B 类）。
 //!
 //! `pluribus_stage1_workflow.md` §B1 要求：
 //!
 //! - 接 PokerKit（Python 子进程或 pyo3）
 //! - 接口：给定 `(initial_state, action_sequence)` 比对终局筹码 / pot 划分 / winner / showdown 顺序
-//! - 第一版只跑 10 手
+//! - B1 第一版只跑 10 手；B2 pass 1 跑 100 手随机牌局
 //!
 //! 实现选择：**Python 子进程 + JSON stdin/stdout**。pyo3 留待 C1 视性能需求
-//! 升级；B1 只验证流程闭环。
+//! 升级。
 //!
 //! 与参考实现的语义边界（D-083 / D-086）：
 //!
@@ -15,16 +15,11 @@
 //! - PokerKit 必须配置为"全程 n_seats 在场、无 sit-in/sit-out、按钮机械每手左移、
 //!   SB/BB 机械推导"模式（D-086）。
 //!
-//! **B1 状态**：
+//! **B2 状态**：
 //!
-//! - GameState 未实现 → 无法构造 `HandHistory` 输入 → 子进程也未真正执行
-//!   PokerKit 翻译。harness 在每个层面都做 fallback：
-//!     - 构造 GameState：`catch_unwind` 捕获 unimplemented panic。
-//!     - 调用子进程：检测 PokerKit 缺失 / B1Stub 退出码，标记 "skipped"。
-//!     - 比对：在数据可用时执行；否则记 skipped。
-//! - smoke 测试断言"流程未崩溃且子进程退出码可识别"，不锁定结果一致性。
-//!
-//! 角色边界：本文件属 `[测试]` agent。`[实现]` agent 不得修改。
+//! - Rust 端随机打一手并输出完整 `HandHistory` JSON。
+//! - Python 子进程用 PokerKit 重放同一动作序列。
+//! - 比对终局 payouts 与 showdown_order；PokerKit 缺失时保留 skipped fallback。
 
 mod common;
 
@@ -33,7 +28,13 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use poker::{GameState, HandHistory, SeatId, TableConfig};
+use poker::{
+    Action, ChaCha20Rng, ChipAmount, GameState, HandHistory, LegalActionSet, RecordedAction,
+    RngSource, SeatId, Street, TableConfig,
+};
+use serde_json::{json, Value};
+
+use common::{expected_total_chips, Invariants};
 
 // ============================================================================
 // 子进程 IO
@@ -47,7 +48,7 @@ pub enum CrossValidationOutcome {
     Diverged { reason: String },
     /// 子进程跳过（PokerKit 未安装、B1 stub 等）。不计入分歧总数。
     Skipped { reason: String },
-    /// 我方 GameState 路径 panic（A1 unimplemented 期望情形）。
+    /// 我方 GameState 路径 panic（保留 legacy fallback，B2 后不应出现）。
     OurPanic { context: String },
     /// IO / 子进程 spawn 错误，与规则正确性无关。
     HarnessError { reason: String },
@@ -84,26 +85,20 @@ impl CrossValidationReport {
 // 入口
 // ============================================================================
 
-/// 跑一手 cross-validation：用 seed 让我方与 PokerKit 各自重放，比对结果。
+/// 跑一手 cross-validation：用 seed 让我方随机打一手，再交给 PokerKit 重放比对。
 ///
 /// 流程：
-/// 1. 我方：`GameState::new(cfg, seed)` + drive 全 fold（占位驱动 — B2 替换为
-///    完整 random walk 或预录 action 序列）。在 A1 unimplemented 阶段会 panic，
-///    用 `catch_unwind` 捕获 → `OurPanic`。
+/// 1. 我方：`GameState::new(cfg, seed)` + 从 `legal_actions()` 采样随机动作直到终局。
 /// 2. PokerKit：把"原始 cfg + seed + 推导的 hole/board + actions"序列化为 JSON，
 ///    调用 `tools/pokerkit_replay.py`，解析 stdout。
 ///    - exit 2 → `Skipped`（PokerKit 缺失）
-///    - error_kind = B1Stub → `Skipped`
 ///    - error_kind = BadInput → `HarnessError`
 ///    - ok = true → 比对终局 payouts / showdown_order
 /// 3. 比对：双方均成功 → `Match` 或 `Diverged`。
 pub fn validate_one_hand(seed: u64) -> CrossValidationOutcome {
-    // ---- 我方路径：A1 panic 占位 ----
-    // 把 cfg 构造也包进 catch_unwind：`TableConfig::default_6max_100bb` 在 A1
-    // 一样 unimplemented。
     let our_result = catch_unwind(AssertUnwindSafe(|| -> (TableConfig, OursSnapshot) {
-        let cfg = TableConfig::default_6max_100bb();
-        let state = GameState::new(&cfg, seed);
+        let (cfg, state) =
+            play_random_hand(seed, 256).unwrap_or_else(|e| panic!("our random hand failed: {e}"));
         let snap = snapshot_from_state(&state);
         (cfg, snap)
     }));
@@ -112,7 +107,7 @@ pub fn validate_one_hand(seed: u64) -> CrossValidationOutcome {
         Ok(pair) => pair,
         Err(_) => {
             return CrossValidationOutcome::OurPanic {
-                context: format!("GameState::new(cfg, seed={seed}) panicked (A1 unimplemented)"),
+                context: format!("GameState::new(cfg, seed={seed}) panicked"),
             };
         }
     };
@@ -176,38 +171,120 @@ pub fn validate_one_hand(seed: u64) -> CrossValidationOutcome {
         .find(|l| !l.trim().is_empty())
         .unwrap_or("");
 
-    // 朴素 JSON 解析：B1 不引入 serde_json 依赖，仅识别两个关键字段。
-    // B2 / C2 有真实 PokerKit 翻译时升级到 serde_json + 严格解析。
-    if last_line.contains("\"ok\":false") || last_line.contains("\"ok\": false") {
-        if last_line.contains("\"error_kind\":\"B1Stub\"")
-            || last_line.contains("\"error_kind\": \"B1Stub\"")
-        {
+    let payload: Value = match serde_json::from_str(last_line) {
+        Ok(v) => v,
+        Err(e) => {
+            return CrossValidationOutcome::HarnessError {
+                reason: format!(
+                    "invalid pokerkit JSON response: {e}; line={last_line:?}; stderr={stderr}"
+                ),
+            };
+        }
+    };
+
+    if payload.get("ok").and_then(Value::as_bool) == Some(false) {
+        if payload.get("error_kind").and_then(Value::as_str) == Some("B1Stub") {
             return CrossValidationOutcome::Skipped {
                 reason: "pokerkit_replay.py is a B1 stub (translation not yet implemented)".into(),
             };
         }
         return CrossValidationOutcome::Diverged {
-            reason: format!("pokerkit returned ok=false: {last_line} (stderr: {stderr})"),
+            reason: format!("pokerkit returned ok=false: {payload} (stderr: {stderr})"),
         };
     }
 
-    if !last_line.contains("\"ok\":true") && !last_line.contains("\"ok\": true") {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
         return CrossValidationOutcome::HarnessError {
-            reason: format!(
-                "unexpected pokerkit response (no ok field): {last_line:?} (stderr: {stderr})"
-            ),
+            reason: format!("unexpected pokerkit response: {payload} (stderr: {stderr})"),
         };
     }
 
-    // C1 / C2：严格解析 final_payouts / showdown_order，与 ours 比对。
-    // B1：只到达"流程闭环"，结果一致性由 C2 保证。
-    if naive_payouts_match(&ours, last_line) {
+    if strict_snapshot_match(&ours, &payload) {
         CrossValidationOutcome::Match
     } else {
         CrossValidationOutcome::Diverged {
-            reason: "payouts/showdown_order mismatch (B1 stub comparator)".to_string(),
+            reason: format!(
+                "PokerKit mismatch for seed {seed}: ours_payouts={:?}, ref_payouts={:?}, \
+                 ours_showdown={:?}, ref_showdown={:?}",
+                ours.final_payouts,
+                parse_payouts(&payload),
+                ours.showdown_order,
+                parse_showdown_order(&payload)
+            ),
         }
     }
+}
+
+fn play_random_hand(seed: u64, max_actions: usize) -> Result<(TableConfig, GameState), String> {
+    let cfg = TableConfig::default_6max_100bb();
+    let total = expected_total_chips(&cfg);
+    let mut state = GameState::new(&cfg, seed);
+    let mut action_rng = ChaCha20Rng::from_seed(seed.wrapping_add(0xC005_CAFE));
+
+    Invariants::check_all(&state, total)?;
+    for index in 0..max_actions {
+        if state.is_terminal() {
+            return Ok((cfg, state));
+        }
+        let la = state.legal_actions();
+        let action = sample_action(&la, &mut action_rng)
+            .ok_or_else(|| format!("no legal action at index {index}"))?;
+        state
+            .apply(action)
+            .map_err(|e| format!("apply #{index} {action:?} failed: {e}"))?;
+        Invariants::check_all(&state, total)
+            .map_err(|e| format!("invariant after #{index} {action:?}: {e}"))?;
+    }
+
+    if state.is_terminal() {
+        Ok((cfg, state))
+    } else {
+        Err(format!(
+            "hand did not terminate within {max_actions} actions"
+        ))
+    }
+}
+
+fn sample_action(la: &LegalActionSet, rng: &mut dyn RngSource) -> Option<Action> {
+    let mut candidates: Vec<Action> = Vec::with_capacity(6);
+    // PokerKit rejects fold when check is available as a redundant fold. The
+    // repo API keeps LA-003 (`fold` always legal), so cross-validation samples
+    // only the overlapping action domain.
+    if la.fold && !la.check {
+        candidates.push(Action::Fold);
+    }
+    if la.check {
+        candidates.push(Action::Check);
+    }
+    if la.call.is_some() {
+        candidates.push(Action::Call);
+    }
+    if let Some((min, max)) = la.bet_range {
+        candidates.push(Action::Bet {
+            to: sample_chip_in_range(min, max, rng),
+        });
+    }
+    if let Some((min, max)) = la.raise_range {
+        candidates.push(Action::Raise {
+            to: sample_chip_in_range(min, max, rng),
+        });
+    }
+    if la.all_in_amount.is_some() {
+        candidates.push(Action::AllIn);
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(candidates[(rng.next_u64() as usize) % candidates.len()])
+}
+
+fn sample_chip_in_range(min: ChipAmount, max: ChipAmount, rng: &mut dyn RngSource) -> ChipAmount {
+    let lo = min.as_u64();
+    let hi = max.as_u64();
+    if lo >= hi {
+        return min;
+    }
+    ChipAmount::new(lo + rng.next_u64() % (hi - lo + 1))
 }
 
 // ============================================================================
@@ -219,65 +296,106 @@ struct OursSnapshot {
     /// `final_payouts` 拷贝；A1 阶段 GameState 不会到这里。B2 起被 [`naive_payouts_match`] 读取。
     #[allow(dead_code)]
     final_payouts: Vec<(SeatId, i64)>,
+    showdown_order: Vec<SeatId>,
     /// 我方的 HandHistory（B2 起完整；A1 该字段无法构造，因此整个 snapshot 的
     /// 收集函数会先 panic — 见 [`validate_one_hand`] 的 `catch_unwind`）。
     hand_history_for_request: Option<HandHistory>,
 }
 
 fn snapshot_from_state(state: &GameState) -> OursSnapshot {
+    let history = state.hand_history().clone();
     OursSnapshot {
         final_payouts: state.payouts().unwrap_or_default(),
-        hand_history_for_request: Some(state.hand_history().clone()),
+        showdown_order: history.showdown_order.clone(),
+        hand_history_for_request: Some(history),
     }
 }
 
-/// 极简 JSON encoder：B1 只输出"足够 PokerKit B1 stub 跑通"的字段集合。
-/// B2 升级到 serde_json + 完整 schema 时直接替换本函数。
+/// JSON encoder：输出完整 hand history，让 Python/PokerKit 可独立重放。
 fn encode_request_json(cfg: &TableConfig, seed: u64, hh: &Option<HandHistory>) -> String {
-    let stacks = cfg
-        .starting_stacks
-        .iter()
-        .map(|c| c.as_u64().to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    // hh 在 A1 阶段为 None（catch_unwind 会先于此处触发 panic 路径），但保留分支以便 B2。
-    let actions_json = match hh {
-        Some(h) => format!("{{\"_count\": {}, \"_seed\": {seed}}}", h.actions.len()),
-        None => "[]".to_string(),
-    };
-    format!(
-        "{{\
-\"schema_version\":1,\
-\"n_seats\":{},\
-\"starting_stacks\":[{stacks}],\
-\"small_blind\":{},\
-\"big_blind\":{},\
-\"ante\":{},\
-\"button_seat\":{},\
-\"hole_cards\":[],\"board\":[],\
-\"actions\":{actions_json}\
-}}",
-        cfg.n_seats,
-        cfg.small_blind.as_u64(),
-        cfg.big_blind.as_u64(),
-        cfg.ante.as_u64(),
-        cfg.button_seat.0,
-    )
+    let h = hh.as_ref().expect("B2 cross-validation requires history");
+    json!({
+        "schema_version": 1,
+        "n_seats": cfg.n_seats,
+        "starting_stacks": cfg.starting_stacks.iter().map(|c| c.as_u64()).collect::<Vec<_>>(),
+        "small_blind": cfg.small_blind.as_u64(),
+        "big_blind": cfg.big_blind.as_u64(),
+        "ante": cfg.ante.as_u64(),
+        "button_seat": cfg.button_seat.0,
+        "seed": seed,
+        "hole_cards": h.hole_cards.iter().map(|hole| {
+            hole.map(|cards| vec![card_to_string(cards[0]), card_to_string(cards[1])])
+        }).collect::<Vec<_>>(),
+        "board": h.board.iter().map(|&card| card_to_string(card)).collect::<Vec<_>>(),
+        "actions": h.actions.iter().map(action_to_json).collect::<Vec<_>>(),
+        "final_payouts": h.final_payouts.iter().map(|(seat, net)| {
+            json!({"seat": seat.0, "net": net})
+        }).collect::<Vec<_>>(),
+        "showdown_order": h.showdown_order.iter().map(|seat| seat.0).collect::<Vec<_>>(),
+    })
+    .to_string()
 }
 
-fn naive_payouts_match(_ours: &OursSnapshot, _line: &str) -> bool {
-    // B1 stub。A1 阶段子进程总是 ok=false + B1Stub，被 [`validate_one_hand`] 中
-    // "B1Stub → Skipped" 分支提前拦截，本函数在 B1 永远不会被调用。
-    //
-    // 一旦 B2 把子进程升级为真实 PokerKit 翻译并开始返回 ok=true，**必须**先在
-    // 这里实现严格 serde_json 解析与 final_payouts / showdown_order 字段比对，
-    // 否则交叉验证会无声地把所有 ok=true 响应判为 Match，等于关闭 B 类 harness
-    // 的核心断言。本 panic 是防遗漏的 trip-wire。
-    panic!(
-        "naive_payouts_match is a B1 skeleton: replace with strict serde_json \
-         parsing of final_payouts / showdown_order before B2 cross-validation \
-         activates (see tests/cross_validation.rs)"
-    );
+fn action_to_json(action: &RecordedAction) -> Value {
+    let (kind, to) = match action.action {
+        Action::Fold => ("fold", 0),
+        Action::Check => ("check", 0),
+        Action::Call => ("call", action.committed_after.as_u64()),
+        Action::Bet { to } => ("bet", to.as_u64()),
+        Action::Raise { to } => ("raise", to.as_u64()),
+        Action::AllIn => unreachable!("history must normalize AllIn"),
+    };
+    json!({
+        "seq": action.seq,
+        "seat": action.seat.0,
+        "street": street_to_string(action.street),
+        "kind": kind,
+        "to": to,
+        "committed_after": action.committed_after.as_u64(),
+    })
+}
+
+fn card_to_string(card: poker::Card) -> String {
+    let ranks = [
+        "2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A",
+    ];
+    let suits = ["c", "d", "h", "s"];
+    let v = card.to_u8();
+    format!("{}{}", ranks[(v / 4) as usize], suits[(v % 4) as usize])
+}
+
+fn street_to_string(street: Street) -> &'static str {
+    match street {
+        Street::Preflop => "preflop",
+        Street::Flop => "flop",
+        Street::Turn => "turn",
+        Street::River => "river",
+        Street::Showdown => "showdown",
+    }
+}
+
+fn strict_snapshot_match(ours: &OursSnapshot, payload: &Value) -> bool {
+    parse_payouts(payload).as_deref() == Some(ours.final_payouts.as_slice())
+        && parse_showdown_order(payload).as_deref() == Some(ours.showdown_order.as_slice())
+}
+
+fn parse_payouts(payload: &Value) -> Option<Vec<(SeatId, i64)>> {
+    let arr = payload.get("final_payouts")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let seat = item.get("seat")?.as_u64()?;
+        let net = item.get("net")?.as_i64()?;
+        out.push((SeatId(u8::try_from(seat).ok()?), net));
+    }
+    out.sort_by_key(|(seat, _)| seat.0);
+    Some(out)
+}
+
+fn parse_showdown_order(payload: &Value) -> Option<Vec<SeatId>> {
+    let arr = payload.get("showdown_order")?.as_array()?;
+    arr.iter()
+        .map(|value| Some(SeatId(u8::try_from(value.as_u64()?).ok()?)))
+        .collect()
 }
 
 fn locate_python_helper() -> PathBuf {
@@ -297,8 +415,7 @@ fn locate_python_helper() -> PathBuf {
 fn cross_validation_smoke_one_hand() {
     let outcome = validate_one_hand(0);
     eprintln!("[xvalidate] seed=0 outcome={outcome:?}");
-    // A1 阶段允许的结局：OurPanic（GameState unimplemented）/ Skipped（pokerkit 缺失或 B1Stub）/ HarnessError。
-    // Diverged 在 A1 不应出现（因为我方先 panic 阻断）。
+    // Smoke 层只要求 harness 不产生规则分歧；环境缺失仍通过 100 手出口测试处理。
     let acceptable = matches!(
         outcome,
         CrossValidationOutcome::OurPanic { .. }
@@ -306,10 +423,13 @@ fn cross_validation_smoke_one_hand() {
             | CrossValidationOutcome::HarnessError { .. }
             | CrossValidationOutcome::Match
     );
-    assert!(acceptable, "B1 smoke 不应出现 Diverged：{outcome:?}");
+    assert!(
+        acceptable,
+        "cross-validation smoke 不应出现 Diverged：{outcome:?}"
+    );
 }
 
-/// 10 手 mini-batch：B1 出口标准明确"第一版只跑 10 手"。
+/// 10 手 mini-batch：基础 smoke，PokerKit 缺失时允许 skipped。
 /// 聚合到 [`CrossValidationReport`]，验证统计接口。
 #[test]
 fn cross_validation_smoke_ten_hands() {
@@ -327,5 +447,27 @@ fn cross_validation_smoke_ten_hands() {
         10,
         "10 手累加必须等于 10"
     );
-    assert_eq!(report.diverged, 0, "B1：我方未实现，不应出现 Diverged");
+    assert_eq!(report.diverged, 0, "10 手 smoke 不应出现 Diverged");
+}
+
+/// B2 出口验证：PokerKit 可用时，100 手随机牌局必须全部 match。
+#[test]
+fn cross_validation_pokerkit_100_random_hands() {
+    let mut report = CrossValidationReport::default();
+    for seed in 0..100u64 {
+        report.record(seed, validate_one_hand(seed));
+    }
+    eprintln!("[xvalidate-100] {report:?}");
+    assert_eq!(report.our_panics, 0);
+    assert_eq!(report.harness_errors, 0);
+    assert_eq!(
+        report.diverged, 0,
+        "first divergence: {:?}",
+        report.first_diverged
+    );
+    if report.skipped > 0 {
+        eprintln!("[xvalidate-100] skipped because PokerKit is unavailable");
+    } else {
+        assert_eq!(report.matches, 100);
+    }
 }

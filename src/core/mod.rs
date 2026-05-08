@@ -39,8 +39,22 @@ pub enum Rank {
 impl Rank {
     /// 从 0..=12 的 u8 值还原 Rank；超出范围返回 `None`。
     pub fn from_u8(value: u8) -> Option<Rank> {
-        let _ = value;
-        unimplemented!()
+        match value {
+            0 => Some(Rank::Two),
+            1 => Some(Rank::Three),
+            2 => Some(Rank::Four),
+            3 => Some(Rank::Five),
+            4 => Some(Rank::Six),
+            5 => Some(Rank::Seven),
+            6 => Some(Rank::Eight),
+            7 => Some(Rank::Nine),
+            8 => Some(Rank::Ten),
+            9 => Some(Rank::Jack),
+            10 => Some(Rank::Queen),
+            11 => Some(Rank::King),
+            12 => Some(Rank::Ace),
+            _ => None,
+        }
     }
 }
 
@@ -57,35 +71,37 @@ pub enum Suit {
 impl Suit {
     /// 从 0..=3 的 u8 值还原 Suit；超出范围返回 `None`。
     pub fn from_u8(value: u8) -> Option<Suit> {
-        let _ = value;
-        unimplemented!()
+        match value {
+            0 => Some(Suit::Clubs),
+            1 => Some(Suit::Diamonds),
+            2 => Some(Suit::Hearts),
+            3 => Some(Suit::Spades),
+            _ => None,
+        }
     }
 }
 
 impl Card {
     /// 构造一张牌。
     pub const fn new(rank: Rank, suit: Suit) -> Card {
-        let _ = rank;
-        let _ = suit;
-        unimplemented!()
+        Card((rank as u8) * 4 + suit as u8)
     }
 
     pub fn rank(self) -> Rank {
-        unimplemented!()
+        Rank::from_u8(self.0 / 4).expect("Card invariant: rank < 13")
     }
 
     pub fn suit(self) -> Suit {
-        unimplemented!()
+        Suit::from_u8(self.0 % 4).expect("Card invariant: suit < 4")
     }
 
     /// 0..52 的稳定数值表示。
     pub fn to_u8(self) -> u8 {
-        unimplemented!()
+        self.0
     }
 
     pub fn from_u8(value: u8) -> Option<Card> {
-        let _ = value;
-        unimplemented!()
+        (value < 52).then_some(Card(value))
     }
 }
 
@@ -106,27 +122,28 @@ impl ChipAmount {
     pub const ZERO: ChipAmount = ChipAmount(0);
 
     pub const fn new(chips: u64) -> ChipAmount {
-        let _ = chips;
-        unimplemented!()
+        ChipAmount(chips)
     }
 
     pub fn as_u64(self) -> u64 {
-        unimplemented!()
+        self.0
     }
 }
 
 impl Add for ChipAmount {
     type Output = ChipAmount;
     fn add(self, rhs: ChipAmount) -> ChipAmount {
-        let _ = rhs;
-        unimplemented!()
+        ChipAmount(
+            self.0
+                .checked_add(rhs.0)
+                .expect("ChipAmount addition overflow"),
+        )
     }
 }
 
 impl AddAssign for ChipAmount {
     fn add_assign(&mut self, rhs: ChipAmount) {
-        let _ = rhs;
-        unimplemented!()
+        *self = *self + rhs;
     }
 }
 
@@ -134,23 +151,28 @@ impl Sub for ChipAmount {
     type Output = ChipAmount;
     /// 下溢时 panic（debug 与 release 均），见 D-026b。
     fn sub(self, rhs: ChipAmount) -> ChipAmount {
-        let _ = rhs;
-        unimplemented!()
+        ChipAmount(
+            self.0
+                .checked_sub(rhs.0)
+                .expect("ChipAmount subtraction underflow"),
+        )
     }
 }
 
 impl SubAssign for ChipAmount {
     fn sub_assign(&mut self, rhs: ChipAmount) {
-        let _ = rhs;
-        unimplemented!()
+        *self = *self - rhs;
     }
 }
 
 impl Mul<u64> for ChipAmount {
     type Output = ChipAmount;
     fn mul(self, rhs: u64) -> ChipAmount {
-        let _ = rhs;
-        unimplemented!()
+        ChipAmount(
+            self.0
+                .checked_mul(rhs)
+                .expect("ChipAmount multiplication overflow"),
+        )
     }
 }
 
@@ -187,10 +209,10 @@ pub enum Position {
 /// 按钮轮转（D-032）、盲注推导（D-022b / D-032）、odd chip 分配（D-039）、
 /// showdown 顺序（D-037）中"向左" / "按钮左侧" 均按此理解。
 ///
-/// **D-039 corner case（BTN 是获胜者）**：odd chip 分配的环绕计数从
-/// `BTN+1`（按 D-029 即按钮左 1）起，**BTN 不优先**获得余 chip；仅当所有
-/// 非 BTN 的获胜座位都已分到、最终环绕回到 BTN 时才落到 BTN。该约定与
-/// PokerKit 等开源参考实现一致。
+/// **D-039-rev1 corner case（BTN 是获胜者）**：odd chip 分配的环绕计数从
+/// `BTN+1`（按 D-029 即按钮左 1）起，**BTN 不优先**获得余 chip；仅当按钮
+/// 左侧顺序中没有其他获胜座位、最终环绕回到 BTN 时，该 pot 的全部余数才
+/// 落到 BTN。该约定与 PokerKit 默认 chips-pushing 语义一致。
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct SeatId(pub u8);
 

@@ -5,6 +5,9 @@
 //! RngSource → deck 发牌协议严格定义，testers 可基于此构造 stacked rng
 //! 来产生指定牌序，无需依赖实现内部细节。
 
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng as RandChaCha20Rng;
+
 /// 显式注入的随机源。所有用到随机数的地方都必须接受 `&mut dyn RngSource`，
 /// 禁止使用全局 rng。
 ///
@@ -20,21 +23,22 @@ pub trait RngSource: Send {
 /// （ChaCha20 算法保证）。禁止使用 `OsRng` / `thread_rng()` 等系统熵源
 /// 进入规则引擎或评估器。
 pub struct ChaCha20Rng {
-    /// 内部状态由 B2 阶段填入（接 `rand_chacha::ChaCha20Rng`）。
-    /// 当前为占位以保持 `pub` API 不可外部构造。
-    _placeholder: (),
+    inner: RandChaCha20Rng,
 }
 
 impl ChaCha20Rng {
     pub fn from_seed(seed: u64) -> Self {
-        let _ = seed;
-        unimplemented!()
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        ChaCha20Rng {
+            inner: RandChaCha20Rng::from_seed(bytes),
+        }
     }
 }
 
 impl RngSource for ChaCha20Rng {
     fn next_u64(&mut self) -> u64 {
-        unimplemented!()
+        self.inner.next_u64()
     }
 }
 
@@ -51,6 +55,6 @@ impl<R: rand::RngCore + Send> RngCoreAdapter<R> {
 
 impl<R: rand::RngCore + Send> RngSource for RngCoreAdapter<R> {
     fn next_u64(&mut self) -> u64 {
-        unimplemented!()
+        self.0.next_u64()
     }
 }
