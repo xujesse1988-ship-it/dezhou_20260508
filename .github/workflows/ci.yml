@@ -49,10 +49,51 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
-      # 阶段 1 大量方法是 unimplemented!()，cargo test 会 panic；用 --no-run 仅
-      # 编译以保证 tests/ 下的类型断言（tests/api_signatures.rs）和未来 B1
-      # scenario 的 spec 漂移在编译期被截获。
+      # D1 起：cargo test 已加入 test job 实跑。本 job 保留为编译期快速失败截断
+      # （tests/api_signatures.rs spec-drift trip-wire 在更便宜的 stage 触发）。
       - run: cargo test --no-run
+
+  test:
+    name: cargo test (default + PokerKit if available)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: install pokerkit
+        run: pip install "pokerkit==0.4.14"
+      - name: cargo test (default suite)
+        # 默认套件含 100 手 cross_validation + 1k 手 cross_eval；PokerKit 缺失
+        # 时自 skip，CI 必装以激活两条交叉验证。
+        run: cargo test
+
+  fuzz-quick:
+    name: cargo fuzz random_play 5min
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz"
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz random_play 5 minutes
+        # workflow §D1 §输出 第 5 条：每次 push 跑 100k 手 fuzz 5 分钟内。
+        # libFuzzer 的 -max_total_time=300 给 5 分钟硬上限；机器实测 100k+ 执行
+        # 数完全可达（B2 10k 手 ~5s debug → 1 核 5 分钟可跑 ~600k）。
+        run: cargo +nightly fuzz run random_play -- -max_total_time=300
+      - name: fuzz history_decode 5 minutes
+        run: cargo +nightly fuzz run history_decode -- -max_total_time=300
+      - name: upload fuzz artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
 
   doc:
     name: cargo doc -D warnings

@@ -471,3 +471,48 @@ fn cross_validation_pokerkit_100_random_hands() {
         assert_eq!(report.matches, 100);
     }
 }
+
+/// D-085 / validation §7 / C2 carve-out 闭合：规则与 PokerKit 100,000 手 0 分歧
+/// 是 C2 最终通过门槛。C-rev1 把测试代码本身留给 D1 [测试] agent 加，本测试即此
+/// 实现。运行成本：每手 ~0.4s（python3 子进程 spawn 主导），单进程串行 100k 手
+/// 估算 10–11 小时；建议在 release profile + self-hosted runner 或开发机本地
+/// 跑一次即可。运行脚本见 `scripts/run-cross-validation-100k.sh`，会用 chunk
+/// 并行多个 cargo 进程把墙上时钟降到 ~2 小时。
+///
+/// `cargo test --release -- --ignored` 单独触发该测试需在 PATH 含 PokerKit
+/// 0.4.14 / Python ≥3.11 的环境。PokerKit 缺失时 `Skipped > 0` → 测试 fail
+/// （与 `cross_eval_full_100k` 同语义；C2 通过门槛不允许在 CI 静默 skip）。
+#[test]
+#[ignore = "D1 full-volume — needs PokerKit; run with scripts/run-cross-validation-100k.sh"]
+fn cross_validation_pokerkit_100k_random_hands() {
+    let total: u64 = std::env::var("XV_TOTAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let chunk_offset: u64 = std::env::var("XV_OFFSET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let mut report = CrossValidationReport::default();
+    for i in 0..total {
+        let seed = chunk_offset.wrapping_add(i);
+        report.record(seed, validate_one_hand(seed));
+        if (i + 1) % 1_000 == 0 {
+            eprintln!("[xvalidate-100k] progress {}/{}", i + 1, total);
+        }
+    }
+    eprintln!("[xvalidate-100k] final {report:?}");
+    assert_eq!(report.our_panics, 0);
+    assert_eq!(report.harness_errors, 0);
+    assert_eq!(
+        report.diverged, 0,
+        "first divergence: {:?}",
+        report.first_diverged
+    );
+    assert_eq!(
+        report.skipped, 0,
+        "PokerKit unavailable — 100k 测试不允许 skipped（D-085 通过门槛）"
+    );
+    assert_eq!(report.matches as u64, total);
+}

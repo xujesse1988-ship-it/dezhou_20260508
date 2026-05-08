@@ -1,0 +1,51 @@
+[package]
+name = "poker-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# D1：cargo-fuzz 子 crate（D-002 / workflow §D1 §输出 第 2 条）。
+#
+# 使用：
+#   rustup install nightly
+#   cargo +nightly install cargo-fuzz
+#   cargo +nightly fuzz run random_play -- -max_total_time=300
+#
+# CI 短任务：max_total_time=300 (5 分钟)；夜间任务：86400 (24h, self-hosted runner)。
+# Workflow §D1 §输出 第 5 条：每次 push 跑 100k 手 fuzz 5 分钟内 — 由 CI fuzz-quick
+# job 触发本 crate 的 random_play target。
+#
+# 角色边界：本 crate 属 [测试] agent；任何在 fuzz 中暴露的 panic / invariant 违反
+# 由 [测试] agent 列入 issue 移交 [实现] (D2) 修复。
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+poker = { path = ".." }
+prost = "0.13"
+
+# 父 crate workspace 默认会把 fuzz/ 当成独立 crate；此处显式禁用 workspace
+# 避免 cargo-fuzz 与父 crate 共享 lockfile 时的解析歧义（cargo-fuzz 标准做法）。
+[workspace]
+
+[profile.release]
+debug = 1
+codegen-units = 1
+overflow-checks = true
+
+[[bin]]
+name = "random_play"
+path = "fuzz_targets/random_play.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "history_decode"
+path = "fuzz_targets/history_decode.rs"
+test = false
+doc = false
+bench = false

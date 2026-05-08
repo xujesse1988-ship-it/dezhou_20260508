@@ -214,11 +214,23 @@ pub struct Invariants;
 
 impl Invariants {
     /// 全套检查。失败时返回第一个违反的不变量编号 + 描述。
+    ///
+    /// **D1 审计（2026-05-08，validation §1 七条覆盖）**：
+    ///
+    /// - 「筹码总和守恒」 → I-001 ✓
+    /// - 「无负筹码」 → 由 ChipAmount = u64 + Sub panic-on-underflow（D-026b）类型层面保证 ✓
+    /// - 「无重复牌」 → I-003 ✓
+    /// - 「pot 金额不守恒」 → pot_equals_sum_committed_total ✓
+    /// - 「未 fold 且未 all-in 的玩家投入额相同（round end）」 → I-004 ✓
+    /// - 「无人获胜」 → I-005 ✓（D1 新增）
+    /// - 「short all-in / min-raise / 跳轮 / showdown 顺序」 → 产品代码 apply() 路径
+    ///   保证；fuzz 通过 no-panic + 筹码守恒间接发现违反；专项断言在 scenario 测试侧。
     pub fn check_all(state: &GameState, expected_starting_total: u64) -> Result<(), String> {
         Self::i001_chip_conservation(state, expected_starting_total)?;
         Self::i003_no_duplicate_cards(state)?;
         Self::i004_round_end_committed_equality(state)?;
         Self::pot_equals_sum_committed_total(state)?;
+        Self::i005_terminal_payouts_well_formed(state)?;
         Self::la_invariants(state)?;
         Ok(())
     }
@@ -315,6 +327,38 @@ impl Invariants {
         if pot != sum {
             return Err(format!(
                 "pot/committed mismatch: pot={pot} != sum(committed_total)={sum}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// I-005：终局 payouts 合式（D1 新增；validation §1 「无人获胜」覆盖）。
+    ///
+    /// `is_terminal && payouts().is_some()` 时：
+    ///
+    /// 1. payouts 非空（每个 seat 都应在结果里）。
+    /// 2. 净额之和为 0（API 自洽：payouts 报的 net = award - committed，整桌
+    ///    award 必等 committed 总和才能保 chip conservation）。
+    ///
+    /// 非终局或 `payouts() == None` 时直接 Ok（非可观察时段）。
+    ///
+    /// **不查「必须有正 net 赢家」**：N 路 board-play 完美平局（每人投入相同 →
+    /// 每人 net = 0）合法，加该断言会误报 ~0.16% 随机牌局（实测 fuzz 10k 中 16
+    /// 例）。该「无人获胜」语义已由 I-001 + compute_payouts 数学约束覆盖。
+    pub fn i005_terminal_payouts_well_formed(state: &GameState) -> Result<(), String> {
+        if !state.is_terminal() {
+            return Ok(());
+        }
+        let Some(payouts) = state.payouts() else {
+            return Ok(());
+        };
+        if payouts.is_empty() {
+            return Err("I-005 violated: terminal but payouts empty".into());
+        }
+        let net_sum: i64 = payouts.iter().map(|(_, n)| *n).sum();
+        if net_sum != 0 {
+            return Err(format!(
+                "I-005 violated: payouts net sum = {net_sum} != 0 (chip conservation broken)"
             ));
         }
         Ok(())

@@ -199,6 +199,77 @@ fn different_seeds_produce_different_hashes() {
 // D. proto bytes 字节稳定（PB-003）— 同 seed 多次 to_proto 必字节相同
 // ============================================================================
 
+// ============================================================================
+// E. D1 出口：1M 手单线程 vs 多线程哈希一致（validation §6 / D-051）
+// ============================================================================
+
+/// D1 full-volume：1,000,000 个 seed 的 content_hash 在单线程 vs 8 线程下完全
+/// 一致。每个 seed 独立产出的 hand history 必须与单线程下完全相同；整批结果
+/// 只允许在 seed 顺序上不同，不允许在内容上不同（validation.md §6 line 4）。
+///
+/// 必须 release profile + `--ignored` 触发；debug 下耗时不可接受。
+#[test]
+#[ignore = "D1 full-volume — opt-in via cargo test --release -- --ignored"]
+fn determinism_full_1m_hands_multithread_match() {
+    const TOTAL: u64 = 1_000_000;
+    const THREADS: usize = 8;
+
+    // 单线程基线
+    let mut single: HashMap<u64, [u8; 32]> = HashMap::with_capacity(TOTAL as usize);
+    for s in 0..TOTAL {
+        let h = play_random_hand(s).unwrap_or_else(|e| panic!("st seed={s}: {e}"));
+        single.insert(s, h.content_hash());
+    }
+
+    // 8 线程并行：seed 区间均分，避免锁争用
+    let chunk = TOTAL.div_ceil(THREADS as u64);
+    let mut handles = Vec::with_capacity(THREADS);
+    for i in 0..THREADS {
+        let lo = (i as u64) * chunk;
+        let hi = ((i as u64 + 1) * chunk).min(TOTAL);
+        handles.push(thread::spawn(move || {
+            let mut local: HashMap<u64, [u8; 32]> = HashMap::with_capacity((hi - lo) as usize);
+            for s in lo..hi {
+                let h = play_random_hand(s).unwrap_or_else(|e| panic!("mt seed={s}: {e}"));
+                local.insert(s, h.content_hash());
+            }
+            local
+        }));
+    }
+    let mut multi: HashMap<u64, [u8; 32]> = HashMap::with_capacity(TOTAL as usize);
+    for h in handles {
+        let part = h.join().expect("thread panicked");
+        for (k, v) in part {
+            multi.insert(k, v);
+        }
+    }
+
+    eprintln!(
+        "[determinism-1m] single={} multi={}",
+        single.len(),
+        multi.len()
+    );
+    assert_eq!(single.len() as u64, TOTAL);
+    assert_eq!(multi.len() as u64, TOTAL);
+
+    let mut diverged = Vec::new();
+    for (seed, st_hash) in &single {
+        let mt_hash = multi.get(seed).expect("missing seed in mt");
+        if st_hash != mt_hash {
+            diverged.push(*seed);
+            if diverged.len() >= 5 {
+                break;
+            }
+        }
+    }
+    assert!(
+        diverged.is_empty(),
+        "{} seeds diverge between single/multi (first up to 5: {:?})",
+        diverged.len(),
+        diverged
+    );
+}
+
 #[test]
 fn proto_bytes_byte_stable_under_repeated_serialization() {
     // 单一 hand 多次 to_proto() 必产出相同字节流。

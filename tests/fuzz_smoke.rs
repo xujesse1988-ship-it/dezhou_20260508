@@ -277,6 +277,28 @@ fn fuzz_b2_10000_hands_no_invariant_violations() {
     assert_eq!(report.hands_panicked, 0);
 }
 
+/// D1 出口验证：随机动作 fuzz 1,000,000 手，每手每步无 invariant 违反。
+///
+/// 必须 `cargo test --release -- --ignored`；debug profile 下耗时不可接受。
+/// validation.md §1 / workflow §D1 §输出 第 1 条。
+#[test]
+#[ignore = "D1 full-volume — opt-in via cargo test --release -- --ignored"]
+fn fuzz_d1_full_1m_hands_no_invariant_violations() {
+    let mut report = FuzzReport::default();
+    for seed in 0..1_000_000u64 {
+        report.record(run_one_hand(seed, 256));
+    }
+    eprintln!("[fuzz-d1-1m] {:?}", report);
+    assert_eq!(report.hands_attempted, 1_000_000);
+    assert_eq!(
+        report.hands_clean, 1_000_000,
+        "D1 fuzz failed: {:?}",
+        report.first_failure
+    );
+    assert_eq!(report.hands_failed_invariant, 0);
+    assert_eq!(report.hands_panicked, 0);
+}
+
 // ============================================================================
 // 入口占位：D1 升级到 cargo fuzz target / 1M 手
 // ============================================================================

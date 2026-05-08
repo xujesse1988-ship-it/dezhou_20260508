@@ -1,0 +1,53 @@
+name: Nightly fuzz (24h)
+
+# D1 §输出 第 4 条：24 小时夜间 fuzz 任务。
+#
+# 运行环境：**self-hosted runner**（GitHub-hosted runner 单 job 6h 上限不够 24h）。
+# 用户在自己的服务器上 register 一个 self-hosted runner，打 label `linux`、`x64`、
+# `fuzz`；本 workflow 会调度到它。
+#
+# Self-hosted runner 一次性配置（Linux）：
+#   1. GitHub repo Settings → Actions → Runners → New self-hosted runner
+#   2. 按页面提示在目标机器上跑 ./config.sh / ./run.sh，labels 填
+#      `self-hosted,linux,x64,fuzz`。
+#   3. 在该机器上预装 nightly toolchain：
+#        rustup install nightly
+#        cargo +nightly install cargo-fuzz --locked
+#   4. 该机器需有持续上电 + 网络稳定（24h 任务）。
+#
+# 触发：每天 02:00 UTC 自动跑一次；也支持手动 dispatch。
+# 单次 24h 总时长（86400 秒）跨 random_play / history_decode 两个 target 各 12h。
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz-24h:
+    runs-on: [self-hosted, linux, x64, fuzz]
+    timeout-minutes: 1500  # 25h，留余量给 setup / teardown
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ensure nightly toolchain present
+        run: |
+          rustup show
+          cargo +nightly --version
+          cargo +nightly fuzz --version || cargo +nightly install cargo-fuzz --locked
+
+      - name: fuzz random_play (12h)
+        run: cargo +nightly fuzz run random_play -- -max_total_time=43200
+
+      - name: fuzz history_decode (12h)
+        run: cargo +nightly fuzz run history_decode -- -max_total_time=43200
+
+      - name: upload fuzz artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-fuzz-artifacts
+          path: |
+            fuzz/artifacts/
+            fuzz/corpus/
+          if-no-files-found: ignore
