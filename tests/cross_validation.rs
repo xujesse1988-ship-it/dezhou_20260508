@@ -69,6 +69,7 @@ impl CrossValidationReport {
         match outcome {
             CrossValidationOutcome::Match => self.matches += 1,
             CrossValidationOutcome::Diverged { reason } => {
+                eprintln!("[xvalidate] DIVERGED seed={seed} | {reason}");
                 self.diverged += 1;
                 if self.first_diverged.is_none() {
                     self.first_diverged = Some((seed, reason));
