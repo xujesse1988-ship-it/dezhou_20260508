@@ -266,9 +266,18 @@ fn encode_request_json(cfg: &TableConfig, seed: u64, hh: &Option<HandHistory>) -
 }
 
 fn naive_payouts_match(_ours: &OursSnapshot, _line: &str) -> bool {
-    // B1 stub 路径已在调用方提前 return 为 Skipped；走到这里意味着子进程
-    // 报告了 ok=true 但我们还没实现严格解析 → 视为占位 Match（不阻塞 B1 出口）。
-    true
+    // B1 stub。A1 阶段子进程总是 ok=false + B1Stub，被 [`validate_one_hand`] 中
+    // "B1Stub → Skipped" 分支提前拦截，本函数在 B1 永远不会被调用。
+    //
+    // 一旦 B2 把子进程升级为真实 PokerKit 翻译并开始返回 ok=true，**必须**先在
+    // 这里实现严格 serde_json 解析与 final_payouts / showdown_order 字段比对，
+    // 否则交叉验证会无声地把所有 ok=true 响应判为 Match，等于关闭 B 类 harness
+    // 的核心断言。本 panic 是防遗漏的 trip-wire。
+    panic!(
+        "naive_payouts_match is a B1 skeleton: replace with strict serde_json \
+         parsing of final_payouts / showdown_order before B2 cross-validation \
+         activates (see tests/cross_validation.rs)"
+    );
 }
 
 fn locate_python_helper() -> PathBuf {

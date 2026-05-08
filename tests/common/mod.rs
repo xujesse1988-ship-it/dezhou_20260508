@@ -266,6 +266,14 @@ impl Invariants {
     /// `committed_this_round` 相等。注意：街内的中间状态不需满足。
     /// 检查触发条件：当前 `street == Showdown` 或 `is_terminal == true`，
     /// 或 `current_player == None` 但仍有未行动玩家（all-in 跳轮场景）。
+    ///
+    /// `current_player.is_none()` 是 round end 的代理，会同时覆盖两条路径：
+    ///
+    /// 1. **正常 round 结束**：本街所有 active 玩家投入相等 → 实际可比；
+    ///    actives.len() ≥ 2，进入字段相等性检查。
+    /// 2. **D-036 跳轮**：除 ≤ 1 名 active 外全员 all-in → actives.len() < 2，
+    ///    本不变量在该状态下不可观察（all-in 玩家投入未必等于 active 玩家），
+    ///    通过 `actives.len() < 2 → Ok` 短路放行，不误报。
     pub fn i004_round_end_committed_equality(state: &GameState) -> Result<(), String> {
         // 仅在 round end 时刻可观察：使用 current_player == None 作为代理
         // （round end 才会出现 None，街内每步都有当前行动者）。
@@ -278,6 +286,7 @@ impl Invariants {
             .filter(|p| p.status == PlayerStatus::Active)
             .collect();
         if actives.len() < 2 {
+            // D-036 跳轮 / 终局，不可观察；上方 doc 解释短路理由。
             return Ok(());
         }
         let first = actives[0].committed_this_round;

@@ -221,12 +221,18 @@ fn short_allin_does_not_reopen_raise() {
 // 4. min_raise_chain_after_short_allin (D-035)
 // ============================================================================
 //
-// 与 #3 同结构：SB raise to 300（差额 200），BB short AllIn 450（差额 150）。
-// 然后 BTN 选 Call（被允许），SB 进入下一动作时如果选 Raise，min raise 链条
-// 应保留为 200（不是 150 — D-033 incomplete raise 不更新链条上限）。
+// 与 #3 同结构：SB raise to 300（差额 200，full raise，更新链条上限），
+// BB short AllIn 450（差额 150，incomplete — D-033 不更新链条）。
+// 然后 BTN 选 Call 跟到 450，SB 回到行动权。如果 SB 选 Raise，按 D-035：
 //
-// 这里我们让 BTN call 后 SB 回到行动权，断言 SB.legal_actions.raise_range.0
-// >= SB 当前 committed + 200（即 to >= 500）。
+//   - max_committed_this_round（SB 行动前）= 450（BB 推升，即使是 incomplete）
+//   - last_full_raise_size = 200（SB 上次自己 from-100-to-300 那次有效 raise）
+//   - 新 raise 的差额 = `to - max_committed_this_round_before` 必须 ≥ 200
+//   - ⇒ min legal `to` = 450 + 200 = 650
+//
+// 注意：NLHE 协议下"加注差额"定义在桌面 max_committed 之上，**不在自己 committed
+// 之上**。把链条算成"SB committed 300 + 200 = 500"是常见误读 —— 那意味着差额
+// 仅 50 chips（500 - 450），远低于 last_full_raise = 200，不构成合法 raise。
 #[test]
 fn min_raise_chain_after_short_allin() {
     let mut cfg = TableConfig::default_6max_100bb();
@@ -249,18 +255,19 @@ fn min_raise_chain_after_short_allin() {
     );
 
     // SB 现在面临 BTN 的 call 与 BB 的 incomplete raise，需要补 call 到 450（差 150）
-    // 或选择 raise；如果 raise，min_to 必须基于 SB 上轮的有效加注差额 200。
+    // 或选择 raise；如果 raise，min_to 必须基于本轮 max_committed=450 + last_full_raise=200。
     assert_eq!(s.current_player(), Some(seat(1)));
     let la = s.legal_actions();
     let (min_to, _max_to) = la
         .raise_range
         .expect("SB 面对未匹配 incomplete raise，应仍可 raise");
-    // SB 本街已 committed 300；min raise 差额 = 200（链条最大有效 raise 差额）。
-    // 下界 to = max(已被加注上限 450, SB committed 300 + 200) = 500（取较大者；D-035）。
+    // D-035：min raise to = max_committed_this_round(450) + last_full_raise_size(200) = 650.
+    // BB 的 incomplete all-in 推升 max_committed_this_round 到 450，但**不更新**
+    // last_full_raise（D-033）—— 链条上限保持 200。
     assert_eq!(
         min_to,
-        chips(500),
-        "D-035：min raise 应保留为有效链条 200（=SB 上次差额），实际 min_to = {min_to:?}"
+        chips(650),
+        "D-035：min raise to = max_committed(450) + last_full_raise(200) = 650，实际 min_to = {min_to:?}"
     );
 }
 
@@ -290,7 +297,11 @@ fn min_raise_chain_after_short_allin() {
 #[test]
 fn two_way_side_pot_basic() {
     let mut cfg = TableConfig::default_6max_100bb();
+    // 三家 starting stacks 必须显式设定到注释推导值；否则 BTN/BB 仍是 default 10000，
+    // all-in 后 side pot 大小变成 19000 而非 1000，下方 net 断言全部偏离。
+    cfg.starting_stacks[0] = chips(1000); // BTN
     cfg.starting_stacks[1] = chips(500); // SB short
+    cfg.starting_stacks[2] = chips(1000); // BB
     let total = expected_total_chips(&cfg);
 
     // 构造 deck：发牌起点 = 按钮左 1 = SB(1)。D-028 顺序：
