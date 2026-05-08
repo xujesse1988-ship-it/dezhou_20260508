@@ -29,7 +29,10 @@ C2 出口数据（截至本仓库 commit；PATH 含 `.venv-pokerkit`/`python3.11
     - `eval_5_6_7_consistency_full` / `eval_antisymmetry_stability_full` / `eval_transitivity_full`（1M naive evaluator 三件套）：合计 46.69s 全绿。注意此 1M 不等于 validation.md §4 的「评估器 vs PokerKit 1M」（E2 aspirational），它们是 naive evaluator 自洽性 / 反对称 / 传递，不涉及参考实现。
 - `cargo fmt --all --check` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。
 
-**唯一 C2 出口 carve-out**：D-085 / validation.md §7 要求「规则与 PokerKit 100,000 手 0 分歧」，但当前测试基础设施仅有 100 手规模（`cross_validation_pokerkit_100_random_hands`），无 `#[ignore]` 100k 变体——C1 没扩规模。按 workflow §修订历史 §B-rev1 §3「`tests/cross_validation.rs` 的扩展由 [测试] agent 负责」 的边界政策，C2 不顺手补测试，此 100→100k 测试由后续 [测试] agent（D1 前置或专门 follow-up）补齐。当前 100 手 0 分歧 + 100k HandCategory 0 分歧作为 cross-validation 部分证据；详见 `docs/pluribus_stage1_workflow.md` §修订历史 C-rev1。
+**唯一 C2 出口 carve-out**：D-085 / validation.md §7 要求「规则与 PokerKit 100,000 手 0 分歧」。
+
+- **测试侧**：C2 闭合时仅有 100 手规模（`cross_validation_pokerkit_100_random_hands`），按 workflow §B-rev1 §3 的边界政策回退给 [测试] agent。D1 [测试] 在 commit `bc75598` 加了 `cross_validation_pokerkit_100k_random_hands` `#[ignore]` + `scripts/run-cross-validation-100k.sh`（N chunk 并行）。**测试缺位部分已闭合**。
+- **0 分歧门槛**：2026-05-08 第一次实跑（commit `2ea667b`，N=8 × 12,500 hand）暴露 **105 条产品代码分歧**（matches=99,895 / 100,000）。形态高度同质：A 桶 10 条仅 `showdown_order` 顺序错（payouts 全等）；B-2way 28 条 `{−1,+1}` payout 差；B-3way 67 条 `{−1,−1,+2}` payout 差。全部满足 chip-conservation。完整 seed 表 + 复现命令入账于 `docs/xvalidate_100k_diverged_seeds.md`，解析脚本 `tools/xvalidate_diverged_summary.py`。**0 分歧门槛仍开**，由 [实现] follow-up（自然落点是 D2 的 bug 修复批）闭合。详见 `docs/pluribus_stage1_workflow.md` §修订历史 C-rev1 / C-rev2。
 
 Build/test/lint commands are valid as of C2 closure:
 
@@ -54,7 +57,7 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test --release -- --ignored  # full-volume
 
 `.venv-pokerkit/` 已在 `.gitignore` 中 ignore。
 
-Step **D1** (`[测试]` agent — fuzz 完整版 + 多线程测试) is next. 其前置工作里包含一笔 C2 留下的 carve-out：在 `tests/cross_validation.rs` 加 `#[ignore]` 100k variant（D-085 规则引擎侧 C2 通过门槛），见 §C2 出口数据 carve-out 与 workflow §修订历史 C-rev1。Stages 2–8 source code does not exist yet.
+Step **D1** (`[测试]` agent — fuzz 完整版 + 多线程测试) **is in progress**：commits `bc75598..2ea667b` 落地 1M fuzz / 多线程 1M / cargo-fuzz 子 crate / cross-arch baseline / CI fuzz-quick / nightly fuzz / C-rev1 carve-out 测试 + per-divergence eprintln。100k cross-validation 实跑结果（105 条分歧）已入账于 `docs/xvalidate_100k_diverged_seeds.md`，作为 D2 [实现] 修 bug 批的输入；该批与 D1 fuzz 暴露的 bug 合并修复。详见 workflow §修订历史 C-rev2。Stages 2–8 source code does not exist yet.
 
 ## Documents and their authority
 
@@ -79,7 +82,7 @@ Stage 1 work is organized as `A → B → C → D → E → F` (13 steps, see `d
 - `[实现]` agent writes product code only. **Never modify tests.** If a test fails, fix the product code; only edit the test if it has an obvious bug, and only after review.
 - `[决策]` and `[报告]` produce or modify docs in `docs/`.
 
-When the user asks you to do stage-1 work, identify which step (A0 / A1 / B1 / …) the task belongs to and operate within that role. The current step is the highest-numbered step whose outputs already exist in the repo — currently **C2 done**（C2 0 产品代码改动闭合：default 61/61 + 6 ignored full-volume + lint 全绿；详见 §C2 出口数据 与 workflow §修订历史 C-rev1）；**D1 has not started**。历史关键边界事件：(1) B2 closure crossed the [实现]→[测试] boundary by completing two test files that B1 had deliberately left as stubs (cross_validation strict comparator + 10k-hand fuzz exit test) — see workflow §修订历史 B-rev1; (2) C2 closure carved out 「规则引擎 100k cross-validation 测试」 留给 [测试] agent，C2 不顺手补 — see workflow §修订历史 C-rev1.
+When the user asks you to do stage-1 work, identify which step (A0 / A1 / B1 / …) the task belongs to and operate within that role. The current step is **D1 [测试] in progress**：C2 已 0 产品代码改动闭合（default 61/61 + 6 ignored full-volume + lint 全绿；workflow §C-rev1）；D1 [测试] 在 commits `bc75598..2ea667b` 落地 1M fuzz / 多线程 / cargo-fuzz / cross-arch / CI / 100k cross-validation 测试 + 实跑（详见 §C2 出口数据 carve-out 与 workflow §C-rev2）。历史关键边界事件：(1) B2 closure crossed the [实现]→[测试] boundary by completing two test files that B1 had deliberately left as stubs (cross_validation strict comparator + 10k-hand fuzz exit test) — see workflow §修订历史 B-rev1; (2) C2 closure carved out 「规则引擎 100k cross-validation 测试」 留给 [测试] agent，C2 不顺手补 — see workflow §修订历史 C-rev1; (3) D1 [测试] 实跑 100k cross-validation 暴露 105 条产品代码分歧，入账于 `docs/xvalidate_100k_diverged_seeds.md`，待 D2 [实现] 与 fuzz 暴露 bug 合并修复 — see workflow §修订历史 C-rev2.
 
 ## Non-negotiable invariants (apply to all stage-1 code)
 

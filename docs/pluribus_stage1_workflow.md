@@ -553,4 +553,25 @@ C2 §输出 列出的 5 条产品代码任务（odd chip / uncalled bet / 跨语
 
 **与 §B-rev1 的关系**：B-rev1 是越界后的事后追认；C-rev1 是无越界的常规闭合。两者共用 §4 同步责任，但触发条件相反。
 
+### C-rev2（2026-05-08）：100k cross-validation carve-out 测试落地 + 实跑暴露 105 条规则引擎分歧
+
+C-rev1 carve-out 把「规则与 PokerKit 100,000 手 0 分歧」的测试缺位留给 D1 [测试] agent。D1 [测试] 在 commit `bc75598` 加了 `cross_validation_pokerkit_100k_random_hands` `#[ignore]` + `scripts/run-cross-validation-100k.sh`（N chunk 并行降墙上时钟）。本节记录第一次实跑结果及 carve-out 当前状态。
+
+**实跑数据**（2026-05-08；commit `2ea667b` 加 per-divergence eprintln 重跑；N=8 × 12,500 hand；PokerKit 0.4.14 / Python 3.11）：
+
+- matches = 99,895 / 100,000；diverged = **105**；our_panics = 0；harness_errors = 0；skipped = 0。
+- 105 条分歧形态高度同质，互斥分三桶：
+    - **A — showdown_order only（10 条）**：payouts 完全相同，仅 `HandHistory.showdown_order` 是两人 swap。
+    - **B-2way（28 条）**：payouts 差额 multiset `{−1, +1}` — 2 人 split pot 的 odd-chip 偏置错配（D-039-rev1 路径）。
+    - **B-3way（67 条）**：payouts 差额 multiset `{−1, −1, +2}` — 3 人 split pot 时多个 side pot 的余 chip 全堆同一座位，PokerKit 累积策略不同。
+- 全部 95 条 B-类满足 chip-conservation（deltas sum=0）；A 与 B 互斥（B 无 showdown_order 差异，A 100% 仅 showdown_order 差异）。
+
+完整 105 条 seed + delta 表入账于 [`docs/xvalidate_100k_diverged_seeds.md`](xvalidate_100k_diverged_seeds.md)。解析脚本 `tools/xvalidate_diverged_summary.py` 从 `target/xvalidate-100k/chunk-*.log` 重新生成该文档；后续重跑用 `python3 tools/xvalidate_diverged_summary.py > docs/xvalidate_100k_diverged_seeds.md` 刷新。
+
+**carve-out 状态**：测试代码侧已闭合（`#[ignore]` 100k 变体存在并能跑）；**0-分歧验收门槛仍开** — 105 条分歧暴露的是产品代码 bug，由 [实现] follow-up（最自然落点是 D2 的 bug 修复批，与 fuzz 暴露的 bug 合并修）负责。本 [测试] 步骤的产出止于诊断文档，不修产品代码。
+
+**[实现] follow-up 入口**：`docs/xvalidate_100k_diverged_seeds.md` §后续 列了三桶各自的最早 minimal-repro seed（A: 1786 / B-2way: 2980 / B-3way: 14204）+ 验收命令。修完后 `N=8 ./scripts/run-cross-validation-100k.sh` 跑出 0 diverged 即关闭 D-085 / validation §7 规则引擎侧 100k 通过门槛，此 carve-out 完全闭合。
+
+**与 §C-rev1 的关系**：C-rev1 描述的 carve-out 是「测试不存在」；C-rev2 描述的是「测试存在但断言不通过」。两者是同一 carve-out 的两个阶段，C-rev2 是 C-rev1 的延续。
+
 **与 validation.md 2026-05-08 的关系**：本节出口数据中 1M 三件套全绿与 validation.md §4 「评估器交叉验证 1M 手为 E2 aspirational」 不矛盾——后者特指「评估器 vs PokerKit 1M 手 rank 一致」需要 E2 的高性能 evaluator + 完整 5-best 名次接口；本节 1M 三件套是「naive evaluator 自洽性 + 反对称 + 传递」三个内部不变量，不涉及参考实现，所以 naive 下也跑得动。
