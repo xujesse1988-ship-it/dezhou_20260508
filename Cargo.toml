@@ -13,6 +13,11 @@ publish = false
 rand = "0.8"
 thiserror = "1.0"
 
+# B1 测试 / harness 专用依赖。仅 tests/ 与 benches/ 引用，不进入产品二进制。
+[dev-dependencies]
+# 阶段 1 §B1 / E1 benchmark harness。`harness = false` 见下方 [[bench]]。
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
 # 本地 cargo clippy / rustdoc 与 CI -D warnings 等级对齐（A1 评审 P1）。
 [lints.rust]
 # 阶段 1 整路径禁用 unsafe（D-026 / D-027 防御）。
@@ -21,3 +26,8 @@ unsafe_code = "forbid"
 [lints.rustdoc]
 # rustdoc intra-doc link 漂移直接 reject，避免 cargo doc 静默吞掉断链。
 broken_intra_doc_links = "deny"
+
+# B1 占位 benchmark：评估器单次调用 + 单手模拟。E1 才接入 SLO 断言。
+[[bench]]
+name = "baseline"
+harness = false
