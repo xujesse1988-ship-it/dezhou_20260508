@@ -336,10 +336,14 @@ impl GameState {
         }
         self.move_chips_to(idx, to)?;
         if to >= self.config.big_blind {
+            // Full bet: open raise option for un-acted players, close own.
             self.last_full_raise_size = to;
             self.open_raise_options_after_full_raise(idx, to);
+            self.raise_option_open[idx] = false;
         }
-        self.raise_option_open[idx] = false;
+        // Incomplete short all-in bet (to < big_blind && to == cap): per D-033-rev1
+        // #4(b) leave every player's raise_option_open flag untouched (the bettor
+        // is unconditionally going AllIn so the flag is dormant either way).
         self.last_aggressor = Some(self.players[idx].seat);
         Ok((Action::Bet { to }, to))
     }
@@ -377,10 +381,16 @@ impl GameState {
         let full_raise = raise_size >= self.last_full_raise_size;
         self.move_chips_to(idx, to)?;
         if full_raise {
+            // Full raise: open raise option for un-acted players, close own.
             self.last_full_raise_size = raise_size;
             self.open_raise_options_after_full_raise(idx, to);
+            self.raise_option_open[idx] = false;
         }
-        self.raise_option_open[idx] = false;
+        // Incomplete raise (`to < min_to && to == cap`): per D-033-rev1 #4(b)
+        // leave every player's raise_option_open flag untouched, including the
+        // raiser's own. The raiser is unconditionally going AllIn here so the
+        // flag is dormant; preserving it keeps the spec contract crisp for
+        // future status-state extensions (sit-out / cap state in C1+).
         self.last_aggressor = Some(self.players[idx].seat);
         Ok((Action::Raise { to }, to))
     }
@@ -716,7 +726,21 @@ impl GameState {
                 .copied()
                 .filter(|&idx| self.players[idx].status != PlayerStatus::Folded)
                 .collect();
+            // Unreachable in valid B2 flow (heads-up to a side pot collapses
+            // via uncalled-bet refund in `single_contributor_tranches` first).
+            // Loud in debug to flush out any C1+ flow that breaks this; in
+            // release fall back to first contributor to preserve I-001
+            // (chip conservation) rather than silently dropping the level.
+            debug_assert!(
+                !contenders.is_empty(),
+                "compute_payouts: level {} has only folded contributors — \
+                 unreachable in valid stage-1 flow; chip non-conservation if \
+                 left unhandled. Inspect single_contributor_tranches / \
+                 player status transitions.",
+                level,
+            );
             if contenders.is_empty() {
+                awards[contributors[0]] += amount;
                 continue;
             }
             let winners = self.pot_winners(&contenders);
@@ -851,9 +875,18 @@ fn empty_legal_actions() -> LegalActionSet {
 }
 
 fn validate_config(config: &TableConfig) {
+    // D-030 names 2..=9 as the spec range, but stage-1 SB/BB derivation per
+    // D-022b ("SB = button+1, BB = button+2") collapses to "BB = button" when
+    // n_seats == 2 — the opposite of standard heads-up NLHE where the button
+    // posts SB. Heads-up support requires a D-022b-revM amendment plus an
+    // explicit handler, neither of which is in B2 scope. Reject n_seats==2
+    // loudly until that lands rather than silently swap blinds.
     assert!(
-        (2..=9).contains(&config.n_seats),
-        "TableConfig.n_seats must be in 2..=9"
+        (3..=9).contains(&config.n_seats),
+        "TableConfig.n_seats must be in 3..=9 (stage-1 limitation: heads-up \
+         requires D-022b-revM button-posts-SB handling, see CLAUDE.md and \
+         workflow.md §修订历史). Spec D-030 reserves 2..=9 but n_seats==2 \
+         is gated until heads-up support lands."
     );
     assert_eq!(
         config.starting_stacks.len(),
