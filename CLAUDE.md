@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-Stage 1 of an 8-stage Pluribus-style 6-max NLHE poker AI. **Step C1 is done**: B2 had landed the full product side (state machine / evaluator / history) and 17 driving tests; C1 ([测试] agent) layered the §C1 acceptance harness on top **without touching product code**:
+Stage 1 of an 8-stage Pluribus-style 6-max NLHE poker AI. **Step C2 is done**: C2 ([实现] agent) closed with **0 lines of product-code change** — C1 had already left the default suite green and the §C2 [实现] §输出 列表的 5 条产品代码任务在 B2/C1 顺序里逐项落地完毕；C2 的实际动作是在装好 PokerKit 0.4.14 的环境把 C1 留下的 6 个 `#[ignore]` full-volume 门槛跑一遍并书写 closure。详见 `docs/pluribus_stage1_workflow.md` §修订历史 C-rev1。C1 状态保留如下：B2 had landed the full product side (state machine / evaluator / history) and 17 driving tests; C1 ([测试] agent) layered the §C1 acceptance harness on top **without touching product code**:
 
 - `tests/common/mod.rs` — extended scenario DSL: `ScenarioCase` + `ScenarioExpect` (含 `LegalAtEndCheck` enum) + `run_scenario` driver，使每个 fixed scenario 5–10 行表达。
 - `tests/scenarios_extended.rs` — 234 fixed scenarios（≥200 门槛达成）含 67 short-allin / incomplete raise（≥50 门槛）、min-raise 链条 / 摊牌顺序 / 拒绝路径覆盖。D-033-rev1 already-acted vs still-open 两条路径在不同 stack 大小下系统化扫描。
@@ -17,25 +17,44 @@ Stage 1 of an 8-stage Pluribus-style 6-max NLHE poker AI. **Step C1 is done**: B
 - `Cargo.toml` 新增 dev-dep `base64 = "0.22"`（C1 跨语言 harness 的 stdin 编码；test-only，不进产品二进制）。
 - D-033-rev1 / D-039-rev1 / API-001-rev1 文档不动；C1 没有触发任何 D-NNN-revM / API-NNN-revM。
 
-C1 出口数据（截至本仓库 commit）：
+C2 出口数据（截至本仓库 commit；PATH 含 `.venv-pokerkit`/`python3.11` + PokerKit 0.4.14）：
 
-- `cargo test`（默认）：61 tests passed / 6 ignored / 0 failed across 12 crates；耗时 ~25s。
-- `cargo test -- --ignored` 中 `cross_lang_full_10k` 实跑：10,000/10,000 matched, 0 diverged。
-- `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 全绿。
+- `cargo test`（默认）：61 passed / 6 ignored / 0 failed across 12 crates；耗时 ~50s。先前在无 PokerKit 时 skipped 的两条交叉验证现 active：
+    - `cross_validation_pokerkit_100_random_hands`（100 手规则引擎 vs PokerKit）：100/100 match，0 diverged。
+    - `cross_eval_smoke_default`（1k 手 HandCategory vs PokerKit）：1000/1000 match，0 diverged。
+- `cargo test --release -- --ignored` 跑齐 6 个 full-volume：
+    - `cross_eval_full_100k`（D-085 评估器侧 C2 通过门槛）：100,000/100,000 match，0 diverged，41.82s。
+    - `cross_lang_full_10k`：10,000/10,000 match，0 diverged，4.48s。
+    - `history_roundtrip_full_100k`：100,000/100,000 ok，8.19s。
+    - `eval_5_6_7_consistency_full` / `eval_antisymmetry_stability_full` / `eval_transitivity_full`（1M naive evaluator 三件套）：合计 46.69s 全绿。注意此 1M 不等于 validation.md §4 的「评估器 vs PokerKit 1M」（E2 aspirational），它们是 naive evaluator 自洽性 / 反对称 / 传递，不涉及参考实现。
+- `cargo fmt --all --check` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。
 
-Build/test/lint commands are valid as of C1 closure:
+**唯一 C2 出口 carve-out**：D-085 / validation.md §7 要求「规则与 PokerKit 100,000 手 0 分歧」，但当前测试基础设施仅有 100 手规模（`cross_validation_pokerkit_100_random_hands`），无 `#[ignore]` 100k 变体——C1 没扩规模。按 workflow §修订历史 §B-rev1 §3「`tests/cross_validation.rs` 的扩展由 [测试] agent 负责」 的边界政策，C2 不顺手补测试，此 100→100k 测试由后续 [测试] agent（D1 前置或专门 follow-up）补齐。当前 100 手 0 分歧 + 100k HandCategory 0 分歧作为 cross-validation 部分证据；详见 `docs/pluribus_stage1_workflow.md` §修订历史 C-rev1。
+
+Build/test/lint commands are valid as of C2 closure:
 
 - `./scripts/setup-rust.sh` — idempotent rustup install. Pins to `rust-toolchain.toml` (currently `1.95.0`).
 - `cargo build --all-targets`
 - `cargo fmt --all --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
-- `cargo test --no-run` — compile tests. C1 闭合后 ships 67 tests across 12 crates：`api_signatures` (1) + `cross_eval` (1+1 ignored) + `cross_lang_history` (1+1 ignored) + `cross_validation` (3) + `determinism` (4) + `evaluator` (8+3 ignored) + `fuzz_smoke` (3) + `history_roundtrip` (3+1 ignored) + `scenarios` (10) + `scenarios_extended` (19) + `side_pots` (8)。
-- `cargo test` — 默认 61/61 全绿。需要外部依赖的两条交叉验证 (`cross_eval` 类别 vs PokerKit / `cross_validation` 100-hand B2 出口) 在 `pokerkit==0.4.14` + Python ≥3.11 不可用时自动 skipped；C2 出口必须在装好 PokerKit 的环境跑过一次确认 0 分歧。
-- `cargo test -- --ignored` — 6 个 full-volume 测试：评估器 1M 一致性 / 反对称 / 传递（运行需性能 evaluator，naive 下耗时较长，留 D2 / E2 回归）；`history_roundtrip_full_100k` / `cross_lang_full_10k` / `cross_eval_full_100k`。当前可在 naive evaluator 下完成的：cross_lang_10k（已实跑通过）。其它 full-volume 在 B2 naive 下耗时长但可跑。
+- `cargo test --no-run` — compile tests. C1/C2 闭合后 ships 67 tests across 12 crates：`api_signatures` (1) + `cross_eval` (1+1 ignored) + `cross_lang_history` (1+1 ignored) + `cross_validation` (3) + `determinism` (4) + `evaluator` (8+3 ignored) + `fuzz_smoke` (3) + `history_roundtrip` (3+1 ignored) + `scenarios` (10) + `scenarios_extended` (19) + `side_pots` (8)。
+- `cargo test` — 默认 61/61 全绿。需要外部依赖的两条交叉验证 (`cross_eval` 类别 vs PokerKit / `cross_validation` 100-hand) 在 `pokerkit==0.4.14` + Python ≥3.11 不可用时自动 skipped；C2 闭合时已在 `.venv-pokerkit`/`python3.11` 环境实跑确认 0 分歧。
+- `cargo test --release -- --ignored` — 6 个 full-volume 测试 C2 闭合时已全绿（4.48s + 8.19s + 41.82s + 46.69s 三件套；详见 §出口数据）。原 C1 注释里 「naive 下耗时较长，留 D2 / E2 回归」 经实测推翻：1M naive 三件套合计 ~50s（release 下），与 PokerKit-dependent 100k 评估器交叉验证 ~42s 同量级。性能 SLO（≥10M eval/s）仍在 E1/E2。
 - `cargo bench --bench baseline` — 仍为 B1 占位；E1/E2 替换。
 
-Step **C2** (`[实现]` agent — 让 C1 中遗留的 corner case 全部通过) is next. C1 落地后默认套件已全绿，所以 C2 的"显式驱动"形式会是：装好 PokerKit 跑 `cargo test -- --ignored` + B2 100 手 PokerKit cross-validation 的扩展版本（C1 没扩规模，C2 接到 100k；按 D-085）。Stages 2–8 source code does not exist yet.
+**装 PokerKit 的标准流程**（C2 实测可用，留作后续 [测试] / [实现] agent 复用；外部 Python ≥3.11 需求来自 `tools/pokerkit_eval.py` 与 `tools/pokerkit_replay.py`）：
+
+```bash
+uv venv --python 3.11 .venv-pokerkit
+uv pip install --python .venv-pokerkit/bin/python "pokerkit==0.4.14"
+PATH=".venv-pokerkit/bin:$PATH" cargo test                      # 默认 + active cross-validation
+PATH=".venv-pokerkit/bin:$PATH" cargo test --release -- --ignored  # full-volume 6 件套
+```
+
+`.venv-pokerkit/` 已在 `.gitignore` 中 ignore。
+
+Step **D1** (`[测试]` agent — fuzz 完整版 + 多线程测试) is next. 其前置工作里包含一笔 C2 留下的 carve-out：在 `tests/cross_validation.rs` 加 `#[ignore]` 100k variant（D-085 规则引擎侧 C2 通过门槛），见 §C2 出口数据 carve-out 与 workflow §修订历史 C-rev1。Stages 2–8 source code does not exist yet.
 
 ## Documents and their authority
 
@@ -60,7 +79,7 @@ Stage 1 work is organized as `A → B → C → D → E → F` (13 steps, see `d
 - `[实现]` agent writes product code only. **Never modify tests.** If a test fails, fix the product code; only edit the test if it has an obvious bug, and only after review.
 - `[决策]` and `[报告]` produce or modify docs in `docs/`.
 
-When the user asks you to do stage-1 work, identify which step (A0 / A1 / B1 / …) the task belongs to and operate within that role. The current step is the highest-numbered step whose outputs already exist in the repo — currently **B2 done** (`GameState` / evaluator / history fully implemented; 10 scenarios + 100-hand PokerKit cross-validation + 10k fuzz all green; D-039-rev1 aligned odd-chip semantics with PokerKit 0.4.14); **C1 has not started**. Note: B2 closure crossed the [实现]→[测试] boundary by completing two test files that B1 had deliberately left as stubs (cross_validation strict comparator + 10k-hand fuzz exit test) — see `docs/pluribus_stage1_workflow.md` §修订历史 B-rev1 for the written acknowledgment and the policy for future analogous situations.
+When the user asks you to do stage-1 work, identify which step (A0 / A1 / B1 / …) the task belongs to and operate within that role. The current step is the highest-numbered step whose outputs already exist in the repo — currently **C2 done**（C2 0 产品代码改动闭合：default 61/61 + 6 ignored full-volume + lint 全绿；详见 §C2 出口数据 与 workflow §修订历史 C-rev1）；**D1 has not started**。历史关键边界事件：(1) B2 closure crossed the [实现]→[测试] boundary by completing two test files that B1 had deliberately left as stubs (cross_validation strict comparator + 10k-hand fuzz exit test) — see workflow §修订历史 B-rev1; (2) C2 closure carved out 「规则引擎 100k cross-validation 测试」 留给 [测试] agent，C2 不顺手补 — see workflow §修订历史 C-rev1.
 
 ## Non-negotiable invariants (apply to all stage-1 code)
 
