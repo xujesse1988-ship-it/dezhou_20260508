@@ -4,27 +4,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-Stage 1 of an 8-stage Pluribus-style 6-max NLHE poker AI. **Step B2 is done**: B1 had stubbed all `[测试]` deliverables on top of A1's `unimplemented!()` API; B2 filled the product side and brought every B1 harness from "skeleton + skipped" to "full pass":
+Stage 1 of an 8-stage Pluribus-style 6-max NLHE poker AI. **Step C1 is done**: B2 had landed the full product side (state machine / evaluator / history) and 17 driving tests; C1 ([测试] agent) layered the §C1 acceptance harness on top **without touching product code**:
 
-- `src/rules/state.rs` — `GameState` 完整状态机：`legal_actions()`（含 short all-in / min-raise 链 / D-033-rev1 raise-option-open 标记）+ `apply()`（街转换、betting round 推进、摊牌）+ `payouts()`（main pot / side pot / **D-039-rev1** odd-chip 整笔分配 / uncalled bet）。
-- `src/eval.rs` — naive `HandEvaluator`：5-card 直接枚举 + 7-choose-5 组合，10k eval/s 量级（按 D-073 故意保留朴素实现，性能优化留给 E2）。
-- `src/history.rs` — `HandHistory` 序列化（protobuf via `prost`）+ 反序列化 + `replay_to(action_index)` 任意 index 恢复。
-- `tools/pokerkit_replay.py` — PokerKit 0.4.14 完整翻译（dead-button 模式 + 显式 hole/board feed），不再返回 B1Stub。
-- 测试侧由 B2 顺手补完两处 B1 留白：`tests/cross_validation.rs` 把 `naive_payouts_match` trip-wire 升级成 strict serde_json 比对 + 新增 100 手 PokerKit 出口测试；`tests/fuzz_smoke.rs` 新增 10k 手 B2 出口测试。该补全跨越 [实现] / [测试] 角色边界，已由 `docs/pluribus_stage1_workflow.md` §修订历史 B-rev1 书面追认。
-- 文档：D-039-rev1（decisions §10）把 odd-chip 余 chip 改为「整笔给按钮左侧最近的获胜者」，对齐 PokerKit 0.4.14 默认 chips-pushing divmod 语义；公开 API 签名不变，`HandHistory.schema_version` 不 bump；`pluribus_stage1_validation.md` §3 同步措辞。
+- `tests/common/mod.rs` — extended scenario DSL: `ScenarioCase` + `ScenarioExpect` (含 `LegalAtEndCheck` enum) + `run_scenario` driver，使每个 fixed scenario 5–10 行表达。
+- `tests/scenarios_extended.rs` — 234 fixed scenarios（≥200 门槛达成）含 67 short-allin / incomplete raise（≥50 门槛）、min-raise 链条 / 摊牌顺序 / 拒绝路径覆盖。D-033-rev1 already-acted vs still-open 两条路径在不同 stack 大小下系统化扫描。
+- `tests/side_pots.rs` — side pot / split pot 110+ scenarios（≥100 门槛）含 25 uncalled bet returned 路径（≥20 门槛）、odd-chip-给-SB 12 例（D-039-rev1）、4-way side pot 17 例、5-way side pot 9 例、dead money 8 例；用 stacked-deck "BB 必胜 quads" 模板让 stack 结构一表一格生成。
+- `tests/evaluator.rs` — 10 类 HandCategory 公开样例 + 类型间相对强度 + 5/6/7-card 接口一致性 + 反对称/稳定性 + 传递性。默认 5k–10k 量级；`#[ignore]` 提供 1M full-volume opt-in（`cargo test -- --ignored`）。
+- `tests/cross_eval.rs` + `tools/pokerkit_eval.py` — 评估器 vs PokerKit 类别交叉验证 harness。默认 1k 手；`#[ignore]` 100k。PokerKit 缺失时 skipped。
+- `tests/history_roundtrip.rs` — proto serialize → deserialize → `replay()` 全字段 + `content_hash` 一致；默认 1k 手；`#[ignore]` 100k。`replay_to(k)` 中间态 50 个 seed × 全 index 验证。
+- `tools/history_reader.py` + `tests/cross_lang_history.rs` — Python minimal proto3 decoder（无 protoc 依赖）读 Rust 写出的 history protobuf。默认 100 手；`#[ignore]` 10k（已实跑 0 分歧）。
+- `tests/determinism.rs` — 同 seed 重复 10 次哈希相同（20 个 seed）+ 单线程 vs 4 线程批量内容一致（200 seeds）+ 不同 seed 哈希足够分散 + `to_proto` 重复字节稳定。
+- `Cargo.toml` 新增 dev-dep `base64 = "0.22"`（C1 跨语言 harness 的 stdin 编码；test-only，不进产品二进制）。
+- D-033-rev1 / D-039-rev1 / API-001-rev1 文档不动；C1 没有触发任何 D-NNN-revM / API-NNN-revM。
 
-Build/test/lint commands are valid as of B2 closure:
+C1 出口数据（截至本仓库 commit）：
 
-- `./scripts/setup-rust.sh` — idempotent rustup install. Pins to the version in `rust-toolchain.toml` (currently `1.95.0`).
+- `cargo test`（默认）：61 tests passed / 6 ignored / 0 failed across 12 crates；耗时 ~25s。
+- `cargo test -- --ignored` 中 `cross_lang_full_10k` 实跑：10,000/10,000 matched, 0 diverged。
+- `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` 全绿。
+
+Build/test/lint commands are valid as of C1 closure:
+
+- `./scripts/setup-rust.sh` — idempotent rustup install. Pins to `rust-toolchain.toml` (currently `1.95.0`).
 - `cargo build --all-targets`
 - `cargo fmt --all --check`
 - `cargo clippy --all-targets -- -D warnings`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
-- `cargo test --no-run` — compile tests. B2 ships 17 tests across 4 crates: `api_signatures` (1, spec-drift trip-wire) + `cross_validation` (3：1-smoke / 10-mini-batch / 100-hand PokerKit B2 出口) + `fuzz_smoke` (3：1-smoke / 10-mini-batch / 10k-hand B2 出口) + `scenarios` (10).
-- `cargo test` — 17/17 全绿。100 手 PokerKit 出口测试需要 PATH 上有装了 `pokerkit==0.4.14` 的 `python3`（要求 Python ≥3.11）；环境缺失时该测试自动 fallback 到 skipped 而非 fail，但出口验收必须在装好 PokerKit 的环境跑过一次确认 0 分歧。
-- `cargo bench --bench baseline` — placeholder 仍是 B1 留下的 `catch_unwind` 包装，跑出占位 ns 数据；真实 hot-path bench + SLO 断言由 E1 / E2 接管。
+- `cargo test --no-run` — compile tests. C1 闭合后 ships 67 tests across 12 crates：`api_signatures` (1) + `cross_eval` (1+1 ignored) + `cross_lang_history` (1+1 ignored) + `cross_validation` (3) + `determinism` (4) + `evaluator` (8+3 ignored) + `fuzz_smoke` (3) + `history_roundtrip` (3+1 ignored) + `scenarios` (10) + `scenarios_extended` (19) + `side_pots` (8)。
+- `cargo test` — 默认 61/61 全绿。需要外部依赖的两条交叉验证 (`cross_eval` 类别 vs PokerKit / `cross_validation` 100-hand B2 出口) 在 `pokerkit==0.4.14` + Python ≥3.11 不可用时自动 skipped；C2 出口必须在装好 PokerKit 的环境跑过一次确认 0 分歧。
+- `cargo test -- --ignored` — 6 个 full-volume 测试：评估器 1M 一致性 / 反对称 / 传递（运行需性能 evaluator，naive 下耗时较长，留 D2 / E2 回归）；`history_roundtrip_full_100k` / `cross_lang_full_10k` / `cross_eval_full_100k`。当前可在 naive evaluator 下完成的：cross_lang_10k（已实跑通过）。其它 full-volume 在 B2 naive 下耗时长但可跑。
+- `cargo bench --bench baseline` — 仍为 B1 占位；E1/E2 替换。
 
-Step **C1** (`[测试]` agent — 把 fixed scenario 扩到 200+ / side pot 扩到 100+ / 评估器与开源参考交叉验证 1M 手 / hand history 100k 手 roundtrip / 跨语言反序列化 / 确定性测试) is next. Stages 2–8 source code does not exist yet.
+Step **C2** (`[实现]` agent — 让 C1 中遗留的 corner case 全部通过) is next. C1 落地后默认套件已全绿，所以 C2 的"显式驱动"形式会是：装好 PokerKit 跑 `cargo test -- --ignored` + B2 100 手 PokerKit cross-validation 的扩展版本（C1 没扩规模，C2 接到 100k；按 D-085）。Stages 2–8 source code does not exist yet.
 
 ## Documents and their authority
 

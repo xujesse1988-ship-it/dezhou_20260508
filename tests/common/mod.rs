@@ -19,8 +19,8 @@
 use std::collections::HashSet;
 
 use poker::{
-    Card, ChipAmount, GameState, LegalActionSet, Player, PlayerStatus, RngSource, SeatId, Street,
-    TableConfig,
+    Action, Card, ChipAmount, GameState, LegalActionSet, Player, PlayerStatus, RngSource, SeatId,
+    Street, TableConfig,
 };
 
 // ============================================================================
@@ -449,4 +449,327 @@ pub const fn _streets_u8(s: Street) -> u8 {
         Street::River => 3,
         Street::Showdown => 4,
     }
+}
+
+// ============================================================================
+// Scenario DSL（C1）
+// ============================================================================
+//
+// `ScenarioCase` 把"一手 fixed scenario"拍平为可表的数据结构。`run_scenario`
+// 是单一驱动入口：构造状态、（可选）注入 stacked deck、按 plan 应用动作并断言
+// 期望。这样让 200+ scenarios 能用 5–10 行紧凑表达，而不是每场景一个 `#[test]`
+// 函数（编译开销与可读性都更好）。
+//
+// 角色边界：DSL 属测试基础设施。**不允许**含产品代码假设（除 API §4 公开签名）。
+
+/// 一个 scenario 的可声明描述。所有字段都可选；只有 `name` / `config` / `plan`
+/// 是必填。
+pub struct ScenarioCase {
+    pub name: &'static str,
+    pub config: TableConfig,
+    /// 使用 `seed` 走默认 ChaCha20 rng；与 `holes` / `board` 互斥。
+    pub seed: u64,
+    /// 显式 stacked deck：长度 = `n_seats`。设置时按 D-028 反推 rng，且必须同时
+    /// 提供 `board`。设为 `None` 时使用 `seed`。
+    pub holes: Option<Vec<(Card, Card)>>,
+    /// `(flop, turn, river)`。仅当 `holes` 也设置时启用。
+    pub board: Option<([Card; 3], Card, Card)>,
+    /// 按顺序的 `(预期当前行动者, 动作)`。
+    pub plan: Vec<(SeatId, Action)>,
+    pub expect: ScenarioExpect,
+}
+
+/// 用于 `ScenarioExpect.legal_at_end` 的合法动作集断言。
+#[derive(Copy, Clone, Debug)]
+pub enum LegalAtEndCheck {
+    /// `raise_range == None`。典型用例：D-033-rev1 已-acted 玩家被 incomplete 不重开。
+    NoRaiseRange,
+    /// `raise_range.is_some()`。典型用例：D-033-rev1 still-open 玩家可加注。
+    HasRaiseRange,
+    /// `raise_range.is_some() && raise_range.min == amount`。
+    /// 典型用例：D-035 链条 min raise 数值断言。
+    RaiseMinExact(ChipAmount),
+    /// `bet_range == None`。
+    NoBetRange,
+    /// `call.is_some() && call == amount`。
+    CallExact(ChipAmount),
+    /// `check == true`（无须 call）。
+    CheckLegal,
+    /// `all_in_amount == Some(amount)`。
+    AllInExact(ChipAmount),
+}
+
+impl LegalAtEndCheck {
+    pub fn assert(self, name: &str, la: &LegalActionSet) {
+        match self {
+            LegalAtEndCheck::NoRaiseRange => assert!(
+                la.raise_range.is_none(),
+                "[{name}] expected raise_range == None, got {:?}",
+                la.raise_range
+            ),
+            LegalAtEndCheck::HasRaiseRange => assert!(
+                la.raise_range.is_some(),
+                "[{name}] expected raise_range.is_some(), got None"
+            ),
+            LegalAtEndCheck::RaiseMinExact(want) => {
+                let (got_min, _) = la
+                    .raise_range
+                    .unwrap_or_else(|| panic!("[{name}] expected raise_range = Some, got None"));
+                assert_eq!(
+                    got_min, want,
+                    "[{name}] raise_range.min: expected {want:?}, got {got_min:?}"
+                );
+            }
+            LegalAtEndCheck::NoBetRange => assert!(
+                la.bet_range.is_none(),
+                "[{name}] expected bet_range == None, got {:?}",
+                la.bet_range
+            ),
+            LegalAtEndCheck::CallExact(want) => {
+                let got = la
+                    .call
+                    .unwrap_or_else(|| panic!("[{name}] expected call = Some, got None"));
+                assert_eq!(got, want, "[{name}] call: expected {want:?}, got {got:?}");
+            }
+            LegalAtEndCheck::CheckLegal => assert!(
+                la.check,
+                "[{name}] expected check == true, got false (call = {:?})",
+                la.call
+            ),
+            LegalAtEndCheck::AllInExact(want) => {
+                let got = la
+                    .all_in_amount
+                    .unwrap_or_else(|| panic!("[{name}] expected all_in_amount = Some, got None"));
+                assert_eq!(
+                    got, want,
+                    "[{name}] all_in_amount: expected {want:?}, got {got:?}"
+                );
+            }
+        }
+    }
+}
+
+/// 终局期望。所有字段可选 — `None` 表示该维度不断言。
+#[derive(Default)]
+pub struct ScenarioExpect {
+    /// `Some(true)` → 必须 terminal；`Some(false)` → 必须未 terminal；`None` → 不查。
+    pub terminal: Option<bool>,
+    pub street: Option<Street>,
+    pub board_len: Option<usize>,
+    /// `(seat_id_u8, expected_net)`。`SeatId` 不直接用是为了让 const 列表更短。
+    pub payouts: Option<Vec<(u8, i64)>>,
+    /// 期望 `payouts` 净和为 0（`I-001` 派生）。默认 `true` — 任何 fixed scenario
+    /// 都该满足；设为 `false` 表示用例显式不要求（罕见，只用于 round-trip 中间态）。
+    pub payouts_zero_sum: bool,
+    /// 终局摊牌顺序 (D-037)：`Some(seat0)` 表示 `showdown_order[0] == seat0`。
+    pub last_aggressor_first: Option<SeatId>,
+    /// `Some((seat_u8, check))`：plan 跑完后，`current_player == seat` 时按 `check`
+    /// 断言 `legal_actions()`。用枚举（而非 fn 指针）以便 200+ scenarios 表中
+    /// 用 const 表达式直接表达，不必每用例写一个具名函数。
+    pub legal_at_end: Option<(u8, LegalAtEndCheck)>,
+    /// `Some(action_to_try)`：plan 跑完后尝试 `apply(action_to_try)`，必须失败。
+    /// 用于 "incomplete raise + already-acted player tries Raise" 等拒绝路径。
+    pub expect_apply_err: Option<Action>,
+}
+
+impl ScenarioExpect {
+    pub fn new() -> ScenarioExpect {
+        ScenarioExpect {
+            terminal: None,
+            street: None,
+            board_len: None,
+            payouts: None,
+            payouts_zero_sum: true,
+            last_aggressor_first: None,
+            legal_at_end: None,
+            expect_apply_err: None,
+        }
+    }
+}
+
+/// Scenario 驱动器。在 plan 应用过程中：
+///
+/// - 每步前断言 `current_player == expected_seat`；
+/// - 每步后调用 [`Invariants::check_all`]；
+/// - plan 跑完后按 `expect` 断言终局 / 中间态。
+///
+/// 失败时 panic（标准 `#[test]` 协议）。
+pub fn run_scenario(case: &ScenarioCase) {
+    let total = expected_total_chips(&case.config);
+
+    let mut state = if let (Some(holes), Some((flop, turn, river))) = (&case.holes, &case.board) {
+        let n = case.config.n_seats as usize;
+        assert_eq!(
+            holes.len(),
+            n,
+            "[{}] holes 长度 {} != n_seats {}",
+            case.name,
+            holes.len(),
+            n
+        );
+        let used: HashSet<u8> = holes
+            .iter()
+            .flat_map(|(a, b)| [a.to_u8(), b.to_u8()])
+            .chain(
+                [flop[0], flop[1], flop[2], *turn, *river]
+                    .iter()
+                    .map(|c| c.to_u8()),
+            )
+            .collect();
+        let padding = pick_unused_padding(&used, 52 - 2 * n - 5);
+        let deck = build_dealing_order(n, holes, *flop, *turn, *river, &padding);
+        let mut rng = StackedDeckRng::from_target_cards(deck);
+        GameState::with_rng(&case.config, case.seed, &mut rng)
+    } else {
+        GameState::new(&case.config, case.seed)
+    };
+
+    Invariants::check_all(&state, total)
+        .unwrap_or_else(|e| panic!("[{}] initial invariant: {e}", case.name));
+
+    for (i, (want_seat, action)) in case.plan.iter().enumerate() {
+        let cp = state.current_player().unwrap_or_else(|| {
+            panic!(
+                "[{}] step {i}: current_player == None, expected {want_seat:?}",
+                case.name
+            )
+        });
+        assert_eq!(
+            cp, *want_seat,
+            "[{}] step {i}: current_player mismatch (expected {want_seat:?}, got {cp:?})",
+            case.name
+        );
+        state
+            .apply(*action)
+            .unwrap_or_else(|e| panic!("[{}] step {i}: apply({action:?}) failed: {e}", case.name));
+        Invariants::check_all(&state, total)
+            .unwrap_or_else(|e| panic!("[{}] step {i} (after {action:?}): {e}", case.name));
+    }
+
+    if let Some(t) = case.expect.terminal {
+        assert_eq!(
+            state.is_terminal(),
+            t,
+            "[{}] expected is_terminal == {t}, got {}",
+            case.name,
+            state.is_terminal()
+        );
+    }
+    if let Some(s) = case.expect.street {
+        assert_eq!(
+            state.street(),
+            s,
+            "[{}] expected street {s:?}, got {:?}",
+            case.name,
+            state.street()
+        );
+    }
+    if let Some(n) = case.expect.board_len {
+        assert_eq!(
+            state.board().len(),
+            n,
+            "[{}] expected board.len() == {n}, got {}",
+            case.name,
+            state.board().len()
+        );
+    }
+    if let Some(expected) = &case.expect.payouts {
+        let actual = state
+            .payouts()
+            .unwrap_or_else(|| panic!("[{}] payouts() == None at expectations", case.name));
+        for (sid, expected_net) in expected {
+            let got = actual
+                .iter()
+                .find(|(s, _)| s.0 == *sid)
+                .unwrap_or_else(|| panic!("[{}] seat {sid} missing in payouts", case.name));
+            assert_eq!(
+                got.1, *expected_net,
+                "[{}] seat {sid} net: expected {expected_net}, got {}",
+                case.name, got.1
+            );
+        }
+        if case.expect.payouts_zero_sum {
+            let sum: i64 = actual.iter().map(|(_, n)| n).sum();
+            assert_eq!(sum, 0, "[{}] payouts net sum != 0: {sum}", case.name);
+        }
+    } else if case.expect.payouts_zero_sum {
+        if let Some(actual) = state.payouts() {
+            let sum: i64 = actual.iter().map(|(_, n)| n).sum();
+            assert_eq!(sum, 0, "[{}] payouts net sum != 0: {sum}", case.name);
+        }
+    }
+    if let Some(seat) = case.expect.last_aggressor_first {
+        let order = &state.hand_history().showdown_order;
+        assert_eq!(
+            order.first(),
+            Some(&seat),
+            "[{}] showdown_order[0] expected {seat:?}, got {:?}",
+            case.name,
+            order.first()
+        );
+    }
+    if let Some((sid, check)) = case.expect.legal_at_end {
+        let cp = state.current_player().unwrap_or_else(|| {
+            panic!(
+                "[{}] expected current_player == seat({sid}), got None",
+                case.name
+            )
+        });
+        assert_eq!(
+            cp.0, sid,
+            "[{}] legal_at_end target {sid}, got {cp:?}",
+            case.name
+        );
+        let la = state.legal_actions();
+        check.assert(case.name, &la);
+    }
+    if let Some(bad_action) = case.expect.expect_apply_err {
+        let err = state.apply(bad_action);
+        assert!(
+            err.is_err(),
+            "[{}] expected apply({bad_action:?}) to error, got Ok",
+            case.name
+        );
+    }
+}
+
+/// 6-max 默认配置 + 自定义 starting_stacks 列表。len 必须 = 6。
+pub fn cfg_6max_with_stacks(stacks: [u64; 6]) -> TableConfig {
+    let mut cfg = TableConfig::default_6max_100bb();
+    for (i, v) in stacks.iter().enumerate() {
+        cfg.starting_stacks[i] = ChipAmount::new(*v);
+    }
+    cfg
+}
+
+/// 把 `(seat_u8, action)` 字面量数组转成 plan vec。
+pub fn plan(items: &[(u8, Action)]) -> Vec<(SeatId, Action)> {
+    items.iter().map(|(s, a)| (SeatId(*s), *a)).collect()
+}
+
+/// 6-max 三玩家模板：UTG/MP/CO 全弃，把"3-人决战"的样板缩成一行调用。
+pub fn fold_to_three_handed_prefix() -> Vec<(SeatId, Action)> {
+    vec![
+        (SeatId(3), Action::Fold),
+        (SeatId(4), Action::Fold),
+        (SeatId(5), Action::Fold),
+    ]
+}
+
+/// 给定 `n_seats`，构造一个所有非按钮 / 非 SB / 非 BB 座位 fold 的 prefix。
+/// 即 BTN/SB/BB 三人决战。
+pub fn fold_to_button_sb_bb(cfg: &TableConfig) -> Vec<(SeatId, Action)> {
+    let n = cfg.n_seats as usize;
+    let btn = cfg.button_seat.0 as usize;
+    let sb = (btn + 1) % n;
+    let bb = (btn + 2) % n;
+    let mut out = Vec::new();
+    // UTG = button + 3，依次 fold 到 BTN 之前。
+    for offset in 3..n {
+        let s = (btn + offset) % n;
+        if s != btn && s != sb && s != bb {
+            out.push((SeatId(s as u8), Action::Fold));
+        }
+    }
+    out
 }

@@ -21,6 +21,8 @@ blake3 = "1.5"
 # 阶段 1 §B1 / E1 benchmark harness。`harness = false` 见下方 [[bench]]。
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 serde_json = "1.0"
+# C1 跨语言反序列化测试：把 prost 输出 base64 后传给 Python 子进程。
+base64 = "0.22"
 
 # 本地 cargo clippy / rustdoc 与 CI -D warnings 等级对齐（A1 评审 P1）。
 [lints.rust]
