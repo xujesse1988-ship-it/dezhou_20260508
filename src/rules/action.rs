@@ -27,10 +27,27 @@ pub enum Action {
 
 /// 合法动作集合。每条字段独立，`None` 表示该动作不合法。
 ///
-/// 不变量见 API §2 LA-001..LA-008：
-/// - `check` 与 `call` 互斥
-/// - `bet_range` 与 `raise_range` 互斥
-/// - `current_player == None` 时所有字段为 false / None（"空集合"）
+/// **不变量**（实现 agent 必须保证、测试 agent 在 invariant suite 中验证；
+/// `docs/pluribus_stage1_api.md` §2）：
+///
+/// - **LA-001** `check` 与 `call` 互斥：当前下注轮 `committed_this_round` 与
+///   `max_committed_this_round` 相等时只能 `check`（`call = None`）；不等时
+///   只能 `call`（`check = false`）。即 `check && call.is_some()` 永远为 false。
+/// - **LA-002** `bet_range` 与 `raise_range` 互斥：本轮 `max_committed_this_round
+///   == 0`（无前序 bet）时 `raise_range = None`；`> 0` 时 `bet_range = None`。
+///   即 `bet_range.is_some() && raise_range.is_some()` 永远为 false。
+/// - **LA-003** `fold` 永远合法（除非 `current_player == None`）：
+///   `current_player().is_some() => fold == true`。
+/// - **LA-004** `call` 与 `check` 至少有一个真：`current_player().is_some()` 时
+///   `check || call.is_some()` 必须为 true。
+/// - **LA-005** `bet_range.min_to >= BB`（首次开局，D-034）；`raise_range.min_to`
+///   满足 D-035 链式 min raise 约束。
+/// - **LA-006** `bet_range / raise_range` 的 `max_to <= committed_this_round
+///   + stack`（不可下注超出剩余筹码 + 本轮已投入）。
+/// - **LA-007** `all_in_amount` 当且仅当 `stack > 0` 时为 `Some`；其值
+///   `= committed_this_round + stack`。
+/// - **LA-008** `current_player() == None`（terminal / all-in 跳轮）时所有
+///   字段为 `false / None`（"空集合"）。
 #[derive(Clone, Debug)]
 pub struct LegalActionSet {
     pub fold: bool,

@@ -1,5 +1,8 @@
 name: CI
 
+# TODO(F2/E2): 跨平台 (macOS / ARM) job 见 D-052。阶段 1 仅作为 aspirational
+# 目标，未列入 A1 出口；后续阶段一并补齐。
+
 on:
   push:
     branches: [main]
@@ -14,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt
       - run: cargo fmt --all --check
@@ -24,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -35,9 +38,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-targets
+
+  test-build:
+    name: cargo test --no-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      # 阶段 1 大量方法是 unimplemented!()，cargo test 会 panic；用 --no-run 仅
+      # 编译以保证 tests/ 下的类型断言（tests/api_signatures.rs）和未来 B1
+      # scenario 的 spec 漂移在编译期被截获。
+      - run: cargo test --no-run
 
   doc:
     name: cargo doc -D warnings
@@ -46,6 +61,6 @@ jobs:
       RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps

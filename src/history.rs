@@ -10,6 +10,19 @@ use crate::rules::state::GameState;
 ///
 /// `replay()` 与 `replay_to()` 基于 `seed` + `actions` 重建中间 / 终局
 /// `GameState`，要求与原始记录完全一致（D-028 发牌协议保证发牌确定性）。
+///
+/// **回放与街转换时序**（详见 `docs/pluribus_stage1_api.md` §5）：
+///
+/// - 公共牌（flop / turn / river）的发牌**不占** `actions` 序列中的位置，
+///   不产生 `RecordedAction`。
+/// - 触发某街最后动作的 `apply` 调用内顺序执行：reset 所有玩家
+///   `committed_this_round` → 发下街公共牌 → 切 `street` → 选下街第一行动者
+///   （postflop = SB 起，preflop = UTG 起）。
+/// - **全员 all-in 跳轮（D-036）多街快进**：若该 `apply` 后剩余 `Active`
+///   玩家 ≤ 1 名，状态机在同一 `apply` 调用内连续发完所有未发公共牌
+///   （直至 `board.len() == 5`）→ 切 `Showdown` → 计算 `payouts` →
+///   `is_terminal == true`，期间不产生新 `RecordedAction`。`replay_to(k)`
+///   若第 k 个动作触发该分支，返回的 `GameState` 已处于终局。
 #[derive(Clone, Debug)]
 pub struct HandHistory {
     /// 当前固定为 1（D-061）。
@@ -37,7 +50,21 @@ pub struct RecordedAction {
     pub street: Street,
     /// AllIn 已归一化为 Bet/Raise/Call。
     pub action: Action,
-    /// 该 seat 在本街（= `self.street`）的投入总额；语义见 API §5。
+    /// 该 seat 在本街（= `self.street`）的投入总额。**取该动作 apply 完成、
+    /// 本街 `committed_this_round` 尚未被街转换重置之前的快照值**：
+    ///
+    /// - 未触发街转换的动作：等价于 apply 后 `player.committed_this_round`。
+    /// - 触发街转换的动作（即本街最后一个动作）：等价于"如果本街不重置，
+    ///   apply 后 `player.committed_this_round` 应有的值"。
+    ///
+    /// 各 `Action` 变体下的具体取值：
+    ///
+    /// - `Fold` / `Check`：`committed_after` = 该 seat 进入本动作前的
+    ///   `committed_this_round`（本动作不改变投入额）。
+    /// - `Call` / `Bet { to }` / `Raise { to }`：`committed_after = to`。
+    ///
+    /// 该定义保证 `committed_after` 在 `replay` / `replay_to` 中可被独立
+    /// 校验，不依赖于"街转换 reset 是否已发生"的内部时序。
     pub committed_after: ChipAmount,
 }
 

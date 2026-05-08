@@ -186,6 +186,11 @@ pub enum Position {
 /// **方向约定（D-029）**：`SeatId(k+1 mod n_seats)` 是 `SeatId(k)` 的左邻。
 /// 按钮轮转（D-032）、盲注推导（D-022b / D-032）、odd chip 分配（D-039）、
 /// showdown 顺序（D-037）中"向左" / "按钮左侧" 均按此理解。
+///
+/// **D-039 corner case（BTN 是获胜者）**：odd chip 分配的环绕计数从
+/// `BTN+1`（按 D-029 即按钮左 1）起，**BTN 不优先**获得余 chip；仅当所有
+/// 非 BTN 的获胜座位都已分到、最终环绕回到 BTN 时才落到 BTN。该约定与
+/// PokerKit 等开源参考实现一致。
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct SeatId(pub u8);
 

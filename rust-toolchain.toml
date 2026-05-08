@@ -1,0 +1,13 @@
+# Rust toolchain pin（D-007 stable channel pin 落地）。
+#
+# 凡 cd 进本仓库执行 cargo / rustc / rustfmt / clippy，rustup 自动切换到此版本，
+# 避免 GitHub Actions / 本地 stable 漂移。CI workflow 与 scripts/setup-rust.sh
+# 同步显式指向同一版本。
+#
+# 升级流程：先在本地 cargo +<new-version> build/test 通过 → 同步本文件 +
+# .github/workflows/ci.yml + Cargo.toml 的 rust-version → PR review。
+
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
