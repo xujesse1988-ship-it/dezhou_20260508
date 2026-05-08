@@ -151,29 +151,23 @@ fn preflop_3bet_4bet_5bet_allin() {
 }
 
 // ============================================================================
-// 3. short_allin_does_not_reopen_raise (D-033 — 最关键 NLHE 陷阱)
+// 3. short_allin_does_not_reopen_raise (D-033 / D-033-rev1 — 最关键 NLHE 陷阱)
 // ============================================================================
 //
-// 场景：preflop 三人参与（BTN / SB / BB），SB 开 3bet，BB short all-in（差额
-// < SB 3bet 差额），轮到 BTN 时按 D-033，BTN 的 `Raise` 必须被拒绝。
+// 验证：incomplete raise 不为 **已-acted** 玩家重开 raise option。
 //
-// 详细数值（默认 6-max 100BB，SB=50/BB=100）：
-//   - BTN(seat 0) start stack = 10000
-//   - SB(seat 1) start stack = 10000，posts 50
-//   - BB(seat 2) start stack = 350 chips（小盲 100，强行让 short all-in 落于此）
+// 序列：BTN limp 100 → SB raise 300（full +200，last_full_raise 更新为 200）
+//   → BB AllIn 450（incomplete +150，**不**更新 last_full_raise、**不**修改任何
+//     raise option 标志，D-033-rev1 规则 4）
+//   → BTN Call 450（BTN 此前持有 SB full raise 开启的 option，但选择 call →
+//     按 D-033-rev1 规则 3 自身置 false）
+//   → 现在轮到 SB。
 //
-// 我们需自定义 starting_stacks 让 BB 短码。drive：
-//   BTN limp call(=100) → SB raise to 400（差额 350） → BB AllIn (= 350，BB 投入 350 - 100 = 250 chips diff，但其本街投入 = 350，差额相对前序 SB 的 to=400 为 -50：BB 没补足 SB 的 raise，是 "short call"，不是有效 raise。归一化为 Call 350 而非 Raise）。
+// SB 自己 raise 时已置 false（规则 2，raiser 自身置 false）。BB incomplete 不修改
+// 标志（规则 4），BTN call 也不修改他人标志（规则 3），故 SB 当前 raise option
+// = false → raise_range = None；显式 Action::Raise 必须返回 RaiseOptionNotReopened。
 //
-// 实际上要构造 "short all-in 形成 incomplete RAISE" 需要 BB 投入额 > 当前最高
-// committed 但差额 < 上一次有效 raise 差额。重新设计：
-//   - BTN(0) limp 100; SB(1) raise to 300（差额 200，min raise 链条上界 = 200）；
-//     BB(2) AllIn = 450（450 比 SB 的 300 大；但加注差额 = 450 - 300 = 150 < 200，
-//     按 D-033 不重开 raise option）。
-//   - 此时 BTN 想 raise，应被拒绝 → `RuleError::RaiseOptionNotReopened`。
-//   - BTN 仍可 Call 或 Fold。
-//
-// 为达成 BB stack = 450（即 100 BB + 350 stack），自定义 starting_stacks。
+// 自定义 starting_stacks：BB stack = 450，让 BB 短码触发 incomplete。
 #[test]
 fn short_allin_does_not_reopen_raise() {
     let mut cfg = TableConfig::default_6max_100bb();
@@ -181,7 +175,6 @@ fn short_allin_does_not_reopen_raise() {
     let total = expected_total_chips(&cfg);
     let mut s = GameState::new(&cfg, 2);
 
-    // UTG/MP/CO 弃 → BTN limp 100 → SB raise to 300 → BB AllIn (incomplete raise 450)
     drive(
         &mut s,
         total,
@@ -189,27 +182,32 @@ fn short_allin_does_not_reopen_raise() {
             (seat(3), Action::Fold),
             (seat(4), Action::Fold),
             (seat(5), Action::Fold),
-            (seat(0), Action::Call),
-            (seat(1), Action::Raise { to: chips(300) }),
-            (seat(2), Action::AllIn),
+            (seat(0), Action::Call),                     // BTN limp 100
+            (seat(1), Action::Raise { to: chips(300) }), // SB full raise (+200)
+            (seat(2), Action::AllIn),                    // BB incomplete 450 (+150)
+            (seat(0), Action::Call),                     // BTN call 450, 自身 option 置 false
         ],
     );
 
-    // 此时 current_player == BTN（seat 0）；legal_actions 必须 raise_range = None。
-    assert_eq!(s.current_player(), Some(seat(0)));
+    // 现在轮到 SB（seat 1）。SB 的 raise option 已关闭、其后无任何 full raise reopen。
+    assert_eq!(s.current_player(), Some(seat(1)));
     let la = s.legal_actions();
     assert!(
         la.raise_range.is_none(),
-        "D-033：BB short all-in 不重开 raise option，BTN 不应有 raise_range，got {:?}",
+        "D-033-rev1：SB 已-acted、其后 BB incomplete + BTN call 都不构成 reopen 事件，\
+         SB 的 raise_range 应为 None；实际 = {:?}",
         la.raise_range
     );
     assert!(la.fold, "LA-003：fold 永远合法");
-    assert!(la.call.is_some(), "BB 比 SB 高，BTN 仍需补 call");
+    assert!(
+        la.call.is_some(),
+        "SB committed 300 但桌面 max=450，仍需补 call"
+    );
 
-    // 显式尝试 raise，应返回 RaiseOptionNotReopened（或同义的 IllegalAction）。
+    // 显式尝试 raise，必须返回 RaiseOptionNotReopened（或同义的 IllegalAction）。
     let err = s
         .apply(Action::Raise { to: chips(900) })
-        .expect_err("D-033 拒绝路径");
+        .expect_err("D-033-rev1 拒绝路径");
     let msg = format!("{err}");
     assert!(
         msg.contains("raise option not reopened") || msg.contains("illegal action"),
@@ -218,21 +216,26 @@ fn short_allin_does_not_reopen_raise() {
 }
 
 // ============================================================================
-// 4. min_raise_chain_after_short_allin (D-035)
+// 4. min_raise_chain_after_short_allin (D-035 + D-033-rev1)
 // ============================================================================
 //
-// 与 #3 同结构：SB raise to 300（差额 200，full raise，更新链条上限），
-// BB short AllIn 450（差额 150，incomplete — D-033 不更新链条）。
-// 然后 BTN 选 Call 跟到 450，SB 回到行动权。如果 SB 选 Raise，按 D-035：
+// 验证：当 raise option 仍开启的玩家在 incomplete 之后行动时，**仍可 raise**；
+// 且 min_to 按 D-035 链条计算，**incomplete 不更新链条**。
 //
-//   - max_committed_this_round（SB 行动前）= 450（BB 推升，即使是 incomplete）
-//   - last_full_raise_size = 200（SB 上次自己 from-100-to-300 那次有效 raise）
-//   - 新 raise 的差额 = `to - max_committed_this_round_before` 必须 ≥ 200
-//   - ⇒ min legal `to` = 450 + 200 = 650
+// 序列：BTN limp 100 → SB raise 300（full +200，last_full_raise=200）
+//   → BB AllIn 450（incomplete +150，不更新 last_full_raise，规则 4a）
+//   → 现在轮到 BTN。
 //
-// 注意：NLHE 协议下"加注差额"定义在桌面 max_committed 之上，**不在自己 committed
-// 之上**。把链条算成"SB committed 300 + 200 = 500"是常见误读 —— 那意味着差额
-// 仅 50 chips（500 - 450），远低于 last_full_raise = 200，不构成合法 raise。
+// BTN 的 raise option：BTN limp 后自身置 false（规则 3）；SB 的 full raise 把所有
+// "尚未对其行动"的 active 玩家（含 BTN，BTN committed=100 < 新 max=300）置 true
+// （规则 2）。BB incomplete 不修改任何标志（规则 4b）。故 BTN 在此刻仍持有 raise
+// option = true，可加注。
+//
+// min_to = max_committed_this_round(450) + last_full_raise_size(200) = 650。
+// 注意：max_committed_this_round 已被 BB 的 incomplete 推到 450，但 last_full_raise
+// 保持 SB 的 200（规则 4a）。把链条算成"自己 committed 100 + 200 = 300"或
+// "max 450 + 150 = 600"都是常见误读 —— 加注差额定义在桌面 max_committed 之上、
+// 链条上限不被 incomplete 更新。
 #[test]
 fn min_raise_chain_after_short_allin() {
     let mut cfg = TableConfig::default_6max_100bb();
@@ -247,27 +250,25 @@ fn min_raise_chain_after_short_allin() {
             (seat(3), Action::Fold),
             (seat(4), Action::Fold),
             (seat(5), Action::Fold),
-            (seat(0), Action::Call),
-            (seat(1), Action::Raise { to: chips(300) }),
-            (seat(2), Action::AllIn), // incomplete raise 450
-            (seat(0), Action::Call),  // BTN 跟到 450
+            (seat(0), Action::Call),                     // BTN limp 100
+            (seat(1), Action::Raise { to: chips(300) }), // SB full raise (+200)
+            (seat(2), Action::AllIn),                    // BB incomplete 450
         ],
     );
 
-    // SB 现在面临 BTN 的 call 与 BB 的 incomplete raise，需要补 call 到 450（差 150）
-    // 或选择 raise；如果 raise，min_to 必须基于本轮 max_committed=450 + last_full_raise=200。
-    assert_eq!(s.current_player(), Some(seat(1)));
+    // 现在轮到 BTN（seat 0），BTN 的 raise option 仍 = true。
+    assert_eq!(s.current_player(), Some(seat(0)));
     let la = s.legal_actions();
-    let (min_to, _max_to) = la
-        .raise_range
-        .expect("SB 面对未匹配 incomplete raise，应仍可 raise");
-    // D-035：min raise to = max_committed_this_round(450) + last_full_raise_size(200) = 650.
-    // BB 的 incomplete all-in 推升 max_committed_this_round 到 450，但**不更新**
-    // last_full_raise（D-033）—— 链条上限保持 200。
+    let (min_to, _max_to) = la.raise_range.expect(
+        "D-033-rev1：BTN 在 incomplete 之前持有 SB full raise 开启的 option，\
+         incomplete 不修改标志，BTN 仍可 raise",
+    );
+    // D-035：min raise to = max_committed_this_round(450) + last_full_raise_size(200) = 650。
     assert_eq!(
         min_to,
         chips(650),
-        "D-035：min raise to = max_committed(450) + last_full_raise(200) = 650，实际 min_to = {min_to:?}"
+        "D-035：min raise to = max_committed_this_round(450) + last_full_raise_size(200) = 650；\
+         实际 min_to = {min_to:?}"
     );
 }
 
@@ -289,11 +290,13 @@ fn min_raise_chain_after_short_allin() {
 //   - BTN / BB committed_total = 1000
 //   - main pot（3-way @ 500）= 1500；side pot（2-way @ 500）= 1000
 //
-// 用 stacked deck 让 BB 拿到顶配 board → BB 赢两个 pot；SB 输 main 与不参与 side。
-// 验证：BB net = +500（main 1500-1000） + 500（side 1000-... 等）= +1000。
-//   BTN net = -1000；SB net = -500。
+// 用 stacked deck 让 BB 拿到顶配 board → BB 同时赢两个 pot；SB 与 BTN 都拿不到
+// 击败 BB 的牌型（在共享的板面 AAQJT 上 SB / BTN 各自只取得"对 A + QJT 杂牌"，
+// 输给 BB 的 AAAAQ）。验证净值：BB 投入 1000、赢 main 1500 + side 1000 = 2500，
+//   net = +1500（拆账：main +1000 = 1500-500，side +500 = 1000-500，合计 +1500）。
+//   BTN net = -1000；SB net = -500；零和。
 //
-// 牌序：让 BB 持 AsAh，board 出 AcAd2c3c5c → BB 拿四条 A（不可击败）。
+// 牌序：让 BB 持 AsAh，board 出 Ac Ad Th Jh Qh → BB 拿四条 A（AAAAQ，不可击败）。
 #[test]
 fn two_way_side_pot_basic() {
     let mut cfg = TableConfig::default_6max_100bb();
@@ -309,12 +312,12 @@ fn two_way_side_pot_basic() {
     //   deck[6]=SB-c1, deck[7]=BB-c1, deck[8]=UTG-c1, deck[9]=MP-c1, deck[10]=CO-c1, deck[11]=BTN-c1,
     //   deck[12..15]=flop, deck[15]=turn, deck[16]=river.
     let holes = vec![
-        (card(0, 0), card(1, 1)),   // SB(1): 2c, 2d (随便给短码 SB 弱牌)
+        (card(0, 0), card(1, 1)),   // SB(1): 2c, 3d (短码 SB 杂牌；与代码一致)
         (card(12, 3), card(12, 2)), // BB(2): As, Ah
         (card(2, 0), card(3, 1)),   // UTG(3)
         (card(4, 0), card(5, 1)),   // MP(4)
         (card(6, 0), card(7, 1)),   // CO(5)
-        (card(0, 1), card(1, 0)),   // BTN(0)（被发到 deck[5]/[11]）
+        (card(0, 1), card(1, 0)),   // BTN(0): 2d, 3c（被发到 deck[5]/[11]）
     ];
     // build_dealing_order 内部按 holes[k] = 第 k 个发牌座位 (即 SB, BB, UTG, MP, CO, BTN)
     let flop = [card(12, 0), card(12, 1), card(8, 2)]; // Ac, Ad, 10h
@@ -362,7 +365,11 @@ fn two_way_side_pot_basic() {
             .map(|(_, n)| *n)
             .unwrap_or_else(|| panic!("seat {sid} not in payouts"))
     };
-    assert_eq!(net(2), 1000, "BB 赢两个 pot 净 +1000");
+    assert_eq!(
+        net(2),
+        1500,
+        "BB 同时赢两个 pot：净 +1500（赢 2500 - 投入 1000）"
+    );
     assert_eq!(net(0), -1000, "BTN 输全部投入");
     assert_eq!(net(1), -500, "SB 输短码全部 (= 500)");
     let net_sum: i64 = payouts.iter().map(|(_, n)| n).sum();

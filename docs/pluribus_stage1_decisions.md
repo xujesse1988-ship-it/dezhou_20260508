@@ -164,6 +164,66 @@
 - D-102 修改若影响 API 签名，必须同步修改 `pluribus_stage1_api.md` 并通知正在工作的 agent
 - D-103 决策修改 PR 必须经过决策者 review 后合入
 
+### 修订历史
+
+- **D-033-rev1** (2026-05-08)：把 D-033 + `pluribus_stage1_validation.md` §1 第 22 行
+  "incomplete raise 不重开 raise option" 的精确语义钉为 **TDA Rule 41 / PokerKit
+  一致** 解读，澄清 "哪类玩家在 incomplete 之后仍可加注"。
+  - **背景**：原 D-033 文字仅说 "incomplete 不重开"；validation §1 第 22 行说
+    "后续未行动玩家只能 call/fold"。两句对 **已行动玩家** 无显式约束、对
+    "未行动" 一词不区分两种状态：(a) "本轮 betting 内尚未做过任何动作"；
+    (b) "已做过动作但尚未对当前最高 full raise 作出回应"。B1 评审第二轮
+    发现 `tests/scenarios.rs` #3 与 #4 在不同解读下分别为真，互相矛盾。
+  - **新规则（TDA-41 等价表述）**：
+    1. **raise option 状态** 为 per-player 一比特：`true` = 仍可加注；
+       `false` = 已关闭。
+       - 初值：postflop 街起手所有 `Active` 玩家 = `true`；preflop BB 在
+         `max_committed_this_round` 仍 == BB（即面对 limp / 无人加注）时
+         = `true`，否则 = `false`；其余玩家 preflop 起手 = `true`。
+    2. **full raise**（差额 ≥ `last_full_raise_size`）发生时：raiser 自身
+       置 `false`；所有 `Active` 且 **尚未对该 full raise 行动**
+       （`committed_this_round` < 新 `max_committed_this_round`）的玩家置
+       `true`。同时更新 `last_full_raise_size = 新差额`。
+    3. **call / fold**：不影响他人；自身置 `false`（call 后已回应；fold
+       后退出）。
+    4. **incomplete raise / short all-in**（差额 < `last_full_raise_size`）：
+       a) **不更新** `last_full_raise_size`（D-035 链条上限不动）。
+       b) **不修改** 任何玩家的 raise option 标志。
+       c) 仅推升 `max_committed_this_round` 并把推升者标为 `AllIn`。
+    5. `legal_actions().raise_range` 仅当当前玩家的 raise option 标志
+       = `true` 且 `stack > 0` 时为 `Some`，`min_to = max_committed_this_round
+       + last_full_raise_size`（D-035）。
+  - **等价口语化表述**："incomplete 不重开 raise option" 仅意味着 incomplete
+    本身 **不充当 reopen 事件**——它 **不** 意味着所有人此后都不能加注；
+    在 incomplete 之前 raise option 仍是开启状态的玩家不受影响。
+  - **影响**：
+    - `tests/scenarios.rs` #3 / #4 的 setup 完全保留，但因 actor 不同断言
+      互换：
+      - **#3 `short_allin_does_not_reopen_raise`**：执行到 BTN Call 450 之后
+        测 SB 的视角——SB 已-acted 且其后无 full raise，`raise_range = None`，
+        显式 `Action::Raise` 返回 `RuleError::RaiseOptionNotReopened`。
+      - **#4 `min_raise_chain_after_short_allin`**：执行到 BB AllIn 之后即
+        停，测 BTN 的视角——BTN 仍持有 SB full raise 开启的 raise option，
+        `raise_range = Some`，`min_to = 650 = max_committed(450) +
+        last_full_raise(200)`。
+      详见同 PR `tests/scenarios.rs` patch。
+    - `pluribus_stage1_validation.md` §1 第 22 行措辞同步收紧（同 PR 改），
+      新条文显式指向 D-033-rev1。
+    - **不** 影响 `Action` / `LegalActionSet` / `RuleError` 公开签名，无需
+      `API-NNN-revM`。
+    - **不** 影响 `HandHistory` protobuf schema，不 bump `schema_version`。
+    - 实现侧（B2 起）：`GameState` 内部需维护 per-player
+      `raise_option_open: bool` 标志，按上述规则 1–4 维护；`legal_actions`
+      按规则 5 暴露。
+  - **与 PokerKit 的对齐**：本解读与 PokerKit 默认行为一致，期望 C2 阶段
+    100k 手 cross-validation 在 short all-in 路径上 0 分歧；若实测发现
+    PokerKit 偏离 TDA-41，追加 D-033-rev2 重新对齐并在 D-086 显式标注配置
+    差异。
+  - **撤销条件**：若决策者后续选择 "严格 / 简化" 语义（任何人在 incomplete
+    之后都不能 raise），需追加 D-033-rev2、翻转 `tests/scenarios.rs` #4
+    的 `raise_range` 断言、并在 D-086 给 PokerKit 引入显式配置差异碳证
+    （D-083 之外的合法分歧来源）。
+
 ---
 
 ## 11. 已知未决项（不阻塞 A1）

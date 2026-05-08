@@ -19,7 +19,7 @@
 - 随机模拟 `1,000,000` 手牌，不能出现非法状态、负筹码、重复牌、无人获胜、pot 金额不守恒。
 - 每手结束时验证：`所有玩家筹码总和 + 桌面未结算筹码 = 初始总筹码`。
 - 每个 betting round 结束时验证：未 fold 且未 all-in 的玩家投入额相同。
-- short all-in 不重开 raise option 规则：当前序加注差额不足以构成 min-raise（incomplete raise / short all-in）时，后续未行动玩家只能 call/fold，不能再 raise。必须有专门测试覆盖该路径。
+- short all-in 不重开 raise option 规则：当前序加注差额不足以构成 min-raise（incomplete raise / short all-in）时，**raise option 此前已被关闭** 的玩家（即已对当前最高 full raise 作出 call / fold / 自身 raise 回应的玩家）只能 call/fold，不能再 raise；**raise option 仍处于开启状态** 的玩家（即尚未对当前最高 full raise 作出回应的玩家）不受 incomplete 影响，仍可加注，且 `min_to` 按 D-035 链式约束计算（`last_full_raise_size` 不被 incomplete 更新）。精确语义见 `pluribus_stage1_decisions.md` §10 修订历史 D-033-rev1。必须有专门测试同时覆盖 "已关闭被拒" 与 "仍开启可加" 两条路径。
 - min-raise 链式约束：每一次 raise 的加注差额必须 `>=` 本轮已发生的最大有效加注差额；首次开局 raise 的最小金额为大盲。
 - 全员（除一名）all-in 后必须跳过后续下注轮，直接发完剩余公共牌进入摊牌。
 - showdown 顺序必须固定可复现：最后激进 (last aggressor) 玩家先亮牌；若无激进者按位置顺序亮牌。该顺序写入 hand history。
