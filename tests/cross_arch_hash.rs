@@ -162,6 +162,64 @@ fn cross_arch_hash_capture_only() {
     print!("{}", out);
 }
 
+/// D-052 跨架构 32-seed 样本一致性 regression guard（D1 [测试]）。
+///
+/// 直接比较 `tests/data/arch-hashes-linux-x86_64.txt` 与
+/// `tests/data/arch-hashes-darwin-aarch64.txt` 两份 baseline 的字节内容；不依赖
+/// 当前 host 架构，所以在任意 (os, arch) 上跑都成立。两份文件都存在且 byte-equal
+/// 时通过；只要有一份缺失 → eprintln 跳过（不算失败，validation §6 要求「文档
+/// 标注当前是否达到」即可）；都存在但 byte-diff → fail，把前 5 行差异 panic。
+///
+/// 当前状态（2026-05-08，D1 commit）：32 seeds 样本 byte-equal，**32-seed 样本
+/// 上跨架构一致达成**；validation §6 / D-052 字面仍是 「期望目标」，本测试不擅
+/// 自把它升级为「必过门槛」，只作 lasting regression guard：未来 toolchain 升级
+/// / refactor 引入跨架构漂移时第一时间在 CI 触发。
+#[test]
+fn cross_arch_baselines_byte_equal_when_both_present() {
+    let manifest = match std::env::var("CARGO_MANIFEST_DIR") {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("[cross-arch-pair] CARGO_MANIFEST_DIR unset; skip");
+            return;
+        }
+    };
+    let linux = PathBuf::from(&manifest)
+        .join("tests")
+        .join("data")
+        .join("arch-hashes-linux-x86_64.txt");
+    let darwin = PathBuf::from(&manifest)
+        .join("tests")
+        .join("data")
+        .join("arch-hashes-darwin-aarch64.txt");
+    let (a, b) = match (fs::read_to_string(&linux), fs::read_to_string(&darwin)) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            eprintln!(
+                "[cross-arch-pair] one or both baselines missing; skip (linux={} darwin={})",
+                linux.display(),
+                darwin.display(),
+            );
+            return;
+        }
+    };
+    if a.trim() == b.trim() {
+        return;
+    }
+    let mut diff = Vec::new();
+    for (i, (la, lb)) in a.lines().zip(b.lines()).enumerate() {
+        if la != lb {
+            diff.push(format!("line {i}: linux={la:?} darwin={lb:?}"));
+            if diff.len() >= 5 {
+                break;
+            }
+        }
+    }
+    panic!(
+        "D-052 regression: linux-x86_64 vs darwin-aarch64 baselines diverge:\n{}\n",
+        diff.join("\n")
+    );
+}
+
 // ============================================================================
 // 共享：随机一手驱动（与 determinism.rs / history_roundtrip.rs 同模板）
 // ============================================================================
