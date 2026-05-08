@@ -11,7 +11,8 @@ edition = "2021"
 #   cargo +nightly install cargo-fuzz
 #   cargo +nightly fuzz run random_play -- -max_total_time=300
 #
-# CI 短任务：max_total_time=300 (5 分钟)；夜间任务：86400 (24h, self-hosted runner)。
+# CI 短任务：max_total_time=300 (5 分钟)；夜间任务：20700 (5h45m, GitHub-hosted
+# matrix 2 target 并行，单 job 受 GH-hosted 6h 上限约束)。
 # Workflow §D1 §输出 第 5 条：每次 push 跑 100k 手 fuzz 5 分钟内 — 由 CI fuzz-quick
 # job 触发本 crate 的 random_play target。
 #

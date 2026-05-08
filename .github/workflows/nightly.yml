@@ -1,22 +1,21 @@
-name: Nightly fuzz (24h)
+name: Nightly fuzz
 
-# D1 §输出 第 4 条：24 小时夜间 fuzz 任务。
+# D1 §输出 第 4 条：夜间 fuzz 任务。
 #
-# 运行环境：**self-hosted runner**（GitHub-hosted runner 单 job 6h 上限不够 24h）。
-# 用户在自己的服务器上 register 一个 self-hosted runner，打 label `linux`、`x64`、
-# `fuzz`；本 workflow 会调度到它。
+# **运行环境：GitHub-hosted ubuntu-latest**（不维护 self-hosted runner）。
 #
-# Self-hosted runner 一次性配置（Linux）：
-#   1. GitHub repo Settings → Actions → Runners → New self-hosted runner
-#   2. 按页面提示在目标机器上跑 ./config.sh / ./run.sh，labels 填
-#      `self-hosted,linux,x64,fuzz`。
-#   3. 在该机器上预装 nightly toolchain：
-#        rustup install nightly
-#        cargo +nightly install cargo-fuzz --locked
-#   4. 该机器需有持续上电 + 网络稳定（24h 任务）。
+# 单 job 时长上限 6h（GitHub-hosted 硬性限制；超时 job 直接被 kill），所以本
+# workflow 走 matrix 把 random_play / history_decode 两个 target 并行各跑 5h50m
+# 每晚累计 fuzz 时间约 11h40m，覆盖介于 ci.yml fuzz-quick (10 min/push) 和 spec
+# 原计划的 24h self-hosted 之间的中间态。**workflow §D1 §输出 第 4 条 「24 小时」
+# 字面未达成，但 spec 意图（扩展时长 fuzz 覆盖低频 bug）以 ~12h/天 + 多日累计的
+# 形式实现**。需要严格 24h 单跑时再切回 self-hosted（保留 git history commit
+# 43cfedd^ 即上一版的 self-hosted yml 可恢复）。
 #
-# 触发：每天 02:00 UTC 自动跑一次；也支持手动 dispatch。
-# 单次 24h 总时长（86400 秒）跨 random_play / history_decode 两个 target 各 12h。
+# 预算考虑：matrix 2 × 5h50m × 30 天 ≈ 350h GH-Actions 分钟/月。public repo 免费；
+# private repo 远超 2000-min 免费额度，需付费或降为 1 个 target。
+#
+# 触发：每天 02:00 UTC 自动；workflow_dispatch 可手动触发。
 
 on:
   schedule:
@@ -24,30 +23,37 @@ on:
   workflow_dispatch:
 
 jobs:
-  fuzz-24h:
-    runs-on: [self-hosted, linux, x64, fuzz]
-    timeout-minutes: 1500  # 25h，留余量给 setup / teardown
+  fuzz:
+    name: cargo fuzz ${{ matrix.target }} ~5h50m
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # 5h50m，留 10 分钟 buffer 给 nightly toolchain 安装 + cargo fuzz install
+    strategy:
+      fail-fast: false  # 一个 target 出 crash artifact 不要 cancel 另一个
+      matrix:
+        target: [random_play, history_decode]
     steps:
       - uses: actions/checkout@v4
 
-      - name: ensure nightly toolchain present
-        run: |
-          rustup show
-          cargo +nightly --version
-          cargo +nightly fuzz --version || cargo +nightly install cargo-fuzz --locked
+      - uses: dtolnay/rust-toolchain@nightly
 
-      - name: fuzz random_play (12h)
-        run: cargo +nightly fuzz run random_play -- -max_total_time=43200
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz"
 
-      - name: fuzz history_decode (12h)
-        run: cargo +nightly fuzz run history_decode -- -max_total_time=43200
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: fuzz ${{ matrix.target }} 5h45m
+        # libFuzzer -max_total_time 单位秒；20700 = 5h45m，给 timeout-minutes 留
+        # 5 分钟 cleanup buffer，避免 GH kill 掉进程导致 artifact 丢失。
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=20700
 
       - name: upload fuzz artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: nightly-fuzz-artifacts
+          name: nightly-fuzz-${{ matrix.target }}-artifacts
           path: |
-            fuzz/artifacts/
-            fuzz/corpus/
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz/corpus/${{ matrix.target }}/
           if-no-files-found: ignore
