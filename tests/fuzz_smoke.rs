@@ -259,6 +259,24 @@ fn fuzz_smoke_ten_hands_aggregate() {
     );
 }
 
+/// B2 出口验证：随机动作 fuzz 10,000 手，每手每步无 invariant 违反。
+#[test]
+fn fuzz_b2_10000_hands_no_invariant_violations() {
+    let mut report = FuzzReport::default();
+    for seed in 0..10_000u64 {
+        report.record(run_one_hand(seed, 256));
+    }
+    eprintln!("[fuzz-b2-10000] {:?}", report);
+    assert_eq!(report.hands_attempted, 10_000);
+    assert_eq!(
+        report.hands_clean, 10_000,
+        "B2 fuzz failed: {:?}",
+        report.first_failure
+    );
+    assert_eq!(report.hands_failed_invariant, 0);
+    assert_eq!(report.hands_panicked, 0);
+}
+
 // ============================================================================
 // 入口占位：D1 升级到 cargo fuzz target / 1M 手
 // ============================================================================
