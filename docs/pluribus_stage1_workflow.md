@@ -490,3 +490,31 @@ D. **benchmark harness 骨架**（无 SLO 断言）：
 - OpenSpiel poker：https://github.com/google-deepmind/open_spiel
 - Cactus Kev 5-card 评估器：http://suffe.cool/poker/evaluator.html
 - Two-Plus-Two 7-card 评估器：https://github.com/chenosaurus/poker-evaluator
+
+---
+
+## 修订历史
+
+### B-rev1（2026-05-08）：B2 关闭后角色边界追认
+
+B2 [实现] 步骤在 codex 分支落地（commits `38050fa..efdd4db`）。出口标准 4 项均达成（10 个 scenario / 100 手 PokerKit cross-validation 0 分歧 / 10,000 手 fuzz 0 invariant 违反 / criterion bench 产出占位数据），但实施过程中 [实现] agent 修改了两个 `tests/` 文件，形式上越过了 §B2 「不修改测试」 的角色边界。本节为该越界做书面追认。
+
+**越界事实**：
+
+1. `tests/cross_validation.rs`（+320 / −89）：把 B1 留下的 `naive_payouts_match` trip-wire panic 替换为完整的 serde_json 严格比对，并在原 1 + 10 手 mini-batch 之外新增 `cross_validation_pokerkit_100_random_hands` 出口测试（B2 出口标准 #2）。
+2. `tests/fuzz_smoke.rs`（+18）：在 1 + 10 手 mini-batch 之外新增 `fuzz_b2_10000_hands_no_invariant_violations` 出口测试（B2 出口标准 #3）。
+
+**追认理由**：
+
+- §B1 在 `naive_payouts_match` 函数体里就明确写了 「**必须**先在这里实现严格 serde_json 解析与 final_payouts / showdown_order 字段比对，否则交叉验证会无声地把所有 ok=true 响应判为 Match」，并在注释里把激活时点钉到 「B2 cross-validation 激活之前」。换言之，该补全是 B1 设计上**预留给 B2** 的洞，未补则出口标准 #2 无法验证；其性质介于「B1 的 [测试] 收尾」与「B2 的 [实现] 前置」之间。
+- 10k 手 fuzz 出口测试与产品代码强耦合（驱动器调 `legal_actions` / `apply` 全 happy-path），它**就是** B2 的出口断言本身，与产品实现互为前后件。
+- D-039-rev1 的修订完全遵循 §B2 风险条款 「不要假设我方对、参考实现错」：100 手 cross-validation 暴露 1-chip 分歧后，先 review 我方逻辑，再确认 PokerKit 0.4.14 的 chips-pushing divmod 语义是更合理的工业基准，最后通过 D-100 修订流程对齐。
+
+**未来类似情况的处理政策**：
+
+1. **优先拆分 commit**：B1 留白 + B2 补全，commit owner / branch 标注 [测试]，让 [实现] agent 只触产品代码。
+2. **不得不顺手补测试时**：必须在该步骤的 closure 评审里**显式追认**（本节即此先例），并说明：（a）越界范围；（b）为什么不能由 [测试] agent 在前置步骤完成；（c）是否需要回填到先前步骤的产出清单。
+3. **C 阶段起的标准回归**：C1 [测试] / C2 [实现] 切换时严格校验角色边界，避免 B2 的 carve-out 静默扩散。`tests/cross_validation.rs` 的 strict 比对一旦在 C2 出现回归，由 C1 的 [测试] agent 负责修，不再由 C2 [实现] agent 顺手改。
+4. **CLAUDE.md 同步责任**：每个 [实现] / [测试] 步骤关闭后，下一个 agent 启动前，必须有一笔 `docs(CLAUDE.md): X 完成后状态同步` 把仓库状态、出口数据、修订历史索引补齐。
+
+**与 D-039-rev1 的关系**：D-039-rev1 是 B2 期间触发的 [决策] 修订，按 `decisions.md` §10 / `validation.md` §3 修订流程独立追加，不属于本 B-rev1 角色边界范畴；记此关联以便日后追溯。
