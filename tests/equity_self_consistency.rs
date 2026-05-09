@@ -14,6 +14,13 @@
 //! 结果或断言失败，流程不 panic"，默认 `cargo test` 不触发；B2 [实现] 落地
 //! `MonteCarloEquity` 后取消 `#[ignore]`。
 //!
+//! **B-rev0 carve-out（继承 stage-1 §B-rev1 §3 同型）**：B1 §出口 line 250
+//! "harness 流程不 panic" 与 [实现] agent "禁修测试代码" 规则在本文件硬冲突
+//! ——A1 全 `unimplemented!()` 状态下只有 `#[ignore]` 才能避免默认 panic。
+//! 解决方案：B2 [实现] 闭合 commit 同 commit **取消 C 类 equity `#[ignore]`**
+//! （[测试] 角色越界，由 §B-rev1 同型 carve-out 追认）。详见
+//! `pluribus_stage2_workflow.md` §修订历史 §B-rev0 carve-out 段落。
+//!
 //! 容差源：D-220a-rev1（`pluribus_stage2_decisions.md` §3 / API §9
 //! EQ-001-rev1）。容差由 [决策] 锁定，[测试] 不自己拍数。
 //!
@@ -389,4 +396,130 @@ fn equity_invalid_input_returns_err() {
         matches!(r3, Err(EquityError::OverlapHole { .. })),
         "EQ overlap hole → Err(OverlapHole)"
     );
+}
+
+// ============================================================================
+// 9. EquityError::IterTooLow（API §3 EquityCalculator 5 类错误之一）
+// ============================================================================
+//
+// `MonteCarloEquity::with_iter(0)` 后调用 `equity` / `equity_vs_hand` /
+// `ehs_squared` / `ochs` 任一接口必须返回 `Err(EquityError::IterTooLow {
+// got: 0 })`。D-220 默认 10_000 不触发，stage 4 消融 / 错配置时触发。
+//
+// 当前测试 8 仅覆盖 OverlapBoard / InvalidBoardLen / OverlapHole 3 类，
+// IterTooLow 未覆盖；本测试补完。
+#[test]
+#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
+fn equity_iter_too_low_returns_err() {
+    use poker::EquityError;
+
+    let calc = make_calc_default().with_iter(0);
+    let mut rng = ChaCha20Rng::from_seed(0xDEAD_BEEF);
+    let board = preflop_board();
+
+    let r = calc.equity(aa(), &board, &mut rng);
+    assert!(
+        matches!(r, Err(EquityError::IterTooLow { got: 0 })),
+        "iter=0 → Err(IterTooLow {{ got: 0 }})，got {r:?}"
+    );
+
+    // equity_vs_hand 同样路径。
+    let r2 = calc.equity_vs_hand(aa(), kk(), &board, &mut rng);
+    assert!(
+        matches!(r2, Err(EquityError::IterTooLow { got: 0 })),
+        "iter=0 / equity_vs_hand → Err(IterTooLow)，got {r2:?}"
+    );
+}
+
+// ============================================================================
+// 10. OCHS shape + finite + range invariant（EQ-002-rev1 / D-222）
+// ============================================================================
+//
+// API §3 / EQ-002-rev1（line 473）字面：`ochs` 返回 `Ok(v)` 时 `v.len() ==
+// n_opp_clusters` 且每维 `∈ [0.0, 1.0]` 且 finite。任一 NaN / Inf / 越界是 P0
+// 阻塞 bug。
+//
+// **stage-2 默认 N=8**（D-222），本测试断言 v.len() == 8、每维 finite、每维
+// `∈ [0.0, 1.0]`。stage 4 消融如果改了 `with_opp_clusters` 配置，本测试自动
+// 通过 `n_opp_clusters()` getter 读到的实际 N 校验 shape。
+#[test]
+#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
+fn ochs_shape_finite_range_smoke() {
+    let calc = make_calc_default();
+    let board = flop_board();
+    let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+        0xCAFE_BABE_F00D,
+        EQUITY_MONTE_CARLO,
+        500,
+    ));
+
+    let v = calc
+        .ochs(aa(), &board, &mut rng)
+        .expect("flop OCHS：合法输入");
+
+    // EQ-002-rev1 shape：v.len() == n_opp_clusters。
+    let n = calc.n_opp_clusters() as usize;
+    assert_eq!(
+        v.len(),
+        n,
+        "EQ-002-rev1：ochs.len() ({}) == n_opp_clusters ({})",
+        v.len(),
+        n
+    );
+    assert_eq!(n, 8, "D-222：stage 2 默认 n_opp_clusters = 8");
+
+    // EQ-002-rev1 finite + range：每维 finite ∧ ∈ [0.0, 1.0]。
+    for (idx, x) in v.iter().enumerate() {
+        assert!(
+            x.is_finite(),
+            "EQ-002-rev1：ochs[{idx}] 必须 finite，got {x}"
+        );
+        assert!(
+            (0.0..=1.0).contains(x),
+            "EQ-002-rev1：ochs[{idx}] ∈ [0.0, 1.0]，got {x}"
+        );
+    }
+}
+
+// ============================================================================
+// 11. ehs_squared finite + range invariant（EQ-002-rev1）
+// ============================================================================
+//
+// EQ-002-rev1 字面：`ehs_squared` 返回 `Ok(x)` 时 `x ∈ [0.0, 1.0]` 且 finite。
+// river 状态退化为 `equity²`（D-227 rollout=0）。本测试断言 flop / turn / river
+// 三街的 `ehs_squared` 输出落在 EQ-002-rev1 不变量内。
+#[test]
+#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
+fn ehs_squared_finite_range_smoke() {
+    let calc = make_calc_default();
+    let mut rng_flop = ChaCha20Rng::from_seed(derive_substream_seed(
+        0xCAFE_BABE_F00D,
+        EQUITY_MONTE_CARLO,
+        600,
+    ));
+    let mut rng_turn = ChaCha20Rng::from_seed(derive_substream_seed(
+        0xCAFE_BABE_F00D,
+        EQUITY_MONTE_CARLO,
+        601,
+    ));
+    let mut rng_river = ChaCha20Rng::from_seed(derive_substream_seed(
+        0xCAFE_BABE_F00D,
+        EQUITY_MONTE_CARLO,
+        602,
+    ));
+
+    for (board, rng, label) in [
+        (flop_board(), &mut rng_flop, "flop"),
+        (turn_board(), &mut rng_turn, "turn"),
+        (river_board(), &mut rng_river, "river"),
+    ] {
+        let x = calc
+            .ehs_squared(aa(), &board, rng)
+            .unwrap_or_else(|e| panic!("{label} ehs²: 合法输入返 Ok, got Err({e:?})"));
+        assert!(x.is_finite(), "EQ-002-rev1 ehs² {label}：finite, got {x}");
+        assert!(
+            (0.0..=1.0).contains(&x),
+            "EQ-002-rev1 ehs² {label}：∈ [0.0, 1.0], got {x}"
+        );
+    }
 }

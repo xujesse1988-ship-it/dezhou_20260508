@@ -163,11 +163,17 @@ fn action_abs_fold_disallowed_after_check() {
 // ============================================================================
 //
 // D-205 / AA-003-rev1 ① fallback：`x×pot < min_to` 时 candidate_to ← min_to
-// （不剔除）。NLHE pot 随 call 增长，default 100BB 配置下 0.5×pot raise 几乎
-// 总满足 ≥ min_to。本测试断言**结构性不变量**——任何 Raise candidate 的 `to`
-// ≥ stage 1 `LegalActionSet.raise_range.min_to`：fallback 触发时落到 min_to，
-// 未触发时落到 ratio×pot 但仍 ≥ min_to。具体 fallback 数值场景留 C1 200+
-// scenarios。
+// （**不剔除**——candidate 必须保留，仅 to 字段升到 min_to）。
+//
+// 本测试用极小自定义 ratio = 0.001（量化 milli=1）人为构造 `x×pot < min_to`
+// 场景，确保 fallback 路径被真正驱动而非"恰好满足"。UTG 开局：pot=150，
+// max_committed=100，min_to=200；0.001×pot raise candidate ≈ 100 + 0.001×250 ≈
+// 100.25，远低于 min_to=200。AA-003-rev1 ① 要求输出 Raise { to=200,
+// ratio_label=BetRatio(milli=1) }（候选保留，to 升到 min_to）；若 [实现] 误
+// 把 under-min candidate 直接丢弃，本测试 fail。
+//
+// （前一版本仅做"`Raise.to >= min_to` 结构性断言"，无法分辨 [实现] 是否真的
+// 走了 fallback 路径——0.5×pot 在默认 100BB 上恰好 ≥ min_to，候选丢失也能过。）
 #[test]
 fn action_abs_bet_pot_falls_back_to_min_raise_when_below() {
     use poker::SeatId;
@@ -182,11 +188,43 @@ fn action_abs_bet_pot_falls_back_to_min_raise_when_below() {
         .map(|(min, _max)| min)
         .expect("UTG 开局应可 raise（LA-005）");
 
-    let abs = DefaultActionAbstraction::default_5_action();
+    // 自定义 ratio = 0.001 (milli=1)：极小，必然 < min_to ⇒ 必触 AA-003-rev1 ①。
+    let cfg = ActionAbstractionConfig::new(vec![0.001])
+        .expect("D-202-rev1：单元素 0.001 合法（milli=1，∈ [1, u32::MAX]）");
+    let tiny_label = cfg.raise_pot_ratios[0];
+    assert_eq!(
+        tiny_label.as_milli(),
+        1,
+        "fixture：0.001 量化到 milli=1（half-to-even）"
+    );
+    let abs = DefaultActionAbstraction::new(cfg);
     let actions = abs.abstract_actions(&s);
     let slice = actions.as_slice();
 
-    // AA-003-rev1 ①：所有 Raise candidate 的 to ≥ min_to。
+    // AA-003-rev1 ①：under-min candidate 必须**保留**——输出中必须存在
+    //   Raise { to = min_to, ratio_label = tiny_label }，不可被丢弃。
+    let raise = slice
+        .iter()
+        .find(|a| matches!(a, AbstractAction::Raise { ratio_label, .. } if *ratio_label == tiny_label))
+        .unwrap_or_else(|| {
+            panic!(
+                "AA-003-rev1 ①：tiny ratio (milli=1) candidate 必须保留并 fallback 到 min_to，\
+                 不可被丢弃；输出 = {slice:?}"
+            )
+        });
+    let raise_to = match raise {
+        AbstractAction::Raise { to, .. } => *to,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        raise_to.as_u64(),
+        min_to.as_u64(),
+        "AA-003-rev1 ①：tiny ratio fallback 到 min_to ({}), got {}",
+        min_to.as_u64(),
+        raise_to.as_u64()
+    );
+
+    // 旁路结构性断言：所有 Raise candidate 的 to ≥ min_to（保留作冗余 invariant）。
     let raise_tos: Vec<ChipAmount> = slice
         .iter()
         .filter_map(|a| match a {
@@ -253,6 +291,201 @@ fn action_abs_bet_falls_back_to_allin_when_above_stack() {
         allin_to.as_u64(),
         450,
         "AA-003-rev1 ②：AllIn.to = committed + stack"
+    );
+}
+
+// ============================================================================
+// 4b. action_abs_short_bb_3bet_min_to_above_stack_priority
+// ============================================================================
+//
+// API §F20 影响 ③（`pluribus_stage2_api.md` line 797）字面要求：B1 [测试]
+// `tests/action_abstraction.rs` 阶段 2 版必须含**至少 2 个 case**断言短码 BB
+// 面对 3-bet → `min_to >= committed + stack` 时 AA-003-rev1 ①+② 同时触发的
+// 优先级（first-match-wins ① → ②，等价口语化：先 floor 到 min_to，再 ceil
+// 到 committed+stack；同时触发走 AllIn）。
+//
+// **Case 1（AA-003-rev1 ①+② 联合优先级）**：BB starting_stack=800（盲注 100
+// 扣后 stack=700，committed_this_round=100，cap=committed+stack=800），UTG
+// raise to 200 → BTN 3-bet to 500 → SB fold → BB 决策。BB max_committed=500，
+// last_full_raise_size=300，min_to=500+300=800；cap=800 ≥ min_to=800 ⇒ stage 1
+// raise_range = Some((800, 800))（min_to == cap，"all-in-only-raise" 边界）。
+//
+// 用自定义 ratio = 0.001 (milli=1) 驱动 ①：candidate_to ≈ call_to + 0.001×pot
+// 远小于 min_to=800 ⇒ ① floor 到 min_to=800；继而 800 ≥ committed+stack=800 ⇒
+// ② ceil 到 AllIn { to=800 }。两步顺序固定（先 floor 再 ceil），同时触发时
+// 走 AllIn——这是 AA-003-rev1 ①+② **联合优先级**唯一可观测路径（API §F20
+// 影响 ③）。
+//
+// 断言：① AllIn { to = 800 } 存在（联合优先级输出）；② 输出中**无**带 tiny
+// ratio_label 的 Raise candidate（① 后的 min_to=800 candidate 必须被 ② 吸收
+// 进 AllIn，不应作为独立 Raise 出现）；③ Call { to = 500 } 存在（与 AllIn
+// 不同 to，AA-004-rev1 dedup 不触）。
+#[test]
+fn action_abs_short_bb_3bet_min_to_above_stack_priority_case1() {
+    use poker::SeatId;
+    let mut tcfg = TableConfig::default_6max_100bb();
+    tcfg.starting_stacks[2] = ChipAmount::new(800); // BB starting=800 ⇒ cap=800
+    let mut s = GameState::new(&tcfg, 0);
+
+    // UTG raise to 200 → MP/CO fold → BTN 3-bet to 500 → SB fold → BB 决策。
+    assert_eq!(s.current_player(), Some(SeatId(3)));
+    s.apply(Action::Raise {
+        to: ChipAmount::new(200),
+    })
+    .expect("UTG open raise");
+    for seat_idx in [4u8, 5] {
+        assert_eq!(s.current_player(), Some(SeatId(seat_idx)));
+        s.apply(Action::Fold).expect("fold");
+    }
+    assert_eq!(s.current_player(), Some(SeatId(0)));
+    s.apply(Action::Raise {
+        to: ChipAmount::new(500),
+    })
+    .expect("BTN 3-bet");
+    assert_eq!(s.current_player(), Some(SeatId(1)));
+    s.apply(Action::Fold).expect("SB fold");
+
+    assert_eq!(s.current_player(), Some(SeatId(2)));
+    let la = s.legal_actions();
+    let raise_range = la
+        .raise_range
+        .expect("fixture: cap = min_to ⇒ raise_range = Some");
+    assert_eq!(
+        (raise_range.0.as_u64(), raise_range.1.as_u64()),
+        (800, 800),
+        "fixture：min_to == cap == 800（AA-003-rev1 ①+② 联合优先级边界）"
+    );
+
+    // 自定义 tiny ratio [0.001] 触发 ① floor 到 min_to=800 → ② ceil 到 AllIn。
+    let abs_cfg = ActionAbstractionConfig::new(vec![0.001])
+        .expect("D-202-rev1：单元素 0.001 合法（milli=1）");
+    let tiny_label = abs_cfg.raise_pot_ratios[0];
+    let abs = DefaultActionAbstraction::new(abs_cfg);
+    let actions = abs.abstract_actions(&s);
+    let slice = actions.as_slice();
+
+    // ① AllIn { to = 800 } 存在。
+    let allin = slice
+        .iter()
+        .find(|a| matches!(a, AbstractAction::AllIn { .. }))
+        .expect("AA-003-rev1 ①+②：联合优先级 ⇒ AllIn 必须出现");
+    let allin_to = match allin {
+        AbstractAction::AllIn { to } => *to,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        allin_to.as_u64(),
+        800,
+        "AA-003-rev1 ②：① 后 min_to=800 ≥ cap=800 ⇒ AllIn.to = cap = 800"
+    );
+
+    // ② 带 tiny_label 的 Raise candidate **不应**作为独立 Raise 出现——已被
+    // ② 吸收进 AllIn 槽位。任何 Raise 出现都意味着 [实现] 漏走 ② ceil 路径。
+    let stale_raise = slice.iter().find(
+        |a| matches!(a, AbstractAction::Raise { ratio_label, .. } if *ratio_label == tiny_label),
+    );
+    assert!(
+        stale_raise.is_none(),
+        "AA-003-rev1 ②：① floor 后的 candidate 必须被 ② 吸收进 AllIn，\
+         不应留下独立 Raise；slice = {slice:?}"
+    );
+
+    // ③ Call { to = 500 } 存在（call_to = min(max_committed=500, cap=800) = 500，
+    // 与 AllIn 800 不同 to ⇒ AA-004-rev1 不触发 dedup）。
+    let call_at_500 = slice
+        .iter()
+        .any(|a| matches!(a, AbstractAction::Call { to } if to.as_u64() == 500));
+    assert!(
+        call_at_500,
+        "Call {{ to = 500 }} 必须保留（与 AllIn=800 不同 to）；slice = {slice:?}"
+    );
+}
+
+// **Case 2（AA-004-rev1 Call/AllIn 同 to dedup）**：BB stack=400（committed
+// 100 + remaining 300，cap=400），同 UTG raise to 200 / BTN 3-bet to 500 路径。
+// BB max_committed=500，cap=400 < max_committed=500 ⇒ stage 1 raise_range=None
+// （cap > max_committed 不成立）。call_to = min(500, 400) = 400 = cap。
+// all_in_amount = Some(cap=400)。
+//
+// 抽象侧无 raise candidate（raise_range=None ⇒ AA-003 不触发），但 Call {
+// to=400 } 与 AllIn { to=400 } 同 to ⇒ AA-004-rev1 dedup 必须保留 AllIn、
+// 移除 Call。
+#[test]
+fn action_abs_short_bb_3bet_min_to_above_stack_priority_case2() {
+    use poker::SeatId;
+    let mut tcfg = TableConfig::default_6max_100bb();
+    tcfg.starting_stacks[2] = ChipAmount::new(400); // BB 极短码
+    let mut s = GameState::new(&tcfg, 0);
+
+    s.apply(Action::Raise {
+        to: ChipAmount::new(200),
+    })
+    .expect("UTG open raise");
+    for _ in 0..2 {
+        s.apply(Action::Fold).expect("fold");
+    }
+    s.apply(Action::Raise {
+        to: ChipAmount::new(500),
+    })
+    .expect("BTN 3-bet");
+    s.apply(Action::Fold).expect("SB fold");
+
+    assert_eq!(s.current_player(), Some(SeatId(2)));
+    let la = s.legal_actions();
+    assert!(
+        la.raise_range.is_none(),
+        "fixture：cap=400 < max_committed=500 ⇒ raise_range=None"
+    );
+    assert_eq!(la.call.map(|c| c.as_u64()), Some(400));
+    assert_eq!(la.all_in_amount.map(|c| c.as_u64()), Some(400));
+
+    let abs = DefaultActionAbstraction::default_5_action();
+    let actions = abs.abstract_actions(&s);
+    let slice = actions.as_slice();
+
+    // AllIn { to = 400 } 存在。
+    let allin = slice
+        .iter()
+        .find(|a| matches!(a, AbstractAction::AllIn { .. }))
+        .expect("AllIn slot：all_in_amount=Some(400) ⇒ AllIn 必须出现");
+    assert_eq!(
+        match allin {
+            AbstractAction::AllIn { to } => to.as_u64(),
+            _ => unreachable!(),
+        },
+        400,
+        "AllIn.to = cap = 400"
+    );
+
+    // AA-004-rev1：Call { to = 400 } 与 AllIn { to = 400 } 同 to ⇒ 保留 AllIn、
+    // 移除 Call。
+    let call_at_400 = slice
+        .iter()
+        .any(|a| matches!(a, AbstractAction::Call { to } if to.as_u64() == 400));
+    assert!(
+        !call_at_400,
+        "AA-004-rev1：Call {{ to = 400 }} 必须被 AllIn 吸收；slice = {slice:?}"
+    );
+
+    // 全局 to 去重不变量（AA-004-rev1 一般化）：任何带 to 的两个 AbstractAction
+    // 不应共享相同 to 数值。
+    let mut tos: Vec<u64> = slice
+        .iter()
+        .filter_map(|a| match a {
+            AbstractAction::Call { to }
+            | AbstractAction::Bet { to, .. }
+            | AbstractAction::Raise { to, .. }
+            | AbstractAction::AllIn { to } => Some(to.as_u64()),
+            _ => None,
+        })
+        .collect();
+    let len_before = tos.len();
+    tos.sort_unstable();
+    tos.dedup();
+    assert_eq!(
+        tos.len(),
+        len_before,
+        "AA-004-rev1：所有带 to 的 AbstractAction `to` 字段必须互不相等（slice = {slice:?}）"
     );
 }
 

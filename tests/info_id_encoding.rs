@@ -289,14 +289,27 @@ fn preflop_169_prior_action_changes_infoset() {
 // `[0, BucketConfig.{street})` 且 `< 2^24`。**B2 阶段** PostflopBucketAbstraction
 // 用 stub 实现（每条街固定返回 bucket_id = 0）；C2 才接入真实 mmap。
 //
-// **B1 状态**：本测试 `#[ignore]`——构造 PostflopBucketAbstraction 需要 mmap
-// 文件，B2 [实现] 决定 stub 路径（典型：内存中假 BucketTable 或 test-only
-// 构造器）；B1 测试结构与断言落位但不进默认 cargo test。详见
-// `pluribus_stage2_workflow.md` §B1 line 222 "info_abs_postflop_bucket_id_in_range
-// （C2 前用 stub bucket）" + §B2 line 274 "PostflopBucketAbstraction 占位实现
-// （C2 才完整）：每条街固定返回 bucket_id = 0"。
+// **B1 状态**：本测试 `#[ignore]`——构造 `PostflopBucketAbstraction` 需要
+// `BucketTable`，但 `BucketTable::open(path)` 仅接受真实 mmap 文件；A1 阶段
+// 无 test-only stub 构造路径（产品代码 0 暴露 in-memory builder）。
+//
+// **[决策] 缺位（B-rev0 carve-out）**：B2 [实现] 必须在产品代码侧暴露其中
+// 之一作为 stub 构造路径——
+//   (1) `BucketTable::stub_for_postflop(BucketConfig)` test-only / cfg(test)
+//       构造器，跳过 mmap 写盘；或
+//   (2) `tools/build_minimal_bucket_table.rs` CLI 写出 minimal valid header +
+//       trailer 的 80+32 byte 文件，tempfile 驱动；或
+//   (3) `PostflopBucketAbstraction::new_with_table_in_memory(BucketConfig)`
+//       专用 stub 构造器（与 §B2 line 274 "PostflopBucketAbstraction 占位实现
+//       (C2 才完整)：每条街固定返回 bucket_id = 0" 协议匹配）。
+//
+// B-rev0 不锁定具体路径——三选一由 B2 [实现] 在闭合 commit 决策；B1 [测试]
+// 不在产品代码暴露 helper 上做工。`info_abs_postflop_bucket_id_in_range`
+// 保留 `#[ignore]` 直到 B2 闭合：B2 同 commit (a) 暴露 stub 构造器、(b)
+// 取消本测试 `#[ignore]` 并填充 setup 路径（继承 §B-rev1 §3 同型角色越界
+// carve-out）。
 #[test]
-#[ignore = "B2: PostflopBucketAbstraction stub 构造路径未定，留 B2 [实现] 决定"]
+#[ignore = "B-rev0 carve-out：B2 [实现] 闭合时同 commit 暴露 BucketTable stub 构造器并取消本 ignore（详见 workflow §B-rev0）"]
 fn info_abs_postflop_bucket_id_in_range() {
     // 占位断言结构：构造 flop street state + AA 起手 + PostflopBucketAbstraction
     // (stub) → 断言 bucket_id < bucket_count(StreetTag::Flop) ≤ 2^24。
