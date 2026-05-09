@@ -231,8 +231,10 @@ pub trait InfoAbstraction: Send + Sync {
     /// 引用 + `state.actor_seat()` 计算 `effective_stack_at_hand_start`，**不允许**
     /// 从 `state.player(seat).stack`（当前剩余筹码）推算。同手内 preflop / flop /
     /// turn / river 调用结果 `stack_bucket` 字段 byte-equal。如 stage 1 `GameState`
-    /// 当前未公开 `config()` getter，A1 [实现] 必须走 stage 1 `API-NNN-revM` 流程
-    /// 在 `pluribus_stage1_api.md` 添加只读 getter。
+    /// 当前未公开 `config()` getter，B2 [实现] 在落地 `InfoAbstraction::map` 实际
+    /// 逻辑时必须走 stage 1 `API-NNN-revM` 流程在 `pluribus_stage1_api.md` 添加
+    /// 只读 getter（A1 阶段仅产签名，`_state` 未取用，签名编译不依赖该 getter，
+    /// 不触发该 rev；详见 §修订历史 batch 7）。
     ///
     /// 整条调用路径**禁止浮点**（D-273 / D-252）；postflop 走 mmap bucket lookup
     /// 命中整数 bucket id；preflop 走组合 lookup 表。
@@ -1059,9 +1061,9 @@ pub trait InfoAbstraction: Send + Sync {
 }
 ```
 
-**stage 1 API 同步要求**：若 stage 1 `GameState` 当前未公开 `config(&self) -> &TableConfig` getter，必须走 `pluribus_stage1_api.md` §11 `API-NNN-revM` 流程在 stage 1 添加只读 getter（继承 D-271 约束）。该 stage 1 API rev 由 A1 [实现] agent 在尝试落地 `InfoAbstraction::map` 时如发现 getter 缺位再触发；A0 阶段不预设。
+**stage 1 API 同步要求**：若 stage 1 `GameState` 当前未公开 `config(&self) -> &TableConfig` getter，必须走 `pluribus_stage1_api.md` §11 `API-NNN-revM` 流程在 stage 1 添加只读 getter（继承 D-271 约束）。该 stage 1 API rev 由 B2 [实现] agent 在尝试落地 `InfoAbstraction::map` 实际逻辑时如发现 getter 缺位再触发；A0 / A1 阶段不预设（A1 仅产签名，`_state` 未取用，编译不依赖该 getter；A1 闭合后此条款由 batch 7 review 确认对齐）。
 
-**影响**：① `InfoAbstraction::map` trait 签名不变；② IA-002 不变量保留（preflop key 区分性），含 stack_bucket 来源约束；③ B1 [测试] `tests/info_id_encoding.rs` 必须含 100 BB / 200 BB / 50 BB 三种 TableConfig 下 stack_bucket 桶分配断言（3 / 4 / 2）；④ A1 [实现] 若 stage 1 GameState getter 缺位，PR 同步触发 stage 1 `API-NNN-revM`。
+**影响**：① `InfoAbstraction::map` trait 签名不变；② IA-002 不变量保留（preflop key 区分性），含 stack_bucket 来源约束；③ B1 [测试] `tests/info_id_encoding.rs` 必须含 100 BB / 200 BB / 50 BB 三种 TableConfig 下 stack_bucket 桶分配断言（3 / 4 / 2）；④ B2 [实现] 在落地 `InfoAbstraction::map` 实际逻辑时若 stage 1 GameState getter 缺位，同 PR 触发 stage 1 `API-NNN-revM`（A1 已闭合，A1 阶段未触发——签名编译路径 `_state` 未取用，不依赖该 getter；详见 §修订历史 batch 7）。
 
 ---
 
@@ -1080,6 +1082,30 @@ pub trait InfoAbstraction: Send + Sync {
 | 顶层 re-export 增加 `BetRatio / ConfigError / BettingState / StreetTag / EquityError` | additive | F26 / D-253-rev1 |
 
 `bucket_table.schema_version` 不 bump（v1 artifact 尚未生成）。`HandHistory.schema_version` 不 bump（不动 stage 1 序列化，D-276 不变）。`feature_set_id` 不 bump（特征组合未动）。
+
+---
+
+#### A1 关闭后 review 措辞收尾 batch 7（2026-05-09，A1 已闭合）
+
+A1 [实现] 落地后（commit `c4107ee`）的 review 抽查发现 4 处文档措辞观察（O1–O4），其中 3 处属 doc-only 修正、1 处保留。本 batch **0 spec 变化、0 公开签名变化、0 不变量变化、0 测试回归**，仅同步 doc 与 CLAUDE.md 措辞，未走 `API-NNN-revM` 流程（无 API 契约改动）。
+
+| 观察 | 类型 | 处理 |
+|---|---|---|
+| O1：§2 `InfoAbstraction::map` trait doc + §F21 carve-out + §F21 影响 ④ 三处「A1 [实现] 必须走 stage 1 `API-NNN-revM` 添加 `GameState::config()` getter」与实现现实冲突 | doc-only | 三处统一改为「B2 [实现] 在落地实际逻辑时触发，A1 阶段仅产签名 `_state` 未取用编译不依赖该 getter」。**理由**：A1 闭合 commit 实测——`info.rs:112-114` doc + `fn map(&self, _state: ...) { unimplemented!(...) }` 整签名编译不依赖 `GameState::config()`，A1 [实现] 选择保守 defer 把 stage 1 API rev 留给 B2，与 §F21 line 1062「再触发」条件式语义吻合。本 batch 把 §2 trait doc 强约束语义（"必须走"）软化为与 §F21 一致的条件式（B2 落地时触发） |
+| O2：`src/abstraction/mod.rs` line 14/16「模块私有」简写措辞与 `pub mod feature; pub mod cluster;` 声明语义不符（这两个子模块经 `poker::abstraction::feature::*` / `poker::abstraction::cluster::*` 路径仍可访问，仅是不在 `lib.rs` 顶层 re-export）| doc-only（rust 注释）| 改写为「D-254 不在 `lib.rs` 顶层 re-export，仅经 `poker::abstraction::*` 路径访问」，与同文件 line 22-24 解释段落一致 |
+| O3：`PreflopLossless169 { _opaque: () }` / `PostflopBucketAbstraction { table, _opaque: () }` 用 `_opaque: ()` 字段做 opaque marker，可改为 tuple struct `pub struct PreflopLossless169(())` 等 | 风格 | **保留不修**。`_opaque: ()` 是 B2 [实现] 即将填充真实状态字段（preflop 169 lookup 表 / postflop canonical id 缓存）的占位——改成 unit struct / tuple struct 在 B2 又要换回命名字段 struct，纯属 churn。`#[allow(dead_code)] // A1 stub; B2 fills` 注释已显式标注此意图 |
+| O4：`CLAUDE.md` line 136 / 172「全 14 个 stage 2 类型 / trait / helper」计数不准，实际为 21 项公开类型 / trait / helper + 1 个子模块（`cluster::rng_substream`）| doc-only | 改为精确计数 21（action 7 / info 4 / preflop 2 / postflop 2 / equity 3 / bucket_table 3）+ 1 子模块 |
+
+**触发文件**（batch 7 commit）：
+
+- `docs/pluribus_stage2_api.md`：§2 trait doc 1 处 + §F21 carve-out 1 处 + §F21 影响 ④ 1 处 + 本 §修订历史 batch 7 子节追加（即本节）
+- `src/abstraction/mod.rs`：line 14/16 「模块私有」改写
+- `CLAUDE.md`：line 136 / 172 计数精确化 + A1 closed 段落补 batch 7 行
+- `docs/pluribus_stage2_workflow.md`：§修订历史 追加 §A-rev1（A1 关闭 + batch 7 收尾）
+
+**触发文件审计**：`src/abstraction/{action,info,preflop,postflop,equity,bucket_table,cluster,feature,map/mod}.rs` 主体（公开 trait / 类型 / 方法签名 / `unimplemented!()` 占位 / `#![deny(clippy::float_arithmetic)]` inner attr / D-228 op_id 常量）**未修改一行**；`tests/api_signatures.rs` trip-wire **未修改一行**；`Cargo.toml` / `Cargo.lock` 依赖列表 **未修改一行**——0 公开签名漂移、0 trip-wire 漂移、0 测试回归。
+
+**复跑 5 道 gate**（A1 闭合 commit 同型）：`cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` / `cargo test`（默认 104 passed / 19 ignored / 0 failed across 16 test crates） 全绿，与 A1 baseline byte-equal。
 
 ---
 

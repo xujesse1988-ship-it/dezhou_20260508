@@ -641,4 +641,39 @@ A0 carry forward 阶段 1 处理政策清单（在 §B-rev1 / §C-rev1 / §D-rev
 
 A0 角色边界审计：仅修 `docs/` 下 4 份文档（`pluribus_stage2_decisions.md` 起草 + `pluribus_stage2_api.md` 起草 + `pluribus_stage2_validation.md` 占位补完 + 本文档 §修订历史 首条）+ `CLAUDE.md` 状态翻面；`src/` / `tests/` / `benches/` / `fuzz/` / `tools/` / `proto/` **未修改一行**——A0 [决策] role 0 越界（继承阶段 1 §F-rev2 / §F-rev0 / §C-rev1 0 越界形态）。
 
-下一步：A1 [实现]（API 骨架代码化）→ B1 [测试] → B2 [实现] → ... → F3 [报告]，按 §步骤序列 13-step 顺序推进。
+补记（§A-rev1 batch 7 时同步）：A0 关闭后另一轮 review（commit `35df4f4`）落地 batch 6 修正 9 处独立 spec drift（F19..F27），其中 7 处涉及 API 签名 / 不变量收紧（详见 `pluribus_stage2_api.md` §修订历史 batch 6）+ 决策侧 9 条 D-NNN-revM（`pluribus_stage2_decisions.md` §修订历史 batch 6）。本 §A-rev0 段落起草于 commit `452fb89`（A0 闭合同步），未及更新到 batch 6 list；按 stage-1 §修订历史 「追加不删」 约定，batch 6 落地见 `CLAUDE.md` Stage 2 A0 closed 段落表格。
+
+#### A1 关闭（2026-05-09）— A-rev1
+
+A1 [实现] 关闭于 commit `c4107ee`（commit message 「A1 [实现] 关闭 — abstraction/ 模块树骨架 + api_signatures trip-wire + memmap2 + D-228/D-252 公开 contract」）。同 commit 落地：
+
+- `src/abstraction/` 完整 10 文件模块树（mod / action / info / preflop / postflop / equity / feature / cluster / bucket_table / map）
+- 全部公开类型 / trait / 方法签名严格匹配 `pluribus_stage2_api.md` API-200..API-302（含 batch 6 一组 rev：AA-003-rev1 / AA-004-rev1 / IA-006-rev1 / EQ-001-rev1 / EQ-002-rev1 / BT-005-rev1 / BT-008-rev1 / EquityCalculator-rev1 / BetRatio::from_f64-rev1 / `BucketTable::lookup` 签名 3 → 2 入参）
+- 全部函数体 `unimplemented!()` / `todo!()` 占位（`BucketConfig::default_500_500_500()` 与 `BetRatio::HALF_POT / FULL_POT` 等 `const` 路径直接给值）
+- `tests/api_signatures.rs` 追加 stage 2 trip-wire（覆盖 50+ 个公开 fn / 常量绑定，与 stage-1 `_api_signature_assertions()` 同形态）
+- `Cargo.toml` 加 `memmap2 = "0.9"`（D-255）
+- `src/abstraction/map/mod.rs` 顶 `#![deny(clippy::float_arithmetic)]` inner attribute（D-252）
+- `src/abstraction/cluster.rs` 落地 `pub mod rng_substream { ... }`（D-228 公开 contract，含 `derive_substream_seed` 函数 + 全 15 个 op_id 常量）
+- `src/lib.rs` D-253-rev1 顶层 re-export 21 个公开类型 / trait / helper + 1 个子模块（`cluster::rng_substream`）
+- `CLAUDE.md` 状态翻 "stage 2 A1 closed"
+
+A1 出口数据（commit `c4107ee` 实测）：`cargo build --all-targets` ok / `cargo clippy --all-targets -- -D warnings` ok / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` ok / `cargo fmt --all --check` ok / `cargo test`（默认）104 passed / 19 ignored / 0 failed across 16 test crates（与 stage-1 baseline byte-equal，A1 不引入测试回归——抽象层 fail-on-call 行为留待 B1 [测试] 测试代码触发）。
+
+A1 角色边界审计：仅写 / 改 stage 1 锁定外的产品代码与配置（10 新文件 `src/abstraction/**` + `src/lib.rs` re-export + `Cargo.toml` 依赖 + `tests/api_signatures.rs` 追加 stage 2 trip-wire）；`src/core/` / `src/rules/` / `src/eval/` / `src/history/` / `src/error.rs` / `proto/` / `benches/` / `fuzz/` / `tools/` **未修改一行**——A1 [实现] 0 越界。`tests/api_signatures.rs` 触动以 §A1 §输出 第 3 条「同 commit 同步签名 trip-wire」+ 继承 stage-1 §B-rev1 §3「测试 trip-wire 同步责任由 [实现] 承担」处理政策追认（避免 B1 [测试] 起步前签名漂移可能性，相同 commit 同步原则与 stage-1 同型）。
+
+##### A1 关闭后 review 措辞收尾 batch 7
+
+A1 闭合 commit `c4107ee` 落地后，review 抽查发现 4 处文档措辞观察（O1..O4），其中 3 处属 doc-only 修正、1 处保留（B2 占位 forward-looking 不动）。本 batch **0 spec 变化、0 公开签名变化、0 不变量变化、0 测试回归、0 角色越界**——仅同步 doc / 注释 / CLAUDE.md 措辞，不走 `API-NNN-revM` 流程（无 API 契约改动）。
+
+| 观察 | 类型 | 处理 |
+|---|---|---|
+| O1：`pluribus_stage2_api.md` §2 `InfoAbstraction::map` trait doc + §F21 carve-out 文 + §F21 影响 ④ 三处把 stage 1 `GameState::config()` getter rev 触发责任压在 A1，与实现现实（A1 选择保守 defer）冲突 | doc-only | 三处统一改为「B2 [实现] 在落地实际逻辑时触发，A1 阶段仅产签名编译不依赖该 getter」。详见 `pluribus_stage2_api.md` §修订历史 batch 7 |
+| O2：`src/abstraction/mod.rs` line 14/16「模块私有」简写措辞与 `pub mod feature; pub mod cluster;` 声明语义不符 | doc-only（rust 注释）| 改写为「D-254 不在 `lib.rs` 顶层 re-export，仅经 `poker::abstraction::*` 路径访问」与同文件 line 22-24 解释段落一致 |
+| O3：`PreflopLossless169 { _opaque: () }` / `PostflopBucketAbstraction { table, _opaque: () }` 用 `_opaque: ()` 字段做 opaque marker | 风格 | **保留不修**——`_opaque: ()` 是 B2 即将填充真实状态字段的命名 struct 占位，改成 unit / tuple struct 在 B2 又要换回命名字段 struct 纯属 churn |
+| O4：`CLAUDE.md` line 136 / 172「全 14 个 stage 2 类型 / trait / helper」计数不准，实际 21 项 + 1 子模块 | doc-only | 改为精确计数 21（action 7 + info 4 + preflop 2 + postflop 2 + equity 3 + bucket_table 3）+ 1 子模块（`cluster::rng_substream`）|
+
+batch 7 触发文件：`docs/pluribus_stage2_api.md`（§2 trait doc + §F21 两处 + §修订历史 batch 7 子节）+ `src/abstraction/mod.rs`（line 14/16 注释）+ `CLAUDE.md`（line 136 / 172 + A1 closed 段落补 batch 7 行）+ 本文档 §A-rev1 batch 7 子节（即本节）。
+
+A1 + batch 7 角色边界审计：`src/abstraction/{action,info,preflop,postflop,equity,bucket_table,cluster,feature,map/mod}.rs` 公开 trait / 类型 / 方法签名 / `unimplemented!()` 占位 / `#![deny(clippy::float_arithmetic)]` inner attr / D-228 op_id 常量 **未修改一行**；`tests/api_signatures.rs` trip-wire **未修改一行**；`Cargo.toml` / `Cargo.lock` 依赖列表 **未修改一行**——0 公开签名漂移、0 trip-wire 漂移、0 测试回归。
+
+下一步：B1 [测试]（核心场景测试 + harness 骨架）→ B2 [实现] → C1 [测试] / C2 [实现]（聚类落地）→ D1 / D2（fuzz + 规模）→ E1 / E2（性能 SLO）→ F1 / F2 / F3（收尾），按 §步骤序列 13-step 顺序推进。

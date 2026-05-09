@@ -12,9 +12,11 @@
 //! - [`postflop`]：mmap 后端 `PostflopBucketAbstraction` + `canonical_observation_id`
 //!   helper
 //! - [`equity`]：`EquityCalculator` trait + `MonteCarloEquity`（允许浮点）
-//! - [`feature`]：特征提取（EHS² / OCHS / histogram）（允许浮点；模块私有）
-//! - [`cluster`]：k-means / EMD 聚类（允许浮点；模块私有，但子模块
-//!   [`cluster::rng_substream`] 公开 D-228 contract）
+//! - [`feature`]：特征提取（EHS² / OCHS / histogram）（允许浮点；D-254 不在
+//!   `lib.rs` 顶层 re-export，仅经 `poker::abstraction::feature::*` 路径访问）
+//! - [`cluster`]：k-means / EMD 聚类（允许浮点；D-254 不在 `lib.rs` 顶层
+//!   re-export，但子模块 [`cluster::rng_substream`] 由 `lib.rs` `pub use` 暴露
+//!   作为 D-228 公开 contract）
 //! - [`bucket_table`]：mmap 文件格式 + `schema_version` + 错误路径
 //! - [`map`]：运行时映射热路径子模块（**禁止浮点**，
 //!   `#![deny(clippy::float_arithmetic)]`，D-252）
