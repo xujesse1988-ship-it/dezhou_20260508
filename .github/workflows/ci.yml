@@ -105,3 +105,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps
+
+  bench-quick:
+    # E1 §输出：「短 benchmark CI 集成（30 秒内）」。
+    # criterion 默认 sample-size=100 / warm-up=3s / measurement=5s，3 个 bench
+    # group × 2 个 bench function = 6 个 bench → 默认 ≥48s。这里走 quick CLI：
+    # sample-size=10、warm-up=1s、measurement=1s，每个 bench 实跑 ~2s ⇒ 总
+    # ~12-20s（含 release build cache miss 时再加 ~30s build）。
+    #
+    # **不断言阈值**：本 job 只验证 bench harness 不 panic + 能产出数据。SLO
+    # 阈值断言放 tests/perf_slo.rs，需 release profile + 显式 --ignored，由
+    # E2 性能优化收尾时作为出口标准实跑。
+    name: cargo bench --bench baseline (quick)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: bench baseline (quick profile)
+        run: |
+          cargo bench --bench baseline -- \
+            --warm-up-time 1 \
+            --measurement-time 1 \
+            --sample-size 10 \
+            --noplot

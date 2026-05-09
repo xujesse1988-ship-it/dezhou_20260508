@@ -57,3 +57,30 @@ jobs:
             fuzz/artifacts/${{ matrix.target }}/
             fuzz/corpus/${{ matrix.target }}/
           if-no-files-found: ignore
+
+  bench-full:
+    # E1 §输出：「全量 benchmark 夜间任务」。
+    # 默认 criterion 参数（sample-size=100 / warm-up=3s / measurement=5s），
+    # 3 个 group × 2 个 function ≈ 50–60s 实测耗时 + release build；与 fuzz job
+    # 解耦在独立 runner 上跑，不与 fuzz 抢 CPU。
+    #
+    # 与 ci.yml::bench-quick 的关系：quick CI 路径 30s 内出粗略数据（push 时
+    # 触发），nightly 用全量参数让 criterion 的统计输出更可信，作为长期
+    # regression baseline。本 job 当前**不断言阈值**；E2 落地后由
+    # tests/perf_slo.rs 负责阈值断言，bench 自身仍只产出数据。
+    name: cargo bench --bench baseline (full)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+      - name: bench baseline (default profile)
+        run: cargo bench --bench baseline -- --noplot
+      - name: upload criterion report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-bench-criterion-report
+          path: target/criterion/
+          if-no-files-found: ignore
