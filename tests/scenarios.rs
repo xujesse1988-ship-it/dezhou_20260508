@@ -622,12 +622,21 @@ fn all_players_allin_runs_out_board() {
 }
 
 // ============================================================================
-// 10. last_aggressor_shows_first (D-037)
+// 10. last_aggressor_shows_first (D-037 / D-037-rev1)
 // ============================================================================
 //
-// preflop BTN raise（voluntary），SB/BB call，三街全 check，到 river showdown。
-// last_aggressor = BTN（preflop 唯一 voluntary aggressor），所以 showdown_order[0]
-// = BTN。其余按按钮左侧依次：SB → BB（SB 在 BTN 左 1）。
+// preflop BTN raise（voluntary），SB/BB call，flop / turn / river 三街全 check
+// 到 showdown。
+//
+// **D-037-rev1 (2026-05-08)**：`last_aggressor` 作用域钉为 **最后一条 betting
+// round 内** 的最后一次 voluntary bet/raise，不再 "整手粘连"。本场景下河牌
+// 全 check → 最后一条 betting round 内无 voluntary bet/raise → fallback 到
+// SB 起亮。preflop 的 BTN raise 在 flop 街起手已被重置，不再影响 showdown
+// 起点。
+//
+// 因此 `showdown_order[0] = SB`、其后向左依次 = BB、BTN。该断言与 PokerKit
+// 0.4.14 `_begin_showdown` (state.py:4135-4145) + `Opening.POSITION` 默认行为
+// 一致，被 100k cross-validation 桶 A 第 10 条 seed 反向证伪。
 #[test]
 fn last_aggressor_shows_first() {
     let (mut s, cfg) = default_state(10);
@@ -664,12 +673,12 @@ fn last_aggressor_shows_first() {
 
     assert!(s.is_terminal());
     let order = &s.hand_history().showdown_order;
+    // D-037-rev1: 河牌街内无 voluntary bet/raise → fallback 起点 = SB(1)。
     assert_eq!(
         order.first(),
-        Some(&seat(0)),
-        "D-037：last_aggressor BTN 先亮"
+        Some(&seat(1)),
+        "D-037-rev1：showdown 街内无 last_aggressor → SB(1) 先亮"
     );
-    // 其余顺序 = BTN 左侧依次未弃牌座位：SB(1), BB(2)
-    assert_eq!(order.get(1), Some(&seat(1)), "BTN 左 1 = SB");
-    assert_eq!(order.get(2), Some(&seat(2)), "BTN 左 2 = BB");
+    assert_eq!(order.get(1), Some(&seat(2)), "SB 左 1 = BB");
+    assert_eq!(order.get(2), Some(&seat(0)), "SB 左 2 = BTN");
 }

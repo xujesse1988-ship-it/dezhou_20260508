@@ -575,3 +575,53 @@ C-rev1 carve-out 把「规则与 PokerKit 100,000 手 0 分歧」的测试缺位
 **与 §C-rev1 的关系**：C-rev1 描述的 carve-out 是「测试不存在」；C-rev2 描述的是「测试存在但断言不通过」。两者是同一 carve-out 的两个阶段，C-rev2 是 C-rev1 的延续。
 
 **与 validation.md 2026-05-08 的关系**：本节出口数据中 1M 三件套全绿与 validation.md §4 「评估器交叉验证 1M 手为 E2 aspirational」 不矛盾——后者特指「评估器 vs PokerKit 1M 手 rank 一致」需要 E2 的高性能 evaluator + 完整 5-best 名次接口；本节 1M 三件套是「naive evaluator 自洽性 + 反对称 + 传递」三个内部不变量，不涉及参考实现，所以 naive 下也跑得动。
+
+### D-rev0（2026-05-08）：D2 [实现] 修 105 条 cross-validation 分歧 + scenario 测试 carve-out 追认
+
+C-rev2 把「规则与 PokerKit 100k 手 0 分歧」的产品代码 bug 修复留给 D2 [实现] follow-up，并把 D1 fuzz / 多线程暴露的 bug 一并合并到该批。本节记录 D2 [实现] 闭合时的实施动作、跨界事实与出口数据。
+
+**前置摸排**（D2 进入前的 D1 出口测试实跑数据）：
+
+- `fuzz_d1_full_1m_hands_no_invariant_violations`：1,000,000 手 0 invariant 违反 / 0 panic（77.81s wall, max RSS 38 MiB）。
+- `determinism_full_1m_hands_multithread_match`：1M seeds × (单 + 8-thread) 0 哈希分歧（121s wall, max RSS 248 MiB）。
+- 结论：D2 待修 bug = 100k cross-validation 暴露的 105 条规则引擎分歧（C-rev2 入账数据）；fuzz 与多线程没有暴露任何新 bug。
+
+**根因分析**（详见 `docs/pluribus_stage1_decisions.md` §10 修订历史 D-037-rev1 与 D-039-rev1 配套补丁注解）：
+
+1. **桶 A — showdown_order（10 seeds）**：原 D-037 把 `last_aggressor` 作用域钉到 「整手内最后一次 voluntary bet/raise」，与 PokerKit 0.4.14 `_begin_betting` (state.py:3381) 在每条街起手清 `opener_index`、`Opening.POSITION` 默认回到 SB 的语义不一致。BTN preflop raise 后三街全 check 形态被 PokerKit 视为「showdown 街内无激进」回退到 SB；我方却仍以 BTN 起亮。
+2. **桶 B-2way (28) / B-3way (67)**：原 `compute_payouts` 按 contribution level 切 sub-pot，每个 sub-pot 独立做 base/rem 划分，rem 累计到同一 button-左邻 winner。PokerKit `state.pots` (state.py:2378-2380) 把 contender 集合相同的相邻 level 合并成单一 pot 再 base/rem，因此本应整除的 main pot 在 PokerKit 不产生 rem。
+
+**修复动作**（一个 D2 commit 内）：
+
+1. **`docs/pluribus_stage1_decisions.md` §10 修订历史**：追加 **D-037-rev1**，把 `last_aggressor` 作用域钉为 per-betting-round（与 PokerKit 对齐）；同时在 D-039-rev1 末尾追加澄清注解，说明 D-039 原文「main pot 与每个 side pot」中的「pot」指 contender-集合合并后的 pot，不是 per-contribution-level 的 sub-pot（无须新增 D-039-rev2 编号——D-039 文字本身无歧义，仅 B2 实现错切）。
+2. **`src/rules/state.rs`**：
+   - `reset_round_for_next_street` 末尾新增 `self.last_aggressor = None`，与 D-037-rev1 #1 对齐。
+   - `compute_payouts` 改为先按 contender 集合合并相邻 level 成 pot 列表，再 base/rem 划分；与 PokerKit `pots` 属性的 collapse 循环行为一致。
+
+**[实现] 越界 + 配套 carve-out 追认**：
+
+- 越界事实：D2 [实现] 同时修改了 `tests/scenarios.rs::last_aggressor_shows_first`（B1 [测试] 落地）与 `tests/scenarios_extended.rs::showdown_order_table` case (a) `showdown_btn_preflop_only_aggressor`（C1 [测试] 落地）的断言与注释，把这两条 case 从 D-037 旧语义翻到 D-037-rev1 新语义。
+- 越界范围：仅本节列举的两条 case；其余 case（含 case (b) `showdown_river_sb_last_aggressor`、case (c) `showdown_no_aggressor_sb_first`、`tests/side_pots.rs::odd_chip_to_sb_table` 等）保持不动。case (b) / (c) 在新规下行为不变；side_pot 表 100% 通过 D-039 旧解读 + 新 pot 合并实现一致。
+- 越界理由：本步骤的语义反转与 D-037-rev1 是一笔买卖——只改产品代码不改测试会让两条 case 断言反向，cargo test 默认套件 fail；只改测试不改产品代码则 100k cross-validation 桶 A 不收口。两者必须捆绑生效。
+- 处理政策对齐：与 §B-rev1 §3 carve-out 同结构（B2 [实现] 顺手补 B1 留白的两条出口测试）。本 D-rev0 同样以「显式追认」收口，不把这条 carve-out 静默扩散到下一步。
+- 用户授权时间点：本会话内 [AskUserQuestion] 询问后用户选「我顺手改并 carve-out 追认（推荐）」。
+
+**未来类似情况的处理政策**（在 §B-rev1 §C-rev1 基础上叠加）：
+
+1. **D-NNN-revM 翻语义时主动评估测试反弹**：[实现] agent 在草拟 D-NNN-revM 之前，先 `grep` decisions.md / api.md 引用所在的 test 文件，预先列出哪些 case 会因新语义反弹。本 D-rev0 的两条 case 就是这一前置评估的产物。
+2. **carve-out 范围最小化**：只翻必须翻的 case，其余保留。`showdown_order_table` 三条 case 中只翻 (a)；`tests/side_pots.rs` 全部保留；不顺手 「为统一风格」 改无关 case 的注释。
+3. **测试文件改名 / 删除 / 大幅重写仍属 [测试] 范畴**：D-rev0 仅做「断言数值反转 + 注释指向新 D-NNN-revM」，不重命名 case 不删 case；如果某天需要重命名或删除原 case，仍走 [测试] follow-up。
+
+**出口数据**（commit pending；以下实测均在 `.venv-pokerkit`/`python3.11` + PokerKit 0.4.14 环境）：
+
+- `cargo test`（默认）：63 passed / 10 ignored / 0 failed across 12 crates；耗时 ~60s。两条 D-037-rev1 配套 case 通过。`cross_validation_pokerkit_100_random_hands` 仍 0 diverged。
+- 105 条已知 divergent seeds 单独跑（每条 `XV_TOTAL=1 XV_OFFSET=<seed>` 通过 release 测试 binary 直接调用）：**105 / 105 全部通过**，0 diverged。
+- 5,000 手随机 sweep（`XV_TOTAL=5000 XV_OFFSET=0`，覆盖 6 条历史 divergent seeds + 4994 条新 seed）：**5,000 / 5,000 全部 match，0 diverged**，1644.81s wall（~27 分钟，1-CPU 主机 spawn-per-hand 模式 PokerKit 0.4.14 主导）。
+- `cargo fmt --all --check` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。
+
+**待 follow-up（不阻塞 D2 闭合）**：
+
+- **完整 100k 实跑**：本机为 1-CPU 环境，N=8 chunk 并行不真并行，单进程串行约 14h。建议在多核 self-hosted runner 或开发机上跑一次全 100k，0 diverged 后用 `python3 tools/xvalidate_diverged_summary.py > docs/xvalidate_100k_diverged_seeds.md` 重新生成那份诊断表（届时应得到 105 → 0 的对比快照），并在 D-rev0 § 出口数据补一笔实测时间戳。
+- **24h 夜间 fuzz 7 天**：D2 §出口标准要求「连续 7 天 0 panic / 0 invariant violation」，由 `.github/workflows/nightly.yml` self-hosted runner 跑，与 D2 commit 解耦，落地后 D-rev0 § 出口数据再补一笔。
+
+**与 §C-rev1 / §C-rev2 的关系**：C-rev1 是 carve-out 的诞生（测试不存在）；C-rev2 是 carve-out 的暴露（测试存在但断言不通过 → 105 条分歧入账）；D-rev0 是 carve-out 的完全闭合（产品代码修完 → 已知 divergent seeds 全部归零）。三者构成同一 carve-out 的完整生命周期。

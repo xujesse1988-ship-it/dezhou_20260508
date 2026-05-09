@@ -873,7 +873,12 @@ fn button_position_sweep_table() {
 fn showdown_order_table() {
     let mut cases: Vec<ScenarioCase> = Vec::new();
 
-    // case (a): 唯一 voluntary aggressor = BTN preflop raise，三街 check 到 river
+    // case (a) [D-037-rev1]: BTN preflop raise + 三街全 check → showdown 街
+    // (river) 内无 voluntary bet/raise → last_aggressor 在 flop 起手被重置 →
+    // fallback 起点 = SB(1)。preflop 的激进与摊牌起点无关（per-street 作用
+    // 域）。本 case 是 D-037-rev1 的代表性测试 — 100k cross-validation
+    // 桶 A 暴露 10 条 seed 全部具备 "preflop 激进 + 后续街检 down" 形态，
+    // 修复后此 case 必须断言 SB 先亮才会与 PokerKit 0.4.14 一致。
     let mut p_a = fold_utg_mp_co();
     p_a.push((seat(0), Action::Raise { to: chips(300) }));
     p_a.push((seat(1), Action::Call));
@@ -882,9 +887,10 @@ fn showdown_order_table() {
     let mut expect = ScenarioExpect::new();
     expect.terminal = Some(true);
     expect.street = Some(Street::Showdown);
-    expect.last_aggressor_first = Some(seat(0));
+    // D-037-rev1: 河牌街内无 last_aggressor → SB(1) fallback。
+    expect.last_aggressor_first = Some(seat(1));
     cases.push(ScenarioCase {
-        name: "showdown_btn_preflop_only_aggressor",
+        name: "showdown_no_river_aggressor_falls_back_to_sb",
         config: default_cfg(),
         seed: 300,
         holes: None,
