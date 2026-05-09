@@ -1,0 +1,587 @@
+# 阶段 2 API 契约
+
+## 文档地位
+
+本文档定义阶段 2（抽象层）所有公开类型与方法的契约。**A1 步骤的代码骨架必须严格匹配本文档**。
+
+- 测试 agent 在 B1 / C1 / D1 / E1 / F1 写测试时，**只依赖**本文档定义的 API 与阶段 1 `pluribus_stage1_api.md` 定义的 API。
+- 实现 agent 在 A1 / B2 / C2 / D2 / E2 / F2 写产品代码时，**不得偏离**本文档签名（除非走 `API-NNN-revM` 修订流程修改本文档）。
+- 任何在实现过程中发现的 API 不足或歧义，必须先在本文档追加 `API-NNN-revM` 条目，再实施。
+
+阶段 2 API 编号从 **API-200** 起，与阶段 1 `API-001..API-099` 不冲突。阶段 1 API 全集 + `API-NNN-revM` 修订作为只读 spec 继承到阶段 2，未在本文档显式扩展的部分以 `pluribus_stage1_api.md` 为准。任何 stage 2 [实现] agent 发现 stage 1 API 不够用 → 走 stage 1 `API-NNN-revM` 修订流程，**不允许**直接在本文档覆盖 stage 1 API。
+
+所有签名为 Rust 风格。语义说明放在签名后的注释或下方文字。
+
+---
+
+## 1. Action abstraction（`module: abstraction::action`）
+
+### AbstractAction / AbstractActionSet / ActionAbstractionConfig
+
+```rust
+/// 抽象动作。pot ratio 编码进 BetRaise 变体；apply 时取 `to`。
+///
+/// `ratio_label` 仅作为 InfoSet 编码区分性（D-207 / D-209），不参与 apply 计算。
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub enum AbstractAction {
+    Fold,
+    Check,
+    Call { to: ChipAmount },
+    BetRaise { to: ChipAmount, ratio_label: BetRatio },
+    AllIn { to: ChipAmount },
+}
+
+/// pot ratio 标签的整数编码，避免 `f64` 进入 `Eq` / `Hash`。
+///
+/// 内部存 `ratio × 1000` 的 `u32`（D-200 默认值：`Half = 500`、`Full = 1000`）。
+/// `ActionAbstractionConfig` 接受 `f64` 输入但内部规整为该整数表示。
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct BetRatio(u32);
+
+impl BetRatio {
+    pub const HALF_POT: BetRatio = BetRatio(500);
+    pub const FULL_POT: BetRatio = BetRatio(1000);
+    pub fn from_f64(ratio: f64) -> Option<BetRatio>;
+    pub fn as_milli(self) -> u32; // 返回内部整数表示
+}
+
+/// 抽象动作集合输出。顺序固定为 D-209：
+/// `[Fold?, Check?, Call?, BetRaise(0.5×pot)?, BetRaise(1.0×pot)?, AllIn?]`
+/// `?` 表示不存在则跳过。
+#[derive(Clone, Debug)]
+pub struct AbstractActionSet {
+    actions: Vec<AbstractAction>,
+}
+
+impl AbstractActionSet {
+    pub fn iter(&self) -> std::slice::Iter<'_, AbstractAction>;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn contains(&self, action: AbstractAction) -> bool;
+    pub fn as_slice(&self) -> &[AbstractAction];
+}
+
+/// `ActionAbstractionConfig`：raise size 集合（D-202）。
+/// `raise_pot_ratios` 长度 ∈ [1, 14]，每个元素 ∈ (0.0, +∞)。
+#[derive(Clone, Debug)]
+pub struct ActionAbstractionConfig {
+    pub raise_pot_ratios: Vec<BetRatio>,
+}
+
+impl ActionAbstractionConfig {
+    /// 默认 5-action 配置：`[BetRatio::HALF_POT, BetRatio::FULL_POT]`。
+    pub fn default_5_action() -> ActionAbstractionConfig;
+
+    /// 自定义构造。长度 / 范围越界返回 `ConfigError`。
+    pub fn new(raise_pot_ratios: Vec<f64>) -> Result<ActionAbstractionConfig, ConfigError>;
+
+    pub fn raise_count(&self) -> usize;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("raise_pot_ratios length out of range: expected [1, 14], got {0}")]
+    RaiseCountOutOfRange(usize),
+    #[error("raise pot ratio not positive finite: {0}")]
+    RaiseRatioInvalid(f64),
+}
+```
+
+### ActionAbstraction trait + DefaultActionAbstraction
+
+```rust
+pub trait ActionAbstraction: Send + Sync {
+    /// 给定当前 GameState，返回抽象动作集合（D-200..D-209 全部 fallback 已应用）。
+    fn abstract_actions(&self, state: &GameState) -> AbstractActionSet;
+
+    /// off-tree action 映射（D-201 PHM stub；stage 2 仅占位实现，
+    /// stage 6c 完整数值验证）。
+    ///
+    /// `real_to` 是对手实际下注的 `to` 字段（绝对金额，与 stage 1
+    /// `Action::Bet/Raise { to }` 同语义）。
+    fn map_off_tree(&self, state: &GameState, real_to: ChipAmount) -> AbstractAction;
+
+    /// 配置只读访问。
+    fn config(&self) -> &ActionAbstractionConfig;
+}
+
+pub struct DefaultActionAbstraction { /* opaque */ }
+
+impl DefaultActionAbstraction {
+    pub fn new(config: ActionAbstractionConfig) -> DefaultActionAbstraction;
+    pub fn default_5_action() -> DefaultActionAbstraction;
+}
+
+impl ActionAbstraction for DefaultActionAbstraction { /* ... */ }
+```
+
+### AbstractAction / AbstractActionSet 不变量
+
+实现 agent 必须保证、测试 agent 在 invariant suite 中验证：
+
+- AA-001 顺序固定（D-209）：`abstract_actions(state).iter()` 输出顺序为 `[Fold?, Check?, Call?, BetRaise(0.5×pot)?, BetRaise(1.0×pot)?, AllIn?]`，`?` 表示不存在则跳过。
+- AA-002 `Fold` 与 `Check` 互斥（D-204）：当 `state.legal_actions().check == true` 时 `Fold` 不出现在抽象动作集合。
+- AA-003 `BetRaise(x×pot)` fallback（D-205）：若 `x×pot < min_to`，输出 `BetRaise { to = min_to }`（不剔除）；若 `x×pot >= committed_this_round + stack`，输出 `AllIn { to = committed_this_round + stack }`。
+- AA-004 折叠去重（D-206）：抽象动作集合中不同 `AbstractAction` 实例的 `to` 字段必须互不相等（除 `Fold` / `Check` 不带 `to`）。
+- AA-005 集合非空：当 `state.current_player().is_some()` 时，`abstract_actions(state).len() >= 1`（至少有 `Fold` 或 `Check` 之一，AA-002 保证不会同时空）。
+- AA-006 集合空：当 `state.current_player().is_none()`（terminal / all-in 跳轮）时，`abstract_actions(state).is_empty() == true`。
+- AA-007 deterministic：同 `(GameState, ActionAbstractionConfig)` 重复调用 `abstract_actions` 1,000,000 次结果完全相同（含 `Vec` 内 byte-equal）。
+- AA-008 `effective_stack` 计算（D-208）：`effective_stack = min(actor.stack, max(opp.stack for opp in still_active_opps))`，仅排除 `Folded` 状态。
+
+---
+
+## 2. Information abstraction（`module: abstraction::info` / `preflop` / `postflop`）
+
+### InfoSetId
+
+```rust
+/// 复合 InfoSet id。低位编码与 D-215 / D-216 一致。
+///
+/// preflop：`hand_class_169 (8 bit) | position (4) | stack (4) | prior_action (4) | street_tag = 0 (4) | reserved (40) = u64`
+/// postflop：`bucket_id (16) | position (4) | stack (4) | prior_voluntary_raise_count (4) | street_tag (4) | reserved (32)`
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd)]
+pub struct InfoSetId(u64);
+
+impl InfoSetId {
+    pub fn raw(self) -> u64;
+    pub fn street_tag(self) -> StreetTag;
+    pub fn position_bucket(self) -> u8;
+    pub fn stack_bucket(self) -> u8;
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(u8)]
+pub enum StreetTag {
+    Preflop = 0,
+    Flop = 1,
+    Turn = 2,
+    River = 3,
+}
+```
+
+### InfoAbstraction trait
+
+```rust
+pub trait InfoAbstraction: Send + Sync {
+    /// `(GameState, hole_cards)` → InfoSet id。
+    ///
+    /// 整条调用路径**禁止浮点**（D-273 / D-252）；postflop 走 mmap bucket lookup
+    /// 命中整数 bucket id；preflop 走组合 lookup 表。
+    fn map(&self, state: &GameState, hole: [Card; 2]) -> InfoSetId;
+}
+```
+
+### PreflopLossless169
+
+```rust
+pub struct PreflopLossless169 { /* opaque */ }
+
+impl PreflopLossless169 {
+    pub fn new() -> PreflopLossless169;
+
+    /// 169 lossless 等价类编号（D-217）：
+    /// - `0..13` = pocket pairs（22, 33, ..., AA 升序）
+    /// - `13..91` = suited（按高牌主排序、低牌副排序：32s 起，AKs 终）
+    /// - `91..169` = offsuit（同顺序）
+    pub fn hand_class(&self, hole: [Card; 2]) -> u8;
+
+    /// 169 类总 hole 计数：pairs 6 / suited 4 / offsuit 12，总和 1326。
+    pub fn hole_count_in_class(class: u8) -> u8;
+}
+
+impl Default for PreflopLossless169 { /* ... */ }
+
+impl InfoAbstraction for PreflopLossless169 {
+    /// preflop 路径：`(hand_class_169, position_bucket, stack_bucket, prior_action_bucket)`
+    /// 复合到 `InfoSetId`（D-215 编码）。
+    fn map(&self, state: &GameState, hole: [Card; 2]) -> InfoSetId;
+}
+```
+
+### PostflopBucketAbstraction
+
+```rust
+pub struct PostflopBucketAbstraction {
+    table: BucketTable,
+    /* canonical id 计算缓存等内部字段 */
+}
+
+impl PostflopBucketAbstraction {
+    /// 从 mmap-loaded BucketTable 构造。
+    pub fn new(table: BucketTable) -> PostflopBucketAbstraction;
+
+    /// 仅对 flop / turn / river 街生效；preflop 应走 PreflopLossless169。
+    pub fn bucket_id(&self, state: &GameState, hole: [Card; 2]) -> u32;
+
+    pub fn config(&self) -> BucketConfig;
+}
+
+impl InfoAbstraction for PostflopBucketAbstraction {
+    /// postflop 路径：`(street, board, hole) → bucket_id`（mmap），与 preflop key
+    /// 字段（position / stack / prior_voluntary_raise_count）合并到 `InfoSetId`
+    /// （D-216 编码）。
+    fn map(&self, state: &GameState, hole: [Card; 2]) -> InfoSetId;
+}
+```
+
+### Information abstraction 不变量
+
+- IA-001 preflop 169 全覆盖（D-217）：枚举全部 1326 起手牌 → 169 类一一映射；每类 hole 计数与组合数学一致（pairs 6 / suited 4 / offsuit 12 / 总和 1326）。
+- IA-002 preflop key 区分性（validation §2）：同一 `hand_class_169` 在不同 `(position, stack, prior_action)` 下产出**不同** `InfoSetId.raw()`，碰撞率 0%。
+- IA-003 postflop bucket id 范围：`PostflopBucketAbstraction::bucket_id(...)` 返回值 ∈ `[0, BucketConfig.{street})`。
+- IA-004 deterministic：`map(state, hole)` 重复 1,000,000 次结果 byte-equal。
+- IA-005 postflop 不依赖 preflop key（D-219）：`PostflopBucketAbstraction::bucket_id(state, hole)` 输出仅依赖 `(street, board, hole)`，不依赖 `(position, stack, prior_action)`。
+- IA-006 街隔离：`map(state, hole)` 必须根据 `state.street()` 选择 preflop 或 postflop 路径；`Showdown` 街调用返回的 `InfoSetId.street_tag()` = `StreetTag::River`（最后一条 betting round）。
+
+---
+
+## 3. Equity calculator（`module: abstraction::equity`）
+
+```rust
+/// Equity 计算 trait。**仅离线 clustering 训练路径** 使用；运行时映射禁止触发
+/// （D-225）。`f64` 出现在本 trait 是显式允许的——本路径在 `abstraction::equity`
+/// / `abstraction::cluster` 子模块，与 `abstraction::map` 子模块（禁浮点，D-252）
+/// 物理隔离。
+pub trait EquityCalculator: Send + Sync {
+    /// hand-vs-uniform-random-hole equity。
+    /// 返回值 ∈ [0.0, 1.0]，必须 finite（D-224）。
+    fn equity(&self, hole: [Card; 2], board: &[Card], rng: &mut dyn RngSource) -> f64;
+
+    /// EHS²（potential-aware 二阶矩，D-223）。
+    /// 返回值 ∈ [0.0, 1.0]。river 状态退化为 `equity²`。
+    fn ehs_squared(
+        &self,
+        hole: [Card; 2],
+        board: &[Card],
+        rng: &mut dyn RngSource,
+    ) -> f64;
+
+    /// OCHS 向量。长度 = `n_opp_clusters`（D-222 默认 8）。
+    /// 每维 ∈ [0.0, 1.0]，必须 finite。
+    fn ochs(
+        &self,
+        hole: [Card; 2],
+        board: &[Card],
+        rng: &mut dyn RngSource,
+    ) -> Vec<f64>;
+}
+
+/// Monte Carlo equity 实现。基于 stage 1 `HandEvaluator`（`pluribus_stage1_api.md` §6）。
+pub struct MonteCarloEquity {
+    iter: u32,
+    n_opp_clusters: u8,
+    /* opaque：HandEvaluator 引用、OCHS opponent cluster 中心、缓存等 */
+}
+
+impl MonteCarloEquity {
+    /// 默认配置：`iter = 10_000`、`n_opp_clusters = 8`（D-220 / D-222）。
+    pub fn new(evaluator: std::sync::Arc<dyn HandEvaluator>) -> MonteCarloEquity;
+
+    /// 自定义 iter（CI 短测试可降到 1,000；clustering 训练必须用默认 10k）。
+    pub fn with_iter(self, iter: u32) -> MonteCarloEquity;
+
+    /// 自定义 OCHS opponent cluster 数（stage 2 默认 8；stage 4 消融可调）。
+    pub fn with_opp_clusters(self, n: u8) -> MonteCarloEquity;
+
+    pub fn iter(&self) -> u32;
+    pub fn n_opp_clusters(&self) -> u8;
+}
+
+impl EquityCalculator for MonteCarloEquity { /* ... */ }
+```
+
+### Equity calculator 不变量
+
+- EQ-001 反对称容差（D-220a）：`|equity(A, B | board) + equity(B, A | board) - 1| ≤ 0.005`（`iter = 10_000`）；`iter = 1_000` 时容差 0.02。
+- EQ-002 范围：`equity / ehs_squared / ochs[i]` 全部 ∈ [0.0, 1.0] 且 finite（D-224）；任何 NaN / Inf 视为 P0 阻塞 bug。
+- EQ-003 EHS² rollout（D-227）：river 退化为 `equity²`（rollout = 0）；turn 全 44 张未发牌穷举 mean of squared EHS（确定性，无 RNG）；flop 当 `iter <= 44*43 = 1892` 时全枚举（确定性），`iter > 1892` 时 Monte Carlo（依赖 RngSource）。
+- EQ-004 OCHS 向量长度：`ochs(...).len() == self.n_opp_clusters() as usize`。
+- EQ-005 deterministic：同 `(hole, board, rng_seed, iter, n_opp_clusters)` 重复调用结果 byte-equal。
+
+---
+
+## 4. Bucket table（`module: abstraction::bucket_table`）
+
+### BucketConfig
+
+```rust
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct BucketConfig {
+    pub flop: u32,
+    pub turn: u32,
+    pub river: u32,
+}
+
+impl BucketConfig {
+    /// stage 2 默认验收配置（D-213）。
+    pub const fn default_500_500_500() -> BucketConfig;
+
+    /// 校验每条街 ∈ [10, 10_000]（D-214）。
+    pub fn new(flop: u32, turn: u32, river: u32) -> Result<BucketConfig, ConfigError>;
+}
+```
+
+### BucketTable
+
+```rust
+/// mmap-backed bucket lookup table（D-240..D-249）。
+///
+/// 文件 layout（D-244）：
+/// ```text
+/// magic: [u8; 8] = b"PLBKT\0\0\0"
+/// schema_version: u32 LE = 1
+/// feature_set_id: u32 LE                    (D-240：1 = EHS² + OCHS(N=8))
+/// flop_count / turn_count / river_count: u32 LE × 3
+/// training_seed: u64 LE
+/// centroid_metadata: per-street per-dim (min: f32 LE, max: f32 LE)
+/// centroid_data: per-street per-bucket per-dim u8 quantized (D-241)
+/// lookup_table: per-street (canonical_id → bucket_id)
+///   - preflop 段（D-245）：[u32 LE; 1326]
+///   - flop / turn / river 段：[u32 LE; n_canonical(street)]
+/// trailer: [u8; 32] = BLAKE3(file_body[..len-32])    (D-243)
+/// ```
+pub struct BucketTable { /* opaque：mmap 内部状态、缓存元数据 */ }
+
+impl BucketTable {
+    /// **eager 校验**：mmap → 读 header → 校验 schema_version / feature_set_id /
+    /// 文件总大小 → 计算 BLAKE3 trailer → 比对 → 任一失败立即返回错误。
+    /// 全 5 类错误路径见 BucketTableError。
+    pub fn open(path: &std::path::Path) -> Result<BucketTable, BucketTableError>;
+
+    /// `(street, board_canonical_id, hole_canonical_id) → bucket_id`。
+    /// preflop 街忽略 board_canonical_id 参数（传 0）。
+    /// hole_canonical_id 越界时返回 None；街参数为 Showdown 时返回 None。
+    pub fn lookup(
+        &self,
+        street: Street,
+        board_canonical_id: u32,
+        hole_canonical_id: u32,
+    ) -> Option<u32>;
+
+    pub fn schema_version(&self) -> u32;
+    pub fn feature_set_id(&self) -> u32;
+    pub fn config(&self) -> BucketConfig;
+    pub fn training_seed(&self) -> u64;
+
+    /// 每条街 bucket 数；preflop 固定返回 169。
+    pub fn bucket_count(&self, street: Street) -> u32;
+
+    /// 文件 BLAKE3 自校验值（D-243）。同 mmap 加载后 byte-equal。
+    pub fn content_hash(&self) -> [u8; 32];
+}
+```
+
+### BucketTableError
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum BucketTableError {
+    #[error("bucket table file not found: {path:?}")]
+    FileNotFound { path: std::path::PathBuf },
+
+    #[error("bucket table schema mismatch: expected {expected}, got {got}")]
+    SchemaMismatch { expected: u32, got: u32 },
+
+    #[error("bucket table feature_set_id mismatch: expected {expected}, got {got}")]
+    FeatureSetMismatch { expected: u32, got: u32 },
+
+    /// mmap 边界越界 / 文件被截断 / header 字段声明的 size 与实际文件不符。
+    #[error("bucket table size mismatch: expected {expected} bytes, got {got}")]
+    SizeMismatch { expected: u64, got: u64 },
+
+    /// magic bytes 错误 / BLAKE3 trailer 不匹配 / 字段越界 / 内部不一致。
+    #[error("bucket table corrupted at offset {offset}: {reason}")]
+    Corrupted { offset: u64, reason: String },
+}
+```
+
+### BucketTable 不变量
+
+- BT-001 magic bytes（D-240）：`open` 必须校验 `file[0..8] == b"PLBKT\0\0\0"`；不匹配返回 `BucketTableError::Corrupted { offset: 0, reason: "magic bytes mismatch" }`。
+- BT-002 schema_version 拒绝路径（D-246）：v1 reader 必须显式拒绝 `schema_version > 1` 文件，返回 `BucketTableError::SchemaMismatch { expected: 1, got: <found> }`。
+- BT-003 feature_set_id 拒绝路径：`open` 校验 `feature_set_id` 是否在当前 reader 支持的集合内；不支持返回 `BucketTableError::FeatureSetMismatch`。stage 2 默认 reader 支持 `{1}`（EHS² + OCHS(N=8)）。
+- BT-004 BLAKE3 trailer eager 校验（D-243）：`open` 必须计算 `BLAKE3(file_body[..len-32])` 并与 `file_body[len-32..len]` 比对；不匹配返回 `BucketTableError::Corrupted { offset: len-32, reason: "blake3 trailer mismatch" }`。
+- BT-005 bucket id 范围：`lookup(street, ...)` 返回 `Some(bucket_id)` 时 `bucket_id < bucket_count(street)`；preflop `bucket_id < 169`。
+- BT-006 deterministic：同 mmap 文件多次 `lookup(...)` 调用结果 byte-equal；`content_hash()` 多次调用结果完全相同。
+- BT-007 byte flip 安全（validation §5）：任意单字节翻转后 `open()` 必须返回 `BucketTableError::*` 而非 panic（除非翻转的是 padding，由 BLAKE3 trailer 检测）。`tests/bucket_table_corruption.rs` 100k 次 byte flip 0 panic。
+
+---
+
+## 5. 训练 CLI（`tools/train_bucket_table.rs`）
+
+```rust
+/// CLI entry point。从 RngSource seed → equity Monte Carlo → k-means clustering →
+/// 写出 mmap bucket table 二进制文件。
+///
+/// 用法（伪代码）：
+/// ```bash
+/// cargo run --release --bin train_bucket_table -- \
+///     --seed 0xCAFEBABE \
+///     --flop 500 --turn 500 --river 500 \
+///     --output artifacts/bucket_table_{git_short}_{config}.bin
+/// ```
+pub fn main() -> Result<(), TrainError>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum TrainError {
+    #[error("invalid CLI args: {0}")]
+    InvalidArgs(String),
+    #[error("clustering failed: {0}")]
+    ClusteringFailed(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("bucket table error: {0}")]
+    BucketTable(#[from] BucketTableError),
+}
+```
+
+CLI 不属公开 API surface（不被 `lib.rs` re-export）；签名变化不需要 `API-NNN-revM`，由 stage 2 [实现] / [测试] agent 在 PR 中自由迭代。但 **CLI 输入参数 → 输出 bucket table** 的契约（同 `(seed, BucketConfig)` 输出 byte-equal）受 D-237 / D-243 约束。
+
+---
+
+## 6. 模块导出（顶层 `lib.rs` 追加）
+
+```rust
+// 阶段 1 既有（不动，仅作上下文）
+pub mod core;
+pub mod rules;
+pub mod eval;
+pub mod history;
+pub mod error;
+
+// 阶段 2 新增 ★
+pub mod abstraction;
+
+// 阶段 1 既有 re-export 不动；以下为阶段 2 顶层 re-export（D-253）
+pub use abstraction::action::{
+    AbstractAction, AbstractActionSet, ActionAbstraction, ActionAbstractionConfig,
+    BetRatio, ConfigError, DefaultActionAbstraction,
+};
+pub use abstraction::info::{InfoAbstraction, InfoSetId, StreetTag};
+pub use abstraction::preflop::PreflopLossless169;
+pub use abstraction::postflop::PostflopBucketAbstraction;
+pub use abstraction::equity::{EquityCalculator, MonteCarloEquity};
+pub use abstraction::bucket_table::{BucketConfig, BucketTable, BucketTableError};
+```
+
+`abstraction::cluster` / `abstraction::feature` / `abstraction::map` 子模块**不**顶层 re-export（D-254 内部子模块隔离）；`abstraction::map` 子模块通过 `PreflopLossless169::map` / `PostflopBucketAbstraction::map` 间接对外，`cluster` 仅由 `tools/train_bucket_table.rs` 引用。
+
+---
+
+## 7. 与阶段 1 类型的桥接
+
+阶段 2 不修改 stage 1 类型；通过以下便捷函数桥接：
+
+```rust
+impl InfoSetId {
+    /// 便捷构造：从 GameState + hole + 抽象层 → InfoSetId。
+    /// 等价于 `abs.map(state, hole)`，仅作为 driver 代码的 ergonomic helper。
+    pub fn from_game_state<A: InfoAbstraction>(
+        state: &GameState,
+        hole: [Card; 2],
+        abs: &A,
+    ) -> InfoSetId;
+}
+
+impl AbstractAction {
+    /// `AbstractAction` → 实际可 apply 的 `Action`（stage 1 类型）。
+    /// `Fold`、`Check`、`Call`、`BetRaise`、`AllIn` 全部映射到对应 `Action` 变体。
+    pub fn to_concrete(self) -> Action;
+}
+```
+
+这些桥接函数仅做字段提取 / 转换，不引入语义层。stage 4 CFR driver 通过 `AbstractAction::to_concrete().apply(&mut state)?` 路径在 mock 抽象树上前进。
+
+---
+
+## 8. 端到端示例（doc test 占位）
+
+A1 [实现] 落以下 doc test 占位（`unimplemented!()` 的代码块仍可通过 `cargo doc`，但 `cargo test --doc` 在 B2 [实现] 完整后启用）：
+
+```rust
+/// # Example（B2 / C2 完成后启用）
+///
+/// ```ignore
+/// use poker::*;
+/// use std::sync::Arc;
+///
+/// let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator::new());
+/// let action_abs = DefaultActionAbstraction::default_5_action();
+/// let preflop_abs = PreflopLossless169::new();
+/// let bucket_table = BucketTable::open("artifacts/bucket_table_demo.bin")?;
+/// let postflop_abs = PostflopBucketAbstraction::new(bucket_table);
+///
+/// let config = TableConfig::default_6max_100bb();
+/// let state = GameState::new(&config, /* seed = */ 42);
+///
+/// // Action abstraction
+/// let actions: AbstractActionSet = action_abs.abstract_actions(&state);
+/// assert!(!actions.is_empty());
+///
+/// // Information abstraction（preflop 路径）
+/// let hole = state.players()[0].hole_cards.unwrap();
+/// let info_id: InfoSetId = preflop_abs.map(&state, hole);
+/// assert_eq!(info_id.street_tag(), StreetTag::Preflop);
+/// ```
+```
+
+---
+
+## 9. API 修改流程
+
+继承阶段 1 §11 API-100 ~ API-102 流程：
+
+- **API-300** 任何对本文档已定义签名的修改必须在本文档以追加 `API-NNN-revM` 条目记录，**不删除原条目**
+- **API-301** 修改若影响 `BucketTable` 二进制兼容性，必须 bump `BucketTable.schema_version` 并提供升级器（继承 stage 1 API-101 精神，`BucketTable.schema_version` 替代 `HandHistory.schema_version`）
+- **API-302** 修改 PR 必须经过决策者 review；测试 agent 与实现 agent 同时被 cc
+
+阶段 1 API（API-001..API-099）的修改仍走 `pluribus_stage1_api.md` §11 流程，**不**走本文档的 API-300。
+
+### 修订历史
+
+阶段 2 实施过程中的 API 修订按时间线追加到本节，遵循阶段 1 §11 修订历史 同样 "追加不删" 约定。
+
+格式参考 stage 1 `API-001-rev1`（`HandHistory::replay` / `replay_to` 返回类型由 `Result<_, RuleError>` 改为 `Result<_, HistoryError>`）。
+
+（本节首条由 stage 2 [实现] agent 在 B2 / C2 / D2 / E2 / F2 任一阶段发现 API 不够用、需要修订时填入。stage 2 A0 关闭时本节为空。）
+
+---
+
+## 10. 与决策文档的对应关系
+
+本文档每个类型 / 字段 / 不变量都可追溯到 `pluribus_stage2_decisions.md` 中的某条 `D-NNN`。如发现不一致，以 `pluribus_stage2_decisions.md` 为准，本文档同步修正。
+
+| 本文档段落 / 类型 | 关联决策（stage 2） | 关联决策（stage 1，只读继承） |
+|---|---|---|
+| §1 `AbstractAction` / `AbstractActionSet` / `ActionAbstractionConfig` | D-200 ~ D-209 | D-026（无浮点的运行时映射约束） |
+| §1 `BetRatio` 整数化 | D-200 / D-202 / D-207 | D-026（避免 `f64` 进入 `Eq`/`Hash`） |
+| §1 `DefaultActionAbstraction::abstract_actions` 不变量（AA-001..AA-008） | D-200 ~ D-209 / D-273 | D-026 / D-027 |
+| §1 `map_off_tree` PHM stub | D-201 | — |
+| §2 `InfoSetId` 编码 | D-215 / D-216 | — |
+| §2 `PreflopLossless169` | D-210 / D-211 / D-212 / D-215 / D-217 | — |
+| §2 `PostflopBucketAbstraction` | D-213 / D-214 / D-216 / D-218 / D-219 | — |
+| §2 IA-005 postflop 不依赖 preflop key | D-219 | — |
+| §3 `EquityCalculator` / `MonteCarloEquity` | D-220 / D-220a / D-221 / D-222 / D-223 / D-224 / D-227 | API-005 `RngSource`（继承）；§6 `HandEvaluator`（继承） |
+| §3 EQ-001 反对称容差 | D-220 / D-220a | — |
+| §3 EQ-003 EHS² rollout | D-227 | — |
+| §4 `BucketTable` 文件 layout | D-240 ~ D-249 | D-053（BLAKE3）；D-061 ~ D-066（schema 兼容精神） |
+| §4 `BucketConfig` | D-213 / D-214 | — |
+| §4 `BucketTableError` 5 类 | D-247 | API §8 `RuleError` / `HistoryError` 同型 |
+| §4 BT-007 byte flip 安全 | D-243 / D-247 | API §10 PB-002 from_proto 拒绝路径同型 |
+| §5 `tools/train_bucket_table.rs` | D-237 / D-242 | — |
+| §6 `lib.rs` 顶层 re-export | D-253 / D-254 | API §9（继承） |
+| §7 `InfoSetId::from_game_state` / `AbstractAction::to_concrete` | D-272（不修改 stage 1 API） | API §1（`Card` / `ChipAmount`）/ §2（`Action`）/ §4（`GameState`） |
+| §8 doc test 占位 | D-273 / API-302 | — |
+
+---
+
+## 参考资料
+
+- 阶段 2 决策记录：`pluribus_stage2_decisions.md`
+- 阶段 2 验收门槛：`pluribus_stage2_validation.md`
+- 阶段 2 实施流程：`pluribus_stage2_workflow.md`
+- 阶段 1 API 契约（只读继承）：`pluribus_stage1_api.md`
+- 阶段 1 决策记录（只读继承）：`pluribus_stage1_decisions.md`
+- prost / thiserror（继承 stage 1）：https://github.com/tokio-rs/prost / https://github.com/dtolnay/thiserror
+- memmap2（D-255 stage 2 新增）：https://github.com/RazrFalcon/memmap2-rs
+- BLAKE3（D-243 自校验）：https://github.com/BLAKE3-team/BLAKE3
