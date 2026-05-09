@@ -27,37 +27,44 @@ pub struct InfoSetId(u64);
 
 impl InfoSetId {
     pub fn raw(self) -> u64 {
-        unimplemented!("A1 stub; B2 implements")
+        self.0
     }
 
     pub fn street_tag(self) -> StreetTag {
-        unimplemented!("A1 stub; B2 implements per D-215 bit 35..38")
+        crate::abstraction::map::unpack_street_tag(self.0)
     }
 
     pub fn position_bucket(self) -> u8 {
-        unimplemented!("A1 stub; B2 implements per D-215 bit 24..28")
+        crate::abstraction::map::unpack_position_bucket(self.0)
     }
 
     pub fn stack_bucket(self) -> u8 {
-        unimplemented!("A1 stub; B2 implements per D-211 / D-215 bit 28..32")
+        crate::abstraction::map::unpack_stack_bucket(self.0)
     }
 
     pub fn betting_state(self) -> BettingState {
-        unimplemented!("A1 stub; B2 implements per D-212 / D-215 bit 32..35")
+        crate::abstraction::map::unpack_betting_state(self.0)
     }
 
     pub fn bucket_id(self) -> u32 {
-        unimplemented!("A1 stub; B2 implements per D-215 bit 0..24")
+        crate::abstraction::map::unpack_bucket_id(self.0)
     }
 
     /// 便捷构造（API §7 桥接）：从 `GameState + hole + 抽象层` → `InfoSetId`。
     /// 等价于 `abs.map(state, hole)`，仅作为 driver 代码的 ergonomic helper。
     pub fn from_game_state<A: InfoAbstraction>(
-        _state: &GameState,
-        _hole: [Card; 2],
-        _abs: &A,
+        state: &GameState,
+        hole: [Card; 2],
+        abs: &A,
     ) -> InfoSetId {
-        unimplemented!("A1 stub; B2 implements per API §7")
+        abs.map(state, hole)
+    }
+
+    /// crate-private 内部构造：仅供 `abstraction::map` 子模块的 `pack_info_set_id`
+    /// 调用，外部代码不应该直接构造 `InfoSetId`（必须经 `InfoAbstraction::map`
+    /// 路径以保证 D-215 字段语义稳定）。
+    pub(crate) fn from_raw_internal(raw: u64) -> InfoSetId {
+        InfoSetId(raw)
     }
 }
 

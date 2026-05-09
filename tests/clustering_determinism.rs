@@ -150,7 +150,6 @@ fn d228_op_id_globally_unique() {
 // **B1 状态**：A1 阶段 `derive_substream_seed` `unimplemented!()`，本测试
 // `#[ignore]`；B2 [实现] 落地 SplitMix64 后取消 ignore。
 #[test]
-#[ignore = "B2: derive_substream_seed unimplemented; 落地后取消 ignore"]
 fn d228_derive_substream_seed_splitmix64_byte_equal() {
     fn closed_form_splitmix64(master_seed: u64, op_id: u32, sub_index: u32) -> u64 {
         let tag = ((op_id as u64) << 32) | (sub_index as u64);
@@ -186,7 +185,6 @@ fn d228_derive_substream_seed_splitmix64_byte_equal() {
 // 不同 (master_seed, op_id, sub_index) 必须派生不同 sub_seed（否则 sub-stream
 // 碰撞，破坏 D-237 byte-equal）。本测试验证 32 组随机输入 → 32 个唯一 sub_seed。
 #[test]
-#[ignore = "B2: derive_substream_seed unimplemented; 落地后取消 ignore"]
 fn d228_derive_substream_seed_distinctness_smoke() {
     let mut seeds = Vec::with_capacity(32);
     for i in 0..32u32 {

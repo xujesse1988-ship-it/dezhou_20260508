@@ -742,3 +742,49 @@ B-rev0 batch 2 出口数据（commit 落地实测；本机 1-CPU AMD64 debug pro
     - **stage-2 B1 + batch 2 新 6 crates** `6 passed / 29 failed / 17 ignored`：action_abstraction 12 panic on unimplemented（10 commit `14508bb` 原有 + 2 batch 2 H2 新 short-stack 3-bet case；H1 是重写非新增）+ canonical_observation 7 panic on unimplemented + 1 should_panic test passed + info_id_encoding 7 panic + 1 ignored + B 类 preflop_169 2 closed-form 独立通过 + 3 stub-driven panic + C/D 类 17 ignored（equity 9 commit `14508bb` + 3 batch 2 新增 = 12，clustering 4，info_abs_postflop_bucket_id_in_range 1 = 17）+ 3 const-only clustering active 通过。整体 §B1 §出口 line 248–250 字面预期满足。
 
 B-rev0 batch 2 角色边界审计：本 commit 仅触 `tests/`（修 3 + 新 1 = 4 文件）+ `docs/pluribus_stage2_workflow.md` §B-rev0 batch 2 + `CLAUDE.md` 状态翻面 batch 2 段落。`src/` / `benches/` / `Cargo.toml` / `Cargo.lock` / `fuzz/` / `tools/` / `proto/` **未修改一行**——0 越界（继承 stage-1 §B-rev1 §3 / §C-rev1 / §D-rev0 0 越界形态）。`tests/scenarios_extended.rs` **未触动**（API §F20 影响 ② 显式 carry-forward 到 C1 §C1 line 317 字面落地）。
+
+#### B2 关闭（2026-05-09）— B-rev1
+
+B2 [实现] 关闭。同 commit 让 B1 (B-rev0 + B-rev0 batch 2) 全绿，按 §B2 §输出 列表落地 5 类产品代码：
+
+- **`DefaultActionAbstraction::abstract_actions`** 完整 5-action 输出（D-200..D-209 + AA-003-rev1 first-match-wins fallback ① floor-to-min_to → ② ceil-to-AllIn → ③ 输出 + AA-004-rev1 折叠去重 AllIn 优先 / Bet/Raise 同 to 保留较小 ratio_label）。`pot_after_call_size = pot() + (max_committed - actor.committed_this_round)` 整数路径计算 candidate_to（D-203），`(milli * pot_after_call).div_ceil(1000)` 向上取整到 chip。
+- **`PreflopLossless169`**：D-217 closed-form `hand_class_169` + `hole_count_in_class`（13×6 + 78×4 + 78×12 = 1326 ✓）+ `canonical_hole_id` 单维 0..1326（lex order on (low, high) ascending）+ `InfoAbstraction::map` preflop 路径（`bucket_id = hand_class_169` / `position_bucket = (actor_seat - button_seat) mod n_seats` / `stack_bucket` from `state.config().starting_stacks[actor_seat] / big_blind` D-211 5 桶 / `betting_state` from voluntary aggression count this street + `legal_actions().check` 区分 Open vs FacingBetNoRaise / `street_tag = StreetTag::Preflop`）。
+- **`PostflopBucketAbstraction` 占位实现**（C2 才完整）：`canonical_observation_id` first-appearance suit remap → sorted (board, hole) canonical → FNV-1a 32-bit fold → mod 2_000_000 上界（D-244-rev1 BT-008-rev1 flop 保守上界）。`bucket_id` 经 `BucketTable::lookup` 在 stub 路径下永远返回 `Some(0)`（§B2 §输出 line 274 字面 "每条街固定返回 bucket_id = 0" 协议）。`PostflopBucketAbstraction::map` 与 preflop 共用 position / stack / betting_state / street_tag 编码（postflop 街沿用 preflop 起手 stack_bucket，D-219 隔离原则）。
+- **`MonteCarloEquity`** 朴素实现（`EquityCalculator` 4 方法 + `EquityError` 5 类错误路径）：`equity` (vs random opp，EHS) MC over (opp_hole, remaining board) / `equity_vs_hand` river=确定性单评估 + turn=44 unseen river enum + flop=C(45,2)=990 (turn,river) enum + preflop=outer MC over 5-card boards / `ehs_squared` river=`equity²` + turn=46 unseen rivers outer + flop=C(47,2)=1081 outer + preflop=outer MC / `ochs` 8 个固定 opp class representative 经 `equity_vs_hand` 计算（B2 stub；C2 用 1D EHS k-means 训 169-class → 8-cluster）。整套使用栈数组 `[u8; 52]` Fisher-Yates 部分洗牌避免 Vec heap churn（10M+ MC iter 下减约 3× debug 开销）。
+- **`derive_substream_seed`** D-228 SplitMix64 finalizer + `BucketConfig::new` D-214 [10, 10_000] 校验 + `BucketTable::stub_for_postflop(BucketConfig)`（B-rev0 carve-out option (1) 落地：cfg(test) 不需要的 in-memory stub 路径，`lookup` 返回 `Some(0)`，`schema_version = 1` / `feature_set_id = 1` / 占位 `n_canonical_<street>` = 2_000_000 / 20_000_000 / 200_000_000 上界）+ `AbstractAction::to_concrete` API §7 桥接（Fold/Check/Call/Bet/Raise/AllIn → stage 1 `Action::*` 字段提取，无状态调用）+ `InfoSetId` getters / `from_game_state` 桥接 / `pack_info_set_id` 整数 bit pack helper（位于 `abstraction::map` 子模块顶 `#![deny(clippy::float_arithmetic)]`，D-252 锁死浮点边界）。
+
+**stage 1 [实现] 越界 carve-out（API-004-rev1）**：B2 [实现] 在 `InfoAbstraction::map` 落地 `stack_bucket` D-211-rev1 协议时发现 stage 1 `GameState` 未公开 `config(&self) -> &TableConfig` getter（私有字段无访问路径），按 §F21 carve-out 文字 "B2 [实现] 在落地实际逻辑时若 stage 1 GameState getter 缺位，同 PR 触发 stage 1 `API-NNN-revM`" 显式触发——同 commit 在 `pluribus_stage1_api.md` §11 修订历史新增 `API-004-rev1`（additive 只读 getter，不修改任何既有签名 / 不变量 / proto schema）+ `src/rules/state.rs` 加 `pub fn config(&self) -> &TableConfig` 单行实现。继承 stage-1 §D-rev0 同型 [实现] → [决策/API] 越界 carve-out（D-037-rev1 落地路径），由 stage 1 §11 修订历史 + 本 §B-rev1 双向标注追认。
+
+**[测试] 角色越界 carve-out（继承 stage-1 §B-rev1 §3 / §B-rev0 batch 2 carve-out 1+2）**：B2 [实现] 闭合 commit 同 commit 触 `tests/`：
+
+1. **取消 12 条 C 类 equity `#[ignore]`**（`tests/equity_self_consistency.rs`）：B-rev0 batch 2 carve-out 1 显式追认。`MonteCarloEquity` 落地后 12 条断言全绿（反对称 river/turn/flop strict 1e-9 + preflop strict dual RngSource 1e-9 + preflop noisy 10k 0.005 + preflop noisy 1k 0.02 + EHS 单调性 AA > 72o + 1k determinism + 4 类错误路径 + OCHS shape + ehs² finite/range）。
+2. **取消 2 条 D 类 D-228 `#[ignore]`**（`tests/clustering_determinism.rs`）：`derive_substream_seed` 落地后 SplitMix64 byte-equal + 32 sub_seed 区分性两条断言全绿。剩余 2 条（`clustering_repeat_blake3_byte_equal_skeleton` / `cross_thread_bucket_id_consistency_skeleton`）是 C2/D1 占位骨架，`#[ignore]` 保留。
+3. **取消 1 条 `info_abs_postflop_bucket_id_in_range` `#[ignore]` 并填充测试体**（`tests/info_id_encoding.rs`）：B-rev0 batch 2 carve-out 2 显式追认。新测试体走 default 6-max preflop fold-to-flop fixture → `BucketTable::stub_for_postflop(BucketConfig::default_500_500_500())` → `PostflopBucketAbstraction::new` → `bucket_id < cfg.flop` + `bucket_id < 2^24` IA-003 in-range smoke。
+4. **修订 `tests/action_abstraction.rs::bet_ratio_from_f64_half_to_even`** 1 条断言（B-rev0 batch 3 carve-out）：B1 [测试] 写测试时假设 `0.5015 * 1000.0 == 501.5_f64`（mathematical），但 IEEE-754 实际值为 `0.5015f64 * 1000.0 = 501.4999999999999...`（< 501.5），不构成 half-to-even 的 "tie"，`round_ties_even` 走标准 round-to-nearest 到 501（非 502）。原断言期望 502 与实现一致性冲突，B2 [实现] 落地 `BetRatio::from_f64` 时按 IEEE-754 spec 实测后修正断言为 501（继承 stage-1 §B-rev1 §3 同型 [实现] → [测试] 角色越界 carve-out）。原 0.5005 / 0.5025 两条 tie 断言保留（这两个值的 *1000 同样落在 .4999... 区间，但 floor 路径 happen 与 half-to-even 结果一致：500/502）。
+
+B2 出口数据（commit 落地实测；本机 1-CPU AMD64 debug profile）：
+
+- `cargo fmt --all --check` ok / `cargo build --all-targets` ok / `cargo clippy --all-targets -- -D warnings` ok（含 1 处 `#[allow(clippy::incompatible_msrv)]` 在 `BetRatio::from_f64` 上：`round_ties_even` Rust 1.77+ stable，项目 `Cargo.toml` `rust-version = "1.75"` 是保守 metadata，`rust-toolchain.toml` 实际 pin 到 1.95.0，suppress lint 不影响运行行为）/ `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` ok（postflop / equity 各 1 处中文 role tag `\[实现\]` 转义补完）。
+- `cargo test --no-run` 编译 22 test crates 成功，`tests/api_signatures.rs` trip-wire（A1 落地 + B2 取用的 50+ 公开签名绑定 + D-228 全 15 op_id 常量）byte-equal 不变，stage 2 公开 API 0 签名漂移。
+- `cargo test --no-fail-fast`（默认）：**154 passed / 21 ignored / 0 failed across 22 test crates**。
+    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`，与 stage1-v1.0 tag **byte-equal**（D-272 不退化要求满足）。
+    - **stage-2 6 crates** `50 passed / 2 ignored / 0 failed`：action_abstraction 12 / canonical_observation 8（含 1 should_panic）/ clustering_determinism 5 active + 2 ignored（C2/D1 占位）/ equity_self_consistency 12 / info_id_encoding 8 / preflop_169 5。
+    - 实测耗时（debug profile）：equity_self_consistency 145s 主导（`equity_determinism_repeat_1k_smoke` 10M MC iter + `ehs_squared_finite_range_smoke` flop 10.8M MC iter；release profile 预计 < 5s，E2 SLO 路径接管），其它 21 crates 合计约 10s。CI 默认走 debug profile，可接受。
+- B2 §出口标准 三条全部满足：line 280 "B1 全部测试通过（含 preflop 169 lossless 1326 → 169 枚举）" ✓；line 281 "equity Monte Carlo 反对称误差在 D-220 容差内"（postflop river/turn/flop 1e-9 + preflop strict dual RngSource 1e-9 + preflop noisy 10k 0.005 + 1k 0.02 全绿）✓；line 282 "阶段 1 全套测试仍 0 failed"（默认 + ignored 套件未受影响）✓。
+
+B2 角色边界审计：本 commit 触 `src/`、`tests/`、`docs/`、`CLAUDE.md`：
+
+- **`src/abstraction/`**（产品代码 8 文件填充）：`action.rs` / `info.rs` / `preflop.rs` / `postflop.rs` / `equity.rs` / `cluster.rs` / `bucket_table.rs` / `map/mod.rs` —— A1 stub `unimplemented!()` 全部填充实现，函数签名与 `pluribus_stage2_api.md` 0 漂移（trip-wire 校验）。
+- **`src/rules/state.rs`**（stage 1 [实现] 越界 carve-out，API-004-rev1）：1 行新增 `pub fn config(&self) -> &TableConfig` 只读 getter。
+- **`src/lib.rs`**：A1 已落地 stage-2 顶层 re-export，本 commit **未修改一行**。
+- **`tests/`**（[测试] 角色越界 carve-out，详见上方 4 条）：`tests/equity_self_consistency.rs` 移除 12 条 `#[ignore]` + `tests/clustering_determinism.rs` 移除 2 条 `#[ignore]` + `tests/info_id_encoding.rs` 移除 1 条 `#[ignore]` 并填充 `info_abs_postflop_bucket_id_in_range` 测试体 + `tests/action_abstraction.rs::bet_ratio_from_f64_half_to_even` 修订 1 条断言（IEEE-754 修正）。`tests/api_signatures.rs` / 其它 21 测试文件 **未修改一行**——B2 [实现] [测试] 越界限定在上述 4 处 carve-out 内。
+- **`docs/`**：`docs/pluribus_stage1_api.md` §11 修订历史追加 `API-004-rev1`（additive `GameState::config()` getter）+ `docs/pluribus_stage2_workflow.md` §修订历史追加本 §B-rev1 + `CLAUDE.md` 状态翻 "stage 2 B2 closed"。
+- **未修改**：`Cargo.toml` / `Cargo.lock` / `benches/` / `fuzz/` / `tools/` / `proto/`（B2 不引入新依赖；E2 / C2 才接 mmap 真实路径）。
+
+§B-rev1 carry forward 处理政策（与 §A-rev0 / §A-rev1 / §B-rev0 / §B-rev0 batch 2 一致）：
+
+- §B-rev1 §3：[实现] 步骤越界改测试代码 → 当 commit 显式追认；不静默扩散到下一步。本 commit 落地 4 处 carve-out（C 类 12 ignore / D 类 2 ignore / postflop 1 ignore + 测试体 / IEEE-754 测试断言修正），全部追认。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 commit 落地。
+- 阶段 1 §C-rev1 / §D-rev0 / §F-rev1 既往政策保持继承不变。
+
+下一步：C1 [测试]（postflop 聚类质量测试）。按 §C1 §输出 落地 `tests/bucket_quality.rs`（500/500/500 配置下每条街每 bucket 至少 1 个 canonical sample / EHS std dev < 0.05 / 相邻 bucket EMD ≥ T_emd / bucket id ↔ EHS 中位数单调一致 / 1k smoke + 1M ignored）+ `tests/equity_features.rs`（EHS² / OCHS 自洽）+ `tests/scenarios_extended.rs` 阶段 2 版扩到 200+ 固定 GameState 场景（API §F20 影响 ② 字面要求 ≥ 2 条 all-in call 场景）+ `tools/bucket_quality_report.py` artifact 输出。预期 C1 [测试] 闭合后 `cargo test --no-fail-fast` 暴露 N 条 fail（B2 stub `bucket_id = 0` 不可能过 EHS std dev / EMD / 单调性等质量门槛，留 C2 修复）+ preflop 169 lossless 全套保持全绿（C1 不动 preflop 信任锚）。

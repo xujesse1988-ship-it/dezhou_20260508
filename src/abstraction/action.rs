@@ -65,13 +65,32 @@ impl BetRatio {
     ///    负数 / 0.0）返回 `None`。
     /// 3. **重复处理**：本函数本身不去重；多输入量化到同一 milli 值由
     ///    `ActionAbstractionConfig::new` 检测，返回 `ConfigError::DuplicateRatio`。
-    pub fn from_f64(_ratio: f64) -> Option<BetRatio> {
-        unimplemented!("A1 stub; B2 implements per D-202-rev1 / BetRatio::from_f64-rev1")
+    // `round_ties_even` is stable since Rust 1.77; project Cargo.toml
+    // `rust-version = "1.75"` is conservative metadata while
+    // `rust-toolchain.toml` pins the actual compiler to 1.95.0 (D-007).
+    // The clippy `incompatible_msrv` lint fires on the MSRV metadata read;
+    // suppressing it here keeps the IEEE-754 half-to-even semantics required
+    // by the D-202-rev1 spec without bumping the Cargo.toml MSRV (a separate
+    // policy decision).
+    #[allow(clippy::incompatible_msrv)]
+    pub fn from_f64(ratio: f64) -> Option<BetRatio> {
+        if !ratio.is_finite() || ratio <= 0.0 {
+            return None;
+        }
+        let raw = ratio * 1000.0;
+        if !raw.is_finite() || raw < 0.0 || raw > u32::MAX as f64 {
+            return None;
+        }
+        let rounded = raw.round_ties_even();
+        if rounded < 1.0 || rounded > u32::MAX as f64 {
+            return None;
+        }
+        Some(BetRatio(rounded as u32))
     }
 
     /// 返回内部整数表示（D-200，`milli = ratio × 1000`）。
     pub fn as_milli(self) -> u32 {
-        unimplemented!("A1 stub; B2 implements")
+        self.0
     }
 }
 
@@ -81,29 +100,28 @@ impl BetRatio {
 /// LA-002 保证）。
 #[derive(Clone, Debug)]
 pub struct AbstractActionSet {
-    #[allow(dead_code)] // A1 stub; B2 fills.
     actions: Vec<AbstractAction>,
 }
 
 impl AbstractActionSet {
     pub fn iter(&self) -> std::slice::Iter<'_, AbstractAction> {
-        unimplemented!("A1 stub; B2 implements")
+        self.actions.iter()
     }
 
     pub fn len(&self) -> usize {
-        unimplemented!("A1 stub; B2 implements")
+        self.actions.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        unimplemented!("A1 stub; B2 implements")
+        self.actions.is_empty()
     }
 
-    pub fn contains(&self, _action: AbstractAction) -> bool {
-        unimplemented!("A1 stub; B2 implements")
+    pub fn contains(&self, action: AbstractAction) -> bool {
+        self.actions.contains(&action)
     }
 
     pub fn as_slice(&self) -> &[AbstractAction] {
-        unimplemented!("A1 stub; B2 implements")
+        &self.actions
     }
 }
 
@@ -117,17 +135,38 @@ pub struct ActionAbstractionConfig {
 impl ActionAbstractionConfig {
     /// 默认 5-action 配置：`[BetRatio::HALF_POT, BetRatio::FULL_POT]`（D-200）。
     pub fn default_5_action() -> ActionAbstractionConfig {
-        unimplemented!("A1 stub; B2 implements per D-200")
+        ActionAbstractionConfig {
+            raise_pot_ratios: vec![BetRatio::HALF_POT, BetRatio::FULL_POT],
+        }
     }
 
     /// 自定义构造。长度 / 范围越界 / 量化后 milli 重复均返回 `ConfigError`
     /// （见 §9 BetRatio::from_f64-rev1 量化协议；D-202-rev1）。
-    pub fn new(_raise_pot_ratios: Vec<f64>) -> Result<ActionAbstractionConfig, ConfigError> {
-        unimplemented!("A1 stub; B2 implements per D-202-rev1")
+    pub fn new(raise_pot_ratios: Vec<f64>) -> Result<ActionAbstractionConfig, ConfigError> {
+        let n = raise_pot_ratios.len();
+        if !(1..=14).contains(&n) {
+            return Err(ConfigError::RaiseCountOutOfRange(n));
+        }
+        let mut quantized: Vec<BetRatio> = Vec::with_capacity(n);
+        for raw in raise_pot_ratios {
+            let q = BetRatio::from_f64(raw).ok_or(ConfigError::RaiseRatioInvalid(raw))?;
+            if quantized
+                .iter()
+                .any(|existing| existing.as_milli() == q.as_milli())
+            {
+                return Err(ConfigError::DuplicateRatio {
+                    milli: q.as_milli(),
+                });
+            }
+            quantized.push(q);
+        }
+        Ok(ActionAbstractionConfig {
+            raise_pot_ratios: quantized,
+        })
     }
 
     pub fn raise_count(&self) -> usize {
-        unimplemented!("A1 stub; B2 implements")
+        self.raise_pot_ratios.len()
     }
 }
 
@@ -168,31 +207,180 @@ pub trait ActionAbstraction: Send + Sync {
 
 /// 默认 5-action 抽象（D-200）。
 pub struct DefaultActionAbstraction {
-    #[allow(dead_code)] // A1 stub; B2 fills.
     config: ActionAbstractionConfig,
 }
 
 impl DefaultActionAbstraction {
-    pub fn new(_config: ActionAbstractionConfig) -> DefaultActionAbstraction {
-        unimplemented!("A1 stub; B2 implements")
+    pub fn new(config: ActionAbstractionConfig) -> DefaultActionAbstraction {
+        DefaultActionAbstraction { config }
     }
 
     pub fn default_5_action() -> DefaultActionAbstraction {
-        unimplemented!("A1 stub; B2 implements per D-200")
+        DefaultActionAbstraction::new(ActionAbstractionConfig::default_5_action())
     }
 }
 
 impl ActionAbstraction for DefaultActionAbstraction {
-    fn abstract_actions(&self, _state: &GameState) -> AbstractActionSet {
-        unimplemented!("A1 stub; B2 implements per D-200..D-209 + AA-003-rev1 / AA-004-rev1")
+    fn abstract_actions(&self, state: &GameState) -> AbstractActionSet {
+        if state.current_player().is_none() {
+            return AbstractActionSet {
+                actions: Vec::new(),
+            };
+        }
+        let la = state.legal_actions();
+        let actor_seat = state
+            .current_player()
+            .expect("current_player checked above");
+        let actor = &state.players()[actor_seat.0 as usize];
+        let committed_this_round = actor.committed_this_round;
+        let max_committed = state
+            .players()
+            .iter()
+            .map(|p| p.committed_this_round)
+            .max()
+            .unwrap_or(ChipAmount::ZERO);
+        let cap = la
+            .all_in_amount
+            .unwrap_or(committed_this_round + actor.stack);
+        let pot_before = state.pot();
+        // pot_after_call_size = pot_before + (max_committed - committed_this_round)
+        let to_call_delta = if max_committed > committed_this_round {
+            max_committed - committed_this_round
+        } else {
+            ChipAmount::ZERO
+        };
+        let pot_after_call = pot_before + to_call_delta;
+
+        // D-209 顺序构建候选: Fold / Check / Call / Bet|Raise(0.5×) / Bet|Raise(1.0×) / AllIn
+        let mut actions: Vec<AbstractAction> = Vec::with_capacity(6);
+
+        // D-204：free-check 局面剔除 Fold
+        if la.fold && !la.check {
+            actions.push(AbstractAction::Fold);
+        }
+        if la.check {
+            actions.push(AbstractAction::Check);
+        }
+        if let Some(call_to) = la.call {
+            actions.push(AbstractAction::Call { to: call_to });
+        }
+
+        // D-205 / AA-003-rev1：每个 raise_pot_ratio 计算 candidate_to + first-match-wins fallback
+        for &ratio in &self.config.raise_pot_ratios {
+            // Skip if neither bet_range nor raise_range is available (no aggression possible).
+            if la.bet_range.is_none() && la.raise_range.is_none() {
+                continue;
+            }
+            let min_to = la
+                .bet_range
+                .map(|(min, _)| min)
+                .or(la.raise_range.map(|(min, _)| min))
+                .expect("bet_range or raise_range checked above");
+            // candidate_to = max_committed + ceil(ratio_milli * pot_after_call / 1000)
+            let milli = ratio.as_milli() as u64;
+            let pot_chips = pot_after_call.as_u64();
+            let scaled = (milli as u128) * (pot_chips as u128);
+            let ratio_part_ceil = scaled.div_ceil(1000) as u64;
+            let mut candidate_to = max_committed + ChipAmount::new(ratio_part_ceil);
+            // ① floor to min_to
+            if candidate_to < min_to {
+                candidate_to = min_to;
+            }
+            // ② ceil to AllIn cap
+            if candidate_to >= cap {
+                // Will be handled by AllIn slot below; emit nothing here so AllIn priority
+                // (AA-003-rev1 ②) absorbs the candidate.
+                continue;
+            }
+            // ③ otherwise: Bet { to } / Raise { to }
+            let candidate = if la.bet_range.is_some() {
+                AbstractAction::Bet {
+                    to: candidate_to,
+                    ratio_label: ratio,
+                }
+            } else {
+                AbstractAction::Raise {
+                    to: candidate_to,
+                    ratio_label: ratio,
+                }
+            };
+            actions.push(candidate);
+        }
+
+        // AllIn slot
+        if let Some(all_in_to) = la.all_in_amount {
+            actions.push(AbstractAction::AllIn { to: all_in_to });
+        }
+
+        // AA-004-rev1 折叠去重（first-match-wins）：
+        //   ① AllIn 优先：任意 Call/Bet/Raise 的 to == cap 折入 AllIn 槽，移除前者。
+        //   ② Bet/Raise(0.5×) 与 Bet/Raise(1.0×) 同 to 时保留 ratio_label 较小的一份。
+        //   ③ Call vs Bet/Raise 不会折叠（D-034 / D-035 严格不等）。
+        if actions
+            .iter()
+            .any(|a| matches!(a, AbstractAction::AllIn { .. }))
+        {
+            actions.retain(|a| match a {
+                AbstractAction::Call { to } => *to != cap,
+                AbstractAction::Bet { to, .. } => *to != cap,
+                AbstractAction::Raise { to, .. } => *to != cap,
+                _ => true,
+            });
+        }
+        // ② 同 to 的 Bet/Raise 去重，保留较小 ratio_label
+        let mut deduped: Vec<AbstractAction> = Vec::with_capacity(actions.len());
+        for action in actions {
+            match action {
+                AbstractAction::Bet { to, ratio_label } => {
+                    if let Some(idx) = deduped
+                        .iter()
+                        .position(|a| matches!(a, AbstractAction::Bet { to: t, .. } if *t == to))
+                    {
+                        if let AbstractAction::Bet {
+                            ratio_label: existing,
+                            ..
+                        } = deduped[idx]
+                        {
+                            if ratio_label.as_milli() < existing.as_milli() {
+                                deduped[idx] = AbstractAction::Bet { to, ratio_label };
+                            }
+                        }
+                    } else {
+                        deduped.push(action);
+                    }
+                }
+                AbstractAction::Raise { to, ratio_label } => {
+                    if let Some(idx) = deduped
+                        .iter()
+                        .position(|a| matches!(a, AbstractAction::Raise { to: t, .. } if *t == to))
+                    {
+                        if let AbstractAction::Raise {
+                            ratio_label: existing,
+                            ..
+                        } = deduped[idx]
+                        {
+                            if ratio_label.as_milli() < existing.as_milli() {
+                                deduped[idx] = AbstractAction::Raise { to, ratio_label };
+                            }
+                        }
+                    } else {
+                        deduped.push(action);
+                    }
+                }
+                _ => deduped.push(action),
+            }
+        }
+
+        AbstractActionSet { actions: deduped }
     }
 
     fn map_off_tree(&self, _state: &GameState, _real_to: ChipAmount) -> AbstractAction {
-        unimplemented!("A1 stub; D-201 PHM stub; stage 6c 完整验证")
+        // D-201 PHM stub。stage 2 仅占位，stage 6c 完整数值验收。
+        unimplemented!("D-201 PHM stub; stage 6c 完整验证")
     }
 
     fn config(&self) -> &ActionAbstractionConfig {
-        unimplemented!("A1 stub; B2 implements")
+        &self.config
     }
 }
 
@@ -214,6 +402,13 @@ impl AbstractAction {
     /// - `AllIn { .. }` → `Action::AllIn`（state machine 自动归一化，`to` 字段
     ///   作为 InfoSet 编码标签即可丢弃）
     pub fn to_concrete(self) -> Action {
-        unimplemented!("A1 stub; B2 implements per API §7 字段提取规则")
+        match self {
+            AbstractAction::Fold => Action::Fold,
+            AbstractAction::Check => Action::Check,
+            AbstractAction::Call { .. } => Action::Call,
+            AbstractAction::Bet { to, .. } => Action::Bet { to },
+            AbstractAction::Raise { to, .. } => Action::Raise { to },
+            AbstractAction::AllIn { .. } => Action::AllIn,
+        }
     }
 }

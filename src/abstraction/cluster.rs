@@ -39,8 +39,12 @@ pub mod rng_substream {
     /// 线性整数：iter / outer-enum-index / split-attempt-index）。
     ///
     /// 输出：64-bit 派生 seed，可直接喂给 `ChaCha20Rng::from_seed`。
-    pub fn derive_substream_seed(_master_seed: u64, _op_id: u32, _sub_index: u32) -> u64 {
-        unimplemented!("A1 stub; B2 implements per D-228 SplitMix64 finalizer protocol")
+    pub fn derive_substream_seed(master_seed: u64, op_id: u32, sub_index: u32) -> u64 {
+        let tag = ((op_id as u64) << 32) | (sub_index as u64);
+        let mut x = master_seed ^ tag;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+        x ^ (x >> 31)
     }
 
     // ===========================================================================

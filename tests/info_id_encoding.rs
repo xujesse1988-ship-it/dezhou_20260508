@@ -308,24 +308,47 @@ fn preflop_169_prior_action_changes_infoset() {
 // 保留 `#[ignore]` 直到 B2 闭合：B2 同 commit (a) 暴露 stub 构造器、(b)
 // 取消本测试 `#[ignore]` 并填充 setup 路径（继承 §B-rev1 §3 同型角色越界
 // carve-out）。
+// **B-rev0 carve-out batch 3 落地（B2 [实现] 闭合 commit）**：B2 [实现] 在
+// `BucketTable` 上暴露 `stub_for_postflop(BucketConfig)` 路径（B-rev0 carve-out
+// option (1)），让本测试可独立构造 stub `PostflopBucketAbstraction` 验证
+// IA-003 in-range 不变量。`lookup` 在 stub 路径下永远返回 `Some(0)`，所以
+// `bucket < cfg.flop` 严格成立；此外 0 < 2^24 显然成立。
 #[test]
-#[ignore = "B-rev0 carve-out：B2 [实现] 闭合时同 commit 暴露 BucketTable stub 构造器并取消本 ignore（详见 workflow §B-rev0）"]
 fn info_abs_postflop_bucket_id_in_range() {
-    // 占位断言结构：构造 flop street state + AA 起手 + PostflopBucketAbstraction
-    // (stub) → 断言 bucket_id < bucket_count(StreetTag::Flop) ≤ 2^24。
-    //
-    // B2 [实现] 落地后取消 #[ignore]：测试体应类似下方伪代码（具体获取
-    // PostflopBucketAbstraction 的路径由 B2 决定，B1 不锁定）：
-    //
-    // ```ignore
-    // let postflop_abs: PostflopBucketAbstraction = /* B2 提供 stub 构造路径 */;
-    // let cfg = postflop_abs.config();
-    // let state_on_flop = drive_to_flop(/* ... */);
-    // let bucket = postflop_abs.bucket_id(&state_on_flop, aa_spades_hearts());
-    // assert!(bucket < cfg.flop, "IA-003: bucket_id < bucket_count(flop)");
-    // assert!(bucket < (1u32 << 24), "IA-003: bucket_id < 2^24 (D-215 字段宽度)");
-    // ```
-    panic!("B1 placeholder：B2 [实现] 落地 PostflopBucketAbstraction stub 后取消 #[ignore]");
+    use poker::{Action, BucketConfig, BucketTable, PostflopBucketAbstraction, SeatId};
+
+    // Drive default 6-max state to flop (UTG/MP/CO/BTN fold, SB call, BB check).
+    let cfg = TableConfig::default_6max_100bb();
+    let mut s = GameState::new(&cfg, 7);
+    for seat_idx in [3u8, 4, 5, 0] {
+        assert_eq!(s.current_player(), Some(SeatId(seat_idx)));
+        s.apply(Action::Fold).expect("preflop fold");
+    }
+    assert_eq!(s.current_player(), Some(SeatId(1)));
+    s.apply(Action::Call).expect("SB limp");
+    assert_eq!(s.current_player(), Some(SeatId(2)));
+    s.apply(Action::Check).expect("BB check → flop");
+    assert_eq!(s.current_player(), Some(SeatId(1)), "SB acts first on flop");
+
+    let bucket_cfg = BucketConfig::default_500_500_500();
+    let table = BucketTable::stub_for_postflop(bucket_cfg);
+    let postflop_abs = PostflopBucketAbstraction::new(table);
+
+    // Use any hole disjoint from current state. AA spades-hearts always works
+    // because deck is dealt from seed=7 and BB held some other cards; we don't
+    // need AA at hand here, just a deterministic 2-card pair (the bucket
+    // returned by stub is 0 regardless of input).
+    let hole = aa_spades_hearts();
+    let bucket = postflop_abs.bucket_id(&s, hole);
+    assert!(
+        bucket < bucket_cfg.flop,
+        "IA-003: bucket_id ({bucket}) < bucket_count(flop)={}",
+        bucket_cfg.flop
+    );
+    assert!(
+        bucket < (1u32 << 24),
+        "IA-003: bucket_id ({bucket}) < 2^24 (D-215 字段宽度)"
+    );
 }
 
 // ============================================================================

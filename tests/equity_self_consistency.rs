@@ -127,7 +127,6 @@ fn fresh_rng_pair(master_seed: u64, sub_index: u32) -> (ChaCha20Rng, ChaCha20Rng
 //
 // river state 确定性枚举（无 RNG 消费），对称性 IEEE-754 reorder 容忍 ≤ 1e-9。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn equity_vs_hand_antisymmetry_river_strict() {
     let calc = make_calc_default();
     let board = river_board();
@@ -156,7 +155,6 @@ fn equity_vs_hand_antisymmetry_river_strict() {
 //
 // turn / flop 确定性枚举，反对称严格 1e-9 容差。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn equity_vs_hand_antisymmetry_turn_strict() {
     let calc = make_calc_default();
     let board = turn_board();
@@ -175,7 +173,6 @@ fn equity_vs_hand_antisymmetry_turn_strict() {
 }
 
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn equity_vs_hand_antisymmetry_flop_strict() {
     let calc = make_calc_default();
     let board = flop_board();
@@ -202,7 +199,6 @@ fn equity_vs_hand_antisymmetry_flop_strict() {
 // 顺序复用同一 `&mut rng` 是 EQ-001-rev1 显式列出的禁止模式（detail 见
 // `pluribus_stage2_api.md` §9 EQ-001-rev1）。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn equity_vs_hand_antisymmetry_preflop_strict_dual_rng_same_seed() {
     let calc = make_calc_default();
     let board = preflop_board();
@@ -232,7 +228,6 @@ fn equity_vs_hand_antisymmetry_preflop_strict_dual_rng_same_seed() {
 // 不同 sub_seed 下 Monte Carlo 噪声反对称容忍。10k iter 标准误差近似
 // `sqrt(0.25 / 10000) ≈ 0.005`。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn equity_vs_hand_antisymmetry_preflop_noisy_10k() {
     let calc = make_calc_default();
     let board = preflop_board();
@@ -263,7 +258,6 @@ fn equity_vs_hand_antisymmetry_preflop_noisy_10k() {
 //
 // 1k iter（CI 短测试）标准误差近似 `sqrt(0.25 / 1000) ≈ 0.016`，容忍 0.02。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn equity_vs_hand_antisymmetry_preflop_noisy_1k() {
     let calc = make_calc_1k_iter();
     let board = preflop_board();
@@ -298,7 +292,6 @@ fn equity_vs_hand_antisymmetry_preflop_noisy_1k() {
 // `equity_vs_hand`——后者要求显式对手 hole；EHS 单调性是在 random-opp 上的
 // 性质。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn preflop_ehs_monotonicity_aa_beats_72o_smoke() {
     let calc = make_calc_default();
     let board = preflop_board();
@@ -329,7 +322,6 @@ fn preflop_ehs_monotonicity_aa_beats_72o_smoke() {
 // 同 sub_seed → 同 RngSource state → equity 输出 byte-equal。1k 次重复验证
 // （B1 smoke；full 1M 留 D1）。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn equity_determinism_repeat_1k_smoke() {
     let calc = make_calc_default();
     let board = preflop_board();
@@ -359,7 +351,6 @@ fn equity_determinism_repeat_1k_smoke() {
 // EquityCalculator-rev1：合法输入返回 Ok，无效输入返回 Err。本测试验证 4 类
 // 错误路径全部命中。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn equity_invalid_input_returns_err() {
     use poker::EquityError;
 
@@ -409,7 +400,6 @@ fn equity_invalid_input_returns_err() {
 // 当前测试 8 仅覆盖 OverlapBoard / InvalidBoardLen / OverlapHole 3 类，
 // IterTooLow 未覆盖；本测试补完。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn equity_iter_too_low_returns_err() {
     use poker::EquityError;
 
@@ -443,7 +433,6 @@ fn equity_iter_too_low_returns_err() {
 // `∈ [0.0, 1.0]`。stage 4 消融如果改了 `with_opp_clusters` 配置，本测试自动
 // 通过 `n_opp_clusters()` getter 读到的实际 N 校验 shape。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn ochs_shape_finite_range_smoke() {
     let calc = make_calc_default();
     let board = flop_board();
@@ -489,7 +478,6 @@ fn ochs_shape_finite_range_smoke() {
 // river 状态退化为 `equity²`（D-227 rollout=0）。本测试断言 flop / turn / river
 // 三街的 `ehs_squared` 输出落在 EQ-002-rev1 不变量内。
 #[test]
-#[ignore = "B2: MonteCarloEquity unimplemented; 落地后取消 ignore"]
 fn ehs_squared_finite_range_smoke() {
     let calc = make_calc_default();
     let mut rng_flop = ChaCha20Rng::from_seed(derive_substream_seed(

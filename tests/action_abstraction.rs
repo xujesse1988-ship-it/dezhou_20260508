@@ -542,18 +542,28 @@ fn bet_ratio_from_f64_half_to_even() {
         Some(500)
     );
 
-    // 0.5015 量化到 502（half-to-even：501.5 → 502 even）。
+    // 0.5015 量化到 501（B2 实测）：IEEE-754 双精度下 0.5015 的最近 f64 是
+    // 0.50149999999999994... 严格小于数学 0.5015，与 1000 相乘后得到
+    // 501.49999999999994... 严格小于 501.5。因此这不构成 half-to-even 的
+    // "tie"，`round_ties_even` 走标准 round-to-nearest 路径 floor 到 501。
+    // **B-rev0 carve-out batch 3**：原 [测试] 期望 502 假设了精确数学 501.5
+    // 触发 half-to-even；B2 [实现] 落地 round_ties_even 时实测 IEEE-754 不支持
+    // 该假设（同型于 stage-1 §B-rev1 §3 的 [实现] → [测试] 角色边界 carve-out）。
+    // 详见 workflow §B-rev0 batch 3。
     assert_eq!(
         BetRatio::from_f64(0.5015).map(BetRatio::as_milli),
-        Some(502),
-        "D-202-rev1：half-to-even 0.5015 量化到 502 (even)"
+        Some(501),
+        "B-rev0 batch 3：IEEE-754 下 0.5015 * 1000 ≈ 501.4999... < 501.5，\
+         round_ties_even 走 floor 路径到 501（非 tie，不触发 half-to-even）"
     );
 
-    // 0.5025 量化到 502（half-to-even：502.5 → 502 even）。
+    // 0.5025 量化到 502（B2 实测）：0.5025 → f64 ≈ 0.50249999999999994 →
+    // 乘 1000 得 502.4999999999999...，floor 到 502（同样非 tie，与
+    // half-to-even 结果巧合一致）。
     assert_eq!(
         BetRatio::from_f64(0.5025).map(BetRatio::as_milli),
         Some(502),
-        "D-202-rev1：half-to-even 0.5025 量化到 502 (even)"
+        "0.5025 * 1000 ≈ 502.4999... floor 到 502（与 half-to-even 502.5→502 巧合一致）"
     );
 }
 

@@ -277,6 +277,11 @@ impl GameState {
 
     /// 当前 hand history 的引用，可随时序列化或回放。
     pub fn hand_history(&self) -> &HandHistory;
+
+    /// 当前 `TableConfig` 的只读引用（API-004-rev1，stage 2 B2 触发；
+    /// stage 2 `InfoAbstraction::map` 按 D-211-rev1 需要 `TableConfig::initial_stack(seat)`
+    /// 计算 `stack_bucket`，不允许从 `player(seat).stack`（当前剩余筹码）反推）。
+    pub fn config(&self) -> &TableConfig;
 }
 ```
 
@@ -656,6 +661,33 @@ message Payout {
     - B1 / C1 测试 agent 编写 replay 相关断言时，以 `HistoryError` 模式匹配。
   - **撤销条件**：若后续发现 history 与 rule 错误必须分离传递（如供 CFR 训练
     时的精细错误分类），可走 API-001-rev2 重拆。
+
+- **API-004-rev1** (2026-05-09)：`GameState` 新增 `config(&self) -> &TableConfig`
+  只读 getter（additive；不修改任何既有签名）。
+  - **背景**：stage 2 D-211-rev1 锁定 `InfoAbstraction::map` 必须从
+    `TableConfig::initial_stack(seat) / big_blind` 计算 `stack_bucket`，
+    不允许从 `player(seat).stack`（当前剩余筹码）反推。stage 1 §4 `GameState`
+    既有 getter（`street` / `board` / `pot` / `players` / `is_terminal` /
+    `payouts` / `hand_history`）未暴露 `config`；`hand_history().config` 是
+    克隆而非引用，热路径上每次 `map` 调用克隆 `TableConfig`（含
+    `Vec<ChipAmount>` `starting_stacks`）开销不可接受。
+  - **理由**：纯 additive 改动——`GameState.config: TableConfig` 内部字段早已
+    存在（私有字段，§4 文档未公开），本 rev 仅添加只读 getter 暴露引用，
+    不改变任何既有不变量、错误路径、proto schema 或行为语义。
+  - **影响**：
+    - 不影响 protobuf schema（不 bump `HandHistory.schema_version`）。
+    - 不影响 stage 1 既有测试 / SLO（`tests/api_signatures.rs` 既有 stage 1
+      assertions 不引用 `config()`，所以不需要修改 trip-wire；stage 2 trip-wire
+      在 stage 2 B1 [测试] 加入时再覆盖）。
+    - 触发条件（stage 2 §修订历史 §F21 carve-out）：B2 [实现] 在落地
+      `InfoAbstraction::map` 实际逻辑时若 stage 1 `GameState::config()` getter
+      缺位，同 PR 触发本 rev。
+    - 后向兼容：所有依赖 stage 1 API 的 stage 1 测试 / 工具继续编译通过；
+      `GameState` 字段添加新方法不破坏其它 impl。
+  - **stage 2 配套**：本 rev 由 stage 2 B2 [实现] 触发，但 stage 2 §F21
+    不需要再起一条 `pluribus_stage2_api.md` rev 条目——stage 2 `InfoAbstraction::map`
+    签名不变，只是 trait doc 中 "B2 [实现] 触发 stage 1 API rev" 条款此 commit
+    落地。
 
 ---
 

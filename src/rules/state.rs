@@ -259,6 +259,22 @@ impl GameState {
         &self.history
     }
 
+    /// 当前 `TableConfig` 的只读引用（API-NNN-rev1，stage 2 D-211-rev1 需要
+    /// `TableConfig::initial_stack(seat)` 计算 `stack_bucket`）。
+    ///
+    /// 引入动机：stage 2 `InfoAbstraction::map` 实现需要按 D-211-rev1 钉死
+    /// `stack_bucket` 来源到 `TableConfig::initial_stack(seat) / big_blind`，
+    /// 不允许从 `state.player(seat).stack`（当前剩余筹码，已被盲注 / call /
+    /// raise 扣减）反推。该 getter 让 stage 2 抽象层无需克隆 `TableConfig`
+    /// 即可读取起手筹码 / 盲注 / 按钮位等不变量。
+    ///
+    /// 与 `hand_history().config` 等价（`HandHistory.config` 为 `TableConfig`
+    /// 的克隆，用于 replay）；本 getter 直接借用 `GameState` 内部字段，
+    /// 避免热路径上的克隆开销。
+    pub fn config(&self) -> &TableConfig {
+        &self.config
+    }
+
     fn apply_inner(&mut self, action: Action) -> Result<(), RuleError> {
         if self.terminal {
             return Err(RuleError::HandTerminated);
