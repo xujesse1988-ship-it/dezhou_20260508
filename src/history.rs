@@ -117,6 +117,17 @@ impl HandHistory {
             .iter()
             .map(|&v| card_from_u32(v, "board"))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut board_mask: u64 = 0;
+        for (idx, c) in board.iter().enumerate() {
+            let bit = 1u64 << c.to_u8();
+            if board_mask & bit != 0 {
+                return Err(HistoryError::Corrupted(format!(
+                    "duplicate card in board at index {idx}: card_value {}",
+                    c.to_u8()
+                )));
+            }
+            board_mask |= bit;
+        }
         let hole_cards = proto
             .hole_cards
             .iter()
@@ -134,16 +145,40 @@ impl HandHistory {
             .iter()
             .map(action_from_proto)
             .collect::<Result<Vec<_>, _>>()?;
+        for (idx, a) in actions.iter().enumerate() {
+            if a.seat.0 >= config.n_seats {
+                return Err(HistoryError::Corrupted(format!(
+                    "action[{idx}].seat {} >= n_seats {}",
+                    a.seat.0, config.n_seats
+                )));
+            }
+        }
         let final_payouts = proto
             .final_payouts
             .iter()
             .map(|p| Ok((seat_from_u32(p.seat, "payout.seat")?, p.amount)))
             .collect::<Result<Vec<_>, HistoryError>>()?;
+        for (idx, (seat, _)) in final_payouts.iter().enumerate() {
+            if seat.0 >= config.n_seats {
+                return Err(HistoryError::Corrupted(format!(
+                    "final_payouts[{idx}].seat {} >= n_seats {}",
+                    seat.0, config.n_seats
+                )));
+            }
+        }
         let showdown_order = proto
             .showdown_order
             .iter()
             .map(|&v| seat_from_u32(v, "showdown_order"))
             .collect::<Result<Vec<_>, _>>()?;
+        for (idx, seat) in showdown_order.iter().enumerate() {
+            if seat.0 >= config.n_seats {
+                return Err(HistoryError::Corrupted(format!(
+                    "showdown_order[{idx}] = {} >= n_seats {}",
+                    seat.0, config.n_seats
+                )));
+            }
+        }
         Ok(HandHistory {
             schema_version: proto.schema_version,
             config,
@@ -239,6 +274,12 @@ fn config_from_proto(config: &proto::TableConfig) -> Result<TableConfig, History
             "starting_stacks length {} != n_seats {}",
             config.starting_stacks.len(),
             config.n_seats
+        )));
+    }
+    if config.button_seat >= config.n_seats {
+        return Err(HistoryError::Corrupted(format!(
+            "button_seat {} >= n_seats {}",
+            config.button_seat, config.n_seats
         )));
     }
     Ok(TableConfig {

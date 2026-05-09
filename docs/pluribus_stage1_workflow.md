@@ -1038,3 +1038,126 @@ F2 [实现] 的字面要求 「让 F1 全绿」 已经达成（默认 cargo test
 F2 自由 trade-off `#[ignore]` 4 条是否纳入产品代码硬约束。stage-1 出口
 检查清单剩余 fall-through 项：F2 [实现]（视 trade-off 决定是否触产品代
 码）+ F3 [报告]（验收文档 + git tag stage1-v1.0）。
+
+### F-rev1（2026-05-09）：F2 [实现] 闭合 + 4/4 F1→F2 carry-over 全部翻绿（0 越界）
+
+F2 [实现] 步骤 trade-off 选择 「错误前移到 from_proto」：把 F1 [测试] 留
+下的 4 条 `#[ignore = "F1 → F2"]` carry-over 全部转为 `--ignored` 触发
+下绿。仅触 `src/history.rs` 一个产品文件，新增 4 处 input 校验路径；
+`tests/`、`benches/`、`fuzz/`、`tools/`、`proto/` 等 [测试] 范畴目录**未修改一行**——
+F2 closure 的 `cargo test -- --ignored` 4/4 全绿是 [实现] agent 在 F2 写
+的产品代码满足 [测试] agent 在 F1 写好的断言，而非反向修测试让断言通过。
+
+**交付清单**（commit pending）：
+
+1. `src/history.rs::config_from_proto`：在 `n_seats` / `starting_stacks
+   长度` 已有两条校验之后，追加 `button_seat < n_seats` 校验：
+    - `if config.button_seat >= config.n_seats { return Err(Corrupted("button_seat {b} >= n_seats {n}")) }`
+    - 闭合 `from_proto_rejects_button_seat_out_of_range`。
+2. `src/history.rs::from_proto`（actions 解析后）：追加 per-action seat
+   越界扫描：
+    - `for (idx, a) in actions.iter().enumerate() { if a.seat.0 >= config.n_seats { return Err(Corrupted("action[{idx}].seat {} >= n_seats {}", a.seat.0, config.n_seats)) } }`
+    - 闭合 `from_proto_rejects_action_seat_out_of_range`。
+3. `src/history.rs::from_proto`（board 解析后）：追加 board-internal
+   uniqueness 扫描，使用 52-bit u64 mask（`bit = 1u64 << card.to_u8()`，
+   零分配 / 零浮点 / 零 unsafe）：
+    - 出现重复卡片即 `Err(Corrupted("duplicate card in board at index {idx}: card_value {v}"))`。
+    - 闭合 `from_proto_rejects_duplicate_card_in_board`。
+4. `src/history.rs::from_proto`（payout / showdown_order 解析后）：搭车
+   追加 `final_payouts[*].seat < n_seats` + `showdown_order[*] < n_seats`
+   越界扫描。F1 没有显式测试这两类 case（攻击 bytes 构造 effort 与 seat
+   类似但 F1 取舍下未落地），F2 一并校验，让 「seat 字段全部 < n_seats」
+   成为单点不变量，下游回放代码不需要重复校验。
+5. 100k fuzz `byte_flip_no_panic_full_100k` 在新校验下仍 ok（产品代码加
+   严校验只会让某些原本 from_proto 通过的输入更早失败，不会让原本失败
+   的输入开始 panic）。F2 的 `cargo test --release --test history_corruption
+   -- --ignored` 实跑 100k fuzz 总耗时 0.45s 0 panic。
+
+**出口实测数据**（2026-05-09，本机：1-CPU AMD64；PATH 含 `.venv-pokerkit`/
+`python3.11` + PokerKit 0.4.14）：
+
+`cargo test`（默认）：104 passed / 19 ignored / 0 failed across 16 test
+crates；`replay_diverged_when_board_swapped` / `replay_diverged_when_hole_cards_swapped`
+两条 board / hole 替换测试 default 仍 active 且通过——seed 27 / 28
+随机 board 在 51 ↔ 0 swap 后未与既有卡片碰撞（[实现] 加严 board uniqueness
+校验在这两个 seed 上不触发误伤；F1 测试注释「命中重叠时也 fine」 在 F2
+后不再是无条件 「fine」，但本仓库具体 seed 命中 OK 路径，无需修测试）。
+
+`cargo test --test history_corruption -- --ignored`：4 passed / 0 failed
+（4 ignored / 23 filtered out），与 F1 出口的 1 passed + 3 failed 形成
+对比 —— F2 闭合 3 条 carry-over：
+
+| `#[ignore]` 测试 | F1 出口 | F2 出口 | 闭合方式 |
+|---|---|---|---|
+| `byte_flip_no_panic_full_100k` | ok（已 0 panic）| ok（仍 0 panic）| 校验加严不破坏 panic-free |
+| `from_proto_rejects_action_seat_out_of_range` | ❌ replay NotPlayerTurn | ✅ from_proto Corrupted | 加 per-action seat 越界扫描 |
+| `from_proto_rejects_button_seat_out_of_range` | ❌ replay 不一定触及 | ✅ from_proto Corrupted | 加 button_seat 越界扫描 |
+| `from_proto_rejects_duplicate_card_in_board` | ❌ replay ReplayDiverged | ✅ from_proto Corrupted | 加 board u64 mask uniqueness |
+
+`cargo test --release --test history_roundtrip --test history_corruption
+--test cross_lang_history -- --ignored`：3 个 release ignored 套件全绿，
+确认 F2 校验在 100k+ 规模下无回归：`history_roundtrip_full_100k` 100,000/
+100,000 ok 2.86s；`cross_lang_full_10k` 10,000/10,000 ok 4.95s；
+`history_corruption` 4/4 0.45s。
+
+`cargo fmt --all --check` / `cargo clippy --all-targets -- -D warnings` /
+`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。
+
+**未实跑（与 F2 解耦的 carve-out，从 D-rev0 / E-rev0 / E-rev1 继承不变）**：
+(a) `slo_eval7_multithread_linear_scaling_to_8_cores` efficiency ≥ 0.70
+多核 host 实测；(b) 完整 100k cross-validation 在多核 host 实跑产出 0
+diverged 时间戳；(c) 24h 夜间 fuzz 7 天连续无 panic。三项都与代码合并
+解耦，F2 不解决。
+
+**[实现] 越界审计（无）**：本步骤只触 `src/history.rs` 一个产品文件
+（`config_from_proto` 加 1 处校验 + `from_proto` 加 4 处校验：board 唯一
+性 + action seat + payout seat + showdown_order seat）。`tests/`、
+`benches/`、`fuzz/`、`tools/`、`proto/` 等 [测试] 与契约文件**未修改一行**——
+F2 [实现] 角色边界审计 0 越界（与 §C-rev1 / §E-rev1 「常规闭合 + 0 越界」
+路径同型）。`docs/pluribus_stage1_decisions.md` / `docs/pluribus_stage1_api.md`
+均不需 D-NNN-revM / API-NNN-revM 入账：错误类型 `HistoryError::Corrupted`
+已在 API §8 列出，公开签名不变；`HandHistory.schema_version` 不 bump
+（序列化格式未动）。
+
+**未来类似情况的处理政策**（在 §B-rev1 §C-rev1 §C-rev2 §D-rev0 §E-rev0
+§E-rev1 §F-rev0 基础上叠加）：
+
+1. **「错误前移到 wire 层」 优于 「等 replay 兜底」**：F2 选择把 4 条
+   from_proto 域校验加在产品代码里，让 corruption 在 decode 阶段一次性
+   挡掉，而非走完整 replay 路径再返回 `HistoryError::Rule { source }`。
+   收益：(a) 更早失败 → 更小 attack surface；(b) 错误类型更精确
+   （`Corrupted` vs `Rule` 区分了 「数据本身坏」 vs 「数据本身合法但
+   语义违反规则」）；(c) 下游 replay 路径可以信任 `from_proto` 出来的
+   数据满足域不变量，少写一份重复校验。代价：解码路径多 ~5 行 O(n)
+   扫描，n ≤ 256 actions / 5 board cards / 6 seats，常数开销可忽略
+   （`history/decode` SLO 5.0× 余量留得够）。
+2. **F1 [测试] 注释里的 「fine 兜底」 不绑死 [实现] 选择**：
+   `replay_diverged_when_board_swapped` 的 「命中重叠时也 fine—— replay
+   仍 diverge」 注释是 [测试] agent 写测试时**对 F1 时点 from_proto 实
+   现的描述**，不是对 F2 [实现] 自由度的限制。F2 加严 board uniqueness
+   后，该注释在 「命中重叠」 路径上不再适用，但 F1 选择的 seed 27 实际
+   未命中重叠 → 测试 default 仍绿。如未来类似 「[测试] 注释 vs [实现]
+   行为差异」 出现：优先看测试 `expect(...)` 的字面 assertion，注释只是
+   编写时点的解释；测试默认 seed 命中边界即接受 [测试] [实现] 同改
+   carve-out（参考 §D-rev0），不命中即直接闭合（本节）。
+3. **「seat 全部 < n_seats」 单点不变量**：F2 在 from_proto 里把 5 处
+   seat 字段（button_seat / action.seat / payout.seat / showdown_order /
+   hole_cards 长度通过 n_seats 间接保证）的越界检查归一到 「decode 后
+   seat 必合法」 的单点不变量。下游回放代码可以直接 `state.players()
+   [seat.0]` 不需要再做边界检查。这条不变量与 D-029 「SeatId(k+1 mod
+   n_seats)」 一致，未来 stage-2 CFR 节点 indexing 也可信赖。
+4. **「[测试] 留 4 条 ignored，[实现] 全部转绿」 = stage-1 完整闭合姿
+   势**：F1 [测试] 留 carry-over `#[ignore]` 时已经做好 「F2 自由选择
+   是否前移」 的 trade-off 文档化（F1 doc-comment + §F-rev0）。F2
+   [实现] 主动选择 「全部前移」 而非 「保留 replay 兜底 + 0 产品代码改
+   动」（同 §C-rev1 路径）的判断依据：错误前移 5 行扫描代码 << 「让下
+   游所有调用方都假设 from_proto 出来的数据合法」 减少的认知负担。如
+   stage-2 / 后续阶段类似 「[测试] 留 ignored，[实现] 选 trade-off」 路
+   径：默认偏向前移到 wire / API 层，除非性能成本不可忽略。
+
+**与 validation §5 的关系**：F1 出口已经满足 「明确错误，禁止静默截断」
+字面要求；F2 把错误产生位置从 replay 阶段（`HistoryError::Rule` /
+`HistoryError::ReplayDiverged`）前移到 from_proto 阶段（`HistoryError::Corrupted`），
+让上游静态分析与下游信任更直接。stage-1 出口检查清单（workflow.md §阶
+段 1 出口检查清单）剩余唯一 fall-through 项：F3 [报告] 验收文档 + git
+tag `stage1-v1.0`。
