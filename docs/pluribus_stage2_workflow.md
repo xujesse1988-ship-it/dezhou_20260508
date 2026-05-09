@@ -788,3 +788,38 @@ B2 角色边界审计：本 commit 触 `src/`、`tests/`、`docs/`、`CLAUDE.md`
 - 阶段 1 §C-rev1 / §D-rev0 / §F-rev1 既往政策保持继承不变。
 
 下一步：C1 [测试]（postflop 聚类质量测试）。按 §C1 §输出 落地 `tests/bucket_quality.rs`（500/500/500 配置下每条街每 bucket 至少 1 个 canonical sample / EHS std dev < 0.05 / 相邻 bucket EMD ≥ T_emd / bucket id ↔ EHS 中位数单调一致 / 1k smoke + 1M ignored）+ `tests/equity_features.rs`（EHS² / OCHS 自洽）+ `tests/scenarios_extended.rs` 阶段 2 版扩到 200+ 固定 GameState 场景（API §F20 影响 ② 字面要求 ≥ 2 条 all-in call 场景）+ `tools/bucket_quality_report.py` artifact 输出。预期 C1 [测试] 闭合后 `cargo test --no-fail-fast` 暴露 N 条 fail（B2 stub `bucket_id = 0` 不可能过 EHS std dev / EMD / 单调性等质量门槛，留 C2 修复）+ preflop 169 lossless 全套保持全绿（C1 不动 preflop 信任锚）。
+
+#### C1 关闭（2026-05-09）— C-rev0
+
+C1 [测试] 关闭。按 §C1 §输出 4 个文件落地 postflop bucket 聚类质量门槛 + EHS² / OCHS 特征自洽 + ActionAbstraction 200+ scenario sweep + bucket 报告生成器：
+
+- **`tests/bucket_quality.rs`**（new，709 行 / 20 个 #[test]）：覆盖 §C1 §输出 lines 304-309 全部 bucket 质量门槛——3 条 1k smoke (board, hole) → bucket id in-range（默认 active；stub 路径下 `lookup` 返回 `Some(0) < 500` 自然通过）+ 4 条 helper sanity（`emd_1d_unit_interval` / `std_dev` / `median` 自检，担保 C2 接入后断言切换由 helper 正确性背书）+ 12 条质量门槛断言（4 类 × 3 街，全 `#[ignore = "C2: <reason>"]`）：① 0 空 bucket（D-236 / validation §3）② EHS std dev < 0.05（path.md §阶段 2 字面）③ 相邻 bucket EMD ≥ T_emd = 0.02（D-233）④ bucket id ↔ EHS 中位数单调一致（D-236b）+ 1 条 1M 完整版（始终 `#[ignore]`，C2/D2 release profile + `--ignored` opt-in 触发，与 stage-1 §C2 / §D2 同形态）。
+
+- **`tests/equity_features.rs`**（new，413 行 / 10 个 #[test]）：覆盖 §C1 §输出 lines 314-316 EHS² / OCHS 自洽——EHS² 单调性 preflop AA > 72o（差距 ≥ 0.10 远超 1k iter MC 噪声 0.016）/ EHS² river 退化为 `inner_EHS²`（D-227 outer rollout = 0，容差 0.05）/ EHS² ≤ EHS 三街分流（Cauchy-Schwarz 二阶矩边界，容差 0.03 留双层 MC 噪声）/ OCHS N=8 一致 D-222（default + with_opp_clusters 双路径）/ OCHS 单调性持 KK vs cluster 0=AA < vs cluster 6=72o（差距 ≥ 0.4）/ OCHS pairwise via equity_vs_hand smoke / OCHS / EHS² 跨街 finite + ∈ [0,1] 不变量 sweep。与 `tests/equity_self_consistency.rs` 边界互补：后者覆盖 EQ-001-rev1 反对称 / EQ-002-rev1 finite shape / EQ-005 determinism / 错误路径；本文件补 *单调 / 边界 / 二阶矩* 维度，无重复。
+
+- **`tests/scenarios_extended.rs`** 追加 `mod stage2_abs_sweep`（+~480 行 / 8 个 #[test]）：覆盖 §C1 §输出 line 317 字面 "扩到 200+ 固定 GameState 场景，覆盖 open / 3-bet / 短码 / incomplete / 多人 all-in 的 5-action 默认输出"——open sweep（4 actor × 4 stack × 3 seed = 36+ cases，断言 facing-bet 必含 Fold/Call、不含 Check）/ 3-bet sweep（5 actor × 4 stack × 3 seed = 36+ cases）/ 短码 open sweep（4 actor × 6 stack × 2 seed = 36+ cases，断言 LA-007 AllIn 必含）/ incomplete short all-in sweep（6 stack × 2 seed = 10+ cases）/ multi-all-in sweep（8 stack × 2 seed = 10+ cases）/ all-in call sweep（API §F20 影响 ② 字面 ≥ 2 cases：BTN short-call 大 raise + BB short-call 3-bet，断言 AA-004-rev1 ① `Call` 不出现 / `AllIn` 出现 / `to = committed + stack`）+ 1 总数 floor 自检 + 1 unused-warning helper。通用 invariant 检查器 `assert_aa_universal_invariants` 覆盖 AA-001（D-209 输出顺序）/ AA-002（Fold ⇔ ¬Check）/ AA-004-rev1（带 `to` 的实例去重）/ AA-005（集合非空 + 上界 ≤ 6）。stage-1 主体 ScenarioCase 表 200+ 规则用例不动；stage-2 sweep 在抽象层维度叠加 ≥ 130 个抽象动作场景。两套维度合计 ≥ 380，远超 §C1 §输出 200+ 字面下限。
+
+- **`tools/bucket_quality_report.py`**（new，~280 行）：bucket 数量 / 内 EHS std dev / 相邻 EMD 直方图 + 单调性 violation 计数 + 描述统计表 → markdown 报告 stdout。`--stub` 模式生成 C1 占位骨架（B2 stub 行为：500 bucket 中 499 空、std dev = 0.20 全 fail、EMD = 0 全 fail）；`stdin` JSON 模式接 C2 `tools/train_bucket_table.rs` + `tools/bucket_table_reader.py`（D-249）写出真实 mmap 后的实测数据。CI artifact 输出格式与 stage-1 `tools/history_reader.py` minimal-deps 风格一致（仅 stdlib + statistics）。
+
+**[测试] "预期失败" → `#[ignore]` 表达 carve-out（§C-rev0 §1）**：§C1 §出口 line 322-324 字面要求 "all C1 tests compile" + "部分测试预期失败（B2 stub bucket 不可能过 EHS std dev 门槛）— 留给 C2 修" + "preflop 169 lossless 全套保持全绿"。直读 line 323 "预期失败" 似乎要求 12 条质量门槛断言在 `cargo test` 中真的 FAILED；但同时 D-272 字面 "stage 1 全套测试 ... 0 failed" + stage-2 既有 baseline "0 failed" 不允许 commit 引入 failed。两者通过 `#[ignore = "C2: <reason>"]` 机制和解：测试代码完整保留 + `cargo test` 默认不触发 + `cargo test -- --ignored` 触发后符合 "预期失败" 语义（B2 stub 下 fail，C2 真 mmap 后 pass）。等价于 stage-1 §B1 line 250 "harness 能跑出占位结果或断言失败，流程不 panic" 同形态——B1 §C 类 equity harness 全部 `#[ignore]` 一直跑到 B2 carve-out 取消 ignore。C1 这里采用同模式，C2 [实现] 闭合 commit 取消 12 条 `#[ignore]` 并验证全绿（继承 §B-rev1 §3 [实现] 步骤越界改测试代码 → 当 commit 显式追认 carve-out 政策；提前在本节标注以避免 C2 commit 重复声明）。
+
+C1 出口数据（commit 落地实测；本机 1-CPU AMD64 debug profile）：
+
+- `cargo fmt --all --check` ok / `cargo build --all-targets` ok / `cargo clippy --all-targets -- -D warnings` ok（无新增 allow）/ `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` ok。
+- `cargo test --no-run` 编译 24 test crates 成功（22 + bucket_quality + equity_features = 24），`tests/api_signatures.rs` trip-wire byte-equal 不变，stage 2 公开 API 0 签名漂移。
+- `cargo test --no-fail-fast`（默认 / debug profile）：**179 passed / 34 ignored / 0 failed across 24 test crates**（+ 2 doc-test crate 0 测）。
+    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`，与 `stage1-v1.0` tag **byte-equal**（D-272 不退化要求满足）；scenarios_extended.rs 新增 8 个 stage-2 sweep #[test] 在 `mod stage2_abs_sweep` 内，stage-1 部分仍是同 104 个 byte-equal 通过（既有 19 个 #[test] 函数 0 修改）。
+    - **stage-2 8 crates** `75 passed / 15 ignored / 0 failed`：action_abstraction 12 / canonical_observation 8 / clustering_determinism 5 active + 2 ignored / equity_self_consistency 12 / info_id_encoding 8 / preflop_169 5 / **bucket_quality 7 active + 13 ignored（new C1）** / **equity_features 10（new C1）** + scenarios_extended `mod stage2_abs_sweep` 8 个（在 stage-1 文件内不重复计数）。
+    - 实测耗时（debug profile）equity_self_consistency 130s + equity_features 24s 主导（10M+ MC iter；release profile 全 < 10s，E2 SLO 路径接管），其它 22 crates 合计约 12s。
+- `python3 tools/bucket_quality_report.py --stub`：smoke 跑 C1 占位数据 → markdown 报告骨架 stdout 验证（B2 stub 行为下全部门槛 ✗，按设计如此，C2 接入真实 mmap 后转 ✓）。
+- §C1 §出口三条全部满足：① "all C1 tests compile" ✓ / ② "部分测试预期失败" ✓（用 `#[ignore]` 表达，详见 §C-rev0 §1 carve-out）/ ③ "preflop 169 lossless 全套保持全绿" ✓（preflop_169 5 active 全绿，equity_self_consistency 12 active 全绿，无回归）。
+
+C1 角色边界审计：本 commit 触 `tests/`（new 2 + 修 1 = 3 文件）+ `tools/`（new 1）+ `docs/pluribus_stage2_workflow.md` §C-rev0（本节）+ `CLAUDE.md` 状态翻 "stage 2 C1 closed"。`src/` / `benches/` / `Cargo.toml` / `Cargo.lock` / `fuzz/` / `proto/` **未修改一行**——C1 [测试] role 0 越界（继承 stage-1 §B-rev1 §3 / §B-rev0 batch 2 / §B-rev1 [测试] role 0 越界形态）。
+
+§C-rev0 carry forward 处理政策（与 §A-rev0 / §A-rev1 / §B-rev0 / §B-rev0 batch 2 / §B-rev1 一致）：
+
+- §B-rev1 §3：[实现] 步骤越界改测试代码 → 当 commit 显式追认。本 commit C1 [测试] 角色 0 越界（不动产品代码），无新 carve-out 触发；`#[ignore]` 表达 "预期失败" 由 §C-rev0 §1 提前标注，由 C2 [实现] 闭合 commit 配合追认。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 commit 落地 C1 闭合后状态翻面段落。
+- 阶段 1 §C-rev1 / §D-rev0 / §F-rev1 既往政策保持继承不变。
+
+下一步：C2 [实现]（postflop 聚类落地）。按 §C2 §输出 落地 `EquityCalculator` 完整 EHS² / OCHS 计算 + `cluster.rs` k-means + EMD 距离实现（D-230 / D-231 / D-232）+ `tools/train_bucket_table.rs` CLI（RngSource seed → 训练 → 写出 mmap artifact）+ `BucketTable::open(path)` mmap 加载 happy path（错误路径 F2）+ `PostflopBucketAbstraction::map(...)` 完整实现 + bucket table v1 schema 落地（D-240..D-249）+ artifact 同 PR 落到 `artifacts/`（gitignore）。出口标准：C1 全部 `#[ignore]` 测试取消 ignore 后通过 + 同 seed clustering BLAKE3 byte-identical（重复 10 次）+ 1M `#[ignore]` 完整版在 release profile 跑通 + stage 1 全套 0 failed。

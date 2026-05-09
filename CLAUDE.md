@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 progress: A0 / A1 / B1 / B2 closed，下一步 C1 [测试]**（详见下文 §Stage 2 progress）。
+8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 progress: A0 / A1 / B1 / B2 / C1 closed，下一步 C2 [实现]**（详见下文 §Stage 2 progress）。
 
 历史 batch 出口数据（stage 1 的 B/C/D/E/F 各步、stage 2 的 A0 batch 1–6 review / A1 batch 7 / B1 batch 2）不在本文件保留——查阅顺序：
 
@@ -96,18 +96,27 @@ API 骨架代码化按 §A1 §输出 全部落地：
 
 **[测试] 角色越界 carve-out 4 处**（继承 stage-1 §B-rev1 §3 / §B-rev0 batch 2 carve-out）：(1) 取消 12 条 C 类 equity `#[ignore]`（`MonteCarloEquity` 落地后断言全绿）；(2) 取消 2 条 D 类 D-228 `#[ignore]`（`derive_substream_seed` 落地后 SplitMix64 byte-equal + 32 sub_seed 区分性）；(3) 取消 1 条 `info_abs_postflop_bucket_id_in_range` 并填充测试体（用 `BucketTable::stub_for_postflop`）；(4) `bet_ratio_from_f64_half_to_even` IEEE-754 断言修正（`0.5015 * 1000.0 = 501.4999...`，原期望 502 → 501）。详见 `pluribus_stage2_workflow.md` §修订历史 §B-rev1。
 
-### Stage 2 当前测试基线（B2 闭合后）
+### C1 closed（2026-05-09，本 commit）
 
-- `cargo test --no-fail-fast`（默认 / debug）：**154 passed / 21 ignored / 0 failed across 22 test crates**。
-    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`，与 `stage1-v1.0` tag **byte-equal**（D-272 不退化要求满足）。
-    - **stage-2 6 crates** `50 passed / 2 ignored / 0 failed`：action_abstraction 12 / canonical_observation 8 / clustering_determinism 5 active + 2 ignored（C2/D1 占位）/ equity_self_consistency 12 / info_id_encoding 8 / preflop_169 5。
-    - 实测耗时（debug profile）equity_self_consistency 145s 主导（10M+ MC iter；release profile 预计 < 5s，E2 SLO 路径接管）。
-- `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings`（含 1 处 `#[allow(clippy::incompatible_msrv)]` 在 `BetRatio::from_f64`；项目 `Cargo.toml` `rust-version = "1.75"` 是保守 metadata，`rust-toolchain.toml` 实际 pin 1.95.0）/ `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。
-- `cargo test --no-run` 22 test crates 编译成功，`tests/api_signatures.rs` trip-wire byte-equal 不变，stage 2 公开 API 0 签名漂移。
+按 §C1 §输出 4 个文件落地 postflop bucket 聚类质量门槛 + EHS² / OCHS 特征自洽 + ActionAbstraction 200+ scenario sweep + bucket 报告生成器：
 
-### 下一步：Stage 2 C1 [测试]
+- `tests/bucket_quality.rs`（new）：20 个 #[test]——3 条 1k smoke (board, hole) → bucket id in-range（默认 active）+ 4 条 helper sanity（emd_1d / std_dev / median 自检，默认 active）+ 12 条质量门槛断言（`#[ignore]` 留 C2，覆盖 0 空 bucket × 3 街 / EHS std dev < 0.05 × 3 街 / 相邻 bucket EMD ≥ T_emd × 3 街 / bucket id ↔ EHS 中位数单调一致 × 3 街）+ 1 条 1M 完整版（始终 `#[ignore]`，C2/D2 跑）。**B-rev0 carve-out 同形态**：B2 stub `BucketTable::lookup` 永远返回 `Some(0)` 让 12 条质量门槛断言无法过；按 §C1 §出口 line 322-324 字面 "部分测试预期失败 — 留给 C2 修"，用 `#[ignore = "C2: <reason>"]` 标注与 B1 §C 类 equity harness 同形态，C2 [实现] 闭合时取消 ignore（角色越界 carve-out，由后续 §C-rev1 / §C-rev0 同 commit 追认）。1D EMD helper 走 sorted CDF 差分（D-234）；`emd_1d_unit_interval` / `std_dev` / `median` 三个 helper 各有 sanity #[test] 担保 C2 接入断言切换的正确性。
+- `tests/equity_features.rs`（new）：10 个 #[test] 覆盖 §C1 §出口 line 314-316 EHS² / OCHS 自洽——EHS² 单调性（preflop AA > 72o，差距 ≥ 0.10）/ EHS² river 退化为 `equity²`（D-227 outer rollout = 0，容差 0.05 留 1k iter MC）/ EHS² ≤ EHS 三街分流（Cauchy-Schwarz 边界，容差 0.03）/ OCHS N=8 一致（D-222，default + with_opp_clusters 双路径）/ OCHS 单调性（持 KK vs cluster 0=AA < vs cluster 6=72o，差距 ≥ 0.4）/ OCHS pairwise via equity_vs_hand smoke / OCHS / EHS² 跨街 finite + ∈ [0,1] 不变量 sweep。与 `tests/equity_self_consistency.rs` 边界互补：后者覆盖 EQ-001-rev1 反对称 / EQ-002-rev1 finite shape / EQ-005 determinism / 错误路径；本文件补 *单调 / 边界 / 二阶矩* 维度。
+- `tests/scenarios_extended.rs` 追加 `mod stage2_abs_sweep`：8 个 #[test]——open sweep（4 actor × 4 stack × 3 seed = 36+ cases，断言 facing-bet 必含 Fold/Call、不含 Check）/ 3-bet sweep（5 actor × 4 stack × 3 seed = 36+ cases）/ 短码 open sweep（4 actor × 6 stack × 2 seed = 36+ cases，断言 LA-007 AllIn 必含）/ incomplete short all-in sweep（6 stack × 2 seed = 10+ cases）/ multi-all-in sweep（8 stack × 2 seed = 10+ cases）/ all-in call sweep（API §F20 影响 ② 字面 ≥ 2 cases：BTN short-call 大 raise + BB short-call 3-bet，断言 AA-004-rev1 ① `Call` 不出现 / `AllIn` 出现 / `to = committed + stack`）+ 1 总数自检 + 1 unused-warning helper。stage-2 sweep 通用 invariant 检查器 `assert_aa_universal_invariants` 覆盖 AA-001（D-209 输出顺序）/ AA-002（Fold ⇔ ¬Check）/ AA-004-rev1（带 `to` 的实例去重）/ AA-005（集合非空 + 上界 ≤ 6）。stage-1 主体 ScenarioCase 表 200+ 规则用例不动；stage-2 sweep 在抽象层维度叠加 ≥ 130 个抽象动作场景。两套维度合计 ≥ 380，远超 §C1 §输出 200+ 字面下限。
+- `tools/bucket_quality_report.py`（new）：bucket 数量 / 内 EHS std dev / 相邻 EMD 直方图 + 单调性 violation 计数 + 描述统计表 → markdown 报告 stdout。`--stub` 模式生成 C1 占位骨架（B2 stub 行为：500 bucket 中 499 空、std dev = 0.20 全 fail、EMD = 0 全 fail）；`stdin` JSON 模式接 C2 `tools/train_bucket_table.rs` + `tools/bucket_table_reader.py`（D-249）写出真实 mmap 后的实测数据。CI artifact 输出格式与 stage-1 `tools/history_reader.py` minimal-deps 风格一致（仅 stdlib + statistics）。
 
-按 §C1 §输出 落地 `tests/bucket_quality.rs`（500/500/500 配置下每条街每 bucket 至少 1 canonical sample / EHS std dev < 0.05 / 相邻 bucket EMD ≥ T_emd / bucket id ↔ EHS 中位数单调一致）+ `tests/equity_features.rs`（EHS² / OCHS 自洽）+ `tests/scenarios_extended.rs` 阶段 2 版扩到 200+ 固定 GameState 场景（API §F20 影响 ② ≥ 2 条 all-in call）+ `tools/bucket_quality_report.py`。预期 C1 闭合后暴露 N 条 fail（B2 stub `bucket_id = 0` 不可能过 EHS std dev / EMD / 单调性等质量门槛，留 C2 修复）+ preflop 169 lossless 全套保持全绿（C1 不动 preflop 信任锚）。
+### Stage 2 当前测试基线（C1 闭合后）
+
+- `cargo test --no-fail-fast`（默认 / debug）：**179 passed / 34 ignored / 0 failed across 24 test crates**（+ 2 doc-test 0 测）。
+    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`，与 `stage1-v1.0` tag **byte-equal**（D-272 不退化要求满足）；scenarios_extended.rs 新增 8 个 stage-2 sweep #[test] 在 `mod stage2_abs_sweep` 内，stage-1 部分仍是同 104 个 byte-equal 通过。
+    - **stage-2 8 crates** `75 passed / 15 ignored / 0 failed`：action_abstraction 12 / canonical_observation 8 / clustering_determinism 5 active + 2 ignored / equity_self_consistency 12 / info_id_encoding 8 / preflop_169 5 / **bucket_quality 7 active + 13 ignored（new C1）** / **equity_features 10（new C1）** + scenarios_extended `mod stage2_abs_sweep` 8 个（在 stage-1 文件内不重复计数）。
+    - 实测耗时（debug profile）equity_self_consistency 130s + equity_features 24s 主导（10M+ MC iter；release profile 全 < 10s，E2 SLO 路径接管）。
+- `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` trip-wire byte-equal 不变，stage 2 公开 API 0 签名漂移。
+- `python3 tools/bucket_quality_report.py --stub`：smoke 跑 C1 占位数据 → markdown 报告骨架 stdout 验证（B2 stub 行为下全部门槛 ✗，按设计如此，C2 接入真实 mmap 后转 ✓）。
+
+### 下一步：Stage 2 C2 [实现]
+
+按 §C2 §输出 落地 `EquityCalculator` 完整 EHS² / OCHS 计算（朴素实现，性能 E2）+ `cluster.rs` k-means + EMD 距离实现（D-230 / D-231 k-means++ 显式 RngSource / D-232 收敛门槛）+ `tools/train_bucket_table.rs` CLI（RngSource seed → 训练 → 写出 mmap artifact）+ `BucketTable::open(path)` mmap 加载 happy path（错误路径 F2）+ `PostflopBucketAbstraction::map(...)` 完整实现（mmap lookup）+ bucket table v1 schema 落地（D-240..D-249）+ artifact 同 PR 落到 `artifacts/`（gitignore）。出口标准：C1 全部 `#[ignore]` 测试取消 ignore 后通过 + 同 seed clustering BLAKE3 byte-identical（重复 10 次）+ 1M `#[ignore]` 完整版在 release profile 跑通 + stage 1 全套 0 failed。
 
 ## Documents and their authority
 
