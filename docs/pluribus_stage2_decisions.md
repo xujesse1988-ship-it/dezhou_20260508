@@ -19,16 +19,16 @@
 
 | 编号 | 决策项 | 选定值 |
 |---|---|---|
-| D-200 | 默认 action 集合 | **5-action**（不含 `Fold` / `Check` 互斥剔除前的 6 个候选）：`{ Fold, Check, Call, BetRaise(0.5×pot), BetRaise(1.0×pot), AllIn }`。详见下方 D-200 详解。 |
+| D-200 | 默认 action 集合 | **5-action**（不含 `Fold` / `Check` 互斥剔除前的候选集合）：`{ Fold, Check, Call, Bet/Raise(0.5×pot), Bet/Raise(1.0×pot), AllIn }`，其中 "Bet/Raise(x×pot)" 在本下注轮无前序 bet 时输出 `Bet`、有前序 bet 时输出 `Raise`（继承 stage 1 LA-002 互斥）。详见下方 D-200 详解。 |
 | D-201 | off-tree action 映射算法 | **Pseudo-harmonic mapping (PHM)**（Pluribus 论文 §S2 标准）。阶段 2 仅落 stub（接口签名稳定 + nearest-action fallback 实现），完整数值验收 + fuzz 留 stage 6c。 |
-| D-202 | `ActionAbstractionConfig` 1–14 raise size 接口 | Rust 结构体 `ActionAbstractionConfig { raise_pot_ratios: Vec<f64> }`，长度 ∈ [1, 14]，每个元素 ∈ (0.0, +∞)；超界由 `ActionAbstractionConfig::new` 返回 `Result<_, ConfigError>`。**阶段 2 仅默认 5-action 强验收**；其它配置仅 smoke test（"配置可加载 + 输出确定性 + 哈希区分性"）。无 TOML / JSON 反序列化层（A0 不预定，stage 4 视消融需求决定）。 |
+| D-202 | `ActionAbstractionConfig` 1–14 raise size 接口 | Rust 结构体 `ActionAbstractionConfig { raise_pot_ratios: Vec<BetRatio> }`，长度 ∈ [1, 14]，每个元素 ∈ (0.0, +∞)；超界由 `ActionAbstractionConfig::new` 返回 `Result<_, ConfigError>`。**阶段 2 仅默认 5-action 强验收**；其它配置仅 smoke test（"配置可加载 + 输出确定性 + 哈希区分性"）。无 TOML / JSON 反序列化层（A0 不预定，stage 4 视消融需求决定）。 |
 | D-203 | "pot" 定义 | **pot-relative bet/raise 中 "pot" = 当前 pot + 当前 actor 跟注金额**（即 actor call 完后的 pot）。等价表述：`new_to = max_committed_this_round + ratio × (pot_before_action + (max_committed_this_round - actor.committed_this_round_before))`。该约定与 PokerKit `state.pot_amount(...)` 在 `PotLimitNoLimit` 模式下的语义一致。 |
 | D-204 | `Fold` 剔除规则 | 当 `LegalActionSet.check == true`（无前序 bet）时，5-action 输出**剔除** `Fold`（玩家 Free-check 局面下 fold 是 -EV 严格劣势动作）。其他局面 `Fold` 保留（需要 call 才能继续时 fold 合法）。 |
-| D-205 | `BetRaise(x×pot)` fallback 规则 | 按以下顺序判定（first-match-wins）：① 若 `x×pot < min_to`（违反 D-034 / D-035），**替换** 为 `min_to`（合法最小加注），不剔除；② 若 `x×pot >= committed_this_round + stack`（即超出剩余筹码），**替换** 为 `AllIn`；③ 否则保留为 `BetRaise(to = x×pot)`，向上取整到 chip。规则 ① 与 ② 同时触发时（min_to > stack）走 `AllIn`。 |
-| D-206 | `BetRaise(x×pot)` 与显式 `AllIn` 去重 | 若 D-205 fallback 后 `BetRaise(0.5×pot)` 与 `BetRaise(1.0×pot)` 折叠到相同 `to` 值（典型场景：短码），保留一份；若进一步与 `AllIn` 折叠，保留一份且枚举 tag 选 `AllIn`（保证抽象动作集合 size 单调收缩，下游 InfoSet 编码不混乱）。 |
-| D-207 | 抽象动作 `to` 字段语义 | 抽象动作集合中每个 `BetRaise` 持有具体 `ChipAmount(to)` 值（不是 ratio 占位符）；与 `Action::Bet/Raise { to }` 同语义。等价表述：`AbstractAction::BetRaise { to: ChipAmount, ratio_label: f64 }`，`ratio_label` 仅作为 InfoSet 编码区分性使用，apply 时取 `to`。 |
+| D-205 | `Bet/Raise(x×pot)` fallback 规则 | bet vs raise 由 stage 1 `LegalActionSet`（LA-002 互斥）决定：`bet_range.is_some()` ⇒ 输出 `Bet`，`raise_range.is_some()` ⇒ 输出 `Raise`。按以下顺序判定（first-match-wins）：① 若 `x×pot < min_to`（违反 D-034 首次开局 / D-035 链式 raise），**替换** `to` 为 `min_to`（合法最小 bet 或 raise，不剔除）；② 若 `x×pot >= committed_this_round + stack`（即超出剩余筹码），**替换**整个动作为 `AllIn { to = committed_this_round + stack }`；③ 否则保留为 `Bet { to = x×pot }` 或 `Raise { to = x×pot }`，向上取整到 chip。规则 ① 与 ② 同时触发时（min_to ≥ committed_this_round + stack）走 `AllIn`。 |
+| D-206 | `Bet/Raise(x×pot)` 与显式 `AllIn` 去重 | 若 D-205 fallback 后 `Bet/Raise(0.5×pot)` 与 `Bet/Raise(1.0×pot)` 折叠到相同 `to` 值（典型场景：短码），保留 ratio_label 较小的一份；若进一步与 `AllIn` 折叠（同 `to`），保留一份且枚举 tag 选 `AllIn`（保证抽象动作集合 size 单调收缩，下游 InfoSet 编码不混乱）。 |
+| D-207 | 抽象动作 `to` 字段语义 | 抽象动作集合中每个 `Bet` / `Raise` / `Call` / `AllIn` 持有具体 `ChipAmount(to)` 值（不是 ratio 占位符）；与 `Action::Bet/Raise { to }` 同语义。`Bet { to, ratio_label }` 与 `Raise { to, ratio_label }` 中 `ratio_label` 仅作为 InfoSet 编码区分性使用，apply 时取 `to`；`Fold` / `Check` 不带 `to`。 |
 | D-208 | 当前 actor 视角下 `effective_stack` 定义 | `effective_stack = min(actor.stack, max(opp.stack for opp in still_active_opps))`，含 actor 自己尚未投入但仍持有的部分。该值用于 D-211 stack bucket 与 D-205 fallback 判定。"still_active_opps" 包含 `Active` 与 `AllIn` 状态（已 all-in 对手对 actor 的 effective stack 没有压制效应，但 still 在 pot 中）；只排除 `Folded`。 |
-| D-209 | 抽象动作集合的 deterministic 顺序 | 输出顺序固定为 `[Fold?, Check?, Call?, BetRaise(0.5×pot)?, BetRaise(1.0×pot)?, AllIn?]`（按 D-200 5-action 顺序）。`?` 表示该位若 D-204 / D-205 / D-206 剔除 / 折叠后不存在则跳过。该顺序作为 InfoSet 编码契约稳定，任何变更走 D-200-revM。 |
+| D-209 | 抽象动作集合的 deterministic 顺序 | 输出顺序固定为 `[Fold?, Check?, Call?, Bet(0.5×pot)? \| Raise(0.5×pot)?, Bet(1.0×pot)? \| Raise(1.0×pot)?, AllIn?]`（按 D-200 5-action 顺序；同一 ratio 槽位 Bet 与 Raise 互斥，由 LA-002 保证）。`?` 表示该位若 D-204 / D-205 / D-206 剔除 / 折叠后不存在则跳过。该顺序作为 InfoSet 编码契约稳定，任何变更走 D-200-revM。 |
 
 ### D-200 详解
 
@@ -36,12 +36,16 @@
 |---|---|---|---|
 | `Fold` | `AbstractAction::Fold` | — | 任意 actor turn |
 | `Check` | `AbstractAction::Check` | — | `LegalActionSet.check == true` |
-| `Call` | `AbstractAction::Call` | — | `LegalActionSet.call.is_some()` |
-| `BetRaise(0.5×pot)` | `AbstractAction::BetRaise { to, ratio_label: 0.5 }` | 0.5 | `LegalActionSet.bet_range.is_some() \|\| raise_range.is_some()` |
-| `BetRaise(1.0×pot)` | `AbstractAction::BetRaise { to, ratio_label: 1.0 }` | 1.0 | 同上 |
+| `Call` | `AbstractAction::Call { to }` | — | `LegalActionSet.call.is_some()` |
+| `Bet(0.5×pot)` | `AbstractAction::Bet { to, ratio_label: HALF_POT }` | 0.5 | `LegalActionSet.bet_range.is_some()`（本下注轮无前序 bet） |
+| `Raise(0.5×pot)` | `AbstractAction::Raise { to, ratio_label: HALF_POT }` | 0.5 | `LegalActionSet.raise_range.is_some()`（本下注轮已有前序 bet） |
+| `Bet(1.0×pot)` | `AbstractAction::Bet { to, ratio_label: FULL_POT }` | 1.0 | 同 `Bet(0.5×pot)` 出现条件 |
+| `Raise(1.0×pot)` | `AbstractAction::Raise { to, ratio_label: FULL_POT }` | 1.0 | 同 `Raise(0.5×pot)` 出现条件 |
 | `AllIn` | `AbstractAction::AllIn { to }` | — | `LegalActionSet.all_in_amount.is_some()` |
 
-**D-200 等价口语化表述**：默认 5-action 不是 "5 个 abstract action" 而是 "5 类输出"——`Fold` / `Check` / `Call` / `BetRaise (含 0.5×pot 和 1.0×pot 两个 ratio_label)` / `AllIn`。"5-action" 命名沿用 path.md §阶段 2 字面，但实际 abstract action 集合 size ≤ 6（含 Fold + 双 ratio + AllIn 上限）；D-204 / D-205 / D-206 处理后 size 通常落在 [2, 5] 区间。
+由 stage 1 LA-002（`bet_range` 与 `raise_range` 互斥）保证：同一 actor turn 上同一 ratio 槽位（如 `0.5×pot`）至多出现 `Bet` 或 `Raise` 之一，绝不同时出现。
+
+**D-200 等价口语化表述**：默认 5-action 不是 "5 个 abstract action 变体" 而是 "5 类输出"——`Fold` / `Check` / `Call` / `Bet 或 Raise (含 0.5×pot 和 1.0×pot 两个 ratio_label)` / `AllIn`。"5-action" 命名沿用 path.md §阶段 2 字面，但实际 abstract action 集合 size ≤ 6（含 Fold + 双 ratio + AllIn 上限）；D-204 / D-205 / D-206 处理后 size 通常落在 [2, 5] 区间。
 
 ---
 
@@ -51,14 +55,14 @@
 |---|---|---|
 | D-210 | preflop position bucket（6-max） | **6 桶**：`{ BTN, SB, BB, UTG, MP, CO }`，与 stage 1 `Position` 枚举（`pluribus_stage1_api.md` §1）byte-equal。stage 2 仅 6-max 强验收；2..=9 其它桌大小走 "seat distance from button mod n_seats" 通用映射，桶数等于 `n_seats`，仅 smoke test。 |
 | D-211 | preflop `effective_stack` bucket 边界 | **5 桶**：`[0, 20) BB / [20, 50) BB / [50, 100) BB / [100, 200) BB / [200, +∞) BB`。`effective_stack` 单位 BB（chip / `big_blind`），向下取整。**preflop 起手时**计算（postflop bucket 不依赖 stack bucket，stack 只进 preflop key）。stage 2 默认 100 BB（D-022），落入 `[100, 200)` 桶。边界值采用左闭右开。 |
-| D-212 | preflop `prior_action` bucket | **4 桶**：`{ first_in, raised_1, raised_2, raised_3plus }`。`first_in` = 当前下注轮无人 voluntary raise（仅盲注 + 任意数量 limp）；`raised_k` = 当前下注轮已发生 k 次 voluntary raise（含 incomplete short all-in 视为 1 次）；`raised_3plus` 吸收 ≥ 3 次。盲注本身不算 raise（继承 stage 1 D-037 voluntary 定义）。preflop limp（call BB）也不算 raise。 |
+| D-212 | `betting_state` bucket（preflop + postflop 统一）| **5 状态**：`{ open, facing_bet_no_raise, facing_raise_1, facing_raise_2, facing_raise_3plus }`，3 bit 编码。该字段同时决定 actor 当前合法动作集（关键：`open` 局面 actor 可 `Check / Bet`，`facing_bet_no_raise` 局面 actor 必须 `Fold / Call / Raise`，二者合法动作集**不同**——若仅以 raise count = 0 编码会让两类局面同 InfoSetId 但合法动作集不同，CFR regret 矩阵跨 GameState 错位）。**preflop 语义**：`open` = BB 在 limpers / walks 后有 check option 的局面；`facing_bet_no_raise` = 非 BB 位首次面对 BB 强制下注（无 voluntary raise，仅盲注 + 任意数量 limp）；`facing_raise_k` = 当前下注轮已发生 k 次 voluntary raise（含 incomplete short all-in 视为 1 次）；`facing_raise_3plus` 吸收 ≥ 3 次。**postflop 语义**：`open` = 本街无任何 voluntary bet，actor 可 check 或 bet；`facing_bet_no_raise` = 本街已有 opening bet 但无 raise；`facing_raise_k` = 本街已有 k 次 voluntary raise。盲注本身不算 voluntary aggression（继承 stage 1 D-037）；preflop limp 不算 raise。 |
 | D-213 | postflop 默认 bucket 数 | **flop = 500, turn = 500, river = 500**（path.md §阶段 2 字面 ≥ 500）。`BucketConfig` 接口允许每条街独立配置 bucket 数 ∈ [10, 10_000]；**stage 2 验收只跑 500/500/500**，其它配置只做 "配置可加载 + 写出 bucket table + bucket id 范围正确" smoke。 |
 | D-214 | postflop `BucketConfig` API | `pub struct BucketConfig { pub flop: u32, pub turn: u32, pub river: u32 }`，构造时校验每条街 ∈ [10, 10_000]。`BucketConfig::default_500_500_500()` 返回默认配置。配置变更时 `BucketTable.schema_version` 不 bump，但 `feature_set_id`（D-240）随特征组合变化。 |
-| D-215 | preflop InfoSet key 复合 | `(hand_class_169, position_bucket, stack_bucket, prior_action_bucket)` → 单一 `u64` InfoSet id：低 8 位 `hand_class_169`（0..168）、次 4 位 position（0..n_seats-1）、次 4 位 stack（0..4）、次 4 位 prior_action（0..3）、剩余位保留 0。该编码字节级稳定，下游 CFR 可直接 hash。 |
-| D-216 | postflop InfoSet key 复合 | `(street, board_canonical_id, hole_canonical_id) → bucket_id` 由 `BucketTable::lookup` 返回；`InfoSetId = (street_tag, bucket_id, position_bucket, stack_bucket_at_preflop, prior_action_history_compressed)`。`prior_action_history_compressed` 阶段 2 简化为 "本街 voluntary raise 计数 0..=3+"（与 D-212 同型扩展）；完整 betting tree path 编码留 stage 3 决策。 |
+| D-215 | InfoSet key 统一 64-bit layout | 单一 `u64` `InfoSetId` 字段顺序（低位起，跨 preflop / postflop **共用同一 layout**，避免 stage 1 `Street` enum 与抽象层语义解耦）：① `bucket_id`（**24 bit**，preflop 取值 = `hand_class_169` ∈ 0..169，postflop 取值 = `BucketTable::lookup` 返回的 cluster id ∈ 0..`bucket_count(street)`；24 bit 上限 16M 覆盖 D-214 当前 [10, 10_000] 与未来 stage 3+ 扩 bucket 数 / 街合并编码）；② `position_bucket`（**4 bit**，0..n_seats-1，支持 D-030 全部 2..=9 桌大小）；③ `stack_bucket`（**4 bit** 留 slack，0..4 = D-211 5 桶；postflop **沿用 preflop 起手 stack bucket**——postflop 不重算 effective_stack 进 InfoSet）；④ `betting_state`（**3 bit**，0..4 = D-212 5 状态 enum 值）；⑤ `street_tag`（**3 bit**，0..3 = `Preflop / Flop / Turn / River`，preflop 显式编码 `street_tag = 0` 而非靠 "其余字段为 0" 启发式判断）；⑥ `reserved`（**26 bit**，必须为 0；任何非零位写入是 P0 阻塞 bug）。该 64-bit 编码字节级稳定，下游 CFR 可直接对 `InfoSetId.raw()` 做 hash key。完整 betting tree path 编码（如未来 4-bet pot vs 5-bet pot 树分裂）留 stage 3 决策，届时通过 `betting_state` 5 状态扩展或新增 history-compressed bit 实现。 |
+| D-216 | preflop / postflop bucket_id 来源差异 | preflop：`bucket_id = hand_class_169` 直接映射，不经 k-means（继承 D-217 编号 + D-239 lossless）。postflop：`bucket_id = BucketTable::lookup(street_tag, board_canonical_id, hole_canonical_id)` 由 mmap 命中返回；street 间 bucket id 命名空间独立（flop bucket 17 与 turn bucket 17 是不同 InfoSet，由 `street_tag` 字段消歧）。两路径下 `bucket_id` 字段宽度都是 D-215 的 24 bit。InfoSetId 跨街 byte-equal 仅在 (bucket_id, position, stack, betting_state, street_tag) 五元组完全相同时成立——这正是 CFR 训练所需的语义。 |
 | D-217 | preflop 169 等价类编号 | `hand_class_169 ∈ 0..169`：`0..13` = pocket pairs（22, 33, ..., AA 升序）；`13..91` = suited（按高牌主排序、低牌副排序：32s, 42s, 43s, 52s, ..., AKs）；`91..169` = offsuit（同顺序）。具体编号表落在 `tests/preflop_169.rs` 的 lookup 断言里，A0 仅锁原则；A1 [实现] 落具体数表。 |
 | D-218 | canonical hand / board id | hole canonical：22 → `(rank=2, rank=2, suited=false)` → 唯一 id；suited 与 offsuit 各异。board canonical：考虑花色对称性等价类，按 rank 多重集 + suit 模式 canonicalize；具体算法 A1 落地。canonical id 是 `u32`，足够覆盖（5-card board canonical 上限 ~134k；7-card 上限 ~1.5M，远在 u32 内）。 |
-| D-219 | postflop 不依赖 preflop key 的隔离原则 | postflop bucket 仅依赖 `(street, board, hole)`（特征只看牌力 / 公牌结构），**不嵌入** position / stack / prior_action。preflop key 的位置 / stack / prior 信息留在 `InfoSetId` 复合字段里（D-216），不渗入 postflop bucket。理由：postflop bucket 表是 cluster 输出，跨手通用；与博弈树位置无关，便于阶段 6 实时搜索复用同一 mmap 表。 |
+| D-219 | postflop 不依赖 preflop key 的隔离原则 | postflop bucket 仅依赖 `(street, board, hole)`（特征只看牌力 / 公牌结构），**不嵌入** position / stack / betting_state。preflop key 的位置 / stack / betting_state 信息留在 `InfoSetId` 复合字段里（D-215 / D-216），不渗入 postflop bucket。理由：postflop bucket 表是 cluster 输出，跨手通用；与博弈树位置无关，便于阶段 6 实时搜索复用同一 mmap 表。 |
 
 ---
 
@@ -70,11 +74,11 @@
 | D-220a | equity 反对称容差 | `\|equity(A, B \| board) + equity(B, A \| board) - 1\| ≤ 0.005` 在 `iter = 10,000` 时；`iter = 1,000` 时容差放宽到 0.02。容差由 D-220 决定（标准误差近似 `sqrt(0.25/iter)`）。该容差用于 `tests/equity_self_consistency.rs` 反对称断言。 |
 | D-221 | 默认特征组合（postflop clustering） | **EHS² + OCHS** 双特征 concat，作为 k-means 输入向量。EHS² 标量 1 维；OCHS 向量 N=8 维（D-222）；总输入维度 = 9。distribution-aware histogram **不进默认**（path.md "可选" 字面），仅作为 stage 4 消融对照接入。 |
 | D-222 | OCHS opponent cluster 数 | **N = 8**（Brown & Sandholm 2014 "Strategy-Based Warm Starting for Real-Time Hold'em Poker" 论文使用值；与 Pluribus 实战一致）。8 个 opponent cluster 在 stage 2 启动时通过 preflop 169 上的 EHS 一维 k-means 自训练（同 RngSource seed → 8 cluster centroid byte-equal）。N 配置接口预留为 `OchsConfig { n_opp_clusters: u8 }`，但 stage 2 只跑 N=8。 |
-| D-223 | EHS / EHS² 计算路径 | EHS = `Pr(我方 7-card final hand strength > 对手随机 hole 7-card final hand strength)`，Monte Carlo over 对手 hole + 未发公牌。EHS² = `E[EHS_at_river² \| current_state]`，Monte Carlo over 未发公牌每条 rollout 计算 river EHS 然后平方求均值。river 状态下 EHS² == EHS²（无未发牌），退化为 EHS²。 |
+| D-223 | EHS / EHS² 计算路径 | **EHS** = `Pr(我方 7-card final hand strength > 对手随机 hole 7-card final hand strength)`，Monte Carlo 联合采样 over (对手 hole, 未发公牌)，对手 hole uniform over remaining unknown cards（即排除我方 hole + 当前 board）。**EHS²** = `E[EHS_at_river² \| current_state]`，**outer** 枚举未发公牌（确定性，无 RNG，详见 D-227），每条 rollout 在补完的 river 状态下计算 inner EHS 然后平方求均值。river 状态下 outer rollout = 0，退化为 `inner_EHS²`（inner EHS 仍走 Monte Carlo over 对手 hole）。 |
 | D-224 | 特征数值范围与 NaN 处理 | EHS / EHS² ∈ [0.0, 1.0]；OCHS 每维 ∈ [0.0, 1.0]。任何 NaN / Inf 出现视为 P0 阻塞 bug（继承 stage 1 D-026 "禁浮点" 精神在 cluster 路径的等价物：浮点允许，但只允许 finite）。`MonteCarloEquity::compute(...)` 返回 `f64`，调用方在写入 bucket table 前必须断言 finite。 |
 | D-225 | equity 离散化前的浮点边界 | clustering / equity 计算允许 `f32` / `f64`；写入 mmap bucket table 时 centroid 量化到 `u8`（D-241），bucket id 量化到 `u32`。运行时映射热路径（`abstraction::map`）只读 `u32` bucket id，禁止浮点（D-252）。 |
 | D-226 | hand-vs-range equity 接口 | 阶段 2 仅实现 `equity(hole, board, rng)`（hand-vs-uniform-random-hole）；`equity(hole, board, opp_range, rng)` range-aware 版接口预留但 stage 2 不实现，留 stage 4 决策。 |
-| D-227 | EHS² 计算 rollout 数 | rollout per hand：river 直接计算（0 rollout）；turn 1 张未发 → 44 张穷举 mean of squared EHS；flop 2 张未发 → Monte Carlo `min(10_000, 44*43)` ≈ 1,892 实际 ≤ 1,892 时全枚举（确定性），> 1,892 时按 Monte Carlo（伪随机）。turn 全枚举走确定性路径，flop ≤ 1892 全枚举走确定性路径，flop > 1892 走 Monte Carlo + RngSource seed 控制。 |
+| D-227 | EHS² 计算 rollout 数（outer enumeration） | **采样口径**：outer 是 "已知我方 hole + 当前 board" 视角下未发**公共牌**枚举；对手 hole 不在 outer 维度，而在 inner equity 内部 Monte Carlo（uniform over remaining cards 排除我方 hole + 完整 board）。**rollout 数**：river 状态 outer = 0 rollout（无未发公共牌），EHS² 退化为 `inner_EHS²`；turn 状态 outer = **46 张**未发 river 卡全枚举（52 - 2 hole - 4 board）；flop 状态 outer = **`C(47, 2) = 1081` 个 (turn, river) 无序对**全枚举（52 - 2 hole - 3 board = 47 张未发，选 2）。outer 全部确定性枚举（无 RNG），inner equity 在每个 outer 评估点走 Monte Carlo（消耗 RngSource，默认 D-220 iter）。**flop 1081 < 默认 inner iter 10000 不可比**——两者维度不同：outer 是确定性枚举数，inner iter 是每个 outer 点上的 Monte Carlo 样本数，总评估次数 ≈ outer × inner。 |
 
 ---
 
@@ -87,11 +91,12 @@
 | D-232 | k-means 收敛门槛 | `max_iter = 100` 与 `centroid_shift_l_inf ≤ 1e-4`（任意一个先满足即停）二者并集为 OR 收敛判据。`centroid_shift_l_inf` = max over centroids of max over dimensions of `\|c_new - c_old\|`。max_iter=100 确保最坏情况下耗时可控（500 bucket × 9 维 × 100 iter ≈ 可控）。 |
 | D-233 | bucket 间 EMD 阈值 `T_emd` | **`T_emd ≥ 0.02`**（衡量相邻 bucket id 间 all-in equity 分布的 1D EMD；分布在 [0,1] 区间）。"相邻" = bucket id `(k, k+1)`。每条街 500 bucket → 499 对相邻；任一对 EMD < 0.02 视为聚类质量不足，回归到 [测试] 指出聚类未达验收 → [实现] 重新调参。 |
 | D-234 | EMD 距离计算（1D） | 1D EMD 在 [0, 1] 区间用 sorted CDF 差分积分计算，O(n log n) sort + O(n) 累加。所有 EMD 计算路径走同一函数 `emd_1d_unit_interval(samples_a, samples_b) -> f64`，确保 byte-equal。 |
-| D-235 | k-means 内部确定性 | 同 seed clustering 重复 10 次 bucket centroid byte-equal。tie-break 路径：① k-means++ 抽样使用 `rng.next_u64() % (sum_d2 as u64)` 取整（避免 `f64` mod 路径浮点 reorder）；② k-means 重分配时数据点距离严格相等情况下取小 cluster id（确定性 tie-break）。 |
+| D-235 | k-means 内部确定性 | 同 seed clustering 重复 10 次 bucket centroid byte-equal。**k-means++ 抽样**：浮点距离平方 `d2[i]` 不可直接 `as u64`（特征 ∈ [0,1]⁹ 时 d2 ∈ [0, 9]，转 u64 会截断到 0..9 严重扭曲分布）。确定性流程：① **量化** `d2_q[i] = (d2[i].clamp(0.0, D2_MAX) / D2_MAX * (1u64 << 40) as f64) as u64`，其中 `D2_MAX = 9.0`（特征上限：9 维 [0,1] 区间，d2 上限 9）；量化后 `d2_q[i] ∈ [0, 2^40]`。② **累积** `cum_q[i] = sum_{j ≤ i} d2_q[j]`（u64 安全：N ≤ 10000 个候选点 × 2^40 上限 ≈ 2^54，远低于 u64 溢出 2^64）。③ **零和 fallback**：若 `cum_q[N-1] == 0`（所有未选点 d2 量化后均为 0，极少发生），取**最小 index** 的未选点。④ 否则 sample：`r = rng.next_u64() % cum_q[N-1]`，二分查找最小 i 使得 `cum_q[i] > r`。**k-means 重分配 tie-break**：数据点到多个 cluster 距离严格相等时取小 cluster id（确定性 tie-break）。 |
 | D-236 | k-means 失败处理 | 若收敛后某 cluster 为空（k-means++ 极少见但非 0 概率）：从最大 cluster 中按 L2 距离最远点切出，保证 0 空 bucket（验收硬条件，validation §3 字面）。该 split 路径需 RngSource tie-break：距离严格相等时取最小 sample id。 |
+| D-236b | 训练完成后 bucket 重编号 | k-means 输出的 cluster id 由初始化顺序决定，**不天然具备强度顺序**。训练完成后必须按 bucket 内 EHS 中位数升序重编号 cluster id（**0 = 最弱 / N-1 = 最强**），重编号后的 lookup table 与 centroid data 按新 id 顺序写入 mmap。**tie-break**：① EHS 中位数严格相等时按 centroid 向量字典序（u8 quantized 后的字节序，D-241）；② centroid 字节序也相等时按旧 cluster id 升序。该步骤是 D-233 "相邻 bucket EMD ≥ T_emd" 与 validation §3 "bucket id ↔ EHS 中位数单调一致" 同时成立的前提；任何 [实现] 跳过 D-236b 直接写 bucket table 都会让 [测试] EMD / 单调性断言批量 fail。重编号是最后一步，发生在 D-243 BLAKE3 trailer 计算之前。 |
 | D-237 | 训练 RngSource seed 编码 | bucket table 训练 seed 是 `u64`，写入 `BucketTable.metadata.training_seed`。任何同 `(BucketConfig, training_seed, feature_set_id)` 组合训练出的 bucket table 必须 BLAKE3 byte-equal（D-243）。 |
 | D-238 | 多街训练顺序 | flop / turn / river 三条街**独立训练**（不依赖彼此 bucket id），可并行。每条街用独立 RngSource fork（`stream_id = 0/1/2`）保证跨并行执行 byte-equal（继承 stage 1 D-054 多线程一致性精神）。 |
-| D-239 | preflop 169 不进 clustering | preflop 169 是组合数学 lossless 等价类（D-217），**不**经 k-means。preflop bucket id 直接 = `hand_class_169`（0..169）。bucket table 中 preflop 段写入空 cluster centroid（`flop_count = 169` 占位），实际查询走 D-217 的 lookup。 |
+| D-239 | preflop 169 不进 clustering | preflop 169 是组合数学 lossless 等价类（D-217），**不**经 k-means。preflop bucket id 直接 = `hand_class_169`（0..169）。bucket table 中 preflop 段：lookup table `[u32; 1326]`（每个 hole canonical id → 0..168 bucket id），**不存** cluster centroid（lossless 无需）。bucket count 固定 169，**header 不显式存 preflop bucket count 字段**（reader 直接返回常量 169）；与 D-244 header 中的 `flop_count / turn_count / river_count` 三字段无关——后者只描述 postflop 三条街的 k-means 输出 bucket 数。 |
 
 ---
 

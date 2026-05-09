@@ -19,7 +19,13 @@
 ### AbstractAction / AbstractActionSet / ActionAbstractionConfig
 
 ```rust
-/// 抽象动作。pot ratio 编码进 BetRaise 变体；apply 时取 `to`。
+/// 抽象动作。pot ratio 编码进 `Bet` / `Raise` 变体；apply 时取 `to`。
+///
+/// `Bet` 与 `Raise` 在构造时由 stage 1 `LegalActionSet`（LA-002 互斥）选定：
+/// 本下注轮无前序 bet ⇒ `Bet`，已有前序 bet ⇒ `Raise`。该拆分让
+/// `to_concrete()` 无状态可调用（见 §7），同时 D-212 `betting_state`
+/// 字段在 `Bet` 与 `Raise` 之间的转移无歧义（`Bet` 把 `Open` 推进到
+/// `FacingBetNoRaise`；`Raise` 把任何状态推进到 `FacingRaise{1,2,3+}`）。
 ///
 /// `ratio_label` 仅作为 InfoSet 编码区分性（D-207 / D-209），不参与 apply 计算。
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -27,7 +33,10 @@ pub enum AbstractAction {
     Fold,
     Check,
     Call { to: ChipAmount },
-    BetRaise { to: ChipAmount, ratio_label: BetRatio },
+    /// 本下注轮无前序 bet（`legal_actions().bet_range.is_some()`）。
+    Bet { to: ChipAmount, ratio_label: BetRatio },
+    /// 本下注轮已有前序 bet（`legal_actions().raise_range.is_some()`）。
+    Raise { to: ChipAmount, ratio_label: BetRatio },
     AllIn { to: ChipAmount },
 }
 
@@ -46,8 +55,8 @@ impl BetRatio {
 }
 
 /// 抽象动作集合输出。顺序固定为 D-209：
-/// `[Fold?, Check?, Call?, BetRaise(0.5×pot)?, BetRaise(1.0×pot)?, AllIn?]`
-/// `?` 表示不存在则跳过。
+/// `[Fold?, Check?, Call?, Bet(0.5×pot)? | Raise(0.5×pot)?, Bet(1.0×pot)? | Raise(1.0×pot)?, AllIn?]`
+/// `?` 表示不存在则跳过；同一 ratio 槽位 `Bet` 与 `Raise` 互斥（由 stage 1 LA-002 保证）。
 #[derive(Clone, Debug)]
 pub struct AbstractActionSet {
     actions: Vec<AbstractAction>,
@@ -84,6 +93,9 @@ pub enum ConfigError {
     RaiseCountOutOfRange(usize),
     #[error("raise pot ratio not positive finite: {0}")]
     RaiseRatioInvalid(f64),
+    /// `BucketConfig::new` 越界：每条街 bucket 数应 ∈ [10, 10_000]（D-214）。
+    #[error("bucket count out of range for {street:?}: expected [10, 10_000], got {got}")]
+    BucketCountOutOfRange { street: StreetTag, got: u32 },
 }
 ```
 
@@ -119,9 +131,9 @@ impl ActionAbstraction for DefaultActionAbstraction { /* ... */ }
 
 实现 agent 必须保证、测试 agent 在 invariant suite 中验证：
 
-- AA-001 顺序固定（D-209）：`abstract_actions(state).iter()` 输出顺序为 `[Fold?, Check?, Call?, BetRaise(0.5×pot)?, BetRaise(1.0×pot)?, AllIn?]`，`?` 表示不存在则跳过。
+- AA-001 顺序固定（D-209）：`abstract_actions(state).iter()` 输出顺序为 `[Fold?, Check?, Call?, Bet(0.5×pot)? | Raise(0.5×pot)?, Bet(1.0×pot)? | Raise(1.0×pot)?, AllIn?]`，`?` 表示不存在则跳过；同一 ratio 槽位 `Bet` 与 `Raise` 互斥（由 stage 1 LA-002 保证，本不变量直接继承）。
 - AA-002 `Fold` 与 `Check` 互斥（D-204）：当 `state.legal_actions().check == true` 时 `Fold` 不出现在抽象动作集合。
-- AA-003 `BetRaise(x×pot)` fallback（D-205）：若 `x×pot < min_to`，输出 `BetRaise { to = min_to }`（不剔除）；若 `x×pot >= committed_this_round + stack`，输出 `AllIn { to = committed_this_round + stack }`。
+- AA-003 `Bet/Raise(x×pot)` fallback（D-205）：bet vs raise 由 stage 1 `LegalActionSet`（LA-002）选定：`bet_range.is_some()` ⇒ 输出 `Bet`，`raise_range.is_some()` ⇒ 输出 `Raise`。若 `x×pot < min_to`，输出 `Bet { to = min_to }` / `Raise { to = min_to }`（不剔除）；若 `x×pot >= committed_this_round + stack`，输出 `AllIn { to = committed_this_round + stack }`。
 - AA-004 折叠去重（D-206）：抽象动作集合中不同 `AbstractAction` 实例的 `to` 字段必须互不相等（除 `Fold` / `Check` 不带 `to`）。
 - AA-005 集合非空：当 `state.current_player().is_some()` 时，`abstract_actions(state).len() >= 1`（至少有 `Fold` 或 `Check` 之一，AA-002 保证不会同时空）。
 - AA-006 集合空：当 `state.current_player().is_none()`（terminal / all-in 跳轮）时，`abstract_actions(state).is_empty() == true`。
@@ -135,10 +147,15 @@ impl ActionAbstraction for DefaultActionAbstraction { /* ... */ }
 ### InfoSetId
 
 ```rust
-/// 复合 InfoSet id。低位编码与 D-215 / D-216 一致。
+/// 复合 InfoSet id。低位编码与 D-215 / D-216 一致，**preflop / postflop 共享同一 64-bit layout**。
 ///
-/// preflop：`hand_class_169 (8 bit) | position (4) | stack (4) | prior_action (4) | street_tag = 0 (4) | reserved (40) = u64`
-/// postflop：`bucket_id (16) | position (4) | stack (4) | prior_voluntary_raise_count (4) | street_tag (4) | reserved (32)`
+/// 字段顺序（低位起）：
+/// - bit  0..24: `bucket_id`         (24 bit；preflop = hand_class_169 ∈ 0..169；postflop = BucketTable::lookup 返回 cluster id ∈ 0..bucket_count(street))
+/// - bit 24..28: `position_bucket`   ( 4 bit；0..n_seats-1，支持 2..=9 桌大小)
+/// - bit 28..32: `stack_bucket`      ( 4 bit；0..4 = D-211 5 桶；postflop 沿用 preflop 起手值)
+/// - bit 32..35: `betting_state`     ( 3 bit；0..4 = D-212 5 状态 enum 值)
+/// - bit 35..38: `street_tag`        ( 3 bit；0..3 = Preflop/Flop/Turn/River；preflop 显式编码 0 不靠零启发式)
+/// - bit 38..64: `reserved`          (26 bit；必须为 0)
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd)]
 pub struct InfoSetId(u64);
 
@@ -147,6 +164,30 @@ impl InfoSetId {
     pub fn street_tag(self) -> StreetTag;
     pub fn position_bucket(self) -> u8;
     pub fn stack_bucket(self) -> u8;
+    pub fn betting_state(self) -> BettingState;
+    pub fn bucket_id(self) -> u32;
+}
+
+/// 当前下注轮的合法动作集语义（D-212）。preflop 与 postflop 共用同一枚举。
+///
+/// 该字段直接决定 actor 的合法动作集——`Open` 局面 actor 可 `Check / Bet`，
+/// `FacingBetNoRaise` 局面 actor 必须 `Fold / Call / Raise`，二者**不同**；
+/// 仅以 raise count = 0 编码会让两类局面同 InfoSetId 但合法动作集不同，
+/// CFR regret 矩阵跨 GameState 错位（F17 修复）。
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[repr(u8)]
+pub enum BettingState {
+    /// preflop: BB 在 limpers / walks 后有 check option；
+    /// postflop: 本街无 voluntary bet。
+    Open = 0,
+    /// preflop: 非 BB 位首次面对 BB 强制下注（无 voluntary raise）；
+    /// postflop: 本街已有 opening bet 但无 raise。
+    FacingBetNoRaise = 1,
+    /// 本下注轮已发生 1 次 voluntary raise（含 incomplete short all-in）。
+    FacingRaise1 = 2,
+    FacingRaise2 = 3,
+    /// ≥ 3 次 voluntary raise 吸收。
+    FacingRaise3Plus = 4,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
@@ -192,8 +233,9 @@ impl PreflopLossless169 {
 impl Default for PreflopLossless169 { /* ... */ }
 
 impl InfoAbstraction for PreflopLossless169 {
-    /// preflop 路径：`(hand_class_169, position_bucket, stack_bucket, prior_action_bucket)`
-    /// 复合到 `InfoSetId`（D-215 编码）。
+    /// preflop 路径：`(hand_class_169, position_bucket, stack_bucket, betting_state)`
+    /// 复合到 `InfoSetId`（D-215 统一 64-bit 编码，`bucket_id = hand_class_169`，
+    /// `street_tag = StreetTag::Preflop`）。
     fn map(&self, state: &GameState, hole: [Card; 2]) -> InfoSetId;
 }
 ```
@@ -218,8 +260,8 @@ impl PostflopBucketAbstraction {
 
 impl InfoAbstraction for PostflopBucketAbstraction {
     /// postflop 路径：`(street, board, hole) → bucket_id`（mmap），与 preflop key
-    /// 字段（position / stack / prior_voluntary_raise_count）合并到 `InfoSetId`
-    /// （D-216 编码）。
+    /// 字段（position / stack / betting_state / street_tag）合并到 `InfoSetId`
+    /// （D-215 统一 64-bit 编码；`bucket_id` 由 `BucketTable::lookup` 命中得到）。
     fn map(&self, state: &GameState, hole: [Card; 2]) -> InfoSetId;
 }
 ```
@@ -227,11 +269,12 @@ impl InfoAbstraction for PostflopBucketAbstraction {
 ### Information abstraction 不变量
 
 - IA-001 preflop 169 全覆盖（D-217）：枚举全部 1326 起手牌 → 169 类一一映射；每类 hole 计数与组合数学一致（pairs 6 / suited 4 / offsuit 12 / 总和 1326）。
-- IA-002 preflop key 区分性（validation §2）：同一 `hand_class_169` 在不同 `(position, stack, prior_action)` 下产出**不同** `InfoSetId.raw()`，碰撞率 0%。
-- IA-003 postflop bucket id 范围：`PostflopBucketAbstraction::bucket_id(...)` 返回值 ∈ `[0, BucketConfig.{street})`。
+- IA-002 preflop key 区分性（validation §2）：同一 `hand_class_169` 在不同 `(position, stack, betting_state)` 下产出**不同** `InfoSetId.raw()`，碰撞率 0%。`betting_state` 5 状态展开（含 `Open` 与 `FacingBetNoRaise` 区分）保证 BB-after-limp 与 first-in-non-BB 不混入同一 InfoSet（F17）。
+- IA-003 postflop bucket id 范围：`PostflopBucketAbstraction::bucket_id(...)` 返回值 ∈ `[0, BucketConfig.{street})`，且必须满足 `< 2^24`（D-215 `bucket_id` 字段宽度上限）。
 - IA-004 deterministic：`map(state, hole)` 重复 1,000,000 次结果 byte-equal。
-- IA-005 postflop 不依赖 preflop key（D-219）：`PostflopBucketAbstraction::bucket_id(state, hole)` 输出仅依赖 `(street, board, hole)`，不依赖 `(position, stack, prior_action)`。
-- IA-006 街隔离：`map(state, hole)` 必须根据 `state.street()` 选择 preflop 或 postflop 路径；`Showdown` 街调用返回的 `InfoSetId.street_tag()` = `StreetTag::River`（最后一条 betting round）。
+- IA-005 postflop 不依赖 preflop key（D-219）：`PostflopBucketAbstraction::bucket_id(state, hole)` 输出仅依赖 `(street, board, hole)`，不依赖 `(position, stack, betting_state)`。
+- IA-006 街隔离：`map(state, hole)` 必须根据 `state.street()` 选择 preflop 或 postflop 路径；`Showdown` 街是 InfoSet 不可达状态（无 actor 决策点），`map` 在 `state.is_terminal() == true` 时返回上一条 betting round 的 `InfoSetId`（即 river 街最后一次决策点的编码），调用方一般不会触发该路径。
+- IA-007 InfoSetId reserved 位为零（D-215）：`InfoSetId.raw()` 的 bit 38..64（26 bit）必须全为 0；任一非零 bit 写入是 P0 阻塞 bug。`tests/info_id_encoding.rs` 全枚举 typical state space 断言此不变量。
 
 ---
 
@@ -294,7 +337,7 @@ impl EquityCalculator for MonteCarloEquity { /* ... */ }
 
 - EQ-001 反对称容差（D-220a）：`|equity(A, B | board) + equity(B, A | board) - 1| ≤ 0.005`（`iter = 10_000`）；`iter = 1_000` 时容差 0.02。
 - EQ-002 范围：`equity / ehs_squared / ochs[i]` 全部 ∈ [0.0, 1.0] 且 finite（D-224）；任何 NaN / Inf 视为 P0 阻塞 bug。
-- EQ-003 EHS² rollout（D-227）：river 退化为 `equity²`（rollout = 0）；turn 全 44 张未发牌穷举 mean of squared EHS（确定性，无 RNG）；flop 当 `iter <= 44*43 = 1892` 时全枚举（确定性），`iter > 1892` 时 Monte Carlo（依赖 RngSource）。
+- EQ-003 EHS² rollout（D-227）：**采样口径**——outer 是 "已知我方 hole + 当前 board" 视角下未发**公共牌**枚举；对手 hole 不在 outer 维度，而在 inner equity 内部 Monte Carlo（uniform over remaining cards 排除我方 hole + 完整 board）。**rollout 数**：river 状态 outer = 0 rollout，EHS² 退化为 `inner_EHS²`（inner equity 仍走 D-220 默认 iter Monte Carlo）；turn 状态 outer = **46 张**未发 river 卡全枚举（52 - 2 hole - 4 board，确定性，无 outer RNG）；flop 状态 outer = **`C(47, 2) = 1081` 个 (turn, river) 无序对**全枚举（52 - 2 hole - 3 board = 47 张未发，选 2，确定性）。outer enumeration 不消耗 RngSource；inner equity 在每个 outer 评估点走 Monte Carlo（消耗 RngSource，sub-stream seed 由 outer enumeration index 决定保证 byte-equal）。
 - EQ-004 OCHS 向量长度：`ochs(...).len() == self.n_opp_clusters() as usize`。
 - EQ-005 deterministic：同 `(hole, board, rng_seed, iter, n_opp_clusters)` 重复调用结果 byte-equal。
 
@@ -349,11 +392,18 @@ impl BucketTable {
     pub fn open(path: &std::path::Path) -> Result<BucketTable, BucketTableError>;
 
     /// `(street, board_canonical_id, hole_canonical_id) → bucket_id`。
-    /// preflop 街忽略 board_canonical_id 参数（传 0）。
-    /// hole_canonical_id 越界时返回 None；街参数为 Showdown 时返回 None。
+    /// preflop 街忽略 `board_canonical_id` 参数（传 0）。
+    /// `hole_canonical_id` 越界时返回 None。
+    ///
+    /// **接口接 `StreetTag`（不接 stage 1 `Street`）**——`StreetTag` 仅含 4 个 betting
+    /// 街变体（`Preflop / Flop / Turn / River`），不含 `Showdown`。caller 必须在
+    /// 调用前把 `Street::Showdown` 局面分流（Showdown 不存在 InfoSet 决策点，调用
+    /// `lookup` 是语义错误）。该约束让 `bucket_count` / `lookup` / `BucketConfig` /
+    /// `ConfigError::BucketCountOutOfRange` 全部用同一个 `StreetTag` 类型，避免
+    /// `Street` ↔ `StreetTag` 反复转换的 spec drift（F9 修复）。
     pub fn lookup(
         &self,
-        street: Street,
+        street: StreetTag,
         board_canonical_id: u32,
         hole_canonical_id: u32,
     ) -> Option<u32>;
@@ -363,8 +413,8 @@ impl BucketTable {
     pub fn config(&self) -> BucketConfig;
     pub fn training_seed(&self) -> u64;
 
-    /// 每条街 bucket 数；preflop 固定返回 169。
-    pub fn bucket_count(&self, street: Street) -> u32;
+    /// 每条街 bucket 数；`StreetTag::Preflop` 固定返回 169。
+    pub fn bucket_count(&self, street: StreetTag) -> u32;
 
     /// 文件 BLAKE3 自校验值（D-243）。同 mmap 加载后 byte-equal。
     pub fn content_hash(&self) -> [u8; 32];
@@ -457,7 +507,7 @@ pub use abstraction::action::{
     AbstractAction, AbstractActionSet, ActionAbstraction, ActionAbstractionConfig,
     BetRatio, ConfigError, DefaultActionAbstraction,
 };
-pub use abstraction::info::{InfoAbstraction, InfoSetId, StreetTag};
+pub use abstraction::info::{BettingState, InfoAbstraction, InfoSetId, StreetTag};
 pub use abstraction::preflop::PreflopLossless169;
 pub use abstraction::postflop::PostflopBucketAbstraction;
 pub use abstraction::equity::{EquityCalculator, MonteCarloEquity};
@@ -484,13 +534,22 @@ impl InfoSetId {
 }
 
 impl AbstractAction {
-    /// `AbstractAction` → 实际可 apply 的 `Action`（stage 1 类型）。
-    /// `Fold`、`Check`、`Call`、`BetRaise`、`AllIn` 全部映射到对应 `Action` 变体。
+    /// `AbstractAction` → 实际可 apply 的 `Action`（stage 1 类型）。**无状态**——
+    /// `AbstractAction::Bet` / `Raise` 在构造时已由 stage 1 `LegalActionSet` 区分，
+    /// 转换无歧义。映射规则：
+    /// - `Fold`            → `Action::Fold`
+    /// - `Check`           → `Action::Check`
+    /// - `Call { .. }`     → `Action::Call`（stage 1 `Action::Call` 不带 `to`，跟注金额由
+    ///                        state machine 推导，等同于 stage 1 §2 行为）
+    /// - `Bet { to, .. }`  → `Action::Bet { to }`
+    /// - `Raise { to, .. }`→ `Action::Raise { to }`
+    /// - `AllIn { .. }`    → `Action::AllIn`（stage 1 状态机自动归一化，`to` 字段作为
+    ///                        InfoSet 编码标签即可丢弃）
     pub fn to_concrete(self) -> Action;
 }
 ```
 
-这些桥接函数仅做字段提取 / 转换，不引入语义层。stage 4 CFR driver 通过 `AbstractAction::to_concrete().apply(&mut state)?` 路径在 mock 抽象树上前进。
+这些桥接函数仅做字段提取 / 转换，不引入语义层。stage 4 CFR driver 通过 `AbstractAction::to_concrete().apply(&mut state)?` 路径在 mock 抽象树上前进；该路径无需 `&GameState` 入参，由 `AbstractAction` 的 `Bet` / `Raise` 拆分自身保证语义正确。
 
 ---
 
@@ -557,15 +616,17 @@ A1 [实现] 落以下 doc test 占位（`unimplemented!()` 的代码块仍可通
 | §1 `BetRatio` 整数化 | D-200 / D-202 / D-207 | D-026（避免 `f64` 进入 `Eq`/`Hash`） |
 | §1 `DefaultActionAbstraction::abstract_actions` 不变量（AA-001..AA-008） | D-200 ~ D-209 / D-273 | D-026 / D-027 |
 | §1 `map_off_tree` PHM stub | D-201 | — |
-| §2 `InfoSetId` 编码 | D-215 / D-216 | — |
+| §2 `InfoSetId` 统一 64-bit layout + `BettingState` enum + `StreetTag` enum | D-212 / D-215 / D-216 | — |
 | §2 `PreflopLossless169` | D-210 / D-211 / D-212 / D-215 / D-217 | — |
-| §2 `PostflopBucketAbstraction` | D-213 / D-214 / D-216 / D-218 / D-219 | — |
+| §2 `PostflopBucketAbstraction` | D-213 / D-214 / D-215 / D-216 / D-218 / D-219 | — |
+| §2 IA-002 betting_state 区分 BB-after-limp vs first-in-non-BB | D-212 / D-215 | — |
 | §2 IA-005 postflop 不依赖 preflop key | D-219 | — |
+| §2 IA-007 reserved 位为零 | D-215 | — |
 | §3 `EquityCalculator` / `MonteCarloEquity` | D-220 / D-220a / D-221 / D-222 / D-223 / D-224 / D-227 | API-005 `RngSource`（继承）；§6 `HandEvaluator`（继承） |
 | §3 EQ-001 反对称容差 | D-220 / D-220a | — |
 | §3 EQ-003 EHS² rollout | D-227 | — |
-| §4 `BucketTable` 文件 layout | D-240 ~ D-249 | D-053（BLAKE3）；D-061 ~ D-066（schema 兼容精神） |
-| §4 `BucketConfig` | D-213 / D-214 | — |
+| §4 `BucketTable` 文件 layout | D-240 ~ D-249（含 D-236b 重编号后的 lookup 写入顺序） | D-053（BLAKE3）；D-061 ~ D-066（schema 兼容精神） |
+| §4 `BucketConfig` + `ConfigError::BucketCountOutOfRange` | D-213 / D-214 | — |
 | §4 `BucketTableError` 5 类 | D-247 | API §8 `RuleError` / `HistoryError` 同型 |
 | §4 BT-007 byte flip 安全 | D-243 / D-247 | API §10 PB-002 from_proto 拒绝路径同型 |
 | §5 `tools/train_bucket_table.rs` | D-237 / D-242 | — |
