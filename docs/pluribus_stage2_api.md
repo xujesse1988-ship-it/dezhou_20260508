@@ -369,20 +369,40 @@ impl BucketConfig {
 ```rust
 /// mmap-backed bucket lookup table（D-240..D-249）。
 ///
-/// 文件 layout（D-244）：
+/// 文件 layout（D-244；80-byte 定长 header + 变长 body + 32-byte trailer，
+/// 全部 little-endian；reader 通过 header §⑨ 偏移表定位变长段，不依赖前段累积 size）：
+///
 /// ```text
-/// magic: [u8; 8] = b"PLBKT\0\0\0"
-/// schema_version: u32 LE = 1
-/// feature_set_id: u32 LE                    (D-240：1 = EHS² + OCHS(N=8))
-/// flop_count / turn_count / river_count: u32 LE × 3
-/// training_seed: u64 LE
-/// centroid_metadata: per-street per-dim (min: f32 LE, max: f32 LE)
-/// centroid_data: per-street per-bucket per-dim u8 quantized (D-241)
-/// lookup_table: per-street (canonical_id → bucket_id)
-///   - preflop 段（D-245）：[u32 LE; 1326]
-///   - flop / turn / river 段：[u32 LE; n_canonical(street)]
-/// trailer: [u8; 32] = BLAKE3(file_body[..len-32])    (D-243)
+/// // ===== header (80 bytes, 8-byte aligned) =====
+/// offset 0x00: magic: [u8; 8] = b"PLBKT\0\0\0"                        // D-240
+/// offset 0x08: schema_version: u32 LE = 1                             // D-240
+/// offset 0x0C: feature_set_id: u32 LE = 1 (EHS² + OCHS(N=8))          // D-240
+/// offset 0x10: bucket_count_flop:  u32 LE                             // D-214
+/// offset 0x14: bucket_count_turn:  u32 LE
+/// offset 0x18: bucket_count_river: u32 LE
+/// offset 0x1C: n_canonical_flop:   u32 LE                             // D-218 / F13
+/// offset 0x20: n_canonical_turn:   u32 LE
+/// offset 0x24: n_canonical_river:  u32 LE
+/// offset 0x28: n_dims:             u8                                 // D-221 (=9)
+/// offset 0x29: pad:                [u8; 7] = 0                        // 8-byte align
+/// offset 0x30: training_seed:      u64 LE                             // D-237
+/// offset 0x38: centroid_metadata_offset: u64 LE                       // F13 (绝对偏移)
+/// offset 0x40: centroid_data_offset:     u64 LE
+/// offset 0x48: lookup_table_offset:      u64 LE
+/// // ===== body (变长，按 header 偏移定位) =====
+/// // centroid_metadata (3 streets × n_dims × (min: f32, max: f32))
+/// // centroid_data     (3 streets × bucket_count(street) × n_dims × u8)  // D-241 / D-236b 重编号顺序
+/// // lookup_table:
+/// //   preflop:  [u32 LE; 1326]                                       // D-239 / D-245
+/// //   flop:     [u32 LE; n_canonical_flop]
+/// //   turn:     [u32 LE; n_canonical_turn]
+/// //   river:    [u32 LE; n_canonical_river]
+/// // ===== trailer (32 bytes) =====
+/// // blake3: [u8; 32] = BLAKE3(file_body[..len-32])                   // D-243
 /// ```
+///
+/// reader 必须按 §⑨ 偏移表定位变长段（不允许 const-bake 段 size 推算），
+/// 任何 offset 越界 / 不递增 / 不 8-byte 对齐均视为 `BucketTableError::Corrupted`。
 pub struct BucketTable { /* opaque：mmap 内部状态、缓存元数据 */ }
 
 impl BucketTable {
@@ -453,7 +473,8 @@ pub enum BucketTableError {
 - BT-004 BLAKE3 trailer eager 校验（D-243）：`open` 必须计算 `BLAKE3(file_body[..len-32])` 并与 `file_body[len-32..len]` 比对；不匹配返回 `BucketTableError::Corrupted { offset: len-32, reason: "blake3 trailer mismatch" }`。
 - BT-005 bucket id 范围：`lookup(street, ...)` 返回 `Some(bucket_id)` 时 `bucket_id < bucket_count(street)`；preflop `bucket_id < 169`。
 - BT-006 deterministic：同 mmap 文件多次 `lookup(...)` 调用结果 byte-equal；`content_hash()` 多次调用结果完全相同。
-- BT-007 byte flip 安全（validation §5）：任意单字节翻转后 `open()` 必须返回 `BucketTableError::*` 而非 panic（除非翻转的是 padding，由 BLAKE3 trailer 检测）。`tests/bucket_table_corruption.rs` 100k 次 byte flip 0 panic。
+- BT-007 byte flip 安全（validation §5）：任意单字节翻转后 `open()` 必须返回 `BucketTableError::*` 而非 panic（除非翻转的是 padding，由 BLAKE3 trailer 检测）。`tests/bucket_table_corruption.rs` 100k 次 byte flip 0 panic。变长段绝对偏移表（D-244 §⑨）让 reader 在 byte-flip 命中 size 字段时也能从偏移读 bound 而非累积 size 推算 → 不会出现 mmap 越界 panic。
+- BT-008 header 偏移表完整性（D-244 §⑨；F13 修复）：`centroid_metadata_offset` / `centroid_data_offset` / `lookup_table_offset` 必须严格递增、每个 ≥ 80（header end）、每个 ≤ `len - 32`（trailer start）、每个 8-byte 对齐；任一违反返回 `BucketTableError::Corrupted { offset: <field offset>, reason: "section offset invariant violated" }`。`bucket_count(street) > 10_000` / `n_canonical(street) > 2^24` / `n_dims != 9 (for feature_set_id=1)` 同样返回 `Corrupted`。
 
 ---
 
@@ -514,7 +535,7 @@ pub use abstraction::equity::{EquityCalculator, MonteCarloEquity};
 pub use abstraction::bucket_table::{BucketConfig, BucketTable, BucketTableError};
 ```
 
-`abstraction::cluster` / `abstraction::feature` / `abstraction::map` 子模块**不**顶层 re-export（D-254 内部子模块隔离）；`abstraction::map` 子模块通过 `PreflopLossless169::map` / `PostflopBucketAbstraction::map` 间接对外，`cluster` 仅由 `tools/train_bucket_table.rs` 引用。
+`abstraction::cluster` / `abstraction::feature` / `abstraction::map` 子模块**不**顶层 re-export（D-254 内部子模块隔离）；`abstraction::map` 子模块通过 `PreflopLossless169::map` / `PostflopBucketAbstraction::map` 间接对外，`cluster` 仅由 `tools/train_bucket_table.rs` 引用。**例外**（D-228 公开 contract）：`abstraction::cluster::rng_substream` 模块顶层暴露 `derive_substream_seed(master_seed, op_id, sub_index) -> u64` 函数 + 全部 `op_id` 命名常量（`OCHS_WARMUP` / `CLUSTER_MAIN_FLOP / TURN / RIVER` / `KMEANS_PP_INIT_*` / `EMPTY_CLUSTER_SPLIT_*` / `EQUITY_MONTE_CARLO` / `EHS2_INNER_EQUITY_*` / `OCHS_FEATURE_INNER`），便于 `tests/clustering_determinism.rs` 等 [测试] 独立构造 sub-stream 验证 byte-equal。该 sub-module 走 `pub use abstraction::cluster::rng_substream;` 从 `abstraction::mod.rs` 暴露，但内部 k-means / EMD / 特征计算实现仍保持模块私有。
 
 ---
 
@@ -625,10 +646,12 @@ A1 [实现] 落以下 doc test 占位（`unimplemented!()` 的代码块仍可通
 | §3 `EquityCalculator` / `MonteCarloEquity` | D-220 / D-220a / D-221 / D-222 / D-223 / D-224 / D-227 | API-005 `RngSource`（继承）；§6 `HandEvaluator`（继承） |
 | §3 EQ-001 反对称容差 | D-220 / D-220a | — |
 | §3 EQ-003 EHS² rollout | D-227 | — |
-| §4 `BucketTable` 文件 layout | D-240 ~ D-249（含 D-236b 重编号后的 lookup 写入顺序） | D-053（BLAKE3）；D-061 ~ D-066（schema 兼容精神） |
+| §6 `abstraction::cluster::rng_substream` 公开 contract（`derive_substream_seed` + op_id 表）| D-228 | D-028（stage 1 deck-dealing 协议同型）/ D-027 / D-050（显式 RngSource） |
+| §4 `BucketTable` 文件 layout（含 80-byte header 偏移表）| D-240 ~ D-249（含 D-236b 重编号后的 lookup 写入顺序）| D-053（BLAKE3）；D-061 ~ D-066（schema 兼容精神） |
 | §4 `BucketConfig` + `ConfigError::BucketCountOutOfRange` | D-213 / D-214 | — |
 | §4 `BucketTableError` 5 类 | D-247 | API §8 `RuleError` / `HistoryError` 同型 |
 | §4 BT-007 byte flip 安全 | D-243 / D-247 | API §10 PB-002 from_proto 拒绝路径同型 |
+| §4 BT-008 header 偏移表完整性 | D-244 §⑨ | — |
 | §5 `tools/train_bucket_table.rs` | D-237 / D-242 | — |
 | §6 `lib.rs` 顶层 re-export | D-253 / D-254 | API §9（继承） |
 | §7 `InfoSetId::from_game_state` / `AbstractAction::to_concrete` | D-272（不修改 stage 1 API） | API §1（`Card` / `ChipAmount`）/ §2（`Action`）/ §4（`GameState`） |
