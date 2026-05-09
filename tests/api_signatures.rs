@@ -15,6 +15,8 @@
 //! - 公开字段类型（结构体定义处由 rustc 校验，且字段广泛被 spec 引用）
 
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
+use std::path::Path;
+use std::sync::Arc;
 
 use poker::*;
 
@@ -23,6 +25,7 @@ fn api_signatures_locked() {
     // 函数体留空：所有断言在编译期完成。本 `#[test]` 仅用于让 `cargo test`
     // 报告一次"通过"。
     _api_signature_assertions();
+    _stage2_api_signature_assertions();
 }
 
 #[allow(dead_code, clippy::type_complexity)]
@@ -102,4 +105,138 @@ fn _api_signature_assertions() {
     let _: for<'a> fn(&'a HandHistory, usize) -> Result<GameState, HistoryError> =
         HandHistory::replay_to;
     let _: for<'a> fn(&'a HandHistory) -> [u8; 32] = HandHistory::content_hash;
+}
+
+// ===========================================================================
+// 阶段 2 trip-wire（API-200..API-302；A1 阶段所有方法体 `unimplemented!()` 返回
+// `!`，与 stage 1 同形态——签名漂移立即在 `cargo test --no-run` 阶段失败。
+//
+// 维护规则同阶段 1：任何对公开 API 签名的合法修改（按
+// `pluribus_stage2_api.md` §9 API-NNN-revM 流程）必须**同步本文件**，否则 PR
+// review 应拒绝合入。
+//
+// 不覆盖：
+// - trait 方法签名（在 trait 定义处由 rustc 校验）
+// - 泛型方法 `InfoSetId::from_game_state<A>`（fn 指针无法表达泛型）
+// - 公开字段类型（结构体定义处由 rustc 校验）
+// ===========================================================================
+
+#[allow(dead_code, clippy::type_complexity)]
+fn _stage2_api_signature_assertions() {
+    // ===================================================================
+    // abstraction::action (api §1)
+    // ===================================================================
+
+    // BetRatio
+    let _: fn(f64) -> Option<BetRatio> = BetRatio::from_f64;
+    let _: fn(BetRatio) -> u32 = BetRatio::as_milli;
+    let _: BetRatio = BetRatio::HALF_POT;
+    let _: BetRatio = BetRatio::FULL_POT;
+
+    // AbstractActionSet
+    let _: for<'a> fn(&'a AbstractActionSet) -> std::slice::Iter<'a, AbstractAction> =
+        AbstractActionSet::iter;
+    let _: for<'a> fn(&'a AbstractActionSet) -> usize = AbstractActionSet::len;
+    let _: for<'a> fn(&'a AbstractActionSet) -> bool = AbstractActionSet::is_empty;
+    let _: for<'a> fn(&'a AbstractActionSet, AbstractAction) -> bool = AbstractActionSet::contains;
+    let _: for<'a> fn(&'a AbstractActionSet) -> &'a [AbstractAction] = AbstractActionSet::as_slice;
+
+    // ActionAbstractionConfig
+    let _: fn() -> ActionAbstractionConfig = ActionAbstractionConfig::default_5_action;
+    let _: fn(Vec<f64>) -> Result<ActionAbstractionConfig, ConfigError> =
+        ActionAbstractionConfig::new;
+    let _: for<'a> fn(&'a ActionAbstractionConfig) -> usize = ActionAbstractionConfig::raise_count;
+
+    // DefaultActionAbstraction
+    let _: fn(ActionAbstractionConfig) -> DefaultActionAbstraction = DefaultActionAbstraction::new;
+    let _: fn() -> DefaultActionAbstraction = DefaultActionAbstraction::default_5_action;
+    // ActionAbstraction trait 方法签名由 trait 定义处校验。
+
+    // §7 桥接：AbstractAction::to_concrete
+    let _: fn(AbstractAction) -> Action = AbstractAction::to_concrete;
+
+    // ===================================================================
+    // abstraction::info (api §2)
+    // ===================================================================
+
+    let _: fn(InfoSetId) -> u64 = InfoSetId::raw;
+    let _: fn(InfoSetId) -> StreetTag = InfoSetId::street_tag;
+    let _: fn(InfoSetId) -> u8 = InfoSetId::position_bucket;
+    let _: fn(InfoSetId) -> u8 = InfoSetId::stack_bucket;
+    let _: fn(InfoSetId) -> BettingState = InfoSetId::betting_state;
+    let _: fn(InfoSetId) -> u32 = InfoSetId::bucket_id;
+    // InfoSetId::from_game_state<A> 是泛型方法，fn 指针无法表达，跳过。
+    // InfoAbstraction::map 是 trait 方法，由 trait 定义处校验。
+
+    // ===================================================================
+    // abstraction::preflop (api §2 + helper)
+    // ===================================================================
+
+    let _: fn([Card; 2]) -> u32 = canonical_hole_id;
+    let _: fn() -> PreflopLossless169 = PreflopLossless169::new;
+    let _: for<'a> fn(&'a PreflopLossless169, [Card; 2]) -> u8 = PreflopLossless169::hand_class;
+    let _: fn(u8) -> u8 = PreflopLossless169::hole_count_in_class;
+
+    // ===================================================================
+    // abstraction::postflop (api §2 + helper)
+    // ===================================================================
+
+    let _: for<'a> fn(StreetTag, &'a [Card], [Card; 2]) -> u32 = canonical_observation_id;
+    let _: fn(BucketTable) -> PostflopBucketAbstraction = PostflopBucketAbstraction::new;
+    let _: for<'a> fn(&'a PostflopBucketAbstraction, &'a GameState, [Card; 2]) -> u32 =
+        PostflopBucketAbstraction::bucket_id;
+    let _: for<'a> fn(&'a PostflopBucketAbstraction) -> BucketConfig =
+        PostflopBucketAbstraction::config;
+
+    // ===================================================================
+    // abstraction::equity (api §3)
+    // ===================================================================
+
+    let _: fn(Arc<dyn HandEvaluator>) -> MonteCarloEquity = MonteCarloEquity::new;
+    let _: fn(MonteCarloEquity, u32) -> MonteCarloEquity = MonteCarloEquity::with_iter;
+    let _: fn(MonteCarloEquity, u8) -> MonteCarloEquity = MonteCarloEquity::with_opp_clusters;
+    let _: for<'a> fn(&'a MonteCarloEquity) -> u32 = MonteCarloEquity::iter;
+    let _: for<'a> fn(&'a MonteCarloEquity) -> u8 = MonteCarloEquity::n_opp_clusters;
+    // EquityCalculator trait 方法（4 条）由 trait 定义处校验。
+
+    // ===================================================================
+    // abstraction::bucket_table (api §4)
+    // ===================================================================
+
+    let _: fn() -> BucketConfig = BucketConfig::default_500_500_500;
+    let _: fn(u32, u32, u32) -> Result<BucketConfig, ConfigError> = BucketConfig::new;
+
+    let _: for<'a> fn(&'a Path) -> Result<BucketTable, BucketTableError> = BucketTable::open;
+    let _: for<'a> fn(&'a BucketTable, StreetTag, u32) -> Option<u32> = BucketTable::lookup;
+    let _: for<'a> fn(&'a BucketTable) -> u32 = BucketTable::schema_version;
+    let _: for<'a> fn(&'a BucketTable) -> u32 = BucketTable::feature_set_id;
+    let _: for<'a> fn(&'a BucketTable) -> BucketConfig = BucketTable::config;
+    let _: for<'a> fn(&'a BucketTable) -> u64 = BucketTable::training_seed;
+    let _: for<'a> fn(&'a BucketTable, StreetTag) -> u32 = BucketTable::bucket_count;
+    let _: for<'a> fn(&'a BucketTable, StreetTag) -> u32 = BucketTable::n_canonical_observation;
+    let _: for<'a> fn(&'a BucketTable) -> [u8; 32] = BucketTable::content_hash;
+
+    // ===================================================================
+    // abstraction::cluster::rng_substream (D-228 公开 contract)
+    // ===================================================================
+
+    let _: fn(u64, u32, u32) -> u64 = rng_substream::derive_substream_seed;
+    // op_id 常量（15 个）：lib.rs 顶层 `pub use abstraction::cluster::rng_substream;`
+    // 暴露后通过 `rng_substream::*` 访问。任何常量重命名 / 数值漂移立即在
+    // `cargo test --no-run` 失败。
+    let _: u32 = rng_substream::OCHS_WARMUP;
+    let _: u32 = rng_substream::CLUSTER_MAIN_FLOP;
+    let _: u32 = rng_substream::CLUSTER_MAIN_TURN;
+    let _: u32 = rng_substream::CLUSTER_MAIN_RIVER;
+    let _: u32 = rng_substream::KMEANS_PP_INIT_FLOP;
+    let _: u32 = rng_substream::KMEANS_PP_INIT_TURN;
+    let _: u32 = rng_substream::KMEANS_PP_INIT_RIVER;
+    let _: u32 = rng_substream::EMPTY_CLUSTER_SPLIT_FLOP;
+    let _: u32 = rng_substream::EMPTY_CLUSTER_SPLIT_TURN;
+    let _: u32 = rng_substream::EMPTY_CLUSTER_SPLIT_RIVER;
+    let _: u32 = rng_substream::EQUITY_MONTE_CARLO;
+    let _: u32 = rng_substream::EHS2_INNER_EQUITY_FLOP;
+    let _: u32 = rng_substream::EHS2_INNER_EQUITY_TURN;
+    let _: u32 = rng_substream::EHS2_INNER_EQUITY_RIVER;
+    let _: u32 = rng_substream::OCHS_FEATURE_INNER;
 }

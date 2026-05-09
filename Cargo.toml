@@ -15,6 +15,8 @@ rand_chacha = "0.3"
 thiserror = "1.0"
 prost = "0.13"
 blake3 = "1.5"
+# 阶段 2 D-255：mmap 加载 bucket table（C2 落地真实加载路径，A1 仅声明依赖）。
+memmap2 = "0.9"
 
 # B1 测试 / harness 专用依赖。仅 tests/ 与 benches/ 引用，不进入产品二进制。
 [dev-dependencies]
