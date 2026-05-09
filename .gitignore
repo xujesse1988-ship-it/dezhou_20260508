@@ -1,3 +1,6 @@
 /target
 # C2 cross-validation 用的 uv venv（PokerKit 0.4.14 + Python 3.11），不进 git
 /.venv-pokerkit
+# Stage 2 D-248 / D-251：bucket table mmap artifact 严格不进 git history，
+# 由 tools/train_bucket_table.rs 按需创建本目录；分发走 GitHub release / git LFS。
+/artifacts

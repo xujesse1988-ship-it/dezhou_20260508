@@ -115,9 +115,19 @@ fn _api_signature_assertions() {
 // `pluribus_stage2_api.md` §9 API-NNN-revM 流程）必须**同步本文件**，否则 PR
 // review 应拒绝合入。
 //
+// trait 方法签名锁定（batch 8 review 收紧）：阶段 1 的「trait 方法由 trait 定义
+// 处由 rustc 校验」措辞**不充分**——rustc 只校验 impl ↔ trait 一致性，不校验
+// trait ↔ API 文档；若 API spec / trait / impl 三者一起漂移（典型反模式：
+// `EquityCalculator::equity` 从 `Result<f64, EquityError>` 改回 `f64` 同时改
+// trait 与 impl），现有 trip-wire 会静默通过。本文件用 UFCS fn-pointer 绑定
+// `<具体 impl as Trait>::method` 的方式把替换后的签名钉在调用点，trait 方法
+// 任一漂移立即在 `cargo test --no-run` 失败。覆盖 `ActionAbstraction` (3 方法
+// × `DefaultActionAbstraction`) + `InfoAbstraction` (`map` × `PreflopLossless169`
+// + `PostflopBucketAbstraction`) + `EquityCalculator` (4 方法 ×
+// `MonteCarloEquity`) 共 9 条 trait 方法 + `InfoSetId::from_game_state` 用
+// `PreflopLossless169` 实例化锁住泛型。
+//
 // 不覆盖：
-// - trait 方法签名（在 trait 定义处由 rustc 校验）
-// - 泛型方法 `InfoSetId::from_game_state<A>`（fn 指针无法表达泛型）
 // - 公开字段类型（结构体定义处由 rustc 校验）
 // ===========================================================================
 
@@ -150,7 +160,19 @@ fn _stage2_api_signature_assertions() {
     // DefaultActionAbstraction
     let _: fn(ActionAbstractionConfig) -> DefaultActionAbstraction = DefaultActionAbstraction::new;
     let _: fn() -> DefaultActionAbstraction = DefaultActionAbstraction::default_5_action;
-    // ActionAbstraction trait 方法签名由 trait 定义处校验。
+
+    // ActionAbstraction trait 方法 UFCS 绑到具体 impl，锁住 trait + impl 联合签名
+    // （rustc 仅校验 impl ↔ trait 一致性，不校验 trait ↔ API 文档；UFCS 把替换后的
+    // 具体签名钉在调用点，trait 方法漂移立即在 cargo test --no-run 失败）。
+    let _: for<'a, 'b> fn(&'a DefaultActionAbstraction, &'b GameState) -> AbstractActionSet =
+        <DefaultActionAbstraction as ActionAbstraction>::abstract_actions;
+    let _: for<'a, 'b> fn(
+        &'a DefaultActionAbstraction,
+        &'b GameState,
+        ChipAmount,
+    ) -> AbstractAction = <DefaultActionAbstraction as ActionAbstraction>::map_off_tree;
+    let _: for<'a> fn(&'a DefaultActionAbstraction) -> &'a ActionAbstractionConfig =
+        <DefaultActionAbstraction as ActionAbstraction>::config;
 
     // §7 桥接：AbstractAction::to_concrete
     let _: fn(AbstractAction) -> Action = AbstractAction::to_concrete;
@@ -165,8 +187,18 @@ fn _stage2_api_signature_assertions() {
     let _: fn(InfoSetId) -> u8 = InfoSetId::stack_bucket;
     let _: fn(InfoSetId) -> BettingState = InfoSetId::betting_state;
     let _: fn(InfoSetId) -> u32 = InfoSetId::bucket_id;
-    // InfoSetId::from_game_state<A> 是泛型方法，fn 指针无法表达，跳过。
-    // InfoAbstraction::map 是 trait 方法，由 trait 定义处校验。
+
+    // InfoSetId::from_game_state<A> 用 PreflopLossless169 实例化锁住泛型签名
+    // （泛型本身无法直接绑 fn-pointer，但具体实例化后类型固定）。
+    let _: for<'a> fn(&'a GameState, [Card; 2], &'a PreflopLossless169) -> InfoSetId =
+        InfoSetId::from_game_state::<PreflopLossless169>;
+
+    // InfoAbstraction::map UFCS 绑到 preflop / postflop 两个 impl，锁住 trait + impl
+    // 联合签名（同 ActionAbstraction 段落理由）。
+    let _: for<'a, 'b> fn(&'a PreflopLossless169, &'b GameState, [Card; 2]) -> InfoSetId =
+        <PreflopLossless169 as InfoAbstraction>::map;
+    let _: for<'a, 'b> fn(&'a PostflopBucketAbstraction, &'b GameState, [Card; 2]) -> InfoSetId =
+        <PostflopBucketAbstraction as InfoAbstraction>::map;
 
     // ===================================================================
     // abstraction::preflop (api §2 + helper)
@@ -197,7 +229,35 @@ fn _stage2_api_signature_assertions() {
     let _: fn(MonteCarloEquity, u8) -> MonteCarloEquity = MonteCarloEquity::with_opp_clusters;
     let _: for<'a> fn(&'a MonteCarloEquity) -> u32 = MonteCarloEquity::iter;
     let _: for<'a> fn(&'a MonteCarloEquity) -> u8 = MonteCarloEquity::n_opp_clusters;
-    // EquityCalculator trait 方法（4 条）由 trait 定义处校验。
+
+    // EquityCalculator trait 全 4 方法 UFCS 绑到 MonteCarloEquity，锁住 trait + impl
+    // 联合签名（同 ActionAbstraction 段落理由）。`&mut dyn RngSource` 高阶生命周期：
+    // self / board / rng 三条独立 borrow，统一以 for<'a, 'b, 'c> 显式表达。
+    let _: for<'a, 'b, 'c> fn(
+        &'a MonteCarloEquity,
+        [Card; 2],
+        &'b [Card],
+        &'c mut dyn RngSource,
+    ) -> Result<f64, EquityError> = <MonteCarloEquity as EquityCalculator>::equity;
+    let _: for<'a, 'b, 'c> fn(
+        &'a MonteCarloEquity,
+        [Card; 2],
+        [Card; 2],
+        &'b [Card],
+        &'c mut dyn RngSource,
+    ) -> Result<f64, EquityError> = <MonteCarloEquity as EquityCalculator>::equity_vs_hand;
+    let _: for<'a, 'b, 'c> fn(
+        &'a MonteCarloEquity,
+        [Card; 2],
+        &'b [Card],
+        &'c mut dyn RngSource,
+    ) -> Result<f64, EquityError> = <MonteCarloEquity as EquityCalculator>::ehs_squared;
+    let _: for<'a, 'b, 'c> fn(
+        &'a MonteCarloEquity,
+        [Card; 2],
+        &'b [Card],
+        &'c mut dyn RngSource,
+    ) -> Result<Vec<f64>, EquityError> = <MonteCarloEquity as EquityCalculator>::ochs;
 
     // ===================================================================
     // abstraction::bucket_table (api §4)
