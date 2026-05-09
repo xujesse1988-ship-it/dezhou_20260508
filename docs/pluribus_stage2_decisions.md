@@ -275,6 +275,186 @@ A0 角色边界审计：仅修 `docs/` 下 4 份新文档（`pluribus_stage2_dec
 
 下一步：B1 [测试]（`tests/api_signatures.rs` 阶段 2 trait 签名编译断言起步 + `tests/preflop_169.rs` 1326 → 169 完整覆盖 + `tests/equity_self_consistency.rs` 反对称 harness + `tests/scenarios.rs` 阶段 2 版 10–15 个 driving 场景 + `tests/clustering_determinism.rs` / `tests/bucket_quality.rs` harness 骨架）。前置 A1 [实现]（API 骨架代码化 + `unimplemented!()` 占位 + `Cargo.toml` 追加 dev-dep + `abstraction::map` 子模块 `clippy::float_arithmetic` inner attribute）由 A0 → B1 之间 [实现] agent 落地。
 
+#### A0 review 修正 batch 6（2026-05-09，A1 起步前）
+
+A0 关闭后另一轮 review 暴露 9 处独立 spec drift（编号 F19..F27），按 §11 修订流程追加 rev 条目，原条目保留。本 batch 与 stage-2 §A-rev0（workflow 修订历史首条）同 commit 落地，目的：避免 A1 [实现] / B1 [测试] 起步后再回头修订契约。
+
+| 编号 | 严重度 | 修正主题 | 修订条目 |
+|---|---|---|---|
+| F19 | P0 | postflop bucket lookup table 索引空间不足以表达 (board, hole) 联合映射 | D-216-rev1 + D-218-rev1 + D-244-rev1（API 同步：BT-005-rev1 / lookup 签名） |
+| F20 | P0 | `Call` 与 `AllIn` 相同 `to` 时的去重优先级缺失 | D-206-rev1（API 同步：AA-004-rev1） |
+| F21 | P1 | postflop `stack_bucket` 沿用 preflop 起手值的来源不可重建 | D-211-rev1（API 同步：InfoAbstraction trait 新增 hand-start snapshot 来源约束） |
+| F22 | P1 | terminal `InfoSetId` 行为无法由 `(GameState, hole)` 重建 | API IA-006-rev1（决策侧仅备注，不新建 D-NNN-revM） |
+| F23 | P1 | `equity_vs_hand` 重叠返回 NaN 与 D-224 finite invariant 冲突 | D-224-rev1（API 同步：EquityCalculator-rev1 / EQ-002-rev1） |
+| F24 | P2 | AA-003 漏写 `min_to` 与 stack 同时触发优先级 | API AA-003-rev1（决策侧 D-205 原文已含优先级，API 同步收紧） |
+| F25 | P2 | preflop pairwise equity 反对称 RNG 契约可执行性不足 | D-220a-rev1（API 同步：EQ-001-rev1） |
+| F26 | P2 | D-253 顶层 re-export 列表与 API §6 不一致 | D-253-rev1 |
+| F27 | P2 | `BetRatio` 量化规则（rounding / 越界 / duplicate）未锁定 | D-202-rev1（API 同步：BetRatio::from_f64 -rev1） |
+
+##### D-216-rev1（2026-05-09，F19）
+
+**背景**：D-216 原文规定 `bucket_id = BucketTable::lookup(street_tag, board_canonical_id, hole_canonical_id)`，但 D-244 原文 lookup_table postflop 段长度仅为 `n_canonical_<street>`（单维 board canonical 数量），无法在同一 board canonical 下区分多个 hole canonical，结构性表达不出 (board, hole) → bucket 映射。
+
+**新规则**：postflop bucket lookup 改用**联合 canonical observation id**：
+
+```text
+canonical_observation_id(street, board, hole) -> u32
+```
+
+返回 (board, hole) 对在花色对称 + rank 多重集等价类下的唯一 id ∈ `[0, n_canonical_observation(street))`。该函数公开导出（`abstraction::postflop::canonical_observation_id`），作为 `BucketTable::lookup` 的输入计算来源。`board_canonical_id` 与 `hole_canonical_id` 单维 canonical 仍由 D-218-rev1 保留作为子函数（`canonical_board_id` / `canonical_hole_id` on board），但**不再单独驱动** lookup 索引。
+
+`canonical_observation_id` 落地约束（与 D-218-rev1 共生）：① 同一 (board, hole) 在 [实现] 重复调用 byte-equal；② 花色重命名 / 同 rank 内花色置换不改变 id；③ id 紧凑分布（无空洞）；④ id 上限：flop ≤ ~1.3M、turn ≤ ~14M、river ≤ ~123M（保守上界，使用 `(board, hole)` 联合等价类计数，由 [实现] A1 给出实际数）。
+
+**影响**：① D-218 保留单维 canonical 子函数（hole-only / board-only），追加联合 canonical observation id 函数；② D-244 header 字段 `n_canonical_<street>` 语义改为 `n_canonical_observation_<street>`（lookup_table 长度跟随）；③ API §4 `BucketTable::lookup` 签名由 `(street, board_id, hole_id)` 改为 `(street, observation_id)`，与 D-216-rev1 同步——见 API §9 `BT-005-rev1` / lookup 签名修订；④ 不影响 preflop 路径——preflop 仍以 hole canonical id（0..1326）单维索引，D-239 / D-245 不变；⑤ `bucket_table.schema_version` 在本 rev 之内**不 bump**（A0 第一版 spec 锁定前的语义澄清，no on-disk file 已写出），但若 stage 2 commit 后再走该 rev，必须 bump。
+
+**与 D-219 的关系**：postflop bucket 仍仅依赖 (street, board, hole)，不嵌入 position / stack / betting_state；D-216-rev1 只改变 lookup 索引方式，**不改变** D-219 隔离原则。
+
+##### D-218-rev1（2026-05-09，F19）
+
+**背景**：D-218 原文只定义 hole canonical id 与 board canonical id 两个单维概念，未明确 postflop bucket lookup 所需的 (board, hole) 联合 canonical id。
+
+**新规则**：D-218 在原文基础上扩展为三层 canonical id：
+
+| 层级 | 函数 | 返回类型 | 用途 |
+|---|---|---|---|
+| L1 单维 hole | `canonical_hole_id(hole) -> u32` | 0..1326 | preflop lookup 唯一索引；postflop 联合 canonical 的 hole 子分量 |
+| L1 单维 board | `canonical_board_id(street, board) -> u32` | 见下 | 内部缓存 / 可观测调试入口（不直接驱动 lookup） |
+| L2 联合 observation | `canonical_observation_id(street, board, hole) -> u32` | 0..n_canonical_observation(street) | **postflop lookup 唯一索引**（替代 D-218 原 (board_id, hole_id) 二维方案） |
+
+L1 单维 board canonical id 上界（D-218 原文 "5-card board canonical 上限 ~134k；7-card 上限 ~1.5M" 保留作为单维参考；联合 observation 的实际枚举数由 [实现] A1 落地枚举确认并写入 `n_canonical_observation_<street>`）。
+
+**影响**：① 公开 API 新增 `canonical_observation_id`；② `BucketTable::lookup` 入参由二维变单维（API §4 同步 BT-005-rev1）；③ `tests/canonical_observation.rs` 由 B1 [测试] 起草，枚举验证花色对称等价类完整性 + 1k 随机 (board, hole) 重复调用 byte-equal；④ `tools/bucket_table_reader.py` Python reader 同步更新（D-249）。
+
+##### D-244-rev1（2026-05-09，F19）
+
+**背景**：D-244 原文 header 字段 `n_canonical_flop / turn / river` 为单维 board canonical 数量，与 D-216-rev1 联合 observation id 索引不匹配；lookup_table postflop 段长度对应不上 (board, hole) 联合空间。
+
+**新规则**：
+
+1. **header 字段语义**（offset 不变，保持 80-byte header 布局兼容）：原 `n_canonical_flop / turn / river`（offset 0x1C / 0x20 / 0x24）三字段语义改为 **`n_canonical_observation_flop / turn / river`**——每条 postflop 街联合 (board, hole) canonical observation id 总数。
+2. **lookup_table 段长度**：postflop 三街分别为 `[u32; n_canonical_observation_<street>]`；`lookup_table_<street>[observation_canonical_id] = bucket_id`。
+3. **bound check**：BT-008 header 偏移表完整性约束扩展——`n_canonical_observation_<street>` 上限由 D-218-rev1 联合等价类枚举上界给出（保守值：flop ≤ 2_000_000、turn ≤ 20_000_000、river ≤ 200_000_000；`> 这些上界` 视为 `Corrupted`，A1 实测后可收紧）；header 字段被解读为 `n_canonical_observation` 后必须 ≥ 1。
+4. **schema_version 处理**：本 rev 不 bump `schema_version`（v1 文件尚未生成，A0 锁定阶段语义澄清）；若本 rev 在已写出 v1 bucket table artifact 后落地，必须 bump 到 v2。
+5. **F13 偏移表完整性**：BT-008 仍按 §⑨ 偏移表强制；`size = lookup_table_offset + 4 × (1326 + n_canonical_observation_flop + n_canonical_observation_turn + n_canonical_observation_river) + 32`（`+32` 为 BLAKE3 trailer），任何字段越界返回 `BucketTableError::Corrupted`。
+
+**影响**：① `tools/bucket_table_reader.py` 更新字段名 / 长度推导；② D-247 错误路径 `Corrupted { offset, reason }` 增加 "n_canonical_observation_<street> out of range" / "lookup_table size mismatch" 两类原因（仍 5 类不变体，仅 reason 字符串扩展）；③ centroid_metadata / centroid_data 段不受影响（postflop bucket 数 `bucket_count_<street>` 不变）。
+
+##### D-206-rev1（2026-05-09，F20）
+
+**背景**：D-206 原文仅约束 `Bet/Raise(0.5×pot)` / `Bet/Raise(1.0×pot)` 之间的折叠 + 与 `AllIn` 折叠时的 tag 选择，**未约束** `Call { to }` 与 `AllIn { to }` 在相同 `to` 值（典型场景：玩家面对下注，剩余 stack 恰等于跟注金额——`call = stack`）下的去重。AA-004 又要求所有带 `to` 的 `AbstractAction` 实例 `to` 字段互不相等，导致语义冲突——是保留 `Call`、保留 `AllIn`，还是两者都保留？
+
+**新规则**：扩展 D-206 折叠优先级规则到完整链：
+
+1. **基线候选生成**（before 折叠）：按 D-200 详解表生成所有候选 `AbstractAction` 实例，每个实例的 `to` 字段按 D-205 fallback 计算后填入。
+2. **折叠优先级**（first-match-wins，从高到低）：
+   - **`AllIn` 优先级最高**：若任何带 `to` 的候选（`Call` / `Bet` / `Raise`）的 `to` 等于 `committed_this_round + stack`（即等价于把剩余筹码全推到当前下注轮，与 stage 1 `Action::AllIn` 状态机归一化后等价），**整组合并为 `AllIn { to }`**。tag 始终落到 `AllIn`。**例外**：AA-002 已剔除 `Fold` 的 free-check 局面下若 `Check` 是仍然合法的非 `to` 动作，`Check` 不参与折叠（不带 `to`，不与 `AllIn` 冲突）。
+   - **`Call` 与 `Bet/Raise(x×pot)` 折叠**：理论上不可能——`Call` 的 `to` 等于 `max_committed_this_round`，`Bet/Raise` 的 `to` 不能小于 `min_to ≥ max_committed_this_round + last_full_raise_size`（D-034 / D-035），二者 `to` 严格不等；如果 [实现] 因 D-205 fallback 把 `Bet/Raise` 折叠到 stack 上限，已被上一条 `AllIn` 优先级吸收。
+   - **`Bet/Raise(0.5×pot)` 与 `Bet/Raise(1.0×pot)` 之间折叠**：保留 ratio_label 较小的一份（沿用 D-206 原规则）。
+3. **去重不变量**：经上述优先级处理后，最终 `AbstractActionSet` 内任意两个带 `to` 的动作 `to` 字段互不相等（AA-004 不变量满足）。
+
+**等价口语化**：当 `Call { to = X }` 与 `AllIn { to = X }` 同时候选时（all-in call），保留 **`AllIn { to = X }`**——因为 stage 1 `Action::Call` 在剩余 stack 等于 call 金额时实际触发 all-in 状态转移，`AllIn` 的 betting_state 状态转移（D-206 原文最后一段）与 `Call` 等价但 InfoSet 编码标签更精确（避免 "字面 Call 实际 all-in" 的混淆）。
+
+**影响**：① API §1 AA-004 不变量同步收紧——`AbstractAction { Call, Bet, Raise, AllIn }` 任意两个实例 `to` 字段不等；② AA-001 D-209 输出顺序中 `Call` 槽位若被 `AllIn` 优先级吸收则**消失**（不出现），输出顺序保持 `[Fold?, Check?, Call?, Bet/Raise(0.5×)?, Bet/Raise(1.0×)?, AllIn?]` 中 `?` 跳过的语义不变；③ `tests/scenarios_extended.rs` 阶段 2 版必须含至少 2 条 all-in call 场景（短码 BTN call 大 raise / 短码 BB call 3-bet）断言 `Call` 不出现而 `AllIn` 出现。
+
+##### D-211-rev1（2026-05-09，F21）
+
+**背景**：D-211 原文规定 "preflop 起手时计算 stack_bucket，postflop 沿用"，但 `InfoAbstraction::map(state, hole)` 只接收当前 `&GameState + hole`，没有保存 "起手 effective_stack bucket" 的入口；postflop 街调用时只能从当前 stack 重新计算（违反 "沿用" 字面）或从 history 第一条状态反推（无 history 入参），来源不可重建。
+
+**新规则**：钉住 stack_bucket 的来源 = **`TableConfig::initial_stack(seat) / big_blind`**（与 stage 1 D-022 / D-022b 默认 100 BB 配套；stage 2 默认 6-max 100 BB 配置 → 全部 actor `stack_bucket = 3`，对应 `[100, 200) BB`）。
+
+具体推导：
+
+1. `effective_stack_at_hand_start(actor) = min(initial_stack(actor), max(initial_stack(opp) for opp in 同手所有对手))`（hand-start snapshot 视角，所有 seat 都还没行动 / 折叠）；
+2. `stack_bucket = bucket_of_bb(effective_stack_at_hand_start(actor) / big_blind)`，按 D-211 5 桶边界向下取整。
+
+**入口要求**（API 同步约束）：`InfoAbstraction::map` 实现必须从 `GameState` 暴露的 `TableConfig` 引用（`state.config()` 返回 `&TableConfig`）+ `state.actor_seat()` 计算 `effective_stack_at_hand_start`，**不允许**从当前 `state.player(seat).stack` 推算（partial call / all-in 后当前 stack 不再是 hand-start 值）。如 stage 1 `GameState` 当前未暴露 `config()` 公开 getter，必须走 stage 1 `API-NNN-revM` 流程在 `pluribus_stage1_api.md` 增加只读 getter（继承 D-271 约束）；本 rev 假设 stage 1 GameState `config()` getter 可访问（见 API IA-stack-bucket-revM 同步）。
+
+**约束范围**：本 rev 仅适用于 stage 2 验收路径（fixed initial stack 100 BB）。stage 4+ 引入 cash-game-style 中途变 stack 时，需走 D-211-rev2 引入显式 hand-start snapshot 字段；stage 2 不预留该入口（避免过度抽象）。
+
+**影响**：① `InfoAbstraction::map` 实现路径必须经 `state.config()`；② 同手内 preflop / flop / turn / river / showdown 调用 `map(state, hole)` 在 (固定 stack 假设) 下 `stack_bucket` 字段 byte-equal；③ B1 [测试] `tests/info_id_encoding.rs` 在 100 BB / 200 BB / 50 BB 三种 TableConfig 下断言 stack_bucket 落入正确桶（3 / 4 / 2）。
+
+##### D-220a-rev1（2026-05-09，F25）
+
+**背景**：D-220a 原文规定 preflop pairwise equity 反对称在 "同 RngSource state（fresh sub-stream from D-228 same op_id + sub_index）下 `|sum - 1| ≤ 1e-9`"，但 `EquityCalculator::equity_vs_hand` 签名只接 `&mut dyn RngSource`——若 [测试] 顺序复用同一个 `&mut rng` 调用两次，第一次会推进 rng 状态，第二次采到不同 future board 集合，严格反对称不成立。
+
+**新规则**：preflop pairwise equity 反对称的 RNG 契约钉为 **"两个独立 `RngSource`，各自从同一 `derive_substream_seed(master_seed, EQUITY_MONTE_CARLO, sub_index)` 构造"**：
+
+```rust
+// B1 [测试] tests/equity_self_consistency.rs 的标准模式：
+let master_seed: u64 = 0xA0B1C2D3_E4F50617;
+let sub_index: u32 = 0;  // 任意固定值
+let sub_seed = derive_substream_seed(master_seed, EQUITY_MONTE_CARLO, sub_index);
+
+let mut rng_ab = ChaCha20Rng::from_seed(sub_seed.to_le_bytes_or_seed_array());
+let mut rng_ba = ChaCha20Rng::from_seed(sub_seed.to_le_bytes_or_seed_array());
+
+let eq_ab = calc.equity_vs_hand(A, B, &[], &mut rng_ab);
+let eq_ba = calc.equity_vs_hand(B, A, &[], &mut rng_ba);
+
+assert!((eq_ab + eq_ba - 1.0).abs() <= 1e-9);  // 严格容差路径
+```
+
+**容差分流**（替代 D-220a 原 "fresh sub-stream" 单句表述）：
+
+| 路径 | RNG 配置 | 容差 |
+|---|---|---|
+| postflop（board.len() ≥ 3） | 不消耗 RNG（确定性枚举） | `\|sum - 1\| ≤ 1e-9` |
+| preflop strict | 两个独立 RngSource，从同一 sub_seed 构造（如上 pseudo code） | `\|sum - 1\| ≤ 1e-9` |
+| preflop noisy（10k iter） | 两个独立 RngSource，从不同 sub_seed 构造 | `\|sum - 1\| ≤ 0.005`（标准误差 ≈ `sqrt(0.25 / 10000)`） |
+| preflop noisy（1k iter） | 两个独立 RngSource，从不同 sub_seed 构造 | `\|sum - 1\| ≤ 0.02` |
+
+**禁止模式**：顺序复用同一 `&mut rng` 调用两次后做严格反对称断言——明确写入 EQ-001-rev1（API 同步）作为反例。`tests/equity_self_consistency.rs` 必须按上述 pseudo code 模式构造 RngSource。
+
+**影响**：① B1 [测试] 反对称 harness 不再有 "fresh sub-stream" 歧义解读空间；② `derive_substream_seed` 输出 `u64` → `[u8; 32]` ChaCha20 seed 的转换路径由 [实现] 在 A1 落地（典型：`u64 → [u8; 8] → 重复 4 次填充 [u8; 32]`，或 SplitMix64 派生 4 次填充；具体 byte 路径在 D-228 op_id 表的 doc comment 里固化）；③ EQ-001 不变量在 API §3 同步 EQ-001-rev1 收紧。
+
+##### D-224-rev1（2026-05-09，F23）
+
+**背景**：D-224 / EQ-002 规定 "任何 NaN / Inf 视为 P0 阻塞 bug"；API §3 `equity_vs_hand` 注释又规定 "`opp_hole` 与 `hole ∪ board` 重叠时返回 NaN"。两条规则同时生效会让 [测试] 无法判断 NaN 是合法错误返回还是 invariant violation。
+
+**新规则**：D-224 finite invariant 收紧到 **"合法、无重叠输入"** 路径，并把 invalid input 的错误返回从 NaN 改为 `Result<f64, EquityError>`：
+
+1. `equity_vs_hand` / `equity` / `ehs_squared` / `ochs` 全部接口签名由返回 `f64` 改为 `Result<f64, EquityError>`（OCHS 改为 `Result<Vec<f64>, EquityError>`），与 stage 1 `RuleError` / `HistoryError` 同型。
+2. `EquityError` 5 类（继承 stage 1 错误同型设计）：
+   - `OverlapHole { card }` — `opp_hole` 与 `hole` 重叠
+   - `OverlapBoard { card }` — `hole` 或 `opp_hole` 与 `board` 重叠
+   - `InvalidBoardLen { got }` — `board.len() ∉ {0, 3, 4, 5}`
+   - `IterTooLow { got, min: 1 }` — Monte Carlo `iter == 0`（默认 10k 不触发，stage 4 消融可触发）
+   - `Internal(String)` — 评估器内部错误透传（继承 stage 1 `HandEvaluator` 错误，可能性极低）
+3. **invariant 收紧**：D-224 / EQ-002 改为——返回 `Ok(x)` 时 `x ∈ [0.0, 1.0]` 且 finite；任何 NaN / Inf 出现在 `Ok` 路径是 P0 阻塞 bug。`Err(EquityError)` 路径不进入 feature / bucket 写入，由 caller 在 clustering 训练前过滤（`MonteCarloEquity::ochs(...)?` 用 `?` 操作符传播错误终止 cluster 数据点）。
+
+**影响**：① API §3 `EquityCalculator` trait 4 个方法签名全部加 `Result` 包装（API §9 EquityCalculator-rev1 同步）；② `tests/equity_self_consistency.rs` 反对称断言路径用 `unwrap()` 解包合法输入；③ fuzz 测试 invariant 用 `match result { Ok(x) => assert!(x.is_finite()), Err(_) => {} }` 模式；④ 不影响 stage 1 类型 / API（错误类型新增，不复用 stage 1 错误体系）；⑤ `feature_set_id` 不 bump（错误返回仅影响接口层，不影响 bucket table 二进制布局）。
+
+##### D-202-rev1（2026-05-09，F27）
+
+**背景**：D-202 / `BetRatio::from_f64` 仅约束 `raise_pot_ratios` 元素 ∈ (0.0, +∞)，但 `BetRatio` 内部 `u32 = ratio × 1000` 量化对 < 0.001 的小数 / > `u32::MAX / 1000 ≈ 4.29M` 的大数 / 多输入映射到同一 milli 值的去重 / rounding 模式（round / floor / ceil）全部未定义。stage 2 默认 5-action 不触发，但 stage 4 消融配置加载非默认 ratio 会让 [实现] 与 [测试] 各自做 ad-hoc 选择。
+
+**新规则**：
+
+1. **rounding mode**：`from_f64(ratio)` 走 **bankers-rounding（half-to-even）** 量化到 `(ratio * 1000.0).round_ties_even() as i64`，再校验范围。理由：half-to-even 让 0.5 / 1.5 / 2.5 等 "整数 + 半" 输入分布对称舍入，避免单向偏差累积；`f64 → i64 → u32` 的中间 `i64` 检测越界。
+2. **合法范围**：`from_f64` 接受 `ratio ∈ [0.001, 4_294_967.295]`（含端点），即量化后 `u32 ∈ [1, u32::MAX]`；越界（`< 0.001` / `> 4_294_967.295` / NaN / Inf / 负数 / 0.0）返回 `None`。
+3. **重复 milli 去重**：`ActionAbstractionConfig::new(raise_pot_ratios: Vec<f64>)` 内部 `Vec<f64> → Vec<BetRatio>` 转换中，若任意两元素量化后 milli 值相同，**返回 `Err(ConfigError::DuplicateRatio { milli })`**——caller 责任去重。理由：量化导致的隐式去重会让 `raise_pot_ratios.len()` 与 `raise_count()` 不一致，破坏 D-209 输出顺序契约。
+4. **误差量级**：half-to-even rounding 引入 ≤ 0.5 milli = 0.0005 ratio 误差；与 D-205 fallback "向上取整到 chip" 的整数级误差相比可忽略；与 D-220 Monte Carlo standard error 0.005 相比远低（量化误差不进入 equity / clustering 路径，仅影响 betting_state 转移点的 to 值取整边界，由 D-205 ② all-in 折叠路径自然吸收）。
+
+**影响**：① API §1 `BetRatio::from_f64` 文字注释收紧（API 同步 BetRatio::from_f64-rev1）；② `ConfigError` 增加 `DuplicateRatio { milli: u32 }` 变体；③ `tests/action_abstraction.rs` 阶段 2 版必须断言 `BetRatio::from_f64(0.5005)` 量化到 `BetRatio::HALF_POT.as_milli() == 500` 且 `from_f64(0.5004)` 也量化到 500（half-to-even），与 `from_f64(0.5)` 严格相等；④ default 5-action 配置 `[BetRatio::HALF_POT, BetRatio::FULL_POT]` (= [500, 1000]) 不触发任何边界路径。
+
+##### D-253-rev1（2026-05-09，F26）
+
+**背景**：D-253 顶层 re-export 列表与 API §6 实际 re-export 不一致——D-253 漏写 `BetRatio` / `ConfigError` / `BettingState` / `StreetTag` 四个类型，但这四个类型出现在公开签名（`BetRatio` 在 `ActionAbstractionConfig`、`ConfigError` 在 `new` 返回、`BettingState` / `StreetTag` 在 `InfoSetId` getter 与 `BucketTable::lookup`）中。caller / [测试] 必须能通过 `use poker::*` 直接使用这四个类型。
+
+**新规则**：D-253 re-export 列表补齐为：
+
+```text
+ActionAbstraction / DefaultActionAbstraction / AbstractAction / AbstractActionSet /
+ActionAbstractionConfig / BetRatio (★新增) / ConfigError (★新增) /
+InfoAbstraction / InfoSetId / BettingState (★新增) / StreetTag (★新增) /
+PreflopLossless169 / PostflopBucketAbstraction / EquityCalculator / EquityError (★新增 D-224-rev1 配套) /
+MonteCarloEquity / BucketTable / BucketConfig / BucketTableError
+```
+
+与 API §6 一致；本 rev **以 API §6 为准**，D-253 文字同步。
+
+**影响**：① 公开 API surface 多 5 个 re-export（`BetRatio` / `ConfigError` / `BettingState` / `StreetTag` / `EquityError`）；② `tests/api_signatures.rs` 阶段 2 版必须断言这 5 个类型可从 crate 顶层导入；③ `abstraction::cluster::rng_substream` 公开 contract（D-228）保持不变（`derive_substream_seed` + op_id 命名常量），不在 D-253 re-export 列表内但通过 `pub use abstraction::cluster::rng_substream;` 模块级别暴露。
+
 ---
 
 ## 12. 与决策文档 / API 文档的对应关系
