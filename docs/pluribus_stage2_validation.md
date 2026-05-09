@@ -21,37 +21,39 @@
 ### 1. Action abstraction
 
 - 默认 5-action 配置：`{ Fold, Check, Call, BetRaise(0.5×pot), BetRaise(1.0×pot), AllIn }`。每个动作是否合法依赖当前 `GameState`：
-    - 已 check 局面无 `Fold`（`Check` 可用时 `Fold` 应被剔除——具体由 `pluribus_stage2_decisions.md` D-NNN 锁定）。
-    - `BetRaise(x×pot)` 当 `x×pot < min_raise_size` 时按 D-NNN 锁定的 fallback 规则替换为 `min_raise` 或剔除。
-    - `BetRaise(x×pot) > effective_stack` 时 fallback 到 `AllIn`。
-- 配置扩展接口：`ActionAbstractionConfig` 至少支持 1–14 个 raise size（任意 `pot ratio`），但阶段 2 仅默认 5-action 走完整 SLO + 全套测试；1–14 raise size 仅做 "配置可加载 + 输出确定性 + 哈希区分性" 的 smoke test。
-- 任意 `(GameState, ActionAbstractionConfig)` → 抽象动作集合的映射必须 **byte-equal 重复一致**：相同输入重复 `1,000,000` 次结果完全相同。
+    - 已 check 局面无 `Fold`（`Check` 可用时 `Fold` 应被剔除——`pluribus_stage2_decisions.md` D-204 锁定）。
+    - `BetRaise(x×pot)` 当 `x×pot < min_to` 时按 D-205 锁定的 fallback 规则替换 `to` 为 `min_to`（不剔除）；`Bet` 与 `Raise` 由 stage 1 `LegalActionSet` LA-002 互斥决定。
+    - `BetRaise(x×pot) >= committed_this_round + stack` 时 fallback 到 `AllIn { to = committed_this_round + stack }`（D-205）。
+- 配置扩展接口：`ActionAbstractionConfig` 至少支持 1–14 个 raise size（任意 `pot ratio`），但阶段 2 仅默认 5-action 走完整 SLO + 全套测试；1–14 raise size 仅做 "配置可加载 + 输出确定性 + 哈希区分性" 的 smoke test（D-202）。
+- 任意 `(GameState, ActionAbstractionConfig)` → 抽象动作集合的映射必须 **byte-equal 重复一致**：相同输入重复 `1,000,000` 次结果完全相同（AA-007）。
 - 抽象动作集合断言：构造至少 `200` 个固定 `GameState` 场景，覆盖 open / 3-bet / 短码 / incomplete raise / 多人 all-in / showdown 临界，断言每个场景下默认 5-action 输出的合法子集与人工预期完全一致。
-- off-tree action handling 接口：`ActionAbstraction::map_off_tree(real_bet) -> AbstractAction` 必须存在且签名稳定；阶段 2 仅占位实现（D-NNN 选定算法的 stub），完整数值验证 + fuzz 留给阶段 6c。
+- off-tree action handling 接口：`ActionAbstraction::map_off_tree(real_bet) -> AbstractAction` 必须存在且签名稳定；阶段 2 仅占位实现（D-201 锁定 Pseudo-harmonic mapping (PHM)，nearest-action fallback stub），完整数值验证 + fuzz 留给阶段 6c。
 
 ### 2. Information abstraction：preflop lossless 169
 
-- 全部 `1326` 起手牌 → 169 等价类（13 paired + 78 suited + 78 offsuit），**100% 覆盖且无重叠**。每个等价类的 hole 组合数与组合数学一致：pairs `6`、suited `4`、offsuit `12`，169 类 hole 计数总和 `1326`。
-- preflop InfoSet 完整 key：`(hand_class_169, position, effective_stack_bucket, prior_action_bucket)`。
-    - **position**：6 选 1（BTN / SB / BB / UTG / MP / CO）。
-    - **effective_stack**：连续 `chips: u64` → 离散桶（默认桶边界由 D-NNN 锁定，建议 `[20, 50, 100, 200, ∞] BB`）。
-    - **prior_action**：默认 4 桶 `{ first_in, raised_1, raised_2, raised_3plus }`（D-NNN 锁定）。
-- 同一 `hand_class_169` 在不同 position / stack / prior_action 下必须产出 **不同** InfoSet id（哈希区分性测试，碰撞率 0%）。
+- 全部 `1326` 起手牌 → 169 等价类（13 paired + 78 suited + 78 offsuit），**100% 覆盖且无重叠**。每个等价类的 hole 组合数与组合数学一致：pairs `6`、suited `4`、offsuit `12`，169 类 hole 计数总和 `1326`。编号公式 D-217 锁定 closed-form（pairs 0..13 / suited 13..91 / offsuit 91..169），B1 [测试] 可在 [实现] 之前直接基于公式枚举断言。
+- preflop InfoSet 完整 key：`(hand_class_169, position_bucket, stack_bucket, betting_state)`，按 D-215 统一 64-bit `InfoSetId` layout 编码（`bucket_id` 24 bit / `position_bucket` 4 bit / `stack_bucket` 4 bit / `betting_state` 3 bit / `street_tag` 3 bit / `reserved` 26 bit；preflop `street_tag = 0`，postflop 共用同一 layout）。
+    - **position_bucket**：6 桶（BTN / SB / BB / UTG / MP / CO），D-210 锁定。其它桌大小（2..=9）走 "seat distance from button mod n_seats" 通用映射，仅 smoke。
+    - **stack_bucket**：连续 `chips: u64` → 5 桶 `[0, 20) BB / [20, 50) BB / [50, 100) BB / [100, 200) BB / [200, +∞) BB`（D-211 锁定，左闭右开，preflop 起手时计算；postflop 沿用 preflop 起手值不重算）。
+    - **betting_state**：5 状态 `{ Open, FacingBetNoRaise, FacingRaise1, FacingRaise2, FacingRaise3Plus }`，3 bit 编码，D-212 锁定。preflop / postflop 共用同一枚举：`Open` 表示 actor 可 `Check / Bet`，`FacingBetNoRaise` 表示 actor 必须 `Fold / Call / Raise`，二者合法动作集**不同**——仅以 raise count 编码会让两类局面同 InfoSetId 但合法动作集不同（IA-002 / F17 修复）。盲注本身不算 voluntary aggression（继承 stage 1 D-037）；preflop limp 不算 raise；incomplete short all-in 视为 1 次 raise。
+- 同一 `hand_class_169` 在不同 `(position_bucket, stack_bucket, betting_state)` 下必须产出 **不同** InfoSet id（哈希区分性测试，碰撞率 0%）。
 - preflop InfoSet mapping 重复 `1,000,000` 次哈希一致。
+- `InfoSetId` reserved 位（bit 38..64，26 bit）必须全为 0（IA-007）；任何非零写入是 P0 阻塞 bug。
 - 169 lossless 是阶段 2 的 **信任锚**：它是 stage 2 唯一无歧义、无聚类、无浮点的部分，因此必须 100% 正确，不允许任何已知偏差进入阶段 3。
 
 ### 3. Information abstraction：postflop bucket（flop / turn / river）
 
 - 默认验收配置：`flop = 500, turn = 500, river = 500`（`pluribus_path.md` §阶段 2 字面 ≥500 per street）。`BucketConfig` 接口允许每条街独立配置 bucket 数。**阶段 2 验收只跑 500/500/500**；其它配置（如 1000/1000/1000）只做 "配置可加载 + 写出 bucket table + bucket id 范围正确" 的 smoke test，不做完整 EHS std dev / EMD 阈值验收。
-- 聚类输入特征（path.md 强约束 "potential-aware"）：至少使用以下两种之一参与聚类：
-    - **EHS²**（Expected Hand Strength squared）— 表征手牌强度的二阶矩，捕捉 distribution shape。
-    - **OCHS**（Opponent Cluster Hand Strength）— 把对手手牌空间预聚类成 N 个 cluster（默认 `N = 8`，由 D-NNN 锁定），手牌特征 = 对每个 cluster 的胜率向量。
-    - **distribution-aware histogram**（可选，作为阶段 4 消融对照不强制启用）。
+- 聚类输入特征（path.md 强约束 "potential-aware"），D-221 锁定 **EHS² + OCHS** 双特征 concat 作为 k-means 输入向量，`feature_set_id = 1` 对应该组合：
+    - **EHS²**（Expected Hand Strength squared）— 表征手牌强度的二阶矩，捕捉 distribution shape；标量 1 维。
+    - **OCHS**（Opponent Cluster Hand Strength）— 把对手手牌空间预聚类成 `N = 8` 个 cluster（D-222 锁定，Brown & Sandholm 2014 / Pluribus 实战值），手牌特征 = 对每个 cluster 的胜率向量；8 维。
+    - **聚类输入向量总维度 = 9 维**（D-244 header `n_dims = 9`）。
+    - **distribution-aware histogram**（path.md "可选" 字面，**不进**默认 `feature_set_id = 1`，仅作为 stage 4 消融对照接入；D-221 锁定）。
     - 纯 hand strength（非 potential-aware）**禁止单独** 用作聚类特征。
-- **Bucket 占用**：每条街每个 bucket id 至少包含 1 个 canonical `(board, hole)` sample，**0 空 bucket**。
+- **Bucket 占用**：每条街每个 bucket id 至少包含 1 个 canonical `(board, hole)` sample，**0 空 bucket**（D-236 空 cluster 切分路径保底）。
 - **Bucket 内方差上限**（path.md §阶段 2 字面）：每条街每个 bucket 内手牌的 EHS std dev `< 0.05`。每条街出具 bucket 内方差直方图报告。
-- **Bucket 间距下限**：每条街相邻 bucket id 间的 all-in equity 分布 EMD `≥ T_emd`（D-NNN 锁定阈值，建议 `≥ 0.02`），证明 bucket 不是噪声聚类。
-- **Bucket 序号单调性**：bucket id 与 bucket 内 EHS 中位数单调一致（id 递增 ⇒ EHS 中位数递增）。便于下游 CFR 调试和 fold/raise 频率监控。
+- **Bucket 间距下限**：每条街相邻 bucket id 间的 all-in equity 分布 EMD `≥ T_emd = 0.02`（D-233 锁定阈值），证明 bucket 不是噪声聚类。"相邻" = bucket id `(k, k+1)`；每条街 500 bucket → 499 对相邻；任一对 EMD `< 0.02` 视为聚类质量不足。
+- **Bucket 序号单调性**：bucket id 与 bucket 内 EHS 中位数单调一致（id 递增 ⇒ EHS 中位数递增）。便于下游 CFR 调试和 fold/raise 频率监控；D-236b 训练完成后 cluster id 重编号为 "0 = 最弱 / N-1 = 最强" 保证此性质。
 - **Clustering 重复一致性**：同 seed clustering 重复跑 `10` 次，bucket lookup table BLAKE3 哈希必须 byte-equal 一致。这是阶段 2 与阶段 1 同等强度的 **硬性 determinism SLO**——clustering 不能因运行时条件浮动。
 
 ### 4. 抽象映射性能 SLO
@@ -65,21 +67,19 @@
 
 ### 5. Bucket lookup table 持久化与 schema
 
-- **形态**（用户决策）：单一独立二进制 artifact，运行时 `mmap` 加载。该路径在阶段 6 实时搜索 lookup 表也会复用。bucket table artifact **不进 git history**（gitignore + git LFS / release artifact 分发）。
-- 文件格式（D-NNN 锁定字段顺序与编码）至少含：
-    - magic bytes（`b"PLBKT"` 候选，D-NNN 锁定）+ `schema_version: u32` + `feature_set_id: u32`（区分 EHS² / OCHS 等特征集组合）
-    - 每条街 bucket 数 `[u32; 4]`（preflop / flop / turn / river；preflop 固定 169）
-    - bucket centroid 向量（u8 quantized 推荐，f32 raw 候选；D-NNN 锁定，建议 u8 quantized 以保证跨架构 byte-equal）
-    - bucket lookup table（canonical id → bucket id；占文件主体）
-    - 文件尾部 BLAKE3 hash（自校验）
-- 加载错误路径（每条均需测试覆盖；继承阶段 1 §F1 错误路径模式）：
+- **形态**（用户决策）：单一独立二进制 artifact，运行时 `mmap` 加载。该路径在阶段 6 实时搜索 lookup 表也会复用。bucket table artifact **不进 git history**（D-248 / D-251 `artifacts/` gitignore + git LFS / release artifact 分发）。
+- 文件格式（D-244 锁定 80-byte 定长 header + 变长 body + 32-byte trailer，全部 little-endian；reader 通过 header 偏移表定位变长段，不依赖前段累积 size）：
+    - **header**（80 bytes，8-byte aligned）：① `magic: [u8; 8] = b"PLBKT\0\0\0"`（D-240 锁定 5 字节 ASCII + 3 字节 zero pad）+ ② `schema_version: u32 = 1`（D-240）+ ③ `feature_set_id: u32 = 1`（D-240，对应 EHS² + OCHS(N=8)）+ ④ `bucket_count_flop / turn / river: u32 × 3`（preflop 固定 169 不存）+ ⑤ `n_canonical_flop / turn / river: u32 × 3`（preflop 固定 1326 不存）+ ⑥ `n_dims: u8 = 9`（D-221 EHS² + OCHS(N=8)）+ ⑦ `pad: [u8; 7] = 0`（8-byte 对齐填充）+ ⑧ `training_seed: u64`（D-237）+ ⑨ `centroid_metadata_offset / centroid_data_offset / lookup_table_offset: u64 × 3`（绝对字节偏移，reader 用此寻址，offset 越界 / 不递增 / 不 8-byte 对齐均 `BucketTableError::Corrupted`）。
+    - **body**（变长，按 header §⑨ 偏移定位）：⑩ `centroid_metadata`（每条 postflop 街 × 9 维 × `(min: f32, max: f32)`）+ ⑪ `centroid_data`（每条 postflop 街 × bucket_count(street) × 9 维 × u8 quantized；D-241 锁定 u8 quantized 保证跨架构 byte-equal，反量化 `x = min + (q / 255.0) * (max - min)`，量化误差 ≤ 0.4% 远低于 D-233 `T_emd = 0.02`；按 D-236b 重编号顺序排列）+ ⑫ `lookup_table`（preflop `[u32; 1326]` D-239 / D-245 + flop `[u32; n_canonical_flop]` + turn `[u32; n_canonical_turn]` + river `[u32; n_canonical_river]`；entry = bucket id）。
+    - **trailer**（32 bytes）：⑬ `blake3: [u8; 32] = BLAKE3(file_body[..len-32])`（D-243 自校验，eager 校验在 `BucketTable::open` 命中）。
+- 加载错误路径（D-247 锁定 5 类，每条均需测试覆盖；继承阶段 1 §F1 错误路径模式）：
     - `BucketTableError::FileNotFound { path }`
-    - `BucketTableError::SchemaMismatch { expected, got }`
+    - `BucketTableError::SchemaMismatch { expected, got }`（含 v1 reader 拒绝 v2 文件，D-246）
     - `BucketTableError::FeatureSetMismatch { expected, got }`
-    - `BucketTableError::Corrupted { offset, reason }`（含 BLAKE3 不匹配）
+    - `BucketTableError::Corrupted { offset, reason }`（含 magic bytes / BLAKE3 不匹配 / header §⑨ 偏移表不变量违反 BT-008）
     - `BucketTableError::SizeMismatch { expected, got }`（mmap 边界 / 截断文件）
-- **v1 → v2 schema 兼容**：至少 1 条向前兼容路径——v1 文件 + v2 代码必须显式拒绝或升级，禁止静默错读。继承阶段 1 §5 schema_version 模式。
-- **跨语言读取**：Python 端必须能完整读取 Rust 写出的 bucket table（与阶段 1 `tools/history_reader.py` 同形态），用于阶段 7 评测脚本。`tools/bucket_table_reader.py` 至少 1k 个 canonical id → bucket id 跨语言比对一致。
+- **v1 → v2 schema 兼容**：v1 reader 必须显式拒绝 `schema_version > 1` 文件（D-246 锁定，返回 `SchemaMismatch { expected: 1, got: 2 }`）。v2 reader 可选支持 v1 升级路径，stage 2 不要求 v2 reader 实现，留 stage 2 schema 第一次 bump 时决定。继承阶段 1 §5 schema_version 模式。
+- **跨语言读取**：Python 端必须能完整读取 Rust 写出的 bucket table（D-249 锁定，与阶段 1 `tools/history_reader.py` 同形态 minimal proto3 decoder 风格）。`tools/bucket_table_reader.py` 至少 1k 个 canonical id → bucket id 跨语言比对一致。
 
 ### 6. 跨平台 / 确定性
 
@@ -113,20 +113,20 @@
 | Clustering 重复一致性 | 同 seed 重复 `10` 次 BLAKE3 一致 | 头号 stage-2 不变量 |
 | Bucket id determinism | 1,000,000 次重复哈希一致 | 跨线程 + 单线程 |
 | Bucket 内 EHS std dev | `< 0.05` per bucket | path.md §阶段 2 字面 |
-| Bucket 间 EMD | `≥ 0.02`（建议） | D-NNN 待锁数 |
+| Bucket 间 EMD | `≥ 0.02` | D-233 锁定 `T_emd = 0.02` |
 
 ## 通过标准
 
 阶段 2 通过标准如下：
 
 - 默认 5-action `ActionAbstraction` 在 `100,000` 个随机 `GameState` 上输出合法且非空抽象动作集合，`0` 例例外；`200+` 个固定场景与人工预期 100% 一致。
-- preflop 169 lossless 等价类全部 `1326` 起手牌 100% 覆盖、无重叠；`(hand_class_169, position, effective_stack, prior_action)` InfoSet key `1,000,000` 次重复哈希一致；`hand_class_169` 跨 position / stack / prior_action 哈希碰撞率 `0%`。
-- postflop bucket 默认 `500/500/500` 配置：每条街 `0` 空 bucket、bucket 内 EHS std dev 全部 `< 0.05`、相邻 bucket 间 EMD 全部 `≥ T_emd`（D-NNN 锁定阈值）；bucket id ↔ EHS 中位数单调一致。
+- preflop 169 lossless 等价类全部 `1326` 起手牌 100% 覆盖、无重叠（D-217 closed-form 公式）；`(hand_class_169, position_bucket, stack_bucket, betting_state)` InfoSet key `1,000,000` 次重复哈希一致；`hand_class_169` 跨 `(position_bucket, stack_bucket, betting_state)` 哈希碰撞率 `0%`。
+- postflop bucket 默认 `500/500/500` 配置：每条街 `0` 空 bucket、bucket 内 EHS std dev 全部 `< 0.05`、相邻 bucket 间 EMD 全部 `≥ T_emd = 0.02`（D-233）；bucket id ↔ EHS 中位数单调一致（D-236b 重编号保证）。
 - bucket lookup table 同 seed 重复 clustering `10` 次 BLAKE3 byte-equal；跨 host 重跑 clustering 同 seed byte-equal。
 - 单线程抽象映射吞吐 `≥ 100,000 mapping/s`；bucket lookup `P95 ≤ 10 μs`；equity Monte Carlo `≥ 1,000 hand/s`。
 - bucket table v1 → v2 schema 兼容路径覆盖；corrupted bucket table `100,000` 次 byte flip `0` panic；5 类 `BucketTableError` 错误路径全部命中。
 - 阶段 1 `GameState` / `HandEvaluator` / `HandHistory` / `RngSource` 接口未受阶段 2 修改；阶段 1 全套测试（123 `#[test]` across 16 crates，默认 104 active / 19 ignored）`0 failed`，stage1-v1.0 tag 在阶段 2 任何 commit 上仍可重跑通过。
-- 与至少 `1` 个外部 abstraction 参考（如 OpenSpiel poker abstractions / Slumbot 公开 bucket 数据）做特征级对照，确认我方 EHS² / OCHS 计算与参考偏差在合理误差范围内（D-NNN 锁定误差容差）；参考实现选定与对照口径在 D-NNN 落地。
+- 与外部 abstraction 参考做 sanity 对照：D-260 锁定 "**自洽性优先 + OpenSpiel 轻量对照**"——主验收依赖内部不变量（preflop 169 lossless / bucket 内方差 < 0.05 / 相邻 bucket EMD ≥ 0.02 / clustering BLAKE3 byte-equal / 1M mapping determinism）；F3 验收报告附带 OpenSpiel poker abstractions preflop 169 类与 5-action 默认配置对照（D-261 锁定口径：169 类**成员**集合相等比对，**不**要求编号顺序一致；postflop bucket 不做一一对照）。Slumbot bucket 数据获取不确定，**不强求**接入。OpenSpiel 169 类成员集合若出现 `≥ 1` 类不一致视为 stage 2 P0 bug（D-262）；bucket 数量 / postflop 边界差异不阻塞，仅在 F3 报告标注。外部对照 sanity 脚本 `tools/external_compare.py` 在 F3 [报告] 起草时一次性接入，stage 2 主线工作（A1..F2）不依赖 OpenSpiel（D-263）。
 
 ## 阶段 2 完成产物
 
@@ -168,4 +168,13 @@
 
 阶段 2 实施期间的角色边界 carve-out 追认（B-rev / C-rev / D-rev / E-rev / F-rev 命名风格继承阶段 1）落到 `pluribus_stage2_workflow.md` §修订历史，本节不重复记录。
 
-- **<待 A0 完成时填>**：A0 [决策] 关闭后，把所有 [D-NNN 待锁] 占位（`§1` action 默认集合、`§2` position / stack / prior_action bucket 边界、`§3` OCHS opponent cluster 数、EMD 阈值 `T_emd`、`§5` magic bytes / centroid 量化 / 字段顺序、`§7` 外部 abstraction 参考选定）补完，并把 `pluribus_stage2_decisions.md` §修订历史首条同步链接到本节。
+- **2026-05-09（A0 [决策] 关闭同步）**：A0 [决策] 落地 `docs/pluribus_stage2_decisions.md`（D-200..D-283）+ `docs/pluribus_stage2_api.md`（API-200..API-302）+ 5 笔 review 修正 batch（commits `3f62842 / 96e3b9c / 1e57942 / 622204f / 9b7085d`，闭合 11/12 spec drift = F7+F8+F9+F10+F11+F13+F14+F15+F16+F17+F18；F12 维持不修——理论 P3，feature 精度 ~5e-3 远高于 d2 量化失效阈值 1e-12，工程不触发）。本文档 §1–§7 + §通过标准 + §SLO 汇总全部 `[D-NNN 待锁]` 占位补成实数（与 `pluribus_stage2_decisions.md` §10 修订历史首条同步）：
+    - §1 action：D-200 默认 5-action `{ Fold, Check, Call, Bet/Raise(0.5×pot), Bet/Raise(1.0×pot), AllIn }`；D-201 off-tree PHM stub；D-204 `Check` 局面剔除 `Fold`；D-205 `x×pot < min_to` fallback 到 `min_to`、`>= committed + stack` fallback 到 `AllIn`；D-209 输出顺序固定。
+    - §2 InfoSet key：D-210 6 桶 position（`{ BTN, SB, BB, UTG, MP, CO }`）；D-211 5 桶 stack `[0, 20) BB / [20, 50) / [50, 100) / [100, 200) / [200, +∞)`，左闭右开；D-212 5 状态 betting_state `{ Open, FacingBetNoRaise, FacingRaise1, FacingRaise2, FacingRaise3Plus }`（**preflop / postflop 共用**，从 4 桶 prior_action 扩到 5 状态以区分 BB-after-limp 与 first-in-non-BB，IA-002 / F17 修复）；D-215 统一 64-bit `InfoSetId` layout（24+4+4+3+3+26 bit）；D-217 hand_class_169 closed-form 公式（pairs 0..13 / suited 13..91 / offsuit 91..169）+ 12 条边界锚点表。
+    - §3 postflop bucket：D-213 默认 `flop = 500 / turn = 500 / river = 500`；D-214 `BucketConfig` 每条街 ∈ [10, 10_000]；D-220 `iter = 10_000`；D-220a EQ-001 反对称容差按街分流（postflop 1e-9 / preflop Monte Carlo 0.005 with iter=10k）；D-221 `feature_set_id = 1` = EHS² + OCHS(N=8)，n_dims=9；D-222 OCHS `N = 8`；D-223 EHS / EHS² 计算口径；D-227 EHS² rollout（river 0 / turn 46 / flop 1081）；D-230 k-means + L2；D-233 `T_emd = 0.02`；D-235 k-means++ 量化 SCALE=2^40 + N ≤ 2_000_000；D-236b 训练完成后 cluster id 重编号为 "0 = 最弱 / N-1 = 最强"。
+    - §5 bucket table：D-240 magic = `b"PLBKT\0\0\0"` 8 字节；D-241 centroid u8 quantized；D-244 80-byte 定长 header + 变长 body + 32-byte BLAKE3 trailer + §⑨ 三段绝对偏移表（解决 BT-007 byte flip 在变长段定位失败导致 panic 的结构性缺口，F11/F13 修复）；D-247 5 类 `BucketTableError`；D-249 Python 跨语言 reader。
+    - §6 跨平台：D-228 RngSource sub-stream 派生协议（SplitMix64 finalizer + op_id 表，F11 修复）；D-237 `(BucketConfig, training_seed, feature_set_id)` 同组合 BLAKE3 byte-equal；D-251 `artifacts/` gitignore；D-252 `abstraction::map` 子模块 `clippy::float_arithmetic` 死锁。
+    - §7 外部对照：D-260 自洽性优先 + OpenSpiel 轻量对照；D-261 preflop 169 类成员集合相等（不要求编号顺序）；D-262 `≥ 1` 类不一致视为 P0；D-263 F3 [报告] 一次性接入 `tools/external_compare.py`。
+    - §通过标准 同步：preflop key 字段名 `prior_action` → `betting_state` 与 D-212 / D-215 对齐。
+    - §SLO 汇总 同步：`Bucket 间 EMD` 阈值由 "D-NNN 待锁数" 锁为 `D-233 锁定 T_emd = 0.02`。
+    本节首条由本 commit 落地，与 `pluribus_stage2_decisions.md` §10 修订历史首条 + `pluribus_stage2_workflow.md` §修订历史首条 + `CLAUDE.md` "stage 2 A0 closed" 状态翻面同步。

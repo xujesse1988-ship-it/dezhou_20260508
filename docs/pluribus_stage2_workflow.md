@@ -35,8 +35,9 @@
 
 阶段 1 已锁定的 dependency 全部继承。阶段 2 候选新增依赖（A0 [决策] 锁定）：
 
-- 自实现 k-means + EMD 距离 vs 引入 `linfa-clustering` / `kmeans` crate：阶段 2 倾向自实现，避免外部 crate 浮点行为跨版本漂移破 clustering determinism。
-- `ndarray`（可选）：特征向量批量计算，是否引入由 D-NNN 锁定。
+- 自实现 k-means + EMD 距离 vs 引入 `linfa-clustering` / `kmeans` crate：D-250 锁定**自实现**——避免外部 crate 浮点行为跨版本漂移破 clustering determinism；stage 2 特征维度 ≤ 9，手工实现性能足够。
+- `ndarray`：D-250 锁定**不引入**——理由同上 + 减少 dependency surface 降低 cargo audit 噪声。clustering / EMD / equity 全部用 `Vec<f32>` / `Vec<f64>` / `Vec<u8>` + 手工索引。
+- `memmap2 = "0.9"`：D-255 锁定**引入**（mmap 加载是不可避免的系统接口）。
 - equity Monte Carlo 仍走阶段 1 `HandEvaluator`，**不引外部** equity 库。
 
 ### Crate 布局（阶段 2 起步）
@@ -610,12 +611,34 @@ E. **Benchmark harness 骨架**（无 SLO 断言，留待 E1 接入）：
 
 格式参考阶段 1 §B-rev1（B2 关闭后角色边界追认）/ §C-rev1（C2 关闭无产品代码改动 + carve-out）/ §C-rev2（carve-out 测试落地 + 实跑暴露 bug）/ §D-rev0（D2 修分歧 + scenario 测试 carve-out 追认）/ §E-rev0（E1 多核 SLO 1-CPU host carve-out）/ §E-rev1（E2 性能转绿同时正确性套件加速）/ §F-rev0（F1 错误路径结构性缺位 carve-out）/ §F-rev1（F2 错误前移到 from_proto）/ §F-rev2（F3 报告落地）。
 
-阶段 2 §修订历史 首条新增项必须显式 carry forward 阶段 1 提炼的处理政策清单：
+#### A0 关闭（2026-05-09）— A-rev0
+
+A0 [决策] 关闭。同 commit 落地：
+
+- `docs/pluribus_stage2_decisions.md`（D-200..D-283 全锁定数值；含 D-220a / D-236b / D-228 sub-stream 派生协议）
+- `docs/pluribus_stage2_api.md`（API-200..API-302 trait + 类型契约 + `EquityCalculator::equity_vs_hand` pairwise 接口 / `BucketTable` 80-byte header 偏移表 / `abstraction::cluster::rng_substream` 公开 contract）
+- `docs/pluribus_stage2_validation.md` §1–§7 + §通过标准 + §SLO 汇总 全部 `[D-NNN 待锁]` 占位补成实数（与 §修订历史 首条同步）
+- 本文档 §修订历史 首条（即本条）carry forward 阶段 1 处理政策
+- `CLAUDE.md` 状态翻 "stage 2 A0 closed"
+
+A0 起步起 review 子 agent 共发现 12 处独立 spec drift（F7..F18），通过 5 笔 commit 落地 11 处修正（F12 维持不修，理论 P3 工程不触发）：
+
+| commit | batch | 修正主题 |
+|---|---|---|
+| `3f62842` | batch 1 | F7 / F8 / F9 / F17 — InfoSet 编码 + 类型一致性（D-215 统一 64-bit layout / `StreetTag` vs `Street` 隔离 / `BettingState` 5 状态展开 / `position_bucket` 4 bit 支持 2..=9 桌大小） |
+| `96e3b9c` | batch 2 | F11 / F13 — RngSource sub-stream 派生协议（D-228 SplitMix64 finalizer + op_id 表）+ bucket table header 80-byte 偏移表（D-244 §⑨ 解决 BT-007 byte flip 变长段定位 panic） |
+| `1e57942` | batch 3 | F14 — D-217 169 hand class closed-form 公式 + 12 条边界锚点表（B1 [测试] 在 [实现] 之前直接基于公式枚举断言） |
+| `622204f` | batch 4 | F10 / F15 / F16 — D-206 fold-collapsed `AllIn` `betting_state` 转移澄清 / D-235 N ≤ 2_000_000 + 量化 SCALE=2^40 / D-243 schema_version vs BLAKE3 reproducibility 耦合标注（v1 only 不解决，stage 3 hook） |
+| `9b7085d` | batch 5 | F18 — D-220a / EQ-001 `equity_vs_hand` pairwise 接口（反对称只在 pairwise 路径成立——`equity(hole, board, rng)` random-opp 数学上不满足反对称） |
+
+A0 carry forward 阶段 1 处理政策清单（在 §B-rev1 / §C-rev1 / §D-rev0 / §F-rev1 提炼）：
 
 - §B-rev1 §3：[实现] 步骤越界改测试 → 当 commit 显式追认；不静默扩散到下一步。
 - §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步` 把仓库状态、出口数据、修订历史索引补齐。
 - §C-rev1：零产品代码改动的 [实现] 步骤同样需要书面 closure；测试规模扩展属于 [测试] 角色，即使 "只是改个常数"。
 - §D-rev0 §1–§3：`D-NNN-revM` 翻语义时主动评估测试反弹；carve-out 范围最小化；测试文件改名 / 删除 / 大幅重写仍属 [测试] 范畴。
-- §F-rev1：错误前移到序列化解码阶段（如 `from_proto`）是 [实现] agent 单点不变量收口的优选模式。
+- §F-rev1：错误前移到序列化解码阶段（如 `from_proto` / `BucketTable::open`）是 [实现] agent 单点不变量收口的优选模式。
 
-（本节首条由 A0 [决策] 关闭后填入，记录 D-200..D-260 锁定数值与 `pluribus_stage2_validation.md` §修订历史首条同步。）
+A0 角色边界审计：仅修 `docs/` 下 4 份文档（`pluribus_stage2_decisions.md` 起草 + `pluribus_stage2_api.md` 起草 + `pluribus_stage2_validation.md` 占位补完 + 本文档 §修订历史 首条）+ `CLAUDE.md` 状态翻面；`src/` / `tests/` / `benches/` / `fuzz/` / `tools/` / `proto/` **未修改一行**——A0 [决策] role 0 越界（继承阶段 1 §F-rev2 / §F-rev0 / §C-rev1 0 越界形态）。
+
+下一步：A1 [实现]（API 骨架代码化）→ B1 [测试] → B2 [实现] → ... → F3 [报告]，按 §步骤序列 13-step 顺序推进。

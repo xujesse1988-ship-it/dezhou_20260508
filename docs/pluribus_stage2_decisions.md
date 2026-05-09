@@ -248,7 +248,22 @@ fn hand_class_169(rank_a: Rank, rank_b: Rank, suited: bool) -> u8 {
 
 阶段 2 实施过程中的决策修订（含 carry forward 阶段 1 处理政策）按时间线追加到本节，遵循阶段 1 §10 修订历史 同样 "追加不删" 约定。
 
-阶段 2 §修订历史 首条新增项必须显式 carry forward 阶段 1 提炼的处理政策清单（与 `pluribus_stage2_workflow.md` §修订历史 首条同步）：
+#### A0 关闭（2026-05-09）
+
+A0 [决策] 关闭，本文档 D-200..D-283（含 D-220a / D-236b / D-228 sub-stream 派生协议）全部锁定数值。同 commit 落地 `docs/pluribus_stage2_api.md` API-200..API-302、`docs/pluribus_stage2_validation.md` §修订历史首条占位补完、`docs/pluribus_stage2_workflow.md` §修订历史首条 carry forward、`CLAUDE.md` 状态翻 "stage 2 A0 closed"。
+
+A0 起步起 review 子 agent 提出 12 处独立 spec drift（编号 F7..F18），通过 5 笔 commit 落地 11 处修正：
+
+| 编号 | 修正主题 | commit |
+|---|---|---|
+| F7 / F8 / F9 / F17 | InfoSet 编码 + 类型一致性（D-215 统一 64-bit layout / `StreetTag` vs `Street` 隔离 / `BettingState` 5 状态展开 / `position_bucket` 4 bit 支持 2..=9 桌大小） | `3f62842` batch 1 |
+| F11 / F13 | RngSource sub-stream 派生协议（D-228 SplitMix64 finalizer + op_id 表）+ bucket table header 80-byte 偏移表（D-244 §⑨ 解决 BT-007 byte flip 变长段定位 panic） | `96e3b9c` batch 2 |
+| F14 | D-217 169 hand class closed-form 公式 + 12 条边界锚点表（B1 [测试] 在 [实现] 之前直接基于公式枚举断言） | `1e57942` batch 3 |
+| F10 / F15 / F16 | D-206 fold-collapsed `AllIn` 的 `betting_state` 状态转移澄清 / D-235 N ≤ 2_000_000 候选点上限 + 量化 SCALE=2^40 / D-243 schema_version vs BLAKE3 reproducibility 耦合标注（v1 only 不解决，stage 3 hook） | `622204f` batch 4 |
+| F18 | D-220a / EQ-001 `equity_vs_hand` pairwise 接口（API §3 trait 新增第三个方法，反对称只在 pairwise 路径成立——`equity(hole, board, rng)` random-opp 数学上不满足反对称） | `9b7085d` batch 5 |
+| F12 | 维持不修（理论 P3：feature 精度 ~5e-3 远高于 d2 量化失效阈值 1e-12，工程不触发） | — |
+
+A0 §修订历史 首条 carry forward 阶段 1 处理政策清单（与 `pluribus_stage2_workflow.md` §修订历史 首条同步）：
 
 - §B-rev1 §3：[实现] 步骤越界改测试 → 当 commit 显式追认；不静默扩散到下一步。
 - §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步` 把仓库状态、出口数据、修订历史索引补齐。
@@ -256,7 +271,9 @@ fn hand_class_169(rank_a: Rank, rank_b: Rank, suited: bool) -> u8 {
 - §D-rev0 §1–§3：`D-NNN-revM` 翻语义时主动评估测试反弹；carve-out 范围最小化；测试文件改名 / 删除 / 大幅重写仍属 [测试] 范畴。
 - §F-rev1：错误前移到序列化解码阶段（如 `from_proto` / `BucketTable::open`）是 [实现] agent 单点不变量收口的优选模式。
 
-（本节首条由 A0 [决策] 关闭后填入，记录 D-200..D-283 锁定数值与 `pluribus_stage2_validation.md` §修订历史首条同步。）
+A0 角色边界审计：仅修 `docs/` 下 4 份新文档（`pluribus_stage2_decisions.md` / `pluribus_stage2_api.md` 起草 + `pluribus_stage2_validation.md` 占位补完 + `pluribus_stage2_workflow.md` §修订历史同步）+ `CLAUDE.md` 状态翻面；`src/` / `tests/` / `benches/` / `fuzz/` / `tools/` / `proto/` **未修改一行**——A0 [决策] role 0 越界。
+
+下一步：B1 [测试]（`tests/api_signatures.rs` 阶段 2 trait 签名编译断言起步 + `tests/preflop_169.rs` 1326 → 169 完整覆盖 + `tests/equity_self_consistency.rs` 反对称 harness + `tests/scenarios.rs` 阶段 2 版 10–15 个 driving 场景 + `tests/clustering_determinism.rs` / `tests/bucket_quality.rs` harness 骨架）。前置 A1 [实现]（API 骨架代码化 + `unimplemented!()` 占位 + `Cargo.toml` 追加 dev-dep + `abstraction::map` 子模块 `clippy::float_arithmetic` inner attribute）由 A0 → B1 之间 [实现] agent 落地。
 
 ---
 
