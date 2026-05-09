@@ -107,9 +107,9 @@ API 骨架代码化按 §A1 §输出 全部落地：
 
 ### Stage 2 当前测试基线（C1 闭合后）
 
-- `cargo test --no-fail-fast`（默认 / debug）：**179 passed / 34 ignored / 0 failed across 24 test crates**（+ 2 doc-test 0 测）。
+- `cargo test --no-fail-fast`（默认 / debug）：**179 passed / 35 ignored / 0 failed across 24 test crates**（+ 2 doc-test 0 测）。
     - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`，与 `stage1-v1.0` tag **byte-equal**（D-272 不退化要求满足）；scenarios_extended.rs 新增 8 个 stage-2 sweep #[test] 在 `mod stage2_abs_sweep` 内，stage-1 部分仍是同 104 个 byte-equal 通过。
-    - **stage-2 8 crates** `75 passed / 15 ignored / 0 failed`：action_abstraction 12 / canonical_observation 8 / clustering_determinism 5 active + 2 ignored / equity_self_consistency 12 / info_id_encoding 8 / preflop_169 5 / **bucket_quality 7 active + 13 ignored（new C1）** / **equity_features 10（new C1）** + scenarios_extended `mod stage2_abs_sweep` 8 个（在 stage-1 文件内不重复计数）。
+    - **stage-2 8 crates** `75 passed / 16 ignored / 0 failed`：action_abstraction 12 / canonical_observation 8 / clustering_determinism 5 active + 3 ignored（C1 后修补：+ `cross_arch_bucket_id_baseline_skeleton`，§C1 §输出 line 313 跨架构 baseline regression guard 占位，与 stage-1 `cross_arch_hash` 同形态）/ equity_self_consistency 12 / info_id_encoding 8 / preflop_169 5 / **bucket_quality 7 active + 13 ignored（new C1）** / **equity_features 10（new C1）** + scenarios_extended `mod stage2_abs_sweep` 8 个（在 stage-1 文件内不重复计数）。
     - 实测耗时（debug profile）equity_self_consistency 130s + equity_features 24s 主导（10M+ MC iter；release profile 全 < 10s，E2 SLO 路径接管）。
 - `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` trip-wire byte-equal 不变，stage 2 公开 API 0 签名漂移。
 - `python3 tools/bucket_quality_report.py --stub`：smoke 跑 C1 占位数据 → markdown 报告骨架 stdout 验证（B2 stub 行为下全部门槛 ✗，按设计如此，C2 接入真实 mmap 后转 ✓）。

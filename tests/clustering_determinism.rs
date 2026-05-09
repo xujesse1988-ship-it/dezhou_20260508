@@ -1,16 +1,18 @@
-//! B1 §D 类：Clustering determinism harness 骨架。
+//! B1 §D 类 + C1 §输出 line 313：Clustering determinism harness 骨架。
 //!
-//! 覆盖 `pluribus_stage2_workflow.md` §B1 §输出 D 类清单：
+//! 覆盖 `pluribus_stage2_workflow.md` §B1 §输出 D 类清单 + §C1 §输出 line 313：
 //!
-//! - 同 seed clustering 重复 → bucket table 字节比对 stub
-//! - 跨线程 bucket id 一致 stub
+//! - 同 seed clustering 重复 → bucket table 字节比对 stub（§B1）
+//! - 跨线程 bucket id 一致 stub（§B1）
+//! - **跨架构 32-seed bucket id baseline regression guard**（§C1 §输出 line 313；
+//!   与阶段 1 `cross_arch_hash` 同形态）
 //! - D-228 RngSource sub-stream 派生协议公开 contract（独立验证）
 //!
 //! 本文件按 §B1 §出口 line 250 "harness 能跑出占位结果或断言失败，流程不
-//! panic"——核心 clustering 重复 / 跨线程断言 `#[ignore]`（依赖 BucketTable
-//! 训练 CLI 完整路径，C2 才接），但 D-228 sub-stream 派生协议测试在 stub
-//! 落地前无法 byte-equal 比对（`derive_substream_seed` 是 unimplemented），
-//! 同样 `#[ignore]`。
+//! panic"——核心 clustering 重复 / 跨线程 / 跨架构 baseline 断言 `#[ignore]`
+//! （依赖 BucketTable 训练 CLI 完整路径，C2 才接），但 D-228 sub-stream 派生
+//! 协议测试在 stub 落地前无法 byte-equal 比对（`derive_substream_seed` 是
+//! unimplemented），同样 `#[ignore]`。
 //!
 //! D-228 op_id 命名常量是 const 路径（A1 已落地具体数值），不依赖 stub；其值
 //! 域 / 命名空间断言走非 ignored 路径，验证 D-228 公开 contract 字面值。
@@ -18,7 +20,7 @@
 //! 全套 1M repeat / BLAKE3 byte-equal 完整断言留 D1。本文件骨架建立 harness
 //! 入口与命名空间，B2 / C2 / D1 / D2 [实现] 与 [测试] 在此基础上扩展。
 //!
-//! 角色边界：本文件属 `[测试]` agent 产物。
+//! 角色边界：本文件属 `[测试]` agent 产物（B1 / C1）。
 
 use poker::rng_substream::{
     self, derive_substream_seed, CLUSTER_MAIN_FLOP, CLUSTER_MAIN_RIVER, CLUSTER_MAIN_TURN,
@@ -252,6 +254,83 @@ fn cross_thread_bucket_id_consistency_skeleton() {
     // assert_eq!(single, multi, "D-238 / IA-004: 跨线程 byte-equal");
     // ```
     panic!("C2/D1 placeholder：多线程 lookup harness 落地后取消 ignore");
+}
+
+// ============================================================================
+// 7. 跨架构 32-seed bucket id baseline regression guard 占位（C1 §输出 line 313；
+//    C2 / D1 接入完整）
+// ============================================================================
+//
+// 验证 `pluribus_stage2_workflow.md` §C1 §输出 line 313 字面：
+//   "跨架构 32-seed bucket id baseline regression guard（与阶段 1
+//    `cross_arch_hash` 同形态）"
+// + `pluribus_stage2_validation.md` §6 字面：
+//   "32-seed bucket id baseline 强制；1M 手 bucket id 跨架构 byte-identical 是
+//    aspirational，不是阶段 2 出口门槛"
+//
+// stage-1 `cross_arch_hash` 模板（参考 `tests/cross_arch_hash.rs::ARCH_BASELINE_SEEDS`）：
+//
+// 1. 选定 32 个固定 seed（覆盖 0 / 小 / 大 / 边界 / 魔数）。
+// 2. 每个 seed → train default 500/500/500 bucket table（C2 `tools/train_bucket_table.rs`
+//    CLI）→ 对每条街取若干固定 (board, hole) probe → `BucketTable::lookup` 收到
+//    bucket id 序列 → BLAKE3 fold。
+// 3. 在 `tests/data/bucket-table-arch-hashes-<os>-<arch>.txt` 维护 baseline 文件：
+//    每行 `seed=<dec> hash=<hex>`。
+// 4. 跨架构 (linux-x86_64 vs darwin-aarch64) baseline 文件 byte-equal 比对（D-052
+//    aspirational 在 32-seed 样本上是强制门槛）。
+//
+// **C1 状态**：B2 stub `lookup` 全部返回 `Some(0)`、`BucketTable::open` /
+// `train_bucket_table.rs` CLI 在 A1 阶段全部 `unimplemented!()`，本测试在
+// stub 路径下无法生成有意义的 32-seed bucket id 序列（全 0 → BLAKE3 退化为
+// 常量），baseline 文件也无法捕获。`#[ignore]` 留 C2 [实现] / D1 [测试]：
+//
+// - C2 commit 落地 `train_bucket_table.rs` + `BucketTable::open` 真实 mmap 路径
+//   后，把当前 host 的 32-seed 输出 capture 到
+//   `tests/data/bucket-table-arch-hashes-linux-x86_64.txt`（与 stage-1
+//   `arch-hashes-linux-x86_64.txt` 同目录）；取消本 #[ignore]；同时引入
+//   `bucket_table_arch_hash_capture_only` capture-only 入口（与 stage-1
+//   `cross_arch_hash_capture_only` 同形态）。
+// - D1 [测试] 把跨架构 cross-pair guard（linux ↔ darwin baseline byte-equal）
+//   纳入夜间 fuzz（与 stage-1 `cross_arch_baselines_byte_equal_when_both_present`
+//   同形态）；详见 §D1 §输出 `tests/clustering_cross_host.rs`。
+#[test]
+#[ignore = "C2/D1: BucketTable::open + train_bucket_table.rs CLI 未落地；32-seed baseline harness 占位（与 stage-1 cross_arch_hash 同形态）"]
+fn cross_arch_bucket_id_baseline_skeleton() {
+    // C2 [实现] 落地后展开为：
+    //
+    // ```ignore
+    // const BUCKET_TABLE_BASELINE_SEEDS: [u64; 32] = [
+    //     0, 1, 2, 3, 7, 13, 42, 100, 255, 256, 1023, 1024,
+    //     65535, 65536, 1_000_000, 0xCAFE_BABE, 0xDEAD_BEEF, 0xFEED_FACE,
+    //     0xC1_E1AA, 0xC1_DA_7A, 0xC1_F00D, 0xC001_CAFE, 0xFFFF_FFFF,
+    //     1u64 << 32, 1u64 << 48, (1u64 << 63) - 1, 1u64 << 63,
+    //     u64::MAX - 1, u64::MAX,
+    //     0xA5A5_A5A5_A5A5_A5A5, 0x5A5A_5A5A_5A5A_5A5A, 0x1234_5678_9ABC_DEF0,
+    // ];
+    //
+    // // 与 stage-1 cross_arch_hash 完全同形态：
+    // let actual = capture_bucket_table_baseline(&BUCKET_TABLE_BASELINE_SEEDS);
+    // let path = match bucket_table_baseline_path() {
+    //     Some(p) => p,
+    //     None => {
+    //         eprintln!("[bucket-table-arch] no baseline declared for this (os, arch); current capture:\n{actual}");
+    //         return;
+    //     }
+    // };
+    // let expected = match fs::read_to_string(&path) {
+    //     Ok(s) => s,
+    //     Err(e) => {
+    //         eprintln!("[bucket-table-arch] baseline missing at {}: {e}\n... current capture:\n{actual}", path.display());
+    //         return;
+    //     }
+    // };
+    // assert_eq!(actual.trim(), expected.trim(), "D-052 aspirational regression：bucket table 32-seed baseline drift");
+    // ```
+    //
+    // 其中 `capture_bucket_table_baseline` 走「每 seed 跑 train CLI → 对每条街
+    // 取 N 个固定 (board, hole) probe → BLAKE3 fold bucket id 序列」流程；具体
+    // probe 集与 N 在 C2 commit 与 stage-2 §C-rev0 一并锁定。
+    panic!("C2/D1 placeholder：train_bucket_table.rs CLI 落地后取消 ignore，并 commit tests/data/bucket-table-arch-hashes-<os>-<arch>.txt baseline 文件");
 }
 
 // ============================================================================

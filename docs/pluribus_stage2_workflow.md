@@ -822,4 +822,28 @@ C1 角色边界审计：本 commit 触 `tests/`（new 2 + 修 1 = 3 文件）+ `
 - §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 commit 落地 C1 闭合后状态翻面段落。
 - 阶段 1 §C-rev1 / §D-rev0 / §F-rev1 既往政策保持继承不变。
 
-下一步：C2 [实现]（postflop 聚类落地）。按 §C2 §输出 落地 `EquityCalculator` 完整 EHS² / OCHS 计算 + `cluster.rs` k-means + EMD 距离实现（D-230 / D-231 / D-232）+ `tools/train_bucket_table.rs` CLI（RngSource seed → 训练 → 写出 mmap artifact）+ `BucketTable::open(path)` mmap 加载 happy path（错误路径 F2）+ `PostflopBucketAbstraction::map(...)` 完整实现 + bucket table v1 schema 落地（D-240..D-249）+ artifact 同 PR 落到 `artifacts/`（gitignore）。出口标准：C1 全部 `#[ignore]` 测试取消 ignore 后通过 + 同 seed clustering BLAKE3 byte-identical（重复 10 次）+ 1M `#[ignore]` 完整版在 release profile 跑通 + stage 1 全套 0 failed。
+#### C-rev0 batch 2（2026-05-09）— C1 后 review 修正：跨架构 baseline skeleton
+
+C1 闭合后第一轮 review 暴露 §C1 §输出 line 313 字面 "跨架构 32-seed bucket id baseline regression guard（与阶段 1 `cross_arch_hash` 同形态）" 在 C1 commit 中**未落地**。原 C1 commit 仅触 4 个文件（`tests/bucket_quality.rs` new + `tests/equity_features.rs` new + `tests/scenarios_extended.rs` 修 + `tools/bucket_quality_report.py` new），`tests/clustering_determinism.rs` 仍是 B1 commit 落地的 5 active + 2 ignored skeleton（覆盖 §B1 §输出 D 类 3 子条 + D-228 op_id），第 4 子条「跨架构 baseline guard」既未在 B1 也未在 C1 出现。
+
+按 §B-rev0 / §B-rev0 batch 2 / B2 后修正 batch 1 同形态处理（review 暴露漏项 → 当 commit 追认 + 不退化 baseline）。本 batch 2 触动一处：
+
+- **`tests/clustering_determinism.rs`**：在末尾追加 §7 `cross_arch_bucket_id_baseline_skeleton` `#[ignore]` skeleton（与既有 `clustering_repeat_blake3_byte_equal_skeleton` / `cross_thread_bucket_id_consistency_skeleton` 同形态）。原因：B2 stub `BucketTable::lookup` 全部返回 `Some(0)`，`BucketTable::open` 与 `tools/train_bucket_table.rs` CLI 在 A1 阶段 `unimplemented!()`，本测试在 stub 路径下无法生成有意义的 32-seed bucket id 序列（全 0 → BLAKE3 退化为常量），baseline 文件也无法捕获——只能落 skeleton 占位 `panic!("C2/D1 placeholder...")`，待 C2 [实现] 闭合 commit 取消 ignore + capture `tests/data/bucket-table-arch-hashes-linux-x86_64.txt` baseline 文件（与 stage-1 `tests/data/arch-hashes-linux-x86_64.txt` 同目录同命名约定）。skeleton body 内附 32-seed 数组（与 stage-1 `ARCH_BASELINE_SEEDS` byte-equal 复用）+ C2 落地路径完整伪代码（`capture_bucket_table_baseline` 函数走「每 seed → train CLI → fixed (board, hole) probe 序列 → BLAKE3 fold」流程），C2 commit 直接展开伪代码即可，避免 review-time 设计推演。
+
+- **文件头注释更新**：`tests/clustering_determinism.rs` 文件级 doc-comment 从 "B1 §D 类：Clustering determinism harness 骨架" 扩到 "B1 §D 类 + C1 §输出 line 313：Clustering determinism harness 骨架"，覆盖范围加 "跨架构 32-seed bucket id baseline regression guard（§C1 §输出 line 313；与阶段 1 `cross_arch_hash` 同形态）"。
+
+C-rev0 batch 2 出口数据（commit 落地实测；本机 1-CPU AMD64 debug profile）：
+
+- `cargo fmt --all --check` ok / `cargo clippy --all-targets -- -D warnings` ok / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` ok。
+- `cargo test --no-fail-fast`（默认 / debug）：**179 passed / 35 ignored / 0 failed across 24 test crates**（+ 2 doc-test crate 0 测）。相对 C1 commit baseline `179 passed / 34 ignored`，新增 1 个 `#[ignore]`（`cross_arch_bucket_id_baseline_skeleton`），active count 不变（179）→ stage-1 baseline 与 `stage1-v1.0` tag byte-equal 维持（D-272 不退化），preflop 169 lossless 5 active 全绿。
+- **stage-2 8 crates** `75 passed / 16 ignored / 0 failed`：clustering_determinism 5 active + **3 ignored**（+1 batch 2）；其它 7 crates 数字不变。
+
+C-rev0 batch 2 角色边界审计：本 commit 触 `tests/clustering_determinism.rs`（修 1 文件，加 1 个 `#[ignore]` skeleton + 文件头注释扩范围）+ `docs/pluribus_stage2_workflow.md` §C-rev0 batch 2（本子节）+ `CLAUDE.md` 状态翻面（stage-2 8 crates `75 passed / 16 ignored` 数字 + clustering_determinism 5 active + 3 ignored）。`src/` / `benches/` / `Cargo.toml` / `Cargo.lock` / `fuzz/` / `tools/` / `proto/` **未修改一行**——C-rev0 batch 2 [测试] role 0 越界（继承 §C-rev0 / §B-rev0 batch 2 / §B-rev1 / stage-1 §B-rev1 §3 0 越界形态）。
+
+§C-rev0 batch 2 carry forward 处理政策（与 §A-rev0 / §A-rev1 / §B-rev0 / §B-rev0 batch 2 / §B-rev1 / §C-rev0 一致）：
+
+- §B-rev1 §3：[测试] 步骤越界改产品代码 → 当 commit 显式追认。本 batch 2 [测试] 0 越界，无追认事项。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 2 已落地 CLAUDE.md 数字翻面。
+- review 暴露的字面遗漏 → 当 commit `#[ignore]` skeleton + 文档 carve-out 追认（不阻塞下一步实施，C2 commit 取消 ignore 同形态于 stage-1 §B-rev1 / §C-rev1）。
+
+下一步：C2 [实现]（postflop 聚类落地）。按 §C2 §输出 落地 `EquityCalculator` 完整 EHS² / OCHS 计算 + `cluster.rs` k-means + EMD 距离实现（D-230 / D-231 / D-232）+ `tools/train_bucket_table.rs` CLI（RngSource seed → 训练 → 写出 mmap artifact）+ `BucketTable::open(path)` mmap 加载 happy path（错误路径 F2）+ `PostflopBucketAbstraction::map(...)` 完整实现 + bucket table v1 schema 落地（D-240..D-249）+ artifact 同 PR 落到 `artifacts/`（gitignore）。出口标准：C1 全部 `#[ignore]` 测试取消 ignore 后通过（含 batch 2 `cross_arch_bucket_id_baseline_skeleton` 取消 ignore 并 capture `tests/data/bucket-table-arch-hashes-linux-x86_64.txt` baseline）+ 同 seed clustering BLAKE3 byte-identical（重复 10 次）+ 1M `#[ignore]` 完整版在 release profile 跑通 + stage 1 全套 0 failed。
