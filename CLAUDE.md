@@ -93,14 +93,35 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test --release -- --ignored  # full-volume
 
 Stages 2–8 source code does not exist yet. **Stage 1 is closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；stage-2 起步阅读顺序见报告 §10。stage-1 与代码合并解耦的 follow-up 项（不阻塞 stage-2 起步、与 stage-2 实施可并行）：(a) 完整 100k cross-validation 在多核 host 实跑产出 0 diverged 时间戳（D-rev0 / E-rev1 carve-out；105 historical divergent seeds 在 stage-1 闭合 commit 0 diverged 已是稳定证据）；(b) 24h 夜间 fuzz 在 self-hosted runner 连续 7 天无 panic / 无 invariant violation（D2 出口；`.github/workflows/nightly.yml` 已落地 GitHub-hosted matrix）；(c) `slo_eval7_multithread_linear_scaling_to_8_cores` 在 ≥2 核 host 上跑出 efficiency ≥ 0.70 实测数据（E-rev0 carve-out，E-rev1 继承）。三项都与代码合并解耦。
 
+**Stage 2 planning started**（commit `bb421e2`，2026-05-09）：起步规划落地两份文档：
+
+- `docs/pluribus_stage2_validation.md`（171 行）：§1 default 5-action `ActionAbstraction` + §2 preflop lossless 169 信任锚（1326 → 169 等价类 + position / effective_stack / prior_action 复合 InfoSet key）+ §3 postflop bucket 默认 500/500/500（`BucketConfig` 可配置；EHS² + OCHS potential-aware 特征；bucket 内 EHS std dev `< 0.05` + 相邻 bucket EMD `≥ T_emd`）+ §4 抽象映射 SLO（运行时 `≥ 100k mapping/s` 单线程 / bucket lookup `P95 ≤ 10μs` / equity Monte Carlo `≥ 1k hand/s` 离线）+ §5 bucket table mmap 独立 artifact（含 `schema_version` + `feature_set_id` + BLAKE3 自校验 + 5 类 `BucketTableError` 错误路径）+ §6 cluster determinism 头号不变量（同 seed 重复 10 次 BLAKE3 byte-equal + 跨 host clustering byte-identical）+ §7 stage-1 API 冻结（`GameState` / `HandEvaluator` / `HandHistory` / `RngSource` 不允许 stage-2 修改；如发现 API-NNN 不够用必须走 API-NNN-revM 流程）+ §8 SLO 汇总。
+- `docs/pluribus_stage2_workflow.md`（621 行）：`A → B → C → D → E → F` 13-step 模板（mirror stage-1）+ A0 起 D-200..D-260 系列编号占位（D-200 系列 action / D-210 系列 info / D-220 系列 equity & 特征 / D-230 系列 clustering / D-240 系列 bucket table / D-250 系列 crate / D-260 系列外部对照）+ crate 布局 `src/abstraction/`（action / info / preflop / postflop / equity / feature / cluster / bucket_table / map 子模块；`abstraction::map` 子模块 `clippy::float_arithmetic` 死锁，禁止浮点泄露到运行时映射热路径）+ `tools/train_bucket_table.rs` CLI + 反模式继承 stage-1 + 出口检查清单 + 时间预算 12–16 周（与 path.md "stage 2: 2–3 人月" 吻合）+ §修订历史 stub（首条由 A0 关闭后填入；显式 carry forward stage-1 §B-rev1 §3 / §B-rev1 §4 / §C-rev1 / §D-rev0 §1–§3 / §F-rev1 处理政策）。
+
+stage-2 起步四项关键决策已贯通两份文档：
+
+1. 默认 5-action（`fold / check / call / 0.5×pot / 1×pot / all-in`），`ActionAbstractionConfig` 1–14 raise size 配置接口预留但 stage 2 不实跑大配置（仅 smoke test "配置可加载 + 输出确定性"）。
+2. Bucket lookup table 运行时 mmap 大文件（独立二进制 artifact，**stage 6 实时搜索 lookup 表也走这条路**，stage 2 落地基础设施；`artifacts/` gitignore + git LFS / release artifact 分发，**不进 git history**）。
+3. Postflop 默认 `flop = 500 / turn = 500 / river = 500`（path.md ≥ 500 字面），`BucketConfig` 接口可配置每条街独立数量；stage 2 验收**只跑** 500/500/500，其它配置 smoke。
+4. 起步先落 validation + workflow，decisions / api 留 A0 [决策] 起草。
+
+**下一步：stage 2 A0 [决策]** — 起草 `docs/pluribus_stage2_decisions.md`（D-200..D-260 系列）+ `docs/pluribus_stage2_api.md`（API-200 起编号）双骨架，把所有 [D-NNN 待锁] 占位补成实数：D-211 effective_stack bucket 边界 / D-220 equity Monte Carlo iter 与反对称容差 / D-222 OCHS opponent cluster 数 / D-230 clustering 算法（k-means + EMD vs L2）/ D-233 bucket 间 EMD 阈值 `T_emd` / D-241 centroid 量化（u8 quantized vs f32 raw）/ D-260 外部 abstraction 参考选定。A0 出口标准要求 stage-2 [测试] / [实现] agent 启动前所有决策落定签字；A0 关闭后须同步 `pluribus_stage2_validation.md` §修订历史 首条 + `CLAUDE.md` 状态翻 "stage 2 A0 closed"（继承 stage-1 §B-rev1 §4 同步责任）。
+
 ## Documents and their authority
 
-The four stage-1 docs form a contract hierarchy. Read them in this order before making changes:
+The stage-1 docs form a contract hierarchy (frozen as of `stage1-v1.0`). Read them in this order before making stage-1 / stage-2 changes:
 
 1. `docs/pluribus_path.md` — overall 8-stage roadmap, stage acceptance gates, hardware/time budgets. Stages 4–6 thresholds are deliberately stricter than the original Pluribus path; do **not** weaken them.
 2. `docs/pluribus_stage1_validation.md` — quantitative pass criteria for stage 1 (e.g. 1M-hand fuzz, ≥10M eval/s, 100k-hand cross-validation with PokerKit).
 3. `docs/pluribus_stage1_decisions.md` — locked technical/rule decisions (D-001 … D-103). **Authoritative spec for implementers.**
 4. `docs/pluribus_stage1_api.md` — locked Rust API contract (API-NNN). **Authoritative spec for testers.**
+
+Stage-2 docs (in flight as of commit `bb421e2`)：
+
+5. `docs/pluribus_stage2_validation.md` — quantitative pass criteria for stage 2 (preflop 169 lossless 100% / postflop bucket EHS std dev < 0.05 / clustering determinism / abstraction mapping ≥100k mapping/s / mmap bucket table schema). Some thresholds carry `[D-NNN 待锁]` placeholders to be filled by stage-2 A0.
+6. `docs/pluribus_stage2_workflow.md` — 13-step test-first workflow for stage 2, mirrors `pluribus_stage1_workflow.md`. §修订历史 starts empty; A0 closure fills first entry.
+7. `docs/pluribus_stage2_decisions.md` — **NOT YET CREATED**, A0 [决策] output. D-200 起编号（与 stage-1 D-NNN 不冲突）.
+8. `docs/pluribus_stage2_api.md` — **NOT YET CREATED**, A0 [决策] output. API-200 起编号. Authoritative spec for stage-2 testers.
 
 If a change affects a decision or API signature, you must follow the **D-100 / API-NNN-revM** amendment flow described in `pluribus_stage1_decisions.md` §10 and `pluribus_stage1_api.md` §11 — append a `D-NNN-revM` / `API-NNN-revM` entry, never delete the original, and bump `HandHistory.schema_version` if serialization is affected. Both docs have a "修订历史" subsection. Past rev entries:
 
@@ -108,15 +129,15 @@ If a change affects a decision or API signature, you must follow the **D-100 / A
 - **D-039-rev1** (decisions §10) — odd-chip 余 chip 由「逐 1 chip 沿按钮左侧分配」改为「**整笔给按钮左侧最近的获胜者**」，对齐 PokerKit 0.4.14 默认 chips-pushing divmod 语义。每个 pot 仍独立计算；不同 pot 之间互不影响。`payouts()` 行为变化但公开签名不变；`HandHistory.schema_version` 不 bump（序列化格式未动）；`pluribus_stage1_validation.md` §3 同步。该 rev 在 B2 cross-validation 100 手 vs PokerKit 出现 1-chip 分歧后落地，遵循 workflow §B2 「默认假设我方理解错了规则」原则。
 - **API-001-rev1** (api §11) — `HandHistory::replay` / `replay_to` return `Result<_, HistoryError>` instead of `RuleError`; `HistoryError::Rule { index, source: RuleError }` wraps the underlying rule error.
 
-## Stage-1 workflow (multi-agent, strict role boundaries)
+## Workflow (multi-agent, strict role boundaries) — applies to all stages
 
-Stage 1 work is organized as `A → B → C → D → E → F` (13 steps, see `docs/pluribus_stage1_workflow.md`). Every step is tagged `[决策] / [测试] / [实现] / [报告]` and **role boundaries are enforced**:
+Each stage is organized as `A → B → C → D → E → F` (13 steps). Stage-1 workflow lives in `docs/pluribus_stage1_workflow.md`; stage-2 workflow lives in `docs/pluribus_stage2_workflow.md` (mirror structure). Every step is tagged `[决策] / [测试] / [实现] / [报告]` and **role boundaries are enforced**:
 
 - `[测试]` agent writes tests / harness / benchmarks only. **Never modify product code.** If a test reveals a bug, file an issue for `[实现]` to fix.
 - `[实现]` agent writes product code only. **Never modify tests.** If a test fails, fix the product code; only edit the test if it has an obvious bug, and only after review.
 - `[决策]` and `[报告]` produce or modify docs in `docs/`.
 
-When the user asks you to do stage-1 work, identify which step (A0 / A1 / B1 / …) the task belongs to and operate within that role. **Stage 1 is closed**（F3 [报告] is done）：所有 13 步按 workflow §修订历史 时间线闭合；下一步是 stage 2 起步（参见 `docs/pluribus_path.md` §阶段 2）。历史关键边界事件：(1) B2 closure crossed the [实现]→[测试] boundary by completing two test files that B1 had deliberately left as stubs — see workflow §修订历史 B-rev1; (2) C2 closure carved out 「规则引擎 100k cross-validation 测试」 留给 [测试] agent — see §C-rev1; (3) D1 [测试] 实跑 100k cross-validation 暴露 105 条产品代码分歧 — see §C-rev2; (4) D2 [实现] 修完 105 条分歧 + 同 commit 翻新 2 条 scenario 测试到 D-037-rev1 语义；越界以 carve-out 追认 — see §D-rev0; (5) E1 [测试] 0 越界落地 bench harness + SLO 断言；多核多线程 SLO 在 1-CPU host 走 skip-with-log 留给多核 follow-up — see §E-rev0; (6) E2 [实现] 0 越界把 5/5 SLO 断言全部转绿（多线程在 1-CPU host 走 skip-with-log 不变）；apply 路径去 clone + 评估器换 bitmask 顺带让 1M fuzz / 1M determinism / 1M three-piece evaluator 等正确性测试加速 5–24× — see §E-rev1; (7) F1 [测试] 0 越界落地 schema 兼容 / corrupted history / evaluator lookup 三件套；评估器 lookup-table 加载失败路径在 E2 const-baked 设计下结构性缺位，F1 用结构性断言 + 黑盒完备性扫描间接覆盖；4 条域违规走 `#[ignore]` 留给 F2 自由 trade-off — see §F-rev0; (8) F2 [实现] 0 越界 trade-off 选择 「错误前移到 from_proto」，仅触 `src/history.rs` 一文件加 5 处域校验，4/4 F1→F2 carry-over `--ignored` 全部翻绿，「decode 后 seat 全部 < n_seats」 成单点不变量 — see §F-rev1; (9) F3 [报告] 0 越界落地 `docs/pluribus_stage1_report.md` + git tag `stage1-v1.0`；阶段 1 出口检查清单可在单核 host 落地的项目全部归零，剩余 3 项 carve-out 与代码合并解耦 — see §F-rev2.
+When the user asks you to do stage work, identify which stage and which step (A0 / A1 / B1 / …) the task belongs to and operate within that role. **Stage 1 is closed**（F3 [报告] is done）：所有 13 步按 workflow §修订历史 时间线闭合。**Stage 2 planning started**（commit `bb421e2`）：validation + workflow 起步文档已落地；下一步是 stage 2 A0 [决策] 起草 `pluribus_stage2_decisions.md` + `pluribus_stage2_api.md`。stage-2 §修订历史 首条新增项必须显式 carry forward stage-1 处理政策（§B-rev1 §3 越界追认 / §B-rev1 §4 CLAUDE.md 同步责任 / §C-rev1 零产品代码改动也需 closure / §D-rev0 §1–§3 D-NNN-revM 翻语义评估测试反弹 / §F-rev1 错误前移单点不变量）。历史 stage-1 关键边界事件：(1) B2 closure crossed the [实现]→[测试] boundary by completing two test files that B1 had deliberately left as stubs — see workflow §修订历史 B-rev1; (2) C2 closure carved out 「规则引擎 100k cross-validation 测试」 留给 [测试] agent — see §C-rev1; (3) D1 [测试] 实跑 100k cross-validation 暴露 105 条产品代码分歧 — see §C-rev2; (4) D2 [实现] 修完 105 条分歧 + 同 commit 翻新 2 条 scenario 测试到 D-037-rev1 语义；越界以 carve-out 追认 — see §D-rev0; (5) E1 [测试] 0 越界落地 bench harness + SLO 断言；多核多线程 SLO 在 1-CPU host 走 skip-with-log 留给多核 follow-up — see §E-rev0; (6) E2 [实现] 0 越界把 5/5 SLO 断言全部转绿（多线程在 1-CPU host 走 skip-with-log 不变）；apply 路径去 clone + 评估器换 bitmask 顺带让 1M fuzz / 1M determinism / 1M three-piece evaluator 等正确性测试加速 5–24× — see §E-rev1; (7) F1 [测试] 0 越界落地 schema 兼容 / corrupted history / evaluator lookup 三件套；评估器 lookup-table 加载失败路径在 E2 const-baked 设计下结构性缺位，F1 用结构性断言 + 黑盒完备性扫描间接覆盖；4 条域违规走 `#[ignore]` 留给 F2 自由 trade-off — see §F-rev0; (8) F2 [实现] 0 越界 trade-off 选择 「错误前移到 from_proto」，仅触 `src/history.rs` 一文件加 5 处域校验，4/4 F1→F2 carry-over `--ignored` 全部翻绿，「decode 后 seat 全部 < n_seats」 成单点不变量 — see §F-rev1; (9) F3 [报告] 0 越界落地 `docs/pluribus_stage1_report.md` + git tag `stage1-v1.0`；阶段 1 出口检查清单可在单核 host 落地的项目全部归零，剩余 3 项 carve-out 与代码合并解耦 — see §F-rev2.
 
 ## Non-negotiable invariants (apply to all stage-1 code)
 
