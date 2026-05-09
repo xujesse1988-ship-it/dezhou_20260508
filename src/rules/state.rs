@@ -123,8 +123,10 @@ impl GameState {
                 schema_version: 1,
                 config: config.clone(),
                 seed,
-                actions: Vec::new(),
-                board: Vec::new(),
+                // 6-max NLHE 单手实测分布的 99 分位 < 32 actions（E1 / D1 1M
+                // fuzz 数据），预分配避免 simulate 热路径上的多次 Vec realloc。
+                actions: Vec::with_capacity(32),
+                board: Vec::with_capacity(5),
                 hole_cards: history_holes,
                 final_payouts: Vec::new(),
                 showdown_order: Vec::new(),
@@ -206,11 +208,16 @@ impl GameState {
     }
 
     /// 应用一个动作。失败时返回错误，状态不改变（I-005）。
+    ///
+    /// **E2 注**：旧实现先 `self.clone()` 再 `apply_inner`，以「克隆-提交」给
+    /// I-005 兜底；克隆每手 GameState（含 `HandHistory.actions`、`config`、
+    /// `players`、`hole_cards`、`raise_option_open` 等约 5–10 个 Vec / 长度
+    /// 与 n_seats 等比的字段）在 simulate 热路径上会扣掉 ~50% 吞吐。E2 把
+    /// `apply_inner` 改为「严格先校验、后变更」原子语义后克隆失去用途——
+    /// 任何返回 `Err` 的子路径都在 mutation 之前 early-return，状态不变。
+    /// 详见 `docs/pluribus_stage1_workflow.md` §修订历史 E-rev1。
     pub fn apply(&mut self, action: Action) -> Result<(), RuleError> {
-        let mut next = self.clone();
-        next.apply_inner(action)?;
-        *self = next;
-        Ok(())
+        self.apply_inner(action)
     }
 
     pub fn street(&self) -> Street {
