@@ -677,3 +677,39 @@ batch 7 触发文件：`docs/pluribus_stage2_api.md`（§2 trait doc + §F21 两
 A1 + batch 7 角色边界审计：`src/abstraction/{action,info,preflop,postflop,equity,bucket_table,cluster,feature,map/mod}.rs` 公开 trait / 类型 / 方法签名 / `unimplemented!()` 占位 / `#![deny(clippy::float_arithmetic)]` inner attr / D-228 op_id 常量 **未修改一行**；`tests/api_signatures.rs` trip-wire **未修改一行**；`Cargo.toml` / `Cargo.lock` 依赖列表 **未修改一行**——0 公开签名漂移、0 trip-wire 漂移、0 测试回归。
 
 下一步：B1 [测试]（核心场景测试 + harness 骨架）→ B2 [实现] → C1 [测试] / C2 [实现]（聚类落地）→ D1 / D2（fuzz + 规模）→ E1 / E2（性能 SLO）→ F1 / F2 / F3（收尾），按 §步骤序列 13-step 顺序推进。
+
+#### B1 关闭（2026-05-09）— B-rev0
+
+B1 [测试] 关闭。同 commit 落地 §B1 §输出 全部 5 类：
+
+- **A 类核心 fixed scenario 测试**（10 + 7 = 17 个 `#[test]`，跨 `tests/action_abstraction.rs` + `tests/info_id_encoding.rs` 两文件）：
+    - `tests/action_abstraction.rs`：`action_abs_default_5_actions_open_raise_legal` / `action_abs_fold_disallowed_after_check` / `action_abs_bet_pot_falls_back_to_min_raise_when_below`（按 default 100BB 配置下 0.5×pot 几乎总满足 ≥ min_to 的工程现实，断言改为**结构性不变量** `Raise.to ≥ min_to`，与 AA-003-rev1 ① 等价；具体数值 fallback 场景留 C1 200+ scenarios）/ `action_abs_bet_falls_back_to_allin_when_above_stack`（短码 BB stack=450 面对 UTG raise，1.0×pot=650 超 stack，AllIn { to = 450 }，AA-003-rev1 ②）/ `action_abs_determinism_repeat_smoke`（AA-007 1k smoke，full 1M 留 D1）+ D-202-rev1 / `BetRatio::from_f64-rev1` 量化协议 4 条断言（half-to-even / 越界 None / DuplicateRatio / RaiseCountOutOfRange）+ §7 桥接 `AbstractAction::to_concrete` 字段提取断言。
+    - `tests/info_id_encoding.rs`：`preflop_169_aces_canonical` / `preflop_169_suited_offsuit_distinction` / `preflop_169_position_changes_infoset` / `preflop_169_stack_bucket_changes_infoset`（D-211-rev1 / API §9 InfoAbstraction::map 配套约束影响 ③ 字面要求 100 BB / 200 BB / 50 BB 三种 TableConfig 桶分配 3 / 4 / 2 断言）/ `preflop_169_prior_action_changes_infoset`（D-212 BettingState 5 状态 FacingBetNoRaise vs FacingRaise1 区分性）/ `info_abs_postflop_bucket_id_in_range`（`#[ignore]`，B2 决定 `PostflopBucketAbstraction` stub 构造路径后取消 ignore）/ `info_abs_determinism_repeat_smoke`（IA-004 1k smoke）/ `info_id_reserved_bits_must_be_zero`（IA-007 bit 38..64 全零）。
+- **B 类 preflop 169 lossless 完整 1326 → 169 枚举测试**（`tests/preflop_169.rs`，5 个 `#[test]`）：阶段 2 信任锚（§B1 line 228 字面）。`preflop_169_anchor_table_closed_form`（D-217 12 锚点公式独立验证）+ `preflop_169_lossless_complete_coverage_closed_form`（1326 起手枚举 → 169 类全覆盖 / hole 计数 6/4/12 / 段长 13/78/78，**完全独立**于 `PreflopLossless169` stub）+ `preflop_169_lossless_via_stub`（12 锚点 stub 比对，B2 driver）+ `preflop_169_lossless_full_via_stub`（1326 完整 stub 比对，B2 driver）+ `preflop_169_hole_count_in_class_complete`（169 类 hole_count_in_class stub-driven）。
+- **C 类 equity Monte Carlo 自洽性 harness**（`tests/equity_self_consistency.rs`，9 个 `#[test]` 全部 `#[ignore]`，B2 落地 `MonteCarloEquity` 后取消 ignore）：EQ-001-rev1 反对称按街分流（river / turn / flop 严格 1e-9 + preflop strict 双 RngSource 同 sub_seed 1e-9 + preflop noisy 10k iter 0.005 + preflop noisy 1k iter 0.02）+ preflop EHS 单调性 smoke（AA vs 72o）+ EQ-005 deterministic 1k 重复 byte-equal + EquityError 4 类错误路径（OverlapBoard / InvalidBoardLen / OverlapHole）。容差由 D-220a-rev1 锁定，[测试] 不自己拍数。
+- **D 类 clustering determinism harness 骨架**（`tests/clustering_determinism.rs`，3 active + 4 ignored）：D-228 op_id 命名空间分类 + 全局唯一性两条 const-only 测试（不依赖 stub）+ rng_substream 模块路径编译验证 + 4 条 `#[ignore]` 骨架（SplitMix64 byte-equal / 32 sub_seed 区分性 / clustering BLAKE3 byte-equal 占位 / 跨线程 bucket id 一致占位，C2/D1 接入完整）。
+- **E 类 criterion benchmark harness 骨架**（追加到 `benches/baseline.rs` per D-259 命名前缀 `abstraction/*`，与 stage-1 5 条 bench 共存）：`abstraction/info_mapping/preflop_lossless_169` 单次 (GameState, hole) → InfoSetId + `abstraction/equity_monte_carlo/flop_1k_iter` 单次 equity 1k iter。无 SLO 阈值断言（E1 才接到 `tests/perf_slo.rs::stage2_*`）。`cargo bench` 触到这两个 bench 时 panic（unimplemented），与 stage-1 §E1 落地前 SLO 全 fail 同形态。
+
+B1 出口数据（commit 落地实测；本机 1-CPU AMD64 debug profile）：
+
+- `cargo build --all-targets` ok / `cargo fmt --all --check` ok / `cargo clippy --all-targets -- -D warnings` ok / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` ok。
+- `cargo test --no-run` 编译 21 test crates（stage-1 16 + stage-2 5 新增）成功，`tests/api_signatures.rs` trip-wire（A1 落地的 50+ 签名绑定 + D-228 全 15 op_id 常量绑定）byte-equal 不变，stage 2 公开 API 0 签名漂移。
+- `cargo test --no-fail-fast`（默认）：109 passed / 20 failed / 33 ignored across 21 test crates。其中：
+    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`，与 stage1-v1.0 tag byte-equal（D-272 不退化要求满足）。
+    - **stage-2 B1 新 5 crates** `5 passed / 20 failed / 14 ignored`：A 类 17 panic on unimplemented（§B1 §出口 line 248 字面 "A 类测试编译通过、运行失败（因 unimplemented!()）" ✓），B 类 2 closed-form 独立通过 + 3 stub-driven panic（§B1 §出口 line 249 字面 "至少枚举正确性测试可独立通过（不依赖产品 stub 之外的实现）" ✓），C/D 类 14 ignored + 3 const-only active 通过（§B1 §出口 line 250 字面 "C / D / E 类 harness 能跑出占位结果或断言失败，流程不 panic" ✓——ignored 路径默认不触发 unimplemented panic）。
+- `cargo bench --bench baseline` 未触发（B1 不要求实跑；E1 才接 bench-quick / bench-full CI 路径）。
+
+B1 角色边界审计：本 commit 仅写 / 改 `tests/`、`benches/`、`docs/` 与 `CLAUDE.md`：
+
+- 新增 5 个 stage-2 测试文件：`tests/action_abstraction.rs` / `tests/info_id_encoding.rs` / `tests/preflop_169.rs` / `tests/equity_self_consistency.rs` / `tests/clustering_determinism.rs`。
+- 修订 1 个 stage-1 [测试] bench 文件：`benches/baseline.rs` 追加 `bench_abstraction_info_mapping` / `bench_abstraction_equity_monte_carlo` 两 group + `criterion_group!` 列表追加（D-259 命名前缀 `abstraction/*`，与 stage-1 5 条 bench 共存，stage-1 既有 `bench_eval7` / `bench_simulate` / `bench_history` 实现 0 修改）。
+- 修订 `docs/pluribus_stage2_workflow.md` §修订历史 追加本 §B-rev0 + `CLAUDE.md` 状态翻 "stage 2 B1 closed"。
+- `src/`、`Cargo.toml`、`Cargo.lock`、`fuzz/`、`tools/`、`proto/` **未修改一行**——B1 [测试] 0 越界（继承 stage-1 §B-rev1 §3 / §C-rev1 / §D-rev0 0 越界形态）。
+
+§B-rev0 carry forward 处理政策（与 §A-rev0 / §A-rev1 一致）：
+
+- §B-rev1 §3：[测试] 步骤越界改产品代码 → 当 commit 显式追认；不静默扩散到下一步。本 commit 0 越界，无追认事项。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步` 把仓库状态、出口数据、修订历史索引补齐。本 commit 落地。
+- §C-rev1 / §D-rev0 / §F-rev1 既往政策保持继承不变。
+
+下一步：B2 [实现]（让 B1 全绿，按 §B2 §输出 列表落地 `DefaultActionAbstraction` / `PreflopLossless169` / `PostflopBucketAbstraction` 占位实现 / `MonteCarloEquity` 朴素实现 / `EHSCalculator` 朴素实现）。B2 出口 `cargo test`（默认）必须把本 §B-rev0 实测 109 passed → 至少 109 + 17 (A 类 panic 转通过) + 3 (B 类 stub-driven panic 转通过) - 1 (info_abs_postflop_bucket_id_in_range 仍 ignored 直到 B2 stub 路径设计) = ≥ 128 passed，并验证 §B2 §出口 line 281 "equity Monte Carlo 反对称误差在 D-220 容差内"（B2 取消 9 条 C 类 #[ignore] 后跑通）。具体计数留 B2 [实现] 实测核对。

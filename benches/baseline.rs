@@ -229,5 +229,86 @@ fn bench_history(c: &mut Criterion) {
 // `--sample-size 10 --warm-up-time 1 --measurement-time 1 --noplot`）总是优先于
 // 这里的 baseline 设置——quick CI 路径压到 30s 以内、nightly 全量走默认。
 
-criterion_group!(baseline, bench_eval7, bench_simulate, bench_history);
+criterion_group!(
+    baseline,
+    bench_eval7,
+    bench_simulate,
+    bench_history,
+    // 阶段 2 B1 占位 bench（D-259 命名前缀 `abstraction/*`，与阶段 1 5 条
+    // bench 共存；E1 才接 SLO 断言）。
+    bench_abstraction_info_mapping,
+    bench_abstraction_equity_monte_carlo,
+);
 criterion_main!(baseline);
+
+// ============================================================================
+// 阶段 2 §B1 §E 类：抽象层 bench harness 骨架（D-259 命名前缀 `abstraction/*`）
+// ============================================================================
+//
+// 覆盖 `pluribus_stage2_workflow.md` §B1 §输出 E 类清单：
+//
+// - 单次 InfoSet mapping（`(GameState, hole) → InfoSetId`，对应 SLO D-280
+//   单线程 ≥ 100,000 mapping/s，但 B1 不做断言）
+// - 单次 equity Monte Carlo（`equity(hole, board, rng)`，对应 SLO D-282
+//   单线程 ≥ 1,000 hand/s 默认 10k iter，但 B1 不做断言）
+//
+// **B1 状态**：A1 阶段 `PreflopLossless169::map` / `MonteCarloEquity::equity`
+// 全部 `unimplemented!()`，运行 `cargo bench --bench baseline` 触到这两个 bench
+// 时立即 panic。本 harness 落地 bench 入口 / 输入构造 / `Throughput::Elements`
+// 单位钉法，B2 / E1 / E2 [实现] 与 [测试] 在此基础上扩展（E1 才接 SLO 阈值
+// 断言到 `tests/perf_slo.rs::stage2_*`，与 stage 1 同型）。
+//
+// 角色边界：本段属 `[测试]` agent 产物（继承 baseline.rs 顶部声明）。
+
+fn bench_abstraction_info_mapping(c: &mut Criterion) {
+    use poker::{InfoAbstraction, PreflopLossless169, Rank, Suit};
+
+    let cfg = TableConfig::default_6max_100bb();
+    let state = GameState::new(&cfg, 0);
+    let abs = PreflopLossless169::new();
+    let hole = [
+        Card::new(Rank::Ace, Suit::Spades),
+        Card::new(Rank::Ace, Suit::Hearts),
+    ];
+
+    let mut group = c.benchmark_group("abstraction/info_mapping");
+    group.throughput(Throughput::Elements(1));
+    // bench：单次 (GameState, hole) → InfoSetId。B1 阶段 panic（unimplemented）。
+    group.bench_function("preflop_lossless_169", |b| {
+        b.iter(|| black_box(abs.map(black_box(&state), black_box(hole))));
+    });
+    group.finish();
+}
+
+fn bench_abstraction_equity_monte_carlo(c: &mut Criterion) {
+    use std::sync::Arc;
+
+    use poker::{EquityCalculator, MonteCarloEquity, Rank, Suit};
+
+    let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
+    let calc = MonteCarloEquity::new(Arc::clone(&evaluator)).with_iter(1_000);
+
+    let hole = [
+        Card::new(Rank::Ace, Suit::Spades),
+        Card::new(Rank::Ace, Suit::Hearts),
+    ];
+    // 固定 flop 板，避开 hole。
+    let board: [Card; 3] = [
+        Card::new(Rank::Five, Suit::Spades),
+        Card::new(Rank::Eight, Suit::Hearts),
+        Card::new(Rank::Ten, Suit::Diamonds),
+    ];
+
+    let mut group = c.benchmark_group("abstraction/equity_monte_carlo");
+    group.throughput(Throughput::Elements(1));
+    // bench：单次 equity (1k iter，CI 短测试模式)。B1 阶段 panic（unimplemented）。
+    group.bench_function("flop_1k_iter", |b| {
+        let mut seed_counter = 0u64;
+        b.iter(|| {
+            let mut rng = ChaCha20Rng::from_seed(seed_counter);
+            seed_counter = seed_counter.wrapping_add(1);
+            black_box(calc.equity(black_box(hole), black_box(&board), &mut rng))
+        });
+    });
+    group.finish();
+}
