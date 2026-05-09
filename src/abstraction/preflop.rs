@@ -1,6 +1,14 @@
 //! Preflop 169 lossless 抽象（API §2）。
 //!
 //! `PreflopLossless169` + `canonical_hole_id` helper（D-217 / D-218-rev1）。
+//!
+//! D-252 浮点边界：本文件位于运行时映射热路径（`InfoAbstraction::map` 落地 +
+//! `compute_*` helper），与 `abstraction::map` 子模块同级承担整数 key 计算，
+//! 故同样顶 `#![deny(clippy::float_arithmetic)]` inner attribute——任何 `f32` /
+//! `f64` 算术触发硬错。浮点特征 / clustering 仅允许在 `abstraction::equity` /
+//! `abstraction::cluster` / `abstraction::feature` sibling 模块出现。
+
+#![deny(clippy::float_arithmetic)]
 
 use crate::core::{Card, ChipAmount, Street};
 use crate::rules::action::Action;

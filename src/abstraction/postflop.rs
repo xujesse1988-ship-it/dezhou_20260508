@@ -2,6 +2,15 @@
 //!
 //! `PostflopBucketAbstraction` + `canonical_observation_id` helper
 //! （D-216-rev1 / D-218-rev1 / D-244-rev1）。
+//!
+//! D-252 浮点边界：本文件位于运行时映射热路径（`InfoAbstraction::map` 落地 +
+//! `canonical_observation_id` 整数 hash + `BucketTable::lookup` 整数 key），
+//! 与 `abstraction::map` 子模块同级承担整数 key 计算，故同样顶
+//! `#![deny(clippy::float_arithmetic)]` inner attribute——任何 `f32` / `f64`
+//! 算术触发硬错。浮点特征 / clustering 仅允许在 `abstraction::equity` /
+//! `abstraction::cluster` / `abstraction::feature` sibling 模块出现。
+
+#![deny(clippy::float_arithmetic)]
 
 use crate::core::Card;
 use crate::rules::state::GameState;
