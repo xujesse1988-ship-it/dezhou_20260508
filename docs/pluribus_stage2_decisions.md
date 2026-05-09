@@ -60,9 +60,58 @@
 | D-214 | postflop `BucketConfig` API | `pub struct BucketConfig { pub flop: u32, pub turn: u32, pub river: u32 }`，构造时校验每条街 ∈ [10, 10_000]。`BucketConfig::default_500_500_500()` 返回默认配置。配置变更时 `BucketTable.schema_version` 不 bump，但 `feature_set_id`（D-240）随特征组合变化。 |
 | D-215 | InfoSet key 统一 64-bit layout | 单一 `u64` `InfoSetId` 字段顺序（低位起，跨 preflop / postflop **共用同一 layout**，避免 stage 1 `Street` enum 与抽象层语义解耦）：① `bucket_id`（**24 bit**，preflop 取值 = `hand_class_169` ∈ 0..169，postflop 取值 = `BucketTable::lookup` 返回的 cluster id ∈ 0..`bucket_count(street)`；24 bit 上限 16M 覆盖 D-214 当前 [10, 10_000] 与未来 stage 3+ 扩 bucket 数 / 街合并编码）；② `position_bucket`（**4 bit**，0..n_seats-1，支持 D-030 全部 2..=9 桌大小）；③ `stack_bucket`（**4 bit** 留 slack，0..4 = D-211 5 桶；postflop **沿用 preflop 起手 stack bucket**——postflop 不重算 effective_stack 进 InfoSet）；④ `betting_state`（**3 bit**，0..4 = D-212 5 状态 enum 值）；⑤ `street_tag`（**3 bit**，0..3 = `Preflop / Flop / Turn / River`，preflop 显式编码 `street_tag = 0` 而非靠 "其余字段为 0" 启发式判断）；⑥ `reserved`（**26 bit**，必须为 0；任何非零位写入是 P0 阻塞 bug）。该 64-bit 编码字节级稳定，下游 CFR 可直接对 `InfoSetId.raw()` 做 hash key。完整 betting tree path 编码（如未来 4-bet pot vs 5-bet pot 树分裂）留 stage 3 决策，届时通过 `betting_state` 5 状态扩展或新增 history-compressed bit 实现。 |
 | D-216 | preflop / postflop bucket_id 来源差异 | preflop：`bucket_id = hand_class_169` 直接映射，不经 k-means（继承 D-217 编号 + D-239 lossless）。postflop：`bucket_id = BucketTable::lookup(street_tag, board_canonical_id, hole_canonical_id)` 由 mmap 命中返回；street 间 bucket id 命名空间独立（flop bucket 17 与 turn bucket 17 是不同 InfoSet，由 `street_tag` 字段消歧）。两路径下 `bucket_id` 字段宽度都是 D-215 的 24 bit。InfoSetId 跨街 byte-equal 仅在 (bucket_id, position, stack, betting_state, street_tag) 五元组完全相同时成立——这正是 CFR 训练所需的语义。 |
-| D-217 | preflop 169 等价类编号 | `hand_class_169 ∈ 0..169`：`0..13` = pocket pairs（22, 33, ..., AA 升序）；`13..91` = suited（按高牌主排序、低牌副排序：32s, 42s, 43s, 52s, ..., AKs）；`91..169` = offsuit（同顺序）。具体编号表落在 `tests/preflop_169.rs` 的 lookup 断言里，A0 仅锁原则；A1 [实现] 落具体数表。 |
+| D-217 | preflop 169 等价类编号（A0 锁定 closed-form 公式） | `hand_class_169 ∈ 0..169`，从 canonical `(rank_high, rank_low, suited)` 三元组用 closed-form 公式直接计算。详见下方 **D-217 详解**——A0 锁定公式 + 12 条边界锚点表，B1 [测试] 在 [实现] 之前即可基于本表写完整 1326 → 169 枚举断言（test-first ground truth），不依赖 [实现] 落地具体数表。 |
 | D-218 | canonical hand / board id | hole canonical：22 → `(rank=2, rank=2, suited=false)` → 唯一 id；suited 与 offsuit 各异。board canonical：考虑花色对称性等价类，按 rank 多重集 + suit 模式 canonicalize；具体算法 A1 落地。canonical id 是 `u32`，足够覆盖（5-card board canonical 上限 ~134k；7-card 上限 ~1.5M，远在 u32 内）。 |
 | D-219 | postflop 不依赖 preflop key 的隔离原则 | postflop bucket 仅依赖 `(street, board, hole)`（特征只看牌力 / 公牌结构），**不嵌入** position / stack / betting_state。preflop key 的位置 / stack / betting_state 信息留在 `InfoSetId` 复合字段里（D-215 / D-216），不渗入 postflop bucket。理由：postflop bucket 表是 cluster 输出，跨手通用；与博弈树位置无关，便于阶段 6 实时搜索复用同一 mmap 表。 |
+
+### D-217 详解
+
+```rust
+fn hand_class_169(rank_a: Rank, rank_b: Rank, suited: bool) -> u8 {
+    // 排序：high ≥ low（rank 数值越大越强，继承 stage 1 D-001 Rank 枚举：
+    // Two = 0, Three = 1, ..., Ace = 12）
+    let (high, low) = if (rank_a as u8) >= (rank_b as u8) {
+        (rank_a as u8, rank_b as u8)
+    } else {
+        (rank_b as u8, rank_a as u8)
+    };
+    if high == low {
+        // Pocket pair：class id = rank 数值（22→0, 33→1, ..., AA→12）
+        high                              // ∈ 0..13
+    } else if suited {
+        // Suited：lex order on (high, low) ascending
+        13 + high * (high - 1) / 2 + low  // ∈ 13..91
+    } else {
+        // Offsuit：同 suited 顺序 + offset 78
+        91 + high * (high - 1) / 2 + low  // ∈ 91..169
+    }
+}
+```
+
+**段长校验**：13 个 pocket pair + 78 个 suited（`C(13, 2) = 78`）+ 78 个 offsuit = **169 类**总计 ✓。**hole 计数**（D-217 每类 hole 组合数 × 类数 = 1326 起手牌）：每 pocket pair 6 组合（`C(4, 2)` 花色对）、每 suited 4 组合（4 花色）、每 offsuit 12 组合（`4 × 3` 花色对），总和 `13×6 + 78×4 + 78×12 = 78 + 312 + 936 = 1326` ✓。
+
+**边界锚点表**（B1 [测试] `tests/preflop_169.rs` 必须断言以下 12 条，作为公式正确性的最小验证集；其余 157 条由公式直接生成枚举断言）：
+
+| Hand | high | low | suited | class id |
+|---|---|---|---|---|
+| 22 | 0 (Two) | 0 | n/a | **0** |
+| 33 | 1 | 1 | n/a | 1 |
+| AA | 12 (Ace) | 12 | n/a | **12** |
+| 32s | 1 | 0 | true | **13** |
+| 42s | 2 | 0 | true | 14 |
+| 43s | 2 | 1 | true | 15 |
+| 52s | 3 | 0 | true | 16 |
+| AKs | 12 | 11 | true | **90** |
+| 32o | 1 | 0 | false | **91** |
+| 42o | 2 | 0 | false | 92 |
+| 43o | 2 | 1 | false | 93 |
+| AKo | 12 | 11 | false | **168** |
+
+**与 D-218 canonical hole id 的关系**：D-218 的 hole canonical id（0..1326）→ D-217 `hand_class_169`（0..169）是多对一映射；逆向映射（`hand_class_169` → 代表性 canonical hole）由 [实现] 选取，不在本决策范围。
+
+**与 BucketTable preflop lookup table 的关系**：D-244 §⑫ preflop 段 `[u32; 1326]` 每个 entry = 该 hole canonical id 的 `hand_class_169` 值（0..168），`BucketTable::lookup(StreetTag::Preflop, _board_canonical_id, hole_canonical_id)` 返回该值。
+
+**与 D-260 / D-261 OpenSpiel 对照的关系**：D-261 sanity check "可能不同顺序但 169 类成员一致"——本 closed-form 公式让 [测试] 与 OpenSpiel 编号无关地枚举我方 169 类成员（13 pair + 78 suited + 78 offsuit），仅做集合相等比对（D-262 P0 阻塞条件）。我方编号顺序锁定后**不**与 OpenSpiel 顺序对齐——CFR 训练只看 InfoSetId byte-equal，不看跨实现编号顺序一致。
 
 ---
 
