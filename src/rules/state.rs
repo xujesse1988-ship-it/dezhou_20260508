@@ -569,6 +569,11 @@ impl GameState {
         for (idx, player) in self.players.iter().enumerate() {
             self.raise_option_open[idx] = player.status == PlayerStatus::Active;
         }
+        // D-037-rev1: showdown_order 起点 = **最后一条 betting round** 的
+        // 最后一次 voluntary bet/raise（不是整手内最后一次）。匹配 PokerKit
+        // 0.4.14 `_begin_betting` (state.py:3381) 在每条街起手清 opener_index
+        // 的语义。空缺时 compute_showdown_order 回退到 SB。
+        self.last_aggressor = None;
     }
 
     fn reset_committed_this_round(&mut self) {
@@ -706,7 +711,16 @@ impl GameState {
     fn compute_payouts(&self) -> Vec<(SeatId, i64)> {
         let mut awards = vec![0u64; self.players.len()];
         let levels = self.contribution_levels();
-        let mut prev = 0;
+
+        // D-039 / D-039-rev1 配套（2026-05-08 补丁）：先按 contender 集合
+        // 合并相邻 contribution level 成 main pot + 各 side pot，再做 base/rem
+        // 划分。与 PokerKit `state.pots` (state.py:2378-2380) 的 pot 合并逻辑
+        // 一致。直接逐 level 切 sub-pot 会让原本应整除的 main pot 因分子被切
+        // 散而生成多余的 1-chip remainder，触发 100k cross-validation 桶 B-2way
+        // (28 seeds) / 桶 B-3way (67 seeds) 分歧。详见
+        // `docs/xvalidate_100k_diverged_seeds.md`。
+        let mut pots: Vec<(u64, Vec<usize>)> = Vec::new();
+        let mut prev = 0u64;
         for level in levels {
             let contributors: Vec<usize> = self
                 .players
@@ -743,6 +757,21 @@ impl GameState {
                 awards[contributors[0]] += amount;
                 continue;
             }
+
+            // Merge with the most recently appended pot if the contender set
+            // is identical (same as PokerKit's `while pots and
+            // pots[-1].player_indices == tuple(player_indices): amount +=
+            // pots.pop().amount` collapse).
+            if let Some(last) = pots.last_mut() {
+                if last.1 == contenders {
+                    last.0 += amount;
+                    continue;
+                }
+            }
+            pots.push((amount, contenders));
+        }
+
+        for (amount, contenders) in pots {
             let winners = self.pot_winners(&contenders);
             let base = amount / winners.len() as u64;
             let remainder = amount % winners.len() as u64;
@@ -752,7 +781,8 @@ impl GameState {
             if remainder > 0 {
                 if let Some(winner) = self.odd_chip_order(&winners).first() {
                     // PokerKit's chips-pushing divmod gives a pot's whole
-                    // remainder to the first winner in button-left order.
+                    // remainder to the first winner in button-left order
+                    // (D-039-rev1).
                     awards[*winner] += remainder;
                 }
             }

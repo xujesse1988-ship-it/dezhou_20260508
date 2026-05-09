@@ -239,6 +239,76 @@
   - **影响**：`payouts()` 语义改变但公开签名不变；`HandHistory` schema
     不变，不 bump `schema_version`。`pluribus_stage1_validation.md` §3
     与实现注释同步改为该语义。
+  - **澄清（D2 [实现] / D-039-rev1 配套补丁，2026-05-08）**：D-039 原文
+    "main pot 与每个 side pot" 中的 "pot" 指 **按 contender 集合合并后的
+    pot**（标准 main pot + 各 side pot），不是 "每个 contribution level 一个
+    sub-pot"。即：建 pot 时若两条相邻 contribution level 的 contender 集合
+    完全相同，须合并为单一 pot 再做 base/rem 划分；rem 在合并后的总额上
+    算一次。该解读与 PokerKit `state.pots` 属性一致（`state.py` 2378-2380
+    `while pots and pots[-1].player_indices == tuple(player_indices): amount
+    += pots.pop().amount`）。该澄清不新增 D-NNN-revM 编号——D-039 文字本身
+    无歧义，仅 B2 实现按 contribution level 切 sub-pot 是错的；100k
+    cross-validation 桶 B-2way (28 seeds) / 桶 B-3way (67 seeds) 由该 bug
+    产生，详见 `docs/xvalidate_100k_diverged_seeds.md`。
+
+- **D-037-rev1** (2026-05-08)：D-037 原文 "last_aggressor = **本手内最后一次**
+  voluntary bet 或 raise 的玩家" 中的 **作用域** 钉为 **本手最后一次 betting
+  round（即 showdown 前的最后一条街）内的最后一次 voluntary bet/raise**，
+  而不是 "整手内最后一次"。若该 betting round 内无 voluntary bet/raise，
+  按 D-037 原 fallback 走（从 SB 起向左）。
+  - **背景**：D-085 / `cross_validation_pokerkit_100k_random_hands` 第一次
+    实跑（commit `2ea667b`，N=8 × 12,500 hand）暴露 10 条 showdown_order
+    分歧（桶 A，最早 seed=1786），形态全为 2-人 swap：典型场景是 BTN
+    preflop raise → 三街全 check 到 river → 摊牌时 BTN 应该不再 "先亮"。
+    PokerKit 0.4.14 的 `opener_index` 在每条街起 `_begin_betting`
+    (`state.py:3381`) 时被重置为 None，按位置 (`Opening.POSITION`) 算回
+    SB；之后每次 `complete_bet_or_raise_to` (`state.py:4100`)
+    `opener_index = player_index` 更新到本街最新的加注者。等到摊牌
+    `_begin_showdown` (`state.py:4135-4145`) 用最终 `opener_index` 确定
+    showdown 起点。换言之 PokerKit 的 "last aggressor" 天然就是 per-betting
+    round 而非 per-hand。原 D-037 把作用域钉到 "本手内"，与 PokerKit 不
+    一致；按 workflow §B2 风险条款 "默认假设我方理解错了规则" 应对齐
+    PokerKit。
+  - **新规则**：
+    1. `last_aggressor` 状态在 `GameState` 中维护，但每条街起手 (preflop
+       初始化、flop / turn / river 起手 `_begin_betting` 等价点)
+       重置为 `None`。
+    2. 每次 voluntary bet 或 raise（含 incomplete short all-in）将
+       `last_aggressor` 置为 actor seat；与 D-033-rev1 #4(b) 不冲突——后者
+       不动 `raise_option_open`，本条不动 `raise_option_open`，仅改
+       `last_aggressor`。
+    3. Showdown 起点：取摊牌时 `last_aggressor`（即 river / 最后一条
+       betting round 的最后一次 voluntary bet/raise actor）；若为 `None`
+       则 fallback 到 SB（D-037 原 fallback）。
+    4. 强制盲注 / ante / preflop limp 仍不算 voluntary aggression（D-037
+       原条款不变）。
+  - **等价口语化表述**："谁先亮" 由 **最后一条街** 的最后一次主动加注者
+    决定；如果最后一条街全部 check / call，那条街没人 "激进"，回退到
+    SB 起摊。前几条街的加注不再 "粘连" 到摊牌起点。
+  - **影响**：
+    - `src/rules/state.rs::reset_round_for_next_street`（街间过渡）需新增
+      `self.last_aggressor = None`；其它 last_aggressor 设值点
+      （`apply_bet` / `apply_raise` 含 incomplete 路径）保持不变。
+    - `tests/scenarios.rs::last_aggressor_shows_first`（B1 [测试]）与
+      `tests/scenarios_extended.rs::showdown_order_table` case (a)
+      `showdown_btn_preflop_only_aggressor`（C1 [测试]）原 expect 直接
+      落在 D-037 旧语义上，需要更新到 D-037-rev1 语义；该改动作为本
+      revM 的配套补丁随同提交，并在 `docs/pluribus_stage1_workflow.md`
+      §修订历史 D-rev0 中显式追认 [实现] agent 触碰 tests 的角色边界
+      carve-out。
+    - `pluribus_stage1_validation.md` §1 第 25 行 "最后激进 (last
+      aggressor) 玩家先亮牌" 表面说法兼容新解读（"最后激进" 在新规
+      下作用域为 "最后一条街"），不强制改文字；如未来再有歧义可再
+      追加澄清。
+    - **不** 影响 `Action` / `LegalActionSet` / `RuleError` 公开签名，
+      无需 `API-NNN-revM`。
+    - **不** 影响 `HandHistory` protobuf schema（`showdown_order` 字段
+      值改变，但字段本身未变），不 bump `schema_version`。
+  - **撤销条件**：若决策者后续选择 "整手最后一次激进" 语义（与 PokerKit
+    显式分歧），需追加 D-037-rev2、翻转两个 scenario 测试断言、并在
+    D-086 给 PokerKit 引入显式配置差异碳证（D-083 之外的合法分歧来源）。
+    届时 `cross_validation_pokerkit_100k_random_hands` 桶 A 会重新出现
+    10 条分歧，需在 D-085 / validation §7 显式 carve-out。
 
 ---
 
