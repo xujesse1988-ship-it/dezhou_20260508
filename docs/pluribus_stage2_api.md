@@ -286,9 +286,44 @@ impl InfoAbstraction for PostflopBucketAbstraction {
 /// / `abstraction::cluster` 子模块，与 `abstraction::map` 子模块（禁浮点，D-252）
 /// 物理隔离。
 pub trait EquityCalculator: Send + Sync {
-    /// hand-vs-uniform-random-hole equity。
-    /// 返回值 ∈ [0.0, 1.0]，必须 finite（D-224）。
+    /// **hand-vs-uniform-random-hole** equity（EHS 路径，D-223）。对手 hole
+    /// uniform over remaining cards。返回值 ∈ [0.0, 1.0]，必须 finite（D-224）。
+    ///
+    /// **不**满足反对称：`equity(A, board) + equity(B, board) ≠ 1`。EQ-001
+    /// 反对称断言不要用本接口；用 `equity_vs_hand`。
     fn equity(&self, hole: [Card; 2], board: &[Card], rng: &mut dyn RngSource) -> f64;
+
+    /// **pairwise** hand-vs-specific-hand equity（D-220a / EQ-001 反对称路径
+    /// 唯一接口；OCHS 内部计算的基本原语，D-223）。返回值 ∈ [0.0, 1.0]，
+    /// 必须 finite（D-224），含 ties counted as 0.5。
+    ///
+    /// 计算口径：
+    /// - **river**（`board.len() == 5`）：直接评估两手牌力，1.0 / 0.5 / 0.0
+    ///   三值离散。无 RNG 消费。
+    /// - **turn**（`board.len() == 4`）：枚举 44 张未发 river 卡（`52 - 2 hole -
+    ///   2 opp_hole - 4 board = 44`），每个补完后 river-level pairwise 平均。
+    ///   无 RNG 消费，确定性。
+    /// - **flop**（`board.len() == 3`）：枚举 `C(45, 2) = 990` 个 (turn, river)
+    ///   无序对（`52 - 2 hole - 2 opp_hole - 3 board = 45` 张未发，选 2）。
+    ///   无 RNG 消费，确定性。注意此处枚举数比 `ehs_squared` 的 1081 少 2 张
+    ///   （opp_hole 占用），是 EQ-001 antisymmetry 测试与 EQ-003 EHS² rollout
+    ///   的关键差异。
+    /// - **preflop**（`board.len() == 0`）：outer Monte Carlo over 5-card 完整
+    ///   公共牌组合（`C(48, 5) ≈ 1.7M` 太大不可全枚举）；消费 RngSource，
+    ///   sub-stream 派生协议见 D-228 `EQUITY_MONTE_CARLO`。同 RngSource state
+    ///   下两次调用 `equity_vs_hand(A, B, []) + equity_vs_hand(B, A, [])`
+    ///   sample 同样 future board 集合，反对称在 IEEE-754 reorder 容忍内成立
+    ///   （EQ-001 ① 路径）。
+    ///
+    /// `opp_hole` 必须与 `hole` ∪ `board` 不重叠；重叠时返回 NaN（[实现] 选择
+    /// NaN 而非 panic，便于 fuzz 测试不中断）。
+    fn equity_vs_hand(
+        &self,
+        hole: [Card; 2],
+        opp_hole: [Card; 2],
+        board: &[Card],
+        rng: &mut dyn RngSource,
+    ) -> f64;
 
     /// EHS²（potential-aware 二阶矩，D-223）。
     /// 返回值 ∈ [0.0, 1.0]。river 状态退化为 `equity²`。
@@ -301,6 +336,11 @@ pub trait EquityCalculator: Send + Sync {
 
     /// OCHS 向量。长度 = `n_opp_clusters`（D-222 默认 8）。
     /// 每维 ∈ [0.0, 1.0]，必须 finite。
+    ///
+    /// 内部以 `equity_vs_hand` 为原语：每个 cluster k 的输出值 ≈
+    /// `mean over opp ∈ cluster_k of equity_vs_hand(hole, opp, board, rng)`，
+    /// 具体抽样 / 枚举策略由 [实现] 在 A1 / B2 / C2 选定（D-222 锁 N=8 + RngSource
+    /// sub-stream 派生 D-228 `OCHS_FEATURE_INNER`）。
     fn ochs(
         &self,
         hole: [Card; 2],
@@ -335,7 +375,7 @@ impl EquityCalculator for MonteCarloEquity { /* ... */ }
 
 ### Equity calculator 不变量
 
-- EQ-001 反对称容差（D-220a）：`|equity(A, B | board) + equity(B, A | board) - 1| ≤ 0.005`（`iter = 10_000`）；`iter = 1_000` 时容差 0.02。
+- EQ-001 反对称容差（D-220a，**pairwise 路径**）：使用 `equity_vs_hand(A, B, board, rng)` 接口（**不**用 `equity(hole, board, rng)`——后者 random-opp 不满足反对称）。容差按街分流：① **postflop**（`board.len() ≥ 3`）：确定性枚举无 RNG，`|equity_vs_hand(A, B, board, _) + equity_vs_hand(B, A, board, _) - 1| ≤ 1e-9`（IEEE-754 reorder 容忍）；② **preflop**（`board.len() == 0`）：同 RngSource state（fresh sub-stream from D-228 same op_id + sub_index）下 `≤ 1e-9`，不同 sub-stream 下 Monte Carlo 噪声容忍 `≤ 0.005`（`iter = 10_000`）/ `≤ 0.02`（`iter = 1_000`）。`tests/equity_self_consistency.rs` 必须先走 postflop 严格容差路径，preflop Monte Carlo 路径单独命名。
 - EQ-002 范围：`equity / ehs_squared / ochs[i]` 全部 ∈ [0.0, 1.0] 且 finite（D-224）；任何 NaN / Inf 视为 P0 阻塞 bug。
 - EQ-003 EHS² rollout（D-227）：**采样口径**——outer 是 "已知我方 hole + 当前 board" 视角下未发**公共牌**枚举；对手 hole 不在 outer 维度，而在 inner equity 内部 Monte Carlo（uniform over remaining cards 排除我方 hole + 完整 board）。**rollout 数**：river 状态 outer = 0 rollout，EHS² 退化为 `inner_EHS²`（inner equity 仍走 D-220 默认 iter Monte Carlo）；turn 状态 outer = **46 张**未发 river 卡全枚举（52 - 2 hole - 4 board，确定性，无 outer RNG）；flop 状态 outer = **`C(47, 2) = 1081` 个 (turn, river) 无序对**全枚举（52 - 2 hole - 3 board = 47 张未发，选 2，确定性）。outer enumeration 不消耗 RngSource；inner equity 在每个 outer 评估点走 Monte Carlo（消耗 RngSource，sub-stream seed 由 outer enumeration index 决定保证 byte-equal）。
 - EQ-004 OCHS 向量长度：`ochs(...).len() == self.n_opp_clusters() as usize`。
