@@ -123,13 +123,13 @@ API 骨架代码化按 §A1 §输出 全部落地：
 
 **`memmap2` 路径 carve-out**：D-244 / D-255 锁 mmap 加载，但 `Mmap::map` 入口 `unsafe`，与 stage 1 D-275 `unsafe_code = "forbid"` 冲突。C2 走 `std::fs::read` 整段加载（语义等价 + 1.4MB 加载 < 5ms 无 SLO 风险）；`memmap2 = "0.9"` 依赖保留但 C2 路径未直接调用。stage 3+ 巨大 bucket table 跨进程 mmap 共享必需时由 D-275-revM 评估。
 
-### Stage 2 当前测试基线（C2 闭合后）
+### Stage 2 当前测试基线（C2 + C-rev1 batch 2 闭合后）
 
-- `cargo test --no-fail-fast`（默认 / debug）：**187 passed / 34 ignored / 0 failed across 25 test crates**（+ 2 doc-test 0 测）。
+- `cargo test --no-fail-fast`（默认 / debug）：**187 passed / 36 ignored / 0 failed across 25 test crates**（+ 2 doc-test 0 测）。
     - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`，与 `stage1-v1.0` tag **byte-equal**（D-272 不退化要求满足）。
-    - **stage-2 9 crates** `83 passed / 15 ignored / 0 failed`：action_abstraction 12 / api_signatures 1（混 stage-1+2）/ canonical_observation 8 / clustering_determinism 7 active + 2 ignored（§C-rev1 §3 §⑤ §⑥ 32-seed baseline + capture-only）/ equity_self_consistency 12 / equity_features 10 / info_id_encoding 8 / preflop_169 5 / **bucket_quality 7 active + 13 ignored**（§C-rev1 §2 §3 §① 12 stub + 1 1M smoke）。
-    - 实测耗时（debug profile）clustering_determinism 552s（C2 BLAKE3 byte-equal + 4 线程 smoke 各跑 200 iter 训练）+ equity_self_consistency 175s + equity_features 29s 主导（10M+ MC iter；release profile 全 < 10s，E2 SLO 路径接管）。
-- `cargo test --release --no-fail-fast -- --ignored`：13 release ignored 套件全绿（含 stage 1 全套 + stage 2 新增 13）；32-seed bucket table baseline 训练 ~5 min release。
+    - **stage-2 9 crates** `83 passed / 17 ignored / 0 failed`：action_abstraction 12 / api_signatures 1（混 stage-1+2）/ canonical_observation 8 / clustering_determinism 7 active + 4 ignored（§C-rev1 §3 §⑤ §⑥ 32-seed baseline + capture-only + §C-rev1 batch 2 §2 BLAKE3 / cross-thread `_full` 子测试）/ equity_self_consistency 12 / equity_features 10 / info_id_encoding 8 / preflop_169 5 / **bucket_quality 7 active + 13 ignored**（§C-rev1 §2 §3 §① 12 stub + 1 1M smoke）。
+    - 实测耗时（debug profile）clustering_determinism 234.5s（C-rev1 batch 2 §2 active 路径降到 10/10/10 + 50 iter，552s → 234.5s 57% 改善；n_train 由 `n_canonical * 4 = 12000` 主导，进一步优化需要重设计 train_one_street sample 策略，移交 D1/D2 评估；50/50/50 + 200 iter `_full` 子测试 `#[ignore]` 留 D1）+ equity_self_consistency 175s + equity_features 29s 主导（10M+ MC iter；release profile 全 < 25s，E2 SLO 路径接管）。
+- `cargo test --release --no-fail-fast -- --ignored`：13 release ignored 套件全绿（含 stage 1 全套 + stage 2 新增 15，含 C-rev1 batch 2 §2 两条 `_full` 子测试）；32-seed bucket table baseline 训练 ~5 min release。
 - `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` trip-wire byte-equal 不变，stage 2 公开 API 0 签名漂移（C2 仅扩 `BucketTable::train_in_memory` / `write_to_path` 非 trait 方法 + `cluster::*` 内部 pub fn，不动公开 API trait surface）。
 
 ### 下一步：Stage 2 D1 [测试]

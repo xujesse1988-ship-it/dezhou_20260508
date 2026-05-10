@@ -215,18 +215,14 @@ fn d228_derive_substream_seed_distinctness_smoke() {
 // 验证 §B1 line 238 + D-237：同 (BucketConfig, training_seed, cluster_iter) 输入
 // 重复 train_in_memory 必须输出 BLAKE3 byte-equal bucket table。
 //
-// **C2 实测**：用 50/50/50 + 200 iter 配置（与 bucket_quality.rs fixture 一致）
-// 重复训练 2 次比对 content_hash 全部 32 字节相等。重复 10 次完整版留 D1
-// （`cargo test --release -- --ignored` opt-in；本路径默认 active）。
-#[test]
-fn clustering_repeat_blake3_byte_equal() {
-    let cfg = BucketConfig {
-        flop: 50,
-        turn: 50,
-        river: 50,
-    };
+// **C-rev1 batch 2 carve-out**：active 路径用 10/10/10 + 50 iter（与本文件
+// `BUCKET_BASELINE_CONFIG` 同形态，release ≈ 5 s / debug ≈ 30 s），保证默认
+// `cargo test` dev loop 不被阻塞 10 min；50/50/50 + 200 iter 完整版另设
+// `_full` 子测试 `#[ignore]`（D1 + CI release 路径触发，与 stage-1 perf_slo /
+// fuzz / cross_arch_baseline 同形态）。byte-equal 是二元属性，小配置同样验证
+// D-237 不变量。
+fn run_clustering_repeat_blake3_byte_equal(cfg: BucketConfig, cluster_iter: u32) {
     let master_seed = 0xC2_BE71_BD75_710E;
-    let cluster_iter = 200;
     let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
     let bt1 = BucketTable::train_in_memory(cfg, master_seed, Arc::clone(&evaluator), cluster_iter);
     let bt2 = BucketTable::train_in_memory(cfg, master_seed, Arc::clone(&evaluator), cluster_iter);
@@ -272,6 +268,31 @@ fn clustering_repeat_blake3_byte_equal() {
     }
 }
 
+#[test]
+fn clustering_repeat_blake3_byte_equal() {
+    run_clustering_repeat_blake3_byte_equal(
+        BucketConfig {
+            flop: 10,
+            turn: 10,
+            river: 10,
+        },
+        50,
+    );
+}
+
+#[test]
+#[ignore = "D1: 50/50/50 + 200 iter 完整版（release ~30 s / debug 数分钟）；CI release + --ignored opt-in"]
+fn clustering_repeat_blake3_byte_equal_full() {
+    run_clustering_repeat_blake3_byte_equal(
+        BucketConfig {
+            flop: 50,
+            turn: 50,
+            river: 50,
+        },
+        200,
+    );
+}
+
 // ============================================================================
 // 6. 跨线程 bucket id 一致（C2 实测：D-238 / IA-004 byte-equal across threads）
 // ============================================================================
@@ -279,22 +300,21 @@ fn clustering_repeat_blake3_byte_equal() {
 // 验证 §B1 line 239：BucketTable::lookup 是只读纯函数（&self），多线程并发
 // 调用必须返回 byte-equal 结果。1M 手 fuzz 留 D1 跑（`--ignored` opt-in）；
 // 默认 active 跑 1k 手 4 线程 sanity。
-#[test]
-fn cross_thread_bucket_id_consistency_smoke() {
+//
+// **C-rev1 batch 2 carve-out**：active 路径同 §5 用 10/10/10 + 50 iter（与
+// `BUCKET_BASELINE_CONFIG` 同形态，release ≈ 5 s）。完整 50/50/50 + 200 iter
+// 版本另设 `_full` 子测试 `#[ignore]`（D1 / CI release opt-in）。lookup 多线程
+// safety 与 bucket_count 解耦，小配置同样验证 IA-004 不变量。
+fn run_cross_thread_bucket_id_consistency(cfg: BucketConfig, cluster_iter: u32) {
     use std::sync::Arc as ArcStd;
     use std::thread;
 
-    let cfg = BucketConfig {
-        flop: 50,
-        turn: 50,
-        river: 50,
-    };
     let evaluator: ArcStd<dyn HandEvaluator> = ArcStd::new(NaiveHandEvaluator);
     let bt = ArcStd::new(BucketTable::train_in_memory(
         cfg,
         0xC27B_BD75_710E,
         evaluator,
-        200,
+        cluster_iter,
     ));
 
     // 生成 1k 个随机 (street, board, hole) 输入。
@@ -369,6 +389,31 @@ fn cross_thread_bucket_id_consistency_smoke() {
             "D-238 / IA-004：跨线程 lookup 必须 byte-equal"
         );
     }
+}
+
+#[test]
+fn cross_thread_bucket_id_consistency_smoke() {
+    run_cross_thread_bucket_id_consistency(
+        BucketConfig {
+            flop: 10,
+            turn: 10,
+            river: 10,
+        },
+        50,
+    );
+}
+
+#[test]
+#[ignore = "D1: 50/50/50 + 200 iter 完整版（release ~30 s / debug 数分钟）；CI release + --ignored opt-in"]
+fn cross_thread_bucket_id_consistency_full() {
+    run_cross_thread_bucket_id_consistency(
+        BucketConfig {
+            flop: 50,
+            turn: 50,
+            river: 50,
+        },
+        200,
+    );
 }
 
 // ============================================================================

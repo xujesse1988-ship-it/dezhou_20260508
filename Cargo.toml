@@ -15,8 +15,10 @@ rand_chacha = "0.3"
 thiserror = "1.0"
 prost = "0.13"
 blake3 = "1.5"
-# 阶段 2 D-255：mmap 加载 bucket table（C2 落地真实加载路径，A1 仅声明依赖）。
-memmap2 = "0.9"
+# 阶段 2 D-255：mmap 加载 bucket table。C2 走 std::fs::read 整段加载替代 mmap
+# （Mmap::map 入口 unsafe 与 stage 1 D-275 unsafe_code = "forbid" 冲突，详见
+# pluribus_stage2_workflow.md §C-rev1 batch 2）。stage 3+ 巨大 bucket table 跨
+# 进程共享必需时由 D-275-revM 评估，届时再加 memmap2 依赖。
 
 # B1 测试 / harness 专用依赖。仅 tests/ 与 benches/ 引用，不进入产品二进制。
 [dev-dependencies]

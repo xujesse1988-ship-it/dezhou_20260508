@@ -905,3 +905,43 @@ C2 [实现] 在 `tests/bucket_quality.rs` 与 `tests/clustering_determinism.rs` 
 - **生成 artifact**：`artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`（95 KB / 不进 git history）。
 
 下一步：D1 [测试]（fuzz 完整版 + 规模化）。按 §D1 §输出 落地 `fuzz/abstraction_smoke` cargo-fuzz target（1M random `(board, hole) → bucket id` determinism）+ `tests/abstraction_fuzz.rs` 100k smoke / 1M `#[ignore]` + 100k off-tree action 抽象稳定性 + `tests/clustering_cross_host.rs` 跨架构 32-seed bucket table baseline regression guard。预期 D1 [测试] 闭合后 `cargo test --release -- --ignored` 暴露 1-3 corner case bug，列入 issue 移交 D2。
+
+#### C-rev1 batch 2（2026-05-10）— C2 后 review 修正：未使用依赖删除 + active 训练测试降配置
+
+C2 关闭后 review 暴露两条工程债：(1) `Cargo.toml` 残留 `memmap2 = "0.9"` 依赖在 §C-rev1 §3 / D-275 carve-out 路径下未被任何 `src/` 文件 import（`memmap2::Mmap::map` 入口 unsafe 与 stage 1 D-275 `unsafe_code = "forbid"` 冲突，C2 走 `std::fs::read` 整段加载替代）；(2) §C-rev1 §3 §③ §④ 把 `clustering_repeat_blake3_byte_equal` / `cross_thread_bucket_id_consistency_smoke` 从 `#[ignore]` 移到 active 后，两条 active 训练（50/50/50 + 200 iter × 2 训练 / 文件）让默认 `cargo test`（debug profile）耗时退化到 552 s（CLAUDE.md C2 闭合后 baseline 自述），违背 stage-1 dev loop 默认 `cargo test` < 30 s 工程预期。
+
+##### batch 2 §1：删除未使用 `memmap2` 依赖
+
+`Cargo.toml` 删除 `memmap2 = "0.9"` 依赖；保留注释指向 stage 3+ D-275-revM 评估路径。`src/abstraction/bucket_table.rs` 内 `memmap2::Mmap` 仅出现在文档注释中，无 import 漂移。
+
+##### batch 2 §2：active 训练测试降配置（10/10/10 + 50 iter）+ 完整版另设 `_full` 子测试 `#[ignore]`
+
+`tests/clustering_determinism.rs` 两条 active 训练测试改造：
+- `clustering_repeat_blake3_byte_equal`（§C-rev1 §3 §③）：active 路径降到 `BucketConfig { 10, 10, 10 }` + `cluster_iter = 50`（与本文件 `BUCKET_BASELINE_CONFIG` 同形态）；新增 `clustering_repeat_blake3_byte_equal_full` `#[ignore = "D1: ..."]` 子测试保留 50/50/50 + 200 iter 完整版。
+- `cross_thread_bucket_id_consistency_smoke`（§C-rev1 §3 §④）：同上降到 10/10/10 + 50 iter；新增 `cross_thread_bucket_id_consistency_full` `#[ignore = "D1: ..."]` 子测试保留 50/50/50 + 200 iter 完整版。
+
+byte-equal / 4 线程并发是二元属性，10/10/10 + 50 iter 同样验证 D-237 / D-238 / IA-004 不变量；完整版语义意义在于 cluster 数量增大后的 statistical 稳定性，留 D1 接入跨架构 cross-pair guard 同 batch 跑（与 stage-1 perf_slo / fuzz / cross_arch_baseline 同形态）。
+
+实测耗时：
+- release：clustering_determinism 28.31 s → 20.60 s（n_train 由 `n_canonical * 4 = 12000` 主导，K 与 cluster_iter 减小只对 k-means inner loop 起效，对 12000 × MC_iter 的特征计算贡献有限）。
+- debug：clustering_determinism 552 s → **234.5 s**（57% 改善）。绝对值仍较高的根因同上：n_train 不可缩；进一步优化需要重设计 train_one_street 的 sample 策略（移交 D1 / D2 评估）。
+
+##### batch 2 §3：[实现] → [测试] 二次越界 carve-out（§C-rev1 §3 同型）
+
+batch 2 §2 二次越界改测试代码（`tests/clustering_determinism.rs`），由本节书面追认；与 §C-rev1 §3 同型——本 commit 同步用 §C1 §出口 line 322-324 "[实现] 闭合 commit 取消 ignore 并验证全绿" 的对偶 "工程取舍下用 `_full` 子测试 + `#[ignore]` 折中" 政策处理。
+
+[测试] 角色后续仍归 D1 agent，batch 2 越界不扩散。
+
+##### batch 2 出口数据（commit 落地实测）
+
+- `cargo test --release --no-fail-fast`：**187 passed / 36 ignored / 0 failed across 25 test crates**（+ 2 doc-test 0 测）。stage-2 9 crates `83 passed / 17 ignored / 0 failed`（clustering_determinism 7 active + 4 ignored；其它 8 crates 不动）。stage-1 baseline 16 crates `104 passed / 19 ignored / 0 failed` byte-equal 不退化（D-272 满足）。
+- `cargo fmt / clippy / doc / build --all-targets`：四道 gate 全绿。
+- `tests/api_signatures.rs` trip-wire byte-equal 不变（batch 2 仅触 `Cargo.toml` 删除依赖 + `tests/clustering_determinism.rs` test name 扩展，不动公开 API surface）。
+
+batch 2 角色边界审计：本 commit 触 `Cargo.toml`（[实现] 删除依赖）+ `tests/clustering_determinism.rs`（[实现] 二次越界改测试）+ `docs/pluribus_stage2_workflow.md` §C-rev1 batch 2（本子节）+ `CLAUDE.md`（test count 187/34→187/36 + 实测耗时同步）。`src/`、`benches/`、`fuzz/`、`tools/`、`proto/`、其它 `tests/` **未修改一行**。
+
+§C-rev1 batch 2 carry forward 处理政策（与 §A-rev0..§C-rev1 一致，不重新论证）：
+- 阶段 1 §C-rev1 / §D-rev0 / §F-rev1 既往政策保持继承不变。
+- §B-rev1 §3：[实现] 步骤越界改测试代码 → 当 commit 显式追认（本 batch §3 第二次追认）。
+
+下一步不变：D1 [测试]。
