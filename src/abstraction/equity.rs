@@ -8,11 +8,16 @@
 //! `abstraction::cluster` 子模块，与 `abstraction::map` 子模块（禁浮点，D-252）
 //! 物理隔离。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use thiserror::Error;
 
-use crate::core::rng::RngSource;
+use crate::abstraction::cluster::rng_substream::{
+    derive_substream_seed, OCHS_FEATURE_INNER, OCHS_WARMUP,
+};
+use crate::abstraction::cluster::{kmeans_fit, reorder_by_ehs_median, KMeansConfig};
+use crate::core::rng::{ChaCha20Rng, RngSource};
 use crate::core::{Card, Rank, Suit};
 use crate::eval::HandEvaluator;
 
@@ -329,19 +334,33 @@ impl EquityCalculator for MonteCarloEquity {
             return Err(EquityError::IterTooLow { got: 0 });
         }
         let _used = build_used_set(&hole, &[], board)?;
-        let opp_reps = ochs_opp_representatives();
-        let n = self.n_opp_clusters as usize;
-        let mut out = Vec::with_capacity(n);
-        for k in 0..n {
-            let opp = opp_reps[k % opp_reps.len()];
-            // Skip representatives that clash with hole or board: fall back to 0.5
-            // (B2 stub; C2 trains true 169-class clustering with disjoint reps).
-            if pair_overlaps(&hole, &opp) || any_overlaps_board(&opp, board) {
-                out.push(0.5);
-                continue;
+        let n = u32::from(self.n_opp_clusters);
+        let table = ochs_table(n, &self.evaluator);
+        let mut out = Vec::with_capacity(n as usize);
+        for cluster_id in 0..n as usize {
+            let classes = &table.classes_per_cluster[cluster_id];
+            let mut sum = 0.0_f64;
+            let mut count = 0u32;
+            for &class_id in classes {
+                let opp = table.representative_hole[class_id as usize];
+                // Skip class representatives that clash with (hole, board); the
+                // remaining classes in the cluster carry the cluster's signal.
+                // §C-rev2 §3：所有 reps 都冲突时 fallback 0.5（与 B2 stub 同型，但
+                // 几乎不会触发——169 classes ÷ 8 clusters ≈ 21 reps/cluster vs ≤ 7
+                // 不可用 cards on (hole + 5-card board)）。
+                if pair_overlaps(&hole, &opp) || any_overlaps_board(&opp, board) {
+                    continue;
+                }
+                let v = self.equity_vs_hand(hole, opp, board, rng)?;
+                sum += v;
+                count += 1;
             }
-            let v = self.equity_vs_hand(hole, opp, board, rng)?;
-            out.push(v);
+            let mean = if count > 0 {
+                sum / f64::from(count)
+            } else {
+                0.5
+            };
+            out.push(mean);
         }
         Ok(out)
     }
@@ -471,51 +490,6 @@ fn sample_opp_and_board(
     (opp_hole, full_board)
 }
 
-/// 8 个 OCHS opponent class 代表 hole（B2 stub；C2 用 1D EHS k-means 训练真实
-/// 169-class → 8-cluster 后取 strongest representative）。
-///
-/// 选用 8 个具有代表性的 hole，按 EHS 强度递减大致排列：
-/// AsAh / KsKh / QsQh / TsTh / 8h8d / 5h5d / 7s2d / 7s2h
-/// （前 6 类是 pocket pair 强度递减，后 2 类是经典最弱 offsuit）。同 hole 出现
-/// 在多个 cluster 时 `MonteCarloEquity::ochs` 自动 fallback 到 0.5（避免
-/// `OverlapHole` 错误）。完整实现留 C2 \[实现\]。
-fn ochs_opp_representatives() -> [[Card; 2]; 8] {
-    [
-        [
-            Card::new(Rank::Ace, Suit::Spades),
-            Card::new(Rank::Ace, Suit::Hearts),
-        ],
-        [
-            Card::new(Rank::King, Suit::Spades),
-            Card::new(Rank::King, Suit::Hearts),
-        ],
-        [
-            Card::new(Rank::Queen, Suit::Spades),
-            Card::new(Rank::Queen, Suit::Hearts),
-        ],
-        [
-            Card::new(Rank::Ten, Suit::Spades),
-            Card::new(Rank::Ten, Suit::Hearts),
-        ],
-        [
-            Card::new(Rank::Eight, Suit::Hearts),
-            Card::new(Rank::Eight, Suit::Diamonds),
-        ],
-        [
-            Card::new(Rank::Five, Suit::Hearts),
-            Card::new(Rank::Five, Suit::Diamonds),
-        ],
-        [
-            Card::new(Rank::Seven, Suit::Spades),
-            Card::new(Rank::Two, Suit::Diamonds),
-        ],
-        [
-            Card::new(Rank::Seven, Suit::Spades),
-            Card::new(Rank::Two, Suit::Hearts),
-        ],
-    ]
-}
-
 fn pair_overlaps(a: &[Card; 2], b: &[Card; 2]) -> bool {
     a.iter().any(|x| b.iter().any(|y| x.to_u8() == y.to_u8()))
 }
@@ -523,4 +497,151 @@ fn pair_overlaps(a: &[Card; 2], b: &[Card; 2]) -> bool {
 fn any_overlaps_board(pair: &[Card; 2], board: &[Card]) -> bool {
     pair.iter()
         .any(|p| board.iter().any(|b| p.to_u8() == b.to_u8()))
+}
+
+// ============================================================================
+// OCHS opponent cluster table（D-222 / §C-rev2 §3）
+// ============================================================================
+
+/// Number of preflop hole equivalence classes（D-217 / preflop.rs `hand_class`
+/// 0..169，13 pocket pairs + 78 suited + 78 offsuit = 169）。
+const N_PREFLOP_CLASSES: usize = 169;
+
+/// Hardcoded master seed for OCHS table precomputation。Stays fixed across
+/// processes to give byte-equal cluster assignments — feature_set_id = 1 仍以
+/// "EHS² + OCHS(N=8) = 9 维"为语义，不 bump schema_version（与 §C-rev1 §1
+/// carve-out 同型）。
+const OCHS_TRAINING_SEED: u64 = 0x0CC8_5EED_C2D2_22A0;
+
+/// Per-class EHS Monte Carlo iter（issue #5 出口建议 ≥10k 让单类标准误差 < 0.005；
+/// 169 × 10k × 2 评估 ≈ 3.4M evaluator calls @ ~50ns/call ≈ 170ms first-call latency
+/// + module-level cache 命中后零成本）。
+const OCHS_PRECOMPUTE_ITER: u32 = 10_000;
+
+struct OchsTable {
+    /// 每个 class_id 的 canonical 代表 hole（具体两张牌）。
+    representative_hole: [[Card; 2]; N_PREFLOP_CLASSES],
+    /// `classes_per_cluster[cluster_id]` = 该 cluster 中所有 class_id 的列表
+    /// （cluster id ∈ 0..n_clusters，D-236b 重编号后：0 = weakest median EHS /
+    /// n-1 = strongest）。
+    classes_per_cluster: Vec<Vec<u8>>,
+}
+
+static OCHS_TABLE_CACHE: OnceLock<Mutex<HashMap<u32, Arc<OchsTable>>>> = OnceLock::new();
+
+fn ochs_cache() -> &'static Mutex<HashMap<u32, Arc<OchsTable>>> {
+    OCHS_TABLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 取 OCHS 表（首次调用按 `n_clusters` 训练并缓存；同一 `n_clusters` 后续 O(1)
+/// 命中 cache）。
+///
+/// **byte-equal 保证**：OCHS 表只依赖 `OCHS_TRAINING_SEED`（hardcoded）和
+/// `n_clusters`，与 evaluator impl 无关（NaiveHandEvaluator 是 stage 1 唯一
+/// `HandEvaluator` impl，输出确定性）。同 (`OCHS_TRAINING_SEED`, `n_clusters`)
+/// 跨进程跨架构 byte-equal（与 stage 1 D-051 同型）。
+fn ochs_table(n_clusters: u32, evaluator: &Arc<dyn HandEvaluator>) -> Arc<OchsTable> {
+    let mut cache = ochs_cache().lock().expect("OCHS cache mutex poisoned");
+    if let Some(t) = cache.get(&n_clusters) {
+        return Arc::clone(t);
+    }
+    let table = Arc::new(build_ochs_table(n_clusters, Arc::clone(evaluator)));
+    cache.insert(n_clusters, Arc::clone(&table));
+    table
+}
+
+/// 训练 OCHS 表（n_clusters 8 默认；其他 n 走同路径）。
+///
+/// 步骤：
+/// 1. 169 class 各取一个 canonical 代表 hole（pocket pair = 同 rank 双花色 / suited
+///    = 双 Spades / offsuit = Spades + Hearts，pair_combination_index 升序索引）。
+/// 2. 对每个 class，用 D-228 OCHS_FEATURE_INNER + class_id 派生 sub-stream 跑
+///    `OCHS_PRECOMPUTE_ITER` 轮 Monte Carlo，估算 EHS = E\[equity vs random opp + 5-card random board\]。
+/// 3. K-means K=n_clusters on 169 个 1D EHS scalar。op_id_init = OCHS_WARMUP，
+///    op_id_split 复用 OCHS_WARMUP（`split_empty_cluster` 不消费 RNG，详见
+///    `cluster.rs::split_empty_cluster` 的 `_master_seed` / `_op_id_split` 标注，
+///    复用同一 op_id 不引入实际冲突）。
+/// 4. D-236b：按 EHS 中位数升序重编号 cluster id（0 = weakest / n-1 = strongest）。
+fn build_ochs_table(n_clusters: u32, evaluator: Arc<dyn HandEvaluator>) -> OchsTable {
+    let representative_hole: [[Card; 2]; N_PREFLOP_CLASSES] =
+        std::array::from_fn(|i| representative_hole_for_class(i as u8));
+
+    // Step 1: per-class EHS Monte Carlo。
+    let mut ehs_per_class: [f64; N_PREFLOP_CLASSES] = [0.0; N_PREFLOP_CLASSES];
+    for class_id in 0..N_PREFLOP_CLASSES {
+        let rep = representative_hole[class_id];
+        let used =
+            build_used_set(&rep, &[], &[]).expect("representative hole has 2 distinct cards");
+        let sub_seed =
+            derive_substream_seed(OCHS_TRAINING_SEED, OCHS_FEATURE_INNER, class_id as u32);
+        let mut rng = ChaCha20Rng::from_seed(sub_seed);
+        let mut wins_x2: u64 = 0;
+        for _ in 0..OCHS_PRECOMPUTE_ITER {
+            let (opp_hole, full_board) = sample_opp_and_board(&used, &[], 5, &mut rng);
+            let me_seven = build_seven_cards(rep, &full_board);
+            let opp_seven = build_seven_cards(opp_hole, &full_board);
+            wins_x2 += compare_x2(evaluator.eval7(&me_seven), evaluator.eval7(&opp_seven));
+        }
+        ehs_per_class[class_id] = wins_x2 as f64 / (2.0 * f64::from(OCHS_PRECOMPUTE_ITER));
+    }
+
+    // Step 2: K-means on 1-d EHS features。
+    let features: Vec<Vec<f64>> = ehs_per_class.iter().map(|&x| vec![x]).collect();
+    let cfg = KMeansConfig::default_d232(n_clusters);
+    let kmeans_res = kmeans_fit(&features, cfg, OCHS_TRAINING_SEED, OCHS_WARMUP, OCHS_WARMUP);
+
+    // Step 3: D-236b 重编号（EHS 中位数升序：cluster 0 = weakest）。
+    let (_centroids, reordered_assignments) =
+        reorder_by_ehs_median(kmeans_res.centroids, kmeans_res.assignments, &ehs_per_class);
+
+    // Step 4: build classes_per_cluster (inverted index for runtime ochs lookup)。
+    let mut classes_per_cluster: Vec<Vec<u8>> = vec![Vec::new(); n_clusters as usize];
+    for (class_id, &cid) in reordered_assignments.iter().enumerate() {
+        classes_per_cluster[cid as usize].push(class_id as u8);
+    }
+
+    OchsTable {
+        representative_hole,
+        classes_per_cluster,
+    }
+}
+
+/// 给定 169 class id，返回该类的 canonical 代表 hole（具体两张牌）。
+///
+/// - `0..=12`：pocket pair（rank = class_id；Spades + Hearts）。
+/// - `13..=90`：suited（pair_combination_index 升序；双 Spades）。
+/// - `91..=168`：offsuit（同索引；Spades + Hearts）。
+fn representative_hole_for_class(class: u8) -> [Card; 2] {
+    match class {
+        0..=12 => {
+            let r = Rank::from_u8(class).expect("0..13 valid rank");
+            [Card::new(r, Suit::Spades), Card::new(r, Suit::Hearts)]
+        }
+        13..=90 => {
+            let idx = class - 13;
+            let (high, low) = decode_high_low(idx);
+            [
+                Card::new(Rank::from_u8(high).expect("0..13 valid"), Suit::Spades),
+                Card::new(Rank::from_u8(low).expect("0..13 valid"), Suit::Spades),
+            ]
+        }
+        91..=168 => {
+            let idx = class - 91;
+            let (high, low) = decode_high_low(idx);
+            [
+                Card::new(Rank::from_u8(high).expect("0..13 valid"), Suit::Spades),
+                Card::new(Rank::from_u8(low).expect("0..13 valid"), Suit::Hearts),
+            ]
+        }
+        _ => panic!("representative_hole_for_class: class {class} >= 169"),
+    }
+}
+
+/// 反解 `idx = high * (high - 1) / 2 + low`（low < high，high ∈ 1..13）。
+fn decode_high_low(idx: u8) -> (u8, u8) {
+    let mut high: u8 = 1;
+    while high * (high + 1) / 2 <= idx {
+        high += 1;
+    }
+    (high, idx - high * (high - 1) / 2)
 }

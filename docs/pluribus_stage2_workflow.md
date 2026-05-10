@@ -1029,3 +1029,63 @@ batch 2 [实现] + 同 PR [测试] 不变量断言（§B-rev0 batch 2 carve-out 
 - §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 CLAUDE.md "Stage 2 当前测试基线" 段落 canonical_observation 数字翻面（189 → 193 active）+ "Non-negotiable invariants" 段落新增 input order 不变量。
 
 下一步：§C-rev2 batch 3（#5 OCHS 落地 D-222 真实 1D EHS k-means + bucket table 重训）。
+
+#### C-rev2 batch 3（2026-05-10）— C2 后第二轮 review：#5 OCHS 落地 D-222 真实 1D EHS k-means
+
+C-rev2 batch 1 / 2（#7 / #6）闭合后，本 batch 3 闭合 [实现] 侧 #5（最大变更：OCHS 路径从 B2 stub 8 个固定 hole 替换为 D-222 169-class k-means K=8 cluster table）。
+
+##### §C-rev2 §3：MonteCarloEquity::ochs 落地 D-222 真实 1D EHS k-means on 169-class（issue #5）
+
+D-222 字面 OCHS N=8 opp cluster 由 preflop 169 class 上的一维 EHS k-means 训练得到。C2 闭合时该路径未真实落地——`equity.rs:332` 直读 `ochs_opp_representatives()` 8 个固定 hole（AsAh / KsKh / QsQh / TsTh / 8h8d / 5h5d / 7s2d / 7s2h），冲突时 fallback 0.5。直接后果：bucket table 9 维特征中 OCHS 8 维不是 D-222 定义的自训练 cluster，`feature_set_id = 1` 声称的语义与训练数据不一致，下游 stage 3+ CFR blueprint 接入将受影响。
+
+修正分四步：
+1. **169-class EHS 预计算**：每 class 取一个 canonical 代表 hole（pocket pair = Spades + Hearts / suited = 双 Spades / offsuit = Spades + Hearts，pair_combination_index 升序索引），随机 board × random opp 跑 `OCHS_PRECOMPUTE_ITER = 10_000` 轮 MC（D-228 `OCHS_FEATURE_INNER` + class_id 派生 sub-stream，单类标准误差 ≈ 0.005），估算 EHS = E\[equity vs uniform random opp + 5-card random board\]。
+2. **K-means K=n_clusters on 169 个 1D EHS scalars**：op_id_init = `OCHS_WARMUP`，op_id_split 复用 `OCHS_WARMUP`（`split_empty_cluster` 不消费 RNG，详见 `cluster.rs::split_empty_cluster` 标注；复用同一 op_id 不引入实际冲突，避免新增 op_id 触发 D-228-revM 流程）。
+3. **D-236b 重编号**：按 EHS 中位数升序 → cluster 0 = weakest median EHS / cluster N-1 = strongest（与 stage-1 D-228 / D-236b 同型）。
+4. **运行时 lookup**：`ochs(hole, board)` 对每个 cluster k 遍历该 cluster 内所有 representative class，过滤掉与 (hole, board) 重叠的，剩余 reps 跑 `equity_vs_hand` 求平均；全部冲突时 fallback 0.5（与 B2 stub 同型，但 169 ÷ 8 ≈ 21 reps/cluster vs ≤ 7 不可用 cards 几乎不会触发）。
+
+存储：`OchsTable { representative_hole: [[Card; 2]; 169], classes_per_cluster: Vec<Vec<u8>> }`，`OnceLock<Mutex<HashMap<u32, Arc<OchsTable>>>>` 模块级 lazy cache（首次 ochs() 调用按 n_clusters 训练 ~170 ms first-call latency，后续 O(1) 命中）。MSRV 1.75 兼容（`OnceLock` since 1.70；`LazyLock` since 1.80 不可用）。
+
+byte-equal 保证：OchsTable 只依赖 hardcoded `OCHS_TRAINING_SEED = 0x0CC8_5EED_C2D2_22A0` + n_clusters，与 evaluator impl 无关（NaiveHandEvaluator 是 stage 1 唯一 `HandEvaluator` impl，输出确定性）；同 (`OCHS_TRAINING_SEED`, `n_clusters`) 跨进程跨架构 byte-equal（与 stage 1 D-051 同型）。
+
+测试侧（同 PR 由 [实现] 落地，§B-rev1 §3 [实现] 越界 carve-out 同型）：`tests/equity_features.rs` 翻 2 条断言方向 + 1 条 rename：
+- `ochs_monotonicity_kk_weaker_vs_strong_cluster`：D-236b cluster 0 = weakest 后，KK vs cluster 0 应 > KK vs cluster N-1（与原 B2 stub 假设的 cluster 0 = AA 最强方向相反）。
+- `ochs_pairwise_antisymmetry_via_equity_vs_hand_river` → 改名为 `ochs_strong_hole_dominates_weak_cluster_river`，cluster_idx = 6 → 0（弱 opp cluster），同时加 KK 案例。
+
+bucket table BLAKE3 影响：OCHS 9 维特征中 8 维改变 → 训练特征向量改变 → k-means assignment 改变 → BLAKE3 trailer 改变。`artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin` 重训：旧 `3236dff01d00c829b319b347aa185cdfe12b34697ae9f249ef947d96912df513` → 新 `0a1b95e958b3c9057065929093302cd5a9067c5c0e7b4fb8c19a22fa2c8a743b`，训练耗时 28 s → 150 s release（OCHS runtime 169 reps/cluster × 8 clusters ≈ 168 evals/call vs 旧 stub 8 evals/call，~21x slower per ochs call；single-pass 训练成本可接受，artifact 重训仅在 [实现] 算法变化时触发）。`feature_set_id = 1` 不变（与 §C-rev1 §1 carve-out 一致），`schema_version = 1` 不 bump（OCHS 算法变化不改特征语义）。`artifacts/` 仍 gitignored（D-248 / D-251）。
+
+`ochs_opp_representatives()` 函数删除；`equity.rs` 内不再持有 stub 路径。同时合并 §C-rev2 §4（#6 canonical_observation_id 顺序无关化）的 obs_id 分布微调影响——本 batch 重训覆盖 #5 + #6 联合后的最终 BLAKE3。
+
+##### batch 3 出口数据（commit 落地实测）
+
+- `cargo fmt / clippy / build / doc --all-targets` 四道 gate 全绿。
+- `cargo test --test equity_features`：10 passed / 0 failed / 0 ignored（数量不变，2 条断言方向翻转 + 1 条 rename）。
+- `cargo test --test equity_self_consistency`：12 passed / 0 failed / 0 ignored（OCHS 路径仍走 equity_vs_hand 原语，shape / finite / range 不变量保留）。
+- `cargo test --release --test clustering_determinism`：7 passed / 0 failed / 4 ignored（含 `clustering_repeat_blake3_byte_equal` 同 seed 跨训练 BLAKE3 byte-equal，证明 OCHS lazy cache + lookup table 确定性满足 D-237 不变量）；release 总耗时 ~395 s（lib unit tests + abstraction tests + 训练用例）。
+- `cargo run --release --bin train_bucket_table -- --seed 0xCAFEBABE --flop 500 --turn 500 --river 500 --cluster-iter 200 --output artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`：150 s release（vs 旧 28 s）；新 artifact BLAKE3 = `0a1b95e958b3c9057065929093302cd5a9067c5c0e7b4fb8c19a22fa2c8a743b`（95 KB / gitignored）。
+- `tests/api_signatures.rs` trip-wire byte-equal 不变（OCHS 实现完全在 `MonteCarloEquity::ochs` 内部 + 私有 helper，不动公开 API surface）。
+
+##### batch 3 角色边界审计
+
+- **修改产品代码**：`src/abstraction/equity.rs`（OchsTable + OCHS_TRAINING_SEED + OCHS_PRECOMPUTE_ITER 常量 + lazy cache via OnceLock<Mutex<HashMap>> + ochs() runtime path 改写 + private helpers `representative_hole_for_class` / `decode_high_low` / `build_ochs_table` / `ochs_table` / `ochs_cache` + 删除 `ochs_opp_representatives` stub）。
+- **修改测试代码（§C-rev2 §3 §B-rev1 §3 carve-out 同型追认）**：`tests/equity_features.rs`（2 条断言方向翻转 + 1 条 rename `ochs_pairwise_antisymmetry_via_equity_vs_hand_river` → `ochs_strong_hole_dominates_weak_cluster_river`）。
+- **未修改**：所有其它 `tests/*.rs` / 其它 `src/abstraction/*.rs` / `Cargo.toml` / stage-1 全部代码。
+- **重训 artifact**：`artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`（不进 git history，新 BLAKE3 见上）。
+
+batch 3 [实现] + 同 PR [测试] 断言数值校准（§B-rev1 §3 [实现] 越界改测试代码 → 当 commit 显式追认 carve-out 同型）。
+
+##### §C-rev2 [实现] 侧三连闭合（batches 1 / 2 / 3）
+
+batches 1 / 2 / 3 至此闭合 [实现] 侧 issues #5 / #6 / #7。剩余 [测试] 侧 issues #2 / #3 / #4 留 §C-rev2 batch 4+：
+
+- **#2** `bucket_quality.rs` 切到 `cached_trained_table()` + 取消 12 条 `#[ignore]`：依赖 #5 (#6 + #7 已落地)，可启动；T1 实跑可能仍触 `#[ignore]` 因 hash design 限制（§C-rev1 §2）但 stub 路径已不是阻塞因子。
+- **#3** cross-arch bucket table baseline 文件落地 + 缺失硬 panic：依赖 batch 3 BLAKE3 稳定，capture 步骤可启动（每 host 一次）。
+- **#4** `bucket_quality.rs` 删本地 EMD/std_dev/median helper 副本：依赖 #7 已闭合。
+
+batch 4+ 由 [测试] agent 落地（继承 §C-rev2 [测试] / [实现] 角色拆分），与 D1 [测试] 顺序解耦——D1 启动条件：[测试] 侧三连闭合 + [实现] 侧无新增 issue。
+
+§C-rev2 batch 3 carry forward 处理政策（与 §A-rev0..§C-rev2 batch 2 一致，不重新论证）：
+- 阶段 1 §B-rev1 §3 / §C-rev1 / §D-rev0 / §F-rev1 既往政策保持继承不变。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 CLAUDE.md "Stage 2 当前测试基线" 完整翻面（test count + bucket table BLAKE3 + 训练耗时 28 s → 150 s + OCHS lazy cache 段落）。
+
+下一步：§C-rev2 batch 4+（[测试] 侧 #2 / #3 / #4，按 #4 / #2 / #3 顺序闭合最稳）→ D1 [测试]。

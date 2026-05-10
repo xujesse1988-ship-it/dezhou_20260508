@@ -271,19 +271,17 @@ fn ochs_n_opp_clusters_explicit_8() {
 }
 
 // ============================================================================
-// 5. OCHS 单调性：KK vs 强 opp（cluster 0=AA） < KK vs 弱 opp（cluster 6/7=72）
+// 5. OCHS 单调性：KK vs 弱 opp（cluster 0） > KK vs 强 opp（cluster N-1）
 // ============================================================================
 //
-// `equity.rs` `ochs_opp_representatives` B2 stub：cluster 0 = AsAh / cluster 1
-// = KsKh / cluster 2 = QsQh / cluster 3 = TsTh / cluster 4 = 8h8d / cluster 5 =
-// 5h5d / cluster 6 = 7s2d / cluster 7 = 7s2h（B2 strength-decreasing）。
+// **§C-rev2 §3 后**（issue #5 落地）：D-236b 重编号让 cluster id 升序对应 EHS
+// 中位数升序 → cluster 0 = weakest opp pool / cluster N-1 = strongest opp pool。
+// 持 KK：vs cluster 0 (weakest，~72o-class) 应高（约 0.85+ 在 flop board），
+// vs cluster 7 (strongest，AA-class 主导) 应低（约 0.20）。差距 ~0.6 远超 noise。
 //
-// 持 KK：vs AA representative（cluster 0）应低（约 0.18），vs 7s2d
-// representative（cluster 6）应高（约 0.85）。差距 ~0.6 远超 noise。
-//
-// **B2 stub 例外**：cluster 1 = KsKh 与持 KK 重叠（KK fixture 是 KcKd，与 KsKh
-// 不重叠），但 cluster 0 = AsAh / cluster 6 = 7s2d 与 KK 不重叠。fall-back
-// 0.5 不触发。
+// 注：旧 B2 stub 顺序相反（cluster 0 = AsAh 最强），断言方向与本测试相反；
+// §C-rev2 §3 落地真实 OCHS clustering 同 PR 翻转测试方向（由 §C-rev2 §3
+// "[实现] + 同 PR 测试断言数值校准" carve-out 显式追认，与 §B-rev1 §3 同型）。
 #[test]
 fn ochs_monotonicity_kk_weaker_vs_strong_cluster() {
     let calc = make_calc_default();
@@ -291,14 +289,15 @@ fn ochs_monotonicity_kk_weaker_vs_strong_cluster() {
     let mut rng =
         ChaCha20Rng::from_seed(derive_substream_seed(0xC1A0_0CB5, EQUITY_MONTE_CARLO, 500));
     let v = calc.ochs(kk(), &board, &mut rng).unwrap();
-    // cluster 0（AA representative）= KK 弱端；cluster 6（7s2d）= KK 强端。
-    let vs_strong = v[0];
-    let vs_weak = v[6];
+    // §C-rev2 §3：D-236b 升序 → cluster 0 = weakest / 7 = strongest。
+    let vs_weak = v[0];
+    let vs_strong = v[v.len() - 1];
     assert!(
         vs_strong < vs_weak,
-        "OCHS 单调性：KK vs cluster 0 (AA, {vs_strong}) 应 < vs cluster 6 (72, {vs_weak})"
+        "OCHS 单调性：KK vs cluster 0 (weak, {vs_weak}) 应 > vs cluster {} (strong, {vs_strong})",
+        v.len() - 1
     );
-    // 差距下限：vs AA 约 0.18，vs 72 约 0.85，差 ≈ 0.67；保守取 0.4 留 noise。
+    // 差距下限：vs weak 约 0.85，vs strong 约 0.20，差 ≈ 0.65；保守取 0.4 留 noise。
     assert!(
         vs_weak - vs_strong > 0.4,
         "OCHS 单调性：差距 ({vs_weak} - {vs_strong}) 应 > 0.4"
@@ -306,19 +305,15 @@ fn ochs_monotonicity_kk_weaker_vs_strong_cluster() {
 }
 
 // ============================================================================
-// 6. OCHS 反对称：A vs B == 1 - B vs A 在 cluster representative 上等价
+// 6. OCHS smoothness：强 hole vs 弱 cluster 胜率显著 ≥ 0.5
 // ============================================================================
 //
-// OCHS 内部以 `equity_vs_hand(hole, opp_rep, board, rng)` 为原语。给定固定
-// representative opp，`equity_vs_hand` 满足 EQ-001-rev1 postflop 严格反对称
-// （板长 ≥ 3，确定性枚举）；因此 `ochs(A)[k] + ochs(B)[k] ≈ 1.0` 当 A, B 不重
-// 叠且都不与 cluster k representative 重叠。
-//
-// 本测试用 cluster 6 = 7s2d，hole_a = AA，hole_b = KK，board = 5♠ 8♥ T♦（与
-// 7s2d 不重叠）。river 板（5 张）走 D-227 outer = 0 路径 → equity_vs_hand 直接
-// 评估，无 RNG 消费 → 严格反对称。
+// **§C-rev2 §3 后**：D-236b cluster 0 = weakest opp（约 72o-class 主导）。
+// 强 hole（AA / KK）on river_board vs 弱 cluster 平均胜率应 ≥ 0.5。river 板
+// （5 张）走 D-227 outer = 0 路径 → equity_vs_hand 直接评估（无 RNG 消费）→
+// cluster 内 N 个 representative 的 equity_vs_hand 平均确定性。
 #[test]
-fn ochs_pairwise_antisymmetry_via_equity_vs_hand_river() {
+fn ochs_strong_hole_dominates_weak_cluster_river() {
     let calc = make_calc_default();
     let board = river_board();
     let mut rng_a = ChaCha20Rng::from_seed(derive_substream_seed(
@@ -332,29 +327,26 @@ fn ochs_pairwise_antisymmetry_via_equity_vs_hand_river() {
         601,
     ));
 
-    // cluster 6 = 7s2d；river 状态确定性枚举（无 RNG 消费），ochs[6] = pairwise
-    // equity_vs_hand。
     let v_aa = calc.ochs(aa(), &board, &mut rng_a).unwrap();
     let v_kk = calc.ochs(kk(), &board, &mut rng_b).unwrap();
-    let cluster_idx = 6;
-    let r_aa_vs_72 = v_aa[cluster_idx];
-    let r_kk_vs_72 = v_kk[cluster_idx];
-    // 两者都是 vs 同一 representative；不直接反对称（hole 不同）。改测：
-    // OCHS sum sanity—same representative cluster k 上，所有 hole 的 v[k] ∈ [0, 1]。
+    let weak_idx = 0;
+    let r_aa_vs_weak = v_aa[weak_idx];
+    let r_kk_vs_weak = v_kk[weak_idx];
     assert!(
-        (0.0..=1.0).contains(&r_aa_vs_72),
-        "EQ-002-rev1：AA vs cluster 6 ∈ [0,1], got {r_aa_vs_72}"
+        (0.0..=1.0).contains(&r_aa_vs_weak),
+        "EQ-002-rev1：AA vs weakest cluster ∈ [0,1], got {r_aa_vs_weak}"
     );
     assert!(
-        (0.0..=1.0).contains(&r_kk_vs_72),
-        "EQ-002-rev1：KK vs cluster 6 ∈ [0,1], got {r_kk_vs_72}"
+        (0.0..=1.0).contains(&r_kk_vs_weak),
+        "EQ-002-rev1：KK vs weakest cluster ∈ [0,1], got {r_kk_vs_weak}"
     );
-    // 反对称等价：AA vs 72 + 72 vs AA = 1。但 ochs 接口走 (hole, opp_rep)
-    // 一方向；要直接断反对称需用 equity_vs_hand。本测试改测 OCHS smooth 性：
-    // 强 hole（AA / KK）vs 弱 cluster representative（72o）应 ≥ 0.5。
     assert!(
-        r_aa_vs_72 >= 0.5,
-        "AA river vs 72o representative：胜率 {r_aa_vs_72} 应 ≥ 0.5"
+        r_aa_vs_weak >= 0.5,
+        "AA river vs weakest opp cluster：胜率 {r_aa_vs_weak} 应 ≥ 0.5"
+    );
+    assert!(
+        r_kk_vs_weak >= 0.5,
+        "KK river vs weakest opp cluster：胜率 {r_kk_vs_weak} 应 ≥ 0.5"
     );
 }
 
