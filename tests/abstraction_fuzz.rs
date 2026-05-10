@@ -179,15 +179,12 @@ fn off_tree_real_bet(iter: usize, label: &str) {
 }
 
 #[test]
-#[ignore = "D2: D-201 PHM stub 占位实现待 D2 落地（src/abstraction/action.rs:379 当前 \
-            unimplemented!()，§D1 §出口预期暴露 issue → 见 GitHub issue #8）"]
 fn off_tree_real_bet_stability_smoke() {
     off_tree_real_bet(OFFTREE_SMOKE_ITER, "offtree-smoke 100k");
 }
 
 #[test]
-#[ignore = "D2: D-201 PHM stub 占位实现待 D2 落地（同 _smoke ignore reason；D2 闭合后切到 \
-            release --ignored opt-in，与 stage-1 1M determinism opt-in 同形态；issue #8）"]
+#[ignore = "D2 full: 1M iter（release ~3 s 实测 / debug 远超），与 stage-1 1M determinism opt-in 同形态"]
 fn off_tree_real_bet_stability_full() {
     off_tree_real_bet(OFFTREE_FULL_ITER, "offtree-full 1M");
 }

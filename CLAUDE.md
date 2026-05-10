@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 progress: A0 / A1 / B1 / B2 / C1 / C2 closed，下一步 D1 [测试]**（详见下文 §Stage 2 progress）。
+8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 progress: A0 / A1 / B1 / B2 / C1 / C2 / D1 / D2 closed，下一步 E1 [测试]**（详见下文 §Stage 2 progress）。
 
 历史 batch 出口数据（stage 1 的 B/C/D/E/F 各步、stage 2 的 A0 batch 1–6 review / A1 batch 7 / B1 batch 2）不在本文件保留——查阅顺序：
 
 1. `docs/pluribus_stage1_report.md` — stage-1 验收报告，含 F3 全套出口数据 + 9 条 §修订历史 carve-out 索引。
 2. `docs/pluribus_stage1_workflow.md` §修订历史（B-rev1 / C-rev1 / C-rev2 / D-rev0 / E-rev0 / E-rev1 / F-rev0 / F-rev1 / F-rev2）= stage-1 9 条 carve-out 全文。
-3. `docs/pluribus_stage2_workflow.md` §修订历史（A-rev0 / A-rev1 / B-rev0 / B-rev1）= stage-2 已闭合步骤的 carve-out 全文。
+3. `docs/pluribus_stage2_workflow.md` §修订历史（A-rev0 / A-rev1 / B-rev0 / B-rev1 / C-rev0 / C-rev1 / C-rev2 / D-rev0 / D-rev1）= stage-2 已闭合步骤的 carve-out 全文。
 4. `git log --oneline stage1-v1.0..` — stage-2 实施提交时间线。
 
 ### Stage 1 baseline（frozen at `stage1-v1.0`，stage-2 D-272 不退化锚点）
@@ -123,19 +123,20 @@ API 骨架代码化按 §A1 §输出 全部落地：
 
 **`memmap2` 路径 carve-out**：D-244 / D-255 锁 mmap 加载，但 `Mmap::map` 入口 `unsafe`，与 stage 1 D-275 `unsafe_code = "forbid"` 冲突。C2 走 `std::fs::read` 整段加载（语义等价 + 1.4MB 加载 < 5ms 无 SLO 风险）；`memmap2 = "0.9"` 依赖保留但 C2 路径未直接调用。stage 3+ 巨大 bucket table 跨进程 mmap 共享必需时由 D-275-revM 评估。
 
-### Stage 2 当前测试基线（D-rev0 batch 1 D1 [测试] 闭合后）
+### Stage 2 当前测试基线（D-rev1 batch 1 D2 [实现] 闭合后）
 
-- `cargo test --release --no-fail-fast`：**196 passed / 40 ignored / 0 failed across 27 test crates**（+ 2 doc-test 0 测；vs §C-rev2 batch 5 baseline 193 / 36 / 0 across 25 crates → +3 active +4 ignored +2 crates，全部由 §D-rev0 batch 1 引入）。
+- `cargo test --release --no-fail-fast`：**197 passed / 39 ignored / 0 failed across 27 test crates**（+ 2 doc-test 0 测；vs §D-rev0 batch 1 baseline 196 / 40 / 0 → +1 active −1 ignored，由 D2 [实现] `off_tree_real_bet_stability_smoke` 翻面 active 引入）。
     - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`，与 `stage1-v1.0` tag **byte-equal**（D-272 不退化要求满足）。
-    - **stage-2 11 crates** `92 passed / 21 ignored / 0 failed`（+2 crates vs §C-rev2 batch 5 9 crates 87/17/0）：action_abstraction 12 / api_signatures 1（混 stage-1+2）/ canonical_observation 12 / clustering_determinism 7 active + 4 ignored / equity_self_consistency 12 / equity_features 10 / info_id_encoding 8 / preflop_169 5 / bucket_quality 7 active + 13 ignored / **abstraction_fuzz 2 active + 4 ignored（new，§D-rev0 batch 1）** / **clustering_cross_host 1 active（new，§D-rev0 batch 1）**。
-    - lib unit tests 8 active（cluster::tests 6 → 8，§C-rev2 batch 1 §5a 新增 2 条 EMD 不等长 regression guard）。
-    - 实测耗时（release profile）：bucket_quality 109.40 s（cached_trained_table fixture 训练 + 7 active）+ clustering_determinism 313.27 s（含 4 线程 BLAKE3 byte-equal + cross-thread bucket id smoke）+ 其它合计 < 30 s = **总 ~7 min release**（vs §C-rev2 batch 5 ~6 min，仅本 batch 新增 abstraction_fuzz 0.21 s + clustering_cross_host 0 s 增量）。debug profile clustering_determinism 234.5 s + equity_self_consistency 149.5 s + equity_features 41 s 不变。
-- **artifact 重训（§C-rev2 batch 3 §3）**：`artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`（95 KB / 不进 git history）旧 BLAKE3 `3236dff01d00c829b319b347aa185cdfe12b34697ae9f249ef947d96912df513`（C2 stub 路径）→ 新 BLAKE3 `0a1b95e958b3c9057065929093302cd5a9067c5c0e7b4fb8c19a22fa2c8a743b`（§C-rev2 batch 3 §3 真实 169-class k-means OCHS）；CLI 训练耗时 28 s → 150 s release。`feature_set_id = 1` / `schema_version = 1` 不变（与 §C-rev1 §1 carve-out 一致）。
-- **跨架构 baseline（§D-rev0 batch 1 落地，issue #3 闭合）**：`tests/data/bucket-table-arch-hashes-linux-x86_64.txt` 32-seed BLAKE3 baseline（10/10/10 + 50 iter × OCHS real 169-class，capture 实测 ~74 min release on 1-CPU host），与 stage-1 `tests/data/arch-hashes-linux-x86_64.txt` 同目录 / 同命名 / 同 32-seed 约定。darwin-aarch64 baseline 不在本 batch 落地（D-052 仍 aspirational）。`tests/clustering_determinism.rs::cross_arch_bucket_id_baseline` baseline 缺失分支已升级硬 `panic!`（issue #3 §出口 step 2）；`tests/clustering_cross_host.rs` 加 cross-pair guard（与 stage-1 `cross_arch_baselines_byte_equal_when_both_present` 同形态）。
-- `cargo test --release --no-fail-fast -- --ignored --skip <heavy/known-fail>`：12 stage-1+2 子集**全绿** 8 passed / 0 failed across 12 crates（含本 batch 新增 3 条 `_full`：`infoset_mapping_repeat_full` + `action_abstraction_config_random_raise_sizes_full` + `bucket_lookup_1m_in_range_full`）。详见 `pluribus_stage2_workflow.md` §修订历史 §D-rev0 batch 1 §5 出口数据 + 7 类 17 个 skip 列表（74-min cross_arch baseline × 2 + issue #8 D2 stub × 2 + 12 bucket_quality 质量门槛 §C-rev2 batch 5 §1 known-fail）+ `cross_validation_pokerkit_100k_random_hands` 1-CPU host hang carve-out（stage-1 follow-up，与 D1 batch 1 无关）。
-- `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` trip-wire byte-equal 不变，stage 2 公开 API **0 签名漂移**（D-rev0 batch 1 0 触 `src/` 公开 surface，纯 [测试] 路径 + CI yml + 文档）。
+    - **stage-2 11 crates** `93 passed / 20 ignored / 0 failed`（+1 active −1 ignored vs §D-rev0 batch 1 92/21/0）：action_abstraction 12 / api_signatures 1（混 stage-1+2）/ canonical_observation 12 / clustering_determinism 7 active + 4 ignored / equity_self_consistency 12 / equity_features 10 / info_id_encoding 8 / preflop_169 5 / bucket_quality 7 active + 13 ignored / **abstraction_fuzz 3 active + 3 ignored（D-rev1 batch 1：`off_tree_real_bet_stability_smoke` 100k 由 D-rev0 ignore 翻 active）** / clustering_cross_host 1 active。
+    - lib unit tests 8 active（不变）。
+    - 实测耗时（release profile）：bucket_quality 110.74 s（cached_trained_table fixture 训练 + 7 active）+ clustering_determinism 309.81 s（含 4 线程 BLAKE3 byte-equal + cross-thread bucket id smoke）+ abstraction_fuzz 0.21 s（3 active；新增 `off_tree_real_bet_stability_smoke` 100k iter 实测无可观测增量）+ 其它合计 < 30 s = **总 ~7 min release**（与 §D-rev0 batch 1 持平）。debug profile clustering_determinism 234.5 s + equity_self_consistency 149.5 s + equity_features 41 s 不变。
+- **artifact 不变**：`artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`（95 KB / 不进 git history）BLAKE3 `0a1b95e958b3c9057065929093302cd5a9067c5c0e7b4fb8c19a22fa2c8a743b`（§C-rev2 batch 3 §3 真实 169-class k-means OCHS）；feature_set_id=1 / schema_version=1 不变（与 §C-rev1 §1 carve-out 一致）。D2 改动 0 触 bucket_table 训练路径（仅 `src/abstraction/action.rs::map_off_tree`）。
+- **跨架构 baseline（§D-rev0 batch 1 落地）**：`tests/data/bucket-table-arch-hashes-linux-x86_64.txt` 32-seed BLAKE3 baseline 不变。darwin-aarch64 baseline 不在本 batch 落地（D-052 仍 aspirational）。
+- `cargo test --release --no-fail-fast -- --ignored --skip <heavy/known-fail>`：D2 batch 1 **24 passed / 0 failed across 12 crates**（含 §D-rev0 batch 1 既有 + 本 batch 新增 1 条 `off_tree_real_bet_stability_full` 1M iter 0 panic / 0 invariant violation 实测；PokerKit-active 路径下 cross_eval_full_100k 37.15 s + cross_lang_full_10k + determinism_full_1m_hands_multithread_match + perf_slo 5 SLO 全过）。详见 `pluribus_stage2_workflow.md` §修订历史 §D-rev1 batch 1 §4 出口数据 + 7 类 17 个 skip 列表（74-min cross_arch baseline × 2 + 12 bucket_quality 质量门槛 §C-rev2 batch 5 §1 known-fail + `cross_validation_pokerkit_100k_random_hands` 1-CPU host hang carve-out，stage-1 follow-up）。
+- **cross_arch_bucket_id_baseline 实跑（§D-rev0 §4 carve-out (c) follow-through）**：D2 commit 同 PR 实跑 32-seed BLAKE3 byte-equal regression guard **0 diverge**，3251.08 s = 54.18 min release on 1-CPU host（vs §D-rev0 §4 capture 73.97 min 快 ~20 min；OCHS hot-cache effect，单测试 invocation + 无并发抢占）；详见 `pluribus_stage2_workflow.md` §修订历史 §D-rev1 batch 1 §3。
+- `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` trip-wire byte-equal 不变，stage 2 公开 API **0 签名漂移**（D-rev1 batch 1 仅触 `src/abstraction/action.rs::map_off_tree` 函数体内部，trait 签名不变）。
 
-### D1 closed（2026-05-10，本 commit）
+### D1 closed（2026-05-10，commit `e7071e0`）
 
 按 §D1 §输出 4 类交付物落地 + 同 PR 闭合 §C-rev2 batch 6 carve-out 推迟的 issue #3（cross-arch bucket table baseline）；详见 `pluribus_stage2_workflow.md` §修订历史 §D-rev0 batch 1：
 
@@ -147,9 +148,22 @@ API 骨架代码化按 §A1 §输出 全部落地：
 
 **§D-rev0 §3 D1 暴露 issue #8（§D1 §出口 line 384 字面预期）**：`DefaultActionAbstraction::map_off_tree`（`src/abstraction/action.rs:379`）当前 body 是 `unimplemented!("D-201 PHM stub; stage 6c 完整验证")`。`tests/abstraction_fuzz.rs::off_tree_real_bet_stability_smoke` 调用即 panic。处理：标 `#[ignore = "D2: D-201 PHM stub 占位实现待 D2 落地..."]` + 列 GitHub issue [#8](https://github.com/xujesse1988-ship-it/dezhou_20260508/issues/8) 移交 D2 [实现]（§出口含落地参考路径：选择 `config().raise_pot_ratios` 中量化 milli 最接近 `real_to / pot()` 的那个 ratio，边界 0/Stack 落 Call/AllIn）。其余 3 个 §D1 §出口示例 bug 类别（k-means 浮点 NaN / EMD 退化 / mmap layout overflow）在本 batch 实跑未暴露——前两条已被 §C-rev1 §1 / §C-rev2 batch 1 §5a 规避，第三条由 D-244-rev1 / BT-008-rev1 / BT-004 BLAKE3 trailer 校验在 C2 锁死。
 
-### 下一步：Stage 2 D2 [实现]
+### D2 closed（2026-05-10，本 commit）
 
-按 §D2 §输出 修复 D1 暴露的 corner case bug：(1) `DefaultActionAbstraction::map_off_tree` D-201 PHM stub 占位实现落地（issue #8）+ 取消 `tests/abstraction_fuzz.rs` 两条 `#[ignore = "D2: ..."]`；(2) `cargo test --release -- --ignored` 全套全绿；(3) 1M abstraction fuzz 0 panic / 0 invariant violation。如发现 `BucketTable` 文件格式或 `BucketTableError` 变体不够用，走 `D-NNN-revM` / `API-NNN-revM` 流程显式 bump（参考 stage-1 §D-rev0 D-037-rev1 / D-039-rev1 处理流程）。预算 0.5–1 人周。
+按 §D2 §输出 字面 + issue #8 §出口 落地 D1 暴露 corner case bug 的产品代码修复（仅 `src/abstraction/action.rs::map_off_tree` 函数体）+ 同 PR 闭合 issue #8；详见 `pluribus_stage2_workflow.md` §修订历史 §D-rev1 batch 1：
+
+- **`src/abstraction/action.rs::DefaultActionAbstraction::map_off_tree` D-201 PHM stub 占位实现**（issue #8 §出口 step 1）：函数体从 `unimplemented!("D-201 PHM stub; stage 6c 完整验证")` 改为确定性映射：① `real_to ≥ cap` → `AllIn { to: cap }`；② `real_to ≤ max_committed` → `Call { to: call_to }`（无 call → Check / Fold 兜底）；③ 无 `bet_range` / `raise_range` legal → Call / Check / Fold 兜底（防御）；④ 否则在 `config().raise_pot_ratios` 中找 `target_to(r) = max_committed + ceil(r.milli × pot_after_call / 1000)` 与 `real_to` 距离最小的 ratio（tie-break: smaller milli first，与 AA-004-rev1 同 to 折叠 ratio_label 较小一致），输出 `Bet | Raise { to: real_to, ratio_label: chosen }`（LA-002 互斥：`bet_range.is_some() → Bet`，否则 `Raise`）。整数算术（`u128 × u128 / u64`），`#![deny(clippy::float_arithmetic)]` 不破。
+- **stage 2 不要求完整数值正确性**（D-201 字面 "stage 6c 才完整"）：本占位实现只满足 issue #8 §出口 step 1 字面 "返回一个**确定性**的 `AbstractAction` 即可：相同 `(state, real_to)` → 相同输出"；Pluribus §S2 完整 pseudo-harmonic mapping 的数值正确性（含 below-min / between-sizes 概率分流）留 stage 6c 替换。
+- **取消 `tests/abstraction_fuzz.rs` 两条 D2 ignore**（issue #8 §出口 step 2）：`off_tree_real_bet_stability_smoke` 100k iter 由 `#[ignore = "D2: ..."]` 翻 active；`off_tree_real_bet_stability_full` 1M iter ignore reason 改 `"D2 full: 1M iter（release ~3 s 实测 / debug 远超），与 stage-1 1M determinism opt-in 同形态"`（保持 ignore，opt-in via `--ignored`，与 `infoset_mapping_repeat_full` / `action_abstraction_config_random_raise_sizes_full` 同形态）。
+- **issue #8 闭合**：D2 commit 同 PR close。stage 6c 完整 PHM 实现走 stage 6 [决策] / [实现] 单独评估，不在 stage 2 范围内（D-201 字面）。
+
+**§D-rev1 §1 [实现] → [测试] 角色越界 carve-out（§B-rev1 §3 / §C-rev1 §3 同型）**：D2 [实现] 闭合 commit 同 commit 触 `tests/abstraction_fuzz.rs` 取消 2 条 `#[ignore]` + 修订 1 条 ignore reason，由 issue #8 §出口 step 4 字面 "[测试] 由 [实现] 角色越界 carve-out 显式记录" 预先批注。书面追认，不静默扩散到 E1 [测试]（E1 仍是 [测试] 单边路径）。
+
+**§D-rev1 §2 cross_arch_bucket_id_baseline 实跑 follow-through**：§D-rev0 §4 carve-out (c) 字面 "D2 [实现] 闭合时 `cargo test --release -- --ignored` 全套 opt-in 跑会自然包含此断言，第一次 D2 commit 即捕获任何不一致"。本 commit 实跑 32-seed BLAKE3 byte-equal 验证 **0 diverge byte-equal**（3251.08 s = 54.18 min release on 1-CPU host，vs §D-rev0 §4 capture 73.97 min 快 ~20 min），D2 改动 0 触 bucket_table 训练路径 + D-051 same-arch determinism 验证通过。**§D-rev0 §4 carve-out 完整闭合**。
+
+### 下一步：Stage 2 E1 [测试]
+
+按 §E1 §输出 落地 stage-2 性能 SLO 断言 + bucket lookup throughput baseline bench group：(1) `tests/perf_slo.rs::stage2_*` 三条 SLO 断言（抽象映射 ≥ 100k mapping/s 单线程 / bucket lookup P95 ≤ 10 μs / equity Monte Carlo ≥ 1k hand/s @ 10k iter）——E1 阶段大概率达不到（B2/C2 朴素实现），断言为 "待达成" 状态留 E2 优化；(2) `benches/baseline.rs` 追加第 3 个 `abstraction/bucket_lookup` group（mmap 命中路径，§D-rev0 §2 carve-out 字面 "属 §E1 §输出 line 424 字面 [测试] 范畴"）；(3) CI 短 benchmark + 全量 nightly + criterion baseline 对照。预算 0.5 人周。E1 完成后进入 E2 [实现]（性能优化到 SLO）。
 
 ## Documents and their authority
 
@@ -183,7 +197,7 @@ Each stage is organized as `A → B → C → D → E → F`（13 steps）。Sta
 - `[实现]` agent writes product code only. **Never modify tests.** If a test fails, fix the product code; only edit the test if it has an obvious bug, and only after review.
 - `[决策]` and `[报告]` produce or modify docs in `docs/`.
 
-When the user asks you to do stage work, identify which stage and which step (A0 / A1 / B1 / …) the task belongs to and operate within that role。**当前进度**：stage 1 全 13 步闭合，stage 2 A0 / A1 / B1 / B2 / C1 / C2 / D1 闭合，下一步 D2 [实现]。历史角色越界 carve-out（[测试] ↔ [实现] 边界破例追认 / 0 产品代码改动也算 closure / D-NNN-revM 翻语义同 commit 翻测试 / 错误前移单点不变量）逐条记录在 `pluribus_stage1_workflow.md` §修订历史 与 `pluribus_stage2_workflow.md` §修订历史；遇相似情况时直接查那两份文档。
+When the user asks you to do stage work, identify which stage and which step (A0 / A1 / B1 / …) the task belongs to and operate within that role。**当前进度**：stage 1 全 13 步闭合，stage 2 A0 / A1 / B1 / B2 / C1 / C2 / D1 / D2 闭合，下一步 E1 [测试]。历史角色越界 carve-out（[测试] ↔ [实现] 边界破例追认 / 0 产品代码改动也算 closure / D-NNN-revM 翻语义同 commit 翻测试 / 错误前移单点不变量）逐条记录在 `pluribus_stage1_workflow.md` §修订历史 与 `pluribus_stage2_workflow.md` §修订历史；遇相似情况时直接查那两份文档。
 
 ## Non-negotiable invariants (apply to all stage-1 code)
 

@@ -374,9 +374,112 @@ impl ActionAbstraction for DefaultActionAbstraction {
         AbstractActionSet { actions: deduped }
     }
 
-    fn map_off_tree(&self, _state: &GameState, _real_to: ChipAmount) -> AbstractAction {
-        // D-201 PHM stub。stage 2 仅占位，stage 6c 完整数值验收。
-        unimplemented!("D-201 PHM stub; stage 6c 完整验证")
+    fn map_off_tree(&self, state: &GameState, real_to: ChipAmount) -> AbstractAction {
+        // D-201 PHM stub（issue #8 §出口）。stage 2 占位实现，stage 6c 替换为
+        // Pluribus §S2 完整 pseudo-harmonic mapping。要求：相同 (state, real_to)
+        // → 相同输出（确定性 + no-panic），数值正确性留 stage 6c。
+        //
+        // 算法：
+        //   ① real_to ≥ cap                → AllIn { to: cap }
+        //   ② real_to ≤ max_committed      → Call (或 Check / Fold 兜底)
+        //   ③ 无 bet_range / raise_range   → Call / Fold 兜底（防御）
+        //   ④ 否则 pick `raise_pot_ratios` 中 target_to 与 real_to 最接近的 ratio：
+        //         target_to(r) = max_committed + ceil(r.milli × pot_after_call / 1000)
+        //      tie-break：milli 较小者先（与 AA-004-rev1 同 to 折叠 ratio_label
+        //      较小一致）。输出 `Bet | Raise { to: real_to, ratio_label }`（LA-002
+        //      互斥：bet_range Some → Bet，否则 Raise）。
+
+        let Some(actor_seat) = state.current_player() else {
+            return AbstractAction::Fold;
+        };
+        let la = state.legal_actions();
+        let actor = &state.players()[actor_seat.0 as usize];
+        let committed_this_round = actor.committed_this_round;
+        let max_committed = state
+            .players()
+            .iter()
+            .map(|p| p.committed_this_round)
+            .max()
+            .unwrap_or(ChipAmount::ZERO);
+        let cap = la
+            .all_in_amount
+            .unwrap_or(committed_this_round + actor.stack);
+
+        // ① cap 上界：AllIn 优先。
+        if real_to >= cap {
+            return AbstractAction::AllIn { to: cap };
+        }
+
+        // ② 非 aggression 区间：real_to ≤ max_committed。
+        if real_to <= max_committed {
+            if let Some(call_to) = la.call {
+                return AbstractAction::Call { to: call_to };
+            }
+            if la.check {
+                return AbstractAction::Check;
+            }
+            return AbstractAction::Fold;
+        }
+
+        // ③ 无 bet/raise legal（terminal / all-in 跳轮 / 防御）。
+        if la.bet_range.is_none() && la.raise_range.is_none() {
+            if let Some(call_to) = la.call {
+                return AbstractAction::Call { to: call_to };
+            }
+            if la.check {
+                return AbstractAction::Check;
+            }
+            return AbstractAction::Fold;
+        }
+
+        // ④ 找最近 ratio。pot_after_call = pot() + (max_committed - committed_this_round)。
+        let pot_before = state.pot();
+        let to_call_delta = if max_committed > committed_this_round {
+            max_committed - committed_this_round
+        } else {
+            ChipAmount::ZERO
+        };
+        let pot_after_call = pot_before + to_call_delta;
+
+        let real_to_chips = real_to.as_u64();
+        let max_committed_chips = max_committed.as_u64();
+        let pot_chips = pot_after_call.as_u64();
+
+        // best = (ratio, distance)；遍历显式 tie-break smaller milli first。
+        let mut best: Option<(BetRatio, u64)> = None;
+        for &ratio in &self.config.raise_pot_ratios {
+            let milli = ratio.as_milli() as u128;
+            let scaled = milli * (pot_chips as u128);
+            let ratio_part_ceil = scaled.div_ceil(1000) as u64;
+            let target_to_chips = max_committed_chips.saturating_add(ratio_part_ceil);
+            let distance = target_to_chips.abs_diff(real_to_chips);
+            match best {
+                None => best = Some((ratio, distance)),
+                Some((existing_ratio, existing_distance)) => {
+                    if distance < existing_distance
+                        || (distance == existing_distance
+                            && ratio.as_milli() < existing_ratio.as_milli())
+                    {
+                        best = Some((ratio, distance));
+                    }
+                }
+            }
+        }
+        let chosen_ratio = best
+            .expect("raise_pot_ratios 非空 (D-202 长度 ∈ [1, 14])")
+            .0;
+
+        if la.bet_range.is_some() {
+            AbstractAction::Bet {
+                to: real_to,
+                ratio_label: chosen_ratio,
+            }
+        } else {
+            AbstractAction::Raise {
+                to: real_to,
+                ratio_label: chosen_ratio,
+            }
+        }
     }
 
     fn config(&self) -> &ActionAbstractionConfig {

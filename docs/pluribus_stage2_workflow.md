@@ -1309,3 +1309,77 @@ not implemented: D-201 PHM stub; stage 6c 完整验证
 - carve-out 政策：D1 暴露的 corner case bug 由 [测试] agent 列 issue + `#[ignore]` 标注 + 同 PR 文档化（与 stage-1 §C-rev2 / §D-rev0 测试 carve-out 同形态）。
 
 下一步：D2 [实现]（按 `pluribus_stage2_workflow.md` §D2 §输出 落地 issue #8 `DefaultActionAbstraction::map_off_tree` D-201 PHM stub 占位实现 + 取消 `abstraction_fuzz` 两条 `#[ignore = "D2: ..."]`；预期 D2 闭合后 `cargo test --release -- --ignored` 全套全绿，1M abstraction fuzz 0 panic / 0 invariant violation）。
+
+#### D2 batch 1（2026-05-10）— D-rev1：D-201 PHM stub 占位实现 + issue #8 闭合 + §D-rev0 §4 cross_arch baseline follow-through
+
+D2 [实现] 第一笔 commit 落地 §D2 §输出 字面 + issue #8 §出口 5 项全部交付物：(1) `DefaultActionAbstraction::map_off_tree` D-201 PHM stub 占位实现；(2) 取消 `tests/abstraction_fuzz.rs` 两条 D2 ignore；(3) issue #8 close；(4) `cargo test --release -- --ignored` 全套（除 7 类 17 个 skip）全绿；(5) 1M `off_tree_real_bet_stability_full` 0 panic / 0 invariant violation。同 PR 实跑 §D-rev0 §4 carve-out (c) 承诺的 cross_arch_bucket_id_baseline byte-equal 验证。本 batch carry forward 阶段 1 §修订历史 + 阶段 2 §A-rev0..§D-rev0 全部处理政策（不重新论证）。
+
+##### §D-rev1 §1：`map_off_tree` D-201 PHM stub 占位实现落地（issue #8 §出口 step 1）
+
+按 issue #8 §出口 step 1 字面 + §D2 §输出 line 399 字面 "Action abstraction off-tree mapping 占位实现（D-201 算法 stub，stage 6c 才完整）" 落地 `src/abstraction/action.rs::DefaultActionAbstraction::map_off_tree`：
+
+- **算法（4 步 first-match-wins）**：
+    1. `real_to ≥ cap` → `AbstractAction::AllIn { to: cap }`（cap = `la.all_in_amount.unwrap_or(committed_this_round + actor.stack)`）。
+    2. `real_to ≤ max_committed` → `Call { to: call_to }`（`la.call.is_some()`）/ `Check`（`la.check`）/ `Fold`（兜底，防御 `current_player().is_none()` 路径）。
+    3. 无 `la.bet_range` 且无 `la.raise_range` legal → Call / Check / Fold 兜底（防御 terminal / all-in 跳轮）。
+    4. 否则遍历 `config().raise_pot_ratios`，计算 `target_to(r) = max_committed + ceil(r.milli × pot_after_call / 1000)`，pick `(target_to - real_to).abs_diff` 最小的 ratio；tie-break: `smaller milli first`（与 AA-004-rev1 同 to 折叠保留 ratio_label 较小一致）。输出 `Bet | Raise { to: real_to, ratio_label: chosen }`（LA-002 互斥：`bet_range.is_some() → Bet`，否则 `Raise`）。
+- **整数算术**：milli × pot_after_call 用 `u128` 防溢出（max `u32::MAX × u64::MAX ≈ 7.9e28 < 2^128`），`saturating_add` 防 target_to overflow（理论上 raise size > 4M × pot 才触，stage-2 5-action 范围内不可达，但作防御）。`#![deny(clippy::float_arithmetic)]`（D-252）不破。
+- **确定性**：`raise_pot_ratios` Vec 迭代顺序固定（构造时按输入顺序，`ActionAbstractionConfig::new` 检测 `DuplicateRatio` 后写入）；tie-break 显式比较 milli；同 `(state, real_to)` → 同输出。
+- **stage 2 vs stage 6c 边界**：本占位实现只满足 issue #8 §出口 step 1 "返回一个**确定性**的 `AbstractAction` 即可：相同 `(state, real_to)` → 相同输出 (no panic)"；Pluribus §S2 完整 pseudo-harmonic mapping 的数值正确性（below-min raise 概率分流 + between-sizes 谐波插值 + fuzz 验收）由 stage 6c 替换。**feature_set_id / schema_version 不 bump**（D-201 决策路径未变更，仅函数体落地）。
+
+##### §D-rev1 §2：[实现] → [测试] 角色越界 carve-out（§B-rev1 §3 / §C-rev1 §3 同型）
+
+D2 [实现] 闭合 commit 同 commit 触 `tests/abstraction_fuzz.rs`：
+
+1. **取消 `off_tree_real_bet_stability_smoke` `#[ignore]`**（issue #8 §出口 step 2 字面）：100k iter 由 D-rev0 ignore-tagged 翻 active，与 `infoset_mapping_repeat_smoke` / `action_abstraction_config_random_raise_sizes_smoke` 同形态走默认路径（release 0.21 s 实测）。
+2. **修订 `off_tree_real_bet_stability_full` ignore reason**：从 `"D2: D-201 PHM stub 占位实现待 D2 落地..."` 改为 `"D2 full: 1M iter（release ~3 s 实测 / debug 远超），与 stage-1 1M determinism opt-in 同形态"`，与同文件其它两条 `_full` 的 reason 文体严格一致（对齐既定模板）。
+
+由 issue #8 §出口 step 4 字面 "角色边界：仅触 `src/abstraction/action.rs`（产品代码）+ `tests/abstraction_fuzz.rs`（取消 ignore，[测试] 由 [实现] 角色越界 carve-out 显式记录）" 预先批注。书面追认，不静默扩散到 E1 [测试]（E1 仍是 [测试] 单边路径）。
+
+与 stage-1 §B-rev1 §3 处理政策一致：[实现] 步骤越界改测试 → 当 commit 显式追认；不静默扩散到下一步。
+
+##### §D-rev1 §3：cross_arch_bucket_id_baseline 实跑 follow-through（§D-rev0 §4 carve-out (c)）
+
+§D-rev0 §4 carve-out (c) 字面承诺：「D2 [实现] 闭合时 `cargo test --release -- --ignored` 全套 opt-in 跑会自然包含此断言，第一次 D2 commit 即捕获任何不一致」。本 commit 实跑 32-seed × 3 街 (10/10/10) × 50 iter × OCHS real 169-class BLAKE3 byte-equal regression guard：
+
+- **实跑路径**：`cargo test --release --no-fail-fast --test clustering_determinism cross_arch_bucket_id_baseline -- --ignored --nocapture`（独立 binary，与 main `--ignored` 套件隔离运行避免 1-CPU 抢占）。
+- **D-051 same-arch determinism 不变量保证**：D2 改动 0 触 bucket_table 训练 / cluster / canonical_observation 路径（仅 `src/abstraction/action.rs::map_off_tree` 函数体内部，无 trait / 类型 / 公开 API 改动），同 hardware（linux x86_64）/ 同 toolchain（1.95.0）/ 同段代码路径下 32-seed BLAKE3 hash 必然 byte-equal——预期 0 diverge。
+- **实跑成本**：**3251.08 s = 54.18 min release on 1-CPU host**（vs §D-rev0 §4 capture 实测 73.97 min 快 ~20 min，可能 OCHS lazy cache 在本次单测试 invocation + 无并发 cargo test 抢占下完全 hot-cache）。
+- **carve-out 闭合**：`cross_arch_bucket_id_baseline` 实跑通过后，§D-rev0 §4 carve-out (c) 完整闭合；后续 stage-2 / stage-3 batch 不再续推迟此项。
+
+##### §D-rev1 §4 batch 1 出口数据（commit 落地实测）
+
+- `cargo fmt --all --check`：全绿（fuzz crate 独立 workspace 不在 root `--all` 范围内，本 batch 不触 `fuzz/`）。
+- `cargo build --all-targets`：全绿（`src/abstraction/action.rs` 函数体改动通过 `dev` profile 编译）。
+- `cargo clippy --all-targets -- -D warnings`：全绿（首次实现引入 `manual_abs_diff` lint 提示，已用 `u64::abs_diff` 替换 `if-else` 模式）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。
+- `cargo test --release --no-fail-fast`：**197 passed / 39 ignored / 0 failed across 27 test crates**（vs §D-rev0 batch 1 baseline 196 / 40 / 0 → +1 active −1 ignored，由 `off_tree_real_bet_stability_smoke` 翻 active 引入）。
+    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`（与 `stage1-v1.0` tag byte-equal，D-272 不退化要求满足）。
+    - **stage-2 11 crates** `93 passed / 20 ignored / 0 failed`（vs §D-rev0 batch 1 92/21/0 → +1 active −1 ignored，全部由 abstraction_fuzz 单 crate 翻面）：abstraction_fuzz 由 2 active + 4 ignored → 3 active + 3 ignored；其它 10 crates 数字不变。
+    - lib unit tests 8 active 不变（D2 0 改动 `src/abstraction/cluster.rs`）。
+    - 实测耗时 release：bucket_quality 110.74 s + clustering_determinism 309.81 s + abstraction_fuzz 0.21 s（含 100k 新 active iter，无可观测增量）+ 其它 < 30 s = **总 ~7 min release**（与 §D-rev0 batch 1 持平）。
+- `cargo test --release --no-fail-fast -- --ignored --skip <heavy/known-fail>`（PokerKit-active 路径：`PATH=".venv-pokerkit/bin:$PATH"`）：**24 passed / 0 failed across 12 crates**（含 §D-rev0 batch 1 既有 + 本 batch 新增 1 条 `off_tree_real_bet_stability_full` 1M iter 0 panic / 0 invariant violation 实测，release 3.03 s）。具体覆盖：
+    - **abstraction_fuzz 3 ignored 全绿**：`infoset_mapping_repeat_full` + `action_abstraction_config_random_raise_sizes_full` + `off_tree_real_bet_stability_full`（D2 [实现] 闭合后 1M iter 实跑 0 panic / 0 invariant violation，release 3.03 s）。
+    - **bucket_quality 1 ignored 全绿**：`bucket_lookup_1m_in_range_full`（110.74 s）。
+    - **clustering_determinism 2 ignored 全绿**：`clustering_repeat_blake3_byte_equal_full` + `cross_thread_bucket_id_consistency_full`（309.81 s 合计）。
+    - **stage-1 ignored 全绿**：cross_eval_full_100k 37.15 s（PokerKit-active）+ cross_lang_full_10k 3.21 s + determinism_full_1m_hands 20.73 s + fuzz_smoke_full 8.05 s + history_corruption / history_roundtrip / evaluator / cross_arch_hash 各全绿 + perf_slo 5 SLO 全过（eval7 single 20.76M eval/s ≥ 10M / simulate 134.9K hand/s ≥ 100K / history encode 5.33M ≥ 1M / history decode 2.51M ≥ 1M / eval7 multithread 走 1-CPU skip-with-log）。
+    - **跳过的 7 类 17 个 ignored 测试**（与 §D-rev0 batch 1 一致，不重新论证）：(1) `cross_arch_bucket_id_baseline` + `bucket_table_arch_hash_capture_only`（74 min × 2，cross_arch baseline 由本 batch §3 follow-through 单独路径实跑）；(2) 12 条 bucket_quality 质量门槛 §C-rev2 batch 5 §1 known-fail（hash design 限制）；(3) `cross_validation_pokerkit_100k_random_hands` 1-CPU host hang carve-out（stage-1 follow-up，与 D2 batch 1 无关）。
+    - **未 skip 的预期 fail 实测**：`cross_eval_full_100k` 在缺 PokerKit PATH 时 panic（"PokerKit unavailable"）—— 是 stage-1 测试的设计行为（C1 full-volume needs PokerKit）。本 batch 第一遍 `--ignored` 实跑时未带 `PATH=".venv-pokerkit/bin:$PATH"` 暴此 panic；按 CLAUDE.md 安装段字面要求加 PokerKit PATH 后第二遍实跑全绿。
+- `cross_arch_bucket_id_baseline` 实跑（§D-rev1 §3 follow-through）：32-seed × 3 街 BLAKE3 byte-equal 通过 **0 diverge**，3251.08 s = 54.18 min release on 1-CPU host（vs §D-rev0 §4 capture 73.97 min 快 ~20 min；OCHS hot-cache effect）。
+- `tests/api_signatures.rs` trip-wire byte-equal **不变**（本 batch 仅触 `src/abstraction/action.rs::map_off_tree` 函数体，trait `ActionAbstraction::map_off_tree` 签名不变；stage 2 公开 API **0 签名漂移**）。
+
+##### §D-rev1 §5 batch 1 角色边界审计
+
+- **修改产品代码**：`src/abstraction/action.rs::DefaultActionAbstraction::map_off_tree` 函数体（unimplemented! → 4 步算法实现，`u64::abs_diff` 整数距离 + tie-break 显式 milli 比较）。
+- **修改测试代码**（[实现] → [测试] 角色越界 carve-out，§D-rev1 §2）：`tests/abstraction_fuzz.rs` 取消 2 条 `#[ignore]` + 修订 1 条 ignore reason。
+- **修改文档**：`docs/pluribus_stage2_workflow.md` §D-rev1 batch 1 carve-out（本子节）+ `CLAUDE.md` Stage 2 progress 完整翻面（D1 closed 段保留 + 新增 D2 closed 段 + 测试基线 196/40/0 → 197/39/0 翻面 + 下一步翻 E1 [测试]）。
+- **未修改**：`src/abstraction/{mod,action,info,preflop,postflop,equity,feature,cluster,bucket_table,map}.rs` 中除 `action.rs::map_off_tree` 之外所有路径 / `src/core/` / `src/rules/` / `src/eval/` / `src/history/` / `src/error.rs` / `proto/` / `benches/baseline.rs` / `tools/*.rs` / `fuzz/` / `.github/workflows/`。
+- **角色越界**：1 处（§D-rev1 §2，issue #8 §出口 step 4 预先批注的 [实现] → [测试] 越界）。**0 静默越界**。
+
+##### §D-rev1 §6 carry forward 处理政策（与 §A-rev0..§D-rev0 一致，不重新论证）
+
+- 阶段 1 §B-rev1 §3 / §C-rev1 / §D-rev0 / §F-rev0 / §F-rev1 既往政策保持继承不变。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 `CLAUDE.md` Stage 2 progress 完整翻面（D2 closed 段新增 + 测试基线翻面 + 下一步 E1 [测试]）。
+- carve-out 政策：[实现] 角色越界由 issue §出口预先批注 + commit 显式追认（与 stage-1 §B-rev1 §3 / stage-2 §C-rev1 §3 同形态）；trade-off carve-out 推迟到下一步骤实跑由 commit 闭合（§D-rev0 §4 → §D-rev1 §3）。
+
+下一步：E1 [测试]（按 `pluribus_stage2_workflow.md` §E1 §输出 落地 stage-2 性能 SLO 断言：抽象映射 ≥ 100k mapping/s 单线程 / bucket lookup P95 ≤ 10 μs / equity Monte Carlo ≥ 1k hand/s @ 10k iter；同 PR 追加 `benches/baseline.rs` 第 3 个 `abstraction/bucket_lookup` group，§D-rev0 §2 carve-out 预先批注的 E1 范畴）。预期 E1 阶段 SLO 断言为 "待达成" 状态，由 E2 [实现] 优化达成。预算 0.5 人周。
