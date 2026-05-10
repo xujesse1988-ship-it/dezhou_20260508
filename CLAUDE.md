@@ -123,11 +123,11 @@ API 骨架代码化按 §A1 §输出 全部落地：
 
 **`memmap2` 路径 carve-out**：D-244 / D-255 锁 mmap 加载，但 `Mmap::map` 入口 `unsafe`，与 stage 1 D-275 `unsafe_code = "forbid"` 冲突。C2 走 `std::fs::read` 整段加载（语义等价 + 1.4MB 加载 < 5ms 无 SLO 风险）；`memmap2 = "0.9"` 依赖保留但 C2 路径未直接调用。stage 3+ 巨大 bucket table 跨进程 mmap 共享必需时由 D-275-revM 评估。
 
-### Stage 2 当前测试基线（C-rev2 batch 1 闭合后）
+### Stage 2 当前测试基线（C-rev2 batch 2 闭合后）
 
-- `cargo test --no-fail-fast`（默认 / debug）：**189 passed / 36 ignored / 0 failed across 25 test crates**（+ 2 doc-test 0 测；189 = 187 baseline + 2 cluster::tests EMD regression guard 由 §C-rev2 batch 1 §5a 新增）。
+- `cargo test --no-fail-fast`（默认 / debug）：**193 passed / 36 ignored / 0 failed across 25 test crates**（+ 2 doc-test 0 测；193 = 187 baseline + 2 cluster::tests EMD regression guard（batch 1 §5a）+ 4 canonical_observation input shuffle invariance + regression canary（batch 2 §4））。
     - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`，与 `stage1-v1.0` tag **byte-equal**（D-272 不退化要求满足）。
-    - **stage-2 9 crates** `83 passed / 17 ignored / 0 failed`：action_abstraction 12 / api_signatures 1（混 stage-1+2）/ canonical_observation 8 / clustering_determinism 7 active + 4 ignored（§C-rev1 §3 §⑤ §⑥ 32-seed baseline + capture-only + §C-rev1 batch 2 §2 BLAKE3 / cross-thread `_full` 子测试）/ equity_self_consistency 12 / equity_features 10 / info_id_encoding 8 / preflop_169 5 / **bucket_quality 7 active + 13 ignored**（§C-rev1 §2 §3 §① 12 stub + 1 1M smoke）。
+    - **stage-2 9 crates** `87 passed / 17 ignored / 0 failed`：action_abstraction 12 / api_signatures 1（混 stage-1+2）/ canonical_observation 12（8 → 12，§C-rev2 batch 2 §4 +4）/ clustering_determinism 7 active + 4 ignored（§C-rev1 §3 §⑤ §⑥ 32-seed baseline + capture-only + §C-rev1 batch 2 §2 BLAKE3 / cross-thread `_full` 子测试）/ equity_self_consistency 12 / equity_features 10 / info_id_encoding 8 / preflop_169 5 / **bucket_quality 7 active + 13 ignored**（§C-rev1 §2 §3 §① 12 stub + 1 1M smoke）。
     - lib unit tests 8 active（cluster::tests 6 → 8，§C-rev2 batch 1 §5a 新增 2 条 EMD 不等长 regression guard）。
     - 实测耗时（debug profile）clustering_determinism 234.5s（C-rev1 batch 2 §2 active 路径降到 10/10/10 + 50 iter，552s → 234.5s 57% 改善；n_train 由 `n_canonical * 4 = 12000` 主导，进一步优化需要重设计 train_one_street sample 策略，移交 D1/D2 评估；50/50/50 + 200 iter `_full` 子测试 `#[ignore]` 留 D1）+ equity_self_consistency 175s + equity_features 29s 主导（10M+ MC iter；release profile 全 < 25s，E2 SLO 路径接管）。
 - `cargo test --release --no-fail-fast -- --ignored`：13 release ignored 套件全绿（含 stage 1 全套 + stage 2 新增 15，含 C-rev1 batch 2 §2 两条 `_full` 子测试）；32-seed bucket table baseline 训练 ~5 min release。
@@ -186,6 +186,7 @@ These are repeated across the decision and validation docs because violations co
 - **Short all-in does not reopen raise option** — but only for **already-acted** players. This is the most error-prone NLHE rule (D-033, **D-033-rev1**, validation §1)。Per D-033-rev1 (TDA Rule 41 alignment): incomplete raises do not (a) update `last_full_raise_size` or (b) modify any player's `raise_option_open` flag. Players whose flag was `true` before the incomplete (un-acted on the prior full raise) keep it `true` and can still raise; players whose flag was already `false` (already-acted) cannot raise until a subsequent full raise reopens.
 - **Determinism baseline:** same architecture + toolchain + seed → identical hand-history BLAKE3 hash. Cross-architecture (x86 vs ARM) is an aspirational goal, not a stage-1 pass criterion (D-051, D-052).
 - **`tests/api_signatures.rs` is the spec-drift trip-wire.** A1 stubs return `!` which unifies with any return type — wrong signatures compile silently otherwise. Any signature change in `pluribus_stage1_api.md` / `pluribus_stage2_api.md` (via API-NNN-revM) must update this file in the same PR; otherwise `cargo test --no-run` fails.
+- **`canonical_observation_id` 对 (board, hole) 集合的任意输入顺序不变** (D-218-rev1 / §C-rev2 §4)。`postflop.rs` 在 first-appearance suit remap 之前先按 `Card::to_u8()` 升序排序 board / hole 各自，确保同 (board set, hole set) 任意输入顺序得到同一 canonical id。`tests/canonical_observation.rs::canonical_observation_id_input_shuffle_invariance_*` 是 regression guard。
 
 ## Engineering anti-patterns (explicit in workflow doc)
 

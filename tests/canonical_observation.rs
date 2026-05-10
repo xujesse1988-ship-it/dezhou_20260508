@@ -265,7 +265,128 @@ fn canonical_observation_id_compactness_smoke_flop() {
 }
 
 // ============================================================================
-// 4. canonical_observation_id_preflop_panics（前置条件断言）
+// 4. canonical_observation_id_input_shuffle_invariance（§C-rev2 §4 / D-218-rev1）
+// ============================================================================
+//
+// D-218-rev1 联合 canonical 等价类要求：board / hole 在扑克语义上是无序集合，
+// 同一 (board set, hole set) 任意输入顺序应得到同一 canonical_id。原实现
+// `for &c in board.iter().chain(hole.iter())` 走原始输入顺序构造 first-appearance
+// suit remap，输入顺序不同 → suit_remap 不同 → 不同 id（§C-rev2 §4 反例：
+// `[As, Kh, Qd]` vs `[Kh, As, Qd]` 同 board set 不同 id）。修正：remap 之前先
+// `to_u8()` 升序排序 board / hole。
+//
+// 测试覆盖：每条街取一个固定 (board, hole) 集合 → 枚举 board 全排列 + hole 两种
+// 顺序 → 全部 canonical_id 必须等于 baseline。flop 6 × 2 = 12 / turn 24 × 2 = 48
+// / river 120 × 2 = 240 cases。
+#[test]
+fn canonical_observation_id_input_shuffle_invariance_flop() {
+    let board = flop_board();
+    let hole = [
+        Card::new(Rank::Queen, Suit::Clubs),
+        Card::new(Rank::Ten, Suit::Diamonds),
+    ];
+    let baseline = canonical_observation_id(StreetTag::Flop, &board, hole);
+    for board_perm in permutations(&board) {
+        for hole_perm in [hole, [hole[1], hole[0]]] {
+            let id = canonical_observation_id(StreetTag::Flop, &board_perm, hole_perm);
+            assert_eq!(
+                baseline, id,
+                "flop input shuffle: board={board_perm:?} hole={hole_perm:?} → {id}, baseline={baseline}"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_observation_id_input_shuffle_invariance_turn() {
+    let board = turn_board();
+    let hole = [
+        Card::new(Rank::Queen, Suit::Clubs),
+        Card::new(Rank::Ten, Suit::Diamonds),
+    ];
+    let baseline = canonical_observation_id(StreetTag::Turn, &board, hole);
+    for board_perm in permutations(&board) {
+        for hole_perm in [hole, [hole[1], hole[0]]] {
+            let id = canonical_observation_id(StreetTag::Turn, &board_perm, hole_perm);
+            assert_eq!(
+                baseline, id,
+                "turn input shuffle: board={board_perm:?} hole={hole_perm:?} → {id}, baseline={baseline}"
+            );
+        }
+    }
+}
+
+#[test]
+fn canonical_observation_id_input_shuffle_invariance_river() {
+    let board = river_board();
+    let hole = [
+        Card::new(Rank::Jack, Suit::Spades),
+        Card::new(Rank::Three, Suit::Clubs),
+    ];
+    let baseline = canonical_observation_id(StreetTag::River, &board, hole);
+    for board_perm in permutations(&board) {
+        for hole_perm in [hole, [hole[1], hole[0]]] {
+            let id = canonical_observation_id(StreetTag::River, &board_perm, hole_perm);
+            assert_eq!(
+                baseline, id,
+                "river input shuffle: board={board_perm:?} hole={hole_perm:?} → {id}, baseline={baseline}"
+            );
+        }
+    }
+}
+
+/// §C-rev2 §4 反例（修复后通过）：原实现下 `[As, Kh, Qd]` vs `[Kh, As, Qd]`
+/// 同 (board set, hole set) 但 first-appearance remap 输出不同 suit 编号 → 不同
+/// canonical_id。修复后两者必须相等。
+#[test]
+fn canonical_observation_id_input_shuffle_regression_canary() {
+    let hole = [
+        Card::new(Rank::Queen, Suit::Clubs),
+        Card::new(Rank::Ten, Suit::Diamonds),
+    ];
+    let board_a = vec![
+        Card::new(Rank::Ace, Suit::Spades),
+        Card::new(Rank::King, Suit::Hearts),
+        Card::new(Rank::Queen, Suit::Diamonds),
+    ];
+    let board_b = vec![
+        Card::new(Rank::King, Suit::Hearts),
+        Card::new(Rank::Ace, Suit::Spades),
+        Card::new(Rank::Queen, Suit::Diamonds),
+    ];
+    let id_a = canonical_observation_id(StreetTag::Flop, &board_a, hole);
+    let id_b = canonical_observation_id(StreetTag::Flop, &board_b, hole);
+    assert_eq!(
+        id_a, id_b,
+        "§C-rev2 §4 regression canary：[As,Kh,Qd] vs [Kh,As,Qd] 同 board set，必须 canonical_id 相同"
+    );
+}
+
+/// 生成 `slice` 的所有排列（Heap's algorithm，n ≤ 5 适用）。
+fn permutations<T: Clone>(slice: &[T]) -> Vec<Vec<T>> {
+    let mut result = Vec::new();
+    let mut buf: Vec<T> = slice.to_vec();
+    let n = buf.len();
+    let mut c = vec![0usize; n];
+    result.push(buf.clone());
+    let mut i = 0;
+    while i < n {
+        if c[i] < i {
+            let swap_with = if i % 2 == 0 { 0 } else { c[i] };
+            buf.swap(swap_with, i);
+            result.push(buf.clone());
+            c[i] += 1;
+            i = 0;
+        } else {
+            c[i] = 0;
+            i += 1;
+        }
+    }
+    result
+}
+
+// ============================================================================
+// 5. canonical_observation_id_preflop_panics（前置条件断言）
 // ============================================================================
 //
 // API §2 字面（line 1022）：`canonical_observation_id` 仅对 `StreetTag::{Flop,

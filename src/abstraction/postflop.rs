@@ -46,13 +46,20 @@ pub const N_CANONICAL_OBSERVATION_RIVER: u32 = 10_000;
 /// 仅对 `StreetTag::{Flop, Turn, River}` 有效（`board.len() ∈ {3, 4, 5}`）；
 /// `StreetTag::Preflop` 调用 panic（caller 应改用 `canonical_hole_id`）。
 ///
-/// **C2 实现策略**：first-appearance suit remap → sorted (board / hole) →
-/// FNV-1a 32-bit fold → mod 街相关上界（[`N_CANONICAL_OBSERVATION_FLOP`] /
-/// `..._TURN` / `..._RIVER`）。算法满足：
+/// **C2 实现策略**：sort (board, hole) by raw card index → first-appearance suit
+/// remap → sort canonical → FNV-1a 32-bit fold → mod 街相关上界
+/// （[`N_CANONICAL_OBSERVATION_FLOP`] / `..._TURN` / `..._RIVER`）。算法满足：
 ///
 /// - **确定性**：纯函数，无 RNG / 全局状态。
-/// - **花色对称不变性**：全局花色置换 σ 应用到 (board, hole) 后 first-appearance
-///   remap 输出同一 canonical 序列；FNV-1a fold 输入相同 → 输出相同 id。
+/// - **input-order 不变性**：board / hole 按 `Card::to_u8()` 升序预排序后再喂给
+///   first-appearance remap；同一 (board set, hole set) 任意输入顺序得到同一
+///   canonical 序列（§C-rev2 §4 修正点）。
+/// - **花色对称不变性**：全局花色置换 σ 应用到 (board, hole) 后，预排序破坏 σ
+///   的位置敏感性，但 first-appearance remap 输出仍与原序列同构 → FNV-1a fold
+///   输入相同 → 输出相同 id（D-218-rev1 花色对称等价类）。
+/// - **board/hole partition 区分**：board 排序在前 / hole 排序在后构造 remap
+///   walk 顺序，保证同一 ranks/suits 不同 partition 划分得到不同 canonical id
+///   （poker 语义：board 公共 vs hole 私有不可互换）。
 /// - **范围**：mod 街相关上界后 id < `n_canonical_observation(street)`，落在
 ///   D-244-rev1 BT-008-rev1 收紧上界内。
 ///
@@ -80,12 +87,23 @@ pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 
         board.len()
     );
 
-    // First-appearance suit remap across (board || hole), preserving original
-    // input order so that any global suit permutation σ applied to all cards
-    // yields the same canonical relabeling sequence (D-218-rev1 花色对称等价类).
+    // §C-rev2 §4：先按 raw `to_u8()` 升序排序 board / hole，消除 caller 传入顺序
+    // 对 first-appearance suit remap 的影响。to_u8() = rank * 4 + suit，是 Card 上
+    // 的稳定全序；同一 (board set, hole set) 任意输入顺序排序后得到同一序列。
+    let mut board_sorted: [Card; 5] = [Card::from_u8(0).expect("0 valid"); 5];
+    for (i, &c) in board.iter().enumerate() {
+        board_sorted[i] = c;
+    }
+    board_sorted[..board.len()].sort_unstable_by_key(|c| c.to_u8());
+    let mut hole_sorted: [Card; 2] = hole;
+    hole_sorted.sort_unstable_by_key(|c| c.to_u8());
+
+    // First-appearance suit remap across sorted (board || hole)。board 在 hole
+    // 之前遍历，partition 区分由 walk 顺序保证（同 ranks/suits 不同 partition
+    // 划分得到不同 remap → 不同 canonical id）。
     let mut suit_remap: [u8; 4] = [u8::MAX; 4];
     let mut next_suit: u8 = 0;
-    for &c in board.iter().chain(hole.iter()) {
+    for &c in board_sorted[..board.len()].iter().chain(hole_sorted.iter()) {
         let s = c.suit() as u8;
         if suit_remap[s as usize] == u8::MAX {
             suit_remap[s as usize] = next_suit;
@@ -97,14 +115,14 @@ pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 
         c.rank() as u8 * 4 + canon_suit
     };
 
-    // Sort each of (board, hole) canonically so the input order doesn't affect
-    // id (boards / holes are unordered sets in poker semantics).
+    // remap 后再按 canonical 值排序：花色置换 σ 让相同 rank 内的 raw_suit 顺序
+    // 漂移，需重新排序到 canonical 顺序保证 FNV-1a 输入序列对 σ 不变。
     let mut board_canon: [u8; 5] = [0; 5];
-    for (i, c) in board.iter().enumerate() {
-        board_canon[i] = to_canonical(*c);
+    for (i, &c) in board_sorted[..board.len()].iter().enumerate() {
+        board_canon[i] = to_canonical(c);
     }
     board_canon[..board.len()].sort_unstable();
-    let mut hole_canon: [u8; 2] = [to_canonical(hole[0]), to_canonical(hole[1])];
+    let mut hole_canon: [u8; 2] = [to_canonical(hole_sorted[0]), to_canonical(hole_sorted[1])];
     hole_canon.sort_unstable();
 
     // FNV-1a 32-bit fold, mod 街相关上界（C2 收紧；A1 原 2_000_000 全街共用）。
