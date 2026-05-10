@@ -42,50 +42,39 @@ use poker::abstraction::cluster::emd_1d_unit_interval;
 use poker::eval::NaiveHandEvaluator;
 use poker::rng_substream::{derive_substream_seed, EQUITY_MONTE_CARLO};
 use poker::{
-    canonical_observation_id, BucketConfig, BucketTable, Card, ChaCha20Rng, HandEvaluator,
-    MonteCarloEquity, RngSource, StreetTag,
+    canonical_observation_id, BucketConfig, BucketTable, Card, ChaCha20Rng, EquityCalculator,
+    HandEvaluator, MonteCarloEquity, RngSource, StreetTag,
 };
 
 // ============================================================================
 // 通用 fixture
 // ============================================================================
 
-/// C2 [实现] 实测 fixture 配置：用 50/50/50 + cluster_iter=200 训练真实 bucket
+/// C2 [实现] 实测 fixture 配置：用 100/100/100 + cluster_iter=200 训练真实 bucket
 /// table，缓存到 OnceLock 避免每个 #[test] 重复训练（默认 500/500/500 + 10k iter
-/// 训练 ~17 min，测试 SLO 不可承受；50/50/50 + 200 iter ≈ 20 s release + 测试套件
-/// 内 12 条质量门槛断言独立 1k EHS 采样的复用代价均摊后总 < 60 s release）。
+/// 训练 ~17 min，测试 SLO 不可承受；100/100/100 + 200 iter 训练 ~70 s release +
+/// 12 条质量门槛断言独立 1k EHS 采样的复用代价均摊后总 < 5 min release）。
 ///
 /// **角色边界 [实现] → [测试] 越界 carve-out**（详见 stage-2 §C-rev0 §修订历史）：
-/// C1 [测试] 写的 `stub_table()` 在 C2 闭合时被改为 `cached_trained_table()`，
-/// 是 §B-rev1 §3 同型「[实现] 步骤越界改测试 → 当 commit 显式追认」carve-out。
-/// C2 闭合后 stub 路径仍由 `BucketTable::stub_for_postflop` 暴露，B1 / B2 残留
-/// 测试不动；本文件 12 条质量断言切换到真实路径以让 §C1 §出口 line 322-324
-/// "C2 [实现] 落地真实 mmap clustering 后取消 ignore 并验证全绿" 出口达成。
-/// 100/100/100 + cluster_iter=200 是 fixture 训练时间 vs 测试通过率的折衷点：
+/// C1 [测试] 写的 `stub_table()` 在 §C-rev2 batch 5 §1 闭合时被切换到
+/// `cached_trained_table()`（[测试] 单边路径，本 batch 0 越界）。100/100/100 +
+/// cluster_iter=200 是 fixture 训练时间 vs 测试通过率的折衷点：
 /// - bucket_count 100：每 bucket 平均 10 sample（test 1k samples / 100 buckets）
 ///   足够算 std_dev / EMD / median。50 bucket 太少（5 sample/bucket 噪声过大），
 ///   500 bucket 训练 7+ min release 太慢。
 /// - cluster_iter 200：触发 EHS² ≈ equity² 近似路径（cluster_iter ≤ 500，详见
 ///   `bucket_table.rs::train_one_street` carve-out 注释）。
-// C2 [实现] 缓存训练 fixture。stage 3+ true equivalence class enumeration 落地后
-// 12 条质量门槛断言取消 #[ignore] + 调用 `cached_trained_table()`，本 batch 因
-// hash design 暴露的限制（§C-rev0）暂未启用，保留 `#[allow(dead_code)]`。
-#[allow(dead_code)]
 const FIXTURE_BUCKET_CONFIG: BucketConfig = BucketConfig {
     flop: 100,
     turn: 100,
     river: 100,
 };
-#[allow(dead_code)]
 const FIXTURE_TRAINING_SEED: u64 = 0xC2_FA22_BD75_710E;
-#[allow(dead_code)]
 const FIXTURE_CLUSTER_ITER: u32 = 200;
 
-#[allow(dead_code)]
 static CACHED_TABLE: OnceLock<Arc<BucketTable>> = OnceLock::new();
 
-/// C2 [实现] 真实路径：训练一次缓存到 OnceLock（stage 3+ 重新启用）。
-#[allow(dead_code)]
+/// C2 [实现] 真实路径：训练一次缓存到 OnceLock（§C-rev2 batch 5 §1 切换到此路径）。
 fn cached_trained_table() -> Arc<BucketTable> {
     CACHED_TABLE
         .get_or_init(|| {
@@ -100,20 +89,12 @@ fn cached_trained_table() -> Arc<BucketTable> {
         .clone()
 }
 
-/// 旧 stub fixture（B1 / B2 残留）。1k smoke 默认 active；C2 后切换到真实路径。
-fn stub_table() -> BucketTable {
-    BucketTable::stub_for_postflop(BucketConfig::default_500_500_500())
-}
-
-/// stage 1 朴素评估器；EHS / EMD 计算路径依赖（C-rev0 stub 后未直接调用，但
-/// `cached_trained_table` 内部仍构造，stage 3+ 重新启用质量断言时直接复用）。
-#[allow(dead_code)]
+/// stage 1 朴素评估器；EHS / EMD 计算路径依赖（12 条质量门槛断言走此路径）。
 fn make_evaluator() -> Arc<dyn HandEvaluator> {
     Arc::new(NaiveHandEvaluator)
 }
 
-/// 短 iter MonteCarloEquity（stage 3+ 质量断言重启时使用）。
-#[allow(dead_code)]
+/// 短 iter MonteCarloEquity（12 条质量门槛断言用 1k iter MC 估算 EHS）。
 fn make_calc_short_iter() -> MonteCarloEquity {
     MonteCarloEquity::new(make_evaluator()).with_iter(1_000)
 }
@@ -191,15 +172,14 @@ fn median(values: &[f64]) -> f64 {
 // ============================================================================
 //
 // §C1 §输出 line 309 字面：`1k 手 (board, hole) → bucket id smoke + #[ignore] 1M 完整版`。
-// stub 路径下所有 lookup 返回 `Some(0)`，in-range 断言（< 500）总可过。本测试是
-// C1 唯一**默认 active 通过**的项；其它 4 类聚类质量断言因 stub 行为均 `#[ignore]`
-// 留 C2。
+// §C-rev2 batch 5 §1 切到 `cached_trained_table()`（fixture 100/100/100 + 200 iter）；
+// 真实 bucket id 范围 < 100，覆盖训练后 in-range 验收。
 //
 // 三街分别 1k 输入；任一 `lookup` 返回 `None`（越界）或 `>= bucket_count(street)`
 // 立即 fail。
 #[test]
 fn bucket_lookup_1k_in_range_smoke_flop() {
-    let table = stub_table();
+    let table = cached_trained_table();
     let bucket_count_flop = table.bucket_count(StreetTag::Flop);
     let samples = sample_observations(StreetTag::Flop, 1_000, 0x00C1_C0DE_F10E);
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -216,7 +196,7 @@ fn bucket_lookup_1k_in_range_smoke_flop() {
 
 #[test]
 fn bucket_lookup_1k_in_range_smoke_turn() {
-    let table = stub_table();
+    let table = cached_trained_table();
     let bucket_count_turn = table.bucket_count(StreetTag::Turn);
     let samples = sample_observations(StreetTag::Turn, 1_000, 0x00C1_C0DE_7A2B);
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -233,7 +213,7 @@ fn bucket_lookup_1k_in_range_smoke_turn() {
 
 #[test]
 fn bucket_lookup_1k_in_range_smoke_river() {
-    let table = stub_table();
+    let table = cached_trained_table();
     let bucket_count_river = table.bucket_count(StreetTag::River);
     let samples = sample_observations(StreetTag::River, 1_000, 0x00C1_C0DE_71BB);
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -259,7 +239,7 @@ fn bucket_lookup_1k_in_range_smoke_river() {
 #[test]
 #[ignore = "C2/D2: 1M 完整版 — release profile + --ignored opt-in（与 stage-1 §C2 / §D2 同形态）"]
 fn bucket_lookup_1m_in_range_full() {
-    let table = stub_table();
+    let table = cached_trained_table();
     for street in [StreetTag::Flop, StreetTag::Turn, StreetTag::River] {
         let bucket_count = table.bucket_count(street);
         // 1M / 3 街 ≈ 333k per street；与 stage-1 1M fuzz 同量级。
@@ -281,40 +261,77 @@ fn bucket_lookup_1m_in_range_full() {
 // 3. 0 空 bucket（D-236 / validation §3）
 // ============================================================================
 //
-// **C2 §C-rev0 carve-out**（详见 `pluribus_stage2_workflow.md` §修订历史 §C-rev0）：
+// **§C-rev1 §2 carve-out**（详见 `pluribus_stage2_workflow.md` §修订历史 §C-rev1 §2）：
 // canonical_observation_id FNV-1a 32-bit hash mod N (3K/6K/10K) 路径下，多个
 // (board, hole) 等价类映射到同一 obs_id（hash 碰撞）→ 同一 bucket。bucket 内
 // EHS std dev 由 hash 碰撞率 + 碰撞跨度决定，而非 k-means clustering 质量。
-// 真实 equivalence class enumeration（D-218-rev1 完整化）需要 stage 3+ 重构，
-// 本 batch C2 仅落地 hash-based approximate canonical id。
+// 真实 equivalence class enumeration（D-218-rev1 完整化）需要 stage 3+ 重构。
 //
 // 4 类质量门槛断言（0 空 bucket / EHS std dev / EMD / 单调性）× 3 街 = 12 条
-// 在 hash design 下不可达，按 §B-rev1 §3 carve-out 政策保留 `#[ignore]` 与
-// 早返回 eprintln 占位（让 `cargo test --release -- --ignored` 不暴 fail，与
-// stage 1 ignored baseline 0 failed 同形态）。完整断言体保留在 git history 与
-// 本文件注释，供 stage 3+ true equivalence class enumeration commit 重新启用。
+// 在 hash design 下不可达，按 §C-rev1 §2 carve-out 政策保留 `#[ignore]`；
+// §C-rev2 batch 5 §1 闭合时还原完整断言体（早返回 eprintln 占位删除，让
+// `cargo test --release -- --ignored` 实跑断言、暴露 hash design 限制实测程度，
+// 与 stage 3+ true equivalence enumeration 落地后取消 ignore 顺势生效）。
 //
 // 默认 active：4 条 helper sanity（emd / std_dev / median）+ 3 条 1k smoke
 // in-range + 1 条 1M smoke（`#[ignore]` opt-in）。
 #[test]
-#[ignore = "C2 §C-rev0：hash-based canonical_observation_id 碰撞，stage 3+ true enumeration 后转 active"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn no_empty_bucket_per_street_flop() {
-    eprintln!("[C2 §C-rev0] no_empty_bucket_per_street_flop: skipped pending stage 3+ true canonical equivalence class enumeration");
-}
-
-#[test]
-#[ignore = "C2 §C-rev0：同 flop"]
-fn no_empty_bucket_per_street_turn() {
-    eprintln!(
-        "[C2 §C-rev0] no_empty_bucket_per_street_turn: skipped pending stage 3+ true enumeration"
+    let table = cached_trained_table();
+    let bucket_count = table.bucket_count(StreetTag::Flop);
+    let samples = sample_observations(StreetTag::Flop, 5 * bucket_count as usize, 0x000C_1EBA_F10E);
+    let mut hit = vec![false; bucket_count as usize];
+    for (board, hole) in &samples {
+        let obs_id = canonical_observation_id(StreetTag::Flop, board, *hole);
+        if let Some(b) = table.lookup(StreetTag::Flop, obs_id) {
+            hit[b as usize] = true;
+        }
+    }
+    let empty_count = hit.iter().filter(|h| !**h).count();
+    assert_eq!(
+        empty_count, 0,
+        "D-236 / validation §3：flop {empty_count} 个 bucket 空（共 {bucket_count}）"
     );
 }
 
 #[test]
-#[ignore = "C2 §C-rev0：同 flop"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+fn no_empty_bucket_per_street_turn() {
+    let table = cached_trained_table();
+    let bucket_count = table.bucket_count(StreetTag::Turn);
+    let samples = sample_observations(StreetTag::Turn, 5 * bucket_count as usize, 0x000C_1EBA_7A2B);
+    let mut hit = vec![false; bucket_count as usize];
+    for (board, hole) in &samples {
+        let obs_id = canonical_observation_id(StreetTag::Turn, board, *hole);
+        if let Some(b) = table.lookup(StreetTag::Turn, obs_id) {
+            hit[b as usize] = true;
+        }
+    }
+    let empty_count = hit.iter().filter(|h| !**h).count();
+    assert_eq!(
+        empty_count, 0,
+        "D-236 / validation §3：turn {empty_count} 个 bucket 空"
+    );
+}
+
+#[test]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn no_empty_bucket_per_street_river() {
-    eprintln!(
-        "[C2 §C-rev0] no_empty_bucket_per_street_river: skipped pending stage 3+ true enumeration"
+    let table = cached_trained_table();
+    let bucket_count = table.bucket_count(StreetTag::River);
+    let samples = sample_observations(StreetTag::River, 5 * bucket_count as usize, 0xC1EB_A71B);
+    let mut hit = vec![false; bucket_count as usize];
+    for (board, hole) in &samples {
+        let obs_id = canonical_observation_id(StreetTag::River, board, *hole);
+        if let Some(b) = table.lookup(StreetTag::River, obs_id) {
+            hit[b as usize] = true;
+        }
+    }
+    let empty_count = hit.iter().filter(|h| !**h).count();
+    assert_eq!(
+        empty_count, 0,
+        "D-236 / validation §3：river {empty_count} 个 bucket 空"
     );
 }
 
@@ -330,21 +347,111 @@ fn no_empty_bucket_per_street_river() {
 // 采样：每条街 1000 sample（C1 1.5 人周限速）；EHS 用 `equity` 接口，1k iter
 // MC（标准误差 ≈ 0.016 < 0.05 阈值的 ~30% — 不会主导信号）。三街独立 #[test]。
 #[test]
-#[ignore = "C2 §C-rev0：hash-based canonical_observation_id 碰撞，stage 3+ true enumeration 后转 active"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn bucket_internal_ehs_std_dev_below_threshold_flop() {
-    eprintln!("[C2 §C-rev0] bucket_internal_ehs_std_dev_below_threshold_flop: skipped pending stage 3+ true enumeration");
+    let table = cached_trained_table();
+    let calc = make_calc_short_iter();
+    let bucket_count = table.bucket_count(StreetTag::Flop) as usize;
+    let samples = sample_observations(StreetTag::Flop, 1_000, 0x000C_157D_F10E);
+
+    let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
+    for (i, (board, hole)) in samples.iter().enumerate() {
+        let obs_id = canonical_observation_id(StreetTag::Flop, board, *hole);
+        let bucket = match table.lookup(StreetTag::Flop, obs_id) {
+            Some(b) => b as usize,
+            None => continue,
+        };
+        let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+            0x000C_157D_F10E,
+            EQUITY_MONTE_CARLO,
+            i as u32,
+        ));
+        let ehs = calc
+            .equity(*hole, board, &mut rng)
+            .expect("EHS：合法 (board, hole) sample");
+        by_bucket[bucket].push(ehs);
+    }
+    for (bid, samples) in by_bucket.iter().enumerate() {
+        if samples.len() < 2 {
+            continue;
+        }
+        let sd = std_dev(samples);
+        assert!(
+            sd < 0.05,
+            "validation §3 (flop)：bucket {bid} EHS std dev {sd} >= 0.05（n={}）",
+            samples.len()
+        );
+    }
 }
 
 #[test]
-#[ignore = "C2 §C-rev0：同 flop"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn bucket_internal_ehs_std_dev_below_threshold_turn() {
-    eprintln!("[C2 §C-rev0] bucket_internal_ehs_std_dev_below_threshold_turn: skipped pending stage 3+ true enumeration");
+    let table = cached_trained_table();
+    let calc = make_calc_short_iter();
+    let bucket_count = table.bucket_count(StreetTag::Turn) as usize;
+    let samples = sample_observations(StreetTag::Turn, 1_000, 0x000C_157D_7A2B);
+
+    let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
+    for (i, (board, hole)) in samples.iter().enumerate() {
+        let obs_id = canonical_observation_id(StreetTag::Turn, board, *hole);
+        let bucket = match table.lookup(StreetTag::Turn, obs_id) {
+            Some(b) => b as usize,
+            None => continue,
+        };
+        let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+            0x000C_157D_7A2B,
+            EQUITY_MONTE_CARLO,
+            i as u32,
+        ));
+        let ehs = calc.equity(*hole, board, &mut rng).expect("EHS turn");
+        by_bucket[bucket].push(ehs);
+    }
+    for (bid, samples) in by_bucket.iter().enumerate() {
+        if samples.len() < 2 {
+            continue;
+        }
+        let sd = std_dev(samples);
+        assert!(
+            sd < 0.05,
+            "validation §3 (turn)：bucket {bid} EHS std dev {sd} >= 0.05"
+        );
+    }
 }
 
 #[test]
-#[ignore = "C2 §C-rev0：同 flop"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn bucket_internal_ehs_std_dev_below_threshold_river() {
-    eprintln!("[C2 §C-rev0] bucket_internal_ehs_std_dev_below_threshold_river: skipped pending stage 3+ true enumeration");
+    let table = cached_trained_table();
+    let calc = make_calc_short_iter();
+    let bucket_count = table.bucket_count(StreetTag::River) as usize;
+    let samples = sample_observations(StreetTag::River, 1_000, 0xC157_D71B);
+
+    let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
+    for (i, (board, hole)) in samples.iter().enumerate() {
+        let obs_id = canonical_observation_id(StreetTag::River, board, *hole);
+        let bucket = match table.lookup(StreetTag::River, obs_id) {
+            Some(b) => b as usize,
+            None => continue,
+        };
+        let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+            0xC157_D71B,
+            EQUITY_MONTE_CARLO,
+            i as u32,
+        ));
+        let ehs = calc.equity(*hole, board, &mut rng).expect("EHS river");
+        by_bucket[bucket].push(ehs);
+    }
+    for (bid, samples) in by_bucket.iter().enumerate() {
+        if samples.len() < 2 {
+            continue;
+        }
+        let sd = std_dev(samples);
+        assert!(
+            sd < 0.05,
+            "validation §3 (river)：bucket {bid} EHS std dev {sd} >= 0.05"
+        );
+    }
 }
 
 // ============================================================================
@@ -355,21 +462,105 @@ fn bucket_internal_ehs_std_dev_below_threshold_river() {
 // **C1 状态**：B2 stub 全部映射到 bucket 0 → bucket 0 vs 1..499 比较时 1..499
 // 全空，`emd_1d` 返回 0 ⇒ `#[ignore]`。C2 落地后 499 对相邻每对 EMD ≥ 0.02。
 #[test]
-#[ignore = "C2 §C-rev0：hash-based canonical_observation_id 碰撞，stage 3+ true enumeration 后转 active"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn adjacent_bucket_emd_above_threshold_flop() {
-    eprintln!("[C2 §C-rev0] adjacent_bucket_emd_above_threshold_flop: skipped pending stage 3+ true enumeration");
+    let table = cached_trained_table();
+    let calc = make_calc_short_iter();
+    let bucket_count = table.bucket_count(StreetTag::Flop) as usize;
+    let samples = sample_observations(StreetTag::Flop, 1_000, 0x000C_1EAD_F10E);
+
+    let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
+    for (i, (board, hole)) in samples.iter().enumerate() {
+        let obs_id = canonical_observation_id(StreetTag::Flop, board, *hole);
+        let bucket = match table.lookup(StreetTag::Flop, obs_id) {
+            Some(b) => b as usize,
+            None => continue,
+        };
+        let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+            0x000C_1EAD_F10E,
+            EQUITY_MONTE_CARLO,
+            i as u32,
+        ));
+        let ehs = calc.equity(*hole, board, &mut rng).expect("EHS flop EMD");
+        by_bucket[bucket].push(ehs);
+    }
+    let t_emd: f64 = 0.02;
+    for k in 0..(bucket_count - 1) {
+        let emd = emd_1d_unit_interval(&by_bucket[k], &by_bucket[k + 1]);
+        assert!(
+            emd >= t_emd,
+            "D-233 (flop)：bucket {k} vs {} EMD {emd} < T_emd {t_emd}",
+            k + 1
+        );
+    }
 }
 
 #[test]
-#[ignore = "C2 §C-rev0：同 flop"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn adjacent_bucket_emd_above_threshold_turn() {
-    eprintln!("[C2 §C-rev0] adjacent_bucket_emd_above_threshold_turn: skipped pending stage 3+ true enumeration");
+    let table = cached_trained_table();
+    let calc = make_calc_short_iter();
+    let bucket_count = table.bucket_count(StreetTag::Turn) as usize;
+    let samples = sample_observations(StreetTag::Turn, 1_000, 0x000C_1EAD_7A2B);
+
+    let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
+    for (i, (board, hole)) in samples.iter().enumerate() {
+        let obs_id = canonical_observation_id(StreetTag::Turn, board, *hole);
+        let bucket = match table.lookup(StreetTag::Turn, obs_id) {
+            Some(b) => b as usize,
+            None => continue,
+        };
+        let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+            0x000C_1EAD_7A2B,
+            EQUITY_MONTE_CARLO,
+            i as u32,
+        ));
+        let ehs = calc.equity(*hole, board, &mut rng).expect("EHS turn EMD");
+        by_bucket[bucket].push(ehs);
+    }
+    let t_emd: f64 = 0.02;
+    for k in 0..(bucket_count - 1) {
+        let emd = emd_1d_unit_interval(&by_bucket[k], &by_bucket[k + 1]);
+        assert!(
+            emd >= t_emd,
+            "D-233 (turn)：bucket {k} vs {} EMD {emd} < T_emd",
+            k + 1
+        );
+    }
 }
 
 #[test]
-#[ignore = "C2 §C-rev0：同 flop"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn adjacent_bucket_emd_above_threshold_river() {
-    eprintln!("[C2 §C-rev0] adjacent_bucket_emd_above_threshold_river: skipped pending stage 3+ true enumeration");
+    let table = cached_trained_table();
+    let calc = make_calc_short_iter();
+    let bucket_count = table.bucket_count(StreetTag::River) as usize;
+    let samples = sample_observations(StreetTag::River, 1_000, 0xC1EA_D71B);
+
+    let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
+    for (i, (board, hole)) in samples.iter().enumerate() {
+        let obs_id = canonical_observation_id(StreetTag::River, board, *hole);
+        let bucket = match table.lookup(StreetTag::River, obs_id) {
+            Some(b) => b as usize,
+            None => continue,
+        };
+        let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+            0xC1EA_D71B,
+            EQUITY_MONTE_CARLO,
+            i as u32,
+        ));
+        let ehs = calc.equity(*hole, board, &mut rng).expect("EHS river EMD");
+        by_bucket[bucket].push(ehs);
+    }
+    let t_emd: f64 = 0.02;
+    for k in 0..(bucket_count - 1) {
+        let emd = emd_1d_unit_interval(&by_bucket[k], &by_bucket[k + 1]);
+        assert!(
+            emd >= t_emd,
+            "D-233 (river)：bucket {k} vs {} EMD {emd} < T_emd",
+            k + 1
+        );
+    }
 }
 
 // ============================================================================
@@ -383,21 +574,135 @@ fn adjacent_bucket_emd_above_threshold_river() {
 // 中位数 NaN（短路：`samples.len() < 2` 跳过 → 整条单调链不可比较 → 测试 fail）。
 // `#[ignore]` 留 C2。
 #[test]
-#[ignore = "C2 §C-rev0：hash-based canonical_observation_id 碰撞，stage 3+ true enumeration 后转 active"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn bucket_id_ehs_median_monotonic_flop() {
-    eprintln!("[C2 §C-rev0] bucket_id_ehs_median_monotonic_flop: skipped pending stage 3+ true enumeration");
+    let table = cached_trained_table();
+    let calc = make_calc_short_iter();
+    let bucket_count = table.bucket_count(StreetTag::Flop) as usize;
+    let samples = sample_observations(StreetTag::Flop, 2_000, 0x000C_1A0B_F10E);
+
+    let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
+    for (i, (board, hole)) in samples.iter().enumerate() {
+        let obs_id = canonical_observation_id(StreetTag::Flop, board, *hole);
+        let bucket = match table.lookup(StreetTag::Flop, obs_id) {
+            Some(b) => b as usize,
+            None => continue,
+        };
+        let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+            0x000C_1A0B_F10E,
+            EQUITY_MONTE_CARLO,
+            i as u32,
+        ));
+        let ehs = calc
+            .equity(*hole, board, &mut rng)
+            .expect("EHS flop median");
+        by_bucket[bucket].push(ehs);
+    }
+    let medians: Vec<(usize, f64)> = (0..bucket_count)
+        .filter_map(|b| {
+            if by_bucket[b].len() < 2 {
+                None
+            } else {
+                Some((b, median(&by_bucket[b])))
+            }
+        })
+        .collect();
+    for w in medians.windows(2) {
+        let (b0, m0) = w[0];
+        let (b1, m1) = w[1];
+        assert!(
+            m1 >= m0,
+            "D-236b (flop)：bucket {b0} median {m0} > bucket {b1} median {m1}（单调违反）"
+        );
+    }
 }
 
 #[test]
-#[ignore = "C2 §C-rev0：同 flop"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn bucket_id_ehs_median_monotonic_turn() {
-    eprintln!("[C2 §C-rev0] bucket_id_ehs_median_monotonic_turn: skipped pending stage 3+ true enumeration");
+    let table = cached_trained_table();
+    let calc = make_calc_short_iter();
+    let bucket_count = table.bucket_count(StreetTag::Turn) as usize;
+    let samples = sample_observations(StreetTag::Turn, 2_000, 0x000C_1A0B_7A2B);
+
+    let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
+    for (i, (board, hole)) in samples.iter().enumerate() {
+        let obs_id = canonical_observation_id(StreetTag::Turn, board, *hole);
+        let bucket = match table.lookup(StreetTag::Turn, obs_id) {
+            Some(b) => b as usize,
+            None => continue,
+        };
+        let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+            0x000C_1A0B_7A2B,
+            EQUITY_MONTE_CARLO,
+            i as u32,
+        ));
+        let ehs = calc
+            .equity(*hole, board, &mut rng)
+            .expect("EHS turn median");
+        by_bucket[bucket].push(ehs);
+    }
+    let medians: Vec<(usize, f64)> = (0..bucket_count)
+        .filter_map(|b| {
+            if by_bucket[b].len() < 2 {
+                None
+            } else {
+                Some((b, median(&by_bucket[b])))
+            }
+        })
+        .collect();
+    for w in medians.windows(2) {
+        let (b0, m0) = w[0];
+        let (b1, m1) = w[1];
+        assert!(
+            m1 >= m0,
+            "D-236b (turn)：bucket {b0} median {m0} > {b1} median {m1}"
+        );
+    }
 }
 
 #[test]
-#[ignore = "C2 §C-rev0：同 flop"]
+#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
 fn bucket_id_ehs_median_monotonic_river() {
-    eprintln!("[C2 §C-rev0] bucket_id_ehs_median_monotonic_river: skipped pending stage 3+ true enumeration");
+    let table = cached_trained_table();
+    let calc = make_calc_short_iter();
+    let bucket_count = table.bucket_count(StreetTag::River) as usize;
+    let samples = sample_observations(StreetTag::River, 2_000, 0xC1A0_B71B);
+
+    let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
+    for (i, (board, hole)) in samples.iter().enumerate() {
+        let obs_id = canonical_observation_id(StreetTag::River, board, *hole);
+        let bucket = match table.lookup(StreetTag::River, obs_id) {
+            Some(b) => b as usize,
+            None => continue,
+        };
+        let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+            0xC1A0_B71B,
+            EQUITY_MONTE_CARLO,
+            i as u32,
+        ));
+        let ehs = calc
+            .equity(*hole, board, &mut rng)
+            .expect("EHS river median");
+        by_bucket[bucket].push(ehs);
+    }
+    let medians: Vec<(usize, f64)> = (0..bucket_count)
+        .filter_map(|b| {
+            if by_bucket[b].len() < 2 {
+                None
+            } else {
+                Some((b, median(&by_bucket[b])))
+            }
+        })
+        .collect();
+    for w in medians.windows(2) {
+        let (b0, m0) = w[0];
+        let (b1, m1) = w[1];
+        assert!(
+            m1 >= m0,
+            "D-236b (river)：bucket {b0} median {m0} > {b1} median {m1}"
+        );
+    }
 }
 
 // ============================================================================

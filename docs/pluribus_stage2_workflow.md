@@ -1120,3 +1120,52 @@ helper sanity 断言行为不变（两条均传等长输入，命中产品 helpe
 - §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 CLAUDE.md "Stage 2 当前测试基线" 段落 batch 4 完成 header + bucket_quality 注释 §C-rev2 §5b 备注（test count 不变 193 / 36，仅注释翻面）。
 
 下一步：§C-rev2 batch 5（[测试] 侧 #2，bucket_quality.rs 切到 cached_trained_table + 12 条 #[ignore] 重新评估 active/ignored）。
+
+#### C-rev2 batch 5（2026-05-10）— C2 后第二轮 review：#2 bucket_quality.rs 切到 cached_trained_table + 还原 12 条断言体
+
+C-rev2 batch 4（#4 删本地 EMD 副本走产品 helper）闭合后，本 batch 5 闭合 [测试] 侧 issue #2：把 1k smoke + 1M `_full` 切换到 `cached_trained_table()` + 还原 12 条质量门槛 `#[ignore]` 断言体（让 `cargo test --release -- --ignored` 实跑断言、暴露 hash design 限制实测程度）。
+
+##### §C-rev2 §1：bucket_quality.rs fixture 切换 + 12 条 #[ignore] 断言体还原（issue #2）
+
+C2 闭合 commit `2418a10` + `3f0c313` 后 review 发现 §C2 §出口 line 322-324 + §C-rev1 §3 carve-out 字面要求的 "C2 [实现] 闭合 commit 同 commit 取消 12 条 `#[ignore]` + 切换到真实路径" 未实质达成——`tests/bucket_quality.rs` 12 条质量门槛 `#[test]`（line 322-424，3 街 × 4 类：empty / std_dev / EMD / monotonic）保留 `#[ignore = "C2 §C-rev0 …"]` 标注 + 测试体只 `eprintln!` + 早 `return`，断言体只活在 git history；`cached_trained_table()` + `FIXTURE_*` / `make_evaluator` / `make_calc_short_iter` 全挂 `#[allow(dead_code)]` 无 active `#[test]` 调用；1k smoke + 1M `_full` 全部 `let table = stub_table();`。
+
+修正分两步落地（issue #2 §出口 (a) + (b)）：
+
+(a) **fixture 切换**：3 条 1k smoke `bucket_lookup_1k_in_range_smoke_{flop, turn, river}` + 1 条 1M `_full` `bucket_lookup_1m_in_range_full` 改用 `cached_trained_table()`（fixture `BucketConfig{flop=100, turn=100, river=100}` + `FIXTURE_TRAINING_SEED=0xC2_FA22_BD75_710E` + `FIXTURE_CLUSTER_ITER=200`，release 训练 ~143 s 单 host 一次性 OnceLock 缓存）；删除全部 `#[allow(dead_code)]` 标注（fixture 常量 / `cached_trained_table()` / `make_evaluator` / `make_calc_short_iter` / `CACHED_TABLE` static 全部转 active 引用）。`stub_table()` 函数保留死代码（B1 / B2 残留路径，§B-rev0 batch 2 carve-out option (1) `BucketTable::stub_for_postflop` 仍在 `bucket_table.rs` 公开 surface）。
+
+(b) **断言体还原**：12 条质量门槛 `#[test]` 从 git history (commit `5d6c8d6` C1 [测试] 关闭版本) 还原完整断言体——`no_empty_bucket_per_street_*` 用 `5 × bucket_count` 采样 + `hit[bucket_id] = true` 标记 + `empty_count == 0` 断言；`bucket_internal_ehs_std_dev_below_threshold_*` 用 1k 采样 + `make_calc_short_iter` 1k iter MC + `std_dev < 0.05` 阈值；`adjacent_bucket_emd_above_threshold_*` 同 1k 采样 + 产品 `cluster::emd_1d_unit_interval` (§C-rev2 batch 4 §5b 切换路径) + `emd >= 0.02` 阈值；`bucket_id_ehs_median_monotonic_*` 用 2k 采样 + median + windows(2) 单调链断言。`#[ignore]` 保留但 reason 字符串统一更新为 `"§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"`，删除 `eprintln!` 早返回让 `cargo test --release -- --ignored` 实跑断言体可见 fail。
+
+##### §C-rev2 §1 active / ignored judgment call
+
+issue #2 §出口字面要求 (4)："取消 ignore 后跑 `cargo test --release --test bucket_quality -- --ignored` 必须全绿"。本 batch 5 在 100/100/100 + 200 iter fixture 上实跑 12 条断言体得：
+
+- **3 条 `no_empty_bucket_per_street_*`**：flop / river 100 个 bucket 中 0 ~ 几个 empty，turn 4 个 empty。三街全 fail（hash design 把 N_CANONICAL=3K/6K/10K obs_id 集合 mod 后散布不均，少量 cluster 训练样本不足分配 → 余 4 个空 bucket）。
+- **3 条 `bucket_internal_ehs_std_dev_below_threshold_*`**：bucket 内 EHS std dev 实测远 > 0.05（hash 碰撞下同 bucket 装混合 EHS 起手）。三街全 fail。
+- **3 条 `adjacent_bucket_emd_above_threshold_*`**：499 / 99 对相邻 EMD 中部分 < 0.02 阈值（D-236b 重编号 + 100 bucket fixture 下相邻 cluster 区分度有限）。三街全 fail。
+- **3 条 `bucket_id_ehs_median_monotonic_*`**：D-236b reorder_by_ehs_median 后 cluster id 单调链 — 但 hash 碰撞使 bucket 内 EHS 中位数估计噪声 > 邻 cluster 距离 → 单调链可断；三街全 fail。
+
+判断结果（[测试] agent judgment call）：**12 条全部保留 `#[ignore]`**，原因严格匹配 §C-rev1 §2 carve-out 字面：FNV-1a hash mod N approximate canonical id 与 D-218-rev1 字面 "联合花色对称等价类唯一 id" 在 hash 碰撞场景下不严格等价，bucket 内分布质量受 hash design 主导而非 k-means clustering 质量。stage 3+ true equivalence class enumeration（D-218-rev2，工作量 ~25K flop 类 + 查表 + Pearson hash）落地后 12 条全部转 active。
+
+§C-rev1 §2 carve-out 政策保持不变（C2 闭合时锁定 + §C-rev2 batch 5 同政策延续）：12 条 `#[ignore]` 不让 `cargo test --release -- --ignored` 默认运行；CI 路径默认不触发 `--ignored` 因此 0 失败信号；本地 `--ignored` 调试时 12 条会 visibly fail，与 stage 3+ enumeration 落地后取消 ignore 直接生效（断言体已就位）。
+
+issue #2 §出口 (4) "全绿" 出口在 hash design 限制下不可达；本 batch 完成 §出口 (1) (2) (3)（fixture 切换 + 还原 + CLAUDE.md 计数同步），(4) 转移到 stage 3+ true enumeration commit。
+
+##### batch 5 出口数据（commit 落地实测）
+
+- `cargo fmt / clippy --all-targets / build / doc` 四道 gate 全绿。
+- `cargo test --test bucket_quality`（debug 默认）：7 passed / 0 failed / 13 ignored（active 计数不变，与 batch 4 保持；fixture 训练在 1k smoke 首次调用触发，~7 min debug profile 单 host 一次性 OnceLock 缓存）。
+- `cargo test --release --test bucket_quality`：7 passed / 0 failed / 13 ignored；fixture 训练 ~143 s release，3 条 1k smoke 全绿。
+- `cargo test --release --test bucket_quality -- --ignored --skip bucket_lookup_1m_in_range_full`：0 passed / 12 failed（§C-rev1 §2 carve-out 实测下限 — 12 条全部 fail 与 hash design 限制一致；fixture 复用第二次 OnceLock 不重训）。本 fail 集合**预期**且 `#[ignore]` 默认挡住，CI nightly `--ignored` 路径如果不显式串入此 12 条则不暴 fail；本 batch 文档化此实测下限便于 stage 3+ enumeration 落地时校对预期变化。
+- 其它 24 test crates 不动（仅 `tests/bucket_quality.rs` 改动 + 不动产品代码）；`tests/api_signatures.rs` trip-wire byte-equal 不变。
+
+##### batch 5 角色边界审计
+
+- **修改测试代码**：`tests/bucket_quality.rs`（fixture 常量 / `cached_trained_table` / `make_evaluator` / `make_calc_short_iter` / `CACHED_TABLE` 取消 `#[allow(dead_code)]` + 1k smoke × 3 + 1M `_full` 切到 `cached_trained_table()` + 12 条质量门槛 `#[test]` 还原断言体 + reason 字符串统一更新到 `"§C-rev1 §2: hash-based ..."`+ 顶部注释段更新 §3 §4 §5 §6 + 顶部 use 增加 `EquityCalculator` trait import）。
+- **未修改**：所有 `src/*.rs` 产品代码 / 其它 `tests/*.rs` / `Cargo.toml` / `tests/data/`。
+- **0 角色越界**：本 batch 是 [测试] 单边（仅改 `tests/bucket_quality.rs` + 文档），与 batch 4 §5b 同型。
+
+§C-rev2 batch 5 carry forward 处理政策（与 §A-rev0..§C-rev2 batch 4 一致，不重新论证）：
+- 阶段 1 §B-rev1 §3 / §C-rev1 / §D-rev0 / §F-rev1 既往政策保持继承不变。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 CLAUDE.md "Stage 2 当前测试基线" 段落 batch 5 完成 header + bucket_quality `7 active + 13 ignored` 数字保持但 ignored 语义翻面（B2 stub `eprintln` 占位 → 真实断言体 + §C-rev1 §2 reason 字符串）。
+
+下一步：§C-rev2 batch 6（[测试] 侧 #3，cross-arch bucket table baseline 文件 capture + 缺失硬 panic）→ D1 [测试]。
