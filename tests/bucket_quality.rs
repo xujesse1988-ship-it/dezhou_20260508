@@ -38,6 +38,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use poker::abstraction::cluster::emd_1d_unit_interval;
 use poker::eval::NaiveHandEvaluator;
 use poker::rng_substream::{derive_substream_seed, EQUITY_MONTE_CARLO};
 use poker::{
@@ -157,30 +158,6 @@ fn sample_observations(
         out.push((board, hole));
     }
     out
-}
-
-/// 把 `Vec<f64>` 排序后用 1D EMD 公式计算两分布距离（D-234）：
-///
-/// ```text
-/// EMD_1D = sum_{i} |F_a(x_i) - F_b(x_i)| · Δx
-/// ```
-///
-/// 等价于排序后 sample 的逐项差分绝对值平均。给定两 sample 集合（已 ∈ [0, 1]）：
-fn emd_1d_unit_interval(samples_a: &[f64], samples_b: &[f64]) -> f64 {
-    // 等长简单实现（D-234 sorted CDF 差分积分）；不等长时按各自 size 等距插值。
-    let mut a: Vec<f64> = samples_a.to_vec();
-    let mut b: Vec<f64> = samples_b.to_vec();
-    a.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-    b.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-    let n = a.len().min(b.len()) as f64;
-    if n == 0.0 {
-        return 0.0;
-    }
-    let mut acc = 0.0_f64;
-    for i in 0..(a.len().min(b.len())) {
-        acc += (a[i] - b[i]).abs();
-    }
-    acc / n
 }
 
 /// 简易 std dev（C1 fixture 用；C2 用 cluster 内 EHS 实测）。
@@ -430,6 +407,10 @@ fn bucket_id_ehs_median_monotonic_river() {
 // 测试基础设施自检。这些 helper 是 C1 全套质量门槛的基础——若 helper 算错，
 // 上面 4 类预期失败的 fail 信号就不可信。本测试始终 active（不依赖产品代码
 // stub 行为），保证 C2 接入后断言切换由 helper 正确性背书。
+//
+// **§C-rev2 §5b**：`emd_1d_unit_interval` 走 `poker::abstraction::cluster::*`
+// 产品 helper（§C-rev2 §5a 修正后），不再持本地副本；`std_dev` / `median`
+// 仍保留本地（非产品功能，stage 3+ 质量断言重启时再评估迁移路径）。
 #[test]
 fn helper_sanity_emd_zero_for_identical_distributions() {
     let a = [0.2, 0.4, 0.6, 0.8];
