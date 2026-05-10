@@ -945,3 +945,42 @@ batch 2 角色边界审计：本 commit 触 `Cargo.toml`（[实现] 删除依赖
 - §B-rev1 §3：[实现] 步骤越界改测试代码 → 当 commit 显式追认（本 batch §3 第二次追认）。
 
 下一步不变：D1 [测试]。
+
+#### C-rev2 batch 1（2026-05-10）— C2 后第二轮 review：#7 cluster::emd_1d_unit_interval 步函数 CDF 积分
+
+C2 + C-rev1 batch 2 关闭后第二轮 review，针对 5 处独立 P0 / P1 / P2 工程 / 正确性问题开 6 条 GitHub issue（#2..#7）按 [测试] / [实现] 角色拆分 §C-rev2 流程：[实现] 侧 #5 / #6 / #7（batch 1 / 2 / 3 顺序闭合）/ [测试] 侧 #2 / #3 / #4（依赖 [实现] 侧落地，预留 batch 4+）。
+
+##### §C-rev2 §5a：cluster::emd_1d_unit_interval 真正 sorted-CDF 积分（issue #7）
+
+D-234 字面 "1D EMD = sorted CDF 差分积分"。原实现 `acc / min(len_a, len_b)` 在不等长样本下截断长分布尾部，与 D-234 数学定义不一致；注释自称 "等距插值" 但实现是 truncation。后果：bucket-quality 验收的相邻 EMD 阈值在 cluster size 不均时系统性低估。
+
+修正：`emd_1d_unit_interval` 按长度分流——
+- **等长**（D-234 主路径，cluster 内 EHS 比较）：保持原实现 `Σ|a[i] - b[i]| / n` 不变（与步函数 CDF 积分数学等价于此特例），保留历史 byte-equal trace。
+- **不等长**：合并 `a ∪ b` 排序后扫一遍 step CDF，逐段累加 `|F_a - F_b| · Δx`，与样本数比例无关。新增 `emd_step_cdf_integral` 私有 helper。
+
+新增 2 条 cluster::tests 单元测试：
+- `emd_unequal_length_uses_full_distribution`：`a=[0.8, 0.9], b=[0.5]`，旧 truncation 算 0.3（丢 a[1]=0.9），新步函数算 0.35（正确）。
+- `emd_unequal_length_same_distribution_near_zero`：100 vs 1000 等距均匀样本，EMD 应 < 0.02。
+
+无生产路径调用（仅 cluster::tests / `tests/bucket_quality.rs` 自带本地副本调用 `emd_1d_unit_interval`），bucket table BLAKE3 不变。issue #4（[测试] 侧删测试本地副本走产品 helper）依赖本 batch 1，留 §C-rev2 batch 4+ 闭合。
+
+##### batch 1 出口数据（commit 落地实测）
+
+- `cargo fmt / clippy / build / doc --all-targets` 四道 gate 全绿。
+- `cargo test --lib`：8 passed / 0 failed / 0 ignored（cluster::tests 6 → 8，+ 2 §C-rev2 §5a regression guards）。
+- 其它 24 test crates 不动（`emd_1d_unit_interval` 无生产路径调用）。
+- `tests/api_signatures.rs` trip-wire byte-equal 不变（仅触 cluster.rs 内部实现 + 私有 helper，不动公开 API surface）。
+
+##### batch 1 角色边界审计
+
+- **修改产品代码**：`src/abstraction/cluster.rs`（`emd_1d_unit_interval` 改写 + `emd_step_cdf_integral` new private helper + 2 条 cluster::tests 单元测试）。
+- **未修改**：所有 `tests/*.rs` 集成测试 / 其它 `src/abstraction/*.rs` / `Cargo.toml` / stage-1 全部代码。
+- **不重训 artifact**：bucket table 无 production 路径调用 emd，BLAKE3 不变。
+
+batch 1 [实现] role 0 越界（cluster.rs 内部 helper 的单元测试与产品代码同 commit 落地，与 stage-1 §B-rev1 §3 [实现] 越界 carve-out 同型；本 batch 单元测试与 helper 强耦合，沿用既有 `mod tests` 内嵌路径不视为越界扩散）。
+
+§C-rev2 batch 1 carry forward 处理政策（与 §A-rev0..§C-rev1 batch 2 一致，不重新论证）：
+- 阶段 1 §B-rev1 §3 / §C-rev1 / §D-rev0 / §F-rev1 既往政策保持继承不变。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 CLAUDE.md "Stage 2 当前测试基线" 段落 cluster::tests 数字翻面（187 → 189 active）。
+
+下一步：§C-rev2 batch 2（#6 canonical_observation_id 顺序无关化）。

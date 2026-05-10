@@ -89,23 +89,74 @@ pub mod rng_substream {
 // 1D EMD（D-234）
 // ============================================================================
 
-/// 1D EMD 在 [0, 1] 区间，sorted CDF 差分积分。等长 sample 时退化为逐项 |a_i - b_i|
-/// 平均；不等长时按各自 size 等距插值（取较短长度）。所有 EMD 路径走本函数确保
-/// byte-equal。
+/// 1D EMD（1-Wasserstein 距离）在 [0, 1] 区间。
+///
+/// 数学定义：`W_1(P, Q) = ∫_0^1 |F_P(x) - F_Q(x)| dx`，其中 `F_P` / `F_Q` 是
+/// 经验 CDF（每个 sample 贡献 1/n 阶跃，n 为各自样本数）。
+///
+/// 实现分两条路径：
+///
+/// - **等长**：保持原实现 `Σ|a[i] - b[i]| / n`（与步函数 CDF 积分数学等价于此特例）。
+///   等长是 D-234 训练时 cluster 内 EHS 分布比较的主路径；保留此路径让历史
+///   byte-equal trace 不漂移。
+/// - **不等长**：合并 `a ∪ b` 排序后扫一遍 step CDF，逐段累加 `|F_a - F_b| · Δx`。
+///   不等长是 §C-rev2 §5a 修正的核心路径——cluster size 不均时 bucket-quality 验收
+///   的相邻 EMD 阈值需要正确反映 long-tail 分布质量，旧 `acc / min(len_a, len_b)`
+///   会丢弃尾部样本，系统性低估距离。
+///
+/// 假设：`samples_a` 与 `samples_b` 元素位于 `[0, 1]`（EHS / equity 输出范围）。
+/// 超出范围不会 panic，但 `prev_x = 0.0` 起步、`tail to 1.0` 收尾的积分语义只在
+/// 单位区间上定义良好。
 pub fn emd_1d_unit_interval(samples_a: &[f64], samples_b: &[f64]) -> f64 {
     let mut a: Vec<f64> = samples_a.to_vec();
     let mut b: Vec<f64> = samples_b.to_vec();
     a.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
     b.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-    let n = a.len().min(b.len());
-    if n == 0 {
+    if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-    let mut acc = 0.0_f64;
-    for i in 0..n {
-        acc += (a[i] - b[i]).abs();
+    if a.len() == b.len() {
+        let n = a.len();
+        let mut acc = 0.0_f64;
+        for i in 0..n {
+            acc += (a[i] - b[i]).abs();
+        }
+        return acc / n as f64;
     }
-    acc / n as f64
+    emd_step_cdf_integral(&a, &b)
+}
+
+/// 步函数 CDF 积分（不等长样本路径）。`a` / `b` 已升序排序、非空。
+fn emd_step_cdf_integral(a: &[f64], b: &[f64]) -> f64 {
+    let inc_a = 1.0_f64 / a.len() as f64;
+    let inc_b = 1.0_f64 / b.len() as f64;
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut prev_x = 0.0_f64;
+    let mut ca = 0.0_f64;
+    let mut cb = 0.0_f64;
+    let mut acc = 0.0_f64;
+    while i < a.len() || j < b.len() {
+        let x = match (i < a.len(), j < b.len()) {
+            (true, true) => a[i].min(b[j]),
+            (true, false) => a[i],
+            (false, true) => b[j],
+            (false, false) => unreachable!(),
+        };
+        acc += (ca - cb).abs() * (x - prev_x);
+        while i < a.len() && a[i] == x {
+            ca += inc_a;
+            i += 1;
+        }
+        while j < b.len() && b[j] == x {
+            cb += inc_b;
+            j += 1;
+        }
+        prev_x = x;
+    }
+    // tail to 1.0：理论上 ca == cb == 1.0，浮点 round-off 残留量级 < 1e-15。
+    acc += (ca - cb).abs() * (1.0_f64 - prev_x).max(0.0);
+    acc
 }
 
 // ============================================================================
@@ -571,6 +622,33 @@ mod tests {
         let a = [0.0, 0.0, 0.0];
         let b = [1.0, 1.0, 1.0];
         assert!((emd_1d_unit_interval(&a, &b) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn emd_unequal_length_uses_full_distribution() {
+        // §C-rev2 §5a 防回归：旧 `acc / min(len_a, len_b)` 截断会丢弃 a[1]=0.9，
+        // 算出 |0.8-0.5| = 0.3；步函数 CDF 积分用全部样本，正确值 0.35：
+        //   F_a: 0 below 0.8, 0.5 in [0.8, 0.9), 1.0 above 0.9
+        //   F_b: 0 below 0.5, 1.0 above 0.5
+        //   ∫|F_a - F_b| = 1.0·(0.8-0.5) + 0.5·(0.9-0.8) = 0.3 + 0.05 = 0.35
+        let a = [0.8, 0.9];
+        let b = [0.5];
+        let emd = emd_1d_unit_interval(&a, &b);
+        assert!(
+            (emd - 0.35).abs() < 1e-12,
+            "step-CDF integral expected 0.35, got {emd}"
+        );
+    }
+
+    #[test]
+    fn emd_unequal_length_same_distribution_near_zero() {
+        // 同分布不同样本数 → EMD 应远小于"明显差异"（如上面 0.35）。两组
+        // deterministic 均匀样本：100 等距 vs 1000 等距。理论上对应的步函数 CDF
+        // 都接近真实 uniform[0,1]，EMD 应 < 0.02。
+        let a: Vec<f64> = (0..100).map(|i| (i as f64 + 0.5) / 100.0).collect();
+        let b: Vec<f64> = (0..1000).map(|i| (i as f64 + 0.5) / 1000.0).collect();
+        let emd = emd_1d_unit_interval(&a, &b);
+        assert!(emd < 0.02, "1000 vs 100 同分布 EMD 应 < 0.02，got {emd}");
     }
 
     #[test]
