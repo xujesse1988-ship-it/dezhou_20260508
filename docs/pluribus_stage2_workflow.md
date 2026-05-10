@@ -1169,3 +1169,58 @@ issue #2 §出口 (4) "全绿" 出口在 hash design 限制下不可达；本 ba
 - §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 CLAUDE.md "Stage 2 当前测试基线" 段落 batch 5 完成 header + bucket_quality `7 active + 13 ignored` 数字保持但 ignored 语义翻面（B2 stub `eprintln` 占位 → 真实断言体 + §C-rev1 §2 reason 字符串）。
 
 下一步：§C-rev2 batch 6（[测试] 侧 #3，cross-arch bucket table baseline 文件 capture + 缺失硬 panic）→ D1 [测试]。
+
+#### C-rev2 batch 6 carve-out（2026-05-10）— issue #3 baseline capture 推迟 D1 [测试]（OCHS 成本退化）
+
+issue #3 §出口 (1) capture `tests/data/bucket-table-arch-hashes-linux-x86_64.txt` baseline 文件 + (2) `cross_arch_bucket_id_baseline` 中 baseline 缺失分支改 `panic!` 在本 batch **未落地**，整体推迟到 D1 [测试] 步骤（或 CI nightly 路径）。
+
+##### §C-rev2 batch 6 §2 carve-out：capture 成本 ~5 min → ~2 h（§C-rev2 §3 OCHS 真实化连锁）
+
+`capture_bucket_table_baseline()`（`tests/clustering_determinism.rs:504`）走 `BUCKET_TABLE_BASELINE_SEEDS[32] × BUCKET_BASELINE_CONFIG (10/10/10) × BUCKET_BASELINE_CLUSTER_ITER 50` 训练 32 个 bucket table。C2 闭合时 `~5 min release`，§C-rev2 §3 OCHS 真实 169-class k-means 落地后单 ochs() 调用从 stub 8 evals/call 升到 168 evals/call（~21x slower），单 seed 训练成本 ~5 s → ~3.3 min × 32 = **~107 min release**（实测 33 min 跑了约 18 % 进度后中止，与估算 ~107 min 一致）。
+
+直接后果：
+- `bucket_table_arch_hash_capture_only` 一次跑无法在 dev session（< 1 h）内完成。
+- 若 hardening `cross_arch_bucket_id_baseline` 缺失分支为 `panic!` 但 baseline 文件未 commit，`cargo test --release -- --ignored` 套件从 `13 ignored 全绿` 退化到 `12 ignored 全绿 + 1 panic`（违反 §C-rev2 batch 5 baseline）。
+
+##### §C-rev2 batch 6 §3 carve-out：deferral 政策 + D1 衔接
+
+issue #3 整条移交 D1 [测试] 步骤（`docs/pluribus_stage2_workflow.md` §D1 §输出 line 中 "跨架构 32-seed bucket table baseline regression guard" 字面任务）。D1 落地路径：
+1. capture 在 self-hosted runner 或长跑 CI 路径（`.github/workflows/nightly.yml` 已落地 GitHub-hosted matrix；本任务接入 nightly 即可一次落地 baseline 文件）。
+2. 同 PR 把 capture 输出 commit 到 `tests/data/bucket-table-arch-hashes-linux-x86_64.txt` + 把 `cross_arch_bucket_id_baseline` 缺失分支改 `panic!`。
+3. 验证 `cargo test --release -- --ignored` 32-seed BLAKE3 byte-equal 实跑通过（在 D1 host 上不退化）。
+
+替代加速路径（D1 [测试] / [实现] 评估时考虑）：
+- `with_ochs_reps_per_cluster(n: u8)` builder 让 `train_one_street` 用 4 reps/cluster（vs 默认 168）；capture 训练成本回落到 ~5 min；**跨 [实现] 边界**，需要 §C-rev2 增补 issue 或 D1 commit 同 PR 落地。
+- 减小 `BUCKET_TABLE_BASELINE_SEEDS` 从 32 → 8；capture ~28 min；与 stage-1 `cross_arch_hash::ARCH_BASELINE_SEEDS[32]` 同形态约定偏离，需要 D1 决策。
+- 跑 capture 的 host 用 ≥ 8 核并行训练 32 seed（当前 `capture_bucket_table_baseline` 串行）；与 D-051 / D-052 跨架构确定性约定兼容（每 seed 内仍单线程）。
+
+##### §C-rev2 batch 6 出口数据（commit 落地实测）
+
+- `tests/clustering_determinism.rs` 未修改（agent 起草的 panic 改动 revert 回到 §C-rev1 batch 2 末态）。
+- `tests/data/bucket-table-arch-hashes-linux-x86_64.txt` **未生成**（推迟 D1）。
+- `cargo test --release --no-fail-fast`：**193 passed / 0 failed / 36 ignored across 25 test crates** 不变（与 §C-rev2 batch 5 baseline byte-equal）。
+- `cargo test --release --no-fail-fast -- --ignored`：13 release ignored 套件保持全绿（baseline 缺失走 `eprintln + return` 不破坏；硬 panic 推迟 D1）。
+- `cargo fmt / clippy --all-targets / build / doc` 四道 gate 全绿。
+- `tests/api_signatures.rs` trip-wire byte-equal 不变（仅触 docs/）。
+
+##### §C-rev2 batch 6 角色边界审计
+
+- **修改文档**：`docs/pluribus_stage2_workflow.md` §修订历史 §C-rev2 batch 6 carve-out（本子节）。
+- **未修改产品代码**、**未修改测试代码**、**未修改 CLAUDE.md**：本 batch 0 实质改动，纯文档 carve-out（与 stage-1 §F-rev0 / §C-rev1 batch 2 §3 同形态）。
+
+§C-rev2 batch 6 carry forward 处理政策（与 §A-rev0..§C-rev2 batch 5 一致，不重新论证）：
+- 阶段 1 §B-rev1 §3 / §C-rev1 / §D-rev0 / §F-rev0 / §F-rev1 既往政策保持继承不变。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 0 实质改动 → CLAUDE.md 不动（§C-rev2 batch 5 末态保持）。
+- carve-out 政策：成本估算超出 batch 预算 → 移交下一步骤 + 当 commit 显式追认 + issue 保持 OPEN（与 stage-1 §F-rev0 错误路径结构性缺位 carve-out 同形态）。
+
+##### §C-rev2 [测试] 侧三连闭合状态
+
+| Issue | 状态 | Batch |
+|-------|------|-------|
+| #4 删 EMD helper 副本 | CLOSED（commit `71275e1`）| batch 4 §5b |
+| #2 bucket_quality cached_trained_table + 还原断言 | CLOSED（commit `1986baf`）| batch 5 §1（12 条 ignore 全部保留 §C-rev1 §2 reason） |
+| #3 cross-arch bucket table baseline | DEFERRED → D1 | batch 6 carve-out（本节） |
+
+§C-rev2 整体闭合状态：[实现] 侧 (#5/#6/#7) + [测试] 侧 (#4/#2) 五条闭合；剩余 #3 移交 D1。下一步 §D1 [测试] 启动条件：本 carve-out 落地（done）→ 无其他 §C-rev2 阻塞项。
+
+下一步：D1 [测试]（按 `docs/pluribus_stage2_workflow.md` §D1 §输出 落地 fuzz 完整版 + 100k smoke + 跨架构 32-seed bucket table baseline regression guard，issue #3 在 D1 同 PR 闭合）。
