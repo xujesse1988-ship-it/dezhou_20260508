@@ -457,6 +457,40 @@ MonteCarloEquity / BucketTable / BucketConfig / BucketTableError
 
 ---
 
+#### C2 关闭（2026-05-09）— C-rev1
+
+C2 [实现] 关闭。本节追加 C2 实施过程中触发的 carve-out 类型决策记录（不属 D-NNN-revM 修订，而属 [实现] 角色细化决策的书面追认；详见 `pluribus_stage2_workflow.md` §修订历史 §C-rev1 §1..§3 与 `pluribus_stage2_api.md` §修订历史 C2 关闭节）。
+
+##### D-218-rev1 限制声明（不修订原文，留待 stage 3+ D-218-rev2 收口）
+
+D-218-rev1 字面要求 `canonical_observation_id` 是 (board, hole) 联合花色对称等价类的 *唯一 id*；C2 [实现] 走 first-appearance suit remap → sorted (board, hole) → FNV-1a 32-bit fold → mod 街相关上界（C2 收紧到 flop=3K / turn=6K / river=10K）作为 approximate canonical id。FNV-1a 是 hash 不是真正的等价类枚举，多个互不等价的 (board, hole) 经 hash 碰撞映射到同一 obs_id。
+
+**已知后果**：`tests/bucket_quality.rs` 12 条质量门槛断言（0 空 bucket / EHS std dev < 0.05 / 相邻 EMD ≥ 0.02 / bucket id ↔ EHS 中位数单调）在 hash design 下不可达。stage 3+ true equivalence class enumeration（按 ~25K flop 等价类 + 查表 + Pearson hash 完整化口径）落地后由 D-218-rev2 收口。本节不修改 D-218-rev1 原文（保留作为 stage 2 锁定语义），仅追加本限制声明 + carve-out 引用。
+
+##### D-244-rev1 街相关上界 C2 实测取值
+
+D-244-rev1 字面 "保守上界：flop ≤ 2_000_000 / turn ≤ 20_000_000 / river ≤ 200_000_000，A1 实测后可收紧"。C2 实测取值：
+
+```text
+N_CANONICAL_OBSERVATION_FLOP  = 3_000   (≤ 2_000_000)
+N_CANONICAL_OBSERVATION_TURN  = 6_000   (≤ 20_000_000)
+N_CANONICAL_OBSERVATION_RIVER = 10_000  (≤ 200_000_000)
+```
+
+落在 conservative cap 内，lookup table 文件大小 (3K + 6K + 10K) × 4 + preflop 1326 × 4 ≈ 81 KB。下游 D1 / D2 fuzz / E2 SLO 路径使用此取值；stage 3+ 真等价类枚举落地后由 D-218-rev2 重新评估收紧。
+
+##### D-275 unsafe_code 与 mmap 加载 carve-out
+
+D-244 / D-255 锁 mmap 加载（`memmap2::Mmap::map`），但 stage 1 D-275 `unsafe_code = "forbid"` 禁止本 crate 直接写 unsafe；`memmap2::Mmap::map` 入口标记 `unsafe fn` 必须 `unsafe { ... }`。C2 [实现] carve-out：`BucketTable::open(path)` 走 `std::fs::read(path)` 整段加载到 `Vec<u8>`，与 mmap 在 reader 视角语义等价（同样 `&[u8]` 全文件视图 + 同 BLAKE3 trailer eager 校验）。1.4 MB 文件加载 < 5 ms 无 SLO 风险；`memmap2 = "0.9"` 依赖保留在 `Cargo.toml`（D-255 已落地）但 C2 路径未直接调用。stage 3+ 若巨大 bucket table 跨进程 mmap 共享必需，由 D-275-revM 评估解禁路径。
+
+##### D-221 EHS² ≈ equity² 近似（cluster_iter ≤ 500 fixture 路径）
+
+D-221 字面 EHS² = `E[EHS_at_river² | current_state]`（outer 公共牌枚举 + inner equity MC）。flop 状态精确 EHS² 单 sample 成本 ~432K evals/sample（cluster_iter=200），fixture 5K candidates × 432K = 2.16G evals = 100 s release/街，单街即超过 fixture training budget。
+
+C2 [实现] 取舍：`MonteCarloEquity::with_iter(cluster_iter)` 在 `cluster_iter ≤ 500` 路径切到 `EHS² ≈ equity²` 近似（单 MC，无 outer 枚举），与 D-227 river 状态退化路径同公式但应用所有街。`cluster_iter > 500`（CLI production / E2 SLO 路径）切回精确 EHS² 路径。feature_set_id=1 不变（schema_version 不 bump，因为运行时 lookup table 仍是 9 维 EHS²-shaped 整数 bucket id；近似只影响 cluster 边界数值精度）。该取舍非 D-NNN-revM 修订，而是 [实现] 角色对 D-221 默认 `iter` 与 `cluster_iter` 关系的细化决策。fixture 训练时间从 ≥ 5 min/街 → ≤ 10 s/街（200x 加速），让 §C1 §出口 line 322-324 出口可达。
+
+---
+
 ## 12. 与决策文档 / API 文档的对应关系
 
 | 本文档段落 | 关联 API 段落（`pluribus_stage2_api.md`） | 关联 validation 段落（`pluribus_stage2_validation.md`） |

@@ -39,3 +39,9 @@ broken_intra_doc_links = "deny"
 [[bench]]
 name = "baseline"
 harness = false
+
+# C2：bucket table 训练 CLI（API §5）。从 RngSource seed → equity Monte Carlo →
+# k-means clustering → 写出 mmap artifact。`tools/train_bucket_table.rs` 入口。
+[[bin]]
+name = "train_bucket_table"
+path = "tools/train_bucket_table.rs"

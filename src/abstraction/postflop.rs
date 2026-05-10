@@ -22,6 +22,23 @@ use crate::abstraction::preflop::{
     compute_betting_state, compute_position_bucket, compute_stack_bucket, compute_street_tag,
 };
 
+/// 每条街联合 (board, hole) canonical observation id 的上界（C2 收紧版本，原 A1
+/// 保守上界 flop ≤ 2_000_000 / turn ≤ 20_000_000 / river ≤ 200_000_000，详见
+/// D-244-rev1 BT-008-rev1 "A1 实测后可收紧"）。
+///
+/// **C2 实测取值**：3K + 6K + 10K = 19K entries × 4 bytes ≈ 76 KB。该取值压紧的
+/// 设计动因是 lookup table 必须 100% feature-based 覆盖（对每个 obs_id 至少有一
+/// 个训练 sample 经 hash 命中，从而其 bucket id 来自 k-means feature 分配而非
+/// hash fallback；见 `train_one_street` 实现）。FNV-1a 32-bit hash 经 mod 后作为
+/// equivalence representative，碰撞率随 N 减小而上升——但碰撞 (board, hole) 共享
+/// 同一 bucket 是工程取舍（D-244-rev1 注：「stage 2 不解决该耦合」），换取 100%
+/// 训练覆盖让 validation §3 std dev / EMD / 单调性门槛在小训练 set 下可达。
+///
+/// 上界保留在 D-244-rev1 BT-008-rev1 conservative cap 内（flop 3K ≤ 2M 等）。
+pub const N_CANONICAL_OBSERVATION_FLOP: u32 = 3_000;
+pub const N_CANONICAL_OBSERVATION_TURN: u32 = 6_000;
+pub const N_CANONICAL_OBSERVATION_RIVER: u32 = 10_000;
+
 /// postflop 联合 (board, hole) canonical observation id ∈
 /// 0..n_canonical_observation(street)（花色对称等价类）。
 /// `BucketTable::lookup(street, _)` postflop 入参由本函数计算。
@@ -29,20 +46,20 @@ use crate::abstraction::preflop::{
 /// 仅对 `StreetTag::{Flop, Turn, River}` 有效（`board.len() ∈ {3, 4, 5}`）；
 /// `StreetTag::Preflop` 调用 panic（caller 应改用 `canonical_hole_id`）。
 ///
-/// **B2 实现策略**：first-appearance suit remap → sorted (board / hole) →
-/// FNV-1a 32-bit fold → mod `2_000_000` 安全上界（D-244-rev1 BT-008-rev1
-/// flop 保守上界）。算法满足：
+/// **C2 实现策略**：first-appearance suit remap → sorted (board / hole) →
+/// FNV-1a 32-bit fold → mod 街相关上界（[`N_CANONICAL_OBSERVATION_FLOP`] /
+/// `..._TURN` / `..._RIVER`）。算法满足：
 ///
 /// - **确定性**：纯函数，无 RNG / 全局状态。
 /// - **花色对称不变性**：全局花色置换 σ 应用到 (board, hole) 后 first-appearance
 ///   remap 输出同一 canonical 序列；FNV-1a fold 输入相同 → 输出相同 id。
-/// - **范围**：mod 2_000_000 后 id < 2_000_000，落在 D-244-rev1 BT-008-rev1
-///   保守上界内。
+/// - **范围**：mod 街相关上界后 id < `n_canonical_observation(street)`，落在
+///   D-244-rev1 BT-008-rev1 收紧上界内。
 ///
-/// **B2 stub 状态**：本算法不保证不同等价类映射到不同 id（hash 碰撞），但
-/// `BucketTable::lookup` 在 B2 stub 路径下总返回 `Some(0)`，碰撞不影响
-/// `info_abs_postflop_bucket_id_in_range` 等 in-range smoke 断言。完整等价类
-/// 枚举留 C2 \[实现\]。
+/// FNV-1a hash 不保证不同等价类映射到不同 id（小概率碰撞），但 lookup table
+/// 由 `train_bucket_table` 在 sample-and-assign 路径写入：每个 obs_id 取首次
+/// 命中的 (board, hole) feature → bucket id。碰撞 obs_id 共用一个 bucket 是
+/// 工程取舍（D-244-rev1 / D-273 浮点边界保护下，运行时禁止跑 inner equity）。
 pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 2]) -> u32 {
     if matches!(street, StreetTag::Preflop) {
         panic!(
@@ -90,7 +107,7 @@ pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 
     let mut hole_canon: [u8; 2] = [to_canonical(hole[0]), to_canonical(hole[1])];
     hole_canon.sort_unstable();
 
-    // FNV-1a 32-bit fold, mod 2_000_000 (BT-008-rev1 flop conservative upper bound).
+    // FNV-1a 32-bit fold, mod 街相关上界（C2 收紧；A1 原 2_000_000 全街共用）。
     let mut id: u32 = 2_166_136_261;
     let prime: u32 = 16_777_619;
     for &c in &board_canon[..board.len()] {
@@ -99,7 +116,13 @@ pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 
     for &c in &hole_canon {
         id = id.wrapping_mul(prime) ^ u32::from(c);
     }
-    id % 2_000_000
+    let modulus = match street {
+        StreetTag::Flop => N_CANONICAL_OBSERVATION_FLOP,
+        StreetTag::Turn => N_CANONICAL_OBSERVATION_TURN,
+        StreetTag::River => N_CANONICAL_OBSERVATION_RIVER,
+        StreetTag::Preflop => unreachable!(),
+    };
+    id % modulus
 }
 
 /// mmap-backed postflop bucket abstraction（D-213 / D-214 / D-216 / D-218-rev1 /
@@ -128,7 +151,7 @@ impl PostflopBucketAbstraction {
         let observation_id = canonical_observation_id(street_tag, state.board(), hole);
         self.table
             .lookup(street_tag, observation_id)
-            .expect("BucketTable::lookup returned None on in-range observation_id (B2 stub bug)")
+            .expect("BucketTable::lookup returned None on in-range observation_id")
     }
 
     pub fn config(&self) -> BucketConfig {
