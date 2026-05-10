@@ -542,16 +542,22 @@ fn bucket_baseline_path() -> Option<std::path::PathBuf> {
     )
 }
 
-/// C2 §C-rev0 carve-out 落地：32-seed bucket table BLAKE3 baseline regression
-/// guard（与 stage-1 cross_arch_hash 同形态）。
+/// C2 §C-rev0 carve-out 落地 + §D-rev0 batch 1 baseline 缺失分支硬 panic：
+/// 32-seed bucket table BLAKE3 baseline regression guard（与 stage-1
+/// cross_arch_hash 同形态）。
 ///
-/// 默认 `#[ignore]` —— 训练成本 ~5 min release（32 seed × 3 街 × 10/10/10 ×
-/// 50 iter naive eval），不适合 every-`cargo test` 触发。CI 在 release profile +
-/// `--ignored` opt-in 跑一次（与 stage-1 §C2 / §D2 同形态）。capture 入口
-/// `bucket_table_arch_hash_capture_only` 同样 `#[ignore]`，由
-/// `scripts/capture-bucket-table-baseline.sh`（占位，D1 落地）调用。
+/// 默认 `#[ignore]` —— 训练成本 ~74 min release（§C-rev2 batch 6 carve-out
+/// 实测 ~107 min 估算下限；32 seed × 3 街 × 10/10/10 × 50 iter × OCHS real
+/// 169-class，§C-rev2 §3 真实化 OCHS 后 ~21x slower per ochs），不适合
+/// every-`cargo test` 触发。CI 在 release profile + `--ignored` opt-in 跑一次
+/// （与 stage-1 §C2 / §D2 同形态）。capture 入口 `bucket_table_arch_hash_capture_only`
+/// 同样 `#[ignore]`，由 `scripts/capture-bucket-table-baseline.sh`（占位，D1
+/// 落地）调用。
+///
+/// **§D-rev0 batch 1**：baseline 文件缺失分支从 `eprintln + return` 升级到
+/// `panic!`（issue #3 §出口 step 2 字面）。
 #[test]
-#[ignore = "C2/D1: 32-seed baseline 训练 ~5 min release；release + --ignored opt-in（与 stage-1 cross_arch_hash 同形态）"]
+#[ignore = "D1: 32-seed baseline 训练 ~74 min release；release + --ignored opt-in（与 stage-1 cross_arch_hash 同形态）"]
 fn cross_arch_bucket_id_baseline() {
     let actual = capture_bucket_table_baseline();
     let path = match bucket_baseline_path() {
@@ -567,13 +573,18 @@ fn cross_arch_bucket_id_baseline() {
     let expected = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!(
-                "[bucket-table-arch] baseline missing at {}: {}\nCurrent capture:\n{}",
+            // §D-rev0 batch 1 / issue #3 §出口 step 2：baseline 缺失从软 skip
+            // 升级为硬 panic。capture 输出在 stdout，便于复现指引。stage-1
+            // `cross_arch_hash::cross_arch_hash_matches_baseline` 同形态 panic 政策。
+            panic!(
+                "[bucket-table-arch] baseline missing at {}: {} — run \
+                 `cargo test --release --test clustering_determinism \
+                 bucket_table_arch_hash_capture_only -- --ignored --nocapture` to regenerate.\n\
+                 Current capture:\n{}",
                 path.display(),
                 e,
                 actual
             );
-            return;
         }
     };
     if actual.trim() != expected.trim() {

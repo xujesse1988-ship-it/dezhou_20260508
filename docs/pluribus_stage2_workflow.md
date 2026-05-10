@@ -1224,3 +1224,88 @@ issue #3 整条移交 D1 [测试] 步骤（`docs/pluribus_stage2_workflow.md` §
 §C-rev2 整体闭合状态：[实现] 侧 (#5/#6/#7) + [测试] 侧 (#4/#2) 五条闭合；剩余 #3 移交 D1。下一步 §D1 [测试] 启动条件：本 carve-out 落地（done）→ 无其他 §C-rev2 阻塞项。
 
 下一步：D1 [测试]（按 `docs/pluribus_stage2_workflow.md` §D1 §输出 落地 fuzz 完整版 + 100k smoke + 跨架构 32-seed bucket table baseline regression guard，issue #3 在 D1 同 PR 闭合）。
+
+#### D1 batch 1（2026-05-10）— D-rev0：fuzz 完整版 + 跨架构 baseline 同 PR 闭合 issue #3
+
+D1 [测试] 第一笔 commit 落地 §D1 §输出 全部 4 条交付物（fuzz target + abstraction_fuzz scale tests + cross_host pair guard + CI / nightly wiring），同 PR 顺带闭合 §C-rev2 batch 6 carve-out 推迟的 issue #3（cross-arch bucket table baseline 文件 capture + 缺失硬 panic）。本 batch carry forward 阶段 1 §修订历史 + 阶段 2 §A-rev0..§C-rev2 batch 6 全部处理政策（不重新论证）。
+
+##### §D-rev0 §1：fuzz 完整版 + 100k smoke harness 落地
+
+按 §D1 §输出 line 373-378 字面四条，落地 1 fuzz target + 2 测试文件 + Cargo.toml [[bin]]：
+
+- **`fuzz/fuzz_targets/abstraction_smoke.rs`**（new）+ **`fuzz/Cargo.toml`** `[[bin]] name = "abstraction_smoke"`：cargo-fuzz target，前 1 字节街选择 + 后 7 字节 Fisher-Yates 部分洗牌抽 (board, hole)；进程内 OnceLock 缓存 BucketTable train_in_memory(10/10/10, seed=0xC1C0_DEAB_5712_0001, 50 iter) 避免每输入重训练。验证 4 条不变量：(1) `canonical_observation_id` repeat byte-equal；(2) board/hole 输入顺序置换 invariance（§C-rev2 §4）；(3) `lookup` 返回 `Some(bucket_id)` 且 `bucket_id < bucket_count(street)`；(4) no-panic。
+- **`tests/abstraction_fuzz.rs`**（new）：3 组 6 个 `#[test]`（§D1 §输出 line 374-377 字面）：
+    - `infoset_mapping_repeat_smoke`（100k iter 默认 active）+ `_full`（1M `#[ignore]` opt-in）：跨随机 (state_seed, hole) 输入维度的 IA-004 deterministic 不变量验证（与 `tests/info_id_encoding.rs::info_abs_determinism_repeat_smoke` 单 (state, hole) 1k 重复维度互补）。
+    - `action_abstraction_config_random_raise_sizes_smoke`（10k iter 默认）+ `_full`（1M `#[ignore]`）：随机 1–14 raise size config（D-202 字面），ConfigError::DuplicateRatio / RaiseRatioInvalid / RaiseCountOutOfRange 三类合法 reject + 成功 path AA-005 上界 + abstract_actions repeat byte-equal。
+    - `off_tree_real_bet_stability_smoke` / `_full`：随机 real_to ChipAmount → `map_off_tree(state, real_to)` repeat byte-equal —— **D1 §出口预期暴露 issue 之一**：`src/abstraction/action.rs:379` 当前 `unimplemented!("D-201 PHM stub; stage 6c 完整验证")`，调用即 panic（详见 §D-rev0 §3）。
+- **`tests/clustering_cross_host.rs`**（new，1 个 `#[test]`）：linux ↔ darwin baseline byte-equal cross-pair guard。模板源自 stage-1 `tests/cross_arch_hash.rs::cross_arch_baselines_byte_equal_when_both_present`：两文件都存在 → 严格 trim byte-equal 否则 panic 前 5 行 diff；任一缺失 → eprintln + return（skip 政策；validation §6 / D-052 字面仍是「期望目标」，本测试不擅自升级为「必过门槛」）。
+
+##### §D-rev0 §2：CI / nightly 工作流串入 abstraction_smoke target
+
+按 §D1 §输出 line 379 字面：
+
+- `.github/workflows/ci.yml::fuzz-quick`：在 `random_play` / `history_decode` 之后追加第三步 `cargo +nightly fuzz run abstraction_smoke -- -max_total_time=300`（5 min budget；OnceLock fixture 训练 ~5 s release，剩 ~4 min 55 s 跑 fuzz 主循环）。
+- `.github/workflows/nightly.yml::fuzz`：matrix `target` 从 `[random_play, history_decode]` 扩到 `[random_play, history_decode, abstraction_smoke]`（每 target 5h45m，累计 17h15m vs 旧 11h40m；预算考虑 / 24h 字面差异说明同步更新到 yml 顶部注释）。
+- **bucket lookup throughput baseline**（§D1 §输出 line 379 末段）：本 batch **不**新增 `abstraction/bucket_lookup` bench group——属 §E1 §输出 line 424 字面 [测试] 范畴（`abstraction/bucket_lookup`：`(street, board, hole) → bucket_id`（mmap 命中））。stage-2 §B1 §输出 已落 2 个 abstraction bench group（info_mapping / equity_monte_carlo），E1 [测试] 落第 3 个 group + `tests/perf_slo.rs::stage2_*` SLO 阈值断言。nightly bench-full job (`cargo bench --bench baseline -- --noplot`) 自动 pick up 任何新增 bench group，本 batch yml 无需改动 bench-full 段。
+
+##### §D-rev0 §3：D1 暴露 issue #8 — `map_off_tree` D-201 PHM stub 占位实现待 D2
+
+§D1 §出口 line 384 字面预期 "暴露 1–3 个 corner case bug — 列入 issue 移交 D2"。本 batch 实测暴露 1 个：`DefaultActionAbstraction::map_off_tree`（`src/abstraction/action.rs:379`）当前 body 是 `unimplemented!("D-201 PHM stub; stage 6c 完整验证")`。`tests/abstraction_fuzz.rs::off_tree_real_bet_stability_smoke` 调用即 panic：
+
+```
+thread 'off_tree_real_bet_stability_smoke' panicked at src/abstraction/action.rs:379:9:
+not implemented: D-201 PHM stub; stage 6c 完整验证
+```
+
+处理（与 stage-1 §B-rev1 §3 / stage-2 §C-rev1 §3 同型）：
+
+1. 标 `#[ignore = "D2: D-201 PHM stub 占位实现待 D2 落地..."]` 让 `cargo test`（默认 / `--ignored` opt-in）保持 0 failed
+2. 列 GitHub issue [#8](https://github.com/xujesse1988-ship-it/dezhou_20260508/issues/8) 移交 D2 [实现]（含 5 项 §出口 + 落地参考路径：选择 `config().raise_pot_ratios` 中量化 milli 最接近 `real_to / pot()` 的那个 ratio + 边界 0/Stack 落 Call/AllIn）
+3. D2 [实现] 闭合时取消 ignore + 切到 release `--ignored` opt-in（与 stage-1 1M determinism opt-in 同形态）
+
+§D1 §出口 字面预期范畴："off-tree action 边界" 是 4 个示例 bug 类别之一；issue #8 完全契合此预期。其余 3 个示例（k-means 浮点 NaN / EMD 退化分布 / mmap 文件 layout overflow）在本 batch `cargo test --release -- --ignored` 实跑（详见 §D-rev0 §5 出口数据）后未暴露——k-means 浮点 NaN 已被 §C-rev1 §1 carve-out（cluster_iter ≤ 500 强制走 `EHS² ≈ equity²` 近似路径）规避；EMD 退化在 1D unit-interval CDF 差分实现（§C-rev2 batch 1 §5a sorted-CDF 不等长积分修正）下不会触发；mmap 文件 layout overflow 由 BLAKE3 trailer eager 校验（BT-004）+ 80-byte header 偏移表完整性（BT-008-rev1）在 D-244-rev1 / `BucketTable::open` C2 闭合时锁死。
+
+##### §D-rev0 §4：issue #3 cross-arch bucket table baseline capture + 缺失硬 panic
+
+§C-rev2 batch 6 carve-out 推迟到 D1 的 issue #3 同 PR 闭合（与 batch 6 carve-out §3 line 1187 字面 "issue #3 整条移交 D1 [测试] 步骤" 一致）：
+
+1. **capture 落地**：本 host（linux x86_64）跑 `cargo test --release --test clustering_determinism bucket_table_arch_hash_capture_only -- --ignored --nocapture` → 重定向到 `tests/data/bucket-table-arch-hashes-linux-x86_64.txt`（32 lines / 2710 bytes / 与 stage-1 `arch-hashes-linux-x86_64.txt` 同形态）。capture 训练成本：32 seed × 3 街 (10/10/10) × 50 iter × OCHS real 169-class（§C-rev2 §3 OCHS lazy cache 命中后 ~3.3 min/seed） — **实测耗时 4438.27 s ≈ 73.97 min release**（前 ~40 min 与 cargo test --release --no-fail-fast 抢 1-CPU host 时降到 ~50% effective，后 ~30 min solo 100% CPU；总 effective time ≈ 70 min，比 §C-rev2 batch 6 §2 carve-out 估算 ~107 min 更优，可能是 OCHS lazy cache hit rate 在 32-seed 串行训练下高于 single-seed 估算）。`BUCKET_TABLE_BASELINE_SEEDS[32]` / `BUCKET_BASELINE_CONFIG` / `BUCKET_BASELINE_CLUSTER_ITER` 三个 const 与 batch 6 carve-out 一致（**未走** §C-rev2 batch 6 §3 三条替代加速路径中任一条——builder `with_ochs_reps_per_cluster` 跨 [实现] 边界、32→8 seed 与 stage-1 32 约定偏离、并行 capture 触动测试代码量过大）。
+2. **缺失分支硬 panic**：`tests/clustering_determinism.rs::cross_arch_bucket_id_baseline`（line 567-577）baseline 缺失分支从 `eprintln + return` 改为 `panic!("baseline missing at {path}: {e} — run bucket_table_arch_hash_capture_only to regenerate")`（issue #3 §出口 step 2 字面）。capture-only 入口 `bucket_table_arch_hash_capture_only` 行为不变（仍 print 32 行 stdout 供 capture script 重定向）。
+3. **darwin baseline 不 commit**：与 `tests/cross_arch_hash.rs::cross_arch_baselines_byte_equal_when_both_present` skip 政策一致（D-052 仍是 aspirational target；validation §6 字面要求 "文档标注当前是否达到" 即可），darwin 副本由后续 Mac runner / self-hosted 落地（与 stage-1 darwin baseline 同形态历史路径）。`tests/clustering_cross_host.rs` 走 skip 分支（linux 存在 / darwin 缺失）→ 不 fail。
+4. **同 host 自比对回归 guard 判断（trade-off carve-out）**：`cross_arch_bucket_id_baseline` 实跑 32-seed 训练 + read baseline 文件 + trim byte-equal 比对 — 本 batch **未单独 re-run** 该断言（该路径会 cost 另一个 ~74 min 同 host 重训）。判断依据：(a) capture 本身就是同 hardware / toolchain / 同段代码路径的 32-seed 训练 → D-051 same-arch determinism 不变量保证 byte-equal，重跑无新信息；(b) baseline 文件即 capture 输出的 trim 形式（grep `^seed=` + 写入），expected 的 `read_to_string + trim` vs actual 的 `capture_bucket_table_baseline + trim` 字节级等价；(c) D2 [实现] 闭合时 `cargo test --release -- --ignored` 全套 opt-in 跑会自然包含此断言，第一次 D2 commit 即捕获任何不一致。本 carve-out 与 §C-rev2 batch 6 §3 同形态：成本超出当 batch 预算 → 显式追认 + 推迟到下一同形态实跑（D2 commit）。
+
+##### §D-rev0 §5 batch 1 出口数据（commit 落地实测）
+
+- `cargo fmt --all --check`：全绿（fuzz crate 独立 workspace 不在 root `--all` 范围内；`fuzz/fuzz_targets/abstraction_smoke.rs` 已在 commit 前 `rustfmt --check` 单独验证全绿）。
+- `cargo build --all-targets`：全绿。
+- `cargo clippy --all-targets -- -D warnings`：全绿。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。
+- `cargo test --release --no-fail-fast`：**196 passed / 40 ignored / 0 failed across 27 test crates**（+ 2 doc-test 0 测；vs §C-rev2 batch 5 baseline 193 / 36 / 0 across 25 crates → +3 active +4 ignored +2 crates）。
+    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`（与 `stage1-v1.0` tag byte-equal，D-272 不退化要求满足）。
+    - **stage-2 11 crates** `92 passed / 21 ignored / 0 failed`（vs §C-rev2 batch 5 9 crates 87/17/0 → +2 crates 新增：`abstraction_fuzz` 2 active + 4 ignored / `clustering_cross_host` 1 active；其它 9 crates 数字不变）。
+    - lib unit tests 8 active 不变。
+    - 实测耗时 release：bucket_quality 109.40 s（fixture 训练，§C-rev2 batch 5 §1 cached_trained_table OnceLock 命中第二次后 0 s）+ clustering_determinism 313.27 s（含 4 线程 BLAKE3 byte-equal smoke + cross-thread bucket id 一致 smoke 主体）+ equity_self_consistency 4.18 s + equity_features 1.30 s + abstraction_fuzz 0.21 s + 其它 < 1 s = **总 ~7 min release**。debug profile 因 fixture 训练在 1k smoke 首次触发会到 ~10–15 min，与 §C-rev2 batch 5 baseline 同形态。
+- `cargo test --release --no-fail-fast -- --ignored --skip <heavy/known-fail>`：12 stage-1+2 ignored 子集**全绿** 8 passed / 0 failed across 12 crates（含本 batch 新增 3 条 `_full`：`infoset_mapping_repeat_full` 1.6 s + `action_abstraction_config_random_raise_sizes_full` 1.7 s + `bucket_lookup_1m_in_range_full` 108.23 s + 既有 `clustering_repeat_blake3_byte_equal_full` + `cross_thread_bucket_id_consistency_full` 合计 310.23 s release + stage-1 fuzz/determinism/cross_eval/cross_lang）。
+    - **跳过的 7 类 17 个 ignored 测试**（与本 batch 直接相关或已知预期 fail）：(1) `cross_arch_bucket_id_baseline` + `bucket_table_arch_hash_capture_only`（74 min × 2 = ~150 min wall，已用 capture 路径实测；§D-rev0 §4 trade-off carve-out）；(2) `off_tree_real_bet_stability_smoke` / `_full`（issue #8 D2 stub，§D-rev0 §3）；(3) 12 条 bucket_quality 质量门槛（`no_empty_bucket_per_street_*` × 3 + `bucket_internal_ehs_std_dev_below_threshold_*` × 3 + `adjacent_bucket_emd_above_threshold_*` × 3 + `bucket_id_ehs_median_monotonic_*` × 3，§C-rev2 batch 5 §1 carve-out 文档化预期 fail 与 hash design 限制一致；stage 3+ true equivalence enumeration 后转 active）。
+    - **未 skip 的预期 fail 实测**：本 batch 同时跑过 `--ignored --skip cross_arch_bucket_id_baseline` 不含上述 (2)(3) skip 的版本，得 14 expected fails（12 bucket_quality + 2 off_tree_real_bet_stability，与 §C-rev2 batch 5 §1 + §D-rev0 §3 文档预期完全一致），证明 skip 正确性 + 已知 fail 集合稳定。
+    - **`cross_validation_pokerkit_100k_random_hands` carve-out**：本 host PokerKit-enabled 路径上该测试在 1-CPU 上挂起（`futex_wait_queue_me`，subprocess 死锁），属 stage-1 已闭合范围、与 D1 batch 1 改动**完全无关**。stage-1 验收时该测试在多核 host 上跑通（D-rev0 多核 host carve-out）；1-CPU host 上的 hang 是 stage-1 follow-up 范畴（CLAUDE.md `Stage 1 follow-up` 段 (a) 多核 host 实跑），不阻塞 D1 batch 1 闭合。
+- `tests/api_signatures.rs` trip-wire byte-equal **不变**（本 batch 触动 `tests/` / `fuzz/` / `.github/workflows/` / `tests/data/` / `docs/` / `CLAUDE.md`，**未触** `src/` 公开 API trait surface）。
+
+##### §D-rev0 §6 batch 1 角色边界审计
+
+- **修改测试代码**：`tests/clustering_determinism.rs`（line 567-577 baseline 缺失分支 `eprintln + return` → `panic!`，issue #3 §出口 step 2）。
+- **新增测试代码**：`tests/abstraction_fuzz.rs`（new，3 组 6 `#[test]`）/ `tests/clustering_cross_host.rs`（new，1 `#[test]`）。
+- **新增 fuzz 代码**：`fuzz/fuzz_targets/abstraction_smoke.rs`（new）。
+- **修改配置**：`fuzz/Cargo.toml`（新 `[[bin]] abstraction_smoke`）/ `.github/workflows/ci.yml`（fuzz-quick 第三步）/ `.github/workflows/nightly.yml`（matrix 扩到 3 target + 顶部注释更新）。
+- **新增数据**：`tests/data/bucket-table-arch-hashes-linux-x86_64.txt`（capture 输出 commit）。
+- **修改文档**：`docs/pluribus_stage2_workflow.md` §D-rev0 batch 1 carve-out（本子节）+ `CLAUDE.md` Stage 2 progress D1 closed 段 + 测试基线翻面 + 下一步翻 D2。
+- **未修改**：所有 `src/*.rs` 产品代码 / `benches/baseline.rs`（`abstraction/bucket_lookup` bench group 留 E1）/ `tools/*.rs` / `proto/`。
+- **0 角色越界**：本 batch 全程 [测试] 单边路径（与 §C-rev2 batch 4 §5b / batch 5 §1 / batch 6 同型，0 产品代码改动）。`tests/clustering_determinism.rs` 是 [测试] 文件（issue #3 §出口 step 2 字面 [测试] 单边落地）。
+
+##### §D-rev0 §7 carry forward 处理政策（与 §A-rev0..§C-rev2 batch 6 一致，不重新论证）
+
+- 阶段 1 §B-rev1 §3 / §C-rev1 / §D-rev0 / §F-rev0 / §F-rev1 既往政策保持继承不变。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 `CLAUDE.md` Stage 2 progress 完整翻面（D1 closed 段落 + 测试基线 N→M 翻面 + 下一步 D2 [实现]）。
+- carve-out 政策：D1 暴露的 corner case bug 由 [测试] agent 列 issue + `#[ignore]` 标注 + 同 PR 文档化（与 stage-1 §C-rev2 / §D-rev0 测试 carve-out 同形态）。
+
+下一步：D2 [实现]（按 `pluribus_stage2_workflow.md` §D2 §输出 落地 issue #8 `DefaultActionAbstraction::map_off_tree` D-201 PHM stub 占位实现 + 取消 `abstraction_fuzz` 两条 `#[ignore = "D2: ..."]`；预期 D2 闭合后 `cargo test --release -- --ignored` 全套全绿，1M abstraction fuzz 0 panic / 0 invariant violation）。

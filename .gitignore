@@ -6,3 +6,5 @@
 /artifacts
 # Python 工具脚本（tools/*.py）运行后生成的字节码缓存
 tools/__pycache__/
+# Claude Code 本地 harness 会话状态（scheduled_tasks lockfile 等）
+/.claude

@@ -50,3 +50,13 @@ path = "fuzz_targets/history_decode.rs"
 test = false
 doc = false
 bench = false
+
+# Stage-2 D1：abstraction_smoke target（workflow §D1 §输出 第 1 条）。
+# 1M 随机 (board, hole) → bucket id determinism + in-range + input-shuffle invariance。
+# CI fuzz-quick 单跑 5 min；nightly matrix 与 random_play / history_decode 并行 ~5h45m。
+[[bin]]
+name = "abstraction_smoke"
+path = "fuzz_targets/abstraction_smoke.rs"
+test = false
+doc = false
+bench = false

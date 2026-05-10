@@ -88,6 +88,11 @@ jobs:
         run: cargo +nightly fuzz run random_play -- -max_total_time=300
       - name: fuzz history_decode 5 minutes
         run: cargo +nightly fuzz run history_decode -- -max_total_time=300
+      - name: fuzz abstraction_smoke 5 minutes
+        # stage-2 workflow §D1 §输出 第 5 条：每次 push 跑 100k 次 abstraction smoke
+        # fuzz 5 分钟内。BucketTable train_in_memory 进程内 OnceLock 缓存（10/10/10
+        # + 50 iter，release ~5 s），首次 init 后 fuzz 主循环 ~> 100k iter / min。
+        run: cargo +nightly fuzz run abstraction_smoke -- -max_total_time=300
       - name: upload fuzz artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4

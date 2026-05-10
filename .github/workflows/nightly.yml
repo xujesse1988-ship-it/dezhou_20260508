@@ -5,15 +5,16 @@ name: Nightly fuzz
 # **运行环境：GitHub-hosted ubuntu-latest**（不维护 self-hosted runner）。
 #
 # 单 job 时长上限 6h（GitHub-hosted 硬性限制；超时 job 直接被 kill），所以本
-# workflow 走 matrix 把 random_play / history_decode 两个 target 并行各跑 5h50m
-# 每晚累计 fuzz 时间约 11h40m，覆盖介于 ci.yml fuzz-quick (10 min/push) 和 spec
-# 原计划的 24h self-hosted 之间的中间态。**workflow §D1 §输出 第 4 条 「24 小时」
-# 字面未达成，但 spec 意图（扩展时长 fuzz 覆盖低频 bug）以 ~12h/天 + 多日累计的
-# 形式实现**。需要严格 24h 单跑时再切回 self-hosted（保留 git history commit
-# 43cfedd^ 即上一版的 self-hosted yml 可恢复）。
+# workflow 走 matrix 把 random_play / history_decode / abstraction_smoke 三个 target
+# 并行各跑 5h45m，每晚累计 fuzz 时间约 17h15m，覆盖介于 ci.yml fuzz-quick (15 min/
+# push) 和 spec 原计划的 24h self-hosted 之间的中间态。**stage-1 workflow §D1
+# §输出 第 4 条 + stage-2 workflow §D1 §输出 第 4 条「24 小时」字面未达成，但 spec
+# 意图（扩展时长 fuzz 覆盖低频 bug）以 ~17h/天 + 多日累计的形式实现**。需要严格
+# 24h 单跑时再切回 self-hosted（保留 git history commit 43cfedd^ 即上一版的
+# self-hosted yml 可恢复）。
 #
-# 预算考虑：matrix 2 × 5h50m × 30 天 ≈ 350h GH-Actions 分钟/月。public repo 免费；
-# private repo 远超 2000-min 免费额度，需付费或降为 1 个 target。
+# 预算考虑：matrix 3 × 5h45m × 30 天 ≈ 517h GH-Actions 分钟/月。public repo 免费；
+# private repo 远超 2000-min 免费额度，需付费或降为 1–2 个 target。
 #
 # 触发：每天 02:00 UTC 自动；workflow_dispatch 可手动触发。
 
@@ -30,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false  # 一个 target 出 crash artifact 不要 cancel 另一个
       matrix:
-        target: [random_play, history_decode]
+        target: [random_play, history_decode, abstraction_smoke]
     steps:
       - uses: actions/checkout@v4
 
