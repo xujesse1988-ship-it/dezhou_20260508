@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 progress: A0 / A1 / B1 / B2 / C1 / C2 / D1 / D2 closed，下一步 E1 [测试]**（详见下文 §Stage 2 progress）。
+8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 progress: A0 / A1 / B1 / B2 / C1 / C2 / D1 / D2 / E1 closed，下一步 E2 [实现]**（详见下文 §Stage 2 progress）。
 
 历史 batch 出口数据（stage 1 的 B/C/D/E/F 各步、stage 2 的 A0 batch 1–6 review / A1 batch 7 / B1 batch 2）不在本文件保留——查阅顺序：
 
 1. `docs/pluribus_stage1_report.md` — stage-1 验收报告，含 F3 全套出口数据 + 9 条 §修订历史 carve-out 索引。
 2. `docs/pluribus_stage1_workflow.md` §修订历史（B-rev1 / C-rev1 / C-rev2 / D-rev0 / E-rev0 / E-rev1 / F-rev0 / F-rev1 / F-rev2）= stage-1 9 条 carve-out 全文。
-3. `docs/pluribus_stage2_workflow.md` §修订历史（A-rev0 / A-rev1 / B-rev0 / B-rev1 / C-rev0 / C-rev1 / C-rev2 / D-rev0 / D-rev1）= stage-2 已闭合步骤的 carve-out 全文。
+3. `docs/pluribus_stage2_workflow.md` §修订历史（A-rev0 / A-rev1 / B-rev0 / B-rev1 / C-rev0 / C-rev1 / C-rev2 / D-rev0 / D-rev1 / E-rev0）= stage-2 已闭合步骤的 carve-out 全文。
 4. `git log --oneline stage1-v1.0..` — stage-2 实施提交时间线。
 
 ### Stage 1 baseline（frozen at `stage1-v1.0`，stage-2 D-272 不退化锚点）
@@ -34,8 +34,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `cargo test --no-run` — compile only。
 - `cargo test` — 默认全绿（详见上方 baseline + 下方 stage 2 当前数字）。需要 PokerKit 的两条交叉验证（`cross_eval` / `cross_validation` 100-hand）在依赖不可用时自动 skipped。
 - `cargo test --release -- --ignored` — full-volume 测试（baseline + stage 2 progress）。
-- `cargo bench --bench baseline` — stage-1 5 条 bench（eval7_naive single/batch / simulate / history encode/decode）+ stage-2 追加 2 条（`abstraction/info_mapping` / `abstraction/equity_monte_carlo`）。CI 短路径走 `--warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot`，nightly 跑全量（`.github/workflows/{ci,nightly}.yml`）。
-- `cargo test --release --test perf_slo -- --ignored` — 5 条 SLO 阈值断言。
+- `cargo bench --bench baseline` — stage-1 5 条 bench（eval7_naive single/batch / simulate / history encode/decode）+ stage-2 追加 3 条（`abstraction/info_mapping` / `abstraction/equity_monte_carlo` / E1 落地的 `abstraction/bucket_lookup` 3 街分流）。CI 短路径走 `--warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot`，nightly 跑全量（`.github/workflows/{ci,nightly}.yml`）。
+- `cargo test --release --test perf_slo -- --ignored` — 5 条 stage-1 SLO 断言 + 3 条 E1 落地的 stage-2 SLO 断言（`stage2_abstraction_mapping_throughput_*` / `stage2_bucket_lookup_p95_latency_*` / `stage2_equity_monte_carlo_throughput_*`）。
 
 ### 装 PokerKit（C2 实测可用）
 
@@ -161,9 +161,46 @@ API 骨架代码化按 §A1 §输出 全部落地：
 
 **§D-rev1 §2 cross_arch_bucket_id_baseline 实跑 follow-through**：§D-rev0 §4 carve-out (c) 字面 "D2 [实现] 闭合时 `cargo test --release -- --ignored` 全套 opt-in 跑会自然包含此断言，第一次 D2 commit 即捕获任何不一致"。本 commit 实跑 32-seed BLAKE3 byte-equal 验证 **0 diverge byte-equal**（3251.08 s = 54.18 min release on 1-CPU host，vs §D-rev0 §4 capture 73.97 min 快 ~20 min），D2 改动 0 触 bucket_table 训练路径 + D-051 same-arch determinism 验证通过。**§D-rev0 §4 carve-out 完整闭合**。
 
-### 下一步：Stage 2 E1 [测试]
+### E1 closed（2026-05-10，本 commit）
 
-按 §E1 §输出 落地 stage-2 性能 SLO 断言 + bucket lookup throughput baseline bench group：(1) `tests/perf_slo.rs::stage2_*` 三条 SLO 断言（抽象映射 ≥ 100k mapping/s 单线程 / bucket lookup P95 ≤ 10 μs / equity Monte Carlo ≥ 1k hand/s @ 10k iter）——E1 阶段大概率达不到（B2/C2 朴素实现），断言为 "待达成" 状态留 E2 优化；(2) `benches/baseline.rs` 追加第 3 个 `abstraction/bucket_lookup` group（mmap 命中路径，§D-rev0 §2 carve-out 字面 "属 §E1 §输出 line 424 字面 [测试] 范畴"）；(3) CI 短 benchmark + 全量 nightly + criterion baseline 对照。预算 0.5 人周。E1 完成后进入 E2 [实现]（性能优化到 SLO）。
+按 §E1 §输出 4 类交付物全部落地（[测试] 单边路径，0 越界）；详见 `pluribus_stage2_workflow.md` §修订历史 §E-rev0 batch 1：
+
+- **`tests/perf_slo.rs::stage2_*` 3 条 release-only `#[ignore]` SLO 阈值断言**（D-280 / D-281 / D-282）：
+    - `stage2_abstraction_mapping_throughput_at_least_100k_per_second`（D-280）— 测量 `(GameState, hole) → InfoSetId` 全路径单线程吞吐，preflop 路径走 `PreflopLossless169::map`（D-217 closed-form `hand_class_169`）；500_000 mapping × 200 hole 输入循环避免分支预测过拟合单点。
+    - `stage2_bucket_lookup_p95_latency_at_most_10us`（D-281）— 测量 `(street, board, hole) → bucket_id` 单次查表延迟分布；fixture 走 `BucketTable::train_in_memory(BucketConfig { 100, 100, 100 }, 0xC2_FA22_BD75_710E, evaluator, 200)`（与 `tests/bucket_quality.rs::cached_trained_table` 同型，~70 s release setup）；每条街 5_000 sample × 3 街 = 15_000 latencies；P95 索引 14_249，`Instant::now()` ~20 ns clock_gettime 开销 ≪ 10 μs 门槛可直接计入。
+    - `stage2_equity_monte_carlo_throughput_at_least_1k_hand_per_second`（D-282）— 测量 `MonteCarloEquity::equity(hole, board, rng)` 默认 10_000 iter 单线程吞吐；100 手 flop 街随机 (board, hole)。
+- **`benches/baseline.rs` 第 3 个 abstraction bench group `abstraction/bucket_lookup`**（§E1 §输出 line 424 字面 / §D-rev0 §2 carve-out 预先批注）：3 个 bench function（按街分流 `flop` / `turn` / `river`）；fixture 走 `BucketTable::train_in_memory(BucketConfig { 10, 10, 10 }, 0xE1BC_1007_5101, evaluator, 50)`（与 `fuzz/fuzz_targets/abstraction_smoke.rs` OnceLock fixture 同型，~5 s release setup）；`criterion_group!` 顶级注册新 group，CI bench-quick + nightly bench-full job 自动 pick up（`.github/workflows/{ci,nightly}.yml` **0 改动**）。
+- **bench 实测出口数据**（quick CI 路径模拟 `--warm-up-time 1 --measurement-time 1 --sample-size 10`，1-CPU release）：
+
+  | bench | thrpt 中位 | latency 中位 | SLO 对照 |
+  |---|---|---|---|
+  | `abstraction/bucket_lookup/flop` | 21.7 M elem/s | 46.0 ns | P95 ≤ 10 μs：~217× under |
+  | `abstraction/bucket_lookup/turn` | 18.8 M elem/s | 53.2 ns | P95 ≤ 10 μs：~188× under |
+  | `abstraction/bucket_lookup/river` | 17.7 M elem/s | 56.5 ns | P95 ≤ 10 μs：~177× under |
+  | `abstraction/equity_monte_carlo/flop_10k_iter` | 433.92 elem/s | 2.30 ms | ≥ 1 K hand/s：~2× short（**与 SLO #3 fail 一致**）|
+
+- **新增 bench function**：`abstraction/equity_monte_carlo/flop_10k_iter`（与 D-282 SLO `≥ 1k hand/s @ 10k iter` 口径直接对齐；既有 B1 `flop_1k_iter` 短测试模式保留）。
+
+- **共享 helper**：`sample_postflop_input(rng, board_len)`（抽 board_len + 2 张不重复 Card → (board\[0..5\], hole\[2\])），bench / SLO 测试两条路径各持一份私有 fn 保证输入分布一致；不上 lib re-export（test-only helper 不属公开 API）。
+
+**§E-rev0 §1..§3 [测试] 单边路径 0 越界**：本步骤未触 `src/` 任何文件；产品代码 0 行修改；`benches/baseline.rs` 与 `tests/perf_slo.rs` 均属 [测试] 范畴。stage-2 §B-rev1 §3 / §C-rev1 §3 / §D-rev1 §1 三处 [实现] → [测试] 越界 carve-out **不传染**到 E1（与 stage-1 §C-rev1 / §E-rev0 同型 «常规闭合 + 0 越界»）。
+
+### Stage 2 当前测试基线（E-rev0 batch 1 E1 [测试] 闭合后）
+
+- `cargo test --release --no-fail-fast`：**197 passed / 42 ignored / 0 failed across 27 test crates**（vs §D-rev1 batch 1 baseline 197/39/0 → 0 active +3 ignored，由 3 条 stage2_* SLO 断言全部 `#[ignore]` 引入）。
+    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`（与 `stage1-v1.0` tag byte-equal，D-272 不退化要求满足；E1 [测试] 0 改动产品代码 / stage-1 conceptual 测试集不变）。
+    - **stage-2 11 crates 数字不变 `93 passed / 20 ignored / 0 failed`**：3 条新增 stage2_* SLO 断言落在 stage-1 文件 `tests/perf_slo.rs`，按文件归属算入 stage-1 16 crates 一栏；`tests/perf_slo.rs` 单 crate 由 stage-1 `0 active + 5 ignored` → stage-1 部分 `0 active + 5 ignored`（不变）+ stage-2 部分 `0 active + 3 ignored`（新增）= 总计 `0 active + 8 ignored`。其它 26 crates 数字不变。
+    - lib unit tests 8 active 不变（E1 0 改动 `src/`）。
+    - 实测耗时（release profile）：bucket_quality 110.74 s + clustering_determinism 309.81 s + abstraction_fuzz 0.21 s + perf_slo 默认套件不跑 `#[ignore]`（0 增量）+ 其它合计 < 30 s = **总 ~7 min release**（与 §D-rev1 batch 1 持平）。
+- **artifact 不变**：`artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`（95 KB / 不进 git history）BLAKE3 不变（§C-rev2 batch 3 §3）；E1 0 触 bucket_table 训练路径。
+- **跨架构 baseline 不变**：`tests/data/bucket-table-arch-hashes-linux-x86_64.txt` 32-seed BLAKE3 baseline 不变。
+- `cargo test --release --test perf_slo -- --ignored --nocapture stage2_`：**2 passed / 1 failed**（总壁钟 139.88 s 含 fixture setup ~70 s）。详细实测：(1) `stage2_abstraction_mapping` **PASS** 16 465 157 mapping/s（164× over 100k 门槛）；(2) `stage2_bucket_lookup` **PASS** P50=97 ns / P95=188 ns / P99=250 ns（53× under 10 μs 门槛）；(3) `stage2_equity_monte_carlo` **FAIL** 502.8 hand/s @ 10k iter（vs 1k 门槛 ~2× short，E2 必须修）。详见 `pluribus_stage2_workflow.md` §E-rev0 §4。
+- `cargo bench --bench baseline -- --warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot abstraction/bucket_lookup`：**3 bench function 全过**（实测见 §E-rev0 §3 / 上方 E1 closed 段表）。
+- `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` trip-wire byte-equal **不变**（E1 [测试] 0 触 `src/` / 公开 API；stage 2 公开 API **0 签名漂移**）。
+
+### 下一步：Stage 2 E2 [实现]
+
+按 §E2 §输出 落地性能优化让 §E-rev0 §4 中失败的 SLO 断言全部转绿，且**不破坏正确性测试**：(1) bucket lookup hot path 内存布局优化（cache-friendly canonical id 编码）；(2) equity Monte Carlo 多线程 + SIMD 优化（如必要）；(3) preflop 169 mapping 走 `[u8; 1326]` 直接表（替代任何条件分支）；(4) `abstraction::map` 子模块持续守住 `clippy::float_arithmetic` 死锁（性能优化不允许引入浮点）。出口标准：E1 全部 SLO 断言通过 + B / C / D 全套测试仍然全绿（**性能优化引入正确性回归是阶段 1 / 阶段 2 同样最常见的翻车场景**——见 stage-1 §E-rev1）+ 1M abstraction fuzz 0 panic。预算 1.5–2 人周。
 
 ## Documents and their authority
 
@@ -177,7 +214,7 @@ The stage-1 docs form a contract hierarchy (frozen as of `stage1-v1.0`). Read th
 Stage-2 docs（locked as of A0 closure 2026-05-09）：
 
 5. `docs/pluribus_stage2_validation.md` — quantitative pass criteria for stage 2（preflop 169 lossless 100% / postflop bucket EHS std dev < 0.05 / clustering determinism / abstraction mapping ≥100k mapping/s / mmap bucket table schema）。
-6. `docs/pluribus_stage2_workflow.md` — 13-step test-first workflow（mirror `pluribus_stage1_workflow.md`）。§修订历史 含 §A-rev0 / §A-rev1 / §B-rev0 / §B-rev1。
+6. `docs/pluribus_stage2_workflow.md` — 13-step test-first workflow（mirror `pluribus_stage1_workflow.md`）。§修订历史 含 §A-rev0 / §A-rev1 / §B-rev0 / §B-rev1 / §C-rev0..§C-rev2 / §D-rev0 / §D-rev1 / §E-rev0。
 7. `docs/pluribus_stage2_decisions.md` — D-200..D-283。**Authoritative spec for implementers.**
 8. `docs/pluribus_stage2_api.md` — API-200..API-302。**Authoritative spec for stage-2 testers.**
 
@@ -197,7 +234,7 @@ Each stage is organized as `A → B → C → D → E → F`（13 steps）。Sta
 - `[实现]` agent writes product code only. **Never modify tests.** If a test fails, fix the product code; only edit the test if it has an obvious bug, and only after review.
 - `[决策]` and `[报告]` produce or modify docs in `docs/`.
 
-When the user asks you to do stage work, identify which stage and which step (A0 / A1 / B1 / …) the task belongs to and operate within that role。**当前进度**：stage 1 全 13 步闭合，stage 2 A0 / A1 / B1 / B2 / C1 / C2 / D1 / D2 闭合，下一步 E1 [测试]。历史角色越界 carve-out（[测试] ↔ [实现] 边界破例追认 / 0 产品代码改动也算 closure / D-NNN-revM 翻语义同 commit 翻测试 / 错误前移单点不变量）逐条记录在 `pluribus_stage1_workflow.md` §修订历史 与 `pluribus_stage2_workflow.md` §修订历史；遇相似情况时直接查那两份文档。
+When the user asks you to do stage work, identify which stage and which step (A0 / A1 / B1 / …) the task belongs to and operate within that role。**当前进度**：stage 1 全 13 步闭合，stage 2 A0 / A1 / B1 / B2 / C1 / C2 / D1 / D2 / E1 闭合，下一步 E2 [实现]。历史角色越界 carve-out（[测试] ↔ [实现] 边界破例追认 / 0 产品代码改动也算 closure / D-NNN-revM 翻语义同 commit 翻测试 / 错误前移单点不变量）逐条记录在 `pluribus_stage1_workflow.md` §修订历史 与 `pluribus_stage2_workflow.md` §修订历史；遇相似情况时直接查那两份文档。
 
 ## Non-negotiable invariants (apply to all stage-1 code)
 

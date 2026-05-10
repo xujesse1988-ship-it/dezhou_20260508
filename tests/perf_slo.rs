@@ -29,8 +29,9 @@ use std::time::Instant;
 
 use poker::eval::NaiveHandEvaluator;
 use poker::{
-    Action, Card, ChaCha20Rng, ChipAmount, GameState, HandEvaluator, HandHistory, LegalActionSet,
-    RngSource, TableConfig,
+    canonical_observation_id, Action, BucketConfig, BucketTable, Card, ChaCha20Rng, ChipAmount,
+    EquityCalculator, GameState, HandEvaluator, HandHistory, InfoAbstraction, LegalActionSet,
+    MonteCarloEquity, PreflopLossless169, RngSource, StreetTag, TableConfig,
 };
 
 // ============================================================================
@@ -319,4 +320,213 @@ fn slo_history_decode_at_least_1m_action_per_second() {
         actions_per_sec >= 1_000_000.0,
         "HandHistory decode {actions_per_sec:.0} action/s < SLO 1M action/s"
     );
+}
+
+// ============================================================================
+// 阶段 2 §E1 §输出：stage2_* SLO 阈值断言（`pluribus_stage2_validation.md` §8）
+// ============================================================================
+//
+// 三条阶段 2 性能门槛断言（D-280 / D-281 / D-282），与 stage-1 SLO 同形态：
+// release-only opt-in via `cargo test --release --test perf_slo -- --ignored`，
+// `#[ignore]` 让 CI 默认套件不破红。E1 closure 期望全部 / 部分失败（B2 / C2 朴素
+// 实现），E2 [实现] 优化后必须全绿。`workflow §E1 §输出` 字面 "断言为待达成
+// 状态"。
+//
+// 角色边界：本节属 `[测试]` agent。`[实现]` agent 不得修改。
+
+/// 阶段 2 §E1 §输出 SLO #1：抽象映射 `≥ 100,000 mapping/s` 单线程（D-280）。
+///
+/// 测量 `(GameState, hole) → InfoSetId` 全路径单线程吞吐——preflop 路径走
+/// `PreflopLossless169::map`（D-217 closed-form）。E2 优化方向（workflow §E2 line
+/// 451）：preflop 169 mapping 改 `[u8; 1326]` 直接表替代任何条件分支。
+#[test]
+#[ignore = "stage2 perf SLO"]
+fn stage2_abstraction_mapping_throughput_at_least_100k_per_second() {
+    let cfg = TableConfig::default_6max_100bb();
+    let state = GameState::new(&cfg, 0);
+    let abs = PreflopLossless169::new();
+    // 200 组互不相同的 hole 输入；hand_class_169 路径对 hole 敏感，单点输入会
+    // 让分支预测过拟合。1326 起手牌总数远大于 200，足够覆盖 169 等价类的常见
+    // 分布而不退化为单类。
+    let mut rng = ChaCha20Rng::from_seed(0xE1AB_5101);
+    let holes: Vec<[Card; 2]> = (0..200)
+        .map(|_| {
+            let (_, hole) = sample_postflop_input(&mut rng, 3);
+            hole
+        })
+        .collect();
+
+    let n_iters = 500_000usize;
+    let start = Instant::now();
+    let mut acc: u64 = 0;
+    for i in 0..n_iters {
+        let hole = holes[i % holes.len()];
+        let id = abs.map(&state, hole);
+        acc = acc.wrapping_add(id.raw());
+    }
+    let elapsed = start.elapsed();
+    if acc == u64::MAX {
+        eprintln!("(unreachable) acc=u64::MAX");
+    }
+    let throughput = n_iters as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "[stage2-abstraction-mapping] 实测 {throughput:.0} mapping/s（SLO 门槛 ≥ 100,000；\
+         {n_iters} mappings / {:.3}s）",
+        elapsed.as_secs_f64(),
+    );
+    assert!(
+        throughput >= 100_000.0,
+        "抽象映射 {throughput:.0} mapping/s < SLO 100k mapping/s（E1 closure 期望失败；\
+         E2 性能优化（preflop [u8; 1326] 直接表）后必须通过）"
+    );
+}
+
+/// 阶段 2 §E1 §输出 SLO #2：bucket lookup `P95 ≤ 10 μs`（D-281）。
+///
+/// 测量 `(street, board, hole) → bucket_id` 单次查表延迟分布——`canonical_observation_id`
+/// （sort + first-appearance suit remap + FNV-1a，dominant 成本）+
+/// `BucketTable::lookup`（mmap-equivalent `bytes[off + id*4..]` 读取）。
+///
+/// **fixture 取舍**：100/100/100 + cluster_iter=200 与 `tests/bucket_quality.rs`
+/// `cached_trained_table` 同型（~70 s release 训练 setup），不依赖 95 KB 的
+/// `artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`（gitignore，
+/// 见 C2 §C-rev1 §1 carve-out）。bucket 数量不影响 lookup body cache 行为。
+///
+/// E2 优化方向（workflow §E2 line 449）：bucket lookup hot path 内存布局优化
+/// （cache-friendly canonical id 编码）。
+#[test]
+#[ignore = "stage2 perf SLO"]
+fn stage2_bucket_lookup_p95_latency_at_most_10us() {
+    let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
+    let table = BucketTable::train_in_memory(
+        BucketConfig {
+            flop: 100,
+            turn: 100,
+            river: 100,
+        },
+        0xC2_FA22_BD75_710E,
+        evaluator,
+        200,
+    );
+
+    // 每条街 5_000 sample × 3 街 = 15_000 latencies；P95 索引位 14_249，分布尾部
+    // 估计噪声 < 5%。Instant::now() 在 Linux x86_64 走 clock_gettime(CLOCK_MONOTONIC)，
+    // ~20 ns 系统调用开销 ≪ 10 μs SLO 门槛，可直接计入测量。
+    let n_per_street = 5_000usize;
+    let mut latencies_ns: Vec<u64> = Vec::with_capacity(n_per_street * 3);
+    let mut rng = ChaCha20Rng::from_seed(0xE1BC_2002);
+    for (street, board_len) in [
+        (StreetTag::Flop, 3usize),
+        (StreetTag::Turn, 4usize),
+        (StreetTag::River, 5usize),
+    ] {
+        for _ in 0..n_per_street {
+            let (board, hole) = sample_postflop_input(&mut rng, board_len);
+            let board_slice: &[Card] = &board[..board_len];
+            let t0 = Instant::now();
+            let obs_id = canonical_observation_id(street, board_slice, hole);
+            let bucket = table.lookup(street, obs_id);
+            let dt = t0.elapsed();
+            // 防 DCE：把 bucket 传入 black_box，避免编译器把 lookup 整段消除。
+            std::hint::black_box(bucket);
+            latencies_ns.push(dt.as_nanos() as u64);
+        }
+    }
+    latencies_ns.sort_unstable();
+    let p50 = latencies_ns[latencies_ns.len() / 2];
+    let p95_idx = (latencies_ns.len() as f64 * 0.95) as usize;
+    let p95 = latencies_ns[p95_idx];
+    let p99_idx = (latencies_ns.len() as f64 * 0.99) as usize;
+    let p99 = latencies_ns[p99_idx];
+    eprintln!(
+        "[stage2-bucket-lookup] {} samples（{n_per_street}/街 × 3 街）：P50 = {p50} ns / \
+         P95 = {p95} ns / P99 = {p99} ns（SLO 门槛 P95 ≤ 10,000 ns = 10 μs）",
+        latencies_ns.len(),
+    );
+    assert!(
+        p95 <= 10_000,
+        "bucket lookup P95 {p95} ns > SLO 10,000 ns = 10 μs（E1 closure 期望失败；\
+         E2 优化 hot path 内存布局后必须通过）"
+    );
+}
+
+/// 阶段 2 §E1 §输出 SLO #3：equity Monte Carlo `≥ 1,000 hand/s` @ 10k iter（D-282）。
+///
+/// 测量 `MonteCarloEquity::equity(hole, board, rng)` 默认 10,000 iter 单线程吞吐。
+/// **仅用于离线 clustering 训练**——D-225 锁运行时映射热路径不允许触发 Monte
+/// Carlo（必须命中 lookup table）。
+///
+/// 阶段 1 §4 / §6.5 间接约束：`10,000 iter / hand × 1,000 hand/s = 10M eval/s`
+/// 正好打满阶段 1 SLO；阶段 1 实测 20.76M eval/s 提供约 2× 缓冲。E1 期望失败
+/// 仍是 B2 朴素实现 deck 拷贝 / RNG 抽样开销在 10k iter 路径上尚未优化。
+///
+/// E2 优化方向（workflow §E2 line 450）：equity Monte Carlo 多线程 + SIMD 优化（如必要）。
+#[test]
+#[ignore = "stage2 perf SLO"]
+fn stage2_equity_monte_carlo_throughput_at_least_1k_hand_per_second() {
+    let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
+    let calc = MonteCarloEquity::new(evaluator).with_iter(10_000);
+
+    // 100 手 × 10k iter @ 1k hand/s SLO ⇒ ~0.1 s 理论；B2 朴素估计 ~10×（朴素
+    // eval ~20M eval/s release × 2 evals / iter = 10M iter/s 上限 / 10k iter ≈
+    // 1k hand/s，刚好 SLO 边界，外加 RNG / deck 开销可能掉到 200–500 hand/s）。
+    let n_hands = 100usize;
+    let mut sample_rng = ChaCha20Rng::from_seed(0xE1E0_3003);
+    let inputs: Vec<([Card; 5], [Card; 2])> = (0..n_hands)
+        .map(|_| sample_postflop_input(&mut sample_rng, 3))
+        .collect();
+
+    let mut equity_rng = ChaCha20Rng::from_seed(0xE1E0_3003_u64.wrapping_add(0xDEAD_BEEF));
+    let start = Instant::now();
+    let mut acc = 0.0f64;
+    for (board, hole) in &inputs {
+        let board_slice: &[Card] = &board[..3];
+        let eq = calc
+            .equity(*hole, board_slice, &mut equity_rng)
+            .expect("equity ok on valid (hole, board) pair");
+        acc += eq;
+    }
+    let elapsed = start.elapsed();
+    if !acc.is_finite() {
+        eprintln!("(unreachable) acc=NaN");
+    }
+    let throughput = n_hands as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "[stage2-equity-mc] 实测 {throughput:.1} hand/s @ 10k iter（{n_hands} hand / {:.3}s，\
+         平均 equity = {:.4}）；SLO 门槛 ≥ 1,000 hand/s",
+        elapsed.as_secs_f64(),
+        acc / n_hands as f64,
+    );
+    assert!(
+        throughput >= 1_000.0,
+        "equity MC {throughput:.1} hand/s < SLO 1,000 hand/s（E1 closure 期望失败；\
+         E2 多线程 + SIMD 优化后必须通过）"
+    );
+}
+
+// ============================================================================
+// 共享 fixture（与 `benches/baseline.rs::sample_postflop_input` 同形态）
+// ============================================================================
+
+/// 从 RngSource 抽取 `board_len + 2` 张不重复的 Card 拆成 (board\[0..5\], hole\[2\])。
+/// `board` 数组仅前 `board_len` 项有效，与 `canonical_observation_id` 接受的
+/// `board: &[Card]` 切片语义一致——`bench` 与 SLO 测试共用同一抽样算法保证
+/// 输入分布一致性。
+fn sample_postflop_input(rng: &mut dyn RngSource, board_len: usize) -> ([Card; 5], [Card; 2]) {
+    debug_assert!((3..=5).contains(&board_len));
+    let mut deck: [u8; 52] = std::array::from_fn(|i| i as u8);
+    let total = board_len + 2;
+    for i in 0..total {
+        let j = i + (rng.next_u64() % ((52 - i) as u64)) as usize;
+        deck.swap(i, j);
+    }
+    let mut board = [Card::from_u8(0).expect("0 valid"); 5];
+    for (i, slot) in board.iter_mut().enumerate().take(board_len) {
+        *slot = Card::from_u8(deck[i]).expect("0..52");
+    }
+    let hole = [
+        Card::from_u8(deck[board_len]).expect("0..52"),
+        Card::from_u8(deck[board_len + 1]).expect("0..52"),
+    ];
+    (board, hole)
 }

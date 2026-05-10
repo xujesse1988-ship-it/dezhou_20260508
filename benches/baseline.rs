@@ -238,6 +238,9 @@ criterion_group!(
     // bench 共存；E1 才接 SLO 断言）。
     bench_abstraction_info_mapping,
     bench_abstraction_equity_monte_carlo,
+    // 阶段 2 §E1 §输出 line 424：第 3 个 abstraction bench group
+    // `(street, board, hole) → bucket_id`（mmap 命中），对应 D-281 P95 ≤ 10 μs。
+    bench_abstraction_bucket_lookup,
 );
 criterion_main!(baseline);
 
@@ -310,5 +313,107 @@ fn bench_abstraction_equity_monte_carlo(c: &mut Criterion) {
             black_box(calc.equity(black_box(hole), black_box(&board), &mut rng))
         });
     });
+    // 阶段 2 §E1 §输出 line 425：`abstraction/equity_monte_carlo_10k_iter` —— 10k iter
+    // 与 D-282 SLO（≥ 1,000 hand/s @ 10k iter）口径对齐，便于 nightly bench-full
+    // job 直接对 SLO 数字回归。E1 [测试] 追加。
+    let calc_10k = MonteCarloEquity::new(Arc::clone(&evaluator)).with_iter(10_000);
+    group.bench_function("flop_10k_iter", |b| {
+        let mut seed_counter = 0u64;
+        b.iter(|| {
+            let mut rng = ChaCha20Rng::from_seed(seed_counter);
+            seed_counter = seed_counter.wrapping_add(1);
+            black_box(calc_10k.equity(black_box(hole), black_box(&board), &mut rng))
+        });
+    });
     group.finish();
+}
+
+// ============================================================================
+// 阶段 2 §E1 §输出 line 424：bucket lookup bench（mmap 命中路径）
+// ============================================================================
+//
+// `abstraction/bucket_lookup`：`(street, board, hole) → bucket_id` 全路径——
+// `canonical_observation_id`（FNV-1a + first-appearance suit remap，dominant
+// 成本）+ `BucketTable::lookup`（bytes[off + id*4..] u32 LE 读取，~5 ns）。
+//
+// **fixture 取舍**：bench-quick CI 30s 总预算（criterion sample-size=10 / warm-up
+// =1s / measurement=1s ≈ 6s 用于本 group 3 个 bench function），训练 fixture
+// 必须 < ~10s 一次性 setup。选 `BucketConfig { 10, 10, 10 }` + cluster_iter=50
+// 与 `fuzz/fuzz_targets/abstraction_smoke.rs` 进程内 OnceLock 缓存 fixture 同型
+// （~5s release）；bucket 数量小不影响 lookup body 的 cache 行为（lookup 只读 4
+// 字节 / 路径长度与 bucket 数量正交）。production 500/500/500 fixture 由
+// `tools/train_bucket_table.rs` CLI 产出 95 KB artifact，bench 不依赖（C2 §C-rev1
+// §1 carve-out）。
+//
+// **角色边界**：本 fn 属 `[测试]` agent。`[实现]` agent 不得修改。
+
+fn bench_abstraction_bucket_lookup(c: &mut Criterion) {
+    use std::sync::Arc;
+
+    use poker::{canonical_observation_id, BucketConfig, BucketTable, StreetTag};
+
+    let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
+    // 一次性 setup ~5 s release（10/10/10 + 50 iter 与 fuzz/abstraction_smoke 同型）。
+    // criterion 在 `b.iter` 之外只测量 closure 本身耗时，setup 不进数据。
+    let table = BucketTable::train_in_memory(
+        BucketConfig {
+            flop: 10,
+            turn: 10,
+            river: 10,
+        },
+        0xE1BC_1007_5101,
+        evaluator,
+        50,
+    );
+
+    let mut group = c.benchmark_group("abstraction/bucket_lookup");
+    group.throughput(Throughput::Elements(1));
+
+    for (street_label, board_len, street) in [
+        ("flop", 3usize, StreetTag::Flop),
+        ("turn", 4usize, StreetTag::Turn),
+        ("river", 5usize, StreetTag::River),
+    ] {
+        // 200 组预生成 (board, hole) 输入；避免 b.iter closure 内的 RNG / sort 成本干扰
+        // bucket lookup 路径本身的延迟测量。bench 在 inputs 上循环复用。
+        let mut rng = ChaCha20Rng::from_seed(0xE1BC_1007 ^ board_len as u64);
+        let inputs: Vec<([Card; 5], [Card; 2])> = (0..200)
+            .map(|_| sample_postflop_input(&mut rng, board_len))
+            .collect();
+        group.bench_function(street_label, |b| {
+            let mut idx = 0usize;
+            b.iter(|| {
+                let (board, hole) = &inputs[idx % inputs.len()];
+                idx = idx.wrapping_add(1);
+                let board_slice: &[Card] = &board[..board_len];
+                let obs_id =
+                    canonical_observation_id(street, black_box(board_slice), black_box(*hole));
+                black_box(table.lookup(street, obs_id))
+            });
+        });
+    }
+    group.finish();
+}
+
+/// 共享 fixture：从 RngSource 抽取 `board_len + 2` 张不重复的 Card 拆成
+/// (board\[0..5\], hole\[2\])（board 仅 `board_len` 项有效，剩余 padding 不参与
+/// `canonical_observation_id`）。与 `tests/perf_slo.rs` 同 helper 同形态，bench /
+/// SLO 测试两条路径共用一份 sampling 算法保证 fixture 输入分布一致。
+fn sample_postflop_input(rng: &mut dyn RngSource, board_len: usize) -> ([Card; 5], [Card; 2]) {
+    debug_assert!((3..=5).contains(&board_len));
+    let mut deck: [u8; 52] = std::array::from_fn(|i| i as u8);
+    let total = board_len + 2;
+    for i in 0..total {
+        let j = i + (rng.next_u64() % ((52 - i) as u64)) as usize;
+        deck.swap(i, j);
+    }
+    let mut board = [Card::from_u8(0).expect("0 valid"); 5];
+    for (i, slot) in board.iter_mut().enumerate().take(board_len) {
+        *slot = Card::from_u8(deck[i]).expect("0..52");
+    }
+    let hole = [
+        Card::from_u8(deck[board_len]).expect("0..52"),
+        Card::from_u8(deck[board_len + 1]).expect("0..52"),
+    ];
+    (board, hole)
 }

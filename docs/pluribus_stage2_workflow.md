@@ -1383,3 +1383,96 @@ D2 [实现] 闭合 commit 同 commit 触 `tests/abstraction_fuzz.rs`：
 - carve-out 政策：[实现] 角色越界由 issue §出口预先批注 + commit 显式追认（与 stage-1 §B-rev1 §3 / stage-2 §C-rev1 §3 同形态）；trade-off carve-out 推迟到下一步骤实跑由 commit 闭合（§D-rev0 §4 → §D-rev1 §3）。
 
 下一步：E1 [测试]（按 `pluribus_stage2_workflow.md` §E1 §输出 落地 stage-2 性能 SLO 断言：抽象映射 ≥ 100k mapping/s 单线程 / bucket lookup P95 ≤ 10 μs / equity Monte Carlo ≥ 1k hand/s @ 10k iter；同 PR 追加 `benches/baseline.rs` 第 3 个 `abstraction/bucket_lookup` group，§D-rev0 §2 carve-out 预先批注的 E1 范畴）。预期 E1 阶段 SLO 断言为 "待达成" 状态，由 E2 [实现] 优化达成。预算 0.5 人周。
+
+#### E1 batch 1（2026-05-10）— E-rev0：3 条 stage2_* SLO 阈值断言 + abstraction/bucket_lookup bench group 落地
+
+E1 [测试] 第一笔 commit 落地 §E1 §输出 全部交付物：(1) `tests/perf_slo.rs::stage2_*` 3 条 release-only `#[ignore]` SLO 阈值断言（D-280 / D-281 / D-282）；(2) `benches/baseline.rs` 第 3 个 abstraction bench group `abstraction/bucket_lookup`（D-281 mmap 命中路径 `(street, board, hole) → bucket_id`）；(3) `criterion_group!` 顶级注册新 bench group，CI bench-quick + nightly bench-full 自动 pick up（与 stage-1 §E-rev0 § 出口同形态，yml 0 改动）。本 batch carry forward 阶段 1 §修订历史 + 阶段 2 §A-rev0..§D-rev1 全部处理政策（不重新论证）。
+
+##### §E-rev0 §1：3 条 stage2_* SLO 阈值断言落地（`tests/perf_slo.rs`）
+
+按 §E1 §输出 line 426-429 字面 + `pluribus_stage2_validation.md` §8 SLO 汇总 / `pluribus_stage2_decisions.md` D-280 / D-281 / D-282 落地 3 条 release-only `#[ignore]` 断言：
+
+- **`stage2_abstraction_mapping_throughput_at_least_100k_per_second`（D-280）**：测量 `(GameState, hole) → InfoSetId` 全路径单线程吞吐——preflop 路径走 `PreflopLossless169::map`（D-217 closed-form `hand_class_169`）。500_000 mapping × 200 hole 输入循环避免分支预测过拟合单点；`InfoSetId::raw()` 累加防 DCE。
+- **`stage2_bucket_lookup_p95_latency_at_most_10us`（D-281）**：测量 `(street, board, hole) → bucket_id` 单次查表延迟分布——`canonical_observation_id`（sort + first-appearance suit remap + FNV-1a，dominant 成本）+ `BucketTable::lookup`（`bytes[off + id*4..]` u32 LE 读取）。每条街 5_000 sample × 3 街 = 15_000 latencies；P95 索引 14_249，`Instant::now()` ~20 ns clock_gettime 开销 ≪ 10 μs 门槛可直接计入。fixture 走 `BucketTable::train_in_memory(BucketConfig { 100, 100, 100 }, 0xC2_FA22_BD75_710E, evaluator, 200)`，与 `tests/bucket_quality.rs::cached_trained_table` 同型（~70 s release setup，独立 OnceLock 不跨 crate 共享）。
+- **`stage2_equity_monte_carlo_throughput_at_least_1k_hand_per_second`（D-282）**：测量 `MonteCarloEquity::equity(hole, board, rng)` 默认 10_000 iter 单线程吞吐。100 手 flop 街随机 (board, hole)；理论上 ~1k hand/s 刚好 SLO 边界，B2 朴素 deck 拷贝 + RNG 抽样开销可能掉到 200–500 hand/s。
+
+3 条断言全部 `#[ignore = "stage2 perf SLO"]`，与 stage-1 5 条 SLO 同形态：release-only opt-in via `cargo test --release --test perf_slo -- --ignored`，CI 默认套件不破红。`#[ignore]` 三条理由（debug profile 数字无意义 / E1 closure 期望失败 / 吞吐机器依赖 2-3×）继承 `tests/perf_slo.rs` 顶 doc-comment 既有声明（stage-2 SLO 同 doc-comment 覆盖，无需重复声明）。
+
+##### §E-rev0 §2：第 3 个 abstraction bench group `abstraction/bucket_lookup` 落地（`benches/baseline.rs`）
+
+按 §E1 §输出 line 424 字面 + §D-rev0 §2 carve-out 预先批注 "属 §E1 §输出 line 424 字面 [测试] 范畴" 在 `benches/baseline.rs` 追加第 3 个 abstraction bench group：
+
+- **bench harness**：`bench_abstraction_bucket_lookup(c: &mut Criterion)`，3 个 bench function（按街分流：`flop` / `turn` / `river`）。每个 bench function 在 `b.iter` 之外预生成 200 组随机 (board, hole) 输入并循环复用，避免 closure 内 RNG / sort 开销污染 lookup 路径本身的延迟测量。
+- **fixture**：`BucketTable::train_in_memory(BucketConfig { 10, 10, 10 }, 0xE1BC_1007_5101, evaluator, 50)` —— 与 `fuzz/fuzz_targets/abstraction_smoke.rs` 进程内 OnceLock 缓存 fixture 同型（~5 s release setup），bench-quick CI 30s 总预算可承受。bucket 数量小不影响 lookup body cache 行为（lookup 仅读 4 字节 / 路径长度与 bucket 数量正交）。
+- **顶级注册**：`criterion_group!(baseline, ..., bench_abstraction_bucket_lookup)` —— 与既有 5 个 stage-1 bench + 2 个 stage-2 abstraction bench 同列；CI bench-quick + nightly bench-full job 通过 `criterion_group!` 自动 pick up 新增 group，`.github/workflows/{ci,nightly}.yml` **0 改动**（继承 stage-1 §E-rev0 同形态：bench harness 扩展不触 yml）。
+- **共享 helper**：`sample_postflop_input(rng, board_len)` —— 抽取 `board_len + 2` 张不重复的 Card 拆成 (board\[0..5\], hole\[2\])。bench 与 SLO 测试两条路径各持一份（`benches/baseline.rs` / `tests/perf_slo.rs` 私有 fn），算法形态严格一致保证输入分布一致；不上 lib re-export（test-only helper 不属公开 API）。
+
+##### §E-rev0 §3：bench 实跑出口数据（commit 落地实测）
+
+`cargo bench --bench baseline -- --warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot`（quick CI 路径模拟，1-CPU release）：
+
+| bench | thrpt 中位 | latency 中位 | SLO 对照 |
+|---|---|---|---|
+| `abstraction/bucket_lookup/flop` | 21.7 M elem/s | 46.0 ns | P95 ≤ 10 μs：~217× under |
+| `abstraction/bucket_lookup/turn` | 18.8 M elem/s | 53.2 ns | P95 ≤ 10 μs：~188× under |
+| `abstraction/bucket_lookup/river` | 17.7 M elem/s | 56.5 ns | P95 ≤ 10 μs：~177× under |
+| `abstraction/equity_monte_carlo/flop_1k_iter` | 4.18 K elem/s | 239 μs | （CI quick 短路径，无 SLO 直接对照）|
+| `abstraction/equity_monte_carlo/flop_10k_iter` | 433.92 elem/s | 2.30 ms | ≥ 1 K hand/s：~2× short（**FAIL 与 SLO 一致**） |
+
+bench setup（bucket_lookup 走 10/10/10 + 50 iter `train_in_memory` ~5 s + equity_monte_carlo bench fixture 0 setup）+ 6 bench function quick 模式总耗时 < 30 s，符合 §E1 «短 benchmark CI 集成（30 秒内）» 字面。`abstraction/equity_monte_carlo/flop_10k_iter` 与 `tests/perf_slo.rs::stage2_equity_monte_carlo_throughput_at_least_1k_hand_per_second` 的 SLO 状态一致：bench 433.92 elem/s × ~10k iter × 评估代价单调缩放 ≈ SLO 502.8 hand/s（差异由 bench 单点 hand fixture vs SLO 100 手随机输入分布造成）。`flop_1k_iter` 既有 B1 落地（CI 短测试模式，4.18 K elem/s vs 1k hand 单位换算 ≈ 4 K/10K = 0.4 K hand/s 与 10k_iter 数据自洽）。
+
+##### §E-rev0 §4：SLO assertion 实跑出口数据
+
+`cargo test --release --test perf_slo -- --ignored --nocapture stage2_`（3 测试，1-CPU release host，~140 s 总壁钟，含 100/100/100 + 200 iter `train_in_memory` fixture ~70 s setup）：
+
+| stage2 SLO | 实测 | 门槛 | 倍率 / 状态 |
+|---|---|---|---|
+| `stage2_abstraction_mapping_throughput_at_least_100k_per_second` | 16 465 157 mapping/s（500 000 mapping / 0.030 s） | ≥ 100 000 mapping/s | **PASS**（164× over）|
+| `stage2_bucket_lookup_p95_latency_at_most_10us` | P50 = 97 ns / **P95 = 188 ns** / P99 = 250 ns（15 000 sample = 5 000/街 × 3 街） | P95 ≤ 10 000 ns（10 μs） | **PASS**（~53× under at P95）|
+| `stage2_equity_monte_carlo_throughput_at_least_1k_hand_per_second` | 502.8 hand/s @ 10k iter（100 hand / 0.199 s，平均 equity = 0.4614） | ≥ 1 000 hand/s | **FAIL**（~50% short，E2 必须修） |
+
+聚合：**2 pass + 1 fail**。`§E1 §出口标准` 字面要求 «所有 SLO 断言为待达成状态 / benchmark 能跑出当前数据但断言失败» — 实际口径与 stage-1 §E-rev0 «3 pass + 2 fail» 实测形态一致：part of SLO 在朴素实现下提前达标（D-280 `PreflopLossless169::map` D-217 closed-form 已 16M+ mapping/s，远超 100k 门槛；D-281 bucket lookup dominant 成本是 FNV-1a hash + sort ~50-200 ns，远低于 10 μs），part 期望失败留 E2（D-282 equity MC 朴素路径每 hand ~2 ms 远高于 1 ms / hand 边界，E2 多线程 + SIMD 优化必须收回）。SLO 字面要求 «所有断言为待达成» 是 E1 的"必要"出口而非"预期失败"硬约束。
+
+**post-batch SLO 状态汇总**（与 stage-1 同形态）：
+
+\- D-280 抽象映射：**已达标**，E2 不需 preflop 169 `[u8; 1326]` 直接表（workflow §E2 line 451 改为可选优化）。
+\- D-281 bucket lookup：**已达标**，E2 不需 hot path 内存布局重排（workflow §E2 line 449 改为可选优化）；性能余量 ~53× 给后续 stage 6c 多 lookup 表 / 巨大 bucket count 留空间。
+\- D-282 equity Monte Carlo：**未达标**，E2 必须落地多线程 + SIMD 优化（workflow §E2 line 450 必须项）；fail 缓冲 ~2× 与 stage-1 E2 同型（朴素 → bitmask 5–24× 加速达标）。
+
+##### §E-rev0 §5：carve-out — 多核 host 预留（继承 stage-1 §E-rev0）
+
+`tests/perf_slo.rs::stage2_*` 3 条断言**均为单线程**测量（D-280 字面 «单线程 ≥ 100,000 mapping/s» / D-281 字面 «P95 ≤ 10 μs 单次查表» / D-282 字面 «单线程 ≥ 1,000 hand/s»）。stage-2 不引入多线程效率断言（如 `slo_eval7_multithread_linear_scaling_to_8_cores` 类）。后续 stage 6c 实时搜索若引入多线程效率断言，按 stage-1 §E-rev0 carve-out «multi-thread / GPU / cross-arch 一类 host-依赖的 SLO 用 skip-with-log 路径而不是硬 fail» 同形态处理。
+
+stage-1 多线程 SLO carve-out 在 stage-2 路径下**未触发新规则**——stage-2 SLO 断言均单线程，`available_parallelism()` 不影响判定路径。
+
+##### §E-rev0 §6：[测试] 越界审计（无）
+
+本步骤未触 `src/` 任何文件；`benches/baseline.rs` 与 `tests/perf_slo.rs` 均属 [测试] 范畴；`docs/pluribus_stage2_workflow.md` / `CLAUDE.md` 属基础设施 + 文档同步，与 [实现] 角色无关。E-rev0 不需要追认任何越界（与 stage-1 §E-rev0 / §C-rev1 同型 «常规闭合 + 0 越界»）。
+
+\- **修改产品代码**：**0 行**（[测试] 角色严守边界）。
+\- **修改测试代码**：`tests/perf_slo.rs`（追加 3 条 stage2_* SLO 断言 + 共享 `sample_postflop_input` helper + import 追加 `BucketConfig / BucketTable / canonical_observation_id / EquityCalculator / InfoAbstraction / MonteCarloEquity / PreflopLossless169 / StreetTag`）/ `benches/baseline.rs`（追加 `bench_abstraction_bucket_lookup` group + `sample_postflop_input` helper + `criterion_group!` 注册扩 1 项 + 既有 `equity_monte_carlo` group 内追加 `flop_10k_iter` bench function 与 D-282 SLO 口径对齐）。
+\- **修改文档**：`docs/pluribus_stage2_workflow.md` §E-rev0 batch 1 carve-out（本子节）+ `CLAUDE.md` Stage 2 progress 完整翻面（D2 closed 段保留 + 新增 E1 closed 段 + 测试基线翻面 + 下一步 E2 [实现]）。
+\- **未修改**：`src/` 全部 / `Cargo.toml` / `Cargo.lock` / `proto/` / `tools/` / `fuzz/` / `.github/workflows/` 全部 / `tests/` 其余（仅触 `tests/perf_slo.rs`）。
+
+##### §E-rev0 §7 batch 1 出口数据（commit 落地实测）
+
+- `cargo fmt --all --check`：全绿。
+- `cargo build --all-targets`：全绿。
+- `cargo clippy --all-targets -- -D warnings`：全绿（首次实现 `0xE1_AB_5101` / `0xE1_BC_2002` / `0xE1_E0_3003` / `0xE1_BC_1007_5101` 4 个 hex 字面触 `clippy::unusual_byte_groupings`，已统一为 `0xXXXX_XXXX` / `0xXXXX_XXXX_XXXX` 4-/8-/12-digit 等长分组）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。
+- `cargo test --release --no-fail-fast`：**197 passed / 42 ignored / 0 failed across 27 test crates**（vs §D-rev1 batch 1 baseline 197 / 39 / 0 → 0 active +3 ignored，由 3 条新增 stage2_* SLO 断言全部 `#[ignore]` 引入；3 条新增 SLO 全部落在 stage-1 文件 `tests/perf_slo.rs`，按文件归属算入 stage-1 16 crates 一栏）。
+    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`（与 `stage1-v1.0` tag byte-equal，D-272 不退化要求满足）。
+    - **stage-2 11 crates 数字不变** `93 passed / 20 ignored / 0 failed`（vs §D-rev1 batch 1 93/20/0；新增 3 条 stage2_* SLO 落在 stage-1 文件 `tests/perf_slo.rs`，所以 stage-2 11 crates 数字不变；perf_slo 单 crate 由 stage-1 `0 active + 5 ignored` → 总计 `0 active + 8 ignored`）。
+    - lib unit tests 8 active 不变（E1 0 改动 `src/`）。
+    - 实测耗时 release：与 §D-rev1 batch 1 持平 ~7 min（perf_slo 默认套件不跑 `#[ignore]`，0 增量；bucket_quality / clustering_determinism / abstraction_fuzz / 其它 crate 数字不变）。
+- `cargo test --release --test perf_slo -- --ignored --nocapture stage2_`：**2 passed / 1 failed**（结果见 §E-rev0 §4 表；总壁钟 139.88 s 含 fixture setup ~70 s）。
+- `cargo bench --bench baseline -- --warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot abstraction/bucket_lookup`：**3 bench function 全过**（实测数据见 §E-rev0 §3）。
+- `tests/api_signatures.rs` trip-wire byte-equal **不变**（本 batch 0 触 `src/` / 公开 API；stage 2 公开 API **0 签名漂移**）。
+
+##### §E-rev0 §8 carry forward 处理政策（与 §A-rev0..§D-rev1 一致，不重新论证）
+
+- 阶段 1 §B-rev1 §3 / §C-rev1 / §D-rev0 / §E-rev0 / §F-rev0 / §F-rev1 既往政策保持继承不变。stage-1 §E-rev0 处理政策 4 条 «SLO 断言切分 / 阈值直接来自 validation §8 / bench harness 与 SLO 拆文件 / host-依赖 SLO 用 skip-with-log» 在 stage-2 路径下同形态适用，不重新论证。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 `CLAUDE.md` Stage 2 progress 完整翻面（E1 closed 段新增 + 测试基线翻面 + 下一步 E2 [实现]）。
+- carve-out 政策：本 batch 0 越界（[测试] 单边路径），无 carve-out 触发。
+
+下一步：E2 [实现]（按 `pluribus_stage2_workflow.md` §E2 §输出 落地性能优化让 §E-rev0 §4 中失败的 SLO 断言全部转绿，且**不破坏正确性测试**——B / C / D 全套测试仍然全绿。预期改动：preflop 169 mapping `[u8; 1326]` 直接表 / bucket lookup hot path 内存布局优化 / equity Monte Carlo 多线程 + SIMD 优化。预算 1.5–2 人周）。
