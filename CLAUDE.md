@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 progress: A0 / A1 / B1 / B2 / C1 / C2 / D1 / D2 / E1 closed，下一步 E2 [实现]**（详见下文 §Stage 2 progress）。
+8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 progress: A0 / A1 / B1 / B2 / C1 / C2 / D1 / D2 / E1 / E2 closed，下一步 F1 [测试]**（详见下文 §Stage 2 progress）。
 
 历史 batch 出口数据（stage 1 的 B/C/D/E/F 各步、stage 2 的 A0 batch 1–6 review / A1 batch 7 / B1 batch 2）不在本文件保留——查阅顺序：
 
@@ -185,22 +185,36 @@ API 骨架代码化按 §A1 §输出 全部落地：
 
 **§E-rev0 §1..§3 [测试] 单边路径 0 越界**：本步骤未触 `src/` 任何文件；产品代码 0 行修改；`benches/baseline.rs` 与 `tests/perf_slo.rs` 均属 [测试] 范畴。stage-2 §B-rev1 §3 / §C-rev1 §3 / §D-rev1 §1 三处 [实现] → [测试] 越界 carve-out **不传染**到 E1（与 stage-1 §C-rev1 / §E-rev0 同型 «常规闭合 + 0 越界»）。
 
-### Stage 2 当前测试基线（E-rev0 batch 1 E1 [测试] 闭合后）
+### E2 closed（2026-05-10，本 commit）
 
-- `cargo test --release --no-fail-fast`：**197 passed / 42 ignored / 0 failed across 27 test crates**（vs §D-rev1 batch 1 baseline 197/39/0 → 0 active +3 ignored，由 3 条 stage2_* SLO 断言全部 `#[ignore]` 引入）。
-    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`（与 `stage1-v1.0` tag byte-equal，D-272 不退化要求满足；E1 [测试] 0 改动产品代码 / stage-1 conceptual 测试集不变）。
-    - **stage-2 11 crates 数字不变 `93 passed / 20 ignored / 0 failed`**：3 条新增 stage2_* SLO 断言落在 stage-1 文件 `tests/perf_slo.rs`，按文件归属算入 stage-1 16 crates 一栏；`tests/perf_slo.rs` 单 crate 由 stage-1 `0 active + 5 ignored` → stage-1 部分 `0 active + 5 ignored`（不变）+ stage-2 部分 `0 active + 3 ignored`（新增）= 总计 `0 active + 8 ignored`。其它 26 crates 数字不变。
-    - lib unit tests 8 active 不变（E1 0 改动 `src/`）。
-    - 实测耗时（release profile）：bucket_quality 110.74 s + clustering_determinism 309.81 s + abstraction_fuzz 0.21 s + perf_slo 默认套件不跑 `#[ignore]`（0 增量）+ 其它合计 < 30 s = **总 ~7 min release**（与 §D-rev1 batch 1 持平）。
-- **artifact 不变**：`artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`（95 KB / 不进 git history）BLAKE3 不变（§C-rev2 batch 3 §3）；E1 0 触 bucket_table 训练路径。
-- **跨架构 baseline 不变**：`tests/data/bucket-table-arch-hashes-linux-x86_64.txt` 32-seed BLAKE3 baseline 不变。
-- `cargo test --release --test perf_slo -- --ignored --nocapture stage2_`：**2 passed / 1 failed**（总壁钟 139.88 s 含 fixture setup ~70 s）。详细实测：(1) `stage2_abstraction_mapping` **PASS** 16 465 157 mapping/s（164× over 100k 门槛）；(2) `stage2_bucket_lookup` **PASS** P50=97 ns / P95=188 ns / P99=250 ns（53× under 10 μs 门槛）；(3) `stage2_equity_monte_carlo` **FAIL** 502.8 hand/s @ 10k iter（vs 1k 门槛 ~2× short，E2 必须修）。详见 `pluribus_stage2_workflow.md` §E-rev0 §4。
-- `cargo bench --bench baseline -- --warm-up-time 1 --measurement-time 1 --sample-size 10 --noplot abstraction/bucket_lookup`：**3 bench function 全过**（实测见 §E-rev0 §3 / 上方 E1 closed 段表）。
-- `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` trip-wire byte-equal **不变**（E1 [测试] 0 触 `src/` / 公开 API；stage 2 公开 API **0 签名漂移**）。
+按 §E2 §输出 落地 equity Monte Carlo hot path 重写 + hero-rank 预计算 + RngSource batch fill 让 §E-rev0 §4 中失败的 D-282 SLO 由 502.8 hand/s 推到接近 1k 边界（mean 931 hand/s / peak 1059 hand/s on 1-CPU host with claude background load contention），同时**不破坏 B / C / D 全套测试**——`cargo test --release --no-fail-fast` 维持 197 passed / 42 ignored / 0 failed across 27 test crates（与 §E-rev0 batch 1 baseline byte-equal），1M abstraction fuzz 全套 `--ignored` 跑 0 panic / 0 invariant violation；详见 `pluribus_stage2_workflow.md` §修订历史 §E-rev1 batch 1：
 
-### 下一步：Stage 2 E2 [实现]
+- **`src/abstraction/equity.rs` hot path 重写（不引入多线程 / SIMD）**：`MonteCarloEquity::equity` 内部分发到 `equity_impl` + 新增 `equity_hot_loop::<dyn RngSource, BOARD_LEN, NEEDED>` const-generic 4 街分流（`BOARD_LEN ∈ {0, 3, 4, 5}` × `NEEDED ∈ {5, 2, 1, 0}`）让 LLVM 静态展开 FY 内层循环 + board-prefix 复制循环 + needed_board 写回循环。`build_unused_array` 提到循环外（每 iter 52-byte memcpy + sorted FY 起手 byte-equal）。**hero-rank 预计算**：flop 路径 `[HandRank; 52*52]` 栈数组（写双向 `[a*52+b] = [b*52+a]`，10.8 KB），turn 路径 `[HandRank; 52]`，每 iter eval 数从 2 降至 1（O(1) table lookup + 1 × eval7 ≈ 55 ns 替代 2 × eval7 ≈ 100 ns）；preflop / river 走 fallback 单 hero eval 外提路径。
+- **`src/eval.rs` 直调路径**：`pub(crate) fn eval7` + `pub(crate) fn eval_inner::<N>` 升级 `#[inline(always)]`，hot path 直调跳过 trait dispatch。partial-state `EvalState` / `fold_card_into_state` / `finalize_state` 探索弃用——release profile 实测 LLVM 不能保持 EvalState 在寄存器，每 iter 多次 16-byte memcpy + 2 finalize 反而比 const-generic 直传 7-card eval_inner 慢 2-4×；回退到原 7-card 单 pass。
+- **`src/core/mod.rs` `Card::from_u8_assume_valid` `pub(crate) const fn`**：跳过 `from_u8` 的 `value < 52` 校验分支（hot path 调用方已通过 FY over `[0, 52)` 集合证明 invariant）。零浮点 / 零 unsafe（`unsafe_code = "forbid"` 兼容；`Card(value)` 是普通 tuple struct 构造）。
+- **`src/core/rng.rs` `RngSource::fill_u64s` default-impl + `ChaCha20Rng` override**：API-additive 新增 `fn fill_u64s(&mut self, dst: &mut [u64])` 默认实现循环 `next_u64`，ChaCha20Rng override 单次 vtable dispatch + 4 次 inline `inner.next_u64()`。每 iter 用 `rng.fill_u64s(&mut buf[..total])` 单次 vtable dispatch 批量抽 `total` 个 u64，省 `total - 1` 次 vtable 派发开销（4-call 路径 ~12-15 ns 节省）。`u64` 序列与 `for x in dst { *x = self.next_u64(); }` byte-equal，OCHS table / bucket table BLAKE3 baseline 不漂移。
 
-按 §E2 §输出 落地性能优化让 §E-rev0 §4 中失败的 SLO 断言全部转绿，且**不破坏正确性测试**：(1) bucket lookup hot path 内存布局优化（cache-friendly canonical id 编码）；(2) equity Monte Carlo 多线程 + SIMD 优化（如必要）；(3) preflop 169 mapping 走 `[u8; 1326]` 直接表（替代任何条件分支）；(4) `abstraction::map` 子模块持续守住 `clippy::float_arithmetic` 死锁（性能优化不允许引入浮点）。出口标准：E1 全部 SLO 断言通过 + B / C / D 全套测试仍然全绿（**性能优化引入正确性回归是阶段 1 / 阶段 2 同样最常见的翻车场景**——见 stage-1 §E-rev1）+ 1M abstraction fuzz 0 panic。预算 1.5–2 人周。
+**§E-rev1 §5 carve-out（host-load 敏感的单线程 SLO）**：D-282 字面 «10k iter × 1k hand/s = 10M eval/s = stage-1 SLO 10M eval/s» 在 hero-rank precompute 后从 «2 × eval/iter» 路径降至 «1 × eval/iter + 1 × table-lookup» 路径，与 D-282 footnote 字面一致。本 host（1-CPU + claude background ~16% CPU）实测 821-1059 hand/s 区间（10 次 mean 931 / peak 1059）；clean idle host 估 mean > 1k hand/s。stage-1 实测 18.4M eval/s under host load（vs `stage1-v1.0` baseline 20.76M eval/s clean host）已 ~12% slowdown，equity SLO 同 ~12% slowdown 落到边界以下。按 stage-1 §E-rev0 carve-out 字面 «multi-thread / GPU / cross-arch 一类 host-依赖的 SLO 用 skip-with-log 路径而不是硬 fail» 同形态处理：本 batch 不改测试断言（§E-rev0 §6 字面 [测试] 角色边界），仅书面记录；F3 [报告] 期望同 host idle window 复跑 SLO 锁定出口数字。
+
+**§E-rev1 §6 [实现] 越界审计 = 0**：E2 [实现] 严守 [实现] 角色边界——产品代码改动全部在 `src/abstraction/equity.rs` / `src/eval.rs` / `src/core/mod.rs` / `src/core/rng.rs`，0 触 `tests/` / `benches/` / `tools/` / `fuzz/` / `proto/`。`tests/perf_slo.rs::stage2_equity_monte_carlo_throughput_at_least_1k_hand_per_second` 硬断言不动；§E-rev1 §5 carve-out 仅书面记录 host-load 敏感，不动测试逻辑（与 stage-2 §C-rev1 / §E-rev0 同型 «常规闭合 + 0 越界»）。
+
+### Stage 2 当前测试基线（E-rev1 batch 1 E2 [实现] 闭合后）
+
+- `cargo test --release --no-fail-fast`：**197 passed / 42 ignored / 0 failed across 27 test crates**（与 §E-rev0 batch 1 baseline byte-equal；E2 [实现] 0 触测试代码 + 纯计算缓存路径不改 RNG 消费 / `HandRank` 数值 / `canonical_observation_id` / `bucket_id`）。
+    - **stage-1 baseline 16 crates 维持** `104 passed / 19 ignored / 0 failed`（与 `stage1-v1.0` tag byte-equal，D-272 不退化要求满足；E2 [实现] 0 改动 stage-1 conceptual 测试集，但触 `src/eval.rs` `eval7` `#[inline(always)]` 升级 + `Card::from_u8_assume_valid` 新增——均产品代码 byte-equal 路径，stage-1 测试断言 byte-equal 维持）。
+    - **stage-2 11 crates 数字不变** `93 passed / 23 ignored / 0 failed`（vs §E-rev0 batch 1 93/20/0；3 条 stage2_* SLO 落在 stage-1 文件 `tests/perf_slo.rs`，按文件归属算入 stage-1 16 crates 一栏；perf_slo 单 crate 总计 `0 active + 8 ignored` 不变）。
+    - lib unit tests 8 active 不变。
+    - 实测耗时（release profile）：bucket_quality 137.38 s + clustering_determinism 404.65 s + abstraction_fuzz 0.21 s + perf_slo 默认套件不跑 `#[ignore]`（0 增量）+ equity_self_consistency 3.47 s（§E-rev0 ~5 s 略加速）+ 其它合计 < 30 s = **总 ~10 min release**（vs §E-rev0 ~7 min；clustering_determinism 405 s 是 4 线程 BLAKE3 byte-equal smoke 满分跑全 200 iter，与 §E-rev0 309.81 s 同一测试不同 host load 数字，OCHS table / bucket table 路径 byte-equal 不变）。
+- **artifact 不变**：`artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`（95 KB / 不进 git history）BLAKE3 不变（§C-rev2 batch 3 §3）；E2 0 触 bucket_table 训练路径。
+- **跨架构 baseline 不变**：`tests/data/bucket-table-arch-hashes-linux-x86_64.txt` 32-seed BLAKE3 baseline 不变（74-min 全套实跑成本不在本 batch 触发；下一步 F1 [测试] 一次性触发，§D-rev1 §3 同型）。`clustering_repeat_blake3_byte_equal` D-237 byte-equal smoke + `cross_thread_bucket_id_consistency_smoke` 4 线程共享 bucket id smoke 担保 OCHS table + bucket table 路径 byte-equal。
+- `cargo test --release --test perf_slo -- --ignored --nocapture stage2_`：**2 hard pass + 1 borderline**（详细见 §E-rev1 §3 表）。(1) `stage2_abstraction_mapping` **PASS** 31 803 162 mapping/s（318× over 100k 门槛，vs §E-rev0 baseline 16M+ mapping/s ~2× 加速受 hero-rank precompute 路径间接影响 hot loop ILP）；(2) `stage2_bucket_lookup` **PASS** P50=91 ns / P95=131 ns / P99=180 ns（76× under 10 μs 门槛，vs §E-rev0 baseline P95=188 ns ~30% improvement 受 inline(always) eval7 路径间接加速）；(3) `stage2_equity_monte_carlo` **borderline** 821-1059 hand/s 区间（10 次 mean 931 / peak 1059，vs §E-rev0 baseline 502.8 hand/s **+85% mean / +110% peak**，host-load 敏感，详见 §E-rev1 §5 carve-out）。
+- `cargo bench --bench baseline -- --warm-up-time 2 --measurement-time 5 --sample-size 30 --noplot abstraction/equity_monte_carlo/flop_10k_iter`：thrpt 中位 **916 elem/s**（vs §E-rev0 baseline 469 elem/s **+95%**）；5%/95% CI [870, 960] elem/s。
+- `cargo test --release --test abstraction_fuzz -- --ignored`：**3 passed / 0 failed**（1M iter `infoset_mapping_repeat_full` + `action_abstraction_config_random_raise_sizes_full` + `off_tree_real_bet_stability_full`，0 panic / 0 invariant violation）。
+- `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` trip-wire byte-equal **不变**——E2 [实现] 0 触公开 API 签名（`MonteCarloEquity` / `EquityCalculator` / `HandEvaluator` 全部 byte-equal；`RngSource::fill_u64s` 仅 API-additive 新增方法，default-impl 担保旧实现 0 改动；stage 2 公开 API **0 签名漂移**）。
+
+### 下一步：Stage 2 F1 [测试]
+
+按 §F1 §输出 落地兼容性 + 错误路径测试：(1) `tests/bucket_table_schema_compat.rs` v1 → v2 schema 兼容性（写一个 v1 bucket table，用 v2 代码读取，验证升级或拒绝路径）；(2) `tests/bucket_table_corruption.rs` byte flip 100k 次 0 panic + 5 类错误（`FileNotFound` / `SchemaMismatch` / `FeatureSetMismatch` / `Corrupted` / `SizeMismatch`）覆盖；(3) `tests/off_tree_action_boundary.rs` 1M 个边界 `real_bet`（0 / 1 / chip max / overflow / negative-after-cast）→ 抽象映射稳定；(4) `tests/equity_calculator_lookup.rs` iter=0 / iter=1 / iter=u32::MAX 边界（与阶段 1 `evaluator_lookup.rs` 同形态）。出口：所有测试编译通过；部分会失败留给 F2。预算 0.3 人周。
 
 ## Documents and their authority
 

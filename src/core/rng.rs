@@ -15,6 +15,19 @@ use rand_chacha::ChaCha20Rng as RandChaCha20Rng;
 /// 实现方必须满足 `Send`。`Sync` 不强制（每线程持有独占 rng）。
 pub trait RngSource: Send {
     fn next_u64(&mut self) -> u64;
+
+    /// 批量抽样 N 个 u64 到 `dst` —— `next_u64` 的 default-impl 顺序循环；
+    /// `ChaCha20Rng` 等具体实现可 override 走单次 vtable dispatch + N 次内联
+    /// 调用，减少 `&mut dyn RngSource` hot path（如 `abstraction::equity` Monte
+    /// Carlo Fisher-Yates）的每 iter 多次 vtable 派发开销。`u64` 序列与
+    /// `for x in dst { *x = self.next_u64(); }` byte-equal（D-051 / D-228 / OCHS
+    /// table BLAKE3 baseline 不漂移）。E2 §E-rev1 引入。
+    #[inline]
+    fn fill_u64s(&mut self, dst: &mut [u64]) {
+        for x in dst.iter_mut() {
+            *x = self.next_u64();
+        }
+    }
 }
 
 /// 标准实现：基于 ChaCha20，seed-determined。
@@ -37,8 +50,18 @@ impl ChaCha20Rng {
 }
 
 impl RngSource for ChaCha20Rng {
+    #[inline]
     fn next_u64(&mut self) -> u64 {
         self.inner.next_u64()
+    }
+
+    /// E2 §E-rev1：override 让 hot path 单次 vtable dispatch 后内联 N 次
+    /// `inner.next_u64()`。byte-equal 于 default impl（仅省 vtable 重复开销）。
+    #[inline]
+    fn fill_u64s(&mut self, dst: &mut [u64]) {
+        for x in dst.iter_mut() {
+            *x = self.inner.next_u64();
+        }
     }
 }
 

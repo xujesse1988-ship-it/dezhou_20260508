@@ -103,6 +103,16 @@ impl Card {
     pub fn from_u8(value: u8) -> Option<Card> {
         (value < 52).then_some(Card(value))
     }
+
+    /// 跳过 `value < 52` 校验的 crate-内构造。仅用于 hot path（equity Monte Carlo
+    /// FY 抽样、bucket lookup canonical id 编码）——调用方已通过 Fisher-Yates over
+    /// `[0, 52)` 集合证明 `value < 52`。零浮点 / 零 unsafe（D-026 / `unsafe_code =
+    /// "forbid"` 兼容；`Card(value)` 是普通 tuple struct 构造，invariant 由调用
+    /// 上下文担保而非 unsafe 标注）。E2 落地（§E-rev1）。
+    #[inline(always)]
+    pub(crate) const fn from_u8_assume_valid(value: u8) -> Card {
+        Card(value)
+    }
 }
 
 // ============================================================================

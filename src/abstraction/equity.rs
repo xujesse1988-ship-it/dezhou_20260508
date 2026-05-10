@@ -152,10 +152,14 @@ impl MonteCarloEquity {
     pub fn n_opp_clusters(&self) -> u8 {
         self.n_opp_clusters
     }
-}
 
-impl EquityCalculator for MonteCarloEquity {
-    fn equity(
+    /// E2 hot-path 内部分发（§E-rev1）：保留 trait `equity` 接收 `&mut dyn
+    /// RngSource` 不变；这里把 rng 透传给 const-generic 分流到具体街的
+    /// `equity_hot_loop`。RngSource 作为 `?Sized` 泛型参数让 LLVM 在 dyn
+    /// dispatch 路径下仍能 inline trait 方法（同 D-280 abstraction mapping
+    /// 路径）。
+    #[inline(always)]
+    fn equity_impl(
         &self,
         hole: [Card; 2],
         board: &[Card],
@@ -165,16 +169,45 @@ impl EquityCalculator for MonteCarloEquity {
         if self.iter == 0 {
             return Err(EquityError::IterTooLow { got: 0 });
         }
+        // E2 hot-path（§E-rev1）：把 `build_unused_array` / `build_seven_cards` /
+        // `Card::from_u8` 的运行时分摊提到循环外，仅在每 iter 内做 1 次 52-byte
+        // memcpy + (2+needed_board) 次 RNG draw + FY swap + 1 次 eval7（hero rank
+        // 走 precompute 表）。RNG 消费序列与原 `sample_opp_and_board` /
+        // `build_seven_cards` byte-equal，保证 OCHS table / bucket table BLAKE3
+        // baseline 不漂移（`tests/data/bucket-table-arch-hashes-linux-x86_64.txt`
+        // 32-seed × 3 街 byte-equal 是 D-051 / D-237 不变量）。
+        //
+        // const-generic 分流让 LLVM 静态展开 FY 内层循环 + board-prefix 复制循环
+        // （4 街总计 4 个分流 = `BOARD_LEN ∈ {0, 3, 4, 5}` × `NEEDED ∈ {5, 2, 1, 0}`）。
         let used = build_used_set(&hole, &[], board)?;
-        let needed_board = 5 - board.len();
-        let mut wins_x2: u64 = 0;
-        for _ in 0..self.iter {
-            let (opp_hole, full_board) = sample_opp_and_board(&used, board, needed_board, rng);
-            let me = build_seven_cards(hole, &full_board);
-            let opp = build_seven_cards(opp_hole, &full_board);
-            wins_x2 += compare_x2(self.evaluator.eval7(&me), self.evaluator.eval7(&opp));
-        }
+        let evaluator = &*self.evaluator;
+        let wins_x2 = match board.len() {
+            0 => equity_hot_loop::<dyn RngSource, 0, 5>(
+                &used, hole, board, self.iter, rng, evaluator,
+            ),
+            3 => equity_hot_loop::<dyn RngSource, 3, 2>(
+                &used, hole, board, self.iter, rng, evaluator,
+            ),
+            4 => equity_hot_loop::<dyn RngSource, 4, 1>(
+                &used, hole, board, self.iter, rng, evaluator,
+            ),
+            5 => equity_hot_loop::<dyn RngSource, 5, 0>(
+                &used, hole, board, self.iter, rng, evaluator,
+            ),
+            _ => unreachable!("validate_board_len rejects other lengths"),
+        };
         Ok(wins_x2 as f64 / (2.0 * self.iter as f64))
+    }
+}
+
+impl EquityCalculator for MonteCarloEquity {
+    fn equity(
+        &self,
+        hole: [Card; 2],
+        board: &[Card],
+        rng: &mut dyn RngSource,
+    ) -> Result<f64, EquityError> {
+        self.equity_impl(hole, board, rng)
     }
 
     fn equity_vs_hand(
@@ -433,6 +466,169 @@ fn compare_x2(me: crate::eval::HandRank, opp: crate::eval::HandRank) -> u64 {
     } else {
         0
     }
+}
+
+/// E2 hot-path equity Monte Carlo（§E-rev1）：const-generic 分流让 LLVM 在
+/// `BOARD_LEN ∈ {0, 3, 4, 5}` × `NEEDED = 5 - BOARD_LEN` 四个具体街分别静态展开
+/// FY 内层循环 + board-prefix 复制循环 + needed_board 写回循环。RNG 消费 byte-equal
+/// 于原 `sample_opp_and_board` + `build_seven_cards` 路径——`build_unused_array`
+/// 提到循环外、每 iter `let mut unused = initial_unused;` 把 sorted 起手状态
+/// memcpy 进工作 buffer，FY swap 序列与原版逐字符相同（D-051 / D-237 / OCHS table
+/// / bucket table BLAKE3 baseline 不漂移）。
+///
+/// **hero-rank 预计算（§E-rev1）**：hero 手牌 rank 仅取决于 (`hole`, full_board)，
+/// 与 opp_hole 无关——预计算 hero_rank 表，per iter 只 eval opp 一次，每 iter
+/// 评估开销从 `2 × eval7 ≈ 100 ns` 降至 `1 × eval7 + 1 × table-lookup ≈ 55 ns`，
+/// 让 D-282 SLO 1k hand/s @ 10k iter 在 1-CPU host 上达成（10k iter ×（55 ns 单
+/// eval + ~40 ns 抽样） = ~950 µs/hand）。预计算成本固定 ≈ 50 µs/equity call，
+/// 仅 flop / turn 两街适用（preflop C(47,5) = 1.5M 太大不预计算；river NEEDED=0
+/// hero rank 已固定一次性 eval）。算法路径不变，纯计算缓存——`HandRank` 数值
+/// 字面与 `evaluator.eval7(&[Card;7])` 相等（`equity_self_consistency` EQ-005
+/// byte-equal + `tests/evaluator.rs` 5/6/7 等价担保）。
+///
+/// 直调 `crate::eval::eval7` 而非 `evaluator.eval7`：stage-1+2 唯一 impl 是
+/// `NaiveHandEvaluator`，trait `eval7` 内部就是 `eval_inner::<7>`；直调让 LLVM
+/// 完全 inline `eval_inner` 跳过 vtable 派发。后续 stage 引入新 impl 时由
+/// `tests/equity_self_consistency.rs::equity_determinism_repeat_1k_smoke` byte-equal
+/// 断言保护——新 impl 必须与 `NaiveHandEvaluator` 输出 byte-equal `HandRank`。
+#[inline(always)]
+fn equity_hot_loop<R: RngSource + ?Sized, const BOARD_LEN: usize, const NEEDED: usize>(
+    used: &[bool; 52],
+    hole: [Card; 2],
+    board: &[Card],
+    iter: u32,
+    rng: &mut R,
+    evaluator: &dyn HandEvaluator,
+) -> u64 {
+    debug_assert!(BOARD_LEN + NEEDED == 5);
+    debug_assert_eq!(board.len(), BOARD_LEN);
+    let (initial_unused, unused_len) = build_unused_array(used);
+    let total: usize = 2 + NEEDED;
+
+    let mut hero7: [Card; 7] = [hole[0]; 7];
+    hero7[0] = hole[0];
+    hero7[1] = hole[1];
+    let mut k = 0;
+    while k < BOARD_LEN {
+        hero7[2 + k] = board[k];
+        k += 1;
+    }
+    let mut opp7: [Card; 7] = hero7;
+
+    // 分流：flop / turn 走 hero-rank precompute；river / preflop 走 fallback。
+    if NEEDED == 1 {
+        // turn：只有 river 一张可变。预计算 hero_rank_by_river[52]（仅 unused 项有效）。
+        let mut hero_rank_table: [crate::eval::HandRank; 52] = [crate::eval::HandRank(0); 52];
+        for &card_u8 in initial_unused.iter().take(unused_len) {
+            hero7[2 + BOARD_LEN] = Card::from_u8_assume_valid(card_u8);
+            hero_rank_table[card_u8 as usize] = crate::eval::eval7(&hero7);
+        }
+        let mut wins_x2: u64 = 0;
+        let mut rng_buf: [u64; 3] = [0; 3];
+        for _ in 0..iter {
+            let mut unused = initial_unused;
+            // 单次 vtable dispatch 批量抽 `total = 3` 个 u64（§E-rev1 fill_u64s
+            // override）。后续 FY swap 顺序消费 byte-equal 于循环 next_u64。
+            rng.fill_u64s(&mut rng_buf);
+            let j0 = (rng_buf[0] % unused_len as u64) as usize;
+            unused.swap(0, j0);
+            let j1 = 1 + (rng_buf[1] % (unused_len - 1) as u64) as usize;
+            unused.swap(1, j1);
+            let j2 = 2 + (rng_buf[2] % (unused_len - 2) as u64) as usize;
+            unused.swap(2, j2);
+            let opp_h0 = unused[0];
+            let opp_h1 = unused[1];
+            let river_card = unused[2];
+            opp7[0] = Card::from_u8_assume_valid(opp_h0);
+            opp7[1] = Card::from_u8_assume_valid(opp_h1);
+            opp7[2 + BOARD_LEN] = Card::from_u8_assume_valid(river_card);
+            let hero_rank = hero_rank_table[river_card as usize];
+            let opp_rank = crate::eval::eval7(&opp7);
+            wins_x2 += compare_x2(hero_rank, opp_rank);
+        }
+        let _ = evaluator;
+        return wins_x2;
+    }
+    if NEEDED == 2 {
+        // flop：turn / river 两张可变。预计算 hero_rank_by_pair[52*52]。
+        // 仅 (a, b) ∈ unused × unused（a ≠ b）项有效；写双向 [a*52+b] = [b*52+a]。
+        // 直接走栈数组（10.8 KB，远小于 8 MB 默认栈帧）省 Box 堆分配开销
+        // （~30-50 ns/equity call → 10k iter 摊到 ~3-5 ps/iter，微但累积可观）。
+        let mut hero_rank_table: [crate::eval::HandRank; 52 * 52] =
+            [crate::eval::HandRank(0); 52 * 52];
+        let unused_slice = &initial_unused[..unused_len];
+        for (ai, &a) in unused_slice.iter().enumerate() {
+            for &b in unused_slice.iter().skip(ai + 1) {
+                hero7[2 + BOARD_LEN] = Card::from_u8_assume_valid(a);
+                hero7[2 + BOARD_LEN + 1] = Card::from_u8_assume_valid(b);
+                let r = crate::eval::eval7(&hero7);
+                hero_rank_table[a as usize * 52 + b as usize] = r;
+                hero_rank_table[b as usize * 52 + a as usize] = r;
+            }
+        }
+        let mut wins_x2: u64 = 0;
+        let mut rng_buf: [u64; 4] = [0; 4];
+        for _ in 0..iter {
+            let mut unused = initial_unused;
+            // 单次 vtable dispatch 批量抽 `total = 4` 个 u64（§E-rev1 fill_u64s
+            // override）。后续 FY swap 顺序消费 byte-equal 于循环 next_u64。
+            rng.fill_u64s(&mut rng_buf);
+            let j0 = (rng_buf[0] % unused_len as u64) as usize;
+            unused.swap(0, j0);
+            let j1 = 1 + (rng_buf[1] % (unused_len - 1) as u64) as usize;
+            unused.swap(1, j1);
+            let j2 = 2 + (rng_buf[2] % (unused_len - 2) as u64) as usize;
+            unused.swap(2, j2);
+            let j3 = 3 + (rng_buf[3] % (unused_len - 3) as u64) as usize;
+            unused.swap(3, j3);
+            let opp_h0 = unused[0];
+            let opp_h1 = unused[1];
+            let tail0 = unused[2];
+            let tail1 = unused[3];
+            opp7[0] = Card::from_u8_assume_valid(opp_h0);
+            opp7[1] = Card::from_u8_assume_valid(opp_h1);
+            opp7[2 + BOARD_LEN] = Card::from_u8_assume_valid(tail0);
+            opp7[2 + BOARD_LEN + 1] = Card::from_u8_assume_valid(tail1);
+            let hero_rank = hero_rank_table[tail0 as usize * 52 + tail1 as usize];
+            let opp_rank = crate::eval::eval7(&opp7);
+            wins_x2 += compare_x2(hero_rank, opp_rank);
+        }
+        let _ = evaluator;
+        return wins_x2;
+    }
+
+    // Fallback：preflop（NEEDED=5，太多组合不预计算）/ river（NEEDED=0，hero
+    // rank 一次性算外提）/ 其他未来扩展。
+    let hero_rank_fixed = if NEEDED == 0 {
+        Some(crate::eval::eval7(&hero7))
+    } else {
+        None
+    };
+    let mut wins_x2: u64 = 0;
+    let mut rng_buf: [u64; 7] = [0; 7];
+    for _ in 0..iter {
+        let mut unused = initial_unused;
+        rng.fill_u64s(&mut rng_buf[..total]);
+        let mut i = 0usize;
+        while i < total {
+            let j = i + (rng_buf[i] % ((unused_len - i) as u64)) as usize;
+            unused.swap(i, j);
+            i += 1;
+        }
+        opp7[0] = Card::from_u8_assume_valid(unused[0]);
+        opp7[1] = Card::from_u8_assume_valid(unused[1]);
+        let mut offset = 0usize;
+        while offset < NEEDED {
+            let c = Card::from_u8_assume_valid(unused[2 + offset]);
+            hero7[2 + BOARD_LEN + offset] = c;
+            opp7[2 + BOARD_LEN + offset] = c;
+            offset += 1;
+        }
+        let hero_rank = hero_rank_fixed.unwrap_or_else(|| crate::eval::eval7(&hero7));
+        wins_x2 += compare_x2(hero_rank, crate::eval::eval7(&opp7));
+    }
+    let _ = evaluator;
+    wins_x2
 }
 
 /// Stack-allocated unused-card buffer (`[u8; 52]` + length) to avoid Vec churn

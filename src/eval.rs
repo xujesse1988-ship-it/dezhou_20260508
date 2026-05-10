@@ -108,14 +108,15 @@ impl HandEvaluator for NaiveHandEvaluator {
     }
 }
 
+#[inline(always)]
 pub(crate) fn eval7(cards: &[Card; 7]) -> HandRank {
-    NaiveHandEvaluator.eval7(cards)
+    eval_inner::<7>(cards)
 }
 
 /// 主评估路径。const-generic 让 LLVM 在 5/6/7-card 三个调用点完全展开
 /// histogram 循环。
 #[inline(always)]
-fn eval_inner<const N: usize>(cards: &[Card; N]) -> HandRank {
+pub(crate) fn eval_inner<const N: usize>(cards: &[Card; N]) -> HandRank {
     let mut by_suit = [0u16; 4];
     let mut all_mask: u16 = 0; // count >= 1
     let mut pair_mask: u16 = 0; // count >= 2
