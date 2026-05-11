@@ -1545,6 +1545,23 @@ E2 [实现] 全部优化均**纯计算缓存路径**——RNG 消费序列、`Ha
 - **stage-1 同型先例**——`slo_eval7_multithread_linear_scaling_to_8_cores` 在 1-CPU host 上 `available_parallelism() < 2` skip-with-eprintln（`tests/perf_slo.rs:171-176`），是 stage-1 验收下 host-dependent SLO 的标准模式。本 batch 不引入同类 skip-with-log 分支（D-282 字面 «单线程» 不存在等价 host-feature gate），仅记录 carve-out。
 - **后续验证路径**——E2 closure 不阻塞 F1 / F2 / F3 推进（§E2 §出口 字面 «E1 所有 SLO 断言通过» 在 idle host 下达成）；F3 [报告] 期望同 host idle window 复跑 SLO 锁定 «mean >= 1k hand/s» 出口数字。stage-2 全闭合 PR 在 self-hosted runner（无 claude background）夜间 fuzz 跑全 SLO 应 byte-equal 满足。
 
+**§E-rev1 §5 carve-out closure（2026-05-11，vultr 4-core EPYC-Rome idle box 50-run aggregate 实测）**：
+
+procedural follow-through commit `58aa951` 落地同日，vultr 4-core AMD EPYC-Rome / 7.7 GB / Linux 5.15 idle box（`load average 0.00` going in；equity Monte Carlo 单线程 workload 跑 1 core 满载其余 3 core 闲）跑 `cargo test --release --test perf_slo -- --ignored stage2_equity_monte_carlo_throughput_at_least_1k_hand_per_second --nocapture` shell loop × 50 次（每次 fresh process 含 cargo cached build + 测试 fixture 重建，单次 dur 0-1 s）：
+
+| 统计 | 实测 | 门槛对照 |
+|---|---|---|
+| n | 50 | — |
+| mean | **1102.1 hand/s** | ≥ 1k 阈值 **+10.2%** |
+| std | 10.6 hand/s | 1% noise，CI [870, 960] elem/s bench 复测一致 |
+| min | **1061.7 hand/s** | ≥ 1k 阈值 **+6.2%**（最差一次仍超 6%）|
+| max | 1117.3 hand/s | ≥ 1k 阈值 +11.7% |
+| SLO pass-rate (≥ 1k hand/s) | **50/50 = 100%** | — |
+
+**carve-out 闭合判定**：原 §5 carve-out 预测 «clean idle host 估 mean > 1k hand/s» 由本数据**严格 confirm**；50 次重跑 0 fail（vs 主 1-CPU host with claude background ~16% CPU 下 821-1059 hand/s 区间 mean 931 hand/s ~30% fail rate），证明 E2 hot path 重写已正确达成 D-282 SLO 字面要求 «单线程 ≥ 1,000 hand/s @ 10k iter»，原 carve-out 实质是「测量条件 host-load contention」而非「实现不达标」。F3 [报告] 不需要再为 D-282 单独复跑——本 §5 闭合段直接作为 F3 SLO 出口数据来源（与 §D-rev1 §3 cross_arch_bucket_id_baseline 实跑闭合 §D-rev0 §4 carve-out 同型「实测后追认」模式）。
+
+**残留 host-feature 边界**：vultr 4-core 是共享 vCPU 而非专用物理核（同时段实测 stage-1 `slo_eval7_multithread_linear_scaling_to_8_cores` efficiency 0.38 不达 0.70 门槛，4-core scaling 仅 1.51× 显示 hyperthread / 邻居 noisy share），stage-1 follow-up (c)「≥ 2 核 host 跑 efficiency ≥ 0.70」carve-out 仍不能在 vultr 上闭合，需要 Hetzner AX 一类 bare-metal host。但 D-282 单线程 SLO 只需「1 个非饱和核」，vultr idle 状态足以——这是 stage-1 vs stage-2 SLO host-feature gate 门槛差异的具体证据。
+
 ##### §E-rev1 §6：[实现] 越界审计（无）
 
 E2 [实现] 严守 [实现] 角色边界——产品代码改动全部在 `src/`，0 触 `tests/` / `benches/` / `tools/` / `fuzz/` / `proto/`：
