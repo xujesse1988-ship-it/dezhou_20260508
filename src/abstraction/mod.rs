@@ -27,6 +27,7 @@
 
 pub mod action;
 pub mod bucket_table;
+pub mod canonical_enum;
 pub mod cluster;
 pub mod equity;
 pub mod feature;

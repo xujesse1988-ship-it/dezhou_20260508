@@ -26,7 +26,7 @@
 //! **§G-batch1 §2 [测试] 新增**（详见 `docs/pluribus_stage2_decisions.md` §10
 //! "Stage 3 起步 batch 1 — D-218-rev2 / D-244-rev2 真等价类枚举"）：第 6 节
 //! D-218-rev2 真等价类枚举 4 类断言（N 常量 / 100K 随机 uniqueness / 100K 随机
-//! max id 接近 N / 全 flop 26M 枚举精确 25,989 distinct）。全部 `#[ignore]` 等
+//! max id 接近 N / 全 flop 26M 枚举精确 N_FLOP distinct）。全部 `#[ignore]` 等
 //! §G-batch1 §3 [实现] 落地（colex ranking + N 真值常量 + schema_version bump）
 //! 后由 [实现] commit 取消 ignore。
 
@@ -429,17 +429,18 @@ fn canonical_observation_id_preflop_panics() {
 // 必须满足的契约：
 //
 // 1. **N 常量精确值**：`N_CANONICAL_OBSERVATION_FLOP / TURN / RIVER` 必须分别
-//    等于标准 hand_isomorphism C lib 数 25,989 / 1,286,792 / 123,156,254
-//    （D-218-rev2 §2 字面）。
+//    等于实测 hand-isomorphism 数 1,286,792 / 13,960,050 / 123,156,254
+//    （D-218-rev2 §2 字面；§G-batch1 §3.1 实测修正 stage 2 §C-rev1 §2 "~25K"
+//    估算误差）。
 // 2. **uniqueness（100K 随机样本）**：从 100K 随机 (board, hole) 应观察到接近
 //    N 量级 distinct canonical_id（D-218-rev2 §3 "唯一性（新）"）。当前 FNV-1a
 //    hash mod 3K/6K/10K 路径下 distinct count 受 modulus 上限封顶。
 // 3. **dense packing（max id 接近 N-1）**：100K 随机样本观察到的 max id 应
 //    接近 `N - 1`（D-218-rev2 §3 "稠密性"）。
-// 4. **full flop 枚举精确 25,989 distinct**：(52 choose 3) × (49 choose 2) =
-//    26M (board, hole) 全枚举后 distinct canonical_id 数恰好 = N_FLOP = 25,989
-//    （`#[ignore]` 双重 release + --ignored opt-in，与 stage-2 §C2 / §D2
-//    同形态）。
+// 4. **full flop 枚举精确 N_FLOP distinct**：(52 choose 3) × (49 choose 2) =
+//    26M (board, hole) 全枚举后 distinct canonical_id 数恰好 = N_FLOP =
+//    1,286,792（`#[ignore]` 双重 release + --ignored opt-in，与 stage-2 §C2 /
+//    §D2 同形态）。
 //
 // 全部 `#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]` 标注；
 // 当前 hash 路径下断言**预期失败**——[实现] 闭合 commit 取消 ignore 并验证
@@ -459,20 +460,25 @@ fn sample_distinct_cards(rng: &mut dyn RngSource, count: usize) -> Vec<Card> {
     out
 }
 
-/// D-218-rev2 §2 N 常量精确值断言（标准 hand_isomorphism C lib 数）。
+/// D-218-rev2 §2 N 常量精确值断言（实测标准 hand-isomorphism 数）。
 ///
 /// **当前 D-218-rev1 状态**：3_000 / 6_000 / 10_000 （C2 收紧上界）——断言失败。
-/// **§G-batch1 §3 [实现] 落地后**：25_989 / 1_286_792 / 123_156_254——断言通过。
+/// **§G-batch1 §3 [实现] 落地后**：1_286_792 / 13_960_050 / 123_156_254——断言通过。
+///
+/// 数字来源：`src/abstraction/canonical_enum.rs::enumerate_canonical_forms`
+/// 实测枚举（详见 `docs/pluribus_stage2_decisions.md` §10 "Stage 3 起步 batch 1
+/// — D-218-rev2"；§G-batch1 §3.1 实测修正 stage 2 §C-rev1 §2 "~25K" 估算 14000x
+/// 误差）。
 #[test]
 #[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
 fn n_canonical_observation_constants_match_d218_rev2_spec() {
     assert_eq!(
-        N_CANONICAL_OBSERVATION_FLOP, 25_989,
-        "D-218-rev2 §2: flop 3+2 cards canonical 等价类 = 25,989"
+        N_CANONICAL_OBSERVATION_FLOP, 1_286_792,
+        "D-218-rev2 §2: flop 3+2 cards canonical 等价类 = 1,286,792"
     );
     assert_eq!(
-        N_CANONICAL_OBSERVATION_TURN, 1_286_792,
-        "D-218-rev2 §2: turn 4+2 cards canonical 等价类 = 1,286,792"
+        N_CANONICAL_OBSERVATION_TURN, 13_960_050,
+        "D-218-rev2 §2: turn 4+2 cards canonical 等价类 = 13,960,050"
     );
     assert_eq!(
         N_CANONICAL_OBSERVATION_RIVER, 123_156_254,
@@ -482,9 +488,10 @@ fn n_canonical_observation_constants_match_d218_rev2_spec() {
 
 /// D-218-rev2 §3 "唯一性（新）" + "稠密性" flop 100K 随机样本 uniqueness。
 ///
-/// 100K 随机 (board, hole) → 期望 distinct count > 20K（接近 N_FLOP = 25_989；
-/// 随机采样路径下 equivalence-class 自然碰撞稀少）+ max_id > 20K（接近 N - 1）。
-/// 当前 FNV-1a hash mod 3K 路径下 distinct < 3000 / max_id < 3000——断言失败。
+/// 100K 随机 (board, hole) → 期望 distinct count > 95K（N_FLOP = 1,286,792 远 >
+/// 100K 采样容量 → equivalence-class 碰撞稀少，期望 ~99K 几乎无重）+ max_id >
+/// 1M（接近 N - 1，dense packing）。当前 FNV-1a hash mod 3K 路径下 distinct <
+/// 3000 / max_id < 3000——断言失败。
 #[test]
 #[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
 fn canonical_observation_id_uniqueness_random_100k_flop() {
@@ -508,22 +515,22 @@ fn canonical_observation_id_uniqueness_random_100k_flop() {
         );
     }
     assert!(
-        seen.len() > 20_000,
-        "D-218-rev2 §3 uniqueness（flop）：expected > 20K distinct canonical_ids from \
+        seen.len() > 95_000,
+        "D-218-rev2 §3 uniqueness（flop）：expected > 95K distinct canonical_ids from \
          100K random samples (got {})；当前 FNV-1a hash mod 3K 路径下 distinct < 3000",
         seen.len()
     );
     assert!(
-        max_id > 20_000,
+        max_id > 1_000_000,
         "D-218-rev2 §3 dense packing（flop）：max canonical_id ({max_id}) 应接近 \
          N_FLOP - 1 = {}",
         N_CANONICAL_OBSERVATION_FLOP - 1
     );
 }
 
-/// D-218-rev2 §3 turn 100K 随机样本 uniqueness（N = 1,286,792，远 > 100K 采样
-/// 容量 → equivalence-class 自然碰撞极稀少，distinct 期望 > 95K + max_id > 1M）。
-/// 当前 FNV-1a hash mod 6K 路径下 distinct < 6000 / max_id < 6000——断言失败。
+/// D-218-rev2 §3 turn 100K 随机样本 uniqueness（N = 13,960,050 远 > 100K 采样
+/// 容量 → equivalence-class 自然碰撞极稀少，distinct 期望 > 99.5K + max_id >
+/// 10M）。当前 FNV-1a hash mod 6K 路径下 distinct < 6000——断言失败。
 #[test]
 #[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
 fn canonical_observation_id_uniqueness_random_100k_turn() {
@@ -547,13 +554,13 @@ fn canonical_observation_id_uniqueness_random_100k_turn() {
         );
     }
     assert!(
-        seen.len() > 95_000,
-        "D-218-rev2 §3 uniqueness（turn）：expected > 95K distinct canonical_ids from \
+        seen.len() > 99_500,
+        "D-218-rev2 §3 uniqueness（turn）：expected > 99.5K distinct canonical_ids from \
          100K random samples (got {})；当前 FNV-1a hash mod 6K 路径下 distinct < 6000",
         seen.len()
     );
     assert!(
-        max_id > 1_000_000,
+        max_id > 10_000_000,
         "D-218-rev2 §3 dense packing（turn）：max canonical_id ({max_id}) 应接近 \
          N_TURN - 1 = {}",
         N_CANONICAL_OBSERVATION_TURN - 1
@@ -599,11 +606,11 @@ fn canonical_observation_id_uniqueness_random_100k_river() {
     );
 }
 
-/// D-218-rev2 §3 flop 全枚举精确 25,989 distinct（exhaustive ground truth）。
+/// D-218-rev2 §3 flop 全枚举精确 1,286,792 distinct（exhaustive ground truth）。
 ///
 /// 枚举 (52 choose 3) × (49 choose 2) = 22,100 × 1,176 = 25,989,600 (board, hole)
-/// 组合（每条 board 取所有 (49 choose 2) hole 组合），所有 canonical_id 收集到
-/// HashSet → 最终 size 必须恰好等于 N_FLOP = 25,989（精确 ground truth）。
+/// 组合，所有 canonical_id 收集到 HashSet → 最终 size 必须恰好等于 N_FLOP =
+/// 1,286,792（实测标准 hand-isomorphism 数）。
 ///
 /// **耗时**：~10 s release on 1-CPU host（26M canonical_observation_id calls
 /// × ~400 ns/call）。`#[ignore]` 默认 `cargo test` 跳过，仅 `cargo test --release
@@ -616,7 +623,7 @@ fn canonical_observation_id_uniqueness_random_100k_river() {
 /// （100K 随机采样在 turn/river 等价类空间下与全枚举差距 < 0.1% statistical）。
 #[test]
 #[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active + release/--ignored opt-in"]
-fn canonical_observation_id_full_flop_enumeration_exactly_25989_distinct() {
+fn canonical_observation_id_full_flop_enumeration_exactly_n_flop_distinct() {
     let mut seen: HashSet<u32> = HashSet::new();
     for b0 in 0..52u8 {
         for b1 in (b0 + 1)..52u8 {

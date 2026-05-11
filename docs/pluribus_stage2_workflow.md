@@ -1952,7 +1952,7 @@ stage 2 闭合后第一项 follow-up：把 hash-based `canonical_observation_id`
 ##### §G-batch1 §1：本 batch [决策] 阶段产出
 
 - `docs/pluribus_stage2_decisions.md` §10 修订历史末尾追加 "Stage 3 起步 batch 1（2026-05-11）— D-218-rev2 / D-244-rev2 真等价类枚举" 段落，含：
-    - **D-218-rev2**（14 条字面规则）：算法选型（Waugh 2013 suit-canonicalize + colex ranking 3 街全枚举）/ N 实测（25,989 / 1,286,792 / 123,156,254）/ 5 类不变量（含新 uniqueness）/ 签名 byte-equal 不变 / lookup table size ~475 MB / schema_version bump 1 → 2 / k-means mini-batch 折衷 / 训练时长 ≤ 60 min release / 运行时 SLO 不退化 / artifact 走 GitHub Release + BLAKE3 verify / 跨架构 baseline 重生 / 12 测试转 active / 角色边界 [决策] → [测试] → [实现] → [报告] / D-218-rev1 关系（追加不删 + 用 colex 替换原 "Pearson hash 完整化" 表述）。
+    - **D-218-rev2**（14 条字面规则；N 值在 §G-batch1 §3.1 实测修正后）：算法选型（Waugh 2013 suit-canonicalize + colex ranking 3 街全枚举）/ N 实测（1,286,792 / 13,960,050 / 123,156,254；修正 stage 2 §C-rev1 §2 "~25K" 估算误差 ~50x）/ 5 类不变量（含新 uniqueness）/ 签名 byte-equal 不变 / lookup table size ~528 MB / schema_version bump 1 → 2 / k-means mini-batch 折衷 / 训练时长 ≤ 120 min release / 运行时 SLO 不退化 / artifact 走 GitHub Release + BLAKE3 verify / 跨架构 baseline 重生 / 12 测试转 active / 角色边界 [决策] → [测试] → [实现] → [报告] / D-218-rev1 关系（追加不删 + 用 colex 替换原 "Pearson hash 完整化" 表述）。
     - **D-244-rev2**（5 条字面规则）：`BUCKET_TABLE_SCHEMA_VERSION = 2` / v1 reader 拒绝路径不变 / BT-008-rev2 bound 收紧到精确等价类数 / artifact size 498,895,272 bytes / D-275 unsafe_code 复审 3 候选选项（A `std::fs::read` 默认 / B mmap unsafe 解禁 / C sharded artifact）。
 - 本 workflow §F-rev2 §4 carve-out 1 同步收口路径已锁，后续 [测试] / [实现] / [报告] 阶段走 §G-batch1 §2..§4 子节（本 commit 仅 [决策] 阶段，子节为空待后续 batch 追加）。
 - 0 src/ / tests/ / benches/ / fuzz/ / tools/ / proto/ 改动——本 commit 严格 [决策] 角色单边路径，与 stage 2 A0 [决策] 0 越界形态同型。
@@ -1968,11 +1968,11 @@ commit 取消 ignore 实跑）。
 **`tests/canonical_observation.rs` 新增节 6 "D-218-rev2 真等价类枚举"**（5 条
 新 `#[test]`，全 `#[ignore = "§G-batch1 §3: ..."]`）：
 
-- `n_canonical_observation_constants_match_d218_rev2_spec`：assert `N_CANONICAL_OBSERVATION_FLOP / TURN / RIVER` 精确等于 25,989 / 1,286,792 / 123,156,254（D-218-rev2 §2 字面）。当前 D-218-rev1 路径下 3K/6K/10K → fail。
+- `n_canonical_observation_constants_match_d218_rev2_spec`：assert `N_CANONICAL_OBSERVATION_FLOP / TURN / RIVER` 精确等于 1,286,792 / 13,960,050 / 123,156,254（D-218-rev2 §2 字面，§G-batch1 §3.1 实测修正）。当前 D-218-rev1 路径下 3K/6K/10K → fail。
 - `canonical_observation_id_uniqueness_random_100k_flop`：100K 随机 (board, hole) → assert distinct count > 20K + max_id > 20K（D-218-rev2 §3 "唯一性（新）" + "稠密性"；当前 FNV-1a mod 3K distinct < 3K / max_id < 3K → fail）。
 - `canonical_observation_id_uniqueness_random_100k_turn`：同 turn 街，distinct > 95K + max_id > 1M（N=1.28M 远 > 100K 采样容量 → equivalence-class 碰撞极稀少）。
 - `canonical_observation_id_uniqueness_random_100k_river`：同 river 街，distinct > 99.9K + max_id > 50M（N=123M 几乎不可能碰撞）。
-- `canonical_observation_id_full_flop_enumeration_exactly_25989_distinct`：(52 choose 3) × (49 choose 2) = 26M (board, hole) 全枚举 → distinct count 必须精确 = 25,989 + max_id = 25,988（dense packing 强约束）。**双重 `#[ignore]`**：§G-batch1 §3 + release/--ignored opt-in（~10 s release，超 dev loop SLO）。turn / river full enumeration **不写**——305M / 2.8B 即使 release 也需 ~2 h / ~16 h，超 dev loop SLO + 与 100K 随机 uniqueness 统计差距 < 0.1%。
+- `canonical_observation_id_full_flop_enumeration_exactly_n_flop_distinct`：(52 choose 3) × (49 choose 2) = 26M (board, hole) 全枚举 → distinct count 必须精确 = N_FLOP = 1,286,792 + max_id = 1,286,791（dense packing 强约束）。**双重 `#[ignore]`**：§G-batch1 §3 + release/--ignored opt-in（~10 s release，超 dev loop SLO）。turn / river full enumeration **不写**——305M / 2.8B 即使 release 也需 ~2 h / ~16 h，超 dev loop SLO + 与 100K 随机 uniqueness 统计差距 < 0.1%。
 
 **`tests/bucket_quality.rs` 12 条 `#[ignore]` reason 字符串转向 §G-batch1 §3**：
 
@@ -1988,10 +1988,119 @@ commit 取消 ignore 实跑）。
 - `cargo test --test bucket_quality --no-run` 编译过；body 0 改动→实跑行为 byte-equal 不变（debug ~5-10 min 实跑 cost 不必跑，reason 字符串变更不影响 test runner behavior）。
 - `cargo fmt --all --check` / `cargo clippy --tests -- -D warnings` 全绿。
 
-##### §G-batch1 §3..§4：待后续 batch 追加
+##### §G-batch1 §3.1 [实现]（2026-05-11）：canonical_enum 模块落地 + N 实测修正
 
-- §G-batch1 §3 [实现]：`src/abstraction/canonical_enum.rs` 新增模块 + `postflop.rs` 三常量改真值 + `bucket_table.rs` schema_version bump + artifact 重训 + 12 ignore 取消 + 跨架构 baseline 重生 + D-275 实测取选项 A/B/C + §G-batch1 §2 节 6 五条 `#[ignore]` 取消。
-- §G-batch1 §4 [报告]：CLAUDE.md ground truth hash 全部漂移更新 + stage 2 report §8 carve-out 表更新（D-218-rev1 carve-out closed）+ `docs/pluribus_stage2_bucket_quality.md` 直方图全部重生 + `pluribus_stage2_api.md` 不变（签名 byte-equal）。
+§G-batch1 §1 [决策] commit `6b52fbe` + §2 [测试] commit `14a668b` 之后第三步：
+落地 Waugh 2013-style hand isomorphism + colex ranking 算法，把 D-218-rev2
+真等价类枚举从决策 / 测试推进到 first-cut [实现]。
+
+**核心算法落地**：
+
+- `src/abstraction/canonical_enum.rs` 新增模块（~720 行 含 tests，420 行 prod
+  + 300 行 tests）：
+    - `pack_canonical_form_key(board, hole) -> u128`：suit canonicalize（按
+      `(b_count, h_count, b_mask, h_mask)` 字典序排 4 个 suit signature）+
+      pack 到 u128（per-suit 32-bit 高位优先 layout，u128 数值序 == canonical
+      tuple 字典序）。
+    - `enumerate_canonical_forms(board_size, hole_size, callback)`：递归 enum
+      canonical-sorted shape (b_counts, h_counts) + 每 shape 内 multiset
+      enumerate (b_mask, h_mask) per canonical suit。复杂度 O(N)。
+    - `canonical_observation_id(street, board, hole) -> u32`：pack → lazy
+      table binary search。lazy table 走 `OnceLock<Vec<u128>>` per street，
+      flop 第一次 call ~30 ms / turn ~150 ms / river ~1.5 s release。
+    - 公开常量 `N_CANONICAL_OBSERVATION_FLOP / TURN / RIVER` 同时落到
+      `canonical_enum.rs`（§G-batch1 §3.2 [实现] 将让 `postflop.rs` 三常量
+      re-export 自此处）。
+- `src/abstraction/mod.rs` 加入 `pub mod canonical_enum`。
+
+**§G-batch1 §3.1 实测 N 值修正 stage 2 §C-rev1 §2 估算误差**：
+
+- stage 2 workflow §C-rev1 §2 line 880 写道 "flop 等价类 ~25K（13 rank × 13² hole
+  / 4! suit symmetry，需要查表 + Pearson hash 完整化）"。该 back-of-envelope
+  估算 `13³ / 4! ≈ 91` 被错当成真等价类数，§G-batch1 §1 [决策] 把估算 25K
+  填到 D-218-rev2 §2 N_FLOP，并把当时认为是 flop 的 1,286,792 数填到 N_TURN，
+  river 数 123,156,254 偶然填对了。
+- §G-batch1 §3.1 实测 `enumerate_canonical_forms(3, 2)` = **1,286,792**（真 flop）
+  / `enumerate_canonical_forms(4, 2)` = **13,960,050**（真 turn）/
+  `enumerate_canonical_forms(5, 2)` = **123,156,254**（真 river，原决策对了）。
+  误差量级：flop ~50x、turn ~10x、river 0x。
+- 修正路径（§G-batch1 §3.1 同 commit）：
+    - `src/abstraction/canonical_enum.rs` 公开常量改为实测真值。
+    - `docs/pluribus_stage2_decisions.md` §10 D-218-rev2 §2 / §5 / §7 / §8 / §9
+      + D-244-rev2 §3 / §4 / §5 中所有 N 值 + artifact size + 训练时长全部
+      重新计算。artifact 整体从 ~475 MB → **528 MB**（river 主导 + turn 大幅
+      上升 5 MB → 56 MB，flop ~5 MB 新增；总体仍在 GitHub Release 2 GB 单
+      文件上限内，分发渠道不变）；训练时长 60 min → 120 min release。
+    - `docs/pluribus_stage2_workflow.md` §G-batch1 §1 / §2 entries N 值同步。
+    - `CLAUDE.md` §下一步 N 值 + artifact 量级同步。
+    - `tests/canonical_observation.rs` 节 6 五条 `#[ignore]` 测试阈值同步
+      （N 期望、uniqueness 阈值 20K → 95K / 99.5K / 99.9K、max_id 阈值 20K →
+      1M / 10M / 50M、full enumeration test 名 `_25989_distinct` →
+      `_n_flop_distinct`）。
+- stage 2 §C-rev1 §2 line 880 / 1147 / 1932 历史 entries 中 "~25K" 表述按
+  "追加不删" 政策**不修改**——保留作为 stage-2 锁定时的估算证据，本 §G-batch1
+  §3.1 entry 显式书面修正。
+
+**单元测试落地**（`canonical_enum.rs` 内 #[cfg(test)] 节，5 active + 3
+release/--ignored）：
+
+| Test | 状态 | 验证 |
+|---|---|---|
+| `each_combination_with_min_full_13_choose_3` | active | Gosper's hack 枚举 C(13,3) = 286 正确 |
+| `each_combination_with_min_skip_first_few` | active | min 跳过路径 |
+| `next_combination_smoke_3_bits_of_5` | active | next_combination_or_zero 枚举 C(5,3)=10 |
+| `pack_key_debug_specific_case_suit_permutation_invariance` | active | 具体 (♣↔♦) σ pack key byte-equal |
+| `pack_key_round_trip_signature_ordering` | active | input-order invariance |
+| `enumerate_flop_canonical_form_count_matches_n_flop` | active | flop ≡ 1,286,792 (debug ~1.5 s) |
+| `enumerate_flop_canonical_forms_are_distinct` | active | 全 distinct（窗口比较） |
+| `brute_force_flop_pack_dedupe_yields_n_flop` | release/--ignored | 26M 暴力枚举 + dedup ≡ 1,286,792 |
+| `enumerate_turn_canonical_form_count_matches_n_turn` | release/--ignored | turn ≡ 13,960,050 |
+| `enumerate_river_canonical_form_count_matches_n_river` | release/--ignored | river ≡ 123,156,254 |
+
+release `--ignored` 3 测试实测 6.8 s 全绿（brute_force ~5 s / turn enum ~0.15 s
+/ river enum ~1.5 s）。
+
+**[实现] 角色边界审计**：本 batch 触 `src/abstraction/canonical_enum.rs`（新文件）
++ `src/abstraction/mod.rs`（加 `pub mod canonical_enum`，1 行）+ `tests/canonical_observation.rs`
+（节 6 五条 `#[ignore]` 测试阈值同步 N 修正；body 严格按 §G-batch1 §2 [测试]
+落地的算法逻辑不变，仅常数值修正）+ `docs/pluribus_stage2_decisions.md`（§10
+D-218-rev2 + D-244-rev2 N 值同步）+ `docs/pluribus_stage2_workflow.md`（§G-batch1
+§1 / §2 N 值同步 + 本节 §G-batch1 §3.1 [实现] 闭合记录追加）+ `CLAUDE.md`（N 值
+同步）。`src/abstraction/postflop.rs`（**未修改**——§G-batch1 §3.2 才动）/
+`src/abstraction/bucket_table.rs`（未修改——§G-batch1 §3.3 才 bump schema）/
+`tools/` / `Cargo.toml` / `Cargo.lock` / `fuzz/` / `proto/` / `tests/bucket_quality.rs`
+（未修改——12 条 ignore 仍指向 §G-batch1 §3）**未修改一行**。
+
+[测试] 角色边界 carve-out：§G-batch1 §2 [测试] 落地的 5 条 `#[ignore]` 测试
+**阈值常数**在 §G-batch1 §3.1 commit 被 [实现] agent 同步修正——这是 [测试]
+→ [实现] 角色边界破例，**追认为 carve-out**：N 值修正本质是 [决策] 阶段
+back-of-envelope 估算被实测推翻，与 stage-2 §B-rev1 §3 / §C-rev1 §3 "决策
+agent 笔误 / 估算与实测漂移由后续 batch 同步" 同型政策。本 batch 同步追认
+不另起 D-NNN-revM（实测取代估算不属于决策修订，属于事实更新）。
+
+**出口检查**：
+
+- `cargo build --tests` 全绿。
+- `cargo test --lib abstraction::canonical_enum::`：7 passed / 0 failed / 3 ignored。
+- `cargo test --release --lib abstraction::canonical_enum:: -- --ignored`：3 passed / 0 failed / 0 ignored，~6.8 s 实测。
+- `cargo test --test canonical_observation`：12 passed / 0 failed / 5 ignored（5 新 ignored 来自 §G-batch1 §2 节 6，阈值已 §G-batch1 §3.1 同步）。
+- `cargo fmt --all --check` / `cargo clippy --all-targets -- -D warnings` 全绿。
+- 阶段 1 baseline 不退化（src/ 改动仅 abstraction/canonical_enum.rs 新文件 + mod.rs 1 行，stage 1 任何 crate 不依赖 abstraction 子树）。
+
+下一步：§G-batch1 §3.2 [实现]（`src/abstraction/postflop.rs::canonical_observation_id`
+重写为 forward 调用 `canonical_enum::canonical_observation_id`；postflop.rs 三
+`N_CANONICAL_OBSERVATION_*` 常量改 re-export 自 `canonical_enum`）。
+
+##### §G-batch1 §3.2..§3.8 + §4：待后续 batch 追加
+
+- §G-batch1 §3.2 [实现]：`postflop.rs::canonical_observation_id` 改 forward 到 `canonical_enum`；三 N 常量 re-export。验证 tests/canonical_observation.rs 5 ignore 可转 active（uniqueness + N 常量 + flop full enum）。
+- §G-batch1 §3.3 [实现]：`bucket_table.rs` `BUCKET_TABLE_SCHEMA_VERSION` 1 → 2 + BT-008-rev2 bound 精确值 check + v1 reject 路径测试更新。
+- §G-batch1 §3.4 [实现]：`tools/train_bucket_table.rs` 处理 528 MB write + 训练时长 ≤ 120 min release + mini-batch k-means fallback for river（可选）。
+- §G-batch1 §3.5 [实现]：artifact 重训（vultr 4-core ~120 min release）+ GitHub Release 上传 + BLAKE3 录入；`tools/fetch_bucket_table.sh` 新增 helper。
+- §G-batch1 §3.6 [实现]：跨架构 baseline 32-seed × 3 街重生（vultr ~3 h release）。
+- §G-batch1 §3.7 [实现]：D-275 实测取选项 A / B / C；如选项 B 走 stage 1 D-275-rev1 流程。
+- §G-batch1 §3.8 [实现]：12 条 `tests/bucket_quality.rs` `#[ignore]` 取消并验证全绿（debug ~5-10 min 实跑 + release ~3 min）；CLAUDE.md ground truth hash 全部漂移更新。
+- §G-batch1 §4 [报告]：stage 2 report §8 carve-out 表更新（D-218-rev1 carve-out closed）+ `docs/pluribus_stage2_bucket_quality.md` 直方图全部重生 + `pluribus_stage2_api.md` 不变（签名 byte-equal）+ CLAUDE.md stage 2 follow-up 索引同步 + §F-rev2 §4 第 1 条 carve-out 状态翻面。
 
 ##### §G-batch1 §5 carry forward 处理政策（与 stage 2 §A-rev0..§F-rev2 一致，不重新论证）
 
