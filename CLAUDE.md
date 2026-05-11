@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 progress: A0 / A1 / B1 / B2 / C1 / C2 / D1 / D2 / E1 / E2 closed，下一步 F1 [测试]**（详见下文 §Stage 2 progress）。
+8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 progress: A0 / A1 / B1 / B2 / C1 / C2 / D1 / D2 / E1 / E2 / F1 closed，下一步 F2 [实现]**（详见下文 §Stage 2 progress）。
 
 历史 batch 出口数据（stage 1 的 B/C/D/E/F 各步、stage 2 的 A0 batch 1–6 review / A1 batch 7 / B1 batch 2）不在本文件保留——查阅顺序：
 
@@ -62,19 +62,20 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test --release -- --ignored # full-volume
 - **D2 [实现]** closed 2026-05-10，commit `e2fa74f` — `src/abstraction/action.rs::map_off_tree` D-201 PHM stub 占位实现（确定性映射 ① ≥ cap → AllIn ② ≤ max_committed → Call ③ 否则在 `config().raise_pot_ratios` 中找距离最近的 ratio；stage 6c 才完整数值正确）；issue #8 闭合。§D-rev1 §1 [实现] → [测试] 越界 carve-out（取消 2 条 fuzz ignore）+ §D-rev1 §2 cross_arch baseline 实跑 0 diverge（54.18 min release on 1-CPU host）闭合 §D-rev0 §4。
 - **E1 [测试]** closed 2026-05-10，commit `c8d7ccb` — `tests/perf_slo.rs::stage2_*` 3 条 SLO 断言（D-280/281/282）+ `benches/baseline.rs abstraction/bucket_lookup` 3 街分流 bench group。E1 实测 SLO #1/#2 大幅过 / SLO #3（equity MC）~2× short，移交 E2。
 - **E2 [实现]** closed 2026-05-10..2026-05-11，commit `d21c5d9`（+ `58aa951` procedural follow-through + `5177639` §E-rev1 §5 carve-out closure）— `src/abstraction/equity.rs` hot path 重写（const-generic 4 街分流 + hero-rank `[HandRank; 52*52]` precompute 让每 iter eval 2→1） + `src/eval.rs eval7` `#[inline(always)]` + `src/core/mod.rs Card::from_u8_assume_valid` + `src/core/rng.rs RngSource::fill_u64s` additive。stage 1 **API-005-rev1**（`RngSource::fill_u64s`）由 `58aa951` 追认。D-282 SLO 在 vultr 4-core idle box 50-run aggregate `mean 1102.1 / 50/50 PASS`，§E-rev1 §5 carve-out closed 2026-05-11。
+- **F1 [测试]** closed 2026-05-11，本 commit — 4 类测试落地：`tests/bucket_table_schema_compat.rs`（9 active：常量锁定 + v1 round-trip + v2/v0/u32::MAX/feature_set_id 拒绝路径）/ `tests/bucket_table_corruption.rs`（12 active + 1 `#[ignore]`：5 类 BucketTableError 命名 case + 1k smoke byte flip + 100k full + exhaustive variant trip-wire）/ `tests/off_tree_action_boundary.rs`（11 active + 1 `#[ignore]`：5 类边界 `real_to` 命名 + multi-stage sweep + 9-value table + 1k random smoke + 1M full + overflow carve-out）/ `tests/equity_calculator_lookup.rs`（16 active + 1 `#[ignore]`：iter=0/1/u32::MAX × 4 方法 + EquityError 5 variant exhaustive + InvalidBoardLen / OverlapHole / OverlapBoard 边界）。release 4-crate 实测：48 passed / 3 ignored / 0 failed。**§F1 §出口字面 "部分会失败留给 F2" 不触发** — 5 类 BucketTableError variants 在 C2 已完整、D-201 PHM stub 在 D2 已确定性化、EquityError IterTooLow 自 B2 起就在，F2 期望走 §C-rev1 / §F-rev0 同形态 0 产品代码改动 closure。
 
-### Stage 2 当前测试基线（E-rev1 §5 closure 后）
+### Stage 2 当前测试基线（F1 [测试] 闭合后）
 
-- `cargo test --release --no-fail-fast`：**197 passed / 42 ignored / 0 failed across 27 test crates**。stage-1 baseline 16 crates `104/19/0` 与 `stage1-v1.0` tag byte-equal（D-272 不退化满足）；stage-2 11 crates `93/23/0` + lib 8 unit。release 全套 ~10 min（bucket_quality ~137 s / clustering_determinism ~405 s 大头）。
-- `cargo test --release --test perf_slo -- --ignored --nocapture stage2_`：**3 hard pass on idle host**。mapping 31.8M/s（318× over）/ bucket lookup P95=131 ns（76× under）/ equity MC vultr 4-core idle 50-run aggregate `mean 1102.1 hand/s / 50/50 PASS`。
-- `cargo bench --bench baseline ... abstraction/equity_monte_carlo/flop_10k_iter`：thrpt 中位 **916 elem/s**（vs §E-rev0 baseline 469 elem/s **+95%**）。
-- `cargo test --release --test abstraction_fuzz -- --ignored`：1M iter 3 个 full 套件 0 panic / 0 invariant violation。
-- artifact `artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`（95 KB / 不进 git history）BLAKE3 `0a1b95e958b3c9057065929093302cd5a9067c5c0e7b4fb8c19a22fa2c8a743b` + 跨架构 baseline `tests/data/bucket-table-arch-hashes-linux-x86_64.txt`（32-seed × 3 街）byte-equal 维持；darwin-aarch64 baseline 仍 aspirational（D-052）。
-- `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` byte-equal，stage 2 公开 API 0 签名漂移（E2 仅 additive `fill_u64s`）。
+- `cargo test --release --no-fail-fast`：**245 passed / 45 ignored / 0 failed across 31 test crates**（与 §E-rev1 batch 1 baseline 197/42/0 → +48 active +3 ignored +4 crates）。stage-1 baseline 16 crates `104/19/0` 与 `stage1-v1.0` tag byte-equal（D-272 不退化满足；F1 0 触产品代码）；stage-2 15 crates `141/26/0` + lib 8 unit。release 全套 ~13 min（bucket_quality ~137 s + clustering_determinism ~405 s + bucket_table_corruption ~106 s + bucket_table_schema_compat ~100 s 四大头）。
+- `cargo test --release --test perf_slo -- --ignored --nocapture stage2_`：**3 hard pass on idle host**（与 §E-rev1 §5 closure 同数字；F1 0 触 SLO 路径）。
+- `cargo bench --bench baseline ... abstraction/equity_monte_carlo/flop_10k_iter`：thrpt 中位 **916 elem/s**（不变）。
+- `cargo test --release --test abstraction_fuzz -- --ignored`：1M iter 3 个 full 套件 0 panic / 0 invariant violation（不变）。
+- artifact `artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`（95 KB / 不进 git history）BLAKE3 `0a1b95e958b3c9057065929093302cd5a9067c5c0e7b4fb8c19a22fa2c8a743b` 不变 + 跨架构 baseline `tests/data/bucket-table-arch-hashes-linux-x86_64.txt`（32-seed × 3 街）byte-equal 维持；darwin-aarch64 baseline 仍 aspirational（D-052）。
+- `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` byte-equal，stage 2 公开 API 0 签名漂移（F1 [测试] 单边路径 0 越界）。
 
-### 下一步：Stage 2 F1 [测试]
+### 下一步：Stage 2 F2 [实现]
 
-按 §F1 §输出 落地兼容性 + 错误路径测试：(1) `tests/bucket_table_schema_compat.rs` v1 → v2；(2) `tests/bucket_table_corruption.rs` byte flip 100k 次 0 panic + 5 类错误（`FileNotFound` / `SchemaMismatch` / `FeatureSetMismatch` / `Corrupted` / `SizeMismatch`）覆盖；(3) `tests/off_tree_action_boundary.rs` 1M 个边界 `real_bet`；(4) `tests/equity_calculator_lookup.rs` iter=0/1/u32::MAX。出口：所有测试编译通过；部分会失败留给 F2。预算 0.3 人周。
+按 §F2 §出口 让 F1 全绿；§F-rev0 batch 1 预期形态：F1 测试**已经全绿**（48 passed / 3 ignored / 0 failed），因 5 类 BucketTableError + D-201 PHM stub + EquityError 在前置 C2/D2 commits 已实现。F2 commit 走 stage-1 §C-rev1 / §F-rev0 同形态 0 产品代码改动 carve-out closure（仅本文档 + workflow §修订历史 §F-rev0 batch 1 追认）。如 review 期间发现遗漏边界 bug 再 [实现] 路径修。预算 0.3 人周 → 实际预期 < 0.05 人周（文档 only）。
 
 ## Documents and their authority
 

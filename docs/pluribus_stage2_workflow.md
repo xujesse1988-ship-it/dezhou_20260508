@@ -1610,3 +1610,80 @@ E2 [实现] 落地 commit `d21c5d9` 后的独立 review 抽查暴露 2 处程序
 **实测验证**（procedural follow-through commit 落地后期望）：`cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` / `cargo test --release --no-fail-fast` 全绿；**197 passed / 42 ignored / 0 failed across 27 test crates** 与 E2 闭合 commit `d21c5d9` byte-equal；vultr 4-core idle box 实测 D-282 SLO 50-run aggregate **mean 1102.1 hand/s / std 10.6 / min 1061.7 / max 1117.3 / 50/50 PASS 100%** 同 batch byte-equal 复跑（procedural follow-through commit 不动 `src/abstraction/equity.rs` hot path / 不动 RNG 消费 / 不动 OCHS table）。
 
 下一步：F1 [测试]（按 `pluribus_stage2_workflow.md` §F1 §输出 落地兼容性 + 错误路径测试：`tests/bucket_table_schema_compat.rs` v1 → v2 schema 兼容性 / `tests/bucket_table_corruption.rs` byte flip 100k 次 0 panic + 5 类错误覆盖 / `tests/off_tree_action_boundary.rs` 1M 个边界 `real_bet` 抽象映射稳定 / `tests/equity_calculator_lookup.rs` iter=0/1/u32::MAX 边界 + R1 stage 2 trip-wire 追加 `fill_u64s` 签名断言。预算 0.3 人周）。
+
+---
+
+### §F-rev0 batch 1（2026-05-11，F1 [测试] 闭合）
+
+#### §F-rev0 §1：F1 §输出 4 个文件落地
+
+按 `pluribus_stage2_workflow.md` §F1 §输出 字面 4 件套全部落地（[测试] 单边路径，0 越界）：
+
+| 文件 | active / ignored 数 | 内容 |
+|---|---|---|
+| `tests/bucket_table_schema_compat.rs` | 9 / 0 | (A) 6 个 schema 常量锁定 + (B) v1 train→write→open round-trip 稳定 + 3 个 header 偏移 byte 锁定 / (C) v2 / v0 / u32::MAX schema_version → `SchemaMismatch` 拒绝 / (C') feature_set_id = 2 → `FeatureSetMismatch` |
+| `tests/bucket_table_corruption.rs` | 12 / 1 | 5 类 `BucketTableError` 命名 case（FileNotFound / SchemaMismatch / FeatureSetMismatch / Corrupted{magic, pad, BLAKE3} / SizeMismatch{header-only, zero, off-by-one}）+ 1k byte-flip smoke `random_byte_flip_smoke_1k_no_panic`（active）+ 100k full `#[ignore = "F1 full"]` + 5 类 exhaustive variant match trip-wire |
+| `tests/off_tree_action_boundary.rs` | 11 / 1 | (A) 5 类命名 `real_to` 边界（0 / 1 / max_committed / cap / cap+1）+ (B) 6 seed × 5 stride multi-stage sweep + (C) 9-value boundary table × 6 seed = 54+ 组合 + (D) overflow 路径不可达 carve-out + (E) 1k random fuzz smoke `random_boundary_real_to_smoke_1k`（active）+ 1M full `#[ignore]` + (F) fresh state sanity；I1..I5 不变量 (determinism / no-panic / LA-002 / AllIn.to=cap / ratio_label ∈ config) |
+| `tests/equity_calculator_lookup.rs` | 16 / 1 | (A) chain setter 链式语义 / (B) iter=0 × 4 方法 × 4 街 → IterTooLow（含 equity_vs_hand 仅 preflop 触发 IterTooLow / river / turn / flop 确定性 Ok 的分流断言）/ (C) iter=1 × 4 方法 × 4 街 → finite ∈ [0,1] / (D) iter=u32::MAX 构造侧 smoke + river equity_vs_hand 不耗 RNG 实跑 + flop equity full `#[ignore]` / (E) EquityError 5 变体 exhaustive match / (F)(G) InvalidBoardLen / OverlapBoard / OverlapHole 边界 |
+
+外加 `tests/api_signatures.rs` 追加 `<ChaCha20Rng as RngSource>::fill_u64s` UFCS trip-wire（§E-rev1 §9 R1 procedural follow-through 同 PR 落地，与 §E-rev1 §9 [测试] 触发条件字面要求一致）。
+
+实测出口数据（**release profile only**，详见 §F-rev0 §3 carve-out）：
+
+```
+running 13 tests bucket_table_corruption  → 12 passed / 1 ignored / 0 failed   106.34 s
+running  9 tests bucket_table_schema_compat → 9 passed / 0 ignored / 0 failed  100.46 s
+running 17 tests equity_calculator_lookup → 16 passed / 1 ignored / 0 failed     0.35 s
+running 12 tests off_tree_action_boundary → 11 passed / 1 ignored / 0 failed     0.00 s
+合计：                                       48 passed / 3 ignored / 0 failed
+```
+
+#### §F-rev0 §2：F1 测试全绿 / F2 [实现] 0 产品代码改动 carve-out
+
+**§F1 §出口字面**：
+
+> 出口标准：所有测试编译通过；部分会失败留给 F2。
+
+**实测结果**：F1 4 个文件 48 active assertion 全绿，0 失败。原因：
+
+1. **5 类 `BucketTableError` variants 在 C2 已完整实现**（`src/abstraction/bucket_table.rs::from_bytes` 9 个 `return Err(...)` 分支，详见 §C-rev1 §C2 关闭节）。F1 测试构造 5 类 fixture（FileNotFound / SchemaMismatch / FeatureSetMismatch / Corrupted×4 / SizeMismatch×3）全部命中已实现的错误路径。
+2. **D-201 `map_off_tree` PHM stub 在 D2 已确定性化**（`src/abstraction/action.rs::map_off_tree` 4 分支整数算术 + saturating_add + tie-break smaller milli first，详见 §D-rev1 §1 D2 关闭节）。F1 测试 5 类边界 `real_to` 全部走稳定路径输出，0 panic / 0 不确定性。
+3. **`EquityError::IterTooLow` 在 B2 起就在**（`src/abstraction/equity.rs` 4 方法 4 个无条件 `return Err(IterTooLow { got: 0 })` 检查，line 170 / 280 / 304 / 367）。F1 iter=0 测试全部命中已实现的早返回路径。
+4. **InvalidBoardLen / OverlapHole / OverlapBoard / chain setter / EquityCalculator trait 方法签名** 全部在 B2 已落地（`MonteCarloEquity` 朴素实现 + `with_iter` / `with_opp_clusters` chain）。
+
+**F2 [实现] 预期形态**：与 stage-1 §C-rev1（C2 关闭无产品代码改动 + carve-out）+ stage-1 §F-rev0（F1 错误路径结构性缺位 carve-out）同形态——纯文档 carve-out commit 追认「F1 测试已经全绿，无产品代码 bug 暴露」。如 F2 review 期间 senior 抽查发现遗漏边界（例如 schema_version = 2 应走升级路径而非 SchemaMismatch 拒绝；当前 v1-only 不需要），新 bug 由 F2 [实现] 路径修；否则 F2 commit 仅追加 `docs/pluribus_stage2_workflow.md` §F-rev1 batch 1 + `CLAUDE.md` 状态翻面。预算 0.3 人周 → 实际预期 < 0.05 人周（与 stage-1 §F-rev0 0 改动 closure 同型预期）。
+
+#### §F-rev0 §3：debug-mode training fixture 成本 carve-out
+
+`bucket_table_schema_compat.rs` / `bucket_table_corruption.rs` 各持一份 `OnceLock<Vec<u8>>` fixture，`BucketTable::train_in_memory(BucketConfig { 10, 10, 10 }, seed, evaluator, 50 iter)`：
+
+- **release profile**：~5 s 训练 + ~100 s 全套（含 1k byte-flip × BLAKE3 over 80 KB）= 单 crate ~100 s 总。
+- **debug profile**：~10 min 训练（实测在 debug-mode `cargo test` 初次跑 bucket_table_corruption 9 min 后未完成，被 SIGTERM kill）+ 1k byte-flip × debug BLAKE3 也 10×–30× release 慢。
+
+**carve-out 政策**：本 F1 batch **不**追加 `#[ignore = "F1 release-only"]` 把训练-heavy 测试隔离到 release——与 `tests/bucket_quality.rs` cached_trained_table 同形态：默认 active，debug profile 实际开发跑得起的人手动 `cargo test --release`。CI / nightly fuzz job 走 release，debug-mode 慢跑不阻塞主流程。F2 [实现] 不需要解此 carve-out（属测试成本权衡，不属错误路径覆盖）。
+
+#### §F-rev0 §4：[实现] 越界审计 = 0
+
+F1 [测试] 严守 [测试] 角色边界：
+
+- **未修改产品代码**：`src/abstraction/{bucket_table,equity,action,postflop,info,preflop,cluster,feature}.rs` / `src/core/{mod,chips,rng}.rs` / `src/eval.rs` / `src/rules/{state,config,action}.rs` 全部 0 行改动。
+- **`tests/api_signatures.rs` 追加 fill_u64s trip-wire 是 stage-1 API-005-rev1 procedural follow-through 闭合**（§E-rev1 §9 R1 [测试] 触发条件字面要求 「F1 [测试] agent 在落地 ... 时同 PR 触发」）—— 本 PR 同 commit 落地，与 §E-rev1 §9 触发条件 byte-equal 兑现，不属新越界。
+- **stage-2 §B-rev1 §3 / §C-rev1 §3 / §D-rev1 §1 三处 [实现] → [测试] 越界 carve-out 不传染**到 F1（与 stage-1 §C-rev1 / §E-rev0 / §F-rev0 同型 «常规闭合 + 0 越界»）。
+
+#### §F-rev0 §5：F1 closure 后实测验证
+
+- `cargo fmt --all --check`：全绿。
+- `cargo clippy --all-targets -- -D warnings`：全绿（含本 batch 4 新 test 文件首过 clippy 时触发 4 类 lint 修订：unusual_byte_groupings × 3 + expect_fun_call × 5 + identity_op × 1 + unnecessary_unwrap × 1 + let_and_return × 1 + unused_imports × 2，全部 [测试] agent 单边路径修正）。
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。
+- `cargo test --release --test bucket_table_schema_compat --test bucket_table_corruption --test off_tree_action_boundary --test equity_calculator_lookup`：48 passed / 3 ignored / 0 failed（§F-rev0 §1 表）。
+- `cargo test --test api_signatures`：1 passed / 0 failed（fill_u64s trip-wire 编译期锁定通过）。
+
+**stage-2 全套 release baseline 不在本 batch 实跑**（F1 [测试] 单边路径，0 触产品代码；stage-1 baseline 16 crates 与 stage-2 既有 11 crates 路径 byte-equal 不变；新加 4 crates 48 passed 已实测）；F2 [实现] 闭合 commit 同 PR 实跑 `cargo test --release --no-fail-fast` 全套 245 passed / 45 ignored / 0 failed across 31 test crates 兜底验证。
+
+#### §F-rev0 §6 carry forward 处理政策（与 §A-rev0..§E-rev1 一致，不重新论证）
+
+- 阶段 1 §B-rev1 §3 / §C-rev1 / §D-rev0 / §E-rev0 / §E-rev1 / §F-rev0 / §F-rev1 / §F-rev2 既往政策保持继承不变。stage-1 §F-rev0 处理政策 «错误路径结构性缺位 carve-out + 三类断言（结构性 / 防 panic / 边界完备）+ F2 视角说明» 在 stage-2 路径下同形态适用——本 batch 落地 `tests/equity_calculator_lookup.rs` (A)/(B)/(C)/(D)/(E)/(F)/(G) 7 段分类直接镜像 stage-1 `tests/evaluator_lookup.rs` (A)/(B)/(C) 三段结构；`tests/bucket_table_corruption.rs` 镜像 stage-1 `tests/history_corruption.rs` 「三类输入 + exhaustive variant trip-wire」 结构。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 `CLAUDE.md` Stage 2 progress F1 closed 段新增 + 测试基线翻面 + 下一步 F2 [实现]。
+- carve-out 政策：本 batch §F-rev0 §3 carve-out 是「测试 fixture 训练成本 vs profile」类型，与 §C-rev1 §1（cluster_iter ≤ 500 EHS² ≈ equity² 近似）/ §F-rev0 §2「F1 测试全绿 → F2 0 产品代码改动 closure」carve-out 同形态——书面记录 + 测试默认 active（用户 debug profile 实跑由 `cargo test --release` opt-in），不破 [测试] 角色边界。
+
+下一步：F2 [实现]（按 `pluribus_stage2_workflow.md` §F2 §出口 让 F1 全绿；预期形态 §F-rev0 §2 字面 stage-1 §F-rev0 / §C-rev1 同形态 0 产品代码改动 closure；如 F2 review 期间暴露遗漏边界则按 §F-rev1 「错误前移到 from_proto」 同模式收口）。

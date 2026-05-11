@@ -64,6 +64,11 @@ fn _api_signature_assertions() {
     let _: fn(u64) -> ChaCha20Rng = ChaCha20Rng::from_seed;
     // RngSource::next_u64 是 trait 方法，rustc 在 trait 定义处校验签名。
     // RngCoreAdapter::from_rng_core 是泛型方法，fn 指针无法表达，跳过。
+    // API-005-rev1（§E-rev1 §9 R1 procedural follow-through，F1 [测试] 同 PR 落地）：
+    // `RngSource::fill_u64s` default-impl trait 方法 UFCS 绑定，让 trait↔impl 任一漂移
+    // 立即在 `cargo test --no-run` 失败。
+    let _: for<'a, 'b> fn(&'a mut ChaCha20Rng, &'b mut [u64]) =
+        <ChaCha20Rng as RngSource>::fill_u64s;
 
     // ===================================================================
     // rules::action / config (api §2 / §3)
