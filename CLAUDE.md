@@ -239,6 +239,7 @@ If a change affects a decision or API signature, follow the **D-NNN-revM / API-N
 - **D-037-rev1**（D2 [实现] 落地）— `last_aggressor` 作用域从「整手最后一次 voluntary bet/raise」收紧到「**最后一条 betting round 内**最后一次 voluntary bet/raise」（PokerKit `_begin_betting` (state.py:3381) 每条街起手清 `opener_index` 语义）。
 - **API-001-rev1** — `HandHistory::replay` / `replay_to` 返回 `Result<_, HistoryError>` instead of `RuleError`；`HistoryError::Rule { index, source: RuleError }` wraps 底层 rule error。
 - **API-004-rev1**（B2 [实现] stage-2 触发）— `GameState::config(&self) -> &TableConfig` additive 只读 getter（`stack_bucket` 来源 D-211-rev1 所需）。
+- **API-005-rev1**（E2 [实现] stage-2 触发 → E2 关闭后 review procedural follow-through 落地）— `RngSource` trait 新增 `fill_u64s(&mut self, dst: &mut [u64])` default-impl 方法（additive；不修改 `next_u64` 既有签名）。byte-equal 不变量：default impl 字节序列严格等价于循环 `next_u64`（D-051 / D-228 / D-237 全部满足）。E2 `src/core/rng.rs:16-30` 改动 + `ChaCha20Rng::fill_u64s` override 用于 `MonteCarloEquity::equity` hot path 减少 vtable dispatch（D-282 SLO 达成）；E2 commit `d21c5d9` 漏 stage 1 API rev 同步，由 §E-rev1 §9 procedural follow-through commit 追认。
 
 ## Workflow (multi-agent, strict role boundaries) — applies to all stages
 

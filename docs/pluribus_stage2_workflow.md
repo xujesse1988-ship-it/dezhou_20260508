@@ -1576,4 +1576,20 @@ E2 [实现] 严守 [实现] 角色边界——产品代码改动全部在 `src/`
 - §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 触 `CLAUDE.md` Stage 2 progress 完整翻面（E2 closed 段新增 + 测试基线持平 + 下一步 F1 [测试]）。
 - carve-out 政策：本 batch §E-rev1 §5 carve-out 是「host-load 敏感 SLO」类型，与 §C-rev1 §1（cluster_iter ≤ 500 EHS² ≈ equity² 近似）/ §D-rev0 §4（D2 [实现] 闭合时 cross_arch_bucket_id_baseline 实跑 follow-through）等「实测后追认」carve-out 同形态——书面记录 + idle host 下复跑验证，不破 [实现] 角色边界 + 不破单线程 SLO 字面要求。
 
-下一步：F1 [测试]（按 `pluribus_stage2_workflow.md` §F1 §输出 落地兼容性 + 错误路径测试：`tests/bucket_table_schema_compat.rs` v1 → v2 schema 兼容性 / `tests/bucket_table_corruption.rs` byte flip 100k 次 0 panic + 5 类错误覆盖 / `tests/off_tree_action_boundary.rs` 1M 个边界 `real_bet` 抽象映射稳定 / `tests/equity_calculator_lookup.rs` iter=0/1/u32::MAX 边界。预算 0.3 人周）。
+##### §E-rev1 §9 procedural follow-through batch（2026-05-10，E2 闭合后 review 触发）
+
+E2 [实现] 落地 commit `d21c5d9` 后的独立 review 抽查暴露 2 处程序性遗漏：(R1) §1.5 `RngSource::fill_u64s` 改动违反 `pluribus_stage2_validation.md` §7 line 99-100 字面「阶段 1 `RngSource` API surface **冻结** / 必须走阶段 1 API-NNN-revM 修订流程」——E2 commit 触 `src/core/rng.rs:16-30` trait 表面但未同步 `pluribus_stage1_api.md` §11 API rev 条目；(R2) §1.6 `MonteCarloEquity::equity()` hot path 直调 `crate::eval::eval7` 与 `equity_vs_hand` / `ehs_squared` / `ochs` 走 `self.evaluator.eval7(...)` 不一致，与 `MonteCarloEquity::new(evaluator: Arc<dyn HandEvaluator>)` 公开 API 契约 stage 3+ 不兼容（stage 2 唯一 `NaiveHandEvaluator` 实现下两条路径数学等价，stage 3+ 引入第二个实现时风险）。
+
+**本 §9 落地 procedural follow-through commit（docs-only，0 src/ 改动 / 0 测试改动 / 0 SLO 出口数据变化）**：
+
+- (R1) `pluribus_stage1_api.md` §7 `RngSource` trait spec 同步追加 `fill_u64s` default-impl + §11 修订历史追加 `API-005-rev1` 条目（与 B2 [实现] 触发 `API-004-rev1` 同型 procedural pattern：纯 additive default-impl trait 方法 / byte-equal RNG 字节序列 / 不破任何 stage 1 既有 `RngSource` 实现 / `tests/api_signatures.rs` stage 1 trip-wire 不引用 `fill_u64s` 不需要修改；stage 2 trip-wire 在 stage 2 F1 [测试] 加入时再覆盖，与 `API-004-rev1` stage 2 trip-wire B1 加入同型）。
+- (R2) `pluribus_stage2_api.md` §3 `MonteCarloEquity` 节追加「Hot-path evaluator carve-out（E-rev1）」段落（明示 stage 2 当前无功能影响 + stage 3+ 风险 + 闭合路径二选一：恢复 trait dispatch 或修订 `MonteCarloEquity::new` 签名）+ §9 §修订历史追加 E2 关闭后 review 触发 procedural follow-through batch 子节。
+- `CLAUDE.md` Documents and their authority 修订历史索引追加 `API-005-rev1` 条目。
+
+**[实现] 角色越界审计**：本 §9 procedural follow-through commit 是 docs-only follow-up，与 stage-2 §B-rev1 §3 / §C-rev1 §3 / §D-rev1 §1 三处 [实现] → [测试] 越界 carve-out **类型不同**（前者是 docs追认，后者是 [实现] 同 commit 触 [测试] 文件）；本 §9 触发文件全部在 `docs/` 与 `CLAUDE.md`，未触 `src/` / `tests/` / `benches/` / `tools/` / `fuzz/` 任意文件——属 [报告] / 文档维护范畴，不破 [实现] 单边路径承诺。
+
+**[测试] 触发条件**：R1 stage 2 trip-wire 覆盖（`tests/api_signatures.rs` 追加 `let _: fn(&mut dyn RngSource, &mut [u64]) = RngSource::fill_u64s;` 同型断言）由 F1 [测试] agent 在落地 `tests/bucket_table_schema_compat.rs` / `off_tree_action_boundary.rs` 等 stage-2 trip-wire 扩展时同 PR 触发；R2 stage 3+ 闭合路径选择在引入第二个 `HandEvaluator` 实现的 PR 同 commit 触发，stage 2 范围内不收口。
+
+**实测验证**（procedural follow-through commit 落地后期望）：`cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` / `cargo test --release --no-fail-fast` 全绿；**197 passed / 42 ignored / 0 failed across 27 test crates** 与 E2 闭合 commit `d21c5d9` byte-equal；vultr 4-core idle box 实测 D-282 SLO 50-run aggregate **mean 1102.1 hand/s / std 10.6 / min 1061.7 / max 1117.3 / 50/50 PASS 100%** 同 batch byte-equal 复跑（procedural follow-through commit 不动 `src/abstraction/equity.rs` hot path / 不动 RNG 消费 / 不动 OCHS table）。
+
+下一步：F1 [测试]（按 `pluribus_stage2_workflow.md` §F1 §输出 落地兼容性 + 错误路径测试：`tests/bucket_table_schema_compat.rs` v1 → v2 schema 兼容性 / `tests/bucket_table_corruption.rs` byte flip 100k 次 0 panic + 5 类错误覆盖 / `tests/off_tree_action_boundary.rs` 1M 个边界 `real_bet` 抽象映射稳定 / `tests/equity_calculator_lookup.rs` iter=0/1/u32::MAX 边界 + R1 stage 2 trip-wire 追加 `fill_u64s` 签名断言。预算 0.3 人周）。

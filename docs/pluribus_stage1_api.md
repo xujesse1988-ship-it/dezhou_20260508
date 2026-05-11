@@ -428,6 +428,18 @@ pub trait HandEvaluator: Send + Sync {
 /// 实现方必须满足 `Send`。`Sync` 不强制（每线程持有独占 rng）。
 pub trait RngSource: Send {
     fn next_u64(&mut self) -> u64;
+
+    /// 批量抽样到 `dst`（API-005-rev1，stage 2 §E-rev1 引入；additive
+    /// default-impl）。默认实现顺序循环 `next_u64`；具体 impl 可 override
+    /// 减少 `&mut dyn RngSource` hot path 的 vtable dispatch 开销。字节序列
+    /// 与 `for x in dst { *x = self.next_u64(); }` byte-equal（D-051 / D-228
+    /// 同 seed 字节确定性不变量）。
+    #[inline]
+    fn fill_u64s(&mut self, dst: &mut [u64]) {
+        for x in dst.iter_mut() {
+            *x = self.next_u64();
+        }
+    }
 }
 
 /// 标准实现：基于 ChaCha20，seed-determined。
@@ -688,6 +700,46 @@ message Payout {
     不需要再起一条 `pluribus_stage2_api.md` rev 条目——stage 2 `InfoAbstraction::map`
     签名不变，只是 trait doc 中 "B2 [实现] 触发 stage 1 API rev" 条款此 commit
     落地。
+
+- **API-005-rev1** (2026-05-10)：`RngSource` trait 新增 `fill_u64s(&mut self, dst: &mut [u64])`
+  default-impl 方法（additive；不修改既有 `next_u64` 签名）。
+  - **背景**：stage 2 E2 [实现] §E-rev1 §1.5 落地 `MonteCarloEquity::equity`
+    hot path 优化时发现：`&mut dyn RngSource` 每次调用 `next_u64()` 走一次
+    vtable dispatch；equity Monte Carlo 每 iter 抽 `2 + needed_board` 张牌
+    （flop 4 / turn 3 / river 2 / preflop 7），每 iter 多次 vtable 派发
+    在 1M+ iter 累积可观（4-call 路径 ~12-15 ns 节省 × 10k iter = ~120-150
+    µs/hand）。
+  - **理由**：纯 additive default-impl 改动——既有 `RngSource` 实现（含
+    `ChaCha20Rng` / `RngCoreAdapter` / 任意 stacked deck 测试实现）0 改动即
+    自动获得默认顺序循环语义；具体实现（如 `ChaCha20Rng`）按需 override
+    单次 vtable dispatch + N 次内联 `inner.next_u64()`。byte-equal 不变量：
+    `fill_u64s` 默认实现严格等价于循环 `next_u64`，OCHS table / bucket
+    table / `cross_arch_bucket_id_baseline` 32-seed BLAKE3 baseline 全部
+    byte-equal 不漂移（D-051 same-arch / D-228 sub-stream / D-237
+    determinism 全部满足）。
+  - **影响**：
+    - 不影响 protobuf schema（不 bump `HandHistory.schema_version`）。
+    - 不影响 stage 1 既有测试 / SLO：default-impl 让所有 stage 1 `RngSource`
+      调用点（`GameState::new` / `with_rng` D-028 dealing 协议 / 任何
+      `&mut dyn RngSource` 入参）byte-equal 不变；`tests/api_signatures.rs`
+      stage 1 既有 trip-wire 断言 `RngSource::next_u64` 签名，不引用
+      `fill_u64s`，所以不需要修改 stage 1 trip-wire。stage 2 trip-wire 在
+      stage 2 F1 [测试] 加入时再覆盖（与 API-004-rev1 同型，stage 2 B1
+      [测试] 加入对应）。
+    - 触发条件（stage 2 §修订历史 §E-rev1 §9 procedural follow-through）：
+      E2 [实现] commit `d21c5d9` 同 PR 改动 `src/core/rng.rs:16-30` 落地
+      `fill_u64s` trait 方法 + `ChaCha20Rng::fill_u64s` override，但**漏了
+      stage 1 API-NNN-revM 同步**；本 rev 由 E2 闭合 review 触发的 docs-only
+      follow-up commit 追认（与 validation `§7 line 100` 字面 "阶段 1
+      API-NNN 锁定的方法签名变化必须走阶段 1 API-NNN-revM 修订流程" 闭合）。
+    - 后向兼容：所有依赖 stage 1 `RngSource` API 的 stage 1 测试 / 工具
+      继续编译通过；新增 default-impl 方法不破坏任何既有 impl（trait
+      新增 default-impl method 是 Rust 后向兼容的标准 additive 操作）。
+  - **stage 2 配套**：本 rev 由 stage 2 E2 [实现] 实际改动触发，stage 2
+    `pluribus_stage2_api.md` §9 §修订历史 §E-rev1 batch 追加交叉引用
+    （stage 2 公开 API 表面不动——`MonteCarloEquity` / `EquityCalculator`
+    / `BucketTable` 全部 byte-equal；本 rev 仅落实 stage 1 `RngSource`
+    surface 的 additive 扩展）。
 
 ---
 

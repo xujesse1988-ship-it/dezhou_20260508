@@ -467,6 +467,18 @@ impl MonteCarloEquity {
 impl EquityCalculator for MonteCarloEquity { /* ... */ }
 ```
 
+#### MonteCarloEquity hot-path evaluator carve-out（E-rev1）
+
+stage 2 E2 [实现] §E-rev1 §1.6 为达成 D-282 SLO（`≥ 1,000 hand/s @ 10k iter`，单线程）将 `equity(hole, board, rng)` 内部分发到 const-generic `equity_hot_loop`，hot loop 直调 `crate::eval::eval7` 跳过 `&dyn HandEvaluator` vtable dispatch；其它三条 API 方法（`equity_vs_hand` / `ehs_squared` / `ochs`，含 OCHS table 预计算路径）仍走 `self.evaluator.eval7(...)` trait dispatch。**直接后果**：
+
+- **stage 2 当前**：唯一具体 `HandEvaluator` 实现是 `NaiveHandEvaluator`（stage 1 §6），其 `eval7` 内部就是 `eval_inner::<7>`，与 `crate::eval::eval7` 字面同一函数体；用户传入 `MonteCarloEquity::new(Arc::new(NaiveHandEvaluator))` 时 `equity` 与 `equity_vs_hand` 两条路径返回值数学等价（同 `(hole, board)` byte-equal `HandRank` 输出）。stage 2 唯一 in-tree 使用全部满足此前提，**stage 2 验收无功能影响**。
+- **stage 3+ 风险**：若未来引入第二个 `HandEvaluator` 实现（如 bitmask perfect-hash 评估器、external lookup table 评估器等），`MonteCarloEquity::new(custom_evaluator)` 注入后 `equity()` **仍走 `NaiveHandEvaluator`**（直调路径硬编码），`equity_vs_hand` / `ehs_squared` / `ochs` 走 `custom_evaluator`——两条路径返回值**可能数学不等价**，破坏「`MonteCarloEquity::new(evaluator)` 接受注入 evaluator」的公开 API 契约最小一致性。
+- **闭合路径**：stage 3+ 引入新 `HandEvaluator` 实现的 PR 必须同步以下二选一：
+    1. 把 hot path 直调 `crate::eval::eval7` 改回 `self.evaluator.eval7(&cards)`，接受 trait dispatch 性能回退（D-282 SLO 可能跌回 §E-rev0 baseline 502 hand/s 路径，需要重新评估优化方案）；或
+    2. 走 API-NNN-revM 流程修改 `MonteCarloEquity` 公开 API，移除 `new(evaluator)` 的注入参数或加入 `with_naive_hot_path(bool)` 显式开关，把当前 hardcode 行为提升为契约（连同 stage 2 既有 `MonteCarloEquity::new(NaiveHandEvaluator)` 使用点同步更新）。
+
+stage 2 [实现] 期间不收口本 carve-out（保留当前 hot path 直调以达成 D-282 SLO 出口数据 mean 1102 hand/s on idle 4-core host）；stage 2 ≤ B1..F3 全套 SLO + B / C / D 全套正确性测试与本 carve-out 兼容（详见 `pluribus_stage2_workflow.md` §修订历史 §E-rev1 §9）。
+
 ### Equity calculator 不变量
 
 - EQ-001-rev1 反对称容差（D-220a-rev1，**pairwise 路径**；§9）：使用 `equity_vs_hand(A, B, board, rng)` 接口（**不**用 `equity(hole, board, rng)`——后者 random-opp 不满足反对称）。容差按街分流：① **postflop**（`board.len() ≥ 3`）：确定性枚举无 RNG 消费，`|r_ab + r_ba - 1| ≤ 1e-9`（IEEE-754 reorder 容忍）；② **preflop strict**（`board.len() == 0`）：必须用**两个独立 `RngSource`，各自从同一 `derive_substream_seed(master_seed, EQUITY_MONTE_CARLO, sub_index)` 构造**——`|r_ab + r_ba - 1| ≤ 1e-9`；③ **preflop noisy**（不同 sub_seed）：容忍 ≤ 0.005（10k iter）/ ≤ 0.02（1k iter）。**禁止模式**：顺序复用同一 `&mut rng` 调用两次后做严格反对称断言（第二次调用看到推进后 RngSource state，采到不同 future board，sum != 1）。`tests/equity_self_consistency.rs` 必须先走 postflop 严格容差路径，preflop strict / noisy 路径单独命名。
@@ -1195,6 +1207,28 @@ D-244 / D-255 锁 mmap 加载（`memmap2::Mmap::map`），但 stage 1 `Cargo.tom
 - **未修改**：`tests/api_signatures.rs` trip-wire / `src/lib.rs` 顶层 re-export / 阶段 1 全部 `src/` 与 `tests/`。
 
 **复跑 5 道 gate**：`cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` / `cargo test`（187 passed / 34 ignored / 0 failed across 25 test crates；stage 1 baseline `104 passed / 19 ignored` byte-equal 不退化）全绿。
+
+---
+
+#### E2 关闭后 review 触发的 procedural follow-through batch（2026-05-10，E2 已闭合 `d21c5d9`）
+
+E2 [实现] 落地 commit `d21c5d9` 的 review 抽查暴露 2 处程序性遗漏；本 batch 走 docs-only follow-up，**0 src/ 改动 / 0 测试改动 / 0 SLO 出口数据变化**，仅追认 stage boundary procedural 流程，与 `pluribus_stage1_api.md` §11 API-005-rev1 同 PR 落地。详见 `pluribus_stage2_workflow.md` §修订历史 §E-rev1 §9。
+
+| 观察 | 类型 | 处理 |
+|---|---|---|
+| R1：`src/core/rng.rs:16-30` 新增 `RngSource::fill_u64s` default-impl trait 方法，但未走 stage 1 `pluribus_stage1_api.md` §11 `API-NNN-revM` 流程；与 `pluribus_stage2_validation.md` §7 line 99-100 字面「阶段 1 `RngSource` API surface **冻结** / 必须走阶段 1 API-NNN-revM 修订流程」冲突 | procedural | 本 batch 同 commit 触 `pluribus_stage1_api.md` §7 trait spec 同步 + §11 追加 `API-005-rev1` 条目（与 B2 [实现] 触发 `API-004-rev1` 同型 procedural pattern）。代码改动不动（additive default-impl 是 Rust 后向兼容标准操作；byte-equal 不变量满足 D-051 / D-228 / D-237），仅落实文档同步 |
+| R2：`MonteCarloEquity::equity()` hot path 直调 `crate::eval::eval7` 跳过注入的 `&dyn HandEvaluator`（`src/abstraction/equity.rs::equity_hot_loop` 3 处 `let _ = evaluator;`），与 `equity_vs_hand` / `ehs_squared` / `ochs` 路径使用 `self.evaluator.eval7(...)` 不一致；stage 2 唯一 `NaiveHandEvaluator` 实现下两条路径数学等价，但 stage 3+ 引入第二个实现时风险 | API 契约 carve-out | 本 batch §3 `MonteCarloEquity` 节追加「Hot-path evaluator carve-out（E-rev1）」段落明示风险 + 提供 stage 3+ 闭合路径二选一（恢复 trait dispatch 或修订 `MonteCarloEquity::new` 签名移除注入）；不动代码 / 不动测试 / 不改动公开签名（`MonteCarloEquity::new(evaluator: Arc<dyn HandEvaluator>)` 签名保持，与 §3 既有 doc 一致）|
+
+**触发文件**（procedural follow-through commit）：
+
+- `docs/pluribus_stage1_api.md`：§7 `RngSource` trait spec 更新 `fill_u64s` + §11 追加 `API-005-rev1` 条目
+- `docs/pluribus_stage2_api.md`：§3 `MonteCarloEquity` 章节追加「Hot-path evaluator carve-out」+ 本 §修订历史 batch 子节追加（即本节）
+- `docs/pluribus_stage2_workflow.md`：§修订历史 §E-rev1 追加 §9 procedural follow-through 子节
+- `CLAUDE.md`：§Documents and their authority 修订历史索引追加 `API-005-rev1` 条目
+
+**触发文件审计**：`src/` 任意路径**未修改一行**；`tests/api_signatures.rs` trip-wire **未修改一行**（stage 1 既有断言不引用 `fill_u64s`；stage 2 trip-wire 在 F1 [测试] 加入时再覆盖，与 `API-004-rev1` stage 2 trip-wire B1 加入同型）；`Cargo.toml` / `Cargo.lock` 依赖列表**未修改一行**——0 公开签名漂移、0 trip-wire 漂移、0 测试回归、0 SLO 出口数据变化（vultr 4-core idle box 实测 D-282 mean 1102.1 hand/s 出口与本 batch 落地无关，本 batch 后实测同 host 复跑应 byte-equal）。
+
+**复跑 5 道 gate**（E2 闭合 commit `d21c5d9` 同型 + 本 procedural follow-through commit 复验）：`cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` / `cargo test`（197 passed / 42 ignored / 0 failed across 27 test crates；stage 1 baseline `104 passed / 19 ignored` byte-equal 不退化）全绿。
 
 ---
 
