@@ -1687,3 +1687,161 @@ F1 [测试] 严守 [测试] 角色边界：
 - carve-out 政策：本 batch §F-rev0 §3 carve-out 是「测试 fixture 训练成本 vs profile」类型，与 §C-rev1 §1（cluster_iter ≤ 500 EHS² ≈ equity² 近似）/ §F-rev0 §2「F1 测试全绿 → F2 0 产品代码改动 closure」carve-out 同形态——书面记录 + 测试默认 active（用户 debug profile 实跑由 `cargo test --release` opt-in），不破 [测试] 角色边界。
 
 下一步：F2 [实现]（按 `pluribus_stage2_workflow.md` §F2 §出口 让 F1 全绿；预期形态 §F-rev0 §2 字面 stage-1 §F-rev0 / §C-rev1 同形态 0 产品代码改动 closure；如 F2 review 期间暴露遗漏边界则按 §F-rev1 「错误前移到 from_proto」 同模式收口）。
+
+---
+
+### §F-rev1 batch 1（2026-05-11，F2 [实现] 闭合）
+
+#### §F-rev1 §1：F2 [实现] = 0 产品代码改动 carve-out（兑现 §F-rev0 §2 字面预测）
+
+**§F2 §出口字面**：
+
+> F1 全绿。如发现 corruption / schema 错误前移到 `BucketTable::open` 阶段比留在 `map(...)` 路径更合理，参考阶段 1 §F-rev1 "错误前移到 `from_proto`" 模式落地。
+
+**实测**：F1 在 commit `d23f7aa`（§F-rev0 batch 1）落地时已经全绿（48 passed / 3 ignored / 0 failed across 4 test crates）。F2 [实现] 步骤 trade-off 选择 stage-1 §C-rev1（C2 关闭无产品代码改动 + carve-out）+ stage-2 §F-rev0 §2 预测同形态：纯文档 carve-out commit 追认「F1 测试已经全绿，无产品代码 bug 暴露」。
+
+**0 产品代码改动判定依据**（与 §F-rev0 §2 字面 4 条原因 byte-equal）：
+
+1. 5 类 `BucketTableError` variants 在 C2 已完整实现（`src/abstraction/bucket_table.rs::from_bytes` 9 个 `return Err(...)` 分支，详见 §C-rev1 §C2 关闭节）。F1 测试构造 5 类 fixture（FileNotFound / SchemaMismatch / FeatureSetMismatch / Corrupted×4 / SizeMismatch×3）全部命中已实现的错误路径——不需 F2 新加错误路径。
+2. D-201 `map_off_tree` PHM stub 在 D2 已确定性化（`src/abstraction/action.rs::map_off_tree` 4 分支整数算术 + saturating_add + tie-break smaller milli first，详见 §D-rev1 §1 D2 关闭节）。F1 测试 5 类边界 `real_to` 全部走稳定路径输出，0 panic / 0 不确定性——不需 F2 加边界硬化。
+3. `EquityError::IterTooLow` 在 B2 起就在（`src/abstraction/equity.rs` 4 方法 4 个无条件 `return Err(IterTooLow { got: 0 })` 检查，line 170 / 280 / 304 / 367）。F1 iter=0 测试全部命中已实现的早返回路径——不需 F2 加 calculator 边界硬化。
+4. InvalidBoardLen / OverlapHole / OverlapBoard / chain setter / EquityCalculator trait 方法签名全部在 B2 已落地（`MonteCarloEquity` 朴素实现 + `with_iter` / `with_opp_clusters` chain）——F2 不需补 trait 表面。
+
+**review 期间未发现遗漏边界 bug**：本 closure batch 同 PR 实跑 `cargo test --release --no-fail-fast` 全套 + vultr 4-core EPYC-Rome idle box D-282 SLO 50-run aggregate 兜底验证（§F-rev1 §3 实测表），所有 245 active 0 failed + 50/50 SLO PASS；F2 [实现] 不需走 §F-rev1 「错误前移到 from_proto」 同形态边界修。如未来 stage-3+ review 暴露 stage-2 漏掉的边界，按 stage-1 §F-rev0 「错误路径结构性缺位 carve-out」 同形态新增产品代码 + 同 commit 追认 carve-out。
+
+#### §F-rev1 §2：artifact BLAKE3 doc drift 修复（CLAUDE.md `0a1b95e...` → 重训 ground truth `4b42bf70...`）
+
+F2 closure 时 `b3sum artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin` 实测 whole-file hash `b2e354585c390e2b74f9de0dc5cfdb9194d8f14943fcd7aa32f70335bdd84a33`（旧 stale artifact）与 CLAUDE.md 「artifact BLAKE3 不变」段记录的 `0a1b95e958b3c9057065929093302cd5a9067c5c0e7b4fb8c19a22fa2c8a743b` 不一致；进一步用 `tools/train_bucket_table.rs` CLI 重训得 body hash `4b42bf70e50cd3273687c2f46cb4e56271649a5df8e889ffe700f7f36c0b93a1`（whole-file b3sum `a35220bb5265c4fa8ef037626ab16cae9f97877c9c4e3b059fc5d1e074a4cc70`），与 CLAUDE.md 历史值仍不匹配。
+
+**根因调查**（commit timeline）：
+
+| commit | timestamp UTC | 事件 |
+|---|---|---|
+| `2418a10` C2 [实现] 闭合 | 2026-05-10 00:32:30 | 旧 artifact 训出（stub OCHS 路径） |
+| 旧 artifact mtime | 2026-05-10 02:48 | C2 后约 2 小时本地训出 `b2e354...` |
+| `2718f69` §C-rev2 batch 1 §5a #7 | 2026-05-10 03:23:53 | `cluster::emd_1d_unit_interval` 步函数 CDF 积分修正 |
+| `9c0233c` §C-rev2 batch 2 §4 #6 | 2026-05-10 03:25:22 | `canonical_observation_id` 顺序无关化（D-218-rev1） |
+| `3644b92` §C-rev2 batch 3 §3 #5 | 2026-05-10 03:28:28 | `MonteCarloEquity::ochs` 落地 D-222 真实 169-class 1D EHS k-means；CLAUDE.md 同 commit 写入 `0a1b95e...` 声称为 OCHS 落地后的新 artifact hash |
+| `e2fa74f` D2 [实现] | 2026-05-10 13:26:04 | 仅触 `src/abstraction/action.rs map_off_tree`（不影响 cluster 输出） |
+| `d21c5d9` E2 [实现] | 2026-05-10 17:50:18 | `src/abstraction/equity.rs` hot path 重写 + `RngSource::fill_u64s` 加 default impl + `ChaCha20Rng` override；同 commit 声称 byte-equal 不变量保持，由 `clustering_repeat_blake3_byte_equal`（`(10,10,10), 50 iter, seed 0xC2BE71BD75710E`）+ `cross_thread_bucket_id_consistency_smoke` test guard |
+| HEAD | 2026-05-11 | F1 / F2 闭合 |
+
+**几个独立证据**指向 `0a1b95e...` 是 OCHS commit `3644b92` 时**未经 test guard 录入**的值（手工误录或当时短暂训出未归档）：
+
+1. **post-3644b92 唯一动产品代码的 commit 是 E2 (`d21c5d9`)**，`Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml` 0 改动（`git log 3644b92..HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml` 0 命中）。
+2. **E2 byte-equal 不变量在 `(10,10,10), 50 iter` 配置下由 `clustering_repeat_blake3_byte_equal` test guard，仍绿**（F2 closure 全套 245/0/45 通过）；`tests/data/bucket-table-arch-hashes-linux-x86_64.txt` 32-seed × 3 街 baseline（`cross_arch_bucket_table_baselines_byte_equal_when_both_present`）也 byte-equal 通过。E2 hot path 的 `equity` rewrite 不动 `ehs_squared` / `ochs` / `equity_vs_hand` 函数体（`git show d21c5d9 -- src/abstraction/equity.rs` 仅 `equity` 拆为 `equity_impl` + `equity_hot_loop` 新增），所以训练用的 EHS² + OCHS 特征生成路径 byte-equal。
+3. **`(500,500,500), 10000 iter, seed 0xCAFEBABE` 默认配置无 test guard**——CLAUDE.md `0a1b95e...` 是 OCHS commit message 时手工录入的描述性数字，未经 `cargo test` 路径自动校验。F2 重训 ground truth `4b42bf70...`（body hash via CLI）/ `a35220bb...`（whole-file via b3sum）即当前 `feature_set_id = 1` / `schema_version = 1` 配置下的真实值。
+
+**F1 / 全套测试 0 影响**：`tests/bucket_table_corruption.rs` / `tests/bucket_table_schema_compat.rs` 两个 F1 fixture 构造方式是 `OnceLock<Vec<u8>>` `BucketTable::train_in_memory(BucketConfig { 10, 10, 10 }, seed, evaluator, 50 iter)` 在内存里训——不读 `artifacts/` 文件，所以本地 artifact stale 不影响 F1 全绿。`tests/bucket_quality.rs` cached_trained_table 同形态在内存训。`artifacts/` 目录在 stage-2 主路径上仅作为 stage-3+ blueprint 训练的输入工件，stage-2 测试套件不依赖。
+
+**F2 closure 修复**：本 commit 同步 `cargo run --release --bin train_bucket_table -- --output artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin` 重训覆写 + 写新 hash 到 CLAUDE.md。重训实测（主 host 1-CPU + claude background）：
+
+```
+[train_bucket_table] seed=0x00000000cafebabe bucket_config=(500/500/500) cluster_iter=10000
+[train_bucket_table] training complete in 8917.885s（148m38s wall）
+[train_bucket_table] wrote "/tmp/bucket_table_retrain.bin" (BLAKE3=4b42bf70e50cd3273687c2f46cb4e56271649a5df8e889ffe700f7f36c0b93a1)
+
+b3sum artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin
+→ a35220bb5265c4fa8ef037626ab16cae9f97877c9c4e3b059fc5d1e074a4cc70
+```
+
+`4b42bf70...` 与 `a35220bb...` 的差异：CLI 输出的 `BLAKE3=...` 是 `bucket_table.rs::content_hash` 即 **body hash**（`bytes[..body_end]` 不含 32-byte trailer），与 `tests/data/bucket-table-arch-hashes-linux-x86_64.txt` 每行 hash 同语义；`b3sum file` 是 **whole-file hash**（含 trailer）。CLAUDE.md 历史值 `0a1b95e...` 与两者均不匹配，按 §F-rev1 §2 调查结论判定为 OCHS commit 时手工误录或未归档样本，本 commit 替换为 CLI body hash `4b42bf70...`（与 cross-arch baseline 文件同语义，便于未来对照）。
+
+**vultr 4-core EPYC-Rome idle box D-051 跨 host byte-equal 复跑**：
+
+```
+ssh shaopeng@64.176.35.138 "cd ~/dezhou_20260508 && cargo run --release --bin train_bucket_table -- --output /tmp/vultr_retrain.bin"
+→ vultr whole-file b3sum: a35220bb5265c4fa8ef037626ab16cae9f97877c9c4e3b059fc5d1e074a4cc70
+→ 主 host whole-file b3sum: a35220bb5265c4fa8ef037626ab16cae9f97877c9c4e3b059fc5d1e074a4cc70
+→ byte-equal ✓
+```
+
+D-051 字面要求 same arch + toolchain + seed → byte-equal；x86_64 + rustc 1.95.0 + seed 0xCAFEBABE 跨主 host 1-CPU + claude background（149 min wall）与 vultr 4-core idle（151 min wall = +2% noise）byte-equal，D-051 满足。同 BLAKE3 担保 §F-rev1 §2 重训 ground truth 不是单 host artifact，是当前代码 + 默认配置下的真实跨 host 一致输出。
+
+**carve-out 政策**：本 §F-rev1 §2 是 「artifact 工件 vs doc hash 一致性」 类型，与 §C-rev1 §1（cluster_iter ≤ 500 EHS² ≈ equity² 近似）/ §F-rev0 §3（debug-mode training fixture 成本）同形态——书面记录 + 实测重训纠正 + CLAUDE.md doc 同步，不破 [实现] 角色边界（不动 `src/` / `tests/` / `benches/` 任意一行）。`artifacts/` 是 gitignore 目录，hash 漂移仅文档可见，不影响 git tree state。
+
+**未来类似情况的处理政策**：CLAUDE.md / workflow / decisions 文档里的 「artifact BLAKE3 不变」类断言**必须由 `cargo test` 路径自动校验**才算可信——手工录入数值会 drift 而无人知晓直到下一次重训对照。stage 3+ blueprint artifact 若有可比性需求，应同型在 `tests/data/<artifact>-hashes-<os>-<arch>.txt` 维护文件 + 加 regression guard，与 `tests/clustering_cross_host.rs` 同形态。本 §F-rev1 §2 暴露的 「OCHS commit 时手工录入未 guard」 不再重复——F3 [报告] 可视情况补 `tests/bucket_table_default_artifact.rs` 加入 regression guard（成本：每次 PR ~150s release 训练，权衡是否值得）。
+
+#### §F-rev1 §3：F2 closure 实测出口数据
+
+**`cargo test --release --no-fail-fast`**（主 host 1-CPU + claude background）：
+
+```
+245 passed / 0 failed / 45 ignored across 31 test crates + 1 lib unit + 1 doc-test = 33 result lines
+```
+
+与 §F-rev0 batch 1 §F-rev0 §5 (F1 closure 后 baseline) byte-equal（F2 0 产品代码改动 → 测试状态 0 漂移）。stage-1 16 crates `104/19/0` 与 `stage1-v1.0` tag byte-equal（D-272 不退化满足）；stage-2 15 crates `141/26/0` + lib 8 unit。release 全套 ~13 min（bucket_quality ~108 s + clustering_determinism ~296 s + bucket_table_corruption ~101 s + bucket_table_schema_compat ~100 s 四大头）。
+
+**`cargo test --release --test perf_slo -- --ignored --nocapture stage2_`**（主 host 1-CPU 单跑）：
+
+```
+stage2_abstraction_mapping_throughput_at_least_100k_per_second  实测 24,952,717 mapping/s（SLO ≥ 100k；249× 余量）  ok
+stage2_bucket_lookup_p95_latency_at_most_10us                    P50=96 ns / P95=153 ns / P99=189 ns（SLO P95 ≤ 10 μs）  ok
+stage2_equity_monte_carlo_throughput_at_least_1k_hand_per_second  实测 911.9 hand/s @ 10k iter  FAILED（host-load contention，§E-rev1 §5 carve-out 同型）
+```
+
+主 host 1-CPU + claude background 单次 911.9 hand/s 与 §E-rev0 baseline 502.8 hand/s / §E-rev1 batch 1 主 host 821-1059 hand/s 区间一致（host-load 敏感）。
+
+**`cargo test --release --test perf_slo -- --ignored --nocapture stage2_equity_monte_carlo`**（vultr 4-core EPYC-Rome idle box / 50-run aggregate）：
+
+```
+n=50 runs / 50 PASS / mean = 1093.2 hand/s / std = 17.1 / min = 1031.9 / max = 1114.5
+（与 §E-rev1 §5 closure 同 host 50-run aggregate mean 1102.1 / std 10.6 / min 1061.7 / max 1117.3 同型，~9 hand/s 偏移在 noise 范围内）
+```
+
+D-282 SLO 50-run 在 vultr 全部 ≥ 1000 hand/s（与 §E-rev1 §5 closure 同 host 同型 byte-equal 复跑），证明 D-282 单线程 SLO 字面要求 「单线程 ≥ 1,000 hand/s @ 10k iter」 在 idle host 下稳定满足。主 host 1-CPU + claude background 单次 911.9 hand/s 受 host-load 影响，与 §E-rev1 §5 carve-out 描述一致——D-282 单线程 SLO 仅 idle host 可重复满足，主 host 上属预期 borderline。
+
+**`cargo fmt --all --check` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` / `cargo build --all-targets`**：全绿。
+
+**artifact BLAKE3**：
+
+```
+b3sum artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin
+→ a35220bb5265c4fa8ef037626ab16cae9f97877c9c4e3b059fc5d1e074a4cc70  （whole-file b3sum）
+
+CLI body hash (`bucket_table.rs::content_hash`)
+→ 4b42bf70e50cd3273687c2f46cb4e56271649a5df8e889ffe700f7f36c0b93a1
+```
+
+替代 CLAUDE.md 历史值 `0a1b95e958b3c9057065929093302cd5a9067c5c0e7b4fb8c19a22fa2c8a743b`（详见 §F-rev1 §2 drift 修复说明）。
+
+**跨架构 baseline `tests/data/bucket-table-arch-hashes-linux-x86_64.txt`**（commit `e7071e0` D1 落地）32-seed × 3 街 byte-equal 维持（F2 0 触；release 全套 `cross_arch_bucket_table_baselines_byte_equal_when_both_present` test 通过）。darwin-aarch64 baseline 仍 aspirational（D-052）。
+
+**1M abstraction fuzz**（`cargo test --release --test abstraction_fuzz -- --ignored`）：3 个 full 套件 0 panic / 0 invariant violation（F2 0 触，§D-rev1 §1 baseline 不变）。
+
+#### §F-rev1 §4：[实现] 角色越界审计 = 0
+
+F2 [实现] 严守 [实现] 角色边界——本 commit **未触一行 `src/` / `tests/` / `benches/` / `fuzz/` / `tools/` / `proto/` / `Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml`**：
+
+- `src/abstraction/{bucket_table,equity,action,postflop,info,preflop,cluster,feature}.rs` / `src/core/{mod,chips,rng}.rs` / `src/eval.rs` / `src/rules/{state,config,action}.rs` / `src/history.rs` / `src/lib.rs` 0 行。
+- `tests/`、`benches/`、`fuzz/`、`tools/`、`proto/` 0 行。
+
+仅触：
+
+- `docs/pluribus_stage2_workflow.md`：本节 §F-rev1 batch 1 追加。
+- `CLAUDE.md`：(a) `Stage 2 progress` 段顶部行 「F1 closed，下一步 F2 [实现]」 → 「F2 closed，下一步 F3 [报告]」；(b) 「已闭合步骤一行索引」 段追加 F2 一行；(c) 「Stage 2 当前测试基线」段更新基线日期 / 引用 §F-rev1 数字；(d) artifact BLAKE3 hash 由 `0a1b95e958b3c9057065929093302cd5a9067c5c0e7b4fb8c19a22fa2c8a743b` 修正到 `4b42bf70e50cd3273687c2f46cb4e56271649a5df8e889ffe700f7f36c0b93a1`（body hash via CLI）；(e) 「下一步」 段由 F2 [实现] 翻面到 F3 [报告]。
+- `artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin`：重训覆写（gitignore，不进 git history）。
+
+`docs/pluribus_stage2_decisions.md` / `docs/pluribus_stage2_api.md` / `docs/pluribus_stage1_decisions.md` / `docs/pluribus_stage1_api.md` 0 行（不需 D-NNN-revM / API-NNN-revM 入账：F1 测试已被 C2/D2/B2 既有产品代码全部满足，公开签名 / proto schema / 决策表 0 漂移）。
+
+与 stage-1 §C-rev1（C2 关闭 0 产品代码改动 carve-out）/ stage-2 §F-rev0 §4「[实现] 越界审计 = 0」 同型：常规闭合 + 0 越界。
+
+#### §F-rev1 §5：「stage-1 F2 错误前移」 vs 「stage-2 F2 = 0 产品代码改动」 trade-off 复盘
+
+stage-1 F2 选择 「错误前移到 from_proto」 路径（stage-1 §F-rev1）：F1 留 4 条 `#[ignore = "F1 → F2"]` carry-over，F2 加 5 处校验路径在 `src/history.rs` 让 4 条全部 unignore 翻绿。stage-2 F2 选择 「0 产品代码改动 closure」 路径（本节）：F1 0 条 carry-over `#[ignore = "F1 → F2"]`，F2 不加任何产品代码。
+
+两条路径的差异源于 **F1 [测试] 写时点 vs 产品代码 maturity**：
+
+- stage-1 F1 [测试] 写 `from_proto` corruption 测试时，`from_proto` 主体只校验 `n_seats` 与 `starting_stacks 长度` 两条；button_seat / action.seat / board uniqueness / payout.seat / showdown_order 越界全走 replay 阶段兜底。
+- stage-2 F1 [测试] 写 `BucketTable::from_bytes` corruption 测试时，C2 commit `2418a10`（§C-rev1）已经把 5 类 `BucketTableError` 9 个 `return Err(...)` 分支全部前移到 from_bytes 入口；D2 commit `e2fa74f`（§D-rev1）已经把 `map_off_tree` 4 分支边界完整化；B2 commit `457be85` 已经把 `EquityError::IterTooLow` / InvalidBoardLen / OverlapHole / OverlapBoard 全部前移到方法入口。F1 测试落地时所有 「应前移」 路径已经在前置 commit 前移完毕，F2 没有 「再前移一层」 的可做工作。
+
+**对未来 stage-3+ 的影响**：stage-2 F2 = 0 产品代码 closure 是 「test-first workflow + [测试]/[实现] 角色严格边界 + [实现] commit 写产品代码时主动覆盖将来测试可能要测的边界」 三者叠加的良性结果——不是 「F1 测试写得不够严」 也不是 「F2 偷懒」。stage-3+ 起步若 [实现] commit 严格遵循同型 「主动前移 + 主动覆盖错误路径」 策略，F2 步骤大概率仍走 0 产品代码 closure；若发现某个 stage 的 F1 [测试] 暴露 [实现] 漏掉的边界（即重新出现 stage-1 F1→F2 carry-over 形态），按 stage-1 §F-rev1 「错误前移到 wire 层」 政策走，加产品代码满足。
+
+#### §F-rev1 §6 carry forward 处理政策（与 §A-rev0..§F-rev0 一致，不重新论证）
+
+- 阶段 1 §B-rev1 §3 / §C-rev1 / §D-rev0 / §E-rev0 / §E-rev1 / §F-rev0 / §F-rev1 / §F-rev2 + 阶段 2 §A-rev0..§F-rev0 既往政策保持继承不变。stage-1 §C-rev1 「C2 关闭无产品代码改动 + carve-out」 处理政策在 stage-2 F2 路径下同形态适用——本 batch 走 stage-1 §C-rev1 同型 0 产品代码改动 carve-out closure，所有出口标准在前置 commit 已满足。
+- §B-rev1 §4：每个步骤关闭后必须有一笔 `docs(CLAUDE.md): X 完成后状态同步`。本 batch 同 commit 触 `CLAUDE.md` Stage 2 progress F2 closed 一行索引追加 + 测试基线段引用 §F-rev1 数字 + 下一步翻面 F3 [报告] + artifact hash 修正。
+- 0 D-NNN-revM / 0 API-NNN-revM：F1 测试已被 C2/D2/B2 既有产品代码全部满足，公开签名 / proto schema / 决策表 0 漂移。
+- carve-out 政策：本 batch §F-rev1 §2 carve-out 是 「artifact 工件 vs doc hash 一致性」 类型，与 §C-rev1 §1 / §F-rev0 §3 同形态——书面记录 + 实测重训纠正 + CLAUDE.md doc 同步，不破 [实现] 角色边界。
+
+下一步：F3 [报告]（`docs/pluribus_stage2_report.md` 验收报告 + git tag `stage2-v1.0`，按 §F3 §出口 字面落地。预算 0.4 人周；可顺手补 §F-rev1 §2 「artifact regression guard」 候选若值得）。
