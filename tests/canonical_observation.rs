@@ -32,7 +32,7 @@
 
 use std::collections::HashSet;
 
-use poker::abstraction::postflop::{
+use poker::abstraction::canonical_enum::{
     N_CANONICAL_OBSERVATION_FLOP, N_CANONICAL_OBSERVATION_RIVER, N_CANONICAL_OBSERVATION_TURN,
 };
 use poker::rng_substream::{derive_substream_seed, EQUITY_MONTE_CARLO};
@@ -442,9 +442,15 @@ fn canonical_observation_id_preflop_panics() {
 //    1,286,792（`#[ignore]` 双重 release + --ignored opt-in，与 stage-2 §C2 /
 //    §D2 同形态）。
 //
-// 全部 `#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]` 标注；
-// 当前 hash 路径下断言**预期失败**——[实现] 闭合 commit 取消 ignore 并验证
-// 全绿（与 stage-1 §C2 / §D2 / §F2 + stage-2 §B1 / §C1 / §F1 同形态）。
+// **§G-batch1 §3.2 [实现] 闭合后**：5 条契约测试 `#[ignore]` 取消，转 active（详
+// 见 stage 2 workflow §G-batch1 §3.2 [实现] 闭合记录）。当前 D-218-rev2 真等价类
+// 枚举路径下断言全绿——canonical_observation_id 走 colex ranking，distinct count
+// ≈ 采样数（远超 100K 阈值），max_id 接近 N - 1。
+//
+// **内存约束**：3 街 uniqueness + full-flop-enum 测试触发 canonical_enum lazy
+// 表构造（flop ~20 MB / turn ~224 MB / river ~1.97 GB）。低内存 host (< 4 GB
+// RAM) 上 river 测试会 OOM SIGKILL；推荐在 ≥ 4 GB host (vultr / CI / 高内存
+// dev box) 上跑全套。Lazy build 走 OnceLock 单线程构造，多 test 调用共享结果。
 
 /// §G-batch1 §2 sampling helper：从 deck 抽 `count` 张不重复 `Card`。
 fn sample_distinct_cards(rng: &mut dyn RngSource, count: usize) -> Vec<Card> {
@@ -470,7 +476,6 @@ fn sample_distinct_cards(rng: &mut dyn RngSource, count: usize) -> Vec<Card> {
 /// — D-218-rev2"；§G-batch1 §3.1 实测修正 stage 2 §C-rev1 §2 "~25K" 估算 14000x
 /// 误差）。
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
 fn n_canonical_observation_constants_match_d218_rev2_spec() {
     assert_eq!(
         N_CANONICAL_OBSERVATION_FLOP, 1_286_792,
@@ -493,7 +498,6 @@ fn n_canonical_observation_constants_match_d218_rev2_spec() {
 /// 1M（接近 N - 1，dense packing）。当前 FNV-1a hash mod 3K 路径下 distinct <
 /// 3000 / max_id < 3000——断言失败。
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
 fn canonical_observation_id_uniqueness_random_100k_flop() {
     let mut seen: HashSet<u32> = HashSet::new();
     let mut max_id: u32 = 0;
@@ -532,7 +536,6 @@ fn canonical_observation_id_uniqueness_random_100k_flop() {
 /// 容量 → equivalence-class 自然碰撞极稀少，distinct 期望 > 99.5K + max_id >
 /// 10M）。当前 FNV-1a hash mod 6K 路径下 distinct < 6000——断言失败。
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
 fn canonical_observation_id_uniqueness_random_100k_turn() {
     let mut seen: HashSet<u32> = HashSet::new();
     let mut max_id: u32 = 0;
@@ -571,7 +574,6 @@ fn canonical_observation_id_uniqueness_random_100k_turn() {
 /// 碰撞 → distinct 期望 > 99,900 + max_id > 50M）。当前 FNV-1a hash mod 10K
 /// 路径下 distinct < 10000 / max_id < 10000——断言失败。
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
 fn canonical_observation_id_uniqueness_random_100k_river() {
     let mut seen: HashSet<u32> = HashSet::new();
     let mut max_id: u32 = 0;
@@ -622,7 +624,7 @@ fn canonical_observation_id_uniqueness_random_100k_river() {
 /// 也需 ~2 h / ~16 h——超 dev loop SLO + 与 100K uniqueness 测试覆盖度等价
 /// （100K 随机采样在 turn/river 等价类空间下与全枚举差距 < 0.1% statistical）。
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active + release/--ignored opt-in"]
+#[ignore = "release/--ignored opt-in（~10 s release + flop lazy table ~20 MB）"]
 fn canonical_observation_id_full_flop_enumeration_exactly_n_flop_distinct() {
     let mut seen: HashSet<u32> = HashSet::new();
     for b0 in 0..52u8 {

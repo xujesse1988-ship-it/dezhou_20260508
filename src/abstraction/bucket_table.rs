@@ -67,8 +67,15 @@ impl BucketConfig {
 
 /// `magic: [u8; 8] = b"PLBKT\0\0\0"`（D-240）。
 pub const BUCKET_TABLE_MAGIC: [u8; 8] = *b"PLBKT\0\0\0";
-/// 当前 schema 版本（D-240）。
-pub const BUCKET_TABLE_SCHEMA_VERSION: u32 = 1;
+/// 当前 schema 版本（D-240 / D-244-rev2）。
+///
+/// **§G-batch1 §3.2 [实现]**：bump 1 → 2（D-244-rev2 §1 字面 mandate）。v1 artifact
+/// 由 §G-batch1 §3.2 之前的 D-218-rev1 FNV-1a hash mod 设计生成（lookup_table 大小
+/// 3K/6K/10K，canonical_observation_id 走 hash 路径）；v2 artifact 由 §G-batch1
+/// §3.2 之后的 D-218-rev2 真等价类枚举设计生成（lookup_table 大小 1.28M/13.96M/
+/// 123.16M，canonical_observation_id 走 colex ranking 路径）。两者 schema 不兼容，
+/// reader 必须靠 schema_version 字段区分。
+pub const BUCKET_TABLE_SCHEMA_VERSION: u32 = 2;
 /// 默认 feature_set_id（D-221 EHS² + OCHS(N=8) = 9 维）。
 pub const BUCKET_TABLE_DEFAULT_FEATURE_SET_ID: u32 = 1;
 /// feature_set_id=1 对应的 centroid 维度（D-221）。
@@ -327,14 +334,17 @@ impl BucketTable {
                 });
             }
         }
-        if n_canonical_flop > 2_000_000
-            || n_canonical_turn > 20_000_000
-            || n_canonical_river > 200_000_000
+        // §G-batch1 §3.2 / D-244-rev2 §3 BT-008-rev2 bound 收紧：从 D-244-rev1
+        // 保守上界 (2M / 20M / 200M) 到 D-218-rev2 §2 实测精确值
+        // (1,286,792 / 13,960,050 / 123,156,254)。≠ 精确值视为 Corrupted。
+        if n_canonical_flop != N_CANONICAL_OBSERVATION_FLOP
+            || n_canonical_turn != N_CANONICAL_OBSERVATION_TURN
+            || n_canonical_river != N_CANONICAL_OBSERVATION_RIVER
         {
             return Err(BucketTableError::Corrupted {
                 offset: 0x1C,
                 reason: format!(
-                    "n_canonical_observation out of conservative bound: \
+                    "n_canonical_observation not matching D-218-rev2 enumeration: \
                      flop={n_canonical_flop} turn={n_canonical_turn} river={n_canonical_river}"
                 ),
             });
@@ -722,11 +732,29 @@ fn train_one_street(
         StreetTag::Preflop => unreachable!(),
     };
 
-    // 1. 候选 sample：`n_train = max(K × 10, 4 × N_canonical)` 让每个 obs_id 期望
-    // 命中 ≥ 4 次（FNV-1a 哈希均匀分布）→ feature-based assignment 覆盖率
-    // 1 - e^-4 ≈ 98.2%。剩余 ~2% 的 obs_id 走 Knuth hash 均匀分布到所有 K 个
-    // bucket（保留 D-236 0 空 bucket 不变量在统计意义上成立）。
-    let n_train: usize = ((bucket_count as usize) * 10).max((n_canonical as usize) * 4);
+    // 1. 候选 sample：`n_train = max(K × 10, min(4 × N_canonical, K × 100))`。
+    //
+    // **§G-batch1 §3.2 [实现] 修正**：原 `n_train = max(K × 10, 4 × N_canonical)`
+    // 在 D-218-rev1 hash mod 路径下（N=3K/6K/10K）取值合理；但 D-218-rev2 真等价类
+    // 枚举（N=1.28M/13.96M/123M）下 4×N=5.12M/55.84M/492.6M 大幅超 fixture 训练预算。
+    // 本 §3.2 引入 `cap = K × 100` 上界，让 fixture 训练时间与 N 无关（仅与 K 相关）。
+    // 实际生效：
+    //
+    //   - K=10  → n_train = max(100, min(4N, 1000))   = 1000（fixture / 10/10/10）
+    //   - K=100 → n_train = max(1000, min(4N, 10000)) = 10000（小 fixture）
+    //   - K=500 → n_train = max(5000, min(4N, 50000)) = 50000（D-218-rev2 默认 prod）
+    //
+    // **覆盖率影响**：K × 100 candidates → 命中 ≈ K × 100 个 obs_id（每个最多被
+    // 1 次命中，因 D-218-rev2 真等价类下 obs_id 唯一）。覆盖率 = K × 100 / N 极低
+    // （K=500 / N=123M → 0.04%）。剩余 obs_ids 走 Knuth hash 落到 K 个 bucket（与
+    // §G-batch1 §3.2 之前 hash mod 路径下未命中 obs_id 处理同形态；D-236 0 空
+    // bucket 不变量在统计意义上成立）。
+    //
+    // **§G-batch1 §3.4+ [实现]**：production 路径需走 mini-batch k-means + 全 N
+    // 候选 enumeration 以达成 D-218-rev2 §3 "唯一性（新）" 与 bucket 质量门槛；
+    // 本 §3.2 cap 仅让 fixture 训练与 schema_compat / corruption 验证可行。
+    let n_train: usize =
+        ((bucket_count as usize) * 10).max(((n_canonical as usize) * 4).min((bucket_count as usize) * 100));
     let mut sample_rng = ChaCha20Rng::from_seed(cluster::rng_substream::derive_substream_seed(
         training_seed,
         cluster_op,

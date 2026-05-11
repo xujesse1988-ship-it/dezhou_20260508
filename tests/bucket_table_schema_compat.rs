@@ -138,12 +138,13 @@ fn write_tmp(bytes: &[u8], label: &str) -> PathBuf {
 // ============================================================================
 
 #[test]
-fn schema_constants_locked_for_v1() {
-    // 任一改动 → 本 test fail。stage 3+ 添加 v2 时显式追加 `_V1` / `_V2` 常量，
-    // 而不是直接改 _SCHEMA_VERSION = 2（会让 v1 文件 100% 拒绝，破坏兼容性）。
+fn schema_constants_locked_for_v2() {
+    // **§G-batch1 §3.2 [实现]**：BUCKET_TABLE_SCHEMA_VERSION 1 → 2（D-244-rev2 §1
+    // mandate）。任一改动 → 本 test fail。stage 4+ 添加 v3 时显式追加 `_V2` / `_V3`
+    // 常量，而不是直接改 _SCHEMA_VERSION = 3（会让 v2 文件 100% 拒绝，破坏兼容性）。
     assert_eq!(
-        BUCKET_TABLE_SCHEMA_VERSION, 1,
-        "schema_version 锁定为 1；v2 必须走 D-NNN-revM 评审"
+        BUCKET_TABLE_SCHEMA_VERSION, 2,
+        "schema_version 锁定为 2（§G-batch1 §3.2 / D-244-rev2）；v3 必须走 D-NNN-revM 评审"
     );
     assert_eq!(
         BUCKET_TABLE_DEFAULT_FEATURE_SET_ID, 1,
@@ -164,17 +165,17 @@ fn schema_constants_locked_for_v1() {
 // ============================================================================
 
 #[test]
-fn v1_train_then_open_roundtrip_stable() {
+fn v2_train_then_open_roundtrip_stable() {
     let bytes = fixture_v1_bytes();
     assert!(
         bytes.len() as u64 >= BUCKET_TABLE_HEADER_LEN + BUCKET_TABLE_TRAILER_LEN,
         "fixture 文件应 ≥ header+trailer"
     );
-    let path = write_tmp(bytes, "v1_roundtrip");
-    let table = BucketTable::open(&path).expect("v1 round-trip open");
+    let path = write_tmp(bytes, "v2_roundtrip");
+    let table = BucketTable::open(&path).expect("v2 round-trip open");
     let _ = std::fs::remove_file(&path);
 
-    assert_eq!(table.schema_version(), 1);
+    assert_eq!(table.schema_version(), 2);
     assert_eq!(table.feature_set_id(), 1);
     assert_eq!(table.training_seed(), FIXTURE_TRAINING_SEED);
     assert_eq!(table.config(), FIXTURE_BUCKET_CONFIG);
@@ -182,7 +183,7 @@ fn v1_train_then_open_roundtrip_stable() {
     assert_ne!(
         table.content_hash(),
         [0u8; 32],
-        "v1 round-trip content_hash 应有效"
+        "v2 round-trip content_hash 应有效"
     );
 }
 
@@ -211,19 +212,37 @@ fn v1_header_feature_set_id_at_offset_c() {
 // ============================================================================
 
 #[test]
-fn future_v2_schema_version_is_rejected_with_schema_mismatch() {
+fn future_v3_schema_version_is_rejected_with_schema_mismatch() {
     let mut bytes = fixture_v1_bytes().to_vec();
-    mutate_schema_version(&mut bytes, 2);
-    let path = write_tmp(&bytes, "fake_v2");
-    let err = open_must_err(&path, "v2 schema_version 必须被拒");
+    mutate_schema_version(&mut bytes, 3);
+    let path = write_tmp(&bytes, "fake_v3");
+    let err = open_must_err(&path, "v3 schema_version 必须被拒");
     let _ = std::fs::remove_file(&path);
 
     match err {
         BucketTableError::SchemaMismatch { expected, got } => {
-            assert_eq!(expected, 1, "expected = 当前 schema_version");
-            assert_eq!(got, 2, "got = 攻击者注入的 v2");
+            assert_eq!(expected, 2, "expected = 当前 schema_version (§G-batch1 §3.2 bumped)");
+            assert_eq!(got, 3, "got = 攻击者注入的 v3");
         }
-        other => panic!("expected SchemaMismatch {{ expected=1, got=2 }}, got {other:?}"),
+        other => panic!("expected SchemaMismatch {{ expected=2, got=3 }}, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_v2_schema_version_v1_is_rejected_with_schema_mismatch() {
+    // §G-batch1 §3.2 [实现]：v1 → v2 bump 后旧 v1 文件必须拒绝（D-244-rev2 §2）。
+    let mut bytes = fixture_v1_bytes().to_vec();
+    mutate_schema_version(&mut bytes, 1);
+    let path = write_tmp(&bytes, "fake_v1");
+    let err = open_must_err(&path, "v1 (legacy D-218-rev1) 文件必须被拒");
+    let _ = std::fs::remove_file(&path);
+
+    match err {
+        BucketTableError::SchemaMismatch { expected, got } => {
+            assert_eq!(expected, 2);
+            assert_eq!(got, 1);
+        }
+        other => panic!("expected SchemaMismatch, got {other:?}"),
     }
 }
 
@@ -237,7 +256,7 @@ fn pre_v1_schema_version_zero_is_rejected_with_schema_mismatch() {
 
     match err {
         BucketTableError::SchemaMismatch { expected, got } => {
-            assert_eq!(expected, 1);
+            assert_eq!(expected, 2);
             assert_eq!(got, 0);
         }
         other => panic!("expected SchemaMismatch, got {other:?}"),
@@ -254,7 +273,7 @@ fn schema_version_u32_max_is_rejected_with_schema_mismatch() {
 
     match err {
         BucketTableError::SchemaMismatch { expected, got } => {
-            assert_eq!(expected, 1);
+            assert_eq!(expected, 2);
             assert_eq!(got, u32::MAX);
         }
         other => panic!("expected SchemaMismatch, got {other:?}"),

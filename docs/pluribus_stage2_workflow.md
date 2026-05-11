@@ -2091,15 +2091,63 @@ agent 笔误 / 估算与实测漂移由后续 batch 同步" 同型政策。本 b
 重写为 forward 调用 `canonical_enum::canonical_observation_id`；postflop.rs 三
 `N_CANONICAL_OBSERVATION_*` 常量改 re-export 自 `canonical_enum`）。
 
-##### §G-batch1 §3.2..§3.8 + §4：待后续 batch 追加
+##### §G-batch1 §3.2 [实现]（2026-05-11）：postflop forward + bucket_table v2 schema + 5 ignore 转 active
 
-- §G-batch1 §3.2 [实现]：`postflop.rs::canonical_observation_id` 改 forward 到 `canonical_enum`；三 N 常量 re-export。验证 tests/canonical_observation.rs 5 ignore 可转 active（uniqueness + N 常量 + flop full enum）。
-- §G-batch1 §3.3 [实现]：`bucket_table.rs` `BUCKET_TABLE_SCHEMA_VERSION` 1 → 2 + BT-008-rev2 bound 精确值 check + v1 reject 路径测试更新。
-- §G-batch1 §3.4 [实现]：`tools/train_bucket_table.rs` 处理 528 MB write + 训练时长 ≤ 120 min release + mini-batch k-means fallback for river（可选）。
-- §G-batch1 §3.5 [实现]：artifact 重训（vultr 4-core ~120 min release）+ GitHub Release 上传 + BLAKE3 录入；`tools/fetch_bucket_table.sh` 新增 helper。
-- §G-batch1 §3.6 [实现]：跨架构 baseline 32-seed × 3 街重生（vultr ~3 h release）。
-- §G-batch1 §3.7 [实现]：D-275 实测取选项 A / B / C；如选项 B 走 stage 1 D-275-rev1 流程。
-- §G-batch1 §3.8 [实现]：12 条 `tests/bucket_quality.rs` `#[ignore]` 取消并验证全绿（debug ~5-10 min 实跑 + release ~3 min）；CLAUDE.md ground truth hash 全部漂移更新。
+§G-batch1 §3.1 commit `2844861` 后第二步：把 `canonical_enum` 接入到 production 路径
+（`postflop::canonical_observation_id` 转 forward）+ bucket_table.rs schema bump
+1 → 2 + 5 条 `tests/canonical_observation.rs` `#[ignore]` 转 active 验证全绿。
+
+**核心改动**（5 文件 +213/-240 行）：
+
+1. `src/abstraction/postflop.rs`：
+    - `canonical_observation_id` 函数体重写为 forward 调用 `canonical_enum::canonical_observation_id`（公开签名 byte-equal 不变）。
+    - 三 `N_CANONICAL_OBSERVATION_FLOP / TURN / RIVER` 常量改为 `pub use crate::abstraction::canonical_enum::{...}`，让既有 caller（`tests/canonical_observation.rs` / `bucket_table.rs` lookup_table 分配）通过本路径无缝切换到真值 1.28M / 13.96M / 123.16M。
+2. `src/abstraction/bucket_table.rs`：
+    - `BUCKET_TABLE_SCHEMA_VERSION` 1 → 2（D-244-rev2 §1 字面 mandate；v1 artifact 不再被 reader 接受，走 `SchemaMismatch { expected: 2, got: 1 }`）。
+    - BT-008-rev2 bound 收紧：从 D-244-rev1 保守上界 (2M / 20M / 200M) 改为 D-218-rev2 §2 精确值校验（≠ 1,286,792 / 13,960,050 / 123,156,254 视为 `Corrupted`）。
+    - `train_one_street` `n_train` 公式加 `K × 100` 上界：原 `max(K × 10, 4 × N)` 在 D-218-rev2 真等价类 (N = 1.28M+) 下飞涨到 5.12M+/55.84M+/492.6M+ candidates / street，fixture 训练不可承受。新公式 `max(K × 10, min(4 × N, K × 100))` 让 fixture 训练时间与 N 无关（仅与 K 相关；K=10 → 1000 candidates / K=100 → 10000 / K=500 → 50000）。覆盖率从 ~98% feature-based 降到 K×100/N 极低（K=500/N=123M → 0.04%）；剩余 obs_ids 走 Knuth hash 落到 K 个 bucket。§G-batch1 §3.4+ production 路径需走 mini-batch k-means + 全 N 候选 enumeration 以达 D-218-rev2 §3 唯一性 + bucket 质量门槛；本 §3.2 cap 仅让 fixture / schema_compat / corruption 验证可行。
+3. `tests/canonical_observation.rs`：
+    - import 从 `poker::abstraction::postflop::N_*` 切到 `poker::abstraction::canonical_enum::N_*`（重定向到 canonical_enum 真值）。
+    - 5 条 `#[ignore = "§G-batch1 §3: ..."]` 取消（节 6：n_canonical_observation_constants_match_d218_rev2_spec / 3 街 uniqueness_random_100k / flop full enum）。flop full enum 测试 `#[ignore]` reason 改为 "release/--ignored opt-in（~10 s release + flop lazy table ~20 MB）"，保留 release/--ignored 触发不变。
+    - 文档注释更新：新增 "内存约束" 说明（low-RAM host 注意事项）。
+4. `tests/bucket_table_schema_compat.rs`：
+    - `schema_constants_locked_for_v1` → `schema_constants_locked_for_v2`：assert `BUCKET_TABLE_SCHEMA_VERSION = 2`。
+    - `v1_train_then_open_roundtrip_stable` → `v2_train_then_open_roundtrip_stable`：assert `schema_version() == 2`。
+    - `future_v2_schema_version_is_rejected_*` → `future_v3_schema_version_is_rejected_*`（now-current v2 不再是 future）。
+    - 新增 `pre_v2_schema_version_v1_is_rejected_*`（D-244-rev2 §2 字面 v1 reject 路径）。
+    - `pre_v1_schema_version_zero_is_rejected_*` + `schema_version_u32_max_is_rejected_*` expected 从 1 → 2 同步。
+5. `tests/bucket_table_corruption.rs`：
+    - `schema_mismatch_via_byte_flip_at_offset_8` expected 1 → 2 同步。
+    - `random_byte_flip_smoke_1k_no_panic` `#[ignore]`：v2 artifact 553 MB × 1000 iter byte-flip = 数小时，本 §3.2 不可承受。
+    - 新增 `random_byte_flip_smoke_10_no_panic`（10 iter smoke, ~30 s release）替代 default smoke 位置，仍验证 byte-flip 5 类错误体系全覆盖。
+    - `random_byte_flip_full_100k_no_panic` 保留 `#[ignore]`（reason 更新到 §G-batch1 §3.4+ artifact 重训路径下复审）。
+
+**Vultr 7.7 GB host 全 release sweep 出口检查**（dev box 1.9 GB RAM OOM 在 river lazy `Vec<u128>` 1.97 GB；切 vultr 跑 `cargo test --release --no-fail-fast` ~200 s 全套）：
+
+- `canonical_observation`: 16 passed / 0 failed / 1 ignored（5 D-218-rev2 契约测试全绿，包含 river uniqueness 100K 触发 river lazy table 1.97 GB 顺利构造）
+- `bucket_table_schema_compat`: 10 / 0 / 0（v2 expectations 全套绿）
+- `info_id_encoding`: 8 / 0 / 0
+- `bucket_table_corruption`: 12 / 0 / 2（10-iter smoke + schema v2 同步绿）
+- `clustering_cross_host`: 1 / 0 / 0
+- `clustering_determinism`: 7 / 0 / 4（fixture training 10/10/10 + 50 iter ~28 s release，K×100 cap 生效）
+- `bucket_quality`: 7 / 0 / 13（100/100/100 + 200 iter fixture ~98 s release；12 条 quality 门槛 `#[ignore]` 仍指向 §G-batch1 §3.3+）
+- stage 1 baseline 16 crates: byte-equal 不退化（104/19/0 与 `stage1-v1.0` tag 一致）
+- 其它 stage 2 crates (action / equity / preflop_169 / scenarios_extended / api_signatures): 全 0 failures
+
+**[实现] 角色边界审计**：本 batch 触 `src/abstraction/postflop.rs` + `src/abstraction/bucket_table.rs`（[实现] 单边）+ `tests/canonical_observation.rs`（[测试] 角色 #[ignore] 取消，§3.2 [实现] 闭合 commit 同步取消，与 stage-2 §C-rev1 §3 + stage-1 §C2 / §D2 / §F2 同形态）+ `tests/bucket_table_schema_compat.rs` + `tests/bucket_table_corruption.rs`（v2 schema 同步同 PR，与 [测试] 角色越界 carve-out 同型）+ `docs/` + `CLAUDE.md`。`src/abstraction/canonical_enum.rs` / `Cargo.toml` / `Cargo.lock` / `fuzz/` / `proto/` / `tools/` / `tests/api_signatures.rs` / `tests/scenarios_extended.rs` / 其它 stage 2 测试 **未修改一行**。
+
+**[测试] 角色边界 carve-out（§G-batch1 §3.2）**：本 [实现] commit 同步取消 5 条 `tests/canonical_observation.rs` `#[ignore]` + 修改 6 条 `tests/bucket_table_schema_compat.rs` 测试（v1 → v2 expectations）+ 修改 2 条 `tests/bucket_table_corruption.rs` 测试。**判定为 carve-out**：与 stage-2 §C-rev1 §3 / §B-rev0 batch 2 / stage-1 §C2 / §D2 / §F2 "schema 同步 / `#[ignore]` 取消 / 实测取代估算" 同型政策，本 batch 走同型 "[实现] 闭合 commit 取消 ignore 并验证全绿" 单边路径处理。
+
+**碎裂的常数同步追认**：`n_train` 公式 `K × 100` cap 是 `bucket_table::train_one_street` 内部 [实现] 阶段细化决策（非 D-NNN-revM 修订），与 stage-2 §C-rev1 §1 "C2 [实现] 取舍：cluster_iter ≤ 500 EHS² ≈ equity² 近似" 同型——production 路径（§G-batch1 §3.3 artifact 重训）仍走 4×N 全覆盖，本 cap 仅让 fixture 训练可行。
+
+##### §G-batch1 §3.3..§3.8 + §4：待后续 batch 追加
+
+- §G-batch1 §3.3 [实现]：`tools/train_bucket_table.rs` 处理 528 MB write + 训练时长 ≤ 120 min release + mini-batch k-means fallback for river（可选）。
+- §G-batch1 §3.4 [实现]：artifact 重训（vultr 4-core ~120 min release，关闭 K×100 cap 走 4×N 全覆盖）+ GitHub Release 上传 + BLAKE3 录入；`tools/fetch_bucket_table.sh` 新增 helper。
+- §G-batch1 §3.5 [实现]：跨架构 baseline 32-seed × 3 街重生（vultr ~3 h release）。
+- §G-batch1 §3.6 [实现]：D-275 实测取选项 A / B / C；如选项 B 走 stage 1 D-275-rev1 流程。
+- §G-batch1 §3.7 [实现]：`tools/bucket_table_reader.py` Python reader schema=2 解析路径 + 精确 N 值断言。
+- §G-batch1 §3.8 [实现]：12 条 `tests/bucket_quality.rs` `#[ignore]` 取消并验证 4 类质量门槛全绿（path.md 字面 EHS std dev < 0.05 / EMD ≥ 0.02 / monotonicity / 0 空 bucket；release ~3 min 实跑）；CLAUDE.md ground truth hash 全部漂移更新。
 - §G-batch1 §4 [报告]：stage 2 report §8 carve-out 表更新（D-218-rev1 carve-out closed）+ `docs/pluribus_stage2_bucket_quality.md` 直方图全部重生 + `pluribus_stage2_api.md` 不变（签名 byte-equal）+ CLAUDE.md stage 2 follow-up 索引同步 + §F-rev2 §4 第 1 条 carve-out 状态翻面。
 
 ##### §G-batch1 §5 carry forward 处理政策（与 stage 2 §A-rev0..§F-rev2 一致，不重新论证）

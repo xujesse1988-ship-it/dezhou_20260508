@@ -22,125 +22,49 @@ use crate::abstraction::preflop::{
     compute_betting_state, compute_position_bucket, compute_stack_bucket, compute_street_tag,
 };
 
-/// 每条街联合 (board, hole) canonical observation id 的上界（C2 收紧版本，原 A1
-/// 保守上界 flop ≤ 2_000_000 / turn ≤ 20_000_000 / river ≤ 200_000_000，详见
-/// D-244-rev1 BT-008-rev1 "A1 实测后可收紧"）。
+/// 每条街联合 (board, hole) canonical observation id 的上界。
 ///
-/// **C2 实测取值**：3K + 6K + 10K = 19K entries × 4 bytes ≈ 76 KB。该取值压紧的
-/// 设计动因是 lookup table 必须 100% feature-based 覆盖（对每个 obs_id 至少有一
-/// 个训练 sample 经 hash 命中，从而其 bucket id 来自 k-means feature 分配而非
-/// hash fallback；见 `train_one_street` 实现）。FNV-1a 32-bit hash 经 mod 后作为
-/// equivalence representative，碰撞率随 N 减小而上升——但碰撞 (board, hole) 共享
-/// 同一 bucket 是工程取舍（D-244-rev1 注：「stage 2 不解决该耦合」），换取 100%
-/// 训练覆盖让 validation §3 std dev / EMD / 单调性门槛在小训练 set 下可达。
+/// **§G-batch1 §3.2 [实现]**：从 C2 收紧的 FNV-1a hash mod 上界（flop=3K / turn=6K
+/// / river=10K）切换到 D-218-rev2 §2 实测真等价类数。三常量改为 `pub use` re-export
+/// 自 `crate::abstraction::canonical_enum`，让既有 caller（`tests/canonical_observation.rs`
+/// / `bucket_table.rs` lookup_table 分配）通过本路径无缝切换到真值。
 ///
-/// 上界保留在 D-244-rev1 BT-008-rev1 conservative cap 内（flop 3K ≤ 2M 等）。
-pub const N_CANONICAL_OBSERVATION_FLOP: u32 = 3_000;
-pub const N_CANONICAL_OBSERVATION_TURN: u32 = 6_000;
-pub const N_CANONICAL_OBSERVATION_RIVER: u32 = 10_000;
+/// 切换前 C2 口径（FNV-1a + mod）：3K + 6K + 10K = 19K × 4 bytes ≈ 76 KB
+/// lookup_table；hash 碰撞下 ~100% bucket 覆盖（D-244-rev1 工程取舍）。
+///
+/// §G-batch1 §3.2 后口径（真等价类）：1,286,792 + 13,960,050 + 123,156,254 =
+/// 138,403,096 entries × 4 bytes ≈ 528 MB lookup_table；每 canonical 观察唯一
+/// obs_id，无碰撞（详见 D-218-rev2 §3 "唯一性（新）"）。Artifact 量级飞涨到
+/// ~528 MB（D-218-rev2 §5），分发走 GitHub Release + BLAKE3（D-218-rev2 §10）。
+pub use crate::abstraction::canonical_enum::{
+    N_CANONICAL_OBSERVATION_FLOP, N_CANONICAL_OBSERVATION_RIVER, N_CANONICAL_OBSERVATION_TURN,
+};
 
 /// postflop 联合 (board, hole) canonical observation id ∈
-/// 0..n_canonical_observation(street)（花色对称等价类）。
+/// `0..n_canonical_observation(street)`（花色对称等价类）。
 /// `BucketTable::lookup(street, _)` postflop 入参由本函数计算。
 ///
 /// 仅对 `StreetTag::{Flop, Turn, River}` 有效（`board.len() ∈ {3, 4, 5}`）；
 /// `StreetTag::Preflop` 调用 panic（caller 应改用 `canonical_hole_id`）。
 ///
-/// **C2 实现策略**：sort (board, hole) by raw card index → first-appearance suit
-/// remap → sort canonical → FNV-1a 32-bit fold → mod 街相关上界
-/// （[`N_CANONICAL_OBSERVATION_FLOP`] / `..._TURN` / `..._RIVER`）。算法满足：
+/// **§G-batch1 §3.2 [实现]**：实现 forward 到
+/// [`crate::abstraction::canonical_enum::canonical_observation_id`]——
+/// D-218-rev2 真等价类枚举（Waugh 2013-style hand isomorphism + colex ranking 3
+/// 街全枚举）。公开签名 byte-equal 不变；返回值数值切换。
 ///
-/// - **确定性**：纯函数，无 RNG / 全局状态。
-/// - **input-order 不变性**：board / hole 按 `Card::to_u8()` 升序预排序后再喂给
-///   first-appearance remap；同一 (board set, hole set) 任意输入顺序得到同一
-///   canonical 序列（§C-rev2 §4 修正点）。
-/// - **花色对称不变性**：全局花色置换 σ 应用到 (board, hole) 后，预排序破坏 σ
-///   的位置敏感性，但 first-appearance remap 输出仍与原序列同构 → FNV-1a fold
-///   输入相同 → 输出相同 id（D-218-rev1 花色对称等价类）。
-/// - **board/hole partition 区分**：board 排序在前 / hole 排序在后构造 remap
-///   walk 顺序，保证同一 ranks/suits 不同 partition 划分得到不同 canonical id
-///   （poker 语义：board 公共 vs hole 私有不可互换）。
-/// - **范围**：mod 街相关上界后 id < `n_canonical_observation(street)`，落在
-///   D-244-rev1 BT-008-rev1 收紧上界内。
+/// **历史 D-218-rev1 / C2 设计（FNV-1a hash mod 上界）**：sort (board, hole) by
+/// raw card index → first-appearance suit remap → FNV-1a 32-bit fold → mod
+/// `N_CANONICAL_OBSERVATION_<street>`（C2 收紧到 3K/6K/10K）。hash 碰撞让多个互
+/// 不等价 (board, hole) 共享 obs_id → 共享 bucket id → bucket 内 EHS std_dev 由
+/// 碰撞跨度决定而非 k-means clustering 质量决定。
 ///
-/// FNV-1a hash 不保证不同等价类映射到不同 id（小概率碰撞），但 lookup table
-/// 由 `train_bucket_table` 在 sample-and-assign 路径写入：每个 obs_id 取首次
-/// 命中的 (board, hole) feature → bucket id。碰撞 obs_id 共用一个 bucket 是
-/// 工程取舍（D-244-rev1 / D-273 浮点边界保护下，运行时禁止跑 inner equity）。
+/// **§G-batch1 §3.2 后口径**：调用 [`canonical_enum`](crate::abstraction::canonical_enum)，
+/// 返回 dense `[0, N)` 上的 canonical id（N = 1,286,792 / 13,960,050 / 123,156,254
+/// per street）。两个互不等价 (board, hole) 一定映射到不同 id（D-218-rev2 §3
+/// "唯一性（新）"）。算法满足同一组不变量（确定性 / input-order invariance /
+/// 花色对称 / partition 区分），由 canonical_enum 严格保证而非 hash 近似。
 pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 2]) -> u32 {
-    if matches!(street, StreetTag::Preflop) {
-        panic!(
-            "canonical_observation_id called with StreetTag::Preflop; use canonical_hole_id \
-             for preflop hole canonical id (API §2 / D-218-rev1)"
-        );
-    }
-    let expected_board_len = match street {
-        StreetTag::Flop => 3usize,
-        StreetTag::Turn => 4,
-        StreetTag::River => 5,
-        StreetTag::Preflop => unreachable!(),
-    };
-    assert_eq!(
-        board.len(),
-        expected_board_len,
-        "canonical_observation_id: board length mismatch for {street:?}: expected {expected_board_len}, got {}",
-        board.len()
-    );
-
-    // §C-rev2 §4：先按 raw `to_u8()` 升序排序 board / hole，消除 caller 传入顺序
-    // 对 first-appearance suit remap 的影响。to_u8() = rank * 4 + suit，是 Card 上
-    // 的稳定全序；同一 (board set, hole set) 任意输入顺序排序后得到同一序列。
-    let mut board_sorted: [Card; 5] = [Card::from_u8(0).expect("0 valid"); 5];
-    for (i, &c) in board.iter().enumerate() {
-        board_sorted[i] = c;
-    }
-    board_sorted[..board.len()].sort_unstable_by_key(|c| c.to_u8());
-    let mut hole_sorted: [Card; 2] = hole;
-    hole_sorted.sort_unstable_by_key(|c| c.to_u8());
-
-    // First-appearance suit remap across sorted (board || hole)。board 在 hole
-    // 之前遍历，partition 区分由 walk 顺序保证（同 ranks/suits 不同 partition
-    // 划分得到不同 remap → 不同 canonical id）。
-    let mut suit_remap: [u8; 4] = [u8::MAX; 4];
-    let mut next_suit: u8 = 0;
-    for &c in board_sorted[..board.len()].iter().chain(hole_sorted.iter()) {
-        let s = c.suit() as u8;
-        if suit_remap[s as usize] == u8::MAX {
-            suit_remap[s as usize] = next_suit;
-            next_suit += 1;
-        }
-    }
-    let to_canonical = |c: Card| -> u8 {
-        let canon_suit = suit_remap[c.suit() as usize];
-        c.rank() as u8 * 4 + canon_suit
-    };
-
-    // remap 后再按 canonical 值排序：花色置换 σ 让相同 rank 内的 raw_suit 顺序
-    // 漂移，需重新排序到 canonical 顺序保证 FNV-1a 输入序列对 σ 不变。
-    let mut board_canon: [u8; 5] = [0; 5];
-    for (i, &c) in board_sorted[..board.len()].iter().enumerate() {
-        board_canon[i] = to_canonical(c);
-    }
-    board_canon[..board.len()].sort_unstable();
-    let mut hole_canon: [u8; 2] = [to_canonical(hole_sorted[0]), to_canonical(hole_sorted[1])];
-    hole_canon.sort_unstable();
-
-    // FNV-1a 32-bit fold, mod 街相关上界（C2 收紧；A1 原 2_000_000 全街共用）。
-    let mut id: u32 = 2_166_136_261;
-    let prime: u32 = 16_777_619;
-    for &c in &board_canon[..board.len()] {
-        id = id.wrapping_mul(prime) ^ u32::from(c);
-    }
-    for &c in &hole_canon {
-        id = id.wrapping_mul(prime) ^ u32::from(c);
-    }
-    let modulus = match street {
-        StreetTag::Flop => N_CANONICAL_OBSERVATION_FLOP,
-        StreetTag::Turn => N_CANONICAL_OBSERVATION_TURN,
-        StreetTag::River => N_CANONICAL_OBSERVATION_RIVER,
-        StreetTag::Preflop => unreachable!(),
-    };
-    id % modulus
+    crate::abstraction::canonical_enum::canonical_observation_id(street, board, hole)
 }
 
 /// mmap-backed postflop bucket abstraction（D-213 / D-214 / D-216 / D-218-rev1 /
