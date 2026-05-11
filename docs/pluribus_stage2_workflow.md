@@ -1957,10 +1957,40 @@ stage 2 闭合后第一项 follow-up：把 hash-based `canonical_observation_id`
 - 本 workflow §F-rev2 §4 carve-out 1 同步收口路径已锁，后续 [测试] / [实现] / [报告] 阶段走 §G-batch1 §2..§4 子节（本 commit 仅 [决策] 阶段，子节为空待后续 batch 追加）。
 - 0 src/ / tests/ / benches/ / fuzz/ / tools/ / proto/ 改动——本 commit 严格 [决策] 角色单边路径，与 stage 2 A0 [决策] 0 越界形态同型。
 
-##### §G-batch1 §2..§4：待后续 batch 追加
+##### §G-batch1 §2 [测试]（2026-05-11）：D-218-rev2 契约 4 类 unit test + 12 ignore reason 转向 §G-batch1 §3
 
-- §G-batch1 §2 [测试]：`tests/canonical_observation.rs` 新增 uniqueness 单元测试 + `tests/bucket_quality.rs` 12 ignore 转 active 准备（不取消，仅准备）。
-- §G-batch1 §3 [实现]：`src/abstraction/canonical_enum.rs` 新增模块 + `postflop.rs` 三常量改真值 + `bucket_table.rs` schema_version bump + artifact 重训 + 12 ignore 取消 + 跨架构 baseline 重生 + D-275 实测取选项 A/B/C。
+§G-batch1 §1 [决策] 落地后第一笔 [测试]：把 D-218-rev2 §2 / §3 字面契约钉成可
+执行 unit test，全部 `#[ignore]` 等 §G-batch1 §3 [实现] 落地后由 [实现] commit
+取消 ignore 并验证全绿（与 stage-2 §B1 / §C1 / §F1 中其它 `#[ignore]` 路径
+同形态——测试在 [测试] 阶段落地、`#[ignore]` 标注 [实现] 步骤名、[实现] 闭合
+commit 取消 ignore 实跑）。
+
+**`tests/canonical_observation.rs` 新增节 6 "D-218-rev2 真等价类枚举"**（5 条
+新 `#[test]`，全 `#[ignore = "§G-batch1 §3: ..."]`）：
+
+- `n_canonical_observation_constants_match_d218_rev2_spec`：assert `N_CANONICAL_OBSERVATION_FLOP / TURN / RIVER` 精确等于 25,989 / 1,286,792 / 123,156,254（D-218-rev2 §2 字面）。当前 D-218-rev1 路径下 3K/6K/10K → fail。
+- `canonical_observation_id_uniqueness_random_100k_flop`：100K 随机 (board, hole) → assert distinct count > 20K + max_id > 20K（D-218-rev2 §3 "唯一性（新）" + "稠密性"；当前 FNV-1a mod 3K distinct < 3K / max_id < 3K → fail）。
+- `canonical_observation_id_uniqueness_random_100k_turn`：同 turn 街，distinct > 95K + max_id > 1M（N=1.28M 远 > 100K 采样容量 → equivalence-class 碰撞极稀少）。
+- `canonical_observation_id_uniqueness_random_100k_river`：同 river 街，distinct > 99.9K + max_id > 50M（N=123M 几乎不可能碰撞）。
+- `canonical_observation_id_full_flop_enumeration_exactly_25989_distinct`：(52 choose 3) × (49 choose 2) = 26M (board, hole) 全枚举 → distinct count 必须精确 = 25,989 + max_id = 25,988（dense packing 强约束）。**双重 `#[ignore]`**：§G-batch1 §3 + release/--ignored opt-in（~10 s release，超 dev loop SLO）。turn / river full enumeration **不写**——305M / 2.8B 即使 release 也需 ~2 h / ~16 h，超 dev loop SLO + 与 100K 随机 uniqueness 统计差距 < 0.1%。
+
+**`tests/bucket_quality.rs` 12 条 `#[ignore]` reason 字符串转向 §G-batch1 §3**：
+
+- 12 条同型 `#[ignore]` reason 从 `"§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"` 改为 `"§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"`。
+- 12 条断言 body 0 改动；fixture 函数 0 改动；当前 `cargo test` 行为 byte-equal 不变（仍 ignored 跳过）。仅 reason 字符串语义指向更新——与 stage 2 §C-rev1 §3 "C2 [实现] 落地后该 reason 不再准确，必须更新" 同型操作。
+
+**[测试] 角色边界审计**：本 batch 触 `tests/canonical_observation.rs`（前置 module-level doc-comment 同步 §G-batch1 §2 出口 + import 多引入 3 个常量 / `ChaCha20Rng` / `RngSource` / `rng_substream::*` + 节 6 五条 `#[test]` + `sample_distinct_cards` helper）+ `tests/bucket_quality.rs`（12 条 ignore reason 字符串 in-place 替换）+ 本 workflow 节 §G-batch1 §2 上一段 [测试] 闭合记录 + `CLAUDE.md` 状态翻面（§下一步指向 §G-batch1 §3 [实现]）。`src/` / `benches/` / `fuzz/` / `tools/` / `proto/` / `Cargo.toml` / `Cargo.lock` / `pluribus_stage2_decisions.md` / `pluribus_stage2_api.md` / `pluribus_stage2_validation.md` **未修改一行**——[测试] 角色 0 越界（与 stage-2 §B1 / §C1 / §F1 0 越界形态同型）。
+
+**出口检查**：
+
+- `cargo build --tests` 全绿（26 s）。
+- `cargo test --test canonical_observation`：12 passed / 0 failed / 5 ignored（5 新 ignored 全部来自 §G-batch1 §2 节 6；既有 12 个 `#[test]` byte-equal 不变）。
+- `cargo test --test bucket_quality --no-run` 编译过；body 0 改动→实跑行为 byte-equal 不变（debug ~5-10 min 实跑 cost 不必跑，reason 字符串变更不影响 test runner behavior）。
+- `cargo fmt --all --check` / `cargo clippy --tests -- -D warnings` 全绿。
+
+##### §G-batch1 §3..§4：待后续 batch 追加
+
+- §G-batch1 §3 [实现]：`src/abstraction/canonical_enum.rs` 新增模块 + `postflop.rs` 三常量改真值 + `bucket_table.rs` schema_version bump + artifact 重训 + 12 ignore 取消 + 跨架构 baseline 重生 + D-275 实测取选项 A/B/C + §G-batch1 §2 节 6 五条 `#[ignore]` 取消。
 - §G-batch1 §4 [报告]：CLAUDE.md ground truth hash 全部漂移更新 + stage 2 report §8 carve-out 表更新（D-218-rev1 carve-out closed）+ `docs/pluribus_stage2_bucket_quality.md` 直方图全部重生 + `pluribus_stage2_api.md` 不变（签名 byte-equal）。
 
 ##### §G-batch1 §5 carry forward 处理政策（与 stage 2 §A-rev0..§F-rev2 一致，不重新论证）

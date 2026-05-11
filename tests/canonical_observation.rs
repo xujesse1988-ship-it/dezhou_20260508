@@ -22,10 +22,21 @@
 //! **B2 状态**：stub 落地后断言激活；本文件保持原文，仅 [实现] 侧填充 stub。
 //!
 //! 角色边界：本文件属 `[测试]` agent 产物。
+//!
+//! **§G-batch1 §2 [测试] 新增**（详见 `docs/pluribus_stage2_decisions.md` §10
+//! "Stage 3 起步 batch 1 — D-218-rev2 / D-244-rev2 真等价类枚举"）：第 6 节
+//! D-218-rev2 真等价类枚举 4 类断言（N 常量 / 100K 随机 uniqueness / 100K 随机
+//! max id 接近 N / 全 flop 26M 枚举精确 25,989 distinct）。全部 `#[ignore]` 等
+//! §G-batch1 §3 [实现] 落地（colex ranking + N 真值常量 + schema_version bump）
+//! 后由 [实现] commit 取消 ignore。
 
 use std::collections::HashSet;
 
-use poker::{canonical_observation_id, Card, Rank, StreetTag, Suit};
+use poker::abstraction::postflop::{
+    N_CANONICAL_OBSERVATION_FLOP, N_CANONICAL_OBSERVATION_RIVER, N_CANONICAL_OBSERVATION_TURN,
+};
+use poker::rng_substream::{derive_substream_seed, EQUITY_MONTE_CARLO};
+use poker::{canonical_observation_id, Card, ChaCha20Rng, Rank, RngSource, StreetTag, Suit};
 
 // ============================================================================
 // 通用 fixture
@@ -406,5 +417,247 @@ fn canonical_observation_id_preflop_panics() {
             Card::new(Rank::Ace, Suit::Spades),
             Card::new(Rank::Ace, Suit::Hearts),
         ],
+    );
+}
+
+// ============================================================================
+// 6. D-218-rev2 真等价类枚举（§G-batch1 §2 [测试] 新增）
+// ============================================================================
+//
+// 详见 `docs/pluribus_stage2_decisions.md` §10 "Stage 3 起步 batch 1
+// — D-218-rev2 / D-244-rev2 真等价类枚举"。本节 4 类断言钉死 D-218-rev2 [实现]
+// 必须满足的契约：
+//
+// 1. **N 常量精确值**：`N_CANONICAL_OBSERVATION_FLOP / TURN / RIVER` 必须分别
+//    等于标准 hand_isomorphism C lib 数 25,989 / 1,286,792 / 123,156,254
+//    （D-218-rev2 §2 字面）。
+// 2. **uniqueness（100K 随机样本）**：从 100K 随机 (board, hole) 应观察到接近
+//    N 量级 distinct canonical_id（D-218-rev2 §3 "唯一性（新）"）。当前 FNV-1a
+//    hash mod 3K/6K/10K 路径下 distinct count 受 modulus 上限封顶。
+// 3. **dense packing（max id 接近 N-1）**：100K 随机样本观察到的 max id 应
+//    接近 `N - 1`（D-218-rev2 §3 "稠密性"）。
+// 4. **full flop 枚举精确 25,989 distinct**：(52 choose 3) × (49 choose 2) =
+//    26M (board, hole) 全枚举后 distinct canonical_id 数恰好 = N_FLOP = 25,989
+//    （`#[ignore]` 双重 release + --ignored opt-in，与 stage-2 §C2 / §D2
+//    同形态）。
+//
+// 全部 `#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]` 标注；
+// 当前 hash 路径下断言**预期失败**——[实现] 闭合 commit 取消 ignore 并验证
+// 全绿（与 stage-1 §C2 / §D2 / §F2 + stage-2 §B1 / §C1 / §F1 同形态）。
+
+/// §G-batch1 §2 sampling helper：从 deck 抽 `count` 张不重复 `Card`。
+fn sample_distinct_cards(rng: &mut dyn RngSource, count: usize) -> Vec<Card> {
+    assert!(count <= 52, "至多 52 张");
+    let mut available: Vec<u8> = (0..52u8).collect();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let pick = (rng.next_u64() % (available.len() as u64 - i as u64)) as usize;
+        let idx = i + pick;
+        available.swap(i, idx);
+        out.push(Card::from_u8(available[i]).expect("0..52 valid"));
+    }
+    out
+}
+
+/// D-218-rev2 §2 N 常量精确值断言（标准 hand_isomorphism C lib 数）。
+///
+/// **当前 D-218-rev1 状态**：3_000 / 6_000 / 10_000 （C2 收紧上界）——断言失败。
+/// **§G-batch1 §3 [实现] 落地后**：25_989 / 1_286_792 / 123_156_254——断言通过。
+#[test]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
+fn n_canonical_observation_constants_match_d218_rev2_spec() {
+    assert_eq!(
+        N_CANONICAL_OBSERVATION_FLOP, 25_989,
+        "D-218-rev2 §2: flop 3+2 cards canonical 等价类 = 25,989"
+    );
+    assert_eq!(
+        N_CANONICAL_OBSERVATION_TURN, 1_286_792,
+        "D-218-rev2 §2: turn 4+2 cards canonical 等价类 = 1,286,792"
+    );
+    assert_eq!(
+        N_CANONICAL_OBSERVATION_RIVER, 123_156_254,
+        "D-218-rev2 §2: river 5+2 cards canonical 等价类 = 123,156,254"
+    );
+}
+
+/// D-218-rev2 §3 "唯一性（新）" + "稠密性" flop 100K 随机样本 uniqueness。
+///
+/// 100K 随机 (board, hole) → 期望 distinct count > 20K（接近 N_FLOP = 25_989；
+/// 随机采样路径下 equivalence-class 自然碰撞稀少）+ max_id > 20K（接近 N - 1）。
+/// 当前 FNV-1a hash mod 3K 路径下 distinct < 3000 / max_id < 3000——断言失败。
+#[test]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
+fn canonical_observation_id_uniqueness_random_100k_flop() {
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut max_id: u32 = 0;
+    let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+        0xD218_BEEF_CAFE_0001,
+        EQUITY_MONTE_CARLO,
+        0,
+    ));
+    for _ in 0..100_000 {
+        let cards = sample_distinct_cards(&mut rng, 5);
+        let board: Vec<Card> = cards[..3].to_vec();
+        let hole: [Card; 2] = [cards[3], cards[4]];
+        let id = canonical_observation_id(StreetTag::Flop, &board, hole);
+        max_id = max_id.max(id);
+        seen.insert(id);
+        assert!(
+            id < N_CANONICAL_OBSERVATION_FLOP,
+            "id ({id}) < N_CANONICAL_OBSERVATION_FLOP ({N_CANONICAL_OBSERVATION_FLOP})"
+        );
+    }
+    assert!(
+        seen.len() > 20_000,
+        "D-218-rev2 §3 uniqueness（flop）：expected > 20K distinct canonical_ids from \
+         100K random samples (got {})；当前 FNV-1a hash mod 3K 路径下 distinct < 3000",
+        seen.len()
+    );
+    assert!(
+        max_id > 20_000,
+        "D-218-rev2 §3 dense packing（flop）：max canonical_id ({max_id}) 应接近 \
+         N_FLOP - 1 = {}",
+        N_CANONICAL_OBSERVATION_FLOP - 1
+    );
+}
+
+/// D-218-rev2 §3 turn 100K 随机样本 uniqueness（N = 1,286,792，远 > 100K 采样
+/// 容量 → equivalence-class 自然碰撞极稀少，distinct 期望 > 95K + max_id > 1M）。
+/// 当前 FNV-1a hash mod 6K 路径下 distinct < 6000 / max_id < 6000——断言失败。
+#[test]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
+fn canonical_observation_id_uniqueness_random_100k_turn() {
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut max_id: u32 = 0;
+    let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+        0xD218_BEEF_CAFE_0002,
+        EQUITY_MONTE_CARLO,
+        0,
+    ));
+    for _ in 0..100_000 {
+        let cards = sample_distinct_cards(&mut rng, 6);
+        let board: Vec<Card> = cards[..4].to_vec();
+        let hole: [Card; 2] = [cards[4], cards[5]];
+        let id = canonical_observation_id(StreetTag::Turn, &board, hole);
+        max_id = max_id.max(id);
+        seen.insert(id);
+        assert!(
+            id < N_CANONICAL_OBSERVATION_TURN,
+            "id ({id}) < N_CANONICAL_OBSERVATION_TURN ({N_CANONICAL_OBSERVATION_TURN})"
+        );
+    }
+    assert!(
+        seen.len() > 95_000,
+        "D-218-rev2 §3 uniqueness（turn）：expected > 95K distinct canonical_ids from \
+         100K random samples (got {})；当前 FNV-1a hash mod 6K 路径下 distinct < 6000",
+        seen.len()
+    );
+    assert!(
+        max_id > 1_000_000,
+        "D-218-rev2 §3 dense packing（turn）：max canonical_id ({max_id}) 应接近 \
+         N_TURN - 1 = {}",
+        N_CANONICAL_OBSERVATION_TURN - 1
+    );
+}
+
+/// D-218-rev2 §3 river 100K 随机样本 uniqueness（N = 123,156,254，几乎不可能
+/// 碰撞 → distinct 期望 > 99,900 + max_id > 50M）。当前 FNV-1a hash mod 10K
+/// 路径下 distinct < 10000 / max_id < 10000——断言失败。
+#[test]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active"]
+fn canonical_observation_id_uniqueness_random_100k_river() {
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut max_id: u32 = 0;
+    let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+        0xD218_BEEF_CAFE_0003,
+        EQUITY_MONTE_CARLO,
+        0,
+    ));
+    for _ in 0..100_000 {
+        let cards = sample_distinct_cards(&mut rng, 7);
+        let board: Vec<Card> = cards[..5].to_vec();
+        let hole: [Card; 2] = [cards[5], cards[6]];
+        let id = canonical_observation_id(StreetTag::River, &board, hole);
+        max_id = max_id.max(id);
+        seen.insert(id);
+        assert!(
+            id < N_CANONICAL_OBSERVATION_RIVER,
+            "id ({id}) < N_CANONICAL_OBSERVATION_RIVER ({N_CANONICAL_OBSERVATION_RIVER})"
+        );
+    }
+    assert!(
+        seen.len() > 99_900,
+        "D-218-rev2 §3 uniqueness（river）：expected > 99.9K distinct canonical_ids from \
+         100K random samples (got {})；当前 FNV-1a hash mod 10K 路径下 distinct < 10000",
+        seen.len()
+    );
+    assert!(
+        max_id > 50_000_000,
+        "D-218-rev2 §3 dense packing（river）：max canonical_id ({max_id}) 应接近 \
+         N_RIVER - 1 = {}",
+        N_CANONICAL_OBSERVATION_RIVER - 1
+    );
+}
+
+/// D-218-rev2 §3 flop 全枚举精确 25,989 distinct（exhaustive ground truth）。
+///
+/// 枚举 (52 choose 3) × (49 choose 2) = 22,100 × 1,176 = 25,989,600 (board, hole)
+/// 组合（每条 board 取所有 (49 choose 2) hole 组合），所有 canonical_id 收集到
+/// HashSet → 最终 size 必须恰好等于 N_FLOP = 25,989（精确 ground truth）。
+///
+/// **耗时**：~10 s release on 1-CPU host（26M canonical_observation_id calls
+/// × ~400 ns/call）。`#[ignore]` 默认 `cargo test` 跳过，仅 `cargo test --release
+/// -- --ignored` 触发（与 stage-1 §C2 / §D2 + stage-2 §C1 / §F1 同形态：
+/// double-ignore 路径下 release + --ignored opt-in）。
+///
+/// turn / river 不写 full enumeration test 因为：turn (52 choose 4) × (48
+/// choose 2) ~305M / river (52 choose 5) × (47 choose 2) ~2.8B 即使 release
+/// 也需 ~2 h / ~16 h——超 dev loop SLO + 与 100K uniqueness 测试覆盖度等价
+/// （100K 随机采样在 turn/river 等价类空间下与全枚举差距 < 0.1% statistical）。
+#[test]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 落地后转 active + release/--ignored opt-in"]
+fn canonical_observation_id_full_flop_enumeration_exactly_25989_distinct() {
+    let mut seen: HashSet<u32> = HashSet::new();
+    for b0 in 0..52u8 {
+        for b1 in (b0 + 1)..52u8 {
+            for b2 in (b1 + 1)..52u8 {
+                let board = [
+                    Card::from_u8(b0).expect("0..52"),
+                    Card::from_u8(b1).expect("0..52"),
+                    Card::from_u8(b2).expect("0..52"),
+                ];
+                let board_vec = board.to_vec();
+                for h0 in 0..52u8 {
+                    if h0 == b0 || h0 == b1 || h0 == b2 {
+                        continue;
+                    }
+                    for h1 in (h0 + 1)..52u8 {
+                        if h1 == b0 || h1 == b1 || h1 == b2 {
+                            continue;
+                        }
+                        let hole = [
+                            Card::from_u8(h0).expect("0..52"),
+                            Card::from_u8(h1).expect("0..52"),
+                        ];
+                        let id = canonical_observation_id(StreetTag::Flop, &board_vec, hole);
+                        seen.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        seen.len(),
+        N_CANONICAL_OBSERVATION_FLOP as usize,
+        "D-218-rev2 §3 exhaustive ground truth（flop）：26M (board, hole) 全枚举后 \
+         distinct canonical_id 必须精确等于 N_FLOP = {}",
+        N_CANONICAL_OBSERVATION_FLOP
+    );
+    // Dense packing 强约束：所有 id ∈ [0, N) 全覆盖（无空洞）。
+    let max_id = *seen.iter().max().expect("non-empty");
+    assert_eq!(
+        max_id,
+        N_CANONICAL_OBSERVATION_FLOP - 1,
+        "D-218-rev2 §3 稠密性（flop）：max canonical_id = N_FLOP - 1（id ∈ [0, N) 全覆盖）"
     );
 }

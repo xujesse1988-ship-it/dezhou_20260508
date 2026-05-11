@@ -276,7 +276,7 @@ fn bucket_lookup_1m_in_range_full() {
 // 默认 active：4 条 helper sanity（emd / std_dev / median）+ 3 条 1k smoke
 // in-range + 1 条 1M smoke（`#[ignore]` opt-in）。
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn no_empty_bucket_per_street_flop() {
     let table = cached_trained_table();
     let bucket_count = table.bucket_count(StreetTag::Flop);
@@ -296,7 +296,7 @@ fn no_empty_bucket_per_street_flop() {
 }
 
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn no_empty_bucket_per_street_turn() {
     let table = cached_trained_table();
     let bucket_count = table.bucket_count(StreetTag::Turn);
@@ -316,7 +316,7 @@ fn no_empty_bucket_per_street_turn() {
 }
 
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn no_empty_bucket_per_street_river() {
     let table = cached_trained_table();
     let bucket_count = table.bucket_count(StreetTag::River);
@@ -347,7 +347,7 @@ fn no_empty_bucket_per_street_river() {
 // 采样：每条街 1000 sample（C1 1.5 人周限速）；EHS 用 `equity` 接口，1k iter
 // MC（标准误差 ≈ 0.016 < 0.05 阈值的 ~30% — 不会主导信号）。三街独立 #[test]。
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn bucket_internal_ehs_std_dev_below_threshold_flop() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
@@ -385,7 +385,7 @@ fn bucket_internal_ehs_std_dev_below_threshold_flop() {
 }
 
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn bucket_internal_ehs_std_dev_below_threshold_turn() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
@@ -420,7 +420,7 @@ fn bucket_internal_ehs_std_dev_below_threshold_turn() {
 }
 
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn bucket_internal_ehs_std_dev_below_threshold_river() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
@@ -462,7 +462,7 @@ fn bucket_internal_ehs_std_dev_below_threshold_river() {
 // **C1 状态**：B2 stub 全部映射到 bucket 0 → bucket 0 vs 1..499 比较时 1..499
 // 全空，`emd_1d` 返回 0 ⇒ `#[ignore]`。C2 落地后 499 对相邻每对 EMD ≥ 0.02。
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn adjacent_bucket_emd_above_threshold_flop() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
@@ -496,7 +496,7 @@ fn adjacent_bucket_emd_above_threshold_flop() {
 }
 
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn adjacent_bucket_emd_above_threshold_turn() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
@@ -530,7 +530,7 @@ fn adjacent_bucket_emd_above_threshold_turn() {
 }
 
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn adjacent_bucket_emd_above_threshold_river() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
@@ -574,7 +574,7 @@ fn adjacent_bucket_emd_above_threshold_river() {
 // 中位数 NaN（短路：`samples.len() < 2` 跳过 → 整条单调链不可比较 → 测试 fail）。
 // `#[ignore]` 留 C2。
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn bucket_id_ehs_median_monotonic_flop() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
@@ -618,7 +618,7 @@ fn bucket_id_ehs_median_monotonic_flop() {
 }
 
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn bucket_id_ehs_median_monotonic_turn() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
@@ -662,7 +662,7 @@ fn bucket_id_ehs_median_monotonic_turn() {
 }
 
 #[test]
-#[ignore = "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active"]
+#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn bucket_id_ehs_median_monotonic_river() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
