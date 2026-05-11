@@ -491,6 +491,94 @@ C2 [实现] 取舍：`MonteCarloEquity::with_iter(cluster_iter)` 在 `cluster_it
 
 ---
 
+#### Stage 3 起步 batch 1（2026-05-11）— D-218-rev2 / D-244-rev2 真等价类枚举
+
+Stage 2 闭合后第一项 follow-up（详见 `pluribus_stage2_workflow.md` §F-rev2 §4 第 1 条 carve-out 与本文 §10 "D-218-rev1 限制声明"）：把 hash-based `canonical_observation_id` 替换为完整的花色对称等价类枚举，使 `tests/bucket_quality.rs` 12 条 `#[ignore]` 质量门槛（0 空 bucket / EHS std dev < 0.05 / 相邻 EMD ≥ 0.02 / bucket id ↔ median 单调）可转 active。本 batch 是 stage 3 [决策] 起步**之前**的 stage 2 收口工作，决策号沿用 D-NNN-revM 体系（不进 stage 3 D-3XX 编号空间）。
+
+##### D-218-rev2（2026-05-11）— 真等价类枚举（Waugh 2013-style hand isomorphism）
+
+**背景**：D-218-rev1 字面要求 `canonical_observation_id` 是 (board, hole) 联合花色对称等价类的*唯一 id*；C2 [实现] 走 FNV-1a 32-bit hash + `mod` street-relative upper bound（flop=3K / turn=6K / river=10K）作为 approximate canonical id。Hash 碰撞让多个互不等价 (board, hole) 共享 obs_id → 共享 bucket id → bucket 内 EHS std_dev 由碰撞跨度决定而非 k-means clustering 质量决定。详见 §10 "D-218-rev1 限制声明（C2 关闭 — C-rev1）"。
+
+**新规则**：用标准的 hand isomorphism enumeration 完整替换 hash-based approach，3 街全枚举。
+
+1. **算法**：Kevin Waugh 2013 "A Fast and Optimal Hand Isomorphism Algorithm" 路径（也是 OpenSpiel poker / pokerstove / `hand_isomorphism` C lib 的标准做法）：
+    - 输入：`(street, board, hole)` 其中 `street ∈ {Flop, Turn, River}` / `board.len() ∈ {3, 4, 5}`。
+    - **Step 1（suit canonicalization）**：为每个 suit `s ∈ {0,1,2,3}` 计算 `(board_ranks_bitset: u16, hole_ranks_bitset: u16)`（13-bit 各占低 13 位）。把 4 元组 `[(b, h); 4]` 按 lexicographic 排序得到 canonical suit 顺序——同一个 hand isomorphism 等价类下，suit 重标后 4-tuple signature 完全相同。Board 优先排序保证 board / hole partition 不可互换（继承 D-218-rev1 同语义）。
+    - **Step 2（colex ranking）**：按 canonical suit 顺序 + 每 suit 内按 (board_ranks, hole_ranks) lexicographic，把整个 (board, hole) 编码到一个 dense `[0, n_canonical_observation_<street>)` 索引上。具体实现见 [实现] 阶段 `src/abstraction/canonical_enum.rs`（新模块，~600 行）。
+2. **N 实测**（标准 `hand_isomorphism` C lib 数；isomorphic count 不带 rank reduction）：
+
+    ```text
+    N_CANONICAL_OBSERVATION_FLOP  = 25_989       // 3 board + 2 hole, 5 cards
+    N_CANONICAL_OBSERVATION_TURN  = 1_286_792    // 4 board + 2 hole, 6 cards
+    N_CANONICAL_OBSERVATION_RIVER = 123_156_254  // 5 board + 2 hole, 7 cards
+    ```
+
+3. **不变量**（继承 D-218-rev1 同形态，由真等价类枚举严格保证而非 hash 近似）：
+    - **确定性**：同一 (board, hole) 重复调用 byte-equal。
+    - **input-order 不变性**：board / hole 任意输入顺序得到同一 id（继承 §C-rev2 §4 修复点）。
+    - **花色对称不变性**：全局花色置换 σ 应用后得到同一 id。
+    - **board/hole partition 区分**：相同 rank multiset 不同 partition 划分得到不同 id（poker 语义）。
+    - **唯一性（新）**：D-218-rev1 字面 "唯一 id" 由真等价类枚举严格保证——任意两个互不等价 (board, hole) 一定映射到不同 id。`tests/canonical_observation.rs` 在 D-218-rev2 落地后新增 *uniqueness* 断言（枚举 100K 随机 (board, hole) → 全部 id 在 `[0, N)` 内 + 同等价类 byte-equal + 不同等价类 id 互不相等）。
+    - **稠密性**：id ∈ `[0, N)` 全覆盖（hash mod 路径下小概率 unused slot 在枚举路径下不存在）。
+4. **签名稳定**：`canonical_observation_id(street, board, hole) -> u32` 公开签名 byte-equal 不变；仅返回值数值改变（FNV-1a hash 结果 → colex rank）。API §2 不触发新 `API-NNN-revM`（签名不变）。
+5. **Bucket lookup table size**（D-244-rev2 同步，见下条）：
+    - lookup_table 段 entry 类型保持 u32（与 header §⑫ 字面，u16 替换需另起 `API-NNN-revM`；本 rev 不优化 entry width）。
+    - lookup_table 段总长度（不含 preflop）：`(25989 + 1286792 + 123156254) × 4 = 498,756,140 bytes ≈ 475 MB`。preflop 段 1326 × 4 = 5,304 bytes（不变）。
+    - 整 artifact size：`80 (header) + 216 (centroid_metadata) + 13500 (centroid_data) + 5304 (preflop lookup) + 103956 (flop lookup) + 5147168 (turn lookup) + 492625016 (river lookup) + 32 (trailer) = 498,895,272 bytes ≈ 475.78 MB` 精确值。
+6. **Schema 影响**：bump `BUCKET_TABLE_SCHEMA_VERSION` 1 → 2（D-244-rev1 §④ 字面 mandate "若本 rev 在已写出 v1 bucket table artifact 后落地，必须 bump"；D-218-rev1 v1 artifact 已生成 + 录入 ground truth hash，本 rev bump 触发）。详见 D-244-rev2（下条）。
+7. **k-means 训练**：postflop bucket 数仍是 500/500/500（不变），但 candidate 数从 3K/6K/10K → 25,989 / 1,286,792 / 123,156,254。river 1.23 亿 candidate × 9 dim × f32 = ~4 GB 内存训练 set；超 stage 2 D-282 SLO 设计的内存预算（vultr 4-core EPYC-Rome 8 GB host borderline）。**[实现] 阶段必须评估**：(a) 完整 in-memory k-means（需 ≥ 8 GB free host）或 (b) mini-batch k-means / sampling-based k-means。本 rev 不锁定，留给 [实现] 阶段实测决策；推荐 mini-batch（batch_size 100K / 200 epoch）作为默认 fallback。
+8. **训练时间预算**：river 1.23 亿 candidate × OCHS feature ≈ 8 evals × ~10 ns/eval = 80 ns/candidate × 1.23e8 ≈ 10 s 一遍 feature pass × cluster_iter=200 ≈ 33 min release。turn 1.28M × outer turn enumerate 1 × inner river 44 ≈ 440 ns/cand × 1.28e6 × 200 ≈ 2 min。flop ~10 s。**3 街总训练时间预算 ≤ 60 min release on vultr 4-core**（vs stage 2 默认 17 min；不阻塞 dev loop 因 artifact 缓存 + GitHub Release 分发）。
+9. **运行时 lookup 性能**：mmap-backed bucket_table 命中 P95 ≤ 10 μs SLO（D-281）依赖 random access cache miss 行为；475 MB working set 全 mmap 后 hot pages 不同手哈希 ≈ 50% miss → P95 估计 100-500 ns（DRAM access latency-bound 而非 SLO bound）。**预期不退化**；E2 后实测 vultr / 主 host 验证。
+10. **Artifact 分发**：超 git LFS 实用规模（带宽 + 单文件 1 GB 实用上限）→ **GitHub Release artifact + BLAKE3 verify**（参照 stage 1 dataset distribution patterns）：
+     - artifact 命名：`bucket_table_default_500_500_500_seed_cafebabe_v2.bin`（v2 suffix 区分 v1 / v2 schema）。
+     - 上传到 git tag `stage2-v1.1` 或 `stage2-d218-rev2` GitHub Release。
+     - `tools/fetch_bucket_table.sh` 新增 helper：从 Release URL 下载 + BLAKE3 verify + cache 到 `artifacts/`（gitignore 不变）。
+     - CI 在 `bucket_quality` + perf SLO job 中 fetch artifact；本地 dev 可走 `cargo run --bin train_bucket_table` 重训（30-60 min release）作为 backup。
+     - `tools/bucket_table_reader.py` Python reader 更新 schema_version=2 解析路径 + n_canonical_observation 精确值断言。
+11. **跨架构 baseline**：`tests/data/bucket-table-arch-hashes-linux-x86_64.txt`（32-seed × 3 街 × 10/10/10 × 50 iter）必须**全部重生**——D-218-rev2 改 canonical_id 算法 → 同 seed clustering 路径下 32 个 content_hash 全部漂移。预算 vultr 4-core ~3 h release（与 D1 commit `e7071e0` baseline 落地预算 ~107 min ≈ 2x 慢，因为现在 candidate 集合大 ~3 个量级）。
+12. **测试转 active**：`tests/bucket_quality.rs` 12 条 `#[ignore]` 标签全部移除（4 类 × 3 街 = 12 条断言）；reason 字符串 "§C-rev1 §2: hash-based canonical_observation_id 碰撞限制；stage 3+ true equivalence enumeration 后转 active" 由 [实现] 阶段在 D-218-rev2 commit 同 PR 取消（与 stage-1 §C2 / §D2 / §F2 同形态——[实现] 闭合 commit 同时取消 `#[ignore]` 并验证全绿）。**预期实际通过 / 部分通过判定**：D-218-rev2 提供等价类正确性，但 k-means 训练质量（path.md 字面阈值 EHS std dev < 0.05 / EMD ≥ 0.02）仍由 feature dimension / cluster_iter / mini-batch 实测决定。若实测显示部分阈值仍不可达（典型怀疑：river bucket 0/N-1 边界的 std dev 散布），由后续 D-218-rev3 / D-233-revM 阈值收紧决策处理；本 rev 不在 [决策] 阶段预判通过率。
+13. **角色边界**：本 rev 是 [决策] 阶段产出；后续 [测试] 阶段产出 `canonical_enum.rs` uniqueness 单元测试 + 12 ignore 转 active 准备；[实现] 阶段产出 colex ranking 实现 + bucket_table.rs schema_version bump + artifact 重训 + 12 测试转 active 验证；[报告] 阶段产出 carve-out closure 同步（CLAUDE.md + stage 2 report §8 carve-out 表更新 + workflow §F-rev3 entry 追加）。
+14. **既有 D-218-rev1 / D-244-rev1 关系**：D-218-rev1 / D-244-rev1 原文保留作为 stage 2 锁定语义（不删除，§修订历史 "追加不删" 政策）；本 rev 在原文基础上**用真等价类枚举替换 hash-based approach**。"D-218-rev1 限制声明（C2 关闭 — C-rev1）" 子节字面 "stage 3+ 真等价类枚举（按 ~25K flop 等价类 + 查表 + Pearson hash 完整化口径）落地后由 D-218-rev2 收口" → 本 rev 完成此承诺。**实际采用 colex ranking 而非 Pearson hash**：colex 是 dense enumeration（无 hash 冲突可能），比 Pearson hash 更简单且不需要 PHF 构造路径；原 "Pearson hash 完整化" 表述按本 rev 收紧为 "colex ranking 完整化"。
+
+**影响**：① `src/abstraction/canonical_enum.rs` 新增模块（~600 行 colex ranking 实现 + helper）；② `src/abstraction/postflop.rs::canonical_observation_id` 重写到 canonical_enum 调用；③ `src/abstraction/postflop.rs` 三个 `N_CANONICAL_OBSERVATION_*` 常量改为真值（25989 / 1286792 / 123156254）；④ `src/abstraction/bucket_table.rs` `BUCKET_TABLE_SCHEMA_VERSION` 1 → 2 + v1 拒绝路径走既有 `SchemaMismatch { expected: 2, got: 1 }` error；⑤ `tools/train_bucket_table.rs` 处理 ~475 MB write + 训练时长上限 60 min release；⑥ `tools/bucket_table_reader.py` schema_version=2 解析路径；⑦ `tools/fetch_bucket_table.sh` 新增 helper；⑧ `tests/bucket_quality.rs` 12 ignore 转 active；⑨ `tests/data/bucket-table-arch-hashes-linux-x86_64.txt` 32 seed × 3 街 baseline 全部重生；⑩ `tests/canonical_observation.rs` 新增 uniqueness 单元测试（100K 枚举无碰撞）+ N 实测 round-trip；⑪ CLAUDE.md ground truth hash 全部漂移更新（whole-file b3sum / content_hash 全变）；⑫ `docs/pluribus_stage2_bucket_quality.md` 直方图全部重生（4 类 × 3 街 × 500 bucket 实测 EHS std dev / 相邻 EMD / monotonicity）。
+
+##### D-244-rev2（2026-05-11）— BT-008-rev2 bound 收紧 + schema_version bump
+
+**背景**：D-244-rev1 §④ 字面 "若本 rev 在已写出 v1 bucket table artifact 后落地，必须 bump"——D-218-rev1 v1 artifact 在 C2 commit `2418a10` 已写出 + 后续 §F-rev1 §2 重训覆写，ground truth body hash `4b42bf...` 全文已锁定。本 rev 触发 schema_version bump 条件。
+
+**新规则**：
+
+1. **`BUCKET_TABLE_SCHEMA_VERSION = 2`**（u32 LE，offset 0x08；D-240 字面常量 bump）。
+2. **v1 reader 拒绝路径**：保留既有 `SchemaMismatch { expected: 2, got: 1 }` error 形态（D-247 5 类错误体系不变；测试 `tests/bucket_table_schema_compat.rs` 中 `v0_v2_versions_rejected` 改名为 `v0_v1_versions_rejected` + 新增 v2 round-trip + v0/v1 reject 三类断言；u32::MAX 拒绝路径不变）。
+3. **BT-008-rev2 bound 收紧**：D-244-rev1 §④ "保守上界 flop ≤ 2_000_000 / turn ≤ 20_000_000 / river ≤ 200_000_000" 收紧为：
+
+    ```text
+    n_canonical_observation_flop  must equal 25_989
+    n_canonical_observation_turn  must equal 1_286_792
+    n_canonical_observation_river must equal 123_156_254
+    ```
+
+    ≠ 上述精确值 → `BucketTableError::Corrupted { reason: "n_canonical_observation_<street> not matching D-218-rev2 enumeration" }`。BT-008 偏移表完整性约束扩展至此精确 size check。
+4. **Artifact whole-file size**：精确 ≈ 498,895,272 bytes（≈ 475.78 MB）；超 git LFS 实用规模 → 不进 git LFS（保留 `artifacts/` gitignore 不变）；分发走 GitHub Release artifact + BLAKE3 verify（D-218-rev2 §10 详述）。
+5. **D-275 unsafe_code carve-out 复审**：D-275 carve-out（`std::fs::read` 整段加载替代 mmap）原 95 KB artifact < 5 ms / 现 475 MB artifact 整段读到 RAM 需 ~1-2 s（顺序读 ~250 MB/s SATA SSD），不可承受。本 rev 触发 D-275 复审 —— **mmap 是 stage 2 D-244 / D-255 字面要求**，C2 走 `std::fs::read` 是 small-artifact carve-out。D-218-rev2 落地后 mmap 路径必须重启，3 候选选项：
+    - **选项 A**：保留 `std::fs::read`，接受 ~1-2 s artifact load + 475 MB RAM 占用（仅一次 startup cost；运行时无影响）。
+    - **选项 B**：解禁 `memmap2::Mmap::map` unsafe → 走 stage 1 `D-275-rev1` 流程（`src/abstraction/bucket_table.rs` 局部 `#[allow(unsafe_code)]` carve-out；与 stage 1 `unsafe_code = "forbid"` 字面要求冲突，必须走 `pluribus_stage1_decisions.md` API-NNN-revM 同型流程）。
+    - **选项 C**：sharded artifact（preflop / flop / turn 一份 + river 一份单独 mmap），让 river 走 mmap、其他走 `std::fs::read`；artifact 数量 + 分发复杂度上升。
+
+    本 rev 暂留 [实现] 阶段决策；选项 A 是 D-218-rev2 默认推荐（一次 startup ≤ 2 s 不阻塞 dev loop / CI；无 stage 1 D-275 越界）；选项 B 仅在 [实现] 实测 RAM 占用 / startup 不可承受时启用。
+
+**影响**：① 同 D-218-rev2 §影响 ④ 体系一并实施；② `tests/bucket_table_schema_compat.rs` 9 active + 1 ignore 重写（v0/v1 reject + v2 accept + n_canonical_observation 精确值校验）；③ `tests/bucket_table_corruption.rs` 12+ 测试 BT-008 / size mismatch 边界改为 v2 schema；④ 选项 B 走 stage 1 `D-275-rev1` 流程（与本 rev 同 PR 或独立 PR），选项 A / C 不触发 stage 1 rev；⑤ `tools/bucket_table_reader.py` Python reader 同步 schema_version=2 + 精确 N 值断言。
+
+##### Stage 3 起步 batch 1 carry forward 处理政策（与 stage 2 §A-rev0..§F-rev2 一致，不重新论证）
+
+- §B-rev1 §3 / §C-rev1 / §D-rev0 / §F-rev1 既往政策保持继承不变。
+- §修订历史 "追加不删"：D-218-rev1 / D-244-rev1 原文保留，D-218-rev2 / D-244-rev2 是叠加修订。
+- schema_version bump 必须在 [实现] 同 PR 触 `BUCKET_TABLE_SCHEMA_VERSION` 常量 + v1 reject 路径测试 + ground truth hash 全部漂移更新。
+- 12 测试转 active 必须在 [实现] 闭合 commit 同步取消 `#[ignore]` 并验证全绿（同 stage-1 §C2 / §D2 / §F2 同形态）；若 path.md 阈值实测部分不可达，由 D-218-rev3 / D-233-revM 后续决策处理，**不阻塞**本 batch closure。
+- D-275 复审：选项 A / C 不触 stage 1 D-NNN；选项 B 走 stage 1 API rev 流程。
+
+---
+
 ## 12. 与决策文档 / API 文档的对应关系
 
 | 本文档段落 | 关联 API 段落（`pluribus_stage2_api.md`） | 关联 validation 段落（`pluribus_stage2_validation.md`） |

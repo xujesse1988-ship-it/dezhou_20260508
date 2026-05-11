@@ -1944,3 +1944,31 @@ F3 [报告] 严守 [报告] 角色边界，**未触一行 `src/` / `tests/` / `b
 - carve-out 政策：本 batch §F-rev2 §3 「[报告] 受控越界 = tools/ 一次性接入」 carve-out 是 D-263 字面授权下的同型扩展；[报告] 严格走 「调用既有公开 API + 不动 src/tests」 单边路径。
 
 下一步：阶段 3 [决策]（D-300..D-3xx 锁定 MCCFR 小规模验证决策表 + API-300.. 锁定 API；按 `pluribus_path.md` §阶段 3 字面起步。**stage 3 第一批候选工作**：D-218-rev2 真等价类枚举（解 §F-rev2 §4 第 1 条 carve-out，让 12 条 bucket_quality `#[ignore]` 转 active）；MCCFR 小规模 self-play；blueprint 训练 host 选型 + 跨架构 baseline 实跑（解 §F-rev2 §4 第 3 条 carve-out））。
+
+#### Stage 3 起步 batch 1 [决策]（2026-05-11）— D-218-rev2 / D-244-rev2 真等价类枚举
+
+stage 2 闭合后第一项 follow-up：把 hash-based `canonical_observation_id` 替换为 3 街全枚举的 Waugh 2013-style hand isomorphism + colex ranking，使 §F-rev2 §4 第 1 条 carve-out（12 条 `tests/bucket_quality.rs` `#[ignore]`）可在 [实现] 阶段转 active。本 batch 是 stage 3 [决策] 起步**之前**的 stage 2 收口工作；决策号沿用 D-NNN-revM 体系（不进 stage 3 D-3XX 编号空间）。
+
+##### §G-batch1 §1：本 batch [决策] 阶段产出
+
+- `docs/pluribus_stage2_decisions.md` §10 修订历史末尾追加 "Stage 3 起步 batch 1（2026-05-11）— D-218-rev2 / D-244-rev2 真等价类枚举" 段落，含：
+    - **D-218-rev2**（14 条字面规则）：算法选型（Waugh 2013 suit-canonicalize + colex ranking 3 街全枚举）/ N 实测（25,989 / 1,286,792 / 123,156,254）/ 5 类不变量（含新 uniqueness）/ 签名 byte-equal 不变 / lookup table size ~475 MB / schema_version bump 1 → 2 / k-means mini-batch 折衷 / 训练时长 ≤ 60 min release / 运行时 SLO 不退化 / artifact 走 GitHub Release + BLAKE3 verify / 跨架构 baseline 重生 / 12 测试转 active / 角色边界 [决策] → [测试] → [实现] → [报告] / D-218-rev1 关系（追加不删 + 用 colex 替换原 "Pearson hash 完整化" 表述）。
+    - **D-244-rev2**（5 条字面规则）：`BUCKET_TABLE_SCHEMA_VERSION = 2` / v1 reader 拒绝路径不变 / BT-008-rev2 bound 收紧到精确等价类数 / artifact size 498,895,272 bytes / D-275 unsafe_code 复审 3 候选选项（A `std::fs::read` 默认 / B mmap unsafe 解禁 / C sharded artifact）。
+- 本 workflow §F-rev2 §4 carve-out 1 同步收口路径已锁，后续 [测试] / [实现] / [报告] 阶段走 §G-batch1 §2..§4 子节（本 commit 仅 [决策] 阶段，子节为空待后续 batch 追加）。
+- 0 src/ / tests/ / benches/ / fuzz/ / tools/ / proto/ 改动——本 commit 严格 [决策] 角色单边路径，与 stage 2 A0 [决策] 0 越界形态同型。
+
+##### §G-batch1 §2..§4：待后续 batch 追加
+
+- §G-batch1 §2 [测试]：`tests/canonical_observation.rs` 新增 uniqueness 单元测试 + `tests/bucket_quality.rs` 12 ignore 转 active 准备（不取消，仅准备）。
+- §G-batch1 §3 [实现]：`src/abstraction/canonical_enum.rs` 新增模块 + `postflop.rs` 三常量改真值 + `bucket_table.rs` schema_version bump + artifact 重训 + 12 ignore 取消 + 跨架构 baseline 重生 + D-275 实测取选项 A/B/C。
+- §G-batch1 §4 [报告]：CLAUDE.md ground truth hash 全部漂移更新 + stage 2 report §8 carve-out 表更新（D-218-rev1 carve-out closed）+ `docs/pluribus_stage2_bucket_quality.md` 直方图全部重生 + `pluribus_stage2_api.md` 不变（签名 byte-equal）。
+
+##### §G-batch1 §5 carry forward 处理政策（与 stage 2 §A-rev0..§F-rev2 一致，不重新论证）
+
+- 阶段 1 §B-rev1 §3 / §C-rev1 / §D-rev0 / §F-rev1 + 阶段 2 §A-rev0..§F-rev2 既往政策保持继承不变。
+- §修订历史 "追加不删"：D-218-rev1 / D-244-rev1 原文保留，D-218-rev2 / D-244-rev2 是叠加修订。
+- 12 测试转 active 必须在 §G-batch1 §3 [实现] 闭合 commit 同步取消 `#[ignore]` 并验证全绿；若 path.md 阈值实测部分不可达，由后续 D-218-rev3 / D-233-revM 决策处理，**不阻塞** §G-batch1 closure。
+
+§G-batch1 §1 [决策] 角色边界审计：本 commit 仅修 `docs/pluribus_stage2_decisions.md` §10 + 本文档 §G-batch1 §1（前置 carry forward）+ `CLAUDE.md` 状态翻面。`src/` / `tests/` / `benches/` / `fuzz/` / `tools/` / `proto/` / `Cargo.toml` / `Cargo.lock` / `pluribus_stage2_api.md` / `pluribus_stage2_validation.md` **未修改一行**——0 越界（继承 stage-1 §F-rev2 / §F-rev0 / §C-rev1 0 越界形态）。
+
+下一步：§G-batch1 §2 [测试]（`tests/canonical_observation.rs` uniqueness 测试 + `tests/bucket_quality.rs` 12 ignore 转 active 准备）。

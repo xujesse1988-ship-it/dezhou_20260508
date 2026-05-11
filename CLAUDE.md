@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository status
 
-8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 closed**（git tag `stage2-v1.0`，验收报告 `docs/pluribus_stage2_report.md`，A0..F3 全 13 步 closed）。下一步 stage 3 [决策]（MCCFR 小规模验证；详见下文 §下一步：Stage 3 起步）。
+8-stage Pluribus-style 6-max NLHE poker AI。**Stage 1 closed**（git tag `stage1-v1.0`，验收报告 `docs/pluribus_stage1_report.md`）；**Stage 2 closed**（git tag `stage2-v1.0`，验收报告 `docs/pluribus_stage2_report.md`，A0..F3 全 13 步 closed）。**Stage 3 起步 batch 1 §G-batch1 §1 [决策]** closed 2026-05-11（D-218-rev2 + D-244-rev2 真等价类枚举决策落地，解 §F-rev2 §4 第 1 条 carve-out）；下一步 §G-batch1 §2 [测试]（详见下文 §下一步：Stage 3 起步 batch 1）。
 
 历史 batch 出口数据（stage 1 的 B/C/D/E/F 各步、stage 2 的 A0 batch 1–6 review / A1 batch 7 / B1 batch 2）不在本文件保留——查阅顺序：
 
@@ -78,9 +78,13 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test --release -- --ignored # full-volume
 - External compare：`docs/pluribus_stage2_external_compare.md` + `.json` preflop 169 类成员 13/78/78 byte-equal + Rust D-217 closed-form artifact round-trip partition 6×4×12 uniform → D-262 P0 阻塞条件**不触发**。
 - `cargo fmt --all --check` / `cargo build --all-targets` / `cargo clippy --all-targets -- -D warnings` / `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：全绿。`tests/api_signatures.rs` byte-equal，stage 2 公开 API 0 签名漂移。
 
-### 下一步：Stage 3 起步
+### 下一步：Stage 3 起步 batch 1 §G-batch1 §2 [测试]（D-218-rev2 真等价类枚举）
 
-stage 2 闭合 → stage 3 [决策]（按 `docs/pluribus_path.md` §阶段 3 字面：MCCFR 小规模验证）。**stage 3 第一批候选工作**：(1) D-218-rev2 真等价类枚举（解 §F-rev2 §4 第 1 条 carve-out，让 12 条 bucket_quality `#[ignore]` 转 active；~25K flop 等价类 + lookup table + Pearson hash 完整化）；(2) MCCFR 小规模 self-play；(3) blueprint 训练 host 选型 + 跨架构 baseline 实跑（解 §F-rev2 §4 第 3 条 carve-out）。
+**Stage 3 起步 batch 1 §G-batch1 §1 [决策]** closed 2026-05-11（本 commit）— `docs/pluribus_stage2_decisions.md` §10 修订历史末尾追加 **D-218-rev2 + D-244-rev2** 真等价类枚举决策 entry：算法 Waugh 2013-style hand isomorphism + colex ranking 3 街全枚举 / N 实测 25,989 + 1,286,792 + 123,156,254 / `canonical_observation_id` 签名 byte-equal 不变 / lookup table ~475 MB / `BUCKET_TABLE_SCHEMA_VERSION` bump 1 → 2 / k-means 推荐 mini-batch fallback / 训练时长 ≤ 60 min release / artifact 走 GitHub Release + BLAKE3 verify / 12 条 `tests/bucket_quality.rs` `#[ignore]` 转 active 路径锁 / D-275 unsafe_code carve-out 复审 3 选项（A `std::fs::read` 默认 / B mmap 解禁走 stage 1 D-275-rev1 / C sharded artifact）。`docs/pluribus_stage2_workflow.md` §修订历史末尾追加 §G-batch1 §1..§5 段落。`src/` / `tests/` / `tools/` / `Cargo.toml` 0 改动；[决策] 角色 0 越界。
+
+**下一步：Stage 3 起步 batch 1 §G-batch1 §2 [测试]**（按 `pluribus_stage2_workflow.md` §G-batch1 §2 字面）：`tests/canonical_observation.rs` 新增 uniqueness 单元测试（100K 枚举无碰撞 + N 实测 round-trip）；`tests/bucket_quality.rs` 12 ignore **不取消**仅准备转 active 注释更新。完成后 §G-batch1 §3 [实现] 落地 `src/abstraction/canonical_enum.rs` + `BUCKET_TABLE_SCHEMA_VERSION` bump + artifact 重训 + 12 ignore 取消并验证全绿。
+
+stage 3 [决策]（D-300..D-3xx 锁 MCCFR 小规模验证决策表 + API-300.. 锁 API）排在 D-218-rev2 §G-batch1 全 [报告] closed 之后启动；按 `pluribus_path.md` §阶段 3 字面（Kuhn 0.01 exploitability / Leduc 稳定曲线 / 简化 NLHE 100M update / regret matching < 1e-9 / checkpoint round-trip）。MCCFR 变体已 user-decided：**Vanilla CFR (Kuhn/Leduc) + ES-MCCFR (简化 NLHE) 双轨**。其它两项 stage 3 候选 ((2) MCCFR 小规模 self-play / (3) blueprint host 选型 + 跨架构 baseline 实跑解 §F-rev2 §4 第 3 条 carve-out) 排 §G-batch1 后启动。
 
 stage 2 输出的稳定 API surface（详见 `pluribus_stage2_api.md` + 报告 §11 切换说明）：`DefaultActionAbstraction` / `PreflopLossless169` / `PostflopBucketAbstraction` / `MonteCarloEquity` / `BucketTable` + `BucketTableError` / `InfoSetId` (64-bit) + `BettingState` + `StreetTag` + `InfoAbstraction` trait / `cluster::rng_substream::*` (sub-stream op_id 表 + `derive_substream_seed` D-228)。stage 1 + stage 2 不变量与反模式继续约束 stage 3。
 
