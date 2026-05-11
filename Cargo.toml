@@ -47,3 +47,9 @@ harness = false
 [[bin]]
 name = "train_bucket_table"
 path = "tools/train_bucket_table.rs"
+
+# F3 [报告]：bucket table 质量数据 dump CLI（一次性 instrumentation）。读取 artifact
+# + 抽样 EHS 计算 → JSON 喂给 tools/bucket_quality_report.py 输出验收直方图。
+[[bin]]
+name = "bucket_quality_dump"
+path = "tools/bucket_quality_dump.rs"

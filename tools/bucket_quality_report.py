@@ -135,20 +135,22 @@ def render_histogram(bins: list[int], lo: float, hi: float, label: str) -> str:
 
 
 def safe_stat(values: list[float], stat: str) -> str:
-    if not values:
+    # `None` (从 JSON `null` 解析得到) 表示 empty bucket 中位数；剔除后再算统计量。
+    finite = [v for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    if not finite:
         return "N/A"
     if stat == "min":
-        return f"{min(values):.4f}"
+        return f"{min(finite):.4f}"
     if stat == "max":
-        return f"{max(values):.4f}"
+        return f"{max(finite):.4f}"
     if stat == "mean":
-        return f"{statistics.fmean(values):.4f}"
+        return f"{statistics.fmean(finite):.4f}"
     if stat == "median":
-        return f"{statistics.median(values):.4f}"
+        return f"{statistics.median(finite):.4f}"
     if stat == "std":
-        if len(values) < 2:
+        if len(finite) < 2:
             return "N/A"
-        return f"{statistics.pstdev(values):.4f}"
+        return f"{statistics.pstdev(finite):.4f}"
     return "?"
 
 
@@ -218,11 +220,21 @@ def gen_report(data: dict[str, Any]) -> str:
                 f"{'✓' if emd_pass_count == len(emd) else '✗'} |"
             )
         if medians:
-            mono_violations = sum(
-                1 for i in range(1, len(medians)) if medians[i] < medians[i - 1]
-            )
+            # `null` 中位数（empty bucket）跳过单调性比较——比较只在 non-null 相邻
+            # 对之间进行（与 stage-2 §C-rev1 §2 hash-based canonical id 限制下
+            # 部分 bucket 不可达 carve-out 同步：empty bucket 不参与单调性 violation
+            # 计数）。
+            mono_violations = 0
+            mono_pairs = 0
+            for i in range(1, len(medians)):
+                a, b = medians[i - 1], medians[i]
+                if a is None or b is None:
+                    continue
+                mono_pairs += 1
+                if b < a:
+                    mono_violations += 1
             out.append(
-                f"| 单调性 violation | {mono_violations} / {max(len(medians) - 1, 0)} | 0 | "
+                f"| 单调性 violation | {mono_violations} / {mono_pairs} | 0 | "
                 f"{'✓' if mono_violations == 0 else '✗'} |"
             )
         out.append("")
@@ -264,21 +276,35 @@ def gen_report(data: dict[str, Any]) -> str:
 
     out.append("---")
     out.append("")
-    out.append("## C1 状态说明")
+    out.append("## 状态说明（stage 2 F3 [报告] 视角）")
     out.append("")
     out.append(
-        "- **C1**：B2 stub `BucketTable::lookup` 全部返回 `Some(0)`，本报告在 stub "
-        "数据上各项指标几乎全 fail（设计如此）。预期失败已在 "
-        "`tests/bucket_quality.rs` 用 `#[ignore]` 标注。"
+        "- **C2 carve-out 现状**：FNV-1a hash-based `canonical_observation_id` mod "
+        "街上界（flop 3K / turn 6K / river 10K）在小训练 set 下让 std_dev / EMD / "
+        "monotonicity 4 类质量门槛断言走 `#[ignore]` 路径——详见 "
+        "`pluribus_stage2_workflow.md` §C-rev1 §2 + `pluribus_stage2_validation.md` "
+        "§修订历史 C2 closure 节。本报告若指标 ✗ 非 bug，是 D-218-rev1 stage-2 闭合"
+        "carve-out 的预期产物，stage 3+ true equivalence class enumeration "
+        "（D-218-rev2，~25K flop 等价类 + lookup + Pearson hash 完整化）落地后所有 ✗ "
+        "应自动转为 ✓。"
     )
     out.append(
-        "- **C2**：`tools/train_bucket_table.rs` 落地后写出真实 mmap artifact，本"
-        "脚本配合 `tools/bucket_table_reader.py`（D-249）读出 bucket 质量数据生成"
-        "真实指标。所有 ✗ 应转为 ✓；任一 ✗ 视为聚类质量门槛未达，回归 [实现]。"
+        "- **F3 [报告] 数据来源**：`tools/bucket_quality_dump.rs` binary 加载 artifact "
+        "（默认 `--samples 10000 --equity-iter 1000`）→ JSON → 本脚本→ markdown。"
+        "完整管道："
     )
+    out.append("")
+    out.append("    ```bash")
+    out.append("    cargo run --release --bin bucket_quality_dump -- \\")
+    out.append("        --artifact artifacts/bucket_table_default_500_500_500_seed_cafebabe.bin \\")
+    out.append("        | python3 tools/bucket_quality_report.py \\")
+    out.append("        > docs/pluribus_stage2_bucket_quality.md")
+    out.append("    ```")
+    out.append("")
     out.append(
-        "- **D1**：1M-volume bucket id determinism + cross-host BLAKE3 byte-equal "
-        "纳入夜间 fuzz；本报告作为 fuzz 输入数据来源之一。"
+        "- **D-242 分发**：bucket table mmap artifact `artifacts/` 目录是 gitignore "
+        "（不进 git history），由 stage-2 release artifact + Python reader "
+        "`tools/bucket_table_reader.py` 一并发布。"
     )
     out.append("")
     return "\n".join(out)
