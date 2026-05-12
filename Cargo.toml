@@ -59,6 +59,14 @@ broken_intra_doc_links = "deny"
 name = "baseline"
 harness = false
 
+# 阶段 3 B1 \[测试\] D-367：CFR / MCCFR 训练 throughput bench framework
+# （2 group：stage3/kuhn_cfr_iter + stage3/leduc_cfr_iter）。C1 \[测试\] 补充
+# stage3/nlhe_es_mccfr_update 第 3 组。E1 \[测试\] 落地 tests/perf_slo.rs::stage3_*
+# 才做严格 fail/pass SLO 断言（D-369）。
+[[bench]]
+name = "stage3"
+harness = false
+
 # C2：bucket table 训练 CLI（API §5）。从 RngSource seed → equity Monte Carlo →
 # k-means clustering → 写出 mmap artifact。`tools/train_bucket_table.rs` 入口。
 [[bin]]
