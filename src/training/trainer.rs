@@ -10,25 +10,18 @@
 //! EsMccfrTrainer for 简化 NLHE（D-301 Lanctot 2009 详解伪代码 + D-321 多线程
 //! thread-safety 模型 deferred 到 C2 \[实现\] 起步前 lock）。
 //!
-//! A1 \[实现\] 阶段所有方法体 `unimplemented!()`；B2 \[实现\] 落地
-//! [`VanillaCfrTrainer::step`] 与全套 Trainer 方法（让 Kuhn 10K iter 单线程 release
-//! `< 1 s` 收敛到 player 1 EV `-1/18`）；C2 \[实现\] 落地 [`EsMccfrTrainer::step`]
-//! 与 [`EsMccfrTrainer::step_parallel`] 多线程入口（D-361 单线程 ≥ 10K update/s
-//! 与 4-core ≥ 50K update/s）。
+//! B2 \[实现\] 落地 [`VanillaCfrTrainer`] 全部 Trainer 方法（除 save/load checkpoint
+//! 走 D2 \[实现\]）；[`EsMccfrTrainer`] 保持 `unimplemented!()`（C2 \[实现\] 落地）。
 
 use std::path::Path;
 
 use crate::core::rng::RngSource;
 use crate::error::{CheckpointError, TrainerError};
-use crate::training::game::Game;
+use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::regret::{RegretTable, StrategyAccumulator};
+use crate::training::sampling::derive_substream_seed;
 
 /// 训练器统一 trait（API-310 / D-371）。
-///
-/// `Trainer<G: Game>` 让 `VanillaCfrTrainer` / `EsMccfrTrainer` 在 Kuhn / Leduc /
-/// 简化 NLHE 上同型可替换（具体 `step` 内部按算法变体派发：Vanilla CFR 遍历完整
-/// 博弈树 `n_players` 次，每次 1 traverser；ES-MCCFR D-307 alternating
-/// traverser）。
 pub trait Trainer<G: Game> {
     /// 执行 1 iter 训练（Vanilla CFR）或 1 update（ES-MCCFR D-307 alternating）。
     fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError>;
@@ -54,65 +47,188 @@ pub trait Trainer<G: Game> {
 
 /// Vanilla CFR Trainer（API-311 / D-300）。
 ///
-/// `iter` 字段单调非降；`rng_substream_seed` D-335 sub-stream root seed（
-/// per-iter sub-stream 由 [`crate::training::sampling::derive_substream_seed`] 派生）。
-///
-/// 字段 `pub(crate)` 让同 crate 测试 / bench 直接 inspect 内部状态而不暴露给外部
-/// 消费者（D-376 公开 vs 私有 API）。
-#[allow(dead_code)] // B2 \[实现\] 落地 VanillaCfrTrainer::step 后字段会被读取
+/// `rng_substream_seed` 是 master_seed 经 SplitMix64 finalizer × 4 派生的 32 byte
+/// ChaCha20Rng seed（D-335），目前由 D2 \[实现\] checkpoint 序列化路径消费；B2
+/// \[实现\] step 走 full-tree 全确定性枚举不消费 rng，因此本字段在 B2 阶段仅占位
+/// 落表（`#[allow(dead_code)]` 在 D2 \[实现\] 落地后取消）。
 pub struct VanillaCfrTrainer<G: Game> {
     pub(crate) game: G,
     pub(crate) regret: RegretTable<G::InfoSet>,
     pub(crate) strategy_sum: StrategyAccumulator<G::InfoSet>,
     pub(crate) iter: u64,
+    #[allow(dead_code)] // D2 \[实现\] checkpoint 落地后取消
     pub(crate) rng_substream_seed: [u8; 32],
 }
 
 impl<G: Game> VanillaCfrTrainer<G> {
-    /// 新建空 Trainer（B2 \[实现\] 落地全部 field 初始化）。
-    pub fn new(_game: G, _master_seed: u64) -> Self {
-        unimplemented!("stage 3 A1 scaffold: VanillaCfrTrainer::new (B2 实现)")
+    /// 新建空 Trainer。`master_seed` 用 D-335 SplitMix64 finalizer × 4 派生 32 byte
+    /// sub-stream seed 占位（Vanilla CFR full-tree 全确定性枚举，sub-stream seed
+    /// 仅在 D2 \[实现\] checkpoint 序列化时存档；step 本身不消费）。
+    pub fn new(game: G, master_seed: u64) -> Self {
+        let rng_substream_seed = derive_substream_seed(master_seed, 0, 0);
+        Self {
+            game,
+            regret: RegretTable::new(),
+            strategy_sum: StrategyAccumulator::new(),
+            iter: 0,
+            rng_substream_seed,
+        }
     }
 }
 
 impl<G: Game> Trainer<G> for VanillaCfrTrainer<G> {
-    fn step(&mut self, _rng: &mut dyn RngSource) -> Result<(), TrainerError> {
-        // D-300 伪代码：alternating traverser × 完整博弈树 DFS × cfv 累积 ×
-        // regret update × strategy_sum 累积。
-        unimplemented!("stage 3 A1 scaffold: VanillaCfrTrainer::step (B2 实现)")
+    fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError> {
+        // D-300：alternating traverser × 完整博弈树 DFS × cfv 累积 × regret update
+        // × strategy_sum 累积。每 step 内部 traverser ∈ [0, n_players) 各遍历 1 次。
+        let n_players = self.game.n_players();
+        let root = self.game.root(rng);
+        for traverser in 0..n_players as u8 {
+            recurse_vanilla::<G>(
+                root.clone(),
+                traverser,
+                1.0,
+                1.0,
+                &mut self.regret,
+                &mut self.strategy_sum,
+                rng,
+            );
+        }
+        self.iter += 1;
+        Ok(())
     }
 
-    fn current_strategy(&self, _info_set: &G::InfoSet) -> Vec<f64> {
-        unimplemented!("stage 3 A1 scaffold: VanillaCfrTrainer::current_strategy (B2 实现)")
+    fn current_strategy(&self, info_set: &G::InfoSet) -> Vec<f64> {
+        let n = self
+            .regret
+            .inner()
+            .get(info_set)
+            .map(|v| v.len())
+            .or_else(|| self.strategy_sum.inner().get(info_set).map(|v| v.len()))
+            .unwrap_or(0);
+        if n == 0 {
+            return Vec::new();
+        }
+        self.regret.current_strategy(info_set, n)
     }
 
-    fn average_strategy(&self, _info_set: &G::InfoSet) -> Vec<f64> {
-        unimplemented!("stage 3 A1 scaffold: VanillaCfrTrainer::average_strategy (B2 实现)")
+    fn average_strategy(&self, info_set: &G::InfoSet) -> Vec<f64> {
+        let n = self
+            .strategy_sum
+            .inner()
+            .get(info_set)
+            .map(|v| v.len())
+            .or_else(|| self.regret.inner().get(info_set).map(|v| v.len()))
+            .unwrap_or(0);
+        if n == 0 {
+            return Vec::new();
+        }
+        self.strategy_sum.average_strategy(info_set, n)
     }
 
     fn update_count(&self) -> u64 {
-        unimplemented!("stage 3 A1 scaffold: VanillaCfrTrainer::update_count (B2 实现)")
+        self.iter
     }
 
     fn save_checkpoint(&self, _path: &Path) -> Result<(), CheckpointError> {
-        unimplemented!("stage 3 A1 scaffold: VanillaCfrTrainer::save_checkpoint (D2 实现)")
+        unimplemented!("stage 3 B2 scaffold: VanillaCfrTrainer::save_checkpoint (D2 实现)")
     }
 
     fn load_checkpoint(_path: &Path, _game: G) -> Result<Self, CheckpointError>
     where
         Self: Sized,
     {
-        unimplemented!("stage 3 A1 scaffold: VanillaCfrTrainer::load_checkpoint (D2 实现)")
+        unimplemented!("stage 3 B2 scaffold: VanillaCfrTrainer::load_checkpoint (D2 实现)")
     }
 }
 
-/// External-Sampling MCCFR Trainer（API-312 / D-301）。
+/// Vanilla CFR DFS recurse（D-300 详解伪代码）。
 ///
-/// 与 [`VanillaCfrTrainer`] 同型字段（`update_count` 替换 `iter` 反映 ES-MCCFR
-/// 按 D-307 alternating traverser × per-iter 1-sample 路径累积；`regret` 在
-/// 多线程模式下可能包装为 D-321 锁定的 thread-safety wrapper，A1 阶段保持
-/// `RegretTable` 直接持有，C2 \[实现\] 起步前由 D-321 lock 时改写）。
-#[allow(dead_code)] // C2 \[实现\] 落地 EsMccfrTrainer::step 后字段会被读取
+/// 返回 traverser 视角的 cfv（counterfactual value）。
+fn recurse_vanilla<G: Game>(
+    state: G::State,
+    traverser: PlayerId,
+    pi_trav: f64,
+    pi_opp: f64,
+    regret: &mut RegretTable<G::InfoSet>,
+    strategy_sum: &mut StrategyAccumulator<G::InfoSet>,
+    rng: &mut dyn RngSource,
+) -> f64 {
+    match G::current(&state) {
+        NodeKind::Terminal => G::payoff(&state, traverser),
+        NodeKind::Chance => {
+            let dist = G::chance_distribution(&state);
+            let mut value = 0.0;
+            for (action, prob) in dist {
+                let next_state = G::next(state.clone(), action, rng);
+                value += prob
+                    * recurse_vanilla::<G>(
+                        next_state,
+                        traverser,
+                        pi_trav,
+                        pi_opp,
+                        regret,
+                        strategy_sum,
+                        rng,
+                    );
+            }
+            value
+        }
+        NodeKind::Player(actor) => {
+            let info = G::info_set(&state, actor);
+            let actions = G::legal_actions(&state);
+            let n = actions.len();
+            // ensure regret slot exists with correct length (D-324)
+            regret.get_or_init(info.clone(), n);
+            let sigma = regret.current_strategy(&info, n);
+
+            if actor == traverser {
+                // traverser node：枚举每个 action 的 cfv，累积 regret + strategy_sum
+                let mut cfvs = Vec::with_capacity(n);
+                for (i, action) in actions.iter().enumerate() {
+                    let next_state = G::next(state.clone(), *action, rng);
+                    let cfv = recurse_vanilla::<G>(
+                        next_state,
+                        traverser,
+                        pi_trav * sigma[i],
+                        pi_opp,
+                        regret,
+                        strategy_sum,
+                        rng,
+                    );
+                    cfvs.push(cfv);
+                }
+                let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
+                // regret update R(I, a) += π_opp × (cfv_a - σ_node)
+                let delta: Vec<f64> = cfvs.iter().map(|c| pi_opp * (c - sigma_value)).collect();
+                regret.accumulate(info.clone(), &delta);
+                // strategy_sum update S(I, a) += π_traverser × σ(I, a)
+                let weighted: Vec<f64> = sigma.iter().map(|s| pi_trav * s).collect();
+                strategy_sum.accumulate(info, &weighted);
+                sigma_value
+            } else {
+                // opponent node：σ 加权累计 cfv，opp reach probability 乘 σ(a)
+                let mut value = 0.0;
+                for (i, action) in actions.iter().enumerate() {
+                    let next_state = G::next(state.clone(), *action, rng);
+                    value += sigma[i]
+                        * recurse_vanilla::<G>(
+                            next_state,
+                            traverser,
+                            pi_trav,
+                            pi_opp * sigma[i],
+                            regret,
+                            strategy_sum,
+                            rng,
+                        );
+                }
+                value
+            }
+        }
+    }
+}
+
+/// External-Sampling MCCFR Trainer（API-312 / D-301）。C2 \[实现\] 落地。
+#[allow(dead_code)]
 pub struct EsMccfrTrainer<G: Game> {
     pub(crate) game: G,
     pub(crate) regret: RegretTable<G::InfoSet>,
@@ -124,51 +240,44 @@ pub struct EsMccfrTrainer<G: Game> {
 impl<G: Game> EsMccfrTrainer<G> {
     /// 新建空 Trainer（C2 \[实现\] 落地全部 field 初始化）。
     pub fn new(_game: G, _master_seed: u64) -> Self {
-        unimplemented!("stage 3 A1 scaffold: EsMccfrTrainer::new (C2 实现)")
+        unimplemented!("stage 3 B2 scaffold: EsMccfrTrainer::new (C2 实现)")
     }
 
-    /// 多线程并发 step（D-321 thread-safety 模型决定具体实现；C2 \[实现\] 起步前
-    /// lock 候选 `parking_lot::RwLock<HashMap>` / `dashmap::DashMap` / thread-local
-    /// accumulator + 周期 batch merge / `crossbeam::SegQueue` snapshot reduce）。
-    ///
-    /// 目标 SLO：4-core release `≥ 50K update/s`（D-361 效率 ≥ 0.5）。
+    /// 多线程并发 step（C2 \[实现\] 起步前由 D-321 lock）。
     pub fn step_parallel(
         &mut self,
         _rng_pool: &mut [Box<dyn RngSource>],
         _n_threads: usize,
     ) -> Result<(), TrainerError> {
-        unimplemented!("stage 3 A1 scaffold: EsMccfrTrainer::step_parallel (C2 实现)")
+        unimplemented!("stage 3 B2 scaffold: EsMccfrTrainer::step_parallel (C2 实现)")
     }
 }
 
 impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
     fn step(&mut self, _rng: &mut dyn RngSource) -> Result<(), TrainerError> {
-        // D-301 伪代码：alternating traverser × DFS × chance node 1-sample
-        // （D-308）× opponent action sampled by current_strategy（D-309 / D-337）
-        // × traverser action 完整枚举累积 cfv（D-338）× regret update。
-        unimplemented!("stage 3 A1 scaffold: EsMccfrTrainer::step (C2 实现)")
+        unimplemented!("stage 3 B2 scaffold: EsMccfrTrainer::step (C2 实现)")
     }
 
     fn current_strategy(&self, _info_set: &G::InfoSet) -> Vec<f64> {
-        unimplemented!("stage 3 A1 scaffold: EsMccfrTrainer::current_strategy (C2 实现)")
+        unimplemented!("stage 3 B2 scaffold: EsMccfrTrainer::current_strategy (C2 实现)")
     }
 
     fn average_strategy(&self, _info_set: &G::InfoSet) -> Vec<f64> {
-        unimplemented!("stage 3 A1 scaffold: EsMccfrTrainer::average_strategy (C2 实现)")
+        unimplemented!("stage 3 B2 scaffold: EsMccfrTrainer::average_strategy (C2 实现)")
     }
 
     fn update_count(&self) -> u64 {
-        unimplemented!("stage 3 A1 scaffold: EsMccfrTrainer::update_count (C2 实现)")
+        unimplemented!("stage 3 B2 scaffold: EsMccfrTrainer::update_count (C2 实现)")
     }
 
     fn save_checkpoint(&self, _path: &Path) -> Result<(), CheckpointError> {
-        unimplemented!("stage 3 A1 scaffold: EsMccfrTrainer::save_checkpoint (D2 实现)")
+        unimplemented!("stage 3 B2 scaffold: EsMccfrTrainer::save_checkpoint (D2 实现)")
     }
 
     fn load_checkpoint(_path: &Path, _game: G) -> Result<Self, CheckpointError>
     where
         Self: Sized,
     {
-        unimplemented!("stage 3 A1 scaffold: EsMccfrTrainer::load_checkpoint (D2 实现)")
+        unimplemented!("stage 3 B2 scaffold: EsMccfrTrainer::load_checkpoint (D2 实现)")
     }
 }
