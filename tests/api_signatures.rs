@@ -14,6 +14,7 @@
 //! - 泛型方法 `RngCoreAdapter::from_rng_core<R>`（fn 指针无法表达泛型）
 //! - 公开字段类型（结构体定义处由 rustc 校验，且字段广泛被 spec 引用）
 
+use std::collections::HashMap;
 use std::ops::{Add, AddAssign, Mul, Sub, SubAssign};
 use std::path::Path;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ fn api_signatures_locked() {
     // 报告一次"通过"。
     _api_signature_assertions();
     _stage2_api_signature_assertions();
+    _stage3_api_signature_assertions();
 }
 
 #[allow(dead_code, clippy::type_complexity)]
@@ -304,4 +306,261 @@ fn _stage2_api_signature_assertions() {
     let _: u32 = rng_substream::EHS2_INNER_EQUITY_TURN;
     let _: u32 = rng_substream::EHS2_INNER_EQUITY_RIVER;
     let _: u32 = rng_substream::OCHS_FEATURE_INNER;
+}
+
+// ===========================================================================
+// 阶段 3 trip-wire（API-300..API-392；A1 \[实现\] 阶段所有方法体 `unimplemented!()`
+// 返回 `!`，与 stage 1 + stage 2 同形态——签名漂移立即在 `cargo test --no-run`
+// 阶段失败。
+//
+// 维护规则同 stage 1 + stage 2：任何对公开 API 签名的合法修改（按
+// `pluribus_stage3_api.md` §11 API-NNN-revM 流程）必须**同步本文件**，否则 PR
+// review 应拒绝合入。
+//
+// trait 方法签名锁定继承 stage 2 §A1 模式：用 UFCS fn-pointer 绑定
+// `<具体 impl as Trait>::method` 让 trait ↔ impl ↔ API 文档三者任一漂移立即在
+// `cargo test --no-run` 失败。覆盖：
+//   - `Game` trait 全 8 方法 × `{KuhnGame, LeducGame, SimplifiedNlheGame}` 3 impl
+//   - `Trainer` trait 全 6 方法 × `{VanillaCfrTrainer<KuhnGame>,
+//     EsMccfrTrainer<SimplifiedNlheGame>}` 2 instantiation
+//   - `BestResponse` trait `compute` × `{KuhnBestResponse, LeducBestResponse}` 2 impl
+//   - `RegretTable` / `StrategyAccumulator` 全部方法 × `KuhnInfoSet` 1 instantiation
+//   - `sampling` 模块自由函数 + 6 个 op_id 常量
+//   - `Checkpoint` save / open + `MAGIC` / `SCHEMA_VERSION` 常量
+//   - `exploitability` 泛型函数 × `<KuhnGame, KuhnBestResponse>` 1 instantiation
+//
+// 不覆盖：
+//   - 公开字段类型（结构体定义处由 rustc 校验）
+//   - 关联类型 `Game::State` / `Action` / `InfoSet`（由 trait 定义处 rustc 校验
+//     + impl `type X = Y;` 同步）
+//   - `LeducHistory` 内部表示（type alias `Vec<LeducAction>` 在 A1 \[实现\] 阶段
+//     替代 API-302 字面 `SmallVec<[LeducAction; 8]>`；详见 `src/training/leduc.rs`
+//     模块 doc 末段；E2 \[实现\] hot path opt 时由 API-302-revM 评估是否引入
+//     `smallvec` crate 第 4 个新增依赖）
+// ===========================================================================
+
+#[allow(dead_code, clippy::type_complexity)]
+fn _stage3_api_signature_assertions() {
+    use poker::training::checkpoint::{MAGIC, SCHEMA_VERSION};
+    use poker::training::kuhn::KuhnState;
+    use poker::training::leduc::LeducState;
+    use poker::training::nlhe::{SimplifiedNlheAction, SimplifiedNlheInfoSet, SimplifiedNlheState};
+    use poker::training::sampling::{
+        derive_substream_seed, sample_discrete, OP_CHANCE_SAMPLE, OP_KUHN_DEAL, OP_LEDUC_DEAL,
+        OP_NLHE_DEAL, OP_OPP_ACTION_SAMPLE, OP_TRAVERSER_TIE,
+    };
+
+    // ===================================================================
+    // training::game (api §1)
+    // ===================================================================
+
+    // Game trait 全 8 方法 UFCS × KuhnGame（同 stage 2 ActionAbstraction UFCS 理由：
+    // rustc 仅校验 impl ↔ trait 一致性，不校验 trait ↔ API 文档；UFCS 把替换后
+    // 的具体签名钉在调用点，trait 方法任一漂移立即在 cargo test --no-run 失败）。
+    let _: for<'a> fn(&'a KuhnGame) -> usize = <KuhnGame as Game>::n_players;
+    let _: for<'a, 'b> fn(&'a KuhnGame, &'b mut dyn RngSource) -> KuhnState =
+        <KuhnGame as Game>::root;
+    let _: for<'a> fn(&'a KuhnState) -> NodeKind = <KuhnGame as Game>::current;
+    let _: for<'a> fn(&'a KuhnState, PlayerId) -> KuhnInfoSet = <KuhnGame as Game>::info_set;
+    let _: for<'a> fn(&'a KuhnState) -> Vec<KuhnAction> = <KuhnGame as Game>::legal_actions;
+    let _: for<'a> fn(KuhnState, KuhnAction, &'a mut dyn RngSource) -> KuhnState =
+        <KuhnGame as Game>::next;
+    let _: for<'a> fn(&'a KuhnState) -> Vec<(KuhnAction, f64)> =
+        <KuhnGame as Game>::chance_distribution;
+    let _: for<'a> fn(&'a KuhnState, PlayerId) -> f64 = <KuhnGame as Game>::payoff;
+
+    // Game trait UFCS × LeducGame。
+    let _: for<'a> fn(&'a LeducGame) -> usize = <LeducGame as Game>::n_players;
+    let _: for<'a, 'b> fn(&'a LeducGame, &'b mut dyn RngSource) -> LeducState =
+        <LeducGame as Game>::root;
+    let _: for<'a> fn(&'a LeducState) -> NodeKind = <LeducGame as Game>::current;
+    let _: for<'a> fn(&'a LeducState, PlayerId) -> LeducInfoSet = <LeducGame as Game>::info_set;
+    let _: for<'a> fn(&'a LeducState) -> Vec<LeducAction> = <LeducGame as Game>::legal_actions;
+    let _: for<'a> fn(LeducState, LeducAction, &'a mut dyn RngSource) -> LeducState =
+        <LeducGame as Game>::next;
+    let _: for<'a> fn(&'a LeducState) -> Vec<(LeducAction, f64)> =
+        <LeducGame as Game>::chance_distribution;
+    let _: for<'a> fn(&'a LeducState, PlayerId) -> f64 = <LeducGame as Game>::payoff;
+
+    // Game trait UFCS × SimplifiedNlheGame。
+    let _: for<'a> fn(&'a SimplifiedNlheGame) -> usize = <SimplifiedNlheGame as Game>::n_players;
+    let _: for<'a, 'b> fn(&'a SimplifiedNlheGame, &'b mut dyn RngSource) -> SimplifiedNlheState =
+        <SimplifiedNlheGame as Game>::root;
+    let _: for<'a> fn(&'a SimplifiedNlheState) -> NodeKind = <SimplifiedNlheGame as Game>::current;
+    let _: for<'a> fn(&'a SimplifiedNlheState, PlayerId) -> SimplifiedNlheInfoSet =
+        <SimplifiedNlheGame as Game>::info_set;
+    let _: for<'a> fn(&'a SimplifiedNlheState) -> Vec<SimplifiedNlheAction> =
+        <SimplifiedNlheGame as Game>::legal_actions;
+    let _: for<'a> fn(
+        SimplifiedNlheState,
+        SimplifiedNlheAction,
+        &'a mut dyn RngSource,
+    ) -> SimplifiedNlheState = <SimplifiedNlheGame as Game>::next;
+    let _: for<'a> fn(&'a SimplifiedNlheState) -> Vec<(SimplifiedNlheAction, f64)> =
+        <SimplifiedNlheGame as Game>::chance_distribution;
+    let _: for<'a> fn(&'a SimplifiedNlheState, PlayerId) -> f64 =
+        <SimplifiedNlheGame as Game>::payoff;
+
+    // SimplifiedNlheGame::new（API-303 构造函数 + D-314 bucket table 依赖 deferred）。
+    let _: fn(Arc<BucketTable>) -> Result<SimplifiedNlheGame, TrainerError> =
+        SimplifiedNlheGame::new;
+
+    // ===================================================================
+    // training::regret (api §3)
+    // ===================================================================
+
+    let _: fn() -> RegretTable<KuhnInfoSet> = RegretTable::<KuhnInfoSet>::new;
+    let _: fn() -> RegretTable<KuhnInfoSet> = <RegretTable<KuhnInfoSet> as Default>::default;
+    let _: for<'a> fn(&'a mut RegretTable<KuhnInfoSet>, KuhnInfoSet, usize) -> &'a mut Vec<f64> =
+        RegretTable::<KuhnInfoSet>::get_or_init;
+    let _: for<'a, 'b> fn(&'a RegretTable<KuhnInfoSet>, &'b KuhnInfoSet, usize) -> Vec<f64> =
+        RegretTable::<KuhnInfoSet>::current_strategy;
+    let _: for<'a, 'b> fn(&'a mut RegretTable<KuhnInfoSet>, KuhnInfoSet, &'b [f64]) =
+        RegretTable::<KuhnInfoSet>::accumulate;
+    let _: for<'a> fn(&'a RegretTable<KuhnInfoSet>) -> usize = RegretTable::<KuhnInfoSet>::len;
+    let _: for<'a> fn(&'a RegretTable<KuhnInfoSet>) -> bool = RegretTable::<KuhnInfoSet>::is_empty;
+
+    let _: fn() -> StrategyAccumulator<KuhnInfoSet> = StrategyAccumulator::<KuhnInfoSet>::new;
+    let _: fn() -> StrategyAccumulator<KuhnInfoSet> =
+        <StrategyAccumulator<KuhnInfoSet> as Default>::default;
+    let _: for<'a, 'b> fn(&'a mut StrategyAccumulator<KuhnInfoSet>, KuhnInfoSet, &'b [f64]) =
+        StrategyAccumulator::<KuhnInfoSet>::accumulate;
+    let _: for<'a, 'b> fn(
+        &'a StrategyAccumulator<KuhnInfoSet>,
+        &'b KuhnInfoSet,
+        usize,
+    ) -> Vec<f64> = StrategyAccumulator::<KuhnInfoSet>::average_strategy;
+    let _: for<'a> fn(&'a StrategyAccumulator<KuhnInfoSet>) -> usize =
+        StrategyAccumulator::<KuhnInfoSet>::len;
+    let _: for<'a> fn(&'a StrategyAccumulator<KuhnInfoSet>) -> bool =
+        StrategyAccumulator::<KuhnInfoSet>::is_empty;
+
+    // ===================================================================
+    // training::trainer (api §2)
+    // ===================================================================
+
+    // VanillaCfrTrainer<KuhnGame> 构造 + Trainer trait 全 6 方法 UFCS。
+    let _: fn(KuhnGame, u64) -> VanillaCfrTrainer<KuhnGame> = VanillaCfrTrainer::<KuhnGame>::new;
+    let _: for<'a, 'b> fn(
+        &'a mut VanillaCfrTrainer<KuhnGame>,
+        &'b mut dyn RngSource,
+    ) -> Result<(), TrainerError> = <VanillaCfrTrainer<KuhnGame> as Trainer<KuhnGame>>::step;
+    let _: for<'a, 'b> fn(&'a VanillaCfrTrainer<KuhnGame>, &'b KuhnInfoSet) -> Vec<f64> =
+        <VanillaCfrTrainer<KuhnGame> as Trainer<KuhnGame>>::current_strategy;
+    let _: for<'a, 'b> fn(&'a VanillaCfrTrainer<KuhnGame>, &'b KuhnInfoSet) -> Vec<f64> =
+        <VanillaCfrTrainer<KuhnGame> as Trainer<KuhnGame>>::average_strategy;
+    let _: for<'a> fn(&'a VanillaCfrTrainer<KuhnGame>) -> u64 =
+        <VanillaCfrTrainer<KuhnGame> as Trainer<KuhnGame>>::update_count;
+    let _: for<'a, 'b> fn(
+        &'a VanillaCfrTrainer<KuhnGame>,
+        &'b Path,
+    ) -> Result<(), CheckpointError> =
+        <VanillaCfrTrainer<KuhnGame> as Trainer<KuhnGame>>::save_checkpoint;
+    let _: for<'a> fn(&'a Path, KuhnGame) -> Result<VanillaCfrTrainer<KuhnGame>, CheckpointError> =
+        <VanillaCfrTrainer<KuhnGame> as Trainer<KuhnGame>>::load_checkpoint;
+
+    // EsMccfrTrainer<SimplifiedNlheGame> 构造 + Trainer trait 全 6 方法 UFCS +
+    // step_parallel inherent method。
+    let _: fn(SimplifiedNlheGame, u64) -> EsMccfrTrainer<SimplifiedNlheGame> =
+        EsMccfrTrainer::<SimplifiedNlheGame>::new;
+    let _: for<'a, 'b> fn(
+        &'a mut EsMccfrTrainer<SimplifiedNlheGame>,
+        &'b mut [Box<dyn RngSource>],
+        usize,
+    ) -> Result<(), TrainerError> = EsMccfrTrainer::<SimplifiedNlheGame>::step_parallel;
+    let _: for<'a, 'b> fn(
+        &'a mut EsMccfrTrainer<SimplifiedNlheGame>,
+        &'b mut dyn RngSource,
+    ) -> Result<(), TrainerError> =
+        <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::step;
+    let _: for<'a, 'b> fn(
+        &'a EsMccfrTrainer<SimplifiedNlheGame>,
+        &'b SimplifiedNlheInfoSet,
+    ) -> Vec<f64> =
+        <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::current_strategy;
+    let _: for<'a, 'b> fn(
+        &'a EsMccfrTrainer<SimplifiedNlheGame>,
+        &'b SimplifiedNlheInfoSet,
+    ) -> Vec<f64> =
+        <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::average_strategy;
+    let _: for<'a> fn(&'a EsMccfrTrainer<SimplifiedNlheGame>) -> u64 =
+        <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::update_count;
+    let _: for<'a, 'b> fn(
+        &'a EsMccfrTrainer<SimplifiedNlheGame>,
+        &'b Path,
+    ) -> Result<(), CheckpointError> =
+        <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::save_checkpoint;
+    let _: for<'a> fn(
+        &'a Path,
+        SimplifiedNlheGame,
+    ) -> Result<EsMccfrTrainer<SimplifiedNlheGame>, CheckpointError> =
+        <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint;
+
+    // ===================================================================
+    // training::best_response (api §4)
+    // ===================================================================
+
+    // BestResponse<G>::compute UFCS × KuhnBestResponse / LeducBestResponse。
+    let _: for<'a, 'b> fn(
+        &'a KuhnGame,
+        &'b dyn Fn(&KuhnInfoSet, usize) -> Vec<f64>,
+        PlayerId,
+    ) -> (HashMap<KuhnInfoSet, Vec<f64>>, f64) =
+        <KuhnBestResponse as BestResponse<KuhnGame>>::compute;
+    let _: for<'a, 'b> fn(
+        &'a LeducGame,
+        &'b dyn Fn(&LeducInfoSet, usize) -> Vec<f64>,
+        PlayerId,
+    ) -> (HashMap<LeducInfoSet, Vec<f64>>, f64) =
+        <LeducBestResponse as BestResponse<LeducGame>>::compute;
+
+    // exploitability<G, BR> 泛型函数 × <KuhnGame, KuhnBestResponse> 1 instantiation
+    // （泛型本身无法直接绑 fn-pointer，但具体实例化后类型固定）。
+    let _: for<'a, 'b> fn(&'a KuhnGame, &'b dyn Fn(&KuhnInfoSet, usize) -> Vec<f64>) -> f64 =
+        exploitability::<KuhnGame, KuhnBestResponse>;
+    let _: for<'a, 'b> fn(&'a LeducGame, &'b dyn Fn(&LeducInfoSet, usize) -> Vec<f64>) -> f64 =
+        exploitability::<LeducGame, LeducBestResponse>;
+
+    // ===================================================================
+    // training::checkpoint (api §5)
+    // ===================================================================
+
+    let _: for<'a, 'b> fn(&'a Checkpoint, &'b Path) -> Result<(), CheckpointError> =
+        Checkpoint::save;
+    let _: for<'a> fn(&'a Path) -> Result<Checkpoint, CheckpointError> = Checkpoint::open;
+
+    // MAGIC / SCHEMA_VERSION 常量值锁（任一漂移 cargo test --no-run 失败）。
+    let _: [u8; 8] = MAGIC;
+    let _: u32 = SCHEMA_VERSION;
+
+    // ===================================================================
+    // training::sampling (api §6)
+    // ===================================================================
+
+    // derive_substream_seed: SplitMix64 finalizer × 4 → 32 byte（API-330 / D-335）。
+    let _: fn(u64, u64, u64) -> [u8; 32] = derive_substream_seed;
+
+    // sample_discrete<A: Copy> 泛型函数 × KuhnAction 1 instantiation。
+    let _: for<'a, 'b> fn(&'a [(KuhnAction, f64)], &'b mut dyn RngSource) -> KuhnAction =
+        sample_discrete::<KuhnAction>;
+
+    // 6 个 op_id 常量值锁（任一重命名 / 数值漂移 cargo test --no-run 失败）。
+    let _: u64 = OP_KUHN_DEAL;
+    let _: u64 = OP_LEDUC_DEAL;
+    let _: u64 = OP_NLHE_DEAL;
+    let _: u64 = OP_OPP_ACTION_SAMPLE;
+    let _: u64 = OP_CHANCE_SAMPLE;
+    let _: u64 = OP_TRAVERSER_TIE;
+
+    // ===================================================================
+    // training::error (api §2 / §5 错误枚举 + 桥接 enum)
+    // ===================================================================
+
+    // TrainerVariant / GameVariant 物理位置在 src/error.rs（D-374），逻辑路径
+    // poker::{TrainerVariant, GameVariant}（顶层 re-export 自 training）。
+    let _: TrainerVariant = TrainerVariant::VanillaCfr;
+    let _: TrainerVariant = TrainerVariant::EsMccfr;
+    let _: GameVariant = GameVariant::Kuhn;
+    let _: GameVariant = GameVariant::Leduc;
+    let _: GameVariant = GameVariant::SimplifiedNlhe;
 }

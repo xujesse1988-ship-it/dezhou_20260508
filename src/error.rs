@@ -1,4 +1,9 @@
 //! 公开错误类型（API §8）。
+//!
+//! Stage 3 D-374 追加 [`CheckpointError`] + [`TrainerError`]（继承 stage 1 + stage 2
+//! 错误追加不删模式）。具体签名锁在 `docs/pluribus_stage3_api.md` API-313 / API-351。
+
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -76,4 +81,86 @@ pub enum HistoryError {
         #[source]
         source: RuleError,
     },
+}
+
+/// Checkpoint 读写错误（D-351 / API-351）。
+///
+/// 5 类错误对应阶段 3 决策 D-350 (schema_version 校验) / D-351 (5 variant) / D-352
+/// (trailer BLAKE3 eager 校验) / D-356 (多 game 不兼容) / 通用 corruption。
+///
+/// 继承 stage 2 [`crate::BucketTableError`] 5 类形态。
+#[derive(Debug, Error)]
+pub enum CheckpointError {
+    #[error("checkpoint file not found: {path:?}")]
+    FileNotFound { path: PathBuf },
+
+    #[error("checkpoint schema mismatch: expected {expected}, got {got}")]
+    SchemaMismatch { expected: u32, got: u32 },
+
+    #[error("checkpoint trainer mismatch: expected {expected:?}, got {got:?}")]
+    TrainerMismatch {
+        expected: (TrainerVariant, GameVariant),
+        got: (TrainerVariant, GameVariant),
+    },
+
+    #[error("checkpoint bucket_table BLAKE3 mismatch: expected {expected:02x?}, got {got:02x?}")]
+    BucketTableMismatch { expected: [u8; 32], got: [u8; 32] },
+
+    #[error("checkpoint corrupted at offset {offset}: {reason}")]
+    Corrupted { offset: u64, reason: String },
+}
+
+/// 训练运行时错误（D-324 / D-325 / D-330 / API-313）。
+///
+/// 5 类错误覆盖：① action_count 训练全程恒定约束（D-324）；② RSS 上界（D-325）；
+/// ③ bucket table schema 版本不支持（D-323 / D-314）；④ regret matching 概率 sum
+/// 容差越界（D-330 path.md §阶段 3 字面 `1e-9` 约束）；⑤ [`CheckpointError`] 传播
+/// （`#[from]` propagate；让 `Trainer::save_checkpoint` 失败路径无须包装）。
+///
+/// 继承 stage 1 [`RuleError`] / [`HistoryError`] + stage 2
+/// [`crate::BucketTableError`] / [`crate::EquityError`] 错误追加不删模式（D-374）。
+#[derive(Debug, Error)]
+pub enum TrainerError {
+    #[error("info_set {info_set:?} action_count mismatch: expected {expected}, got {got}")]
+    ActionCountMismatch {
+        info_set: String,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("training process RSS {rss_bytes} exceeded limit {limit}")]
+    OutOfMemory { rss_bytes: u64, limit: u64 },
+
+    #[error("bucket table schema {got} not supported (expected {expected})")]
+    UnsupportedBucketTable { expected: u32, got: u32 },
+
+    #[error("regret matching probability sum {got} out of tolerance {tolerance}")]
+    ProbabilitySumOutOfTolerance { got: f64, tolerance: f64 },
+
+    #[error("checkpoint error: {0}")]
+    Checkpoint(#[from] CheckpointError),
+}
+
+/// Trainer 变体 tag（API-350 binary schema offset 12 / D-356 跨 trainer 不兼容拒绝）。
+///
+/// 定义在 `src/error.rs` 而非 `src/training/checkpoint.rs` 以避免 `error.rs` ↔
+/// `training/checkpoint.rs` 循环依赖（[`CheckpointError::TrainerMismatch`] 需引用该类型）。
+/// `src/training/checkpoint.rs` 通过 `pub use crate::error::TrainerVariant;` 再导出，
+/// 与 API-350 锁定的 `module: training::checkpoint` 公开路径保持一致。
+#[repr(u8)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash)]
+pub enum TrainerVariant {
+    VanillaCfr = 0,
+    EsMccfr = 1,
+}
+
+/// Game 变体 tag（API-350 binary schema offset 13 / D-356 跨 game 不兼容拒绝）。
+///
+/// 定义位置同 [`TrainerVariant`]，避免循环依赖。
+#[repr(u8)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash)]
+pub enum GameVariant {
+    Kuhn = 0,
+    Leduc = 1,
+    SimplifiedNlhe = 2,
 }

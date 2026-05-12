@@ -1,7 +1,8 @@
-//! 6-max NLHE poker AI crate — stage 1 锁定 + stage 2 抽象层骨架。
+//! 6-max NLHE poker AI crate — stage 1 锁定 + stage 2 锁定 + stage 3 训练层骨架。
 //!
 //! 公开 API 严格对应 `docs/pluribus_stage1_api.md`（§API-001..API-099 锁定）+
-//! `docs/pluribus_stage2_api.md`（§API-200..API-302，A1 \[实现\] 阶段骨架，函数体
+//! `docs/pluribus_stage2_api.md`（§API-200..API-302 锁定）+
+//! `docs/pluribus_stage3_api.md`（§API-300..API-392，A1 \[实现\] 阶段骨架，函数体
 //! `unimplemented!()`，B2/C2/D2/E2/F2 逐步填充）。
 //!
 //! 阶段 1 模块（D-011，闭合于 `stage1-v1.0`）：
@@ -11,9 +12,13 @@
 //! - [`history`]：手牌历史与回放
 //! - [`error`]：公开错误类型
 //!
-//! 阶段 2 模块（A1 \[实现\] 起步，A0 决策已锁定）：
+//! 阶段 2 模块（闭合于 `stage2-v1.0`）：
 //! - [`abstraction`]：抽象层（action / info / preflop / postflop / equity /
 //!   feature / cluster / bucket_table / map）
+//!
+//! 阶段 3 模块（A1 \[实现\] 起步，A0 决策已锁定）：
+//! - [`training`]：CFR / MCCFR 训练层（game / kuhn / leduc / nlhe / regret /
+//!   trainer / sampling / best_response / checkpoint）
 
 pub mod abstraction;
 pub mod core;
@@ -21,6 +26,7 @@ pub mod error;
 pub mod eval;
 pub mod history;
 pub mod rules;
+pub mod training;
 
 // 阶段 1 顶层 re-export（与 `docs/pluribus_stage1_api.md` §9 保持一致）。
 pub use crate::core::rng::{ChaCha20Rng, RngCoreAdapter, RngSource};
@@ -52,3 +58,14 @@ pub use crate::abstraction::preflop::{canonical_hole_id, PreflopLossless169};
 // `cluster::rng_substream` 例外，由 `lib.rs` 直接 `pub use` 暴露便于 [测试] 独立
 // 构造 sub-stream 验证 byte-equal。
 pub use crate::abstraction::cluster::rng_substream;
+
+// 阶段 3 顶层 re-export（D-374 / D-377 / API-380；与 `docs/pluribus_stage3_api.md`
+// §8 公开 surface 列表对齐）。`Game::InfoSet` 关联类型不显式 re-export（D-377：
+// 不暴露具体 InfoSet 类型枚举，通过 `G::InfoSet` 表达）。
+pub use crate::training::{
+    exploitability, BestResponse, Checkpoint, CheckpointError, EsMccfrTrainer, Game, GameVariant,
+    KuhnAction, KuhnBestResponse, KuhnGame, KuhnHistory, KuhnInfoSet, LeducAction,
+    LeducBestResponse, LeducGame, LeducInfoSet, LeducStreet, NodeKind, PlayerId, RegretTable,
+    SimplifiedNlheGame, StrategyAccumulator, Trainer, TrainerError, TrainerVariant,
+    VanillaCfrTrainer,
+};
