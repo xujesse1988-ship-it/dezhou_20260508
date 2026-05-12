@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blake3;
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::abstraction::action::ConfigError;
@@ -887,63 +888,75 @@ fn train_one_street(
     let ochs_op = cluster::rng_substream::OCHS_FEATURE_INNER;
 
     let t_features = std::time::Instant::now();
-    // 进度日志间隔：n_train ≥ 200K 时每 5% / 100K（取大）打一行；fixture 路径
-    // n_train ≤ 50K 不触发，保持 fixture 行为安静。
-    let feature_log_interval: usize = if n_train >= 200_000 {
-        (n_train / 20).max(100_000)
+    // §G-batch1 §3.4-batch1.5 [实现]：rayon par_iter 数据并行。每 sample 的 RNG
+    // 通过 derive_substream_seed(seed, op, i) 派生（pure function of i），与执行
+    // 顺序无关；rayon `.collect()` 保留迭代序 → 输出 features / ehs_per_sample
+    // 顺序与 sequential `.iter().collect()` byte-equal。
+    //
+    // chunk-based 进度日志（n_train ≥ 200K 时每 5% / 50K 取大；fixture n_train ≤
+    // 50K 走单 chunk 无中间日志保持 fixture 路径安静）。chunked 让 par_iter 在
+    // chunk 内并行 + chunk 间串行打日志，比 lock-based 全局 progress counter 简单。
+    let chunk_size: usize = if n_train >= 200_000 {
+        (n_train / 20).max(50_000)
     } else {
-        usize::MAX
+        n_train.max(1)
     };
+    let n_chunks: usize = n_train.div_ceil(chunk_size);
     let mut features: Vec<Vec<f64>> = Vec::with_capacity(n_train);
     let mut ehs_per_sample: Vec<f64> = Vec::with_capacity(n_train);
-    for (i, (board, hole)) in candidates.iter().enumerate() {
-        if i > 0 && i % feature_log_interval == 0 {
+    for chunk_idx in 0..n_chunks {
+        let start = chunk_idx * chunk_size;
+        let end = (start + chunk_size).min(n_train);
+        if chunk_idx > 0 && n_chunks > 1 {
             eprintln!(
-                "[train_one_street] street={street:?} phase=1 features {}/{} ({:.1}%) \
-                 elapsed={:?}",
-                i,
-                n_train,
-                100.0 * (i as f64) / (n_train as f64),
+                "[train_one_street] street={street:?} phase=1 features chunk {chunk_idx}/{n_chunks} \
+                 [{start}..{end}) elapsed={:?}",
                 t_features.elapsed()
             );
         }
-        let mut rng_ehs = ChaCha20Rng::from_seed(cluster::rng_substream::derive_substream_seed(
-            training_seed,
-            ehs_op,
-            i as u32,
-        ));
-        let mut rng_ochs = ChaCha20Rng::from_seed(cluster::rng_substream::derive_substream_seed(
-            training_seed,
-            ochs_op,
-            i as u32,
-        ));
-        let ehs = calc
-            .equity(*hole, board, &mut rng_ehs)
-            .unwrap_or(0.5)
-            .clamp(0.0, 1.0);
-        let ehs2 = if use_proxy {
-            ehs * ehs
-        } else {
-            // production 精确路径（cluster_iter > 500）。
-            calc.ehs_squared(*hole, board, &mut rng_ehs)
-                .unwrap_or(ehs * ehs)
-                .clamp(0.0, 1.0)
-        };
-        let ochs = calc
-            .ochs(*hole, board, &mut rng_ochs)
-            .unwrap_or_else(|_| vec![0.5; 8]);
-        let mut feat: Vec<f64> = Vec::with_capacity(9);
-        feat.push(ehs2);
-        for v in ochs.iter().take(8) {
-            feat.push((*v).clamp(0.0, 1.0));
+        let chunk_results: Vec<(Vec<f64>, f64)> = candidates[start..end]
+            .par_iter()
+            .enumerate()
+            .map(|(j, (board, hole))| {
+                let i: u32 = (start + j) as u32;
+                let mut rng_ehs = ChaCha20Rng::from_seed(
+                    cluster::rng_substream::derive_substream_seed(training_seed, ehs_op, i),
+                );
+                let mut rng_ochs = ChaCha20Rng::from_seed(
+                    cluster::rng_substream::derive_substream_seed(training_seed, ochs_op, i),
+                );
+                let ehs = calc
+                    .equity(*hole, board, &mut rng_ehs)
+                    .unwrap_or(0.5)
+                    .clamp(0.0, 1.0);
+                let ehs2 = if use_proxy {
+                    ehs * ehs
+                } else {
+                    // production 精确路径（cluster_iter > 500）。
+                    calc.ehs_squared(*hole, board, &mut rng_ehs)
+                        .unwrap_or(ehs * ehs)
+                        .clamp(0.0, 1.0)
+                };
+                let ochs = calc
+                    .ochs(*hole, board, &mut rng_ochs)
+                    .unwrap_or_else(|_| vec![0.5; 8]);
+                let mut feat: Vec<f64> = Vec::with_capacity(9);
+                feat.push(ehs2);
+                for v in ochs.iter().take(8) {
+                    feat.push((*v).clamp(0.0, 1.0));
+                }
+                // 若 OCHS 长度 < 8（理论不会，n_opp_clusters 默认 8），用 0.5 padding。
+                while feat.len() < (BUCKET_TABLE_FEATURE_SET_1_DIMS as usize) {
+                    feat.push(0.5);
+                }
+                // D-236b 重编号 key：直接用 ehs（EHS = `equity()` 输出，非 EHS²）。
+                (feat, ehs)
+            })
+            .collect();
+        for (feat, ehs) in chunk_results {
+            features.push(feat);
+            ehs_per_sample.push(ehs);
         }
-        // 若 OCHS 长度 < 8（理论不会，n_opp_clusters 默认 8），用 0.5 padding。
-        while feat.len() < (BUCKET_TABLE_FEATURE_SET_1_DIMS as usize) {
-            feat.push(0.5);
-        }
-        features.push(feat);
-        // D-236b 重编号 key：直接用 ehs（EHS = `equity()` 输出，非 EHS²）。
-        ehs_per_sample.push(ehs);
     }
 
     eprintln!(
@@ -1008,73 +1021,89 @@ fn train_one_street(
             // 使用 `id` 而非 phase 1 sample index `i`——同 training_seed 下二者
             // 重叠区域 (id < n_train_phase1) 会取到同样的 substream seed，但
             // (board, hole) 输入不同 → feature 自然不同；determinism 不变。
+            //
+            // §G-batch1 §3.4-batch1.5 [实现]：rayon par_iter chunked 数据并行。
+            // 每 id 的 RNG 通过 derive_substream_seed(seed, op, id) 派生（pure
+            // function of id），与执行顺序无关；rayon `.collect()` 保留迭代序 →
+            // lookup_table 写入字节顺序 byte-equal sequential 路径。chunk 间
+            // 串行打日志（含 ETA），chunk 内 par_iter 并行。
             let t_phase2 = std::time::Instant::now();
-            // Phase 2 进度日志：每 5% / 200K（取大）打一行 + 起止 banner。
-            let phase2_log_interval: u32 = ((n_canonical / 20).max(200_000)) as u32;
+            let chunk_size_p2: usize = ((n_canonical as usize) / 20).max(200_000);
+            let n_chunks_p2: usize = (n_canonical as usize).div_ceil(chunk_size_p2);
             eprintln!(
                 "[train_one_street] street={street:?} phase=2 enumerate-assign N={n_canonical} \
-                 starting (interval={phase2_log_interval} ids)"
+                 starting (chunks={n_chunks_p2} chunk_size={chunk_size_p2})"
             );
             let n_dims = BUCKET_TABLE_FEATURE_SET_1_DIMS as usize;
-            for id in 0..n_canonical {
-                if id > 0 && id % phase2_log_interval == 0 {
+            for chunk_idx in 0..n_chunks_p2 {
+                let start = chunk_idx * chunk_size_p2;
+                let end = ((start + chunk_size_p2) as u32).min(n_canonical) as usize;
+                if chunk_idx > 0 {
                     let elapsed = t_phase2.elapsed();
-                    let pct = 100.0 * (id as f64) / (n_canonical as f64);
-                    let eta_sec = if id > 0 {
-                        elapsed.as_secs_f64() * ((n_canonical - id) as f64) / (id as f64)
-                    } else {
-                        f64::NAN
-                    };
+                    let pct = 100.0 * (start as f64) / (n_canonical as f64);
+                    let eta_sec = elapsed.as_secs_f64() * ((n_canonical as usize - start) as f64)
+                        / (start as f64);
                     eprintln!(
-                        "[train_one_street] street={street:?} phase=2 {}/{} ({:.1}%) \
-                         elapsed={:?} eta={:.0}s",
-                        id, n_canonical, pct, elapsed, eta_sec
+                        "[train_one_street] street={street:?} phase=2 chunk {chunk_idx}/{n_chunks_p2} \
+                         [{start}..{end}) ({:.1}%) elapsed={:?} eta={:.0}s",
+                        pct, elapsed, eta_sec
                     );
                 }
-                let (board, hole) = canonical_enum::nth_canonical_form(street, id);
-                let mut rng_ehs = ChaCha20Rng::from_seed(
-                    cluster::rng_substream::derive_substream_seed(training_seed, ehs_op, id),
-                );
-                let mut rng_ochs = ChaCha20Rng::from_seed(
-                    cluster::rng_substream::derive_substream_seed(training_seed, ochs_op, id),
-                );
-                let ehs = calc
-                    .equity(hole, &board, &mut rng_ehs)
-                    .unwrap_or(0.5)
-                    .clamp(0.0, 1.0);
-                let ehs2 = if use_proxy {
-                    ehs * ehs
-                } else {
-                    calc.ehs_squared(hole, &board, &mut rng_ehs)
-                        .unwrap_or(ehs * ehs)
-                        .clamp(0.0, 1.0)
-                };
-                let ochs = calc
-                    .ochs(hole, &board, &mut rng_ochs)
-                    .unwrap_or_else(|_| vec![0.5; 8]);
-                // 初始化为 0.5 padding（与 phase 1 OCHS 长度 < 8 时的 fallback 一致）；
-                // 然后写入 ehs2 + ochs。
-                let mut feat: [f64; 9] = [0.5; 9];
-                feat[0] = ehs2;
-                for (d, v) in ochs.iter().take(8).enumerate() {
-                    feat[d + 1] = (*v).clamp(0.0, 1.0);
-                }
-                // 找最近 centroid（L2 距离，post-D-236b 重编号顺序，centroids 是
-                // f64 reference 值；u8 量化仅用于 artifact 存储）。
-                let mut best_id: u32 = 0;
-                let mut best_dist: f64 = f64::INFINITY;
-                for (c_id, c) in centroids.iter().enumerate() {
-                    let mut dist: f64 = 0.0;
-                    for d in 0..n_dims {
-                        let diff = feat[d] - c[d];
-                        dist += diff * diff;
-                    }
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_id = c_id as u32;
-                    }
-                }
-                lookup_table[id as usize] = best_id;
+                let chunk_results: Vec<u32> = (start..end)
+                    .into_par_iter()
+                    .map(|id_usize| {
+                        let id: u32 = id_usize as u32;
+                        let (board, hole) = canonical_enum::nth_canonical_form(street, id);
+                        let mut rng_ehs =
+                            ChaCha20Rng::from_seed(cluster::rng_substream::derive_substream_seed(
+                                training_seed,
+                                ehs_op,
+                                id,
+                            ));
+                        let mut rng_ochs =
+                            ChaCha20Rng::from_seed(cluster::rng_substream::derive_substream_seed(
+                                training_seed,
+                                ochs_op,
+                                id,
+                            ));
+                        let ehs = calc
+                            .equity(hole, &board, &mut rng_ehs)
+                            .unwrap_or(0.5)
+                            .clamp(0.0, 1.0);
+                        let ehs2 = if use_proxy {
+                            ehs * ehs
+                        } else {
+                            calc.ehs_squared(hole, &board, &mut rng_ehs)
+                                .unwrap_or(ehs * ehs)
+                                .clamp(0.0, 1.0)
+                        };
+                        let ochs = calc
+                            .ochs(hole, &board, &mut rng_ochs)
+                            .unwrap_or_else(|_| vec![0.5; 8]);
+                        let mut feat: [f64; 9] = [0.5; 9];
+                        feat[0] = ehs2;
+                        for (d, v) in ochs.iter().take(8).enumerate() {
+                            feat[d + 1] = (*v).clamp(0.0, 1.0);
+                        }
+                        // 找最近 centroid（L2 距离，post-D-236b 重编号顺序，centroids
+                        // 是 f64 reference 值；u8 量化仅用于 artifact 存储）。
+                        let mut best_id: u32 = 0;
+                        let mut best_dist: f64 = f64::INFINITY;
+                        for (c_id, c) in centroids.iter().enumerate() {
+                            let mut dist: f64 = 0.0;
+                            for d in 0..n_dims {
+                                let diff = feat[d] - c[d];
+                                dist += diff * diff;
+                            }
+                            if dist < best_dist {
+                                best_dist = dist;
+                                best_id = c_id as u32;
+                            }
+                        }
+                        best_id
+                    })
+                    .collect();
+                lookup_table[start..end].copy_from_slice(&chunk_results);
             }
             eprintln!(
                 "[train_one_street] street={street:?} phase=2 done {} ids / {:?}",

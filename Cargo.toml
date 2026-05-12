@@ -15,6 +15,12 @@ rand_chacha = "0.3"
 thiserror = "1.0"
 prost = "0.13"
 blake3 = "1.5"
+# §G-batch1 §3.4-batch1.5 [实现]：data parallelism for production bucket table
+# 训练（`train_one_street` phase 1 features + phase 2 enumerate-assign 热循环）。
+# rayon 0.x → 1.x 系列稳定 API，按 minor 锁定。determinism 保证：每 iteration 的
+# RNG 通过 derive_substream_seed(seed, op, i) 派生（pure function of i），par_iter
+# `.collect()` 顺序与 `.iter().collect()` 一致 → byte-equal artifact 不变量保持。
+rayon = "1.10"
 # 阶段 2 D-255：mmap 加载 bucket table。C2 走 std::fs::read 整段加载替代 mmap
 # （Mmap::map 入口 unsafe 与 stage 1 D-275 unsafe_code = "forbid" 冲突，详见
 # pluribus_stage2_workflow.md §C-rev1 batch 2）。stage 3+ 巨大 bucket table 跨
