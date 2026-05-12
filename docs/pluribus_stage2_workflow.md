@@ -2281,15 +2281,123 @@ enumeration inverse + 100% 覆盖 + n_train = N" 选项替代，达成 D-218-rev
 行）。与 stage-2 §C-rev0 / §C-rev1 工程取舍记录（D-221 字面 "EHS²" 在 fixture
 路径改 EHS² ≈ equity²）同形态。
 
+下一步：§G-batch1 §3.4-batch1.5 [实现]（rayon par_iter 并行化训练热循环；commit
+`9c67658` 已落地，本文档 entry 由 §3.4-batch1.5 closure 同 commit 追加）。然后
+§G-batch1 §3.4-batch2 [实现]（production artifact 重训 + hash 录入 + GitHub
+Release + fetch helper）。
+
+##### §G-batch1 §3.4-batch1.5 [实现]（2026-05-12）：rayon par_iter 并行化训练热循环（commit `9c67658` 追认 + AWS 32-core 验证）
+
+§G-batch1 §3.4-batch1 commit `5177639` 后第五步——`train_one_street` 两个热循环
+（phase 1 features 计算 + phase 2 enumerate-assign）在 §3.4-batch1 落地时为
+sequential `for` loop，让 vultr 4-core 只用 1 个 vCPU，多核机器（AWS EPYC 7R13
+32-core / Hetzner AX 系列 / bare metal）也无法加速；本 batch1.5 切 rayon
+par_iter chunked + chunk-level 进度日志，让 ≥ 2 core 机器线性 scale。
+
+**核心改动**（commit `9c67658`，3 files +187/-106 行）：
+
+1. `Cargo.toml`：加 `rayon = "1.10"` runtime dep。Cargo.lock 同步 rayon 1.12.0 +
+   rayon-core 1.13.0 + crossbeam-utils 0.8.21 + crossbeam-epoch 0.9.18 +
+   crossbeam-deque 0.8.6 + 2 个解析新增。
+2. `src/abstraction/bucket_table.rs`：
+    - `use rayon::prelude::*;` import。
+    - `train_one_street` phase 1 features for-loop → chunk-based par_iter：每
+      chunk 串行打日志（含 elapsed time），chunk 内 par_iter 并行计算 feat +
+      ehs，`.collect::<Vec<(Vec<f64>, f64)>>()` 保留迭代序 → 后续 features.push
+      / ehs_per_sample.push 顺序与 sequential 路径 byte-equal。chunk size =
+      max(50K, n_train/20)；fixture 路径 n_train ≤ 50K 走单 chunk 无中间日志
+      保持 fixture 行为安静。
+    - `train_one_street` Production-mode phase 2 enumerate-assign for-loop →
+      chunk-based par_iter：每 chunk 串行打 banner + ETA，chunk 内 par_iter
+      并行 decode + feature + nearest-centroid，`.collect::<Vec<u32>>()` 保留
+      id 顺序 → `lookup_table[start..end].copy_from_slice(&chunk_results)`
+      写入与 sequential 路径 byte-equal。chunk size = max(200K, N/20)。
+    - Fixture-mode lookup_table 构建路径不变（既有 sample-assignment + Knuth
+      hash fallback，sequential；fixture n_train ≤ 50K 不需要并行）。
+3. K-means inner loop（`cluster::kmeans_fit` 中的 assignment / centroid update
+   / shift check）**未** rayon 化——`KMeansConfig::default_d232.max_iter = 100`
+   固定上限 + N ≤ 2M × K=500 × dim=9 sequential 约 30-60 s/街，不在本 batch
+   优化范围；§G-batch1 §3.4-batch2 实跑后若 k-means 成 bottleneck 再追加。
+
+**Determinism 不变量证明**（rayon `.collect::<Vec<_>>()` 按 `IndexedParallelIterator`
+顺序返回 = sequential `.iter().collect()` byte-equal）：
+
+1. **每 iteration 的 RNG 通过 `derive_substream_seed(seed, op, i)` 派生**——pure
+   function of `i`（phase 1）或 `id`（phase 2），与 rayon 执行顺序无关。
+2. **`.collect()` 保留迭代序**——同 chunk 内 par_iter 输出按 `start..end` 顺序
+   写回 `Vec`，与 sequential `.iter().collect()` 同结构。
+3. **写回 `features` / `lookup_table` 顺序固定**——chunk 串行处理 + chunk 内
+   par_iter 输出顺序固定，整体写回 byte-equal sequential 路径。
+
+**AWS 32-core 实跑验证**（2026-05-12，AWS EC2 EPYC 7R13 Milan 32 vCPU / 61 GB
+RAM / Ubuntu 24.04 / rustc 1.95.0 + b3sum 1.2.0；commit `9c67658` 本身的
+"vultr 实跑验证" 字面 carve-out 由本 entry 落地）：
+
+1. **byte-equal §3.3 fixture smoke**：`cargo run --release --bin train_bucket_table
+   -- --mode fixture --flop 10 --turn 10 --river 10 --cluster-iter 100 --output
+   /tmp/smoke_fixture_rayon.bin` → wall 12.6 s / user 19.9 s（≈1.6× CPU；fixture
+   n_train=1000 << chunk_size 50K threshold → 单 chunk 无 par_iter benefit）/
+   BLAKE3 body hash `a6989eeb1dc618ef8a6b375d6af1dcef547a96cdb2c0e84e4b6341562183c2b6`
+   **与 §G-batch1 §3.3 commit `7e2bd2e` 字面记录精确匹配** ✓ → rayon 不破
+   determinism baseline。
+2. **byte-equal default fixture (`clustering_repeat_blake3_byte_equal`)**：
+   `cargo test --release --test clustering_determinism -- clustering_repeat_blake3_byte_equal`
+   → 1 passed / wall 10.3 s（K=10/10/10 + cluster_iter=50，两次训练互相
+   byte-equal 自检通过）✓。
+3. **K=500/500/500 + cluster_iter=200 fixture calibration speedup**：
+   `cargo run --release --bin train_bucket_table -- --mode fixture --flop 500
+   --turn 500 --river 500 --cluster-iter 200 --output /tmp/smoke_fixture_500_200.bin`
+   → wall 59.0 s / user 11m29s（≈11.7× CPU；OCHS precompute + k-means inner
+   loop sequential 段限制效率到 ~37% 满载）/ BLAKE3 body hash
+   `8e240471881809ffe1988545f192f2a02655eda19a540ff417e80eea150a4a34`。
+   vs vultr 4-core sequential baseline（§3.4-batch1 commit message 字面 "8m6s
+   wall / 单核"）= **~8.2× speedup**（486 s → 59 s）。
+
+   per-street wall 分解（K=500 cluster_iter=200 use_proxy=true 路径）：
+
+    - Flop：phase 1 features 19.8 s + k-means 11.1 s = 31.0 s（k-means 36%）
+    - Turn：phase 1 features 0.86 s + k-means 10.3 s = 11.9 s（k-means 87%）
+    - River：phase 1 features 53.8 ms + k-means 9.3 s = 15.6 s（k-means 60%）
+
+    Flop phase 1 features （49.7 K samples × ~200×168 OCHS evals dominant）是
+    主成本；turn/river k-means 收敛偏慢成 bottleneck（centroid_shift_tol=1e-4
+    + max_iter=100 跑满）。
+
+4. **5 道 gate 全绿**（commit `9c67658` 自带 fmt / build / clippy / doc gate；本
+   AWS 验证补 byte-equal + speedup 两项 vultr 实跑 carve-out）。
+
+**[实现] 角色边界审计**：commit `9c67658` 仅触 `src/abstraction/bucket_table.rs`
++ `Cargo.{toml,lock}`，tests / docs / 其他 src / benches / fuzz / tools / proto
+0 改动；fmt + clippy + doc gate 在 par_iter 引入后 0 退化。**本 entry**（§3.4-
+batch1.5 retrospective closure）仅触 `docs/pluribus_stage2_workflow.md` 本节 +
+`CLAUDE.md` stage 2 progress 段（§G-batch1 §3.4-batch1 → §3.4-batch1.5 状态
+翻面）；src/ 0 改动维持。
+
+**碎裂的常数同步追认**：chunk_size = max(50K, n_train/20) for phase 1 features
++ chunk_size = max(200K, N/20) for phase 2 enumerate-assign 是 `bucket_table`
+内部 [实现] 阶段细化决策（非 D-NNN-revM 修订），与 stage-2 §C-rev1 §1
+"cluster_iter ≤ 500 EHS² ≈ equity² 近似" / §G-batch1 §3.4-batch1 "PRODUCTION_
+PHASE1_MAX_SAMPLES = 2_000_000" 同型——实测可调整，不触发 D-NNN-revM。
+
+**"vultr 实跑验证 + 实测 4× speedup vs §3.4-batch1 sequential baseline" carve-
+out**：commit `9c67658` 字面 "5 道 gate 全绿（local dev box）+ (vultr 4-core
+byte-equal + calibration smoke 在 push 后单独跑验证)" 让 vultr 验证留作 deferred；
+本 entry 把验证落地在 AWS 32-core EPYC 7R13（而非 commit 字面预期的 vultr 4-core
+EPYC-Rome），但 byte-equal 不变量是与硬件无关的字节字符串比较 + speedup
+方向（8.2× > 1×）确定，故 carve-out closure 同 commit message 字面预期
+（vultr 4-core ~2-3 min wall 预期 vs AWS 32-core 59 s 实测，二者方向一致）；
+vultr 4-core 实际 wall 由 §G-batch1 §3.4-batch2 production retrain 决定是否
+落到该 host 走（按 §3.4-batch2 选 AWS 32-core 路径，vultr 4-core 复跑由 §3.5
+跨架构 baseline 重生 batch 收口）。
+
 下一步：§G-batch1 §3.4-batch2 [实现]（按 `pluribus_stage2_workflow.md` §G-batch1
-§3.4 字面其余 deliverables）：(a) production artifact 重训 on vultr 4-core
-（`cargo run --release --bin train_bucket_table -- --mode production --flop 500
---turn 500 --river 500 --cluster-iter <T> --output artifacts/bucket_table_default
-_500_500_500_seed_cafebabe_v2.bin`；cluster_iter 选择由 vultr 实测决定，目标 ≤
-120 min wall）；(b) artifact whole-file b3sum + `BucketTable::content_hash()`
-录入 CLAUDE.md ground truth；(c) artifact 上传 GitHub Release tag `stage2-d218-
-rev2` 或 `stage2-v1.1`；(d) `tools/fetch_bucket_table.sh` 新增 helper（curl +
-BLAKE3 verify + cache 到 `artifacts/`）。
+§3.4 字面其余 deliverables）：(a) production artifact 重训 on **AWS 32-core
+EPYC 7R13**（替代 §3.4 字面 "vultr 4-core" host——本 batch1.5 实测 AWS 8.2×
+speedup + 61 GB RAM 让 cluster_iter=10000 + 2M phase 1 + 123M river phase 2
+可行）；(b) artifact whole-file b3sum + `BucketTable::content_hash()` 录入
+CLAUDE.md ground truth；(c) artifact 上传 GitHub Release tag `stage2-d218-rev2`
+或 `stage2-v1.1`；(d) `tools/fetch_bucket_table.sh` 新增 helper（curl + BLAKE3
+verify + cache 到 `artifacts/`）。
 
 ##### §G-batch1 §3.5..§3.8 + §4：待后续 batch 追加
 
