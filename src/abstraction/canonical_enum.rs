@@ -1,4 +1,4 @@
-//! D-218-rev2 真等价类枚举（§G-batch1 §3.1 [实现]）。
+//! D-218-rev2 真等价类枚举（§G-batch1 §3.1 \[实现\]）。
 //!
 //! Waugh 2013-style hand isomorphism for postflop (board, hole) canonical
 //! observation id。本模块实现 D-218-rev2 字面 (board, hole) 联合花色对称等价
@@ -34,8 +34,9 @@
 //!
 //! 4. **Enumeration**：用递归方式枚举每个 canonical shape (b_counts, h_counts
 //!    per canonical suit 多重集) → 每个 shape 内 enumerate canonical multiset of
-//!    (b_mask, h_mask) pairs。详见 [`enumerate_canonical_forms`]。复杂度上界 =
-//!    N（每 canonical form 严格 enumerate 一次，无 brute-force dedup）。
+//!    (b_mask, h_mask) pairs。详见 `enumerate_canonical_forms` (本模块 private
+//!    递归实现，非 pub API)。复杂度上界 = N（每 canonical form 严格 enumerate
+//!    一次，无 brute-force dedup）。
 //!
 //! # 内存预算
 //!

@@ -2140,9 +2140,59 @@ agent 笔误 / 估算与实测漂移由后续 batch 同步" 同型政策。本 b
 
 **碎裂的常数同步追认**：`n_train` 公式 `K × 100` cap 是 `bucket_table::train_one_street` 内部 [实现] 阶段细化决策（非 D-NNN-revM 修订），与 stage-2 §C-rev1 §1 "C2 [实现] 取舍：cluster_iter ≤ 500 EHS² ≈ equity² 近似" 同型——production 路径（§G-batch1 §3.3 artifact 重训）仍走 4×N 全覆盖，本 cap 仅让 fixture 训练可行。
 
-##### §G-batch1 §3.3..§3.8 + §4：待后续 batch 追加
+##### §G-batch1 §3.3 [实现]（2026-05-11）：CLI `--mode` flag + `TrainingMode` API surface + doc-comment 漂移 carry-forward 修复
 
-- §G-batch1 §3.3 [实现]：`tools/train_bucket_table.rs` 处理 528 MB write + 训练时长 ≤ 120 min release + mini-batch k-means fallback for river（可选）。
+§G-batch1 §3.2 commit `c2a21e6` 后第三步：把 §3.2 cap 关闭机制暴露到 CLI 与 public
+API，让 §3.4 production artifact 重训能走 4×N 全覆盖路径（workflow §3.4 字面）；
+本 §3.3 仅交付 wiring，actual production 重训 + memory feasibility 留 §3.4 实跑。
+
+**核心改动**（6 文件 +138/-31 行）：
+
+1. `src/abstraction/bucket_table.rs`：
+    - 新增 `pub enum TrainingMode { Fixture, Production }`（`#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]`；`Default = Fixture`）。
+    - 新增 `pub fn BucketTable::train_in_memory_with_mode(config, training_seed, evaluator, cluster_iter, mode)` API surface。
+    - 既有 `train_in_memory(...)` 保留 byte-equal 签名 + 行为，改为 forward 到 `_with_mode(..., TrainingMode::Fixture)`。7 处既有 caller（5 tests + 1 bench + 1 CLI 旧入口）byte-equal 不变量保持。
+    - `train_one_street` 加 `mode: TrainingMode` 参数；`n_train` 公式按 mode 分流：`Fixture` = 既有 K×100 cap 公式不变 / `Production` = `4 × N_canonical`（workflow §G-batch1 §3.4 字面 "关闭 K×100 cap 走 4×N 全覆盖"，flop/turn/river → 5.12M / 55.84M / 492.6M candidates）。
+    - `build_bucket_table_bytes` 加 `mode` 参数透传。
+2. `src/lib.rs`：`TrainingMode` 加入 `pub use crate::abstraction::bucket_table::{...}` re-export。
+3. `tools/train_bucket_table.rs`：
+    - 新增 `--mode {fixture,production}` CLI flag，默认 `production`（用户决策：CLI 入口本身为产 artifact 服务，fixture 是测试路径；冷启动不加 flag = production）。`prod` 作为 `production` alias。
+    - 调用从 `BucketTable::train_in_memory(...)` 切到 `BucketTable::train_in_memory_with_mode(..., opts.mode)`。
+    - startup log line 加 `mode={mode:?}` 字段（observability）。
+    - help 文案同步更新 (`--mode <fixture|production>`)。
+4. `src/abstraction/postflop.rs`：§G-batch1 §3.2 commit `c2a21e6` 遗留 doc-comment 漂移 carry-forward 修复（2 处 `**§G-batch1 §3.2 [实现]**` → `§G-batch1 §3.2 \[实现\]`），让 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` gate 全绿。
+5. `src/abstraction/canonical_enum.rs`：§G-batch1 §3.1 commit `2844861` 遗留 doc-comment 漂移 carry-forward 修复（1 处 `§G-batch1 §3.1 [实现]` → `§G-batch1 §3.1 \[实现\]` + 1 处 `[`enumerate_canonical_forms`]` 私函数 doc link → 纯文本表达式）。
+6. `tests/bucket_table_schema_compat.rs`：§G-batch1 §3.2 commit `c2a21e6` 遗留 `cargo fmt --all` 漂移 carry-forward 修复（rustfmt 自动 reformat `assert_eq!` 调用三行展开）。
+
+**vultr 4-core EPYC-Rome 7.7 GB idle box 出口数据**（dev box 1.9 GB RAM OOM 在 river lazy `Vec<u128>` 1.97 GB 时无法跑 release fixture 测试，与 §G-batch1 §3.2 vultr 切换同型）：
+
+- 5 道 gate 全绿：
+    - `cargo fmt --all --check`：OK
+    - `cargo build --all-targets`：OK
+    - `cargo clippy --all-targets -- -D warnings`：OK
+    - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：OK
+    - 4 fixture-heavy release tests byte-equal 与 §G-batch1 §3.2 baseline：
+        - `clustering_determinism`：7 passed / 0 failed / 4 ignored / 33.8 s（含 `clustering_repeat_blake3_byte_equal` fixture BLAKE3 验证）
+        - `bucket_table_schema_compat`：10 / 0 / 0 / 28.9 s（v2 expectations 全套绿）
+        - `bucket_table_corruption`：12 / 0 / 2 / 37.1 s（schema_version=2 同步绿；10-iter smoke + 5 类 BucketTableError variants 全覆盖）
+        - `bucket_quality`：7 / 0 / 13 / 97.8 s（fixture 100/100/100 + 200 iter trained_table + 12 条 quality 门槛仍 `#[ignore]` 指向 §G-batch1 §3.8）
+- **Fixture-mode smoke**：`cargo run --release --bin train_bucket_table -- --mode fixture --flop 10 --turn 10 --river 10 --cluster-iter 100 --output /tmp/smoke_fixture.bin` → 18.4 s wall / 528 MB artifact / BLAKE3 `a6989eeb1dc618ef8a6b375d6af1dcef547a96cdb2c0e84e4b6341562183c2b6` / 0 errors。验证 CLI flag 解析 + dispatch 到 `train_in_memory_with_mode(Fixture)` + 528 MB atomic write + BLAKE3 trailer 全链路。
+- **Production-mode dispatch confirmation**：`cargo run --release --bin train_bucket_table -- --mode production --flop 10 --turn 10 --river 10 --cluster-iter 100 --output /tmp/smoke_production.bin` startup log 显示 `mode=Production`（CLI 解析正确 + dispatch 路径活跃）；end-to-end 因 `n_train = 4 × N` 与 K 无关（K=10 仍触发 4×123M = 492M river candidates）unfeasibly 慢，10+ min 未完成被 kill。Production end-to-end 验证留 §G-batch1 §3.4 实跑（按 workflow §3.4 字面 ~120 min release on vultr 4-core）。
+
+**[实现] 角色边界审计**：本 batch 触 `src/abstraction/bucket_table.rs` + `src/abstraction/postflop.rs` + `src/abstraction/canonical_enum.rs` + `src/lib.rs` + `tools/train_bucket_table.rs`（[实现] 单边）+ `tests/bucket_table_schema_compat.rs`（`cargo fmt --all` 自动 reformat carry-forward；非 logic 改动）+ `docs/pluribus_stage2_workflow.md`（本 entry）+ `CLAUDE.md` 状态翻面。`Cargo.toml` / `Cargo.lock` / `fuzz/` / `proto/` / `benches/` / `tests/api_signatures.rs` / `tests/canonical_observation.rs` / `tests/bucket_quality.rs` / `tests/bucket_table_corruption.rs` / `tests/clustering_determinism.rs` / `tests/perf_slo.rs` / 其它 stage 2 测试 / `pluribus_stage2_decisions.md` / `pluribus_stage2_api.md` / `pluribus_stage2_validation.md` **未修改一行**。
+
+**[实现] 角色边界 carve-out（§G-batch1 §3.3 doc-comment 漂移 carry-forward）**：本 [实现] commit 同步修 `src/abstraction/postflop.rs` (2 处) + `src/abstraction/canonical_enum.rs` (2 处) doc-comment 中 `[实现]` / `[`enumerate_canonical_forms`]` 等 rustdoc 误识别为 doc-link 的语法漂移。**判定为 carry-forward**：漂移源头 §G-batch1 §3.1 commit `2844861` 与 §3.2 commit `c2a21e6` 在 [实现] 当时未跑 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`（CLAUDE.md stage 2 baseline 段字面 "全绿" 是 §3.2 出口未实测的口径漂移）；本 §3.3 commit 必须跑该 gate 以满足 stage 1 + stage 2 既定不退化要求，相伴修复 4 处遗留 doc 警告 + 1 处 `cargo fmt --all` 遗留是最小越界路径。与 stage-2 §F-rev1 §2 "stage 2 closure 期发现既往口径漂移由 closure commit 一并修复" 同形态——口径漂移修复同 commit 闭合。
+
+**碎裂的 [测试] 角色边界 0 越界**：本 batch 0 修改 logic 的测试文件。`tests/bucket_table_schema_compat.rs` 唯一改动是 `cargo fmt --all` 在 5 行块上自动展开 `assert_eq!` 调用（既有 `(expected, 2, "...")` 单行 → 三行展开），非 [测试] role 业务行为变化；与 stage-1 §B-rev1 §3 / stage-2 §C-rev1 §3 / §G-batch1 §3.2 既往 fmt 漂移政策同型继承。
+
+**碎裂的常数同步追认**：`TrainingMode::Production` 公式 `n_train = 4 × N_canonical` 字面继承 workflow §G-batch1 §3.4 "关闭 K×100 cap 走 4×N 全覆盖" 与 D-218-rev2 §8 "4×N candidate per street" 字面；本 [实现] 仅交付 CLI flag 通路，**[实现] 阶段警告**已写入 `TrainingMode::Production` doc-comment：river 4×N ≈ 17 GB f32 训练 set（D-218-rev2 §7 估算）或 ~47 GB f64 实际 `Vec<Vec<f64>>` 占用，超 vultr 4-core 8 GB host 上限——§G-batch1 §3.4 实跑前 [实现] 必须实测取舍（option (a) 切 mini-batch k-means + 流式 feature 计算 / (b) sub-sample river n_train 至 ~20M + 接受部分 coupon 覆盖 / (c) 暴露 canonical-enumeration 逆函数 + 100% 覆盖 + n_train = N）。本 §3.3 closure 不预判取舍，留 §3.4 实跑闭合。
+
+**mini-batch k-means fallback for river（workflow §3.3 字面 "可选"）**：本 §3.3 closure **未交付**——D-218-rev2 §8 估算 river 训练 ~33 min release（cluster_iter=200 / N candidates），3 街合计 ≤ 120 min budget 不依赖 mini-batch；mini-batch 实质是 memory 优化而非 time 优化，本 §3.3 提供 wiring 后由 §3.4 实跑决定是否需要切 mini-batch。与 §3.3 description 字面 "(可选)" 一致。
+
+下一步：§G-batch1 §3.4 [实现]（按 `pluribus_stage2_workflow.md` §G-batch1 §3.3..§3.8 + §4 字面 §3.4 子节）：production artifact 重训（vultr 4-core ~120 min release，`cargo run --release --bin train_bucket_table -- --mode production --flop 500 --turn 500 --river 500 --cluster-iter 10000 --output artifacts/bucket_table_default_500_500_500_seed_cafebabe_v2.bin`，关闭 K×100 cap 走 4×N 全覆盖）+ memory feasibility 实测取舍（option (a)/(b)/(c) 三选一）+ GitHub Release artifact 上传 + BLAKE3 verify + `tools/fetch_bucket_table.sh` 新增 helper + CLAUDE.md ground truth hash 录入。
+
+##### §G-batch1 §3.4..§3.8 + §4：待后续 batch 追加
+
 - §G-batch1 §3.4 [实现]：artifact 重训（vultr 4-core ~120 min release，关闭 K×100 cap 走 4×N 全覆盖）+ GitHub Release 上传 + BLAKE3 录入；`tools/fetch_bucket_table.sh` 新增 helper。
 - §G-batch1 §3.5 [实现]：跨架构 baseline 32-seed × 3 街重生（vultr ~3 h release）。
 - §G-batch1 §3.6 [实现]：D-275 实测取选项 A / B / C；如选项 B 走 stage 1 D-275-rev1 流程。

@@ -39,7 +39,9 @@ pub use crate::abstraction::action::{
     AbstractAction, AbstractActionSet, ActionAbstraction, ActionAbstractionConfig, BetRatio,
     ConfigError, DefaultActionAbstraction,
 };
-pub use crate::abstraction::bucket_table::{BucketConfig, BucketTable, BucketTableError};
+pub use crate::abstraction::bucket_table::{
+    BucketConfig, BucketTable, BucketTableError, TrainingMode,
+};
 pub use crate::abstraction::equity::{EquityCalculator, EquityError, MonteCarloEquity};
 pub use crate::abstraction::info::{BettingState, InfoAbstraction, InfoSetId, StreetTag};
 pub use crate::abstraction::postflop::{canonical_observation_id, PostflopBucketAbstraction};

@@ -221,7 +221,10 @@ fn future_v3_schema_version_is_rejected_with_schema_mismatch() {
 
     match err {
         BucketTableError::SchemaMismatch { expected, got } => {
-            assert_eq!(expected, 2, "expected = 当前 schema_version (§G-batch1 §3.2 bumped)");
+            assert_eq!(
+                expected, 2,
+                "expected = 当前 schema_version (§G-batch1 §3.2 bumped)"
+            );
             assert_eq!(got, 3, "got = 攻击者注入的 v3");
         }
         other => panic!("expected SchemaMismatch {{ expected=2, got=3 }}, got {other:?}"),

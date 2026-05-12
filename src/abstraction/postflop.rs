@@ -24,7 +24,7 @@ use crate::abstraction::preflop::{
 
 /// 每条街联合 (board, hole) canonical observation id 的上界。
 ///
-/// **§G-batch1 §3.2 [实现]**：从 C2 收紧的 FNV-1a hash mod 上界（flop=3K / turn=6K
+/// §G-batch1 §3.2 \[实现\]：从 C2 收紧的 FNV-1a hash mod 上界（flop=3K / turn=6K
 /// / river=10K）切换到 D-218-rev2 §2 实测真等价类数。三常量改为 `pub use` re-export
 /// 自 `crate::abstraction::canonical_enum`，让既有 caller（`tests/canonical_observation.rs`
 /// / `bucket_table.rs` lookup_table 分配）通过本路径无缝切换到真值。
@@ -47,7 +47,7 @@ pub use crate::abstraction::canonical_enum::{
 /// 仅对 `StreetTag::{Flop, Turn, River}` 有效（`board.len() ∈ {3, 4, 5}`）；
 /// `StreetTag::Preflop` 调用 panic（caller 应改用 `canonical_hole_id`）。
 ///
-/// **§G-batch1 §3.2 [实现]**：实现 forward 到
+/// §G-batch1 §3.2 \[实现\]：实现 forward 到
 /// [`crate::abstraction::canonical_enum::canonical_observation_id`]——
 /// D-218-rev2 真等价类枚举（Waugh 2013-style hand isomorphism + colex ranking 3
 /// 街全枚举）。公开签名 byte-equal 不变；返回值数值切换。

@@ -35,6 +35,36 @@ pub struct BucketConfig {
     pub river: u32,
 }
 
+/// 训练模式（§G-batch1 §3.3 \[实现\]）。
+///
+/// 选择 `train_one_street` 内部 candidate 采样数 `n_train` 的公式：
+///
+/// - [`TrainingMode::Fixture`]（默认；§G-batch1 §3.2 落地形态 byte-equal）：
+///   `n_train = max(K × 10, min(4 × N_canonical, K × 100))`。K×100 cap 让 fixture
+///   训练时间与 N 无关，仅与 K 相关（K=10 → 1000；K=100 → 10000；K=500 → 50000）。
+///   所有 stage 2 test fixture + bench 走该路径。覆盖率 K×100/N 极低，剩余
+///   obs_ids 走 Knuth hash fallback；D-236 0 空 bucket 不变量在统计意义上成立。
+/// - [`TrainingMode::Production`]（CLI 默认；workflow §G-batch1 §3.4 字面 "关闭
+///   K×100 cap 走 4×N 全覆盖"）：`n_train = 4 × N_canonical`。N=1.28M / 13.96M /
+///   123M → n_train = 5.12M / 55.84M / 492.6M per street。\[实现\] 阶段警告：
+///   river 4×N ≈ 17 GB f32 训练 set（D-218-rev2 §7 估算）或 ~47 GB f64 实际占用，
+///   超 vultr 4-core 8 GB host 上限——§G-batch1 §3.4 实跑前 \[实现\] 必须实测取舍
+///   （option (a) 切 mini-batch k-means + 流式 feature 计算 / (b) sub-sample river
+///   n_train 至 ~20M + 接受部分 coupon 覆盖 / (c) 暴露 canonical-enumeration 逆
+///   函数 + 100% 覆盖 + n_train = N）。本模式仅提供 CLI flag 通路，实际
+///   feasibility decision 留 §3.4 实跑。
+///
+/// 同 (config, training_seed, evaluator, cluster_iter, mode) 输入下 artifact
+/// byte-equal（D-237）。改 mode 触发不同的 RNG draw 序列 → BLAKE3 漂移。
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+pub enum TrainingMode {
+    /// K×100 cap 公式（fixture / 测试路径）。
+    #[default]
+    Fixture,
+    /// 4×N 全覆盖（CLI production 路径；workflow §G-batch1 §3.4 字面）。
+    Production,
+}
+
 impl BucketConfig {
     /// stage 2 默认验收配置（D-213）：`flop = turn = river = 500`。
     pub const fn default_500_500_500() -> BucketConfig {
@@ -69,7 +99,7 @@ impl BucketConfig {
 pub const BUCKET_TABLE_MAGIC: [u8; 8] = *b"PLBKT\0\0\0";
 /// 当前 schema 版本（D-240 / D-244-rev2）。
 ///
-/// **§G-batch1 §3.2 [实现]**：bump 1 → 2（D-244-rev2 §1 字面 mandate）。v1 artifact
+/// §G-batch1 §3.2 \[实现\]：bump 1 → 2（D-244-rev2 §1 字面 mandate）。v1 artifact
 /// 由 §G-batch1 §3.2 之前的 D-218-rev1 FNV-1a hash mod 设计生成（lookup_table 大小
 /// 3K/6K/10K，canonical_observation_id 走 hash 路径）；v2 artifact 由 §G-batch1
 /// §3.2 之后的 D-218-rev2 真等价类枚举设计生成（lookup_table 大小 1.28M/13.96M/
@@ -216,7 +246,13 @@ impl BucketTable {
     }
 
     /// in-memory 训练（`tools/train_bucket_table.rs` CLI 与 \[测试\] 共享路径）。
-    /// 同 (config, training_seed, evaluator) 输入下 byte-equal（D-237）。
+    /// 同 (config, training_seed, evaluator, cluster_iter) 输入下 byte-equal（D-237）。
+    ///
+    /// §G-batch1 §3.3：`train_in_memory` 走 [`TrainingMode::Fixture`] (K×100 cap
+    /// 公式，与 §G-batch1 §3.2 落地行为 byte-equal)；stage 2 test fixture / bench
+    /// / capture 路径继承既有 byte-equal artifact。CLI production 路径
+    /// (`tools/train_bucket_table.rs --mode production`) 走
+    /// [`BucketTable::train_in_memory_with_mode`] + [`TrainingMode::Production`]。
     ///
     /// `cluster_iter` = MonteCarloEquity 训练时使用的 iter 数（默认 D-220 = 10_000；
     /// 测试加速可降到 200~1_000，特征向量数值噪声相应增大）。
@@ -226,7 +262,28 @@ impl BucketTable {
         evaluator: Arc<dyn HandEvaluator>,
         cluster_iter: u32,
     ) -> BucketTable {
-        let bytes = build_bucket_table_bytes(config, training_seed, evaluator, cluster_iter);
+        Self::train_in_memory_with_mode(
+            config,
+            training_seed,
+            evaluator,
+            cluster_iter,
+            TrainingMode::Fixture,
+        )
+    }
+
+    /// in-memory 训练（显式 [`TrainingMode`]）。详见 [`TrainingMode`] 文档对每个
+    /// 模式 `n_train` 公式与覆盖率取舍的说明。
+    ///
+    /// 同 (config, training_seed, evaluator, cluster_iter, mode) 输入下 byte-equal
+    /// （D-237）；改 mode 触发不同的 RNG draw 序列 → BLAKE3 content_hash 漂移。
+    pub fn train_in_memory_with_mode(
+        config: BucketConfig,
+        training_seed: u64,
+        evaluator: Arc<dyn HandEvaluator>,
+        cluster_iter: u32,
+        mode: TrainingMode,
+    ) -> BucketTable {
+        let bytes = build_bucket_table_bytes(config, training_seed, evaluator, cluster_iter, mode);
         Self::from_bytes(bytes).expect("build_bucket_table_bytes 自洽产物 byte-validate 应成功")
     }
 
@@ -559,12 +616,13 @@ impl BucketTable {
 // ============================================================================
 
 /// 训练并序列化 bucket table 到 in-memory Vec<u8>。同 (config, training_seed,
-/// cluster_iter) 输入产出 byte-equal（D-237）。
+/// cluster_iter, mode) 输入产出 byte-equal（D-237）。
 fn build_bucket_table_bytes(
     config: BucketConfig,
     training_seed: u64,
     evaluator: Arc<dyn HandEvaluator>,
     cluster_iter: u32,
+    mode: TrainingMode,
 ) -> Vec<u8> {
     // 1. 三街独立训练（D-238 多街顺序）。
     let train_flop = train_one_street(
@@ -573,6 +631,7 @@ fn build_bucket_table_bytes(
         training_seed,
         Arc::clone(&evaluator),
         cluster_iter,
+        mode,
     );
     let train_turn = train_one_street(
         StreetTag::Turn,
@@ -580,6 +639,7 @@ fn build_bucket_table_bytes(
         training_seed,
         Arc::clone(&evaluator),
         cluster_iter,
+        mode,
     );
     let train_river = train_one_street(
         StreetTag::River,
@@ -587,6 +647,7 @@ fn build_bucket_table_bytes(
         training_seed,
         Arc::clone(&evaluator),
         cluster_iter,
+        mode,
     );
 
     let n_dims = BUCKET_TABLE_FEATURE_SET_1_DIMS;
@@ -700,6 +761,7 @@ fn train_one_street(
     training_seed: u64,
     evaluator: Arc<dyn HandEvaluator>,
     cluster_iter: u32,
+    mode: TrainingMode,
 ) -> StreetTraining {
     let cluster_op = match street {
         StreetTag::Flop => cluster::rng_substream::CLUSTER_MAIN_FLOP,
@@ -732,29 +794,35 @@ fn train_one_street(
         StreetTag::Preflop => unreachable!(),
     };
 
-    // 1. 候选 sample：`n_train = max(K × 10, min(4 × N_canonical, K × 100))`。
+    // 1. 候选 sample：`n_train` 由 [`TrainingMode`] 选公式（§G-batch1 §3.3）。
     //
-    // **§G-batch1 §3.2 [实现] 修正**：原 `n_train = max(K × 10, 4 × N_canonical)`
-    // 在 D-218-rev1 hash mod 路径下（N=3K/6K/10K）取值合理；但 D-218-rev2 真等价类
-    // 枚举（N=1.28M/13.96M/123M）下 4×N=5.12M/55.84M/492.6M 大幅超 fixture 训练预算。
-    // 本 §3.2 引入 `cap = K × 100` 上界，让 fixture 训练时间与 N 无关（仅与 K 相关）。
-    // 实际生效：
+    // - [`TrainingMode::Fixture`]（§G-batch1 §3.2 落地形态 byte-equal）：
+    //   `n_train = max(K × 10, min(4 × N_canonical, K × 100))`。K×100 cap 让
+    //   fixture 训练时间与 N 无关，仅与 K 相关：
     //
-    //   - K=10  → n_train = max(100, min(4N, 1000))   = 1000（fixture / 10/10/10）
-    //   - K=100 → n_train = max(1000, min(4N, 10000)) = 10000（小 fixture）
-    //   - K=500 → n_train = max(5000, min(4N, 50000)) = 50000（D-218-rev2 默认 prod）
+    //     K=10  → n_train = max(100, min(4N, 1000))   = 1000（fixture / 10/10/10）
+    //     K=100 → n_train = max(1000, min(4N, 10000)) = 10000（小 fixture）
+    //     K=500 → n_train = max(5000, min(4N, 50000)) = 50000（fixture 边界）
     //
-    // **覆盖率影响**：K × 100 candidates → 命中 ≈ K × 100 个 obs_id（每个最多被
-    // 1 次命中，因 D-218-rev2 真等价类下 obs_id 唯一）。覆盖率 = K × 100 / N 极低
-    // （K=500 / N=123M → 0.04%）。剩余 obs_ids 走 Knuth hash 落到 K 个 bucket（与
-    // §G-batch1 §3.2 之前 hash mod 路径下未命中 obs_id 处理同形态；D-236 0 空
-    // bucket 不变量在统计意义上成立）。
+    //   覆盖率 K × 100 / N 极低（K=500 / N=123M → 0.04%）；剩余 obs_ids 走 Knuth
+    //   hash fallback；D-236 0 空 bucket 不变量在统计意义上成立。
     //
-    // **§G-batch1 §3.4+ [实现]**：production 路径需走 mini-batch k-means + 全 N
-    // 候选 enumeration 以达成 D-218-rev2 §3 "唯一性（新）" 与 bucket 质量门槛；
-    // 本 §3.2 cap 仅让 fixture 训练与 schema_compat / corruption 验证可行。
-    let n_train: usize =
-        ((bucket_count as usize) * 10).max(((n_canonical as usize) * 4).min((bucket_count as usize) * 100));
+    // - [`TrainingMode::Production`]（workflow §G-batch1 §3.4 字面 "关闭 K×100
+    //   cap 走 4×N 全覆盖"）：`n_train = 4 × N_canonical`：
+    //
+    //     flop  → 4 × 1,286,792   = 5,147,168
+    //     turn  → 4 × 13,960,050  = 55,840,200
+    //     river → 4 × 123,156,254 = 492,625,016
+    //
+    //   river 4×N feature memory ~17 GB f32（D-218-rev2 §7 估算）或 ~47 GB 实际
+    //   `Vec<Vec<f64>>` 占用 → 超 vultr 4-core 8 GB host 上限。§G-batch1 §3.4
+    //   实跑前必须实测取舍（mini-batch k-means / sub-sample / canonical enumerate
+    //   inverse）；本 §3.3 仅提供 CLI flag 通路。
+    let n_train: usize = match mode {
+        TrainingMode::Fixture => ((bucket_count as usize) * 10)
+            .max(((n_canonical as usize) * 4).min((bucket_count as usize) * 100)),
+        TrainingMode::Production => (n_canonical as usize) * 4,
+    };
     let mut sample_rng = ChaCha20Rng::from_seed(cluster::rng_substream::derive_substream_seed(
         training_seed,
         cluster_op,
