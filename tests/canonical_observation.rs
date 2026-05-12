@@ -33,7 +33,8 @@
 use std::collections::HashSet;
 
 use poker::abstraction::canonical_enum::{
-    N_CANONICAL_OBSERVATION_FLOP, N_CANONICAL_OBSERVATION_RIVER, N_CANONICAL_OBSERVATION_TURN,
+    nth_canonical_form, N_CANONICAL_OBSERVATION_FLOP, N_CANONICAL_OBSERVATION_RIVER,
+    N_CANONICAL_OBSERVATION_TURN,
 };
 use poker::rng_substream::{derive_substream_seed, EQUITY_MONTE_CARLO};
 use poker::{canonical_observation_id, Card, ChaCha20Rng, Rank, RngSource, StreetTag, Suit};
@@ -669,4 +670,130 @@ fn canonical_observation_id_full_flop_enumeration_exactly_n_flop_distinct() {
         N_CANONICAL_OBSERVATION_FLOP - 1,
         "D-218-rev2 §3 稠密性（flop）：max canonical_id = N_FLOP - 1（id ∈ [0, N) 全覆盖）"
     );
+}
+
+// ============================================================================
+// 7. nth_canonical_form 逆函数 round-trip（§G-batch1 §3.4 [实现] 新增）
+// ============================================================================
+//
+// `nth_canonical_form(street, id) → (board, hole)` 是 [`canonical_observation_id`]
+// 的反函数（D-218-rev2 §3）。本节断言：
+//
+// 1. **Round-trip 等价**：`canonical_observation_id(street, board, hole) == id`
+//    对任意 id ∈ [0, N) 成立。
+// 2. **panics on preflop / out-of-range id**：与 forward 函数同型前置条件。
+// 3. **Flop 全枚举 round-trip**：枚举 id ∈ [0, N_FLOP) → 解码 → 再编码 → 全套
+//    byte-equal（exhaustive ground truth；`#[ignore]` opt-in）。
+//
+// 用途（§G-batch1 §3.4 [实现] dual-phase production training）：phase 2 100%
+// canonical 覆盖路径要求逆函数稳定可靠；本节是该路径的 regression guard。
+//
+// **内存约束**：flop ~20 MB lazy table；turn ~224 MB；river ~1.97 GB——river
+// round-trip 测试 `#[ignore]` 标记，仅 ≥ 4 GB host (vultr / CI) 上跑。
+
+/// flop nth_canonical_form 与 canonical_observation_id round-trip（1K 随机 id 抽样）。
+#[test]
+fn nth_canonical_form_round_trip_random_1k_flop() {
+    let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+        0xD218_F00D_CAFE_0001,
+        EQUITY_MONTE_CARLO,
+        0,
+    ));
+    for _ in 0..1_000 {
+        let id = (rng.next_u64() % (N_CANONICAL_OBSERVATION_FLOP as u64)) as u32;
+        let (board, hole) = nth_canonical_form(StreetTag::Flop, id);
+        assert_eq!(board.len(), 3, "flop board.len() == 3");
+        let round = canonical_observation_id(StreetTag::Flop, &board, hole);
+        assert_eq!(
+            round, id,
+            "flop nth_canonical_form round-trip mismatch for id {id}: got {round}"
+        );
+    }
+}
+
+/// turn nth_canonical_form round-trip（1K 随机 id；turn lazy table ~224 MB build）。
+#[test]
+fn nth_canonical_form_round_trip_random_1k_turn() {
+    let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+        0xD218_F00D_CAFE_0002,
+        EQUITY_MONTE_CARLO,
+        0,
+    ));
+    for _ in 0..1_000 {
+        let id = (rng.next_u64() % (N_CANONICAL_OBSERVATION_TURN as u64)) as u32;
+        let (board, hole) = nth_canonical_form(StreetTag::Turn, id);
+        assert_eq!(board.len(), 4, "turn board.len() == 4");
+        let round = canonical_observation_id(StreetTag::Turn, &board, hole);
+        assert_eq!(
+            round, id,
+            "turn nth_canonical_form round-trip mismatch for id {id}: got {round}"
+        );
+    }
+}
+
+/// river nth_canonical_form round-trip（1K 随机 id）。
+///
+/// **`#[ignore]`**：river lazy table ~1.97 GB build → dev box (< 4 GB RAM) OOM；
+/// 仅 vultr / CI / 高内存 dev box 上 `cargo test --release -- --ignored` 触发。
+#[test]
+#[ignore = "river lazy table ~1.97 GB build; ≥ 4 GB host (vultr/CI) opt-in"]
+fn nth_canonical_form_round_trip_random_1k_river() {
+    let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+        0xD218_F00D_CAFE_0003,
+        EQUITY_MONTE_CARLO,
+        0,
+    ));
+    for _ in 0..1_000 {
+        let id = (rng.next_u64() % (N_CANONICAL_OBSERVATION_RIVER as u64)) as u32;
+        let (board, hole) = nth_canonical_form(StreetTag::River, id);
+        assert_eq!(board.len(), 5, "river board.len() == 5");
+        let round = canonical_observation_id(StreetTag::River, &board, hole);
+        assert_eq!(
+            round, id,
+            "river nth_canonical_form round-trip mismatch for id {id}: got {round}"
+        );
+    }
+}
+
+/// 边界 id 0 与 N - 1 round-trip（flop）。
+#[test]
+fn nth_canonical_form_round_trip_boundary_ids_flop() {
+    for &id in &[0u32, N_CANONICAL_OBSERVATION_FLOP - 1] {
+        let (board, hole) = nth_canonical_form(StreetTag::Flop, id);
+        let round = canonical_observation_id(StreetTag::Flop, &board, hole);
+        assert_eq!(round, id, "flop boundary id {id} round-trip mismatch");
+    }
+}
+
+/// preflop nth_canonical_form panic（前置条件断言；与 canonical_observation_id 同型）。
+#[test]
+#[should_panic]
+fn nth_canonical_form_preflop_panics() {
+    let _ = nth_canonical_form(StreetTag::Preflop, 0);
+}
+
+/// 越界 id panic（flop id = N_FLOP）。
+#[test]
+#[should_panic]
+fn nth_canonical_form_out_of_range_id_panics_flop() {
+    let _ = nth_canonical_form(StreetTag::Flop, N_CANONICAL_OBSERVATION_FLOP);
+}
+
+/// Flop 全枚举 round-trip（id 0..N_FLOP 各 decode → encode 应字节等价）。
+///
+/// 与 `canonical_observation_id_full_flop_enumeration_exactly_n_flop_distinct`
+/// 互补：那个测试枚举 26M (board, hole) → 验证 distinct count；本测试枚举 1.28M
+/// canonical id → 验证逆函数 round-trip。
+///
+/// **`#[ignore]`**：1.28M decode × pack ≈ ~3 s release on 1-CPU host；`cargo test
+/// --release -- --ignored` opt-in（与 stage-2 §C2 / §D2 / §F1 + §G-batch1 §2
+/// double-ignore opt-in 同形态）。
+#[test]
+#[ignore = "release/--ignored opt-in（~3 s release + 1.28M canonical_id 全覆盖）"]
+fn nth_canonical_form_full_flop_enumeration_round_trip() {
+    for id in 0..N_CANONICAL_OBSERVATION_FLOP {
+        let (board, hole) = nth_canonical_form(StreetTag::Flop, id);
+        let round = canonical_observation_id(StreetTag::Flop, &board, hole);
+        assert_eq!(round, id, "flop full enum round-trip mismatch at id {id}");
+    }
 }

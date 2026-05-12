@@ -222,6 +222,107 @@ pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 
 }
 
 // ============================================================================
+// nth_canonical_form：canonical id → 具体 (board, hole) 代表（D-218-rev2 §3）
+// ============================================================================
+
+/// 反函数：给定 `street` 与 canonical id ∈ `[0, N)`，返回该 canonical 等价类
+/// 的一个具体 (board, hole) representative。round-trip 与 [`canonical_observation_id`]
+/// 等价（debug_assert）。
+///
+/// 适用 `StreetTag::{Flop, Turn, River}`；preflop / id ≥ N panic。
+///
+/// **representative 选择规则**：把 canonical suit slot 0/1/2/3（pack key 中按
+/// (b_count, h_count, b_mask, h_mask) 字典序排序后的位置）按位映射到真实 suit
+/// 0/1/2/3——同一等价类内多个真实 (board, hole) 都映射到同一 canonical id，
+/// 本函数选取 canonical slot 与 real suit 一一对齐的那个 representative。
+///
+/// **用途**（§G-batch1 §3.4 \[实现\] dual-phase production training）：phase 2 100%
+/// canonical 覆盖路径——为每个 canonical id 解码出一张实际 (board, hole)，计算
+/// features，分配到最近 centroid，让 `BucketTable::lookup_table` 不再依赖 Knuth
+/// hash fallback。
+pub fn nth_canonical_form(street: StreetTag, id: u32) -> (Vec<Card>, [Card; 2]) {
+    if matches!(street, StreetTag::Preflop) {
+        panic!(
+            "nth_canonical_form called with StreetTag::Preflop; preflop canonical id is hole-only \
+             via canonical_hole_id (D-218-rev2 §2)"
+        );
+    }
+    let table = lazy_table(street);
+    let n = table.len();
+    assert!(
+        (id as usize) < n,
+        "nth_canonical_form: id {id} >= N_canonical_observation = {n} for street {street:?}"
+    );
+    let key: u128 = table[id as usize];
+    let board_size: usize = match street {
+        StreetTag::Flop => 3,
+        StreetTag::Turn => 4,
+        StreetTag::River => 5,
+        StreetTag::Preflop => unreachable!(),
+    };
+
+    let mut board: Vec<Card> = Vec::with_capacity(board_size);
+    let mut hole_buf: Vec<Card> = Vec::with_capacity(2);
+
+    // 4 个 canonical suit slot 按 MSB→LSB 在 u128 中排布（slot 0 在 bit 96..128，
+    // slot 3 在 bit 0..32）。每 slot 32-bit 按 [unused(1) | b_count(3) | h_count(2)
+    // | b_mask(13) | h_mask(13)] 高到低排布。
+    for slot in 0u32..4 {
+        let shift: u32 = 32 * (3 - slot);
+        let chunk: u32 = ((key >> shift) & 0xFFFF_FFFF) as u32;
+        let b_count: u8 = ((chunk >> 28) & 0x7) as u8;
+        let h_count: u8 = ((chunk >> 26) & 0x3) as u8;
+        let b_mask: u16 = ((chunk >> 13) & 0x1FFF) as u16;
+        let h_mask: u16 = (chunk & 0x1FFF) as u16;
+        debug_assert_eq!(
+            b_mask.count_ones() as u8,
+            b_count,
+            "nth_canonical_form: slot {slot} b_count/b_mask mismatch"
+        );
+        debug_assert_eq!(
+            h_mask.count_ones() as u8,
+            h_count,
+            "nth_canonical_form: slot {slot} h_count/h_mask mismatch"
+        );
+
+        // canonical slot 编号 0..3 直接映射到真实 suit 0..3。
+        let suit_u8: u8 = slot as u8;
+        for rank in 0u8..13 {
+            if (b_mask >> rank) & 1 == 1 {
+                let card_u8: u8 = rank * 4 + suit_u8;
+                board.push(Card::from_u8(card_u8).expect("rank<13 + suit<4 → card<52"));
+            }
+            if (h_mask >> rank) & 1 == 1 {
+                let card_u8: u8 = rank * 4 + suit_u8;
+                hole_buf.push(Card::from_u8(card_u8).expect("rank<13 + suit<4 → card<52"));
+            }
+        }
+    }
+
+    assert_eq!(
+        board.len(),
+        board_size,
+        "nth_canonical_form: board enumeration produced {} cards, expected {board_size}",
+        board.len()
+    );
+    assert_eq!(
+        hole_buf.len(),
+        2,
+        "nth_canonical_form: hole enumeration produced {} cards, expected 2",
+        hole_buf.len()
+    );
+    let hole: [Card; 2] = [hole_buf[0], hole_buf[1]];
+
+    debug_assert_eq!(
+        canonical_observation_id(street, &board, hole),
+        id,
+        "nth_canonical_form: round-trip mismatch for id {id} street {street:?}"
+    );
+
+    (board, hole)
+}
+
+// ============================================================================
 // 枚举 + 构表
 // ============================================================================
 

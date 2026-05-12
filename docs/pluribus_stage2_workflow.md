@@ -2191,9 +2191,109 @@ API，让 §3.4 production artifact 重训能走 4×N 全覆盖路径（workflow
 
 下一步：§G-batch1 §3.4 [实现]（按 `pluribus_stage2_workflow.md` §G-batch1 §3.3..§3.8 + §4 字面 §3.4 子节）：production artifact 重训（vultr 4-core ~120 min release，`cargo run --release --bin train_bucket_table -- --mode production --flop 500 --turn 500 --river 500 --cluster-iter 10000 --output artifacts/bucket_table_default_500_500_500_seed_cafebabe_v2.bin`，关闭 K×100 cap 走 4×N 全覆盖）+ memory feasibility 实测取舍（option (a)/(b)/(c) 三选一）+ GitHub Release artifact 上传 + BLAKE3 verify + `tools/fetch_bucket_table.sh` 新增 helper + CLAUDE.md ground truth hash 录入。
 
-##### §G-batch1 §3.4..§3.8 + §4：待后续 batch 追加
+##### §G-batch1 §3.4-batch1 [实现]（2026-05-12）：dual-phase 训练实现（canonical-inverse + 100% canonical 覆盖）
 
-- §G-batch1 §3.4 [实现]：artifact 重训（vultr 4-core ~120 min release，关闭 K×100 cap 走 4×N 全覆盖）+ GitHub Release 上传 + BLAKE3 录入；`tools/fetch_bucket_table.sh` 新增 helper。
+§G-batch1 §3.3 commit `7e2bd2e` 后第四步——§3.4 计划字面 "关闭 K×100 cap 走 4×N
+全覆盖" 经 [实现] 阶段实测预算判定为 vultr OOM 不可行（river 4×N ≈ 492M
+candidates × ~120 bytes ≈ 47 GB → 远超 7.7 GB host），按 D-244-rev2 §5 footnote
+"option (c) canonical-enumeration inverse + 100% 覆盖" 实测路径替代。本 batch1
+是 §3.4 实现拆分的第一部分：交付 dual-phase 训练代码 + canonical inverse 函数 +
+round-trip 单元测试。§3.4-batch2 落地 production artifact 重训 + GitHub Release
+上传 + BLAKE3 录入。
+
+**核心改动**（3 文件 +260/-31 行）：
+
+1. `src/abstraction/canonical_enum.rs`：
+    - 新增 `pub fn nth_canonical_form(street, id) -> (Vec<Card>, [Card; 2])` 逆函数：
+      给定 canonical id ∈ [0, N)，解码 sorted `Vec<u128>` table 第 id 个 canonical
+      form key 为具体 (board, hole) representative。decode 流程：u128 → 4 个
+      canonical suit slot × (b_count, h_count, b_mask, h_mask) → 把 canonical
+      slot 0/1/2/3 顺序映射到真实 suit 0/1/2/3 → 按 b_mask / h_mask bit 位置
+      emit Card(rank, suit)。debug_assert round-trip：`canonical_observation_id
+      (street, board, hole) == id`。preflop / id ≥ N panic。
+    - 用途：§G-batch1 §3.4 dual-phase production training phase 2 100% canonical
+      覆盖路径——逐 id 解码 → 计算 feature → 分配到最近 centroid，让
+      `BucketTable::lookup_table` 不再依赖 Knuth hash fallback（D-218-rev1 hash
+      mod 路径的 quality gate 失败根因）。
+2. `src/abstraction/bucket_table.rs`：
+    - 新增 `pub const PRODUCTION_PHASE1_MAX_SAMPLES: usize = 2_000_000`：Production
+      mode phase 1 candidate cap（feature memory ≤ 2M × ~120 bytes ≈ 240 MB peak，
+      在 vultr 7.7 GB host 内）。
+    - `train_one_street::n_train` Production 公式从 §3.3 的 `4 × N`（OOM）改为
+      `min(N_canonical, 2_000_000)`：phase 1 在 ≤ 2M 候选子集上跑 k-means → 得到
+      K centroids（flop 1.28M 全覆盖 / turn / river 子集 2M）。
+    - `train_one_street::6 构建 lookup_table` 段按 `TrainingMode` 分流：
+      - `Fixture`：既有 sample-assignment + Knuth hash fallback 路径 byte-equal。
+      - `Production`：枚举 id ∈ [0, N)，`canonical_enum::nth_canonical_form` 解码
+        → 同 phase 1 pipeline 计算 feature（EHS² + OCHS₈ = 9 dim） + 相同
+        op_ids（`EHS2_INNER_EQUITY_<street>` + `OCHS_FEATURE_INNER`）以 `id` 作
+        ramp → L2 距离搜索 K 个 post-reorder f64 centroids → lookup_table[id] =
+        nearest_centroid_id。100% canonical 覆盖，无 Knuth hash fallback。
+    - `TrainingMode::Production` 文档更新：从 "4×N 全覆盖" 改为 "dual-phase
+      canonical-inverse + 100% 覆盖"；引用 D-244-rev2 §5 footnote option (c)。
+3. `tests/canonical_observation.rs`：节 7 新增 6 条 `nth_canonical_form` round-trip 单元测试：
+    - active：`nth_canonical_form_round_trip_random_1k_flop` / `_turn`（1K 随机 id 抽样）/
+      `_boundary_ids_flop`（id=0 与 N-1） / `_preflop_panics` / `_out_of_range_id_panics_flop`
+    - `#[ignore]`（vultr / ≥ 4 GB host opt-in）：`_round_trip_random_1k_river`（river
+      lazy 1.97 GB build）/ `_full_flop_enumeration_round_trip`（1.28M 全枚举 ~3 s release）
+
+**Vultr 4-core EPYC-Rome 7.7 GB idle box 5 道 gate 全绿**：
+
+- `cargo fmt --all --check`：OK
+- `cargo build --all-targets`：OK
+- `cargo clippy --all-targets -- -D warnings`：OK
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`：OK
+- 4 fixture-heavy release tests byte-equal 与 §G-batch1 §3.3 baseline（Fixture
+  path 0 logic 改动，K×100 cap 公式 byte-equal；artifact BLAKE3 验证）：
+    - `clustering_determinism`：7 passed / 0 failed / 4 ignored / 27.5 s
+    - `bucket_table_schema_compat`：10 / 0 / 0 / 21.8 s
+    - `bucket_table_corruption`：12 / 0 / 2（未单独 grep；4-crate 合计 wall 185 s 与 §3.3 baseline 197 s 吻合）
+    - `bucket_quality`：7 / 0 / 13（同上）
+- **River canonical inverse round-trip opt-in**：`cargo test --release --test
+  canonical_observation -- --ignored nth_canonical_form_round_trip_random_1k_river`
+  → 1 passed / 6.31 s（river lazy 1.97 GB build hot cache）
+
+**dev box 1.9 GB 出口数据**（限 active 路径；river / `#[ignore]` 路径走 vultr）：
+canonical_observation_id 节 7 active 5 tests passed / 2 ignored / 22 s debug。
+
+**[实现] 角色边界审计**：本 batch 触 `src/abstraction/canonical_enum.rs`（新增
+inverse 函数）+ `src/abstraction/bucket_table.rs`（[实现] 单边 dual-phase 落地）
++ `tests/canonical_observation.rs`（[测试] 角色越界 carve-out：新增 6 条 round-
+trip 单元测试），与 stage-2 §B-rev1 §3 / §F-rev0 §1 / §G-batch1 §3.2 同 commit
+新增测试 carve-out 同形态——既有 D-218-rev2 §3 真等价类契约不可在 [测试] 角色
+单独 PR 中提前钉死（依赖逆函数实现），由 [实现] commit 同步落地最小越界路径。
+其它源 / 文档 / 配置文件 **未修改一行**。
+
+**碎裂的常数同步追认**：`PRODUCTION_PHASE1_MAX_SAMPLES = 2_000_000` 是
+`bucket_table` 内部 [实现] 阶段细化决策（非 D-NNN-revM 修订），与 stage-2
+§C-rev1 §1 "C2 [实现] 取舍：cluster_iter ≤ 500 EHS² ≈ equity² 近似" / §G-batch1
+§3.2 "n_train K × 100 cap" 同型；§3.4-batch2 production 实跑前可基于 vultr
+memory 实测调整（向下到 1M 或向上到 4M），不触发 D-NNN-revM 翻译。
+
+**§3.4 计划字面 "关闭 K×100 cap 走 4×N 全覆盖" 修订追认**：workflow §3.4
+description line 字面要求 [实现] 阶段走 4×N，但 [实现] 实测 vultr OOM 不可行
+（river 47 GB > 7.7 GB host）；按 D-244-rev2 §5 footnote 明示 "(c) canonical-
+enumeration inverse + 100% 覆盖 + n_train = N" 选项替代，达成 D-218-rev2 §3
+"唯一性（新）" + "稠密性" 双重不变量。§3.4 字面 "4×N 全覆盖" 由本 batch1
+[实现] 取舍记录追认为 "dual-phase canonical-inverse + 100% 覆盖"（语义同——
+两者目标都是无 Knuth hash fallback 的 100% canonical 覆盖；实现差异仅在 phase
+1 sample 数：4×N 全 + memory 不可行 vs sub-sample + phase 2 enumerate-assign 可
+行）。与 stage-2 §C-rev0 / §C-rev1 工程取舍记录（D-221 字面 "EHS²" 在 fixture
+路径改 EHS² ≈ equity²）同形态。
+
+下一步：§G-batch1 §3.4-batch2 [实现]（按 `pluribus_stage2_workflow.md` §G-batch1
+§3.4 字面其余 deliverables）：(a) production artifact 重训 on vultr 4-core
+（`cargo run --release --bin train_bucket_table -- --mode production --flop 500
+--turn 500 --river 500 --cluster-iter <T> --output artifacts/bucket_table_default
+_500_500_500_seed_cafebabe_v2.bin`；cluster_iter 选择由 vultr 实测决定，目标 ≤
+120 min wall）；(b) artifact whole-file b3sum + `BucketTable::content_hash()`
+录入 CLAUDE.md ground truth；(c) artifact 上传 GitHub Release tag `stage2-d218-
+rev2` 或 `stage2-v1.1`；(d) `tools/fetch_bucket_table.sh` 新增 helper（curl +
+BLAKE3 verify + cache 到 `artifacts/`）。
+
+##### §G-batch1 §3.5..§3.8 + §4：待后续 batch 追加
+
+- §G-batch1 §3.4 [实现]：（已被 §3.4-batch1 + 待落地 §3.4-batch2 覆盖；见上述记录）。
 - §G-batch1 §3.5 [实现]：跨架构 baseline 32-seed × 3 街重生（vultr ~3 h release）。
 - §G-batch1 §3.6 [实现]：D-275 实测取选项 A / B / C；如选项 B 走 stage 1 D-275-rev1 流程。
 - §G-batch1 §3.7 [实现]：`tools/bucket_table_reader.py` Python reader schema=2 解析路径 + 精确 N 值断言。

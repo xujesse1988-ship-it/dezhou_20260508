@@ -13,6 +13,7 @@ use blake3;
 use thiserror::Error;
 
 use crate::abstraction::action::ConfigError;
+use crate::abstraction::canonical_enum;
 use crate::abstraction::cluster::{
     self, kmeans_fit, quantize_centroids_u8, reorder_by_ehs_median, KMeansConfig,
 };
@@ -35,33 +36,44 @@ pub struct BucketConfig {
     pub river: u32,
 }
 
-/// 训练模式（§G-batch1 §3.3 \[实现\]）。
+/// 训练模式（§G-batch1 §3.3 \[实现\] 引入 enum；§G-batch1 §3.4 \[实现\] dual-phase
+/// 实现）。
 ///
-/// 选择 `train_one_street` 内部 candidate 采样数 `n_train` 的公式：
+/// 选择 `train_one_street` 的执行 pipeline：
 ///
-/// - [`TrainingMode::Fixture`]（默认；§G-batch1 §3.2 落地形态 byte-equal）：
-///   `n_train = max(K × 10, min(4 × N_canonical, K × 100))`。K×100 cap 让 fixture
-///   训练时间与 N 无关，仅与 K 相关（K=10 → 1000；K=100 → 10000；K=500 → 50000）。
-///   所有 stage 2 test fixture + bench 走该路径。覆盖率 K×100/N 极低，剩余
-///   obs_ids 走 Knuth hash fallback；D-236 0 空 bucket 不变量在统计意义上成立。
-/// - [`TrainingMode::Production`]（CLI 默认；workflow §G-batch1 §3.4 字面 "关闭
-///   K×100 cap 走 4×N 全覆盖"）：`n_train = 4 × N_canonical`。N=1.28M / 13.96M /
-///   123M → n_train = 5.12M / 55.84M / 492.6M per street。\[实现\] 阶段警告：
-///   river 4×N ≈ 17 GB f32 训练 set（D-218-rev2 §7 估算）或 ~47 GB f64 实际占用，
-///   超 vultr 4-core 8 GB host 上限——§G-batch1 §3.4 实跑前 \[实现\] 必须实测取舍
-///   （option (a) 切 mini-batch k-means + 流式 feature 计算 / (b) sub-sample river
-///   n_train 至 ~20M + 接受部分 coupon 覆盖 / (c) 暴露 canonical-enumeration 逆
-///   函数 + 100% 覆盖 + n_train = N）。本模式仅提供 CLI flag 通路，实际
-///   feasibility decision 留 §3.4 实跑。
+/// - [`TrainingMode::Fixture`]（默认；§G-batch1 §3.2 落地形态 byte-equal）：单
+///   phase 路径——`n_train = max(K × 10, min(4 × N_canonical, K × 100))`，K×100
+///   cap 让 fixture 训练时间与 N 无关，仅与 K 相关（K=10 → 1000；K=100 → 10000；
+///   K=500 → 50000）。stage 2 test fixture / bench / capture 路径走该模式。
+///   覆盖率 K×100/N 极低（K=500 / N=123M → 0.04%）；剩余 obs_ids 走 Knuth hash
+///   fallback；D-236 0 空 bucket 不变量在统计意义上成立。
+/// - [`TrainingMode::Production`]（CLI 默认；§G-batch1 §3.4 dual-phase 实现）：
+///   两 phase 路径——
+///   - Phase 1：`n_train = min(N_canonical, [`PRODUCTION_PHASE1_MAX_SAMPLES`] =
+///     2_000_000)` 随机采样 → 计算 features → k-means → K centroids。
+///   - Phase 2：枚举每个 canonical_id ∈ \[0, N) → [`canonical_enum::nth_canonical_form`]
+///     逆函数解码 → 计算 feature → 分配到最近 centroid → lookup_table\[id\] =
+///     nearest_centroid_id。100% canonical 覆盖，无 Knuth hash fallback；
+///     bucket_quality 4 类门槛（path.md 字面 EHS std dev / EMD / monotonicity /
+///     0 空 bucket）由 proper k-means assignment 保障。
+///
+///   Phase 1 features memory 上限 ~240 MB（2M samples × ~120 bytes）；phase 2 单
+///   sample feature 临时占用；total ~3 GB peak（含 canonical_enum lazy table）
+///   在 vultr 7.7 GB host 内。详见 [`PRODUCTION_PHASE1_MAX_SAMPLES`] 文档。
+///
+///   §G-batch1 §3.3 commit `7e2bd2e` 历史 `n_train = 4 × N`（unfeasibly OOM on
+///   vultr）被本 §3.4 \[实现\] 修订为 dual-phase + cap；D-244-rev2 §5 footnote
+///   "option (c) canonical-enumeration inverse + 100% 覆盖" 实测路径。
 ///
 /// 同 (config, training_seed, evaluator, cluster_iter, mode) 输入下 artifact
-/// byte-equal（D-237）。改 mode 触发不同的 RNG draw 序列 → BLAKE3 漂移。
+/// byte-equal（D-237）。改 mode 触发不同 RNG draw 序列 → BLAKE3 漂移。
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub enum TrainingMode {
-    /// K×100 cap 公式（fixture / 测试路径）。
+    /// 单 phase K×100 cap 公式（fixture / 测试路径）。
     #[default]
     Fixture,
-    /// 4×N 全覆盖（CLI production 路径；workflow §G-batch1 §3.4 字面）。
+    /// Dual-phase canonical-inverse + 100% canonical 覆盖（CLI production 路径；
+    /// §G-batch1 §3.4 实现）。
     Production,
 }
 
@@ -794,7 +806,7 @@ fn train_one_street(
         StreetTag::Preflop => unreachable!(),
     };
 
-    // 1. 候选 sample：`n_train` 由 [`TrainingMode`] 选公式（§G-batch1 §3.3）。
+    // 1. 候选 sample：`n_train` 由 [`TrainingMode`] 选公式（§G-batch1 §3.3 / §3.4）。
     //
     // - [`TrainingMode::Fixture`]（§G-batch1 §3.2 落地形态 byte-equal）：
     //   `n_train = max(K × 10, min(4 × N_canonical, K × 100))`。K×100 cap 让
@@ -807,28 +819,48 @@ fn train_one_street(
     //   覆盖率 K × 100 / N 极低（K=500 / N=123M → 0.04%）；剩余 obs_ids 走 Knuth
     //   hash fallback；D-236 0 空 bucket 不变量在统计意义上成立。
     //
-    // - [`TrainingMode::Production`]（workflow §G-batch1 §3.4 字面 "关闭 K×100
-    //   cap 走 4×N 全覆盖"）：`n_train = 4 × N_canonical`：
+    // - [`TrainingMode::Production`]（§G-batch1 §3.4 dual-phase memory feasibility
+    //   option (c)：canonical-inverse + dual-phase）：
+    //   `n_train = min(N_canonical, PRODUCTION_PHASE1_MAX_SAMPLES = 2_000_000)`。
+    //   Phase 1 在 ≤ 2M 候选子集上跑 k-means → 得到 K 个 centroids；Phase 2 枚举
+    //   全 N canonical_ids（[`nth_canonical_form`] 逆函数解码）→ 计算 feature →
+    //   分配到最近 centroid → 100% canonical 覆盖（无 Knuth hash fallback）。
     //
-    //     flop  → 4 × 1,286,792   = 5,147,168
-    //     turn  → 4 × 13,960,050  = 55,840,200
-    //     river → 4 × 123,156,254 = 492,625,016
+    //     flop  → n_train = 1,286,792（全覆盖，等价于 phase 1 + phase 2 同集合）
+    //     turn  → n_train = 2,000,000（phase 1 子集；phase 2 覆盖剩余 11.96M）
+    //     river → n_train = 2,000,000（phase 1 子集；phase 2 覆盖剩余 121.16M）
     //
-    //   river 4×N feature memory ~17 GB f32（D-218-rev2 §7 估算）或 ~47 GB 实际
-    //   `Vec<Vec<f64>>` 占用 → 超 vultr 4-core 8 GB host 上限。§G-batch1 §3.4
-    //   实跑前必须实测取舍（mini-batch k-means / sub-sample / canonical enumerate
-    //   inverse）；本 §3.3 仅提供 CLI flag 通路。
+    //   Phase 1 features memory: 2M × ~120 bytes ≈ 240 MB peak；phase 2 单 sample
+    //   feature 临时占用，bounded RAM。Total ~3 GB peak（含 canonical_enum lazy
+    //   table）在 vultr 7.7 GB host 内。
+    //
+    //   §G-batch1 §3.3 commit `7e2bd2e` 历史形态 `n_train = 4 × N`（unfeasibly OOM
+    //   on vultr）被本 §3.4 [实现] 修订为 `min(N, 2M)`。
     let n_train: usize = match mode {
         TrainingMode::Fixture => ((bucket_count as usize) * 10)
             .max(((n_canonical as usize) * 4).min((bucket_count as usize) * 100)),
-        TrainingMode::Production => (n_canonical as usize) * 4,
+        TrainingMode::Production => (n_canonical as usize).min(PRODUCTION_PHASE1_MAX_SAMPLES),
     };
+    // 进度日志（§G-batch1 §3.4-batch1）：long-running Production retrain 走 stderr
+    // 实时观测 + Fixture 路径同型保持一致。在 release ~120 min budget 内不引入
+    // 显著 I/O overhead（每街仅几次 eprintln 起止）。
+    let t_street_start = std::time::Instant::now();
+    eprintln!(
+        "[train_one_street] street={street:?} mode={mode:?} K={bucket_count} \
+         n_canonical={n_canonical} n_train_phase1={n_train} cluster_iter={cluster_iter}"
+    );
     let mut sample_rng = ChaCha20Rng::from_seed(cluster::rng_substream::derive_substream_seed(
         training_seed,
         cluster_op,
         0,
     ));
+    let t_sample = std::time::Instant::now();
     let candidates = sample_n_postflop_candidates(&mut sample_rng, board_len, n_train);
+    eprintln!(
+        "[train_one_street] street={street:?} phase=1 sampled {} candidates in {:?}",
+        candidates.len(),
+        t_sample.elapsed()
+    );
 
     // 2. 计算特征向量（D-221 EHS² + OCHS_8 = 9 维）。
     //
@@ -854,9 +886,27 @@ fn train_one_street(
     };
     let ochs_op = cluster::rng_substream::OCHS_FEATURE_INNER;
 
+    let t_features = std::time::Instant::now();
+    // 进度日志间隔：n_train ≥ 200K 时每 5% / 100K（取大）打一行；fixture 路径
+    // n_train ≤ 50K 不触发，保持 fixture 行为安静。
+    let feature_log_interval: usize = if n_train >= 200_000 {
+        (n_train / 20).max(100_000)
+    } else {
+        usize::MAX
+    };
     let mut features: Vec<Vec<f64>> = Vec::with_capacity(n_train);
     let mut ehs_per_sample: Vec<f64> = Vec::with_capacity(n_train);
     for (i, (board, hole)) in candidates.iter().enumerate() {
+        if i > 0 && i % feature_log_interval == 0 {
+            eprintln!(
+                "[train_one_street] street={street:?} phase=1 features {}/{} ({:.1}%) \
+                 elapsed={:?}",
+                i,
+                n_train,
+                100.0 * (i as f64) / (n_train as f64),
+                t_features.elapsed()
+            );
+        }
         let mut rng_ehs = ChaCha20Rng::from_seed(cluster::rng_substream::derive_substream_seed(
             training_seed,
             ehs_op,
@@ -896,9 +946,20 @@ fn train_one_street(
         ehs_per_sample.push(ehs);
     }
 
+    eprintln!(
+        "[train_one_street] street={street:?} phase=1 features done {} samples / {:?}",
+        features.len(),
+        t_features.elapsed()
+    );
+
     // 3. k-means + L2（D-230 / D-231 / D-232）。
+    let t_kmeans = std::time::Instant::now();
     let kmeans_cfg = KMeansConfig::default_d232(bucket_count);
     let kmeans_res = kmeans_fit(&features, kmeans_cfg, training_seed, kmeans_pp_op, split_op);
+    eprintln!(
+        "[train_one_street] street={street:?} phase=1 kmeans done K={bucket_count} / {:?}",
+        t_kmeans.elapsed()
+    );
 
     // 4. D-236b 重编号（按 EHS 中位数升序）。
     let (centroids, assignments) = reorder_by_ehs_median(
@@ -911,28 +972,122 @@ fn train_one_street(
     let (centroids_quantized, centroid_min_per_dim, centroid_max_per_dim) =
         quantize_centroids_u8(&centroids);
 
-    // 6. 构建 lookup_table：obs_id → bucket id。
+    // 6. 构建 lookup_table：obs_id → bucket id。模式分流（§G-batch1 §3.4）：
     //
-    // Strategy: 每个 sample 的 (board, hole) → canonical_observation_id → 第一个
-    // 命中的 sample 的 bucket id 写入 lookup_table[obs_id]。剩余未命中的 obs_id
-    // 用 hash-derived fallback：`(obs_id as u64).wrapping_mul(2654435761) % bucket_count`
-    // （Knuth multiplicative hash），保证均匀分布到 [0, bucket_count)，让"无空 bucket"
-    // 不变量在统计意义上成立。
+    // - [`TrainingMode::Fixture`]（§G-batch1 §3.2 形态 byte-equal）：每个 sample 的
+    //   (board, hole) → canonical_observation_id → 第一个命中的 sample 的 bucket
+    //   id 写入 lookup_table[obs_id]；剩余未命中的 obs_id 用 Knuth hash fallback
+    //   （`(obs_id × 2654435761) mod bucket_count`），让 "无空 bucket" 不变量在
+    //   统计意义上成立。
+    // - [`TrainingMode::Production`]（§G-batch1 §3.4 dual-phase）：枚举所有 N
+    //   canonical_ids → [`nth_canonical_form`] 解码 (board, hole) → 同 phase 1
+    //   pipeline 计算 feature → 找最近 centroid（L2 距离，post-D-236b 重编号顺序）
+    //   → lookup_table[id] = nearest_centroid_id。100% canonical 覆盖，无 Knuth
+    //   hash fallback；bucket_quality 4 类门槛（path.md 字面）由 proper k-means
+    //   assignment 保障。
     let mut lookup_table: Vec<u32> = vec![u32::MAX; n_canonical as usize];
-    for (i, (board, hole)) in candidates.iter().enumerate() {
-        let obs_id = canonical_observation_id(street, board, *hole);
-        if lookup_table[obs_id as usize] == u32::MAX {
-            lookup_table[obs_id as usize] = assignments[i];
+    match mode {
+        TrainingMode::Fixture => {
+            for (i, (board, hole)) in candidates.iter().enumerate() {
+                let obs_id = canonical_observation_id(street, board, *hole);
+                if lookup_table[obs_id as usize] == u32::MAX {
+                    lookup_table[obs_id as usize] = assignments[i];
+                }
+            }
+            // Knuth hash fallback for unsampled obs_ids。
+            for obs_id in 0..n_canonical {
+                if lookup_table[obs_id as usize] == u32::MAX {
+                    let h = (obs_id as u64).wrapping_mul(2654435761);
+                    lookup_table[obs_id as usize] = (h % (bucket_count as u64)) as u32;
+                }
+            }
         }
-    }
-    // Fallback for unsampled obs_ids：按 obs_id 哈希到 bucket id 均匀分布。
-    for obs_id in 0..n_canonical {
-        if lookup_table[obs_id as usize] == u32::MAX {
-            let h = (obs_id as u64).wrapping_mul(2654435761);
-            lookup_table[obs_id as usize] = (h % (bucket_count as u64)) as u32;
+        TrainingMode::Production => {
+            // Phase 2 (§G-batch1 §3.4)：枚举每个 canonical_id → decode → feature →
+            // 最近 centroid。RNG op_ids 与 phase 1 相同（ehs_op / ochs_op），但 ramp
+            // 使用 `id` 而非 phase 1 sample index `i`——同 training_seed 下二者
+            // 重叠区域 (id < n_train_phase1) 会取到同样的 substream seed，但
+            // (board, hole) 输入不同 → feature 自然不同；determinism 不变。
+            let t_phase2 = std::time::Instant::now();
+            // Phase 2 进度日志：每 5% / 200K（取大）打一行 + 起止 banner。
+            let phase2_log_interval: u32 = ((n_canonical / 20).max(200_000)) as u32;
+            eprintln!(
+                "[train_one_street] street={street:?} phase=2 enumerate-assign N={n_canonical} \
+                 starting (interval={phase2_log_interval} ids)"
+            );
+            let n_dims = BUCKET_TABLE_FEATURE_SET_1_DIMS as usize;
+            for id in 0..n_canonical {
+                if id > 0 && id % phase2_log_interval == 0 {
+                    let elapsed = t_phase2.elapsed();
+                    let pct = 100.0 * (id as f64) / (n_canonical as f64);
+                    let eta_sec = if id > 0 {
+                        elapsed.as_secs_f64() * ((n_canonical - id) as f64) / (id as f64)
+                    } else {
+                        f64::NAN
+                    };
+                    eprintln!(
+                        "[train_one_street] street={street:?} phase=2 {}/{} ({:.1}%) \
+                         elapsed={:?} eta={:.0}s",
+                        id, n_canonical, pct, elapsed, eta_sec
+                    );
+                }
+                let (board, hole) = canonical_enum::nth_canonical_form(street, id);
+                let mut rng_ehs = ChaCha20Rng::from_seed(
+                    cluster::rng_substream::derive_substream_seed(training_seed, ehs_op, id),
+                );
+                let mut rng_ochs = ChaCha20Rng::from_seed(
+                    cluster::rng_substream::derive_substream_seed(training_seed, ochs_op, id),
+                );
+                let ehs = calc
+                    .equity(hole, &board, &mut rng_ehs)
+                    .unwrap_or(0.5)
+                    .clamp(0.0, 1.0);
+                let ehs2 = if use_proxy {
+                    ehs * ehs
+                } else {
+                    calc.ehs_squared(hole, &board, &mut rng_ehs)
+                        .unwrap_or(ehs * ehs)
+                        .clamp(0.0, 1.0)
+                };
+                let ochs = calc
+                    .ochs(hole, &board, &mut rng_ochs)
+                    .unwrap_or_else(|_| vec![0.5; 8]);
+                // 初始化为 0.5 padding（与 phase 1 OCHS 长度 < 8 时的 fallback 一致）；
+                // 然后写入 ehs2 + ochs。
+                let mut feat: [f64; 9] = [0.5; 9];
+                feat[0] = ehs2;
+                for (d, v) in ochs.iter().take(8).enumerate() {
+                    feat[d + 1] = (*v).clamp(0.0, 1.0);
+                }
+                // 找最近 centroid（L2 距离，post-D-236b 重编号顺序，centroids 是
+                // f64 reference 值；u8 量化仅用于 artifact 存储）。
+                let mut best_id: u32 = 0;
+                let mut best_dist: f64 = f64::INFINITY;
+                for (c_id, c) in centroids.iter().enumerate() {
+                    let mut dist: f64 = 0.0;
+                    for d in 0..n_dims {
+                        let diff = feat[d] - c[d];
+                        dist += diff * diff;
+                    }
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best_id = c_id as u32;
+                    }
+                }
+                lookup_table[id as usize] = best_id;
+            }
+            eprintln!(
+                "[train_one_street] street={street:?} phase=2 done {} ids / {:?}",
+                n_canonical,
+                t_phase2.elapsed()
+            );
         }
     }
 
+    eprintln!(
+        "[train_one_street] street={street:?} mode={mode:?} total wall {:?}",
+        t_street_start.elapsed()
+    );
     StreetTraining {
         centroids_quantized,
         centroid_min_per_dim,
@@ -940,6 +1095,17 @@ fn train_one_street(
         lookup_table,
     }
 }
+
+/// Production-mode phase 1 candidate cap（§G-batch1 §3.4 \[实现\] memory feasibility
+/// option (c)）。Phase 1 在 ≤ 2M candidates 上训 k-means → 得到 K centroids；
+/// phase 2 通过 [`crate::abstraction::canonical_enum::nth_canonical_form`] 逆函数
+/// 100% 枚举 N canonical_ids → 分配到最近 centroid。该 cap 让 phase 1 features
+/// memory ≤ 2M × ~120 bytes ≈ 240 MB peak，在 vultr 7.7 GB host 内可承受。
+///
+/// 数值选择 2M 是 trade-off：(a) 足够大让 K=500 centroids 收敛稳定（每 centroid
+/// ~4K samples 期望）；(b) 足够小让 feature 计算时间（2M × 9 × cluster_iter 评估）
+/// + memory 在 ~30 min release 内完成。§G-batch1 §3.4-batch2 实跑前可调整。
+pub const PRODUCTION_PHASE1_MAX_SAMPLES: usize = 2_000_000;
 
 /// 训练用 (board, hole) 候选采样：每次随机抽 `board_len + 2` 张不重复牌。
 fn sample_n_postflop_candidates(
