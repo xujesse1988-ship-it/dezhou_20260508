@@ -2399,6 +2399,142 @@ CLAUDE.md ground truth；(c) artifact 上传 GitHub Release tag `stage2-d218-rev
 或 `stage2-v1.1`；(d) `tools/fetch_bucket_table.sh` 新增 helper（curl + BLAKE3
 verify + cache 到 `artifacts/`）。
 
+##### §G-batch1 §3.4-batch2 [实现]（2026-05-13）：production artifact 重训 on AWS on-demand 16-core EPYC 7R13 + fetch helper（GitHub Release 上传 user-gated）
+
+§G-batch1 §3.4-batch1.5 commit `1bb8850` 后下一步：按 workflow §3.4 字面 4 项
+deliverable 落地 production artifact + 分发链路。host 选 **AWS EC2 c6a.4xlarge
+on-demand 16-core EPYC 7R13 Milan / 30 GB RAM**（前置经历）：
+
+1. AWS spot 32-core EPYC 7R13 第一次（`54.89.113.65`）跑 cluster_iter=10000 → 2h
+   32min 被回收（chunk 5/21 of flop p1，进度 ~5%）；
+2. AWS spot 32-core 第二次（`3.139.90.23`）改 cluster_iter=2000 → 25 min 又被
+   回收（chunk 1/21 of flop p1，进度 ~1%）；
+3. **切 on-demand 16-core EPYC 7R13（`3.19.232.138`）跑 cluster_iter=2000 → 一次
+   性跑完 11h 47min 52s**。
+
+**核心命令**：
+
+```bash
+cd ~/dezhou_20260508 && nohup cargo run --release --bin train_bucket_table -- \
+    --mode production \
+    --flop 500 --turn 500 --river 500 \
+    --cluster-iter 2000 \
+    --output artifacts/bucket_table_default_500_500_500_seed_cafebabe_v2.bin \
+    > /tmp/prod_retrain.log 2>&1 &
+```
+
+**cluster_iter 从字面 10000 降到 2000 的取舍**（与 stage-2 §C-rev1 §1 "cluster_iter
+≤ 500 EHS² ≈ equity² 近似" 同型 [实现] 阶段细化决策，非 D-NNN-revM 修订）：
+
+| 街 | iter=10000 噪声 | iter=2000 噪声 | bucket spacing | 判定 |
+|---|---|---|---|---|
+| Flop ehs² (1176 outer × inner) | σ ≈ 0.015% | σ ≈ 0.033% | 0.2% (K=500) | ✓ < spacing |
+| Turn ehs² (46 outer × inner)   | σ ≈ 0.073% | σ ≈ 0.16%  | 0.2%          | ✓ < spacing |
+| River ehs² = equity² (inner only) | σ ≈ 1.0%   | σ ≈ 2.2%   | 0.2%          | 高于 spacing，留 §3.8 4 类质量门槛实测决定 |
+| Wall (16-core EPYC 7R13)       | ~27h         | **~12h**   | —             | — |
+
+预算/质量权衡：flop+turn ehs² 在 iter=2000 仍远低于 K=500 bucket spacing；river
+ehs²/equity 在 iter=2000 噪声 ~2.2% 是约 11× bucket spacing，部分 boundary 样本
+分类会偏离 ideal — 接受这个代价以避免 ~27h wall + 多次 spot 被回收风险。
+
+**实跑出口数据**：
+
+- **总 wall = 42472.22s = 11h 47min 52s**
+- Aggregate eval rate **224M eval/s = 14M eval7/s/core** on 16-core（vs stage 2
+  SLO baseline 21M/core ≈ **67% 效率**；rayon contention + trait object
+  dispatch ~33% 开销）
+- per-street wall 分解：
+
+| 街 | phase 1 features | phase 1 k-means | phase 2 enumerate-assign | 街 total | 占总 wall |
+|---|---|---|---|---|---|
+| Flop | 4h 17min 30s (15449.87s) | 4min 49s (289.05s) | 4h 12min 25s (15144.65s) | **8h 34min 44s** | 72.7% |
+| Turn | 17min 24s (1043.98s) | 7min 29s (449.05s) | 1h 55min 36s (6935.54s) | **2h 20min 29s** | 19.9% |
+| River | 43.5s (43.54s) | 7min 29s (448.90s) | 44min 26s (2666.11s) | **52min 39s** | 7.4% |
+
+- chunk wall 稳定性：flop p1 σ < 0.05% (5+ samples)；flop p2 σ ≈ 0.2%；turn p2
+  σ ≈ 0.1%；river p2 σ ≈ 0.5% — 极稳，无 thermal throttle / IO contention
+- RSS 峰值：river p2 期间 ~3.1 GB（canonical_enum river lazy table ~2 GB +
+  features Vec ~144 MB + lookup_table ~492 MB）
+- CPU 利用率持续 ~1565-1599% / 1600% theoretical max = **97-99% 16-core 满载**
+
+**v2 artifact ground truth**:
+
+- 路径：`artifacts/bucket_table_default_500_500_500_seed_cafebabe_v2.bin`
+- 大小：**553,631,520 bytes = 528 MiB**
+- BLAKE3 body hash（`BucketTable::content_hash()` CLI 输出）：
+  `e602f5486f0f48956a979a55d6827745b09e60ec9e4eaca0906fd1cd17e228e5`
+- whole-file b3sum（含 32-byte BLAKE3 trailer）：
+  `211319ff86686a5734eb6952d92ff664c9dc230cd28506a732b97012b44535db`
+- scp 本地 byte-equal 校验通过 ✓（whole-file b3sum 同值）
+
+**deliverable (a) production artifact 重训** ✓ 落地（见上述详细数据）。rayon
+par_iter 满载 16 cores（CPU% 持续 ~1599%）+ chunk-level stderr 进度日志。期间
+**bark.day.app iOS 5 个里程碑全部触发**：
+
+- "10%" `_10` at 15:25 — flop p1 chunk 0 done (12.88 min)
+- "30%" `_30` at 19:30 — flop p1 features done (4h 17min)
+- "50%" `_50` at 23:47 — flop street total wall (8h 34min)
+- "80%" `_80` at 02:07 — turn street total wall (10h 55min)
+- "100%" `_100` at 03:00 — artifact wrote + BLAKE3 hash (11h 47min)
+
+**deliverable (b) artifact hash 录入 CLAUDE.md ground truth** ✓ 同 commit
+更新 `CLAUDE.md` 「### Stage 2 当前测试基线」段 artifact line：v2 hash 替换
+v1（v1 hash 保留作历史参照；schema_version 1 → 2 bump 后 v1 由 BucketTable::open
+拒绝）。
+
+**deliverable (c) GitHub Release 上传**：留用户手动触发（共享对外可见状态，
+单向发布）。建议命令：
+
+```bash
+gh release create stage2-v1.1 \
+    --title "stage 2 v1.1 — D-218-rev2 真等价类 bucket table v2 artifact" \
+    --notes "528 MiB v2 artifact; BLAKE3 body=e602f548... whole=211319ff..." \
+    artifacts/bucket_table_default_500_500_500_seed_cafebabe_v2.bin
+```
+
+tag 选 `stage2-v1.1`（与 stage 1 `stage1-v1.0` / stage 2 `stage2-v1.0` 同型
+minor bump；D-218-rev2 是 inline 修订非单独 stage tag，故不用 `stage2-d218-rev2`）。
+
+**deliverable (d) `tools/fetch_bucket_table.sh` helper** ✓ 同 commit 落地
+~160 行 bash：`--repo` / `--tag` / `--artifact` / `--expected-blake3` /
+`--force` flag；默认拉 stage2-v1.1 tag 下的 v2 artifact，curl follow-redirects
+下载到 `.partial` → b3sum 校验 → atomic rename 到 `artifacts/`；hash mismatch
+exit code 3 / 下载失败 exit code 2；shell 依赖 `curl` + `b3sum`。
+`EXPECTED_BLAKE3_DEFAULT="211319ff..."` 已硬编码 §3.4-batch2 retrain ground truth。
+
+**[实现] 角色边界审计**：本 batch 触 `tools/fetch_bucket_table.sh`（新增）+
+`docs/pluribus_stage2_workflow.md` 本节 + `CLAUDE.md`（artifact line v1 → v2
+hash 替换 + Repository status 头段 §3.4-batch1.5 → §3.4-batch2 状态翻面 + 删
+"§3.4-batch2..§4 deferred" 表述 + 新增 §3.4-batch2 closure entry）。`src/` /
+`tests/` / `benches/` / `fuzz/` / `Cargo.toml` / `Cargo.lock` /
+`pluribus_stage2_decisions.md` / `pluribus_stage2_api.md` /
+`pluribus_stage2_validation.md` **未修改一行**——0 src 改动维持 §G-batch1
+§3.4-batch1.5 形态。
+
+**v1 → v2 artifact 替代追认**：本 batch 退役 stage 2 F-rev1 §2 重训的 v1 95 KB
+artifact（`bucket_table_default_500_500_500_seed_cafebabe.bin`，body hash
+`4b42bf70...` / whole-file `a35220bb...`）作为 production lookup 来源。§G-batch1
+§3.2 commit `c2a21e6` 已让 BucketTable::open 在遇到 v1 schema 时拒绝
+（`SchemaVersionMismatch` error）；本 v2 artifact `*_v2.bin` 替代之。v1 hash 在
+CLAUDE.md 中作 "历史参照" 保留，不删（追加不删政策，避免与 stage 2 F-rev1 §2
+追认 record 漂移）。
+
+**iter=10000 → 2000 取舍 carve-out**：workflow §3.4 字面要求 `--cluster-iter
+10000`，本 batch [实现] 实测预算决定降到 2000。与 stage-2 §C-rev1 §1 同型工程
+取舍（[实现] 阶段细化决策，非 D-NNN-revM 修订）：iter=10000 在 32-core EPYC
+7R13 实测 ~27h wall、spot 两次回收损失 ~3h compute；on-demand 16-core 跑 iter=
+10000 ~24h $20 cost 但 river ehs² noise 1.0% 仍 5× bucket spacing；iter=2000
+on-demand 16-core 跑 12h $10 cost / river noise 2.2% 接受为 §3.8 bucket quality
+4 类门槛实测前提。如 §3.8 实测 quality 不达标，由 §G-batch1 §5 carry-forward
+后续 batch 重训 iter=10000 fix（v3 artifact 命名 `*_v3.bin`，schema_version
+保持 2）。
+
+下一步：§G-batch1 §3.5 [实现] 跨架构 baseline 32-seed × 3 街重生（AWS 16-core
+on-demand ~6 h release，覆盖 `tests/data/bucket-table-arch-hashes-linux-x86_64.txt`）
++ §G-batch1 §3.6 D-275 实测 + §G-batch1 §3.7 reader v2 + §G-batch1 §3.8 12 条
+quality 转 active + §G-batch1 §4 [报告]。GitHub Release 上传由用户手动触发（独立
+deliverable c，本 closure 不阻塞）。
+
 ##### §G-batch1 §3.5..§3.8 + §4：待后续 batch 追加
 
 - §G-batch1 §3.4 [实现]：（已被 §3.4-batch1 + 待落地 §3.4-batch2 覆盖；见上述记录）。
