@@ -7,7 +7,11 @@
 //! A1 \[实现\] 阶段所有具体 impl 方法体 `unimplemented!()`；B2 \[实现\] 落地
 //! KuhnGame / LeducGame 全部方法，C2 \[实现\] 落地 SimplifiedNlheGame。
 
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+
 use crate::core::rng::RngSource;
+use crate::error::GameVariant;
 
 /// 0-indexed 玩家 id；2-player game `player ∈ {0, 1}`（API-300）。
 pub type PlayerId = u8;
@@ -54,8 +58,29 @@ pub trait Game {
     /// - 简化 NLHE: 继承 stage 2 [`crate::InfoSetId`]（64-bit layout）
     ///
     /// `Eq + Hash + Clone + Debug` 是 [`crate::training::RegretTable`] HashMap 键
-    /// 的必要 bound。
-    type InfoSet: Clone + Send + Sync + Eq + std::hash::Hash + std::fmt::Debug;
+    /// 的必要 bound；`Serialize + DeserializeOwned` 让 D-327 checkpoint bincode 序列化
+    /// 走 derive 入口（D2 \[实现\]）。
+    type InfoSet: Clone
+        + Send
+        + Sync
+        + Eq
+        + std::hash::Hash
+        + std::fmt::Debug
+        + Serialize
+        + DeserializeOwned;
+
+    /// 游戏变体 tag（D-356 多 game checkpoint 不兼容拒绝 / D-350 binary header
+    /// offset 13）。`VanillaCfrTrainer<G>` / `EsMccfrTrainer<G>` 在
+    /// [`crate::training::Trainer::save_checkpoint`] 里读取本常量回填到 header
+    /// `game_variant` 字段；`load_checkpoint` 反向校验。
+    const VARIANT: GameVariant;
+
+    /// 当前 Game 配套 bucket_table 内容 BLAKE3 hash（D-350 binary header offset 60
+    /// / D-356 BucketTableMismatch 校验）。Kuhn / Leduc 全零；SimplifiedNlhe 返回
+    /// [`crate::BucketTable::content_hash`]。
+    fn bucket_table_blake3(&self) -> [u8; 32] {
+        [0u8; 32]
+    }
 
     /// 玩家数（Kuhn / Leduc / 简化 NLHE 全部 = 2）。
     fn n_players(&self) -> usize;

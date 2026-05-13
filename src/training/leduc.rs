@@ -26,7 +26,7 @@ pub struct LeducGame;
 /// 仅 betting 5 个变体 `{Check, Bet, Call, Fold, Raise}` 出现在 `LeducHistory`；
 /// `Deal0..Deal5` 仅出现在 chance node 的 `chance_distribution` / `next` 入参，
 /// 表示发牌结果（card index 0..=5）。Unit variants 让 `as u8` cast 保持有效。
-#[derive(Clone, Copy, Eq, Hash, Debug, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LeducAction {
     Check,
     Bet,
@@ -68,7 +68,7 @@ impl LeducAction {
 }
 
 /// Leduc 街阶段（API-302 / D-311）。
-#[derive(Clone, Copy, Eq, Hash, Debug, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LeducStreet {
     Preflop,
     Postflop,
@@ -78,7 +78,7 @@ pub enum LeducStreet {
 pub type LeducHistory = Vec<LeducAction>;
 
 /// Leduc 玩家视角 InfoSet（API-302）。
-#[derive(Clone, Eq, Hash, Debug, PartialEq)]
+#[derive(Clone, Eq, Hash, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LeducInfoSet {
     pub actor: PlayerId,
     pub private_card: u8,
@@ -222,6 +222,8 @@ impl Game for LeducGame {
     type State = LeducState;
     type Action = LeducAction;
     type InfoSet = LeducInfoSet;
+
+    const VARIANT: crate::error::GameVariant = crate::error::GameVariant::Leduc;
 
     fn n_players(&self) -> usize {
         2

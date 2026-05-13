@@ -409,6 +409,50 @@ pack_info_set_id(bucket_id_with_mask, position_bucket, stack_bucket, betting_sta
 
 ---
 
+### 10.4 D-373-rev1 / API-300-rev1 lock（D2 [实现] 落地中，2026-05-13）
+
+**触发器**：`pluribus_stage3_workflow.md` §步骤 D2 line 253-255 字面要求 `Checkpoint::save` / `open` 全 5 类 CheckpointError dispatch 落地。`Checkpoint` body 是 bincode-serialized `Vec<(InfoSet, Vec<f64>)>`（D-327）；D-373 原列 3 crate（bincode + tempfile + thread-safety TBD）暗示 serde derive 走 bincode 1.x re-export，但 derive 入口必须直接 import `serde::{Serialize, Deserialize}`，本 lock 追加 `serde = "1"` (derive feature) 到 stage 3 [dependencies] 明显化（D-373-rev1）。同时 `Game` trait 必须暴露 `const VARIANT: GameVariant`（D-350 binary header offset 13 让 `VanillaCfrTrainer<G> / EsMccfrTrainer<G> save_checkpoint` 写出 game_variant 字段）+ `fn bucket_table_blake3(&self) -> [u8; 32]` 默认方法（D-356 BucketTableMismatch 校验源），本 lock 追加 API-300-rev1 同 commit 落地。
+
+**lock 决定**：
+
+1. **D-373-rev1**：`Cargo.toml [dependencies]` 在 D2 [实现] commit 内追加 `serde = { version = "1", features = ["derive"] }`，让 `KuhnInfoSet` / `LeducInfoSet` / `InfoSetId` 三处 derive `Serialize` + `Deserialize` 直接命中（D-327 bincode 1.x serde re-export 间接路径不支持 derive macro 入口）。crate 总数从 3 翻到 4（bincode + tempfile + serde + thread-safety TBD）；其余 2 crate 不变。**不引入** serde 之外的格式 crate（`serde_yaml` / `toml` / `ron` 等不在 stage 3 范围）。
+
+2. **API-300-rev1**：`Game` trait 在 D2 [实现] commit 内追加 2 个 item：
+    - `const VARIANT: GameVariant;`（associated const，3 个 Game impl 强制实现：`KuhnGame = Kuhn` / `LeducGame = Leduc` / `SimplifiedNlheGame = SimplifiedNlhe`）。
+    - `fn bucket_table_blake3(&self) -> [u8; 32]` 默认 `[0u8; 32]`；仅 `SimplifiedNlheGame` override 返回 `self.bucket_table.content_hash()`。
+   `type InfoSet` bound 同时追加 `serde::Serialize + serde::de::DeserializeOwned`（D-327 bincode derive 入口必要 bound）。3 个 Game impl 在 stage 3 内部 cover，外部消费者目前不存在；A1 + B2 + C2 落地的 Game impl 在 D2 commit 内同步追加 `const VARIANT`。
+
+**理由**：
+
+- **D-373-rev1**：D-327 字面 "bincode 1.x serialize HashMap 走 InfoSet Debug-sort 顺序" 在 D2 落地时撞到 derive macro 入口路径——`serde::{Serialize, Deserialize}` derive 必须直接 import；bincode 1.x 虽 re-export serde 但不暴露 derive macros。原 D-373 列 serde 在 "继承 stage 1 既有依赖"（stage 1 仅 dev-dependency `serde_json` 间接拉入），实际 [dependencies] 段不含 serde；D2 [实现] 直接 derive 必须显式声明。
+- **API-300-rev1**：`Trainer<G: Game>::save_checkpoint(&self, path)` 在 generic `G` 上必须知道当前 GameVariant 才能填 binary header offset 13；`fn variant() -> GameVariant` vs `const VARIANT: GameVariant` 二选一，选 const 更简洁（无 `&self` 开销、纯 type-level 信息）。`bucket_table_blake3` 走 trait default 方法让 Kuhn/Leduc 无需 override（默认全零 = D-350 binary header offset 60 字面规格），仅 NLHE override 返回真实 hash；vs 强制每个 impl 实现一遍冗余。
+- **零外部影响**：`Game` trait 是 stage 3 内部新增 trait（不在 stage 1 / stage 2 surface），追加 const + default-method 不打破任何 downstream consumer（stage 3 内部 3 个 impl + tests 全部在同 commit 内 cover）。`type InfoSet` bound 追加 `Serialize + DeserializeOwned` 是 derive-trait 必要约束，3 个 InfoSet 类型同 commit 加 derive macro 即满足。
+
+**调用契约**（D2 [实现] commit 内 Game trait 形态）：
+
+```rust
+pub trait Game {
+    type State: Clone + Send + Sync;
+    type Action: Clone + Copy + Send + Sync + Eq + std::fmt::Debug;
+    type InfoSet: Clone + Send + Sync + Eq + std::hash::Hash + std::fmt::Debug
+        + serde::Serialize + serde::de::DeserializeOwned;
+
+    /// D-350 binary header offset 13 game_variant 字段来源。
+    const VARIANT: GameVariant;
+
+    /// D-356 BucketTableMismatch 校验源。Kuhn / Leduc 默认 [0u8; 32]；
+    /// SimplifiedNlhe override 返回 BucketTable::content_hash。
+    fn bucket_table_blake3(&self) -> [u8; 32] { [0u8; 32] }
+
+    fn n_players(&self) -> usize;
+    // ... 其余 6 方法不变
+}
+```
+
+**carve-out**：本 lock 由 D2 [实现] agent 落地决策文档变更，与 §10.1 / §10.2 / §10.3 同型 workflow 字面授权角色越界（D2 [实现] 字面要求落地 `Checkpoint::save` / `open` + 5 类 CheckpointError dispatch；本 rev 是落地路径上的 in-place trait + dependency 调整）。本 §10.4 entry 同 commit 落地，无需独立 `pluribus_stage3_workflow.md` §修订历史 entry 追认（workflow line 253-255 字面授权 = 修订历史 entry 等价物，本场景 expose 的是 D-327 derive 入口路径 + D-356 BLAKE3 校验源访问，stage 3 内部 in-place 修复不波及 stage 1 / stage 2 surface）。
+
+---
+
 ## 11. 决策修改流程
 
 继承 `pluribus_stage1_decisions.md` §10 + `pluribus_stage2_decisions.md` §11 修改流程，**D-NNN-revM 追加不删** + 在工作流 issue / PR 中显式标注 + 必要时 bump schema_version。stage 3 引入 `Checkpoint.schema_version`（D-350）作为 stage 3 自己的 serialization version anchor，与 stage 1 `HandHistory.schema_version` + stage 2 `BucketTable.schema_version` 互不冲突。

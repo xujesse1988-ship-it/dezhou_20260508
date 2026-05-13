@@ -22,7 +22,9 @@ use crate::rules::state::GameState;
 /// - bit 35..38: `street_tag`        ( 3 bit；0..3 = Preflop/Flop/Turn/River；
 ///   preflop 显式编码 0 不靠零启发式)
 /// - bit 38..64: `reserved`          (26 bit；必须为 0)
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd)]
+#[derive(
+    Copy, Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
 pub struct InfoSetId(u64);
 
 impl InfoSetId {

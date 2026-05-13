@@ -27,7 +27,21 @@ pub trait Game {
     /// game-specific action（Kuhn: { Check, Bet, Call, Fold }; Leduc: { Check, Bet, Call, Fold, Raise }; 简化 NLHE: AbstractAction from stage 2）
     type Action: Clone + Copy + Send + Sync + Eq + std::fmt::Debug;
     /// game-specific InfoSet id（Kuhn/Leduc 用 stage 3 独立编码；简化 NLHE 继承 stage 2 InfoSetId）
-    type InfoSet: Clone + Send + Sync + Eq + std::hash::Hash + std::fmt::Debug;
+    /// API-300-rev1：bound 追加 `serde::Serialize + serde::de::DeserializeOwned`（D-327 bincode derive 入口）
+    type InfoSet: Clone + Send + Sync + Eq + std::hash::Hash + std::fmt::Debug
+        + serde::Serialize + serde::de::DeserializeOwned;
+
+    /// API-300-rev1：D-350 binary header offset 13 game_variant 字段来源；
+    /// D-356 多 game checkpoint 不兼容拒绝由 `Trainer::load_checkpoint` 拿
+    /// `G::VARIANT` 与 checkpoint header 比对触发。3 个 Game impl 强制实现：
+    /// `KuhnGame = Kuhn` / `LeducGame = Leduc` / `SimplifiedNlheGame = SimplifiedNlhe`。
+    const VARIANT: GameVariant;
+
+    /// API-300-rev1：D-350 binary header offset 60 bucket_table_blake3 字段来源；
+    /// D-356 BucketTableMismatch 校验由 `Trainer::load_checkpoint` 拿 `game.bucket_table_blake3()`
+    /// 与 checkpoint header bytes[60..92] 比对触发。Kuhn / Leduc 默认 `[0u8; 32]`；
+    /// SimplifiedNlhe override 返回 `BucketTable::content_hash()`。
+    fn bucket_table_blake3(&self) -> [u8; 32] { [0u8; 32] }
 
     /// 玩家数（Kuhn/Leduc/简化 NLHE 全部 = 2）
     fn n_players(&self) -> usize;
@@ -635,17 +649,23 @@ pub use training::{
 };
 ```
 
-### `Cargo.toml` 新增依赖（D-373 锁定 3 个）
+### `Cargo.toml` 新增依赖（D-373 / D-373-rev1）
 
 ```toml
 [dependencies]
-# ... stage 1 + stage 2 既有依赖（blake3 / memmap2 / serde / thiserror 等）
+# ... stage 1 + stage 2 既有依赖（blake3 / rand / rand_chacha / thiserror 等）
 
 # stage 3 新增
 bincode = "1.3"
 tempfile = "3"
+# D-373-rev1（2026-05-13 D2 [实现] 落地中追加）：让 KuhnInfoSet / LeducInfoSet /
+# InfoSetId 三处 `#[derive(serde::Serialize, serde::Deserialize)]` 直接命中
+# （bincode 1.x re-export serde 不暴露 derive macros）。详见
+# pluribus_stage3_decisions.md §10.4 D-373-rev1 lock。
+serde = { version = "1", features = ["derive"] }
 # thread-safety: 在 D-321 batch 3 [实现] 之前 lock；候选 parking_lot / dashmap / crossbeam
-# (commented placeholder — A0 batch 5 不预提交)
+# (commented placeholder — A0 batch 5 不预提交；C2 [实现] D-321-rev1 lock 落
+# serial-equivalent fallback 不引入；E2 [实现] 落地真并发时引入)
 # parking_lot = "0.12"
 ```
 
@@ -784,6 +804,12 @@ assert_eq!(loaded.regret_blake3(), trainer2.regret_blake3());
 4. 通知所有正在工作的 agent
 
 ### 修订历史
+
+- **2026-05-13（D2 [实现] 落地中）**：API-300 `Game` trait **新增 2 个 item**（`const VARIANT: GameVariant;` + `fn bucket_table_blake3(&self) -> [u8; 32]` 默认方法）+ `type InfoSet` bound 追加 `serde::Serialize + serde::de::DeserializeOwned`。3 个 Game impl 在同 commit 落地 `const VARIANT`（KuhnGame = Kuhn / LeducGame = Leduc / SimplifiedNlheGame = SimplifiedNlhe）+ `SimplifiedNlheGame::bucket_table_blake3` override 返回 `self.bucket_table.content_hash()`。原 A0 [决策] 起步 batch 5 落地的 6-方法 trait surface 扩为 6-方法 + 1-const + 1-默认方法（继承 stage 1 + stage 2 错误追加不删模式）；外部消费者目前不存在，无下游 break。
+    - 触发器：D2 [实现] 落地 `Checkpoint::save` / `open` + 5 类 `CheckpointError` 全 dispatch（D-350 binary header offset 13 game_variant + offset 60 bucket_table_blake3 字段需要 `G::VARIANT` + `game.bucket_table_blake3()` 在 generic `Trainer<G: Game>::save_checkpoint(&self, path)` 上提供）。详见 `pluribus_stage3_decisions.md` §10.4 D-373-rev1 / API-300-rev1 lock 段落。
+    - 同 rev：D-373 `Cargo.toml [dependencies]` 追加 `serde = { version = "1", features = ["derive"] }`（让 `KuhnInfoSet` / `LeducInfoSet` / `InfoSetId` 三处 `#[derive(serde::Serialize, serde::Deserialize)]` 直接命中；bincode 1.x re-export serde 不暴露 derive macros）。
+    - `tests/api_signatures.rs` 0 改动（fn 指针签名锁不覆盖 const + 默认方法）；`Game` trait 方法签名由 rustc 在 trait 定义处校验（继承 stage 1 + stage 2 同型 trip-wire 范围）。
+    - 本节由 D2 [实现] commit 落地，与 `pluribus_stage3_decisions.md` §10.4 D-373-rev1 / API-300-rev1 lock 同 commit。
 
 - **2026-05-13（C2 [实现] 落地中暴露）**：API-303 `SimplifiedNlheGame` + `SimplifiedNlheState` + type alias **新增 bucket_table 字段**（`pub(crate) bucket_table: Arc<BucketTable>`）让 `Game::info_set` 静态方法在 postflop 路径上访问 lookup 表。原 A0 batch 5 落地的 `SimplifiedNlheState` 2-field shape（`game_state` + `action_history`）扩展为 3-field（追加 `bucket_table`）；外部消费者只读字段 `pub game_state` / `pub action_history` 不变（继承 stage 1 + stage 2 错误追加不删模式）。`pub use poker::training::nlhe::{SimplifiedNlheState, ...}` 顶层 re-export 同型，公开 API surface 兼容。
     - `SimplifiedNlheInfoSet = InfoSetId` type alias 不变（**D-317-rev1**：在 stage 2 `InfoSetId.bucket_id` field bits 12..18 编码 6-bit `legal_actions` availability mask 让 D-324 成立；详见 `pluribus_stage3_decisions.md` §10.3）。

@@ -242,6 +242,12 @@ impl Game for SimplifiedNlheGame {
     type Action = SimplifiedNlheAction;
     type InfoSet = SimplifiedNlheInfoSet;
 
+    const VARIANT: crate::error::GameVariant = crate::error::GameVariant::SimplifiedNlhe;
+
+    fn bucket_table_blake3(&self) -> [u8; 32] {
+        self.bucket_table.content_hash()
+    }
+
     fn n_players(&self) -> usize {
         // D-313 简化 NLHE 范围严格 2-player（不向 6-max 通用化；stage 4 走单独
         // 6-max blueprint）。

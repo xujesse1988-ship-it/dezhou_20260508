@@ -16,7 +16,8 @@
 use std::path::Path;
 
 use crate::core::rng::RngSource;
-use crate::error::{CheckpointError, TrainerError};
+use crate::error::{CheckpointError, TrainerError, TrainerVariant};
+use crate::training::checkpoint::{preflight_trainer, read_file_bytes, Checkpoint, SCHEMA_VERSION};
 use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::regret::{RegretTable, StrategyAccumulator};
 use crate::training::sampling::{derive_substream_seed, sample_discrete};
@@ -56,7 +57,6 @@ pub struct VanillaCfrTrainer<G: Game> {
     pub(crate) regret: RegretTable<G::InfoSet>,
     pub(crate) strategy_sum: StrategyAccumulator<G::InfoSet>,
     pub(crate) iter: u64,
-    #[allow(dead_code)] // D2 \[实现\] checkpoint 落地后取消
     pub(crate) rng_substream_seed: [u8; 32],
 }
 
@@ -129,15 +129,43 @@ impl<G: Game> Trainer<G> for VanillaCfrTrainer<G> {
         self.iter
     }
 
-    fn save_checkpoint(&self, _path: &Path) -> Result<(), CheckpointError> {
-        unimplemented!("stage 3 B2 scaffold: VanillaCfrTrainer::save_checkpoint (D2 实现)")
+    fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
+        let regret_table_bytes = encode_table(self.regret.inner())?;
+        let strategy_sum_bytes = encode_table(self.strategy_sum.inner())?;
+        let ckpt = Checkpoint {
+            schema_version: SCHEMA_VERSION,
+            trainer_variant: TrainerVariant::VanillaCfr,
+            game_variant: G::VARIANT,
+            update_count: self.iter,
+            rng_state: self.rng_substream_seed,
+            bucket_table_blake3: self.game.bucket_table_blake3(),
+            regret_table_bytes,
+            strategy_sum_bytes,
+        };
+        ckpt.save(path)
     }
 
-    fn load_checkpoint(_path: &Path, _game: G) -> Result<Self, CheckpointError>
+    fn load_checkpoint(path: &Path, game: G) -> Result<Self, CheckpointError>
     where
         Self: Sized,
     {
-        unimplemented!("stage 3 B2 scaffold: VanillaCfrTrainer::load_checkpoint (D2 实现)")
+        let bytes = read_file_bytes(path)?;
+        preflight_trainer(
+            &bytes,
+            TrainerVariant::VanillaCfr,
+            G::VARIANT,
+            game.bucket_table_blake3(),
+        )?;
+        let ckpt = Checkpoint::parse_bytes(&bytes)?;
+        let regret = decode_table::<G::InfoSet>(&ckpt.regret_table_bytes)?;
+        let strategy_sum = decode_strategy::<G::InfoSet>(&ckpt.strategy_sum_bytes)?;
+        Ok(Self {
+            game,
+            regret,
+            strategy_sum,
+            iter: ckpt.update_count,
+            rng_substream_seed: ckpt.rng_state,
+        })
     }
 }
 
@@ -241,7 +269,6 @@ pub struct EsMccfrTrainer<G: Game> {
     pub(crate) regret: RegretTable<G::InfoSet>,
     pub(crate) strategy_sum: StrategyAccumulator<G::InfoSet>,
     pub(crate) update_count: u64,
-    #[allow(dead_code)] // D2 \[实现\] checkpoint 落地后取消
     pub(crate) rng_substream_seed: [u8; 32],
 }
 
@@ -332,15 +359,43 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
         self.update_count
     }
 
-    fn save_checkpoint(&self, _path: &Path) -> Result<(), CheckpointError> {
-        unimplemented!("stage 3 C2 scaffold: EsMccfrTrainer::save_checkpoint (D2 实现)")
+    fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
+        let regret_table_bytes = encode_table(self.regret.inner())?;
+        let strategy_sum_bytes = encode_table(self.strategy_sum.inner())?;
+        let ckpt = Checkpoint {
+            schema_version: SCHEMA_VERSION,
+            trainer_variant: TrainerVariant::EsMccfr,
+            game_variant: G::VARIANT,
+            update_count: self.update_count,
+            rng_state: self.rng_substream_seed,
+            bucket_table_blake3: self.game.bucket_table_blake3(),
+            regret_table_bytes,
+            strategy_sum_bytes,
+        };
+        ckpt.save(path)
     }
 
-    fn load_checkpoint(_path: &Path, _game: G) -> Result<Self, CheckpointError>
+    fn load_checkpoint(path: &Path, game: G) -> Result<Self, CheckpointError>
     where
         Self: Sized,
     {
-        unimplemented!("stage 3 C2 scaffold: EsMccfrTrainer::load_checkpoint (D2 实现)")
+        let bytes = read_file_bytes(path)?;
+        preflight_trainer(
+            &bytes,
+            TrainerVariant::EsMccfr,
+            G::VARIANT,
+            game.bucket_table_blake3(),
+        )?;
+        let ckpt = Checkpoint::parse_bytes(&bytes)?;
+        let regret = decode_table::<G::InfoSet>(&ckpt.regret_table_bytes)?;
+        let strategy_sum = decode_strategy::<G::InfoSet>(&ckpt.strategy_sum_bytes)?;
+        Ok(Self {
+            game,
+            regret,
+            strategy_sum,
+            update_count: ckpt.update_count,
+            rng_substream_seed: ckpt.rng_state,
+        })
     }
 }
 
@@ -479,4 +534,68 @@ fn recurse_es<G: Game>(
             }
         }
     }
+}
+
+// ===========================================================================
+// Checkpoint serialization helpers（D-327 / D-354）
+// ===========================================================================
+
+/// HashMap<I, Vec<f64>> → bincode-serialized bytes，按 Debug 排序保证跨 host
+/// byte-equal（D-327）。
+///
+/// 输出格式 = `bincode::serialize(&Vec<(I, Vec<f64>)>::sorted)`。bincode 1.x
+/// 默认走 little-endian + varint integer encoding（D-354），不依赖 host endian。
+fn encode_table<I>(
+    table: &std::collections::HashMap<I, Vec<f64>>,
+) -> Result<Vec<u8>, CheckpointError>
+where
+    I: Clone + std::fmt::Debug + serde::Serialize,
+{
+    let mut entries: Vec<(I, Vec<f64>)> =
+        table.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // D-327 sorted-by-InfoSet 顺序：以 Debug 输出为排序键（避免给 InfoSet
+    // 引入 Ord bound — KuhnInfoSet / LeducInfoSet 未派生 Ord，且 Debug
+    // 输出对每个 InfoSet 类型确定性，足以保证跨 host byte-equal）。
+    entries.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
+    bincode::serialize(&entries).map_err(|e| CheckpointError::Corrupted {
+        offset: 0,
+        reason: format!("bincode serialize regret/strategy table failed: {e}"),
+    })
+}
+
+/// bincode-serialized bytes → [`RegretTable<I>`]（[`encode_table`] 的逆）。
+fn decode_table<I>(bytes: &[u8]) -> Result<RegretTable<I>, CheckpointError>
+where
+    I: Clone + Eq + std::hash::Hash + std::fmt::Debug + serde::de::DeserializeOwned,
+{
+    let entries: Vec<(I, Vec<f64>)> =
+        bincode::deserialize(bytes).map_err(|e| CheckpointError::Corrupted {
+            offset: 0,
+            reason: format!("bincode deserialize regret table failed: {e}"),
+        })?;
+    let mut table = RegretTable::new();
+    for (k, v) in entries {
+        // 空表上 accumulate 等价 set：get_or_init 创建 vec![0; n]，再加 delta
+        // = vec![0+d; n]。
+        table.accumulate(k, &v);
+    }
+    Ok(table)
+}
+
+/// bincode-serialized bytes → [`StrategyAccumulator<I>`]（[`encode_table`] 的逆，
+/// 与 [`decode_table`] 输出类型不同所以独立成函数）。
+fn decode_strategy<I>(bytes: &[u8]) -> Result<StrategyAccumulator<I>, CheckpointError>
+where
+    I: Clone + Eq + std::hash::Hash + std::fmt::Debug + serde::de::DeserializeOwned,
+{
+    let entries: Vec<(I, Vec<f64>)> =
+        bincode::deserialize(bytes).map_err(|e| CheckpointError::Corrupted {
+            offset: 0,
+            reason: format!("bincode deserialize strategy table failed: {e}"),
+        })?;
+    let mut acc = StrategyAccumulator::new();
+    for (k, v) in entries {
+        acc.accumulate(k, &v);
+    }
+    Ok(acc)
 }
