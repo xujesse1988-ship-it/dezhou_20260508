@@ -563,4 +563,34 @@ fn _stage3_api_signature_assertions() {
     let _: GameVariant = GameVariant::Kuhn;
     let _: GameVariant = GameVariant::Leduc;
     let _: GameVariant = GameVariant::SimplifiedNlhe;
+
+    // CheckpointError 5 variant 构造 trip-wire（API-351 / D-351，D1 \[测试\] 同
+    // commit 落地；继承 stage 1 + stage 2 错误枚举追加不删模式）。任一 variant
+    // 重命名 / 字段类型 / 字段名漂移立即在 `cargo test --no-run` 失败。变体语义
+    // 索引：
+    //   ① FileNotFound { path: PathBuf }
+    //   ② SchemaMismatch { expected: u32, got: u32 }
+    //   ③ TrainerMismatch { expected: (TrainerVariant, GameVariant),
+    //                       got: (TrainerVariant, GameVariant) }
+    //   ④ BucketTableMismatch { expected: [u8; 32], got: [u8; 32] }
+    //   ⑤ Corrupted { offset: u64, reason: String }
+    let _: CheckpointError = CheckpointError::FileNotFound {
+        path: std::path::PathBuf::from("/tmp/api-sig"),
+    };
+    let _: CheckpointError = CheckpointError::SchemaMismatch {
+        expected: 1u32,
+        got: 0u32,
+    };
+    let _: CheckpointError = CheckpointError::TrainerMismatch {
+        expected: (TrainerVariant::VanillaCfr, GameVariant::Kuhn),
+        got: (TrainerVariant::EsMccfr, GameVariant::SimplifiedNlhe),
+    };
+    let _: CheckpointError = CheckpointError::BucketTableMismatch {
+        expected: [0u8; 32],
+        got: [0u8; 32],
+    };
+    let _: CheckpointError = CheckpointError::Corrupted {
+        offset: 0u64,
+        reason: String::new(),
+    };
 }
