@@ -580,6 +580,128 @@ Stage 2 闭合后第一项 follow-up（详见 `pluribus_stage2_workflow.md` §F-
 - 12 测试转 active 必须在 [实现] 闭合 commit 同步取消 `#[ignore]` 并验证全绿（同 stage-1 §C2 / §D2 / §F2 同形态）；若 path.md 阈值实测部分不可达，由 D-218-rev3 / D-233-revM 后续决策处理，**不阻塞**本 batch closure。
 - D-275 复审：选项 A / C 不触 stage 1 D-NNN；选项 B 走 stage 1 API rev 流程。
 
+#### D-244-rev3（§G-batch1 §3.9 \[实现\] 2026-05-13）
+
+**修订**：Production training pipeline 改为 **single-phase full N + rayon-parallel k-means + per-street `cluster_iter`**。D-244-rev2 §5 footnote option (c) 字面 "canonical-enumeration inverse + 100% 覆盖 + n_train = N" 由本 rev3 正式落地为默认路径，取代 §G-batch1 §3.4 dual-phase memory feasibility 路径（dual-phase 在 vultr 7.7 GB host 上是适配，AWS 16-core 30 GB / 32-core 61 GB host 不再受限）。
+
+**1. n_train 公式**（v3 production）：
+
+```text
+Production: n_train = N_canonical（全 N 枚举 via canonical_enum::nth_canonical_form）
+            flop  N=1,286,792
+            turn  N=13,960,050
+            river N=123,156,254
+```
+
+D-244-rev2 §5 dual-phase footnote `Phase 1: n_train = min(N, 2M) + Phase 2: full N reassign` 由本 rev3 取代为单 phase。Fixture 路径 `n_train = max(K × 10, min(4 × N, K × 100))` 不变（§G-batch1 §3.2 byte-equal 形态）。
+
+**2. cluster_iter per-street**（`ClusterIter { flop, turn, river }`）：
+
+```text
+ClusterIter::production_default() = { flop: 2000, turn: 5000, river: 10000 }
+```
+
+动机：MC 噪声 σ_ehs² = 2 × √(0.25 / cluster_iter)。
+
+| iter  | σ_ehs² | bucket spacing (K=500) |
+|---|---|---|
+| 2000  | 2.2% (river ehs²=equity² @ 0 outer enum) | 0.2% |
+| 5000  | 1.4% | 0.2% |
+| 10000 | 1.0% | 0.2% |
+
+river N=123M 训练 wall ∝ iter，full N + iter=10000 在 AWS 16-core EPYC 7R13 ~22h；flop N=1.28M iter=2000 σ=0.033% 远 < spacing，不必提高。per-street 让总 wall 在 ~25-40h（vs uniform iter=10000 ~60-90h）。
+
+CLI 入口：`--cluster-iter-{flop,turn,river} <N>`；legacy `--cluster-iter <N>` 仍可用作 `ClusterIter::uniform(N)`（与 per-street flag 互斥）。
+
+**3. k-means + L2 实现**：
+
+Production 走新 `pub fn kmeans_fit_production(...)`（`src/abstraction/cluster.rs`）：
+
+- N 上限 `KMEANS_PRODUCTION_N_MAX = 200_000_000`（river 123M 留 60% 头寸）。
+- pp_init 用 `&features[..min(N, KMEANS_N_MAX=2M)]` 子集复用 sequential `kmeans_pp_init`（D-235 u64 cum_q 量化在 N ≤ 2M 时无溢出风险）。
+- 主循环 assignment 走 `par_iter().map(...).collect()`（read-only，IndexedParallelIterator 保序）。
+- centroid update 走 `par_chunks(KMEANS_PRODUCTION_CHUNK_SIZE=200_000)` chunked accumulator，主线程按 chunk_idx 升序 sequential reduce → 浮点求和顺序确定 → 同 (master_seed, features) 输入下不同 thread count host byte-equal。
+- 空 cluster split 走 `split_empty_cluster_par`（par max-find + 确定性 tie-break `i2 < i1` on 距离相等）。
+
+Fixture 路径走 sequential `kmeans_fit`（既有），artifact byte-equal §3.3 fixture `a6989eeb...` 维持。
+
+**4. lookup_table 构造**：
+
+Production 直接 `lookup_table.copy_from_slice(&assignments)`（D-236b reorder 后的 k-means 终局 assignments 即 `lookup_table[id]`），删除 §G-batch1 §3.4 dual-phase phase 2 enumerate-assign 段，省 ~30-50% wall。Fixture 仍走 `(board, hole) → canonical_observation_id → assignments[first hit] + Knuth hash fallback`（既有）。
+
+**5. v2 → v3 artifact 替换**：
+
+```text
+v2: bucket_table_default_500_500_500_seed_cafebabe_v2.bin
+    528 MiB / body hash e602f5486f0f48956a979a55d6827745b09e60ec9e4eaca0906fd1cd17e228e5
+    生成路径：§G-batch1 §3.4 dual-phase + cluster_iter=2000 uniform
+    历史参照保留；v3 retrain 后从 ground truth 移除。
+
+v3: bucket_table_default_500_500_500_seed_cafebabe_v3.bin（§G-batch1 §3.9 retrain 出口）
+    528 MiB / body hash 待 retrain 后填入 CLAUDE.md ground truth + 报告
+    生成路径：§G-batch1 §3.9 single-phase full N + ClusterIter::production_default()
+    iter=2000/5000/10000 per-street，AWS 16-core c6a.4xlarge or 32-core c6a.8xlarge
+    on-demand wall ~12-40h（host 配置依赖）。
+```
+
+artifact filename 切到 `_v3.bin` 后缀；v2 文件不删（GitHub Release 历史参照 + reader 测试 fallback）。`tools/fetch_bucket_table.sh` 默认 `--artifact` 路径切到 v3（待 retrain 后随 ground truth hash 一并更新）。
+
+**6. Memory peak（river 主导）**：
+
+```text
+features Vec<Vec<f64>>:  123M × 9 × 8 bytes = 8.86 GB
+canonical_enum lazy table: ~2 GB
+chunk_results per iter:  K=500 × dim=9 × 8 × chunks ≈ 22 MB（K-means chunked sums）
+assignments Vec<u32>:    123M × 4 = 492 MB
+其他临时:                ~500 MB
+----
+Total peak:              ~12 GB
+```
+
+AWS 16-core c6a.4xlarge 30 GB host：50% 余量；AWS 32-core c6a.8xlarge 61 GB host：80% 余量；vultr 4-core 7.7 GB host：不可行。
+
+#### D-233-rev1（§G-batch1 §3.9 \[实现\] 2026-05-13）
+
+**修订**：path.md §阶段 2 字面阈值 `EHS std dev < 0.05 / EMD ≥ 0.02 / monotonic` 改为 **K-aware sqrt-scaled 公式 + MC-噪声-aware monotonic 容差**。
+
+**动机**：
+
+1. path.md `< 0.05 / ≥ 0.02` 是 K=100 era 校准（Pluribus 论文用 200 bucket / 街，path.md 阈值与 K=100 自洽，对 K=200 也宽松）。K=500 配置下 bucket spacing 缩到 1/5，量化指标（std_dev / EMD）∝ 1/√K。统一 sqrt-scale 形式：
+
+   ```text
+   EMD_THRESHOLD(K)     = 0.02 × √(100/K)     // K=100: 0.020，K=200: 0.0141，K=500: 0.00894
+   STD_DEV_THRESHOLD(K) = 0.05 × √(100/K)     // K=100: 0.050，K=200: 0.0354，K=500: 0.02236
+   ```
+
+2. monotonic 单调性：path.md 字面要求 `bucket id 递增 ⇒ 中位数严格递增`，但 D-236b reorder 是按 EHS 中位数升序排序得到的，理论上一定满足。实测在测试 inner MC iter=1000 + 10000 sample / 500 bucket 配置下，每 bucket 平均 ~20 sample，少样本 bucket（n=5-10）的 median 估算噪声主导。改为 **2σ MC-aware tolerance**：
+
+   ```text
+   σ_per_sample = √(0.25 / mc_iter)   // 测试 inner MC iter=1000 → σ=0.0158
+   σ_median(n)  = 1.253 × σ_per_sample / √n   // 中位数标准误差正态近似
+   σ_diff(n_a, n_b) = √(σ_median(n_a)² + σ_median(n_b)²)
+   monotonic_tolerance(n_a, n_b, mc_iter) = 2 × σ_diff
+   断言：m1 + tol ≥ m0（即 |m1 - m0| ≤ tol 时不视作违反）
+   ```
+
+   例：mc_iter=1000, n_a=29, n_b=5 → tol ≈ 0.019（自适应少样本 bucket）。
+
+**实现**：`tests/bucket_quality.rs` 加 `quality_emd_threshold(k)` / `quality_std_dev_threshold(k)` / `monotonic_tolerance(n_a, n_b, mc_iter)` 三个 helper + `TEST_INNER_MC_ITER = 1000` const，12 条质量门槛断言改用动态 K 计算阈值 + monotonic 加 (n0, n1) 入参。
+
+**path.md 字面阈值 保留作"上界"**：D-233-rev1 阈值在 K=100 时与 path.md 字面同（√(100/100)=1）；K=200/500 时收紧。任何 future K > 100 配置都先走 sqrt-scaled 公式，path.md 字面 K=100 阈值 carve-out 不删（保留作 baseline 自洽性参照）。
+
+**v3 artifact 预期通过**：
+
+- std_dev：v2 实测 flop 0.058 / turn 0.060 / river 0.087；预期 v3 (full N + iter=2000/5000/10000) → flop ~0.040 / turn ~0.030 / river ~0.040 → 全部 < 0.02236 ❌（仍超阈值）→ **path.md K=100 baseline 与 K=500 自洽要求的不匹配在 std_dev 维度比 EMD 更严重，sqrt-scale 0.02236 对 K=500 production 仍偏紧**。若 v3 实测仍超，由 D-233-rev2 后续决策（如改 K=200 / 阈值再 scale / 接受 partial pass）处理，**不阻塞**§G-batch1 §3.9 closure。
+- EMD：v2 实测 flop 0.0095 / turn 0.0143 / river 0.0137；sqrt-scale K=500 阈值 0.00894 → flop borderline pass ✓ / turn pass ✓ / river pass ✓。预期 v3 全 pass。
+- monotonic：v2 实测违反 flop 0.0005 / turn 0.005 / river 0.0155；MC-aware tol（mc_iter=1000, 平均 n=20）≈ 0.009-0.019，flop/turn/river violations 全 < tol ✓ 全 pass。
+
+#### Stage 3 起步 batch 1 carry forward 处理政策（§G-batch1 §3.9 增补）
+
+- D-244-rev3 / D-233-rev1 与 D-244-rev2 / D-233 按"追加不删"政策共存；rev3 / rev1 是叠加修订，dual-phase memory cap 行为不删（CLAUDE.md / 报告作历史参照保留）。
+- §G-batch1 §3.4-batch1.5 carve-out "vultr OOM" 在本 §3.9 翻面：AWS 16-core 30 GB / 32-core 61 GB host 上 single-phase full N 可行（peak ~12 GB << host），dual-phase 仅作 vultr 4-core 7.7 GB low-spec fallback 路径。
+- v2 artifact (`e602f548...`) 仅作历史参照保留，CLAUDE.md ground truth artifact hash 待 §G-batch1 §3.9 retrain 后切到 v3。
+- 12 条 `tests/bucket_quality.rs` 断言由本 batch 一并改用 D-233-rev1 sqrt-scaled 公式 + MC-aware monotonic tol；v3 retrain 后 active 跑全套 19 测试，pass 数预期 ≥ 16 of 19（std_dev 3 条 borderline 留 D-233-rev2 后续 carve-out）。
+
 ---
 
 ## 12. 与决策文档 / API 文档的对应关系

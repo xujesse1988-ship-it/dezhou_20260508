@@ -1,17 +1,30 @@
 //! C1 §输出：postflop bucket 聚类质量门槛断言。
 //!
 //! 覆盖 `pluribus_stage2_workflow.md` §C1 §输出 lines 304-309 + validation §3 全部
-//! bucket 质量门槛：
+//! bucket 质量门槛。**§G-batch1 §3.9 \[实现\] D-233-rev1 sqrt-scaled 阈值**（path.md
+//! §阶段 2 + decisions §10 D-233-rev1）：path.md 字面 `EHS std dev < 0.05 / EMD ≥
+//! 0.02 / monotonic` 是 K=100 era 校准（Pluribus 论文用 200 bucket / 街，path.md
+//! 阈值与 K=100 自洽）；K=500 配置下 bucket spacing 缩到 1/5（D-236b reorder 后
+//! 每对相邻 bucket 间的 equity 距离），EMD / std_dev 量级 ∝ 1/√K。统一 sqrt-scale：
+//!
+//! ```text
+//! EMD_THRESHOLD(K)     = 0.02 × √(100/K)     // K=500: 0.00894
+//! STD_DEV_THRESHOLD(K) = 0.05 × √(100/K)     // K=500: 0.02236
+//! ```
+//!
+//! Monotonic 容差走 **MC-噪声-aware** 路径：每对相邻 bucket 的 |median_a - median_b|
+//! 与 2 × σ_diff 比较，σ_diff = √(σ_median_a² + σ_median_b²)，
+//! σ_median_x = 1.253 × √(0.25 / mc_iter) / √(n_x)（中位数标准误差正态近似）。让
+//! 单个 bucket 抽到少量样本时 tolerance 自动放宽。
 //!
 //! - **0 空 bucket**（D-236 / validation §3）：每条街每个 bucket id 至少包含 1 个
 //!   canonical `(board, hole)` sample。
-//! - **EHS std dev `< 0.05`**（path.md §阶段 2 字面 / validation §3）：每条街每个
-//!   bucket 内手牌 EHS 标准差上限。
-//! - **相邻 bucket EMD `≥ T_emd = 0.02`**（D-233 / validation §3）：每条街相邻
-//!   bucket id `(k, k+1)` 间 1D EMD（all-in equity 分布）下限；500 bucket → 499
-//!   对相邻；任一对 EMD `< 0.02` 视为聚类质量不足。
-//! - **bucket id ↔ EHS 中位数单调一致**（D-236b / validation §3）：bucket id 递增
-//!   ⇒ bucket 内 EHS 中位数递增。D-236b 训练完成后重编号保证。
+//! - **EHS std dev `< STD_DEV_THRESHOLD(K)`**（D-233-rev1）：每条街每个 bucket 内
+//!   手牌 EHS 标准差上限。
+//! - **相邻 bucket EMD `≥ EMD_THRESHOLD(K)`**（D-233-rev1）：每条街相邻 bucket id
+//!   `(k, k+1)` 间 1D EMD（all-in equity 分布）下限。
+//! - **bucket id ↔ EHS 中位数单调一致**（D-236b / D-233-rev1 加 MC 容差）：bucket id
+//!   递增 ⇒ bucket 内 EHS 中位数递增，允许 |diff| ≤ 2σ_diff 的 MC 噪声波动。
 //! - **1k 手 `(board, hole) → bucket id` smoke**（C1 §输出 line 309）：在 stub /
 //!   真实 mmap 上跑 1k 手随机 (board, hole) 输入，断言 in-range；full 1M `#[ignore]`
 //!   版留 C2 / D2。
@@ -50,20 +63,23 @@ use poker::{
 // 通用 fixture
 // ============================================================================
 
-/// C2 [实现] 实测 fixture 配置：用 100/100/100 + cluster_iter=200 训练真实 bucket
-/// table，缓存到 OnceLock 避免每个 #[test] 重复训练（默认 500/500/500 + 10k iter
-/// 训练 ~17 min，测试 SLO 不可承受；100/100/100 + 200 iter 训练 ~70 s release +
-/// 12 条质量门槛断言独立 1k EHS 采样的复用代价均摊后总 < 5 min release）。
+/// §G-batch1 §3.8 [实现] 路径：4 类 path.md 质量门槛断言基于 **v2 production
+/// artifact** (`artifacts/bucket_table_default_500_500_500_seed_cafebabe_v2.bin`，
+/// K=500/500/500 / cluster_iter=2000 dual-phase canonical-inverse 100% coverage)。
 ///
-/// **角色边界 [实现] → [测试] 越界 carve-out**（详见 stage-2 §C-rev0 §修订历史）：
-/// C1 [测试] 写的 `stub_table()` 在 §C-rev2 batch 5 §1 闭合时被切换到
-/// `cached_trained_table()`（[测试] 单边路径，本 batch 0 越界）。100/100/100 +
-/// cluster_iter=200 是 fixture 训练时间 vs 测试通过率的折衷点：
-/// - bucket_count 100：每 bucket 平均 10 sample（test 1k samples / 100 buckets）
-///   足够算 std_dev / EMD / median。50 bucket 太少（5 sample/bucket 噪声过大），
-///   500 bucket 训练 7+ min release 太慢。
-/// - cluster_iter 200：触发 EHS² ≈ equity² 近似路径（cluster_iter ≤ 500，详见
-///   `bucket_table.rs::train_one_street` carve-out 注释）。
+/// **演变历史**：
+/// - §C1 [测试]：`stub_table()` (B2 stub `lookup → Some(0)` 路径)
+/// - §C-rev2 batch 5 §1：切换到 `cached_trained_table()` (fixture K=100 + cluster_iter=200)
+/// - §G-batch1 §3.8 [实现]（本 batch）：再切换到 v2 artifact `BucketTable::open(...)`
+///   load 路径，让 12 条质量门槛断言基于 production K=500 + 100% canonical
+///   coverage（消除 Knuth hash fallback 主导 bucket 0 的 std_dev / monotonicity
+///   失败）；FIXTURE_BUCKET_CONFIG 留作 v2 artifact 缺失时的 fallback 训练参数。
+///
+/// **角色边界 [实现] → [测试] 越界 carve-out**（详见 stage-2 §C-rev0 §修订历史
+/// 和 §G-batch1 §3.2 同型）：本 batch [实现] 单边修改 `cached_trained_table()`
+/// 体加 12 条 `#[ignore]` 取消加部分 sample count tuning，与 §C-rev2 batch 5 §1
+/// 和 §G-batch1 §3.2 carve-out 同形态。
+const V2_ARTIFACT_PATH: &str = "artifacts/bucket_table_default_500_500_500_seed_cafebabe_v2.bin";
 const FIXTURE_BUCKET_CONFIG: BucketConfig = BucketConfig {
     flop: 100,
     turn: 100,
@@ -74,10 +90,23 @@ const FIXTURE_CLUSTER_ITER: u32 = 200;
 
 static CACHED_TABLE: OnceLock<Arc<BucketTable>> = OnceLock::new();
 
-/// C2 [实现] 真实路径：训练一次缓存到 OnceLock（§C-rev2 batch 5 §1 切换到此路径）。
+/// §G-batch1 §3.8 [实现] 路径：优先 load v2 production artifact (K=500，100%
+/// canonical 覆盖)；如 artifact 不存在则回退到 fixture 训练 (K=100，4 类质量
+/// 门槛不保证通过——Knuth hash fallback 主导，仅用于 CI / dev box smoke)。
 fn cached_trained_table() -> Arc<BucketTable> {
     CACHED_TABLE
         .get_or_init(|| {
+            // 优先 load v2 production artifact (§G-batch1 §3.4-batch2 retrain 出口)
+            let v2_path = std::path::Path::new(V2_ARTIFACT_PATH);
+            if v2_path.exists() {
+                return Arc::new(BucketTable::open(v2_path).expect("v2 artifact open"));
+            }
+            // Fallback：fixture 训练（K=100，Knuth hash fallback 主导，质量门槛
+            // 大概率失败；适用于无 artifact 的 CI / dev box smoke 场景）。
+            eprintln!(
+                "warning: v2 artifact not found at {V2_ARTIFACT_PATH}; \
+                 falling back to fixture K=100 training (quality gates may fail)"
+            );
             let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
             Arc::new(BucketTable::train_in_memory(
                 FIXTURE_BUCKET_CONFIG,
@@ -152,6 +181,47 @@ fn std_dev(values: &[f64]) -> f64 {
     var.sqrt()
 }
 
+/// §G-batch1 §3.9 / D-233-rev1：sqrt-scaled bucket quality threshold。
+///
+/// path.md 字面阈值是 K=100 era 校准（Pluribus 论文 200 bucket，path.md
+/// 0.05/0.02 略宽松）；K=500 下 spacing 缩 1/5，均量化指标 ∝ 1/√K。统一公式：
+///
+/// ```text
+/// EMD_THRESHOLD(K) = path_md_emd × √(100/K)        // K=100: 0.020，K=500: 0.00894
+/// STD_DEV_THRESHOLD(K) = path_md_std_dev × √(100/K) // K=100: 0.050，K=500: 0.02236
+/// ```
+fn quality_emd_threshold(k: u32) -> f64 {
+    0.02 * (100.0_f64 / k as f64).sqrt()
+}
+
+fn quality_std_dev_threshold(k: u32) -> f64 {
+    0.05 * (100.0_f64 / k as f64).sqrt()
+}
+
+/// §G-batch1 §3.9 / D-233-rev1：MC-噪声-aware 单调性容差。
+///
+/// 测试用 MonteCarloEquity::with_iter(MC_ITER) 估算每个 sample 的 EHS；MC 噪声
+/// σ_per_sample = √(0.25 / MC_ITER)。bucket 内中位数标准误差 σ_median ≈
+/// 1.253 × σ_per_sample / √n（正态近似；当 n 小时尤其重要）。两个 bucket 中位数
+/// 差的标准误差 σ_diff = √(σ_median_a² + σ_median_b²)。2σ tolerance 接受 |diff|
+/// ≤ 2σ_diff 的 MC 噪声波动。
+///
+/// 例：MC_ITER=1000, n_a=29, n_b=5 → σ_median_a=0.0037, σ_median_b=0.0089,
+/// σ_diff=0.0096, tolerance=0.019（比固定 0.009 全局容差更适应少样本 bucket）。
+fn monotonic_tolerance(n_a: usize, n_b: usize, mc_iter: u32) -> f64 {
+    if n_a == 0 || n_b == 0 {
+        return f64::INFINITY;
+    }
+    let sigma_per_sample = (0.25_f64 / (mc_iter as f64)).sqrt();
+    let sigma_median_a = 1.253 * sigma_per_sample / (n_a as f64).sqrt();
+    let sigma_median_b = 1.253 * sigma_per_sample / (n_b as f64).sqrt();
+    let sigma_diff = (sigma_median_a * sigma_median_a + sigma_median_b * sigma_median_b).sqrt();
+    2.0 * sigma_diff
+}
+
+/// 测试 inner MC iter（`make_calc_short_iter().with_iter(...)` 一致）。
+const TEST_INNER_MC_ITER: u32 = 1_000;
+
 /// 简易中位数（D-236b 单调性测试用）。
 fn median(values: &[f64]) -> f64 {
     let mut sorted: Vec<f64> = values.to_vec();
@@ -181,7 +251,7 @@ fn median(values: &[f64]) -> f64 {
 fn bucket_lookup_1k_in_range_smoke_flop() {
     let table = cached_trained_table();
     let bucket_count_flop = table.bucket_count(StreetTag::Flop);
-    let samples = sample_observations(StreetTag::Flop, 1_000, 0x00C1_C0DE_F10E);
+    let samples = sample_observations(StreetTag::Flop, 10_000, 0x00C1_C0DE_F10E);
     for (i, (board, hole)) in samples.iter().enumerate() {
         let obs_id = canonical_observation_id(StreetTag::Flop, board, *hole);
         let bucket = table
@@ -198,7 +268,7 @@ fn bucket_lookup_1k_in_range_smoke_flop() {
 fn bucket_lookup_1k_in_range_smoke_turn() {
     let table = cached_trained_table();
     let bucket_count_turn = table.bucket_count(StreetTag::Turn);
-    let samples = sample_observations(StreetTag::Turn, 1_000, 0x00C1_C0DE_7A2B);
+    let samples = sample_observations(StreetTag::Turn, 10_000, 0x00C1_C0DE_7A2B);
     for (i, (board, hole)) in samples.iter().enumerate() {
         let obs_id = canonical_observation_id(StreetTag::Turn, board, *hole);
         let bucket = table
@@ -215,7 +285,7 @@ fn bucket_lookup_1k_in_range_smoke_turn() {
 fn bucket_lookup_1k_in_range_smoke_river() {
     let table = cached_trained_table();
     let bucket_count_river = table.bucket_count(StreetTag::River);
-    let samples = sample_observations(StreetTag::River, 1_000, 0x00C1_C0DE_71BB);
+    let samples = sample_observations(StreetTag::River, 10_000, 0x00C1_C0DE_71BB);
     for (i, (board, hole)) in samples.iter().enumerate() {
         let obs_id = canonical_observation_id(StreetTag::River, board, *hole);
         let bucket = table
@@ -275,64 +345,38 @@ fn bucket_lookup_1m_in_range_full() {
 //
 // 默认 active：4 条 helper sanity（emd / std_dev / median）+ 3 条 1k smoke
 // in-range + 1 条 1M smoke（`#[ignore]` opt-in）。
+/// §G-batch1 §3.8 [实现]：deterministic 全枚举（vs §C-rev2 sample 5×K Poisson 路径）
+/// — Production-mode 100% canonical 覆盖 + `lookup_table[id] = bucket_id` 全密集
+/// 写入下，"0 空 bucket" 是 lookup_table 的字面属性而非随机采样统计性质。
+fn assert_no_empty_bucket(table: &BucketTable, street: StreetTag) {
+    let bucket_count = table.bucket_count(street);
+    let n_canonical = table.n_canonical_observation(street);
+    let mut hit = vec![false; bucket_count as usize];
+    for id in 0..n_canonical {
+        if let Some(b) = table.lookup(street, id) {
+            hit[b as usize] = true;
+        }
+    }
+    let empty_count = hit.iter().filter(|h| !**h).count();
+    assert_eq!(
+        empty_count, 0,
+        "D-236 / validation §3：{street:?} {empty_count} 个 bucket 空（共 {bucket_count}；N_canonical={n_canonical}）"
+    );
+}
+
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn no_empty_bucket_per_street_flop() {
-    let table = cached_trained_table();
-    let bucket_count = table.bucket_count(StreetTag::Flop);
-    let samples = sample_observations(StreetTag::Flop, 5 * bucket_count as usize, 0x000C_1EBA_F10E);
-    let mut hit = vec![false; bucket_count as usize];
-    for (board, hole) in &samples {
-        let obs_id = canonical_observation_id(StreetTag::Flop, board, *hole);
-        if let Some(b) = table.lookup(StreetTag::Flop, obs_id) {
-            hit[b as usize] = true;
-        }
-    }
-    let empty_count = hit.iter().filter(|h| !**h).count();
-    assert_eq!(
-        empty_count, 0,
-        "D-236 / validation §3：flop {empty_count} 个 bucket 空（共 {bucket_count}）"
-    );
+    assert_no_empty_bucket(&cached_trained_table(), StreetTag::Flop);
 }
 
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn no_empty_bucket_per_street_turn() {
-    let table = cached_trained_table();
-    let bucket_count = table.bucket_count(StreetTag::Turn);
-    let samples = sample_observations(StreetTag::Turn, 5 * bucket_count as usize, 0x000C_1EBA_7A2B);
-    let mut hit = vec![false; bucket_count as usize];
-    for (board, hole) in &samples {
-        let obs_id = canonical_observation_id(StreetTag::Turn, board, *hole);
-        if let Some(b) = table.lookup(StreetTag::Turn, obs_id) {
-            hit[b as usize] = true;
-        }
-    }
-    let empty_count = hit.iter().filter(|h| !**h).count();
-    assert_eq!(
-        empty_count, 0,
-        "D-236 / validation §3：turn {empty_count} 个 bucket 空"
-    );
+    assert_no_empty_bucket(&cached_trained_table(), StreetTag::Turn);
 }
 
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
 fn no_empty_bucket_per_street_river() {
-    let table = cached_trained_table();
-    let bucket_count = table.bucket_count(StreetTag::River);
-    let samples = sample_observations(StreetTag::River, 5 * bucket_count as usize, 0xC1EB_A71B);
-    let mut hit = vec![false; bucket_count as usize];
-    for (board, hole) in &samples {
-        let obs_id = canonical_observation_id(StreetTag::River, board, *hole);
-        if let Some(b) = table.lookup(StreetTag::River, obs_id) {
-            hit[b as usize] = true;
-        }
-    }
-    let empty_count = hit.iter().filter(|h| !**h).count();
-    assert_eq!(
-        empty_count, 0,
-        "D-236 / validation §3：river {empty_count} 个 bucket 空"
-    );
+    assert_no_empty_bucket(&cached_trained_table(), StreetTag::River);
 }
 
 // ============================================================================
@@ -347,12 +391,12 @@ fn no_empty_bucket_per_street_river() {
 // 采样：每条街 1000 sample（C1 1.5 人周限速）；EHS 用 `equity` 接口，1k iter
 // MC（标准误差 ≈ 0.016 < 0.05 阈值的 ~30% — 不会主导信号）。三街独立 #[test]。
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
+
 fn bucket_internal_ehs_std_dev_below_threshold_flop() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
     let bucket_count = table.bucket_count(StreetTag::Flop) as usize;
-    let samples = sample_observations(StreetTag::Flop, 1_000, 0x000C_157D_F10E);
+    let samples = sample_observations(StreetTag::Flop, 10_000, 0x000C_157D_F10E);
 
     let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -371,26 +415,28 @@ fn bucket_internal_ehs_std_dev_below_threshold_flop() {
             .expect("EHS：合法 (board, hole) sample");
         by_bucket[bucket].push(ehs);
     }
+    let threshold = quality_std_dev_threshold(bucket_count as u32);
     for (bid, samples) in by_bucket.iter().enumerate() {
         if samples.len() < 2 {
             continue;
         }
         let sd = std_dev(samples);
         assert!(
-            sd < 0.05,
-            "validation §3 (flop)：bucket {bid} EHS std dev {sd} >= 0.05（n={}）",
+            sd < threshold,
+            "D-233-rev1 (flop)：bucket {bid} EHS std dev {sd} >= {threshold:.5} \
+             (sqrt-scaled K={bucket_count}; n={})",
             samples.len()
         );
     }
 }
 
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
+
 fn bucket_internal_ehs_std_dev_below_threshold_turn() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
     let bucket_count = table.bucket_count(StreetTag::Turn) as usize;
-    let samples = sample_observations(StreetTag::Turn, 1_000, 0x000C_157D_7A2B);
+    let samples = sample_observations(StreetTag::Turn, 10_000, 0x000C_157D_7A2B);
 
     let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -407,25 +453,28 @@ fn bucket_internal_ehs_std_dev_below_threshold_turn() {
         let ehs = calc.equity(*hole, board, &mut rng).expect("EHS turn");
         by_bucket[bucket].push(ehs);
     }
+    let threshold = quality_std_dev_threshold(bucket_count as u32);
     for (bid, samples) in by_bucket.iter().enumerate() {
         if samples.len() < 2 {
             continue;
         }
         let sd = std_dev(samples);
         assert!(
-            sd < 0.05,
-            "validation §3 (turn)：bucket {bid} EHS std dev {sd} >= 0.05"
+            sd < threshold,
+            "D-233-rev1 (turn)：bucket {bid} EHS std dev {sd} >= {threshold:.5} \
+             (sqrt-scaled K={bucket_count}; n={})",
+            samples.len()
         );
     }
 }
 
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
+
 fn bucket_internal_ehs_std_dev_below_threshold_river() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
     let bucket_count = table.bucket_count(StreetTag::River) as usize;
-    let samples = sample_observations(StreetTag::River, 1_000, 0xC157_D71B);
+    let samples = sample_observations(StreetTag::River, 10_000, 0xC157_D71B);
 
     let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -442,14 +491,17 @@ fn bucket_internal_ehs_std_dev_below_threshold_river() {
         let ehs = calc.equity(*hole, board, &mut rng).expect("EHS river");
         by_bucket[bucket].push(ehs);
     }
+    let threshold = quality_std_dev_threshold(bucket_count as u32);
     for (bid, samples) in by_bucket.iter().enumerate() {
         if samples.len() < 2 {
             continue;
         }
         let sd = std_dev(samples);
         assert!(
-            sd < 0.05,
-            "validation §3 (river)：bucket {bid} EHS std dev {sd} >= 0.05"
+            sd < threshold,
+            "D-233-rev1 (river)：bucket {bid} EHS std dev {sd} >= {threshold:.5} \
+             (sqrt-scaled K={bucket_count}; n={})",
+            samples.len()
         );
     }
 }
@@ -462,12 +514,12 @@ fn bucket_internal_ehs_std_dev_below_threshold_river() {
 // **C1 状态**：B2 stub 全部映射到 bucket 0 → bucket 0 vs 1..499 比较时 1..499
 // 全空，`emd_1d` 返回 0 ⇒ `#[ignore]`。C2 落地后 499 对相邻每对 EMD ≥ 0.02。
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
+
 fn adjacent_bucket_emd_above_threshold_flop() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
     let bucket_count = table.bucket_count(StreetTag::Flop) as usize;
-    let samples = sample_observations(StreetTag::Flop, 1_000, 0x000C_1EAD_F10E);
+    let samples = sample_observations(StreetTag::Flop, 10_000, 0x000C_1EAD_F10E);
 
     let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -484,24 +536,25 @@ fn adjacent_bucket_emd_above_threshold_flop() {
         let ehs = calc.equity(*hole, board, &mut rng).expect("EHS flop EMD");
         by_bucket[bucket].push(ehs);
     }
-    let t_emd: f64 = 0.02;
+    let t_emd = quality_emd_threshold(bucket_count as u32);
     for k in 0..(bucket_count - 1) {
         let emd = emd_1d_unit_interval(&by_bucket[k], &by_bucket[k + 1]);
         assert!(
             emd >= t_emd,
-            "D-233 (flop)：bucket {k} vs {} EMD {emd} < T_emd {t_emd}",
+            "D-233-rev1 (flop)：bucket {k} vs {} EMD {emd} < T_emd {t_emd:.5} \
+             (sqrt-scaled K={bucket_count})",
             k + 1
         );
     }
 }
 
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
+
 fn adjacent_bucket_emd_above_threshold_turn() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
     let bucket_count = table.bucket_count(StreetTag::Turn) as usize;
-    let samples = sample_observations(StreetTag::Turn, 1_000, 0x000C_1EAD_7A2B);
+    let samples = sample_observations(StreetTag::Turn, 10_000, 0x000C_1EAD_7A2B);
 
     let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -518,24 +571,25 @@ fn adjacent_bucket_emd_above_threshold_turn() {
         let ehs = calc.equity(*hole, board, &mut rng).expect("EHS turn EMD");
         by_bucket[bucket].push(ehs);
     }
-    let t_emd: f64 = 0.02;
+    let t_emd = quality_emd_threshold(bucket_count as u32);
     for k in 0..(bucket_count - 1) {
         let emd = emd_1d_unit_interval(&by_bucket[k], &by_bucket[k + 1]);
         assert!(
             emd >= t_emd,
-            "D-233 (turn)：bucket {k} vs {} EMD {emd} < T_emd",
+            "D-233-rev1 (turn)：bucket {k} vs {} EMD {emd} < T_emd {t_emd:.5} \
+             (sqrt-scaled K={bucket_count})",
             k + 1
         );
     }
 }
 
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
+
 fn adjacent_bucket_emd_above_threshold_river() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
     let bucket_count = table.bucket_count(StreetTag::River) as usize;
-    let samples = sample_observations(StreetTag::River, 1_000, 0xC1EA_D71B);
+    let samples = sample_observations(StreetTag::River, 10_000, 0xC1EA_D71B);
 
     let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -552,12 +606,13 @@ fn adjacent_bucket_emd_above_threshold_river() {
         let ehs = calc.equity(*hole, board, &mut rng).expect("EHS river EMD");
         by_bucket[bucket].push(ehs);
     }
-    let t_emd: f64 = 0.02;
+    let t_emd = quality_emd_threshold(bucket_count as u32);
     for k in 0..(bucket_count - 1) {
         let emd = emd_1d_unit_interval(&by_bucket[k], &by_bucket[k + 1]);
         assert!(
             emd >= t_emd,
-            "D-233 (river)：bucket {k} vs {} EMD {emd} < T_emd",
+            "D-233-rev1 (river)：bucket {k} vs {} EMD {emd} < T_emd {t_emd:.5} \
+             (sqrt-scaled K={bucket_count})",
             k + 1
         );
     }
@@ -574,12 +629,12 @@ fn adjacent_bucket_emd_above_threshold_river() {
 // 中位数 NaN（短路：`samples.len() < 2` 跳过 → 整条单调链不可比较 → 测试 fail）。
 // `#[ignore]` 留 C2。
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
+
 fn bucket_id_ehs_median_monotonic_flop() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
     let bucket_count = table.bucket_count(StreetTag::Flop) as usize;
-    let samples = sample_observations(StreetTag::Flop, 2_000, 0x000C_1A0B_F10E);
+    let samples = sample_observations(StreetTag::Flop, 10_000, 0x000C_1A0B_F10E);
 
     let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -598,32 +653,36 @@ fn bucket_id_ehs_median_monotonic_flop() {
             .expect("EHS flop median");
         by_bucket[bucket].push(ehs);
     }
-    let medians: Vec<(usize, f64)> = (0..bucket_count)
+    let medians: Vec<(usize, f64, usize)> = (0..bucket_count)
         .filter_map(|b| {
-            if by_bucket[b].len() < 2 {
+            let n = by_bucket[b].len();
+            if n < 2 {
                 None
             } else {
-                Some((b, median(&by_bucket[b])))
+                Some((b, median(&by_bucket[b]), n))
             }
         })
         .collect();
     for w in medians.windows(2) {
-        let (b0, m0) = w[0];
-        let (b1, m1) = w[1];
+        let (b0, m0, n0) = w[0];
+        let (b1, m1, n1) = w[1];
+        let tol = monotonic_tolerance(n0, n1, TEST_INNER_MC_ITER);
         assert!(
-            m1 >= m0,
-            "D-236b (flop)：bucket {b0} median {m0} > bucket {b1} median {m1}（单调违反）"
+            m1 + tol >= m0,
+            "D-233-rev1 / D-236b (flop)：bucket {b0} median {m0} > bucket {b1} \
+             median {m1}（diff {} > MC-aware tol {tol:.4}; n0={n0} n1={n1}）",
+            m0 - m1
         );
     }
 }
 
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
+
 fn bucket_id_ehs_median_monotonic_turn() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
     let bucket_count = table.bucket_count(StreetTag::Turn) as usize;
-    let samples = sample_observations(StreetTag::Turn, 2_000, 0x000C_1A0B_7A2B);
+    let samples = sample_observations(StreetTag::Turn, 10_000, 0x000C_1A0B_7A2B);
 
     let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -642,32 +701,36 @@ fn bucket_id_ehs_median_monotonic_turn() {
             .expect("EHS turn median");
         by_bucket[bucket].push(ehs);
     }
-    let medians: Vec<(usize, f64)> = (0..bucket_count)
+    let medians: Vec<(usize, f64, usize)> = (0..bucket_count)
         .filter_map(|b| {
-            if by_bucket[b].len() < 2 {
+            let n = by_bucket[b].len();
+            if n < 2 {
                 None
             } else {
-                Some((b, median(&by_bucket[b])))
+                Some((b, median(&by_bucket[b]), n))
             }
         })
         .collect();
     for w in medians.windows(2) {
-        let (b0, m0) = w[0];
-        let (b1, m1) = w[1];
+        let (b0, m0, n0) = w[0];
+        let (b1, m1, n1) = w[1];
+        let tol = monotonic_tolerance(n0, n1, TEST_INNER_MC_ITER);
         assert!(
-            m1 >= m0,
-            "D-236b (turn)：bucket {b0} median {m0} > {b1} median {m1}"
+            m1 + tol >= m0,
+            "D-233-rev1 / D-236b (turn)：bucket {b0} median {m0} > bucket {b1} \
+             median {m1}（diff {} > MC-aware tol {tol:.4}; n0={n0} n1={n1}）",
+            m0 - m1
         );
     }
 }
 
 #[test]
-#[ignore = "§G-batch1 §3: D-218-rev2 [实现] 真等价类枚举落地后转 active（origin §C-rev1 §2: hash-based canonical_observation_id 碰撞限制）"]
+
 fn bucket_id_ehs_median_monotonic_river() {
     let table = cached_trained_table();
     let calc = make_calc_short_iter();
     let bucket_count = table.bucket_count(StreetTag::River) as usize;
-    let samples = sample_observations(StreetTag::River, 2_000, 0xC1A0_B71B);
+    let samples = sample_observations(StreetTag::River, 10_000, 0xC1A0_B71B);
 
     let mut by_bucket: Vec<Vec<f64>> = vec![Vec::new(); bucket_count];
     for (i, (board, hole)) in samples.iter().enumerate() {
@@ -686,21 +749,25 @@ fn bucket_id_ehs_median_monotonic_river() {
             .expect("EHS river median");
         by_bucket[bucket].push(ehs);
     }
-    let medians: Vec<(usize, f64)> = (0..bucket_count)
+    let medians: Vec<(usize, f64, usize)> = (0..bucket_count)
         .filter_map(|b| {
-            if by_bucket[b].len() < 2 {
+            let n = by_bucket[b].len();
+            if n < 2 {
                 None
             } else {
-                Some((b, median(&by_bucket[b])))
+                Some((b, median(&by_bucket[b]), n))
             }
         })
         .collect();
     for w in medians.windows(2) {
-        let (b0, m0) = w[0];
-        let (b1, m1) = w[1];
+        let (b0, m0, n0) = w[0];
+        let (b1, m1, n1) = w[1];
+        let tol = monotonic_tolerance(n0, n1, TEST_INNER_MC_ITER);
         assert!(
-            m1 >= m0,
-            "D-236b (river)：bucket {b0} median {m0} > {b1} median {m1}"
+            m1 + tol >= m0,
+            "D-233-rev1 / D-236b (river)：bucket {b0} median {m0} > bucket {b1} \
+             median {m1}（diff {} > MC-aware tol {tol:.4}; n0={n0} n1={n1}）",
+            m0 - m1
         );
     }
 }

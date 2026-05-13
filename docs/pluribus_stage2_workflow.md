@@ -2553,3 +2553,71 @@ deliverable c，本 closure 不阻塞）。
 §G-batch1 §1 [决策] 角色边界审计：本 commit 仅修 `docs/pluribus_stage2_decisions.md` §10 + 本文档 §G-batch1 §1（前置 carry forward）+ `CLAUDE.md` 状态翻面。`src/` / `tests/` / `benches/` / `fuzz/` / `tools/` / `proto/` / `Cargo.toml` / `Cargo.lock` / `pluribus_stage2_api.md` / `pluribus_stage2_validation.md` **未修改一行**——0 越界（继承 stage-1 §F-rev2 / §F-rev0 / §C-rev1 0 越界形态）。
 
 下一步：§G-batch1 §2 [测试]（`tests/canonical_observation.rs` uniqueness 测试 + `tests/bucket_quality.rs` 12 ignore 转 active 准备）。
+
+##### §G-batch1 §3.9 [实现]（2026-05-13）：single-phase full N + per-street cluster_iter + rayon kmeans_fit_production + D-233-rev1 sqrt-scaled thresholds
+
+§G-batch1 §3.8 报告 §7 全 N 替代方案分析 + 用户授权 "取消 2M cap 走全 N + iter=2000/5000/10000 + 调 EMD/monotonic 不合理标准" 三项一起落地。本 batch 同时触发多 D-NNN-revM 修订：
+
+- **D-244-rev3**（详 `pluribus_stage2_decisions.md` §10 修订历史）：Production training 改 single-phase full N + rayon `kmeans_fit_production` + per-street `ClusterIter { flop, turn, river }`。
+- **D-233-rev1**（同上）：path.md 字面 `< 0.05 / ≥ 0.02 / monotonic` → sqrt-scaled `× √(100/K)` + MC-noise-aware monotonic tolerance。
+
+**代码 commit 1（src + tools，本 batch [实现] 主体）** — commit `6c9b938`：
+
+1. `src/abstraction/cluster.rs` 新增 `pub fn kmeans_fit_production(...)`（rayon par_iter assignment + chunked 确定性 centroid sum reduction + N 上限 200M）+ `KMEANS_PRODUCTION_N_MAX = 200_000_000` + `KMEANS_PRODUCTION_CHUNK_SIZE = 200_000` + 私函数 `split_empty_cluster_par`（par max-find + 确定性 tie-break）。Fixture 路径走 sequential `kmeans_fit`（既有）保 §3.3 fixture artifact `a6989eeb...` byte-equal。
+
+2. `src/abstraction/bucket_table.rs`：
+   - 新增 `pub struct ClusterIter { flop, turn, river }` + `::uniform(iter)` / `::production_default() = { flop: 2000, turn: 5000, river: 10000 }`。
+   - 新增 `pub fn train_in_memory_with_mode_iter(...)`（per-street iter 入参）；既有 `train_in_memory` / `train_in_memory_with_mode(cluster_iter: u32)` 签名 byte-equal 维持。
+   - `train_one_street` Production 路径重写 single-phase full N：候选 via `canonical_enum::nth_canonical_form(street, id)` 全 N 枚举 → rayon par_iter features compute → `kmeans_fit_production` → D-236b reorder → `lookup_table[id] = assignments[id]` 直接（删除 §G-batch1 §3.4 dual-phase phase 2 enumerate-assign 段）。
+   - 删除 `pub const PRODUCTION_PHASE1_MAX_SAMPLES = 2_000_000`。
+
+3. `src/lib.rs`：`pub use ClusterIter` re-export。
+
+4. `tools/train_bucket_table.rs` 加 `--cluster-iter-flop/turn/river` 三个 per-street flag；legacy `--cluster-iter <N>` 保留作 `ClusterIter::uniform(N)`（互斥）。
+
+**5 道 gate 全绿** + **Fixture-mode smoke** on AWS 32-core c6a.8xlarge 61 GB IP `18.217.90.217`：
+
+```text
+[train_bucket_table] mode=Fixture flop=10/turn=10/river=10 cluster_iter=uniform(100)
+BLAKE3 = a6989eeb1dc618ef8a6b375d6af1dcef547a96cdb2c0e84e4b6341562183c2b6  ← byte-equal §3.3 ✓
+Total wall: 12.1 s (vs vultr 4-core §3.3 18.4 s)
+```
+
+Fixture pipeline byte-equal 维持，sqrt-scaled threshold + rayon kmeans_fit_production 不破现有 Fixture artifact。
+
+**代码 commit 2（tests + docs，本 batch 同 PR）**：
+
+1. `tests/bucket_quality.rs`：
+   - 模块文档头改用 D-233-rev1 描述。
+   - 新增 helper：`quality_emd_threshold(k) = 0.02 × √(100/k)` / `quality_std_dev_threshold(k) = 0.05 × √(100/k)` / `monotonic_tolerance(n_a, n_b, mc_iter) = 2 × √(σ_median_a² + σ_median_b²)` + `TEST_INNER_MC_ITER = 1000`。
+   - 12 条质量门槛断言改用动态 K-aware 阈值；monotonic 加 (n0, n1) 入参算 tolerance。Failure 消息 prefix `D-233-rev1`。
+
+2. `docs/pluribus_stage2_decisions.md` §10 修订历史末尾追加：D-244-rev3 + D-233-rev1 两个 entry。
+
+3. `docs/pluribus_stage2_workflow.md` §修订历史 末尾追加本 §G-batch1 §3.9 entry（即本节）。
+
+4. `CLAUDE.md` stage 2 progress 段：§G-batch1 §3.9 状态翻面占位（v3 artifact ground truth 待 retrain 后填入）。
+
+**角色边界 [测试] ↔ [实现] ↔ [决策] ↔ [报告] 多角色 carve-out**（与 §G-batch1 §3.2 / §3.8 同型；用户授权三动作一起走）：本 batch 同时触及 `[实现]`（src + tools）+ `[测试]`（tests/bucket_quality.rs 阈值改）+ `[决策]`（D-244-rev3 + D-233-rev1）+ `[报告]`（workflow + CLAUDE.md）四类角色。Stage 1 §B-rev1 §3 multi-role 政策继承生效。
+
+**§G-batch1 §3.4-batch1.5 carve-out 翻面**：commit message 字面 "vultr 4-core byte-equal" 由本 §3.9 形态取代——vultr OOM 在 AWS 16-core 30 GB / 32-core 61 GB host 上不再适用，single-phase full N 不可行约束消失。`tests/clustering_determinism.rs` `clustering_repeat_blake3_byte_equal` 默认 fixture mode 路径继续 byte-equal v2 / v3 fixture artifact `a6989eeb...`。
+
+**v3 retrain on AWS** — c6a.8xlarge 32-core 61 GB on-demand，本 entry closure 后启动：
+
+```bash
+ssh -i ~/us-east-2.pem ubuntu@18.217.90.217 \
+    'cd ~/dezhou_20260508 && git pull && source ~/.cargo/env && \
+     cargo build --release --bin train_bucket_table && \
+     ./target/release/train_bucket_table --mode production \
+       --output artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin \
+       2>&1 | tee artifacts/train_v3.log'
+```
+
+默认 `ClusterIter::production_default()` (flop 2000 / turn 5000 / river 10000)。Wall 估算 12-25h on 32-core (vs 16-core 25-40h)；完成后产物：
+
+- `artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin` ~528 MiB
+- BLAKE3 body hash（待 retrain 后录入）
+- 19 条 `cargo test --release --test bucket_quality` 实测（v3 + D-233-rev1 sqrt-scaled threshold）
+- v3 报告 `docs/pluribus_stage2_bucket_quality_v3_test_report.md` 替代 v2 报告
+
+下一步：commit + push（tests + docs commit 2）+ 起 AWS 32-core retrain v3 artifact + 跑 19 条 bucket_quality 实测 + 写 v3 报告 + CLAUDE.md ground truth artifact hash 切到 v3。
