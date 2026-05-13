@@ -251,6 +251,66 @@
     cross-validation 桶 B-2way (28 seeds) / 桶 B-3way (67 seeds) 由该 bug
     产生，详见 `docs/xvalidate_100k_diverged_seeds.md`。
 
+- **D-022b-rev1** (2026-05-13)：把 D-022b "SB = 按钮左 1、BB = 按钮左 2" 机械推导
+  的作用域显式收紧到 `n_seats >= 3`，并把 `n_seats == 2`（heads-up）路径打开为
+  **标准 HU NLHE 语义** `button = SB / non-button = BB`。原 D-022b 文本对
+  n_seats==2 不显式区分；按机械推导 SB=button+1=non-button、BB=button+2=button
+  会让 BB 等于按钮位，与全行业标准 heads-up 约定相反（标准 HU：按钮位 post SB
+  以让按钮拥有 preflop position 优势）。stage 1 `validate_config` 因此 hard-reject
+  `n_seats==2` 至 stage 3 起步。
+  - **背景**：stage 3 D-313 字面 "2-player + 100 BB starting stack" 要求 2-player
+    NLHE 训练 testbed；`tests/cfr_simplified_nlhe.rs::simplified_nlhe_game_root_state_2_player_100bb_starting_stack`
+    断言 `players().len() == 2`。stage 1 `validate_config` 的 hard-reject
+    与 stage 3 必需的 2-player runtime 直接冲突。原 `validate_config` 注释字面
+    指向 "D-022b-revM button-posts-SB handling" 为唯一合法解锁路径。
+  - **新规则**（stage 3 C2 [实现] 起步前用户授权 2026-05-13 落地）：
+    1. `validate_config` 接受范围由 `3..=9` 扩展为 `2..=9`（D-030 spec 范围全开）。
+    2. `small_blind_seat()`：n_seats==2 时返回 `config.button_seat`；n_seats>=3 时
+       仍返回 `next_seat(button)`（旧 D-022b 推导）。
+    3. `big_blind_seat()`：n_seats==2 时返回 `next_seat(button)`（非按钮位）；
+       n_seats>=3 时仍返回 `next_seat(small_blind_seat())`。
+    4. **postflop 起手者**：新增 `first_postflop_actor()` = `next_seat(button)`
+       作为 universal NLHE rule。n_seats>=3 等价于 `small_blind_seat()`（旧行为
+       byte-equal）；n_seats==2 等价于 `big_blind_seat()`（OOP 先行 = 标准 HU）。
+       `finish_betting_round` 3 处 flop/turn/river 起手 + `compute_showdown_order`
+       fallback 路径全部从 `first_active_from(small_blind_seat())` 切到
+       `first_active_from(first_postflop_actor())`。
+    5. **preflop 起手者**：`apply` 后调用 `next_player_needing_action_from(
+       next_seat(big_blind_seat()))`，公式不变：
+       - n_seats>=3：next_seat(BB=button+2) = button+3 = UTG ✓
+       - n_seats==2 (HU)：next_seat(BB=non-button) = button = SB 先行 ✓（标准
+         HU：button=SB 先 preflop 行动）
+    6. **showdown_order fallback**：`last_aggressor=None` 时从
+       `first_postflop_actor()` 起向左查找未弃牌座位。n_seats>=3 等价于 SB（旧
+       行为 byte-equal）；n_seats==2 等价于 BB（OOP，标准 HU showdown order）。
+  - **影响**：
+    - `src/rules/state.rs`：`validate_config` 范围放宽 + `small_blind_seat` /
+      `big_blind_seat` 添加 HU 分支 + 新增 `first_postflop_actor` 内部 helper +
+      `finish_betting_round` 3 处 postflop 起手切换 + `compute_showdown_order`
+      fallback 切换。共 5 处 in-place 改动。
+    - **stage 1 既有测试 byte-equal**：所有 `tests/scenarios*` / `tests/cross_validation*` /
+      `tests/side_pots*` / `tests/cross_eval*` / `tests/scenarios_extended*`
+      与 stage 2 `tests/abstraction_fuzz*` / `tests/bucket_table_corruption*`
+      等套件均走 `TableConfig::default_6max_100bb()`（n_seats=6），新分支不命中，
+      预期 byte-equal 维持。`stage1-v1.0` baseline 不退化 + `stage2-v1.0` baseline
+      不退化锚点继续成立。
+    - **不**影响 `HandHistory` schema（`src/history.rs::config_from_proto` 已经
+      `(2..=9).contains(&config.n_seats)` 接受 n_seats==2，历史 schema 早已为
+      此预留 forward-compat 路径，本 rev 仅打通 runtime gate）。不 bump
+      `schema_version`。
+    - **不**影响 `Action` / `LegalActionSet` / `RuleError` / `TableConfig` /
+      `GameState` 公开签名，无需 `API-NNN-revM`。
+    - **stage 3 C2 [实现] 桥接路径**：`SimplifiedNlheGame::new` 构造
+      `TableConfig { n_seats: 2, starting_stacks: vec![ChipAmount::new(10_000); 2],
+      small_blind: ChipAmount::new(50), big_blind: ChipAmount::new(100), ante: 0,
+      button_seat: SeatId(0) }`，与 D-313 字面 "2-player + 100 BB starting stack +
+      盲注 0.5/1.0 BB" 严格对齐（10_000 chips = 100 BB；50/100 chips = 0.5/1.0 BB）。
+  - **撤销条件**：若决策者后续选择 "保留 D-022b 机械推导，HU 反向" 语义（即
+    button=BB 的非标准 HU 约定），需追加 D-022b-rev2 翻转 `small_blind_seat` /
+    `big_blind_seat` 的 n_seats==2 分支 + 同步翻转 `first_postflop_actor` 在 HU 下
+    的语义。但该选择与全行业 HU NLHE 约定相反，需在 D-022b-rev2 显式
+    标注 carve-out。
+
 - **D-037-rev1** (2026-05-08)：D-037 原文 "last_aggressor = **本手内最后一次**
   voluntary bet 或 raise 的玩家" 中的 **作用域** 钉为 **本手最后一次 betting
   round（即 showdown 前的最后一条街）内的最后一次 voluntary bet/raise**，

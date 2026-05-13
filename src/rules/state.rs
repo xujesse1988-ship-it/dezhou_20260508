@@ -546,19 +546,19 @@ impl GameState {
                 self.reset_round_for_next_street();
                 self.deal_board_to(3);
                 self.street = Street::Flop;
-                self.current_player = self.first_active_from(self.small_blind_seat());
+                self.current_player = self.first_active_from(self.first_postflop_actor());
             }
             Street::Flop => {
                 self.reset_round_for_next_street();
                 self.deal_board_to(4);
                 self.street = Street::Turn;
-                self.current_player = self.first_active_from(self.small_blind_seat());
+                self.current_player = self.first_active_from(self.first_postflop_actor());
             }
             Street::Turn => {
                 self.reset_round_for_next_street();
                 self.deal_board_to(5);
                 self.street = Street::River;
-                self.current_player = self.first_active_from(self.small_blind_seat());
+                self.current_player = self.first_active_from(self.first_postflop_actor());
             }
             Street::River => {
                 self.reset_committed_this_round();
@@ -892,7 +892,7 @@ impl GameState {
         let start = self
             .last_aggressor
             .filter(|seat| self.players[seat.0 as usize].status != PlayerStatus::Folded)
-            .unwrap_or_else(|| self.small_blind_seat());
+            .unwrap_or_else(|| self.first_postflop_actor());
         let mut order = Vec::new();
         for offset in 0..n {
             let seat = SeatId(((start.0 as usize + offset) % n) as u8);
@@ -904,11 +904,36 @@ impl GameState {
     }
 
     fn small_blind_seat(&self) -> SeatId {
-        self.next_seat(self.config.button_seat)
+        // D-022b-rev1：n_seats==2 走 button=SB 标准 HU 语义；n_seats>=3 仍按
+        // D-022b 机械推导 SB=button+1。
+        if self.players.len() == 2 {
+            self.config.button_seat
+        } else {
+            self.next_seat(self.config.button_seat)
+        }
     }
 
     fn big_blind_seat(&self) -> SeatId {
-        self.next_seat(self.small_blind_seat())
+        // D-022b-rev1：n_seats==2 走 BB=non-button=button+1；n_seats>=3 仍按
+        // D-022b 机械推导 BB=button+2。
+        if self.players.len() == 2 {
+            self.next_seat(self.config.button_seat)
+        } else {
+            self.next_seat(self.small_blind_seat())
+        }
+    }
+
+    /// postflop 第一个行动者（universal NLHE rule：next_seat(button)）。
+    ///
+    /// - n_seats>=3：next_seat(button) = button+1 = SB
+    /// - n_seats==2 (D-022b-rev1)：next_seat(button) = non-button = BB（OOP 先行）
+    ///
+    /// 取代了 finish_betting_round / compute_showdown_order 内的
+    /// `first_active_from(small_blind_seat())` 路径（D-022b-rev1 之前 SB/BB
+    /// 等价于 button+1/+2，二者在 n_seats>=3 上 byte-equal；HU 启用后必须显式
+    /// 走 next_seat(button) 才能让 OOP=BB 先行）。
+    fn first_postflop_actor(&self) -> SeatId {
+        self.next_seat(self.config.button_seat)
     }
 
     fn next_seat(&self, seat: SeatId) -> SeatId {
@@ -928,18 +953,16 @@ fn empty_legal_actions() -> LegalActionSet {
 }
 
 fn validate_config(config: &TableConfig) {
-    // D-030 names 2..=9 as the spec range, but stage-1 SB/BB derivation per
-    // D-022b ("SB = button+1, BB = button+2") collapses to "BB = button" when
-    // n_seats == 2 — the opposite of standard heads-up NLHE where the button
-    // posts SB. Heads-up support requires a D-022b-revM amendment plus an
-    // explicit handler, neither of which is in B2 scope. Reject n_seats==2
-    // loudly until that lands rather than silently swap blinds.
+    // D-022b-rev1 (2026-05-13, stage 3 C2 [实现] 起步前授权)：把 n_seats==2 heads-up
+    // 路径打开，按标准 HU NLHE 语义 (button=SB, non-button=BB) 推导盲注 +
+    // postflop OOP 先行。具体规则映射见 small_blind_seat / big_blind_seat /
+    // finish_betting_round / compute_showdown_order 的 n_seats==2 分支。详见
+    // docs/pluribus_stage1_decisions.md §修订历史 D-022b-rev1。
     assert!(
-        (3..=9).contains(&config.n_seats),
-        "TableConfig.n_seats must be in 3..=9 (stage-1 limitation: heads-up \
-         requires D-022b-revM button-posts-SB handling, see CLAUDE.md and \
-         workflow.md §修订历史). Spec D-030 reserves 2..=9 but n_seats==2 \
-         is gated until heads-up support lands."
+        (2..=9).contains(&config.n_seats),
+        "TableConfig.n_seats must be in 2..=9 (D-030 范围；n_seats==2 由 D-022b-rev1 \
+         按标准 HU NLHE 语义 button=SB / non-button=BB 推导，详见 \
+         docs/pluribus_stage1_decisions.md §修订历史 D-022b-rev1)"
     );
     assert_eq!(
         config.starting_stacks.len(),

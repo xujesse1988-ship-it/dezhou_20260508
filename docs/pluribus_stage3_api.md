@@ -785,6 +785,13 @@ assert_eq!(loaded.regret_blake3(), trainer2.regret_blake3());
 
 ### 修订历史
 
+- **2026-05-13（C2 [实现] 落地中暴露）**：API-303 `SimplifiedNlheGame` + `SimplifiedNlheState` + type alias **新增 bucket_table 字段**（`pub(crate) bucket_table: Arc<BucketTable>`）让 `Game::info_set` 静态方法在 postflop 路径上访问 lookup 表。原 A0 batch 5 落地的 `SimplifiedNlheState` 2-field shape（`game_state` + `action_history`）扩展为 3-field（追加 `bucket_table`）；外部消费者只读字段 `pub game_state` / `pub action_history` 不变（继承 stage 1 + stage 2 错误追加不删模式）。`pub use poker::training::nlhe::{SimplifiedNlheState, ...}` 顶层 re-export 同型，公开 API surface 兼容。
+    - `SimplifiedNlheInfoSet = InfoSetId` type alias 不变（**D-317-rev1**：在 stage 2 `InfoSetId.bucket_id` field bits 12..18 编码 6-bit `legal_actions` availability mask 让 D-324 成立；详见 `pluribus_stage3_decisions.md` §10.3）。
+    - `SimplifiedNlheGame::new` 校验 `BucketTable::schema_version() == 2` + `BucketTable::config() == BucketConfig::new(500, 500, 500)`（**D-314-rev1** v3 production artifact lock）。schema_version=1 输入 → `TrainerError::UnsupportedBucketTable`（D-314-rev2 fallback 已废弃）。
+    - `EsMccfrTrainer::step_parallel` C2 落地形态 = **serial-equivalent fallback**（在 `rng_pool` 上循环 single-threaded step；忽略 `n_threads`）。**D-321-rev1** lock = thread-local accumulator + batch merge（候选 ③）；真并发实现 deferred 到 E2 [实现]。外部签名（`pub fn step_parallel(&mut self, rng_pool: &mut [Box<dyn RngSource>], n_threads: usize) -> Result<(), TrainerError>`）不变。
+    - `Game::current` 在 SimplifiedNlheGame 上恒返回 `NodeKind::Player(_)` 或 `NodeKind::Terminal`（chance 已在 root 一次性消费，board 由 stage 1 `GameState::deal_board_to` 自动 deal）；`Game::chance_distribution` 在 SimplifiedNlheGame 上 panic（永远不应被 ES-MCCFR / Vanilla CFR 触发；该约束让 simplified NLHE 路径不引入额外 chance 节点）。
+    - 本节由 C2 [实现] commit 落地，与 `pluribus_stage3_decisions.md` §10.2 D-321-rev1 + §10.3 D-317-rev1 + stage 1 §修订历史 D-022b-rev1 同 commit。
+
 - **2026-05-12（A0 [决策] 起步 batch 5 落地）**：stage 3 A0 [决策] 起步 batch 5 落地 `docs/pluribus_stage3_api.md`（本文档）骨架 + API-300..API-392 全 API surface。本节首条由 stage 3 A0 [决策] batch 5 commit 落地，与 `pluribus_stage3_validation.md` §修订历史 + `pluribus_stage3_decisions.md` §修订历史同步。
     - §1 Game trait: API-300 `Game` trait 通用签名 + 3 个关联类型（State / Action / InfoSet）+ 6 个方法 + `NodeKind` / `PlayerId` 辅助 + 5 条不变量；API-301 `KuhnGame` + `KuhnAction` + `KuhnInfoSet` + `KuhnHistory` + `KuhnState`；API-302 `LeducGame` + `LeducAction` + `LeducInfoSet` + `LeducStreet` + `LeducHistory` + `LeducState`；API-303 `SimplifiedNlheGame` + `SimplifiedNlheState` + type alias `SimplifiedNlheAction = AbstractAction` + `SimplifiedNlheInfoSet = InfoSetId`。
     - §2 Trainer trait: API-310 `Trainer<G: Game>` trait 6 方法（`step` / `current_strategy` / `average_strategy` / `update_count` / `save_checkpoint` / `load_checkpoint`）；API-311 `VanillaCfrTrainer<G>`；API-312 `EsMccfrTrainer<G>` + `step_parallel`；API-313 `TrainerError` 5 variant。
@@ -806,10 +813,10 @@ assert_eq!(loaded.regret_blake3(), trainer2.regret_blake3());
 | API-300 `Game` trait | D-312 | trait 抽象层 |
 | API-301 `KuhnGame` | D-310 | Kuhn 规则 |
 | API-302 `LeducGame` | D-311 | Leduc 规则 |
-| API-303 `SimplifiedNlheGame` | D-313 + D-314 (deferred) | 简化 NLHE 范围 + bucket table 依赖 deferred |
+| API-303 `SimplifiedNlheGame` | D-313 + D-314-rev1 + D-317-rev1 | 简化 NLHE 范围 + bucket table v3 lock + action mask carve-out |
 | API-310 `Trainer` trait | D-371 | trait surface |
 | API-311 `VanillaCfrTrainer` | D-300 | Vanilla CFR for Kuhn/Leduc |
-| API-312 `EsMccfrTrainer` | D-301 + D-321 (deferred) | ES-MCCFR + thread-safety deferred |
+| API-312 `EsMccfrTrainer` | D-301 + D-321-rev1 | ES-MCCFR + thread-local accumulator lock (C2 serial fallback / E2 真并发) |
 | API-313 `TrainerError` | D-324 / D-325 / D-330 | 5 类错误 |
 | API-320 `RegretTable` | D-320 / D-323 / D-328 | HashMap + lazy + query |
 | API-321 `StrategyAccumulator` | D-322 / D-328 | 独立结构 + query |

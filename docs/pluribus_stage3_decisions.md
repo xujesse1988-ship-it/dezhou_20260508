@@ -140,7 +140,7 @@ function average_strategy(I, strategy_sum):
 | D-314 | bucket table 依赖（简化 NLHE） | **deferred**（详见 §10 已知未决项）。bucket table 依赖只在 B2/C2 [实现] 真正构造 `SimplifiedNlheGame` 时被消费，A0..B2 期间 §G-batch1 §3.4-batch2 可在 vultr 并行跑完；到 C2 起步时若 v2 528 MB artifact 已 ready 由 D-314-rev1 lock 为 v2，否则 v1 95 KB fallback 由 D-314-rev2 lock + 显式标注 collision carve-out。 |
 | D-315 | chance distribution / sampling 接口 | **统一走 stage 1 `RngSource`** 显式注入（继承 D-027 + D-050）。chance node 在 `Game::next` 内部按 D-312 `chance_distribution` 返回的离散分布 + `rng.next_u64()` 采样 1 outcome（D-308 在算法层锁定 1-sample，本条锁定具体接口）。**禁止** `rand::thread_rng()` 隐式调用；任何隐式 RNG 是 stage 3 P0 阻塞 bug。Kuhn / Leduc deck shuffle + 简化 NLHE deal hole / deal board 全部走该路径。 |
 | D-316 | terminal payoff utility 计算 | **player 视角整数 chip 净收益直接当 utility**（不归一化、不除以 BB）。`payoff(state, player) -> f64 = (final_stack_chip - initial_stack_chip) as f64`。Kuhn / Leduc 严格零和 `payoff(state, 0) + payoff(state, 1) = 0`；简化 NLHE 含 rake = 0 默认（继承 stage 1）也严格零和。该约定让 exploitability 单位与 path.md §阶段 3 字面 "chips/game" 直接对齐。 |
-| D-317 | InfoSet 识别（history → InfoSetId 映射） | **Kuhn / Leduc** 走 stage 3 独立 InfoSet 编码（`KuhnInfoSetId` / `LeducInfoSetId`，类型不同于 stage 2 `InfoSetId`），按 `(player_private_card, public_history_string)` 直接索引（小博弈无 abstraction 需求，全 InfoSet 唯一）。**简化 NLHE** 走 stage 2 `InfoSetId`（D-215 64-bit layout，继承 `PreflopLossless169` / `PostflopBucketAbstraction`）。该差异由 `Game::info_set` 关联类型 + `Trainer<G: Game>` 泛型表达，避免 InfoSet 类型混用。 |
+| D-317 | InfoSet 识别（history → InfoSetId 映射） | **Kuhn / Leduc** 走 stage 3 独立 InfoSet 编码（`KuhnInfoSetId` / `LeducInfoSetId`，类型不同于 stage 2 `InfoSetId`），按 `(player_private_card, public_history_string)` 直接索引（小博弈无 abstraction 需求，全 InfoSet 唯一）。**简化 NLHE** 走 stage 2 `InfoSetId`（D-215 64-bit layout，继承 `PreflopLossless169` / `PostflopBucketAbstraction`）。该差异由 `Game::info_set` 关联类型 + `Trainer<G: Game>` 泛型表达，避免 InfoSet 类型混用。**D-317-rev1（2026-05-13 C2 [实现] 落地中暴露）**：简化 NLHE 路径在 stage 2 `InfoSetId.bucket_id` field bits 12..18 编码 6-bit `legal_actions` availability mask（D-324 在 stage 2 `stack_bucket` 5 桶 + `DefaultActionAbstraction` 可变长输出下不自动满足；本 rev 把 mask 编码到 bucket_id field 上 carve out，不触及 IA-007 reserved 区域）。详见 §10.3 D-317-rev1 lock 段落。 |
 | D-318 | `Game::legal_actions` 与 stage 2 `ActionAbstraction` 边界 | **Kuhn / Leduc**：`Game::legal_actions` 直接返回 game-specific action 枚举（`KuhnAction { Check, Bet, Call, Fold }` / `LeducAction { ... }`），不经 stage 2 抽象层。**简化 NLHE**：`SimplifiedNlheGame::legal_actions` **内部调用** stage 2 `DefaultActionAbstraction::actions(&GameState)`，把 5-action `AbstractAction` 直接当 `Game::Action` 返回（不再二次抽象）。该约定保持 Kuhn / Leduc 零 stage 2 依赖、简化 NLHE 全 stack stage 2 抽象。 |
 | D-319 | state representation 选型 | **owned clone**（每个 recurse 节点持有独立 `Game::State`），不引入 persistent data structure / state diff / ZipperList。**理由**：① Kuhn / Leduc state size ≤ 100 byte，clone 成本可忽略；② 简化 NLHE state 是 stage 1 `GameState`（继承设计已优化 clone 路径，stage 1 测试 ~5M clone/s）；③ 持久化结构会引入 unsafe / Cow / Rc 等模式与 stage 1 `unsafe_code = "forbid"` 冲突。性能 SLO（D-361）单线程 ≥ 10K update/s 在 owned clone 路径已可达。 |
 
@@ -264,7 +264,7 @@ function average_strategy(I, strategy_sum):
 阶段 3 A0 [决策] batch 1 锁定算法变体 + 验收门槛骨架后仍有以下未决项；列入此处不阻塞 A1 [实现] 脚手架推进，但在 B2/C2 [实现] 真正消费时必须由后续 D-NNN-revM 落地：
 
 - **D-314（bucket table 依赖）** — **已 lock 为 D-314-rev1（2026-05-13，C1 [测试] 起草前）**：bucket table 依赖锁定为 §G-batch1 §3.10 production v3 artifact `artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin`（528 MiB / body BLAKE3 `67ee555439f2c918698650c05f40a7a5e9e812280ceb87fc3c6590add98650cd`）。详见 §10.1 D-314-rev1 lock 段落。**原文（locked 前 / A0 [决策] entry）**：~~简化 NLHE 训练用 stage 2 C2 hash-based 95 KB v1 artifact 还是 §G-batch1 §3.4-batch2 production 528 MB v2 artifact。**A0 [决策] 不锁，runway 给 §G-batch1 §3.4-batch2 在 vultr 并行跑完**：A0..B2 期间（按 stage 2 时间线 2-3 周）若 v2 artifact 已 ready 由 D-314-rev1 lock 为 v2；否则 v1 fallback 由 D-314-rev2 lock 为 v1 + 显式标注已知 collision carve-out。lock 时间窗：B2/C2 [实现] 简化 NLHE `SimplifiedNlheGame` 开始构造之前。该决策 deferred 是用户授权 stage 3 [决策] 优先于 §G-batch1 §3.4-batch2..§4 closure 的直接产物。~~
-- **多线程 ES-MCCFR thread-safety 模型**（D-321 候选）：`RegretTable` HashMap 多线程并发写候选方案（① `parking_lot::RwLock<HashMap>` / ② `dashmap::DashMap` / ③ thread-local accumulator + batch merge / ④ `crossbeam::SegQueue` snapshot reduce）。具体选型留 D-321 在 batch 3 落地，影响 D-361 多线程 SLO 实现路径。
+- ~~**多线程 ES-MCCFR thread-safety 模型**（D-321 候选）：`RegretTable` HashMap 多线程并发写候选方案（① `parking_lot::RwLock<HashMap>` / ② `dashmap::DashMap` / ③ thread-local accumulator + batch merge / ④ `crossbeam::SegQueue` snapshot reduce）。具体选型留 D-321 在 batch 3 落地，影响 D-361 多线程 SLO 实现路径。~~ — **已 lock 为 D-321-rev1（2026-05-13，C2 [实现] 起步前）**：候选 ③ thread-local accumulator + batch merge + C2 commit ship serial-equivalent step_parallel；真并发实现 deferred 到 E2 [实现] 性能优化阶段。详见 §10.2 D-321-rev1 lock 段落。
 - **Linear CFR weighting 引入时间窗**（D-302-rev1 候选）：阶段 3 出口（F3 [报告]）若 simplified NLHE 100M update 后 LBR 实测高于 stage 4 起步 acceptance 预期，可选择在 stage 3 出口前引入 Linear CFR weighting 提前消化收敛速度问题。lock 时间窗：F2 [实现] 收尾前 + 用户授权。
 - **regret matching+ 引入时间窗**（D-303-rev1 候选）：同 D-302-rev1，与 Linear CFR 联动。lock 时间窗：F2 [实现] 收尾前 + 用户授权。
 
@@ -292,6 +292,120 @@ function average_strategy(I, strategy_sum):
 **D-314-rev2（v1 95 KB fallback）废弃路径**：A0 [决策] entry 字面预留的 v1 fallback 在 §G-batch1 §3.10 v3 artifact 落地后不再需要。C2 [实现] 落地 `SimplifiedNlheGame::new` 时直接拒绝 schema_version=1，不留 v1 兼容入口。
 
 **carve-out**：本 lock 由 C1 [测试] agent 落地决策文档变更，属 stage 3 workflow 字面授权的角色越界（与 stage 2 §B-rev1 / stage 3 §B-rev0 同型）。本 §10.1 entry 同 commit 落地，无需独立 `pluribus_stage3_workflow.md` §修订历史 entry 追认（workflow line 206 字面授权 = 修订历史 entry 等价物）。
+
+---
+
+### 10.2 D-321-rev1 lock（C2 [实现] 起步前，2026-05-13）
+
+**触发器**：`pluribus_stage3_workflow.md` §步骤 C2 line 216 字面 "D-321 thread-safety 模型在 C2 [实现] 起步前 lock；C2 commit 锁定具体实现" + line 441 carry-forward + D-321 4 候选并行 deferred。本 lock 由 C2 [实现] agent 在 2026-05-13 用户授权下落地（与 §10.1 D-314-rev1 同型：D-NNN-revM 文档变更由非 [决策] role 在 workflow 字面授权下执行）。
+
+**lock 决定**：thread-safety 模型 = 候选 ③ **thread-local accumulator + batch merge**。C2 commit ship "serial-equivalent step_parallel"（在 rng_pool 上循环单线程 step；不引入实际跨线程同步），真并发实现 deferred 到 E2 [实现] 性能优化阶段。
+
+**理由**：
+- C1 [测试] 全 5 条测试（D-313 root / D-318 桥接 / D-317 桥接 / D-342 1K smoke / D-362 1M × 3 BLAKE3 byte-equal）均走单线程 `EsMccfrTrainer::step`，不消费 `step_parallel`。C2 commit 主线交付目标 = "C1 5 条测试全部转绿"，不依赖多线程实现。
+- 候选 ③（thread-local accumulator）让 regret accumulator 在每线程独立持有 owned clone，per-step 末端 batch merge 到主表。该路径 vs ① RwLock / ② DashMap 的优势：① / ② 在 lock contention 下 4-core throughput 通常退化到 1.5× 单线程（已知 HashMap 全锁 / 细粒度锁 fan-in pattern）；③ 在 batch merge 间无 lock 接触，4-core 接近 4× 线性 scaling。候选 ④（crossbeam::SegQueue）适合 producer-consumer 模式与 CFR backward induction cfv 累积语义不匹配。
+- D-361 多线程 SLO（4-core `≥ 50,000 update/s`，效率 `≥ 0.5`）实测落地在 E1 [测试]；E2 [实现] 可基于实测瓶颈选 ③ 之 sub-variant（如 lock-free merge 或 channel-based reduce）。C2 commit 锁定 ③ 路径方向，sub-variant 由 E2 实测决定，不在 C2 commit 内细化。
+- **D-373 依赖**：C2 commit 不引入 `parking_lot` / `dashmap` / `crossbeam` 任一 thread-safety crate（候选 ③ 走 std `Vec<f64>` + `HashMap` clone 即可）。`Cargo.toml [dependencies]` 在 C2 commit 内继续保持 bincode + tempfile 2 crate；E2 [实现] 评估是否需新增 `rayon = "1"`（thread pool） / `crossbeam-channel = "0.5"`（batch merge channel）。
+
+**调用契约**（C2 commit 内 `EsMccfrTrainer::step_parallel` 接口形态）：
+
+```rust
+impl<G: Game> EsMccfrTrainer<G> {
+    /// C2 [实现] commit ship serial-equivalent fallback（D-321-rev1 lock）：
+    /// 在 `rng_pool` 上循环 single-threaded `step`；忽略 `n_threads` 参数。E2
+    /// [实现] 落地真并发后翻面为 thread-local accumulator + batch merge 真路径。
+    pub fn step_parallel(
+        &mut self,
+        rng_pool: &mut [Box<dyn RngSource>],
+        _n_threads: usize,
+    ) -> Result<(), TrainerError> {
+        for rng in rng_pool.iter_mut() {
+            self.step(rng.as_mut())?;
+        }
+        Ok(())
+    }
+}
+```
+
+**E2 [实现] 路径预告**（D-321-rev1 之外的 sub-variant 决策窗口）：
+1. 替换 `step_parallel` 内部循环为 `std::thread::scope` × n_threads 并行 spawn；每 spawn 持有 thread-local `(RegretTable, StrategyAccumulator)` clone。
+2. spawn 结束后 main thread 走 batch merge：遍历每个 thread-local accumulator 的 HashMap entries → 累加到 main accumulator（accumulate 走 D-305 标准 CFR update + D-322 strategy_sum 累积）。
+3. step_parallel 一次调用 = n_threads × per-step update（D-307 alternating traverser 在线程间共享 `update_count % n_players` 选 traverser 让每线程 alternate）。
+4. 与 D-362 重复确定性兼容性：thread-local accumulator 顺序合并（按 thread id 升序）→ HashMap entries 排序后 merge → 跨 run BLAKE3 byte-equal 不破。
+
+**carve-out**：本 lock 由 C2 [实现] agent 落地决策文档变更，与 §10.1 D-314-rev1 同型 workflow 字面授权角色越界。本 §10.2 entry 同 commit 落地，无需独立 `pluribus_stage3_workflow.md` §修订历史 entry 追认（workflow line 216 字面授权 = 修订历史 entry 等价物）。
+
+---
+
+### 10.3 D-317-rev1 lock（C2 [实现] 落地中暴露，2026-05-13）
+
+**触发器**：C2 [实现] 落地 `EsMccfrTrainer::step` 后跑 `simplified_nlhe_es_mccfr_1k_update_no_panic_no_nan_no_inf` 在第 N 次 update（N ≪ 1000）panic：`RegretTable::get_or_init action_count mismatch: stored 3, requested 2 (D-324)`。根因：D-324 字面 "action_count 训练全程对同一 InfoSetId 恒定" 在 simplified NLHE + `DefaultActionAbstraction` + stage 2 `InfoSetId` 组合下不自动满足。
+
+**根因分析**：
+1. **stage 2 `DefaultActionAbstraction`** D-209 输出顺序 `[Fold?, Check?, Call?, Bet|Raise@0.5?, Bet|Raise@1.0?, AllIn?]` 长度可变（`?` skippable）；同 `(GameState, hole)` 输入下输出长度由 `LegalActionSet.fold/check/call/bet_range/raise_range/all_in_amount` 与 cap 决定。
+2. **stage 2 `InfoSetId`**（D-215）仅编码 `(bucket_id, position_bucket, stack_bucket, betting_state, street_tag)`，其中 `stack_bucket` 是 5 桶粗分（D-211：< 20 BB / 20..50 / 50..100 / 100..200 / ≥ 200）。同 stack_bucket 内不同 cap 值（如 200 BB vs 350 BB）会让 `raise_range` / `all_in_amount` 触发条件不同 → `DefaultActionAbstraction` 输出长度不同。
+3. **D-324 违反**：rollout A 在 same InfoSetId 命中 5 actions、rollout B 命中 2 actions → `RegretTable::get_or_init(I, n)` 第二次调用 panic。
+
+**lock 决定**：D-317-rev1 = stage 3 **carve-out** "把 `legal_actions(state)` 输出的 6-bit availability mask 写入 `InfoSetId.bucket_id` field bits 12..18"。具体规则：
+
+- 6 个 mask bit 对应 D-209 顺序：bit 0=Fold / bit 1=Check / bit 2=Call / bit 3=Bet|Raise@`BetRatio::HALF_POT` / bit 4=Bet|Raise@`BetRatio::FULL_POT` / bit 5=AllIn。
+- `bucket_id` field 24 bits 切分：bits 0..12 = 实际 bucket（preflop hand_class 0..169 / postflop bucket 0..500，均 < 4096）+ bits 12..18 = action mask + bits 18..24 = 0 reserved within bucket_id。
+- stage 2 `InfoSetId` 整体 64-bit layout 不变：bits 38..64 reserved 仍恒为零（IA-007 不变量满足；本 carve-out 仅触及 bucket_id field 内部位分配，不触及 stage 2 IA-007 reserved 区域）。
+- `pack_info_set_id` 调用方式不变（输入仍是 u32 bucket_id，stage 3 调用方在写入 mask 后传入 combined value `base_bucket | (mask << 12)`）。
+
+**调用契约**（C2 commit 内 `src/training/nlhe.rs` 落地）：
+
+```rust
+// src/training/nlhe.rs
+const ACTION_MASK_SHIFT: u32 = 12;
+const ACTION_MASK_BITS: u32 = 6;
+
+fn action_signature_mask(actions: &[AbstractAction]) -> u8 {
+    let mut mask = 0u8;
+    for a in actions {
+        let bit = match a {
+            AbstractAction::Fold => 0,
+            AbstractAction::Check => 1,
+            AbstractAction::Call { .. } => 2,
+            AbstractAction::Bet { ratio_label, .. }
+            | AbstractAction::Raise { ratio_label, .. } => {
+                if ratio_label.as_milli() == BetRatio::HALF_POT.as_milli() { 3 }
+                else if ratio_label.as_milli() == BetRatio::FULL_POT.as_milli() { 4 }
+                else { 4 }  // default_5_action 仅 HALF_POT / FULL_POT
+            }
+            AbstractAction::AllIn { .. } => 5,
+        };
+        mask |= 1u8 << bit;
+    }
+    mask
+}
+
+// Game::info_set 内：
+let bucket_id_with_mask = base_bucket | (u32::from(action_mask) << ACTION_MASK_SHIFT);
+pack_info_set_id(bucket_id_with_mask, position_bucket, stack_bucket, betting_state, street_tag)
+```
+
+**不变量** (D-317-rev1 / D-324 联合)：
+
+1. `base_bucket < 2^12 = 4096`（preflop hand_class ≤ 168 / postflop bucket ≤ 499 均成立）。`debug_assert!` 在 C2 commit 内 enforce。
+2. `mask < 2^6 = 64`（D-209 最多 6 个 slot）。`debug_assert!` enforce。
+3. 同 (InfoSetId, mask) → 同 `legal_actions().len()`（mask 是 popcount 的 superset；同 mask 必同 popcount）。D-324 严格满足。
+4. 不同 (InfoSetId, mask) → CFR 视作两个独立 InfoSet（HashMap key 不同）。该约束让 stack_bucket=4 内不同 cap 状态被自动分离训练，提升 CFR 收敛精度（vs 原 D-317 字面 lossy aggregation）。
+5. mask 编码与 D-209 顺序绑定：bit i 对应输出位置 i 的 role；action index 在 trainer RegretTable Vec<f64> 内的角色跨 rollout 一致（D-318 字面 "action 顺序 deterministic 且与 RegretTable Vec<f64> 索引一一对应"）。
+
+**与 IA-007 关系**：`pluribus_stage2_api.md` IA-007 / `tests/info_id_encoding.rs::info_id_reserved_bits_must_be_zero` 仅校验 stage 2 `PreflopLossless169::map` / `PostflopBucketAbstraction::map` 输出的 `InfoSetId.raw() & !((1<<38)-1) == 0`。stage 3 `SimplifiedNlheGame::info_set` 输出的 `InfoSetId` 经 bucket_id field 编码 mask（bits 12..18）后，bits 38..64 仍恒为零——IA-007 数学上仍成立。stage 2 既有测试不受影响。
+
+**与 D-326 关系**：D-326 "多 game 独立 RegretTable"（Kuhn / Leduc / 简化 NLHE 三 game checkpoint 互不兼容）继续成立。simplified NLHE 的 InfoSetId 与 stage 2 `InfoAbstraction::map` 输出的 InfoSetId 同型 u64，但语义不同（stage 3 bucket_id field 复用了 6 bits）；D-326 已经隔离这两类 InfoSetId 池，互不污染。
+
+**与 D-356 关系**：D-356 BucketTableMismatch 拒绝跨 bucket_table 加载（checkpoint header `bucket_table_blake3`）。InfoSetId 编码 mask 的方式仅与 `DefaultActionAbstraction::default_5_action()` 输出有关，不与 bucket_table 内容直接相关；D-356 跨 bucket_table 隔离继续成立。
+
+**stage 4 转出**：stage 4 6-max blueprint 走 Linear CFR / RM+ 翻面（D-302-rev1 / D-303-rev1）时，stage 3 InfoSetId encoding（bits 12..18 action mask）是 stage 4 入口前必须 mat决定的 carry-forward 项。两条候选路径：
+1. stage 4 继续走 D-317-rev1 stage 3 encoding（直接复用 stage 3 checkpoint）；
+2. stage 4 引入 `D-215-revM` 让 InfoSetId layout 显式预留 action_mask field（stage 2 schema bump）。
+
+具体由 stage 4 起步 [决策] batch 决定，stage 3 F3 [报告] 时只标注 carry-forward 状态。
+
+**carve-out**：本 lock 由 C2 [实现] agent 在 C1 测试触发 D-324 panic 时落地（与 §10.1 / §10.2 同型 workflow 字面授权角色越界）。C1 测试 0 改动（继承 stage 2 §B-rev1 / stage 3 §B-rev0 角色边界政策）；C2 [实现] 落地路径全部在 `src/training/nlhe.rs` 内部 + 同 commit 落地 §10.3 entry。无需独立 `pluribus_stage3_workflow.md` §修订历史 entry 追认（workflow line 478 字面 "C1 test expose 产品代码之外的契约 bug → filed issue 协商 D-NNN-revM 流程" = 本 lock 等价物，本场景 expose 的是 D-324 vs stage 2 InfoSetId granularity 不匹配，stage 3 内部 in-place 修复不波及 stage 1 / stage 2 surface）。
 
 ---
 

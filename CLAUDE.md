@@ -11,7 +11,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Stage 3 起步 §G-batch1**（D-218-rev2 真等价类枚举，stage 2 → stage 3 carry-forward）：§1..§3.10 closed 2026-05-11..2026-05-13。production artifact v3 落地（详见下方 "当前 artifact 基线"）。**§3.5..§4 deferred** 到 stage 3 F3 [报告] 后回头补（跨架构 baseline 重生 + D-275 选项 + reader v2 + 12 条 bucket quality 转 active + stage 2 report §8 carve-out 翻面 + GitHub Release 上传由用户手动触发）。
 - **Stage 3 主线 A0..B2 closed 2026-05-12**：A0 [决策] 4 docs 落地（`pluribus_stage3_{validation,decisions,api,workflow}.md`，D-300..D-379 + API-300..API-392）；A1 [实现] scaffold（`src/training/` 10 文件骨架 + `tools/train_cfr.rs`）；B1 [测试] 3 integration crate + 1 bench crate；B2 [实现] sampling/regret/kuhn/leduc/trainer/best_response 全部落地，Kuhn closed-form `-1/18` anchor + Leduc `< 0.1` 阈值 + 1000× BLAKE3 byte-equal 全 pass，**§B-rev0 carve-out** Leduc curve test 5% tolerance 留 F1 决定。
 - **Stage 3 C1 [测试] closed 2026-05-13**：`tests/cfr_simplified_nlhe.rs` 5 条测试落地（D-313 root state + D-318 5-action 桥接 + D-317 InfoSetId 桥接 + D-342 工程稳定性 smoke + D-362 1M update × 3 BLAKE3 repeat）+ `benches/stage3.rs` 第 3 个 bench group `stage3/nlhe_es_mccfr_update` + **D-314-rev1 lock**（v3 production 528 MiB artifact / body BLAKE3 `67ee5554...`，详见 `docs/pluribus_stage3_decisions.md` §10.1）。5 道 gate 全绿；3 active panic-fail + 2 release-ignored 是 scaffold 阶段预期形态。`tests/api_signatures.rs` 0 改动（stage 3 trip-wire 已在 A1 提前同步）。
-- **下一步**：**Stage 3 C2 [实现]** — `SimplifiedNlheGame` Game trait 全 8 方法 + `EsMccfrTrainer::new + step` + D-321 thread-safety 模型 lock + C1 5 条测试全部转绿（详见 `docs/pluribus_stage3_workflow.md` §步骤 C2）。
+- **Stage 3 C2 [实现] closed 2026-05-13**：`SimplifiedNlheGame` Game trait 全 8 方法 + `EsMccfrTrainer::new + step + step_parallel(serial-fallback)` 落地 + D-022b-rev1 + D-321-rev1 + D-317-rev1 三条 revM 同 commit 落地（stage 1 HU NLHE 语义 / stage 3 thread-safety lock / stage 3 bucket_id action mask carve-out）。C1 全 3 条 active 测试 + 2 条 release/--ignored 全套转绿。
+- **下一步**：**Stage 3 D1 [测试]** — `tests/checkpoint_round_trip.rs` + `tests/cfr_fuzz.rs` + `tests/simplified_nlhe_100M_update.rs` + checkpoint 5 类 CheckpointError 全覆盖（详见 `docs/pluribus_stage3_workflow.md` §步骤 D1）。
 
 历史出口数据、carve-out 全文、实测数字一律不在本文件保留。查阅顺序：
 
@@ -80,12 +81,15 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test --release -- --ignored # full-volume
 
 变更影响决策/API 签名走 **D-NNN-revM / API-NNN-revM** flow（`pluribus_stage1_decisions.md` §10 + `pluribus_stage1_api.md` §11）：append rev entry，不删原条，serialization 受影响则 bump `HandHistory.schema_version`。历史 rev 索引（全文见各文档 §10/§11 修订历史）：
 
+- D-022b-rev1 — `n_seats == 2` heads-up 走标准 HU NLHE 语义（button=SB / non-button=BB / postflop OOP 先行）；新增 `first_postflop_actor() = next_seat(button)` universal rule；n_seats>=3 路径 byte-equal 不变。
 - D-033-rev1 — incomplete raise 不重开 raise option，TDA Rule 41 / PokerKit 对齐；per-player `raise_option_open: bool`。
 - D-039-rev1 — odd-chip 余 chip 整笔给按钮左侧最近获胜者（PokerKit chips-pushing divmod 语义）。
 - D-037-rev1 — `last_aggressor` 作用域收紧到「最后一条 betting round 内」（PokerKit `_begin_betting` 每街起手清 `opener_index`）。
 - API-001-rev1 — `HandHistory::replay` / `replay_to` 返回 `Result<_, HistoryError>`，wraps `RuleError`。
 - API-004-rev1（stage 2 B2 触发）— `GameState::config()` additive 只读 getter（D-211-rev1 `stack_bucket` 来源）。
 - API-005-rev1（stage 2 E2 触发）— `RngSource::fill_u64s(&mut self, dst: &mut [u64])` additive default-impl；byte-equal 与循环 `next_u64` 等价（D-051 / D-228 / D-237 满足）。
+- D-321-rev1（stage 3 C2 触发）— ES-MCCFR thread-safety = thread-local accumulator + batch merge（候选 ③）；C2 ship serial-equivalent step_parallel；真并发 deferred 到 E2（详 `docs/pluribus_stage3_decisions.md` §10.2）。
+- D-317-rev1（stage 3 C2 触发）— 简化 NLHE InfoSetId 在 stage 2 `bucket_id` field bits 12..18 编码 6-bit `legal_actions` availability mask 让 D-324 成立；IA-007 reserved 区域不受影响（详 `docs/pluribus_stage3_decisions.md` §10.3）。
 
 ## Workflow (multi-agent, strict role boundaries) — applies to all stages
 
