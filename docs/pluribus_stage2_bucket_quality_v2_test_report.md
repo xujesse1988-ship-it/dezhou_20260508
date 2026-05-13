@@ -195,17 +195,151 @@ River bucket 0 median 0.033，bucket 1 median 0.0175 — bucket 1 median 比 buc
 
 ---
 
-## 7. 给 reviewer 的提问
+## 7. 架构替代方案：取消 2M sample cap 走全 N 训练
+
+### 7.1 现状回顾
+
+当前 `train_in_memory_with_mode(..., TrainingMode::Production)` (§G-batch1 §3.4-batch1) 走 dual-phase 流程：
+
+- **Phase 1**：从 N canonical_ids 随机采样 `n_train = min(N, PRODUCTION_PHASE1_MAX_SAMPLES = 2_000_000)` → 算 9 维 feature → k-means → K=500 centroids
+- **Phase 2**：枚举 ALL N canonical_ids → 解码 + **重新计算** features → 找最近 centroid → 写 lookup_table
+
+`PRODUCTION_PHASE1_MAX_SAMPLES = 2_000_000` 这个 cap 的历史原因：
+
+```text
+§G-batch1 §3.4-batch1 落地时设计目标兼容 vultr 4-core / 7.7 GB host：
+- Phase 1 features Vec memory peak = 2M × 9 × 8 = 144 MB
+- River canonical_enum lazy table = ~2 GB (单独)
+- 总 RAM 预算控制在 ~3 GB 之下
+```
+
+### 7.2 提议：取消 2M cap，phase 1 直接全枚举 + 删除 phase 2
+
+**前提**：训练 host 升级到 AWS 16-core 30 GB / 32-core 61 GB，memory 不再约束。
+
+**新 pipeline**（单 phase）：
+
+```rust
+for street in [Flop, Turn, River] {
+    // Step 1: enumerate ALL canonical_ids, compute features
+    for id in 0..N_canonical {
+        features[id] = compute_features(nth_canonical_form(street, id));
+        ehs_per_id[id] = compute_ehs(...);
+    }
+    // Step 2: k-means on full N (rayon-ized inner loops)
+    let (centroids, assignments) = kmeans_fit_rayon(&features, K, ...);
+    // Step 3: D-236b reorder
+    let (reordered, lookup) = reorder_by_ehs_median(centroids, assignments, &ehs_per_id);
+    // Step 4: lookup_table[id] = lookup[id]  -- direct from k-means assignments
+}
+```
+
+**关键变化**：
+1. **取消 PRODUCTION_PHASE1_MAX_SAMPLES cap**——`n_train = N_canonical` 直接用全 N
+2. **删除 phase 2 enumerate-assign 段**——k-means 输出的 `assignments[id]` 就是 lookup_table[id]
+3. **K-means 需要 rayon 化**（当前 sequential，N=123M × K=500 × dim=9 × max_iter=100 = ~5.5×10^13 ops 单核需 3+ hours）
+
+### 7.3 内存预算（AWS hosts）
+
+| 街 | N_canonical | Features Vec | Assignments | K-means working | 总 peak | 16-core 30 GB | 32-core 61 GB |
+|---|---|---|---|---|---|---|---|
+| Flop | 1,286,792 | 100 MB | 5 MB | ~50 MB | ~155 MB | ✅ | ✅ |
+| Turn | 13,960,050 | 1.1 GB | 55 MB | ~550 MB | ~1.7 GB | ✅ | ✅ |
+| River | 123,156,254 | **9.8 GB** | 490 MB | ~4.9 GB | **~15 GB** | ✅ (15 GB 余量) | ✅ (46 GB 余量) |
+
+River 是限制因子但 30 GB host 仍有 50% 余量。
+
+### 7.4 Wall time 对比（基于 224M eval/s 16-core 实测）
+
+| 街 | 现状 (sampled 2M phase 1 + full N phase 2) | 新方案 (full N single-phase) |
+|---|---|---|
+| Flop p1 features | 8.5h (1.28M × 12ms, N<2M 已 full) | 8.5h (相同) |
+| Flop k-means | 5 min sequential | 5 min (相同) |
+| Flop p2 enumerate-assign | 4.3h (重算 1.28M × 12ms) | **0 (删除)** |
+| **Flop total** | **12.8h** | **~8.5h (省 4.3h)** |
+| Turn p1 features | 17 min (sampled 2M × 0.5ms) | 2h (full 13.96M × 0.5ms) |
+| Turn k-means | 7.5 min sequential | **15 min rayon** (N=13.96M) |
+| Turn p2 enumerate-assign | 1h 55min | **0** |
+| **Turn total** | **2h 20min** | **~2h 17min** |
+| River p1 features | 43 sec (sampled 2M × 0.022ms) | **20 min** (full 123M × 0.022ms 含 nth_canonical_form decode) |
+| River k-means | 7.5 min sequential | **~17 min rayon** (N=123M × K=500 × dim=9 × 100 iter @ ~5 GFLOPS aggregate) |
+| River p2 enumerate-assign | 44 min | **0** |
+| **River total** | **52 min** | **~37 min (省 15 min)** |
+| **总 wall** | **11h 47min (v2 实测)** | **~11h (省 ~1h)** |
+
+总 wall **基本持平**。Flop 节省最多（4h，因为 phase 2 之前是重复 work），但 river/turn 因 k-means 现在跑全 N 反而增加少量时间。Rayon-ize k-means 是必要前置工作。
+
+### 7.5 质量改善（关键）
+
+**K-means centroid 估算误差** σ ∝ 1/√(N_samples/K)：
+
+| 街 | 现状 sampled N | σ_centroid | 新方案 full N | σ_centroid | 改善 ratio |
+|---|---|---|---|---|---|
+| Flop | 1.28M (N<2M) | 0.020 | 1.28M | 0.020 | 0× (已 full) |
+| Turn | 2M (sampled) | 0.016 | 13.96M | 0.006 | **2.7× 更精确** |
+| River | 2M (sampled) | 0.016 | 123M | 0.002 | **8× 更精确** |
+
+**对 9 个 quality failures 的预期影响**：
+
+| Failure | 现状值 | 全 N 训练预测（保持 iter=2000） | 改善路径 |
+|---|---|---|---|
+| flop std_dev b0 (0.0575) | borderline +15% | 不变 (已 full N) | ❌ 仍需阈值修订或 iter=10000 |
+| turn std_dev b0 (0.0598) | +20% | 改善 30-40% → ~0.04 | ✅ 大概率过 0.05 |
+| river std_dev b0 (0.0874) | +75% | 改善 50%+ → ~0.05 边缘 | 🤔 borderline，iter=10000 才稳过 |
+| flop EMD b0/b1 (0.0095) | -52% | 不变（已 full N） | ❌ K mismatch 不变 |
+| turn EMD b0/b1 (0.0143) | -28% | 边界 bucket 仍紧，可能稍改善 | 🤔 borderline |
+| river EMD b1/b2 (0.0137) | -31% | 改善 ~30% → 0.018 | 🤔 borderline |
+| flop monotonic b4/b5 | 0.0005 微小 | 不变 | ❌ MC 噪声 |
+| turn monotonic b2/b3 | 0.005 | 改善 50% → 0.0025 | ✅ 大概率过 |
+| river monotonic b0/b1 | 0.0155 显著 | 改善 50%+ → 0.008 | 🤔 borderline |
+
+**预测**：full N 训练（保持 iter=2000）单独可能修复 **2-4 个失败**（turn 全部 + river 部分）。flop 因 N<2M 已 full 不受影响。
+
+### 7.6 与 river iter=10000 组合
+
+**a. river-only iter=10000 (per-street CLI)**：修 river 3 个 + 可能 turn 1-2 个 = 3-5 fail
+**b. 取消 2M cap 走全 N (无 iter 改变)**：修 turn 3 个 + river 1-2 个 = 2-4 fail
+**c. a + b 组合**：修 turn 3 个 + river 3 个 = 5-6 fail；剩 flop 3 个由 K=500 阈值修订（§7 路径 B）处理 → **预测全 9 → 0**
+
+### 7.7 代码改动估算
+
+| 改动项 | 行数 | 风险 |
+|---|---|---|
+| 删除 `PRODUCTION_PHASE1_MAX_SAMPLES` cap（或加 CLI flag override） | ~5 行 | 低 |
+| 修改 `train_one_street`：删除 phase 2 段，phase 1 直接产 lookup_table | ~30 行（删多于加） | 中（破坏现 Fixture 路径 byte-equal） |
+| Rayon-ize `kmeans_fit` 的 assignment + centroid update 两个 inner loop | ~40 行 | 中（需 verify determinism 不变 — `derive_substream_seed` 已 pure，rayon `.collect()` 保序） |
+| 加 per-street cluster_iter CLI flag (`--cluster-iter-river 10000`) | ~30 行 | 低 |
+| 加 byte-equal test 验证 v2 与 v2.1 在 flop（N<2M 已 full）字节相同 | ~30 行 test | 低 |
+| Workflow + decisions doc 修订（D-244-rev3 / D-244-rev2 修订或 carve-out） | ~50 行 docs | 低 |
+| **总** | **~150-200 行** | 中等 |
+
+### 7.8 兼容性 / 历史 carve-out
+
+- **D-244-rev2 §5 footnote option (c)** 字面 "canonical-enumeration inverse + 100% 覆盖 + n_train = N" — **新方案正是该 footnote** option (c) 的字面落地（之前因 vultr memory OOM 走的是 dual-phase 替代）
+- **D-218-rev2 §3** "唯一性 + 稠密性" 不变量满足度更纯净（不再 split sample vs full enum）
+- **§G-batch1 §3.4-batch1 carve-out** 取舍记录可翻面 — "vultr OOM 不可行" 在 AWS 上不再适用
+- v2 artifact 仍可用作 baseline；v2.1 artifact 走新 pipeline 重训
+
+### 7.9 主要不确定性
+
+1. **Rayon-ize k-means 的 determinism**：需要严格验证 `assignment + centroid update + shift check` 在 par_iter 下与 sequential 输出 byte-equal。Stage 1 D-051 / D-237 跨架构 byte-equal 不变量是硬约束
+2. **K-means 在 N=123M 上收敛速度**：当前 sequential 5 GFLOPS/core → 11 hours；rayon 16-core 仅 LINEAR scale 假设下 ~40 min/iter assignment phase × 100 max_iter / centroid_shift_tol=1e-4 早退化率？需实测
+3. **River features compute wall 20 min** 含 `nth_canonical_form` decode 成本（lazy `Vec<u128>` table 已 amortized）—— 与 phase 2 现状 44 min 对比差 24 min 多出的是什么？需 profile
+
+---
+
+## 8. 给 reviewer 的提问
 
 1. **path.md 字面 `EHS std dev <0.05 / EMD ≥0.02` 是否针对特定 K？** 如果 path.md 设计时 K=100，那 K=500 应该 scale 阈值（路径 B）。
 2. **river bucket 0 std_dev 0.087 是否可接受？** 对 CFR 训练实际影响？bucket 0 含 ~3-5% of all postflop hands（低 EHS hands），CFR 会怎样应对？
 3. **D-236b 重编号在 river 显著违反**（bucket 0 median 0.033 > bucket 1 median 0.0175）是否触发 P0 阻塞？还是说 bucket id 顺序只是 cosmetic（CFR 不用顺序）？
 4. **iter=2000 vs iter=10000 的 CFR 影响**：v3 重训 24h $15 是否值得？v2 的 quality 缺陷 (15-20% 超 std_dev / 30-50% 低 EMD) 在 CFR 实际训练中会放大还是被洗掉？
 5. **Pluribus 论文用 200 bucket**，我们 K=500 — 是否过细化？降到 K=200/200/200 是否能让 quality gates 更宽松地通过（spacing 大 2.5× → std_dev / EMD 都按 K=100 scale 更接近 path.md）？
+6. **§7 全 N 训练替代方案是否应该走？** D-244-rev2 §5 footnote option (c) 字面就是 "canonical-enumeration inverse + 100% 覆盖 + n_train = N"，新 host 内存 30+ GB 不再受限。Trade-off：~150-200 行代码改动 + rayon-ize k-means determinism 验证 vs 修复 2-4 个 quality failures + 简化 pipeline + D-244-rev2 footnote 字面落地。是否优于 iter=10000 + 阈值修订组合？
 
 ---
 
-## 8. 附录：完整 raw test output
+## 9. 附录：完整 raw test output
 
 ```
 test result: FAILED. 10 passed; 9 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.50s
@@ -238,7 +372,7 @@ panicked messages:
 
 ---
 
-## 9. 引用
+## 10. 引用
 
 - `docs/pluribus_path.md` §阶段 2（path.md bucket quality 阈值原文）
 - `docs/pluribus_stage2_validation.md` §3（验证标准 D-233）
