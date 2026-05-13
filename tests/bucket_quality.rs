@@ -63,23 +63,26 @@ use poker::{
 // 通用 fixture
 // ============================================================================
 
-/// §G-batch1 §3.8 [实现] 路径：4 类 path.md 质量门槛断言基于 **v2 production
-/// artifact** (`artifacts/bucket_table_default_500_500_500_seed_cafebabe_v2.bin`，
-/// K=500/500/500 / cluster_iter=2000 dual-phase canonical-inverse 100% coverage)。
+/// §G-batch1 §3.10 [实现] 路径：12 条 path.md 质量门槛断言（D-233-rev1 sqrt-scaled
+/// 阈值）基于 **v3 production artifact**
+/// (`artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin`，
+/// K=500/500/500 / cluster_iter=2000/5000/10000 single-phase full N + river_exact
+/// 990 outcomes enumerate)。
 ///
 /// **演变历史**：
 /// - §C1 [测试]：`stub_table()` (B2 stub `lookup → Some(0)` 路径)
 /// - §C-rev2 batch 5 §1：切换到 `cached_trained_table()` (fixture K=100 + cluster_iter=200)
-/// - §G-batch1 §3.8 [实现]（本 batch）：再切换到 v2 artifact `BucketTable::open(...)`
-///   load 路径，让 12 条质量门槛断言基于 production K=500 + 100% canonical
-///   coverage（消除 Knuth hash fallback 主导 bucket 0 的 std_dev / monotonicity
-///   失败）；FIXTURE_BUCKET_CONFIG 留作 v2 artifact 缺失时的 fallback 训练参数。
+/// - §G-batch1 §3.8 [实现]：切换到 v2 artifact `BucketTable::open(...)` load 路径
+///   (cluster_iter=2000 dual-phase MC inner river)
+/// - §G-batch1 §3.10 [实现]（本 batch）：再切换到 v3 artifact 路径（§3.9
+///   single-phase full N + per-street iter + §3.10 river_exact 990 enumerate），
+///   12 条断言改用 D-233-rev1 sqrt-scaled threshold。
 ///
 /// **角色边界 [实现] → [测试] 越界 carve-out**（详见 stage-2 §C-rev0 §修订历史
-/// 和 §G-batch1 §3.2 同型）：本 batch [实现] 单边修改 `cached_trained_table()`
-/// 体加 12 条 `#[ignore]` 取消加部分 sample count tuning，与 §C-rev2 batch 5 §1
-/// 和 §G-batch1 §3.2 carve-out 同形态。
-const V2_ARTIFACT_PATH: &str = "artifacts/bucket_table_default_500_500_500_seed_cafebabe_v2.bin";
+/// 和 §G-batch1 §3.2 / §3.8 同型）：本 batch [实现] 单边修改 `cached_trained_table()`
+/// path constant + 12 条阈值公式，继承 §C-rev2 batch 5 §1 carve-out 形态。
+const PRODUCTION_ARTIFACT_PATH: &str =
+    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin";
 const FIXTURE_BUCKET_CONFIG: BucketConfig = BucketConfig {
     flop: 100,
     turn: 100,
@@ -90,21 +93,22 @@ const FIXTURE_CLUSTER_ITER: u32 = 200;
 
 static CACHED_TABLE: OnceLock<Arc<BucketTable>> = OnceLock::new();
 
-/// §G-batch1 §3.8 [实现] 路径：优先 load v2 production artifact (K=500，100%
-/// canonical 覆盖)；如 artifact 不存在则回退到 fixture 训练 (K=100，4 类质量
-/// 门槛不保证通过——Knuth hash fallback 主导，仅用于 CI / dev box smoke)。
+/// §G-batch1 §3.10 [实现] 路径：优先 load v3 production artifact (K=500，100%
+/// canonical 覆盖 + river_exact 990 enumerate)；如 artifact 不存在则回退到 fixture
+/// 训练 (K=100，4 类质量门槛不保证通过——Knuth hash fallback 主导，仅用于 CI /
+/// dev box smoke)。
 fn cached_trained_table() -> Arc<BucketTable> {
     CACHED_TABLE
         .get_or_init(|| {
-            // 优先 load v2 production artifact (§G-batch1 §3.4-batch2 retrain 出口)
-            let v2_path = std::path::Path::new(V2_ARTIFACT_PATH);
-            if v2_path.exists() {
-                return Arc::new(BucketTable::open(v2_path).expect("v2 artifact open"));
+            // 优先 load v3 production artifact (§G-batch1 §3.10 retrain 出口)
+            let path = std::path::Path::new(PRODUCTION_ARTIFACT_PATH);
+            if path.exists() {
+                return Arc::new(BucketTable::open(path).expect("v3 artifact open"));
             }
             // Fallback：fixture 训练（K=100，Knuth hash fallback 主导，质量门槛
             // 大概率失败；适用于无 artifact 的 CI / dev box smoke 场景）。
             eprintln!(
-                "warning: v2 artifact not found at {V2_ARTIFACT_PATH}; \
+                "warning: v3 artifact not found at {PRODUCTION_ARTIFACT_PATH}; \
                  falling back to fixture K=100 training (quality gates may fail)"
             );
             let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);

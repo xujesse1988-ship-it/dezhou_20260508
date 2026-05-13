@@ -2671,3 +2671,99 @@ ssh -i ~/us-east-2.pem ubuntu@18.217.90.217 \
 **Retrain 重起**：本 commit push 后 SSH AWS pull + rebuild + 起新 v3 retrain（PID 4849 已 kill；partial artifact 已 clean）。Bark watcher 重起，TRAIN_PID 更新到新 PID。
 
 下一步：commit + push（src + docs，本 §3.10）→ AWS pull + rebuild + 起新 v3 retrain + watcher → 等 ~2.5h → fetch v3 artifact + 19 bucket_quality 测试 + v3 报告。
+
+##### §G-batch1 §3.10-batch2 [实现 / 报告] closure（2026-05-13）：v3 artifact 落地 + 19 bucket_quality 实测 + v3 报告
+
+§G-batch1 §3.10 src + docs commit (b51a189) push 后 AWS 32-core c6a.8xlarge 实跑 retrain + 跑 19 bucket_quality 测试 + 写 v3 报告，本 entry 是 §3.10 完整 closure。
+
+**1. v3 retrain 实测**：
+
+AWS c6a.8xlarge 32-core EPYC 7R13 Milan / 61 GB RAM / Ubuntu 24.04 on-demand。
+
+| Street | features wall | kmeans wall | street total | % |
+|---|---|---|---|---|
+| Flop  | 2404s = 40m 04s | 22s | **40m 27s** | 42% |
+| Turn  | 1280s = 21m 20s | 182s = 3m 02s | **24m 23s** | 25% |
+| River | 387s = 6m 27s | 1535s = 25m 35s | **32m 05s** | 33% |
+| **总** | | | **5820s = 1h 37m** | |
+
+vs §3.10 estimate (~2.5h)：**快 1.5×**。vs §3.9-only estimate (~8h)：**快 5×**。
+
+**v3 artifact**：
+
+```text
+size:     528 MiB (553,631,520 bytes)
+filename: bucket_table_default_500_500_500_seed_cafebabe_v3.bin
+body hash (content_hash): 67ee555439f2c918698650c05f40a7a5e9e812280ceb87fc3c6590add98650cd
+```
+
+`tools/v3_bark_watcher.sh` 推送了全部 11 个 milestone（watcher started + 3 街 × 3 events + TRAINING COMPLETE + ARTIFACT WROTE）。
+
+**2. tests/bucket_quality.rs path constant 切到 v3**（test-only 改动；§3.10-batch2 commit 同 PR）：
+
+```rust
+const PRODUCTION_ARTIFACT_PATH: &str =
+    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin";
+```
+
+**3. 19 bucket_quality 测试 vs v3 artifact**：
+
+```text
+cargo test --release --test bucket_quality
+test result: FAILED. 10 passed; 9 failed; 1 ignored; finished in 6.87s
+```
+
+10 passed = 3 in_range smoke + 3 no_empty_bucket + 4 helper sanity（D-244-rev3 single-phase 100% canonical 覆盖验证 ✓）。
+
+9 failed (4 类 × 3 街 的 std_dev/EMD/monotonic 9 条；同 v2 模式)。详细数字 + v2 对比 + 失败根因分析 + D-233-rev2 候选路径见 v3 报告 `docs/pluribus_stage2_bucket_quality_v3_test_report.md`。
+
+**4. v2 vs v3 改善 (quantitative)**：
+
+| 维度 | v2 | v3 | 改善 |
+|---|---|---|---|
+| Wall (16-core eq) | 188 core-hours | 52 core-hours | **3.6× 省** |
+| Inner river equity noise | σ=1.1% MC | σ=0 exact | **exact** |
+| std_dev flop b0 | 0.058 | 0.034 | **−41%** |
+| std_dev turn b0 | 0.060 | 0.049 | −18% |
+| std_dev river b0 | 0.087 | 0.058 | **−34%** |
+| Coverage | 100% (Knuth hash for unsampled) | 100% (proper k-means) | **honest** |
+| 测试 pass / fail | 10 / 9 | 10 / 9 | 模式相同，数值改善 |
+
+**5. CLAUDE.md ground truth 切换**：
+
+CLAUDE.md stage 2 progress 段 artifact 行 v2 hash `e602f548...` → v3 hash `67ee5554...`。v2 hash 作历史参照保留，v1 hash 不删（追加不删政策）。
+
+**6. v3 报告写入**：
+
+`docs/pluribus_stage2_bucket_quality_v3_test_report.md` 10 节 ~250 行：背景 + 训练参数 + 测试方法 + 结果 + v2 对比 + 失败根因 + D-233-rev2 候选路径 + v3 落地 + 引用 + raw output。报告替代 v2 报告作 production-quality baseline 参照。
+
+**7. Fixture artifact byte-equal 实测**：
+
+- 本地 8-core: BLAKE3 `a6989eeb1dc618ef8a6b375d6af1dcef547a96cdb2c0e84e4b6341562183c2b6` ✓
+- AWS 32-core post-§3.10: 同上 ✓ (9s wall)
+
+§3.3 / §3.4-batch1.5 ground truth 维持 ✓。Stage 1 cross_arch baseline 32-seed × 3 街 fixture mode hash 无需重 capture（path constant 默认 false，Fixture path 不变）。
+
+**8. D-233-rev2 carve-out（不在本 batch 范围）**：
+
+v3 9 fail tests 是 D-233-rev1 sqrt-scaled K=500 threshold (0.02236 std_dev / 0.00894 EMD) 偏紧 + D-236b training median sort 受 MC noise 影响的体现，**v3 abstraction quality 实质 > v2**（详 v3 报告 §6）。D-233-rev2 候选路径 6 选 1 等 stage 3 CFR 实测 v3 exploitability 后回头决定：
+
+A. sqrt-scale 系数松到 × √(50/K)  
+B. soft threshold (超过 X% 内 OK)  
+C. informational metric (print 而非 panic)  
+D. 降 K 到 K=200 重训 v4  
+E. OCHS suit-mean (D-222-rev1) 减少 OCHS rep bias  
+F. 维持 D-233-rev1 + 9 条 fail tests `#[ignore]` + 文档化  
+
+**§G-batch1 §3.10 closure**：
+
+- ✅ v3 production artifact 落地 (`67ee5554...`)
+- ✅ §3.9 + §3.10 单 commit batch 全部 src + tests + docs deliverables
+- ✅ Fixture byte-equal + Stage 1 cross_arch baseline 维持
+- ✅ 19 bucket_quality 测试实跑（10 passed / 9 failed 同 v2 模式）
+- ✅ v3 报告 (~250 行 in `docs/pluribus_stage2_bucket_quality_v3_test_report.md`)
+- ✅ CLAUDE.md ground truth 段 v2 → v3 切换
+- ⏸ D-233-rev2 候选 等 stage 3 CFR 实测后决定
+- ⏸ §G-batch1 §3.5 (跨架构 baseline 32-seed × 3 街重生) + §3.6 (D-275 实测) + §3.7 (Python reader v2) + §4 ([报告]) 仍 deferred 到 stage 3 F3 [报告] 后
+
+下一步：commit + push（test path + 报告 + CLAUDE.md ground truth）→ 用户可手动 `gh release create stage2-v1.2 ... artifacts/*_v3.bin` 发 GitHub Release（user-gated）→ 回 stage 3 C1 [测试]（pluribus_stage3_workflow.md §C 节）。
