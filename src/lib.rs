@@ -46,7 +46,7 @@ pub use crate::abstraction::action::{
     ConfigError, DefaultActionAbstraction,
 };
 pub use crate::abstraction::bucket_table::{
-    BucketConfig, BucketTable, BucketTableError, TrainingMode,
+    BucketConfig, BucketTable, BucketTableError, ClusterIter, TrainingMode,
 };
 pub use crate::abstraction::equity::{EquityCalculator, EquityError, MonteCarloEquity};
 pub use crate::abstraction::info::{BettingState, InfoAbstraction, InfoSetId, StreetTag};

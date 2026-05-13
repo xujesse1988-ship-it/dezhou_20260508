@@ -11,6 +11,8 @@
 //! 1D（D-234）/ 空 cluster split（D-236）/ EHS 中位数重编号（D-236b）/ centroid
 //! u8 量化（D-241）/ k-means 量化抽样（D-235 SCALE=2^40）。
 
+use rayon::prelude::*;
+
 use crate::core::rng::{ChaCha20Rng, RngSource};
 
 pub mod rng_substream {
@@ -198,6 +200,19 @@ pub struct KMeansResult {
 const D2_MAX: f64 = 9.0;
 const D2_QUANT_SCALE: u64 = 1u64 << 40;
 const KMEANS_N_MAX: usize = 2_000_000;
+
+/// `kmeans_fit_production` 的 N 上限（§G-batch1 §3.9 \[实现\]）。设置为 200M 让
+/// river `N_canonical_observation_river = 123_156_254` 留 ~60% 头寸。同步覆盖
+/// turn (~14M) / flop (~1.28M)。`kmeans_fit`（Fixture 路径）保持 `KMEANS_N_MAX
+/// = 2_000_000` 不动 → Fixture artifact byte-equal §3.3 `a6989eeb...` 维持。
+const KMEANS_PRODUCTION_N_MAX: usize = 200_000_000;
+
+/// `kmeans_fit_production` centroid update 阶段的固定 chunk 大小（§G-batch1 §3.9
+/// \[实现\]）。chunk 数 = N.div_ceil(CHUNK)，与 rayon 线程数无关；chunk_results
+/// 按 `chunk_idx` 升序在主线程 sequential 累加，保证浮点求和顺序确定 → 同
+/// (master_seed, features) 输入下 `kmeans_fit_production` 在不同 thread count
+/// 主机间 byte-equal。
+const KMEANS_PRODUCTION_CHUNK_SIZE: usize = 200_000;
 
 /// k-means + k-means++ 初始化（D-230 / D-231 / D-232 / D-235）。
 ///
@@ -452,6 +467,236 @@ fn l2_sq(a: &[f64], b: &[f64]) -> f64 {
         acc += d * d;
     }
     acc
+}
+
+// ============================================================================
+// kmeans_fit_production：rayon par_iter + full N 支持（§G-batch1 §3.9 \[实现\]）
+// ============================================================================
+
+/// k-means + k-means++ 初始化（D-230 / D-231 / D-232 / D-235）的 **production**
+/// 变体，支持 N 上限 `KMEANS_PRODUCTION_N_MAX` = 200M（vs [`kmeans_fit`] N ≤ 2M
+/// 的 Fixture 路径）。
+///
+/// 与 [`kmeans_fit`] 的差异（§G-batch1 §3.9 \[实现\]）：
+///
+/// 1. **pp_init 子集**：k-means++ 初始化只用 `&features[..min(N, KMEANS_N_MAX)]`
+///    切片，复用既有 `kmeans_pp_init` 私函数路径（D-235 u64 cum_q 量化在 N ≤ 2M
+///    时无溢出风险）。剩余 features 用于 main loop 全 N 收敛。pp_init 只决定 K 个
+///    起始 centroids 的位置，对最终 k-means 收敛点不敏感 —— 用 first 2M 而非
+///    full N 牺牲少量初始化 quality，换取 D-235 quantization byte-equal。
+/// 2. **assignment 阶段 par_iter**：`features.par_iter().map(...).collect()`
+///    （`IndexedParallelIterator` 保序），与 sequential `.iter().map(...).collect()`
+///    输出 byte-equal。`l2_sq` 是 pure function of (sample, centroid)，无 cross-sample
+///    依赖。
+/// 3. **centroid update chunked 确定性 reduction**：`par_chunks(KMEANS_PRODUCTION_CHUNK_SIZE)`
+///    在每个 chunk 内构造 local `(sums, counts)` accumulator，主线程按 `chunk_idx`
+///    升序 sequential 累加到全局。chunk 数固定（与 N + chunk_size 唯一相关，与
+///    rayon thread count 无关），保证浮点求和顺序确定 → 同 (master_seed, features)
+///    输入下不同主机 byte-equal。
+///
+///    **注**：与 [`kmeans_fit`] 单 sample 顺序 sum 不 byte-equal —— production
+///    artifact 是新生成的 v3，不与 v2（dual-phase + sampled 2M）byte-equal，
+///    碎片化求和顺序的差异不构成不变量违反。Fixture 路径走 [`kmeans_fit`]
+///    sequential 顺序，artifact byte-equal §3.3 `a6989eeb...` 维持。
+/// 4. **空 cluster split par max-find**：`split_empty_cluster_par` 私函数用
+///    `par_iter().filter().reduce()` 找最大 cluster 内最远 sample，O(N) 并行
+///    + 确定性 tie-break (`i2 < i1` on 距离相等)。
+///
+/// 入参与 [`kmeans_fit`] 同：`features` 全 N 特征向量；`cfg.k`= K；
+/// `master_seed` + `op_id_init` + `op_id_split` 为 D-228 sub-stream 协议入参。
+///
+/// 同 (features, cfg, master_seed, op_id_init, op_id_split) 输入下 byte-equal
+/// （D-237），不受 rayon thread count 影响。
+#[allow(clippy::needless_range_loop)]
+pub fn kmeans_fit_production(
+    features: &[Vec<f64>],
+    cfg: KMeansConfig,
+    master_seed: u64,
+    op_id_init: u32,
+    op_id_split: u32,
+) -> KMeansResult {
+    let n = features.len();
+    let k = cfg.k as usize;
+    assert!(n >= k, "kmeans_fit_production: n={n} < k={k}");
+    assert!(
+        n <= KMEANS_PRODUCTION_N_MAX,
+        "kmeans_fit_production: n={n} > KMEANS_PRODUCTION_N_MAX={KMEANS_PRODUCTION_N_MAX}"
+    );
+    let dim = features.first().map(|v| v.len()).unwrap_or(0);
+    assert!(dim > 0, "kmeans_fit_production: feature vectors empty");
+
+    // 1. k-means++ 初始化（pp_init 用 first min(N, 2M) features 子集复用既有路径）。
+    let pp_init_cap = n.min(KMEANS_N_MAX);
+    let mut centroids = kmeans_pp_init(&features[..pp_init_cap], k, master_seed, op_id_init);
+
+    // 2. k-means 主迭代。
+    let mut assignments: Vec<u32> = vec![0u32; n];
+    let mut split_sub_index: u32 = 0;
+    for _iter in 0..cfg.max_iter {
+        // 2a. assignment（par_iter；each sample 独立分配）。
+        assignments = features
+            .par_iter()
+            .map(|sample| {
+                let mut best_c: u32 = 0;
+                let mut best_d2 = l2_sq(sample, &centroids[0]);
+                for c in 1..k {
+                    let d2 = l2_sq(sample, &centroids[c]);
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best_c = c as u32;
+                    }
+                }
+                best_c
+            })
+            .collect();
+
+        // 2b. centroid 更新（chunked 确定性 reduction）。
+        let chunk_size = KMEANS_PRODUCTION_CHUNK_SIZE;
+        let chunk_results: Vec<(Vec<Vec<f64>>, Vec<u64>)> = features
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let start = chunk_idx * chunk_size;
+                let mut sums: Vec<Vec<f64>> = vec![vec![0.0_f64; dim]; k];
+                let mut cnts: Vec<u64> = vec![0u64; k];
+                for (j, sample) in chunk.iter().enumerate() {
+                    let c = assignments[start + j] as usize;
+                    cnts[c] += 1;
+                    for d in 0..dim {
+                        sums[c][d] += sample[d];
+                    }
+                }
+                (sums, cnts)
+            })
+            .collect();
+
+        let mut new_centroids: Vec<Vec<f64>> = vec![vec![0.0_f64; dim]; k];
+        let mut counts: Vec<u64> = vec![0u64; k];
+        for (sums, cnts) in chunk_results {
+            for c in 0..k {
+                counts[c] += cnts[c];
+                for d in 0..dim {
+                    new_centroids[c][d] += sums[c][d];
+                }
+            }
+        }
+        for c in 0..k {
+            if counts[c] > 0 {
+                let inv = 1.0 / counts[c] as f64;
+                for d in 0..dim {
+                    new_centroids[c][d] *= inv;
+                }
+            } else {
+                split_empty_cluster_par(
+                    features,
+                    &assignments,
+                    &mut new_centroids,
+                    &counts,
+                    c,
+                    master_seed,
+                    op_id_split,
+                    split_sub_index,
+                );
+                split_sub_index += 1;
+            }
+        }
+
+        // 2c. 收敛判定。
+        let mut shift_inf: f64 = 0.0;
+        for c in 0..k {
+            for d in 0..dim {
+                let s = (new_centroids[c][d] - centroids[c][d]).abs();
+                if s > shift_inf {
+                    shift_inf = s;
+                }
+            }
+        }
+        centroids = new_centroids;
+        if shift_inf <= cfg.centroid_shift_tol {
+            break;
+        }
+    }
+
+    // 3. 最终 assignment（centroid 已更新，重算一次保证一致；par_iter）。
+    let final_assignments: Vec<u32> = features
+        .par_iter()
+        .map(|sample| {
+            let mut best_c: u32 = 0;
+            let mut best_d2 = l2_sq(sample, &centroids[0]);
+            for c in 1..k {
+                let d2 = l2_sq(sample, &centroids[c]);
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best_c = c as u32;
+                }
+            }
+            best_c
+        })
+        .collect();
+
+    KMeansResult {
+        centroids,
+        assignments: final_assignments,
+    }
+}
+
+/// 空 cluster split 的 par 变体（[`split_empty_cluster`] 的 N=123M 友好版）。
+/// 用 `par_iter().filter().reduce()` 找最大 cluster 内最远 sample；reduce 闭包
+/// tie-break 取小 sample id 保确定性。
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_range_loop)]
+fn split_empty_cluster_par(
+    features: &[Vec<f64>],
+    assignments: &[u32],
+    centroids: &mut [Vec<f64>],
+    counts: &[u64],
+    empty_idx: usize,
+    _master_seed: u64,
+    _op_id_split: u32,
+    _sub_index: u32,
+) {
+    // 找 counts 最大的 cluster id（tie-break 取最小；K=500 sequential 足够快）。
+    let mut best_c = 0usize;
+    let mut best_count = counts[0];
+    for c in 1..counts.len() {
+        if counts[c] > best_count {
+            best_count = counts[c];
+            best_c = c;
+        }
+    }
+    let target_centroid = centroids[best_c].clone();
+    // par_iter 找 best_c 内最远 sample；初始 sentinel (usize::MAX, -1.0) 在合并
+    // 时会被任何合法 (i, d2 ≥ 0) 覆盖；tie-break：距离相等取小 i。
+    let (farthest_idx_opt, _farthest_d2) = features
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, sample)| {
+            if assignments[i] as usize == best_c {
+                Some((i, l2_sq(sample, &target_centroid)))
+            } else {
+                None
+            }
+        })
+        .reduce(
+            || (usize::MAX, -1.0_f64),
+            |(i1, d1), (i2, d2)| {
+                if i1 == usize::MAX {
+                    (i2, d2)
+                } else if i2 == usize::MAX {
+                    (i1, d1)
+                } else if d2 > d1 || (d2 == d1 && i2 < i1) {
+                    (i2, d2)
+                } else {
+                    (i1, d1)
+                }
+            },
+        );
+    let farthest_idx = if farthest_idx_opt == usize::MAX {
+        0
+    } else {
+        farthest_idx_opt
+    };
+    centroids[empty_idx] = features[farthest_idx].clone();
 }
 
 // ============================================================================
