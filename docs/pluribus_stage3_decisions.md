@@ -263,10 +263,35 @@ function average_strategy(I, strategy_sum):
 
 阶段 3 A0 [决策] batch 1 锁定算法变体 + 验收门槛骨架后仍有以下未决项；列入此处不阻塞 A1 [实现] 脚手架推进，但在 B2/C2 [实现] 真正消费时必须由后续 D-NNN-revM 落地：
 
-- **D-314（bucket table 依赖）**：简化 NLHE 训练用 stage 2 C2 hash-based 95 KB v1 artifact 还是 §G-batch1 §3.4-batch2 production 528 MB v2 artifact。**A0 [决策] 不锁，runway 给 §G-batch1 §3.4-batch2 在 vultr 并行跑完**：A0..B2 期间（按 stage 2 时间线 2-3 周）若 v2 artifact 已 ready 由 D-314-rev1 lock 为 v2；否则 v1 fallback 由 D-314-rev2 lock 为 v1 + 显式标注已知 collision carve-out。lock 时间窗：B2/C2 [实现] 简化 NLHE `SimplifiedNlheGame` 开始构造之前。该决策 deferred 是用户授权 stage 3 [决策] 优先于 §G-batch1 §3.4-batch2..§4 closure 的直接产物。
+- **D-314（bucket table 依赖）** — **已 lock 为 D-314-rev1（2026-05-13，C1 [测试] 起草前）**：bucket table 依赖锁定为 §G-batch1 §3.10 production v3 artifact `artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin`（528 MiB / body BLAKE3 `67ee555439f2c918698650c05f40a7a5e9e812280ceb87fc3c6590add98650cd`）。详见 §10.1 D-314-rev1 lock 段落。**原文（locked 前 / A0 [决策] entry）**：~~简化 NLHE 训练用 stage 2 C2 hash-based 95 KB v1 artifact 还是 §G-batch1 §3.4-batch2 production 528 MB v2 artifact。**A0 [决策] 不锁，runway 给 §G-batch1 §3.4-batch2 在 vultr 并行跑完**：A0..B2 期间（按 stage 2 时间线 2-3 周）若 v2 artifact 已 ready 由 D-314-rev1 lock 为 v2；否则 v1 fallback 由 D-314-rev2 lock 为 v1 + 显式标注已知 collision carve-out。lock 时间窗：B2/C2 [实现] 简化 NLHE `SimplifiedNlheGame` 开始构造之前。该决策 deferred 是用户授权 stage 3 [决策] 优先于 §G-batch1 §3.4-batch2..§4 closure 的直接产物。~~
 - **多线程 ES-MCCFR thread-safety 模型**（D-321 候选）：`RegretTable` HashMap 多线程并发写候选方案（① `parking_lot::RwLock<HashMap>` / ② `dashmap::DashMap` / ③ thread-local accumulator + batch merge / ④ `crossbeam::SegQueue` snapshot reduce）。具体选型留 D-321 在 batch 3 落地，影响 D-361 多线程 SLO 实现路径。
 - **Linear CFR weighting 引入时间窗**（D-302-rev1 候选）：阶段 3 出口（F3 [报告]）若 simplified NLHE 100M update 后 LBR 实测高于 stage 4 起步 acceptance 预期，可选择在 stage 3 出口前引入 Linear CFR weighting 提前消化收敛速度问题。lock 时间窗：F2 [实现] 收尾前 + 用户授权。
 - **regret matching+ 引入时间窗**（D-303-rev1 候选）：同 D-302-rev1，与 Linear CFR 联动。lock 时间窗：F2 [实现] 收尾前 + 用户授权。
+
+---
+
+### 10.1 D-314-rev1 lock（C1 [测试] 起草前，2026-05-13）
+
+**触发器**：`pluribus_stage3_workflow.md` §步骤 C1 line 206 字面 "C1 [测试] 起草前由用户决策 lock D-314 为 v1（D-314-rev2）或 v2（D-314-rev1）" + line 441 carry-forward。本 lock 由 C1 [测试] agent 在 2026-05-13 用户授权下落地（与 stage 2 §A-rev0 / stage 3 §B-rev0 同型：D-NNN-revM 文档变更由非 [决策] role 在 workflow 字面授权下执行）。
+
+**lock 决定**：bucket table 依赖 = §G-batch1 §3.10 production **v3** artifact（不是 v1 fallback 也不是 v2 dual-phase MC artifact）。具体参数：
+
+- **artifact 路径**：`artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin`（CLAUDE.md ground truth 路径，gitignore 不进 git history）
+- **size**：553,631,520 bytes = **528 MiB**
+- **body BLAKE3**：`67ee555439f2c918698650c05f40a7a5e9e812280ceb87fc3c6590add98650cd`（CLI `content_hash`；CLAUDE.md "当前 artifact 基线" 段 ground truth）
+- **schema_version**：`2`（§G-batch1 §3.2 bump，与 D-244-rev2 mandate 一致）
+- **训练参数**：single-phase full N × per-street ClusterIter::production_default() (flop=2000/turn=5000/river=10000) × river_exact=true（§3.10 990 outcome enumeration）
+- **生成 host**：AWS c6a.8xlarge 32-core EPYC 7R13 / 61 GB on-demand 1h 37m
+
+**调用契约**：`SimplifiedNlheGame::new(bucket_table: Arc<BucketTable>)` 调用方负责 `BucketTable::open(artifact_path)` + `Arc::new` 包装；artifact 缺失或 BLAKE3 mismatch 时由 `BucketTable::open` 返回 `BucketTableError`，`SimplifiedNlheGame::new` 走 `TrainerError::UnsupportedBucketTable`。C2 [实现] 落地 `new` 时校验 `schema_version() == 2`（v1 95 KB fallback 走 `D-314-rev2` 已废弃，C2 拒绝 schema_version=1 输入）。
+
+**测试 setup 策略**（C1 [测试] 起草决定）：`tests/cfr_simplified_nlhe.rs` 5 条测试共享 helper `load_v3_artifact_or_skip()`，当 default artifact 路径文件不存在（典型 CI / GitHub-hosted runner 场景）时打印 eprintln 提示并 `return`（pass-with-skip）。本地 dev box / vultr / AWS host 有 artifact 时跑完整测试。CI 上 panic-fail 形态保留给 A1 scaffold 阶段 `SimplifiedNlheGame::new` 自身 `unimplemented!()`（C2 落地后 skip 路径生效）。
+
+**D-356 BucketTableMismatch 校验路径**：以 v3 body hash `67ee5554...` 为 expected；checkpoint round-trip 跨 artifact 不兼容（v3 训练的 checkpoint 不能加载到 v2/v1 BucketTable 上）。具体 expected hash 锁定在 D2 [实现] checkpoint header schema 落地时由 `BucketTable::content_hash()` 动态写入而非编译期常量。
+
+**D-314-rev2（v1 95 KB fallback）废弃路径**：A0 [决策] entry 字面预留的 v1 fallback 在 §G-batch1 §3.10 v3 artifact 落地后不再需要。C2 [实现] 落地 `SimplifiedNlheGame::new` 时直接拒绝 schema_version=1，不留 v1 兼容入口。
+
+**carve-out**：本 lock 由 C1 [测试] agent 落地决策文档变更，属 stage 3 workflow 字面授权的角色越界（与 stage 2 §B-rev1 / stage 3 §B-rev0 同型）。本 §10.1 entry 同 commit 落地，无需独立 `pluribus_stage3_workflow.md` §修订历史 entry 追认（workflow line 206 字面授权 = 修订历史 entry 等价物）。
 
 ---
 

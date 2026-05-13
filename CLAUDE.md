@@ -10,7 +10,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Stage 2 closed**：git tag `stage2-v1.0`，验收报告 `docs/pluribus_stage2_report.md`，A0..F3 全 13 步 closed。
 - **Stage 3 起步 §G-batch1**（D-218-rev2 真等价类枚举，stage 2 → stage 3 carry-forward）：§1..§3.10 closed 2026-05-11..2026-05-13。production artifact v3 落地（详见下方 "当前 artifact 基线"）。**§3.5..§4 deferred** 到 stage 3 F3 [报告] 后回头补（跨架构 baseline 重生 + D-275 选项 + reader v2 + 12 条 bucket quality 转 active + stage 2 report §8 carve-out 翻面 + GitHub Release 上传由用户手动触发）。
 - **Stage 3 主线 A0..B2 closed 2026-05-12**：A0 [决策] 4 docs 落地（`pluribus_stage3_{validation,decisions,api,workflow}.md`，D-300..D-379 + API-300..API-392）；A1 [实现] scaffold（`src/training/` 10 文件骨架 + `tools/train_cfr.rs`）；B1 [测试] 3 integration crate + 1 bench crate；B2 [实现] sampling/regret/kuhn/leduc/trainer/best_response 全部落地，Kuhn closed-form `-1/18` anchor + Leduc `< 0.1` 阈值 + 1000× BLAKE3 byte-equal 全 pass，**§B-rev0 carve-out** Leduc curve test 5% tolerance 留 F1 决定。
-- **下一步**：**Stage 3 C1 [测试]** — 简化 NLHE ES-MCCFR + Game trait + checkpoint round-trip（详见 `docs/pluribus_stage3_workflow.md` §步骤 C1）。
+- **Stage 3 C1 [测试] closed 2026-05-13**：`tests/cfr_simplified_nlhe.rs` 5 条测试落地（D-313 root state + D-318 5-action 桥接 + D-317 InfoSetId 桥接 + D-342 工程稳定性 smoke + D-362 1M update × 3 BLAKE3 repeat）+ `benches/stage3.rs` 第 3 个 bench group `stage3/nlhe_es_mccfr_update` + **D-314-rev1 lock**（v3 production 528 MiB artifact / body BLAKE3 `67ee5554...`，详见 `docs/pluribus_stage3_decisions.md` §10.1）。5 道 gate 全绿；3 active panic-fail + 2 release-ignored 是 scaffold 阶段预期形态。`tests/api_signatures.rs` 0 改动（stage 3 trip-wire 已在 A1 提前同步）。
+- **下一步**：**Stage 3 C2 [实现]** — `SimplifiedNlheGame` Game trait 全 8 方法 + `EsMccfrTrainer::new + step` + D-321 thread-safety 模型 lock + C1 5 条测试全部转绿（详见 `docs/pluribus_stage3_workflow.md` §步骤 C2）。
 
 历史出口数据、carve-out 全文、实测数字一律不在本文件保留。查阅顺序：
 
