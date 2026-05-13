@@ -971,7 +971,16 @@ fn train_one_street(
     // 改 EHS² ≈ equity²，feature_set_id 仍为 1（schema 不 bump）；production
     // CLI（`--cluster-iter 10000`）走精确路径，无影响。
     let use_proxy = cluster_iter <= 500;
-    let calc = MonteCarloEquity::new(Arc::clone(&evaluator)).with_iter(cluster_iter);
+    // §G-batch1 §3.10 (D-220-rev1)：Production 路径开启 river_exact 让所有
+    // board.len()==5 的 equity() 调用走 enumerate 990 outcomes 精确路径替代 MC
+    // iter。直接 river EHS / ehs² 省 ~10×；turn / flop ehs² 内 inner river equity
+    // 也省同等 (turn 460k → 91k evals/sample, flop 4.3M → 1.07M evals/sample)。
+    // OCHS 走 `equity_vs_hand` 不受 flag 影响（已是 deterministic showdown / enum
+    // 路径）。Fixture path 走默认 `river_exact = false` 保 §3.3 fixture artifact
+    // `a6989eeb...` byte-equal + stage 1 cross_arch baseline 32-seed byte-equal。
+    let calc = MonteCarloEquity::new(Arc::clone(&evaluator))
+        .with_iter(cluster_iter)
+        .with_river_exact(matches!(mode, TrainingMode::Production));
     let ehs_op = match street {
         StreetTag::Flop => cluster::rng_substream::EHS2_INNER_EQUITY_FLOP,
         StreetTag::Turn => cluster::rng_substream::EHS2_INNER_EQUITY_TURN,

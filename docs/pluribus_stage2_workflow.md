@@ -2621,3 +2621,53 @@ ssh -i ~/us-east-2.pem ubuntu@18.217.90.217 \
 - v3 报告 `docs/pluribus_stage2_bucket_quality_v3_test_report.md` 替代 v2 报告
 
 下一步：commit + push（tests + docs commit 2）+ 起 AWS 32-core retrain v3 artifact + 跑 19 条 bucket_quality 实测 + 写 v3 报告 + CLAUDE.md ground truth artifact hash 切到 v3。
+
+##### §G-batch1 §3.10 [实现]（2026-05-13）：river-state equity enumerate 990 outcomes fast path
+
+用户实跑 §G-batch1 §3.9 v3 retrain 进度 ~30 min 后 flag 出关键优化点：river-state (board.len()==5) `equity_hot_loop::<5, 0>` MC iter=10000 sample 990 opp hole outcomes 是浪费——直接 enumerate 990 outcomes 既精确又快 ~20×。**用户授权 abort 当前 v3 retrain (PID 4849) + watcher (PID 5456) + 加 river_exact fast path + 重起**。
+
+**核心发现**：river state 完整 outcome space = `C(45, 2) = 990` 个对手 hole（hero hole + 5-card board 用 7 张牌 → deck 剩 45）。MC iter=10000 估算 990 outcomes σ ≈ 0.5%；enumerate 990 outcomes σ=0 且只需 1 me + 990 opp evals = 991 evals (vs MC 20000 evals → **20× 省**)。
+
+**连锁省 wall**（D-220-rev1 详 `pluribus_stage2_decisions.md` §10）：
+
+| Inner equity 调用点 | per-sample evals 现状 | per-sample evals exact | 省 |
+|---|---|---|---|
+| River EHS | 20k (MC iter=10k × 2 eval) | 990 + 1 me | 20× |
+| River ehs² (复用 equity()) | 20k | 990 + 1 me | 20× |
+| Turn ehs² (46 outer × inner river MC) | 460k | 46 × (990+1) ≈ 46k | 10× |
+| Flop ehs² (1081 outer × inner river MC) | 4.3M | 1081 × (990+1) ≈ 1.07M | 4× |
+
+**Wall 估算修正**（叠加 §3.9）：
+
+| 训练 | flop wall | turn wall | river wall | 总 |
+|---|---|---|---|---|
+| v2 §3.4 dual-phase MC iter=2000 uniform (16-core) | 8h 34m | 2h 20m | 53m | 11h 47m |
+| v3 §3.9 single-phase per-street iter MC river (32-core) | ~3h | ~2.5h | ~2.5h | ~8h |
+| **v3 §3.9 + §3.10 river_exact (32-core)** | **~1.5h** | **~0.5h** | **~0.25h** | **~2.5h** |
+
+**代码 commit**（src + docs，本 batch [实现]）：
+
+1. `src/abstraction/equity.rs`：
+   - `MonteCarloEquity` 加 `river_exact: bool` field（默认 `false`）；
+   - 新 builder `pub fn with_river_exact(self, on: bool) -> MonteCarloEquity`；
+   - 新私函数 `fn equity_river_exact_impl(...)` 走 enumerate 990 outcomes（不消耗 RNG，single eval7(me) + 990 eval7(opp) + compare_x2 sum）；
+   - `equity_impl` 入口加 `if board.len() == 5 && self.river_exact { return self.equity_river_exact_impl(...); }` early-return；MC 路径不动。
+
+2. `src/abstraction/bucket_table.rs::train_one_street`：
+   - `MonteCarloEquity::new(...).with_iter(cluster_iter).with_river_exact(matches!(mode, TrainingMode::Production))`：Production 显式开 exact；Fixture 走默认 `false`。
+
+3. `docs/pluribus_stage2_decisions.md` §10 修订历史末尾追加 D-220-rev1 + D-227-rev1 entry。
+
+4. 本文档 §修订历史 末尾追加本 §G-batch1 §3.10 entry。
+
+**Byte-equal 不变量验证**：
+
+- **Fixture artifact `a6989eeb...`**（§3.3 ground truth）：`BucketTable::train_in_memory(...)` → Fixture mode → `river_exact = false` → MC 路径 byte-equal。**本地实测 fixture smoke K=10/10/10 cluster_iter=100 BLAKE3 `a6989eeb1dc618ef8a6b375d6af1dcef547a96cdb2c0e84e4b6341562183c2b6` 与 §3.3 / §3.4-batch1.5 ground truth byte-equal ✓**。
+- **Stage 1 cross_arch baseline**（`tests/data/bucket-table-arch-hashes-linux-x86_64.txt` 32-seed × 3 街 fixture mode）：同上 Fixture path → MC 不变 → byte-equal 维持 ✓ (无需重 capture)。
+- `tests/equity_self_consistency.rs` 12 测试 + `tests/equity_calculator_lookup.rs` 17 测试 + `tests/equity_features.rs` 10 测试 全 pass byte-equal（default 不调 with_river_exact）。
+
+**5 道 gate 全绿**：fmt / build / clippy `-D warnings` / doc `-D warnings` / test `--no-run`。
+
+**Retrain 重起**：本 commit push 后 SSH AWS pull + rebuild + 起新 v3 retrain（PID 4849 已 kill；partial artifact 已 clean）。Bark watcher 重起，TRAIN_PID 更新到新 PID。
+
+下一步：commit + push（src + docs，本 §3.10）→ AWS pull + rebuild + 起新 v3 retrain + watcher → 等 ~2.5h → fetch v3 artifact + 19 bucket_quality 测试 + v3 报告。

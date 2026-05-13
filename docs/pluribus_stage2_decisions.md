@@ -702,6 +702,56 @@ AWS 16-core c6a.4xlarge 30 GB host：50% 余量；AWS 32-core c6a.8xlarge 61 GB 
 - v2 artifact (`e602f548...`) 仅作历史参照保留，CLAUDE.md ground truth artifact hash 待 §G-batch1 §3.9 retrain 后切到 v3。
 - 12 条 `tests/bucket_quality.rs` 断言由本 batch 一并改用 D-233-rev1 sqrt-scaled 公式 + MC-aware monotonic tol；v3 retrain 后 active 跑全套 19 测试，pass 数预期 ≥ 16 of 19（std_dev 3 条 borderline 留 D-233-rev2 后续 carve-out）。
 
+#### D-220-rev1 + D-227-rev1（§G-batch1 §3.10 \[实现\] 2026-05-13）
+
+**修订**：`MonteCarloEquity` 加 `river_exact: bool` builder（默认 `false` 保 stage 2 既有 MC 路径 byte-equal）。当 `river_exact = true` 时，**任何 `board.len() == 5` 的 `equity()` 调用走 enumerate `C(45, 2) = 990` outcomes 精确路径**（不消耗 RNG），替代原 MC `iter=self.iter` 路径。
+
+**动机**：river-state outcome space = 990 个对手 hole（确定性 + 有限），MC sample iter=10000 对 990 outcomes 既有 ~0.5% noise (σ = √(0.25/10000)) 又比 enumerate 慢 ~20×（10000 me + 10000 opp evals vs 1 me + 990 opp evals）。enumerate 是**严格更优**：精确 + ~10-20× 快 + 不消耗 RNG。Stage 2 一直走 MC 是 const-generic 4 街分流的统一 path 简化，不是 D-220 / D-227 字面要求。
+
+**`river_exact` flag 影响范围**：所有 **inner equity() with `board.len()==5`** 路径：
+
+1. **River EHS** (`board.len()==5` → `equity_hot_loop::<5, 0>` MC vs 990-enum): per-sample 20k → 990 evals (**20× 省**)
+2. **River ehs²** (`ehs_squared(board.len()==5)` 内 `let inner = self.equity(...)`): 同上 20× 省
+3. **Turn ehs²** (`ehs_squared(board.len()==4)` 内 46 outer × inner equity(board.len()==5)): per-sample 460k → 46 × 990 ≈ 46k evals (**10× 省**)
+4. **Flop ehs²** (`ehs_squared(board.len()==3)` 内 1081 outer × inner equity(board.len()==5)): per-sample 4.3M → 1081 × 990 ≈ 1.07M evals (**4× 省**)
+
+**不受 flag 影响的路径**：
+
+- `equity_vs_hand(...)` 内部分流（已经是 deterministic showdown on river + enumerate 46/1081 on turn/flop），OCHS feature 路径走它。
+- `equity(board.len() ∈ {0, 3, 4})` 路径（非 river state；preflop / flop / turn 直接 equity）。
+- `ehs_squared(board.len()==0)` preflop 路径（outer MC iter sample 5-card board，不涉及 inner river-state）。
+- `equity_iter`（perf SLO `stage2_equity_monte_carlo_throughput_*`）保持 MC 路径，SLO 数字不变。
+
+**Byte-equal 不变量维持**：
+
+- **Fixture artifact `a6989eeb...`**（§G-batch1 §3.3 / §3.4-batch1.5 ground truth）：`BucketTable::train_in_memory(...)` → `TrainingMode::Fixture` → `train_one_street` 内 `with_river_exact(matches!(mode, Production))` = `false` → `river_exact = false` → MC 路径不变。**本地实测 fixture smoke K=10/10/10 cluster_iter=100 BLAKE3 `a6989eeb1dc618ef8a6b375d6af1dcef547a96cdb2c0e84e4b6341562183c2b6` 与 §3.3 ground truth byte-equal ✓**。
+- **Stage 1 cross_arch baseline** (`tests/data/bucket-table-arch-hashes-linux-x86_64.txt` 32-seed × 3 街 fixture mode hashes)：同上 Fixture path → MC 不变 → byte-equal 维持 ✓。
+- `tests/equity_self_consistency.rs` 12 测试 + `tests/equity_calculator_lookup.rs` + `tests/equity_features.rs` 默认走 `MonteCarloEquity::new(...)` (river_exact default false) → 全 pass byte-equal ✓。
+
+**仅 Production artifact 受影响**：v3 artifact body hash 与 v2 本来就不 byte-equal（v2 是 §3.4 dual-phase + iter=2000 uniform；v3 是 §3.9 single-phase + per-street iter + rayon kmeans_fit_production），加 river_exact 是 production-only 第三个独立变量，artifact 漂移不构成新不变量违反。
+
+**Wall 估算修正**（§G-batch1 §3.9 + §3.10 叠加）：
+
+| 训练 | flop wall | turn wall | river wall | 总 |
+|---|---|---|---|---|
+| v2 §3.4 dual-phase iter=2000 uniform (16-core) | 8h 34m (73%) | 2h 20m (20%) | 53m (7%) | 11h 47m |
+| v3 §3.9 single-phase + per-street iter (32-core, MC river) | ~3h | ~2.5h | ~2.5h | ~8h |
+| v3 §3.9 + §3.10 river_exact (32-core) | **~1.5h** | **~0.5h** | **~0.25h** | **~2.5h** |
+
+(estimates 假设 32-core efficiency ~0.6 with rayon contention + OCHS sequential pieces)。
+
+**OCHS 改进留 future batch**：本 rev 不动 OCHS `equity_vs_hand` 路径，因为它已经是 deterministic enumerate (river single eval / turn 46 enum / flop 1081 enum)，无 MC 噪声 + 无 inner equity() river-state 调用。`equity_iter` parameter 对 OCHS 不生效 (`equity_vs_hand` 不用 self.iter)。
+
+**实现**（`src/abstraction/equity.rs`）：
+
+- `pub struct MonteCarloEquity` 加 `river_exact: bool` field（默认 false）。
+- `pub fn with_river_exact(self, on: bool) -> MonteCarloEquity` builder。
+- `fn equity_river_exact_impl(&self, hole, board) -> Result<f64, EquityError>`：枚举 unused deck `C(N, 2)` 个 opp_hole 组合，每个 single eval7(me) + eval7(opp) + compare_x2 sum；`Ok(sum_x2 / (2 × count))`。不消耗 RNG。
+- `equity_impl` 入口加 `if board.len() == 5 && self.river_exact { return self.equity_river_exact_impl(...); }` early-return 分支；MC 路径不动。
+- `src/abstraction/bucket_table.rs::train_one_street`：`MonteCarloEquity::new(...).with_iter(cluster_iter).with_river_exact(matches!(mode, TrainingMode::Production))`。
+
+**carry forward**：与 D-244-rev3 / D-233-rev1 同 batch 同 commit 落地；§G-batch1 §3.10 workflow entry 一并追加。
+
 ---
 
 ## 12. 与决策文档 / API 文档的对应关系

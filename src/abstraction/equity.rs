@@ -119,15 +119,30 @@ pub enum EquityError {
 pub struct MonteCarloEquity {
     iter: u32,
     n_opp_clusters: u8,
+    /// §G-batch1 §3.10 \[实现\] (D-220-rev1 / D-227-rev1)：river-state (board.len()==5)
+    /// equity 走 enumerate 990 outcomes（精确，无 MC 噪声、无 RNG 消耗）替代 MC
+    /// iter=self.iter。默认 `false` 保 stage 2 既有 MC byte-equal（D-051 / D-237
+    /// cross_arch baseline + fixture artifact `a6989eeb...`）；
+    /// [`TrainingMode::Production`] 路径显式开启走 exact。
+    ///
+    /// 影响范围：所有 `board.len()==5` 的 `equity()` 直接 / 间接调用：(a) river
+    /// EHS / ehs²；(b) turn ehs² 内 46 outer × inner river equity；(c) flop ehs²
+    /// 内 1081 outer × inner river equity。OCHS 路径走 `equity_vs_hand`（已是
+    /// closed-form showdown on river / deterministic enumerate on turn / flop），
+    /// 不受 flag 影响。
+    river_exact: bool,
     evaluator: Arc<dyn HandEvaluator>,
 }
 
 impl MonteCarloEquity {
-    /// 默认配置：`iter = 10_000`、`n_opp_clusters = 8`（D-220 / D-222）。
+    /// 默认配置：`iter = 10_000`、`n_opp_clusters = 8`、`river_exact = false`
+    /// （D-220 / D-222；D-220-rev1 / D-227-rev1 river_exact 默认 false 保 stage 2
+    /// byte-equal）。
     pub fn new(evaluator: Arc<dyn HandEvaluator>) -> MonteCarloEquity {
         MonteCarloEquity {
             iter: 10_000,
             n_opp_clusters: 8,
+            river_exact: false,
             evaluator,
         }
     }
@@ -145,12 +160,57 @@ impl MonteCarloEquity {
         }
     }
 
+    /// §G-batch1 §3.10 \[实现\]：开启 river-state (board.len()==5) equity 走
+    /// enumerate 990 outcomes 精确路径（vs `iter` 次 MC sample）。详见
+    /// `river_exact` field doc。
+    pub fn with_river_exact(self, on: bool) -> MonteCarloEquity {
+        MonteCarloEquity {
+            river_exact: on,
+            ..self
+        }
+    }
+
     pub fn iter(&self) -> u32 {
         self.iter
     }
 
     pub fn n_opp_clusters(&self) -> u8 {
         self.n_opp_clusters
+    }
+
+    pub fn river_exact(&self) -> bool {
+        self.river_exact
+    }
+
+    /// River-state (board.len()==5) exact equity via 990-outcome enumerate（D-220-rev1
+    /// / §G-batch1 §3.10）。`board` 必须是 5 张；`opp_hole` 在剩余 45 张 deck 中枚举
+    /// `C(45, 2) = 990` 个组合（实际 < 45 张时 N=remaining 个 cards, count=N*(N-1)/2）。
+    ///
+    /// 不消耗 RNG。返回 `wins_x2 / (2 × count)` ∈ [0, 1]（D-220 同维度）。
+    fn equity_river_exact_impl(&self, hole: [Card; 2], board: &[Card]) -> Result<f64, EquityError> {
+        debug_assert_eq!(board.len(), 5);
+        let used = build_used_set(&hole, &[], board)?;
+        let me = build_seven_cards(hole, board);
+        let rm = self.evaluator.eval7(&me);
+        let unused: Vec<u8> = (0..52u8).filter(|v| !used[*v as usize]).collect();
+        let n = unused.len();
+        let mut sum_x2: u64 = 0;
+        let mut count: u64 = 0;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let opp_hole = [
+                    Card::from_u8(unused[i]).expect("0..52"),
+                    Card::from_u8(unused[j]).expect("0..52"),
+                ];
+                let opp = build_seven_cards(opp_hole, board);
+                let ro = self.evaluator.eval7(&opp);
+                sum_x2 += compare_x2(rm, ro);
+                count += 1;
+            }
+        }
+        // 通常 count = 990 (52 - 5 - 2 = 45 → C(45, 2)=990)；少数边界（hole/board
+        // 包含越界，理论不可能）下 count 可能减小。
+        Ok(sum_x2 as f64 / (2.0 * count as f64))
     }
 
     /// E2 hot-path 内部分发（§E-rev1）：保留 trait `equity` 接收 `&mut dyn
@@ -179,6 +239,12 @@ impl MonteCarloEquity {
         //
         // const-generic 分流让 LLVM 静态展开 FY 内层循环 + board-prefix 复制循环
         // （4 街总计 4 个分流 = `BOARD_LEN ∈ {0, 3, 4, 5}` × `NEEDED ∈ {5, 2, 1, 0}`）。
+        // §G-batch1 §3.10 (D-220-rev1)：river_exact 路径不消耗 RNG，走精确 990
+        // outcome enumerate。Fixture mode (`river_exact=false`) 走老 MC 路径
+        // byte-equal §3.3 + cross_arch baseline。Production mode 显式开启 exact。
+        if board.len() == 5 && self.river_exact {
+            return self.equity_river_exact_impl(hole, board);
+        }
         let used = build_used_set(&hole, &[], board)?;
         let evaluator = &*self.evaluator;
         let wins_x2 = match board.len() {
