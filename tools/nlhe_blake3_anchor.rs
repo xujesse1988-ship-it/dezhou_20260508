@@ -35,7 +35,7 @@
 //! surface。仅 `Cargo.toml` 追加 \[\[bin\]\] entry 让 cargo 识别（继承
 //! `train_bucket_table` / `bucket_quality_dump` / `train_cfr` 同型 entry）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
@@ -64,9 +64,10 @@ const REPEAT_COUNT: usize = 3;
 /// snapshot probe 上限（与 cfr_simplified_nlhe.rs::SNAPSHOT_PROBE_LIMIT 同型）。
 const SNAPSHOT_PROBE_LIMIT: usize = 4_096;
 
-fn parse_args() -> Result<(PathBuf, u64), String> {
+fn parse_args() -> Result<(PathBuf, u64, Option<PathBuf>), String> {
     let mut artifact: Option<PathBuf> = None;
     let mut updates: u64 = DEFAULT_UPDATES;
+    let mut save_checkpoint: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -81,11 +82,20 @@ fn parse_args() -> Result<(PathBuf, u64), String> {
                     .parse::<u64>()
                     .map_err(|e| format!("--updates 解析失败：{e}"))?;
             }
+            "--save-checkpoint" => {
+                save_checkpoint = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--save-checkpoint 需要值".to_string())?,
+                ));
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "用法：cargo run --release --bin nlhe_blake3_anchor -- \\\n\
-                     \t--artifact <path>  (默认 artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin)\n\
-                     \t--updates <n>      (默认 {DEFAULT_UPDATES} = 10M)\n"
+                     \t--artifact <path>      (默认 artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin)\n\
+                     \t--updates <n>          (默认 {DEFAULT_UPDATES} = 10M)\n\
+                     \t--save-checkpoint <path>  (可选) — F3 [报告] milestone checkpoint artifact 输出路径；\n\
+                     \t                           设置后仅跑 1 run × N updates 然后 trainer.save_checkpoint 写入 PATH\n\
+                     \t                           （不跑 3-run anchor 验证；用于 GitHub Release artifact 上传）\n"
                 );
                 std::process::exit(0);
             }
@@ -95,7 +105,7 @@ fn parse_args() -> Result<(PathBuf, u64), String> {
     let artifact = artifact.unwrap_or_else(|| {
         PathBuf::from("artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin")
     });
-    Ok((artifact, updates))
+    Ok((artifact, updates, save_checkpoint))
 }
 
 fn blake3_hex(bytes: &[u8; 32]) -> String {
@@ -147,7 +157,11 @@ fn blake3_avg_strategy_snapshot(
     hasher.finalize().into()
 }
 
-fn run_one(table: Arc<BucketTable>, updates: u64) -> Result<([u8; 32], f64), String> {
+fn run_one(
+    table: Arc<BucketTable>,
+    updates: u64,
+    save_checkpoint: Option<&Path>,
+) -> Result<([u8; 32], f64), String> {
     let game = SimplifiedNlheGame::new(table)
         .map_err(|e| format!("SimplifiedNlheGame::new 失败：{e:?}"))?;
     let probes = collect_snapshot_probes(&game);
@@ -175,23 +189,48 @@ fn run_one(table: Arc<BucketTable>, updates: u64) -> Result<([u8; 32], f64), Str
     }
     let elapsed = t0.elapsed().as_secs_f64();
     let hash = blake3_avg_strategy_snapshot(&trainer, &probes);
+    if let Some(path) = save_checkpoint {
+        trainer
+            .save_checkpoint(path)
+            .map_err(|e| format!("save_checkpoint({}) 失败：{e:?}", path.display()))?;
+        eprintln!(
+            "  saved checkpoint -> {} ({} bytes file, trainer.update_count = {})",
+            path.display(),
+            std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            trainer.update_count()
+        );
+    }
     Ok((hash, elapsed))
 }
 
 fn main() -> ExitCode {
-    let (artifact, updates) = match parse_args() {
+    let (artifact, updates, save_checkpoint) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[nlhe_blake3_anchor] 参数错误：{e}");
             return ExitCode::from(2);
         }
     };
+    // --save-checkpoint 模式：单 run 跑完后 save_checkpoint，不跑 3-run anchor 验证
+    // （anchor 已在 F3 [报告] 起步 batch 1 vultr sweep 落地，本路径用于 GitHub Release
+    // milestone artifact 生成）。
+    let n_runs = if save_checkpoint.is_some() {
+        1
+    } else {
+        REPEAT_COUNT
+    };
     eprintln!("[nlhe_blake3_anchor] artifact = {}", artifact.display());
     eprintln!(
         "[nlhe_blake3_anchor] updates  = {} × {} run",
-        updates, REPEAT_COUNT
+        updates, n_runs
     );
     eprintln!("[nlhe_blake3_anchor] seed     = 0x{FIXED_SEED:016x}");
+    if let Some(p) = &save_checkpoint {
+        eprintln!(
+            "[nlhe_blake3_anchor] save_checkpoint = {} (single-run mode)",
+            p.display()
+        );
+    }
 
     let table = match BucketTable::open(&artifact) {
         Ok(t) => t,
@@ -209,11 +248,18 @@ fn main() -> ExitCode {
     }
     let shared = Arc::new(table);
 
-    let mut hashes: Vec<[u8; 32]> = Vec::with_capacity(REPEAT_COUNT);
-    let mut walls: Vec<f64> = Vec::with_capacity(REPEAT_COUNT);
-    for run in 0..REPEAT_COUNT {
+    let mut hashes: Vec<[u8; 32]> = Vec::with_capacity(n_runs);
+    let mut walls: Vec<f64> = Vec::with_capacity(n_runs);
+    for run in 0..n_runs {
         eprintln!("[nlhe_blake3_anchor] === run #{run} ===");
-        match run_one(Arc::clone(&shared), updates) {
+        // 仅在最后一个 run 上 save_checkpoint（n_runs==1 时即 run #0；多 run 模式
+        // 不 save，仅 BLAKE3 anchor 验证）。
+        let save_path = if save_checkpoint.is_some() && run + 1 == n_runs {
+            save_checkpoint.as_deref()
+        } else {
+            None
+        };
+        match run_one(Arc::clone(&shared), updates, save_path) {
             Ok((h, w)) => {
                 eprintln!(
                     "[nlhe_blake3_anchor] run #{run} BLAKE3 = {} wall = {:.1}s",
@@ -238,13 +284,22 @@ fn main() -> ExitCode {
         }
         return ExitCode::from(5);
     }
-    let total_updates = updates * REPEAT_COUNT as u64;
+    let total_updates = updates * n_runs as u64;
     let total_wall: f64 = walls.iter().sum();
     let avg_throughput = total_updates as f64 / total_wall.max(1e-9);
-    println!("\nD-362 anchor PASS — 3 runs BLAKE3 byte-equal ✓");
+    let mode = if save_checkpoint.is_some() {
+        "single-run milestone checkpoint mode (no 3-run anchor verification)"
+    } else {
+        "3-run anchor verification mode"
+    };
+    if n_runs >= 2 {
+        println!("\nD-362 anchor PASS — {n_runs} runs BLAKE3 byte-equal ✓");
+    } else {
+        println!("\nMilestone checkpoint generated — 1 run completed (mode: {mode})");
+    }
     println!("BLAKE3 = {}", blake3_hex(&first));
     println!("updates_per_run = {updates}");
-    println!("runs = {REPEAT_COUNT}");
+    println!("runs = {n_runs}");
     for (i, w) in walls.iter().enumerate() {
         let tp = updates as f64 / w.max(1e-9);
         println!("  run #{i}: wall = {w:.1}s throughput = {tp:.0} update/s");
@@ -252,5 +307,9 @@ fn main() -> ExitCode {
     println!(
         "total_updates = {total_updates}  total_wall = {total_wall:.1}s  avg_throughput = {avg_throughput:.0} update/s"
     );
+    if let Some(p) = &save_checkpoint {
+        let file_size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        println!("checkpoint = {} ({} bytes)", p.display(), file_size);
+    }
     ExitCode::from(0)
 }
