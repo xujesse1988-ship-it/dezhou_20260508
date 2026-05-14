@@ -9,8 +9,10 @@
 //!    `SCHEMA_VERSION + 1`（典型 bump）/ `SCHEMA_VERSION - 1`（下游 reader 旧版本）。
 //! 2. **trainer_variant / game_variant 越界 tag** — D1 仅测合法 variant 间互翻
 //!    （Kuhn↔Leduc / VanillaCfr↔EsMccfr 触发 `TrainerMismatch`），F1 加 unknown
-//!    tag（`2` / `0xFF` for trainer；`3` / `0xFF` for game），走 `Corrupted` dispatch
-//!    （checkpoint.rs::parse_bytes line 215-233 字面）。
+//!    tag（`3` / `0xFF` for trainer；`4` / `0xFF` for game — stage 4 A1 \[实现\]
+//!    扩展 TrainerVariant::EsMccfrLinearRmPlus=2 + GameVariant::Nlhe6Max=3 后
+//!    未占用 tag 上移一位），走 `Corrupted` dispatch（checkpoint.rs::parse_bytes
+//!    line 215-233 字面）。
 //! 3. **bucket_table_blake3 mismatch (Kuhn 路径)** — D1 仅在 NLHE 路径触发
 //!    `BucketTableMismatch`（且 release/--ignored 依赖 v3 artifact），F1 加 Kuhn
 //!    路径：Kuhn 期望 `bucket_table_blake3 = [0; 32]`（D-356 `Game::bucket_table_blake3`
@@ -198,13 +200,14 @@ fn schema_version_downgrade_returns_schema_mismatch() {
 // ===========================================================================
 
 #[test]
-fn trainer_variant_unknown_tag_2_returns_corrupted() {
-    // TrainerVariant 仅有 0 (VanillaCfr) / 1 (EsMccfr)；2 必走 Corrupted dispatch
-    // （checkpoint.rs::parse_bytes line 215-224 字面）。
+fn trainer_variant_unknown_tag_3_returns_corrupted() {
+    // TrainerVariant 已扩到 0 (VanillaCfr) / 1 (EsMccfr) / 2 (EsMccfrLinearRmPlus
+    // stage 4 API-441)；3 是 stage 4 A1 [实现] 后下一个未占用 tag，必走 Corrupted
+    // dispatch（checkpoint.rs::parse_bytes 字面）。
     let mut bytes = kuhn_fixture_bytes().to_vec();
-    bytes[OFFSET_TRAINER_VARIANT] = 2;
-    let path = write_tmp(&bytes, "trainer_tag_2");
-    let err = open_must_err(&path, "trainer_variant = 2 必须 Err");
+    bytes[OFFSET_TRAINER_VARIANT] = 3;
+    let path = write_tmp(&bytes, "trainer_tag_3");
+    let err = open_must_err(&path, "trainer_variant = 3 必须 Err");
     cleanup(&path);
     match err {
         CheckpointError::Corrupted { offset, reason } => {
@@ -237,12 +240,13 @@ fn trainer_variant_unknown_tag_0xff_returns_corrupted() {
 }
 
 #[test]
-fn game_variant_unknown_tag_3_returns_corrupted() {
-    // GameVariant 仅有 0 (Kuhn) / 1 (Leduc) / 2 (SimplifiedNlhe)；3 必走 Corrupted。
+fn game_variant_unknown_tag_4_returns_corrupted() {
+    // GameVariant 已扩到 0 (Kuhn) / 1 (Leduc) / 2 (SimplifiedNlhe) / 3 (Nlhe6Max
+    // stage 4 API-411)；4 是 stage 4 A1 [实现] 后下一个未占用 tag，必走 Corrupted。
     let mut bytes = kuhn_fixture_bytes().to_vec();
-    bytes[OFFSET_GAME_VARIANT] = 3;
-    let path = write_tmp(&bytes, "game_tag_3");
-    let err = open_must_err(&path, "game_variant = 3 必须 Err");
+    bytes[OFFSET_GAME_VARIANT] = 4;
+    let path = write_tmp(&bytes, "game_tag_4");
+    let err = open_must_err(&path, "game_variant = 4 必须 Err");
     cleanup(&path);
     match err {
         CheckpointError::Corrupted { offset, reason } => {

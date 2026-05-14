@@ -321,6 +321,12 @@ impl TrainerVariant {
         match b {
             0 => Some(TrainerVariant::VanillaCfr),
             1 => Some(TrainerVariant::EsMccfr),
+            // stage 4 API-441 — EsMccfrLinearRmPlus 走 schema_version=2 路径。
+            // stage 3 schema_version=1 文件读到 tag=2 时由 SCHEMA_VERSION
+            // mismatch 拒绝（schema_version 在 from_u8 之前 eager 校验）；本
+            // helper 仅完成 tag → enum 映射，schema dispatch 由 stage 4 D2
+            // \[实现\] 落地。
+            2 => Some(TrainerVariant::EsMccfrLinearRmPlus),
             _ => None,
         }
     }
@@ -333,6 +339,9 @@ impl GameVariant {
             0 => Some(GameVariant::Kuhn),
             1 => Some(GameVariant::Leduc),
             2 => Some(GameVariant::SimplifiedNlhe),
+            // stage 4 API-411 — Nlhe6Max 走 schema_version=2 路径（同
+            // TrainerVariant::EsMccfrLinearRmPlus 注释）。
+            3 => Some(GameVariant::Nlhe6Max),
             _ => None,
         }
     }

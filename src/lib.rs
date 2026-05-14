@@ -19,6 +19,19 @@
 //! 阶段 3 模块（A1 \[实现\] 起步，A0 决策已锁定）：
 //! - [`training`]：CFR / MCCFR 训练层（game / kuhn / leduc / nlhe / regret /
 //!   trainer / sampling / best_response / checkpoint）
+//!
+//! 阶段 4 模块（A0 闭合 2026-05-14；A1 \[实现\] scaffold 落地）：
+//! - [`training::nlhe_6max`]：`NlheGame6` 6-player NLHE Game trait impl
+//!   （D-410 / API-410）
+//! - [`training::lbr`]：`LbrEvaluator` Rust 自实现（D-450 / API-450）
+//! - [`training::slumbot_eval`]：Slumbot HTTP bridge + Head-to-Head 100K 手
+//!   评测（D-460 / API-460）
+//! - [`training::baseline_eval`]：`Opponent6Max` trait + 3 baseline impl +
+//!   1M 手 sanity 评测（D-480 / API-480）
+//! - [`training::metrics`]：`TrainingMetrics` 9 字段 + `TrainingAlarm` 5
+//!   variant + JSONL log（D-470 / API-470）
+//! - [`abstraction::action_pluribus`]：`PluribusActionAbstraction` 14-action
+//!   抽象（D-420 / API-420）
 
 pub mod abstraction;
 pub mod core;
@@ -68,4 +81,15 @@ pub use crate::training::{
     LeducBestResponse, LeducGame, LeducInfoSet, LeducStreet, NodeKind, PlayerId, RegretTable,
     SimplifiedNlheGame, StrategyAccumulator, Trainer, TrainerError, TrainerVariant,
     VanillaCfrTrainer,
+};
+
+// 阶段 4 顶层 re-export（A1 \[实现\] scaffold；与 `docs/pluribus_stage4_api.md`
+// §11 公开 surface 列表对齐）。
+pub use crate::abstraction::action_pluribus::{PluribusAction, PluribusActionAbstraction};
+pub use crate::training::{
+    evaluate_vs_baseline, write_metrics_jsonl, BaselineEvalResult, CallStationOpponent,
+    DecayStrategy, Head2HeadResult, HuHandResult, LbrEvaluator, LbrResult, MetricsCollector,
+    NlheGame6, NlheGame6Action, NlheGame6InfoSet, NlheGame6State, OpenSpielHuBaseline,
+    Opponent6Max, RandomOpponent, SixTraverserLbrResult, SlumbotBridge, SlumbotHandResult,
+    TagOpponent, TrainerConfig, TrainingAlarm, TrainingMetrics,
 };

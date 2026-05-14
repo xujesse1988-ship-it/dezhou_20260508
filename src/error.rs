@@ -137,6 +137,13 @@ pub enum TrainerError {
     #[error("regret matching probability sum {got} out of tolerance {tolerance}")]
     ProbabilitySumOutOfTolerance { got: f64, tolerance: f64 },
 
+    /// stage 4 D-456 — `LbrEvaluator::new` 在 `action_set_size != 14 && != 5` 时
+    /// 拒绝；让 LBR computation 与训练时使用的 action abstraction 一致（D-456
+    /// 字面：14 action 默认，5 action 走 stage 3 SimplifiedNlheGame ablation）。
+    /// stage 4 A1 \[实现\] 占位 variant；E2/F2 \[实现\] 实际触发。
+    #[error("LBR action_set_size unsupported (must be 5 or 14)")]
+    PreflopActionAbstractionMismatch,
+
     #[error("checkpoint error: {0}")]
     Checkpoint(#[from] CheckpointError),
 }
@@ -152,6 +159,10 @@ pub enum TrainerError {
 pub enum TrainerVariant {
     VanillaCfr = 0,
     EsMccfr = 1,
+    /// stage 4 D-449 / API-441 — Linear MCCFR + RM+ trainer variant；
+    /// checkpoint schema_version=2 路径专属（D-449 字面不向前兼容 stage 3
+    /// schema_version=1）。stage 4 D2 \[实现\] 落地实际 dispatch。
+    EsMccfrLinearRmPlus = 2,
 }
 
 /// Game 变体 tag（API-350 binary schema offset 13 / D-356 跨 game 不兼容拒绝）。
@@ -163,4 +174,7 @@ pub enum GameVariant {
     Kuhn = 0,
     Leduc = 1,
     SimplifiedNlhe = 2,
+    /// stage 4 D-411 / API-411 — 6-player NLHE 主目标变体；
+    /// checkpoint schema_version=2 路径专属（traverser_count = 6）。
+    Nlhe6Max = 3,
 }

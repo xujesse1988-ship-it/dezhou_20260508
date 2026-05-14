@@ -28,6 +28,7 @@ fn api_signatures_locked() {
     _api_signature_assertions();
     _stage2_api_signature_assertions();
     _stage3_api_signature_assertions();
+    _stage4_api_signature_assertions();
 }
 
 #[allow(dead_code, clippy::type_complexity)]
@@ -690,4 +691,296 @@ fn _stage3_api_signature_assertions() {
     // binary header offset 12/13 → enum 解析路径）。
     let _: fn(u8) -> Option<TrainerVariant> = TrainerVariant::from_u8;
     let _: fn(u8) -> Option<GameVariant> = GameVariant::from_u8;
+}
+
+#[allow(dead_code, clippy::type_complexity, clippy::unit_arg)]
+fn _stage4_api_signature_assertions() {
+    // ===================================================================
+    // stage 4 A1 [实现] scaffold — API-400..API-499 trip-wire（继承 stage 1 +
+    // stage 2 + stage 3 同型 lock 模式）。
+    //
+    // 任一 stage 4 公开 API 签名漂移立即在 `cargo test --no-run` 失败。
+    // ===================================================================
+
+    use poker::abstraction::action_pluribus::{PluribusAction, PluribusActionAbstraction};
+    use poker::training::lbr::{LbrEvaluator, LbrResult, SixTraverserLbrResult};
+    use poker::training::metrics::{MetricsCollector, TrainingAlarm, TrainingMetrics};
+    use poker::training::nlhe_6max::{NlheGame6, NlheGame6Action, NlheGame6State};
+    use poker::training::slumbot_eval::{
+        Head2HeadResult, HuHandResult, OpenSpielHuBaseline, SlumbotBridge, SlumbotHandResult,
+    };
+    use poker::training::trainer::{DecayStrategy, EsMccfrTrainer, TrainerConfig};
+    use poker::{BucketTable, ChipAmount, GameState, InfoSetId, PlayerId, RngSource};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    // ---------------------------------------------------------------
+    // API-411 — GameVariant::Nlhe6Max 4th variant + from_u8(3)
+    // ---------------------------------------------------------------
+    let _: GameVariant = GameVariant::Nlhe6Max;
+    let _: Option<GameVariant> = GameVariant::from_u8(3);
+
+    // ---------------------------------------------------------------
+    // API-441 — TrainerVariant::EsMccfrLinearRmPlus 3rd variant + from_u8(2)
+    // ---------------------------------------------------------------
+    let _: TrainerVariant = TrainerVariant::EsMccfrLinearRmPlus;
+    let _: Option<TrainerVariant> = TrainerVariant::from_u8(2);
+
+    // ---------------------------------------------------------------
+    // API-420 — PluribusAction 14-variant enum + N_ACTIONS / all() /
+    // raise_multiplier() / from_u8 helper lock
+    // ---------------------------------------------------------------
+    let _: usize = PluribusAction::N_ACTIONS;
+    let _: fn() -> [PluribusAction; 14] = PluribusAction::all;
+    let _: fn(PluribusAction) -> Option<f64> = PluribusAction::raise_multiplier;
+    let _: fn(u8) -> Option<PluribusAction> = PluribusAction::from_u8;
+    // 14 variant byte-equal 顺序锁（与 D-420 字面 §S3 Pluribus 主论文一致）。
+    let actions = PluribusAction::all();
+    let _: PluribusAction = actions[0]; // Fold
+    let _: PluribusAction = actions[13]; // AllIn
+    let _: u8 = PluribusAction::AllIn as u8;
+
+    // ---------------------------------------------------------------
+    // API-420 / API-421 — PluribusActionAbstraction inherent method lock
+    // ---------------------------------------------------------------
+    let _: fn() -> PluribusActionAbstraction = <PluribusActionAbstraction as Default>::default;
+    let _: for<'a, 'b> fn(&'a PluribusActionAbstraction, &'b GameState) -> Vec<PluribusAction> =
+        PluribusActionAbstraction::actions;
+    let _: for<'a, 'b, 'c> fn(
+        &'a PluribusActionAbstraction,
+        &'b PluribusAction,
+        &'c GameState,
+    ) -> bool = PluribusActionAbstraction::is_legal;
+    let _: for<'a, 'b> fn(&'a PluribusActionAbstraction, &'b GameState, f64) -> ChipAmount =
+        PluribusActionAbstraction::compute_raise_to;
+
+    // ---------------------------------------------------------------
+    // API-423 — InfoSetId::with_14action_mask / legal_actions_mask_14 lock
+    // ---------------------------------------------------------------
+    let _: fn(InfoSetId, u16) -> InfoSetId = InfoSetId::with_14action_mask;
+    let _: fn(InfoSetId) -> u16 = InfoSetId::legal_actions_mask_14;
+
+    // ---------------------------------------------------------------
+    // API-410 — NlheGame6 inherent method lock + Game trait const VARIANT
+    // ---------------------------------------------------------------
+    let _: fn(Arc<BucketTable>) -> Result<NlheGame6, TrainerError> = NlheGame6::new;
+    let _: fn(Arc<BucketTable>) -> Result<NlheGame6, TrainerError> = NlheGame6::new_hu;
+    let _: fn(Arc<BucketTable>, poker::TableConfig) -> Result<NlheGame6, TrainerError> =
+        NlheGame6::with_config;
+    let _: fn(u64) -> PlayerId = NlheGame6::traverser_at_iter;
+    let _: fn(u64, usize) -> PlayerId = NlheGame6::traverser_for_thread;
+    let _: for<'a> fn(&'a NlheGame6State, poker::SeatId) -> PlayerId = NlheGame6::actor_at_seat;
+    let _: for<'a> fn(&'a GameState) -> u16 = NlheGame6::compute_14action_mask;
+    let _: GameVariant = <NlheGame6 as Game>::VARIANT;
+    let _: for<'a> fn(&'a NlheGame6) -> [u8; 32] = <NlheGame6 as Game>::bucket_table_blake3;
+
+    // NlheGame6Action / NlheGame6InfoSet 类型 alias lock（编译期 = 等价
+    // PluribusAction / InfoSetId）。
+    let _act: NlheGame6Action = NlheGame6Action::Fold;
+    let _: PluribusAction = _act;
+
+    // ---------------------------------------------------------------
+    // API-401 — TrainerConfig fields + DecayStrategy enum + Default
+    // ---------------------------------------------------------------
+    let cfg = TrainerConfig {
+        n_threads: 1,
+        checkpoint_interval: 0,
+        metrics_interval: 100_000,
+        linear_weighting_enabled: false,
+        rm_plus_enabled: false,
+        warmup_complete_at: 1_000_000,
+        decay_strategy: DecayStrategy::EagerDecay,
+    };
+    let _: u8 = cfg.n_threads;
+    let _: u64 = cfg.checkpoint_interval;
+    let _: u64 = cfg.metrics_interval;
+    let _: bool = cfg.linear_weighting_enabled;
+    let _: bool = cfg.rm_plus_enabled;
+    let _: u64 = cfg.warmup_complete_at;
+    let _: DecayStrategy = cfg.decay_strategy;
+    let _: TrainerConfig = TrainerConfig::default();
+    let _: DecayStrategy = DecayStrategy::EagerDecay;
+    let _: DecayStrategy = DecayStrategy::LazyDecay;
+
+    // ---------------------------------------------------------------
+    // API-400 — EsMccfrTrainer::with_linear_rm_plus builder + config()
+    // ---------------------------------------------------------------
+    let _: fn(EsMccfrTrainer<NlheGame6>, u64) -> EsMccfrTrainer<NlheGame6> =
+        EsMccfrTrainer::<NlheGame6>::with_linear_rm_plus;
+    let _: for<'a> fn(&'a EsMccfrTrainer<NlheGame6>) -> &'a TrainerConfig =
+        EsMccfrTrainer::<NlheGame6>::config;
+
+    // ---------------------------------------------------------------
+    // API-450 / API-451 — LbrEvaluator + LbrResult / SixTraverserLbrResult
+    // ---------------------------------------------------------------
+    let _: fn(
+        Arc<EsMccfrTrainer<NlheGame6>>,
+        usize,
+        u8,
+    ) -> Result<LbrEvaluator<NlheGame6>, TrainerError> = LbrEvaluator::<NlheGame6>::new;
+    // compute / compute_six_traverser_average 入参含 trait object dyn RngSource，
+    // fn 指针表达走 for<'a, 'b> closure 形态。
+    let _: for<'a, 'b> fn(
+        &'a LbrEvaluator<NlheGame6>,
+        PlayerId,
+        u64,
+        &'b mut dyn RngSource,
+    ) -> Result<LbrResult, TrainerError> = LbrEvaluator::<NlheGame6>::compute;
+    let _: for<'a, 'b> fn(
+        &'a LbrEvaluator<NlheGame6>,
+        u64,
+        &'b mut dyn RngSource,
+    ) -> Result<SixTraverserLbrResult, TrainerError> =
+        LbrEvaluator::<NlheGame6>::compute_six_traverser_average;
+    let _: for<'a, 'b> fn(&'a LbrEvaluator<NlheGame6>, &'b Path) -> Result<(), TrainerError> =
+        LbrEvaluator::<NlheGame6>::export_policy_for_openspiel;
+
+    // LbrResult / SixTraverserLbrResult 字段 lock
+    let lr = LbrResult {
+        lbr_player: 0,
+        lbr_value_mbbg: 0.0,
+        standard_error_mbbg: 0.0,
+        n_hands: 0,
+        computation_seconds: 0.0,
+    };
+    let _: PlayerId = lr.lbr_player;
+    let _: f64 = lr.lbr_value_mbbg;
+    let _: f64 = lr.standard_error_mbbg;
+    let _: u64 = lr.n_hands;
+    let _: f64 = lr.computation_seconds;
+
+    let stlr = SixTraverserLbrResult {
+        per_traverser: [
+            lr.clone(),
+            lr.clone(),
+            lr.clone(),
+            lr.clone(),
+            lr.clone(),
+            lr.clone(),
+        ],
+        average_mbbg: 0.0,
+        max_mbbg: 0.0,
+        min_mbbg: 0.0,
+    };
+    let _: [LbrResult; 6] = stlr.per_traverser;
+    let _: f64 = stlr.average_mbbg;
+    let _: f64 = stlr.max_mbbg;
+    let _: f64 = stlr.min_mbbg;
+
+    // ---------------------------------------------------------------
+    // API-460 / API-461 / API-462 — SlumbotBridge + Head2HeadResult /
+    // SlumbotHandResult + OpenSpielHuBaseline / HuHandResult
+    // ---------------------------------------------------------------
+    let _: fn(String) -> SlumbotBridge = SlumbotBridge::new;
+    // SlumbotBridge::play_one_hand / evaluate_blueprint 走 impl<T: Trainer<NlheGame6>>
+    // 泛型方法，fn 指针无法表达泛型 — 单测在编译期通过 mod-level resolution 自动
+    // 校验签名（与 stage 1 RngCoreAdapter::from_rng_core 同型 skip）。
+
+    let h2h = Head2HeadResult {
+        mean_mbbg: 0.0,
+        standard_error_mbbg: 0.0,
+        confidence_interval_95: (0.0, 0.0),
+        n_hands: 0,
+        duplicate_dealing: false,
+        blueprint_seed: 0,
+        wall_clock_seconds: 0.0,
+    };
+    let _: f64 = h2h.mean_mbbg;
+    let _: (f64, f64) = h2h.confidence_interval_95;
+    let _: bool = h2h.duplicate_dealing;
+
+    let shr = SlumbotHandResult {
+        blueprint_chip_delta: 0,
+        mbb_delta: 0.0,
+        seed: 0,
+        wall_clock_seconds: 0.0,
+    };
+    let _: i64 = shr.blueprint_chip_delta;
+    let _: f64 = shr.mbb_delta;
+
+    let _: fn(PathBuf) -> OpenSpielHuBaseline = OpenSpielHuBaseline::new;
+
+    let hu = HuHandResult {
+        blueprint_chip_delta: 0,
+        mbb_delta: 0.0,
+        seed: 0,
+        wall_clock_seconds: 0.0,
+    };
+    let _: i64 = hu.blueprint_chip_delta;
+
+    // ---------------------------------------------------------------
+    // API-470 / API-471 — TrainingMetrics 9 字段 + TrainingAlarm 5 variant
+    // ---------------------------------------------------------------
+    let _: fn() -> TrainingMetrics = TrainingMetrics::zero;
+    let tm = TrainingMetrics::zero();
+    let _: u64 = tm.update_count;
+    let _: f64 = tm.wall_clock_seconds;
+    let _: f64 = tm.avg_regret_growth_rate;
+    let _: u8 = tm.regret_growth_trend_up_count;
+    let _: f64 = tm.policy_entropy;
+    let _: f64 = tm.policy_oscillation;
+    let _: u64 = tm.peak_rss_bytes;
+    let _: f64 = tm.ev_sum_residual;
+    let _: Option<TrainingAlarm> = tm.last_alarm;
+
+    // 5 variant exhaustive sample（与 trainer_error_boundary.rs::trainer_error_6
+    // _variants_exhaustive_match_lock 同型 trip-wire）。
+    let _alarms: [TrainingAlarm; 5] = [
+        TrainingAlarm::RegretGrowthTrendUp {
+            trend_up_count: 5,
+            last_sample_t: 100,
+        },
+        TrainingAlarm::EntropyRising { delta_pct: 5.5 },
+        TrainingAlarm::OscillationTrendUp,
+        TrainingAlarm::OutOfMemory {
+            rss_bytes: 1,
+            limit_bytes: 0,
+        },
+        TrainingAlarm::EvSumViolation {
+            residual: 1.0,
+            tolerance: 1e-3,
+        },
+    ];
+
+    // ---------------------------------------------------------------
+    // API-473 — MetricsCollector::new constructor
+    // ---------------------------------------------------------------
+    let _: fn(u64) -> MetricsCollector = MetricsCollector::new;
+    // MetricsCollector::observe 走 impl<T: Trainer<NlheGame6>> 泛型，fn 指针
+    // skip（同 SlumbotBridge::play_one_hand）。
+
+    // ---------------------------------------------------------------
+    // API-474 — write_metrics_jsonl 入口
+    // ---------------------------------------------------------------
+    // write_metrics_jsonl 走 impl<W: io::Write> 泛型，fn 指针 skip。
+
+    // ---------------------------------------------------------------
+    // API-480 — Opponent6Max trait + 3 baseline impl + BaselineEvalResult
+    // ---------------------------------------------------------------
+    use poker::training::baseline_eval::{
+        BaselineEvalResult, CallStationOpponent, Opponent6Max, RandomOpponent, TagOpponent,
+    };
+    let _: RandomOpponent = RandomOpponent;
+    let _: CallStationOpponent = CallStationOpponent;
+    let _: TagOpponent = TagOpponent::default();
+    let _: fn(&RandomOpponent) -> &'static str = <RandomOpponent as Opponent6Max>::name;
+    let _: fn(&CallStationOpponent) -> &'static str = <CallStationOpponent as Opponent6Max>::name;
+    let _: fn(&TagOpponent) -> &'static str = <TagOpponent as Opponent6Max>::name;
+
+    let ber = BaselineEvalResult {
+        mean_mbbg: 0.0,
+        standard_error_mbbg: 0.0,
+        n_hands: 0,
+        opponent_name: String::new(),
+        blueprint_seats: Vec::new(),
+        opponent_seats: Vec::new(),
+    };
+    let _: f64 = ber.mean_mbbg;
+    let _: String = ber.opponent_name;
+    let _: Vec<usize> = ber.blueprint_seats;
+
+    // 静态消费 `actions` / `stlr` / `_alarms` / `_act` / `_l` / 等让 unused
+    // binding 不触发 -D warnings。
+    let _ = actions;
+    let _ = stlr;
 }

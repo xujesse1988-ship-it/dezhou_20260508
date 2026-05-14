@@ -54,6 +54,102 @@ pub trait Trainer<G: Game> {
     fn load_checkpoint(path: &Path, game: G) -> Result<Self, CheckpointError>
     where
         Self: Sized;
+
+    /// stage 4 API-403 — 6-traverser routing 入口（D-412 / D-414）。
+    ///
+    /// `traverser` ∈ `[0, n_players)`，返回该 traverser 视角下的 current strategy。
+    /// stage 3 Kuhn / Leduc / SimplifiedNlheGame 路径（`n_players` ≤ 2）走默认
+    /// 实现退化到 single-traverser [`Self::current_strategy`]；stage 4
+    /// `NlheGame6` 路径 C2 \[实现\] 起步前 override 走 6 套独立 RegretTable
+    /// 数组 + traverser routing。
+    fn current_strategy_for_traverser(
+        &self,
+        traverser: PlayerId,
+        info_set: &G::InfoSet,
+    ) -> Vec<f64> {
+        let _ = traverser;
+        self.current_strategy(info_set)
+    }
+
+    /// stage 4 API-403 — 6-traverser average strategy routing（D-412 / D-414）。
+    ///
+    /// 同 [`Self::current_strategy_for_traverser`] 默认退化到
+    /// [`Self::average_strategy`]；C2 \[实现\] 落地 `NlheGame6` override。
+    fn average_strategy_for_traverser(
+        &self,
+        traverser: PlayerId,
+        info_set: &G::InfoSet,
+    ) -> Vec<f64> {
+        let _ = traverser;
+        self.average_strategy(info_set)
+    }
+}
+
+/// stage 4 D-401-revM — `EsMccfrTrainer` Linear discounting eager vs lazy 选型
+/// （API-401）。
+///
+/// `EagerDecay` 是 A0 \[决策\] 默认，每 iter 起始扫全表应用 decay factor；
+/// `LazyDecay` 是 D-401-revM 候选，每 entry 存 `(value, last_update_count_t)`
+/// tuple 让 query 时延迟应用。B2 \[实现\] 起步前根据 stage 3 §8.1 carry-forward
+/// (I) perf flamegraph 实测 lock 选项。
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Default)]
+pub enum DecayStrategy {
+    /// stage 4 A0 默认 — eager decay，每 iter 起始扫全表应用 decay factor。
+    #[default]
+    EagerDecay,
+    /// stage 4 D-401-revM 候选 — lazy decay；query 时延迟应用 decay factor。
+    /// B2 \[实现\] 起步前 evaluate 是否翻面。
+    LazyDecay,
+}
+
+/// stage 4 API-401 — `EsMccfrTrainer` 配置字段聚合。
+///
+/// stage 3 既有字段 (`n_threads` / `checkpoint_interval` / `metrics_interval`)
+/// 在 stage 3 trainer 内部分散；stage 4 A1 \[实现\] 起步阶段聚合到本 struct，
+/// 配 `EsMccfrTrainer::config: TrainerConfig` 字段。stage 3 `EsMccfrTrainer::new(...)`
+/// 路径维持 `TrainerConfig::default()`（linear_weighting / rm_plus / warmup_complete
+/// 全部 disable，等价 stage 3 standard CFR + RM 路径 byte-equal 保持）；stage 4
+/// 路径走 `EsMccfrTrainer::with_linear_rm_plus(warmup_complete_at)` builder 切到
+/// Linear MCCFR + RM+ 模式。
+///
+/// **A1 \[实现\] 状态**：struct 签名锁；字段语义在 B2 \[实现\] 起步前根据
+/// flamegraph 实测可能调整 `decay_strategy` 默认值。
+#[derive(Clone, Copy, Debug)]
+pub struct TrainerConfig {
+    /// stage 3 既有 — 并发线程数（`step_parallel` 入参 `n_threads`，与本字段
+    /// 解耦让 stage 3 模式不必构造 `TrainerConfig`）。
+    pub n_threads: u8,
+    /// stage 3 既有 — checkpoint cadence。
+    pub checkpoint_interval: u64,
+    /// stage 3 既有 — metrics observe cadence（stage 4 D-476 字面继承
+    /// 10⁵ update 默认）。
+    pub metrics_interval: u64,
+
+    /// stage 4 D-401 — Linear discounting on/off。
+    pub linear_weighting_enabled: bool,
+    /// stage 4 D-402 — RM+ clamp on/off。
+    pub rm_plus_enabled: bool,
+    /// stage 4 D-409 — warm-up phase 长度（默认 1_000_000 update）。warm-up
+    /// 期间走 stage 3 standard CFR + RM 路径 byte-equal 保持（D-409
+    /// 字面继承 stage 3 1M update × 3 BLAKE3 anchor）；切换后下一次
+    /// `step()` 起触发路径切换。
+    pub warmup_complete_at: u64,
+    /// stage 4 D-401-revM — eager vs lazy decay 选型（详见 [`DecayStrategy`]）。
+    pub decay_strategy: DecayStrategy,
+}
+
+impl Default for TrainerConfig {
+    fn default() -> Self {
+        Self {
+            n_threads: 1,
+            checkpoint_interval: 0,
+            metrics_interval: 100_000,
+            linear_weighting_enabled: false,
+            rm_plus_enabled: false,
+            warmup_complete_at: 1_000_000,
+            decay_strategy: DecayStrategy::EagerDecay,
+        }
+    }
 }
 
 /// Vanilla CFR Trainer（API-311 / D-300）。
@@ -289,6 +385,9 @@ pub struct EsMccfrTrainer<G: Game> {
     pub(crate) strategy_sum: StrategyAccumulator<G::InfoSet>,
     pub(crate) update_count: u64,
     pub(crate) rng_substream_seed: [u8; 32],
+    /// stage 4 API-401 — trainer 配置（默认 stage 3 standard CFR + RM 路径，
+    /// `with_linear_rm_plus()` builder 切到 stage 4 Linear MCCFR + RM+ 模式）。
+    pub(crate) config: TrainerConfig,
 }
 
 impl<G: Game> EsMccfrTrainer<G> {
@@ -296,6 +395,11 @@ impl<G: Game> EsMccfrTrainer<G> {
     /// 4 派生 32 byte sub-stream seed 占位（D2 checkpoint 序列化时存档；step
     /// 本身不消费——`step` 接受的 `rng: &mut dyn RngSource` 是唯一 randomness
     /// 来源）。
+    ///
+    /// stage 4 `config` 字段默认 [`TrainerConfig::default()`]（linear_weighting /
+    /// rm_plus / warmup_complete 全部 disable，等价 stage 3 standard CFR + RM
+    /// 路径 byte-equal 保持）；走 stage 4 路径调用 [`Self::with_linear_rm_plus`]
+    /// builder 切入。
     pub fn new(game: G, master_seed: u64) -> Self {
         let rng_substream_seed = derive_substream_seed(master_seed, 0, 0);
         Self {
@@ -304,7 +408,38 @@ impl<G: Game> EsMccfrTrainer<G> {
             strategy_sum: StrategyAccumulator::new(),
             update_count: 0,
             rng_substream_seed,
+            config: TrainerConfig::default(),
         }
+    }
+
+    /// stage 4 API-400 — 切到 Linear MCCFR + RM+ 模式（D-400 / D-401 / D-402 /
+    /// D-403 + D-409 warm-up）。
+    ///
+    /// **不变量**：
+    /// - 切换之前累积的 regret / strategy_sum 保留不动（warmup phase 1M update
+    ///   走 stage 3 standard CFR + RM 路径 byte-equal 保持，stage 3 BLAKE3 anchor
+    ///   1M update × 3 不变量在 stage 4 warmup phase 必须重现一致）。
+    /// - 切换后下一次 [`Trainer::step`] 起触发 D-409 warm-up phase 检查：
+    ///   `update_count < warmup_complete_at` 走 stage 3 路径，
+    ///   `update_count >= warmup_complete_at` 走 stage 4 路径。
+    /// - Deterministic 切换边界：切换点 `update_count = warmup_complete_at`
+    ///   的那一个 step 必须 byte-equal across multiple runs（warmup_complete
+    ///   状态进 checkpoint header，API-440 D-446 字面）。
+    ///
+    /// **A1 \[实现\] 状态**：方法体只更新 config 字段（B2 \[实现\] 落地实际
+    /// step 路径切换；warm-up boundary deterministic byte-equal 由 B1 \[测试\]
+    /// 钉死）。
+    pub fn with_linear_rm_plus(mut self, warmup_complete_at: u64) -> Self {
+        self.config.linear_weighting_enabled = true;
+        self.config.rm_plus_enabled = true;
+        self.config.warmup_complete_at = warmup_complete_at;
+        self
+    }
+
+    /// stage 4 API-401 — 公开 read-only config（B2 \[实现\] 起步前评估是否
+    /// 转 `pub config: TrainerConfig` 字段；A1 \[实现\] 走 getter 占位）。
+    pub fn config(&self) -> &TrainerConfig {
+        &self.config
     }
 
     /// 多线程并发 step（D-321-rev1 lock + E2-rev1 \[实现\] 优化）。
@@ -507,6 +642,11 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             strategy_sum,
             update_count: ckpt.update_count,
             rng_substream_seed: ckpt.rng_state,
+            // stage 3 load_checkpoint 路径走 schema_version=1，对应 stage 3
+            // standard CFR + RM 模式（linear_weighting / rm_plus disable）；
+            // stage 4 schema_version=2 路径走 D2 \[实现\] 新增的 load_v2 dispatch
+            // 后从 header 字段反序列化 TrainerConfig。
+            config: TrainerConfig::default(),
         })
     }
 }

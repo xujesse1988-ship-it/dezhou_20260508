@@ -68,6 +68,34 @@ impl InfoSetId {
     pub(crate) fn from_raw_internal(raw: u64) -> InfoSetId {
         InfoSetId(raw)
     }
+
+    /// stage 4 API-423 — 14-action availability mask 写入 reserved 区域（D-423）。
+    ///
+    /// 复用 stage 2 IA-007 reserved bits（位置由 stage 4 D-423-rev0 在 B2 \[实现\]
+    /// 起步前最终 lock；A1 \[实现\] 占位 mask 落到 bits 38..52 = stage 2 reserved
+    /// 区域内 14 bit 子段）。stage 3 D-317-rev1 6-bit mask（bits 12..18，
+    /// `SimplifiedNlheGame` 路径）不受影响。
+    ///
+    /// **A1 \[实现\] 状态**：方法体 `unimplemented!()`，签名锁，B2 \[实现\] 落地
+    /// 真实 mask 编码 + `InfoSetId` 64-bit layout 内一致性校验（debug_assert
+    /// `mask < (1 << 14)`，写入区域 byte-equal）。
+    pub fn with_14action_mask(self, mask: u16) -> InfoSetId {
+        let _ = mask;
+        unimplemented!(
+            "stage 4 A1 [实现] scaffold: InfoSetId::with_14action_mask 落地 B2 [实现] D-423"
+        )
+    }
+
+    /// stage 4 API-423 — 读回 14-action availability mask（D-423）。
+    ///
+    /// 反 [`Self::with_14action_mask`] 写入路径；`SimplifiedNlheGame` 路径上
+    /// （未调用 with_14action_mask）返回 0。A1 \[实现\] 占位 `unimplemented!()`，
+    /// B2 \[实现\] 落地真实解码。
+    pub fn legal_actions_mask_14(self) -> u16 {
+        unimplemented!(
+            "stage 4 A1 [实现] scaffold: InfoSetId::legal_actions_mask_14 落地 B2 [实现] D-423"
+        )
+    }
 }
 
 /// 当前下注轮的合法动作集语义（D-212）。preflop 与 postflop 共用同一枚举。

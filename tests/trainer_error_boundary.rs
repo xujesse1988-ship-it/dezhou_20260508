@@ -356,24 +356,32 @@ fn checkpoint_error_propagation_construction_trip_wire() {
 }
 
 // ===========================================================================
-// 6. 5 类 TrainerError exhaustive match — 添加第 6 类 variant 必须显式同步
+// 6. 6 类 TrainerError exhaustive match — 添加第 7 类 variant 必须显式同步
+//
+// stage 4 A1 \[实现\]（2026-05-14）追加 [`TrainerError::PreflopActionAbstractionMismatch`]
+// 第 6 个 variant（D-456 字面 `LbrEvaluator::new` action_set_size 越界拒绝）；
+// stage 3 既有 5 variant 路径不变（API-313 字面），exhaustive match 自适应 stage
+// 4 新 variant 让 stage 3 `cargo test --test trainer_error_boundary` byte-equal
+// 维持。
 // ===========================================================================
 
-fn assert_one_of_five_known_trainer_variants(err: &TrainerError) {
+fn assert_one_of_six_known_trainer_variants(err: &TrainerError) {
     match err {
         TrainerError::ActionCountMismatch { .. }
         | TrainerError::OutOfMemory { .. }
         | TrainerError::UnsupportedBucketTable { .. }
         | TrainerError::ProbabilitySumOutOfTolerance { .. }
+        | TrainerError::PreflopActionAbstractionMismatch
         | TrainerError::Checkpoint(_) => {}
     }
 }
 
 #[test]
-fn trainer_error_5_variants_exhaustive_match_lock() {
+fn trainer_error_6_variants_exhaustive_match_lock() {
     // 与 `tests/checkpoint_round_trip.rs::checkpoint_error_5_variants_exhaustive_match_lock`
-    // 同型：构造 5 个变体 minimum sample，让 match 闭门枚举编译期 trip-wire 触发。
-    let samples: [TrainerError; 5] = [
+    // 同型：构造 6 个变体 minimum sample，让 match 闭门枚举编译期 trip-wire 触发。
+    // stage 4 A1 \[实现\] 追加 PreflopActionAbstractionMismatch 第 6 variant。
+    let samples: [TrainerError; 6] = [
         TrainerError::ActionCountMismatch {
             info_set: "test".to_string(),
             expected: 2,
@@ -391,13 +399,14 @@ fn trainer_error_5_variants_exhaustive_match_lock() {
             got: 1.5,
             tolerance: 1.0e-9,
         },
+        TrainerError::PreflopActionAbstractionMismatch,
         TrainerError::Checkpoint(CheckpointError::Corrupted {
             offset: 0,
             reason: "test".to_string(),
         }),
     ];
     for s in &samples {
-        assert_one_of_five_known_trainer_variants(s);
+        assert_one_of_six_known_trainer_variants(s);
         let _ = format!("{s}");
         let _ = format!("{s:?}");
     }

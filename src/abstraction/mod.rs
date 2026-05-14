@@ -26,6 +26,10 @@
 //! `lib.rs` 直接 `pub use` 暴露（D-228 公开 contract）。
 
 pub mod action;
+// stage 4 D-420 / API-420 — Pluribus 14-action 抽象（A1 \[实现\] scaffold；
+// B2 \[实现\] 起步前 lock `actions` / `is_legal` / `compute_raise_to` 走
+// stage 1 [`crate::GameState`] legal action + pot / current_bet 计算）。
+pub mod action_pluribus;
 pub mod bucket_table;
 pub mod canonical_enum;
 pub mod cluster;

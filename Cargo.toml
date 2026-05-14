@@ -48,11 +48,23 @@ serde = { version = "1", features = ["derive"] }
 # 起步前 lock（详见 docs/pluribus_stage3_decisions.md §10 已知未决项 + D-321），
 # A1 \[实现\] scaffold 阶段不预提交，避免后续 batch 调整时依赖漂移。
 
+# 阶段 4 D-373-rev3 新增依赖（A0 \[决策\] 起步 batch 5 lock；A1 \[实现\] 落地
+# `src/training/{slumbot_eval,metrics}.rs` + `src/abstraction/action_pluribus.rs`
+# 占位字段引用立即消费，避免 unused dependency 警告）。
+# reqwest blocking + json features：D-463 Slumbot HTTP bridge（A0 lock blocking
+# 路径；如需 async 走 D-463-revM tokio 翻面）。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# serde_json：D-474 JSONL log 输出（stage 3 dev-dependencies 已引入；stage 4
+# 提升为 [dependencies] 让产品代码 `src/training/metrics.rs::write_metrics_jsonl`
+# 引用合法）。
+serde_json = "1"
+
 # B1 测试 / harness 专用依赖。仅 tests/ 与 benches/ 引用，不进入产品二进制。
 [dev-dependencies]
 # 阶段 1 §B1 / E1 benchmark harness。`harness = false` 见下方 [[bench]]。
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
-serde_json = "1.0"
+# serde_json — stage 3 dev-only 入口；stage 4 已提升到 [dependencies]（D-474
+# JSONL log），dev-dependencies 不再重复声明（Cargo 自动复用）。
 # C1 跨语言反序列化测试：把 prost 输出 base64 后传给 Python 子进程。
 base64 = "0.22"
 
@@ -105,3 +117,25 @@ path = "tools/train_cfr.rs"
 [[bin]]
 name = "nlhe_blake3_anchor"
 path = "tools/nlhe_blake3_anchor.rs"
+
+# 阶段 4 D-450 / API-452：LBR computation CLI。A1 \[实现\] scaffold main body
+# 走 stub；E2 \[实现\] 落地走 `LbrEvaluator::compute` + `compute_six_traverser_
+# average` dispatch（D-450..D-457）。
+[[bin]]
+name = "lbr_compute"
+path = "tools/lbr_compute.rs"
+
+# 阶段 4 D-461 + D-481 / API-462 + API-484：Slumbot + baseline 整合评测 CLI。
+# A1 \[实现\] scaffold main body 走 stub；F2 \[实现\] 落地走 `SlumbotBridge::
+# evaluate_blueprint` + `evaluate_vs_baseline` 双重 dispatch（D-460..D-481）。
+[[bin]]
+name = "eval_blueprint"
+path = "tools/eval_blueprint.rs"
+
+# 阶段 4 D-496 / API-499：3 bench group throughput 数据
+# （`nlhe_6max_es_mccfr_linear_rm_plus_update` / `lbr_compute_1000_hand` /
+# `baseline_eval_1000_hand`）。A1 \[实现\] scaffold 阶段 entry 占位；E1 /
+# F1 \[测试\] 起步前 lock 具体 bench fn 实现。
+[[bench]]
+name = "stage4"
+harness = false

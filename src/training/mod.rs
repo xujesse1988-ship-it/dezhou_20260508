@@ -33,6 +33,23 @@ pub mod regret;
 pub mod sampling;
 pub mod trainer;
 
+// stage 4 D-410 / API-410 — `NlheGame6` 6-player NLHE Game trait impl + 14-action
+// abstraction + 6-traverser routing + HU 退化路径（A1 \[实现\] scaffold；C2
+// \[实现\] 起步前 lock 全 trait method 翻面）。
+pub mod nlhe_6max;
+// stage 4 D-450 / API-450 — `LbrEvaluator` Rust 自实现 + 6-traverser average
+// LBR + OpenSpiel sanity export（A1 \[实现\] scaffold；E2 \[实现\] 落地）。
+pub mod lbr;
+// stage 4 D-460 / API-460 — Slumbot HTTP bridge + Head-to-Head 100K 手评测
+// + OpenSpiel HU fallback（A1 \[实现\] scaffold；F2 \[实现\] 落地）。
+pub mod slumbot_eval;
+// stage 4 D-480 / API-480 — `Opponent6Max` trait + 3 baseline impl + 1M 手
+// sanity 评测（A1 \[实现\] scaffold；F2 \[实现\] 落地）。
+pub mod baseline_eval;
+// stage 4 D-470 / API-470 — `TrainingMetrics` 9 字段 + `TrainingAlarm` 5
+// variant + JSONL log（A1 \[实现\] scaffold；F2 \[实现\] 落地）。
+pub mod metrics;
+
 // API-300 / API-380 顶层公开 surface（与 `docs/pluribus_stage3_api.md` §8 对齐）。
 pub use best_response::{exploitability, BestResponse, KuhnBestResponse, LeducBestResponse};
 pub use checkpoint::Checkpoint;
@@ -43,7 +60,19 @@ pub use nlhe::{
     SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
 };
 pub use regret::{RegretTable, StrategyAccumulator};
-pub use trainer::{EsMccfrTrainer, Trainer, VanillaCfrTrainer};
+pub use trainer::{DecayStrategy, EsMccfrTrainer, Trainer, TrainerConfig, VanillaCfrTrainer};
+
+// stage 4 公开 surface re-export（API-498 lib.rs surface lock）。
+pub use baseline_eval::{
+    evaluate_vs_baseline, BaselineEvalResult, CallStationOpponent, Opponent6Max, RandomOpponent,
+    TagOpponent,
+};
+pub use lbr::{LbrEvaluator, LbrResult, SixTraverserLbrResult};
+pub use metrics::{write_metrics_jsonl, MetricsCollector, TrainingAlarm, TrainingMetrics};
+pub use nlhe_6max::{NlheGame6, NlheGame6Action, NlheGame6InfoSet, NlheGame6State};
+pub use slumbot_eval::{
+    Head2HeadResult, HuHandResult, OpenSpielHuBaseline, SlumbotBridge, SlumbotHandResult,
+};
 
 // CheckpointError + TrainerError + TrainerVariant + GameVariant 物理位置在
 // `src/error.rs`（D-374），逻辑路径 `poker::training::{Checkpoint, CheckpointError, ...}`
