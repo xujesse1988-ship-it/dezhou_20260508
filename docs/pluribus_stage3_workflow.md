@@ -585,3 +585,31 @@ F. 收尾                    : F1 [测试] → F2 [实现] → F3 [报告]
     - **F1 30 active 测试不退化**：`cargo test --test cfr_kuhn --test cfr_leduc --test cfr_simplified_nlhe --test checkpoint_round_trip --test checkpoint_corruption --test trainer_error_boundary --test cross_host_blake3 --test api_signatures --test cfr_fuzz` 实测 12 + 14 + 4 + 1 + 15 + 2 + 3 + 1 + 1 = 53 passed / 0 failed / 22 ignored。**关键证据**：`cross_host_blake3::cross_host_baseline_byte_equal_for_current_arch` 32-seed Kuhn 5-iter checkpoint BLAKE3 baseline `tests/data/checkpoint-hashes-linux-x86_64.txt` byte-equal 维持 — 间接证明 Kuhn 单线程 step + save_checkpoint byte-equal 不破。
     - **vultr SLO 实测 pending followup commit**（F1-rev1 → E2-rev1 工程契约任务清单 (c)）：本 commit ship 后由本 agent 执行 `git push origin main` → `ssh shaopeng@64.176.35.138 'bash -lc "cd ~/dezhou_20260508 && git fetch origin && git reset --hard origin/main && cargo test --release --test perf_slo stage3 -- --ignored --nocapture"'` → 6 SLO 测试一并跑（NLHE 单线程 + 4-core + Kuhn 10K iter + Leduc 10K iter + Kuhn BR + Leduc BR），实测数字回填到本 §修订历史 + CLAUDE.md。
     - **E2-rev1 → followup commit 工程契约**：(i) 如 vultr 双 SLO 翻面（单线程 ≥ 10K + 4-core ≥ 50K）+ 其余 4 条不退化 → followup commit 翻面 E2-rev1 closure 状态 + 下一步改 F2 [实现]（doc drift 修复 + 0 产品代码改动 carve-out closure）；(ii) 如 vultr 单线程过但 4-core 仍 < 50K → 走 D-321-rev3 / E2-rev2 评估（state borrow 替 clone / sample_discrete CDF lookup-table / D-322 batch merge 并行但破 BLAKE3 byte-equal 红线慎重）；(iii) 如 vultr 单线程仍 < 10K → 回 SimplifiedNlheState clone 频度 + canonical_observation_id 缓存层面优化（属 stage 3 大改造，由用户授权后再走）。
+- **2026-05-14（E2-rev1-vultr-measured carve-out — SLO 部分成功 / 双 fail / 触发 E2-rev2 评估）**：commit `5c39989` push 后接 vultr 64.176.35.138 4-core EPYC-Rome 实测 6 SLO（`cargo test --release --test perf_slo stage3 -- --ignored --nocapture` 总耗时 34.18 s）。
+    - **6 SLO 实测**：
+        | SLO | E2 baseline | E2-rev1 实测 | 提升 | SLO 门槛 | 状态 |
+        |---|---|---|---|---|---|
+        | Kuhn 10K iter | (E2: < 1 s) | 0.125 s = **80,188 iter/s** | - | < 1 s | ✓ PASS |
+        | Leduc 10K iter | (E2: < 60 s) | 34.181 s = **293 iter/s** | - | < 60 s | ✓ PASS |
+        | Kuhn BR | (E2: < 100 ms) | 0.04 ms | - | < 100 ms | ✓ PASS |
+        | Leduc BR | (E2: < 1000 ms) | 10.74 ms | - | < 1000 ms | ✓ PASS |
+        | **NLHE single** | 4,313 update/s | **4,357 update/s** | **+1.0%** | ≥ 10K | **✗ FAIL (43%)** |
+        | **NLHE 4-core** | 4,929 update/s | **7,741 update/s** | **+57%** | ≥ 50K | **✗ FAIL (15%)** |
+    - **4-core efficiency 改善**：4-core/single = 7741/4357 = **1.78×**（baseline 1.14× → 改善 1.56×）—— rayon long-lived pool + append-only delta playback merge 解了 D-321-rev1 batch merge sort `format!("{:?}", I)` × O(N log N) 主导成本。但远低于 ideal 4× scaling（efficiency 仅 44.5%）。
+    - **SmallVec hot path 几乎无单线程收益**（+1.0%）：根因 = single-thread bottleneck **不在** `Vec<f64>` 短向量 alloc 路径上。Rust 1.95 优化下 `Vec::with_capacity(5)` 对 jemalloc/system allocator 已经是常数纳秒级；真实 single-thread 瓶颈推测在更深路径（按 vultr 实测 ~230 μs/update budget 倒推）：
+        - **`SimplifiedNlheState::clone()`** — 每次 `Game::next` clone 全 state，含 `Vec<SimplifiedNlheAction>` 增长 5-30 元素（递归深度），每 update DFS ~10-20 次 clone × Vec heap copy ~~50-100 μs；
+        - **`canonical_observation_id` 重算** — 每次 `Game::info_set` 调用重新跑 colex ranking + first-appearance suit remap，不缓存（postflop street ~5-10 调用/update × ~3-5 μs = 15-50 μs）；
+        - **`BucketTable::lookup`** — 528 MiB mmap 随机读，cold miss 触发 page fault（vultr 4 GB RAM 装不下 528 MiB hot working set）；
+        - **`eval7` hand evaluator** — terminal 7-card eval ~150 ns × showdown 概率 ~10% × ES-MCCFR sample-1 trajectory ~1 eval/update → 15 ns/update（不是主导）。
+    - **E2-rev1 部分成功 / 未达 closure 标准**：4-core efficiency 改善（1.14 → 1.78×）+ 代码 ship 保留作为渐进改善基线；NLHE 双 SLO 仍 fail（单线程 43% / 4-core 15% 阈值）。**不退回 / 不撤 commit** — E2-rev1 真改善了 4-core scaling，append-only delta + rayon pool 是 stage 4 起步前长期保留路径；触发 E2-rev2 [实现] 评估 deeper bottleneck 路径，由用户授权后进 iteration。
+    - **E2-rev2 候选优化路径**（按预期收益排序）：
+        - **(1) `SimplifiedNlheState` borrow 替 clone**：`Game::next(state, action) -> State` 改 `Game::next(&state, action) -> State` 让 trainer 内部 walk 共享 base state + 仅 fork 修改差异；预期单线程 ~2-4× 加速。**API-300 break**：trait 签名变 = API-300-rev2 + 同 commit 改 3 Game impl + 改 trainer recurse_es / recurse_es_parallel / recurse_vanilla 参数路径；scope ~3-5 天。
+        - **(2) `canonical_observation_id` 缓存 / 提前计算**：让 `SimplifiedNlheState` 在 `Game::next` 时 in-place 算好 postflop bucket_id（cache 在 state 字段），`Game::info_set` 直接读 cache；预期单线程 ~1.5-2× 加速。**架构 break**：state 增字段需同步 `Clone` / `Debug` / 序列化；scope ~2-3 天。
+        - **(3) bucket_table mlock / `madvise WILLNEED`**：vultr 4 GB RAM 装 528 MiB v3 artifact 应足够（~13% RAM），但 cold miss 触发 page fault；启动时 `mlock(2)` 强制 pin 物理 RAM 或 `madvise(MADV_WILLNEED)` 预热；预期 cold-start 后 ~1.2-1.5× 加速；scope ~半天。
+        - **(4) `sample_discrete` CDF lookup-table**：5-action CDF 走 binary search 改 lookup table；预期 ~1.05-1.1× 加速（micro），不是主导。
+        - **(5) D-322 batch merge 并行**：4 thread-local delta 按 InfoSet hash 分桶并行合并；**破 BLAKE3 byte-equal 红线**（D-321-rev1 / D-321-rev2 lock 段落明确：sort/playback 顺序保 byte-equal），**禁止用** stage 3 内部，留 stage 4 起步前评估。
+    - **三条决策路径**（由用户选）：
+        - **Option A — 进 E2-rev2 [实现]**：选优化路径 (1) + (2) + (3) 组合，预期单线程 ~3-5× 加速 = 13-20K update/s 翻面 SLO，4-core 50-80K update/s 翻面 SLO；新工作量 ~1-2 周；保 BLAKE3 byte-equal 不破。
+        - **Option B — D-361-revM 翻面降低 SLO 阈值**：与原 Pluribus path.md 字面冲突，需充分理由（如 path.md 假设过乐观 / vultr 4-core EPYC-Rome 性价比 vs Pluribus 论文 8-core target）；走 path.md `D-NNN-revM` 修订流程 + 用户书面授权。
+        - **Option C — 接受 E2-rev1 现状当 stage 3 出口 baseline**：NLHE SLO 双 fail 列入 stage 3 报告 §8 已知偏离 + carry-forward 到 stage 4 起步并行清单（继承 stage 2 §G-batch1 §3.4-batch2 deferred 同型 carve-out 模式）；F2 [实现] / F3 [报告] 路径恢复，但 stage 3 出口报告必须显式标注 SLO 不达标 + 后续 stage 4 6-max blueprint 训练吞吐预算调整。
+    - **角色边界**：本 carve-out 0 产品代码改动（仅 docs），E2-rev1 [实现] 主线 commit `5c39989` 不撤；本 entry 由 E2-rev1 followup commit 落地（与 F1-rev1 carve-out 同型 [测试]/[实现] 角色越界追认 — 实测 + carve-out 标记不属严格 [实现] 工作但属 E2-rev1 → followup commit 工程契约字面授权）。
