@@ -310,7 +310,7 @@ pub enum TrainerError {
     #[error("regret matching probability sum {got} out of tolerance {tolerance}")]
     ProbabilitySumOutOfTolerance { got: f64, tolerance: f64 },
     #[error("checkpoint error: {0}")]
-    CheckpointError(#[from] CheckpointError),
+    Checkpoint(#[from] CheckpointError),
 }
 ```
 
