@@ -97,3 +97,11 @@ path = "tools/bucket_quality_dump.rs"
 [[bin]]
 name = "train_cfr"
 path = "tools/train_cfr.rs"
+
+# 阶段 3 F3 \[报告\]：简化 NLHE D-362 BLAKE3 byte-equal anchor 一次性 instrumentation。
+# 用户授权 F3 anchor 降标 100M 单 run → 10M × 3 run 检查；本 binary 跑 fixed_seed
+# × 3 EsMccfr 训练，比对 avg_strategy BLAKE3 byte-equal。继承 stage 2
+# `bucket_quality_dump` F3 \[报告\] 一次性工具同型 entry。
+[[bin]]
+name = "nlhe_blake3_anchor"
+path = "tools/nlhe_blake3_anchor.rs"
