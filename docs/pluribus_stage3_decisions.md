@@ -453,6 +453,88 @@ pub trait Game {
 
 ---
 
+### 10.5 D-373-rev2 lock（E2-rev1 [实现] 落地中，2026-05-14）
+
+**触发器**：`pluribus_stage3_workflow.md` §修订历史 F1-rev1 carve-out 段落字面 "如选 SmallVec → 走 D-373-rev2 翻面引入 `smallvec` 第 4 crate" + F1-rev1 → E2-rev1 工程契约字面任务清单 (b)。F1-rev1 vultr 实测 NLHE 单线程 4,313 update/s（43% SLO）+ 4-core 4,929 update/s（9.9% SLO，efficiency 1.14×）双 fail；E2-rev1 [实现] agent 选 SmallVec hot path + rayon thread pool + append-only delta 路径，前者引入 `smallvec` 是 D-373 dependency 列表的第 4 stage 3 crate（D-373-rev1 落地 bincode + tempfile + serde 3 crate；本 rev 追加 smallvec 翻为 4 crate）。
+
+**lock 决定**：`Cargo.toml [dependencies]` 在 E2-rev1 [实现] commit 内追加 `smallvec = "1"`（默认 features，无需 `serde` / `union` / `const_generics` / `write` / `arbitrary` 等可选 features，stage 3 仅消费 inline-storage `SmallVec<[T; N]>` 基础 API）。crate 总数从 3（D-373-rev1）翻到 4（bincode + tempfile + serde + smallvec）；`rayon` 不算 stage 3 新增 crate（stage 2 §G-batch1 §3.4-batch1.5 [实现] 已引入 rayon 1.x 用于 production artifact 训练 phase 1/2 par_iter 并行化，E2-rev1 仅消费已有依赖）。
+
+**理由**：
+
+- **F1-rev1 实测确认 alloc/clone 主导**：vultr 4-core EPYC-Rome 单线程 4.3K update/s 远低于 SLO 10K，根因之一 = `RegretTable::current_strategy` / per-action `cfvs: Vec<f64>` / per-action `delta: Vec<f64>` / per-action `weighted: Vec<f64>` / `nonzero_dist: Vec<(Action, f64)>` 这些 typical 5-action（NLHE D-209）/ 2-action（Kuhn）/ 3-action（Leduc）短向量每步走堆分配；ES-MCCFR 单 update DFS 触达 ~10-20 InfoSet × ~5-action = ~50-100 次 `Vec::with_capacity(n)` 调用，alloc/dealloc 开销主导。SmallVec inline-8 让全部 stage 3 实际场景走 stack alloc（5 ≤ 8 ≤ 8 < spill threshold），alloc 路径全消除。
+- **inline-size 8 选定**：覆盖 D-209 5-action + Kuhn 2-action + Leduc 3-action 三场景；留余量给未来可能引入的 large-action abstraction（如 6-action / 7-action betting size variants）；超 8 自动 spill 到堆（不 panic / 不 truncate，与未来 stage 4-6 扩展兼容）。stage 3 实际所有路径 ≤ 5 actions（[D-209 字面](#) `default_5_action`），inline-8 覆盖 100% 调用站点。
+- **vs `tinyvec` / `arrayvec` 对比**：`smallvec` API 最接近 `Vec`（`with_capacity`/`push`/`iter`/`clone`/`Deref<Target = [T]>`/`IntoIterator` 全套）替换无感；`tinyvec` 要求 `T: Default` 不适合 `(Action, f64)`；`arrayvec` 固定 capacity 不 spill 不灵活。`smallvec` 1.x 是 firefox / servo / rustc 内部依赖，2026 年仍稳定维护。
+- **零外部 API 影响**：`SigmaVec` + `LocalRegretDelta` + `LocalStrategyDelta` 全部 `pub(crate)`（D-376 公开 API surface 政策：仅 `RegretTable` / `StrategyAccumulator` / `Trainer` 等 pub；新内部 helper 不进 surface）。`Trainer::current_strategy` / `average_strategy` trait 入口仍返回 `Vec<f64>`（API-310 surface 不变）；hot path 内部 `current_strategy_smallvec` `pub(crate)` 入口让 trainer 直接消费 `SmallVec` 避免 `Vec`/`SmallVec` 互转开销。
+
+**carve-out**：本 lock 由 E2-rev1 [实现] agent 落地决策文档变更，与 §10.1 / §10.2 / §10.3 / §10.4 同型 workflow 字面授权角色越界（F1-rev1 → E2-rev1 工程契约字面任务清单 (b) 直接授权 SmallVec / lookup-table 优化路径 + 同 commit 落地 D-373-rev2 doc）。本 §10.5 entry 同 E2-rev1 [实现] commit 落地，无需独立 `pluribus_stage3_workflow.md` §修订历史 entry 追认（F1-rev1 carve-out 段落字面授权 = 修订历史 entry 等价物）。
+
+---
+
+### 10.6 D-321-rev2 lock（E2-rev1 [实现] 落地中，2026-05-14）
+
+**触发器**：F1-rev1 carve-out 段落字面 "D-321-rev2 候选（thread::scope 改 thread pool 长寿命 worker / 减 spawn 频率）：rayon `par_iter` 池化 worker 替 `thread::scope`，让 12,500 次'调度'摊分到 4 长寿命 thread；spawn overhead 应 ≈ 0" + 根因分析候选 (3) "spawn/join overhead — 50K update / 4 thread = 12,500 次 thread::scope spawn ... ~1.5 s overhead（占 10.145 s 的 ~15%）" 与候选 (2) "batch merge 阶段 single-threaded HashMap iter + Debug-sort + accumulate 成主导成本" 双重 hit。
+
+**lock 决定**：`EsMccfrTrainer::step_parallel` 内部实现路径**两处同 commit 翻面**（D-321-rev1 lock 段落 §10.2 字面 "sub-variant 由 E2 实测决定" 授权范围内）：
+
+1. **rayon thread pool 替 `std::thread::scope`**：原 D-321-rev1 实现走 `std::thread::scope(|s| { let handles = active_pool.iter_mut().enumerate().map(|(tid, ...)| s.spawn(...)).collect(); handles.into_iter().map(|h| h.join()...).collect() })`，每次 `step_parallel` 调用创建 `n_active` 个 OS thread；rayon 走 `active_pool.par_iter_mut().enumerate().map(...).collect::<Vec<_>>()`，复用全局长寿命 worker pool（rayon 默认 pool 大小 = `num_cpus`）。**跨 run 决定性**：`par_iter_mut().enumerate()` 是 `IndexedParallelIterator`，`.collect()` 保 input index 顺序输出 `Vec<(LocalRegretDelta, LocalStrategyDelta)>` 与 tid 一一对应（等价 `std::thread::scope` spawn-by-tid 顺序输出）；spawn overhead ≈ ns 级 atomic dequeue（vs OS thread spawn ~30 μs）。
+2. **append-only delta 替 thread-local `RegretTable` + sort merge**：原 D-321-rev1 走 `(RegretTable<I>, StrategyAccumulator<I>)` thread-local 容器 + `merge_regret_delta` / `merge_strategy_delta` helper 内部 `format!("{:?}", I)` × O(N log N) Debug-sort merge（保跨 run 顺序 deterministic）；新形态走 `(LocalRegretDelta<I>, LocalStrategyDelta<I>)` = `Vec<(I, SigmaVec)>` append-only DFS-顺序 push + main thread playback merge（按 tid 升序 × 每 thread 内 push 顺序累加到主表）。**跨 run 决定性来源**：(a) DFS 顺序 deterministic（rng 决定 sampled trajectory，rng 来自 rng_pool 跨 step_parallel 调用 deterministic）；(b) tid 顺序 deterministic（`par_iter_mut().enumerate().collect()` 保 index 顺序）；(c) 同 InfoSet 多次访问按 push 顺序 playback，f64 加法序列与原 thread-local table accumulate 后再合并完全等价（数值结果恒等：`main += local_table[i] = (((0+d1)+d2)+...)` 与 `main += d1; main += d2; ...` 在 f64 上恒等，f64 结合律失败仅在不同顺序下，本路径顺序保留）。merge cost 由 O(N log N × \|Debug(I)\|) String alloc + cmp 降到 O(N) plain push playback，FFFFFF1-rev1 实测 batch merge sort 是 4-core 加速比 1.14× 主导成本。
+
+**调用契约**（E2-rev1 [实现] commit 内 `EsMccfrTrainer::step_parallel` 接口形态）：
+
+```rust
+pub fn step_parallel(
+    &mut self,
+    rng_pool: &mut [Box<dyn RngSource>],
+    n_threads: usize,
+) -> Result<(), TrainerError>
+where
+    G: Sync,
+    G::InfoSet: Send,  // E2-rev1 新增 bound：rayon par_iter 跨线程 move LocalRegretDelta<I> 需要
+{
+    let n_active = n_threads.min(rng_pool.len());
+    if n_active == 0 { return Ok(()); }
+    let active_pool = &mut rng_pool[..n_active];
+    let n_players = self.game.n_players() as u64;
+    let base_update_count = self.update_count;
+    let game = &self.game;
+    let shared_regret: &RegretTable<G::InfoSet> = &self.regret;
+    
+    // rayon par_iter_mut().enumerate().collect() 长寿命 pool dispatch
+    let deltas: Vec<(LocalRegretDelta<G::InfoSet>, LocalStrategyDelta<G::InfoSet>)> =
+        active_pool.par_iter_mut().enumerate().map(|(tid, rng_slot)| {
+            let traverser = ((base_update_count + tid as u64) % n_players) as PlayerId;
+            let mut local_regret = LocalRegretDelta::<G::InfoSet>::new();
+            let mut local_strategy = LocalStrategyDelta::<G::InfoSet>::new();
+            let rng = rng_slot.as_mut();
+            let root = game.root(rng);
+            recurse_es_parallel::<G>(root, traverser, 1.0, 1.0,
+                shared_regret, &mut local_regret, &mut local_strategy, rng);
+            (local_regret, local_strategy)
+        }).collect();
+    
+    // playback merge：tid 升序 × thread 内 push 顺序
+    for (local_regret, local_strategy) in deltas {
+        for (info, delta) in local_regret.into_entries() { self.regret.accumulate(info, &delta); }
+        for (info, weighted) in local_strategy.into_entries() { self.strategy_sum.accumulate(info, &weighted); }
+    }
+    self.update_count += n_active as u64;
+    Ok(())
+}
+```
+
+**新增 trait bound `G::InfoSet: Send`**：rayon par_iter 跨 worker move `LocalRegretDelta<I>` = `Vec<(I, SigmaVec)>` 需要 `I: Send`（`Vec<T: Send>: Send`）。3 个 Game impl 的 InfoSet 类型（`KuhnInfoSet` / `LeducInfoSet` / `InfoSetId`）全自动满足（无 raw pointer / Cell / Rc 字段），api_signatures `step_parallel` 函数指针 trip-wire byte-equal 维持（trait bound 在具体类型满足时不改函数指针类型）。
+
+**新增 helper 类型**（`pub(crate)` 限定，D-376 surface 政策 + 不进 api_signatures.rs 公开 trip-wire）：
+- `pub(crate) type SigmaVec = SmallVec<[f64; 8]>`（`src/training/regret.rs`）
+- `pub(crate) struct LocalRegretDelta<I> { entries: Vec<(I, SigmaVec)> }` + `pub(crate) fn { new, push, len, is_empty, into_entries }`（`src/training/regret.rs`）
+- `pub(crate) struct LocalStrategyDelta<I> { entries: Vec<(I, SigmaVec)> }` 同型
+- `pub(crate) fn current_strategy_smallvec(&self, info_set, n) -> SigmaVec`（`src/training/regret.rs::RegretTable`，hot path 入口）
+- `type ShortVec<T> = SmallVec<[T; 8]>`（`src/training/trainer.rs` 内部 type alias，跨 cfvs / delta / weighted / nonzero_dist 复用）
+
+**carve-out**：本 lock 由 E2-rev1 [实现] agent 落地决策文档变更（与 §10.5 D-373-rev2 同 commit）。F1-rev1 carve-out 段落字面授权 sub-variant 优化路径 + D-321-rev1 §10.2 字面 "sub-variant 由 E2 实测决定" 双重授权 = 本 §10.6 entry 等价 workflow 字面授权角色越界。**D-321-rev1 → D-321-rev2 关系**：rev1 ship serial-equivalent fallback（C2 commit）+ thread::scope + sort merge（E2 commit）；rev2 ship rayon pool + append-only delta + playback merge（E2-rev1 commit）。两 rev 同 trait surface 同 D-307 alternating traverser 同 跨 run 决定性，仅内部实现路径迭代。
+
+---
+
 ## 11. 决策修改流程
 
 继承 `pluribus_stage1_decisions.md` §10 + `pluribus_stage2_decisions.md` §11 修改流程，**D-NNN-revM 追加不删** + 在工作流 issue / PR 中显式标注 + 必要时 bump schema_version。stage 3 引入 `Checkpoint.schema_version`（D-350）作为 stage 3 自己的 serialization version anchor，与 stage 1 `HandHistory.schema_version` + stage 2 `BucketTable.schema_version` 互不冲突。

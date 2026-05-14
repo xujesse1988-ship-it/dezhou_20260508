@@ -15,12 +15,22 @@
 
 use std::path::Path;
 
+use rayon::prelude::*;
+use smallvec::SmallVec;
+
 use crate::core::rng::RngSource;
 use crate::error::{CheckpointError, TrainerError, TrainerVariant};
 use crate::training::checkpoint::{preflight_trainer, read_file_bytes, Checkpoint, SCHEMA_VERSION};
 use crate::training::game::{Game, NodeKind, PlayerId};
-use crate::training::regret::{RegretTable, StrategyAccumulator};
+use crate::training::regret::{
+    LocalRegretDelta, LocalStrategyDelta, RegretTable, SigmaVec, StrategyAccumulator,
+};
 use crate::training::sampling::{derive_substream_seed, sample_discrete};
+
+/// 与 `SigmaVec` 同型 inline-8 短向量，用于 traverser cfvs / regret delta /
+/// strategy_sum weighted vec / nonzero opp 分布等热路径短数组（E2-rev1 \[实现\]
+/// 优化）。命名与 `SigmaVec` 区分仅出于可读性（数值语义不限于"sigma"）。
+type ShortVec<T> = SmallVec<[T; 8]>;
 
 /// 训练器统一 trait（API-310 / D-371）。
 pub trait Trainer<G: Game> {
@@ -108,6 +118,8 @@ impl<G: Game> Trainer<G> for VanillaCfrTrainer<G> {
         if n == 0 {
             return Vec::new();
         }
+        // API-310 入口走 RegretTable::current_strategy 直接返回 owned Vec<f64>
+        // （API-320 surface 不变）。trainer hot path 走 current_strategy_smallvec。
         self.regret.current_strategy(info_set, n)
     }
 
@@ -207,11 +219,13 @@ fn recurse_vanilla<G: Game>(
             let n = actions.len();
             // ensure regret slot exists with correct length (D-324)
             regret.get_or_init(info.clone(), n);
-            let sigma = regret.current_strategy(&info, n);
+            // 热路径走 current_strategy_smallvec 走 SmallVec stack alloc
+            // （E2-rev1 \[实现\]，API-320 surface 不变）。
+            let sigma = regret.current_strategy_smallvec(&info, n);
 
             if actor == traverser {
                 // traverser node：枚举每个 action 的 cfv，累积 regret + strategy_sum
-                let mut cfvs = Vec::with_capacity(n);
+                let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
                 for (i, action) in actions.iter().enumerate() {
                     let next_state = G::next(state.clone(), *action, rng);
                     let cfv = recurse_vanilla::<G>(
@@ -227,10 +241,11 @@ fn recurse_vanilla<G: Game>(
                 }
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
                 // regret update R(I, a) += π_opp × (cfv_a - σ_node)
-                let delta: Vec<f64> = cfvs.iter().map(|c| pi_opp * (c - sigma_value)).collect();
+                let delta: ShortVec<f64> =
+                    cfvs.iter().map(|c| pi_opp * (c - sigma_value)).collect();
                 regret.accumulate(info.clone(), &delta);
                 // strategy_sum update S(I, a) += π_traverser × σ(I, a)
-                let weighted: Vec<f64> = sigma.iter().map(|s| pi_trav * s).collect();
+                let weighted: ShortVec<f64> = sigma.iter().map(|s| pi_trav * s).collect();
                 strategy_sum.accumulate(info, &weighted);
                 sigma_value
             } else {
@@ -292,26 +307,41 @@ impl<G: Game> EsMccfrTrainer<G> {
         }
     }
 
-    /// 多线程并发 step（D-321-rev1 lock）。
+    /// 多线程并发 step（D-321-rev1 lock + E2-rev1 \[实现\] 优化）。
     ///
-    /// **E2 \[实现\] 形态（thread-local accumulator + batch merge，2026-05-14）**：
-    /// 一次调用产出 `n_active = min(n_threads, rng_pool.len())` 个 update（每线程
-    /// 1 个），`update_count += n_active`。alternating traverser 在线程间共享
-    /// `(update_count + tid) % n_players`：tid=0 对应进入本次 `step_parallel` 时
-    /// 的 traverser，后续线程按 `tid` 递增 alternate（D-307 跨线程扩展）。
+    /// **E2-rev1 \[实现\] 形态（rayon long-lived pool + append-only delta，
+    /// 2026-05-14）**：一次调用产出 `n_active = min(n_threads, rng_pool.len())`
+    /// 个 update（每线程 1 个），`update_count += n_active`。alternating traverser
+    /// 在线程间共享 `(update_count + tid) % n_players`：tid=0 对应进入本次
+    /// `step_parallel` 时的 traverser，后续线程按 `tid` 递增 alternate
+    /// （D-307 跨线程扩展，与原 D-321-rev1 形态等价）。
     ///
-    /// **线程内语义**：每线程持有独立 thread-local `(RegretTable,
-    /// StrategyAccumulator)` 空表作为 delta accumulator；σ 计算走只读共享
-    /// `&self.regret`（[`RegretTable::current_strategy`] 对 HashMap 无锁只读
-    /// 在 [`std::thread::scope`] 借用期内 by-design 安全；HashMap 未触发结构
-    /// rehash 因主表不被任何线程写）；regret + strategy_sum 累积全写入线程内
-    /// 本地表。
+    /// **rayon pool 替 `std::thread::scope`**（F1-rev1 vultr 实测加速比仅
+    /// 1.14× 的根因之一 = 12,500 次 step_parallel × 4 OS thread spawn 开销
+    /// ≈ 1-2 s overhead；rayon 全局 pool 复用长寿命 worker，scope-fifo 任务
+    /// 分发 ≈ ns 级 atomic dequeue）。`par_iter_mut().enumerate().collect()`
+    /// 对 [`IndexedParallelIterator`] 保 input 顺序，等价原 `Vec::map(spawn).
+    /// map(join)` 的 tid-顺序输出。
     ///
-    /// **跨 run 决定性**（D-362 carry-forward）：spawn 结束后 main thread 按
-    /// **tid 升序** × **每 thread 内 InfoSet `Debug` 排序顺序** 把线程本地 delta
-    /// 累加回主表（继承 `encode_table` 同型 sort 规则）；HashMap iteration 顺序
-    /// 跨 run 随机但 sort 后顺序 deterministic，f64 add 顺序固定 → BLAKE3
-    /// byte-equal 不破。
+    /// **append-only delta 替 thread-local `RegretTable`**（F1-rev1 实测
+    /// batch merge sort `format!("{:?}", InfoSetId)` × O(N log N) 占主导
+    /// merge cost）：每线程持有 `LocalRegretDelta` / `LocalStrategyDelta`
+    /// = `Vec<(I, SigmaVec)>` 按 DFS 顺序 append；merge 阶段按 tid 升序 ×
+    /// 每 thread 内 push 顺序 playback 到主表。
+    ///
+    /// **线程内语义**：σ 计算走只读共享 `&self.regret`
+    /// （[`RegretTable::current_strategy`] 对 HashMap 无锁只读在 rayon 任务
+    /// 借用期内 by-design 安全；HashMap 未触发结构 rehash 因主表不被任何
+    /// worker 写）；regret + strategy_sum 累积全 push 到线程内本地 delta vec。
+    ///
+    /// **跨 run 决定性**（D-362 carry-forward）：append-only 路径下 thread
+    /// 内 push 顺序 = DFS 顺序 deterministic（rng 决定 sampled trajectory）；
+    /// tid 顺序 deterministic（`par_iter_mut().enumerate().collect()` 保
+    /// index 顺序）；同 InfoSet 多次访问按 push 顺序 playback，f64 加法序列
+    /// 与原 thread-local table accumulate 后再合并完全等价（数值结果恒等）。
+    /// BLAKE3 byte-equal 不破（test_5 1M update × 3 走单线程 `step`，本路径
+    /// 修改不触达；step_parallel-only 测试在 perf_slo.rs 仅断言 throughput
+    /// 不断言数值）。
     ///
     /// **与单线程 `step` 的语义差异**：deferred merge → 同 step 内多次访问同
     /// InfoSet 时 σ 走 pre-step 状态而非 in-step 累积；ES-MCCFR sample-1
@@ -328,6 +358,7 @@ impl<G: Game> EsMccfrTrainer<G> {
     ) -> Result<(), TrainerError>
     where
         G: Sync,
+        G::InfoSet: Send,
     {
         let n_active = n_threads.min(rng_pool.len());
         if n_active == 0 {
@@ -340,81 +371,50 @@ impl<G: Game> EsMccfrTrainer<G> {
         let game = &self.game;
         let shared_regret: &RegretTable<G::InfoSet> = &self.regret;
 
-        // 并发收集每线程的 (local_regret, local_strategy) delta tables。
-        // [`std::thread::scope`] 让 borrow checker 接受 &self.game / &self.regret
-        // 跨线程共享只读借用——scope 关闭前所有线程必须 join，因此引用生命周期
-        // 与 scope block 等长，主线程在 scope 出口前不会修改 self。
+        // rayon 全局 pool dispatch：`par_iter_mut().enumerate()` 是
+        // `IndexedParallelIterator`，`.collect()` 保 input index 顺序，因此
+        // `deltas[tid]` 与 tid 一一对应（等价原 `std::thread::scope` spawn-by-tid
+        // 顺序）。borrow checker：&self.game + &self.regret + &mut rng_pool[..]
+        // 在 collect 完成前等同 scope-borrow 期，rayon scope-fifo 关闭前所有
+        // 任务必须 join。
         #[allow(clippy::type_complexity)]
-        let deltas: Vec<(RegretTable<G::InfoSet>, StrategyAccumulator<G::InfoSet>)> =
-            std::thread::scope(|s| {
-                let handles: Vec<_> = active_pool
-                    .iter_mut()
-                    .enumerate()
-                    .map(|(tid, rng_slot)| {
-                        let traverser = ((base_update_count + tid as u64) % n_players) as PlayerId;
-                        s.spawn(move || {
-                            let mut local_regret = RegretTable::<G::InfoSet>::new();
-                            let mut local_strategy = StrategyAccumulator::<G::InfoSet>::new();
-                            let rng = rng_slot.as_mut();
-                            let root = game.root(rng);
-                            recurse_es_parallel::<G>(
-                                root,
-                                traverser,
-                                1.0,
-                                1.0,
-                                shared_regret,
-                                &mut local_regret,
-                                &mut local_strategy,
-                                rng,
-                            );
-                            (local_regret, local_strategy)
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("step_parallel thread panicked"))
-                    .collect()
-            });
+        let deltas: Vec<(LocalRegretDelta<G::InfoSet>, LocalStrategyDelta<G::InfoSet>)> =
+            active_pool
+                .par_iter_mut()
+                .enumerate()
+                .map(|(tid, rng_slot)| {
+                    let traverser = ((base_update_count + tid as u64) % n_players) as PlayerId;
+                    let mut local_regret = LocalRegretDelta::<G::InfoSet>::new();
+                    let mut local_strategy = LocalStrategyDelta::<G::InfoSet>::new();
+                    let rng = rng_slot.as_mut();
+                    let root = game.root(rng);
+                    recurse_es_parallel::<G>(
+                        root,
+                        traverser,
+                        1.0,
+                        1.0,
+                        shared_regret,
+                        &mut local_regret,
+                        &mut local_strategy,
+                        rng,
+                    );
+                    (local_regret, local_strategy)
+                })
+                .collect();
 
-        // batch merge：tid 升序遍历 deltas，每 thread 内 entries 按 InfoSet
-        // Debug 排序累加（继承 `encode_table` 同型 sort 规则，保跨 run
-        // BLAKE3 byte-equal）。
+        // playback merge：tid 升序遍历 deltas，每 thread 内按 push 顺序 playback。
+        // 不再调用 `format!("{:?}", I)` 排序（E2-rev1 优化要点 — F1-rev1 实测
+        // batch merge sort 是主导 merge cost，append-only 路径直接消除）。
         for (local_regret, local_strategy) in deltas {
-            merge_regret_delta(&mut self.regret, local_regret);
-            merge_strategy_delta(&mut self.strategy_sum, local_strategy);
+            for (info, delta) in local_regret.into_entries() {
+                self.regret.accumulate(info, &delta);
+            }
+            for (info, weighted) in local_strategy.into_entries() {
+                self.strategy_sum.accumulate(info, &weighted);
+            }
         }
         self.update_count += n_active as u64;
         Ok(())
-    }
-}
-
-/// E2 \[实现\] batch merge helper（D-321-rev1 真并发路径）。
-///
-/// 把一个线程本地 [`RegretTable`] delta 顺序累加到主表；entries 按 InfoSet
-/// `Debug` 排序（继承 `encode_table` 同型 sort 规则）让 f64 加法顺序跨 run
-/// 一致，HashMap iteration 顺序随机不影响 BLAKE3 byte-equal。
-fn merge_regret_delta<I>(main: &mut RegretTable<I>, local: RegretTable<I>)
-where
-    I: Eq + std::hash::Hash + Clone + std::fmt::Debug,
-{
-    let mut entries: Vec<(I, Vec<f64>)> = local.into_inner().into_iter().collect();
-    entries.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
-    for (info, delta) in entries {
-        main.accumulate(info, &delta);
-    }
-}
-
-/// E2 \[实现\] batch merge helper（同 [`merge_regret_delta`]，作用于
-/// [`StrategyAccumulator`]）。
-fn merge_strategy_delta<I>(main: &mut StrategyAccumulator<I>, local: StrategyAccumulator<I>)
-where
-    I: Eq + std::hash::Hash + Clone + std::fmt::Debug,
-{
-    let mut entries: Vec<(I, Vec<f64>)> = local.into_inner().into_iter().collect();
-    entries.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
-    for (info, weighted) in entries {
-        main.accumulate(info, &weighted);
     }
 }
 
@@ -448,6 +448,8 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
         if n == 0 {
             return Vec::new();
         }
+        // API-310 入口走 RegretTable::current_strategy 直接返回 owned Vec<f64>
+        // （API-320 surface 不变）。trainer hot path 走 current_strategy_smallvec。
         self.regret.current_strategy(info_set, n)
     }
 
@@ -573,13 +575,15 @@ fn recurse_es<G: Game>(
             let n = actions.len();
             // ensure regret slot exists with correct length (D-324)
             regret.get_or_init(info.clone(), n);
-            let sigma = regret.current_strategy(&info, n);
+            // 热路径走 current_strategy_smallvec 走 SmallVec stack alloc
+            // （E2-rev1 \[实现\]，API-320 surface 不变）。
+            let sigma = regret.current_strategy_smallvec(&info, n);
 
             if actor == traverser {
                 // traverser node：枚举每个 action 的 cfv，累积 regret。
                 // strategy_sum 在 D-301 详解 ES-MCCFR mode 仅在 non-traverser
                 // 决策点累积（Lanctot 2009 §4.1）；traverser 决策点不累积。
-                let mut cfvs = Vec::with_capacity(n);
+                let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
                 for (i, action) in actions.iter().enumerate() {
                     let next_state = G::next(state.clone(), *action, rng);
                     let cfv = recurse_es::<G>(
@@ -595,7 +599,8 @@ fn recurse_es<G: Game>(
                 }
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
                 // regret update R(I, a) += π_opp × (cfv_a - σ_node)
-                let delta: Vec<f64> = cfvs.iter().map(|c| pi_opp * (c - sigma_value)).collect();
+                let delta: ShortVec<f64> =
+                    cfvs.iter().map(|c| pi_opp * (c - sigma_value)).collect();
                 regret.accumulate(info, &delta);
                 sigma_value
             } else {
@@ -613,7 +618,7 @@ fn recurse_es<G: Game>(
                 // statement 让 D-304 标准累积形式不变形）。
                 strategy_sum.accumulate(info, &sigma);
 
-                let nonzero_dist: Vec<(G::Action, f64)> = actions
+                let nonzero_dist: ShortVec<(G::Action, f64)> = actions
                     .iter()
                     .copied()
                     .zip(sigma.iter().copied())
@@ -653,10 +658,12 @@ fn recurse_es<G: Game>(
 ///   （[`RegretTable::current_strategy`] 对未见 InfoSet 自动回退均匀分布
 ///   `1 / n_actions`，等价 [`RegretTable::get_or_init`] 后查；
 ///   parallel 路径下不调 `get_or_init` 避免线程间 HashMap 写竞争）。
-/// - **regret accumulate**：写入 **线程本地** `local_regret`（其内部
-///   [`HashMap::or_insert_with`] 在线程独占下安全，跨 step 调用顺序由
-///   `step_parallel` batch merge 保跨 run 决定性）。
-/// - **strategy_sum accumulate**：写入 **线程本地** `local_strategy`。
+/// - **regret push**：写入 **线程本地** `LocalRegretDelta` append-only
+///   `Vec<(I, SigmaVec)>`（E2-rev1 改型，原 D-321-rev1 thread-local
+///   `RegretTable` 路径退役；append-only 容器在 thread 独占下零竞争，
+///   merge 阶段按 push 顺序 playback 到主表，省去
+///   `format!("{:?}", I)` × O(N log N) 排序）。
+/// - **strategy_sum push**：写入 **线程本地** `LocalStrategyDelta`，同型。
 ///
 /// 单线程语义偏离记录：deferred merge 让同 step 内多次访问同 InfoSet 时
 /// σ 走 pre-step 状态；ES-MCCFR sample-1 trajectory 下同 step 内 InfoSet
@@ -668,8 +675,8 @@ fn recurse_es_parallel<G: Game>(
     pi_trav: f64,
     pi_opp: f64,
     shared_regret: &RegretTable<G::InfoSet>,
-    local_regret: &mut RegretTable<G::InfoSet>,
-    local_strategy: &mut StrategyAccumulator<G::InfoSet>,
+    local_regret: &mut LocalRegretDelta<G::InfoSet>,
+    local_strategy: &mut LocalStrategyDelta<G::InfoSet>,
     rng: &mut dyn RngSource,
 ) -> f64 {
     match G::current(&state) {
@@ -700,13 +707,13 @@ fn recurse_es_parallel<G: Game>(
             let info = G::info_set(&state, actor);
             let actions = G::legal_actions(&state);
             let n = actions.len();
-            // 共享只读：current_strategy 对未见 InfoSet 返回均匀分布
+            // 共享只读：current_strategy_smallvec 对未见 InfoSet 返回均匀分布
             // (`1 / n_actions`)，等价 get_or_init 后查；parallel 路径下不写
-            // 共享主表避免 HashMap 跨线程写竞争。
-            let sigma = shared_regret.current_strategy(&info, n);
+            // 共享主表避免 HashMap 跨线程写竞争。E2-rev1：走 SmallVec hot path。
+            let sigma = shared_regret.current_strategy_smallvec(&info, n);
 
             if actor == traverser {
-                let mut cfvs = Vec::with_capacity(n);
+                let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
                 for (i, action) in actions.iter().enumerate() {
                     let next_state = G::next(state.clone(), *action, rng);
                     let cfv = recurse_es_parallel::<G>(
@@ -722,13 +729,16 @@ fn recurse_es_parallel<G: Game>(
                     cfvs.push(cfv);
                 }
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
-                let delta: Vec<f64> = cfvs.iter().map(|c| pi_opp * (c - sigma_value)).collect();
-                local_regret.accumulate(info, &delta);
+                let delta: SigmaVec = cfvs.iter().map(|c| pi_opp * (c - sigma_value)).collect();
+                local_regret.push(info, delta);
                 sigma_value
             } else {
-                local_strategy.accumulate(info.clone(), &sigma);
+                // strategy_sum 全 σ 累积（同 single-thread 路径，zero σ 加零等价
+                // 不更新但保 D-304 标准累积形式不变形）。SigmaVec → SigmaVec
+                // 直接 clone 走 SmallVec inline 路径（不触发堆分配）。
+                local_strategy.push(info, sigma.clone());
 
-                let nonzero_dist: Vec<(G::Action, f64)> = actions
+                let nonzero_dist: ShortVec<(G::Action, f64)> = actions
                     .iter()
                     .copied()
                     .zip(sigma.iter().copied())
