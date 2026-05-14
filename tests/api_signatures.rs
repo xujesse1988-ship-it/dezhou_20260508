@@ -593,4 +593,101 @@ fn _stage3_api_signature_assertions() {
         offset: 0u64,
         reason: String::new(),
     };
+
+    // TrainerError 5 variant 构造 trip-wire（API-313 / D-324 / D-325 / D-323 /
+    // D-330 / D-351 propagation；F1 \[测试\] 同 commit 落地，stage 3 出口前最后一次
+    // 签名 lock 入口）。继承 stage 1 + stage 2 错误枚举追加不删模式 + 与
+    // CheckpointError 5 variant lock 同型。变体语义索引：
+    //   ① ActionCountMismatch { info_set: String, expected: usize, got: usize }
+    //   ② OutOfMemory { rss_bytes: u64, limit: u64 }
+    //   ③ UnsupportedBucketTable { expected: u32, got: u32 }
+    //   ④ ProbabilitySumOutOfTolerance { got: f64, tolerance: f64 }
+    //   ⑤ Checkpoint(#[from] CheckpointError) — `From<CheckpointError>` 自动 dispatch
+    //
+    // **doc drift 备注**：`pluribus_stage3_api.md` §API-313 落地形态把 ⑤ 写为
+    // `CheckpointError(#[from] CheckpointError)`（变体名同 payload 类型名）；
+    // D2 \[实现\] 落地的代码形态为 `Checkpoint(#[from] CheckpointError)`（变体名简
+    // 化）。本 trip-wire 锁代码形态——文档 drift 走 F2 \[实现\] 同 commit 修复
+    // （继承 stage 2 §F2 字面 "0 产品代码改动 carve-out closure（合并 commit 修
+    // doc drift）" 模式）。
+    let _: TrainerError = TrainerError::ActionCountMismatch {
+        info_set: String::new(),
+        expected: 0usize,
+        got: 0usize,
+    };
+    let _: TrainerError = TrainerError::OutOfMemory {
+        rss_bytes: 0u64,
+        limit: 0u64,
+    };
+    let _: TrainerError = TrainerError::UnsupportedBucketTable {
+        expected: 0u32,
+        got: 0u32,
+    };
+    let _: TrainerError = TrainerError::ProbabilitySumOutOfTolerance {
+        got: 0.0f64,
+        tolerance: 0.0f64,
+    };
+    let _: TrainerError = TrainerError::Checkpoint(CheckpointError::Corrupted {
+        offset: 0u64,
+        reason: String::new(),
+    });
+    // From<CheckpointError> for TrainerError 自动 dispatch trip-wire（API-313
+    // `#[from]` attribute；let `?` 操作符跨 `Result<_, CheckpointError>` →
+    // `Result<_, TrainerError>` 转换继续可用）。
+    let _: fn(CheckpointError) -> TrainerError = <TrainerError as From<CheckpointError>>::from;
+
+    // ===================================================================
+    // training::game (api §1 trait const + 默认方法 — D2 \[实现\] 落地的 surface 扩展)
+    // ===================================================================
+
+    // Game::VARIANT const lock × 3 impl（API-300-rev1 lock 在 D2 \[实现\] 落地，
+    // F1 同 commit 锁定不变量；任一 const 重命名 / 类型改动 / 数值翻面立即在
+    // `cargo test --no-run` 失败）。
+    let _: GameVariant = <KuhnGame as Game>::VARIANT;
+    let _: GameVariant = <LeducGame as Game>::VARIANT;
+    let _: GameVariant = <SimplifiedNlheGame as Game>::VARIANT;
+
+    // Game::bucket_table_blake3 默认方法 UFCS lock × 3 impl（API-300-rev1 D2
+    // 落地的默认方法；KuhnGame / LeducGame 走 default 返回 [0; 32]；
+    // SimplifiedNlheGame override 返回 self.bucket_table.content_hash()）。
+    let _: for<'a> fn(&'a KuhnGame) -> [u8; 32] = <KuhnGame as Game>::bucket_table_blake3;
+    let _: for<'a> fn(&'a LeducGame) -> [u8; 32] = <LeducGame as Game>::bucket_table_blake3;
+    let _: for<'a> fn(&'a SimplifiedNlheGame) -> [u8; 32] =
+        <SimplifiedNlheGame as Game>::bucket_table_blake3;
+
+    // ===================================================================
+    // training::checkpoint (api §5 — D2 \[实现\] 落地的 pub field + helper 常量)
+    // ===================================================================
+
+    // Checkpoint pub field 类型 lock（API-350 / D-350 binary header offset 表）。
+    // 任一字段类型 / 顺序漂移立即在 `cargo test --no-run` 失败。
+    let ckpt = Checkpoint {
+        schema_version: 1u32,
+        trainer_variant: TrainerVariant::VanillaCfr,
+        game_variant: GameVariant::Kuhn,
+        update_count: 0u64,
+        rng_state: [0u8; 32],
+        bucket_table_blake3: [0u8; 32],
+        regret_table_bytes: Vec::new(),
+        strategy_sum_bytes: Vec::new(),
+    };
+    let _: u32 = ckpt.schema_version;
+    let _: TrainerVariant = ckpt.trainer_variant;
+    let _: GameVariant = ckpt.game_variant;
+    let _: u64 = ckpt.update_count;
+    let _: [u8; 32] = ckpt.rng_state;
+    let _: [u8; 32] = ckpt.bucket_table_blake3;
+    let _: Vec<u8> = ckpt.regret_table_bytes;
+    let _: Vec<u8> = ckpt.strategy_sum_bytes;
+
+    // HEADER_LEN / TRAILER_LEN 常量值锁（D-350 binary layout 头号不变量；与
+    // checkpoint_round_trip.rs::d350_binary_layout_offsets_lock 双重锁定）。
+    use poker::training::checkpoint::{HEADER_LEN, TRAILER_LEN};
+    let _: usize = HEADER_LEN;
+    let _: usize = TRAILER_LEN;
+
+    // TrainerVariant / GameVariant `from_u8` 反序列化 helper UFCS lock（D-350
+    // binary header offset 12/13 → enum 解析路径）。
+    let _: fn(u8) -> Option<TrainerVariant> = TrainerVariant::from_u8;
+    let _: fn(u8) -> Option<GameVariant> = GameVariant::from_u8;
 }
