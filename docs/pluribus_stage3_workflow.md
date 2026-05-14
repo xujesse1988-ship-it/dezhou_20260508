@@ -613,3 +613,39 @@ F. 收尾                    : F1 [测试] → F2 [实现] → F3 [报告]
         - **Option B — D-361-revM 翻面降低 SLO 阈值**：与原 Pluribus path.md 字面冲突，需充分理由（如 path.md 假设过乐观 / vultr 4-core EPYC-Rome 性价比 vs Pluribus 论文 8-core target）；走 path.md `D-NNN-revM` 修订流程 + 用户书面授权。
         - **Option C — 接受 E2-rev1 现状当 stage 3 出口 baseline**：NLHE SLO 双 fail 列入 stage 3 报告 §8 已知偏离 + carry-forward 到 stage 4 起步并行清单（继承 stage 2 §G-batch1 §3.4-batch2 deferred 同型 carve-out 模式）；F2 [实现] / F3 [报告] 路径恢复，但 stage 3 出口报告必须显式标注 SLO 不达标 + 后续 stage 4 6-max blueprint 训练吞吐预算调整。
     - **角色边界**：本 carve-out 0 产品代码改动（仅 docs），E2-rev1 [实现] 主线 commit `5c39989` 不撤；本 entry 由 E2-rev1 followup commit 落地（与 F1-rev1 carve-out 同型 [测试]/[实现] 角色越界追认 — 实测 + carve-out 标记不属严格 [实现] 工作但属 E2-rev1 → followup commit 工程契约字面授权）。
+- **2026-05-14（E2-rev1-profile carve-out — vultr microbench 推翻 candidate (1)(2)(3)）**：E2-rev1-vultr-measured carve-out 三条决策路径选择前，用户授权先做 single-thread hot path 时间分布 microbench 量化决策依据（`cargo bench --bench stage3` criterion mean 不够，dev box / vultr 都没装 perf / cargo-flamegraph）。落地 `tests/e2_rev1_profile.rs` 7-test diagnostic（diagnostic-only / `#[ignore]` opt-in / 不进 default `cargo test` 套件 / 与 D-376 公开 API surface 边界一致仅 use crate-internal helpers）：
+    - **vultr 4-core EPYC-Rome 实测**（commit `fc718e8`，6 测试 ~3 sec + info_set_postflop 0.07 s）：
+        | 组件 | 实测 (ns/call) | 摊算 ~150 calls/update budget |
+        |---|---|---|
+        | full_update baseline | **218,921 ns** = 4,568 update/s | 100%（vultr SLO 4,357 ±5% 同基线） |
+        | state_clone | 181 | 181 × 35 = 6,335 ns ≈ **2.9%** |
+        | game_next（含 state.clone + apply） | 1,479 | 1,479 × 35 = 51,765 ns ≈ **23.6%** |
+        | info_set_postflop（canonical_observation_id + bucket_table.lookup mmap） | 693 | 693 × 17（postflop ~50%） = 11,781 ns ≈ **5.4%** |
+        | current_strategy_5action | 76 | 76 × 35 = 2,660 ns ≈ **1.2%** |
+        | sample_discrete_5action | 159 | 159 × 17 = 2,703 ns ≈ **1.2%** |
+        | blake3_8byte_anchor | 95 | 锚点参考 |
+    - **意外发现 — 原 candidate 全 wishful thinking**：
+        - **(1) state borrow 替 clone**：state_clone 仅 181 ns 占 < 0.1% budget；E2-rev2 改 `Game::next(&state, action) -> State` 收益 ≈ 0；同时 API-300 break 成本 ~3-5 天。**否决**。
+        - **(2) canonical_observation_id 缓存**：info_set_postflop 仅 693 ns（含 lookup！）占 < 0.5% budget；缓存收益 ≈ 0；架构 break ~2-3 天。**否决**。
+        - **(3) bucket_table mlock / madvise WILLNEED**：mmap warm 后 bucket_table.lookup 已包含在 info_set_postflop 693 ns 内；cold-start 仅一次性影响（vultr SLO 实测已 warm）；收益 ≈ 0。**否决**。
+        - **(4) sample_discrete CDF lookup-table**：159 ns × 17 calls/update = 2,703 ns 占 1.2% budget；理论收益上限 ~50% × 1.2% = 0.6%。**否决**。
+        - **(5) D-322 batch merge 并行**：破 BLAKE3 byte-equal 红线，禁止用。**否决**。
+    - **真实瓶颈定位**：218,921 ns - 75,244 ns（measured sum）= **143,677 ns ≈ 65.6% unaccounted**，归类到 **ES-MCCFR DFS 递归结构本身** + **stage 1 `GameState::apply` 内部 ~1.3 μs/call** + **HashMap 操作（regret.accumulate / strategy.accumulate entry-or-insert ~100-300 ns × 多次）** + **legal_actions Vec 分配 + Vec<Action> 返回值堆分配** + **ES sample-1 trajectory branch mispredict / 函数调用 indirect via dyn RngSource**。
+    - **可能的有效路径**（量级估计未实测）：
+        - **(X) outcome sampling MCCFR 替 external sampling**：traverser 节点也 sample 1 action（树宽 5 → 1）= 理论 5x 单 update 加速；但 D-301 字面 lock 为 ES-MCCFR + 收敛速度退化（per Lanctot 2009 Theorem 7：OS variance 远高于 ES）；翻 D-301-revM 走破 lock 路径 + 收敛速度需 stage 4 重新验证；scope ~2 周 + 翻面 D-301 字面 lock 文档冲突。
+        - **(Y) HashMap → 预分配 capacity / FxHashMap**：估计收益 5-15%（< SLO 翻面所需 2.3x / 6.5x）；轻量改动 ~半天。
+        - **(Z) `legal_actions` Vec 复用 + `with_capacity` hot path**：估计收益 5-10%；轻量 ~半天。
+        - **(W) stage 1 `GameState::apply` micro-opt**：跨 stage 3 模块边界（D-374 字面禁止 stage 3 改 stage 1）；scope ~1 周 + stage 1 API-NNN-revM 流程；预期收益 10-30% 单线程。
+    - **角色边界**：本 carve-out 0 产品代码改动（仅追加 `tests/e2_rev1_profile.rs` diagnostic test + 本 §修订历史 entry）；diagnostic test `#[ignore]` 不进 default `cargo test` 套件，0 影响 default profile 实测形态。
+- **2026-05-14（E2-rev1 closure — Option C accepted by user）**：E2-rev1-profile carve-out 数据展示后由用户授权选 **Option C — 接受 E2-rev1 现状当 stage 3 出口 baseline**。F1-rev1 → E2-rev1 → E2-rev1-vultr-measured → E2-rev1-profile carve-out 四轮迭代闭合（E2 [实现] closure 后无新 [实现] 角色 work；后续 F2 [实现] 走 0 产品代码改动 doc drift 修复 closure）。
+    - **stage 3 出口已知偏离 lock**：D-361 NLHE 双 SLO 实测 fail（单线程 4,357 < 10K 阈值 / 4-core 7,741 < 50K 阈值），列入 `pluribus_stage3_report.md` §8 已知偏离 + carry-forward 到 stage 4 起步并行清单（继承 stage 2 §G-batch1 §3.4-batch2 deferred 同型 carve-out 模式：stage 出口允许 SLO 不达标，但必须显式文档化 + 给出根因分析 + 后续 stage 修复路径）。**SLO 阈值 path.md 字面 unchanged**（不走 D-361-revM，不破 path.md spec）；stage 3 acceptance 通过显式 known-deviation carve-out 模式而非降阈值。
+    - **E2-rev1 真改进保留 ship**：commit `5c39989` 改动不撤 — (a) 4-core efficiency 1.14 → 1.78× 真改善；(b) append-only delta + rayon long-lived pool 比 D-321-rev1 std::thread::scope + sort-by-Debug merge 在工程实现上更清晰且 BLAKE3 byte-equal 不破；(c) SmallVec hot path 虽单线程收益少（+1%）但保 BLAKE3 byte-equal anchor 不破，作为 stage 4 起步的优化基线。
+    - **stage 4 起步并行清单 carry-forward 项**：
+        - **(I) perf + cargo-flamegraph proper sampling profiler**：dev box / vultr 都没装 perf；下次 stage 4 起步前 install + 实测真实 hot path 分布（estimated unaccounted 65.6% budget 是 GameState::apply / HashMap / legal_actions Vec / 函数调用 overhead 的某种组合，需 sampling profiler 量化）。
+        - **(II) 评估 D-301 outcome sampling 替 external sampling**：理论 5x 单 update 加速 + 收敛速度需 stage 4 重新验证（Lanctot 2009 OS variance 远高于 ES，可能需更多 update 量补偿；走 D-301-revM 翻 lock）。
+        - **(III) 评估 (Y) HashMap 预分配 + FxHashMap 替换 + (Z) legal_actions Vec 复用**：估计 10-25% 综合收益，单独不足以翻面 SLO 但可累积进 stage 4 baseline（轻量改动 ~1 天 total）。
+        - **(IV) 评估 stage 1 `GameState::apply` micro-opt**：D-374 模块边界跨 stage 1 评估，需 stage 1 `API-NNN-revM` 流程 + 用户授权（estimated 10-30% 单线程收益，scope ~1 周 + 跨 stage 影响面）。
+        - **(V) 评估 D-361-revM 翻面降阈值**：与 Pluribus path.md 字面冲突；需充分理由（vultr 4-core EPYC-Rome 性价比 vs Pluribus 论文 8-core target / 实测真实 budget vs path.md 假设过乐观）+ 用户书面授权 + path.md `D-NNN-revM` 修订流程。
+    - **`tests/e2_rev1_profile.rs` 保留 ship**：原 commit message 字面 "E2-rev2 路径决策完后由用户授权撤回"，但实测数据是 stage 4 carry-forward 项 (I)..(III) 评估的强 baseline，撤回会丢弃 vultr 4-core EPYC-Rome 实测 anchor。改 carve-out：保留 diagnostic test 作为 stage 4 carry-forward `#[ignore]` baseline，与 stage 2 §G-batch1 §3.10 v3 artifact body BLAKE3 同型 ground-truth 模式（保留作长期 anchor，非临时 fixture）。test 文件本身不在 default `cargo test` 套件，0 影响 stage 3 出口形态。
+    - **F2 [实现] 工程契约（继承 stage 2 §F2 字面模式）**：(a) 修 doc drift `pluribus_stage3_api.md` §API-313 ⑤ 变体名（doc=`CheckpointError(#[from] CheckpointError)` → code=`Checkpoint(#[from] CheckpointError)`，code 形态简洁更合 Rust convention）；(b) 0 产品代码改动 closure；(c) F2 closure 后 → F3 [报告]（stage 3 验收报告 + git tag `stage3-v1.0` + checkpoint artifact 上传 GitHub Release，详见 `pluribus_stage3_workflow.md` §步骤 F3）。**F2 时间预算**：~半天（仅 doc drift + 同 commit `pluribus_stage3_workflow.md` §修订历史 F2 entry + CLAUDE.md 状态翻面）。
+    - **角色边界**：本 closure entry 0 产品代码改动（仅 docs：本 §修订历史 entry + `CLAUDE.md` ## Repository status E2-rev1-profile → E2-rev1 closure ship + 下一步改 F2 [实现]）；F1-rev1 carve-out + E2-rev1-vultr-measured carve-out + E2-rev1-profile carve-out + 本 closure 完整闭合 stage 3 出口 SLO 决策链。

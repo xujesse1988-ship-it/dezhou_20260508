@@ -200,9 +200,7 @@ fn info_set_postflop_cost() {
                     let pick = actions
                         .iter()
                         .copied()
-                        .find(|a| {
-                            matches!(a, AbstractAction::Check | AbstractAction::Call { .. })
-                        })
+                        .find(|a| matches!(a, AbstractAction::Check | AbstractAction::Call { .. }))
                         .unwrap_or(actions[0]);
                     state = SimplifiedNlheGame::next(state, pick, &mut rng);
                 }
@@ -282,14 +280,19 @@ fn current_strategy_cost_5action() {
 #[test]
 #[ignore = "diagnostic-only; release/--ignored opt-in"]
 fn sample_discrete_5action_cost() {
-    use poker::training::nlhe::SimplifiedNlheAction;
     use poker::abstraction::action::BetRatio;
+    use poker::training::nlhe::SimplifiedNlheAction;
     use poker::{AbstractAction, ChipAmount};
 
     let dist: Vec<(SimplifiedNlheAction, f64)> = vec![
         (AbstractAction::Fold, 0.2),
         (AbstractAction::Check, 0.1),
-        (AbstractAction::Call { to: ChipAmount::new(100) }, 0.3),
+        (
+            AbstractAction::Call {
+                to: ChipAmount::new(100),
+            },
+            0.3,
+        ),
         (
             AbstractAction::Bet {
                 to: ChipAmount::new(500),
@@ -297,7 +300,12 @@ fn sample_discrete_5action_cost() {
             },
             0.2,
         ),
-        (AbstractAction::AllIn { to: ChipAmount::new(10000) }, 0.2),
+        (
+            AbstractAction::AllIn {
+                to: ChipAmount::new(10000),
+            },
+            0.2,
+        ),
     ];
     let mut rng = ChaCha20Rng::from_seed(0xD1_D1_D1_D1_D1_D1_D1_D1);
 
