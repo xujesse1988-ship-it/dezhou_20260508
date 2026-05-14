@@ -23,11 +23,18 @@
 //!
 //! 角色边界：本文件属 `[测试]` agent。`[实现]` agent 不得修改。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
 use poker::eval::NaiveHandEvaluator;
+use poker::training::kuhn::{KuhnGame, KuhnInfoSet};
+use poker::training::leduc::{LeducGame, LeducInfoSet};
+use poker::training::nlhe::SimplifiedNlheGame;
+use poker::training::{
+    exploitability, EsMccfrTrainer, KuhnBestResponse, LeducBestResponse, Trainer, VanillaCfrTrainer,
+};
 use poker::{
     canonical_observation_id, Action, BucketConfig, BucketTable, Card, ChaCha20Rng, ChipAmount,
     EquityCalculator, GameState, HandEvaluator, HandHistory, InfoAbstraction, LegalActionSet,
@@ -529,4 +536,374 @@ fn sample_postflop_input(rng: &mut dyn RngSource, board_len: usize) -> ([Card; 5
         Card::from_u8(deck[board_len + 1]).expect("0..52"),
     ];
     (board, hole)
+}
+
+// ============================================================================
+// 阶段 3 §E1 §输出：stage3_* SLO 阈值断言（`pluribus_stage3_validation.md` §8 +
+// `pluribus_stage3_decisions.md` §7 D-360..D-369 + D-348）
+// ============================================================================
+//
+// 六条 stage 3 性能门槛断言（D-360 训练时长 × 2 + D-361 训练吞吐 × 2 + D-348
+// exploitability 计算 × 2），与 stage 1 / stage 2 SLO 同形态：release-only
+// opt-in via `cargo test --release --test perf_slo -- --ignored`，`#[ignore]`
+// 让 CI 默认套件不破红。E1 closure 期望部分失败（B2 / C2 朴素实现，特别是
+// D-361 多线程 SLO 在 C2 serial-fallback `step_parallel` 路径下必然失败），
+// E2 \[实现\] 优化 + D-321-rev1 真并发后必须全绿。workflow §E1 line 278 字面
+// "perf 测试不暴露新 API"。
+//
+// 角色边界：本节属 stage 3 \[测试\] agent。\[实现\] agent 不得修改。
+
+/// v3 production artifact path（D-314-rev1 lock）。与 `tests/cfr_simplified_nlhe.rs`
+/// + `benches/stage3.rs` 同 const，跨测试 / bench 共享 ground truth。
+const STAGE3_V3_ARTIFACT_PATH: &str =
+    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin";
+
+/// v3 artifact body BLAKE3 ground truth（CLAUDE.md "当前 artifact 基线"）。
+/// 用于 stage 3 NLHE SLO 测试 helper 兜底 sanity check：artifact body hash
+/// 不匹配 v3 → eprintln + skip（与 cfr_simplified_nlhe.rs 同型）。
+const STAGE3_V3_BODY_BLAKE3_HEX: &str =
+    "67ee555439f2c918698650c05f40a7a5e9e812280ceb87fc3c6590add98650cd";
+
+/// D-360 SLO #1 + #2 字面 iteration count：Kuhn / Leduc 10K iter Vanilla CFR。
+const STAGE3_CFR_ITERS: u64 = 10_000;
+
+/// D-348 BR SLO 用的 trained-trainer iter 数：BR 计算延迟与 trainer 训练程度
+/// 无关（BR 算法复杂度由 InfoSet 数量和树规模决定，不读 regret 量级），
+/// 1K iter 即可让 trainer.average_strategy 在所有 reachable InfoSet 上 populated；
+/// 训练成本 ~10 ms release，远不影响 BR 测量。
+const STAGE3_BR_TRAIN_ITERS: u64 = 1_000;
+
+/// D-361 NLHE 单线程吞吐 SLO 测量 update 数：≥ 10K update/s 下 20K updates ≈
+/// 2 s baseline，样本量稳定且不爆 ignored 套件时长。
+const STAGE3_NLHE_SINGLE_THREAD_UPDATES: u64 = 20_000;
+
+/// D-361 NLHE 4-core 吞吐 SLO 测量 update 数：≥ 50K update/s 下 50K updates ≈
+/// 1 s baseline；C2 serial-fallback `step_parallel` 路径下实测 ≈ 单线程吞吐，
+/// 期望 SLO 失败（E1 closure 形态）。
+const STAGE3_NLHE_FOUR_CORE_UPDATES: u64 = 50_000;
+
+/// 加载 v3 artifact 并构造 `SimplifiedNlheGame`；artifact 缺失 / schema 不匹配 /
+/// `SimplifiedNlheGame::new` 失败时 eprintln + 返回 `None`（pass-with-skip）。
+/// 与 `tests/cfr_simplified_nlhe.rs::load_v3_artifact_or_skip` 同型路径，避免
+/// 跨 test crate 共享 helper 引入 pub API（perf_slo 不暴露新 API per workflow
+/// §E1 line 278）。
+fn stage3_load_v3_artifact_or_skip() -> Option<SimplifiedNlheGame> {
+    let path = PathBuf::from(STAGE3_V3_ARTIFACT_PATH);
+    if !path.exists() {
+        eprintln!(
+            "[stage3-nlhe-slo] skip: v3 artifact `{STAGE3_V3_ARTIFACT_PATH}` 不存在（CI / \
+             GitHub-hosted runner 典型场景；本地 dev box / vultr / AWS host 有 artifact 时跑）。"
+        );
+        return None;
+    }
+    let table = match BucketTable::open(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[stage3-nlhe-slo] skip: BucketTable::open 失败：{e:?}");
+            return None;
+        }
+    };
+    let body_hex = stage3_blake3_hex(&table.content_hash());
+    if body_hex != STAGE3_V3_BODY_BLAKE3_HEX {
+        eprintln!(
+            "[stage3-nlhe-slo] skip: artifact body BLAKE3 `{body_hex}` 不匹配 v3 ground truth \
+             `{STAGE3_V3_BODY_BLAKE3_HEX}`（D-314-rev1 lock 要求 v3 artifact；stale v1/v2 路径 skip）。"
+        );
+        return None;
+    }
+    match SimplifiedNlheGame::new(Arc::new(table)) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[stage3-nlhe-slo] skip: SimplifiedNlheGame::new 失败：{e:?}");
+            None
+        }
+    }
+}
+
+fn stage3_blake3_hex(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+// ----------------------------------------------------------------------------
+// SLO #1：Kuhn 10K iter Vanilla CFR `< 1 s` release（D-360）
+// ----------------------------------------------------------------------------
+
+/// D-360 字面上界 `< 1 s` release for Kuhn 10K iter Vanilla CFR。
+///
+/// Vanilla CFR 在 Kuhn 上 1 iter = 1 完整博弈树 DFS × 2 traverser；Kuhn 12
+/// InfoSet × 2 action ≈ 240K node visits per 10K iter；release 下应 `< 1 s`
+/// 在任意现代 host 上达成。E1 closure 在 B2 朴素实现下大概率通过（Kuhn 树规模
+/// 小到 SLO 余量充足），E2 优化路径主要给 Leduc / NLHE。本测试是 D-360 lower
+/// bound trip-wire。
+#[test]
+#[ignore = "stage3 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage3_kuhn_10k_iter_under_1s_release() {
+    let master_seed: u64 = 0xE153_014B_5548_4EFF;
+    let mut trainer = VanillaCfrTrainer::new(KuhnGame, master_seed);
+    let mut rng = ChaCha20Rng::from_seed(master_seed);
+
+    let start = Instant::now();
+    for _ in 0..STAGE3_CFR_ITERS {
+        trainer
+            .step(&mut rng)
+            .expect("Kuhn Vanilla CFR step 期望成功（D-330 容差仅 warn 不 panic）");
+    }
+    let elapsed = start.elapsed();
+    let iters_per_sec = STAGE3_CFR_ITERS as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "[stage3-kuhn-10k] 实测 {STAGE3_CFR_ITERS} iter / {:.3} s = {iters_per_sec:.0} iter/s\
+         （SLO 门槛 ≤ 1.000 s）",
+        elapsed.as_secs_f64(),
+    );
+    assert!(
+        elapsed.as_secs_f64() < 1.0,
+        "Kuhn 10K iter Vanilla CFR 耗时 {:.3} s ≥ D-360 字面阈值 1.0 s",
+        elapsed.as_secs_f64(),
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO #2：Leduc 10K iter Vanilla CFR `< 60 s` release（D-360）
+// ----------------------------------------------------------------------------
+
+/// D-360 字面上界 `< 60 s` release for Leduc 10K iter Vanilla CFR。
+///
+/// Leduc ~288 InfoSet × 树规模 × 10K iter ≈ 数百万 node visits；release 下应
+/// `< 60 s`。E1 closure 在 B2 朴素 `HashMap<InfoSet, Vec<f64>>` 路径下可能边界
+/// 紧（具体由 host CPU + cache 决定），E2 优化方向（D-303 + D-306 `SmallVec`
+/// hot path、D-336 CDF lookup table）翻面。
+#[test]
+#[ignore = "stage3 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage3_leduc_10k_iter_under_60s_release() {
+    let master_seed: u64 = 0xE153_024C_4544_55FF;
+    let mut trainer = VanillaCfrTrainer::new(LeducGame, master_seed);
+    let mut rng = ChaCha20Rng::from_seed(master_seed);
+
+    let start = Instant::now();
+    for _ in 0..STAGE3_CFR_ITERS {
+        trainer
+            .step(&mut rng)
+            .expect("Leduc Vanilla CFR step 期望成功（D-330 容差仅 warn 不 panic）");
+    }
+    let elapsed = start.elapsed();
+    let iters_per_sec = STAGE3_CFR_ITERS as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "[stage3-leduc-10k] 实测 {STAGE3_CFR_ITERS} iter / {:.3} s = {iters_per_sec:.0} iter/s\
+         （SLO 门槛 ≤ 60.000 s）",
+        elapsed.as_secs_f64(),
+    );
+    assert!(
+        elapsed.as_secs_f64() < 60.0,
+        "Leduc 10K iter Vanilla CFR 耗时 {:.3} s ≥ D-360 字面阈值 60.0 s",
+        elapsed.as_secs_f64(),
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO #3：简化 NLHE 单线程 ES-MCCFR `≥ 10,000 update/s` release（D-361 单线程）
+// ----------------------------------------------------------------------------
+
+/// D-361 字面下界 `≥ 10,000 update/s` release 单线程 for 简化 NLHE ES-MCCFR。
+///
+/// 100M update / 10K update/s = 10,000 s ≈ 2.78 h 单 host 可行（D-342 验收门槛
+/// 100M update）。E1 closure 在 C2 朴素实现下 throughput 由 `RegretTable` HashMap
+/// hit rate + cfv 累积 alloc 模式决定，E2 优化方向（`SmallVec` / lookup-table /
+/// 借用替 clone）翻面。
+///
+/// artifact 缺失（CI 典型场景）走 eprintln + pass-with-skip（与 cfr_simplified_nlhe.rs
+/// 同型），本地 dev box / vultr / AWS host 有 artifact 时跑真实 throughput。
+#[test]
+#[ignore = "stage3 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage3_simplified_nlhe_single_thread_throughput_ge_10k_update_per_s() {
+    let Some(game) = stage3_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0xE153_034E_4C48_45FF;
+    let mut trainer = EsMccfrTrainer::new(game, master_seed);
+    let mut rng = ChaCha20Rng::from_seed(master_seed);
+
+    // warm-up 100 update：首批 update 触发 RegretTable lazy alloc，让 throughput
+    // 测量段落只反映 steady-state cost（与 stage 2 P95 SLO `sample_postflop_input`
+    // 同型 warm-up 思路）。
+    for _ in 0..100 {
+        trainer.step(&mut rng).expect("NLHE warm-up step");
+    }
+
+    let start = Instant::now();
+    for _ in 0..STAGE3_NLHE_SINGLE_THREAD_UPDATES {
+        trainer
+            .step(&mut rng)
+            .expect("NLHE ES-MCCFR step 期望成功（D-330 容差仅 warn 不 panic）");
+    }
+    let elapsed = start.elapsed();
+    let throughput = STAGE3_NLHE_SINGLE_THREAD_UPDATES as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "[stage3-nlhe-single] 实测 {STAGE3_NLHE_SINGLE_THREAD_UPDATES} update / {:.3} s = \
+         {throughput:.0} update/s（SLO 门槛 ≥ 10,000）",
+        elapsed.as_secs_f64(),
+    );
+    assert!(
+        throughput >= 10_000.0,
+        "NLHE ES-MCCFR 单线程 {throughput:.0} update/s < D-361 字面阈值 10,000 update/s\
+         （E1 closure 期望失败时由 E2 优化路径翻面）",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO #4：简化 NLHE 4-core ES-MCCFR `≥ 50,000 update/s` release（D-361 多线程）
+// ----------------------------------------------------------------------------
+
+/// D-361 字面下界 `≥ 50,000 update/s` release 4-core for 简化 NLHE ES-MCCFR
+/// （效率 ≥ 0.5）。
+///
+/// **C2 closed 时形态**：`EsMccfrTrainer::step_parallel` = serial-equivalent
+/// fallback（D-321-rev1 lock 段落 `pluribus_stage3_decisions.md` §10.2，2026-05-13）；
+/// 单次 `step_parallel(&mut [Box<dyn RngSource>; 4], 4)` = 4 顺序 `step` 调用，
+/// 实测吞吐 ≈ 单线程，SLO 期望失败。**E2 \[实现\] 落地真并发后**（D-321-rev1
+/// thread-local accumulator + batch merge）必须达成 ≥ 50K update/s。
+///
+/// host 限制：`thread::available_parallelism() < 4` 时 eprintln 提示 + return
+/// （pass-with-skip）；与 stage 1 多线程 SLO 同型 host-load skip 路径。
+#[test]
+#[ignore = "stage3 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage3_simplified_nlhe_4core_throughput_ge_50k_update_per_s() {
+    let cores_target = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if cores_target < 4 {
+        eprintln!(
+            "[stage3-nlhe-4core] skip: host 仅 {cores_target} core，< 4 core 无法验证 \
+             D-361 4-core SLO（host 强制 4-core 时跑）。"
+        );
+        return;
+    }
+    let Some(game) = stage3_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0xE153_044E_3443_52FF;
+    let mut trainer = EsMccfrTrainer::new(game, master_seed);
+    // 4 个独立 RngSource 派生自 master_seed + 不同 nonce，避免 4 线程 RNG byte-equal
+    // 导致 sampled trajectory 完全重合（D-308 sub-stream 独立性同型思路）。
+    let mut rng_pool: Vec<Box<dyn RngSource>> = (0..4u64)
+        .map(|tid| {
+            let seeded = master_seed.wrapping_add(0xDEAD_BEEF_u64.wrapping_mul(tid + 1));
+            Box::new(ChaCha20Rng::from_seed(seeded)) as Box<dyn RngSource>
+        })
+        .collect();
+
+    // warm-up 4 update（per pool size）：触发 RegretTable lazy alloc。
+    trainer
+        .step_parallel(&mut rng_pool, 4)
+        .expect("NLHE warm-up step_parallel");
+
+    // 总 update 数 = pool size × n_calls = 4 × n_calls = STAGE3_NLHE_FOUR_CORE_UPDATES。
+    let n_calls = STAGE3_NLHE_FOUR_CORE_UPDATES / 4;
+    let start = Instant::now();
+    for _ in 0..n_calls {
+        trainer
+            .step_parallel(&mut rng_pool, 4)
+            .expect("NLHE ES-MCCFR step_parallel 期望成功（C2 serial-fallback 路径）");
+    }
+    let elapsed = start.elapsed();
+    let total_updates = n_calls * 4;
+    let throughput = total_updates as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "[stage3-nlhe-4core] 实测 {total_updates} update / {:.3} s = {throughput:.0} \
+         update/s（SLO 门槛 ≥ 50,000；C2 serial-fallback 期望失败，E2 \\[实现\\] 真并发\
+         落地 D-321-rev1 thread-local accumulator + batch merge 后必须通过）",
+        elapsed.as_secs_f64(),
+    );
+    assert!(
+        throughput >= 50_000.0,
+        "NLHE ES-MCCFR 4-core {throughput:.0} update/s < D-361 字面阈值 50,000 update/s\
+         （E1 closure 期望失败；E2 真并发实现后必须通过）",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO #5：Kuhn exploitability 单次计算 `< 100 ms` release（D-348）
+// ----------------------------------------------------------------------------
+
+/// D-348 字面上界 `< 100 ms` release for Kuhn 单次 exploitability 计算。
+///
+/// `exploitability::<KuhnGame, KuhnBestResponse>` 内部走 `BR::compute` 2 次
+/// （player 0 + player 1）+ full-tree backward induction over 12 InfoSet × 2
+/// action；release 下 < 100 ms 余量充足。让 F3 \[报告\] 4 checkpoint Kuhn
+/// exploitability 实测能在 `4 × 100 ms = 400 ms` 内完成。
+///
+/// 注：trainer.average_strategy 在 BR closure 中是 hot path（每 BR 节点查
+/// HashMap 一次）；E1 closure 在 B2 朴素实现下 `< 100 ms` 一般通过，E2 优化
+/// 主要给 D-361 NLHE 吞吐。
+#[test]
+#[ignore = "stage3 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage3_kuhn_best_response_under_100ms_release() {
+    let master_seed: u64 = 0xE153_054B_4252_5FFF;
+    let mut trainer = VanillaCfrTrainer::new(KuhnGame, master_seed);
+    let mut rng = ChaCha20Rng::from_seed(master_seed);
+    // 预训练（BR 性能与 trainer 训练程度无关；populate average_strategy 让 BR
+    // closure 拿到真实 strategy 而非空 HashMap）。
+    for _ in 0..STAGE3_BR_TRAIN_ITERS {
+        trainer.step(&mut rng).expect("Kuhn pretrain step");
+    }
+    let avg_closure = |info: &KuhnInfoSet, _n: usize| trainer.average_strategy(info);
+
+    let start = Instant::now();
+    let expl = exploitability::<KuhnGame, KuhnBestResponse>(&KuhnGame, &avg_closure);
+    let elapsed = start.elapsed();
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    eprintln!(
+        "[stage3-kuhn-br] 实测 exploitability = {expl:.6} chips/game / 单次耗时 {ms:.2} ms\
+         （SLO 门槛 ≤ 100 ms）",
+    );
+    assert!(
+        expl >= 0.0,
+        "exploitability {expl} 必须非负（D-340 定义 `(BR_0 + BR_1) / 2`）",
+    );
+    assert!(
+        elapsed.as_secs_f64() < 0.100,
+        "Kuhn exploitability 单次计算耗时 {ms:.2} ms ≥ D-348 字面阈值 100 ms",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO #6：Leduc exploitability 单次计算 `< 1 s` release（D-348）
+// ----------------------------------------------------------------------------
+
+/// D-348 字面上界 `< 1 s` release for Leduc 单次 exploitability 计算。
+///
+/// `exploitability::<LeducGame, LeducBestResponse>` 内部走 `BR::compute` 2 次，
+/// 加 backward induction polynomial in InfoSet count（~288 InfoSet × 树规模）；
+/// release 下应 `< 1 s`。让 F3 \[报告\] 4 checkpoint Leduc exploitability 实测
+/// 能在 `4 × 1 s = 4 s` 内完成。
+#[test]
+#[ignore = "stage3 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage3_leduc_best_response_under_1s_release() {
+    let master_seed: u64 = 0xE153_064C_4252_5FFF;
+    let mut trainer = VanillaCfrTrainer::new(LeducGame, master_seed);
+    let mut rng = ChaCha20Rng::from_seed(master_seed);
+    for _ in 0..STAGE3_BR_TRAIN_ITERS {
+        trainer.step(&mut rng).expect("Leduc pretrain step");
+    }
+    let avg_closure = |info: &LeducInfoSet, _n: usize| trainer.average_strategy(info);
+
+    let start = Instant::now();
+    let expl = exploitability::<LeducGame, LeducBestResponse>(&LeducGame, &avg_closure);
+    let elapsed = start.elapsed();
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    eprintln!(
+        "[stage3-leduc-br] 实测 exploitability = {expl:.6} chips/game / 单次耗时 {ms:.2} ms\
+         （SLO 门槛 ≤ 1000 ms）",
+    );
+    assert!(
+        expl >= 0.0,
+        "exploitability {expl} 必须非负（D-341 同 D-340 定义）",
+    );
+    assert!(
+        elapsed.as_secs_f64() < 1.0,
+        "Leduc exploitability 单次计算耗时 {ms:.2} ms ≥ D-348 字面阈值 1000 ms",
+    );
 }

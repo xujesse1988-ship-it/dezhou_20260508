@@ -1,7 +1,8 @@
-//! 阶段 3 B1 + C1 \[测试\]：CFR / MCCFR 训练 throughput benchmark framework
+//! 阶段 3 B1 + C1 + E1 \[测试\]：CFR / MCCFR 训练 throughput benchmark framework
 //! （D-367 criterion bench）。
 //!
-//! 3 个 bench group（B1 落地 2 个 + C1 落地 1 个）：
+//! 3 个 bench group active（B1 落地 2 个 + C1 落地 1 个，E1 \[测试\] 维持 3
+//! group active + criterion measurement per workflow §E1 line 275）：
 //!
 //! 1. `stage3/kuhn_cfr_iter`（B1）：Kuhn Vanilla CFR 单 step throughput。SLO 关联
 //!    D-360（10K iter `< 1 s` release → 单 step `< 100 µs`，目标 throughput
@@ -17,12 +18,14 @@
 //!    host 上 panic）。
 //!
 //! 本文件不做 SLO 断言，仅产生 throughput 数据。SLO 阈值断言 + 严格 fail/pass
-//! 走 E1 \[测试\] 落地的 `tests/perf_slo.rs::stage3_*`（D-369）。
+//! 走 E1 \[测试\] 落地的 `tests/perf_slo.rs::stage3_*`（D-369）—— D-360 / D-361
+//! / D-348 共 6 条断言。
 //!
-//! 当前 A1 / B2 scaffold 阶段：[`VanillaCfrTrainer::step`] B2 落地、
-//! [`EsMccfrTrainer::step`] `unimplemented!()` 留 C2 \[实现\]；前两个 bench 在 B2
-//! 后转 throughput 正常，第三个 nlhe bench 在 C2 落地后转正常（与 C1
-//! `tests/cfr_simplified_nlhe.rs` active 测试同形态契约）。
+//! 当前 D2 \[实现\] 已 closed 状态：[`VanillaCfrTrainer::step`] B2 落地、
+//! [`EsMccfrTrainer::step`] C2 落地、`Checkpoint::{save,open}` D2 落地。3 个
+//! bench group 在 release profile 全部产生有效 throughput 数据；
+//! `stage3/nlhe_es_mccfr_update` 在 artifact 缺失时维持 no-op 占位（CI 无
+//! artifact host 上 `cargo bench --bench stage3` 不 panic）。
 //!
 //! 角色边界：本文件属 `[测试]` agent。`[实现]` agent 不得修改。
 
