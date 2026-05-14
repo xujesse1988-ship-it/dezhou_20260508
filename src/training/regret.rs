@@ -126,6 +126,15 @@ impl<I: Eq + Hash + Clone> RegretTable<I> {
     pub fn inner(&self) -> &HashMap<I, Vec<f64>> {
         &self.inner
     }
+
+    /// 消费 [`RegretTable`] 取出 owned HashMap（E2 \[实现\] 落地 D-321-rev1 真并发
+    /// `step_parallel` batch merge 时调用：每线程 spawn 持有独立 thread-local
+    /// `RegretTable` 作为 delta accumulator，spawn 结束后 main thread 调用本方法
+    /// 取出 owned entries → 按 InfoSet `Debug` 排序 → 顺序累加到主表）。
+    #[doc(hidden)]
+    pub(crate) fn into_inner(self) -> HashMap<I, Vec<f64>> {
+        self.inner
+    }
 }
 
 /// strategy 累积容器（API-321 / D-322）。
@@ -213,5 +222,12 @@ impl<I: Eq + Hash + Clone> StrategyAccumulator<I> {
     #[doc(hidden)]
     pub fn inner(&self) -> &HashMap<I, Vec<f64>> {
         &self.inner
+    }
+
+    /// 消费 [`StrategyAccumulator`] 取出 owned HashMap（E2 \[实现\] 落地 D-321-rev1
+    /// 真并发 `step_parallel` batch merge 入口；语义同 [`RegretTable::into_inner`]）。
+    #[doc(hidden)]
+    pub(crate) fn into_inner(self) -> HashMap<I, Vec<f64>> {
+        self.inner
     }
 }
