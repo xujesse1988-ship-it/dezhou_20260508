@@ -161,6 +161,8 @@ fn game_next_cost() {
 #[test]
 #[ignore = "diagnostic-only; release/--ignored opt-in"]
 fn info_set_postflop_cost() {
+    use poker::AbstractAction;
+
     let Some(table) = load_v3_or_skip() else {
         return;
     };
@@ -168,41 +170,53 @@ fn info_set_postflop_cost() {
     let master_seed: u64 = 0xC3_C3_C3_C3_C3_C3_C3_C3;
     let mut rng = ChaCha20Rng::from_seed(master_seed);
 
-    // walk 到 postflop（preflop deal + call + check 让 flop 出来）
+    // walk 到 postflop：每个 player turn 优先选 Check / Call（让对手不 fold），
+    // 避开 Fold 让 hand 立刻 terminate；max 100 步 safety bound。
     let mut state: SimplifiedNlheState = game.root(&mut rng);
-    let mut steps = 0;
-    loop {
-        if steps > 50 {
-            // 没走到 postflop 可能因为 chance distribution 走了 fold 路径，重 root
-            state = game.root(&mut rng);
-            steps = 0;
-            continue;
-        }
-        match SimplifiedNlheGame::current(&state) {
-            NodeKind::Chance => {
-                let dist = SimplifiedNlheGame::chance_distribution(&state);
-                let action = sample_discrete(&dist, &mut rng);
-                state = SimplifiedNlheGame::next(state, action, &mut rng);
-            }
-            NodeKind::Player(_) => {
-                let actions = SimplifiedNlheGame::legal_actions(&state);
-                if actions.is_empty() {
+    let mut found_postflop = false;
+    'outer: for _restart in 0..50 {
+        for _step in 0..100 {
+            match SimplifiedNlheGame::current(&state) {
+                NodeKind::Terminal => {
                     state = game.root(&mut rng);
-                    continue;
+                    break;
                 }
-                // 选 Call/Check 推进到下一街
-                if state.game_state.board().len() > 0 {
-                    break; // 已 postflop
+                NodeKind::Chance => {
+                    let dist = SimplifiedNlheGame::chance_distribution(&state);
+                    let action = sample_discrete(&dist, &mut rng);
+                    state = SimplifiedNlheGame::next(state, action, &mut rng);
                 }
-                state = SimplifiedNlheGame::next(state, actions[0], &mut rng);
-            }
-            NodeKind::Terminal => {
-                state = game.root(&mut rng);
-                steps = 0;
-                continue;
+                NodeKind::Player(_) => {
+                    if !state.game_state.board().is_empty() {
+                        found_postflop = true;
+                        break 'outer;
+                    }
+                    let actions = SimplifiedNlheGame::legal_actions(&state);
+                    if actions.is_empty() {
+                        state = game.root(&mut rng);
+                        break;
+                    }
+                    // 优先 Check / Call 推进；后备走 actions[0]
+                    let pick = actions
+                        .iter()
+                        .copied()
+                        .find(|a| {
+                            matches!(a, AbstractAction::Check | AbstractAction::Call { .. })
+                        })
+                        .unwrap_or(actions[0]);
+                    state = SimplifiedNlheGame::next(state, pick, &mut rng);
+                }
             }
         }
-        steps += 1;
+        if found_postflop {
+            break;
+        }
+        state = game.root(&mut rng);
+    }
+
+    if !found_postflop {
+        eprintln!("[profile] info_set_postflop: 无法 walk 到 postflop（fixture issue），skip");
+        return;
     }
 
     eprintln!(
