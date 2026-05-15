@@ -780,6 +780,38 @@ fn _stage4_api_signature_assertions() {
     let _: PluribusAction = _act;
 
     // ---------------------------------------------------------------
+    // C1 [测试] — NlheGame6 as Game trait 8 method UFCS lock（D-410 / D-411
+    // / D-420 / D-422 / D-423 字面，C2 [实现] 起步前签名漂移立即在 cargo test
+    // --no-run 暴露；A1 scaffold 8 method 全 `unimplemented!()`）。
+    // ---------------------------------------------------------------
+    let _: for<'a> fn(&'a NlheGame6) -> usize = <NlheGame6 as Game>::n_players;
+    let _: for<'a, 'b> fn(&'a NlheGame6, &'b mut dyn RngSource) -> NlheGame6State =
+        <NlheGame6 as Game>::root;
+    let _: for<'a> fn(&'a NlheGame6State) -> poker::training::game::NodeKind =
+        <NlheGame6 as Game>::current;
+    let _: for<'a> fn(&'a NlheGame6State, PlayerId) -> NlheGame6InfoSet =
+        <NlheGame6 as Game>::info_set;
+    let _: for<'a> fn(&'a NlheGame6State) -> Vec<NlheGame6Action> =
+        <NlheGame6 as Game>::legal_actions;
+    let _: for<'a> fn(NlheGame6State, NlheGame6Action, &'a mut dyn RngSource) -> NlheGame6State =
+        <NlheGame6 as Game>::next;
+    let _: for<'a> fn(&'a NlheGame6State) -> Vec<(NlheGame6Action, f64)> =
+        <NlheGame6 as Game>::chance_distribution;
+    let _: for<'a> fn(&'a NlheGame6State, PlayerId) -> f64 = <NlheGame6 as Game>::payoff;
+
+    // ---------------------------------------------------------------
+    // C1 [测试] — Checkpoint v2 schema header layout 常量 lock（API-440 /
+    // D-449 字面）。stage 3 字面 SCHEMA_VERSION = 1 / HEADER_LEN = 108；stage 4
+    // D2 [实现] 起步落地 bump 到 2 / 128，本 UFCS 仅 const ref bind 让 const
+    // 类型 / 名称漂移立即在 cargo test --no-run 暴露（实际数值由
+    // tests/checkpoint_v2_schema.rs 验证 panic-fail 直到 D2 落地）。
+    // ---------------------------------------------------------------
+    let _: u32 = poker::training::checkpoint::SCHEMA_VERSION;
+    let _: usize = poker::training::checkpoint::HEADER_LEN;
+    let _: usize = poker::training::checkpoint::TRAILER_LEN;
+    let _: [u8; 8] = poker::training::checkpoint::MAGIC;
+
+    // ---------------------------------------------------------------
     // API-401 — TrainerConfig fields + DecayStrategy enum + Default
     // ---------------------------------------------------------------
     let cfg = TrainerConfig {
