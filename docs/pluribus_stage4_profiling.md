@@ -199,3 +199,53 @@ Path A1 + A2 由 stage 4 E2 [实现] closure 后基于 AWS c7a.8xlarge 实测 pr
 ## 修订历史
 
 - **2026-05-15(profiling batch 1 落地)**:本文档首次落地。AWS c7a.8xlarge(`3.144.145.182`)实测 stage4_* SLO 8 条 + perf record 4-core × 30s + 32-vCPU × 30s flamegraph + leaf hotspot 12 项 + Root cause 两层分析 + Path A / Path B 优化方案 + 50K target 推算。`examples/profile_step_parallel.rs` 一次性 profiling 工具(不进 git history,AWS-only)。生成 SVG flamegraph 字节大小:`perf.4core.svg` 101 KB / `perf.32vcpu.svg` 77 KB。
+
+- **2026-05-15(profiling batch 2 — Path A 实施后复测,root cause hypothesis 验证)**:Path A(A1 + A2)commit `ddd91cd` 落地后在同一 AWS c7a.8xlarge host 重测 perf record 4-core × 30s batch=8 + 32-vCPU × 30s batch=8。free-running throughput:4-core 21,871 update/s / 32-vCPU 66,116 update/s;**perf-recording throughput**(stack sampling 引入 ~20% overhead):4-core 21,834 / 32-vCPU 52,561 update/s。
+
+  **A2 rayon coordination overhead 大幅下降(验证)**:
+
+  | 函数 | 4-core baseline | 4-core A1+A2 | Δ pp | 32-vCPU baseline | 32-vCPU A1+A2 | Δ pp |
+  |---|---|---|---|---|---|---|
+  | `crossbeam_epoch::with_handle` | 9.89% | **2.73%** | **-7.2** | 9.36% | **2.04%** | **-7.3** |
+  | `crossbeam_epoch::try_advance` | 7.54% | 2.48% | -5.0 | 4.74% | < 1% | -3.7+ |
+  | `crossbeam_deque::Stealer::steal` | 3.64% | < 1% | -2.6+ | 3.38% | < 1% | -2.4+ |
+  | `__sched_yield` | 8.49% | **2.85%** | **-5.6** | 6.71% | **2.08%** | **-4.6** |
+  | `[k]` kernel sched(top entry) | 14.04% | **5.09%** | **-9.0** | 10.60% | **3.11%** | **-7.5** |
+  | **协调开销小计** | **~43.6%** | **~13.2%** | **-30.4** | **~34.8%** | **~7.2%** | **-27.6** |
+
+  Path A2 amortize-per-call hypothesis 完全兑现 — batch=8 让 step_parallel 调用频率从 4-core 2,167/s → 273/s / 32-vCPU 817/s → 102/s,crossbeam epoch GC + Stealer + sched_yield per-call 协调开销摊薄 8×。
+
+  **A1 legal_actions hoist(验证)**:
+
+  | 函数 | baseline | A1+A2 | Δ pp |
+  |---|---|---|---|
+  | `PluribusActionAbstraction::is_legal` | 7.89% / 10.33% | inlined into `actions()` | — |
+  | `GameState::legal_actions` | 3.66% / 6.04% | **< 1% / 1.53%** | **-2.7 / -4.5** |
+  | `PluribusActionAbstraction::actions`(合并后) | < 1%(隐藏 inline) | **10.94% / 13.46%** | +10+ |
+
+  `actions()` 占比从隐藏(被 inline 在 is_legal 内)变成显式 ~11-13%,这是 legitimate cost(枚举 14 个 PluribusAction + Vec 构造 + 14 个 legal check 短路)。`is_legal` 公开符号从 leaf hotspot 消失 → 被 `actions()` inline 了 `is_legal_cached` 私有 helper 进。`legal_actions` 占比从 ~5% 降到 ~1-1.5% → 14× → 1× hoist 兑现。
+
+  **A1+A2 后 leaf hotspot 主要是 legitimate CFR 计算**:
+
+  | 4-core batch=8 | 32-vCPU batch=8 |
+  |---|---|
+  | 10.94% `actions()` | 13.46% `actions()` |
+  | 5.68% `current_strategy_smallvec`(CFR core) | 5.51% `current_strategy_smallvec` |
+  | 5.09% `[k]` kernel | 4.78% `GameState::apply` |
+  | 3.87% `GameState::apply` | 3.85% `malloc` |
+  | 3.70% `quicksort<u128>`(InfoSet sort) | 3.58% `recurse_es_parallel` |
+  | 3.04% `GameState::finalize_terminal` | 3.39% `NlheGame6State::clone` |
+  | 2.92% `canonical_observation_id` | 3.33% `GameState::finalize_terminal` |
+  | 2.92% `recurse_es_parallel` | 3.11% `[k]` kernel |
+  | 2.85% `__sched_yield` | 3.01% `NlheGame6::info_set` |
+  | 2.83% `malloc` | 2.84% `cfree` |
+
+  剩余优化空间(Path B 候选):
+  - **`malloc`/`cfree` 6.7%**:Vec / SmallVec spillover + RegretTable HashMap allocations,FxHashMap + capacity hint 可减少;Path B4 候选(+2-5%)
+  - **`actions()` 11-13%**:legitimate 但可改成 `&[PluribusAction; 14]` const array + bitmask 返回避免 Vec 构造;~3-5% 节省
+  - **`NlheGame6State::clone` 2-3%**:每 traversal action 应用前 clone 整个 state,可改成 undo stack 模式;~2-3% 节省
+  - **`quicksort<u128>`(InfoSet sort)2.9-3.7%**:小 N(typically ≤ 14)用 sort network 替代;~2% 节省
+
+  Path B 全部 deferred 到 stage 4 F3 [报告] 闭合后 + 用户授权评估(继承 D-441-rev0 同型 deferred 政策)。Path A 已远超 50K target,Path B 不在 stage 4 主线时间预算内。
+
+  Flamegraph SVG:`~/dezhou_20260508/perf.4core.bs8.svg`(55 KB) + `perf.32vcpu.bs8.svg`(45 KB)on AWS host;本地 `/tmp/profile_results/perf.{4core,32vcpu}.bs8.svg`。SVG 字节数从 baseline 101 KB / 77 KB 降到 55 KB / 45 KB,反映 rayon work-stealing 状态机派生的多变 stack 显著简化。
