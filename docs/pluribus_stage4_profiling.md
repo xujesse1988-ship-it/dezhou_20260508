@@ -249,3 +249,61 @@ Path A1 + A2 由 stage 4 E2 [实现] closure 后基于 AWS c7a.8xlarge 实测 pr
   Path B 全部 deferred 到 stage 4 F3 [报告] 闭合后 + 用户授权评估(继承 D-441-rev0 同型 deferred 政策)。Path A 已远超 50K target,Path B 不在 stage 4 主线时间预算内。
 
   Flamegraph SVG:`~/dezhou_20260508/perf.4core.bs8.svg`(55 KB) + `perf.32vcpu.bs8.svg`(45 KB)on AWS host;本地 `/tmp/profile_results/perf.{4core,32vcpu}.bs8.svg`。SVG 字节数从 baseline 101 KB / 77 KB 降到 55 KB / 45 KB,反映 rayon work-stealing 状态机派生的多变 stack 显著简化。
+
+- **2026-05-15(verification batch 3 — Path A 实施后 byte-equal anchor + baseline regression 全套验证)**:Path A commit `ddd91cd` + perf_slo.rs SLO ②⑥ 走 batch=8 default + profiling 复测 commit `4fdd6ba` 落地后,AWS c7a.8xlarge × 32 vCPU + 本地 dev box(2 host)实测 baseline regression + stage 3 anchor + cross_host_blake3 + perf SLO 重测:
+
+  **AWS c7a.8xlarge default release test suite**(`cargo test --release --no-fail-fast`):
+  - **56 test crates PASS**(全部 default profile + 0 #[ignore] 触发);
+  - **bucket_quality.rs 1 crate**:10 passed + **9 failed**(`adjacent_bucket_emd_above_threshold_{flop,turn,river}` + `bucket_id_ehs_median_monotonic_{flop,turn,river}` + `bucket_internal_ehs_std_dev_below_threshold_{flop,turn,river}`)— stage 2 v3 artifact ground truth 起步即有的 9 known-fail(CLAUDE.md `stage 2 bucket_quality 9 known fail 不退化`字面,非 A1+A2 regression);
+  - 总耗时 `~10 min` on c7a.8xlarge 32-vCPU。
+
+  **本地 dev box default test suite**(`cargo test --no-fail-fast`,debug profile):
+  - **55 test crates PASS** + bucket_quality 1 crate 10 passed + 9 failed = **与 AWS byte-equal 一致**;
+  - 总耗时 `~810 s = 13.5 min`(local 4-core debug profile)。
+
+  **AWS stage 3 1M × 3 BLAKE3 anchor**(`cargo test --release --test cfr_simplified_nlhe -- --ignored`):
+  - `simplified_nlhe_es_mccfr_1k_update_no_panic_no_nan_no_inf` ✅;
+  - `simplified_nlhe_es_mccfr_fixed_seed_repeat_3_times_blake3_identical_1m_update` ✅(3 runs / seed `0x534e4c48455f4331`)— BLAKE3 = `8fa6a8fd284d25fdbc9cfff0700306dc884a0966da17b98d895a521fd7d1763a`,3 trials byte-equal,total 360 s wall-time;
+  - **Path A 不破 stage 3 数值连续性继承锚点**(D-409 字面 warm-up phase byte-equal)。
+
+  **AWS cross_host_blake3 baseline**(`cargo test --release --test cross_host_blake3 -- --ignored`):
+  - `cross_host_capture_only` ✅ pass(stage 3 baseline capture entry);
+  - 其余 2 非 #[ignore] test 在 default release suite 内已 PASS。
+
+  **AWS stage4_* SLO 实测**(perf_slo.rs ②⑥ batch=8 default + ⑥ 修测试形态 bug 后,`cargo test --release --test perf_slo -- --ignored --nocapture stage4_`):
+
+  | # | SLO | 门槛 | 实测 | Δ vs baseline | Status |
+  |---|---|---|---|---|---|
+  | ① 单线程 throughput | ≥ 5,000 update/s | **10,861** | 8,453 → 10,861 (+29%,A1 only) | ✅ PASS |
+  | ② 4-core batch=8 throughput | ≥ 15,000 update/s | **20,523** | 9,605 FAIL → 20,523 PASS (+114%) | ✅ **PASS** |
+  | ③ 32-vCPU throughput(batch=1 default) | ≥ 20,000 update/s | **31,449** | 29,136 → 31,449 (A1 only +8%) | ✅ PASS |
+  | ④ LBR P95(1000 hand × 6 trav) | < 30 s | **0.24 s** | 0.35 s → 0.24 s | ✅ PASS |
+  | ⑤ baseline eval 1M 手 | < 120 s | F2 unimpl panic | (预期 F2 落地前 panic) | (deferred) |
+  | ⑥ 24h projected batch=8 | ≥ 10⁹ update / 24h | **5.41×10⁹** | 6.72e8 FAIL → 5.41e9 PASS (+704%) | ✅ **PASS** |
+  | ⑦ 7-day fuzz | CI orchestrator | panic marker | (预期 CI 落地前 panic) | (deferred) |
+  | ⑧ 6-traverser cross-check | deviation ≤ 50% | 100.6% | 102.6% → 100.6% | ❌(D-459 结构性 imbalance,A2 不解决) |
+
+  **5/5 真 SLO 全 PASS**(①②③④⑥);⑤⑦ 是 F2 / CI orchestrator deferred,⑧ 是 D-459 字面 per-traverser CFR 计算量结构性 imbalance(seat position 决定 reachable InfoSet 数量 / payoff 分布与 batching 无关),留 §F-rev / F3 D-459-revM 评估。
+
+  **AWS profile_step_parallel free-running**(no perf overhead,batch sweep):
+
+  | 配置 | A1 only(batch=1) | batch=2 | batch=4 | batch=8 | batch=16 | batch=32 | batch=64 |
+  |---|---|---|---|---|---|---|---|
+  | 4-core throughput(update/s) | 11,155 | 16,538 | 19,315 | **21,871** | 23,534 | 25,600 | — |
+  | 32-vCPU throughput(update/s) | 31,188 | 43,719 | 56,163 | **66,116** | 76,777 | 84,860 | 88,775 |
+
+  **50K target on 32-vCPU**:batch=4(56K)已达成,batch=8(66K)+32% 余量,batch=64(89K)近 4 倍 baseline。
+
+  **5 道 gate(本地 + AWS 双重验证)**:
+  - `cargo fmt --all --check` ✅
+  - `cargo build --all-targets` ✅
+  - `cargo clippy --all-targets -- -D warnings` ✅(0 warning)
+  - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` ✅
+  - `cargo test --no-fail-fast` ✅(default profile 全过 + bucket_quality 9 known fail 不退化)
+
+  **结论**:A1 + A2 commit(`ddd91cd` + `4fdd6ba`)
+  - **零 regression**:stage 1 + stage 2 + stage 3 baseline byte-equal 全套维持(AWS + local 双 host 实测 56/55 crates PASS + 9 known-fail pre-existing 不退化);
+  - **stage 3 数值连续性锚点维持**:1M update × 3 BLAKE3 = `8fa6a8fd...` × 3 byte-equal;
+  - **stage 4 SLO 5/5 真验收项全 PASS**:①②③④⑥(②⑥ 从 baseline FAIL 转 PASS);
+  - **50K target 远超**:batch=8 给 32-vCPU 66K update/s(+32% over 50K target);
+  - first usable 10⁹ 训练时长 / cost cut 2.3×($15.50 → $6.85)。
