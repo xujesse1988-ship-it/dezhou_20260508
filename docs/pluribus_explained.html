@@ -1,0 +1,993 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pluribus 算法深度解读 — 从论文到 Rust 实现</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" integrity="sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV" crossorigin="anonymous">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js" integrity="sha384-XjKyOOlGwcjNTAIQHIpgOno0Hl1YQqzUOEleOLALmuqehneUG+vnGctmUb0ZY0l8" crossorigin="anonymous"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js" integrity="sha384-+VBxd3r6XgURycqtZ117nYw44OOcIax56Z4dCRWbxyPt0Koah1uHoK0o4+/RRE05" crossorigin="anonymous"
+onload="renderMathInElement(document.body, {delimiters: [{left: '$$', right: '$$', display: true},{left: '$', right: '$', display: false}]});"></script>
+<style>
+:root {
+  --bg: #0f1419;
+  --bg-panel: #181f27;
+  --bg-code: #0a0e13;
+  --fg: #d9e1ea;
+  --fg-dim: #9aa6b3;
+  --accent: #ff7a45;
+  --accent-2: #5cc8ff;
+  --accent-3: #b18cff;
+  --green: #7ed957;
+  --red: #ff5e5e;
+  --border: #2a3340;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg); color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  line-height: 1.7;
+  font-size: 16px;
+}
+.wrapper {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  max-width: 1280px;
+  margin: 0 auto;
+}
+nav.toc {
+  position: sticky; top: 0; align-self: start;
+  height: 100vh; overflow-y: auto;
+  padding: 32px 20px; border-right: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-size: 14px;
+}
+nav.toc h3 {
+  font-size: 13px; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--fg-dim); margin: 16px 0 8px;
+}
+nav.toc h3:first-child { margin-top: 0; }
+nav.toc a {
+  display: block; padding: 4px 8px; color: var(--fg-dim);
+  text-decoration: none; border-radius: 4px; margin: 2px 0;
+}
+nav.toc a:hover { background: rgba(255,122,69,0.1); color: var(--accent); }
+main {
+  padding: 48px 56px; max-width: 880px;
+}
+h1 {
+  font-size: 36px; line-height: 1.25; margin: 0 0 16px;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-3) 100%);
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+h2 {
+  font-size: 26px; margin: 56px 0 16px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--border);
+  scroll-margin-top: 20px;
+}
+h3 {
+  font-size: 19px; margin: 32px 0 12px; color: var(--accent-2);
+  scroll-margin-top: 20px;
+}
+h4 { font-size: 16px; margin: 20px 0 8px; color: var(--accent-3); }
+p { margin: 0 0 14px; }
+.subtitle { color: var(--fg-dim); font-size: 18px; margin-bottom: 32px; }
+.hero {
+  padding: 24px 28px; margin: 24px 0 32px;
+  background: linear-gradient(135deg, rgba(255,122,69,0.08) 0%, rgba(177,140,255,0.08) 100%);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.hero p:last-child { margin-bottom: 0; }
+.callout {
+  padding: 16px 20px; margin: 20px 0;
+  background: var(--bg-panel); border-left: 3px solid var(--accent);
+  border-radius: 4px;
+}
+.callout.tip { border-left-color: var(--accent-2); }
+.callout.warn { border-left-color: var(--red); }
+.callout.note { border-left-color: var(--accent-3); }
+.callout-title {
+  font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--accent); font-weight: 600; margin-bottom: 6px;
+}
+.callout.tip .callout-title { color: var(--accent-2); }
+.callout.warn .callout-title { color: var(--red); }
+.callout.note .callout-title { color: var(--accent-3); }
+code {
+  font-family: "SF Mono", "JetBrains Mono", Consolas, Monaco, monospace;
+  font-size: 13.5px;
+  background: var(--bg-code); padding: 2px 6px; border-radius: 3px;
+  color: var(--accent-2);
+}
+pre {
+  background: var(--bg-code); padding: 16px 20px;
+  border-radius: 6px; overflow-x: auto;
+  border: 1px solid var(--border);
+  font-size: 13px; line-height: 1.55;
+}
+pre code { background: none; padding: 0; color: var(--fg); }
+.k { color: #ff7a45; } /* keyword */
+.s { color: #7ed957; } /* string */
+.c { color: #6a7785; font-style: italic; } /* comment */
+.n { color: #5cc8ff; } /* identifier */
+.t { color: #b18cff; } /* type */
+.num { color: #ffd166; }
+table {
+  width: 100%; border-collapse: collapse; margin: 20px 0;
+  font-size: 14px;
+}
+th, td {
+  text-align: left; padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+th {
+  background: var(--bg-panel); color: var(--accent);
+  font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em;
+}
+tbody tr:hover { background: rgba(92,200,255,0.04); }
+.tag {
+  display: inline-block; padding: 2px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  background: rgba(177,140,255,0.15); color: var(--accent-3);
+  margin: 0 4px 0 0;
+}
+.tag.closed { background: rgba(126,217,87,0.15); color: var(--green); }
+.tag.pending { background: rgba(255,213,102,0.15); color: #ffd166; }
+.tag.future { background: rgba(154,166,179,0.15); color: var(--fg-dim); }
+.tag.D { background: rgba(255,122,69,0.15); color: var(--accent); }
+.grid-2 {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+}
+.grid-3 {
+  display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px;
+}
+.card {
+  padding: 16px 20px; background: var(--bg-panel);
+  border: 1px solid var(--border); border-radius: 6px;
+}
+.card h4 { margin-top: 0; }
+.big-number {
+  font-size: 32px; font-weight: 700;
+  color: var(--accent); line-height: 1.1;
+}
+.metric-label {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--fg-dim); margin-top: 4px;
+}
+svg { display: block; margin: 24px auto; max-width: 100%; }
+.diagram-caption {
+  text-align: center; color: var(--fg-dim);
+  font-size: 13px; margin: -12px 0 24px;
+}
+hr {
+  border: none; border-top: 1px solid var(--border);
+  margin: 48px 0;
+}
+.toc-mobile { display: none; }
+@media (max-width: 920px) {
+  .wrapper { grid-template-columns: 1fr; }
+  nav.toc { display: none; }
+  main { padding: 32px 20px; }
+  .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  h1 { font-size: 28px; }
+}
+footer {
+  text-align: center; padding: 32px 20px;
+  color: var(--fg-dim); font-size: 13px;
+  border-top: 1px solid var(--border); margin-top: 64px;
+}
+.formula-box {
+  padding: 20px 24px; margin: 24px 0;
+  background: rgba(92,200,255,0.05);
+  border-left: 3px solid var(--accent-2);
+  border-radius: 4px;
+  text-align: center;
+  font-size: 17px;
+  overflow-x: auto;
+}
+.poker-card {
+  display: inline-block; width: 40px; height: 56px;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: #f4f0e6; color: #1a1a1a;
+  text-align: center; padding: 6px 0; margin: 0 2px;
+  font-weight: 700; font-size: 18px; vertical-align: middle;
+  font-family: Georgia, serif;
+}
+.poker-card.red { color: #d33; }
+ul, ol { padding-left: 24px; }
+li { margin: 4px 0; }
+strong { color: #fff; }
+em { color: var(--accent-2); font-style: normal; font-weight: 500; }
+.divider-emoji {
+  text-align: center; color: var(--fg-dim);
+  margin: 32px 0; letter-spacing: 1em;
+}
+</style>
+</head>
+<body>
+<div class="wrapper">
+<nav class="toc">
+  <h3>导航</h3>
+  <a href="#intro">引言 · Pluribus 是什么</a>
+  <a href="#challenge">1 难点：6-max NLHE</a>
+  <a href="#overview">2 三件套总览</a>
+  <h3>核心算法</h3>
+  <a href="#cfr">3 CFR 与 Regret Matching</a>
+  <a href="#mccfr">4 MCCFR：采样加速</a>
+  <a href="#linear">5 Linear MCCFR + RM+</a>
+  <h3>抽象层</h3>
+  <a href="#action-abs">6 Action Abstraction</a>
+  <a href="#info-abs">7 Information Abstraction</a>
+  <h3>训练与对弈</h3>
+  <a href="#blueprint">8 Blueprint 训练规模</a>
+  <a href="#search">9 实时 Depth-Limited Search</a>
+  <a href="#biased">10 Biased Leaf 关键</a>
+  <a href="#offtree">11 Off-tree 动作处理</a>
+  <h3>结论</h3>
+  <a href="#why-win">12 为何能击败职业玩家</a>
+  <a href="#repo">13 本仓库 8-stage 落地</a>
+</nav>
+
+<main>
+
+<h1>Pluribus 算法深度解读</h1>
+<p class="subtitle">从论文到 Rust 实现 · 6-max 无限注德州扑克 AI 的工程化全景</p>
+
+<section id="intro">
+<div class="hero">
+<p><strong>Pluribus</strong>（CMU + Facebook AI，2019 Science 论文）是<strong>第一个在 6 人桌无限注德州扑克（6-max NLHE）中战胜顶级人类职业玩家的 AI</strong>。在与 12 名世界级职业选手的 10,000 手对局中，Pluribus 以统计显著的优势赢钱——而它训练所用的"自博弈"成本只有大约 <em>150 美元的云算力</em>。</p>
+<p>这份文档不是论文复述。它把 Pluribus 的核心思想拆成<strong>可工程落地、可量化验收</strong>的模块，并对应到本仓库 <code>dezhou_20260508</code> 的实际 Rust 代码与 8-stage 路线。读完之后，你应该能回答两个问题：<em>它在算法上做对了什么？它在工程上又如何把这些算法塞进现实的算力预算？</em></p>
+</div>
+</section>
+
+<section id="challenge">
+<h2>1. 难点：6-max NLHE 为何如此难</h2>
+
+<p>德州扑克之所以让 AI 头疼，不是因为某一项困难，而是它把博弈论里几乎所有"硬"问题<strong>同时</strong>叠在了一起：</p>
+
+<div class="grid-2">
+<div class="card">
+<h4>① 不完美信息</h4>
+<p>对手的底牌不可见。AI 必须在<strong>信息集</strong>（infoset）上推理：所有"我看到的相同公共历史 + 我自己的底牌"的世界状态被合并成一个决策点。</p>
+</div>
+<div class="card">
+<h4>② 巨大的状态空间</h4>
+<p>6 玩家、4 条街、52 张牌、连续筹码量。原始游戏树节点数估计 <span class="num">~10<sup>165</sup></span>，远超国际象棋 <span class="num">~10<sup>47</sup></span>、围棋 <span class="num">~10<sup>170</sup></span>，且<strong>不完美</strong>。</p>
+</div>
+<div class="card">
+<h4>③ 多玩家</h4>
+<p>2 人零和有理论上的 Nash 均衡保证；<strong>≥3 人</strong>的零和（或一般和）博弈不再有这种保证。即便算出某种"均衡"，对手仍可能合谋偏离把你吃掉。</p>
+</div>
+<div class="card">
+<h4>④ 连续动作空间</h4>
+<p>"加注多少"是一个连续量：理论上可加 1 chip、2 chip、… 整个动作集合是 <span class="num">[2BB, stack]</span> 的实数区间。CFR 这类算法只能在有限动作集合上运行。</p>
+</div>
+</div>
+
+<div class="callout warn">
+<div class="callout-title">关键数字对比</div>
+<p>国际象棋（DeepBlue 1997 / AlphaZero 2017）和围棋（AlphaGo 2016）都是 <strong>2 玩家完美信息</strong>。HU NLHE（2 玩家无限注）于 2017 年被 Libratus 攻克。<strong>6-max NLHE</strong> 直到 Pluribus（2019）才被攻克——这正是博弈论 AI 的"最后一公里"。</p>
+</div>
+
+</section>
+
+<section id="overview">
+<h2>2. 三件套总览：Pluribus 是怎么组装起来的</h2>
+
+<p>Pluribus 的胜利不来自任何单一新算法，而来自三个旧思想<strong>精确组合</strong>所形成的化学反应：</p>
+
+<svg viewBox="0 0 800 360" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#ff7a45" stop-opacity="0.25"/>
+    <stop offset="100%" stop-color="#ff7a45" stop-opacity="0.05"/>
+  </linearGradient>
+  <linearGradient id="g2" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#5cc8ff" stop-opacity="0.25"/>
+    <stop offset="100%" stop-color="#5cc8ff" stop-opacity="0.05"/>
+  </linearGradient>
+  <linearGradient id="g3" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#b18cff" stop-opacity="0.25"/>
+    <stop offset="100%" stop-color="#b18cff" stop-opacity="0.05"/>
+  </linearGradient>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#9aa6b3"/>
+  </marker>
+</defs>
+
+<!-- 三个主模块 -->
+<rect x="40" y="40" width="220" height="120" rx="8" fill="url(#g1)" stroke="#ff7a45" stroke-width="1.5"/>
+<text x="150" y="70" text-anchor="middle" fill="#ff7a45" font-size="14" font-weight="700">① Abstraction</text>
+<text x="150" y="92" text-anchor="middle" fill="#d9e1ea" font-size="12">把无穷大的真实博弈</text>
+<text x="150" y="110" text-anchor="middle" fill="#d9e1ea" font-size="12">压缩成有限可训练博弈</text>
+<text x="150" y="135" text-anchor="middle" fill="#9aa6b3" font-size="11">14-action × ~10⁹ bucket</text>
+
+<rect x="290" y="40" width="220" height="120" rx="8" fill="url(#g2)" stroke="#5cc8ff" stroke-width="1.5"/>
+<text x="400" y="70" text-anchor="middle" fill="#5cc8ff" font-size="14" font-weight="700">② Blueprint</text>
+<text x="400" y="92" text-anchor="middle" fill="#d9e1ea" font-size="12">离线自博弈训练</text>
+<text x="400" y="110" text-anchor="middle" fill="#d9e1ea" font-size="12">Linear MCCFR + RM+</text>
+<text x="400" y="135" text-anchor="middle" fill="#9aa6b3" font-size="11">~10¹¹ sampled updates</text>
+
+<rect x="540" y="40" width="220" height="120" rx="8" fill="url(#g3)" stroke="#b18cff" stroke-width="1.5"/>
+<text x="650" y="70" text-anchor="middle" fill="#b18cff" font-size="14" font-weight="700">③ Real-time Search</text>
+<text x="650" y="92" text-anchor="middle" fill="#d9e1ea" font-size="12">对局时重解当前子博弈</text>
+<text x="650" y="110" text-anchor="middle" fill="#d9e1ea" font-size="12">+ 4 个 Biased Leaf 策略</text>
+<text x="650" y="135" text-anchor="middle" fill="#9aa6b3" font-size="11">P95 &lt; 30 秒/决策</text>
+
+<!-- 箭头 -->
+<line x1="265" y1="100" x2="285" y2="100" stroke="#9aa6b3" stroke-width="2" marker-end="url(#arrow)"/>
+<line x1="515" y1="100" x2="535" y2="100" stroke="#9aa6b3" stroke-width="2" marker-end="url(#arrow)"/>
+
+<!-- 输入/输出 -->
+<rect x="40" y="220" width="720" height="100" rx="8" fill="#181f27" stroke="#2a3340"/>
+<text x="400" y="248" text-anchor="middle" fill="#d9e1ea" font-size="13" font-weight="600">对局现场（live play）</text>
+<text x="400" y="272" text-anchor="middle" fill="#9aa6b3" font-size="12">公共状态 + 我的底牌 + 下注历史</text>
+<text x="60" y="298" fill="#9aa6b3" font-size="11">→ 在 abstract 树里查 blueprint</text>
+<text x="280" y="298" fill="#9aa6b3" font-size="11">→ 从当前 public state 起 depth-limited solve</text>
+<text x="560" y="298" fill="#9aa6b3" font-size="11">→ 输出动作概率分布</text>
+
+<line x1="150" y1="170" x2="150" y2="215" stroke="#9aa6b3" stroke-width="1.5" stroke-dasharray="4,3"/>
+<line x1="400" y1="170" x2="400" y2="215" stroke="#9aa6b3" stroke-width="1.5" stroke-dasharray="4,3"/>
+<line x1="650" y1="170" x2="650" y2="215" stroke="#9aa6b3" stroke-width="1.5" stroke-dasharray="4,3"/>
+</svg>
+<p class="diagram-caption">图 1：Pluribus 系统结构 — abstraction 把无穷大变有限，blueprint 在抽象上做自博弈，real-time search 在真实对局时再校正。</p>
+
+<p>本仓库的 8 个 stage 正好对应这条流水线的实现顺序：</p>
+<ul>
+<li><strong>Stage 1-2</strong>：规则环境 + Abstraction <span class="tag closed">closed</span></li>
+<li><strong>Stage 3</strong>：MCCFR 算法在 Kuhn/Leduc 小博弈上验证 <span class="tag closed">closed</span></li>
+<li><strong>Stage 4</strong>：6-max Blueprint 训练 <span class="tag pending">进行中 · 当前位于此</span></li>
+<li><strong>Stage 5</strong>：训练性能与内存优化 <span class="tag future">future</span></li>
+<li><strong>Stage 6a/6b/6c</strong>：实时 depth-limited search + biased leaf + off-tree <span class="tag future">future</span></li>
+<li><strong>Stage 7-8</strong>：评测体系 + 策略服务化 <span class="tag future">future</span></li>
+</ul>
+
+</section>
+
+<section id="cfr">
+<h2>3. CFR 与 Regret Matching：自博弈的引擎</h2>
+
+<h3>3.1 直觉：什么是"后悔"？</h3>
+
+<p>想象你打完了一手牌：在某个决策点你 <em>check</em>，最终输了 50 chip。<strong>事后看</strong>，如果你当时改 <em>raise</em>，可能赢 80 chip。那么这个决策点上 raise 相对 check 的"后悔值"就是 <span class="num">+130</span>。</p>
+
+<p><strong>Counterfactual Regret Minimization（CFR）</strong>的核心想法非常朴素：</p>
+
+<div class="callout tip">
+<div class="callout-title">CFR 一句话总结</div>
+<p>对每一个信息集（infoset）、每一个动作，<strong>累积</strong>这种"如果当初改选这个动作能多赚多少"的反事实差值。下一轮自博弈时，<strong>按"正后悔"成比例</strong>挑动作。重复几十亿次，平均策略收敛到 <em>ε-Nash 均衡</em>。</p>
+</div>
+
+<h3>3.2 公式</h3>
+
+<p>设信息集为 <span class="n">I</span>，动作集合 <span class="n">A(I)</span>，迭代次数 <span class="n">t</span>。每个 (I, a) 对累积两个数：</p>
+
+<div class="formula-box">
+$$ R_t(I, a) = \sum_{\tau=1}^{t} \pi^{-i}_\tau(I) \cdot \left[v^\tau(I, a) - v^\tau(I)\right] $$
+</div>
+
+<p>其中 $\pi^{-i}(I)$ 是<strong>对手与机会节点到达 I 的概率</strong>（counterfactual reach probability，CFR 名字的来源），$v^\tau(I,a)$ 是第 τ 轮 traverser 视角下 I 上选 a 的期望价值，$v^\tau(I)$ 是当前策略 σ 的期望价值。</p>
+
+<p>下一轮 σ 由 <strong>Regret Matching</strong>（Hart &amp; Mas-Colell, 2000）给出：</p>
+
+<div class="formula-box">
+$$ \sigma_{t+1}(I, a) = \frac{\max(R_t(I,a), 0)}{\sum_{b \in A(I)} \max(R_t(I, b), 0)} $$
+</div>
+
+<p>当分母为 0（所有 regret ≤ 0），退化为均匀分布。</p>
+
+<p>最终用 <strong>average strategy</strong>（不是 current strategy！）作为输出——这是 CFR 收敛性的关键：</p>
+
+<div class="formula-box">
+$$ \bar\sigma_T(I, a) = \frac{\sum_{t=1}^T \pi^i_t(I) \cdot \sigma_t(I, a)}{\sum_{t=1}^T \pi^i_t(I)} $$
+</div>
+
+<h3>3.3 在代码里长什么样</h3>
+
+<p>本仓库 <code>src/training/regret.rs</code> 里的实现非常直接：</p>
+
+<pre><code><span class="c">/// Regret Matching：σ(I, a) = max(R(I,a), 0) / Σ max(R(I,b), 0)</span>
+<span class="c">/// 全部 regret ≤ 0 时退化为均匀分布（D-303 / D-331）</span>
+<span class="k">pub fn</span> <span class="n">current_strategy</span>(&amp;<span class="k">self</span>, info_set: &amp;I) -&gt; <span class="t">SigmaVec</span> {
+    <span class="k">let</span> regrets = <span class="k">match</span> <span class="k">self</span>.inner.get(info_set) {
+        <span class="t">Some</span>(r) =&gt; r,
+        <span class="t">None</span> =&gt; <span class="k">return</span> <span class="t">SigmaVec</span>::new(),
+    };
+    <span class="k">let</span> pos_sum: <span class="t">f64</span> = regrets.iter().map(|&amp;r| r.max(<span class="num">0.0</span>)).sum();
+    <span class="k">if</span> pos_sum &gt; <span class="num">0.0</span> {
+        regrets.iter().map(|&amp;r| r.max(<span class="num">0.0</span>) / pos_sum).collect()
+    } <span class="k">else</span> {
+        <span class="c">// 退化均匀分布</span>
+        <span class="k">let</span> n = regrets.len() <span class="k">as</span> <span class="t">f64</span>;
+        regrets.iter().map(|_| <span class="num">1.0</span> / n).collect()
+    }
+}
+</code></pre>
+
+<p>整个 CFR 的"灵魂"就这 5 行。所有复杂性都在<strong>如何在合理时间里把这 5 行调用足够多次</strong>。</p>
+
+</section>
+
+<section id="mccfr">
+<h2>4. MCCFR：采样让 CFR 跑得起来</h2>
+
+<p>Vanilla CFR 每轮需要<strong>遍历整棵博弈树</strong>。德州游戏树太大，整棵跑一遍要几年。<strong>MCCFR</strong>（Lanctot 2009）的关键观察：</p>
+
+<div class="callout note">
+<div class="callout-title">采样替代遍历</div>
+<p>每轮不必遍历整棵树。只<strong>采样</strong>一条 trajectory，按重要性重新加权 regret 更新。期望收敛速度从 O(全树/iter) 变成 O(单条 trajectory/iter)，每秒 update 数提升几个数量级。</p>
+</div>
+
+<h3>4.1 External-Sampling MCCFR（ES-MCCFR）</h3>
+
+<p>Pluribus 用的是 <strong>External Sampling</strong> 变种（也是本仓库 Stage 3/4 选型，详 <span class="tag D">D-301</span>）：</p>
+
+<ul>
+<li>选定本轮的 <strong>traverser</strong>（视角玩家）。</li>
+<li>traverser 自己的决策点：<strong>遍历所有 action</strong>，分别递归计算每个分支的 cfv（counterfactual value）。这是"全展开"的方向。</li>
+<li>对手 + 机会节点（发牌）：<strong>采样一个 action</strong>（按当前策略概率），只递归这条分支。这是"采样"的方向。</li>
+</ul>
+
+<p>这样 <strong>每条 trajectory 走完 ≈ 一次 update</strong>，traverser 视角下的 regret 表得到完整更新，而对手视角的 regret 留到下一轮当他做 traverser 时再更新。<strong>6 玩家就轮转 6 个 traverser</strong>（D-307 alternating，本仓库 <code>NlheGame6</code> 实现）。</p>
+
+<svg viewBox="0 0 700 300" xmlns="http://www.w3.org/2000/svg">
+<!-- 树形示意 -->
+<circle cx="350" cy="40" r="14" fill="#ff7a45"/>
+<text x="350" y="44" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">T</text>
+<text x="380" y="44" fill="#ff7a45" font-size="11">traverser 决策点</text>
+
+<!-- T 三分支全展开 -->
+<line x1="350" y1="54" x2="200" y2="100" stroke="#ff7a45" stroke-width="2"/>
+<line x1="350" y1="54" x2="350" y2="100" stroke="#ff7a45" stroke-width="2"/>
+<line x1="350" y1="54" x2="500" y2="100" stroke="#ff7a45" stroke-width="2"/>
+
+<circle cx="200" cy="110" r="12" fill="#5cc8ff"/>
+<text x="200" y="114" text-anchor="middle" fill="#0f1419" font-size="10" font-weight="700">O</text>
+<circle cx="350" cy="110" r="12" fill="#5cc8ff"/>
+<text x="350" y="114" text-anchor="middle" fill="#0f1419" font-size="10" font-weight="700">O</text>
+<circle cx="500" cy="110" r="12" fill="#5cc8ff"/>
+<text x="500" y="114" text-anchor="middle" fill="#0f1419" font-size="10" font-weight="700">O</text>
+
+<!-- 对手只采样一条 -->
+<line x1="200" y1="122" x2="160" y2="170" stroke="#2a3340" stroke-width="1" stroke-dasharray="3,3"/>
+<line x1="200" y1="122" x2="200" y2="170" stroke="#5cc8ff" stroke-width="2"/>
+<line x1="200" y1="122" x2="240" y2="170" stroke="#2a3340" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="200" y="190" text-anchor="middle" fill="#5cc8ff" font-size="11">采样 1 条</text>
+
+<line x1="350" y1="122" x2="310" y2="170" stroke="#2a3340" stroke-width="1" stroke-dasharray="3,3"/>
+<line x1="350" y1="122" x2="350" y2="170" stroke="#5cc8ff" stroke-width="2"/>
+<line x1="350" y1="122" x2="390" y2="170" stroke="#2a3340" stroke-width="1" stroke-dasharray="3,3"/>
+
+<line x1="500" y1="122" x2="460" y2="170" stroke="#2a3340" stroke-width="1" stroke-dasharray="3,3"/>
+<line x1="500" y1="122" x2="500" y2="170" stroke="#5cc8ff" stroke-width="2"/>
+<line x1="500" y1="122" x2="540" y2="170" stroke="#2a3340" stroke-width="1" stroke-dasharray="3,3"/>
+
+<text x="380" y="44" fill="#ff7a45" font-size="11">traverser：全展开</text>
+<text x="50" y="114" fill="#5cc8ff" font-size="11">对手：采样</text>
+
+<!-- 终止节点 -->
+<circle cx="200" cy="200" r="8" fill="#7ed957"/>
+<circle cx="350" cy="200" r="8" fill="#7ed957"/>
+<circle cx="500" cy="200" r="8" fill="#7ed957"/>
+<text x="350" y="230" text-anchor="middle" fill="#7ed957" font-size="11">terminal payoff</text>
+
+<text x="350" y="270" text-anchor="middle" fill="#9aa6b3" font-size="12">每条 trajectory 走完，回传 cfv，更新 traverser 的 regret 表</text>
+</svg>
+<p class="diagram-caption">图 2：External-Sampling MCCFR — 一次"展开 + 采样"组合，比 Vanilla CFR 快几个数量级。</p>
+
+<p>本仓库 <code>EsMccfrTrainer::step</code> 在 <code>src/training/trainer.rs</code> 里实现这套逻辑。每次 <code>step()</code> 调用 = 1 个 traverser 的 1 次 sampled update。<strong>10¹¹ update</strong> 就是这种 step 跑这么多次。</p>
+
+</section>
+
+<section id="linear">
+<h2>5. Linear MCCFR + RM+：两个让自博弈"早收敛"的小改动</h2>
+
+<p>朴素 MCCFR 收敛率是 O(1/√T)。Pluribus 用了两个工程上看似很小、却让收敛速度<strong>显著加速</strong>的 trick：</p>
+
+<h3>5.1 Linear Weighting（线性加权）</h3>
+
+<p>把<strong>新</strong>累积的 regret 权重 ↑，<strong>旧</strong>累积的权重 ↓。具体做法：每轮 t 起始时给已有 regret 乘上一个衰减因子：</p>
+
+<div class="formula-box">
+$$ R_t(I, a) \leftarrow R_{t-1}(I, a) \cdot \frac{t}{t+1} + \text{(本轮新增)} $$
+</div>
+
+<p>直观：自博弈早期策略很烂、产生的 regret 噪声很大，应该被后期更高质量的 regret 覆盖。Linear 是 Pluribus 实测最优的"平滑老 regret"形式（其它如 CFR+ 用阈值截断、Discounted CFR 用指数衰减，效果各有千秋）。</p>
+
+<h3>5.2 Regret Matching+（RM+）</h3>
+
+<p>每次更新 regret 后立即把负值<strong>截断到 0</strong>：</p>
+
+<div class="formula-box">
+$$ R_t(I, a) \leftarrow \max\left(R_t(I, a), 0\right) $$
+</div>
+
+<p>直观：负 regret 长期积累后，要让一个"曾经很烂"的动作被重新选中，得花很多次 update 才能把累积值拉回 0。RM+ 强制每次重置，等价于<strong>给坏动作一个二次机会</strong>。论文与本仓库实测在多人 NLHE 上 RM+ 收敛比纯 RM 快约 2-4×。</p>
+
+<h3>5.3 在代码里</h3>
+
+<p>本仓库 <code>src/training/trainer.rs</code> 中 <code>EsMccfrTrainer::apply_decay</code> + <code>clamp_nonneg</code> 实现这两步（<span class="tag D">D-401</span> + <span class="tag D">D-402</span>）：</p>
+
+<pre><code><span class="c">// 每 iter 起始：扫全表应用 t/(t+1) decay（D-401 EagerDecay 主路径）</span>
+<span class="k">fn</span> <span class="n">apply_decay</span>(&amp;<span class="k">mut</span> <span class="k">self</span>, t: <span class="t">u64</span>) {
+    <span class="k">let</span> factor = (t <span class="k">as</span> <span class="t">f64</span>) / ((t + <span class="num">1</span>) <span class="k">as</span> <span class="t">f64</span>);
+    <span class="k">for</span> regrets <span class="k">in</span> <span class="k">self</span>.regret_table.iter_mut() {
+        <span class="k">for</span> r <span class="k">in</span> regrets.iter_mut() { *r *= factor; }
+    }
+}
+
+<span class="c">// 每次 regret update 后：RM+ floor at 0 （D-402）</span>
+<span class="k">fn</span> <span class="n">clamp_nonneg</span>(regrets: &amp;<span class="k">mut</span> [<span class="t">f64</span>]) {
+    <span class="k">for</span> r <span class="k">in</span> regrets.iter_mut() { *r = r.max(<span class="num">0.0</span>); }
+}
+</code></pre>
+
+<div class="callout note">
+<div class="callout-title">Warm-up 期</div>
+<p>Linear MCCFR + RM+ 在 t=0 附近会过度抑制初始 regret，导致策略卡在均匀分布。本仓库的解决方案（<span class="tag D">D-409</span>）：前 <strong>1M update</strong> 走标准 CFR + RM，之后再切换到 Linear + RM+。等价于"先让 regret 长出来，再开启加速器"。</p>
+</div>
+
+</section>
+
+<section id="action-abs">
+<h2>6. Action Abstraction：把连续下注空间压缩到 14 个动作</h2>
+
+<p>NLHE 真实动作是连续的：raise to 250 chip、raise to 251 chip… CFR 必须在<strong>有限</strong>动作集合上跑。Pluribus 字面用的是 <strong>14 个动作</strong>（本仓库 <code>src/abstraction/action_pluribus.rs</code>，<span class="tag D">D-420</span>）：</p>
+
+<table>
+<thead><tr><th>动作</th><th>含义</th><th>raise 金额（基于 pot）</th></tr></thead>
+<tbody>
+<tr><td>Fold</td><td>弃牌</td><td>—</td></tr>
+<tr><td>Check</td><td>过牌</td><td>—</td></tr>
+<tr><td>Call</td><td>跟注</td><td>—</td></tr>
+<tr><td>Raise 0.5 Pot</td><td>半 pot 加注</td><td>0.5 × pot</td></tr>
+<tr><td>Raise 0.75 Pot</td><td>四分之三 pot</td><td>0.75 × pot</td></tr>
+<tr><td>Raise 1 Pot</td><td>满 pot</td><td>1 × pot</td></tr>
+<tr><td>Raise 1.5 / 2 / 3 / 5 / 10 / 25 / 50 Pot</td><td>大注 / 加注战</td><td>2 ~ 50 × pot</td></tr>
+<tr><td>All-In</td><td>全押</td><td>剩余筹码</td></tr>
+</tbody>
+</table>
+
+<p>关键点：<strong>不同街、不同位置不一定都用全部 14 个</strong>。preflop 通常只用前 5-7 个；后街根据 pot 大小动态裁剪（>2× pot 的 raise 通常等价于 all-in）。这让有效树尺寸进一步缩小。</p>
+
+<h3>6.1 量化公式</h3>
+
+<p>raise 金额公式（<code>compute_raise_to</code>）：</p>
+
+<div class="formula-box">
+$$ \text{raise\_to} = \text{current\_bet} + \lfloor \text{multiplier} \times \text{pot\_size} \rfloor $$
+</div>
+
+<p>floor 舍入是字面选择（B2 测试容差 ±1 chip 允许 floor/round/ceil 任一）。</p>
+
+</section>
+
+<section id="info-abs">
+<h2>7. Information Abstraction：把 10⁵⁰ 个手牌组合压缩到 ~10⁹ bucket</h2>
+
+<p>Action abstraction 还不够。每条街还有<strong>巨量的发牌历史 × 公共牌组合</strong>。Information abstraction 把<strong>策略上等价</strong>的状态合并成同一个 bucket。</p>
+
+<div class="grid-2">
+<div class="card">
+<h4>Preflop：169 个 lossless 类</h4>
+<p>52 张牌 × 51 张牌 = 1326 个底牌组合。但翻牌前花色除了"是否同花"外没有意义。所以：</p>
+<ul>
+<li><strong>13 对</strong>（pocket pair）</li>
+<li><strong>78 同花</strong>（suited）</li>
+<li><strong>78 不同花</strong>（offsuit）</li>
+</ul>
+<p>= <span class="big-number" style="font-size:20px;display:inline">169</span> 个完全无损类。本仓库 <code>PreflopLossless169</code>（<span class="tag D">D-217</span>）。</p>
+</div>
+<div class="card">
+<h4>Flop/Turn/River：~10⁴ bucket/街</h4>
+<p>翻牌后状态太多。本仓库 v3 production bucket table 配置 <strong>flop=2000 / turn=5000 / river=10000</strong> bucket。聚类特征用 <em>EHS²</em>（Expected Hand Strength squared）和 distribution-aware histogram（参考 OCHS）。</p>
+<p>artifact 528 MiB，BLAKE3 hash 锁定。<span class="tag D">D-218-rev2</span></p>
+</div>
+</div>
+
+<h3>7.1 InfoSet 编码</h3>
+
+<p>每个决策点压缩成 <strong>64-bit InfoSetId</strong>：</p>
+
+<svg viewBox="0 0 720 100" xmlns="http://www.w3.org/2000/svg">
+<rect x="20" y="30" width="680" height="40" fill="#181f27" stroke="#2a3340"/>
+<line x1="120" y1="30" x2="120" y2="70" stroke="#2a3340"/>
+<line x1="250" y1="30" x2="250" y2="70" stroke="#2a3340"/>
+<line x1="380" y1="30" x2="380" y2="70" stroke="#2a3340"/>
+<line x1="500" y1="30" x2="500" y2="70" stroke="#2a3340"/>
+<line x1="620" y1="30" x2="620" y2="70" stroke="#2a3340"/>
+
+<text x="70" y="55" text-anchor="middle" fill="#ff7a45" font-size="12" font-weight="600">street</text>
+<text x="70" y="20" text-anchor="middle" fill="#9aa6b3" font-size="10">2 bit</text>
+
+<text x="185" y="55" text-anchor="middle" fill="#5cc8ff" font-size="12" font-weight="600">bucket_id</text>
+<text x="185" y="20" text-anchor="middle" fill="#9aa6b3" font-size="10">14 bit</text>
+
+<text x="315" y="55" text-anchor="middle" fill="#b18cff" font-size="12" font-weight="600">position</text>
+<text x="315" y="20" text-anchor="middle" fill="#9aa6b3" font-size="10">3 bit</text>
+
+<text x="440" y="55" text-anchor="middle" fill="#7ed957" font-size="12" font-weight="600">stack_bucket</text>
+<text x="440" y="20" text-anchor="middle" fill="#9aa6b3" font-size="10">4 bit</text>
+
+<text x="560" y="55" text-anchor="middle" fill="#ffd166" font-size="12" font-weight="600">action_history</text>
+<text x="560" y="20" text-anchor="middle" fill="#9aa6b3" font-size="10">~25 bit</text>
+
+<text x="660" y="55" text-anchor="middle" fill="#9aa6b3" font-size="12" font-weight="600">reserved</text>
+<text x="660" y="20" text-anchor="middle" fill="#9aa6b3" font-size="10">16 bit</text>
+</svg>
+<p class="diagram-caption">图 3：本仓库 InfoSetId 64-bit 编码示意。所有"对策略等价"的状态映射到同一个 id，CFR 在 id 上累积 regret。</p>
+
+</section>
+
+<section id="blueprint">
+<h2>8. Blueprint 训练：算力账</h2>
+
+<p>有了抽象层和 MCCFR，剩下的就是"跑够多次"。Pluribus 论文报告 blueprint 训练用 <strong>~8 天 × 64 核</strong>（即 ~12k core-hour）。本仓库 Stage 4 量化门槛：</p>
+
+<div class="grid-3">
+<div class="card">
+<div class="big-number">10⁹</div>
+<div class="metric-label">First Usable</div>
+<p>~14-18 小时 / 32 vCPU。仅打通流水线、调消融，<strong>不具实战质量</strong>。LBR &lt; 200 mbb/g。</p>
+</div>
+<div class="card">
+<div class="big-number">10¹¹</div>
+<div class="metric-label">Production</div>
+<p>~58 天连续运行。对标 Pluribus 论文规模。LBR &lt; 100 mbb/g，对 Slumbot 不输。</p>
+</div>
+<div class="card">
+<div class="big-number">6</div>
+<div class="metric-label">Traverser</div>
+<p>每个 seat 轮转做 traverser。各自独立的 RegretTable，避免单视角 over-fit。</p>
+</div>
+</div>
+
+<h3>8.1 SLO（性能下界）</h3>
+
+<table>
+<thead><tr><th>条件</th><th>throughput 阈值</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>单线程</td><td>≥ 5,000 update/s</td><td>对应 stage 3 SLO 退化 1/2（14-action × 6-player 路径长 2-3×）</td></tr>
+<tr><td>4-core</td><td>≥ 15,000 update/s</td><td>rayon long-lived pool + thread-local delta accumulator</td></tr>
+<tr><td>32-vCPU</td><td>≥ 20,000 update/s</td><td>对应 c7a.8xlarge AWS 主训练 host</td></tr>
+</tbody>
+</table>
+
+<h3>8.2 Checkpoint</h3>
+
+<p>每 ~10⁸ update 落盘一次（<span class="tag D">D-447</span>），约 30-50 GB。本仓库 schema v2（<code>src/training/checkpoint.rs</code>）：128-byte header + 6 个 regret region（per-traverser）+ trailer BLAKE3。这让 24h+ 的训练可以断点恢复，bit-exact 等价。</p>
+
+<h3>8.3 收敛监控</h3>
+
+<p>训练过程中实时输出三组指标（<span class="tag D">D-470</span>）：</p>
+<ul>
+<li><strong>Average regret 增长曲线</strong>：理论应 sublinear（O(√T)），线性增长意味着算法在<strong>发散</strong>。</li>
+<li><strong>策略 entropy</strong>：早期高（接近均匀），后期下降但<strong>不应坍缩</strong>到 one-hot（坍缩说明 RM+ 卡在某分支）。</li>
+<li><strong>动作概率震荡幅度</strong>：训练后期振幅应衰减，持续大幅震荡 → 报警。</li>
+</ul>
+
+</section>
+
+<section id="search">
+<h2>9. 实时 Depth-Limited Search：blueprint 的"现场校正"</h2>
+
+<p>Blueprint 是<strong>抽象</strong>博弈上的近似 Nash。直接拿它打实战会撞上两个问题：</p>
+<ol>
+<li>抽象动作集合（14 个）和真实下注金额不匹配 → off-tree 问题。</li>
+<li>对手可能在抽象边界附近"卡位"剥削。</li>
+</ol>
+
+<p>解决方案：<strong>每个决策点</strong>从当前 public state 出发，做一次<strong>有限深度子博弈重解</strong>，叶子节点用 blueprint 估值，输出更优的本地策略。这就是 Pluribus 的 "continual re-solving"（<span class="tag future">stage 6a</span>）。</p>
+
+<svg viewBox="0 0 700 320" xmlns="http://www.w3.org/2000/svg">
+<!-- 大树 -->
+<rect x="20" y="20" width="660" height="40" fill="rgba(126,217,87,0.08)" stroke="#7ed957" stroke-dasharray="4,3"/>
+<text x="350" y="45" text-anchor="middle" fill="#7ed957" font-size="13" font-weight="600">完整 abstract game tree — blueprint 已收敛</text>
+
+<!-- 当前 public state -->
+<circle cx="350" cy="100" r="14" fill="#ff7a45"/>
+<text x="350" y="104" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">★</text>
+<text x="380" y="105" fill="#ff7a45" font-size="12">当前 public state（real-time 触发点）</text>
+
+<!-- subgame 边界 -->
+<rect x="160" y="130" width="380" height="140" fill="rgba(92,200,255,0.05)" stroke="#5cc8ff" stroke-width="1.5"/>
+<text x="170" y="150" fill="#5cc8ff" font-size="11" font-weight="600">depth-limited subgame</text>
+
+<!-- 节点 -->
+<line x1="350" y1="115" x2="220" y2="165" stroke="#5cc8ff" stroke-width="1.5"/>
+<line x1="350" y1="115" x2="350" y2="165" stroke="#5cc8ff" stroke-width="1.5"/>
+<line x1="350" y1="115" x2="480" y2="165" stroke="#5cc8ff" stroke-width="1.5"/>
+
+<circle cx="220" cy="175" r="10" fill="#5cc8ff"/>
+<circle cx="350" cy="175" r="10" fill="#5cc8ff"/>
+<circle cx="480" cy="175" r="10" fill="#5cc8ff"/>
+
+<line x1="220" y1="185" x2="180" y2="225" stroke="#5cc8ff" stroke-width="1.5"/>
+<line x1="220" y1="185" x2="260" y2="225" stroke="#5cc8ff" stroke-width="1.5"/>
+<line x1="350" y1="185" x2="320" y2="225" stroke="#5cc8ff" stroke-width="1.5"/>
+<line x1="350" y1="185" x2="380" y2="225" stroke="#5cc8ff" stroke-width="1.5"/>
+<line x1="480" y1="185" x2="450" y2="225" stroke="#5cc8ff" stroke-width="1.5"/>
+<line x1="480" y1="185" x2="510" y2="225" stroke="#5cc8ff" stroke-width="1.5"/>
+
+<!-- 叶子（blueprint 估值） -->
+<rect x="170" y="225" width="20" height="20" fill="#7ed957" rx="3"/>
+<rect x="250" y="225" width="20" height="20" fill="#7ed957" rx="3"/>
+<rect x="310" y="225" width="20" height="20" fill="#7ed957" rx="3"/>
+<rect x="370" y="225" width="20" height="20" fill="#7ed957" rx="3"/>
+<rect x="440" y="225" width="20" height="20" fill="#7ed957" rx="3"/>
+<rect x="500" y="225" width="20" height="20" fill="#7ed957" rx="3"/>
+
+<text x="350" y="265" text-anchor="middle" fill="#7ed957" font-size="11">leaf：用 blueprint 估值（或 biased leaf 策略）</text>
+
+<!-- 注释 -->
+<text x="170" y="295" fill="#9aa6b3" font-size="11">求解器：在该 subgame 上跑 MCCFR / CFR-D ~1000 iter</text>
+<text x="170" y="312" fill="#9aa6b3" font-size="11">输出 ★ 节点上的精修策略（比 blueprint 更精细的动作集）</text>
+</svg>
+<p class="diagram-caption">图 4：Depth-Limited Search — 不再用整棵树，只在 P95 &lt; 30 秒预算内求解当前子博弈。</p>
+
+<p><strong>关键技术点</strong>（path.md 阶段 6a）：</p>
+<ul>
+<li>当前下注轮用<strong>更细</strong>的 action abstraction（甚至接近 lossless），未来下注轮用受控 bucket。</li>
+<li>叶子节点用 blueprint 估值。这避免重新搜索整个未来。</li>
+<li>subgame 总 action sequence 控制在 <span class="num">100-2000</span>，否则求解爆炸。</li>
+</ul>
+
+</section>
+
+<section id="biased">
+<h2>10. Biased Leaf Strategies：Pluribus 真正能赢人的关键</h2>
+
+<div class="callout warn">
+<div class="callout-title">这是 Pluribus 论文最难理解、也最有创意的部分</div>
+<p>它解释了为什么 Pluribus 不需要建模对手，也能在多人桌上稳赢——靠的是<strong>在自己的子博弈解里假设对手有 4 种 meta-strategy 可选</strong>，给"被剥削"留出明确的应对。</p>
+</div>
+
+<h3>10.1 问题：朴素 search 会被反剥削</h3>
+
+<p>朴素方案：每个决策点 solve 一次子博弈，叶子直接用 blueprint 估值。问题是—— blueprint 是<strong>对全局</strong>近似 Nash，到了某个具体 subgame 它可能<strong>过于一致</strong>。聪明对手知道你后面会按 blueprint 出牌，就可以选择对你最不利的偏离。</p>
+
+<h3>10.2 Pluribus 的解法：4 个 Biased Leaf 策略</h3>
+
+<p>在子博弈叶子节点，<strong>不止</strong>给一个 blueprint 估值。而是给对手 <span class="num">4</span> 个可选的 meta-strategy：</p>
+
+<div class="grid-2">
+<div class="card">
+<h4>① Unbiased</h4>
+<p>对手按 blueprint 原样出牌。</p>
+</div>
+<div class="card">
+<h4>② Fold-Biased</h4>
+<p>对手系统性地更倾向 fold（叶子估值用"对手多 fold 时"的 EV 计算）。</p>
+</div>
+<div class="card">
+<h4>③ Call-Biased</h4>
+<p>对手更倾向 call（被动跟注，骗信息）。</p>
+</div>
+<div class="card">
+<h4>④ Raise-Biased</h4>
+<p>对手更倾向 raise（激进试探）。</p>
+</div>
+</div>
+
+<p><strong>子博弈求解时假设对手会选择 4 个策略中对 ta 最有利的那个</strong>。这相当于在 subgame 解里把"对手会动手脚"显式建模成 max-min。Pluribus 的策略就是在这个更悲观的假设下做出反应。</p>
+
+<div class="callout tip">
+<div class="callout-title">为什么这破解了"无法建模对手"的难题</div>
+<p>传统 opponent modeling 要观察对手很多手才能判断 ta 是哪种类型；Pluribus 不建模具体对手，而是<strong>预设对手"理论上"可以选这 4 种偏离</strong>。如果它的策略对这 4 种都不亏，那对任何介于其间的真实人类对手也不会亏太多。这是<strong>纳什的稳健化</strong>（robustification）。</p>
+</div>
+
+<p>每条 biased strategy 都能单独消融开关。论文与本仓库 stage 6b 都要求：去掉任一 biased leaf 后<strong>可剥削性显著上升</strong>，证明这 4 条不是装饰。</p>
+
+</section>
+
+<section id="offtree">
+<h2>11. Off-tree Action Handling：边界剥削防御</h2>
+
+<p>抽象动作集合是 14 个。如果对手 raise 真实金额刚好<strong>夹在</strong>两个抽象动作之间（比如他 raise 0.625 pot，介于 0.5 pot 和 0.75 pot 之间），Pluribus 必须把这个动作<strong>映射</strong>到某个抽象动作上，否则没法查 blueprint。</p>
+
+<h3>11.1 Pseudo-Harmonic Mapping</h3>
+
+<p>Pluribus 用 <strong>pseudo-harmonic mapping</strong>（Ganzfried &amp; Sandholm, 2013）。直觉：</p>
+
+<ul>
+<li>真实下注 <span class="n">x</span> 落在抽象动作 <span class="n">A</span>（金额 <span class="n">a</span>）和 <span class="n">B</span>（金额 <span class="n">b</span>，<span class="n">a &lt; x &lt; b</span>）之间。</li>
+<li>用<strong>调和平均</strong>而不是算术平均，因为下注金额的对数空间更接近策略意义上的"远近"。</li>
+</ul>
+
+<div class="formula-box">
+$$ P(A \mid x) = \frac{(b - x)(1 + a)}{(b - a)(1 + x)} $$
+</div>
+
+<p>剩余概率给 B。然后<strong>随机化</strong>选 A 或 B，避免被对手通过"边界偏移"剥削。本仓库占位实现在 <code>src/abstraction/action_pluribus.rs::map_off_tree</code>（<span class="tag future">stage 6c 完整实现</span>）。</p>
+
+<div class="callout warn">
+<div class="callout-title">最大的实战 bug 来源</div>
+<p>Pluribus 论文与本仓库 path.md 都强调：<strong>off-tree handling 是实战阶段 bug 与可剥削性的最大来源</strong>。stage 6c 必须 fuzz 1M 个 off-tree 下注金额、对故意卡边界的对手做 1M 手对战，统计是否能通过卡边界获得显著正收益（视为可剥削性证据）。</p>
+</div>
+
+</section>
+
+<section id="why-win">
+<h2>12. 为什么 Pluribus 能击败职业玩家</h2>
+
+<p>所有零件都摆完了。回到最开头的问题：<strong>这一套东西凑在一起，为什么真的能赢顶级人类？</strong></p>
+
+<h3>12.1 三个互相强化的论点</h3>
+
+<div class="card" style="margin: 16px 0;">
+<h4>论点 ①：纳什均衡近似在不完美信息下是稳健的</h4>
+<p>2 人零和有理论保证：打 Nash 策略不会输（期望意义下）。6 人非零和虽然没有这种保证，<strong>但 Pluribus 用 6-traverser self-play + 4-biased leaf</strong> 把"被剥削的最大可能损失"压到了人类难以察觉的小量级。LBR exploitability &lt; 100 mbb/g 意味着即便神级对手知道 Pluribus 的全部策略，每 100 手最多只能赢 1 个大盲。</p>
+</div>
+
+<div class="card" style="margin: 16px 0;">
+<h4>论点 ②：不依赖对手建模 → 不可被"反扮演"</h4>
+<p>很多扑克 AI 试图建模对手风格（tight / loose / aggressive）。问题是<strong>对手知道你在建模 ta</strong>，可以反向欺骗。Pluribus 完全<strong>无视</strong>对手是谁，每个决策点只看公共历史 + 自己底牌，按 blueprint + search 出牌。结果是<strong>对手没法通过演戏诱导 Pluribus 走入陷阱</strong>。</p>
+</div>
+
+<div class="card" style="margin: 16px 0;">
+<h4>论点 ③：实时 search 弥补了抽象的粗糙</h4>
+<p>Blueprint 是 ~10⁹ bucket 上的近似策略，单看挺粗糙。但每个决策点重新 solve 一次 subgame，把<strong>当前真实金额、真实公牌</strong>带入精细求解，相当于"用 blueprint 当估值函数，做一个浅层的 AlphaZero-style 搜索"。Pluribus 论文报告：去掉 search 后胜率从 +5 bb/100 降到接近 0。<strong>search 不是锦上添花，是必需的</strong>。</p>
+</div>
+
+<h3>12.2 一个常见误解</h3>
+
+<div class="callout note">
+<div class="callout-title">"Pluribus 能赢，是因为算力大"？</div>
+<p>不完全对。Pluribus blueprint 训练只用了 <strong>~150 美元</strong>云算力，real-time search 用一台 28 核机器。同一时期的"算力堆栈"做法（暴力扩大抽象 + 长时间 CFR）都没能达到 Pluribus 的水平。<strong>Pluribus 的优势是算法选型（Linear MCCFR + biased leaf + depth-limited search）</strong>，算力只是把这些算法跑完所必需的工程预算，不是优势来源本身。</p>
+</div>
+
+<h3>12.3 量化结果</h3>
+
+<table>
+<thead><tr><th>实验</th><th>对手</th><th>结果</th></tr></thead>
+<tbody>
+<tr><td>5 Pluribus + 1 人类 × 10,000 手</td><td>13 名职业玩家轮转</td><td>Pluribus +48 mbb/100，p &lt; 0.01</td></tr>
+<tr><td>5 人类 + 1 Pluribus × 10,000 手</td><td>同上</td><td>Pluribus +32 mbb/100，p = 0.028</td></tr>
+<tr><td>训练成本</td><td>—</td><td>~150 美元（云 spot）</td></tr>
+<tr><td>实时决策延迟</td><td>—</td><td>中位数 20s，P95 &lt; 30s</td></tr>
+</tbody>
+</table>
+
+<p>"48 mbb/100" 意思是：每 100 手赢 0.048 个大盲。对人类职业选手来说，这是一个<strong>显著</strong>且<strong>不可挽回</strong>的劣势——他们打了 10,000 手仍输得统计显著。</p>
+
+</section>
+
+<section id="repo">
+<h2>13. 本仓库 8-stage 落地路线 + 当前进度</h2>
+
+<p>这套理论在本仓库的工程落地按 8 个 stage 串行推进：</p>
+
+<table>
+<thead><tr><th>Stage</th><th>目标</th><th>状态</th><th>关键 artifact</th></tr></thead>
+<tbody>
+<tr>
+<td><strong>1</strong></td>
+<td>规则环境 + 手牌评估器（zero-FP / no-unsafe）</td>
+<td><span class="tag closed">closed</span></td>
+<td><code>stage1-v1.0</code> tag · 7-card eval ≥ 1M/s</td>
+</tr>
+<tr>
+<td><strong>2</strong></td>
+<td>Abstraction（169 preflop + flop/turn/river bucket）</td>
+<td><span class="tag closed">closed</span></td>
+<td><code>stage2-v1.0</code> · 528 MiB v3 bucket table</td>
+</tr>
+<tr>
+<td><strong>3</strong></td>
+<td>MCCFR 在 Kuhn / Leduc / 简化 NLHE 上验证</td>
+<td><span class="tag closed">closed</span></td>
+<td><code>stage3-v1.0</code> · Kuhn expl &lt; 0.01 锚定</td>
+</tr>
+<tr>
+<td><strong>4</strong></td>
+<td>6-max blueprint 训练（Linear MCCFR + RM+ + 14-action）</td>
+<td><span class="tag pending">A0..E2 closed · F1 [测试] 待启动</span></td>
+<td>D2 Checkpoint v2 + E2 LbrEvaluator 落地</td>
+</tr>
+<tr>
+<td><strong>5</strong></td>
+<td>训练性能/内存优化（pruning + 分片存储）</td>
+<td><span class="tag future">未开始</span></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>6a</strong></td>
+<td>单层 subgame 重解</td>
+<td><span class="tag future">未开始</span></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>6b</strong></td>
+<td>Continual re-solving + 4 biased leaf strategies</td>
+<td><span class="tag future">未开始</span></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>6c</strong></td>
+<td>Off-tree action handling（pseudo-harmonic）</td>
+<td><span class="tag future">未开始</span></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>7</strong></td>
+<td>评测体系（AIVAT/DIVAT + Slumbot + LBR）</td>
+<td><span class="tag future">未开始</span></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>8</strong></td>
+<td>策略服务化（API + 热加载 + 版本哈希）</td>
+<td><span class="tag future">未开始</span></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+
+<h3>13.1 代码地图</h3>
+
+<table>
+<thead><tr><th>模块</th><th>对应概念</th></tr></thead>
+<tbody>
+<tr><td><code>src/core/</code></td><td>基础类型 · <code>ChipAmount</code>（u64 整数）· <code>RngSource</code> 显式注入</td></tr>
+<tr><td><code>src/rules/</code></td><td>NLHE 规则状态机 · <code>GameState</code> · <code>LegalActionSet</code></td></tr>
+<tr><td><code>src/eval.rs</code></td><td>7-card 手牌评估器</td></tr>
+<tr><td><code>src/abstraction/preflop.rs</code></td><td>169 lossless preflop class</td></tr>
+<tr><td><code>src/abstraction/postflop.rs</code></td><td>flop/turn/river bucket + canonical observation</td></tr>
+<tr><td><code>src/abstraction/action_pluribus.rs</code></td><td>14-action abstraction（本文档 §6）</td></tr>
+<tr><td><code>src/abstraction/bucket_table.rs</code></td><td>528 MiB bucket table mmap 查表</td></tr>
+<tr><td><code>src/training/game.rs</code></td><td><code>Game</code> trait 抽象（Kuhn / Leduc / NLHE 共用）</td></tr>
+<tr><td><code>src/training/regret.rs</code></td><td><code>RegretTable</code> + Regret Matching（本文档 §3）</td></tr>
+<tr><td><code>src/training/trainer.rs</code></td><td><code>VanillaCfrTrainer</code> + <code>EsMccfrTrainer</code> · Linear + RM+（本文档 §4-§5）</td></tr>
+<tr><td><code>src/training/nlhe_6max.rs</code></td><td><code>NlheGame6</code> Game trait 实现 · 6-traverser routing</td></tr>
+<tr><td><code>src/training/lbr.rs</code></td><td>Local Best Response · blueprint 可剥削性上界评估</td></tr>
+<tr><td><code>src/training/slumbot_eval.rs</code></td><td>Slumbot HTTP bridge · 100K 手 head-to-head</td></tr>
+<tr><td><code>src/training/checkpoint.rs</code></td><td>schema v2 checkpoint · atomic write + BLAKE3 trailer</td></tr>
+</tbody>
+</table>
+
+<h3>13.2 关键不可妥协的工程约束</h3>
+
+<ul>
+<li><strong>无浮点</strong>进入规则/评估/历史/抽象路径。Chips 是 <code>u64</code>，P&amp;L 是 <code>i64</code>。浮点只允许出现在 <code>training::regret</code> 内部（CFR 必须）。</li>
+<li><strong>无全局 RNG</strong>。所有随机性走 <code>RngSource</code> 显式参数。便于复现 + 跨架构对齐。</li>
+<li><strong>无 unsafe 代码</strong>。<code>Cargo.toml</code> 编译期 <code>unsafe_code = "forbid"</code>。</li>
+<li><strong>决定性 baseline</strong>：同架构 + 同工具链 + 同 seed → 同 hand history BLAKE3 hash。跨 commit byte-equal 维持。</li>
+<li><strong>测试与实现严格分离</strong>：<code>[测试]</code> agent 不动产品代码，<code>[实现]</code> agent 不动测试。所有越界都有 <code>D-NNN-revM</code> carve-out 显式追认。</li>
+</ul>
+
+</section>
+
+<hr/>
+
+<section>
+<h2>结语</h2>
+
+<p>Pluribus 的胜利不是"AI 突然变聪明了"。它是 <strong>30 年博弈论积累 + 10 年 CFR 工程经验 + 几个关键工程小 trick</strong> 的合流：</p>
+<ul>
+<li><strong>CFR</strong>（Zinkevich 2007）是基础引擎。</li>
+<li><strong>MCCFR</strong>（Lanctot 2009）让它跑得起。</li>
+<li><strong>Linear MCCFR + RM+</strong> 让它<strong>收敛得快</strong>。</li>
+<li><strong>Action / Information abstraction</strong> 让它<strong>装得下</strong>。</li>
+<li><strong>Depth-Limited Search + Biased Leaf Strategies</strong> 让它<strong>能赢人</strong>。</li>
+<li><strong>Off-tree mapping</strong> 让它<strong>不被边界剥削</strong>。</li>
+</ul>
+
+<p>本仓库的工作就是把这条路线<strong>一砖一瓦</strong>用 Rust 重写，每一步都有量化验收门槛、test-first 流程、byte-equal baseline。目前刚刚走完 Stage 4 主算法落地，下一步是 F1 [测试]：钉死 Slumbot 评测协议 + 三类 baseline + cross-host 锚点，为 production blueprint 训练做准备。</p>
+
+<p>真正的难关——stage 6 的 continual re-solving + biased leaf——还在前方。但因为前面 5 个 stage 把抽象、blueprint、checkpoint、监控都做扎实了，stage 6 的工程难度会显著降低。<strong>这就是 8-stage 串行的意义</strong>：不抄近路、每一步都可量化验收，最终在合理算力下复现"AI 击败人类职业玩家"这一里程碑。</p>
+</section>
+
+<footer>
+<p>本文档基于 Pluribus 论文（Brown &amp; Sandholm, Science 2019）+ 本仓库代码与设计文档生成。</p>
+<p>参考资料：<br/>
+Pluribus 主论文 · <code>https://noambrown.github.io/papers/19-Science-Superhuman.pdf</code><br/>
+Pluribus 补充材料 · <code>https://noambrown.github.io/papers/19-Science-Superhuman_Supp.pdf</code><br/>
+本仓库实现路线 · <code>docs/pluribus_path.md</code></p>
+</footer>
+
+</main>
+</div>
+</body>
+</html>
