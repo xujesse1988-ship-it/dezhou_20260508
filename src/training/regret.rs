@@ -50,7 +50,13 @@ pub(crate) type SigmaVec = SmallVec<[f64; 8]>;
 /// - [`Self::current_strategy`] 返回 `Vec<f64>` 长度 = `n_actions`，sum = `1.0 ±
 ///   1e-9`（D-330）。
 /// - 已访问 InfoSet 后 [`Self::len`] 单调非降。
-#[derive(Debug)]
+///
+/// stage 4 E2 \[实现\] 起步加 `Clone` derive 让 [`crate::training::trainer::
+/// EsMccfrTrainer`] 在 warm-up phase 完成 + Linear+RM+ + NlheGame6 路径下
+/// 把 single shared 表 deep-clone 到 6 套 per-traverser 表（D-412 字面
+/// runtime 真实多表）。InfoSet `I` 已被 Game trait 约束为 `Clone`，
+/// 内层 `Vec<f64>` 自动 Clone，整体 derive 安全。
+#[derive(Clone, Debug)]
 pub struct RegretTable<I: Eq + Hash + Clone> {
     inner: HashMap<I, Vec<f64>>,
 }
@@ -292,7 +298,10 @@ impl<I> LocalRegretDelta<I> {
 /// `S(I, a) += σ(I, a) × 1` per sampled reach（ES-MCCFR D-304）。
 ///
 /// 不变量同 [`RegretTable`]（D-324 / D-330 / 单调非降 len）。
-#[derive(Debug)]
+///
+/// stage 4 E2 \[实现\] `Clone` derive 与 [`RegretTable`] 同型理由
+/// （per-traverser 表 lazy clone）。
+#[derive(Clone, Debug)]
 pub struct StrategyAccumulator<I: Eq + Hash + Clone> {
     inner: HashMap<I, Vec<f64>>,
 }

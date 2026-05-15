@@ -429,6 +429,62 @@ pub struct EsMccfrTrainer<G: Game> {
     /// stage 4 API-401 — trainer 配置（默认 stage 3 standard CFR + RM 路径，
     /// `with_linear_rm_plus()` builder 切到 stage 4 Linear MCCFR + RM+ 模式）。
     pub(crate) config: TrainerConfig,
+
+    /// stage 4 E2 \[实现\] — 6-traverser independent table arrays（D-412 字面
+    /// "6 套独立 RegretTable + StrategyAccumulator 每 traverser 1 套"）。
+    ///
+    /// `None` 时 trainer 走 single shared `regret` / `strategy_sum` 路径
+    /// （stage 3 + warm-up phase + 非 NlheGame6 G 全部走此路径，stage 1/2/3
+    /// BLAKE3 byte-equal anchor 不变）。`Some(...)` 由首次 post-warmup
+    /// Linear+RM+ step 触发 lazy 初始化（[`Self::ensure_per_traverser_initialized`]）
+    /// 走 deep-clone single shared 表 × `n_players` 复制实现 — 每 traverser
+    /// 从 warmup 出口的同一份共享 state 起步独立累积（D-414 字面 "cross-traverser
+    /// regret 不共享"）。
+    ///
+    /// 一旦激活，trainer step / step_parallel 在每次 `update_count` 增 1 之前
+    /// 路由到 `per_traverser[traverser]` 的 regret + strategy_sum 上累积，
+    /// 单 shared `regret` / `strategy_sum` 在 post-warmup 阶段不再被写入
+    /// （读路径仍可作为 fallback，但 query API 通常走 per-traverser override）。
+    pub(crate) per_traverser: Option<PerTraverserTables<G::InfoSet>>,
+}
+
+/// stage 4 E2 \[实现\] — 6-traverser independent table 容器（[`EsMccfrTrainer::
+/// per_traverser`] 字段类型；D-412 字面）。
+///
+/// `Vec<RegretTable<I>>` 长度 = `n_players`（NlheGame6 = 6；HU 退化 = 2）；
+/// `Vec<StrategyAccumulator<I>>` 同长。`new_initialized_from_shared` 通过
+/// `Clone::clone(shared_table)` × `n_players` 复制实现初始化（`RegretTable` /
+/// `StrategyAccumulator` 在 stage 4 E2 \[实现\] 起步加 `Clone` derive）。
+pub struct PerTraverserTables<I: std::hash::Hash + Eq + Clone> {
+    pub regret: Vec<RegretTable<I>>,
+    pub strategy_sum: Vec<StrategyAccumulator<I>>,
+}
+
+impl<I: std::hash::Hash + Eq + Clone> PerTraverserTables<I> {
+    /// 从 single shared `(regret, strategy_sum)` 复制初始化 `n_players` 套
+    /// 独立 table（每 traverser 一套）。
+    pub fn new_initialized_from_shared(
+        shared_regret: &RegretTable<I>,
+        shared_strategy: &StrategyAccumulator<I>,
+        n_players: usize,
+    ) -> Self {
+        let regret = (0..n_players).map(|_| shared_regret.clone()).collect();
+        let strategy_sum = (0..n_players).map(|_| shared_strategy.clone()).collect();
+        Self {
+            regret,
+            strategy_sum,
+        }
+    }
+
+    /// 构造 `n_players` 套空 table（reload v2 checkpoint sub-region body 时入口）。
+    pub fn new_empty(n_players: usize) -> Self {
+        let regret = (0..n_players).map(|_| RegretTable::new()).collect();
+        let strategy_sum = (0..n_players).map(|_| StrategyAccumulator::new()).collect();
+        Self {
+            regret,
+            strategy_sum,
+        }
+    }
 }
 
 impl<G: Game> EsMccfrTrainer<G> {
@@ -450,7 +506,43 @@ impl<G: Game> EsMccfrTrainer<G> {
             update_count: 0,
             rng_substream_seed,
             config: TrainerConfig::default(),
+            per_traverser: None,
         }
+    }
+
+    /// stage 4 E2 \[实现\] — 6-traverser per-traverser table 激活条件
+    /// （NlheGame6 + Linear+RM+ + post-warmup）。
+    ///
+    /// 返回 `true` 即 trainer 已切入 D-412 字面 "6 套独立表" 路径，step /
+    /// step_parallel + query API 都走 `per_traverser` 数组；返回 `false` 即
+    /// 维持 single shared regret + strategy_sum（stage 3 byte-equal anchor /
+    /// warm-up phase / 非 NlheGame6 路径）。
+    pub fn per_traverser_active(&self) -> bool {
+        self.per_traverser.is_some()
+    }
+
+    /// stage 4 E2 \[实现\] — lazy 初始化 [`Self::per_traverser`]（首次
+    /// post-warmup Linear+RM+ NlheGame6 step 触发；其它入口不调用）。
+    ///
+    /// 不变量：调用前 `per_traverser` 必须为 `None`；调用后变为 `Some(...)`
+    /// 长度 = `n_players`（NlheGame6 = 6 / HU 退化 = 2）。
+    fn ensure_per_traverser_initialized(&mut self) {
+        if self.per_traverser.is_none() {
+            self.per_traverser = Some(PerTraverserTables::new_initialized_from_shared(
+                &self.regret,
+                &self.strategy_sum,
+                self.game.n_players(),
+            ));
+        }
+    }
+
+    /// 当前 step / step_parallel 是否应路由到 per-traverser 表数组。
+    fn should_use_per_traverser(&self) -> bool {
+        let warm_up_done = self.update_count >= self.config.warmup_complete_at;
+        self.config.linear_weighting_enabled
+            && self.config.rm_plus_enabled
+            && G::VARIANT == GameVariant::Nlhe6Max
+            && warm_up_done
     }
 
     /// stage 4 API-400 — 切到 Linear MCCFR + RM+ 模式（D-400 / D-401 / D-402 /
@@ -540,22 +632,86 @@ impl<G: Game> EsMccfrTrainer<G> {
         if n_active == 0 {
             return Ok(());
         }
+
+        // stage 4 E2 \[实现\] — 6-traverser table-array dispatch（§D2-revM 翻面）。
+        // post-warmup Linear+RM+ NlheGame6 路径下 step_parallel 走
+        // `[RegretTable; n_players]` + `[StrategyAccumulator; n_players]`
+        // 数组：每线程读 traverser 自己的 `regret[traverser]` 作为 σ 共享只读
+        // 源（D-414 字面 cross-traverser 不共享），写入到线程本地
+        // LocalRegretDelta / LocalStrategyDelta；merge 阶段按 (tid 顺序 →
+        // 对应 traverser) 把 delta playback 到该 traverser 的 table（多个 tid
+        // 指向同一 traverser 时按 tid 升序串行 playback，保跨 run 决定性）。
+        // ensure_per_traverser_initialized 必须在任何 `&self.*` 不可变借用
+        // （`game` / `tables` / `regret_ref`）之前完成，避免与可变借用冲突。
+        let use_per_traverser = self.should_use_per_traverser();
+        if use_per_traverser {
+            self.ensure_per_traverser_initialized();
+        }
+
         let active_pool = &mut rng_pool[..n_active];
         let n_players = self.game.n_players() as u64;
         let base_update_count = self.update_count;
-
         let game = &self.game;
-        let shared_regret: &RegretTable<G::InfoSet> = &self.regret;
 
-        // rayon 全局 pool dispatch：`par_iter_mut().enumerate()` 是
-        // `IndexedParallelIterator`，`.collect()` 保 input index 顺序，因此
-        // `deltas[tid]` 与 tid 一一对应（等价原 `std::thread::scope` spawn-by-tid
-        // 顺序）。borrow checker：&self.game + &self.regret + &mut rng_pool[..]
-        // 在 collect 完成前等同 scope-borrow 期，rayon scope-fifo 关闭前所有
-        // 任务必须 join。
-        #[allow(clippy::type_complexity)]
-        let deltas: Vec<(LocalRegretDelta<G::InfoSet>, LocalStrategyDelta<G::InfoSet>)> =
-            active_pool
+        if use_per_traverser {
+            let tables = self
+                .per_traverser
+                .as_ref()
+                .expect("ensure_per_traverser_initialized 已激活 per_traverser");
+            let regret_ref = &tables.regret;
+
+            #[allow(clippy::type_complexity)]
+            let deltas: Vec<(
+                PlayerId,
+                LocalRegretDelta<G::InfoSet>,
+                LocalStrategyDelta<G::InfoSet>,
+            )> = active_pool
+                .par_iter_mut()
+                .enumerate()
+                .map(|(tid, rng_slot)| {
+                    let traverser = ((base_update_count + tid as u64) % n_players) as PlayerId;
+                    let shared_regret_for_traverser = &regret_ref[traverser as usize];
+                    let mut local_regret = LocalRegretDelta::<G::InfoSet>::new();
+                    let mut local_strategy = LocalStrategyDelta::<G::InfoSet>::new();
+                    let rng = rng_slot.as_mut();
+                    let root = game.root(rng);
+                    recurse_es_parallel::<G>(
+                        root,
+                        traverser,
+                        1.0,
+                        1.0,
+                        shared_regret_for_traverser,
+                        &mut local_regret,
+                        &mut local_strategy,
+                        rng,
+                    );
+                    (traverser, local_regret, local_strategy)
+                })
+                .collect();
+
+            // merge — 按 tid 升序 playback 到 per-traverser 表（保跨 run BLAKE3
+            // 决定性同 single-shared 路径同型政策）。
+            let tables = self.per_traverser.as_mut().expect("per_traverser 已激活");
+            for (traverser, local_regret, local_strategy) in deltas {
+                let r = &mut tables.regret[traverser as usize];
+                let s = &mut tables.strategy_sum[traverser as usize];
+                for (info, delta) in local_regret.into_entries() {
+                    r.accumulate(info, &delta);
+                }
+                for (info, weighted) in local_strategy.into_entries() {
+                    s.accumulate(info, &weighted);
+                }
+            }
+        } else {
+            // single-shared 路径（stage 3 + warm-up phase + 非 NlheGame6 G 全部
+            // 走此分支，E2-rev1 stage 3 D-321-rev2 路径不退化）。
+            let shared_regret: &RegretTable<G::InfoSet> = &self.regret;
+
+            #[allow(clippy::type_complexity)]
+            let deltas: Vec<(
+                LocalRegretDelta<G::InfoSet>,
+                LocalStrategyDelta<G::InfoSet>,
+            )> = active_pool
                 .par_iter_mut()
                 .enumerate()
                 .map(|(tid, rng_slot)| {
@@ -578,15 +734,13 @@ impl<G: Game> EsMccfrTrainer<G> {
                 })
                 .collect();
 
-        // playback merge：tid 升序遍历 deltas，每 thread 内按 push 顺序 playback。
-        // 不再调用 `format!("{:?}", I)` 排序（E2-rev1 优化要点 — F1-rev1 实测
-        // batch merge sort 是主导 merge cost，append-only 路径直接消除）。
-        for (local_regret, local_strategy) in deltas {
-            for (info, delta) in local_regret.into_entries() {
-                self.regret.accumulate(info, &delta);
-            }
-            for (info, weighted) in local_strategy.into_entries() {
-                self.strategy_sum.accumulate(info, &weighted);
+            for (local_regret, local_strategy) in deltas {
+                for (info, delta) in local_regret.into_entries() {
+                    self.regret.accumulate(info, &delta);
+                }
+                for (info, weighted) in local_strategy.into_entries() {
+                    self.strategy_sum.accumulate(info, &weighted);
+                }
             }
         }
         self.update_count += n_active as u64;
@@ -617,37 +771,69 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             0
         };
 
-        // 步骤 1：D-401 Linear discounting eager decay（regret 累积乘 t/(t+1)）。
-        // warm-up phase 内不应用（factor = 1 等价 stage 3 path byte-equal）。
-        if use_linear {
-            let decay = (t_stage4 as f64) / ((t_stage4 + 1) as f64);
-            self.regret.apply_decay(decay);
-        }
-
-        // 步骤 2：标准 ES-MCCFR DFS recurse（D-307 alternating traverser）+
-        // D-403 Linear weighted strategy sum 累积 `S_t = S_{t-1} + t × σ_t`
-        // （`strategy_sum_weight` = `t_stage4`；warm-up phase 走 1.0 等价 stage
-        // 3 D-304 unweighted by t 累积 byte-equal）。
         let n_players = self.game.n_players() as u64;
         let traverser = (self.update_count % n_players) as PlayerId;
         let root = self.game.root(rng);
         let strategy_sum_weight: f64 = if use_linear { t_stage4 as f64 } else { 1.0 };
-        recurse_es::<G>(
-            root,
-            traverser,
-            1.0,
-            1.0,
-            &mut self.regret,
-            &mut self.strategy_sum,
-            rng,
-            strategy_sum_weight,
-        );
 
-        // 步骤 3：D-402 RM+ in-place clamp（每 update 累积完 regret delta 后立即
-        // `R̃ ← max(R̃, 0)`）。warm-up phase 内不应用（stage 3 path stored R 允许
-        // 负值长期累积，与 stage 3 BLAKE3 anchor 一致）。
-        if use_rm_plus {
-            self.regret.clamp_nonneg();
+        // stage 4 E2 \[实现\] — 6-traverser table-array dispatch（§D2-revM
+        // table-array deferral 翻面）：post-warmup Linear+RM+ NlheGame6 路径
+        // 走 [`PerTraverserTables`] per-traverser table 数组；其它路径维持
+        // single shared regret + strategy_sum（stage 1/2/3 byte-equal）。
+        if self.should_use_per_traverser() {
+            self.ensure_per_traverser_initialized();
+            let tables = self
+                .per_traverser
+                .as_mut()
+                .expect("ensure_per_traverser_initialized 已激活 per_traverser");
+            let regret = &mut tables.regret[traverser as usize];
+            let strategy_sum = &mut tables.strategy_sum[traverser as usize];
+
+            // 步骤 1：D-401 Linear discounting eager decay（per-traverser
+            // table 上 in-place 乘 t/(t+1)）。
+            if use_linear {
+                let decay = (t_stage4 as f64) / ((t_stage4 + 1) as f64);
+                regret.apply_decay(decay);
+            }
+            // 步骤 2：标准 ES-MCCFR DFS recurse + D-403 Linear weighted
+            // strategy sum 累积（与 single-shared 路径同型）。
+            recurse_es::<G>(
+                root,
+                traverser,
+                1.0,
+                1.0,
+                regret,
+                strategy_sum,
+                rng,
+                strategy_sum_weight,
+            );
+            // 步骤 3：D-402 RM+ in-place clamp（per-traverser table 上）。
+            if use_rm_plus {
+                regret.clamp_nonneg();
+            }
+        } else {
+            // single-shared 路径（stage 3 byte-equal + warm-up phase + 非
+            // NlheGame6 G 全部走此分支）。
+            // 步骤 1：D-401 Linear discounting eager decay。
+            if use_linear {
+                let decay = (t_stage4 as f64) / ((t_stage4 + 1) as f64);
+                self.regret.apply_decay(decay);
+            }
+            // 步骤 2：标准 ES-MCCFR DFS recurse + D-403。
+            recurse_es::<G>(
+                root,
+                traverser,
+                1.0,
+                1.0,
+                &mut self.regret,
+                &mut self.strategy_sum,
+                rng,
+                strategy_sum_weight,
+            );
+            // 步骤 3：D-402 RM+ in-place clamp。
+            if use_rm_plus {
+                self.regret.clamp_nonneg();
+            }
         }
 
         self.update_count += 1;
@@ -684,18 +870,76 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
         self.strategy_sum.average_strategy(info_set, n)
     }
 
+    /// stage 4 E2 \[实现\] — 6-traverser per-traverser query 路由（D-414 字面）。
+    ///
+    /// `per_traverser` 激活时（NlheGame6 + Linear+RM+ + post-warmup）读
+    /// `per_traverser[traverser].regret` 上的 current strategy；其它路径退化
+    /// 到 single-shared `Self::current_strategy`（stage 3 + Kuhn / Leduc /
+    /// SimplifiedNlhe / warm-up phase 全部走此 fallback）。
+    fn current_strategy_for_traverser(
+        &self,
+        traverser: PlayerId,
+        info_set: &G::InfoSet,
+    ) -> Vec<f64> {
+        if let Some(tables) = self.per_traverser.as_ref() {
+            let idx = traverser as usize;
+            if idx < tables.regret.len() {
+                let regret = &tables.regret[idx];
+                let strategy_sum = &tables.strategy_sum[idx];
+                let n = regret
+                    .inner()
+                    .get(info_set)
+                    .map(|v| v.len())
+                    .or_else(|| strategy_sum.inner().get(info_set).map(|v| v.len()))
+                    .unwrap_or(0);
+                if n > 0 {
+                    return regret.current_strategy(info_set, n);
+                }
+            }
+        }
+        self.current_strategy(info_set)
+    }
+
+    /// stage 4 E2 \[实现\] — 6-traverser average strategy 路由（D-414 字面）。
+    ///
+    /// 语义同 [`Self::current_strategy_for_traverser`]，作用于
+    /// `strategy_sum` 表。LBR `compute_six_traverser_average` /
+    /// `export_policy_for_openspiel` 走此入口取 per-traverser blueprint。
+    fn average_strategy_for_traverser(
+        &self,
+        traverser: PlayerId,
+        info_set: &G::InfoSet,
+    ) -> Vec<f64> {
+        if let Some(tables) = self.per_traverser.as_ref() {
+            let idx = traverser as usize;
+            if idx < tables.strategy_sum.len() {
+                let strategy_sum = &tables.strategy_sum[idx];
+                let regret = &tables.regret[idx];
+                let n = strategy_sum
+                    .inner()
+                    .get(info_set)
+                    .map(|v| v.len())
+                    .or_else(|| regret.inner().get(info_set).map(|v| v.len()))
+                    .unwrap_or(0);
+                if n > 0 {
+                    return strategy_sum.average_strategy(info_set, n);
+                }
+            }
+        }
+        self.average_strategy(info_set)
+    }
+
     fn update_count(&self) -> u64 {
         self.update_count
     }
 
     fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
-        let regret_table_bytes = encode_table(self.regret.inner())?;
-        let strategy_sum_bytes = encode_table(self.strategy_sum.inner())?;
-
         // stage 4 D2 \[实现\] — schema_version dispatch（D-449 字面）：
         // - G == NlheGame6 AND linear_weighting && rm_plus → 走 v2 path
-        //   (schema_version=2, trainer=EsMccfrLinearRmPlus, traverser_count=6,
-        //    4 个 stage 4 字段从 config 持久化)。
+        //   (schema_version=2, trainer=EsMccfrLinearRmPlus, 4 个 stage 4
+        //    字段从 config 持久化)；当 [`Self::per_traverser`] 激活时 body
+        //    走 6-region encoding (E2 \[实现\] 翻面)，否则走 single-region
+        //    encoding 与 traverser_count=1 字面（warm-up 阶段 save）。
         // - 其它（含 NlheGame6 default-config 与 SimplifiedNlheGame）→ 走 v1 path
         //   (schema_version=1, trainer=EsMccfr, 4 个 stage 4 字段以默认值占位)。
         let stage4_path = G::VARIANT == GameVariant::Nlhe6Max
@@ -703,6 +947,28 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             && self.config.rm_plus_enabled;
         let ckpt = if stage4_path {
             let warmup_complete = self.update_count >= self.config.warmup_complete_at;
+            // stage 4 E2 \[实现\] — per-traverser table 激活时走 6-region body
+            // encoding（D-412 字面 6 套独立表）；非激活路径（pre-warmup save）
+            // 走 single-region encoding 与 traverser_count=1 字面（与 stage 3
+            // path body 同型，warm-up 阶段 BLAKE3 byte-equal 不破）。
+            let (regret_table_bytes, strategy_sum_bytes, traverser_count) =
+                if let Some(tables) = self.per_traverser.as_ref() {
+                    let regret_inner: Vec<&std::collections::HashMap<G::InfoSet, Vec<f64>>> =
+                        tables.regret.iter().map(|t| t.inner()).collect();
+                    let strategy_inner: Vec<&std::collections::HashMap<G::InfoSet, Vec<f64>>> =
+                        tables.strategy_sum.iter().map(|t| t.inner()).collect();
+                    (
+                        encode_multi_table(&regret_inner)?,
+                        encode_multi_table(&strategy_inner)?,
+                        tables.regret.len() as u8,
+                    )
+                } else {
+                    (
+                        encode_table(self.regret.inner())?,
+                        encode_table(self.strategy_sum.inner())?,
+                        1u8,
+                    )
+                };
             Checkpoint {
                 schema_version: SCHEMA_VERSION,
                 trainer_variant: TrainerVariant::EsMccfrLinearRmPlus,
@@ -712,12 +978,14 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
                 bucket_table_blake3: self.game.bucket_table_blake3(),
                 regret_table_bytes,
                 strategy_sum_bytes,
-                traverser_count: self.game.n_players() as u8,
+                traverser_count,
                 linear_weighting_enabled: true,
                 rm_plus_enabled: true,
                 warmup_complete,
             }
         } else {
+            let regret_table_bytes = encode_table(self.regret.inner())?;
+            let strategy_sum_bytes = encode_table(self.strategy_sum.inner())?;
             Checkpoint {
                 schema_version: SCHEMA_VERSION_V1,
                 trainer_variant: TrainerVariant::EsMccfr,
@@ -767,8 +1035,33 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             game.bucket_table_blake3(),
         )?;
         let ckpt = Checkpoint::parse_bytes(&bytes)?;
-        let regret = decode_table::<G::InfoSet>(&ckpt.regret_table_bytes)?;
-        let strategy_sum = decode_strategy::<G::InfoSet>(&ckpt.strategy_sum_bytes)?;
+
+        // stage 4 E2 \[实现\] — body sub-region encoding dispatch（D-412 字面）。
+        // - traverser_count <= 1 → single-region body（stage 3 / pre-warmup v2 save）
+        // - traverser_count > 1 → 6-region body 解码到 per_traverser 数组
+        let (regret, strategy_sum, per_traverser) = if ckpt.traverser_count as usize > 1 {
+            let regret_tables =
+                decode_multi_regret::<G::InfoSet>(&ckpt.regret_table_bytes, ckpt.traverser_count)?;
+            let strategy_tables = decode_multi_strategy::<G::InfoSet>(
+                &ckpt.strategy_sum_bytes,
+                ckpt.traverser_count,
+            )?;
+            // 单 shared 表保持空（per_traverser 激活后 trainer 不再读写
+            // self.regret/strategy_sum；保留构造让 struct 字段非 Option）。
+            (
+                RegretTable::new(),
+                StrategyAccumulator::new(),
+                Some(PerTraverserTables {
+                    regret: regret_tables,
+                    strategy_sum: strategy_tables,
+                }),
+            )
+        } else {
+            let regret = decode_table::<G::InfoSet>(&ckpt.regret_table_bytes)?;
+            let strategy_sum = decode_strategy::<G::InfoSet>(&ckpt.strategy_sum_bytes)?;
+            (regret, strategy_sum, None)
+        };
+
         Ok(Self {
             game,
             regret,
@@ -781,6 +1074,7 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             //  / false → 沿用 default 1_000_000，因 update_count < default
             //  时 step path 自然走 warmup 路径，与 byte-equal 不变量一致）。
             config: expected_config,
+            per_traverser,
         })
     }
 }
@@ -1176,4 +1470,105 @@ where
         acc.accumulate(k, &v);
     }
     Ok(acc)
+}
+
+// ===========================================================================
+// stage 4 E2 \[实现\] — Checkpoint v2 6-region body 序列化 helpers（D-412
+// 字面 6 套独立表持久化 + §D2-revM table-array deferral 翻面）。
+// ===========================================================================
+
+/// 多 traverser 表 → bincode bytes（regret 与 strategy_sum 共用）。
+///
+/// 序列化形态 `Vec<Vec<(I, Vec<f64>)>>` 长度 = 输入 slice 长度（NlheGame6 = 6
+/// / HU 退化 = 2）。每个内层 entries 按 `Debug` 排序保跨 host BLAKE3 byte-equal
+/// （与 [`encode_table`] 同 D-327 政策）。outer 顺序 = traverser index 0..N
+/// （deterministic，无需排序）。
+fn encode_multi_table<I>(
+    tables: &[&std::collections::HashMap<I, Vec<f64>>],
+) -> Result<Vec<u8>, CheckpointError>
+where
+    I: Clone + std::fmt::Debug + serde::Serialize,
+{
+    let mut outer: Vec<Vec<(I, Vec<f64>)>> = Vec::with_capacity(tables.len());
+    for table in tables {
+        let mut entries: Vec<(I, Vec<f64>)> =
+            table.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        entries.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
+        outer.push(entries);
+    }
+    bincode::serialize(&outer).map_err(|e| CheckpointError::Corrupted {
+        offset: 0,
+        reason: format!("bincode serialize multi-traverser table failed: {e}"),
+    })
+}
+
+/// bincode bytes → `Vec<RegretTable<I>>`（[`encode_multi_table`] 的 regret 侧逆向）。
+///
+/// 校验 outer 长度与 expected `traverser_count` 一致，不一致 → Corrupted。
+fn decode_multi_regret<I>(
+    bytes: &[u8],
+    expected_count: u8,
+) -> Result<Vec<RegretTable<I>>, CheckpointError>
+where
+    I: Clone + Eq + std::hash::Hash + std::fmt::Debug + serde::de::DeserializeOwned,
+{
+    let outer: Vec<Vec<(I, Vec<f64>)>> =
+        bincode::deserialize(bytes).map_err(|e| CheckpointError::Corrupted {
+            offset: 0,
+            reason: format!("bincode deserialize multi-traverser regret table failed: {e}"),
+        })?;
+    if outer.len() != expected_count as usize {
+        return Err(CheckpointError::Corrupted {
+            offset: 0,
+            reason: format!(
+                "multi-traverser regret table count mismatch: header={} body={}",
+                expected_count,
+                outer.len()
+            ),
+        });
+    }
+    let mut tables = Vec::with_capacity(outer.len());
+    for entries in outer {
+        let mut t = RegretTable::new();
+        for (k, v) in entries {
+            t.accumulate(k, &v);
+        }
+        tables.push(t);
+    }
+    Ok(tables)
+}
+
+/// bincode bytes → `Vec<StrategyAccumulator<I>>`（[`encode_multi_table`] 的
+/// strategy_sum 侧逆向，与 [`decode_multi_regret`] 同型）。
+fn decode_multi_strategy<I>(
+    bytes: &[u8],
+    expected_count: u8,
+) -> Result<Vec<StrategyAccumulator<I>>, CheckpointError>
+where
+    I: Clone + Eq + std::hash::Hash + std::fmt::Debug + serde::de::DeserializeOwned,
+{
+    let outer: Vec<Vec<(I, Vec<f64>)>> =
+        bincode::deserialize(bytes).map_err(|e| CheckpointError::Corrupted {
+            offset: 0,
+            reason: format!("bincode deserialize multi-traverser strategy table failed: {e}"),
+        })?;
+    if outer.len() != expected_count as usize {
+        return Err(CheckpointError::Corrupted {
+            offset: 0,
+            reason: format!(
+                "multi-traverser strategy table count mismatch: header={} body={}",
+                expected_count,
+                outer.len()
+            ),
+        });
+    }
+    let mut tables = Vec::with_capacity(outer.len());
+    for entries in outer {
+        let mut t = StrategyAccumulator::new();
+        for (k, v) in entries {
+            t.accumulate(k, &v);
+        }
+        tables.push(t);
+    }
+    Ok(tables)
 }
