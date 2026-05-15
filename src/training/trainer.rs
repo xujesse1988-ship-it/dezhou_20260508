@@ -19,8 +19,10 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use crate::core::rng::RngSource;
-use crate::error::{CheckpointError, TrainerError, TrainerVariant};
-use crate::training::checkpoint::{preflight_trainer, read_file_bytes, Checkpoint, SCHEMA_VERSION};
+use crate::error::{CheckpointError, GameVariant, TrainerError, TrainerVariant};
+use crate::training::checkpoint::{
+    preflight_trainer, read_file_bytes, Checkpoint, SCHEMA_VERSION, SCHEMA_VERSION_V1,
+};
 use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::regret::{
     LocalRegretDelta, LocalStrategyDelta, RegretTable, SigmaVec, StrategyAccumulator,
@@ -240,8 +242,11 @@ impl<G: Game> Trainer<G> for VanillaCfrTrainer<G> {
     fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
         let regret_table_bytes = encode_table(self.regret.inner())?;
         let strategy_sum_bytes = encode_table(self.strategy_sum.inner())?;
+        // stage 4 D2 \[实现\]：VanillaCfrTrainer 仍写 schema=1（stage 3
+        // byte-equal 维持），4 个 stage 4 字段以默认值占位让 Checkpoint struct
+        // 字段集 12-field 在 v1 / v2 路径下统一构造。
         let ckpt = Checkpoint {
-            schema_version: SCHEMA_VERSION,
+            schema_version: SCHEMA_VERSION_V1,
             trainer_variant: TrainerVariant::VanillaCfr,
             game_variant: G::VARIANT,
             update_count: self.iter,
@@ -249,6 +254,10 @@ impl<G: Game> Trainer<G> for VanillaCfrTrainer<G> {
             bucket_table_blake3: self.game.bucket_table_blake3(),
             regret_table_bytes,
             strategy_sum_bytes,
+            traverser_count: 1,
+            linear_weighting_enabled: false,
+            rm_plus_enabled: false,
+            warmup_complete: false,
         };
         ckpt.save(path)
     }
@@ -258,6 +267,9 @@ impl<G: Game> Trainer<G> for VanillaCfrTrainer<G> {
         Self: Sized,
     {
         let bytes = read_file_bytes(path)?;
+        // VanillaCfrTrainer 只支持 schema=1（stage 3 path）。stage 4 schema=2
+        // 文件（EsMccfrLinearRmPlus 写出）经此入口加载 → SchemaMismatch。
+        ensure_trainer_schema(&bytes, SCHEMA_VERSION_V1)?;
         preflight_trainer(
             &bytes,
             TrainerVariant::VanillaCfr,
@@ -275,6 +287,35 @@ impl<G: Game> Trainer<G> for VanillaCfrTrainer<G> {
             rng_substream_seed: ckpt.rng_state,
         })
     }
+}
+
+/// stage 4 D2 \[实现\] — trainer 侧 schema_version 预检（D-449 字面）。
+///
+/// 在 [`preflight_trainer`] 与 [`Checkpoint::parse_bytes`] 之前 eager 校验
+/// file `schema_version` 字段与 trainer expected 是否一致；命中 mismatch 立即
+/// 返回 [`CheckpointError::SchemaMismatch { expected, got }`]。
+///
+/// 行为细节：
+/// - 文件过短 / magic 错误 → 不预拦截（让后续 [`Checkpoint::parse_bytes`] 走
+///   标准 dispatch 返 Corrupted）。
+/// - 文件 schema == expected → `Ok(())`。
+/// - 文件 schema != expected → 立即 `Err(SchemaMismatch)`。
+fn ensure_trainer_schema(bytes: &[u8], expected_schema: u32) -> Result<(), CheckpointError> {
+    use crate::training::checkpoint::{HEADER_LEN_V1, MAGIC};
+    if bytes.len() < HEADER_LEN_V1 {
+        return Ok(());
+    }
+    if bytes[0..8] != MAGIC {
+        return Ok(());
+    }
+    let schema = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    if schema != expected_schema {
+        return Err(CheckpointError::SchemaMismatch {
+            expected: expected_schema,
+            got: schema,
+        });
+    }
+    Ok(())
 }
 
 /// Vanilla CFR DFS recurse（D-300 详解伪代码）。
@@ -650,15 +691,47 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
     fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
         let regret_table_bytes = encode_table(self.regret.inner())?;
         let strategy_sum_bytes = encode_table(self.strategy_sum.inner())?;
-        let ckpt = Checkpoint {
-            schema_version: SCHEMA_VERSION,
-            trainer_variant: TrainerVariant::EsMccfr,
-            game_variant: G::VARIANT,
-            update_count: self.update_count,
-            rng_state: self.rng_substream_seed,
-            bucket_table_blake3: self.game.bucket_table_blake3(),
-            regret_table_bytes,
-            strategy_sum_bytes,
+
+        // stage 4 D2 \[实现\] — schema_version dispatch（D-449 字面）：
+        // - G == NlheGame6 AND linear_weighting && rm_plus → 走 v2 path
+        //   (schema_version=2, trainer=EsMccfrLinearRmPlus, traverser_count=6,
+        //    4 个 stage 4 字段从 config 持久化)。
+        // - 其它（含 NlheGame6 default-config 与 SimplifiedNlheGame）→ 走 v1 path
+        //   (schema_version=1, trainer=EsMccfr, 4 个 stage 4 字段以默认值占位)。
+        let stage4_path = G::VARIANT == GameVariant::Nlhe6Max
+            && self.config.linear_weighting_enabled
+            && self.config.rm_plus_enabled;
+        let ckpt = if stage4_path {
+            let warmup_complete = self.update_count >= self.config.warmup_complete_at;
+            Checkpoint {
+                schema_version: SCHEMA_VERSION,
+                trainer_variant: TrainerVariant::EsMccfrLinearRmPlus,
+                game_variant: G::VARIANT,
+                update_count: self.update_count,
+                rng_state: self.rng_substream_seed,
+                bucket_table_blake3: self.game.bucket_table_blake3(),
+                regret_table_bytes,
+                strategy_sum_bytes,
+                traverser_count: self.game.n_players() as u8,
+                linear_weighting_enabled: true,
+                rm_plus_enabled: true,
+                warmup_complete,
+            }
+        } else {
+            Checkpoint {
+                schema_version: SCHEMA_VERSION_V1,
+                trainer_variant: TrainerVariant::EsMccfr,
+                game_variant: G::VARIANT,
+                update_count: self.update_count,
+                rng_state: self.rng_substream_seed,
+                bucket_table_blake3: self.game.bucket_table_blake3(),
+                regret_table_bytes,
+                strategy_sum_bytes,
+                traverser_count: 1,
+                linear_weighting_enabled: false,
+                rm_plus_enabled: false,
+                warmup_complete: false,
+            }
         };
         ckpt.save(path)
     }
@@ -668,9 +741,28 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
         Self: Sized,
     {
         let bytes = read_file_bytes(path)?;
+
+        // stage 4 D2 \[实现\] — schema dispatch（D-449 字面）：
+        // - G == NlheGame6 → 接受 v1 与 v2（v1 走 HU 退化兼容 / v2 走 Linear+RM+ 主路径）。
+        // - 其它 G → 严格 v1（stage 3 path）；v2 文件经此入口 → SchemaMismatch(expected=1, got=2)。
+        let (expected_trainer, expected_config) = if G::VARIANT == GameVariant::Nlhe6Max {
+            // NlheGame6 接受两个 schema；trainer_variant 预检按文件 schema 字段分流。
+            let schema = peek_schema(&bytes);
+            match schema {
+                Some(SCHEMA_VERSION) => (
+                    TrainerVariant::EsMccfrLinearRmPlus,
+                    build_linear_rm_plus_config(&self_default_config_nlhe6max(), &bytes),
+                ),
+                _ => (TrainerVariant::EsMccfr, TrainerConfig::default()),
+            }
+        } else {
+            ensure_trainer_schema(&bytes, SCHEMA_VERSION_V1)?;
+            (TrainerVariant::EsMccfr, TrainerConfig::default())
+        };
+
         preflight_trainer(
             &bytes,
-            TrainerVariant::EsMccfr,
+            expected_trainer,
             G::VARIANT,
             game.bucket_table_blake3(),
         )?;
@@ -683,13 +775,66 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             strategy_sum,
             update_count: ckpt.update_count,
             rng_substream_seed: ckpt.rng_state,
-            // stage 3 load_checkpoint 路径走 schema_version=1，对应 stage 3
-            // standard CFR + RM 模式（linear_weighting / rm_plus disable）；
-            // stage 4 schema_version=2 路径走 D2 \[实现\] 新增的 load_v2 dispatch
-            // 后从 header 字段反序列化 TrainerConfig。
-            config: TrainerConfig::default(),
+            // stage 4 D2 \[实现\]：schema=2 路径 reconstruct TrainerConfig
+            // （linear_weighting / rm_plus / warmup_complete_at 从 header
+            // 4 字段还原；warmup_complete 字段反推：true → warmup_complete_at = 0
+            //  / false → 沿用 default 1_000_000，因 update_count < default
+            //  时 step path 自然走 warmup 路径，与 byte-equal 不变量一致）。
+            config: expected_config,
         })
     }
+}
+
+/// peek 文件 `schema_version` 字段；文件不合法或 magic 错误 → `None`。
+fn peek_schema(bytes: &[u8]) -> Option<u32> {
+    use crate::training::checkpoint::{HEADER_LEN_V1, MAGIC};
+    if bytes.len() < HEADER_LEN_V1 {
+        return None;
+    }
+    if bytes[0..8] != MAGIC {
+        return None;
+    }
+    Some(u32::from_le_bytes(bytes[8..12].try_into().unwrap()))
+}
+
+/// stage 4 D2 \[实现\] — NlheGame6 + schema=2 path 默认 TrainerConfig 重建。
+///
+/// 从 v2 header 4 字段还原 `linear_weighting_enabled` /
+/// `rm_plus_enabled` / `warmup_complete_at`（warmup_complete bool → effective
+/// warmup_complete_at 字段）。读取 4 字段失败 / 文件不是 v2 → 落 default。
+fn build_linear_rm_plus_config(default: &TrainerConfig, bytes: &[u8]) -> TrainerConfig {
+    use crate::training::checkpoint::{
+        HEADER_LEN, OFFSET_LINEAR_WEIGHTING, OFFSET_RM_PLUS, OFFSET_WARMUP_COMPLETE,
+    };
+    if bytes.len() < HEADER_LEN {
+        return *default;
+    }
+    let linear = bytes[OFFSET_LINEAR_WEIGHTING] == 1;
+    let rm_plus = bytes[OFFSET_RM_PLUS] == 1;
+    let warmup_complete = bytes[OFFSET_WARMUP_COMPLETE] == 1;
+    TrainerConfig {
+        linear_weighting_enabled: linear,
+        rm_plus_enabled: rm_plus,
+        // warmup_complete=true → warmup_at=0 让 reload 后第一个 step 立即走
+        // Linear+RM+ 路径（与 save 之前的 trainer state 一致）；
+        // warmup_complete=false → 维持 default 让 step 路径继续 stage 3 path 直到
+        // update_count 跨边界（与 stage 3 anchor 兼容）。
+        warmup_complete_at: if warmup_complete {
+            0
+        } else {
+            default.warmup_complete_at
+        },
+        ..*default
+    }
+}
+
+/// stage 4 D2 \[实现\] — NlheGame6 path 的 trainer default config helper。
+///
+/// 让 [`<EsMccfrTrainer<G> as Trainer<G>>::load_checkpoint`] 在 generic G 路径下
+/// 拿到 `TrainerConfig::default()` 让 [`build_linear_rm_plus_config`] override
+/// 4 个 stage 4 字段。函数避免在 trait impl 内部使用关键字。
+fn self_default_config_nlhe6max() -> TrainerConfig {
+    TrainerConfig::default()
 }
 
 /// External-Sampling MCCFR DFS recurse（D-301 详解伪代码）。

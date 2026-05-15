@@ -396,6 +396,7 @@ fn hu_degenerate_1m_update_x_3_blake3_byte_equal_stage3_simplified_nlhe_anchor()
 /// **D2 落地前**：`SCHEMA_VERSION=1`，`Checkpoint::open` 见 schema=1 直接通过，
 /// 不返 SchemaMismatch → panic-fail。D2 bump 1→2 后转绿。
 #[test]
+#[ignore = "§D2-revM 2026-05-15（stage 4 D2 \\[实现\\] dispatch carve-out）：用户授权 Option A — Checkpoint::open 走 v1/v2 dispatch（接受两个 schema 版本）让 stage 3 既有 corruption / round-trip / warmup 测试套件全部 byte-equal 维持。本 test 期望 schema=1 文件被 Checkpoint::open 严格拒绝，但 dispatch 路径下 schema=1 走 v1 parse 合法 → 与 stage 3 兼容性政策不可同时满足。stage 3 ↔ stage 4 跨版本拒绝改由 Trainer::load_checkpoint 内置 `ensure_trainer_schema` preflight 落地（VanillaCfr/EsMccfr expected=1 / EsMccfrLinearRmPlus expected=2）；test 5 (`stage4_byte_crafted_schema_v2_file_rejected_by_stage3_kuhn_trainer_dispatch`) 字面继续覆盖该 trainer-level dispatch。本 test 留待 §D2-revM 后续 re-author（如走 Trainer::load_checkpoint dispatch 路径 / 或 byte-craft schema > 2 unsupported file）。详 `docs/pluribus_stage4_workflow.md` §D2 修订历史。"]
 fn stage3_schema_v1_kuhn_checkpoint_rejected_by_stage4_with_schema_mismatch() {
     // 走 stage 3 Kuhn trainer 真实 save 写 schema=1 文件（artifact-free）。
     let mut trainer = VanillaCfrTrainer::new(KuhnGame, FIXED_SEED);

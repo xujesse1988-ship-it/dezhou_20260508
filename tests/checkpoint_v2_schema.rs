@@ -236,18 +236,19 @@ fn checkpoint_header_field_size_addendum_32_bytes() {
         + strategy_offset_size;
     assert_eq!(new_fields_total, 20, "API-440：6 个新字段总 byte size = 20");
 
-    // stage 3 → stage 4 HEADER_LEN bump 108 → 128 让 +20 byte 新字段 + 12 byte
-    // alignment / pad_b reserved（详 doc 顶部 layout 表）。本断言走 D2 落地后
-    // panic-fail 翻面通过：当前 HEADER_LEN = 108，D2 落地后 = 128，差 = 20 +
-    // 12 = 32 byte。
-    //
-    // C1 阶段 panic-fail 让 D2 起步前 HEADER_LEN 漂移立即暴露：
+    // §D2-revM 2026-05-15（stage 4 D2 \[实现\] 落地，C1 测试 +12 算术误差订正）：
+    // stage 3 → stage 4 HEADER_LEN bump 108 → 128 = +20 byte。`new_fields_total`
+    // 统计 6 项含 regret_offset / strategy_offset（这两项 v1 已存在 8 byte，
+    // 在 v2 仅 byte offset 平移）→ 该 20 已包含 v1 → v2 总增量；不再加额外 +12
+    // pad 修正。pad_a (6 byte) 在 v1 已存在；新增 pad_b 16 byte 与 4 个 stage 4
+    // u8 共同贡献 20 byte 总增量（4 + 16 = 20，与 new_fields_total 同值）。详
+    // `docs/pluribus_stage4_workflow.md` §D2 修订历史。
     let stage_3_header_len: usize = 108;
     let stage_4_header_len: usize = 128;
     assert_eq!(
         stage_4_header_len - stage_3_header_len,
-        new_fields_total + 12,
-        "D-449：HEADER_LEN bump = 新字段 size + alignment/pad_b 12 byte"
+        new_fields_total,
+        "D-449：HEADER_LEN bump = 20 byte = 4 个新 u8 + 16-byte pad_b（与 new_fields_total 等价）"
     );
 
     // 当前 HEADER_LEN 应当 == stage_4 expected（D2 落地后），不等则 panic-fail

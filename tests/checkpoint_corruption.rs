@@ -173,13 +173,10 @@ fn schema_version_bump_plus_one_returns_schema_mismatch() {
 }
 
 #[test]
+#[ignore = "§D2-revM 2026-05-15（stage 4 D2 \\[实现\\] dispatch carve-out）：SCHEMA_VERSION bump 1 → 2 后 `Checkpoint::open` 走 v1/v2 dispatch 双路径接受（用户授权 Option A）；schema=SCHEMA_VERSION-1=1 是 legacy v1 schema 仍合法，本 \"downgrade\" 语义在 dispatch 路径下不再触达 — 留待 §D2-revM 后续 re-author（如改为 schema=0 / 跨 v2+1 测试）。详 `docs/pluribus_stage4_workflow.md` §D2 修订历史。"]
 fn schema_version_downgrade_returns_schema_mismatch() {
-    // SCHEMA_VERSION 起步 = 1，downgrade 到 0；与 schema_version_zero 等价但
-    // 文案显式表达 reader-on-newer-writer-on-older 的语义边界（D-350 schema
-    // 字段 monotonically increasing 政策：旧 reader 不读新 writer，新 reader
-    // 不读旧 writer）。
     if SCHEMA_VERSION == 0 {
-        return; // 不可达；防止 assert_eq! panic 错位。
+        return;
     }
     let mut bytes = kuhn_fixture_bytes().to_vec();
     write_schema(&mut bytes, SCHEMA_VERSION - 1);

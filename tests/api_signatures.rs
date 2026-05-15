@@ -660,8 +660,9 @@ fn _stage3_api_signature_assertions() {
     // training::checkpoint (api §5 — D2 \[实现\] 落地的 pub field + helper 常量)
     // ===================================================================
 
-    // Checkpoint pub field 类型 lock（API-350 / D-350 binary header offset 表）。
-    // 任一字段类型 / 顺序漂移立即在 `cargo test --no-run` 失败。
+    // Checkpoint pub field 类型 lock（API-350 / D-350 binary header offset 表 +
+    // stage 4 D-449 新增 4 字段，§D2-revM 字面继承 D1 \[测试\] line 880-887
+    // 内置 TODO 授权扩展）。任一字段类型 / 顺序漂移立即在 `cargo test --no-run` 失败。
     let ckpt = Checkpoint {
         schema_version: 1u32,
         trainer_variant: TrainerVariant::VanillaCfr,
@@ -671,6 +672,11 @@ fn _stage3_api_signature_assertions() {
         bucket_table_blake3: [0u8; 32],
         regret_table_bytes: Vec::new(),
         strategy_sum_bytes: Vec::new(),
+        // stage 4 D-449 / API-441 4 新字段（D1 \[测试\] line 880-887 TODO 字面）
+        traverser_count: 1u8,
+        linear_weighting_enabled: false,
+        rm_plus_enabled: false,
+        warmup_complete: false,
     };
     let _: u32 = ckpt.schema_version;
     let _: TrainerVariant = ckpt.trainer_variant;
@@ -680,6 +686,10 @@ fn _stage3_api_signature_assertions() {
     let _: [u8; 32] = ckpt.bucket_table_blake3;
     let _: Vec<u8> = ckpt.regret_table_bytes;
     let _: Vec<u8> = ckpt.strategy_sum_bytes;
+    let _: u8 = ckpt.traverser_count;
+    let _: bool = ckpt.linear_weighting_enabled;
+    let _: bool = ckpt.rm_plus_enabled;
+    let _: bool = ckpt.warmup_complete;
 
     // HEADER_LEN / TRAILER_LEN 常量值锁（D-350 binary layout 头号不变量；与
     // checkpoint_round_trip.rs::d350_binary_layout_offsets_lock 双重锁定）。

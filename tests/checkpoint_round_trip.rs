@@ -911,7 +911,10 @@ fn checkpoint_error_5_variants_exhaustive_match_lock() {
 #[test]
 fn d350_header_constants_lock() {
     assert_eq!(MAGIC, *b"PLCKPT\0\0", "D-350 magic 字面字节序列锁");
-    assert_eq!(SCHEMA_VERSION, 1, "D-350 SCHEMA_VERSION 起步值 = 1");
+    // §D2-revM（2026-05-15，stage 4 D2 \[实现\] 落地）：SCHEMA_VERSION
+    // bump 1 → 2 后本断言改 == 2；stage 3 trainer 仍写 schema=1（Checkpoint::open
+    // dispatch v1/v2 双路径接受）— 详 `docs/pluribus_stage4_workflow.md` §D2 修订历史。
+    assert_eq!(SCHEMA_VERSION, 2, "D-449 stage 4 SCHEMA_VERSION = 2");
 }
 
 #[test]
