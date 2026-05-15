@@ -1,0 +1,27 @@
+# stage 4 §F1 [测试] checkpoint BLAKE3 baseline（linux/x86_64）— F1 closure
+# placeholder mode（0 个 seed=... 行 → tests/cross_host_blake3.rs::
+# stage4_cross_host_baseline_byte_equal_for_current_arch 走 skip-with-message
+# 路径，让 default profile 8 active anchor 通过条件不退化）。
+#
+# stage 4 baseline 内容由用户授权 AWS c7a.8xlarge × 32 vCPU 或 vultr 1-CPU host
+# 跑：
+#
+#     cargo test --release --test cross_host_blake3 -- --ignored \
+#         stage4_cross_host_capture_only --nocapture > tests/data/\
+#         checkpoint-hashes-linux-x86_64-stage4.txt
+#
+# 生成 32 行 `seed=<dec> hash=<64-hex>` 字面后翻面成 active byte-equal
+# regression（D-484 stage 4 模式同 stage 3 D-362 32-seed × 5 iter Kuhn）。
+#
+# placeholder 模式判定规则：tests/cross_host_blake3.rs::stage4_baseline_is_
+# placeholder(&content) — `content.lines().filter(starts_with("seed=")).count()
+# == 0` → 视 placeholder → skip-with-message 不 panic。
+#
+# F2 [实现] / F3 [报告] 翻面顺序：
+# 1. F2 [实现] commit 落地 SlumbotBridge / Opponent6Max / MetricsCollector
+#    impl（不影响 NlheGame6 trainer 路径；checkpoint hash 在 stage 4 E2 closure
+#    后已稳定）。
+# 2. 用户授权 AWS c7a.8xlarge × 32 vCPU 实例跑 stage4_cross_host_capture_only
+#    --ignored，wall-time ~5-10 min（10⁵ × 32 seeds），输出 32 行写入本文件。
+# 3. F3 [报告] commit 把更新后的本文件 + scripts/capture-checkpoint-hashes-
+#    stage4.sh 一并 commit；翻面成 active byte-equal regression。

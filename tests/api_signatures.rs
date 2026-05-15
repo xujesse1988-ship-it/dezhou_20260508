@@ -1066,6 +1066,18 @@ fn _stage4_api_signature_assertions() {
     ];
 
     // ---------------------------------------------------------------
+    // API-472 — EsMccfrTrainer::metrics(&self) -> &TrainingMetrics
+    // （read-only 接口，D-473 字面 trainer 不主动 abort）。**F1 [测试] 状态**：
+    // `metrics()` 方法尚未落地 src/training/trainer.rs（F2 [实现] 起步前
+    // 翻面接入 MetricsCollector::observe 路径）。这里只做 expected return
+    // type const sanity；F2 [实现] 落地 `pub fn metrics(&self) -> &TrainingMetrics`
+    // 后翻面成 UFCS bind：
+    //   let _: for<'a> fn(&'a EsMccfrTrainer<NlheGame6>) -> &'a TrainingMetrics =
+    //       EsMccfrTrainer::<NlheGame6>::metrics;
+    // ---------------------------------------------------------------
+    let _: TrainingMetrics = TrainingMetrics::zero();
+
+    // ---------------------------------------------------------------
     // API-473 — MetricsCollector::new constructor
     // ---------------------------------------------------------------
     let _: fn(u64) -> MetricsCollector = MetricsCollector::new;
