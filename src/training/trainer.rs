@@ -48,6 +48,11 @@ pub trait Trainer<G: Game> {
     /// 已完成 iter / update 数（Vanilla CFR: iter；ES-MCCFR: per-player update）。
     fn update_count(&self) -> u64;
 
+    /// stage 4 F2 \[实现\] — 公开 game 引用（baseline_eval / slumbot_eval /
+    /// metrics 路径需要访问 game 内部 [`Game::n_players`] / [`Game::root`] /
+    /// [`Game::next`] 等静态方法 + NlheGame6 specific config）。
+    fn game_ref(&self) -> &G;
+
     /// 写出 checkpoint（D-353 write-to-temp + atomic rename + D-352 trailer BLAKE3）。
     fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError>;
 
@@ -249,6 +254,10 @@ impl<G: Game> Trainer<G> for VanillaCfrTrainer<G> {
         self.iter
     }
 
+    fn game_ref(&self) -> &G {
+        &self.game
+    }
+
     fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
         let regret_table_bytes = encode_table(self.regret.inner())?;
         let strategy_sum_bytes = encode_table(self.strategy_sum.inner())?;
@@ -439,6 +448,11 @@ pub struct EsMccfrTrainer<G: Game> {
     /// stage 4 API-401 — trainer 配置（默认 stage 3 standard CFR + RM 路径，
     /// `with_linear_rm_plus()` builder 切到 stage 4 Linear MCCFR + RM+ 模式）。
     pub(crate) config: TrainerConfig,
+    /// stage 4 API-472 — 训练监控指标（trainer 不主动 abort；CLI 根据
+    /// `metrics().last_alarm` 决策，D-473 字面）。由
+    /// [`crate::training::metrics::MetricsCollector::observe`] 在每
+    /// `metrics_interval` update 更新。
+    pub(crate) metrics: crate::training::metrics::TrainingMetrics,
 
     /// stage 4 E2 \[实现\] — 6-traverser independent table arrays（D-412 字面
     /// "6 套独立 RegretTable + StrategyAccumulator 每 traverser 1 套"）。
@@ -516,8 +530,16 @@ impl<G: Game> EsMccfrTrainer<G> {
             update_count: 0,
             rng_substream_seed,
             config: TrainerConfig::default(),
+            metrics: crate::training::metrics::TrainingMetrics::zero(),
             per_traverser: None,
         }
+    }
+
+    /// stage 4 API-472 — read-only metrics 接口（D-473 字面）。trainer 不主动
+    /// abort；CLI / 用户根据 metrics 决策（`--abort-on-alarm {none,p0,all}`
+    /// flag，D-473 字面）。
+    pub fn metrics(&self) -> &crate::training::metrics::TrainingMetrics {
+        &self.metrics
     }
 
     /// stage 4 E2 \[实现\] — 6-traverser per-traverser table 激活条件
@@ -994,6 +1016,10 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
         self.update_count
     }
 
+    fn game_ref(&self) -> &G {
+        &self.game
+    }
+
     fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
         // stage 4 D2 \[实现\] — schema_version dispatch（D-449 字面）：
         // - G == NlheGame6 AND linear_weighting && rm_plus → 走 v2 path
@@ -1135,6 +1161,7 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             //  / false → 沿用 default 1_000_000，因 update_count < default
             //  时 step path 自然走 warmup 路径，与 byte-equal 不变量一致）。
             config: expected_config,
+            metrics: crate::training::metrics::TrainingMetrics::zero(),
             per_traverser,
         })
     }

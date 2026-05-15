@@ -246,6 +246,12 @@ impl NlheGame6 {
         );
         mask
     }
+
+    /// stage 4 F2 \[实现\] — 公开 [`TableConfig`] 引用（baseline_eval / slumbot_eval
+    /// 路径需要 big_blind 用于 mbb/g 单位换算）。
+    pub fn config(&self) -> &TableConfig {
+        &self.config
+    }
 }
 
 /// 6-player NLHE 完整状态（API-410）。
