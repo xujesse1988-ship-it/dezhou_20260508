@@ -29,9 +29,12 @@ use std::thread;
 use std::time::Instant;
 
 use poker::eval::NaiveHandEvaluator;
+use poker::training::baseline_eval::{evaluate_vs_baseline, RandomOpponent};
 use poker::training::kuhn::{KuhnGame, KuhnInfoSet};
+use poker::training::lbr::LbrEvaluator;
 use poker::training::leduc::{LeducGame, LeducInfoSet};
 use poker::training::nlhe::SimplifiedNlheGame;
+use poker::training::nlhe_6max::NlheGame6;
 use poker::training::{
     exploitability, EsMccfrTrainer, KuhnBestResponse, LeducBestResponse, Trainer, VanillaCfrTrainer,
 };
@@ -905,5 +908,593 @@ fn stage3_leduc_best_response_under_1s_release() {
     assert!(
         elapsed.as_secs_f64() < 1.0,
         "Leduc exploitability 单次计算耗时 {ms:.2} ms ≥ D-348 字面阈值 1000 ms",
+    );
+}
+
+// ============================================================================
+// 阶段 4 §E1 §输出：stage4_* SLO 阈值断言（`pluribus_stage4_validation.md` §通过
+// 标准 + `pluribus_stage4_decisions.md` §10 D-490 + §6 D-454 + §9 D-485 +
+// §11 D-461 / D-498 + workflow §E1 line 264）
+// ============================================================================
+//
+// 8 条 stage 4 性能 SLO 断言：
+//   ① D-490 单线程 ≥ 5K update/s release
+//   ② D-490 4-core ≥ 15K update/s release（效率 ≥ 0.75）
+//   ③ D-490 32-vCPU ≥ 20K update/s release（AWS c7a.8xlarge）
+//   ④ D-454 LBR computation P95 < 30 s for 1000 hand × 6 traverser
+//   ⑤ D-485 baseline sanity 1-2 min wall time（3 类 × 3 seed）
+//   ⑥ D-461 24h continuous run 至少触达 first usable 10⁹ update（wall-time SLO）
+//   ⑦ D-498 7-day nightly fuzz 无 panic（CI nightly fuzz wrapper）
+//   ⑧ D-490 6-traverser per-traverser throughput cross-check（D-414 6 套独立
+//      RegretTable 避免 1 traverser 主导虚假通过）
+//
+// 与 stage 1 / 2 / 3 SLO 同形态：release-only opt-in via `cargo test --release
+// --test perf_slo -- --ignored`，全 `#[ignore]` 让 CI 默认套件不破红。
+//
+// **E1 closure 期望**：default profile 14 测试 panic-fail（`#[ignore]` 跳过；
+// opt-in --ignored 触发后 ④ LBR P95 / ⑤ baseline 走 `unimplemented!()` 路径
+// panic；①②③⑥⑧ 走 `EsMccfrTrainer<NlheGame6>::step` 实测，C2 single-shared
+// RegretTable + traverser alternating 路径 single-thread 与 stage 3 SLO 退化
+// 1/2 ≈ 4-5K update/s，可能边界；E2 \[实现\] 6-traverser 数组 + rayon thread
+// pool 真并发后 32-vCPU AWS c7a.8xlarge 达 20K update/s）。⑦ nightly fuzz 走
+// 7 × 24h external orchestration，本测试为 panic-fail 标记符（CI nightly job
+// orchestrator 由 stage 4 F3 报告时配置）。
+//
+// **角色边界**：本节属 stage 4 \[测试\] agent。\[实现\] agent 不得修改。
+
+/// stage 4 D-424 v3 production artifact path（继承 stage 3 D-314-rev1 lock）。
+const STAGE4_V3_ARTIFACT_PATH: &str = STAGE3_V3_ARTIFACT_PATH;
+
+/// stage 4 D-424 v3 artifact body BLAKE3 ground truth（CLAUDE.md 当前 artifact 基线）。
+const STAGE4_V3_BODY_BLAKE3_HEX: &str = STAGE3_V3_BODY_BLAKE3_HEX;
+
+/// stage 4 D-409 字面 warm-up 切换点（前 1M update 走 stage 3 standard
+/// CFR + RM 维持 BLAKE3 byte-equal anchor；之后切 Linear MCCFR + RM+）。
+const STAGE4_WARMUP_COMPLETE_AT: u64 = 1_000_000;
+
+/// stage 4 D-490 ① 单线程 SLO 测量 update 数（≥ 5K update/s 下 20K updates
+/// ≈ 4 s baseline，与 stage 3 STAGE3_NLHE_SINGLE_THREAD_UPDATES 同型）。
+const STAGE4_SINGLE_THREAD_UPDATES: u64 = 20_000;
+
+/// stage 4 D-490 ② 4-core SLO 测量 update 数（≥ 15K update/s 下 60K updates
+/// ≈ 4 s baseline）。
+const STAGE4_FOUR_CORE_UPDATES: u64 = 60_000;
+
+/// stage 4 D-490 ③ 32-vCPU SLO 测量 update 数（≥ 20K update/s 下 80K updates
+/// ≈ 4 s baseline）。
+const STAGE4_32VCPU_UPDATES: u64 = 80_000;
+
+/// stage 4 D-490 6-traverser cross-check：每 traverser 至少 1K update 让 6 套
+/// 独立 RegretTable（E2 \[实现\] 落地后）触达 steady-state（D-412 字面
+/// alternating 6 traverser 路径下，6K total updates / 6 traverser = 1K per
+/// traverser）。
+const STAGE4_SIX_TRAVERSER_PER_TRAVERSER_UPDATES: u64 = 1_000;
+
+/// stage 4 D-454 LBR computation 单次采样 hand 数（D-452 字面 1000 hand /
+/// LBR-player）。
+const STAGE4_LBR_N_HANDS: u64 = 1_000;
+
+/// stage 4 D-485 baseline sanity 单 baseline 评测 hand 数（D-481 字面 1M 手 /
+/// baseline；E1 SLO 测试为 wall-time sanity，取 D-485 评测 wall time ≤ 2 min
+/// 字面 = `tests/perf_slo` 跑 1M × 3 baseline × 3 seed = 9M hand 总 wall time
+/// ≤ 2 min；本测试取代表性 1M × 3 baseline = 3M hand sub-sample 减低对单 host
+/// 1-CPU dev box 友好度，AWS 32-vCPU 跑全 1M × 3 × 3 seed）。
+const STAGE4_BASELINE_HANDS: u64 = 1_000_000;
+
+/// stage 4 D-454 LBR computation P95 wall-time 上界（`< 30 s` for 1000 hand
+/// × 6 traverser，候选机器 4-core EPYC）。
+const STAGE4_LBR_P95_SECS: f64 = 30.0;
+
+/// stage 4 D-485 baseline sanity 总 wall-time 上界（`≤ 2 min` for 3 类 × 3
+/// seed @ 32-vCPU c7a.8xlarge；dev box 1-CPU 给 4 min 余量 + pass-with-skip）。
+const STAGE4_BASELINE_TOTAL_WALL_SECS: f64 = 120.0;
+
+/// stage 4 D-490 SLO 阈值（update/s）。
+const STAGE4_SLO_SINGLE_THREAD: f64 = 5_000.0;
+const STAGE4_SLO_FOUR_CORE: f64 = 15_000.0;
+const STAGE4_SLO_32VCPU: f64 = 20_000.0;
+
+/// stage 4 D-490 6-traverser cross-check：D-459 字面单 traverser 偏离 6-traverser
+/// average > 50% 视为 alternating 路径主导 → carve-out trigger（E2 \[实现\] 真
+/// 6 套独立表落地后字面通过）。
+const STAGE4_SIX_TRAVERSER_DEVIATION_PCT: f64 = 50.0;
+
+/// 加载 v3 artifact 并构造 `NlheGame6`；artifact 缺失 / schema 不匹配 /
+/// `NlheGame6::new` 失败时 eprintln + 返回 `None`（pass-with-skip），与 stage 3
+/// `stage3_load_v3_artifact_or_skip` / `tests/training_24h_continuous.rs` 同型。
+fn stage4_load_v3_artifact_or_skip() -> Option<NlheGame6> {
+    let path = PathBuf::from(STAGE4_V3_ARTIFACT_PATH);
+    if !path.exists() {
+        eprintln!(
+            "[stage4-nlhe-slo] skip: v3 artifact `{STAGE4_V3_ARTIFACT_PATH}` 不存在（CI / \
+             GitHub-hosted runner 典型场景；本地 dev box / vultr / AWS host 有 artifact 时跑）。"
+        );
+        return None;
+    }
+    let table = match BucketTable::open(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[stage4-nlhe-slo] skip: BucketTable::open 失败：{e:?}");
+            return None;
+        }
+    };
+    let body_hex = stage3_blake3_hex(&table.content_hash());
+    if body_hex != STAGE4_V3_BODY_BLAKE3_HEX {
+        eprintln!(
+            "[stage4-nlhe-slo] skip: artifact body BLAKE3 `{body_hex}` 不匹配 v3 ground truth \
+             `{STAGE4_V3_BODY_BLAKE3_HEX}`（D-424 lock 要求 v3 artifact）。"
+        );
+        return None;
+    }
+    match NlheGame6::new(Arc::new(table)) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[stage4-nlhe-slo] skip: NlheGame6::new 失败：{e:?}");
+            None
+        }
+    }
+}
+
+/// 构造 stage 4 NlheGame6 + Linear+RM+ trainer（warmup_at=1M，D-409 主路径）。
+fn stage4_build_trainer(game: NlheGame6, master_seed: u64) -> EsMccfrTrainer<NlheGame6> {
+    EsMccfrTrainer::new(game, master_seed).with_linear_rm_plus(STAGE4_WARMUP_COMPLETE_AT)
+}
+
+// ----------------------------------------------------------------------------
+// SLO ①：NlheGame6 Linear MCCFR + RM+ 单线程 release `≥ 5K update/s`（D-490 ①）
+// ----------------------------------------------------------------------------
+
+/// stage 4 D-490 ① 字面下界 `≥ 5,000 update/s` release 单线程 for NlheGame6
+/// Linear MCCFR + RM+。
+///
+/// **E1 closure 形态**：C2 + D2 commit 上 `EsMccfrTrainer<NlheGame6>` 走
+/// single-shared `RegretTable` + `traverser = update_count % 6` alternating
+/// 路径（§D2-revM table-array deferral，runtime 真实多表 deferred 到 E2
+/// \[实现\]）；14-action × 6-player 路径长度比 stage 3 5-action × 2-player
+/// 增加 2-3×，throughput 估计退化 1/2 ≈ 4-5K update/s 单线程，边界紧。
+/// **E2 \[实现\]** 落地 D-321-rev2 thread-local accumulator + batch merge +
+/// SmallVec hot path + D-401-revM lazy decay（若需）后达 ≥ 5K update/s。
+///
+/// stage 3 D-361 单线程 ≥ 10K update/s（5-action × 2-player）→ stage 4 D-490 ①
+/// ≥ 5K update/s 字面退化 1/2，与 14-action / 5-action × 6-player / 2-player
+/// 比例一致。
+#[test]
+#[ignore = "stage4 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage4_nlhe_6max_single_thread_throughput_ge_5k_update_per_s() {
+    let Some(game) = stage4_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0xE415_014E_4C48_45FF;
+    let mut trainer = stage4_build_trainer(game, master_seed);
+    let mut rng = ChaCha20Rng::from_seed(master_seed);
+
+    // warm-up 100 update：触发 RegretTable lazy alloc，让 throughput 测量段落
+    // 只反映 steady-state cost。
+    for _ in 0..100 {
+        trainer.step(&mut rng).expect("stage4 NLHE warm-up step");
+    }
+
+    let start = Instant::now();
+    for _ in 0..STAGE4_SINGLE_THREAD_UPDATES {
+        trainer
+            .step(&mut rng)
+            .expect("stage4 NLHE Linear MCCFR + RM+ step 期望成功");
+    }
+    let elapsed = start.elapsed();
+    let throughput = STAGE4_SINGLE_THREAD_UPDATES as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "[stage4-nlhe-single] 实测 {STAGE4_SINGLE_THREAD_UPDATES} update / {:.3} s = \
+         {throughput:.0} update/s（D-490 ① SLO 门槛 ≥ {STAGE4_SLO_SINGLE_THREAD:.0}）",
+        elapsed.as_secs_f64(),
+    );
+    assert!(
+        throughput >= STAGE4_SLO_SINGLE_THREAD,
+        "NlheGame6 Linear MCCFR + RM+ 单线程 {throughput:.0} update/s < D-490 ① 字面阈值 \
+         {STAGE4_SLO_SINGLE_THREAD:.0} update/s（E1 closure 期望 C2+D2 路径边界紧；E2 \\[实现\\] \
+         真并发 + lazy decay 翻面后必须通过）",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO ②：NlheGame6 Linear MCCFR + RM+ 4-core release `≥ 15K update/s`（D-490 ②）
+// ----------------------------------------------------------------------------
+
+/// stage 4 D-490 ② 字面下界 `≥ 15,000 update/s` release 4-core for NlheGame6
+/// Linear MCCFR + RM+（效率 ≥ 0.75）。
+///
+/// **E1 closure 形态**：D2 commit 上 `EsMccfrTrainer<NlheGame6>::step_parallel`
+/// 走 serial-equivalent fallback（继承 stage 3 D-321-rev1）；4-core throughput
+/// ≈ 单线程 ≈ 4-5K update/s，远低于 ≥ 15K SLO。**E2 \[实现\]** 落地 D-321-rev2
+/// 真并发（thread-local accumulator + append-only delta merge，继承 stage 3
+/// E2-rev1 vultr 4-core 1.78× efficiency）后达 ≥ 15K update/s。
+///
+/// host 限制：`thread::available_parallelism() < 4` 时 eprintln + return
+/// （pass-with-skip）；与 stage 3 4-core SLO 同型 host-load skip 路径。
+#[test]
+#[ignore = "stage4 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage4_nlhe_6max_four_core_throughput_ge_15k_update_per_s() {
+    let cores_target = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if cores_target < 4 {
+        eprintln!(
+            "[stage4-nlhe-4core] skip: host 仅 {cores_target} core，< 4 core 无法验证 \
+             D-490 ② 4-core SLO（AWS c7a.8xlarge × 32 vCPU 实测时跑）。"
+        );
+        return;
+    }
+    let Some(game) = stage4_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0xE415_024E_3443_52FF;
+    let mut trainer = stage4_build_trainer(game, master_seed);
+    let mut rng_pool: Vec<Box<dyn RngSource>> = (0..4u64)
+        .map(|tid| {
+            let seeded = master_seed.wrapping_add(0xDEAD_BEEF_u64.wrapping_mul(tid + 1));
+            Box::new(ChaCha20Rng::from_seed(seeded)) as Box<dyn RngSource>
+        })
+        .collect();
+
+    // warm-up 1 round（4 update）：触发 RegretTable lazy alloc。
+    trainer
+        .step_parallel(&mut rng_pool, 4)
+        .expect("stage4 NLHE warm-up step_parallel");
+
+    let n_calls = STAGE4_FOUR_CORE_UPDATES / 4;
+    let start = Instant::now();
+    for _ in 0..n_calls {
+        trainer
+            .step_parallel(&mut rng_pool, 4)
+            .expect("stage4 NLHE step_parallel 期望成功");
+    }
+    let elapsed = start.elapsed();
+    let total_updates = n_calls * 4;
+    let throughput = total_updates as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "[stage4-nlhe-4core] 实测 {total_updates} update / {:.3} s = {throughput:.0} \
+         update/s（D-490 ② SLO 门槛 ≥ {STAGE4_SLO_FOUR_CORE:.0}；D2 serial-fallback 期望失败，\
+         E2 \\[实现\\] D-321-rev2 真并发落地后必须通过）",
+        elapsed.as_secs_f64(),
+    );
+    assert!(
+        throughput >= STAGE4_SLO_FOUR_CORE,
+        "NlheGame6 Linear MCCFR + RM+ 4-core {throughput:.0} update/s < D-490 ② 字面阈值 \
+         {STAGE4_SLO_FOUR_CORE:.0} update/s（E1 closure 期望失败；E2 真并发实现后必须通过）",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO ③：NlheGame6 Linear MCCFR + RM+ 32-vCPU release `≥ 20K update/s`（D-490 ③）
+// ----------------------------------------------------------------------------
+
+/// stage 4 D-490 ③ 字面下界 `≥ 20,000 update/s` release 32-vCPU for NlheGame6
+/// Linear MCCFR + RM+（AWS c7a.8xlarge 字面 host，效率 ≥ 0.13）。
+///
+/// **E1 closure 形态**：仅在 host `available_parallelism >= 32` 时触发；
+/// dev box / vultr 4-core / 8-core 走 pass-with-skip。AWS c7a.8xlarge 32-vCPU
+/// 实测前 E2 \[实现\] 必须落地真并发 thread pool（D-321-rev2 + rayon long-lived
+/// pool）。32-vCPU 受限于 HashMap contention + AWS Hyperthread sibling 竞争 +
+/// L3 cache pressure，efficiency 估计 0.1-0.2 之间，throughput 估计 20K-30K
+/// update/s。
+///
+/// 10⁹ update / 20K update/s ≈ 14 h × c7a.8xlarge $1.36/h ≈ $20 first usable
+/// 训练 cost。
+#[test]
+#[ignore = "stage4 perf SLO; AWS c7a.8xlarge × 32 vCPU 实测；opt-in via `--ignored`"]
+fn stage4_nlhe_6max_32vcpu_throughput_ge_20k_update_per_s() {
+    let cores_target = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    if cores_target < 32 {
+        eprintln!(
+            "[stage4-nlhe-32vcpu] skip: host {cores_target} core，< 32 core 无法验证 \
+             D-490 ③ 32-vCPU SLO（AWS c7a.8xlarge × 32 vCPU 实测时跑）。"
+        );
+        return;
+    }
+    let Some(game) = stage4_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0xE415_0332_5643_5055;
+    let mut trainer = stage4_build_trainer(game, master_seed);
+    let mut rng_pool: Vec<Box<dyn RngSource>> = (0..32u64)
+        .map(|tid| {
+            let seeded = master_seed.wrapping_add(0xC0FF_EE00_u64.wrapping_mul(tid + 1));
+            Box::new(ChaCha20Rng::from_seed(seeded)) as Box<dyn RngSource>
+        })
+        .collect();
+
+    // warm-up 1 round（32 update）：触发 RegretTable lazy alloc。
+    trainer
+        .step_parallel(&mut rng_pool, 32)
+        .expect("stage4 NLHE 32-vCPU warm-up step_parallel");
+
+    let n_calls = STAGE4_32VCPU_UPDATES / 32;
+    let start = Instant::now();
+    for _ in 0..n_calls {
+        trainer
+            .step_parallel(&mut rng_pool, 32)
+            .expect("stage4 NLHE step_parallel 期望成功（32-vCPU）");
+    }
+    let elapsed = start.elapsed();
+    let total_updates = n_calls * 32;
+    let throughput = total_updates as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "[stage4-nlhe-32vcpu] 实测 {total_updates} update / {:.3} s = {throughput:.0} \
+         update/s（D-490 ③ SLO 门槛 ≥ {STAGE4_SLO_32VCPU:.0}；E2 \\[实现\\] D-321-rev2 真并发 + \
+         rayon pool 落地后必须通过）",
+        elapsed.as_secs_f64(),
+    );
+    assert!(
+        throughput >= STAGE4_SLO_32VCPU,
+        "NlheGame6 Linear MCCFR + RM+ 32-vCPU {throughput:.0} update/s < D-490 ③ 字面阈值 \
+         {STAGE4_SLO_32VCPU:.0} update/s（E1 closure 期望失败；E2 真并发 + rayon long-lived \
+         pool 落地后必须通过）",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO ④：LBR computation P95 `< 30 s` for 1000 hand × 6 traverser（D-454）
+// ----------------------------------------------------------------------------
+
+/// stage 4 D-454 字面上界 `< 30 s` release for LBR computation on 1000 hand ×
+/// 6 traverser（候选机器 4-core EPYC）。
+///
+/// **E1 closure 形态**：`LbrEvaluator::compute_six_traverser_average` A1 \[实现\]
+/// scaffold 走 `unimplemented!()`，opt-in `--ignored` 触发后立即 panic-fail。
+/// **E2 \[实现\]** 落地 LBR Rust 自实现（D-453 + D-450 + D-455 myopic horizon=1
+/// + D-456 14-action enumerate）后达 < 30 s。
+///
+/// stage 4 训练 100 个 LBR 采样点共耗 `~50 min`，与训练总 wall-time 14-18 h
+/// 占比 `~5%`，可接受。
+#[test]
+#[ignore = "stage4 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage4_lbr_computation_p95_under_30s() {
+    let Some(game) = stage4_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0xE415_044C_4252_5045;
+    let trainer = stage4_build_trainer(game, master_seed);
+    let trainer_arc = Arc::new(trainer);
+    // D-456 字面 14-action / D-455 字面 myopic horizon = 1。
+    let evaluator = LbrEvaluator::<NlheGame6>::new(Arc::clone(&trainer_arc), 14, 1)
+        .expect("LbrEvaluator::new(action_set_size=14, myopic_horizon=1) 期望成功");
+    let mut rng = ChaCha20Rng::from_seed(master_seed.wrapping_add(1));
+
+    let start = Instant::now();
+    let result = evaluator
+        .compute_six_traverser_average(STAGE4_LBR_N_HANDS, &mut rng)
+        .expect("compute_six_traverser_average 期望成功");
+    let elapsed = start.elapsed();
+    let secs = elapsed.as_secs_f64();
+    eprintln!(
+        "[stage4-lbr-p95] LBR 6-traverser × {STAGE4_LBR_N_HANDS} hand wall-time {secs:.2} s \
+         （SLO 门槛 ≤ {STAGE4_LBR_P95_SECS:.0} s）; average_mbbg = {:.2} / max = {:.2} / min = {:.2}",
+        result.average_mbbg, result.max_mbbg, result.min_mbbg,
+    );
+    assert!(
+        secs < STAGE4_LBR_P95_SECS,
+        "LBR computation wall-time {secs:.2} s ≥ D-454 字面阈值 {STAGE4_LBR_P95_SECS:.0} s\
+         （E1 closure A1 scaffold panic；E2 \\[实现\\] LBR 自实现落地后必须通过）",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO ⑤：baseline sanity 1-2 min wall time（D-485）
+// ----------------------------------------------------------------------------
+
+/// stage 4 D-485 字面上界 `≤ 2 min` wall time for 3 类 baseline × 3 seed
+/// （c7a.8xlarge 32-vCPU 估算）。
+///
+/// **E1 closure 形态**：`evaluate_vs_baseline` A1 \[实现\] scaffold 走
+/// `unimplemented!()`，opt-in 触发后立即 panic-fail。**F2 \[实现\]** 落地
+/// `Opponent6Max::act` 3 baseline impl + 1M 手评测 + 9 配置（3 baseline ×
+/// 3 seed）后达 ≤ 2 min wall time（c7a.8xlarge 32-vCPU 实测）。
+///
+/// dev box / vultr 1-CPU 给 4 min 余量；本测试取代表性 RandomOpponent × 1
+/// seed × `STAGE4_BASELINE_HANDS = 1M 手` sub-sample 作为 wall-time anchor。
+#[test]
+#[ignore = "stage4 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage4_baseline_eval_under_2min() {
+    let Some(game) = stage4_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0xE415_0542_4153_454C;
+    let trainer = stage4_build_trainer(game, master_seed);
+    let mut opponent = RandomOpponent;
+    let mut rng = ChaCha20Rng::from_seed(master_seed.wrapping_add(1));
+
+    let start = Instant::now();
+    let result = evaluate_vs_baseline::<NlheGame6, _, _>(
+        &trainer,
+        &mut opponent,
+        STAGE4_BASELINE_HANDS,
+        master_seed,
+        &mut rng,
+    )
+    .expect("evaluate_vs_baseline 期望成功");
+    let elapsed = start.elapsed();
+    let secs = elapsed.as_secs_f64();
+    eprintln!(
+        "[stage4-baseline-eval] 单 baseline × 1M 手 wall-time {secs:.2} s（SLO 门槛 \
+         3 类 × 3 seed ≤ {STAGE4_BASELINE_TOTAL_WALL_SECS:.0} s）; mean = {:.2} mbb/g / \
+         opponent = {}",
+        result.mean_mbbg, result.opponent_name,
+    );
+    // 单 baseline × 1 seed 的 9 倍上界 ≤ 2 min wall time（D-485 字面 3 × 3 配置）
+    assert!(
+        secs * 9.0 < STAGE4_BASELINE_TOTAL_WALL_SECS,
+        "单 baseline × 1 seed wall-time {secs:.2} s × 9 配置 = {:.2} s ≥ D-485 字面阈值 \
+         {STAGE4_BASELINE_TOTAL_WALL_SECS:.0} s（E1 closure A1 scaffold panic；F2 \\[实现\\] \
+         3 baseline impl 落地后必须通过）",
+        secs * 9.0,
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO ⑥：24h continuous run wall-time `≥ 10⁹ update / 24h`（D-461）
+// ----------------------------------------------------------------------------
+
+/// stage 4 D-461 字面 24h continuous run wall-time SLO：24h 连续训练**至少**
+/// 触达 first usable 10⁹ update（D-440 字面 first usable 阈值）。
+///
+/// 数学形式：throughput 必须 ≥ 10⁹ / (24 × 3600) ≈ 11,574 update/s。stage 4
+/// D-490 ② 4-core ≥ 15K update/s 给 ~30% 余量；D-490 ③ 32-vCPU ≥ 20K update/s
+/// 给 ~73% 余量。
+///
+/// **E1 closure 形态**：本测试在 release/--ignored opt-in 下触发，跑 sub-sample
+/// 1M update 实测 throughput 后外推 24h 总 update 数 ≥ 10⁹。`tests/
+/// training_24h_continuous.rs::stage4_six_max_24h_no_crash` 是真实 24h wall-time
+/// 测试；本 SLO 是 wall-time 上界 sanity check 让 `perf_slo` opt-in 套件覆盖
+/// D-461 字面（与 `training_24h_continuous` 测试解耦避免 24h × 1 run 阻塞 SLO
+/// 套件）。
+#[test]
+#[ignore = "stage4 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage4_24h_continuous_wall_time_ge_1e9_update_per_24h() {
+    let Some(game) = stage4_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0xE415_0632_3468_4F55;
+    let mut trainer = stage4_build_trainer(game, master_seed);
+    let mut rng = ChaCha20Rng::from_seed(master_seed);
+
+    // warm-up 100 update + sub-sample 100K update 实测 throughput。
+    for _ in 0..100 {
+        trainer.step(&mut rng).expect("stage4 D-461 warm-up step");
+    }
+    const SUB_SAMPLE_UPDATES: u64 = 100_000;
+    let start = Instant::now();
+    for _ in 0..SUB_SAMPLE_UPDATES {
+        trainer
+            .step(&mut rng)
+            .expect("stage4 D-461 sub-sample step 期望成功");
+    }
+    let elapsed = start.elapsed();
+    let throughput = SUB_SAMPLE_UPDATES as f64 / elapsed.as_secs_f64();
+    let projected_24h_updates = throughput * 24.0 * 3600.0;
+    eprintln!(
+        "[stage4-d461-24h] 实测 {SUB_SAMPLE_UPDATES} update / {:.3} s = {throughput:.0} \
+         update/s → 24h projected = {projected_24h_updates:.2e} update（SLO 门槛 ≥ 10⁹ = \
+         first usable D-440 字面）",
+        elapsed.as_secs_f64(),
+    );
+    let first_usable_threshold = 1.0e9_f64;
+    assert!(
+        projected_24h_updates >= first_usable_threshold,
+        "stage4 24h continuous projected updates {projected_24h_updates:.2e} < D-440 字面 \
+         first usable 10⁹（throughput {throughput:.0} update/s × 24h × 3600 s）；E1 closure \
+         single-shared RegretTable 路径下 throughput 不足；E2 \\[实现\\] 真并发 + rayon pool \
+         落地后必须通过",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO ⑦：7-day nightly fuzz 无 panic / NaN / Inf（D-498）
+// ----------------------------------------------------------------------------
+
+/// stage 4 D-498 字面 7-day nightly fuzz：CI nightly fuzz = stage 4 24h
+/// continuous + 全 panic / NaN 监控 + checkpoint round-trip + monitoring 阈值；
+/// 连续 7 天无 panic 是 stage 4 carve-out（继承 stage 1 + stage 2 + stage 3
+/// 24h fuzz carve-out 模式）。
+///
+/// **E1 closure 形态**：本测试为 panic-fail 标记符（7 × 24h × 7 day = 168h
+/// wall-time 不在 perf_slo opt-in 套件内跑；由 stage 4 F3 \[报告\] CI nightly
+/// job orchestrator 配置外部 7 days × 1 run 调用 `tests/
+/// training_24h_continuous.rs::stage4_six_max_24h_no_crash` 7 次 + 收集 panic
+/// 计数）。本测试在 `--ignored` opt-in 下立即 eprintln + panic 提示 orchestrator
+/// 路径，不实际跑 7 天。E2 \[实现\] 落地 + orchestrator 配置后此测试 body 改为
+/// 读 CI nightly job status JSON / 调 `gh workflow runs list --workflow=
+/// stage4-nightly-fuzz.yml` 验证连续 7 天 status=success。
+#[test]
+#[ignore = "stage4 perf SLO; CI nightly orchestrator-only；opt-in via `--ignored` panic 标记符"]
+fn stage4_7day_nightly_fuzz_no_crash() {
+    eprintln!(
+        "[stage4-d498-7day] D-498 字面 7-day nightly fuzz 由 stage 4 F3 \\[报告\\] CI nightly \
+         job orchestrator 实施（7 × 24h × stage4_six_max_24h_no_crash 调用 + panic 计数收集 \
+         + checkpoint round-trip BLAKE3 byte-equal）。本测试为 panic-fail 标记符，E2 + F2 \
+         + orchestrator 落地后此 body 改为读 CI nightly job status 验证。"
+    );
+    panic!(
+        "D-498：stage 4 F3 \\[报告\\] CI nightly orchestrator 配置 deferred；本测试 panic-fail \
+         直到 orchestrator + `gh workflow runs list --workflow=stage4-nightly-fuzz.yml` \
+         status=success × 7 days 落地（E2 \\[实现\\] 主线之外的外部基础设施项）",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// SLO ⑧：6-traverser per-traverser throughput cross-check（D-490 6-traverser）
+// ----------------------------------------------------------------------------
+
+/// stage 4 D-490 6-traverser per-traverser throughput cross-check（D-414 / D-412
+/// 字面 6 套独立 RegretTable）：单 traverser throughput 不偏离 6-traverser
+/// average > 50% 视为 alternating 路径主导虚假通过（continue 1 traverser 优秀
+/// + 5 fail 模式，D-459 字面 §carve-out 同型逻辑）。
+///
+/// **E1 closure 形态**：D2 commit single-shared RegretTable + `traverser =
+/// update_count % 6` alternating 路径下，6 traverser 共享 regret 表导致 per-
+/// traverser throughput 理论上 byte-equal（同一 RegretTable HashMap hit/miss
+/// pattern），cross-check 字面通过。**E2 \[实现\]** 落地真 6 套独立表后
+/// per-traverser throughput 可能因 RegretTable 大小不同（每 traverser 触达
+/// InfoSet 分布不同）出现 ±30% 差异，本测试 50% 阈值给余量。如 E2 实测 > 50%
+/// 偏离 → D-459-revM 翻面条件。
+#[test]
+#[ignore = "stage4 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored`"]
+fn stage4_nlhe_6max_six_traverser_per_traverser_throughput_cross_check() {
+    let Some(game) = stage4_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0xE415_0836_5452_4156;
+    let mut trainer = stage4_build_trainer(game, master_seed);
+    let mut rng = ChaCha20Rng::from_seed(master_seed);
+
+    // 6 traverser × N update per traverser = 6 × N update total（alternating
+    // 路径下 update_count = 6 N，traverser = i % 6 触达每 traverser 各 N 次）。
+    let per_traverser = STAGE4_SIX_TRAVERSER_PER_TRAVERSER_UPDATES;
+    let total = per_traverser * 6;
+
+    // warm-up 12 update（每 traverser 2 update）触发 RegretTable lazy alloc。
+    for _ in 0..12 {
+        trainer.step(&mut rng).expect("stage4 6-traverser warm-up");
+    }
+
+    let mut per_traverser_secs = [0.0_f64; 6];
+    let start_count = trainer.update_count();
+    for i in 0..total {
+        let cur_traverser = ((start_count + i) % 6) as usize;
+        let start = Instant::now();
+        trainer
+            .step(&mut rng)
+            .expect("stage4 6-traverser step 期望成功");
+        per_traverser_secs[cur_traverser] += start.elapsed().as_secs_f64();
+    }
+
+    let per_traverser_throughput: [f64; 6] =
+        std::array::from_fn(|i| per_traverser as f64 / per_traverser_secs[i]);
+    let avg_throughput: f64 = per_traverser_throughput.iter().sum::<f64>() / 6.0;
+    let max_deviation_pct: f64 = per_traverser_throughput
+        .iter()
+        .map(|&t| ((t - avg_throughput).abs() / avg_throughput) * 100.0)
+        .fold(0.0_f64, f64::max);
+
+    eprintln!(
+        "[stage4-6traverser-xcheck] per_traverser throughput = {:?} update/s / avg = \
+         {avg_throughput:.0} update/s / max_deviation = {max_deviation_pct:.1}%（SLO 门槛 \
+         ≤ {STAGE4_SIX_TRAVERSER_DEVIATION_PCT:.0}%）",
+        per_traverser_throughput
+            .iter()
+            .map(|t| format!("{t:.0}"))
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        max_deviation_pct <= STAGE4_SIX_TRAVERSER_DEVIATION_PCT,
+        "stage4 6-traverser cross-check max deviation {max_deviation_pct:.1}% > 阈值 \
+         {STAGE4_SIX_TRAVERSER_DEVIATION_PCT:.0}%（D-414 字面 6 traverser 独立 RegretTable \
+         + alternating 路径下 D-459-revM 翻面条件）",
+    );
+    assert!(
+        avg_throughput >= STAGE4_SLO_SINGLE_THREAD,
+        "stage4 6-traverser avg throughput {avg_throughput:.0} update/s < D-490 ① 字面 \
+         {STAGE4_SLO_SINGLE_THREAD:.0}（单线程 path）；6-traverser cross-check 下 avg ≈ \
+         single-thread baseline 期望成立",
     );
 }
