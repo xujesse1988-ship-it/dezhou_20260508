@@ -11,10 +11,21 @@
 //! 14 测试 0.75 Pot ±1 chip 容差通过（floor / round-half-up / ceil 任一形态均
 //! 落在容差内）；整数 multiplier × pot 精确等于不依赖 rounding policy。
 //!
-//! 不调用 stage 2 既有 [`crate::ActionAbstraction`] trait impl（trait 返回
-//! [`crate::AbstractAction`] 与 14-variant `PluribusAction` 不是一一映射）；
-//! stage 4 C2 \[实现\] 落地 trait impl 桥接（API-494）。
+//! **C2 \[实现\] 状态**（2026-05-15）：落地 `impl ActionAbstraction for
+//! PluribusActionAbstraction`（API-494 字面）— `abstract_actions(&self, state)`
+//! 走 inherent [`PluribusActionAbstraction::actions`] 输出 → 每条转 stage 2
+//! [`AbstractAction`]（Fold/Check/Call/AllIn 直读 stage 1 `LegalActionSet` 字段；
+//! Raise X Pot 走 [`PluribusActionAbstraction::compute_raise_to`] + `BetRatio::
+//! from_f64(mult)` 量化 `ratio_label`，由 stage 1 `legal_actions().bet_range.
+//! is_some()` 决定 Bet vs Raise 分流）。`map_off_tree` 占位 D-201 PHM stub。
+//! `config()` 返 10-raise-ratio [`ActionAbstractionConfig`]（OnceLock 静态实例
+//! 让 `&'_ ActionAbstractionConfig` lifetime 与 trait 签名匹配）。
 
+use std::sync::OnceLock;
+
+use crate::abstraction::action::{
+    AbstractAction, AbstractActionSet, ActionAbstraction, ActionAbstractionConfig, BetRatio,
+};
 use crate::core::ChipAmount;
 use crate::rules::state::GameState;
 
@@ -191,5 +202,91 @@ impl PluribusActionAbstraction {
             .unwrap_or(ChipAmount::ZERO);
         let raise_delta_chips = (pot.as_u64() as f64 * multiplier) as u64;
         current_bet + ChipAmount::new(raise_delta_chips)
+    }
+}
+
+/// stage 4 D-420 字面 — Pluribus 10 raise pot ratio（API-494 桥接 stage 2
+/// [`ActionAbstractionConfig`] 时 [`PluribusActionAbstraction::config`] 返回此
+/// 静态实例的引用）。OnceLock + lazy init 让 `BetRatio::from_f64` 非 const 量化
+/// 路径在首次调用时一次性构建，后续读取走只读引用（无每次 trait 调用堆分配）。
+fn pluribus_action_abstraction_config() -> &'static ActionAbstractionConfig {
+    static CONFIG: OnceLock<ActionAbstractionConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        ActionAbstractionConfig::new(vec![0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 25.0, 50.0])
+            .expect("stage 4 D-420：10 个 Pluribus raise multiplier 字面落在 BetRatio 合法范围")
+    })
+}
+
+impl ActionAbstraction for PluribusActionAbstraction {
+    /// stage 4 API-494 字面 — 走 inherent [`Self::actions`] 输出 → stage 2
+    /// [`AbstractAction`] 桥接。映射规则：
+    ///
+    /// - [`PluribusAction::Fold`] → [`AbstractAction::Fold`]
+    /// - [`PluribusAction::Check`] → [`AbstractAction::Check`]
+    /// - [`PluribusAction::Call`] → [`AbstractAction::Call`] `{ to: la.call.unwrap() }`
+    /// - `Raise X Pot` → [`AbstractAction::Bet`] `{ to: compute_raise_to(state, X),
+    ///   ratio_label: BetRatio::from_f64(X) }`（`la.bet_range.is_some()` 路径）
+    ///   或 [`AbstractAction::Raise`] `{ ... }`（`la.raise_range.is_some()` 路径）
+    /// - [`PluribusAction::AllIn`] → [`AbstractAction::AllIn`] `{ to:
+    ///   la.all_in_amount.unwrap() }`
+    ///
+    /// 输入 [`Self::actions`] 已通过 [`Self::is_legal`] filter，对应 stage 1
+    /// `LegalActionSet` 字段在 mapping 时一定 `Some`（unwrap 安全）。
+    fn abstract_actions(&self, state: &GameState) -> AbstractActionSet {
+        if state.current_player().is_none() {
+            // terminal / all-in 跳轮局面：返回空集（stage 2 D-209 字面）。
+            return AbstractActionSet::from_actions(Vec::new());
+        }
+        let la = state.legal_actions();
+        let actions = self.actions(state);
+        let mut out = Vec::with_capacity(actions.len());
+        for action in actions {
+            let abstract_action = match action {
+                PluribusAction::Fold => AbstractAction::Fold,
+                PluribusAction::Check => AbstractAction::Check,
+                PluribusAction::Call => AbstractAction::Call {
+                    to: la
+                        .call
+                        .expect("is_legal(Call) → LegalActionSet.call is Some"),
+                },
+                PluribusAction::AllIn => AbstractAction::AllIn {
+                    to: la
+                        .all_in_amount
+                        .expect("is_legal(AllIn) → LegalActionSet.all_in_amount is Some"),
+                },
+                other => {
+                    let mult = other
+                        .raise_multiplier()
+                        .expect("non-raise variants already matched above");
+                    let to = self.compute_raise_to(state, mult);
+                    let ratio_label = BetRatio::from_f64(mult)
+                        .expect("stage 4 D-420 raise multiplier 字面落在 BetRatio 合法范围");
+                    if la.bet_range.is_some() {
+                        AbstractAction::Bet { to, ratio_label }
+                    } else {
+                        AbstractAction::Raise { to, ratio_label }
+                    }
+                }
+            };
+            out.push(abstract_action);
+        }
+        AbstractActionSet::from_actions(out)
+    }
+
+    /// stage 4 API-494 D-201 PHM stub 占位（与 stage 2
+    /// [`crate::DefaultActionAbstraction::map_off_tree`] 同型语义不复制具体策略）。
+    ///
+    /// stage 4 NlheGame6 主路径不消费 off-tree action 映射（实战 search 阶段
+    /// 才需要把对手 real bet 映射到 14-action 树），本方法在 stage 4 训练路径上
+    /// 不会被触发；返回最近 ratio_label 走 Fold 走兜底（与 stage 2 stub 同型
+    /// "no-panic + deterministic"）。stage 6c 替换为完整 PHM。
+    fn map_off_tree(&self, state: &GameState, real_to: ChipAmount) -> AbstractAction {
+        let _ = (state, real_to);
+        AbstractAction::Fold
+    }
+
+    /// stage 4 API-494 — Pluribus 10 raise pot ratio config（D-420 字面）。
+    fn config(&self) -> &ActionAbstractionConfig {
+        pluribus_action_abstraction_config()
     }
 }

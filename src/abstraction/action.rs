@@ -123,6 +123,15 @@ impl AbstractActionSet {
     pub fn as_slice(&self) -> &[AbstractAction] {
         &self.actions
     }
+
+    /// stage 4 API-494 桥接 — 把已构造的 `Vec<AbstractAction>` 包成
+    /// [`AbstractActionSet`]（[`crate::PluribusActionAbstraction::abstract_actions`]
+    /// 路径消费）。`pub(crate)` 让同 crate 桥接路径走，外部消费者继续走 stage 2
+    /// `DefaultActionAbstraction::abstract_actions` 等既有 trait 实现入口
+    /// （不暴露未经 D-209 / AA-004-rev1 dedup 约束的 raw 构造路径）。
+    pub(crate) fn from_actions(actions: Vec<AbstractAction>) -> AbstractActionSet {
+        AbstractActionSet { actions }
+    }
 }
 
 /// `ActionAbstractionConfig`：raise size 集合（D-202）。

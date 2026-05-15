@@ -71,30 +71,44 @@ impl InfoSetId {
 
     /// stage 4 API-423 — 14-action availability mask 写入 reserved 区域（D-423）。
     ///
-    /// 复用 stage 2 IA-007 reserved bits（位置由 stage 4 D-423-rev0 在 B2 \[实现\]
-    /// 起步前最终 lock；A1 \[实现\] 占位 mask 落到 bits 38..52 = stage 2 reserved
-    /// 区域内 14 bit 子段）。stage 3 D-317-rev1 6-bit mask（bits 12..18，
-    /// `SimplifiedNlheGame` 路径）不受影响。
+    /// **C2 \[实现\] lock**（2026-05-15）：mask 区域 = bits 33..47（14-bit
+    /// 子段），与 `CLAUDE.md` "stage 4 C2 \[实现\] 起步前 lock" + `pluribus_stage4_
+    /// api.md` API-423 字面一致。
     ///
-    /// **A1 \[实现\] 状态**：方法体 `unimplemented!()`，签名锁，B2 \[实现\] 落地
-    /// 真实 mask 编码 + `InfoSetId` 64-bit layout 内一致性校验（debug_assert
-    /// `mask < (1 << 14)`，写入区域 byte-equal）。
+    /// 该区域在 stage 2 D-215 实际 layout 上跨越 `betting_state`（bits 32..35）的
+    /// 高 2 bit（33,34）+ `street_tag`（bits 35..38）全 3 bit + reserved（bits
+    /// 38..64）的低 9 bit；NlheGame6 路径走 `crate::training::NlheGame6` 的
+    /// `info_set` 实现通过 `pack_info_set_id` + `with_14action_mask` 串联编码
+    /// （先 pack 出基础 InfoSetId，再写入 mask），mask 写入后**字面禁止**回头
+    /// 调用 [`Self::betting_state`] / [`Self::street_tag`] 解包（写入会破坏这两
+    /// 字段的 bit 位）— D-423 文档承诺：NlheGame6 路径不消费 unpack 链路，由
+    /// mask 本身提供 betting/street 的等价判别力（不同 betting state / street
+    /// 必映射到不同 legal_actions subset，进而映射到不同 mask）。
+    ///
+    /// **stage 3 SimplifiedNlheGame 路径不受影响**：SimplifiedNlhe 走
+    /// D-317-rev1 6-bit mask（bits 12..18 写入 bucket_id field），不调用
+    /// [`Self::with_14action_mask`]；stage 1/2/3 既有测试套件（`tests/
+    /// info_id_encoding.rs` 与 `tests/cfr_simplified_nlhe.rs`）使用的
+    /// `betting_state()` / `street_tag()` getter 在 stage 3 InfoSetId 上 byte-equal
+    /// 维持。
     pub fn with_14action_mask(self, mask: u16) -> InfoSetId {
-        let _ = mask;
-        unimplemented!(
-            "stage 4 A1 [实现] scaffold: InfoSetId::with_14action_mask 落地 B2 [实现] D-423"
-        )
+        debug_assert!(
+            u32::from(mask) < (1u32 << 14),
+            "with_14action_mask: mask {mask} 越界 (14-bit 上界 < 16384)"
+        );
+        let raw = self.0;
+        let cleared = raw & !(0x3FFFu64 << 33);
+        let with_mask = cleared | ((u64::from(mask) & 0x3FFF) << 33);
+        InfoSetId(with_mask)
     }
 
     /// stage 4 API-423 — 读回 14-action availability mask（D-423）。
     ///
     /// 反 [`Self::with_14action_mask`] 写入路径；`SimplifiedNlheGame` 路径上
-    /// （未调用 with_14action_mask）返回 0。A1 \[实现\] 占位 `unimplemented!()`，
-    /// B2 \[实现\] 落地真实解码。
+    /// （未调用 with_14action_mask）返回 0（reserved 区域 stage 2 D-215 字面初
+    /// 始化全零，写 mask 前读出 0）。
     pub fn legal_actions_mask_14(self) -> u16 {
-        unimplemented!(
-            "stage 4 A1 [实现] scaffold: InfoSetId::legal_actions_mask_14 落地 B2 [实现] D-423"
-        )
+        ((self.0 >> 33) & 0x3FFF) as u16
     }
 }
 
