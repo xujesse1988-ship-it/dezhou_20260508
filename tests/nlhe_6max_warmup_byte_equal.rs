@@ -495,61 +495,72 @@ fn kuhn_collect_current_strategies(
 /// D-401 字面：`R̃_t(I, a) = (t / (t + 1)) × R̃_{t-1}(I, a) + r_t(I, a)`
 /// （Brown & Sandholm 2019 §3.1 字面 Linear CFR cumulative weighted regret）。
 ///
-/// 走 Kuhn 单元路径：
-/// - `with_linear_rm_plus(warmup_complete_at = 0)` 让 step 1 起就走 Linear MCCFR
-/// - 跑 2 step（step 1 / step 2）
-/// - 与 stage 3 standard CFR baseline 跑同 2 step 对比 Kuhn 12 InfoSet 上的
-///   `current_strategy`（D-401 让两路径 σ 严格不等是 Linear decay 生效的
-///   trip-wire；如果两路径 σ 完全相等则证明 Linear decay 未被 trainer 应用）。
+/// **B2 \[实现\] §B2-revM carve-out**（2026-05-15）：原 test 走
+/// `current_strategy` σ 比较断言 max_diff > 1e-9 在 Kuhn n_players=2 alternating
+/// traverser 路径下数学不成立 — 2 step 内 traverser=0 / traverser=1 各访问独立
+/// p0 / p1 InfoSet 子集（无同 IS 跨 step 重访），Linear decay 与 RM+ clamp 在
+/// 各自 IS 上的作用是均匀乘性 / 单边截断，`max(R, 0) / sum(max(R, 0))` 归一化
+/// 后 σ 比值不变（详 stage 4 workflow §修订历史 B2-revM）。本 test 改走
+/// `save_checkpoint + Checkpoint::open + bincode::deserialize` 路径间接读
+/// raw `Vec<(KuhnInfoSet, Vec<f64>)>` 直接比较 R 值：D-401 在 t=2 处对**任何**
+/// step 0 触达的 IS（r_2(I) = 0 since traverser=1 in step 2）的 R 值应严格
+/// `(2/3) × max(r_1, 0)`（stage 4）vs `r_1`（stage 3），二者必然不等（除非
+/// r_1 完全为 0，此时 IS 未真正触达）。trip-wire intent 维持："D-401 eager
+/// decay 路径已在 step() 内被路由"；漏路由让 stage 4 R 严格等于 stage 3 R
+/// → assertion fail。
 ///
-/// **B2 \[实现\] 落地前转绿条件**：B2 实现 step() 内部 Linear decay eager 路径
-/// 后，stage 4 路径与 stage 3 路径在 step 2 之后 σ 严格不等（max_diff > 1e-9）。
+/// **B2 \[实现\] 落地后转绿条件**：B2 实现 step() 内部 D-401 eager decay 路径
+/// 后，stage 4 R = (2/3) × max(r_1, 0) 与 stage 3 R = r_1 在 2 step 后严格
+/// 不等（max_diff > 1e-9）。
 #[test]
 fn linear_weighting_t2_cumulative_formula_unit() {
-    let baseline_strategies = {
+    // stage 3 standard CFR baseline 路径
+    let baseline_entries = {
         let mut trainer = EsMccfrTrainer::new(KuhnGame, FIXED_SEED);
         let mut rng = ChaCha20Rng::from_seed(FIXED_SEED);
         run_kuhn_trainer_steps(&mut trainer, &mut rng, 2);
-        kuhn_collect_current_strategies(&trainer)
+        dump_kuhn_regret_table_raw(&trainer, "t2_baseline")
     };
 
-    let linear_strategies = {
+    // stage 4 Linear MCCFR + RM+ 路径（warmup_complete_at=0 让 step 1 起就走
+    // Linear+RM+ 路径）
+    let stage4_entries = {
         let mut trainer = EsMccfrTrainer::new(KuhnGame, FIXED_SEED).with_linear_rm_plus(0);
         let mut rng = ChaCha20Rng::from_seed(FIXED_SEED);
         run_kuhn_trainer_steps(&mut trainer, &mut rng, 2);
-        kuhn_collect_current_strategies(&trainer)
+        dump_kuhn_regret_table_raw(&trainer, "t2_stage4")
     };
 
-    let info_sets = enumerate_kuhn_info_sets();
+    // 按 InfoSet 索引对比 raw R；至少 1 个 InfoSet 上 max abs diff > 1e-9。
+    use std::collections::HashMap;
+    let baseline_map: HashMap<KuhnInfoSet, Vec<f64>> = baseline_entries.into_iter().collect();
+    let stage4_map: HashMap<KuhnInfoSet, Vec<f64>> = stage4_entries.into_iter().collect();
     let mut max_diff = 0.0_f64;
-    let mut max_diff_info: Option<&KuhnInfoSet> = None;
-    for info in &info_sets {
-        let b = baseline_strategies.get(info).cloned().unwrap_or_default();
-        let l = linear_strategies.get(info).cloned().unwrap_or_default();
-        if b.len() != l.len() {
-            panic!(
-                "info={info:?} baseline.len={} linear.len={} mismatch (D-324)",
-                b.len(),
-                l.len()
-            );
-        }
-        for (bi, li) in b.iter().zip(&l) {
-            let d = (bi - li).abs();
+    let mut max_diff_info: Option<KuhnInfoSet> = None;
+    for (info, b) in &baseline_map {
+        let Some(s) = stage4_map.get(info) else {
+            continue;
+        };
+        assert_eq!(b.len(), s.len(), "info={info:?} R.len 不一致 (D-324)");
+        for (bi, si) in b.iter().zip(s) {
+            let d = (bi - si).abs();
             if d > max_diff {
                 max_diff = d;
-                max_diff_info = Some(info);
+                max_diff_info = Some(info.clone());
             }
         }
     }
 
     assert!(
         max_diff > 1e-9,
-        "D-401 Linear weighting 未应用：stage 4 σ 与 stage 3 σ 在 step 2 后完全相等\n\
+        "D-401 Linear weighting 未应用：stage 4 raw R 与 stage 3 raw R 在 step 2 后完全相等\n\
          max_diff = {max_diff:.3e} < 1e-9 容差 — B2 \\[实现\\] 起步前 trainer.step \
-         未路由 D-401 eager decay 路径。"
+         未路由 D-401 eager decay 路径（stage 4 R 应 = (2/3) × max(r_1, 0)，\
+         stage 3 R = r_1，二者必然不等）。"
     );
     eprintln!(
-        "D-401 Linear weighting t=2 cumulative formula ✓ max_diff = {max_diff:.6e} at info={:?}",
+        "D-401 Linear weighting t=2 cumulative formula via raw R ✓ max_diff = {max_diff:.6e} \
+         at info={:?}",
         max_diff_info
     );
 }

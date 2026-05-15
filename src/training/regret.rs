@@ -183,6 +183,48 @@ impl<I: Eq + Hash + Clone> RegretTable<I> {
     pub(crate) fn into_inner(self) -> HashMap<I, Vec<f64>> {
         self.inner
     }
+
+    /// stage 4 B2 \[实现\] — Linear discounting eager decay 应用（D-401）。
+    ///
+    /// 全表 in-place 乘 `factor`（典型 `t / (t + 1)`），值语义为
+    /// `R̃_t(I, a) ← factor × R̃_{t-1}(I, a)`；caller（[`crate::training::trainer::
+    /// EsMccfrTrainer::step`]）在 update 之前应用 decay，update 内累积当前 iter
+    /// regret delta（D-401 字面 cumulative weighted regret 公式
+    /// `R̃_t = (t/(t+1)) × R̃_{t-1} + r_t`）。
+    ///
+    /// **性能**：O(InfoSet 数 × n_actions) 全表扫描；stage 3 v3 InfoSet 量级
+    /// `~10⁶` × 14 action = 1.4 × 10⁷ f64 multiply per iter，单线程 ~ms 量级。
+    /// D-401-revM lazy decay 候选路径在 E2-rev1 / F1-rev1 后评估翻面（仍
+    /// deferred）。
+    pub(crate) fn apply_decay(&mut self, factor: f64) {
+        for entry in self.inner.values_mut() {
+            for r in entry.iter_mut() {
+                *r *= factor;
+            }
+        }
+    }
+
+    /// stage 4 B2 \[实现\] — RM+ in-place clamp（D-402）。
+    ///
+    /// 全表 in-place clamp 负值到 0：`R̃ ← max(R̃, 0)`（Tammelin 2015 §3）。
+    /// caller（[`crate::training::trainer::EsMccfrTrainer::step`]）在 update
+    /// 累积完 regret delta 之后立即调用（D-402 字面 in-place 时机；clamp 在
+    /// query 时延迟应用 = 错误实现，让 regret 持续累积大负值后丢失正确的近期
+    /// positive regret 信号）。
+    ///
+    /// 与标准 RM `current_strategy` 内 `max(R, 0)` 路径（D-303）等价于"读时
+    /// clamp"差异：D-402 落地后 stored R 严格 `>= 0`（B1 Test 5 `rm_plus_clamp_
+    /// raw_regret_non_negative_via_checkpoint_inspection` trip-wire 通过
+    /// `save_checkpoint + Checkpoint::open + bincode::deserialize` 路径外部验证）。
+    pub(crate) fn clamp_nonneg(&mut self) {
+        for entry in self.inner.values_mut() {
+            for r in entry.iter_mut() {
+                if *r < 0.0 {
+                    *r = 0.0;
+                }
+            }
+        }
+    }
 }
 
 /// E2-rev1 \[实现\] thread-local regret delta accumulator（D-321-rev1 lock 真并发

@@ -97,12 +97,19 @@ fn make_hj_facing_utg_3x_state() -> GameState {
     state
 }
 
-/// 构造 HU postflop check-option 状态（让 [`PluribusAction::Check`] 测试在合法
-/// 局面运行）：
+/// 构造 HU **flop 街首行动** check-option 状态（B2 \[实现\] §B2-revM carve-out
+/// 修改：原 preflop 状态在 BB Check 后会触发 preflop 关街 + flop deal +
+/// committed_this_round 全员 reset，让 `apply(Check)` 前后 `committed=100 → 0`
+/// 不等违反测试不变量「Check 不改变 committed_this_round」；本 factory 改走
+/// HU flop 街首行动状态：SB Call + BB Check 后已进入 flop，OOP=BB 先行
+/// （D-022b-rev1 postflop OOP 先行字面），committed=0 → Check 不关街
+/// （SB 未行动），committed 保持 0 不变）：
 ///
 /// - HU（n_seats=2，button=0=SB，non-button=1=BB）
-/// - SB Call to 100 → BB to act with check option (committed_this_round = 100 ==
-///   max_committed = 100)
+/// - SB Call → BB Check → 进入 flop
+/// - flop：BB（seat 1）OOP 先行，committed_this_round = 0，max_committed = 0
+///   ⇒ [`PluribusAction::Check`] legal；apply 后 BB.committed 仍 0（街内 Check
+///   no-op，SB 未行动街不关）。
 fn make_hu_bb_check_state() -> GameState {
     let cfg = TableConfig {
         n_seats: 2,
@@ -115,10 +122,18 @@ fn make_hu_bb_check_state() -> GameState {
     let mut state = GameState::new(&cfg, FIXED_SEED);
     // D-022b-rev1：HU 走 button=SB 语义；SB（seat 0）acts first preflop。
     state.apply(Action::Call).expect("SB call 应当合法");
+    state
+        .apply(Action::Check)
+        .expect("BB check 应当合法（关闭 preflop）");
+    assert_eq!(
+        state.street(),
+        poker::Street::Flop,
+        "SB Call + BB Check 后应进入 Flop 街"
+    );
     assert_eq!(
         state.current_player(),
         Some(SeatId(1)),
-        "SB call 后 BB (seat 1) to act with check option"
+        "flop 街 BB (seat 1, OOP) 先行（D-022b-rev1 postflop OOP 先行）"
     );
     state
 }

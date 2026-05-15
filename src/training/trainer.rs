@@ -555,10 +555,42 @@ impl<G: Game> EsMccfrTrainer<G> {
 
 impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
     fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError> {
-        // D-307 alternating traverser：iter t 上 traverser = (t mod n_players)。
+        // D-409 warm-up phase routing：前 warmup_complete_at update 走 stage 3
+        // standard CFR + RM 路径 byte-equal 保持（stage 3 D-362 1M update × 3
+        // BLAKE3 anchor 不退化）；warmup_complete_at 之后切 stage 4 Linear
+        // MCCFR + RM+ 路径。当 `with_linear_rm_plus()` 未调用时
+        // `config.linear_weighting_enabled = config.rm_plus_enabled = false`，
+        // 与 stage 3 路径完全等价（B1 Test 1 anchor）。
+        let warm_up_done = self.update_count >= self.config.warmup_complete_at;
+        let use_linear = self.config.linear_weighting_enabled && warm_up_done;
+        let use_rm_plus = self.config.rm_plus_enabled && warm_up_done;
+
+        // D-401 字面 `R̃_t(I, a) = (t / (t + 1)) × R̃_{t-1}(I, a) + r_t(I, a)`
+        // 中的 t：stage 4 phase 内 1-indexed iter counter。warm-up phase 后
+        // 第一 step 起 t=1（让 t=1 时 decay factor = 1/2 应用于 R̃_0 = 0 退化
+        // 不影响数值，与 stage 3 路径在 t=1 处 σ byte-equal — B1 Test 7 字面
+        // sanity anchor）。
+        let t_stage4: u64 = if use_linear {
+            self.update_count - self.config.warmup_complete_at + 1
+        } else {
+            0
+        };
+
+        // 步骤 1：D-401 Linear discounting eager decay（regret 累积乘 t/(t+1)）。
+        // warm-up phase 内不应用（factor = 1 等价 stage 3 path byte-equal）。
+        if use_linear {
+            let decay = (t_stage4 as f64) / ((t_stage4 + 1) as f64);
+            self.regret.apply_decay(decay);
+        }
+
+        // 步骤 2：标准 ES-MCCFR DFS recurse（D-307 alternating traverser）+
+        // D-403 Linear weighted strategy sum 累积 `S_t = S_{t-1} + t × σ_t`
+        // （`strategy_sum_weight` = `t_stage4`；warm-up phase 走 1.0 等价 stage
+        // 3 D-304 unweighted by t 累积 byte-equal）。
         let n_players = self.game.n_players() as u64;
         let traverser = (self.update_count % n_players) as PlayerId;
         let root = self.game.root(rng);
+        let strategy_sum_weight: f64 = if use_linear { t_stage4 as f64 } else { 1.0 };
         recurse_es::<G>(
             root,
             traverser,
@@ -567,7 +599,16 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             &mut self.regret,
             &mut self.strategy_sum,
             rng,
+            strategy_sum_weight,
         );
+
+        // 步骤 3：D-402 RM+ in-place clamp（每 update 累积完 regret delta 后立即
+        // `R̃ ← max(R̃, 0)`）。warm-up phase 内不应用（stage 3 path stored R 允许
+        // 负值长期累积，与 stage 3 BLAKE3 anchor 一致）。
+        if use_rm_plus {
+            self.regret.clamp_nonneg();
+        }
+
         self.update_count += 1;
         Ok(())
     }
@@ -664,6 +705,11 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
 /// - `pi_trav` / `pi_opp`：当前节点 reach probability 分解（不含 chance）
 /// - `regret` / `strategy_sum`：可变借用累积容器
 /// - `rng`：chance + opp action sampling 共享 rng（D-315 显式注入）
+/// - `strategy_sum_weight`：stage 4 D-403 Linear weighted strategy sum 累积因子
+///   `S_t(I, a) ← S_{t-1}(I, a) + w × σ_t(I, a)`，stage 3 path 走 `w = 1.0`
+///   字面等价 stage 3 D-304 unweighted by t 累积（B1 Test 1 anchor 字面继承）；
+///   stage 4 path 走 `w = t_stage4`（caller 在 [`EsMccfrTrainer::step`] 内传入）。
+#[allow(clippy::too_many_arguments)]
 fn recurse_es<G: Game>(
     state: G::State,
     traverser: PlayerId,
@@ -672,6 +718,7 @@ fn recurse_es<G: Game>(
     regret: &mut RegretTable<G::InfoSet>,
     strategy_sum: &mut StrategyAccumulator<G::InfoSet>,
     rng: &mut dyn RngSource,
+    strategy_sum_weight: f64,
 ) -> f64 {
     match G::current(&state) {
         NodeKind::Terminal => {
@@ -707,6 +754,7 @@ fn recurse_es<G: Game>(
                 regret,
                 strategy_sum,
                 rng,
+                strategy_sum_weight,
             )
         }
         NodeKind::Player(actor) => {
@@ -734,6 +782,7 @@ fn recurse_es<G: Game>(
                         regret,
                         strategy_sum,
                         rng,
+                        strategy_sum_weight,
                     );
                     cfvs.push(cfv);
                 }
@@ -745,8 +794,9 @@ fn recurse_es<G: Game>(
                 sigma_value
             } else {
                 // opponent node（D-309 / D-337）：按 σ 采样 1 action；非
-                // traverser 决策点 strategy_sum 累积 `S(I, b) += σ(b)` for all
-                // b（D-301 详解 / D-322）。
+                // traverser 决策点 strategy_sum 累积 `S(I, b) += w × σ(b)` for
+                // all b（D-301 详解 / D-322 + stage 4 D-403 Linear weighted
+                // 累积 `w = t_stage4`；stage 3 path `w = 1.0` byte-equal 维持）。
                 //
                 // 过滤零概率 outcome（API-331 [`sample_discrete`] 不变量：所有
                 // p > 0；零概率 action 由 caller 剔除）。当 regret matching 后
@@ -754,9 +804,15 @@ fn recurse_es<G: Game>(
                 // 这些 action 在采样阶段不可达，从分布中剔除即可——剩余 σ 仍
                 // sum 到 1（D-330 容差）。
                 //
-                // strategy_sum 仍按全 σ 累积（zero σ 累加零等价于不更新；保留
-                // statement 让 D-304 标准累积形式不变形）。
-                strategy_sum.accumulate(info, &sigma);
+                // strategy_sum 仍按全 σ 累积（zero σ 加权累加零等价于不更新；
+                // 保留 statement 让 D-304 标准累积形式不变形）。
+                if strategy_sum_weight == 1.0 {
+                    strategy_sum.accumulate(info, &sigma);
+                } else {
+                    let weighted: SigmaVec =
+                        sigma.iter().map(|s| s * strategy_sum_weight).collect();
+                    strategy_sum.accumulate(info, &weighted);
+                }
 
                 let nonzero_dist: ShortVec<(G::Action, f64)> = actions
                     .iter()
@@ -785,6 +841,7 @@ fn recurse_es<G: Game>(
                     regret,
                     strategy_sum,
                     rng,
+                    strategy_sum_weight,
                 )
             }
         }

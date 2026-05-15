@@ -4,11 +4,12 @@
 //! `{Fold, Check, Call, Raise 0.5/0.75/1/1.5/2/3/5/10/25/50 × pot, AllIn}`
 //! 复用 Pluribus 主论文 §S3 字面顺序。
 //!
-//! **A1 \[实现\] 状态**：[`PluribusAction`] 14-variant enum + [`PluribusAction::all`]
-//! / [`PluribusAction::raise_multiplier`] 公开 const helper 落地；
-//! [`PluribusActionAbstraction`] struct + `actions` / `is_legal` / `compute_raise_to`
-//! 内部方法签名锁，方法体 `unimplemented!()` 占位，B2 \[实现\] 落地走 stage 1
-//! [`crate::GameState`] legal action + pot / current_bet 计算。
+//! **B2 \[实现\] 状态**（2026-05-15）：[`PluribusActionAbstraction::actions` /
+//! `is_legal` / `compute_raise_to`] 全部落地走 stage 1 [`GameState`] legal
+//! action + pot / current_bet 计算。`compute_raise_to` rounding policy =
+//! **floor**（`(pot.as_u64() as f64 * multiplier) as u64` 隐式截断），让 B1
+//! 14 测试 0.75 Pot ±1 chip 容差通过（floor / round-half-up / ceil 任一形态均
+//! 落在容差内）；整数 multiplier × pot 精确等于不依赖 rounding policy。
 //!
 //! 不调用 stage 2 既有 [`crate::ActionAbstraction`] trait impl（trait 返回
 //! [`crate::AbstractAction`] 与 14-variant `PluribusAction` 不是一一映射）；
@@ -115,10 +116,6 @@ impl PluribusAction {
 /// 无字段 — `legal_actions` 计算只读消费 [`GameState`]（D-420 字面）。stage 2
 /// [`crate::DefaultActionAbstraction`] 5-action 抽象作为 ablation baseline 维持
 /// 独立 impl 不退化。
-///
-/// **A1 \[实现\] 状态**：struct 签名锁；`actions` / `is_legal` /
-/// `compute_raise_to` 全 `unimplemented!()`。B2 \[实现\] 落地走 stage 1
-/// [`GameState`] legal action 计算。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PluribusActionAbstraction;
 
@@ -126,42 +123,73 @@ impl PluribusActionAbstraction {
     /// stage 4 D-420 字面 — 列出 `state` 上合法的 14-action 子集。
     ///
     /// 走 stage 1 [`GameState`] legal action + pot / current_bet 计算（D-422
-    /// 字面 raise size 走 stage 1 [`GameState::apply`] byte-equal 验证）。
-    ///
-    /// **A1 \[实现\] 状态**：方法体 `unimplemented!()`，B2 \[实现\] 落地。
+    /// 字面 raise size 走 stage 1 [`GameState::apply`] byte-equal 验证）。输出
+    /// 顺序固定 = [`PluribusAction::all`] 字面顺序（deterministic）。
     pub fn actions(&self, state: &GameState) -> Vec<PluribusAction> {
-        let _ = state;
-        unimplemented!(
-            "stage 4 A1 [实现] scaffold: PluribusActionAbstraction::actions 落地 B2 [实现] D-420"
-        )
+        let mut out = Vec::with_capacity(PluribusAction::N_ACTIONS);
+        for action in PluribusAction::all() {
+            if self.is_legal(&action, state) {
+                out.push(action);
+            }
+        }
+        out
     }
 
     /// stage 4 D-420 + D-422 — 判定 [`PluribusAction`] 在 `state` 上是否 legal。
     ///
-    /// 走 stage 1 [`GameState`] betting state + stack / pot 计算；超过 stack 的
-    /// raise size 自动转 [`PluribusAction::AllIn`]（与 stage 1 D-022 字面继承）。
-    /// 不满足 min raise（stage 1 D-033）的 raise size 自动剔除。
-    ///
-    /// **A1 \[实现\] 状态**：方法体 `unimplemented!()`，B2 \[实现\] 落地。
+    /// 走 stage 1 [`GameState::legal_actions`] 返回的 [`crate::LegalActionSet`]：
+    /// - `Fold` / `Check` / `Call` / `AllIn` 直接读对应字段
+    /// - `Raise X Pot` 计算 `raise_to = current_bet + multiplier × pot`（D-420
+    ///   字面公式），检验落在 `raise_range`（已有前序 bet）或 `bet_range`
+    ///   （无前序 bet）区间内。raise_to 超 cap（stack 上限）或低于 min raise
+    ///   都返回 `false`（不满足 min raise → D-422(a) stage 1 D-033 字面继承
+    ///   自动剔除；超 stack → D-422(e) 自动转 AllIn 由 caller 单独枚举 AllIn
+    ///   action 覆盖）。
     pub fn is_legal(&self, action: &PluribusAction, state: &GameState) -> bool {
-        let _ = (action, state);
-        unimplemented!(
-            "stage 4 A1 [实现] scaffold: PluribusActionAbstraction::is_legal 落地 B2 [实现] D-420"
-        )
+        let legal = state.legal_actions();
+        match action {
+            PluribusAction::Fold => legal.fold,
+            PluribusAction::Check => legal.check,
+            PluribusAction::Call => legal.call.is_some(),
+            PluribusAction::AllIn => legal.all_in_amount.is_some(),
+            other => {
+                let Some(mult) = other.raise_multiplier() else {
+                    return false;
+                };
+                let raise_to = self.compute_raise_to(state, mult);
+                if let Some((min_to, max_to)) = legal.raise_range {
+                    raise_to >= min_to && raise_to <= max_to
+                } else if let Some((min_to, max_to)) = legal.bet_range {
+                    raise_to >= min_to && raise_to <= max_to
+                } else {
+                    false
+                }
+            }
+        }
     }
 
     /// stage 4 D-420 — raise size 计算：`raise_to = current_bet + multiplier × pot_size`。
     ///
-    /// `multiplier` 来自 [`PluribusAction::raise_multiplier`] 的 `Some(_)` 值；
-    /// non-raise [`PluribusAction`]（Fold / Check / Call / AllIn）由 caller
-    /// `unreachable!()` 拒绝（不进入本路径）。
+    /// `current_bet` = `max_p (committed_this_round[p])`（与 stage 1
+    /// `GameState::max_committed_this_round` 内部计算等价；外部入口只读
+    /// `players().committed_this_round` 累积 max 不依赖私有方法）。
+    /// `pot_size` = [`GameState::pot`]（含所有玩家累积总投入）。
     ///
-    /// **A1 \[实现\] 状态**：方法体 `unimplemented!()`，B2 \[实现\] 落地走 stage 1
-    /// [`GameState::pot`] + per-player committed_this_round 计算 current_bet。
+    /// rounding policy = **floor**（`(pot × mult) as u64` 截断小数）：整数
+    /// multiplier × pot 精确等于；0.75 Pot 等非整数 rounding 落在 B1 \[测试\]
+    /// ±1 chip 容差内（floor / round-half-up / ceil 任一形态均满足）。caller
+    /// (`is_legal`) 不进入 non-raise [`PluribusAction`] 分支（Fold / Check /
+    /// Call / AllIn 的 `raise_multiplier()` 返回 `None`，分支不会触达本方法）；
+    /// 外部直接消费 `compute_raise_to` 时 caller 责任保证 `multiplier >= 0`。
     pub fn compute_raise_to(&self, state: &GameState, multiplier: f64) -> ChipAmount {
-        let _ = (state, multiplier);
-        unimplemented!(
-            "stage 4 A1 [实现] scaffold: PluribusActionAbstraction::compute_raise_to 落地 B2 [实现] D-420"
-        )
+        let pot = state.pot();
+        let current_bet = state
+            .players()
+            .iter()
+            .map(|p| p.committed_this_round)
+            .max()
+            .unwrap_or(ChipAmount::ZERO);
+        let raise_delta_chips = (pot.as_u64() as f64 * multiplier) as u64;
+        current_bet + ChipAmount::new(raise_delta_chips)
     }
 }
