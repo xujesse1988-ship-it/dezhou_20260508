@@ -368,6 +368,190 @@ fn cfr_simplified_nlhe_full_1m_update_no_panic_no_nan_no_inf() {
 }
 
 // ===========================================================================
+// 阶段 4 D1 \[测试\] 扩展（D-410 / D-412 / D-420 / D-401 / D-402 / D-409）
+//
+// 6 条 NlheGame6 + 14-action + Linear+RM+ 路径 fuzz 测试（3 game variant ×
+// 2 规模 active smoke + release-ignored full）。
+//
+// 维度：
+// - 6-player NlheGame6 trainer（D-410 / D-412 6-traverser alternating） +
+//   14-action PluribusActionAbstraction（D-420）
+// - Linear+RM+ 路径（D-401 / D-402 / D-409）vs stage 3 standard CFR + RM
+//   baseline 路径
+// - D-330 容差不变量：所有 step 后 average_strategy / current_strategy 输出
+//   `.is_finite()` + sum ∈ [1 - 1e-6, 1 + 1e-6]（warm-up 前后均维持）
+// - D-307 alternating traverser invariance：6 player NLHE 每 step
+//   update_count += 1（不退化到 step_parallel n_active 模式）
+// ===========================================================================
+
+use poker::training::game::NodeKind as Stage4NodeKind;
+use poker::training::nlhe_6max::{NlheGame6, NlheGame6InfoSet};
+
+/// NlheGame6 fuzz smoke step 数（active default — 小到 dev box 跑得动）。
+const STAGE4_SMOKE_STEPS: u64 = 200;
+
+/// NlheGame6 fuzz full step 数（release/ignored — vultr 4-core ~ 7K update/s
+/// → 1M / 7K ~ 140 s release）。
+const STAGE4_FULL_STEPS: u64 = 1_000_000;
+
+/// Linear+RM+ warmup_complete_at（fuzz 中切边界让 warm-up + post-warmup 两路径
+/// 各覆盖一段；smoke 100 step warm-up + 100 step post-warmup）。
+const STAGE4_WARMUP_AT: u64 = 100;
+
+/// stage 4 fuzz fixed master seed（ASCII "STG4_FZ\0"）。
+const STAGE4_FUZZ_SEED: u64 = 0x53_54_47_34_5F_46_5A_00;
+
+/// 沿 deterministic chance-path 收 6-player NlheGame6 InfoSet 序列（与 stage
+/// 3 `nlhe_probe_info_sets` 同型，n_players=6 路径覆盖）。
+fn nlhe6_probe_info_sets(game: &NlheGame6) -> Vec<NlheGame6InfoSet> {
+    use poker::training::game::Game as Stage4Game;
+    let mut rng = ChaCha20Rng::from_seed(0xCAFE_DEAD_BEEF_1234);
+    let mut state = game.root(&mut rng);
+    let mut out = Vec::with_capacity(PROBES_PER_BATCH);
+    for _ in 0..32 {
+        match NlheGame6::current(&state) {
+            Stage4NodeKind::Terminal => break,
+            Stage4NodeKind::Chance => break, // NlheGame6 字面无独立 chance 节点
+            Stage4NodeKind::Player(actor) => {
+                let info = NlheGame6::info_set(&state, actor);
+                out.push(info);
+                let actions = NlheGame6::legal_actions(&state);
+                if actions.is_empty() {
+                    break;
+                }
+                state = NlheGame6::next(state, actions[0], &mut rng);
+            }
+        }
+        if out.len() >= PROBES_PER_BATCH {
+            break;
+        }
+    }
+    out
+}
+
+/// NlheGame6 fuzz runner — `n_steps` 个 step 后断言 D-300 / D-301 / D-330
+/// 不变量；当 `warmup_at = 0` 时全程 Linear+RM+；`warmup_at >= n_steps` 时全程
+/// stage 3 path。
+fn run_nlhe6_fuzz(steps: u64, master_seed: u64, warmup_at: u64, label: &str) {
+    let Some(table) = load_v3_or_skip() else {
+        return;
+    };
+    let game = NlheGame6::new(table).expect("v3 artifact");
+    let probes = nlhe6_probe_info_sets(&game);
+    let mut trainer = EsMccfrTrainer::new(game, master_seed).with_linear_rm_plus(warmup_at);
+    let mut rng = ChaCha20Rng::from_seed(master_seed);
+    let mut last_count: u64 = 0;
+    for i in 0..steps {
+        trainer
+            .step(&mut rng)
+            .unwrap_or_else(|e| panic!("nlhe6 fuzz {label} step {i}: {e:?}"));
+        let cur = trainer.update_count();
+        assert_eq!(
+            cur,
+            last_count + 1,
+            "D-307：NlheGame6 step update_count 应当 += 1（{label} step {i}）"
+        );
+        last_count = cur;
+        if i % PROBE_EVERY == 0 || i + 1 == steps {
+            for info in probes.iter().take(PROBES_PER_BATCH) {
+                let cur_strat = trainer.current_strategy(info);
+                let avg_strat = trainer.average_strategy(info);
+                assert_finite(&cur_strat, "nlhe6 current_strategy", i);
+                assert_finite(&avg_strat, "nlhe6 average_strategy", i);
+                assert_prob_sum(&cur_strat, "nlhe6 current_strategy", i);
+                assert_prob_sum(&avg_strat, "nlhe6 average_strategy", i);
+            }
+        }
+    }
+    eprintln!("nlhe6 fuzz {label}: {steps} step 全 0 panic / 0 NaN / 0 Inf / sum ∈ 1 ± {PROB_SUM_TOLERANCE} ✓");
+}
+
+// ---------------------------------------------------------------------------
+// 6 stage 4 fuzz 测试（smoke active + full release-ignored × 3 路径）
+// ---------------------------------------------------------------------------
+
+/// D-410 / D-420 fuzz：6-player NLHE 全程 stage 3 standard CFR + RM 路径
+/// （warmup_at 无穷大，即 never enter Linear+RM+）。
+///
+/// **D1 \[测试\] panic-fail 状态**：依赖 v3 artifact + NlheGame6 trainer（C2
+/// commit 落地）。default profile 走 pass-with-skip（artifact 缺失）。
+#[test]
+#[ignore = "release/--ignored opt-in（v3 artifact 依赖；200 step NlheGame6 ~ 30 s）"]
+fn cfr_nlhe6_stage3_path_smoke_no_panic_no_nan_no_inf() {
+    run_nlhe6_fuzz(
+        STAGE4_SMOKE_STEPS,
+        STAGE4_FUZZ_SEED,
+        u64::MAX,
+        "stage3_path_smoke",
+    );
+}
+
+/// D-410 / D-420 fuzz full：与 smoke 同 stage 3 path，1M step coverage。
+#[test]
+#[ignore = "release/--ignored opt-in（v3 artifact 依赖；1M NlheGame6 ~ 140 s release）"]
+fn cfr_nlhe6_stage3_path_full_1m_no_panic_no_nan_no_inf() {
+    run_nlhe6_fuzz(
+        STAGE4_FULL_STEPS,
+        STAGE4_FUZZ_SEED.wrapping_add(1),
+        u64::MAX,
+        "stage3_path_full_1M",
+    );
+}
+
+/// D-401 / D-402 / D-409 fuzz：6-player NLHE 跨 warmup boundary（前 100 step
+/// stage 3 path，后 100 step Linear+RM+ post-warmup path）。
+#[test]
+#[ignore = "release/--ignored opt-in（v3 artifact 依赖；200 step NlheGame6 ~ 30 s）"]
+fn cfr_nlhe6_warmup_boundary_smoke_no_panic_no_nan_no_inf() {
+    run_nlhe6_fuzz(
+        STAGE4_SMOKE_STEPS,
+        STAGE4_FUZZ_SEED.wrapping_add(2),
+        STAGE4_WARMUP_AT,
+        "warmup_boundary_smoke",
+    );
+}
+
+/// D-401 / D-402 / D-409 fuzz full：1M step coverage 跨 100 update warmup boundary
+/// → 99% step 走 Linear+RM+ post-warmup path（覆盖 D-401 eager decay 长期不溢出
+/// + D-402 RM+ clamp 长期不破 finite invariant）。
+#[test]
+#[ignore = "release/--ignored opt-in（v3 artifact 依赖；1M NlheGame6 + Linear+RM+ ~ 140 s release）"]
+fn cfr_nlhe6_warmup_boundary_full_1m_no_panic_no_nan_no_inf() {
+    run_nlhe6_fuzz(
+        STAGE4_FULL_STEPS,
+        STAGE4_FUZZ_SEED.wrapping_add(3),
+        STAGE4_WARMUP_AT,
+        "warmup_boundary_full_1M",
+    );
+}
+
+/// D-401 / D-402 fuzz：6-player NLHE 全程 Linear+RM+ 路径（warmup_at = 0
+/// 让 step 1 起就走 Linear+RM+，覆盖 step 1 path D-401 t=1 数值边界）。
+#[test]
+#[ignore = "release/--ignored opt-in（v3 artifact 依赖；200 step NlheGame6 + Linear+RM+ ~ 30 s）"]
+fn cfr_nlhe6_pure_linear_rm_plus_smoke_no_panic_no_nan_no_inf() {
+    run_nlhe6_fuzz(
+        STAGE4_SMOKE_STEPS,
+        STAGE4_FUZZ_SEED.wrapping_add(4),
+        0,
+        "pure_linear_rm_plus_smoke",
+    );
+}
+
+/// D-401 / D-402 fuzz full：1M step pure Linear+RM+ 路径，覆盖 D-401 eager
+/// decay 1M iter 后 t/(t+1) 因子接近 1 的数值稳定边界。
+#[test]
+#[ignore = "release/--ignored opt-in（v3 artifact 依赖；1M NlheGame6 + Linear+RM+ ~ 140 s release）"]
+fn cfr_nlhe6_pure_linear_rm_plus_full_1m_no_panic_no_nan_no_inf() {
+    run_nlhe6_fuzz(
+        STAGE4_FULL_STEPS,
+        STAGE4_FUZZ_SEED.wrapping_add(5),
+        0,
+        "pure_linear_rm_plus_full_1M",
+    );
+}
+
+// ===========================================================================
 // dead_code 抑制 import helper
 // ===========================================================================
 

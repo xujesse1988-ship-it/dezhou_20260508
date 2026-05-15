@@ -812,6 +812,81 @@ fn _stage4_api_signature_assertions() {
     let _: [u8; 8] = poker::training::checkpoint::MAGIC;
 
     // ---------------------------------------------------------------
+    // D1 [测试] — Checkpoint v2 schema header field byte offset 字面 sanity
+    // （API-440 字面 128-byte layout）。本 const 字面只作为 trip-wire 锚点；
+    // 实际数值断言落 tests/checkpoint_v2_schema.rs::
+    // checkpoint_v2_layout_offsets_match_api_440_spec + tests/checkpoint_v2_round_trip.rs。
+    //
+    // D2 [实现] 落地 src/training/checkpoint.rs 新增 const 字段时（OFFSET_TRAVERSER_COUNT
+    // = 14 / OFFSET_LINEAR_WEIGHTING = 15 / OFFSET_RM_PLUS = 16 / OFFSET_WARMUP_COMPLETE
+    // = 17 / OFFSET_REGRET_OFFSET = 96 / OFFSET_STRATEGY_OFFSET = 104 / OFFSET_PAD_B
+    // = 112），这里加 UFCS const ref bind 让漂移立即在 cargo test --no-run 暴露。
+    // 当前 src/training/checkpoint.rs 未暴露这些 const，本块仅 1 个字面 trip-wire
+    // 通过本测试模块内部 const 字面让 D1 [测试] 期望 layout 字段不漂移。
+    // ---------------------------------------------------------------
+    {
+        // D-449 字面 6 个新字段 offset 字面 lock（与 tests/checkpoint_v2_round_trip.rs
+        // 同 const 字面，D2 [实现] 落地新增 src/training/checkpoint.rs::OFFSET_*
+        // 后翻面走 `let _: usize = poker::training::checkpoint::OFFSET_TRAVERSER_COUNT;`
+        // 形式 UFCS bind）。
+        const OFFSET_TRAVERSER_COUNT: usize = 14;
+        const OFFSET_LINEAR_WEIGHTING: usize = 15;
+        const OFFSET_RM_PLUS: usize = 16;
+        const OFFSET_WARMUP_COMPLETE: usize = 17;
+        const OFFSET_REGRET_OFFSET: usize = 96;
+        const OFFSET_STRATEGY_OFFSET: usize = 104;
+        const OFFSET_PAD_B: usize = 112;
+        const HEADER_V2_LEN: usize = 128;
+        const _: () = assert!(OFFSET_LINEAR_WEIGHTING == OFFSET_TRAVERSER_COUNT + 1);
+        const _: () = assert!(OFFSET_RM_PLUS == OFFSET_LINEAR_WEIGHTING + 1);
+        const _: () = assert!(OFFSET_WARMUP_COMPLETE == OFFSET_RM_PLUS + 1);
+        const _: () = assert!(OFFSET_STRATEGY_OFFSET == OFFSET_REGRET_OFFSET + 8);
+        const _: () = assert!(OFFSET_PAD_B == OFFSET_STRATEGY_OFFSET + 8);
+        const _: () = assert!(HEADER_V2_LEN == OFFSET_PAD_B + 16);
+        let _: usize = OFFSET_TRAVERSER_COUNT;
+        let _: usize = OFFSET_LINEAR_WEIGHTING;
+        let _: usize = OFFSET_RM_PLUS;
+        let _: usize = OFFSET_WARMUP_COMPLETE;
+        let _: usize = OFFSET_REGRET_OFFSET;
+        let _: usize = OFFSET_STRATEGY_OFFSET;
+        let _: usize = OFFSET_PAD_B;
+        let _: usize = HEADER_V2_LEN;
+    }
+
+    // ---------------------------------------------------------------
+    // D1 [测试] — Checkpoint pub field 类型 lock（API-441 字面）。
+    // stage 3 Checkpoint struct 7 字段已在 _stage3 段 line 663-682 lock；本块
+    // 锁 stage 4 D2 [实现] 起步前**预期**新增的 4 个字段（traverser_count: u8 /
+    // linear_weighting_enabled: bool / rm_plus_enabled: bool / warmup_complete: bool）。
+    //
+    // 字段尚未落地时（A1/B2/C2 commit 形态），本块通过本测试模块内部 const 字面
+    // 锁 stage 4 期望字段名 — D2 [实现] 落地 src/training/checkpoint.rs 加字段
+    // 后翻面成 `let _: u8 = ckpt.traverser_count;` 形式（与 _stage3 line 675-682
+    // 同型）。当前形态：4 字面 const 锁字段类型 + 数值范围 sanity。
+    // ---------------------------------------------------------------
+    {
+        const EXPECTED_TRAVERSER_COUNT_NLHE6: u8 = 6;
+        const EXPECTED_TRAVERSER_COUNT_STAGE3: u8 = 1;
+        const EXPECTED_LINEAR_WEIGHTING_ON: bool = true;
+        const EXPECTED_RM_PLUS_ON: bool = true;
+        const EXPECTED_WARMUP_INITIAL: bool = false;
+        const EXPECTED_WARMUP_POST: bool = true;
+        let _: u8 = EXPECTED_TRAVERSER_COUNT_NLHE6;
+        let _: u8 = EXPECTED_TRAVERSER_COUNT_STAGE3;
+        let _: bool = EXPECTED_LINEAR_WEIGHTING_ON;
+        let _: bool = EXPECTED_RM_PLUS_ON;
+        let _: bool = EXPECTED_WARMUP_INITIAL;
+        let _: bool = EXPECTED_WARMUP_POST;
+        // D2 [实现] 落地后该 block 替换为：
+        //   let ckpt_v2 = Checkpoint { ..stage3_fields, traverser_count: 6,
+        //       linear_weighting_enabled: true, rm_plus_enabled: true,
+        //       warmup_complete: true };
+        //   let _: u8 = ckpt_v2.traverser_count;
+        //   let _: bool = ckpt_v2.linear_weighting_enabled;
+        //   ...
+    }
+
+    // ---------------------------------------------------------------
     // API-401 — TrainerConfig fields + DecayStrategy enum + Default
     // ---------------------------------------------------------------
     let cfg = TrainerConfig {
