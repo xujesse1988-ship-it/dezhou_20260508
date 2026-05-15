@@ -138,6 +138,15 @@ pub struct TrainerConfig {
     pub warmup_complete_at: u64,
     /// stage 4 D-401-revM — eager vs lazy decay 选型（详见 [`DecayStrategy`]）。
     pub decay_strategy: DecayStrategy,
+
+    /// **§E-rev2 / A2 优化（2026-05-15，AWS c7a.8xlarge profiling 触发）** —
+    /// `step_parallel` 内每 rayon task 跑 batch 次连续 traversal,摊薄 crossbeam
+    /// work-stealing + sched_yield per-call 协调开销（profiling 实测占 ~35-44%）。
+    /// 默认 `1` 保持 stage 3 / stage 4 既有路径 byte-equal;走 §E-rev2 优化路径
+    /// 调用 [`EsMccfrTrainer::with_parallel_batch_size`] builder 切换。
+    /// `step_parallel` `update_count` 增量 `n_active × batch`（n_active 与 batch
+    /// 解耦）;`step`（单线程）路径不受影响。
+    pub parallel_batch_size: usize,
 }
 
 impl Default for TrainerConfig {
@@ -150,6 +159,7 @@ impl Default for TrainerConfig {
             rm_plus_enabled: false,
             warmup_complete_at: 1_000_000,
             decay_strategy: DecayStrategy::EagerDecay,
+            parallel_batch_size: 1,
         }
     }
 }
@@ -569,6 +579,30 @@ impl<G: Game> EsMccfrTrainer<G> {
         self
     }
 
+    /// **§E-rev2 / A2 优化（2026-05-15，AWS c7a.8xlarge profiling 触发）** —
+    /// 设置 [`TrainerConfig::parallel_batch_size`],让 [`Self::step_parallel`]
+    /// 每 rayon task 跑 `batch` 次连续 traversal,摊薄 crossbeam work-stealing
+    /// per-call 协调开销。`batch == 0` 退化到 `1`（与 `Default` 等价）。
+    ///
+    /// **不变量**:
+    /// - 默认 `batch=1` 路径与 stage 3 / stage 4 既有 byte-equal anchor 完全等价
+    ///   （`TrainerConfig::default().parallel_batch_size == 1`）。
+    /// - `batch > 1` 路径下 `step_parallel(pool, n_threads)` 一次调用产 update
+    ///   `n_active × batch`,`update_count` 增量同;`step`（单线程）路径不变。
+    /// - Traverser routing `(base_update_count + tid * batch + k) % n_players`
+    ///   for k=0..batch-1,preserving D-307 alternating semantic（per-update 粒度
+    ///   不变,只是同 rayon task 内 batch 个 update 顺序执行）。
+    /// - Merge order 按 `(tid 升序, k 升序)` × per-task push 顺序 playback,
+    ///   保跨 run BLAKE3 决定性（继承 D-321-rev2 append-only delta 政策）。
+    ///
+    /// **测试影响**:warm-up phase（D-409 字面）走单线程 `step()`,**不消费**
+    /// `step_parallel`,stage 3 1M update × 3 BLAKE3 anchor + stage 4 warm-up
+    /// byte-equal anchor 不受 batch 设置影响。
+    pub fn with_parallel_batch_size(mut self, batch: usize) -> Self {
+        self.config.parallel_batch_size = batch.max(1);
+        self
+    }
+
     /// stage 4 API-401 — 公开 read-only config（B2 \[实现\] 起步前评估是否
     /// 转 `pub config: TrainerConfig` 字段；A1 \[实现\] 走 getter 占位）。
     pub fn config(&self) -> &TrainerConfig {
@@ -652,6 +686,9 @@ impl<G: Game> EsMccfrTrainer<G> {
         let n_players = self.game.n_players() as u64;
         let base_update_count = self.update_count;
         let game = &self.game;
+        // §E-rev2 / A2 — batch K traversal per rayon task,摊薄 crossbeam
+        // per-call 协调开销（profiling 实测 35-44%）。default 1 等价旧路径。
+        let batch = self.config.parallel_batch_size.max(1);
 
         if use_per_traverser {
             let tables = self
@@ -661,45 +698,59 @@ impl<G: Game> EsMccfrTrainer<G> {
             let regret_ref = &tables.regret;
 
             #[allow(clippy::type_complexity)]
-            let deltas: Vec<(
-                PlayerId,
-                LocalRegretDelta<G::InfoSet>,
-                LocalStrategyDelta<G::InfoSet>,
-            )> = active_pool
+            let deltas: Vec<
+                Vec<(
+                    PlayerId,
+                    LocalRegretDelta<G::InfoSet>,
+                    LocalStrategyDelta<G::InfoSet>,
+                )>,
+            > = active_pool
                 .par_iter_mut()
                 .enumerate()
                 .map(|(tid, rng_slot)| {
-                    let traverser = ((base_update_count + tid as u64) % n_players) as PlayerId;
-                    let shared_regret_for_traverser = &regret_ref[traverser as usize];
-                    let mut local_regret = LocalRegretDelta::<G::InfoSet>::new();
-                    let mut local_strategy = LocalStrategyDelta::<G::InfoSet>::new();
+                    let mut per_task: Vec<(
+                        PlayerId,
+                        LocalRegretDelta<G::InfoSet>,
+                        LocalStrategyDelta<G::InfoSet>,
+                    )> = Vec::with_capacity(batch);
                     let rng = rng_slot.as_mut();
-                    let root = game.root(rng);
-                    recurse_es_parallel::<G>(
-                        root,
-                        traverser,
-                        1.0,
-                        1.0,
-                        shared_regret_for_traverser,
-                        &mut local_regret,
-                        &mut local_strategy,
-                        rng,
-                    );
-                    (traverser, local_regret, local_strategy)
+                    for k in 0..batch {
+                        let global_idx =
+                            base_update_count + (tid as u64) * (batch as u64) + (k as u64);
+                        let traverser = (global_idx % n_players) as PlayerId;
+                        let shared_regret_for_traverser = &regret_ref[traverser as usize];
+                        let mut local_regret = LocalRegretDelta::<G::InfoSet>::new();
+                        let mut local_strategy = LocalStrategyDelta::<G::InfoSet>::new();
+                        let root = game.root(rng);
+                        recurse_es_parallel::<G>(
+                            root,
+                            traverser,
+                            1.0,
+                            1.0,
+                            shared_regret_for_traverser,
+                            &mut local_regret,
+                            &mut local_strategy,
+                            rng,
+                        );
+                        per_task.push((traverser, local_regret, local_strategy));
+                    }
+                    per_task
                 })
                 .collect();
 
-            // merge — 按 tid 升序 playback 到 per-traverser 表（保跨 run BLAKE3
-            // 决定性同 single-shared 路径同型政策）。
+            // merge — 按 (tid 升序, k 升序) playback 到 per-traverser 表（保跨 run
+            // BLAKE3 决定性同 single-shared 路径同型政策）。
             let tables = self.per_traverser.as_mut().expect("per_traverser 已激活");
-            for (traverser, local_regret, local_strategy) in deltas {
-                let r = &mut tables.regret[traverser as usize];
-                let s = &mut tables.strategy_sum[traverser as usize];
-                for (info, delta) in local_regret.into_entries() {
-                    r.accumulate(info, &delta);
-                }
-                for (info, weighted) in local_strategy.into_entries() {
-                    s.accumulate(info, &weighted);
+            for per_task in deltas {
+                for (traverser, local_regret, local_strategy) in per_task {
+                    let r = &mut tables.regret[traverser as usize];
+                    let s = &mut tables.strategy_sum[traverser as usize];
+                    for (info, delta) in local_regret.into_entries() {
+                        r.accumulate(info, &delta);
+                    }
+                    for (info, weighted) in local_strategy.into_entries() {
+                        s.accumulate(info, &weighted);
+                    }
                 }
             }
         } else {
@@ -708,42 +759,52 @@ impl<G: Game> EsMccfrTrainer<G> {
             let shared_regret: &RegretTable<G::InfoSet> = &self.regret;
 
             #[allow(clippy::type_complexity)]
-            let deltas: Vec<(
-                LocalRegretDelta<G::InfoSet>,
-                LocalStrategyDelta<G::InfoSet>,
-            )> = active_pool
+            let deltas: Vec<
+                Vec<(LocalRegretDelta<G::InfoSet>, LocalStrategyDelta<G::InfoSet>)>,
+            > = active_pool
                 .par_iter_mut()
                 .enumerate()
                 .map(|(tid, rng_slot)| {
-                    let traverser = ((base_update_count + tid as u64) % n_players) as PlayerId;
-                    let mut local_regret = LocalRegretDelta::<G::InfoSet>::new();
-                    let mut local_strategy = LocalStrategyDelta::<G::InfoSet>::new();
+                    let mut per_task: Vec<(
+                        LocalRegretDelta<G::InfoSet>,
+                        LocalStrategyDelta<G::InfoSet>,
+                    )> = Vec::with_capacity(batch);
                     let rng = rng_slot.as_mut();
-                    let root = game.root(rng);
-                    recurse_es_parallel::<G>(
-                        root,
-                        traverser,
-                        1.0,
-                        1.0,
-                        shared_regret,
-                        &mut local_regret,
-                        &mut local_strategy,
-                        rng,
-                    );
-                    (local_regret, local_strategy)
+                    for k in 0..batch {
+                        let global_idx =
+                            base_update_count + (tid as u64) * (batch as u64) + (k as u64);
+                        let traverser = (global_idx % n_players) as PlayerId;
+                        let mut local_regret = LocalRegretDelta::<G::InfoSet>::new();
+                        let mut local_strategy = LocalStrategyDelta::<G::InfoSet>::new();
+                        let root = game.root(rng);
+                        recurse_es_parallel::<G>(
+                            root,
+                            traverser,
+                            1.0,
+                            1.0,
+                            shared_regret,
+                            &mut local_regret,
+                            &mut local_strategy,
+                            rng,
+                        );
+                        per_task.push((local_regret, local_strategy));
+                    }
+                    per_task
                 })
                 .collect();
 
-            for (local_regret, local_strategy) in deltas {
-                for (info, delta) in local_regret.into_entries() {
-                    self.regret.accumulate(info, &delta);
-                }
-                for (info, weighted) in local_strategy.into_entries() {
-                    self.strategy_sum.accumulate(info, &weighted);
+            for per_task in deltas {
+                for (local_regret, local_strategy) in per_task {
+                    for (info, delta) in local_regret.into_entries() {
+                        self.regret.accumulate(info, &delta);
+                    }
+                    for (info, weighted) in local_strategy.into_entries() {
+                        self.strategy_sum.accumulate(info, &weighted);
+                    }
                 }
             }
         }
-        self.update_count += n_active as u64;
+        self.update_count += (n_active as u64) * (batch as u64);
         Ok(())
     }
 }

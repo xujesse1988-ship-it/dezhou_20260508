@@ -999,6 +999,13 @@ const STAGE4_SLO_32VCPU: f64 = 20_000.0;
 /// 6 套独立表落地后字面通过）。
 const STAGE4_SIX_TRAVERSER_DEVIATION_PCT: f64 = 50.0;
 
+/// **§E-rev2 / A2** — `step_parallel` 内每 rayon task 跑 `batch` 次连续 traversal,
+/// 摊薄 crossbeam work-stealing per-call 协调开销（AWS c7a.8xlarge profiling 实测
+/// 4-core 9.6K → 21.8K / 32-vCPU 29K → 66K）。SLO ② ⑥ ⑧ 默认走 batch=8;详见
+/// `docs/pluribus_stage4_profiling.md` Path A2 推算 + `pluribus_stage4_workflow.md`
+/// §修订历史 §E-rev2 carve-out 全文。
+const STAGE4_SLO_PARALLEL_BATCH: usize = 8;
+
 /// 加载 v3 artifact 并构造 `NlheGame6`；artifact 缺失 / schema 不匹配 /
 /// `NlheGame6::new` 失败时 eprintln + 返回 `None`（pass-with-skip），与 stage 3
 /// `stage3_load_v3_artifact_or_skip` / `tests/training_24h_continuous.rs` 同型。
@@ -1038,6 +1045,19 @@ fn stage4_load_v3_artifact_or_skip() -> Option<NlheGame6> {
 /// 构造 stage 4 NlheGame6 + Linear+RM+ trainer（warmup_at=1M，D-409 主路径）。
 fn stage4_build_trainer(game: NlheGame6, master_seed: u64) -> EsMccfrTrainer<NlheGame6> {
     EsMccfrTrainer::new(game, master_seed).with_linear_rm_plus(STAGE4_WARMUP_COMPLETE_AT)
+}
+
+/// **§E-rev2 / A2** — 构造带 `parallel_batch_size=8` 的 stage 4 trainer（AWS
+/// c7a.8xlarge profiling 实测 batch=8 给 32-vCPU 66K update/s = baseline 29K
+/// 的 2.27×;4-core 21.8K = baseline 9.6K 的 2.27× ≥ 15K SLO）。SLO ② ⑥ ⑧
+/// 三条用此 builder 实测 §E-rev2 优化后吞吐。详见 `docs/pluribus_stage4_profiling.md`。
+fn stage4_build_trainer_with_batch_8(
+    game: NlheGame6,
+    master_seed: u64,
+) -> EsMccfrTrainer<NlheGame6> {
+    EsMccfrTrainer::new(game, master_seed)
+        .with_linear_rm_plus(STAGE4_WARMUP_COMPLETE_AT)
+        .with_parallel_batch_size(STAGE4_SLO_PARALLEL_BATCH)
 }
 
 // ----------------------------------------------------------------------------
@@ -1127,7 +1147,9 @@ fn stage4_nlhe_6max_four_core_throughput_ge_15k_update_per_s() {
         return;
     };
     let master_seed: u64 = 0xE415_024E_3443_52FF;
-    let mut trainer = stage4_build_trainer(game, master_seed);
+    // §E-rev2 / A2 — 走 parallel_batch_size=8 摊薄 rayon per-call 协调开销
+    // （AWS c7a.8xlarge profiling 实测 batch=8 给 4-core 21.8K update/s ≥ 15K SLO）。
+    let mut trainer = stage4_build_trainer_with_batch_8(game, master_seed);
     let mut rng_pool: Vec<Box<dyn RngSource>> = (0..4u64)
         .map(|tid| {
             let seeded = master_seed.wrapping_add(0xDEAD_BEEF_u64.wrapping_mul(tid + 1));
@@ -1135,12 +1157,14 @@ fn stage4_nlhe_6max_four_core_throughput_ge_15k_update_per_s() {
         })
         .collect();
 
-    // warm-up 1 round（4 update）：触发 RegretTable lazy alloc。
+    // warm-up 1 round（4 thread × batch=8 update）：触发 RegretTable lazy alloc。
     trainer
         .step_parallel(&mut rng_pool, 4)
         .expect("stage4 NLHE warm-up step_parallel");
 
-    let n_calls = STAGE4_FOUR_CORE_UPDATES / 4;
+    // 每 call 4 threads × batch=8 = 32 update;n_calls = total / 32。
+    let per_call: u64 = 4 * (STAGE4_SLO_PARALLEL_BATCH as u64);
+    let n_calls = STAGE4_FOUR_CORE_UPDATES / per_call;
     let start = Instant::now();
     for _ in 0..n_calls {
         trainer
@@ -1148,18 +1172,20 @@ fn stage4_nlhe_6max_four_core_throughput_ge_15k_update_per_s() {
             .expect("stage4 NLHE step_parallel 期望成功");
     }
     let elapsed = start.elapsed();
-    let total_updates = n_calls * 4;
+    let total_updates = n_calls * per_call;
     let throughput = total_updates as f64 / elapsed.as_secs_f64();
     eprintln!(
         "[stage4-nlhe-4core] 实测 {total_updates} update / {:.3} s = {throughput:.0} \
-         update/s（D-490 ② SLO 门槛 ≥ {STAGE4_SLO_FOUR_CORE:.0}；D2 serial-fallback 期望失败，\
-         E2 \\[实现\\] D-321-rev2 真并发落地后必须通过）",
+         update/s（D-490 ② SLO 门槛 ≥ {STAGE4_SLO_FOUR_CORE:.0}；§E-rev2 / A2 batch={} \
+         AWS c7a.8xlarge 实测 ~21.8K ≥ 15K SLO）",
         elapsed.as_secs_f64(),
+        STAGE4_SLO_PARALLEL_BATCH,
     );
     assert!(
         throughput >= STAGE4_SLO_FOUR_CORE,
         "NlheGame6 Linear MCCFR + RM+ 4-core {throughput:.0} update/s < D-490 ② 字面阈值 \
-         {STAGE4_SLO_FOUR_CORE:.0} update/s（E1 closure 期望失败；E2 真并发实现后必须通过）",
+         {STAGE4_SLO_FOUR_CORE:.0} update/s（§E-rev2 / A2 batch={} 后必须通过）",
+        STAGE4_SLO_PARALLEL_BATCH,
     );
 }
 
@@ -1355,36 +1381,66 @@ fn stage4_24h_continuous_wall_time_ge_1e9_update_per_24h() {
         return;
     };
     let master_seed: u64 = 0xE415_0632_3468_4F55;
-    let mut trainer = stage4_build_trainer(game, master_seed);
-    let mut rng = ChaCha20Rng::from_seed(master_seed);
-
-    // warm-up 100 update + sub-sample 100K update 实测 throughput。
-    for _ in 0..100 {
-        trainer.step(&mut rng).expect("stage4 D-461 warm-up step");
+    // §E-rev2 / A2 — 测试形态 bug 修复：旧实现走单线程 `step()` 外推 24h
+    // throughput,与 first usable 训练真路径（走 `step_parallel(32, batch=8)`）
+    // 不对应;新实现走 step_parallel + parallel_batch_size=8 实测路径,AWS
+    // c7a.8xlarge 32 vCPU 实测 ~66K update/s → 24h projected ~5.7e9 ≫ 10⁹。
+    // 单线程 / 4-core / 8-core host 走 pass-with-skip（D-461 字面 32-vCPU host
+    // 实测）。
+    let cores_target = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let n_threads = cores_target.clamp(1, 32);
+    if n_threads < 4 {
+        eprintln!(
+            "[stage4-d461-24h] skip: host 仅 {cores_target} core,< 4 core 无法验证 \
+             D-461 24h projected SLO（first usable 10⁹ 训练真路径走 step_parallel ≥ 4 thread）。"
+        );
+        return;
     }
-    const SUB_SAMPLE_UPDATES: u64 = 100_000;
+
+    let mut trainer = stage4_build_trainer_with_batch_8(game, master_seed);
+    let mut rng_pool: Vec<Box<dyn RngSource>> = (0..n_threads as u64)
+        .map(|tid| {
+            let seeded = master_seed.wrapping_add(0xDEAD_BEEF_u64.wrapping_mul(tid + 1));
+            Box::new(ChaCha20Rng::from_seed(seeded)) as Box<dyn RngSource>
+        })
+        .collect();
+
+    // warm-up 1 step_parallel call（n_threads × batch=8 update）。
+    trainer
+        .step_parallel(&mut rng_pool, n_threads)
+        .expect("stage4 D-461 warm-up step_parallel");
+
+    // sub-sample ~100K update：n_calls × n_threads × batch ≥ 100_000。
+    let per_call: u64 = (n_threads as u64) * (STAGE4_SLO_PARALLEL_BATCH as u64);
+    const SUB_SAMPLE_TARGET: u64 = 100_000;
+    let n_calls = SUB_SAMPLE_TARGET.div_ceil(per_call);
+    let total_updates = n_calls * per_call;
     let start = Instant::now();
-    for _ in 0..SUB_SAMPLE_UPDATES {
+    for _ in 0..n_calls {
         trainer
-            .step(&mut rng)
-            .expect("stage4 D-461 sub-sample step 期望成功");
+            .step_parallel(&mut rng_pool, n_threads)
+            .expect("stage4 D-461 sub-sample step_parallel 期望成功");
     }
     let elapsed = start.elapsed();
-    let throughput = SUB_SAMPLE_UPDATES as f64 / elapsed.as_secs_f64();
+    let throughput = total_updates as f64 / elapsed.as_secs_f64();
     let projected_24h_updates = throughput * 24.0 * 3600.0;
     eprintln!(
-        "[stage4-d461-24h] 实测 {SUB_SAMPLE_UPDATES} update / {:.3} s = {throughput:.0} \
+        "[stage4-d461-24h] 实测 {total_updates} update / {:.3} s = {throughput:.0} \
          update/s → 24h projected = {projected_24h_updates:.2e} update（SLO 门槛 ≥ 10⁹ = \
-         first usable D-440 字面）",
+         first usable D-440 字面；§E-rev2 / A2 step_parallel × {n_threads} thread × \
+         batch={} 实测）",
         elapsed.as_secs_f64(),
+        STAGE4_SLO_PARALLEL_BATCH,
     );
     let first_usable_threshold = 1.0e9_f64;
     assert!(
         projected_24h_updates >= first_usable_threshold,
         "stage4 24h continuous projected updates {projected_24h_updates:.2e} < D-440 字面 \
-         first usable 10⁹（throughput {throughput:.0} update/s × 24h × 3600 s）；E1 closure \
-         single-shared RegretTable 路径下 throughput 不足；E2 \\[实现\\] 真并发 + rayon pool \
-         落地后必须通过",
+         first usable 10⁹（throughput {throughput:.0} update/s × 24h × 3600 s）；§E-rev2 \
+         / A2 step_parallel × {n_threads} × batch={} 实测后必须通过",
+        STAGE4_SLO_PARALLEL_BATCH,
     );
 }
 
@@ -1444,7 +1500,14 @@ fn stage4_nlhe_6max_six_traverser_per_traverser_throughput_cross_check() {
         return;
     };
     let master_seed: u64 = 0xE415_0836_5452_4156;
-    let mut trainer = stage4_build_trainer(game, master_seed);
+    // §E-rev2 / A2 — trainer 走 parallel_batch_size=8 配置（虽然本测试走单线程
+    // `step()` 测量 per-traverser CFR 计算耗时,batch 设置不影响 step() 路径,
+    // 但保持 trainer 配置与 SLO ②⑥ 一致;真 first usable 训练同走 batch=8）。
+    // D-459 字面 per-traverser deviation 是 6-player NLHE 树结构固有不对称,
+    // batching 不解决（CFR 路径长度 / reachable InfoSet 数量 / payoff 分布与
+    // seat position 强相关）。E1 closure 实测 deviation ~103% → §F-rev / F3
+    // D-459-revM 翻面候选条件触发。
+    let mut trainer = stage4_build_trainer_with_batch_8(game, master_seed);
     let mut rng = ChaCha20Rng::from_seed(master_seed);
 
     // 6 traverser × N update per traverser = 6 × N update total（alternating

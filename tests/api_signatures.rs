@@ -907,6 +907,7 @@ fn _stage4_api_signature_assertions() {
         rm_plus_enabled: false,
         warmup_complete_at: 1_000_000,
         decay_strategy: DecayStrategy::EagerDecay,
+        parallel_batch_size: 1,
     };
     let _: u8 = cfg.n_threads;
     let _: u64 = cfg.checkpoint_interval;
@@ -915,17 +916,22 @@ fn _stage4_api_signature_assertions() {
     let _: bool = cfg.rm_plus_enabled;
     let _: u64 = cfg.warmup_complete_at;
     let _: DecayStrategy = cfg.decay_strategy;
+    let _: usize = cfg.parallel_batch_size;
     let _: TrainerConfig = TrainerConfig::default();
     let _: DecayStrategy = DecayStrategy::EagerDecay;
     let _: DecayStrategy = DecayStrategy::LazyDecay;
 
     // ---------------------------------------------------------------
     // API-400 — EsMccfrTrainer::with_linear_rm_plus builder + config()
+    // §E-rev2 / A2 — with_parallel_batch_size builder（AWS c7a.8xlarge
+    // profiling 触发,详见 docs/pluribus_stage4_profiling.md）。
     // ---------------------------------------------------------------
     let _: fn(EsMccfrTrainer<NlheGame6>, u64) -> EsMccfrTrainer<NlheGame6> =
         EsMccfrTrainer::<NlheGame6>::with_linear_rm_plus;
     let _: for<'a> fn(&'a EsMccfrTrainer<NlheGame6>) -> &'a TrainerConfig =
         EsMccfrTrainer::<NlheGame6>::config;
+    let _: fn(EsMccfrTrainer<NlheGame6>, usize) -> EsMccfrTrainer<NlheGame6> =
+        EsMccfrTrainer::<NlheGame6>::with_parallel_batch_size;
 
     // ---------------------------------------------------------------
     // API-450 / API-451 — LbrEvaluator + LbrResult / SixTraverserLbrResult

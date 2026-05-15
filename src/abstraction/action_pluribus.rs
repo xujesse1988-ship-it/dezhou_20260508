@@ -27,6 +27,7 @@ use crate::abstraction::action::{
     AbstractAction, AbstractActionSet, ActionAbstraction, ActionAbstractionConfig, BetRatio,
 };
 use crate::core::ChipAmount;
+use crate::rules::action::LegalActionSet;
 use crate::rules::state::GameState;
 
 /// Pluribus 14-action enumeration（API-420 / D-420 字面顺序）。
@@ -136,10 +137,18 @@ impl PluribusActionAbstraction {
     /// 走 stage 1 [`GameState`] legal action + pot / current_bet 计算（D-422
     /// 字面 raise size 走 stage 1 [`GameState::apply`] byte-equal 验证）。输出
     /// 顺序固定 = [`PluribusAction::all`] 字面顺序（deterministic）。
+    ///
+    /// **A1 优化（2026-05-15，AWS c7a.8xlarge profiling 触发）**：hoist
+    /// [`GameState::legal_actions`] 调用出循环 — 旧实现 14 次 [`Self::is_legal`]
+    /// 各自重算 [`LegalActionSet`]（profiling 实测 `legal_actions` + `is_legal`
+    /// 在 step_parallel hot path 占 ~12-16%）；新实现一次性算好后走
+    /// `is_legal_cached` 私有 helper filter 14 个 [`PluribusAction`]。输出与旧实现
+    /// byte-equal（`is_legal_cached` 与 `is_legal` 内部计算等价）。
     pub fn actions(&self, state: &GameState) -> Vec<PluribusAction> {
+        let legal = state.legal_actions();
         let mut out = Vec::with_capacity(PluribusAction::N_ACTIONS);
         for action in PluribusAction::all() {
-            if self.is_legal(&action, state) {
+            if self.is_legal_cached(&action, state, &legal) {
                 out.push(action);
             }
         }
@@ -158,6 +167,20 @@ impl PluribusActionAbstraction {
     ///   action 覆盖）。
     pub fn is_legal(&self, action: &PluribusAction, state: &GameState) -> bool {
         let legal = state.legal_actions();
+        self.is_legal_cached(action, state, &legal)
+    }
+
+    /// **A1 优化** — `is_legal` 的内部 cached 版本，跳过 [`GameState::legal_actions`]
+    /// 重算。供 [`Self::actions`] 14-action filter loop 调用，避免每 CFR 决策点
+    /// 14 次 LegalActionSet 重算。输出与 [`Self::is_legal`] 字面等价（接受外部
+    /// 传入的 `legal` 与内部重算 byte-equal — `legal_actions` 是 `&GameState` 上
+    /// 的纯函数）。
+    fn is_legal_cached(
+        &self,
+        action: &PluribusAction,
+        state: &GameState,
+        legal: &LegalActionSet,
+    ) -> bool {
         match action {
             PluribusAction::Fold => legal.fold,
             PluribusAction::Check => legal.check,
