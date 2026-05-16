@@ -279,15 +279,35 @@ impl SlumbotBridge {
         let mut sum_sq_mbb: f64 = 0.0;
         let mut completed: u64 = 0;
 
+        let mut failed: u64 = 0;
         for hand_id in 0..n_hands {
             let seed = master_seed
                 .wrapping_add(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(hand_id.wrapping_add(1)));
-            let r1 = self.play_one_hand(blueprint, seed)?;
-            sum_mbb += r1.mbb_delta;
-            sum_sq_mbb += r1.mbb_delta * r1.mbb_delta;
-            completed += 1;
+            match self.play_one_hand(blueprint, seed) {
+                Ok(r1) => {
+                    sum_mbb += r1.mbb_delta;
+                    sum_sq_mbb += r1.mbb_delta * r1.mbb_delta;
+                    completed += 1;
+                }
+                Err(_) => {
+                    // 单手失败 skip-and-continue（§F3-revM 字面）— 失败统计输出
+                    // stderr 让 caller 决定是否 abort；累计 mean / SE 只统计
+                    // completed 路径让 estimator 不偏。
+                    failed += 1;
+                    if std::env::var("SLUMBOT_DEBUG").is_ok() {
+                        eprintln!(
+                            "[slumbot] hand_id={hand_id} skipped (failed); completed={completed} failed={failed}"
+                        );
+                    }
+                }
+            }
         }
         let _ = duplicate_dealing; // §F3-revM no-op flag (API 兼容)
+        if failed > 0 {
+            eprintln!(
+                "[slumbot] evaluate_blueprint: {failed}/{n_hands} hands failed and were skipped"
+            );
+        }
 
         let n_hands_reported = n_hands;
         let n = completed as f64;
@@ -621,19 +641,18 @@ fn apply_slumbot_action_str(
 }
 
 /// `PluribusAction` → Slumbot incr string，依赖 `state.game_state` 给 raise/bet
-/// 计算 absolute "to" chip。
+/// 计算 absolute "to" chip + 落入 Slumbot legal range（min_raise / max=stack）。
 ///
-/// **Fold/Check 互转**：Slumbot 把 fold-when-check-legal 视为 "Illegal fold"
-/// 拒绝；本函数若 blueprint 选 Fold 但当前面无 bet（即 Check 合法），改发
-/// `k`（语义等价 — 都是不投入更多 chip 的 minimal-loss 选择，避免 Slumbot 拒绝
-/// 整 hand 失败）。同型把 Check-when-call-required 拒绝由 stage 1 legal_actions
-/// 上游已过滤（PluribusActionAbstraction 不会在 face bet 时返 Check）。
+/// **defensive 翻译**（防 Slumbot "Illegal fold" / "Illegal bet" 拒绝整 hand）:
+/// - Fold-when-check-legal → Check（Slumbot fold 必须有 bet 面对）。
+/// - Raise variant 算 `to` 后 clamp 到 stage 1 `legal.raise_range / bet_range`
+///   `[min_to, max_to]` 内（下限 = min raise，上限 = remaining stack）；落不进
+///   合法区间的退化到 AllIn 或 Call。
 fn pluribus_to_slumbot_incr(action: PluribusAction, state: &NlheGame6State) -> String {
     let la = state.game_state.legal_actions();
-    let check_legal = la.check;
     match action {
         PluribusAction::Fold => {
-            if check_legal {
+            if la.check {
                 "k".to_string()
             } else {
                 "f".to_string()
@@ -650,8 +669,26 @@ fn pluribus_to_slumbot_incr(action: PluribusAction, state: &NlheGame6State) -> S
         raise => {
             let mult = raise.raise_multiplier().expect("raise variant matched");
             let abstraction = PluribusActionAbstraction;
-            let to = abstraction.compute_raise_to(&state.game_state, mult);
-            format!("b{}", to.as_u64())
+            let raw_to = abstraction.compute_raise_to(&state.game_state, mult).as_u64();
+            let range = la.raise_range.or(la.bet_range);
+            match range {
+                Some((min_to, max_to)) => {
+                    let min = min_to.as_u64();
+                    let max = max_to.as_u64();
+                    let to = raw_to.clamp(min, max);
+                    format!("b{to}")
+                }
+                None => {
+                    // 不能 raise/bet — 退化到 Call/Check/Fold（按合法性优先级）
+                    if la.call.is_some() {
+                        "c".to_string()
+                    } else if la.check {
+                        "k".to_string()
+                    } else {
+                        "f".to_string()
+                    }
+                }
+            }
         }
     }
 }
