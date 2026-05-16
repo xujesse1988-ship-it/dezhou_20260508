@@ -122,10 +122,7 @@ impl SlumbotBridge {
         let start = std::time::Instant::now();
         let table = Arc::clone(blueprint.game_ref().bucket_table_for_eval());
         let game_200bb =
-            build_200bb_hu_game(table).map_err(|_| TrainerError::ProbabilitySumOutOfTolerance {
-                got: 0.0,
-                tolerance: 0.0,
-            })?;
+            build_200bb_hu_game(table).map_err(|_| slumbot_err_ctx("build_200bb_hu_game failed"))?;
         let mut hand_rng = ChaCha20Rng::from_seed(seed);
 
         // 1. POST /new_hand
@@ -133,7 +130,7 @@ impl SlumbotBridge {
         let mut token = response
             .get("token")
             .and_then(|v| v.as_str())
-            .ok_or_else(slumbot_err)?
+            .ok_or_else(|| slumbot_err_ctx("missing token in /new_hand response"))?
             .to_string();
 
         const MAX_ROUNDS: usize = 256;
@@ -158,11 +155,16 @@ impl SlumbotBridge {
             let our_seat_pos = response
                 .get("client_pos")
                 .and_then(|v| v.as_u64())
-                .ok_or_else(slumbot_err)? as u8;
-            let hole = parse_card_array(response.get("hole_cards").ok_or_else(slumbot_err)?)
-                .ok_or_else(slumbot_err)?;
+                .ok_or_else(|| slumbot_err_ctx("missing client_pos"))?
+                as u8;
+            let hole = parse_card_array(
+                response
+                    .get("hole_cards")
+                    .ok_or_else(|| slumbot_err_ctx("missing hole_cards"))?,
+            )
+            .ok_or_else(|| slumbot_err_ctx("parse hole_cards failed"))?;
             if hole.len() != 2 {
-                return Err(slumbot_err());
+                return Err(slumbot_err_ctx("hole_cards.len() != 2"));
             }
             let board = parse_card_array(response.get("board").unwrap_or(&serde_json::json!([])))
                 .unwrap_or_default();
@@ -172,26 +174,31 @@ impl SlumbotBridge {
                 .unwrap_or("")
                 .to_string();
 
-            // Slumbot client_pos: 0 = SB / button (act first preflop) ; 1 = BB
-            // NlheGame6 HU: button=seat 0=SB; non-button=seat 1=BB.
-            let our_seat: u8 = our_seat_pos;
+            // Slumbot client_pos convention（实测验证 + sample_api.py ParseAction
+            // 间接推算）：client_pos=0 = BB（non-button），client_pos=1 = SB
+            // （button，preflop 先行）。验证：probe 中 client_pos=0 + 我方 fold
+            // 后 winnings=-100（恰为 BB blind 损失）。
+            // NlheGame6 HU: button=SeatId(0)=SB; non-button=SeatId(1)=BB；
+            // 因此 our_seat = 1 - client_pos。
+            let our_seat: u8 = 1 - our_seat_pos;
 
             // 2. Build state with the known cards (opp hole filled with arbitrary
             // unused cards) and replay full action history.
             let our_hole = [hole[0], hole[1]];
             let state = build_hu_state_with_cards(&game_200bb, our_seat, our_hole, &board)
-                .map_err(|_| slumbot_err())?;
+                .map_err(|_| slumbot_err_ctx(&format!("build_hu_state_with_cards our_seat={our_seat}")))?;
             let state = apply_slumbot_action_str(state, &action_str, &mut hand_rng)
-                .map_err(|_| slumbot_err())?;
+                .map_err(|_| slumbot_err_ctx(&format!("apply_slumbot_action_str: {action_str}")))?;
 
             // 3. Sanity: it's our turn now (Slumbot wouldn't ask otherwise).
             let actor = match NlheGame6::current(&state) {
                 NodeKind::Player(a) => a,
-                _ => return Err(slumbot_err()),
+                other => return Err(slumbot_err_ctx(&format!("expected Player node, got {other:?} action_str={action_str}"))),
             };
             if actor != our_seat {
-                // Server / client model mismatch — surface as parseable error
-                return Err(slumbot_err());
+                return Err(slumbot_err_ctx(&format!(
+                    "actor {actor} != our_seat {our_seat} (action_str={action_str} client_pos={our_seat_pos})"
+                )));
             }
 
             // 4. Query blueprint policy and sample.
@@ -199,7 +206,7 @@ impl SlumbotBridge {
             let avg = blueprint.average_strategy_for_traverser(actor, &info);
             let legal = NlheGame6::legal_actions(&state);
             if legal.is_empty() {
-                return Err(slumbot_err());
+                return Err(slumbot_err_ctx("legal_actions empty"));
             }
             let chosen = sample_blueprint_action(&legal, &avg, &mut hand_rng);
 
@@ -440,6 +447,15 @@ fn slumbot_err() -> TrainerError {
         got: 0.0,
         tolerance: 0.0,
     }
+}
+
+/// 带 context 的 error builder — debug 用，把 context 字符串 eprint 出来便于
+/// 定位失败点。生产路径默认 silent，由 SLUMBOT_DEBUG 环境变量启用。
+fn slumbot_err_ctx(ctx: &str) -> TrainerError {
+    if std::env::var("SLUMBOT_DEBUG").is_ok() {
+        eprintln!("[slumbot] {ctx}");
+    }
+    slumbot_err()
 }
 
 /// 解析 `["Th", "9c"]` 形式的 JSON 数组到 `Vec<Card>`。无法解析 → `None`。
