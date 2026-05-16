@@ -232,14 +232,24 @@ impl SlumbotBridge {
         if let Some(key) = &self.api_key {
             req = req.header("X-API-Key", key);
         }
-        let resp = req.send().map_err(|_| slumbot_err())?;
+        let resp = req
+            .send()
+            .map_err(|e| slumbot_err_ctx(&format!("POST {url} send: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(slumbot_err());
+            return Err(slumbot_err_ctx(&format!(
+                "POST {url} status {status}"
+            )));
         }
-        let v: serde_json::Value = resp.json().map_err(|_| slumbot_err())?;
-        if v.get("error_msg").is_some() {
-            return Err(slumbot_err());
+        let body_text = resp
+            .text()
+            .map_err(|e| slumbot_err_ctx(&format!("POST {url} body read: {e}")))?;
+        let v: serde_json::Value = serde_json::from_str(&body_text)
+            .map_err(|e| slumbot_err_ctx(&format!("POST {url} json parse: {e} body={body_text}")))?;
+        if let Some(err) = v.get("error_msg") {
+            return Err(slumbot_err_ctx(&format!(
+                "POST {url} error_msg: {err}"
+            )));
         }
         Ok(v)
     }
