@@ -40,16 +40,18 @@ solving 完整化目标，stage 5 起步不需要等齐这些项。
    编码 — 200 BB stack 在 100 BB 训练分布下 bin 到 deep-stack 区域，blueprint
    policy 偏 uniform。详见 §8.1 第 3 条。
 
-4. **D-461 Slumbot 100K 手 mean ≥ -10 mbb/g first usable 阈值未达**（实测
-   待填）：受 stage-size mismatch + 10⁹ vs 10¹¹ training scale gap 双重影响，
-   Slumbot 100K 手 mean_mbbg 实测约为 [TBD] mbb/g（D-461 阈值 ≥ -10 mbb/g），
-   留 stage 5 翻面评估"NlheGame6 200 BB HU 重训 + production 10¹¹ scale" 双轨
-   翻面路径。详见 §8.1 第 4 条。
+4. **D-461 Slumbot mean ≥ -10 mbb/g first usable 阈值未达**：§F3-rev2 收窄
+   100K → 10K 评测规模实测 mean **-1110.92 mbb/g**（95% CI [-1918, -303]），
+   阈值 ≥ -10 fail by ~111×。受 n_players mismatch（6-max blueprint × HU
+   eval）+ stack-size mismatch（100 BB training × 200 BB Slumbot）+ 10⁹ vs
+   10¹² training scale gap 三重影响。留 stage 5 翻面评估"NlheGame6 200 BB HU
+   重训 + production 10¹¹ scale" 双轨翻面路径。详见 §5 + §8.1 第 4 条。
 
-5. **D-450 LBR < 200 mbb/g first usable 阈值未达**（实测待填）：6-traverser
-   average LBR 实测约为 [TBD] mbb/g（D-450 阈值 < 200 mbb/g）。10⁹ training
-   scale 下 LBR 收敛尚未完全到 first usable 字面阈值，与 Pluribus 原 paper
-   10¹² scale 训练对应。详见 §8.1 第 5 条。
+5. **D-450 LBR < 200 mbb/g first usable 阈值未达**：6-traverser average LBR
+   实测 **56,231 mbb/g**（D-450 阈值 < 200 mbb/g）。10⁹ training scale 下
+   LBR 收敛在 100M → 1B 区间仅下降 2.2%（57.5K → 56.2K mbb/g），与 Pluribus
+   原 paper 10¹² scale 训练 LBR < 100 mbb/g 数字相差 ~280×（合理 — 算力
+   1/250 - 1/1000）。详见 §4 + §8.1 第 5 条。
 
 阶段 4 交付的核心制品：
 
@@ -241,25 +243,78 @@ Pluribus 原 paper 报 LBR < 100 mbb/g 是 10¹² training scale × 64-core 8-da
 [待填 — 从 100M/200M/300M/.../1B 各 auto checkpoint 跑 LBR 收敛曲线，stage 5
 起步 carve-out 评估，本 F3 [报告] 不阻塞]
 
-## 5. Slumbot HU 100K 手评测
+## 5. Slumbot HU 10K 手评测（§F3-rev2 用户授权 100K → 10K 收窄）
 
-### 5.1 final checkpoint Slumbot 100K 手
+### 5.1 §F3-rev2 — 100K → 10K 评测规模收窄
+
+D-461 字面 first usable 阈值评测协议是 100K 手，但由于 stage-size + n_players
+双重抽象层 mismatch 让预期实测远超阈值（详见 §8.1 第 4 条），用户授权
+§F3-rev2 把 stage 4 F3 [报告] 起步 100K 规模收窄到 10K，节省 ~80 min
+Slumbot API 调用 + 验证仍能给出统计意义上有效的 95% CI（10K n_hands ×
+~24 hands/s ≈ 7 min，SE ~ 410 mbb/g）。10K 数据已足以判断 D-461 是否通过
+first usable 阈值。
+
+100K 完整规模留 stage 5 production 10¹¹ 训练后单独 evaluate（届时阈值预期
+更接近达成，再走完整 D-461 协议）。
+
+### 5.2 final checkpoint Slumbot 10K 手实测
 
 `target/release/eval_blueprint --checkpoint <final.ckpt> --slumbot-endpoint
-https://slumbot.com/api/ --slumbot-hands 100000 --baseline-hands 0
+https://slumbot.com/api/ --slumbot-hands 10000 --baseline-hands 0
 --master-seed 42`
 
 | 项 | 数值 |
 |---|---|
-| n_hands | [TBD] / 100000 |
-| failed (skipped) | [TBD] |
-| mean_mbbg | [TBD] |
-| standard_error_mbbg | [TBD] |
-| 95% CI 下界 | [TBD] |
-| 95% CI 上界 | [TBD] |
-| Wall time | [TBD] s |
+| n_hands target | 10,000 |
+| n_hands completed | 9,879 |
+| failed (skipped, "Illegal bet" Slumbot rejection edge case) | 121 (1.21%) |
+| mean_mbbg | **-1110.92** |
+| standard_error_mbbg | 411.96 |
+| 95% CI 下界 | -1918.37 |
+| 95% CI 上界 | -303.47 |
+| Wall time | 410.64 s (≈ 6.84 min) |
+| Throughput | 24.4 hands/s (HTTP-bound) |
 
-D-461 first usable 阈值：mean ≥ -10 mbb/g；95% CI 下界 ≥ -30 mbb/g。
+D-461 first usable 阈值 vs 实测：
+
+| 阈值 | 字面阈值 | 实测 | 通过 |
+|---|---|---|---|
+| mean ≥ -10 mbb/g | mean ≥ -10 | **-1111** | ❌ **fail by ~111×** |
+| 95% CI 下界 ≥ -30 mbb/g | CI 下界 ≥ -30 | -1918 | ❌ **fail by ~64×** |
+| 95% CI 上界 ≥ 0 | (隐含) | -303 | ❌ 上界仍负 |
+
+### 5.3 与 100M intermediate smoke 数据对比
+
+| Checkpoint | mean_mbbg | n_hands |
+|---|---|---|
+| 100M intermediate (smoke) | -909.85 | 1,000 |
+| 1B final (本节) | -1110.92 | 10,000 |
+
+**关键观察**：100M → 1B 进一步训练（10× scale）下 Slumbot 表现 **没有改善**
+（实际略恶化 -201 mbb/g）。这与 §4 LBR 趋势一致 — exploitability 在 10⁹
+scale 下基本停滞。stage-size mismatch 主导 Slumbot 这条评测路径的偏差，
+增加训练量不会改善（需要 stage 5 NlheGame6 200 BB HU 重训才能解耦
+mismatch）。
+
+### 5.4 protocol mapping 摘要
+
+§F3-revM Slumbot 集成关键映射：
+- `client_pos`：0 = BB（non-button），1 = SB（button，preflop 先行）
+  ；NlheGame6 our_seat = 1 - client_pos
+- 200 BB stack matching：`build_200bb_hu_game(table)` 配
+  `n_seats=2 / starting_stacks=20_000 chip / 200 BB`
+- StackedDeckRng D-028 反推协议构造目标 deck
+- defensive `pluribus_to_slumbot_incr` Fold→Check + Raise to clamp 防 Illegal
+  fold / Illegal bet 拒绝
+
+### 5.5 known issues
+
+- ~1.21% hand failure rate（Slumbot returns "Illegal bet" / "Illegal fold"
+  edge case：blueprint 选 Raise variant 但 clamped 结果仍触发 Slumbot
+  字面 min-raise check fail 等罕见情况）skip-and-continue 不阻塞 evaluation
+- stack-size mismatch：blueprint 训练 100 BB 6-max；Slumbot 200 BB HU；
+  predicted bias ~ -20 至 -30 mbb/g；实测 -1111 mbb/g 比预测多 ~30×，说明
+  n_players mismatch（6-max → HU）+ 10⁹ training scale 不足是主导因素
 
 ### 5.2 protocol mapping 摘要
 
@@ -394,11 +449,29 @@ LBR 6-traverser average 56,231 mbb/g，max-min deviation = (61441-51545)/56231 =
 message 含 carve-out 全文]
 
 1. **§F2-revM** — train_cfr CLI 落地提前到 F3 起步（commit `6d14695`）。
-2. **§F3-revM** — Slumbot HU NLHE 完整集成（commits `7df14a3`...`5f52cee`）。
-3. **stack-size 抽象层 mismatch** — blueprint 训练 100 BB / Slumbot 200 BB。
-4. **D-461 Slumbot 阈值 fail**（待训练完成后填充）— 留 stage 5 翻面。
-5. **D-450 LBR 阈值 fail**（待训练完成后填充）— 留 stage 5 production
-   10¹¹ 训练翻面。
+2. **§F3-revM** — Slumbot HU NLHE 完整集成（commits `7df14a3` →
+   `405568b` client_pos 反演 → `e6d66f3` post_json 诊断 → `227e19e`
+   Fold→Check 翻译 → `5f52cee` defensive clamp + skip-failed-hands）。
+3. **§F3-rev2** — Slumbot 100K → 10K 评测规模收窄（用户授权 2026-05-16）。
+   原因：stack-size + n_players 双重 mismatch 让阈值预期远超 fail；10K 已
+   足以给统计意义有效 95% CI，节省 ~80 min Slumbot API 调用 + 减轻
+   Slumbot 公益服务负载。100K 完整规模留 stage 5 production 10¹¹ 训练
+   + HU 200 BB 重训后单独 evaluate。
+4. **stack-size 抽象层 mismatch** — blueprint 训练 100 BB / Slumbot 200 BB。
+   `stack_bucket` InfoSet bin 不匹配 + n_players=6 vs 2 训练分布差异 →
+   Slumbot 评测路径 mean -1111 mbb/g（D-461 阈值 ≥ -10 fail 111×）。stage 5
+   评估"NlheGame6 200 BB HU 重训"或"Slumbot custom 100 BB endpoint"两轨翻面。
+5. **D-461 Slumbot 阈值 fail** — mean -1111 mbb/g vs ≥ -10 阈值 fail by 111×；
+   95% CI 下界 -1918 vs ≥ -30 阈值 fail by 64×。stage 5 production
+   10¹¹ 训练 + HU 重训承接翻面。
+6. **D-450 LBR 阈值 fail** — 6-traverser average LBR 56,231 mbb/g vs < 200
+   阈值 fail by 281×；per-traverser min 51,545 vs < 500 阈值 fail by 103×。
+   100M → 1B 训练（10× scale）仅改善 2.2%，需 stage 5 production 10¹¹
+   training scale 翻面承接。
+7. **D-480 vs TAG baseline mean > 0 fail** — vs TAG mean -267 mbb/g（vs
+   Random + CallStation pass）。D-489 carve-out 字面预留 TAG ±20% noise
+   tolerance 不覆盖 -267 magnitude；与 §6.4 翻前 dump trash-hand 过激
+   + BTN/SB uniform 1/12 现象一致。stage 5 训练规模翻面承接。
 
 ### 8.2 stage 5 起步并行清单（carry-forward）
 
@@ -439,7 +512,7 @@ message 含 carve-out 全文]
 | 9 | stage 3 baseline 不退化 | byte-equal | `stage3-v1.0` tag 重跑 byte-equal 维持；§F2-revM / §F3-revM 不触达 stage 3 trainer/checkpoint dispatch 路径 | ✅ |
 | 10 | first usable 10⁹ 训练完成 | 6-traverser blueprint artifact + checkpoint round-trip BLAKE3 | **完成** — 1B update / 4.76h / final checkpoint 95.7 MB / SHA256 `388e8d84...` | ✅ |
 | 11 | LBR < 200 mbb/g first usable | average ≤ 200 + min < 500 + 100 采样点单调非升 ±10% | average **56,231 mbb/g** / min 51,545 / max 61,441；100 采样点收敛曲线 deferred 到 stage 5 | ❌ **fail by 281×**（已知偏离 §8.1 第 5 条） |
-| 12 | Slumbot 100K 手 mean ≥ -10 mbb/g | + 95% CI 下界 ≥ -30 + 5 次重复 SE | **[TBD — 100K eval 进行中，约 07:30 UTC 完成]**；预期 fail（stack-size mismatch + 6-max blueprint × HU eval） | ❌ **预期 fail**（已知偏离 §8.1 第 4 条） |
+| 12 | Slumbot 100K 手 mean ≥ -10 mbb/g | + 95% CI 下界 ≥ -30 + 5 次重复 SE | §F3-rev2 收窄到 10K：mean **-1111 mbb/g** / 95% CI [-1918, -303] / 9879/10000 completed | ❌ **fail by 111×**（已知偏离 §8.1 第 4 条） |
 | 13 | baseline 3 类 mean > 0 | random + call_station + TAG 全 mean > 0 | Random +1657 ✅ / CallStation +98 ✅ / TAG **-267** ❌ | ⚠️ **2/3 pass**（D-489 carve-out TAG 字面 noise ±20% 不覆盖此 -267 的 magnitude） |
 | 14 | 24h continuous run | RSS 增量 < 5 GB + 全 checkpoint round-trip 成功 | RSS 增量 280 MB / 5 GB = 5.6%（17.8× 余量）；10 个 auto checkpoint 全 round-trip BLAKE3 成功（`tests/checkpoint_v2_round_trip.rs` D1 测试涵盖）| ✅ |
 | 15 | 多人 CFR 监控 | average regret growth sublinear + entropy 单调下降 + 动作概率震荡幅度单调下降 | metrics.jsonl 2,679 采样点全程 0 alarm；regret/entropy/oscillation 三条曲线 monotone decay 到 ~3e-5 / 1.6e-9 量级 | ✅ |

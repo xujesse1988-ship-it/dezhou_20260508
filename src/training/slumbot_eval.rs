@@ -121,8 +121,8 @@ impl SlumbotBridge {
     {
         let start = std::time::Instant::now();
         let table = Arc::clone(blueprint.game_ref().bucket_table_for_eval());
-        let game_200bb =
-            build_200bb_hu_game(table).map_err(|_| slumbot_err_ctx("build_200bb_hu_game failed"))?;
+        let game_200bb = build_200bb_hu_game(table)
+            .map_err(|_| slumbot_err_ctx("build_200bb_hu_game failed"))?;
         let mut hand_rng = ChaCha20Rng::from_seed(seed);
 
         // 1. POST /new_hand
@@ -186,14 +186,20 @@ impl SlumbotBridge {
             // unused cards) and replay full action history.
             let our_hole = [hole[0], hole[1]];
             let state = build_hu_state_with_cards(&game_200bb, our_seat, our_hole, &board)
-                .map_err(|_| slumbot_err_ctx(&format!("build_hu_state_with_cards our_seat={our_seat}")))?;
+                .map_err(|_| {
+                    slumbot_err_ctx(&format!("build_hu_state_with_cards our_seat={our_seat}"))
+                })?;
             let state = apply_slumbot_action_str(state, &action_str, &mut hand_rng)
                 .map_err(|_| slumbot_err_ctx(&format!("apply_slumbot_action_str: {action_str}")))?;
 
             // 3. Sanity: it's our turn now (Slumbot wouldn't ask otherwise).
             let actor = match NlheGame6::current(&state) {
                 NodeKind::Player(a) => a,
-                other => return Err(slumbot_err_ctx(&format!("expected Player node, got {other:?} action_str={action_str}"))),
+                other => {
+                    return Err(slumbot_err_ctx(&format!(
+                        "expected Player node, got {other:?} action_str={action_str}"
+                    )))
+                }
             };
             if actor != our_seat {
                 return Err(slumbot_err_ctx(&format!(
@@ -237,19 +243,16 @@ impl SlumbotBridge {
             .map_err(|e| slumbot_err_ctx(&format!("POST {url} send: {e}")))?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(slumbot_err_ctx(&format!(
-                "POST {url} status {status}"
-            )));
+            return Err(slumbot_err_ctx(&format!("POST {url} status {status}")));
         }
         let body_text = resp
             .text()
             .map_err(|e| slumbot_err_ctx(&format!("POST {url} body read: {e}")))?;
-        let v: serde_json::Value = serde_json::from_str(&body_text)
-            .map_err(|e| slumbot_err_ctx(&format!("POST {url} json parse: {e} body={body_text}")))?;
+        let v: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| {
+            slumbot_err_ctx(&format!("POST {url} json parse: {e} body={body_text}"))
+        })?;
         if let Some(err) = v.get("error_msg") {
-            return Err(slumbot_err_ctx(&format!(
-                "POST {url} error_msg: {err}"
-            )));
+            return Err(slumbot_err_ctx(&format!("POST {url} error_msg: {err}")));
         }
         Ok(v)
     }
@@ -669,7 +672,9 @@ fn pluribus_to_slumbot_incr(action: PluribusAction, state: &NlheGame6State) -> S
         raise => {
             let mult = raise.raise_multiplier().expect("raise variant matched");
             let abstraction = PluribusActionAbstraction;
-            let raw_to = abstraction.compute_raise_to(&state.game_state, mult).as_u64();
+            let raw_to = abstraction
+                .compute_raise_to(&state.game_state, mult)
+                .as_u64();
             let range = la.raise_range.or(la.bet_range);
             match range {
                 Some((min_to, max_to)) => {
