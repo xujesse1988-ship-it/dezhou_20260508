@@ -197,10 +197,16 @@ fn schema_version_downgrade_returns_schema_mismatch() {
 // ===========================================================================
 
 #[test]
+#[ignore = "§stage5-rev0 2026-05-16（stage 5 A1 [实现] dispatch carve-out 跟进）：\
+            stage 5 A1 commit 4d67e24 把 TrainerVariant::EsMccfrLinearRmPlusCompact 加 = 3 + \
+            `from_u8(3) -> Some(EsMccfrLinearRmPlusCompact)`，tag = 3 不再走 Corrupted dispatch；\
+            本测试在 dispatch 路径下原 \"未占用 tag\" 语义不可达，B1 [测试] 起步前 §stage5-rev0 \
+            carve-out 沿用 §D2-revM (i) 模式 ignore，留待后续 re-author（如改 tag = 4 / \
+            tag = 0xFE 之类）。详 `docs/pluribus_stage5_workflow.md` §10 / §修订历史。"]
 fn trainer_variant_unknown_tag_3_returns_corrupted() {
     // TrainerVariant 已扩到 0 (VanillaCfr) / 1 (EsMccfr) / 2 (EsMccfrLinearRmPlus
-    // stage 4 API-441)；3 是 stage 4 A1 [实现] 后下一个未占用 tag，必走 Corrupted
-    // dispatch（checkpoint.rs::parse_bytes 字面）。
+    // stage 4 API-441) / 3 (EsMccfrLinearRmPlusCompact stage 5 API-540)；3 现在
+    // 是已占用 tag，走 EsMccfrLinearRmPlusCompact dispatch（checkpoint.rs::parse_bytes 字面）。
     let mut bytes = kuhn_fixture_bytes().to_vec();
     bytes[OFFSET_TRAINER_VARIANT] = 3;
     let path = write_tmp(&bytes, "trainer_tag_3");

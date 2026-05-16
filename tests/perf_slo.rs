@@ -1561,3 +1561,120 @@ fn stage4_nlhe_6max_six_traverser_per_traverser_throughput_cross_check() {
          single-thread baseline 期望成立",
     );
 }
+
+// ============================================================================
+// stage 5 B1 [测试] — D-530 + D-540 + D-569 SLO assertion harness
+// （API-594 字面 3 新 `#[test] #[ignore]` 函数）
+// ============================================================================
+//
+// 本节 SLO 默认 `#[ignore]`，opt-in via:
+//   cargo test --release --test perf_slo -- --ignored stage5_compact
+//
+// E2 [实现] 落地紧凑 RegretTable + q15 quantization + pruning + AVX2 SoA 路径
+// 后；F1 [测试] / F3 [报告] 在 c6a.8xlarge 32-vCPU host 实测：
+//
+// - D-530 字面 ≥ 200,000 update/s @ c6a.8xlarge 32-vCPU 32 vCPU AMD EPYC 7R13
+//   Milan / Zen 3 / 64 GB DDR4 / 单 NUMA / `cpupower frequency-set -g performance`
+//   + 关闭 turbo throttling + idle box（D-537 字面 preflight）。3 trial min ≥
+//   200K（D-532 字面）；本测试单 run 取 mid-run steady-state mean update/s。
+// - D-540 字面 ≥ 50% reduction vs stage 4 naive HashMap baseline；测量 scope =
+//   6 traverser × RegretTable + StrategyAccumulator section_bytes（不含 bucket
+//   table 528 MiB / thread pool / Tokio runtime / OS overhead）。stage 4 first
+//   usable run 实测 RSS 增量 280 MB baseline → stage 5 ≤ 140 MB（同 InfoSet 数下）。
+// - D-569 字面 collision metrics：load_factor ≤ 0.75 + max_probe_distance ≤ 16
+//   + avg_probe_distance ≤ 2.0；1M warm-up + 10M steady-state 两次 snapshot。
+
+/// D-530 字面 — **训练吞吐 SLO ≥ 200,000 update/s @ AWS c6a.8xlarge 32-vCPU**
+/// （continuous mid-run steady-state mean，3 trial min ≥ 200K，D-592 字面测试
+/// 协议）。
+///
+/// **B1 [测试] 状态**：A1 stub `EsMccfrLinearRmPlusCompactTrainer::new()` 走
+/// `unimplemented!()` panic-fail；B2 + C2 + D2 + E2 [实现] 落地后 c6a host
+/// `cargo test --release --test perf_slo -- --ignored
+/// stage5_compact_regret_table_throughput_c6a_32vcpu_geq_200k` opt-in 实测。
+///
+/// **baseline ref**：stage 4 §E-rev2 c7a 32-vCPU 85K update/s @ A1+A2 batch=32
+/// → c6a Zen 3 等效 ~72-75K（IPC -13~15%）。SLO gap 2.67-2.78× stretch（D-530
+/// 字面 5 优化全打满后达成）。
+///
+/// **carve-out 路径**：若实测 < 200K，走 D-533 carve-out floor 至
+/// `max(实测 min, 150K)`，**必须用户授权** + commit message 字面记录实测数字
+/// + carve-out 后新 SLO 数字（继承 stage 3 §F3-rev1 stage 4 §F3-revM 同型字面）。
+#[test]
+#[ignore = "stage5 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored \
+            stage5_compact_regret_table_throughput_c6a_32vcpu_geq_200k`"]
+fn stage5_compact_regret_table_throughput_c6a_32vcpu_geq_200k() {
+    let Some(game) = stage4_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0x5701_2000_C6A8_8AA0; // SLO #1: 200K @ c6a.8xlarge
+    let _ = (game, master_seed);
+    panic!(
+        "stage 5 D-530 SLO ≥ 200,000 update/s @ c6a.8xlarge 32-vCPU — B1 [测试] scaffold；\
+         B2 + C2 + D2 + E2 [实现] 落地 `EsMccfrLinearRmPlusCompactTrainer` 全路径后 c6a \
+         host opt-in 实测。当前 A1 stub `unimplemented!()` panic-fail。\
+         carve-out 路径：实测 < 200K 走 D-533 floor 至 max(实测 min, 150K)。"
+    );
+}
+
+/// D-540 字面 — **内存 SLO ≥ 50% reduction vs stage 4 naive HashMap baseline**
+/// （path.md §5 #4 字面）。
+///
+/// **测量 scope**：6 traverser × RegretTable + StrategyAccumulator section_bytes
+/// （不含 bucket table 528 MiB / thread pool / Tokio runtime / OS overhead）。
+///
+/// **baseline**：stage 4 first usable 1B run 中段（10M update 处）实测 RegretTable
+/// 与 StrategyAccumulator 字段累计 byte 数 = stage 4 RSS 增量 280 MB；stage 5
+/// 优化后同等 InfoSet count 条件下 ≤ 140 MB（≥ 50% ↓）。
+///
+/// **B1 [测试] 状态**：A1 stub trainer 路径 `unimplemented!()` panic-fail；
+/// E2 [实现] 落地 + c6a 实测后 opt-in 转 pass。
+///
+/// **D-542 字面 acceptance 规则**：3 trial mean ≤ baseline × 0.5 即 PASS
+/// （不强制 min ≤ 50%，因为 cache footprint 难精确控）。
+#[test]
+#[ignore = "stage5 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored \
+            stage5_compact_regret_table_memory_geq_50_percent_reduction`"]
+fn stage5_compact_regret_table_memory_geq_50_percent_reduction() {
+    let Some(game) = stage4_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0x5742_0000_8C8A_FE50; // SLO #2: 50% memory ↓
+    let _ = (game, master_seed);
+    panic!(
+        "stage 5 D-540 SLO ≥ 50% memory ↓ vs stage 4 naive HashMap baseline — \
+         B1 [测试] scaffold；B2 + D2 + E2 [实现] 落地 + c6a host 实测 RegretTableCompact \
+         + StrategyAccumulatorCompact section_bytes ≤ baseline × 0.5 后 opt-in 转 pass。\
+         当前 A1 stub `unimplemented!()` panic-fail。baseline 写入 \
+         `tests/data/stage5_naive_baseline.json`（D-547/D-548 字面 BLAKE3 锁定）。"
+    );
+}
+
+/// D-569 字面 — collision metrics anchor：紧凑 RegretTable Robin Hood probing
+/// 健康检查（load_factor ≤ 0.75 + max_probe_distance ≤ 16 + avg_probe_distance
+/// ≤ 2.0）。
+///
+/// **测量协议**：1M warm-up + 10M steady-state 两次 snapshot 全表 collision
+/// metrics（API-519 字面 `collision_metrics(traverser)` getter）。违反任一阈值
+/// abort + alarm dispatch（D-477 alarm variant pattern 扩展）。
+///
+/// **B1 [测试] 状态**：A1 stub `RegretTableCompact::collision_metrics`
+/// `unimplemented!()` panic-fail；B2 [实现] 落地 Robin Hood probe 后 opt-in
+/// 转 pass。
+#[test]
+#[ignore = "stage5 perf SLO; opt-in via `cargo test --release --test perf_slo -- --ignored \
+            stage5_compact_regret_table_collision_metrics_within_bounds`"]
+fn stage5_compact_regret_table_collision_metrics_within_bounds() {
+    let Some(game) = stage4_load_v3_artifact_or_skip() else {
+        return;
+    };
+    let master_seed: u64 = 0x5042_C0AD_DEAD_BEEF; // SLO #3: collision
+    let _ = (game, master_seed);
+    panic!(
+        "stage 5 D-569 collision metrics anchor — B1 [测试] scaffold；B2 [实现] 落地 \
+         Robin Hood probe + FxHash 路径 + 1M warm-up + 10M steady-state 两次 snapshot \
+         全表 collision_metrics 实测 load_factor ≤ 0.75 / max_probe_distance ≤ 16 / \
+         avg_probe_distance ≤ 2.0 后 opt-in 转 pass。当前 A1 stub `unimplemented!()` \
+         panic-fail。"
+    );
+}

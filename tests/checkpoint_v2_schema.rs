@@ -134,7 +134,19 @@ fn checkpoint_magic_is_plckpt_pad_stage_3_inherited() {
 /// **A1 scaffold 状态**：已落地 enum variant + from_u8 dispatch，本测试 default
 /// profile active pass。trip-wire 让 D2 \[实现\] 起步前 enum 字面 tag 漂移立即
 /// 暴露（影响 Checkpoint header offset 12 字面写入）。
+///
+/// **§stage5-rev0 2026-05-16**：stage 5 A1 commit 4d67e24 把
+/// `TrainerVariant::EsMccfrLinearRmPlusCompact = 3` + `from_u8(3) -> Some(...)`
+/// 加入。原 stage 4 anchor 内 `from_u8(3) == None` 字面断言不再成立；本 commit
+/// `#[ignore]` 走 §stage5-rev0 carve-out，沿用 §D2-revM (i) dispatch carve-out
+/// 同型模式。stage 5 D1 \[测试\] 起步前 re-author 为完整 4-variant cardinality
+/// anchor（已经 ship 在 `tests/checkpoint_v3_round_trip.rs::
+/// trainer_variant_es_mccfr_linear_rm_plus_compact_expected_schema_3`）。
 #[test]
+#[ignore = "§stage5-rev0 — stage 5 A1 commit 加 TrainerVariant tag = 3 (EsMccfrLinearRmPlusCompact)；\
+            原 stage 4 字面 `from_u8(3) == None` 断言失效，由 \
+            tests/checkpoint_v3_round_trip.rs 4-variant cardinality anchor 承接。\
+            详 `docs/pluribus_stage5_workflow.md` §修订历史。"]
 fn trainer_variant_es_mccfr_linear_rm_plus_tag_is_2() {
     assert_eq!(
         TrainerVariant::EsMccfrLinearRmPlus as u8,
@@ -393,7 +405,16 @@ fn checkpoint_schema_version_mismatch_dispatch_anchor_d2() {
 ///
 /// 本测试纯字面 enum cardinality sanity（A1 scaffold 已落地），D2 \[实现\] 起步
 /// 前 enum 变体增减立即在 cargo test 暴露。
+///
+/// **§stage5-rev0 2026-05-16**：stage 5 A1 commit 4d67e24 把
+/// `TrainerVariant::EsMccfrLinearRmPlusCompact = 3` 加入；原 stage 4 cardinality
+/// 字面（`from_u8(3) == None`）失效；本 commit `#[ignore]` 走 §stage5-rev0
+/// carve-out 沿用 §D2-revM (i) 模式。stage 5 D1 \[测试\] 起步前 re-author 为
+/// 完整 4 trainer × 4 game cardinality anchor。
 #[test]
+#[ignore = "§stage5-rev0 — stage 5 A1 commit 加 TrainerVariant tag = 3 (EsMccfrLinearRmPlusCompact)；\
+            原 stage 4 cardinality 字面 from_u8(3) == None 失效。\
+            详 `docs/pluribus_stage5_workflow.md` §修订历史。"]
 fn checkpoint_variant_cardinality_anchor() {
     // 4 个 GameVariant（A1 scaffold 字面，D-411 字面 stage 4 4th variant 锁定）
     assert!(GameVariant::from_u8(0).is_some());
