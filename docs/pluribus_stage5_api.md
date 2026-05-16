@@ -218,28 +218,243 @@ pub struct ResurfaceMetrics {
 
 ## 3. Trainer extension + Checkpoint v3 API（API-540..API-559）
 
-**deferred to batch 3 详化**。skeleton：
+### Batch 3 lock
 
-- API-540 `TrainerVariant::EsMccfrLinearRmPlusCompact` enum variant
-- API-541 `EsMccfrTrainer::with_compact_regret_table(table: RegretTableCompact) -> Self` builder
-- API-542 `Trainer::regret_table_compact(&self) -> Option<&RegretTableCompact>` default None override
-- API-543..API-549 stage 5 trainer 独占方法（pruning state read / shard hot/cold stats / quantization scale dump）
-- API-550 `Checkpoint::SCHEMA_VERSION = 3` 常量
-- API-551 `Checkpoint::open` v3 dispatch path
-- API-552 `EsMccfrTrainer::save_checkpoint` schema=3 path
-- API-553..API-559 v3 header field + body sub-region encoding
+```rust
+// src/training/trainer.rs — TrainerVariant 扩展
+
+// API-540
+pub enum TrainerVariant {
+    VanillaCfr = 1,                   // stage 3 D-302
+    EsMccfr = 2,                      // stage 3 D-301
+    EsMccfrLinearRmPlus = 3,          // stage 4 D-400
+    EsMccfrLinearRmPlusCompact = 4,   // stage 5 D-500 主线
+}
+
+impl TrainerVariant {
+    pub const fn expected_schema_version(self) -> u8 {
+        match self {
+            Self::VanillaCfr | Self::EsMccfr => 1,
+            Self::EsMccfrLinearRmPlus => 2,
+            Self::EsMccfrLinearRmPlusCompact => 3,
+        }
+    }
+}
+
+// API-541
+pub struct EsMccfrLinearRmPlusCompactTrainer<G: Game> {
+    game: G,
+    regret_tables: [RegretTableCompact<G::InfoSet>; 6],
+    strategy_accums: [StrategyAccumulatorCompact<G::InfoSet>; 6],
+    pruning_config: PruningConfig,
+    shard_loader: Option<ShardLoader>,           // None = first usable single-host
+    update_count: u64,
+    warmup_complete: bool,
+    resurface_pass_id: u64,
+    metrics: TrainingMetrics,
+    config: TrainerConfig,
+}
+
+impl<G: Game> EsMccfrLinearRmPlusCompactTrainer<G> {
+    pub fn new(game: G, config: TrainerConfig) -> Self;
+    pub fn with_initial_capacity_estimate(self, estimate: usize) -> Self;
+    pub fn with_pruning_config(self, cfg: PruningConfig) -> Self;
+    pub fn with_shard_loader(self, loader: ShardLoader) -> Self;
+}
+
+// API-542
+impl<G: Game> Trainer<G> for EsMccfrLinearRmPlusCompactTrainer<G> {
+    // 7 既有必实现方法签名 byte-equal 维持（stage 4 D2 + E2 lock）
+    fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError>;
+    fn step_parallel(&mut self, rng_pool: &mut [dyn RngSource], batch_size: usize) -> Result<(), TrainerError>;
+    fn current_strategy_for_traverser(&self, traverser: usize, info_set: G::InfoSet, out: &mut [f32; 14]);
+    fn average_strategy_for_traverser(&self, traverser: usize, info_set: G::InfoSet, out: &mut [f32; 14]);
+    fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError>;
+    fn load_checkpoint(&mut self, path: &Path) -> Result<(), CheckpointError>;
+    fn game_ref(&self) -> &G;
+}
+
+// API-543
+impl<G: Game> EsMccfrLinearRmPlusCompactTrainer<G> {
+    pub fn regret_table_compact(&self, traverser: usize) -> &RegretTableCompact<G::InfoSet>;
+    pub fn strategy_accum_compact(&self, traverser: usize) -> &StrategyAccumulatorCompact<G::InfoSet>;
+    pub fn pruning_config(&self) -> &PruningConfig;
+    pub fn collision_metrics(&self, traverser: usize) -> CollisionMetrics;
+    pub fn update_count(&self) -> u64;
+    pub fn warmup_complete(&self) -> bool;
+    pub fn resurface_pass_id(&self) -> u64;
+    pub fn shard_stats(&self) -> Option<ShardStats>;
+}
+
+// API-544 — Trainer trait additive method (default None)
+impl<G: Game, T: Trainer<G>> T {
+    fn regret_table_compact_opt(&self) -> Option<&RegretTableCompact<G::InfoSet>> { None }
+    fn strategy_accum_compact_opt(&self) -> Option<&StrategyAccumulatorCompact<G::InfoSet>> { None }
+}
+// EsMccfrLinearRmPlusCompactTrainer override 返 Some
+
+// API-545..API-549 stage 5 trainer 独占辅助（保留扩展）
+```
+
+```rust
+// src/training/checkpoint.rs — schema_version 2 → 3
+
+// API-550
+pub const SCHEMA_VERSION: u8 = 3;
+pub const HEADER_LEN: usize = 192;
+pub const STAGE3_HEADER_LEN: usize = 108;
+pub const STAGE4_HEADER_LEN: usize = 128;
+
+// API-551
+#[repr(C)]
+pub struct CheckpointHeaderV3 {
+    pub magic: [u8; 8],                          // "PLBRSCKT" 字面
+    pub schema_version: u8,                      // = 3
+    pub trainer_variant: u8,                     // = TrainerVariant::EsMccfrLinearRmPlusCompact as u8
+    pub info_set_id_layout_version: u8,          // = 1 (stage 2 D-218 维持)
+    pub traverser_count: u8,                     // = 6 (stage 4 D-412)
+    pub quant_bits: u8,                          // = 15 (q15 字面)
+    pub padding_a: [u8; 3],                      // align
+    pub capacity_estimate: u64,                  // per-table capacity (D-518)
+    pub update_count: u64,                       // cumulative since first run
+    pub warmup_complete: u8,                     // bool
+    pub padding_b: [u8; 7],                      // align
+    pub pruning_config_threshold: f32,           // D-520 字面
+    pub pruning_config_resurface_period: u64,    // D-521
+    pub pruning_config_resurface_epsilon: f32,
+    pub pruning_config_resurface_reset: f32,
+    pub resurface_pass_id: u64,                  // D-528
+    pub naive_baseline_blake3: [u8; 32],         // D-548 baseline 锁定 + 跨 binary 拒绝
+    pub body_blake3: [u8; 32],                   // D-563 self-consistency
+    pub padding_c: [u8; remaining_to_192],       // align to HEADER_LEN
+}
+
+// API-552
+impl Checkpoint {
+    pub fn open(path: &Path) -> Result<Self, CheckpointError>;
+    // 内部: 读 first 8 byte magic + 1 byte schema_version → dispatch 三路径
+    //   schema = 1 → stage 3 path (108 byte header, EsMccfr / VanillaCfr body)
+    //   schema = 2 → stage 4 path (128 byte header, EsMccfrLinearRmPlus body)
+    //   schema = 3 → stage 5 path (192 byte header, EsMccfrLinearRmPlusCompact body)
+    //   other → CheckpointError::SchemaVersionMismatch
+
+    pub fn save_schema_v3(
+        path: &Path,
+        header: &CheckpointHeaderV3,
+        regret_tables: &[RegretTableCompact<I>; 6],
+        strategy_accums: &[StrategyAccumulatorCompact<I>; 6],
+    ) -> Result<(), CheckpointError>;
+    // 内部: 写 192 byte header + body 12 sub-region (6 traverser × 2 table)
+    //   每 sub-region encoding = bincode + zstd level=3 compress
+    //   sub-region 间用 4-byte magic 0xDEADBEEF 分隔
+    //   body_blake3 在 header 落地前算完 + write
+}
+
+// API-553
+pub fn ensure_trainer_schema(
+    expected_variant: TrainerVariant,
+    actual_schema: u8,
+) -> Result<(), CheckpointError>;
+// 内部: expected_variant.expected_schema_version() == actual_schema 否则 Err
+
+// API-554..API-559 v3 body region encoding helper
+pub(crate) fn encode_compact_region<I: InfoSet>(
+    table: &RegretTableCompact<I>,
+    writer: &mut impl Write,
+) -> Result<(), CheckpointError>;
+pub(crate) fn decode_compact_region<I: InfoSet>(
+    reader: &mut impl Read,
+) -> Result<RegretTableCompact<I>, CheckpointError>;
+// 同型 strategy_accum encode/decode
+```
 
 ---
 
 ## 4. Shard loader API（API-560..API-579）
 
-**deferred to batch 3 详化**。skeleton：
+### Batch 3 lock
 
-- API-560 `ShardLoader::new(base_dir: &Path, shard_count: u8) -> Self`
-- API-561 `ShardLoader::load_shard(&mut self, shard_id: u8) -> Result<&RegretShard, ShardError>`
-- API-562 `ShardLoader::evict_lru(&mut self) -> Option<u8>`
-- API-563..API-569 shard 持久化 file layout / mmap / hit/miss metrics
-- API-570..API-579 shard pin / Arc<RwLock> ref count / madvise(MADV_DONTNEED) 路径
+```rust
+// src/training/shard.rs
+
+// API-560
+pub struct ShardLoader {
+    base_dir: PathBuf,
+    shard_count: u8,                                  // = 256 (D-512 字面 高 8 bit InfoSetId)
+    max_resident_shards: usize,                       // = 128 (D-512 字面 LRU pin 上限)
+    resident: HashMap<(u8, u8), Arc<RwLock<RegretShard>>>,  // (traverser, shard_id) → mmap
+    last_access: HashMap<(u8, u8), u64>,              // last access timestamp
+    access_counter: AtomicU64,
+    metrics: ShardMetrics,
+}
+
+impl ShardLoader {
+    pub fn new(base_dir: &Path, shard_count: u8, max_resident_shards: usize) -> Result<Self, ShardError>;
+}
+
+// API-561
+impl ShardLoader {
+    pub fn load_shard(&mut self, traverser: u8, shard_id: u8) -> Result<Arc<RwLock<RegretShard>>, ShardError>;
+    // 内部: 1. 检查 resident → 若 hit 返回 + 更新 last_access
+    //       2. miss 时 → 若 resident.len() >= max_resident_shards → evict_lru
+    //       3. mmap-open file `base_dir/regret_t{traverser:02}_s{shard_id:03}.bin`
+    //       4. 插入 resident + 更新 metrics
+}
+
+// API-562
+impl ShardLoader {
+    pub fn evict_lru(&mut self) -> Option<(u8, u8)>;
+    // 内部: 找 last_access 最早 + ref_count == 0 (Arc::strong_count == 1)
+    //       madvise(MADV_DONTNEED) → 从 resident 移除
+    //       Arc<RwLock> Drop 走标准路径, 文件不删（mmap-only）
+}
+
+// API-563
+#[repr(C)]
+pub struct RegretShard {
+    pub traverser: u8,
+    pub shard_id: u8,
+    pub key_count: u64,
+    pub keys: Mmap<u64>,         // memmap2 read-only mmap
+    pub payloads: Mmap<[i16; 16]>,
+    pub scales: Mmap<f32>,
+}
+
+// API-564
+pub fn shard_file_path(base_dir: &Path, traverser: u8, shard_id: u8) -> PathBuf;
+// 内部: base_dir.join(format!("regret_t{:02}_s{:03}.bin", traverser, shard_id))
+
+// API-565..API-569
+pub struct ShardMetrics {
+    pub hit_count: u64,
+    pub miss_count: u64,
+    pub evict_count: u64,
+    pub mmap_resident_bytes: u64,
+    pub mmap_total_bytes: u64,
+}
+
+pub fn shard_id_from_info_set(info_set: u64) -> u8;
+// 内部: (info_set >> 56) as u8 (D-512 字面高 8 bit)
+
+#[derive(Debug, thiserror::Error)]
+pub enum ShardError {
+    #[error("shard {0} traverser {1} not found at {2:?}")]
+    NotFound(u8, u8, PathBuf),
+    #[error("shard {0} traverser {1} mmap failed: {2}")]
+    MmapFailed(u8, u8, io::Error),
+    #[error("shard {0} traverser {1} schema mismatch")]
+    SchemaMismatch(u8, u8),
+    #[error("evict blocked: shard {0} traverser {1} pinned by {2} readers")]
+    EvictBlocked(u8, u8, usize),
+}
+
+// API-570..API-579 shard pin + Arc<RwLock> ref count 路径
+impl ShardLoader {
+    pub fn pin_shard(&self, traverser: u8, shard_id: u8) -> Result<Arc<RwLock<RegretShard>>, ShardError>;
+    pub fn metrics(&self) -> &ShardMetrics;
+    pub fn flush_metrics_to_jsonl(&self, writer: &mut impl Write) -> Result<(), io::Error>;
+}
+```
 
 ---
 
@@ -251,16 +466,137 @@ batch 2 已落地（D-520..D-529 字面）。具体签名见 §2 末尾 — `Pru
 
 ## 6. 性能 instrumentation + 测试 harness API（API-580..API-599）
 
+### Batch 3 lock — perf_baseline binary 全套
+
+```rust
+// tools/perf_baseline.rs — D-535 acceptance run host scheduling 主驱动
+
+// API-580
+pub fn main() -> Result<(), Box<dyn Error>>;
+// CLI flag (16 total):
+//   --game nlhe-6max                     (D-410)
+//   --trainer es-mccfr-linear-rm-plus-compact  (API-540)
+//   --abstraction pluribus-14            (D-420)
+//   --bucket-table <path>                 v3 production 528 MiB
+//   --naive-baseline <path>               tests/data/stage5_naive_baseline.json (D-547)
+//   --seed-list 42,43,44                  3 seed (D-532 字面)
+//   --run-wall-seconds 1800               30 min (D-538)
+//   --warm-up-wall-seconds 300            5 min (D-538)
+//   --updates-per-trial 0                 0 = wall-bound, else update-bound
+//   --threads 32                          c6a 32 vCPU (D-506)
+//   --parallel-batch-size 32              stage 4 §E-rev2 baseline (扩展到 64/128 由 D-515 阶段 1)
+//   --pruning-on                          bool (D-525 default false 但 perf_baseline default true)
+//   --output-jsonl perf_baseline.jsonl
+//   --acceptance-target-update-per-s 200000  (D-530 字面)
+//   --acceptance-target-memory-ratio 0.5     (D-540 字面)
+//   --skip-host-preflight                 emergency override (default false)
+
+// API-581
+pub struct PerfBaselinePreflight {
+    pub load_average_5m: f64,
+    pub cpu_governor: String,
+    pub cpu_freq_mhz_min: u64,
+    pub cpu_freq_mhz_max: u64,
+    pub freq_consistency_ok: bool,         // (max - min) / max < 0.05
+}
+
+pub fn preflight_check() -> Result<PerfBaselinePreflight, PreflightError>;
+// 内部: D-537 字面 — uptime / cpupower frequency-info / /proc/cpuinfo MHz 一致性
+// 任一 fail abort + 提示 user 修复
+
+#[derive(Debug, thiserror::Error)]
+pub enum PreflightError {
+    #[error("load average {0} > 0.5, host not idle")]
+    HostNotIdle(f64),
+    #[error("cpu governor {0:?} != 'performance', run: cpupower frequency-set -g performance")]
+    WrongGovernor(String),
+    #[error("cpu freq inconsistent (min {0} MHz, max {1} MHz), turbo throttling suspected")]
+    FreqInconsistent(u64, u64),
+}
+
+// API-582
+pub struct TrialResult {
+    pub seed: u64,
+    pub trial_idx: u8,           // 0 = first attempt, 1 = retry (D-536)
+    pub update_per_s_mean: f64,
+    pub update_per_s_min_window: f64,
+    pub update_per_s_max_window: f64,
+    pub steady_state_seconds: f64,
+    pub rss_bytes_peak: u64,
+    pub regret_table_section_bytes_peak: u64,
+    pub naive_baseline_ratio: f64,    // section_bytes / naive_baseline (D-548)
+    pub passed: bool,
+}
+
+pub fn run_trial(
+    seed: u64,
+    cfg: &PerfBaselineConfig,
+) -> Result<TrialResult, TrialError>;
+// 内部: 启 EsMccfrLinearRmPlusCompactTrainer + 跑 wall-bound 30 min
+//        收集 metrics.jsonl + 计算 steady-state slice (D-538)
+//        D-536 retry: 若 result.update_per_s_mean < target → 重测 1 次
+
+// API-583
+pub struct AcceptanceSummary {
+    pub trials: Vec<TrialResult>,        // 3+ trials with retries
+    pub min_update_per_s: f64,
+    pub mean_update_per_s: f64,
+    pub max_update_per_s: f64,
+    pub min_memory_ratio: f64,
+    pub mean_memory_ratio: f64,
+    pub max_memory_ratio: f64,
+    pub slo_throughput_pass: bool,       // min ≥ 200K (D-539)
+    pub slo_memory_pass: bool,           // mean ≤ 0.5 (D-542)
+    pub naive_baseline_blake3: String,   // D-548 锁定来源
+    pub git_sha: String,
+    pub host_info: HostInfo,
+}
+
+pub fn aggregate_trials(trials: Vec<TrialResult>) -> AcceptanceSummary;
+// D-539 字面: SLO PASS 判据 min(3 trials) ≥ target
+
+// API-584
+pub fn write_acceptance_jsonl(
+    summary: &AcceptanceSummary,
+    writer: &mut impl Write,
+) -> Result<(), io::Error>;
+// JSONL schema: 1 line per trial + 1 final line summary
+// 各字段全 commit message + report 引用唯一来源 (D-595)
+
+// API-585
+pub struct HostInfo {
+    pub instance_type: String,       // "c6a.8xlarge"
+    pub vcpu_count: u32,             // 32
+    pub cpu_model: String,           // "AMD EPYC 7R13"
+    pub ram_gb: u32,
+    pub kernel: String,
+    pub rustc_version: String,
+}
+
+pub fn detect_host_info() -> HostInfo;
+// 内部: /proc/cpuinfo + uname + rustc --version + AWS IMDS (instance-type)
+
+// API-586..API-589 预留 — c6a host scheduling automation hooks
+//   候选: --host-boot-aws-c6a-8xlarge (自动 boot via aws cli)
+//        / --host-shutdown-on-completion
+//        / --gh-release-upload-jsonl
+//        / --slack-notify-webhook
+```
+
+### Stage 5 既有 trainer + metrics 扩展 API（API-590..API-599）
+
 | 编号 | API 签名 | 说明 |
 |---|---|---|
-| API-580..API-589 | **deferred to batch 3 详化** | perf_baseline binary 内部 helper + 3-trial 汇总 + JSONL schema |
-| API-590 | `TrainingMetrics::regret_table_section_bytes() -> u64` | read-only getter，D-540 内存 SLO 测量路径 |
-| API-591 | `MetricsCollector::sample_throughput_window(&self, window: Duration) -> f64` | mid-run steady-state throughput 计算，D-591 测试协议路径 |
-| API-592 | `MetricsCollector::record_warm_up_complete(&mut self, update_count: u64)` | warm-up 5 min skip 边界标记，D-592 字面 |
-| API-593 | metrics.jsonl schema 扩展 — 新字段 | `regret_table_section_bytes: u64` / `strategy_accum_section_bytes: u64` / `pruning_state_section_bytes: u64` / `shard_hit_count: u64` / `shard_miss_count: u64`。继承 stage 4 既有 3 条曲线 proxy + 5-variant alarm dispatch byte-equal 维持。|
-| API-594 | `tests/perf_slo.rs` 扩 stage 5 — 新增 `#[test] #[ignore]` 函数 | `stage5_compact_regret_table_thread_throughput_c6a_32vcpu_geq_200k` 等 SLO 断言。所有 stage 5 SLO 测试**默认 #[ignore]**，opt-in via `cargo test --release --test perf_slo -- --ignored`。|
-| API-595 | `tests/api_signatures.rs` 扩 stage 5 | API-500..API-599 全套 trip-wire（A1 stub 返 `!`，错签名 silently compile fail）|
-| API-596..API-599 | 预留 | batch 3 详化（候选：c6a host idle detection / cpu frequency lock check / NUMA topology asserttion 等）|
+| API-590 | `TrainingMetrics::regret_table_section_bytes() -> u64` | read-only getter，D-540 + D-544 公式 |
+| API-591 | `MetricsCollector::sample_throughput_window(&self, window: Duration) -> f64` | mid-run steady-state throughput 计算（D-538 / D-591 测试协议路径）|
+| API-592 | `MetricsCollector::record_warm_up_complete(&mut self, update_count: u64)` | warm-up 5 min skip 边界标记（D-538 字面）|
+| API-593 | metrics.jsonl schema 扩展 — 新字段 | `regret_table_section_bytes: u64` / `strategy_accum_section_bytes: u64` / `pruning_state_section_bytes: u64`（D-524 字面 = 0 不单独存储）/ `shard_hit_count: u64` / `shard_miss_count: u64` / `evict_count: u64` / `mmap_resident_bytes: u64` / `mmap_total_bytes: u64`（D-546 production 路径）/ `elapsed_wall_s: f64`（D-534）/ `update_per_s_window: f64`（D-534）/ `pruned_action_count: u64` / `pruned_action_ratio: f32` / `resurface_event_count: u64` / `resurface_reactivated_count: u64`（D-526 字面）。stage 4 既有字段 + 5-variant alarm dispatch byte-equal 维持。|
+| API-594 | `tests/perf_slo.rs` 扩 stage 5 — 新增 `#[test] #[ignore]` 函数 | `stage5_compact_regret_table_throughput_c6a_32vcpu_geq_200k` / `stage5_compact_regret_table_memory_geq_50_percent_reduction` / `stage5_compact_regret_table_collision_metrics_within_bounds`（D-569）。所有 stage 5 SLO 测试**默认 #[ignore]**。|
+| API-595 | `tests/api_signatures.rs` 扩 stage 5 | API-500..API-599 全套 trip-wire（A1 stub 返 `!`）|
+| API-596 | `tests/checkpoint_v3_round_trip.rs` 新 integration crate | D-563 anchor 实施路径：写 → 读 → 重写 → BLAKE3 byte-equal；schema dispatch 三路径 (v1/v2/v3) 全覆盖；跨 binary 拒绝 mismatch 走 D-549 `ensure_trainer_schema` preflight |
+| API-597 | `tests/stage5_anchors.rs` 新 integration crate | D-560..D-563 anchor 4 项实测覆盖：LBR 6-traverser ≤ 59,000 / baseline 3 类 mean 阈值 / Slumbot 95% CI overlap / round-trip BLAKE3 |
+| API-598 | `tests/regret_table_compact_collision.rs` 新 integration crate | D-569 collision metrics anchor：1M warm-up + 10M steady-state 两次 snapshot；load_factor / max_probe_distance / avg_probe_distance 三阈值 |
+| API-599 | 预留 | batch 4 详化（候选：c6a host scheduling automation hook test / NUMA topology assertion / cpu freq lock check test）|
 
 ---
 
@@ -268,16 +604,18 @@ batch 2 已落地（D-520..D-529 字面）。具体签名见 §2 末尾 — `Pru
 
 | 编号 | 项 | 触发条件 / 决策时点 |
 |---|---|---|
-| API-540..API-589 全集 | Trainer extension + Checkpoint v3 schema + Shard loader + perf_baseline binary 全套签名 | batch 3 详化时 lock |
-| API-505 HEADER_LEN bump 数字 | 取决于 v3 header field 新增数 | batch 3 详化时 lock |
-| API-507 CLI flag default 值 | `--pruning-on` 默认 false（D-525 batch 2 lock）；其他 stage 5 主线 default-on / default-off 策略 batch 3 详化 | batch 3 详化时 lock |
-| API-508 `tools/perf_baseline.rs` 是否合并到 `tools/train_cfr.rs` | 取决于 A1 [实现] scaffold 起步前评估 | A1 [实现] 起步前 batch 4 决定 |
+| API-505 HEADER_LEN bump | batch 3 lock = 192 byte（API-550 字面 24 byte 新增 + 40 byte 对齐 pad）| 本 commit batch 3 关闭 |
+| API-540..API-589 全集 | batch 3 lock | 本 commit batch 3 关闭 |
+| API-586..API-589 host scheduling automation | 取决于 stage 5 主线 c6a host on-demand 启停是否需要 binary 内自动化（vs 手动 ssh）| stage 5 F2 [实现] production 训练触发前评估 |
+| API-599 | host preflight / NUMA topology assertion | batch 4 详化（如有则补，否则关闭）|
+| API-508 `tools/perf_baseline.rs` 是否合并到 `tools/train_cfr.rs` | batch 3 lock = **不合并**（perf_baseline 是 acceptance run 专用 binary，独立 16 flag + preflight check + 3-trial aggregation，与 train_cfr 主训练循环职责分离）| 本 commit batch 3 关闭 |
 
 ---
 
 ## 修订历史
 
 - **batch 1**（commit c2fa4f4）= API-500..API-509 + API-590..API-595 + 占位 API 编号落地。
-- **batch 2**（本 commit）= API-510..API-529 紧凑 RegretTable + q15 quantization + StrategyAccumulator 全套签名 + API-530..API-539 Pruning + resurface 签名 + §3-5 段范围 renumber。
+- **batch 2**（commit 63154ec）= API-510..API-529 紧凑 RegretTable + q15 quantization + StrategyAccumulator 全套签名 + API-530..API-539 Pruning + resurface 签名 + §3-5 段范围 renumber。
+- **batch 3**（本 commit）= API-540..API-559 Trainer extension + Checkpoint v3 schema（HEADER_LEN 128 → 192 + 8 new header fields + 6×2 sub-region encoding + body BLAKE3 self-consistency）+ API-560..API-579 Shard loader（256 shard mmap + LRU 128 pin + Arc<RwLock> ref count + madvise）+ API-580..API-589 perf_baseline binary（16 CLI flag + preflight check + 3-trial aggregate + AcceptanceSummary）+ API-590..API-599 既有 trainer metrics 扩展 + 3 新 integration test crate（checkpoint_v3_round_trip / stage5_anchors / regret_table_compact_collision）。
 
 后续 API-NNN-revM 修订按 stage 1 §11 + stage 2 §11 + stage 3 §11 + stage 4 §11 同型 flow append。
