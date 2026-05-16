@@ -249,6 +249,16 @@ impl NlheGame6 {
 
     /// stage 4 F2 \[实现\] — 公开 [`TableConfig`] 引用（baseline_eval / slumbot_eval
     /// 路径需要 big_blind 用于 mbb/g 单位换算）。
+    /// stage 4 §F3-revM — bucket_table read-only accessor for Slumbot eval。
+    ///
+    /// 本 getter 让 [`crate::training::slumbot_eval::SlumbotBridge::play_one_hand`]
+    /// 在不破坏 `pub(crate) bucket_table` 字段封装的前提下复用 trained
+    /// blueprint 的同一份 bucket_table（v3 production 528 MiB Arc clone）走
+    /// 200 BB HU 替换 game 配置。
+    pub fn bucket_table_for_eval(&self) -> &Arc<BucketTable> {
+        &self.bucket_table
+    }
+
     pub fn config(&self) -> &TableConfig {
         &self.config
     }
