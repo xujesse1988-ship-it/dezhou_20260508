@@ -132,6 +132,13 @@ path = "tools/lbr_compute.rs"
 name = "eval_blueprint"
 path = "tools/eval_blueprint.rs"
 
+# 阶段 4 §F3-revM：trained blueprint preflop strategy dump 一次性 instrumentation
+# （6 scenarios × 13 hand class × 14-action 概率表），让 F3 [报告] 检查策略
+# 是否合理（premium / marginal / trash 区分度 + 位置敏感度）。
+[[bin]]
+name = "dump_preflop_strategy"
+path = "tools/dump_preflop_strategy.rs"
+
 # 阶段 4 D-496 / API-499：3 bench group throughput 数据
 # （`nlhe_6max_es_mccfr_linear_rm_plus_update` / `lbr_compute_1000_hand` /
 # `baseline_eval_1000_hand`）。A1 \[实现\] scaffold 阶段 entry 占位；E1 /
