@@ -117,12 +117,12 @@ stage 4 报告 §11.1 P0/P1/P2 共 9 项 + stage 3 §8.1 残余 + stage 5 主线
 
 ## 8. A0 [决策] batch 后续计划
 
-| batch | 范围 | ETA |
+| batch | 范围 | 状态 |
 |---|---|---|
-| **batch 1**（本 commit）| 4-doc skeleton + D-500..D-509 + D-510..D-512 skeleton + D-520..D-521 skeleton + D-530/D-540 硬 SLO 钉死 + D-550 skeleton + D-560..D-563 skeleton + D-570..D-576 5 优化顺序 + D-590..D-595 host + 测试协议 + path.md 5 门槛映射 | 本 commit |
-| **batch 2** | D-510..D-515 紧凑存储实现细节字面 + D-520..D-521 pruning 阈值 + 周期具体值 + API-510..API-529 紧凑 RegretTable API 全套 | A1 [实现] scaffold 前 |
-| **batch 3** | D-530..D-549 SLO 测试协议详化 + 4 anchor 量化阈值 + Checkpoint v3 schema body sub-region encoding + API-530..API-589 全套 | A1 完成 → B1 起步前 |
-| **batch 4** | workflow 13 步 commit checklist + carry-forward 9 项最终分流确认 + A0 closure commit | A1 完成 + batch 3 lock 后 |
+| **batch 1**（commit c2fa4f4）| 4-doc skeleton + D-500..D-509 + D-510..D-512 skeleton + D-520..D-521 skeleton + D-530/D-540 硬 SLO 钉死 + D-550 skeleton + D-560..D-563 skeleton + D-570..D-576 5 优化顺序 + D-590..D-595 host + 测试协议 + path.md 5 门槛映射 + API-500..API-509 + API-590..API-595 | ✅ closed |
+| **batch 2**（本 commit）| D-510..D-519 紧凑 array + perfect hash + q15 quantization + 分片加载 + SoA + AVX2 + bucket layout + rayon 实现细节字面 lock；D-520..D-529 pruning 阈值 -300M 绝对 + ε resurface 周期 1e7 iter + 比例 0.05 + reset -150M + warm-up 互斥 + 数学正确性 + 不单独 serialize pruning state + CLI flag + metrics + unit test scaffold + RNG 派生具体值 lock；API-510..API-529 紧凑 RegretTable + StrategyAccumulator + quantize helper 全套签名；API-530..API-539 Pruning + resurface 签名 | ✅ closed |
+| **batch 3** | D-530..D-549 SLO 测试协议详化 + 4 anchor 量化阈值 + Checkpoint v3 schema body sub-region encoding + API-540..API-589 Trainer extension + Shard loader + perf_baseline 全套 | A1 完成 → B1 起步前 |
+| **batch 4** | workflow 13 步 commit checklist + carry-forward 9 项最终分流确认 + A0 closure commit + CLAUDE.md stage 5 段更新 | A1 完成 + batch 3 lock 后 |
 
 ---
 

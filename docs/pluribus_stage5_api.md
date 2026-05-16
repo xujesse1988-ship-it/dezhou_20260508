@@ -38,56 +38,214 @@ API-510..API-589 全集（紧凑 RegretTable / Trainer extension / shard loader 
 
 ## 2. 紧凑 RegretTable + StrategyAccumulator API（API-510..API-529）
 
-**deferred to batch 3 详化**。skeleton：
+### Batch 2 lock — 紧凑 array 数据结构 + q15 quantization 全套签名
 
-- API-510 `RegretTableCompact::new(initial_capacity: usize) -> Self`
-- API-511 `RegretTableCompact::regret_at(&self, info_set: InfoSet, action: usize) -> f32`
-- API-512 `RegretTableCompact::add_regret(&mut self, info_set: InfoSet, action: usize, delta: f32)`
-- API-513 `RegretTableCompact::clamp_rm_plus(&mut self)` — RM+ 路径
-- API-514 `RegretTableCompact::scale_linear(&mut self, decay: f32)` — Linear discounting eager 路径（保留 stage 4 D-401-revM lazy 路径在 batch 2 评估）
-- API-515 `RegretTableCompact::len() -> usize` / `is_empty() -> bool`
-- API-516..API-519 q15 quantization helper API（继承 API-501）
-- API-520..API-525 StrategyAccumulator 同型 API
-- API-526..API-529 紧凑 RegretTable iteration API（dump / load / metrics）
+模块布局：`src/training/regret_compact.rs`（D-510 字面 SoA Robin Hood）+ `src/training/quantize.rs`（D-511 字面 q15 helper）+ `src/training/pruning.rs`（D-520 字面 inline pruning + D-521 resurface）。
+
+```rust
+// src/training/regret_compact.rs — pub struct + pub impl
+
+pub struct RegretTableCompact<I: InfoSet> {
+    keys: Vec<u64>,           // InfoSetId.to_u64(), u64::MAX = empty sentinel
+    payloads: Vec<[i16; 16]>, // q15 quantized regret, padded 14→16 for AVX2
+    scales: Vec<f32>,         // per-row scale factor
+    len: usize,               // populated slot count
+    capacity: usize,          // 2^N power-of-two
+    _info_set_marker: PhantomData<I>,
+}
+
+// API-510
+impl<I: InfoSet> RegretTableCompact<I> {
+    pub fn with_initial_capacity_estimate(estimated_unique_info_sets: usize) -> Self;
+}
+
+// API-511
+pub fn regret_at(&self, info_set: I, action: usize) -> f32;
+// 内部: probe slot via FxHash → dequant q15 × scale → f32
+
+// API-512
+pub fn add_regret(&mut self, info_set: I, action: usize, delta: f32);
+// 内部: probe-or-insert slot → quant delta to q15 → saturating_add → check row overflow → maybe row-renorm
+
+// API-513
+pub fn clamp_rm_plus(&mut self);
+// 内部: in-place SIMD max(q15_lane, 0) over all slots, AVX2 path + scalar fallback
+
+// API-514
+pub fn scale_linear_lazy(&mut self, decay: f32);
+// 内部: 仅 mutate scales[i] *= decay for all populated slots (D-511 lazy 路径, scale-only)
+
+// API-515
+pub fn len(&self) -> usize;
+pub fn is_empty(&self) -> bool;
+
+// API-516
+pub fn section_bytes(&self) -> u64;
+// 内部: (keys.len() × 8) + (payloads.len() × 32) + (scales.len() × 4) + metadata overhead
+// 给 D-540 内存 SLO 测量路径 + metrics.jsonl regret_table_section_bytes 字段
+
+// API-517
+pub fn iter(&self) -> RegretTableCompactIter<'_, I>;
+// 内部: 迭代非空 slot (keys[i] != u64::MAX) → 返回 (info_set, &[i16; 16], scale)
+
+// API-518
+pub fn renormalize_scales(&mut self);
+// D-511 字面: 每 1e6 iter 触发 → 全表 scan → max(|q15|) 区间判断 → scale × 2 + q15 >> 1 或 scale / 2 + q15 << 1
+
+// API-519
+pub fn collision_metrics(&self) -> CollisionMetrics;
+// 内部: 返 (max_probe_distance, avg_probe_distance, load_factor) - 给 B1 [测试] 用
+pub struct CollisionMetrics {
+    pub max_probe_distance: usize,
+    pub avg_probe_distance: f32,
+    pub load_factor: f32,
+}
+```
+
+```rust
+// src/training/quantize.rs — pub fn helper
+
+// API-520
+pub fn f32_to_q15(value: f32, scale: f32) -> i16;
+// (value / scale × 32768).round().clamp(-32768, 32767) as i16
+// scale == 0.0 时返回 0 (defensive, 应当不发生因为 row 至少有 1 个非零值时 scale > 0)
+
+// API-521
+pub fn q15_to_f32(q: i16, scale: f32) -> f32;
+// (q as f32) × (scale / 32768.0)
+
+// API-522
+pub fn compute_row_scale(row_values: &[f32; 14]) -> f32;
+// max(|row_values|.iter()) 或 0.0 如全 0
+// 给 add_regret 路径下 row scale 初始化 / 重算
+
+// API-523
+pub fn quantize_row(row_values: &[f32; 14], scale: f32, out: &mut [i16; 16]);
+// 14 个值走 f32_to_q15, padding[14..16] = i16::MIN
+
+// API-524
+pub fn dequantize_row(payload: &[i16; 16], scale: f32, out: &mut [f32; 14]);
+// 14 个值走 q15_to_f32, 忽略 padding[14..16]
+
+// API-525
+pub fn dequantize_action(payload: &[i16; 16], scale: f32, action: usize) -> f32;
+// 单 action q15_to_f32, 给 should_prune inline check 用
+```
+
+```rust
+// StrategyAccumulator 同型 API（API-526..API-529）
+
+// API-526
+pub struct StrategyAccumulatorCompact<I: InfoSet> {
+    // SoA: keys / payloads / scales, 同 RegretTableCompact 布局
+}
+
+impl<I: InfoSet> StrategyAccumulatorCompact<I> {
+    pub fn with_initial_capacity_estimate(estimated_unique_info_sets: usize) -> Self;
+    pub fn add_strategy_sum(&mut self, info_set: I, action: usize, delta: f32);
+    pub fn average_strategy(&self, info_set: I, out: &mut [f32; 14]);
+    pub fn scale_linear_lazy(&mut self, decay: f32);
+    pub fn section_bytes(&self) -> u64;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn iter(&self) -> StrategyAccumulatorCompactIter<'_, I>;
+    pub fn renormalize_scales(&mut self);
+}
+
+// API-527 — pruning state 派生 query
+// （pruning state 不单独存储，由 RegretTableCompact.regret_at 派生）
+
+// API-528 — RegretTableCompact + StrategyAccumulatorCompact 共享 InfoSet derive
+// 两者 keys 数组**不共享**（D-517 字面）；各 alloc 独立 capacity
+
+// API-529 — 紧凑 array Drop + Clone 语义
+// #[derive(Clone)] 走 Vec::clone × 3，capacity 保留 (D-519 字面)
+// Drop 走标准 Vec::drop，无 unsafe
+```
+
+### Pruning 模块 API（API-530..API-539）
+
+> Note: 编号 API-530..API-539 batch 2 落地（与 batch 3 详化的 Trainer extension API-540+ 不冲突重排）。
+
+```rust
+// src/training/pruning.rs
+
+// API-530
+pub struct PruningConfig {
+    pub threshold: f32,           // default -300_000_000.0 (D-520 字面)
+    pub resurface_period: u64,    // default 10_000_000 (D-521 字面)
+    pub resurface_epsilon: f32,   // default 0.05 (D-521 字面)
+    pub resurface_reset_value: f32, // default -150_000_000.0 (D-521 字面 = threshold × 0.5)
+}
+
+impl Default for PruningConfig {
+    fn default() -> Self {
+        Self {
+            threshold: -300_000_000.0,
+            resurface_period: 10_000_000,
+            resurface_epsilon: 0.05,
+            resurface_reset_value: -150_000_000.0,
+        }
+    }
+}
+
+// API-531
+pub fn should_prune(table: &RegretTableCompact<I>, info_set: I, action: usize, cfg: &PruningConfig) -> bool;
+// 内部: regret_at(info_set, action) < cfg.threshold
+
+// API-532
+pub fn resurface_pass<I: InfoSet>(
+    table: &mut RegretTableCompact<I>,
+    cfg: &PruningConfig,
+    rng: &mut dyn RngSource,
+    resurface_pass_id: u64,
+) -> ResurfaceMetrics;
+// 内部: 全表 scan → 每 pruned action (q15 < quantized_threshold) → rng.next_uniform_f32() < ε → q15 ← quantize(reset_value, scale)
+// rng seed 走 master_seed.wrapping_add(0xDEAD_BEEF_CAFE_BABE * resurface_pass_id) (D-528 字面)
+
+pub struct ResurfaceMetrics {
+    pub scanned_action_count: u64,
+    pub pruned_action_count: u64,
+    pub reactivated_action_count: u64,
+    pub wall_time: Duration,
+}
+
+// API-533..API-539 预留
+// 候选: metrics.jsonl 写入 helper / pruning toggle status / resurface pass scheduler
+```
 
 ---
 
-## 3. Trainer extension + Checkpoint v3 API（API-530..API-549）
+## 3. Trainer extension + Checkpoint v3 API（API-540..API-559）
 
 **deferred to batch 3 详化**。skeleton：
 
-- API-530 `TrainerVariant::EsMccfrLinearRmPlusCompact` enum variant
-- API-531 `EsMccfrTrainer::with_compact_regret_table(table: RegretTableCompact) -> Self` builder
-- API-532 `Trainer::regret_table_compact(&self) -> Option<&RegretTableCompact>` default None override
-- API-533..API-539 stage 5 trainer 独占方法（pruning state read / shard hot/cold stats / quantization scale dump）
-- API-540 `Checkpoint::SCHEMA_VERSION = 3` 常量
-- API-541 `Checkpoint::open` v3 dispatch path
-- API-542 `EsMccfrTrainer::save_checkpoint` schema=3 path
-- API-543..API-549 v3 header field + body sub-region encoding
+- API-540 `TrainerVariant::EsMccfrLinearRmPlusCompact` enum variant
+- API-541 `EsMccfrTrainer::with_compact_regret_table(table: RegretTableCompact) -> Self` builder
+- API-542 `Trainer::regret_table_compact(&self) -> Option<&RegretTableCompact>` default None override
+- API-543..API-549 stage 5 trainer 独占方法（pruning state read / shard hot/cold stats / quantization scale dump）
+- API-550 `Checkpoint::SCHEMA_VERSION = 3` 常量
+- API-551 `Checkpoint::open` v3 dispatch path
+- API-552 `EsMccfrTrainer::save_checkpoint` schema=3 path
+- API-553..API-559 v3 header field + body sub-region encoding
 
 ---
 
-## 4. Shard loader API（API-550..API-559）
+## 4. Shard loader API（API-560..API-579）
 
 **deferred to batch 3 详化**。skeleton：
 
-- API-550 `ShardLoader::new(base_dir: &Path, shard_count: u8) -> Self`
-- API-551 `ShardLoader::load_shard(&mut self, shard_id: u8) -> Result<&RegretShard, ShardError>`
-- API-552 `ShardLoader::evict_lru(&mut self) -> Option<u8>`
-- API-553..API-559 shard 持久化 file layout / hit/miss metrics
+- API-560 `ShardLoader::new(base_dir: &Path, shard_count: u8) -> Self`
+- API-561 `ShardLoader::load_shard(&mut self, shard_id: u8) -> Result<&RegretShard, ShardError>`
+- API-562 `ShardLoader::evict_lru(&mut self) -> Option<u8>`
+- API-563..API-569 shard 持久化 file layout / mmap / hit/miss metrics
+- API-570..API-579 shard pin / Arc<RwLock> ref count / madvise(MADV_DONTNEED) 路径
 
 ---
 
-## 5. Pruning + resurface API（API-560..API-579）
+## 5. Pruning + resurface API（已在 §2 API-530..API-539 落地）
 
-**deferred to batch 3 详化**。skeleton：
-
-- API-560 `PruningState::new(initial_capacity: usize) -> Self`
-- API-561 `PruningState::should_prune(&self, info_set: InfoSet, action: usize) -> bool`
-- API-562 `PruningState::mark_pruned(&mut self, info_set: InfoSet, action: usize)`
-- API-563 `PruningState::resurface_pass(&mut self, rng: &mut dyn RngSource, threshold: f32, epsilon: f32)`
-- API-564..API-569 pruning + warm-up boundary state / serialize/deserialize / metrics 接入
-- API-570..API-579 ε resurface 周期 / 比例 / 全表扫描 schedule
+batch 2 已落地（D-520..D-529 字面）。具体签名见 §2 末尾 — `PruningConfig` / `should_prune` / `resurface_pass` / `ResurfaceMetrics`。**编号 API-530..API-539 batch 2 lock 后**与 §3 Trainer + Checkpoint API-540+ 不冲突重排。
 
 ---
 
@@ -110,13 +268,16 @@ API-510..API-589 全集（紧凑 RegretTable / Trainer extension / shard loader 
 
 | 编号 | 项 | 触发条件 / 决策时点 |
 |---|---|---|
-| API-510..API-589 全集 | 紧凑 RegretTable / Trainer extension / shard loader / pruning toggle / pruning state 全套签名 | batch 3 详化时 lock |
+| API-540..API-589 全集 | Trainer extension + Checkpoint v3 schema + Shard loader + perf_baseline binary 全套签名 | batch 3 详化时 lock |
 | API-505 HEADER_LEN bump 数字 | 取决于 v3 header field 新增数 | batch 3 详化时 lock |
-| API-507 CLI flag default 值 | 取决于 stage 5 主线 default-on / default-off 策略 | batch 3 详化时 lock |
+| API-507 CLI flag default 值 | `--pruning-on` 默认 false（D-525 batch 2 lock）；其他 stage 5 主线 default-on / default-off 策略 batch 3 详化 | batch 3 详化时 lock |
 | API-508 `tools/perf_baseline.rs` 是否合并到 `tools/train_cfr.rs` | 取决于 A1 [实现] scaffold 起步前评估 | A1 [实现] 起步前 batch 4 决定 |
 
 ---
 
 ## 修订历史
 
-stage 5 A0 [决策] 起步 commit（本 commit）= API-500..API-509 + API-590..API-595 + 占位 API 编号 batch 1 落地。后续 API-NNN-revM 修订按 stage 1 §11 + stage 2 §11 + stage 3 §11 + stage 4 §11 同型 flow append。
+- **batch 1**（commit c2fa4f4）= API-500..API-509 + API-590..API-595 + 占位 API 编号落地。
+- **batch 2**（本 commit）= API-510..API-529 紧凑 RegretTable + q15 quantization + StrategyAccumulator 全套签名 + API-530..API-539 Pruning + resurface 签名 + §3-5 段范围 renumber。
+
+后续 API-NNN-revM 修订按 stage 1 §11 + stage 2 §11 + stage 3 §11 + stage 4 §11 同型 flow append。
