@@ -623,16 +623,25 @@ fn apply_slumbot_action_str(
 /// `PluribusAction` → Slumbot incr string，依赖 `state.game_state` 给 raise/bet
 /// 计算 absolute "to" chip。
 ///
-/// 全 raise variant 走 `compute_raise_to(state, mult)`；非法 / 越界由
-/// Slumbot 端拒绝 — 本函数不再做二次 clamp（Slumbot return error_msg → caller
-/// 走 [`slumbot_err`] 路径）。
+/// **Fold/Check 互转**：Slumbot 把 fold-when-check-legal 视为 "Illegal fold"
+/// 拒绝；本函数若 blueprint 选 Fold 但当前面无 bet（即 Check 合法），改发
+/// `k`（语义等价 — 都是不投入更多 chip 的 minimal-loss 选择，避免 Slumbot 拒绝
+/// 整 hand 失败）。同型把 Check-when-call-required 拒绝由 stage 1 legal_actions
+/// 上游已过滤（PluribusActionAbstraction 不会在 face bet 时返 Check）。
 fn pluribus_to_slumbot_incr(action: PluribusAction, state: &NlheGame6State) -> String {
+    let la = state.game_state.legal_actions();
+    let check_legal = la.check;
     match action {
-        PluribusAction::Fold => "f".to_string(),
+        PluribusAction::Fold => {
+            if check_legal {
+                "k".to_string()
+            } else {
+                "f".to_string()
+            }
+        }
         PluribusAction::Check => "k".to_string(),
         PluribusAction::Call => "c".to_string(),
         PluribusAction::AllIn => {
-            // 全 stack 推 in：street_last_bet_to + remaining stack
             let actor_seat = state.game_state.current_player().unwrap_or(SeatId(0));
             let player = &state.game_state.players()[actor_seat.0 as usize];
             let to = player.committed_this_round.as_u64() + player.stack.as_u64();
