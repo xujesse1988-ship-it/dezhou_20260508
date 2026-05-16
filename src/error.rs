@@ -163,6 +163,32 @@ pub enum TrainerVariant {
     /// checkpoint schema_version=2 路径专属（D-449 字面不向前兼容 stage 3
     /// schema_version=1）。stage 4 D2 \[实现\] 落地实际 dispatch。
     EsMccfrLinearRmPlus = 2,
+    /// stage 5 D-549 / API-540 — Linear MCCFR + RM+ + compact RegretTable +
+    /// q15 quantization + pruning trainer variant；checkpoint schema_version=3
+    /// 路径专属（D-549 字面不向前兼容 stage 3 schema_version=1 / stage 4
+    /// schema_version=2）。stage 5 D2 \[实现\] 落地实际 dispatch。
+    EsMccfrLinearRmPlusCompact = 3,
+}
+
+impl TrainerVariant {
+    /// API-540 字面 — trainer variant ↔ checkpoint schema_version 期望映射
+    /// （`ensure_trainer_schema` preflight 路径）。
+    ///
+    /// - `VanillaCfr` / `EsMccfr` → `1`（stage 3 schema）
+    /// - `EsMccfrLinearRmPlus` → `2`（stage 4 schema）
+    /// - `EsMccfrLinearRmPlusCompact` → `3`（stage 5 schema）
+    ///
+    /// schema_version 字段在 checkpoint 文件 layout 中是 u32（详见
+    /// `crate::training::checkpoint::SCHEMA_VERSION`）；本 method 返 u32 与
+    /// header 字段类型一致（API-540 字面规约表面给 u8，但实际文件 schema
+    /// version 由 u32 字段持久化，stage 5 实现以 u32 为准避免运行期窄化转换）。
+    pub const fn expected_schema_version(self) -> u32 {
+        match self {
+            Self::VanillaCfr | Self::EsMccfr => 1,
+            Self::EsMccfrLinearRmPlus => 2,
+            Self::EsMccfrLinearRmPlusCompact => 3,
+        }
+    }
 }
 
 /// Game 变体 tag（API-350 binary schema offset 13 / D-356 跨 game 不兼容拒绝）。

@@ -89,6 +89,21 @@ struct Args {
     abort_on_alarm: AbortPolicy,
     resume: Option<PathBuf>,
     quiet: bool,
+    // stage 5 API-507 字面 — 5 new flag（A1 \[实现\] scaffold parse-only；
+    // stage 5 D2 \[实现\] 起步前 wire 到 EsMccfrLinearRmPlusCompactTrainer
+    // dispatch 路径）。stage 4 既有 16 flag byte-equal 维持。
+    /// 切到 stage 5 紧凑 RegretTable + q15 quantization 路径（默认 false =
+    /// stage 4 既有 EsMccfrLinearRmPlus 路径）。
+    compact_regret_table: bool,
+    /// 启用极负 regret pruning（D-525 字面默认 false，user 显式 `--pruning-on`）。
+    pruning_on: bool,
+    /// pruning 阈值（D-520 字面默认 `-3e8`）。
+    pruning_threshold: f32,
+    /// resurface 周期（D-521 字面默认 `1e7`）。
+    resurface_period: u64,
+    /// shard 总数（D-512 字面默认 256；first usable path 维持但 shard_loader
+    /// 不激活，production 10¹¹ path 走 `--compact-regret-table` + 真实分片加载）。
+    shard_count: u8,
 }
 
 impl Args {
@@ -112,6 +127,12 @@ impl Args {
             abort_on_alarm: AbortPolicy::P0,
             resume: None,
             quiet: false,
+            // stage 5 API-507 字面 5 flag 默认值（A1 \[实现\] scaffold parse-only）。
+            compact_regret_table: false,
+            pruning_on: false,
+            pruning_threshold: -300_000_000.0,
+            resurface_period: 10_000_000,
+            shard_count: 0,
         };
 
         let mut it = std::env::args().skip(1);
@@ -208,6 +229,30 @@ impl Args {
                     args.resume = Some(PathBuf::from(it.next().ok_or("--resume missing")?))
                 }
                 "--quiet" => args.quiet = true,
+                // stage 5 API-507 字面 — 5 new flag parse（A1 scaffold parse-only）。
+                "--compact-regret-table" => args.compact_regret_table = true,
+                "--pruning-on" => args.pruning_on = true,
+                "--pruning-threshold" => {
+                    args.pruning_threshold = it
+                        .next()
+                        .ok_or("--pruning-threshold missing")?
+                        .parse()
+                        .map_err(|e| format!("--pruning-threshold parse: {e}"))?
+                }
+                "--resurface-period" => {
+                    args.resurface_period = it
+                        .next()
+                        .ok_or("--resurface-period missing")?
+                        .parse()
+                        .map_err(|e| format!("--resurface-period parse: {e}"))?
+                }
+                "--shard-count" => {
+                    args.shard_count = it
+                        .next()
+                        .ok_or("--shard-count missing")?
+                        .parse()
+                        .map_err(|e| format!("--shard-count parse: {e}"))?
+                }
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -258,6 +303,13 @@ fn print_help() {
     eprintln!("    --abort-on-alarm {{none,p0,all}}           (D-473；默认 p0)");
     eprintln!("    --resume PATH                            (从 checkpoint 恢复)");
     eprintln!("    --quiet                                   静默 progress log");
+    eprintln!();
+    eprintln!("STAGE 5 FLAGS (API-507 字面；A1 \\[实现\\] scaffold parse-only):");
+    eprintln!("    --compact-regret-table                     切到 stage 5 紧凑 RegretTable 路径 (D2 [实现] 落地)");
+    eprintln!("    --pruning-on                               启用极负 regret pruning (D-525)");
+    eprintln!("    --pruning-threshold -300000000.0           D-520 字面阈值");
+    eprintln!("    --resurface-period 10000000                D-521 字面周期");
+    eprintln!("    --shard-count 0                            D-512 字面分片数 (0 = 不激活)");
 }
 
 fn main() -> ExitCode {
@@ -298,9 +350,26 @@ fn main() -> ExitCode {
 }
 
 fn run_nlhe6max(args: Args) -> Result<(), String> {
+    // stage 5 API-507 字面 5 flag — A1 \[实现\] scaffold parse-only，**未** wire 到
+    // 实际训练 dispatch。任一 stage 5 flag 启用都触发显式 deferred 错误。
+    if args.compact_regret_table
+        || args.pruning_on
+        || args.shard_count != 0
+        || args.trainer_kind == "es-mccfr-linear-rm-plus-compact"
+    {
+        return Err(format!(
+            "stage 5 trainer 路径（--compact-regret-table / --pruning-on / --shard-count / \
+             --trainer es-mccfr-linear-rm-plus-compact）由 stage 5 D2 \\[实现\\] 起步前 wire；\
+             A1 scaffold 仅暴露 CLI flag spec（API-507 字面）。详 \
+             `docs/pluribus_stage5_workflow.md` §10 D2 entry/exit。当前传入：\
+             compact_regret_table={} pruning_on={} shard_count={} trainer_kind={:?}",
+            args.compact_regret_table, args.pruning_on, args.shard_count, args.trainer_kind
+        ));
+    }
     if args.trainer_kind != "es-mccfr-linear-rm-plus" {
         return Err(format!(
-            "--trainer 必须 es-mccfr-linear-rm-plus（got {}）— stage 4 F3 critical path lock",
+            "--trainer 必须 es-mccfr-linear-rm-plus（got {}）— stage 4 F3 critical path lock；\
+             stage 5 es-mccfr-linear-rm-plus-compact 路径由 D2 \\[实现\\] wire",
             args.trainer_kind
         ));
     }
@@ -310,6 +379,9 @@ fn run_nlhe6max(args: Args) -> Result<(), String> {
             args.abstraction
         ));
     }
+    // 显式 silence stage 5 flag 占位字段（A1 scaffold parse-only，避免 unused 警告
+    // 在 cargo clippy --all-targets -D warnings 触发）。
+    let _ = (args.pruning_threshold, args.resurface_period);
 
     fs::create_dir_all(&args.checkpoint_dir).map_err(|e| format!("checkpoint-dir create: {e}"))?;
 

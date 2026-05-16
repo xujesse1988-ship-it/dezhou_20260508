@@ -63,6 +63,48 @@ pub struct TrainingMetrics {
 
     /// 最近一次触发的 alarm（`None` = 全绿）。
     pub last_alarm: Option<TrainingAlarm>,
+
+    // ----- stage 5 D-526 / D-540 / D-544 / D-546 / D-595 字面新字段 -----
+    //
+    // **A1 \[实现\] scaffold lock**：字段集字面 + 默认 `0` / `0.0`；F2 \[实现\]
+    // step 路径接入 metrics.jsonl 写入实际值。所有新字段 `serde::Serialize`
+    // derive 自动覆盖（JSONL log writer 不需要改动）。
+    //
+    /// D-544 字面 — RegretTable section 估算 byte（compact 紧凑路径：6 traverser
+    /// × `RegretTableCompact::section_bytes()` 求和）。stage 4 既有 trainer 路
+    /// 径下保持 `0`（无紧凑表）。
+    pub regret_table_section_bytes: u64,
+    /// D-544 字面 — StrategyAccumulator section 估算 byte（同型 stage 5 紧凑路径）。
+    pub strategy_accum_section_bytes: u64,
+    /// D-524 字面 — pruning state 不单独 serialize（query-time 派生），本字段
+    /// 字面 `= 0` lock 给 metrics.jsonl 字段集完整性（不省略）。
+    pub pruning_state_section_bytes: u64,
+    /// D-512 字面 — shard hit 累积。stage 5 first usable path 下 `shard_loader
+    /// = None` 时维持 `0`。
+    pub shard_hit_count: u64,
+    /// D-512 字面 — shard miss 累积（含 mmap-open）。
+    pub shard_miss_count: u64,
+    /// D-512 字面 — LRU evict 累积。
+    pub evict_count: u64,
+    /// D-546 字面 — mmap resident byte（仅 production 10¹¹ 分片路径有意义）。
+    pub mmap_resident_bytes: u64,
+    /// D-546 字面 — mmap total byte（256 shard 全文件 byte）。
+    pub mmap_total_bytes: u64,
+    /// D-534 字面 — 单调累积秒（continuous run elapsed wall）。
+    pub elapsed_wall_s: f64,
+    /// D-534 字面 — 最近 10s 滑窗 throughput（update/s）。
+    pub update_per_s_window: f64,
+    /// D-534 字面 — lifetime 累积均值 throughput。
+    pub update_per_s_lifetime: f64,
+    /// D-526 字面 — 全表 pruned action 总数（snapshot at cadence）。
+    pub pruned_action_count: u64,
+    /// D-526 字面 — `pruned_action_count / total_active`（0-1 float）。
+    pub pruned_action_ratio: f32,
+    /// D-526 字面 — 累计 resurface pass 次数（与 [`TrainingMetrics::update_count`]
+    /// / `resurface_period` 整除一致）。
+    pub resurface_event_count: u64,
+    /// D-526 字面 — 累计 resurface 重激活 action 总数。
+    pub resurface_reactivated_count: u64,
 }
 
 impl TrainingMetrics {
@@ -78,6 +120,23 @@ impl TrainingMetrics {
             peak_rss_bytes: 0,
             ev_sum_residual: 0.0,
             last_alarm: None,
+            // stage 5 字段全 0 / 0.0 起步（A1 \[实现\] scaffold；F2 \[实现\]
+            // 落地实际 step 路径累加 + cadence sample）。
+            regret_table_section_bytes: 0,
+            strategy_accum_section_bytes: 0,
+            pruning_state_section_bytes: 0,
+            shard_hit_count: 0,
+            shard_miss_count: 0,
+            evict_count: 0,
+            mmap_resident_bytes: 0,
+            mmap_total_bytes: 0,
+            elapsed_wall_s: 0.0,
+            update_per_s_window: 0.0,
+            update_per_s_lifetime: 0.0,
+            pruned_action_count: 0,
+            pruned_action_ratio: 0.0,
+            resurface_event_count: 0,
+            resurface_reactivated_count: 0,
         }
     }
 }
@@ -211,6 +270,38 @@ impl MetricsCollector {
         metrics.last_alarm = alarm;
 
         Ok(())
+    }
+
+    /// stage 5 API-591 — mid-run steady-state throughput 计算（D-538 / D-591
+    /// 测试协议路径）。
+    ///
+    /// 返回最近 `window` 时间窗内 `update / wall_s` 比值；window 越短越敏感，
+    /// 默认 10s 滑窗 / 30 min run 内取 mid-section mean。
+    ///
+    /// # A1 \[实现\] 状态
+    ///
+    /// `unimplemented!()` 占位。E1 \[实现\] 落地走真实 ring buffer 累积。
+    pub fn sample_throughput_window(&self, window: std::time::Duration) -> f64 {
+        let _ = window;
+        unimplemented!(
+            "stage 5 A1 scaffold — MetricsCollector::sample_throughput_window 落地于 E1 [实现]"
+        )
+    }
+
+    /// stage 5 API-592 — warm-up 5 min skip 边界标记（D-538 字面）。
+    ///
+    /// `perf_baseline` binary 在 `--warm-up-wall-seconds` 阈值过后调用，让
+    /// 后续 [`Self::sample_throughput_window`] 走 steady-state slice 而非
+    /// warm-up + steady-state 全程平均。
+    ///
+    /// # A1 \[实现\] 状态
+    ///
+    /// `unimplemented!()` 占位。E1 \[实现\] 落地。
+    pub fn record_warm_up_complete(&mut self, update_count: u64) {
+        let _ = update_count;
+        unimplemented!(
+            "stage 5 A1 scaffold — MetricsCollector::record_warm_up_complete 落地于 E1 [实现]"
+        )
     }
 }
 

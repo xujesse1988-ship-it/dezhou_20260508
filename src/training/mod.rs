@@ -50,6 +50,28 @@ pub mod baseline_eval;
 // variant + JSONL log（A1 \[实现\] scaffold；F2 \[实现\] 落地）。
 pub mod metrics;
 
+// stage 5 D-510 / API-500 — 紧凑 RegretTable + StrategyAccumulator（Open-
+// addressed Robin Hood + FxHash + load factor 0.75 + SoA 三 Vec + capacity
+// 2^20 起步；q15 quantization + per-row scale；section_bytes 给 D-540 内存
+// SLO 测量路径）。A1 \[实现\] scaffold 全 `unimplemented!()` 占位；B2 \[实现\]
+// 落地真实 probe + quant/dequant + SIMD path。**不替换** `regret.rs` 既有
+// HashMap-backed RegretTable（stage 3 D-321-rev2 维持作为 fallback + ablation
+// baseline + stage 4 schema=2 checkpoint 加载路径必需）。
+pub mod regret_compact;
+// stage 5 D-511 / API-501 — q15 quantization helper（per-row scale + RM+
+// in-place clamp + Linear discounting lazy decay 路径）。A1 \[实现\] scaffold
+// 全 `unimplemented!()` 占位；B2 \[实现\] 落地。
+pub mod quantize;
+// stage 5 D-512 / API-502 — 256 shard mmap + LRU 128 pin + Arc<RwLock> 并发
+// 安全 + madvise(MADV_DONTNEED) eviction。A1 \[实现\] scaffold 全
+// `unimplemented!()` 占位；C2 \[实现\] 落地真实 mmap-backed dispatch。
+pub mod shard;
+// stage 5 D-520 + D-521 / API-503 — 极负 regret pruning（阈值 -300M）+ 周期
+// ε resurface（周期 1e7 iter / 比例 0.05 / reset -150M）。A1 \[实现\] scaffold
+// 落地 `PruningConfig` 字段集 + `Default` impl 真值；`should_prune` /
+// `resurface_pass` 占位；E2 \[实现\] 落地 step 路径接入。
+pub mod pruning;
+
 // API-300 / API-380 顶层公开 surface（与 `docs/pluribus_stage3_api.md` §8 对齐）。
 pub use best_response::{exploitability, BestResponse, KuhnBestResponse, LeducBestResponse};
 pub use checkpoint::Checkpoint;
@@ -73,6 +95,20 @@ pub use nlhe_6max::{NlheGame6, NlheGame6Action, NlheGame6InfoSet, NlheGame6State
 pub use slumbot_eval::{
     Head2HeadResult, HuHandResult, OpenSpielHuBaseline, SlumbotBridge, SlumbotHandResult,
 };
+
+// stage 5 公开 surface re-export（API-500..API-579 字面）。
+pub use pruning::{resurface_pass, should_prune, PruningConfig, ResurfaceMetrics};
+pub use quantize::{
+    compute_row_scale, dequantize_action, dequantize_row, f32_to_q15, q15_to_f32, quantize_row,
+};
+pub use regret_compact::{
+    CollisionMetrics, RegretTableCompact, RegretTableCompactIter, StrategyAccumulatorCompact,
+    StrategyAccumulatorCompactIter,
+};
+pub use shard::{
+    shard_file_path, shard_id_from_info_set, RegretShard, ShardError, ShardLoader, ShardMetrics,
+};
+pub use trainer::EsMccfrLinearRmPlusCompactTrainer;
 
 // CheckpointError + TrainerError + TrainerVariant + GameVariant 物理位置在
 // `src/error.rs`（D-374），逻辑路径 `poker::training::{Checkpoint, CheckpointError, ...}`

@@ -59,6 +59,20 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # 引用合法）。
 serde_json = "1"
 
+# 阶段 5 D-373-rev4 新增依赖（A1 \[实现\] scaffold lock；B2 / C2 \[实现\] 起步前
+# 实际消费）。stage 4 D-275 mmap unsafe 与 `[lints.rust] unsafe_code = "forbid"`
+# 冲突的约束在 stage 5 D-512 production 路径下评估翻面：`memmap2::Mmap` 暴露的
+# safe API `Mmap::map(&File)` 内部使用 `unsafe` 但**不在调用方代码段**触发；
+# `forbid` 拦截调用方代码段的 `unsafe` 块，不阻止 crate 内部 `unsafe`。stage 5
+# A1 scaffold 仅 declarative 引入；B2 / C2 \[实现\] 真消费时若触发 `forbid`
+# 重审走 §X-revN carve-out。
+memmap2 = "0.9"
+# rustc-hash 2.x：D-510 字面 `RegretTableCompact` 紧凑 Robin Hood hash table 内的
+# `FxHash` 实现。InfoSetId 已是 stage 2 D-218 64-bit pseudo-random 输出，FxHash
+# 单 multiply + xor + shift 足够低碰撞 + 极快（vs `std::collections::hash_map`
+# SipHash 路径慢 ~3-4×）。stage 5 A1 scaffold 仅 declarative；B2 \[实现\] 真消费。
+rustc-hash = "2"
+
 # B1 测试 / harness 专用依赖。仅 tests/ 与 benches/ 引用，不进入产品二进制。
 [dev-dependencies]
 # 阶段 1 §B1 / E1 benchmark harness。`harness = false` 见下方 [[bench]]。
@@ -146,3 +160,11 @@ path = "tools/dump_preflop_strategy.rs"
 [[bench]]
 name = "stage4"
 harness = false
+
+# 阶段 5 D-535 / API-580：c6a.8xlarge on-demand 上跑 perf baseline 测量 update/s
+# + RSS + 3-trial min/mean/max 汇总（D-591 + D-592 字面 acceptance protocol 自
+# 动化）。A1 \[实现\] scaffold main body 走 stub；E1 / E2 \[实现\] 落地 16-flag
+# CLI + preflight check + run_trial + aggregate_trials + write_acceptance_jsonl。
+[[bin]]
+name = "perf_baseline"
+path = "tools/perf_baseline.rs"

@@ -90,6 +90,33 @@ pub trait Trainer<G: Game> {
         let _ = traverser;
         self.average_strategy(info_set)
     }
+
+    /// stage 5 API-544 — read-only compact regret 表查询（default `None`）。
+    ///
+    /// stage 3 + stage 4 既有 trainer impl 默认 `None`（不持有紧凑表）；
+    /// stage 5 [`EsMccfrLinearRmPlusCompactTrainer`] override 返 `Some(...)`。
+    /// 给 metrics / collision_metrics / pruning 旁路查询用，**不**触发 step
+    /// 路径切换（trainer step 路径由 trainer variant 决定）。
+    ///
+    /// **traverser 参数**：D-412 字面 6 套独立表，per-traverser 取一份；非
+    /// 6-traverser 路径 trainer 返 `None`。
+    fn regret_table_compact_opt(
+        &self,
+        traverser: PlayerId,
+    ) -> Option<&crate::training::regret_compact::RegretTableCompact<G::InfoSet>> {
+        let _ = traverser;
+        None
+    }
+
+    /// stage 5 API-544 — read-only compact strategy accumulator 表查询
+    /// （default `None`；同 [`Self::regret_table_compact_opt`] 语义）。
+    fn strategy_accum_compact_opt(
+        &self,
+        traverser: PlayerId,
+    ) -> Option<&crate::training::regret_compact::StrategyAccumulatorCompact<G::InfoSet>> {
+        let _ = traverser;
+        None
+    }
 }
 
 /// stage 4 D-401-revM — `EsMccfrTrainer` Linear discounting eager vs lazy 选型
@@ -1659,4 +1686,294 @@ where
         tables.push(t);
     }
     Ok(tables)
+}
+
+// ===========================================================================
+// stage 5 API-541..API-543 — `EsMccfrLinearRmPlusCompactTrainer` 紧凑 RegretTable
+// + q15 quantization + pruning trainer variant scaffold（A1 \[实现\]）
+// ===========================================================================
+
+use crate::training::pruning::PruningConfig;
+use crate::training::regret_compact::{
+    CollisionMetrics, RegretTableCompact, StrategyAccumulatorCompact,
+};
+use crate::training::shard::{ShardLoader, ShardMetrics};
+
+/// stage 5 D-549 / API-541 — Linear MCCFR + RM+ + compact RegretTable + q15
+/// quantization + pruning trainer variant。
+///
+/// 取代 [`EsMccfrTrainer`]（HashMap-backed naive 路径）在 stage 5 D-441-rev0
+/// production 10¹¹ training 路径上的 RegretTable + StrategyAccumulator 存储：
+/// - **6 套独立** [`RegretTableCompact`] / [`StrategyAccumulatorCompact`]
+///   （D-412 + D-414 字面 per-traverser 不共享）
+/// - **`PruningConfig` 字面** -300M 阈值 + 1e7 周期 + 0.05 ε + -150M reset
+/// - **Optional [`ShardLoader`]**：first usable single-host 路径下 `None`；
+///   production 10¹¹ 路径下 `Some(...)` 走 256-shard mmap + LRU 128 pin
+/// - **TrainingMetrics** 含 stage 5 新字段（D-526 + D-540 + D-546 + D-595）
+/// - **TrainerConfig** 继承 stage 4 字段集（`linear_weighting_enabled` /
+///   `rm_plus_enabled` / `warmup_complete_at` / `parallel_batch_size` 等）
+///
+/// # A1 \[实现\] 状态
+///
+/// 字段集字面锁；方法体走 `unimplemented!()` 占位。E2 \[实现\] 落地。`allow
+/// (dead_code)` 在 A1 stub 阶段抑制 dead-code 警告，D2 / E2 \[实现\] 起步前
+/// 消费全字段移除该 attribute。
+#[allow(dead_code)]
+pub struct EsMccfrLinearRmPlusCompactTrainer<G: Game> {
+    pub(crate) game: G,
+    /// API-541 字面 — 6 套独立 RegretTable（D-412 字面 `[...; 6]` 固定长度）。
+    /// HU 退化路径（n_players = 2）通过 trainer constructor 检查 `n_players ==
+    /// 6` 强制 6-player NLHE 主路径；HU baseline 走 stage 4
+    /// [`EsMccfrTrainer<NlheGame6>::new_hu`] 既有路径（不消费本 trainer）。
+    pub(crate) regret_tables: [RegretTableCompact<G::InfoSet>; 6],
+    /// API-541 字面 — 6 套独立 StrategyAccumulator（D-412 / D-414）。
+    pub(crate) strategy_accums: [StrategyAccumulatorCompact<G::InfoSet>; 6],
+    /// API-541 字面 — pruning 配置（D-520..D-529）。
+    pub(crate) pruning_config: PruningConfig,
+    /// API-541 字面 — 分片加载（`None` = first usable single-host RAM-only；
+    /// `Some(...)` = production 10¹¹ mmap-backed）。
+    pub(crate) shard_loader: Option<ShardLoader>,
+    /// 累计 update 数（D-504 字面 = sampled-decision node visit 计量；继承
+    /// stage 3 D-361 + stage 4 D-490 语义）。
+    pub(crate) update_count: u64,
+    /// warm-up phase 是否完成（D-409 字面继承 stage 4 boundary）。
+    pub(crate) warmup_complete: bool,
+    /// 当前 resurface pass id（D-528 RNG 派生输入 + checkpoint header 字段）。
+    pub(crate) resurface_pass_id: u64,
+    /// API-541 字面 — 训练监控指标（stage 5 新字段集；D-526 + D-540 + D-595）。
+    pub(crate) metrics: crate::training::metrics::TrainingMetrics,
+    /// 继承 stage 4 trainer config（A1 \[实现\] scaffold 不引入新 config
+    /// 字段；stage 5 5 优化 flag 由 [`tools/train_cfr.rs`] CLI 经 builder
+    /// 传入）。
+    pub(crate) config: TrainerConfig,
+}
+
+impl<G: Game> EsMccfrLinearRmPlusCompactTrainer<G> {
+    /// API-541 — 新建空 trainer。
+    ///
+    /// 默认 [`PruningConfig::default()`] + `shard_loader = None`（first usable
+    /// path）+ [`TrainerConfig::default()`] override 走 `linear_weighting_enabled
+    /// = true` + `rm_plus_enabled = true`（stage 5 trainer 默认进入 stage 4
+    /// 路径同型）+ warmup_complete_at 默认 1_000_000（D-409）+ pruning 开启
+    /// （D-525 字面 stage 5 trainer 默认开启，与 stage 4 trainer `--pruning-on`
+    /// flag 区分）。
+    ///
+    /// # A1 \[实现\] 状态
+    ///
+    /// `unimplemented!()` 占位。D2 \[实现\] 落地起步前 lock 实际构造路径
+    /// （6 套独立紧凑表 lazy 初始化 + capacity 估算逻辑）。
+    pub fn new(game: G, config: TrainerConfig) -> Self {
+        let _ = (game, config);
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::new 落地于 D2 [实现]"
+        )
+    }
+
+    /// API-541 — 设置 capacity 估算（D-518 字面 `max(estimated, 2^20)` 起步预
+    /// size，避开 hot path grow）。
+    ///
+    /// # A1 \[实现\] 状态
+    ///
+    /// `unimplemented!()` 占位。
+    pub fn with_initial_capacity_estimate(self, estimate: usize) -> Self {
+        let _ = estimate;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::with_initial_capacity_estimate \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-541 — 注入自定义 [`PruningConfig`]（D-525 字面 CLI flag 5 项配套）。
+    ///
+    /// # A1 \[实现\] 状态
+    ///
+    /// `unimplemented!()` 占位。
+    pub fn with_pruning_config(self, cfg: PruningConfig) -> Self {
+        let _ = cfg;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::with_pruning_config \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-541 — 注入 [`ShardLoader`]（production 10¹¹ path 触发；first usable
+    /// path 不调本 builder，shard_loader 维持 `None`）。
+    ///
+    /// # A1 \[实现\] 状态
+    ///
+    /// `unimplemented!()` 占位。
+    pub fn with_shard_loader(self, loader: ShardLoader) -> Self {
+        let _ = loader;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::with_shard_loader \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-543 — read-only 单 traverser 紧凑 RegretTable 引用。
+    pub fn regret_table_compact(&self, traverser: usize) -> &RegretTableCompact<G::InfoSet> {
+        let _ = traverser;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::regret_table_compact \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-543 — read-only 单 traverser 紧凑 StrategyAccumulator 引用。
+    pub fn strategy_accum_compact(
+        &self,
+        traverser: usize,
+    ) -> &StrategyAccumulatorCompact<G::InfoSet> {
+        let _ = traverser;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::strategy_accum_compact \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-543 — read-only [`PruningConfig`] 引用。
+    pub fn pruning_config(&self) -> &PruningConfig {
+        &self.pruning_config
+    }
+
+    /// API-543 — 单 traverser 紧凑表的 Robin Hood 健康检查（D-569 anchor）。
+    pub fn collision_metrics(&self, traverser: usize) -> CollisionMetrics {
+        let _ = traverser;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::collision_metrics \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-543 — read-only 累计 update 数。
+    pub fn update_count(&self) -> u64 {
+        self.update_count
+    }
+
+    /// API-543 — read-only warm-up 完成状态。
+    pub fn warmup_complete(&self) -> bool {
+        self.warmup_complete
+    }
+
+    /// API-543 — read-only resurface pass id（D-528）。
+    pub fn resurface_pass_id(&self) -> u64 {
+        self.resurface_pass_id
+    }
+
+    /// API-543 — read-only [`ShardMetrics`]（仅当 `shard_loader = Some(...)`
+    /// 时有意义；first usable single-host path 返 `None`）。
+    pub fn shard_stats(&self) -> Option<&ShardMetrics> {
+        self.shard_loader.as_ref().map(|l| l.metrics())
+    }
+
+    /// API-541 — read-only [`crate::training::metrics::TrainingMetrics`] 引用
+    /// （继承 stage 4 trainer `metrics()` 同型 getter）。
+    pub fn metrics(&self) -> &crate::training::metrics::TrainingMetrics {
+        &self.metrics
+    }
+
+    /// stage 4 trainer 同型 — read-only [`TrainerConfig`] 引用。
+    pub fn config(&self) -> &TrainerConfig {
+        &self.config
+    }
+}
+
+impl<G: Game> Trainer<G> for EsMccfrLinearRmPlusCompactTrainer<G> {
+    /// API-542 — 1 update（D-307 alternating traverser × ES-MCCFR step）。
+    ///
+    /// stage 5 路径下 step 内部走：
+    /// 1. warm-up boundary 检查（`update_count < warmup_complete_at` 走 stage
+    ///    3 standard CFR + RM 路径维持 byte-equal anchor）
+    /// 2. post-warmup 走 Linear MCCFR + RM+ + pruning：
+    ///    - `apply_linear_decay`（`scale_linear_lazy` per-row scale × decay）
+    ///    - 14-action loop 内 `should_prune` inline check skip pruned action
+    ///      子树
+    ///    - `apply_rm_plus_clamp`（`clamp_rm_plus` AVX2 SIMD path）
+    /// 3. 每 `resurface_period` update 触发 `resurface_pass`（D-521 1e7）
+    /// 4. `update_count += 1`
+    ///
+    /// # A1 \[实现\] 状态
+    ///
+    /// `unimplemented!()` 占位。D2 + E2 \[实现\] 逐步落地。
+    fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError> {
+        let _ = rng;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::step 落地于 D2/E2 [实现]"
+        )
+    }
+
+    /// API-542 — 单 InfoSet 上的 current strategy（regret matching）。
+    fn current_strategy(&self, info_set: &G::InfoSet) -> Vec<f64> {
+        let _ = info_set;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::current_strategy \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-542 — 单 InfoSet 上的 average strategy（strategy_sum 归一化）。
+    fn average_strategy(&self, info_set: &G::InfoSet) -> Vec<f64> {
+        let _ = info_set;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::average_strategy \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-542 — 累计 update 数（trait impl 内联走字段；inherent method
+    /// [`Self::update_count`] 同型签名走 `pub fn` 让 stage 5 trainer 直接调
+    /// 不走 trait dispatch overhead）。
+    fn update_count(&self) -> u64 {
+        self.update_count
+    }
+
+    /// API-542 — 公开 game 引用（继承 stage 4 D-456 / API-403 同型）。
+    fn game_ref(&self) -> &G {
+        &self.game
+    }
+
+    /// API-542 — 写出 checkpoint（D-549 字面 schema=3 路径）。
+    fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
+        let _ = path;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::save_checkpoint \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-542 — 从 checkpoint 恢复（D-549 字面 schema=3 路径）。
+    fn load_checkpoint(path: &Path, game: G) -> Result<Self, CheckpointError>
+    where
+        Self: Sized,
+    {
+        let _ = (path, game);
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::load_checkpoint \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-544 — override 返 `Some(...)`（stage 5 trainer 持有紧凑表）。
+    fn regret_table_compact_opt(
+        &self,
+        traverser: PlayerId,
+    ) -> Option<&RegretTableCompact<G::InfoSet>> {
+        let _ = traverser;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::regret_table_compact_opt \
+             落地于 D2 [实现]"
+        )
+    }
+
+    /// API-544 — override 返 `Some(...)`（stage 5 trainer 持有紧凑表）。
+    fn strategy_accum_compact_opt(
+        &self,
+        traverser: PlayerId,
+    ) -> Option<&StrategyAccumulatorCompact<G::InfoSet>> {
+        let _ = traverser;
+        unimplemented!(
+            "stage 5 A1 scaffold — EsMccfrLinearRmPlusCompactTrainer::strategy_accum_compact_opt \
+             落地于 D2 [实现]"
+        )
+    }
 }

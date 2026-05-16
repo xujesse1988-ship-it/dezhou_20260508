@@ -95,6 +95,29 @@ pub const HEADER_LEN: usize = 128;
 /// stage 3 v1 layout header 长度（保留让 trainer / 测试桥接到 legacy 路径）。
 pub const HEADER_LEN_V1: usize = 108;
 
+/// stage 5 D-549 / API-550 字面 — schema_version=3 header 长度（192 byte）。
+///
+/// **A1 \[实现\] scaffold lock**：常量字面落地让 [`CheckpointHeaderV3`] field
+/// layout 字段集签名锁定；实际 `Checkpoint::save_schema_v3` /
+/// `parse_bytes_v3` dispatch 由 stage 5 D2 \[实现\] 落地。stage 4 既有 v1 /
+/// v2 双路径 dispatch 不动（D-507 字面 stage 1/2/3/4 baseline byte-equal 维持）。
+pub const HEADER_LEN_V3: usize = 192;
+
+/// API-550 字面 alias — stage 3 v1 header length。
+pub const STAGE3_HEADER_LEN: usize = HEADER_LEN_V1;
+
+/// API-550 字面 alias — stage 4 v2 header length。
+pub const STAGE4_HEADER_LEN: usize = HEADER_LEN;
+
+/// stage 5 D-549 / API-550 字面 schema_version=3 占位。
+///
+/// **A1 \[实现\] scaffold lock**：常量字面落地让 [`crate::error::TrainerVariant
+/// ::expected_schema_version`] 在 [`crate::error::TrainerVariant::
+/// EsMccfrLinearRmPlusCompact`] 分支返回 `3` 与该常量字面一致；实际
+/// [`Checkpoint::open`] 路径仍走 v1 / v2 双路径 dispatch（stage 5 D2 \[实现\]
+/// 起步前 lock 三路径翻面）。
+pub const SCHEMA_VERSION_V3: u32 = 3;
+
 /// Trailer BLAKE3 长度（API-350 / D-352；stage 3 / 4 共享）。
 pub const TRAILER_LEN: usize = 32;
 
@@ -646,6 +669,10 @@ impl TrainerVariant {
             1 => Some(TrainerVariant::EsMccfr),
             // stage 4 API-441 — EsMccfrLinearRmPlus 走 schema_version=2 路径。
             2 => Some(TrainerVariant::EsMccfrLinearRmPlus),
+            // stage 5 API-540 — EsMccfrLinearRmPlusCompact 走 schema_version=3
+            // 路径。A1 \[实现\] scaffold 仅暴露 tag → enum 解析；实际 schema=3
+            // dispatch 路径由 D2 \[实现\] 落地。
+            3 => Some(TrainerVariant::EsMccfrLinearRmPlusCompact),
             _ => None,
         }
     }
@@ -747,4 +774,125 @@ pub(crate) fn preflight_trainer(
         });
     }
     Ok(())
+}
+
+// ===========================================================================
+// stage 5 schema_version=3 scaffold（A1 \[实现\] field layout lock；D2 \[实现\]
+// 落地实际 save / open dispatch + 12 sub-region encode/decode helper）
+// ===========================================================================
+
+/// API-551 字面 — stage 5 schema_version=3 header struct（192 byte / D-549）。
+///
+/// **A1 \[实现\] scaffold lock**：字段集字面顺序锁让 D1 \[测试\] /
+/// D2 \[实现\] 起步前 `tests/checkpoint_v3_round_trip.rs` 字段顺序 / 偏移 /
+/// 编码全 byte-equal 不漂移。
+///
+/// 字段总长 = 8 + 1+1+1+1+1 + 3 + 8 + 8 + 1 + 7 + 4 + 8 + 4 + 4 + 8 + 32 + 32
+/// = 131 byte 实际内容 + 61 byte padding 对齐到 192 byte。具体 layout offset
+/// 在 D2 \[实现\] 起步前 lock。
+///
+/// **schema_version 字段**：与既有 v1 / v2 layout 共享首 8 byte magic +
+/// 4 byte schema_version 字段（D2 \[实现\] dispatch 路径走 schema_version
+/// 分流）。
+///
+/// **`#[repr(C)]` not yet applied**：A1 \[实现\] scaffold 阶段保留宽松 layout，
+/// D2 \[实现\] 落地起步前 evaluate 是否切到 `#[repr(C)]` 走 byte-cast；当前
+/// 路径下序列化由独立 `parse_bytes_v3` / `save_schema_v3` 手动逐字段读写
+/// （继承 stage 3 / 4 写法）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CheckpointHeaderV3 {
+    /// 字面 `b"PLCKPT\0\0"`（D-549 字面与 stage 3 / 4 共享 magic）。
+    pub magic: [u8; 8],
+    /// 字面 `= 3`（[`SCHEMA_VERSION_V3`]）。
+    pub schema_version: u32,
+    /// 字面 `= TrainerVariant::EsMccfrLinearRmPlusCompact as u8 = 3`。
+    pub trainer_variant: u8,
+    /// 字面 `= 1`（stage 2 D-218 InfoSetId layout schema version；D-516 字面
+    /// stage 5 维持不变）。
+    pub info_set_id_layout_version: u8,
+    /// 字面 `= 6`（stage 4 D-412 字面 6 套独立 RegretTable + StrategyAccumulator）。
+    pub traverser_count: u8,
+    /// 字面 `= 15`（q15 quantization；D-511 字面）。
+    pub quant_bits: u8,
+    /// per-table capacity（D-518 字面 power-of-two；D2 \[实现\] 时由 trainer
+    /// 写出 build-time max capacity 用于 load-time 预 size）。
+    pub capacity_estimate: u64,
+    /// 累计 update 数（继承 stage 4 schema=2 同字段语义）。
+    pub update_count: u64,
+    /// warm-up phase 是否已完成（继承 stage 4 D-409 字面）。
+    pub warmup_complete: bool,
+    /// `PruningConfig::threshold` 字面 `-300_000_000.0`（D-520）。
+    pub pruning_config_threshold: f32,
+    /// `PruningConfig::resurface_period` 字面 `10_000_000`（D-521）。
+    pub pruning_config_resurface_period: u64,
+    /// `PruningConfig::resurface_epsilon` 字面 `0.05`（D-521）。
+    pub pruning_config_resurface_epsilon: f32,
+    /// `PruningConfig::resurface_reset_value` 字面 `-150_000_000.0`（D-521）。
+    pub pruning_config_resurface_reset: f32,
+    /// 当前 resurface pass id（D-528 RNG 派生输入；继承 stage 4 D-468 同型派生）。
+    pub resurface_pass_id: u64,
+    /// `tests/data/stage5_naive_baseline.json` BLAKE3（D-548 字面 baseline
+    /// 持久化路径；跨 binary version 拒绝 mismatch）。
+    pub naive_baseline_blake3: [u8; 32],
+    /// 6 traverser × 2 table 全 12 sub-region 的 body BLAKE3（D-563
+    /// self-consistency 字面）。
+    pub body_blake3: [u8; 32],
+}
+
+impl CheckpointHeaderV3 {
+    /// API-551 — 占位零初始化构造（A1 \[实现\] scaffold；D2 \[实现\] 落地起步
+    /// 前 evaluate 是否替换为 builder-style 构造）。
+    ///
+    /// **不变量**：`magic` 字面 [`MAGIC`] + `schema_version` 字面
+    /// [`SCHEMA_VERSION_V3`] + `trainer_variant` 字面 `3` +
+    /// `info_set_id_layout_version` 字面 `1` + `traverser_count` 字面 `6` +
+    /// `quant_bits` 字面 `15`；其它字段零初始化让 D2 \[实现\] 起步前 builder
+    /// 逐字段填入。
+    ///
+    /// # A1 \[实现\] 状态
+    ///
+    /// 字段全 literal lock；D2 \[实现\] 起步前不动。
+    pub fn zero_with_lock() -> Self {
+        Self {
+            magic: MAGIC,
+            schema_version: SCHEMA_VERSION_V3,
+            trainer_variant: TrainerVariant::EsMccfrLinearRmPlusCompact as u8,
+            info_set_id_layout_version: 1,
+            traverser_count: 6,
+            quant_bits: 15,
+            capacity_estimate: 0,
+            update_count: 0,
+            warmup_complete: false,
+            pruning_config_threshold: -300_000_000.0,
+            pruning_config_resurface_period: 10_000_000,
+            pruning_config_resurface_epsilon: 0.05,
+            pruning_config_resurface_reset: -150_000_000.0,
+            resurface_pass_id: 0,
+            naive_baseline_blake3: [0u8; 32],
+            body_blake3: [0u8; 32],
+        }
+    }
+}
+
+/// API-553 — trainer ↔ checkpoint schema 一致性 preflight。
+///
+/// 走 [`TrainerVariant::expected_schema_version`] 比对 file `schema_version`
+/// 字段；不一致返 [`CheckpointError::SchemaMismatch`]。
+///
+/// **A1 \[实现\] scaffold lock**：实际 logic 落地不 stubbed（pure logic 无依
+/// 赖）。stage 5 D2 \[实现\] 起步前 [`Checkpoint::open`] 三路径 dispatch
+/// 接入本 helper。
+pub fn ensure_trainer_schema(
+    expected_variant: TrainerVariant,
+    actual_schema: u32,
+) -> Result<(), CheckpointError> {
+    let expected_schema = expected_variant.expected_schema_version();
+    if expected_schema == actual_schema {
+        Ok(())
+    } else {
+        Err(CheckpointError::SchemaMismatch {
+            expected: expected_schema,
+            got: actual_schema,
+        })
+    }
 }

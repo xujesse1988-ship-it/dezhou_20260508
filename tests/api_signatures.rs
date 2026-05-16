@@ -29,6 +29,7 @@ fn api_signatures_locked() {
     _stage2_api_signature_assertions();
     _stage3_api_signature_assertions();
     _stage4_api_signature_assertions();
+    _stage5_api_signature_assertions();
 }
 
 #[allow(dead_code, clippy::type_complexity)]
@@ -1118,4 +1119,276 @@ fn _stage4_api_signature_assertions() {
     // binding 不触发 -D warnings。
     let _ = actions;
     let _ = stlr;
+}
+
+#[allow(dead_code, clippy::type_complexity, clippy::unit_arg)]
+fn _stage5_api_signature_assertions() {
+    // ===================================================================
+    // stage 5 A1 [实现] scaffold — API-500..API-599 trip-wire（继承 stage 1 +
+    // stage 2 + stage 3 + stage 4 同型 lock 模式）。
+    //
+    // 任一 stage 5 公开 API 签名漂移立即在 `cargo test --no-run` 失败。
+    // A1 stub 全 `unimplemented!()` 返 `!`，与任意返回类型 unify — 误改公开
+    // 签名（如 `RegretTableCompact::regret_at` 改返 `f64` 而非 `f32`）不会
+    // 导致 `cargo build` 失败，必须本文件捕获。
+    // ===================================================================
+
+    use std::time::Duration;
+
+    use poker::training::checkpoint::{
+        ensure_trainer_schema, CheckpointHeaderV3, HEADER_LEN_V3, SCHEMA_VERSION_V3,
+        STAGE3_HEADER_LEN, STAGE4_HEADER_LEN,
+    };
+    use poker::training::nlhe_6max::NlheGame6;
+    use poker::training::pruning::{resurface_pass, should_prune, PruningConfig, ResurfaceMetrics};
+    use poker::training::quantize::{
+        compute_row_scale, dequantize_action, dequantize_row, f32_to_q15, q15_to_f32, quantize_row,
+    };
+    use poker::training::regret_compact::{
+        CollisionMetrics, RegretTableCompact, RegretTableCompactIter, StrategyAccumulatorCompact,
+        StrategyAccumulatorCompactIter,
+    };
+    use poker::training::shard::{
+        shard_file_path, shard_id_from_info_set, RegretShard, ShardError, ShardLoader, ShardMetrics,
+    };
+    use poker::training::trainer::{EsMccfrLinearRmPlusCompactTrainer, TrainerConfig};
+    use poker::training::Trainer;
+    use poker::{InfoSetId, PlayerId, RngSource};
+    use std::path::{Path, PathBuf};
+
+    // -------------------------------------------------------------------
+    // API-540 — TrainerVariant::EsMccfrLinearRmPlusCompact 4th variant +
+    // from_u8(3) + expected_schema_version
+    // -------------------------------------------------------------------
+    let _: TrainerVariant = TrainerVariant::EsMccfrLinearRmPlusCompact;
+    let _: Option<TrainerVariant> = TrainerVariant::from_u8(3);
+    let _: fn(TrainerVariant) -> u32 = TrainerVariant::expected_schema_version;
+
+    // -------------------------------------------------------------------
+    // API-550 — checkpoint v3 常量
+    // -------------------------------------------------------------------
+    let _: u32 = SCHEMA_VERSION_V3;
+    let _: usize = HEADER_LEN_V3;
+    let _: usize = STAGE3_HEADER_LEN;
+    let _: usize = STAGE4_HEADER_LEN;
+
+    // -------------------------------------------------------------------
+    // API-551 — CheckpointHeaderV3 struct + zero_with_lock 构造
+    // -------------------------------------------------------------------
+    let hdr: CheckpointHeaderV3 = CheckpointHeaderV3::zero_with_lock();
+    let _: [u8; 8] = hdr.magic;
+    let _: u32 = hdr.schema_version;
+    let _: u8 = hdr.trainer_variant;
+    let _: u8 = hdr.info_set_id_layout_version;
+    let _: u8 = hdr.traverser_count;
+    let _: u8 = hdr.quant_bits;
+    let _: u64 = hdr.capacity_estimate;
+    let _: u64 = hdr.update_count;
+    let _: bool = hdr.warmup_complete;
+    let _: f32 = hdr.pruning_config_threshold;
+    let _: u64 = hdr.pruning_config_resurface_period;
+    let _: f32 = hdr.pruning_config_resurface_epsilon;
+    let _: f32 = hdr.pruning_config_resurface_reset;
+    let _: u64 = hdr.resurface_pass_id;
+    let _: [u8; 32] = hdr.naive_baseline_blake3;
+    let _: [u8; 32] = hdr.body_blake3;
+
+    // -------------------------------------------------------------------
+    // API-553 — ensure_trainer_schema preflight signature
+    // -------------------------------------------------------------------
+    let _: fn(TrainerVariant, u32) -> Result<(), CheckpointError> = ensure_trainer_schema;
+
+    // -------------------------------------------------------------------
+    // API-510..API-519 — RegretTableCompact<InfoSetId> 紧凑 RegretTable
+    // 主路径（NlheGame6 monomorphization）。
+    // -------------------------------------------------------------------
+    type RT = RegretTableCompact<InfoSetId>;
+    let _: fn(usize) -> RT = RT::with_initial_capacity_estimate;
+    let _: for<'a> fn(&'a RT, InfoSetId, usize) -> f32 = RT::regret_at;
+    let _: for<'a> fn(&'a mut RT, InfoSetId, usize, f32) = RT::add_regret;
+    let _: for<'a> fn(&'a mut RT) = RT::clamp_rm_plus;
+    let _: for<'a> fn(&'a mut RT, f32) = RT::scale_linear_lazy;
+    let _: for<'a> fn(&'a RT) -> usize = RT::len;
+    let _: for<'a> fn(&'a RT) -> bool = RT::is_empty;
+    let _: for<'a> fn(&'a RT) -> u64 = RT::section_bytes;
+    let _: for<'a> fn(&'a RT) -> RegretTableCompactIter<'a, InfoSetId> = RT::iter;
+    let _: for<'a> fn(&'a mut RT) = RT::renormalize_scales;
+    let _: for<'a> fn(&'a RT) -> CollisionMetrics = RT::collision_metrics;
+
+    // -------------------------------------------------------------------
+    // API-519 — CollisionMetrics 字段访问
+    // -------------------------------------------------------------------
+    let cm = CollisionMetrics {
+        max_probe_distance: 0,
+        avg_probe_distance: 0.0,
+        load_factor: 0.0,
+    };
+    let _: usize = cm.max_probe_distance;
+    let _: f32 = cm.avg_probe_distance;
+    let _: f32 = cm.load_factor;
+
+    // -------------------------------------------------------------------
+    // API-520..API-525 — quantize helper signatures
+    // -------------------------------------------------------------------
+    let _: fn(f32, f32) -> i16 = f32_to_q15;
+    let _: fn(i16, f32) -> f32 = q15_to_f32;
+    let _: for<'a> fn(&'a [f32; 14]) -> f32 = compute_row_scale;
+    let _: for<'a, 'b> fn(&'a [f32; 14], f32, &'b mut [i16; 16]) = quantize_row;
+    let _: for<'a, 'b> fn(&'a [i16; 16], f32, &'b mut [f32; 14]) = dequantize_row;
+    let _: for<'a> fn(&'a [i16; 16], f32, usize) -> f32 = dequantize_action;
+
+    // -------------------------------------------------------------------
+    // API-526..API-529 — StrategyAccumulatorCompact 同型签名
+    // -------------------------------------------------------------------
+    type SA = StrategyAccumulatorCompact<InfoSetId>;
+    let _: fn(usize) -> SA = SA::with_initial_capacity_estimate;
+    let _: for<'a> fn(&'a mut SA, InfoSetId, usize, f32) = SA::add_strategy_sum;
+    let _: for<'a, 'b> fn(&'a SA, InfoSetId, &'b mut [f32; 14]) = SA::average_strategy;
+    let _: for<'a> fn(&'a mut SA, f32) = SA::scale_linear_lazy;
+    let _: for<'a> fn(&'a SA) -> u64 = SA::section_bytes;
+    let _: for<'a> fn(&'a SA) -> usize = SA::len;
+    let _: for<'a> fn(&'a SA) -> bool = SA::is_empty;
+    let _: for<'a> fn(&'a SA) -> StrategyAccumulatorCompactIter<'a, InfoSetId> = SA::iter;
+    let _: for<'a> fn(&'a mut SA) = SA::renormalize_scales;
+
+    // -------------------------------------------------------------------
+    // API-530..API-532 — PruningConfig + should_prune + resurface_pass
+    // -------------------------------------------------------------------
+    let pc: PruningConfig = PruningConfig::default();
+    let _: f32 = pc.threshold;
+    let _: u64 = pc.resurface_period;
+    let _: f32 = pc.resurface_epsilon;
+    let _: f32 = pc.resurface_reset_value;
+    assert_eq!(pc.threshold, -300_000_000.0);
+    assert_eq!(pc.resurface_period, 10_000_000);
+    assert!((pc.resurface_epsilon - 0.05).abs() < 1e-9);
+    assert_eq!(pc.resurface_reset_value, -150_000_000.0);
+
+    let _: for<'a, 'b> fn(
+        &'a RegretTableCompact<InfoSetId>,
+        InfoSetId,
+        usize,
+        &'b PruningConfig,
+    ) -> bool = should_prune::<InfoSetId>;
+    let _: for<'a, 'b, 'c> fn(
+        &'a mut RegretTableCompact<InfoSetId>,
+        &'b PruningConfig,
+        &'c mut dyn RngSource,
+        u64,
+    ) -> ResurfaceMetrics = resurface_pass::<InfoSetId>;
+
+    let rm = ResurfaceMetrics::default();
+    let _: u64 = rm.scanned_action_count;
+    let _: u64 = rm.pruned_action_count;
+    let _: u64 = rm.reactivated_action_count;
+    let _: Duration = rm.wall_time;
+
+    // -------------------------------------------------------------------
+    // API-541..API-544 — EsMccfrLinearRmPlusCompactTrainer<NlheGame6>
+    // -------------------------------------------------------------------
+    type CT = EsMccfrLinearRmPlusCompactTrainer<NlheGame6>;
+    let _: fn(NlheGame6, TrainerConfig) -> CT = CT::new;
+    let _: fn(CT, usize) -> CT = CT::with_initial_capacity_estimate;
+    let _: fn(CT, PruningConfig) -> CT = CT::with_pruning_config;
+    let _: fn(CT, ShardLoader) -> CT = CT::with_shard_loader;
+    let _: for<'a> fn(&'a CT, usize) -> &'a RegretTableCompact<InfoSetId> =
+        CT::regret_table_compact;
+    let _: for<'a> fn(&'a CT, usize) -> &'a StrategyAccumulatorCompact<InfoSetId> =
+        CT::strategy_accum_compact;
+    let _: for<'a> fn(&'a CT) -> &'a PruningConfig = CT::pruning_config;
+    let _: for<'a> fn(&'a CT, usize) -> CollisionMetrics = CT::collision_metrics;
+    let _: for<'a> fn(&'a CT) -> u64 = CT::update_count;
+    let _: for<'a> fn(&'a CT) -> bool = CT::warmup_complete;
+    let _: for<'a> fn(&'a CT) -> u64 = CT::resurface_pass_id;
+    let _: for<'a> fn(&'a CT) -> Option<&'a ShardMetrics> = CT::shard_stats;
+
+    // Trainer<NlheGame6> trait impl UFCS（继承 stage 4 EsMccfrTrainer 同型）。
+    let _: for<'a, 'b> fn(&'a mut CT, &'b mut dyn RngSource) -> Result<(), TrainerError> =
+        <CT as Trainer<NlheGame6>>::step;
+    let _: for<'a, 'b> fn(&'a CT, &'b InfoSetId) -> Vec<f64> =
+        <CT as Trainer<NlheGame6>>::current_strategy;
+    let _: for<'a, 'b> fn(&'a CT, &'b InfoSetId) -> Vec<f64> =
+        <CT as Trainer<NlheGame6>>::average_strategy;
+    let _: for<'a> fn(&'a CT) -> u64 = <CT as Trainer<NlheGame6>>::update_count;
+    let _: for<'a> fn(&'a CT) -> &'a NlheGame6 = <CT as Trainer<NlheGame6>>::game_ref;
+    let _: for<'a, 'b> fn(&'a CT, &'b Path) -> Result<(), CheckpointError> =
+        <CT as Trainer<NlheGame6>>::save_checkpoint;
+    let _: fn(&Path, NlheGame6) -> Result<CT, CheckpointError> =
+        <CT as Trainer<NlheGame6>>::load_checkpoint;
+
+    // API-544 — Trainer trait default-impl 扩展（stage 5 trainer override 返
+    // Some(...)；stage 3 / stage 4 既有 trainer 走 trait default 返 None，
+    // 详 src/training/trainer.rs Trainer trait 段）。
+    let _: for<'a> fn(&'a CT, PlayerId) -> Option<&'a RegretTableCompact<InfoSetId>> =
+        <CT as Trainer<NlheGame6>>::regret_table_compact_opt;
+    let _: for<'a> fn(&'a CT, PlayerId) -> Option<&'a StrategyAccumulatorCompact<InfoSetId>> =
+        <CT as Trainer<NlheGame6>>::strategy_accum_compact_opt;
+
+    // -------------------------------------------------------------------
+    // API-560..API-579 — ShardLoader + RegretShard + ShardMetrics + helper
+    // -------------------------------------------------------------------
+    let _: fn(&Path, u8, usize) -> Result<ShardLoader, ShardError> = ShardLoader::new;
+    let _: for<'a> fn(
+        &'a mut ShardLoader,
+        u8,
+        u8,
+    ) -> Result<std::sync::Arc<std::sync::RwLock<RegretShard>>, ShardError> =
+        ShardLoader::load_shard;
+    let _: for<'a> fn(&'a mut ShardLoader) -> Option<(u8, u8)> = ShardLoader::evict_lru;
+    let _: for<'a> fn(
+        &'a ShardLoader,
+        u8,
+        u8,
+    ) -> Result<std::sync::Arc<std::sync::RwLock<RegretShard>>, ShardError> =
+        ShardLoader::pin_shard;
+    let _: for<'a> fn(&'a ShardLoader) -> &'a ShardMetrics = ShardLoader::metrics;
+    let _: fn(&Path, u8, u8) -> PathBuf = shard_file_path;
+    let _: fn(u64) -> u8 = shard_id_from_info_set;
+
+    let sm = ShardMetrics::default();
+    let _: u64 = sm.hit_count;
+    let _: u64 = sm.miss_count;
+    let _: u64 = sm.evict_count;
+    let _: u64 = sm.mmap_resident_bytes;
+    let _: u64 = sm.mmap_total_bytes;
+
+    // -------------------------------------------------------------------
+    // API-590..API-593 — MetricsCollector stage 5 扩展 + TrainingMetrics 新字段
+    // -------------------------------------------------------------------
+    use poker::training::metrics::{MetricsCollector, TrainingMetrics};
+    let _: fn(std::time::Duration) -> f64 = |w| {
+        let mc = MetricsCollector::new(100_000);
+        mc.sample_throughput_window(w)
+    };
+    let _: fn(u64) = |t| {
+        let mut mc = MetricsCollector::new(100_000);
+        mc.record_warm_up_complete(t);
+    };
+
+    // TrainingMetrics stage 5 14 个新字段访问。
+    let tm: TrainingMetrics = TrainingMetrics::zero();
+    let _: u64 = tm.regret_table_section_bytes;
+    let _: u64 = tm.strategy_accum_section_bytes;
+    let _: u64 = tm.pruning_state_section_bytes;
+    let _: u64 = tm.shard_hit_count;
+    let _: u64 = tm.shard_miss_count;
+    let _: u64 = tm.evict_count;
+    let _: u64 = tm.mmap_resident_bytes;
+    let _: u64 = tm.mmap_total_bytes;
+    let _: f64 = tm.elapsed_wall_s;
+    let _: f64 = tm.update_per_s_window;
+    let _: f64 = tm.update_per_s_lifetime;
+    let _: u64 = tm.pruned_action_count;
+    let _: f32 = tm.pruned_action_ratio;
+    let _: u64 = tm.resurface_event_count;
+    let _: u64 = tm.resurface_reactivated_count;
+
+    // 静态消费 hdr / cm / pc / rm / sm / tm 避免 unused 警告（部分变量已被
+    // assert 消费）。
+    let _ = hdr;
+    let _ = cm;
+    let _ = pc;
+    let _ = rm;
+    let _ = sm;
+    let _ = tm;
 }
