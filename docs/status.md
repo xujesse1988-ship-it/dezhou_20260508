@@ -14,6 +14,7 @@
 | Leduc Vanilla CFR | ✅ exploitability `< 0.1` @ 10K iter | `tests/cfr_leduc.rs` |
 | Leduc ES-MCCFR | ✅ 1M 外部对照通过；Rust 2M per-player update EV 与 `leduc_mccfr.py` 1M iter 同量级 | `leduc_mccfr.py` + `tools/leduc_es_mccfr_report.rs` |
 | 简化 NLHE ES-MCCFR | ✅ release ignored smoke 通过：1K finite strategy + 1M × 3 fixed-seed BLAKE3 byte-equal | `tests/cfr_simplified_nlhe.rs` |
+| H3 简化 NLHE 闭环工具 | ✅ 训练入口、三类 baseline 评测、H3 LBR proxy、Markdown/JSON report smoke 通过；完整 100M H3 gate 待跑 | `tools/train_cfr.rs` + `tools/nlhe_h3_report.rs` + `tests/nlhe_h3_eval.rs` |
 
 ### 最近验证证据
 
@@ -31,6 +32,12 @@
 - 简化 NLHE 复测：`cargo test --release --test cfr_simplified_nlhe -- --ignored --nocapture`
   通过 2 条 ignored 测试；1M × 3 fixed-seed snapshot BLAKE3 =
   `4d211620a09ed97ce9593055eb8e4ee42b592d6b44f9fa90e65faaa8d84d1ab4`。
+- H3 闭环工具 smoke：
+  - `cargo run --release --bin train_cfr -- --game nlhe --trainer es-mccfr --bucket-table artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin --updates 4 --seed 0x48335f4e4c48455f --threads 2 --checkpoint-dir artifacts/h3_smoke --checkpoint-every 2 --quiet`
+    成功写出 4 update checkpoint。
+  - `cargo run --release --bin nlhe_h3_report -- --checkpoint artifacts/h3_smoke/nlhe_es_mccfr_final_000000000004.ckpt --artifact artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin --eval-hands-per-seat 2 --lbr-probes 2 --lbr-rollouts 1 --output artifacts/h3_smoke/h3_report.md`
+    成功写出 `artifacts/h3_smoke/h3_report.md` / `.json`，包含 random / call-station / overly-tight 与 LBR proxy 曲线。
+  - 完整 H3 gate 仍需按 100M update + 1M hands 评测命令单独跑，当前未把 smoke 结果冒充为正式通过。
 
 ## 代码结构
 
@@ -50,6 +57,8 @@ tools/           一次性诊断 / 分析 binary
 - `src/training/trainer.rs::recurse_vanilla` — Vanilla CFR DFS
 - `src/training/leduc.rs` — Leduc 规则 + InfoSet 编码
 - `tools/leduc_es_mccfr_report.rs` — Leduc ES-MCCFR 收敛报告
+- `tools/train_cfr.rs` — H3 简化 NLHE ES-MCCFR 训练入口（checkpoint / resume / threads）
+- `tools/nlhe_h3_report.rs` — H3 baseline 评测 + LBR proxy Markdown/JSON 报告
 
 ## 构建 / 测试
 

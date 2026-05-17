@@ -63,9 +63,11 @@ pub use crate::abstraction::cluster::rng_substream;
 // §8 公开 surface 列表对齐）。`Game::InfoSet` 关联类型不显式 re-export（D-377：
 // 不暴露具体 InfoSet 类型枚举，通过 `G::InfoSet` 表达）。
 pub use crate::training::{
-    exploitability, BestResponse, Checkpoint, CheckpointError, EsMccfrTrainer, Game, GameVariant,
-    KuhnAction, KuhnBestResponse, KuhnGame, KuhnHistory, KuhnInfoSet, LeducAction,
-    LeducBestResponse, LeducGame, LeducInfoSet, LeducStreet, NodeKind, PlayerId, RegretTable,
+    estimate_simplified_nlhe_lbr, evaluate_blueprint_vs_baseline, exploitability, BestResponse,
+    Checkpoint, CheckpointError, EsMccfrTrainer, Game, GameVariant, KuhnAction, KuhnBestResponse,
+    KuhnGame, KuhnHistory, KuhnInfoSet, LeducAction, LeducBestResponse, LeducGame, LeducInfoSet,
+    LeducStreet, NlheBaselinePolicy, NlheEvaluationConfig, NlheEvaluationError,
+    NlheEvaluationReport, NlheLbrConfig, NlheLbrReport, NodeKind, PlayerId, RegretTable,
     SimplifiedNlheGame, StrategyAccumulator, Trainer, TrainerError, TrainerVariant,
     VanillaCfrTrainer,
 };

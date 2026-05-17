@@ -346,6 +346,10 @@ fn _stage3_api_signature_assertions() {
     use poker::training::kuhn::KuhnState;
     use poker::training::leduc::LeducState;
     use poker::training::nlhe::{SimplifiedNlheAction, SimplifiedNlheInfoSet, SimplifiedNlheState};
+    use poker::training::nlhe_eval::{
+        estimate_simplified_nlhe_lbr, evaluate_blueprint_vs_baseline, NlheBaselinePolicy,
+        NlheEvaluationConfig, NlheEvaluationReport, NlheLbrConfig, NlheLbrReport,
+    };
     use poker::training::sampling::{
         derive_substream_seed, sample_discrete, OP_CHANCE_SAMPLE, OP_KUHN_DEAL, OP_LEDUC_DEAL,
         OP_NLHE_DEAL, OP_OPP_ACTION_SAMPLE, OP_TRAVERSER_TIE,
@@ -523,6 +527,39 @@ fn _stage3_api_signature_assertions() {
         exploitability::<LeducGame, LeducBestResponse>;
 
     // ===================================================================
+    // training::nlhe_eval (H3 blueprint-only 评测 surface)
+    // ===================================================================
+
+    let _: fn(NlheBaselinePolicy) -> &'static str = NlheBaselinePolicy::label;
+    let _: for<'a, 'b, 'c> fn(
+        NlheBaselinePolicy,
+        &'a SimplifiedNlheState,
+        &'b [SimplifiedNlheAction],
+        &'c mut dyn RngSource,
+    ) -> Result<SimplifiedNlheAction, NlheEvaluationError> = NlheBaselinePolicy::select_action;
+    let _: for<'a, 'b, 'c> fn(
+        &'a SimplifiedNlheGame,
+        &'b dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
+        NlheBaselinePolicy,
+        &'c NlheEvaluationConfig,
+    ) -> Result<NlheEvaluationReport, NlheEvaluationError> = evaluate_blueprint_vs_baseline;
+    let _: for<'a, 'b, 'c> fn(
+        &'a SimplifiedNlheGame,
+        &'b dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
+        &'c NlheLbrConfig,
+    ) -> Result<NlheLbrReport, NlheEvaluationError> = estimate_simplified_nlhe_lbr;
+    let eval_cfg = NlheEvaluationConfig::default();
+    let _: u64 = eval_cfg.hands_per_seat;
+    let _: u64 = eval_cfg.seed;
+    let _: usize = eval_cfg.max_actions_per_hand;
+    let lbr_cfg = NlheLbrConfig::default();
+    let _: u64 = lbr_cfg.probes;
+    let _: u64 = lbr_cfg.rollouts_per_action;
+    let _: u64 = lbr_cfg.seed;
+    let _: usize = lbr_cfg.max_actions_per_probe;
+    let _: usize = lbr_cfg.max_actions_per_rollout;
+
+    // ===================================================================
     // training::checkpoint (api §5)
     // ===================================================================
 
@@ -636,6 +673,35 @@ fn _stage3_api_signature_assertions() {
     // `#[from]` attribute；let `?` 操作符跨 `Result<_, CheckpointError>` →
     // `Result<_, TrainerError>` 转换继续可用）。
     let _: fn(CheckpointError) -> TrainerError = <TrainerError as From<CheckpointError>>::from;
+
+    // NlheEvaluationError H3 评测错误枚举（追加不删模式）。覆盖 strategy shape、
+    // rollout 边界、hole card 缺失与 checkpoint 传播。
+    let _: NlheEvaluationError = NlheEvaluationError::StrategyLengthMismatch {
+        info_set: String::new(),
+        expected: 0usize,
+        got: 0usize,
+    };
+    let _: NlheEvaluationError = NlheEvaluationError::InvalidStrategyProbability {
+        index: 0usize,
+        probability: 0.0,
+    };
+    let _: NlheEvaluationError = NlheEvaluationError::InvalidStrategySum { sum: 0.0 };
+    let _: NlheEvaluationError = NlheEvaluationError::EmptyLegalActions {
+        state: String::new(),
+    };
+    let _: NlheEvaluationError = NlheEvaluationError::NonTerminalRollout {
+        max_actions: 0usize,
+    };
+    let _: NlheEvaluationError = NlheEvaluationError::MissingHoleCards { seat: SeatId(0) };
+    let _: NlheEvaluationError = NlheEvaluationError::InvalidConfig {
+        reason: String::new(),
+    };
+    let _: NlheEvaluationError = NlheEvaluationError::Checkpoint(CheckpointError::Corrupted {
+        offset: 0u64,
+        reason: String::new(),
+    });
+    let _: fn(CheckpointError) -> NlheEvaluationError =
+        <NlheEvaluationError as From<CheckpointError>>::from;
 
     // ===================================================================
     // training::game (api §1 trait const + 默认方法 — D2 \[实现\] 落地的 surface 扩展)

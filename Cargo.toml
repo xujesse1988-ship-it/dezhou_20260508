@@ -43,6 +43,7 @@ smallvec = "1"
 # dependencies 已经间接拉入 serde（via serde_json），但产品代码引用必须显式声明，
 # 否则 cargo doc / clippy 在 stage 3 D2 \[实现\] 落地后报 missing trait。
 serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
 # Thread-safety crate（D-321 多线程 ES-MCCFR thread-safety 模型）：候选
 # parking_lot 0.12 / dashmap 5.5 / crossbeam 0.8。具体选型 deferred 到 C2 \[实现\]
 # 起步前 lock（详见 docs/pluribus_stage3_decisions.md §10 已知未决项 + D-321），
@@ -52,7 +53,6 @@ serde = { version = "1", features = ["derive"] }
 [dev-dependencies]
 # 阶段 1 §B1 / E1 benchmark harness。`harness = false` 见下方 [[bench]]。
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
-serde_json = "1.0"
 # C1 跨语言反序列化测试：把 prost 输出 base64 后传给 Python 子进程。
 base64 = "0.22"
 
@@ -105,6 +105,10 @@ path = "tools/train_cfr.rs"
 [[bin]]
 name = "nlhe_blake3_anchor"
 path = "tools/nlhe_blake3_anchor.rs"
+
+[[bin]]
+name = "nlhe_h3_report"
+path = "tools/nlhe_h3_report.rs"
 
 [[bin]]
 name = "leduc_es_mccfr_report"

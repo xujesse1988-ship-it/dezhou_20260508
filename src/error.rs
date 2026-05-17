@@ -141,6 +141,41 @@ pub enum TrainerError {
     Checkpoint(#[from] CheckpointError),
 }
 
+/// H3 简化 NLHE blueprint 评测错误。
+///
+/// 评测路径不改变训练 / checkpoint schema；这些错误只表达评测 harness 在
+/// strategy lookup、rollout 或 baseline action 选择时遇到的可诊断失败。
+#[derive(Debug, Error)]
+pub enum NlheEvaluationError {
+    #[error("info_set {info_set:?} strategy length mismatch: expected {expected}, got {got}")]
+    StrategyLengthMismatch {
+        info_set: String,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("strategy probability invalid at index {index}: {probability}")]
+    InvalidStrategyProbability { index: usize, probability: f64 },
+
+    #[error("strategy probability sum {sum} is not positive finite")]
+    InvalidStrategySum { sum: f64 },
+
+    #[error("player node has no legal actions: {state}")]
+    EmptyLegalActions { state: String },
+
+    #[error("rollout did not terminate within {max_actions} actions")]
+    NonTerminalRollout { max_actions: usize },
+
+    #[error("player {seat:?} hole cards are missing")]
+    MissingHoleCards { seat: crate::core::SeatId },
+
+    #[error("invalid evaluation config: {reason}")]
+    InvalidConfig { reason: String },
+
+    #[error("checkpoint error: {0}")]
+    Checkpoint(#[from] CheckpointError),
+}
+
 /// Trainer 变体 tag（API-350 binary schema offset 12 / D-356 跨 trainer 不兼容拒绝）。
 ///
 /// 定义在 `src/error.rs` 而非 `src/training/checkpoint.rs` 以避免 `error.rs` ↔

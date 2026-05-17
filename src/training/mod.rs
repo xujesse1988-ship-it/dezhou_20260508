@@ -10,6 +10,7 @@
 //! - [`leduc`]：`LeducGame` + `LeducAction` + `LeducInfoSet` + `LeducStreet` +
 //!   `LeducHistory` + `LeducState`
 //! - [`nlhe`]：`SimplifiedNlheGame` + `SimplifiedNlheState` + type alias 桥接 stage 2
+//! - [`nlhe_eval`]：H3 blueprint-only baseline 评测 + local BR proxy
 //! - [`regret`]：`RegretTable` + `StrategyAccumulator`（允许 `f64` 浮点；D-379）
 //! - [`trainer`]：`Trainer` trait + `VanillaCfrTrainer` + `EsMccfrTrainer`
 //! - [`sampling`]：`derive_substream_seed` + `sample_discrete` + 6 个 op_id 常量
@@ -29,6 +30,7 @@ pub mod game;
 pub mod kuhn;
 pub mod leduc;
 pub mod nlhe;
+pub mod nlhe_eval;
 pub mod regret;
 pub mod sampling;
 pub mod trainer;
@@ -42,10 +44,16 @@ pub use leduc::{LeducAction, LeducGame, LeducHistory, LeducInfoSet, LeducState, 
 pub use nlhe::{
     SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
 };
+pub use nlhe_eval::{
+    estimate_simplified_nlhe_lbr, evaluate_blueprint_vs_baseline, NlheBaselinePolicy,
+    NlheEvaluationConfig, NlheEvaluationReport, NlheLbrConfig, NlheLbrReport,
+};
 pub use regret::{RegretTable, StrategyAccumulator};
 pub use trainer::{EsMccfrTrainer, Trainer, VanillaCfrTrainer};
 
 // CheckpointError + TrainerError + TrainerVariant + GameVariant 物理位置在
 // `src/error.rs`（D-374），逻辑路径 `poker::training::{Checkpoint, CheckpointError, ...}`
 // 由本 `pub use` 暴露，与 API-313 / API-351 / API-350 公开路径一致。
-pub use crate::error::{CheckpointError, GameVariant, TrainerError, TrainerVariant};
+pub use crate::error::{
+    CheckpointError, GameVariant, NlheEvaluationError, TrainerError, TrainerVariant,
+};
