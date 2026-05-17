@@ -206,11 +206,13 @@ Pluribus 的可实现路线可以概括为：
 - 长局数评测结果稳定，至少覆盖 `10,000,000` 手牌累计评测，且使用 AIVAT/DIVAT 方差缩减后结果一致性可复现。
 - 每个策略版本都有可复现的训练配置、checkpoint、评测报告（含 LBR 与方差缩减后的 `mbb/g`）和版本哈希。
 
-## 详细阶段文档
+## 当前进度与已知问题
 
-- 阶段 1：规则环境与手牌评估器的量化验证方式，见 [pluribus_stage1_validation.md](./pluribus_stage1_validation.md)。
-- 阶段 1 实施流程（test-first 路径），见 [pluribus_stage1_workflow.md](./pluribus_stage1_workflow.md)。
-- 阶段 2-8：后续按阶段 1 的格式继续拆分，每个阶段单独维护目标、验证方式、通过标准和进入下一阶段的门槛。
+见 [status.md](./status.md)。
+
+## 代码层硬约束
+
+见 [invariants.md](./invariants.md)。
 
 ## 参考资料
 
