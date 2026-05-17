@@ -262,6 +262,10 @@ fn leduc_collect_dfs(
                 hasher.update(&[info.private_card]);
                 hasher.update(&[info.public_card.unwrap_or(0xFF)]);
                 hasher.update(&[info.street as u8]);
+                hasher.update(&(info.preflop_history.len() as u32).to_le_bytes());
+                for a in &info.preflop_history {
+                    hasher.update(&[*a as u8]);
+                }
                 hasher.update(&(info.history.len() as u32).to_le_bytes());
                 for a in &info.history {
                     hasher.update(&[*a as u8]);

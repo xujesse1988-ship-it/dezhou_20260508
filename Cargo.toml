@@ -105,3 +105,7 @@ path = "tools/train_cfr.rs"
 [[bin]]
 name = "nlhe_blake3_anchor"
 path = "tools/nlhe_blake3_anchor.rs"
+
+[[bin]]
+name = "leduc_es_mccfr_report"
+path = "tools/leduc_es_mccfr_report.rs"

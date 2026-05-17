@@ -78,12 +78,17 @@ pub enum LeducStreet {
 pub type LeducHistory = Vec<LeducAction>;
 
 /// Leduc 玩家视角 InfoSet（API-302）。
+///
+/// `private_card` / `public_card` 存 rank（J/Q/K = 11/12/13），不是 0..5 的物理
+/// 牌 id。Leduc 的两张同 rank 牌在策略信息上等价；物理牌 id 只保留在
+/// [`LeducState`] 里用于 card-removal chance 枚举。
 #[derive(Clone, Eq, Hash, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LeducInfoSet {
     pub actor: PlayerId,
     pub private_card: u8,
     pub public_card: Option<u8>,
     pub street: LeducStreet,
+    pub preflop_history: LeducHistory,
     pub history: LeducHistory,
 }
 
@@ -97,6 +102,7 @@ pub struct LeducState {
     pub cards: [u8; 2],
     pub public_card: Option<u8>,
     pub street: LeducStreet,
+    pub preflop_history: LeducHistory,
     pub history: LeducHistory,
     pub committed: [u32; 2],
     pub terminal_payoffs: Option<[f64; 2]>,
@@ -234,6 +240,7 @@ impl Game for LeducGame {
             cards: [0xFF, 0xFF],
             public_card: None,
             street: LeducStreet::Preflop,
+            preflop_history: Vec::new(),
             history: Vec::new(),
             committed: [1, 1],
             terminal_payoffs: None,
@@ -255,9 +262,13 @@ impl Game for LeducGame {
         assert!(private != 0xFF, "info_set called before private deal");
         LeducInfoSet {
             actor,
-            private_card: private,
-            public_card: state.public_card,
+            private_card: rank_of(private),
+            public_card: state.public_card.map(rank_of),
             street: state.street,
+            preflop_history: match state.street {
+                LeducStreet::Preflop => Vec::new(),
+                LeducStreet::Postflop => state.preflop_history.clone(),
+            },
             history: state.history.clone(),
         }
     }
@@ -329,6 +340,7 @@ impl Game for LeducGame {
                 LeducStreet::Preflop => {
                     // 进入 postflop：清 history，准备 public deal chance
                     state.street = LeducStreet::Postflop;
+                    state.preflop_history = state.history.clone();
                     state.history.clear();
                 }
                 LeducStreet::Postflop => {
