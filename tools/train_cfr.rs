@@ -22,6 +22,7 @@ struct Args {
     checkpoint_dir: PathBuf,
     resume: Option<PathBuf>,
     checkpoint_every: u64,
+    report_every: Option<u64>,
     keep_last: usize,
     bucket_table: PathBuf,
     threads: usize,
@@ -38,6 +39,7 @@ impl Default for Args {
             checkpoint_dir: PathBuf::from("artifacts"),
             resume: None,
             checkpoint_every: 0,
+            report_every: None,
             keep_last: 5,
             bucket_table: PathBuf::new(),
             threads: 1,
@@ -69,6 +71,9 @@ fn run() -> Result<(), String> {
     }
     if args.threads == 0 {
         return Err("--threads must be > 0".to_string());
+    }
+    if args.report_every == Some(0) {
+        return Err("--report-every must be > 0 when provided".to_string());
     }
     if args.bucket_table.as_os_str().is_empty() {
         return Err("--bucket-table is required for --game nlhe".to_string());
@@ -123,6 +128,9 @@ fn run() -> Result<(), String> {
             "[train_cfr] checkpoint_dir   = {}",
             args.checkpoint_dir.display()
         );
+        if let Some(report_every) = args.report_every {
+            eprintln!("[train_cfr] report_every     = {report_every}");
+        }
     }
 
     let mut single_rng = ChaCha20Rng::from_seed(args.seed);
@@ -134,9 +142,10 @@ fn run() -> Result<(), String> {
         .collect();
 
     let t0 = Instant::now();
-    let report_every = args
+    let default_report_every = args
         .checkpoint_every
         .max((args.updates - start_update).saturating_div(10).max(1));
+    let report_every = args.report_every.unwrap_or(default_report_every);
     let mut next_report = start_update.saturating_add(report_every);
     let mut next_checkpoint = if args.checkpoint_every > 0 {
         ((start_update / args.checkpoint_every) + 1) * args.checkpoint_every
@@ -215,6 +224,9 @@ fn parse_args() -> Result<Args, String> {
             "--resume" => out.resume = Some(PathBuf::from(next_value(&mut args, "--resume")?)),
             "--checkpoint-every" => {
                 out.checkpoint_every = parse_u64(&next_value(&mut args, "--checkpoint-every")?)?
+            }
+            "--report-every" => {
+                out.report_every = Some(parse_u64(&next_value(&mut args, "--report-every")?)?)
             }
             "--keep-last" => {
                 out.keep_last = parse_u64(&next_value(&mut args, "--keep-last")?)? as usize
@@ -298,6 +310,7 @@ fn print_usage() {
          \t--resume <checkpoint>\n\
          \t--checkpoint-dir <dir>\n\
          \t--checkpoint-every <N>\n\
+         \t--report-every <N>\n\
          \t--keep-last <N>\n\
          \t--quiet"
     );
