@@ -30,3 +30,5 @@ Recent commits use concise Chinese messages with optional conventional prefixes,
 ## Agent-Specific Instructions
 
 Respect stage role boundaries from `CLAUDE.md`: test agents edit tests/harness/benchmarks only, implementation agents edit product code, and decision/report agents edit docs. For decision or API changes, append revision entries instead of deleting historical decisions.
+
+After modifying repository files, agents should verify the change, then commit and push by default unless the user explicitly says not to commit or not to push.
