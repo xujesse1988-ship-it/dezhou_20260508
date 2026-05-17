@@ -34,4 +34,19 @@ impl TableConfig {
             button_seat: SeatId(0),
         }
     }
+
+    /// Heads-up 100BB 的默认配置：2 座、起始 100BB、SB=50、BB=100、ante=0、按钮在座位 0。
+    ///
+    /// `GameState` 按标准 HU NLHE 语义推导：button seat 同时是 SB，非 button
+    /// seat 是 BB，postflop 由 BB 先行动。
+    pub fn default_hu_100bb() -> TableConfig {
+        TableConfig {
+            n_seats: 2,
+            starting_stacks: vec![ChipAmount::new(10_000); 2],
+            small_blind: ChipAmount::new(50),
+            big_blind: ChipAmount::new(100),
+            ante: ChipAmount::ZERO,
+            button_seat: SeatId(0),
+        }
+    }
 }

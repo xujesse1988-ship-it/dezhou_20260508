@@ -40,7 +40,7 @@ use crate::abstraction::preflop::{
     PreflopLossless169,
 };
 use crate::core::rng::RngSource;
-use crate::core::{ChipAmount, SeatId};
+use crate::core::SeatId;
 use crate::error::TrainerError;
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
@@ -142,26 +142,6 @@ fn action_signature_mask(actions: &[AbstractAction]) -> u8 {
     mask
 }
 
-/// 简化 NLHE 默认 `TableConfig`（D-313 + D-022b-rev1）：
-///
-/// - `n_seats = 2`（HU；D-022b-rev1 button=SB / non-button=BB）
-/// - `starting_stacks = [10_000; 2]` chips = 100 BB × 2 seat（D-313 字面）
-/// - `small_blind = 50` chips = 0.5 BB（D-313 字面）
-/// - `big_blind = 100` chips = 1.0 BB（D-313 字面）
-/// - `ante = 0`（继承 stage 1 D-024 默认）
-/// - `button_seat = SeatId(0)`（SB=0 / BB=1 under HU 推导；继承 stage 1
-///   D-022b `default_6max_100bb` 同型起点选定）
-fn simplified_nlhe_table_config() -> TableConfig {
-    TableConfig {
-        n_seats: 2,
-        starting_stacks: vec![ChipAmount::new(10_000); 2],
-        small_blind: ChipAmount::new(50),
-        big_blind: ChipAmount::new(100),
-        ante: ChipAmount::ZERO,
-        button_seat: SeatId(0),
-    }
-}
-
 /// 简化 NLHE Game token（API-303）。
 ///
 /// 构造时载入 stage 2 `BucketTable`（D-314-rev1 v3 artifact）+ stage 1
@@ -204,7 +184,7 @@ impl SimplifiedNlheGame {
         }
         Ok(Self {
             bucket_table,
-            config: simplified_nlhe_table_config(),
+            config: TableConfig::default_hu_100bb(),
         })
     }
 }

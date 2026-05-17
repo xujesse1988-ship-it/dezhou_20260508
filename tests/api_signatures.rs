@@ -77,6 +77,7 @@ fn _api_signature_assertions() {
     // ===================================================================
 
     let _: fn() -> TableConfig = TableConfig::default_6max_100bb;
+    let _: fn() -> TableConfig = TableConfig::default_hu_100bb;
 
     // ===================================================================
     // rules::state (api §4 + API-001-rev1)
