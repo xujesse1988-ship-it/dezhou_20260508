@@ -12,8 +12,25 @@
 |---|---|---|
 | Kuhn Vanilla CFR | ✅ 收敛到 closed-form Nash `-1/18` | `tests/cfr_kuhn.rs` |
 | Leduc Vanilla CFR | ✅ exploitability `< 0.1` @ 10K iter | `tests/cfr_leduc.rs` |
-| Leduc ES-MCCFR | ⚠️ 算法 2026-05-17 修正，**未跑 1M iter 对照 `leduc_mccfr.py`** | commit 240bb1a |
-| 简化 NLHE ES-MCCFR | ⚠️ 同上路径，**未复测** | — |
+| Leduc ES-MCCFR | ✅ 1M 外部对照通过；Rust 2M per-player update EV 与 `leduc_mccfr.py` 1M iter 同量级 | `leduc_mccfr.py` + `tools/leduc_es_mccfr_report.rs` |
+| 简化 NLHE ES-MCCFR | ✅ release ignored smoke 通过：1K finite strategy + 1M × 3 fixed-seed BLAKE3 byte-equal | `tests/cfr_simplified_nlhe.rs` |
+
+### 最近验证证据
+
+- Leduc 外部参考：`python3 leduc_mccfr.py --iterations 1000000 --seed 7 --compact`
+  输出 `Expected value for player 0: -0.08668`。
+- Leduc Rust ES-MCCFR：`cargo run --release --bin leduc_es_mccfr_report -- --updates 2000000 --seed 0x4c454455435f4553 --report-every 2000000 --output artifacts/leduc_es_mccfr_2m_h2_status.txt`
+  输出 `ev_p0=-0.087396516`、`exploitability_chips_per_game=0.258471407`、
+  `average_strategy_blake3=b48a079c68fc595e722f3232e6c0219a52f91ebdabd1a9fadfe483ba9dce950a`。
+  口径说明：`leduc_mccfr.py` 的 1 次 iteration 会分别更新两个 traverser；Rust `update_count`
+  是 per-player update，因此用 Rust 2M update 对齐 Python 1M iter。
+- Leduc 长跑趋势：已有 Rust 100M report
+  `artifacts/leduc_es_mccfr_100m_full_history.txt` 输出 `ev_p0=-0.086036478`、
+  `exploitability_chips_per_game=0.147556546`、
+  `average_strategy_blake3=c0b8bcfa6db843b410f515b8526f08de19f573c88fb4eaf20afe431dba98385c`。
+- 简化 NLHE 复测：`cargo test --release --test cfr_simplified_nlhe -- --ignored --nocapture`
+  通过 2 条 ignored 测试；1M × 3 fixed-seed snapshot BLAKE3 =
+  `4d211620a09ed97ce9593055eb8e4ee42b592d6b44f9fa90e65faaa8d84d1ab4`。
 
 ## 代码结构
 
