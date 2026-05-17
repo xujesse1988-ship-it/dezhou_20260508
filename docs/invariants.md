@@ -2,7 +2,6 @@
 
 下列规则由编译器 / clippy / `Cargo.toml` 强制，违反通不过 build。
 
-不要试图绕过 —— 如果觉得需要绕，**先怀疑设计**。
 
 ## 1. 规则 / 评估器 / 抽象层不用浮点
 
@@ -59,13 +58,7 @@ unsafe_code = "forbid"
 
 ## 7. 改算法必须有外部对照
 
-凡是修改 CFR / MCCFR / regret matching / sampling 公式的 commit，
-必须附上对照外部参照实现的输出（OpenSpiel / `leduc_mccfr.py` / 学术论文已知 Nash value）。
 
-仅"按论文公式重写"不够 —— 论文里 outcome sampling 和 external sampling 公式经常在同一节，
-读者本人可能搞混（**项目历史上的 ES-MCCFR bug 就是这么进来的**）。
-
-外部对照不通过的算法改动不进 main。
 
 ## 8. `closed` 必须 hard pass
 
@@ -74,4 +67,4 @@ stage 验收门槛全部通过才能 close。
 不允许 "下个 stage 修"。
 
 如果一个量化门槛偏离阈值 10× 以上，**停下来怀疑算法**，
-不要在偏离上面继续盖新阶段（**项目历史 stage 4 LBR 281× 偏离继续推进 stage 5，是失败的直接原因**）。
+不要在偏离上面继续盖新阶段

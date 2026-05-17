@@ -14,33 +14,6 @@
 | Leduc Vanilla CFR | ✅ exploitability `< 0.1` @ 10K iter | `tests/cfr_leduc.rs` |
 | Leduc ES-MCCFR | ⚠️ 算法 2026-05-17 修正，**未跑 1M iter 对照 `leduc_mccfr.py`** | commit 240bb1a |
 | 简化 NLHE ES-MCCFR | ⚠️ 同上路径，**未复测** | — |
-| 6-max NLHE blueprint (stage 4) | ❌ 训练用的 ES-MCCFR 有 bug，工件不可信 | LBR 56,231 mbb/g vs 阈值 200 |
-| stage 5 性能优化 | ❌ 建在 stage 4 之上，同污染 | — |
-
-外部参照点（任何 ES-MCCFR 改动必须跟其中至少一条对照）：
-
-- Brian Berns Vanilla CFR 500M iter on Leduc: EV P0 = **-0.08553**
-- Python `leduc_mccfr.py` 1M iter: EV P0 = **-0.08668**
-- zig-leduc-cfr 100K iter: EV P0 = **-0.08597**
-- 三独立实现一致 → Leduc P0 Nash value ≈ **-0.087** 是 ground truth
-
-## 下一步唯一允许的工作
-
-跑 Leduc ES-MCCFR 1M iter 对照 Python ref，验证：
-
-1. exploitability `< 0.1`
-2. EV P0 ∈ `[-0.10, -0.07]`
-3. P1 持 J 面对 bet（preflop）的策略 `fold ≥ 0.5`
-
-三条都过之前不允许动 stage 4 / stage 5 任何代码。
-三条任一失败 → 继续修 `recurse_es` 路径，不开新功能。
-
-跑法：
-
-```bash
-cargo run --release --bin leduc_es_mccfr_report
-# 对照工件：leduc_mccfr.py（python3 leduc_mccfr.py --iterations 1000000 --compact）
-```
 
 ## 代码结构
 
@@ -84,20 +57,14 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test
 
 - `artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin`
   528 MiB / body BLAKE3 `67ee5554…98650cd` / 不进 git。
-  生产用 abstraction，stage 4 NLHE 训练依赖。
 
 - 测试用 fixture（`--mode fixture --flop 10 --turn 10 --river 10`）每次现造。
 
 ## 已知污染清单
 
-- stage 3 docs 历史里 NLHE BLAKE3 anchor `9e8258d1…`、`8fa6a8fd…` 等数字：
-  算法修复后不再可复现，不要拿这些值作 regression 比对。
-- stage 4 训练结果（任何形式的 blueprint checkpoint）：用旧 ES-MCCFR 训练，不可信。
-- stage 5 性能优化数字（吞吐 / 内存）：基于 stage 4 工件，参考价值有限。
 
 ## 文档维护规则
 
 - 现在描述的状态错了 → **直接改本文件**，不追加"修订历史"。git 自带历史。
 - 已经过时的事实 → 删除，不留"已废弃"标注。
 - 新事实跟旧事实矛盾 → 旧的删掉，不并列。
-- 算法 / 不变量 / 流程的本质性变化 → 改 `pluribus_path.md` 或 `invariants.md`，不在本文里堆叠。
