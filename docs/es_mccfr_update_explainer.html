@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>一次 ES-MCCFR Update</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #1b2430;
+      --muted: #5d6a7c;
+      --line: #d7dee8;
+      --paper: #f8fafc;
+      --panel: #ffffff;
+      --blue: #2f6fbb;
+      --teal: #168276;
+      --rose: #c95062;
+      --amber: #b77619;
+      --green: #2d8a4d;
+      --shadow: 0 18px 50px rgba(42, 56, 77, 0.12);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(180deg, rgba(47, 111, 187, 0.08), transparent 360px),
+        var(--paper);
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 42px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 330px;
+      gap: 24px;
+      align-items: stretch;
+      margin-bottom: 22px;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin: 0;
+    }
+
+    h1 {
+      max-width: 760px;
+      font-size: clamp(2rem, 4.6vw, 4.25rem);
+      line-height: 1.02;
+      letter-spacing: 0;
+    }
+
+    .lead {
+      max-width: 760px;
+      margin-top: 16px;
+      color: var(--muted);
+      font-size: 1.05rem;
+      line-height: 1.75;
+    }
+
+    .hero-copy,
+    .quick-card,
+    .panel,
+    .step-detail,
+    .formula-row,
+    .node-card,
+    .note {
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.92);
+      box-shadow: var(--shadow);
+    }
+
+    .hero-copy {
+      min-height: 280px;
+      padding: 30px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      border-radius: 8px;
+    }
+
+    .quick-card {
+      border-radius: 8px;
+      padding: 22px;
+      display: grid;
+      align-content: center;
+      gap: 18px;
+    }
+
+    .quick-card strong {
+      display: block;
+      margin-bottom: 4px;
+      color: var(--ink);
+      font-size: 0.98rem;
+    }
+
+    .quick-card span {
+      color: var(--muted);
+      line-height: 1.55;
+      font-size: 0.94rem;
+    }
+
+    .status-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 22px;
+    }
+
+    .status-item {
+      border: 1px solid var(--line);
+      border-left: 5px solid var(--blue);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 14px 16px;
+      min-height: 88px;
+    }
+
+    .status-item:nth-child(2) {
+      border-left-color: var(--teal);
+    }
+
+    .status-item:nth-child(3) {
+      border-left-color: var(--rose);
+    }
+
+    .status-item:nth-child(4) {
+      border-left-color: var(--amber);
+    }
+
+    .status-item b {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 0.88rem;
+    }
+
+    .status-item span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.5;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 310px minmax(0, 1fr);
+      gap: 22px;
+      align-items: start;
+    }
+
+    .panel {
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .panel-head {
+      border-bottom: 1px solid var(--line);
+      padding: 18px 20px;
+      background: #f3f7fb;
+    }
+
+    .panel-head h2 {
+      font-size: 1.1rem;
+      letter-spacing: 0;
+    }
+
+    .timeline {
+      padding: 12px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .step-button {
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr);
+      gap: 12px;
+      width: 100%;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      padding: 12px;
+      color: var(--ink);
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .step-button:hover,
+    .step-button.active {
+      border-color: #9db9dc;
+      background: #eef6ff;
+    }
+
+    .step-button .num {
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      background: var(--blue);
+      color: white;
+      font-weight: 750;
+      font-size: 0.88rem;
+    }
+
+    .step-button:nth-child(2) .num,
+    .step-button:nth-child(5) .num {
+      background: var(--teal);
+    }
+
+    .step-button:nth-child(3) .num,
+    .step-button:nth-child(6) .num {
+      background: var(--rose);
+    }
+
+    .step-button:nth-child(4) .num,
+    .step-button:nth-child(7) .num {
+      background: var(--amber);
+    }
+
+    .step-title {
+      display: block;
+      font-weight: 760;
+      font-size: 0.95rem;
+      line-height: 1.25;
+    }
+
+    .step-sub {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+
+    .step-detail {
+      border-radius: 8px;
+      padding: 24px;
+      min-height: 282px;
+    }
+
+    .step-detail h2 {
+      margin-bottom: 12px;
+      font-size: 1.55rem;
+      letter-spacing: 0;
+    }
+
+    .step-detail p {
+      color: var(--muted);
+      line-height: 1.75;
+      font-size: 1rem;
+    }
+
+    .code-pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 18px;
+    }
+
+    .code-pill {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 10px;
+      background: #f8fbff;
+      color: #2a3a50;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.82rem;
+    }
+
+    .diagram-wrap {
+      margin-top: 22px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfdff;
+      overflow: hidden;
+    }
+
+    svg {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 22px;
+      margin-top: 22px;
+    }
+
+    .node-card {
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    .node-card h3 {
+      margin-bottom: 10px;
+      font-size: 1.05rem;
+    }
+
+    .node-card p {
+      color: var(--muted);
+      line-height: 1.65;
+      font-size: 0.94rem;
+    }
+
+    .formula-row {
+      margin-top: 22px;
+      border-radius: 8px;
+      padding: 22px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .formula {
+      border-left: 4px solid var(--blue);
+      padding-left: 14px;
+    }
+
+    .formula:nth-child(2) {
+      border-left-color: var(--teal);
+    }
+
+    .formula:nth-child(3) {
+      border-left-color: var(--rose);
+    }
+
+    .formula b {
+      display: block;
+      margin-bottom: 7px;
+      font-size: 0.92rem;
+    }
+
+    .formula code {
+      color: #2c415d;
+      font-size: 0.88rem;
+      white-space: normal;
+      line-height: 1.65;
+    }
+
+    .note {
+      margin-top: 22px;
+      border-radius: 8px;
+      padding: 20px 22px;
+      color: var(--muted);
+      line-height: 1.7;
+    }
+
+    .note b {
+      color: var(--ink);
+    }
+
+    .footer {
+      margin-top: 28px;
+      color: var(--muted);
+      font-size: 0.88rem;
+      line-height: 1.6;
+    }
+
+    .hide {
+      display: none;
+    }
+
+    @media (max-width: 920px) {
+      header,
+      .grid,
+      .two-col,
+      .formula-row {
+        grid-template-columns: 1fr;
+      }
+
+      .status-strip {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .hero-copy {
+        min-height: auto;
+      }
+    }
+
+    @media (max-width: 560px) {
+      main {
+        width: min(100% - 20px, 1180px);
+        padding-top: 14px;
+      }
+
+      .hero-copy,
+      .quick-card,
+      .step-detail,
+      .node-card,
+      .note {
+        padding: 18px;
+      }
+
+      .status-strip {
+        grid-template-columns: 1fr;
+      }
+
+      .step-button {
+        grid-template-columns: 28px minmax(0, 1fr);
+        padding: 10px;
+      }
+
+      .step-button .num {
+        width: 28px;
+        height: 28px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <section class="hero-copy" aria-labelledby="page-title">
+        <h1 id="page-title">一次 ES-MCCFR update 是怎么走完的</h1>
+        <p class="lead">把一次训练更新想成一条带探照灯的路线：本次被训练的玩家会在自己的每个决策点把所有选择都试一遍；对手节点只按当前策略抽一条路。走到终局后，收益一路回传，更新 regret 和平均策略。</p>
+      </section>
+      <aside class="quick-card" aria-label="核心记忆点">
+        <div>
+          <strong>谁被更新</strong>
+          <span><code>traverser = update_count % 2</code>，两名玩家轮流成为本次 update 的主角。</span>
+        </div>
+        <div>
+          <strong>哪里全展开</strong>
+          <span>只有 traverser 自己的节点会枚举所有动作，计算每个动作的 counterfactual value。</span>
+        </div>
+        <div>
+          <strong>哪里采样</strong>
+          <span>对手节点按当前策略抽一个动作；NLHE 的发牌随机性已经在 root 一次性完成。</span>
+        </div>
+      </aside>
+    </header>
+
+    <section class="status-strip" aria-label="一眼看懂">
+      <div class="status-item">
+        <b>输入</b>
+        <span>当前 regret 表、strategy_sum 表、随机数源、bucket table。</span>
+      </div>
+      <div class="status-item">
+        <b>路径</b>
+        <span>从 root 递归到 terminal，traverser 节点全展开，对手节点采样。</span>
+      </div>
+      <div class="status-item">
+        <b>输出</b>
+        <span>一批 regret delta 和 strategy_sum 增量，最后 <code>update_count += 1</code>。</span>
+      </div>
+      <div class="status-item">
+        <b>安全网</b>
+        <span>动作来自 legal_actions；真正 apply 时规则层还会拒绝非法金额。</span>
+      </div>
+    </section>
+
+    <section class="grid">
+      <nav class="panel" aria-label="update 步骤">
+        <div class="panel-head">
+          <h2>步骤导航</h2>
+        </div>
+        <div class="timeline">
+          <button class="step-button active" type="button" data-step="0">
+            <span class="num">1</span>
+            <span><span class="step-title">选 traverser</span><span class="step-sub">决定本次更新谁</span></span>
+          </button>
+          <button class="step-button" type="button" data-step="1">
+            <span class="num">2</span>
+            <span><span class="step-title">生成 root</span><span class="step-sub">发牌和预生成公共牌</span></span>
+          </button>
+          <button class="step-button" type="button" data-step="2">
+            <span class="num">3</span>
+            <span><span class="step-title">进入节点</span><span class="step-sub">Terminal / Chance / Player</span></span>
+          </button>
+          <button class="step-button" type="button" data-step="3">
+            <span class="num">4</span>
+            <span><span class="step-title">算 info 与 sigma</span><span class="step-sub">信息集、动作、当前策略</span></span>
+          </button>
+          <button class="step-button" type="button" data-step="4">
+            <span class="num">5</span>
+            <span><span class="step-title">traverser 节点</span><span class="step-sub">所有动作都试一遍</span></span>
+          </button>
+          <button class="step-button" type="button" data-step="5">
+            <span class="num">6</span>
+            <span><span class="step-title">对手节点</span><span class="step-sub">按策略采样一条路</span></span>
+          </button>
+          <button class="step-button" type="button" data-step="6">
+            <span class="num">7</span>
+            <span><span class="step-title">回填更新</span><span class="step-sub">regret 与 average strategy</span></span>
+          </button>
+        </div>
+      </nav>
+
+      <article class="step-detail" aria-live="polite">
+        <h2 id="step-heading">1. 选 traverser</h2>
+        <p id="step-body">一次 update 只更新一个玩家。heads-up 下，update 0 更新玩家 0，update 1 更新玩家 1，之后继续轮流。这样每个玩家都会从自己的视角学习：哪些动作比当前混合策略更好，哪些更差。</p>
+        <div class="code-pill-row" id="step-pills">
+          <span class="code-pill">traverser = update_count % n_players</span>
+          <span class="code-pill">update_count: 0 -> 1 -> 2</span>
+        </div>
+        <div class="diagram-wrap" aria-label="一次 update 流程图">
+          <svg viewBox="0 0 880 360" role="img" aria-labelledby="flow-title flow-desc">
+            <title id="flow-title">一次 ES-MCCFR update 的流程</title>
+            <desc id="flow-desc">流程从选择 traverser 开始，经过 root、节点判断、玩家节点处理，最后更新 regret 和 strategy_sum。</desc>
+            <defs>
+              <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#52657a"></path>
+              </marker>
+              <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+                <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#2a384d" flood-opacity="0.13"></feDropShadow>
+              </filter>
+            </defs>
+            <rect x="0" y="0" width="880" height="360" fill="#fbfdff"></rect>
+            <g filter="url(#soft)">
+              <rect x="34" y="70" width="132" height="76" rx="8" fill="#ffffff" stroke="#9db9dc"></rect>
+              <rect x="218" y="70" width="132" height="76" rx="8" fill="#ffffff" stroke="#9fd0c9"></rect>
+              <rect x="402" y="70" width="132" height="76" rx="8" fill="#ffffff" stroke="#dda5af"></rect>
+              <rect x="586" y="70" width="132" height="76" rx="8" fill="#ffffff" stroke="#d8b170"></rect>
+            </g>
+            <text x="100" y="100" text-anchor="middle" font-size="15" font-weight="800" fill="#1b2430">选 traverser</text>
+            <text x="100" y="123" text-anchor="middle" font-size="12" fill="#5d6a7c">本次更新谁</text>
+            <text x="284" y="100" text-anchor="middle" font-size="15" font-weight="800" fill="#1b2430">root</text>
+            <text x="284" y="123" text-anchor="middle" font-size="12" fill="#5d6a7c">发牌 + 盲注</text>
+            <text x="468" y="100" text-anchor="middle" font-size="15" font-weight="800" fill="#1b2430">递归节点</text>
+            <text x="468" y="123" text-anchor="middle" font-size="12" fill="#5d6a7c">判断类型</text>
+            <text x="652" y="100" text-anchor="middle" font-size="15" font-weight="800" fill="#1b2430">回填表</text>
+            <text x="652" y="123" text-anchor="middle" font-size="12" fill="#5d6a7c">R 和 S 累加</text>
+            <path d="M166 108 H218" stroke="#52657a" stroke-width="2" marker-end="url(#arrow)"></path>
+            <path d="M350 108 H402" stroke="#52657a" stroke-width="2" marker-end="url(#arrow)"></path>
+            <path d="M534 108 H586" stroke="#52657a" stroke-width="2" marker-end="url(#arrow)"></path>
+
+            <g>
+              <rect x="112" y="218" width="150" height="74" rx="8" fill="#eef6ff" stroke="#9db9dc"></rect>
+              <rect x="365" y="214" width="150" height="82" rx="8" fill="#f0fbf8" stroke="#9fd0c9"></rect>
+              <rect x="618" y="218" width="150" height="74" rx="8" fill="#fff6e8" stroke="#d8b170"></rect>
+              <text x="187" y="248" text-anchor="middle" font-size="14" font-weight="800" fill="#1b2430">traverser 节点</text>
+              <text x="187" y="270" text-anchor="middle" font-size="12" fill="#5d6a7c">枚举所有动作</text>
+              <text x="440" y="245" text-anchor="middle" font-size="14" font-weight="800" fill="#1b2430">对手节点</text>
+              <text x="440" y="267" text-anchor="middle" font-size="12" fill="#5d6a7c">按 sigma 采样</text>
+              <text x="693" y="248" text-anchor="middle" font-size="14" font-weight="800" fill="#1b2430">terminal</text>
+              <text x="693" y="270" text-anchor="middle" font-size="12" fill="#5d6a7c">返回 payoff</text>
+              <path d="M468 146 C468 178 187 176 187 218" stroke="#52657a" fill="none" stroke-width="2" marker-end="url(#arrow)"></path>
+              <path d="M468 146 C468 176 440 178 440 214" stroke="#52657a" fill="none" stroke-width="2" marker-end="url(#arrow)"></path>
+              <path d="M468 146 C468 178 693 176 693 218" stroke="#52657a" fill="none" stroke-width="2" marker-end="url(#arrow)"></path>
+            </g>
+          </svg>
+        </div>
+      </article>
+    </section>
+
+    <section class="two-col" aria-label="traverser 与对手节点对比">
+      <div class="node-card">
+        <h3>traverser 节点：像做选择题复盘</h3>
+        <p>轮到本次要训练的玩家时，算法不会只抽一个动作，而是把 Fold、Call、Raise 等所有合法抽象动作都试一遍。每条分支递归到底，得到每个动作的价值，再和当前混合策略的平均价值比较。</p>
+        <div class="diagram-wrap">
+          <svg viewBox="0 0 520 280" role="img" aria-label="traverser 节点全展开图">
+            <rect width="520" height="280" fill="#fbfdff"></rect>
+            <circle cx="260" cy="58" r="32" fill="#2f6fbb"></circle>
+            <text x="260" y="63" text-anchor="middle" font-size="13" font-weight="800" fill="#fff">I</text>
+            <g stroke="#52657a" stroke-width="2" marker-end="url(#arrow)">
+              <path d="M243 86 L122 178"></path>
+              <path d="M260 91 L260 178"></path>
+              <path d="M277 86 L398 178"></path>
+            </g>
+            <g>
+              <rect x="64" y="178" width="116" height="52" rx="8" fill="#eef6ff" stroke="#9db9dc"></rect>
+              <rect x="202" y="178" width="116" height="52" rx="8" fill="#eef6ff" stroke="#9db9dc"></rect>
+              <rect x="340" y="178" width="116" height="52" rx="8" fill="#eef6ff" stroke="#9db9dc"></rect>
+              <text x="122" y="209" text-anchor="middle" font-size="13" font-weight="750" fill="#1b2430">a0 -> v0</text>
+              <text x="260" y="209" text-anchor="middle" font-size="13" font-weight="750" fill="#1b2430">a1 -> v1</text>
+              <text x="398" y="209" text-anchor="middle" font-size="13" font-weight="750" fill="#1b2430">a2 -> v2</text>
+            </g>
+            <text x="260" y="252" text-anchor="middle" font-size="13" fill="#5d6a7c">所有动作都有一个 cfv，全部参与 regret 更新</text>
+          </svg>
+        </div>
+      </div>
+      <div class="node-card">
+        <h3>对手节点：像按概率抽一张路线卡</h3>
+        <p>轮到对手时，算法按对手当前策略分布采样一个动作，只沿这一条路继续。这样一次 update 的成本会低很多，但长期大量采样后，仍然能估计整棵博弈树的方向。</p>
+        <div class="diagram-wrap">
+          <svg viewBox="0 0 520 280" role="img" aria-label="对手节点采样图">
+            <rect width="520" height="280" fill="#fbfdff"></rect>
+            <circle cx="260" cy="58" r="32" fill="#168276"></circle>
+            <text x="260" y="63" text-anchor="middle" font-size="13" font-weight="800" fill="#fff">O</text>
+            <g stroke="#c4ceda" stroke-width="2">
+              <path d="M243 86 L122 178"></path>
+              <path d="M277 86 L398 178"></path>
+            </g>
+            <path d="M260 91 L260 178" stroke="#168276" stroke-width="4" marker-end="url(#arrow)"></path>
+            <g>
+              <rect x="64" y="178" width="116" height="52" rx="8" fill="#f7f9fb" stroke="#d7dee8"></rect>
+              <rect x="202" y="178" width="116" height="52" rx="8" fill="#f0fbf8" stroke="#9fd0c9"></rect>
+              <rect x="340" y="178" width="116" height="52" rx="8" fill="#f7f9fb" stroke="#d7dee8"></rect>
+              <text x="122" y="209" text-anchor="middle" font-size="13" fill="#9aa6b5">a0</text>
+              <text x="260" y="209" text-anchor="middle" font-size="13" font-weight="750" fill="#1b2430">抽中 a1</text>
+              <text x="398" y="209" text-anchor="middle" font-size="13" fill="#9aa6b5">a2</text>
+            </g>
+            <text x="260" y="252" text-anchor="middle" font-size="13" fill="#5d6a7c">只有 sampled action 继续递归，未抽中的分支本次不走</text>
+          </svg>
+        </div>
+      </div>
+    </section>
+
+    <section class="formula-row" aria-label="核心公式">
+      <div class="formula">
+        <b>当前策略</b>
+        <code>sigma(a) = max(R(a), 0) / sum(max(R, 0))；如果全非正，就均匀随机。</code>
+      </div>
+      <div class="formula">
+        <b>节点价值</b>
+        <code>sigma_value = sum_a sigma(a) * cfv(a)，表示当前混合策略的平均价值。</code>
+      </div>
+      <div class="formula">
+        <b>regret 增量</b>
+        <code>delta(a) = cfv(a) - sigma_value；更好的动作涨 regret，更差的动作降 regret。</code>
+      </div>
+    </section>
+
+    <section class="note">
+      <b>和 NLHE 适配层的关系：</b>
+      本页讲的是训练器的一次 update。落到 `SimplifiedNlheGame` 时，`info_set` 会把手牌/公共牌 bucket、位置、stack、下注状态、街道和动作金额语义签名打包；`legal_actions` 从规则层合法动作集合生成默认 5-action 抽象；`next` 再把抽象动作转成规则层动作并 apply。
+    </section>
+
+    <p class="footer">对应代码入口：<code>src/training/trainer.rs::EsMccfrTrainer::step</code>、<code>recurse_es</code>，以及 <code>src/training/nlhe.rs::SimplifiedNlheGame</code>。</p>
+  </main>
+
+  <script>
+    const steps = [
+      {
+        title: "1. 选 traverser",
+        body: "一次 update 只更新一个玩家。heads-up 下，update 0 更新玩家 0，update 1 更新玩家 1，之后继续轮流。这样每个玩家都会从自己的视角学习：哪些动作比当前混合策略更好，哪些更差。",
+        pills: ["traverser = update_count % n_players", "update_count: 0 -> 1 -> 2"]
+      },
+      {
+        title: "2. 生成 root",
+        body: "训练器向 game 要一个初始状态。NLHE 的 root 会一次性消费随机数：发双方底牌、下盲注、预生成 flop/turn/river。之后递归过程中翻牌不再暴露成单独 chance node。",
+        pills: ["root = game.root(rng)", "GameState::with_rng", "runout board 已生成"]
+      },
+      {
+        title: "3. 进入节点",
+        body: "递归函数每到一个 state，先问它是哪种节点。Terminal 直接返回 traverser 的 payoff；Chance 会采样一个结果；Player 则进入信息集、动作集合和策略计算。当前 NLHE 设计通常只有 Player 和 Terminal。",
+        pills: ["G::current(&state)", "Terminal -> payoff", "Player(actor) -> 决策"]
+      },
+      {
+        title: "4. 算 info 与 sigma",
+        body: "Player 节点会先构造 actor 的信息集，然后取当前合法抽象动作，再用 regret matching 得到当前策略 sigma。第一次见到某个信息集时 regret 为空，所以 sigma 会退化成均匀分布。",
+        pills: ["info_set(state, actor)", "legal_actions(state)", "sigma = regret_matching(R)"]
+      },
+      {
+        title: "5. traverser 节点",
+        body: "如果当前 actor 就是本次 update 的 traverser，算法会枚举每个动作。每个动作都走一次 next + recurse，得到 cfv[a]。这些 cfv 会和当前策略平均值比较，用来更新 regret。",
+        pills: ["for action in actions", "cfv[a] = recurse(next)", "delta[a] = cfv[a] - sigma_value"]
+      },
+      {
+        title: "6. 对手节点",
+        body: "如果当前 actor 是对手，external sampling 不会展开全部动作，而是按对手当前 sigma 采样一个非零概率动作，只沿这一条路径继续。这样 NLHE 这种大树才有可能训练。",
+        pills: ["nonzero_dist = actions x sigma", "sample_discrete(nonzero_dist)", "只走 sampled action"]
+      },
+      {
+        title: "7. 回填更新",
+        body: "递归值返回到 traverser 节点后，regret 表累加每个动作的 delta，strategy_sum 表累加当前策略的权重。整个递归结束后，update_count 加一，下一次换另一个玩家。",
+        pills: ["R(I,a) += delta[a]", "S(I,a) += pi_trav * sigma[a]", "update_count += 1"]
+      }
+    ];
+
+    const buttons = Array.from(document.querySelectorAll(".step-button"));
+    const heading = document.getElementById("step-heading");
+    const body = document.getElementById("step-body");
+    const pills = document.getElementById("step-pills");
+
+    function renderStep(index) {
+      const step = steps[index];
+      heading.textContent = step.title;
+      body.textContent = step.body;
+      pills.innerHTML = "";
+      for (const text of step.pills) {
+        const pill = document.createElement("span");
+        pill.className = "code-pill";
+        pill.textContent = text;
+        pills.appendChild(pill);
+      }
+      buttons.forEach((button, i) => {
+        button.classList.toggle("active", i === index);
+      });
+    }
+
+    buttons.forEach((button) => {
+      button.addEventListener("click", () => renderStep(Number(button.dataset.step)));
+    });
+  </script>
+</body>
+</html>
