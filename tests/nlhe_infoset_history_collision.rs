@@ -1,9 +1,12 @@
-//! 验证 `docs/nlhe_infoset_history_investigation.md` Step 1 假设。
+//! 验证 `docs/nlhe_infoset_history_investigation.md` 方案 A Phase 3 行为修复。
 //!
-//! 简化 NLHE 的 `InfoSetId` 不编码跨街动作历史。两条不同的 preflop 线推进到
-//! flop 同一决策点时，应当产生**同一** `InfoSetId`（collision）。本测试把这条
-//! collision 钉成 regression：当 history 字段加入 `InfoSetId` 编码后，`assert_eq`
-//! 会失败，提示测试需要翻转为 `assert_ne`。
+//! 历史背景（commit 60eacec）：旧 InfoSetId 编码不含跨街动作历史，本测试当时以
+//! `assert_eq` 钉住了 collision——SB-aggressor 与 BB-aggressor 两条 preflop 线
+//! 推进到 flop 同一决策点时返回同一 InfoSetId。
+//!
+//! Phase 3 起 InfoSetId v2 layout 把 PublicBettingTree node_id 写入高 26 bit，
+//! 抽象动作序列单射于 node_id → 两条不同 preflop 线必产出不同 InfoSetId。
+//! 断言翻转为 `assert_ne`，作为 history fix 的 regression gate。
 
 use std::sync::Arc;
 
@@ -53,7 +56,7 @@ fn assert_at_flop_bb_to_act(state: &SimplifiedNlheState) {
 }
 
 #[test]
-fn simplified_nlhe_infoset_collapses_distinct_preflop_lines() {
+fn simplified_nlhe_infoset_distinguishes_distinct_preflop_lines() {
     let game = stub_game();
     let seed = 0x4833_494E_464F_5F43_u64; // "H3INFO_C"
 
@@ -121,13 +124,25 @@ fn simplified_nlhe_infoset_collapses_distinct_preflop_lines() {
         "branches must have taken distinct preflop action sequences"
     );
 
-    // --- 核心断言：当前 `InfoSetId` 编码丢失跨街 history，两条线 collapse 到同一 key。 ---
+    // --- 核心断言：v2 InfoSetId 通过 node_id 区分跨街 aggressor 身份。 ---
     let info_a: InfoSetId = SimplifiedNlheGame::info_set(&flop_a, 1);
     let info_b: InfoSetId = SimplifiedNlheGame::info_set(&flop_b, 1);
-    assert_eq!(
+    assert_ne!(
         info_a.raw(),
         info_b.raw(),
-        "regression: SB-aggressor flop vs BB-aggressor flop currently share InfoSetId. \
-         当 InfoSetId 加入 history 编码后翻转为 assert_ne。"
+        "InfoSetId v2 must distinguish SB-aggressor flop vs BB-aggressor flop \
+         via node_id; assert_eq 翻 assert_ne 是 Phase 3 行为修复的 gate。"
+    );
+    // 同 hand_bucket 同 street_tag → 低 38 bit 应一致；差异只能来自 node_id（bits 38..64）。
+    let low_mask: u64 = (1u64 << 38) - 1;
+    assert_eq!(
+        info_a.raw() & low_mask,
+        info_b.raw() & low_mask,
+        "两条线 hand_bucket / street_tag 一致；差异应当只在 node_id 位上"
+    );
+    assert_ne!(
+        info_a.raw() >> 38,
+        info_b.raw() >> 38,
+        "node_id 必须不同，否则 tree 没做单射"
     );
 }
