@@ -113,3 +113,7 @@ path = "tools/nlhe_h3_report.rs"
 [[bin]]
 name = "leduc_es_mccfr_report"
 path = "tools/leduc_es_mccfr_report.rs"
+
+[[bin]]
+name = "nlhe_betting_tree_sizing"
+path = "tools/nlhe_betting_tree_sizing.rs"
