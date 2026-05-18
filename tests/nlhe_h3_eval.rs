@@ -54,6 +54,7 @@ fn h3_baseline_policies_only_return_legal_actions() {
         NlheBaselinePolicy::Random,
         NlheBaselinePolicy::CallStation,
         NlheBaselinePolicy::OverlyTight,
+        NlheBaselinePolicy::EquityEv,
     ];
 
     let mut checked = 0usize;

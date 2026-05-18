@@ -3,11 +3,14 @@
 //! 本模块只复用现有 [`crate::training::nlhe::SimplifiedNlheGame`] /
 //! [`crate::training::trainer::EsMccfrTrainer`] 查询面，不改变
 //! game trait、checkpoint schema 或 bucket table schema。H3 的目标是把
-//! blueprint-only 策略闭环跑通：固定 seed 可复现评测、三类基础 baseline 对战，
+//! blueprint-only 策略闭环跑通：固定 seed 可复现评测、多类基础 baseline 对战，
 //! 以及一个工程用 local best-response proxy 趋势指标。
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::abstraction::equity::{EquityCalculator, MonteCarloEquity};
 use crate::core::rng::{ChaCha20Rng, RngSource};
 use crate::core::{Card, Rank, SeatId, Street};
 use crate::error::NlheEvaluationError;
@@ -15,6 +18,8 @@ use crate::eval::{HandCategory, HandEvaluator, NaiveHandEvaluator};
 use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::nlhe::{SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet};
 use crate::training::sampling::sample_discrete;
+
+const EQUITY_EV_BASELINE_ITER: u32 = 512;
 
 /// H3 baseline policy 集合。
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
@@ -26,6 +31,8 @@ pub enum NlheBaselinePolicy {
     /// Preflop 只继续 TT+ / AK / AQ / AJs / KQs；postflop 面对下注仅 made hand
     /// one-pair+ 继续；不主动 bet/raise。
     OverlyTight,
+    /// 用手牌 + 当前公共牌估计对随机对手胜率，按正 EV 边界选择接近下注额。
+    EquityEv,
 }
 
 impl NlheBaselinePolicy {
@@ -34,6 +41,7 @@ impl NlheBaselinePolicy {
             NlheBaselinePolicy::Random => "random",
             NlheBaselinePolicy::CallStation => "call-station",
             NlheBaselinePolicy::OverlyTight => "overly-tight",
+            NlheBaselinePolicy::EquityEv => "equity-ev",
         }
     }
 
@@ -59,6 +67,7 @@ impl NlheBaselinePolicy {
             }
             NlheBaselinePolicy::CallStation => passive_action(actions, true),
             NlheBaselinePolicy::OverlyTight => tight_action(state, actions)?,
+            NlheBaselinePolicy::EquityEv => equity_ev_action(state, actions, rng)?,
         };
         debug_assert!(actions.contains(&chosen));
         Ok(chosen)
@@ -508,6 +517,83 @@ fn tight_action(
         let made = has_one_pair_or_better(state, actor)?;
         Ok(passive_action(actions, made))
     }
+}
+
+fn equity_ev_action(
+    state: &crate::training::nlhe::SimplifiedNlheState,
+    actions: &[SimplifiedNlheAction],
+    rng: &mut dyn RngSource,
+) -> Result<SimplifiedNlheAction, NlheEvaluationError> {
+    let actor = state
+        .game_state
+        .current_player()
+        .expect("equity_ev_action only called on player node");
+    let player = &state.game_state.players()[actor.0 as usize];
+    let hole = player
+        .hole_cards
+        .ok_or(NlheEvaluationError::MissingHoleCards { seat: actor })?;
+    let equity = estimate_direct_equity(hole, state.game_state.board(), rng)?;
+    let pot = state.game_state.pot().as_u64() as f64;
+
+    let mut best: Option<(SimplifiedNlheAction, u64)> = None;
+    for &action in actions {
+        let Some(risk_chips) = action_incremental_risk_chips(action, player.committed_this_round)
+        else {
+            continue;
+        };
+        if risk_chips == 0 {
+            continue;
+        }
+        let risk = risk_chips as f64;
+        let ev = equity * pot - (1.0 - equity) * risk;
+        if ev <= 0.0 {
+            continue;
+        }
+
+        // Positive EV implies risk is below the break-even boundary; the largest
+        // legal risk is therefore the closest abstract size to that boundary.
+        if best
+            .map(|(_, best_risk)| risk_chips > best_risk)
+            .unwrap_or(true)
+        {
+            best = Some((action, risk_chips));
+        }
+    }
+
+    if let Some((action, _)) = best {
+        Ok(action)
+    } else {
+        Ok(passive_action(actions, false))
+    }
+}
+
+fn estimate_direct_equity(
+    hole: [Card; 2],
+    board: &[Card],
+    rng: &mut dyn RngSource,
+) -> Result<f64, NlheEvaluationError> {
+    let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
+    let calc = MonteCarloEquity::new(evaluator)
+        .with_iter(EQUITY_EV_BASELINE_ITER)
+        .with_river_exact(true);
+    calc.equity(hole, board, rng)
+        .map_err(|e| NlheEvaluationError::InvalidConfig {
+            reason: format!("equity-ev baseline equity failed: {e}"),
+        })
+}
+
+fn action_incremental_risk_chips(
+    action: SimplifiedNlheAction,
+    committed_this_round: crate::core::ChipAmount,
+) -> Option<u64> {
+    let to = match action {
+        SimplifiedNlheAction::Fold | SimplifiedNlheAction::Check => return None,
+        SimplifiedNlheAction::Call { to }
+        | SimplifiedNlheAction::Bet { to, .. }
+        | SimplifiedNlheAction::Raise { to, .. }
+        | SimplifiedNlheAction::AllIn { to } => to,
+    };
+    Some(to.as_u64().saturating_sub(committed_this_round.as_u64()))
 }
 
 fn is_tight_preflop_continue(hole: [Card; 2]) -> bool {

@@ -147,10 +147,9 @@ fn run() -> Result<(), String> {
         .max((args.updates - start_update).saturating_div(10).max(1));
     let report_every = args.report_every.unwrap_or(default_report_every);
     let mut next_report = start_update.saturating_add(report_every);
-    let mut next_checkpoint = if args.checkpoint_every > 0 {
-        ((start_update / args.checkpoint_every) + 1) * args.checkpoint_every
-    } else {
-        u64::MAX
+    let mut next_checkpoint = match start_update.checked_div(args.checkpoint_every) {
+        Some(n) => (n + 1) * args.checkpoint_every,
+        None => u64::MAX,
     };
     let mut saved_this_run: Vec<PathBuf> = Vec::new();
 

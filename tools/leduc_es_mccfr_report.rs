@@ -206,7 +206,7 @@ fn enumerate_reachable_infosets() -> Vec<(LeducInfoSet, Vec<LeducAction>)> {
     let mut infos = HashMap::new();
     collect_infos(&root, &mut seen, &mut infos, &mut rng);
     let mut out: Vec<_> = infos.into_iter().collect();
-    out.sort_by(|a, b| info_sort_key(&a.0).cmp(&info_sort_key(&b.0)));
+    out.sort_by_key(|a| info_sort_key(&a.0));
     out
 }
 

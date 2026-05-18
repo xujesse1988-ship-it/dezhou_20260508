@@ -149,6 +149,7 @@ fn run() -> Result<(), String> {
         NlheBaselinePolicy::Random,
         NlheBaselinePolicy::CallStation,
         NlheBaselinePolicy::OverlyTight,
+        NlheBaselinePolicy::EquityEv,
     ] {
         eprintln!("[nlhe_h3_report] evaluating baseline {}", baseline.label());
         evaluations.push(

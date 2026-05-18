@@ -531,6 +531,7 @@ fn _stage3_api_signature_assertions() {
     // ===================================================================
 
     let _: fn(NlheBaselinePolicy) -> &'static str = NlheBaselinePolicy::label;
+    let _: NlheBaselinePolicy = NlheBaselinePolicy::EquityEv;
     let _: for<'a, 'b, 'c> fn(
         NlheBaselinePolicy,
         &'a SimplifiedNlheState,
