@@ -40,7 +40,7 @@ use crate::abstraction::preflop::{
     PreflopLossless169,
 };
 use crate::core::rng::RngSource;
-use crate::core::SeatId;
+use crate::core::{ChipAmount, SeatId};
 use crate::error::TrainerError;
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
@@ -71,60 +71,97 @@ fn expected_bucket_config() -> BucketConfig {
 /// fallback (D-314-rev2) 已废弃；C2 [实现] 拒绝 schema_version=1 输入。
 const EXPECTED_BUCKET_SCHEMA_VERSION: u32 = 2;
 
-/// `bucket_id` field 内 action mask shift（D-317-rev1）。
+/// NLHE action semantic signature 写入 `InfoSetId` raw bits 38..64。
 ///
-/// 简化 NLHE 走 `DefaultActionAbstraction`，stage 2 D-209 输出长度可变（Fold? /
-/// Check? / Call? / Bet|Raise@0.5? / Bet|Raise@1.0? / AllIn?）。stage 2 `InfoSetId`
-/// 仅编码 (`bucket_id`, `position_bucket`, `stack_bucket`, `betting_state`,
-/// `street_tag`)；同一 InfoSetId 可能命中不同 `legal_actions().len()`（e.g.,
-/// stack_bucket=4 的 200+ BB 范围内 cap 可能从 200 BB 到 300+ BB，导致 raise
-/// range 可达性差异），违反 D-324 "action_count 训练全程对同一 InfoSetId 恒定"。
+/// `docs/h3_500m_checkpoint_investigation.md` 指出旧 D-317-rev1 只把 6-bit
+/// availability mask 写入 `bucket_id`，无法区分 "Call 200 / Raise 400" 与
+/// "Call 300 / Raise 600" 这类同角色、不同金额语义的决策点。CFR 表按
+/// `(InfoSetId, action_index)` 累积 regret，因此 action index 的抽象语义必须是
+/// key 的一部分。
 ///
-/// **stage 3 carve-out**（D-317-rev1，2026-05-13 C2 [实现] 起步前用户授权）：把
-/// `legal_actions()` 输出的 6 位 action availability mask 写入 `bucket_id` field
-/// 的 bits 12..18。preflop hand_class < 169 < 4096 = `2^12` / postflop bucket
-/// id < 500 < `2^12`，原始 `bucket_id` 占用 bits 0..12；bits 12..18 在 stage 2
-/// 默认实现中恒为零（IA-007 reserved bits 38..64 zero 不受影响——本 carve-out
-/// 仅触及 bucket_id field 内部，不触及 stage 2 reserved 区域）。
-///
-/// 6 个 mask bit 对应 D-209 顺序：
-/// - bit 0: Fold
-/// - bit 1: Check
-/// - bit 2: Call
-/// - bit 3: Bet|Raise @ 0.5×pot ratio
-/// - bit 4: Bet|Raise @ 1.0×pot ratio
-/// - bit 5: AllIn
-const ACTION_MASK_SHIFT: u32 = 12;
+/// 本 stage-3 NLHE overlay 保留 stage-2 低 38 bit layout（bucket/position/stack/
+/// betting/street getter 继续可用），只在 `SimplifiedNlheGame::info_set` 返回值的
+/// 高 26 bit 写入私有 action signature。stage-2 `InfoAbstraction::map` 路径仍
+/// 保持 IA-007 reserved bits = 0。
+const NLHE_ACTION_SIGNATURE_SHIFT: u32 = 38;
 
-/// `bucket_id` field 内 action mask 占据 6 位（D-317-rev1）。
-const ACTION_MASK_BITS: u32 = 6;
+/// bits 38..64 共 26 bit。
+const NLHE_ACTION_SIGNATURE_BITS: u32 = 26;
 
-/// 把 [`DefaultActionAbstraction::abstract_actions`] 输出折成 6-bit availability
-/// mask（D-317-rev1）。Mask 编码对应 D-209 顺序：
+/// D-209 slots: 6-bit role mask + 4 个 5-bit 金额桶 = 26 bit。
+const ACTION_ROLE_MASK_BITS: u32 = 6;
+const ACTION_AMOUNT_BUCKET_BITS: u32 = 5;
+const CALL_BUCKET_SHIFT: u32 = ACTION_ROLE_MASK_BITS;
+const HALF_POT_BUCKET_SHIFT: u32 = CALL_BUCKET_SHIFT + ACTION_AMOUNT_BUCKET_BITS;
+const FULL_POT_BUCKET_SHIFT: u32 = HALF_POT_BUCKET_SHIFT + ACTION_AMOUNT_BUCKET_BITS;
+const ALL_IN_BUCKET_SHIFT: u32 = FULL_POT_BUCKET_SHIFT + ACTION_AMOUNT_BUCKET_BITS;
+
+/// 金额桶的上界，以 half-BB 为单位。bucket 0 是 "slot 不存在"，bucket 1..31
+/// 表示实际金额；1..20 精确覆盖 0.5BB..10BB，后段逐步变粗到 80BB+。
+const AMOUNT_BUCKET_CEIL_HALF_BB: [u64; 31] = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    24,
+    28,
+    32,
+    36,
+    40,
+    50,
+    60,
+    80,
+    120,
+    160,
+    u64::MAX,
+];
+
+/// 把 [`DefaultActionAbstraction::abstract_actions`] 输出折成 26-bit action semantic
+/// signature（H3 500M investigation 修复）。编码：
 ///
-/// - bit 0: Fold
-/// - bit 1: Check
-/// - bit 2: Call
-/// - bit 3: Bet|Raise @ `BetRatio::HALF_POT`
-/// - bit 4: Bet|Raise @ `BetRatio::FULL_POT`
-/// - bit 5: AllIn
+/// - bits 0..6: D-209 role availability mask
+/// - bits 6..11: Call `to` 金额桶
+/// - bits 11..16: Bet|Raise @ `BetRatio::HALF_POT` 的 `to` 金额桶
+/// - bits 16..21: Bet|Raise @ `BetRatio::FULL_POT` 的 `to` 金额桶
+/// - bits 21..26: AllIn `to` 金额桶
 ///
-/// **不变量**：同一 (state) 输入 → 同一 mask（pure function；继承 D-209
-/// deterministic 顺序）。两个 InfoSetId 拥有相同 mask 当且仅当
-/// `legal_actions(state).iter().map(role) == ...` 集合等价（按 D-209 normalized
-/// 顺序）。
-fn action_signature_mask(actions: &[AbstractAction]) -> u8 {
-    let mut mask = 0u8;
+/// 这不是 exact-chip public history；它是 NLHE-specific betting geometry
+/// abstraction，目标是让同一 InfoSetId 下 action index 的角色和金额桶语义一致。
+fn action_semantic_signature(state: &GameState, actions: &[AbstractAction]) -> u32 {
+    let big_blind = state.config().big_blind;
+    let mut role_mask = 0u32;
+    let mut call_bucket = 0u32;
+    let mut half_pot_bucket = 0u32;
+    let mut full_pot_bucket = 0u32;
+    let mut all_in_bucket = 0u32;
+
     for action in actions {
         let bit = match action {
             AbstractAction::Fold => 0,
             AbstractAction::Check => 1,
-            AbstractAction::Call { .. } => 2,
+            AbstractAction::Call { to } => {
+                call_bucket = u32::from(action_amount_bucket(*to, big_blind));
+                2
+            }
             AbstractAction::Bet { ratio_label, .. } | AbstractAction::Raise { ratio_label, .. } => {
                 if ratio_label.as_milli() == BetRatio::HALF_POT.as_milli() {
                     3
-                } else if ratio_label.as_milli() == BetRatio::FULL_POT.as_milli() {
-                    4
                 } else {
                     // DefaultActionAbstraction::default_5_action() only emits
                     // HALF_POT / FULL_POT ratios; any other ratio comes from
@@ -134,12 +171,43 @@ fn action_signature_mask(actions: &[AbstractAction]) -> u8 {
                     4
                 }
             }
-            AbstractAction::AllIn { .. } => 5,
+            AbstractAction::AllIn { to } => {
+                all_in_bucket = u32::from(action_amount_bucket(*to, big_blind));
+                5
+            }
         };
-        mask |= 1u8 << bit;
+        role_mask |= 1u32 << bit;
+
+        if let AbstractAction::Bet { to, ratio_label } | AbstractAction::Raise { to, ratio_label } =
+            action
+        {
+            let bucket = u32::from(action_amount_bucket(*to, big_blind));
+            if ratio_label.as_milli() == BetRatio::HALF_POT.as_milli() {
+                half_pot_bucket = bucket;
+            } else {
+                full_pot_bucket = bucket;
+            }
+        }
     }
-    debug_assert!(u32::from(mask) < (1u32 << ACTION_MASK_BITS));
-    mask
+
+    let signature = role_mask
+        | (call_bucket << CALL_BUCKET_SHIFT)
+        | (half_pot_bucket << HALF_POT_BUCKET_SHIFT)
+        | (full_pot_bucket << FULL_POT_BUCKET_SHIFT)
+        | (all_in_bucket << ALL_IN_BUCKET_SHIFT);
+    debug_assert!(signature < (1u32 << NLHE_ACTION_SIGNATURE_BITS));
+    signature
+}
+
+fn action_amount_bucket(to: ChipAmount, big_blind: ChipAmount) -> u8 {
+    let bb = big_blind.as_u64().max(1);
+    let half_bb_units = ((u128::from(to.as_u64()) * 2).div_ceil(u128::from(bb))) as u64;
+    for (idx, &ceil_units) in AMOUNT_BUCKET_CEIL_HALF_BB.iter().enumerate() {
+        if half_bb_units <= ceil_units {
+            return (idx + 1) as u8;
+        }
+    }
+    AMOUNT_BUCKET_CEIL_HALF_BB.len() as u8
 }
 
 /// 简化 NLHE Game token（API-303）。
@@ -289,21 +357,19 @@ impl Game for SimplifiedNlheGame {
             }
         };
 
-        // D-317-rev1：把 legal_actions() 的 6-bit action availability mask 写入
-        // `bucket_id` field 的 bits 12..18 让 D-324 action_count 对同一 InfoSetId
-        // 恒定（base_bucket < 2^12 字面适配 preflop 169 + postflop 500 范围）。
         let abs = DefaultActionAbstraction::default_5_action();
         let action_set = abs.abstract_actions(&state.game_state);
-        let action_mask = action_signature_mask(action_set.as_slice());
-        debug_assert!(base_bucket < (1u32 << ACTION_MASK_SHIFT));
-        let bucket_id_with_mask = base_bucket | (u32::from(action_mask) << ACTION_MASK_SHIFT);
-
-        pack_info_set_id(
-            bucket_id_with_mask,
+        let base_info = pack_info_set_id(
+            base_bucket,
             position_bucket,
             stack_bucket,
             betting_state,
             street_tag,
+        );
+        let action_signature = action_semantic_signature(&state.game_state, action_set.as_slice());
+        debug_assert!(action_signature < (1u32 << NLHE_ACTION_SIGNATURE_BITS));
+        InfoSetId::from_raw_internal(
+            base_info.raw() | (u64::from(action_signature) << NLHE_ACTION_SIGNATURE_SHIFT),
         )
     }
 
