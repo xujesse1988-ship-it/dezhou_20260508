@@ -915,7 +915,10 @@ fn checkpoint_error_5_variants_exhaustive_match_lock() {
 #[test]
 fn d350_header_constants_lock() {
     assert_eq!(MAGIC, *b"PLCKPT\0\0", "D-350 magic 字面字节序列锁");
-    assert_eq!(SCHEMA_VERSION, 1, "D-350 SCHEMA_VERSION 起步值 = 1");
+    assert_eq!(
+        SCHEMA_VERSION, 2,
+        "Phase 3 方案 A 后 SCHEMA_VERSION = 2（NLHE InfoSetId v2 layout 不向后兼容）"
+    );
 }
 
 #[test]
