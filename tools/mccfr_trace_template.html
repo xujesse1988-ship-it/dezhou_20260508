@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>MCCFR 一次 update trace · Leduc</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; background: #f7f8fa; color: #1f2328; }
+  header { padding: 10px 16px; background: #0d1117; color: #c9d1d9; display: flex; flex-wrap: wrap; gap: 18px; align-items: baseline; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .meta { font-size: 12px; color: #8b949e; }
+  header .meta b { color: #c9d1d9; font-weight: 600; }
+  .tabs { display: flex; gap: 0; background: #fff; border-bottom: 1px solid #d0d7de; }
+  .tab { padding: 9px 18px; cursor: pointer; font-size: 13px; border-bottom: 2px solid transparent; color: #57606a; }
+  .tab.active { color: #0969da; border-bottom-color: #0969da; font-weight: 600; }
+  .view { display: none; height: calc(100vh - 44px - 36px); }
+  .view.active { display: flex; }
+  /* tree view */
+  .tree-wrap { flex: 1 1 auto; display: flex; flex-direction: column; border-right: 1px solid #d0d7de; min-width: 0; }
+  .toolbar { padding: 7px 12px; background: #fff; border-bottom: 1px solid #d0d7de; display: flex; gap: 8px; align-items: center; font-size: 12px; }
+  .toolbar button { font-size: 12px; padding: 4px 9px; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 4px; cursor: pointer; color: #24292f; }
+  .toolbar button:hover { background: #eaeef2; }
+  .toolbar button:disabled { color: #8c959f; cursor: not-allowed; background: #f6f8fa; }
+  .toolbar .spacer { flex: 1 1 auto; }
+  .toolbar .step-counter { color: #57606a; }
+  .toolbar label { display: inline-flex; gap: 4px; align-items: center; }
+  .tree-svg-wrap { flex: 1 1 auto; overflow: auto; background: #fff; }
+  svg.tree { display: block; }
+  .node circle { stroke: #1f2328; stroke-width: 1.2; cursor: pointer; transition: r 0.1s, stroke-width 0.1s; }
+  .node circle:hover { stroke-width: 2.2; }
+  .node.kind-chance circle { fill: #c9d1d9; }
+  .node.kind-traverser circle { fill: #54aeff; }
+  .node.kind-opponent circle { fill: #ffa657; }
+  .node.kind-terminal-pos circle { fill: #56d364; }
+  .node.kind-terminal-neg circle { fill: #f85149; }
+  .node.kind-terminal-zero circle { fill: #d0d7de; }
+  .node.cursor circle { stroke: #d4af37; stroke-width: 3.4; }
+  .node.selected circle { stroke: #6f42c1; stroke-width: 3; }
+  .node.dimmed { opacity: 0.18; }
+  .node text { font-size: 9.5px; pointer-events: none; user-select: none; fill: #1f2328; }
+  .node text.label-secondary { fill: #57606a; font-size: 8.5px; }
+  .link { fill: none; stroke: #8c959f; stroke-width: 1.0; }
+  .link.dimmed { opacity: 0.12; }
+  .link.cursor-path { stroke: #d4af37; stroke-width: 2.2; }
+  /* details panel */
+  .details { width: 440px; flex: 0 0 440px; padding: 12px 14px; background: #fff; overflow-y: auto; font-size: 12.5px; }
+  .details h2 { font-size: 13px; margin: 0 0 8px; color: #1f2328; }
+  .details .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; margin-right: 6px; font-weight: 500; }
+  .badge.chance { background: #e7ecf3; color: #24292f; }
+  .badge.traverser { background: #ddf4ff; color: #0969da; }
+  .badge.opponent { background: #ffe8d0; color: #9a6700; }
+  .badge.terminal { background: #ecffe8; color: #1f7a1f; }
+  .kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 12px; margin: 6px 0 10px; }
+  .kv .k { color: #57606a; }
+  .kv .v { color: #1f2328; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .section { margin: 12px 0 8px; padding-top: 10px; border-top: 1px dashed #d0d7de; }
+  .section h3 { font-size: 12px; margin: 0 0 6px; color: #57606a; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+  table.actions { width: 100%; border-collapse: collapse; font-size: 11.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  table.actions th, table.actions td { padding: 3px 6px; text-align: right; border-bottom: 1px solid #eaeef2; }
+  table.actions th { font-weight: 600; color: #57606a; background: #f6f8fa; }
+  table.actions td:first-child, table.actions th:first-child { text-align: left; color: #24292f; }
+  table.actions tr.sampled { background: #fff8c5; }
+  td .bar { display: inline-block; height: 7px; background: #54aeff; border-radius: 1px; vertical-align: middle; margin-right: 4px; }
+  td .bar.neg { background: #f85149; }
+  td .delta-pos { color: #1a7f37; }
+  td .delta-neg { color: #b1413f; }
+  /* infoset view */
+  .infoset-list { width: 360px; flex: 0 0 360px; border-right: 1px solid #d0d7de; overflow-y: auto; background: #fff; }
+  .infoset-list .item { padding: 8px 12px; border-bottom: 1px solid #eaeef2; cursor: pointer; font-size: 12px; }
+  .infoset-list .item:hover { background: #f6f8fa; }
+  .infoset-list .item.selected { background: #ddf4ff; border-left: 3px solid #0969da; padding-left: 9px; }
+  .infoset-list .item .summary { color: #57606a; font-size: 10.5px; margin-top: 2px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .infoset-detail { flex: 1 1 auto; padding: 14px 18px; overflow-y: auto; background: #fff; }
+  .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .compare-grid .col h4 { margin: 0 0 6px; font-size: 12px; color: #24292f; }
+  .legend { display: flex; gap: 10px; font-size: 11px; color: #57606a; align-items: center; }
+  .legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 1px solid #444; margin-right: 3px; vertical-align: middle; }
+  .empty { color: #8c959f; font-style: italic; padding: 30px 18px; text-align: center; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MCCFR 一次 update · DFS trace</h1>
+  <div class="meta">
+    game=<b id="m-game"></b> · seed=<b id="m-seed"></b> · warmup=<b id="m-warmup"></b> ·
+    update#=<b id="m-update"></b> · traverser=<b id="m-traverser"></b> ·
+    nodes=<b id="m-nodes"></b> · infosets=<b id="m-infosets"></b>
+  </div>
+</header>
+<div class="tabs">
+  <div class="tab active" data-tab="tree">递归树（DFS 步进）</div>
+  <div class="tab" data-tab="infosets">信息集 before/after 快照</div>
+</div>
+
+<div class="view active" id="view-tree">
+  <div class="tree-wrap">
+    <div class="toolbar">
+      <button id="btn-reset">⟲ Reset</button>
+      <button id="btn-prev">◀</button>
+      <button id="btn-play">▶ Play</button>
+      <button id="btn-next">▶</button>
+      <button id="btn-end">⏭ All</button>
+      <span class="step-counter" id="step-counter">step 0 / 0</span>
+      <label><input type="checkbox" id="cb-dim" checked> 仅高亮已访问</label>
+      <span class="spacer"></span>
+      <span class="legend">
+        <span><span class="dot" style="background:#c9d1d9"></span>chance</span>
+        <span><span class="dot" style="background:#54aeff"></span>traverser</span>
+        <span><span class="dot" style="background:#ffa657"></span>opponent</span>
+        <span><span class="dot" style="background:#56d364"></span>terminal +</span>
+        <span><span class="dot" style="background:#f85149"></span>terminal −</span>
+      </span>
+    </div>
+    <div class="tree-svg-wrap" id="tree-svg-wrap"></div>
+  </div>
+  <div class="details" id="details">
+    <div class="empty">点击树上节点查看详情，或用工具栏 ◀ / ▶ 按 DFS 顺序步进。</div>
+  </div>
+</div>
+
+<div class="view" id="view-infosets">
+  <div class="infoset-list" id="infoset-list"></div>
+  <div class="infoset-detail" id="infoset-detail">
+    <div class="empty">从左侧选一个信息集查看 before/after 对比。</div>
+  </div>
+</div>
+
+<script>
+const TRACE = __TRACE_DATA__;
+
+// ---------- metadata header ----------
+(function fillMeta() {
+  const m = TRACE.metadata;
+  document.getElementById('m-game').textContent = m.game;
+  document.getElementById('m-seed').textContent = m.seed_hex;
+  document.getElementById('m-warmup').textContent = m.warmup_updates;
+  document.getElementById('m-update').textContent = m.update_index;
+  document.getElementById('m-traverser').textContent = 'P' + m.traverser;
+  document.getElementById('m-nodes').textContent = m.n_nodes;
+  document.getElementById('m-infosets').textContent = m.n_infosets_touched;
+})();
+
+// ---------- tab switching ----------
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.getElementById('view-' + t.dataset.tab).classList.add('active');
+  });
+});
+
+// ---------- tree layout (top-down, allocate by leaf count) ----------
+const NODES = TRACE.nodes;
+const N = NODES.length;
+const NODE_BY_ID = new Map();
+NODES.forEach(n => NODE_BY_ID.set(n.id, n));
+const ROOT = NODES.find(n => n.parent_id === null);
+
+// post-order leaf count
+function postOrder(root) {
+  const order = [];
+  const stack = [[root, false]];
+  while (stack.length) {
+    const [n, visited] = stack.pop();
+    if (visited) { order.push(n); continue; }
+    stack.push([n, true]);
+    for (const cid of n.children_ids) stack.push([NODE_BY_ID.get(cid), false]);
+  }
+  return order;
+}
+const leafCount = new Map();
+for (const n of postOrder(ROOT)) {
+  if (n.children_ids.length === 0) leafCount.set(n.id, 1);
+  else {
+    let s = 0;
+    for (const c of n.children_ids) s += leafCount.get(c);
+    leafCount.set(n.id, s);
+  }
+}
+
+const DX = 36;   // horizontal per leaf
+const DY = 64;   // vertical per depth level
+const PADX = 30;
+const PADY = 30;
+
+const pos = new Map();
+function assignPos(n, leftLeaf, depth) {
+  const lc = leafCount.get(n.id);
+  const center = leftLeaf + lc / 2;
+  pos.set(n.id, { x: PADX + center * DX, y: PADY + depth * DY });
+  let off = leftLeaf;
+  for (const cid of n.children_ids) {
+    const child = NODE_BY_ID.get(cid);
+    assignPos(child, off, depth + 1);
+    off += leafCount.get(cid);
+  }
+}
+assignPos(ROOT, 0, 0);
+
+const totalLeaves = leafCount.get(ROOT.id);
+const maxDepth = Math.max(...NODES.map(n => n.depth));
+const svgWidth = PADX * 2 + totalLeaves * DX;
+const svgHeight = PADY * 2 + maxDepth * DY + 20;
+
+// ---------- node kind classification ----------
+function nodeKindClass(n) {
+  if (n.record.kind === 'Chance') return 'kind-chance';
+  if (n.record.kind === 'Terminal') {
+    const p = n.record.payoff_traverser;
+    if (p > 0.0001) return 'kind-terminal-pos';
+    if (p < -0.0001) return 'kind-terminal-neg';
+    return 'kind-terminal-zero';
+  }
+  return n.record.is_traverser ? 'kind-traverser' : 'kind-opponent';
+}
+
+function nodeShortLabel(n) {
+  if (n.record.kind === 'Terminal') {
+    const p = n.record.payoff_traverser;
+    return (p >= 0 ? '+' : '') + p.toFixed(2);
+  }
+  if (n.record.kind === 'Chance') {
+    return n.record.sampled_action.replace(/^Deal\(|\)$/g, '');
+  }
+  return 'P' + n.record.actor + ' ' + (n.record.is_traverser ? '*' : '');
+}
+
+function nodeEdgeLabel(parentNode, childNode) {
+  // What action took us from parent → child? For chance: sampled deal. For
+  // traverser: index in actions[]. For opponent: sampled action.
+  if (parentNode.record.kind === 'Chance') return parentNode.record.sampled_action;
+  if (parentNode.record.kind === 'Decision') {
+    if (parentNode.record.is_traverser) {
+      const idx = parentNode.children_ids.indexOf(childNode.id);
+      return parentNode.record.actions[idx] || '';
+    } else {
+      return parentNode.record.sampled_action || '';
+    }
+  }
+  return '';
+}
+
+// ---------- SVG render ----------
+const wrap = document.getElementById('tree-svg-wrap');
+const svgNS = 'http://www.w3.org/2000/svg';
+const svg = document.createElementNS(svgNS, 'svg');
+svg.classList.add('tree');
+svg.setAttribute('width', svgWidth);
+svg.setAttribute('height', svgHeight);
+wrap.appendChild(svg);
+
+// links
+const linkLayer = document.createElementNS(svgNS, 'g');
+svg.appendChild(linkLayer);
+const nodeLayer = document.createElementNS(svgNS, 'g');
+svg.appendChild(nodeLayer);
+
+const linkElems = new Map(); // child_id → path elem
+const nodeElems = new Map();
+
+for (const n of NODES) {
+  if (n.parent_id === null) continue;
+  const p = pos.get(n.parent_id);
+  const c = pos.get(n.id);
+  const path = document.createElementNS(svgNS, 'path');
+  // cubic bezier
+  const midY = (p.y + c.y) / 2;
+  path.setAttribute('d', `M ${p.x} ${p.y} C ${p.x} ${midY}, ${c.x} ${midY}, ${c.x} ${c.y}`);
+  path.classList.add('link');
+  linkLayer.appendChild(path);
+  linkElems.set(n.id, path);
+
+  // edge action label (midpoint)
+  const parent = NODE_BY_ID.get(n.parent_id);
+  const lbl = nodeEdgeLabel(parent, n);
+  if (lbl) {
+    const txt = document.createElementNS(svgNS, 'text');
+    txt.classList.add('label-secondary');
+    txt.setAttribute('x', (p.x + c.x) / 2 + 4);
+    txt.setAttribute('y', midY);
+    txt.setAttribute('text-anchor', 'start');
+    txt.textContent = lbl;
+    linkLayer.appendChild(txt);
+  }
+}
+
+for (const n of NODES) {
+  const { x, y } = pos.get(n.id);
+  const g = document.createElementNS(svgNS, 'g');
+  g.classList.add('node', nodeKindClass(n));
+  g.setAttribute('transform', `translate(${x},${y})`);
+
+  const circle = document.createElementNS(svgNS, 'circle');
+  circle.setAttribute('r', n.record.kind === 'Terminal' ? 7 : 9);
+  g.appendChild(circle);
+
+  const label = document.createElementNS(svgNS, 'text');
+  label.setAttribute('text-anchor', 'middle');
+  label.setAttribute('y', -14);
+  label.textContent = nodeShortLabel(n);
+  g.appendChild(label);
+
+  // id below
+  const idLabel = document.createElementNS(svgNS, 'text');
+  idLabel.classList.add('label-secondary');
+  idLabel.setAttribute('text-anchor', 'middle');
+  idLabel.setAttribute('y', 22);
+  idLabel.textContent = '#' + n.id;
+  g.appendChild(idLabel);
+
+  g.addEventListener('click', () => { selectNode(n.id, /*moveCursor=*/ true); });
+
+  nodeLayer.appendChild(g);
+  nodeElems.set(n.id, g);
+}
+
+// ---------- DFS step cursor ----------
+let cursor = -1;          // -1 means nothing visited yet; max = N-1
+let selectedId = null;
+let playTimer = null;
+const cbDim = document.getElementById('cb-dim');
+const stepCounter = document.getElementById('step-counter');
+
+function ancestorChain(id) {
+  const out = [];
+  let cur = NODE_BY_ID.get(id);
+  while (cur) {
+    out.push(cur.id);
+    if (cur.parent_id === null) break;
+    cur = NODE_BY_ID.get(cur.parent_id);
+  }
+  return out;
+}
+
+function applyHighlights() {
+  const visitedSet = new Set();
+  for (let i = 0; i <= cursor; i++) visitedSet.add(i);
+
+  // cursor highlight = node at id == cursor
+  const cursorPath = cursor >= 0 ? new Set(ancestorChain(cursor)) : new Set();
+
+  for (const n of NODES) {
+    const g = nodeElems.get(n.id);
+    g.classList.toggle('cursor', n.id === cursor);
+    g.classList.toggle('selected', n.id === selectedId && n.id !== cursor);
+    if (cbDim.checked) {
+      g.classList.toggle('dimmed', !visitedSet.has(n.id));
+    } else {
+      g.classList.remove('dimmed');
+    }
+  }
+  for (const n of NODES) {
+    if (n.parent_id === null) continue;
+    const link = linkElems.get(n.id);
+    link.classList.toggle('cursor-path', cursorPath.has(n.id) && cursorPath.has(n.parent_id));
+    if (cbDim.checked) {
+      link.classList.toggle('dimmed', !visitedSet.has(n.id));
+    } else {
+      link.classList.remove('dimmed');
+    }
+  }
+  stepCounter.textContent = `step ${cursor + 1} / ${N}`;
+}
+
+cbDim.addEventListener('change', applyHighlights);
+
+function selectNode(id, moveCursor) {
+  selectedId = id;
+  if (moveCursor) cursor = id;       // ids are assigned in DFS pre-order
+  renderDetails(NODE_BY_ID.get(id));
+  applyHighlights();
+  // scroll into view
+  const g = nodeElems.get(id);
+  if (g) {
+    const cx = pos.get(id).x, cy = pos.get(id).y;
+    const wrap = document.getElementById('tree-svg-wrap');
+    const targetLeft = cx - wrap.clientWidth / 2;
+    const targetTop = cy - wrap.clientHeight / 2;
+    wrap.scrollTo({ left: Math.max(0, targetLeft), top: Math.max(0, targetTop), behavior: 'smooth' });
+  }
+}
+
+document.getElementById('btn-reset').addEventListener('click', () => {
+  stopPlay();
+  cursor = -1; selectedId = null;
+  document.getElementById('details').innerHTML =
+    '<div class="empty">已 reset。点击节点查看详情，或用 ◀ / ▶ 按 DFS 顺序步进。</div>';
+  applyHighlights();
+});
+document.getElementById('btn-prev').addEventListener('click', () => {
+  stopPlay();
+  if (cursor > 0) { cursor--; selectNode(cursor, false); }
+});
+document.getElementById('btn-next').addEventListener('click', () => {
+  stopPlay();
+  if (cursor < N - 1) { cursor++; selectNode(cursor, false); }
+});
+document.getElementById('btn-end').addEventListener('click', () => {
+  stopPlay();
+  cursor = N - 1; selectNode(cursor, false);
+});
+function stopPlay() {
+  if (playTimer) { clearInterval(playTimer); playTimer = null; document.getElementById('btn-play').textContent = '▶ Play'; }
+}
+document.getElementById('btn-play').addEventListener('click', () => {
+  if (playTimer) { stopPlay(); return; }
+  document.getElementById('btn-play').textContent = '⏸ Pause';
+  playTimer = setInterval(() => {
+    if (cursor < N - 1) { cursor++; selectNode(cursor, false); }
+    else { stopPlay(); }
+  }, 320);
+});
+
+// ---------- details rendering ----------
+function fmt(x, d=4) {
+  if (x === null || x === undefined || !isFinite(x)) return String(x);
+  if (Math.abs(x) < 1e-12) return '0';
+  return x.toFixed(d);
+}
+function fmtPct(x) { return (x * 100).toFixed(2) + '%'; }
+function deltaStr(a, b) {
+  const d = b - a;
+  if (Math.abs(d) < 1e-12) return '·';
+  const sign = d > 0 ? '+' : '';
+  return `<span class="${d > 0 ? 'delta-pos' : 'delta-neg'}">${sign}${fmt(d, 4)}</span>`;
+}
+function barFor(p, maxAbs) {
+  const w = Math.max(0, Math.min(60, Math.round(60 * Math.abs(p) / (maxAbs || 1))));
+  return `<span class="bar${p < 0 ? ' neg' : ''}" style="width:${w}px"></span>`;
+}
+
+function renderDetails(n) {
+  const root = document.getElementById('details');
+  const r = n.record;
+  let html = '';
+
+  if (r.kind === 'Chance') {
+    html += `<h2><span class="badge chance">Chance #${n.id}</span> ${escapeHtml(r.deal_target)}</h2>`;
+    html += stateBlock(n);
+    html += '<div class="section"><h3>chance distribution</h3>';
+    html += '<table class="actions"><tr><th>outcome</th><th>prob</th></tr>';
+    r.distribution.forEach((d, i) => {
+      const sampled = i === r.sampled_index;
+      html += `<tr class="${sampled ? 'sampled' : ''}"><td>${escapeHtml(d.action)}${sampled ? ' ★' : ''}</td><td>${fmtPct(d.prob)}</td></tr>`;
+    });
+    html += '</table>';
+    html += `<div style="margin-top:6px;font-size:11.5px;color:#57606a">采样命中 <b>${escapeHtml(r.sampled_action)}</b>（ES-MCCFR D-308：chance sample-1，reach 由"采样到该节点"的概率隐式承担）</div>`;
+    html += '</div>';
+  } else if (r.kind === 'Terminal') {
+    const cls = r.payoff_traverser > 0 ? 'delta-pos' : (r.payoff_traverser < 0 ? 'delta-neg' : '');
+    html += `<h2><span class="badge terminal">Terminal #${n.id}</span></h2>`;
+    html += stateBlock(n);
+    html += `<div class="section"><h3>payoff（traverser 视角）</h3>`;
+    html += `<div class="kv"><span class="k">payoff(P${TRACE.metadata.traverser})</span><span class="v ${cls}">${r.payoff_traverser >= 0 ? '+' : ''}${fmt(r.payoff_traverser, 4)} chips</span>`;
+    html += `<span class="k">committed</span><span class="v">P0=${r.committed[0]}, P1=${r.committed[1]}</span></div></div>`;
+  } else {
+    // Decision
+    const badgeClass = r.is_traverser ? 'traverser' : 'opponent';
+    const tag = r.is_traverser ? `Traverser P${r.actor}` : `Opponent P${r.actor}`;
+    html += `<h2><span class="badge ${badgeClass}">${tag} #${n.id}</span></h2>`;
+    html += `<div class="kv"><span class="k">InfoSet</span><span class="v">${escapeHtml(r.info_set_label)}</span>`;
+    html += `<span class="k">π<sub>traverser</sub></span><span class="v">${fmt(r.pi_trav, 6)}</span></div>`;
+    html += stateBlock(n);
+
+    // strategy / regret table
+    const nA = r.actions.length;
+    const maxRegret = Math.max(1e-9, ...r.regret_at_visit.map(Math.abs));
+    html += '<div class="section"><h3>σ (regret-matched current strategy)</h3>';
+    html += '<table class="actions"><tr><th>action</th><th>regret(visit)</th><th>σ</th>';
+    if (r.is_traverser) {
+      html += '<th>cfv</th><th>regret_Δ</th><th>regret(after)</th>';
+    } else {
+      html += '<th></th>';
+    }
+    html += '</tr>';
+    for (let i = 0; i < nA; i++) {
+      const isSampled = !r.is_traverser && i === r.sampled_index;
+      const row = [];
+      row.push(`<td>${escapeHtml(r.actions[i])}${isSampled ? ' ★' : ''}</td>`);
+      row.push(`<td>${barFor(r.regret_at_visit[i], maxRegret)}${fmt(r.regret_at_visit[i], 3)}</td>`);
+      row.push(`<td><span class="bar" style="width:${Math.round(60 * r.sigma[i])}px"></span>${fmtPct(r.sigma[i])}</td>`);
+      if (r.is_traverser && r.cfvs) {
+        row.push(`<td>${fmt(r.cfvs[i], 3)}</td>`);
+        const d = r.regret_delta[i];
+        row.push(`<td class="${d > 1e-9 ? 'delta-pos' : (d < -1e-9 ? 'delta-neg' : '')}">${d >= 0 ? '+' : ''}${fmt(d, 3)}</td>`);
+        row.push(`<td>${fmt(r.regret_after_node[i], 3)}</td>`);
+      } else {
+        row.push('<td></td>');
+      }
+      html += `<tr class="${isSampled ? 'sampled' : ''}">${row.join('')}</tr>`;
+    }
+    html += '</table>';
+    if (r.is_traverser && r.sigma_value !== undefined) {
+      html += `<div style="margin-top:6px;font-size:11.5px;color:#57606a">σ-value = Σ σ(a)·cfv(a) = <b>${fmt(r.sigma_value, 4)}</b> ← 节点返回值 / regret_Δ(a) = cfv(a) − σ-value</div>`;
+    } else if (!r.is_traverser) {
+      html += `<div style="margin-top:6px;font-size:11.5px;color:#57606a">External sampling：按 σ 采样 1 action <b>${escapeHtml(r.sampled_action)}</b>，opponent 不更新 regret / strategy_sum</div>`;
+    }
+    html += '</div>';
+
+    if (r.is_traverser && r.weighted_strategy_added) {
+      html += '<div class="section"><h3>strategy_sum update（traverser 自身 reach 加权）</h3>';
+      html += '<table class="actions"><tr><th>action</th><th>+ π·σ</th><th>S(after node)</th></tr>';
+      for (let i = 0; i < nA; i++) {
+        html += `<tr><td>${escapeHtml(r.actions[i])}</td><td>+${fmt(r.weighted_strategy_added[i], 5)}</td><td>${fmt(r.strategy_sum_after_node[i], 4)}</td></tr>`;
+      }
+      html += '</table></div>';
+    }
+  }
+
+  root.innerHTML = html;
+}
+
+function stateBlock(n) {
+  const s = n.state_summary;
+  const cardsStr = (s.cards[0] || '?') + ' / ' + (s.cards[1] || '?');
+  let html = '<div class="kv">';
+  html += `<span class="k">street</span><span class="v">${escapeHtml(s.street)}</span>`;
+  html += `<span class="k">private cards</span><span class="v">${escapeHtml(cardsStr)} (P0 / P1)</span>`;
+  html += `<span class="k">public board</span><span class="v">${escapeHtml(s.public_card || '—')}</span>`;
+  if (s.preflop_history.length) html += `<span class="k">preflop hist</span><span class="v">[${s.preflop_history.map(escapeHtml).join(', ')}]</span>`;
+  html += `<span class="k">this-street hist</span><span class="v">[${s.history.map(escapeHtml).join(', ')}]</span>`;
+  html += `<span class="k">committed</span><span class="v">P0=${s.committed[0]}, P1=${s.committed[1]}</span>`;
+  html += '</div>';
+  return html;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+applyHighlights();
+
+// ---------- infoset view ----------
+const SNAPS = TRACE.infoset_snapshots;
+const list = document.getElementById('infoset-list');
+let snapSelected = -1;
+SNAPS.forEach((s, i) => {
+  const item = document.createElement('div');
+  item.className = 'item';
+  item.dataset.idx = i;
+  item.innerHTML = `<div><b>${escapeHtml(s.label)}</b></div><div class="summary">${escapeHtml(s.key)}</div>`;
+  item.addEventListener('click', () => selectSnap(i));
+  list.appendChild(item);
+});
+if (SNAPS.length === 0) {
+  list.innerHTML = '<div class="empty">本次 update 未触达任何 traverser/opponent decision node（仅 chance + terminal）</div>';
+}
+
+function selectSnap(i) {
+  snapSelected = i;
+  document.querySelectorAll('#infoset-list .item').forEach(it => it.classList.toggle('selected', +it.dataset.idx === i));
+  renderSnap(SNAPS[i]);
+}
+function renderSnap(s) {
+  const root = document.getElementById('infoset-detail');
+  let html = `<h2>${escapeHtml(s.label)}</h2>`;
+  html += `<div style="font-size:11px;color:#57606a;font-family:ui-monospace,monospace;word-break:break-all;margin-bottom:14px">${escapeHtml(s.key)}</div>`;
+
+  html += '<div class="section"><h3>regret</h3>';
+  html += snapTable(s.actions, s.regret_before, s.regret_after, 4);
+  html += '</div>';
+  html += '<div class="section"><h3>σ (regret-matched current strategy)</h3>';
+  html += snapTable(s.actions, s.sigma_before, s.sigma_after, 4, true);
+  html += '</div>';
+  html += '<div class="section"><h3>strategy_sum</h3>';
+  html += snapTable(s.actions, s.strategy_sum_before, s.strategy_sum_after, 4);
+  html += '</div>';
+  html += '<div class="section"><h3>average strategy（S 归一化）</h3>';
+  html += snapTable(s.actions, s.average_strategy_before, s.average_strategy_after, 4, true);
+  html += '</div>';
+  root.innerHTML = html;
+}
+function snapTable(actions, before, after, dec, isProb) {
+  let html = '<table class="actions"><tr><th>action</th><th>before</th><th>after</th><th>Δ</th></tr>';
+  const maxAbs = Math.max(1e-9, ...before.map(Math.abs), ...after.map(Math.abs));
+  for (let i = 0; i < actions.length; i++) {
+    const b = before[i], a = after[i], d = a - b;
+    const bf = isProb ? fmtPct(b) : fmt(b, dec);
+    const af = isProb ? fmtPct(a) : fmt(a, dec);
+    html += `<tr><td>${escapeHtml(actions[i])}</td><td>${barFor(b, maxAbs)}${bf}</td><td>${barFor(a, maxAbs)}${af}</td><td>${deltaStr(b, a)}</td></tr>`;
+  }
+  html += '</table>';
+  return html;
+}
+if (SNAPS.length > 0) selectSnap(0);
+</script>
+</body>
+</html>
