@@ -45,6 +45,7 @@ use crate::error::TrainerError;
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::{Game, NodeKind, PlayerId};
+use crate::training::nlhe_betting_tree::{AbstractActionTag, Child, NodeId, PublicBettingTree};
 
 /// 简化 NLHE action 桥接（API-303 / D-318）。
 ///
@@ -218,6 +219,10 @@ fn action_amount_bucket(to: ChipAmount, big_blind: ChipAmount) -> u8 {
 pub struct SimplifiedNlheGame {
     pub(crate) bucket_table: Arc<BucketTable>,
     pub(crate) config: TableConfig,
+    /// 抽象 betting tree，构造时一次性建好（Phase 1 节点数实测 48,224）。
+    /// State 沿 `tree.node(current_node_id).children` 跳转；Phase 3 起 `info_set`
+    /// 用 `current_node_id` 作为下注历史维度，根除跨街 collision。
+    pub(crate) tree: Arc<PublicBettingTree>,
 }
 
 impl SimplifiedNlheGame {
@@ -250,9 +255,12 @@ impl SimplifiedNlheGame {
                 got: 0,
             });
         }
+        let config = TableConfig::default_hu_100bb();
+        let tree = Arc::new(PublicBettingTree::build(&config));
         Ok(Self {
             bucket_table,
-            config: TableConfig::default_hu_100bb(),
+            config,
+            tree,
         })
     }
 }
@@ -270,6 +278,12 @@ pub struct SimplifiedNlheState {
     pub game_state: GameState,
     pub action_history: Vec<SimplifiedNlheAction>,
     pub(crate) bucket_table: Arc<BucketTable>,
+    /// 当前节点在 `tree` 中的 id（Phase 2 起）。`root` 时初始化为 `tree.root_id()`；
+    /// `next` 沿 `tree.node(current_node_id).children[action_idx]` 跳转。
+    /// Terminal 状态下保留进入 Terminal 前最后一个决策节点 id（CFR 不会再读取，
+    /// 仅用于调试 / 测试 path-to-root 还原）。
+    pub current_node_id: NodeId,
+    pub(crate) tree: Arc<PublicBettingTree>,
 }
 
 impl std::fmt::Debug for SimplifiedNlheState {
@@ -280,7 +294,9 @@ impl std::fmt::Debug for SimplifiedNlheState {
         f.debug_struct("SimplifiedNlheState")
             .field("game_state", &self.game_state)
             .field("action_history", &self.action_history)
+            .field("current_node_id", &self.current_node_id)
             .field("bucket_table", &"<Arc<BucketTable>>")
+            .field("tree", &"<Arc<PublicBettingTree>>")
             .finish()
     }
 }
@@ -312,6 +328,8 @@ impl Game for SimplifiedNlheGame {
             game_state,
             action_history: Vec::new(),
             bucket_table: Arc::clone(&self.bucket_table),
+            current_node_id: self.tree.root_id(),
+            tree: Arc::clone(&self.tree),
         }
     }
 
@@ -392,11 +410,48 @@ impl Game for SimplifiedNlheGame {
         // 在构造时已区分），转 stage 1 `Action` 后 apply。
         let concrete = action.to_concrete();
         let mut next_state = state;
+
+        // Phase 2: 沿 tree 跳转 current_node_id。先按 AbstractActionTag 在当前节点
+        // legal_actions 里定位 edge index，再从 children[idx] 取下一个 NodeId。
+        // 必须在 apply 之前查表——apply 之后 game_state.current_player 可能切人
+        // 或进 Terminal，而 tree lookup 用的是动作本身的 tag，不依赖 chip 值。
+        let tag = AbstractActionTag::of(&action);
+        let edge_idx = {
+            let node = next_state.tree.node(next_state.current_node_id);
+            node.legal_actions.iter().position(|t| *t == tag).expect(
+                "Phase 2 invariant: action tag must appear in current node legal_actions; \
+                     mismatch indicates CFR走了 tree 外动作 or tree builder 漏 edge",
+            )
+        };
+        let child = next_state.tree.node(next_state.current_node_id).children[edge_idx];
+
         next_state
             .game_state
             .apply(concrete)
             .expect("SimplifiedNlhe next: AbstractAction → Action apply must be legal");
         next_state.action_history.push(action);
+
+        // Tree 跳转后 invariant 自检：tree 标的 Terminal/Decision 必须跟 game_state
+        // 实际 terminality 一致；不一致说明 builder 漏 case 或 game_state apply 行为
+        // 跟 builder 期望不符。
+        match child {
+            Child::Decision(next_id) => {
+                debug_assert!(
+                    !next_state.game_state.is_terminal(),
+                    "Phase 2 invariant: tree says Decision(id={next_id}) but game_state is Terminal"
+                );
+                next_state.current_node_id = next_id;
+            }
+            Child::Terminal => {
+                debug_assert!(
+                    next_state.game_state.is_terminal(),
+                    "Phase 2 invariant: tree says Terminal but game_state is not"
+                );
+                // current_node_id 保留 Terminal 前最后一个 decision id（已不再被
+                // info_set/recurse 读到；CFR 检测到 Terminal 后走 payoff 路径）。
+            }
+        }
+
         // 不消费 `_rng`（API-300 invariant：decision node `next` pure transition）。
         // stage 1 GameState 的 board 切换走 `deal_board_to` 从 `runout_board`
         // 取出已发的卡（在 root 时一次性消费 rng 发牌），不依赖 rng。
