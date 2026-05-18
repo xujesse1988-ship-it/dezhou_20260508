@@ -145,6 +145,31 @@ impl SimplifiedNlheGame {
             tree,
         })
     }
+
+    /// 公开 `PublicBettingTree` 引用，供诊断工具（如 `nlhe_preflop_strategy_dump`）
+    /// 在不构造完整 `SimplifiedNlheState` 的情况下走树定位特定 spot 的 node_id。
+    pub fn tree(&self) -> &PublicBettingTree {
+        &self.tree
+    }
+
+    /// 直接为指定的 preflop `node_id` × `hole` 构造 `InfoSetId`（绕过 `Game::info_set`
+    /// 对 `SimplifiedNlheState` 的依赖）。仅 preflop 路径——postflop hand bucket 依赖
+    /// `state.game_state.board()`，那条路径走完整 `info_set`。
+    pub fn preflop_info_set_for_hand(
+        &self,
+        node_id: NodeId,
+        hole: [crate::core::Card; 2],
+    ) -> InfoSetId {
+        let node = self.tree.node(node_id);
+        debug_assert_eq!(
+            node.street,
+            StreetTag::Preflop,
+            "preflop_info_set_for_hand 只支持 Preflop 节点；node {node_id} street = {:?}",
+            node.street
+        );
+        let hand_bucket = u32::from(PreflopLossless169::new().hand_class(hole));
+        pack_info_set_v2(hand_bucket, node_id, StreetTag::Preflop)
+    }
 }
 
 /// 简化 NLHE 完整状态（API-303）。

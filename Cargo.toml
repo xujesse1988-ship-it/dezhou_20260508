@@ -119,6 +119,10 @@ name = "nlhe_betting_tree_sizing"
 path = "tools/nlhe_betting_tree_sizing.rs"
 
 [[bin]]
+name = "nlhe_preflop_strategy_dump"
+path = "tools/nlhe_preflop_strategy_dump.rs"
+
+[[bin]]
 name = "mccfr_trace"
 path = "tools/mccfr_trace.rs"
 
