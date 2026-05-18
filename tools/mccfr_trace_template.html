@@ -528,15 +528,15 @@ function renderDetails(n) {
 }
 
 function stateBlock(n) {
-  const s = n.state_summary;
-  const cardsStr = (s.cards[0] || '?') + ' / ' + (s.cards[1] || '?');
+  // state_summary 是 game-agnostic 的 { fields: [{k, v}] }；Rust 工具自己决定
+  // 字段名和值的格式化（避免在 JS 里写 Leduc / NLHE 分支）。
+  const fields = (n.state_summary && n.state_summary.fields) || [];
+  if (fields.length === 0) return '';
   let html = '<div class="kv">';
-  html += `<span class="k">street</span><span class="v">${escapeHtml(s.street)}</span>`;
-  html += `<span class="k">private cards</span><span class="v">${escapeHtml(cardsStr)} (P0 / P1)</span>`;
-  html += `<span class="k">public board</span><span class="v">${escapeHtml(s.public_card || '—')}</span>`;
-  if (s.preflop_history.length) html += `<span class="k">preflop hist</span><span class="v">[${s.preflop_history.map(escapeHtml).join(', ')}]</span>`;
-  html += `<span class="k">this-street hist</span><span class="v">[${s.history.map(escapeHtml).join(', ')}]</span>`;
-  html += `<span class="k">committed</span><span class="v">P0=${s.committed[0]}, P1=${s.committed[1]}</span>`;
+  for (const f of fields) {
+    if (f.v === null || f.v === undefined || f.v === '') continue;
+    html += `<span class="k">${escapeHtml(f.k)}</span><span class="v">${escapeHtml(String(f.v))}</span>`;
+  }
   html += '</div>';
   return html;
 }

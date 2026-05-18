@@ -121,3 +121,7 @@ path = "tools/nlhe_betting_tree_sizing.rs"
 [[bin]]
 name = "mccfr_trace"
 path = "tools/mccfr_trace.rs"
+
+[[bin]]
+name = "nlhe_trace"
+path = "tools/nlhe_trace.rs"

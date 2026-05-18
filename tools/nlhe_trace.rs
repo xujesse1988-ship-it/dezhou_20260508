@@ -1,42 +1,43 @@
-//! 一次 ES-MCCFR update 的 trace 可视化工具（Leduc）。
+//! 一次 ES-MCCFR update 的 trace 可视化工具（简化 NLHE / heads-up 100BB）。
 //!
 //! 跑法：
 //! ```
-//! cargo run --release --bin mccfr_trace -- \
-//!     --warmup 200 --seed 0x4c454455435f5452 \
-//!     --output artifacts/mccfr_trace.html
+//! cargo run --release --bin nlhe_trace -- \
+//!     --bucket-table artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin \
+//!     --warmup 20 --seed 0x4e4c48455f545241 \
+//!     --output artifacts/nlhe_trace.html
 //! ```
 //!
-//! 输出一个自包含的 HTML 文件，内嵌：
-//! - DFS 递归树（chance / traverser-decision / opponent-decision / terminal）
-//! - 每个 traverser 决策点的 sigma / cfvs / regret_delta / regret(before/after)
-//!   / strategy_sum(before/after)
-//! - 每个 opponent 决策点的 sigma / sampled action
-//! - 触达 InfoSet 的 before/after snapshot（regret / current_strategy / strategy_sum
-//!   / average_strategy）
+//! 输出与 Leduc 版同型的自包含 HTML（共用 `mccfr_trace_template.html`）；NLHE 没有
+//! 独立 chance node（D-308 / D-315：所有 randomness 在 `GameState::with_rng` 时
+//! 一次性消费），因此树里只有 Decision / Terminal 两种节点。
 //!
-//! 注意：本工具自带 `RegretTable + StrategyAccumulator`，warmup 复用与
-//! `src/training/trainer.rs::recurse_es` 同型的本地 `step_es` 实现，traced step 由
-//! `recurse_traced` 在同一份表上直接 mutate。算法路径（采样、regret/strategy_sum
-//! 累积顺序）与 trainer 内部完全一致；本工具不消费 `EsMccfrTrainer`（其内部字段
-//! `pub(crate)`，binary crate 无法触达）。
+//! warmup 默认值偏小（20）—— 单次 NLHE update 比 Leduc 重；如果想看到 regret /
+//! sigma 上明显的非均匀分布，可以加大到 100-500。bucket table 加载 ~528 MiB / 1-2 s。
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
+use poker::abstraction::action::{AbstractAction, BetRatio};
+use poker::abstraction::info::{InfoSetId, StreetTag};
+use poker::core::{Card, Rank, Suit};
 use poker::training::game::{Game, NodeKind, PlayerId};
-use poker::training::leduc::{LeducAction, LeducGame, LeducInfoSet, LeducState, LeducStreet};
+use poker::training::nlhe::{
+    SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
+};
 use poker::training::{RegretTable, StrategyAccumulator};
-use poker::{ChaCha20Rng, RngSource};
+use poker::{BucketTable, ChaCha20Rng, RngSource};
 
-const DEFAULT_WARMUP: u64 = 200;
-const DEFAULT_SEED: u64 = 0x4c45_4455_435f_5452; // "LEDUC_TR"
+const DEFAULT_WARMUP: u64 = 20;
+const DEFAULT_SEED: u64 = 0x4e4c_4845_5f54_5241; // "NLHE_TRA"
 
 struct Args {
     warmup: u64,
     seed: u64,
+    bucket_table: PathBuf,
     output: PathBuf,
 }
 
@@ -44,9 +45,10 @@ fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("[mccfr_trace] argument error: {e}");
+            eprintln!("[nlhe_trace] argument error: {e}");
             eprintln!(
-                "usage: cargo run --release --bin mccfr_trace -- \
+                "usage: cargo run --release --bin nlhe_trace -- \
+                 --bucket-table PATH \
                  [--warmup N] [--seed N] [--output PATH]"
             );
             return ExitCode::from(2);
@@ -55,7 +57,7 @@ fn main() -> ExitCode {
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("[mccfr_trace] failed: {e}");
+            eprintln!("[nlhe_trace] failed: {e}");
             ExitCode::from(1)
         }
     }
@@ -64,17 +66,22 @@ fn main() -> ExitCode {
 fn parse_args() -> Result<Args, String> {
     let mut warmup = DEFAULT_WARMUP;
     let mut seed = DEFAULT_SEED;
-    let mut output = PathBuf::from("artifacts/mccfr_trace.html");
+    let mut bucket_table = PathBuf::new();
+    let mut output = PathBuf::from("artifacts/nlhe_trace.html");
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--warmup" => warmup = parse_u64(&it.next().ok_or("--warmup need value")?)?,
             "--seed" => seed = parse_u64(&it.next().ok_or("--seed need value")?)?,
+            "--bucket-table" => {
+                bucket_table = PathBuf::from(it.next().ok_or("--bucket-table need value")?)
+            }
             "--output" => output = PathBuf::from(it.next().ok_or("--output need value")?),
             "-h" | "--help" => {
                 println!(
-                    "usage: cargo run --release --bin mccfr_trace -- \
+                    "usage: cargo run --release --bin nlhe_trace -- \
+                     --bucket-table PATH \
                      [--warmup N] [--seed N] [--output PATH]"
                 );
                 std::process::exit(0);
@@ -82,9 +89,13 @@ fn parse_args() -> Result<Args, String> {
             x => return Err(format!("unknown arg: {x}")),
         }
     }
+    if bucket_table.as_os_str().is_empty() {
+        return Err("--bucket-table is required".into());
+    }
     Ok(Args {
         warmup,
         seed,
+        bucket_table,
         output,
     })
 }
@@ -99,49 +110,45 @@ fn parse_u64(s: &str) -> Result<u64, String> {
 }
 
 // ===========================================================================
-// 与 src/training/trainer.rs::recurse_es 同型的本地 step_es（不带 trace）
+// 镜像 src/training/trainer.rs::recurse_es（NLHE 路径无 Chance 分支）
 // ===========================================================================
 
 fn step_es(
     update_count: u64,
     n_players: u64,
-    regret: &mut RegretTable<LeducInfoSet>,
-    strategy_sum: &mut StrategyAccumulator<LeducInfoSet>,
+    game: &SimplifiedNlheGame,
+    regret: &mut RegretTable<SimplifiedNlheInfoSet>,
+    strategy_sum: &mut StrategyAccumulator<SimplifiedNlheInfoSet>,
     rng: &mut dyn RngSource,
 ) {
     let traverser = (update_count % n_players) as PlayerId;
-    let root = LeducGame.root(rng);
+    let root = game.root(rng);
     recurse_es(root, traverser, 1.0, regret, strategy_sum, rng);
 }
 
 fn recurse_es(
-    state: LeducState,
+    state: SimplifiedNlheState,
     traverser: PlayerId,
     pi_trav: f64,
-    regret: &mut RegretTable<LeducInfoSet>,
-    strategy_sum: &mut StrategyAccumulator<LeducInfoSet>,
+    regret: &mut RegretTable<SimplifiedNlheInfoSet>,
+    strategy_sum: &mut StrategyAccumulator<SimplifiedNlheInfoSet>,
     rng: &mut dyn RngSource,
 ) -> f64 {
-    match LeducGame::current(&state) {
-        NodeKind::Terminal => LeducGame::payoff(&state, traverser),
-        NodeKind::Chance => {
-            let dist = LeducGame::chance_distribution(&state);
-            let action = sample_discrete(&dist, rng);
-            let next_state = LeducGame::next(state, action, rng);
-            recurse_es(next_state, traverser, pi_trav, regret, strategy_sum, rng)
-        }
+    match SimplifiedNlheGame::current(&state) {
+        NodeKind::Terminal => SimplifiedNlheGame::payoff(&state, traverser),
+        NodeKind::Chance => unreachable!("simplified NLHE has no in-game chance nodes"),
         NodeKind::Player(actor) => {
-            let info = LeducGame::info_set(&state, actor);
-            let actions = LeducGame::legal_actions(&state);
+            let info = SimplifiedNlheGame::info_set(&state, actor);
+            let actions = SimplifiedNlheGame::legal_actions(&state);
             let n = actions.len();
-            regret.get_or_init(info.clone(), n);
+            regret.get_or_init(info, n);
             let sigma = regret.current_strategy(&info, n);
             if actor == traverser {
                 let weighted: Vec<f64> = sigma.iter().map(|s| pi_trav * s).collect();
-                strategy_sum.accumulate(info.clone(), &weighted);
+                strategy_sum.accumulate(info, &weighted);
                 let mut cfvs: Vec<f64> = Vec::with_capacity(n);
                 for (i, action) in actions.iter().enumerate() {
-                    let next_state = LeducGame::next(state.clone(), *action, rng);
+                    let next_state = SimplifiedNlheGame::next(state.clone(), *action, rng);
                     let cfv = recurse_es(
                         next_state,
                         traverser,
@@ -157,14 +164,14 @@ fn recurse_es(
                 regret.accumulate(info, &delta);
                 sigma_value
             } else {
-                let nonzero: Vec<(LeducAction, f64)> = actions
+                let nonzero: Vec<(SimplifiedNlheAction, f64)> = actions
                     .iter()
                     .copied()
                     .zip(sigma.iter().copied())
                     .filter(|(_, p)| *p > 0.0)
                     .collect();
                 let sampled = sample_discrete(&nonzero, rng);
-                let next_state = LeducGame::next(state, sampled, rng);
+                let next_state = SimplifiedNlheGame::next(state, sampled, rng);
                 recurse_es(next_state, traverser, pi_trav, regret, strategy_sum, rng)
             }
         }
@@ -189,24 +196,16 @@ fn sample_discrete<A: Copy>(dist: &[(A, f64)], rng: &mut dyn RngSource) -> A {
 // ===========================================================================
 
 #[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)] // one-off trace tool；总节点 < 100，Box 化无收益
+#[allow(clippy::large_enum_variant)]
 enum NodeRecord {
-    Chance {
-        deal_target: String,
-        distribution: Vec<(String, f64)>,
-        sampled_action: String,
-        sampled_index: usize,
-    },
     Decision {
         actor: u8,
         is_traverser: bool,
         info_set_label: String,
         info_set_key: String,
-        private_card_rank: u8,
-        public_card_rank: Option<u8>,
+        bucket_id: u32,
+        node_id_in_tree: u32,
         street: String,
-        preflop_history: Vec<String>,
-        history: Vec<String>,
         actions: Vec<String>,
         pi_trav: f64,
         sigma: Vec<f64>,
@@ -236,8 +235,6 @@ struct TraceNode {
     children_ids: Vec<usize>,
 }
 
-/// 通用 state 摘要：`fields = [(k, v)]`，HTML 模板按出现顺序渲染。Leduc / NLHE
-/// 各自决定字段集合与格式化，避免 JS 侧分支。
 #[derive(Debug, Clone)]
 struct StateSummary {
     fields: Vec<(String, String)>,
@@ -245,8 +242,16 @@ struct StateSummary {
 
 struct Collector {
     nodes: Vec<TraceNode>,
-    visited_order: Vec<LeducInfoSet>,
-    visited_seen: HashSet<String>,
+    visited_order: Vec<TouchedInfo>,
+    visited_seen: HashSet<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct TouchedInfo {
+    info: SimplifiedNlheInfoSet,
+    label: String,
+    actions: Vec<String>,
+    n_actions: usize,
 }
 
 impl Collector {
@@ -257,148 +262,179 @@ impl Collector {
             visited_seen: HashSet::new(),
         }
     }
-    fn note_infoset(&mut self, info: &LeducInfoSet) {
-        let key = format!("{info:?}");
-        if self.visited_seen.insert(key) {
-            self.visited_order.push(info.clone());
+    fn note_infoset(&mut self, info: SimplifiedNlheInfoSet, touched: TouchedInfo) {
+        if self.visited_seen.insert(info.raw()) {
+            self.visited_order.push(touched);
         }
     }
 }
 
 // ===========================================================================
-// 标签 helpers
+// Labels / formatting
 // ===========================================================================
 
-fn card_label(c: u8) -> String {
-    let rank = match c / 2 {
-        0 => "J",
-        1 => "Q",
-        2 => "K",
-        _ => "?",
-    };
-    let suit = if c % 2 == 0 { "s" } else { "h" };
-    format!("{rank}{suit}")
-}
-
-fn rank_label(r: u8) -> &'static str {
+fn rank_char(r: Rank) -> char {
     match r {
-        11 => "J",
-        12 => "Q",
-        13 => "K",
-        _ => "?",
+        Rank::Two => '2',
+        Rank::Three => '3',
+        Rank::Four => '4',
+        Rank::Five => '5',
+        Rank::Six => '6',
+        Rank::Seven => '7',
+        Rank::Eight => '8',
+        Rank::Nine => '9',
+        Rank::Ten => 'T',
+        Rank::Jack => 'J',
+        Rank::Queen => 'Q',
+        Rank::King => 'K',
+        Rank::Ace => 'A',
     }
 }
-
-fn action_label(a: LeducAction) -> String {
-    match a {
-        LeducAction::Check => "Check",
-        LeducAction::Bet => "Bet",
-        LeducAction::Call => "Call",
-        LeducAction::Fold => "Fold",
-        LeducAction::Raise => "Raise",
-        LeducAction::Deal0 => "Deal(Js)",
-        LeducAction::Deal1 => "Deal(Jh)",
-        LeducAction::Deal2 => "Deal(Qs)",
-        LeducAction::Deal3 => "Deal(Qh)",
-        LeducAction::Deal4 => "Deal(Ks)",
-        LeducAction::Deal5 => "Deal(Kh)",
-    }
-    .to_string()
-}
-
-fn street_label(s: LeducStreet) -> &'static str {
+fn suit_char(s: Suit) -> char {
     match s {
-        LeducStreet::Preflop => "Preflop",
-        LeducStreet::Postflop => "Postflop",
+        Suit::Clubs => 'c',
+        Suit::Diamonds => 'd',
+        Suit::Hearts => 'h',
+        Suit::Spades => 's',
+    }
+}
+fn card_label(c: Card) -> String {
+    format!("{}{}", rank_char(c.rank()), suit_char(c.suit()))
+}
+fn cards_label(cards: &[Card]) -> String {
+    cards
+        .iter()
+        .map(|c| card_label(*c))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn hole_label(h: Option<[Card; 2]>) -> String {
+    match h {
+        Some([a, b]) => format!("{}{}", card_label(a), card_label(b)),
+        None => "—".into(),
     }
 }
 
-fn state_summary(state: &LeducState) -> StateSummary {
-    let card_str = |c: u8| {
-        if c == 0xFF {
-            "—".to_string()
-        } else {
-            card_label(c)
+/// chips（1 chip = 1/100 BB）→ "N (= X.YY BB)" 字符串。
+fn chip_str(chips: u64) -> String {
+    let bb = chips as f64 / 100.0;
+    format!("{} ({} BB)", chips, format_bb(bb))
+}
+fn format_bb(bb: f64) -> String {
+    if bb == bb.round() {
+        format!("{:.0}", bb)
+    } else {
+        format!("{:.2}", bb)
+    }
+}
+
+fn ratio_label(r: BetRatio) -> String {
+    let m = r.as_milli();
+    if m == 500 {
+        "½p".into()
+    } else if m == 1000 {
+        "1p".into()
+    } else {
+        format!("{:.3}p", m as f64 / 1000.0)
+    }
+}
+
+fn action_label(a: AbstractAction) -> String {
+    match a {
+        AbstractAction::Fold => "Fold".into(),
+        AbstractAction::Check => "Check".into(),
+        AbstractAction::Call { to } => format!("Call→{}", to.as_u64()),
+        AbstractAction::Bet { to, ratio_label: r } => {
+            format!("Bet {}→{}", ratio_label(r), to.as_u64())
         }
-    };
-    let mut fields = vec![
-        ("street".to_string(), street_label(state.street).to_string()),
-        (
-            "private cards".to_string(),
-            format!(
-                "P0={} / P1={}",
-                card_str(state.cards[0]),
-                card_str(state.cards[1])
-            ),
-        ),
-        (
-            "public board".to_string(),
-            state
-                .public_card
-                .map(card_label)
-                .unwrap_or_else(|| "—".to_string()),
-        ),
-    ];
-    if !state.preflop_history.is_empty() {
-        let pre: Vec<String> = state
-            .preflop_history
-            .iter()
-            .copied()
-            .map(action_label)
-            .collect();
-        fields.push(("preflop hist".to_string(), format!("[{}]", pre.join(", "))));
+        AbstractAction::Raise { to, ratio_label: r } => {
+            format!("Raise {}→{}", ratio_label(r), to.as_u64())
+        }
+        AbstractAction::AllIn { to } => format!("AllIn→{}", to.as_u64()),
     }
-    let cur: Vec<String> = state.history.iter().copied().map(action_label).collect();
-    fields.push((
-        "this-street hist".to_string(),
-        format!("[{}]", cur.join(", ")),
-    ));
-    fields.push((
-        "committed".to_string(),
-        format!("P0={}, P1={}", state.committed[0], state.committed[1]),
-    ));
-    StateSummary { fields }
 }
 
-fn info_set_label(info: &LeducInfoSet) -> String {
-    let pub_s = info
-        .public_card
-        .map(|r| rank_label(r).to_string())
-        .unwrap_or_else(|| "?".into());
-    let prv = rank_label(info.private_card);
-    let preflop = info
-        .preflop_history
-        .iter()
-        .copied()
-        .map(action_label)
-        .collect::<Vec<_>>()
-        .join(",");
-    let history = info
-        .history
-        .iter()
-        .copied()
-        .map(action_label)
-        .collect::<Vec<_>>()
-        .join(",");
+fn street_label(s: poker::core::Street) -> &'static str {
+    use poker::core::Street;
+    match s {
+        Street::Preflop => "Preflop",
+        Street::Flop => "Flop",
+        Street::Turn => "Turn",
+        Street::River => "River",
+        Street::Showdown => "Showdown",
+    }
+}
+
+fn street_from_tag(t: StreetTag) -> &'static str {
+    match t {
+        StreetTag::Preflop => "Preflop",
+        StreetTag::Flop => "Flop",
+        StreetTag::Turn => "Turn",
+        StreetTag::River => "River",
+    }
+}
+
+fn info_set_label(info: SimplifiedNlheInfoSet, street_tag: StreetTag, node_id_tree: u32) -> String {
+    let bucket = info.bucket_id();
+    let bucket_tag = match street_tag {
+        StreetTag::Preflop => format!("hand_class169={}", bucket),
+        _ => format!("cluster={}", bucket),
+    };
     format!(
-        "P{} | {} | board={} | {} | pre=[{}] | this=[{}]",
-        info.actor,
-        prv,
-        pub_s,
-        street_label(info.street),
-        preflop,
-        history
+        "{} | {} | tree_node={}",
+        street_from_tag(street_tag),
+        bucket_tag,
+        node_id_tree
     )
 }
 
-fn deal_target_label(state: &LeducState) -> String {
-    if state.cards[0] == 0xFF {
-        "deal private card → P0".into()
-    } else if state.cards[1] == 0xFF {
-        "deal private card → P1".into()
-    } else {
-        "deal public board card".into()
+fn state_summary(state: &SimplifiedNlheState) -> StateSummary {
+    let gs = &state.game_state;
+    let players = gs.players();
+    let p0_hole = players.first().and_then(|p| p.hole_cards);
+    let p1_hole = players.get(1).and_then(|p| p.hole_cards);
+    let board = gs.board();
+    let mut fields: Vec<(String, String)> = Vec::new();
+
+    fields.push(("street".into(), street_label(gs.street()).into()));
+    fields.push((
+        "P0 hole".into(),
+        hole_label(p0_hole)
+            + &format!(
+                "  stack={}  committed={}",
+                players[0].stack.as_u64(),
+                players[0].committed_total.as_u64()
+            ),
+    ));
+    fields.push((
+        "P1 hole".into(),
+        hole_label(p1_hole)
+            + &format!(
+                "  stack={}  committed={}",
+                players[1].stack.as_u64(),
+                players[1].committed_total.as_u64()
+            ),
+    ));
+    fields.push((
+        "board".into(),
+        if board.is_empty() {
+            "—".into()
+        } else {
+            cards_label(board)
+        },
+    ));
+    fields.push(("pot".into(), chip_str(gs.pot().as_u64())));
+
+    let hist: Vec<String> = state
+        .action_history
+        .iter()
+        .copied()
+        .map(action_label)
+        .collect();
+    if !hist.is_empty() {
+        fields.push(("abs action hist".into(), format!("[{}]", hist.join(", "))));
     }
+    StateSummary { fields }
 }
 
 // ===========================================================================
@@ -407,11 +443,11 @@ fn deal_target_label(state: &LeducState) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn recurse_traced(
-    state: LeducState,
+    state: SimplifiedNlheState,
     traverser: PlayerId,
     pi_trav: f64,
-    regret: &mut RegretTable<LeducInfoSet>,
-    strategy_sum: &mut StrategyAccumulator<LeducInfoSet>,
+    regret: &mut RegretTable<SimplifiedNlheInfoSet>,
+    strategy_sum: &mut StrategyAccumulator<SimplifiedNlheInfoSet>,
     rng: &mut dyn RngSource,
     parent_id: Option<usize>,
     depth: usize,
@@ -419,9 +455,14 @@ fn recurse_traced(
 ) -> f64 {
     let summary = state_summary(&state);
 
-    match LeducGame::current(&state) {
+    match SimplifiedNlheGame::current(&state) {
+        NodeKind::Chance => unreachable!("simplified NLHE has no in-game chance nodes"),
         NodeKind::Terminal => {
-            let payoff = LeducGame::payoff(&state, traverser);
+            let payoff = SimplifiedNlheGame::payoff(&state, traverser);
+            let committed = [
+                state.game_state.players()[0].committed_total.as_u64() as u32,
+                state.game_state.players()[1].committed_total.as_u64() as u32,
+            ];
             let id = collector.nodes.len();
             collector.nodes.push(TraceNode {
                 id,
@@ -430,7 +471,7 @@ fn recurse_traced(
                 state_summary: summary,
                 record: NodeRecord::Terminal {
                     payoff_traverser: payoff,
-                    committed: state.committed,
+                    committed,
                 },
                 children_ids: vec![],
             });
@@ -439,59 +480,25 @@ fn recurse_traced(
             }
             payoff
         }
-        NodeKind::Chance => {
-            let dist = LeducGame::chance_distribution(&state);
-            // 必须与 sample_discrete 路径同消费 1 次 rng（保持算法等价）
-            let raw = rng.next_u64();
-            let u = (raw >> 11) as f64 / ((1u64 << 53) as f64);
-            let mut cum = 0.0;
-            let mut chosen_idx = dist.len() - 1;
-            for (i, (_, p)) in dist.iter().enumerate().take(dist.len() - 1) {
-                cum += p;
-                if u < cum {
-                    chosen_idx = i;
-                    break;
-                }
-            }
-            let chosen_action = dist[chosen_idx].0;
-
-            let id = collector.nodes.len();
-            collector.nodes.push(TraceNode {
-                id,
-                parent_id,
-                depth,
-                state_summary: summary,
-                record: NodeRecord::Chance {
-                    deal_target: deal_target_label(&state),
-                    distribution: dist.iter().map(|(a, p)| (action_label(*a), *p)).collect(),
-                    sampled_action: action_label(chosen_action),
-                    sampled_index: chosen_idx,
-                },
-                children_ids: vec![],
-            });
-            if let Some(pid) = parent_id {
-                collector.nodes[pid].children_ids.push(id);
-            }
-
-            let next_state = LeducGame::next(state, chosen_action, rng);
-            recurse_traced(
-                next_state,
-                traverser,
-                pi_trav,
-                regret,
-                strategy_sum,
-                rng,
-                Some(id),
-                depth + 1,
-                collector,
-            )
-        }
         NodeKind::Player(actor) => {
-            let info = LeducGame::info_set(&state, actor);
-            collector.note_infoset(&info);
-            let actions = LeducGame::legal_actions(&state);
+            let info = SimplifiedNlheGame::info_set(&state, actor);
+            let actions = SimplifiedNlheGame::legal_actions(&state);
             let n = actions.len();
-            regret.get_or_init(info.clone(), n);
+            let node_id_tree: u32 = ((info.raw() >> 38) & ((1u64 << 26) - 1)) as u32;
+            let street_tag = info.street_tag();
+            let label = info_set_label(info, street_tag, node_id_tree);
+            let action_labels: Vec<String> = actions.iter().copied().map(action_label).collect();
+            collector.note_infoset(
+                info,
+                TouchedInfo {
+                    info,
+                    label: label.clone(),
+                    actions: action_labels.clone(),
+                    n_actions: n,
+                },
+            );
+
+            regret.get_or_init(info, n);
             let regret_at_visit = regret
                 .inner()
                 .get(&info)
@@ -505,19 +512,12 @@ fn recurse_traced(
             let record = NodeRecord::Decision {
                 actor,
                 is_traverser,
-                info_set_label: info_set_label(&info),
-                info_set_key: format!("{info:?}"),
-                private_card_rank: info.private_card,
-                public_card_rank: info.public_card,
-                street: street_label(info.street).into(),
-                preflop_history: info
-                    .preflop_history
-                    .iter()
-                    .copied()
-                    .map(action_label)
-                    .collect(),
-                history: info.history.iter().copied().map(action_label).collect(),
-                actions: actions.iter().copied().map(action_label).collect(),
+                info_set_label: label,
+                info_set_key: format!("0x{:016x}", info.raw()),
+                bucket_id: info.bucket_id(),
+                node_id_in_tree: node_id_tree,
+                street: street_from_tag(street_tag).into(),
+                actions: action_labels,
                 pi_trav,
                 sigma: sigma.clone(),
                 regret_at_visit,
@@ -544,7 +544,7 @@ fn recurse_traced(
 
             if is_traverser {
                 let weighted: Vec<f64> = sigma.iter().map(|s| pi_trav * s).collect();
-                strategy_sum.accumulate(info.clone(), &weighted);
+                strategy_sum.accumulate(info, &weighted);
                 let strategy_sum_after_node = strategy_sum
                     .inner()
                     .get(&info)
@@ -553,7 +553,7 @@ fn recurse_traced(
 
                 let mut cfvs: Vec<f64> = Vec::with_capacity(n);
                 for (i, action) in actions.iter().enumerate() {
-                    let next_state = LeducGame::next(state.clone(), *action, rng);
+                    let next_state = SimplifiedNlheGame::next(state.clone(), *action, rng);
                     let cfv = recurse_traced(
                         next_state,
                         traverser,
@@ -569,7 +569,7 @@ fn recurse_traced(
                 }
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
                 let delta: Vec<f64> = cfvs.iter().map(|c| c - sigma_value).collect();
-                regret.accumulate(info.clone(), &delta);
+                regret.accumulate(info, &delta);
                 let regret_after_node = regret
                     .inner()
                     .get(&info)
@@ -595,13 +595,12 @@ fn recurse_traced(
                 }
                 sigma_value
             } else {
-                let nonzero: Vec<(LeducAction, f64)> = actions
+                let nonzero: Vec<(SimplifiedNlheAction, f64)> = actions
                     .iter()
                     .copied()
                     .zip(sigma.iter().copied())
                     .filter(|(_, p)| *p > 0.0)
                     .collect();
-                // 与 sample_discrete 同消费 1 次 rng
                 let raw = rng.next_u64();
                 let u = (raw >> 11) as f64 / ((1u64 << 53) as f64);
                 let mut cum = 0.0;
@@ -626,7 +625,7 @@ fn recurse_traced(
                     *si = Some(sampled_orig_idx);
                 }
 
-                let next_state = LeducGame::next(state, sampled, rng);
+                let next_state = SimplifiedNlheGame::next(state, sampled, rng);
                 recurse_traced(
                     next_state,
                     traverser,
@@ -644,7 +643,7 @@ fn recurse_traced(
 }
 
 // ===========================================================================
-// 手写 JSON encoding（避开给 InfoSet 引入 Serialize 实现的依赖）
+// JSON encoding（手写，与 mccfr_trace.rs 同型）
 // ===========================================================================
 
 fn esc(s: &str) -> String {
@@ -700,35 +699,14 @@ fn state_summary_json(s: &StateSummary) -> String {
 
 fn record_json(r: &NodeRecord) -> String {
     match r {
-        NodeRecord::Chance {
-            deal_target,
-            distribution,
-            sampled_action,
-            sampled_index,
-        } => {
-            let dist = distribution
-                .iter()
-                .map(|(a, p)| format!("{{\"action\":{},\"prob\":{}}}", esc(a), f64_json(*p)))
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "{{\"kind\":\"Chance\",\"deal_target\":{},\"distribution\":[{}],\"sampled_action\":{},\"sampled_index\":{}}}",
-                esc(deal_target),
-                dist,
-                esc(sampled_action),
-                sampled_index,
-            )
-        }
         NodeRecord::Decision {
             actor,
             is_traverser,
             info_set_label,
             info_set_key,
-            private_card_rank,
-            public_card_rank,
+            bucket_id,
+            node_id_in_tree,
             street,
-            preflop_history,
-            history,
             actions,
             pi_trav,
             sigma,
@@ -748,16 +726,9 @@ fn record_json(r: &NodeRecord) -> String {
                 format!("\"is_traverser\":{}", is_traverser),
                 format!("\"info_set_label\":{}", esc(info_set_label)),
                 format!("\"info_set_key\":{}", esc(info_set_key)),
-                format!("\"private_card_rank\":{}", private_card_rank),
-                format!(
-                    "\"public_card_rank\":{}",
-                    public_card_rank
-                        .map(|r| r.to_string())
-                        .unwrap_or_else(|| "null".to_string())
-                ),
+                format!("\"bucket_id\":{}", bucket_id),
+                format!("\"node_id_in_tree\":{}", node_id_in_tree),
                 format!("\"street\":{}", esc(street)),
-                format!("\"preflop_history\":{}", vec_str_json(preflop_history)),
-                format!("\"history\":{}", vec_str_json(history)),
                 format!("\"actions\":{}", vec_str_json(actions)),
                 format!("\"pi_trav\":{}", f64_json(*pi_trav)),
                 format!("\"sigma\":{}", vec_f64_json(sigma)),
@@ -825,9 +796,7 @@ fn node_json(n: &TraceNode) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn snapshot_json(
-    info: &LeducInfoSet,
-    n: usize,
-    actions: &[LeducAction],
+    touched: &TouchedInfo,
     regret_before: &[f64],
     regret_after: &[f64],
     sigma_before: &[f64],
@@ -837,15 +806,13 @@ fn snapshot_json(
     avg_before: &[f64],
     avg_after: &[f64],
 ) -> String {
-    let label = info_set_label(info);
-    let key = format!("{info:?}");
-    let actions_str: Vec<String> = actions.iter().copied().map(action_label).collect();
+    let key = format!("0x{:016x}", touched.info.raw());
     format!(
         "{{\"label\":{},\"key\":{},\"n_actions\":{},\"actions\":{},\"regret_before\":{},\"regret_after\":{},\"sigma_before\":{},\"sigma_after\":{},\"strategy_sum_before\":{},\"strategy_sum_after\":{},\"average_strategy_before\":{},\"average_strategy_after\":{}}}",
-        esc(&label),
+        esc(&touched.label),
         esc(&key),
-        n,
-        vec_str_json(&actions_str),
+        touched.n_actions,
+        vec_str_json(&touched.actions),
         vec_f64_json(regret_before),
         vec_f64_json(regret_after),
         vec_f64_json(sigma_before),
@@ -862,16 +829,29 @@ fn snapshot_json(
 // ===========================================================================
 
 fn run(args: Args) -> Result<(), String> {
-    let n_players = LeducGame.n_players() as u64;
-    let mut regret = RegretTable::<LeducInfoSet>::new();
-    let mut strategy_sum = StrategyAccumulator::<LeducInfoSet>::new();
+    eprintln!(
+        "[nlhe_trace] loading bucket table from {} ...",
+        args.bucket_table.display()
+    );
+    let bucket_table = Arc::new(
+        BucketTable::open(&args.bucket_table)
+            .map_err(|e| format!("BucketTable::open failed: {e:?}"))?,
+    );
+    let game = SimplifiedNlheGame::new(Arc::clone(&bucket_table))
+        .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
+    let n_players = game.n_players() as u64;
+
+    let mut regret = RegretTable::<SimplifiedNlheInfoSet>::new();
+    let mut strategy_sum = StrategyAccumulator::<SimplifiedNlheInfoSet>::new();
     let mut rng = ChaCha20Rng::from_seed(args.seed);
 
     let mut update_count: u64 = 0;
+    eprintln!("[nlhe_trace] running {} warmup updates ...", args.warmup);
     for _ in 0..args.warmup {
         step_es(
             update_count,
             n_players,
+            &game,
             &mut regret,
             &mut strategy_sum,
             &mut rng,
@@ -879,20 +859,21 @@ fn run(args: Args) -> Result<(), String> {
         update_count += 1;
     }
 
-    let regret_before_table: HashMap<LeducInfoSet, Vec<f64>> = regret
+    let regret_before_table: HashMap<InfoSetId, Vec<f64>> = regret
         .inner()
         .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| (*k, v.clone()))
         .collect();
-    let strategy_sum_before_table: HashMap<LeducInfoSet, Vec<f64>> = strategy_sum
+    let strategy_sum_before_table: HashMap<InfoSetId, Vec<f64>> = strategy_sum
         .inner()
         .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| (*k, v.clone()))
         .collect();
     let traverser = (update_count % n_players) as PlayerId;
 
     let mut collector = Collector::new();
-    let root = LeducGame.root(&mut rng);
+    let root = game.root(&mut rng);
+    eprintln!("[nlhe_trace] running traced update (traverser=P{traverser})...");
     let _ = recurse_traced(
         root,
         traverser,
@@ -906,32 +887,34 @@ fn run(args: Args) -> Result<(), String> {
     );
     let traced_update_index = update_count;
 
-    let regret_after_table: HashMap<LeducInfoSet, Vec<f64>> = regret
+    let regret_after_table: HashMap<InfoSetId, Vec<f64>> = regret
         .inner()
         .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| (*k, v.clone()))
         .collect();
-    let strategy_sum_after_table: HashMap<LeducInfoSet, Vec<f64>> = strategy_sum
+    let strategy_sum_after_table: HashMap<InfoSetId, Vec<f64>> = strategy_sum
         .inner()
         .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| (*k, v.clone()))
         .collect();
 
     let mut snapshots: Vec<String> = Vec::new();
-    for info in &collector.visited_order {
-        let regret_after = regret_after_table.get(info).cloned().unwrap_or_default();
-        let n = regret_after.len();
-        let actions = leduc_actions_from_info(info);
+    for t in &collector.visited_order {
+        let n = t.n_actions;
         let regret_before = regret_before_table
-            .get(info)
+            .get(&t.info)
+            .cloned()
+            .unwrap_or_else(|| vec![0.0; n]);
+        let regret_after = regret_after_table
+            .get(&t.info)
             .cloned()
             .unwrap_or_else(|| vec![0.0; n]);
         let ssum_before = strategy_sum_before_table
-            .get(info)
+            .get(&t.info)
             .cloned()
             .unwrap_or_else(|| vec![0.0; n]);
         let ssum_after = strategy_sum_after_table
-            .get(info)
+            .get(&t.info)
             .cloned()
             .unwrap_or_else(|| vec![0.0; n]);
         let sigma_before = sigma_from_regret(&regret_before, n);
@@ -939,9 +922,7 @@ fn run(args: Args) -> Result<(), String> {
         let avg_before = avg_from_ssum(&ssum_before, n);
         let avg_after = avg_from_ssum(&ssum_after, n);
         snapshots.push(snapshot_json(
-            info,
-            n,
-            &actions,
+            t,
             &regret_before,
             &regret_after,
             &sigma_before,
@@ -956,7 +937,7 @@ fn run(args: Args) -> Result<(), String> {
     let nodes_json: Vec<String> = collector.nodes.iter().map(node_json).collect();
 
     let payload = format!(
-        "{{\"metadata\":{{\"game\":\"Leduc\",\"seed_hex\":\"0x{:016x}\",\"warmup_updates\":{},\"update_index\":{},\"traverser\":{},\"n_nodes\":{},\"n_infosets_touched\":{}}},\"nodes\":[{}],\"infoset_snapshots\":[{}]}}",
+        "{{\"metadata\":{{\"game\":\"Simplified NLHE\",\"seed_hex\":\"0x{:016x}\",\"warmup_updates\":{},\"update_index\":{},\"traverser\":{},\"n_nodes\":{},\"n_infosets_touched\":{}}},\"nodes\":[{}],\"infoset_snapshots\":[{}]}}",
         args.seed,
         args.warmup,
         traced_update_index,
@@ -973,14 +954,12 @@ fn run(args: Args) -> Result<(), String> {
                 .map_err(|e| format!("mkdir {} failed: {e}", parent.display()))?;
         }
     }
-    // 模板里占位符写成 `/*__TRACE_DATA__*/ null`，让未替换的模板也是合法 JS
-    // （直接在浏览器打开模板只显示提示页，不抛 ReferenceError）。
     let html = HTML_TEMPLATE.replace("/*__TRACE_DATA__*/ null", &payload);
     fs::write(&args.output, html.as_bytes())
         .map_err(|e| format!("write {} failed: {e}", args.output.display()))?;
 
     println!(
-        "[mccfr_trace] wrote {} ({} nodes, {} info sets touched, traverser=P{}, update#={})",
+        "[nlhe_trace] wrote {} ({} nodes, {} info sets touched, traverser=P{}, update#={})",
         args.output.display(),
         collector.nodes.len(),
         collector.visited_order.len(),
@@ -1015,33 +994,6 @@ fn avg_from_ssum(s: &[f64], n: usize) -> Vec<f64> {
         s.iter().map(|x| x / sum).collect()
     } else {
         vec![1.0 / n as f64; n]
-    }
-}
-
-fn leduc_actions_from_info(info: &LeducInfoSet) -> Vec<LeducAction> {
-    let has_outstanding = info
-        .history
-        .iter()
-        .rev()
-        .find_map(|a| match a {
-            LeducAction::Bet | LeducAction::Raise => Some(true),
-            LeducAction::Call | LeducAction::Check | LeducAction::Fold => Some(false),
-            _ => None,
-        })
-        .unwrap_or(false);
-    if has_outstanding {
-        let raises = info
-            .history
-            .iter()
-            .filter(|a| matches!(a, LeducAction::Bet | LeducAction::Raise))
-            .count();
-        let mut out = vec![LeducAction::Fold, LeducAction::Call];
-        if raises < 2 {
-            out.push(LeducAction::Raise);
-        }
-        out
-    } else {
-        vec![LeducAction::Check, LeducAction::Bet]
     }
 }
 
