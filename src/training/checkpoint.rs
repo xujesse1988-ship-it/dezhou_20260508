@@ -47,9 +47,12 @@ pub const MAGIC: [u8; 8] = *b"PLCKPT\0\0";
 
 /// 当前 schema version（API-350 / D-350）。
 ///
-/// 起步值 `1`；任何 schema 字段语义 / 顺序 / 长度变更必须 bump 该版本并在 D-350
-/// 修订历史落地（与 stage 2 `BucketTable::SCHEMA_VERSION` 同型 bump 政策）。
-pub const SCHEMA_VERSION: u32 = 1;
+/// `1 → 2`（commit Phase 3 方案 A）：简化 NLHE `InfoSetId` v2 layout 把 node_id
+/// 写入高 26 bit，与 v1 行为不兼容；任何 v1 NLHE 训练成果（含 H3 100M / 500M
+/// checkpoint）regret 表 key 在 v2 编码下指向无关 InfoSet，加载即静默废弃训练
+/// 进度，因此必须 bump 拒绝。Kuhn / Leduc InfoSet 编码未变但同步 bump（一次性
+/// 失效旧 ckpt，避免分 game variant 维护子版本号）。
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Header 长度（API-350 binary layout）。
 pub const HEADER_LEN: usize = 108;
