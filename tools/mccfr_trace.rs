@@ -957,7 +957,9 @@ fn run(args: Args) -> Result<(), String> {
                 .map_err(|e| format!("mkdir {} failed: {e}", parent.display()))?;
         }
     }
-    let html = HTML_TEMPLATE.replace("__TRACE_DATA__", &payload);
+    // 模板里占位符写成 `/*__TRACE_DATA__*/ null`，让未替换的模板也是合法 JS
+    // （直接在浏览器打开模板只显示提示页，不抛 ReferenceError）。
+    let html = HTML_TEMPLATE.replace("/*__TRACE_DATA__*/ null", &payload);
     fs::write(&args.output, html.as_bytes())
         .map_err(|e| format!("write {} failed: {e}", args.output.display()))?;
 

@@ -126,7 +126,21 @@
 </div>
 
 <script>
-const TRACE = __TRACE_DATA__;
+// __TRACE_DATA__ 是 Rust 工具 (tools/mccfr_trace.rs) 替换的占位符。
+// 直接打开本模板（未经替换）会落到 null 分支并显示提示，不抛异常。
+const TRACE = /*__TRACE_DATA__*/ null;
+
+if (!TRACE) {
+  document.body.innerHTML =
+    '<div style="padding:40px;font-family:-apple-system,sans-serif;color:#1f2328;max-width:680px;margin:60px auto;background:#fff;border:1px solid #d0d7de;border-radius:8px;line-height:1.6">' +
+    '<h2 style="margin-top:0">这是模板文件，不是要打开的可视化产物</h2>' +
+    '<p>你打开了 <code>tools/mccfr_trace_template.html</code>。本文件里 <code>__TRACE_DATA__</code> 是给 <code>tools/mccfr_trace.rs</code> 替换的占位符，未替换时没有数据可显示。</p>' +
+    '<p>跑：</p>' +
+    '<pre style="background:#f6f8fa;padding:12px;border-radius:6px;font-size:12px">cargo run --release --bin mccfr_trace -- \\\n    --warmup 200 --seed 0x4c454455435f5452 \\\n    --output artifacts/mccfr_trace.html</pre>' +
+    '<p>然后打开 <code>artifacts/mccfr_trace.html</code>。</p>' +
+    '</div>';
+  throw new Error('mccfr_trace_template.html opened directly; open artifacts/mccfr_trace.html instead');
+}
 
 // ---------- metadata header ----------
 (function fillMeta() {
