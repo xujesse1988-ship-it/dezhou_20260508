@@ -47,14 +47,19 @@ pub enum AbstractAction {
 
 /// pot ratio 标签的整数编码，避免 `f64` 进入 `Eq` / `Hash`。
 ///
-/// 内部存 `ratio × 1000` 的 `u32`（D-200 默认值：`Half = 500`、`Full = 1000`）。
+/// 内部存 `ratio × 1000` 的 `u32`（D-200 默认值：`0.33 / 0.5 / 0.75 / 1.0 / 1.5 / 2.0 pot`）。
 /// `ActionAbstractionConfig` 接受 `f64` 输入但内部规整为该整数表示。
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct BetRatio(u32);
 
 impl BetRatio {
+    /// Literal 0.33 pot sizing (`330` milli-pot), not exact mathematical 1/3.
+    pub const THIRTY_THREE_POT: BetRatio = BetRatio(330);
     pub const HALF_POT: BetRatio = BetRatio(500);
+    pub const THREE_QUARTER_POT: BetRatio = BetRatio(750);
     pub const FULL_POT: BetRatio = BetRatio(1000);
+    pub const ONE_AND_HALF_POT: BetRatio = BetRatio(1500);
+    pub const DOUBLE_POT: BetRatio = BetRatio(2000);
 
     /// 量化协议（D-202-rev1 / BetRatio::from_f64-rev1）：
     ///
@@ -95,9 +100,10 @@ impl BetRatio {
 }
 
 /// 抽象动作集合输出。顺序固定为 D-209：
-/// `[Fold?, Check?, Call?, Bet(0.5×pot)? | Raise(0.5×pot)?, Bet(1.0×pot)? | Raise(1.0×pot)?, AllIn?]`
+/// `[Fold?, Check?, Call?, Bet/Raise(ratio_0)?, ..., Bet/Raise(ratio_n)?, AllIn?]`
 /// `?` 表示不存在则跳过；同一 ratio 槽位 `Bet` 与 `Raise` 互斥（由 stage 1
-/// LA-002 保证）。
+/// LA-002 保证）。默认 ratio profile 是
+/// `0.33×pot / 0.5×pot / 0.75×pot / 1.0×pot / 1.5×pot / 2.0×pot`。
 #[derive(Clone, Debug)]
 pub struct AbstractActionSet {
     actions: Vec<AbstractAction>,
@@ -133,11 +139,25 @@ pub struct ActionAbstractionConfig {
 }
 
 impl ActionAbstractionConfig {
-    /// 默认 5-action 配置：`[BetRatio::HALF_POT, BetRatio::FULL_POT]`（D-200）。
-    pub fn default_5_action() -> ActionAbstractionConfig {
+    /// 默认 6 档 bet/raise 配置：
+    /// `0.33×pot / 0.5×pot / 0.75×pot / 1.0×pot / 1.5×pot / 2.0×pot`。
+    pub fn default_six_ratio_action() -> ActionAbstractionConfig {
         ActionAbstractionConfig {
-            raise_pot_ratios: vec![BetRatio::HALF_POT, BetRatio::FULL_POT],
+            raise_pot_ratios: vec![
+                BetRatio::THIRTY_THREE_POT,
+                BetRatio::HALF_POT,
+                BetRatio::THREE_QUARTER_POT,
+                BetRatio::FULL_POT,
+                BetRatio::ONE_AND_HALF_POT,
+                BetRatio::DOUBLE_POT,
+            ],
         }
+    }
+
+    /// Legacy constructor name kept for API compatibility. It now returns the
+    /// default 6-ratio action profile.
+    pub fn default_5_action() -> ActionAbstractionConfig {
+        Self::default_six_ratio_action()
     }
 
     /// 自定义构造。长度 / 范围越界 / 量化后 milli 重复均返回 `ConfigError`
@@ -205,7 +225,7 @@ pub trait ActionAbstraction: Send + Sync {
     fn config(&self) -> &ActionAbstractionConfig;
 }
 
-/// 默认 5-action 抽象（D-200）。
+/// 默认 action 抽象（D-200），当前 bet/raise profile 为 6 档 pot ratio。
 pub struct DefaultActionAbstraction {
     config: ActionAbstractionConfig,
 }
@@ -216,7 +236,11 @@ impl DefaultActionAbstraction {
     }
 
     pub fn default_5_action() -> DefaultActionAbstraction {
-        DefaultActionAbstraction::new(ActionAbstractionConfig::default_5_action())
+        Self::default_six_ratio_action()
+    }
+
+    pub fn default_six_ratio_action() -> DefaultActionAbstraction {
+        DefaultActionAbstraction::new(ActionAbstractionConfig::default_six_ratio_action())
     }
 }
 
@@ -251,8 +275,9 @@ impl ActionAbstraction for DefaultActionAbstraction {
         };
         let pot_after_call = pot_before + to_call_delta;
 
-        // D-209 顺序构建候选: Fold / Check / Call / Bet|Raise(0.5×) / Bet|Raise(1.0×) / AllIn
-        let mut actions: Vec<AbstractAction> = Vec::with_capacity(6);
+        // D-209 顺序构建候选: Fold / Check / Call / configured Bet|Raise ratios / AllIn.
+        let mut actions: Vec<AbstractAction> =
+            Vec::with_capacity(4 + self.config.raise_pot_ratios.len());
 
         // D-204：free-check 局面剔除 Fold
         if la.fold && !la.check {
@@ -314,7 +339,7 @@ impl ActionAbstraction for DefaultActionAbstraction {
 
         // AA-004-rev1 折叠去重（first-match-wins）：
         //   ① AllIn 优先：任意 Call/Bet/Raise 的 to == cap 折入 AllIn 槽，移除前者。
-        //   ② Bet/Raise(0.5×) 与 Bet/Raise(1.0×) 同 to 时保留 ratio_label 较小的一份。
+        //   ② 多个 Bet/Raise ratio 同 to 时保留 ratio_label 较小的一份。
         //   ③ Call vs Bet/Raise 不会折叠（D-034 / D-035 严格不等）。
         if actions
             .iter()

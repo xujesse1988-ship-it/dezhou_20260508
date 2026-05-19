@@ -9,7 +9,7 @@
 //! 2. `simplified_nlhe_legal_actions_returns_default_action_abstraction_5_action`
 //!    （D-318 桥接 sanity，default profile active）— 从 root walk chance node 到
 //!    首个 Player node，`legal_actions` 返回 `Vec<AbstractAction>` 且 size ∈ [2, 5]
-//!    （5-action 上界，SB/BB 可能 ≤ 5 受 stack/bet 约束）。
+//!    （默认 6 档 bet/raise 上界，SB/BB 可能受 stack/bet 约束更少）。
 //! 3. `simplified_nlhe_info_set_uses_stage2_infosetid`（D-317 桥接 sanity，default
 //!    profile active）— 首个 Player node 的 `info_set` 返回 `InfoSetId`（stage 2
 //!    64-bit layout），`street_tag` ∈ Preflop（root 后未发 board）。
@@ -199,18 +199,18 @@ fn simplified_nlhe_game_root_state_2_player_100bb_starting_stack() {
 }
 
 // ===========================================================================
-// Test 2 — D-318 legal_actions = AbstractAction 5-action 桥接 sanity
+// Test 2 — D-318 legal_actions = AbstractAction 默认 action profile 桥接 sanity
 // ===========================================================================
 
 /// D-318 桥接 sanity：首个 Player node 的 `legal_actions` 返回
-/// `Vec<AbstractAction>`（不再二次抽象），size ∈ [2, 5]（5-action 上界 per D-209；
+/// `Vec<AbstractAction>`（不再二次抽象），size ∈ [2, 9]（默认 6 档 bet/raise 上界；
 /// 下界 2：至少 Fold + Call 或 Fold + 某一 Raise）。
 ///
 /// **不锁定** 具体 5 action 出现顺序或具体 AbstractAction variants（C2 \[实现\] 走
 /// `DefaultActionAbstraction::abstract_actions(&game_state)` 桥接，具体集合由 stage
 /// 2 D-209 + D-210 决定，C1 仅锁桥接通路 sanity）。
 #[test]
-fn simplified_nlhe_legal_actions_returns_default_action_abstraction_5_action() {
+fn simplified_nlhe_legal_actions_returns_default_action_abstraction_profile() {
     let Some(game) = load_v3_artifact_or_skip() else {
         return;
     };
@@ -220,12 +220,12 @@ fn simplified_nlhe_legal_actions_returns_default_action_abstraction_5_action() {
     // AbstractAction;` 锁定，本测试在运行时再断言 size 范围合 D-209。
     assert!(
         actions.len() >= 2,
-        "legal_actions().len() = {} < 2（D-209 5-action 下界至少 Fold + Call/Bet）",
+        "legal_actions().len() = {} < 2（D-209 默认 action profile 下界至少 Fold + Call/Bet）",
         actions.len()
     );
     assert!(
-        actions.len() <= 5,
-        "legal_actions().len() = {} > 5（D-209 默认 5-action 上界，SB/BB 短码可能 ≤ 5）",
+        actions.len() <= 9,
+        "legal_actions().len() = {} > 9（D-209 默认 6 档 bet/raise 上界，SB/BB 短码可能更少）",
         actions.len()
     );
     // 全部 actions 应当是有效 AbstractAction（trait bound `Eq + Copy + Debug` 已由
@@ -440,7 +440,7 @@ fn collect_snapshot_probes(game: &SimplifiedNlheGame) -> Vec<InfoSetId> {
                 let actions = SimplifiedNlheGame::legal_actions(&state);
                 assert!(
                     !actions.is_empty(),
-                    "Player node 应当有 ≥ 1 legal action（D-318 5-action 下界）"
+                    "Player node 应当有 ≥ 1 legal action（D-318 默认 action profile 下界）"
                 );
                 let next_action = actions[0]; // 走确定性首项让 path deterministic
                 state = SimplifiedNlheGame::next(state, next_action, &mut rng);

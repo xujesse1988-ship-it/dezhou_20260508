@@ -16,7 +16,7 @@
 ```text
 // ===== header (108 bytes, 8-byte aligned) =====
 offset 0x00: magic:                  [u8; 8] = b"PLCKPT\\0\\0"
-offset 0x08: schema_version:         u32 LE = 1
+offset 0x08: schema_version:         u32 LE = 3
 offset 0x0C: trainer_variant:        u8 (0 = VanillaCfr, 1 = EsMccfr)
 offset 0x0D: game_variant:           u8 (0 = Kuhn, 1 = Leduc, 2 = SimplifiedNlhe)
 offset 0x0E: pad:                    [u8; 6] = 0
@@ -37,7 +37,7 @@ offset 0x64: strategy_sum_offset:    u64 LE
 不区分 enum）：
 
 - `magic != b"PLCKPT\\0\\0"` → `CheckpointReaderError("magic bytes mismatch")`
-- `schema_version != 1`       → `CheckpointReaderError("schema mismatch ...")`
+- `schema_version != 3`       → `CheckpointReaderError("schema mismatch ...")`
 - `trainer_variant` 未知 tag  → `CheckpointReaderError("unknown trainer_variant tag ...")`
 - `game_variant` 未知 tag     → `CheckpointReaderError("unknown game_variant tag ...")`
 - header pad != 0             → `CheckpointReaderError("pad byte non-zero ...")`
@@ -96,7 +96,7 @@ from typing import Any, Optional
 
 
 MAGIC = b"PLCKPT\x00\x00"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 HEADER_LEN = 108
 TRAILER_LEN = 32
 

@@ -1,7 +1,7 @@
 //! SimplifiedNlheGame（API-303 / D-313）+ stage 1 / stage 2 桥接（API-390..API-392）。
 //!
 //! 简化 NLHE 范围（D-313）：2-player + 100 BB starting stack + 盲注 0.5/1.0 BB +
-//! 完整 4 街 + stage 2 `DefaultActionAbstraction`（5-action）+ stage 2
+//! 完整 4 街 + stage 2 `DefaultActionAbstraction`（6 档 bet/raise ratio）+ stage 2
 //! `PreflopLossless169` + `PostflopBucketAbstraction`（500/500/500 bucket）。
 //! 复用 stage 1 [`crate::GameState`] + stage 2 [`crate::ActionAbstraction`] /
 //! [`crate::InfoAbstraction`] / [`crate::BucketTable`]，仅在 `SimplifiedNlheGame`
@@ -44,7 +44,7 @@ use crate::training::nlhe_betting_tree::{AbstractActionTag, Child, NodeId, Publi
 
 /// 简化 NLHE action 桥接（API-303 / D-318）。
 ///
-/// 直接走 stage 2 `AbstractAction`（5-action 顺序由 D-209 deterministic）；不再
+/// 直接走 stage 2 `AbstractAction`（D-209 deterministic 顺序）；不再
 /// 二次抽象。`Game::Action` trait bound `Copy + Eq + Debug` 由 stage 2 实现满足。
 pub type SimplifiedNlheAction = AbstractAction;
 
@@ -81,7 +81,7 @@ const NLHE_V2_NODE_ID_BITS: u32 = 26;
 fn pack_info_set_v2(hand_bucket: u32, node_id: NodeId, street_tag: StreetTag) -> InfoSetId {
     debug_assert!(
         node_id < (1u32 << NLHE_V2_NODE_ID_BITS),
-        "Phase 0b 实测节点数 48,224 << 2^26；node_id={node_id} 越界提示树规模超预期"
+        "NLHE abstract betting tree node_id={node_id} 越界 26-bit field；提示树规模超预期"
     );
     let base = pack_info_set_id(
         hand_bucket,
@@ -101,7 +101,7 @@ fn pack_info_set_v2(hand_bucket: u32, node_id: NodeId, street_tag: StreetTag) ->
 pub struct SimplifiedNlheGame {
     pub(crate) bucket_table: Arc<BucketTable>,
     pub(crate) config: TableConfig,
-    /// 抽象 betting tree，构造时一次性建好（Phase 1 节点数实测 48,224）。
+    /// 抽象 betting tree，构造时一次性建好。
     /// State 沿 `tree.node(current_node_id).children` 跳转；Phase 3 起 `info_set`
     /// 用 `current_node_id` 作为下注历史维度，根除跨街 collision。
     pub(crate) tree: Arc<PublicBettingTree>,
@@ -293,10 +293,10 @@ impl Game for SimplifiedNlheGame {
 
     fn legal_actions(state: &SimplifiedNlheState) -> Vec<SimplifiedNlheAction> {
         // D-318 桥接：stage 2 `DefaultActionAbstraction::abstract_actions`
-        // 顺序由 D-209 deterministic（每次构造同型 5-action 抽象，开销可忽略
+        // 顺序由 D-209 deterministic（每次构造同型默认抽象，开销可忽略
         // —— `DefaultActionAbstraction::new` 仅 clone 配置）；Trainer 的 RegretTable
         // `Vec<f64>` 索引一一对应（D-324 action_count 训练全程恒定）。
-        let abs = DefaultActionAbstraction::default_5_action();
+        let abs = DefaultActionAbstraction::default_six_ratio_action();
         let set = abs.abstract_actions(&state.game_state);
         set.as_slice().to_vec()
     }

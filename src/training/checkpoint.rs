@@ -47,12 +47,17 @@ pub const MAGIC: [u8; 8] = *b"PLCKPT\0\0";
 
 /// 当前 schema version（API-350 / D-350）。
 ///
+/// `2 → 3`：默认 action abstraction 从 2 档 bet/raise ratio
+/// (`0.5 / 1.0 pot`) 扩为 6 档 (`0.33 / 0.5 / 0.75 / 1.0 / 1.5 / 2.0 pot`)。
+/// 这会改变同一 NLHE InfoSet 下的 action_count 与 action_index 语义，旧 checkpoint
+/// 的 regret / strategy_sum 向量不能安全复用，因此必须 bump 拒绝。
+///
 /// `1 → 2`（commit Phase 3 方案 A）：简化 NLHE `InfoSetId` v2 layout 把 node_id
 /// 写入高 26 bit，与 v1 行为不兼容；任何 v1 NLHE 训练成果（含 H3 100M / 500M
 /// checkpoint）regret 表 key 在 v2 编码下指向无关 InfoSet，加载即静默废弃训练
 /// 进度，因此必须 bump 拒绝。Kuhn / Leduc InfoSet 编码未变但同步 bump（一次性
 /// 失效旧 ckpt，避免分 game variant 维护子版本号）。
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Header 长度（API-350 binary layout）。
 pub const HEADER_LEN: usize = 108;

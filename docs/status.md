@@ -13,7 +13,7 @@
 | Kuhn Vanilla CFR | ✅ 收敛到 closed-form Nash `-1/18` | `tests/cfr_kuhn.rs` |
 | Leduc Vanilla CFR | ✅ exploitability `< 0.1` @ 10K iter | `tests/cfr_leduc.rs` |
 | Leduc ES-MCCFR | ✅ 1M 外部对照通过；Rust 2M per-player update EV 与 `leduc_mccfr.py` 1M iter 同量级 | `leduc_mccfr.py` + `tools/leduc_es_mccfr_report.rs` |
-| 简化 NLHE ES-MCCFR | ✅ InfoSetId v2 layout（hand_bucket / node_id / street_tag）跨街抽象动作历史单射；preflop 病态消失（BB 拿 AKo limp 后 100% AllIn 变 ~0）；1B update LBR plateau @ 940 mbb/g ± 20（bucket abstraction floor，stage 2 重做才能再降）；1K finite strategy + 1M × 3 fixed-seed BLAKE3 byte-equal smoke | `tests/cfr_simplified_nlhe.rs` + `tests/nlhe_infoset_history_collision.rs` + `src/training/nlhe_betting_tree.rs` |
+| 简化 NLHE ES-MCCFR | ⚠️ 默认 action profile 已扩为 `0.33/0.5/0.75/1.0/1.5/2.0 pot + all-in`；checkpoint schema v3，旧 2-ratio checkpoint 不兼容需重训；InfoSetId v2 layout（hand_bucket / node_id / street_tag）跨街抽象动作历史单射仍保留 | `src/abstraction/action.rs` + `src/training/nlhe_betting_tree.rs` + `tests/cfr_simplified_nlhe.rs` |
 | H3 简化 NLHE 闭环工具 | ✅ 训练入口、三类 baseline 评测、H3 LBR proxy、Markdown/JSON report、preflop strategy dump、抽象 betting tree sizing 全套 smoke 通过 | `tools/train_cfr.rs` + `tools/nlhe_h3_report.rs` + `tools/nlhe_preflop_strategy_dump.rs` + `tools/nlhe_betting_tree_sizing.rs` + `tests/nlhe_h3_eval.rs` |
 
 ### 最近验证证据
@@ -29,19 +29,14 @@
   `artifacts/leduc_es_mccfr_100m_full_history.txt` 输出 `ev_p0=-0.086036478`、
   `exploitability_chips_per_game=0.147556546`、
   `average_strategy_blake3=c0b8bcfa6db843b410f515b8526f08de19f573c88fb4eaf20afe431dba98385c`。
-- 简化 NLHE 复测：`cargo test --release --test cfr_simplified_nlhe -- --ignored --nocapture`
-  通过 2 条 ignored 测试；1M × 3 fixed-seed snapshot BLAKE3 =
-  `4d211620a09ed97ce9593055eb8e4ee42b592d6b44f9fa90e65faaa8d84d1ab4`。
-- 简化 NLHE InfoSetId v2 + 1B 验证（2026-05-19）：
-  - 抽象 betting tree 节点数 = 48,224（`tools/nlhe_betting_tree_sizing.rs` 实测，16-bit node_id 足够）。
-  - `tests/nlhe_infoset_history_collision.rs`：SB-aggressor vs BB-aggressor 两条 preflop 线推进到 flop 同一决策点，InfoSetId 不同（按 node_id 区分）。
-  - 1B update LBR proxy 曲线（`--lbr-probes 10000 --lbr-rollouts 16`，bucket_table v3）：
-    `0M=2711, 100M=947, 200M=937, 300M=944, 400M=955, 500M=959, 600M=964, 700M=957, 800M=956, 900M=958, 1B=934`
-    （SE ≈ 20）。100M 后所有点都在 940 ± 20 chips 噪声带内 → bucket abstraction floor。
-  - preflop 策略合理：SB-root 72o 100% fold；BB-vs-limp AKo 96% Raise FULL_POT / 2% AllIn（旧版 500M 此 spot AKo 87% AllIn 病态已消除）。
-  - bucket_table BLAKE3 = `67ee555439f2c918698650c05f40a7a5e9e812280ceb87fc3c6590add98650cd`。
-  - 训练 seed = `0x48335f4e4c48455f`。
-- 进一步降 LBR proxy 需要换 bucket abstraction（500/500/500 → 更细），属 stage 2 重做范围，不在 stage 3 范围。
+- 简化 NLHE action profile 更新（2026-05-19）：
+  - 默认 bet/raise ratio = `0.33 / 0.5 / 0.75 / 1.0 / 1.5 / 2.0 pot`，外加 all-in。
+  - checkpoint `SCHEMA_VERSION = 3`；`artifacts/phase3_post_history_fix_1b/*.ckpt`
+    是旧 2-ratio profile 训练结果，当前代码会拒绝加载，需要按新 profile 重训。
+  - 抽象 betting tree 节点数 = 5,201,712（`tools/nlhe_betting_tree_sizing.rs` 实测），
+    node_id 需要 23 bit，仍小于当前 InfoSetId v2 的 26-bit node_id 字段。
+  - 旧 1B 结果（preflop 病态消失、LBR plateau @ 940 mbb/g ± 20）只作为历史参考，
+    不再代表当前 action profile 的训练质量。
 
 ## 代码结构
 

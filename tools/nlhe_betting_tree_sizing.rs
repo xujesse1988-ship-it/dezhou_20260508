@@ -135,9 +135,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    let viable = stats.decision_nodes < 1_000_000;
+    let viable = bits_needed <= 26;
     println!(
-        "Phase 0 gate (< 10^6 decision nodes): {}",
+        "NodeId 26-bit gate     : {}",
         if viable { "PASS" } else { "FAIL" }
     );
 

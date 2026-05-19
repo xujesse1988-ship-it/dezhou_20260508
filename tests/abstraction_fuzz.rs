@@ -15,7 +15,7 @@
 //! 输入 1k 重复维度。两者覆盖 IA-004 不变量的不同切面。
 //!
 //! 与 `tests/action_abstraction.rs::action_abs_determinism_repeat_smoke`（B1 1k smoke）
-//! 互补：本文件跨 1–14 raise size 配置维度，action_abstraction 单默认 5-action 配置
+//! 互补：本文件跨 1–14 raise size 配置维度，action_abstraction 单默认 action 配置
 //! 维度。
 //!
 //! 角色边界：本文件属 `[测试]` agent 产物。任一断言被 [实现] 反驳由 [测试] agent

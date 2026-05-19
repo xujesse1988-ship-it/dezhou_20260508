@@ -239,7 +239,7 @@ fn info_set_postflop_cost() {
     );
 }
 
-/// 量 RegretTable::current_strategy_smallvec 单次 cost（5-action 典型）。
+/// 量 RegretTable::current_strategy_smallvec 单次 cost（短 action vector 典型）。
 /// 用真实游戏 state 取一个 SimplifiedNlheInfoSet 模拟 trainer typical 调用。
 #[test]
 #[ignore = "diagnostic-only; release/--ignored opt-in"]
@@ -276,7 +276,7 @@ fn current_strategy_cost_5action() {
     );
 }
 
-/// 量 sample_discrete 5-action 单次 cost。
+/// 量 sample_discrete 短 action vector 单次 cost。
 #[test]
 #[ignore = "diagnostic-only; release/--ignored opt-in"]
 fn sample_discrete_5action_cost() {

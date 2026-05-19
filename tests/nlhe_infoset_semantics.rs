@@ -8,36 +8,13 @@ use std::sync::Arc;
 
 use poker::training::game::{Game, NodeKind};
 use poker::training::nlhe::SimplifiedNlheGame;
-use poker::{
-    AbstractAction, BetRatio, BucketConfig, BucketTable, ChaCha20Rng, ChipAmount, InfoSetId,
-};
+use poker::{AbstractAction, BucketConfig, BucketTable, ChaCha20Rng, ChipAmount, InfoSetId};
 
 fn stub_game() -> SimplifiedNlheGame {
     let table = Arc::new(BucketTable::stub_for_postflop(
         BucketConfig::default_500_500_500(),
     ));
     SimplifiedNlheGame::new(table).expect("500/500/500 stub table should construct NLHE game")
-}
-
-fn role_mask(actions: &[AbstractAction]) -> u8 {
-    let mut mask = 0u8;
-    for action in actions {
-        let bit = match action {
-            AbstractAction::Fold => 0,
-            AbstractAction::Check => 1,
-            AbstractAction::Call { .. } => 2,
-            AbstractAction::Bet { ratio_label, .. } | AbstractAction::Raise { ratio_label, .. } => {
-                if ratio_label.as_milli() == BetRatio::HALF_POT.as_milli() {
-                    3
-                } else {
-                    4
-                }
-            }
-            AbstractAction::AllIn { .. } => 5,
-        };
-        mask |= 1 << bit;
-    }
-    mask
 }
 
 fn find_call(actions: &[AbstractAction]) -> AbstractAction {
@@ -48,18 +25,12 @@ fn find_call(actions: &[AbstractAction]) -> AbstractAction {
         .expect("state should offer Call")
 }
 
-fn find_raise(actions: &[AbstractAction], ratio: BetRatio) -> AbstractAction {
+fn raise_actions(actions: &[AbstractAction]) -> Vec<AbstractAction> {
     actions
         .iter()
         .copied()
-        .find(|action| {
-            matches!(
-                action,
-                AbstractAction::Raise { ratio_label, .. }
-                    if ratio_label.as_milli() == ratio.as_milli()
-            )
-        })
-        .expect("state should offer requested Raise ratio")
+        .filter(|action| matches!(action, AbstractAction::Raise { .. }))
+        .collect()
 }
 
 fn action_to_amount(action: AbstractAction) -> ChipAmount {
@@ -70,6 +41,20 @@ fn action_to_amount(action: AbstractAction) -> ChipAmount {
         | AbstractAction::AllIn { to } => to,
         AbstractAction::Fold | AbstractAction::Check => ChipAmount::ZERO,
     }
+}
+
+fn action_shape_signature(actions: &[AbstractAction]) -> Vec<(u8, u32)> {
+    actions
+        .iter()
+        .map(|action| match action {
+            AbstractAction::Fold => (0, 0),
+            AbstractAction::Check => (1, 0),
+            AbstractAction::Call { .. } => (2, 0),
+            AbstractAction::Bet { ratio_label, .. } => (3, ratio_label.as_milli()),
+            AbstractAction::Raise { ratio_label, .. } => (4, ratio_label.as_milli()),
+            AbstractAction::AllIn { .. } => (5, 0),
+        })
+        .collect()
 }
 
 #[test]
@@ -85,66 +70,60 @@ fn simplified_nlhe_infoset_distinguishes_limp_raise_amount_semantics() {
     let bb_to_act = SimplifiedNlheGame::next(root, limp, &mut rng);
     assert_eq!(SimplifiedNlheGame::current(&bb_to_act), NodeKind::Player(1));
 
-    // Compare BB half-pot raise vs full-pot raise, then SB's response node.
+    // Compare two BB raise sizes, then SB's response nodes. Do not lock exact
+    // labels here: the expanded default profile can dedup smaller ratios into
+    // the same `to` amount, so the available labels are profile-dependent.
     let bb_actions = SimplifiedNlheGame::legal_actions(&bb_to_act);
-    let half_pot_raise = find_raise(&bb_actions, BetRatio::HALF_POT);
-    let full_pot_raise = find_raise(&bb_actions, BetRatio::FULL_POT);
-    assert_eq!(action_to_amount(half_pot_raise), ChipAmount::new(200));
-    assert_eq!(action_to_amount(full_pot_raise), ChipAmount::new(300));
-
-    let facing_half = SimplifiedNlheGame::next(bb_to_act.clone(), half_pot_raise, &mut rng);
-    let facing_full = SimplifiedNlheGame::next(bb_to_act, full_pot_raise, &mut rng);
-    assert_eq!(
-        SimplifiedNlheGame::current(&facing_half),
-        NodeKind::Player(0)
-    );
-    assert_eq!(
-        SimplifiedNlheGame::current(&facing_full),
-        NodeKind::Player(0)
+    let raises = raise_actions(&bb_actions);
+    assert!(
+        raises.len() >= 2,
+        "regression setup needs at least two BB raise sizes; actions={bb_actions:?}"
     );
 
-    let half_actions = SimplifiedNlheGame::legal_actions(&facing_half);
-    let full_actions = SimplifiedNlheGame::legal_actions(&facing_full);
-    assert_eq!(
-        role_mask(&half_actions),
-        role_mask(&full_actions),
-        "regression setup must keep the old 6-bit availability mask identical"
-    );
+    let mut chosen = None;
+    for i in 0..raises.len() {
+        for j in (i + 1)..raises.len() {
+            if action_to_amount(raises[i]) == action_to_amount(raises[j]) {
+                continue;
+            }
+            let facing_a = SimplifiedNlheGame::next(bb_to_act.clone(), raises[i], &mut rng);
+            let facing_b = SimplifiedNlheGame::next(bb_to_act.clone(), raises[j], &mut rng);
+            if SimplifiedNlheGame::current(&facing_a) != NodeKind::Player(0)
+                || SimplifiedNlheGame::current(&facing_b) != NodeKind::Player(0)
+            {
+                continue;
+            }
+            let actions_a = SimplifiedNlheGame::legal_actions(&facing_a);
+            let actions_b = SimplifiedNlheGame::legal_actions(&facing_b);
+            if action_shape_signature(&actions_a) == action_shape_signature(&actions_b)
+                && actions_a != actions_b
+            {
+                chosen = Some((facing_a, facing_b, actions_a, actions_b));
+                break;
+            }
+        }
+        if chosen.is_some() {
+            break;
+        }
+    }
+
+    let (facing_a, facing_b, actions_a, actions_b) = chosen.unwrap_or_else(|| {
+        panic!(
+            "regression setup must find two raise sizes with same action shape but different amount semantics; raises={raises:?}"
+        )
+    });
+
     assert_ne!(
-        half_actions, full_actions,
-        "regression setup must differ only by action amount semantics"
+        action_to_amount(find_call(&actions_a)),
+        action_to_amount(find_call(&actions_b)),
+        "response nodes should differ in call amount semantics"
     );
 
-    assert_eq!(
-        action_to_amount(find_call(&half_actions)),
-        ChipAmount::new(200)
-    );
-    assert_eq!(
-        action_to_amount(find_call(&full_actions)),
-        ChipAmount::new(300)
-    );
-    assert_eq!(
-        action_to_amount(find_raise(&half_actions, BetRatio::HALF_POT)),
-        ChipAmount::new(400)
-    );
-    assert_eq!(
-        action_to_amount(find_raise(&full_actions, BetRatio::HALF_POT)),
-        ChipAmount::new(600)
-    );
-    assert_eq!(
-        action_to_amount(find_raise(&half_actions, BetRatio::FULL_POT)),
-        ChipAmount::new(600)
-    );
-    assert_eq!(
-        action_to_amount(find_raise(&full_actions, BetRatio::FULL_POT)),
-        ChipAmount::new(900)
-    );
-
-    let info_half: InfoSetId = SimplifiedNlheGame::info_set(&facing_half, 0);
-    let info_full: InfoSetId = SimplifiedNlheGame::info_set(&facing_full, 0);
+    let info_a: InfoSetId = SimplifiedNlheGame::info_set(&facing_a, 0);
+    let info_b: InfoSetId = SimplifiedNlheGame::info_set(&facing_b, 0);
     assert_ne!(
-        info_half.raw(),
-        info_full.raw(),
-        "SB facing BB half-pot raise and full-pot raise must not share an InfoSetId"
+        info_a.raw(),
+        info_b.raw(),
+        "SB facing distinct BB raise amounts with same action shape must not share an InfoSetId"
     );
 }

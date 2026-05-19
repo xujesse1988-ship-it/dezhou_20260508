@@ -23,7 +23,7 @@ use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::PlayerId;
 
-/// 决策节点 id；16 bit 实测足够（Phase 0b 测得 48,224 节点），用 u32 留余量。
+/// 决策节点 id；用 u32 给 action profile 扩展留余量。
 pub type NodeId = u32;
 
 /// 抽象动作的"身份"——同抽象边在不同 chip state 下产出的 `AbstractAction`
@@ -68,8 +68,8 @@ pub struct TreeNode {
     pub action_from_parent: Option<AbstractActionTag>,
     /// 节点合法动作集 tag 序列，**顺序与 [`DefaultActionAbstraction::abstract_actions`]
     /// 输出严格对齐**（D-209）。`children[i]` 对应 `legal_actions[i]` 这条边。
-    pub legal_actions: SmallVec<[AbstractActionTag; 8]>,
-    pub children: SmallVec<[Child; 8]>,
+    pub legal_actions: SmallVec<[AbstractActionTag; 12]>,
+    pub children: SmallVec<[Child; 12]>,
 }
 
 pub struct PublicBettingTree {
@@ -110,9 +110,9 @@ impl PublicBettingTree {
             .0 as PlayerId;
         let my_id = self.nodes.len() as NodeId;
 
-        let abs = DefaultActionAbstraction::default_5_action();
+        let abs = DefaultActionAbstraction::default_six_ratio_action();
         let legal_set = abs.abstract_actions(&state);
-        let legal_actions: SmallVec<[AbstractActionTag; 8]> =
+        let legal_actions: SmallVec<[AbstractActionTag; 12]> =
             legal_set.iter().map(AbstractActionTag::of).collect();
 
         // Placeholder for stable index; children backfilled after recursion.
@@ -125,7 +125,7 @@ impl PublicBettingTree {
             children: SmallVec::new(),
         });
 
-        let mut children: SmallVec<[Child; 8]> = SmallVec::new();
+        let mut children: SmallVec<[Child; 12]> = SmallVec::new();
         for action in legal_set.iter().copied() {
             let mut next_state = state.clone();
             next_state
@@ -212,10 +212,10 @@ mod tests {
 
     #[test]
     fn node_count_matches_phase0_sizing() {
-        // Phase 0b sizing tool reported 48,224 decision nodes from the same root.
+        // Six-ratio default action profile sizing tool reported 5,201,712 decision nodes.
         // Tree builder must agree (same DFS shape, same `DefaultActionAbstraction`).
         let tree = build_default_tree();
-        assert_eq!(tree.num_nodes(), 48_224);
+        assert_eq!(tree.num_nodes(), 5_201_712);
     }
 
     #[test]

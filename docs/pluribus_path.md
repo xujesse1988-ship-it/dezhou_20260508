@@ -20,7 +20,7 @@ Pluribus 的可实现路线可以概括为：
 核心模块：
 
 - `Blueprint`：离线用自博弈训练出的基础策略，覆盖完整游戏树的抽象版本。
-- `Action abstraction`：把无限注下注空间压缩成有限动作集合，例如 fold/call/check、0.5 pot、1 pot、all-in。
+- `Action abstraction`：把无限注下注空间压缩成有限动作集合，例如 fold/call/check、0.33 pot、0.5 pot、0.75 pot、1 pot、1.5 pot、2 pot、all-in。
 - `Information abstraction`：把牌面、手牌强度、听牌结构、下注历史等映射到有限 bucket。
 - `Linear MCCFR`：用 Monte Carlo Counterfactual Regret Minimization 训练多人局策略，并对后期迭代赋予更高权重。
 - `Depth-limited search`：实战中从当前 public state 出发，对有限深度子博弈实时搜索，用 blueprint 作为叶子节点价值近似。
@@ -76,7 +76,7 @@ Pluribus 的可实现路线可以概括为：
 
 量化门槛：
 
-- action abstraction 至少支持 fold/check/call、`0.5 pot`、`1 pot`、`all-in`，并可配置扩展到 `1-14` 个 raise size。
+- action abstraction 至少支持 fold/check/call、`0.33 pot`、`0.5 pot`、`0.75 pot`、`1 pot`、`1.5 pot`、`2 pot`、`all-in`，并可配置扩展到 `1-14` 个 raise size。
 - preflop 支持 lossless `169` 起手牌类别，并能区分位置、有效筹码和前序动作。
 - flop/turn/river 至少支持 `500` 个 bucket 配置，并能输出 bucket 分布报告。
 - 抽象映射必须确定性可复现：同一状态重复映射 `1,000,000` 次，bucket id 完全一致。

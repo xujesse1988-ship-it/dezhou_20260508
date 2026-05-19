@@ -27,10 +27,10 @@ use crate::training::regret::{
 };
 use crate::training::sampling::{derive_substream_seed, sample_discrete};
 
-/// 与 `SigmaVec` 同型 inline-8 短向量，用于 traverser cfvs / regret delta /
+/// 与 `SigmaVec` 同型 inline-12 短向量，用于 traverser cfvs / regret delta /
 /// strategy_sum weighted vec / nonzero opp 分布等热路径短数组（E2-rev1 \[实现\]
 /// 优化）。命名与 `SigmaVec` 区分仅出于可读性（数值语义不限于"sigma"）。
-type ShortVec<T> = SmallVec<[T; 8]>;
+type ShortVec<T> = SmallVec<[T; 12]>;
 
 /// 训练器统一 trait（API-310 / D-371）。
 pub trait Trainer<G: Game> {

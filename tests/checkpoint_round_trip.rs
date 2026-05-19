@@ -567,7 +567,7 @@ fn file_not_found_returns_file_not_found_error() {
 #[test]
 fn schema_mismatch_via_byte_flip_at_offset_8() {
     let mut bytes = kuhn_fixture_bytes().to_vec();
-    // 把 schema_version (offset 8 LE u32) 改成 0xDEAD_BEEF（远高于 SCHEMA_VERSION = 1）
+    // 把 schema_version (offset 8 LE u32) 改成 0xDEAD_BEEF（远高于当前 SCHEMA_VERSION）
     let bs = 0xDEAD_BEEFu32.to_le_bytes();
     bytes[OFFSET_SCHEMA_VERSION..OFFSET_SCHEMA_VERSION + 4].copy_from_slice(&bs);
     let path = write_tmp(&bytes, "schema_mismatch");
@@ -916,8 +916,8 @@ fn checkpoint_error_5_variants_exhaustive_match_lock() {
 fn d350_header_constants_lock() {
     assert_eq!(MAGIC, *b"PLCKPT\0\0", "D-350 magic 字面字节序列锁");
     assert_eq!(
-        SCHEMA_VERSION, 2,
-        "Phase 3 方案 A 后 SCHEMA_VERSION = 2（NLHE InfoSetId v2 layout 不向后兼容）"
+        SCHEMA_VERSION, 3,
+        "6 档 bet/raise action profile 后 SCHEMA_VERSION = 3（NLHE action_count / action_index 语义不向后兼容）"
     );
 }
 

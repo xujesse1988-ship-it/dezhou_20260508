@@ -148,8 +148,12 @@ fn _stage2_api_signature_assertions() {
     // BetRatio
     let _: fn(f64) -> Option<BetRatio> = BetRatio::from_f64;
     let _: fn(BetRatio) -> u32 = BetRatio::as_milli;
+    let _: BetRatio = BetRatio::THIRTY_THREE_POT;
     let _: BetRatio = BetRatio::HALF_POT;
+    let _: BetRatio = BetRatio::THREE_QUARTER_POT;
     let _: BetRatio = BetRatio::FULL_POT;
+    let _: BetRatio = BetRatio::ONE_AND_HALF_POT;
+    let _: BetRatio = BetRatio::DOUBLE_POT;
 
     // AbstractActionSet
     let _: for<'a> fn(&'a AbstractActionSet) -> std::slice::Iter<'a, AbstractAction> =
@@ -161,6 +165,7 @@ fn _stage2_api_signature_assertions() {
 
     // ActionAbstractionConfig
     let _: fn() -> ActionAbstractionConfig = ActionAbstractionConfig::default_5_action;
+    let _: fn() -> ActionAbstractionConfig = ActionAbstractionConfig::default_six_ratio_action;
     let _: fn(Vec<f64>) -> Result<ActionAbstractionConfig, ConfigError> =
         ActionAbstractionConfig::new;
     let _: for<'a> fn(&'a ActionAbstractionConfig) -> usize = ActionAbstractionConfig::raise_count;
@@ -168,6 +173,7 @@ fn _stage2_api_signature_assertions() {
     // DefaultActionAbstraction
     let _: fn(ActionAbstractionConfig) -> DefaultActionAbstraction = DefaultActionAbstraction::new;
     let _: fn() -> DefaultActionAbstraction = DefaultActionAbstraction::default_5_action;
+    let _: fn() -> DefaultActionAbstraction = DefaultActionAbstraction::default_six_ratio_action;
 
     // ActionAbstraction trait 方法 UFCS 绑到具体 impl，锁住 trait + impl 联合签名
     // （rustc 仅校验 impl ↔ trait 一致性，不校验 trait ↔ API 文档；UFCS 把替换后的

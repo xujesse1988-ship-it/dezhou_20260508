@@ -51,25 +51,25 @@ fn fold_to_btn(state: &mut GameState) {
 }
 
 // ============================================================================
-// 1. action_abs_default_5_actions_open_raise_legal
+// 1. action_abs_default_action_profile_open_raise_legal
 // ============================================================================
 //
 // 6-max 默认 100BB，UTG 起手 3-bet 局面：UTG / MP / CO fold，BTN 面对盲注 +
-// limpers，触发 D-200 默认 5-action：`{ Fold, Call, Bet/Raise(0.5×pot),
-// Bet/Raise(1.0×pot), AllIn }`（无 `Check`，因为面对前序 bet）。
+// limpers，触发 D-200 默认 action profile：`{ Fold, Call, Bet/Raise(0.33×pot),
+// 0.5×pot, 0.75×pot, 1.0×pot, 1.5×pot, 2.0×pot, AllIn }`
+//（无 `Check`，因为面对前序 bet）。
 #[test]
-fn action_abs_default_5_actions_open_raise_legal() {
+fn action_abs_default_action_profile_open_raise_legal() {
     let (mut s, _cfg) = default_state(0);
     fold_to_btn(&mut s);
 
-    let abs = DefaultActionAbstraction::default_5_action();
+    let abs = DefaultActionAbstraction::default_six_ratio_action();
     let actions: AbstractActionSet = abs.abstract_actions(&s);
 
-    // BTN 面对 BB（强制 bet），D-200 5-action：
+    // BTN 面对 BB（强制 bet），D-200 默认 action profile：
     //   - Fold（保留，D-204 仅在 free-check 局面剔除）
     //   - Call（跟注 BB）
-    //   - Raise(0.5×pot)（D-200，本下注轮已有前序 bet，输出 Raise）
-    //   - Raise(1.0×pot)
+    //   - Raise(0.33×pot / 0.5×pot / 0.75×pot / 1.0×pot / 1.5×pot / 2.0×pot)
     //   - AllIn
     // **不**含 Check（无 free-check option）；Bet 与 Raise 由 LA-002 互斥决定，
     // 此处 max_committed_this_round = BB > 0 ⇒ Raise 路径。
@@ -91,8 +91,7 @@ fn action_abs_default_5_actions_open_raise_legal() {
         "AA-002：面对 bet 局面无 Check"
     );
 
-    // D-200 / AA-001：D-209 顺序 Fold? / Check? / Call? / Bet|Raise(0.5×) / Bet|Raise(1.0×) / AllIn?。
-    // 本场景为 Fold / Call / Raise(0.5×) / Raise(1.0×) / AllIn 5 项。
+    // D-200 / AA-001：D-209 顺序 Fold? / Check? / Call? / configured Bet|Raise ratios / AllIn?。
     let pos_fold = slice.iter().position(|a| matches!(a, AbstractAction::Fold));
     let pos_call = slice
         .iter()
@@ -107,7 +106,7 @@ fn action_abs_default_5_actions_open_raise_legal() {
         "AA-001：AllIn 占位末尾"
     );
 
-    // AA-007 deterministic smoke：默认 5-action 配置同 GameState 重复 16 次结果一致。
+    // AA-007 deterministic smoke：默认配置同 GameState 重复 16 次结果一致。
     let baseline = abs.abstract_actions(&s);
     for _ in 0..16 {
         let other = abs.abstract_actions(&s);
@@ -144,7 +143,7 @@ fn action_abs_fold_disallowed_after_check() {
 
     // 进入 flop，SB 先动（postflop 起手）。SB 面对 free-check 局面，D-204
     // 强制剔除 Fold。
-    let abs = DefaultActionAbstraction::default_5_action();
+    let abs = DefaultActionAbstraction::default_six_ratio_action();
     let actions = abs.abstract_actions(&s);
     let slice = actions.as_slice();
 
@@ -273,7 +272,7 @@ fn action_abs_bet_falls_back_to_allin_when_above_stack() {
     }
     assert_eq!(s.current_player(), Some(SeatId(2)), "短码 BB 决策");
 
-    let abs = DefaultActionAbstraction::default_5_action();
+    let abs = DefaultActionAbstraction::default_six_ratio_action();
     let actions = abs.abstract_actions(&s);
     let slice = actions.as_slice();
 
@@ -439,7 +438,7 @@ fn action_abs_short_bb_3bet_min_to_above_stack_priority_case2() {
     assert_eq!(la.call.map(|c| c.as_u64()), Some(400));
     assert_eq!(la.all_in_amount.map(|c| c.as_u64()), Some(400));
 
-    let abs = DefaultActionAbstraction::default_5_action();
+    let abs = DefaultActionAbstraction::default_six_ratio_action();
     let actions = abs.abstract_actions(&s);
     let slice = actions.as_slice();
 
@@ -501,7 +500,7 @@ fn action_abs_determinism_repeat_smoke() {
     let (mut s, _cfg) = default_state(42);
     fold_to_btn(&mut s);
 
-    let abs = DefaultActionAbstraction::default_5_action();
+    let abs = DefaultActionAbstraction::default_six_ratio_action();
     let baseline = abs.abstract_actions(&s);
     for i in 0..1_000 {
         let other = abs.abstract_actions(&s);
@@ -524,8 +523,12 @@ fn action_abs_determinism_repeat_smoke() {
 #[test]
 fn bet_ratio_from_f64_half_to_even() {
     // 默认常量值（A1 const 已落地，不依赖 unimplemented stub）。
+    assert_eq!(BetRatio::THIRTY_THREE_POT.as_milli(), 330);
     assert_eq!(BetRatio::HALF_POT.as_milli(), 500);
+    assert_eq!(BetRatio::THREE_QUARTER_POT.as_milli(), 750);
     assert_eq!(BetRatio::FULL_POT.as_milli(), 1000);
+    assert_eq!(BetRatio::ONE_AND_HALF_POT.as_milli(), 1500);
+    assert_eq!(BetRatio::DOUBLE_POT.as_milli(), 2000);
 
     // half-to-even：0.5005 → 500.5 → 500（ties to even）；0.5015 → 501.5 → 502。
     let half_via_f64 = BetRatio::from_f64(0.5005).expect("0.5005 合法");

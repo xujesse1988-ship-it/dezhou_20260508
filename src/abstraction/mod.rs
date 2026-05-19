@@ -5,7 +5,7 @@
 //!
 //! 模块组织（D-211 / D-212 / D-215 / D-220 / D-244 / D-252 / D-253-rev1 / D-254）：
 //!
-//! - [`action`]：抽象动作集合 + `DefaultActionAbstraction`（5-action 默认）
+//! - [`action`]：抽象动作集合 + `DefaultActionAbstraction`（6 档 bet/raise 默认）
 //! - [`info`]：`InfoSetId` 64-bit 编码 + `InfoAbstraction` trait + `BettingState` /
 //!   `StreetTag` enum
 //! - [`preflop`]：169 lossless preflop 抽象 + `canonical_hole_id` helper

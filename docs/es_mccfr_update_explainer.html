@@ -626,7 +626,7 @@
 
     <section class="note">
       <b>和 NLHE 适配层的关系：</b>
-      本页讲的是训练器的一次 update。落到 `SimplifiedNlheGame` 时，`info_set` 会把手牌/公共牌 bucket、位置、stack、下注状态、街道和动作金额语义签名打包；`legal_actions` 从规则层合法动作集合生成默认 5-action 抽象；`next` 再把抽象动作转成规则层动作并 apply。
+      本页讲的是训练器的一次 update。落到 `SimplifiedNlheGame` 时，`info_set` 会把手牌/公共牌 bucket、位置、stack、下注状态、街道和动作金额语义签名打包；`legal_actions` 从规则层合法动作集合生成默认 action 抽象；`next` 再把抽象动作转成规则层动作并 apply。
     </section>
 
     <p class="footer">对应代码入口：<code>src/training/trainer.rs::EsMccfrTrainer::step</code>、<code>recurse_es</code>，以及 <code>src/training/nlhe.rs::SimplifiedNlheGame</code>。</p>
