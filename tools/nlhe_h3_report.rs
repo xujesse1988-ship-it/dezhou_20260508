@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use poker::training::game::{Game, NodeKind};
 use poker::training::nlhe::{NlheStackProfile, SimplifiedNlheGame, SimplifiedNlheState};
+use poker::training::nlhe_betting_tree::PublicBettingTree;
 use poker::training::sampling::sample_discrete;
 use poker::training::{
     estimate_simplified_nlhe_lbr, estimate_simplified_nlhe_lbr_filtered,
@@ -230,6 +231,7 @@ fn run() -> Result<(), String> {
 
     let game = SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&table), args.stack_profile)
         .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
+    let shared_tree = game.tree_arc();
     let mut trainer = if let Some(ref checkpoint) = args.checkpoint {
         eprintln!("[nlhe_h3_report] checkpoint     = {}", checkpoint.display());
         <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
@@ -243,9 +245,12 @@ fn run() -> Result<(), String> {
     if args.train_updates > 0 {
         train_inline(&mut trainer, args.train_updates, args.seed, args.threads)?;
     }
-    let eval_game =
-        SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&table), args.stack_profile)
-            .map_err(|e| format!("SimplifiedNlheGame::new for eval failed: {e:?}"))?;
+    let eval_game = SimplifiedNlheGame::new_sharing_tree(
+        Arc::clone(&table),
+        args.stack_profile,
+        Arc::clone(&shared_tree),
+    )
+    .map_err(|e| format!("SimplifiedNlheGame::new for eval failed: {e:?}"))?;
 
     let eval_cfg = NlheEvaluationConfig {
         hands_per_seat: args.eval_hands_per_seat,
@@ -293,12 +298,14 @@ fn run() -> Result<(), String> {
     lbr_curve.push(uniform_lbr_curve_point(
         Arc::clone(&table),
         args.stack_profile,
+        Arc::clone(&shared_tree),
         &lbr_cfg,
     )?);
     for (label, path) in &args.curve_checkpoints {
         lbr_curve.push(load_lbr_curve_point(
             Arc::clone(&table),
             args.stack_profile,
+            Arc::clone(&shared_tree),
             label.clone(),
             path,
             &lbr_cfg,
@@ -383,9 +390,10 @@ fn train_inline(
 fn uniform_lbr_curve_point(
     table: Arc<BucketTable>,
     stack_profile: NlheStackProfile,
+    tree: Arc<PublicBettingTree>,
     cfg: &NlheLbrConfig,
 ) -> Result<LbrCurvePoint, String> {
-    let game = SimplifiedNlheGame::new_with_stack_profile(table, stack_profile)
+    let game = SimplifiedNlheGame::new_sharing_tree(table, stack_profile, tree)
         .map_err(|e| format!("SimplifiedNlheGame::new for uniform curve failed: {e:?}"))?;
     let uniform = |_info: &InfoSetId, _n: usize| Vec::new();
     let report = estimate_simplified_nlhe_lbr(&game, &uniform, cfg)
@@ -400,23 +408,26 @@ fn uniform_lbr_curve_point(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_lbr_curve_point(
     table: Arc<BucketTable>,
     stack_profile: NlheStackProfile,
+    tree: Arc<PublicBettingTree>,
     label: String,
     path: &Path,
     cfg: &NlheLbrConfig,
     policy: FallbackPolicy,
     filter: ProbeFilter,
 ) -> Result<LbrCurvePoint, String> {
-    let load_game = SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&table), stack_profile)
-        .map_err(|e| format!("SimplifiedNlheGame::new for curve failed: {e:?}"))?;
+    let load_game =
+        SimplifiedNlheGame::new_sharing_tree(Arc::clone(&table), stack_profile, Arc::clone(&tree))
+            .map_err(|e| format!("SimplifiedNlheGame::new for curve failed: {e:?}"))?;
     let trainer =
         <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
             path, load_game,
         )
         .map_err(|e| format!("load curve checkpoint {} failed: {e:?}", path.display()))?;
-    let eval_game = SimplifiedNlheGame::new_with_stack_profile(table, stack_profile)
+    let eval_game = SimplifiedNlheGame::new_sharing_tree(table, stack_profile, tree)
         .map_err(|e| format!("SimplifiedNlheGame::new for curve eval failed: {e:?}"))?;
     let strategy = make_strategy_fn(&trainer, policy);
     let probe_filter = make_probe_filter(&trainer, filter);

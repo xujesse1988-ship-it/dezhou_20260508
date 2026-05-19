@@ -197,10 +197,52 @@ impl SimplifiedNlheGame {
     ///
     /// `Hu100Bb` 是既有默认；`Hu200Bb` 用于 Slumbot 对齐。profile 会进入
     /// checkpoint 兼容 fingerprint，避免 100BB / 200BB 训练结果误加载。
+    ///
+    /// 同进程内需要多个 game 实例（例如 training / eval / LBR curve 等）时，
+    /// 用 [`Self::tree_arc`] 拿到已建好的 tree，再走 [`Self::new_sharing_tree`]
+    /// 复用——避免重复 build（200BB 单棵 tree ~7.6 GB / 数分钟）。
     pub fn new_with_stack_profile(
         bucket_table: Arc<BucketTable>,
         stack_profile: NlheStackProfile,
     ) -> Result<Self, TrainerError> {
+        Self::validate_bucket_table(&bucket_table)?;
+        let config = stack_profile.table_config();
+        let tree = Arc::new(PublicBettingTree::build(&config));
+        Ok(Self {
+            bucket_table,
+            config,
+            stack_profile,
+            tree,
+        })
+    }
+
+    /// 复用既有 `Arc<PublicBettingTree>` 构造同 profile 的另一个 game 实例。
+    ///
+    /// 调用者负责保证 `tree` 是从同一 `stack_profile` 的 `TableConfig` build 出来的；
+    /// debug build 校验 `tree.root_id()` 节点 player_acting / street 与新建 root 一致。
+    /// 共享后所有 game 走同一棵 tree，避免 ~1.3 GB（100BB）/ ~7.6 GB（200BB）级别的
+    /// 重复占用与重复 build 开销。
+    pub fn new_sharing_tree(
+        bucket_table: Arc<BucketTable>,
+        stack_profile: NlheStackProfile,
+        tree: Arc<PublicBettingTree>,
+    ) -> Result<Self, TrainerError> {
+        Self::validate_bucket_table(&bucket_table)?;
+        let config = stack_profile.table_config();
+        debug_assert_eq!(
+            tree.node(tree.root_id()).street,
+            StreetTag::Preflop,
+            "shared tree root 必须 preflop（profile 不匹配迹象）"
+        );
+        Ok(Self {
+            bucket_table,
+            config,
+            stack_profile,
+            tree,
+        })
+    }
+
+    fn validate_bucket_table(bucket_table: &BucketTable) -> Result<(), TrainerError> {
         let schema = bucket_table.schema_version();
         if schema != EXPECTED_BUCKET_SCHEMA_VERSION {
             return Err(TrainerError::UnsupportedBucketTable {
@@ -216,14 +258,7 @@ impl SimplifiedNlheGame {
                 got: 0,
             });
         }
-        let config = stack_profile.table_config();
-        let tree = Arc::new(PublicBettingTree::build(&config));
-        Ok(Self {
-            bucket_table,
-            config,
-            stack_profile,
-            tree,
-        })
+        Ok(())
     }
 
     /// 当前 NLHE 起始筹码 profile。
@@ -240,6 +275,12 @@ impl SimplifiedNlheGame {
     /// 在不构造完整 `SimplifiedNlheState` 的情况下走树定位特定 spot 的 node_id。
     pub fn tree(&self) -> &PublicBettingTree {
         &self.tree
+    }
+
+    /// 拿到当前 `Arc<PublicBettingTree>` clone，配合 [`Self::new_sharing_tree`]
+    /// 让多个 game 实例共享同一棵 tree。
+    pub fn tree_arc(&self) -> Arc<PublicBettingTree> {
+        Arc::clone(&self.tree)
     }
 
     /// 直接为指定的 preflop `node_id` × `hole` 构造 `InfoSetId`（绕过 `Game::info_set`

@@ -421,6 +421,14 @@ fn _stage3_api_signature_assertions() {
         SimplifiedNlheGame::new;
     let _: fn(Arc<BucketTable>, NlheStackProfile) -> Result<SimplifiedNlheGame, TrainerError> =
         SimplifiedNlheGame::new_with_stack_profile;
+    let _: fn(
+        Arc<BucketTable>,
+        NlheStackProfile,
+        Arc<poker::training::nlhe_betting_tree::PublicBettingTree>,
+    ) -> Result<SimplifiedNlheGame, TrainerError> = SimplifiedNlheGame::new_sharing_tree;
+    let _: for<'a> fn(
+        &'a SimplifiedNlheGame,
+    ) -> Arc<poker::training::nlhe_betting_tree::PublicBettingTree> = SimplifiedNlheGame::tree_arc;
     let _: for<'a> fn(&'a SimplifiedNlheGame) -> NlheStackProfile =
         SimplifiedNlheGame::stack_profile;
     let _: for<'a> fn(&'a SimplifiedNlheGame) -> &'a TableConfig = SimplifiedNlheGame::config;

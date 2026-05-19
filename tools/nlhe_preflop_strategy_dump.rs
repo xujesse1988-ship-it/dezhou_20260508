@@ -74,13 +74,14 @@ fn run(args: Args) -> Result<(), String> {
     let load_game =
         SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&table), args.stack_profile)
             .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
+    let shared_tree = load_game.tree_arc();
     let trainer =
         <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
             &args.checkpoint,
             load_game,
         )
         .map_err(|e| format!("load_checkpoint failed: {e:?}"))?;
-    let game = SimplifiedNlheGame::new_with_stack_profile(table, args.stack_profile)
+    let game = SimplifiedNlheGame::new_sharing_tree(table, args.stack_profile, shared_tree)
         .map_err(|e| format!("SimplifiedNlheGame::new (probe) failed: {e:?}"))?;
 
     let tree = game.tree();
