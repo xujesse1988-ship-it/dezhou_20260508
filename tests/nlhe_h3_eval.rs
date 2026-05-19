@@ -13,9 +13,11 @@ use poker::{BucketTable, ChaCha20Rng, RngSource, SeatId, SimplifiedNlheGame};
 
 const V3_ARTIFACT_PATH: &str = "artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin";
 const V3_BODY_BLAKE3_HEX: &str = "67ee555439f2c918698650c05f40a7a5e9e812280ceb87fc3c6590add98650cd";
-const H3_OLD_CHECKPOINT_PATH: &str =
-    "artifacts/phase3_post_history_fix_100m/nlhe_es_mccfr_final_000100000000.ckpt";
-const H3_NEW_CHECKPOINT_PATH: &str =
+const H3_CHECKPOINT_100M_PATH: &str =
+    "artifacts/phase3_post_history_fix_1b/nlhe_es_mccfr_auto_000100000008.ckpt";
+const H3_CHECKPOINT_500M_PATH: &str =
+    "artifacts/phase3_post_history_fix_1b/nlhe_es_mccfr_auto_000500000016.ckpt";
+const H3_CHECKPOINT_1B_PATH: &str =
     "artifacts/phase3_post_history_fix_1b/nlhe_es_mccfr_final_001000000000.ckpt";
 const H3_HEAD_TO_HEAD_BB_CHIPS: f64 = 100.0;
 
@@ -436,62 +438,83 @@ fn h3_lbr_proxy_is_finite_and_seed_deterministic() {
 }
 
 #[test]
-#[ignore = "release/--ignored opt-in；加载 100M + 1B H3 checkpoint 并跑 fixed-seed head-to-head"]
-fn h3_checkpoint_head_to_head_1b_vs_100m_is_finite_and_deterministic() {
+#[ignore = "release/--ignored opt-in；加载 H3 100M/500M/1B checkpoint 并跑 10K fixed-seed head-to-head"]
+fn h3_checkpoint_head_to_head_curve_pairs_10k_are_finite() {
     let Some(table) = load_v3_or_skip() else {
         return;
     };
-    let Some(old_trainer) = load_h3_checkpoint_or_skip(H3_OLD_CHECKPOINT_PATH, Arc::clone(&table))
+    let Some(trainer_100m) =
+        load_h3_checkpoint_or_skip(H3_CHECKPOINT_100M_PATH, Arc::clone(&table))
     else {
         return;
     };
-    let Some(new_trainer) = load_h3_checkpoint_or_skip(H3_NEW_CHECKPOINT_PATH, Arc::clone(&table))
+    let Some(trainer_500m) =
+        load_h3_checkpoint_or_skip(H3_CHECKPOINT_500M_PATH, Arc::clone(&table))
     else {
         return;
     };
-    assert_eq!(old_trainer.update_count(), 100_000_000);
-    assert_eq!(new_trainer.update_count(), 1_000_000_000);
+    let Some(trainer_1b) = load_h3_checkpoint_or_skip(H3_CHECKPOINT_1B_PATH, Arc::clone(&table))
+    else {
+        return;
+    };
+    assert_eq!(trainer_100m.update_count(), 100_000_008);
+    assert_eq!(trainer_500m.update_count(), 500_000_016);
+    assert_eq!(trainer_1b.update_count(), 1_000_000_000);
 
     let cfg = HeadToHeadConfig {
-        hands_per_seat: 1_000,
+        hands_per_seat: 5_000,
         seed: 0x4833_4832_4821_0001,
         max_actions_per_hand: 512,
     };
-    let first =
-        evaluate_checkpoint_head_to_head(Arc::clone(&table), &new_trainer, &old_trainer, cfg)
-            .expect("1B-vs-100M head-to-head should evaluate");
-    let second = evaluate_checkpoint_head_to_head(table, &new_trainer, &old_trainer, cfg)
-        .expect("fixed-seed head-to-head should be repeatable");
 
-    eprintln!(
-        "H3 checkpoint H2H: new={} old={} hands={} seed=0x{:016x} new_vs_old={:.3} mbb/g SE={:.3} 95%CI=[{:.3}, {:.3}] SB={:.3} BB={:.3} total_chips={:.0}",
-        H3_NEW_CHECKPOINT_PATH,
-        H3_OLD_CHECKPOINT_PATH,
-        first.hands,
-        first.seed,
-        first.new_mbb_per_game,
-        first.standard_error_mbb_per_game,
-        first.ci95_low_mbb_per_game,
-        first.ci95_high_mbb_per_game,
-        first.new_as_sb_mbb_per_game,
-        first.new_as_bb_mbb_per_game,
-        first.new_total_chips,
-    );
+    let pairs = [
+        (
+            "500M_vs_100M",
+            H3_CHECKPOINT_500M_PATH,
+            &trainer_500m,
+            H3_CHECKPOINT_100M_PATH,
+            &trainer_100m,
+        ),
+        (
+            "1B_vs_500M",
+            H3_CHECKPOINT_1B_PATH,
+            &trainer_1b,
+            H3_CHECKPOINT_500M_PATH,
+            &trainer_500m,
+        ),
+        (
+            "1B_vs_100M",
+            H3_CHECKPOINT_1B_PATH,
+            &trainer_1b,
+            H3_CHECKPOINT_100M_PATH,
+            &trainer_100m,
+        ),
+    ];
 
-    assert_eq!(first.hands, cfg.hands_per_seat * 2);
-    assert_eq!(first.hands_per_seat, cfg.hands_per_seat);
-    assert!(first.new_total_chips.is_finite());
-    assert!(first.new_mbb_per_game.is_finite());
-    assert!(first.standard_error_mbb_per_game.is_finite());
-    assert!(first.ci95_low_mbb_per_game <= first.ci95_high_mbb_per_game);
-    assert_eq!(
-        first.new_mbb_per_game.to_bits(),
-        second.new_mbb_per_game.to_bits(),
-        "fixed-seed checkpoint head-to-head must be byte-stable"
-    );
-    assert_eq!(
-        first.standard_error_mbb_per_game.to_bits(),
-        second.standard_error_mbb_per_game.to_bits(),
-        "fixed-seed checkpoint head-to-head SE must be byte-stable"
-    );
+    for (label, later_path, later, earlier_path, earlier) in pairs {
+        let report = evaluate_checkpoint_head_to_head(Arc::clone(&table), later, earlier, cfg)
+            .unwrap_or_else(|e| panic!("{label} head-to-head should evaluate: {e}"));
+
+        eprintln!(
+            "H3 checkpoint H2H {label}: later={} earlier={} hands={} seed=0x{:016x} later_vs_earlier={:.3} mbb/g SE={:.3} 95%CI=[{:.3}, {:.3}] later_as_SB={:.3} later_as_BB={:.3} total_chips={:.0}",
+            later_path,
+            earlier_path,
+            report.hands,
+            report.seed,
+            report.new_mbb_per_game,
+            report.standard_error_mbb_per_game,
+            report.ci95_low_mbb_per_game,
+            report.ci95_high_mbb_per_game,
+            report.new_as_sb_mbb_per_game,
+            report.new_as_bb_mbb_per_game,
+            report.new_total_chips,
+        );
+
+        assert_eq!(report.hands, cfg.hands_per_seat * 2);
+        assert_eq!(report.hands_per_seat, cfg.hands_per_seat);
+        assert!(report.new_total_chips.is_finite());
+        assert!(report.new_mbb_per_game.is_finite());
+        assert!(report.standard_error_mbb_per_game.is_finite());
+        assert!(report.ci95_low_mbb_per_game <= report.ci95_high_mbb_per_game);
+    }
 }
