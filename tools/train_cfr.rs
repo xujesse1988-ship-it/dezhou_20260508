@@ -1,7 +1,8 @@
 //! Stage 3 CFR / MCCFR 训练 CLI（H3 NLHE 路径）。
 //!
 //! H3 只要求补齐简化 heads-up NLHE blueprint 训练入口；Kuhn / Leduc 仍通过
-//! 测试和专用 report 工具覆盖，不在本 CLI 中新增行为。
+//! 测试和专用 report 工具覆盖，不在本 CLI 中新增行为。默认 100BB；`--stack-bb
+//! 200` 使用 Slumbot 对齐的 200BB 起始筹码。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use poker::training::nlhe::SimplifiedNlheGame;
+use poker::training::nlhe::{NlheStackProfile, SimplifiedNlheGame};
 use poker::training::{EsMccfrTrainer, Trainer};
 use poker::{BucketTable, ChaCha20Rng, RngSource};
 
@@ -25,6 +26,7 @@ struct Args {
     report_every: Option<u64>,
     keep_last: usize,
     bucket_table: PathBuf,
+    stack_profile: NlheStackProfile,
     threads: usize,
     quiet: bool,
 }
@@ -42,6 +44,7 @@ impl Default for Args {
             report_every: None,
             keep_last: 5,
             bucket_table: PathBuf::new(),
+            stack_profile: NlheStackProfile::default(),
             threads: 1,
             quiet: false,
         }
@@ -87,9 +90,10 @@ fn run() -> Result<(), String> {
             args.bucket_table.display()
         )
     })?);
-    let game = SimplifiedNlheGame::new(Arc::clone(&table))
+    let game = SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&table), args.stack_profile)
         .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
     let table_hash = hex32(&table.content_hash());
+    let checkpoint_stem = format!("nlhe_{}_es_mccfr", args.stack_profile.slug());
 
     let mut trainer = if let Some(ref resume) = args.resume {
         <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
@@ -108,7 +112,7 @@ fn run() -> Result<(), String> {
                 start_update, args.updates
             );
         }
-        save_checkpoint(&trainer, &args.checkpoint_dir, "final")?;
+        save_checkpoint(&trainer, &args.checkpoint_dir, &checkpoint_stem, "final")?;
         return Ok(());
     }
 
@@ -118,6 +122,7 @@ fn run() -> Result<(), String> {
         eprintln!("[train_cfr] target_updates   = {}", args.updates);
         eprintln!("[train_cfr] start_update     = {start_update}");
         eprintln!("[train_cfr] seed             = 0x{:016x}", args.seed);
+        eprintln!("[train_cfr] stack_profile    = {}", args.stack_profile);
         eprintln!("[train_cfr] threads          = {}", args.threads);
         eprintln!(
             "[train_cfr] bucket_table     = {}",
@@ -183,7 +188,7 @@ fn run() -> Result<(), String> {
         }
 
         if args.checkpoint_every > 0 && cur >= next_checkpoint {
-            let path = save_checkpoint(&trainer, &args.checkpoint_dir, "auto")?;
+            let path = save_checkpoint(&trainer, &args.checkpoint_dir, &checkpoint_stem, "auto")?;
             saved_this_run.push(path);
             prune_saved(&mut saved_this_run, args.keep_last);
             while next_checkpoint <= cur {
@@ -192,7 +197,7 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let final_path = save_checkpoint(&trainer, &args.checkpoint_dir, "final")?;
+    let final_path = save_checkpoint(&trainer, &args.checkpoint_dir, &checkpoint_stem, "final")?;
     if !args.quiet {
         let elapsed = t0.elapsed().as_secs_f64();
         let throughput = (trainer.update_count() - start_update) as f64 / elapsed.max(1e-9);
@@ -233,6 +238,9 @@ fn parse_args() -> Result<Args, String> {
             "--bucket-table" => {
                 out.bucket_table = PathBuf::from(next_value(&mut args, "--bucket-table")?)
             }
+            "--stack-bb" => {
+                out.stack_profile = next_value(&mut args, "--stack-bb")?.parse()?;
+            }
             "--threads" => out.threads = parse_u64(&next_value(&mut args, "--threads")?)? as usize,
             "--quiet" => out.quiet = true,
             "--help" | "-h" => {
@@ -265,10 +273,11 @@ fn parse_u64(raw: &str) -> Result<u64, String> {
 fn save_checkpoint(
     trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
     dir: &Path,
+    stem: &str,
     label: &str,
 ) -> Result<PathBuf, String> {
     let path = dir.join(format!(
-        "nlhe_es_mccfr_{label}_{:012}.ckpt",
+        "{stem}_{label}_{:012}.ckpt",
         trainer.update_count()
     ));
     trainer
@@ -305,6 +314,7 @@ fn print_usage() {
          \t--game nlhe --trainer es-mccfr --bucket-table <path> --updates <N> [options]\n\n\
          options:\n\
          \t--seed <N|0xHEX>\n\
+         \t--stack-bb <100|200>       default 100; 200 matches Slumbot stack depth\n\
          \t--threads <N>\n\
          \t--resume <checkpoint>\n\
          \t--checkpoint-dir <dir>\n\

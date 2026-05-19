@@ -75,9 +75,9 @@ pub trait Game {
     /// `game_variant` 字段；`load_checkpoint` 反向校验。
     const VARIANT: GameVariant;
 
-    /// 当前 Game 配套 bucket_table 内容 BLAKE3 hash（D-350 binary header offset 60
-    /// / D-356 BucketTableMismatch 校验）。Kuhn / Leduc 全零；SimplifiedNlhe 返回
-    /// [`crate::BucketTable::content_hash`]。
+    /// 当前 Game 配套 checkpoint 兼容 fingerprint（D-350 binary header offset 60
+    /// / D-356 BucketTableMismatch 校验）。Kuhn / Leduc 全零；SimplifiedNlhe v4
+    /// 返回 bucket table 内容 hash + stack profile + table config 的 BLAKE3。
     fn bucket_table_blake3(&self) -> [u8; 32] {
         [0u8; 32]
     }

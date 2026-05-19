@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use poker::training::game::{Game, NodeKind};
-use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
+use poker::training::nlhe::{NlheStackProfile, SimplifiedNlheGame, SimplifiedNlheState};
 use poker::{BucketConfig, BucketTable, ChaCha20Rng};
 
 const SEED: u64 = 0x4E4C_4845_5F53_5A4E; // "NLHE_SZN"
@@ -72,11 +72,37 @@ fn walk(state: &SimplifiedNlheState, depth: u32, stats: &mut Stats) {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn parse_stack_profile() -> Result<NlheStackProfile, String> {
+    let mut profile = NlheStackProfile::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--stack-bb" => {
+                let raw = args
+                    .next()
+                    .ok_or_else(|| "--stack-bb requires a value".to_string())?;
+                profile = raw.parse()?;
+            }
+            "--help" | "-h" => {
+                eprintln!(
+                    "usage: cargo run --release --bin nlhe_betting_tree_sizing -- \
+                     [--stack-bb 100|200]"
+                );
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(profile)
+}
+
+fn run() -> Result<(), String> {
+    let stack_profile = parse_stack_profile()?;
     let table = Arc::new(BucketTable::stub_for_postflop(
         BucketConfig::default_500_500_500(),
     ));
-    let game = SimplifiedNlheGame::new(table)?;
+    let game = SimplifiedNlheGame::new_with_stack_profile(table, stack_profile)
+        .map_err(|e| format!("SimplifiedNlheGame::new_with_stack_profile failed: {e:?}"))?;
     let mut rng = ChaCha20Rng::from_seed(SEED);
     let root = game.root(&mut rng);
 
@@ -87,6 +113,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("=== Simplified NLHE Abstract Betting Tree Sizing ===");
     println!("RNG seed              : 0x{SEED:016x}");
+    println!("stack profile         : {stack_profile}");
     println!("walk wall time        : {:.3}s", elapsed.as_secs_f64());
     println!();
     println!("Decision node total   : {}", stats.decision_nodes);

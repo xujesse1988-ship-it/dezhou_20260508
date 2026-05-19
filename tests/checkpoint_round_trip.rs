@@ -671,7 +671,7 @@ fn bucket_table_mismatch_via_byte_flip_at_offset_60() {
             );
             assert_ne!(
                 expected, [0; 32],
-                "expected 应是当前 BucketTable.content_hash 非零"
+                "expected 应是当前 NLHE bucket/profile 兼容 fingerprint 非零"
             );
         }
         other => panic!("expected BucketTableMismatch, got {other:?}"),
@@ -916,8 +916,8 @@ fn checkpoint_error_5_variants_exhaustive_match_lock() {
 fn d350_header_constants_lock() {
     assert_eq!(MAGIC, *b"PLCKPT\0\0", "D-350 magic 字面字节序列锁");
     assert_eq!(
-        SCHEMA_VERSION, 3,
-        "6 档 bet/raise action profile 后 SCHEMA_VERSION = 3（NLHE action_count / action_index 语义不向后兼容）"
+        SCHEMA_VERSION, 4,
+        "200BB stack profile 进入 NLHE checkpoint 兼容 fingerprint 后 SCHEMA_VERSION = 4"
     );
 }
 

@@ -13,7 +13,7 @@ use blake3::Hasher;
 use serde::Serialize;
 
 use poker::training::game::{Game, NodeKind};
-use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
+use poker::training::nlhe::{NlheStackProfile, SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::sampling::sample_discrete;
 use poker::training::{
     estimate_simplified_nlhe_lbr, estimate_simplified_nlhe_lbr_filtered,
@@ -117,6 +117,7 @@ struct Args {
     output: PathBuf,
     fallback_policy: FallbackPolicy,
     probe_filter: ProbeFilter,
+    stack_profile: NlheStackProfile,
 }
 
 impl Default for Args {
@@ -136,6 +137,7 @@ impl Default for Args {
             output: PathBuf::from("artifacts/h3_nlhe_report.md"),
             fallback_policy: FallbackPolicy::Hybrid,
             probe_filter: ProbeFilter::None,
+            stack_profile: NlheStackProfile::default(),
         }
     }
 }
@@ -168,6 +170,7 @@ fn make_strategy_fn(
 struct H3JsonReport {
     artifact: String,
     bucket_table_blake3: String,
+    stack_profile: String,
     checkpoint: Option<String>,
     update_count: u64,
     strategy_blake3: String,
@@ -223,7 +226,9 @@ fn run() -> Result<(), String> {
     );
     eprintln!("[nlhe_h3_report] bucket_blake3  = {bucket_hash}");
 
-    let game = SimplifiedNlheGame::new(Arc::clone(&table))
+    eprintln!("[nlhe_h3_report] stack_profile = {}", args.stack_profile);
+
+    let game = SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&table), args.stack_profile)
         .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
     let mut trainer = if let Some(ref checkpoint) = args.checkpoint {
         eprintln!("[nlhe_h3_report] checkpoint     = {}", checkpoint.display());
@@ -238,8 +243,9 @@ fn run() -> Result<(), String> {
     if args.train_updates > 0 {
         train_inline(&mut trainer, args.train_updates, args.seed, args.threads)?;
     }
-    let eval_game = SimplifiedNlheGame::new(Arc::clone(&table))
-        .map_err(|e| format!("SimplifiedNlheGame::new for eval failed: {e:?}"))?;
+    let eval_game =
+        SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&table), args.stack_profile)
+            .map_err(|e| format!("SimplifiedNlheGame::new for eval failed: {e:?}"))?;
 
     let eval_cfg = NlheEvaluationConfig {
         hands_per_seat: args.eval_hands_per_seat,
@@ -284,10 +290,15 @@ fn run() -> Result<(), String> {
     let strategy_hash = strategy_hash(&trainer, &eval_game);
 
     let mut lbr_curve = Vec::new();
-    lbr_curve.push(uniform_lbr_curve_point(Arc::clone(&table), &lbr_cfg)?);
+    lbr_curve.push(uniform_lbr_curve_point(
+        Arc::clone(&table),
+        args.stack_profile,
+        &lbr_cfg,
+    )?);
     for (label, path) in &args.curve_checkpoints {
         lbr_curve.push(load_lbr_curve_point(
             Arc::clone(&table),
+            args.stack_profile,
             label.clone(),
             path,
             &lbr_cfg,
@@ -307,6 +318,7 @@ fn run() -> Result<(), String> {
     let json = H3JsonReport {
         artifact: args.artifact.display().to_string(),
         bucket_table_blake3: bucket_hash,
+        stack_profile: args.stack_profile.to_string(),
         checkpoint: args.checkpoint.as_ref().map(|p| p.display().to_string()),
         update_count: trainer.update_count(),
         strategy_blake3: strategy_hash,
@@ -370,9 +382,10 @@ fn train_inline(
 
 fn uniform_lbr_curve_point(
     table: Arc<BucketTable>,
+    stack_profile: NlheStackProfile,
     cfg: &NlheLbrConfig,
 ) -> Result<LbrCurvePoint, String> {
-    let game = SimplifiedNlheGame::new(table)
+    let game = SimplifiedNlheGame::new_with_stack_profile(table, stack_profile)
         .map_err(|e| format!("SimplifiedNlheGame::new for uniform curve failed: {e:?}"))?;
     let uniform = |_info: &InfoSetId, _n: usize| Vec::new();
     let report = estimate_simplified_nlhe_lbr(&game, &uniform, cfg)
@@ -389,20 +402,21 @@ fn uniform_lbr_curve_point(
 
 fn load_lbr_curve_point(
     table: Arc<BucketTable>,
+    stack_profile: NlheStackProfile,
     label: String,
     path: &Path,
     cfg: &NlheLbrConfig,
     policy: FallbackPolicy,
     filter: ProbeFilter,
 ) -> Result<LbrCurvePoint, String> {
-    let load_game = SimplifiedNlheGame::new(Arc::clone(&table))
+    let load_game = SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&table), stack_profile)
         .map_err(|e| format!("SimplifiedNlheGame::new for curve failed: {e:?}"))?;
     let trainer =
         <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
             path, load_game,
         )
         .map_err(|e| format!("load curve checkpoint {} failed: {e:?}", path.display()))?;
-    let eval_game = SimplifiedNlheGame::new(table)
+    let eval_game = SimplifiedNlheGame::new_with_stack_profile(table, stack_profile)
         .map_err(|e| format!("SimplifiedNlheGame::new for curve eval failed: {e:?}"))?;
     let strategy = make_strategy_fn(&trainer, policy);
     let probe_filter = make_probe_filter(&trainer, filter);
@@ -485,6 +499,7 @@ fn markdown_report(report: &H3JsonReport) -> String {
         "- bucket_table_blake3: `{}`\n",
         report.bucket_table_blake3
     ));
+    out.push_str(&format!("- stack_profile: `{}`\n", report.stack_profile));
     out.push_str(&format!(
         "- checkpoint: `{}`\n",
         report.checkpoint.as_deref().unwrap_or("<inline/fresh>")
@@ -576,6 +591,7 @@ fn parse_args() -> Result<Args, String> {
             "--probe-filter" => {
                 out.probe_filter = ProbeFilter::from_str(&next_value(&mut args, &arg)?)?
             }
+            "--stack-bb" => out.stack_profile = next_value(&mut args, &arg)?.parse()?,
             "--output" => out.output = PathBuf::from(next_value(&mut args, &arg)?),
             "--help" | "-h" => {
                 print_usage();
@@ -635,6 +651,7 @@ fn print_usage() {
          零 strategy_sum infoset 走 current_strategy 代替均匀分布)\n\
          \t--probe-filter <m>           none|has-average (default none; \
          has-average 跳过 strategy_sum 全零的 target probe，只统计真实学过的 spot)\n\
+         \t--stack-bb <100|200>         default 100; use 200 for Slumbot-depth checkpoints\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>"
     );

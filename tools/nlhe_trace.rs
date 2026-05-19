@@ -1,11 +1,12 @@
-//! 一次 ES-MCCFR update 的 trace 可视化工具（简化 NLHE / heads-up 100BB）。
+//! 一次 ES-MCCFR update 的 trace 可视化工具（简化 NLHE / heads-up stack profile）。
 //!
 //! 跑法：
 //! ```
 //! cargo run --release --bin nlhe_trace -- \
 //!     --bucket-table artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin \
 //!     --warmup 20 --seed 0x4e4c48455f545241 \
-//!     --output artifacts/nlhe_trace.html
+//!     --output artifacts/nlhe_trace.html \
+//!     [--stack-bb 100|200]
 //! ```
 //!
 //! 输出与 Leduc 版同型的自包含 HTML（共用 `mccfr_trace_template.html`）；NLHE 没有
@@ -26,7 +27,8 @@ use poker::abstraction::info::{InfoSetId, StreetTag};
 use poker::core::{Card, Rank, Suit};
 use poker::training::game::{Game, NodeKind, PlayerId};
 use poker::training::nlhe::{
-    SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
+    NlheStackProfile, SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet,
+    SimplifiedNlheState,
 };
 use poker::training::{RegretTable, StrategyAccumulator};
 use poker::{BucketTable, ChaCha20Rng, RngSource};
@@ -39,6 +41,7 @@ struct Args {
     seed: u64,
     bucket_table: PathBuf,
     output: PathBuf,
+    stack_profile: NlheStackProfile,
 }
 
 fn main() -> ExitCode {
@@ -49,7 +52,7 @@ fn main() -> ExitCode {
             eprintln!(
                 "usage: cargo run --release --bin nlhe_trace -- \
                  --bucket-table PATH \
-                 [--warmup N] [--seed N] [--output PATH]"
+                 [--warmup N] [--seed N] [--output PATH] [--stack-bb 100|200]"
             );
             return ExitCode::from(2);
         }
@@ -68,6 +71,7 @@ fn parse_args() -> Result<Args, String> {
     let mut seed = DEFAULT_SEED;
     let mut bucket_table = PathBuf::new();
     let mut output = PathBuf::from("artifacts/nlhe_trace.html");
+    let mut stack_profile = NlheStackProfile::default();
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -78,11 +82,14 @@ fn parse_args() -> Result<Args, String> {
                 bucket_table = PathBuf::from(it.next().ok_or("--bucket-table need value")?)
             }
             "--output" => output = PathBuf::from(it.next().ok_or("--output need value")?),
+            "--stack-bb" => {
+                stack_profile = it.next().ok_or("--stack-bb need value")?.parse()?;
+            }
             "-h" | "--help" => {
                 println!(
                     "usage: cargo run --release --bin nlhe_trace -- \
                      --bucket-table PATH \
-                     [--warmup N] [--seed N] [--output PATH]"
+                     [--warmup N] [--seed N] [--output PATH] [--stack-bb 100|200]"
                 );
                 std::process::exit(0);
             }
@@ -97,6 +104,7 @@ fn parse_args() -> Result<Args, String> {
         seed,
         bucket_table,
         output,
+        stack_profile,
     })
 }
 
@@ -837,8 +845,9 @@ fn run(args: Args) -> Result<(), String> {
         BucketTable::open(&args.bucket_table)
             .map_err(|e| format!("BucketTable::open failed: {e:?}"))?,
     );
-    let game = SimplifiedNlheGame::new(Arc::clone(&bucket_table))
-        .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
+    let game =
+        SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&bucket_table), args.stack_profile)
+            .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
     let n_players = game.n_players() as u64;
 
     let mut regret = RegretTable::<SimplifiedNlheInfoSet>::new();
@@ -937,7 +946,8 @@ fn run(args: Args) -> Result<(), String> {
     let nodes_json: Vec<String> = collector.nodes.iter().map(node_json).collect();
 
     let payload = format!(
-        "{{\"metadata\":{{\"game\":\"Simplified NLHE\",\"seed_hex\":\"0x{:016x}\",\"warmup_updates\":{},\"update_index\":{},\"traverser\":{},\"n_nodes\":{},\"n_infosets_touched\":{}}},\"nodes\":[{}],\"infoset_snapshots\":[{}]}}",
+        "{{\"metadata\":{{\"game\":\"Simplified NLHE\",\"stack_profile\":\"{}\",\"seed_hex\":\"0x{:016x}\",\"warmup_updates\":{},\"update_index\":{},\"traverser\":{},\"n_nodes\":{},\"n_infosets_touched\":{}}},\"nodes\":[{}],\"infoset_snapshots\":[{}]}}",
+        args.stack_profile,
         args.seed,
         args.warmup,
         traced_update_index,

@@ -10,7 +10,7 @@
 
 - `2 人`：当前求解、训练、评测都先只要求 heads-up。
 - `No-Limit / 无限注`：下注大小不固定，动作抽象负责把连续下注空间压缩成有限动作集合。
-- `有效筹码`：求解器仍以有限有效筹码为状态变量，默认优先支持 `100BB`；后续可增加 `50BB`、`200BB` 或更深筹码 profile。
+- `有效筹码`：求解器仍以有限有效筹码为状态变量，默认优先支持 `100BB`，并提供 `200BB`（Slumbot 对齐）profile；后续可增加 `50BB` 或更深筹码 profile。
 - `无限筹码`：不按数学意义上的无限 stack 建模。真实无限 stack 会让游戏树缺少可工程验收的上界，暂不进入当前目标。
 - `可扩展到 6 人`：规则引擎、座位模型、hand history、抽象接口、训练 trait 不写死 2 人；但训练质量、性能门槛和正式评测先只对 2 人负责。
 
@@ -71,7 +71,7 @@ information abstraction 不应假设永远只有 2 人，但当前 bucket 特征
 
 验收：
 
-- 新增或明确 `TableConfig::default_hu_100bb()`。
+- 新增或明确 `TableConfig::default_hu_100bb()`；Slumbot 对齐路径使用 `TableConfig::default_hu_200bb()`。
 - heads-up preflop / postflop 行动顺序测试通过。
 - random play heads-up `1,000,000` 手牌无非法状态。
 - hand history roundtrip / cross-language reader 对 heads-up 样例通过。
@@ -161,7 +161,7 @@ information abstraction 不应假设永远只有 2 人，但当前 bucket 特征
 
 ### D-HU-002：No-Limit 使用有限有效筹码建模
 
-当前求解器按 No-Limit 德州扑克处理下注空间，但仍使用有限有效筹码 profile。默认优先 `100BB`。数学意义上的无限 stack 不进入当前目标。
+当前求解器按 No-Limit 德州扑克处理下注空间，但仍使用有限有效筹码 profile。默认优先 `100BB`；Slumbot 对齐训练/评测可显式选择 `200BB`。数学意义上的无限 stack 不进入当前目标。
 
 ### D-HU-003：规则层通用，训练层专注 2 人
 

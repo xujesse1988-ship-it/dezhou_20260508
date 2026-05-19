@@ -10,7 +10,8 @@
 //! cargo run --release --bin nlhe_preflop_strategy_dump -- \
 //!     --checkpoint <PATH> \
 //!     --bucket-table <PATH> \
-//!     --output <MD_PATH>
+//!     --output <MD_PATH> \
+//!     [--stack-bb 100|200]
 //! ```
 
 use std::fs::{self, File};
@@ -19,7 +20,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use poker::training::nlhe::SimplifiedNlheGame;
+use poker::training::nlhe::{NlheStackProfile, SimplifiedNlheGame};
 use poker::training::nlhe_betting_tree::{AbstractActionTag, Child, NodeId};
 use poker::training::{EsMccfrTrainer, Trainer};
 use poker::{BetRatio, BucketTable, Card, InfoSetId, Rank, Suit};
@@ -28,12 +29,14 @@ struct Args {
     checkpoint: PathBuf,
     bucket_table: PathBuf,
     output: PathBuf,
+    stack_profile: NlheStackProfile,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut checkpoint: Option<PathBuf> = None;
     let mut bucket_table: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut stack_profile = NlheStackProfile::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut take = || -> Result<String, String> {
@@ -44,10 +47,11 @@ fn parse_args() -> Result<Args, String> {
             "--checkpoint" => checkpoint = Some(PathBuf::from(take()?)),
             "--bucket-table" | "--artifact" => bucket_table = Some(PathBuf::from(take()?)),
             "--output" => output = Some(PathBuf::from(take()?)),
+            "--stack-bb" => stack_profile = take()?.parse()?,
             "--help" | "-h" => {
                 eprintln!(
                     "usage: nlhe_preflop_strategy_dump --checkpoint PATH \
-                     --bucket-table PATH --output PATH"
+                     --bucket-table PATH --output PATH [--stack-bb 100|200]"
                 );
                 std::process::exit(0);
             }
@@ -58,6 +62,7 @@ fn parse_args() -> Result<Args, String> {
         checkpoint: checkpoint.ok_or("--checkpoint required")?,
         bucket_table: bucket_table.ok_or("--bucket-table required")?,
         output: output.ok_or("--output required")?,
+        stack_profile,
     })
 }
 
@@ -66,15 +71,16 @@ fn run(args: Args) -> Result<(), String> {
         BucketTable::open(&args.bucket_table)
             .map_err(|e| format!("BucketTable::open failed: {e:?}"))?,
     );
-    let load_game = SimplifiedNlheGame::new(Arc::clone(&table))
-        .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
+    let load_game =
+        SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&table), args.stack_profile)
+            .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
     let trainer =
         <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
             &args.checkpoint,
             load_game,
         )
         .map_err(|e| format!("load_checkpoint failed: {e:?}"))?;
-    let game = SimplifiedNlheGame::new(table)
+    let game = SimplifiedNlheGame::new_with_stack_profile(table, args.stack_profile)
         .map_err(|e| format!("SimplifiedNlheGame::new (probe) failed: {e:?}"))?;
 
     let tree = game.tree();
@@ -109,6 +115,7 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(out, "- checkpoint: `{}`", args.checkpoint.display()).unwrap();
     writeln!(out, "- update_count: `{}`", trainer.update_count()).unwrap();
     writeln!(out, "- bucket_table: `{}`", args.bucket_table.display()).unwrap();
+    writeln!(out, "- stack_profile: `{}`", args.stack_profile).unwrap();
     writeln!(out).unwrap();
 
     for (spot_name, node_id, actor) in spots {

@@ -1,8 +1,9 @@
 //! SimplifiedNlheGame（API-303 / D-313）+ stage 1 / stage 2 桥接（API-390..API-392）。
 //!
-//! 简化 NLHE 范围（D-313）：2-player + 100 BB starting stack + 盲注 0.5/1.0 BB +
-//! 完整 4 街 + stage 2 `DefaultActionAbstraction`（6 档 bet/raise ratio）+ stage 2
-//! `PreflopLossless169` + `PostflopBucketAbstraction`（500/500/500 bucket）。
+//! 简化 NLHE 范围（D-313）：2-player + 可选 100BB / 200BB starting stack +
+//! 盲注 0.5/1.0 BB + 完整 4 街 + stage 2 `DefaultActionAbstraction`
+//! （6 档 bet/raise ratio）+ stage 2 `PreflopLossless169` +
+//! `PostflopBucketAbstraction`（500/500/500 bucket）。
 //! 复用 stage 1 [`crate::GameState`] + stage 2 [`crate::ActionAbstraction`] /
 //! [`crate::InfoAbstraction`] / [`crate::BucketTable`]，仅在 `SimplifiedNlheGame`
 //! 适配层把 stage 1 `GameState` 包装成 [`Game`] trait state。
@@ -41,6 +42,76 @@ use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::nlhe_betting_tree::{AbstractActionTag, Child, NodeId, PublicBettingTree};
+
+/// 简化 NLHE 起始筹码 profile。
+///
+/// 默认保持 100BB，供既有测试 / benchmark / 训练入口向后兼容；200BB profile 对齐
+/// Slumbot：SB=50、BB=100、每手起始 20,000 chips。
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Hash, Default)]
+pub enum NlheStackProfile {
+    #[default]
+    Hu100Bb,
+    Hu200Bb,
+}
+
+impl NlheStackProfile {
+    pub fn from_stack_bb(stack_bb: u16) -> Option<Self> {
+        match stack_bb {
+            100 => Some(Self::Hu100Bb),
+            200 => Some(Self::Hu200Bb),
+            _ => None,
+        }
+    }
+
+    pub fn stack_bb(self) -> u16 {
+        match self {
+            Self::Hu100Bb => 100,
+            Self::Hu200Bb => 200,
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Hu100Bb => "100bb",
+            Self::Hu200Bb => "200bb",
+        }
+    }
+
+    pub fn table_config(self) -> TableConfig {
+        match self {
+            Self::Hu100Bb => TableConfig::default_hu_100bb(),
+            Self::Hu200Bb => TableConfig::default_hu_200bb(),
+        }
+    }
+
+    fn checkpoint_profile_tag(self) -> u8 {
+        match self {
+            Self::Hu100Bb => 0,
+            Self::Hu200Bb => 1,
+        }
+    }
+}
+
+impl std::fmt::Display for NlheStackProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.slug())
+    }
+}
+
+impl std::str::FromStr for NlheStackProfile {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let s = raw.trim().to_ascii_lowercase();
+        match s.as_str() {
+            "100" | "100bb" | "hu100" | "hu100bb" => Ok(Self::Hu100Bb),
+            "200" | "200bb" | "hu200" | "hu200bb" | "slumbot" => Ok(Self::Hu200Bb),
+            _ => Err(format!(
+                "invalid NLHE stack profile {raw:?}; expected 100bb or 200bb"
+            )),
+        }
+    }
+}
 
 /// 简化 NLHE action 桥接（API-303 / D-318）。
 ///
@@ -96,11 +167,12 @@ fn pack_info_set_v2(hand_bucket: u32, node_id: NodeId, street_tag: StreetTag) ->
 /// 简化 NLHE Game token（API-303）。
 ///
 /// 构造时载入 stage 2 `BucketTable`（D-314-rev1 v3 artifact）+ stage 1
-/// `TableConfig`（2-player + 100 BB）。字段 `pub(crate)` 让同 crate 测试 / bench
-/// 访问内部状态而不暴露给外部消费者（D-376）。
+/// `TableConfig`（2-player + selected stack profile）。字段 `pub(crate)` 让同
+/// crate 测试 / bench 访问内部状态而不暴露给外部消费者（D-376）。
 pub struct SimplifiedNlheGame {
     pub(crate) bucket_table: Arc<BucketTable>,
     pub(crate) config: TableConfig,
+    pub(crate) stack_profile: NlheStackProfile,
     /// 抽象 betting tree，构造时一次性建好。
     /// State 沿 `tree.node(current_node_id).children` 跳转；Phase 3 起 `info_set`
     /// 用 `current_node_id` 作为下注历史维度，根除跨街 collision。
@@ -118,6 +190,17 @@ impl SimplifiedNlheGame {
     /// 编码 `schema_version`；`got` 字段编码实际 schema_version（schema 不匹配）
     /// 或返回 `0`（config 不匹配，无另外 variant 表达）。
     pub fn new(bucket_table: Arc<BucketTable>) -> Result<Self, TrainerError> {
+        Self::new_with_stack_profile(bucket_table, NlheStackProfile::default())
+    }
+
+    /// 使用指定起始筹码 profile 构造简化 NLHE game。
+    ///
+    /// `Hu100Bb` 是既有默认；`Hu200Bb` 用于 Slumbot 对齐。profile 会进入
+    /// checkpoint 兼容 fingerprint，避免 100BB / 200BB 训练结果误加载。
+    pub fn new_with_stack_profile(
+        bucket_table: Arc<BucketTable>,
+        stack_profile: NlheStackProfile,
+    ) -> Result<Self, TrainerError> {
         let schema = bucket_table.schema_version();
         if schema != EXPECTED_BUCKET_SCHEMA_VERSION {
             return Err(TrainerError::UnsupportedBucketTable {
@@ -128,22 +211,29 @@ impl SimplifiedNlheGame {
         let cfg = bucket_table.config();
         let expected = expected_bucket_config();
         if cfg.flop != expected.flop || cfg.turn != expected.turn || cfg.river != expected.river {
-            // 复用 UnsupportedBucketTable variant 表达 config 不匹配（schema 路径
-            // 也走该 variant；`got = 0` 让区分通过日志上下文判断）。stage 3
-            // F1 / F2 [测试 / 实现] 评估是否引入新 variant
-            // `TrainerError::UnsupportedBucketConfig { expected, got }`。
             return Err(TrainerError::UnsupportedBucketTable {
                 expected: EXPECTED_BUCKET_SCHEMA_VERSION,
                 got: 0,
             });
         }
-        let config = TableConfig::default_hu_100bb();
+        let config = stack_profile.table_config();
         let tree = Arc::new(PublicBettingTree::build(&config));
         Ok(Self {
             bucket_table,
             config,
+            stack_profile,
             tree,
         })
+    }
+
+    /// 当前 NLHE 起始筹码 profile。
+    pub fn stack_profile(&self) -> NlheStackProfile {
+        self.stack_profile
+    }
+
+    /// 当前规则配置。
+    pub fn config(&self) -> &TableConfig {
+        &self.config
     }
 
     /// 公开 `PublicBettingTree` 引用，供诊断工具（如 `nlhe_preflop_strategy_dump`）
@@ -216,7 +306,19 @@ impl Game for SimplifiedNlheGame {
     const VARIANT: crate::error::GameVariant = crate::error::GameVariant::SimplifiedNlhe;
 
     fn bucket_table_blake3(&self) -> [u8; 32] {
-        self.bucket_table.content_hash()
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"poker:nlhe-checkpoint-compat:v1");
+        hasher.update(&self.bucket_table.content_hash());
+        hasher.update(&[self.stack_profile.checkpoint_profile_tag()]);
+        hasher.update(&self.config.n_seats.to_le_bytes());
+        for stack in &self.config.starting_stacks {
+            hasher.update(&stack.as_u64().to_le_bytes());
+        }
+        hasher.update(&self.config.small_blind.as_u64().to_le_bytes());
+        hasher.update(&self.config.big_blind.as_u64().to_le_bytes());
+        hasher.update(&self.config.ante.as_u64().to_le_bytes());
+        hasher.update(&self.config.button_seat.0.to_le_bytes());
+        hasher.finalize().into()
     }
 
     fn n_players(&self) -> usize {

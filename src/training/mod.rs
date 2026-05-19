@@ -43,7 +43,8 @@ pub use game::{Game, NodeKind, PlayerId};
 pub use kuhn::{KuhnAction, KuhnGame, KuhnHistory, KuhnInfoSet, KuhnState};
 pub use leduc::{LeducAction, LeducGame, LeducHistory, LeducInfoSet, LeducState, LeducStreet};
 pub use nlhe::{
-    SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
+    NlheStackProfile, SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet,
+    SimplifiedNlheState,
 };
 pub use nlhe_eval::{
     estimate_simplified_nlhe_lbr, estimate_simplified_nlhe_lbr_filtered,

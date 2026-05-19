@@ -170,7 +170,8 @@ fn walk_to_first_player_node(
 ///
 /// 该测试在 A1 scaffold 阶段必然 panic-fail（`SimplifiedNlheGame::new` /
 /// `SimplifiedNlheGame::n_players` 均 `unimplemented!()`），C2 \[实现\] 落地后转
-/// 绿。本 trip-wire 锁定 D-313 "2-player + 100 BB starting stack" 字面范围。
+/// 绿。本 trip-wire 锁定 D-313 "2-player + selected finite stack profile" 字面范围；
+/// 默认构造仍为 100BB。
 #[test]
 fn simplified_nlhe_game_root_state_2_player_100bb_starting_stack() {
     let Some(game) = load_v3_artifact_or_skip() else {

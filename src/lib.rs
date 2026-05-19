@@ -68,6 +68,7 @@ pub use crate::training::{
     EsMccfrTrainer, Game, GameVariant, KuhnAction, KuhnBestResponse, KuhnGame, KuhnHistory,
     KuhnInfoSet, LeducAction, LeducBestResponse, LeducGame, LeducInfoSet, LeducStreet,
     NlheBaselinePolicy, NlheEvaluationConfig, NlheEvaluationError, NlheEvaluationReport,
-    NlheLbrConfig, NlheLbrReport, NodeKind, PlayerId, RegretTable, SimplifiedNlheGame,
-    StrategyAccumulator, Trainer, TrainerError, TrainerVariant, VanillaCfrTrainer,
+    NlheLbrConfig, NlheLbrReport, NlheStackProfile, NodeKind, PlayerId, RegretTable,
+    SimplifiedNlheGame, StrategyAccumulator, Trainer, TrainerError, TrainerVariant,
+    VanillaCfrTrainer,
 };

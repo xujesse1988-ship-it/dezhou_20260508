@@ -78,6 +78,8 @@ fn _api_signature_assertions() {
 
     let _: fn() -> TableConfig = TableConfig::default_6max_100bb;
     let _: fn() -> TableConfig = TableConfig::default_hu_100bb;
+    let _: fn() -> TableConfig = TableConfig::default_hu_200bb;
+    let _: fn() -> TableConfig = TableConfig::default_hu_slumbot_200bb;
 
     // ===================================================================
     // rules::state (api §4 + API-001-rev1)
@@ -351,7 +353,9 @@ fn _stage3_api_signature_assertions() {
     use poker::training::checkpoint::{MAGIC, SCHEMA_VERSION};
     use poker::training::kuhn::KuhnState;
     use poker::training::leduc::LeducState;
-    use poker::training::nlhe::{SimplifiedNlheAction, SimplifiedNlheInfoSet, SimplifiedNlheState};
+    use poker::training::nlhe::{
+        NlheStackProfile, SimplifiedNlheAction, SimplifiedNlheInfoSet, SimplifiedNlheState,
+    };
     use poker::training::nlhe_eval::{
         estimate_simplified_nlhe_lbr, evaluate_blueprint_vs_baseline, NlheBaselinePolicy,
         NlheEvaluationConfig, NlheEvaluationReport, NlheLbrConfig, NlheLbrReport,
@@ -415,6 +419,17 @@ fn _stage3_api_signature_assertions() {
     // SimplifiedNlheGame::new（API-303 构造函数 + D-314 bucket table 依赖 deferred）。
     let _: fn(Arc<BucketTable>) -> Result<SimplifiedNlheGame, TrainerError> =
         SimplifiedNlheGame::new;
+    let _: fn(Arc<BucketTable>, NlheStackProfile) -> Result<SimplifiedNlheGame, TrainerError> =
+        SimplifiedNlheGame::new_with_stack_profile;
+    let _: for<'a> fn(&'a SimplifiedNlheGame) -> NlheStackProfile =
+        SimplifiedNlheGame::stack_profile;
+    let _: for<'a> fn(&'a SimplifiedNlheGame) -> &'a TableConfig = SimplifiedNlheGame::config;
+    let _: fn(u16) -> Option<NlheStackProfile> = NlheStackProfile::from_stack_bb;
+    let _: fn(NlheStackProfile) -> u16 = NlheStackProfile::stack_bb;
+    let _: fn(NlheStackProfile) -> &'static str = NlheStackProfile::slug;
+    let _: fn(NlheStackProfile) -> TableConfig = NlheStackProfile::table_config;
+    let _: NlheStackProfile = NlheStackProfile::Hu100Bb;
+    let _: NlheStackProfile = NlheStackProfile::Hu200Bb;
 
     // ===================================================================
     // training::regret (api §3)
@@ -723,7 +738,7 @@ fn _stage3_api_signature_assertions() {
 
     // Game::bucket_table_blake3 默认方法 UFCS lock × 3 impl（API-300-rev1 D2
     // 落地的默认方法；KuhnGame / LeducGame 走 default 返回 [0; 32]；
-    // SimplifiedNlheGame override 返回 self.bucket_table.content_hash()）。
+    // SimplifiedNlheGame override 返回 bucket table + stack profile 兼容 fingerprint）。
     let _: for<'a> fn(&'a KuhnGame) -> [u8; 32] = <KuhnGame as Game>::bucket_table_blake3;
     let _: for<'a> fn(&'a LeducGame) -> [u8; 32] = <LeducGame as Game>::bucket_table_blake3;
     let _: for<'a> fn(&'a SimplifiedNlheGame) -> [u8; 32] =

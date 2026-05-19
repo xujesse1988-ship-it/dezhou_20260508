@@ -49,4 +49,24 @@ impl TableConfig {
             button_seat: SeatId(0),
         }
     }
+
+    /// Heads-up 200BB 的默认配置：2 座、起始 200BB、SB=50、BB=100、ante=0、按钮在座位 0。
+    ///
+    /// 该 profile 对齐 Slumbot 网站/API 的公开规则：每手 20,000 chips 起始筹码，
+    /// blinds 50/100，stack 每手重置。
+    pub fn default_hu_200bb() -> TableConfig {
+        TableConfig {
+            n_seats: 2,
+            starting_stacks: vec![ChipAmount::new(20_000); 2],
+            small_blind: ChipAmount::new(50),
+            big_blind: ChipAmount::new(100),
+            ante: ChipAmount::ZERO,
+            button_seat: SeatId(0),
+        }
+    }
+
+    /// Slumbot 对齐别名；语义等价于 [`Self::default_hu_200bb`]。
+    pub fn default_hu_slumbot_200bb() -> TableConfig {
+        Self::default_hu_200bb()
+    }
 }

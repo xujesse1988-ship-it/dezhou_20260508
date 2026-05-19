@@ -16,13 +16,14 @@
 ```text
 // ===== header (108 bytes, 8-byte aligned) =====
 offset 0x00: magic:                  [u8; 8] = b"PLCKPT\\0\\0"
-offset 0x08: schema_version:         u32 LE = 3
+offset 0x08: schema_version:         u32 LE = 4
 offset 0x0C: trainer_variant:        u8 (0 = VanillaCfr, 1 = EsMccfr)
 offset 0x0D: game_variant:           u8 (0 = Kuhn, 1 = Leduc, 2 = SimplifiedNlhe)
 offset 0x0E: pad:                    [u8; 6] = 0
 offset 0x14: update_count:           u64 LE
 offset 0x1C: rng_state:              [u8; 32]
-offset 0x3C: bucket_table_blake3:    [u8; 32]（Kuhn / Leduc 全零）
+offset 0x3C: bucket_table_blake3:    [u8; 32]（Kuhn / Leduc 全零；NLHE v4 起为
+                                      bucket table + stack profile 兼容 fingerprint）
 offset 0x5C: regret_table_offset:    u64 LE（≥ 108）
 offset 0x64: strategy_sum_offset:    u64 LE
 // ===== body (变长, 按 header §regret/strategy offset 定位) =====
@@ -37,7 +38,7 @@ offset 0x64: strategy_sum_offset:    u64 LE
 不区分 enum）：
 
 - `magic != b"PLCKPT\\0\\0"` → `CheckpointReaderError("magic bytes mismatch")`
-- `schema_version != 3`       → `CheckpointReaderError("schema mismatch ...")`
+- `schema_version != 4`       → `CheckpointReaderError("schema mismatch ...")`
 - `trainer_variant` 未知 tag  → `CheckpointReaderError("unknown trainer_variant tag ...")`
 - `game_variant` 未知 tag     → `CheckpointReaderError("unknown game_variant tag ...")`
 - header pad != 0             → `CheckpointReaderError("pad byte non-zero ...")`
@@ -96,7 +97,7 @@ from typing import Any, Optional
 
 
 MAGIC = b"PLCKPT\x00\x00"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 HEADER_LEN = 108
 TRAILER_LEN = 32
 

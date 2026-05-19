@@ -23,7 +23,8 @@
 //!     --checkpoint <PATH> \
 //!     --bucket-table <PATH> \
 //!     --mode <strategy|regret> \
-//!     --output <MD_PATH>
+//!     --output <MD_PATH> \
+//!     [--stack-bb 100|200]
 //! ```
 
 use std::collections::BTreeMap;
@@ -33,7 +34,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use poker::training::nlhe::SimplifiedNlheGame;
+use poker::training::nlhe::{NlheStackProfile, SimplifiedNlheGame};
 use poker::training::{EsMccfrTrainer, Trainer};
 use poker::{BucketTable, InfoSetId, StreetTag};
 
@@ -91,6 +92,7 @@ struct Args {
     bucket_table: PathBuf,
     output: PathBuf,
     mode: Mode,
+    stack_profile: NlheStackProfile,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -98,6 +100,7 @@ fn parse_args() -> Result<Args, String> {
     let mut bucket_table: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut mode: Mode = Mode::Strategy;
+    let mut stack_profile = NlheStackProfile::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut take = || -> Result<String, String> {
@@ -109,10 +112,12 @@ fn parse_args() -> Result<Args, String> {
             "--bucket-table" | "--artifact" => bucket_table = Some(PathBuf::from(take()?)),
             "--output" => output = Some(PathBuf::from(take()?)),
             "--mode" => mode = Mode::from_str(&take()?)?,
+            "--stack-bb" => stack_profile = take()?.parse()?,
             "--help" | "-h" => {
                 eprintln!(
                     "usage: nlhe_infoset_signal_dump --checkpoint PATH \
-                     --bucket-table PATH --output PATH [--mode strategy|regret]"
+                     --bucket-table PATH --output PATH [--mode strategy|regret] \
+                     [--stack-bb 100|200]"
                 );
                 std::process::exit(0);
             }
@@ -124,6 +129,7 @@ fn parse_args() -> Result<Args, String> {
         bucket_table: bucket_table.ok_or("--bucket-table required")?,
         output: output.ok_or("--output required")?,
         mode,
+        stack_profile,
     })
 }
 
@@ -132,7 +138,7 @@ fn run(args: Args) -> Result<(), String> {
         BucketTable::open(&args.bucket_table)
             .map_err(|e| format!("BucketTable::open failed: {e:?}"))?,
     );
-    let game = SimplifiedNlheGame::new(Arc::clone(&table))
+    let game = SimplifiedNlheGame::new_with_stack_profile(Arc::clone(&table), args.stack_profile)
         .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
     let trainer =
         <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
@@ -183,6 +189,7 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(out, "- checkpoint: `{}`", args.checkpoint.display()).unwrap();
     writeln!(out, "- update_count: `{}`", trainer.update_count()).unwrap();
     writeln!(out, "- bucket_table: `{}`", args.bucket_table.display()).unwrap();
+    writeln!(out, "- stack_profile: `{}`", args.stack_profile).unwrap();
     writeln!(out, "- mode: `{}`", args.mode.slug()).unwrap();
     writeln!(out, "- weight_formula: `{}`", args.mode.formula()).unwrap();
     writeln!(out, "- n_visited_infosets: `{}`", n_all).unwrap();

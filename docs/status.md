@@ -13,7 +13,7 @@
 | Kuhn Vanilla CFR | ✅ 收敛到 closed-form Nash `-1/18` | `tests/cfr_kuhn.rs` |
 | Leduc Vanilla CFR | ✅ exploitability `< 0.1` @ 10K iter | `tests/cfr_leduc.rs` |
 | Leduc ES-MCCFR | ✅ 1M 外部对照通过；Rust 2M per-player update EV 与 `leduc_mccfr.py` 1M iter 同量级 | `leduc_mccfr.py` + `tools/leduc_es_mccfr_report.rs` |
-| 简化 NLHE ES-MCCFR | ⚠️ 默认 action profile 已扩为 `0.33/0.5/0.75/1.0/1.5/2.0 pot + all-in`；checkpoint schema v3，旧 2-ratio checkpoint 不兼容需重训；InfoSetId v2 layout（hand_bucket / node_id / street_tag）跨街抽象动作历史单射仍保留 | `src/abstraction/action.rs` + `src/training/nlhe_betting_tree.rs` + `tests/cfr_simplified_nlhe.rs` |
+| 简化 NLHE ES-MCCFR | ⚠️ 默认 action profile 已扩为 `0.33/0.5/0.75/1.0/1.5/2.0 pot + all-in`；起始筹码 profile 支持 `100BB` / `200BB`（Slumbot 对齐）；checkpoint schema v4，旧 profile checkpoint 不兼容需重训；InfoSetId v2 layout（hand_bucket / node_id / street_tag）跨街抽象动作历史单射仍保留 | `src/abstraction/action.rs` + `src/training/nlhe.rs` + `src/training/nlhe_betting_tree.rs` + `tests/cfr_simplified_nlhe.rs` |
 | H3 简化 NLHE 闭环工具 | ✅ 训练入口、三类 baseline 评测、H3 LBR proxy、Markdown/JSON report、preflop strategy dump、抽象 betting tree sizing 全套 smoke 通过 | `tools/train_cfr.rs` + `tools/nlhe_h3_report.rs` + `tools/nlhe_preflop_strategy_dump.rs` + `tools/nlhe_betting_tree_sizing.rs` + `tests/nlhe_h3_eval.rs` |
 
 ### 最近验证证据
@@ -29,12 +29,16 @@
   `artifacts/leduc_es_mccfr_100m_full_history.txt` 输出 `ev_p0=-0.086036478`、
   `exploitability_chips_per_game=0.147556546`、
   `average_strategy_blake3=c0b8bcfa6db843b410f515b8526f08de19f573c88fb4eaf20afe431dba98385c`。
-- 简化 NLHE action profile 更新（2026-05-19）：
+- 简化 NLHE action / stack profile 更新（2026-05-19）：
   - 默认 bet/raise ratio = `0.33 / 0.5 / 0.75 / 1.0 / 1.5 / 2.0 pot`，外加 all-in。
-  - checkpoint `SCHEMA_VERSION = 3`；`artifacts/phase3_post_history_fix_1b/*.ckpt`
-    是旧 2-ratio profile 训练结果，当前代码会拒绝加载，需要按新 profile 重训。
-  - 抽象 betting tree 节点数 = 5,201,712（`tools/nlhe_betting_tree_sizing.rs` 实测），
-    node_id 需要 23 bit，仍小于当前 InfoSetId v2 的 26-bit node_id 字段。
+  - `NlheStackProfile` 支持 `100bb`（默认）与 `200bb`（Slumbot：20,000 chips,
+    SB/BB=50/100）；`train_cfr` / H3 report / preflop dump / signal dump /
+    betting-tree sizing 均支持 `--stack-bb 100|200`。
+  - checkpoint `SCHEMA_VERSION = 4`；NLHE checkpoint 兼容 fingerprint 包含 bucket table
+    hash + stack profile + table config。旧 v3/v2 checkpoint 当前代码会拒绝加载，
+    需要按新 profile 重训。
+  - 100BB 抽象 betting tree 节点数 = 5,201,712（node_id 23 bit）；200BB 节点数
+    = 29,744,992（node_id 25 bit），均小于当前 InfoSetId v2 的 26-bit node_id 字段。
   - 旧 1B 结果（preflop 病态消失、LBR plateau @ 940 mbb/g ± 20）只作为历史参考，
     不再代表当前 action profile 的训练质量。
 

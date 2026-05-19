@@ -1,6 +1,6 @@
 //! Heads-up NLHE profile regression tests.
 //!
-//! These tests lock the public 2-player 100BB profile introduced for the
+//! These tests lock the public 2-player HU profiles introduced for the
 //! heads-up solver target while keeping the generic `SeatId` / `TableConfig`
 //! model intact.
 
@@ -66,6 +66,40 @@ fn default_hu_100bb_posts_button_sb_and_bb() {
 
     Invariants::check_all(&state, expected_total_chips(&cfg))
         .expect("default HU initial state should satisfy invariants");
+}
+
+#[test]
+fn default_hu_200bb_posts_button_sb_and_bb() {
+    let cfg = TableConfig::default_hu_200bb();
+    assert_eq!(cfg.n_seats, 2);
+    assert_eq!(cfg.starting_stacks, vec![chips(20_000); 2]);
+    assert_eq!(cfg.small_blind, chips(50));
+    assert_eq!(cfg.big_blind, chips(100));
+    assert_eq!(cfg.ante, chips(0));
+    assert_eq!(cfg.button_seat, seat(0));
+
+    let state = GameState::new(&cfg, 0);
+    assert_eq!(state.players().len(), 2);
+    assert_eq!(state.pot(), chips(150));
+    assert_eq!(
+        state.current_player(),
+        Some(seat(0)),
+        "HU preflop first action should be button/SB"
+    );
+
+    let sb = &state.players()[0];
+    let bb = &state.players()[1];
+    assert_eq!(sb.stack, chips(19_950));
+    assert_eq!(sb.committed_this_round, chips(50));
+    assert_eq!(bb.stack, chips(19_900));
+    assert_eq!(bb.committed_this_round, chips(100));
+
+    let legal = state.legal_actions();
+    assert_eq!(legal.raise_range, Some((chips(200), chips(20_000))));
+    assert_eq!(legal.all_in_amount, Some(chips(20_000)));
+
+    Invariants::check_all(&state, expected_total_chips(&cfg))
+        .expect("default HU 200BB initial state should satisfy invariants");
 }
 
 #[test]
