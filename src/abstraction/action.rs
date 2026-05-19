@@ -47,7 +47,8 @@ pub enum AbstractAction {
 
 /// pot ratio 标签的整数编码，避免 `f64` 进入 `Eq` / `Hash`。
 ///
-/// 内部存 `ratio × 1000` 的 `u32`（D-200 默认值：`0.33 / 0.5 / 0.75 / 1.0 / 1.5 / 2.0 pot`）。
+/// 内部存 `ratio × 1000` 的 `u32`（D-200 当前默认值：
+/// `0.5 / 0.75 / 1.0 / 2.0 pot`）。
 /// `ActionAbstractionConfig` 接受 `f64` 输入但内部规整为该整数表示。
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct BetRatio(u32);
@@ -103,7 +104,7 @@ impl BetRatio {
 /// `[Fold?, Check?, Call?, Bet/Raise(ratio_0)?, ..., Bet/Raise(ratio_n)?, AllIn?]`
 /// `?` 表示不存在则跳过；同一 ratio 槽位 `Bet` 与 `Raise` 互斥（由 stage 1
 /// LA-002 保证）。默认 ratio profile 是
-/// `0.33×pot / 0.5×pot / 0.75×pot / 1.0×pot / 1.5×pot / 2.0×pot`。
+/// `0.5×pot / 0.75×pot / 1.0×pot / 2.0×pot`。
 #[derive(Clone, Debug)]
 pub struct AbstractActionSet {
     actions: Vec<AbstractAction>,
@@ -139,25 +140,29 @@ pub struct ActionAbstractionConfig {
 }
 
 impl ActionAbstractionConfig {
-    /// 默认 6 档 bet/raise 配置：
-    /// `0.33×pot / 0.5×pot / 0.75×pot / 1.0×pot / 1.5×pot / 2.0×pot`。
-    pub fn default_six_ratio_action() -> ActionAbstractionConfig {
+    /// 默认 4 档 bet/raise 配置：
+    /// `0.5×pot / 0.75×pot / 1.0×pot / 2.0×pot`。
+    pub fn default_four_ratio_action() -> ActionAbstractionConfig {
         ActionAbstractionConfig {
             raise_pot_ratios: vec![
-                BetRatio::THIRTY_THREE_POT,
                 BetRatio::HALF_POT,
                 BetRatio::THREE_QUARTER_POT,
                 BetRatio::FULL_POT,
-                BetRatio::ONE_AND_HALF_POT,
                 BetRatio::DOUBLE_POT,
             ],
         }
     }
 
     /// Legacy constructor name kept for API compatibility. It now returns the
-    /// default 6-ratio action profile.
+    /// default 4-ratio action profile.
+    pub fn default_six_ratio_action() -> ActionAbstractionConfig {
+        Self::default_four_ratio_action()
+    }
+
+    /// Legacy constructor name kept for API compatibility. It now returns the
+    /// default 4-ratio action profile.
     pub fn default_5_action() -> ActionAbstractionConfig {
-        Self::default_six_ratio_action()
+        Self::default_four_ratio_action()
     }
 
     /// 自定义构造。长度 / 范围越界 / 量化后 milli 重复均返回 `ConfigError`
@@ -225,7 +230,7 @@ pub trait ActionAbstraction: Send + Sync {
     fn config(&self) -> &ActionAbstractionConfig;
 }
 
-/// 默认 action 抽象（D-200），当前 bet/raise profile 为 6 档 pot ratio。
+/// 默认 action 抽象（D-200），当前 bet/raise profile 为 4 档 pot ratio。
 pub struct DefaultActionAbstraction {
     config: ActionAbstractionConfig,
 }
@@ -236,11 +241,15 @@ impl DefaultActionAbstraction {
     }
 
     pub fn default_5_action() -> DefaultActionAbstraction {
-        Self::default_six_ratio_action()
+        Self::default_four_ratio_action()
+    }
+
+    pub fn default_four_ratio_action() -> DefaultActionAbstraction {
+        DefaultActionAbstraction::new(ActionAbstractionConfig::default_four_ratio_action())
     }
 
     pub fn default_six_ratio_action() -> DefaultActionAbstraction {
-        DefaultActionAbstraction::new(ActionAbstractionConfig::default_six_ratio_action())
+        Self::default_four_ratio_action()
     }
 }
 

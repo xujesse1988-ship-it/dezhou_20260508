@@ -2,7 +2,7 @@
 //!
 //! 简化 NLHE 范围（D-313）：2-player + 可选 100BB / 200BB starting stack +
 //! 盲注 0.5/1.0 BB + 完整 4 街 + stage 2 `DefaultActionAbstraction`
-//! （6 档 bet/raise ratio）+ stage 2 `PreflopLossless169` +
+//! （4 档 bet/raise ratio）+ stage 2 `PreflopLossless169` +
 //! `PostflopBucketAbstraction`（500/500/500 bucket）。
 //! 复用 stage 1 [`crate::GameState`] + stage 2 [`crate::ActionAbstraction`] /
 //! [`crate::InfoAbstraction`] / [`crate::BucketTable`]，仅在 `SimplifiedNlheGame`
@@ -350,6 +350,7 @@ impl Game for SimplifiedNlheGame {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"poker:nlhe-checkpoint-compat:v1");
         hasher.update(&self.bucket_table.content_hash());
+        hasher.update(b"action-profile:0.5,0.75,1.0,2.0,allin");
         hasher.update(&[self.stack_profile.checkpoint_profile_tag()]);
         hasher.update(&self.config.n_seats.to_le_bytes());
         for stack in &self.config.starting_stacks {
@@ -439,7 +440,7 @@ impl Game for SimplifiedNlheGame {
         // 顺序由 D-209 deterministic（每次构造同型默认抽象，开销可忽略
         // —— `DefaultActionAbstraction::new` 仅 clone 配置）；Trainer 的 RegretTable
         // `Vec<f64>` 索引一一对应（D-324 action_count 训练全程恒定）。
-        let abs = DefaultActionAbstraction::default_six_ratio_action();
+        let abs = DefaultActionAbstraction::default_four_ratio_action();
         let set = abs.abstract_actions(&state.game_state);
         set.as_slice().to_vec()
     }

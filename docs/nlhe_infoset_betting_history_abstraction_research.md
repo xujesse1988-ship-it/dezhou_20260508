@@ -23,7 +23,7 @@ history collision，但也让 reachable infoset 数随 betting tree 规模快速
 不应该共用同一策略。
 
 代价是 infoset 膨胀。`docs/status.md` 中已有规模记录：100BB 抽象 betting tree
-节点约 `5,201,712`，200BB 约 `29,744,992`。这些节点大多来自下注历史路径，而
+节点约 `361,424`，200BB 约 `1,403,936`。这些节点大多来自下注历史路径，而
 CFR regret / average strategy 表会围绕 infoset key 展开。若每条路径都保持唯一，
 训练内存与采样覆盖都会变重。
 

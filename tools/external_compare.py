@@ -28,10 +28,9 @@ D-262 字面：
 通过 `--openspiel-path <path>` 参数 import 对应模块；本脚本会优先 fallback 到
 本地实现并打印对照结果。
 
-默认 action profile 对照（path.md 字面）：仅文字检查 D-200 默认 action set 与
-当前 `{ Fold, Check, Call, BetRaise(0.33×pot), BetRaise(0.5×pot),
-BetRaise(0.75×pot), BetRaise(1.0×pot), BetRaise(1.5×pot),
-BetRaise(2.0×pot), AllIn }` 匹配（无外部数据源对照）。
+默认 action profile 对照：仅文字检查 D-200 默认 action set 与当前
+`{ Fold, Check, Call, BetRaise(0.5×pot), BetRaise(0.75×pot),
+BetRaise(1.0×pot), BetRaise(2.0×pot), AllIn }` 匹配（无外部数据源对照）。
 
 用法::
 
@@ -169,9 +168,8 @@ def render_markdown(comparison: dict[str, dict], openspiel_used: bool) -> str:
     out.append("")
     out.append(f"- 对照路径：{'OpenSpiel `pyspiel`' if openspiel_used else '纯本地 169 类生成 fallback'}")
     out.append("- 默认 action profile：D-200 锁定 `{ Fold, Check, Call, "
-               "BetRaise(0.33×pot), BetRaise(0.5×pot), BetRaise(0.75×pot), "
-               "BetRaise(1.0×pot), BetRaise(1.5×pot), BetRaise(2.0×pot), AllIn }` "
-               "与 path.md §阶段 2 字面对齐 ✓ (文字对照，无数据源)")
+               "BetRaise(0.5×pot), BetRaise(0.75×pot), BetRaise(1.0×pot), "
+               "BetRaise(2.0×pot), AllIn }` ✓ (文字对照，无数据源)")
     out.append("")
 
     total_eq = all(v["equal"] for v in comparison.values())

@@ -55,21 +55,21 @@ fn fold_to_btn(state: &mut GameState) {
 // ============================================================================
 //
 // 6-max 默认 100BB，UTG 起手 3-bet 局面：UTG / MP / CO fold，BTN 面对盲注 +
-// limpers，触发 D-200 默认 action profile：`{ Fold, Call, Bet/Raise(0.33×pot),
-// 0.5×pot, 0.75×pot, 1.0×pot, 1.5×pot, 2.0×pot, AllIn }`
+// limpers，触发 D-200 默认 action profile：`{ Fold, Call, Bet/Raise(0.5×pot),
+// 0.75×pot, 1.0×pot, 2.0×pot, AllIn }`
 //（无 `Check`，因为面对前序 bet）。
 #[test]
 fn action_abs_default_action_profile_open_raise_legal() {
     let (mut s, _cfg) = default_state(0);
     fold_to_btn(&mut s);
 
-    let abs = DefaultActionAbstraction::default_six_ratio_action();
+    let abs = DefaultActionAbstraction::default_four_ratio_action();
     let actions: AbstractActionSet = abs.abstract_actions(&s);
 
     // BTN 面对 BB（强制 bet），D-200 默认 action profile：
     //   - Fold（保留，D-204 仅在 free-check 局面剔除）
     //   - Call（跟注 BB）
-    //   - Raise(0.33×pot / 0.5×pot / 0.75×pot / 1.0×pot / 1.5×pot / 2.0×pot)
+    //   - Raise(0.5×pot / 0.75×pot / 1.0×pot / 2.0×pot)
     //   - AllIn
     // **不**含 Check（无 free-check option）；Bet 与 Raise 由 LA-002 互斥决定，
     // 此处 max_committed_this_round = BB > 0 ⇒ Raise 路径。
@@ -143,7 +143,7 @@ fn action_abs_fold_disallowed_after_check() {
 
     // 进入 flop，SB 先动（postflop 起手）。SB 面对 free-check 局面，D-204
     // 强制剔除 Fold。
-    let abs = DefaultActionAbstraction::default_six_ratio_action();
+    let abs = DefaultActionAbstraction::default_four_ratio_action();
     let actions = abs.abstract_actions(&s);
     let slice = actions.as_slice();
 
@@ -272,7 +272,7 @@ fn action_abs_bet_falls_back_to_allin_when_above_stack() {
     }
     assert_eq!(s.current_player(), Some(SeatId(2)), "短码 BB 决策");
 
-    let abs = DefaultActionAbstraction::default_six_ratio_action();
+    let abs = DefaultActionAbstraction::default_four_ratio_action();
     let actions = abs.abstract_actions(&s);
     let slice = actions.as_slice();
 
@@ -438,7 +438,7 @@ fn action_abs_short_bb_3bet_min_to_above_stack_priority_case2() {
     assert_eq!(la.call.map(|c| c.as_u64()), Some(400));
     assert_eq!(la.all_in_amount.map(|c| c.as_u64()), Some(400));
 
-    let abs = DefaultActionAbstraction::default_six_ratio_action();
+    let abs = DefaultActionAbstraction::default_four_ratio_action();
     let actions = abs.abstract_actions(&s);
     let slice = actions.as_slice();
 
@@ -500,7 +500,7 @@ fn action_abs_determinism_repeat_smoke() {
     let (mut s, _cfg) = default_state(42);
     fold_to_btn(&mut s);
 
-    let abs = DefaultActionAbstraction::default_six_ratio_action();
+    let abs = DefaultActionAbstraction::default_four_ratio_action();
     let baseline = abs.abstract_actions(&s);
     for i in 0..1_000 {
         let other = abs.abstract_actions(&s);

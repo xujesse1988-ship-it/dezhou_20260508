@@ -11,7 +11,7 @@
 //! | `pad` | 14 | 6 | 0 |
 //! | `update_count` | 20 | 8 | u64 LE |
 //! | `rng_state` | 28 | 32 | bytes |
-//! | `bucket_table_blake3` | 60 | 32 | bytes（Kuhn / Leduc 全零；NLHE v4 起为 bucket table + stack profile 兼容 fingerprint）|
+//! | `bucket_table_blake3` | 60 | 32 | bytes（Kuhn / Leduc 全零；NLHE v5 起为 bucket table + action profile + stack profile 兼容 fingerprint）|
 //! | `regret_table_offset` | 92 | 8 | u64 LE（≥ 108）|
 //! | `strategy_sum_offset` | 100 | 8 | u64 LE |
 //! | `regret_table_body` | `regret_table_offset` | varies | bincode 1.x serialized `Vec<(InfoSet, Vec<f64>)>` |
@@ -47,10 +47,16 @@ pub const MAGIC: [u8; 8] = *b"PLCKPT\0\0";
 
 /// 当前 schema version（API-350 / D-350）。
 ///
+/// `4 → 5`：默认 NLHE action abstraction 从 6 档 bet/raise ratio
+/// (`0.33 / 0.5 / 0.75 / 1.0 / 1.5 / 2.0 pot`) 缩为 4 档
+/// (`0.5 / 0.75 / 1.0 / 2.0 pot`)。同一 InfoSet 下 action_count 与 action_index
+/// 语义改变，旧 checkpoint 的 regret / strategy_sum 向量不能安全复用，因此必须
+/// bump 拒绝。
+///
 /// `3 → 4`：简化 NLHE 增加 200BB stack profile；checkpoint header 中原
 /// `bucket_table_blake3` 兼容字段对 NLHE 改为
-/// `BLAKE3(bucket_table_hash + stack profile + table config)`，避免 100BB / 200BB
-/// regret 表在同一 bucket table 下误加载。
+/// `BLAKE3(bucket_table_hash + action profile + stack profile + table config)`，
+/// 避免不同 NLHE profile 的 regret 表在同一 bucket table 下误加载。
 ///
 /// `2 → 3`：默认 action abstraction 从 2 档 bet/raise ratio
 /// (`0.5 / 1.0 pot`) 扩为 6 档 (`0.33 / 0.5 / 0.75 / 1.0 / 1.5 / 2.0 pot`)。
@@ -62,7 +68,7 @@ pub const MAGIC: [u8; 8] = *b"PLCKPT\0\0";
 /// checkpoint）regret 表 key 在 v2 编码下指向无关 InfoSet，加载即静默废弃训练
 /// 进度，因此必须 bump 拒绝。Kuhn / Leduc InfoSet 编码未变但同步 bump（一次性
 /// 失效旧 ckpt，避免分 game variant 维护子版本号）。
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Header 长度（API-350 binary layout）。
 pub const HEADER_LEN: usize = 108;

@@ -37,7 +37,7 @@ tempfile = "3"
 # `cfvs` / `delta` / `weighted` / `nonzero_dist` 这些短向量（当前 NLHE 默认动作集 /
 # `[f64; 12]` inline 容量）走 stack alloc 替 `Vec<f64>` 堆分配，让 `recurse_es` /
 # `recurse_es_parallel` 内部 ~1-2M 次/run alloc/dealloc 收回。`SmallVec` 1.x
-# stable API；inline-size 12 覆盖当前 6 档 bet/raise ratio action profile + 留余量给后续抽象。
+# stable API；inline-size 12 覆盖当前 4 档 bet/raise ratio action profile + 留余量给后续抽象。
 smallvec = "1"
 # serde + derive：D-327 InfoSet / 累积向量经 bincode 序列化的 derive 入口。dev-
 # dependencies 已经间接拉入 serde（via serde_json），但产品代码引用必须显式声明，

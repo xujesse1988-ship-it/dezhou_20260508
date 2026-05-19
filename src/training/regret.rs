@@ -31,7 +31,7 @@ use smallvec::SmallVec;
 
 /// 短策略向量类型别名（E2-rev1 \[实现\]）。
 ///
-/// `SmallVec<[f64; 12]>` inline 容量 12 覆盖当前 NLHE 默认 6 档 ratio action
+/// `SmallVec<[f64; 12]>` inline 容量 12 覆盖当前 NLHE 默认 4 档 ratio action
 /// profile / Kuhn 2-action / Leduc 3-action 全场景；溢出时自动 spill 到堆（保留对未来 large-action
 /// abstraction 的兼容）。返回值实现 `IntoIterator<Item = f64>` 与
 /// `Deref<Target = [f64]>`，调用站点与 `Vec<f64>` 替换无感（除显式 `Vec` 注解）。

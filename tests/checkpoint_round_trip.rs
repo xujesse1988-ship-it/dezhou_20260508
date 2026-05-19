@@ -916,8 +916,8 @@ fn checkpoint_error_5_variants_exhaustive_match_lock() {
 fn d350_header_constants_lock() {
     assert_eq!(MAGIC, *b"PLCKPT\0\0", "D-350 magic 字面字节序列锁");
     assert_eq!(
-        SCHEMA_VERSION, 4,
-        "200BB stack profile 进入 NLHE checkpoint 兼容 fingerprint 后 SCHEMA_VERSION = 4"
+        SCHEMA_VERSION, 5,
+        "默认 NLHE action profile 缩为 4 档后 SCHEMA_VERSION = 5"
     );
 }
 

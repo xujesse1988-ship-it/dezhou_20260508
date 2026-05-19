@@ -167,6 +167,7 @@ fn _stage2_api_signature_assertions() {
 
     // ActionAbstractionConfig
     let _: fn() -> ActionAbstractionConfig = ActionAbstractionConfig::default_5_action;
+    let _: fn() -> ActionAbstractionConfig = ActionAbstractionConfig::default_four_ratio_action;
     let _: fn() -> ActionAbstractionConfig = ActionAbstractionConfig::default_six_ratio_action;
     let _: fn(Vec<f64>) -> Result<ActionAbstractionConfig, ConfigError> =
         ActionAbstractionConfig::new;
@@ -175,6 +176,7 @@ fn _stage2_api_signature_assertions() {
     // DefaultActionAbstraction
     let _: fn(ActionAbstractionConfig) -> DefaultActionAbstraction = DefaultActionAbstraction::new;
     let _: fn() -> DefaultActionAbstraction = DefaultActionAbstraction::default_5_action;
+    let _: fn() -> DefaultActionAbstraction = DefaultActionAbstraction::default_four_ratio_action;
     let _: fn() -> DefaultActionAbstraction = DefaultActionAbstraction::default_six_ratio_action;
 
     // ActionAbstraction trait 方法 UFCS 绑到具体 impl，锁住 trait + impl 联合签名
@@ -746,7 +748,7 @@ fn _stage3_api_signature_assertions() {
 
     // Game::bucket_table_blake3 默认方法 UFCS lock × 3 impl（API-300-rev1 D2
     // 落地的默认方法；KuhnGame / LeducGame 走 default 返回 [0; 32]；
-    // SimplifiedNlheGame override 返回 bucket table + stack profile 兼容 fingerprint）。
+    // SimplifiedNlheGame override 返回 bucket table + action profile + stack profile 兼容 fingerprint）。
     let _: for<'a> fn(&'a KuhnGame) -> [u8; 32] = <KuhnGame as Game>::bucket_table_blake3;
     let _: for<'a> fn(&'a LeducGame) -> [u8; 32] = <LeducGame as Game>::bucket_table_blake3;
     let _: for<'a> fn(&'a SimplifiedNlheGame) -> [u8; 32] =

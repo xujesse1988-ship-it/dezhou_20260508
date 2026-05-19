@@ -9,7 +9,7 @@
 //! 2. `simplified_nlhe_legal_actions_returns_default_action_abstraction_5_action`
 //!    （D-318 桥接 sanity，default profile active）— 从 root walk chance node 到
 //!    首个 Player node，`legal_actions` 返回 `Vec<AbstractAction>` 且 size ∈ [2, 5]
-//!    （默认 6 档 bet/raise 上界，SB/BB 可能受 stack/bet 约束更少）。
+//!    （默认 4 档 bet/raise 上界，SB/BB 可能受 stack/bet 约束更少）。
 //! 3. `simplified_nlhe_info_set_uses_stage2_infosetid`（D-317 桥接 sanity，default
 //!    profile active）— 首个 Player node 的 `info_set` 返回 `InfoSetId`（stage 2
 //!    64-bit layout），`street_tag` ∈ Preflop（root 后未发 board）。
@@ -204,7 +204,7 @@ fn simplified_nlhe_game_root_state_2_player_100bb_starting_stack() {
 // ===========================================================================
 
 /// D-318 桥接 sanity：首个 Player node 的 `legal_actions` 返回
-/// `Vec<AbstractAction>`（不再二次抽象），size ∈ [2, 9]（默认 6 档 bet/raise 上界；
+/// `Vec<AbstractAction>`（不再二次抽象），size ∈ [2, 7]（默认 4 档 bet/raise 上界；
 /// 下界 2：至少 Fold + Call 或 Fold + 某一 Raise）。
 ///
 /// **不锁定** 具体 5 action 出现顺序或具体 AbstractAction variants（C2 \[实现\] 走
@@ -225,8 +225,8 @@ fn simplified_nlhe_legal_actions_returns_default_action_abstraction_profile() {
         actions.len()
     );
     assert!(
-        actions.len() <= 9,
-        "legal_actions().len() = {} > 9（D-209 默认 6 档 bet/raise 上界，SB/BB 短码可能更少）",
+        actions.len() <= 7,
+        "legal_actions().len() = {} > 7（D-209 默认 4 档 bet/raise 上界，SB/BB 短码可能更少）",
         actions.len()
     );
     // 全部 actions 应当是有效 AbstractAction（trait bound `Eq + Copy + Debug` 已由

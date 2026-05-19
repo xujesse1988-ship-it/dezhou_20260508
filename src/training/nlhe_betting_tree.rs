@@ -110,7 +110,7 @@ impl PublicBettingTree {
             .0 as PlayerId;
         let my_id = self.nodes.len() as NodeId;
 
-        let abs = DefaultActionAbstraction::default_six_ratio_action();
+        let abs = DefaultActionAbstraction::default_four_ratio_action();
         let legal_set = abs.abstract_actions(&state);
         let legal_actions: SmallVec<[AbstractActionTag; 12]> =
             legal_set.iter().map(AbstractActionTag::of).collect();
@@ -212,10 +212,10 @@ mod tests {
 
     #[test]
     fn node_count_matches_phase0_sizing() {
-        // Six-ratio default action profile sizing tool reported 5,201,712 decision nodes.
+        // Four-ratio default action profile sizing tool reports this count.
         // Tree builder must agree (same DFS shape, same `DefaultActionAbstraction`).
         let tree = build_default_tree();
-        assert_eq!(tree.num_nodes(), 5_201_712);
+        assert_eq!(tree.num_nodes(), 361_424);
     }
 
     #[test]

@@ -106,7 +106,7 @@ information abstraction 不应假设永远只有 2 人，但当前 bucket 特征
 
 验收：
 
-- action abstraction 支持 fold/check/call、`0.33 pot`、`0.5 pot`、`0.75 pot`、`1 pot`、`1.5 pot`、`2 pot`、all-in，并可配置。
+- 默认 action abstraction 支持 fold/check/call、`0.5 pot`、`0.75 pot`、`1 pot`、`2 pot`、all-in；`0.33 pot`、`1.5 pot` 等尺寸仍可通过自定义配置扩展。
 - preflop 至少 lossless `169` 起手类别。
 - flop / turn / river bucket 表可生成、可加载、可复现。
 - first usable blueprint 至少完成 `1,000,000,000` 次 sampled decision 更新。
