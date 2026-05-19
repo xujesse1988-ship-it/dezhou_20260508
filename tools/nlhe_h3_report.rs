@@ -22,6 +22,43 @@ use poker::training::{
 };
 use poker::{BucketTable, ChaCha20Rng, InfoSetId, RngSource};
 
+/// Blueprint 策略 fallback 策略（D-321 派生修正）。
+///
+/// 默认 `Hybrid`：strategy_sum 全零（π_trav 长期 = 0 的 off-policy infoset）退化为
+/// average_strategy 均匀 fallback 的 53.5% infoset 改走 current_strategy（regret
+/// matching 后的策略），这些 infoset 的 regret 是真实更新过的。
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum FallbackPolicy {
+    /// 一律 `trainer.average_strategy(info)`；零 strategy_sum infoset 退化均匀分布
+    /// （旧默认行为，可用于复现历史 LBR 数字）。
+    Average,
+    /// 一律 `trainer.current_strategy(info)`（regret matching）。
+    Current,
+    /// strategy_sum 全零 → current_strategy；其它 → average_strategy。
+    Hybrid,
+}
+
+impl FallbackPolicy {
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "average" | "avg" => Ok(FallbackPolicy::Average),
+            "current" | "cur" => Ok(FallbackPolicy::Current),
+            "hybrid" => Ok(FallbackPolicy::Hybrid),
+            other => Err(format!(
+                "unknown --fallback-policy {other:?}; expected average|current|hybrid"
+            )),
+        }
+    }
+    fn slug(self) -> &'static str {
+        match self {
+            FallbackPolicy::Average => "average",
+            FallbackPolicy::Current => "current",
+            FallbackPolicy::Hybrid => "hybrid",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Args {
     artifact: PathBuf,
@@ -34,6 +71,7 @@ struct Args {
     lbr_probes: u64,
     lbr_rollouts: u64,
     output: PathBuf,
+    fallback_policy: FallbackPolicy,
 }
 
 impl Default for Args {
@@ -51,6 +89,31 @@ impl Default for Args {
             lbr_probes: 1_000,
             lbr_rollouts: 16,
             output: PathBuf::from("artifacts/h3_nlhe_report.md"),
+            fallback_policy: FallbackPolicy::Hybrid,
+        }
+    }
+}
+
+/// 构造 blueprint 策略 closure。`Hybrid` 模式在 strategy_sum 全零（π_trav 持续 0
+/// 的 off-policy infoset）时回退到 regret-matched `current_strategy`，避免 LBR
+/// probe 在这类 infoset 上拿到均匀分布而不是真实学到的策略。
+fn make_strategy_fn(
+    trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
+    policy: FallbackPolicy,
+) -> impl Fn(&InfoSetId, usize) -> Vec<f64> + '_ {
+    move |info: &InfoSetId, _n: usize| match policy {
+        FallbackPolicy::Average => trainer.average_strategy(info),
+        FallbackPolicy::Current => trainer.current_strategy(info),
+        FallbackPolicy::Hybrid => {
+            let degenerate = match trainer.strategy_sum().inner().get(info) {
+                None => true,
+                Some(v) => v.iter().sum::<f64>() <= 0.0,
+            };
+            if degenerate {
+                trainer.current_strategy(info)
+            } else {
+                trainer.average_strategy(info)
+            }
         }
     }
 }
@@ -62,6 +125,7 @@ struct H3JsonReport {
     checkpoint: Option<String>,
     update_count: u64,
     strategy_blake3: String,
+    fallback_policy: FallbackPolicy,
     evaluations: Vec<NlheEvaluationReport>,
     lbr: NlheLbrReport,
     lbr_curve: Vec<LbrCurvePoint>,
@@ -143,7 +207,11 @@ fn run() -> Result<(), String> {
         max_actions_per_rollout: 512,
     };
 
-    let strategy = |info: &InfoSetId, _n: usize| trainer.average_strategy(info);
+    eprintln!(
+        "[nlhe_h3_report] fallback_policy = {}",
+        args.fallback_policy.slug()
+    );
+    let strategy = make_strategy_fn(&trainer, args.fallback_policy);
     let mut evaluations = Vec::new();
     for baseline in [
         NlheBaselinePolicy::Random,
@@ -171,6 +239,7 @@ fn run() -> Result<(), String> {
             label.clone(),
             path,
             &lbr_cfg,
+            args.fallback_policy,
         )?);
     }
     lbr_curve.push(LbrCurvePoint {
@@ -188,6 +257,7 @@ fn run() -> Result<(), String> {
         checkpoint: args.checkpoint.as_ref().map(|p| p.display().to_string()),
         update_count: trainer.update_count(),
         strategy_blake3: strategy_hash,
+        fallback_policy: args.fallback_policy,
         evaluations,
         lbr,
         lbr_curve,
@@ -268,6 +338,7 @@ fn load_lbr_curve_point(
     label: String,
     path: &Path,
     cfg: &NlheLbrConfig,
+    policy: FallbackPolicy,
 ) -> Result<LbrCurvePoint, String> {
     let load_game = SimplifiedNlheGame::new(Arc::clone(&table))
         .map_err(|e| format!("SimplifiedNlheGame::new for curve failed: {e:?}"))?;
@@ -278,7 +349,7 @@ fn load_lbr_curve_point(
         .map_err(|e| format!("load curve checkpoint {} failed: {e:?}", path.display()))?;
     let eval_game = SimplifiedNlheGame::new(table)
         .map_err(|e| format!("SimplifiedNlheGame::new for curve eval failed: {e:?}"))?;
-    let strategy = |info: &InfoSetId, _n: usize| trainer.average_strategy(info);
+    let strategy = make_strategy_fn(&trainer, policy);
     let report = estimate_simplified_nlhe_lbr(&eval_game, &strategy, cfg)
         .map_err(|e| format!("curve LBR proxy {label} failed: {e:?}"))?;
     Ok(LbrCurvePoint {
@@ -364,8 +435,12 @@ fn markdown_report(report: &H3JsonReport) -> String {
     ));
     out.push_str(&format!("- update_count: `{}`\n", report.update_count));
     out.push_str(&format!(
-        "- strategy_blake3: `{}`\n\n",
+        "- strategy_blake3: `{}`\n",
         report.strategy_blake3
+    ));
+    out.push_str(&format!(
+        "- fallback_policy: `{}`\n\n",
+        report.fallback_policy.slug()
     ));
 
     out.push_str("## Baseline Evaluation\n\n");
@@ -433,6 +508,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--lbr-probes" => out.lbr_probes = parse_u64(&next_value(&mut args, &arg)?)?,
             "--lbr-rollouts" => out.lbr_rollouts = parse_u64(&next_value(&mut args, &arg)?)?,
+            "--fallback-policy" => {
+                out.fallback_policy = FallbackPolicy::from_str(&next_value(&mut args, &arg)?)?
+            }
             "--output" => out.output = PathBuf::from(next_value(&mut args, &arg)?),
             "--help" | "-h" => {
                 print_usage();
@@ -488,6 +566,8 @@ fn print_usage() {
          \t--eval-hands-per-seat <N>    default 1000\n\
          \t--lbr-probes <N>             default 1000\n\
          \t--lbr-rollouts <N>           default 16\n\
+         \t--fallback-policy <m>        average|current|hybrid (default hybrid; \
+         零 strategy_sum infoset 走 current_strategy 代替均匀分布)\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>"
     );
