@@ -1,8 +1,13 @@
 //! 简化 NLHE infoset 学习信号强度分析工具。
 //!
-//! 从 checkpoint 加载 ES-MCCFR trainer，dump 每个 infoset 的
-//! `Σ_a strategy_sum[I][a]`（= 该 infoset 上所有 traverser 访问的 π_trav
-//! 累计和，即该 infoset 对最终 average strategy 输出的贡献权重）。
+//! 从 checkpoint 加载 ES-MCCFR trainer，按 `--mode` 选择 dump 哪一种"信号权重"：
+//!
+//! - `strategy`（默认）：`Σ_a strategy_sum[I][a]` = 该 infoset 上所有 traverser
+//!   访问的 π_trav 累计和；越大该 infoset 对最终 average strategy 输出贡献越大。
+//!   π_trav = 0 的访问不算入。
+//! - `regret`：`Σ_a |regret[I][a]|` = 该 infoset 上所有 traverser 访问的 regret
+//!   更新 L1 累计幅度（无 π_trav 加权）；更接近"被更新次数 × 平均 |cfv − σ·v|"，
+//!   能区分"勤更新但 π_trav 持续为 0"和"几乎没被访问"两种情形。
 //!
 //! 输出：
 //! - 按 street_tag (preflop/flop/turn/river) 分桶的 percentile 分布
@@ -17,6 +22,7 @@
 //! cargo run --release --bin nlhe_infoset_signal_dump -- \
 //!     --checkpoint <PATH> \
 //!     --bucket-table <PATH> \
+//!     --mode <strategy|regret> \
 //!     --output <MD_PATH>
 //! ```
 
@@ -31,16 +37,67 @@ use poker::training::nlhe::SimplifiedNlheGame;
 use poker::training::{EsMccfrTrainer, Trainer};
 use poker::{BucketTable, InfoSetId, StreetTag};
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum Mode {
+    /// `Σ_a strategy_sum[I][a]` —— average strategy 输出贡献权重，
+    /// π_trav 加权。
+    Strategy,
+    /// `Σ_a |regret[I][a]|` —— regret 表 L1 累计幅度，无 π_trav 加权，
+    /// 更接近"被更新次数 × 平均 |cfv − σ·v|"。
+    RegretL1,
+}
+
+impl Mode {
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "strategy" | "strategy_sum" => Ok(Mode::Strategy),
+            "regret" | "regret_l1" => Ok(Mode::RegretL1),
+            other => Err(format!(
+                "unknown --mode {other:?}; expected `strategy` or `regret`"
+            )),
+        }
+    }
+    fn slug(self) -> &'static str {
+        match self {
+            Mode::Strategy => "strategy_sum",
+            Mode::RegretL1 => "regret_l1",
+        }
+    }
+    fn formula(self) -> &'static str {
+        match self {
+            Mode::Strategy => "Σ_a strategy_sum[I][a]",
+            Mode::RegretL1 => "Σ_a |regret[I][a]|",
+        }
+    }
+    fn description(self) -> &'static str {
+        match self {
+            Mode::Strategy => {
+                "= 该 infoset 上所有 traverser 访问的 π_trav 累计和。值越大表示该 \
+                 infoset 上的训练对最终 average strategy 输出贡献越大；值接近 0 \
+                 表示访问稀少或 π_trav 几乎为 0 的尾部节点。"
+            }
+            Mode::RegretL1 => {
+                "= 该 infoset 上所有 traverser 访问累计的 regret L1 范数。无 π_trav \
+                 加权，与「被 traverser 访问 + 实际更新」的次数更直接相关；\
+                 与 strategy_sum 对比能识别「勤更新但 π_trav = 0 → 不进 average」\
+                 这一类 infoset。"
+            }
+        }
+    }
+}
+
 struct Args {
     checkpoint: PathBuf,
     bucket_table: PathBuf,
     output: PathBuf,
+    mode: Mode,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut checkpoint: Option<PathBuf> = None;
     let mut bucket_table: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut mode: Mode = Mode::Strategy;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut take = || -> Result<String, String> {
@@ -51,10 +108,11 @@ fn parse_args() -> Result<Args, String> {
             "--checkpoint" => checkpoint = Some(PathBuf::from(take()?)),
             "--bucket-table" | "--artifact" => bucket_table = Some(PathBuf::from(take()?)),
             "--output" => output = Some(PathBuf::from(take()?)),
+            "--mode" => mode = Mode::from_str(&take()?)?,
             "--help" | "-h" => {
                 eprintln!(
                     "usage: nlhe_infoset_signal_dump --checkpoint PATH \
-                     --bucket-table PATH --output PATH"
+                     --bucket-table PATH --output PATH [--mode strategy|regret]"
                 );
                 std::process::exit(0);
             }
@@ -65,6 +123,7 @@ fn parse_args() -> Result<Args, String> {
         checkpoint: checkpoint.ok_or("--checkpoint required")?,
         bucket_table: bucket_table.ok_or("--bucket-table required")?,
         output: output.ok_or("--output required")?,
+        mode,
     })
 }
 
@@ -82,13 +141,22 @@ fn run(args: Args) -> Result<(), String> {
         )
         .map_err(|e| format!("load_checkpoint failed: {e:?}"))?;
 
-    // Collect per-infoset signal weight = Σ_a strategy_sum[I][a].
-    let inner = trainer.strategy_sum().inner();
+    // Collect per-infoset signal weight per --mode：
+    // - strategy: Σ_a strategy_sum[I][a]
+    // - regret_l1: Σ_a |regret[I][a]|
+    let inner = match args.mode {
+        Mode::Strategy => trainer.strategy_sum().inner(),
+        Mode::RegretL1 => trainer.regret_table().inner(),
+    };
+    let weight_fn: fn(&[f64]) -> f64 = match args.mode {
+        Mode::Strategy => |v| v.iter().sum(),
+        Mode::RegretL1 => |v| v.iter().map(|x| x.abs()).sum(),
+    };
     let mut by_street: BTreeMap<u8, Vec<f64>> = BTreeMap::new();
     let mut all_weights: Vec<f64> = Vec::with_capacity(inner.len());
     let mut action_count: BTreeMap<usize, usize> = BTreeMap::new();
     for (info, vec) in inner {
-        let weight: f64 = vec.iter().sum();
+        let weight: f64 = weight_fn(vec);
         let info: InfoSetId = *info;
         let street = info.street_tag() as u8;
         by_street.entry(street).or_default().push(weight);
@@ -105,23 +173,26 @@ fn run(args: Args) -> Result<(), String> {
             .map_err(|e| format!("create {} failed: {e}", args.output.display()))?,
     );
 
-    writeln!(out, "# Simplified NLHE Infoset Signal Strength Dump").unwrap();
+    writeln!(
+        out,
+        "# Simplified NLHE Infoset Signal Strength Dump ({})",
+        args.mode.slug()
+    )
+    .unwrap();
     writeln!(out).unwrap();
     writeln!(out, "- checkpoint: `{}`", args.checkpoint.display()).unwrap();
     writeln!(out, "- update_count: `{}`", trainer.update_count()).unwrap();
     writeln!(out, "- bucket_table: `{}`", args.bucket_table.display()).unwrap();
+    writeln!(out, "- mode: `{}`", args.mode.slug()).unwrap();
+    writeln!(out, "- weight_formula: `{}`", args.mode.formula()).unwrap();
     writeln!(out, "- n_visited_infosets: `{}`", n_all).unwrap();
-    writeln!(
-        out,
-        "- total_signal (Σ_I Σ_a strategy_sum[I][a]): `{total:.6e}`"
-    )
-    .unwrap();
+    writeln!(out, "- total_signal: `{total:.6e}`").unwrap();
     writeln!(out).unwrap();
     writeln!(
         out,
-        "信号权重 = `Σ_a strategy_sum[I][a]` = 该 infoset 上所有 traverser 访问的 \
-         π_trav 累计和。值越大表示该 infoset 上的训练对最终 average strategy \
-         输出贡献越大；值接近 0 表示访问稀少或 π_trav 几乎为 0 的尾部节点。"
+        "信号权重 = `{}` {}",
+        args.mode.formula(),
+        args.mode.description()
     )
     .unwrap();
     writeln!(out).unwrap();
