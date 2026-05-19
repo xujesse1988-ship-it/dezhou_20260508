@@ -16,9 +16,9 @@ use poker::training::game::{Game, NodeKind};
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::sampling::sample_discrete;
 use poker::training::{
-    estimate_simplified_nlhe_lbr, evaluate_blueprint_vs_baseline, EsMccfrTrainer,
-    NlheBaselinePolicy, NlheEvaluationConfig, NlheEvaluationReport, NlheLbrConfig, NlheLbrReport,
-    Trainer,
+    estimate_simplified_nlhe_lbr, estimate_simplified_nlhe_lbr_filtered,
+    evaluate_blueprint_vs_baseline, EsMccfrTrainer, NlheBaselinePolicy, NlheEvaluationConfig,
+    NlheEvaluationReport, NlheLbrConfig, NlheLbrReport, Trainer,
 };
 use poker::{BucketTable, ChaCha20Rng, InfoSetId, RngSource};
 
@@ -59,6 +59,50 @@ impl FallbackPolicy {
     }
 }
 
+/// LBR probe 过滤策略。`HasAverage` 在 target player 决策点上要求 strategy_sum
+/// 累计 > 0（即该 infoset 有真实学到的 average strategy），否则丢弃该 probe；用于
+/// 回答"如果只在 blueprint 真实学过的 infoset 上 probe，LBR 是多少"。
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProbeFilter {
+    None,
+    HasAverage,
+}
+
+impl ProbeFilter {
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "none" => Ok(ProbeFilter::None),
+            "has-average" | "has_average" | "has-avg" => Ok(ProbeFilter::HasAverage),
+            other => Err(format!(
+                "unknown --probe-filter {other:?}; expected none|has-average"
+            )),
+        }
+    }
+    fn slug(self) -> &'static str {
+        match self {
+            ProbeFilter::None => "none",
+            ProbeFilter::HasAverage => "has-average",
+        }
+    }
+}
+
+/// 构造 probe filter closure。`HasAverage` 走 trainer.strategy_sum() 查 sum > 0
+/// （等价于 average_strategy 非退化均匀分布）。
+fn make_probe_filter(
+    trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
+    filter: ProbeFilter,
+) -> impl Fn(&InfoSetId) -> bool + '_ {
+    move |info: &InfoSetId| match filter {
+        ProbeFilter::None => true,
+        ProbeFilter::HasAverage => trainer
+            .strategy_sum()
+            .inner()
+            .get(info)
+            .is_some_and(|v| v.iter().sum::<f64>() > 0.0),
+    }
+}
+
 #[derive(Debug)]
 struct Args {
     artifact: PathBuf,
@@ -72,6 +116,7 @@ struct Args {
     lbr_rollouts: u64,
     output: PathBuf,
     fallback_policy: FallbackPolicy,
+    probe_filter: ProbeFilter,
 }
 
 impl Default for Args {
@@ -90,6 +135,7 @@ impl Default for Args {
             lbr_rollouts: 16,
             output: PathBuf::from("artifacts/h3_nlhe_report.md"),
             fallback_policy: FallbackPolicy::Hybrid,
+            probe_filter: ProbeFilter::None,
         }
     }
 }
@@ -126,6 +172,7 @@ struct H3JsonReport {
     update_count: u64,
     strategy_blake3: String,
     fallback_policy: FallbackPolicy,
+    probe_filter: ProbeFilter,
     evaluations: Vec<NlheEvaluationReport>,
     lbr: NlheLbrReport,
     lbr_curve: Vec<LbrCurvePoint>,
@@ -211,7 +258,12 @@ fn run() -> Result<(), String> {
         "[nlhe_h3_report] fallback_policy = {}",
         args.fallback_policy.slug()
     );
+    eprintln!(
+        "[nlhe_h3_report] probe_filter    = {}",
+        args.probe_filter.slug()
+    );
     let strategy = make_strategy_fn(&trainer, args.fallback_policy);
+    let probe_filter = make_probe_filter(&trainer, args.probe_filter);
     let mut evaluations = Vec::new();
     for baseline in [
         NlheBaselinePolicy::Random,
@@ -227,7 +279,7 @@ fn run() -> Result<(), String> {
     }
 
     eprintln!("[nlhe_h3_report] estimating LBR proxy");
-    let lbr = estimate_simplified_nlhe_lbr(&eval_game, &strategy, &lbr_cfg)
+    let lbr = estimate_simplified_nlhe_lbr_filtered(&eval_game, &strategy, &probe_filter, &lbr_cfg)
         .map_err(|e| format!("LBR proxy failed: {e:?}"))?;
     let strategy_hash = strategy_hash(&trainer, &eval_game);
 
@@ -240,6 +292,7 @@ fn run() -> Result<(), String> {
             path,
             &lbr_cfg,
             args.fallback_policy,
+            args.probe_filter,
         )?);
     }
     lbr_curve.push(LbrCurvePoint {
@@ -258,6 +311,7 @@ fn run() -> Result<(), String> {
         update_count: trainer.update_count(),
         strategy_blake3: strategy_hash,
         fallback_policy: args.fallback_policy,
+        probe_filter: args.probe_filter,
         evaluations,
         lbr,
         lbr_curve,
@@ -339,6 +393,7 @@ fn load_lbr_curve_point(
     path: &Path,
     cfg: &NlheLbrConfig,
     policy: FallbackPolicy,
+    filter: ProbeFilter,
 ) -> Result<LbrCurvePoint, String> {
     let load_game = SimplifiedNlheGame::new(Arc::clone(&table))
         .map_err(|e| format!("SimplifiedNlheGame::new for curve failed: {e:?}"))?;
@@ -350,7 +405,8 @@ fn load_lbr_curve_point(
     let eval_game = SimplifiedNlheGame::new(table)
         .map_err(|e| format!("SimplifiedNlheGame::new for curve eval failed: {e:?}"))?;
     let strategy = make_strategy_fn(&trainer, policy);
-    let report = estimate_simplified_nlhe_lbr(&eval_game, &strategy, cfg)
+    let probe_filter = make_probe_filter(&trainer, filter);
+    let report = estimate_simplified_nlhe_lbr_filtered(&eval_game, &strategy, &probe_filter, cfg)
         .map_err(|e| format!("curve LBR proxy {label} failed: {e:?}"))?;
     Ok(LbrCurvePoint {
         label,
@@ -439,8 +495,12 @@ fn markdown_report(report: &H3JsonReport) -> String {
         report.strategy_blake3
     ));
     out.push_str(&format!(
-        "- fallback_policy: `{}`\n\n",
+        "- fallback_policy: `{}`\n",
         report.fallback_policy.slug()
+    ));
+    out.push_str(&format!(
+        "- probe_filter: `{}`\n\n",
+        report.probe_filter.slug()
     ));
 
     out.push_str("## Baseline Evaluation\n\n");
@@ -465,11 +525,13 @@ fn markdown_report(report: &H3JsonReport) -> String {
     out.push_str("\n## LBR Proxy\n\n");
     out.push_str("H3 local best-response proxy only; not formal exploitability.\n\n");
     out.push_str(&format!(
-        "- mean_best_response_chips: `{:.6}`\n- standard_error_chips: `{:.6}`\n- probes_used: `{}` / `{}`\n\n",
+        "- mean_best_response_chips: `{:.6}`\n- standard_error_chips: `{:.6}`\n- probes_used: `{}` / `{}`\n- filtered_probes: `{}`\n- terminal_or_unreached_probes: `{}`\n\n",
         report.lbr.mean_best_response_chips,
         report.lbr.standard_error_chips,
         report.lbr.probes_used,
-        report.lbr.probes_requested
+        report.lbr.probes_requested,
+        report.lbr.filtered_probes,
+        report.lbr.terminal_or_unreached_probes,
     ));
     out.push_str("| label | updates | mean BR chips | SE chips | probes | strategy hash |\n");
     out.push_str("|---|---:|---:|---:|---:|---|\n");
@@ -510,6 +572,9 @@ fn parse_args() -> Result<Args, String> {
             "--lbr-rollouts" => out.lbr_rollouts = parse_u64(&next_value(&mut args, &arg)?)?,
             "--fallback-policy" => {
                 out.fallback_policy = FallbackPolicy::from_str(&next_value(&mut args, &arg)?)?
+            }
+            "--probe-filter" => {
+                out.probe_filter = ProbeFilter::from_str(&next_value(&mut args, &arg)?)?
             }
             "--output" => out.output = PathBuf::from(next_value(&mut args, &arg)?),
             "--help" | "-h" => {
@@ -568,6 +633,8 @@ fn print_usage() {
          \t--lbr-rollouts <N>           default 16\n\
          \t--fallback-policy <m>        average|current|hybrid (default hybrid; \
          零 strategy_sum infoset 走 current_strategy 代替均匀分布)\n\
+         \t--probe-filter <m>           none|has-average (default none; \
+         has-average 跳过 strategy_sum 全零的 target probe，只统计真实学过的 spot)\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>"
     );

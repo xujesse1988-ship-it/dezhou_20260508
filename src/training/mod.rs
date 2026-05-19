@@ -46,8 +46,9 @@ pub use nlhe::{
     SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
 };
 pub use nlhe_eval::{
-    estimate_simplified_nlhe_lbr, evaluate_blueprint_vs_baseline, NlheBaselinePolicy,
-    NlheEvaluationConfig, NlheEvaluationReport, NlheLbrConfig, NlheLbrReport,
+    estimate_simplified_nlhe_lbr, estimate_simplified_nlhe_lbr_filtered,
+    evaluate_blueprint_vs_baseline, NlheBaselinePolicy, NlheEvaluationConfig, NlheEvaluationReport,
+    NlheLbrConfig, NlheLbrReport,
 };
 pub use regret::{RegretTable, StrategyAccumulator};
 pub use trainer::{EsMccfrTrainer, Trainer, VanillaCfrTrainer};

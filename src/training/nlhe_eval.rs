@@ -142,6 +142,10 @@ pub struct NlheLbrReport {
     pub probes_requested: u64,
     pub probes_used: u64,
     pub terminal_or_unreached_probes: u64,
+    /// 被 `probe_accept` filter 拒绝的 probe 数（[`estimate_simplified_nlhe_lbr_filtered`]
+    /// 路径专用；默认 wrapper 走 `|_| true` 永远是 0）。
+    #[serde(default)]
+    pub filtered_probes: u64,
     pub rollouts_per_action: u64,
     pub seed: u64,
     pub mean_best_response_chips: f64,
@@ -229,6 +233,22 @@ pub fn estimate_simplified_nlhe_lbr(
     blueprint_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
     config: &NlheLbrConfig,
 ) -> Result<NlheLbrReport, NlheEvaluationError> {
+    estimate_simplified_nlhe_lbr_filtered(game, blueprint_strategy, &|_| true, config)
+}
+
+/// 带 probe filter 的 LBR proxy。`probe_accept(target_info)` 返回 false 时本次
+/// probe 被丢弃（既不进 mean BR 估值，也不计入 `probes_used`，而是计入
+/// [`NlheLbrReport::filtered_probes`]）。用于回答"如果只在 blueprint 真实学过的
+/// infoset 上 probe，LBR 会是多少"这类对照实验。
+///
+/// `probe_accept` 在 target player 决策点上调用，参数是该点的 [`SimplifiedNlheInfoSet`]，
+/// 调用方可在闭包内查 strategy_sum / regret 表决定是否接受。
+pub fn estimate_simplified_nlhe_lbr_filtered(
+    game: &SimplifiedNlheGame,
+    blueprint_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
+    probe_accept: &dyn Fn(&SimplifiedNlheInfoSet) -> bool,
+    config: &NlheLbrConfig,
+) -> Result<NlheLbrReport, NlheEvaluationError> {
     if config.probes == 0 {
         return Err(NlheEvaluationError::InvalidConfig {
             reason: "probes must be > 0".to_string(),
@@ -244,6 +264,7 @@ pub fn estimate_simplified_nlhe_lbr(
     let mut values_p0 = Vec::new();
     let mut values_p1 = Vec::new();
     let mut skipped = 0u64;
+    let mut filtered = 0u64;
 
     for probe_idx in 0..config.probes {
         let target = (probe_idx % 2) as PlayerId;
@@ -260,6 +281,12 @@ pub fn estimate_simplified_nlhe_lbr(
                     state = SimplifiedNlheGame::next(state, action, &mut rng);
                 }
                 NodeKind::Player(actor) if actor == target => {
+                    let target_info = SimplifiedNlheGame::info_set(&state, actor);
+                    if !probe_accept(&target_info) {
+                        filtered += 1;
+                        reached = true;
+                        break;
+                    }
                     let best = estimate_best_action_value(
                         game,
                         &state,
@@ -300,6 +327,7 @@ pub fn estimate_simplified_nlhe_lbr(
         probes_requested: config.probes,
         probes_used: values.len() as u64,
         terminal_or_unreached_probes: skipped,
+        filtered_probes: filtered,
         rollouts_per_action: config.rollouts_per_action,
         seed: config.seed,
         mean_best_response_chips: stats.mean,
