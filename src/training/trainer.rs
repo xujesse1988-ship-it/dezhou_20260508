@@ -307,6 +307,19 @@ impl<G: Game> EsMccfrTrainer<G> {
         }
     }
 
+    /// 已访问 infoset 的 strategy_sum 表只读访问（诊断用：导出
+    /// `Σ_a strategy_sum[I][a]` 作为该 infoset 的"学习信号权重"，用于分布分析）。
+    #[doc(hidden)]
+    pub fn strategy_sum(&self) -> &StrategyAccumulator<G::InfoSet> {
+        &self.strategy_sum
+    }
+
+    /// 已访问 infoset 的 regret 表只读访问（诊断用，同 [`Self::strategy_sum`]）。
+    #[doc(hidden)]
+    pub fn regret_table(&self) -> &RegretTable<G::InfoSet> {
+        &self.regret
+    }
+
     /// 多线程并发 step（D-321-rev1 lock + E2-rev1 \[实现\] 优化）。
     ///
     /// **E2-rev1 \[实现\] 形态（rayon long-lived pool + append-only delta，

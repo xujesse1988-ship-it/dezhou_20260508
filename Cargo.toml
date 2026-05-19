@@ -123,6 +123,10 @@ name = "nlhe_preflop_strategy_dump"
 path = "tools/nlhe_preflop_strategy_dump.rs"
 
 [[bin]]
+name = "nlhe_infoset_signal_dump"
+path = "tools/nlhe_infoset_signal_dump.rs"
+
+[[bin]]
 name = "mccfr_trace"
 path = "tools/mccfr_trace.rs"
 
