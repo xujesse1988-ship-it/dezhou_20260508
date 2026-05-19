@@ -44,6 +44,13 @@ smallvec = "1"
 # 否则 cargo doc / clippy 在 stage 3 D2 \[实现\] 落地后报 missing trait。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+# ureq 2.x：Slumbot API client（`tools/slumbot_client.rs`）需要 HTTPS POST + JSON。
+# 挑 ureq 而不是 reqwest，因为 ureq 是 blocking sync 实现，**不拖 tokio runtime
+# 进项目**（与 CLAUDE.md "默认不引 async 抽象" 一致）；feature = "tls" 走 rustls
+# (avoid openssl 系统依赖 → CI 与 vultr image 都能裸跑)，"json" 提供 send_json /
+# into_json serde 直通。仅 Slumbot client 这一个 binary 用，不进入训练 / 评测
+# hot path。
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 # Thread-safety crate（D-321 多线程 ES-MCCFR thread-safety 模型）：候选
 # parking_lot 0.12 / dashmap 5.5 / crossbeam 0.8。具体选型 deferred 到 C2 \[实现\]
 # 起步前 lock（详见 docs/pluribus_stage3_decisions.md §10 已知未决项 + D-321），
@@ -133,3 +140,7 @@ path = "tools/mccfr_trace.rs"
 [[bin]]
 name = "nlhe_trace"
 path = "tools/nlhe_trace.rs"
+
+[[bin]]
+name = "slumbot_client"
+path = "tools/slumbot_client.rs"
