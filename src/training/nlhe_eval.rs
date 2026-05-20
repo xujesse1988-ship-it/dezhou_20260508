@@ -200,10 +200,15 @@ pub fn estimate_simplified_nlhe_lbr(
 }
 
 /// 带 probe filter 的 LBR proxy。薄壳调用 game-generic [`estimate_lbr_filtered`]。
+/// `probe_accept(state, target_info)` 在 target player 决策点上被调用，可以
+/// 同时查 state（如 `state.game_state.street()`）和 trainer 表。
 pub fn estimate_simplified_nlhe_lbr_filtered(
     game: &SimplifiedNlheGame,
     blueprint_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
-    probe_accept: &dyn Fn(&SimplifiedNlheInfoSet) -> bool,
+    probe_accept: &dyn Fn(
+        &crate::training::nlhe::SimplifiedNlheState,
+        &SimplifiedNlheInfoSet,
+    ) -> bool,
     config: &NlheLbrConfig,
 ) -> Result<NlheLbrReport, NlheEvaluationError> {
     estimate_lbr_filtered::<SimplifiedNlheGame>(game, blueprint_strategy, probe_accept, config)

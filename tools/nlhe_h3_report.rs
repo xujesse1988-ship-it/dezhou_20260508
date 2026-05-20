@@ -87,19 +87,73 @@ impl ProbeFilter {
     }
 }
 
+/// 限定 target 决策点的 street。`Any` 不过滤；其它仅保留对应街的 probe。
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum TargetStreet {
+    Any,
+    Preflop,
+    Flop,
+    Turn,
+    River,
+}
+
+impl TargetStreet {
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "any" => Ok(TargetStreet::Any),
+            "preflop" => Ok(TargetStreet::Preflop),
+            "flop" => Ok(TargetStreet::Flop),
+            "turn" => Ok(TargetStreet::Turn),
+            "river" => Ok(TargetStreet::River),
+            other => Err(format!(
+                "unknown --target-street {other:?}; expected any|preflop|flop|turn|river"
+            )),
+        }
+    }
+
+    fn slug(self) -> &'static str {
+        match self {
+            TargetStreet::Any => "any",
+            TargetStreet::Preflop => "preflop",
+            TargetStreet::Flop => "flop",
+            TargetStreet::Turn => "turn",
+            TargetStreet::River => "river",
+        }
+    }
+
+    fn matches(self, street: poker::Street) -> bool {
+        use poker::Street;
+        match self {
+            TargetStreet::Any => true,
+            TargetStreet::Preflop => street == Street::Preflop,
+            TargetStreet::Flop => street == Street::Flop,
+            TargetStreet::Turn => street == Street::Turn,
+            TargetStreet::River => street == Street::River,
+        }
+    }
+}
+
 /// 构造 probe filter closure。`HasAverage` 走 trainer.strategy_sum() 查 sum > 0
-/// （等价于 average_strategy 非退化均匀分布）。
+/// （等价于 average_strategy 非退化均匀分布）；`TargetStreet` 限定 probe target
+/// 决策点的街。两个维度 AND 组合。
 fn make_probe_filter(
     trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
     filter: ProbeFilter,
-) -> impl Fn(&InfoSetId) -> bool + '_ {
-    move |info: &InfoSetId| match filter {
-        ProbeFilter::None => true,
-        ProbeFilter::HasAverage => trainer
-            .strategy_sum()
-            .inner()
-            .get(info)
-            .is_some_and(|v| v.iter().sum::<f64>() > 0.0),
+    target_street: TargetStreet,
+) -> impl Fn(&poker::training::nlhe::SimplifiedNlheState, &InfoSetId) -> bool + '_ {
+    move |state: &poker::training::nlhe::SimplifiedNlheState, info: &InfoSetId| {
+        if !target_street.matches(state.game_state.street()) {
+            return false;
+        }
+        match filter {
+            ProbeFilter::None => true,
+            ProbeFilter::HasAverage => trainer
+                .strategy_sum()
+                .inner()
+                .get(info)
+                .is_some_and(|v| v.iter().sum::<f64>() > 0.0),
+        }
     }
 }
 
@@ -117,6 +171,7 @@ struct Args {
     output: PathBuf,
     fallback_policy: FallbackPolicy,
     probe_filter: ProbeFilter,
+    target_street: TargetStreet,
 }
 
 impl Default for Args {
@@ -136,6 +191,7 @@ impl Default for Args {
             output: PathBuf::from("artifacts/h3_nlhe_report.md"),
             fallback_policy: FallbackPolicy::Hybrid,
             probe_filter: ProbeFilter::None,
+            target_street: TargetStreet::Any,
         }
     }
 }
@@ -173,6 +229,7 @@ struct H3JsonReport {
     strategy_blake3: String,
     fallback_policy: FallbackPolicy,
     probe_filter: ProbeFilter,
+    target_street: TargetStreet,
     evaluations: Vec<NlheEvaluationReport>,
     lbr: NlheLbrReport,
     lbr_curve: Vec<LbrCurvePoint>,
@@ -262,8 +319,12 @@ fn run() -> Result<(), String> {
         "[nlhe_h3_report] probe_filter    = {}",
         args.probe_filter.slug()
     );
+    eprintln!(
+        "[nlhe_h3_report] target_street   = {}",
+        args.target_street.slug()
+    );
     let strategy = make_strategy_fn(&trainer, args.fallback_policy);
-    let probe_filter = make_probe_filter(&trainer, args.probe_filter);
+    let probe_filter = make_probe_filter(&trainer, args.probe_filter, args.target_street);
     let mut evaluations = Vec::new();
     for baseline in [
         NlheBaselinePolicy::Random,
@@ -293,6 +354,7 @@ fn run() -> Result<(), String> {
             &lbr_cfg,
             args.fallback_policy,
             args.probe_filter,
+            args.target_street,
         )?);
     }
     lbr_curve.push(LbrCurvePoint {
@@ -312,6 +374,7 @@ fn run() -> Result<(), String> {
         strategy_blake3: strategy_hash,
         fallback_policy: args.fallback_policy,
         probe_filter: args.probe_filter,
+        target_street: args.target_street,
         evaluations,
         lbr,
         lbr_curve,
@@ -394,6 +457,7 @@ fn load_lbr_curve_point(
     cfg: &NlheLbrConfig,
     policy: FallbackPolicy,
     filter: ProbeFilter,
+    target_street: TargetStreet,
 ) -> Result<LbrCurvePoint, String> {
     let load_game = SimplifiedNlheGame::new(Arc::clone(&table))
         .map_err(|e| format!("SimplifiedNlheGame::new for curve failed: {e:?}"))?;
@@ -405,7 +469,7 @@ fn load_lbr_curve_point(
     let eval_game = SimplifiedNlheGame::new(table)
         .map_err(|e| format!("SimplifiedNlheGame::new for curve eval failed: {e:?}"))?;
     let strategy = make_strategy_fn(&trainer, policy);
-    let probe_filter = make_probe_filter(&trainer, filter);
+    let probe_filter = make_probe_filter(&trainer, filter, target_street);
     let report = estimate_simplified_nlhe_lbr_filtered(&eval_game, &strategy, &probe_filter, cfg)
         .map_err(|e| format!("curve LBR proxy {label} failed: {e:?}"))?;
     Ok(LbrCurvePoint {
@@ -499,8 +563,12 @@ fn markdown_report(report: &H3JsonReport) -> String {
         report.fallback_policy.slug()
     ));
     out.push_str(&format!(
-        "- probe_filter: `{}`\n\n",
+        "- probe_filter: `{}`\n",
         report.probe_filter.slug()
+    ));
+    out.push_str(&format!(
+        "- target_street: `{}`\n\n",
+        report.target_street.slug()
     ));
 
     out.push_str("## Baseline Evaluation\n\n");
@@ -576,6 +644,9 @@ fn parse_args() -> Result<Args, String> {
             "--probe-filter" => {
                 out.probe_filter = ProbeFilter::from_str(&next_value(&mut args, &arg)?)?
             }
+            "--target-street" => {
+                out.target_street = TargetStreet::from_str(&next_value(&mut args, &arg)?)?
+            }
             "--output" => out.output = PathBuf::from(next_value(&mut args, &arg)?),
             "--help" | "-h" => {
                 print_usage();
@@ -635,6 +706,8 @@ fn print_usage() {
          零 strategy_sum infoset 走 current_strategy 代替均匀分布)\n\
          \t--probe-filter <m>           none|has-average (default none; \
          has-average 跳过 strategy_sum 全零的 target probe，只统计真实学过的 spot)\n\
+         \t--target-street <m>          any|preflop|flop|turn|river (default any; \
+         限定 LBR target 决策点的街，配合 probe-filter 做按街 LBR 切片)\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>"
     );

@@ -71,17 +71,20 @@ pub fn estimate_lbr<G: Game>(
     blueprint_strategy: &dyn Fn(&G::InfoSet, usize) -> Vec<f64>,
     config: &LbrConfig,
 ) -> Result<LbrReport, NlheEvaluationError> {
-    estimate_lbr_filtered(game, blueprint_strategy, &|_| true, config)
+    estimate_lbr_filtered(game, blueprint_strategy, &|_, _| true, config)
 }
 
-/// 带 probe filter 的 LBR proxy。`probe_accept(target_info)` 返回 false 时本次
-/// probe 被丢弃（既不进 mean BR 估值，也不计入 `probes_used`，而是计入
-/// [`LbrReport::filtered_probes`]）。用于回答"如果只在 blueprint 真实学过的
-/// infoset 上 probe，LBR 会是多少"这类对照实验。
+/// 带 probe filter 的 LBR proxy。`probe_accept(state, target_info)` 返回 false
+/// 时本次 probe 被丢弃（既不进 mean BR 估值，也不计入 `probes_used`，而是计入
+/// [`LbrReport::filtered_probes`]）。用于回答 "如果只在 blueprint 真实学过的
+/// infoset 上 probe，LBR 会是多少" 或者 "只看 flop 决策点" 这类对照实验。
+///
+/// 谓词同时收到 `state` 和 `target_info`，所以既可以查 trainer 的 strategy_sum /
+/// regret 表，也可以走 `state` 拿 game-specific 信息（如 street）。
 pub fn estimate_lbr_filtered<G: Game>(
     game: &G,
     blueprint_strategy: &dyn Fn(&G::InfoSet, usize) -> Vec<f64>,
-    probe_accept: &dyn Fn(&G::InfoSet) -> bool,
+    probe_accept: &dyn Fn(&G::State, &G::InfoSet) -> bool,
     config: &LbrConfig,
 ) -> Result<LbrReport, NlheEvaluationError> {
     if config.probes == 0 {
@@ -117,7 +120,7 @@ pub fn estimate_lbr_filtered<G: Game>(
                 }
                 NodeKind::Player(actor) if actor == target => {
                     let target_info = G::info_set(&state, actor);
-                    if !probe_accept(&target_info) {
+                    if !probe_accept(&state, &target_info) {
                         filtered += 1;
                         reached = true;
                         break;
