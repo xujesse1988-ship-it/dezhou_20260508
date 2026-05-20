@@ -81,7 +81,7 @@ const NLHE_V2_NODE_ID_BITS: u32 = 26;
 fn pack_info_set_v2(hand_bucket: u32, node_id: NodeId, street_tag: StreetTag) -> InfoSetId {
     debug_assert!(
         node_id < (1u32 << NLHE_V2_NODE_ID_BITS),
-        "Phase 0b 实测节点数 48,224 << 2^26；node_id={node_id} 越界提示树规模超预期"
+        "200BB 默认实测节点数 117,552 << 2^26；node_id={node_id} 越界提示树规模超预期"
     );
     let base = pack_info_set_id(
         hand_bucket,
@@ -96,12 +96,12 @@ fn pack_info_set_v2(hand_bucket: u32, node_id: NodeId, street_tag: StreetTag) ->
 /// 简化 NLHE Game token（API-303）。
 ///
 /// 构造时载入 stage 2 `BucketTable`（D-314-rev1 v3 artifact）+ stage 1
-/// `TableConfig`（2-player + 100 BB）。字段 `pub(crate)` 让同 crate 测试 / bench
+/// `TableConfig`（2-player + 200 BB 默认）。字段 `pub(crate)` 让同 crate 测试 / bench
 /// 访问内部状态而不暴露给外部消费者（D-376）。
 pub struct SimplifiedNlheGame {
     pub(crate) bucket_table: Arc<BucketTable>,
     pub(crate) config: TableConfig,
-    /// 抽象 betting tree，构造时一次性建好（Phase 1 节点数实测 48,224）。
+    /// 抽象 betting tree，构造时一次性建好（200BB 默认 + 5-action 实测 117,552 节点）。
     /// State 沿 `tree.node(current_node_id).children` 跳转；Phase 3 起 `info_set`
     /// 用 `current_node_id` 作为下注历史维度，根除跨街 collision。
     pub(crate) tree: Arc<PublicBettingTree>,

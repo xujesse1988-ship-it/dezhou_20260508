@@ -23,7 +23,8 @@ use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::PlayerId;
 
-/// 决策节点 id；16 bit 实测足够（Phase 0b 测得 48,224 节点），用 u32 留余量。
+/// 决策节点 id；200BB 默认 + 5-action {0.5p, 1p, allin} 实测 117,552 节点（17 bit），
+/// u32 给后续扩 raise size / 加深筹码 profile 留余量。
 pub type NodeId = u32;
 
 /// 抽象动作的"身份"——同抽象边在不同 chip state 下产出的 `AbstractAction`
