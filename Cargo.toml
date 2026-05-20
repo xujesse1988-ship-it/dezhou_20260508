@@ -49,13 +49,6 @@ serde_json = "1.0"
 # 起步前 lock（详见 docs/pluribus_stage3_decisions.md §10 已知未决项 + D-321），
 # A1 \[实现\] scaffold 阶段不预提交，避免后续 batch 调整时依赖漂移。
 
-# indexmap 2.x：thread-local pre-aggregate（step_parallel `LocalRegretDelta` /
-# `LocalStrategyDelta`）需要 insertion-order 保留的 HashMap：同 trajectory 内
-# 多次访问同 InfoSet 时 in-place 累加，merge 时按 push 顺序 playback 到主表，
-# 让 N 个主表 HashMap entry 调用降到 dedup 后的实际唯一 InfoSet 数（参见
-# docs/status.md step 2）。stable API，按 minor 锁定。
-indexmap = "2"
-
 # B1 测试 / harness 专用依赖。仅 tests/ 与 benches/ 引用，不进入产品二进制。
 [dev-dependencies]
 # 阶段 1 §B1 / E1 benchmark harness。`harness = false` 见下方 [[bench]]。
