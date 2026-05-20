@@ -51,8 +51,10 @@ pub struct LbrReport {
     pub probes_requested: u64,
     pub probes_used: u64,
     pub terminal_or_unreached_probes: u64,
-    /// 被 `probe_accept` filter 拒绝的 probe 数（[`estimate_lbr_filtered`] 路径专用；
-    /// 默认 wrapper 走 `|_| true` 永远是 0）。
+    /// 被 `probe_accept` walk-through 过滤跳过的 target 决策**点**计数（跨所有
+    /// probe 累加；同一 probe 在找到 accepted 决策点之前 walk 过几个 rejected
+    /// 决策点就累计几次）。`estimate_lbr_filtered` 路径专用；默认 wrapper 走
+    /// `|_, _| true` 永远是 0。
     #[serde(default)]
     pub filtered_probes: u64,
     pub rollouts_per_action: u64,
@@ -75,9 +77,10 @@ pub fn estimate_lbr<G: Game>(
 }
 
 /// 带 probe filter 的 LBR proxy。`probe_accept(state, target_info)` 返回 false
-/// 时本次 probe 被丢弃（既不进 mean BR 估值，也不计入 `probes_used`，而是计入
-/// [`LbrReport::filtered_probes`]）。用于回答 "如果只在 blueprint 真实学过的
-/// infoset 上 probe，LBR 会是多少" 或者 "只看 flop 决策点" 这类对照实验。
+/// 时 target 也照 blueprint 抽一个动作继续走 (walk-through 语义)，直到落在
+/// accepted target 决策点为止；跳过的 target 决策点累计到
+/// [`LbrReport::filtered_probes`]。用于"只看 flop 决策点"或"只在 blueprint
+/// 真实学过的 infoset 上 probe"这类对照实验。
 ///
 /// 谓词同时收到 `state` 和 `target_info`，所以既可以查 trainer 的 strategy_sum /
 /// regret 表，也可以走 `state` 拿 game-specific 信息（如 street）。
@@ -121,9 +124,18 @@ pub fn estimate_lbr_filtered<G: Game>(
                 NodeKind::Player(actor) if actor == target => {
                     let target_info = G::info_set(&state, actor);
                     if !probe_accept(&state, &target_info) {
+                        // Walk-through 语义：filter 不接受时，target 也照
+                        // blueprint 走一步继续找下一个 target 决策点；
+                        // `filtered` 累计跳过的 target 决策数（不是 probe 数）。
                         filtered += 1;
-                        reached = true;
-                        break;
+                        let action = sample_blueprint_action::<G>(
+                            &state,
+                            actor,
+                            blueprint_strategy,
+                            &mut rng,
+                        )?;
+                        state = G::next(state, action, &mut rng);
+                        continue;
                     }
                     let best = estimate_best_action_value::<G>(
                         &state,
