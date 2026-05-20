@@ -1,8 +1,9 @@
 //! SimplifiedNlheGame（API-303 / D-313）+ stage 1 / stage 2 桥接（API-390..API-392）。
 //!
-//! 简化 NLHE 范围（D-313）：2-player + 100 BB starting stack + 盲注 0.5/1.0 BB +
-//! 完整 4 街 + stage 2 `DefaultActionAbstraction`（5-action）+ stage 2
-//! `PreflopLossless169` + `PostflopBucketAbstraction`（500/500/500 bucket）。
+//! 简化 NLHE 范围：2-player + 200 BB starting stack + 盲注 0.5/1.0 BB +
+//! 完整 4 街 + stage 2 `DefaultActionAbstraction`（6-action：{0.5p, 1p, 2p} +
+//! Fold/Check/Call/AllIn）+ stage 2 `PreflopLossless169` +
+//! `PostflopBucketAbstraction`（500/500/500 bucket）。
 //! 复用 stage 1 [`crate::GameState`] + stage 2 [`crate::ActionAbstraction`] /
 //! [`crate::InfoAbstraction`] / [`crate::BucketTable`]，仅在 `SimplifiedNlheGame`
 //! 适配层把 stage 1 `GameState` 包装成 [`Game`] trait state。
@@ -44,7 +45,7 @@ use crate::training::nlhe_betting_tree::{AbstractActionTag, Child, NodeId, Publi
 
 /// 简化 NLHE action 桥接（API-303 / D-318）。
 ///
-/// 直接走 stage 2 `AbstractAction`（5-action 顺序由 D-209 deterministic）；不再
+/// 直接走 stage 2 `AbstractAction`（6-action 顺序由 D-209 deterministic）；不再
 /// 二次抽象。`Game::Action` trait bound `Copy + Eq + Debug` 由 stage 2 实现满足。
 pub type SimplifiedNlheAction = AbstractAction;
 
@@ -81,7 +82,7 @@ const NLHE_V2_NODE_ID_BITS: u32 = 26;
 fn pack_info_set_v2(hand_bucket: u32, node_id: NodeId, street_tag: StreetTag) -> InfoSetId {
     debug_assert!(
         node_id < (1u32 << NLHE_V2_NODE_ID_BITS),
-        "200BB 默认实测节点数 117,552 << 2^26；node_id={node_id} 越界提示树规模超预期"
+        "200BB 默认 6-action 实测节点数 240,096 << 2^26；node_id={node_id} 越界提示树规模超预期"
     );
     let base = pack_info_set_id(
         hand_bucket,
@@ -101,7 +102,7 @@ fn pack_info_set_v2(hand_bucket: u32, node_id: NodeId, street_tag: StreetTag) ->
 pub struct SimplifiedNlheGame {
     pub(crate) bucket_table: Arc<BucketTable>,
     pub(crate) config: TableConfig,
-    /// 抽象 betting tree，构造时一次性建好（200BB 默认 + 5-action 实测 117,552 节点）。
+    /// 抽象 betting tree，构造时一次性建好（200BB 默认 + 6-action 实测 240,096 节点）。
     /// State 沿 `tree.node(current_node_id).children` 跳转；Phase 3 起 `info_set`
     /// 用 `current_node_id` 作为下注历史维度，根除跨街 collision。
     pub(crate) tree: Arc<PublicBettingTree>,
@@ -293,10 +294,10 @@ impl Game for SimplifiedNlheGame {
 
     fn legal_actions(state: &SimplifiedNlheState) -> Vec<SimplifiedNlheAction> {
         // D-318 桥接：stage 2 `DefaultActionAbstraction::abstract_actions`
-        // 顺序由 D-209 deterministic（每次构造同型 5-action 抽象，开销可忽略
+        // 顺序由 D-209 deterministic（每次构造同型 6-action 抽象，开销可忽略
         // —— `DefaultActionAbstraction::new` 仅 clone 配置）；Trainer 的 RegretTable
         // `Vec<f64>` 索引一一对应（D-324 action_count 训练全程恒定）。
-        let abs = DefaultActionAbstraction::default_5_action();
+        let abs = DefaultActionAbstraction::default_6_action();
         let set = abs.abstract_actions(&state.game_state);
         set.as_slice().to_vec()
     }

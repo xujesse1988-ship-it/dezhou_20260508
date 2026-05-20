@@ -23,7 +23,7 @@ use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::PlayerId;
 
-/// 决策节点 id；200BB 默认 + 5-action {0.5p, 1p, allin} 实测 117,552 节点（17 bit），
+/// 决策节点 id；200BB 默认 + 6-action {0.5p, 1p, 2p, allin} 实测 240,096 节点（18 bit），
 /// u32 给后续扩 raise size / 加深筹码 profile 留余量。
 pub type NodeId = u32;
 
@@ -111,7 +111,7 @@ impl PublicBettingTree {
             .0 as PlayerId;
         let my_id = self.nodes.len() as NodeId;
 
-        let abs = DefaultActionAbstraction::default_5_action();
+        let abs = DefaultActionAbstraction::default_6_action();
         let legal_set = abs.abstract_actions(&state);
         let legal_actions: SmallVec<[AbstractActionTag; 8]> =
             legal_set.iter().map(AbstractActionTag::of).collect();

@@ -8,7 +8,7 @@
 //! `pluribus_stage2_workflow.md` §C1 §输出 line 317 字面：
 //!
 //! - tests/scenarios_extended.rs（阶段 2 版）扩到 200+ 固定 GameState 场景，覆盖
-//!   open / 3-bet / 短码 / incomplete / 多人 all-in 的 5-action 默认输出。API §F20
+//!   open / 3-bet / 短码 / incomplete / 多人 all-in 的 6-action 默认输出。API §F20
 //!   影响 ② 字面 ≥ 2 条 all-in call 场景断言 `Call` 不出现而 `AllIn` 出现。
 //!
 //! 本文件只验证 **规则合法动作 / 状态机推进 / D-033-rev1 / D-035 / 结算 zero-sum**
@@ -1510,13 +1510,13 @@ fn empty_card_helper_unused_warning_suppressed() {
 // ============================================================================
 //
 // `pluribus_stage2_workflow.md` §C1 §输出 line 317 字面要求扫扩到 200+ 固定
-// `GameState` 场景，覆盖 open / 3-bet / 短码 / incomplete / 多人 all-in 的 5-action
+// `GameState` 场景，覆盖 open / 3-bet / 短码 / incomplete / 多人 all-in 的 6-action
 // 默认输出。API §F20 影响 ② 字面 ≥ 2 条 all-in call 场景断言 `Call` 不出现而
 // `AllIn` 出现。
 //
 // 角色边界：本节属 [测试] agent 产物（C1）。每个 sweep 用 parameterized 循环
 // 在单一 `#[test]` 内枚举 N 个固定 (config, plan, decision-point) 三元组，断言
-// `DefaultActionAbstraction::default_5_action().abstract_actions(&state)` 输出
+// `DefaultActionAbstraction::default_6_action().abstract_actions(&state)` 输出
 // 满足 AA-001..AA-007 + AA-003-rev1 + AA-004-rev1 不变量；具体每用例的
 // (must_contain / must_not_contain) 谓词由 sweep 内部按局面分流。
 //
@@ -1533,8 +1533,8 @@ mod stage2_abs_sweep {
 
     // ----- helper -----
 
-    fn default_5_abs() -> DefaultActionAbstraction {
-        DefaultActionAbstraction::default_5_action()
+    fn default_abs() -> DefaultActionAbstraction {
+        DefaultActionAbstraction::default_6_action()
     }
 
     /// 把 `actions` 切片转成 (Fold?, Check?, Call?, Bet?, Raise?, AllIn?) 各 kind
@@ -1567,9 +1567,9 @@ mod stage2_abs_sweep {
     /// 通用 invariant 断言（`label` 用作失败信息定位）。覆盖：
     ///
     /// - **AA-005**：集合非空 + 上界 |集合| ≤ Fold? + Check? + Call? + |raise_ratios|×2 + AllIn?
-    ///   （上界 stage-2 默认 5-action 实测 ≤ 6）。
+    ///   （上界 stage-2 默认 6-action 实测 ≤ 7）。
     /// - **AA-001**：D-209 输出顺序 Fold? / Check? / Call? / Bet|Raise(0.5×) /
-    ///   Bet|Raise(1.0×) / AllIn?。具体表述：所有 Fold 在 Check 之前、Check 在 Call
+    ///   Bet|Raise(1.0×) / Bet|Raise(2.0×) / AllIn?。具体表述：所有 Fold 在 Check 之前、Check 在 Call
     ///   之前、Call 在 Bet/Raise 之前、Bet/Raise 在 AllIn 之前。
     /// - **AA-002**：Fold ⇔ ¬Check（free-check 与 facing-bet 二选一）。
     /// - **AA-004-rev1**：所有带 `to` 的 entry（Call / Bet / Raise / AllIn）`to` 字段
@@ -1640,11 +1640,11 @@ mod stage2_abs_sweep {
             }
         }
 
-        // AA-005 上界（默认 5-action：Fold? + Check? + Call? + 2 raise + AllIn?
-        // ≤ 6；扩展 N raise size 配置时上界放宽到 N + 4，但此处仅检默认）。
+        // AA-005 上界（默认 6-action：Fold? + Check? + Call? + 3 raise + AllIn?
+        // ≤ 7；扩展 N raise size 配置时上界放宽到 N + 4，但此处仅检默认）。
         assert!(
-            slice.len() <= 6,
-            "[{label}] AA-005 上界（默认 5-action）：|集合| {} > 6（slice={slice:?}）",
+            slice.len() <= 7,
+            "[{label}] AA-005 上界（默认 6-action）：|集合| {} > 7（slice={slice:?}）",
             slice.len()
         );
     }
@@ -1664,7 +1664,7 @@ mod stage2_abs_sweep {
         let actors: [u8; 4] = [3, 4, 5, 0];
         let stacks: [u64; 4] = [2_000, 5_000, 10_000, 20_000];
         let seeds: [u64; 3] = [0, 42, 0xDEAD_BEEF];
-        let abs = default_5_abs();
+        let abs = default_abs();
         let mut count = 0;
         for &actor in &actors {
             for &stack in &stacks {
@@ -1713,7 +1713,7 @@ mod stage2_abs_sweep {
         let three_bettors: [u8; 5] = [4, 5, 0, 1, 2];
         let stacks: [u64; 4] = [3_000, 5_000, 10_000, 20_000];
         let seeds: [u64; 3] = [1, 100, 0xCAFE_BABE];
-        let abs = default_5_abs();
+        let abs = default_abs();
         let mut count = 0;
         for &three_bettor in &three_bettors {
             for &stack in &stacks {
@@ -1763,7 +1763,7 @@ mod stage2_abs_sweep {
         let actors: [u8; 4] = [3, 4, 5, 0];
         let short_stacks: [u64; 6] = [400, 600, 1_000, 1_500, 2_500, 4_000];
         let seeds: [u64; 2] = [7, 0x00C0_FFEE];
-        let abs = default_5_abs();
+        let abs = default_abs();
         let mut count = 0;
         for &actor in &actors {
             for &short in &short_stacks {
@@ -1811,7 +1811,7 @@ mod stage2_abs_sweep {
         // 路径上决策——AA 输出应满足 AA-005 + AA-001。
         let bb_stacks: [u64; 6] = [220, 250, 280, 310, 340, 380];
         let seeds: [u64; 2] = [11, 0xBA5E_BA11];
-        let abs = default_5_abs();
+        let abs = default_abs();
         let mut count = 0;
         for &bb_stack in &bb_stacks {
             for &seed in &seeds {
@@ -1850,7 +1850,7 @@ mod stage2_abs_sweep {
         assert!(count >= 10, "incomplete sweep ≥ 10 cases，实际 {count}");
     }
 
-    // ----- 5. multi-all-in sweep（多人 all-in 后下一 actor 5-action） -----
+    // ----- 5. multi-all-in sweep（多人 all-in 后下一 actor 6-action） -----
 
     #[test]
     fn abs_sweep_multi_allin() {
@@ -1858,7 +1858,7 @@ mod stage2_abs_sweep {
         // Fold / AllIn-fold）。stack 按 [200..1500] sweep。
         let pile_stacks: [u64; 8] = [800, 1_000, 1_200, 1_500, 2_000, 2_500, 3_000, 4_000];
         let seeds: [u64; 2] = [0x00A1, 0x00A2];
-        let abs = default_5_abs();
+        let abs = default_abs();
         let mut count = 0;
         for &stack in &pile_stacks {
             for &seed in &seeds {
@@ -1910,7 +1910,7 @@ mod stage2_abs_sweep {
         // 100 盲注，可投 stack=300），UTG raise to 200 → BTN 3-bet to 600，SB
         // fold，BB 决策：to_call = 600，BB cap = 100 + 300 = 400 < 600 ⇒ 跟注必
         // all-in，Call.to = 400 = AllIn.to。
-        let abs = default_5_abs();
+        let abs = default_abs();
 
         // Case 1: BTN short call.
         {
@@ -2043,8 +2043,8 @@ mod stage2_abs_sweep {
     // 让 unused-import 警告不触（部分 helper 仅在内部 sweep 使用）。
     #[test]
     fn abs_sweep_internal_helpers_unused_warning_suppressed() {
-        let abs = default_5_abs();
-        let _config: ActionAbstractionConfig = ActionAbstractionConfig::default_5_action();
+        let abs = default_abs();
+        let _config: ActionAbstractionConfig = ActionAbstractionConfig::default_6_action();
         // 调一次 abstract_actions 让 abs 不被 dead_code 警告。
         let cfg = cfg_uniform(10_000);
         let s = GameState::new(&cfg, 0);

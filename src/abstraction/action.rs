@@ -55,6 +55,7 @@ pub struct BetRatio(u32);
 impl BetRatio {
     pub const HALF_POT: BetRatio = BetRatio(500);
     pub const FULL_POT: BetRatio = BetRatio(1000);
+    pub const TWO_POT: BetRatio = BetRatio(2000);
 
     /// 量化协议（D-202-rev1 / BetRatio::from_f64-rev1）：
     ///
@@ -133,10 +134,11 @@ pub struct ActionAbstractionConfig {
 }
 
 impl ActionAbstractionConfig {
-    /// 默认 5-action 配置：`[BetRatio::HALF_POT, BetRatio::FULL_POT]`（D-200）。
-    pub fn default_5_action() -> ActionAbstractionConfig {
+    /// 默认 6-action 配置：`[BetRatio::HALF_POT, BetRatio::FULL_POT, BetRatio::TWO_POT]`。
+    /// 3 个分数 raise size + Fold + Check/Call + AllIn → 单决策点最多 6 个抽象动作。
+    pub fn default_6_action() -> ActionAbstractionConfig {
         ActionAbstractionConfig {
-            raise_pot_ratios: vec![BetRatio::HALF_POT, BetRatio::FULL_POT],
+            raise_pot_ratios: vec![BetRatio::HALF_POT, BetRatio::FULL_POT, BetRatio::TWO_POT],
         }
     }
 
@@ -215,8 +217,8 @@ impl DefaultActionAbstraction {
         DefaultActionAbstraction { config }
     }
 
-    pub fn default_5_action() -> DefaultActionAbstraction {
-        DefaultActionAbstraction::new(ActionAbstractionConfig::default_5_action())
+    pub fn default_6_action() -> DefaultActionAbstraction {
+        DefaultActionAbstraction::new(ActionAbstractionConfig::default_6_action())
     }
 }
 

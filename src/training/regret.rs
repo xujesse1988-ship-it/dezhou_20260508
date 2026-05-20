@@ -10,7 +10,7 @@
 //! stage 1 / stage 2 锁定路径。
 //!
 //! E2-rev1 \[实现\]（2026-05-14）热路径优化：[`RegretTable::current_strategy`]
-//! 返回 `SigmaVec` = `SmallVec<[f64; 8]>`，让 typical 5-action（NLHE D-209）/
+//! 返回 `SigmaVec` = `SmallVec<[f64; 8]>`，让 typical 6-action（NLHE D-209）/
 //! 2-action（Kuhn）/ 3-action（Leduc）路径走 stack alloc，规避 `Vec::with_capacity`
 //! 堆分配。`Trainer::current_strategy` / `Trainer::average_strategy` trait 入口
 //! 仍返回 `Vec<f64>`（API-310 surface 不变），仅在 trait impl 边界经
@@ -31,7 +31,7 @@ use smallvec::SmallVec;
 
 /// 短策略向量类型别名（E2-rev1 \[实现\]）。
 ///
-/// `SmallVec<[f64; 8]>` inline 容量 8 覆盖 stage 3 D-209 5-action / Kuhn 2-action
+/// `SmallVec<[f64; 8]>` inline 容量 8 覆盖 stage 3 D-209 6-action / Kuhn 2-action
 /// / Leduc 3-action 全场景；溢出时自动 spill 到堆（保留对未来 large-action
 /// abstraction 的兼容）。返回值实现 `IntoIterator<Item = f64>` 与
 /// `Deref<Target = [f64]>`，调用站点与 `Vec<f64>` 替换无感（除显式 `Vec` 注解）。
@@ -102,7 +102,7 @@ impl<I: Eq + Hash + Clone> RegretTable<I> {
             .into_vec()
     }
 
-    /// 热路径变体：返回 `SigmaVec` = `SmallVec<[f64; 8]>`，让 typical 5-action
+    /// 热路径变体：返回 `SigmaVec` = `SmallVec<[f64; 8]>`，让 typical 6-action
     /// （NLHE）/ 2-action（Kuhn）/ 3-action（Leduc）路径走 stack alloc，规避
     /// `Vec::with_capacity` 堆分配（E2-rev1 \[实现\]）。
     ///
@@ -197,7 +197,7 @@ impl<I: Eq + Hash + Clone> RegretTable<I> {
 /// - DFS 顺序 deterministic（rng 决定 sampled trajectory）
 /// - tid 顺序 deterministic（rayon `par_iter_mut().enumerate().collect()` 保
 ///   index 顺序，等价 `std::thread::scope` spawn-by-tid 顺序）
-/// - 同 InfoSet 多次访问（traverser 5-action enumerate 偶发触发）按 push 顺序
+/// - 同 InfoSet 多次访问（traverser 6-action enumerate 偶发触发）按 push 顺序
 ///   playback，f64 加法序列与原 thread-local table accumulate 后再合并完全等价
 ///   （`main += local_table[i] = (((0+d1)+d2)+...)` 与 `main += d1; main += d2;
 ///   ...` 数值结果恒等，f64 结合律失败仅在不同顺序下）。

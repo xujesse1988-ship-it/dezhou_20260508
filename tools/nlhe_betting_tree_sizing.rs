@@ -119,10 +119,9 @@ fn print_stats(label: &str, ratios: &[f64], stats: &Stats, baseline: Option<u64>
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let configs: &[(&str, &[f64])] = &[
-        ("baseline (current default)", &[0.5, 1.0]),
-        ("+ 0.75p", &[0.5, 0.75, 1.0]),
-        ("+ 2p", &[0.5, 1.0, 2.0]),
-        ("+ 0.75p + 2p (Slumbot-like)", &[0.5, 0.75, 1.0, 2.0]),
+        ("default 6-action {0.5p, 1p, 2p}", &[0.5, 1.0, 2.0]),
+        ("2-raise {0.5p, 1p}", &[0.5, 1.0]),
+        ("+ 0.75p {0.5p, 0.75p, 1p, 2p}", &[0.5, 0.75, 1.0, 2.0]),
     ];
 
     println!("=== Simplified NLHE Abstract Betting Tree Sizing (HU 200BB default) ===");

@@ -179,7 +179,7 @@ fn fresh_preflop_state() -> GameState {
 
 #[test]
 fn boundary_real_to_zero_yields_fold_or_check_or_call() {
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     let state = fresh_preflop_state();
     let real_to = ChipAmount::ZERO;
     assert_invariants(&aa, &state, real_to, "boundary real_to=0");
@@ -197,7 +197,7 @@ fn boundary_real_to_zero_yields_fold_or_check_or_call() {
 
 #[test]
 fn boundary_real_to_one_yields_fold_or_check_or_call() {
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     let state = fresh_preflop_state();
     let real_to = ChipAmount::new(1);
     assert_invariants(&aa, &state, real_to, "boundary real_to=1");
@@ -215,7 +215,7 @@ fn boundary_real_to_one_yields_fold_or_check_or_call() {
 
 #[test]
 fn boundary_real_to_u64_max_yields_all_in() {
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     let state = fresh_preflop_state();
     let real_to = ChipAmount::new(u64::MAX);
     assert_invariants(&aa, &state, real_to, "boundary real_to=u64::MAX");
@@ -234,7 +234,7 @@ fn boundary_real_to_u64_max_yields_all_in() {
 
 #[test]
 fn boundary_real_to_equals_max_committed_yields_fold_check_or_call() {
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     let state = fresh_preflop_state();
     let real_to = max_committed(&state); // = BB = 100
     assert_invariants(&aa, &state, real_to, "boundary real_to=max_committed");
@@ -252,7 +252,7 @@ fn boundary_real_to_equals_max_committed_yields_fold_check_or_call() {
 
 #[test]
 fn boundary_real_to_equals_cap_yields_all_in() {
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     let state = fresh_preflop_state();
     let cap = current_cap(&state);
     let real_to = cap;
@@ -271,7 +271,7 @@ fn boundary_real_to_equals_cap_yields_all_in() {
 
 #[test]
 fn boundary_real_to_just_above_max_committed_yields_bet_or_raise_or_allin() {
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     let state = fresh_preflop_state();
     let max_c = max_committed(&state);
     let real_to = max_c + ChipAmount::new(1);
@@ -299,7 +299,7 @@ fn boundary_real_to_just_above_max_committed_yields_bet_or_raise_or_allin() {
 
 #[test]
 fn boundary_real_to_zero_across_multiple_betting_states() {
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     for seed_offset in 0u64..6 {
         let mut state = fresh_state(F1_MASTER_SEED.wrapping_add(seed_offset * 0x1000));
         for stride in [0usize, 1, 2, 3, 4] {
@@ -358,7 +358,7 @@ fn boundary_value_table(max_c: ChipAmount, cap: ChipAmount) -> Vec<ChipAmount> {
 
 #[test]
 fn boundary_value_table_cross_states_smoke() {
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     let seeds = [
         F1_MASTER_SEED,
         F1_MASTER_SEED ^ 0xC0DE_5701,
@@ -399,7 +399,7 @@ fn overflow_path_is_unreachable_in_stage2_self_play() {
     // 攻击向量：调用方传 ChipAmount::new(u64::MAX) → cap 检查在算术 ④ 前触 ①，
     // 直接 AllIn 不进 ④。算术 ④ 路径 stage-2 自然 state 永远不会 overflow。本 test
     // 验证 ① 分支拦截 u64::MAX，作为该 carve-out 的 regression guard。
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     let state = fresh_preflop_state();
     let cap = current_cap(&state);
     let m = aa.map_off_tree(&state, ChipAmount::new(u64::MAX));
@@ -414,7 +414,7 @@ fn overflow_path_is_unreachable_in_stage2_self_play() {
 // ============================================================================
 
 fn random_boundary_real_to(iter: usize, label: &str) {
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     let mut rng = ChaCha20Rng::from_seed(F1_MASTER_SEED ^ 0xFF00);
     // 6 个 base state，循环抽
     let states: Vec<GameState> = (0..6u64)

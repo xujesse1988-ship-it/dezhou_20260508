@@ -15,7 +15,7 @@
 //! 输入 1k 重复维度。两者覆盖 IA-004 不变量的不同切面。
 //!
 //! 与 `tests/action_abstraction.rs::action_abs_determinism_repeat_smoke`（B1 1k smoke）
-//! 互补：本文件跨 1–14 raise size 配置维度，action_abstraction 单默认 5-action 配置
+//! 互补：本文件跨 1–14 raise size 配置维度，action_abstraction 单默认 6-action 配置
 //! 维度。
 //!
 //! 角色边界：本文件属 `[测试]` agent 产物。任一断言被 [实现] 反驳由 [测试] agent
@@ -163,7 +163,7 @@ fn action_abstraction_config_random_raise_sizes_full() {
 // ============================================================================
 
 fn off_tree_real_bet(iter: usize, label: &str) {
-    let aa = DefaultActionAbstraction::default_5_action();
+    let aa = DefaultActionAbstraction::default_6_action();
     let mut rng = ChaCha20Rng::from_seed(FUZZ_MASTER_SEED.wrapping_add(0x77CC_E000));
     let state = fresh_state(0x00C1_FACE_F00D_0000);
     for i in 0..iter {

@@ -13,7 +13,7 @@
 | Kuhn Vanilla CFR | ✅ 收敛到 closed-form Nash `-1/18` | `tests/cfr_kuhn.rs` |
 | Leduc Vanilla CFR | ✅ exploitability `< 0.1` @ 10K iter | `tests/cfr_leduc.rs` |
 | Leduc ES-MCCFR | ✅ 1M 外部对照通过；Rust 2M per-player update EV 与 `leduc_mccfr.py` 1M iter 同量级 | `leduc_mccfr.py` + `tools/leduc_es_mccfr_report.rs` |
-| 简化 NLHE ES-MCCFR | ⚠️ 算法 pipeline + InfoSetId v2 layout + 1K/1M smoke 跑通；默认 profile 已切到 200BB，200BB blueprint 未训练（H4 范围） | `tests/cfr_simplified_nlhe.rs` + `tests/nlhe_infoset_history_collision.rs` + `src/training/nlhe_betting_tree.rs` |
+| 简化 NLHE ES-MCCFR | ⚠️ 算法 pipeline + InfoSetId v2 layout + 1K/1M smoke 跑通；默认 profile 已切到 200BB + 6-action {0.5p, 1p, 2p}（betting tree 240,096 节点），blueprint 未训练（H4 范围） | `tests/cfr_simplified_nlhe.rs` + `tests/nlhe_infoset_history_collision.rs` + `src/training/nlhe_betting_tree.rs` |
 | H3 简化 NLHE 闭环工具 | ✅ 训练入口、baseline 评测、LBR proxy、Markdown/JSON report、preflop strategy dump、抽象 betting tree sizing 工具齐备（200BB 重新跑数据待 H4） | `tools/train_cfr.rs` + `tools/nlhe_h3_report.rs` + `tools/nlhe_preflop_strategy_dump.rs` + `tools/nlhe_betting_tree_sizing.rs` + `tests/nlhe_h3_eval.rs` |
 
 ### 最近验证证据

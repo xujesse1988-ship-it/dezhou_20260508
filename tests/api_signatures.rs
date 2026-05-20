@@ -160,14 +160,14 @@ fn _stage2_api_signature_assertions() {
     let _: for<'a> fn(&'a AbstractActionSet) -> &'a [AbstractAction] = AbstractActionSet::as_slice;
 
     // ActionAbstractionConfig
-    let _: fn() -> ActionAbstractionConfig = ActionAbstractionConfig::default_5_action;
+    let _: fn() -> ActionAbstractionConfig = ActionAbstractionConfig::default_6_action;
     let _: fn(Vec<f64>) -> Result<ActionAbstractionConfig, ConfigError> =
         ActionAbstractionConfig::new;
     let _: for<'a> fn(&'a ActionAbstractionConfig) -> usize = ActionAbstractionConfig::raise_count;
 
     // DefaultActionAbstraction
     let _: fn(ActionAbstractionConfig) -> DefaultActionAbstraction = DefaultActionAbstraction::new;
-    let _: fn() -> DefaultActionAbstraction = DefaultActionAbstraction::default_5_action;
+    let _: fn() -> DefaultActionAbstraction = DefaultActionAbstraction::default_6_action;
 
     // ActionAbstraction trait 方法 UFCS 绑到具体 impl，锁住 trait + impl 联合签名
     // （rustc 仅校验 impl ↔ trait 一致性，不校验 trait ↔ API 文档；UFCS 把替换后的
