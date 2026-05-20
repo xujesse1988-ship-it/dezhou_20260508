@@ -81,23 +81,30 @@ Leduc 10 × 10K BLAKE3 复现 ok / Leduc ES-MCCFR 2M anchor `ev_p0=-0.087396516`
 `tests/data/checkpoint-hashes-linux-x86_64.txt` 已刷新，`tests/cross_host_blake3.rs::
 cross_host_baseline_byte_equal_for_current_arch` 由 fail 变 ok。
 
-### 已修：`step_parallel` thread-local pre-aggregate
+### 已尝试 + 回滚：`step_parallel` thread-local pre-aggregate（IndexMap）
 
 `LocalRegretDelta` / `LocalStrategyDelta` 内部 `Vec<(I, SigmaVec)>` 换成
-`IndexMap<I, SigmaVec>`：DFS 内 push 时若同一 InfoSet 已存在则 in-place 累加，merge 阶段
-每个唯一 InfoSet 只触发一次主表 HashMap entry 调用。跨 run 确定性来源：
+`IndexMap<I, SigmaVec>` 想做 DFS 内 in-place 累加 + dedup。预期 1.5-2.5× throughput。
 
-- 同 trajectory 多次 push 同 InfoSet 时按 DFS 顺序左结合 → 单线程 f64 序列恒定
-- IndexMap 保 insertion order，merge 按首次 push 顺序 playback
-- 跨 thread 仍是 tid 升序（rayon `par_iter_mut().enumerate().collect()`）
+AWS c7i 32 vCPU × 10M update 实测：
 
-验收：Kuhn / Leduc Vanilla CFR + Leduc ES-MCCFR anchor 数值 byte-equal；step_parallel
-20K updates × 4 threads × `seed=0xcafef00d` 跨 2 次 run 最终 checkpoint BLAKE3 byte-equal
-(`a597567d18c99207a3aa94341361e0a3780c96b5124f66edef7e3593141504a8`)。
+| 配置 | 0-5M steady throughput | wall（含 5M auto ckpt + final ckpt） |
+|---|---|---|
+| 旧 Vec append-only（status 原 baseline） | 10,273/s | n/a（500K 那次 RSS=10.7 GiB ckpt 261s） |
+| IndexMap pre-aggregate（本次实测） | 9,285/s | 1077s compute + 125s 5M ckpt + 205s final ckpt = 1281.7s |
 
-vultr 4 core 短跑 throughput 旧 ≈ 3,300/s → 当前 ≈ 3,254/s 同量级（vultr core 数太少，
-真正的 scaling 看 AWS 32 vCPU；status 旧 32-thread steady 10,273 update/s 待 H4 训练前
-在 AWS 复测确认 dedup 是否产出预期 1.5–2.5× 提升）。
+**结论：throughput 没提升反而略低**。根因：ES-MCCFR 一条 trajectory 在树状 DFS 下每个
+traverser-actor InfoSet 只被访问一次（节点 `info_set = bucket | node_id | street_tag`，
+不同 action 路径生成不同 node_id → 不同 InfoSet），IndexMap 的 dedup 没料可吃，
+HashMap lookup 比 Vec push 多花常数。
+
+已回滚到 Vec 路径。如果之后要解 serial-merge 瓶颈，必须碰跨线程合并顺序
+（hash shard / lock-free atomic），那会破：
+- Leduc ES-MCCFR 外部对照（Python `leduc_mccfr.py` 1M iter `-0.08668` anchor）
+- Kuhn / Leduc fixed-seed BLAKE3 复现
+- `cross_host_blake3` 跨 host byte-equal baseline
+
+要不要做、做到什么程度，单独决策（不在本 step 范围）。
 
 ## 下一步唯一允许的工作
 
