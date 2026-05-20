@@ -38,17 +38,88 @@
   betting tree 节点数已实测：`tools/nlhe_betting_tree_sizing` 输出 240,096 决策节点（18-bit node_id），
   与 `NodeId = u32` + `InfoSetId v2` 26-bit cap 一致。
 
+## 训练吞吐基线 + 已知 perf bug（2026-05-20 实测）
+
+### 吞吐基线（AWS c7i 32 vCPU EPYC 7R13 / 61 GiB）
+
+`tools/train_cfr.rs` 在当前默认 200BB / 6-action / preflop 169 lossless / postflop 500-500-500 bucket
+配置下实测：
+
+| Threads | Throughput (steady) | Speedup |
+|---|---|---|
+| 1 | 3,379 update/s | 1.0× |
+| 32 | 10,273 update/s | 3.04× |
+
+32 线程时 `%CPU = 703`（7 个核满载），scaling efficiency ≈ 22%。
+
+### 瓶颈定位：`step_parallel` serial merge 是硬上限
+
+`src/training/trainer.rs:367-430` 的 fork-join 形态：N 个 rayon worker 并行跑 DFS，主线程
+**串行 merge N 个 `LocalRegretDelta` 回主 `RegretTable`**（`src/training/trainer.rs:420-427`）。
+两组实测数据反推：
+
+- `T_game`（每 trajectory 并行成本） ≈ 296 μs
+- `T_merge`（每 delta 串行合并成本） ≈ 88 μs
+- `throughput(N) = N / (T_game + N × T_merge)`，N → ∞ 时渐近 `1/T_merge ≈ 11,364/s`
+
+**含义：加更多线程 / 更大机器都没用**，throughput 被 serial merge 卡死在 ~11K/s。
+1B updates 在现状下 wall ≈ 28 h。
+
+### 已修：checkpoint 序列化排序键换成 `Ord::cmp`
+
+旧路径 `entries.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)))` 每次比较
+分配 2 个 String，总 alloc 数 O(N log N)。500K updates 实测 RSS=10.7 GiB → final checkpoint
+写盘 261 s（compute 才 148 s）。
+
+修法：`Game::InfoSet` bound 加 `Ord`，`KuhnAction/KuhnHistory/KuhnInfoSet` /
+`LeducAction/LeducStreet/LeducInfoSet` 全部 `derive(PartialOrd, Ord)`（`InfoSetId` 之前
+就有），`encode_table` 改成 `a.0.cmp(&b.0)` 零分配排序。Kuhn 1000 × 10K BLAKE3 复现 ok /
+Leduc 10 × 10K BLAKE3 复现 ok / Leduc ES-MCCFR 2M anchor `ev_p0=-0.087396516`
+`exploitability=0.258471407` `blake3=b48a079c...` byte-equal。
+
+副作用：bincode entry 顺序变（同 InfoSet 集合按 Ord 序 vs 旧 Debug 字符序）→
+`tests/data/checkpoint-hashes-linux-x86_64.txt` 已刷新，`tests/cross_host_blake3.rs::
+cross_host_baseline_byte_equal_for_current_arch` 由 fail 变 ok。
+
+### 已修：`step_parallel` thread-local pre-aggregate
+
+`LocalRegretDelta` / `LocalStrategyDelta` 内部 `Vec<(I, SigmaVec)>` 换成
+`IndexMap<I, SigmaVec>`：DFS 内 push 时若同一 InfoSet 已存在则 in-place 累加，merge 阶段
+每个唯一 InfoSet 只触发一次主表 HashMap entry 调用。跨 run 确定性来源：
+
+- 同 trajectory 多次 push 同 InfoSet 时按 DFS 顺序左结合 → 单线程 f64 序列恒定
+- IndexMap 保 insertion order，merge 按首次 push 顺序 playback
+- 跨 thread 仍是 tid 升序（rayon `par_iter_mut().enumerate().collect()`）
+
+验收：Kuhn / Leduc Vanilla CFR + Leduc ES-MCCFR anchor 数值 byte-equal；step_parallel
+20K updates × 4 threads × `seed=0xcafef00d` 跨 2 次 run 最终 checkpoint BLAKE3 byte-equal
+(`a597567d18c99207a3aa94341361e0a3780c96b5124f66edef7e3593141504a8`)。
+
+vultr 4 core 短跑 throughput 旧 ≈ 3,300/s → 当前 ≈ 3,254/s 同量级（vultr core 数太少，
+真正的 scaling 看 AWS 32 vCPU；status 旧 32-thread steady 10,273 update/s 待 H4 训练前
+在 AWS 复测确认 dedup 是否产出预期 1.5–2.5× 提升）。
+
 ## 下一步唯一允许的工作
 
-训出**200BB / 6-action / preflop 169 lossless** 的 first usable blueprint：
-- `tools/train_cfr.rs` 跑 ≥ 10⁹ sampled decision updates（H4 first-usable 门槛）。
-- 训练前先短跑（10⁷–10⁸）确认 LBR proxy 曲线下降、preflop 策略 spot 没回归到 100% AllIn 病态。
-- 训练完出 H4 baseline 数据填回上文"最近验证证据"：betting tree（已有 240,096）+ LBR 曲线 +
-  fixed-seed snapshot BLAKE3 + preflop spot 检查。
+### Step 3：跑 1B blueprint
 
-跳过 / 暂不做：
-- Slumbot HTTP H2H 接入（H4 验收门槛但"不阻塞 first usable"，留到 first usable 出曲线后再排）。
-- 500/500/500 postflop bucket 质量提升（已知污染清单第 1 条；stage 2 重做范围，不在 H4 内）。
+- `tools/train_cfr.rs --updates 10⁹ --threads 32` on AWS c7i.4xlarge 同档机器
+- 训练前先 10⁷–10⁸ 短跑确认 LBR proxy 曲线下降、preflop 策略 spot 没回归到 100% AllIn
+- 训练完出 H4 baseline 填回上文"最近验证证据"：betting tree（已有 240,096）+ LBR 曲线 +
+  fixed-seed snapshot BLAKE3 + preflop spot 检查
+
+### 不做（明确划界）
+
+- **Parallel merge by hash shard / lock-free atomic 累加**：触碰跨线程 f64 顺序，
+  Leduc 外部对照 + 跨 host BLAKE3 测试都要重做，ROI 不够（除非 H4 后还要反复训练大量轮次）
+- Slumbot HTTP H2H 接入（H4 验收门槛但"不阻塞 first usable"）
+- 500/500/500 postflop bucket 质量提升（stage 2 范围）
+
+### 硬件备忘
+
+vultr (4 core / 7.7 GiB) **跑不动** —— 第 3M updates 时 RSS 就到 7.6 GiB，进 swap
+throughput 从 3,536/s 衰减到 808/s。1B 跑只能在 ≥ 16 vCPU / ≥ 32 GiB 的机器上。
+本次用的是 AWS c7i.4xlarge（32 vCPU / 61 GiB，~$0.71/h），1B 完整跑成本 ~$20–25。
 
 ## 代码结构
 
@@ -109,16 +180,6 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test
   - 在父 commit `ee4da88` 上同号同值复现，**非本次 200BB 切换引入**。
   - 根因：当前 500/500/500 bucket 抽象质量不达标，属 stage 2 重做范围
     （上文简化 NLHE 行 ⚠️ 状态的同一原因）。
-- `tests/cross_host_blake3.rs::cross_host_baseline_byte_equal_for_current_arch` fail：
-  32-seed Kuhn Vanilla CFR 5-iter checkpoint BLAKE3 实测值与
-  `tests/data/checkpoint-hashes-linux-x86_64.txt` baseline 全条目漂移
-  （actual `840fdf8c…` vs expected `191a4d72…` 等）。
-  - 同测试文件的 `within_process_blake3_reproducible_twice` 和
-    `cross_arch_baselines_byte_equal_when_both_present` 仍绿 → 本机内确定性 + 跨架构 baseline
-    比对都 OK，只是 linux baseline 文件落后于当前 checkpoint 实测。
-  - 在父 commit `ee4da88` 上同号同值复现，非本次 200BB 切换引入。
-  - 处理：等下一次 Kuhn checkpoint serialization 真正稳定后，跑
-    `scripts/capture-checkpoint-hashes.sh` 重新生成 baseline 文件。
 
 
 ## 文档维护规则
