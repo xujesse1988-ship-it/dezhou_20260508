@@ -13,7 +13,7 @@
 | Kuhn Vanilla CFR | ✅ 收敛到 closed-form Nash `-1/18` | `tests/cfr_kuhn.rs` |
 | Leduc Vanilla CFR | ✅ exploitability `< 0.1` @ 10K iter | `tests/cfr_leduc.rs` |
 | Leduc ES-MCCFR | ✅ 1M 外部对照通过；Rust 2M per-player update EV 与 `leduc_mccfr.py` 1M iter 同量级 | `leduc_mccfr.py` + `tools/leduc_es_mccfr_report.rs` |
-| 简化 NLHE ES-MCCFR | ⚠️ 算法 pipeline + InfoSetId v2 layout + 1K/1M smoke 跑通；默认 profile 已切到 200BB + 6-action {0.5p, 1p, 2p}（betting tree 240,096 节点），blueprint 未训练（H4 范围） | `tests/cfr_simplified_nlhe.rs` + `tests/nlhe_infoset_history_collision.rs` + `src/training/nlhe_betting_tree.rs` |
+| 简化 NLHE ES-MCCFR | ⚠️ 算法 pipeline + InfoSetId v2 layout + 1K/1M smoke 跑通；默认 profile = 200BB + 6-action {0.5p, 1p, 2p} + preflop lossless 169（postflop 走 500/500/500 bucket）；betting tree 实测 240,096 节点（18-bit）；blueprint 未训练（H4 范围） | `tests/cfr_simplified_nlhe.rs` + `tests/nlhe_infoset_history_collision.rs` + `src/training/nlhe_betting_tree.rs` + `src/abstraction/preflop.rs` |
 | H3 简化 NLHE 闭环工具 | ✅ 训练入口、baseline 评测、LBR proxy、Markdown/JSON report、preflop strategy dump、抽象 betting tree sizing 工具齐备（200BB 重新跑数据待 H4） | `tools/train_cfr.rs` + `tools/nlhe_h3_report.rs` + `tools/nlhe_preflop_strategy_dump.rs` + `tools/nlhe_betting_tree_sizing.rs` + `tests/nlhe_h3_eval.rs` |
 
 ### 最近验证证据
@@ -33,8 +33,22 @@
   （与 stack profile 无关，仍可用作 H4 200BB 训练的输入抽象）。
 - `tests/nlhe_infoset_history_collision.rs`：SB-aggressor vs BB-aggressor 两条 preflop 线推进到 flop
   同一决策点，InfoSetId 不同（按 node_id 区分）。
-- 200BB 默认切换后简化 NLHE 训练数据全部待 H4 重跑：betting tree 节点数、LBR proxy 曲线、
-  preflop 策略 spot 检查、fixed-seed snapshot BLAKE3 都需要在 200BB 上重新 baseline。
+- 200BB + 6-action 默认切换后简化 NLHE 训练数据待 H4 重跑：LBR proxy 曲线、preflop 策略 spot 检查、
+  fixed-seed snapshot BLAKE3 都需要在 200BB / 6-action 上重新 baseline。
+  betting tree 节点数已实测：`tools/nlhe_betting_tree_sizing` 输出 240,096 决策节点（18-bit node_id），
+  与 `NodeId = u32` + `InfoSetId v2` 26-bit cap 一致。
+
+## 下一步唯一允许的工作
+
+训出**200BB / 6-action / preflop 169 lossless** 的 first usable blueprint：
+- `tools/train_cfr.rs` 跑 ≥ 10⁹ sampled decision updates（H4 first-usable 门槛）。
+- 训练前先短跑（10⁷–10⁸）确认 LBR proxy 曲线下降、preflop 策略 spot 没回归到 100% AllIn 病态。
+- 训练完出 H4 baseline 数据填回上文"最近验证证据"：betting tree（已有 240,096）+ LBR 曲线 +
+  fixed-seed snapshot BLAKE3 + preflop spot 检查。
+
+跳过 / 暂不做：
+- Slumbot HTTP H2H 接入（H4 验收门槛但"不阻塞 first usable"，留到 first usable 出曲线后再排）。
+- 500/500/500 postflop bucket 质量提升（已知污染清单第 1 条；stage 2 重做范围，不在 H4 内）。
 
 ## 代码结构
 
