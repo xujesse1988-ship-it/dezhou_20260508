@@ -16,17 +16,18 @@
 //! 仍返回 `Vec<f64>`（API-310 surface 不变），仅在 trait impl 边界经
 //! `SigmaVec::into_vec` 转 owned `Vec<f64>`（cheap，spill 后零拷贝）。
 //!
-//! E2-rev1 同 commit 引入 `LocalRegretDelta` / `LocalStrategyDelta` 用作
-//! `step_parallel` thread-local delta accumulator：`Vec<(I, SigmaVec)>` 按 DFS
-//! 顺序 append，无内部 dedup / sort，merge 阶段按 insertion 顺序 playback 到主表。
-//! 跨 run 决定性来源 = DFS 顺序 deterministic（rng 决定 sampled trajectory）+
-//! tid 顺序 deterministic（rayon `par_iter_mut().enumerate().collect()` 保 index
-//! 顺序），不依赖 HashMap iteration 顺序，省去原 D-321-rev1 batch merge 的
-//! `format!("{:?}", I)` × O(N log N) 排序开销。
+//! `LocalRegretDelta` / `LocalStrategyDelta` 作为 `step_parallel` thread-local
+//! delta accumulator：`IndexMap<I, SigmaVec>` 在 DFS 过程中 in-place 累加同一
+//! InfoSet 的多次访问，merge 阶段按首次 push 顺序 playback 到主表，每个唯一
+//! InfoSet 只触发一次主表 HashMap entry 调用。跨 run 决定性来源 = DFS 顺序
+//! deterministic（rng 决定 sampled trajectory）+ tid 顺序 deterministic
+//! （rayon `par_iter_mut().enumerate().collect()` 保 index 顺序）+ `IndexMap`
+//! 保 insertion order，不依赖 std `HashMap` iteration 顺序。
 
 use std::collections::HashMap;
 use std::hash::Hash;
 
+use indexmap::IndexMap;
 use smallvec::SmallVec;
 
 /// 短策略向量类型别名（E2-rev1 \[实现\]）。
@@ -185,47 +186,67 @@ impl<I: Eq + Hash + Clone> RegretTable<I> {
     }
 }
 
-/// E2-rev1 \[实现\] thread-local regret delta accumulator（D-321-rev1 lock 真并发
-/// `step_parallel` batch merge 入口）。
+/// thread-local regret delta accumulator（`step_parallel` 真并发 batch merge 入口）。
 ///
-/// `Vec<(I, SigmaVec)>` 按 DFS 顺序 append（不 dedup / 不 sort，保留单线程内
-/// f64 加法顺序的天然 deterministic）。merge 时 main thread 按 tid 升序 ×
-/// 每 thread 内 insertion 顺序 playback 到主 [`RegretTable`]。
+/// 内部 `IndexMap<I, SigmaVec>`：DFS 内同一 InfoSet 多次访问时 **in-place 累加**
+/// 在同一槽位，merge 阶段每个唯一 InfoSet 只往主 [`RegretTable`] 写一次。
+/// `IndexMap` 保 insertion 顺序，merge 按 tid 升序 × 每 thread 内首次 push 顺序
+/// playback。
 ///
-/// 与原 D-321-rev1 lock（thread-local `RegretTable` + `format!("{:?}", I)` ×
-/// O(N log N) 排序合并）等价的跨 run BLAKE3 byte-equal 来源：
-/// - DFS 顺序 deterministic（rng 决定 sampled trajectory）
-/// - tid 顺序 deterministic（rayon `par_iter_mut().enumerate().collect()` 保
-///   index 顺序，等价 `std::thread::scope` spawn-by-tid 顺序）
-/// - 同 InfoSet 多次访问（traverser 6-action enumerate 偶发触发）按 push 顺序
-///   playback，f64 加法序列与原 thread-local table accumulate 后再合并完全等价
-///   （`main += local_table[i] = (((0+d1)+d2)+...)` 与 `main += d1; main += d2;
-///   ...` 数值结果恒等，f64 结合律失败仅在不同顺序下）。
+/// 跨 run BLAKE3 byte-equal 来源：
+/// - 同 trajectory 内多次 push 同 InfoSet 时 in-place 累加按 DFS 顺序结合，
+///   `local[I] = (((0 + d1) + d2) + d3) + ...`，单线程内 f64 加法序列恒定。
+/// - merge 时 `main.accumulate(I, &local[I])` 把 thread-local 已聚合的总量加到主表，
+///   跨 thread 顺序仍是 tid 升序（rayon `par_iter_mut().enumerate().collect()`
+///   保 index 顺序）。
+/// - `IndexMap` 的 insertion-order iteration 与 std `HashMap` 不同，是确定性保 N
+///   个唯一 InfoSet 按首次 push 顺序 playback 的关键。
 ///
-/// 性能优势：省去 `format!("{:?}", I)` × 每比较一次 String alloc 的开销
-/// （F1-rev1 vultr 4-core 加速比 1.14× 主因 = batch merge sort 而非 spawn
-/// overhead），merge cost 由 O(N log N × |Debug(I)|) 降到 O(N)。
+/// 性能优势 vs 旧 `Vec<(I, SigmaVec)>` append-only 路径（status step 2）：
+/// - merge 阶段对主表的 HashMap entry 调用数从 **N push 数** 降到 **N 唯一 InfoSet 数**
+///   （DFS 内同 InfoSet 多次访问时 dedup）。
+/// - 主表 entry call 是 step_parallel 序列化点，T_merge ~ 88 μs/delta（status
+///   段 "瓶颈定位"），dedup 后等比下降。
 #[derive(Debug, Default)]
-pub(crate) struct LocalRegretDelta<I> {
-    entries: Vec<(I, SigmaVec)>,
+pub(crate) struct LocalRegretDelta<I: Eq + Hash> {
+    entries: IndexMap<I, SigmaVec>,
 }
 
-impl<I> LocalRegretDelta<I> {
+impl<I: Eq + Hash> LocalRegretDelta<I> {
     /// 空容器。
     pub(crate) fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: IndexMap::new(),
         }
     }
 
-    /// Append 1 个 (info_set, delta) 条目；不 dedup / 不 sort（merge 时按 push
-    /// 顺序 playback）。`delta` 调用方持有 `SmallVec<[f64; 8]>`（`SigmaVec`），
-    /// 本方法直接 owned 接收避免再分配。
+    /// Push 1 个 (info_set, delta) 条目：
+    /// - 首次见 `info_set` → 直接 insert（保 insertion order）。
+    /// - 已存在 → in-place `slot[i] += delta[i]` 累加（DFS 访问序左结合）。
+    ///
+    /// `delta` 调用方持有 `SmallVec<[f64; 8]>`（`SigmaVec`），首次插入 owned
+    /// 转移避免再分配；已存在时只读 slice 累加。
     pub(crate) fn push(&mut self, info_set: I, delta: SigmaVec) {
-        self.entries.push((info_set, delta));
+        match self.entries.get_mut(&info_set) {
+            Some(slot) => {
+                debug_assert_eq!(
+                    slot.len(),
+                    delta.len(),
+                    "LocalRegretDelta::push action_count mismatch: stored {}, requested {} (D-324)",
+                    slot.len(),
+                    delta.len()
+                );
+                for (s, d) in slot.iter_mut().zip(delta.iter()) {
+                    *s += *d;
+                }
+            }
+            None => {
+                self.entries.insert(info_set, delta);
+            }
+        }
     }
 
-    /// 已 push 条目数（监控用）。
+    /// 已存唯一 InfoSet 数（监控用）。
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -237,9 +258,9 @@ impl<I> LocalRegretDelta<I> {
         self.entries.is_empty()
     }
 
-    /// 消费并返回 owned entries（merge 入口）。
+    /// 消费并返回 owned entries（merge 入口），按 insertion order 输出。
     pub(crate) fn into_entries(self) -> Vec<(I, SigmaVec)> {
-        self.entries
+        self.entries.into_iter().collect()
     }
 }
 
@@ -342,28 +363,45 @@ impl<I: Eq + Hash + Clone> StrategyAccumulator<I> {
     }
 }
 
-/// E2-rev1 \[实现\] thread-local strategy_sum delta accumulator
-/// （语义同 `LocalRegretDelta`，作用于 [`StrategyAccumulator`]）。
+/// thread-local strategy_sum delta accumulator
+/// （语义同 [`LocalRegretDelta`]，作用于 [`StrategyAccumulator`]）。
 #[derive(Debug, Default)]
-pub(crate) struct LocalStrategyDelta<I> {
-    entries: Vec<(I, SigmaVec)>,
+pub(crate) struct LocalStrategyDelta<I: Eq + Hash> {
+    entries: IndexMap<I, SigmaVec>,
 }
 
-impl<I> LocalStrategyDelta<I> {
+impl<I: Eq + Hash> LocalStrategyDelta<I> {
     /// 空容器。
     pub(crate) fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: IndexMap::new(),
         }
     }
 
-    /// Append 1 个 (info_set, weighted_strategy) 条目（语义同
+    /// Push 1 个 (info_set, weighted_strategy) 条目（语义同
     /// [`LocalRegretDelta::push`]）。
     pub(crate) fn push(&mut self, info_set: I, weighted: SigmaVec) {
-        self.entries.push((info_set, weighted));
+        match self.entries.get_mut(&info_set) {
+            Some(slot) => {
+                debug_assert_eq!(
+                    slot.len(),
+                    weighted.len(),
+                    "LocalStrategyDelta::push action_count mismatch: stored {}, requested {} \
+                     (D-324)",
+                    slot.len(),
+                    weighted.len()
+                );
+                for (s, d) in slot.iter_mut().zip(weighted.iter()) {
+                    *s += *d;
+                }
+            }
+            None => {
+                self.entries.insert(info_set, weighted);
+            }
+        }
     }
 
-    /// 已 push 条目数（监控用）。
+    /// 已存唯一 InfoSet 数（监控用）。
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
@@ -375,8 +413,8 @@ impl<I> LocalStrategyDelta<I> {
         self.entries.is_empty()
     }
 
-    /// 消费并返回 owned entries（merge 入口）。
+    /// 消费并返回 owned entries（merge 入口），按 insertion order 输出。
     pub(crate) fn into_entries(self) -> Vec<(I, SigmaVec)> {
-        self.entries
+        self.entries.into_iter().collect()
     }
 }

@@ -447,6 +447,7 @@ dependencies = [
  "bincode",
  "blake3",
  "criterion",
+ "indexmap",
  "prost",
  "rand",
  "rand_chacha",
