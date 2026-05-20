@@ -1,4 +1,4 @@
-//! 一次 ES-MCCFR update 的 trace 可视化工具（简化 NLHE / heads-up 100BB）。
+//! 一次 ES-MCCFR update 的 trace 可视化工具（简化 NLHE / heads-up 200BB）。
 //!
 //! 跑法：
 //! ```

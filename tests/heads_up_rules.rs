@@ -1,8 +1,7 @@
 //! Heads-up NLHE profile regression tests.
 //!
-//! These tests lock the public 2-player 100BB profile introduced for the
-//! heads-up solver target while keeping the generic `SeatId` / `TableConfig`
-//! model intact.
+//! These tests lock the public 2-player 200BB default profile (Slumbot-aligned)
+//! while keeping the generic `SeatId` / `TableConfig` model intact.
 
 mod common;
 
@@ -28,10 +27,10 @@ fn drive(state: &mut GameState, expected_total: u64, plan: &[(SeatId, Action)]) 
 }
 
 #[test]
-fn default_hu_100bb_posts_button_sb_and_bb() {
-    let cfg = TableConfig::default_hu_100bb();
+fn default_hu_200bb_posts_button_sb_and_bb() {
+    let cfg = TableConfig::default_hu_200bb();
     assert_eq!(cfg.n_seats, 2);
-    assert_eq!(cfg.starting_stacks, vec![chips(10_000); 2]);
+    assert_eq!(cfg.starting_stacks, vec![chips(20_000); 2]);
     assert_eq!(cfg.small_blind, chips(50));
     assert_eq!(cfg.big_blind, chips(100));
     assert_eq!(cfg.ante, chips(0));
@@ -49,11 +48,11 @@ fn default_hu_100bb_posts_button_sb_and_bb() {
     let sb = &state.players()[0];
     let bb = &state.players()[1];
     assert_eq!(sb.seat, seat(0));
-    assert_eq!(sb.stack, chips(9_950));
+    assert_eq!(sb.stack, chips(19_950));
     assert_eq!(sb.committed_this_round, chips(50));
     assert_eq!(sb.committed_total, chips(50));
     assert_eq!(bb.seat, seat(1));
-    assert_eq!(bb.stack, chips(9_900));
+    assert_eq!(bb.stack, chips(19_900));
     assert_eq!(bb.committed_this_round, chips(100));
     assert_eq!(bb.committed_total, chips(100));
 
@@ -61,8 +60,8 @@ fn default_hu_100bb_posts_button_sb_and_bb() {
     assert!(legal.fold);
     assert!(!legal.check);
     assert_eq!(legal.call, Some(chips(100)));
-    assert_eq!(legal.raise_range, Some((chips(200), chips(10_000))));
-    assert_eq!(legal.all_in_amount, Some(chips(10_000)));
+    assert_eq!(legal.raise_range, Some((chips(200), chips(20_000))));
+    assert_eq!(legal.all_in_amount, Some(chips(20_000)));
 
     Invariants::check_all(&state, expected_total_chips(&cfg))
         .expect("default HU initial state should satisfy invariants");
@@ -70,7 +69,7 @@ fn default_hu_100bb_posts_button_sb_and_bb() {
 
 #[test]
 fn heads_up_call_check_reaches_flop_with_bb_first_to_act() {
-    let cfg = TableConfig::default_hu_100bb();
+    let cfg = TableConfig::default_hu_200bb();
     let mut state = GameState::new(&cfg, 1);
     let total = expected_total_chips(&cfg);
 
@@ -123,7 +122,7 @@ fn heads_up_call_check_reaches_flop_with_bb_first_to_act() {
 
 #[test]
 fn heads_up_button_seat_controls_preflop_and_postflop_order() {
-    let mut cfg = TableConfig::default_hu_100bb();
+    let mut cfg = TableConfig::default_hu_200bb();
     cfg.button_seat = seat(1);
     let mut state = GameState::new(&cfg, 2);
     let total = expected_total_chips(&cfg);

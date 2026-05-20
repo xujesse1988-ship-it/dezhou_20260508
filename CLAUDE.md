@@ -4,13 +4,14 @@ This file gives Claude Code guidance for working in this repository.
 
 ## 项目是什么
 
-8-stage Pluribus 风格 6-max NLHE 扑克 AI。Rust 实现。
+Heads-up No-Limit Texas Hold'em 求解器，默认 200BB profile，架构保留 6-max 扩展余地。Rust 实现。
 
 ## 每次开始工作前必读
 
 1. `docs/status.md` — 当前代码真实状态 + 下一步唯一允许的工作。**先看算法正确性表，再决定要不要动代码**。
 2. `docs/invariants.md` — 代码层硬约束。违反这些规则的 PR 不通过。
-3. `docs/pluribus_path.md` — 8 阶段 roadmap 和量化门槛。
+3. `docs/heads_up_nlhe_solver_target.md` — 当前主线目标 + heads-up 阶段（H1–H5）量化门槛。
+4. `docs/pluribus_path.md` — 6-max 长线参考，**非当前验收目标**。
 
 历史决策、carve-out、流程叙事一律不在文档里保留。需要查走 `git log` / `git show`。
 

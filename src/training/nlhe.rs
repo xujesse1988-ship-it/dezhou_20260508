@@ -137,7 +137,7 @@ impl SimplifiedNlheGame {
                 got: 0,
             });
         }
-        let config = TableConfig::default_hu_100bb();
+        let config = TableConfig::default_hu_200bb();
         let tree = Arc::new(PublicBettingTree::build(&config));
         Ok(Self {
             bucket_table,

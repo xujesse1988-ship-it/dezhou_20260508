@@ -3,7 +3,7 @@
 //!
 //! 五条核心 trip-wire（`pluribus_stage3_workflow.md` §步骤 C1 lines 197-202）：
 //!
-//! 1. `simplified_nlhe_game_root_state_2_player_100bb_starting_stack`（D-313 范围
+//! 1. `simplified_nlhe_game_root_state_2_player_200bb_starting_stack`（D-313 范围
 //!    sanity，default profile active）— 验证 `Game::n_players() == 2` + root
 //!    `game_state.players().len() == 2`。
 //! 2. `simplified_nlhe_legal_actions_returns_default_action_abstraction_5_action`
@@ -170,9 +170,9 @@ fn walk_to_first_player_node(
 ///
 /// 该测试在 A1 scaffold 阶段必然 panic-fail（`SimplifiedNlheGame::new` /
 /// `SimplifiedNlheGame::n_players` 均 `unimplemented!()`），C2 \[实现\] 落地后转
-/// 绿。本 trip-wire 锁定 D-313 "2-player + 100 BB starting stack" 字面范围。
+/// 绿。本 trip-wire 锁定 "2-player + 200 BB starting stack" 字面范围。
 #[test]
-fn simplified_nlhe_game_root_state_2_player_100bb_starting_stack() {
+fn simplified_nlhe_game_root_state_2_player_200bb_starting_stack() {
     let Some(game) = load_v3_artifact_or_skip() else {
         return;
     };

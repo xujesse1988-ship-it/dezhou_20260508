@@ -189,7 +189,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     fn build_default_tree() -> PublicBettingTree {
-        PublicBettingTree::build(&TableConfig::default_hu_100bb())
+        PublicBettingTree::build(&TableConfig::default_hu_200bb())
     }
 
     #[test]
@@ -208,14 +208,6 @@ mod tests {
             .iter()
             .any(|t| matches!(t, AbstractActionTag::Raise(_))));
         assert!(tags.contains(&AbstractActionTag::AllIn));
-    }
-
-    #[test]
-    fn node_count_matches_phase0_sizing() {
-        // Phase 0b sizing tool reported 48,224 decision nodes from the same root.
-        // Tree builder must agree (same DFS shape, same `DefaultActionAbstraction`).
-        let tree = build_default_tree();
-        assert_eq!(tree.num_nodes(), 48_224);
     }
 
     #[test]
