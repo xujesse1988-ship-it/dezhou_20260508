@@ -16,6 +16,7 @@ use crate::core::{Card, Rank, SeatId, Street};
 use crate::error::NlheEvaluationError;
 use crate::eval::{HandCategory, HandEvaluator, NaiveHandEvaluator};
 use crate::training::game::{Game, NodeKind, PlayerId};
+use crate::training::lbr::{estimate_lbr, estimate_lbr_filtered, LbrConfig, LbrReport};
 use crate::training::nlhe::{SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet};
 use crate::training::sampling::sample_discrete;
 
@@ -111,48 +112,13 @@ pub struct NlheEvaluationReport {
     pub bb_mbb_per_game: f64,
 }
 
-/// 近似 local best-response proxy 配置。
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct NlheLbrConfig {
-    /// 采样多少个 target-player decision probe。
-    pub probes: u64,
-    /// 每个候选动作用多少条 blueprint rollout 估计 EV。
-    pub rollouts_per_action: u64,
-    pub seed: u64,
-    pub max_actions_per_probe: usize,
-    pub max_actions_per_rollout: usize,
-}
+/// 历史名称，等价于 [`LbrConfig`]。LBR proxy 已 game-generic 化，新代码请直接
+/// 用 [`LbrConfig`]；此 alias 仅为保持公开 API 稳定（`NlheLbrConfig::default()` /
+/// 字段访问全部继承自 generic）。
+pub type NlheLbrConfig = LbrConfig;
 
-impl Default for NlheLbrConfig {
-    fn default() -> Self {
-        Self {
-            probes: 1_000,
-            rollouts_per_action: 16,
-            seed: 0x4833_4c42_5200_0001,
-            max_actions_per_probe: 128,
-            max_actions_per_rollout: 512,
-        }
-    }
-}
-
-/// H3 工程用 LBR proxy。它不是正式 exploitability，只用于比较同一评测配置下
-/// checkpoint 之间的趋势。
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct NlheLbrReport {
-    pub probes_requested: u64,
-    pub probes_used: u64,
-    pub terminal_or_unreached_probes: u64,
-    /// 被 `probe_accept` filter 拒绝的 probe 数（[`estimate_simplified_nlhe_lbr_filtered`]
-    /// 路径专用；默认 wrapper 走 `|_| true` 永远是 0）。
-    #[serde(default)]
-    pub filtered_probes: u64,
-    pub rollouts_per_action: u64,
-    pub seed: u64,
-    pub mean_best_response_chips: f64,
-    pub standard_error_chips: f64,
-    pub target0_mean_chips: f64,
-    pub target1_mean_chips: f64,
-}
+/// 历史名称，等价于 [`LbrReport`]。
+pub type NlheLbrReport = LbrReport;
 
 /// 评测 blueprint average strategy 对单个 baseline 的收益。
 ///
@@ -223,118 +189,24 @@ pub fn evaluate_blueprint_vs_baseline(
     })
 }
 
-/// 估计 H3 工程用 local best-response proxy。
-///
-/// 每个 probe 先沿 blueprint self-play 采样到 target player 的一个决策点，再枚举该
-/// 点 legal actions；每个 action 后续按 blueprint rollout，取最高 EV。target
-/// player 之后的未来决策也回到 blueprint，因此这是 local proxy，不是正式 BR。
+/// 估计 H3 工程用 local best-response proxy。薄壳调用 game-generic
+/// [`estimate_lbr`]，保持公开 API 稳定。
 pub fn estimate_simplified_nlhe_lbr(
     game: &SimplifiedNlheGame,
     blueprint_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
     config: &NlheLbrConfig,
 ) -> Result<NlheLbrReport, NlheEvaluationError> {
-    estimate_simplified_nlhe_lbr_filtered(game, blueprint_strategy, &|_| true, config)
+    estimate_lbr::<SimplifiedNlheGame>(game, blueprint_strategy, config)
 }
 
-/// 带 probe filter 的 LBR proxy。`probe_accept(target_info)` 返回 false 时本次
-/// probe 被丢弃（既不进 mean BR 估值，也不计入 `probes_used`，而是计入
-/// [`NlheLbrReport::filtered_probes`]）。用于回答"如果只在 blueprint 真实学过的
-/// infoset 上 probe，LBR 会是多少"这类对照实验。
-///
-/// `probe_accept` 在 target player 决策点上调用，参数是该点的 [`SimplifiedNlheInfoSet`]，
-/// 调用方可在闭包内查 strategy_sum / regret 表决定是否接受。
+/// 带 probe filter 的 LBR proxy。薄壳调用 game-generic [`estimate_lbr_filtered`]。
 pub fn estimate_simplified_nlhe_lbr_filtered(
     game: &SimplifiedNlheGame,
     blueprint_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
     probe_accept: &dyn Fn(&SimplifiedNlheInfoSet) -> bool,
     config: &NlheLbrConfig,
 ) -> Result<NlheLbrReport, NlheEvaluationError> {
-    if config.probes == 0 {
-        return Err(NlheEvaluationError::InvalidConfig {
-            reason: "probes must be > 0".to_string(),
-        });
-    }
-    if config.rollouts_per_action == 0 {
-        return Err(NlheEvaluationError::InvalidConfig {
-            reason: "rollouts_per_action must be > 0".to_string(),
-        });
-    }
-
-    let mut values: Vec<f64> = Vec::with_capacity(config.probes as usize);
-    let mut values_p0 = Vec::new();
-    let mut values_p1 = Vec::new();
-    let mut skipped = 0u64;
-    let mut filtered = 0u64;
-
-    for probe_idx in 0..config.probes {
-        let target = (probe_idx % 2) as PlayerId;
-        let mut rng = ChaCha20Rng::from_seed(mix3(config.seed, 0x9b52, probe_idx));
-        let mut state = game.root(&mut rng);
-        let mut reached = false;
-
-        for _ in 0..config.max_actions_per_probe {
-            match SimplifiedNlheGame::current(&state) {
-                NodeKind::Terminal => break,
-                NodeKind::Chance => {
-                    let dist = SimplifiedNlheGame::chance_distribution(&state);
-                    let action = sample_discrete(&dist, &mut rng);
-                    state = SimplifiedNlheGame::next(state, action, &mut rng);
-                }
-                NodeKind::Player(actor) if actor == target => {
-                    let target_info = SimplifiedNlheGame::info_set(&state, actor);
-                    if !probe_accept(&target_info) {
-                        filtered += 1;
-                        reached = true;
-                        break;
-                    }
-                    let best = estimate_best_action_value(
-                        game,
-                        &state,
-                        target,
-                        blueprint_strategy,
-                        config,
-                        probe_idx,
-                    )?;
-                    values.push(best);
-                    if target == 0 {
-                        values_p0.push(best);
-                    } else {
-                        values_p1.push(best);
-                    }
-                    reached = true;
-                    break;
-                }
-                NodeKind::Player(actor) => {
-                    let action =
-                        sample_blueprint_action(&state, actor, blueprint_strategy, &mut rng)?;
-                    state = SimplifiedNlheGame::next(state, action, &mut rng);
-                }
-            }
-        }
-        if !reached {
-            skipped += 1;
-        }
-    }
-
-    if values.is_empty() {
-        return Err(NlheEvaluationError::InvalidConfig {
-            reason: "no LBR probes reached a target-player decision".to_string(),
-        });
-    }
-
-    let stats = sample_stats(&values);
-    Ok(NlheLbrReport {
-        probes_requested: config.probes,
-        probes_used: values.len() as u64,
-        terminal_or_unreached_probes: skipped,
-        filtered_probes: filtered,
-        rollouts_per_action: config.rollouts_per_action,
-        seed: config.seed,
-        mean_best_response_chips: stats.mean,
-        standard_error_chips: stats.standard_error,
-        target0_mean_chips: sample_stats(&values_p0).mean,
-        target1_mean_chips: sample_stats(&values_p1).mean,
-    })
+    estimate_lbr_filtered::<SimplifiedNlheGame>(game, blueprint_strategy, probe_accept, config)
 }
 
 fn rollout_blueprint_vs_baseline(
@@ -370,64 +242,6 @@ fn rollout_blueprint_vs_baseline(
         }
     }
     Err(NlheEvaluationError::NonTerminalRollout { max_actions })
-}
-
-fn finish_blueprint_rollout(
-    mut state: crate::training::nlhe::SimplifiedNlheState,
-    blueprint_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
-    rng: &mut dyn RngSource,
-    max_actions: usize,
-) -> Result<crate::training::nlhe::SimplifiedNlheState, NlheEvaluationError> {
-    for _ in 0..max_actions {
-        match SimplifiedNlheGame::current(&state) {
-            NodeKind::Terminal => return Ok(state),
-            NodeKind::Chance => {
-                let dist = SimplifiedNlheGame::chance_distribution(&state);
-                let action = sample_discrete(&dist, rng);
-                state = SimplifiedNlheGame::next(state, action, rng);
-            }
-            NodeKind::Player(actor) => {
-                let action = sample_blueprint_action(&state, actor, blueprint_strategy, rng)?;
-                state = SimplifiedNlheGame::next(state, action, rng);
-            }
-        }
-    }
-    Err(NlheEvaluationError::NonTerminalRollout { max_actions })
-}
-
-fn estimate_best_action_value(
-    _game: &SimplifiedNlheGame,
-    state: &crate::training::nlhe::SimplifiedNlheState,
-    target: PlayerId,
-    blueprint_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
-    config: &NlheLbrConfig,
-    probe_idx: u64,
-) -> Result<f64, NlheEvaluationError> {
-    let actions = SimplifiedNlheGame::legal_actions(state);
-    if actions.is_empty() {
-        return Err(NlheEvaluationError::EmptyLegalActions {
-            state: format!("{:?}", SimplifiedNlheGame::current(state)),
-        });
-    }
-    let mut best = f64::NEG_INFINITY;
-    for (action_idx, action) in actions.iter().enumerate() {
-        let mut sum = 0.0;
-        for rollout_idx in 0..config.rollouts_per_action {
-            let seed = mix4(config.seed, probe_idx, action_idx as u64, rollout_idx);
-            let mut rng = ChaCha20Rng::from_seed(seed);
-            let next = SimplifiedNlheGame::next(state.clone(), *action, &mut rng);
-            let terminal = finish_blueprint_rollout(
-                next,
-                blueprint_strategy,
-                &mut rng,
-                config.max_actions_per_rollout,
-            )?;
-            sum += SimplifiedNlheGame::payoff(&terminal, target);
-        }
-        let mean = sum / config.rollouts_per_action as f64;
-        best = best.max(mean);
-    }
-    Ok(best)
 }
 
 fn sample_blueprint_action(
@@ -731,14 +545,6 @@ fn sample_stats(xs: &[f64]) -> Stats {
 
 fn mix3(seed: u64, a: u64, b: u64) -> u64 {
     mix64(seed ^ a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_mul(0xBF58_476D_1CE4_E5B9))
-}
-
-fn mix4(seed: u64, a: u64, b: u64, c: u64) -> u64 {
-    mix64(
-        seed ^ a.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            ^ b.wrapping_mul(0xBF58_476D_1CE4_E5B9)
-            ^ c.wrapping_mul(0x94D0_49BB_1331_11EB),
-    )
 }
 
 fn mix64(mut x: u64) -> u64 {

@@ -28,6 +28,7 @@ pub mod best_response;
 pub mod checkpoint;
 pub mod game;
 pub mod kuhn;
+pub mod lbr;
 pub mod leduc;
 pub mod nlhe;
 pub mod nlhe_betting_tree;
@@ -41,6 +42,7 @@ pub use best_response::{exploitability, BestResponse, KuhnBestResponse, LeducBes
 pub use checkpoint::Checkpoint;
 pub use game::{Game, NodeKind, PlayerId};
 pub use kuhn::{KuhnAction, KuhnGame, KuhnHistory, KuhnInfoSet, KuhnState};
+pub use lbr::{estimate_lbr, estimate_lbr_filtered, LbrConfig, LbrReport};
 pub use leduc::{LeducAction, LeducGame, LeducHistory, LeducInfoSet, LeducState, LeducStreet};
 pub use nlhe::{
     SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
