@@ -728,23 +728,26 @@ fn recurse_es_parallel<G: Game>(
 // Checkpoint serialization helpers（D-327 / D-354）
 // ===========================================================================
 
-/// HashMap<I, Vec<f64>> → bincode-serialized bytes，按 Debug 排序保证跨 host
+/// HashMap<I, Vec<f64>> → bincode-serialized bytes，按 `Ord::cmp` 排序保证跨 host
 /// byte-equal（D-327）。
 ///
 /// 输出格式 = `bincode::serialize(&Vec<(I, Vec<f64>)>::sorted)`。bincode 1.x
 /// 默认走 little-endian + varint integer encoding（D-354），不依赖 host endian。
+///
+/// 排序键：直接走 `I: Ord` 派生比较，不再用 `format!("{:?}", I)`。
+/// 旧路径每次 cmp 分配 2 个 String，总 alloc 数 O(N log N)，500K entries 实测
+/// final checkpoint 写盘耗时主要被排序里的字符串分配吃掉（compute 148s vs
+/// checkpoint 261s）。`Ord::cmp` 路径零分配 + O(N log N) 比较，跨 host byte-equal
+/// 仍由 derived Ord 的确定性保证。
 fn encode_table<I>(
     table: &std::collections::HashMap<I, Vec<f64>>,
 ) -> Result<Vec<u8>, CheckpointError>
 where
-    I: Clone + std::fmt::Debug + serde::Serialize,
+    I: Clone + Ord + serde::Serialize,
 {
     let mut entries: Vec<(I, Vec<f64>)> =
         table.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    // D-327 sorted-by-InfoSet 顺序：以 Debug 输出为排序键（避免给 InfoSet
-    // 引入 Ord bound — KuhnInfoSet / LeducInfoSet 未派生 Ord，且 Debug
-    // 输出对每个 InfoSet 类型确定性，足以保证跨 host byte-equal）。
-    entries.sort_by(|a, b| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)));
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
     bincode::serialize(&entries).map_err(|e| CheckpointError::Corrupted {
         offset: 0,
         reason: format!("bincode serialize regret/strategy table failed: {e}"),

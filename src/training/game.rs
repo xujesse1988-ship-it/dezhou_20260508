@@ -59,11 +59,14 @@ pub trait Game {
     ///
     /// `Eq + Hash + Clone + Debug` 是 [`crate::training::RegretTable`] HashMap 键
     /// 的必要 bound；`Serialize + DeserializeOwned` 让 D-327 checkpoint bincode 序列化
-    /// 走 derive 入口（D2 \[实现\]）。
+    /// 走 derive 入口（D2 \[实现\]）。`Ord` 用作 checkpoint 序列化时的稳定排序键
+    /// （`encode_table` 直接走 `Ord::cmp`，省去 `format!("{:?}", I)` × O(N log N)
+    /// 字符串分配开销）。
     type InfoSet: Clone
         + Send
         + Sync
         + Eq
+        + Ord
         + std::hash::Hash
         + std::fmt::Debug
         + Serialize

@@ -26,7 +26,9 @@ pub struct LeducGame;
 /// 仅 betting 5 个变体 `{Check, Bet, Call, Fold, Raise}` 出现在 `LeducHistory`；
 /// `Deal0..Deal5` 仅出现在 chance node 的 `chance_distribution` / `next` 入参，
 /// 表示发牌结果（card index 0..=5）。Unit variants 让 `as u8` cast 保持有效。
-#[derive(Clone, Copy, Eq, Hash, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Eq, Hash, Debug, PartialEq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum LeducAction {
     Check,
     Bet,
@@ -68,7 +70,9 @@ impl LeducAction {
 }
 
 /// Leduc 街阶段（API-302 / D-311）。
-#[derive(Clone, Copy, Eq, Hash, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Eq, Hash, Debug, PartialEq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum LeducStreet {
     Preflop,
     Postflop,
@@ -82,7 +86,9 @@ pub type LeducHistory = Vec<LeducAction>;
 /// `private_card` / `public_card` 存 rank（J/Q/K = 11/12/13），不是 0..5 的物理
 /// 牌 id。Leduc 的两张同 rank 牌在策略信息上等价；物理牌 id 只保留在
 /// [`LeducState`] 里用于 card-removal chance 枚举。
-#[derive(Clone, Eq, Hash, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Eq, Hash, Debug, PartialEq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct LeducInfoSet {
     pub actor: PlayerId,
     pub private_card: u8,

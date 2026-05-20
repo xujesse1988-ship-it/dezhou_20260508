@@ -28,7 +28,9 @@ pub struct KuhnGame;
 /// 顺序与 [`Game::legal_actions`] 返回 `Vec<KuhnAction>` 索引一一对应（D-324
 /// action_count 全程恒定）。`DealCard(u8)` 仅在 chance node 出现（B2 \[实现\]
 /// 追加变体，让 `chance_distribution` 在 chance node 暴露具体 card outcome）。
-#[derive(Clone, Copy, Eq, Hash, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Eq, Hash, Debug, PartialEq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum KuhnAction {
     Check,
     Bet,
@@ -39,7 +41,9 @@ pub enum KuhnAction {
 }
 
 /// Kuhn 公开历史枚举（API-301）。
-#[derive(Clone, Copy, Eq, Hash, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Eq, Hash, Debug, PartialEq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum KuhnHistory {
     /// P0 to act（initial betting 状态）。
     Empty,
@@ -52,7 +56,9 @@ pub enum KuhnHistory {
 }
 
 /// Kuhn 玩家视角 InfoSet（API-301）。
-#[derive(Clone, Eq, Hash, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Eq, Hash, Debug, PartialEq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct KuhnInfoSet {
     pub actor: PlayerId,
     pub private_card: u8,
