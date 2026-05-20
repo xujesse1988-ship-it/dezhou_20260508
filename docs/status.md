@@ -85,6 +85,27 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test
 
 ## 已知污染清单
 
+- `tests/bucket_quality.rs` 9 条 sqrt-scaled K=500 阈值断言 fail（v3 bucket_table，与 stack profile 无关）：
+  - `adjacent_bucket_emd_above_threshold_{flop,turn,river}`：相邻 bucket EMD 实测 0.003 / 0.008 / 0.009，
+    落到阈值 0.00894 以下（约 1.0–3.0× 偏差）。
+  - `bucket_internal_ehs_std_dev_below_threshold_{flop,turn,river}`：bucket 内 EHS std dev 实测
+    0.034 / 0.049 / 0.058，越上限 0.02236（约 1.5–2.6× 偏差）。
+  - `bucket_id_ehs_median_monotonic_{flop,turn,river}`：bucket id 序与 EHS 中位数不单调，diff 实测
+    0.010 / 0.017 / 0.011，超 MC-aware tol（约 1.2–1.7× 偏差）。
+  - 在父 commit `ee4da88` 上同号同值复现，**非本次 200BB 切换引入**。
+  - 根因：当前 500/500/500 bucket 抽象质量不达标，属 stage 2 重做范围
+    （上文简化 NLHE 行 ⚠️ 状态的同一原因）。
+- `tests/cross_host_blake3.rs::cross_host_baseline_byte_equal_for_current_arch` fail：
+  32-seed Kuhn Vanilla CFR 5-iter checkpoint BLAKE3 实测值与
+  `tests/data/checkpoint-hashes-linux-x86_64.txt` baseline 全条目漂移
+  （actual `840fdf8c…` vs expected `191a4d72…` 等）。
+  - 同测试文件的 `within_process_blake3_reproducible_twice` 和
+    `cross_arch_baselines_byte_equal_when_both_present` 仍绿 → 本机内确定性 + 跨架构 baseline
+    比对都 OK，只是 linux baseline 文件落后于当前 checkpoint 实测。
+  - 在父 commit `ee4da88` 上同号同值复现，非本次 200BB 切换引入。
+  - 处理：等下一次 Kuhn checkpoint serialization 真正稳定后，跑
+    `scripts/capture-checkpoint-hashes.sh` 重新生成 baseline 文件。
+
 
 ## 文档维护规则
 
