@@ -3,7 +3,11 @@
 /.venv-pokerkit
 # Stage 2 D-248 / D-251：bucket table mmap artifact 严格不进 git history，
 # 由 tools/train_bucket_table.rs 按需创建本目录；分发走 GitHub release / git LFS。
-/artifacts
+/artifacts/*
+# 例外：OCHS warmup dump artifact 体积小 (~10-22 KB)、deterministic 可复现，
+# 进 git 让 doc 引用稳定 + CI 复现校验，由 tools/ochs_warmup_dump.rs 生成。
+!/artifacts/ochs_warmup_*.json
+!/artifacts/ochs_warmup_*.json.b3sum
 # Python 工具脚本（tools/*.py）运行后生成的字节码缓存
 tools/__pycache__/
 # Claude Code 本地 harness 会话状态（scheduled_tasks lockfile 等）
