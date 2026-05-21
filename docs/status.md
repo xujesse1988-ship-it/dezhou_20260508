@@ -165,24 +165,45 @@ SB at root 关键 hand：
 
 **没回归 100% AllIn**，preflop 形态符合 NLHE 直觉。
 
+### by-street LBR slice（2026-05-21 实测，`--probe-filter has-average --lbr-probes 2000`）
+
+| Street | LBR mean (chips) | SE | probes used | filtered | filter rate |
+|---|---:|---:|---:|---:|---:|
+| preflop | **1,640.2** | 84.2 | 1,905 / 2,000 | 0 | 0% |
+| flop | 1,317.2 | 109.7 | 1,102 / 2,000 | 2,158 | 53% |
+| turn | 1,321.4 | 138.1 | 687 / 2,000 | 3,521 | 64% |
+| river | 1,268.5 | 172.0 | 464 / 2,000 | 4,342 | **68%** |
+
+**两个反直觉的发现：**
+
+1. **Preflop LBR 最高（1,640.2 chips），尽管 169-class lossless 无抽象损失**。filter rate=0
+   说明 BR 估值干净，**preflop 残留 BR 跟 abstraction 无关，是训练样本质量问题**。
+
+2. **Postflop 三街 filter rate 53/64/68%**：river 68% probes 落在 strategy_sum 全零的 InfoSet
+   （200M update 期间 never visited）。ES-MCCFR sample-1 chance + sample-1 opponent action
+   在 postflop 深处采样过浅，**不是 abstraction 到底了，是训练量不够覆盖**。
+
+3. Postflop LBR 数字（1,268–1,321）**不可信**：filter 把"难"的 spot 全去掉了，剩下都是
+   学过的 spot；effective probes（464–1,102）让 SE 跳到 110–172，统计噪音淹没差异。
+
 ## 下一步唯一允许的工作
 
-### Step 3 重新决策：1B blueprint 大概率边际，先升 abstraction
+### Step 3 重新决策：1B blueprint **可能值回票价**，收益在 postflop coverage
 
-LBR proxy 在当前 500/500/500 bucket abstraction 下 **100M 已饱和**（100M → 200M 无显著下降）。
-继续训到 1B：
-- compute ≈ 38 h × $0.71 = ~$27
-- 预期 LBR 降 0–100 chips（CI 内）
-- 不会突破 abstraction 上限
+100M → 200M LBR proxy 飞机看似饱和（1,604 → 1,615 在 SE 内），但 by-street 数据揭示真相：
+- preflop 已全覆盖但残留 1,640 chips BR → **更多训练数据有用**（不是抽象到顶）
+- postflop 53–68% probes 没访问过 → **更多训练直接补 coverage**
 
-**优先做的两件事（顺序按 ROI）：**
+1B blueprint 预算：~38h × $0.71 = ~$27。预期：
+- postflop filter rate 显著下降（200M → 1B = 5× sample → river filter rate 可能从 68% → 30–40%）
+- preflop LBR 可能继续降 200–500 chips（CFR 在 lossless preflop 上还没完全收敛）
+- 总 LBR proxy 1,615 → 可能 1,200–1,400 量级
 
-1. **by-street LBR slice**：用 `--target-street {preflop,flop,turn,river}` + `--probe-filter
-   has-average` 分街跑 LBR proxy，定位哪条街贡献了 1,600 chips 的剩余 BR（500 bucket 哪条街
-   质量最差）。决定 abstraction 升级时优先打哪里。
-2. **postflop bucket K 升级**：根据 by-street 结果决定。已知污染清单里 9 条 sqrt-scaled K=500
-   阈值断言 fail，bucket 质量本就不达标。候选：K=500 → K=2000（4× 训练数据 + 4× 内存 + 4×
-   ckpt 大小）；或换 EHS-aware feature。
+**操作顺序：**
+1. 先 dump 200M ckpt 各街 InfoSet 访问数分布（如 `tools/nlhe_infoset_signal_dump` 或 ad-hoc），
+   量化 postflop coverage 现状，给 1B 收益估值找一个先验。
+2. 再决定：(a) 直接跑 1B；(b) 先做 abstraction 升级（K=500 → K=2000）；(c) 换 sampling
+   形态（external sampling / outcome sampling 形态对 postflop coverage 的影响）。
 
 ### 不做（明确划界）
 
