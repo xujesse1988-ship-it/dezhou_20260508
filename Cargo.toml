@@ -141,3 +141,7 @@ path = "tools/mccfr_trace.rs"
 [[bin]]
 name = "nlhe_trace"
 path = "tools/nlhe_trace.rs"
+
+[[bin]]
+name = "ochs_warmup_dump"
+path = "tools/ochs_warmup_dump.rs"

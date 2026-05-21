@@ -868,6 +868,75 @@ fn build_ochs_table(n_clusters: u32, evaluator: Arc<dyn HandEvaluator>) -> OchsT
     }
 }
 
+/// OCHS warmup dump 结果（`tools/ochs_warmup_dump.rs` 使用）。
+///
+/// 同 `build_ochs_table` 算法路径，额外保留每 class EHS 与 cluster 重编号后的
+/// centroid EHS 数值，便于工具序列化为 JSON 后人工 inspect / 写入 doc。
+pub struct OchsWarmupDump {
+    /// 169 个 preflop class 的 canonical 代表 hole。
+    pub representative_hole: [[Card; 2]; 169],
+    /// 每个 class 的 EHS（OCHS_PRECOMPUTE_ITER MC 估算）。
+    pub ehs_per_class: [f64; 169],
+    /// `classes_per_cluster[c]` = D-236b 重编号后 cluster c 包含的 class id 列表
+    /// （c = 0 weakest，c = n_clusters - 1 strongest）。
+    pub classes_per_cluster: Vec<Vec<u8>>,
+    /// `cluster_centroid_ehs[c]` = 重编号后 cluster c 的 centroid EHS（1D k-means
+    /// 收敛终值，未必等于 EHS 中位数）。
+    pub cluster_centroid_ehs: Vec<f64>,
+    /// 算法常量（写入 JSON 让 reader 复现）。
+    pub ochs_training_seed: u64,
+    pub ochs_precompute_iter: u32,
+}
+
+/// 公开 dump 接口（`tools/ochs_warmup_dump.rs`）。同 `build_ochs_table` 算法，
+/// hardcoded `OCHS_TRAINING_SEED` + `OCHS_PRECOMPUTE_ITER`；同 (n_clusters,
+/// evaluator) 输入下输出 byte-equal `build_ochs_table` 内部数据。
+pub fn dump_ochs_warmup(n_clusters: u32, evaluator: Arc<dyn HandEvaluator>) -> OchsWarmupDump {
+    let representative_hole: [[Card; 2]; N_PREFLOP_CLASSES] =
+        std::array::from_fn(|i| representative_hole_for_class(i as u8));
+
+    let mut ehs_per_class: [f64; N_PREFLOP_CLASSES] = [0.0; N_PREFLOP_CLASSES];
+    for class_id in 0..N_PREFLOP_CLASSES {
+        let rep = representative_hole[class_id];
+        let used =
+            build_used_set(&rep, &[], &[]).expect("representative hole has 2 distinct cards");
+        let sub_seed =
+            derive_substream_seed(OCHS_TRAINING_SEED, OCHS_FEATURE_INNER, class_id as u32);
+        let mut rng = ChaCha20Rng::from_seed(sub_seed);
+        let mut wins_x2: u64 = 0;
+        for _ in 0..OCHS_PRECOMPUTE_ITER {
+            let (opp_hole, full_board) = sample_opp_and_board(&used, &[], 5, &mut rng);
+            let me_seven = build_seven_cards(rep, &full_board);
+            let opp_seven = build_seven_cards(opp_hole, &full_board);
+            wins_x2 += compare_x2(evaluator.eval7(&me_seven), evaluator.eval7(&opp_seven));
+        }
+        ehs_per_class[class_id] = wins_x2 as f64 / (2.0 * f64::from(OCHS_PRECOMPUTE_ITER));
+    }
+
+    let features: Vec<Vec<f64>> = ehs_per_class.iter().map(|&x| vec![x]).collect();
+    let cfg = KMeansConfig::default_d232(n_clusters);
+    let kmeans_res = kmeans_fit(&features, cfg, OCHS_TRAINING_SEED, OCHS_WARMUP, OCHS_WARMUP);
+
+    let (reordered_centroids, reordered_assignments) =
+        reorder_by_ehs_median(kmeans_res.centroids, kmeans_res.assignments, &ehs_per_class);
+
+    let mut classes_per_cluster: Vec<Vec<u8>> = vec![Vec::new(); n_clusters as usize];
+    for (class_id, &cid) in reordered_assignments.iter().enumerate() {
+        classes_per_cluster[cid as usize].push(class_id as u8);
+    }
+
+    let cluster_centroid_ehs: Vec<f64> = reordered_centroids.iter().map(|c| c[0]).collect();
+
+    OchsWarmupDump {
+        representative_hole,
+        ehs_per_class,
+        classes_per_cluster,
+        cluster_centroid_ehs,
+        ochs_training_seed: OCHS_TRAINING_SEED,
+        ochs_precompute_iter: OCHS_PRECOMPUTE_ITER,
+    }
+}
+
 /// 给定 169 class id，返回该类的 canonical 代表 hole（具体两张牌）。
 ///
 /// - `0..=12`：pocket pair（rank = class_id；Spades + Hearts）。
