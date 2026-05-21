@@ -8,6 +8,10 @@
 # 进 git 让 doc 引用稳定 + CI 复现校验，由 tools/ochs_warmup_dump.rs 生成。
 !/artifacts/ochs_warmup_*.json
 !/artifacts/ochs_warmup_*.json.b3sum
+# Stage 1 features_<street>.bin (docs/bucket_feature_design.md §6.2)：8.84 GB
+# 二进制本身不进 git（跟 bucket_table 同型规则），仅记 .b3sum anchor 让 reader
+# 反查 "这份 features 是用同一份代码 + 同一份 OCHS warmup 算出来的"。
+!/artifacts/features_*.bin.b3sum
 # Python 工具脚本（tools/*.py）运行后生成的字节码缓存
 tools/__pycache__/
 # Claude Code 本地 harness 会话状态（scheduled_tasks lockfile 等）
