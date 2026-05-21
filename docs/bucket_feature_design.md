@@ -212,7 +212,9 @@ fn ochs_n(hero: [Card; 2], board: &[Card], evaluator: &dyn HandEvaluator, n: u8)
     out
 }
 
-// equity_vs_hand 不变（按 board.len() 走 1-shot showdown / 46 / 990 enumerate）。
+// equity_vs_hand 不变（按 board.len() 走 1-shot showdown / 44 / 990 enumerate）。
+// 注：turn equity_vs_hand 是 specific opp hand，hero(2) + opp(2) + board(4) = 8 张牌占用，
+// 剩余 52-8 = 44 张作为 river 候选；不要和 §2.1 hist 的 46 (hero only) 混淆。
 ```
 
 `equity_vs_hand` 实现（按 `board.len()` 分支）：
@@ -225,7 +227,7 @@ fn equity_vs_hand(hero: [Card; 2], opp: [Card; 2], board: &[Card], eval: &dyn Ha
             let op = eval.eval7(&[opp[0], opp[1], board[0..5]].concat());
             if me > op { 1.0 } else if me == op { 0.5 } else { 0.0 }
         }
-        4 => {  // turn: enumerate 46 river outcomes
+        4 => {  // turn: enumerate 44 river outcomes（hero + opp + board = 8 used, 44 unused）
             let used = build_used_set(&hero, &opp, board);
             let mut wins_x2 = 0u64; let mut count = 0u64;
             for c in (0..52).filter(|c| !used[*c as usize]) {
@@ -592,10 +594,10 @@ JSON 字段（postflop-hist 模式）：`mode / n_clusters / ochs_postflop_train
 实现阶段把 `equity.rs::ochs_table()` 的 1D-EHS warmup 路径**直接替换**为 postflop-hist：
 
 1. `OchsTable.classes_per_cluster` 由 `dump_ochs_warmup_postflop_hist(n_clusters, n_rivers, evaluator)` 生成；OnceLock 缓存 key 升级为 `(n_clusters, n_rivers)`
-2. `EquityCalculator::ochs` 内层循环改 combo 级（§2.2），`representative_hole_for_class` 改名为 `combos_for_class` 返回 `Vec<[Card; 2]>`
+2. `EquityCalculator::ochs` runtime 内层循环改 combo 级（§2.2）：**新增** `combos_for_class(class_id) -> Vec<[Card; 2]>`；既有 `representative_hole_for_class` **保留**（dump 工具 `--mode ehs` + §2.3 1D-EHS warmup 算 EHS 仍需要 rep）
 3. n_rivers 默认 1000（warmup wall ~1.5s on vultr 4-core）
 
-`equity.rs::build_ochs_table` + `representative_hole_for_class` 旧 1D-EHS rep-level 路径可整体删除（不再被任何 caller 引用），dump 工具 `--mode ehs` 保留作 doc §2.3 数据复现 + algorithm validation。
+`equity.rs::build_ochs_table` 1D-EHS warmup **runtime 路径**删除（runtime OnceLock 改走 `dump_ochs_warmup_postflop_hist`），但其底层算法函数 + `representative_hole_for_class` 保留给 dump 工具 `--mode ehs` 用作 doc §2.3 数据复现 + algorithm validation。即：representative_hole_for_class 与 combos_for_class **并存**，前者服务 warmup / 历史复现，后者服务 runtime OCHS combo-level expansion。
 
 ## 3. 距离度量
 
@@ -761,7 +763,23 @@ let kmeans_res = kmeans_fit_production(features, KMeansConfig::default(K),
 //    update（fixed-bin 1D histogram 上无闭式解，不是 per-bin 算术均值），
 //    列为后续 ablation 实验，不阻塞 Stage 1 出 bucket table。
 
-// 3. reorder by EHS median（centroid hist 中心质量 / OCHS mean）
+// 3. reorder by EHS median —— 用独立的 reorder_key_ehs，不直接拿 centroid OCHS mean
+//
+//   不能直接用 centroid 16-dim OCHS arithmetic mean 排 river bucket：OCHS_N[k]
+//   内部已按 valid_combos per cluster k 加权，外层再 unweighted arithmetic mean
+//   不等于 uniform-per-combo opp 视角的 hero EHS（cluster size 7-50 不齐 → 偏差）。
+//
+//   Stage 2 为每个 canonical sample 单独算一个 scalar `reorder_key_ehs`
+//   （uniform-opponent hero EHS proxy），bucket 内取 median 作为该 bucket 的 EHS，
+//   再按升序重排 cluster id（cluster 0 = weakest）。来源按街分：
+//     - flop / turn: 用 hist 一阶矩 = Σ_k p_k · (k + 0.5) / 8（hist 是 hero EHS
+//       的 8-bin 直方图，一阶矩 = 期望 = EHS，cheap，从 feature file 现成 hist
+//       维度直接算，零 eval7 调用）
+//     - river:       exact river EHS = (1/990) · Σ_{opp ∈ unused_C(45,2)} compare(hero, opp)
+//       Stage 2 inline 重算（123M samples × 990 opp × 2 eval7 ≈ 2.4 × 10¹¹ eval7
+//       ≈ ~15 min on c6a.8xlarge）。一次性成本，不阻塞 K-means 调参迭代
+//
+//   reorder_by_ehs_median 输入：assignments + per_sample_reorder_key（不再读 centroids）
 let (centroids, assignments) = reorder_by_ehs_median(...);
 
 // 4. centroid u8 量化
@@ -790,16 +808,16 @@ offset 0x98: feature_river_blake3: [u8; 32]
 | 街 | N canonical | hist 部分 | OCHS 部分 | 单 sample eval7 | 全 N eval7 |
 |---|---|---|---|---|---|
 | flop | 1,286,792 | 1081 future × C(45,2) × 2 ≈ 2.14 M | 8 × ~21 × ~6 × C(45,2) × 2 ≈ 2.0 M | ~4.14 M | ~5.3 × 10¹² |
-| turn | 13,960,050 | 46 future × C(45,2) × 2 ≈ 91 k | 8 × ~21 × ~6 × 46 × 2 ≈ 93 k | ~184 k | ~2.6 × 10¹² |
+| turn | 13,960,050 | 46 future × C(45,2) × 2 ≈ 91 k | 8 × ~21 × ~6 × 44 × 2 ≈ 89 k | ~180 k | ~2.5 × 10¹² |
 | river | 123,156,254 | — | 16 × ~11 × ~6 × 1 × 2 ≈ 2.1 k | ~2.1 k | ~2.6 × 10¹¹ |
-| 合计 | — | — | — | — | **~8.2 × 10¹²** |
+| 合计 | — | — | — | — | **~8.1 × 10¹²** |
 
-**Stage 1 wall**（@ ~50 ns/eval7，32-vCPU 主机）：
+**Stage 1 wall**（@ ~50 ns/eval7，目标主机 = **AWS c6a.8xlarge** = 32 vCPU AMD EPYC Milan + 64 GB RAM）：
 
 - flop：5.3 × 10¹² / 32 / 50 ns ≈ 3300 s ≈ **~55 min**
-- turn：2.6 × 10¹² / 32 / 50 ns ≈ 1625 s ≈ **~27 min**
+- turn：2.5 × 10¹² / 32 / 50 ns ≈ 1560 s ≈ **~26 min**
 - river：2.6 × 10¹¹ / 32 / 50 ns ≈ 163 s ≈ **~3 min**
-- 串行总 wall：**~85 min**；三街并发可降到 **~55 min**（flop bound）
+- 串行总 wall：**~84 min**；三街并发可降到 **~55 min**（flop bound）
 
 **Stage 2（K-means）**，每 iter 成本（K=500，dim=16）：
 
@@ -850,25 +868,29 @@ centroid 量化：u8 per-dim min/max（与 bucket_table.rs 既有 centroid_metad
 BLAKE3 trailer（与既有同型，路径无关）。
 ```
 
-5 段结构（header / centroid_metadata / centroid_data / lookup_table / trailer）沿用 `bucket_table.rs` D-244 物理布局，但**字段语义不同 → 必须显式 bump `feature_set_id`**。
+5 段结构（header / centroid_metadata / centroid_data / lookup_table / trailer）沿用 `bucket_table.rs` D-244 物理布局，但 header **新增 3 个 BLAKE3 字段（0x58 / 0x78 / 0x98）→ header 物理长度变化 → 必须同时 bump `schema_version` 和 `feature_set_id`**：
 
-旧 artifact：`schema_version=1, feature_set_id=1` = EHS² + OCHS_8 = 9 dim。
-新 artifact：`schema_version=1, feature_set_id=2` = hist_8 + OCHS_8 / OCHS_16 = 16 dim。
+| 常量 | 当前代码值（旧 schema） | 新 schema 目标值 |
+|---|---|---|
+| `BUCKET_TABLE_SCHEMA_VERSION` | `2` | **`3`**（header 新增 hash chain 字段，物理布局变） |
+| `BUCKET_TABLE_DEFAULT_FEATURE_SET_ID` | `1`（EHS² + OCHS_8 = 9 dim） | **`2`**（hist_8 + OCHS_8 / OCHS_16 = 16 dim） |
+| `BUCKET_TABLE_HEADER_LEN` | `80`（0x50） | **`184`**（0xB8 = 0x98 + 0x20，hash chain 末尾） |
 
-reader 加载时按 `feature_set_id` 分派：
+reader 加载时按 `(schema_version, feature_set_id)` 双 key 分派：
 
-- `feature_set_id=1`：旧 9 维 schema —— 新代码不再支持，reader 直接拒绝（错误 `UnsupportedFeatureSet`，提示用户重新训练）。
-- `feature_set_id=2`：新 16 维 schema —— 走本文档定义的解析路径。
-- 其他值：reader 拒绝加载。
+- `(2, 1)`：旧 9 维 EHS² + OCHS_8 artifact —— 新代码不再支持，reader 直接拒绝（错误 `UnsupportedSchema`，提示用户重新训练）。
+- `(3, 2)`：新 16 维 hist + OCHS schema —— 走本文档定义的解析路径。
+- 其他组合：reader 拒绝加载。
 
-`bucket_table.rs` 头注释会同步更新到新 feature 语义；旧 schema 注释整体替换。`BUCKET_TABLE_DEFAULT_FEATURE_SET_ID` 常量从 1 改为 2。
+`bucket_table.rs` 头注释会同步更新到新 feature 语义；旧 schema 注释整体替换。三个常量同步 bump。
 
-新增 BLAKE3 hash chain 字段（追加在原 header 末尾）：
+新增 BLAKE3 hash chain 字段（追加在原 header 末尾，0x58 起共 96 字节，新 header 总长 0xB8 = 184 字节）：
 
 ```
-offset 0x58: feature_flop_blake3:  [u8; 32]
-offset 0x78: feature_turn_blake3:  [u8; 32]
-offset 0x98: feature_river_blake3: [u8; 32]
+offset 0x58: feature_flop_blake3:  [u8; 32]   // 0x58 .. 0x77
+offset 0x78: feature_turn_blake3:  [u8; 32]   // 0x78 .. 0x97
+offset 0x98: feature_river_blake3: [u8; 32]   // 0x98 .. 0xB7
+// header_len 0xB8 = 184；centroid_metadata 起始 offset = align8(0xB8) = 0xB8
 ```
 
 让 bucket_table → features_<street>.bin → ochs_warmup_postflop_<N>_n<R>.json → ground truth 形成可验证链。
