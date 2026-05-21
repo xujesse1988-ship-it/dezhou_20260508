@@ -623,29 +623,199 @@ CFR 收敛验收（H3 LBR）之前可做的便宜检查：
 
 终极判据是 H3 LBR / exploitability — 仅 CFR 收敛后可测。
 
-## 6. 训练规模
+## 6. 训练流水线
 
-每 sample 的 evaluator 调用数（eval7 计数；hero rank 可复用前提下数字减半，本表按朴素 2× 算 upper bound）。
+训练分两阶段：**Stage 1 算特征 → 落盘二进制文件；Stage 2 读盘 → k-means → bucket table**。
 
-**OCHS 部分按 §2.2 combo 级展开计算**（avg 7.84 combos/class，扣除冲突后 ~6 effective combos/class）：
+### 6.1 设计动机
 
-| 街 | N canonical | hist 部分（per sample） | OCHS 部分（per sample） | 单 sample eval7 | 全 N eval7 |
+既有实现（`bucket_table.rs::build_bucket_table_bytes`）单进程一次性完成 "算特征 + 跑 k-means + 写 artifact"。flop / turn / river 三街顺序串行，全 N enumerate 算特征是主导成本（§6.3 估算 flop alone ~5.3×10¹² eval7）。
+
+问题：
+
+- K-means 调参（K 值、距离度量、初值 seed）每次都要重算 ~12 小时特征，无法快速迭代
+- features `Vec<Vec<f64>>` 内存峰值 river ~12 GB，需要大内存主机
+- 单进程失败 → 全部重来；中途机器故障无法续跑
+
+Two-stage 分离：
+
+- **Stage 1**：feature 计算昂贵但**一次性**。三街独立 N × 16 dim → 三个 `.bin` 文件。
+- **Stage 2**：feature mmap 读取，k-means + reorder + 量化 → bucket table。K-means 内存峰值 ~K × dim + thread-local accumulator，**与 N 解耦**。
+
+ROI：
+
+- 同一份 feature file 可跑多组 K（500 / 1000 / 200）/ 距离（L2 / EMD / mixed-α）/ reorder 策略 → bucket quality 验证 §5 spread 指标可在 ~30 min 内迭代一次（vs 12h）
+- Stage 2 可在普通主机跑（不需要 32 vCPU + 64 GB）
+- Stage 1 中断可按 chunk 续跑（§6.5）
+
+### 6.2 Stage 1：特征文件生成
+
+CLI：`tools/bucket_features_dump.rs`
+
+```bash
+cargo run --release --bin bucket_features_dump -- \
+    --street flop  --output artifacts/features_flop.bin
+cargo run --release --bin bucket_features_dump -- \
+    --street turn  --output artifacts/features_turn.bin
+cargo run --release --bin bucket_features_dump -- \
+    --street river --output artifacts/features_river.bin
+```
+
+三街独立可并行起三个进程。
+
+**算法**：
+
+```rust
+for canonical_id in 0..N(street) {
+    let (board, hole) = canonical_enum::nth_canonical_form(street, canonical_id);
+    let feature: [f32; 16] = match street {
+        Flop | Turn => {
+            let hist = equity_hist_8(hole, &board, evaluator);  // §2.1
+            let ochs = ochs_n(hole, &board, evaluator, 8);       // §2.2 combo 级
+            concat(hist, ochs)  // 8 + 8 = 16
+        }
+        River => {
+            ochs_n(hole, &board, evaluator, 16)                  // §2.2 combo 级
+        }
+    };
+    write_at_offset(file, canonical_id, feature);  // row-major
+}
+```
+
+rayon par_iter over canonical_id，按 chunk 收集后顺序写盘（保证 byte-equal 不依赖线程数，与 cluster.rs::kmeans_fit_production 同型）。
+
+**文件格式**（per-street `features_<street>.bin`）：
+
+```text
+=== header (64 bytes, 8-byte aligned) ===
+offset 0x00: magic: [u8; 8] = b"PLBKFEAT"
+offset 0x08: schema_version: u32 LE = 1
+offset 0x0c: street: u32 LE       (0 = flop, 1 = turn, 2 = river)
+offset 0x10: n_canonical: u32 LE  (1_286_792 / 13_960_050 / 123_156_254)
+offset 0x14: n_dims: u32 LE = 16
+offset 0x18: dtype: u32 LE = 0    (0 = f32 LE; 1 = f64 LE; 其他保留)
+offset 0x1c: feature_layout: u32 LE
+                                  (0 = hist_8 || OCHS_8;
+                                   1 = OCHS_16;
+                                   其他保留)
+offset 0x20: ochs_warmup_blake3: [u8; 32]
+                                  (BLAKE3 of artifacts/ochs_warmup_postflop_<N>_n<R>.json)
+offset 0x40: ochs_n_rivers: u32 LE        (warmup 时的 n_rivers 参数)
+offset 0x44: ochs_n_clusters: u32 LE      (warmup 时的 n_clusters 参数；
+                                           flop/turn = 8，river = 16)
+offset 0x48: pad: [u8; 8] = 0
+
+=== body (n_canonical × n_dims × 4 bytes, row-major f32 LE) ===
+sample i 的 16 维特征从 offset 64 + i × 64 起，连续 64 bytes。
+sample 顺序与 canonical_enum::nth_canonical_form(street, i) 一致。
+
+=== trailer (32 bytes) ===
+offset (file_len - 32): blake3: [u8; 32] = BLAKE3(file[..file_len - 32])
+```
+
+文件大小（f32 dtype）：
+
+| 街 | N canonical | body size | 总 size |
+|---|---|---|---|
+| flop | 1,286,792 | 82 MB | ~82 MB |
+| turn | 13,960,050 | 894 MB | ~894 MB |
+| river | 123,156,254 | 7.88 GB | ~7.88 GB |
+| 合计 | 138,403,096 | 8.84 GB | **~8.84 GB** |
+
+f32 精度（24-bit mantissa）远超下游 u8 centroid 量化精度（~0.004），不损失。
+
+`ochs_warmup_blake3` 字段让 Stage 2 能校验 "用同一 OCHS warmup artifact 算的特征"，防止 warmup 漂移导致特征语义不一致。
+
+### 6.3 Stage 2：K-means + bucket table 生成
+
+CLI：`tools/bucket_kmeans_fit.rs`
+
+```bash
+cargo run --release --bin bucket_kmeans_fit -- \
+    --feature-flop  artifacts/features_flop.bin  \
+    --feature-turn  artifacts/features_turn.bin  \
+    --feature-river artifacts/features_river.bin \
+    --bucket-flop  500 \
+    --bucket-turn  500 \
+    --bucket-river 500 \
+    --training-seed 0xcafebabe \
+    --output artifacts/bucket_table.bin
+```
+
+**算法**（per street）：
+
+```rust
+let mmap = open_feature_file(path);  // 校验 magic + blake3 + ochs_warmup_blake3
+let features: &[[f32; 16]] = mmap.body_as_rows();
+
+// 1. K-means (cluster.rs::kmeans_fit_production，改入参为 &[[f32; 16]])
+let kmeans_res = kmeans_fit_production(features, KMeansConfig::default(K),
+                                        training_seed, init_op, split_op);
+
+// 2. 距离度量：flop/turn 走 mixed EMD+L2（§3），river 走 L2
+//    （kmeans_fit_production 当前 L2 全路径；mixed 路径见 §3 实现注解）
+
+// 3. reorder by EHS median（centroid hist 中心质量 / OCHS mean）
+let (centroids, assignments) = reorder_by_ehs_median(...);
+
+// 4. centroid u8 量化
+let (q_centroids, min, max) = quantize_centroids_u8(&centroids);
+
+// 5. lookup_table[canonical_id] = assignments[canonical_id]
+let lookup_table: Vec<u32> = assignments.into_iter().map(|x| x as u32).collect();
+```
+
+三街独立处理，最终合并写一个 bucket_table.bin（schema 见 §7）。
+
+bucket_table.bin header 增加引用 feature file 的 BLAKE3 chain：
+
+```
+offset 0x58: feature_flop_blake3:  [u8; 32]
+offset 0x78: feature_turn_blake3:  [u8; 32]
+offset 0x98: feature_river_blake3: [u8; 32]
+```
+
+让 bucket_table → features → ochs_warmup 形成可验证 hash chain。
+
+### 6.4 训练规模估算
+
+**Stage 1（特征计算）**，每 sample eval7 调用数（hero rank 复用前 upper bound，OCHS 按 §2.2 combo 级展开，avg ~6 effective combos/class 扣除冲突后）：
+
+| 街 | N canonical | hist 部分 | OCHS 部分 | 单 sample eval7 | 全 N eval7 |
 |---|---|---|---|---|---|
 | flop | 1,286,792 | 1081 future × C(45,2) × 2 ≈ 2.14 M | 8 × ~21 × ~6 × C(45,2) × 2 ≈ 2.0 M | ~4.14 M | ~5.3 × 10¹² |
 | turn | 13,960,050 | 46 future × C(45,2) × 2 ≈ 91 k | 8 × ~21 × ~6 × 46 × 2 ≈ 93 k | ~184 k | ~2.6 × 10¹² |
 | river | 123,156,254 | — | 16 × ~11 × ~6 × 1 × 2 ≈ 2.1 k | ~2.1 k | ~2.6 × 10¹¹ |
+| 合计 | — | — | — | — | **~8.2 × 10¹²** |
 
-**flop 仍是最贵的街**：hist 部分 2.14 M + OCHS 部分（combo 展开后）2.0 M ≈ 4.14 M eval7 / sample。相对 §2.2 combo 展开**前** 估算（OCHS ~333 k），全 N flop 训练 eval7 从 3.2 × 10¹² → 5.3 × 10¹²（+66%）；turn 同比例上升；river OCHS 翻倍但绝对值仍便宜。
+**Stage 1 wall**（@ ~50 ns/eval7，32-vCPU 主机）：
 
-实际实现需考虑（不在本文档承诺，留给实现阶段决策）：
+- flop：5.3 × 10¹² / 32 / 50 ns ≈ 3300 s ≈ **~55 min**
+- turn：2.6 × 10¹² / 32 / 50 ns ≈ 1625 s ≈ **~27 min**
+- river：2.6 × 10¹¹ / 32 / 50 ns ≈ 163 s ≈ **~3 min**
+- 串行总 wall：**~85 min**；三街并发可降到 **~55 min**（flop bound）
 
-- flop hist 是否需要 future outcome 抽样（如 200/1081）替代 full enumerate
-- hero rank 在 inner 990 opp enumerate 内复用（§E hot path 已有 precompute table 模式）
-- OCHS inner 枚举是否需要降到 sample / 多 cluster 共享 inner outcome
-- OCHS combo 展开是否在 rainbow non-paired board 上自动塌缩到 1 combo（class-level 等价）
-- `combos_for_class` 输出 `[Vec<[Card; 2]>; 169]` static precompute
-- features 是否落盘以解耦 "算特征" 和 "跑 k-means"
-- f32 vs f64 内存代价
+**Stage 2（K-means）**，每 iter 成本（K=500，dim=16）：
+
+| 街 | N | per-iter assignment ops | per-iter centroid update ops | 总 ops / iter |
+|---|---|---|---|---|
+| flop | 1.28 M | N × K × d = 1.0 × 10¹⁰ | N × d = 2.0 × 10⁷ | ~10¹⁰ |
+| turn | 14 M | 1.1 × 10¹¹ | 2.2 × 10⁸ | ~10¹¹ |
+| river | 123 M | 9.8 × 10¹¹ | 2.0 × 10⁹ | ~10¹² |
+
+@ 1 ns/op + 32-vCPU rayon，river 单 iter ~30 s；典型 30 iter 收敛 → river ~15 min。flop/turn 各 ~1-2 min。
+
+**Stage 2 总 wall**：~20 min for all 3 streets。可在 vultr 4-core 主机跑（~80 min），调参不阻塞 Stage 1。
+
+### 6.5 实现要点
+
+- **byte-equal**：Stage 1 输出文件给定 (canonical_enum, OCHS warmup, evaluator) 跨架构 byte-equal（与 stage 1 cross_arch baseline 同型）。Stage 2 输出 bucket table 给定 (feature file BLAKE3, training_seed, K) 也跨架构 byte-equal。
+- **hero rank 复用**：hist / OCHS 内 990 opp_hole enumerate 共享 hero eval7 结果（§E hot path 模式），实测 ~2× speedup
+- **OCHS combo 展开在 rainbow non-paired board 自动塌缩**：判断 board suit shape，若 rainbow 且无 pair → 同 class 内 combos 等价 → 只计算 1 个；典型 ~40% board 触发，平均 cost ~4× 而非 6×
+- **`combos_for_class` static precompute**：进程启动时算一次 `[Vec<[Card; 2]>; 169]` 表，每次 OCHS call O(1) 查表
+- **Stage 1 续跑**：feature file 按 chunk_size = 200_000 canonical 分段写入临时文件 `features_<street>.bin.part<chunk_idx>`；全部完成后 concat + 写 header / trailer。中断时 enum 已存在的 part，从 next missing chunk 继续
+- **Stage 2 mmap**：feature file 用 `memmap2` 只读 mmap，进程内存峰值 = K × dim × f64 (centroids) + chunk × dim × f64 (accumulator)（~MB 级，与 N 解耦）。注：项目 D-275 `unsafe_code = "forbid"`，mmap 需走 `std::fs::read` 整段加载 → river 7.88 GB 内存。如内存预算紧张，Stage 2 改为 chunk-based 顺序读（Vec<u8> + 流式解析），代价是无法 mmap 跨进程共享
+- **dtype 选 f32**：精度 24-bit 远超 u8 centroid 量化精度 ~8-bit；文件大小相对 f64 减半（17.68 GB → 8.84 GB），相对 u8 大 ~4×（8.84 GB vs 2.21 GB）但避免 quantization 噪声进入 k-means convergence
 
 ## 7. 新 artifact schema
 
@@ -675,3 +845,22 @@ BLAKE3 trailer（与既有同型，路径无关）。
 ```
 
 header / centroid_metadata / centroid_data / lookup_table / trailer 字段布局沿用 `bucket_table.rs` D-244 既有 5 段结构（无新增 mode / n_rivers 字段，因为只有一种实现路径）。同一份 `bucket_table.rs` 头注释会更新到新 feature 语义；旧 schema 注释整体替换。
+
+新增 BLAKE3 hash chain 字段（追加在原 header 末尾）：
+
+```
+offset 0x58: feature_flop_blake3:  [u8; 32]
+offset 0x78: feature_turn_blake3:  [u8; 32]
+offset 0x98: feature_river_blake3: [u8; 32]
+```
+
+让 bucket_table → features_<street>.bin → ochs_warmup_postflop_<N>_n<R>.json → ground truth 形成可验证链。CI / reader 校验：
+
+```
+1. bucket_table 自身 BLAKE3 trailer 匹配 → 文件未损坏
+2. bucket_table 内 feature_<street>_blake3 字段匹配 features_<street>.bin 实际 BLAKE3
+3. features_<street>.bin 内 ochs_warmup_blake3 字段匹配 ochs_warmup artifact 实际 BLAKE3
+4. ochs_warmup artifact 跨架构 byte-equal（§2.4 已验证）
+```
+
+任一断链 → reader 拒绝加载。
