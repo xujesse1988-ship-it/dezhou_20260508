@@ -587,14 +587,13 @@ JSON 字段（postflop-hist 模式）：`mode / n_clusters / ochs_postflop_train
 
 #### 落地路径（实现阶段）
 
-当前 `equity.rs::ochs_table()` 仍走 1D-EHS warmup（OnceLock cache）。要让 OCHS feature 路径走 postflop-hist，实现阶段需要：
+实现阶段把 `equity.rs::ochs_table()` 的 1D-EHS warmup 路径**直接替换**为 postflop-hist：
 
-1. 在 `OchsTable` 加 mode 字段（或新增 `OchsTablePostflop`），让 cache 按 mode + n_clusters + n_rivers 分桶
-2. `ochs_table_postflop(n_clusters, n_rivers, evaluator)` 调 `dump_ochs_warmup_postflop_hist` 取 classes_per_cluster
-3. `EquityCalculator::ochs` 增加 mode 选项（feature_set_id 升级到 2 = "hist_8 + OCHS_postflop"）
-4. BucketTable header 增加 OCHS mode + n_rivers 字段，artifact schema_version 升 → 3
+1. `OchsTable.classes_per_cluster` 由 `dump_ochs_warmup_postflop_hist(n_clusters, n_rivers, evaluator)` 生成；OnceLock 缓存 key 升级为 `(n_clusters, n_rivers)`
+2. `EquityCalculator::ochs` 内层循环改 combo 级（§2.2），`representative_hole_for_class` 改名为 `combos_for_class` 返回 `Vec<[Card; 2]>`
+3. n_rivers 默认 1000（warmup wall ~1.5s on vultr 4-core）
 
-不在本文档承诺，作为 §2 feature 设计落地的前置 PR。
+`equity.rs::build_ochs_table` + `representative_hole_for_class` 旧 1D-EHS rep-level 路径可整体删除（不再被任何 caller 引用），dump 工具 `--mode ehs` 保留作 doc §2.3 数据复现 + algorithm validation。
 
 ## 3. 距离度量
 
@@ -648,28 +647,31 @@ CFR 收敛验收（H3 LBR）之前可做的便宜检查：
 - features 是否落盘以解耦 "算特征" 和 "跑 k-means"
 - f32 vs f64 内存代价
 
-## 7. 与现状的不变量差异
+## 7. 新 artifact schema
 
-本设计不与现有 v3 artifact byte-equal：
+本设计是 bucket table 的新实现，**不保留与既往 artifact 的兼容性**。原 BucketTable artifact 格式（`bucket_table.rs` 当前实现）整体重写，无 reader 双路径 / feature_set_id 多版本 / mode 字段开关。
 
-- feature 维度仍 16 但语义改变（flop/turn 的 dim 0 从 EHS² 变成 hist[0]，river 的 dim 0..7 从 EHS²+OCHS_8 变成 OCHS_16[0..7]）
-- k-means 距离从全 L2 改为混合 EMD + L2
-- **OCHS_N 从 169-class rep 路径改为 1326-combo 展开路径**（§2.2）—— 同一 (hero, board) 下 OCHS 分量数值改变，与 v3 byte-equal 必然漂移
-- OCHS warmup 路径从 1D-EHS（§2.3）切到 postflop-hist（§2.4）—— cluster 划分改变
-- BLAKE3 content hash 必然漂移，新 artifact 是 v4
-
-`feature_set_id` 需要 bump 到 2（v3 是 1 = "EHS² + OCHS_8 rep-level"）。新 v4 的 feature_set_id = 2 语义：
+新 artifact 在 `bucket_table.rs` 头部承诺：
 
 ```
-feature_set_id = 2:
-  flop/turn = equity_hist_8 + OCHS_8(combo-level, postflop-hist warmup) = 16 dim
-  river     = OCHS_16(combo-level, postflop-hist warmup)                 = 16 dim
+feature semantics:
+  flop  = equity_hist_8 (over 1081 future outcomes) + OCHS_8  = 16 dim
+  turn  = equity_hist_8 (over 46 future outcomes)   + OCHS_8  = 16 dim
+  river = OCHS_16                                              = 16 dim
+
+OCHS 实现：
+  warmup     = postflop-histogram（§2.4，n_rivers=1000）
+  feature    = 1326-combo level expansion（§2.2）
+
+K-means 距离：
+  hist 维度 → 1D EMD on [0, 1]
+  OCHS 维度 → L2
+  flop/turn 混合 → EMD(hist) + α · L2(OCHS)，α=1 baseline
+
+centroid 量化：u8 per-dim min/max（与 bucket_table.rs 既有 centroid_metadata
+段同型，n_dims=16）。
+
+BLAKE3 trailer（与既有同型，路径无关）。
 ```
 
-schema_version 同步 bump 到 3（v3 → v4 artifact）。BucketTable header 增加字段：
-
-- `ochs_warmup_mode: u8`（0 = 1D-EHS / 1 = postflop-hist）
-- `ochs_warmup_n_rivers: u32`（postflop-hist 路径的 n_rivers，1D-EHS 路径写 0）
-- `ochs_combo_expansion: u8`（0 = rep-level / 1 = combo-level）
-
-reader 必须按这些字段判断 feature 兼容性。
+header / centroid_metadata / centroid_data / lookup_table / trailer 字段布局沿用 `bucket_table.rs` D-244 既有 5 段结构（无新增 mode / n_rivers 字段，因为只有一种实现路径）。同一份 `bucket_table.rs` 头注释会更新到新 feature 语义；旧 schema 注释整体替换。
