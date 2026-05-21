@@ -120,66 +120,125 @@ fn bin_index(eq: f64) -> usize {
 
 ### 2.2 OCHS_N（三街都用）
 
-#### 定义
+#### 169 classes vs 1326 combos
 
-将 169 preflop class 按 EHS 聚成 N 个对手 cluster（OCHS warmup table，详见 §2.3）。给定 (hero_hole, board)，对每个 cluster k 计算：
+OCHS warmup（§2.3 / §2.4）在 169 个 preflop class 上做聚类（13 pair + 78 suited + 78 offsuit）。但 preflop 的 **1326 = C(52, 2)** 真实手牌空间在每个 class 内有多个 specific suit combos：
+
+| class 类型 | 数量 | combos / class | 例子 |
+|---|---|---|---|
+| pocket pair | 13 | **6** | AA: AsAh / AsAd / AsAc / AhAd / AhAc / AdAc |
+| suited | 78 | **4** | AKs: AsKs / AhKh / AdKd / AcKc |
+| offsuit | 78 | **12** | AKo: AsKh / AsKd / AsKc / AhKs / AhKd / AhKc / AdKs / AdKh / AdKc / AcKs / AcKh / AcKd |
+| 合计 | 169 | **avg 7.84** | 13×6 + 78×4 + 78×12 = 1326 |
+
+**关键**：preflop EHS 在 class 内 suit-invariant（deck 旋转对称），warmup 用 169 class 不丢信息；**postflop 不是** —— 具体 combo 与 board 的 suit 交互（flush draw、blocker）让同 class 不同 combo 在 fixed board 上 equity 差异显著。
+
+#### 定义（combo 级展开）
+
+OCHS_N 在 runtime feature 阶段 **必须按 combo 展开**：
 
 ```
-OCHS_N[k] = (1 / |cluster_k|') × Σ over class ∈ cluster_k of {
-                  equity_vs_hand(hero, class_rep, board)
-                  if class_rep 不与 hero / board 冲突
+OCHS_N[k] = (1 / |valid_combos(cluster_k, hero, board)|) × Σ {
+                  equity_vs_hand(hero, opp_combo, board)
+                  : class ∈ cluster_k
+                  : opp_combo ∈ combos_for_class(class)
+                  : opp_combo 与 hero / board 无 card 重叠
                 }
 ```
 
-其中 `|cluster_k|'` 是 cluster_k 中**未冲突**的 class 数（与 hero/board 有 card 重叠的 rep 跳过；冲突 rep 全跳过时落回 0.5）。
+冲突剔除策略：board + hero 占 5-7 张 specific cards，每张 card 会让若干 class 内 combos 失效（如 hero 持 As 时 AA 仅剩 3 个有效 combos = AhAd / AhAc / AdAc）。**剔除粒度从 class 改为 combo**：
 
-输出 ∈ ℝᴺ，每维 ∈ [0, 1]。
+- 旧（rep 路径）：rep 与 hero/board 冲突 → 整 class 跳过 → cluster k 信号塌缩
+- 新（combo 路径）：仅冲突 combo 跳过 → cluster k 仍有大量有效 combos 贡献
 
 #### 实现 pseudo-code
 
 ```rust
-fn ochs_n(hole: [Card; 2], board: &[Card], evaluator: &dyn HandEvaluator, n: u8) -> Vec<f64> {
-    let table = ochs_table(n, evaluator);  // OnceLock 缓存 (§2.3)
+/// 返回 class_id ∈ 0..169 对应的全部 specific combos（6 / 4 / 12 个）。
+fn combos_for_class(class_id: u8) -> Vec<[Card; 2]> {
+    if class_id <= 12 {
+        // pocket pair: 6 combos = C(4, 2) suits
+        let r = Rank::from_u8(class_id).unwrap();
+        let suits = [Suit::Spades, Suit::Hearts, Suit::Diamonds, Suit::Clubs];
+        let mut out = Vec::with_capacity(6);
+        for i in 0..4 {
+            for j in (i+1)..4 {
+                out.push([Card::new(r, suits[i]), Card::new(r, suits[j])]);
+            }
+        }
+        out
+    } else if class_id <= 90 {
+        // suited: 4 combos = 4 suits
+        let (high, low) = decode_high_low(class_id - 13);
+        let suits = [Suit::Spades, Suit::Hearts, Suit::Diamonds, Suit::Clubs];
+        suits.iter().map(|&s|
+            [Card::new(Rank::from_u8(high).unwrap(), s),
+             Card::new(Rank::from_u8(low).unwrap(), s)]
+        ).collect()
+    } else {
+        // offsuit: 12 combos = 4 × 3 distinct suit pairs
+        let (high, low) = decode_high_low(class_id - 91);
+        let suits = [Suit::Spades, Suit::Hearts, Suit::Diamonds, Suit::Clubs];
+        let mut out = Vec::with_capacity(12);
+        for &s1 in &suits {
+            for &s2 in &suits {
+                if s1 != s2 {
+                    out.push([Card::new(Rank::from_u8(high).unwrap(), s1),
+                              Card::new(Rank::from_u8(low).unwrap(), s2)]);
+                }
+            }
+        }
+        out
+    }
+}
+
+fn ochs_n(hero: [Card; 2], board: &[Card], evaluator: &dyn HandEvaluator, n: u8) -> Vec<f64> {
+    let table = ochs_table(n, evaluator);
     let mut out = Vec::with_capacity(n as usize);
     for cluster_id in 0..(n as usize) {
-        let classes = &table.classes_per_cluster[cluster_id];
         let mut sum = 0.0;
         let mut count = 0u32;
-        for &class_id in classes {
-            let opp = table.representative_hole[class_id as usize];
-            if pair_overlaps(&hole, &opp) || any_overlaps_board(&opp, board) {
-                continue;
+        for &class_id in &table.classes_per_cluster[cluster_id] {
+            for opp_combo in combos_for_class(class_id) {
+                if pair_overlaps(&hero, &opp_combo) || any_overlaps_board(&opp_combo, board) {
+                    continue;
+                }
+                sum += equity_vs_hand(hero, opp_combo, board, evaluator);
+                count += 1;
             }
-            sum += equity_vs_hand(hole, opp, board, evaluator);  // 见下
-            count += 1;
         }
         out.push(if count > 0 { sum / count as f64 } else { 0.5 });
     }
     out
 }
 
-fn equity_vs_hand(hole: [Card; 2], opp: [Card; 2], board: &[Card], eval: &dyn HandEvaluator) -> f64 {
+// equity_vs_hand 不变（按 board.len() 走 1-shot showdown / 46 / 990 enumerate）。
+```
+
+`equity_vs_hand` 实现（按 `board.len()` 分支）：
+
+```rust
+fn equity_vs_hand(hero: [Card; 2], opp: [Card; 2], board: &[Card], eval: &dyn HandEvaluator) -> f64 {
     match board.len() {
-        5 => {  // river: 1-shot showdown
-            let me = eval.eval7(&[hole[0], hole[1], board[0..5]].concat());
+        5 => {  // river: 1-shot showdown，2 次 eval7
+            let me = eval.eval7(&[hero[0], hero[1], board[0..5]].concat());
             let op = eval.eval7(&[opp[0], opp[1], board[0..5]].concat());
             if me > op { 1.0 } else if me == op { 0.5 } else { 0.0 }
         }
         4 => {  // turn: enumerate 46 river outcomes
-            let used = build_used_set(&hole, &opp, board);
-            let mut wins_x2 = 0u64;
-            let mut count = 0u64;
+            let used = build_used_set(&hero, &opp, board);
+            let mut wins_x2 = 0u64; let mut count = 0u64;
             for c in (0..52).filter(|c| !used[*c as usize]) {
                 let full_board = [board[0], board[1], board[2], board[3], Card::from_u8(c)];
                 wins_x2 += compare_x2(
-                    eval.eval7(&[hole[0], hole[1], full_board[0..5]].concat()),
-                    eval.eval7(&[opp[0], opp[1], full_board[0..5]].concat()),
+                    eval.eval7(&[hero[0], hero[1], full_board[..]].concat()),
+                    eval.eval7(&[opp[0], opp[1], full_board[..]].concat()),
                 );
                 count += 1;
             }
             wins_x2 as f64 / (2.0 * count as f64)
         }
-        3 => {  // flop: enumerate C(45,2) = 990 (turn, river) outcomes
+        3 => {  // flop: enumerate C(45, 2) = 990 (turn, river) outcomes
             // 同 turn 但双层循环
         }
         _ => unreachable!(),
@@ -187,16 +246,42 @@ fn equity_vs_hand(hole: [Card; 2], opp: [Card; 2], board: &[Card], eval: &dyn Ha
 }
 ```
 
+#### 为什么需要 combo 展开 —— suit 交互举例
+
+**例 1**：board = `Ts 9s 8s`（monotone flop），hero = `Jd Jc`，opp class = `AKs`（4 combos）：
+
+| opp_combo | equity vs hero JdJc | 解读 |
+|---|---|---|
+| AsKs | ~0.78 | opp 有 nut flush draw + 2 overcards |
+| AhKh | ~0.45 | opp 只剩 2 overcards |
+| AdKd | ~0.45 | 同上 |
+| AcKc | ~0.45 | 同上 |
+| **mean** | **0.53** | 真实 "AKs class 平均强度" |
+
+旧 rep 路径用 AsKs，OCHS_N[k] 多算 ~0.25，**严重高估** "AKs 这类对手的威胁"。
+
+**例 2**：board = `Ts 9s 8s`（同上），hero = `As Ah`：
+
+| opp_combo of AKs class | 状态 |
+|---|---|
+| AsKs | conflict（As 已被 hero 占）→ 跳过 |
+| AhKh | conflict（Ah 被 hero 占）→ 跳过 |
+| AdKd | ~0.0（hero 顶对 + nut flush draw blocker）|
+| AcKc | ~0.0（同上）|
+
+旧 rep 路径：rep = AsKs，与 hero 冲突 → **整 AKs class 在该 cluster 内被跳过** → cluster 信号塌缩到非 AKs 类成员，方差爆炸。
+新 combo 路径：剩 2 个有效 combos 平均 ≈ 0.0，正确反映 "vs AKs 我打爆"。
+
 #### 性能注解
 
-- N=8 / N=16 OCHS warmup table 在 OnceLock 静态缓存（每进程一次性 cost ≈ 10s）
-- equity_vs_hand 内层 enumerate 都是 deterministic，不消耗 RNG
-- 平均 cluster 大小：N=8 → ~21 class/cluster；N=16 → ~10.6 class/cluster
-- 冲突 skip 数：board+hero 占 5-7 张，169 reps 中约 ≤ 7 rep 冲突，影响 ≤ 33% per cluster
+- 平均 combos / class = 7.84；剔除与 hero/board 冲突后实际生效 ~5-7 combos / class（依 board / hero suit composition）
+- per OCHS_N call 内 `equity_vs_hand` 调用数从 "~21 (N=8) / ~11 (N=16) class" 提升到 "~165 / ~83 combo"（约 6-8×）
+- N=8 / N=16 OCHS warmup table 仍走 169-class（preflop suit-invariant，warmup 不需 combo 级），OnceLock 缓存不变
+- `combos_for_class` 输出确定性，可在 process startup 预计算成 `[Vec<[Card; 2]>; 169]` static table 避免每次 OCHS call 重算（属于实现优化）
 
 #### 含义
 
-对每个对手 "假想范围" 给出 hero 的相对强度。river N 提高到 16 因为 river 没有 hist 维度，需要更多 OCHS 粒度填充信息空间，且 river deterministic 计算便宜（每 dim ≤ 22 次 eval7）。
+对每个对手 "假想范围" 给出 hero 的相对强度。**combo 展开确保 suit-interactive board（monotone / two-tone / paired，占 ~60% postflop 状态）下 OCHS 分量正确**。river N 提高到 16 因为 river 没有 hist 维度，需要更多 OCHS 粒度填充信息空间，且 river deterministic 计算便宜（每 combo 仅 2 次 eval7）。
 
 ### 2.3 OCHS warmup table（共享基础设施）
 
@@ -541,21 +626,25 @@ CFR 收敛验收（H3 LBR）之前可做的便宜检查：
 
 ## 6. 训练规模
 
-每 sample 的 evaluator 调用数（eval7 计数；hero rank 可复用前提下数字减半，本表按朴素 2× 算 upper bound）：
+每 sample 的 evaluator 调用数（eval7 计数；hero rank 可复用前提下数字减半，本表按朴素 2× 算 upper bound）。
+
+**OCHS 部分按 §2.2 combo 级展开计算**（avg 7.84 combos/class，扣除冲突后 ~6 effective combos/class）：
 
 | 街 | N canonical | hist 部分（per sample） | OCHS 部分（per sample） | 单 sample eval7 | 全 N eval7 |
 |---|---|---|---|---|---|
-| flop | 1,286,792 | 1081 future × C(45,2) × 2 ≈ 2.14 M | 8 × ~21 × C(45,2) × 2 ≈ 333 k | ~2.47 M | ~3.2 × 10¹² |
-| turn | 13,960,050 | 46 future × C(45,2) × 2 ≈ 91 k | 8 × ~21 × 46 × 2 ≈ 15 k | ~106 k | ~1.5 × 10¹² |
-| river | 123,156,254 | — | 16 × ~11 × 1 × 2 ≈ 339 | ~339 | ~4.2 × 10¹⁰ |
+| flop | 1,286,792 | 1081 future × C(45,2) × 2 ≈ 2.14 M | 8 × ~21 × ~6 × C(45,2) × 2 ≈ 2.0 M | ~4.14 M | ~5.3 × 10¹² |
+| turn | 13,960,050 | 46 future × C(45,2) × 2 ≈ 91 k | 8 × ~21 × ~6 × 46 × 2 ≈ 93 k | ~184 k | ~2.6 × 10¹² |
+| river | 123,156,254 | — | 16 × ~11 × ~6 × 1 × 2 ≈ 2.1 k | ~2.1 k | ~2.6 × 10¹¹ |
 
-**flop 反而是最贵的街**：hist_8 在每个 future (turn, river) 上要做一次完整 5-card-board equity 计算（C(45, 2) = 990 个 opp_hole enumerate），1081 × 990 × 2 ≈ 2.14 M eval7 / sample 主导成本。river 因 deterministic 1-shot showdown 最便宜。
+**flop 仍是最贵的街**：hist 部分 2.14 M + OCHS 部分（combo 展开后）2.0 M ≈ 4.14 M eval7 / sample。相对 §2.2 combo 展开**前** 估算（OCHS ~333 k），全 N flop 训练 eval7 从 3.2 × 10¹² → 5.3 × 10¹²（+66%）；turn 同比例上升；river OCHS 翻倍但绝对值仍便宜。
 
 实际实现需考虑（不在本文档承诺，留给实现阶段决策）：
 
 - flop hist 是否需要 future outcome 抽样（如 200/1081）替代 full enumerate
 - hero rank 在 inner 990 opp enumerate 内复用（§E hot path 已有 precompute table 模式）
 - OCHS inner 枚举是否需要降到 sample / 多 cluster 共享 inner outcome
+- OCHS combo 展开是否在 rainbow non-paired board 上自动塌缩到 1 combo（class-level 等价）
+- `combos_for_class` 输出 `[Vec<[Card; 2]>; 169]` static precompute
 - features 是否落盘以解耦 "算特征" 和 "跑 k-means"
 - f32 vs f64 内存代价
 
@@ -565,6 +654,22 @@ CFR 收敛验收（H3 LBR）之前可做的便宜检查：
 
 - feature 维度仍 16 但语义改变（flop/turn 的 dim 0 从 EHS² 变成 hist[0]，river 的 dim 0..7 从 EHS²+OCHS_8 变成 OCHS_16[0..7]）
 - k-means 距离从全 L2 改为混合 EMD + L2
+- **OCHS_N 从 169-class rep 路径改为 1326-combo 展开路径**（§2.2）—— 同一 (hero, board) 下 OCHS 分量数值改变，与 v3 byte-equal 必然漂移
+- OCHS warmup 路径从 1D-EHS（§2.3）切到 postflop-hist（§2.4）—— cluster 划分改变
 - BLAKE3 content hash 必然漂移，新 artifact 是 v4
 
-`feature_set_id` 需要 bump 到 2（v3 是 1 = "EHS² + OCHS_8"）。schema_version 是否同步 bump 由 reader 兼容性决定（centroid 维度仍 9 → 16 → header `n_dims` 需改）。
+`feature_set_id` 需要 bump 到 2（v3 是 1 = "EHS² + OCHS_8 rep-level"）。新 v4 的 feature_set_id = 2 语义：
+
+```
+feature_set_id = 2:
+  flop/turn = equity_hist_8 + OCHS_8(combo-level, postflop-hist warmup) = 16 dim
+  river     = OCHS_16(combo-level, postflop-hist warmup)                 = 16 dim
+```
+
+schema_version 同步 bump 到 3（v3 → v4 artifact）。BucketTable header 增加字段：
+
+- `ochs_warmup_mode: u8`（0 = 1D-EHS / 1 = postflop-hist）
+- `ochs_warmup_n_rivers: u32`（postflop-hist 路径的 n_rivers，1D-EHS 路径写 0）
+- `ochs_combo_expansion: u8`（0 = rep-level / 1 = combo-level）
+
+reader 必须按这些字段判断 feature 兼容性。
