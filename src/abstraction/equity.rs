@@ -1156,3 +1156,341 @@ fn decode_high_low(idx: u8) -> (u8, u8) {
     }
     (high, idx - high * (high - 1) / 2)
 }
+
+/// River-state (5-card board) deterministic equity vs uniform random opp hole。
+/// `docs/bucket_feature_design.md` §2.1 `equity_exact_river`。
+///
+/// 枚举 deck 剩余 45 张牌的 C(45, 2) = 990 个 opp_hole，对每个 opp 调
+/// `evaluator.eval7` 两次（hero / opp），输出 `wins_x2 / (2 × 990)` ∈ [0, 1]。
+/// hero rank 在 990-loop 外预计算一次（§E hot path 模式）。
+///
+/// 与 `MonteCarloEquity::equity_river_exact_impl` 算法等价；本函数提供 evaluator-
+/// only 入口（不需要 MonteCarloEquity 实例 / RngSource），供 Stage 1 feature
+/// 生成（`equity_hist_8` / `equity_features_dump.rs`）调用。
+///
+/// **输入约束**（caller 责任，违反 debug_assert 触发；release build 行为未定义）：
+/// - `board.len() == 5`
+/// - `hole` 内两张牌互不重叠且都不在 `board` 中
+pub fn equity_river_exact(hole: [Card; 2], board: &[Card], evaluator: &dyn HandEvaluator) -> f64 {
+    debug_assert_eq!(board.len(), 5, "equity_river_exact: board.len() must be 5");
+    let mut used = [false; 52];
+    used[hole[0].to_u8() as usize] = true;
+    used[hole[1].to_u8() as usize] = true;
+    for c in board.iter() {
+        used[c.to_u8() as usize] = true;
+    }
+    debug_assert_eq!(
+        used.iter().filter(|b| **b).count(),
+        7,
+        "equity_river_exact: hole + board must be 7 distinct cards"
+    );
+    let me = build_seven_cards(hole, board);
+    let rm = evaluator.eval7(&me);
+    let unused: Vec<u8> = (0..52u8).filter(|v| !used[*v as usize]).collect();
+    let n = unused.len();
+    let mut sum_x2: u64 = 0;
+    let mut count: u64 = 0;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let opp_hole = [
+                Card::from_u8(unused[i]).expect("0..52"),
+                Card::from_u8(unused[j]).expect("0..52"),
+            ];
+            let opp = build_seven_cards(opp_hole, board);
+            let ro = evaluator.eval7(&opp);
+            sum_x2 += compare_x2(rm, ro);
+            count += 1;
+        }
+    }
+    sum_x2 as f64 / (2.0 * count as f64)
+}
+
+/// hand-vs-specific-hand deterministic equity（`docs/bucket_feature_design.md`
+/// §2.2 `equity_vs_hand`）。**postflop 专用**（board.len() ∈ {3, 4, 5}）。
+///
+/// - `board.len() == 5` (river)：1-shot showdown，2 次 eval7
+/// - `board.len() == 4` (turn)：enumerate 44 个 river outcome；hero + opp +
+///   board = 8 张占用，余 44 张作 river 候选
+/// - `board.len() == 3` (flop)：enumerate C(45, 2) = 990 个 (turn, river) 对
+///
+/// 与 `MonteCarloEquity::equity_vs_hand` 在 postflop（board.len() ≠ 0）路径
+/// 算法等价；本函数提供 evaluator-only / 零分配 / 零 RNG 入口，供 Stage 1
+/// OCHS combo-level feature 计算调用。
+///
+/// **输入约束**（caller 责任，违反 debug_assert）：
+/// - `board.len() ∈ {3, 4, 5}`
+/// - `hole` / `opp_hole` 两张牌各自互不重叠，且与 `board` 都不重叠，且
+///   `hole ∩ opp_hole = ∅`
+pub fn equity_vs_hand_exact(
+    hole: [Card; 2],
+    opp_hole: [Card; 2],
+    board: &[Card],
+    evaluator: &dyn HandEvaluator,
+) -> f64 {
+    debug_assert!(
+        matches!(board.len(), 3..=5),
+        "equity_vs_hand_exact: board.len() must be 3/4/5, got {}",
+        board.len()
+    );
+    let mut used = [false; 52];
+    used[hole[0].to_u8() as usize] = true;
+    used[hole[1].to_u8() as usize] = true;
+    used[opp_hole[0].to_u8() as usize] = true;
+    used[opp_hole[1].to_u8() as usize] = true;
+    for c in board.iter() {
+        used[c.to_u8() as usize] = true;
+    }
+    debug_assert_eq!(
+        used.iter().filter(|b| **b).count(),
+        4 + board.len(),
+        "equity_vs_hand_exact: hole / opp_hole / board must be all distinct"
+    );
+
+    match board.len() {
+        5 => {
+            let me = build_seven_cards(hole, board);
+            let opp = build_seven_cards(opp_hole, board);
+            let rm = evaluator.eval7(&me);
+            let ro = evaluator.eval7(&opp);
+            if rm > ro {
+                1.0
+            } else if rm == ro {
+                0.5
+            } else {
+                0.0
+            }
+        }
+        4 => {
+            let mut sum_x2: u64 = 0;
+            let mut count: u64 = 0;
+            for v in 0..52u8 {
+                if used[v as usize] {
+                    continue;
+                }
+                let river = Card::from_u8(v).expect("0..52");
+                let full_board: [Card; 5] = [board[0], board[1], board[2], board[3], river];
+                let me = build_seven_cards(hole, &full_board);
+                let opp = build_seven_cards(opp_hole, &full_board);
+                sum_x2 += compare_x2(evaluator.eval7(&me), evaluator.eval7(&opp));
+                count += 1;
+            }
+            sum_x2 as f64 / (2.0 * count as f64)
+        }
+        3 => {
+            let unused: Vec<u8> = (0..52u8).filter(|v| !used[*v as usize]).collect();
+            let n = unused.len();
+            let mut sum_x2: u64 = 0;
+            let mut count: u64 = 0;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let turn = Card::from_u8(unused[i]).expect("0..52");
+                    let river = Card::from_u8(unused[j]).expect("0..52");
+                    let full_board: [Card; 5] = [board[0], board[1], board[2], turn, river];
+                    let me = build_seven_cards(hole, &full_board);
+                    let opp = build_seven_cards(opp_hole, &full_board);
+                    sum_x2 += compare_x2(evaluator.eval7(&me), evaluator.eval7(&opp));
+                    count += 1;
+                }
+            }
+            sum_x2 as f64 / (2.0 * count as f64)
+        }
+        _ => unreachable!("debug_assert above ensures board.len() in {{3, 4, 5}}"),
+    }
+}
+
+/// Combo-level OCHS feature（`docs/bucket_feature_design.md` §2.2）。
+///
+/// 对每个 opp cluster k：枚举 cluster 内 class id → 枚举 class 的 1326-combo
+/// 展开（pair=6 / suited=4 / offsuit=12）→ 跳过与 `hole`/`board` 冲突的 combo
+/// → 调 `equity_vs_hand_exact(hole, opp_combo, board, evaluator)` → 加权
+/// 平均。
+///
+/// 不同于既有 `MonteCarloEquity::ochs`（rep 路径，每 class 只取 1 个 canonical
+/// 代表）：本函数对 monotone / flush-draw / paired board 等 suit-interactive
+/// 场景给出正确的 cluster-mean equity（doc §2.2 数值示例：JdJc on Ts9s8s vs
+/// AKs class，rep 路径 0.22 vs combo 路径 0.47）。
+///
+/// **输入**：
+/// - `board.len() ∈ {3, 4, 5}`（postflop only；preflop 走独立 169 lossless 路径）
+/// - `classes_per_cluster[k]` = cluster k 包含的 class id 列表；length =
+///   n_clusters；与 [`OchsPostflopWarmupDump::classes_per_cluster`] 同型
+///
+/// **输出**：长度 n_clusters 的 Vec\<f64\>，每项 ∈ [0, 1]。Cluster k 内全部
+/// combos 都与 hero/board 冲突 → 该 cluster 输出 0.5（与既有 ochs 同 fallback）。
+pub fn ochs_n_combo(
+    hole: [Card; 2],
+    board: &[Card],
+    evaluator: &dyn HandEvaluator,
+    classes_per_cluster: &[Vec<u8>],
+) -> Vec<f64> {
+    debug_assert!(
+        matches!(board.len(), 3..=5),
+        "ochs_n_combo: board.len() must be 3/4/5, got {}",
+        board.len()
+    );
+    let mut out: Vec<f64> = Vec::with_capacity(classes_per_cluster.len());
+    for classes in classes_per_cluster {
+        let mut sum = 0.0_f64;
+        let mut count: u32 = 0;
+        for &class_id in classes {
+            for opp_combo in combos_for_class(class_id) {
+                if pair_overlaps(&hole, &opp_combo) || any_overlaps_board(&opp_combo, board) {
+                    continue;
+                }
+                let v = equity_vs_hand_exact(hole, opp_combo, board, evaluator);
+                sum += v;
+                count += 1;
+            }
+        }
+        let mean = if count > 0 {
+            sum / f64::from(count)
+        } else {
+            0.5
+        };
+        out.push(mean);
+    }
+    out
+}
+
+/// 8-bin equity histogram over future-card outcomes（`docs/bucket_feature_design.md`
+/// §2.1）。flop（board.len()=3） / turn（board.len()=4）专用。
+///
+/// 枚举所有 future outcome（flop = C(47, 2) = 1081 个 (turn, river) 无序对；
+/// turn = 46 个 river 单卡），对每个 outcome 调 `equity_river_exact` 算 hero
+/// 在 resulting 5-card board 上的 deterministic equity。8 bin 划分 [0, 1]，
+/// bin k = [k/8, (k+1)/8)；equity = 1.0 归入 bin 7。
+///
+/// 输出归一化频率向量 `[f64; 8]`，分量和 = 1.0。
+///
+/// **输入约束**（caller 责任）：
+/// - `board.len() ∈ {3, 4}`
+/// - hole + board 5 / 6 张牌互不重叠
+///
+/// **性能**：flop = 1081 × (1 hero + 990 opp) eval7 ≈ 1.07M eval7 / call；
+/// turn = 46 × 991 ≈ 45.6k eval7 / call。stage 1 主要成本。
+pub fn equity_hist_8(hole: [Card; 2], board: &[Card], evaluator: &dyn HandEvaluator) -> [f64; 8] {
+    debug_assert!(
+        board.len() == 3 || board.len() == 4,
+        "equity_hist_8: board.len() must be 3 or 4, got {}",
+        board.len()
+    );
+    let mut used = [false; 52];
+    used[hole[0].to_u8() as usize] = true;
+    used[hole[1].to_u8() as usize] = true;
+    for c in board.iter() {
+        used[c.to_u8() as usize] = true;
+    }
+
+    let mut bins = [0u64; 8];
+    let mut total: u64 = 0;
+
+    match board.len() {
+        3 => {
+            // 1081 个 (turn, river) 无序对 over unused 47 张
+            let unused: Vec<u8> = (0..52u8).filter(|v| !used[*v as usize]).collect();
+            let n = unused.len();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let full_board: [Card; 5] = [
+                        board[0],
+                        board[1],
+                        board[2],
+                        Card::from_u8(unused[i]).expect("0..52"),
+                        Card::from_u8(unused[j]).expect("0..52"),
+                    ];
+                    let eq = equity_river_exact(hole, &full_board, evaluator);
+                    let bin = ((eq * 8.0).floor() as usize).min(7);
+                    bins[bin] += 1;
+                    total += 1;
+                }
+            }
+        }
+        4 => {
+            // 46 个 river single card over unused 46 张
+            for v in 0..52u8 {
+                if used[v as usize] {
+                    continue;
+                }
+                let river = Card::from_u8(v).expect("0..52");
+                let full_board: [Card; 5] = [board[0], board[1], board[2], board[3], river];
+                let eq = equity_river_exact(hole, &full_board, evaluator);
+                let bin = ((eq * 8.0).floor() as usize).min(7);
+                bins[bin] += 1;
+                total += 1;
+            }
+        }
+        _ => unreachable!("debug_assert above ensures board.len() in {{3, 4}}"),
+    }
+
+    let inv = 1.0_f64 / total as f64;
+    [
+        bins[0] as f64 * inv,
+        bins[1] as f64 * inv,
+        bins[2] as f64 * inv,
+        bins[3] as f64 * inv,
+        bins[4] as f64 * inv,
+        bins[5] as f64 * inv,
+        bins[6] as f64 * inv,
+        bins[7] as f64 * inv,
+    ]
+}
+
+/// 给定 169 class id，返回该类的全部 specific suit combos（pocket pair = 6 /
+/// suited = 4 / offsuit = 12）。`docs/bucket_feature_design.md` §2.2。
+///
+/// 用途：OCHS_N runtime feature 计算的 combo 级展开，**正确处理 monotone /
+/// flush-draw / paired board 上同 class 内不同 suit combos 与 hero/board 的
+/// blocker / flush 交互**。与 `representative_hole_for_class` 互补——后者
+/// 仅在 1D-EHS warmup 路径使用（preflop EHS suit-invariant 时 rep 不丢
+/// 信息）；本函数用于 postflop feature 计算时 rep 信息塌缩问题。
+///
+/// 编码与 `representative_hole_for_class` 同步：
+/// - `0..=12`：pocket pair（rank = class_id），C(4, 2) = 6 combos。
+/// - `13..=90`：suited（pair_combination_index 升序），4 combos。
+/// - `91..=168`：offsuit（同索引），4×3 = 12 distinct suit pair combos。
+///
+/// 输出 combos 内每条 `[Card; 2]` 严格 distinct（pair_overlaps == false）；
+/// **suit 顺序固定** [Spades, Hearts, Diamonds, Clubs]（Suit 枚举 to_u8 顺序
+/// 3/2/1/0；本函数采用语义顺序而非 to_u8 升序，保留 doc §2.2 pseudocode 一致
+/// 性），保证 byte-equal 跨架构 / 跨进程。
+pub fn combos_for_class(class_id: u8) -> Vec<[Card; 2]> {
+    const SUITS: [Suit; 4] = [Suit::Spades, Suit::Hearts, Suit::Diamonds, Suit::Clubs];
+    match class_id {
+        0..=12 => {
+            let r = Rank::from_u8(class_id).expect("0..13 valid rank");
+            let mut out: Vec<[Card; 2]> = Vec::with_capacity(6);
+            for (i, &s1) in SUITS.iter().enumerate() {
+                for &s2 in &SUITS[(i + 1)..] {
+                    out.push([Card::new(r, s1), Card::new(r, s2)]);
+                }
+            }
+            out
+        }
+        13..=90 => {
+            let idx = class_id - 13;
+            let (high, low) = decode_high_low(idx);
+            let rh = Rank::from_u8(high).expect("0..13 valid");
+            let rl = Rank::from_u8(low).expect("0..13 valid");
+            SUITS
+                .iter()
+                .map(|&s| [Card::new(rh, s), Card::new(rl, s)])
+                .collect()
+        }
+        91..=168 => {
+            let idx = class_id - 91;
+            let (high, low) = decode_high_low(idx);
+            let rh = Rank::from_u8(high).expect("0..13 valid");
+            let rl = Rank::from_u8(low).expect("0..13 valid");
+            let mut out: Vec<[Card; 2]> = Vec::with_capacity(12);
+            for &s1 in &SUITS {
+                for &s2 in &SUITS {
+                    if s1 != s2 {
+                        out.push([Card::new(rh, s1), Card::new(rl, s2)]);
+                    }
+                }
+            }
+            out
+        }
+        _ => panic!("combos_for_class: class {class_id} >= 169"),
+    }
+}

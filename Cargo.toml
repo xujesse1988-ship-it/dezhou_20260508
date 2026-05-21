@@ -145,3 +145,10 @@ path = "tools/nlhe_trace.rs"
 [[bin]]
 name = "ochs_warmup_dump"
 path = "tools/ochs_warmup_dump.rs"
+
+# Stage 1（docs/bucket_feature_design.md §6.2）：per-street canonical_enum →
+# 16-dim feature → features_<street>.bin。两阶段训练流水线第一阶段，输出独立
+# artifact 供 Stage 2 K-means 读盘消费。
+[[bin]]
+name = "bucket_features_dump"
+path = "tools/bucket_features_dump.rs"
