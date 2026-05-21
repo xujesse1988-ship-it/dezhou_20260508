@@ -14,12 +14,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 
 use crate::abstraction::cluster::rng_substream::{
-    derive_substream_seed, OCHS_FEATURE_INNER, OCHS_WARMUP,
+    derive_substream_seed, OCHS_FEATURE_INNER, OCHS_WARMUP, POSTFLOP_WARMUP_BOARD_SAMPLE,
 };
 use crate::abstraction::cluster::{kmeans_fit, reorder_by_ehs_median, KMeansConfig};
 use crate::core::rng::{ChaCha20Rng, RngSource};
 use crate::core::{Card, Rank, Suit};
 use crate::eval::HandEvaluator;
+use rayon::prelude::*;
 
 /// Equity 计算 trait。
 ///
@@ -935,6 +936,185 @@ pub fn dump_ochs_warmup(n_clusters: u32, evaluator: Arc<dyn HandEvaluator>) -> O
         ochs_training_seed: OCHS_TRAINING_SEED,
         ochs_precompute_iter: OCHS_PRECOMPUTE_ITER,
     }
+}
+
+/// Postflop-histogram OCHS warmup dump（`bucket_feature_design.md` §2.3 选项 C）。
+///
+/// 与 `dump_ochs_warmup`（1D-EHS warmup）的核心差异：对每个 preflop class，特征
+/// **不是** EHS 标量，而是 **8-bin equity 直方图** over `n_rivers` 个采样 5-card
+/// river boards。能区分 set-mining hand（双峰分布）与 top-pair hand（单峰分布），
+/// 解决 1D-EHS warmup "99 + AKs 揉到同 cluster" 问题。
+///
+/// 每个 class 计算特征流程：
+/// 1. 用 `derive_substream_seed(OCHS_TRAINING_SEED, POSTFLOP_WARMUP_BOARD_SAMPLE,
+///    class_id)` 派生 ChaCha20Rng
+/// 2. sample `n_rivers` 个 5-card river boards（FY 抽取，与 class representative
+///    hole 不重叠）
+/// 3. 每 board 计算 deterministic equity = `enumerate C(45, 2) = 990 个 opp_hole`
+///    → equity ∈ [0, 1]
+/// 4. 8-bin histogram on [0, 1]（bin k = [k/8, (k+1)/8)；equity = 1 归入 bin 7）
+///
+/// K-means + L2 on 169 × 8 histograms（kmeans_fit 复用既有 L2 路径——EMD 距离在
+/// 1D fixed-bin 情况下与 L2 共享同样的 centroid update 即 per-bin 均值；assignment
+/// 阶段的 EMD vs L2 差异留作未来 stage 升级时再换距离函数。当前 L2 已足够区分
+/// histogram 形状）。
+///
+/// 重编号：按每 cluster 内 `ehs_mean_per_class` 中位数升序（cluster 0 = weakest，
+/// 与 1D-EHS warmup 同语义）。
+///
+/// 成本：169 × n_rivers × 990 × 2 eval7 = 169 × n_rivers × 1980 eval7。
+/// n_rivers=1000 → ~3.3 × 10⁸ eval7 ≈ ~17s single-core / ~5s rayon@4-core。
+///
+/// 同 (n_clusters, n_rivers, evaluator) 输入下 byte-equal。
+pub fn dump_ochs_warmup_postflop_hist(
+    n_clusters: u32,
+    n_rivers: u32,
+    evaluator: Arc<dyn HandEvaluator>,
+) -> OchsPostflopWarmupDump {
+    assert!(n_rivers >= 1, "n_rivers must be >= 1");
+    assert!(
+        (2..=64).contains(&n_clusters),
+        "n_clusters must be in [2, 64]"
+    );
+
+    let representative_hole: [[Card; 2]; N_PREFLOP_CLASSES] =
+        std::array::from_fn(|i| representative_hole_for_class(i as u8));
+
+    // Step 1: per-class equity histogram。Rayon 并行 over 169 classes。
+    let per_class: Vec<([f64; 8], f64)> = (0..N_PREFLOP_CLASSES)
+        .into_par_iter()
+        .map(|class_id| {
+            let rep = representative_hole[class_id];
+            let used =
+                build_used_set(&rep, &[], &[]).expect("representative hole has 2 distinct cards");
+            let sub_seed = derive_substream_seed(
+                OCHS_TRAINING_SEED,
+                POSTFLOP_WARMUP_BOARD_SAMPLE,
+                class_id as u32,
+            );
+            let mut rng = ChaCha20Rng::from_seed(sub_seed);
+
+            let mut bin_counts = [0u32; 8];
+            let mut equity_sum = 0.0_f64;
+
+            for _ in 0..n_rivers {
+                // Sample 5-card river board not overlapping with `rep`。
+                let full_board = sample_n_board_cards(&used, 5, &mut rng);
+
+                // Compute exact equity vs uniform random opp_hole（C(45, 2) = 990
+                // enumerations）on this 5-card board。复用 hero eval7 一次。
+                let me_seven = build_seven_cards(rep, &full_board);
+                let rm = evaluator.eval7(&me_seven);
+
+                let mut used_with_board = used;
+                for c in &full_board {
+                    used_with_board[c.to_u8() as usize] = true;
+                }
+                let unused: Vec<u8> = (0..52u8)
+                    .filter(|v| !used_with_board[*v as usize])
+                    .collect();
+                let n_unused = unused.len();
+                let mut sum_x2: u64 = 0;
+                let mut count: u64 = 0;
+                for i in 0..n_unused {
+                    for j in (i + 1)..n_unused {
+                        let opp_hole = [
+                            Card::from_u8(unused[i]).expect("0..52"),
+                            Card::from_u8(unused[j]).expect("0..52"),
+                        ];
+                        let opp_seven = build_seven_cards(opp_hole, &full_board);
+                        let ro = evaluator.eval7(&opp_seven);
+                        sum_x2 += compare_x2(rm, ro);
+                        count += 1;
+                    }
+                }
+                let equity = sum_x2 as f64 / (2.0 * count as f64);
+
+                let bin = ((equity * 8.0).floor() as usize).min(7);
+                bin_counts[bin] += 1;
+                equity_sum += equity;
+            }
+
+            let mut hist = [0.0_f64; 8];
+            for (b, &c) in bin_counts.iter().enumerate() {
+                hist[b] = c as f64 / n_rivers as f64;
+            }
+            let ehs_mean = equity_sum / n_rivers as f64;
+            (hist, ehs_mean)
+        })
+        .collect();
+
+    let equity_hist_per_class: Vec<Vec<f64>> = per_class.iter().map(|(h, _)| h.to_vec()).collect();
+    let mut ehs_mean_per_class = [0.0_f64; N_PREFLOP_CLASSES];
+    for (i, (_, e)) in per_class.iter().enumerate() {
+        ehs_mean_per_class[i] = *e;
+    }
+
+    // Step 2: K-means + L2 on 8-dim histograms。
+    let cfg = KMeansConfig::default_d232(n_clusters);
+    let kmeans_res = kmeans_fit(
+        &equity_hist_per_class,
+        cfg,
+        OCHS_TRAINING_SEED,
+        OCHS_WARMUP,
+        OCHS_WARMUP,
+    );
+
+    // Step 3: reorder by per-cluster median EHS_mean。reorder_by_ehs_median 期望
+    // ehs scalar per sample，复用即可（assignments 重编号，centroids 跟随）。
+    let (reordered_centroids, reordered_assignments) = reorder_by_ehs_median(
+        kmeans_res.centroids,
+        kmeans_res.assignments,
+        &ehs_mean_per_class,
+    );
+
+    // Step 4: inverted index
+    let mut classes_per_cluster: Vec<Vec<u8>> = vec![Vec::new(); n_clusters as usize];
+    for (class_id, &cid) in reordered_assignments.iter().enumerate() {
+        classes_per_cluster[cid as usize].push(class_id as u8);
+    }
+
+    // Step 5: cluster centroid EHS = histogram 中心质量
+    let cluster_centroid_ehs: Vec<f64> = reordered_centroids
+        .iter()
+        .map(|h| {
+            h.iter()
+                .enumerate()
+                .map(|(b, &p)| ((b as f64) + 0.5) / 8.0 * p)
+                .sum()
+        })
+        .collect();
+
+    OchsPostflopWarmupDump {
+        representative_hole,
+        equity_hist_per_class,
+        ehs_mean_per_class,
+        classes_per_cluster,
+        cluster_centroid_hist: reordered_centroids,
+        cluster_centroid_ehs,
+        n_rivers_sampled: n_rivers,
+        ochs_postflop_training_seed: OCHS_TRAINING_SEED,
+    }
+}
+
+/// `dump_ochs_warmup_postflop_hist` 返回结构。
+pub struct OchsPostflopWarmupDump {
+    pub representative_hole: [[Card; 2]; N_PREFLOP_CLASSES],
+    /// `equity_hist_per_class[class_id]` = 8-bin equity histogram（频率向量，和=1）
+    /// over `n_rivers_sampled` 个采样 river boards。
+    pub equity_hist_per_class: Vec<Vec<f64>>,
+    /// 每 class 的 mean equity = `mean over sampled rivers of equity_vs_uniform_opp`。
+    /// 与 `OchsWarmupDump.ehs_per_class` 计算方式不同（postflop sample vs preflop MC），
+    /// 但语义同（mean EHS）。
+    pub ehs_mean_per_class: [f64; N_PREFLOP_CLASSES],
+    /// 重编号后 cluster c (0=weakest) 内的 class id 列表。
+    pub classes_per_cluster: Vec<Vec<u8>>,
+    /// 重编号后 cluster c 的 8-bin centroid histogram（与 cluster_centroid_ehs 对应）。
+    pub cluster_centroid_hist: Vec<Vec<f64>>,
+    /// 重编号后 cluster c 的 centroid EHS（centroid histogram 的中心质量）。
+    pub cluster_centroid_ehs: Vec<f64>,
+    pub n_rivers_sampled: u32,
+    pub ochs_postflop_training_seed: u64,
 }
 
 /// 给定 169 class id，返回该类的 canonical 代表 hole（具体两张牌）。

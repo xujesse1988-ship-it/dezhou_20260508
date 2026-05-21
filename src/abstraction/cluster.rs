@@ -85,6 +85,14 @@ pub mod rng_substream {
 
     /// OCHS feature 计算的 inner equity 采样（D-222 / D-228）。
     pub const OCHS_FEATURE_INNER: u32 = 0x0007_0000;
+
+    /// Postflop-histogram OCHS warmup: per-class river board sampling。
+    /// 见 `equity.rs::dump_ochs_warmup_postflop_hist`。每个 sub_index = class_id
+    /// (0..169)，派生 ChaCha20Rng 后用于 sample 5-card river boards。新增 op_id
+    /// 仅影响 dump 工具与未来 postflop-warmup OCHS feature 路径，不与既有
+    /// BucketTable artifact 路径相交（build_bucket_table_bytes 仍用 OCHS_FEATURE_INNER
+    /// 走 1D-EHS warmup），故 schema_version 不 bump。
+    pub const POSTFLOP_WARMUP_BOARD_SAMPLE: u32 = 0x0008_0000;
 }
 
 // ============================================================================
