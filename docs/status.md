@@ -38,32 +38,51 @@
   betting tree 节点数已实测：`tools/nlhe_betting_tree_sizing` 输出 240,096 决策节点（18-bit node_id），
   与 `NodeId = u32` + `InfoSetId v2` 26-bit cap 一致。
 
-## 训练吞吐基线 + 已知 perf bug（2026-05-20 实测）
+## 训练吞吐基线 + 200M run 实测（2026-05-20/21 实测）
 
 ### 吞吐基线（AWS c7i 32 vCPU EPYC 7R13 / 61 GiB）
 
 `tools/train_cfr.rs` 在当前默认 200BB / 6-action / preflop 169 lossless / postflop 500-500-500 bucket
-配置下实测：
+配置下，**200M update 实测衰减曲线**（5M sliding window 瞬时 throughput）：
 
-| Threads | Throughput (steady) | Speedup |
+| Update 区间 | inst throughput | 备注 |
 |---|---|---|
-| 1 | 3,379 update/s | 1.0× |
-| 32 | 10,273 update/s | 3.04× |
+| 0–5M | 10,679/s | warm-up |
+| 5–10M | 11,084/s | **peak** |
+| 10–20M | ~9,000/s | table 长大 |
+| 20–50M | ~8,000/s | |
+| 50–100M | 7,312/s | |
+| 100–200M | **7,436/s** | 饱和稳态 |
 
-32 线程时 `%CPU = 703`（7 个核满载），scaling efficiency ≈ 22%。
+整段 avg = 7,569/s。**衰减来源**：主 HashMap 长大后 cache miss 增加 + per-delta merge 操作数线性涨。
+status 早期"32-thread steady 10,273/s"是 0-10M 窗口的数字，不是长 run 实测稳态。
+
+### 200M run 总结
+
+- compute (0 → 200M) = 26,066 s = **7.24 h**
+- 100M auto ckpt = 6.59 GiB / 写盘 ~164s
+- 200M final ckpt = 7.02 GiB / 写盘 358.7s
+- **total wall = 7.34 h**（AWS c7i.4xlarge × 32 thread）
+
+修订 wall 估算（按实测稳态 7,400/s）：
+
+| 目标 | compute | 加 ckpt overhead | 总 wall | AWS cost @ $0.71/h |
+|---|---|---|---|---|
+| 500M | 18.8 h | +0.4 h | ~19.2 h | ~$14 |
+| 1B | 37.5 h | +0.7 h | ~38 h | ~$27 |
 
 ### 瓶颈定位：`step_parallel` serial merge 是硬上限
 
 `src/training/trainer.rs:367-430` 的 fork-join 形态：N 个 rayon worker 并行跑 DFS，主线程
 **串行 merge N 个 `LocalRegretDelta` 回主 `RegretTable`**（`src/training/trainer.rs:420-427`）。
-两组实测数据反推：
+两组实测数据反推（早期窗口）：
 
 - `T_game`（每 trajectory 并行成本） ≈ 296 μs
-- `T_merge`（每 delta 串行合并成本） ≈ 88 μs
-- `throughput(N) = N / (T_game + N × T_merge)`，N → ∞ 时渐近 `1/T_merge ≈ 11,364/s`
+- `T_merge`（每 delta 串行合并成本） ≈ 88 μs（实测随 table 长大单调上涨）
+- `throughput(N) = N / (T_game + N × T_merge)`，N → ∞ 时渐近 `1/T_merge ≈ 11,364/s`（早期峰值，
+  长 run 实测因 cache miss / merge cost 增长降到 ~7,400/s）
 
-**含义：加更多线程 / 更大机器都没用**，throughput 被 serial merge 卡死在 ~11K/s。
-1B updates 在现状下 wall ≈ 28 h。
+**含义：加更多线程 / 更大机器都没用**，throughput 被 serial merge + 主表 cache miss 卡死。
 
 ### 已修：checkpoint 序列化排序键换成 `Ord::cmp`
 
@@ -106,14 +125,64 @@ HashMap lookup 比 Vec push 多花常数。
 
 要不要做、做到什么程度，单独决策（不在本 step 范围）。
 
+## 200M H3 报告（2026-05-21 实测）
+
+ckpt：`artifacts/run_200m/nlhe_es_mccfr_final_000200000000.ckpt`（7.02 GiB / strategy_blake3
+`ac87e9fcf5953cebb4658281bac8b0c89078b0bafca1c72df0baab9d3c51048a` / update_count 200,000,000）。
+
+### LBR proxy 曲线（核心信号）
+
+`tools/nlhe_h3_report --eval-hands-per-seat 1000 --lbr-probes 1000 --lbr-rollouts 16 --seed 0x42`：
+
+| 阶段 | LBR BR chips | SE | probes | strategy hash |
+|---|---:|---:|---:|---|
+| uniform-0 | 5,617.85 | 212.56 | 912 | `uniform-empty` |
+| 100M | **1,603.70** | 115.15 | 939 | `0d0d6b93...` |
+| 200M | **1,614.96** | 114.03 | 952 | `ac87e9fc...` |
+
+- uniform → 100M：**-71.5%**（CFR 在头 100M 学到大部分） 
+- 100M → 200M：+11 chips 在 SE=115 噪音内，**多训 100M 没产出**
+
+### Baseline EV（mbb/g，正值 = 训练侧赢）
+
+| Baseline opp | mbb/g | 95% CI |
+|---|---:|---|
+| random | +8,674 | [6,090, 11,258] |
+| equity-ev | +3,995 | [1,609, 6,381] |
+| call-station | +2,705 | [1,878, 3,531] |
+| overly-tight | +612 | [327, 896] |
+
+四档都正显著（95% CI 全不过 0）。
+
+### Preflop spot 检查（`tools/nlhe_preflop_strategy_dump`）
+
+SB at root 关键 hand：
+
+- AA：F=0 / C=0.097 / R500=0.337 / R1000=0.292 / R2000=0.273 / A=0（**不 AllIn**，premium 走 raise mix）
+- AKs：F=0 / C=0.044 / R500=0.480 / R1000=0.437 / R2000=0.035 / A=0.003
+- 72o：F=0.959 / C=0 / R500=0.037（96% fold trash，对）
+- 22：F=0.007 / C=0.621 / R500=0.198 / R1000=0.174（limp/raise mix）
+
+**没回归 100% AllIn**，preflop 形态符合 NLHE 直觉。
+
 ## 下一步唯一允许的工作
 
-### Step 3：跑 1B blueprint
+### Step 3 重新决策：1B blueprint 大概率边际，先升 abstraction
 
-- `tools/train_cfr.rs --updates 10⁹ --threads 32` on AWS c7i.4xlarge 同档机器
-- 训练前先 10⁷–10⁸ 短跑确认 LBR proxy 曲线下降、preflop 策略 spot 没回归到 100% AllIn
-- 训练完出 H4 baseline 填回上文"最近验证证据"：betting tree（已有 240,096）+ LBR 曲线 +
-  fixed-seed snapshot BLAKE3 + preflop spot 检查
+LBR proxy 在当前 500/500/500 bucket abstraction 下 **100M 已饱和**（100M → 200M 无显著下降）。
+继续训到 1B：
+- compute ≈ 38 h × $0.71 = ~$27
+- 预期 LBR 降 0–100 chips（CI 内）
+- 不会突破 abstraction 上限
+
+**优先做的两件事（顺序按 ROI）：**
+
+1. **by-street LBR slice**：用 `--target-street {preflop,flop,turn,river}` + `--probe-filter
+   has-average` 分街跑 LBR proxy，定位哪条街贡献了 1,600 chips 的剩余 BR（500 bucket 哪条街
+   质量最差）。决定 abstraction 升级时优先打哪里。
+2. **postflop bucket K 升级**：根据 by-street 结果决定。已知污染清单里 9 条 sqrt-scaled K=500
+   阈值断言 fail，bucket 质量本就不达标。候选：K=500 → K=2000（4× 训练数据 + 4× 内存 + 4×
+   ckpt 大小）；或换 EHS-aware feature。
 
 ### 不做（明确划界）
 
