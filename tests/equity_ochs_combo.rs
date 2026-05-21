@@ -83,16 +83,12 @@ fn equity_vs_hand_exact_river_showdown() {
 
 #[test]
 fn ochs_n_combo_aks_monotone_doc_example() {
-    // doc §2.2 例 1 设定：board = Ts9s8s（monotone）、hero = JdJc、opp class = AKs (90)。
-    // doc 例子里给的 "AsKs hero equity ~0.22 / AhKh ~0.55 / mean ~0.47" 是**估算且偏差大**
-    // ——actually 在 monotone flop 上 AsKs 已是 made nut flush（不是 draw），doc 分析文字
-    // 写的 "nut flush draw + 2 overs" 把 made flush 误写为 draw。实际 enumerate 990
-    // (turn, river) 得：
-    //   AsKs (made flush) → hero JJ equity ≈ 0.0293（只剩 ~3% 翻盘）
-    //   AhKh / AdKd / AcKc (无同花) → hero JJ equity ≈ 0.7869（JJ overpair vs AKo 优势）
-    //   mean ≈ 0.5974
-    // combo 路径 vs rep 路径差距比 doc 估的 0.25 更大（实际 ≈ 0.57），doc 主旨（combo
-    // 展开能纠正 rep 路径塌缩）依然成立，仅数值需修正。
+    // doc §2.2 例 1：board = Ts9s8s（monotone）、hero = JdJc、opp class = AKs (90)。
+    // 真实 enumerate 990 (turn, river)：
+    //   AsKs (made nut flush on monotone) → hero JJ equity 0.0293
+    //   AhKh / AdKd / AcKc (无 flush)     → hero JJ equity 0.7869
+    //   mean = 0.5974
+    // combo 路径 vs rep 路径 gap = 0.568，证明 combo 展开纠正 rep 塌缩。
     let hole = [c(Rank::Jack, Suit::Diamonds), c(Rank::Jack, Suit::Clubs)];
     let board = [
         c(Rank::Ten, Suit::Spades),

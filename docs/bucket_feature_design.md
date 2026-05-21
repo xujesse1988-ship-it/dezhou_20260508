@@ -252,29 +252,29 @@ fn equity_vs_hand(hero: [Card; 2], opp: [Card; 2], board: &[Card], eval: &dyn Ha
 
 数值方向约定：OCHS_N[k] = **hero** 在 opp 范围下的 equity（formal definition §2.2 + `equity_vs_hand` 实现 `me > op → 1.0`）。下表所有 equity 数值都是 **hero 视角**，不是 opp 视角。
 
-**例 1**：board = `Ts 9s 8s`（monotone flop），hero = `Jd Jc`，opp class = `AKs`（4 combos）：
+**例 1**：board = `Ts 9s 8s`（monotone flop），hero = `Jd Jc`，opp class = `AKs`（4 combos）。实测 enumerate 990 (turn, river) outcomes per combo（`tests/equity_ochs_combo.rs::ochs_n_combo_aks_monotone_doc_example`）：
 
 | opp_combo | hero equity vs opp_combo | 解读 |
 |---|---|---|
-| AsKs | ~0.22 | opp 有 nut flush draw + 2 overcards，hero 是 dog |
-| AhKh | ~0.55 | opp 只剩 2 overcards |
-| AdKd | ~0.55 | 同上 |
-| AcKc | ~0.55 | 同上 |
-| **mean** | **0.47** | 真实 "vs AKs class hero equity" |
+| AsKs | **0.0293** | board 三张同花 spades + opp 持 As/Ks → opp 已是 **made nut flush**（不是 draw），hero JJ 仅靠 set-then-fill 等 ~3% 路径翻盘 |
+| AhKh | **0.7869** | opp 持 0 spade，AhKh 在 monotone board 上无 flush 可能，仅 6 overcard outs；hero JJ overpair 大幅领先 |
+| AdKd | **0.7869** | 同 AhKh |
+| AcKc | **0.7869** | 同 AhKh |
+| **mean** | **0.5974** | 真实 "vs AKs class hero equity" |
 
-旧 rep 路径用 AsKs，OCHS_N[k] = 0.22；真实 mean = 0.47 → **低估 hero 0.25**，等价于 "严重高估 AKs 这类对手的威胁"。
+旧 rep 路径仅看 AsKs，OCHS_N[k] = 0.029；真实 mean = 0.597 → **低估 hero 0.568**，等价于"AsKs 这一个 combo 是 made flush 这种极端情况被当成整个 AKs class 的代表"——monotone board 上同 class 不同 combos 的 equity 是双峰分布（一个 ~0.03，其它三个 ~0.79），mean 跟 mode 完全脱节，rep 路径塌缩到任意一个 mode 都是错的。
 
-**例 2**：board = `Ts 9s 8s`（同上），hero = `As Ah`：
+**例 2**：board = `Ts 9s 8s`（同上），hero = `As Ah`。实测 enumerate 990 outcomes：
 
 | opp_combo of AKs class | 状态 | hero equity |
 |---|---|---|
 | AsKs | conflict（As 已被 hero 占）→ 跳过 | — |
 | AhKh | conflict（Ah 被 hero 占）→ 跳过 | — |
-| AdKd | hero overpair AA + nut flush draw（As blocker），opp Ax 顶 blocked | ~1.0 |
-| AcKc | 同上 | ~1.0 |
+| AdKd | hero overpair AA + nut flush blocker（As 在手），opp Ax top-pair blocked | **0.9793** |
+| AcKc | 同上 | **0.9793** |
 
 旧 rep 路径：rep = AsKs，与 hero 冲突 → **整 AKs class 在该 cluster 内被跳过** → cluster 信号塌缩到非 AKs 类成员，方差爆炸。
-新 combo 路径：剩 2 个有效 combos hero equity 平均 ≈ 1.0，正确反映 "vs AKs 我打爆"。
+新 combo 路径：剩 2 个有效 combos hero equity 平均 0.979，正确反映 "vs AKs class 我接近碾压"。
 
 #### 性能注解
 
@@ -812,12 +812,16 @@ offset 0x98: feature_river_blake3: [u8; 32]
 | river | 123,156,254 | — | 16 × ~11 × ~6 × 1 × 2 ≈ 2.1 k | ~2.1 k | ~2.6 × 10¹¹ |
 | 合计 | — | — | — | — | **~8.1 × 10¹²** |
 
-**Stage 1 wall**（@ ~50 ns/eval7，目标主机 = **AWS c6a.8xlarge** = 32 vCPU AMD EPYC Milan + 64 GB RAM）：
+**Stage 1 wall**（目标主机 = **AWS c6a.8xlarge** = 32 vCPU AMD EPYC Milan + 64 GB RAM）：
 
-- flop：5.3 × 10¹² / 32 / 50 ns ≈ 3300 s ≈ **~55 min**
-- turn：2.5 × 10¹² / 32 / 50 ns ≈ 1560 s ≈ **~26 min**
-- river：2.6 × 10¹¹ / 32 / 50 ns ≈ 163 s ≈ **~3 min**
-- 串行总 wall：**~84 min**；三街并发可降到 **~55 min**（flop bound）
+| 街 | wall | per-core eval7 实测 | 备注 |
+|---|---|---|---|
+| flop | ~55 min（估，无 AWS 实测） | — | 用户在独立机器上跑 |
+| turn | **44.76 min** | ~34 ns/eval | chunk_size=200_000 × 70 chunks，每 chunk ~38.5 s 稳态 |
+| river | **8.83 min** | ~65 ns/eval | 616 chunks 每 chunk ~745 ms；chunk 1 含 canonical_enum river lazy table build (~6 s) |
+| 串行（已含 flop 估） | **~108 min** | — | turn + river 实测 53.6 min，加 flop 估 55 min |
+
+per-call eval7 在 EPYC Milan 上从 turn 的 ~34 ns 到 river 的 ~65 ns 不等（cache 行为差异）；早期估算 50 ns 是中位假设。flop / turn 大头是 hist + OCHS combo expansion（avg ~6 valid combos/class 扣冲突后）；river 没有 hist 维度，全部成本在 OCHS_16 combo 上。
 
 **Stage 2（K-means）**，每 iter 成本（K=500，dim=16）：
 
