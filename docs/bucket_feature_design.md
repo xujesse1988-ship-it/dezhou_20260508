@@ -248,29 +248,31 @@ fn equity_vs_hand(hero: [Card; 2], opp: [Card; 2], board: &[Card], eval: &dyn Ha
 
 #### 为什么需要 combo 展开 —— suit 交互举例
 
+数值方向约定：OCHS_N[k] = **hero** 在 opp 范围下的 equity（formal definition §2.2 + `equity_vs_hand` 实现 `me > op → 1.0`）。下表所有 equity 数值都是 **hero 视角**，不是 opp 视角。
+
 **例 1**：board = `Ts 9s 8s`（monotone flop），hero = `Jd Jc`，opp class = `AKs`（4 combos）：
 
-| opp_combo | equity vs hero JdJc | 解读 |
+| opp_combo | hero equity vs opp_combo | 解读 |
 |---|---|---|
-| AsKs | ~0.78 | opp 有 nut flush draw + 2 overcards |
-| AhKh | ~0.45 | opp 只剩 2 overcards |
-| AdKd | ~0.45 | 同上 |
-| AcKc | ~0.45 | 同上 |
-| **mean** | **0.53** | 真实 "AKs class 平均强度" |
+| AsKs | ~0.22 | opp 有 nut flush draw + 2 overcards，hero 是 dog |
+| AhKh | ~0.55 | opp 只剩 2 overcards |
+| AdKd | ~0.55 | 同上 |
+| AcKc | ~0.55 | 同上 |
+| **mean** | **0.47** | 真实 "vs AKs class hero equity" |
 
-旧 rep 路径用 AsKs，OCHS_N[k] 多算 ~0.25，**严重高估** "AKs 这类对手的威胁"。
+旧 rep 路径用 AsKs，OCHS_N[k] = 0.22；真实 mean = 0.47 → **低估 hero 0.25**，等价于 "严重高估 AKs 这类对手的威胁"。
 
 **例 2**：board = `Ts 9s 8s`（同上），hero = `As Ah`：
 
-| opp_combo of AKs class | 状态 |
-|---|---|
-| AsKs | conflict（As 已被 hero 占）→ 跳过 |
-| AhKh | conflict（Ah 被 hero 占）→ 跳过 |
-| AdKd | ~0.0（hero 顶对 + nut flush draw blocker）|
-| AcKc | ~0.0（同上）|
+| opp_combo of AKs class | 状态 | hero equity |
+|---|---|---|
+| AsKs | conflict（As 已被 hero 占）→ 跳过 | — |
+| AhKh | conflict（Ah 被 hero 占）→ 跳过 | — |
+| AdKd | hero overpair AA + nut flush draw（As blocker），opp Ax 顶 blocked | ~1.0 |
+| AcKc | 同上 | ~1.0 |
 
 旧 rep 路径：rep = AsKs，与 hero 冲突 → **整 AKs class 在该 cluster 内被跳过** → cluster 信号塌缩到非 AKs 类成员，方差爆炸。
-新 combo 路径：剩 2 个有效 combos 平均 ≈ 0.0，正确反映 "vs AKs 我打爆"。
+新 combo 路径：剩 2 个有效 combos hero equity 平均 ≈ 1.0，正确反映 "vs AKs 我打爆"。
 
 #### 性能注解
 
@@ -494,7 +496,7 @@ pub fn dump_ochs_warmup_postflop_hist(
 }
 ```
 
-**关于距离度量的简化**：8-bin histogram 应该用 EMD（Wasserstein-1）距离反映 bin 间 ordinal 关系，但 EMD k-means 的 centroid update 在 1D fixed-bin 下与 L2 等价（per-bin 算术均值就是 1D Wasserstein barycenter）；assignment step 用 EMD vs L2 在 169 个点的小数据集上经验差异有限。当前实现走 L2 全路径，未来 stage 升级若发现 EMD 边际显著可换距离函数（cluster.rs::emd_1d_unit_interval 已实现）。
+**关于距离度量的简化**：8-bin histogram 概念上应该用 EMD（Wasserstein-1）距离反映 bin 间 ordinal 关系。但 EMD k-means 的 centroid update 在 fixed-bin 1D histogram 上**没有闭式解**（per-bin 算术均值 ≠ 1D Wasserstein barycenter，后者要 quantile averaging，是个常见误区）。当前实现走 **L2 全路径作为 baseline**，是 heuristic 选择，不是数学等价。后续 stage 若发现 169 个点上 EMD vs L2 cluster 划分显著不同，再实现完整 EMD assignment + 真 Wasserstein barycenter centroid update（`cluster.rs::emd_1d_unit_interval` 已实现 distance 函数，barycenter 需新增 + 新 DistanceMetric 分支）。
 
 #### Dump 工具用法
 
@@ -605,6 +607,8 @@ JSON 字段（postflop-hist 模式）：`mode / n_clusters / ochs_postflop_train
 
 river 全维 L2。
 
+**实现注意**：混合距离不是 `cluster.rs::kmeans_fit_production` 的小改 —— 现有实现是 L2 全路径（assignment + centroid update 都假设 Euclidean）。EMD assignment 要新 distance 函数；EMD centroid update 在 fixed-bin 1D histogram 上没有闭式解（per-bin 算术均值不是 Wasserstein barycenter）。落地需在 kmeans 内引入 `DistanceMetric { L2, MixedEmdL2 { hist_dims, alpha } }` 新分支，包含独立的 assignment 与 centroid update 实现。Stage 实施初期先走 L2 全路径出 baseline bucket table；EMD 分支作为后续 distance-metric ablation 加入，不阻塞 Stage 1。
+
 ## 4. 不包含的特征及原因
 
 - **EHS² scalar（当前 9 维方案的核心维度）**：equity_hist_8 的二阶矩 ∑ p_k · ((k+0.5)/8)² 严格包含 EHS² 信息，冗余。
@@ -687,7 +691,7 @@ rayon par_iter over canonical_id，按 chunk 收集后顺序写盘（保证 byte
 **文件格式**（per-street `features_<street>.bin`）：
 
 ```text
-=== header (64 bytes, 8-byte aligned) ===
+=== header (80 bytes, 16-byte aligned) ===
 offset 0x00: magic: [u8; 8] = b"PLBKFEAT"
 offset 0x08: schema_version: u32 LE = 1
 offset 0x0c: street: u32 LE       (0 = flop, 1 = turn, 2 = river)
@@ -703,10 +707,10 @@ offset 0x20: ochs_warmup_blake3: [u8; 32]
 offset 0x40: ochs_n_rivers: u32 LE        (warmup 时的 n_rivers 参数)
 offset 0x44: ochs_n_clusters: u32 LE      (warmup 时的 n_clusters 参数；
                                            flop/turn = 8，river = 16)
-offset 0x48: pad: [u8; 8] = 0
+offset 0x48: pad: [u8; 8] = 0             (使 header 对齐到 0x50 = 80 字节)
 
 === body (n_canonical × n_dims × 4 bytes, row-major f32 LE) ===
-sample i 的 16 维特征从 offset 64 + i × 64 起，连续 64 bytes。
+sample i 的 16 维特征从 offset 80 + i × 64 起，连续 64 bytes。
 sample 顺序与 canonical_enum::nth_canonical_form(street, i) 一致。
 
 === trailer (32 bytes) ===
@@ -752,8 +756,10 @@ let features: &[[f32; 16]] = mmap.body_as_rows();
 let kmeans_res = kmeans_fit_production(features, KMeansConfig::default(K),
                                         training_seed, init_op, split_op);
 
-// 2. 距离度量：flop/turn 走 mixed EMD+L2（§3），river 走 L2
-//    （kmeans_fit_production 当前 L2 全路径；mixed 路径见 §3 实现注解）
+// 2. 距离度量：Stage 1 实施先走 L2 baseline（全街）。
+//    mixed EMD+L2 (flop/turn) 需要新增 DistanceMetric 分支 + EMD centroid
+//    update（fixed-bin 1D histogram 上无闭式解，不是 per-bin 算术均值），
+//    列为后续 ablation 实验，不阻塞 Stage 1 出 bucket table。
 
 // 3. reorder by EHS median（centroid hist 中心质量 / OCHS mean）
 let (centroids, assignments) = reorder_by_ehs_median(...);
@@ -811,7 +817,7 @@ offset 0x98: feature_river_blake3: [u8; 32]
 
 - **byte-equal**：Stage 1 输出文件给定 (canonical_enum, OCHS warmup, evaluator) 跨架构 byte-equal（与 stage 1 cross_arch baseline 同型）。Stage 2 输出 bucket table 给定 (feature file BLAKE3, training_seed, K) 也跨架构 byte-equal。
 - **hero rank 复用**：hist / OCHS 内 990 opp_hole enumerate 共享 hero eval7 结果（§E hot path 模式），实测 ~2× speedup
-- **OCHS combo 展开在 rainbow non-paired board 自动塌缩**：判断 board suit shape，若 rainbow 且无 pair → 同 class 内 combos 等价 → 只计算 1 个；典型 ~40% board 触发，平均 cost ~4× 而非 6×
+- **不做 "rainbow non-paired board combo 塌缩" 优化**：rainbow board 上每种花色出现 1 次，suited opp combos 各自有 backdoor flush draw；叠加 hero 手牌 suit blocker 后，同 class 内 combos 在 equity 上仍有差异，不严格等价。要做塌缩需严格 suit-orbit 分组（按 hero suit / board suit composition 等价类）。当前 stage 以 full combo enumerate 为正确性 baseline，优化留待 suit-orbit 实现
 - **`combos_for_class` static precompute**：进程启动时算一次 `[Vec<[Card; 2]>; 169]` 表，每次 OCHS call O(1) 查表
 - **Stage 1 续跑**：feature file 按 chunk_size = 200_000 canonical 分段写入临时文件 `features_<street>.bin.part<chunk_idx>`；全部完成后 concat + 写 header / trailer。中断时 enum 已存在的 part，从 next missing chunk 继续
 - **Stage 2 mmap**：feature file 用 `memmap2` 只读 mmap，进程内存峰值 = K × dim × f64 (centroids) + chunk × dim × f64 (accumulator)（~MB 级，与 N 解耦）。注：项目 D-275 `unsafe_code = "forbid"`，mmap 需走 `std::fs::read` 整段加载 → river 7.88 GB 内存。如内存预算紧张，Stage 2 改为 chunk-based 顺序读（Vec<u8> + 流式解析），代价是无法 mmap 跨进程共享
@@ -844,7 +850,18 @@ centroid 量化：u8 per-dim min/max（与 bucket_table.rs 既有 centroid_metad
 BLAKE3 trailer（与既有同型，路径无关）。
 ```
 
-header / centroid_metadata / centroid_data / lookup_table / trailer 字段布局沿用 `bucket_table.rs` D-244 既有 5 段结构（无新增 mode / n_rivers 字段，因为只有一种实现路径）。同一份 `bucket_table.rs` 头注释会更新到新 feature 语义；旧 schema 注释整体替换。
+5 段结构（header / centroid_metadata / centroid_data / lookup_table / trailer）沿用 `bucket_table.rs` D-244 物理布局，但**字段语义不同 → 必须显式 bump `feature_set_id`**。
+
+旧 artifact：`schema_version=1, feature_set_id=1` = EHS² + OCHS_8 = 9 dim。
+新 artifact：`schema_version=1, feature_set_id=2` = hist_8 + OCHS_8 / OCHS_16 = 16 dim。
+
+reader 加载时按 `feature_set_id` 分派：
+
+- `feature_set_id=1`：旧 9 维 schema —— 新代码不再支持，reader 直接拒绝（错误 `UnsupportedFeatureSet`，提示用户重新训练）。
+- `feature_set_id=2`：新 16 维 schema —— 走本文档定义的解析路径。
+- 其他值：reader 拒绝加载。
+
+`bucket_table.rs` 头注释会同步更新到新 feature 语义；旧 schema 注释整体替换。`BUCKET_TABLE_DEFAULT_FEATURE_SET_ID` 常量从 1 改为 2。
 
 新增 BLAKE3 hash chain 字段（追加在原 header 末尾）：
 
@@ -854,13 +871,18 @@ offset 0x78: feature_turn_blake3:  [u8; 32]
 offset 0x98: feature_river_blake3: [u8; 32]
 ```
 
-让 bucket_table → features_<street>.bin → ochs_warmup_postflop_<N>_n<R>.json → ground truth 形成可验证链。CI / reader 校验：
+让 bucket_table → features_<street>.bin → ochs_warmup_postflop_<N>_n<R>.json → ground truth 形成可验证链。
 
-```
-1. bucket_table 自身 BLAKE3 trailer 匹配 → 文件未损坏
-2. bucket_table 内 feature_<street>_blake3 字段匹配 features_<street>.bin 实际 BLAKE3
-3. features_<street>.bin 内 ochs_warmup_blake3 字段匹配 ochs_warmup artifact 实际 BLAKE3
-4. ochs_warmup artifact 跨架构 byte-equal（§2.4 已验证）
-```
+**校验责任划分**（runtime vs 离线工具）：
 
-任一断链 → reader 拒绝加载。
+| 步骤 | 校验内容 | runtime `BucketTable::open` | 离线工具 `tools/bucket_validate_chain` |
+|---|---|---|---|
+| 1 | bucket_table 自身 BLAKE3 trailer 匹配（文件未损坏）+ magic + schema_version + feature_set_id | **必查** | 查 |
+| 2 | bucket_table 内 feature_<street>_blake3 == features_<street>.bin 实际 BLAKE3 | 不查 | 查 |
+| 3 | features_<street>.bin 内 ochs_warmup_blake3 == ochs_warmup artifact 实际 BLAKE3 | 不查 | 查 |
+| 4 | ochs_warmup artifact 跨架构 byte-equal（§2.4） | 不查 | 查（dump 工具 byte-equal regression） |
+
+理由：runtime 部署通常只携带 bucket_table.bin 一个文件（features_*.bin 共 ~8.84 GB、ochs_warmup_*.json 不会随部署分发），无法在线做步骤 2-4。runtime 只查文件自身完整性 + schema 兼容；hash chain 完整性由训练机 / CI 上的离线工具承担。
+
+- runtime 步骤 1 任一失败 → `BucketTable::open` 返回错误，进程拒绝加载。
+- 离线工具步骤 2-4 任一失败 → 工具返回非 0，CI 失败，artifact 不进 git。
