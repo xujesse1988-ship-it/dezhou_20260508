@@ -88,25 +88,26 @@ EVR / ARI 数学公式：
 | `tools/bucket_table_seed_compare.py` | 多 artifact ARI + bucket size 对比 (需 numpy) |
 | `tests/bucket_quality.rs` | 4 类 gate (19 test, 1 ignored 1M smoke) |
 
-## 7. AWS 状态 (54.89.149.215, c6a.8xlarge)
+## 7. artifact 位置
+
+**3 个 v3 artifact 在 vultr 作为 stage 3 source-of-truth**（AWS 已 terminate）：
 
 ```
-~/dezhou_20260508/             think @ ae2c394
-~/dezhou_20260508/artifacts/
-  features_flop.bin             82 MB
-  features_turn.bin            893 MB
-  features_river.bin          7.88 GB
-  bucket_table_..._cafebabe.bin   553 MB
-  bucket_table_..._deadbeef.bin   553 MB
-  bucket_table_..._b16b00b5.bin   553 MB
-  (+ 同名 .b3sum 各 126 B)
-/tmp/bucket_fit_{cafebabe,deadbeef,b16b00b5}.log    训练 per-iter 日志
-/tmp/run_2seeds.master.log                          deadbeef+b16b00b5 串行 wrapper 日志
-/tmp/seed_compare.md                                3-way ARI 输出
-python3-numpy 2.3.5 (apt 装)
+shaopeng@64.176.35.138:~/dezhou_20260508/artifacts/
+  bucket_table_..._cafebabe_schemav3.bin   553 MB  + .b3sum
+  bucket_table_..._deadbeef_schemav3.bin   553 MB  + .b3sum
+  bucket_table_..._b16b00b5_schemav3.bin   553 MB  + .b3sum
 ```
 
-ssh: `ssh -i ~/vultr_48.pem ubuntu@54.89.149.215`
+BLAKE3 trailer 与 .b3sum 文件一致校验过。
+
+**stage 1 features_*.bin (8.85 GB) 已随 AWS terminate 一起销毁**。stage 3 CFR 不需要 features，只用 `BucketTable::lookup`。
+
+如以后要新 seed artifact 重训：
+1. 起新 c6a.8xlarge 或同档机（≥ 8 vCPU / 64 GB RAM）
+2. `tools/bucket_features_dump` 重生 features_*.bin
+3. `tools/bucket_kmeans_fit --training-seed 0xXXXX` (~60-75 min)
+artifact byte-equal 取决于 (features bytes, seed, code commit)。
 
 ## 8. 5bac263 之前的 12345678 artifact
 
