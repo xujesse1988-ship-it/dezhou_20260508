@@ -82,12 +82,18 @@ from typing import Optional
 
 
 MAGIC = b"PLBKT\x00\x00\x00"
-SCHEMA_VERSION = 1
-FEATURE_SET_ID = 1
-N_DIMS = 9
-HEADER_LEN = 80
+SCHEMA_VERSION = 3
+FEATURE_SET_ID = 2
+N_DIMS = 16
+HEADER_LEN = 0xB8  # 184 bytes (v3: 80 + 8 pad + 3 × 32 feature_blake3)
 TRAILER_LEN = 32
 PREFLOP_LOOKUP_LEN = 1326
+
+# v3 新增 header 偏移
+HDR_OFF_PAD_0X50 = 0x50  # 8-byte pad before feature blake3 chain
+HDR_OFF_FEATURE_FLOP_BLAKE3 = 0x58
+HDR_OFF_FEATURE_TURN_BLAKE3 = 0x78
+HDR_OFF_FEATURE_RIVER_BLAKE3 = 0x98
 
 
 class BucketTableReaderError(Exception):
@@ -147,6 +153,21 @@ def parse(buf: bytes) -> dict:
     centroid_metadata_offset = _u64_le(buf, 0x38)
     centroid_data_offset = _u64_le(buf, 0x40)
     lookup_table_offset = _u64_le(buf, 0x48)
+    # v3 pad 0x50..0x58 必须为 0
+    for off in range(HDR_OFF_PAD_0X50, HDR_OFF_FEATURE_FLOP_BLAKE3):
+        if buf[off] != 0:
+            raise BucketTableReaderError(
+                f"header pad bytes (0x50..0x58) must be zero (offset 0x{off:02x} = 0x{buf[off]:02x})"
+            )
+    feature_flop_blake3 = bytes(
+        buf[HDR_OFF_FEATURE_FLOP_BLAKE3 : HDR_OFF_FEATURE_FLOP_BLAKE3 + 32]
+    )
+    feature_turn_blake3 = bytes(
+        buf[HDR_OFF_FEATURE_TURN_BLAKE3 : HDR_OFF_FEATURE_TURN_BLAKE3 + 32]
+    )
+    feature_river_blake3 = bytes(
+        buf[HDR_OFF_FEATURE_RIVER_BLAKE3 : HDR_OFF_FEATURE_RIVER_BLAKE3 + 32]
+    )
 
     body_start = HEADER_LEN
     body_end = n - TRAILER_LEN
@@ -344,6 +365,23 @@ def summary_dict(parsed: dict) -> dict:
     """summary 视图：去掉大体积内部字段。"""
     out = {k: v for k, v in parsed.items() if not k.startswith("_")}
     return out
+
+
+def lookup_array(parsed: dict, street: str):
+    """返回 street 的完整 lookup_table 为 numpy uint32 数组（O(n) 解码）。
+
+    river 123M × 4 bytes = ~492 MB 内存。preflop/flop/turn 远小。
+    """
+    if street not in ("preflop", "flop", "turn", "river"):
+        raise ValueError(f"unknown street: {street}")
+    try:
+        import numpy as np
+    except ImportError as e:
+        raise RuntimeError("lookup_array requires numpy (pip install numpy)") from e
+    buf = parsed["_buf"]
+    seg_off = parsed["lookup_table_offsets"][street]
+    n = parsed["lookup_table_lengths"][street]
+    return np.frombuffer(buf, dtype=np.uint32, count=n, offset=seg_off)
 
 
 def main() -> int:
