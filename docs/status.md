@@ -29,13 +29,18 @@
   `artifacts/leduc_es_mccfr_100m_full_history.txt` 输出 `ev_p0=-0.086036478`、
   `exploitability_chips_per_game=0.147556546`、
   `average_strategy_blake3=c0b8bcfa6db843b410f515b8526f08de19f573c88fb4eaf20afe431dba98385c`。
-- bucket_table 已切换 schema **v3 / feature_set_id 2 / 16 维 hist + OCHS**（参
-  `docs/bucket_feature_design.md` §6.3 + §7）。旧 9 维 EHS² + OCHS_8 artifact
-  (`bucket_table_default_500_500_500_seed_cafebabe_v3.bin` body BLAKE3
-  `67ee5554...`) **不再可加载**（reader 拒 (schema, feature_set_id) ≠ (3, 2)）。
-  200M 旧 ckpt 的 strategy 仍可读取，但任何重新依赖 bucket_table 输入的训练
-  必须先走 Stage 1 (bucket_features_dump) + Stage 2 (bucket_kmeans_fit) 重新
-  生成 schema v3 artifact。
+- bucket_table v3 stage 2 训练完成，3 个 production artifact 在 vultr
+  `~/dezhou_20260508/artifacts/`：seed `cafebabe` / `deadbeef` / `b16b00b5`，
+  各 553 MB，BLAKE3 详见下方"bucket table 工件"节。EVR 0.9709–0.9712，
+  cross-seed ARI 0.65–0.75（partition seed-dependent，quality seed-independent；
+  详 `docs/temp/bucket_v3_stage2_state_2026_05_22.md`）。
+  **Stage 3 CFR canonical 输入 = `bucket_table_default_500_500_500_seed_cafebabe_schemav3.bin`**
+  （BLAKE3 `1c22c1ee32fdd557db2c2fefaeb8a5c287dfd165d648fa6c2488d76a226575a0`）。
+  `tests/bucket_quality.rs` 4 类 gate × 3 seed 全过（empty / std dev P90 /
+  EMD extreme+density / group monotonic）。
+- 旧 9 维 EHS² + OCHS_8 v2 artifact (`bucket_table_default_500_500_500_seed_cafebabe_v3.bin`
+  body BLAKE3 `67ee5554...`) **不再可加载**（reader 拒 (schema, feature_set_id) ≠ (3, 2)）；
+  200M 旧 ckpt 的 strategy 仍可读取，但任何重新依赖 bucket_table 输入的训练必须用上述 v3 artifact。
 - `tests/nlhe_infoset_history_collision.rs`：SB-aggressor vs BB-aggressor 两条 preflop 线推进到 flop
   同一决策点，InfoSetId 不同（按 node_id 区分）。
 - 200BB + 6-action 默认切换后简化 NLHE 训练数据待 H4 重跑：LBR proxy 曲线、preflop 策略 spot 检查、
@@ -215,7 +220,6 @@ SB at root 关键 hand：
 - **Parallel merge by hash shard / lock-free atomic 累加**：触碰跨线程 f64 顺序，
   Leduc 外部对照 + 跨 host BLAKE3 测试都要重做，ROI 不够（除非 H4 后还要反复训练大量轮次）
 - Slumbot HTTP H2H 接入（H4 验收门槛但"不阻塞 first usable"）
-- 500/500/500 postflop bucket 质量提升（stage 2 范围）
 
 ### 硬件备忘
 
@@ -265,36 +269,28 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test
 
 ## bucket table 工件
 
-- `artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav3.bin`
-  目标产物（schema v3 / feature_set_id 2 / 16 维 hist + OCHS）。
-  Stage 1 = `tools/bucket_features_dump` → `features_<street>.bin`（参 §6.4 wall 估算）；
-  Stage 2 = `tools/bucket_kmeans_fit` 读 features → kmeans → reorder → 量化 → 写 artifact。
-  待 AWS c6a.8xlarge 一次性跑出，不进 git；旁路 `.b3sum` 文件作 anchor。
+Stage 2 训练已完成。3 个 production v3 artifact 在 vultr
+`~/dezhou_20260508/artifacts/`（不进 git，旁路 `.b3sum` 文件作 anchor）：
 
-- 旧 v2 schema artifact `bucket_table_default_500_500_500_seed_cafebabe_v3.bin`
-  (body BLAKE3 `67ee5554…98650cd`) 仍在 vultr / 历史目录，但**新代码 reader 拒绝
-  加载**（schema_version=2 / feature_set_id=1 与 v3 不兼容）。
+| seed | filename | BLAKE3 | EVR |
+|---|---|---|---|
+| **cafebabe (canonical)** | `bucket_table_default_500_500_500_seed_cafebabe_schemav3.bin` | `1c22c1ee32fdd557db2c2fefaeb8a5c287dfd165d648fa6c2488d76a226575a0` | **0.9712** |
+| deadbeef | `bucket_table_default_500_500_500_seed_deadbeef_schemav3.bin` | `1a7f39882ddee8012a06420afc788bd6ad5ca03b593f187e5330b34004a630be` | 0.9711 |
+| b16b00b5 | `bucket_table_default_500_500_500_seed_b16b00b5_schemav3.bin` | `9c47f4fdbe7ce4dd6388d7d980e6a115212a36a586ff1e528d9bd588f7cb9311` | 0.9709 |
 
-- 测试 fixture：`BucketTable::synthetic_v3_for_tests(config, seed)` deterministic
-  byte-equal（不调 kmeans），秒级完成；用于 bucket_table_corruption /
-  bucket_table_schema_compat / clustering_determinism 全部测试。
+**Stage 3 CFR 输入钉死 `cafebabe`**（EVR 最高 + 表首约定）；`deadbeef` / `b16b00b5`
+留作 seed robustness 对照实验，stage 3 不消费。3 seed cross-ARI 0.65–0.75，
+EVR 差 < 0.04% → partition seed-dependent + quality seed-independent，CFR 不关心
+cluster id 命名；3 seed 等价依据见 `docs/temp/bucket_v3_stage2_state_2026_05_22.md`。
 
-## 已知污染清单
+Stage 1 features file (`features_<street>.bin`，合计 8.85 GB) 已随 AWS 训练机
+terminate 销毁；stage 3 CFR 只用 `BucketTable::lookup`，不需要 features。如要新 seed
+重训，按 `docs/bucket_feature_design.md` §6.2 / §6.3 起 ≥ 8 vCPU / 64 GB 主机
+重跑 stage 1+2（~60–75 min）。
 
-- `tests/bucket_quality.rs` 9 条 sqrt-scaled K=500 阈值断言 fail（v3 bucket_table 抽象质量
-  问题，schema v3 切换后**未消解**——同一组 K=500 阈值仍超）：
-  - `adjacent_bucket_emd_above_threshold_{flop,turn,river}`：相邻 bucket EMD 实测 0.003 / 0.008 / 0.009，
-    落到阈值 0.00894 以下（约 1.0–3.0× 偏差）。
-  - `bucket_internal_ehs_std_dev_below_threshold_{flop,turn,river}`：bucket 内 EHS std dev 实测
-    0.034 / 0.049 / 0.058，越上限 0.02236（约 1.5–2.6× 偏差）。
-  - `bucket_id_ehs_median_monotonic_{flop,turn,river}`：bucket id 序与 EHS 中位数不单调，diff 实测
-    0.010 / 0.017 / 0.011，超 MC-aware tol（约 1.2–1.7× 偏差）。
-  - 这些断言依赖于真实 bucket_table artifact（不在 git 内）；当 artifact 不存在时
-    `cached_trained_table()` 回退到 `synthetic_v3_for_tests` fixture，阈值大概率
-    都 fail（synthetic 是 Knuth hash 而非 real kmeans）；这是已知行为，详见
-    `tests/bucket_quality.rs::cached_trained_table` 注释。
-  - 根因：500/500/500 bucket 抽象质量需要 Stage 2 跑过 AWS 生产路径才能正式评估。
-    schema v3 引入 16 维 hist + OCHS feature 后阈值是否仍超有待 AWS 实测确认。
+测试 fixture：`BucketTable::synthetic_v3_for_tests(config, seed)` deterministic
+byte-equal（不调 kmeans），秒级完成；用于 bucket_table_corruption /
+bucket_table_schema_compat / clustering_determinism 全部测试。
 
 
 ## 文档维护规则
