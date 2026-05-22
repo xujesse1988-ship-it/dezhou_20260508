@@ -186,9 +186,12 @@ pub struct KMeansConfig {
 
 impl KMeansConfig {
     pub const fn default_d232(k: u32) -> KMeansConfig {
+        // 2026-05-22 bump: max_iter 100 → 500。stage 2 实测 K=500 / N=123M river
+        // 在 100 iter 内 shift_inf 卡在 1e-2 量级（震荡），未真正收敛到 tol=1e-4。
+        // 500 iter 上限给真正收敛留空间；正常情况下早期 break by tol。
         KMeansConfig {
             k,
-            max_iter: 100,
+            max_iter: 500,
             centroid_shift_tol: 1e-4,
         }
     }
@@ -533,12 +536,32 @@ pub fn kmeans_fit_production(
     let dim = features.first().map(|v| v.len()).unwrap_or(0);
     assert!(dim > 0, "kmeans_fit_production: feature vectors empty");
 
-    // 1. k-means++ 初始化（pp_init 用 first min(N, 2M) features 子集复用既有路径）。
+    // 1. k-means++ 初始化（deterministic stride sample over full N，避免 N=123M
+    //    river 前 2M 段 canonical_id 偏置）。stride 抽样 sample[i] = features[i * N / cap]，
+    //    确定性 + 跨架构 byte-equal（与全程 byte-equal 不变量同型）。
     let pp_init_cap = n.min(KMEANS_N_MAX);
-    let mut centroids = kmeans_pp_init(&features[..pp_init_cap], k, master_seed, op_id_init);
+    let pp_init_sample: Vec<Vec<f64>> = if n <= pp_init_cap {
+        features.to_vec()
+    } else {
+        eprintln!(
+            "[kmeans_fit_production] pp_init stride sample n_full={n} sample_n={pp_init_cap} stride={:.2}",
+            (n as f64) / (pp_init_cap as f64)
+        );
+        (0..pp_init_cap)
+            .into_par_iter()
+            .map(|i| {
+                let idx = ((i as u64) * (n as u64) / (pp_init_cap as u64)) as usize;
+                features[idx].clone()
+            })
+            .collect()
+    };
+    let mut centroids = kmeans_pp_init(&pp_init_sample, k, master_seed, op_id_init);
+    drop(pp_init_sample);
 
     // 2. k-means 主迭代。
     let mut assignments: Vec<u32> = vec![0u32; n];
+    let mut prev_assignments: Option<Vec<u32>> = None;
+    let mut prev_inertia: Option<f64> = None;
     let mut split_sub_index: u32 = 0;
     eprintln!(
         "[kmeans_fit_production] start n={n} k={k} dim={dim} max_iter={} tol={:.1e} op_init=0x{:08x}",
@@ -546,8 +569,8 @@ pub fn kmeans_fit_production(
     );
     for iter_idx in 0..cfg.max_iter {
         let t_iter = std::time::Instant::now();
-        // 2a. assignment（par_iter；each sample 独立分配）。
-        assignments = features
+        // 2a. assignment + inertia（par_iter；each sample 独立分配并返回 best_d2）。
+        let assignment_results: Vec<(u32, f64)> = features
             .par_iter()
             .map(|sample| {
                 let mut best_c: u32 = 0;
@@ -559,9 +582,26 @@ pub fn kmeans_fit_production(
                         best_c = c as u32;
                     }
                 }
-                best_c
+                (best_c, best_d2)
             })
             .collect();
+        assignments = assignment_results.iter().map(|(c, _)| *c).collect();
+        let inertia: f64 = assignment_results.iter().map(|(_, d2)| *d2).sum();
+        drop(assignment_results);
+
+        // assignment_changed: 与上一 iter 对比；首次 iter 视为全部变更（n）。
+        let assignment_changed: usize = match &prev_assignments {
+            Some(prev) => prev
+                .iter()
+                .zip(assignments.iter())
+                .filter(|(a, b)| a != b)
+                .count(),
+            None => n,
+        };
+        let inertia_rel_delta: f64 = match prev_inertia {
+            Some(p) if p > 0.0 => (p - inertia).abs() / p,
+            _ => f64::INFINITY,
+        };
 
         // 2b. centroid 更新（chunked 确定性 reduction）。
         let chunk_size = KMEANS_PRODUCTION_CHUNK_SIZE;
@@ -593,6 +633,26 @@ pub fn kmeans_fit_production(
                 }
             }
         }
+        // 2b'. bucket size 统计（split 前；reflect 当前 assignment 真实分布）。
+        let mut empty_count: u32 = 0;
+        let mut counts_max: u64 = 0;
+        let mut counts_min_ne: u64 = u64::MAX;
+        for c in 0..k {
+            if counts[c] == 0 {
+                empty_count += 1;
+            } else {
+                if counts[c] > counts_max {
+                    counts_max = counts[c];
+                }
+                if counts[c] < counts_min_ne {
+                    counts_min_ne = counts[c];
+                }
+            }
+        }
+        if counts_min_ne == u64::MAX {
+            counts_min_ne = 0;
+        }
+
         for c in 0..k {
             if counts[c] > 0 {
                 let inv = 1.0 / counts[c] as f64;
@@ -625,8 +685,13 @@ pub fn kmeans_fit_production(
             }
         }
         centroids = new_centroids;
+        let changed_pct = 100.0 * (assignment_changed as f64) / (n as f64);
         eprintln!(
-            "[kmeans_fit_production] iter={iter_idx} shift_inf={shift_inf:.6e} wall={:?} (tol={:.1e})",
+            "[kmeans_fit_production] iter={iter_idx} shift_inf={shift_inf:.6e} \
+             inertia={inertia:.6e} inertia_rel_delta={inertia_rel_delta:.3e} \
+             delta_assign={assignment_changed} ({changed_pct:.4}%) \
+             empty={empty_count} bucket_size_min_ne={counts_min_ne} max={counts_max} \
+             wall={:?} (tol={:.1e})",
             t_iter.elapsed(),
             cfg.centroid_shift_tol,
         );
@@ -637,6 +702,8 @@ pub fn kmeans_fit_production(
             );
             break;
         }
+        prev_assignments = Some(std::mem::take(&mut assignments));
+        prev_inertia = Some(inertia);
     }
 
     // 3. 最终 assignment（centroid 已更新，重算一次保证一致；par_iter）。
