@@ -3,7 +3,7 @@
 //! 简化 NLHE 范围：2-player + 200 BB starting stack + 盲注 0.5/1.0 BB +
 //! 完整 4 街 + stage 2 `DefaultActionAbstraction`（6-action：{0.5p, 1p, 2p} +
 //! Fold/Check/Call/AllIn）+ stage 2 `PreflopLossless169` +
-//! `PostflopBucketAbstraction`（500/500/500 bucket）。
+//! `PostflopBucketAbstraction`（artifact-provided per-street bucket counts）。
 //! 复用 stage 1 [`crate::GameState`] + stage 2 [`crate::ActionAbstraction`] /
 //! [`crate::InfoAbstraction`] / [`crate::BucketTable`]，仅在 `SimplifiedNlheGame`
 //! 适配层把 stage 1 `GameState` 包装成 [`Game`] trait state。
@@ -21,16 +21,14 @@
 //! stage 1 `validate_config` 范围扩展为 `2..=9`；本模块构造 `TableConfig`
 //! 时显式 `n_seats=2`。
 //!
-//! **D-314-rev1 lock**（2026-05-13 stage 3 decisions §10.1）：bucket table 依赖
-//! = §G-batch1 §3.10 production v3 artifact `artifacts/bucket_table_default_500_
-//! 500_500_seed_cafebabe_v3.bin`（schema_version=2 / body BLAKE3 `67ee5554...`）。
-//! `SimplifiedNlheGame::new` 校验 `schema_version() == 2`（v1 95 KB fallback
-//! D-314-rev2 已废弃，构造时拒绝）+ `config() == BucketConfig::new(500, 500, 500)`。
+//! **D-314-rev3 lock**（2026-05-23 stage 3）：bucket table 依赖当前 v3 schema
+//! artifact。`SimplifiedNlheGame::new` 校验 `schema_version() == 3`，bucket counts
+//! 由 artifact 配置提供（例如 500/500/500 或 1000/1000/1000）。
 
 use std::sync::Arc;
 
 use crate::abstraction::action::{AbstractAction, ActionAbstraction, DefaultActionAbstraction};
-use crate::abstraction::bucket_table::{BucketConfig, BucketTable};
+use crate::abstraction::bucket_table::{BucketTable, BUCKET_TABLE_SCHEMA_VERSION};
 use crate::abstraction::info::{InfoSetId, StreetTag};
 use crate::abstraction::map::pack_info_set_id;
 use crate::abstraction::postflop::canonical_observation_id;
@@ -53,20 +51,12 @@ pub type SimplifiedNlheAction = AbstractAction;
 ///
 /// 直接走 stage 2 64-bit `InfoSetId`（D-215 layout）。preflop 走
 /// `PreflopLossless169` hand_class 169 等价类；postflop 走 stage 2 `BucketTable`
-/// lookup（D-314-rev1 v3 artifact 500/500/500 bucket）。
+/// lookup（当前 v3 artifact 的 per-street bucket ids）。
 pub type SimplifiedNlheInfoSet = InfoSetId;
 
-/// 简化 NLHE expected `BucketConfig`（D-313）：preflop 169 lossless（不走 bucket
-/// table）+ flop/turn/river 各 500 bucket（§G-batch1 §3.10 v3 production lock）。
-fn expected_bucket_config() -> BucketConfig {
-    // BucketConfig::new 失败仅当任意 street bucket count 越界 [10, 10_000]
-    // （D-214）；500/500/500 严格在范围内，构造永远成功。
-    BucketConfig::new(500, 500, 500).expect("BucketConfig::new(500,500,500) within D-214 range")
-}
-
-/// 简化 NLHE expected `BucketTable` schema_version（D-314-rev1）。v1 95 KB
-/// fallback (D-314-rev2) 已废弃；C2 [实现] 拒绝 schema_version=1 输入。
-const EXPECTED_BUCKET_SCHEMA_VERSION: u32 = 2;
+/// 简化 NLHE expected `BucketTable` schema_version。legacy schema v1/v2 artifact
+/// 已退出 train_cfr 路径；当前 stage 2 产物写入 v3 schema。
+const EXPECTED_BUCKET_SCHEMA_VERSION: u32 = BUCKET_TABLE_SCHEMA_VERSION;
 
 /// 简化 NLHE `InfoSetId` v2 layout：把 26-bit node_id 写入 `InfoSetId` raw 高位
 /// （bits 38..64）。低 38 bit 复用 stage-2 [`pack_info_set_id`] 字段位置以保留
@@ -111,31 +101,18 @@ pub struct SimplifiedNlheGame {
 impl SimplifiedNlheGame {
     /// 构造函数（API-303）。
     ///
-    /// 校验项（D-314-rev1）：
-    /// - `BucketTable::schema_version()` == `2`（v1 fallback 已废弃）
-    /// - `BucketTable::config()` == `BucketConfig::new(500, 500, 500)`
+    /// 校验项（D-314-rev3）：
+    /// - `BucketTable::schema_version()` == 当前 v3 schema
+    /// - bucket counts 使用 artifact 自带配置（`BucketConfig` reader 已校验范围）
     ///
     /// 失败路径：[`TrainerError::UnsupportedBucketTable`]。`expected` 字段
-    /// 编码 `schema_version`；`got` 字段编码实际 schema_version（schema 不匹配）
-    /// 或返回 `0`（config 不匹配，无另外 variant 表达）。
+    /// 编码 `schema_version`；`got` 字段编码实际 schema_version。
     pub fn new(bucket_table: Arc<BucketTable>) -> Result<Self, TrainerError> {
         let schema = bucket_table.schema_version();
         if schema != EXPECTED_BUCKET_SCHEMA_VERSION {
             return Err(TrainerError::UnsupportedBucketTable {
                 expected: EXPECTED_BUCKET_SCHEMA_VERSION,
                 got: schema,
-            });
-        }
-        let cfg = bucket_table.config();
-        let expected = expected_bucket_config();
-        if cfg.flop != expected.flop || cfg.turn != expected.turn || cfg.river != expected.river {
-            // 复用 UnsupportedBucketTable variant 表达 config 不匹配（schema 路径
-            // 也走该 variant；`got = 0` 让区分通过日志上下文判断）。stage 3
-            // F1 / F2 [测试 / 实现] 评估是否引入新 variant
-            // `TrainerError::UnsupportedBucketConfig { expected, got }`。
-            return Err(TrainerError::UnsupportedBucketTable {
-                expected: EXPECTED_BUCKET_SCHEMA_VERSION,
-                got: 0,
             });
         }
         let config = TableConfig::default_hu_200bb();
