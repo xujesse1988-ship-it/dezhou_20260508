@@ -78,11 +78,12 @@ harness = false
 name = "stage3"
 harness = false
 
-# C2：bucket table 训练 CLI（API §5）。从 RngSource seed → equity Monte Carlo →
-# k-means clustering → 写出 mmap artifact。`tools/train_bucket_table.rs` 入口。
+# bucket table v3 训练 CLI：读取 Stage 1 features_<street>.bin → kmeans → v3
+# artifact（schema 3 / feature_set_id 2 / 16 维 hist + OCHS）。
+# 参 `docs/bucket_feature_design.md` §6.3 Stage 2。
 [[bin]]
-name = "train_bucket_table"
-path = "tools/train_bucket_table.rs"
+name = "bucket_kmeans_fit"
+path = "tools/bucket_kmeans_fit.rs"
 
 # F3 [报告]：bucket table 质量数据 dump CLI（一次性 instrumentation）。读取 artifact
 # + 抽样 EHS 计算 → JSON 喂给 tools/bucket_quality_report.py 输出验收直方图。

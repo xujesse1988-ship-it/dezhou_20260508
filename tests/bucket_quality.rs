@@ -81,15 +81,16 @@ use poker::{
 /// **角色边界 [实现] → [测试] 越界 carve-out**（详见 stage-2 §C-rev0 §修订历史
 /// 和 §G-batch1 §3.2 / §3.8 同型）：本 batch [实现] 单边修改 `cached_trained_table()`
 /// path constant + 12 条阈值公式，继承 §C-rev2 batch 5 §1 carve-out 形态。
+/// v3 production artifact 路径（schema v3 / feature_set_id 2 / 16-dim hist + OCHS）。
+/// 由 `tools/bucket_kmeans_fit` 生产；不在 git 内（参 status.md "bucket table 工件" 段）。
 const PRODUCTION_ARTIFACT_PATH: &str =
-    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin";
+    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav3.bin";
 const FIXTURE_BUCKET_CONFIG: BucketConfig = BucketConfig {
     flop: 100,
     turn: 100,
     river: 100,
 };
 const FIXTURE_TRAINING_SEED: u64 = 0xC2_FA22_BD75_710E;
-const FIXTURE_CLUSTER_ITER: u32 = 200;
 
 static CACHED_TABLE: OnceLock<Arc<BucketTable>> = OnceLock::new();
 
@@ -105,18 +106,15 @@ fn cached_trained_table() -> Arc<BucketTable> {
             if path.exists() {
                 return Arc::new(BucketTable::open(path).expect("v3 artifact open"));
             }
-            // Fallback：fixture 训练（K=100，Knuth hash fallback 主导，质量门槛
+            // Fallback：synthetic v3 fixture（K=100，Knuth hash lookup，质量门槛
             // 大概率失败；适用于无 artifact 的 CI / dev box smoke 场景）。
             eprintln!(
                 "warning: v3 artifact not found at {PRODUCTION_ARTIFACT_PATH}; \
-                 falling back to fixture K=100 training (quality gates may fail)"
+                 falling back to synthetic_v3_for_tests K=100 (quality gates may fail)"
             );
-            let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
-            Arc::new(BucketTable::train_in_memory(
+            Arc::new(BucketTable::synthetic_v3_for_tests(
                 FIXTURE_BUCKET_CONFIG,
                 FIXTURE_TRAINING_SEED,
-                evaluator,
-                FIXTURE_CLUSTER_ITER,
             ))
         })
         .clone()

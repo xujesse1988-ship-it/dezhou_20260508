@@ -404,16 +404,13 @@ fn stage2_abstraction_mapping_throughput_at_least_100k_per_second() {
 #[test]
 #[ignore = "stage2 perf SLO"]
 fn stage2_bucket_lookup_p95_latency_at_most_10us() {
-    let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
-    let table = BucketTable::train_in_memory(
+    let table = BucketTable::synthetic_v3_for_tests(
         BucketConfig {
             flop: 100,
             turn: 100,
             river: 100,
         },
         0xC2_FA22_BD75_710E,
-        evaluator,
-        200,
     );
 
     // 每条街 5_000 sample × 3 街 = 15_000 latencies；P95 索引位 14_249，分布尾部

@@ -22,9 +22,6 @@
 //!
 //! 角色边界：本文件属 `[测试]` agent 产物（B1 / C1）。
 
-use std::sync::Arc;
-
-use poker::eval::NaiveHandEvaluator;
 use poker::rng_substream::{
     self, derive_substream_seed, CLUSTER_MAIN_FLOP, CLUSTER_MAIN_RIVER, CLUSTER_MAIN_TURN,
     EHS2_INNER_EQUITY_FLOP, EHS2_INNER_EQUITY_RIVER, EHS2_INNER_EQUITY_TURN,
@@ -32,7 +29,7 @@ use poker::rng_substream::{
     EQUITY_MONTE_CARLO, KMEANS_PP_INIT_FLOP, KMEANS_PP_INIT_RIVER, KMEANS_PP_INIT_TURN,
     OCHS_FEATURE_INNER, OCHS_WARMUP,
 };
-use poker::{canonical_observation_id, BucketConfig, BucketTable, Card, HandEvaluator, StreetTag};
+use poker::{canonical_observation_id, BucketConfig, BucketTable, Card, StreetTag};
 
 // ============================================================================
 // 1. D-228 op_id 命名空间分类（独立常量断言，不依赖 stub）
@@ -209,35 +206,33 @@ fn d228_derive_substream_seed_distinctness_smoke() {
 }
 
 // ============================================================================
-// 5. Clustering BLAKE3 byte-equal（C2 实测：D-237 byte-equal 不变量）
+// 5. v3 synthetic fixture BLAKE3 byte-equal（D-237 byte-equal 不变量）
 // ============================================================================
 //
-// 验证 §B1 line 238 + D-237：同 (BucketConfig, training_seed, cluster_iter) 输入
-// 重复 train_in_memory 必须输出 BLAKE3 byte-equal bucket table。
+// v3 schema 下完整 train_v3_in_memory 路径要求 features.len() = N_canonical（flop
+// 1.28M / turn 14M / river 123M），无法在普通 `cargo test` 时跑全 N（vultr 7.7
+// GB RAM 装不下 river f64 features）。这里用 deterministic synthetic_v3_for_tests
+// fixture 验证 artifact 序列化路径的 byte-equal 不变量。
 //
-// **C-rev1 batch 2 carve-out**：active 路径用 10/10/10 + 50 iter（与本文件
-// `BUCKET_BASELINE_CONFIG` 同形态，release ≈ 5 s / debug ≈ 30 s），保证默认
-// `cargo test` dev loop 不被阻塞 10 min；50/50/50 + 200 iter 完整版另设
-// `_full` 子测试 `#[ignore]`（D1 + CI release 路径触发，与 stage-1 perf_slo /
-// fuzz / cross_arch_baseline 同形态）。byte-equal 是二元属性，小配置同样验证
-// D-237 不变量。
-fn run_clustering_repeat_blake3_byte_equal(cfg: BucketConfig, cluster_iter: u32) {
+// 注意：kmeans_fit_production 自身的 byte-equal 在 src/abstraction/cluster.rs 内
+// `kmeans_deterministic_same_seed` 单元测试已覆盖；整 Stage 1+2 pipeline 的
+// byte-equal（features_<street>.bin BLAKE3 → bucket_table BLAKE3）由 tools/
+// bucket_kmeans_fit dry-run + .b3sum anchor 在 vultr / AWS 实测。
+fn run_synthetic_v3_byte_equal(cfg: BucketConfig) {
     let master_seed = 0xC2_BE71_BD75_710E;
-    let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
-    let bt1 = BucketTable::train_in_memory(cfg, master_seed, Arc::clone(&evaluator), cluster_iter);
-    let bt2 = BucketTable::train_in_memory(cfg, master_seed, Arc::clone(&evaluator), cluster_iter);
+    let bt1 = BucketTable::synthetic_v3_for_tests(cfg, master_seed);
+    let bt2 = BucketTable::synthetic_v3_for_tests(cfg, master_seed);
     assert_eq!(
         bt1.content_hash(),
         bt2.content_hash(),
-        "D-237 / clustering byte-equal：同 (cfg, seed, iter) 重复训练 BLAKE3 必须相等"
+        "D-237 / v3 synthetic byte-equal：同 (cfg, seed) 重复构造 BLAKE3 必须相等"
     );
-    // 校验 lookup 路径上 1k 输入命中相同 bucket id。
+    // lookup 路径 byte-equal：1k 随机 (street, board, hole)
     use poker::rng_substream::{derive_substream_seed, EQUITY_MONTE_CARLO};
     use poker::ChaCha20Rng;
     use poker::RngSource;
     let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(master_seed, EQUITY_MONTE_CARLO, 0));
     for _ in 0..1000 {
-        // sample one random (board, hole) on each street and compare bt1.lookup vs bt2.lookup
         for street in [StreetTag::Flop, StreetTag::Turn, StreetTag::River] {
             let board_len = match street {
                 StreetTag::Flop => 3,
@@ -263,59 +258,35 @@ fn run_clustering_repeat_blake3_byte_equal(cfg: BucketConfig, cluster_iter: u32)
             let obs_id = canonical_observation_id(street, &board, hole);
             let b1 = bt1.lookup(street, obs_id);
             let b2 = bt2.lookup(street, obs_id);
-            assert_eq!(b1, b2, "lookup 应 byte-equal across two trainings");
+            assert_eq!(b1, b2, "lookup 应 byte-equal across two synthetic builds");
         }
     }
 }
 
 #[test]
-fn clustering_repeat_blake3_byte_equal() {
-    run_clustering_repeat_blake3_byte_equal(
-        BucketConfig {
-            flop: 10,
-            turn: 10,
-            river: 10,
-        },
-        50,
-    );
+fn synthetic_v3_byte_equal_smoke() {
+    run_synthetic_v3_byte_equal(BucketConfig {
+        flop: 10,
+        turn: 10,
+        river: 10,
+    });
 }
 
 #[test]
-#[ignore = "D1: 50/50/50 + 200 iter 完整版（release ~30 s / debug 数分钟）；CI release + --ignored opt-in"]
-fn clustering_repeat_blake3_byte_equal_full() {
-    run_clustering_repeat_blake3_byte_equal(
-        BucketConfig {
-            flop: 50,
-            turn: 50,
-            river: 50,
-        },
-        200,
-    );
+fn synthetic_v3_byte_equal_500_500_500() {
+    run_synthetic_v3_byte_equal(BucketConfig::default_500_500_500());
 }
 
 // ============================================================================
-// 6. 跨线程 bucket id 一致（C2 实测：D-238 / IA-004 byte-equal across threads）
+// 6. 跨线程 bucket id 一致（D-238 / IA-004 byte-equal across threads）
 // ============================================================================
 //
-// 验证 §B1 line 239：BucketTable::lookup 是只读纯函数（&self），多线程并发
-// 调用必须返回 byte-equal 结果。1M 手 fuzz 留 D1 跑（`--ignored` opt-in）；
-// 默认 active 跑 1k 手 4 线程 sanity。
-//
-// **C-rev1 batch 2 carve-out**：active 路径同 §5 用 10/10/10 + 50 iter（与
-// `BUCKET_BASELINE_CONFIG` 同形态，release ≈ 5 s）。完整 50/50/50 + 200 iter
-// 版本另设 `_full` 子测试 `#[ignore]`（D1 / CI release opt-in）。lookup 多线程
-// safety 与 bucket_count 解耦，小配置同样验证 IA-004 不变量。
-fn run_cross_thread_bucket_id_consistency(cfg: BucketConfig, cluster_iter: u32) {
+// BucketTable::lookup 是只读纯函数，多线程并发调用必须返回 byte-equal 结果。
+fn run_cross_thread_bucket_id_consistency(cfg: BucketConfig) {
     use std::sync::Arc as ArcStd;
     use std::thread;
 
-    let evaluator: ArcStd<dyn HandEvaluator> = ArcStd::new(NaiveHandEvaluator);
-    let bt = ArcStd::new(BucketTable::train_in_memory(
-        cfg,
-        0xC27B_BD75_710E,
-        evaluator,
-        cluster_iter,
-    ));
+    let bt = ArcStd::new(BucketTable::synthetic_v3_for_tests(cfg, 0xC27B_BD75_710E));
 
     // 生成 1k 个随机 (street, board, hole) 输入。
     use poker::rng_substream::{derive_substream_seed, EQUITY_MONTE_CARLO};
@@ -393,27 +364,16 @@ fn run_cross_thread_bucket_id_consistency(cfg: BucketConfig, cluster_iter: u32) 
 
 #[test]
 fn cross_thread_bucket_id_consistency_smoke() {
-    run_cross_thread_bucket_id_consistency(
-        BucketConfig {
-            flop: 10,
-            turn: 10,
-            river: 10,
-        },
-        50,
-    );
+    run_cross_thread_bucket_id_consistency(BucketConfig {
+        flop: 10,
+        turn: 10,
+        river: 10,
+    });
 }
 
 #[test]
-#[ignore = "D1: 50/50/50 + 200 iter 完整版（release ~30 s / debug 数分钟）；CI release + --ignored opt-in"]
-fn cross_thread_bucket_id_consistency_full() {
-    run_cross_thread_bucket_id_consistency(
-        BucketConfig {
-            flop: 50,
-            turn: 50,
-            river: 50,
-        },
-        200,
-    );
+fn cross_thread_bucket_id_consistency_500_500_500() {
+    run_cross_thread_bucket_id_consistency(BucketConfig::default_500_500_500());
 }
 
 // ============================================================================
@@ -490,27 +450,17 @@ const BUCKET_TABLE_BASELINE_SEEDS: [u64; 32] = [
     0x1234_5678_9ABC_DEF0,
 ];
 
-/// C2 baseline 训练配置：使用 10/10/10 + 50 iter（最小可训练规模，每 seed
-/// 总 32 seeds × 3 街 ≈ 1500 candidate 训练；release ~10s/seed = 5 min total）。
-/// D1 [测试] 把跨架构 cross-pair guard 引入夜间 fuzz，可使用 50/50/50 + 200 iter
-/// 的更精细配置。
+/// baseline 配置：10/10/10。32 seed × 3 街 × synthetic 路径 → release ~ 秒级。
 const BUCKET_BASELINE_CONFIG: BucketConfig = BucketConfig {
     flop: 10,
     turn: 10,
     river: 10,
 };
-const BUCKET_BASELINE_CLUSTER_ITER: u32 = 50;
 
 fn capture_bucket_table_baseline() -> String {
-    let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
     let mut lines = String::new();
     for seed in BUCKET_TABLE_BASELINE_SEEDS {
-        let bt = BucketTable::train_in_memory(
-            BUCKET_BASELINE_CONFIG,
-            seed,
-            Arc::clone(&evaluator),
-            BUCKET_BASELINE_CLUSTER_ITER,
-        );
+        let bt = BucketTable::synthetic_v3_for_tests(BUCKET_BASELINE_CONFIG, seed);
         let hash = bt.content_hash();
         let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
         lines.push_str(&format!("seed={} hash={}\n", seed, hex));
@@ -542,22 +492,11 @@ fn bucket_baseline_path() -> Option<std::path::PathBuf> {
     )
 }
 
-/// C2 §C-rev0 carve-out 落地 + §D-rev0 batch 1 baseline 缺失分支硬 panic：
-/// 32-seed bucket table BLAKE3 baseline regression guard（与 stage-1
-/// cross_arch_hash 同形态）。
-///
-/// 默认 `#[ignore]` —— 训练成本 ~74 min release（§C-rev2 batch 6 carve-out
-/// 实测 ~107 min 估算下限；32 seed × 3 街 × 10/10/10 × 50 iter × OCHS real
-/// 169-class，§C-rev2 §3 真实化 OCHS 后 ~21x slower per ochs），不适合
-/// every-`cargo test` 触发。CI 在 release profile + `--ignored` opt-in 跑一次
-/// （与 stage-1 §C2 / §D2 同形态）。capture 入口 `bucket_table_arch_hash_capture_only`
-/// 同样 `#[ignore]`，由 `scripts/capture-bucket-table-baseline.sh`（占位，D1
-/// 落地）调用。
-///
-/// **§D-rev0 batch 1**：baseline 文件缺失分支从 `eprintln + return` 升级到
-/// `panic!`（issue #3 §出口 step 2 字面）。
+/// 32-seed v3 synthetic_v3_for_tests BLAKE3 baseline regression guard（与
+/// stage-1 cross_arch_hash 同形态）。synthetic 路径不调 kmeans，秒级完成；
+/// baseline 文件 byte-equal 跨架构验证 deterministic 序列化路径。
 #[test]
-#[ignore = "D1: 32-seed baseline 训练 ~74 min release；release + --ignored opt-in（与 stage-1 cross_arch_hash 同形态）"]
+#[ignore = "baseline file capture path — opt-in via --ignored"]
 fn cross_arch_bucket_id_baseline() {
     let actual = capture_bucket_table_baseline();
     let path = match bucket_baseline_path() {

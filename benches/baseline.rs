@@ -348,22 +348,17 @@ fn bench_abstraction_equity_monte_carlo(c: &mut Criterion) {
 // **角色边界**：本 fn 属 `[测试]` agent。`[实现]` agent 不得修改。
 
 fn bench_abstraction_bucket_lookup(c: &mut Criterion) {
-    use std::sync::Arc;
-
     use poker::{canonical_observation_id, BucketConfig, BucketTable, StreetTag};
 
-    let evaluator: Arc<dyn HandEvaluator> = Arc::new(NaiveHandEvaluator);
-    // 一次性 setup ~5 s release（10/10/10 + 50 iter 与 fuzz/abstraction_smoke 同型）。
-    // criterion 在 `b.iter` 之外只测量 closure 本身耗时，setup 不进数据。
-    let table = BucketTable::train_in_memory(
+    // synthetic v3 fixture（不调 kmeans，毫秒级 setup）；bench 只测 lookup hot
+    // path，table 内容真假无影响。
+    let table = BucketTable::synthetic_v3_for_tests(
         BucketConfig {
             flop: 10,
             turn: 10,
             river: 10,
         },
         0xE1BC_1007_5101,
-        evaluator,
-        50,
     );
 
     let mut group = c.benchmark_group("abstraction/bucket_lookup");
