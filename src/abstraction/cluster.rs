@@ -540,7 +540,12 @@ pub fn kmeans_fit_production(
     // 2. k-means 主迭代。
     let mut assignments: Vec<u32> = vec![0u32; n];
     let mut split_sub_index: u32 = 0;
-    for _iter in 0..cfg.max_iter {
+    eprintln!(
+        "[kmeans_fit_production] start n={n} k={k} dim={dim} max_iter={} tol={:.1e} op_init=0x{:08x}",
+        cfg.max_iter, cfg.centroid_shift_tol, op_id_init,
+    );
+    for iter_idx in 0..cfg.max_iter {
+        let t_iter = std::time::Instant::now();
         // 2a. assignment（par_iter；each sample 独立分配）。
         assignments = features
             .par_iter()
@@ -620,7 +625,16 @@ pub fn kmeans_fit_production(
             }
         }
         centroids = new_centroids;
+        eprintln!(
+            "[kmeans_fit_production] iter={iter_idx} shift_inf={shift_inf:.6e} wall={:?} (tol={:.1e})",
+            t_iter.elapsed(),
+            cfg.centroid_shift_tol,
+        );
         if shift_inf <= cfg.centroid_shift_tol {
+            eprintln!(
+                "[kmeans_fit_production] converged at iter={iter_idx} (shift_inf={shift_inf:.6e} <= tol={:.1e})",
+                cfg.centroid_shift_tol,
+            );
             break;
         }
     }
