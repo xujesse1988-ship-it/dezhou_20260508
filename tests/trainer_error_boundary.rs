@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | `ActionCountMismatch` | `RegretTable::accumulate` / `current_strategy` / `StrategyAccumulator::accumulate` / `average_strategy` 上 InfoSet 长度不匹配 | 4 条 panic 路径 + 1 条构造 trip-wire |
 //! | `OutOfMemory` | 训练监控阈值（D-325 字面 SLO 8 GB；本变体 stage 3 路径未实际触发，留 stage 4 监控接入） | 仅构造 + Display/Debug trip-wire |
-//! | `UnsupportedBucketTable` | `SimplifiedNlheGame::new(BucketTable)` schema_version != 2 或 config != (500, 500, 500) | 构造 stub + config (100, 100, 100) → Err |
+//! | `UnsupportedBucketTable` | `SimplifiedNlheGame::new(BucketTable)` schema_version != 3 或 config != (500, 500, 500) | 构造 stub + config (100, 100, 100) → Err |
 //! | `ProbabilitySumOutOfTolerance` | regret matching σ sum 越界 \[1 - 1e-9, 1 + 1e-9\]（D-330；本变体 stage 3 未实际触发，留 stage 4 监控接入） | 仅构造 + Display/Debug trip-wire |
 //! | `Checkpoint(...)` propagation | `Trainer::save_checkpoint` 失败时 `CheckpointError` → 通过 `#[from]` propagate 到 `TrainerError` | 构造 + `From<CheckpointError>` 路径 trip-wire |
 //!
@@ -147,21 +147,21 @@ fn out_of_memory_construction_trip_wire() {
 
 #[test]
 fn simplified_nlhe_new_with_wrong_bucket_config_returns_unsupported_bucket_table() {
-    // `SimplifiedNlheGame::new` 校验 `BucketTable::config() == (500, 500, 500)`
-    // （D-314-rev1）；config (100, 100, 100) 走 second branch 返回
-    // `UnsupportedBucketTable { expected: 2, got: 0 }`（nlhe.rs:200-203 字面：
-    // got=0 让 caller 通过 schema_version 路径区分 vs config 路径）。
+    // `SimplifiedNlheGame::new` 校验 `BucketTable::config() == (500, 500, 500)`；
+    // config (100, 100, 100) 走 second branch 返回
+    // `UnsupportedBucketTable { expected: 3, got: 0 }`（got=0 让 caller 通过
+    // schema_version 路径区分 vs config 路径）。
     let bucket_cfg = BucketConfig::new(100, 100, 100).expect("100 in [10, 10000]");
     let table = BucketTable::stub_for_postflop(bucket_cfg);
-    // stub 维持 schema_version=2，所以 first branch 不触发；second branch (config 不匹配) 触发。
+    // stub 持 schema_version=3，first branch 通过；second branch (config 不匹配) 触发。
     let err = match SimplifiedNlheGame::new(Arc::new(table)) {
         Ok(_) => panic!("SimplifiedNlheGame::new with wrong config 必须 Err"),
         Err(e) => e,
     };
     match err {
         TrainerError::UnsupportedBucketTable { expected, got } => {
-            // expected = EXPECTED_BUCKET_SCHEMA_VERSION（2）；got = 0（config 不匹配 sentinel）。
-            assert_eq!(expected, 2, "expected 应为 EXPECTED_BUCKET_SCHEMA_VERSION");
+            // expected = EXPECTED_BUCKET_SCHEMA_VERSION（3）；got = 0（config 不匹配 sentinel）。
+            assert_eq!(expected, 3, "expected 应为 EXPECTED_BUCKET_SCHEMA_VERSION");
             assert_eq!(got, 0, "config-mismatch 路径 got 字段是 0 sentinel");
         }
         other => panic!("expected UnsupportedBucketTable, got {other:?}"),

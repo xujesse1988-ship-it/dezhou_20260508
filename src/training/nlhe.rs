@@ -21,11 +21,11 @@
 //! stage 1 `validate_config` 范围扩展为 `2..=9`；本模块构造 `TableConfig`
 //! 时显式 `n_seats=2`。
 //!
-//! **D-314-rev1 lock**（2026-05-13 stage 3 decisions §10.1）：bucket table 依赖
-//! = §G-batch1 §3.10 production v3 artifact `artifacts/bucket_table_default_500_
-//! 500_500_seed_cafebabe_v3.bin`（schema_version=2 / body BLAKE3 `67ee5554...`）。
-//! `SimplifiedNlheGame::new` 校验 `schema_version() == 2`（v1 95 KB fallback
-//! D-314-rev2 已废弃，构造时拒绝）+ `config() == BucketConfig::new(500, 500, 500)`。
+//! Bucket table 依赖 = stage 2 v3 production artifact
+//! `artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav3.bin`
+//! （schema_version=3 / feature_set_id=2 / 16-dim hist+OCHS / body BLAKE3
+//! `1c22c1ee...`）。`SimplifiedNlheGame::new` 校验 `schema_version() == 3` +
+//! `config() == BucketConfig::new(500, 500, 500)`。
 
 use std::sync::Arc;
 
@@ -64,9 +64,9 @@ fn expected_bucket_config() -> BucketConfig {
     BucketConfig::new(500, 500, 500).expect("BucketConfig::new(500,500,500) within D-214 range")
 }
 
-/// 简化 NLHE expected `BucketTable` schema_version（D-314-rev1）。v1 95 KB
-/// fallback (D-314-rev2) 已废弃；C2 [实现] 拒绝 schema_version=1 输入。
-const EXPECTED_BUCKET_SCHEMA_VERSION: u32 = 2;
+/// 简化 NLHE expected `BucketTable` schema_version。stage 2 已升 v3
+/// (16-dim hist+OCHS feature)；v1/v2 artifact 不再可加载。
+const EXPECTED_BUCKET_SCHEMA_VERSION: u32 = 3;
 
 /// 简化 NLHE `InfoSetId` v2 layout：把 26-bit node_id 写入 `InfoSetId` raw 高位
 /// （bits 38..64）。低 38 bit 复用 stage-2 [`pack_info_set_id`] 字段位置以保留
@@ -112,7 +112,7 @@ impl SimplifiedNlheGame {
     /// 构造函数（API-303）。
     ///
     /// 校验项（D-314-rev1）：
-    /// - `BucketTable::schema_version()` == `2`（v1 fallback 已废弃）
+    /// - `BucketTable::schema_version()` == `3`（v1/v2 已废弃）
     /// - `BucketTable::config()` == `BucketConfig::new(500, 500, 500)`
     ///
     /// 失败路径：[`TrainerError::UnsupportedBucketTable`]。`expected` 字段

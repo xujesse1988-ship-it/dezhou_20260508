@@ -3,7 +3,7 @@
 //! 读取 Stage 1 三街 `features_<street>.bin` → 校验文件 BLAKE3 + header →
 //! 抽取 f32 features + 算 per-sample `reorder_key_ehs` → 调
 //! [`BucketTable::train_v3_in_memory`] 跑 k-means + reorder + 量化 → 写 v3
-//! bucket_table artifact + 旁路 `.b3sum` 文件。
+//! bucket_table artifact + 旁路 `.b3sum`（whole-file BLAKE3，配 `b3sum -c` 使用）。
 //!
 //! 用法：
 //!
@@ -30,6 +30,7 @@
 //! 15.76 GB + reorder_key 1 GB + kmeans assignments 492 MB + chunk accumulator
 //! ~MB ≈ peak ~25 GB。c6a.8xlarge 64 GB 充裕；vultr 7.7 GB 跑不动 river。
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -256,40 +257,80 @@ fn main() -> ExitCode {
         eprintln!("error: write_to_path({:?}): {e}", opts.output);
         return ExitCode::from(1);
     }
+    // body BLAKE3 = artifact 末 32 byte trailer 的值，BucketTable::open / train_cfr
+    // 日志 / status.md 文档锚点用的就是它。
     let body_hash: [u8; 32] = table.content_hash();
-    let hex: String = body_hash.iter().map(|b| format!("{:02x}", b)).collect();
-    let b3sum_path = {
-        let mut p = opts.output.clone();
-        let mut name = p
-            .file_name()
-            .map(|n| n.to_owned())
-            .unwrap_or_else(|| std::ffi::OsString::from("bucket_table.bin"));
-        name.push(".b3sum");
-        p.set_file_name(name);
-        p
+    let body_hex: String = body_hash.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // whole-file BLAKE3 = `.b3sum` 旁路文件的值。`b3sum -c <file>.b3sum` 工具算
+    // whole-file BLAKE3 并 与 `.b3sum` 内容比较，所以这里写的必须是 whole-file 而非
+    // body hash（早期版本写的是 body hash 让 `b3sum -c` 永远 FAILED）。
+    let file_hash = {
+        let mut hasher = blake3::Hasher::new();
+        match std::fs::File::open(&opts.output) {
+            Ok(mut f) => {
+                let mut buf = vec![0u8; 1 << 20];
+                loop {
+                    match f.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => hasher.update(&buf[..n]),
+                        Err(e) => {
+                            eprintln!("warning: read artifact for b3sum failed: {e}");
+                            return ExitCode::from(0);
+                        }
+                    };
+                }
+                Some(hasher.finalize())
+            }
+            Err(e) => {
+                eprintln!("warning: open artifact for b3sum failed: {e}");
+                None
+            }
+        }
     };
-    if let Err(e) = std::fs::write(
-        &b3sum_path,
-        format!(
-            "{hex}  {}\n",
-            opts.output
+
+    if let Some(h) = file_hash {
+        let file_hex = h.to_hex().to_string();
+        let b3sum_path = {
+            let mut p = opts.output.clone();
+            let mut name = p
                 .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "bucket_table.bin".to_string())
-        ),
-    ) {
+                .map(|n| n.to_owned())
+                .unwrap_or_else(|| std::ffi::OsString::from("bucket_table.bin"));
+            name.push(".b3sum");
+            p.set_file_name(name);
+            p
+        };
+        if let Err(e) = std::fs::write(
+            &b3sum_path,
+            format!(
+                "{file_hex}  {}\n",
+                opts.output
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "bucket_table.bin".to_string())
+            ),
+        ) {
+            eprintln!(
+                "warning: failed to write {} ({e}). Artifact已成功，仅 .b3sum 旁路缺失。",
+                b3sum_path.display()
+            );
+        }
         eprintln!(
-            "warning: failed to write {} ({e}). Artifact已成功，仅 .b3sum 旁路缺失。",
-            b3sum_path.display()
+            "[bucket_kmeans_fit] done {} body_blake3={} file_blake3={} total_wall={:?}",
+            opts.output.display(),
+            body_hex,
+            file_hex,
+            t_start.elapsed()
+        );
+    } else {
+        eprintln!(
+            "[bucket_kmeans_fit] done {} body_blake3={} total_wall={:?} (`.b3sum` 旁路写入失败，artifact 完整)",
+            opts.output.display(),
+            body_hex,
+            t_start.elapsed()
         );
     }
-
-    eprintln!(
-        "[bucket_kmeans_fit] done {} (BLAKE3={}) total_wall={:?}",
-        opts.output.display(),
-        hex,
-        t_start.elapsed()
-    );
     ExitCode::from(0)
 }
 
