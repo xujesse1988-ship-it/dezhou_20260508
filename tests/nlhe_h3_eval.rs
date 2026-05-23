@@ -213,7 +213,7 @@ fn hybrid_checkpoint_strategy(
     trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
     info: &poker::InfoSetId,
 ) -> Vec<f64> {
-    let degenerate = match trainer.strategy_sum().inner().get(info) {
+    let degenerate = match trainer.strategy_sum_for(info) {
         None => true,
         Some(v) => v.iter().sum::<f64>() <= 0.0,
     };

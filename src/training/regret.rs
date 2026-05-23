@@ -342,6 +342,207 @@ impl<I: Eq + Hash + Clone> StrategyAccumulator<I> {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+struct CompactEntry {
+    offset: u32,
+    n_actions: u8,
+}
+
+/// Combined arena-backed regret + strategy table for ES-MCCFR hot training.
+///
+/// Layout per infoset in `values`: `[regret; n_actions][strategy_sum; n_actions]`.
+/// The index stores each key once and points into the dense arena, avoiding two
+/// HashMaps and millions of per-infoset `Vec<f64>` heap allocations.
+#[derive(Debug, Default)]
+pub(crate) struct CfrTables<I: Eq + Hash + Clone> {
+    index: HashMap<I, CompactEntry>,
+    values: Vec<f64>,
+}
+
+impl<I: Eq + Hash + Clone> CfrTables<I> {
+    pub(crate) fn new() -> Self {
+        Self {
+            index: HashMap::new(),
+            values: Vec::new(),
+        }
+    }
+
+    fn get_or_init_meta(&mut self, info_set: I, n_actions: usize) -> CompactEntry {
+        if let Some(&meta) = self.index.get(&info_set) {
+            assert_eq!(
+                meta.n_actions as usize, n_actions,
+                "CfrTables action_count mismatch: stored {}, requested {} (D-324)",
+                meta.n_actions, n_actions
+            );
+            return meta;
+        }
+        assert!(
+            n_actions <= u8::MAX as usize,
+            "CfrTables supports up to u8::MAX actions per infoset"
+        );
+        let offset = self.values.len();
+        assert!(
+            offset <= u32::MAX as usize,
+            "CfrTables arena offset exceeded u32::MAX"
+        );
+        self.values.resize(offset + 2 * n_actions, 0.0);
+        let meta = CompactEntry {
+            offset: offset as u32,
+            n_actions: n_actions as u8,
+        };
+        self.index.insert(info_set, meta);
+        meta
+    }
+
+    fn regret_range(meta: CompactEntry) -> std::ops::Range<usize> {
+        let start = meta.offset as usize;
+        start..start + meta.n_actions as usize
+    }
+
+    fn strategy_range(meta: CompactEntry) -> std::ops::Range<usize> {
+        let start = meta.offset as usize + meta.n_actions as usize;
+        start..start + meta.n_actions as usize
+    }
+
+    pub(crate) fn action_count(&self, info_set: &I) -> Option<usize> {
+        self.index.get(info_set).map(|m| m.n_actions as usize)
+    }
+
+    pub(crate) fn accumulate_regret(&mut self, info_set: I, delta: &[f64]) {
+        let meta = self.get_or_init_meta(info_set, delta.len());
+        for (slot, &d) in self.values[Self::regret_range(meta)].iter_mut().zip(delta) {
+            *slot += d;
+        }
+    }
+
+    pub(crate) fn accumulate_strategy(&mut self, info_set: I, weighted_strategy: &[f64]) {
+        let meta = self.get_or_init_meta(info_set, weighted_strategy.len());
+        for (slot, &w) in self.values[Self::strategy_range(meta)]
+            .iter_mut()
+            .zip(weighted_strategy)
+        {
+            *slot += w;
+        }
+    }
+
+    pub(crate) fn current_strategy_smallvec(&self, info_set: &I, n_actions: usize) -> SigmaVec {
+        let uniform = || SigmaVec::from_elem(1.0 / n_actions as f64, n_actions);
+        let Some(&meta) = self.index.get(info_set) else {
+            return uniform();
+        };
+        assert_eq!(
+            meta.n_actions as usize, n_actions,
+            "CfrTables::current_strategy action_count mismatch: stored {}, requested {} (D-324)",
+            meta.n_actions, n_actions
+        );
+        let regrets = &self.values[Self::regret_range(meta)];
+        let mut positives: SigmaVec = SigmaVec::with_capacity(n_actions);
+        let mut sum = 0.0_f64;
+        for &r in regrets {
+            let r_plus = if r > 0.0 { r } else { 0.0 };
+            positives.push(r_plus);
+            sum += r_plus;
+        }
+        if sum > 0.0 {
+            for p in &mut positives {
+                *p /= sum;
+            }
+            positives
+        } else {
+            uniform()
+        }
+    }
+
+    pub(crate) fn current_strategy(&self, info_set: &I, n_actions: usize) -> Vec<f64> {
+        self.current_strategy_smallvec(info_set, n_actions)
+            .into_vec()
+    }
+
+    pub(crate) fn average_strategy(&self, info_set: &I, n_actions: usize) -> Vec<f64> {
+        let uniform = || vec![1.0 / n_actions as f64; n_actions];
+        let Some(&meta) = self.index.get(info_set) else {
+            return uniform();
+        };
+        assert_eq!(
+            meta.n_actions as usize, n_actions,
+            "CfrTables::average_strategy action_count mismatch: stored {}, requested {} (D-324)",
+            meta.n_actions, n_actions
+        );
+        let sums = &self.values[Self::strategy_range(meta)];
+        let total: f64 = sums.iter().sum();
+        if total > 0.0 {
+            sums.iter().map(|s| s / total).collect()
+        } else {
+            uniform()
+        }
+    }
+
+    pub(crate) fn strategy_slice(&self, info_set: &I) -> Option<&[f64]> {
+        self.index
+            .get(info_set)
+            .map(|&meta| &self.values[Self::strategy_range(meta)])
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub(crate) fn regret_entries(&self) -> impl Iterator<Item = (&I, &[f64])> {
+        self.index
+            .iter()
+            .map(|(info, &meta)| (info, &self.values[Self::regret_range(meta)] as &[f64]))
+    }
+
+    pub(crate) fn strategy_entries(&self) -> impl Iterator<Item = (&I, &[f64])> {
+        self.index
+            .iter()
+            .map(|(info, &meta)| (info, &self.values[Self::strategy_range(meta)] as &[f64]))
+    }
+
+    pub(crate) fn to_regret_table(&self) -> RegretTable<I> {
+        let inner = self
+            .regret_entries()
+            .map(|(info, values)| (info.clone(), values.to_vec()))
+            .collect();
+        RegretTable { inner }
+    }
+
+    pub(crate) fn to_strategy_accumulator(&self) -> StrategyAccumulator<I> {
+        let inner = self
+            .strategy_entries()
+            .map(|(info, values)| (info.clone(), values.to_vec()))
+            .collect();
+        StrategyAccumulator { inner }
+    }
+
+    pub(crate) fn from_tables(
+        regret: HashMap<I, Vec<f64>>,
+        strategy: HashMap<I, Vec<f64>>,
+    ) -> Self {
+        let mut out = Self::new();
+        for (info, regrets) in regret {
+            let meta = out.get_or_init_meta(info.clone(), regrets.len());
+            out.values[Self::regret_range(meta)].copy_from_slice(&regrets);
+            if let Some(strategy_values) = strategy.get(&info) {
+                assert_eq!(
+                    strategy_values.len(),
+                    regrets.len(),
+                    "CfrTables::from_tables action_count mismatch for strategy table"
+                );
+                out.values[Self::strategy_range(meta)].copy_from_slice(strategy_values);
+            }
+        }
+        for (info, strategy_values) in strategy {
+            if out.index.contains_key(&info) {
+                continue;
+            }
+            let meta = out.get_or_init_meta(info, strategy_values.len());
+            out.values[Self::strategy_range(meta)].copy_from_slice(&strategy_values);
+        }
+        out
+    }
+}
+
 /// E2-rev1 \[实现\] thread-local strategy_sum delta accumulator
 /// （语义同 `LocalRegretDelta`，作用于 [`StrategyAccumulator`]）。
 #[derive(Debug, Default)]

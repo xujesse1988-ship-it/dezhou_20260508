@@ -253,7 +253,7 @@ fn make_strategy_fn(
             FallbackPolicy::Average => trainer.average_strategy(info),
             FallbackPolicy::Current => trainer.current_strategy(info),
             FallbackPolicy::Hybrid => {
-                let degenerate = match trainer.strategy_sum().inner().get(info) {
+                let degenerate = match trainer.strategy_sum_for(info) {
                     None => true,
                     Some(v) => v.iter().sum::<f64>() <= 0.0,
                 };

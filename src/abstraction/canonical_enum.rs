@@ -27,10 +27,10 @@
 //!    高位到低位排列。pack 输出在 `u128 高 127 位之内（最高 1 位永 0），所以
 //!    `u128 numerical cmp == canonical tuple lex cmp`。
 //!
-//! 3. **Lazy sorted table per street**：第一次调用 [`canonical_observation_id`]
-//!    时，对该街枚举所有 canonical form key 并 sort 到 `Vec<u128>`。canonical
-//!    id = `Vec` 中 binary-search position。tables 走 [`OnceLock`]，per-street
-//!    lazy build 避免不需要 river 的测试也付 ~1 s build cost。
+//! 3. **Direct combinatorial rank**：[`canonical_observation_id`] 将输入 canonical
+//!    signature 直接排名到旧 sorted-key 顺序中的 dense id，不再为训练热路径常驻
+//!    `Vec<u128>` 全表。`nth_canonical_form` 仍保留 lazy sorted table 路径，供离线
+//!    bucket artifact 构建 / 诊断工具按 id 反解 representative。
 //!
 //! 4. **Enumeration**：用递归方式枚举每个 canonical shape (b_counts, h_counts
 //!    per canonical suit 多重集) → 每个 shape 内 enumerate canonical multiset of
@@ -40,7 +40,7 @@
 //!
 //! # 内存预算
 //!
-//! Per-street sorted `Vec<u128>` 大小：
+//! `nth_canonical_form` 使用的 per-street sorted `Vec<u128>` 大小：
 //!
 //! | street | N | bytes (×16) |
 //! |---|---|---|
@@ -48,8 +48,8 @@
 //! | turn | 13,960,050 | ~223 MB |
 //! | river | 123,156,254 | ~1.97 GB |
 //!
-//! Lazy build 让只 touch flop 的测试只付 ~416 KB；full training 路径付完整
-//! ~1.99 GB。Build time on 1-CPU host: flop ~30 ms / turn ~2 s / river ~3 min。
+//! 训练路径不再构建这些表；只有调用 `nth_canonical_form` 的离线路径会付这笔成本。
+//! Build time on 1-CPU host: flop ~30 ms / turn ~2 s / river ~3 min。
 //!
 //! # 不变量
 //!
@@ -127,7 +127,13 @@ pub fn n_canonical_observation(street: StreetTag) -> u32 {
 /// 因为 `u128` 数值序与 canonical (b_count, h_count, b_mask, h_mask) tuple 字典
 /// 序一一对应（每 component 占用固定高位段 + 不溢出），sort `Vec<u128>` 等价于
 /// sort canonical tuple Vec。
+#[cfg(test)]
 fn pack_canonical_form_key(board: &[Card], hole: &[Card; 2]) -> u128 {
+    let sigs = canonical_signatures(board, hole);
+    pack_signatures(&sigs)
+}
+
+fn canonical_signatures(board: &[Card], hole: &[Card; 2]) -> [(u8, u8, u16, u16); 4] {
     let mut suits: [(u16, u16); 4] = [(0, 0); 4];
     for &c in board {
         suits[c.suit() as usize].0 |= 1u16 << (c.rank() as u8);
@@ -146,7 +152,10 @@ fn pack_canonical_form_key(board: &[Card], hole: &[Card; 2]) -> u128 {
         );
     }
     sigs.sort_unstable();
+    sigs
+}
 
+fn pack_signatures(sigs: &[(u8, u8, u16, u16); 4]) -> u128 {
     let mut key: u128 = 0;
     for (i, sig) in sigs.iter().enumerate() {
         let pack: u128 = ((sig.0 as u128) << 28)
@@ -167,6 +176,27 @@ static FLOP_TABLE: OnceLock<Vec<u128>> = OnceLock::new();
 static TURN_TABLE: OnceLock<Vec<u128>> = OnceLock::new();
 static RIVER_TABLE: OnceLock<Vec<u128>> = OnceLock::new();
 
+static RANK_INDEX: OnceLock<RankIndex> = OnceLock::new();
+
+const MAX_BOARD_PER_SUIT: usize = 5;
+const MAX_HOLE_PER_SUIT: usize = 2;
+const RANK_INDEX_REM: usize = 4; // suffix lengths 0..=3
+const RANK_INDEX_B: usize = MAX_BOARD_PER_SUIT + 1;
+const RANK_INDEX_H: usize = MAX_HOLE_PER_SUIT + 1;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct SuitSig {
+    packed: u32,
+    b_count: u8,
+    h_count: u8,
+}
+
+#[derive(Debug)]
+struct RankIndex {
+    sigs: Vec<SuitSig>,
+    first_sum: Vec<u32>,
+}
+
 fn lazy_table(street: StreetTag) -> &'static [u128] {
     match street {
         StreetTag::Preflop => {
@@ -179,16 +209,139 @@ fn lazy_table(street: StreetTag) -> &'static [u128] {
     .as_slice()
 }
 
+impl RankIndex {
+    fn stride(&self) -> usize {
+        self.sigs.len() + 1
+    }
+
+    fn sum_idx(&self, rem: usize, b: usize, h: usize, sig_idx: usize) -> usize {
+        (((rem * RANK_INDEX_B + b) * RANK_INDEX_H + h) * self.stride()) + sig_idx
+    }
+
+    fn first_sum(&self, rem: usize, b: usize, h: usize, sig_idx: usize) -> u32 {
+        if b > MAX_BOARD_PER_SUIT || h > MAX_HOLE_PER_SUIT {
+            return 0;
+        }
+        self.first_sum[self.sum_idx(rem, b, h, sig_idx)]
+    }
+
+    fn range_sum(&self, rem: usize, b: usize, h: usize, start: usize, end: usize) -> u32 {
+        self.first_sum(rem, b, h, start) - self.first_sum(rem, b, h, end)
+    }
+
+    fn signature_index(&self, packed: u32) -> Option<usize> {
+        self.sigs.binary_search_by_key(&packed, |s| s.packed).ok()
+    }
+}
+
+fn build_rank_index() -> RankIndex {
+    let mut sigs = Vec::new();
+    for b_count in 0..=MAX_BOARD_PER_SUIT as u8 {
+        for h_count in 0..=MAX_HOLE_PER_SUIT as u8 {
+            each_mask_pair_at_least(b_count, h_count, (0, 0), |b_mask, h_mask| {
+                sigs.push(SuitSig {
+                    packed: pack_signature((b_count, h_count, b_mask, h_mask)),
+                    b_count,
+                    h_count,
+                });
+            });
+        }
+    }
+    sigs.sort_by_key(|s| s.packed);
+    debug_assert!(
+        sigs.windows(2).all(|w| w[0].packed < w[1].packed),
+        "canonical rank index signatures must be unique"
+    );
+
+    let stride = sigs.len() + 1;
+    let layer_len = RANK_INDEX_B * RANK_INDEX_H * stride;
+    let mut first_sum = vec![0u32; RANK_INDEX_REM * layer_len];
+
+    for rem in 0..RANK_INDEX_REM {
+        for b in 0..RANK_INDEX_B {
+            for h in 0..RANK_INDEX_H {
+                let mut running = 0u32;
+                for sig_idx in (0..sigs.len()).rev() {
+                    let sig = sigs[sig_idx];
+                    if sig.b_count as usize <= b && sig.h_count as usize <= h {
+                        let b_after = b - sig.b_count as usize;
+                        let h_after = h - sig.h_count as usize;
+                        let add = if rem == 0 {
+                            if b_after == 0 && h_after == 0 {
+                                1
+                            } else {
+                                0
+                            }
+                        } else {
+                            let prev_idx = (((rem - 1) * RANK_INDEX_B + b_after) * RANK_INDEX_H
+                                + h_after)
+                                * stride
+                                + sig_idx;
+                            first_sum[prev_idx]
+                        };
+                        running = running.checked_add(add).expect(
+                            "canonical rank index count overflow; expected <= river N canonical",
+                        );
+                    }
+                    let out_idx = ((rem * RANK_INDEX_B + b) * RANK_INDEX_H + h) * stride + sig_idx;
+                    first_sum[out_idx] = running;
+                }
+            }
+        }
+    }
+
+    let index = RankIndex { sigs, first_sum };
+    debug_assert_eq!(index.first_sum(3, 3, 2, 0), N_CANONICAL_OBSERVATION_FLOP);
+    debug_assert_eq!(index.first_sum(3, 4, 2, 0), N_CANONICAL_OBSERVATION_TURN);
+    debug_assert_eq!(index.first_sum(3, 5, 2, 0), N_CANONICAL_OBSERVATION_RIVER);
+    index
+}
+
+fn pack_signature(sig: (u8, u8, u16, u16)) -> u32 {
+    ((sig.0 as u32) << 28) | ((sig.1 as u32) << 26) | ((sig.2 as u32) << 13) | sig.3 as u32
+}
+
+fn canonical_rank(street: StreetTag, sigs: &[(u8, u8, u16, u16); 4]) -> u32 {
+    let index = RANK_INDEX.get_or_init(build_rank_index);
+    let target_total_b = match street {
+        StreetTag::Preflop => unreachable!(),
+        StreetTag::Flop => 3usize,
+        StreetTag::Turn => 4,
+        StreetTag::River => 5,
+    };
+    let mut rank = 0u32;
+    let mut min_idx = 0usize;
+    let mut b_rem = target_total_b;
+    let mut h_rem = 2usize;
+    for (pos, sig) in sigs.iter().enumerate() {
+        let packed = pack_signature(*sig);
+        let target_idx = index
+            .signature_index(packed)
+            .unwrap_or_else(|| panic!("canonical_enum: signature 0x{packed:08x} not indexed"));
+        let remaining_len = 3 - pos;
+        if target_idx > min_idx {
+            rank += index.range_sum(remaining_len, b_rem, h_rem, min_idx, target_idx);
+        }
+        b_rem -= sig.0 as usize;
+        h_rem -= sig.1 as usize;
+        min_idx = target_idx;
+    }
+    debug_assert_eq!(b_rem, 0);
+    debug_assert_eq!(h_rem, 0);
+    debug_assert!(rank < n_canonical_observation(street));
+    rank
+}
+
 /// 计算 (board, hole) 在 `street` 街上的 canonical observation id ∈ `[0, N)`。
 ///
 /// 仅对 `StreetTag::{Flop, Turn, River}` 有效；preflop 路径 panic（caller 应改用
 /// [`crate::abstraction::preflop::canonical_hole_id`]）。
 ///
-/// 算法：pack canonical form 到 u128 sort key → binary search 在 lazy 构造的
-/// sorted `Vec<u128>` 中 → 返回 index。
+/// 算法：pack canonical form 到 suit signatures → 对旧 sorted-key 顺序做组合排名
+/// → 返回 index。训练热路径不再构造 per-street `Vec<u128>` 全表。
 ///
-/// 复杂度：`O(log N)` per call after lazy build；build cost 在第一次 call 时
-/// 摊销（flop ~30 ms / turn ~2 s / river ~3 min on 1-CPU host）。
+/// 复杂度：常量级（4 suit + 4 次 rank-index range sum）；首次调用 lazy 构造约 30 MiB
+/// 的共享 rank index。
 pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 2]) -> u32 {
     if matches!(street, StreetTag::Preflop) {
         panic!(
@@ -210,15 +363,8 @@ pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 
         board.len()
     );
 
-    let key = pack_canonical_form_key(board, &hole);
-    let table = lazy_table(street);
-    match table.binary_search(&key) {
-        Ok(idx) => idx as u32,
-        Err(_) => panic!(
-            "canonical_observation_id: canonical form key 0x{key:032x} not found in lazy \
-             table (street {street:?}); enumeration bug — please file issue"
-        ),
-    }
+    let sigs = canonical_signatures(board, &hole);
+    canonical_rank(street, &sigs)
 }
 
 // ============================================================================
@@ -447,16 +593,7 @@ fn enumerate_groups<F: FnMut(u128)>(
 ) {
     if group_idx == groups.len() {
         // 全部 4 suit 已赋值，pack 输出 key
-        let mut key: u128 = 0;
-        for (i, sig) in sigs.iter().enumerate() {
-            let pack: u128 = ((sig.0 as u128) << 28)
-                | ((sig.1 as u128) << 26)
-                | ((sig.2 as u128) << 13)
-                | (sig.3 as u128);
-            let shift = 32 * (3 - i);
-            key |= pack << shift;
-        }
-        callback(key);
+        callback(pack_signatures(sigs));
         return;
     }
 
@@ -662,6 +799,36 @@ mod tests {
         each_combination_with_min(13, 3, 0b0000000000111, |_| count += 1);
         // ≥ 0b111 = 7 的全部 C(13,3) mask = 286（因为 0b111 本身是最小 3-bit mask）。
         assert_eq!(count, 286);
+    }
+
+    fn unpack_key_for_test(key: u128) -> [(u8, u8, u16, u16); 4] {
+        let mut sigs = [(0u8, 0u8, 0u16, 0u16); 4];
+        for slot in 0u32..4 {
+            let shift = 32 * (3 - slot);
+            let chunk = ((key >> shift) & 0xFFFF_FFFF) as u32;
+            sigs[slot as usize] = (
+                ((chunk >> 28) & 0x7) as u8,
+                ((chunk >> 26) & 0x3) as u8,
+                ((chunk >> 13) & 0x1FFF) as u16,
+                (chunk & 0x1FFF) as u16,
+            );
+        }
+        sigs
+    }
+
+    #[test]
+    fn canonical_rank_matches_full_flop_sorted_table() {
+        let mut table = Vec::with_capacity(N_CANONICAL_OBSERVATION_FLOP as usize);
+        enumerate_canonical_forms(3, 2, &mut |key| {
+            table.push(key);
+        });
+        table.sort_unstable();
+        for (idx, key) in table.iter().copied().enumerate() {
+            let sigs = unpack_key_for_test(key);
+            let got = canonical_rank(StreetTag::Flop, &sigs);
+            assert_eq!(got, idx as u32, "idx={idx} key=0x{key:032x} sigs={sigs:?}");
+        }
+        assert_eq!(table.len() as u32, N_CANONICAL_OBSERVATION_FLOP);
     }
 
     /// Debug: 检查一个具体 (board, hole) 的 pack_canonical_form_key 输出

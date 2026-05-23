@@ -204,7 +204,8 @@ fn run(args: Args) -> Result<(), String> {
     // 每个 node 上实际出现在 strategy_sum 表里的 distinct bucket 数。
     let mut present_per_node: Vec<u32> = vec![0; n_nodes];
     let mut entries_out_of_range: u64 = 0;
-    for (info, vec) in trainer.strategy_sum().inner() {
+    let strategy_sum = trainer.strategy_sum();
+    for (info, vec) in strategy_sum.inner() {
         // sanity: ES-MCCFR 下 entry 创建后 σ-累积必非全 0；遇到反例记录但不打断。
         debug_assert!(
             vec.iter().any(|&x| x > 0.0),
@@ -313,7 +314,7 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(
         out,
         "- strategy_sum entries: `{}`",
-        trainer.strategy_sum().inner().len()
+        trainer.strategy_sum_len()
     )
     .unwrap();
     if entries_out_of_range > 0 {

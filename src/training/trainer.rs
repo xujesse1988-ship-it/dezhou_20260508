@@ -23,7 +23,7 @@ use crate::error::{CheckpointError, TrainerError, TrainerVariant};
 use crate::training::checkpoint::{preflight_trainer, read_file_bytes, Checkpoint, SCHEMA_VERSION};
 use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::regret::{
-    LocalRegretDelta, LocalStrategyDelta, RegretTable, SigmaVec, StrategyAccumulator,
+    CfrTables, LocalRegretDelta, LocalStrategyDelta, RegretTable, SigmaVec, StrategyAccumulator,
 };
 use crate::training::sampling::{derive_substream_seed, sample_discrete};
 
@@ -285,8 +285,7 @@ fn recurse_vanilla<G: Game>(
 /// D2 \[实现\] checkpoint 序列化路径消费。
 pub struct EsMccfrTrainer<G: Game> {
     pub(crate) game: G,
-    pub(crate) regret: RegretTable<G::InfoSet>,
-    pub(crate) strategy_sum: StrategyAccumulator<G::InfoSet>,
+    pub(crate) tables: CfrTables<G::InfoSet>,
     pub(crate) update_count: u64,
     pub(crate) rng_substream_seed: [u8; 32],
 }
@@ -300,8 +299,7 @@ impl<G: Game> EsMccfrTrainer<G> {
         let rng_substream_seed = derive_substream_seed(master_seed, 0, 0);
         Self {
             game,
-            regret: RegretTable::new(),
-            strategy_sum: StrategyAccumulator::new(),
+            tables: CfrTables::new(),
             update_count: 0,
             rng_substream_seed,
         }
@@ -310,14 +308,29 @@ impl<G: Game> EsMccfrTrainer<G> {
     /// 已访问 infoset 的 strategy_sum 表只读访问（诊断用：导出
     /// `Σ_a strategy_sum[I][a]` 作为该 infoset 的"学习信号权重"，用于分布分析）。
     #[doc(hidden)]
-    pub fn strategy_sum(&self) -> &StrategyAccumulator<G::InfoSet> {
-        &self.strategy_sum
+    pub fn strategy_sum(&self) -> StrategyAccumulator<G::InfoSet> {
+        self.tables.to_strategy_accumulator()
     }
 
     /// 已访问 infoset 的 regret 表只读访问（诊断用，同 [`Self::strategy_sum`]）。
     #[doc(hidden)]
-    pub fn regret_table(&self) -> &RegretTable<G::InfoSet> {
-        &self.regret
+    pub fn regret_table(&self) -> RegretTable<G::InfoSet> {
+        self.tables.to_regret_table()
+    }
+
+    #[doc(hidden)]
+    pub fn strategy_sum_for(&self, info_set: &G::InfoSet) -> Option<&[f64]> {
+        self.tables.strategy_slice(info_set)
+    }
+
+    #[doc(hidden)]
+    pub fn regret_len(&self) -> usize {
+        self.tables.len()
+    }
+
+    #[doc(hidden)]
+    pub fn strategy_sum_len(&self) -> usize {
+        self.tables.len()
     }
 
     /// 多线程并发 step（D-321-rev1 lock + E2-rev1 \[实现\] 优化）。
@@ -342,8 +355,8 @@ impl<G: Game> EsMccfrTrainer<G> {
     /// = `Vec<(I, SigmaVec)>` 按 DFS 顺序 append；merge 阶段按 tid 升序 ×
     /// 每 thread 内 push 顺序 playback 到主表。
     ///
-    /// **线程内语义**：σ 计算走只读共享 `&self.regret`
-    /// （[`RegretTable::current_strategy`] 对 HashMap 无锁只读在 rayon 任务
+    /// **线程内语义**：σ 计算走只读共享 `&self.tables`
+    /// （[`CfrTables::current_strategy_smallvec`] 对 HashMap 无锁只读在 rayon 任务
     /// 借用期内 by-design 安全；HashMap 未触发结构 rehash 因主表不被任何
     /// worker 写）；regret + strategy_sum 累积全 push 到线程内本地 delta vec。
     ///
@@ -382,12 +395,12 @@ impl<G: Game> EsMccfrTrainer<G> {
         let base_update_count = self.update_count;
 
         let game = &self.game;
-        let shared_regret: &RegretTable<G::InfoSet> = &self.regret;
+        let shared_tables: &CfrTables<G::InfoSet> = &self.tables;
 
         // rayon 全局 pool dispatch：`par_iter_mut().enumerate()` 是
         // `IndexedParallelIterator`，`.collect()` 保 input index 顺序，因此
         // `deltas[tid]` 与 tid 一一对应（等价原 `std::thread::scope` spawn-by-tid
-        // 顺序）。borrow checker：&self.game + &self.regret + &mut rng_pool[..]
+        // 顺序）。borrow checker：&self.game + &self.tables + &mut rng_pool[..]
         // 在 collect 完成前等同 scope-borrow 期，rayon scope-fifo 关闭前所有
         // 任务必须 join。
         #[allow(clippy::type_complexity)]
@@ -405,7 +418,7 @@ impl<G: Game> EsMccfrTrainer<G> {
                         root,
                         traverser,
                         1.0,
-                        shared_regret,
+                        shared_tables,
                         &mut local_regret,
                         &mut local_strategy,
                         rng,
@@ -419,10 +432,10 @@ impl<G: Game> EsMccfrTrainer<G> {
         // batch merge sort 是主导 merge cost，append-only 路径直接消除）。
         for (local_regret, local_strategy) in deltas {
             for (info, delta) in local_regret.into_entries() {
-                self.regret.accumulate(info, &delta);
+                self.tables.accumulate_regret(info, &delta);
             }
             for (info, weighted) in local_strategy.into_entries() {
-                self.strategy_sum.accumulate(info, &weighted);
+                self.tables.accumulate_strategy(info, &weighted);
             }
         }
         self.update_count += n_active as u64;
@@ -436,46 +449,25 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
         let n_players = self.game.n_players() as u64;
         let traverser = (self.update_count % n_players) as PlayerId;
         let root = self.game.root(rng);
-        recurse_es::<G>(
-            root,
-            traverser,
-            1.0,
-            &mut self.regret,
-            &mut self.strategy_sum,
-            rng,
-        );
+        recurse_es_compact::<G>(root, traverser, 1.0, &mut self.tables, rng);
         self.update_count += 1;
         Ok(())
     }
 
     fn current_strategy(&self, info_set: &G::InfoSet) -> Vec<f64> {
-        let n = self
-            .regret
-            .inner()
-            .get(info_set)
-            .map(|v| v.len())
-            .or_else(|| self.strategy_sum.inner().get(info_set).map(|v| v.len()))
-            .unwrap_or(0);
+        let n = self.tables.action_count(info_set).unwrap_or(0);
         if n == 0 {
             return Vec::new();
         }
-        // API-310 入口走 RegretTable::current_strategy 直接返回 owned Vec<f64>
-        // （API-320 surface 不变）。trainer hot path 走 current_strategy_smallvec。
-        self.regret.current_strategy(info_set, n)
+        self.tables.current_strategy(info_set, n)
     }
 
     fn average_strategy(&self, info_set: &G::InfoSet) -> Vec<f64> {
-        let n = self
-            .strategy_sum
-            .inner()
-            .get(info_set)
-            .map(|v| v.len())
-            .or_else(|| self.regret.inner().get(info_set).map(|v| v.len()))
-            .unwrap_or(0);
+        let n = self.tables.action_count(info_set).unwrap_or(0);
         if n == 0 {
             return Vec::new();
         }
-        self.strategy_sum.average_strategy(info_set, n)
+        self.tables.average_strategy(info_set, n)
     }
 
     fn update_count(&self) -> u64 {
@@ -483,8 +475,8 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
     }
 
     fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
-        let regret_table_bytes = encode_table(self.regret.inner())?;
-        let strategy_sum_bytes = encode_table(self.strategy_sum.inner())?;
+        let regret_table_bytes = encode_table_iter(self.tables.regret_entries())?;
+        let strategy_sum_bytes = encode_table_iter(self.tables.strategy_entries())?;
         let ckpt = Checkpoint {
             schema_version: SCHEMA_VERSION,
             trainer_variant: TrainerVariant::EsMccfr,
@@ -510,12 +502,11 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             game.bucket_table_blake3(),
         )?;
         let ckpt = Checkpoint::parse_bytes(&bytes)?;
-        let regret = decode_table::<G::InfoSet>(&ckpt.regret_table_bytes)?;
-        let strategy_sum = decode_strategy::<G::InfoSet>(&ckpt.strategy_sum_bytes)?;
+        let regret = decode_entries::<G::InfoSet>(&ckpt.regret_table_bytes)?;
+        let strategy_sum = decode_entries::<G::InfoSet>(&ckpt.strategy_sum_bytes)?;
         Ok(Self {
             game,
-            regret,
-            strategy_sum,
+            tables: CfrTables::from_tables(regret, strategy_sum),
             update_count: ckpt.update_count,
             rng_substream_seed: ckpt.rng_state,
         })
@@ -537,6 +528,7 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
 ///   提供，不能在 sampled path 上再次显式相乘。
 /// - `regret` / `strategy_sum`：可变借用累积容器
 /// - `rng`：chance + opp action sampling 共享 rng（D-315 显式注入）
+#[allow(dead_code)]
 fn recurse_es<G: Game>(
     state: G::State,
     traverser: PlayerId,
@@ -621,11 +613,73 @@ fn recurse_es<G: Game>(
     }
 }
 
+fn recurse_es_compact<G: Game>(
+    state: G::State,
+    traverser: PlayerId,
+    pi_trav: f64,
+    tables: &mut CfrTables<G::InfoSet>,
+    rng: &mut dyn RngSource,
+) -> f64 {
+    match G::current(&state) {
+        NodeKind::Terminal => G::payoff(&state, traverser),
+        NodeKind::Chance => {
+            let dist = G::chance_distribution(&state);
+            let action = sample_discrete(&dist, rng);
+            let next_state = G::next(state, action, rng);
+            recurse_es_compact::<G>(next_state, traverser, pi_trav, tables, rng)
+        }
+        NodeKind::Player(actor) => {
+            let info = G::info_set(&state, actor);
+            let actions = G::legal_actions(&state);
+            let n = actions.len();
+            let sigma = tables.current_strategy_smallvec(&info, n);
+
+            if actor == traverser {
+                let weighted: ShortVec<f64> = sigma.iter().map(|s| pi_trav * s).collect();
+                tables.accumulate_strategy(info.clone(), &weighted);
+
+                let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
+                for (i, action) in actions.iter().enumerate() {
+                    let next_state = G::next(state.clone(), *action, rng);
+                    let cfv = recurse_es_compact::<G>(
+                        next_state,
+                        traverser,
+                        pi_trav * sigma[i],
+                        tables,
+                        rng,
+                    );
+                    cfvs.push(cfv);
+                }
+                let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
+                let delta: ShortVec<f64> = cfvs.iter().map(|c| c - sigma_value).collect();
+                tables.accumulate_regret(info, &delta);
+                sigma_value
+            } else {
+                let nonzero_dist: ShortVec<(G::Action, f64)> = actions
+                    .iter()
+                    .copied()
+                    .zip(sigma.iter().copied())
+                    .filter(|(_, p)| *p > 0.0)
+                    .collect();
+                debug_assert!(
+                    !nonzero_dist.is_empty(),
+                    "non-traverser σ all-zero impossible: CfrTables::current_strategy 退化局面 \
+                     回退均匀分布 (D-331)，sum = n_actions × (1/n_actions) = 1.0 strictly > 0"
+                );
+                let sampled = sample_discrete(&nonzero_dist, rng);
+
+                let next_state = G::next(state, sampled, rng);
+                recurse_es_compact::<G>(next_state, traverser, pi_trav, tables, rng)
+            }
+        }
+    }
+}
+
 /// E2 \[实现\] 真并发 DFS recurse（D-301 详解伪代码 + D-321-rev1 真并发路径）。
 ///
 /// 与 [`recurse_es`] 同型语义，差别仅在累积容器分流：
-/// - **σ 计算（current_strategy）**：走 **共享只读** `shared_regret`
-///   （[`RegretTable::current_strategy`] 对未见 InfoSet 自动回退均匀分布
+/// - **σ 计算（current_strategy）**：走 **共享只读** `shared_tables`
+///   （[`CfrTables::current_strategy_smallvec`] 对未见 InfoSet 自动回退均匀分布
 ///   `1 / n_actions`，等价 [`RegretTable::get_or_init`] 后查；
 ///   parallel 路径下不调 `get_or_init` 避免线程间 HashMap 写竞争）。
 /// - **regret push**：写入 **线程本地** `LocalRegretDelta` append-only
@@ -643,7 +697,7 @@ fn recurse_es_parallel<G: Game>(
     state: G::State,
     traverser: PlayerId,
     pi_trav: f64,
-    shared_regret: &RegretTable<G::InfoSet>,
+    shared_tables: &CfrTables<G::InfoSet>,
     local_regret: &mut LocalRegretDelta<G::InfoSet>,
     local_strategy: &mut LocalStrategyDelta<G::InfoSet>,
     rng: &mut dyn RngSource,
@@ -658,7 +712,7 @@ fn recurse_es_parallel<G: Game>(
                 next_state,
                 traverser,
                 pi_trav,
-                shared_regret,
+                shared_tables,
                 local_regret,
                 local_strategy,
                 rng,
@@ -671,7 +725,7 @@ fn recurse_es_parallel<G: Game>(
             // 共享只读：current_strategy_smallvec 对未见 InfoSet 返回均匀分布
             // (`1 / n_actions`)，等价 get_or_init 后查；parallel 路径下不写
             // 共享主表避免 HashMap 跨线程写竞争。E2-rev1：走 SmallVec hot path。
-            let sigma = shared_regret.current_strategy_smallvec(&info, n);
+            let sigma = shared_tables.current_strategy_smallvec(&info, n);
 
             if actor == traverser {
                 let weighted: SigmaVec = sigma.iter().map(|s| pi_trav * s).collect();
@@ -684,7 +738,7 @@ fn recurse_es_parallel<G: Game>(
                         next_state,
                         traverser,
                         pi_trav * sigma[i],
-                        shared_regret,
+                        shared_tables,
                         local_regret,
                         local_strategy,
                         rng,
@@ -714,7 +768,7 @@ fn recurse_es_parallel<G: Game>(
                     next_state,
                     traverser,
                     pi_trav,
-                    shared_regret,
+                    shared_tables,
                     local_regret,
                     local_strategy,
                     rng,
@@ -745,13 +799,37 @@ fn encode_table<I>(
 where
     I: Clone + Ord + serde::Serialize,
 {
-    let mut entries: Vec<(I, Vec<f64>)> =
-        table.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    encode_table_iter(table.iter().map(|(k, v)| (k, v.as_slice())))
+}
+
+fn encode_table_iter<'a, I, It>(entries: It) -> Result<Vec<u8>, CheckpointError>
+where
+    I: Clone + Ord + serde::Serialize + 'a,
+    It: IntoIterator<Item = (&'a I, &'a [f64])>,
+{
+    let mut entries: Vec<(I, Vec<f64>)> = entries
+        .into_iter()
+        .map(|(k, v)| (k.clone(), v.to_vec()))
+        .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     bincode::serialize(&entries).map_err(|e| CheckpointError::Corrupted {
         offset: 0,
         reason: format!("bincode serialize regret/strategy table failed: {e}"),
     })
+}
+
+fn decode_entries<I>(
+    bytes: &[u8],
+) -> Result<std::collections::HashMap<I, Vec<f64>>, CheckpointError>
+where
+    I: Clone + Eq + std::hash::Hash + serde::de::DeserializeOwned,
+{
+    let entries: Vec<(I, Vec<f64>)> =
+        bincode::deserialize(bytes).map_err(|e| CheckpointError::Corrupted {
+            offset: 0,
+            reason: format!("bincode deserialize table failed: {e}"),
+        })?;
+    Ok(entries.into_iter().collect())
 }
 
 /// bincode-serialized bytes → [`RegretTable<I>`]（`encode_table` 的逆）。

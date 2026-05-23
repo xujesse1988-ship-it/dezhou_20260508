@@ -144,17 +144,25 @@ fn run(args: Args) -> Result<(), String> {
     // Collect per-infoset signal weight per --mode：
     // - strategy: Σ_a strategy_sum[I][a]
     // - regret_l1: Σ_a |regret[I][a]|
-    let inner = match args.mode {
-        Mode::Strategy => trainer.strategy_sum().inner(),
-        Mode::RegretL1 => trainer.regret_table().inner(),
-    };
     let weight_fn: fn(&[f64]) -> f64 = match args.mode {
         Mode::Strategy => |v| v.iter().sum(),
         Mode::RegretL1 => |v| v.iter().map(|x| x.abs()).sum(),
     };
     let mut by_street: BTreeMap<u8, Vec<f64>> = BTreeMap::new();
-    let mut all_weights: Vec<f64> = Vec::with_capacity(inner.len());
     let mut action_count: BTreeMap<usize, usize> = BTreeMap::new();
+    let strategy_table;
+    let regret_table;
+    let inner = match args.mode {
+        Mode::Strategy => {
+            strategy_table = trainer.strategy_sum();
+            strategy_table.inner()
+        }
+        Mode::RegretL1 => {
+            regret_table = trainer.regret_table();
+            regret_table.inner()
+        }
+    };
+    let mut all_weights: Vec<f64> = Vec::with_capacity(inner.len());
     for (info, vec) in inner {
         let weight: f64 = weight_fn(vec);
         let info: InfoSetId = *info;
