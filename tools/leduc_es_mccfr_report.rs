@@ -20,6 +20,9 @@ struct Args {
     seed: u64,
     report_every: u64,
     output: PathBuf,
+    /// LCFR-MCCFR period 大小（updates per period）。`None` = vanilla ES-MCCFR baseline。
+    /// Brown & Sandholm 2018 §Discounted Monte Carlo CFR：period n 末 rescale × n/(n+1)。
+    lcfr_period: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -49,6 +52,7 @@ fn parse_args() -> Result<Args, String> {
     let mut seed = DEFAULT_SEED;
     let mut report_every = 10_000_000;
     let mut output = PathBuf::from("artifacts/leduc_es_mccfr_100m_strategy.txt");
+    let mut lcfr_period: Option<u64> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -65,10 +69,16 @@ fn parse_args() -> Result<Args, String> {
             "--output" => {
                 output = PathBuf::from(args.next().ok_or("--output requires a value")?);
             }
+            "--lcfr-period" => {
+                lcfr_period = Some(parse_u64(
+                    &args.next().ok_or("--lcfr-period requires a value")?,
+                )?);
+            }
             "--help" | "-h" => {
                 println!(
                     "usage: cargo run --release --bin leduc_es_mccfr_report -- \
-                     [--updates N] [--seed N] [--report-every N] [--output PATH]"
+                     [--updates N] [--seed N] [--report-every N] [--output PATH] \
+                     [--lcfr-period N]"
                 );
                 std::process::exit(0);
             }
@@ -81,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
         seed,
         report_every,
         output,
+        lcfr_period,
     })
 }
 
@@ -100,12 +111,19 @@ fn run(args: Args) -> Result<(), String> {
     }
 
     let mut trainer = EsMccfrTrainer::new(LeducGame, args.seed);
+    if let Some(period) = args.lcfr_period {
+        trainer = trainer.with_lcfr_period(period);
+    }
     let mut rng = ChaCha20Rng::from_seed(args.seed);
     let started = Instant::now();
     let report_every = args.report_every.max(1);
 
+    let mode_label = match args.lcfr_period {
+        Some(p) => format!("LCFR-MCCFR period={p}"),
+        None => "vanilla ES-MCCFR".to_string(),
+    };
     eprintln!(
-        "[leduc_es_mccfr_report] updates={} seed=0x{:016x}",
+        "[leduc_es_mccfr_report] updates={} seed=0x{:016x} mode={mode_label}",
         args.updates, args.seed
     );
 
@@ -136,6 +154,7 @@ fn run(args: Args) -> Result<(), String> {
     let mut out = BufWriter::new(file);
 
     writeln!(out, "Leduc ES-MCCFR strategy report").map_err(write_err)?;
+    writeln!(out, "mode: {mode_label}").map_err(write_err)?;
     writeln!(out, "updates: {}", trainer.update_count()).map_err(write_err)?;
     writeln!(out, "seed: 0x{:016x}", args.seed).map_err(write_err)?;
     writeln!(out, "wall_seconds: {:.3}", started.elapsed().as_secs_f64()).map_err(write_err)?;

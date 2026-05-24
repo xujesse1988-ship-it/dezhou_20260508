@@ -153,6 +153,17 @@ impl<I: Eq + Hash + Clone> RegretTable<I> {
         }
     }
 
+    /// 整表逐元素 × factor（LCFR-MCCFR period boundary rescale，Brown & Sandholm
+    /// 2018 §Discounted Monte Carlo CFR）。period n 末尾以 `factor = n/(n+1)` 调用，
+    /// 等价 Linear CFR 的逐 iter 权重 t 但 amortize 到 period 粒度。
+    pub fn rescale_all(&mut self, factor: f64) {
+        for entry in self.inner.values_mut() {
+            for slot in entry.iter_mut() {
+                *slot *= factor;
+            }
+        }
+    }
+
     /// 已访问 InfoSet 数（监控用 + 跨 host 一致性 sanity）。
     pub fn len(&self) -> usize {
         self.inner.len()
@@ -287,6 +298,16 @@ impl<I: Eq + Hash + Clone> StrategyAccumulator<I> {
         );
         for (slot, &w) in entry.iter_mut().zip(weighted_strategy) {
             *slot += w;
+        }
+    }
+
+    /// 整表逐元素 × factor（LCFR-MCCFR period boundary rescale，语义同
+    /// [`RegretTable::rescale_all`]，作用于 strategy_sum）。
+    pub fn rescale_all(&mut self, factor: f64) {
+        for entry in self.inner.values_mut() {
+            for slot in entry.iter_mut() {
+                *slot *= factor;
+            }
         }
     }
 

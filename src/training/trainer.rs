@@ -289,6 +289,17 @@ pub struct EsMccfrTrainer<G: Game> {
     pub(crate) strategy_sum: StrategyAccumulator<G::InfoSet>,
     pub(crate) update_count: u64,
     pub(crate) rng_substream_seed: [u8; 32],
+    /// LCFR-MCCFR period 大小（updates per period）。`None` = vanilla ES-MCCFR
+    /// （strategy_sum / regret 不衰减）。`Some(P)` = Brown & Sandholm 2018
+    /// §Discounted Monte Carlo CFR：每完成 P 个 update 触发一次 period boundary
+    /// rescale，period n 末乘 `n/(n+1)`，等价 Linear CFR 权重但 amortize 到 period
+    /// 粒度。Burch 2017 + Brown 2018 验证 CFR+ 加 MCCFR 不起作用，LCFR 加 MCCFR
+    /// 显著优于 vanilla（HUNL subgame Figure 10/11，arxiv 1809.04040）。
+    pub(crate) lcfr_period_size: Option<u64>,
+    /// 已完成的 period 数（= 已触发 rescale 次数）。`step` / `step_parallel` 末
+    /// `target = update_count / period_size` 与本字段比较，差值为本批应补的 rescale
+    /// 次数。`lcfr_period_size = None` 时本字段恒 0。
+    pub(crate) lcfr_periods_completed: u64,
 }
 
 impl<G: Game> EsMccfrTrainer<G> {
@@ -304,6 +315,48 @@ impl<G: Game> EsMccfrTrainer<G> {
             strategy_sum: StrategyAccumulator::new(),
             update_count: 0,
             rng_substream_seed,
+            lcfr_period_size: None,
+            lcfr_periods_completed: 0,
+        }
+    }
+
+    /// 启用 LCFR-MCCFR period rescale（Brown & Sandholm 2018 §Discounted Monte
+    /// Carlo CFR）。`period_size` = 每 period 多少个 update；典型取值让
+    /// `total_updates / period_size` 落在 20–100 之间（period 太少 → linear 权重
+    /// 不充分，period 太多 → rescale 开销可见）。0 或 `update_count > 0` 时调用
+    /// panic（必须在训练开始前 / `update_count == 0` 状态配置）。
+    pub fn with_lcfr_period(mut self, period_size: u64) -> Self {
+        assert!(
+            period_size > 0,
+            "LCFR period_size must be > 0 (got 0); pass None / 不调用本方法 = vanilla ES-MCCFR"
+        );
+        assert_eq!(
+            self.update_count, 0,
+            "LCFR period_size must be configured before any step (update_count = {} != 0)",
+            self.update_count
+        );
+        self.lcfr_period_size = Some(period_size);
+        self
+    }
+
+    /// 处理 LCFR period boundary rescale（`step` / `step_parallel` 末调用）。
+    /// `update_count` 已更新到本批末尾值；本方法补做 `lcfr_periods_completed` 与
+    /// `update_count / period_size` 之间所有缺失的 rescale。
+    ///
+    /// `step_parallel` 一批可能跨多个 period boundary（n_threads × P 的极端情形），
+    /// 通过 while-loop 顺序补齐，每个 boundary 用对应的 `n/(n+1)` 因子。
+    fn maybe_lcfr_rescale(&mut self) {
+        let Some(period_size) = self.lcfr_period_size else {
+            return;
+        };
+        let target = self.update_count / period_size;
+        while self.lcfr_periods_completed < target {
+            let n = self.lcfr_periods_completed + 1;
+            // factor = n / (n+1)；n+1 不溢出（u64 范围远超 NLHE 实际 period count）。
+            let factor = (n as f64) / ((n + 1) as f64);
+            self.regret.rescale_all(factor);
+            self.strategy_sum.rescale_all(factor);
+            self.lcfr_periods_completed = n;
         }
     }
 
@@ -426,6 +479,12 @@ impl<G: Game> EsMccfrTrainer<G> {
             }
         }
         self.update_count += n_active as u64;
+        // LCFR-MCCFR period rescale 在批合并完成后触发；本批的所有 delta 都在
+        // pre-rescale scale 下累积（worker 读 σ 也走 pre-rescale R⁺，σ 归一化后
+        // 跟 rescale 无关）。跨 period boundary 时 boundary 后 ≤ n_threads 个
+        // update 享受了 boundary 前的 weight，period_size ≫ n_threads 时误差
+        // 可忽略（NLHE 默认 period 1M / n_threads 32 → 0.003% 偏置）。
+        self.maybe_lcfr_rescale();
         Ok(())
     }
 }
@@ -445,6 +504,7 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             rng,
         );
         self.update_count += 1;
+        self.maybe_lcfr_rescale();
         Ok(())
     }
 
@@ -518,6 +578,12 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             strategy_sum,
             update_count: ckpt.update_count,
             rng_substream_seed: ckpt.rng_state,
+            // LCFR period 配置不存 checkpoint（schema v2 不变）。resume 后默认
+            // vanilla ES-MCCFR；调用方若要继续 LCFR 需立即调 `with_lcfr_period`，
+            // 但本 trainer 校验 update_count == 0 → resume 路径无法 enable LCFR。
+            // production 路径走"先决定 period_size，cold start，跑到底"。
+            lcfr_period_size: None,
+            lcfr_periods_completed: 0,
         })
     }
 }
