@@ -27,6 +27,7 @@
 //! `1c22c1ee...`）。`SimplifiedNlheGame::new` 校验 `schema_version() == 3` +
 //! `config() == BucketConfig::new(500, 500, 500)`。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::abstraction::action::{AbstractAction, ActionAbstraction, DefaultActionAbstraction};
@@ -181,7 +182,6 @@ impl SimplifiedNlheGame {
 /// 静态方法在 postflop 路径上能访问 lookup 表（trait 方法签名 `state: &Self::State`
 /// 不含 `&self`，因此 bucket_table 引用必须通过 state 携带；Arc clone 每次
 /// `next` 增 1 引用计数，无堆复制）。
-#[derive(Clone)]
 pub struct SimplifiedNlheState {
     pub game_state: GameState,
     pub action_history: Vec<SimplifiedNlheAction>,
@@ -192,6 +192,50 @@ pub struct SimplifiedNlheState {
     /// 仅用于调试 / 测试 path-to-root 还原）。
     pub current_node_id: NodeId,
     pub(crate) tree: Arc<PublicBettingTree>,
+    /// info_set hand_bucket per-street cache（packed u64，layout 见
+    /// [`pack_info_set_cache`]）。同一 trajectory 内 (street, actor) 不变时直接命中，
+    /// 跳过 `canonical_observation_id` + `BucketTable::lookup`；street 切换时
+    /// `info_set` 读到 packed `street_plus_one` mismatch 自动重算。Atomic 仅为满足
+    /// `Game::State: Sync` bound（State 实际由单 worker 拥有，Relaxed 等价普通
+    /// load/store）。
+    pub(crate) info_set_cache: AtomicU64,
+}
+
+impl Clone for SimplifiedNlheState {
+    fn clone(&self) -> Self {
+        Self {
+            game_state: self.game_state.clone(),
+            action_history: self.action_history.clone(),
+            bucket_table: Arc::clone(&self.bucket_table),
+            current_node_id: self.current_node_id,
+            tree: Arc::clone(&self.tree),
+            info_set_cache: AtomicU64::new(self.info_set_cache.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// info_set hand_bucket cache packed layout（小端，低位起）：
+/// - bits 0..8:   `street_plus_one`（0 = invalid，1..=4 = Preflop..River + 1）
+/// - bits 8..16:  `set_mask`（bit `actor` = actor 的 bucket 已缓存；HU 仅低 2 位有效）
+/// - bits 16..32: actor 0 hand_bucket（u16；preflop ≤ 169 / postflop ≤ 500，远 < 65536）
+/// - bits 32..48: actor 1 hand_bucket（u16）
+/// - bits 48..64: reserved 0
+#[inline]
+fn pack_info_set_cache(street_plus_one: u8, mask: u8, bucket0: u16, bucket1: u16) -> u64 {
+    (street_plus_one as u64)
+        | ((mask as u64) << 8)
+        | ((bucket0 as u64) << 16)
+        | ((bucket1 as u64) << 32)
+}
+
+#[inline]
+fn unpack_info_set_cache(packed: u64) -> (u8, u8, u16, u16) {
+    (
+        packed as u8,
+        (packed >> 8) as u8,
+        (packed >> 16) as u16,
+        (packed >> 32) as u16,
+    )
 }
 
 impl std::fmt::Debug for SimplifiedNlheState {
@@ -243,6 +287,7 @@ impl Game for SimplifiedNlheGame {
             bucket_table: Arc::clone(&self.bucket_table),
             current_node_id: self.tree.root_id(),
             tree: Arc::clone(&self.tree),
+            info_set_cache: AtomicU64::new(0),
         }
     }
 
@@ -264,9 +309,6 @@ impl Game for SimplifiedNlheGame {
         // node_id 单射于抽象 betting tree 路径，subsume 旧 position/stack/betting_state
         // /action_signature 字段，并彻底解决跨街 collision（见
         // `docs/nlhe_infoset_history_investigation.md` 方案 A）。
-        let hole = state.game_state.players()[actor as usize]
-            .hole_cards
-            .expect("SimplifiedNlhe info_set: actor hole_cards must be present on decision node");
         let node = state.tree.node(state.current_node_id);
         debug_assert_eq!(
             node.player_acting, actor,
@@ -274,6 +316,24 @@ impl Game for SimplifiedNlheGame {
             node.player_acting
         );
         let street_tag = node.street;
+        let street_plus_one: u8 = (street_tag as u8) + 1;
+        debug_assert!(actor < 2, "HU NLHE actor must be 0 or 1, got {actor}");
+        let actor_bit: u8 = 1u8 << actor;
+
+        // info_set hand_bucket per-street cache（D-378 后续优化）：同一 trajectory
+        // 内 (street, actor) 的 (board, hole) 不变 → hand_bucket 必相同；命中跳过
+        // postflop `canonical_observation_id` 二进制搜索 + bucket_table.lookup。
+        // street 切换时 packed `street_plus_one` mismatch 自动失效。
+        let cached = state.info_set_cache.load(Ordering::Relaxed);
+        let (cached_sp1, cached_mask, cached_b0, cached_b1) = unpack_info_set_cache(cached);
+        if cached_sp1 == street_plus_one && (cached_mask & actor_bit) != 0 {
+            let bucket = if actor == 0 { cached_b0 } else { cached_b1 } as u32;
+            return pack_info_set_v2(bucket, state.current_node_id, street_tag);
+        }
+
+        let hole = state.game_state.players()[actor as usize]
+            .hole_cards
+            .expect("SimplifiedNlhe info_set: actor hole_cards must be present on decision node");
 
         let hand_bucket: u32 = match street_tag {
             StreetTag::Preflop => {
@@ -293,6 +353,33 @@ impl Game for SimplifiedNlheGame {
                     .expect("BucketTable::lookup returned None on in-range observation_id")
             }
         };
+        debug_assert!(
+            hand_bucket < (1u32 << 16),
+            "hand_bucket={hand_bucket} 超 u16 cache slot 上限；preflop ≤ 169 / postflop ≤ 500"
+        );
+        let hand_bucket_u16 = hand_bucket as u16;
+
+        let (new_mask, new_b0, new_b1) = if cached_sp1 == street_plus_one {
+            // 同街已缓存对手 → 保留对手 bucket，写本 actor slot。
+            let (b0, b1) = if actor == 0 {
+                (hand_bucket_u16, cached_b1)
+            } else {
+                (cached_b0, hand_bucket_u16)
+            };
+            (cached_mask | actor_bit, b0, b1)
+        } else {
+            // 街切换 / 首次 → 仅本 actor slot 有效。
+            let (b0, b1) = if actor == 0 {
+                (hand_bucket_u16, 0)
+            } else {
+                (0, hand_bucket_u16)
+            };
+            (actor_bit, b0, b1)
+        };
+        state.info_set_cache.store(
+            pack_info_set_cache(street_plus_one, new_mask, new_b0, new_b1),
+            Ordering::Relaxed,
+        );
 
         pack_info_set_v2(hand_bucket, state.current_node_id, street_tag)
     }
