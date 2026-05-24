@@ -300,6 +300,9 @@ pub struct EsMccfrTrainer<G: Game> {
     /// `target = update_count / period_size` 与本字段比较，差值为本批应补的 rescale
     /// 次数。`lcfr_period_size = None` 时本字段恒 0。
     pub(crate) lcfr_periods_completed: u64,
+    /// LCFR rescale 是否同时作用于 regret 表（Brown 2018 默认 true）；false 时
+    /// 仅 rescale strategy_sum（对照实验入口，见 [`Self::with_lcfr_period_strategy_only`]）。
+    pub(crate) lcfr_rescale_regret: bool,
 }
 
 impl<G: Game> EsMccfrTrainer<G> {
@@ -317,6 +320,7 @@ impl<G: Game> EsMccfrTrainer<G> {
             rng_substream_seed,
             lcfr_period_size: None,
             lcfr_periods_completed: 0,
+            lcfr_rescale_regret: true,
         }
     }
 
@@ -354,10 +358,31 @@ impl<G: Game> EsMccfrTrainer<G> {
             let n = self.lcfr_periods_completed + 1;
             // factor = n / (n+1)；n+1 不溢出（u64 范围远超 NLHE 实际 period count）。
             let factor = (n as f64) / ((n + 1) as f64);
-            self.regret.rescale_all(factor);
+            if self.lcfr_rescale_regret {
+                self.regret.rescale_all(factor);
+            }
             self.strategy_sum.rescale_all(factor);
             self.lcfr_periods_completed = n;
         }
+    }
+
+    /// 仅对 strategy_sum 做 LCFR rescale，regret 不动（"Linear average only"
+    /// 对照实验入口）。Brown 2018 §Discounted MCCFR 标准形态是 regret + strategy_sum
+    /// 同时 rescale；本方法用于诊断"regret discount 是否在 Leduc 收敛后期 over-discount"。
+    /// 必须在 `update_count == 0` 时调用。
+    pub fn with_lcfr_period_strategy_only(mut self, period_size: u64) -> Self {
+        assert!(
+            period_size > 0,
+            "LCFR period_size must be > 0 (got 0); pass None / 不调用本方法 = vanilla ES-MCCFR"
+        );
+        assert_eq!(
+            self.update_count, 0,
+            "LCFR period_size must be configured before any step (update_count = {} != 0)",
+            self.update_count
+        );
+        self.lcfr_period_size = Some(period_size);
+        self.lcfr_rescale_regret = false;
+        self
     }
 
     /// 已访问 infoset 的 strategy_sum 表只读访问（诊断用：导出
@@ -584,6 +609,7 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             // production 路径走"先决定 period_size，cold start，跑到底"。
             lcfr_period_size: None,
             lcfr_periods_completed: 0,
+            lcfr_rescale_regret: true,
         })
     }
 }

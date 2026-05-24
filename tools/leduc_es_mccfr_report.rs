@@ -23,6 +23,8 @@ struct Args {
     /// LCFR-MCCFR period 大小（updates per period）。`None` = vanilla ES-MCCFR baseline。
     /// Brown & Sandholm 2018 §Discounted Monte Carlo CFR：period n 末 rescale × n/(n+1)。
     lcfr_period: Option<u64>,
+    /// 仅 rescale strategy_sum，regret 不动（对照实验入口）。默认 false = 标准 LCFR。
+    lcfr_strategy_only: bool,
 }
 
 fn main() -> ExitCode {
@@ -53,6 +55,7 @@ fn parse_args() -> Result<Args, String> {
     let mut report_every = 10_000_000;
     let mut output = PathBuf::from("artifacts/leduc_es_mccfr_100m_strategy.txt");
     let mut lcfr_period: Option<u64> = None;
+    let mut lcfr_strategy_only = false;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -74,11 +77,14 @@ fn parse_args() -> Result<Args, String> {
                     &args.next().ok_or("--lcfr-period requires a value")?,
                 )?);
             }
+            "--lcfr-strategy-only" => {
+                lcfr_strategy_only = true;
+            }
             "--help" | "-h" => {
                 println!(
                     "usage: cargo run --release --bin leduc_es_mccfr_report -- \
                      [--updates N] [--seed N] [--report-every N] [--output PATH] \
-                     [--lcfr-period N]"
+                     [--lcfr-period N] [--lcfr-strategy-only]"
                 );
                 std::process::exit(0);
             }
@@ -92,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
         report_every,
         output,
         lcfr_period,
+        lcfr_strategy_only,
     })
 }
 
@@ -112,15 +119,20 @@ fn run(args: Args) -> Result<(), String> {
 
     let mut trainer = EsMccfrTrainer::new(LeducGame, args.seed);
     if let Some(period) = args.lcfr_period {
-        trainer = trainer.with_lcfr_period(period);
+        trainer = if args.lcfr_strategy_only {
+            trainer.with_lcfr_period_strategy_only(period)
+        } else {
+            trainer.with_lcfr_period(period)
+        };
     }
     let mut rng = ChaCha20Rng::from_seed(args.seed);
     let started = Instant::now();
     let report_every = args.report_every.max(1);
 
-    let mode_label = match args.lcfr_period {
-        Some(p) => format!("LCFR-MCCFR period={p}"),
-        None => "vanilla ES-MCCFR".to_string(),
+    let mode_label = match (args.lcfr_period, args.lcfr_strategy_only) {
+        (Some(p), true) => format!("LCFR-MCCFR period={p} strategy-only"),
+        (Some(p), false) => format!("LCFR-MCCFR period={p}"),
+        (None, _) => "vanilla ES-MCCFR".to_string(),
     };
     eprintln!(
         "[leduc_es_mccfr_report] updates={} seed=0x{:016x} mode={mode_label}",
