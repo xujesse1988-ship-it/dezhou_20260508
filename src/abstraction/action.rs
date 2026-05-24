@@ -124,6 +124,12 @@ impl AbstractActionSet {
     pub fn as_slice(&self) -> &[AbstractAction] {
         &self.actions
     }
+
+    /// 消费 set，move 出内部 `Vec<AbstractAction>`（避免 `as_slice().to_vec()`
+    /// 在 CFR `Game::legal_actions` 热路径上每节点多 alloc 一次 Vec）。
+    pub fn into_actions(self) -> Vec<AbstractAction> {
+        self.actions
+    }
 }
 
 /// `ActionAbstractionConfig`：raise size 集合（D-202）。
