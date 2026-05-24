@@ -472,6 +472,7 @@ fn _stage3_api_signature_assertions() {
         &'a mut EsMccfrTrainer<SimplifiedNlheGame>,
         &'b mut [Box<dyn RngSource>],
         usize,
+        usize,
     ) -> Result<(), TrainerError> = EsMccfrTrainer::<SimplifiedNlheGame>::step_parallel;
     let _: for<'a, 'b> fn(
         &'a mut EsMccfrTrainer<SimplifiedNlheGame>,

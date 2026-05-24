@@ -26,6 +26,11 @@ struct Args {
     keep_last: usize,
     bucket_table: PathBuf,
     threads: usize,
+    /// 每 worker 单次 `step_parallel` 跑多少条 trajectory。1 = 原"每 worker
+    /// 1 trajectory 然后 sync"行为；> 1 摊薄 rayon 调度 + `sched_yield` overhead，
+    /// 是 NLHE 多核 scaling 的主 knob（详 `EsMccfrTrainer::step_parallel` doc）。
+    /// 仅在 `--threads > 1` 路径生效。
+    batch_per_worker: usize,
     quiet: bool,
     /// LCFR-MCCFR period 大小（None = vanilla ES-MCCFR）。Brown & Sandholm 2018
     /// §Discounted Monte Carlo CFR：period n 末 rescale × n/(n+1)。HUNL 推荐
@@ -49,6 +54,7 @@ impl Default for Args {
             keep_last: 5,
             bucket_table: PathBuf::new(),
             threads: 1,
+            batch_per_worker: 16,
             quiet: false,
             lcfr_period: None,
         }
@@ -78,6 +84,9 @@ fn run() -> Result<(), String> {
     }
     if args.threads == 0 {
         return Err("--threads must be > 0".to_string());
+    }
+    if args.batch_per_worker == 0 {
+        return Err("--batch-per-worker must be > 0".to_string());
     }
     if args.report_every == Some(0) {
         return Err("--report-every must be > 0 when provided".to_string());
@@ -140,6 +149,11 @@ fn run() -> Result<(), String> {
         eprintln!("[train_cfr] seed             = 0x{:016x}", args.seed);
         eprintln!("[train_cfr] threads          = {}", args.threads);
         eprintln!(
+            "[train_cfr] batch_per_worker = {} (effective per step_parallel = {})",
+            args.batch_per_worker,
+            args.threads * args.batch_per_worker,
+        );
+        eprintln!(
             "[train_cfr] bucket_table     = {}",
             args.bucket_table.display()
         );
@@ -184,13 +198,21 @@ fn run() -> Result<(), String> {
                 .step(&mut single_rng)
                 .map_err(|e| format!("step failed at update {}: {e:?}", trainer.update_count()))?;
         } else {
-            let n = args.threads.min(remaining as usize);
-            trainer.step_parallel(&mut rng_pool, n).map_err(|e| {
-                format!(
-                    "step_parallel failed at update {}: {e:?}",
-                    trainer.update_count()
-                )
-            })?;
+            // 单次 step_parallel 产 n × batch_per_worker 个 update；最后一个尾批
+            // 缩 batch_per_worker，避免越过 args.updates。n 同步缩到 ≥ 1 worker。
+            let n = args.threads.min(remaining as usize).max(1);
+            let max_batch = remaining
+                .div_ceil(n as u64)
+                .min(args.batch_per_worker as u64) as usize;
+            let batch = max_batch.max(1);
+            trainer
+                .step_parallel(&mut rng_pool, n, batch)
+                .map_err(|e| {
+                    format!(
+                        "step_parallel failed at update {}: {e:?}",
+                        trainer.update_count()
+                    )
+                })?;
         }
 
         let cur = trainer.update_count();
@@ -258,6 +280,10 @@ fn parse_args() -> Result<Args, String> {
                 out.bucket_table = PathBuf::from(next_value(&mut args, "--bucket-table")?)
             }
             "--threads" => out.threads = parse_u64(&next_value(&mut args, "--threads")?)? as usize,
+            "--batch-per-worker" => {
+                out.batch_per_worker =
+                    parse_u64(&next_value(&mut args, "--batch-per-worker")?)? as usize
+            }
             "--quiet" => out.quiet = true,
             "--lcfr-period" => {
                 out.lcfr_period = Some(parse_u64(&next_value(&mut args, "--lcfr-period")?)?)
@@ -333,6 +359,7 @@ fn print_usage() {
          options:\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>\n\
+         \t--batch-per-worker <N>  (default 16; trajectories per worker per step_parallel dispatch)\n\
          \t--resume <checkpoint>\n\
          \t--checkpoint-dir <dir>\n\
          \t--checkpoint-every <N>\n\

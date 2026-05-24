@@ -118,10 +118,13 @@ fn simplified_nlhe_infoset_distinguishes_distinct_preflop_lines() {
         "flop board must match between branches"
     );
 
-    // --- Sanity: 两条线 action_history 实际不同，collision 不是状态退化。 ---
+    // --- Sanity: 两条线 实际走到不同 tree 节点（D-378 CFR fast path 起 root
+    // 不累 `action_history`，改用 tree path-to-root 验证抽象动作序列不同）。 ---
+    let path_a = game.tree().path_to_root(flop_a.current_node_id);
+    let path_b = game.tree().path_to_root(flop_b.current_node_id);
     assert_ne!(
-        flop_a.action_history, flop_b.action_history,
-        "branches must have taken distinct preflop action sequences"
+        path_a, path_b,
+        "branches must have taken distinct preflop abstract-action paths"
     );
 
     // --- 核心断言：v2 InfoSetId 通过 node_id 区分跨街 aggressor 身份。 ---

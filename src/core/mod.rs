@@ -240,7 +240,7 @@ pub enum PlayerStatus {
     SittingOut,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct Player {
     pub seat: SeatId,
     /// 当前剩余筹码（不含本街已投入）。

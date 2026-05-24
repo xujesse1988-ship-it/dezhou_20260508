@@ -414,9 +414,13 @@ fn train_inline(
                 .step(&mut single_rng)
                 .map_err(|e| format!("inline step failed: {e:?}"))?;
         } else {
-            let n = threads.min(remaining as usize);
+            let n = threads.min(remaining as usize).max(1);
+            // 复用 train_cfr 默认 batch_per_worker = 16；inline trainer 跑短 update
+            // 量级（典型 < 200K），用同样的 batch 让 throughput 行为与正式训练一致。
+            let max_batch = remaining.div_ceil(n as u64).min(16) as usize;
+            let batch = max_batch.max(1);
             trainer
-                .step_parallel(&mut rng_pool, n)
+                .step_parallel(&mut rng_pool, n, batch)
                 .map_err(|e| format!("inline step_parallel failed: {e:?}"))?;
         }
     }

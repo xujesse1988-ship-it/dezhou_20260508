@@ -407,52 +407,64 @@ impl<G: Game> EsMccfrTrainer<G> {
     /// `step_parallel` 时的 traverser，后续线程按 `tid` 递增 alternate
     /// （D-307 跨线程扩展，与原 D-321-rev1 形态等价）。
     ///
-    /// **rayon pool 替 `std::thread::scope`**（F1-rev1 vultr 实测加速比仅
-    /// 1.14× 的根因之一 = 12,500 次 step_parallel × 4 OS thread spawn 开销
-    /// ≈ 1-2 s overhead；rayon 全局 pool 复用长寿命 worker，scope-fifo 任务
-    /// 分发 ≈ ns 级 atomic dequeue）。`par_iter_mut().enumerate().collect()`
-    /// 对 [`IndexedParallelIterator`] 保 input 顺序，等价原 `Vec::map(spawn).
-    /// map(join)` 的 tid-顺序输出。
+    /// **每 worker 跑 `batch_per_worker` 条 trajectory**（关键性能 knob）：
+    /// rayon `par_iter_mut().enumerate()` 内 `for batch_idx in 0..batch_per_worker`
+    /// 循环；一次 `step_parallel` 调用产 `n_active × batch_per_worker` 个 update。
+    /// `batch_per_worker = 1` 退化为"每 worker 1 trajectory 然后 sync"的原形。
     ///
-    /// **append-only delta 替 thread-local `RegretTable`**（F1-rev1 实测
-    /// batch merge sort `format!("{:?}", InfoSetId)` × O(N log N) 占主导
-    /// merge cost）：每线程持有 `LocalRegretDelta` / `LocalStrategyDelta`
-    /// = `Vec<(I, SigmaVec)>` 按 DFS 顺序 append；merge 阶段按 tid 升序 ×
-    /// 每 thread 内 push 顺序 playback 到主表。
+    /// **为什么需要 batching**：32-vCPU c6a.8xlarge 实测 perf 显示 17% CPU 花在
+    /// `sched_yield` + `futex`、13% 花在 crossbeam / rayon 工作偷取，原因是每次
+    /// `step_parallel` 的 dispatch 只产 `n_threads` 条 ~1 ms 的小任务，worker
+    /// 醒来跑完立刻又等下一批 → 调度成本与计算量同量级。batch_per_worker = 16
+    /// 让每次 dispatch 覆盖 ~16 ms 计算，调度开销摊薄 16×，scaling 从 1→32
+    /// vCPU 由 2.85× 提到接近 8-10×（实测见 docs/status_v2.md 训练吞吐基线）。
+    ///
+    /// **alternating traverser**：trajectory_index = `batch_idx × n_active + tid`，
+    /// 让 tid=0 在 `batch_per_worker = 1` 时映射到 `(base + 0) % n_players`，与
+    /// 原版完全一致；B ≥ 2 时 tid 维度 stride-N 走遍完整 update 区间，traverser
+    /// 周期性 alternate 等价原 D-307 alternating 语义。
+    ///
+    /// **rayon pool 替 `std::thread::scope`**：rayon 全局 pool 复用长寿命 worker，
+    /// scope-fifo 任务分发 ≈ ns 级 atomic dequeue。`par_iter_mut().enumerate().
+    /// collect()` 对 [`IndexedParallelIterator`] 保 input 顺序，因此 `deltas[tid]`
+    /// 与 tid 一一对应。
+    ///
+    /// **append-only delta**：每线程持有 `LocalRegretDelta` / `LocalStrategyDelta`
+    /// = `Vec<(I, SigmaVec)>` 按 DFS 顺序 append；merge 阶段按 tid 升序 × 每
+    /// thread 内 push 顺序 playback 到主表，省去原 `format!("{:?}", I)` ×
+    /// O(N log N) 排序。
     ///
     /// **线程内语义**：σ 计算走只读共享 `&self.regret`
     /// （[`RegretTable::current_strategy`] 对 HashMap 无锁只读在 rayon 任务
     /// 借用期内 by-design 安全；HashMap 未触发结构 rehash 因主表不被任何
     /// worker 写）；regret + strategy_sum 累积全 push 到线程内本地 delta vec。
+    /// 同 worker 的 `batch_per_worker` 条 trajectory 都读 pre-dispatch σ
+    /// （stale-σ window 由 `n_active` 变为 `n_active × batch_per_worker`，
+    /// NLHE 119M infoset 下 256² / 119M ≈ 0.06% 重访概率，bias 可忽略；
+    /// Leduc 288 infoset 不能走 batched 路径，应继续单线程 `step`）。
     ///
-    /// **跨 run 决定性**（D-362 carry-forward）：append-only 路径下 thread
-    /// 内 push 顺序 = DFS 顺序 deterministic（rng 决定 sampled trajectory）；
-    /// tid 顺序 deterministic（`par_iter_mut().enumerate().collect()` 保
-    /// index 顺序）；同 InfoSet 多次访问按 push 顺序 playback，f64 加法序列
-    /// 与原 thread-local table accumulate 后再合并完全等价（数值结果恒等）。
-    /// BLAKE3 byte-equal 不破（test_5 1M update × 3 走单线程 `step`，本路径
-    /// 修改不触达；step_parallel-only 测试在 perf_slo.rs 仅断言 throughput
-    /// 不断言数值）。
+    /// **跨 run 决定性**：append-only 路径下 thread 内 push 顺序 = DFS 顺序
+    /// deterministic（rng 决定 sampled trajectory）；tid 顺序 deterministic
+    /// （`par_iter_mut().enumerate().collect()` 保 index 顺序）；同 InfoSet 多次
+    /// 访问按 push 顺序 playback，f64 加法序列 deterministic。BLAKE3 byte-equal
+    /// 不破（D-362 anchor `tests/cfr_simplified_nlhe.rs` Test 5 走纯单线程
+    /// `step`，本路径修改不触达；step_parallel-only 测试在 perf_slo.rs 仅断言
+    /// throughput 不断言数值）。
     ///
-    /// **与单线程 `step` 的语义差异**：deferred merge → 同 step 内多次访问同
-    /// InfoSet 时 σ 走 pre-step 状态而非 in-step 累积；ES-MCCFR sample-1
-    /// trajectory 下同 step 内 InfoSet 重访稀有，差异可忽略；D-362 单线程 1M
-    /// update × 3 BLAKE3 路径不消费 `step_parallel`（`tests/cfr_simplified_nlhe.rs`
-    /// Test 5 走纯 single-threaded `step`），byte-equal 不受影响。
-    ///
-    /// **边界**：`rng_pool.is_empty()` 或 `n_threads == 0` → no-op，返回 `Ok(())`；
-    /// `n_active > rng_pool.len()` 时截断到 `rng_pool.len()`。
+    /// **边界**：`rng_pool.is_empty()` / `n_threads == 0` / `batch_per_worker == 0`
+    /// → no-op，返回 `Ok(())`；`n_active > rng_pool.len()` 时截断到 `rng_pool.len()`。
     pub fn step_parallel(
         &mut self,
         rng_pool: &mut [Box<dyn RngSource>],
         n_threads: usize,
+        batch_per_worker: usize,
     ) -> Result<(), TrainerError>
     where
         G: Sync,
         G::InfoSet: Send,
     {
         let n_active = n_threads.min(rng_pool.len());
-        if n_active == 0 {
+        if n_active == 0 || batch_per_worker == 0 {
             return Ok(());
         }
         let active_pool = &mut rng_pool[..n_active];
@@ -464,37 +476,37 @@ impl<G: Game> EsMccfrTrainer<G> {
 
         // rayon 全局 pool dispatch：`par_iter_mut().enumerate()` 是
         // `IndexedParallelIterator`，`.collect()` 保 input index 顺序，因此
-        // `deltas[tid]` 与 tid 一一对应（等价原 `std::thread::scope` spawn-by-tid
-        // 顺序）。borrow checker：&self.game + &self.regret + &mut rng_pool[..]
-        // 在 collect 完成前等同 scope-borrow 期，rayon scope-fifo 关闭前所有
-        // 任务必须 join。
+        // `deltas[tid]` 与 tid 一一对应。每 worker 在自己的 rayon 任务里跑
+        // `batch_per_worker` 条 trajectory，σ 全程读 pre-dispatch `shared_regret`。
         #[allow(clippy::type_complexity)]
         let deltas: Vec<(LocalRegretDelta<G::InfoSet>, LocalStrategyDelta<G::InfoSet>)> =
             active_pool
                 .par_iter_mut()
                 .enumerate()
                 .map(|(tid, rng_slot)| {
-                    let traverser = ((base_update_count + tid as u64) % n_players) as PlayerId;
                     let mut local_regret = LocalRegretDelta::<G::InfoSet>::new();
                     let mut local_strategy = LocalStrategyDelta::<G::InfoSet>::new();
                     let rng = rng_slot.as_mut();
-                    let root = game.root(rng);
-                    recurse_es_parallel::<G>(
-                        root,
-                        traverser,
-                        1.0,
-                        shared_regret,
-                        &mut local_regret,
-                        &mut local_strategy,
-                        rng,
-                    );
+                    for batch_idx in 0..batch_per_worker {
+                        let trajectory_index = batch_idx as u64 * n_active as u64 + tid as u64;
+                        let traverser =
+                            ((base_update_count + trajectory_index) % n_players) as PlayerId;
+                        let root = game.root(rng);
+                        recurse_es_parallel::<G>(
+                            root,
+                            traverser,
+                            1.0,
+                            shared_regret,
+                            &mut local_regret,
+                            &mut local_strategy,
+                            rng,
+                        );
+                    }
                     (local_regret, local_strategy)
                 })
                 .collect();
 
         // playback merge：tid 升序遍历 deltas，每 thread 内按 push 顺序 playback。
-        // 不再调用 `format!("{:?}", I)` 排序（E2-rev1 优化要点 — F1-rev1 实测
-        // batch merge sort 是主导 merge cost，append-only 路径直接消除）。
         for (local_regret, local_strategy) in deltas {
             for (info, delta) in local_regret.into_entries() {
                 self.regret.accumulate(info, &delta);
@@ -503,12 +515,12 @@ impl<G: Game> EsMccfrTrainer<G> {
                 self.strategy_sum.accumulate(info, &weighted);
             }
         }
-        self.update_count += n_active as u64;
+        self.update_count += (n_active as u64) * (batch_per_worker as u64);
         // LCFR-MCCFR period rescale 在批合并完成后触发；本批的所有 delta 都在
-        // pre-rescale scale 下累积（worker 读 σ 也走 pre-rescale R⁺，σ 归一化后
-        // 跟 rescale 无关）。跨 period boundary 时 boundary 后 ≤ n_threads 个
-        // update 享受了 boundary 前的 weight，period_size ≫ n_threads 时误差
-        // 可忽略（NLHE 默认 period 1M / n_threads 32 → 0.003% 偏置）。
+        // pre-rescale scale 下累积。跨 period boundary 时 boundary 后
+        // ≤ n_active × batch_per_worker 个 update 享受 boundary 前 weight，
+        // period_size ≫ n_active × batch_per_worker 时误差可忽略
+        // （NLHE 默认 period 1M / n_active × B = 32×16 = 512 → 0.05% 偏置）。
         self.maybe_lcfr_rescale();
         Ok(())
     }
@@ -766,12 +778,20 @@ fn recurse_es_parallel<G: Game>(
             let sigma = shared_regret.current_strategy_smallvec(&info, n);
 
             if actor == traverser {
+                debug_assert!(
+                    n > 0,
+                    "traverser Player 节点必有 ≥ 1 legal action（API-300 invariant：fold 兜底）"
+                );
                 let weighted: SigmaVec = sigma.iter().map(|s| pi_trav * s).collect();
                 local_strategy.push(info.clone(), weighted);
 
                 let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
-                for (i, action) in actions.iter().enumerate() {
-                    let next_state = G::next(state.clone(), *action, rng);
+                // last iteration 消耗原 state（move 进 `G::next`）；前 n-1 次 clone。
+                // 每个 traverser 节点 fan-out 省 1 次 State::clone + drop。NLHE 默认
+                // 6-action 节点 → -16% clone 流量（在 traverser 分支内）。
+                let last_idx = n - 1;
+                for i in 0..last_idx {
+                    let next_state = G::next(state.clone(), actions[i], rng);
                     let cfv = recurse_es_parallel::<G>(
                         next_state,
                         traverser,
@@ -783,6 +803,17 @@ fn recurse_es_parallel<G: Game>(
                     );
                     cfvs.push(cfv);
                 }
+                let last_state = G::next(state, actions[last_idx], rng);
+                let cfv_last = recurse_es_parallel::<G>(
+                    last_state,
+                    traverser,
+                    pi_trav * sigma[last_idx],
+                    shared_regret,
+                    local_regret,
+                    local_strategy,
+                    rng,
+                );
+                cfvs.push(cfv_last);
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
                 let delta: SigmaVec = cfvs.iter().map(|c| c - sigma_value).collect();
                 local_regret.push(info, delta);

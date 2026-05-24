@@ -793,31 +793,34 @@ fn stage3_simplified_nlhe_4core_throughput_ge_50k_update_per_s() {
         .collect();
 
     // warm-up 4 update（per pool size）：触发 RegretTable lazy alloc。
+    // batch_per_worker = 1 保 warm-up 总 update 数与 pool size 对齐。
     trainer
-        .step_parallel(&mut rng_pool, 4)
+        .step_parallel(&mut rng_pool, 4, 1)
         .expect("NLHE warm-up step_parallel");
 
-    // 总 update 数 = pool size × n_calls = 4 × n_calls = STAGE3_NLHE_FOUR_CORE_UPDATES。
-    let n_calls = STAGE3_NLHE_FOUR_CORE_UPDATES / 4;
+    // 总 update 数 = pool size × batch_per_worker × n_calls = STAGE3_NLHE_FOUR_CORE_UPDATES。
+    // batch_per_worker = 16 对齐 train_cfr 默认；4 × 16 = 64 update per call。
+    let batch_per_worker = 16;
+    let updates_per_call = 4 * batch_per_worker;
+    let n_calls = STAGE3_NLHE_FOUR_CORE_UPDATES as usize / updates_per_call;
     let start = Instant::now();
     for _ in 0..n_calls {
         trainer
-            .step_parallel(&mut rng_pool, 4)
-            .expect("NLHE ES-MCCFR step_parallel 期望成功（C2 serial-fallback 路径）");
+            .step_parallel(&mut rng_pool, 4, batch_per_worker)
+            .expect("NLHE ES-MCCFR step_parallel 期望成功");
     }
     let elapsed = start.elapsed();
-    let total_updates = n_calls * 4;
+    let total_updates = n_calls * updates_per_call;
     let throughput = total_updates as f64 / elapsed.as_secs_f64();
     eprintln!(
         "[stage3-nlhe-4core] 实测 {total_updates} update / {:.3} s = {throughput:.0} \
-         update/s（SLO 门槛 ≥ 50,000；C2 serial-fallback 期望失败，E2 \\[实现\\] 真并发\
-         落地 D-321-rev1 thread-local accumulator + batch merge 后必须通过）",
+         update/s（SLO 门槛 ≥ 50,000；batched parallel = pool 4 × batch_per_worker \
+         {batch_per_worker}）",
         elapsed.as_secs_f64(),
     );
     assert!(
         throughput >= 50_000.0,
-        "NLHE ES-MCCFR 4-core {throughput:.0} update/s < D-361 字面阈值 50,000 update/s\
-         （E1 closure 期望失败；E2 真并发实现后必须通过）",
+        "NLHE ES-MCCFR 4-core {throughput:.0} update/s < D-361 字面阈值 50,000 update/s",
     );
 }
 

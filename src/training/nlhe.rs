@@ -227,11 +227,16 @@ impl Game for SimplifiedNlheGame {
     }
 
     fn root(&self, rng: &mut dyn RngSource) -> SimplifiedNlheState {
-        // stage 1 `GameState::with_rng` 在构造时按 D-028 deal protocol 消费
-        // RNG（51 次 `next_u64` Fisher-Yates）发底牌 + post blinds + 5 张
+        // stage 1 `GameState::with_rng_no_history` 在构造时按 D-028 deal protocol
+        // 消费 RNG（51 次 `next_u64` Fisher-Yates）发底牌 + post blinds + 5 张
         // runout board。`seed` 参数仅作为 `HandHistory.seed` 标签写入，不参与
         // 发牌——实际 randomness 全部来自 `rng`（D-028 字面）。
-        let game_state = GameState::with_rng(&self.config, 0, rng);
+        //
+        // D-378 CFR fast path：走 `with_rng_no_history` 跳过 `history.actions`
+        // 的 `with_capacity(32)` 预分配 + per-apply `push`；`payouts()` 不受影响
+        // （走 `state.final_payouts` 字段）。NLHE 自身的 `action_history` 也只在
+        // 调试 / trace 工具中被读取，CFR 路径上同步跳 push。
+        let game_state = GameState::with_rng_no_history(&self.config, 0, rng);
         SimplifiedNlheState {
             game_state,
             action_history: Vec::new(),
@@ -330,7 +335,13 @@ impl Game for SimplifiedNlheGame {
             .game_state
             .apply(concrete)
             .expect("SimplifiedNlhe next: AbstractAction → Action apply must be legal");
-        next_state.action_history.push(action);
+        // D-378 CFR fast path：`game_state.track_history() == false` 时（NLHE root
+        // 走 `with_rng_no_history`）跳过 `action_history.push` —— CFR 不读
+        // `action_history`，避免每节点的 Vec push / clone 成本。trace / 调试
+        // 路径走 `Game::root` 之外的入口仍正常累积。
+        if next_state.game_state.track_history() {
+            next_state.action_history.push(action);
+        }
 
         // Tree 跳转后 invariant 自检：tree 标的 Terminal/Decision 必须跟 game_state
         // 实际 terminality 一致；不一致说明 builder 漏 case 或 game_state apply 行为

@@ -2,6 +2,8 @@
 
 use std::collections::BTreeSet;
 
+use smallvec::{smallvec, SmallVec};
+
 use crate::core::rng::{ChaCha20Rng, RngSource};
 use crate::core::{Card, ChipAmount, Player, PlayerStatus, SeatId, Street};
 use crate::error::RuleError;
@@ -31,17 +33,32 @@ use crate::rules::config::TableConfig;
 #[derive(Clone, Debug)]
 pub struct GameState {
     config: TableConfig,
-    players: Vec<Player>,
+    /// SmallVec 内联存 ≤ 9 个 `Player`（D-030 n_seats 上界），HU NLHE (n=2) 完全
+    /// 走 inline 路径，`GameState::clone` 不再为 players 字段 malloc/free（实测
+    /// CFR 热路径 clone+drop ≈ 24% → 显著下降）。`pub fn players() -> &[Player]`
+    /// 由 SmallVec Deref 透明转 slice，公开 API 不变。
+    players: SmallVec<[Player; 9]>,
     street: Street,
-    board: Vec<Card>,
+    /// SmallVec inline 5 张公共牌；preflop 状态 `len() == 0` 不 alloc，flop/turn/river
+    /// 推进时 len 增至 3/4/5 仍 inline。
+    board: SmallVec<[Card; 5]>,
     runout_board: [Card; 5],
     current_player: Option<SeatId>,
     terminal: bool,
     final_payouts: Option<Vec<(SeatId, i64)>>,
     history: HandHistory,
-    raise_option_open: Vec<bool>,
+    /// SmallVec inline ≤ 9 个 bool，clone 走 inline 拷贝免 malloc。
+    raise_option_open: SmallVec<[bool; 9]>,
     last_full_raise_size: ChipAmount,
     last_aggressor: Option<SeatId>,
+    /// CFR 训练 fast path（D-378）：`false` 时 `apply` / `finalize_terminal`
+    /// 跳过 `history.actions` / `history.board` / `history.final_payouts` /
+    /// `history.showdown_order` 写入，`history.actions` 起始无 buffer 预分配。
+    /// `clone()` 由此省 `with_capacity(32)` Vec buffer 复制 + per-apply push
+    /// realloc。`hand_history()` 仍可访问（仅返回 config / seed / hole_cards）。
+    /// 默认 `true` 兼容所有现存使用方；只有 [`GameState::with_rng_no_history`]
+    /// 构造路径置 `false`。
+    track_history: bool,
 }
 
 impl GameState {
@@ -69,6 +86,32 @@ impl GameState {
     ///
     /// [`HistoryError::ReplayDiverged`]: crate::error::HistoryError::ReplayDiverged
     pub fn with_rng(config: &TableConfig, seed: u64, rng: &mut dyn RngSource) -> GameState {
+        Self::with_rng_opts(config, seed, rng, true)
+    }
+
+    /// CFR 训练专用 fast path（D-378）：与 [`Self::with_rng`] 行为完全一致，
+    /// 但 `apply` / `finalize_terminal` 内所有 `history.actions` / `history.board`
+    /// / `history.final_payouts` / `history.showdown_order` 写入跳过；
+    /// `history.actions` 不预分配 32-entry buffer。`clone()` 因此省一次
+    /// 32 × sizeof(RecordedAction) 的 buffer 复制 + 每次 apply 的 Vec push 增长。
+    ///
+    /// `payouts()` / 终态合法性不受影响（走 `self.final_payouts` 字段，独立于
+    /// `history.final_payouts`）。仅 `hand_history().actions/board/final_payouts/
+    /// showdown_order` 在 no-history 模式下为空 —— 仍可读 `config / seed / hole_cards`。
+    pub fn with_rng_no_history(
+        config: &TableConfig,
+        seed: u64,
+        rng: &mut dyn RngSource,
+    ) -> GameState {
+        Self::with_rng_opts(config, seed, rng, false)
+    }
+
+    fn with_rng_opts(
+        config: &TableConfig,
+        seed: u64,
+        rng: &mut dyn RngSource,
+        track_history: bool,
+    ) -> GameState {
         validate_config(config);
 
         let n = config.n_seats as usize;
@@ -81,7 +124,7 @@ impl GameState {
             deck.swap(i, j);
         }
 
-        let mut players = Vec::with_capacity(n);
+        let mut players: SmallVec<[Player; 9]> = SmallVec::with_capacity(n);
         for seat in 0..n {
             players.push(Player {
                 seat: SeatId(seat as u8),
@@ -114,7 +157,7 @@ impl GameState {
             config: config.clone(),
             players,
             street: Street::Preflop,
-            board: Vec::with_capacity(5),
+            board: SmallVec::new(),
             runout_board,
             current_player: None,
             terminal: false,
@@ -125,15 +168,22 @@ impl GameState {
                 seed,
                 // 6-max NLHE 单手实测分布的 99 分位 < 32 actions（E1 / D1 1M
                 // fuzz 数据），预分配避免 simulate 热路径上的多次 Vec realloc。
-                actions: Vec::with_capacity(32),
+                // no-history (track_history=false) 路径绝不 push，buffer 留空
+                // 让每次 `GameState::clone` 省 32 × sizeof(RecordedAction) 字节复制。
+                actions: if track_history {
+                    Vec::with_capacity(32)
+                } else {
+                    Vec::new()
+                },
                 board: Vec::with_capacity(5),
                 hole_cards: history_holes,
                 final_payouts: Vec::new(),
                 showdown_order: Vec::new(),
             },
-            raise_option_open: vec![true; n],
+            raise_option_open: smallvec![true; n],
             last_full_raise_size: config.big_blind,
             last_aggressor: None,
+            track_history,
         };
 
         state.post_forced_bets();
@@ -257,6 +307,13 @@ impl GameState {
     /// 当前 hand history 的引用，可随时序列化或回放。
     pub fn hand_history(&self) -> &HandHistory {
         &self.history
+    }
+
+    /// `true` 表示本 state 路径仍累积 `HandHistory.actions / board /
+    /// final_payouts / showdown_order`；`false` 是 [`Self::with_rng_no_history`]
+    /// 构造的 CFR fast path，上述字段不被写入（D-378）。
+    pub fn track_history(&self) -> bool {
+        self.track_history
     }
 
     /// 当前 `TableConfig` 的只读引用（API-NNN-rev1，stage 2 D-211-rev1 需要
@@ -469,6 +526,9 @@ impl GameState {
         action: Action,
         committed_after: ChipAmount,
     ) {
+        if !self.track_history {
+            return;
+        }
         let seq = self.history.actions.len() as u32;
         self.history.actions.push(RecordedAction {
             seq,
@@ -575,14 +635,16 @@ impl GameState {
     fn finalize_terminal(&mut self, showdown: bool) {
         self.current_player = None;
         self.terminal = true;
-        self.history.board = self.board.clone();
-        self.history.showdown_order = if showdown {
-            self.compute_showdown_order()
-        } else {
-            Vec::new()
-        };
         let payouts = self.compute_payouts();
-        self.history.final_payouts = payouts.clone();
+        if self.track_history {
+            self.history.board = self.board.to_vec();
+            self.history.showdown_order = if showdown {
+                self.compute_showdown_order()
+            } else {
+                Vec::new()
+            };
+            self.history.final_payouts = payouts.clone();
+        }
         self.final_payouts = Some(payouts);
     }
 
@@ -688,7 +750,9 @@ impl GameState {
         while self.board.len() < len {
             self.board.push(self.runout_board[self.board.len()]);
         }
-        self.history.board = self.board.clone();
+        if self.track_history {
+            self.history.board = self.board.to_vec();
+        }
     }
 
     fn return_uncalled_bets(&mut self) {
