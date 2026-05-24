@@ -137,12 +137,21 @@ impl GameState {
         }
 
         let deal_order = seat_order(config.button_seat, n, 1);
-        let mut history_holes = vec![None; n];
+        // D-378 CFR fast path：!track_history 时不分配 history.hole_cards Vec
+        // （每条 clone 省一次 malloc + free）；pot_winners 已改读
+        // players[].hole_cards。track_history 路径仍正常累积，保 replay 语义。
+        let mut history_holes: Vec<Option<[Card; 2]>> = if track_history {
+            vec![None; n]
+        } else {
+            Vec::new()
+        };
         for (k, seat) in deal_order.iter().enumerate() {
             let idx = seat.0 as usize;
             let hole = [deck[k], deck[n + k]];
             players[idx].hole_cards = Some(hole);
-            history_holes[idx] = Some(hole);
+            if track_history {
+                history_holes[idx] = Some(hole);
+            }
         }
 
         let runout_board = [
@@ -175,7 +184,13 @@ impl GameState {
                 } else {
                     Vec::new()
                 },
-                board: Vec::with_capacity(5),
+                // !track_history 时 board 留空（finalize_terminal / deal_board_to
+                // 均 gated by track_history，不会写）；省一次 cap=5 Vec alloc。
+                board: if track_history {
+                    Vec::with_capacity(5)
+                } else {
+                    Vec::new()
+                },
                 hole_cards: history_holes,
                 final_payouts: Vec::new(),
                 showdown_order: Vec::new(),
@@ -896,7 +911,12 @@ impl GameState {
         let mut best = None;
         let mut winners = Vec::new();
         for &idx in contenders {
-            let Some(hole) = self.history.hole_cards[idx] else {
+            // 直接读 players[].hole_cards：contenders 已过滤 Folded（compute_payouts
+            // 见 line ~828），所以 hole_cards 对每个 contender 必为 Some。
+            // 之前走 self.history.hole_cards[idx] 是 history 路径下的冗余 backup
+            // —— 在 D-378 CFR fast path（track_history=false）下 history.hole_cards
+            // 留空以省 per-clone malloc / cfree。
+            let Some(hole) = self.players[idx].hole_cards else {
                 continue;
             };
             let cards = [
