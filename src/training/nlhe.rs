@@ -41,7 +41,7 @@ use crate::core::SeatId;
 use crate::error::TrainerError;
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
-use crate::training::game::{Game, NodeKind, PlayerId};
+use crate::training::game::{ActionVec, Game, NodeKind, PlayerId};
 use crate::training::nlhe_betting_tree::{AbstractActionTag, Child, NodeId, PublicBettingTree};
 
 /// 简化 NLHE action 桥接（API-303 / D-318）。
@@ -384,14 +384,15 @@ impl Game for SimplifiedNlheGame {
         pack_info_set_v2(hand_bucket, state.current_node_id, street_tag)
     }
 
-    fn legal_actions(state: &SimplifiedNlheState) -> Vec<SimplifiedNlheAction> {
+    fn legal_actions(state: &SimplifiedNlheState) -> ActionVec<SimplifiedNlheAction> {
         // D-318 桥接：stage 2 `DefaultActionAbstraction::abstract_actions`
         // 顺序由 D-209 deterministic（每次构造同型 6-action 抽象，开销可忽略
         // —— `DefaultActionAbstraction::new` 仅 clone 配置）；Trainer 的 RegretTable
         // `Vec<f64>` 索引一一对应（D-324 action_count 训练全程恒定）。
         //
-        // `into_actions()` 直接 move 出 set 的内部 Vec；之前走
-        // `as_slice().to_vec()` 每节点会多 alloc + memcpy 一份。
+        // 第四轮 perf：`into_actions()` 直接 move 出 set 的内部
+        // `AbstractActionVec` = `SmallVec<[AbstractAction; 8]>`，与本 trait 返回
+        // 类型 `ActionVec<A>` 同型，避免每节点一次 Vec 堆分配 + memcpy。
         let abs = DefaultActionAbstraction::default_6_action();
         abs.abstract_actions(&state.game_state).into_actions()
     }

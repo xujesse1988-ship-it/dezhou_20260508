@@ -215,7 +215,7 @@ fn simplified_nlhe_legal_actions_returns_default_action_abstraction_6_action() {
         return;
     };
     let (state, _actor) = walk_to_first_player_node(&game, FIXED_SEED);
-    let actions: Vec<SimplifiedNlheAction> = SimplifiedNlheGame::legal_actions(&state);
+    let actions = SimplifiedNlheGame::legal_actions(&state);
     // SimplifiedNlheAction == AbstractAction 类型恒等由 nlhe.rs `type SimplifiedNlheAction =
     // AbstractAction;` 锁定，本测试在运行时再断言 size 范围合 D-209。
     assert!(

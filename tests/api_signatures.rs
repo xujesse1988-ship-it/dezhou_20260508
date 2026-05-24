@@ -367,7 +367,7 @@ fn _stage3_api_signature_assertions() {
         <KuhnGame as Game>::root;
     let _: for<'a> fn(&'a KuhnState) -> NodeKind = <KuhnGame as Game>::current;
     let _: for<'a> fn(&'a KuhnState, PlayerId) -> KuhnInfoSet = <KuhnGame as Game>::info_set;
-    let _: for<'a> fn(&'a KuhnState) -> Vec<KuhnAction> = <KuhnGame as Game>::legal_actions;
+    let _: for<'a> fn(&'a KuhnState) -> ActionVec<KuhnAction> = <KuhnGame as Game>::legal_actions;
     let _: for<'a> fn(KuhnState, KuhnAction, &'a mut dyn RngSource) -> KuhnState =
         <KuhnGame as Game>::next;
     let _: for<'a> fn(&'a KuhnState) -> Vec<(KuhnAction, f64)> =
@@ -380,7 +380,8 @@ fn _stage3_api_signature_assertions() {
         <LeducGame as Game>::root;
     let _: for<'a> fn(&'a LeducState) -> NodeKind = <LeducGame as Game>::current;
     let _: for<'a> fn(&'a LeducState, PlayerId) -> LeducInfoSet = <LeducGame as Game>::info_set;
-    let _: for<'a> fn(&'a LeducState) -> Vec<LeducAction> = <LeducGame as Game>::legal_actions;
+    let _: for<'a> fn(&'a LeducState) -> ActionVec<LeducAction> =
+        <LeducGame as Game>::legal_actions;
     let _: for<'a> fn(LeducState, LeducAction, &'a mut dyn RngSource) -> LeducState =
         <LeducGame as Game>::next;
     let _: for<'a> fn(&'a LeducState) -> Vec<(LeducAction, f64)> =
@@ -394,7 +395,7 @@ fn _stage3_api_signature_assertions() {
     let _: for<'a> fn(&'a SimplifiedNlheState) -> NodeKind = <SimplifiedNlheGame as Game>::current;
     let _: for<'a> fn(&'a SimplifiedNlheState, PlayerId) -> SimplifiedNlheInfoSet =
         <SimplifiedNlheGame as Game>::info_set;
-    let _: for<'a> fn(&'a SimplifiedNlheState) -> Vec<SimplifiedNlheAction> =
+    let _: for<'a> fn(&'a SimplifiedNlheState) -> ActionVec<SimplifiedNlheAction> =
         <SimplifiedNlheGame as Game>::legal_actions;
     let _: for<'a> fn(
         SimplifiedNlheState,

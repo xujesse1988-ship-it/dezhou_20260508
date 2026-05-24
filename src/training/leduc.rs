@@ -15,7 +15,7 @@
 //! Sentinel：未发的私有牌 `cards[i] == 0xFF`；初始 `cards = [0xFF, 0xFF]`。
 
 use crate::core::rng::RngSource;
-use crate::training::game::{Game, NodeKind, PlayerId};
+use crate::training::game::{ActionVec, Game, NodeKind, PlayerId};
 
 /// Zero-sized game token（API-302）。
 #[derive(Clone, Copy, Debug, Default)]
@@ -279,17 +279,19 @@ impl Game for LeducGame {
         }
     }
 
-    fn legal_actions(state: &LeducState) -> Vec<LeducAction> {
+    fn legal_actions(state: &LeducState) -> ActionVec<LeducAction> {
         if state.has_outstanding_bet() {
             // {Fold, Call} always; Raise if raises < 2
-            let mut out = vec![LeducAction::Fold, LeducAction::Call];
+            let mut out = ActionVec::new();
+            out.push(LeducAction::Fold);
+            out.push(LeducAction::Call);
             if state.raises_in_round() < MAX_RAISES_PER_ROUND {
                 out.push(LeducAction::Raise);
             }
             out
         } else {
             // no bet pending → {Check, Bet}
-            vec![LeducAction::Check, LeducAction::Bet]
+            ActionVec::from_slice(&[LeducAction::Check, LeducAction::Bet])
         }
     }
 

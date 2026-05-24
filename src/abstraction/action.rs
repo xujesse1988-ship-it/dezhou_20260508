@@ -6,6 +6,7 @@
 //! 不变量 AA-001..AA-008（含 AA-003-rev1 / AA-004-rev1）见
 //! `docs/pluribus_stage2_api.md` §1；A1 阶段所有方法体走 `unimplemented!()`。
 
+use smallvec::SmallVec;
 use thiserror::Error;
 
 use crate::core::ChipAmount;
@@ -13,6 +14,14 @@ use crate::rules::action::Action;
 use crate::rules::state::GameState;
 
 use crate::abstraction::info::StreetTag;
+
+/// `AbstractActionSet` 内部容器（D-378 / 第四轮 perf）。
+///
+/// inline 8 覆盖 D-209 默认 6-action（Fold + Check/Call + 3 raise + AllIn） +
+/// 边界场景（≤ 14 raise_pot_ratios spill 到 heap，AA-005 上界 `n + 4`）。
+/// `AbstractActionSet::into_actions` 直接 move 出本类型，让 NLHE
+/// `Game::legal_actions` 返回的 `ActionVec` 不走堆分配。
+pub type AbstractActionVec = SmallVec<[AbstractAction; 8]>;
 
 /// 抽象动作。pot ratio 编码进 `Bet` / `Raise` 变体；apply 时取 `to`。
 ///
@@ -101,7 +110,7 @@ impl BetRatio {
 /// LA-002 保证）。
 #[derive(Clone, Debug)]
 pub struct AbstractActionSet {
-    actions: Vec<AbstractAction>,
+    actions: AbstractActionVec,
 }
 
 impl AbstractActionSet {
@@ -125,9 +134,9 @@ impl AbstractActionSet {
         &self.actions
     }
 
-    /// 消费 set，move 出内部 `Vec<AbstractAction>`（避免 `as_slice().to_vec()`
-    /// 在 CFR `Game::legal_actions` 热路径上每节点多 alloc 一次 Vec）。
-    pub fn into_actions(self) -> Vec<AbstractAction> {
+    /// 消费 set，move 出内部 [`AbstractActionVec`]（避免 `as_slice().to_vec()`
+    /// 在 CFR `Game::legal_actions` 热路径上每节点多 alloc 一次容器）。
+    pub fn into_actions(self) -> AbstractActionVec {
         self.actions
     }
 }
@@ -232,7 +241,7 @@ impl ActionAbstraction for DefaultActionAbstraction {
     fn abstract_actions(&self, state: &GameState) -> AbstractActionSet {
         if state.current_player().is_none() {
             return AbstractActionSet {
-                actions: Vec::new(),
+                actions: AbstractActionVec::new(),
             };
         }
         let la = state.legal_actions();
@@ -260,7 +269,7 @@ impl ActionAbstraction for DefaultActionAbstraction {
         let pot_after_call = pot_before + to_call_delta;
 
         // D-209 顺序构建候选: Fold / Check / Call / Bet|Raise(0.5×) / Bet|Raise(1.0×) / AllIn
-        let mut actions: Vec<AbstractAction> = Vec::with_capacity(6);
+        let mut actions: AbstractActionVec = AbstractActionVec::new();
 
         // D-204：free-check 局面剔除 Fold
         if la.fold && !la.check {
@@ -336,7 +345,7 @@ impl ActionAbstraction for DefaultActionAbstraction {
             });
         }
         // ② 同 to 的 Bet/Raise 去重，保留较小 ratio_label
-        let mut deduped: Vec<AbstractAction> = Vec::with_capacity(actions.len());
+        let mut deduped: AbstractActionVec = AbstractActionVec::new();
         for action in actions {
             match action {
                 AbstractAction::Bet { to, ratio_label } => {
