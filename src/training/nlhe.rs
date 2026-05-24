@@ -409,14 +409,15 @@ impl Game for SimplifiedNlheGame {
         // 必须在 apply 之前查表——apply 之后 game_state.current_player 可能切人
         // 或进 Terminal，而 tree lookup 用的是动作本身的 tag，不依赖 chip 值。
         let tag = AbstractActionTag::of(&action);
-        let edge_idx = {
-            let node = next_state.tree.node(next_state.current_node_id);
-            node.legal_actions.iter().position(|t| *t == tag).expect(
-                "Phase 2 invariant: action tag must appear in current node legal_actions; \
-                     mismatch indicates CFR走了 tree 外动作 or tree builder 漏 edge",
-            )
-        };
-        let child = next_state.tree.node(next_state.current_node_id).children[edge_idx];
+        // 单次 tree.node 查表，先取 edge index 再取对应 child；
+        // 两次 lookup Arc<PublicBettingTree>::node + Vec<TreeNode> 索引
+        // LLVM 不一定能 CSE（Arc deref 阻塞 alias 分析）。
+        let node = next_state.tree.node(next_state.current_node_id);
+        let edge_idx = node.legal_actions.iter().position(|t| *t == tag).expect(
+            "Phase 2 invariant: action tag must appear in current node legal_actions; \
+                 mismatch indicates CFR走了 tree 外动作 or tree builder 漏 edge",
+        );
+        let child = node.children[edge_idx];
 
         next_state
             .game_state
