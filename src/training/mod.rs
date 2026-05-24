@@ -40,7 +40,7 @@ pub mod trainer;
 // API-300 / API-380 顶层公开 surface（与 `docs/pluribus_stage3_api.md` §8 对齐）。
 pub use best_response::{exploitability, BestResponse, KuhnBestResponse, LeducBestResponse};
 pub use checkpoint::Checkpoint;
-pub use game::{ActionVec, Game, NodeKind, PlayerId};
+pub use game::{Game, NodeKind, PlayerId};
 pub use kuhn::{KuhnAction, KuhnGame, KuhnHistory, KuhnInfoSet, KuhnState};
 pub use lbr::{estimate_lbr, estimate_lbr_filtered, LbrConfig, LbrReport};
 pub use leduc::{LeducAction, LeducGame, LeducHistory, LeducInfoSet, LeducState, LeducStreet};

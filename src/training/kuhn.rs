@@ -17,7 +17,7 @@
 //! KuhnAction 不 pattern-match 变体的契约）。
 
 use crate::core::rng::RngSource;
-use crate::training::game::{ActionVec, Game, NodeKind, PlayerId};
+use crate::training::game::{Game, NodeKind, PlayerId};
 
 /// Zero-sized game token；`KuhnGame` 不持有 state（API-301）。
 #[derive(Clone, Copy, Debug, Default)]
@@ -135,14 +135,10 @@ impl Game for KuhnGame {
         }
     }
 
-    fn legal_actions(state: &KuhnState) -> ActionVec<KuhnAction> {
+    fn legal_actions(state: &KuhnState) -> Vec<KuhnAction> {
         match state.history {
-            KuhnHistory::Empty | KuhnHistory::Check => {
-                ActionVec::from_slice(&[KuhnAction::Check, KuhnAction::Bet])
-            }
-            KuhnHistory::Bet | KuhnHistory::CheckBet => {
-                ActionVec::from_slice(&[KuhnAction::Fold, KuhnAction::Call])
-            }
+            KuhnHistory::Empty | KuhnHistory::Check => vec![KuhnAction::Check, KuhnAction::Bet],
+            KuhnHistory::Bet | KuhnHistory::CheckBet => vec![KuhnAction::Fold, KuhnAction::Call],
         }
     }
 

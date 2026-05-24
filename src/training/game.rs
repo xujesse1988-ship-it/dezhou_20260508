@@ -9,18 +9,9 @@
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use smallvec::SmallVec;
 
 use crate::core::rng::RngSource;
 use crate::error::GameVariant;
-
-/// 单决策点 legal_actions / abstract_actions 返回容器（D-378 / 第四轮 perf）。
-///
-/// inline 8 覆盖 NLHE D-209 6-action / Kuhn 2-action / Leduc 3-action 全场景，
-/// 避免每节点一次 `Vec::with_capacity(6)` 堆分配。与 [`crate::training::regret::SigmaVec`]
-/// 同尺寸 8，方便 collect 时 inline。spill 时退化为 `Vec`，外层 trait 调用站点
-/// 通过 `Deref<Target=[T]>` 与 slice 兼容。
-pub type ActionVec<A> = SmallVec<[A; 8]>;
 
 /// 0-indexed 玩家 id；2-player game `player ∈ {0, 1}`（API-300）。
 pub type PlayerId = u8;
@@ -111,10 +102,7 @@ pub trait Game {
     /// 当前节点合法 action 列表（D-318）。
     /// - Kuhn / Leduc：直接返回 game-specific 枚举
     /// - 简化 NLHE：走 stage 2 `DefaultActionAbstraction::abstract_actions`
-    ///
-    /// 返回 [`ActionVec`] = `SmallVec<[A; 8]>`，inline 8 覆盖各 game 默认 action
-    /// 数；trainer 热路径每决策点省一次 `Vec::with_capacity` 堆分配。
-    fn legal_actions(state: &Self::State) -> ActionVec<Self::Action>;
+    fn legal_actions(state: &Self::State) -> Vec<Self::Action>;
 
     /// 执行 action 转移状态；chance node 走 `chance_distribution + rng` 采样
     /// （D-336 自实现 binary search 累积分布），decision node 直接 apply。

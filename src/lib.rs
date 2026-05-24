@@ -65,9 +65,9 @@ pub use crate::abstraction::cluster::rng_substream;
 pub use crate::training::{
     estimate_lbr, estimate_lbr_filtered, estimate_simplified_nlhe_lbr,
     estimate_simplified_nlhe_lbr_filtered, evaluate_blueprint_vs_baseline, exploitability,
-    ActionVec, BestResponse, Checkpoint, CheckpointError, EsMccfrTrainer, Game, GameVariant,
-    KuhnAction, KuhnBestResponse, KuhnGame, KuhnHistory, KuhnInfoSet, LbrConfig, LbrReport,
-    LeducAction, LeducBestResponse, LeducGame, LeducInfoSet, LeducStreet, NlheBaselinePolicy,
+    BestResponse, Checkpoint, CheckpointError, EsMccfrTrainer, Game, GameVariant, KuhnAction,
+    KuhnBestResponse, KuhnGame, KuhnHistory, KuhnInfoSet, LbrConfig, LbrReport, LeducAction,
+    LeducBestResponse, LeducGame, LeducInfoSet, LeducStreet, NlheBaselinePolicy,
     NlheEvaluationConfig, NlheEvaluationError, NlheEvaluationReport, NlheLbrConfig, NlheLbrReport,
     NodeKind, PlayerId, RegretTable, SimplifiedNlheGame, StrategyAccumulator, Trainer,
     TrainerError, TrainerVariant, VanillaCfrTrainer,

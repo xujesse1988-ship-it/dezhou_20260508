@@ -258,7 +258,7 @@ fn collect_infos(
         NodeKind::Player(actor) => {
             let info = LeducGame::info_set(state, actor);
             if seen.insert(info.clone()) {
-                infos.insert(info.clone(), LeducGame::legal_actions(state).to_vec());
+                infos.insert(info.clone(), LeducGame::legal_actions(state));
             }
             for action in LeducGame::legal_actions(state) {
                 let next = LeducGame::next(state.clone(), action, rng);
