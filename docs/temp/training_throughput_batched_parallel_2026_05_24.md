@@ -294,3 +294,99 @@ src/training/nlhe.rs           SimplifiedNlheState info_set_cache: AtomicU64；i
 
 perf data：`/tmp/perf_v4.data`（cache + CSE，HEAD=`c1d36f5`）、`/tmp/perf_v5.data`
 （fast-path 完成，HEAD=`4e7b3a2`）。基线 `/tmp/perf_t32_b16.data` 在 AWS host。
+
+## 第四轮（legal_actions / abstract_actions 改 SmallVec → ablation 失败回退）
+
+第三轮 next steps #2 字面落地：`Game::legal_actions` 返回类型 `Vec<A>` →
+`ActionVec<A>` = `SmallVec<[A; 8]>`；`AbstractActionSet { actions }` 内部容器
+同步换 `AbstractActionVec` = `SmallVec<[AbstractAction; 8]>`；`abstract_actions`
+内部 `Vec::with_capacity(6)` / dedup buffer 改 SmallVec；Kuhn / Leduc / NLHE
+三个 game impl + trainer / lbr / best_response / nlhe_eval 调用站点 + tools/tests
+对齐。改动 11 文件（commit `c0610e8`）。
+
+### baseline（commit `2f90218`，AWS c6a.8xlarge `3.144.174.32`，32t B=128 1M updates，3 次）
+
+| run | elapsed (s) | last-200K throughput (/s) |
+|---:|---:|---:|
+| 1 | 49.5 | 23,757 |
+| 2 | 48.8 | 24,960 |
+| 3 | 49.4 | 24,648 |
+| **中位** | **49.4** | **24,648** |
+
+`elapsed` = trainer report 最后一行；`last-200K throughput` = 802K → 1M 段
+`Δupdates / Δelapsed`。比第三轮文档表 17,880/s 高 ~38%——文档当时 noise 显著
+（包含 11 GB checkpoint 写 tmpfs，本次跑 disk quota 拒了 final ckpt 反而拿到
+干净 elapsed），重新 anchor 在 24,648/s。
+
+### 改后（commit `c0610e8`，同机同 cmdline，3 次）
+
+| run | elapsed (s) | last-200K throughput (/s) |
+|---:|---:|---:|
+| 1 | 58.2 | 19,718 |
+| 2 | 55.1 | 19,718 |
+| 3 | 52.2 | 23,198 |
+| **中位** | **55.1** | **19,718** |
+
+elapsed +11.5%，last-200K throughput -20%——**整体负向**。
+
+### 根因
+
+probe `std::mem::size_of` on AWS host：
+
+```
+AbstractAction              = 16 byte
+Vec<AbstractAction>         = 24 byte
+SmallVec<[A; 8]>            = 144 byte  (128 inline + 16 header)
+SmallVec<[A; 6]>            = 112 byte
+SmallVec<[A; 4]>            = 80 byte
+```
+
+`Game::legal_actions` 每决策点返回 owned 容器，调用方 `let actions = ...`
+要做一次 stack-to-stack memcpy；新版每次 +120 byte（24 → 144）。NLHE
+ES-MCCFR `recurse_es_parallel` traverser fan-out 节点 6 × clone state +
+6 × G::next + 1 × G::legal_actions，stack 压力翻倍后 L1 hot working set
+被踢出，per-update CPU 时间反升。
+
+`SmallVec` 在 inline 空间够大时省一次 heap alloc + 一次 free（典型 ~10 ns），
+但要付一次大 memcpy 的代价。这里 alloc/free 太便宜（小 6-entry 分配 +
+free 都在 jemalloc thread-local cache），分摊不掉 stack copy 成本。
+
+理论上换 `SmallVec<[A; 4]>` 可以让 stack copy 降到 80 byte（同时 NLHE
+6-action 时 spill 到 heap，等价回到 Vec 路径不带新增收益）；`SmallVec<[A; 6]>`
+112 byte 仍比 Vec 大 ~5×。**没有 inline 容量 ≥ 6 + size ≤ Vec 的方案**——
+ablation 路全负向，回退。
+
+### 回退
+
+`ac0df06 Revert "perf(game): legal_actions / abstract_actions 返回 SmallVec..."`
+（`git revert c0610e8`）。`92c12bd8d774...bed5c81` 50K updates × 1 thread
+单次 SHA-256 确定性 anchor 在改前 / 改后 / 回退后 三次跑均 byte-equal，
+确认行为变更纯属性能 noise。
+
+### 结论 / 教训
+
+1. **inline size × entry size 是 SmallVec 选型硬指标**：`AbstractAction` = 16 byte
+   让 inline 8 直接 hit 144 byte stack copy threshold；Kuhn `KuhnAction` /
+   Leduc `LeducAction` 小 enum 同改动可能无害（甚至有微小收益），但 NLHE
+   是热路径主战场，跟着倒霉。Trait 一体化必然让最大 entry size 主导。
+2. **"省 heap alloc" 不是无脑收益**：分摊到 32 thread × ~20K calls/s 的
+   `Vec::with_capacity(6)` + free 本身 < 1% wall，stack copy 反而能压塌
+   cache。SmallVec ROI 看的是 `alloc_cost − stack_copy_cost`，前者 ≈ 0
+   时改动一定亏。
+3. **改前先 probe sizeof**：本轮改动跳过了这步，第三轮 next steps 估
+   "+1-2%" 在数据面前完全错。后续 SmallVec / 容器选型先 `size_of` 再写代码。
+
+### 下一步候选（第四轮结束时）
+
+1. **state apply/unapply 替 clone**（仍是第三轮 next steps #1）— clone+drop
+   `8.47% + 8.11% = 16.58%` 主要在 Arc deref + GameState 内部 SmallVec/HashMap
+   memcpy。需要 `GameState::undo(undo_info)` API + `recurse_es_parallel` 改
+   push/pop 路径。工作量 1-2 天，预期 +5-10%。风险点：确定性 anchor + tree
+   path 一致性。
+2. **重拍 profile**：第四轮 baseline 实测 24,648/s last-200K（vs 第三轮文档
+   17,880/s）。perf 顶部 symbol 分布可能已经漂移，下个攻击点未必是第三轮
+   profile 写的 next/info_set。先 `perf record` 重拍。
+3. **更新 `docs/status_v2.md` 训练吞吐表**：本机 / vultr / AWS 上 short 1M
+   run cumulative ~20K/s，但表格里的 6,885/s 是 c6a.8xlarge 长 100M run 全程
+   均（含 LCFR rescale + checkpoint + warmup）。要复测长 run 才能更新长 run
+   估算；短 run 数字可以加在表脚注。
