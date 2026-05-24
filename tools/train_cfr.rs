@@ -27,6 +27,12 @@ struct Args {
     bucket_table: PathBuf,
     threads: usize,
     quiet: bool,
+    /// LCFR-MCCFR period 大小（None = vanilla ES-MCCFR）。Brown & Sandholm 2018
+    /// §Discounted Monte Carlo CFR：period n 末 rescale × n/(n+1)。HUNL 推荐
+    /// period ≈ 10⁶ updates（Brown 原 paper 10⁷ nodes / ~10 nodes per update）。
+    /// 只在 cold start (`--resume` 不传) 生效；resume 不能 enable LCFR
+    /// （EsMccfrTrainer 校验 update_count == 0）。
+    lcfr_period: Option<u64>,
 }
 
 impl Default for Args {
@@ -44,6 +50,7 @@ impl Default for Args {
             bucket_table: PathBuf::new(),
             threads: 1,
             quiet: false,
+            lcfr_period: None,
         }
     }
 }
@@ -92,12 +99,25 @@ fn run() -> Result<(), String> {
     let table_hash = hex32(&table.content_hash());
 
     let mut trainer = if let Some(ref resume) = args.resume {
+        if args.lcfr_period.is_some() {
+            return Err(
+                "--lcfr-period cannot be combined with --resume: LCFR period state 不存 \
+                 checkpoint，resume 路径默认回退 vanilla（详 EsMccfrTrainer::load_checkpoint doc）。\
+                 production 路径走 cold start。"
+                    .to_string(),
+            );
+        }
         <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
             resume, game,
         )
         .map_err(|e| format!("load checkpoint {} failed: {e:?}", resume.display()))?
     } else {
-        EsMccfrTrainer::new(game, args.seed)
+        let base = EsMccfrTrainer::new(game, args.seed);
+        if let Some(period) = args.lcfr_period {
+            base.with_lcfr_period(period)
+        } else {
+            base
+        }
     };
 
     let start_update = trainer.update_count();
@@ -130,6 +150,10 @@ fn run() -> Result<(), String> {
         );
         if let Some(report_every) = args.report_every {
             eprintln!("[train_cfr] report_every     = {report_every}");
+        }
+        match args.lcfr_period {
+            Some(p) => eprintln!("[train_cfr] lcfr_period      = {p} (LCFR-MCCFR)"),
+            None => eprintln!("[train_cfr] lcfr_period      = none (vanilla ES-MCCFR)"),
         }
     }
 
@@ -235,6 +259,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--threads" => out.threads = parse_u64(&next_value(&mut args, "--threads")?)? as usize,
             "--quiet" => out.quiet = true,
+            "--lcfr-period" => {
+                out.lcfr_period = Some(parse_u64(&next_value(&mut args, "--lcfr-period")?)?)
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -311,6 +338,7 @@ fn print_usage() {
          \t--checkpoint-every <N>\n\
          \t--report-every <N>\n\
          \t--keep-last <N>\n\
+         \t--lcfr-period <N>  (cold start only; LCFR-MCCFR period rescale)\n\
          \t--quiet"
     );
 }
