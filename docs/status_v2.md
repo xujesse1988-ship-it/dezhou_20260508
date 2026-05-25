@@ -40,13 +40,37 @@ LCFR-MCCFR 在 Leduc 10M+ update 时反退化（不带 LCFR 的 ES-MCCFR exploit
 
 LCFR rescale 开销不可见（period boundary 每 1M update 全表 O(N) rescale，amortize 后 <1% wall）。
 
-**短跑 1M baseline**（同 c6a.8xlarge 32t B=128，HEAD=`ac0df06`，3 次中位）：
-1M updates wall 49.4s = cumulative 20,231/s；last-200K segment 24,648/s。
-跟长 run avg `6,885/s` 量级差 ~3.5×，主要差距 = 100M run 内存 11 GB
-RegretTable 已饱、HashMap collision 增长 + LCFR period rescale 全表 O(N) 摊
-+ checkpoint 写入。长 run wall 估算的 100M / 4h 没有 invalidate；短跑数字
-仅反映"trainer 自身热路径"在最近一轮优化后的状态（详
-`docs/temp/training_throughput_batched_parallel_2026_05_24.md`）。
+### batched-parallel 热路径优化（2026-05-24，已告一段落）
+
+`step_parallel` 加 `batch_per_worker`：每 worker 连跑 B 条 trajectory 再合并，把
+rayon dispatch / `sched_yield` 调度开销摊薄 B 倍（旧版每次只 dispatch `n_threads`
+条 ~1ms 任务，调度成本与计算同量级）。配套热路径减分配：history fast path
+（`with_rng_no_history` + `track_history` flag）、traverser fan-out consume-last、
+info_set per-street bucket cache、`next` CSE、`legal_actions` move-out。
+`tools/train_cfr --batch-per-worker` 默认 128。
+
+净效果（c6a.8xlarge 32t，1M updates，含 checkpoint，同方法 3 次中位）：
+steady last-200K `15,171 → 19,356/s`（+27.6%）、cumulative `10,048 → 12,208/s`
+（+21.5%）、wall `113 → 94s`（-16.7%）、user CPU `550 → 427s`（-22.4%）。
+剔除 11 GB checkpoint 写 tmpfs 噪声后，HEAD=`ac0df06` 当前 32t B=128 1M 短跑
+last-200K **24,648/s**、cumulative **20,231/s**（wall 49.4s）。这跟上表长 run avg
+`6,885/s` 差 ~3.5× 是预期的：长 run 受 11 GB RegretTable 内存饱和 + HashMap
+collision 增长 + LCFR period rescale 全表 O(N) + checkpoint 写入摊薄，热路径
+提速在长 run 上被吃掉大半。长 run 100M wall 估算（≈4h）是优化前全程均值，
+优化后未复测。
+
+`legal_actions` / `abstract_actions` 全面改 SmallVec（第四轮）实测负向
+（last-200K -20%；`AbstractAction` 16B × inline-8 = 144B stack copy 压塌 L1），
+已 `ac0df06` 回退；下一个候选是 `GameState` apply/undo 替 clone（clone+drop
+仍 ~16%），未做。
+
+行为中性的现有依据仅 50K updates × `--threads 1 --seed cafebabe` checkpoint
+SHA-256 改前 / 改后 / 回退后三次 byte-equal（`92c12bd8…bed5c81`，只证确定性）。
+NLHE 1M BLAKE3 anchor（`tests/cfr_simplified_nlhe.rs` Test 5）因期望 artifact
+文件名 `_v3.bin` 与实际 `_schemav3.bin` 不符**当前在 skip**；并行 `step_parallel`
+路径也无 Leduc/Kuhn 收敛对照（Leduc 288 infoset ≪ B×线程 window，无法走
+batched）——本轮改动未被任一收敛 gate 覆盖。round 详记
+`docs/temp/training_throughput_batched_parallel_2026_05_24.md`。
 
 长 run wall 估算（同 32 vCPU 主机，c7i / c6a 量级相当）：
 
