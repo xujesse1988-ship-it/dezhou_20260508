@@ -198,13 +198,13 @@ fn run() -> Result<(), String> {
                 .step(&mut single_rng)
                 .map_err(|e| format!("step failed at update {}: {e:?}", trainer.update_count()))?;
         } else {
-            // 单次 step_parallel 产 n × batch_per_worker 个 update；最后一个尾批
-            // 缩 batch_per_worker，避免越过 args.updates。n 同步缩到 ≥ 1 worker。
+            // 单次 step_parallel 产 n × batch 个 update。floor batch 保证
+            // n × batch ≤ remaining，绝不越过 args.updates；不足一整批的尾数
+            // （remaining % n）留到下一轮——下一轮 n 缩到该尾数后 batch = 1 收尾，
+            // 精确命中 args.updates（div_ceil 会 round-up 越界，见 P1 修复）。
             let n = args.threads.min(remaining as usize).max(1);
-            let max_batch = remaining
-                .div_ceil(n as u64)
-                .min(args.batch_per_worker as u64) as usize;
-            let batch = max_batch.max(1);
+            let batch =
+                ((remaining / n as u64).min(args.batch_per_worker as u64) as usize).max(1);
             trainer
                 .step_parallel(&mut rng_pool, n, batch)
                 .map_err(|e| {

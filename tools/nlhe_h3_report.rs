@@ -415,10 +415,11 @@ fn train_inline(
                 .map_err(|e| format!("inline step failed: {e:?}"))?;
         } else {
             let n = threads.min(remaining as usize).max(1);
-            // 复用 train_cfr 默认 batch_per_worker = 16；inline trainer 跑短 update
-            // 量级（典型 < 200K），用同样的 batch 让 throughput 行为与正式训练一致。
-            let max_batch = remaining.div_ceil(n as u64).min(16) as usize;
-            let batch = max_batch.max(1);
+            // floor batch（batch_per_worker = 16 同 train_cfr 默认）：n × batch ≤
+            // remaining，绝不越过 target_updates；尾数留到下一轮 n 缩到尾数后
+            // batch = 1 收尾，精确命中 target_updates。inline trainer 跑短 update
+            // 量级，curve point 必须精确落在 target（div_ceil 会 round-up 越界）。
+            let batch = ((remaining / n as u64).min(16) as usize).max(1);
             trainer
                 .step_parallel(&mut rng_pool, n, batch)
                 .map_err(|e| format!("inline step_parallel failed: {e:?}"))?;
