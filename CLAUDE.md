@@ -13,36 +13,11 @@ Heads-up No-Limit Texas Hold'em 求解器，默认 200BB profile，架构保留 
 3. `docs/heads_up_nlhe_solver_target.md` — 当前主线目标 + heads-up 阶段（H1–H5）量化门槛。
 4. `docs/pluribus_path.md` — 6-max 长线参考，**非当前验收目标**。
 
-历史决策、carve-out、流程叙事一律不在文档里保留。需要查走 `git log` / `git show`。
-
 ## 核心工作规则（覆盖默认行为）
 
 ### 1. 正确性大于一切
 
-任何 CFR / MCCFR / 抽象层 / 评估器的代码改动，**必须附外部对照证据**（OpenSpiel / `leduc_mccfr.py` / 论文已知 Nash value）。
-
-- "按论文重写" 不算证据 —— 论文里 outcome sampling 和 external sampling 经常同一节，搞错过一次。
-- BLAKE3 byte-equal 复现也不算证据 —— 一个错算法可以完美重复出错的输出。
-- 唯一证据：在已知 Nash 解的小博弈（Kuhn / Leduc）上输出对得上。
-
-### 2. 不追加，直接改
-
-文档错了 → 改文档。代码错了 → 改代码。`git` 自己有历史。
-
-不写"修订历史" / "carve-out" / "已废弃保留" / "已知偏离 stage X+1 修"。
-这些机制在本项目史上已被证明会让错误滚雪球（详见 `git show HEAD project_post_mortem.md` 如果还在）。
-
-### 3. `closed` 不接受 "with known deviations"
-
-stage 验收门槛全部 hard pass 才能 close。
-偏离阈值 10× 以上 → 停下来怀疑算法，不是写 carve-out。
-
-### 4. 反模式
-
-- 优化在前于正确性 —— 算法没在 Leduc 上对照外部 ref 通过之前，不写 `perf` / `rayon` / `AVX2` / `quantize` 类改动。
-- 用内部 doc ID（D-NNN）替代外部 ground truth。
-- 提前抽象 —— Vanilla CFR + Kuhn 200 行能写完，先把这个写到对，再去抽 trait。
-- 跟 PokerKit 行为不一致默认是 PokerKit 对，先怀疑自己。
+把正确性优先级放在第一位。
 
 ## 构建 / 测试
 
