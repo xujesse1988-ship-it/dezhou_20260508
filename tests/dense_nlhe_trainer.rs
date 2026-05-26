@@ -9,9 +9,11 @@
 //!
 //! **内存 + 运行**：dense 两表 *满分配* 4.62 GiB（当前 119.7M profile）虚拟空间，但
 //! `vec![0.0; N]` 走 `calloc` 惰性提交——RSS 只随**真正写过的 slot** 增长：
-//! - vanilla scenario 只写访问过的 slot（稀疏）→ 实测峰值 ~1.5 GiB。
-//! - LCFR scenario 的 `rescale_all` 扫**整张表** → 提交全部 4.62 GiB（+bucket 0.55 GiB
-//!   ≈ 5.2 GiB 峰值）。
+//! - vanilla scenario 只写访问过的 slot（稀疏，但 ES-MCCFR traverser 节点全 fan-out
+//!   会铺开大量 infoset）→ 实测峰值 ~3.8 GiB（5000 update）。
+//! - LCFR scenario 的 `rescale_all` 扫**整张表** → 提交全部 4.62 GiB dense + bucket
+//!   0.55 GiB 硬地板 → 实测峰值 ~5.7 GiB（1000 update；5000 update 会顶到 7.33 GiB
+//!   逼近 vultr 上限，故 LCFR 压到 1000 update）。
 //!
 //! 故拆成两个 `#[ignore]` test，**各自单独一次 `cargo test` 调用**跑（进程退出后 OS
 //! 全部回收，峰值只压一个 scenario；同进程内顺序跑会因 glibc 不及时还内存而叠加到
@@ -132,15 +134,18 @@ fn dense_es_mccfr_byte_equal_hashmap_vanilla() {
     eprintln!("[dense byte-equal] vanilla: {n} infoset byte-equal ✓");
 }
 
-/// LCFR period=1000 byte-equal：5000 update 跨 5 个 period boundary，regret +
-/// strategy_sum 双 rescale。`rescale_all` 扫全表 → 提交全部 4.62 GiB（+bucket ≈ 5.2 GiB
-/// 峰值），**单独一次 cargo test 调用跑**（勿与 vanilla 同进程，否则叠加到 ~7 GiB）。
+/// LCFR period=200 byte-equal：1000 update 跨 5 个 period boundary，regret +
+/// strategy_sum 双 rescale。`rescale_all` 扫**全表** → 不论 update 数都提交全部
+/// 4.62 GiB dense（+bucket 0.55 GiB 是硬地板）；update 数压到 1000 仅为缩小 HashMap
+/// 对照表的内存（5000 update 时 HashMap + 触达页把峰值顶到 7.33 GiB，逼近 vultr
+/// 7.7 GiB 上限）。1000 update 实测峰值 ~5.7 GiB，留 ~2 GiB 余量。**单独一次
+/// cargo test 调用跑**（勿与 vanilla 同进程，否则 glibc 未及时还内存会叠加）。
 #[test]
-#[ignore = "LCFR rescale 提交全表 → 峰值 ~5.2 GiB；release --ignored 单独跑（勿与 vanilla 同进程）"]
+#[ignore = "LCFR rescale 提交全表 → 峰值 ~5.7 GiB；release --ignored 单独跑（勿与 vanilla 同进程）"]
 fn dense_es_mccfr_byte_equal_hashmap_lcfr() {
     let Some(bucket_table) = load_bucket_table_or_skip() else {
         return;
     };
-    let n = run_scenario(&bucket_table, Some(1_000), 5_000);
-    eprintln!("[dense byte-equal] LCFR(period=1000): {n} infoset byte-equal ✓");
+    let n = run_scenario(&bucket_table, Some(200), 1_000);
+    eprintln!("[dense byte-equal] LCFR(period=200): {n} infoset byte-equal ✓");
 }
