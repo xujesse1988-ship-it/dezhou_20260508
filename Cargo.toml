@@ -85,6 +85,12 @@ harness = false
 name = "bucket_kmeans_fit"
 path = "tools/bucket_kmeans_fit.rs"
 
+# 一次性迁移：v3 bucket table → v4（canonical id 由整表 sort rank 改为 shape-major
+# 后重排 lookup 段，bucket 不变）。详见 tools/bucket_table_reindex_v3_to_v4.rs。
+[[bin]]
+name = "bucket_table_reindex_v3_to_v4"
+path = "tools/bucket_table_reindex_v3_to_v4.rs"
+
 # F3 [报告]：bucket table 质量数据 dump CLI（一次性 instrumentation）。读取 artifact
 # + 抽样 EHS 计算 → JSON 喂给 tools/bucket_quality_report.py 输出验收直方图。
 [[bin]]
