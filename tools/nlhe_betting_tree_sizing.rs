@@ -175,23 +175,15 @@ fn print_stats(label: &str, desc: &str, stats: &Stats, baseline: Option<u64>) {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     // raise 集合常量，方便复用。
     const R3: &[f64] = &[0.5, 1.0, 2.0]; // 现在的 6-action {0.5p,1p,2p}
-    const R4: &[f64] = &[0.5, 0.75, 1.0, 2.0]; // 均匀 +0.75p
-    const PF5: &[f64] = &[0.33, 0.5, 0.75, 1.0, 2.0]; // 早街加细：+0.33p +0.75p
-    const PF4: &[f64] = &[0.5, 0.75, 1.0, 2.0]; // 早街只 +0.75p
+    const FLOP_USER: &[f64] = &[0.33, 0.66, 1.0, 2.0]; // 用户选定 flop 尺度
 
     // [preflop, flop, turn, river]
     let configs: &[(&str, [&[f64]; 4])] = &[
         ("baseline 全街 {0.5,1,2}", [R3, R3, R3, R3]),
-        ("均匀 +0.75p 全街", [R4, R4, R4, R4]),
         (
-            "按街: pre/flop +{0.33,0.75} / turn,river 不动",
-            [PF5, PF5, R3, R3],
+            "用户: pre {0.5,1,2} / flop {0.33,0.66,1,2} / turn,river 不动",
+            [R3, FLOP_USER, R3, R3],
         ),
-        (
-            "按街: pre/flop +0.75 only / turn,river 不动",
-            [PF4, PF4, R3, R3],
-        ),
-        ("按街: flop-only +{0.33,0.75} / 其它不动", [R3, PF5, R3, R3]),
     ];
 
     println!("=== Simplified NLHE Abstract Betting Tree Sizing (HU 200BB default) ===");
