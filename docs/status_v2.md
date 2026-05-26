@@ -10,6 +10,7 @@
 | Leduc LCFR-MCCFR | ✅ 算法正确（所有变体 `ev_p0` 收敛到 -0.087）；不带 LCFR 的 ES-MCCFR 路径 BLAKE3 byte-equal 保留；早期 regime（2M update）显著降 exploit（p=10K -38.4%） | `artifacts/lcfr_leduc/` on vultr |
 | 简化 NLHE ES-MCCFR（不带 LCFR） | ✅ 100M LBR proxy 1,863 chips；500M LBR 1,849 chips（floor，100→500M < 1 SE） | `run_v3_100m`, `run_v3_500m` on vultr |
 | 简化 NLHE LCFR-MCCFR | ✅ **旧路径 100M LBR 1,503；优化路径 100M 1,233 → 500M 1,126（破 ES-MCCFR floor 1,849 约 39%）；100M→500M < 1 SE = 饱和** | `run_lcfr_100m` / `run_lcfr_500m` |
+| 简化 NLHE dense 后端（dense 表 + v4 bucket） | ✅ **byte-equal HashMap（5 对照）+ 端到端 100M LBR 1,143 ± 87 ≈ HashMap+v3 baseline 1,233 ± 96.9（差 91 < 合并 SE 130，不显著 = 同质量）** | `tests/dense_nlhe_trainer.rs` + `run_dense_lcfr_100m` on vultr |
 
 ### 简化 NLHE profile
 
@@ -38,8 +39,11 @@ LCFR-MCCFR 在 Leduc 10M+ update 时反退化（不带 LCFR 的 ES-MCCFR exploit
 | AWS c7i.4xlarge (32 vCPU Intel) | ES-MCCFR（不带 LCFR） | 10,679/s | 7,312/s | n/a | run_v3_100m |
 | AWS c6a.8xlarge (32 vCPU AMD EPYC 7R13) | LCFR-MCCFR period=1M（旧路径） | 9,877/s | 7,154/s | 6,885/s | run_lcfr_100m |
 | AWS c6a.8xlarge (32 vCPU AMD EPYC 7R13) | LCFR-MCCFR period=1M **优化 B=128** | 17,608/s¹ | 12,420/s | 12,965/s | run_lcfr_500m |
+| AWS 32 vCPU (3.90.231.50, 已 terminate) | **dense 后端** LCFR period=1M B=128 | ~36,500/s² | ~26,800/s³ | 26,180/s | run_dense_lcfr_100m |
 
 ¹ 0–10M 窗口（该 run report-every=10M，无 5M 采样点）。优化 vs 旧路径同档主机：**稳态段 50–100M +70.5%、100M 累计 +88%**；全程 500M 累计 12,063/s（含 5 次 checkpoint 暂停）vs 旧 100M avg 6,885/s = **+75%**。
+
+² 0–5M 窗口。³ dense 关键观察：稳态 ~26.8k/s **从 70M 后压平不再衰减**（无 HashMap collision growth / glibc arena bloat），对比 HashMap 同 profile 100M+ 衰到 ~12k/s → **dense ~2.2× 且长 run 不塌**。wall 63.7min（vs HashMap 100M 估算 2h18min ≈ 半程）。RSS 全程平 ~5.2 GiB（4.62 表 + 0.55 bucket），**checkpoint 写不暴涨**（dense ckpt 流式写 raw f64，无 bincode 全缓冲；对比 HashMap final 序列化峰值 46.8 GB）。dense ckpt 固定 4.7 GiB（含两表，比 HashMap ~8.5 GiB 小：无 InfoSetId key + 无 per-row Vec len，position=identity）。**跨主机非同档对照**：该 box CPU 型号未记录，2.2× 是跨机估算，未做同机 HashMap 对照。
 
 LCFR rescale 开销不可见（period boundary 每 1M update 全表 O(N) rescale，amortize 后 <1% wall）。
 
@@ -132,6 +136,23 @@ throughput 上限由 `step_parallel` serial merge 卡死，加更多核 / 更大
   500M 不值（多 ~7h / ~$8 只换噪声内微动）**。此前 next-step 选项 A 的疑问（LCFR 是否一路向下）
   答案 = 类似 floor。
 - 此 run 100M blueprint 同时是 batched-parallel 优化路径的收敛域正确性证据（见 §训练吞吐基线）。
+
+### dense 后端 100M（dense 表 + v4 bucket，run_dense_lcfr_100m，vultr 持久）
+
+- `~/dezhou_20260508/artifacts/run_dense_lcfr_100m/nlhe_es_mccfr_final_000100000000.ckpt`
+- 4.7 GiB（dense raw v3 格式）/ b3sum `e1a346717f31a7c5332603d6803cbc511195c1abbb76797c27b9e26e0d515502`
+- strategy_blake3 `2fab8afe11fa03f18c9adbea98c8569889717c1d4a85eec588d3292fd63022f7`
+- seed `0x4e4c48455f48335f` / LCFR period `1_000_000` / **bucket cafebabe v4** `ac501bcf...`（body BLAKE3）
+- update_count 100,000,000 / wall 3,819.7s = 63.7min / throughput avg 26,180/s（AWS 32 vCPU dense，2026-05-26）
+- **LBR proxy 1,142.86 chips ± 87.01**（probes=1000, fallback=hybrid, 964 probes used）
+- vs HashMap+v3 100M baseline `1,233.53 ± 96.9`：差 91 < 合并 SE 130，**不显著 = 同质量**（dense 后端 + v4
+  reindex bucket 未改变 blueprint 质量）。uniform-0 对照 5,680 ≈ 历史 5,617，estimator 自洽。
+- **新增 CLI**（think `8a4023e` / `4b39efc`）：`train_cfr --dense`（DenseNlheEsMccfrTrainer 后端）、
+  `nlhe_h3_report --dense`（评测 dense raw v3 ckpt）。中间 25/50/75M ckpt 未存（仅在已 terminate 的 AWS box）。
+- H3 baseline EV（此 dense run，mbb/g，全 4 个 95% 正显著）：random +5,887 [3,480, 8,294] /
+  call-station +3,628 [2,662, 4,593] / overly-tight +565 [367, 762] / equity-ev +2,658 [354, 4,961]。
+  （绝对值与下表 LCFR 100M 不同档：eval seed 不同 + 2,000 hands 噪声大，random/equity-ev SE ±1,200；
+  LBR 才是稳定质量度量，且对齐 baseline。）
 
 ### H3 baseline EV @ LCFR 100M（mbb/g，正值 = 训练侧赢）
 
@@ -229,9 +250,13 @@ c6a 单核略弱但每 vCPU 便宜，wall 同档（受 serial merge 卡死）。
 - **update 数不是瓶颈**：ES-MCCFR 与 LCFR 在当前 profile 都 100M 即饱和（100M→500M LBR < 1 SE）。
   再加 update（1B 等）大概率同 floor，不值。LCFR 100M LBR 1,503 / 优化路径 100M 1,233 是当前最优区间。
 - **优化 batched-parallel 路径已验证正确**（NLHE 收敛域：复现 baseline EV + LBR 在学习区间）。
+- **dense 后端 + v4 bucket 已端到端验证**（`run_dense_lcfr_100m`：throughput ~2.2× HashMap 且长 run 不塌、
+  RAM 平 5.2 GiB、checkpoint 不暴涨、100M LBR 同质量）——bet-size 扩张的前置 enabler 就位。
 
 → 若要更强 blueprint，杠杆不在迭代数，而在 **information abstraction（bucket 数 / 特征）或 action
-abstraction 粒度**——这是架构级改动，需单独评估。剩余候选（D. strategy-only LCFR 对照）仍可选但优先级低。
+abstraction 粒度**——这是架构级改动。**下一步明确**：上 flop bet-size 扩张 `{0.33,0.66,1,2}` / 359.6M infoset
+（按街 abstraction 已落地 `3379db8`，dense 两表 13.48 GiB 需 32–64 GB 机），dense path 已扫清内存/正确性障碍。
+剩余候选（D. strategy-only LCFR 对照）仍可选但优先级低。
 
 ## 文档维护规则
 
