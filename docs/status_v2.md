@@ -160,9 +160,10 @@ schema_version=4 / feature_set_id=2（16-dim hist+OCHS feature）；v1/v2/v3 art
 **v4 来历**（2026-05）：`canonical_enum` 把 canonical observation id 编号从「整表 u128
 sort rank」改为 shape-major direct combinatorial rank（O(1) 公式，消除 ~2.2 GB lazy 表
 + ~3 min build）。bucket 分配与编号无关，故 v4 由 `tools/bucket_table_reindex_v3_to_v4`
-对 v3 表 lookup 段做无损重排得到（**未重训**，bucket 逐一对应、EVR 不变）；旧 v3 文件
-仍在 vultr `artifacts/` 留作 rollback 源。校验：`bucket_quality` 全部质量门槛在 v4
-cafebabe 上 19/19 绿（= same hand → same bucket 端到端验证）。
+对 v3 表 lookup 段做无损重排得到（**未重训**，bucket 逐一对应、EVR 不变）。旧 v3 文件
+已删（重排可逆：排列是双射，必要时可从 v4 反向重排回 v3 编号，或重训）。校验：
+`bucket_quality` 全部质量门槛在 v4 cafebabe 上 19/19 绿（= same hand → same bucket
+端到端验证）。
 
 ## 算法 + 关键代码入口
 
