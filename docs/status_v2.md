@@ -146,16 +146,23 @@ throughput 上限由 `step_parallel` serial merge 卡死，加更多核 / 更大
 
 ## bucket table 工件
 
-3 个 production v3 artifact 在 vultr `~/dezhou_20260508/artifacts/`（不进 git，旁路 `.b3sum` anchor）：
+3 个 production v4 artifact 在 vultr `~/dezhou_20260508/artifacts/`（不进 git，旁路 `.b3sum` anchor）：
 
 | seed | filename | body BLAKE3 | EVR |
 |---|---|---|---|
-| **cafebabe (canonical)** | `bucket_table_default_500_500_500_seed_cafebabe_schemav3.bin` | `1c22c1ee32fdd557db2c2fefaeb8a5c287dfd165d648fa6c2488d76a226575a0` | **0.9712** |
-| deadbeef | `bucket_table_default_500_500_500_seed_deadbeef_schemav3.bin` | `1a7f39882ddee8012a06420afc788bd6ad5ca03b593f187e5330b34004a630be` | 0.9711 |
-| b16b00b5 | `bucket_table_default_500_500_500_seed_b16b00b5_schemav3.bin` | `9c47f4fdbe7ce4dd6388d7d980e6a115212a36a586ff1e528d9bd588f7cb9311` | 0.9709 |
+| **cafebabe (canonical)** | `bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin` | `ac501bcfb7aef43b816f78c81d315d92f2602d5d932afedfce5e0a314bbe19c9` | **0.9712** |
+| deadbeef | `bucket_table_default_500_500_500_seed_deadbeef_schemav4.bin` | `56f836729ca5213affbb0ac9daad643de0432943593e92ced78972243f4ac57a` | 0.9711 |
+| b16b00b5 | `bucket_table_default_500_500_500_seed_b16b00b5_schemav4.bin` | `18e5233fee7f2b17b04a0907ebba8337ee59728fe0d5af83519b3c9ccbd547a6` | 0.9709 |
 
 Stage 3 CFR 输入钉死 `cafebabe`（EVR 最高）；`deadbeef` / `b16b00b5` 留 seed robustness 对照。
-schema_version=3 / feature_set_id=2（16-dim hist+OCHS feature）；v1/v2 artifact 不再可加载。
+schema_version=4 / feature_set_id=2（16-dim hist+OCHS feature）；v1/v2/v3 artifact 不再可加载。
+
+**v4 来历**（2026-05）：`canonical_enum` 把 canonical observation id 编号从「整表 u128
+sort rank」改为 shape-major direct combinatorial rank（O(1) 公式，消除 ~2.2 GB lazy 表
++ ~3 min build）。bucket 分配与编号无关，故 v4 由 `tools/bucket_table_reindex_v3_to_v4`
+对 v3 表 lookup 段做无损重排得到（**未重训**，bucket 逐一对应、EVR 不变）；旧 v3 文件
+仍在 vultr `artifacts/` 留作 rollback 源。校验：`bucket_quality` 全部质量门槛在 v4
+cafebabe 上 19/19 绿（= same hand → same bucket 端到端验证）。
 
 ## 算法 + 关键代码入口
 

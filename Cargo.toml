@@ -91,6 +91,11 @@ path = "tools/bucket_kmeans_fit.rs"
 name = "bucket_table_reindex_v3_to_v4"
 path = "tools/bucket_table_reindex_v3_to_v4.rs"
 
+# 整文件 BLAKE3 → `<file>.b3sum`（b3sum CLI 不在 host 上时的替代）。
+[[bin]]
+name = "b3sum"
+path = "tools/b3sum.rs"
+
 # F3 [报告]：bucket table 质量数据 dump CLI（一次性 instrumentation）。读取 artifact
 # + 抽样 EHS 计算 → JSON 喂给 tools/bucket_quality_report.py 输出验收直方图。
 [[bin]]

@@ -23,11 +23,11 @@
 //!    snapshot avg_strategy，3 runs byte-equal。
 //!
 //! **D-314-rev1 lock**（`pluribus_stage3_decisions.md` §10.1，2026-05-13）：
-//! bucket table = §G-batch1 §3.10 production **v3** artifact
-//! `artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin`（528 MiB /
+//! bucket table = §G-batch1 §3.10 production **v4** artifact
+//! `artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin`（528 MiB /
 //! body BLAKE3 `67ee5554...`）。
 //!
-//! 测试 setup 走 `load_v3_artifact_or_skip` helper：artifact 缺失（CI / GitHub-
+//! 测试 setup 走 `load_v4_artifact_or_skip` helper：artifact 缺失（CI / GitHub-
 //! hosted runner 典型场景）时打印 eprintln 提示并 `return`（pass-with-skip），不
 //! 强行依赖远端拉 528 MiB。本地 dev box / vultr / AWS host 有 artifact 时全套跑。
 //!
@@ -50,13 +50,14 @@ use poker::{AbstractAction, BucketTable, ChaCha20Rng, InfoSetId, StreetTag};
 // 共享常量 + helper
 // ===========================================================================
 
-/// v3 production artifact path（D-314-rev1 lock，相对 repo root）。
-const V3_ARTIFACT_PATH: &str = "artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin";
+/// v4 production artifact path（D-314-rev1 lock，相对 repo root）。
+const V4_ARTIFACT_PATH: &str =
+    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin";
 
-/// v3 artifact body BLAKE3 (D-314-rev1 ground truth；CLAUDE.md "当前 artifact 基线")。
-/// 用于 helper 兜底 sanity check：artifact 加载成功但 `content_hash()` 不匹配 v3 →
+/// v4 artifact body BLAKE3 (D-314-rev1 ground truth；CLAUDE.md "当前 artifact 基线")。
+/// 用于 helper 兜底 sanity check：artifact 加载成功但 `content_hash()` 不匹配 v4 →
 /// 视同 schema 不兼容，eprintln + skip（避免 v2/v1 stale artifact 误闯入 C1 测试路径）。
-const V3_BODY_BLAKE3_HEX: &str = "67ee555439f2c918698650c05f40a7a5e9e812280ceb87fc3c6590add98650cd";
+const V4_BODY_BLAKE3_HEX: &str = "ac501bcfb7aef43b816f78c81d315d92f2602d5d932afedfce5e0a314bbe19c9";
 
 /// 固定 master seed（D-335 sub-stream root）。跨所有 5 条测试共享，让 BLAKE3
 /// byte-equal 可交叉验证 + 让 release/--ignored 多 run 之间共享 determinism。
@@ -78,16 +79,16 @@ const CHANCE_WALK_LIMIT: usize = 32;
 /// 数量上限（每路径 ≤ ~16 decision node 在简化 NLHE 边界）。
 const SNAPSHOT_PROBE_LIMIT: usize = 64;
 
-/// 加载 v3 artifact 并构造 `SimplifiedNlheGame`；artifact 缺失 / schema 不匹配 /
+/// 加载 v4 artifact 并构造 `SimplifiedNlheGame`；artifact 缺失 / schema 不匹配 /
 /// `SimplifiedNlheGame::new` 失败时 eprintln + 返回 `None`（pass-with-skip）。
 ///
 /// scaffold 阶段 `SimplifiedNlheGame::new` 自身 `unimplemented!()` → 本 helper 在
 /// `SimplifiedNlheGame::new` 路径 panic；C2 \[实现\] 落地后 skip 路径生效。
-fn load_v3_artifact_or_skip() -> Option<SimplifiedNlheGame> {
-    let path = PathBuf::from(V3_ARTIFACT_PATH);
+fn load_v4_artifact_or_skip() -> Option<SimplifiedNlheGame> {
+    let path = PathBuf::from(V4_ARTIFACT_PATH);
     if !path.exists() {
         eprintln!(
-            "skip: v3 artifact `{V3_ARTIFACT_PATH}` 不存在（CI / GitHub-hosted runner 典型 \
+            "skip: v4 artifact `{V4_ARTIFACT_PATH}` 不存在（CI / GitHub-hosted runner 典型 \
              场景；本地 dev box / vultr / AWS host 有 artifact 时跑）。"
         );
         return None;
@@ -95,17 +96,17 @@ fn load_v3_artifact_or_skip() -> Option<SimplifiedNlheGame> {
     let table = match BucketTable::open(&path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("skip: BucketTable::open({V3_ARTIFACT_PATH}) 失败：{e:?}");
+            eprintln!("skip: BucketTable::open({V4_ARTIFACT_PATH}) 失败：{e:?}");
             return None;
         }
     };
-    // sanity：content_hash 匹配 v3 ground truth；v2 / v1 stale artifact 走 hash
+    // sanity：content_hash 匹配 v4 ground truth；v2 / v1 stale artifact 走 hash
     // 不匹配 → skip（避免 stale artifact 误闯入 C1 测试路径）。
     let body_hex = blake3_hex(&table.content_hash());
-    if body_hex != V3_BODY_BLAKE3_HEX {
+    if body_hex != V4_BODY_BLAKE3_HEX {
         eprintln!(
-            "skip: artifact body BLAKE3 `{body_hex}` 不匹配 v3 ground truth \
-             `{V3_BODY_BLAKE3_HEX}`（D-314-rev1 lock 要求 v3 artifact；stale v1/v2 路径 skip）。"
+            "skip: artifact body BLAKE3 `{body_hex}` 不匹配 v4 ground truth \
+             `{V4_BODY_BLAKE3_HEX}`（D-314-rev1 lock 要求 v4 artifact；stale v1/v2 路径 skip）。"
         );
         return None;
     }
@@ -173,7 +174,7 @@ fn walk_to_first_player_node(
 /// 绿。本 trip-wire 锁定 "2-player + 200 BB starting stack" 字面范围。
 #[test]
 fn simplified_nlhe_game_root_state_2_player_200bb_starting_stack() {
-    let Some(game) = load_v3_artifact_or_skip() else {
+    let Some(game) = load_v4_artifact_or_skip() else {
         return;
     };
     assert_eq!(
@@ -211,7 +212,7 @@ fn simplified_nlhe_game_root_state_2_player_200bb_starting_stack() {
 /// 2 D-209 + D-210 决定，C1 仅锁桥接通路 sanity）。
 #[test]
 fn simplified_nlhe_legal_actions_returns_default_action_abstraction_6_action() {
-    let Some(game) = load_v3_artifact_or_skip() else {
+    let Some(game) = load_v4_artifact_or_skip() else {
         return;
     };
     let (state, _actor) = walk_to_first_player_node(&game, FIXED_SEED);
@@ -250,7 +251,7 @@ fn simplified_nlhe_legal_actions_returns_default_action_abstraction_6_action() {
 /// stage 2 D-215 layout 决定，C1 仅锁 street_tag 桥接通路 sanity）。
 #[test]
 fn simplified_nlhe_info_set_uses_stage2_infosetid() {
-    let Some(game) = load_v3_artifact_or_skip() else {
+    let Some(game) = load_v4_artifact_or_skip() else {
         return;
     };
     let (state, actor) = walk_to_first_player_node(&game, FIXED_SEED);
@@ -283,7 +284,7 @@ fn simplified_nlhe_info_set_uses_stage2_infosetid() {
 #[test]
 #[ignore = "release/--ignored opt-in（1K ES-MCCFR update + smoke probe；C2 \\[实现\\] 落地后通过）"]
 fn simplified_nlhe_es_mccfr_1k_update_no_panic_no_nan_no_inf() {
-    let Some(game) = load_v3_artifact_or_skip() else {
+    let Some(game) = load_v4_artifact_or_skip() else {
         return;
     };
     // 先走一遍 walk 收集 InfoSet probe（在训练之前；trainer 训练后 query 同一 InfoSet
@@ -359,9 +360,9 @@ fn assert_finite_strategy(strategy: &[f64], label: &str) {
 #[test]
 #[ignore = "release/--ignored opt-in（1M ES-MCCFR update × 3 runs ~ 5 min；C2 \\[实现\\] 落地后通过）"]
 fn simplified_nlhe_es_mccfr_fixed_seed_repeat_3_times_blake3_identical_1m_update() {
-    let path = PathBuf::from(V3_ARTIFACT_PATH);
+    let path = PathBuf::from(V4_ARTIFACT_PATH);
     if !path.exists() {
-        eprintln!("skip: v3 artifact `{V3_ARTIFACT_PATH}` 不存在；本测试需 528 MiB v3 artifact");
+        eprintln!("skip: v4 artifact `{V4_ARTIFACT_PATH}` 不存在；本测试需 528 MiB v4 artifact");
         return;
     }
     let table = match BucketTable::open(&path) {
@@ -372,10 +373,10 @@ fn simplified_nlhe_es_mccfr_fixed_seed_repeat_3_times_blake3_identical_1m_update
         }
     };
     let body_hex = blake3_hex(&table.content_hash());
-    if body_hex != V3_BODY_BLAKE3_HEX {
+    if body_hex != V4_BODY_BLAKE3_HEX {
         eprintln!(
-            "skip: artifact body BLAKE3 不匹配 v3 ground truth（actual = {body_hex}，\
-             expected = {V3_BODY_BLAKE3_HEX}）"
+            "skip: artifact body BLAKE3 不匹配 v4 ground truth（actual = {body_hex}，\
+             expected = {V4_BODY_BLAKE3_HEX}）"
         );
         return;
     }
@@ -385,7 +386,7 @@ fn simplified_nlhe_es_mccfr_fixed_seed_repeat_3_times_blake3_identical_1m_update
     let repeat_count = 3;
     for run in 0..repeat_count {
         let game = SimplifiedNlheGame::new(Arc::clone(&shared_table)).expect(
-            "D-314-rev1：v3 artifact schema_version = 2 应当被 SimplifiedNlheGame::new 接受",
+            "D-314-rev1：v4 artifact（schema_version = 4）应当被 SimplifiedNlheGame::new 接受",
         );
         // 在训练前固定一条 chance-deterministic path 用于 snapshot probe（path 由
         // walk_to_first_player_node + 几步固定 action sequence 派生；本 probe 路径与
