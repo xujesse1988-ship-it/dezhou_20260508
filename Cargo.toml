@@ -112,6 +112,10 @@ name = "nlhe_h3_report"
 path = "tools/nlhe_h3_report.rs"
 
 [[bin]]
+name = "nlhe_checkpoint_vs_checkpoint"
+path = "tools/nlhe_checkpoint_vs_checkpoint.rs"
+
+[[bin]]
 name = "leduc_es_mccfr_report"
 path = "tools/leduc_es_mccfr_report.rs"
 
