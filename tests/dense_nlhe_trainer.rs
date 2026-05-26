@@ -9,21 +9,28 @@
 //!
 //! **内存 + 运行**：dense 两表 *满分配* 4.62 GiB（当前 119.7M profile）虚拟空间，但
 //! `vec![0.0; N]` 走 `calloc` 惰性提交——RSS 只随**真正写过的 slot** 增长：
-//! - vanilla scenario 只写访问过的 slot（稀疏，但 ES-MCCFR traverser 节点全 fan-out
-//!   会铺开大量 infoset）→ 实测峰值 ~3.8 GiB（5000 update）。
-//! - LCFR scenario 的 `rescale_all` 扫**整张表** → 提交全部 4.62 GiB dense + bucket
-//!   0.55 GiB 硬地板 → 实测峰值 ~5.7 GiB（1000 update；5000 update 会顶到 7.33 GiB
-//!   逼近 vultr 上限，故 LCFR 压到 1000 update）。
+//! - **vanilla**（`rescale_all` 不触发）：dense 只提交访问过的 slot（稀疏，但
+//!   ES-MCCFR traverser 节点全 fan-out 会铺开大量 infoset）→ 实测峰值 **~3.8 GiB**。
+//!   vultr（7.7 GiB）充裕，是 dense recurse byte-equal 的主验证。
+//! - **LCFR**：`rescale_all` 扫**整张表** → 提交全部 4.62 GiB dense；再叠 HashMap
+//!   对照表（traverser fan-out 下很快饱和到 ~2 GiB，**与 update 数几乎无关**——1000
+//!   与 5000 update 实测峰值都是 ~7.33 GiB）+ bucket 0.55 GiB → 峰值 **~7.33 GiB**。
+//!   这逼近 vultr 7.7 GiB 上限（idle 时实测 0 swap 通过，但无余量）。dense 与 HashMap
+//!   对照表必须同时在场才能比，glibc 又不把 HashMap 释放的 arena 还给 OS，**没法靠
+//!   先 drop 再分配压下来**——这条路属 **≥ ~10 GiB 机器**，不是 vultr-safe。
 //!
-//! 故拆成两个 `#[ignore]` test，**各自单独一次 `cargo test` 调用**跑（进程退出后 OS
-//! 全部回收，峰值只压一个 scenario；同进程内顺序跑会因 glibc 不及时还内存而叠加到
-//! ~7 GiB）。在 vultr（7.7 GiB）：
+//! 拆成两个 `#[ignore]` test，**各自单独一次 `cargo test` 调用**跑（同进程顺序跑会
+//! 因 glibc 不及时还内存叠加）：
 //! ```bash
+//! # vultr 安全：
 //! cargo test --release --test dense_nlhe_trainer dense_es_mccfr_byte_equal_hashmap_vanilla -- --ignored
+//! # 需 ≥ ~10 GiB 机器（vultr idle 勉强过，无余量）：
 //! cargo test --release --test dense_nlhe_trainer dense_es_mccfr_byte_equal_hashmap_lcfr     -- --ignored
 //! ```
 //! **目标扩张 profile（359.6M / 两表 13.48 GiB）vultr 装不下**，需 32–64 GB 机器
-//! （见 plan §验证门槛）。
+//! （见 plan §验证门槛）。LCFR rescale byte-equal 本身已由 Phase 1 `nlhe_dense` 单测
+//! （`rescale_all` vs HashMap，合成 delta）覆盖；本 LCFR 集成 test 额外验的是 trainer
+//! 把 `maybe_lcfr_rescale` 接在正确 boundary 上。
 //!
 //! **artifact**：走真实存在的 `..._schemav3.bin`（注意：`cfr_simplified_nlhe.rs` 的
 //! 常量指向不存在的 `..._v3.bin`，会 skip——本文件特意用 schemav3 以确保真跑）。
@@ -134,18 +141,16 @@ fn dense_es_mccfr_byte_equal_hashmap_vanilla() {
     eprintln!("[dense byte-equal] vanilla: {n} infoset byte-equal ✓");
 }
 
-/// LCFR period=200 byte-equal：1000 update 跨 5 个 period boundary，regret +
-/// strategy_sum 双 rescale。`rescale_all` 扫**全表** → 不论 update 数都提交全部
-/// 4.62 GiB dense（+bucket 0.55 GiB 是硬地板）；update 数压到 1000 仅为缩小 HashMap
-/// 对照表的内存（5000 update 时 HashMap + 触达页把峰值顶到 7.33 GiB，逼近 vultr
-/// 7.7 GiB 上限）。1000 update 实测峰值 ~5.7 GiB，留 ~2 GiB 余量。**单独一次
-/// cargo test 调用跑**（勿与 vanilla 同进程，否则 glibc 未及时还内存会叠加）。
+/// LCFR period=1000 byte-equal：5000 update 跨 5 个 period boundary，regret +
+/// strategy_sum 双 rescale。**峰值 ~7.33 GiB**（full-dense rescale 全提交 + HashMap
+/// 对照表 ~2 GiB + bucket，与 update 数几乎无关），需 ≥ ~10 GiB 机器；vultr idle
+/// 勉强过、无余量。**单独一次 cargo test 调用跑**。
 #[test]
-#[ignore = "LCFR rescale 提交全表 → 峰值 ~5.7 GiB；release --ignored 单独跑（勿与 vanilla 同进程）"]
+#[ignore = "LCFR：峰值 ~7.33 GiB（>vultr 余量），需 ≥ ~10 GiB 机器；release --ignored 单独跑"]
 fn dense_es_mccfr_byte_equal_hashmap_lcfr() {
     let Some(bucket_table) = load_bucket_table_or_skip() else {
         return;
     };
-    let n = run_scenario(&bucket_table, Some(200), 1_000);
-    eprintln!("[dense byte-equal] LCFR(period=200): {n} infoset byte-equal ✓");
+    let n = run_scenario(&bucket_table, Some(1_000), 5_000);
+    eprintln!("[dense byte-equal] LCFR(period=1000): {n} infoset byte-equal ✓");
 }
