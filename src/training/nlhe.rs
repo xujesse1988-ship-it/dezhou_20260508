@@ -91,10 +91,19 @@ fn nlhe_action_abstraction() -> StreetActionAbstraction {
 ///
 /// stage-2 `InfoAbstraction::map`（preflop.rs / postflop.rs）走 IA-007 reserved bits = 0
 /// 的旧路径不受影响——本 v2 packer 仅在 [`SimplifiedNlheGame::info_set`] 内使用。
-const NLHE_V2_NODE_ID_SHIFT: u32 = 38;
-const NLHE_V2_NODE_ID_BITS: u32 = 26;
+///
+/// `pub(crate)`：[`crate::training::nlhe_dense::NlheDenseIndexer`] 要按同一 shift
+/// 从 `InfoSetId` 反解 node_id，pack / unpack 共用同一常量保证不会漂移。
+pub(crate) const NLHE_V2_NODE_ID_SHIFT: u32 = 38;
+pub(crate) const NLHE_V2_NODE_ID_BITS: u32 = 26;
 
-fn pack_info_set_v2(hand_bucket: u32, node_id: NodeId, street_tag: StreetTag) -> InfoSetId {
+/// `pub(crate)`：dense indexer 单元测试 + 未来 dense trainer 复用同一 packer 构造
+/// `InfoSetId`，避免在测试里重抄一遍 bit 编码（抄错会让测试假绿）。
+pub(crate) fn pack_info_set_v2(
+    hand_bucket: u32,
+    node_id: NodeId,
+    street_tag: StreetTag,
+) -> InfoSetId {
     debug_assert!(
         node_id < (1u32 << NLHE_V2_NODE_ID_BITS),
         "200BB 默认 6-action 实测节点数 240,096 << 2^26；node_id={node_id} 越界提示树规模超预期"
