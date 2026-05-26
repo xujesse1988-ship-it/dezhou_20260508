@@ -8,26 +8,34 @@
 
 use std::path::PathBuf;
 
-use poker::{
-    canonical_observation_id, BucketTable, Card, Rank, StreetTag, Suit,
-};
 use poker::abstraction::preflop::canonical_hole_id;
+use poker::{canonical_observation_id, BucketTable, Card, Rank, StreetTag, Suit};
 
 fn parse_rank(c: char) -> Rank {
     match c {
-        '2' => Rank::Two, '3' => Rank::Three, '4' => Rank::Four,
-        '5' => Rank::Five, '6' => Rank::Six, '7' => Rank::Seven,
-        '8' => Rank::Eight, '9' => Rank::Nine, 'T' | 't' => Rank::Ten,
-        'J' | 'j' => Rank::Jack, 'Q' | 'q' => Rank::Queen,
-        'K' | 'k' => Rank::King, 'A' | 'a' => Rank::Ace,
+        '2' => Rank::Two,
+        '3' => Rank::Three,
+        '4' => Rank::Four,
+        '5' => Rank::Five,
+        '6' => Rank::Six,
+        '7' => Rank::Seven,
+        '8' => Rank::Eight,
+        '9' => Rank::Nine,
+        'T' | 't' => Rank::Ten,
+        'J' | 'j' => Rank::Jack,
+        'Q' | 'q' => Rank::Queen,
+        'K' | 'k' => Rank::King,
+        'A' | 'a' => Rank::Ace,
         _ => panic!("bad rank: {c}"),
     }
 }
 
 fn parse_suit(c: char) -> Suit {
     match c {
-        'c' | 'C' => Suit::Clubs, 'd' | 'D' => Suit::Diamonds,
-        'h' | 'H' => Suit::Hearts, 's' | 'S' => Suit::Spades,
+        'c' | 'C' => Suit::Clubs,
+        'd' | 'D' => Suit::Diamonds,
+        'h' | 'H' => Suit::Hearts,
+        's' | 'S' => Suit::Spades,
         _ => panic!("bad suit: {c}"),
     }
 }
@@ -53,48 +61,190 @@ struct Case {
 fn cases() -> Vec<Case> {
     vec![
         // ---- preflop ----
-        Case { label: "AA",              street: StreetTag::Preflop, hole: "As Ah", board: "" },
-        Case { label: "KK",              street: StreetTag::Preflop, hole: "Ks Kh", board: "" },
-        Case { label: "QQ",              street: StreetTag::Preflop, hole: "Qs Qh", board: "" },
-        Case { label: "AKs",             street: StreetTag::Preflop, hole: "As Ks", board: "" },
-        Case { label: "AKo",             street: StreetTag::Preflop, hole: "As Kh", board: "" },
-        Case { label: "76s",             street: StreetTag::Preflop, hole: "7s 6s", board: "" },
-        Case { label: "22",              street: StreetTag::Preflop, hole: "2s 2h", board: "" },
-        Case { label: "72o",             street: StreetTag::Preflop, hole: "7s 2h", board: "" },
-
+        Case {
+            label: "AA",
+            street: StreetTag::Preflop,
+            hole: "As Ah",
+            board: "",
+        },
+        Case {
+            label: "KK",
+            street: StreetTag::Preflop,
+            hole: "Ks Kh",
+            board: "",
+        },
+        Case {
+            label: "QQ",
+            street: StreetTag::Preflop,
+            hole: "Qs Qh",
+            board: "",
+        },
+        Case {
+            label: "AKs",
+            street: StreetTag::Preflop,
+            hole: "As Ks",
+            board: "",
+        },
+        Case {
+            label: "AKo",
+            street: StreetTag::Preflop,
+            hole: "As Kh",
+            board: "",
+        },
+        Case {
+            label: "76s",
+            street: StreetTag::Preflop,
+            hole: "7s 6s",
+            board: "",
+        },
+        Case {
+            label: "22",
+            street: StreetTag::Preflop,
+            hole: "2s 2h",
+            board: "",
+        },
+        Case {
+            label: "72o",
+            street: StreetTag::Preflop,
+            hole: "7s 2h",
+            board: "",
+        },
         // ---- flop ----
-        Case { label: "AA on dry 7c4d2h",     street: StreetTag::Flop, hole: "As Ah", board: "7c 4d 2h" },
-        Case { label: "AA on KsQsJs (mono)",  street: StreetTag::Flop, hole: "Ac Ad", board: "Ks Qs Js" },
-        Case { label: "AKs nut flush AsKs on Qs7s2c", street: StreetTag::Flop, hole: "As Ks", board: "Qs 7s 2c" },
-        Case { label: "AKo top pair on AhKc7d",       street: StreetTag::Flop, hole: "As Kh", board: "Ad 7d 2c" }, // top pair top kicker
-        Case { label: "55 set on 5h7s2d",     street: StreetTag::Flop, hole: "5d 5c", board: "5h 7s 2d" },
-        Case { label: "QJ str8+OE on Tc9h8s", street: StreetTag::Flop, hole: "Qd Jc", board: "Tc 9h 8s" },
-        Case { label: "88 underpair on AhKd7d", street: StreetTag::Flop, hole: "8d 8c", board: "Ah Kd 7d" },
-        Case { label: "72o trash on AsKhQd",  street: StreetTag::Flop, hole: "7d 2c", board: "As Kh Qd" },
-        Case { label: "9♥8♥ open-ender + bd flush on Th7s2h", street: StreetTag::Flop, hole: "9h 8h", board: "Th 7s 2h" },
-
+        Case {
+            label: "AA on dry 7c4d2h",
+            street: StreetTag::Flop,
+            hole: "As Ah",
+            board: "7c 4d 2h",
+        },
+        Case {
+            label: "AA on KsQsJs (mono)",
+            street: StreetTag::Flop,
+            hole: "Ac Ad",
+            board: "Ks Qs Js",
+        },
+        Case {
+            label: "AKs nut flush AsKs on Qs7s2c",
+            street: StreetTag::Flop,
+            hole: "As Ks",
+            board: "Qs 7s 2c",
+        },
+        Case {
+            label: "AKo top pair on AhKc7d",
+            street: StreetTag::Flop,
+            hole: "As Kh",
+            board: "Ad 7d 2c",
+        }, // top pair top kicker
+        Case {
+            label: "55 set on 5h7s2d",
+            street: StreetTag::Flop,
+            hole: "5d 5c",
+            board: "5h 7s 2d",
+        },
+        Case {
+            label: "QJ str8+OE on Tc9h8s",
+            street: StreetTag::Flop,
+            hole: "Qd Jc",
+            board: "Tc 9h 8s",
+        },
+        Case {
+            label: "88 underpair on AhKd7d",
+            street: StreetTag::Flop,
+            hole: "8d 8c",
+            board: "Ah Kd 7d",
+        },
+        Case {
+            label: "72o trash on AsKhQd",
+            street: StreetTag::Flop,
+            hole: "7d 2c",
+            board: "As Kh Qd",
+        },
+        Case {
+            label: "9♥8♥ open-ender + bd flush on Th7s2h",
+            street: StreetTag::Flop,
+            hole: "9h 8h",
+            board: "Th 7s 2h",
+        },
         // ---- turn ----
-        Case { label: "AA overpair on Ks Qs Js 2h",   street: StreetTag::Turn, hole: "Ac Ad", board: "Ks Qs Js 2h" },
-        Case { label: "AKs nut flush on QsJs7s 2c",   street: StreetTag::Turn, hole: "As Ks", board: "Qs Js 7s 2c" },
-        Case { label: "55 set on 5h7s2d Th",          street: StreetTag::Turn, hole: "5d 5c", board: "5h 7s 2d Th" },
-        Case { label: "AsKh trash on 2c3d4h5s",       street: StreetTag::Turn, hole: "As Kh", board: "2c 3d 4h 5s" }, // wheel on board, hero plays board
-        Case { label: "7d6d FD+OESD on Td9d2c 3h",    street: StreetTag::Turn, hole: "7d 6d", board: "Td 9d 2c 3h" },
-        Case { label: "72o trash on AsKhQdJc",        street: StreetTag::Turn, hole: "7d 2c", board: "As Kh Qd Jc" },
-
+        Case {
+            label: "AA overpair on Ks Qs Js 2h",
+            street: StreetTag::Turn,
+            hole: "Ac Ad",
+            board: "Ks Qs Js 2h",
+        },
+        Case {
+            label: "AKs nut flush on QsJs7s 2c",
+            street: StreetTag::Turn,
+            hole: "As Ks",
+            board: "Qs Js 7s 2c",
+        },
+        Case {
+            label: "55 set on 5h7s2d Th",
+            street: StreetTag::Turn,
+            hole: "5d 5c",
+            board: "5h 7s 2d Th",
+        },
+        Case {
+            label: "AsKh trash on 2c3d4h5s",
+            street: StreetTag::Turn,
+            hole: "As Kh",
+            board: "2c 3d 4h 5s",
+        }, // wheel on board, hero plays board
+        Case {
+            label: "7d6d FD+OESD on Td9d2c 3h",
+            street: StreetTag::Turn,
+            hole: "7d 6d",
+            board: "Td 9d 2c 3h",
+        },
+        Case {
+            label: "72o trash on AsKhQdJc",
+            street: StreetTag::Turn,
+            hole: "7d 2c",
+            board: "As Kh Qd Jc",
+        },
         // ---- river ----
-        Case { label: "AA full on KsQsJs 2h Kh",       street: StreetTag::River, hole: "Ac Ad", board: "Ks Qs Js 2h Kh" },
-        Case { label: "AsKs str-flush on QsJsTs 9s 8s", street: StreetTag::River, hole: "As Ks", board: "Qs Js Ts 9s 8s" },
-        Case { label: "55 quads on 5h5s2d 8c 7h",      street: StreetTag::River, hole: "5d 5c", board: "5h 5s 2d 8c 7h" },
-        Case { label: "AsKh top two on AdKc 7c 3d 2s", street: StreetTag::River, hole: "As Kh", board: "Ad Kc 7c 3d 2s" },
-        Case { label: "72o trash on AsKhQdJcTc",       street: StreetTag::River, hole: "7d 2c", board: "As Kh Qd Jc Tc" },
-        Case { label: "QdJc bdb_str on Tc9h8s 3d 2c",  street: StreetTag::River, hole: "Qd Jc", board: "Tc 9h 8s 3d 2c" },
+        Case {
+            label: "AA full on KsQsJs 2h Kh",
+            street: StreetTag::River,
+            hole: "Ac Ad",
+            board: "Ks Qs Js 2h Kh",
+        },
+        Case {
+            label: "AsKs str-flush on QsJsTs 9s 8s",
+            street: StreetTag::River,
+            hole: "As Ks",
+            board: "Qs Js Ts 9s 8s",
+        },
+        Case {
+            label: "55 quads on 5h5s2d 8c 7h",
+            street: StreetTag::River,
+            hole: "5d 5c",
+            board: "5h 5s 2d 8c 7h",
+        },
+        Case {
+            label: "AsKh top two on AdKc 7c 3d 2s",
+            street: StreetTag::River,
+            hole: "As Kh",
+            board: "Ad Kc 7c 3d 2s",
+        },
+        Case {
+            label: "72o trash on AsKhQdJcTc",
+            street: StreetTag::River,
+            hole: "7d 2c",
+            board: "As Kh Qd Jc Tc",
+        },
+        Case {
+            label: "QdJc bdb_str on Tc9h8s 3d 2c",
+            street: StreetTag::River,
+            hole: "Qd Jc",
+            board: "Tc 9h 8s 3d 2c",
+        },
     ]
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect(
-        "usage: bucket_lookup_hands <bucket_table.bin>",
-    );
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: bucket_lookup_hands <bucket_table.bin>");
     let table = BucketTable::open(&PathBuf::from(&path)).expect("open BucketTable");
 
     eprintln!(
@@ -109,7 +259,9 @@ fn main() {
     for c in cases() {
         if current_street != Some(c.street) {
             if matches!(c.street, StreetTag::River) {
-                eprintln!("[bucket_lookup_hands] first River lookup will build lazy table (~3 min)...");
+                eprintln!(
+                    "[bucket_lookup_hands] first River lookup will build lazy table (~3 min)..."
+                );
             }
             current_street = Some(c.street);
             println!();

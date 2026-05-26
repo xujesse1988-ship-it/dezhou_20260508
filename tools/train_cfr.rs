@@ -203,8 +203,7 @@ fn run() -> Result<(), String> {
             // （remaining % n）留到下一轮——下一轮 n 缩到该尾数后 batch = 1 收尾，
             // 精确命中 args.updates（div_ceil 会 round-up 越界，见 P1 修复）。
             let n = args.threads.min(remaining as usize).max(1);
-            let batch =
-                ((remaining / n as u64).min(args.batch_per_worker as u64) as usize).max(1);
+            let batch = ((remaining / n as u64).min(args.batch_per_worker as u64) as usize).max(1);
             trainer
                 .step_parallel(&mut rng_pool, n, batch)
                 .map_err(|e| {

@@ -440,8 +440,11 @@ fn collect_bucket_ehs(
             Some(b) => b as usize,
             None => continue,
         };
-        let mut rng =
-            ChaCha20Rng::from_seed(derive_substream_seed(master_seed, EQUITY_MONTE_CARLO, i as u32));
+        let mut rng = ChaCha20Rng::from_seed(derive_substream_seed(
+            master_seed,
+            EQUITY_MONTE_CARLO,
+            i as u32,
+        ));
         let ehs = calc.equity(*hole, board, &mut rng).expect("EHS sample");
         by_bucket[bucket].push(ehs);
     }
@@ -528,11 +531,7 @@ fn assert_group_monotonic(by_bucket: &[Vec<f64>], street: StreetTag, n_groups: u
         } else {
             (g + 1) * group_size
         };
-        let mut pooled: Vec<f64> = by_bucket[start..end]
-            .iter()
-            .flatten()
-            .copied()
-            .collect();
+        let mut pooled: Vec<f64> = by_bucket[start..end].iter().flatten().copied().collect();
         assert!(
             pooled.len() >= 2,
             "{street:?} group {g} has < 2 samples (start={start} end={end})"
