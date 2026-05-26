@@ -7,6 +7,13 @@
 //! 一致 → 同一 sampled trajectory；每 infoset 的 regret / strategy_sum 累积 f64 序列
 //! 一致 → `current_strategy` / `average_strategy` 逐位（`f64::to_bits`）相等。
 //!
+//! **byte-equal 对照的覆盖范围 = `hm.strategy_sum().inner().keys()`（traverser 访问过的
+//! infoset）**。这结构上**排除**了「仅作为非-traverser 访问过、从未作为 traverser 遍历」
+//! 的 infoset：那个集合上 dense 的 public query 与 HashMap 有已知偏离（HashMap 经
+//! get_or_init 返回 uniform、dense 因 touched 未置位返回空 `Vec`，见
+//! `DenseNlheEsMccfrTrainer::current_strategy` doc）。这些是零信息节点（regret/strategy_sum
+//! 恒 0），训练值数组两路径仍逐位相同，故不影响本对照的结论；但本测试**不**断言该集合。
+//!
 //! **内存 + 运行**：dense 两表 *满分配* 4.62 GiB（当前 119.7M profile）虚拟空间，但
 //! `vec![0.0; N]` 走 `calloc` 惰性提交——RSS 只随**真正写过的 slot** 增长：
 //! - **vanilla**（`rescale_all` 不触发）：dense 只提交访问过的 slot（稀疏，但
