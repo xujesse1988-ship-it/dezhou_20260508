@@ -43,6 +43,19 @@ pub struct GameState {
     /// 推进时 len 增至 3/4/5 仍 inline。
     board: SmallVec<[Card; 5]>,
     runout_board: [Card; 5],
+    /// 每个 seat 的摊牌手牌强度，在 `with_rng_opts`（root）一次性用 `runout_board`
+    /// 的全 5 张 + 该 seat hole_cards 预算。一次 update 内牌全程固定（NLHE 无
+    /// in-game chance，runout 在 root 发完），摊牌胜负只由牌决定，与下注路径无关；
+    /// `pot_winners` 读此缓存即可，避免 ES-MCCFR traverser 枚举出的多个 showdown
+    /// terminal 各自重跑 `eval7`。
+    ///
+    /// 与历史逐 terminal `eval7(board[0..5])` **逐 bit 一致**：`deal_board_to` 保证
+    /// `board[i] == runout_board[i]`，showdown 时 `board` 必为全 5 张（见
+    /// `pot_winners` 仅在 `contenders.len() > 1` 被调用），故 root 用 `runout_board`
+    /// 与终局用 `board` 是同一组牌。SmallVec inline ≤ 9 个 `Option<HandRank>`，
+    /// clone 走内联拷贝无 malloc；无 hole_cards 的 seat 存 `None`，保持原
+    /// `let Some(hole) = .. else continue` 跳过语义。
+    showdown_ranks: SmallVec<[Option<eval::HandRank>; 9]>,
     current_player: Option<SeatId>,
     terminal: bool,
     final_payouts: Option<Vec<(SeatId, i64)>>,
@@ -162,12 +175,32 @@ impl GameState {
             deck[2 * n + 4],
         ];
 
+        // 预算每个 seat 的摊牌强度（root 一次性）。runout_board 此刻已是全 5 张，
+        // hole_cards 也已发完，rank 由 hole + 全板唯一确定，整手不再变。
+        let showdown_ranks: SmallVec<[Option<eval::HandRank>; 9]> = players
+            .iter()
+            .map(|p| {
+                p.hole_cards.map(|hole| {
+                    eval::eval7(&[
+                        hole[0],
+                        hole[1],
+                        runout_board[0],
+                        runout_board[1],
+                        runout_board[2],
+                        runout_board[3],
+                        runout_board[4],
+                    ])
+                })
+            })
+            .collect();
+
         let mut state = GameState {
             config: config.clone(),
             players,
             street: Street::Preflop,
             board: SmallVec::new(),
             runout_board,
+            showdown_ranks,
             current_player: None,
             terminal: false,
             final_payouts: None,
@@ -911,24 +944,14 @@ impl GameState {
         let mut best = None;
         let mut winners = Vec::new();
         for &idx in contenders {
-            // 直接读 players[].hole_cards：contenders 已过滤 Folded（compute_payouts
-            // 见 line ~828），所以 hole_cards 对每个 contender 必为 Some。
-            // 之前走 self.history.hole_cards[idx] 是 history 路径下的冗余 backup
-            // —— 在 D-378 CFR fast path（track_history=false）下 history.hole_cards
-            // 留空以省 per-clone malloc / cfree。
-            let Some(hole) = self.players[idx].hole_cards else {
+            // 读 root 预算的 showdown_ranks（见字段 doc）：rank = eval7(hole +
+            // runout_board)，与历史 eval7(hole + board[0..5]) 同牌同值。contenders
+            // 已过滤 Folded（compute_payouts 见 line ~860），hole_cards 必为 Some，
+            // 故缓存槽必为 Some；保留 None→continue 与原 `let Some(hole)` 跳过语义
+            // 完全一致（无 hole_cards 的 seat 不参与比牌）。
+            let Some(rank) = self.showdown_ranks[idx] else {
                 continue;
             };
-            let cards = [
-                hole[0],
-                hole[1],
-                self.board[0],
-                self.board[1],
-                self.board[2],
-                self.board[3],
-                self.board[4],
-            ];
-            let rank = eval::eval7(&cards);
             match best {
                 None => {
                     best = Some(rank);
