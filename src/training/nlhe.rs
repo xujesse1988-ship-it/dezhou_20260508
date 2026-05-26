@@ -21,17 +21,17 @@
 //! stage 1 `validate_config` 范围扩展为 `2..=9`；本模块构造 `TableConfig`
 //! 时显式 `n_seats=2`。
 //!
-//! Bucket table 依赖 = stage 2 v3 production artifact
-//! `artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav3.bin`
-//! （schema_version=3 / feature_set_id=2 / 16-dim hist+OCHS / body BLAKE3
-//! `1c22c1ee...`）。`SimplifiedNlheGame::new` 校验 `schema_version() == 3` +
-//! `config() == BucketConfig::new(500, 500, 500)`。
+//! Bucket table 依赖 = production artifact（v4）
+//! `artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin`
+//! （schema_version=4 / feature_set_id=2 / 16-dim hist+OCHS）。v4 = v3 layout +
+//! shape-major canonical id 编号（旧 v3 artifact 需重算）。`SimplifiedNlheGame::new`
+//! 校验 `schema_version() == 4` + `config() == BucketConfig::new(500, 500, 500)`。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::abstraction::action::{AbstractAction, ActionAbstraction, StreetActionAbstraction};
-use crate::abstraction::bucket_table::{BucketConfig, BucketTable};
+use crate::abstraction::bucket_table::{BucketConfig, BucketTable, BUCKET_TABLE_SCHEMA_VERSION};
 use crate::abstraction::info::{InfoSetId, StreetTag};
 use crate::abstraction::map::pack_info_set_id;
 use crate::abstraction::postflop::canonical_observation_id;
@@ -65,9 +65,10 @@ fn expected_bucket_config() -> BucketConfig {
     BucketConfig::new(500, 500, 500).expect("BucketConfig::new(500,500,500) within D-214 range")
 }
 
-/// 简化 NLHE expected `BucketTable` schema_version。stage 2 已升 v3
-/// (16-dim hist+OCHS feature)；v1/v2 artifact 不再可加载。
-const EXPECTED_BUCKET_SCHEMA_VERSION: u32 = 3;
+/// 简化 NLHE expected `BucketTable` schema_version。直接锚定
+/// [`BUCKET_TABLE_SCHEMA_VERSION`]（当前 v4 = v3 layout + shape-major canonical id
+/// 编号）；v1/v2/v3 artifact 不再可加载。
+const EXPECTED_BUCKET_SCHEMA_VERSION: u32 = BUCKET_TABLE_SCHEMA_VERSION;
 
 /// 简化 NLHE 生产 action abstraction 的**唯一来源**（D-318 桥接 + 按街扩张前置）。
 ///
@@ -136,7 +137,7 @@ impl SimplifiedNlheGame {
     /// 构造函数（API-303）。
     ///
     /// 校验项（D-314-rev1）：
-    /// - `BucketTable::schema_version()` == `3`（v1/v2 已废弃）
+    /// - `BucketTable::schema_version()` == `4`（v1/v2/v3 已废弃）
     /// - `BucketTable::config()` == `BucketConfig::new(500, 500, 500)`
     ///
     /// 失败路径：[`TrainerError::UnsupportedBucketTable`]。`expected` 字段

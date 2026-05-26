@@ -81,10 +81,11 @@ use poker::{
 /// **角色边界 [实现] → [测试] 越界 carve-out**（详见 stage-2 §C-rev0 §修订历史
 /// 和 §G-batch1 §3.2 / §3.8 同型）：本 batch [实现] 单边修改 `cached_trained_table()`
 /// path constant + 12 条阈值公式，继承 §C-rev2 batch 5 §1 carve-out 形态。
-/// v3 production artifact 路径（schema v3 / feature_set_id 2 / 16-dim hist + OCHS）。
+/// v4 production artifact 路径（schema v4 / feature_set_id 2 / 16-dim hist + OCHS）。
+/// v4 = v3 layout + shape-major canonical id 编号；旧 v3 artifact 已失效需重算。
 /// 由 `tools/bucket_kmeans_fit` 生产；不在 git 内（参 status.md "bucket table 工件" 段）。
 const PRODUCTION_ARTIFACT_PATH: &str =
-    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav3.bin";
+    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin";
 const FIXTURE_BUCKET_CONFIG: BucketConfig = BucketConfig {
     flop: 100,
     turn: 100,

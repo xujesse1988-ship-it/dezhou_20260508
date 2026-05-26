@@ -414,7 +414,7 @@ fn fixture_self_magic_intact() {
 }
 
 #[test]
-fn fixture_self_schema_version_is_v3() {
+fn fixture_self_schema_version_is_v4() {
     let bytes = fixture_bytes();
     let sv = u32::from_le_bytes(bytes[0x08..0x0C].try_into().unwrap());
     assert_eq!(sv, BUCKET_TABLE_SCHEMA_VERSION);

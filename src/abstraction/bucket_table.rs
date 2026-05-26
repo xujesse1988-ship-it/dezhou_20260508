@@ -157,7 +157,7 @@ pub struct StreetFeaturesV3 {
 // BucketTable
 // ============================================================================
 
-/// bucket lookup table（schema v3）。
+/// bucket lookup table（schema v4）。
 ///
 /// 文件 layout（184-byte 定长 header + 变长 body + 32-byte trailer，全部 little-
 /// endian）：

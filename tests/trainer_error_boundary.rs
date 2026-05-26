@@ -153,15 +153,15 @@ fn simplified_nlhe_new_with_wrong_bucket_config_returns_unsupported_bucket_table
     // schema_version 路径区分 vs config 路径）。
     let bucket_cfg = BucketConfig::new(100, 100, 100).expect("100 in [10, 10000]");
     let table = BucketTable::stub_for_postflop(bucket_cfg);
-    // stub 持 schema_version=3，first branch 通过；second branch (config 不匹配) 触发。
+    // stub 持 schema_version=4，first branch 通过；second branch (config 不匹配) 触发。
     let err = match SimplifiedNlheGame::new(Arc::new(table)) {
         Ok(_) => panic!("SimplifiedNlheGame::new with wrong config 必须 Err"),
         Err(e) => e,
     };
     match err {
         TrainerError::UnsupportedBucketTable { expected, got } => {
-            // expected = EXPECTED_BUCKET_SCHEMA_VERSION（3）；got = 0（config 不匹配 sentinel）。
-            assert_eq!(expected, 3, "expected 应为 EXPECTED_BUCKET_SCHEMA_VERSION");
+            // expected = EXPECTED_BUCKET_SCHEMA_VERSION（4）；got = 0（config 不匹配 sentinel）。
+            assert_eq!(expected, 4, "expected 应为 EXPECTED_BUCKET_SCHEMA_VERSION");
             assert_eq!(got, 0, "config-mismatch 路径 got 字段是 0 sentinel");
         }
         other => panic!("expected UnsupportedBucketTable, got {other:?}"),

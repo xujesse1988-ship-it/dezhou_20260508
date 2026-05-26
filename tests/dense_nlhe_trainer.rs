@@ -39,8 +39,8 @@
 //! （`rescale_all` vs HashMap，合成 delta）覆盖；本 LCFR 集成 test 额外验的是 trainer
 //! 把 `maybe_lcfr_rescale` 接在正确 boundary 上。
 //!
-//! **artifact**：走真实存在的 `..._schemav3.bin`（注意：`cfr_simplified_nlhe.rs` 的
-//! 常量指向不存在的 `..._v3.bin`，会 skip——本文件特意用 schemav3 以确保真跑）。
+//! **artifact**：走 `..._schemav4.bin`（v4 = v3 layout + shape-major canonical id
+//! 编号）。旧 v3 artifact 已失效；v4 artifact 重算出来前本文件 skip（无可加载表）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,10 +50,10 @@ use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{EsMccfrTrainer, Trainer};
 use poker::{BucketTable, ChaCha20Rng, InfoSetId, RngSource};
 
-/// 候选 v3 artifact 路径（相对 repo root）。优先真实存在的 `schemav3`。
+/// 候选 v4 artifact 路径（相对 repo root）。
 const V3_ARTIFACT_CANDIDATES: &[&str] = &[
-    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav3.bin",
-    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_v3.bin",
+    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin",
+    "artifacts/bucket_table_default_500_500_500_seed_cafebabe_v4.bin",
 ];
 
 /// 外部 rng seed（驱动 `step` 的 randomness 来源；两 trainer 各起一个同 seed rng）。

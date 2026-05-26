@@ -14,7 +14,7 @@
 //!     --feature-river artifacts/features_river.bin \
 //!     --bucket-flop  500 --bucket-turn 500 --bucket-river 500 \
 //!     --training-seed 0xcafebabe \
-//!     --output artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav3.bin
+//!     --output artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin
 //! ```
 //!
 //! 同 (features_<street>.bin BLAKE3, training_seed, bucket counts) → artifact
