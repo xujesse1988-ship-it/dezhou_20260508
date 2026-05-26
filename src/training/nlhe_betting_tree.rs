@@ -14,7 +14,7 @@
 use smallvec::SmallVec;
 
 use crate::abstraction::action::{
-    AbstractAction, ActionAbstraction, BetRatio, DefaultActionAbstraction,
+    AbstractAction, ActionAbstraction, BetRatio, StreetActionAbstraction,
 };
 use crate::abstraction::info::StreetTag;
 use crate::core::rng::ChaCha20Rng;
@@ -67,7 +67,7 @@ pub struct TreeNode {
     pub player_acting: PlayerId,
     pub parent: Option<NodeId>,
     pub action_from_parent: Option<AbstractActionTag>,
-    /// 节点合法动作集 tag 序列，**顺序与 [`DefaultActionAbstraction::abstract_actions`]
+    /// 节点合法动作集 tag 序列，**顺序与 [`StreetActionAbstraction::abstract_actions`]
     /// 输出严格对齐**（D-209）。`children[i]` 对应 `legal_actions[i]` 这条边。
     pub legal_actions: SmallVec<[AbstractActionTag; 8]>,
     pub children: SmallVec<[Child; 8]>,
@@ -83,8 +83,23 @@ pub struct PublicBettingTree {
 const TREE_BUILD_RNG_SEED: u64 = 0x4E4C_4845_5F54_5245; // "NLHE_TRE"
 
 impl PublicBettingTree {
-    /// 从 `config` 出发 DFS 建完整树。同 `config` 必出同结构（节点顺序确定）。
+    /// 从 `config` 出发 DFS 建完整树（全街 `{0.5,1,2}` 默认 abstraction）。同
+    /// `config` 必出同结构（节点顺序确定）。
+    ///
+    /// 行为与历史一致：`StreetActionAbstraction::default_6_action()` 四条街共用
+    /// `{0.5,1,2}`，与旧的 `DefaultActionAbstraction::default_6_action()` byte-equal。
     pub fn build(config: &TableConfig) -> PublicBettingTree {
+        Self::build_with_abstraction(config, &StreetActionAbstraction::default_6_action())
+    }
+
+    /// 用指定的按街 abstraction 建树（bet-size 扩张：flop `{0.33,0.66,1,2}` 等）。
+    /// `legal_actions` 随街变——`TreeNode.legal_actions` 逐节点由
+    /// `abs.abstract_actions(state)` 决定，因此 [`crate::abstraction::action::StreetActionAbstraction::per_street`]
+    /// 下各街取各街的 raise 集合。同 `(config, abs)` 必出同结构。
+    pub fn build_with_abstraction(
+        config: &TableConfig,
+        abs: &StreetActionAbstraction,
+    ) -> PublicBettingTree {
         let mut tree = PublicBettingTree {
             nodes: Vec::new(),
             root_id: 0,
@@ -95,7 +110,7 @@ impl PublicBettingTree {
             !state.is_terminal() && state.current_player().is_some(),
             "root state must be a Player decision node"
         );
-        tree.root_id = tree.walk(state, None, None);
+        tree.root_id = tree.walk(state, None, None, abs);
         tree
     }
 
@@ -104,6 +119,7 @@ impl PublicBettingTree {
         state: GameState,
         parent: Option<NodeId>,
         action_from_parent: Option<AbstractActionTag>,
+        abs: &StreetActionAbstraction,
     ) -> NodeId {
         let actor = state
             .current_player()
@@ -111,7 +127,6 @@ impl PublicBettingTree {
             .0 as PlayerId;
         let my_id = self.nodes.len() as NodeId;
 
-        let abs = DefaultActionAbstraction::default_6_action();
         let legal_set = abs.abstract_actions(&state);
         let legal_actions: SmallVec<[AbstractActionTag; 8]> =
             legal_set.iter().map(AbstractActionTag::of).collect();
@@ -131,12 +146,12 @@ impl PublicBettingTree {
             let mut next_state = state.clone();
             next_state
                 .apply(action.to_concrete())
-                .expect("DefaultActionAbstraction must emit legal Actions for current state");
+                .expect("action abstraction must emit legal Actions for current state");
             let child = if next_state.is_terminal() {
                 Child::Terminal
             } else {
                 let next_action_tag = AbstractActionTag::of(&action);
-                Child::Decision(self.walk(next_state, Some(my_id), Some(next_action_tag)))
+                Child::Decision(self.walk(next_state, Some(my_id), Some(next_action_tag), abs))
             };
             children.push(child);
         }
@@ -191,6 +206,40 @@ mod tests {
 
     fn build_default_tree() -> PublicBettingTree {
         PublicBettingTree::build(&TableConfig::default_hu_200bb())
+    }
+
+    /// 默认全街 `{0.5,1,2}` 树节点数 = 240,096（与 `nlhe_betting_tree_sizing` 工具
+    /// 独立 walk 测得一致）。守住 `build` 路由经 `StreetActionAbstraction::default_6_action`
+    /// 后行为不变（前置 P byte-equal 默认路径）。
+    #[test]
+    fn default_tree_node_count_unchanged() {
+        let tree = build_default_tree();
+        assert_eq!(
+            tree.num_nodes(),
+            240_096,
+            "默认 6-action 树节点数偏离实测 240,096——build 路由或 abstraction 改了行为"
+        );
+    }
+
+    /// per-street 目标 profile（flop `{0.33,0.66,1,2}`、其余 `{0.5,1,2}`）树节点数
+    /// = 719,764，与 `nlhe_betting_tree_sizing` 工具实测一致。这是按街分派建树的
+    /// 外部对照：tree builder 与 sizing 工具走两条独立代码路径，节点计数必须吻合。
+    ///
+    /// `#[ignore]`：719,764 节点 debug 建树较慢，走 `cargo test --release -- --ignored`。
+    #[test]
+    #[ignore = "构建 719,764 节点目标树较慢；release + --ignored 跑"]
+    fn per_street_target_tree_node_count_matches_sizing_tool() {
+        use crate::abstraction::action::ActionAbstractionConfig;
+        let r3 = || ActionAbstractionConfig::new(vec![0.5, 1.0, 2.0]).unwrap();
+        let flop = ActionAbstractionConfig::new(vec![0.33, 0.66, 1.0, 2.0]).unwrap();
+        let abs = StreetActionAbstraction::per_street([r3(), flop, r3(), r3()]);
+        let tree =
+            PublicBettingTree::build_with_abstraction(&TableConfig::default_hu_200bb(), &abs);
+        assert_eq!(
+            tree.num_nodes(),
+            719_764,
+            "目标 profile 树节点数偏离 sizing 工具实测 719,764"
+        );
     }
 
     #[test]

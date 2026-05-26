@@ -9,6 +9,7 @@
 use thiserror::Error;
 
 use crate::core::ChipAmount;
+use crate::core::Street;
 use crate::rules::action::Action;
 use crate::rules::state::GameState;
 
@@ -495,6 +496,92 @@ impl ActionAbstraction for DefaultActionAbstraction {
     }
 }
 
+/// 按街分派的 action abstraction：preflop / flop / turn / river 各持一个
+/// [`DefaultActionAbstraction`]，[`abstract_actions`](ActionAbstraction::abstract_actions)
+/// / [`map_off_tree`](ActionAbstraction::map_off_tree) 按 `state.street()` 选对应街配置。
+///
+/// 动机（`docs/temp/nlhe_dense_infoset_table_plan_2026_05_26.md` 前置 P）：bet-size
+/// 扩张目标 profile 要求各街不同 raise 集合（flop `{0.33,0.66,1,2}`、其余
+/// `{0.5,1,2}`），而单个 `DefaultActionAbstraction` 只有一组全局 ratio。
+///
+/// - [`uniform`](Self::uniform)：四条街共用同一 config，输出与单个
+///   `DefaultActionAbstraction::new(config)` **byte-identical**（用于保持旧路径不变
+///   + 重构对照）。
+/// - [`per_street`](Self::per_street)：`[preflop, flop, turn, river]` 各一组 config。
+///
+/// `Street::Showdown`（terminal）不应作为决策节点进入；万一传入，落到 river 槽位的
+/// 底层 abstraction，由其 `current_player().is_none()` 守卫返回空集 / `Fold`，与
+/// `DefaultActionAbstraction` 行为一致。
+pub struct StreetActionAbstraction {
+    /// index = `Street as usize`（Preflop=0, Flop=1, Turn=2, River=3）。
+    by_street: [DefaultActionAbstraction; 4],
+}
+
+impl StreetActionAbstraction {
+    /// 四条街共用同一 config；输出等价单个 `DefaultActionAbstraction::new(config)`。
+    pub fn uniform(config: ActionAbstractionConfig) -> StreetActionAbstraction {
+        StreetActionAbstraction {
+            by_street: [
+                DefaultActionAbstraction::new(config.clone()),
+                DefaultActionAbstraction::new(config.clone()),
+                DefaultActionAbstraction::new(config.clone()),
+                DefaultActionAbstraction::new(config),
+            ],
+        }
+    }
+
+    /// per-street raise 集合：`[preflop, flop, turn, river]`。
+    pub fn per_street(configs: [ActionAbstractionConfig; 4]) -> StreetActionAbstraction {
+        let [preflop, flop, turn, river] = configs;
+        StreetActionAbstraction {
+            by_street: [
+                DefaultActionAbstraction::new(preflop),
+                DefaultActionAbstraction::new(flop),
+                DefaultActionAbstraction::new(turn),
+                DefaultActionAbstraction::new(river),
+            ],
+        }
+    }
+
+    /// 全街 `{0.5,1,2}`（= [`DefaultActionAbstraction::default_6_action`] 的 per-street
+    /// 包装）。简化 NLHE 生产默认路径，与历史行为 byte-equal。
+    pub fn default_6_action() -> StreetActionAbstraction {
+        StreetActionAbstraction::uniform(ActionAbstractionConfig::default_6_action())
+    }
+
+    /// 指定街对应的底层 abstraction。`Showdown` 复用 river 槽位（见类型文档）。
+    fn abs_for_street(&self, street: Street) -> &DefaultActionAbstraction {
+        let idx = match street {
+            Street::Preflop => 0,
+            Street::Flop => 1,
+            Street::Turn => 2,
+            Street::River | Street::Showdown => 3,
+        };
+        &self.by_street[idx]
+    }
+
+    /// 指定街的 config 只读访问（诊断 / 测试）。
+    pub fn config_for(&self, street: Street) -> &ActionAbstractionConfig {
+        self.abs_for_street(street).config()
+    }
+}
+
+impl ActionAbstraction for StreetActionAbstraction {
+    fn abstract_actions(&self, state: &GameState) -> AbstractActionSet {
+        self.abs_for_street(state.street()).abstract_actions(state)
+    }
+
+    fn map_off_tree(&self, state: &GameState, real_to: ChipAmount) -> AbstractAction {
+        self.abs_for_street(state.street())
+            .map_off_tree(state, real_to)
+    }
+
+    /// 返回 preflop 街的 config 作为代表（仅在 `uniform` 下对全街成立）。
+    fn config(&self) -> &ActionAbstractionConfig {
+        self.by_street[0].config()
+    }
+}
+
 // ===========================================================================
 // §7 桥接：AbstractAction → stage 1 Action
 // ===========================================================================
@@ -521,5 +608,135 @@ impl AbstractAction {
             AbstractAction::Raise { to, .. } => Action::Raise { to },
             AbstractAction::AllIn { .. } => Action::AllIn,
         }
+    }
+}
+
+// ===========================================================================
+// StreetActionAbstraction 按街分派单元测试（dense 前置 P 外部对照）
+// ===========================================================================
+
+#[cfg(test)]
+mod street_abstraction_tests {
+    use super::*;
+    use crate::core::Street;
+    use crate::rules::action::Action;
+    use crate::rules::config::TableConfig;
+    use crate::rules::state::GameState;
+
+    /// 沿 check/call 被动线推进到 `target` 街的首个决策节点（HU 200BB）。
+    /// 不打 fold/raise，因此 preflop→flop→turn→river 全可达，river 之前不进 terminal。
+    fn decision_state_on_street(target: Street, seed: u64) -> GameState {
+        let cfg = TableConfig::default_hu_200bb();
+        let mut s = GameState::new(&cfg, seed);
+        let mut guard = 0;
+        while s.street() != target {
+            assert!(
+                s.current_player().is_some(),
+                "被动线在到达 {target:?} 前不应进入 terminal"
+            );
+            let la = s.legal_actions();
+            // preflop SB 面对 BB 无 check → Call；postflop 首 actor 可 Check。
+            let action = if la.check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            s.apply(action).expect("被动 action 必合法");
+            guard += 1;
+            assert!(guard < 64, "推进循环失控（target={target:?}）");
+        }
+        assert!(
+            s.current_player().is_some(),
+            "{target:?} 街状态必须是决策节点"
+        );
+        s
+    }
+
+    const ALL_STREETS: [Street; 4] = [Street::Preflop, Street::Flop, Street::Turn, Street::River];
+
+    /// uniform(cfg) 在每条街都与单个 `DefaultActionAbstraction::new(cfg)` byte-equal
+    /// （证明 per-street 包装不改既有全街同一组行为；前置 P 重构对照）。
+    #[test]
+    fn uniform_matches_single_default_abstraction_on_every_street() {
+        let cfg = ActionAbstractionConfig::default_6_action();
+        let uniform = StreetActionAbstraction::uniform(cfg.clone());
+        let single = DefaultActionAbstraction::new(cfg);
+        for &street in &ALL_STREETS {
+            for seed in [1u64, 7, 0xC0FFEE] {
+                let s = decision_state_on_street(street, seed);
+                assert_eq!(
+                    uniform.abstract_actions(&s).as_slice(),
+                    single.abstract_actions(&s).as_slice(),
+                    "uniform 与单街 abstraction 在 {street:?} (seed={seed:#x}) 输出不一致"
+                );
+            }
+        }
+    }
+
+    /// per_street([pre, flop, turn, river]) 在每条街分派到对应 config：输出与该街
+    /// 单个 `DefaultActionAbstraction::new(street_cfg)` 完全一致（按街分派正确性）。
+    #[test]
+    fn per_street_dispatches_to_matching_street_config() {
+        let pre = ActionAbstractionConfig::new(vec![0.5, 1.0, 2.0]).unwrap();
+        let flop = ActionAbstractionConfig::new(vec![0.33, 0.66, 1.0, 2.0]).unwrap();
+        let turn = ActionAbstractionConfig::new(vec![0.75, 1.5]).unwrap();
+        let river = ActionAbstractionConfig::new(vec![1.0]).unwrap();
+        let street_abs = StreetActionAbstraction::per_street([
+            pre.clone(),
+            flop.clone(),
+            turn.clone(),
+            river.clone(),
+        ]);
+        let by_street = [
+            (Street::Preflop, pre),
+            (Street::Flop, flop),
+            (Street::Turn, turn),
+            (Street::River, river),
+        ];
+        for (street, cfg) in by_street {
+            let single = DefaultActionAbstraction::new(cfg);
+            for seed in [3u64, 11, 0xBEEF] {
+                let s = decision_state_on_street(street, seed);
+                assert_eq!(
+                    street_abs.abstract_actions(&s).as_slice(),
+                    single.abstract_actions(&s).as_slice(),
+                    "{street:?} (seed={seed:#x}) 未分派到对应街 config"
+                );
+            }
+        }
+    }
+
+    /// 判别性检查：flop 状态下 per_street 的输出 ≠ 若全街都用 preflop config 的输出。
+    /// 证明分派**确实按街选**，而非固定用某一组 ratio。fresh-flop pot=2BB 下
+    /// flop `{0.33,0.66,1,2}` 出 4 个 bet、preflop `{0.5,1,2}` 出 3 个 → 长度不同。
+    #[test]
+    fn per_street_flop_differs_from_preflop_config() {
+        let pre = ActionAbstractionConfig::new(vec![0.5, 1.0, 2.0]).unwrap();
+        let flop = ActionAbstractionConfig::new(vec![0.33, 0.66, 1.0, 2.0]).unwrap();
+        let street_abs =
+            StreetActionAbstraction::per_street([pre.clone(), flop, pre.clone(), pre.clone()]);
+        let pre_only = DefaultActionAbstraction::new(pre);
+        let s = decision_state_on_street(Street::Flop, 5);
+        assert_ne!(
+            street_abs.abstract_actions(&s).as_slice(),
+            pre_only.abstract_actions(&s).as_slice(),
+            "flop 分派应取 flop 4-size 集，与 preflop 3-size 集不同"
+        );
+    }
+
+    /// `config_for` 取对应街配置；uniform 下全街同 raise_count，per_street 各取各。
+    #[test]
+    fn config_for_returns_per_street_config() {
+        let pre = ActionAbstractionConfig::new(vec![0.5, 1.0, 2.0]).unwrap();
+        let flop = ActionAbstractionConfig::new(vec![0.33, 0.66, 1.0, 2.0]).unwrap();
+        let turn = ActionAbstractionConfig::new(vec![0.75, 1.5]).unwrap();
+        let river = ActionAbstractionConfig::new(vec![1.0]).unwrap();
+        let abs = StreetActionAbstraction::per_street([pre, flop, turn, river]);
+        assert_eq!(abs.config_for(Street::Preflop).raise_count(), 3);
+        assert_eq!(abs.config_for(Street::Flop).raise_count(), 4);
+        assert_eq!(abs.config_for(Street::Turn).raise_count(), 2);
+        assert_eq!(abs.config_for(Street::River).raise_count(), 1);
+        // Showdown 复用 river 槽位（见类型文档）。
+        assert_eq!(abs.config_for(Street::Showdown).raise_count(), 1);
     }
 }

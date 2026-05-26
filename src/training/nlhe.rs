@@ -30,7 +30,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::abstraction::action::{AbstractAction, ActionAbstraction, DefaultActionAbstraction};
+use crate::abstraction::action::{AbstractAction, ActionAbstraction, StreetActionAbstraction};
 use crate::abstraction::bucket_table::{BucketConfig, BucketTable};
 use crate::abstraction::info::{InfoSetId, StreetTag};
 use crate::abstraction::map::pack_info_set_id;
@@ -68,6 +68,20 @@ fn expected_bucket_config() -> BucketConfig {
 /// 简化 NLHE expected `BucketTable` schema_version。stage 2 已升 v3
 /// (16-dim hist+OCHS feature)；v1/v2 artifact 不再可加载。
 const EXPECTED_BUCKET_SCHEMA_VERSION: u32 = 3;
+
+/// 简化 NLHE 生产 action abstraction 的**唯一来源**（D-318 桥接 + 按街扩张前置）。
+///
+/// `new()` 建 betting tree 与 [`SimplifiedNlheGame::legal_actions`] 运行期都从这里
+/// 取——保证 tree 的 `legal_actions` tag 顺序与运行期 `abstract_actions` 输出严格
+/// 一致（否则 regret 向量下标与 tree child 下标错位）。
+///
+/// 当前 = 全街 `{0.5,1,2}`（`StreetActionAbstraction::default_6_action`），与历史
+/// `DefaultActionAbstraction::default_6_action()` byte-equal，树仍 240,096 节点。
+/// bet-size 扩张（目标 flop `{0.33,0.66,1,2}`、其余 `{0.5,1,2}`）时只改这一处为
+/// `StreetActionAbstraction::per_street([...])`，建树与运行期自动同步。
+fn nlhe_action_abstraction() -> StreetActionAbstraction {
+    StreetActionAbstraction::default_6_action()
+}
 
 /// 简化 NLHE `InfoSetId` v2 layout：把 26-bit node_id 写入 `InfoSetId` raw 高位
 /// （bits 38..64）。低 38 bit 复用 stage-2 [`pack_info_set_id`] 字段位置以保留
@@ -140,7 +154,10 @@ impl SimplifiedNlheGame {
             });
         }
         let config = TableConfig::default_hu_200bb();
-        let tree = Arc::new(PublicBettingTree::build(&config));
+        let tree = Arc::new(PublicBettingTree::build_with_abstraction(
+            &config,
+            &nlhe_action_abstraction(),
+        ));
         Ok(Self {
             bucket_table,
             config,
@@ -385,14 +402,17 @@ impl Game for SimplifiedNlheGame {
     }
 
     fn legal_actions(state: &SimplifiedNlheState) -> Vec<SimplifiedNlheAction> {
-        // D-318 桥接：stage 2 `DefaultActionAbstraction::abstract_actions`
-        // 顺序由 D-209 deterministic（每次构造同型 6-action 抽象，开销可忽略
-        // —— `DefaultActionAbstraction::new` 仅 clone 配置）；Trainer 的 RegretTable
-        // `Vec<f64>` 索引一一对应（D-324 action_count 训练全程恒定）。
+        // D-318 桥接：stage 2 `ActionAbstraction::abstract_actions` 顺序由 D-209
+        // deterministic（每次构造同型抽象，开销可忽略——仅 clone 配置）；Trainer 的
+        // RegretTable `Vec<f64>` 索引一一对应（D-324 action_count 训练全程恒定）。
+        //
+        // 必须与 `new()` 建 tree 用同一 `nlhe_action_abstraction()`：按街分派下
+        // `abstract_actions` 自动按 `state.street()` 选对应街 raise 集合，tag 顺序与
+        // tree child 下标对齐。
         //
         // `into_actions()` 直接 move 出 set 的内部 Vec；之前走
         // `as_slice().to_vec()` 每节点会多 alloc + memcpy 一份。
-        let abs = DefaultActionAbstraction::default_6_action();
+        let abs = nlhe_action_abstraction();
         abs.abstract_actions(&state.game_state).into_actions()
     }
 

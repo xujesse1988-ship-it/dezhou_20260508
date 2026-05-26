@@ -43,7 +43,7 @@ pub use crate::rules::state::GameState;
 // 阶段 2 顶层 re-export（D-253-rev1，与 `docs/pluribus_stage2_api.md` §6 保持一致）。
 pub use crate::abstraction::action::{
     AbstractAction, AbstractActionSet, ActionAbstraction, ActionAbstractionConfig, BetRatio,
-    ConfigError, DefaultActionAbstraction,
+    ConfigError, DefaultActionAbstraction, StreetActionAbstraction,
 };
 pub use crate::abstraction::bucket_table::{
     BucketConfig, BucketTable, BucketTableError, StreetFeaturesV3,
