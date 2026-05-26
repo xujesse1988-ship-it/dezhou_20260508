@@ -14,6 +14,7 @@ use serde::Serialize;
 
 use poker::training::game::{Game, NodeKind};
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
+use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::sampling::sample_discrete;
 use poker::training::{
     estimate_simplified_nlhe_lbr, estimate_simplified_nlhe_lbr_filtered,
@@ -21,6 +22,56 @@ use poker::training::{
     NlheEvaluationReport, NlheLbrConfig, NlheLbrReport, Trainer,
 };
 use poker::{BucketTable, ChaCha20Rng, InfoSetId, RngSource};
+
+/// blueprint 策略来源抽象：HashMap [`EsMccfrTrainer`] 与 [`DenseNlheEsMccfrTrainer`]
+/// 都能驱动 LBR / baseline 评测。两后端 byte-equal，本 trait 让 eval 主路径只写一份。
+///
+/// `strategy_sum_total` 是「该 infoset 有没有 average 信号」的后端无关入口：HashMap
+/// 查 `strategy_sum().inner()`，dense 查 `strategy_sum().row_sum_by_info`。`> 0` 等价
+/// 「entry present 且非全零」，供 `Hybrid` 退化判定 + `HasAverage` probe filter 共用。
+///
+/// **空 `Vec` 语义**：dense 对「仅作为非-traverser 路过」的 infoset 返回空 `Vec`，
+/// HashMap 返回 uniform——但 LBR 估计器把空 `Vec` 当 uniform 兜底（见
+/// `uniform_lbr_curve_point` 的 all-empty oracle），两后端在 estimator 边界等价。
+trait StrategySource {
+    fn average_strategy(&self, info: &InfoSetId) -> Vec<f64>;
+    fn current_strategy(&self, info: &InfoSetId) -> Vec<f64>;
+    fn strategy_sum_total(&self, info: &InfoSetId) -> f64;
+    fn update_count(&self) -> u64;
+}
+
+impl StrategySource for EsMccfrTrainer<SimplifiedNlheGame> {
+    fn average_strategy(&self, info: &InfoSetId) -> Vec<f64> {
+        <Self as Trainer<SimplifiedNlheGame>>::average_strategy(self, info)
+    }
+    fn current_strategy(&self, info: &InfoSetId) -> Vec<f64> {
+        <Self as Trainer<SimplifiedNlheGame>>::current_strategy(self, info)
+    }
+    fn strategy_sum_total(&self, info: &InfoSetId) -> f64 {
+        self.strategy_sum()
+            .inner()
+            .get(info)
+            .map_or(0.0, |v| v.iter().sum())
+    }
+    fn update_count(&self) -> u64 {
+        <Self as Trainer<SimplifiedNlheGame>>::update_count(self)
+    }
+}
+
+impl StrategySource for DenseNlheEsMccfrTrainer {
+    fn average_strategy(&self, info: &InfoSetId) -> Vec<f64> {
+        DenseNlheEsMccfrTrainer::average_strategy(self, *info)
+    }
+    fn current_strategy(&self, info: &InfoSetId) -> Vec<f64> {
+        DenseNlheEsMccfrTrainer::current_strategy(self, *info)
+    }
+    fn strategy_sum_total(&self, info: &InfoSetId) -> f64 {
+        self.strategy_sum().row_sum_by_info(*info)
+    }
+    fn update_count(&self) -> u64 {
+        DenseNlheEsMccfrTrainer::update_count(self)
+    }
+}
 
 /// Blueprint 策略 fallback 策略（D-321 派生修正）。
 ///
@@ -137,22 +188,18 @@ impl TargetStreet {
 /// 构造 probe filter closure。`HasAverage` 走 trainer.strategy_sum() 查 sum > 0
 /// （等价于 average_strategy 非退化均匀分布）；`TargetStreet` 限定 probe target
 /// 决策点的街。两个维度 AND 组合。
-fn make_probe_filter(
-    trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
+fn make_probe_filter<'a, S: StrategySource>(
+    source: &'a S,
     filter: ProbeFilter,
     target_street: TargetStreet,
-) -> impl Fn(&poker::training::nlhe::SimplifiedNlheState, &InfoSetId) -> bool + '_ {
+) -> impl Fn(&poker::training::nlhe::SimplifiedNlheState, &InfoSetId) -> bool + 'a {
     move |state: &poker::training::nlhe::SimplifiedNlheState, info: &InfoSetId| {
         if !target_street.matches(state.game_state.street()) {
             return false;
         }
         match filter {
             ProbeFilter::None => true,
-            ProbeFilter::HasAverage => trainer
-                .strategy_sum()
-                .inner()
-                .get(info)
-                .is_some_and(|v| v.iter().sum::<f64>() > 0.0),
+            ProbeFilter::HasAverage => source.strategy_sum_total(info) > 0.0,
         }
     }
 }
@@ -172,6 +219,9 @@ struct Args {
     fallback_policy: FallbackPolicy,
     probe_filter: ProbeFilter,
     target_street: TargetStreet,
+    /// 用 dense raw v3 checkpoint（[`DenseNlheEsMccfrTrainer`]）做策略来源，而非
+    /// HashMap checkpoint。只评测既有 dense checkpoint（不支持 inline 训练 / curve）。
+    dense: bool,
 }
 
 impl Default for Args {
@@ -192,6 +242,7 @@ impl Default for Args {
             fallback_policy: FallbackPolicy::Hybrid,
             probe_filter: ProbeFilter::None,
             target_street: TargetStreet::Any,
+            dense: false,
         }
     }
 }
@@ -199,22 +250,18 @@ impl Default for Args {
 /// 构造 blueprint 策略 closure。`Hybrid` 模式在 strategy_sum 全零（π_trav 持续 0
 /// 的 off-policy infoset）时回退到 regret-matched `current_strategy`，避免 LBR
 /// probe 在这类 infoset 上拿到均匀分布而不是真实学到的策略。
-fn make_strategy_fn(
-    trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
+fn make_strategy_fn<'a, S: StrategySource>(
+    source: &'a S,
     policy: FallbackPolicy,
-) -> impl Fn(&InfoSetId, usize) -> Vec<f64> + '_ {
+) -> impl Fn(&InfoSetId, usize) -> Vec<f64> + 'a {
     move |info: &InfoSetId, _n: usize| match policy {
-        FallbackPolicy::Average => trainer.average_strategy(info),
-        FallbackPolicy::Current => trainer.current_strategy(info),
+        FallbackPolicy::Average => source.average_strategy(info),
+        FallbackPolicy::Current => source.current_strategy(info),
         FallbackPolicy::Hybrid => {
-            let degenerate = match trainer.strategy_sum().inner().get(info) {
-                None => true,
-                Some(v) => v.iter().sum::<f64>() <= 0.0,
-            };
-            if degenerate {
-                trainer.current_strategy(info)
+            if source.strategy_sum_total(info) <= 0.0 {
+                source.current_strategy(info)
             } else {
-                trainer.average_strategy(info)
+                source.average_strategy(info)
             }
         }
     }
@@ -280,24 +327,6 @@ fn run() -> Result<(), String> {
     );
     eprintln!("[nlhe_h3_report] bucket_blake3  = {bucket_hash}");
 
-    let game = SimplifiedNlheGame::new(Arc::clone(&table))
-        .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
-    let mut trainer = if let Some(ref checkpoint) = args.checkpoint {
-        eprintln!("[nlhe_h3_report] checkpoint     = {}", checkpoint.display());
-        <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
-            checkpoint, game,
-        )
-        .map_err(|e| format!("load checkpoint {} failed: {e:?}", checkpoint.display()))?
-    } else {
-        EsMccfrTrainer::new(game, args.seed)
-    };
-
-    if args.train_updates > 0 {
-        train_inline(&mut trainer, args.train_updates, args.seed, args.threads)?;
-    }
-    let eval_game = SimplifiedNlheGame::new(Arc::clone(&table))
-        .map_err(|e| format!("SimplifiedNlheGame::new for eval failed: {e:?}"))?;
-
     let eval_cfg = NlheEvaluationConfig {
         hands_per_seat: args.eval_hands_per_seat,
         seed: args.seed ^ 0x4556_414c,
@@ -311,6 +340,88 @@ fn run() -> Result<(), String> {
         max_actions_per_rollout: 512,
     };
 
+    // 后端选择：dense raw v3 checkpoint or HashMap checkpoint / 现场训练。
+    // dense 只评测既有 checkpoint（不支持 inline 训练 / curve checkpoints——后者走
+    // HashMap loader）。
+    let game = SimplifiedNlheGame::new(Arc::clone(&table))
+        .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
+    let json = if args.dense {
+        if args.train_updates > 0 {
+            return Err("--dense 不支持 --train-updates：只评测既有 dense checkpoint".to_string());
+        }
+        if !args.curve_checkpoints.is_empty() {
+            return Err(
+                "--dense 不支持 --curve-checkpoints（curve 走 HashMap loader）".to_string(),
+            );
+        }
+        let checkpoint = args
+            .checkpoint
+            .as_ref()
+            .ok_or("--dense 需要 --checkpoint（dense raw v3 格式）")?;
+        eprintln!(
+            "[nlhe_h3_report] checkpoint     = {} (dense)",
+            checkpoint.display()
+        );
+        let source = DenseNlheEsMccfrTrainer::load_checkpoint(checkpoint, game).map_err(|e| {
+            format!(
+                "load dense checkpoint {} failed: {e:?}",
+                checkpoint.display()
+            )
+        })?;
+        run_eval(
+            &source,
+            Arc::clone(&table),
+            &args,
+            &eval_cfg,
+            &lbr_cfg,
+            bucket_hash,
+        )?
+    } else {
+        let mut trainer = if let Some(ref checkpoint) = args.checkpoint {
+            eprintln!("[nlhe_h3_report] checkpoint     = {}", checkpoint.display());
+            <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
+                checkpoint, game,
+            )
+            .map_err(|e| format!("load checkpoint {} failed: {e:?}", checkpoint.display()))?
+        } else {
+            EsMccfrTrainer::new(game, args.seed)
+        };
+        if args.train_updates > 0 {
+            train_inline(&mut trainer, args.train_updates, args.seed, args.threads)?;
+        }
+        run_eval(
+            &trainer,
+            Arc::clone(&table),
+            &args,
+            &eval_cfg,
+            &lbr_cfg,
+            bucket_hash,
+        )?
+    };
+
+    write_reports(&args.output, &json)?;
+    eprintln!("[nlhe_h3_report] wrote {}", args.output.display());
+    eprintln!(
+        "[nlhe_h3_report] wrote {}",
+        args.output.with_extension("json").display()
+    );
+    Ok(())
+}
+
+/// blueprint 评测主路径（后端无关）：baseline EV + LBR proxy + LBR 曲线 + report 组装。
+/// `S` 提供策略来源（HashMap or dense），其余与后端无关。curve checkpoints（如有）
+/// 仍走 HashMap loader（dense 路径已在 `run` 里拒绝 `--curve-checkpoints`）。
+fn run_eval<S: StrategySource>(
+    source: &S,
+    table: Arc<BucketTable>,
+    args: &Args,
+    eval_cfg: &NlheEvaluationConfig,
+    lbr_cfg: &NlheLbrConfig,
+    bucket_hash: String,
+) -> Result<H3JsonReport, String> {
+    let eval_game = SimplifiedNlheGame::new(Arc::clone(&table))
+        .map_err(|e| format!("SimplifiedNlheGame::new for eval failed: {e:?}"))?;
+
     eprintln!(
         "[nlhe_h3_report] fallback_policy = {}",
         args.fallback_policy.slug()
@@ -323,8 +434,8 @@ fn run() -> Result<(), String> {
         "[nlhe_h3_report] target_street   = {}",
         args.target_street.slug()
     );
-    let strategy = make_strategy_fn(&trainer, args.fallback_policy);
-    let probe_filter = make_probe_filter(&trainer, args.probe_filter, args.target_street);
+    let strategy = make_strategy_fn(source, args.fallback_policy);
+    let probe_filter = make_probe_filter(source, args.probe_filter, args.target_street);
     let mut evaluations = Vec::new();
     for baseline in [
         NlheBaselinePolicy::Random,
@@ -334,43 +445,43 @@ fn run() -> Result<(), String> {
     ] {
         eprintln!("[nlhe_h3_report] evaluating baseline {}", baseline.label());
         evaluations.push(
-            evaluate_blueprint_vs_baseline(&eval_game, &strategy, baseline, &eval_cfg)
+            evaluate_blueprint_vs_baseline(&eval_game, &strategy, baseline, eval_cfg)
                 .map_err(|e| format!("evaluate {} failed: {e:?}", baseline.label()))?,
         );
     }
 
     eprintln!("[nlhe_h3_report] estimating LBR proxy");
-    let lbr = estimate_simplified_nlhe_lbr_filtered(&eval_game, &strategy, &probe_filter, &lbr_cfg)
+    let lbr = estimate_simplified_nlhe_lbr_filtered(&eval_game, &strategy, &probe_filter, lbr_cfg)
         .map_err(|e| format!("LBR proxy failed: {e:?}"))?;
-    let strategy_hash = strategy_hash(&trainer, &eval_game);
+    let strategy_hash = strategy_hash(source, &eval_game);
 
     let mut lbr_curve = Vec::new();
-    lbr_curve.push(uniform_lbr_curve_point(Arc::clone(&table), &lbr_cfg)?);
+    lbr_curve.push(uniform_lbr_curve_point(Arc::clone(&table), lbr_cfg)?);
     for (label, path) in &args.curve_checkpoints {
         lbr_curve.push(load_lbr_curve_point(
             Arc::clone(&table),
             label.clone(),
             path,
-            &lbr_cfg,
+            lbr_cfg,
             args.fallback_policy,
             args.probe_filter,
             args.target_street,
         )?);
     }
     lbr_curve.push(LbrCurvePoint {
-        label: format!("active-{}", trainer.update_count()),
-        update_count: trainer.update_count(),
+        label: format!("active-{}", source.update_count()),
+        update_count: source.update_count(),
         strategy_blake3: strategy_hash.clone(),
         mean_best_response_chips: lbr.mean_best_response_chips,
         standard_error_chips: lbr.standard_error_chips,
         probes_used: lbr.probes_used,
     });
 
-    let json = H3JsonReport {
+    Ok(H3JsonReport {
         artifact: args.artifact.display().to_string(),
         bucket_table_blake3: bucket_hash,
         checkpoint: args.checkpoint.as_ref().map(|p| p.display().to_string()),
-        update_count: trainer.update_count(),
+        update_count: source.update_count(),
         strategy_blake3: strategy_hash,
         fallback_policy: args.fallback_policy,
         probe_filter: args.probe_filter,
@@ -378,15 +489,7 @@ fn run() -> Result<(), String> {
         evaluations,
         lbr,
         lbr_curve,
-    };
-
-    write_reports(&args.output, &json)?;
-    eprintln!("[nlhe_h3_report] wrote {}", args.output.display());
-    eprintln!(
-        "[nlhe_h3_report] wrote {}",
-        args.output.with_extension("json").display()
-    );
-    Ok(())
+    })
 }
 
 fn train_inline(
@@ -395,7 +498,7 @@ fn train_inline(
     seed: u64,
     threads: usize,
 ) -> Result<(), String> {
-    let start = trainer.update_count();
+    let start = Trainer::update_count(trainer);
     if start >= target_updates {
         return Ok(());
     }
@@ -407,8 +510,8 @@ fn train_inline(
         })
         .collect();
     let t0 = Instant::now();
-    while trainer.update_count() < target_updates {
-        let remaining = target_updates - trainer.update_count();
+    while Trainer::update_count(trainer) < target_updates {
+        let remaining = target_updates - Trainer::update_count(trainer);
         if threads == 1 {
             trainer
                 .step(&mut single_rng)
@@ -426,11 +529,11 @@ fn train_inline(
         }
     }
     let elapsed = t0.elapsed().as_secs_f64();
-    let throughput = (trainer.update_count() - start) as f64 / elapsed.max(1e-9);
+    let throughput = (Trainer::update_count(trainer) - start) as f64 / elapsed.max(1e-9);
     eprintln!(
         "[nlhe_h3_report] trained inline {} -> {} in {:.1}s ({throughput:.0}/s)",
         start,
-        trainer.update_count(),
+        Trainer::update_count(trainer),
         elapsed
     );
     Ok(())
@@ -479,7 +582,7 @@ fn load_lbr_curve_point(
         .map_err(|e| format!("curve LBR proxy {label} failed: {e:?}"))?;
     Ok(LbrCurvePoint {
         label,
-        update_count: trainer.update_count(),
+        update_count: Trainer::update_count(&trainer),
         strategy_blake3: strategy_hash(&trainer, &eval_game),
         mean_best_response_chips: report.mean_best_response_chips,
         standard_error_chips: report.standard_error_chips,
@@ -487,16 +590,13 @@ fn load_lbr_curve_point(
     })
 }
 
-fn strategy_hash(
-    trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
-    game: &SimplifiedNlheGame,
-) -> String {
+fn strategy_hash<S: StrategySource>(source: &S, game: &SimplifiedNlheGame) -> String {
     let probes = collect_strategy_probes(game);
     let mut hasher = Hasher::new();
-    hasher.update(&trainer.update_count().to_le_bytes());
+    hasher.update(&source.update_count().to_le_bytes());
     hasher.update(&(probes.len() as u64).to_le_bytes());
     for info in probes {
-        let strategy = trainer.average_strategy(&info);
+        let strategy = source.average_strategy(&info);
         hasher.update(&info.raw().to_le_bytes());
         hasher.update(&(strategy.len() as u32).to_le_bytes());
         for p in strategy {
@@ -653,6 +753,7 @@ fn parse_args() -> Result<Args, String> {
                 out.target_street = TargetStreet::from_str(&next_value(&mut args, &arg)?)?
             }
             "--output" => out.output = PathBuf::from(next_value(&mut args, &arg)?),
+            "--dense" => out.dense = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);

@@ -342,6 +342,15 @@ impl DenseNlheTable {
         }
     }
 
+    /// 该 infoset 行各 slot 值之和（只读诊断）。strategy_sum 表上 `> 0` 等价 HashMap
+    /// 路径「entry present 且非全零」——LBR Hybrid 退化判定 / `HasAverage` probe filter
+    /// 用它做后端无关的「该 infoset 有 average 信号吗」判断。未访问行恒 0 → 0.0。
+    pub fn row_sum_by_info(&self, info: InfoSetId) -> f64 {
+        let slot = self.indexer.locate(info);
+        let start = slot.slot_start as usize;
+        self.values[start..start + slot.action_count].iter().sum()
+    }
+
     /// 某行是否被写过（Phase 2+ public query「未见 infoset 返回空 `Vec`」语义入口）。
     pub fn touched_row(&self, row_index: u64) -> bool {
         self.touched_rows.get(row_index)
