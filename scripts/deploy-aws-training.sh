@@ -10,7 +10,7 @@
 #   1. 全新 AWS box 没有 cc/linker —— rustup 只 warn 不装，不装 build-essential
 #      cargo build 直接失败。
 #   2. toolchain pin 文件名是 rust-toolchain.toml（不是 rust-toolchain）。
-#   3. v3 bucket table 不在 GitHub Release，只在 vultr，必须 relay 过来。
+#   3. v4 bucket table 不在 GitHub Release，只在 vultr，必须 relay 过来。
 #   4. LCFR 不能 resume（period state 不存 checkpoint，resume 回退 vanilla）——
 #      训练必须一个进程从头跑完，所以用 setsid nohup 完全脱离 ssh 会话。
 #   5. --batch-per-worker CLI 默认 16，热路径优化要的是 128，必须显式传。
@@ -45,6 +45,9 @@
 #   --report-every <N>     throughput 上报间隔（默认 10000000）
 #   --keep-last <N>        保留最近几个 auto checkpoint（默认 6）
 #   --run-name <name>      checkpoint 子目录名（默认 run_lcfr_<updates>）
+#   --bucket-schema <v>    bucket schema 后缀（默认 schemav4；v3 artifact 已删，仅 v4 可加载）
+#   --dense                用 dense full-prealloc infoset 表后端（train_cfr --dense）；
+#                          与默认 HashMap 后端 byte-equal，但 checkpoint 走 dense raw v3 格式
 #   --no-launch            只部署 + 编译，不启动训练
 #
 # 退出后用这些命令盯训练（脚本结束会打印）：
@@ -62,6 +65,8 @@ BRANCH="think"
 VULTR="shaopeng@64.176.35.138"
 REMOTE_DIR="dezhou_20260508"
 BUCKET_SEED="cafebabe"
+BUCKET_SCHEMA="schemav4"
+DENSE=0
 
 UPDATES=500000000
 TRAIN_SEED=0x4e4c48455f48335f
@@ -93,6 +98,8 @@ while [ "$#" -gt 0 ]; do
         --report-every) REPORT_EVERY="$2"; shift 2;;
         --keep-last)    KEEP_LAST="$2"; shift 2;;
         --run-name)     RUN_NAME="$2"; shift 2;;
+        --bucket-schema) BUCKET_SCHEMA="$2"; shift 2;;
+        --dense)        DENSE=1; shift;;
         --no-launch)    DO_LAUNCH=0; shift;;
         -h|--help)      usage 0;;
         *) echo "[deploy] unknown arg: $1" >&2; usage 1;;
@@ -104,7 +111,7 @@ done
 [ -z "$RUN_NAME" ] && RUN_NAME="run_lcfr_$(( UPDATES / 1000000 ))m"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUCKET_FILE="bucket_table_default_500_500_500_seed_${BUCKET_SEED}_schemav3.bin"
+BUCKET_FILE="bucket_table_default_500_500_500_seed_${BUCKET_SEED}_${BUCKET_SCHEMA}.bin"
 AWS="$AWS_USER@$AWS_HOST"
 SSH=(ssh -i "$AWS_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20)
 RD="$REMOTE_DIR"   # 远端 ~/dezhou_20260508
@@ -114,7 +121,8 @@ say() { echo "[deploy] $*"; }
 # ---------------------------------------------------------------------------
 # 0. 探测 box
 # ---------------------------------------------------------------------------
-say "目标 $AWS  分支 $BRANCH  bucket $BUCKET_SEED  run $RUN_NAME"
+BACKEND="hashmap"; [ "$DENSE" -eq 1 ] && BACKEND="dense"
+say "目标 $AWS  分支 $BRANCH  bucket $BUCKET_SEED/$BUCKET_SCHEMA  backend $BACKEND  run $RUN_NAME"
 REMOTE_NPROC="$("${SSH[@]}" "$AWS" 'nproc')"
 say "远端 nproc = $REMOTE_NPROC"
 [ "$THREADS" -eq 0 ] && THREADS="$REMOTE_NPROC"
@@ -191,13 +199,16 @@ say "编译完成"
 # ---------------------------------------------------------------------------
 # 5. 启动训练（detached：setsid nohup，脱离 ssh 会话，断连不影响）
 # ---------------------------------------------------------------------------
+DENSE_ARG=""
+[ "$DENSE" -eq 1 ] && DENSE_ARG="--dense"
+
 if [ "$DO_LAUNCH" -eq 0 ]; then
     say "--no-launch：部署完成，未启动训练。"
     echo
     echo "手动启动示例："
     echo "  ssh -i $AWS_KEY $AWS"
     echo "  cd ~/$RD && . ~/.cargo/env"
-    echo "  ./target/release/train_cfr --game nlhe --trainer es-mccfr \\"
+    echo "  ./target/release/train_cfr --game nlhe --trainer es-mccfr $DENSE_ARG \\"
     echo "    --bucket-table artifacts/$BUCKET_FILE \\"
     echo "    --updates $UPDATES --seed $TRAIN_SEED --lcfr-period $LCFR_PERIOD \\"
     echo "    --threads $THREADS --batch-per-worker $BATCH \\"
@@ -209,7 +220,7 @@ fi
 LCFR_ARG=""
 [ "$LCFR_PERIOD" -gt 0 ] && LCFR_ARG="--lcfr-period $LCFR_PERIOD"
 
-say "启动 $RUN_NAME：$UPDATES updates / threads=$THREADS / batch=$BATCH / lcfr=$LCFR_PERIOD"
+say "启动 $RUN_NAME：$UPDATES updates / backend=$BACKEND / threads=$THREADS / batch=$BATCH / lcfr=$LCFR_PERIOD"
 "${SSH[@]}" "$AWS" "bash -se" <<REMOTE
 set -euo pipefail
 cd ~/$RD && . "\$HOME/.cargo/env"
@@ -217,7 +228,7 @@ mkdir -p artifacts/$RUN_NAME
 if pgrep -f 'release/train_cfr' >/dev/null; then
     echo "[remote] 已有 train_cfr 在跑，拒绝重复启动" >&2; exit 1
 fi
-setsid nohup ./target/release/train_cfr --game nlhe --trainer es-mccfr \
+setsid nohup ./target/release/train_cfr --game nlhe --trainer es-mccfr $DENSE_ARG \
     --bucket-table artifacts/$BUCKET_FILE \
     --updates $UPDATES --seed $TRAIN_SEED $LCFR_ARG \
     --threads $THREADS --batch-per-worker $BATCH \

@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use poker::training::nlhe::SimplifiedNlheGame;
+use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{EsMccfrTrainer, Trainer};
-use poker::{BucketTable, ChaCha20Rng, RngSource};
+use poker::{BucketTable, ChaCha20Rng, CheckpointError, RngSource, TrainerError};
 
 #[derive(Debug)]
 struct Args {
@@ -38,6 +39,13 @@ struct Args {
     /// 只在 cold start (`--resume` 不传) 生效；resume 不能 enable LCFR
     /// （EsMccfrTrainer 校验 update_count == 0）。
     lcfr_period: Option<u64>,
+    /// 用 dense full-prealloc infoset 表（[`DenseNlheEsMccfrTrainer`]）替代默认
+    /// HashMap 后端。两后端在同 seed 下 byte-equal（`tests/dense_nlhe_trainer.rs`
+    /// 5 个对照）；dense 把 `HashMap<InfoSetId, Vec<f64>>` 换成两张扁平 `Vec<f64>`
+    /// （当前 119.7M profile ~4.6 GiB），避免 HashMap collision + 几百 M infoset
+    /// 扩张时的内存爆炸。checkpoint 走 dense raw v3 格式（与 HashMap ckpt 不互通，
+    /// resume 必须 dense ckpt；LCFR 元数据随 dense ckpt 恢复）。
+    dense: bool,
 }
 
 impl Default for Args {
@@ -57,7 +65,63 @@ impl Default for Args {
             batch_per_worker: 16,
             quiet: false,
             lcfr_period: None,
+            dense: false,
         }
+    }
+}
+
+/// 训练后端抽象：HashMap 与 dense 两个 trainer 的 step/checkpoint 入口同型但不共享
+/// trait（dense 是 NLHE 专属、不实现泛型 `Trainer<G>`）。本地 trait 让 CLI 的训练
+/// 主循环只写一份，两后端走同一 [`drive`]，保证 throughput / checkpoint 节奏一致。
+trait CfrBackend {
+    fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError>;
+    fn step_parallel(
+        &mut self,
+        rng_pool: &mut [Box<dyn RngSource>],
+        n_threads: usize,
+        batch_per_worker: usize,
+    ) -> Result<(), TrainerError>;
+    fn update_count(&self) -> u64;
+    fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError>;
+}
+
+impl CfrBackend for EsMccfrTrainer<SimplifiedNlheGame> {
+    fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError> {
+        <Self as Trainer<SimplifiedNlheGame>>::step(self, rng)
+    }
+    fn step_parallel(
+        &mut self,
+        rng_pool: &mut [Box<dyn RngSource>],
+        n_threads: usize,
+        batch_per_worker: usize,
+    ) -> Result<(), TrainerError> {
+        EsMccfrTrainer::step_parallel(self, rng_pool, n_threads, batch_per_worker)
+    }
+    fn update_count(&self) -> u64 {
+        <Self as Trainer<SimplifiedNlheGame>>::update_count(self)
+    }
+    fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
+        <Self as Trainer<SimplifiedNlheGame>>::save_checkpoint(self, path)
+    }
+}
+
+impl CfrBackend for DenseNlheEsMccfrTrainer {
+    fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError> {
+        DenseNlheEsMccfrTrainer::step(self, rng)
+    }
+    fn step_parallel(
+        &mut self,
+        rng_pool: &mut [Box<dyn RngSource>],
+        n_threads: usize,
+        batch_per_worker: usize,
+    ) -> Result<(), TrainerError> {
+        DenseNlheEsMccfrTrainer::step_parallel(self, rng_pool, n_threads, batch_per_worker)
+    }
+    fn update_count(&self) -> u64 {
+        DenseNlheEsMccfrTrainer::update_count(self)
+    }
+    fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
+        DenseNlheEsMccfrTrainer::save_checkpoint(self, path)
     }
 }
 
@@ -107,7 +171,23 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
     let table_hash = hex32(&table.content_hash());
 
-    let mut trainer = if let Some(ref resume) = args.resume {
+    // 后端选择：dense full-prealloc 表 or 默认 HashMap。两者 byte-equal（见 Args.dense
+    // doc），训练主循环共用 `drive`——只构造入口不同。
+    if args.dense {
+        let mut trainer = build_dense(&args, game)?;
+        drive(&mut trainer, &args, &table_hash, "dense-es-mccfr")
+    } else {
+        let mut trainer = build_hashmap(&args, game)?;
+        drive(&mut trainer, &args, &table_hash, "es-mccfr")
+    }
+}
+
+/// 构造 HashMap 后端（默认路径，行为与改动前一致）。
+fn build_hashmap(
+    args: &Args,
+    game: SimplifiedNlheGame,
+) -> Result<EsMccfrTrainer<SimplifiedNlheGame>, String> {
+    if let Some(ref resume) = args.resume {
         if args.lcfr_period.is_some() {
             return Err(
                 "--lcfr-period cannot be combined with --resume: LCFR period state 不存 \
@@ -119,16 +199,48 @@ fn run() -> Result<(), String> {
         <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
             resume, game,
         )
-        .map_err(|e| format!("load checkpoint {} failed: {e:?}", resume.display()))?
+        .map_err(|e| format!("load checkpoint {} failed: {e:?}", resume.display()))
     } else {
         let base = EsMccfrTrainer::new(game, args.seed);
-        if let Some(period) = args.lcfr_period {
-            base.with_lcfr_period(period)
-        } else {
-            base
-        }
-    };
+        Ok(match args.lcfr_period {
+            Some(period) => base.with_lcfr_period(period),
+            None => base,
+        })
+    }
+}
 
+/// 构造 dense 后端。resume 走 dense raw v3 ckpt（`DenseNlheEsMccfrTrainer::load_checkpoint`
+/// 随 ckpt 恢复 LCFR 元数据，故 dense resume 不需要、也不接受 `--lcfr-period`）。
+/// 从旧 HashMap ckpt 迁移用 `from_hashmap_checkpoint`，不在本 CLI 路径暴露。
+fn build_dense(args: &Args, game: SimplifiedNlheGame) -> Result<DenseNlheEsMccfrTrainer, String> {
+    if let Some(ref resume) = args.resume {
+        if args.lcfr_period.is_some() {
+            return Err(
+                "--lcfr-period cannot be combined with --resume (--dense): dense ckpt 已存 \
+                 LCFR period state，resume 自动续；显式传 --lcfr-period 会与恢复的状态冲突。"
+                    .to_string(),
+            );
+        }
+        DenseNlheEsMccfrTrainer::load_checkpoint(resume, game)
+            .map_err(|e| format!("load dense checkpoint {} failed: {e:?}", resume.display()))
+    } else {
+        let base = DenseNlheEsMccfrTrainer::new(game, args.seed);
+        Ok(match args.lcfr_period {
+            Some(period) => base.with_lcfr_period(period),
+            None => base,
+        })
+    }
+}
+
+/// 训练主循环（后端无关）：banner → step/step_parallel 直到 `args.updates` →
+/// 周期 checkpoint + 最终 checkpoint。两后端共用以保证 throughput / checkpoint 节奏
+/// 一致；唯一差异是 `trainer` 的具体类型。
+fn drive<T: CfrBackend>(
+    trainer: &mut T,
+    args: &Args,
+    table_hash: &str,
+    backend_label: &str,
+) -> Result<(), String> {
     let start_update = trainer.update_count();
     if start_update >= args.updates {
         if !args.quiet {
@@ -137,13 +249,13 @@ fn run() -> Result<(), String> {
                 start_update, args.updates
             );
         }
-        save_checkpoint(&trainer, &args.checkpoint_dir, "final")?;
+        save_checkpoint(trainer, &args.checkpoint_dir, "final")?;
         return Ok(());
     }
 
     if !args.quiet {
         eprintln!("[train_cfr] game             = nlhe");
-        eprintln!("[train_cfr] trainer          = es-mccfr");
+        eprintln!("[train_cfr] trainer          = {backend_label}");
         eprintln!("[train_cfr] target_updates   = {}", args.updates);
         eprintln!("[train_cfr] start_update     = {start_update}");
         eprintln!("[train_cfr] seed             = 0x{:016x}", args.seed);
@@ -228,7 +340,7 @@ fn run() -> Result<(), String> {
         }
 
         if args.checkpoint_every > 0 && cur >= next_checkpoint {
-            let path = save_checkpoint(&trainer, &args.checkpoint_dir, "auto")?;
+            let path = save_checkpoint(trainer, &args.checkpoint_dir, "auto")?;
             saved_this_run.push(path);
             prune_saved(&mut saved_this_run, args.keep_last);
             while next_checkpoint <= cur {
@@ -237,7 +349,7 @@ fn run() -> Result<(), String> {
         }
     }
 
-    let final_path = save_checkpoint(&trainer, &args.checkpoint_dir, "final")?;
+    let final_path = save_checkpoint(trainer, &args.checkpoint_dir, "final")?;
     if !args.quiet {
         let elapsed = t0.elapsed().as_secs_f64();
         let throughput = (trainer.update_count() - start_update) as f64 / elapsed.max(1e-9);
@@ -287,6 +399,7 @@ fn parse_args() -> Result<Args, String> {
             "--lcfr-period" => {
                 out.lcfr_period = Some(parse_u64(&next_value(&mut args, "--lcfr-period")?)?)
             }
+            "--dense" => out.dense = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -314,11 +427,7 @@ fn parse_u64(raw: &str) -> Result<u64, String> {
     }
 }
 
-fn save_checkpoint(
-    trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
-    dir: &Path,
-    label: &str,
-) -> Result<PathBuf, String> {
+fn save_checkpoint<T: CfrBackend>(trainer: &T, dir: &Path, label: &str) -> Result<PathBuf, String> {
     let path = dir.join(format!(
         "nlhe_es_mccfr_{label}_{:012}.ckpt",
         trainer.update_count()
@@ -365,6 +474,7 @@ fn print_usage() {
          \t--report-every <N>\n\
          \t--keep-last <N>\n\
          \t--lcfr-period <N>  (cold start only; LCFR-MCCFR period rescale)\n\
+         \t--dense  (dense full-prealloc infoset table backend; byte-equal to default HashMap)\n\
          \t--quiet"
     );
 }
