@@ -25,7 +25,7 @@
 //! **D-314-rev1 lock**（`pluribus_stage3_decisions.md` §10.1，2026-05-13）：
 //! bucket table = §G-batch1 §3.10 production **v4** artifact
 //! `artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin`（528 MiB /
-//! body BLAKE3 `67ee5554...`）。
+//! body BLAKE3 `ac501bcf...`）。
 //!
 //! 测试 setup 走 `load_v4_artifact_or_skip` helper：artifact 缺失（CI / GitHub-
 //! hosted runner 典型场景）时打印 eprintln 提示并 `return`（pass-with-skip），不
