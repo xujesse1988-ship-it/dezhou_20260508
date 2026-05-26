@@ -448,14 +448,39 @@ dense 表本身不产生更强 blueprint——它只是承载 bet-size 扩张的
 - `cargo build --all-targets` / `fmt --all --check` / `clippy --all-targets -D warnings`（本机）+
   `training::nlhe*` 全套单测（vultr）通过，前置 P / betting tree 既有测试不回归。
 
-### Phase 2：DenseNlheEsMccfrTrainer
+### Phase 2：DenseNlheEsMccfrTrainer — ✅ 已落地（2026-05-26）
 
-- 复制 NLHE ES-MCCFR recurse，改成 dense index hot path。
-- local delta 存 `slot_start` 而不是 `InfoSetId`。
-- 单线程 `step` 与 HashMap 路径短跑对照：
-  - 固定 seed
-  - 1K / 50K updates
-  - snapshot probes average_strategy 一致或 byte-equal
+**落地实现**（commit `a0ccbf5`，think 分支，`src/training/nlhe_dense_trainer.rs`）：
+
+- `DenseNlheEsMccfrTrainer`：把 `EsMccfrTrainer` 的 NLHE 单线程 `recurse_es` 复制一份
+  （`recurse_es_dense`，逐行对应），σ 读 / regret 累积 / strategy_sum 累积换成
+  `DenseNlheTable` 入口。**不泛型化** `EsMccfrTrainer<G>`（避免动 Kuhn/Leduc/generic
+  签名 + 既有测试），稳定后再评估抽 `RegretStorage` trait。
+- `step`（alternating traverser = `update_count % n_players`）/ `current_strategy` /
+  `average_strategy`（两表都未 touch → 空 `Vec`，与 Trainer trait 同语义）/
+  `update_count` + LCFR period rescale（`with_lcfr_period[_strategy_only]` +
+  `maybe_lcfr_rescale`，逐行抄 `EsMccfrTrainer`）。
+- 不实现 `Trainer` trait（checkpoint 属 Phase 4）。
+- **单线程直接 `accumulate_by_info`**（内部 `locate`），未走 local-delta-by-slot——
+  那是 Phase 3 并行 merge 的优化，单线程不需要。
+
+**byte-equal 对照（tests/dense_nlhe_trainer.rs，vultr 实测）**：dense vs HashMap
+`EsMccfrTrainer<SimplifiedNlheGame>` 同 seed 单线程 lockstep，对所有已访问 infoset 比
+`average_strategy` / `current_strategy` **f64 to_bits 逐位相等**：
+
+- **vanilla**（5000 update）：byte-equal ✓，峰值 **3.8 GiB**（dense 只提交访问过的 slot），
+  vultr 充裕——dense recurse 的主验证。
+- **LCFR**（period=1000，5000 update，跨 5 个 rescale boundary）：byte-equal ✓，峰值
+  **~7.33 GiB**（`rescale_all` 全提交 4.62 GiB dense + HashMap 对照表 ~2 GiB + bucket，
+  与 update 数几乎无关）。**逼近 vultr 7.7 GiB 上限、无余量**——属 ≥ ~10 GiB 机器，
+  idle vultr 勉强过（0 swap）。
+
+> **内存教训（决定 Phase 3+ 跑哪）**：当前 119.7M profile 下 full-dense 两表 4.62 GiB；
+> 一旦触发 `rescale_all`（LCFR / period boundary）就全提交，叠 HashMap 对照表后逼近
+> vultr 上限。**目标扩张 profile 两表 13.48 GiB，vultr（7.7 GiB）直接装不下。** Phase 3
+> 并行 + 目标 profile 验证需 32–64 GB 机器（AWS c6a.8xlarge / Hetzner / vultr 大机型），
+> 不能继续压在当前 vultr 上。LCFR rescale byte-equal 本身另由 Phase 1 `nlhe_dense` 单测
+> （合成 delta vs HashMap）覆盖，所以 vultr 上只跑 vanilla 也够拿 recurse 正确性。
 
 ### Phase 3：parallel dense path
 
