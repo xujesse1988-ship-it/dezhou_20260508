@@ -1,11 +1,12 @@
-//! F1：bucket table schema 兼容性测试（v3 schema lock-in）。
+//! F1：bucket table schema 兼容性测试（v4 schema lock-in）。
 //!
-//! 验收门槛：v3 round-trip 稳定 + (v0 / v1 / v2 / v4 / u32::MAX) 全部拒绝 +
+//! 验收门槛：v4 round-trip 稳定 + (v0 / v1 / v2 / v3 / v5 / u32::MAX) 全部拒绝 +
 //! (feature_set_id 0 / 1 / 3) 全部拒绝。
 //!
-//! 当前 schema = (schema_version=3, feature_set_id=2)，对应 16 维 hist + OCHS feature
-//! 集（`docs/bucket_feature_design.md` §2）。schema v2 (9 维 EHS² + OCHS_8)
-//! 已退出，reader 必须 SchemaMismatch 拒绝。
+//! 当前 schema = (schema_version=4, feature_set_id=2)，对应 16 维 hist + OCHS feature
+//! 集（`docs/bucket_feature_design.md` §2）。v4 与 v3 二进制 layout 相同，仅 lookup
+//! 段 canonical id 编号改为 shape-major（`canonical_enum` 2026-05 重写）；v3（旧
+//! 编号）/ v2 (9 维 EHS² + OCHS_8) 均已退出，reader 必须 SchemaMismatch 拒绝。
 
 use poker::abstraction::bucket_table::{
     BUCKET_TABLE_DEFAULT_FEATURE_SET_ID, BUCKET_TABLE_FEATURE_SET_2_DIMS, BUCKET_TABLE_HEADER_LEN,
@@ -82,10 +83,11 @@ fn write_tmp(bytes: &[u8], label: &str) -> PathBuf {
 // ============================================================================
 
 #[test]
-fn schema_constants_locked_for_v3() {
+fn schema_constants_locked_for_v4() {
     assert_eq!(
-        BUCKET_TABLE_SCHEMA_VERSION, 3,
-        "schema_version 锁定为 3（v3 = 16 维 hist + OCHS，`docs/bucket_feature_design.md` §7）"
+        BUCKET_TABLE_SCHEMA_VERSION, 4,
+        "schema_version 锁定为 4（v4 = v3 layout + shape-major canonical id 编号，\
+         `src/abstraction/canonical_enum.rs` 2026-05 重写）"
     );
     assert_eq!(
         BUCKET_TABLE_DEFAULT_FEATURE_SET_ID, 2,
@@ -119,7 +121,7 @@ fn v3_synthetic_then_open_roundtrip_stable() {
     let table = BucketTable::open(&path).expect("v3 round-trip open");
     let _ = std::fs::remove_file(&path);
 
-    assert_eq!(table.schema_version(), 3);
+    assert_eq!(table.schema_version(), 4);
     assert_eq!(table.feature_set_id(), 2);
     assert_eq!(table.training_seed(), FIXTURE_TRAINING_SEED);
     assert_eq!(table.config(), FIXTURE_BUCKET_CONFIG);
@@ -197,8 +199,15 @@ fn assert_schema_mismatch(new_version: u32, label: &str) {
 }
 
 #[test]
-fn future_v4_schema_version_is_rejected() {
-    assert_schema_mismatch(4, "fake_v4");
+fn future_v5_schema_version_is_rejected() {
+    assert_schema_mismatch(5, "fake_v5");
+}
+
+/// v3 = 旧 canonical id 编号方案（2026-05 前），二进制 layout 与 v4 相同但 lookup
+/// 行语义不兼容；reader 必须按 schema_version 拒绝，避免静默读错 bucket。
+#[test]
+fn pre_v4_schema_version_v3_is_rejected() {
+    assert_schema_mismatch(3, "fake_v3");
 }
 
 #[test]

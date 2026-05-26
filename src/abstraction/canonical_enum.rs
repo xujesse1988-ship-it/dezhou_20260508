@@ -27,29 +27,37 @@
 //!    高位到低位排列。pack 输出在 `u128 高 127 位之内（最高 1 位永 0），所以
 //!    `u128 numerical cmp == canonical tuple lex cmp`。
 //!
-//! 3. **Lazy sorted table per street**：第一次调用 [`canonical_observation_id`]
-//!    时，对该街枚举所有 canonical form key 并 sort 到 `Vec<u128>`。canonical
-//!    id = `Vec` 中 binary-search position。tables 走 [`OnceLock`]，per-street
-//!    lazy build 避免不需要 river 的测试也付 ~1 s build cost。
+//! 3. **Direct combinatorial rank（2026-05 重写，shape-major）**：canonical id 由
+//!    组合数学公式 O(1) 直接算出，不再建 per-street `Vec<u128>` 整表、不再 binary
+//!    search 整表。编号方案：
 //!
-//! 4. **Enumeration**：用递归方式枚举每个 canonical shape (b_counts, h_counts
-//!    per canonical suit 多重集) → 每个 shape 内 enumerate canonical multiset of
-//!    (b_mask, h_mask) pairs。详见 `enumerate_canonical_forms` (本模块 private
-//!    递归实现，非 pub API)。复杂度上界 = N（每 canonical form 严格 enumerate
-//!    一次，无 brute-force dedup）。
+//!    - **shape 偏移**：4 个 canonical suit 的 (b_count, h_count) 序列当作 shape，
+//!      按 shape 字典序排列；id 落在「所有字典序更小 shape 的容量之和」（`shape_offset`）
+//!      起的连续区间。合法 shape 总数极少（每街 < 几百），用一张几百字节的
+//!      [`OnceLock`] 表存 `(shape_key, offset, size)`。
+//!    - **shape 内排名**：同一 (b_count, h_count) 的连续 suit 组成 group；每个
+//!      group 内的 (b_mask, h_mask) 多重集用组合数系（colex / combinadic）rank
+//!      编号，各 group 间按混合进制（group 0 最高位）拼成 shape 内稠密 rank。
+//!
+//!    id = `shape_offset + shape 内 rank`，是 `[0, N)` 上的双射。
+//!
+//!    **注意**：本方案与 2026-05 之前的「整表 sort + binary search」产出的 id
+//!    **不同**——旧方案按 packed u128 数值序，会把不同 shape 交错排列（早 slot 的
+//!    mask 位先于晚 slot 的 count 位参与比较）。任何用旧 id 训练的 bucket 表语义
+//!    失效；`bucket_table` 的 `schema_version` 已 bump 以令 reader 拒绝旧 artifact。
+//!
+//! 4. **Enumeration（仅供微型 shape 表 + 自校验测试）**：递归枚举每个 canonical
+//!    shape → 每个 shape 内 enumerate canonical multiset of (b_mask, h_mask)
+//!    pairs。详见 `enumerate_canonical_forms`（本模块 private 递归实现，非 pub
+//!    API）。现仅用于建微型 shape 表（取 shape 列表 + 用公式算各 shape 容量）和
+//!    校验 N；运行时 id 计算不再走它。
 //!
 //! # 内存预算
 //!
-//! Per-street sorted `Vec<u128>` 大小：
-//!
-//! | street | N | bytes (×16) |
-//! |---|---|---|
-//! | flop | 1,286,792 | ~20.6 MB |
-//! | turn | 13,960,050 | ~223 MB |
-//! | river | 123,156,254 | ~1.97 GB |
-//!
-//! Lazy build 让只 touch flop 的测试只付 ~416 KB；full training 路径付完整
-//! ~1.99 GB。Build time on 1-CPU host: flop ~30 ms / turn ~2 s / river ~3 min。
+//! 不再常驻 per-street `Vec<u128>` 整表（旧方案 river ~1.97 GB / build ~3 min）。
+//! 现在每街只 lazy 建一张 `(shape_key, offset, size)` 微型表（每街 < 几百条目，
+//! < 10 KB），build < 1 ms。[`canonical_observation_id`] / [`nth_canonical_form`]
+//! 都是 O(1) 公式 + 一次微型表 binary search。
 //!
 //! # 不变量
 //!
@@ -60,8 +68,9 @@
 //!   （suit canonicalization 把 σ 吸收）。
 //! - **board/hole partition 区分**：相同 rank multiset 不同 partition 划分得到
 //!   不同 id（partition info 显式编码在 b_mask vs h_mask）。
-//! - **唯一性（新）**：D-218-rev2 §3 字面要求——两个互不等价的 (board, hole) 一定
-//!   映射到不同 id。由 sorted Vec dedup + binary search 严格保证。
+//! - **唯一性**：两个互不等价的 (board, hole) 一定映射到不同 id。由组合数系 rank
+//!   的双射性严格保证（每个 canonical 等价类 ↔ 唯一 (shape, 各 group 多重集 rank)
+//!   ↔ 唯一 id）。
 //! - **稠密性**：id ∈ `[0, N)` 全覆盖。
 
 #![deny(clippy::float_arithmetic)]
@@ -100,34 +109,13 @@ pub fn n_canonical_observation(street: StreetTag) -> u32 {
 }
 
 // ============================================================================
-// canonical form key packing
+// canonical signatures + key packing
 // ============================================================================
 
-/// 给定 (board, hole)，计算 canonical form `u128` key。
-///
-/// Layout（MSB → LSB，4 suits × 32-bit）：
-///
-/// ```text
-///   bit 127:96  →  suit 0 signature (32-bit packed)
-///   bit  95:64  →  suit 1 signature
-///   bit  63:32  →  suit 2 signature
-///   bit  31: 0  →  suit 3 signature
-/// ```
-///
-/// Per-suit 32-bit signature（高位优先）：
-///
-/// ```text
-///   bit 31    →  unused (0)
-///   bit 30:28 →  b_count (0..=5)        (3 bits)
-///   bit 27:26 →  h_count (0..=2)        (2 bits)
-///   bit 25:13 →  b_mask (13-bit rank set)
-///   bit 12: 0 →  h_mask (13-bit rank set)
-/// ```
-///
-/// 因为 `u128` 数值序与 canonical (b_count, h_count, b_mask, h_mask) tuple 字典
-/// 序一一对应（每 component 占用固定高位段 + 不溢出），sort `Vec<u128>` 等价于
-/// sort canonical tuple Vec。
-fn pack_canonical_form_key(board: &[Card], hole: &[Card; 2]) -> u128 {
+/// 计算 (board, hole) 的 canonical sorted suit signatures：4 个
+/// `(b_count, h_count, b_mask, h_mask)` 按字典序升序排列。同一花色对称等价类下
+/// 返回完全相同的数组（花色重标 + 输入顺序都被吸收，因为先按 suit 聚合 + sort）。
+fn canonical_sigs(board: &[Card], hole: &[Card; 2]) -> [(u8, u8, u16, u16); 4] {
     let mut suits: [(u16, u16); 4] = [(0, 0); 4];
     for &c in board {
         suits[c.suit() as usize].0 |= 1u16 << (c.rank() as u8);
@@ -146,7 +134,17 @@ fn pack_canonical_form_key(board: &[Card], hole: &[Card; 2]) -> u128 {
         );
     }
     sigs.sort_unstable();
+    sigs
+}
 
+/// 把 canonical sorted sigs 打包成 `u128` key（仅 test ground-truth 用；运行时
+/// id 计算走 direct combinatorial rank，不再依赖整表 sort）。
+///
+/// Layout（MSB → LSB，4 suits × 32-bit）：slot 0 在 `bit 127:96` … slot 3 在
+/// `bit 31:0`。每 suit 32-bit 高位优先排 `[unused(1) | b_count(3) | h_count(2) |
+/// b_mask(13) | h_mask(13)]`，所以 `u128` 数值序 == canonical tuple 字典序。
+#[cfg(test)]
+fn pack_sigs(sigs: &[(u8, u8, u16, u16); 4]) -> u128 {
     let mut key: u128 = 0;
     for (i, sig) in sigs.iter().enumerate() {
         let pack: u128 = ((sig.0 as u128) << 28)
@@ -159,36 +157,287 @@ fn pack_canonical_form_key(board: &[Card], hole: &[Card; 2]) -> u128 {
     key
 }
 
+#[cfg(test)]
+fn pack_canonical_form_key(board: &[Card], hole: &[Card; 2]) -> u128 {
+    pack_sigs(&canonical_sigs(board, hole))
+}
+
 // ============================================================================
-// canonical_observation_id：lazy table + binary search
+// 组合数学底层原语（direct combinatorial rank）
 // ============================================================================
 
-static FLOP_TABLE: OnceLock<Vec<u128>> = OnceLock::new();
-static TURN_TABLE: OnceLock<Vec<u128>> = OnceLock::new();
-static RIVER_TABLE: OnceLock<Vec<u128>> = OnceLock::new();
+/// 组合数 C(n, k)。n / k 在本模块用途内都很小（n ≤ ~4300，k ≤ 4），增量乘法精确
+/// 无溢出（中间值 << u64::MAX）。`k > n` 返回 0。
+fn choose(n: u64, k: u64) -> u64 {
+    if k > n {
+        return 0;
+    }
+    let k = k.min(n - k);
+    let mut result: u64 = 1;
+    let mut i: u64 = 1;
+    while i <= k {
+        // C(n, i) = C(n, i-1) * (n - i + 1) / i，按此顺序每步整除精确。
+        result = result * (n - k + i) / i;
+        i += 1;
+    }
+    result
+}
 
-fn lazy_table(street: StreetTag) -> &'static [u128] {
+/// 一个集合（用 set bit 位置表示）的 colexicographic rank：取 set bit 位置升序
+/// `p_0 < p_1 < ...`，rank = Σ_i C(p_i, i+1)。该值随 mask 整数值单调递增，等于
+/// Gosper 升序枚举里的下标。本重载吃 `u16` mask（位置 ≤ 15）。
+fn colex_rank(mask: u16) -> u64 {
+    let mut rank: u64 = 0;
+    let mut m = mask;
+    let mut i: u64 = 1;
+    while m != 0 {
+        let p = m.trailing_zeros() as u64;
+        rank += choose(p, i);
+        m &= m - 1;
+        i += 1;
+    }
+    rank
+}
+
+/// `colex_rank` 的逆：在 `n`-bit 空间里恢复有 `k` 个 set bit、rank 为 `rank` 的
+/// mask（组合数系 greedy unranking）。`k == 0` 返回 0。
+fn colex_unrank(mut rank: u64, k: u32, n: u32) -> u16 {
+    let mut mask: u16 = 0;
+    let mut i = k;
+    while i >= 1 {
+        // 找最大 cand（< n）使 C(cand, i) <= rank：从 i-1（C(i-1,i)=0）往上爬。
+        let mut cand = i - 1;
+        while cand + 1 < n && choose((cand + 1) as u64, i as u64) <= rank {
+            cand += 1;
+        }
+        rank -= choose(cand as u64, i as u64);
+        mask |= 1u16 << cand;
+        i -= 1;
+    }
+    mask
+}
+
+/// 把 `h_mask`（与 `b_mask` 不相交）压缩到 `b_mask` 空出的 13 - popcount(b_mask)
+/// 个 rank 位中——每个 set bit 的新位置 = 原位置减去其下方被 `b_mask` 占用的位数。
+fn compress_mask(h_mask: u16, b_mask: u16) -> u16 {
+    let mut out: u16 = 0;
+    let mut m = h_mask;
+    while m != 0 {
+        let p = m.trailing_zeros();
+        let below = b_mask & ((1u16 << p) - 1);
+        let cp = p - below.count_ones();
+        out |= 1u16 << cp;
+        m &= m - 1;
+    }
+    out
+}
+
+/// `compress_mask` 的逆：把压缩位 `mapped_h` 在 `b_mask` 的空位上展开回 13-bit
+/// rank 空间。
+fn expand_mask(mapped_h: u16, b_mask: u16) -> u16 {
+    let mut out: u16 = 0;
+    let mut comp_idx: u32 = 0;
+    for p in 0..13u16 {
+        if (b_mask >> p) & 1 == 1 {
+            continue; // 被 board 占用，跳过
+        }
+        if (mapped_h >> comp_idx) & 1 == 1 {
+            out |= 1u16 << p;
+        }
+        comp_idx += 1;
+    }
+    out
+}
+
+/// 固定 (b_count, h_count) 下合法 (b_mask, h_mask) 对的总数 =
+/// C(13, b_count) · C(13 - b_count, h_count)。
+fn mask_pair_count(bc: u8, hc: u8) -> u64 {
+    choose(13, bc as u64) * choose(13 - bc as u64, hc as u64)
+}
+
+/// 把一个 (b_mask, h_mask) 对映射成稠密整数 ∈ `[0, mask_pair_count(bc, hc))`。
+/// 与 `each_mask_pair_at_least(.., min=0)` 的枚举顺序一致（b_mask colex 升序，
+/// 内层 h_mask 在剩余位上 colex 升序）。
+fn mask_pair_rank(bc: u8, hc: u8, b_mask: u16, h_mask: u16) -> u64 {
+    let b_rank = colex_rank(b_mask);
+    let mapped_h = compress_mask(h_mask, b_mask);
+    let h_rank = colex_rank(mapped_h);
+    b_rank * choose(13 - bc as u64, hc as u64) + h_rank
+}
+
+/// `mask_pair_rank` 的逆。
+fn mask_pair_unrank(bc: u8, hc: u8, rank: u64) -> (u16, u16) {
+    let h_space = choose(13 - bc as u64, hc as u64);
+    let b_rank = rank / h_space;
+    let h_rank = rank % h_space;
+    let b_mask = colex_unrank(b_rank, bc as u32, 13);
+    let mapped_h = colex_unrank(h_rank, hc as u32, 13 - bc as u32);
+    let h_mask = expand_mask(mapped_h, b_mask);
+    (b_mask, h_mask)
+}
+
+/// 一段非降序列 `ranks`（各 ∈ `[0, m)`）的稠密 rank ∈ `[0, C(m + k - 1, k))`。
+/// 用 `c_i = ranks[i] + i` 把非降序列变成严格升序的 k-子集（值域 `[0, m+k-1)`），
+/// 再取其 colex rank = Σ_i C(c_i, i+1)。`ranks` 必须非降。
+fn multiset_rank(ranks: &[u64], _m: u64) -> u64 {
+    let mut rank: u64 = 0;
+    for (i, &r) in ranks.iter().enumerate() {
+        let c = r + i as u64;
+        rank += choose(c, i as u64 + 1);
+    }
+    rank
+}
+
+/// `multiset_rank` 的逆：给定 rank / 序列长度 `k` / 值域上界 `m`，恢复非降序列。
+fn multiset_unrank(rank: u64, k: u32, m: u64) -> [u64; 4] {
+    let mut cs = [0u64; 4]; // c_i（1-based 系数存到 cs[i-1]）
+    let n = m + k as u64 - 1; // 严格升序子集的值域上界（exclusive）
+    let mut rem = rank;
+    let mut i = k;
+    while i >= 1 {
+        // 上界：i==k 用 n，否则用更高位系数（保证严格递减）。
+        let upper = if i == k { n } else { cs[i as usize] };
+        let mut cand = (i - 1) as u64;
+        while cand + 1 < upper && choose(cand + 1, i as u64) <= rem {
+            cand += 1;
+        }
+        rem -= choose(cand, i as u64);
+        cs[(i - 1) as usize] = cand;
+        i -= 1;
+    }
+    // r_i = c_i - i
+    let mut out = [0u64; 4];
+    for j in 0..k as usize {
+        out[j] = cs[j] - j as u64;
+    }
+    out
+}
+
+// ============================================================================
+// 微型 shape 偏移表（shape_key → 起始 offset + 容量）
+// ============================================================================
+
+/// 把 shape（4 个 (b_count, h_count)）打包成 u32 key：每 slot 5 bit
+/// `[b_count(3) | h_count(2)]`，slot 0 在高位。u32 数值序 == shape 字典序。
+fn pack_shape_key(shape: &[(u8, u8); 4]) -> u32 {
+    let mut key: u32 = 0;
+    for (i, &(bc, hc)) in shape.iter().enumerate() {
+        let pack: u32 = ((bc as u32) << 2) | (hc as u32);
+        let shift = 5 * (3 - i as u32);
+        key |= pack << shift;
+    }
+    key
+}
+
+fn unpack_shape_key(key: u32) -> [(u8, u8); 4] {
+    let mut shape = [(0u8, 0u8); 4];
+    for (i, slot) in shape.iter_mut().enumerate() {
+        let shift = 5 * (3 - i as u32);
+        let chunk = (key >> shift) & 0x1F;
+        *slot = (((chunk >> 2) & 0x7) as u8, (chunk & 0x3) as u8);
+    }
+    shape
+}
+
+/// 把 shape 切成 group（连续相同 (b_count, h_count) 的 suit 段）：
+/// 返回 `[(b_count, h_count, start, end_exclusive); 4]` + group 数。
+fn group_runs(shape: &[(u8, u8); 4]) -> ([(u8, u8, u8, u8); 4], usize) {
+    let mut groups = [(0u8, 0u8, 0u8, 0u8); 4];
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i < 4 {
+        let mut j = i + 1;
+        while j < 4 && shape[j] == shape[i] {
+            j += 1;
+        }
+        groups[n] = (shape[i].0, shape[i].1, i as u8, j as u8);
+        n += 1;
+        i = j;
+    }
+    (groups, n)
+}
+
+/// 一个 shape 的容量 = Π_group C(mask_pair_count + group_size - 1, group_size)。
+fn shape_size(shape: &[(u8, u8); 4]) -> u64 {
+    let (groups, n) = group_runs(shape);
+    let mut size: u64 = 1;
+    for &(bc, hc, start, end) in &groups[..n] {
+        let k = (end - start) as u64;
+        size *= choose(mask_pair_count(bc, hc) + k - 1, k);
+    }
+    size
+}
+
+static FLOP_SHAPES: OnceLock<Vec<(u32, u32, u32)>> = OnceLock::new();
+static TURN_SHAPES: OnceLock<Vec<(u32, u32, u32)>> = OnceLock::new();
+static RIVER_SHAPES: OnceLock<Vec<(u32, u32, u32)>> = OnceLock::new();
+
+/// 该街的微型 shape 表，元素 `(shape_key, shape_offset, shape_size)` 按 shape_key
+/// 升序（= 字典序），offset 为前缀和。lazy build，几百条目 / build < 1 ms。
+fn shape_table(street: StreetTag) -> &'static [(u32, u32, u32)] {
     match street {
         StreetTag::Preflop => {
-            panic!("canonical_enum::lazy_table called on Preflop; use canonical_hole_id")
+            panic!("canonical_enum::shape_table called on Preflop; use canonical_hole_id")
         }
-        StreetTag::Flop => FLOP_TABLE.get_or_init(|| build_sorted_table(StreetTag::Flop)),
-        StreetTag::Turn => TURN_TABLE.get_or_init(|| build_sorted_table(StreetTag::Turn)),
-        StreetTag::River => RIVER_TABLE.get_or_init(|| build_sorted_table(StreetTag::River)),
+        StreetTag::Flop => {
+            FLOP_SHAPES.get_or_init(|| build_shape_table(3, 2, N_CANONICAL_OBSERVATION_FLOP))
+        }
+        StreetTag::Turn => {
+            TURN_SHAPES.get_or_init(|| build_shape_table(4, 2, N_CANONICAL_OBSERVATION_TURN))
+        }
+        StreetTag::River => {
+            RIVER_SHAPES.get_or_init(|| build_shape_table(5, 2, N_CANONICAL_OBSERVATION_RIVER))
+        }
     }
     .as_slice()
 }
+
+fn build_shape_table(board_size: u8, hole_size: u8, expected_n: u32) -> Vec<(u32, u32, u32)> {
+    let mut shapes: Vec<(u32, u64)> = Vec::new();
+    let mut shape = [(0u8, 0u8); 4];
+    enumerate_shapes(
+        &mut shape,
+        0,
+        board_size,
+        hole_size,
+        (0, 0),
+        &mut |s: &[(u8, u8); 4]| {
+            shapes.push((pack_shape_key(s), shape_size(s)));
+        },
+    );
+    shapes.sort_unstable_by_key(|x| x.0);
+    debug_assert!(
+        shapes.windows(2).all(|w| w[0].0 < w[1].0),
+        "canonical_enum: 重复 shape_key（enumerate_shapes 产出重复 shape）"
+    );
+    let mut out: Vec<(u32, u32, u32)> = Vec::with_capacity(shapes.len());
+    let mut offset: u64 = 0;
+    for (key, size) in shapes {
+        out.push((key, offset as u32, size as u32));
+        offset += size;
+    }
+    assert_eq!(
+        offset, expected_n as u64,
+        "canonical_enum: shape 表容量之和 {offset} != N {expected_n}"
+    );
+    out
+}
+
+// ============================================================================
+// canonical_observation_id：direct combinatorial rank（shape-major）
+// ============================================================================
 
 /// 计算 (board, hole) 在 `street` 街上的 canonical observation id ∈ `[0, N)`。
 ///
 /// 仅对 `StreetTag::{Flop, Turn, River}` 有效；preflop 路径 panic（caller 应改用
 /// [`crate::abstraction::preflop::canonical_hole_id`]）。
 ///
-/// 算法：pack canonical form 到 u128 sort key → binary search 在 lazy 构造的
-/// sorted `Vec<u128>` 中 → 返回 index。
+/// 算法（shape-major direct rank）：canonical sorted sigs → shape → 从微型 shape
+/// 表查 `shape_offset` → 逐 group 算多重集 rank、按混合进制拼成 shape 内 rank →
+/// `shape_offset + shape 内 rank`。全程 O(1) 公式 + 一次微型表 binary search。
 ///
-/// 复杂度：`O(log N)` per call after lazy build；build cost 在第一次 call 时
-/// 摊销（flop ~30 ms / turn ~2 s / river ~3 min on 1-CPU host）。
+/// **注意**：本 id 编号与 2026-05 之前的「整表 sort + binary search」方案 **不同**
+/// （旧方案按 packed u128 数值序）。详见模块头 §算法 step 3。
 pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 2]) -> u32 {
     if matches!(street, StreetTag::Preflop) {
         panic!(
@@ -210,15 +459,50 @@ pub fn canonical_observation_id(street: StreetTag, board: &[Card], hole: [Card; 
         board.len()
     );
 
-    let key = pack_canonical_form_key(board, &hole);
-    let table = lazy_table(street);
-    match table.binary_search(&key) {
-        Ok(idx) => idx as u32,
-        Err(_) => panic!(
-            "canonical_observation_id: canonical form key 0x{key:032x} not found in lazy \
-             table (street {street:?}); enumeration bug — please file issue"
-        ),
+    let sigs = canonical_sigs(board, &hole);
+    let shape: [(u8, u8); 4] = [
+        (sigs[0].0, sigs[0].1),
+        (sigs[1].0, sigs[1].1),
+        (sigs[2].0, sigs[2].1),
+        (sigs[3].0, sigs[3].1),
+    ];
+    let table = shape_table(street);
+    let shape_key = pack_shape_key(&shape);
+    let idx = table
+        .binary_search_by_key(&shape_key, |e| e.0)
+        .unwrap_or_else(|_| {
+            panic!(
+                "canonical_observation_id: shape_key 0x{shape_key:05x} not in shape table \
+                 (street {street:?}); enumeration bug"
+            )
+        });
+    let offset = table[idx].1 as u64;
+
+    // shape 内 rank：逐 group 多重集 rank，group 0 最高位混合进制。
+    let (groups, ng) = group_runs(&shape);
+    let mut local: u64 = 0;
+    for &(bc, hc, start, end) in &groups[..ng] {
+        let k = (end - start) as usize;
+        let m = mask_pair_count(bc, hc);
+        let mut ranks = [0u64; 4];
+        for (j, slot) in (start as usize..end as usize).enumerate() {
+            ranks[j] = mask_pair_rank(bc, hc, sigs[slot].2, sigs[slot].3);
+        }
+        debug_assert!(
+            ranks[..k].windows(2).all(|w| w[0] <= w[1]),
+            "canonical_observation_id: group mask ranks 非降假设被破坏"
+        );
+        let g_size = choose(m + k as u64 - 1, k as u64);
+        let g_rank = multiset_rank(&ranks[..k], m);
+        local = local * g_size + g_rank;
     }
+
+    let id = offset + local;
+    debug_assert!(
+        id < n_canonical_observation(street) as u64,
+        "canonical_observation_id: id {id} >= N for {street:?}"
+    );
+    id as u32
 }
 
 // ============================================================================
@@ -247,13 +531,12 @@ pub fn nth_canonical_form(street: StreetTag, id: u32) -> (Vec<Card>, [Card; 2]) 
              via canonical_hole_id (D-218-rev2 §2)"
         );
     }
-    let table = lazy_table(street);
-    let n = table.len();
+    let table = shape_table(street);
+    let total: u64 = table.last().map(|e| e.1 as u64 + e.2 as u64).unwrap_or(0);
     assert!(
-        (id as usize) < n,
-        "nth_canonical_form: id {id} >= N_canonical_observation = {n} for street {street:?}"
+        (id as u64) < total,
+        "nth_canonical_form: id {id} >= N_canonical_observation = {total} for street {street:?}"
     );
-    let key: u128 = table[id as usize];
     let board_size: usize = match street {
         StreetTag::Flop => 3,
         StreetTag::Turn => 4,
@@ -261,40 +544,49 @@ pub fn nth_canonical_form(street: StreetTag, id: u32) -> (Vec<Card>, [Card; 2]) 
         StreetTag::Preflop => unreachable!(),
     };
 
+    // 1. 定位 shape：offset 单调递增（按 shape_key 排序的前缀和），找最后一个
+    //    offset <= id 的条目。
+    let pos = table.partition_point(|e| (e.1 as u64) <= id as u64);
+    debug_assert!(pos >= 1, "nth_canonical_form: 第一个 shape offset 必为 0");
+    let (shape_key, offset, _size) = table[pos - 1];
+    let shape = unpack_shape_key(shape_key);
+    let (groups, ng) = group_runs(&shape);
+
+    // 2. 每个 group 的容量（混合进制 radix），group 0 最高位。
+    let mut sizes = [1u64; 4];
+    for (g, &(bc, hc, start, end)) in groups[..ng].iter().enumerate() {
+        let k = (end - start) as u64;
+        sizes[g] = choose(mask_pair_count(bc, hc) + k - 1, k);
+    }
+
+    // 3. 逐 group 反解多重集 rank → 每个 suit 的 (b_mask, h_mask)。
+    let mut local = id as u64 - offset as u64;
+    let mut sigs: [(u8, u8, u16, u16); 4] = [(0, 0, 0, 0); 4];
+    for (g, &(bc, hc, start, end)) in groups[..ng].iter().enumerate() {
+        let k = (end - start) as usize;
+        let m = mask_pair_count(bc, hc);
+        let weight: u64 = sizes[g + 1..ng].iter().product();
+        let g_rank = local / weight;
+        local %= weight;
+        let rs = multiset_unrank(g_rank, k as u32, m);
+        for (j, slot) in (start as usize..end as usize).enumerate() {
+            let (bm, hm) = mask_pair_unrank(bc, hc, rs[j]);
+            sigs[slot] = (bc, hc, bm, hm);
+        }
+    }
+
+    // 4. canonical slot 0..3 直接映射到真实 suit 0..3，重建 (board, hole)。
     let mut board: Vec<Card> = Vec::with_capacity(board_size);
     let mut hole_buf: Vec<Card> = Vec::with_capacity(2);
-
-    // 4 个 canonical suit slot 按 MSB→LSB 在 u128 中排布（slot 0 在 bit 96..128，
-    // slot 3 在 bit 0..32）。每 slot 32-bit 按 [unused(1) | b_count(3) | h_count(2)
-    // | b_mask(13) | h_mask(13)] 高到低排布。
-    for slot in 0u32..4 {
-        let shift: u32 = 32 * (3 - slot);
-        let chunk: u32 = ((key >> shift) & 0xFFFF_FFFF) as u32;
-        let b_count: u8 = ((chunk >> 28) & 0x7) as u8;
-        let h_count: u8 = ((chunk >> 26) & 0x3) as u8;
-        let b_mask: u16 = ((chunk >> 13) & 0x1FFF) as u16;
-        let h_mask: u16 = (chunk & 0x1FFF) as u16;
-        debug_assert_eq!(
-            b_mask.count_ones() as u8,
-            b_count,
-            "nth_canonical_form: slot {slot} b_count/b_mask mismatch"
-        );
-        debug_assert_eq!(
-            h_mask.count_ones() as u8,
-            h_count,
-            "nth_canonical_form: slot {slot} h_count/h_mask mismatch"
-        );
-
-        // canonical slot 编号 0..3 直接映射到真实 suit 0..3。
+    for (slot, &(_bc, _hc, b_mask, h_mask)) in sigs.iter().enumerate() {
         let suit_u8: u8 = slot as u8;
         for rank in 0u8..13 {
             if (b_mask >> rank) & 1 == 1 {
-                let card_u8: u8 = rank * 4 + suit_u8;
-                board.push(Card::from_u8(card_u8).expect("rank<13 + suit<4 → card<52"));
+                board.push(Card::from_u8(rank * 4 + suit_u8).expect("rank<13 + suit<4 → card<52"));
             }
             if (h_mask >> rank) & 1 == 1 {
-                let card_u8: u8 = rank * 4 + suit_u8;
-                hole_buf.push(Card::from_u8(card_u8).expect("rank<13 + suit<4 → card<52"));
+                hole_buf
+                    .push(Card::from_u8(rank * 4 + suit_u8).expect("rank<13 + suit<4 → card<52"));
             }
         }
     }
@@ -323,41 +615,8 @@ pub fn nth_canonical_form(street: StreetTag, id: u32) -> (Vec<Card>, [Card; 2]) 
 }
 
 // ============================================================================
-// 枚举 + 构表
+// 枚举（喂微型 shape 表 + 自校验测试；不再常驻整表）
 // ============================================================================
-
-/// 构造 street 的 sorted canonical form `Vec<u128>`（一次性 build，OnceLock cache）。
-fn build_sorted_table(street: StreetTag) -> Vec<u128> {
-    let expected_n = match street {
-        StreetTag::Preflop => unreachable!(),
-        StreetTag::Flop => N_CANONICAL_OBSERVATION_FLOP as usize,
-        StreetTag::Turn => N_CANONICAL_OBSERVATION_TURN as usize,
-        StreetTag::River => N_CANONICAL_OBSERVATION_RIVER as usize,
-    };
-    let board_size: u8 = match street {
-        StreetTag::Preflop => unreachable!(),
-        StreetTag::Flop => 3,
-        StreetTag::Turn => 4,
-        StreetTag::River => 5,
-    };
-
-    let mut table: Vec<u128> = Vec::with_capacity(expected_n);
-    enumerate_canonical_forms(board_size, 2, &mut |key| {
-        table.push(key);
-    });
-    table.sort_unstable();
-    debug_assert!(
-        table.windows(2).all(|w| w[0] < w[1]),
-        "canonical_enum: enumerate_canonical_forms 产出重复 canonical key for {street:?}"
-    );
-    assert_eq!(
-        table.len(),
-        expected_n,
-        "canonical_enum: street {street:?} 枚举得到 {} 条，期望 {expected_n}",
-        table.len()
-    );
-    table
-}
 
 /// 递归枚举 (board, hole) 全部 canonical forms，每个 form 调一次 `callback`。
 ///
@@ -371,6 +630,7 @@ fn build_sorted_table(street: StreetTag) -> Vec<u128> {
 ///    multiset 顺序 enumerate (b_mask, h_mask) 配置——shape 内连续相同
 ///    `(b_count, h_count)` 的 suit 组成 group，group 内 (b_mask, h_mask) 必须
 ///    canonical-sorted。详见 [`enumerate_mask_assignments_for_shape`]。
+#[cfg(test)]
 fn enumerate_canonical_forms<F: FnMut(u128)>(board_size: u8, hole_size: u8, callback: &mut F) {
     let mut shape = [(0u8, 0u8); 4];
     enumerate_shapes(
@@ -418,6 +678,7 @@ fn enumerate_shapes<F: FnMut(&[(u8, u8); 4])>(
 ///
 /// 处理 multiset 约束：shape 内连续相同 (b_count, h_count) 的 suit 组成 group，
 /// group 内 (b_mask, h_mask) 必须 canonical-sorted（多重集 enumeration）。
+#[cfg(test)]
 fn enumerate_mask_assignments_for_shape<F: FnMut(u128)>(shape: &[(u8, u8); 4], callback: &mut F) {
     // 识别 group：每个 group 是 shape 中连续相同 (b_count, h_count) 的最长子段。
     let mut groups: [(u8, u8, u8, u8); 4] = [(0, 0, 0, 0); 4]; // (b_count, h_count, group_start, group_end_exclusive)
@@ -439,6 +700,7 @@ fn enumerate_mask_assignments_for_shape<F: FnMut(u128)>(shape: &[(u8, u8); 4], c
 }
 
 /// 递归遍历每个 group，group 内 enumerate canonical-sorted mask multiset。
+#[cfg(test)]
 fn enumerate_groups<F: FnMut(u128)>(
     groups: &[(u8, u8, u8, u8)],
     group_idx: usize,
@@ -447,16 +709,7 @@ fn enumerate_groups<F: FnMut(u128)>(
 ) {
     if group_idx == groups.len() {
         // 全部 4 suit 已赋值，pack 输出 key
-        let mut key: u128 = 0;
-        for (i, sig) in sigs.iter().enumerate() {
-            let pack: u128 = ((sig.0 as u128) << 28)
-                | ((sig.1 as u128) << 26)
-                | ((sig.2 as u128) << 13)
-                | (sig.3 as u128);
-            let shift = 32 * (3 - i);
-            key |= pack << shift;
-        }
-        callback(key);
+        callback(pack_sigs(sigs));
         return;
     }
 
@@ -480,6 +733,7 @@ fn enumerate_groups<F: FnMut(u128)>(
 /// `group_size`。`min_mask` 是 group 内前一个 suit 的 (b_mask, h_mask)；当前 suit
 /// 的 mask 必须 ≥ `min_mask` 字典序。
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn enumerate_mask_multiset_in_group<F: FnMut(&mut [(u8, u8, u16, u16); 4])>(
     b_count: u8,
     h_count: u8,
@@ -518,6 +772,7 @@ fn enumerate_mask_multiset_in_group<F: FnMut(&mut [(u8, u8, u16, u16); 4])>(
 /// - `h_mask.count_ones() == h_count`，bits in `0..13`
 /// - `b_mask & h_mask == 0`（per-suit 内 board / hole 用不同 rank）
 /// - `(b_mask, h_mask) >= min_mask` lex
+#[cfg(test)]
 fn each_mask_pair_at_least<F: FnMut(u16, u16)>(
     b_count: u8,
     h_count: u8,
@@ -536,6 +791,7 @@ fn each_mask_pair_at_least<F: FnMut(u16, u16)>(
 
 /// Enumerate `u16` masks `m` with `m.count_ones() == k`，bits in `0..n`，
 /// `m >= min`，按字典序非降回调（i.e. 数值非降，因为 u16 cmp == bit lex cmp）。
+#[cfg(test)]
 fn each_combination_with_min<F: FnMut(u16)>(n: u8, k: u8, min: u16, mut callback: F) {
     if k == 0 {
         if min == 0 {
@@ -578,6 +834,7 @@ fn each_combination_with_min<F: FnMut(u16)>(n: u8, k: u8, min: u16, mut callback
 /// Enumerate `u16` masks `m` with `m.count_ones() == k`, bits in `0..n`, and
 /// `m & excluded == 0`, `m >= min`。当 `excluded` 占用部分 rank 位时，本函数自动
 /// 跳过含 excluded bit 的 mask。
+#[cfg(test)]
 fn each_combination_subset_with_min<F: FnMut(u16)>(
     n: u8,
     k: u8,
@@ -609,6 +866,7 @@ fn each_combination_subset_with_min<F: FnMut(u16)>(
 
 /// Gosper's hack：给定 `x` 是 k-bit mask 中的一个，返回下一个 k-bit mask（lex
 /// 次序）；如已是最大 k-bit mask 则返回 0。
+#[cfg(test)]
 fn next_combination_or_zero(x: u32) -> u32 {
     if x == 0 {
         return 0;
@@ -811,5 +1069,152 @@ mod tests {
             "river canonical form count must match N_CANONICAL_OBSERVATION_RIVER = {}",
             N_CANONICAL_OBSERVATION_RIVER
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // direct combinatorial rank 原语自校验（2026-05 shape-major 重写）
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn choose_basic_values() {
+        assert_eq!(choose(13, 0), 1);
+        assert_eq!(choose(13, 1), 13);
+        assert_eq!(choose(13, 2), 78);
+        assert_eq!(choose(13, 3), 286);
+        assert_eq!(choose(5, 3), 10);
+        assert_eq!(choose(3, 5), 0);
+        assert_eq!(choose(0, 0), 1);
+    }
+
+    #[test]
+    fn colex_rank_matches_gosper_index_and_round_trips() {
+        for k in 0u32..=5 {
+            let total = choose(13, k as u64);
+            // colex_rank == 升序枚举下标；unrank 反解一致。
+            let mut expect = 0u64;
+            let mut prev: Option<u16> = None;
+            each_combination_with_min(13, k as u8, 0, |m| {
+                assert_eq!(colex_rank(m), expect, "colex_rank == enum index (k={k})");
+                assert_eq!(colex_unrank(expect, k, 13), m, "colex_unrank (k={k})");
+                if let Some(p) = prev {
+                    assert!(m > p, "Gosper 升序");
+                }
+                prev = Some(m);
+                expect += 1;
+            });
+            assert_eq!(expect, total, "C(13,{k}) 枚举数");
+        }
+    }
+
+    #[test]
+    fn mask_pair_rank_round_trips_exhaustively() {
+        for (bc, hc) in [
+            (0u8, 0u8),
+            (0, 1),
+            (0, 2),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (2, 0),
+            (2, 1),
+            (2, 2),
+            (3, 2),
+            (5, 0),
+        ] {
+            let m = mask_pair_count(bc, hc);
+            for r in 0..m {
+                let (bm, hm) = mask_pair_unrank(bc, hc, r);
+                assert_eq!(bm.count_ones() as u8, bc, "b_count ({bc},{hc}) r={r}");
+                assert_eq!(hm.count_ones() as u8, hc, "h_count ({bc},{hc}) r={r}");
+                assert_eq!(bm & hm, 0, "board/hole disjoint ({bc},{hc}) r={r}");
+                assert!(bm < (1 << 13) && hm < (1 << 13));
+                assert_eq!(
+                    mask_pair_rank(bc, hc, bm, hm),
+                    r,
+                    "mask_pair round-trip ({bc},{hc}) r={r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn multiset_rank_round_trips() {
+        for m in [1u64, 2, 3, 13, 78] {
+            for k in 1u32..=3 {
+                let total = choose(m + k as u64 - 1, k as u64);
+                for r in 0..total {
+                    let rs = multiset_unrank(r, k, m);
+                    for j in 0..k as usize {
+                        assert!(rs[j] < m, "value in range m={m} k={k} r={r}");
+                        if j > 0 {
+                            assert!(rs[j] >= rs[j - 1], "non-decreasing m={m} k={k} r={r}");
+                        }
+                    }
+                    assert_eq!(
+                        multiset_rank(&rs[..k as usize], m),
+                        r,
+                        "multiset round-trip m={m} k={k} r={r}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shape_table_flop_sums_to_n() {
+        let t = shape_table(StreetTag::Flop);
+        let total: u64 = t.last().map(|e| e.1 as u64 + e.2 as u64).unwrap();
+        assert_eq!(total, N_CANONICAL_OBSERVATION_FLOP as u64);
+        for w in t.windows(2) {
+            assert!(w[0].0 < w[1].0, "shape_key 严格升序");
+            assert!(w[0].1 < w[1].1, "offset 严格升序");
+        }
+    }
+
+    #[test]
+    fn shape_key_pack_unpack_round_trip() {
+        for &shape in &[
+            [(0u8, 0u8), (0, 1), (1, 0), (2, 1)],
+            [(0, 2), (1, 0), (1, 0), (1, 0)],
+            [(0, 0), (0, 0), (0, 0), (5, 2)],
+        ] {
+            assert_eq!(unpack_shape_key(pack_shape_key(&shape)), shape);
+        }
+    }
+
+    /// 独立 ground truth：用 `enumerate_canonical_forms`（与 id 公式无关的代码路径）
+    /// 枚举全部 flop canonical 等价类，decode 出 representative (board, hole)，
+    /// 经新 `canonical_observation_id` 算 id，断言这些 id 恰好填满 `[0, N)` 无重无漏
+    /// ——即新 shape-major 编号是双射。
+    #[test]
+    #[ignore = "release/--ignored opt-in（flop 1.28M 枚举）"]
+    fn flop_new_id_is_bijection_via_enumeration() {
+        let n = N_CANONICAL_OBSERVATION_FLOP as usize;
+        let mut seen = vec![false; n];
+        enumerate_canonical_forms(3, 2, &mut |key| {
+            let mut board: Vec<Card> = Vec::with_capacity(3);
+            let mut hole: Vec<Card> = Vec::with_capacity(2);
+            for slot in 0u32..4 {
+                let shift = 32 * (3 - slot);
+                let chunk = ((key >> shift) & 0xFFFF_FFFF) as u32;
+                let b_mask = ((chunk >> 13) & 0x1FFF) as u16;
+                let h_mask = (chunk & 0x1FFF) as u16;
+                for rank in 0u8..13 {
+                    if (b_mask >> rank) & 1 == 1 {
+                        board.push(Card::from_u8(rank * 4 + slot as u8).unwrap());
+                    }
+                    if (h_mask >> rank) & 1 == 1 {
+                        hole.push(Card::from_u8(rank * 4 + slot as u8).unwrap());
+                    }
+                }
+            }
+            assert_eq!(board.len(), 3);
+            assert_eq!(hole.len(), 2);
+            let id = canonical_observation_id(StreetTag::Flop, &board, [hole[0], hole[1]]);
+            assert!((id as usize) < n, "id {id} 越界");
+            assert!(!seen[id as usize], "重复 id {id}");
+            seen[id as usize] = true;
+        });
+        assert!(seen.iter().all(|&b| b), "存在未覆盖 id → 非双射");
     }
 }

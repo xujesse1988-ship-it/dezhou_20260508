@@ -1,8 +1,10 @@
-//! Bucket lookup table（schema v3 / feature_set_id = 2 / 16-dim hist + OCHS）。
+//! Bucket lookup table（schema v4 / feature_set_id = 2 / 16-dim hist + OCHS）。
 //!
 //! `BucketConfig` + `BucketTable` + `BucketTableError` + `StreetFeaturesV3`。
 //!
-//! schema v3 严格对应 `docs/bucket_feature_design.md` §6.3 + §7：
+//! v4 与 v3 二进制 layout 完全相同；唯一区别是 lookup 段按 `canonical_enum` 的
+//! shape-major direct combinatorial rank 编号 canonical observation id（2026-05
+//! 重写）。feature 语义沿用 v3，严格对应 `docs/bucket_feature_design.md` §6.3 + §7：
 //!
 //! - feature 语义：flop / turn = `equity_hist_8 || OCHS_8` (16 维)；river = `OCHS_16` (16 维)
 //! - OCHS warmup 走 postflop-histogram 路径（`docs/bucket_feature_design.md` §2.4）
@@ -12,8 +14,9 @@
 //! - 文件 trailer = BLAKE3(file[..len-32])
 //! - header 0x58 / 0x78 / 0x98 嵌入 features_<street>.bin 的 BLAKE3 形成可验证 hash chain
 //!
-//! schema v2 (9-dim EHS² + OCHS_8) 已退出；reader 拒绝 (schema_version, feature_set_id)
-//! ≠ (3, 2) 的 artifact（参 `docs/bucket_feature_design.md` §7）。
+//! schema v2 (9-dim EHS² + OCHS_8) / v3（旧 canonical id 编号）均已退出；reader
+//! 拒绝 (schema_version, feature_set_id) ≠ (4, 2) 的 artifact（参
+//! `docs/bucket_feature_design.md` §7）。
 
 use std::fs::File;
 use std::io::Write;
@@ -79,9 +82,15 @@ impl BucketConfig {
 /// `magic: [u8; 8] = b"PLBKT\0\0\0"`。
 pub const BUCKET_TABLE_MAGIC: [u8; 8] = *b"PLBKT\0\0\0";
 
-/// schema 版本。v3 = 16 维 hist + OCHS feature 集，header 含 features_<street>.bin
-/// BLAKE3 hash chain（参 `docs/bucket_feature_design.md` §7）。
-pub const BUCKET_TABLE_SCHEMA_VERSION: u32 = 3;
+/// schema 版本。
+///
+/// - v3 = 16 维 hist + OCHS feature 集，header 含 features_<street>.bin BLAKE3
+///   hash chain（参 `docs/bucket_feature_design.md` §7）。
+/// - v4（2026-05）= 二进制 layout 与 v3 完全相同，但 lookup 段的 canonical
+///   observation id 编号改为 `canonical_enum` 的 shape-major direct combinatorial
+///   rank。v3 表 lookup 行按旧「整表 sort」编号建，行↔等价类对应关系已变，语义不
+///   兼容——reader 拒绝 v3 表（强制重算），避免静默读错 bucket。
+pub const BUCKET_TABLE_SCHEMA_VERSION: u32 = 4;
 
 /// 默认 feature_set_id。v3 schema 仅支持 `feature_set_id = 2`（16 维 hist + OCHS）。
 /// 历史 `feature_set_id = 1`（9 维 EHS² + OCHS_8）已与 v2 schema 一同退出。
@@ -156,7 +165,7 @@ pub struct StreetFeaturesV3 {
 /// ```text
 /// // ===== header (184 bytes = 0xB8, 8-byte aligned) =====
 /// offset 0x00: magic: [u8; 8] = b"PLBKT\0\0\0"
-/// offset 0x08: schema_version: u32 LE = 3
+/// offset 0x08: schema_version: u32 LE = 4
 /// offset 0x0C: feature_set_id: u32 LE = 2 (16 dim hist + OCHS)
 /// offset 0x10: bucket_count_flop:  u32 LE
 /// offset 0x14: bucket_count_turn:  u32 LE
@@ -187,7 +196,7 @@ pub struct StreetFeaturesV3 {
 /// ```
 ///
 /// reader 按 header 偏移表定位变长段，任何 offset 越界 / 不递增 / 不 8-byte 对齐 /
-/// 全文件 BLAKE3 不匹配 / `(schema_version, feature_set_id) ≠ (3, 2)` 均视为
+/// 全文件 BLAKE3 不匹配 / `(schema_version, feature_set_id) ≠ (4, 2)` 均视为
 /// `BucketTableError::Corrupted` / `SchemaMismatch` / `FeatureSetMismatch`。
 pub struct BucketTable {
     config: BucketConfig,
