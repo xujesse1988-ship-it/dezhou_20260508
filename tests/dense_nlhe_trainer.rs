@@ -41,7 +41,7 @@ use std::sync::Arc;
 use poker::training::nlhe::SimplifiedNlheGame;
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{EsMccfrTrainer, Trainer};
-use poker::{BucketTable, ChaCha20Rng, InfoSetId};
+use poker::{BucketTable, ChaCha20Rng, InfoSetId, RngSource};
 
 /// 候选 v3 artifact 路径（相对 repo root）。优先真实存在的 `schemav3`。
 const V3_ARTIFACT_CANDIDATES: &[&str] = &[
@@ -153,4 +153,223 @@ fn dense_es_mccfr_byte_equal_hashmap_lcfr() {
     };
     let n = run_scenario(&bucket_table, Some(1_000), 5_000);
     eprintln!("[dense byte-equal] LCFR(period=1000): {n} infoset byte-equal ✓");
+}
+
+// ===========================================================================
+// Phase 3：并行 step_parallel byte-equal 对照
+// ===========================================================================
+
+/// 建 `n` 个独立 `ChaCha20Rng`（per-tid nonce），同 `base` 下两次调用产同 pool
+/// （让 dense / HashMap 两路径吃完全相同的 randomness）。
+fn build_rng_pool(base: u64, n: usize) -> Vec<Box<dyn RngSource>> {
+    (0..n as u64)
+        .map(|tid| {
+            let seeded = base.wrapping_add(0xDEAD_BEEF_u64.wrapping_mul(tid + 1));
+            Box::new(ChaCha20Rng::from_seed(seeded)) as Box<dyn RngSource>
+        })
+        .collect()
+}
+
+/// dense `step_parallel` 与 HashMap `EsMccfrTrainer::step_parallel` 在**同 rng pool /
+/// 同 n_threads / 同 batch_per_worker** 下逐位相等（Phase 3 §并行语义 最强对照）。
+///
+/// 两路径结构一一对应：worker 读 pre-dispatch shared regret snapshot → 同 σ → 同
+/// trajectory（同 rng）→ 同 delta；merge 按 tid 升序 × push 顺序 → 每个 cell 的 f64
+/// 加法序列完全一致 → strategy snapshot byte-equal。**峰值 ~7 GiB**（dense + HashMap
+/// 两套表并存），需 ≥ ~10 GiB 机器。
+#[test]
+#[ignore = "dense + HashMap 并行两套表并存峰值 ~7 GiB，需 ≥ ~10 GiB 机器；release --ignored 单独跑"]
+fn dense_step_parallel_byte_equal_hashmap() {
+    let Some(bucket_table) = load_bucket_table_or_skip() else {
+        return;
+    };
+    let game_dense = SimplifiedNlheGame::new(Arc::clone(&bucket_table)).expect("dense game");
+    let game_hm = SimplifiedNlheGame::new(Arc::clone(&bucket_table)).expect("hashmap game");
+    let mut dense = DenseNlheEsMccfrTrainer::new(game_dense, MASTER_SEED);
+    let mut hm: EsMccfrTrainer<SimplifiedNlheGame> = EsMccfrTrainer::new(game_hm, MASTER_SEED);
+
+    let n_threads = 4;
+    let batch_per_worker = 8;
+    let n_calls = 60; // 4 × 8 × 60 = 1920 update
+    let mut pool_dense = build_rng_pool(RNG_SEED, n_threads);
+    let mut pool_hm = build_rng_pool(RNG_SEED, n_threads);
+    for _ in 0..n_calls {
+        dense
+            .step_parallel(&mut pool_dense, n_threads, batch_per_worker)
+            .expect("dense step_parallel");
+        hm.step_parallel(&mut pool_hm, n_threads, batch_per_worker)
+            .expect("hashmap step_parallel");
+    }
+    assert_eq!(dense.update_count(), hm.update_count());
+    assert_eq!(
+        dense.update_count(),
+        (n_threads * batch_per_worker * n_calls) as u64
+    );
+
+    let visited: Vec<InfoSetId> = hm.strategy_sum().inner().keys().copied().collect();
+    assert!(
+        visited.len() > 500,
+        "并行短跑仅访问 {} 个 infoset，样本太少",
+        visited.len()
+    );
+    for &info in &visited {
+        assert!(
+            bits_eq(&hm.average_strategy(&info), &dense.average_strategy(info)),
+            "parallel average_strategy byte mismatch @ info {:#x}",
+            info.raw()
+        );
+        assert!(
+            bits_eq(&hm.current_strategy(&info), &dense.current_strategy(info)),
+            "parallel current_strategy byte mismatch @ info {:#x}",
+            info.raw()
+        );
+    }
+    eprintln!(
+        "[dense parallel byte-equal] {} infoset byte-equal ✓（{} update）",
+        visited.len(),
+        dense.update_count()
+    );
+}
+
+// ===========================================================================
+// Phase 4：dense checkpoint v3 集成
+// ===========================================================================
+
+/// 唯一临时文件路径（同 checkpoint_round_trip.rs 风格，避免依赖 tempfile crate 在
+/// 集成 test crate 的可见性）。
+fn unique_temp_path(label: &str) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "poker_dense_ckpt_{label}_{}_{nanos}.bin",
+        std::process::id()
+    ));
+    p
+}
+
+fn cleanup(path: &PathBuf) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// dense save → load roundtrip：load 后 `update_count` + 所有已访问 infoset 的
+/// `average_strategy` / `current_strategy` 与原 trainer byte-equal。**LCFR 元数据**
+/// 也随 checkpoint 恢复（period=500，2000 update 跨 4 个 boundary）。
+///
+/// 用并行 HashMap lockstep 仅为**采集已访问 infoset key 集**（dense 表是扁平数组，
+/// 无 key 枚举入口）——Phase 2 已证 dense 与 HashMap 同 seed 访问同一批 infoset。
+/// 峰值 ~9 GiB（采集后 drop HashMap，再 load 第二个 dense）。
+#[test]
+#[ignore = "dense roundtrip：2 套 dense 表 + HashMap key 采集，峰值 ~9 GiB；release --ignored 单独跑"]
+fn dense_checkpoint_roundtrip_preserves_strategy() {
+    let Some(bucket_table) = load_bucket_table_or_skip() else {
+        return;
+    };
+    let updates = 2_000u64;
+    let lcfr_period = 500u64;
+
+    let game_dense = SimplifiedNlheGame::new(Arc::clone(&bucket_table)).expect("dense game");
+    let game_hm = SimplifiedNlheGame::new(Arc::clone(&bucket_table)).expect("hashmap game");
+    let mut dense =
+        DenseNlheEsMccfrTrainer::new(game_dense, MASTER_SEED).with_lcfr_period(lcfr_period);
+    let mut hm: EsMccfrTrainer<SimplifiedNlheGame> =
+        EsMccfrTrainer::new(game_hm, MASTER_SEED).with_lcfr_period(lcfr_period);
+    let mut rng_dense = ChaCha20Rng::from_seed(RNG_SEED);
+    let mut rng_hm = ChaCha20Rng::from_seed(RNG_SEED);
+    for _ in 0..updates {
+        dense.step(&mut rng_dense).expect("dense step");
+        hm.step(&mut rng_hm).expect("hashmap step");
+    }
+    // 采集 key 集后释放 HashMap（降峰值），保留 dense 做 save。
+    let visited: Vec<InfoSetId> = hm.strategy_sum().inner().keys().copied().collect();
+    assert!(visited.len() > 500, "仅访问 {} 个 infoset", visited.len());
+    drop(hm);
+
+    let path = unique_temp_path("roundtrip");
+    dense.save_checkpoint(&path).expect("dense save_checkpoint");
+
+    let game_load = SimplifiedNlheGame::new(Arc::clone(&bucket_table)).expect("load game");
+    let loaded =
+        DenseNlheEsMccfrTrainer::load_checkpoint(&path, game_load).expect("dense load_checkpoint");
+    assert_eq!(
+        loaded.update_count(),
+        dense.update_count(),
+        "update_count roundtrip"
+    );
+
+    for &info in &visited {
+        assert!(
+            bits_eq(
+                &dense.average_strategy(info),
+                &loaded.average_strategy(info)
+            ),
+            "roundtrip average_strategy byte mismatch @ info {:#x}",
+            info.raw()
+        );
+        assert!(
+            bits_eq(
+                &dense.current_strategy(info),
+                &loaded.current_strategy(info)
+            ),
+            "roundtrip current_strategy byte mismatch @ info {:#x}",
+            info.raw()
+        );
+    }
+    cleanup(&path);
+    eprintln!(
+        "[dense ckpt roundtrip] {} infoset byte-equal ✓（{} update, lcfr={lcfr_period}）",
+        visited.len(),
+        loaded.update_count()
+    );
+}
+
+/// 旧 HashMap v2 checkpoint → dense 单向加载 byte-equal：HashMap 跑 2000 update →
+/// `save_checkpoint`（v2）→ `from_hashmap_checkpoint` 填 dense → 对所有已访问 infoset
+/// `average_strategy` / `current_strategy` 与 HashMap trainer byte-equal。验证
+/// plan §Checkpoint 兼容策略「HashMap → dense」无损。
+#[test]
+#[ignore = "hashmap→dense：dense 满分配 4.62 GiB + HashMap ~2 GiB，需 ≥ ~8 GiB 机器；release --ignored 单独跑"]
+fn hashmap_checkpoint_to_dense_byte_equal() {
+    let Some(bucket_table) = load_bucket_table_or_skip() else {
+        return;
+    };
+    let game = SimplifiedNlheGame::new(Arc::clone(&bucket_table)).expect("hashmap game");
+    let mut hm: EsMccfrTrainer<SimplifiedNlheGame> = EsMccfrTrainer::new(game, MASTER_SEED);
+    let mut rng = ChaCha20Rng::from_seed(RNG_SEED);
+    for _ in 0..2_000 {
+        hm.step(&mut rng).expect("hashmap step");
+    }
+    let visited: Vec<InfoSetId> = hm.strategy_sum().inner().keys().copied().collect();
+    assert!(visited.len() > 500, "仅访问 {} 个 infoset", visited.len());
+
+    let path = unique_temp_path("hm_v2");
+    hm.save_checkpoint(&path)
+        .expect("HashMap v2 save_checkpoint");
+
+    let game_dense = SimplifiedNlheGame::new(Arc::clone(&bucket_table)).expect("dense game");
+    let dense = DenseNlheEsMccfrTrainer::from_hashmap_checkpoint(&path, game_dense)
+        .expect("from_hashmap_checkpoint");
+    assert_eq!(dense.update_count(), hm.update_count(), "update_count 一致");
+
+    for &info in &visited {
+        assert!(
+            bits_eq(&hm.average_strategy(&info), &dense.average_strategy(info)),
+            "hashmap→dense average_strategy byte mismatch @ info {:#x}",
+            info.raw()
+        );
+        assert!(
+            bits_eq(&hm.current_strategy(&info), &dense.current_strategy(info)),
+            "hashmap→dense current_strategy byte mismatch @ info {:#x}",
+            info.raw()
+        );
+    }
+    cleanup(&path);
+    eprintln!(
+        "[hashmap→dense] {} infoset byte-equal ✓（{} update）",
+        visited.len(),
+        dense.update_count()
+    );
 }

@@ -273,8 +273,20 @@ impl DenseNlheTable {
     /// 未访问行恒为 0 → `Σ R⁺ == 0` → uniform，与 HashMap key 缺失同分支，byte-equal。
     pub(crate) fn current_strategy_smallvec_by_info(&self, info: InfoSetId) -> SigmaVec {
         let slot = self.indexer.locate(info);
-        let n = slot.action_count;
-        let start = slot.slot_start as usize;
+        self.current_strategy_smallvec_at(slot.slot_start, slot.action_count)
+    }
+
+    /// regret matching 热路径变体，直接按已定位的 `slot_start` / `action_count` 读
+    /// （Phase 3 并行 recurse 已 `locate` 一次，省第二次 unpack）。数值序列与
+    /// [`Self::current_strategy_smallvec_by_info`] 完全一致——后者就是先 `locate`
+    /// 再调本方法。`&self` 只读，可在 rayon worker 间共享借用。
+    pub(crate) fn current_strategy_smallvec_at(
+        &self,
+        slot_start: u64,
+        action_count: usize,
+    ) -> SigmaVec {
+        let n = action_count;
+        let start = slot_start as usize;
         let regrets = &self.values[start..start + n];
 
         let uniform = || SigmaVec::from_elem(1.0 / n as f64, n);
@@ -339,6 +351,27 @@ impl DenseNlheTable {
     pub fn touched_count(&self) -> u64 {
         self.touched_rows.count()
     }
+
+    /// raw 扁平 values 只读 slice（Phase 4 checkpoint save：直接写 raw f64 LE）。
+    pub(crate) fn raw_values(&self) -> &[f64] {
+        &self.values
+    }
+
+    /// raw 扁平 values 可写 slice（Phase 4 checkpoint load：streaming 填回 raw f64）。
+    /// 调用方负责保证写入长度 == `num_slots()`。
+    pub(crate) fn raw_values_mut(&mut self) -> &mut [f64] {
+        &mut self.values
+    }
+
+    /// touched bitset words 只读 slice（Phase 4 checkpoint save）。
+    pub(crate) fn touched_words(&self) -> &[u64] {
+        self.touched_rows.words()
+    }
+
+    /// touched bitset words 可写 slice（Phase 4 checkpoint load）。
+    pub(crate) fn touched_words_mut(&mut self) -> &mut [u64] {
+        self.touched_rows.words_mut()
+    }
 }
 
 /// 行级 touched bitset（`Vec<u64>` word 数组；无第三方依赖，符合 D-275
@@ -376,6 +409,61 @@ impl TouchedRows {
 
     fn count(&self) -> u64 {
         self.words.iter().map(|w| u64::from(w.count_ones())).sum()
+    }
+
+    /// 底层 word 数组只读（Phase 4 checkpoint save）。长度 = `total_rows.div_ceil(64)`。
+    fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    /// 底层 word 数组可写（Phase 4 checkpoint load：直接填回持久化的 bit）。
+    fn words_mut(&mut self) -> &mut [u64] {
+        &mut self.words
+    }
+}
+
+/// Phase 3 并行 worker 的线程本地 delta accumulator（plan §并行语义 slot-based
+/// local delta）。HashMap 路径的 `(InfoSetId, SigmaVec)` 在这里换成
+/// `(slot_start, row_index, SigmaVec)`：merge 时 main thread 直接调
+/// [`DenseNlheTable::accumulate_by_slot`]，省掉一次 `locate`。`row_index` 仅供
+/// touched bitset 标记。
+///
+/// 与 [`crate::training::regret::LocalRegretDelta`] 同型：按 DFS 顺序 append，
+/// 不 dedup / 不 sort；merge 阶段 main thread 按 tid 升序 × 每 worker 内 push
+/// 顺序 playback，f64 加法序列 deterministic（跨 run BLAKE3 byte-equal）。
+#[derive(Debug, Default)]
+pub(crate) struct DenseLocalDelta {
+    entries: Vec<(u64, u64, SigmaVec)>,
+}
+
+impl DenseLocalDelta {
+    /// 空容器。
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Append 1 条 `(slot_start, row_index, delta)`；不 dedup / 不 sort。
+    pub(crate) fn push(&mut self, slot_start: u64, row_index: u64, delta: SigmaVec) {
+        self.entries.push((slot_start, row_index, delta));
+    }
+
+    /// 消费返回 owned entries（merge 入口）。
+    pub(crate) fn into_entries(self) -> Vec<(u64, u64, SigmaVec)> {
+        self.entries
+    }
+
+    /// 已 push 条目数（监控用）。
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 空容器 sanity（让 clippy::len_without_is_empty 通过）。
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 

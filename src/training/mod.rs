@@ -33,6 +33,7 @@ pub mod leduc;
 pub mod nlhe;
 pub mod nlhe_betting_tree;
 pub mod nlhe_dense;
+pub mod nlhe_dense_checkpoint;
 pub mod nlhe_dense_trainer;
 pub mod nlhe_eval;
 pub mod regret;

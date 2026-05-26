@@ -16,20 +16,30 @@
 //! - 归纳：update 0 两表皆空 → σ 全 uniform → 同采样；第 t 步前两路径每个 infoset 值
 //!   逐位相等 → σ 逐位相等 → 同采样 → 同 trajectory → 第 t 步后仍逐位相等。
 //!
-//! **未做**（后续 Phase）：并行 `step_parallel`（Phase 3）、checkpoint v3（Phase 4）。
-//! 本 trainer 不实现 [`crate::training::Trainer`] trait（trait 的 checkpoint 方法属
-//! Phase 4），只提供 inherent `step` / 查询 / 诊断入口。
+//! **Phase 3**（已落地）：[`DenseNlheEsMccfrTrainer::step_parallel`] 走
+//! deterministic local-delta + merge（镜像 [`crate::training::trainer::EsMccfrTrainer::step_parallel`]，
+//! 与其 byte-equal）。**Phase 4**（已落地）：`save_checkpoint` / `load_checkpoint`
+//! 走 dense raw v3（[`crate::training::nlhe_dense_checkpoint`]），`from_hashmap_checkpoint`
+//! 单向加载旧 v2 HashMap ckpt。本 trainer **不实现** [`crate::training::Trainer`] trait
+//! （它是泛型 `Trainer<G>`，dense 是 NLHE 专属；保持 inherent 方法避免耦合 Kuhn/Leduc
+//! 泛型路径），只提供 inherent `step` / `step_parallel` / checkpoint / 查询 / 诊断入口。
 
+use std::path::Path;
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use crate::abstraction::info::{InfoSetId, StreetTag};
 use crate::core::rng::RngSource;
-use crate::error::TrainerError;
+use crate::error::{CheckpointError, GameVariant, TrainerError, TrainerVariant};
+use crate::training::checkpoint::Checkpoint;
 use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::nlhe::{SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheState};
-use crate::training::nlhe_dense::{DenseNlheTable, NlheDenseIndexer};
+use crate::training::nlhe_dense::{DenseLocalDelta, DenseNlheTable, NlheDenseIndexer};
+use crate::training::nlhe_dense_checkpoint::{
+    load_dense_checkpoint, save_dense_checkpoint, DenseCheckpointMeta, DenseLayoutFingerprint,
+};
 use crate::training::regret::SigmaVec;
 use crate::training::sampling::{derive_substream_seed, sample_discrete};
 
@@ -43,9 +53,8 @@ pub struct DenseNlheEsMccfrTrainer {
     regret: DenseNlheTable,
     strategy_sum: DenseNlheTable,
     update_count: u64,
-    /// 仅用于 Phase 4 checkpoint 序列化存档（step 本身不消费——randomness 来自
-    /// `step` 传入的 `rng`）。与 `EsMccfrTrainer.rng_substream_seed` 同义。
-    #[allow(dead_code)]
+    /// Phase 4 checkpoint 序列化存档（step 本身不消费——randomness 来自 `step` 传入的
+    /// `rng`）。与 `EsMccfrTrainer.rng_substream_seed` 同义。
     rng_substream_seed: [u8; 32],
     lcfr_period_size: Option<u64>,
     lcfr_periods_completed: u64,
@@ -150,6 +159,88 @@ impl DenseNlheEsMccfrTrainer {
         }
     }
 
+    /// 多线程并发 step（Phase 3 dense 并行路径）。
+    ///
+    /// 结构逐项镜像 [`crate::training::trainer::EsMccfrTrainer::step_parallel`]：一次
+    /// 调用产 `n_active = min(n_threads, rng_pool.len())` × `batch_per_worker` 个
+    /// update；每 worker 在 rayon 任务里跑 `batch_per_worker` 条 trajectory，σ 全程读
+    /// **pre-dispatch shared dense regret**（[`DenseNlheTable::current_strategy_smallvec_at`]
+    /// 只读借用，rayon 任务期内安全——主表本批不被任何 worker 写）；regret /
+    /// strategy_sum 累积 push 到线程本地 [`DenseLocalDelta`]（slot-based）。dispatch
+    /// 结束后 main thread 按 tid 升序 × 每 worker 内 push 顺序 playback merge 回主表。
+    ///
+    /// **确定性 / byte-equal**：plan §并行语义 默认路径 = deterministic local delta +
+    /// merge，**不** atomic direct write / Hogwild。trajectory（rng 消费）、σ 读
+    /// （pre-dispatch snapshot）、push 顺序（DFS）、merge 顺序（tid 升序 × push 顺序）
+    /// 全 deterministic，且与 HashMap `step_parallel` 一一对应 →
+    /// `(InfoSetId → slot)` 双射后每个 cell 的 f64 加法序列与 HashMap 路径完全一致，
+    /// 两路径 strategy snapshot byte-equal（集成测试 anchor）。
+    ///
+    /// **边界**：`n_active == 0` / `batch_per_worker == 0` → no-op 返回 `Ok(())`。
+    pub fn step_parallel(
+        &mut self,
+        rng_pool: &mut [Box<dyn RngSource>],
+        n_threads: usize,
+        batch_per_worker: usize,
+    ) -> Result<(), TrainerError> {
+        let n_active = n_threads.min(rng_pool.len());
+        if n_active == 0 || batch_per_worker == 0 {
+            return Ok(());
+        }
+        let active_pool = &mut rng_pool[..n_active];
+        let n_players = self.game.n_players() as u64;
+        let base_update_count = self.update_count;
+
+        let game = &self.game;
+        let shared_regret: &DenseNlheTable = &self.regret;
+
+        // rayon dispatch：`par_iter_mut().enumerate()` 是 IndexedParallelIterator，
+        // `.collect()` 保 input index 顺序，因此 `deltas[tid]` 与 tid 一一对应。
+        // 每 worker σ 全程读 pre-dispatch `shared_regret`（slot-based 只读）。
+        let deltas: Vec<(DenseLocalDelta, DenseLocalDelta)> = active_pool
+            .par_iter_mut()
+            .enumerate()
+            .map(|(tid, rng_slot)| {
+                let mut local_regret = DenseLocalDelta::new();
+                let mut local_strategy = DenseLocalDelta::new();
+                let rng = rng_slot.as_mut();
+                for batch_idx in 0..batch_per_worker {
+                    let trajectory_index = batch_idx as u64 * n_active as u64 + tid as u64;
+                    let traverser =
+                        ((base_update_count + trajectory_index) % n_players) as PlayerId;
+                    let root = game.root(rng);
+                    recurse_es_dense_parallel(
+                        root,
+                        traverser,
+                        1.0,
+                        shared_regret,
+                        &mut local_regret,
+                        &mut local_strategy,
+                        rng,
+                    );
+                }
+                (local_regret, local_strategy)
+            })
+            .collect();
+
+        // playback merge：tid 升序遍历 deltas，每 worker 内按 push 顺序 playback。
+        for (local_regret, local_strategy) in deltas {
+            for (slot_start, row_index, delta) in local_regret.into_entries() {
+                self.regret
+                    .accumulate_by_slot(slot_start, row_index, &delta);
+            }
+            for (slot_start, row_index, weighted) in local_strategy.into_entries() {
+                self.strategy_sum
+                    .accumulate_by_slot(slot_start, row_index, &weighted);
+            }
+        }
+        self.update_count += (n_active as u64) * (batch_per_worker as u64);
+        // LCFR period rescale 在批合并完成后触发（本批 delta 全在 pre-rescale scale
+        // 下累积；语义同 EsMccfrTrainer::step_parallel）。
+        self.maybe_lcfr_rescale();
+        Ok(())
+    }
+
     /// current strategy（regret matching）。与 HashMap
     /// [`crate::training::Trainer::current_strategy`] 同语义：两表都没碰过该 infoset
     /// → 空 `Vec`；否则走 regret matching（退化均匀分布）。
@@ -192,6 +283,104 @@ impl DenseNlheEsMccfrTrainer {
     /// 持有的 game 只读访问（诊断 / 测试：走 tree 定位 spot 的 node_id）。
     pub fn game(&self) -> &SimplifiedNlheGame {
         &self.game
+    }
+
+    /// dense 表布局指纹（save / load 共用：从持有的 indexer + game bucket hash 算）。
+    fn layout_fingerprint(&self) -> DenseLayoutFingerprint {
+        DenseLayoutFingerprint::from_indexer(self.regret.indexer(), self.game.bucket_table_blake3())
+    }
+
+    /// 写出 dense checkpoint v3（Phase 4）：raw f64 两表 + touched bitset + lcfr
+    /// 元数据 + layout fingerprint。格式见 [`crate::training::nlhe_dense_checkpoint`]。
+    pub fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
+        let fingerprint = self.layout_fingerprint();
+        let meta = DenseCheckpointMeta {
+            update_count: self.update_count,
+            rng_state: self.rng_substream_seed,
+            lcfr_period_size: self.lcfr_period_size,
+            lcfr_periods_completed: self.lcfr_periods_completed,
+            lcfr_rescale_regret: self.lcfr_rescale_regret,
+        };
+        save_dense_checkpoint(path, &fingerprint, &meta, &self.regret, &self.strategy_sum)
+    }
+
+    /// 从 dense checkpoint v3 恢复。`game` 重建 indexer + expected fingerprint；
+    /// fingerprint 不符（不同树 / abstraction / bucket）即拒绝。**LCFR 元数据随
+    /// dense checkpoint 一并恢复**——与 HashMap 路径不同（后者 resume 丢 LCFR 配置），
+    /// dense resume 能无缝续跑 LCFR period rescale。
+    pub fn load_checkpoint(path: &Path, game: SimplifiedNlheGame) -> Result<Self, CheckpointError> {
+        let indexer = Arc::new(NlheDenseIndexer::from_tree(
+            game.tree(),
+            bucket_count_by_street(&game),
+        ));
+        let expected = DenseLayoutFingerprint::from_indexer(&indexer, game.bucket_table_blake3());
+        let (meta, regret, strategy_sum) =
+            load_dense_checkpoint(path, &expected, Arc::clone(&indexer))?;
+        Ok(Self {
+            game,
+            regret,
+            strategy_sum,
+            update_count: meta.update_count,
+            rng_substream_seed: meta.rng_state,
+            lcfr_period_size: meta.lcfr_period_size,
+            lcfr_periods_completed: meta.lcfr_periods_completed,
+            lcfr_rescale_regret: meta.lcfr_rescale_regret,
+        })
+    }
+
+    /// 从旧 HashMap path checkpoint（schema v2，`PLCKPT\0\0`）单向加载到 dense 表
+    /// （plan §Checkpoint 兼容策略：HashMap → dense）。逐 entry `accumulate_by_info`
+    /// 填空表（等价 set：空表 0 + delta = delta），值与 HashMap 路径 byte-equal。
+    ///
+    /// 校验 trainer_variant == EsMccfr / game_variant == SimplifiedNlhe /
+    /// bucket_table_blake3 与 `game` 一致；不符返回相应 mismatch。LCFR 元数据不在 v2
+    /// schema 内 → resume 后默认 vanilla（同 HashMap `load_checkpoint` 行为）。
+    pub fn from_hashmap_checkpoint(
+        path: &Path,
+        game: SimplifiedNlheGame,
+    ) -> Result<Self, CheckpointError> {
+        let ckpt = Checkpoint::open(path)?;
+        if ckpt.trainer_variant != TrainerVariant::EsMccfr
+            || ckpt.game_variant != GameVariant::SimplifiedNlhe
+        {
+            return Err(CheckpointError::TrainerMismatch {
+                expected: (TrainerVariant::EsMccfr, GameVariant::SimplifiedNlhe),
+                got: (ckpt.trainer_variant, ckpt.game_variant),
+            });
+        }
+        let expected_bucket = game.bucket_table_blake3();
+        if ckpt.bucket_table_blake3 != expected_bucket {
+            return Err(CheckpointError::BucketTableMismatch {
+                expected: expected_bucket,
+                got: ckpt.bucket_table_blake3,
+            });
+        }
+
+        let regret_entries: Vec<(InfoSetId, Vec<f64>)> =
+            bincode::deserialize(&ckpt.regret_table_bytes).map_err(|e| {
+                CheckpointError::Corrupted {
+                    offset: 0,
+                    reason: format!("bincode deserialize regret table failed: {e}"),
+                }
+            })?;
+        let strategy_entries: Vec<(InfoSetId, Vec<f64>)> =
+            bincode::deserialize(&ckpt.strategy_sum_bytes).map_err(|e| {
+                CheckpointError::Corrupted {
+                    offset: 0,
+                    reason: format!("bincode deserialize strategy table failed: {e}"),
+                }
+            })?;
+
+        let mut trainer = Self::new(game, 0);
+        for (info, v) in regret_entries {
+            trainer.regret.accumulate_by_info(info, &v);
+        }
+        for (info, v) in strategy_entries {
+            trainer.strategy_sum.accumulate_by_info(info, &v);
+        }
+        trainer.update_count = ckpt.update_count;
+        trainer.rng_substream_seed = ckpt.rng_state;
+        Ok(trainer)
     }
 }
 
@@ -278,6 +467,97 @@ fn recurse_es_dense(
                 let sampled = sample_discrete(&nonzero_dist, rng);
                 let next_state = SimplifiedNlheGame::next(state, sampled, rng);
                 recurse_es_dense(next_state, traverser, pi_trav, regret, strategy_sum, rng)
+            }
+        }
+    }
+}
+
+/// Phase 3 并行 DFS recurse（dense 存储版）。
+///
+/// 与 [`recurse_es_dense`] 同型语义，差别仅在累积容器分流（镜像 HashMap 路径的
+/// [`crate::training::trainer`] 私有 `recurse_es_parallel`）：
+/// - **σ 计算**：走 **共享只读** `shared_regret`（[`DenseNlheTable::current_strategy_smallvec_at`]
+///   对未访问行返回 uniform，等价 HashMap 未见 InfoSet 回退；parallel 路径不写
+///   主表，避免跨线程数据竞争）。
+/// - **regret / strategy_sum push**：写入 **线程本地** [`DenseLocalDelta`]
+///   （slot-based append-only），merge 阶段按 push 顺序 playback 到主表。
+///
+/// `locate` 每决策节点只调一次（拿 `slot_start` / `row_index` / `action_count`），
+/// σ 读与 delta push 都复用同一定位结果。push 顺序与 [`recurse_es_dense`] /
+/// HashMap `recurse_es_parallel` 一致：traverser 分支先 push strategy_sum，递归
+/// 子节点后再 push regret。
+fn recurse_es_dense_parallel(
+    state: SimplifiedNlheState,
+    traverser: PlayerId,
+    pi_trav: f64,
+    shared_regret: &DenseNlheTable,
+    local_regret: &mut DenseLocalDelta,
+    local_strategy: &mut DenseLocalDelta,
+    rng: &mut dyn RngSource,
+) -> f64 {
+    match SimplifiedNlheGame::current(&state) {
+        NodeKind::Terminal => SimplifiedNlheGame::payoff(&state, traverser),
+        NodeKind::Chance => unreachable!(
+            "简化 NLHE 无 in-game chance node（randomness 全在 Game::root 消费）；\
+             current(state) 不应返回 Chance"
+        ),
+        NodeKind::Player(actor) => {
+            let info = SimplifiedNlheGame::info_set(&state, actor);
+            let actions = SimplifiedNlheGame::legal_actions(&state);
+            let n = actions.len();
+            // 每决策节点 locate 一次：σ 读 + delta push 复用同一 slot 定位。
+            let slot = shared_regret.indexer().locate(info);
+            let sigma =
+                shared_regret.current_strategy_smallvec_at(slot.slot_start, slot.action_count);
+
+            if actor == traverser {
+                // traverser node：先按 traverser reach 累积 average strategy（顺序与
+                // recurse_es_dense 一致：strategy_sum 先于 regret）。
+                let weighted: SigmaVec = sigma.iter().map(|s| pi_trav * s).collect();
+                local_strategy.push(slot.slot_start, slot.row_index, weighted);
+
+                let mut cfvs: SigmaVec = SigmaVec::with_capacity(n);
+                for (i, action) in actions.iter().enumerate() {
+                    let next_state = SimplifiedNlheGame::next(state.clone(), *action, rng);
+                    let cfv = recurse_es_dense_parallel(
+                        next_state,
+                        traverser,
+                        pi_trav * sigma[i],
+                        shared_regret,
+                        local_regret,
+                        local_strategy,
+                        rng,
+                    );
+                    cfvs.push(cfv);
+                }
+                let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
+                // External sampling：per-visit delta 不乘 pi_opp（与 recurse_es_dense 一致）。
+                let delta: SigmaVec = cfvs.iter().map(|c| c - sigma_value).collect();
+                local_regret.push(slot.slot_start, slot.row_index, delta);
+                sigma_value
+            } else {
+                // opponent node：按 σ 采样 1 action（剔除零概率 outcome）。
+                let nonzero_dist: SmallVec<[(SimplifiedNlheAction, f64); 8]> = actions
+                    .iter()
+                    .copied()
+                    .zip(sigma.iter().copied())
+                    .filter(|(_, p)| *p > 0.0)
+                    .collect();
+                debug_assert!(
+                    !nonzero_dist.is_empty(),
+                    "non-traverser σ all-zero impossible: current_strategy 退化局面回退均匀分布"
+                );
+                let sampled = sample_discrete(&nonzero_dist, rng);
+                let next_state = SimplifiedNlheGame::next(state, sampled, rng);
+                recurse_es_dense_parallel(
+                    next_state,
+                    traverser,
+                    pi_trav,
+                    shared_regret,
+                    local_regret,
+                    local_strategy,
+                    rng,
+                )
             }
         }
     }

@@ -482,25 +482,68 @@ dense 表本身不产生更强 blueprint——它只是承载 bet-size 扩张的
 > 不能继续压在当前 vultr 上。LCFR rescale byte-equal 本身另由 Phase 1 `nlhe_dense` 单测
 > （合成 delta vs HashMap）覆盖，所以 vultr 上只跑 vanilla 也够拿 recurse 正确性。
 
-### Phase 3：parallel dense path
+### Phase 3：parallel dense path — ✅ 已落地（2026-05-26）
 
-- 实现 `step_parallel`：
-  - worker 只读 shared dense regret。
-  - local indexed delta append-only。
-  - main thread deterministic playback merge。
-- 对照 HashMap parallel 路径：
-  - throughput
-  - RSS
-  - strategy snapshot
-  - LBR proxy 小样本
+**落地实现**（think 分支，`src/training/nlhe_dense_trainer.rs` + `nlhe_dense.rs`）：
 
-### Phase 4：checkpoint v3
+- `DenseNlheEsMccfrTrainer::step_parallel(rng_pool, n_threads, batch_per_worker)`：结构
+  逐项镜像 `EsMccfrTrainer::step_parallel`——rayon `par_iter_mut().enumerate()` dispatch
+  `n_active × batch_per_worker` 个 update，worker σ 全程读 **pre-dispatch shared dense
+  regret**（`DenseNlheTable::current_strategy_smallvec_at` 只读借用，rayon 任务期内安全），
+  regret / strategy_sum 累积 push 到线程本地 `DenseLocalDelta`（slot-based
+  `(slot_start, row_index, SigmaVec)`，替代 HashMap 路径的 `(InfoSetId, SigmaVec)`，省 merge
+  期一次 `locate`）；dispatch 结束 main thread 按 tid 升序 × push 顺序 playback
+  `accumulate_by_slot`。
+- `recurse_es_dense_parallel`：与单线程 `recurse_es_dense` 同 DFS / 同 rng 消费顺序，仅
+  σ 读共享只读、delta push 到线程本地。每决策节点 `locate` 一次，σ 读 + 两次 push 复用。
+- LCFR period rescale 在批合并后触发（语义同 `EsMccfrTrainer`）。
 
-- dense raw checkpoint save/load。
-- old HashMap checkpoint -> dense load。
-- roundtrip 测试：
-  - dense save/load 后 strategy snapshot 一致。
-  - fingerprint 不匹配时明确报错。
+**为什么默认仍走 deterministic local-delta + merge**（plan §并行语义）：不用 atomic direct
+write / Hogwild——保 byte-equal 确定性 + pre-dispatch σ snapshot 语义。
+
+**验证（artifact-gated `#[ignore]`，留 AWS 跑）**：`tests/dense_nlhe_trainer.rs`
+`dense_step_parallel_byte_equal_hashmap`——dense `step_parallel` 与 HashMap
+`EsMccfrTrainer::step_parallel` 在**同 rng pool / 同 n_threads / 同 batch_per_worker** 下，
+对所有已访问 infoset `average_strategy` / `current_strategy` **f64 to_bits byte-equal**。
+两路径一一对应（同 σ 读 → 同 trajectory → 同 delta → 同 merge 顺序 →
+`InfoSetId→slot` 双射后每 cell f64 加法序列一致）。峰值 ~7 GiB（dense + HashMap 两套表
+并存），需 ≥ ~10 GiB 机器。
+
+> throughput / RSS / LBR proxy 对照属目标 profile 放大跑的量（AWS c6a.8xlarge），不在
+> 单测里断言数值。byte-equal 对照才是 Phase 3 的正确性门。
+
+### Phase 4：checkpoint v3 — ✅ 已落地（2026-05-26）
+
+**落地实现**（think 分支，`src/training/nlhe_dense_checkpoint.rs` + trainer 方法）：
+
+- 独立二进制格式（magic `PLDNCKPT` / schema 3 / storage_kind DenseNlheV1），**不** bump
+  HashMap path 的全局 `SCHEMA_VERSION=2`（否则废掉既有 v2 ckpt 测试 + 产物；plan §非目标
+  明确 dense 需 schema bump + 不追求双向兼容）。header 160 byte + regret/strategy touched
+  bitset + raw f64 LE 两表 + trailer BLAKE3。save / load 全 **streaming**（chunked +
+  增量 BLAKE3），峰值 ≈ 两表本身（目标 profile 13.48 GiB 时不能整文件 buffer）；save 走
+  write-to-temp + fsync + atomic rename。
+- `DenseLayoutFingerprint`：bucket_table_blake3 + num_nodes/total_rows/total_slots +
+  **per-node `(street, bucket_count, action_count)` BLAKE3**。load 时用调用方 game 重建
+  indexer 算 expected，逐字段比——bucket 不符 → `BucketTableMismatch`，layout（含 action
+  序列）不符 → `Corrupted`。拦住「A 树 / abstraction 数组误读成 B profile」（plan §风险）。
+- trainer 方法：`save_checkpoint` / `load_checkpoint`（dense raw v3，**LCFR 元数据一并恢复**
+  → dense resume 能续跑 LCFR，优于 HashMap 路径的丢配置）；`from_hashmap_checkpoint`
+  单向加载旧 v2 HashMap ckpt（`Checkpoint::open` + 校验 variant/bucket blake3 + bincode
+  逐 entry `accumulate_by_info` 填 dense 表）。
+
+**验证**：
+
+- **synthetic 单测（无 artifact，任意机器跑）** `nlhe_dense_checkpoint.rs`：roundtrip
+  meta + raw values byte-equal + touched bitset 一致；bucket blake mismatch →
+  `BucketTableMismatch`；不同树 → `Corrupted`；**同 total_rows/slots/num_nodes 但
+  per-node action 序列不同**（A=[(P,6,2),(F,6,3)] vs B=[(P,6,3),(F,6,2)]）→ 仍被
+  action_count hash 抓到 → `Corrupted`；翻 body byte → trailer BLAKE3 `Corrupted`；
+  schema 改 → `SchemaMismatch`；缺文件 → `FileNotFound`。
+- **artifact-gated `#[ignore]`（留 AWS 跑）** `tests/dense_nlhe_trainer.rs`：
+  `dense_checkpoint_roundtrip_preserves_strategy`（save→load 后 update_count + 已访问
+  infoset 策略 byte-equal，含 LCFR period=500 元数据恢复）；
+  `hashmap_checkpoint_to_dense_byte_equal`（HashMap v2 ckpt → dense 加载后与 HashMap
+  trainer 策略 byte-equal）。
 
 ### Phase 5：（不做）paged dense
 
