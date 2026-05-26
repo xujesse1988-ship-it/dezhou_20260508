@@ -418,15 +418,35 @@ dense 表本身不产生更强 blueprint——它只是承载 bet-size 扩张的
 > `NlheDenseIndexer` 落地**——这些测的是 indexer 索引数学，indexer 结构体属 Phase 1。
 > Phase 0 已用工具把 `total_slots` / 内存量准、决策门答清。
 
-### Phase 1：dense table 原型
+### Phase 1：dense table 原型 — ✅ 已落地（2026-05-26）
 
-- 新增 `NlheDenseIndexer` 和 `DenseNlheTable`。
-- 支持：
-  - `current_strategy_smallvec_by_info`
-  - `accumulate_by_slot`
+**落地实现**（commit `fbe1388`，think 分支，`src/training/nlhe_dense.rs`）：
+
+- `NlheDenseIndexer`：`from_node_specs`（逐节点 spec，`node_id` = 输入顺序，测试可喂合成
+  节点不必建全树）/ `from_tree(tree, [u32;4])`（生产 `[169,500,500,500]`，`action_count`
+  逐节点取 `tree.node(id).legal_actions.len()` → 天然兼容按街 abstraction）。
+  `locate(InfoSetId)` 用 `NLHE_V2_NODE_ID_SHIFT`（与 `pack_info_set_v2` 共用同一常量，
+  pack/unpack 不漂移）反解 `node_id` + `bucket_id`，出 `(slot_start, row_index, action_count)`。
+- `DenseNlheTable`：full dense prealloc 单值表（`Vec<f64>` 满 `total_slots`）+ 行级
+  `touched_rows` bitset（`Vec<u64>`，无第三方依赖 / 不碰 `unsafe`）。方法：
+  - `accumulate_by_slot` / `accumulate_by_info`
+  - `current_strategy_smallvec_by_info`（`pub(crate)` 热路径）/ `current_strategy_by_info`
   - `average_strategy_by_info`
   - `rescale_all`
-- 不接 trainer，先用合成 delta 测试数值语义。
+  数值语义逐位对齐 `regret.rs`（同一 R⁺ 累加 / sum+除法 / 退化 uniform 分支）。
+- `nlhe.rs`：`NLHE_V2_NODE_ID_SHIFT`/`BITS` + `pack_info_set_v2` 升 `pub(crate)`（单一来源）。
+- **未接 trainer**（Phase 2 才接），全部用合成 delta 验数值语义。
+
+**验证（全在 vultr 跑过，绿）**：
+
+- 默认全街 `{0.5,1,2}` 树 indexer `total_rows == 119,746,128` / `total_slots == 310,151,877`
+  与 `nlhe_betting_tree_sizing` 工具独立 walk 实测吻合（两条代码路径对照）。
+- `action_count` 逐节点 == `tree.node(id).legal_actions.len()`。
+- 小合成树穷举索引数学：row 全单射 / slot 区间互不重叠 / `slot_start+action_count ≤ total_slots`。
+- `current_strategy` + `average_strategy` 与 HashMap `RegretTable`/`StrategyAccumulator` 在
+  同 delta 序列（含负 regret + LCFR rescale + 未访问 info）下 **f64 to_bits byte-equal**。
+- `cargo build --all-targets` / `fmt --all --check` / `clippy --all-targets -D warnings`（本机）+
+  `training::nlhe*` 全套单测（vultr）通过，前置 P / betting tree 既有测试不回归。
 
 ### Phase 2：DenseNlheEsMccfrTrainer
 
