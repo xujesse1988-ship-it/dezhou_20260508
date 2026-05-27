@@ -1,13 +1,15 @@
 //! 两个简化 heads-up NLHE checkpoint 互相对弈（head-to-head）。
 //!
-//! 加载 checkpoint A / B 两份 `EsMccfrTrainer`，双座位轮换各打 `--hands-per-seat`
-//! 手，统计 A 相对 B 的 mbb/game + 95% 置信区间 + 分座位胜率。对弈与统计逻辑直接
-//! 复用 `tests/nlhe_h3_eval.rs` 里已被 H3 评测套件验证过的实现，不引入新算法。
+//! 加载 checkpoint A / B 两份 ES-MCCFR trainer（HashMap 或 `--dense` checkpoint），
+//! 双座位轮换各打 `--hands-per-seat` 手，统计 A 相对 B 的 mbb/game + 95% 置信区间
+//! + 分座位胜率。对弈与统计逻辑直接复用 `tests/nlhe_h3_eval.rs` 里已被 H3 评测
+//! 套件验证过的实现，不引入新算法。
 //!
 //! checkpoint 各约 8.5 GB，加载两份的常驻 + 瞬时峰值约 30–40 GB，需在 ≥ 64 GB
 //! 内存的机器上跑（vultr 7.7 GB 跑不动）。
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -17,6 +19,8 @@ use serde::Serialize;
 
 use poker::training::game::{Game, NodeKind};
 use poker::training::nlhe::{SimplifiedNlheAction, SimplifiedNlheState};
+use poker::training::nlhe_dense_checkpoint::DENSE_MAGIC;
+use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::sampling::sample_discrete;
 use poker::training::{EsMccfrTrainer, Trainer};
 use poker::{BucketTable, ChaCha20Rng, InfoSetId, RngSource, SeatId, SimplifiedNlheGame};
@@ -54,7 +58,8 @@ impl FallbackPolicy {
 struct Args {
     checkpoint_a: PathBuf,
     checkpoint_b: PathBuf,
-    bucket_table: PathBuf,
+    bucket_table_a: PathBuf,
+    bucket_table_b: PathBuf,
     hands_per_seat: u64,
     seed: u64,
     max_actions_per_hand: usize,
@@ -63,15 +68,69 @@ struct Args {
     output: Option<PathBuf>,
 }
 
+struct LoadedTrainer {
+    backend: TrainerBackend,
+    game: SimplifiedNlheGame,
+}
+
+enum TrainerBackend {
+    HashMap(EsMccfrTrainer<SimplifiedNlheGame>),
+    Dense(DenseNlheEsMccfrTrainer),
+}
+
+impl LoadedTrainer {
+    fn storage_kind(&self) -> &'static str {
+        match &self.backend {
+            TrainerBackend::HashMap(_) => "hashmap",
+            TrainerBackend::Dense(_) => "dense",
+        }
+    }
+
+    fn update_count(&self) -> u64 {
+        match &self.backend {
+            TrainerBackend::HashMap(trainer) => trainer.update_count(),
+            TrainerBackend::Dense(trainer) => trainer.update_count(),
+        }
+    }
+
+    fn current_strategy(&self, info: InfoSetId) -> Vec<f64> {
+        match &self.backend {
+            TrainerBackend::HashMap(trainer) => trainer.current_strategy(&info),
+            TrainerBackend::Dense(trainer) => trainer.current_strategy(info),
+        }
+    }
+
+    fn average_strategy(&self, info: InfoSetId) -> Vec<f64> {
+        match &self.backend {
+            TrainerBackend::HashMap(trainer) => trainer.average_strategy(&info),
+            TrainerBackend::Dense(trainer) => trainer.average_strategy(info),
+        }
+    }
+
+    fn has_average_signal(&self, info: InfoSetId) -> bool {
+        match &self.backend {
+            TrainerBackend::HashMap(trainer) => trainer
+                .strategy_sum()
+                .inner()
+                .get(&info)
+                .is_some_and(|v| v.iter().sum::<f64>() > 0.0),
+            TrainerBackend::Dense(trainer) => trainer.strategy_sum().row_sum_by_info(info) > 0.0,
+        }
+    }
+}
+
 fn usage() -> String {
     "\
 usage: nlhe_checkpoint_vs_checkpoint \\
     --checkpoint-a <A.ckpt> --checkpoint-b <B.ckpt> \\
-    --bucket-table <bucket.bin> \\
+    --bucket-table <shared-bucket.bin> \\
+    [--bucket-table-a <A-bucket.bin>] [--bucket-table-b <B-bucket.bin>] \\
     [--hands-per-seat 50000] [--seed 0xC4EC4E0F] \\
     [--max-actions-per-hand 512] [--bb-chips 100.0] \\
     [--fallback-policy hybrid|average|current] [--out report.md]
 
+`--bucket-table` 是 A/B 共用快捷参数；若 A/B 使用不同 bucket abstraction，
+请分别传 `--bucket-table-a` 和 `--bucket-table-b`。两边仍必须使用同一 action/tree。
 报告里所有 mbb/game 均从 checkpoint-a 视角：正数 = A 净赢 B。"
         .to_string()
 }
@@ -80,6 +139,8 @@ fn parse_args() -> Result<Args, String> {
     let mut checkpoint_a: Option<PathBuf> = None;
     let mut checkpoint_b: Option<PathBuf> = None;
     let mut bucket_table: Option<PathBuf> = None;
+    let mut bucket_table_a: Option<PathBuf> = None;
+    let mut bucket_table_b: Option<PathBuf> = None;
     let mut hands_per_seat: u64 = 50_000;
     let mut seed: u64 = 0xC4EC_4E0F;
     let mut max_actions_per_hand: usize = 512;
@@ -98,6 +159,8 @@ fn parse_args() -> Result<Args, String> {
             "--checkpoint-a" => checkpoint_a = Some(PathBuf::from(next()?)),
             "--checkpoint-b" => checkpoint_b = Some(PathBuf::from(next()?)),
             "--bucket-table" => bucket_table = Some(PathBuf::from(next()?)),
+            "--bucket-table-a" => bucket_table_a = Some(PathBuf::from(next()?)),
+            "--bucket-table-b" => bucket_table_b = Some(PathBuf::from(next()?)),
             "--hands-per-seat" => {
                 hands_per_seat = next()?
                     .parse()
@@ -116,10 +179,18 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
+    let bucket_table_a = bucket_table_a
+        .or_else(|| bucket_table.clone())
+        .ok_or("missing --bucket-table-a or --bucket-table")?;
+    let bucket_table_b = bucket_table_b
+        .or(bucket_table)
+        .ok_or("missing --bucket-table-b or --bucket-table")?;
+
     Ok(Args {
         checkpoint_a: checkpoint_a.ok_or("missing --checkpoint-a")?,
         checkpoint_b: checkpoint_b.ok_or("missing --checkpoint-b")?,
-        bucket_table: bucket_table.ok_or("missing --bucket-table")?,
+        bucket_table_a,
+        bucket_table_b,
         hands_per_seat,
         seed,
         max_actions_per_hand,
@@ -142,8 +213,10 @@ fn parse_u64(s: &str) -> Result<u64, String> {
 struct H2hReport {
     checkpoint_a: String,
     checkpoint_b: String,
-    bucket_table: String,
-    bucket_table_blake3: String,
+    bucket_table_a: String,
+    bucket_table_b: String,
+    bucket_table_a_blake3: String,
+    bucket_table_b_blake3: String,
     a_update_count: u64,
     b_update_count: u64,
     fallback_policy: FallbackPolicy,
@@ -183,22 +256,29 @@ fn run() -> Result<(), String> {
         return Err("--bb-chips must be a positive finite number".to_string());
     }
 
-    let table = Arc::new(BucketTable::open(&args.bucket_table).map_err(|e| {
-        format!(
-            "BucketTable::open({}) failed: {e:?}",
-            args.bucket_table.display()
-        )
-    })?);
-    let bucket_hash = hex32(&table.content_hash());
-    eprintln!("[h2h] bucket_table   = {}", args.bucket_table.display());
-    eprintln!("[h2h] bucket_blake3  = {bucket_hash}");
+    let table_a = open_bucket_table(&args.bucket_table_a)?;
+    let table_b = open_bucket_table(&args.bucket_table_b)?;
+    let bucket_hash_a = hex32(&table_a.content_hash());
+    let bucket_hash_b = hex32(&table_b.content_hash());
+    eprintln!("[h2h] bucket_table A = {}", args.bucket_table_a.display());
+    eprintln!("[h2h] bucket_blake3 A = {bucket_hash_a}");
+    eprintln!("[h2h] bucket_table B = {}", args.bucket_table_b.display());
+    eprintln!("[h2h] bucket_blake3 B = {bucket_hash_b}");
 
     eprintln!("[h2h] loading A = {}", args.checkpoint_a.display());
-    let trainer_a = load_checkpoint(&args.checkpoint_a, Arc::clone(&table))?;
-    eprintln!("[h2h]   A update_count = {}", trainer_a.update_count());
+    let trainer_a = load_checkpoint(&args.checkpoint_a, Arc::clone(&table_a))?;
+    eprintln!(
+        "[h2h]   A storage = {} | update_count = {}",
+        trainer_a.storage_kind(),
+        trainer_a.update_count()
+    );
     eprintln!("[h2h] loading B = {}", args.checkpoint_b.display());
-    let trainer_b = load_checkpoint(&args.checkpoint_b, Arc::clone(&table))?;
-    eprintln!("[h2h]   B update_count = {}", trainer_b.update_count());
+    let trainer_b = load_checkpoint(&args.checkpoint_b, Arc::clone(&table_b))?;
+    eprintln!(
+        "[h2h]   B storage = {} | update_count = {}",
+        trainer_b.storage_kind(),
+        trainer_b.update_count()
+    );
 
     eprintln!(
         "[h2h] fallback_policy = {} | hands_per_seat = {} (×2 seats) | seed = {:#x}",
@@ -208,14 +288,16 @@ fn run() -> Result<(), String> {
     );
 
     let t0 = Instant::now();
-    let report = evaluate_head_to_head(Arc::clone(&table), &trainer_a, &trainer_b, &args)?;
+    let report = evaluate_head_to_head(&trainer_a, &trainer_b, &args)?;
     let wall = t0.elapsed().as_secs_f64();
 
     let json = H2hReport {
         checkpoint_a: args.checkpoint_a.display().to_string(),
         checkpoint_b: args.checkpoint_b.display().to_string(),
-        bucket_table: args.bucket_table.display().to_string(),
-        bucket_table_blake3: bucket_hash,
+        bucket_table_a: args.bucket_table_a.display().to_string(),
+        bucket_table_b: args.bucket_table_b.display().to_string(),
+        bucket_table_a_blake3: bucket_hash_a,
+        bucket_table_b_blake3: bucket_hash_b,
         a_update_count: trainer_a.update_count(),
         b_update_count: trainer_b.update_count(),
         fallback_policy: args.fallback_policy,
@@ -237,29 +319,54 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn load_checkpoint(
-    path: &Path,
-    table: Arc<BucketTable>,
-) -> Result<EsMccfrTrainer<SimplifiedNlheGame>, String> {
+fn open_bucket_table(path: &Path) -> Result<Arc<BucketTable>, String> {
+    BucketTable::open(path)
+        .map(Arc::new)
+        .map_err(|e| format!("BucketTable::open({}) failed: {e:?}", path.display()))
+}
+
+fn load_checkpoint(path: &Path, table: Arc<BucketTable>) -> Result<LoadedTrainer, String> {
     if !path.exists() {
         return Err(format!("checkpoint {} 不存在", path.display()));
     }
-    let game = SimplifiedNlheGame::new(table)
+    let checkpoint_game = SimplifiedNlheGame::new(Arc::clone(&table))
         .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
-    <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(path, game)
-        .map_err(|e| format!("load_checkpoint({}) failed: {e:?}", path.display()))
+    let rollout_game = SimplifiedNlheGame::new(table)
+        .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
+    let backend = if is_dense_checkpoint(path)? {
+        DenseNlheEsMccfrTrainer::load_checkpoint(path, checkpoint_game)
+            .map(TrainerBackend::Dense)
+            .map_err(|e| format!("load dense checkpoint({}) failed: {e:?}", path.display()))
+    } else {
+        <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
+            path,
+            checkpoint_game,
+        )
+        .map(TrainerBackend::HashMap)
+        .map_err(|e| format!("load checkpoint({}) failed: {e:?}", path.display()))
+    }?;
+    Ok(LoadedTrainer {
+        backend,
+        game: rollout_game,
+    })
+}
+
+fn is_dense_checkpoint(path: &Path) -> Result<bool, String> {
+    let mut file = fs::File::open(path)
+        .map_err(|e| format!("open checkpoint {} failed: {e}", path.display()))?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)
+        .map_err(|e| format!("read checkpoint magic {} failed: {e}", path.display()))?;
+    Ok(magic == DENSE_MAGIC)
 }
 
 // ---- 以下对弈 / 统计逻辑复用 tests/nlhe_h3_eval.rs（H3 评测套件已验证）----
 
 fn evaluate_head_to_head(
-    table: Arc<BucketTable>,
-    trainer_a: &EsMccfrTrainer<SimplifiedNlheGame>,
-    trainer_b: &EsMccfrTrainer<SimplifiedNlheGame>,
+    trainer_a: &LoadedTrainer,
+    trainer_b: &LoadedTrainer,
     args: &Args,
 ) -> Result<H2hReport, String> {
-    let game = SimplifiedNlheGame::new(table)
-        .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
     let mut all_a_pnl = Vec::with_capacity((args.hands_per_seat * 2) as usize);
     let mut a_as_sb_total = 0.0;
     let mut a_as_bb_total = 0.0;
@@ -268,15 +375,19 @@ fn evaluate_head_to_head(
     for a_seat in [SeatId(0), SeatId(1)] {
         for hand_idx in 0..args.hands_per_seat {
             let seed = mix3(args.seed, a_seat.0 as u64, hand_idx);
-            let mut rng = ChaCha20Rng::from_seed(seed);
-            let root = game.root(&mut rng);
+            let mut rng_a = ChaCha20Rng::from_seed(seed);
+            let mut rng_b = ChaCha20Rng::from_seed(seed);
+            let root_a = trainer_a.game.root(&mut rng_a);
+            let root_b = trainer_b.game.root(&mut rng_b);
             let terminal = rollout_head_to_head(
-                root,
+                root_a,
+                root_b,
                 a_seat,
                 trainer_a,
                 trainer_b,
                 args.fallback_policy,
-                &mut rng,
+                &mut rng_a,
+                &mut rng_b,
                 args.max_actions_per_hand,
             )?;
             let pnl = SimplifiedNlheGame::payoff(&terminal, a_seat.0);
@@ -298,8 +409,10 @@ fn evaluate_head_to_head(
         // 以下字段在 run() 中用 `..` 覆盖填入。
         checkpoint_a: String::new(),
         checkpoint_b: String::new(),
-        bucket_table: String::new(),
-        bucket_table_blake3: String::new(),
+        bucket_table_a: String::new(),
+        bucket_table_b: String::new(),
+        bucket_table_a_blake3: String::new(),
+        bucket_table_b_blake3: String::new(),
         a_update_count: 0,
         b_update_count: 0,
         fallback_policy: args.fallback_policy,
@@ -320,30 +433,48 @@ fn evaluate_head_to_head(
 
 #[allow(clippy::too_many_arguments)]
 fn rollout_head_to_head(
-    mut state: SimplifiedNlheState,
+    mut state_a: SimplifiedNlheState,
+    mut state_b: SimplifiedNlheState,
     a_seat: SeatId,
-    trainer_a: &EsMccfrTrainer<SimplifiedNlheGame>,
-    trainer_b: &EsMccfrTrainer<SimplifiedNlheGame>,
+    trainer_a: &LoadedTrainer,
+    trainer_b: &LoadedTrainer,
     policy: FallbackPolicy,
-    rng: &mut dyn RngSource,
+    rng_a: &mut dyn RngSource,
+    rng_b: &mut dyn RngSource,
     max_actions: usize,
 ) -> Result<SimplifiedNlheState, String> {
     for _ in 0..max_actions {
-        match SimplifiedNlheGame::current(&state) {
-            NodeKind::Terminal => return Ok(state),
+        let current = SimplifiedNlheGame::current(&state_a);
+        let current_b = SimplifiedNlheGame::current(&state_b);
+        if current != current_b {
+            return Err(format!(
+                "A/B rollout state desynchronized: A current {:?}, B current {:?}",
+                current, current_b
+            ));
+        }
+
+        match current {
+            NodeKind::Terminal => return Ok(state_a),
             NodeKind::Chance => {
-                let dist = SimplifiedNlheGame::chance_distribution(&state);
-                let action = sample_discrete(&dist, rng);
-                state = SimplifiedNlheGame::next(state, action, rng);
+                return Err("unexpected chance node during simplified NLHE h2h rollout".to_string());
             }
             NodeKind::Player(actor) => {
-                let trainer = if SeatId(actor) == a_seat {
-                    trainer_a
+                let actions_a = SimplifiedNlheGame::legal_actions(&state_a);
+                let actions_b = SimplifiedNlheGame::legal_actions(&state_b);
+                if actions_a != actions_b {
+                    return Err(format!(
+                        "A/B legal action mismatch at actor {actor}: A={actions_a:?}, B={actions_b:?}"
+                    ));
+                }
+
+                let (state, trainer) = if SeatId(actor) == a_seat {
+                    (&state_a, trainer_a)
                 } else {
-                    trainer_b
+                    (&state_b, trainer_b)
                 };
-                let action = sample_action(&state, actor, trainer, policy, rng)?;
-                state = SimplifiedNlheGame::next(state, action, rng);
+                let action = sample_action(state, actor, trainer, policy, rng_a)?;
+                state_a = SimplifiedNlheGame::next(state_a, action, rng_a);
+                state_b = SimplifiedNlheGame::next(state_b, action, rng_b);
             }
         }
     }
@@ -355,7 +486,7 @@ fn rollout_head_to_head(
 fn sample_action(
     state: &SimplifiedNlheState,
     actor: u8,
-    trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
+    trainer: &LoadedTrainer,
     policy: FallbackPolicy,
     rng: &mut dyn RngSource,
 ) -> Result<SimplifiedNlheAction, String> {
@@ -367,28 +498,20 @@ fn sample_action(
         ));
     }
     let info = SimplifiedNlheGame::info_set(state, actor);
-    let raw = strategy_for(trainer, &info, policy);
+    let raw = strategy_for(trainer, info, policy);
     let dist = strategy_distribution(&actions, &raw)?;
     Ok(sample_discrete(&dist, rng))
 }
 
-fn strategy_for(
-    trainer: &EsMccfrTrainer<SimplifiedNlheGame>,
-    info: &InfoSetId,
-    policy: FallbackPolicy,
-) -> Vec<f64> {
+fn strategy_for(trainer: &LoadedTrainer, info: InfoSetId, policy: FallbackPolicy) -> Vec<f64> {
     match policy {
         FallbackPolicy::Average => trainer.average_strategy(info),
         FallbackPolicy::Current => trainer.current_strategy(info),
         FallbackPolicy::Hybrid => {
-            let degenerate = match trainer.strategy_sum().inner().get(info) {
-                None => true,
-                Some(v) => v.iter().sum::<f64>() <= 0.0,
-            };
-            if degenerate {
-                trainer.current_strategy(info)
-            } else {
+            if trainer.has_average_signal(info) {
                 trainer.average_strategy(info)
+            } else {
+                trainer.current_strategy(info)
             }
         }
     }
@@ -465,7 +588,8 @@ fn render_markdown(r: &H2hReport) -> String {
          \n\
          - checkpoint A : `{a}`（update_count = {auc}）\n\
          - checkpoint B : `{b}`（update_count = {buc}）\n\
-         - bucket_table : `{bt}`（blake3 = {bth}）\n\
+         - bucket_table A : `{bta}`（blake3 = {btah}）\n\
+         - bucket_table B : `{btb}`（blake3 = {btbh}）\n\
          - fallback_policy = {fp} | seed = {seed:#x} | bb_chips = {bb}\n\
          - hands = {hands}（每座 {hps} 手 ×2 座位）| wall = {wall:.1}s\n\
          \n\
@@ -481,8 +605,10 @@ fn render_markdown(r: &H2hReport) -> String {
         auc = r.a_update_count,
         b = r.checkpoint_b,
         buc = r.b_update_count,
-        bt = r.bucket_table,
-        bth = r.bucket_table_blake3,
+        bta = r.bucket_table_a,
+        btb = r.bucket_table_b,
+        btah = r.bucket_table_a_blake3,
+        btbh = r.bucket_table_b_blake3,
         fp = r.fallback_policy.slug(),
         seed = r.seed,
         bb = r.bb_chips,
