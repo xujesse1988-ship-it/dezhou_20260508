@@ -301,6 +301,7 @@ fn h3_baseline_policies_only_return_legal_actions() {
     let mut state = game.root(&mut rng);
     let policies = [
         NlheBaselinePolicy::Random,
+        NlheBaselinePolicy::RandomNoFold,
         NlheBaselinePolicy::CallStation,
         NlheBaselinePolicy::OverlyTight,
         NlheBaselinePolicy::EquityEv,
@@ -338,6 +339,61 @@ fn h3_baseline_policies_only_return_legal_actions() {
         }
     }
     assert!(checked >= 24, "expected to check multiple policy decisions");
+}
+
+#[test]
+fn h3_random_no_fold_baseline_skips_fold_when_possible() {
+    let Some(table) = load_v3_or_skip() else {
+        return;
+    };
+    let game = make_game(table);
+    let mut rng = ChaCha20Rng::from_seed(0x4833_4e4f_464f_4c44);
+    let mut state = game.root(&mut rng);
+    let mut checked = 0usize;
+
+    for _ in 0..64 {
+        match SimplifiedNlheGame::current(&state) {
+            NodeKind::Terminal => {
+                state = game.root(&mut rng);
+            }
+            NodeKind::Chance => {
+                let dist = SimplifiedNlheGame::chance_distribution(&state);
+                state = SimplifiedNlheGame::next(
+                    state,
+                    poker::training::sampling::sample_discrete(&dist, &mut rng),
+                    &mut rng,
+                );
+            }
+            NodeKind::Player(_) => {
+                let actions = SimplifiedNlheGame::legal_actions(&state);
+                if actions
+                    .iter()
+                    .any(|a| matches!(a, SimplifiedNlheAction::Fold))
+                    && actions
+                        .iter()
+                        .any(|a| !matches!(a, SimplifiedNlheAction::Fold))
+                {
+                    for _ in 0..32 {
+                        let action = NlheBaselinePolicy::RandomNoFold
+                            .select_action(&state, &actions, &mut rng)
+                            .expect("random-no-fold should choose a legal action");
+                        assert!(
+                            !matches!(action, SimplifiedNlheAction::Fold),
+                            "random-no-fold returned Fold from {actions:?}"
+                        );
+                        assert!(actions.contains(&action));
+                    }
+                    checked += 1;
+                }
+                let idx = (rng.next_u64() as usize) % actions.len();
+                state = SimplifiedNlheGame::next(state, actions[idx], &mut rng);
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "expected at least one spot with fold plus alternatives"
+    );
 }
 
 #[test]

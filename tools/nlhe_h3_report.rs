@@ -439,6 +439,7 @@ fn run_eval<S: StrategySource>(
     let mut evaluations = Vec::new();
     for baseline in [
         NlheBaselinePolicy::Random,
+        NlheBaselinePolicy::RandomNoFold,
         NlheBaselinePolicy::CallStation,
         NlheBaselinePolicy::OverlyTight,
         NlheBaselinePolicy::EquityEv,

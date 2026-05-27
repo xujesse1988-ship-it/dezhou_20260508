@@ -27,6 +27,8 @@ const EQUITY_EV_BASELINE_ITER: u32 = 512;
 pub enum NlheBaselinePolicy {
     /// 当前抽象 legal actions 上均匀随机。
     Random,
+    /// 在非 fold legal actions 上均匀随机；只在无非 fold 动作时退回全量随机。
+    RandomNoFold,
     /// 可 check 则 check；面对下注优先 call，否则 fold；不主动 bet/raise。
     CallStation,
     /// Preflop 只继续 TT+ / AK / AQ / AJs / KQs；postflop 面对下注仅 made hand
@@ -40,6 +42,7 @@ impl NlheBaselinePolicy {
     pub fn label(self) -> &'static str {
         match self {
             NlheBaselinePolicy::Random => "random",
+            NlheBaselinePolicy::RandomNoFold => "random-no-fold",
             NlheBaselinePolicy::CallStation => "call-station",
             NlheBaselinePolicy::OverlyTight => "overly-tight",
             NlheBaselinePolicy::EquityEv => "equity-ev",
@@ -66,6 +69,7 @@ impl NlheBaselinePolicy {
                 let idx = (rng.next_u64() as usize) % actions.len();
                 actions[idx]
             }
+            NlheBaselinePolicy::RandomNoFold => random_no_fold_action(actions, rng),
             NlheBaselinePolicy::CallStation => passive_action(actions, true),
             NlheBaselinePolicy::OverlyTight => tight_action(state, actions)?,
             NlheBaselinePolicy::EquityEv => equity_ev_action(state, actions, rng)?,
@@ -303,6 +307,28 @@ fn strategy_distribution(
         }
     }
     Ok(out)
+}
+
+fn random_no_fold_action(
+    actions: &[SimplifiedNlheAction],
+    rng: &mut dyn RngSource,
+) -> SimplifiedNlheAction {
+    let non_fold_count = actions
+        .iter()
+        .filter(|a| !matches!(a, SimplifiedNlheAction::Fold))
+        .count();
+    if non_fold_count == 0 {
+        let idx = (rng.next_u64() as usize) % actions.len();
+        return actions[idx];
+    }
+
+    let target = (rng.next_u64() as usize) % non_fold_count;
+    actions
+        .iter()
+        .copied()
+        .filter(|a| !matches!(a, SimplifiedNlheAction::Fold))
+        .nth(target)
+        .expect("target index is bounded by non_fold_count")
 }
 
 fn passive_action(
