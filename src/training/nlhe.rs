@@ -3,7 +3,8 @@
 //! 简化 NLHE 范围：2-player + 200 BB starting stack + 盲注 0.5/1.0 BB +
 //! 完整 4 街 + stage 2 `DefaultActionAbstraction`（6-action：{0.5p, 1p, 2p} +
 //! Fold/Check/Call/AllIn）+ stage 2 `PreflopLossless169` +
-//! `PostflopBucketAbstraction`（500/500/500 bucket）。
+//! `PostflopBucketAbstraction`（当前训练入口支持 500/500/500 与 1000/1000/1000
+//! postflop bucket 表）。
 //! 复用 stage 1 [`crate::GameState`] + stage 2 [`crate::ActionAbstraction`] /
 //! [`crate::InfoAbstraction`] / [`crate::BucketTable`]，仅在 `SimplifiedNlheGame`
 //! 适配层把 stage 1 `GameState` 包装成 [`Game`] trait state。
@@ -22,10 +23,10 @@
 //! 时显式 `n_seats=2`。
 //!
 //! Bucket table 依赖 = production artifact（v4）
-//! `artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin`
+//! `artifacts/bucket_table_default_{500,1000}_{500,1000}_{500,1000}_seed_cafebabe_schemav4.bin`
 //! （schema_version=4 / feature_set_id=2 / 16-dim hist+OCHS）。v4 = v3 layout +
-//! shape-major canonical id 编号（旧 v3 artifact 需重算）。`SimplifiedNlheGame::new`
-//! 校验 `schema_version() == 4` + `config() == BucketConfig::new(500, 500, 500)`。
+//! shape-major canonical id 编号（旧 v3 artifact 需重排）。`SimplifiedNlheGame::new`
+//! 校验 `schema_version() == 4` + supported postflop bucket config。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -54,15 +55,17 @@ pub type SimplifiedNlheAction = AbstractAction;
 ///
 /// 直接走 stage 2 64-bit `InfoSetId`（D-215 layout）。preflop 走
 /// `PreflopLossless169` hand_class 169 等价类；postflop 走 stage 2 `BucketTable`
-/// lookup（D-314-rev1 v3 artifact 500/500/500 bucket）。
+/// lookup（D-314-rev1 v4 production bucket table）。
 pub type SimplifiedNlheInfoSet = InfoSetId;
 
-/// 简化 NLHE expected `BucketConfig`（D-313）：preflop 169 lossless（不走 bucket
-/// table）+ flop/turn/river 各 500 bucket（§G-batch1 §3.10 v3 production lock）。
-fn expected_bucket_config() -> BucketConfig {
-    // BucketConfig::new 失败仅当任意 street bucket count 越界 [10, 10_000]
-    // （D-214）；500/500/500 严格在范围内，构造永远成功。
-    BucketConfig::new(500, 500, 500).expect("BucketConfig::new(500,500,500) within D-214 range")
+/// 简化 NLHE supported `BucketConfig`（D-313-rev）：preflop 169 lossless（不走
+/// bucket table）+ postflop production bucket 表。500/500/500 是历史 baseline；
+/// 1000/1000/1000 是 v4 feature 数据重排后的当前训练目标。
+fn is_supported_bucket_config(cfg: BucketConfig) -> bool {
+    cfg == BucketConfig::default_500_500_500()
+        || cfg
+            == BucketConfig::new(1000, 1000, 1000)
+                .expect("BucketConfig::new(1000,1000,1000) within D-214 range")
 }
 
 /// 简化 NLHE expected `BucketTable` schema_version。直接锚定
@@ -138,7 +141,7 @@ impl SimplifiedNlheGame {
     ///
     /// 校验项（D-314-rev1）：
     /// - `BucketTable::schema_version()` == `4`（v1/v2/v3 已废弃）
-    /// - `BucketTable::config()` == `BucketConfig::new(500, 500, 500)`
+    /// - `BucketTable::config()` is supported (`500/500/500` or `1000/1000/1000`)
     ///
     /// 失败路径：[`TrainerError::UnsupportedBucketTable`]。`expected` 字段
     /// 编码 `schema_version`；`got` 字段编码实际 schema_version（schema 不匹配）
@@ -152,8 +155,7 @@ impl SimplifiedNlheGame {
             });
         }
         let cfg = bucket_table.config();
-        let expected = expected_bucket_config();
-        if cfg.flop != expected.flop || cfg.turn != expected.turn || cfg.river != expected.river {
+        if !is_supported_bucket_config(cfg) {
             // 复用 UnsupportedBucketTable variant 表达 config 不匹配（schema 路径
             // 也走该 variant；`got = 0` 让区分通过日志上下文判断）。stage 3
             // F1 / F2 [测试 / 实现] 评估是否引入新 variant
@@ -371,7 +373,7 @@ impl Game for SimplifiedNlheGame {
             StreetTag::Flop | StreetTag::Turn | StreetTag::River => {
                 // D-317 postflop：走 stage 2 `BucketTable::lookup` 命中
                 // cluster id（D-218-rev2 真等价类 canonical_observation_id +
-                // §G-batch1 §3.10 v3 production lookup 表）。
+                // §G-batch1 §3.10 v4 production lookup 表）。
                 let observation =
                     canonical_observation_id(street_tag, state.game_state.board(), hole);
                 state
@@ -382,7 +384,7 @@ impl Game for SimplifiedNlheGame {
         };
         debug_assert!(
             hand_bucket < (1u32 << 16),
-            "hand_bucket={hand_bucket} 超 u16 cache slot 上限；preflop ≤ 169 / postflop ≤ 500"
+            "hand_bucket={hand_bucket} 超 u16 cache slot 上限；preflop ≤ 169 / postflop ≤ 1000"
         );
         let hand_bucket_u16 = hand_bucket as u16;
 

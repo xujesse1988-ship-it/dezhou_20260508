@@ -147,9 +147,9 @@ fn out_of_memory_construction_trip_wire() {
 
 #[test]
 fn simplified_nlhe_new_with_wrong_bucket_config_returns_unsupported_bucket_table() {
-    // `SimplifiedNlheGame::new` 校验 `BucketTable::config() == (500, 500, 500)`；
-    // config (100, 100, 100) 走 second branch 返回
-    // `UnsupportedBucketTable { expected: 3, got: 0 }`（got=0 让 caller 通过
+    // `SimplifiedNlheGame::new` 校验 supported postflop bucket config；
+    // config (100, 100, 100) 不在生产白名单，走 second branch 返回
+    // `UnsupportedBucketTable { expected: 4, got: 0 }`（got=0 让 caller 通过
     // schema_version 路径区分 vs config 路径）。
     let bucket_cfg = BucketConfig::new(100, 100, 100).expect("100 in [10, 10000]");
     let table = BucketTable::stub_for_postflop(bucket_cfg);
@@ -166,6 +166,14 @@ fn simplified_nlhe_new_with_wrong_bucket_config_returns_unsupported_bucket_table
         }
         other => panic!("expected UnsupportedBucketTable, got {other:?}"),
     }
+}
+
+#[test]
+fn simplified_nlhe_new_config_1000_1000_1000_is_supported() {
+    let bucket_cfg = BucketConfig::new(1000, 1000, 1000).expect("1000 in [10, 10000]");
+    let table = BucketTable::stub_for_postflop(bucket_cfg);
+    SimplifiedNlheGame::new(Arc::new(table))
+        .expect("1000/1000/1000 v4 bucket config 应被训练入口接受");
 }
 
 #[test]
