@@ -19,23 +19,21 @@
 //! - **vanilla**（`rescale_all` 不触发）：dense 只提交访问过的 slot（稀疏，但
 //!   ES-MCCFR traverser 节点全 fan-out 会铺开大量 infoset）→ 实测峰值 **~3.8 GiB**。
 //!   vultr（7.7 GiB）充裕，是 dense recurse byte-equal 的主验证。
-//! - **LCFR**：`rescale_all` 扫**整张表** → 提交全部 4.62 GiB dense；再叠 HashMap
-//!   对照表（traverser fan-out 下很快饱和到 ~2 GiB，**与 update 数几乎无关**——1000
-//!   与 5000 update 实测峰值都是 ~7.33 GiB）+ bucket 0.55 GiB → 峰值 **~7.33 GiB**。
-//!   这逼近 vultr 7.7 GiB 上限（idle 时实测 0 swap 通过，但无余量）。dense 与 HashMap
-//!   对照表必须同时在场才能比，glibc 又不把 HashMap 释放的 arena 还给 OS，**没法靠
-//!   先 drop 再分配压下来**——这条路属 **≥ ~10 GiB 机器**，不是 vultr-safe。
+//! - **LCFR**：dense `rescale_all` 走表级 lazy scale，不再扫完整数组 / 提交所有
+//!   pages；峰值重新由实际访问 slot + HashMap 对照表决定。由于 lazy scale 改变
+//!   rescale 后的 f64 运算顺序，LCFR 对照用 tight tolerance 验证策略语义，不再要求
+//!   HashMap eager path 的 `to_bits` 逐位相等。
 //!
 //! 拆成两个 `#[ignore]` test，**各自单独一次 `cargo test` 调用**跑（同进程顺序跑会
 //! 因 glibc 不及时还内存叠加）：
 //! ```bash
 //! # vultr 安全：
 //! cargo test --release --test dense_nlhe_trainer dense_es_mccfr_byte_equal_hashmap_vanilla -- --ignored
-//! # 需 ≥ ~10 GiB 机器（vultr idle 勉强过，无余量）：
+//! # LCFR lazy scale 语义对照：
 //! cargo test --release --test dense_nlhe_trainer dense_es_mccfr_byte_equal_hashmap_lcfr     -- --ignored
 //! ```
 //! **目标扩张 profile（359.6M / 两表 13.48 GiB）vultr 装不下**，需 32–64 GB 机器
-//! （见 plan §验证门槛）。LCFR rescale byte-equal 本身已由 Phase 1 `nlhe_dense` 单测
+//! （见 plan §验证门槛）。LCFR lazy rescale 语义本身已由 Phase 1 `nlhe_dense` 单测
 //! （`rescale_all` vs HashMap，合成 delta）覆盖；本 LCFR 集成 test 额外验的是 trainer
 //! 把 `maybe_lcfr_rescale` 接在正确 boundary 上。
 //!
@@ -86,6 +84,12 @@ fn bits_eq(a: &[f64], b: &[f64]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
+/// LCFR lazy scale 与 HashMap eager rescale 的 f64 运算顺序不同；用 tight tolerance
+/// 比较策略概率。
+fn close_eq(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (*x - *y).abs() <= 1.0e-12)
+}
+
 /// 跑一个 scenario：建 dense + HashMap 两 trainer（同 seed），lockstep `updates` 步，
 /// 对所有 HashMap 已访问 infoset 比较 `average_strategy` / `current_strategy` byte-equal。
 /// 返回 (已访问 infoset 数, 比较通过数)。trainer 在函数返回时 drop（释放 ~4.6 GiB）。
@@ -119,16 +123,26 @@ fn run_scenario(bucket_table: &Arc<BucketTable>, lcfr_period: Option<u64>, updat
     for &info in &visited {
         let avg_hm = hm.average_strategy(&info);
         let avg_dense = dense.average_strategy(info);
+        let avg_ok = if lcfr_period.is_some() {
+            close_eq(&avg_hm, &avg_dense)
+        } else {
+            bits_eq(&avg_hm, &avg_dense)
+        };
         assert!(
-            bits_eq(&avg_hm, &avg_dense),
-            "average_strategy byte mismatch @ info {:#x} (lcfr={lcfr_period:?}): hm={avg_hm:?} dense={avg_dense:?}",
+            avg_ok,
+            "average_strategy mismatch @ info {:#x} (lcfr={lcfr_period:?}): hm={avg_hm:?} dense={avg_dense:?}",
             info.raw()
         );
         let cur_hm = hm.current_strategy(&info);
         let cur_dense = dense.current_strategy(info);
+        let cur_ok = if lcfr_period.is_some() {
+            close_eq(&cur_hm, &cur_dense)
+        } else {
+            bits_eq(&cur_hm, &cur_dense)
+        };
         assert!(
-            bits_eq(&cur_hm, &cur_dense),
-            "current_strategy byte mismatch @ info {:#x} (lcfr={lcfr_period:?})",
+            cur_ok,
+            "current_strategy mismatch @ info {:#x} (lcfr={lcfr_period:?})",
             info.raw()
         );
     }
@@ -148,12 +162,11 @@ fn dense_es_mccfr_byte_equal_hashmap_vanilla() {
     eprintln!("[dense byte-equal] vanilla: {n} infoset byte-equal ✓");
 }
 
-/// LCFR period=1000 byte-equal：5000 update 跨 5 个 period boundary，regret +
-/// strategy_sum 双 rescale。**峰值 ~7.33 GiB**（full-dense rescale 全提交 + HashMap
-/// 对照表 ~2 GiB + bucket，与 update 数几乎无关），需 ≥ ~10 GiB 机器；vultr idle
-/// 勉强过、无余量。**单独一次 cargo test 调用跑**。
+/// LCFR period=1000：5000 update 跨 5 个 period boundary，regret + strategy_sum
+/// 双 rescale。dense 侧 rescale 为 global lazy scale；与 HashMap eager path 用 tight
+/// tolerance 对照策略语义。**单独一次 cargo test 调用跑**。
 #[test]
-#[ignore = "LCFR：峰值 ~7.33 GiB（>vultr 余量），需 ≥ ~10 GiB 机器；release --ignored 单独跑"]
+#[ignore = "LCFR lazy scale 语义对照；release --ignored 单独跑"]
 fn dense_es_mccfr_byte_equal_hashmap_lcfr() {
     let Some(bucket_table) = load_bucket_table_or_skip() else {
         return;

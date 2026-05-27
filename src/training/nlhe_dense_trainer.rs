@@ -7,7 +7,8 @@
 //! 泛型化成 storage trait——那会动到 Kuhn / Leduc / generic trainer 的签名与既有
 //! 测试。低风险路线是新增本 NLHE 专用 trainer，稳定后再评估抽 `RegretStorage` trait。
 //!
-//! **byte-equal 来源**：与 HashMap 路径在同 seed 下逐位相等，靠确定性 lockstep——
+//! **vanilla byte-equal 来源**：与 HashMap 路径在同 seed 下逐位相等，靠确定性
+//! lockstep——
 //! - `step` 的 traverser、`root(rng)` 发牌、recurse 结构、`sample_discrete` 采样全
 //!   与 [`crate::training::trainer::EsMccfrTrainer::step`] 一致 → 消费 rng 完全一致 →
 //!   同一 sampled trajectory。
@@ -16,9 +17,12 @@
 //! - 归纳：update 0 两表皆空 → σ 全 uniform → 同采样；第 t 步前两路径每个 infoset 值
 //!   逐位相等 → σ 逐位相等 → 同采样 → 同 trajectory → 第 t 步后仍逐位相等。
 //!
+//! LCFR 开启后 dense `rescale_all` 走 global lazy scale，不再复刻 HashMap eager
+//! rescale 的逐 slot f64 运算顺序；策略语义仍等价，但 `to_bits` 不再作为跨后端合同。
+//!
 //! **Phase 3**（已落地）：[`DenseNlheEsMccfrTrainer::step_parallel`] 走
 //! deterministic local-delta + merge（镜像 [`crate::training::trainer::EsMccfrTrainer::step_parallel`]，
-//! 与其 byte-equal）。**Phase 4**（已落地）：`save_checkpoint` / `load_checkpoint`
+//! vanilla 下与其 byte-equal）。**Phase 4**（已落地）：`save_checkpoint` / `load_checkpoint`
 //! 走 dense raw v3（[`crate::training::nlhe_dense_checkpoint`]），`from_hashmap_checkpoint`
 //! 单向加载旧 v2 HashMap ckpt。本 trainer **不实现** [`crate::training::Trainer`] trait
 //! （它是泛型 `Trainer<G>`，dense 是 NLHE 专属；保持 inherent 方法避免耦合 Kuhn/Leduc

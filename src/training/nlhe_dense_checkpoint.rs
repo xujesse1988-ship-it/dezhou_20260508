@@ -32,8 +32,8 @@
 //! | `action_count_blake3` | 128 | 32 | per-node (street,bucket_count,action_count) hash |
 //! | `regret_touched` | 160 | `8·⌈rows/64⌉` | bitset words u64 LE |
 //! | `strategy_touched` | … | `8·⌈rows/64⌉` | bitset words u64 LE |
-//! | `regret_values` | … | `8·total_slots` | raw f64 LE |
-//! | `strategy_values` | … | `8·total_slots` | raw f64 LE |
+//! | `regret_values` | … | `8·total_slots` | logical f64 LE（lazy scale 已 materialize 到流中） |
+//! | `strategy_values` | … | `8·total_slots` | logical f64 LE（lazy scale 已 materialize 到流中） |
 //! | `trailer_blake3` | `len-32` | 32 | BLAKE3 over 上面全部 byte |
 //!
 //! save / load 都 **streaming**（chunked，BufWriter / BufReader + 增量 BLAKE3），峰值
@@ -200,8 +200,18 @@ pub fn save_dense_checkpoint(
     write_hashed(&mut writer, &mut hasher, &header)?;
     write_words(&mut writer, &mut hasher, regret.touched_words())?;
     write_words(&mut writer, &mut hasher, strategy_sum.touched_words())?;
-    write_f64s(&mut writer, &mut hasher, regret.raw_values())?;
-    write_f64s(&mut writer, &mut hasher, strategy_sum.raw_values())?;
+    write_f64s_scaled(
+        &mut writer,
+        &mut hasher,
+        regret.raw_values(),
+        regret.global_scale(),
+    )?;
+    write_f64s_scaled(
+        &mut writer,
+        &mut hasher,
+        strategy_sum.raw_values(),
+        strategy_sum.global_scale(),
+    )?;
     let trailer: [u8; 32] = hasher.finalize().into();
     writer
         .write_all(&trailer)
@@ -413,12 +423,17 @@ fn write_words<W: Write>(w: &mut W, h: &mut Hasher, words: &[u64]) -> Result<(),
     Ok(())
 }
 
-fn write_f64s<W: Write>(w: &mut W, h: &mut Hasher, vals: &[f64]) -> Result<(), CheckpointError> {
+fn write_f64s_scaled<W: Write>(
+    w: &mut W,
+    h: &mut Hasher,
+    vals: &[f64],
+    scale: f64,
+) -> Result<(), CheckpointError> {
     let mut buf = [0u8; CHUNK_BYTES];
     for chunk in vals.chunks(CHUNK_ELEMS) {
         let mut off = 0;
         for &v in chunk {
-            buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+            buf[off..off + 8].copy_from_slice(&(v * scale).to_le_bytes());
             off += 8;
         }
         write_hashed(w, h, &buf[..off])?;
@@ -522,8 +537,12 @@ mod tests {
         }
     }
 
-    fn bits(v: &[f64]) -> Vec<u64> {
-        v.iter().map(|x| x.to_bits()).collect()
+    fn logical_bits(table: &DenseNlheTable) -> Vec<u64> {
+        table
+            .raw_values()
+            .iter()
+            .map(|x| (x * table.global_scale()).to_bits())
+            .collect()
     }
 
     /// save → load 后 meta / 两表 raw values（byte-equal）/ touched bitset 完全一致。
@@ -550,15 +569,17 @@ mod tests {
 
         assert_eq!(loaded_meta, meta, "meta roundtrip");
         assert_eq!(
-            bits(loaded_regret.raw_values()),
-            bits(regret.raw_values()),
-            "regret raw values byte-equal"
+            logical_bits(&loaded_regret),
+            logical_bits(&regret),
+            "regret logical values byte-equal"
         );
         assert_eq!(
-            bits(loaded_strategy.raw_values()),
-            bits(strategy.raw_values()),
-            "strategy raw values byte-equal"
+            logical_bits(&loaded_strategy),
+            logical_bits(&strategy),
+            "strategy logical values byte-equal"
         );
+        assert_eq!(loaded_regret.global_scale().to_bits(), 1.0_f64.to_bits());
+        assert_eq!(loaded_strategy.global_scale().to_bits(), 1.0_f64.to_bits());
         assert_eq!(
             loaded_regret.touched_words(),
             regret.touched_words(),

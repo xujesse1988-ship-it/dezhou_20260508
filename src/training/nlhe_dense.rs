@@ -25,6 +25,8 @@
 //!   [`crate::training::regret::StrategyAccumulator::average_strategy`] 同一 sum + 除法。
 //! - full dense 下「未访问行」恒为 `0.0`，与 HashMap「key 缺失」走同一退化分支
 //!   （均匀分布），故对外可观测策略 byte-equal。
+//! - LCFR `rescale_all` 走 dense-only 表级 lazy scale：period boundary 只更新一个
+//!   全局正 scale，后续 delta 按当前 scale 折回 raw storage；不扫满整张表。
 //!
 //! `touched_rows` bitset 不参与上面这条 byte-equal 语义（全 0 行本就退化成 uniform）；
 //! 它服务于 Phase 2+ 的 Trainer public query「未见 infoset 返回空 `Vec`」语义、
@@ -204,6 +206,10 @@ impl NlheDenseIndexer {
 #[derive(Debug)]
 pub struct DenseNlheTable {
     indexer: Arc<NlheDenseIndexer>,
+    /// 物理存储值满足 `logical_value = values[i] * global_scale`。LCFR 正因子
+    /// rescale 只更新本标量；新增 delta 写入 `delta / global_scale`，从而保持逻辑
+    /// 表语义而不触碰未访问 page。
+    global_scale: f64,
     values: Vec<f64>,
     touched_rows: TouchedRows,
 }
@@ -215,6 +221,7 @@ impl DenseNlheTable {
         let total_rows = indexer.total_rows();
         Self {
             indexer,
+            global_scale: 1.0,
             values: vec![0.0; total_slots as usize],
             touched_rows: TouchedRows::new(total_rows),
         }
@@ -245,8 +252,15 @@ impl DenseNlheTable {
             delta.len(),
             self.values.len()
         );
-        for (slot, &d) in self.values[start..end].iter_mut().zip(delta) {
-            *slot += d;
+        if self.global_scale == 1.0 {
+            for (slot, &d) in self.values[start..end].iter_mut().zip(delta) {
+                *slot += d;
+            }
+        } else {
+            let scale = self.global_scale;
+            for (slot, &d) in self.values[start..end].iter_mut().zip(delta) {
+                *slot += d / scale;
+            }
         }
         self.touched_rows.set(row_index);
     }
@@ -288,12 +302,14 @@ impl DenseNlheTable {
         let n = action_count;
         let start = slot_start as usize;
         let regrets = &self.values[start..start + n];
+        let scale = self.global_scale;
 
         let uniform = || SigmaVec::from_elem(1.0 / n as f64, n);
         let mut positives: SigmaVec = SigmaVec::with_capacity(n);
         let mut sum = 0.0_f64;
         for &r in regrets {
-            let r_plus = if r > 0.0 { r } else { 0.0 };
+            let logical = r * scale;
+            let r_plus = if logical > 0.0 { logical } else { 0.0 };
             positives.push(r_plus);
             sum += r_plus;
         }
@@ -322,24 +338,45 @@ impl DenseNlheTable {
         let n = slot.action_count;
         let start = slot.slot_start as usize;
         let sums = &self.values[start..start + n];
+        let scale = self.global_scale;
 
-        let total: f64 = sums.iter().sum();
+        let total: f64 = sums.iter().map(|s| s * scale).sum();
         if total > 0.0 {
-            sums.iter().map(|s| s / total).collect()
+            sums.iter().map(|s| (s * scale) / total).collect()
         } else {
             vec![1.0 / n as f64; n]
         }
     }
 
-    /// 整表逐元素 × factor（LCFR period boundary rescale，语义同
+    /// 逻辑整表 × factor（LCFR period boundary rescale，语义同
     /// [`crate::training::regret::RegretTable::rescale_all`]）。
     ///
-    /// full dense 下扫满整张表，未访问行 `0.0 * factor == 0.0` 无副作用——对可观测
-    /// 策略与 HashMap「只 scale 已访问 entry」byte-equal（缺失 entry 隐含 0）。
+    /// LCFR 正因子走表级 lazy scale：只更新 `global_scale`，不扫满 `values`。
+    /// 非正 / NaN / Inf 等非 LCFR 因子退回 eager materialize，保持旧 public 行为。
     pub fn rescale_all(&mut self, factor: f64) {
-        for slot in self.values.iter_mut() {
+        let next_scale = self.global_scale * factor;
+        if factor > 0.0 && next_scale.is_finite() && next_scale != 0.0 {
+            self.global_scale = next_scale;
+            return;
+        }
+
+        self.materialize_global_scale();
+        for slot in &mut self.values {
             *slot *= factor;
         }
+    }
+
+    /// 把 lazy scale 刷回 raw storage（仅非 LCFR rescale fallback / checkpoint 诊断
+    /// 需要；正常 period boundary 不调用）。
+    fn materialize_global_scale(&mut self) {
+        if self.global_scale == 1.0 {
+            return;
+        }
+        let scale = self.global_scale;
+        for slot in &mut self.values {
+            *slot *= scale;
+        }
+        self.global_scale = 1.0;
     }
 
     /// 该 infoset 行各 slot 值之和（只读诊断）。strategy_sum 表上 `> 0` 等价 HashMap
@@ -348,7 +385,10 @@ impl DenseNlheTable {
     pub fn row_sum_by_info(&self, info: InfoSetId) -> f64 {
         let slot = self.indexer.locate(info);
         let start = slot.slot_start as usize;
-        self.values[start..start + slot.action_count].iter().sum()
+        self.values[start..start + slot.action_count]
+            .iter()
+            .map(|v| v * self.global_scale)
+            .sum()
     }
 
     /// 某行是否被写过（Phase 2+ public query「未见 infoset 返回空 `Vec`」语义入口）。
@@ -361,13 +401,18 @@ impl DenseNlheTable {
         self.touched_rows.count()
     }
 
-    /// raw 扁平 values 只读 slice（Phase 4 checkpoint save：直接写 raw f64 LE）。
+    /// 当前 lazy scale（Phase 4 checkpoint save：流式写出 `raw * scale` 逻辑值）。
+    pub(crate) fn global_scale(&self) -> f64 {
+        self.global_scale
+    }
+
+    /// raw 扁平 values 只读 slice（内部物理存储；逻辑值需乘 [`Self::global_scale`]）。
     pub(crate) fn raw_values(&self) -> &[f64] {
         &self.values
     }
 
-    /// raw 扁平 values 可写 slice（Phase 4 checkpoint load：streaming 填回 raw f64）。
-    /// 调用方负责保证写入长度 == `num_slots()`。
+    /// raw 扁平 values 可写 slice（Phase 4 checkpoint load：streaming 填回逻辑 f64，
+    /// 新表 scale 为 1）。调用方负责保证写入长度 == `num_slots()`。
     pub(crate) fn raw_values_mut(&mut self) -> &mut [f64] {
         &mut self.values
     }
@@ -599,15 +644,32 @@ mod tests {
         v.iter().map(|x| x.to_bits()).collect()
     }
 
+    fn assert_close(actual: &[f64], expected: &[f64], ctx: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{ctx}: strategy length mismatch"
+        );
+        for (i, (&a, &e)) in actual.iter().zip(expected).enumerate() {
+            let diff = (a - e).abs();
+            assert!(
+                diff <= 1.0e-12,
+                "{ctx}: action {i} differs: actual={a:?} expected={e:?} diff={diff:e}"
+            );
+        }
+    }
+
     /// dense 表的 current_strategy / average_strategy 必须与 HashMap
-    /// `RegretTable` / `StrategyAccumulator` 在同一 delta 序列下 **byte-equal**
-    /// （f64 to_bits 逐位）。对相同 info 多次累积 + 含负 regret + rescale，覆盖：
+    /// `RegretTable` / `StrategyAccumulator` 在同一 delta 序列下语义一致。LCFR lazy
+    /// scale 改变 rescale 后的 f64 运算顺序，因此含 rescale 场景不再要求 HashMap
+    /// eager path 的 `to_bits` 逐位相等。对相同 info 多次累积 + 含负 regret + rescale，
+    /// 覆盖：
     /// - R⁺ clamp（负 regret → 0）
     /// - Σ R⁺ == 0 退化 uniform（全负）
     /// - 未访问 info 退化 uniform
-    /// - 多节点不串扰（串扰会让某 info 策略偏离 HashMap，被逐位比较抓到）
+    /// - 多节点不串扰（串扰会让某 info 策略偏离 HashMap，被比较抓到）
     #[test]
-    fn byte_equal_vs_hashmap_under_synthetic_deltas() {
+    fn lazy_rescale_matches_hashmap_strategy_semantics_under_synthetic_deltas() {
         let specs = [
             spec(StreetTag::Preflop, 3, 3),
             spec(StreetTag::Flop, 4, 6),
@@ -659,17 +721,15 @@ mod tests {
 
         // 已访问 info：current_strategy + average_strategy 必须逐位相等。
         for &(info, n) in &visited {
-            assert_eq!(
-                bits(&regret_hm.current_strategy(&info, n)),
-                bits(&regret_dense.current_strategy_by_info(info)),
-                "current_strategy byte mismatch @ info {:#x}",
-                info.raw()
+            assert_close(
+                &regret_dense.current_strategy_by_info(info),
+                &regret_hm.current_strategy(&info, n),
+                &format!("current_strategy @ info {:#x}", info.raw()),
             );
-            assert_eq!(
-                bits(&strat_hm.average_strategy(&info, n)),
-                bits(&strat_dense.average_strategy_by_info(info)),
-                "average_strategy byte mismatch @ info {:#x}",
-                info.raw()
+            assert_close(
+                &strat_dense.average_strategy_by_info(info),
+                &strat_hm.average_strategy(&info, n),
+                &format!("average_strategy @ info {:#x}", info.raw()),
             );
         }
 
@@ -679,18 +739,49 @@ mod tests {
                 let info = pack_info_set_v2(bucket, node_id as NodeId, s.street);
                 let n = usize::from(s.action_count);
                 assert!(!regret_dense.touched_row(idx.locate(info).row_index));
-                assert_eq!(
-                    bits(&regret_hm.current_strategy(&info, n)),
-                    bits(&regret_dense.current_strategy_by_info(info)),
-                    "未访问 current_strategy 应均匀且 byte-equal"
+                assert_close(
+                    &regret_dense.current_strategy_by_info(info),
+                    &regret_hm.current_strategy(&info, n),
+                    "未访问 current_strategy 应均匀且一致",
                 );
-                assert_eq!(
-                    bits(&strat_hm.average_strategy(&info, n)),
-                    bits(&strat_dense.average_strategy_by_info(info)),
-                    "未访问 average_strategy 应均匀且 byte-equal"
+                assert_close(
+                    &strat_dense.average_strategy_by_info(info),
+                    &strat_hm.average_strategy(&info, n),
+                    "未访问 average_strategy 应均匀且一致",
                 );
             }
         }
+    }
+
+    /// LCFR dense-only lazy scale：正因子 rescale 只更新全局 scale，不扫 raw values；
+    /// 对外 row sum / strategy 仍按逻辑值读取。
+    #[test]
+    fn positive_rescale_is_global_lazy_scale() {
+        let specs = [spec(StreetTag::Preflop, 2, 3)];
+        let idx = Arc::new(NlheDenseIndexer::from_node_specs(specs.iter().copied()));
+        let mut table = DenseNlheTable::new(Arc::clone(&idx));
+        let info = pack_info_set_v2(0, 0, StreetTag::Preflop);
+        table.accumulate_by_info(info, &[1.0, 2.0, 3.0]);
+        let raw_before = bits(table.raw_values());
+
+        table.rescale_all(2.0 / 3.0);
+
+        assert_eq!(
+            bits(table.raw_values()),
+            raw_before,
+            "raw values must stay lazy"
+        );
+        assert_eq!(table.global_scale().to_bits(), (2.0_f64 / 3.0).to_bits());
+        assert_eq!(
+            table.row_sum_by_info(info).to_bits(),
+            4.0_f64.to_bits(),
+            "logical row sum should include global scale"
+        );
+        assert_close(
+            &table.average_strategy_by_info(info),
+            &[1.0 / 6.0, 2.0 / 6.0, 3.0 / 6.0],
+            "average strategy after lazy rescale",
+        );
     }
 
     /// touched bitset：只标记被 accumulate 过的行，count 等于不同访问行数。
