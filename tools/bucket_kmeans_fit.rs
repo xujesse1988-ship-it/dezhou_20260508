@@ -2,8 +2,10 @@
 //!
 //! 读取 Stage 1 三街 `features_<street>.bin` → 校验文件 BLAKE3 + header →
 //! 抽取 f32 features + 算 per-sample `reorder_key_ehs` → 调
-//! [`BucketTable::train_v3_in_memory`] 跑 k-means + reorder + 量化 → 写 v3
-//! bucket_table artifact + 旁路 `.b3sum`（whole-file BLAKE3，配 `b3sum -c` 使用）。
+//! [`BucketTable::train_v3_in_memory`] 跑 k-means + reorder + 量化 → 写 schema
+//! v4 bucket_table artifact（v3 feature layout + shape-major canonical id；函数名
+//! 里的 "v3" 指 feature/训练 layout，非 artifact schema_version）+ 旁路 `.b3sum`
+//! （whole-file BLAKE3，配 `b3sum -c` 使用）。
 //!
 //! 用法：
 //!

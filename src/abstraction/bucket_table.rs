@@ -391,9 +391,12 @@ impl BucketTable {
         }
     }
 
-    /// v3 in-memory 训练。
+    /// v3 layout in-memory 训练（产出 schema v4 artifact）。
     ///
-    /// 三街独立 k-means + D-236b reorder + u8 centroid 量化，组装成完整 v3 artifact。
+    /// 函数名里的 "v3" 指 feature/训练 layout（`StreetFeaturesV3`），写出来的
+    /// artifact `schema_version == 4`（v3 layout + shape-major canonical id）。
+    ///
+    /// 三街独立 k-means + D-236b reorder + u8 centroid 量化，组装成完整 schema v4 artifact。
     /// 同 (config, training_seed, flop/turn/river feature 内容 + feature_blake3) 输入下
     /// artifact byte-equal。
     ///
