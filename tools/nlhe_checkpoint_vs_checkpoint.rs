@@ -23,7 +23,10 @@ use poker::training::nlhe_dense_checkpoint::DENSE_MAGIC;
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::sampling::sample_discrete;
 use poker::training::{EsMccfrTrainer, Trainer};
-use poker::{BucketTable, ChaCha20Rng, InfoSetId, RngSource, SeatId, SimplifiedNlheGame};
+use poker::{
+    BucketTable, Card, ChaCha20Rng, ChipAmount, InfoSetId, Rank, RngSource, SeatId,
+    SimplifiedNlheGame, Street, Suit,
+};
 
 /// strategy_sum 全零（off-policy 未学过）的 infoset 退化为 `current_strategy`
 /// （regret matching），其余用 `average_strategy`。与 H3 评测套件同款 hybrid。
@@ -65,6 +68,7 @@ struct Args {
     max_actions_per_hand: usize,
     bb_chips: f64,
     fallback_policy: FallbackPolicy,
+    trace_hands: u64,
     output: Option<PathBuf>,
 }
 
@@ -127,6 +131,7 @@ usage: nlhe_checkpoint_vs_checkpoint \\
     [--bucket-table-a <A-bucket.bin>] [--bucket-table-b <B-bucket.bin>] \\
     [--hands-per-seat 50000] [--seed 0xC4EC4E0F] \\
     [--max-actions-per-hand 512] [--bb-chips 100.0] \\
+    [--trace-hands 0] \\
     [--fallback-policy hybrid|average|current] [--out report.md]
 
 `--bucket-table` 是 A/B 共用快捷参数；若 A/B 使用不同 bucket abstraction，
@@ -146,6 +151,7 @@ fn parse_args() -> Result<Args, String> {
     let mut max_actions_per_hand: usize = 512;
     let mut bb_chips: f64 = 100.0;
     let mut fallback_policy = FallbackPolicy::Hybrid;
+    let mut trace_hands: u64 = 0;
     let mut output: Option<PathBuf> = None;
 
     let mut it = std::env::args().skip(1);
@@ -174,6 +180,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--bb-chips" => bb_chips = next()?.parse().map_err(|e| format!("--bb-chips: {e}"))?,
             "--fallback-policy" => fallback_policy = FallbackPolicy::from_str(&next()?)?,
+            "--trace-hands" => {
+                trace_hands = next()?.parse().map_err(|e| format!("--trace-hands: {e}"))?
+            }
             "--out" => output = Some(PathBuf::from(next()?)),
             other => return Err(format!("unknown arg {other:?}\n\n{}", usage())),
         }
@@ -196,6 +205,7 @@ fn parse_args() -> Result<Args, String> {
         max_actions_per_hand,
         bb_chips,
         fallback_policy,
+        trace_hands,
         output,
     })
 }
@@ -288,7 +298,7 @@ fn run() -> Result<(), String> {
     );
 
     let t0 = Instant::now();
-    let report = evaluate_head_to_head(&trainer_a, &trainer_b, &args)?;
+    let (report, trace_md) = evaluate_head_to_head(&trainer_a, &trainer_b, &args)?;
     let wall = t0.elapsed().as_secs_f64();
 
     let json = H2hReport {
@@ -306,9 +316,10 @@ fn run() -> Result<(), String> {
     };
 
     let md = render_markdown(&json);
-    print!("{md}");
+    print!("{trace_md}{md}");
     if let Some(ref out) = args.output {
-        fs::write(out, &md).map_err(|e| format!("write {} failed: {e}", out.display()))?;
+        fs::write(out, format!("{trace_md}{md}"))
+            .map_err(|e| format!("write {} failed: {e}", out.display()))?;
         let json_path = out.with_extension("json");
         let json_text =
             serde_json::to_string_pretty(&json).map_err(|e| format!("serialize json: {e}"))?;
@@ -366,19 +377,31 @@ fn evaluate_head_to_head(
     trainer_a: &LoadedTrainer,
     trainer_b: &LoadedTrainer,
     args: &Args,
-) -> Result<H2hReport, String> {
+) -> Result<(H2hReport, String), String> {
     let mut all_a_pnl = Vec::with_capacity((args.hands_per_seat * 2) as usize);
     let mut a_as_sb_total = 0.0;
     let mut a_as_bb_total = 0.0;
+    let mut trace_md = String::new();
 
     // a_seat 轮换：A 先坐 SB(0) 打 hands_per_seat 手，再坐 BB(1) 打 hands_per_seat 手。
     for a_seat in [SeatId(0), SeatId(1)] {
         for hand_idx in 0..args.hands_per_seat {
+            let global_hand_idx = all_a_pnl.len() as u64;
             let seed = mix3(args.seed, a_seat.0 as u64, hand_idx);
             let mut rng_a = ChaCha20Rng::from_seed(seed);
             let mut rng_b = ChaCha20Rng::from_seed(seed);
             let root_a = trainer_a.game.root(&mut rng_a);
             let root_b = trainer_b.game.root(&mut rng_b);
+            let mut trace = (global_hand_idx < args.trace_hands).then(|| {
+                HandTrace::new(
+                    global_hand_idx + 1,
+                    hand_idx,
+                    seed,
+                    a_seat,
+                    &root_a,
+                    args.bb_chips,
+                )
+            });
             let terminal = rollout_head_to_head(
                 root_a,
                 root_b,
@@ -389,8 +412,13 @@ fn evaluate_head_to_head(
                 &mut rng_a,
                 &mut rng_b,
                 args.max_actions_per_hand,
+                trace.as_mut(),
             )?;
             let pnl = SimplifiedNlheGame::payoff(&terminal, a_seat.0);
+            if let Some(trace) = trace.as_mut() {
+                trace.finish(&terminal, a_seat, pnl);
+                trace_md.push_str(&trace.render());
+            }
             if a_seat == SeatId(0) {
                 a_as_sb_total += pnl;
             } else {
@@ -405,30 +433,33 @@ fn evaluate_head_to_head(
     let scale = 1000.0 / args.bb_chips;
     let mean_mbb = mean * scale;
     let se_mbb = se * scale;
-    Ok(H2hReport {
-        // 以下字段在 run() 中用 `..` 覆盖填入。
-        checkpoint_a: String::new(),
-        checkpoint_b: String::new(),
-        bucket_table_a: String::new(),
-        bucket_table_b: String::new(),
-        bucket_table_a_blake3: String::new(),
-        bucket_table_b_blake3: String::new(),
-        a_update_count: 0,
-        b_update_count: 0,
-        fallback_policy: args.fallback_policy,
-        wall_seconds: 0.0,
-        hands,
-        hands_per_seat: args.hands_per_seat,
-        seed: args.seed,
-        bb_chips: args.bb_chips,
-        a_total_chips: all_a_pnl.iter().sum(),
-        a_mbb_per_game: mean_mbb,
-        standard_error_mbb_per_game: se_mbb,
-        ci95_low_mbb_per_game: mean_mbb - 1.96 * se_mbb,
-        ci95_high_mbb_per_game: mean_mbb + 1.96 * se_mbb,
-        a_as_sb_mbb_per_game: (a_as_sb_total / args.hands_per_seat as f64) * scale,
-        a_as_bb_mbb_per_game: (a_as_bb_total / args.hands_per_seat as f64) * scale,
-    })
+    Ok((
+        H2hReport {
+            // 以下字段在 run() 中用 `..` 覆盖填入。
+            checkpoint_a: String::new(),
+            checkpoint_b: String::new(),
+            bucket_table_a: String::new(),
+            bucket_table_b: String::new(),
+            bucket_table_a_blake3: String::new(),
+            bucket_table_b_blake3: String::new(),
+            a_update_count: 0,
+            b_update_count: 0,
+            fallback_policy: args.fallback_policy,
+            wall_seconds: 0.0,
+            hands,
+            hands_per_seat: args.hands_per_seat,
+            seed: args.seed,
+            bb_chips: args.bb_chips,
+            a_total_chips: all_a_pnl.iter().sum(),
+            a_mbb_per_game: mean_mbb,
+            standard_error_mbb_per_game: se_mbb,
+            ci95_low_mbb_per_game: mean_mbb - 1.96 * se_mbb,
+            ci95_high_mbb_per_game: mean_mbb + 1.96 * se_mbb,
+            a_as_sb_mbb_per_game: (a_as_sb_total / args.hands_per_seat as f64) * scale,
+            a_as_bb_mbb_per_game: (a_as_bb_total / args.hands_per_seat as f64) * scale,
+        },
+        trace_md,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -442,8 +473,9 @@ fn rollout_head_to_head(
     rng_a: &mut dyn RngSource,
     rng_b: &mut dyn RngSource,
     max_actions: usize,
+    mut trace: Option<&mut HandTrace>,
 ) -> Result<SimplifiedNlheState, String> {
-    for _ in 0..max_actions {
+    for action_idx in 0..max_actions {
         let current = SimplifiedNlheGame::current(&state_a);
         let current_b = SimplifiedNlheGame::current(&state_b);
         if current != current_b {
@@ -472,7 +504,17 @@ fn rollout_head_to_head(
                 } else {
                     (&state_b, trainer_b)
                 };
-                let action = sample_action(state, actor, trainer, policy, rng_a)?;
+                let decision = sample_action(state, actor, trainer, policy, rng_a)?;
+                if let Some(trace) = trace.as_mut() {
+                    trace.record_decision(
+                        action_idx + 1,
+                        &state_a,
+                        actor,
+                        SeatId(actor) == a_seat,
+                        &decision,
+                    );
+                }
+                let action = decision.action;
                 state_a = SimplifiedNlheGame::next(state_a, action, rng_a);
                 state_b = SimplifiedNlheGame::next(state_b, action, rng_b);
             }
@@ -483,13 +525,19 @@ fn rollout_head_to_head(
     ))
 }
 
+struct ActionDecision {
+    info: InfoSetId,
+    distribution: Vec<(SimplifiedNlheAction, f64)>,
+    action: SimplifiedNlheAction,
+}
+
 fn sample_action(
     state: &SimplifiedNlheState,
     actor: u8,
     trainer: &LoadedTrainer,
     policy: FallbackPolicy,
     rng: &mut dyn RngSource,
-) -> Result<SimplifiedNlheAction, String> {
+) -> Result<ActionDecision, String> {
     let actions = SimplifiedNlheGame::legal_actions(state);
     if actions.is_empty() {
         return Err(format!(
@@ -500,7 +548,12 @@ fn sample_action(
     let info = SimplifiedNlheGame::info_set(state, actor);
     let raw = strategy_for(trainer, info, policy);
     let dist = strategy_distribution(&actions, &raw)?;
-    Ok(sample_discrete(&dist, rng))
+    let action = sample_discrete(&dist, rng);
+    Ok(ActionDecision {
+        info,
+        distribution: dist,
+        action,
+    })
 }
 
 fn strategy_for(trainer: &LoadedTrainer, info: InfoSetId, policy: FallbackPolicy) -> Vec<f64> {
@@ -549,6 +602,239 @@ fn strategy_distribution(
         .filter(|(_, p)| *p > 0.0)
         .map(|(action, p)| (action, p / sum))
         .collect())
+}
+
+struct HandTrace {
+    lines: Vec<String>,
+    bb_chips: f64,
+}
+
+impl HandTrace {
+    fn new(
+        display_hand_no: u64,
+        hand_idx_in_seat: u64,
+        seed: u64,
+        a_seat: SeatId,
+        root: &SimplifiedNlheState,
+        bb_chips: f64,
+    ) -> Self {
+        let mut trace = Self {
+            lines: Vec::new(),
+            bb_chips,
+        };
+        let b_seat = SeatId(1 - a_seat.0);
+        trace.lines.push(format!(
+            "## trace hand #{display_hand_no} (seat-loop hand_idx={hand_idx_in_seat}, seed={seed:#x}, A=P{}, B=P{})",
+            a_seat.0, b_seat.0
+        ));
+        trace.lines.push(format!(
+            "initial: street={} board={} pot={} | {} | {}",
+            street_label(root.game_state.street()),
+            format_cards(root.game_state.board()),
+            trace.fmt_chips(root.game_state.pot()),
+            trace.format_player(root, SeatId(0)),
+            trace.format_player(root, SeatId(1)),
+        ));
+        trace
+    }
+
+    fn record_decision(
+        &mut self,
+        step: usize,
+        state: &SimplifiedNlheState,
+        actor: u8,
+        is_a: bool,
+        decision: &ActionDecision,
+    ) {
+        let who = if is_a { "A" } else { "B" };
+        let actor = SeatId(actor);
+        self.lines.push(format!(
+            "{step:02}. {who}/P{} acts | street={} board={} pot={} node={} info={} bucket={} | {}",
+            actor.0,
+            street_label(state.game_state.street()),
+            format_cards(state.game_state.board()),
+            self.fmt_chips(state.game_state.pot()),
+            state.current_node_id,
+            format_info_set(decision.info),
+            decision.info.bucket_id(),
+            self.format_player(state, actor),
+        ));
+        self.lines.push(format!(
+            "    strategy: {}",
+            format_distribution(&decision.distribution, self.bb_chips)
+        ));
+        self.lines.push(format!(
+            "    chosen: {} (p={:.2}%)",
+            format_action(decision.action, self.bb_chips),
+            chosen_probability(&decision.distribution, decision.action) * 100.0
+        ));
+    }
+
+    fn finish(&mut self, terminal: &SimplifiedNlheState, a_seat: SeatId, a_pnl: f64) {
+        let payouts = terminal.game_state.payouts().unwrap_or_default();
+        let p0 = payouts
+            .iter()
+            .find(|(seat, _)| *seat == SeatId(0))
+            .map(|(_, pnl)| *pnl)
+            .unwrap_or(0);
+        let p1 = payouts
+            .iter()
+            .find(|(seat, _)| *seat == SeatId(1))
+            .map(|(_, pnl)| *pnl)
+            .unwrap_or(0);
+        self.lines.push(format!(
+            "terminal: street={} board={} pot={} | P0 pnl={} | P1 pnl={} | A(P{}) pnl={}",
+            street_label(terminal.game_state.street()),
+            format_cards(terminal.game_state.board()),
+            self.fmt_chips(terminal.game_state.pot()),
+            self.fmt_signed_chips(p0 as f64),
+            self.fmt_signed_chips(p1 as f64),
+            a_seat.0,
+            self.fmt_signed_chips(a_pnl),
+        ));
+        self.lines.push(String::new());
+    }
+
+    fn render(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn format_player(&self, state: &SimplifiedNlheState, seat: SeatId) -> String {
+        let player = &state.game_state.players()[seat.0 as usize];
+        let role = if seat.0 == 0 { "SB" } else { "BB" };
+        let hole = player
+            .hole_cards
+            .map(|cards| format_cards(&cards))
+            .unwrap_or_else(|| "-".to_string());
+        format!(
+            "P{}({role}) hole={} stack={} round_commit={} total_commit={} status={:?}",
+            seat.0,
+            hole,
+            self.fmt_chips(player.stack),
+            self.fmt_chips(player.committed_this_round),
+            self.fmt_chips(player.committed_total),
+            player.status,
+        )
+    }
+
+    fn fmt_chips(&self, chips: ChipAmount) -> String {
+        format_chips(chips.as_u64() as f64, self.bb_chips)
+    }
+
+    fn fmt_signed_chips(&self, chips: f64) -> String {
+        let sign = if chips >= 0.0 { "+" } else { "" };
+        format!("{sign}{}", format_chips(chips, self.bb_chips))
+    }
+}
+
+fn format_info_set(info: InfoSetId) -> String {
+    format!("{:#018x}", info.raw())
+}
+
+fn format_distribution(dist: &[(SimplifiedNlheAction, f64)], bb_chips: f64) -> String {
+    dist.iter()
+        .map(|(action, p)| format!("{}={:.2}%", format_action(*action, bb_chips), p * 100.0))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn chosen_probability(dist: &[(SimplifiedNlheAction, f64)], action: SimplifiedNlheAction) -> f64 {
+    dist.iter()
+        .find(|(candidate, _)| *candidate == action)
+        .map(|(_, p)| *p)
+        .unwrap_or(0.0)
+}
+
+fn format_action(action: SimplifiedNlheAction, bb_chips: f64) -> String {
+    match action {
+        SimplifiedNlheAction::Fold => "Fold".to_string(),
+        SimplifiedNlheAction::Check => "Check".to_string(),
+        SimplifiedNlheAction::Call { to } => format!("Call({})", format_to(to, bb_chips)),
+        SimplifiedNlheAction::Bet { to, ratio_label } => format!(
+            "Bet({},{})",
+            format_to(to, bb_chips),
+            format_ratio(ratio_label.as_milli())
+        ),
+        SimplifiedNlheAction::Raise { to, ratio_label } => format!(
+            "Raise({},{})",
+            format_to(to, bb_chips),
+            format_ratio(ratio_label.as_milli())
+        ),
+        SimplifiedNlheAction::AllIn { to } => format!("AllIn({})", format_to(to, bb_chips)),
+    }
+}
+
+fn format_to(to: ChipAmount, bb_chips: f64) -> String {
+    format!("to {}", format_chips(to.as_u64() as f64, bb_chips))
+}
+
+fn format_chips(chips: f64, bb_chips: f64) -> String {
+    if bb_chips > 0.0 {
+        format!("{:.2}bb", chips / bb_chips)
+    } else {
+        format!("{chips:.1} chips")
+    }
+}
+
+fn format_ratio(milli: u32) -> String {
+    match milli {
+        500 => "0.5p".to_string(),
+        1000 => "1.0p".to_string(),
+        2000 => "2.0p".to_string(),
+        other => format!("{:.3}p", other as f64 / 1000.0),
+    }
+}
+
+fn street_label(street: Street) -> &'static str {
+    match street {
+        Street::Preflop => "preflop",
+        Street::Flop => "flop",
+        Street::Turn => "turn",
+        Street::River => "river",
+        Street::Showdown => "showdown",
+    }
+}
+
+fn format_cards(cards: &[Card]) -> String {
+    if cards.is_empty() {
+        return "-".to_string();
+    }
+    cards
+        .iter()
+        .map(|card| format_card(*card))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn format_card(card: Card) -> String {
+    format!("{}{}", rank_label(card.rank()), suit_label(card.suit()))
+}
+
+fn rank_label(rank: Rank) -> &'static str {
+    match rank {
+        Rank::Two => "2",
+        Rank::Three => "3",
+        Rank::Four => "4",
+        Rank::Five => "5",
+        Rank::Six => "6",
+        Rank::Seven => "7",
+        Rank::Eight => "8",
+        Rank::Nine => "9",
+        Rank::Ten => "T",
+        Rank::Jack => "J",
+        Rank::Queen => "Q",
+        Rank::King => "K",
+        Rank::Ace => "A",
+    }
+}
+
+fn suit_label(suit: Suit) -> &'static str {
+    match suit {
+        Suit::Clubs => "c",
+        Suit::Diamonds => "d",
+        Suit::Hearts => "h",
+        Suit::Spades => "s",
+    }
 }
 
 fn sample_mean_se(xs: &[f64]) -> (f64, f64) {
