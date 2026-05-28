@@ -46,6 +46,13 @@ struct Args {
     /// 扩张时的内存爆炸。checkpoint 走 dense raw v3 格式（与 HashMap ckpt 不互通，
     /// resume 必须 dense ckpt；LCFR 元数据随 dense ckpt 恢复）。
     dense: bool,
+    /// 切到 dense **lock-free atomic** 并行路径（[`DenseNlheEsMccfrTrainer::step_parallel_lockfree`]，
+    /// `docs/temp/nlhe_dense_parallel_merge_alternatives_2026_05_28.md` §A）。worker 直接 CAS
+    /// add 主表，省 local delta + merge 阶段，throughput 高但 CAS race 顺序不定 →
+    /// **跨 run 不再 byte-equal**（deterministic merge 路径仍是 byte-equal anchor）。
+    /// 仅与 `--dense` 组合生效；`--threads 1` 走 `step()`，本旗等价 no-op。
+    /// checkpoint / resume 与 deterministic dense 互通（表 layout 同；只是写入路径不同）。
+    lockfree: bool,
 }
 
 impl Default for Args {
@@ -66,6 +73,7 @@ impl Default for Args {
             quiet: false,
             lcfr_period: None,
             dense: false,
+            lockfree: false,
         }
     }
 }
@@ -105,9 +113,18 @@ impl CfrBackend for EsMccfrTrainer<SimplifiedNlheGame> {
     }
 }
 
-impl CfrBackend for DenseNlheEsMccfrTrainer {
+/// dense backend 包装：`lockfree` 旗子决定 `step_parallel` 分派到 deterministic
+/// local-delta + merge ([`DenseNlheEsMccfrTrainer::step_parallel`]) 还是
+/// lock-free atomic CAS ([`DenseNlheEsMccfrTrainer::step_parallel_lockfree`])。
+/// 单线程路径不分流（`drive` 在 `args.threads == 1` 时走 `step()`）。
+struct DenseBackend {
+    inner: DenseNlheEsMccfrTrainer,
+    lockfree: bool,
+}
+
+impl CfrBackend for DenseBackend {
     fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError> {
-        DenseNlheEsMccfrTrainer::step(self, rng)
+        self.inner.step(rng)
     }
     fn step_parallel(
         &mut self,
@@ -115,13 +132,19 @@ impl CfrBackend for DenseNlheEsMccfrTrainer {
         n_threads: usize,
         batch_per_worker: usize,
     ) -> Result<(), TrainerError> {
-        DenseNlheEsMccfrTrainer::step_parallel(self, rng_pool, n_threads, batch_per_worker)
+        if self.lockfree {
+            self.inner
+                .step_parallel_lockfree(rng_pool, n_threads, batch_per_worker)
+        } else {
+            self.inner
+                .step_parallel(rng_pool, n_threads, batch_per_worker)
+        }
     }
     fn update_count(&self) -> u64 {
-        DenseNlheEsMccfrTrainer::update_count(self)
+        self.inner.update_count()
     }
     fn save_checkpoint(&self, path: &Path) -> Result<(), CheckpointError> {
-        DenseNlheEsMccfrTrainer::save_checkpoint(self, path)
+        self.inner.save_checkpoint(path)
     }
 }
 
@@ -158,6 +181,13 @@ fn run() -> Result<(), String> {
     if args.bucket_table.as_os_str().is_empty() {
         return Err("--bucket-table is required for --game nlhe".to_string());
     }
+    if args.lockfree && !args.dense {
+        return Err(
+            "--lockfree requires --dense: lock-free atomic 路径仅 DenseNlheEsMccfrTrainer 实现 \
+             (HashMap 后端无 step_parallel_lockfree)。"
+                .to_string(),
+        );
+    }
     fs::create_dir_all(&args.checkpoint_dir)
         .map_err(|e| format!("create checkpoint dir failed: {e}"))?;
 
@@ -172,10 +202,20 @@ fn run() -> Result<(), String> {
     let table_hash = hex32(&table.content_hash());
 
     // 后端选择：dense full-prealloc 表 or 默认 HashMap。两者 byte-equal（见 Args.dense
-    // doc），训练主循环共用 `drive`——只构造入口不同。
+    // doc），训练主循环共用 `drive`——只构造入口不同。dense 路径下 --lockfree 进一步
+    // 切到 lock-free atomic CAS（详 Args.lockfree doc / DenseBackend）。
     if args.dense {
-        let mut trainer = build_dense(&args, game)?;
-        drive(&mut trainer, &args, &table_hash, "dense-es-mccfr")
+        let inner = build_dense(&args, game)?;
+        let mut trainer = DenseBackend {
+            inner,
+            lockfree: args.lockfree,
+        };
+        let label = if args.lockfree {
+            "dense-lockfree-es-mccfr"
+        } else {
+            "dense-es-mccfr"
+        };
+        drive(&mut trainer, &args, &table_hash, label)
     } else {
         let mut trainer = build_hashmap(&args, game)?;
         drive(&mut trainer, &args, &table_hash, "es-mccfr")
@@ -280,6 +320,14 @@ fn drive<T: CfrBackend>(
         match args.lcfr_period {
             Some(p) => eprintln!("[train_cfr] lcfr_period      = {p} (LCFR-MCCFR)"),
             None => eprintln!("[train_cfr] lcfr_period      = none (vanilla ES-MCCFR)"),
+        }
+        if args.dense {
+            let mode = if args.lockfree {
+                "lockfree (atomic CAS; not byte-equal)"
+            } else {
+                "deterministic merge (byte-equal anchor)"
+            };
+            eprintln!("[train_cfr] dense_parallel   = {mode}");
         }
     }
 
@@ -400,6 +448,7 @@ fn parse_args() -> Result<Args, String> {
                 out.lcfr_period = Some(parse_u64(&next_value(&mut args, "--lcfr-period")?)?)
             }
             "--dense" => out.dense = true,
+            "--lockfree" => out.lockfree = true,
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -475,6 +524,7 @@ fn print_usage() {
          \t--keep-last <N>\n\
          \t--lcfr-period <N>  (cold start only; LCFR-MCCFR period rescale)\n\
          \t--dense  (dense full-prealloc infoset table backend; byte-equal to default HashMap)\n\
+         \t--lockfree  (with --dense: lock-free atomic CAS parallel path; not byte-equal across runs)\n\
          \t--quiet"
     );
 }
