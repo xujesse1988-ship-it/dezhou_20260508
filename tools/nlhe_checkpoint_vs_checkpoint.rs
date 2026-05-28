@@ -526,7 +526,6 @@ fn rollout_head_to_head(
 }
 
 struct ActionDecision {
-    info: InfoSetId,
     distribution: Vec<(SimplifiedNlheAction, f64)>,
     action: SimplifiedNlheAction,
 }
@@ -550,7 +549,6 @@ fn sample_action(
     let dist = strategy_distribution(&actions, &raw)?;
     let action = sample_discrete(&dist, rng);
     Ok(ActionDecision {
-        info,
         distribution: dist,
         action,
     })
@@ -627,13 +625,22 @@ impl HandTrace {
             "## trace hand #{display_hand_no} (seat-loop hand_idx={hand_idx_in_seat}, seed={seed:#x}, A=P{}, B=P{})",
             a_seat.0, b_seat.0
         ));
+        trace.lines.push(
+            "| step | actor | street | board | pot | hand | stack | strategy | chosen |"
+                .to_string(),
+        );
+        trace
+            .lines
+            .push("|---:|---|---|---|---:|---|---:|---|---|".to_string());
         trace.lines.push(format!(
-            "initial: street={} board={} pot={} | {} | {}",
+            "| 0 | initial | {} | {} | {} | {}<br>{} | {}<br>{} | - | - |",
             street_label(root.game_state.street()),
             format_cards(root.game_state.board()),
             trace.fmt_chips(root.game_state.pot()),
-            trace.format_player(root, SeatId(0)),
-            trace.format_player(root, SeatId(1)),
+            trace.format_player_hand(root, SeatId(0)),
+            trace.format_player_hand(root, SeatId(1)),
+            trace.format_player_stack(root, SeatId(0)),
+            trace.format_player_stack(root, SeatId(1)),
         ));
         trace
     }
@@ -649,22 +656,15 @@ impl HandTrace {
         let who = if is_a { "A" } else { "B" };
         let actor = SeatId(actor);
         self.lines.push(format!(
-            "{step:02}. {who}/P{} acts | street={} board={} pot={} node={} info={} bucket={} | {}",
+            "| {step} | {who}/P{}({}) | {} | {} | {} | {} | {} | {} | {} ({:.2}%) |",
             actor.0,
+            role_label(actor),
             street_label(state.game_state.street()),
             format_cards(state.game_state.board()),
             self.fmt_chips(state.game_state.pot()),
-            state.current_node_id,
-            format_info_set(decision.info),
-            decision.info.bucket_id(),
-            self.format_player(state, actor),
-        ));
-        self.lines.push(format!(
-            "    strategy: {}",
-            format_distribution(&decision.distribution, self.bb_chips)
-        ));
-        self.lines.push(format!(
-            "    chosen: {} (p={:.2}%)",
+            self.format_hole(state, actor),
+            self.format_stack(state, actor),
+            format_distribution(&decision.distribution, self.bb_chips),
             format_action(decision.action, self.bb_chips),
             chosen_probability(&decision.distribution, decision.action) * 100.0
         ));
@@ -682,14 +682,15 @@ impl HandTrace {
             .find(|(seat, _)| *seat == SeatId(1))
             .map(|(_, pnl)| *pnl)
             .unwrap_or(0);
+        let actor_label = format!("A/P{}", a_seat.0);
         self.lines.push(format!(
-            "terminal: street={} board={} pot={} | P0 pnl={} | P1 pnl={} | A(P{}) pnl={}",
+            "| - | terminal | {} | {} | {} | P0 pnl={}<br>P1 pnl={} | {} pnl={} | - | - |",
             street_label(terminal.game_state.street()),
             format_cards(terminal.game_state.board()),
             self.fmt_chips(terminal.game_state.pot()),
             self.fmt_signed_chips(p0 as f64),
             self.fmt_signed_chips(p1 as f64),
-            a_seat.0,
+            actor_label,
             self.fmt_signed_chips(a_pnl),
         ));
         self.lines.push(String::new());
@@ -699,22 +700,30 @@ impl HandTrace {
         self.lines.join("\n")
     }
 
-    fn format_player(&self, state: &SimplifiedNlheState, seat: SeatId) -> String {
+    fn format_player_hand(&self, state: &SimplifiedNlheState, seat: SeatId) -> String {
+        format!(
+            "P{}({}) {}",
+            seat.0,
+            role_label(seat),
+            self.format_hole(state, seat)
+        )
+    }
+
+    fn format_player_stack(&self, state: &SimplifiedNlheState, seat: SeatId) -> String {
+        format!("P{} {}", seat.0, self.format_stack(state, seat))
+    }
+
+    fn format_hole(&self, state: &SimplifiedNlheState, seat: SeatId) -> String {
         let player = &state.game_state.players()[seat.0 as usize];
-        let role = if seat.0 == 0 { "SB" } else { "BB" };
-        let hole = player
+        player
             .hole_cards
             .map(|cards| format_cards(&cards))
-            .unwrap_or_else(|| "-".to_string());
-        format!(
-            "P{}({role}) hole={} stack={} round_commit={} total_commit={} status={:?}",
-            seat.0,
-            hole,
-            self.fmt_chips(player.stack),
-            self.fmt_chips(player.committed_this_round),
-            self.fmt_chips(player.committed_total),
-            player.status,
-        )
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    fn format_stack(&self, state: &SimplifiedNlheState, seat: SeatId) -> String {
+        let player = &state.game_state.players()[seat.0 as usize];
+        self.fmt_chips(player.stack)
     }
 
     fn fmt_chips(&self, chips: ChipAmount) -> String {
@@ -727,15 +736,19 @@ impl HandTrace {
     }
 }
 
-fn format_info_set(info: InfoSetId) -> String {
-    format!("{:#018x}", info.raw())
-}
-
 fn format_distribution(dist: &[(SimplifiedNlheAction, f64)], bb_chips: f64) -> String {
     dist.iter()
         .map(|(action, p)| format!("{}={:.2}%", format_action(*action, bb_chips), p * 100.0))
         .collect::<Vec<_>>()
-        .join(" | ")
+        .join("<br>")
+}
+
+fn role_label(seat: SeatId) -> &'static str {
+    if seat.0 == 0 {
+        "SB"
+    } else {
+        "BB"
+    }
 }
 
 fn chosen_probability(dist: &[(SimplifiedNlheAction, f64)], action: SimplifiedNlheAction) -> f64 {
