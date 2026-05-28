@@ -201,12 +201,19 @@ fn lockfree_self_consistency() {
 ///   就 σ 分叉 → action 分叉 → state 分叉 → NLHE 巨大状态空间下两集合
 ///   90%+ 不重合是预期的（实测 ≈ 92.5%）。
 ///
-/// **baseline 实测**（vultr 4-core / 1920 update / 同 RNG_SEED）：
-/// - `HM strategy_sum.keys = 107523`
-/// - `dense strategy_sum touched = 107038`（与 HM 比 99.5%；同数量级 ✓）
-/// - `dense regret touched = 107038`
-/// - `intersection = 7516`（trajectory 发散预期，~7%）
-/// - `median L∞ / p75 / p95 / worst`：vultr 跑通后回填本行
+/// **baseline 实测**（vultr 4-core AMD EPYC-Rome / 1920 update / 同 RNG_SEED；
+/// 2026-05-28 跑 4 次取范围）：
+/// - `HM strategy_sum.keys = 107523`（4 run 稳定）
+/// - `dense strategy_sum touched ∈ [101747, 107038]`（touched_ratio 0.946 - 0.995；
+///   ≪ 1.0 的浮动是 Hogwild! CAS race 让每次 trajectory 集略不同的预期）
+/// - `dense regret touched`：与 strategy_sum 同（traverser 节点同时 set 两 bit）
+/// - `n (intersection) ∈ [7286, 7368]`（intersection_coverage 0.068 - 0.070）
+/// - `median L∞ = 0e0`、`p75 L∞ = 0e0`（> 75% 交集 infoset 完全 byte-equal —— σ
+///   分叉前同 rng 同空表 → 同累积；分叉后才有差异）
+/// - `p95 L∞ ∈ [0.332, 0.340]`
+/// - `worst L∞ = 1.0`（尾部 trajectory 完全分叉是预期，单样本 MCCFR 单次 update
+///   就能把概率推到不同 action）
+/// - wall ~5.5s / Maximum RSS ~5.3 GiB（vultr 7.7 GiB 充裕）
 #[test]
 #[ignore = "dense + HashMap 两套表 + 短跑收敛对照，峰值 ~7 GiB；release --ignored 单独跑"]
 fn lockfree_avg_strategy_close_to_hashmap() {
@@ -320,8 +327,20 @@ fn lockfree_avg_strategy_close_to_hashmap() {
 /// - 交集 infoset 上 `median L∞ < 0.15`、`p75 < 0.30`（LCFR rescale 引入的
 ///   额外 σ 漂移让门槛比 vanilla 0.10/0.20 略松）
 ///
-/// **baseline TODO**：vultr 实测后把 `n=…, median=…, p75=…, p95=…, worst=…,
-/// touched_ratio=…, intersection_coverage=…, checked_sum=…` 钉进本注释。
+/// **baseline 实测**（vultr 4-core AMD EPYC-Rome / 1920 update / period=500 /
+/// 同 RNG_SEED；2026-05-28 跑 3 次取范围）：
+/// - `HM strategy_sum.keys = 110187`（LCFR 不影响 traverser-visited 集大小，
+///   与 vanilla 107523 同数量级）
+/// - `dense strategy_sum touched ∈ [107239, 109313]`（touched_ratio 0.973 - 0.992）
+/// - `dense regret touched`：与 strategy_sum 同
+/// - `n (intersection) ∈ [10609, 10809]`（intersection_coverage 0.096 - 0.098；
+///   比 vanilla 6.8% 略高，可能因 LCFR 衰减让两路径"新 trajectory"更易重合）
+/// - `median L∞ = 0e0`、`p75 L∞ = 0e0`（与 vanilla 同样 > 75% byte-equal）
+/// - `p95 L∞ ∈ [0.307, 0.323]`
+/// - `worst L∞ = 1.0`（与 vanilla 同）
+/// - `checked_sum == n`（所有交集 infoset 都满足 Σ avg ≈ 1.0 ± 1e-9，rescale
+///   不破归一化语义 ✓）
+///
 /// 命中失败时优先核查：rescale 是否在某个 worker 上下文里被错误触发（应当只
 /// 在 main thread `&mut self` 路径）、`global_scale` 是否在 par_iter 中被错
 /// 误读取（worker 内每次 `accumulate_by_slot` 读当下 scale，但本批 rescale
