@@ -231,6 +231,17 @@ fn lockfree_avg_strategy_close_to_hashmap() {
         "仅访问 {} 个 infoset，样本太少",
         visited.len()
     );
+    // 诊断：dense 自己的 touched_count 与 HM strategy_sum keys 数对比。
+    // 区分 (a) dense 真访问了 ≈ HM 数量但 average_strategy 检测异常 vs
+    // (b) dense lockfree 实际 trajectory 集与 HM 严重发散。
+    let dense_strat_touched = dense.strategy_sum().touched_count();
+    let dense_regret_touched = dense.regret_table().touched_count();
+    eprintln!(
+        "[diag] HM strategy_sum.keys={} | dense strategy_sum touched={} regret touched={}",
+        visited.len(),
+        dense_strat_touched,
+        dense_regret_touched,
+    );
 
     let mut diffs: Vec<f64> = Vec::with_capacity(visited.len());
     for &info in &visited {
@@ -254,9 +265,12 @@ fn lockfree_avg_strategy_close_to_hashmap() {
     let coverage = diffs.len() as f64 / visited.len() as f64;
     assert!(
         coverage >= 0.5,
-        "lockfree coverage 塌方：diffs.len()={} / visited.len()={} = {coverage:.3} < 0.5",
+        "lockfree coverage 塌方：diffs.len()={} / visited.len()={} = {coverage:.3} < 0.5\n\
+         [diag] dense strategy_sum touched={} regret touched={}",
         diffs.len(),
         visited.len(),
+        dense_strat_touched,
+        dense_regret_touched,
     );
     diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = diffs.len();
