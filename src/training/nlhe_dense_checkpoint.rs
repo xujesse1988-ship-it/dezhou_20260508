@@ -51,6 +51,7 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use blake3::Hasher;
@@ -361,16 +362,16 @@ pub fn load_dense_checkpoint(
     debug_assert_eq!(indexer.total_slots(), total_slots);
     debug_assert_eq!(indexer.total_rows(), total_rows);
 
-    let mut regret = DenseNlheTable::new(Arc::clone(&indexer));
-    let mut strategy_sum = DenseNlheTable::new(indexer);
+    let regret = DenseNlheTable::new(Arc::clone(&indexer));
+    let strategy_sum = DenseNlheTable::new(indexer);
 
-    read_words(&mut reader, &mut hasher, regret.touched_words_mut())
+    read_words(&mut reader, &mut hasher, regret.touched_words())
         .map_err(|e| corrupted(HEADER_LEN as u64, format!("read regret touched: {e}")))?;
-    read_words(&mut reader, &mut hasher, strategy_sum.touched_words_mut())
+    read_words(&mut reader, &mut hasher, strategy_sum.touched_words())
         .map_err(|e| corrupted(0, format!("read strategy touched: {e}")))?;
-    read_f64s(&mut reader, &mut hasher, regret.raw_values_mut())
+    read_f64s(&mut reader, &mut hasher, regret.raw_values())
         .map_err(|e| corrupted(0, format!("read regret values: {e}")))?;
-    read_f64s(&mut reader, &mut hasher, strategy_sum.raw_values_mut())
+    read_f64s(&mut reader, &mut hasher, strategy_sum.raw_values())
         .map_err(|e| corrupted(0, format!("read strategy values: {e}")))?;
 
     // trailer：直接读 32 byte（不喂 hasher），与已累加的 body hash 比。
@@ -410,11 +411,16 @@ fn write_hashed<W: Write>(w: &mut W, h: &mut Hasher, bytes: &[u8]) -> Result<(),
         .map_err(|e| corrupted(0, format!("write failed: {e}")))
 }
 
-fn write_words<W: Write>(w: &mut W, h: &mut Hasher, words: &[u64]) -> Result<(), CheckpointError> {
+fn write_words<W: Write>(
+    w: &mut W,
+    h: &mut Hasher,
+    words: &[AtomicU64],
+) -> Result<(), CheckpointError> {
     let mut buf = [0u8; CHUNK_BYTES];
     for chunk in words.chunks(CHUNK_ELEMS) {
         let mut off = 0;
-        for &word in chunk {
+        for cell in chunk {
+            let word = cell.load(Ordering::Relaxed);
             buf[off..off + 8].copy_from_slice(&word.to_le_bytes());
             off += 8;
         }
@@ -426,13 +432,14 @@ fn write_words<W: Write>(w: &mut W, h: &mut Hasher, words: &[u64]) -> Result<(),
 fn write_f64s_scaled<W: Write>(
     w: &mut W,
     h: &mut Hasher,
-    vals: &[f64],
+    vals: &[AtomicU64],
     scale: f64,
 ) -> Result<(), CheckpointError> {
     let mut buf = [0u8; CHUNK_BYTES];
     for chunk in vals.chunks(CHUNK_ELEMS) {
         let mut off = 0;
-        for &v in chunk {
+        for cell in chunk {
+            let v = f64::from_bits(cell.load(Ordering::Relaxed));
             buf[off..off + 8].copy_from_slice(&(v * scale).to_le_bytes());
             off += 8;
         }
@@ -447,25 +454,26 @@ fn read_hashed<R: Read>(r: &mut R, h: &mut Hasher, buf: &mut [u8]) -> std::io::R
     Ok(())
 }
 
-fn read_words<R: Read>(r: &mut R, h: &mut Hasher, words: &mut [u64]) -> std::io::Result<()> {
+fn read_words<R: Read>(r: &mut R, h: &mut Hasher, words: &[AtomicU64]) -> std::io::Result<()> {
     let mut buf = [0u8; CHUNK_BYTES];
-    for chunk in words.chunks_mut(CHUNK_ELEMS) {
+    for chunk in words.chunks(CHUNK_ELEMS) {
         let nbytes = chunk.len() * 8;
         read_hashed(r, h, &mut buf[..nbytes])?;
-        for (word, b) in chunk.iter_mut().zip(buf[..nbytes].chunks_exact(8)) {
-            *word = u64::from_le_bytes(b.try_into().unwrap());
+        for (cell, b) in chunk.iter().zip(buf[..nbytes].chunks_exact(8)) {
+            cell.store(u64::from_le_bytes(b.try_into().unwrap()), Ordering::Relaxed);
         }
     }
     Ok(())
 }
 
-fn read_f64s<R: Read>(r: &mut R, h: &mut Hasher, vals: &mut [f64]) -> std::io::Result<()> {
+fn read_f64s<R: Read>(r: &mut R, h: &mut Hasher, vals: &[AtomicU64]) -> std::io::Result<()> {
     let mut buf = [0u8; CHUNK_BYTES];
-    for chunk in vals.chunks_mut(CHUNK_ELEMS) {
+    for chunk in vals.chunks(CHUNK_ELEMS) {
         let nbytes = chunk.len() * 8;
         read_hashed(r, h, &mut buf[..nbytes])?;
-        for (v, b) in chunk.iter_mut().zip(buf[..nbytes].chunks_exact(8)) {
-            *v = f64::from_le_bytes(b.try_into().unwrap());
+        for (cell, b) in chunk.iter().zip(buf[..nbytes].chunks_exact(8)) {
+            let v = f64::from_le_bytes(b.try_into().unwrap());
+            cell.store(v.to_bits(), Ordering::Relaxed);
         }
     }
     Ok(())
@@ -538,10 +546,21 @@ mod tests {
     }
 
     fn logical_bits(table: &DenseNlheTable) -> Vec<u64> {
+        let scale = table.global_scale();
         table
             .raw_values()
             .iter()
-            .map(|x| (x * table.global_scale()).to_bits())
+            .map(|c| (f64::from_bits(c.load(Ordering::Relaxed)) * scale).to_bits())
+            .collect()
+    }
+
+    /// touched bitset words 加载成 `Vec<u64>`（test-only helper：AtomicU64 不实现
+    /// `PartialEq`，直接 `assert_eq!` 两 slice 不行）。
+    fn touched_word_bits(table: &DenseNlheTable) -> Vec<u64> {
+        table
+            .touched_words()
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
             .collect()
     }
 
@@ -581,13 +600,13 @@ mod tests {
         assert_eq!(loaded_regret.global_scale().to_bits(), 1.0_f64.to_bits());
         assert_eq!(loaded_strategy.global_scale().to_bits(), 1.0_f64.to_bits());
         assert_eq!(
-            loaded_regret.touched_words(),
-            regret.touched_words(),
+            touched_word_bits(&loaded_regret),
+            touched_word_bits(&regret),
             "regret touched bitset roundtrip"
         );
         assert_eq!(
-            loaded_strategy.touched_words(),
-            strategy.touched_words(),
+            touched_word_bits(&loaded_strategy),
+            touched_word_bits(&strategy),
             "strategy touched bitset roundtrip"
         );
         // 未访问行加载后仍未 touched（区分 0 值 vs 未访问）。

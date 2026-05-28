@@ -32,6 +32,7 @@
 //! 它服务于 Phase 2+ 的 Trainer public query「未见 infoset 返回空 `Vec`」语义、
 //! Phase 4 sparse checkpoint、以及诊断。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::abstraction::info::{InfoSetId, StreetTag};
@@ -202,27 +203,43 @@ impl NlheDenseIndexer {
 /// 的 0 占用，换热路径无 page lookup）。`touched_rows` 标记被写过的行，供 Phase 2+
 /// public query / Phase 4 checkpoint。
 ///
+/// **存储为 `Vec<AtomicU64>`（f64 bits）**：
+/// - 单 cell 的 8-byte aligned 原子 load/store 是 Rust 内存模型保证的；deterministic
+///   merge 路径 ([`crate::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer::step_parallel`])
+///   单线程 playback 下 [`Self::accumulate_by_slot`] 的 CAS 永远一次成功，f64 加法
+///   序列与 `*v += d` 逐位等价 → HashMap 路径 byte-equal 不破。
+/// - lockfree 并行路径 ([`crate::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer::step_parallel_lockfree`])
+///   多 worker 共享 `&self` 直接 CAS 写主表，去掉 local delta + merge 阶段；按
+///   `docs/temp/nlhe_dense_parallel_merge_alternatives_2026_05_28.md` 方案 A 收敛
+///   性沿用 Hogwild!（Niu et al. 2011）。CAS race 顺序不确定，本路径不保
+///   byte-equal。
+///
 /// 数值语义逐位对齐 [`crate::training::regret`]（模块文档）。
 #[derive(Debug)]
 pub struct DenseNlheTable {
     indexer: Arc<NlheDenseIndexer>,
     /// 物理存储值满足 `logical_value = values[i] * global_scale`。LCFR 正因子
     /// rescale 只更新本标量；新增 delta 写入 `delta / global_scale`，从而保持逻辑
-    /// 表语义而不触碰未访问 page。
-    global_scale: f64,
-    values: Vec<f64>,
+    /// 表语义而不触碰未访问 page。AtomicU64 持 f64 bits，rescale 在 worker join 后
+    /// 调用（lockfree 路径前置 join，deterministic 路径单线程）。
+    global_scale: AtomicU64,
+    /// f64 bits 数组；每 cell 通过 [`atomic_f64_add`] CAS loop 累积。`Vec<AtomicU64>`
+    /// 与 `Vec<f64>` 在内存上等价（8-byte aligned u64），RSS 不变。
+    values: Vec<AtomicU64>,
     touched_rows: TouchedRows,
 }
 
 impl DenseNlheTable {
     /// 按 indexer 的 `total_slots` / `total_rows` 一次性分配 0 值表 + 空 bitset。
     pub fn new(indexer: Arc<NlheDenseIndexer>) -> Self {
-        let total_slots = indexer.total_slots();
+        let total_slots = indexer.total_slots() as usize;
         let total_rows = indexer.total_rows();
+        let mut values: Vec<AtomicU64> = Vec::with_capacity(total_slots);
+        values.resize_with(total_slots, || AtomicU64::new(0));
         Self {
             indexer,
-            global_scale: 1.0,
-            values: vec![0.0; total_slots as usize],
+            global_scale: AtomicU64::new(1.0_f64.to_bits()),
+            values,
             touched_rows: TouchedRows::new(total_rows),
         }
     }
@@ -240,10 +257,15 @@ impl DenseNlheTable {
     /// 累积到指定 slot（热路径入口；§并行语义 local delta 已带 `slot_start` /
     /// `row_index`，merge 时直接调用，省一次 `locate`）。
     ///
-    /// `values[slot_start + a] += delta[a]`，并标记 `row_index` 已访问。f64 加法序列
-    /// 与 [`crate::training::regret::RegretTable::accumulate`] 完全等价。
+    /// `values[slot_start + a] += delta[a]`，并标记 `row_index` 已访问。**单线程
+    /// 调用下** f64 加法序列与 [`crate::training::regret::RegretTable::accumulate`]
+    /// 完全等价（CAS 无竞争 → 一次成功，bit-identical `*v += d`）；多线程并发调用
+    /// 下走 lock-free atomic add，CFR/MCCFR 收敛性沿用 Hogwild!（Niu et al. 2011）。
+    ///
+    /// `&self` 入口允许 rayon worker 共享借用主表；deterministic merge 路径调用方
+    /// 仍持有 `&mut self` 上下文，单线程 playback 无竞争。
     #[inline]
-    pub fn accumulate_by_slot(&mut self, slot_start: u64, row_index: u64, delta: &[f64]) {
+    pub fn accumulate_by_slot(&self, slot_start: u64, row_index: u64, delta: &[f64]) {
         let start = slot_start as usize;
         let end = start + delta.len();
         debug_assert!(
@@ -252,14 +274,16 @@ impl DenseNlheTable {
             delta.len(),
             self.values.len()
         );
-        if self.global_scale == 1.0 {
-            for (slot, &d) in self.values[start..end].iter_mut().zip(delta) {
-                *slot += d;
+        let scale = self.global_scale_value();
+        // `d / scale` 与旧路径逐位一致（保 byte-equal）；不写成 `d * (1/scale)`
+        // 改省一次除法——会因二次舍入破坏 BLAKE3 anchor。
+        if scale == 1.0 {
+            for (cell, &d) in self.values[start..end].iter().zip(delta) {
+                atomic_f64_add(cell, d);
             }
         } else {
-            let scale = self.global_scale;
-            for (slot, &d) in self.values[start..end].iter_mut().zip(delta) {
-                *slot += d / scale;
+            for (cell, &d) in self.values[start..end].iter().zip(delta) {
+                atomic_f64_add(cell, d / scale);
             }
         }
         self.touched_rows.set(row_index);
@@ -268,7 +292,7 @@ impl DenseNlheTable {
     /// 便捷入口：先 `locate(info)` 再 [`Self::accumulate_by_slot`]。`delta.len()`
     /// 必须 == 该节点 action_count（debug_assert）。
     #[inline]
-    pub fn accumulate_by_info(&mut self, info: InfoSetId, delta: &[f64]) {
+    pub fn accumulate_by_info(&self, info: InfoSetId, delta: &[f64]) {
         let slot = self.indexer.locate(info);
         debug_assert_eq!(
             slot.action_count,
@@ -293,7 +317,8 @@ impl DenseNlheTable {
     /// regret matching 热路径变体，直接按已定位的 `slot_start` / `action_count` 读
     /// （Phase 3 并行 recurse 已 `locate` 一次，省第二次 unpack）。数值序列与
     /// [`Self::current_strategy_smallvec_by_info`] 完全一致——后者就是先 `locate`
-    /// 再调本方法。`&self` 只读，可在 rayon worker 间共享借用。
+    /// 再调本方法。`&self` 只读，可在 rayon worker 间共享借用；lockfree 路径下
+    /// 读到的每 cell 是原子单点 snapshot（cell 之间可能跨 update，CFR/MCCFR 容忍）。
     pub(crate) fn current_strategy_smallvec_at(
         &self,
         slot_start: u64,
@@ -301,13 +326,13 @@ impl DenseNlheTable {
     ) -> SigmaVec {
         let n = action_count;
         let start = slot_start as usize;
-        let regrets = &self.values[start..start + n];
-        let scale = self.global_scale;
+        let scale = self.global_scale_value();
 
         let uniform = || SigmaVec::from_elem(1.0 / n as f64, n);
         let mut positives: SigmaVec = SigmaVec::with_capacity(n);
         let mut sum = 0.0_f64;
-        for &r in regrets {
+        for cell in &self.values[start..start + n] {
+            let r = f64::from_bits(cell.load(Ordering::Relaxed));
             let logical = r * scale;
             let r_plus = if logical > 0.0 { logical } else { 0.0 };
             positives.push(r_plus);
@@ -337,12 +362,15 @@ impl DenseNlheTable {
         let slot = self.indexer.locate(info);
         let n = slot.action_count;
         let start = slot.slot_start as usize;
-        let sums = &self.values[start..start + n];
-        let scale = self.global_scale;
+        let scale = self.global_scale_value();
 
-        let total: f64 = sums.iter().map(|s| s * scale).sum();
+        let logical: Vec<f64> = self.values[start..start + n]
+            .iter()
+            .map(|cell| f64::from_bits(cell.load(Ordering::Relaxed)) * scale)
+            .collect();
+        let total: f64 = logical.iter().copied().sum();
         if total > 0.0 {
-            sums.iter().map(|s| (s * scale) / total).collect()
+            logical.iter().map(|s| s / total).collect()
         } else {
             vec![1.0 / n as f64; n]
         }
@@ -353,30 +381,38 @@ impl DenseNlheTable {
     ///
     /// LCFR 正因子走表级 lazy scale：只更新 `global_scale`，不扫满 `values`。
     /// 非正 / NaN / Inf 等非 LCFR 因子退回 eager materialize，保持旧 public 行为。
+    ///
+    /// **调用前提**：所有 worker 已 join（deterministic 路径单线程；lockfree 路径在
+    /// `step_parallel_lockfree` 末调用，rayon par_iter 已结束）。本方法用 `&mut self`
+    /// 强制独占借用，命中前提则 worker 不可能并发触发，CAS race 消失。
     pub fn rescale_all(&mut self, factor: f64) {
-        let next_scale = self.global_scale * factor;
-        if factor > 0.0 && next_scale.is_finite() && next_scale != 0.0 {
-            self.global_scale = next_scale;
+        let cur = self.global_scale_value();
+        let next = cur * factor;
+        if factor > 0.0 && next.is_finite() && next != 0.0 {
+            self.global_scale.store(next.to_bits(), Ordering::Relaxed);
             return;
         }
 
         self.materialize_global_scale();
-        for slot in &mut self.values {
-            *slot *= factor;
+        for cell in &self.values {
+            let v = f64::from_bits(cell.load(Ordering::Relaxed)) * factor;
+            cell.store(v.to_bits(), Ordering::Relaxed);
         }
     }
 
     /// 把 lazy scale 刷回 raw storage（仅非 LCFR rescale fallback / checkpoint 诊断
     /// 需要；正常 period boundary 不调用）。
     fn materialize_global_scale(&mut self) {
-        if self.global_scale == 1.0 {
+        let scale = self.global_scale_value();
+        if scale == 1.0 {
             return;
         }
-        let scale = self.global_scale;
-        for slot in &mut self.values {
-            *slot *= scale;
+        for cell in &self.values {
+            let v = f64::from_bits(cell.load(Ordering::Relaxed)) * scale;
+            cell.store(v.to_bits(), Ordering::Relaxed);
         }
-        self.global_scale = 1.0;
+        self.global_scale
+            .store(1.0_f64.to_bits(), Ordering::Relaxed);
     }
 
     /// 该 infoset 行各 slot 值之和（只读诊断）。strategy_sum 表上 `> 0` 等价 HashMap
@@ -385,9 +421,10 @@ impl DenseNlheTable {
     pub fn row_sum_by_info(&self, info: InfoSetId) -> f64 {
         let slot = self.indexer.locate(info);
         let start = slot.slot_start as usize;
+        let scale = self.global_scale_value();
         self.values[start..start + slot.action_count]
             .iter()
-            .map(|v| v * self.global_scale)
+            .map(|cell| f64::from_bits(cell.load(Ordering::Relaxed)) * scale)
             .sum()
     }
 
@@ -403,76 +440,94 @@ impl DenseNlheTable {
 
     /// 当前 lazy scale（Phase 4 checkpoint save：流式写出 `raw * scale` 逻辑值）。
     pub(crate) fn global_scale(&self) -> f64 {
-        self.global_scale
+        self.global_scale_value()
     }
 
-    /// raw 扁平 values 只读 slice（内部物理存储；逻辑值需乘 [`Self::global_scale`]）。
-    pub(crate) fn raw_values(&self) -> &[f64] {
+    /// AtomicU64 → f64 helper（hot path 内联）。
+    #[inline]
+    fn global_scale_value(&self) -> f64 {
+        f64::from_bits(self.global_scale.load(Ordering::Relaxed))
+    }
+
+    /// raw 扁平 values 只读 slice（内部物理存储，AtomicU64 持 f64 bits；逻辑值
+    /// 需对每 cell `load(Relaxed)` 取 f64 后乘 [`Self::global_scale`]）。
+    pub(crate) fn raw_values(&self) -> &[AtomicU64] {
         &self.values
     }
 
-    /// raw 扁平 values 可写 slice（Phase 4 checkpoint load：streaming 填回逻辑 f64，
-    /// 新表 scale 为 1）。调用方负责保证写入长度 == `num_slots()`。
-    pub(crate) fn raw_values_mut(&mut self) -> &mut [f64] {
-        &mut self.values
-    }
-
-    /// touched bitset words 只读 slice（Phase 4 checkpoint save）。
-    pub(crate) fn touched_words(&self) -> &[u64] {
+    /// touched bitset words 只读 slice（Phase 4 checkpoint save；每 word `load(Relaxed)`
+    /// 取 u64）。
+    pub(crate) fn touched_words(&self) -> &[AtomicU64] {
         self.touched_rows.words()
-    }
-
-    /// touched bitset words 可写 slice（Phase 4 checkpoint load）。
-    pub(crate) fn touched_words_mut(&mut self) -> &mut [u64] {
-        self.touched_rows.words_mut()
     }
 }
 
-/// 行级 touched bitset（`Vec<u64>` word 数组；无第三方依赖，符合 D-275
+/// f64 cell lock-free atomic add（CAS loop）。
+///
+/// 严格 Hogwild!（Niu et al. 2011）原版裸写 `*p += δ`，靠硬件 8-byte aligned store
+/// 原子性——Rust 内存模型不允许这条假设且需 unsafe；仓库 `unsafe_code = "forbid"`
+/// 砍掉此档。本路径用 `fetch_update` CAS loop：每次循环把 cell 写成「之前值 +
+/// delta」，整体原子可见，单 cell 写永远是合法 delta 子集之和。
+///
+/// `Relaxed` 即可：CFR 收敛只关心最终值，不依赖跨 cell happens-before；CAS 内部
+/// 提供单 cell read-modify-write 原子性。无 ABA 风险（f64 加法是单步业务原子单位）。
+///
+/// **单线程调用**：CAS 一次成功，结果与 `*v += d` 逐位相等 → deterministic merge
+/// 路径的 BLAKE3 / HashMap byte-equal 不受影响。
+#[inline]
+fn atomic_f64_add(cell: &AtomicU64, delta: f64) {
+    let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+        Some((f64::from_bits(bits) + delta).to_bits())
+    });
+}
+
+/// 行级 touched bitset（`Vec<AtomicU64>` word 数组；无第三方依赖，符合 D-275
 /// `unsafe_code = "forbid"`）。
+///
+/// `set` 通过 `fetch_or(Relaxed)` 单 word 原子置位，允许多 worker `&self` 共享并发
+/// 标记（lockfree 路径配套；deterministic 路径单线程下退化为零竞争 fetch_or，结
+/// 果与 `*word |= bit` 完全等价 → 不影响 byte-equal）。
 #[derive(Debug)]
 struct TouchedRows {
-    words: Vec<u64>,
+    words: Vec<AtomicU64>,
     len: u64,
 }
 
 impl TouchedRows {
     fn new(len: u64) -> Self {
         let n_words = (len as usize).div_ceil(64);
-        Self {
-            words: vec![0u64; n_words],
-            len,
-        }
+        let mut words: Vec<AtomicU64> = Vec::with_capacity(n_words);
+        words.resize_with(n_words, || AtomicU64::new(0));
+        Self { words, len }
     }
 
     #[inline]
-    fn set(&mut self, idx: u64) {
+    fn set(&self, idx: u64) {
         debug_assert!(idx < self.len, "row {idx} 越界（共 {} 行）", self.len);
         let word = (idx / 64) as usize;
-        let bit = (idx % 64) as u32;
-        self.words[word] |= 1u64 << bit;
+        let bit = 1u64 << (idx % 64);
+        self.words[word].fetch_or(bit, Ordering::Relaxed);
     }
 
     #[inline]
     fn get(&self, idx: u64) -> bool {
         debug_assert!(idx < self.len, "row {idx} 越界（共 {} 行）", self.len);
         let word = (idx / 64) as usize;
-        let bit = (idx % 64) as u32;
-        (self.words[word] >> bit) & 1 == 1
+        let bit = 1u64 << (idx % 64);
+        (self.words[word].load(Ordering::Relaxed) & bit) != 0
     }
 
     fn count(&self) -> u64 {
-        self.words.iter().map(|w| u64::from(w.count_ones())).sum()
+        self.words
+            .iter()
+            .map(|w| u64::from(w.load(Ordering::Relaxed).count_ones()))
+            .sum()
     }
 
-    /// 底层 word 数组只读（Phase 4 checkpoint save）。长度 = `total_rows.div_ceil(64)`。
-    fn words(&self) -> &[u64] {
+    /// 底层 word 数组只读（Phase 4 checkpoint save / load）。长度 = `total_rows.div_ceil(64)`。
+    /// AtomicU64 的 `store(&self, ...)` 不需要 `&mut` 入口，加载侧用 `load(Relaxed)`。
+    fn words(&self) -> &[AtomicU64] {
         &self.words
-    }
-
-    /// 底层 word 数组可写（Phase 4 checkpoint load：直接填回持久化的 bit）。
-    fn words_mut(&mut self) -> &mut [u64] {
-        &mut self.words
     }
 }
 
@@ -640,8 +695,9 @@ mod tests {
         ((x >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     }
 
-    fn bits(v: &[f64]) -> Vec<u64> {
-        v.iter().map(|x| x.to_bits()).collect()
+    /// 把 AtomicU64 raw_values slice 加载成 f64-bit 序列（test-only helper）。
+    fn bits(v: &[AtomicU64]) -> Vec<u64> {
+        v.iter().map(|c| c.load(Ordering::Relaxed)).collect()
     }
 
     fn assert_close(actual: &[f64], expected: &[f64], ctx: &str) {
@@ -789,7 +845,7 @@ mod tests {
     fn touched_rows_track_accumulated_rows() {
         let specs = [spec(StreetTag::Preflop, 4, 3), spec(StreetTag::Flop, 5, 6)];
         let idx = Arc::new(NlheDenseIndexer::from_node_specs(specs.iter().copied()));
-        let mut table = DenseNlheTable::new(Arc::clone(&idx));
+        let table = DenseNlheTable::new(Arc::clone(&idx));
 
         let touched_infos = [
             pack_info_set_v2(0, 0, StreetTag::Preflop),

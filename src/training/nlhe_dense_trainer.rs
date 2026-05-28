@@ -245,6 +245,62 @@ impl DenseNlheEsMccfrTrainer {
         Ok(())
     }
 
+    /// 多线程并发 step（dense **lock-free atomic** 并行路径，
+    /// `docs/temp/nlhe_dense_parallel_merge_alternatives_2026_05_28.md` 方案 A）。
+    ///
+    /// 与 [`Self::step_parallel`] 的 deterministic local-delta + merge 区别：
+    /// - **去掉 local delta + merge 阶段**：worker 直接对 `&self.regret` /
+    ///   `&self.strategy_sum` 走 lock-free atomic f64 add（CAS loop，[`DenseNlheTable::accumulate_by_slot`]
+    ///   `&self` 入口），整批结束后 rayon par_iter 自然 join。
+    /// - **σ 读看到当下表**：worker 间没有 pre-dispatch snapshot 概念，每次决策
+    ///   节点都 load 主表当前值（cell 之间可能跨 update，CFR/MCCFR 容忍；
+    ///   Hogwild! Niu et al. 2011）。
+    /// - **不保 byte-equal**：CAS race 顺序不确定，跨 run / 跨后端字节不再相等；
+    ///   [`Self::step_parallel`] 仍保持 byte-equal anchor。
+    /// - **LCFR rescale 时机一致**：rayon par_iter join 后调
+    ///   [`Self::maybe_lcfr_rescale`]，与 [`Self::step_parallel`] 同——本批 delta
+    ///   全用 pre-rescale `global_scale` 累积，rescale 不在 worker 内部触发。
+    ///
+    /// **边界**：`n_active == 0` / `batch_per_worker == 0` → no-op 返回 `Ok(())`。
+    pub fn step_parallel_lockfree(
+        &mut self,
+        rng_pool: &mut [Box<dyn RngSource>],
+        n_threads: usize,
+        batch_per_worker: usize,
+    ) -> Result<(), TrainerError> {
+        let n_active = n_threads.min(rng_pool.len());
+        if n_active == 0 || batch_per_worker == 0 {
+            return Ok(());
+        }
+        let active_pool = &mut rng_pool[..n_active];
+        let n_players = self.game.n_players() as u64;
+        let base_update_count = self.update_count;
+
+        let game = &self.game;
+        let regret: &DenseNlheTable = &self.regret;
+        let strategy_sum: &DenseNlheTable = &self.strategy_sum;
+
+        active_pool
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(tid, rng_slot)| {
+                let rng = rng_slot.as_mut();
+                for batch_idx in 0..batch_per_worker {
+                    let trajectory_index = batch_idx as u64 * n_active as u64 + tid as u64;
+                    let traverser =
+                        ((base_update_count + trajectory_index) % n_players) as PlayerId;
+                    let root = game.root(rng);
+                    recurse_es_dense_lockfree(root, traverser, 1.0, regret, strategy_sum, rng);
+                }
+            });
+
+        self.update_count += (n_active as u64) * (batch_per_worker as u64);
+        // LCFR period rescale 在 rayon par_iter join 后触发，worker 不可能并发；
+        // `rescale_all` 用 `&mut self` 强制独占借用，CAS race 消失。
+        self.maybe_lcfr_rescale();
+        Ok(())
+    }
+
     /// current strategy（regret matching）：两表都没 touch 过该 infoset → 空 `Vec`；
     /// 否则走 regret matching（退化均匀分布）。
     ///
@@ -611,6 +667,95 @@ fn recurse_es_dense_parallel(
                     local_strategy,
                     rng,
                 )
+            }
+        }
+    }
+}
+
+/// **Lock-free atomic** 并行 DFS recurse（dense 存储版，方案 A）。
+///
+/// 与 [`recurse_es_dense_parallel`] 同构，差别在累积写入直接走 **共享主表** 的
+/// lock-free atomic add（[`DenseNlheTable::accumulate_by_slot`] `&self` 入口，
+/// CAS loop）：不再 push 进线程本地 `DenseLocalDelta`，无 merge 阶段。σ 读看到的是
+/// 当下表（不再是 pre-dispatch snapshot），跨 cell 可能跨 update，CFR/MCCFR 容忍
+/// （Hogwild! Niu et al. 2011 + 后续 MCCFR 经验）。
+///
+/// `locate` 每决策节点只调一次；σ 读 + 写入都复用同一 slot 定位。push 顺序与
+/// [`recurse_es_dense_parallel`] 一致：traverser 分支先写 strategy_sum，递归子节点
+/// 后再写 regret。`last-iteration move`（前 n-1 次 `state.clone()` / 最后一次
+/// move）保持，对齐并行同型；本路径 byte-equal 本就不成立（CAS race 顺序不定），
+/// 但 rng 消费序列与 deterministic 路径一致，便于做 LBR / avg_strategy 统计对照。
+fn recurse_es_dense_lockfree(
+    state: SimplifiedNlheState,
+    traverser: PlayerId,
+    pi_trav: f64,
+    regret: &DenseNlheTable,
+    strategy_sum: &DenseNlheTable,
+    rng: &mut dyn RngSource,
+) -> f64 {
+    match SimplifiedNlheGame::current(&state) {
+        NodeKind::Terminal => SimplifiedNlheGame::payoff(&state, traverser),
+        NodeKind::Chance => unreachable!(
+            "简化 NLHE 无 in-game chance node（randomness 全在 Game::root 消费）；\
+             current(state) 不应返回 Chance"
+        ),
+        NodeKind::Player(actor) => {
+            let info = SimplifiedNlheGame::info_set(&state, actor);
+            let actions = SimplifiedNlheGame::legal_actions(&state);
+            let n = actions.len();
+            let slot = regret.indexer().locate(info);
+            let sigma = regret.current_strategy_smallvec_at(slot.slot_start, slot.action_count);
+
+            if actor == traverser {
+                let weighted: SigmaVec = sigma.iter().map(|s| pi_trav * s).collect();
+                strategy_sum.accumulate_by_slot(slot.slot_start, slot.row_index, &weighted);
+
+                debug_assert!(
+                    n > 0,
+                    "traverser Player 节点必有 ≥ 1 legal action（fold 兜底）"
+                );
+                let mut cfvs: SigmaVec = SigmaVec::with_capacity(n);
+                let last_idx = n - 1;
+                for i in 0..last_idx {
+                    let next_state = SimplifiedNlheGame::next(state.clone(), actions[i], rng);
+                    let cfv = recurse_es_dense_lockfree(
+                        next_state,
+                        traverser,
+                        pi_trav * sigma[i],
+                        regret,
+                        strategy_sum,
+                        rng,
+                    );
+                    cfvs.push(cfv);
+                }
+                let last_state = SimplifiedNlheGame::next(state, actions[last_idx], rng);
+                let cfv_last = recurse_es_dense_lockfree(
+                    last_state,
+                    traverser,
+                    pi_trav * sigma[last_idx],
+                    regret,
+                    strategy_sum,
+                    rng,
+                );
+                cfvs.push(cfv_last);
+                let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
+                let delta: SigmaVec = cfvs.iter().map(|c| c - sigma_value).collect();
+                regret.accumulate_by_slot(slot.slot_start, slot.row_index, &delta);
+                sigma_value
+            } else {
+                let nonzero_dist: SmallVec<[(SimplifiedNlheAction, f64); 8]> = actions
+                    .iter()
+                    .copied()
+                    .zip(sigma.iter().copied())
+                    .filter(|(_, p)| *p > 0.0)
+                    .collect();
+                debug_assert!(
+                    !nonzero_dist.is_empty(),
+                    "non-traverser σ all-zero impossible: current_strategy 退化局面回退均匀分布"
+                );
+                let sampled = sample_discrete(&nonzero_dist, rng);
+                let next_state = SimplifiedNlheGame::next(state, sampled, rng);
+                recurse_es_dense_lockfree(next_state, traverser, pi_trav, regret, strategy_sum, rng)
             }
         }
     }
