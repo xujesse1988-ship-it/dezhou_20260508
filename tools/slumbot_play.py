@@ -186,13 +186,32 @@ def _warn_once(msg):
 _warn_once.seen = set()
 
 
+# 请求节流：相邻两次 Slumbot API 请求（login/new_hand/act 都算）至少间隔
+# `_request_interval` 秒，避免无延迟疯狂拉取触发公开 API 的 IP 频率限制 / 封禁。
+# main() 从 --request-interval 设置；0 = 关闭。
+_request_interval = 0.0
+_last_request_ts = 0.0
+
+
+def _throttle():
+    """距上次请求不足 `_request_interval` 秒则 sleep 补足。进程级、跨 endpoint 生效。"""
+    global _last_request_ts
+    if _request_interval > 0.0:
+        wait = _request_interval - (time.monotonic() - _last_request_ts)
+        if wait > 0.0:
+            time.sleep(wait)
+    _last_request_ts = time.monotonic()
+
+
 def _post(endpoint, data, retries=4, backoff=2.0, timeout=30):
     """POST 到 Slumbot，对瞬时网络异常（SSL EOF / 超时 / 连接断）重试 `retries` 次
-    （线性退避）。重试耗尽抛 NetworkError；HTTP 非 200 / error_msg 由 caller 处理。"""
+    （线性退避）。重试耗尽抛 NetworkError；HTTP 非 200 / error_msg 由 caller 处理。
+    每次实际发请求前过 `_throttle()`，限速避免触发 IP 频率限制。"""
     import requests
     url = f'https://{host}/slumbot/api/{endpoint}'
     last = None
     for attempt in range(retries):
+        _throttle()
         try:
             return requests.post(url, headers={}, json=data, timeout=timeout)
         except requests.exceptions.RequestException as e:
@@ -563,6 +582,9 @@ def main():
     parser.add_argument('--fallback-policy', default='hybrid')
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--num-hands', type=int, default=100)
+    parser.add_argument('--request-interval', type=float, default=0.25,
+                        help='相邻两次 Slumbot API 请求的最小间隔秒数（login/new_hand/act 都算），'
+                             '限速避免高频请求触发 IP 频率限制 / 封禁；0 = 关闭')
     parser.add_argument('--username', type=str)
     parser.add_argument('--password', type=str)
     parser.add_argument('--selftest', action='store_true',
@@ -577,6 +599,9 @@ def main():
                         help='策略文件：每手 type=hand 完整记录（含 decisions/action_probs，即每种 '
                              'action 的概率），按 hand 号可与原文件对齐；不写任何统计行；空串关闭')
     args = parser.parse_args()
+
+    global _request_interval
+    _request_interval = args.request_interval
 
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
                       args.fallback_policy, args.seed)
