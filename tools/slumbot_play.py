@@ -381,6 +381,7 @@ def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None,
     token = login_token
     mbb = []
     pos_mbb = {0: [], 1: []}  # 按 Slumbot client_pos 分组（1=SB/button，0=BB）
+    block_start = 0           # 上一次 stats 检查点的手数 → 切出"本块"（最近 100 手）
     errors = 0
     played = 0
     # 两份日志：hand_log = 原文件（不带策略，去掉 decisions）+ 统计 stats/summary 行；
@@ -420,14 +421,18 @@ def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None,
                 base = {k: v for k, v in transcript.items() if k != 'decisions'}
                 hand_log_f.write(json.dumps(base, ensure_ascii=False) + '\n')
                 hand_log_f.flush()
-            # 每 100 局做一次统计：打到 stderr + 作为 type=stats 行写进原文件（累计口径）。
+            # 每 100 局做一次统计：本块（最近 100 手）+ 累积，打到 stderr + 写 type=stats 行。
             if played % 100 == 0:
-                stats = build_stats(mbb, pos_mbb, errors)
-                print(f'  [{played}/{num_hands}] mbb/g = {stats["mbb_per_g"]:.1f}  '
-                      f'total = {stats["total_bb"]:+.1f} BB', file=sys.stderr)
+                stats = build_stats(mbb, pos_mbb, errors)   # 累积口径
+                block = compute_stats(mbb[block_start:])     # 本块口径（最近 100 手）
+                block_start = played
+                print(f'  [{played}/{num_hands}] 本块 mbb/g = {block["mbb_per_g"]:.1f}  '
+                      f'累积 mbb/g = {stats["mbb_per_g"]:.1f}  '
+                      f'累积 total = {stats["total_bb"]:+.1f} BB', file=sys.stderr)
                 if hand_log_f:
                     rec = {'type': 'stats'}
-                    rec.update(stats)
+                    rec.update(stats)            # 顶层 = 累积
+                    rec['block'] = block         # block = 本块（最近 100 手）
                     hand_log_f.write(json.dumps(rec, ensure_ascii=False) + '\n')
                     hand_log_f.flush()
         # 文件末尾追加最终 summary 行（总输赢 + mbb/g + CI + 分位置拆分 + 放弃手数）。
