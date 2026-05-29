@@ -335,7 +335,10 @@ def play_hand(token, advisor, repro_log=None):
         if winnings is not None:
             transcript = {
                 'type': 'hand',
-                'client_pos': client_pos, 'hole_cards': hole_cards, 'board': board,
+                'client_pos': client_pos, 'hole_cards': hole_cards,
+                # Slumbot 手结束就亮对方底牌（连弃牌也亮），缺则 None。
+                'bot_hole_cards': r.get('bot_hole_cards'),
+                'board': board,
                 'action': action, 'our_incrs': our_incrs, 'decisions': decisions,
                 'winnings': winnings,
             }
