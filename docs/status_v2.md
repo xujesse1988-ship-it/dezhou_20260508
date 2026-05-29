@@ -154,6 +154,29 @@ throughput 上限由 `step_parallel` serial merge 卡死，加更多核 / 更大
   （绝对值与下表 LCFR 100M 不同档：eval seed 不同 + 2,000 hands 噪声大，random/equity-ev SE ±1,200；
   LBR 才是稳定质量度量，且对齐 baseline。）
 
+### Slumbot HUNL API 实测（dense 100M blueprint，2026-05-29）
+
+首次接真实强对手（Slumbot 2019）。桥接 = Python driver（HTTP/token，`tools/slumbot_play.py`，
+fork sample_api.py）+ 常驻 Rust advisor（`tools/slumbot_advisor.rs`，加载 dense ckpt + v4 bucket
+一次，stdio JSON-lines 每决策重放手局→查 blueprint→出 incr）。crate 改动仅
+`SimplifiedNlheGame::info_set_for_cards`（注入真实牌构 InfoSetId，与 `Game::info_set` byte-equal，
+`tests/nlhe_infoset_semantics.rs` T1 钉死）。设计/里程碑见
+`docs/temp/slumbot_api_bridge_plan_2026_05_29.md`。
+
+- **结果（vultr 实打 1000 手，免登录匿名，seed=7）**：`mbb/g = −1,969 ± 1,720（95% CI [−3,690, −249]）`
+  / SE 878 / bb/100 = −197。整段 CI < 0 → **显著负**（dense 100M coarse abstraction 显著输给 Slumbot）。
+- **管线已验证正确**（不是 bug）：advisor 8 项单测全绿（T2 Card / T3 重放对齐独立移植 ParseAction /
+  T4 outgoing 合法区间 / T4b call-of-all-in→c / T5 端到端）；实打 **0 次 Illegal bet**；启动
+  `strategy_blake3` 复现 `2fab8afe…`（= 加载的就是该 100M blueprint）；加载 RSS 5.21 GiB（< vultr 7.7）。
+- **亏损高度集中**：21 个大底池（|w|≥80bb）= 总亏的 **84%**（−164,450 / −196,900）；小底池近乎打平
+  （win<80bb 486 手 / lose<80bb 486 手 / median −50）。6 笔最大亏损全是 SB 位用 AK/KQ/QQ/AJ/A5s 在
+  4-bet/5-bet war 里 **200bb stack off 后输**——coarse abstraction 在深码大底池过度 commit。
+- **解读 + 杠杆**：非管线缺陷，是 6-action/500-bucket/200bb 抽象 + v1 nearest-ratio off-tree 映射
+  在深码多次加注 spot 的精度不足（abstract/real pot 漂移放大）。正好命中
+  `slumbot_api_bridge_plan §9` 的 PHM 升级触发条件（在 gap 区间系统性失血）。改进方向同既有「下一步」：
+  bet-size 扩张 / 更细 bucket / PHM off-tree。1000 手方差仍大（SE 878），要更紧数字需 ≥ 1 万手。
+- 牌局明细落盘 `m6_hands.jsonl`（每手 hole/board/action/our_incrs/winnings/mbb，vultr 上）。
+
 ### H3 baseline EV @ LCFR 100M（mbb/g，正值 = 训练侧赢）
 
 | baseline | mbb/g | 95% CI |
