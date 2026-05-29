@@ -201,6 +201,39 @@ impl SimplifiedNlheGame {
         let hand_bucket = u32::from(PreflopLossless169::new().hand_class(hole));
         pack_info_set_v2(hand_bucket, node_id, StreetTag::Preflop)
     }
+
+    /// 用注入的真实 hole+board 为指定 `node_id` 构造 `InfoSetId`，绕过 [`Game::info_set`]
+    /// 对 `SimplifiedNlheState`（随机发牌）的依赖。Slumbot 实时对战 advisor 用：树位置
+    /// 由抽象影子状态的 `current_node_id` 给出，手牌强度用对面发来的**真实牌**算。
+    ///
+    /// 与 [`Game::info_set`] **逐行同路径**：`street_tag = self.tree.node(node_id).street`；
+    /// preflop 走 `PreflopLossless169::hand_class`，postflop 走 `canonical_observation_id`
+    /// 接 `BucketTable::lookup`，最后同一个 [`pack_info_set_v2`] 打包。区别仅在没有
+    /// per-trajectory hand_bucket cache（单次查询不需要）——cache 命中路径返回值与重算
+    /// 路径 byte-equal，故对处于 `current_node_id == node_id` 且持有相同 `(hole, board)`
+    /// 的 state，结果与该 state 上 `Game::info_set(state, actor)` 逐位相等
+    /// （`tests/nlhe_infoset_semantics.rs` T1 钉死）。
+    ///
+    /// `board` 必须是该街实际公共牌（flop=3 / turn=4 / river=5；preflop 忽略），否则
+    /// `canonical_observation_id` 内部 `board.len()` 断言 panic。
+    pub fn info_set_for_cards(
+        &self,
+        node_id: NodeId,
+        hole: [crate::core::Card; 2],
+        board: &[crate::core::Card],
+    ) -> InfoSetId {
+        let street_tag = self.tree.node(node_id).street;
+        let hand_bucket: u32 = match street_tag {
+            StreetTag::Preflop => u32::from(PreflopLossless169::new().hand_class(hole)),
+            StreetTag::Flop | StreetTag::Turn | StreetTag::River => {
+                let observation = canonical_observation_id(street_tag, board, hole);
+                self.bucket_table
+                    .lookup(street_tag, observation)
+                    .expect("BucketTable::lookup returned None on in-range observation_id")
+            }
+        };
+        pack_info_set_v2(hand_bucket, node_id, street_tag)
+    }
 }
 
 /// 简化 NLHE 完整状态（API-303）。

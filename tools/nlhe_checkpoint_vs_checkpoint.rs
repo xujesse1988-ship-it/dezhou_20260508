@@ -1,8 +1,8 @@
 //! 两个简化 heads-up NLHE checkpoint 互相对弈（head-to-head）。
 //!
 //! 加载 checkpoint A / B 两份 ES-MCCFR trainer（HashMap 或 `--dense` checkpoint），
-//! 双座位轮换各打 `--hands-per-seat` 手，统计 A 相对 B 的 mbb/game + 95% 置信区间
-//! + 分座位胜率。对弈与统计逻辑直接复用 `tests/nlhe_h3_eval.rs` 里已被 H3 评测
+//! 双座位轮换各打 `--hands-per-seat` 手，统计 A 相对 B 的 mbb/game、95% 置信区间
+//! 及分座位胜率。对弈与统计逻辑直接复用 `tests/nlhe_h3_eval.rs` 里已被 H3 评测
 //! 套件验证过的实现，不引入新算法。
 //!
 //! checkpoint 各约 8.5 GB，加载两份的常驻 + 瞬时峰值约 30–40 GB，需在 ≥ 64 GB
