@@ -186,6 +186,25 @@ def _warn_once(msg):
 _warn_once.seen = set()
 
 
+def _short_action(name):
+    """动作名简写：raise0.5pot / bet0.5pot → 0.5pot；fold/check/call/allin 原样。"""
+    for pre in ('raise', 'bet'):
+        if name.startswith(pre):
+            return name[len(pre):]
+    return name
+
+
+def _compact_decision(dec):
+    """把 advisor 的 action_probs（[{action,prob},...]）压成有序 dict {名: 概率(4位)}，
+    动作名去掉 bet/raise 前缀（0.5pot/1pot/2pot）；chosen 同步简写以对齐 key。原地改 dec。
+    同一决策点 bet 与 raise 互斥，简写后不会撞 key。"""
+    aps = dec.get('action_probs')
+    if isinstance(aps, list):
+        dec['action_probs'] = {_short_action(ap['action']): round(ap['prob'], 4) for ap in aps}
+    if 'chosen' in dec:
+        dec['chosen'] = _short_action(dec['chosen'])
+
+
 # 请求节流：相邻两次 Slumbot API 请求（login/new_hand/act 都算）至少间隔
 # `_request_interval` 秒，避免无延迟疯狂拉取触发公开 API 的 IP 频率限制 / 封禁。
 # main() 从 --request-interval 设置；0 = 关闭。
@@ -355,6 +374,7 @@ def play_hand(token, advisor, repro_log=None):
                        '请在该机重建 target/release/slumbot_advisor 后重跑')
             adv_dec = {}
         dec = dict(adv_dec)
+        _compact_decision(dec)
         dec['action_before'] = action
         dec['board_at_decision'] = list(board)
         decisions.append(dec)
