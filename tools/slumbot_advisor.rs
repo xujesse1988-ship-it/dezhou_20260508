@@ -404,21 +404,68 @@ struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     incr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<Decision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 impl Response {
-    fn ok(incr: String) -> Self {
+    fn ok(decision: Decision) -> Self {
         Response {
-            incr: Some(incr),
+            incr: Some(decision.incr.clone()),
+            decision: Some(decision),
             error: None,
         }
     }
     fn err(msg: impl Into<String>) -> Self {
         Response {
             incr: None,
+            decision: None,
             error: Some(msg.into()),
         }
+    }
+}
+
+/// 一次我方决策的完整记录（随 Response 回给 Python driver，落进牌局日志，供离线对账）：
+/// 在哪条街、infoset、合法动作集 + blueprint 给的分布、采样选了哪个、是否走了均匀兜底、
+/// 最终发给 Slumbot 的 incr。`legal[i]` 与 `strategy[i]` 一一对齐。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct Decision {
+    incr: String,
+    street: String,
+    info_set: u64,
+    legal: Vec<String>,
+    strategy: Vec<f64>,
+    chosen: String,
+    chosen_index: usize,
+    /// blueprint 该 infoset 无记录（空 / 全零）→ 退均匀分布兜底。
+    fallback_uniform: bool,
+}
+
+/// 抽象动作 → 短标签（写进决策记录便于人读）。`Bet/Raise` 带 pot ratio（如 `bet0.5pot`）。
+fn action_label(a: &AbstractAction) -> String {
+    match a {
+        AbstractAction::Fold => "fold".to_string(),
+        AbstractAction::Check => "check".to_string(),
+        AbstractAction::Call { .. } => "call".to_string(),
+        AbstractAction::Bet { ratio_label, .. } => {
+            format!("bet{}pot", ratio_label.as_milli() as f64 / 1000.0)
+        }
+        AbstractAction::Raise { ratio_label, .. } => {
+            format!("raise{}pot", ratio_label.as_milli() as f64 / 1000.0)
+        }
+        AbstractAction::AllIn { .. } => "allin".to_string(),
+    }
+}
+
+/// 决策街 → 短标签。
+fn street_label(s: poker::Street) -> &'static str {
+    match s {
+        poker::Street::Preflop => "preflop",
+        poker::Street::Flop => "flop",
+        poker::Street::Turn => "turn",
+        poker::Street::River => "river",
+        poker::Street::Showdown => "showdown",
     }
 }
 
@@ -441,7 +488,7 @@ fn decide(
     req: &Request,
     strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
     base_seed: u64,
-) -> Result<String, String> {
+) -> Result<Decision, String> {
     if req.hole_cards.len() != 2 {
         return Err(format!(
             "hole_cards 必须 2 张，收到 {}",
@@ -488,7 +535,8 @@ fn decide(
 
     // 查策略 + 均匀兜底（空 / 全零）。
     let raw_dist = strategy_fn(&info, legal.len());
-    let dist: Vec<f64> = if raw_dist.is_empty() || raw_dist.iter().all(|p| *p <= 0.0) {
+    let fallback_uniform = raw_dist.is_empty() || raw_dist.iter().all(|p| *p <= 0.0);
+    let dist: Vec<f64> = if fallback_uniform {
         vec![1.0 / legal.len() as f64; legal.len()]
     } else {
         raw_dist
@@ -504,7 +552,18 @@ fn decide(
     // per-decision 确定性采样：seed = hash(action, hole, board, base_seed)。
     let idx = sample_index(&dist, req, &hole, &board, base_seed);
     let chosen = legal[idx];
-    outgoing_incr(&ctx.real, abstraction, chosen)
+    let incr = outgoing_incr(&ctx.real, abstraction, chosen)?;
+
+    Ok(Decision {
+        incr,
+        street: street_label(street).to_string(),
+        info_set: info.raw(),
+        legal: legal.iter().map(action_label).collect(),
+        strategy: dist,
+        chosen: action_label(&chosen),
+        chosen_index: idx,
+        fallback_uniform,
+    })
 }
 
 /// 从分布按 per-decision 确定性 seed 采样索引（保留混合策略 + 可复现）。
@@ -667,7 +726,7 @@ fn run() -> Result<(), String> {
         }
         let resp = match serde_json::from_str::<Request>(&line) {
             Ok(req) => match decide(game, &abstraction, &req, &strategy_fn, args.seed) {
-                Ok(incr) => Response::ok(incr),
+                Ok(decision) => Response::ok(decision),
                 Err(e) => Response::err(e),
             },
             Err(e) => Response::err(format!("bad request JSON: {e}")),
@@ -1210,13 +1269,25 @@ mod tests {
                 client_pos,
                 action: action.to_string(),
             };
-            let incr = decide(&game, &abs, &req, &uniform, 0xC0FFEE)
+            let d = decide(&game, &abs, &req, &uniform, 0xC0FFEE)
                 .unwrap_or_else(|e| panic!("decide({action:?}, pos={client_pos}) 失败: {e}"));
+            let incr = &d.incr;
             let ok = incr == "f"
                 || incr == "k"
                 || incr == "c"
                 || (incr.starts_with('b') && incr[1..].parse::<u64>().is_ok());
             assert!(ok, "decide({action:?}) 出非法 incr {incr:?}");
+            // 决策记录自洽：legal/strategy 等长对齐、chosen 落在 legal 内、分布归一。
+            assert_eq!(d.legal.len(), d.strategy.len(), "legal 与 strategy 须等长");
+            assert!(d.chosen_index < d.legal.len(), "chosen_index 越界");
+            assert_eq!(
+                d.chosen, d.legal[d.chosen_index],
+                "chosen 标签须等于 legal[chosen_index]"
+            );
+            let sum: f64 = d.strategy.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-9, "strategy 须归一，实际 {sum}");
+            // uniform fallback fn 喂的是全正分布 → 不该判 fallback_uniform。
+            assert!(!d.fallback_uniform, "正分布不该走均匀兜底");
         }
 
         // board 长度与街不符 → 干净 Err（不 panic）。

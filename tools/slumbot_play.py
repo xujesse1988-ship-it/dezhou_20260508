@@ -245,6 +245,8 @@ class Advisor:
         self.ready = ready
 
     def act(self, hole_cards, board, client_pos, action):
+        """返回 advisor 完整响应 dict：{'incr': ..., 'decision': {...}}。
+        'decision' 是该决策点的明细（街/infoset/合法动作 + 分布/选了哪个/是否均匀兜底）。"""
         req = json.dumps({
             'hole_cards': hole_cards, 'board': board,
             'client_pos': client_pos, 'action': action,
@@ -257,7 +259,7 @@ class Advisor:
         resp = json.loads(line)
         if 'error' in resp:
             raise RuntimeError(f'advisor error on {req}: {resp["error"]}')
-        return resp['incr']
+        return resp
 
     def close(self):
         try:
@@ -280,12 +282,15 @@ def board_for_street(full_board, st):
 # ===========================================================================
 def play_hand(token, advisor, repro_log=None):
     """打一手。返回 (token, winnings, transcript)。transcript 记录该手完整牌局：
-    我方 hole / 最终 board / client_pos / 最终 action 串 / 我方逐步 incr / winnings（chips）。"""
+    我方 hole / 最终 board / client_pos / 最终 action 串 / 我方逐步 incr / winnings（chips）/
+    decisions（每个我方决策点的明细：街/infoset/合法动作 + blueprint 分布/选了哪个/兜底标记/
+    决策前的 action 串与 board）。"""
     r = NewHand(token)
     new_token = r.get('token')
     if new_token:
         token = new_token
     our_incrs = []
+    decisions = []
     hole_cards = r.get('hole_cards')
     client_pos = r.get('client_pos')
     board = r.get('board', [])
@@ -300,12 +305,20 @@ def play_hand(token, advisor, repro_log=None):
         winnings = r.get('winnings')
         if winnings is not None:
             transcript = {
+                'type': 'hand',
                 'client_pos': client_pos, 'hole_cards': hole_cards, 'board': board,
-                'action': action, 'our_incrs': our_incrs, 'winnings': winnings,
+                'action': action, 'our_incrs': our_incrs, 'decisions': decisions,
+                'winnings': winnings,
             }
             return token, winnings, transcript
-        incr = advisor.act(hole_cards, board, client_pos, action)
+        resp = advisor.act(hole_cards, board, client_pos, action)
+        incr = resp['incr']
         our_incrs.append(incr)
+        # 记录该决策点明细：advisor 给的 decision + 决策当时看到的 action 串与 board。
+        dec = dict(resp.get('decision') or {})
+        dec['action_before'] = action
+        dec['board_at_decision'] = list(board)
+        decisions.append(dec)
         try:
             r = Act(token, incr)
         except Exception as e:
@@ -327,6 +340,7 @@ def play_hand(token, advisor, repro_log=None):
 def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
     token = login_token
     mbb = []
+    pos_mbb = {0: [], 1: []}  # 按 Slumbot client_pos 分组（1=SB/button，0=BB）
     errors = 0
     played = 0
     hand_log_f = open(hand_log, 'w') if hand_log else None
@@ -346,16 +360,31 @@ def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
                     print('  错误累计 > 20，疑似 systematic 问题，停止联机', file=sys.stderr)
                     break
                 continue
-            mbb.append(w * 1000.0 / BIG_BLIND)  # chips → mbb（1 BB = 100 chips）
+            w_mbb = w * 1000.0 / BIG_BLIND  # chips → mbb（1 BB = 100 chips）
+            mbb.append(w_mbb)
+            cp = transcript.get('client_pos')
+            if cp in pos_mbb:
+                pos_mbb[cp].append(w_mbb)
             played += 1
             if hand_log_f:
                 transcript['hand'] = played
-                transcript['mbb'] = w * 1000.0 / BIG_BLIND
+                transcript['mbb'] = w_mbb
                 hand_log_f.write(json.dumps(transcript, ensure_ascii=False) + '\n')
                 hand_log_f.flush()
             if played % 50 == 0:
                 print(f'  [{played}/{num_hands}] running mbb/g = {sum(mbb) / len(mbb):.1f}',
                       file=sys.stderr)
+        # 文件末尾追加统计 summary 行（总输赢 + mbb/g + CI + 分位置拆分 + 放弃手数）。
+        if hand_log_f:
+            summary = {'type': 'summary'}
+            summary.update(compute_stats(mbb))
+            summary['errors_dropped'] = errors
+            summary['by_position'] = {
+                'sb_button': compute_stats(pos_mbb[1]),  # Slumbot pos 1 = SB/button
+                'bb': compute_stats(pos_mbb[0]),         # pos 0 = BB
+            }
+            hand_log_f.write(json.dumps(summary, ensure_ascii=False) + '\n')
+            hand_log_f.flush()
     finally:
         if hand_log_f:
             hand_log_f.close()
@@ -364,27 +393,47 @@ def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
         print(f'  ({errors} 手因 error 放弃，未计入统计；类型见上方 [drop #N] 行——'
               f'网络抖动已自动重试，仍失败才放弃)')
     if hand_log:
-        print(f'  牌局明细已记录到 {hand_log}（{played} 手 JSONL）')
+        print(f'  牌局明细已记录到 {hand_log}（{played} 手 JSONL + 末尾 summary 统计行）')
 
 
-def report(mbb):
+def compute_stats(mbb):
+    """一组每手 mbb（= winnings_chips × 1000 / BB）→ 统计 dict。
+    含总输赢（total_chips / total_bb）、mbb/g、SE、95% CI、bb/100。空列表只含 hands=0。"""
     n = len(mbb)
     if n == 0:
-        print('no hands played')
-        return
+        return {'hands': 0}
     mean = sum(mbb) / n
     if n > 1:
         var = sum((x - mean) ** 2 for x in mbb) / (n - 1)
         se = math.sqrt(var / n)
     else:
         se = 0.0
-    total_chips = sum(x * BIG_BLIND / 1000.0 for x in mbb)
+    total_chips = sum(x * BIG_BLIND / 1000.0 for x in mbb)  # mbb → chips（1 BB = 100 chips）
     ci = 1.96 * se
-    print(f'hands={n}  total_chips={total_chips:.0f}  '
-          f'mbb/g={mean:.2f} ± {ci:.2f} (95% CI)  SE={se:.2f}')
-    # bb/100 = 每 100 手净 BB = (mbb/g) / 10（1 BB = 1000 mbb，再 ×100 手）。
-    print(f'  bb/100 = {mean / 10:.1f} ± {ci / 10:.1f}  '
-          f'(95% CI [{(mean - ci) / 10:.0f}, {(mean + ci) / 10:.0f}] BB/100；即每 100 手净 {mean / 10:.1f} BB)')
+    return {
+        'hands': n,
+        'total_chips': total_chips,      # 总净输赢（筹码）
+        'total_bb': total_chips / BIG_BLIND,  # 总净输赢（BB）
+        'mbb_per_g': mean,
+        'se': se,
+        'ci95': ci,
+        # bb/100 = 每 100 手净 BB = (mbb/g) / 10（1 BB = 1000 mbb，再 ×100 手）。
+        'bb_per_100': mean / 10.0,
+        'bb_per_100_ci95': ci / 10.0,
+    }
+
+
+def report(mbb):
+    s = compute_stats(mbb)
+    if s['hands'] == 0:
+        print('no hands played')
+        return
+    mean, ci = s['mbb_per_g'], s['ci95']
+    print(f"hands={s['hands']}  total={s['total_chips']:.0f} chips ({s['total_bb']:+.1f} BB)  "
+          f"mbb/g={mean:.2f} ± {ci:.2f} (95% CI)  SE={s['se']:.2f}")
+    print(f"  bb/100 = {s['bb_per_100']:.1f} ± {s['bb_per_100_ci95']:.1f}  "
+          f"(95% CI [{(mean - ci) / 10:.0f}, {(mean + ci) / 10:.0f}] BB/100；"
+          f"即每 100 手净 {s['bb_per_100']:.1f} BB)")
 
 
 # ===========================================================================
@@ -432,7 +481,7 @@ def mock_play_hand(advisor, rng):
             return client_pos, action, our_incrs
         bd = board_for_street(board, a['st'])
         if pos == client_pos:
-            incr = advisor.act(our_hole, bd, client_pos, action)
+            incr = advisor.act(our_hole, bd, client_pos, action)['incr']
             our_incrs.append(incr)
             _validate_incr(incr)
         else:
@@ -475,8 +524,9 @@ def main():
     parser.add_argument('--repro-log', type=str, default=None,
                         help='Slumbot 拒我方 incr 时，落盘完整上下文 JSONL 供离线诊断')
     parser.add_argument('--hand-log', type=str, default='slumbot_hands.jsonl',
-                        help='每手牌局明细（hole/board/action/our_incrs/winnings/mbb）写此 JSONL；'
-                             '空串关闭')
+                        help='每手牌局明细写此 JSONL（type=hand：hole/board/action/our_incrs/'
+                             'decisions/winnings/mbb），文件末尾追加 type=summary 统计行'
+                             '（总输赢/mbb-g/CI/分位置拆分）；空串关闭')
     args = parser.parse_args()
 
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
