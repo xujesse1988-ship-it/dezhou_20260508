@@ -284,13 +284,29 @@ def play_hand(token, advisor):
 def run_real(advisor, num_hands, login_token):
     token = login_token
     mbb = []
-    for h in range(num_hands):
-        token, w = play_hand(token, advisor)
+    errors = 0
+    played = 0
+    while played < num_hands:
+        try:
+            token, w = play_hand(token, advisor)
+        except Exception as e:
+            # 不静默继续：打全上下文日志（advisor error 含 offending request），放弃该手
+            # （不计入统计），重置 token 起新会话续打。systematic 问题 → 累计上限后停。
+            errors += 1
+            print(f'  [hand error #{errors}] {e}', file=sys.stderr)
+            token = login_token
+            if errors > 20:
+                print('  错误累计 > 20，疑似 systematic 问题，停止联机', file=sys.stderr)
+                break
+            continue
         mbb.append(w * 1000.0 / BIG_BLIND)  # chips → mbb（1 BB = 100 chips）
-        if (h + 1) % 50 == 0:
-            print(f'  [{h + 1}/{num_hands}] running mbb/g = {sum(mbb) / len(mbb):.1f}',
+        played += 1
+        if played % 50 == 0:
+            print(f'  [{played}/{num_hands}] running mbb/g = {sum(mbb) / len(mbb):.1f}',
                   file=sys.stderr)
     report(mbb)
+    if errors:
+        print(f'  ({errors} 手因 advisor/replay error 放弃，未计入统计)')
 
 
 def report(mbb):
