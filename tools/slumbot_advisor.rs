@@ -243,7 +243,12 @@ fn resolve_actions(
             Action::Check,
         )),
         Token::Call => Ok((
-            find_tag(&legal_abs, AbstractActionTag::Call).ok_or("Call 在 abs 当前节点不合法")?,
+            // call-of-all-in：当 call 额 == 自己的 all-in cap（HU 等额起手栈下对手 all-in 即此），
+            // `abstract_actions` 按 AA-004-rev1 把该 Call 折进 AllIn 槽 → 无 Call 边，落到 AllIn。
+            // real 侧 Action::Call 由规则引擎归一化为 all-in 跟注（→ 终局），与 abs 一致。
+            find_tag(&legal_abs, AbstractActionTag::Call)
+                .or_else(|| find_tag(&legal_abs, AbstractActionTag::AllIn))
+                .ok_or("Call/AllIn 在 abs 当前节点都不合法")?,
             Action::Call,
         )),
         Token::Fold => Ok((
