@@ -354,13 +354,17 @@ def play_hand(token, advisor, repro_log=None):
             )
 
 
-def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
+def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None,
+             strategy_log=None):
     token = login_token
     mbb = []
     pos_mbb = {0: [], 1: []}  # 按 Slumbot client_pos 分组（1=SB/button，0=BB）
     errors = 0
     played = 0
+    # 两份日志：hand_log = 原文件（不带策略，去掉 decisions）+ 统计 stats/summary 行；
+    # strategy_log = 完整每手记录（含 decisions/action_probs）但不写任何统计行。
     hand_log_f = open(hand_log, 'w') if hand_log else None
+    strat_log_f = open(strategy_log, 'w') if strategy_log else None
     try:
         while played < num_hands:
             try:
@@ -383,12 +387,18 @@ def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
             if cp in pos_mbb:
                 pos_mbb[cp].append(w_mbb)
             played += 1
+            transcript['hand'] = played
+            transcript['mbb'] = w_mbb
+            if strat_log_f:
+                # 带策略：完整 transcript（含 decisions/action_probs），不写统计。
+                strat_log_f.write(json.dumps(transcript, ensure_ascii=False) + '\n')
+                strat_log_f.flush()
             if hand_log_f:
-                transcript['hand'] = played
-                transcript['mbb'] = w_mbb
-                hand_log_f.write(json.dumps(transcript, ensure_ascii=False) + '\n')
+                # 原文件：去掉 decisions（策略数据），其余照写。
+                base = {k: v for k, v in transcript.items() if k != 'decisions'}
+                hand_log_f.write(json.dumps(base, ensure_ascii=False) + '\n')
                 hand_log_f.flush()
-            # 每 100 局做一次统计：打到 stderr + 作为 type=stats 行写进文件（累计口径）。
+            # 每 100 局做一次统计：打到 stderr + 作为 type=stats 行写进原文件（累计口径）。
             if played % 100 == 0:
                 stats = build_stats(mbb, pos_mbb, errors)
                 print(f'  [{played}/{num_hands}] mbb/g = {stats["mbb_per_g"]:.1f}  '
@@ -407,13 +417,17 @@ def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
     finally:
         if hand_log_f:
             hand_log_f.close()
+        if strat_log_f:
+            strat_log_f.close()
     report(mbb)
     if errors:
         print(f'  ({errors} 手因 error 放弃，未计入统计；类型见上方 [drop #N] 行——'
               f'网络抖动已自动重试，仍失败才放弃)')
     if hand_log:
-        print(f'  牌局明细已记录到 {hand_log}（{played} 手 JSONL + 每 100 局 type=stats '
-              f'+ 末尾 type=summary 统计行）')
+        print(f'  原文件（不带策略 + 统计）已记录到 {hand_log}（{played} 手 type=hand '
+              f'+ 每 100 局 type=stats + 末尾 type=summary）')
+    if strategy_log:
+        print(f'  策略明细（含 action_probs，不带统计）已记录到 {strategy_log}（{played} 手 type=hand）')
 
 
 def compute_stats(mbb):
@@ -556,9 +570,12 @@ def main():
     parser.add_argument('--repro-log', type=str, default=None,
                         help='Slumbot 拒我方 incr 时，落盘完整上下文 JSONL 供离线诊断')
     parser.add_argument('--hand-log', type=str, default='slumbot_hands.jsonl',
-                        help='每手牌局明细写此 JSONL（type=hand：hole/board/action/our_incrs/'
-                             'decisions/winnings/mbb），每 100 局追加 type=stats 统计行、'
-                             '末尾追加 type=summary 统计行（总输赢/mbb-g/CI/分位置拆分）；空串关闭')
+                        help='原文件：每手 type=hand（hole/board/action/our_incrs/winnings/mbb，'
+                             '不含策略 decisions），每 100 局追加 type=stats、末尾追加 type=summary '
+                             '统计行（总输赢/mbb-g/CI/分位置拆分）；空串关闭')
+    parser.add_argument('--strategy-log', type=str, default='slumbot_strategy.jsonl',
+                        help='策略文件：每手 type=hand 完整记录（含 decisions/action_probs，即每种 '
+                             'action 的概率），按 hand 号可与原文件对齐；不写任何统计行；空串关闭')
     args = parser.parse_args()
 
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
@@ -571,8 +588,10 @@ def main():
             if args.username and args.password:
                 token = Login(args.username, args.password)
             hand_log = args.hand_log if args.hand_log else None
+            strategy_log = args.strategy_log if args.strategy_log else None
             run_real(advisor, args.num_hands, token,
-                     repro_log=args.repro_log, hand_log=hand_log)
+                     repro_log=args.repro_log, hand_log=hand_log,
+                     strategy_log=strategy_log)
     finally:
         advisor.close()
 
