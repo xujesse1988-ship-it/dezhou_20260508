@@ -19,6 +19,7 @@ import math
 import random
 import subprocess
 import sys
+import time
 
 # `requests` 只在真实联机路径用，延迟到 NewHand/Act/Login 内 import——这样离线
 # --selftest（M5）在没装 requests 的机器上也能跑。
@@ -171,12 +172,29 @@ def ParseAction(action):
 # ===========================================================================
 # Slumbot 网络层（真实端点；M6 用）
 # ===========================================================================
-def NewHand(token):
+class NetworkError(RuntimeError):
+    """网络抖动（连接断/超时/SSL EOF），与 advisor/replay/Slumbot 拒单区分开。"""
+
+
+def _post(endpoint, data, retries=4, backoff=2.0, timeout=30):
+    """POST 到 Slumbot，对瞬时网络异常（SSL EOF / 超时 / 连接断）重试 `retries` 次
+    （线性退避）。重试耗尽抛 NetworkError；HTTP 非 200 / error_msg 由 caller 处理。"""
     import requests
-    data = {}
-    if token:
-        data['token'] = token
-    response = requests.post(f'https://{host}/slumbot/api/new_hand', headers={}, json=data)
+    url = f'https://{host}/slumbot/api/{endpoint}'
+    last = None
+    for attempt in range(retries):
+        try:
+            return requests.post(url, headers={}, json=data, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            last = e
+            if attempt < retries - 1:
+                time.sleep(backoff)
+    raise NetworkError(f'{endpoint} 网络重试 {retries} 次仍失败: {last}')
+
+
+def NewHand(token):
+    data = {'token': token} if token else {}
+    response = _post('new_hand', data)
     if response.status_code != 200:
         raise RuntimeError(f'new_hand status {response.status_code}: {response.text}')
     r = response.json()
@@ -186,9 +204,7 @@ def NewHand(token):
 
 
 def Act(token, incr):
-    import requests
-    data = {'token': token, 'incr': incr}
-    response = requests.post(f'https://{host}/slumbot/api/act', headers={}, json=data)
+    response = _post('act', {'token': token, 'incr': incr})
     if response.status_code != 200:
         raise RuntimeError(f'act status {response.status_code}: {response.text}')
     r = response.json()
@@ -198,9 +214,7 @@ def Act(token, incr):
 
 
 def Login(username, password):
-    import requests
-    data = {'username': username, 'password': password}
-    response = requests.post(f'https://{host}/slumbot/api/login', json=data)
+    response = _post('login', {'username': username, 'password': password})
     if response.status_code != 200:
         raise RuntimeError(f'login status {response.status_code}: {response.text}')
     r = response.json()
@@ -321,10 +335,12 @@ def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
             try:
                 token, w, transcript = play_hand(token, advisor, repro_log=repro_log)
             except Exception as e:
-                # 不静默继续：打全上下文日志（含 offending request），放弃该手（不计入
-                # 统计），重置 token 起新会话续打。systematic 问题 → 累计上限后停。
+                # 不静默继续：打全上下文日志（含 offending request + 当前已成功手数），放弃
+                # 该手（不计入统计），重置 token 起新会话续打。区分网络抖动 vs advisor/拒单。
+                # 网络抖动已在 _post 内重试过，到这里说明重试也没救回。systematic → 上限后停。
                 errors += 1
-                print(f'  [hand error #{errors}] {e}', file=sys.stderr)
+                kind = "网络" if isinstance(e, NetworkError) else "advisor/重放/拒单"
+                print(f'  [drop #{errors} 类型={kind} @ played={played}] {e}', file=sys.stderr)
                 token = login_token
                 if errors > 20:
                     print('  错误累计 > 20，疑似 systematic 问题，停止联机', file=sys.stderr)
@@ -345,7 +361,8 @@ def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
             hand_log_f.close()
     report(mbb)
     if errors:
-        print(f'  ({errors} 手因 advisor/replay error 放弃，未计入统计)')
+        print(f'  ({errors} 手因 error 放弃，未计入统计；类型见上方 [drop #N] 行——'
+              f'网络抖动已自动重试，仍失败才放弃)')
     if hand_log:
         print(f'  牌局明细已记录到 {hand_log}（{played} 手 JSONL）')
 
