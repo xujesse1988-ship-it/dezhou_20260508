@@ -176,6 +176,16 @@ class NetworkError(RuntimeError):
     """网络抖动（连接断/超时/SSL EOF），与 advisor/replay/Slumbot 拒单区分开。"""
 
 
+def _warn_once(msg):
+    """同一条 msg 整个进程只打一次 stderr，避免长跑时刷屏。"""
+    if msg not in _warn_once.seen:
+        print(f'  [warn] {msg}', file=sys.stderr)
+        _warn_once.seen.add(msg)
+
+
+_warn_once.seen = set()
+
+
 def _post(endpoint, data, retries=4, backoff=2.0, timeout=30):
     """POST 到 Slumbot，对瞬时网络异常（SSL EOF / 超时 / 连接断）重试 `retries` 次
     （线性退避）。重试耗尽抛 NetworkError；HTTP 非 200 / error_msg 由 caller 处理。"""
@@ -314,8 +324,15 @@ def play_hand(token, advisor, repro_log=None):
         resp = advisor.act(hole_cards, board, client_pos, action)
         incr = resp['incr']
         our_incrs.append(incr)
-        # 记录该决策点明细：advisor 给的 decision + 决策当时看到的 action 串与 board。
-        dec = dict(resp.get('decision') or {})
+        # 记录该决策点明细：advisor 给的 decision（含每种 action 的概率 action_probs）+
+        # 决策当时看到的 action 串与 board。decision 缺失 = advisor 二进制偏旧 → 警告一次，
+        # 别让"瘦"决策（没概率）静默落盘。
+        adv_dec = resp.get('decision')
+        if adv_dec is None:
+            _warn_once('advisor 未返回 decision（每种 action 的概率缺失）——release 二进制偏旧，'
+                       '请在该机重建 target/release/slumbot_advisor 后重跑')
+            adv_dec = {}
+        dec = dict(adv_dec)
         dec['action_before'] = action
         dec['board_at_decision'] = list(board)
         decisions.append(dec)

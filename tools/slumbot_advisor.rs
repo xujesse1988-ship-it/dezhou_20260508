@@ -426,18 +426,24 @@ impl Response {
     }
 }
 
+/// 一种合法动作及 blueprint 给它的概率（决策记录里逐个动作一行，便于人直接读"每种
+/// action 的概率"）。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct ActionProb {
+    action: String,
+    prob: f64,
+}
+
 /// 一次我方决策的完整记录（随 Response 回给 Python driver，落进牌局日志，供离线对账）：
-/// 在哪条街、infoset、合法动作集 + blueprint 给的分布、采样选了哪个、是否走了均匀兜底、
-/// 最终发给 Slumbot 的 incr。`legal[i]` 与 `strategy[i]` 一一对齐。
+/// 在哪条街、infoset、每种合法动作 + blueprint 概率、采样选了哪个、是否走了均匀兜底、
+/// 最终发给 Slumbot 的 incr。`action_probs` 顺序 = 抽象动作顺序，概率和为 1。
 #[derive(Serialize, Debug, Clone, PartialEq)]
 struct Decision {
     incr: String,
     street: String,
     info_set: u64,
-    legal: Vec<String>,
-    strategy: Vec<f64>,
+    action_probs: Vec<ActionProb>,
     chosen: String,
-    chosen_index: usize,
     /// blueprint 该 infoset 无记录（空 / 全零）→ 退均匀分布兜底。
     fallback_uniform: bool,
 }
@@ -554,14 +560,22 @@ fn decide(
     let chosen = legal[idx];
     let incr = outgoing_incr(&ctx.real, abstraction, chosen)?;
 
+    // 每种合法动作配上 blueprint 概率（顺序一致），决策记录里直接可读。
+    let action_probs = legal
+        .iter()
+        .zip(dist.iter())
+        .map(|(a, p)| ActionProb {
+            action: action_label(a),
+            prob: *p,
+        })
+        .collect();
+
     Ok(Decision {
         incr,
         street: street_label(street).to_string(),
         info_set: info.raw(),
-        legal: legal.iter().map(action_label).collect(),
-        strategy: dist,
+        action_probs,
         chosen: action_label(&chosen),
-        chosen_index: idx,
         fallback_uniform,
     })
 }
@@ -1277,15 +1291,15 @@ mod tests {
                 || incr == "c"
                 || (incr.starts_with('b') && incr[1..].parse::<u64>().is_ok());
             assert!(ok, "decide({action:?}) 出非法 incr {incr:?}");
-            // 决策记录自洽：legal/strategy 等长对齐、chosen 落在 legal 内、分布归一。
-            assert_eq!(d.legal.len(), d.strategy.len(), "legal 与 strategy 须等长");
-            assert!(d.chosen_index < d.legal.len(), "chosen_index 越界");
-            assert_eq!(
-                d.chosen, d.legal[d.chosen_index],
-                "chosen 标签须等于 legal[chosen_index]"
+            // 决策记录自洽：每种动作各一概率、概率归一、chosen 落在合法动作里。
+            assert!(!d.action_probs.is_empty(), "action_probs 不该为空");
+            let sum: f64 = d.action_probs.iter().map(|ap| ap.prob).sum();
+            assert!((sum - 1.0).abs() < 1e-9, "概率须归一，实际 {sum}");
+            assert!(
+                d.action_probs.iter().any(|ap| ap.action == d.chosen),
+                "chosen {:?} 须是 action_probs 里的某个动作",
+                d.chosen
             );
-            let sum: f64 = d.strategy.iter().sum();
-            assert!((sum - 1.0).abs() < 1e-9, "strategy 须归一，实际 {sum}");
             // uniform fallback fn 喂的是全正分布 → 不该判 fallback_uniform。
             assert!(!d.fallback_uniform, "正分布不该走均匀兜底");
         }
