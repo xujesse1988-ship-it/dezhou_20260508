@@ -265,19 +265,33 @@ def board_for_street(full_board, st):
 # 真实对局（M6）
 # ===========================================================================
 def play_hand(token, advisor, repro_log=None):
+    """打一手。返回 (token, winnings, transcript)。transcript 记录该手完整牌局：
+    我方 hole / 最终 board / client_pos / 最终 action 串 / 我方逐步 incr / winnings（chips）。"""
     r = NewHand(token)
     new_token = r.get('token')
     if new_token:
         token = new_token
+    our_incrs = []
+    hole_cards = r.get('hole_cards')
+    client_pos = r.get('client_pos')
+    board = r.get('board', [])
     while True:
+        # 每个响应都刷新最新的 board / action / client_pos（hole 全程不变）。
+        if r.get('hole_cards') is not None:
+            hole_cards = r.get('hole_cards')
+        if r.get('client_pos') is not None:
+            client_pos = r.get('client_pos')
+        board = r.get('board', board)
+        action = r.get('action', '')
         winnings = r.get('winnings')
         if winnings is not None:
-            return token, winnings
-        action = r.get('action', '')
-        client_pos = r.get('client_pos')
-        hole_cards = r.get('hole_cards')
-        board = r.get('board', [])
+            transcript = {
+                'client_pos': client_pos, 'hole_cards': hole_cards, 'board': board,
+                'action': action, 'our_incrs': our_incrs, 'winnings': winnings,
+            }
+            return token, winnings, transcript
         incr = advisor.act(hole_cards, board, client_pos, action)
+        our_incrs.append(incr)
         try:
             r = Act(token, incr)
         except Exception as e:
@@ -296,32 +310,44 @@ def play_hand(token, advisor, repro_log=None):
             )
 
 
-def run_real(advisor, num_hands, login_token, repro_log=None):
+def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
     token = login_token
     mbb = []
     errors = 0
     played = 0
-    while played < num_hands:
-        try:
-            token, w = play_hand(token, advisor, repro_log=repro_log)
-        except Exception as e:
-            # 不静默继续：打全上下文日志（advisor error 含 offending request），放弃该手
-            # （不计入统计），重置 token 起新会话续打。systematic 问题 → 累计上限后停。
-            errors += 1
-            print(f'  [hand error #{errors}] {e}', file=sys.stderr)
-            token = login_token
-            if errors > 20:
-                print('  错误累计 > 20，疑似 systematic 问题，停止联机', file=sys.stderr)
-                break
-            continue
-        mbb.append(w * 1000.0 / BIG_BLIND)  # chips → mbb（1 BB = 100 chips）
-        played += 1
-        if played % 50 == 0:
-            print(f'  [{played}/{num_hands}] running mbb/g = {sum(mbb) / len(mbb):.1f}',
-                  file=sys.stderr)
+    hand_log_f = open(hand_log, 'w') if hand_log else None
+    try:
+        while played < num_hands:
+            try:
+                token, w, transcript = play_hand(token, advisor, repro_log=repro_log)
+            except Exception as e:
+                # 不静默继续：打全上下文日志（含 offending request），放弃该手（不计入
+                # 统计），重置 token 起新会话续打。systematic 问题 → 累计上限后停。
+                errors += 1
+                print(f'  [hand error #{errors}] {e}', file=sys.stderr)
+                token = login_token
+                if errors > 20:
+                    print('  错误累计 > 20，疑似 systematic 问题，停止联机', file=sys.stderr)
+                    break
+                continue
+            mbb.append(w * 1000.0 / BIG_BLIND)  # chips → mbb（1 BB = 100 chips）
+            played += 1
+            if hand_log_f:
+                transcript['hand'] = played
+                transcript['mbb'] = w * 1000.0 / BIG_BLIND
+                hand_log_f.write(json.dumps(transcript, ensure_ascii=False) + '\n')
+                hand_log_f.flush()
+            if played % 50 == 0:
+                print(f'  [{played}/{num_hands}] running mbb/g = {sum(mbb) / len(mbb):.1f}',
+                      file=sys.stderr)
+    finally:
+        if hand_log_f:
+            hand_log_f.close()
     report(mbb)
     if errors:
         print(f'  ({errors} 手因 advisor/replay error 放弃，未计入统计)')
+    if hand_log:
+        print(f'  牌局明细已记录到 {hand_log}（{played} 手 JSONL）')
 
 
 def report(mbb):
@@ -429,6 +455,9 @@ def main():
                         help='本地 mock，不连 slumbot.com（M5 验收）')
     parser.add_argument('--repro-log', type=str, default=None,
                         help='Slumbot 拒我方 incr 时，落盘完整上下文 JSONL 供离线诊断')
+    parser.add_argument('--hand-log', type=str, default='slumbot_hands.jsonl',
+                        help='每手牌局明细（hole/board/action/our_incrs/winnings/mbb）写此 JSONL；'
+                             '空串关闭')
     args = parser.parse_args()
 
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
@@ -440,7 +469,9 @@ def main():
             token = None
             if args.username and args.password:
                 token = Login(args.username, args.password)
-            run_real(advisor, args.num_hands, token, repro_log=args.repro_log)
+            hand_log = args.hand_log if args.hand_log else None
+            run_real(advisor, args.num_hands, token,
+                     repro_log=args.repro_log, hand_log=hand_log)
     finally:
         advisor.close()
 

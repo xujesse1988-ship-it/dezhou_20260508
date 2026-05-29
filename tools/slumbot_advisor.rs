@@ -340,7 +340,7 @@ fn outgoing_incr(
                 .legal_actions()
                 .all_in_amount
                 .ok_or("选中 AllIn 但 real 无 all_in_amount（无筹码？）")?;
-            Ok(format!("b{}", to.as_u64()))
+            Ok(bet_or_call(real, to.as_u64()))
         }
         AbstractAction::Bet { ratio_label, .. } | AbstractAction::Raise { ratio_label, .. } => {
             // 同一抽象作用在真实 pot 上，找同 ratio 的档取其真实 `to`。
@@ -351,7 +351,7 @@ fn outgoing_incr(
                     | AbstractAction::Raise { to, ratio_label: r }
                         if r.as_milli() == ratio_label.as_milli() =>
                     {
-                        return Ok(format!("b{}", to.as_u64()));
+                        return Ok(bet_or_call(real, to.as_u64()));
                     }
                     _ => {}
                 }
@@ -361,8 +361,27 @@ fn outgoing_incr(
                 .legal_actions()
                 .all_in_amount
                 .ok_or("选中 Bet/Raise 档但真实侧既无该档也无 all_in_amount")?;
-            Ok(format!("b{}", to.as_u64()))
+            Ok(bet_or_call(real, to.as_u64()))
         }
+    }
+}
+
+/// 把目标 `to`（本街累计下注到）翻成 Slumbot incr：`to` **严格高于**当前下注水位
+/// （`max committed_this_round`）才构成合法 bet/raise（增量 > 0）→ `b<to>`；否则不是
+/// 加注 = 跟注 → `c`。关键 case：对手 all-in 覆盖我方时，我方"AllIn"的 to == 对手
+/// 下注水位（甚至更低，all-in for less），增量 0 会被 Slumbot 判 Illegal bet——这其实
+/// 是 all-in 跟注，应发 `c`。
+fn bet_or_call(real: &GameState, to: u64) -> String {
+    let bet_level = real
+        .players()
+        .iter()
+        .map(|p| p.committed_this_round.as_u64())
+        .max()
+        .unwrap_or(0);
+    if to > bet_level {
+        format!("b{to}")
+    } else {
+        "c".to_string()
     }
 }
 
@@ -1125,6 +1144,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// T4b（回归：vultr 实打捕获的 Illegal bet 根因）：面对对手 all-in（覆盖我方），
+    /// 我方 abstract「AllIn」其实是 all-in 跟注（to == 对手下注水位，增量 0），outgoing
+    /// 必须发 `c` 而非 `b<to>`（否则 Slumbot 判 Illegal bet）。
+    #[test]
+    fn t4b_call_of_all_in_emits_c() {
+        let game = stub_game();
+        let abs = default_abstraction();
+        // SB all-in（b20000）→ BB 面对 all-in，等额 200bb 下 BB 的 call/all-in 同额。
+        let ctx = replay_str(&game, &abs, "b20000").expect("replay b20000");
+        assert_eq!(
+            ctx.real.current_player(),
+            Some(SeatId(1)),
+            "b20000 后应轮 BB(SeatId1) 动"
+        );
+        let legal = SimplifiedNlheGame::legal_actions(&ctx.abs);
+        // 等额栈 all-in：Call 被折进 AllIn 槽，合法集应是 {Fold, AllIn}。
+        let all_in = legal
+            .iter()
+            .copied()
+            .find(|a| matches!(a, AbstractAction::AllIn { .. }))
+            .expect("面对 all-in 应有 AllIn 抽象动作");
+        assert_eq!(
+            outgoing_incr(&ctx.real, &abs, all_in).unwrap(),
+            "c",
+            "面对对手 all-in，AllIn 即跟注，必须发 c 不是 b<to>"
+        );
+        let fold = legal
+            .iter()
+            .copied()
+            .find(|a| matches!(a, AbstractAction::Fold))
+            .expect("面对 all-in 应有 Fold");
+        assert_eq!(outgoing_incr(&ctx.real, &abs, fold).unwrap(), "f");
     }
 
     /// T5：端到端 smoke（无网络）。canned 手局（含空串/我先动、含 `/`、含 all-in、
