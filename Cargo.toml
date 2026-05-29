@@ -122,6 +122,13 @@ path = "tools/nlhe_blake3_anchor.rs"
 name = "nlhe_h3_report"
 path = "tools/nlhe_h3_report.rs"
 
+# Slumbot HUNL API 对接：常驻 advisor（docs/temp/slumbot_api_bridge_plan_2026_05_29.md）。
+# Python driver 跑 HTTP/token；本进程加载 dense blueprint + v4 bucket 表，stdio JSON-lines
+# 每决策重放手局 → 查 blueprint → 出 incr。零网络依赖（网络全在 Python 侧）。
+[[bin]]
+name = "slumbot_advisor"
+path = "tools/slumbot_advisor.rs"
+
 [[bin]]
 name = "nlhe_checkpoint_vs_checkpoint"
 path = "tools/nlhe_checkpoint_vs_checkpoint.rs"
