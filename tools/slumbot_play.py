@@ -371,18 +371,20 @@ def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
                 transcript['mbb'] = w_mbb
                 hand_log_f.write(json.dumps(transcript, ensure_ascii=False) + '\n')
                 hand_log_f.flush()
-            if played % 50 == 0:
-                print(f'  [{played}/{num_hands}] running mbb/g = {sum(mbb) / len(mbb):.1f}',
-                      file=sys.stderr)
-        # 文件末尾追加统计 summary 行（总输赢 + mbb/g + CI + 分位置拆分 + 放弃手数）。
+            # 每 100 局做一次统计：打到 stderr + 作为 type=stats 行写进文件（累计口径）。
+            if played % 100 == 0:
+                stats = build_stats(mbb, pos_mbb, errors)
+                print(f'  [{played}/{num_hands}] mbb/g = {stats["mbb_per_g"]:.1f}  '
+                      f'total = {stats["total_bb"]:+.1f} BB', file=sys.stderr)
+                if hand_log_f:
+                    rec = {'type': 'stats'}
+                    rec.update(stats)
+                    hand_log_f.write(json.dumps(rec, ensure_ascii=False) + '\n')
+                    hand_log_f.flush()
+        # 文件末尾追加最终 summary 行（总输赢 + mbb/g + CI + 分位置拆分 + 放弃手数）。
         if hand_log_f:
             summary = {'type': 'summary'}
-            summary.update(compute_stats(mbb))
-            summary['errors_dropped'] = errors
-            summary['by_position'] = {
-                'sb_button': compute_stats(pos_mbb[1]),  # Slumbot pos 1 = SB/button
-                'bb': compute_stats(pos_mbb[0]),         # pos 0 = BB
-            }
+            summary.update(build_stats(mbb, pos_mbb, errors))
             hand_log_f.write(json.dumps(summary, ensure_ascii=False) + '\n')
             hand_log_f.flush()
     finally:
@@ -393,7 +395,8 @@ def run_real(advisor, num_hands, login_token, repro_log=None, hand_log=None):
         print(f'  ({errors} 手因 error 放弃，未计入统计；类型见上方 [drop #N] 行——'
               f'网络抖动已自动重试，仍失败才放弃)')
     if hand_log:
-        print(f'  牌局明细已记录到 {hand_log}（{played} 手 JSONL + 末尾 summary 统计行）')
+        print(f'  牌局明细已记录到 {hand_log}（{played} 手 JSONL + 每 100 局 type=stats '
+              f'+ 末尾 type=summary 统计行）')
 
 
 def compute_stats(mbb):
@@ -421,6 +424,18 @@ def compute_stats(mbb):
         'bb_per_100': mean / 10.0,
         'bb_per_100_ci95': ci / 10.0,
     }
+
+
+def build_stats(mbb, pos_mbb, errors):
+    """整体统计 + 放弃手数 + 分位置拆分（SB/button vs BB）。周期 stats 行与末尾 summary
+    行同形，便于下游统一解析、看 mbb/g 随手数的轨迹。"""
+    s = dict(compute_stats(mbb))
+    s['errors_dropped'] = errors
+    s['by_position'] = {
+        'sb_button': compute_stats(pos_mbb[1]),  # Slumbot pos 1 = SB/button
+        'bb': compute_stats(pos_mbb[0]),         # pos 0 = BB
+    }
+    return s
 
 
 def report(mbb):
@@ -525,8 +540,8 @@ def main():
                         help='Slumbot 拒我方 incr 时，落盘完整上下文 JSONL 供离线诊断')
     parser.add_argument('--hand-log', type=str, default='slumbot_hands.jsonl',
                         help='每手牌局明细写此 JSONL（type=hand：hole/board/action/our_incrs/'
-                             'decisions/winnings/mbb），文件末尾追加 type=summary 统计行'
-                             '（总输赢/mbb-g/CI/分位置拆分）；空串关闭')
+                             'decisions/winnings/mbb），每 100 局追加 type=stats 统计行、'
+                             '末尾追加 type=summary 统计行（总输赢/mbb-g/CI/分位置拆分）；空串关闭')
     args = parser.parse_args()
 
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
