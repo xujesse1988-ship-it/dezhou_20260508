@@ -362,10 +362,12 @@ def report(mbb):
     else:
         se = 0.0
     total_chips = sum(x * BIG_BLIND / 1000.0 for x in mbb)
+    ci = 1.96 * se
     print(f'hands={n}  total_chips={total_chips:.0f}  '
-          f'mbb/g={mean:.2f} ± {1.96 * se:.2f} (95% CI)  SE={se:.2f}')
-    print(f'  (mbb/g = milli-big-blind per hand；bb/100 = mbb/g × 0.1 × 100 = {mean:.2f}/10 = '
-          f'{mean / 10:.2f})')
+          f'mbb/g={mean:.2f} ± {ci:.2f} (95% CI)  SE={se:.2f}')
+    # bb/100 = 每 100 手净 BB = (mbb/g) / 10（1 BB = 1000 mbb，再 ×100 手）。
+    print(f'  bb/100 = {mean / 10:.1f} ± {ci / 10:.1f}  '
+          f'(95% CI [{(mean - ci) / 10:.0f}, {(mean + ci) / 10:.0f}] BB/100；即每 100 手净 {mean / 10:.1f} BB)')
 
 
 # ===========================================================================
