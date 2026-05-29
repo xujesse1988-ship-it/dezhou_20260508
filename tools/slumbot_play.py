@@ -264,7 +264,7 @@ def board_for_street(full_board, st):
 # ===========================================================================
 # 真实对局（M6）
 # ===========================================================================
-def play_hand(token, advisor):
+def play_hand(token, advisor, repro_log=None):
     r = NewHand(token)
     new_token = r.get('token')
     if new_token:
@@ -278,17 +278,32 @@ def play_hand(token, advisor):
         hole_cards = r.get('hole_cards')
         board = r.get('board', [])
         incr = advisor.act(hole_cards, board, client_pos, action)
-        r = Act(token, incr)
+        try:
+            r = Act(token, incr)
+        except Exception as e:
+            # Slumbot 拒了我们的 incr（如 "Illegal bet"）。落盘完整上下文供离线复现 +
+            # 诊断（ParseAction(action) 可算出 Slumbot 合法区间，对比我们的 to）。
+            ctx = {
+                'hole_cards': hole_cards, 'board': board, 'client_pos': client_pos,
+                'action': action, 'incr': incr, 'slumbot_error': str(e),
+            }
+            if repro_log:
+                with open(repro_log, 'a') as f:
+                    f.write(json.dumps(ctx) + '\n')
+            raise RuntimeError(
+                f'Slumbot 拒 incr={incr!r}（action={action!r} pos={client_pos} '
+                f'board={board} hole={hole_cards}）: {e}'
+            )
 
 
-def run_real(advisor, num_hands, login_token):
+def run_real(advisor, num_hands, login_token, repro_log=None):
     token = login_token
     mbb = []
     errors = 0
     played = 0
     while played < num_hands:
         try:
-            token, w = play_hand(token, advisor)
+            token, w = play_hand(token, advisor, repro_log=repro_log)
         except Exception as e:
             # 不静默继续：打全上下文日志（advisor error 含 offending request），放弃该手
             # （不计入统计），重置 token 起新会话续打。systematic 问题 → 累计上限后停。
@@ -412,6 +427,8 @@ def main():
     parser.add_argument('--password', type=str)
     parser.add_argument('--selftest', action='store_true',
                         help='本地 mock，不连 slumbot.com（M5 验收）')
+    parser.add_argument('--repro-log', type=str, default=None,
+                        help='Slumbot 拒我方 incr 时，落盘完整上下文 JSONL 供离线诊断')
     args = parser.parse_args()
 
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
@@ -423,7 +440,7 @@ def main():
             token = None
             if args.username and args.password:
                 token = Login(args.username, args.password)
-            run_real(advisor, args.num_hands, token)
+            run_real(advisor, args.num_hands, token, repro_log=args.repro_log)
     finally:
         advisor.close()
 
