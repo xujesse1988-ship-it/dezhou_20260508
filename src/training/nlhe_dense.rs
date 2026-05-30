@@ -175,6 +175,19 @@ impl NlheDenseIndexer {
         }
     }
 
+    /// 直接由 `(node_id, bucket_id)` 算行号（绕过 `InfoSetId` 打包/解包）。AIVAT 值表
+    /// 按街缓存 bucket 后逐节点取行用（见 [`crate::training::aivat_value`]）。
+    #[inline]
+    pub fn row_for(&self, node_id: NodeId, bucket_id: u32) -> u64 {
+        let meta = &self.nodes[node_id as usize];
+        debug_assert!(
+            u64::from(bucket_id) < u64::from(meta.bucket_count),
+            "bucket_id {bucket_id} >= bucket_count {}（node {node_id}）",
+            meta.bucket_count
+        );
+        meta.row_base + u64::from(bucket_id)
+    }
+
     /// dense 表行数 = Σ bucket_count（应 == infoset 数；建 sizing 工具已自洽校验）。
     pub fn total_rows(&self) -> u64 {
         self.total_rows

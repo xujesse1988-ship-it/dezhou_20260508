@@ -129,6 +129,11 @@ path = "tools/nlhe_h3_report.rs"
 name = "slumbot_advisor"
 path = "tools/slumbot_advisor.rs"
 
+# 构建 AIVAT 值函数表（NLHE 自对弈 MC）→ artifact，供 aivat_eval 估计器加载。
+[[bin]]
+name = "aivat_build_values"
+path = "tools/aivat_build_values.rs"
+
 [[bin]]
 name = "nlhe_checkpoint_vs_checkpoint"
 path = "tools/nlhe_checkpoint_vs_checkpoint.rs"
