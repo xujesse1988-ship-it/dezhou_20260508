@@ -24,6 +24,7 @@
 //! 走 `poker::training::{Checkpoint, CheckpointError, TrainerError, ...}` 短路径访问，
 //! 与 API-380 / API-350 公开路径一致。
 
+pub mod aivat;
 pub mod best_response;
 pub mod checkpoint;
 pub mod game;
@@ -41,6 +42,7 @@ pub mod sampling;
 pub mod trainer;
 
 // API-300 / API-380 顶层公开 surface（与 `docs/pluribus_stage3_api.md` §8 对齐）。
+pub use aivat::{enumerate_aivat_moments, exact_state_value, AivatMoments};
 pub use best_response::{exploitability, BestResponse, KuhnBestResponse, LeducBestResponse};
 pub use checkpoint::Checkpoint;
 pub use game::{Game, NodeKind, PlayerId};
