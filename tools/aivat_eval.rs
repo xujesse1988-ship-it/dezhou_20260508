@@ -196,6 +196,12 @@ fn main() -> Result<(), String> {
     let mut c_board = Stat::default();
     let mut c_runout = Stat::default();
     let mut c_act = Stat::default();
+    // 诊断：各修正子集的 AIVAT（看哪些项真降方差、哪些净加噪声）。
+    let mut av_deals = Stat::default(); // raw − 双方发牌
+    let mut av_runout = Stat::default(); // raw − runout
+    let mut av_dense = Stat::default(); // raw − 发牌 − runout（dense/精确项）
+    let mut av_no_board = Stat::default(); // full − c_board（= raw − 发牌 − runout − act）
+    let mut av_no_act = Stat::default(); // full − c_act
 
     let mut failures: u64 = 0;
     let mut printed_fail = 0u32;
@@ -237,6 +243,12 @@ fn main() -> Result<(), String> {
             Ok(r) => {
                 let our_pos = r.our_pos;
                 total_offtree += r.n_offtree as u64;
+                let deals = r.c_deal_us + r.c_deal_opp;
+                av_deals.push(r.raw - deals);
+                av_runout.push(r.raw - r.c_runout);
+                av_dense.push(r.raw - deals - r.c_runout);
+                av_no_board.push(r.raw - deals - r.c_runout - r.c_act);
+                av_no_act.push(r.raw - deals - r.c_board - r.c_runout);
                 accumulate(
                     &r,
                     our_pos,
@@ -284,6 +296,26 @@ fn main() -> Result<(), String> {
         "  SE 缩减比 raw/AIVAT = {se_ratio:.3}x   方差缩减 = {:.2}x",
         se_ratio * se_ratio
     );
+
+    println!("\n-- 子集诊断（SE + raw/SE 缩减比；看哪些项真降方差）--");
+    let raw_se = raw.se();
+    for (name, s) in [
+        ("raw", &raw),
+        ("−deals", &av_deals),
+        ("−runout", &av_runout),
+        ("−deals−runout", &av_dense),
+        ("−deals−runout−act(no_board)", &av_no_board),
+        ("−deals−board−runout(no_act)", &av_no_act),
+        ("AIVAT(full)", &aivat),
+    ] {
+        let se = s.se() * MBB;
+        let ratio = if s.se() > 0.0 {
+            raw_se / s.se()
+        } else {
+            f64::NAN
+        };
+        println!("  {name:<30} SE={se:>8.2}   raw/SE={ratio:.3}x");
+    }
 
     println!("\n-- 配对差 d = AIVAT − raw（无偏闸门：|mean(d)| ≤ 1.96·SE(d)）--");
     let dm = diff.mean() * MBB;
