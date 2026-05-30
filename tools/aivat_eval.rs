@@ -202,6 +202,7 @@ fn main() -> Result<(), String> {
     let mut av_dense = Stat::default(); // raw − 发牌 − runout（dense/精确项）
     let mut av_no_board = Stat::default(); // full − c_board（= raw − 发牌 − runout − act）
     let mut av_no_act = Stat::default(); // full − c_act
+    let mut diff_dense = Stat::default(); // 推荐 AIVAT(deals+runout) − raw（配对，逐手）
 
     let mut failures: u64 = 0;
     let mut printed_fail = 0u32;
@@ -249,6 +250,7 @@ fn main() -> Result<(), String> {
                 av_dense.push(r.raw - deals - r.c_runout);
                 av_no_board.push(r.raw - deals - r.c_runout - r.c_act);
                 av_no_act.push(r.raw - deals - r.c_board - r.c_runout);
+                diff_dense.push(-(deals + r.c_runout));
                 accumulate(
                     &r,
                     our_pos,
@@ -284,18 +286,27 @@ fn main() -> Result<(), String> {
     if failures > 0 {
         println!("⚠️  有 {failures} 手失败——存在系统性 bug 或脏数据，下面的数字不可信，先修失败。");
     }
-    println!("\n-- 总体 --");
+    println!("\n-- 总体（推荐 AIVAT = deals+runout：值函数可靠的精确/稠密修正集；仍无偏）--");
     report("raw", &raw);
-    report("AIVAT", &aivat);
-    let se_ratio = if aivat.se() > 0.0 {
-        raw.se() / aivat.se()
+    report("AIVAT(rec)", &av_dense);
+    let se_rec = if av_dense.se() > 0.0 {
+        raw.se() / av_dense.se()
     } else {
         f64::NAN
     };
     println!(
-        "  SE 缩减比 raw/AIVAT = {se_ratio:.3}x   方差缩减 = {:.2}x",
-        se_ratio * se_ratio
+        "  SE 缩减比 raw/AIVAT(rec) = {se_rec:.3}x   方差缩减 = {:.2}x",
+        se_rec * se_rec
     );
+    // 全修正 AIVAT（含 opp-integrated VF 的 board/act）：本 blueprint 的自对弈 VF 太弱，
+    // board/act 净加噪声 → full ≈ raw。保留供对照，非推荐估计器。
+    report("AIVAT(full)", &aivat);
+    let se_full = if aivat.se() > 0.0 {
+        raw.se() / aivat.se()
+    } else {
+        f64::NAN
+    };
+    println!("  SE 缩减比 raw/AIVAT(full) = {se_full:.3}x（board/act 弱，仅对照）");
 
     println!("\n-- 子集诊断（SE + raw/SE 缩减比；看哪些项真降方差）--");
     let raw_se = raw.se();
@@ -318,19 +329,17 @@ fn main() -> Result<(), String> {
     }
 
     println!("\n-- 配对差 d = AIVAT − raw（无偏闸门：|mean(d)| ≤ 1.96·SE(d)）--");
-    let dm = diff.mean() * MBB;
-    let dse = diff.se() * MBB;
-    let pass = diff.mean().abs() <= 1.96 * diff.se();
-    println!(
-        "  mean(d)={dm:>10.2} mbb/g   SE(d)={dse:>8.2}   95% CI [{:>10.2}, {:>10.2}]   {}",
-        dm - 1.96 * dse,
-        dm + 1.96 * dse,
-        if pass {
-            "✅ 落在 CI 内"
-        } else {
-            "❌ 偏出 CI"
-        }
-    );
+    for (label, dst) in [("rec(deals+runout)", &diff_dense), ("full", &diff)] {
+        let dm = dst.mean() * MBB;
+        let dse = dst.se() * MBB;
+        let pass = dst.mean().abs() <= 1.96 * dst.se();
+        println!(
+            "  [{label:<18}] mean(d)={dm:>9.2}   SE(d)={dse:>7.2}   95% CI [{:>9.2}, {:>9.2}]   {}",
+            dm - 1.96 * dse,
+            dm + 1.96 * dse,
+            if pass { "✅ 无偏" } else { "❌ 偏出" }
+        );
+    }
 
     println!("\n-- 按位置 --");
     for (pos, name) in [(0usize, "SB/button"), (1usize, "BB")] {
