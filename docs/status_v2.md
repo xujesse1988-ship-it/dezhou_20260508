@@ -11,6 +11,7 @@
 | 简化 NLHE ES-MCCFR（不带 LCFR） | ✅ 100M LBR proxy 1,863 chips；500M LBR 1,849 chips（floor，100→500M < 1 SE） | `run_v3_100m`, `run_v3_500m` on vultr |
 | 简化 NLHE LCFR-MCCFR | ✅ **旧路径 100M LBR 1,503；优化路径 100M 1,233 → 500M 1,126（破 ES-MCCFR floor 1,849 约 39%）；100M→500M < 1 SE = 饱和** | `run_lcfr_100m` / `run_lcfr_500m` |
 | 简化 NLHE dense 后端（dense 表 + v4 bucket） | ✅ **byte-equal HashMap（5 对照）+ 端到端 100M LBR 1,143 ± 87 ≈ HashMap+v3 baseline 1,233 ± 96.9（差 91 < 合并 SE 130，不显著 = 同质量）** | `tests/dense_nlhe_trainer.rs` + `run_dense_lcfr_100m` on vultr |
+| AIVAT 估计器（Slumbot 评测降方差） | ✅ **无偏已全证**（runout 逐 completion == 引擎结算；自对弈闸门 `\|mean(d)\|/SE=0.98`；真 1B+1万手两 gate 无偏）；真日志降方差 **1.21×**（精确项 deals+runout），full 不降（自对弈 VF 的 board/act 太弱） | `tests/aivat_nlhe_{runout,selfplay}.rs` + `src/training/aivat_nlhe.rs` + `docs/aivat_eval.md` §10 |
 
 ### 简化 NLHE profile
 
@@ -176,6 +177,34 @@ fork sample_api.py）+ 常驻 Rust advisor（`tools/slumbot_advisor.rs`，加载
   `slumbot_api_bridge_plan §9` 的 PHM 升级触发条件（在 gap 区间系统性失血）。改进方向同既有「下一步」：
   bet-size 扩张 / 更细 bucket / PHM off-tree。1000 手方差仍大（SE 878），要更紧数字需 ≥ 1 万手。
 - 牌局明细落盘 `m6_hands.jsonl`（每手 hole/board/action/our_incrs/winnings/mbb，vultr 上）。
+
+### AIVAT 评测降方差（真 1B blueprint + 真 10000 手日志，2026-05-30）
+
+给 Slumbot 单边对战评测加 AIVAT（Burch et al. AAAI 2018）收窄 CI。控制变量形式只修正
+chance（双方发牌 + flop/turn/river）+ 我方决策，**不碰 Slumbot 动作** → 对任意值函数无偏。
+代码 `src/training/{nlhe_replay,aivat_nlhe,aivat_value,aivat}.rs` + `tools/aivat_eval.rs`，
+方法/设计/修订全记 `docs/aivat_eval.md`（§10 = 实测结果 + 对前文两处正确性修订）。
+
+数据 = `slumbot_strategy_20260529_1.jsonl`（10000 手，逐决策 info_set/action_probs/chosen）；
+blueprint = `run_dense_lockfree/...001000000000.ckpt`（1B dense，9.3 GB）+ 重训 1000 桶表（log
+info_set 解码实测确认同源）。生产跑在 AWS c6a.4xlarge（VF 表 ~15GB / eval ~13GB > vultr 11GiB）：
+VF build 50M 手 wall 238s（209k 手/s）、eval 10000 手 wall 31s。
+
+| 估计量 | mean (mbb/g) | SE | 95% CI | SE 缩减 |
+|---|---:|---:|---|---:|
+| raw | −85.25 | 174.71 | [−427.7, 257.2] | 1.00× |
+| **AIVAT（推荐 = deals+runout）** | **−108.31** | **158.90** | **[−419.8, 203.1]** | **1.10×（方差 1.21×，~21% 省手数）** |
+| AIVAT（full，含 board/act） | −172.35 | 175.03 | [−515.4, 170.7] | 0.998×（不降）|
+
+- **无偏已全证**：runout 闭式 `m·(2eq−1)` 逐 completion == GameState 结算（含 all-in-for-less）；
+  自对弈无偏闸门 `|mean(d)|/SE=0.98`；真日志两 gate 配对差均落 CI 内（rec −23±145 / full −87±275）。
+  两 CI 都跨 0 → 1 万手对 Slumbot 仍不显著，AIVAT 收窄 ~9% 半宽但不翻显著性。
+- **降方差全来自精确/稠密项**：c_runout（all-in 精确 equity，单独 1.085×）+ 双方发牌（VF-1/2 覆盖好）。
+  自对弈 VF 的 **board/act 修正净加噪声**（子集诊断：−deals−runout 158.90，再加 c_act→172.92 大幅变差），
+  印证 `aivat_eval.md` §4.3/§9「opp-integrated V_info 降方差弱」+ 50M 手才 2.1% 行覆盖。1.21× 是值函数
+  质量上限，非 bug。
+- **达 doc 预期 2–3× 的杠杆** = §4.3 精确两手 equity 控制变量（日志含双方底牌 → equity 稠密 + 强相关 U），
+  卡 flop sibling C(48,3)×completions 枚举成本（~8.5e10 eval7，需 MC/粗粒度），**未做**。
 
 ### H3 baseline EV @ LCFR 100M（mbb/g，正值 = 训练侧赢）
 
