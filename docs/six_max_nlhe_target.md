@@ -67,13 +67,30 @@ heads-up 是二人零和 → CFR 可证收敛 Nash → exploitability/LBR 是真
 
 ### S1：6-max 规则正确性钉死（正确性优先，先于任何训练）
 
-引擎虽已 N-generic，但从没像 HU 那样在 6-max 下被验过。本阶段不写训练代码，只钉规则。
+**实测纠正前文「从没在 6-max 下验过」的假设（2026-05-30 探索 + vultr 实跑）**：规则层是**按 6-max 先建、
+先验**的——项目最初目标就是 6-max（heads-up 是 2026-05-17 才降级的，见 `heads_up_nlhe_solver_target.md`）。
+所有错误高发的规则都已实现并带决策记录、且有测试：
 
-- 6-max 100BB random play `1,000,000` 手零非法状态。
-- 多人 side pot 固定场景（含 3+ 同时 all-in / all-in-for-less / odd chip / split）全过；与 PokerKit 跨验证
-  在 6-max 样例上一致（沿用 HU 的 PokerKit 对照机制）。
-- 6-max 盲注 / 行动顺序 / dead button / 翻后首个 actor 显式测试。
-- 既有 HU 测试全绿不退化。
+- 最小加注 / 不完整加注不重开下注（all-in for less 合法但不给已行动者重开）= `D-033/D-035`
+  （`state.rs:500,508`，`last_full_raise_size` + `raise_option_open`）。
+- 多人 side pot（3+ 同时 all-in / all-in-for-less / 未跟注返还）= `compute_payouts` / `contribution_levels` /
+  `single_contributor_tranches`（`state.rs:826–940`）。
+- 奇数筹码归属（button 左手第一个赢家）= `D-039-rev1`（`state.rs:909–923,984–995`）。
+- 摊牌顺序（末轮最后加注者先亮，否则 button 左手第一个）= `D-037-rev1`（`state.rs:997–1011`，每街重置）。
+- N 座盲注 / 行动顺序（preflop UTG=button+3 先动、BB 最后有 option；postflop SB 先动）= `state.rs:1013–1048`，
+  heads-up 走 button=SB 特例（`D-022b-rev1`）。
+- **dead button 不适用**：自对弈 solver 全程固定 N 座、无 sit-in/sit-out（`D-032`，`config.rs`），按钮机械左移，
+  无空座 → 此前门槛里的 "dead button" 是误列，删。
+
+测试现状（2026-05-30 vultr HEAD `fae5fdf` 实跑全绿）:`scenarios`(10) / `scenarios_extended`(27) /
+`side_pots`(8,含 2/3/4-way + 奇数筹码 + 未跟注返还) / `heads_up_rules`(3) 全过;`cross_validation` 默认
+`default_6max_100bb()`,**100 手对 PokerKit 0.4.14 `matches:100 diverged:0 skipped:0`**(独立参考实现逐手比对
+payouts + showdown_order)。`.venv-pokerkit` 已在 vultr 装好。
+
+**S1 唯一未闭项 = 重跑 100k 手 PokerKit 跨验证**（`cross_validation_pokerkit_100k_random_hands`，`#[ignore]`,
+`scripts/run-cross-validation-100k.sh`）。理由不是走形式:`src/rules/` 在 D1 那次 100k 之后又被两个 **perf**
+commit 动过 showdown/payout 热路径(`c8fff0a` showdown rank 预算 + pot_winners 缓存、`4e7b3a2` D-378 fast
+path),按"正确性大于一切"这类改动后最该重跑最强 gate。成本:vultr 4 核 N=4 ≈ 2.75h(python 子进程 0.4s/手)。
 
 ### S2：6-max 树规模量化 + game 参数化
 
