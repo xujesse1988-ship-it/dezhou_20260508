@@ -76,6 +76,9 @@ pub struct HandResult {
     pub n_our_decisions: usize,
     /// 我方位置（0 = SB/button，1 = BB），供调用方按位置拆分统计。
     pub our_pos: usize,
+    /// 本手有几个我方决策的 replay map_off_tree 反推 ≠ 日志 chosen（off-tree 下注帧不一致；
+    /// a* 已用日志值，此处仅诊断数据脏度）。
+    pub n_offtree: usize,
 }
 
 /// 值函数抽象：估计器只按 `(pos, node, bucket)` / `(pos, 双方 169 类)` 查，未访问返回
@@ -90,11 +93,57 @@ pub trait AivatValueFn {
 pub struct TableValueFn {
     pub tables: AivatValueTables,
     pub indexer: Arc<NlheDenseIndexer>,
+    /// 每 `(pos, node)` 在已访问 bucket 上的 visit-加权均值。**确定性 fallback**：未访问的
+    /// `(node,bucket)` cell → 返回节点均值而非 0，使 `c_b ≈ realized − node_mean` 成为真·均值
+    /// 零低方差项（VF 稀疏时 0-fallback 让 `c_b ≈ realized`，方差不降反增）。仍是固定 V → 无偏。
+    /// `NaN` = 该节点全未访问 → v_info 返 `None`（估计器再退 0）。
+    node_mean: [Vec<f64>; 2],
+}
+
+impl TableValueFn {
+    /// 预算每 `(pos, node)` 的访问加权均值（一次扫全表，~1–2s）。
+    pub fn new(tables: AivatValueTables, indexer: Arc<NlheDenseIndexer>) -> Self {
+        let num_nodes = indexer.num_nodes();
+        let mut node_mean = [vec![f64::NAN; num_nodes], vec![f64::NAN; num_nodes]];
+        for (pos, nm) in node_mean.iter_mut().enumerate() {
+            for (node, slot) in nm.iter_mut().enumerate() {
+                let meta = indexer.node_meta(node as NodeId);
+                let start = meta.row_base as usize;
+                let end = start + meta.bucket_count as usize;
+                let mut s = 0.0;
+                let mut c: u64 = 0;
+                for r in start..end {
+                    let cnt = tables.vf_count[pos][r];
+                    if cnt > 0 {
+                        s += tables.vf_mean[pos][r] * cnt as f64;
+                        c += u64::from(cnt);
+                    }
+                }
+                if c > 0 {
+                    *slot = s / c as f64;
+                }
+            }
+        }
+        TableValueFn {
+            tables,
+            indexer,
+            node_mean,
+        }
+    }
 }
 
 impl AivatValueFn for TableValueFn {
     fn v_info(&self, pos: usize, node: NodeId, bucket: u32) -> Option<f64> {
-        self.tables.v_info(pos, self.indexer.row_for(node, bucket))
+        let row = self.indexer.row_for(node, bucket);
+        if let Some(v) = self.tables.v_info(pos, row) {
+            return Some(v); // 访问过的 cell：用真值
+        }
+        let nm = self.node_mean[pos][node as usize];
+        if nm.is_nan() {
+            None // 节点全未访问 → 估计器退 0
+        } else {
+            Some(nm) // 节点均值 fallback
+        }
     }
     fn v_root_both(&self, pos: usize, our_class: usize, opp_class: usize) -> Option<f64> {
         self.tables.v_root_both(pos, our_class, opp_class)
@@ -204,13 +253,17 @@ impl<'a> AivatNlheEstimator<'a> {
         // ---- §4.5 我方动作 ----
         let mut c_act = 0.0;
         for (k, d) in our_decisions.iter().enumerate() {
-            c_act += ctx.c_act(
+            let (c, off_tree) = ctx.c_act(
                 d.node_id,
                 d.street,
                 d.chosen_idx,
                 &input.log_decisions[k],
                 &d.real_before,
             )?;
+            c_act += c;
+            if off_tree {
+                res.n_offtree += 1;
+            }
         }
         res.c_act = c_act;
 
@@ -343,7 +396,7 @@ impl<'a> HandCtx<'a> {
         replay_chosen_idx: usize,
         log: &LoggedDecision,
         real_before: &GameState,
-    ) -> Result<f64, String> {
+    ) -> Result<(f64, bool), String> {
         // info_set 一致性（重建 == 日志）。
         let board_at = &self.board[..BOARD_LEN[street as usize]];
         let info = self
@@ -407,12 +460,11 @@ impl<'a> HandCtx<'a> {
                 log.chosen
             )
         })?;
-        // a* 下标一致（replay 解析 == 日志 chosen 位置）。
-        if replay_chosen_idx != log_chosen_idx {
-            return Err(format!(
-                "chosen 下标不一致：replay {replay_chosen_idx} != 日志 {log_chosen_idx}（node {node_id}）"
-            ));
-        }
+        // a* = **日志 chosen**（§4.5 [v2.1]：advisor 当时实际采样的抽象动作）。replay 的
+        // resolve_actions 走 map_off_tree 反推，off-tree 下注时会反推成相邻 ratio（≠ 实际选的）
+        // ——那是已知的帧不一致坑，**不能**用它定 a*。replay_chosen_idx 仅作 off-tree 诊断
+        // （replay 仍按 map_off_tree 推进，保后续 node/info 与 advisor 无状态重放一致）。
+        let off_tree = replay_chosen_idx != log_chosen_idx;
 
         // 各动作的 V_child。
         let mut vchild = Vec::with_capacity(n);
@@ -420,7 +472,7 @@ impl<'a> HandCtx<'a> {
             vchild.push(self.v_child(node, i, street, real_before)?);
         }
         let baseline: f64 = sigma.iter().zip(&vchild).map(|(s, v)| s * v).sum();
-        Ok(vchild[replay_chosen_idx] - baseline)
+        Ok((vchild[log_chosen_idx] - baseline, off_tree))
     }
 
     /// 单个动作 `i`（在 `node`）的孩子值 `V_child`。

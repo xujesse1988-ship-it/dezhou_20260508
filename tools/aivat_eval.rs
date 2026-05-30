@@ -177,10 +177,7 @@ fn main() -> Result<(), String> {
         }
     });
 
-    let vffn = TableValueFn {
-        tables: vf,
-        indexer: Arc::clone(&indexer),
-    };
+    let vffn = TableValueFn::new(vf, Arc::clone(&indexer));
     let estimator = AivatNlheEstimator::new(game, &vffn, sigma_fn);
 
     // ---- 流式跑日志 ----
@@ -203,6 +200,7 @@ fn main() -> Result<(), String> {
     let mut failures: u64 = 0;
     let mut printed_fail = 0u32;
     let mut processed = 0usize;
+    let mut total_offtree: u64 = 0;
 
     let t0 = Instant::now();
     for (lineno, line) in text.lines().enumerate() {
@@ -238,6 +236,7 @@ fn main() -> Result<(), String> {
         match estimator.estimate_hand(&input) {
             Ok(r) => {
                 let our_pos = r.our_pos;
+                total_offtree += r.n_offtree as u64;
                 accumulate(
                     &r,
                     our_pos,
@@ -266,7 +265,7 @@ fn main() -> Result<(), String> {
 
     println!("\n========== AIVAT 评测报告 ==========");
     println!(
-        "处理 {processed} 手 / 成功 {} / 失败 {failures} / wall {:.1}s",
+        "处理 {processed} 手 / 成功 {} / 失败 {failures} / off-tree a* {total_offtree} 决策 / wall {:.1}s",
         raw.n,
         wall.as_secs_f64()
     );
