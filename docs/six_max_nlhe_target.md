@@ -94,13 +94,40 @@ path),按"正确性大于一切"这类改动后最该重跑最强 gate。成本:
 
 ### S2：6-max 树规模量化 + game 参数化
 
-- 扩 `tools/nlhe_betting_tree_sizing` 到 6-max / 100BB，实测**节点数 / infoset 数 / dense 两表 RAM**
-  （HU 240,096 节点 / 119.7M infoset 是 2 人数；6-max 会大数量级，需先量再定预算）。
-- 参数化 `SimplifiedNlheGame`（或新 `SixMaxNlheGame`）到 6 座 + 100BB；用 N-generic tree builder 重建树。
-- 定按位置动作抽象的初版 size 集（先粗：fold/check/call + 少量 pot ratio + allin，按位置精选）。
-- 门槛：sizing 报告出炉（含 total_slots / 内存 / action_count 直方图，自洽校验 total_rows==infosets）；
-  树构建确定性可复现；据此定**算力预算 + 训练机**（大概率 ≥ Pluribus 64 核级，对齐
-  `feedback_high_perf_host_on_demand` 先报预算给用户起机）。
+**工具已就绪**（commit `892d683` / `59edd80`）：`tools/nlhe_betting_tree_sizing` 从 HU-only 扩到任意
+`TableConfig`——`walk` 本就玩家数无关，换 `default_6max_100bb()` 即枚举 6-max 树。6-max raise 集走 argv、
+postflop 桶数走 env `XV_POSTFLOP`（preflop 固定 169 lossless），迭代抽象配置不用重编译。加 `NODE_CAP=100M`：
+到上限即停下探并标记 capped，把"是否大到无法全宽枚举"当结论返回。HU self-check 复现 240,096 节点 /
+119.7M infoset（exact，验证 refactor 不改计数）。
+
+**实测结果（vultr，2026-05-30，preflop 169 / postflop 200）**：
+
+| raise 集 | 决策节点 | infosets | dense 两表(variable) | 可行性 |
+|---|---:|---:|---:|---|
+| `{1.0}` 1 档 | 4,685,850 | 933.9M | **29.14 GiB** | ✅ 64 GB 机富余（= HU c6a.8xlarge 同档） |
+| `{0.5, 1.0}` 2 档 | **>100M**(capped) | **≥20B**(下界) | **≥645 GiB**(下界) | ❌ 爆，单机无解 |
+
+- `{1.0}` max depth 38（HU 15）/ avg action_count 2.09（91% 节点只剩 call/fold 二选一，因 1pot 加注几轮即 all-in）。
+  **内存不是瓶颈**：29.14 GiB 两表 + 小桶表 + working set ≈ 31–33 GiB RSS，落进 64 GB 富余。
+- `{0.5,1.0}` 那行是 **lower bound**（枚举到 1 亿节点被 NODE_CAP 截断，真实更大）：加一个**小档**（0.5pot）
+  把树从 469 万炸到 >1 亿（>21× 且未到顶）。
+- raise 比例语义（`action.rs:288`）= 标准 pot-sized：`candidate_to = max_committed + ceil(ratio × pot_after_call)`。
+  翻前 UTG open 用 1pot = 100 + 1.0×250 = 350 = **3.5BB**（min-raise 2BB **不在** `{1.0}` 抽象里）。
+
+**硬约束（S2 关键结论）**：6-max **不能裸加 bet size，尤其不能加小注**。
+
+- 病因不是"档数"而是**小注**：小注 → 底池几何增长慢 → all-in 前能塞很多轮 re-raise → 6 人各自再加注 →
+  re-raise 序列**组合爆炸**。大注（≥1pot）几轮顶到 all-in，深度被卡住。
+- **节点数与桶数无关**——是下注树本身的结构爆炸。postflop 砍到 50 桶甚至 1 桶都救不了 >1 亿（真实可能几十亿）
+  节点的树，策略表都存不下。
+- 能用的杠杆：① **按街/按位置只在个别街加档**（工具 per-street 已支持，现 CLI 是全街同集）；② **raise cap**
+  限制每街 re-raise 轮数（Pluribus 真正做法，但当前下注树**无深度上限**，需引擎改动）；③ 小注尽量别要 / 只放一条街。
+
+**剩余项**：① 跑 `{1.0,2.0}`（两大档无小注）隔离病因——验证"小注=深链=杀手"，定起步抽象；② 起步抽象大概率
+锁定**少量大档**（`{1.0}` 已可行，或 `{1.0,2.0}` 若可行）；③ 参数化 `SimplifiedNlheGame`（`nlhe.rs:310`
+硬编码 `n_seats=2`）到 6 座 + 重建树（注：sizing 不需要它，直接 `GameState` + 6max config 枚举即可；训练才需要）；
+④ 据最终抽象的 infoset 数定**训练机 + 算力预算**（`{1.0}` 的 64 GB 已够内存，瓶颈在训练时长，对齐
+`feedback_high_perf_host_on_demand` 报预算）。
 
 ### S3：多人信息抽象（最大研究点，先验证再训练）
 
