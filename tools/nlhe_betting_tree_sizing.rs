@@ -285,9 +285,26 @@ fn print_dense_layout(stats: &Stats, infosets: u64) {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // raise 集合常量。
-    const R3: &[f64] = &[0.5, 1.0, 2.0]; // HU 现 6-action {0.5p,1p,2p}
-    const R1: &[f64] = &[1.0]; // S2 6-max 起步：单一 bet size（pot-sized）
+    const R3: &[f64] = &[0.5, 1.0, 2.0]; // HU 现 6-action {0.5p,1p,2p}（self-check 用）
+
+    // 6-max raise 集合从 argv 读（f64 列表，全街同集）；无参默认 {1.0}。
+    // postflop 桶数从 env XV_POSTFLOP 读（默认 200）；preflop 固定 169 lossless。
+    // 例：cargo run --release --bin nlhe_betting_tree_sizing -- 0.5 1.0
+    //     XV_POSTFLOP=500 cargo run ... -- 1.0
+    let argv: Vec<f64> = std::env::args()
+        .skip(1)
+        .map(|a| {
+            a.parse::<f64>()
+                .map_err(|e| format!("argv raise ratio '{a}' 不是 f64: {e}"))
+        })
+        .collect::<Result<_, _>>()?;
+    let six_ratios: Vec<f64> = if argv.is_empty() { vec![1.0] } else { argv };
+    let postflop_buckets: u64 = std::env::var("XV_POSTFLOP")
+        .ok()
+        .map(|s| s.parse::<u64>())
+        .transpose()
+        .map_err(|e| format!("XV_POSTFLOP 不是 u64: {e}"))?
+        .unwrap_or(200);
 
     println!("=== Simplified NLHE Abstract Betting Tree Sizing ===");
     println!("RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {NODE_CAP}");
@@ -311,21 +328,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("walk wall time  : {:.3}s\n", start.elapsed().as_secs_f64());
     }
 
-    // (2) 6-max S2 起步探针：单一 bet size {1.0}，preflop 169 / postflop 200。
+    // (2) 6-max S2 探针：argv raise 集 / env postflop 桶数 / preflop 169。
     {
         let six = BucketCounts {
             preflop: 169,
-            postflop: 200,
+            postflop: postflop_buckets,
         };
         let cfg = TableConfig::default_6max_100bb();
-        let start = std::time::Instant::now();
-        let stats = measure(&cfg, [R1, R1, R1, R1], &six);
-        print_stats(
-            "6-max 100BB / 1 bet size {1.0} / preflop 169 / postflop 200",
-            &ratios_desc([R1, R1, R1, R1]),
-            &stats,
-            &six,
+        let r: &[f64] = &six_ratios;
+        let label = format!(
+            "6-max 100BB / {} bet size(s) / preflop 169 / postflop {postflop_buckets}",
+            six_ratios.len()
         );
+        let start = std::time::Instant::now();
+        let stats = measure(&cfg, [r, r, r, r], &six);
+        print_stats(&label, &ratios_desc([r, r, r, r]), &stats, &six);
         println!("walk wall time  : {:.3}s\n", start.elapsed().as_secs_f64());
     }
 
