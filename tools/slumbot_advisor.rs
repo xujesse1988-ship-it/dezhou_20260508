@@ -695,7 +695,7 @@ fn run() -> Result<(), String> {
     let game: &SimplifiedNlheGame = trainer.game();
 
     // ready 行：update_count + strategy_blake3（与 nlhe_h3_report 同 probe walk，可对照
-    // status_v2 记录的 blueprint hash 验证 ckpt + bucket 表加载正确）。
+    // 该 blueprint 训练时记录的 hash 验证 ckpt + bucket 表加载正确）。
     let update_count = trainer.update_count();
     let strategy_blake3 = compute_strategy_blake3(&trainer, game);
     let ready = ReadyLine {
@@ -765,8 +765,8 @@ fn fallback_slug(p: FallbackPolicy) -> &'static str {
 }
 
 /// blueprint strategy 指纹：与 `nlhe_h3_report::strategy_hash` 同 probe walk + 同
-/// 字节布局，因此对同一 dense 100M blueprint 复现 `status_v2.md` 记录的
-/// `2fab8afe…`——advisor 加载正确性的端到端校验。
+/// 字节布局，因此对同一 dense 100M blueprint 复现其已知指纹 `2fab8afe…`——
+/// advisor 加载正确性的端到端校验。
 fn compute_strategy_blake3(trainer: &DenseNlheEsMccfrTrainer, game: &SimplifiedNlheGame) -> String {
     let probes = collect_strategy_probes(game);
     let mut hasher = blake3::Hasher::new();

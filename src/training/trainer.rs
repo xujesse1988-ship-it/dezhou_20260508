@@ -417,7 +417,7 @@ impl<G: Game> EsMccfrTrainer<G> {
     /// `step_parallel` 的 dispatch 只产 `n_threads` 条 ~1 ms 的小任务，worker
     /// 醒来跑完立刻又等下一批 → 调度成本与计算量同量级。batch_per_worker = 16
     /// 让每次 dispatch 覆盖 ~16 ms 计算，调度开销摊薄 16×，scaling 从 1→32
-    /// vCPU 由 2.85× 提到接近 8-10×（实测见 docs/status_v2.md 训练吞吐基线）。
+    /// vCPU 由 2.85× 提到接近 8-10×（c6a.8xlarge 32t 实测）。
     ///
     /// **alternating traverser**：trajectory_index = `batch_idx × n_active + tid`，
     /// 让 tid=0 在 `batch_per_worker = 1` 时映射到 `(base + 0) % n_players`，与

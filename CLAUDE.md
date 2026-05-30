@@ -8,10 +8,10 @@ Heads-up No-Limit Texas Hold'em 求解器，默认 200BB profile，架构保留 
 
 ## 每次开始工作前必读
 
-1. `docs/status_v2.md` — 当前代码真实状态。**先看算法正确性表，再决定要不要动代码**。
+1. `docs/status_v3.md` — 当前代码真实状态。**先看算法正确性表，再决定要不要动代码**。
 2. `docs/invariants.md` — 代码层硬约束。违反这些规则的 PR 不通过。
-3. `docs/heads_up_nlhe_solver_target.md` — 当前主线目标 + heads-up 阶段（H1–H5）量化门槛。
-4. `docs/pluribus_path.md` — 6-max 长线参考，**非当前验收目标**。
+3. `docs/six_max_nlhe_target.md` — **当前主线目标** = 6-max blueprint-only（路线 A / 100BB）阶段 S1–S5 量化门槛 + 代码就绪度。
+4. `docs/heads_up_nlhe_solver_target.md` — heads-up 阶段（H1–H5），**已收尾**，仅剩 Slumbot 对战数据采集。
 
 ## 核心工作规则（覆盖默认行为）
 

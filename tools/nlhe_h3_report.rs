@@ -1,7 +1,7 @@
 //! H3 简化 heads-up NLHE blueprint 评测报告工具。
 //!
 //! 支持从 checkpoint 评测，也支持现场训练一段 update 后评测。输出 Markdown 与
-//! 同名 JSON，供 `docs/status.md` / release 记录引用。
+//! 同名 JSON，供文档 / release 记录引用。
 
 use std::fs;
 use std::path::{Path, PathBuf};

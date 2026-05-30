@@ -260,7 +260,7 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     // body BLAKE3 = artifact 末 32 byte trailer 的值，BucketTable::open / train_cfr
-    // 日志 / status.md 文档锚点用的就是它。
+    // 日志 / 文档 b3sum 锚点用的就是它。
     let body_hash: [u8; 32] = table.content_hash();
     let body_hex: String = body_hash.iter().map(|b| format!("{:02x}", b)).collect();
 
