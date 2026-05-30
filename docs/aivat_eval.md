@@ -229,3 +229,51 @@ VF 表为 `f64`（评测层，非 rules/abstraction 整数不变量路径，与 
   全下手需要（×约数千手 ≈ 1e8 次，分钟级）；turn 45 / river 44 平凡。非正确性。
 - **最稳工作流**：今后对战一律开 strategy log，σ/a\* 逐字读回，彻底绕开 §4.5 还原与 §6
   provenance 断言的脆弱性。现有 6447 手日志按退路处理，并在报告里标注残余 provenance 风险。
+
+## 10. 实现状态（2026-05-30 落地，含对前文的实测修订）
+
+代码（branch `aivat-eval`，commit `eebb99b`+）：
+
+- `src/training/nlhe_replay.rs`：advisor/estimator **共享**的 abs+real lockstep 重放（§6 硬要求）
+  —— `tokenize` / `replay` / `resolve_actions` / `outgoing_incr` + 新增 `replay_trajectory`（整手
+  轨迹：每决策节点 + 每街首决策 + 终局类型 + 各决策 real 快照）+ `tag_short_name`。
+- `src/training/aivat_nlhe.rs`：估计器。值函数走 `AivatValueFn` trait（生产 `TableValueFn` 包 VF 表；
+  测试注合成闭包，省多 GB 表 + blueprint）。
+- `tools/aivat_eval.rs`：接日志 + VF + blueprint，provenance 断言 + Hybrid σ + 报告。
+
+**两处修正本文前面的字面表述（正确性，已被 §7 闸门验证）：**
+
+1. **§4.5 河前 all-in-call 的 V_child**：前文写"终局取确定性 payoff"。但河前 all-in-call 的孩子
+   后面还有 runout chance，"realized payoff" 依赖未来随机 → **不是** child state 的固定函数 → 有偏 +
+   留 runout 方差。正解 = `E_runout`（completions 平均，§4.4 同一量）。fold / 河牌摊牌（牌已全发）
+   仍是确定性 payoff。
+2. **§4.5 街切换 V_child（前文"我方 bucket 不变"未覆盖）**：关闭本街的动作（call/check 收口）孩子
+   是**下一街**决策节点，下一街牌未发。不可偷看 realized board（否则非固定函数 → 有偏）。正解 = 对
+   下一街新牌**积分** `avg_{新牌} V_info[child, bucket(us, board+新牌)]`。这恰让相邻修正项 telescoping
+   （该积分 == 同 node_b 的 c_b sibling 平均），把 U 方差逐层剥掉。同街动作才"bucket 不变"。
+
+**校验（全 vultr 跑）：**
+
+- runout 交叉验证（`tests/aivat_nlhe_runout.rs`）：`runout_ev` 闭式 `m·(2eq−1)` 与 `showdown_net` ==
+  GameState `compute_payouts` **逐 completion** 一致（river 44 / turn+river 990 / 含 all-in-for-less），
+  3/3 过。
+- 无偏主闸门（`tests/aivat_nlhe_selfplay.rs` #[ignore]，6000 手合成 VF+σ 自对弈）：
+  `|mean(d)|/SE(d)=0.98`（无偏）；SE `143.17→76.52 = 1.87×`（≈3.5× 方差）即便 betting-node VF 合成
+  ——降方差来自 runout/showdown 用真 equity。非常数 VF 激活所有 sibling 集合 → 抓 board 枚举 / 街切换 /
+  位置 / telescoping 的结构 bug。
+
+**实测修正 §1 资产事实：**
+
+- 日志 `slumbot_strategy_20260529_1.jsonl` = **10000 手**（非 8378，run 续过）；**raw 均值 −85.25 mbb/g**
+  （非 +62）；**0 个 fallback_uniform 决策**。client_pos 5001/4999。
+- blueprint ckpt `run_dense_lockfree/...001000000000.ckpt` = **9.3 GB**（§1 写的 570MB 错；含 regret+
+  strategy 两表）；bucket `..._1000_..._cafebabe_schemav4.bin` = **529 MB**（用户重训版，质量正常）。
+- log `info_set` 解码（node = raw>>38 / bucket = raw&0xFFFFFF）实测：postflop bucket≤999、node≤239232、
+  preflop bucket≤168 → **确认**该 log 由 1B dense + 1000 桶生成。
+
+**主机/内存（修正 §1/§5/§6 的"vultr 11GiB 够"——错，按错的 570MB 估的）：** VF 表 total_rows≈2.39 亿，
+mean+count ×2 位 ≈ 5.7 GB；**VF build = blueprint 9.3 + 累加器 5.7 ≈ 15 GB**、**eval = 9.3 + VF mean 3.8 ≈
+13 GB**，都 > vultr 11 GiB（会进 swap，self-play 随机访问 9.3GB blueprint 会塌）。→ **生产跑要 ~32GB 机**
+（AWS c6a.4xlarge ~$0.6/h）；§5 原判对，v2.1 乐观估错。ckpt 已在 vultr，跑前 vultr→AWS 传 9.3GB。
+
+**待做：** 生产跑 = `aivat_build_values`（真 VF）→ `aivat_eval`（真 10000 手日志），见上主机要求。
