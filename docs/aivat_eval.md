@@ -276,4 +276,22 @@ mean+count ×2 位 ≈ 5.7 GB；**VF build = blueprint 9.3 + 累加器 5.7 ≈ 1
 13 GB**，都 > vultr 11 GiB（会进 swap，self-play 随机访问 9.3GB blueprint 会塌）。→ **生产跑要 ~32GB 机**
 （AWS c6a.4xlarge ~$0.6/h）；§5 原判对，v2.1 乐观估错。ckpt 已在 vultr，跑前 vultr→AWS 传 9.3GB。
 
-**待做：** 生产跑 = `aivat_build_values`（真 VF）→ `aivat_eval`（真 10000 手日志），见上主机要求。
+**生产跑结果（2026-05-30，AWS c6a.4xlarge / 真 1B blueprint + 真 10000 手日志 + 50M 自对弈 VF）：**
+
+| 估计量 | mean (mbb/g) | SE | 95% CI | SE 缩减 |
+|---|---:|---:|---|---:|
+| raw | −85.25 | 174.71 | [−427.7, 257.2] | 1.00× |
+| **AIVAT（推荐 = deals+runout）** | **−108.31** | **158.90** | **[−419.8, 203.1]** | **1.10×（方差 1.21×）** |
+| AIVAT（full，含 board/act） | −172.35 | 175.03 | [−515.4, 170.7] | 0.998×（不降）|
+
+- 两估计量配对差均无偏（rec d=−23.06 ± 145 / full d=−87.10 ± 275，均落 CI 内）；点估计差异是不同无偏
+  估计量的抽样差，非偏差。两 CI 都跨 0 → 1 万手对 Slumbot 仍不显著，AIVAT 收窄 ~9% 半宽但不翻显著性。
+- **降方差全来自精确/稠密项**：c_runout（all-in 精确 equity，单独 1.085×）+ 双方发牌（VF-1/2 覆盖好）。
+  自对弈 VF 的 **board/act 修正净加噪声**（子集诊断：−deals−runout SE 158.90；再加 c_act→172.92 大幅变
+  差、加 c_board→161.18 略差）——印证 §4.3/§9「opp-integrated V_info 降方差弱」，且 50M 手才 2.1% 行覆盖
+  （`node_mean` fallback 让 c_board 从害变中性，治不了 c_act 桶盲噪声）。→ estimator 默认/推荐**只用
+  deals+runout**（值函数可靠子集，仍无偏）；full 保留对照。
+- VF build 50M 手 wall 238s（209k 手/s）/ eval 31s / RAM 峰 16GB。off-tree a* 6/10000 决策（a* 已用日志
+  chosen 修正，replay map_off_tree 反推仅诊断）。
+- **达 §1 预期 2–3× 的杠杆 = §4.3 精确两手 equity 控制变量**（日志含双方底牌 → equity 稠密 + 强相关 U）；
+  flop sibling C(48,3)×completions 枚举昂（~8.5e10 eval7）→ 需 MC/粗粒度 flop equity 控成本，**未做**。
