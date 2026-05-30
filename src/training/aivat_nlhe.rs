@@ -250,7 +250,8 @@ impl<'a> HandCtx<'a> {
         }
         let deck = remaining_deck(&self.our_hole, &self.opp_hole, fixed_prefix);
         let mut board: Vec<Card> = fixed_prefix.to_vec();
-        board.extend(std::iter::repeat(fixed_prefix[0]).take(n_new)); // 占位，循环里覆盖
+        // 占位（循环里 copy_from_slice 覆盖）；用恒有效的我方牌，prefix 空时也不越界。
+        board.extend(std::iter::repeat(self.our_hole[0]).take(n_new));
         let prefix_len = fixed_prefix.len();
         let mut sum = 0.0;
         let mut count: u64 = 0;
