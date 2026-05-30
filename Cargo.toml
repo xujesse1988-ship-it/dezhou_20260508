@@ -134,6 +134,11 @@ path = "tools/slumbot_advisor.rs"
 name = "aivat_build_values"
 path = "tools/aivat_build_values.rs"
 
+# AIVAT 估计器：接日志 + VF 表 + blueprint，输出 raw vs AIVAT mbb/g + 配对降方差。
+[[bin]]
+name = "aivat_eval"
+path = "tools/aivat_eval.rs"
+
 [[bin]]
 name = "nlhe_checkpoint_vs_checkpoint"
 path = "tools/nlhe_checkpoint_vs_checkpoint.rs"
