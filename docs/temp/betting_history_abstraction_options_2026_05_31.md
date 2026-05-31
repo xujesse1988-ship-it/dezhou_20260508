@@ -82,11 +82,111 @@ postflop `{0.5,1.0}` 但**只允许首次进攻（开池 `Bet`）打 0.5 或 1po
 
 本质：把"下注历史"当成另一个要做信息抽象的维度，跟对私牌做 bucket 同理。
 
-### B3. 紧凑 betting-state 摘要（feature tuple）
-不存完整路径，只存一个有界小元组，例如：
-`(street, 底池桶/SPR 桶, 本街已加注数, 面对的下注尺寸桶, aggressor, 在场人数, position)`。
-大量不同序列 → 同一 key。**这恰好让 `{0.5,1}` 的爆炸消失**：不管底池怎么涨到这么大，落进同一 SPR
-桶就是同一 infoset。key 空间有界且远小于树。
+### B3. 紧凑 betting-state 摘要（feature tuple）— 设计草案（2026-05-31，待 sizing 工具实测）
+
+不存完整路径，只存一个有界小元组当 infoset 的下注历史维度。大量不同动作序列 → 同一 key = 对下注历史做
+imperfect recall（§B4 的具体编码）。**这恰好让 `{0.5,1}` 的爆炸消失**：不管底池怎么涨到这么大、经过几轮
+re-raise，只要落进同一 `(SPR 桶, 面对尺寸桶, 本街加注结构, ...)` 就是同一 infoset，key 空间由字段笛卡尔积
+封顶，**几乎与 bet-size 菜单无关**。
+
+**理论依据 / 业界实践（2026-05-31 调研，见文末参考）**
+
+- **续局价值的充分统计量 ≈ 底池 / SPR，不是路径**——商用 solver 的标准做法。PioSOLVER/GTO+ 类解 postflop
+  时，preflop 一长串"谁加注谁跟"被压成一个**起手底池 + 有效筹码**，不记是谁怎么把池子打大的（GTO Wizard:
+  "different postflop solutions … based on initial pot sizes … *without needing to consider who specifically
+  raised and called*"）。DeepStack 的价值网络输入是 `(双方 range, 底池, 公共牌)`——同样把下注历史摘成底池一个标量。
+  **但有个关键限定**：DeepStack 敢只喂底池，是因为它**同时喂 range**——range 已把下注历史的后果编码了（一路开火
+  的人 range 自动是强的）。我们是 **tabular blueprint，无 range 输入，infoset key 是唯一通道**，所以对我们 SPR 只是
+  **博弈动态**（能下什么注、赌注多大）的充分统计量、**不是 range 分布**的；range 不对称必须靠 `last_aggressor` 进 key 撑
+  （别把 SPR 当成 range 的充分统计量——这是初版措辞的过度声称，已纠正）。
+- **理论上有界**。Kroer & Sandholm EC'16（*Imperfect-Recall Abstractions with Bounds*，把 Lanctot et al. 2012
+  的 skew well-formed games 推广到 CRSWF）给出把两个 infoset 并进同一抽象 infoset 的**解质量上界** = reward
+  error（合并叶子收益差，按到达概率加权）+ chance error（自然到达概率差）。落到下注历史上 = **两条到达相同
+  `(街, 底池/SPR, 该谁动, 本街加注结构)` 的序列续局价值几乎相等 → reward error 小 → 合并安全**。这正是拿 SPR 桶
+  当 key 的依据。
+- **诚实的反面：顶级 solver 并不摘下注历史**。Pluribus/Libratus 对下注历史用**完美回忆**（supp: "two infosets
+  are bucketed together iff they share the *same action-abstraction sequence* and the same info bucket"——只摘
+  **牌**不摘下注）；靠 ① 每街限档（首街最细、后街粗，1–14 档）+ ② **lazy 分配**（action sequence 第一次被访问
+  才分配 regret，省 >2×，= 我们的 C5）+ ③ 负 regret 剪枝，把 6.65 亿动作序列做下来。文献里 imperfect recall
+  的成熟战绩（Johanson et al. AAMAS'13：同内存下 imperfect recall 在 exploitability + 单挑都**胜过** perfect
+  recall）几乎都是摘**牌**（忘前街桶、把桶预算压到当前街），摘**下注历史**远没那么多先例。**⇒ B3 有理论撑，但比
+  "摘牌"激进、业界验证少；质量必须实测，不能假设收敛。**
+
+**字段设计（定稿 2026-05-31，6-max；HU 是其子集）**
+
+完整 infoset key 两部分：私牌 + 街沿用当前 v2，下注摘要 6 字段替掉 `node_id` 完整路径。全部是 public state 的整数
+函数（双方可见、与私牌无关；禁浮点 D-252，桶边界用定点比较）：
+
+| 字段 | 编码 / 取值 | bit(6-max) | 跨街? | 作用 |
+|---|---|---|---|---|
+| `bucket_id` | preflop 169 无损 / postflop 500 k-means 桶 | 24 | — | 私牌强度 |
+| `street_tag` | Preflop/Flop/Turn/River | 3 | — | 街 |
+| `actor_position` | 相对 button 0..5 / HU 0..1 | 3 | 当前 | 该谁动 + 位置 |
+| `live_players` | **相对 button 在场 bitmask**，1 bit/座位（`Active∪AllIn`=1，`Folded`=0） | 6 | 累积（fold 永久） | 6-max 多路结构（记住"谁在场+在哪"，非仅人数） |
+| `raises_this_street` | `{0,1,2,≥3}`，cap=K（= A1 那个量，当**特征**不剪树） | 2 | 当前（每街 reset） | ①**决定合法动作** + 本街激进度 |
+| `facing_size_bucket` | `{无活注, ≤0.5p, ~1p, ≥2p, ~all-in}` | 3 | 当前 | ①**决定合法动作** + pot odds |
+| `spr_bucket` | log 间距 ~12 桶（有效**剩余**筹码 / 当前底池） | 4 | 累积 | ②续局**物理量**（深度） |
+| `last_aggressor` | 2 槽 `{preflop_aggressor, postflop_line_aggressor}`，各 `{无} ∪ 相对 button 座位` | 6 | 累积 | ②续局 **range/initiative** |
+
+**设计决定（本轮敲定）**：
+
+- `live_players` 用 **bitmask 不用计数**——6-max 里 button 在 vs UTG 在剩余 range/位置完全不同；硬约束
+  `actor_position ⊂ live_players` 砍掉大量非法组合。不另花 bit 区分 Active/AllIn（深度后果已被 `spr_bucket` 吃掉）。
+- `last_aggressor` 从"本街 1 个"扩成 **2 槽（preflop + postflop 线），相对 button**——过去街 aggressor 可能已弃牌，
+  相对 actor 的"前/后"会坏，相对 button 是固定坐标系才记得住。**删掉"我是否 aggressor"**（= `last_aggressor==我` 可
+  导出）和单独 initiative bit（已被 `preflop_aggressor` 槽吸收）；只记 2 槽（PFR + postflop 线）而非满 4 街，避免滑向完美回忆。
+- **两个作用**：① `raises_this_street` + `facing_size_bucket`（含"无活注"）**必须**完整决定合法动作集，否则重蹈
+  F17（同 key 但合法动作不同 → regret 矩阵错位）；② `spr_bucket`（物理量）+ `live_players` + `last_aggressor`
+  （range/initiative）逼近续局价值。
+- **跨街信息只靠 `spr_bucket` / `live_players` / `last_aggressor` 三个累积字段扛**；其余只看当前街。**仍丢**：精确路径、
+  桶外精确尺寸、街内逐手次序、fold 先后——这是 imperfect recall 的有损部分。
+
+**位预算**：下注摘要 = 3+6+2+3+4+6 = **24 bit**，装进 v2 弃用的 `position(4)+stack(4)+betting_state(3)`+reserved 26
+= 37 bit 可用；全 key（含 `bucket_id` 24 + `street_tag` 3）≤ 51 bit < 64，富余。
+
+**key 空间 / infoset 估算（量级，待 sizing 工具实测坐实；定稿字段比初版更富，规模上移）**
+
+- 定稿字段（bitmask `live_players` + 2 槽相对-button `last_aggressor`）的**原始**笛卡尔积比初版大不少（单街粗估
+  `6 × ~30(actor×在场集) × 4 × 5 × 12 × ~20(2 槽 aggressor) ≈ 10⁵–10⁶/街`）；但硬约束狠砍可达集：`actor⊂live`、
+  aggressor 必属当街在场、无活注 ⇒ `raises=0`、底池小 ⇒ SPR 不可能极高。
+- **HU（首个验证目标）极小**：`live_players` 恒满、aggressor 槽各 1 bit、actor 0..1 → 下注 key 仅几百~几千/街，
+  dense 两表必然 ≪ 1 GiB，先在 HU 上把不变量 + 收敛质量验明白。
+- **6-max 是真问题**：bitmask + 2 槽是"保真度换大小"的两个旋钮，把 key 空间推向大端，**6-max 绝对规模必须实测**
+  才能断言能否进 64 GiB 小机——这正是当初警告的"滑向完美回忆"的代价，不再给初版那个乐观的 ~1600 万 infoset 单点估计。
+- 不变的定性结论：key 空间**有界且与 bet-size 菜单几乎无关**（`{0.5,1.0}` 只把 SPR/尺寸桶填密，不像树那样组合
+  爆炸），故 B3 下 `{0.5,1.0}` **不再像 node_id 那样 ≥645 GiB**；"具体几 GiB / 进不进小机"是 6-max 实测题
+  （待办 c）。这是 B3 相对 A3（首选但要 ~512 GB 大机）的根本方向——**有望小机保住小注尺寸，量级待坐实**。
+
+**与 InfoSetId 打包的改动面**
+
+好消息：64-bit layout **本来就为此留了位**。当前 v2 packer（`nlhe.rs:pack_info_set_v2`）把 26 bit reserved 塞
+node_id，而把 stage-2 设计的 `position_bucket`(4)/`stack_bucket`(4)/`betting_state`(3) 三个字段**置 0 弃用**
+（见 `src/abstraction/map/mod.rs` layout）。B3 = 把这套字段**复活并扩充**（`betting_state` 5 状态 → 上表多字段
+摘要，借 reserved 26 bit 装 spr/facing/aggressor/live_players），位预算绰绰有余（需 ~20 bit < 37 bit 可用）。改动点：
+
+1. `pack_info_set_v2` → `pack_info_set_b3(bucket, summary_key, street)`：`summary_key` **由 `GameState` 算**，不再由
+   tree `node_id` 给。这是核心语义变更：InfoSetId 从"树路径的单射"变成"public state 的多对一摘要"。
+2. 新增 `betting_summary_key(state: &GameState) -> u32`（纯整数，守 `map/mod.rs` 的 D-252/D-273 禁浮点；SPR 桶边界
+   用定点比较，不进 `f64`）。
+3. **关键不变量（不可破）**：`summary_key` **必须**完整决定该节点合法动作集，否则重蹈 F17（`Open` 与
+   `FacingBetNoRaise` 同 key 但合法动作不同 → CFR regret 矩阵错位）。即 `raises_this_street` + `facing_size_bucket`
+   （含"无活注"）要够还原 {可 check? 可 bet? 必须 fold/call/raise? raise 是否被 cap 封}。合并前先证——可在 sizing
+   工具里断言"同 key 的所有 tree 节点 `legal_actions` 一致"。
+4. dense indexer（`nlhe_dense.rs`）：现按 `node_id` 一节点一 meta；B3 改按 **distinct `summary_key` 一 key 一 meta**。
+   建表从"走树"变成"走树 + 收集 distinct key"（每 key 的 `bucket_count`/`action_count` 取该 key 任一代表节点，前提
+   不变量 3 成立）。或：key 空间稀疏（~3 万）时直接用 HashMap 后端（C5），dense 预分配意义变小。
+5. `current_node_id` 仍保留——树还要用来枚举合法抽象动作 + 推进 state；只是**不再进 infoset key**。AIVAT 值表
+   （`aivat_value.rs` 按 `(node_id, bucket)`）同步改按 `(summary_key, bucket)`。
+
+**风险 / 取舍**
+
+- **有损 + 弱收敛**：imperfect recall 让 CFR 完美回忆收敛保证失效（2 人零和也不保证 Nash）。按项目"正确性优先"
+  红线，B3 对错只能由 exploitability/LBR/对 Slumbot 实测裁定，**不能假设收敛**；若质量比 `{1.0}` perfect-recall
+  baseline 差 ≥10× 要停下追"摘掉了什么 value-critical 信息"（典型嫌疑：忘了底池被动跟大 vs 被加注打大 → `last_aggressor`
+  不够细 → 加细）。
+- **改 InfoSetId 语义**：`node_id`（精确路径，单射）→ 计算摘要 key（多对一），波及 checkpoint 兼容、AIVAT 重建、
+  所有按 node_id 索引的诊断。
+- **6-max 特有**：`live_players` 编码（计数 vs bitmask）是质量/大小的主旋钮；HU 阶段先验证再上 6-max。
 
 ### B4. Imperfect recall（不完美回忆）
 "忘掉"前几街动作细节，只保留当前街摘要 + 粗粒度底池/SPR。**大规模求解器扩状态空间的标准手段**
@@ -120,9 +220,11 @@ postflop `{0.5,1.0}` 但**只允许首次进攻（开池 `Bet`）打 0.5 或 1po
 
 - **(i) ~512 GB 大机 + first-bet-small（§A3）**：无损保留完整路径，纯堆内存，224 GiB 两表落进 512 GB 富余。
   代价 = 大机 + 训练 wall（infoset 7.02B ≈ `{1.0}` 的 7.5×）。**当前倾向先走这条摸质量上限**（无损、不改语义）。
-- **(ii) 小机 + B3 摘要**：`(street, SPR/底池桶, 本街已加注数, 面对尺寸桶, aggressor, 在场人数, position)`
-  替掉 `node_id` 完整路径 → key 空间有界、爆炸消失。本质 = 对下注历史做 imperfect-recall。代价 = **有损**
-  （bot 不再区分"底池怎么变大的"）+ 改 InfoSetId 语义。是把 (i) 省成小机的路子。
+- **(ii) 小机 + B3 摘要**（详细设计见 §B3 草案）：`(actor_position, live_players, raises_this_street,
+  facing_size_bucket, spr_bucket, last_aggressor)` 替掉 `node_id` 完整路径 → key 空间有界（估 ~3–4 万 key /
+  ~1600 万 infoset / dense 两表 <1 GiB，待实测）、爆炸消失且与档数无关。本质 = 对下注历史做 imperfect-recall。
+  代价 = **有损 + 弱收敛**（bot 不再区分"底池怎么变大的"，CFR 完美回忆保证失效，须实测裁定）+ 改 InfoSetId
+  语义。是把 (i) 省成小机的路子；理论有界（Kroer-Sandholm CRSWF）但摘下注历史业界少见，比"摘牌"激进。
 - **(iii) 直接弃小注**：少量大档 + A1（`{1.0,2.0}` cap=1 已进 64 GiB），最省事，放弃 postflop 小注尺寸。
 
 ## 待办 / 下一步候选
@@ -130,14 +232,32 @@ postflop `{0.5,1.0}` 但**只允许首次进攻（开池 `Bet`）打 0.5 或 1po
 - (a) ✅ **已做**（2026-05-31，见 §A1 实测，`RAISE_CAP` 探针 commit `df75058`）：raise cap=K 对
   `{0.5,1}` **无效**（cap=1 仍 199 GiB，cap≥2 破亿），对 `{1.0,2.0}` **有效**（cap=1 = 28.27 GiB 进
   64 GiB）。结论：A1 = 大档区杠杆，非小注解药。
-- (b) 起草 **betting-state 摘要 key** 设计：列保留字段 + 估 key 空间大小 + 与 InfoSetId 打包的改动面。
+- (b) ✅ **已草拟**（2026-05-31，见 §B3 设计草案）：保留字段（`actor_position` / `live_players` /
+  `raises_this_street` / `facing_size_bucket` / `spr_bucket` / `last_aggressor`）+ key 空间量级估算（~3–4 万
+  betting key、~1600 万 infoset、dense 两表 <1 GiB，待实测）+ 与 InfoSetId 打包的改动面（复活 v2 弃用的
+  `position/stack/betting_state` 字段 + reserved 26 bit；`pack_info_set_v2`→`_b3`；dense indexer 改按 distinct
+  key；关键不变量 = key 必须决定合法动作集，否则重蹈 F17）。
   （A1 既已证救不动小注，(b) 的有损摘要从"可选"升为"想保留小注就必需"；若走"弃小注 + 大档 + A1"
   路线则可暂不做 (b)。）
+- (c) **实测 B3 key 空间**（把 §B3 估算坐实）：在 `tools/nlhe_betting_tree_sizing` 复用现成 `walk`，每访问一个
+  tree 节点算 `betting_summary_key`，用 HashSet 数 distinct `(summary_key, street)` 与 infoset 数；对
+  `{1.0}` / `{1.0,2.0}` / `{0.5,1.0}` 各跑一遍。同时断言"同 key 节点 `legal_actions` 一致"（验不变量 3）。
+  这是把"设计"变"数字"的最小实验，不动训练路径。
 
 ## 参考
 
-- Waugh et al. *A Practical Use of Imperfect Recall*（CFR + imperfect-recall 抽象）。
-- Johanson et al. 关于 poker abstraction / bucketing。
-- Brown & Sandholm Libratus / Pluribus（action abstraction + 有限 bet size + 子博弈重解）。
-- 本项目：`docs/six_max_nlhe_target.md` §S2（树规模实测）；`src/training/nlhe_betting_tree.rs`；
-  `src/abstraction/map/mod.rs`（InfoSetId 打包）。
+- Waugh et al. 2009 *A Practical Use of Imperfect Recall*（CFR + imperfect-recall 抽象的奠基工作）。
+- **Kroer & Sandholm, EC'16 *Imperfect-Recall Abstractions with Bounds in Games***（CRSWF 游戏类 + 合并
+  infoset 的解质量上界 = reward error + chance error；B3 拿 SPR 桶当 key 的理论依据）。推广自 Lanctot et al.
+  2012 skew well-formed games。
+- **Johanson et al. AAMAS'13 *Evaluating State-Space Abstractions in Extensive-Form Games***（imperfect recall
+  同内存下 exploitability + 单挑都胜过 perfect recall——但其 imperfect recall 摘的是**牌**不是下注历史）。
+- **Brown & Sandholm 2019 *Superhuman AI for multiplayer poker*（Pluribus）supp**：对下注历史用**完美回忆**
+  （bucket iff 同 action-abstraction sequence + 同牌桶），1–14 档每街递减、lazy 分配、6.65 亿动作序列；
+  **不**摘下注成 SPR 桶——B3 的"摘下注"是更激进、业界少见的路子。
+- DeepStack（Moravčík et al. 2017）/ 商用 solver（GTO Wizard / PioSOLVER）：续局价值的充分统计量取
+  `(range, 底池/SPR, 公共牌)`，preflop 序列压成起手底池——B3 "SPR 桶 = key" 的业界先例（限于跨街折叠）。
+- 本项目：`docs/six_max_nlhe_target.md` §S2（树规模实测）；`src/training/nlhe_betting_tree.rs`（node_id 完美回忆树）；
+  `src/training/nlhe.rs:pack_info_set_v2`（v2 packer，弃用 position/stack/betting_state）；`src/training/nlhe_dense.rs`
+  （按 node_id 的 dense indexer）；`src/abstraction/info.rs`（`BettingState` 5 状态 + InfoSetId layout）；
+  `src/abstraction/map/mod.rs`（位编码 + D-252 禁浮点）。

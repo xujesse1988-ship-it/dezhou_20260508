@@ -20,13 +20,21 @@
 //!
 //! 支持 per-street raise 集合（street-dependent action abstraction 的 sizing 探针）：
 //! 每条街用各自的 `DefaultActionAbstraction`，按 `state.street()` 分派。
+//!
+//! B3 摘要探针（`B3_SUMMARY=1`，docs/temp/betting_history_abstraction_options_2026_05_31.md
+//! §B3）：除了按 `node_id`（完美回忆完整路径）的计数，另在 walk 中为每个决策节点
+//! 计算 betting-state 摘要 key = `(street, actor_position 相对 button, live_players
+//! bitmask, raises_this_street{cap3}, facing_size_bucket, spr_bucket, last_aggressor
+//! 2 槽 preflop+postflop 相对 button)`，统计 **distinct key 数 / B3 infoset 数 /
+//! B3 dense 表体量**，并断言"同 key 的所有节点 legal_actions 一致"（不变量：key 必须
+//! 决定合法动作集，否则重蹈 F17）。把"下注历史摘成有界 key 后还剩多大"变成数字。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::ExitCode;
 
 use poker::{
     AbstractAction, ActionAbstraction, ActionAbstractionConfig, BetRatio, ChaCha20Rng,
-    DefaultActionAbstraction, GameState, RngSource, TableConfig,
+    DefaultActionAbstraction, GameState, PlayerStatus, RngSource, TableConfig,
 };
 
 const WALK_SEED: u64 = 0x4E4C_4845_5F53_5A4E; // "NLHE_SZN"
@@ -52,6 +60,15 @@ impl BucketCounts {
     }
 }
 
+/// B3 摘要 key 的逐 key 元数据（取该 key 首次出现节点的合法动作签名 + 动作数）。
+#[derive(Clone, Copy)]
+struct B3KeyMeta {
+    /// 合法动作集签名（Fold/Check/Call/AllIn + 各 ratio 的 Bet/Raise 位）。
+    action_sig: u64,
+    /// 合法动作数（dense stride）。
+    action_count: u32,
+}
+
 #[derive(Default)]
 struct Stats {
     decision_nodes: u64,
@@ -71,6 +88,13 @@ struct Stats {
     per_street_slots: BTreeMap<u8, u64>,
     /// action_count（= legal_actions.len()）→ 节点数直方图。
     action_count_hist: BTreeMap<usize, u64>,
+    // ---- B3 摘要探针（仅 b3_enabled 时填）----
+    /// distinct 摘要 key → meta（key 低 2 bit 编码 street，便于按街还原）。
+    b3_keys: HashMap<u64, B3KeyMeta>,
+    /// 同一 key 出现过不同 legal_actions 签名的次数（> 0 = 不变量被破，key 不够决定动作集）。
+    b3_violations: u64,
+    /// 首个违规示例 `(key, 已存签名, 新签名)`，便于定位。
+    b3_first_violation: Option<(u64, u64, u64)>,
 }
 
 impl Stats {
@@ -81,6 +105,184 @@ impl Stats {
             .map(|(street, count)| count * buckets.for_street(*street))
             .sum()
     }
+
+    /// 记录一个决策节点的 B3 摘要 key + 合法动作签名。首见即存；重见则校验签名一致
+    /// （不一致 = 不变量违规，累计并记首例）。
+    fn record_b3(&mut self, key: u64, sig: u64, action_count: u32) {
+        match self.b3_keys.get(&key).map(|m| m.action_sig) {
+            Some(existing) if existing != sig => {
+                self.b3_violations += 1;
+                if self.b3_first_violation.is_none() {
+                    self.b3_first_violation = Some((key, existing, sig));
+                }
+            }
+            Some(_) => {}
+            None => {
+                self.b3_keys.insert(
+                    key,
+                    B3KeyMeta {
+                        action_sig: sig,
+                        action_count,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// 跨街 aggressor 追踪（B3 `last_aggressor` 2 槽）。值 = 相对 button 的座位 relpos，
+/// `NONE`(7) 表示该街/该手尚无 voluntary 进攻。preflop 槽只在 preflop 更新、postflop
+/// 槽在 flop/turn/river 任一进攻更新（postflop 线最近一个 aggressor，不随街清零）。
+#[derive(Clone, Copy)]
+struct Aggr {
+    pre: u8,
+    post: u8,
+}
+
+const AGGR_NONE: u8 = 7;
+
+impl Default for Aggr {
+    fn default() -> Self {
+        Aggr {
+            pre: AGGR_NONE,
+            post: AGGR_NONE,
+        }
+    }
+}
+
+/// 相对 button 的座位号 = `(seat + n - button) % n`，范围 `0..n`。
+fn relpos(seat: u8, button: u8, n: u8) -> u8 {
+    (seat + n - button) % n
+}
+
+/// SPR 桶（有效剩余筹码 / 当前底池），log 间距 12 桶（0..11）。
+fn spr_bucket(eff_stack: u64, pot: u64) -> u8 {
+    if pot == 0 {
+        return 11;
+    }
+    let spr = eff_stack as f64 / pot as f64;
+    const BOUNDS: [f64; 11] = [0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0, 13.0, 20.0, 35.0];
+    let mut idx = 0u8;
+    for &b in BOUNDS.iter() {
+        if spr > b {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    idx
+}
+
+/// 面对的下注尺寸桶：0 = 无活注（可 check）、1 = ≤0.5p、2 = ~1p、3 = ≥~2p、
+/// 4 = 跟注即 all-in（to_call ≥ 自己 stack）。
+fn facing_bucket(state: &GameState, actor_idx: usize) -> u8 {
+    let legal = state.legal_actions();
+    if legal.check {
+        return 0;
+    }
+    let Some(call_to) = legal.call else {
+        return 0;
+    };
+    let p = &state.players()[actor_idx];
+    let committed = p.committed_this_round.as_u64();
+    let to_call = call_to.as_u64().saturating_sub(committed);
+    let stack = p.stack.as_u64();
+    if to_call >= stack {
+        return 4;
+    }
+    let pot = state.pot().as_u64();
+    if pot == 0 {
+        return 2;
+    }
+    let r = to_call as f64 / pot as f64;
+    if r <= 0.5 {
+        1
+    } else if r <= 1.5 {
+        2
+    } else {
+        3
+    }
+}
+
+/// 在场 bitmask（相对 button，`Active∪AllIn`=1，`Folded`=0），6-max → 6 bit。
+fn live_mask(state: &GameState, button: u8, n: u8) -> u8 {
+    let mut m = 0u8;
+    for p in state.players() {
+        if matches!(p.status, PlayerStatus::Active | PlayerStatus::AllIn) {
+            m |= 1 << relpos(p.seat.0, button, n);
+        }
+    }
+    m
+}
+
+/// 组装 B3 摘要 key（u64，仅探针用：字段笛卡尔积的单射打包，不必对齐生产位布局）。
+/// 低 2 bit = street，便于 report 按街还原。
+fn b3_key(state: &GameState, actor_seat: u8, street: u8, raises_on_street: u32, aggr: Aggr) -> u64 {
+    let cfg = state.config();
+    let n = cfg.n_seats;
+    let button = cfg.button_seat.0;
+    let apos = relpos(actor_seat, button, n) as u64; // 3 bit
+    let lmask = live_mask(state, button, n) as u64; // 6 bit
+    let raises = raises_on_street.min(3) as u64; // 2 bit
+    let facing = facing_bucket(state, actor_seat as usize) as u64; // 3 bit
+    let eff = state
+        .players()
+        .iter()
+        .filter(|p| matches!(p.status, PlayerStatus::Active))
+        .map(|p| p.stack.as_u64())
+        .min()
+        .unwrap_or(0);
+    let spr = spr_bucket(eff, state.pot().as_u64()) as u64; // 4 bit
+    let pre = aggr.pre as u64; // 3 bit (7=none)
+    let post = aggr.post as u64; // 3 bit
+    (street as u64 & 0b11)
+        | (apos << 2)
+        | (lmask << 5)
+        | (raises << 11)
+        | (facing << 13)
+        | (spr << 16)
+        | (pre << 20)
+        | (post << 23)
+}
+
+/// 把 ratio 标签压成 0..3 的小下标（500/1000/2000 → 0/1/2，其它 → 3）。
+fn ratio_idx(r: BetRatio) -> u32 {
+    match r.as_milli() {
+        500 => 0,
+        1000 => 1,
+        2000 => 2,
+        _ => 3,
+    }
+}
+
+/// 合法动作集签名（位掩码）：Fold=bit0 Check=bit1 Call=bit2 AllIn=bit3，
+/// Bet(ratio)=bit(4+idx)、Raise(ratio)=bit(10+idx)。用于 B3 不变量校验。
+fn action_sig(actions: &[AbstractAction]) -> u64 {
+    let mut s = 0u64;
+    for a in actions {
+        match a {
+            AbstractAction::Fold => s |= 1 << 0,
+            AbstractAction::Check => s |= 1 << 1,
+            AbstractAction::Call { .. } => s |= 1 << 2,
+            AbstractAction::AllIn { .. } => s |= 1 << 3,
+            AbstractAction::Bet { ratio_label, .. } => s |= 1 << (4 + ratio_idx(*ratio_label)),
+            AbstractAction::Raise { ratio_label, .. } => s |= 1 << (10 + ratio_idx(*ratio_label)),
+        }
+    }
+    s
+}
+
+/// 某动作是否进攻（用于 raise 计数 + aggressor 追踪）。`raises_this_street` 沿用
+/// 工具原口径只数 Bet/Raise（AllIn 不计入 cap）；aggressor 追踪则把 AllIn 也算进攻
+/// （all-in 是把筹码推进去的攻击，对 range 不对称有意义）。
+fn is_bet_or_raise(a: &AbstractAction) -> bool {
+    matches!(a, AbstractAction::Bet { .. } | AbstractAction::Raise { .. })
+}
+fn is_aggression_for_aggressor(a: &AbstractAction) -> bool {
+    matches!(
+        a,
+        AbstractAction::Bet { .. } | AbstractAction::Raise { .. } | AbstractAction::AllIn { .. }
+    )
 }
 
 /// A1 raise cap（每街 (Bet+Raise) 聚合上限）：`raises_on_street` 是到达本节点前
@@ -93,15 +295,24 @@ impl Stats {
 /// 任何 `Raise { ratio_label = HALF_POT }`（re-raise 一律走 1pot）。preflop 集为
 /// {1.0} 时该过滤天然不触发（无 0.5），只在 postflop {0.5,1.0} 处生效。与
 /// `raise_cap` 可叠加。
+/// `b3_summary`：开 B3 摘要 key 探针（见文件头）。
 /// 递归过程中不变的配置（打包以免 `walk` 参数过多）。
 struct WalkCfg<'a> {
     abs_by_street: &'a [DefaultActionAbstraction; 4],
     buckets: &'a BucketCounts,
     raise_cap: u32,
     drop_small_reraise: bool,
+    b3_summary: bool,
 }
 
-fn walk(state: &GameState, depth: u32, raises_on_street: u32, cfg: &WalkCfg, stats: &mut Stats) {
+fn walk(
+    state: &GameState,
+    depth: u32,
+    raises_on_street: u32,
+    aggr: Aggr,
+    cfg: &WalkCfg,
+    stats: &mut Stats,
+) {
     if state.is_terminal() {
         stats.terminal_nodes += 1;
         return;
@@ -132,13 +343,11 @@ fn walk(state: &GameState, depth: u32, raises_on_street: u32, cfg: &WalkCfg, sta
     // 动作过滤：① A1 raise cap 到顶剔 sized Bet/Raise；② first-bet-small 剔 0.5pot 的 Raise。
     // 二者只砍 sized 进攻，Fold/Check/Call/AllIn 永远保留。
     let cap_reached = raises_on_street >= cfg.raise_cap;
-    let is_aggressive =
-        |a: &AbstractAction| matches!(a, AbstractAction::Bet { .. } | AbstractAction::Raise { .. });
     let actions: Vec<AbstractAction> = legal_set
         .iter()
         .copied()
         .filter(|a| {
-            if cap_reached && is_aggressive(a) {
+            if cap_reached && is_bet_or_raise(a) {
                 return false;
             }
             if cfg.drop_small_reraise {
@@ -161,6 +370,12 @@ fn walk(state: &GameState, depth: u32, raises_on_street: u32, cfg: &WalkCfg, sta
     *stats.per_street_slots.entry(street).or_default() += rows * action_count;
     *stats.action_count_hist.entry(actions.len()).or_default() += 1;
 
+    // B3 摘要 key：用本节点 incoming 状态（aggr 反映到达此节点前的攻击）。
+    if cfg.b3_summary {
+        let key = b3_key(state, actor, street, raises_on_street, aggr);
+        stats.record_b3(key, action_sig(&actions), actions.len() as u32);
+    }
+
     for action in actions {
         let mut next_state = state.clone();
         next_state
@@ -170,12 +385,22 @@ fn walk(state: &GameState, depth: u32, raises_on_street: u32, cfg: &WalkCfg, sta
         let next_street = next_state.street() as u8;
         let next_raises = if next_street != street {
             0
-        } else if is_aggressive(&action) {
+        } else if is_bet_or_raise(&action) {
             raises_on_street + 1
         } else {
             raises_on_street
         };
-        walk(&next_state, depth + 1, next_raises, cfg, stats);
+        // aggressor 追踪：本动作若进攻，更新对应槽（相对 button）。postflop 槽跨街不清零。
+        let mut next_aggr = aggr;
+        if is_aggression_for_aggressor(&action) {
+            let rp = relpos(actor, state.config().button_seat.0, state.config().n_seats);
+            if street == 0 {
+                next_aggr.pre = rp;
+            } else {
+                next_aggr.post = rp;
+            }
+        }
+        walk(&next_state, depth + 1, next_raises, next_aggr, cfg, stats);
         if stats.capped {
             return;
         }
@@ -191,12 +416,14 @@ fn make_abs(raise_ratios: &[f64]) -> DefaultActionAbstraction {
 /// `per_street` = [preflop, flop, turn, river] 各自的 raise ratio 集合。
 /// `raise_cap` = 每街 (Bet+Raise) 聚合上限（`u32::MAX` = 无 cap）。
 /// `drop_small_reraise` = first-bet-small 规则（见 `walk`）。
+/// `b3_summary` = 开 B3 摘要 key 探针。
 fn measure(
     table_cfg: &TableConfig,
     per_street: [&[f64]; 4],
     buckets: &BucketCounts,
     raise_cap: u32,
     drop_small_reraise: bool,
+    b3_summary: bool,
 ) -> Stats {
     let abs_by_street = [
         make_abs(per_street[0]),
@@ -212,9 +439,10 @@ fn measure(
         buckets,
         raise_cap,
         drop_small_reraise,
+        b3_summary,
     };
     let mut stats = Stats::default();
-    walk(&state, 0, 0, &cfg, &mut stats);
+    walk(&state, 0, 0, Aggr::default(), &cfg, &mut stats);
     stats
 }
 
@@ -282,6 +510,9 @@ fn print_stats(label: &str, desc: &str, stats: &Stats, buckets: &BucketCounts) {
     println!();
 
     print_dense_layout(stats, infosets);
+    if !stats.b3_keys.is_empty() {
+        print_b3_summary(stats, buckets);
+    }
     println!();
 }
 
@@ -342,6 +573,65 @@ fn print_dense_layout(stats: &Stats, infosets: u64) {
     );
 }
 
+/// B3 摘要 key 探针报告：distinct key（总 + 按街）、B3 infoset、B3 dense 两表体量、
+/// 不变量（同 key legal_actions 一致）校验结果。与上面 node_id 计数对照看压缩比。
+fn print_b3_summary(stats: &Stats, buckets: &BucketCounts) {
+    let mut keys_per_street = [0u64; 4];
+    let mut slots_per_street = [0u64; 4];
+    for (key, meta) in &stats.b3_keys {
+        let street = (key & 0b11) as usize;
+        keys_per_street[street] += 1;
+        slots_per_street[street] += buckets.for_street(street as u8) * u64::from(meta.action_count);
+    }
+    let total_keys: u64 = keys_per_street.iter().sum();
+    let b3_infosets: u64 = (0..4)
+        .map(|s| keys_per_street[s] * buckets.for_street(s as u8))
+        .sum();
+    let b3_slots: u64 = slots_per_street.iter().sum();
+    let avg_ac = b3_slots as f64 / b3_infosets.max(1) as f64;
+    let var_two = b3_slots * 8 * 2;
+
+    println!("--- B3 摘要 key 探针 ---");
+    if stats.capped {
+        println!(
+            "⚠ 树枚举 CAPPED → B3 key/infoset 也是 LOWER BOUND（但 key 空间有界，可能已近饱和）"
+        );
+    }
+    print!("B3 distinct key : {total_keys}   按街:");
+    for (s, count) in keys_per_street.iter().enumerate() {
+        print!(" {}={}", street_label(s as u8), count);
+    }
+    println!();
+    println!(
+        "B3 infosets     : {b3_infosets}  ({:.2}M)   [vs node_id infosets {} ({:.1}M)]",
+        b3_infosets as f64 / 1e6,
+        stats.infosets(buckets),
+        stats.infosets(buckets) as f64 / 1e6
+    );
+    println!(
+        "B3 dense slots  : {b3_slots}  (avg action_count {avg_ac:.3})   两表 {:.3} GiB",
+        var_two as f64 / GIB
+    );
+    let node_infosets = stats.infosets(buckets);
+    if b3_infosets > 0 {
+        println!(
+            "压缩比          : node_id/B3 infoset = {:.1}×",
+            node_infosets as f64 / b3_infosets as f64
+        );
+    }
+    if stats.b3_violations == 0 {
+        println!("不变量          : ✓ 同 key 所有节点 legal_actions 一致（key 决定合法动作集）");
+    } else {
+        println!(
+            "不变量          : ✗ {} 次违规（同 key 不同 legal_actions → key 不足以决定动作集）",
+            stats.b3_violations
+        );
+        if let Some((k, a, b)) = stats.b3_first_violation {
+            println!("  首例: key=0x{k:07x}  已存签名=0b{a:014b}  冲突签名=0b{b:014b}");
+        }
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     const R3: &[f64] = &[0.5, 1.0, 2.0]; // HU 现 6-action {0.5p,1p,2p}（self-check 用）
 
@@ -377,6 +667,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("FIRST_SMALL").ok().as_deref(),
         Some("1") | Some("true")
     );
+    // B3_SUMMARY=1：开 B3 betting-state 摘要 key 探针（distinct key / B3 infoset / 不变量）。
+    // 纯 B3 摘要应在无 RAISE_CAP / 无 FIRST_SMALL 下跑（这两者改的是动作集，不是摘要本身）。
+    let b3_summary: bool = matches!(
+        std::env::var("B3_SUMMARY").ok().as_deref(),
+        Some("1") | Some("true")
+    );
 
     println!("=== Simplified NLHE Abstract Betting Tree Sizing ===");
     let cap_desc = if raise_cap == u32::MAX {
@@ -385,7 +681,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         raise_cap.to_string()
     };
     println!(
-        "RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {NODE_CAP}   RAISE_CAP = {cap_desc}   FIRST_SMALL = {first_small}"
+        "RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {NODE_CAP}   RAISE_CAP = {cap_desc}   FIRST_SMALL = {first_small}   B3_SUMMARY = {b3_summary}"
     );
     println!();
 
@@ -398,7 +694,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let cfg = TableConfig::default_hu_200bb();
         let start = std::time::Instant::now();
         // HU self-check 永远不加 cap / 不加 first-small，守住 240,096 节点 / 119.7M 这个不变量。
-        let stats = measure(&cfg, [R3, R3, R3, R3], &hu, u32::MAX, false);
+        // B3 探针随 flag 开关（不影响 node 计数，只多算摘要 key）。
+        let stats = measure(&cfg, [R3, R3, R3, R3], &hu, u32::MAX, false, b3_summary);
         print_stats(
             "HU self-check (期望 240,096 节点 / 119.7M)",
             &ratios_desc([R3, R3, R3, R3]),
@@ -436,7 +733,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
         };
         let start = std::time::Instant::now();
-        let stats = measure(&cfg, per_street, &six, raise_cap, first_small);
+        let stats = measure(&cfg, per_street, &six, raise_cap, first_small, b3_summary);
         print_stats(&label, &ratios_desc(per_street), &stats, &six);
         println!("walk wall time  : {:.3}s\n", start.elapsed().as_secs_f64());
     }
