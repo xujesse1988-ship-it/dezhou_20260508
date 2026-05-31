@@ -160,12 +160,20 @@ name = "nlhe_preflop_strategy_dump"
 path = "tools/nlhe_preflop_strategy_dump.rs"
 
 [[bin]]
+name = "nlhe_dense_preflop_169_dump"
+path = "tools/nlhe_dense_preflop_169_dump.rs"
+
+[[bin]]
 name = "nlhe_infoset_signal_dump"
 path = "tools/nlhe_infoset_signal_dump.rs"
 
 [[bin]]
 name = "nlhe_zero_strategy_audit"
 path = "tools/nlhe_zero_strategy_audit.rs"
+
+[[bin]]
+name = "nlhe_dense_zero_strategy_count"
+path = "tools/nlhe_dense_zero_strategy_count.rs"
 
 [[bin]]
 name = "mccfr_trace"
