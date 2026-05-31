@@ -29,7 +29,7 @@
 //! B3 dense 表体量**，并断言"同 key 的所有节点 legal_actions 一致"（不变量：key 必须
 //! 决定合法动作集，否则重蹈 F17）。把"下注历史摘成有界 key 后还剩多大"变成数字。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::ExitCode;
 
 use poker::{
@@ -39,9 +39,10 @@ use poker::{
 
 const WALK_SEED: u64 = 0x4E4C_4845_5F53_5A4E; // "NLHE_SZN"
 
-/// 决策节点枚举上限。到上限即停止下探（标记 capped）。6-max 树可能 ≫ 这个数，
-/// 那本身就是结论：该抽象在全宽枚举 / 单机 dense 表下不可行。
-const NODE_CAP: u64 = 100_000_000;
+/// 决策节点枚举上限**默认值**。到上限即停止下探（标记 capped）。6-max 树可能 ≫ 这个数，
+/// 那本身就是结论：该抽象在全宽枚举 / 单机 dense 表下不可行。可用 env `NODE_CAP` 覆盖
+/// （§待办 g：B3 distinct key 在 100M 下未饱和，需更大 cap 重测真值）。
+const NODE_CAP_DEFAULT: u64 = 100_000_000;
 
 /// 每条街的 bucket 数（preflop = lossless hand class，postflop = K-means 桶）。
 #[derive(Clone, Copy)]
@@ -95,6 +96,9 @@ struct Stats {
     b3_violations: u64,
     /// 首个违规示例 `(key, 已存签名, 新签名)`，便于定位。
     b3_first_violation: Option<(u64, u64, u64)>,
+    // ---- A4 width cap 探针（仅 width_cap < 255 时非零）----
+    /// 被 width cap 剪掉的 postflop 节点数（含其整棵子树根，统计透明用）。
+    width_pruned: u64,
 }
 
 impl Stats {
@@ -215,6 +219,29 @@ fn live_mask(state: &GameState, button: u8, n: u8) -> u8 {
     m
 }
 
+/// 在场人数（`Active∪AllIn`）。A4 width cap 用：与文档 `live_players` bitmask 同口径
+/// （all-in 玩家算"已见后续街"，仍在底池里）。
+fn live_count(state: &GameState) -> u8 {
+    state
+        .players()
+        .iter()
+        .filter(|p| matches!(p.status, PlayerStatus::Active | PlayerStatus::AllIn))
+        .count() as u8
+}
+
+/// 抽象动作的稳定小整数编码（用于采样 walk 把"已走动作序列"折成 PR rolling hash =
+/// 完美回忆 node 身份）。同一抽象动作 → 同一码，不同 ratio 的 Bet/Raise 区分开。
+fn action_code(a: &AbstractAction) -> u64 {
+    match a {
+        AbstractAction::Fold => 1,
+        AbstractAction::Check => 2,
+        AbstractAction::Call { .. } => 3,
+        AbstractAction::AllIn { .. } => 4,
+        AbstractAction::Bet { ratio_label, .. } => 8 + ratio_idx(*ratio_label) as u64,
+        AbstractAction::Raise { ratio_label, .. } => 16 + ratio_idx(*ratio_label) as u64,
+    }
+}
+
 /// 组装 B3 摘要 key（u64，仅探针用：字段笛卡尔积的单射打包，不必对齐生产位布局）。
 /// 低 2 bit = street，便于 report 按街还原。
 fn b3_key(state: &GameState, actor_seat: u8, street: u8, raises_on_street: u32, aggr: Aggr) -> u64 {
@@ -307,6 +334,12 @@ struct WalkCfg<'a> {
     drop_small_reraise: bool,
     b3_summary: bool,
     b3_pin_actions: bool,
+    /// A4 width cap：preflop 之后只允许 ≤ 此人数（`Active∪AllIn`）在场，超出的节点
+    /// 连同子树被剪掉（drop 版 = 量"多路 width"对树规模的贡献，是 capped 博弈规模下界）。
+    /// `255` = 无 cap（max live ≤ n_seats ≤ 9，永不触发）。
+    width_cap: u8,
+    /// 决策节点枚举上限（env `NODE_CAP` 覆盖默认 `NODE_CAP_DEFAULT`）。
+    node_cap: u64,
 }
 
 fn walk(
@@ -322,14 +355,22 @@ fn walk(
         return;
     }
 
+    let street = state.street() as u8;
+    // A4 width cap：preflop（street 0）之后，剪掉在场人数 > cap 的节点（含整棵子树）。
+    // 直接弃这些"多路续局"线 = 量 width 病对树规模的贡献；是 capped 博弈规模的下界
+    // （真正的 capped 博弈会把这些线重定向到 ≤cap 人续局而非整段删除）。
+    if street > 0 && live_count(state) > cfg.width_cap {
+        stats.width_pruned += 1;
+        return;
+    }
+
     // NODE_CAP：到上限停止下探，把 capped 当结论返回。
-    if stats.decision_nodes >= NODE_CAP {
+    if stats.decision_nodes >= cfg.node_cap {
         stats.capped = true;
         return;
     }
 
     stats.decision_nodes += 1;
-    let street = state.street() as u8;
     let actor = state
         .current_player()
         .expect("non-terminal state must have current_player")
@@ -428,6 +469,7 @@ fn make_abs(raise_ratios: &[f64]) -> DefaultActionAbstraction {
 /// `raise_cap` = 每街 (Bet+Raise) 聚合上限（`u32::MAX` = 无 cap）。
 /// `drop_small_reraise` = first-bet-small 规则（见 `walk`）。
 /// `b3_summary` = 开 B3 摘要 key 探针；`b3_pin_actions` = 把动作集签名折进 key。
+#[allow(clippy::too_many_arguments)]
 fn measure(
     table_cfg: &TableConfig,
     per_street: [&[f64]; 4],
@@ -436,6 +478,8 @@ fn measure(
     drop_small_reraise: bool,
     b3_summary: bool,
     b3_pin_actions: bool,
+    width_cap: u8,
+    node_cap: u64,
 ) -> Stats {
     let abs_by_street = [
         make_abs(per_street[0]),
@@ -453,6 +497,8 @@ fn measure(
         drop_small_reraise,
         b3_summary,
         b3_pin_actions,
+        width_cap,
+        node_cap,
     };
     let mut stats = Stats::default();
     walk(&state, 0, 0, Aggr::default(), &cfg, &mut stats);
@@ -501,7 +547,9 @@ fn print_stats(label: &str, desc: &str, stats: &Stats, buckets: &BucketCounts) {
         buckets.preflop, buckets.postflop
     );
     if stats.capped {
-        println!("⚠ CAPPED        : 枚举到 NODE_CAP={NODE_CAP} 被截断 → 下面计数是 LOWER BOUND，真实树更大");
+        println!(
+            "⚠ CAPPED        : 枚举到 NODE_CAP 上限被截断 → 下面计数是 LOWER BOUND，真实树更大"
+        );
     }
     println!(
         "Decision nodes  : {n}    [node_id {bits} bit → cover {}]",
@@ -521,6 +569,12 @@ fn print_stats(label: &str, desc: &str, stats: &Stats, buckets: &BucketCounts) {
         print!(" {}={}", street_label(*street), count);
     }
     println!();
+    if stats.width_pruned > 0 {
+        println!(
+            "Width-pruned    : {} 个 postflop 节点被 width cap 剪掉（连子树）",
+            stats.width_pruned
+        );
+    }
 
     print_dense_layout(stats, infosets);
     if !stats.b3_keys.is_empty() {
@@ -645,6 +699,237 @@ fn print_b3_summary(stats: &Stats, buckets: &BucketCounts) {
     }
 }
 
+// ===========================================================================
+// reach 采样 walk（§待办 e/f/g）：均匀随机 playout 量 reached 集
+// ===========================================================================
+
+/// 采样 walk 的 RNG 种子（与枚举 walk 的 `WALK_SEED` 区分，结果可复现）。
+const SAMPLE_SEED: u64 = 0x4E4C_4845_5F52_4348; // "NLHE_RCH"
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// 采样 walk 配置（与枚举 `WalkCfg` 平行，但 playout 单路下行不分桶计 dense）。
+struct SampleCfg<'a> {
+    abs_by_street: &'a [DefaultActionAbstraction; 4],
+    raise_cap: u32,
+    drop_small_reraise: bool,
+    b3_pin_actions: bool,
+    width_cap: u8,
+}
+
+#[derive(Default)]
+struct ReachStats {
+    samples: u64,
+    /// distinct 完美回忆 betting 序列前缀 hash（= reached 决策节点）；低 2 bit 强制为
+    /// street，便于按街还原。两条不同动作序列 → 不同 hash（与 node_id 单射同义）。
+    pr_nodes: HashSet<u64>,
+    /// distinct B3 摘要 key（reached）；与枚举 walk 的 `b3_key` 同编码（可叠 pin）。
+    b3_keys: HashSet<u64>,
+    /// 命中 width-pruned 线（capped 博弈里不存在）而提前停止的 playout 数。
+    width_pruned_playouts: u64,
+}
+
+/// 一次均匀随机 playout：fresh deal（chance 采样）→ 每个决策节点记 reached 节点 + B3
+/// key，再均匀随机选一个抽象动作推进，直到 terminal / width-pruned / 空动作集。
+fn sample_playout(
+    table_cfg: &TableConfig,
+    cfg: &SampleCfg,
+    rng: &mut dyn RngSource,
+    stats: &mut ReachStats,
+) {
+    let mut state = GameState::with_rng_no_history(table_cfg, 0, rng);
+    let mut raises_on_street = 0u32;
+    let mut aggr = Aggr::default();
+    let mut seq = FNV_OFFSET; // 已走动作序列的 rolling hash（root = 空序列）
+    loop {
+        if state.is_terminal() {
+            return;
+        }
+        let street = state.street() as u8;
+        if street > 0 && live_count(&state) > cfg.width_cap {
+            stats.width_pruned_playouts += 1;
+            return;
+        }
+        let Some(actor_seat) = state.current_player() else {
+            return;
+        };
+        let actor = actor_seat.0;
+        let legal = cfg.abs_by_street[street as usize].abstract_actions(&state);
+        // 与枚举 walk 完全一致的动作过滤（raise cap + first-bet-small）。
+        let cap_reached = raises_on_street >= cfg.raise_cap;
+        let actions: Vec<AbstractAction> = legal
+            .iter()
+            .copied()
+            .filter(|a| {
+                if cap_reached && is_bet_or_raise(a) {
+                    return false;
+                }
+                if cfg.drop_small_reraise {
+                    if let AbstractAction::Raise { ratio_label, .. } = a {
+                        if *ratio_label == BetRatio::HALF_POT {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .collect();
+        if actions.is_empty() {
+            return;
+        }
+        // 记录 reached 决策节点（PR 序列前缀 hash，低 2 bit = street）+ B3 摘要 key。
+        stats
+            .pr_nodes
+            .insert((seq & !0b11) | (street as u64 & 0b11));
+        let mut bk = b3_key(&state, actor, street, raises_on_street, aggr);
+        if cfg.b3_pin_actions {
+            bk |= action_sig(&actions) << 26;
+        }
+        stats.b3_keys.insert(bk);
+        // 均匀随机选动作。
+        let idx = (rng.next_u64() % actions.len() as u64) as usize;
+        let action = actions[idx];
+        // aggressor 追踪（pre-apply 的 button/n，与枚举 walk 同口径）。
+        let rp = relpos(actor, state.config().button_seat.0, state.config().n_seats);
+        // rolling hash 推进（FNV-1a 风格，顺序敏感）。
+        seq = (seq ^ action_code(&action)).wrapping_mul(FNV_PRIME);
+        state
+            .apply(action.to_concrete())
+            .expect("DefaultActionAbstraction must emit legal actions");
+        let next_street = state.street() as u8;
+        raises_on_street = if next_street != street {
+            0
+        } else if is_bet_or_raise(&action) {
+            raises_on_street + 1
+        } else {
+            raises_on_street
+        };
+        if is_aggression_for_aggressor(&action) {
+            if street == 0 {
+                aggr.pre = rp;
+            } else {
+                aggr.post = rp;
+            }
+        }
+    }
+}
+
+/// 驱动 reach 采样：最多 `max_samples` 个 playout，每 100 万检查点打印进度；B3 key
+/// 连续 3 个检查点增长 < 0.05% 即判饱和提前停（有界 key 空间，饱和值 = 真 distinct key）。
+fn sample_reach(
+    table_cfg: &TableConfig,
+    per_street: [&[f64]; 4],
+    raise_cap: u32,
+    drop_small_reraise: bool,
+    b3_pin_actions: bool,
+    width_cap: u8,
+    max_samples: u64,
+) -> ReachStats {
+    let abs_by_street = [
+        make_abs(per_street[0]),
+        make_abs(per_street[1]),
+        make_abs(per_street[2]),
+        make_abs(per_street[3]),
+    ];
+    let cfg = SampleCfg {
+        abs_by_street: &abs_by_street,
+        raise_cap,
+        drop_small_reraise,
+        b3_pin_actions,
+        width_cap,
+    };
+    let mut rng = ChaCha20Rng::from_seed(SAMPLE_SEED);
+    let mut stats = ReachStats::default();
+    let checkpoint: u64 = 1_000_000;
+    let mut last_b3 = 0usize;
+    let mut stale = 0u32;
+    let mut s = 0u64;
+    println!(
+        "--- reach 采样 walk（均匀随机 playout；B3 key 有界→饱和即真值，PR 节点无界→reach(M) 下界）---"
+    );
+    while s < max_samples {
+        sample_playout(table_cfg, &cfg, &mut rng as &mut dyn RngSource, &mut stats);
+        s += 1;
+        if s % checkpoint == 0 {
+            let cur = stats.b3_keys.len();
+            let delta = cur - last_b3;
+            println!(
+                "  {:>4}M playout: reached PR 节点 {}  B3 key {} (+{} 自上检查点)",
+                s / 1_000_000,
+                stats.pr_nodes.len(),
+                cur,
+                delta,
+            );
+            if (delta as f64) < (cur as f64) * 0.0005 {
+                stale += 1;
+            } else {
+                stale = 0;
+            }
+            last_b3 = cur;
+            if stale >= 3 {
+                println!("  → B3 key 已饱和（连续 3 检查点 <0.05% 增长），停止采样");
+                break;
+            }
+        }
+    }
+    stats.samples = s;
+    stats
+}
+
+/// reach 采样结果报告：reached PR 节点 / reached infoset（按街 × 桶）/ 与枚举对照 /
+/// 饱和后的 B3 distinct key。
+fn print_reach(stats: &ReachStats, buckets: &BucketCounts, enumerated: &Stats) {
+    let mut pr_per_street = [0u64; 4];
+    let mut b3_per_street = [0u64; 4];
+    for &k in &stats.pr_nodes {
+        pr_per_street[(k & 0b11) as usize] += 1;
+    }
+    for &k in &stats.b3_keys {
+        b3_per_street[(k & 0b11) as usize] += 1;
+    }
+    let pr_total: u64 = pr_per_street.iter().sum();
+    let b3_total: u64 = b3_per_street.iter().sum();
+    let reached_infosets: u64 = (0..4)
+        .map(|s| pr_per_street[s] * buckets.for_street(s as u8))
+        .sum();
+    let enum_nodes = enumerated.decision_nodes;
+    let enum_infosets = enumerated.infosets(buckets);
+
+    println!("--- reach 采样结果（{} playout）---", stats.samples);
+    print!("Reached PR 节点 : {pr_total}   按街:");
+    for (s, c) in pr_per_street.iter().enumerate() {
+        print!(" {}={}", street_label(s as u8), c);
+    }
+    println!();
+    println!(
+        "Reached infoset : {reached_infosets} ({:.2}M)   [枚举 {} ({:.1}M)]",
+        reached_infosets as f64 / 1e6,
+        enum_infosets,
+        enum_infosets as f64 / 1e6,
+    );
+    if enumerated.capped {
+        println!(
+            "reached/枚举    : 枚举 capped（≥{enum_nodes} 节点），无比例；reached 是 uniform-play 下界"
+        );
+    } else if enum_nodes > 0 {
+        println!(
+            "reached/枚举    : 节点 {:.1}%  ({pr_total} / {enum_nodes})  ⚠ uniform-play 覆盖率，非收敛策略 reached（后者需真 trainer）",
+            pr_total as f64 / enum_nodes as f64 * 100.0,
+        );
+    }
+    print!("Reached B3 key  : {b3_total}（采样饱和值）   按街:");
+    for (s, c) in b3_per_street.iter().enumerate() {
+        print!(" {}={}", street_label(s as u8), c);
+    }
+    println!();
+    if stats.width_pruned_playouts > 0 {
+        println!(
+            "width-pruned    : {} 个 playout 命中超宽线提前停止",
+            stats.width_pruned_playouts
+        );
+    }
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     const R3: &[f64] = &[0.5, 1.0, 2.0]; // HU 现 6-action {0.5p,1p,2p}（self-check 用）
 
@@ -692,6 +977,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("B3_PIN_ACTIONS").ok().as_deref(),
         Some("1") | Some("true")
     );
+    // WIDTH_CAP=N（§A4 待办 e）：preflop 之后只允许 ≤ N 人（Active∪AllIn）在场，超宽节点
+    // 连子树剪掉。env 不设 = 255（无 cap）。例：WIDTH_CAP=3 cargo run ... -- 0.5 1.0。
+    let width_cap: u8 = std::env::var("WIDTH_CAP")
+        .ok()
+        .map(|s| s.parse::<u8>())
+        .transpose()
+        .map_err(|e| format!("WIDTH_CAP 不是 u8: {e}"))?
+        .unwrap_or(255);
+    // MENU（§A3/§A4 待办 f）：raise-index/街 依赖菜单选择器，优先于 argv / FIRST_SMALL。
+    //   first_small       = preflop{1} postflop{0.5,1}，0.5 仅开池 Bet（= §A3 first-bet-small）
+    //   turn_river_small  = preflop{1} flop{1} turn/river{0.5,1}，0.5 仅 turn/river 开池
+    //   （EV 集中在河、树成本最低的对偶杠杆，见 research §3.2）
+    let menu: Option<String> = std::env::var("MENU").ok().filter(|s| !s.is_empty());
+    // REACH_SAMPLES=M（§待办 e/f/g）：开均匀随机采样 reach walk，跑至多 M 个 playout
+    //   （B3 key 有界→饱和即真值，PR 节点无界→reach(M) 下界）。0/不设 = 关。
+    let reach_samples: u64 = std::env::var("REACH_SAMPLES")
+        .ok()
+        .map(|s| s.parse::<u64>())
+        .transpose()
+        .map_err(|e| format!("REACH_SAMPLES 不是 u64: {e}"))?
+        .unwrap_or(0);
+    // NODE_CAP=N（§待办 g）：覆盖默认枚举上限 NODE_CAP_DEFAULT（=100M）。B3 distinct key
+    // 在 100M 下未饱和，用更大 cap 重测真值。例：NODE_CAP=300000000 B3_SUMMARY=1 ...
+    let node_cap: u64 = std::env::var("NODE_CAP")
+        .ok()
+        .map(|s| s.parse::<u64>())
+        .transpose()
+        .map_err(|e| format!("NODE_CAP 不是 u64: {e}"))?
+        .unwrap_or(NODE_CAP_DEFAULT);
 
     println!("=== Simplified NLHE Abstract Betting Tree Sizing ===");
     let cap_desc = if raise_cap == u32::MAX {
@@ -699,8 +1013,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         raise_cap.to_string()
     };
+    let width_desc = if width_cap == 255 {
+        "none".to_string()
+    } else {
+        width_cap.to_string()
+    };
+    let menu_desc = menu.as_deref().unwrap_or("(argv/FIRST_SMALL)");
     println!(
-        "RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {NODE_CAP}   RAISE_CAP = {cap_desc}   FIRST_SMALL = {first_small}   B3_SUMMARY = {b3_summary}   B3_PIN_ACTIONS = {b3_pin_actions}"
+        "RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {node_cap}   RAISE_CAP = {cap_desc}   FIRST_SMALL = {first_small}   B3_SUMMARY = {b3_summary}   B3_PIN_ACTIONS = {b3_pin_actions}"
+    );
+    println!(
+        "WIDTH_CAP = {width_desc}   MENU = {menu_desc}   REACH_SAMPLES = {reach_samples}   SAMPLE seed = 0x{SAMPLE_SEED:016x}"
     );
     println!();
 
@@ -712,8 +1035,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
         let cfg = TableConfig::default_hu_200bb();
         let start = std::time::Instant::now();
-        // HU self-check 永远不加 cap / 不加 first-small，守住 240,096 节点 / 119.7M 这个不变量。
-        // B3 探针随 flag 开关（不影响 node 计数，只多算摘要 key）。
+        // HU self-check 永远不加 cap / 不加 first-small / 不加 width-cap，守住 240,096 节点 /
+        // 119.7M 这个不变量。B3 探针随 flag 开关（不影响 node 计数，只多算摘要 key）。
         let stats = measure(
             &cfg,
             [R3, R3, R3, R3],
@@ -722,6 +1045,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             false,
             b3_summary,
             b3_pin_actions,
+            255,
+            node_cap,
         );
         print_stats(
             "HU self-check (期望 240,096 节点 / 119.7M)",
@@ -739,38 +1064,74 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             postflop: postflop_buckets,
         };
         let cfg = TableConfig::default_6max_100bb();
-        // FIRST_SMALL 时 per-street 固定 preflop{1.0} / postflop{0.5,1.0} + drop Raise{0.5}；
-        // 否则沿用 argv raise 集（全街同集）。
+        // 菜单解析（MENU > FIRST_SMALL > argv）。`drop_small` = 0.5 仅作开池 Bet（禁 Raise{0.5}）。
         const PRE1: &[f64] = &[1.0];
+        const POST1: &[f64] = &[1.0];
         const POST05_1: &[f64] = &[0.5, 1.0];
         let r: &[f64] = &six_ratios;
-        let per_street: [&[f64]; 4] = if first_small {
-            [PRE1, POST05_1, POST05_1, POST05_1]
-        } else {
-            [r, r, r, r]
+        let (per_street, drop_small, menu_label): ([&[f64]; 4], bool, String) = match menu
+            .as_deref()
+        {
+            Some("first_small") => (
+                [PRE1, POST05_1, POST05_1, POST05_1],
+                true,
+                "preflop{1} postflop{0.5,1} first-bet-small (MENU)".to_string(),
+            ),
+            Some("turn_river_small") => (
+                [PRE1, POST1, POST05_1, POST05_1],
+                true,
+                "preflop{1} flop{1} turn/river{0.5,1} 0.5-仅-turn/river-开池".to_string(),
+            ),
+            Some(other) => {
+                return Err(
+                    format!("未知 MENU '{other}'（支持 first_small | turn_river_small）").into(),
+                );
+            }
+            None if first_small => (
+                [PRE1, POST05_1, POST05_1, POST05_1],
+                true,
+                "preflop{1} postflop{0.5,1} first-bet-small (FIRST_SMALL)".to_string(),
+            ),
+            None => (
+                [r, r, r, r],
+                false,
+                format!("{} bet size(s) (argv)", six_ratios.len()),
+            ),
         };
-        let label = if first_small {
-            format!(
-                "6-max 100BB / preflop{{1.0}} postflop{{0.5,1.0}} first-bet-small / preflop 169 / postflop {postflop_buckets} / raise_cap {cap_desc}"
-            )
-        } else {
-            format!(
-                "6-max 100BB / {} bet size(s) / preflop 169 / postflop {postflop_buckets} / raise_cap {cap_desc}",
-                six_ratios.len()
-            )
-        };
+        let label = format!(
+            "6-max 100BB / {menu_label} / preflop 169 / postflop {postflop_buckets} / raise_cap {cap_desc} / width_cap {width_desc}"
+        );
         let start = std::time::Instant::now();
         let stats = measure(
             &cfg,
             per_street,
             &six,
             raise_cap,
-            first_small,
+            drop_small,
             b3_summary,
             b3_pin_actions,
+            width_cap,
+            node_cap,
         );
         print_stats(&label, &ratios_desc(per_street), &stats, &six);
         println!("walk wall time  : {:.3}s\n", start.elapsed().as_secs_f64());
+
+        // reach 采样 walk（§待办 e/f/g）：同菜单/同 cap 下均匀随机 playout，量 reached
+        // PR 节点（无界，reach(M) 下界）+ 饱和后的 B3 distinct key（有界，真值）。
+        if reach_samples > 0 {
+            let start = std::time::Instant::now();
+            let reach = sample_reach(
+                &cfg,
+                per_street,
+                raise_cap,
+                drop_small,
+                b3_pin_actions,
+                width_cap,
+                reach_samples,
+            );
+            print_reach(&reach, &six, &stats);
+            println!("reach wall time : {:.3}s\n", start.elapsed().as_secs_f64());
+        }
     }
 
     Ok(())
