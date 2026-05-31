@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use poker::{
-    AbstractAction, ActionAbstraction, ActionAbstractionConfig, ChaCha20Rng,
+    AbstractAction, ActionAbstraction, ActionAbstractionConfig, BetRatio, ChaCha20Rng,
     DefaultActionAbstraction, GameState, RngSource, TableConfig,
 };
 
@@ -89,15 +89,19 @@ impl Stats {
 /// 本节点合法集里只留 `Fold/Check/Call/AllIn`——`AllIn` 始终保留（escape hatch，
 /// 不计入 cap），砍掉的只是 sized `Bet`/`Raise` 这条组合爆炸链。`raise_cap = u32::MAX`
 /// 等价无 cap（与历史行为逐字节一致，见 run() 的 huge-cap self-check）。
-fn walk(
-    state: &GameState,
-    depth: u32,
-    raises_on_street: u32,
+/// `drop_small_reraise`：first-bet-small 规则——0.5pot 只许作开池 `Bet`，禁掉
+/// 任何 `Raise { ratio_label = HALF_POT }`（re-raise 一律走 1pot）。preflop 集为
+/// {1.0} 时该过滤天然不触发（无 0.5），只在 postflop {0.5,1.0} 处生效。与
+/// `raise_cap` 可叠加。
+/// 递归过程中不变的配置（打包以免 `walk` 参数过多）。
+struct WalkCfg<'a> {
+    abs_by_street: &'a [DefaultActionAbstraction; 4],
+    buckets: &'a BucketCounts,
     raise_cap: u32,
-    stats: &mut Stats,
-    abs_by_street: &[DefaultActionAbstraction; 4],
-    buckets: &BucketCounts,
-) {
+    drop_small_reraise: bool,
+}
+
+fn walk(state: &GameState, depth: u32, raises_on_street: u32, cfg: &WalkCfg, stats: &mut Stats) {
     if state.is_terminal() {
         stats.terminal_nodes += 1;
         return;
@@ -122,22 +126,35 @@ fn walk(
         stats.max_depth = depth;
     }
 
-    let abs = &abs_by_street[street as usize];
+    let abs = &cfg.abs_by_street[street as usize];
     let legal_set = abs.abstract_actions(state);
 
-    // A1 raise cap：本街进攻数到顶后剔除 sized Bet/Raise，仅留 Fold/Check/Call/AllIn。
-    let cap_reached = raises_on_street >= raise_cap;
+    // 动作过滤：① A1 raise cap 到顶剔 sized Bet/Raise；② first-bet-small 剔 0.5pot 的 Raise。
+    // 二者只砍 sized 进攻，Fold/Check/Call/AllIn 永远保留。
+    let cap_reached = raises_on_street >= cfg.raise_cap;
     let is_aggressive =
         |a: &AbstractAction| matches!(a, AbstractAction::Bet { .. } | AbstractAction::Raise { .. });
     let actions: Vec<AbstractAction> = legal_set
         .iter()
         .copied()
-        .filter(|a| !(cap_reached && is_aggressive(a)))
+        .filter(|a| {
+            if cap_reached && is_aggressive(a) {
+                return false;
+            }
+            if cfg.drop_small_reraise {
+                if let AbstractAction::Raise { ratio_label, .. } = a {
+                    if *ratio_label == BetRatio::HALF_POT {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
         .collect();
 
     // dense 布局累加：本节点贡献 bucket_count 行、bucket_count × action_count 个 slot。
     let action_count = actions.len() as u64;
-    let rows = buckets.for_street(street);
+    let rows = cfg.buckets.for_street(street);
     stats.total_rows += rows;
     stats.total_slots += rows * action_count;
     *stats.per_street_rows.entry(street).or_default() += rows;
@@ -158,15 +175,7 @@ fn walk(
         } else {
             raises_on_street
         };
-        walk(
-            &next_state,
-            depth + 1,
-            next_raises,
-            raise_cap,
-            stats,
-            abs_by_street,
-            buckets,
-        );
+        walk(&next_state, depth + 1, next_raises, cfg, stats);
         if stats.capped {
             return;
         }
@@ -181,11 +190,13 @@ fn make_abs(raise_ratios: &[f64]) -> DefaultActionAbstraction {
 
 /// `per_street` = [preflop, flop, turn, river] 各自的 raise ratio 集合。
 /// `raise_cap` = 每街 (Bet+Raise) 聚合上限（`u32::MAX` = 无 cap）。
+/// `drop_small_reraise` = first-bet-small 规则（见 `walk`）。
 fn measure(
     table_cfg: &TableConfig,
     per_street: [&[f64]; 4],
     buckets: &BucketCounts,
     raise_cap: u32,
+    drop_small_reraise: bool,
 ) -> Stats {
     let abs_by_street = [
         make_abs(per_street[0]),
@@ -196,8 +207,14 @@ fn measure(
     let mut rng = ChaCha20Rng::from_seed(WALK_SEED);
     let state = GameState::with_rng(table_cfg, 0, &mut rng as &mut dyn RngSource);
 
+    let cfg = WalkCfg {
+        abs_by_street: &abs_by_street,
+        buckets,
+        raise_cap,
+        drop_small_reraise,
+    };
     let mut stats = Stats::default();
-    walk(&state, 0, 0, raise_cap, &mut stats, &abs_by_street, buckets);
+    walk(&state, 0, 0, &cfg, &mut stats);
     stats
 }
 
@@ -354,6 +371,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()
         .map_err(|e| format!("RAISE_CAP 不是 u32: {e}"))?
         .unwrap_or(u32::MAX);
+    // FIRST_SMALL=1：preflop {1.0}、postflop {0.5,1.0}，且 0.5pot 只许作开池 Bet、
+    // re-raise 一律 1pot（禁 Raise{0.5}）。设此 flag 时忽略 argv raise 集（per-street 固定）。
+    let first_small: bool = matches!(
+        std::env::var("FIRST_SMALL").ok().as_deref(),
+        Some("1") | Some("true")
+    );
 
     println!("=== Simplified NLHE Abstract Betting Tree Sizing ===");
     let cap_desc = if raise_cap == u32::MAX {
@@ -361,7 +384,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         raise_cap.to_string()
     };
-    println!("RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {NODE_CAP}   RAISE_CAP = {cap_desc}");
+    println!(
+        "RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {NODE_CAP}   RAISE_CAP = {cap_desc}   FIRST_SMALL = {first_small}"
+    );
     println!();
 
     // (1) HU self-check：复现 240,096 节点 / 119.7M infoset（验证 refactor 没改计数）。
@@ -372,8 +397,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
         let cfg = TableConfig::default_hu_200bb();
         let start = std::time::Instant::now();
-        // HU self-check 永远不加 cap，守住 240,096 节点 / 119.7M 这个 refactor 不变量。
-        let stats = measure(&cfg, [R3, R3, R3, R3], &hu, u32::MAX);
+        // HU self-check 永远不加 cap / 不加 first-small，守住 240,096 节点 / 119.7M 这个不变量。
+        let stats = measure(&cfg, [R3, R3, R3, R3], &hu, u32::MAX, false);
         print_stats(
             "HU self-check (期望 240,096 节点 / 119.7M)",
             &ratios_desc([R3, R3, R3, R3]),
@@ -390,14 +415,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             postflop: postflop_buckets,
         };
         let cfg = TableConfig::default_6max_100bb();
+        // FIRST_SMALL 时 per-street 固定 preflop{1.0} / postflop{0.5,1.0} + drop Raise{0.5}；
+        // 否则沿用 argv raise 集（全街同集）。
+        const PRE1: &[f64] = &[1.0];
+        const POST05_1: &[f64] = &[0.5, 1.0];
         let r: &[f64] = &six_ratios;
-        let label = format!(
-            "6-max 100BB / {} bet size(s) / preflop 169 / postflop {postflop_buckets} / raise_cap {cap_desc}",
-            six_ratios.len()
-        );
+        let per_street: [&[f64]; 4] = if first_small {
+            [PRE1, POST05_1, POST05_1, POST05_1]
+        } else {
+            [r, r, r, r]
+        };
+        let label = if first_small {
+            format!(
+                "6-max 100BB / preflop{{1.0}} postflop{{0.5,1.0}} first-bet-small / preflop 169 / postflop {postflop_buckets} / raise_cap {cap_desc}"
+            )
+        } else {
+            format!(
+                "6-max 100BB / {} bet size(s) / preflop 169 / postflop {postflop_buckets} / raise_cap {cap_desc}",
+                six_ratios.len()
+            )
+        };
         let start = std::time::Instant::now();
-        let stats = measure(&cfg, [r, r, r, r], &six, raise_cap);
-        print_stats(&label, &ratios_desc([r, r, r, r]), &stats, &six);
+        let stats = measure(&cfg, per_street, &six, raise_cap, first_small);
+        print_stats(&label, &ratios_desc(per_street), &stats, &six);
         println!("walk wall time  : {:.3}s\n", start.elapsed().as_secs_f64());
     }
 
