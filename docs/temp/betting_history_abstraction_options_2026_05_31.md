@@ -144,18 +144,37 @@ re-raise，只要落进同一 `(SPR 桶, 面对尺寸桶, 本街加注结构, ..
 **位预算**：下注摘要 = 3+6+2+3+4+6 = **24 bit**，装进 v2 弃用的 `position(4)+stack(4)+betting_state(3)`+reserved 26
 = 37 bit 可用；全 key（含 `bucket_id` 24 + `street_tag` 3）≤ 51 bit < 64，富余。
 
-**key 空间 / infoset 估算（量级，待 sizing 工具实测坐实；定稿字段比初版更富，规模上移）**
+**key 空间 / infoset 实测（2026-05-31，vultr `9ddf6b3`，`nlhe_betting_tree_sizing` 加 `B3_SUMMARY` 探针，
+postflop 500）**
 
-- 定稿字段（bitmask `live_players` + 2 槽相对-button `last_aggressor`）的**原始**笛卡尔积比初版大不少（单街粗估
-  `6 × ~30(actor×在场集) × 4 × 5 × 12 × ~20(2 槽 aggressor) ≈ 10⁵–10⁶/街`）；但硬约束狠砍可达集：`actor⊂live`、
-  aggressor 必属当街在场、无活注 ⇒ `raises=0`、底池小 ⇒ SPR 不可能极高。
-- **HU（首个验证目标）极小**：`live_players` 恒满、aggressor 槽各 1 bit、actor 0..1 → 下注 key 仅几百~几千/街，
-  dense 两表必然 ≪ 1 GiB，先在 HU 上把不变量 + 收敛质量验明白。
-- **6-max 是真问题**：bitmask + 2 槽是"保真度换大小"的两个旋钮，把 key 空间推向大端，**6-max 绝对规模必须实测**
-  才能断言能否进 64 GiB 小机——这正是当初警告的"滑向完美回忆"的代价，不再给初版那个乐观的 ~1600 万 infoset 单点估计。
-- 不变的定性结论：key 空间**有界且与 bet-size 菜单几乎无关**（`{0.5,1.0}` 只把 SPR/尺寸桶填密，不像树那样组合
-  爆炸），故 B3 下 `{0.5,1.0}` **不再像 node_id 那样 ≥645 GiB**；"具体几 GiB / 进不进小机"是 6-max 实测题
-  （待办 c）。这是 B3 相对 A3（首选但要 ~512 GB 大机）的根本方向——**有望小机保住小注尺寸，量级待坐实**。
+把估算变成了数字。探针在现成 walk 里逐决策节点算上表的摘要 key，数 distinct key / B3 infoset / B3 dense 两表，
+并断言"同 key 节点 `legal_actions` 一致"。两种 key：**纯字段**（暴露不变量）vs **pin 动作集**
+（`B3_PIN_ACTIONS=1`，把合法动作集签名折进 key 高位 = 下方「修法」）。node_id 基线同跑（postflop 500，故比 §S2 的
+postflop 200 大 ~2.5×）：
+
+| raise 集 | node_id infoset / 两表 | B3 distinct key（纯/pin） | B3 infoset / 两表（pin） | 压缩 | 纯字段不变量 |
+|---|---|---|---|---|---|
+| `{1.0}` | 2307.5M / 71.98 GiB | 116,908 / 120,643 | 58.71M / **2.28 GiB** | 39× | ✗ 19,457 |
+| `{1.0,2.0}` | 4939.4M / 153.16 GiB | 145,502 / 150,370 | 72.86M / **3.04 GiB** | 68× | ✗ 28,032 |
+| `{0.5,1.0}` † | ≥49,654M / ≥1603 GiB | 172,352 / ≥197,432 | ≥96.50M / **≥4.86 GiB** | 515× | ✗ 1,016,860 |
+| HU self-check | 119.7M / 4.62 GiB | 1,616 | 0.79M / 0.05 GiB | 152× | ✗ 8,624 |
+
+† `{0.5,1.0}` node 枚举撞 `NODE_CAP=100M`（树 >1 亿节点），故该行 node_id 与 B3 都是**下界**；但 key 空间有界、
+应已近饱和。
+
+**两条结论（坐实了 §B3 的核心论点）**：
+
+1. **B3 的命门成立——key 空间有界且几乎与 bet-size 菜单无关**。distinct key 三档全是 ~10⁵（117K/146K/172K），而
+   node_id 树从 469 万节点炸到 ≥1 亿（≥21×）：`{0.5,1.0}` 的 key 只比 `{1.0}` 多 ~1.5×，**不是 ~21×**。那个原本
+   ≥1603 GiB（≥645 见 §S2 postflop 200）单机无解的 `{0.5,1.0}`，**B3 下 ~4.9 GiB 两表稳进 64 GiB 小机**——B3 把
+   小注的组合爆炸直接化解。压缩比 39–515×，档越多/越小压得越狠。这就是 B3 相对 A3（首选但要 ~512 GB 大机）的根本好处。
+2. **纯字段 key 不足以决定合法动作集（不变量被破，必须修）**。三档都出现"同 key 不同 `legal_actions`"（`{1.0}`
+   1.9 万次 / `{0.5,1.0}` 100 万次）。病根：`facing_size_bucket`/`spr_bucket` 把"sized raise 还构造得出吗"这个精确
+   筹码边界抹平了，落同桶的两个节点一个能 raise、一个只能 call/fold/allin → 合法动作集不同 → 重蹈 F17（regret 槽
+   错位）。**生产修法 = key 必须含合法动作集信息**（`B3_PIN_ACTIONS` 把 `action_sig` 折进 key）。代价**几乎为零**：
+   pin 后 key 只多 ~3%（`{1.0}` 120,643 vs 116,908；`{0.5,1.0}` +15%），不变量按构造成立——说明动作集本就几乎被字段
+   决定，违规只在少量边界 key。**字段表（上）须再加一项 `legal_action_set_id`**（由 `state.legal_actions()` 派生的
+   几 bit），否则 dense stride 与 regret 槽无法对齐。
 
 **与 InfoSetId 打包的改动面**
 
@@ -239,10 +258,14 @@ node_id，而把 stage-2 设计的 `position_bucket`(4)/`stack_bucket`(4)/`betti
   key；关键不变量 = key 必须决定合法动作集，否则重蹈 F17）。
   （A1 既已证救不动小注，(b) 的有损摘要从"可选"升为"想保留小注就必需"；若走"弃小注 + 大档 + A1"
   路线则可暂不做 (b)。）
-- (c) **实测 B3 key 空间**（把 §B3 估算坐实）：在 `tools/nlhe_betting_tree_sizing` 复用现成 `walk`，每访问一个
-  tree 节点算 `betting_summary_key`，用 HashSet 数 distinct `(summary_key, street)` 与 infoset 数；对
-  `{1.0}` / `{1.0,2.0}` / `{0.5,1.0}` 各跑一遍。同时断言"同 key 节点 `legal_actions` 一致"（验不变量 3）。
-  这是把"设计"变"数字"的最小实验，不动训练路径。
+- (c) ✅ **已做**（2026-05-31，见 §B3「key 空间 / infoset 实测」，`B3_SUMMARY` 探针 commit `9ddf6b3`）：
+  distinct key 三档全 ~10⁵、与档数几乎无关，`{0.5,1.0}` ≥1603 GiB → ~4.9 GiB 进小机（命门成立）；但纯字段 key
+  不变量被破（同 key 不同 `legal_actions`），修法 = key 加 `legal_action_set_id`（`B3_PIN_ACTIONS` 验证，pin 后
+  规模只 +3~15%、不变量按构造成立）。
+- (d) **下一步**：把 `legal_action_set_id` 正式列入字段表（已在 §B3 标注），并跑**真正放开** `{0.5,1.0}` 的
+  key 饱和确认（现是 `NODE_CAP=100M` 下界）——可加"连续 N 万节点无新 key 即判饱和"早停，或临时抬高
+  `NODE_CAP`。然后才谈把 B3 接进 `pack_info_set` / dense indexer 的实现（§B3 改动面）+ HU 上 exploitability/LBR
+  对 `{1.0}` perfect-recall baseline 验质量（imperfect recall 收敛无保证，须实测裁定）。
 
 ## 参考
 
