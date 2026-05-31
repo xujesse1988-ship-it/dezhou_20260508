@@ -296,6 +296,9 @@ fn is_aggression_for_aggressor(a: &AbstractAction) -> bool {
 /// {1.0} 时该过滤天然不触发（无 0.5），只在 postflop {0.5,1.0} 处生效。与
 /// `raise_cap` 可叠加。
 /// `b3_summary`：开 B3 摘要 key 探针（见文件头）。
+/// `b3_pin_actions`：把合法动作集签名折进 B3 key（bits 26+）。不开时 key 只含字段元组，
+/// 用于暴露"字段是否足以决定合法动作集"（不变量校验）；开时 key 按构造决定动作集
+/// （生产修法：dense stride 要求同 key 同动作集），测的是修法后的真实有界规模。
 /// 递归过程中不变的配置（打包以免 `walk` 参数过多）。
 struct WalkCfg<'a> {
     abs_by_street: &'a [DefaultActionAbstraction; 4],
@@ -303,6 +306,7 @@ struct WalkCfg<'a> {
     raise_cap: u32,
     drop_small_reraise: bool,
     b3_summary: bool,
+    b3_pin_actions: bool,
 }
 
 fn walk(
@@ -372,8 +376,15 @@ fn walk(
 
     // B3 摘要 key：用本节点 incoming 状态（aggr 反映到达此节点前的攻击）。
     if cfg.b3_summary {
-        let key = b3_key(state, actor, street, raises_on_street, aggr);
-        stats.record_b3(key, action_sig(&actions), actions.len() as u32);
+        let sig = action_sig(&actions);
+        let mut key = b3_key(state, actor, street, raises_on_street, aggr);
+        if cfg.b3_pin_actions {
+            // 把合法动作集签名折进高位（生产修法：key 必须决定动作集，否则 dense
+            // stride 与 regret 槽错位 = F17）。此后 record_b3 的不变量恒成立，
+            // distinct key 数即修法后的真实规模。
+            key |= sig << 26;
+        }
+        stats.record_b3(key, sig, actions.len() as u32);
     }
 
     for action in actions {
@@ -416,7 +427,7 @@ fn make_abs(raise_ratios: &[f64]) -> DefaultActionAbstraction {
 /// `per_street` = [preflop, flop, turn, river] 各自的 raise ratio 集合。
 /// `raise_cap` = 每街 (Bet+Raise) 聚合上限（`u32::MAX` = 无 cap）。
 /// `drop_small_reraise` = first-bet-small 规则（见 `walk`）。
-/// `b3_summary` = 开 B3 摘要 key 探针。
+/// `b3_summary` = 开 B3 摘要 key 探针；`b3_pin_actions` = 把动作集签名折进 key。
 fn measure(
     table_cfg: &TableConfig,
     per_street: [&[f64]; 4],
@@ -424,6 +435,7 @@ fn measure(
     raise_cap: u32,
     drop_small_reraise: bool,
     b3_summary: bool,
+    b3_pin_actions: bool,
 ) -> Stats {
     let abs_by_street = [
         make_abs(per_street[0]),
@@ -440,6 +452,7 @@ fn measure(
         raise_cap,
         drop_small_reraise,
         b3_summary,
+        b3_pin_actions,
     };
     let mut stats = Stats::default();
     walk(&state, 0, 0, Aggr::default(), &cfg, &mut stats);
@@ -673,6 +686,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("B3_SUMMARY").ok().as_deref(),
         Some("1") | Some("true")
     );
+    // B3_PIN_ACTIONS=1：把合法动作集签名折进 B3 key（生产修法）。需同时 B3_SUMMARY=1。
+    // 关时暴露"字段是否足以决定动作集"（不变量校验）；开时测修法后真实有界规模。
+    let b3_pin_actions: bool = matches!(
+        std::env::var("B3_PIN_ACTIONS").ok().as_deref(),
+        Some("1") | Some("true")
+    );
 
     println!("=== Simplified NLHE Abstract Betting Tree Sizing ===");
     let cap_desc = if raise_cap == u32::MAX {
@@ -681,7 +700,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         raise_cap.to_string()
     };
     println!(
-        "RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {NODE_CAP}   RAISE_CAP = {cap_desc}   FIRST_SMALL = {first_small}   B3_SUMMARY = {b3_summary}"
+        "RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {NODE_CAP}   RAISE_CAP = {cap_desc}   FIRST_SMALL = {first_small}   B3_SUMMARY = {b3_summary}   B3_PIN_ACTIONS = {b3_pin_actions}"
     );
     println!();
 
@@ -695,7 +714,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let start = std::time::Instant::now();
         // HU self-check 永远不加 cap / 不加 first-small，守住 240,096 节点 / 119.7M 这个不变量。
         // B3 探针随 flag 开关（不影响 node 计数，只多算摘要 key）。
-        let stats = measure(&cfg, [R3, R3, R3, R3], &hu, u32::MAX, false, b3_summary);
+        let stats = measure(
+            &cfg,
+            [R3, R3, R3, R3],
+            &hu,
+            u32::MAX,
+            false,
+            b3_summary,
+            b3_pin_actions,
+        );
         print_stats(
             "HU self-check (期望 240,096 节点 / 119.7M)",
             &ratios_desc([R3, R3, R3, R3]),
@@ -733,7 +760,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
         };
         let start = std::time::Instant::now();
-        let stats = measure(&cfg, per_street, &six, raise_cap, first_small, b3_summary);
+        let stats = measure(
+            &cfg,
+            per_street,
+            &six,
+            raise_cap,
+            first_small,
+            b3_summary,
+            b3_pin_actions,
+        );
         print_stats(&label, &ratios_desc(per_street), &stats, &six);
         println!("walk wall time  : {:.3}s\n", start.elapsed().as_secs_f64());
     }
