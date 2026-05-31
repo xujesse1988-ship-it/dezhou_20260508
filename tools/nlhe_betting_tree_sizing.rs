@@ -25,8 +25,8 @@ use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use poker::{
-    ActionAbstraction, ActionAbstractionConfig, ChaCha20Rng, DefaultActionAbstraction, GameState,
-    RngSource, TableConfig,
+    AbstractAction, ActionAbstraction, ActionAbstractionConfig, ChaCha20Rng,
+    DefaultActionAbstraction, GameState, RngSource, TableConfig,
 };
 
 const WALK_SEED: u64 = 0x4E4C_4845_5F53_5A4E; // "NLHE_SZN"
@@ -83,9 +83,17 @@ impl Stats {
     }
 }
 
+/// A1 raise cap（每街 (Bet+Raise) 聚合上限）：`raises_on_street` 是到达本节点前
+/// 本街已发生的 voluntary 进攻动作（`Bet` + `Raise`，对齐 `BettingState` 的
+/// `FacingBetNoRaise`/`FacingRaise{1,2,3+}` 计数）次数。到达 `raise_cap` 后，
+/// 本节点合法集里只留 `Fold/Check/Call/AllIn`——`AllIn` 始终保留（escape hatch，
+/// 不计入 cap），砍掉的只是 sized `Bet`/`Raise` 这条组合爆炸链。`raise_cap = u32::MAX`
+/// 等价无 cap（与历史行为逐字节一致，见 run() 的 huge-cap self-check）。
 fn walk(
     state: &GameState,
     depth: u32,
+    raises_on_street: u32,
+    raise_cap: u32,
     stats: &mut Stats,
     abs_by_street: &[DefaultActionAbstraction; 4],
     buckets: &BucketCounts,
@@ -117,21 +125,48 @@ fn walk(
     let abs = &abs_by_street[street as usize];
     let legal_set = abs.abstract_actions(state);
 
+    // A1 raise cap：本街进攻数到顶后剔除 sized Bet/Raise，仅留 Fold/Check/Call/AllIn。
+    let cap_reached = raises_on_street >= raise_cap;
+    let is_aggressive =
+        |a: &AbstractAction| matches!(a, AbstractAction::Bet { .. } | AbstractAction::Raise { .. });
+    let actions: Vec<AbstractAction> = legal_set
+        .iter()
+        .copied()
+        .filter(|a| !(cap_reached && is_aggressive(a)))
+        .collect();
+
     // dense 布局累加：本节点贡献 bucket_count 行、bucket_count × action_count 个 slot。
-    let action_count = legal_set.len() as u64;
+    let action_count = actions.len() as u64;
     let rows = buckets.for_street(street);
     stats.total_rows += rows;
     stats.total_slots += rows * action_count;
     *stats.per_street_rows.entry(street).or_default() += rows;
     *stats.per_street_slots.entry(street).or_default() += rows * action_count;
-    *stats.action_count_hist.entry(legal_set.len()).or_default() += 1;
+    *stats.action_count_hist.entry(actions.len()).or_default() += 1;
 
-    for action in legal_set.iter().copied() {
+    for action in actions {
         let mut next_state = state.clone();
         next_state
             .apply(action.to_concrete())
             .expect("DefaultActionAbstraction must emit legal actions");
-        walk(&next_state, depth + 1, stats, abs_by_street, buckets);
+        // 街切换则进攻计数清零；否则 Bet/Raise +1，其它（Call/Check/AllIn）不变。
+        let next_street = next_state.street() as u8;
+        let next_raises = if next_street != street {
+            0
+        } else if is_aggressive(&action) {
+            raises_on_street + 1
+        } else {
+            raises_on_street
+        };
+        walk(
+            &next_state,
+            depth + 1,
+            next_raises,
+            raise_cap,
+            stats,
+            abs_by_street,
+            buckets,
+        );
         if stats.capped {
             return;
         }
@@ -145,7 +180,13 @@ fn make_abs(raise_ratios: &[f64]) -> DefaultActionAbstraction {
 }
 
 /// `per_street` = [preflop, flop, turn, river] 各自的 raise ratio 集合。
-fn measure(table_cfg: &TableConfig, per_street: [&[f64]; 4], buckets: &BucketCounts) -> Stats {
+/// `raise_cap` = 每街 (Bet+Raise) 聚合上限（`u32::MAX` = 无 cap）。
+fn measure(
+    table_cfg: &TableConfig,
+    per_street: [&[f64]; 4],
+    buckets: &BucketCounts,
+    raise_cap: u32,
+) -> Stats {
     let abs_by_street = [
         make_abs(per_street[0]),
         make_abs(per_street[1]),
@@ -156,7 +197,7 @@ fn measure(table_cfg: &TableConfig, per_street: [&[f64]; 4], buckets: &BucketCou
     let state = GameState::with_rng(table_cfg, 0, &mut rng as &mut dyn RngSource);
 
     let mut stats = Stats::default();
-    walk(&state, 0, &mut stats, &abs_by_street, buckets);
+    walk(&state, 0, 0, raise_cap, &mut stats, &abs_by_street, buckets);
     stats
 }
 
@@ -305,9 +346,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()
         .map_err(|e| format!("XV_POSTFLOP 不是 u64: {e}"))?
         .unwrap_or(200);
+    // A1 raise cap：每街 (Bet+Raise) 聚合上限。env 不设 = 无 cap（u32::MAX）。
+    // 例：RAISE_CAP=2 cargo run ... -- 0.5 1.0  →  含 0.5pot 小注但每街最多 2 次进攻。
+    let raise_cap: u32 = std::env::var("RAISE_CAP")
+        .ok()
+        .map(|s| s.parse::<u32>())
+        .transpose()
+        .map_err(|e| format!("RAISE_CAP 不是 u32: {e}"))?
+        .unwrap_or(u32::MAX);
 
     println!("=== Simplified NLHE Abstract Betting Tree Sizing ===");
-    println!("RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {NODE_CAP}");
+    let cap_desc = if raise_cap == u32::MAX {
+        "none".to_string()
+    } else {
+        raise_cap.to_string()
+    };
+    println!("RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {NODE_CAP}   RAISE_CAP = {cap_desc}");
     println!();
 
     // (1) HU self-check：复现 240,096 节点 / 119.7M infoset（验证 refactor 没改计数）。
@@ -318,7 +372,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
         let cfg = TableConfig::default_hu_200bb();
         let start = std::time::Instant::now();
-        let stats = measure(&cfg, [R3, R3, R3, R3], &hu);
+        // HU self-check 永远不加 cap，守住 240,096 节点 / 119.7M 这个 refactor 不变量。
+        let stats = measure(&cfg, [R3, R3, R3, R3], &hu, u32::MAX);
         print_stats(
             "HU self-check (期望 240,096 节点 / 119.7M)",
             &ratios_desc([R3, R3, R3, R3]),
@@ -337,11 +392,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let cfg = TableConfig::default_6max_100bb();
         let r: &[f64] = &six_ratios;
         let label = format!(
-            "6-max 100BB / {} bet size(s) / preflop 169 / postflop {postflop_buckets}",
+            "6-max 100BB / {} bet size(s) / preflop 169 / postflop {postflop_buckets} / raise_cap {cap_desc}",
             six_ratios.len()
         );
         let start = std::time::Instant::now();
-        let stats = measure(&cfg, [r, r, r, r], &six);
+        let stats = measure(&cfg, [r, r, r, r], &six, raise_cap);
         print_stats(&label, &ratios_desc([r, r, r, r]), &stats, &six);
         println!("walk wall time  : {:.3}s\n", start.elapsed().as_secs_f64());
     }
