@@ -17,10 +17,13 @@
 > **2026-05-31 Phase 0 已跑完更新**（vultr `eeba801`，§待办 e/f/g 五 probe，详见 §A4/§A3/§B3 实测 +
 > 文末「对我们最对症的组合」决策表）：① **B3 进 64 GiB 现为精确结论**——全 `{0.5,1}` 树精确枚举 287.86M
 > 节点 → B3 distinct key **307,951** / dense **7.61 GiB**（~8× 余量），原"未饱和下界"作废。② **lossless
-> 进 64 GiB 无现成单杠杆**：width cap N=2 复现 ~20×（24.5×）但仍 74 GiB（进 96 不进 64），turn/river-小注
-> 105 GiB，first-small 224 GiB，**full lossless 连 512 GB 都不够**（1820 GiB@200）。③ **要小机保多路小注 →
-> 只能 B3**（lossy）。④ **reached-set 仍未真测**（uniform 采样 ≠ 收敛 reached、且漏 65% 稀有 key，需真
-> 6-max trainer）。
+> 进 64 GiB 无现成*单*杠杆**：width cap N=2 复现 ~20×（24.5×）但仍 74 GiB（进 96 不进 64），turn/river-小注
+> 105 GiB，first-small 224 GiB，**full lossless 连 512 GB 都不够**（1820 GiB@200）。③ **但 A3×A4 双杠杆叠加
+> = 首个进 64 GiB 的 perfect-recall 小注路**（first-small × width cap，无需改代码）：N=2 **2.96** / N=3 **18.20
+> GiB@200**（@500 6.52 / 44.63），super-multiplicative（649× > 8.2×24.5），顺手把 A3 单用 7.02B infoset 的训练-
+> wall 砍到 85–541M，详见 §A3×A4——**"要小机只能 B3"被推翻**（B3 = 改 recall 保全游戏；A3×A4 = 改游戏保全
+> recall，二选一）。④ **reached-set 仍未真测**（uniform 采样 ≠ 收敛 reached、且漏 65% 稀有 key，需真 6-max
+> trainer）。
 
 ## 0. 当前做法 = 显式 betting tree（完美回忆）
 
@@ -219,8 +222,65 @@ drop 版 = 剪掉 preflop 后 `live(Active∪AllIn) > N` 的节点连子树）**
   几何在 3-way 仍在（印证 §A3「病根是底池几何不是 re-raise」：N=3 砍不动那套几何）。
 - **绝对量仍超 64**：即便最狠的 N=2，postflop 200 下仍 **74.21 GiB > 64**（lossless `{0.5,1}` 基线 ~1820 GiB@200
   / 4519 GiB@500 太大，24× 不够）。**落进 96 GiB**（lossless，但 heads-up 后续街是重度改游戏、丢全部多路）。
-- **要 lossless 进 64**：须叠加（N=2 + §A1 raise-cap、或更少 postflop 桶、或 N=2 @ 更小 profile）。74.21 极近 64，
-  小幅叠加即可清掉。**B3 不受此限**：width 任意档 B3 都 0.2–1 GiB（见上表）。
+- **要 lossless 进 64**：须叠加。**§A3×A4 已实测做到**（first-small × width cap，见下）：N=2 = 2.96 GiB、
+  N=3 = 18.20 GiB@200，远进 64。其它叠法（N=2 + §A1 raise-cap、更少 postflop 桶、N=2 @ 更小 profile）同向。
+  **B3 不受此限**：width 任意档 B3 都 0.2–1 GiB（见上表）。
+
+### A3×A4 — first-bet-small + width cap 叠加（2026-05-31 实测）— **首个进 64 GiB 的 perfect-recall 小注路**
+
+§A4 末尾留的"要 lossless 进 64 须叠加"——本节把叠加项落到 **§A3 first-bet-small × §A4 width cap**。两者是
+`walk` 里两个正交 flag（A3 = `drop_small_reraise` 禁 `Raise{0.5}`；A4 = `width_cap`，postflop 只许 ≤N 人在场），
+**无需改代码即叠加**。基线逐字节复现（first_small 单用 35,129,484 节点 / 224.58 GiB = §A3；WIDTH_CAP=2 单用
+11,726,438 / 74.21 GiB = §A4），故组合数可信。
+
+**实测（vultr `eeba801`，6-max 100BB，全 `{0.5,1}`，width cap = drop 版 / §A4 口径，preflop 169）**：
+
+| 配置（`{0.5,1}`） | 决策节点 | max depth | 两表@200 | 两表@500 | 进 64? | vs 全树 |
+|---|---|---|---|---|---|---|
+| 全树（无限制） | 287.86M | 43 | 1820 GiB | 4519 GiB | ✗ | 1× |
+| A3 first_small 单用 | 35.13M | 43 | 224.58 GiB | — | ✗ | 8.2× |
+| A3 turn_river_small 单用 | 16.38M | — | 105.08 GiB | — | ✗ | 17.6× |
+| A4 WIDTH_CAP=3 单用 | 47.72M | — | 307.72 GiB | — | ✗ | 6.0× |
+| A4 WIDTH_CAP=2 单用 | 11.73M | 27 | 74.21 GiB | — | ✗(进96) | 24.5× |
+| **first_small + WIDTH_CAP=3** | **2.72M** | 26 | **18.20 GiB** | **44.63 GiB** | **✅** | **105.7×** |
+| **first_small + WIDTH_CAP=2** | **0.444M** | 22 | **2.96 GiB** | **6.52 GiB** | **✅** | **649×** |
+| **turn_river_small + WIDTH_CAP=3** | **1.65M** | 26 | **10.88 GiB** | **26.32 GiB** | **✅** | **174.8×** |
+| **turn_river_small + WIDTH_CAP=2** | **0.328M** | 22 | **2.13 GiB** | **4.44 GiB** | **✅** | **876×** |
+
+（@200/@500 = postflop 桶数，节点数与桶数无关。infoset@200：first_small+N=2 = **85.4M**、+N=3 = **541.2M**、
+turn_river+N=2 = 62.4M、+N=3 = 326.1M。）
+
+**三条结论**：
+
+1. **叠加是协同（super-multiplicative），不止正交**。单用 A3 = 8.2×、单用 A4(N=2) = 24.5×，若独立则积 = 200×；
+   实测 first_small+N=2 = **649× > 200×**。机理 = 两杠杆的"幸存线"各自集中在对方主攻的维度：A4 留下的 heads-up
+   线恰是 `{0.5,1}` 深 re-raise 战（A4-N=2 单用 depth 仍 27），正是 A3 砍得最狠的；A3 留下的 35M 线恰是小底池
+   多路续局（A3 单用 depth 仍 43），正是 A4 砍得最狠的。depth 印证：first_small+N=2 = **22 < 两个单用（43 / 27）**。
+
+2. **这是第一条把 perfect-recall `{0.5,1}`（保小注）塞进 64 GiB 的路**，填上 §A4「lossless 进 64 无现成*单*
+   杠杆」的缺口。最省的 N=2 仅 **2.96 GiB@200 / 6.52 GiB@500**（21× / 9.8× 余量）；**更值得看 N=3**——保 ≤3-way
+   多路（非强制 heads-up）+ 双档小注 + perfect recall，**18.20 GiB@200 / 44.63 GiB@500 仍进 64**。注意这**不是
+   "lossless 全 6-max"**：A4 改游戏（postflop ≤N-way、丢 4+ 路），A3 限菜单（0.5 只开池不 re-raise）；但
+   **recall 完整**（node_id 不合并）→ 保留 perfect-recall 的 **no-regret / regret-bound by construction**（非
+   Nash——6-max 一般和本无 Nash 保证，见 §A3【验证纠正】），与 B3（imperfect recall，regret bound 仅在分桶恰好
+   CRSWF 时成立、F17 那 ~100 万违例即脆弱证据）是两类不同的"有损"。
+
+3. **顺手解掉 A3 单用的训练-wall 病**。§A3 记 first-small 单用 infoset 7.02B（≈ `{1.0}` 全多路 933.9M 的
+   7.5×），wall 是真瓶颈；叠 width cap 后 infoset 暴跌到 **85.4M(N=2) / 541.2M(N=3)@200，反而 < 单档 `{1.0}`
+   的 933.9M**——因 6-max infoset 主体是多路 width 不是 bet-size 菜单（再次印证 §A4「病根是 width」）。内存与
+   wall 一并解决，(h)② VR-MCCFR 对这条路不再是必需。
+
+**取舍 / 待验**：
+- **改游戏程度**：N=2 = 强制 heads-up 后续街（丢全部多路，重度失真）；N=3 = max 3-way（保 3-way，失真小得多）
+  → N=3 是"保多路 + 进 64 + perfect recall"的甜点。先量"≤N-way 丢多少 EV"再定 N（§A4 同款待验）。
+- **drop 版偏差**：width cap 用 drop 版（postflop 剪 >N-way 子树、preflop 全枚举）；真 capped 博弈（重定向第
+  (N+1) 进场者于 preflop fold）规模与此有偏差（preflop 枚举范围 + postflop 重定向，方向本文不复证）。N=2
+  （≥9.8× 余量）、N=3@200（3.5× 余量）对偏差稳健；唯 **N=3@500（44.63 GiB / 1.4× 余量）敏感**——若在 @500 用
+  N=3，须先实现 redirect 版精确量、或退到 N=2 / 用 @200。
+- **vs B3 决策**：进 64 现有两条路——**B3**（不改游戏 / 改 recall，7.61 GiB@500，但 imperfect-recall 收敛风险
+  + F17 + InfoSetId 重写）vs **A3×A4**（改游戏 / 不改 recall，N=3 44.63 GiB@500，无收敛风险，代码改动最小 =
+  legal_actions 加 width + menu 过滤，探针已实现）。**"要小机只能 B3"不再成立**——选哪条 = 选"改 recall 保全
+  游戏"(B3) vs "改游戏保全 recall"(A3×A4)。
 
 ## B. 有损削减（用摘要替代完整序列 = 把信息抽象用在下注历史上）
 
@@ -419,21 +479,29 @@ enumerated 上界从没量 reached（§A3/§盲点 2）、小注 EV 小且集中
   | first-bet-small（§A3） | 224.58 GiB@200 | ✗ | ✗ | 1.57 GiB ✅ |
   | turn/river-小注（§A3 对偶） | 105.08 GiB@200 | ✗ | ✗ | 1.35 GiB ✅ |
   | WIDTH_CAP=2（heads-up 后续街） | **74.21 GiB@200** | ✗(差一点) | ✅ | 0.23 GiB ✅ |
+  | **A3×A4: first-small + N=3**（§A3×A4） | **18.20 GiB@200 / 44.63@500** | **✅** | ✅ | — |
+  | **A3×A4: first-small + N=2** | **2.96 GiB@200 / 6.52@500** | **✅** | ✅ | — |
+  | **A3×A4: turn/river-small + N=2** | **2.13 GiB@200 / 4.44@500** | **✅** | ✅ | — |
 
-  - **lossless 进 64 GiB：无现成单杠杆**。最接近 = WIDTH_CAP=2（74 GiB，进 96，但重度改游戏丢全部多路）；
-    要进 64 须叠（N=2 + raise-cap / 更少桶）。**full lossless `{0.5,1}` 连 512 GB 都不够**（1820 GiB@200）——
-    必须限制（first-small / width / turn-river）或走 B3。
-  - **B3 进 64 GiB：精确坐实**（307,951 key / 7.61 GiB@500，~8× 余量），是唯一不改游戏又进小机的路。
+  - **perfect-recall 进 64 GiB：无单*杠杆*，但 A3×A4 双杠杆做到了**（§A3×A4）。单杠杆最接近 = WIDTH_CAP=2
+    （74 GiB，进 96，重度改游戏丢全部多路）；叠上 §A3 first-small 后 = N=2 **2.96**/ N=3 **18.20 GiB@200**
+    （@500 6.52 / 44.63）——**进 64 且 perfect recall**，代价 = A4 改游戏（postflop ≤N-way）+ A3 限菜单
+    （0.5 不 re-raise）。**不改游戏-不限菜单**的 full lossless `{0.5,1}` 仍连 512 GB 都不够（1820 GiB@200）——
+    那条必须 B3 或大机。
+  - **B3 进 64 GiB：精确坐实**（307,951 key / 7.61 GiB@500，~8× 余量），是唯一**不改游戏**又进小机的路
+    （代价 = imperfect recall / 收敛无保证）。
   - **reached-set 仍未真测**（uniform 采样 ≠ 收敛 reached，且 B3 采样漏 65% 稀有 key）；Pluribus-62% 那个数
     要等真 6-max trainer（`nlhe.rs` `n_seats=2` 未接），见「reached 未闭」。
 - **Phase 1（据 Phase 0 选路，已收窄）**：
-  - **要小机（64 GiB）+ 保多路小注 → 只能 B3**（lossy；唯一进 64 的无-改游戏路）。重设计 = A2 exact-key +
-    last_aggressor + `capped` 位 + `legal_action_set_id` pin，**先在 HU 零和管线验**（exploitability/LBR 在那才
-    有牙齿），再上 6-max。无损路线在 64 GiB 已被 Phase 0 否掉（无单杠杆够）。
-  - **要 lossless + 有 96 GiB 机 → WIDTH_CAP=2**（heads-up 后续街，74 GiB），但先量"强制 heads-up 后续街丢多少
-    EV"再定（重度改游戏）。
-  - **要 lossless 全多路 → 唯一可行 = first-bet-small / turn-river-small + ~256–512 GB 大机**（105–224 GiB），
-    full `{0.5,1}` 已确认连 512 GB 不够。
+  - **要小机（64 GiB）→ 两条路（"只能 B3"已被 §A3×A4 推翻）**：① **B3**（改 recall / 不改游戏；7.61 GiB@500，
+    唯一保全 4+ 路多路的进-64 路；代价 = imperfect-recall 收敛风险 + F17 + InfoSetId 重写；重设计 = A2 exact-key
+    + last_aggressor + `capped` + `legal_action_set_id` pin，先 HU 零和管线验 exploitability/LBR 再上 6-max）；
+    ② **A3×A4**（改游戏 / 不改 recall；N=3 44.63 GiB@500 / N=2 6.52 GiB@500，perfect-recall 无收敛风险，代码
+    改动最小 = legal_actions 加 width + menu 过滤，探针已实现；代价 = 丢 4+ 路 + 小 re-raise）。选哪条 = 选
+    "改 recall 保全游戏"(B3) vs "改游戏保全 recall"(A3×A4)。**不改游戏-不改 recall 的全 lossless 路在 64 GiB 仍
+    被 Phase 0 否掉**（full `{0.5,1}` 连 512 GB 不够）。
+  - **要 lossless 全多路（不限 width）→ 唯一可行 = first-bet-small / turn-river-small + ~256–512 GB 大机**
+    （105–224 GiB），full `{0.5,1}` 已确认连 512 GB 不够。若可接受 ≤3-way，§A3×A4 的 N=3 直接进 64（更省）。
 - **Phase 2（不论选哪条都做）**：`map_off_tree` 升 PHM；VR-MCCFR baselines 治训练 wall；A-loss 断言 +
   range-skew(KL/EMD) 实测把"有损"量成数字。
 
@@ -492,8 +560,15 @@ enumerated 上界从没量 reached（§A3/§盲点 2）、小注 EV 小且集中
   62% 也 ~1100–2800 GiB，仍无解——**所以 reached 未闭不影响 Phase 1 选 B3 的结论**。
 - (h) **【新】Phase 2 正交收益**：① `map_off_tree`（`action.rs:386` nearest-ratio stub）升 **pseudo-harmonic**
   （`f(x)=(B-x)(1+A)/((B-A)(1+x))`，正确 off-tree handler，但不压 key、不替代 key 决策）；② **VR-MCCFR
-  control-variate baselines** 治 A3 真瓶颈（训练 wall 7.5×，文档原称无解）；③ **A-loss recall 断言 +
-  range-skew(KL/EMD)** 把 B3"糊掉多少 range"量成训练前数字（用现成 `action_probs` 日志）。
+  control-variate baselines** 治 A3 真瓶颈（训练 wall 7.5×，文档原称无解；**注**：§A3×A4 的 width cap 已把
+  infoset 砍到 85–541M < `{1.0}` 933.9M，A3×A4 路线下 wall 已非瓶颈，② 仅对 full-multiway A3 必需）；③ **A-loss
+  recall 断言 + range-skew(KL/EMD)** 把 B3"糊掉多少 range"量成训练前数字（用现成 `action_probs` 日志）。
+- (i) ✅ **已做**（2026-05-31，vultr `eeba801`，§A3×A4 实测）：A3(first-small)×A4(width cap) 叠加 = **首个进
+  64 GiB 的 perfect-recall `{0.5,1}` 路**（N=2 2.96 / N=3 18.20 GiB@200；@500 6.52 / 44.63），叠加 super-
+  multiplicative（649× > 8.2×24.5 之积），且把 A3 单用 7.02B infoset 的训练-wall 砍到 85–541M。两 flag
+  （`drop_small_reraise` × `width_cap`）正交无需改代码，基线逐字节复现。**下一步候选**：① 实现 width-cap
+  **redirect 版**（当前 drop 版是近似，N=3@500 余量仅 1.4× 对此敏感）拿 capped 博弈精确规模；② 量"≤N-way 强制
+  出局丢多少 EV"定 N（N=3 保 3-way 是甜点）；③ 把 A3×A4 当 perfect-recall 候选与 B3 一起进 HU 验质量队列。
 
 ## 参考
 
