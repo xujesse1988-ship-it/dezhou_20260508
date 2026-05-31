@@ -13,6 +13,14 @@
 > 修正后的 bottom line：**别急着为 static A3 租 512 GB**；先跑 §待办 Phase 0 五个便宜 probe，
 > 很可能推翻"必须保小注 / 必须 512GB"前提。本文若干数字/框架已据验证纠正（A3 收敛框架、
 > B3 `{0.5,1}` GiB、Pluribus 内核、translation 定位），逐处标 `【验证纠正】`。
+>
+> **2026-05-31 Phase 0 已跑完更新**（vultr `eeba801`，§待办 e/f/g 五 probe，详见 §A4/§A3/§B3 实测 +
+> 文末「对我们最对症的组合」决策表）：① **B3 进 64 GiB 现为精确结论**——全 `{0.5,1}` 树精确枚举 287.86M
+> 节点 → B3 distinct key **307,951** / dense **7.61 GiB**（~8× 余量），原"未饱和下界"作废。② **lossless
+> 进 64 GiB 无现成单杠杆**：width cap N=2 复现 ~20×（24.5×）但仍 74 GiB（进 96 不进 64），turn/river-小注
+> 105 GiB，first-small 224 GiB，**full lossless 连 512 GB 都不够**（1820 GiB@200）。③ **要小机保多路小注 →
+> 只能 B3**（lossy）。④ **reached-set 仍未真测**（uniform 采样 ≠ 收敛 reached、且漏 65% 稀有 key，需真
+> 6-max trainer）。
 
 ## 0. 当前做法 = 显式 betting tree（完美回忆）
 
@@ -174,8 +182,13 @@ postflop `{0.5,1.0}` 但**只允许首次进攻（开池 `Bet`）打 0.5 或 1po
 - **可省的对偶杠杆**：小注 EV **集中在河牌**（终局、无再加注爆炸），故 **"0.5 只在 turn/river 开池"**
   能用零头树成本拿走大部分 EV——比"全街 0.5 开池"（现 224 GiB）更便宜。且 224 GiB 是 **enumerated 上界**，
   C5 lazy 下真正绑内存的是 **reached set**（Pluribus 62%），从没量过，见 §待办 (f)。
+  **实测对偶杠杆成立但仍超 64（2026-05-31，vultr `eeba801`，`MENU=turn_river_small`，postflop 200）**：
+  `preflop{1} flop{1} turn/river{0.5,1}`（0.5 仅 turn/river 开池）= **16.38M 节点 / 105.08 GiB**，比 first-bet-small
+  全街（35.13M / **224.58 GiB**，本次 `MENU=first_small` 逐字节复现 §A3 实测 = 菜单管线自洽）**便宜 2.1×**，
+  确实拿到"把 0.5 限在最值钱的后两街"的省。但 105 GiB 仍 > 64（perfect-recall），落 96–128 GiB 机或叠 width/cap。
+  **B3 下两者都 ~1.4–1.6 GiB**（turn_river_small 157,415 key / 1.351 GiB；first_small 178,430 key / 1.565 GiB）。
 
-### A4. Width cap（限制同时在场人数）— 新增（2026-05-31 调研，待 WIDTH_CAP 实测）
+### A4. Width cap（限制同时在场人数）— 新增（2026-05-31 调研 + 实测）
 
 **【填补盲点】爆炸的病根是 width（多路），但 A1/A2/A3 全是 depth 或单节点 encoding 杠杆，B3 是
 encoding——没有一个限制"同时在场人数"。** A4 直接砍宽度：preflop 后只允许 ≤N 人进入后续街（N=2/3），
@@ -187,8 +200,27 @@ encoding——没有一个限制"同时在场人数"。** A4 直接砍宽度：p
   仍共用合法动作集），否则重蹈 F17。
 - **取舍**：改了游戏（强制部分玩家出局）→ 对完整 6-max 博弈有损，但对"实战里 4+ 人打到河"这种罕见且
   策略价值低的线损失小；直击 A1 治不了的"6 人各自再加注"组合。
-- **待实测**：`nlhe_betting_tree_sizing` 加 `WIDTH_CAP` probe：枚举 `{0.5,1}` 但剪掉 preflop 后 >N 人在场的
-  节点，量 node/infoset/reached（§待办 (e)）。
+
+**实测（2026-05-31，vultr `eeba801`，`WIDTH_CAP=N` 探针；枚举 `{0.5,1}` 全街，preflop 169 / postflop 200，
+drop 版 = 剪掉 preflop 后 `live(Active∪AllIn) > N` 的节点连子树）**：
+
+| 配置 | 决策节点 | node_id dense 两表 | vs 全树（节点） | B3 distinct key(pin) | B3 dense 两表 |
+|---|---|---|---|---|---|
+| 全 `{0.5,1}` 无 cap | **287.86M**（精确，见 §B3 待办 g） | ~1820 GiB@200 / 4519 GiB@500 | 1× | 307,951（精确） | 7.61 GiB@500 |
+| WIDTH_CAP=3 | 47.72M | 307.72 GiB | 6.0× | 95,220 | 0.98 GiB@200 |
+| WIDTH_CAP=2 | 11.73M | **74.21 GiB** | **24.5×** | 22,815 | 0.23 GiB@200 |
+
+（全树 287.86M 节点 = §待办 g 的 `NODE_CAP=300M` 跑出的**精确枚举**，非下界；node_id dense@200 由实测
+@500=4519 GiB 按 postflop 200/500 折算 ~1820。width-cap 行 postflop 200 直测。）
+
+**结论 = width 确是病根之一、N=2 复现 ~20×，但单用救不动 lossless 64 GiB**：
+- **~20× 复现了**：WIDTH_CAP=2（postflop 只许 2 人在场 = 强制 heads-up 后续街）把 287.86M 节点砍到 11.73M
+  = **24.5×**，正落在 GTO Wizard ~20× 区间。但 N=3（max 3-way）只 **6.0×**——小注的"小底池→深筹码多路续局"
+  几何在 3-way 仍在（印证 §A3「病根是底池几何不是 re-raise」：N=3 砍不动那套几何）。
+- **绝对量仍超 64**：即便最狠的 N=2，postflop 200 下仍 **74.21 GiB > 64**（lossless `{0.5,1}` 基线 ~1820 GiB@200
+  / 4519 GiB@500 太大，24× 不够）。**落进 96 GiB**（lossless，但 heads-up 后续街是重度改游戏、丢全部多路）。
+- **要 lossless 进 64**：须叠加（N=2 + §A1 raise-cap、或更少 postflop 桶、或 N=2 @ 更小 profile）。74.21 极近 64，
+  小幅叠加即可清掉。**B3 不受此限**：width 任意档 B3 都 0.2–1 GiB（见上表）。
 
 ## B. 有损削减（用摘要替代完整序列 = 把信息抽象用在下注历史上）
 
@@ -279,11 +311,20 @@ postflop 200 大 ~2.5×）：
 | `{0.5,1.0}` † | ≥49,654M / ≥1603 GiB | 172,352 / ≥197,432 | ≥96.50M / **≥4.86 GiB** | 515× | ✗ 1,016,860 |
 | HU self-check | 119.7M / 4.62 GiB | 1,616 | 0.79M / 0.05 GiB | 152× | ✗ 8,624 |
 
-† `{0.5,1.0}` node 枚举撞 `NODE_CAP=100M`（树 >1 亿节点），故该行 node_id 与 B3 都是**下界**。
-**【验证纠正】"应已近饱和"是错的**：cap sweep（pin）实测 5M→27,455 / 20M→73,259 / 50M→104,377 /
-100M→197,432 key，**仍每翻倍 ×~1.9（未饱和）**；真值可能 high-10⁵~10⁶（pure-field 上界 2²⁴≈16.7M）。
-故"172K ~10⁵"**低估**，"~4.86 GiB"是**未饱和下界、不可用于定机器**。但**"进 64 GiB"定性稳**（即便真值
-~2M key：~2M×500 桶×~3.4 动作×8B×2 表 ≈ 48 GiB < 64）。需用更大 NODE_CAP / key-only walk 重测真值，见 §待办 (g)。
+† `{0.5,1.0}` 该行原撞 `NODE_CAP=100M` → node_id 与 B3 都曾是**下界**。**已被 §待办 g 精确解决（下）**。
+
+**【待办 g 闭环——`{0.5,1}` B3 distinct key 精确值 = 307,951，不再是下界】**（2026-05-31，vultr `eeba801`，
+`NODE_CAP=300000000` postflop 500）：全 `{0.5,1}` 6-max 树**精确枚举完毕 = 287,855,722 决策节点**（< 300M cap，
+**非下界**），max depth 43。于是：
+- **node_id（完美回忆）真值**：infoset **142,691M**（vs 原 ≥49,654M 下界）/ dense 两表 **4519.28 GiB@500**
+  （vs 原 ≥1603 GiB）——单机彻底无解，坐实"完美回忆 `{0.5,1}` 不可单机"。
+- **B3 distinct key 精确 = 307,951**（pin；vs 原 100M-cap 下界 197,432）/ B3 infoset 150.52M / **B3 dense 两表 7.61 GiB@500**
+  / 压缩 948×；不变量 ✓。落在原预测 high-10⁵~10⁶ 的**低端（high-10⁵）**。
+- **⇒ "B3 进 64 GiB" 现在是精确结论不是定性**：307,951 key × 500 桶 × ~3.4 动作 × 8B × 2 表 = **7.61 GiB ≪ 64**，
+  ~8× 余量。原"~4.86 GiB 未饱和下界、不可定机器"caveat 作废，真值 7.61 GiB。
+- **方法学副产**：均匀采样（`REACH_SAMPLES=40M`）B3 只数到 **106,908（真值的 35%）**——uniform-play 严重漏稀有深
+  re-raise key，**采样不可用于 B3 饱和**；可靠法是更大 NODE_CAP 的 DFS（恰好 300M 即全枚举）。cap sweep 外推
+  （5M→27K…100M→197K，×~1.9/翻倍）若线性外推会**高估**，实测真值 307,951 印证"树到 ~2.88 亿节点就到顶"。
 
 **两条结论（坐实了 §B3 的核心论点）**：
 
@@ -369,13 +410,30 @@ node_id，而把 stage-2 设计的 `position_bucket`(4)/`stack_bucket`(4)/`betti
 先走 (i)"被三点推翻：A3 的"无损保 Nash"在 6-max 是 no-regret/soundness 优势而非 Nash（§A3）、224 GiB 是
 enumerated 上界从没量 reached（§A3/§盲点 2）、小注 EV 小且集中在河（§盲点 3）。正确顺序：
 
-- **Phase 0（几天，便宜，先做）**：跑 §待办 (e)(f)(g) 五个 probe——raise-index/街菜单 + A4 width cap +
-  reached-set + B3 真 distinct-key。很可能直接把"必须 512GB"降到 64–96 GiB。
-- **Phase 1（据 Phase 0 选路）**：
-  - 若小注子集能压进 64–96 GiB → 走**无损路线**（coarse 菜单 + A2 transposition memo 无损挤压），保
-    no-regret/soundness，躲 B3 无业界先例的"摘下注历史"。
-  - 若无论如何无损塞不下、且质量 probe 证明小注值 → 上**重设计 B3** = A2 exact-key + last_aggressor +
-    `capped` 位 + `legal_action_set_id` pin，**先在 HU 零和管线验**（exploitability/LBR 在那才有牙齿），再上 6-max。
+- **Phase 0** ✅ **已跑完（2026-05-31，vultr `eeba801`，§待办 e/f/g）。结论 = "必须 512GB" 部分被推翻但
+  没降到 64 GiB lossless；唯一进 64 GiB 的是 B3（lossy）**：
+
+  | 方案（`{0.5,1}`） | node_id 两表 | 进 64? | 进 96? | B3 两表 |
+  |---|---|---|---|---|
+  | 全树（无限制） | 1820 GiB@200 / 4519@500 | ✗ | ✗ | 7.61 GiB ✅ |
+  | first-bet-small（§A3） | 224.58 GiB@200 | ✗ | ✗ | 1.57 GiB ✅ |
+  | turn/river-小注（§A3 对偶） | 105.08 GiB@200 | ✗ | ✗ | 1.35 GiB ✅ |
+  | WIDTH_CAP=2（heads-up 后续街） | **74.21 GiB@200** | ✗(差一点) | ✅ | 0.23 GiB ✅ |
+
+  - **lossless 进 64 GiB：无现成单杠杆**。最接近 = WIDTH_CAP=2（74 GiB，进 96，但重度改游戏丢全部多路）；
+    要进 64 须叠（N=2 + raise-cap / 更少桶）。**full lossless `{0.5,1}` 连 512 GB 都不够**（1820 GiB@200）——
+    必须限制（first-small / width / turn-river）或走 B3。
+  - **B3 进 64 GiB：精确坐实**（307,951 key / 7.61 GiB@500，~8× 余量），是唯一不改游戏又进小机的路。
+  - **reached-set 仍未真测**（uniform 采样 ≠ 收敛 reached，且 B3 采样漏 65% 稀有 key）；Pluribus-62% 那个数
+    要等真 6-max trainer（`nlhe.rs` `n_seats=2` 未接），见「reached 未闭」。
+- **Phase 1（据 Phase 0 选路，已收窄）**：
+  - **要小机（64 GiB）+ 保多路小注 → 只能 B3**（lossy；唯一进 64 的无-改游戏路）。重设计 = A2 exact-key +
+    last_aggressor + `capped` 位 + `legal_action_set_id` pin，**先在 HU 零和管线验**（exploitability/LBR 在那才
+    有牙齿），再上 6-max。无损路线在 64 GiB 已被 Phase 0 否掉（无单杠杆够）。
+  - **要 lossless + 有 96 GiB 机 → WIDTH_CAP=2**（heads-up 后续街，74 GiB），但先量"强制 heads-up 后续街丢多少
+    EV"再定（重度改游戏）。
+  - **要 lossless 全多路 → 唯一可行 = first-bet-small / turn-river-small + ~256–512 GB 大机**（105–224 GiB），
+    full `{0.5,1}` 已确认连 512 GB 不够。
 - **Phase 2（不论选哪条都做）**：`map_off_tree` 升 PHM；VR-MCCFR baselines 治训练 wall；A-loss 断言 +
   range-skew(KL/EMD) 实测把"有损"量成数字。
 
@@ -411,13 +469,27 @@ enumerated 上界从没量 reached（§A3/§盲点 2）、小注 EV 小且集中
 
 **【2026-05-31 调研新增——Phase 0 便宜 probe，应先于任何买机器/选 B3 的决定】**
 
-- (e) **【新】WIDTH_CAP probe（§A4）**：`nlhe_betting_tree_sizing` 枚举 `{0.5,1}` 但剪掉 preflop 后 >N 人
-  （N=2/3）在场的节点，量 node/infoset/reached。验"6 人各自再加注"的 width 是不是病根、~20× 能否复现。
-- (f) **【新】raise-index/街 菜单 + reached-set probe**：`legal_bet_sizes` 做成 `(street, raise_index)` 纯函数
-  （0.5 仅每街首次加注 / 仅 turn-river），enumerate **并**量 C5 后端的 **reached set**（不只 enumerated dense
-  字节）。测"小注不可行"是不是平菜单 artifact + reached 是否把内存拉进 64–96 GiB（Pluribus reach 62%）。
-- (g) **【强化 (d)】B3 `{0.5,1}` 真 distinct-key**：cap sweep 已证 `NODE_CAP=100M` **未饱和**（每翻倍 ×~1.9），
-  现 ~4.9 GiB 不可用于定机器。用更大 cap / key-only walk 重测真值（high-10⁵~10⁶?），再定 dense GiB。
+- (e) ✅ **已做**（2026-05-31，vultr `eeba801`，`WIDTH_CAP=N` 探针，见 §A4 实测）：~20× **复现于 N=2**
+  （287.86M→11.73M = 24.5×），但 N=3 只 6.0×（小注几何在 3-way 仍在）；**单用救不动 lossless 64 GiB**
+  （N=2 仍 74.21 GiB@200，落 96 GiB）。width 是病根之一但非小注解药，须叠加。B3 任意 width 档 0.2–1 GiB。
+- (f) ✅ **已做**（2026-05-31，`MENU=turn_river_small|first_small` 探针，见 §A3 实测）：对偶杠杆成立——
+  0.5 仅 turn/river 开池 = 16.38M / **105.08 GiB@200**，比 first-bet-small 全街（35.13M / 224.58 GiB，逐字节复现
+  §A3）**便宜 2.1×**；但仍 > 64（perfect-recall），落 96–128 GiB。**reached-set 仍未真测**：探针的 uniform-play
+  采样 reach（2–14% 覆盖率 @20M playout）是有限采样覆盖率、**不是收敛策略 reached**（Pluribus 62% 那个数仍需真
+  6-max trainer，当前 `nlhe.rs` `n_seats=2` 未接），见下「reached 未闭」。
+- (g) ✅ **已做（精确，超出预期）**（2026-05-31，`NODE_CAP=300M` postflop 500，见 §B3「待办 g 闭环」）：全
+  `{0.5,1}` 树 **精确枚举 = 287.86M 节点**（< 300M cap，非下界）→ B3 distinct key **精确 307,951** / B3 dense
+  **7.61 GiB@500** ≪ 64（~8× 余量）。原"~4.9 GiB 未饱和下界"作废。副产：uniform 采样只数到真值 35%，采样不可用于
+  B3 饱和、更大 cap DFS 才对。
+- (g2) **【reached 未闭——Phase 0 唯一没真做成的一项】**：探针给的 reached 是 **uniform-play 采样覆盖率**
+  （2–14% @20M playout，§A3/§A4 实测），**不是 C5 收敛策略 reached**（Pluribus 62% 那个数）；且 uniform 采样
+  连**有界**的 B3 key 都漏 65% 稀有深 re-raise key（全 `{0.5,1}` 真值 307,951 vs 采样 106,908），故 reach 采样
+  **只能当覆盖率诊断、不能定内存**。真测 reached 须接 6-max trainer（`nlhe.rs:310` `n_seats=2` 硬编码未参数化）
+  跑 C5 HashMap 后端、数实际 materialize 的 infoset——这是把 enumerated（4519 GiB@500）降到实际 reached 的唯一
+  可靠法，但**不是便宜 sizing probe**，归入"接 6-max 训练管线"那条线（与 §B3 接 `pack_info_set` / dense indexer
+  同批）。**注**：对 B3 路线 reached 关系不大（B3 key 已有界 307,951，dense 7.6 GiB 直接预分配即可）；reached
+  只对"赌 perfect-recall + C5 lazy 能塞下"那条路关键，而 Phase 0 已证那条路基线 1820–4519 GiB，reached 即便
+  62% 也 ~1100–2800 GiB，仍无解——**所以 reached 未闭不影响 Phase 1 选 B3 的结论**。
 - (h) **【新】Phase 2 正交收益**：① `map_off_tree`（`action.rs:386` nearest-ratio stub）升 **pseudo-harmonic**
   （`f(x)=(B-x)(1+A)/((B-A)(1+x))`，正确 off-tree handler，但不压 key、不替代 key 决策）；② **VR-MCCFR
   control-variate baselines** 治 A3 真瓶颈（训练 wall 7.5×，文档原称无解）；③ **A-loss recall 断言 +
