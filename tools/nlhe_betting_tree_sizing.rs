@@ -99,6 +99,14 @@ struct Stats {
     // ---- A4 width cap 探针（仅 width_cap < 255 时非零）----
     /// 被 width cap 剪掉的 postflop 节点数（含其整棵子树根，统计透明用）。
     width_pruned: u64,
+    // ---- A4 redirect（真 capped 博弈，仅 width_redirect < 255 时非零）----
+    /// 应用了 closing-action 规则、第 (N+1) 个 entrant 被禁被动进场（Check/Call 被删）的节点数。
+    redirect_restricted: u64,
+    /// redirect 模式下 postflop 见过的最大在场人数（Active∪AllIn）。正常 ≤ N；
+    /// 唯一可能 > N 的是多人 all-in 跑马线（无 postflop 下注，不贡献树）。
+    redirect_max_postflop_live: u8,
+    /// redirect 模式下 postflop 在场 > N 的决策节点数（透明用，应≈0 = 仅 all-in 跑马）。
+    redirect_postflop_over_n: u64,
 }
 
 impl Stats {
@@ -338,6 +346,10 @@ struct WalkCfg<'a> {
     /// 连同子树被剪掉（drop 版 = 量"多路 width"对树规模的贡献，是 capped 博弈规模下界）。
     /// `255` = 无 cap（max live ≤ n_seats ≤ 9，永不触发）。
     width_cap: u8,
+    /// A4 redirect（真 capped 博弈，closing-action 优先）：preflop 里第 (N+1) 个 entrant
+    /// 不能被动进场（Check/Call 被删 → 只能 fold 或 squeeze），靠加注挤人把见 flop 人数
+    /// 收到 ≤ 此值。与 drop 版互斥（run() 强制最多一个 != 255）。`255` = 关。
+    width_redirect: u8,
     /// 决策节点枚举上限（env `NODE_CAP` 覆盖默认 `NODE_CAP_DEFAULT`）。
     node_cap: u64,
 }
@@ -347,6 +359,7 @@ fn walk(
     depth: u32,
     raises_on_street: u32,
     aggr: Aggr,
+    entrants: u16,
     cfg: &WalkCfg,
     stats: &mut Stats,
 ) {
@@ -362,6 +375,17 @@ fn walk(
     if street > 0 && live_count(state) > cfg.width_cap {
         stats.width_pruned += 1;
         return;
+    }
+    // A4 redirect 透明统计：redirect 模式下 postflop 在场人数应 ≤ N（closing-action 规则保证）。
+    // 唯一例外 = 多人 all-in 跑马（被动 call 被 gate，只能靠 shove 越线），无 postflop 下注、不贡献树。
+    if cfg.width_redirect != 255 && street > 0 {
+        let lc = live_count(state);
+        if lc > stats.redirect_max_postflop_live {
+            stats.redirect_max_postflop_live = lc;
+        }
+        if u32::from(lc) > u32::from(cfg.width_redirect) {
+            stats.redirect_postflop_over_n += 1;
+        }
     }
 
     // NODE_CAP：到上限停止下探，把 capped 当结论返回。
@@ -385,8 +409,21 @@ fn walk(
     let abs = &cfg.abs_by_street[street as usize];
     let legal_set = abs.abstract_actions(state);
 
-    // 动作过滤：① A1 raise cap 到顶剔 sized Bet/Raise；② first-bet-small 剔 0.5pot 的 Raise。
-    // 二者只砍 sized 进攻，Fold/Check/Call/AllIn 永远保留。
+    // A4 redirect（真 capped 博弈，closing-action 优先）：第 (N+1) 个 entrant 不能被动进场。
+    // E = 当前 entrant 数；actor 已是 entrant → 留下后 E 不变，否则 E+1。留下后 > N 即禁 Check/Call
+    // （只剩 Fold + Raise/AllIn = squeeze 或 fold）。Raise/AllIn 永不 gate；某 entrant 被挤走弃牌后
+    // slot 释放（见 recursion 的 entrant 清位）。redirect 关时（255）恒 false，零影响。
+    let redirect_block_passive = if cfg.width_redirect != 255 {
+        let e = entrants.count_ones();
+        let actor_in = (entrants >> actor) & 1 == 1;
+        let stay_e = if actor_in { e } else { e + 1 };
+        stay_e > u32::from(cfg.width_redirect)
+    } else {
+        false
+    };
+
+    // 动作过滤：① A1 raise cap 到顶剔 sized Bet/Raise；② first-bet-small 剔 0.5pot 的 Raise；
+    // ③ A4 redirect 禁被动进场剔 Check/Call。Fold + Raise/AllIn（除被 ①② 剔的 sized）始终保留。
     let cap_reached = raises_on_street >= cfg.raise_cap;
     let actions: Vec<AbstractAction> = legal_set
         .iter()
@@ -402,9 +439,21 @@ fn walk(
                     }
                 }
             }
+            if redirect_block_passive
+                && matches!(a, AbstractAction::Check | AbstractAction::Call { .. })
+            {
+                return false;
+            }
             true
         })
         .collect();
+    if redirect_block_passive
+        && legal_set
+            .iter()
+            .any(|a| matches!(a, AbstractAction::Check | AbstractAction::Call { .. }))
+    {
+        stats.redirect_restricted += 1;
+    }
 
     // dense 布局累加：本节点贡献 bucket_count 行、bucket_count × action_count 个 slot。
     let action_count = actions.len() as u64;
@@ -452,7 +501,22 @@ fn walk(
                 next_aggr.post = rp;
             }
         }
-        walk(&next_state, depth + 1, next_raises, next_aggr, cfg, stats);
+        // entrant 追踪（A4 redirect）：非弃牌动作 → 标记 actor 为 entrant；弃牌 → 清位（slot 释放）。
+        // 跨街不清零（entrant = 谁还在这手牌里，累积）；redirect 关时该 mask 不被读取，零影响。
+        let next_entrants = if matches!(action, AbstractAction::Fold) {
+            entrants & !(1u16 << actor)
+        } else {
+            entrants | (1u16 << actor)
+        };
+        walk(
+            &next_state,
+            depth + 1,
+            next_raises,
+            next_aggr,
+            next_entrants,
+            cfg,
+            stats,
+        );
         if stats.capped {
             return;
         }
@@ -479,6 +543,7 @@ fn measure(
     b3_summary: bool,
     b3_pin_actions: bool,
     width_cap: u8,
+    width_redirect: u8,
     node_cap: u64,
 ) -> Stats {
     let abs_by_street = [
@@ -498,10 +563,11 @@ fn measure(
         b3_summary,
         b3_pin_actions,
         width_cap,
+        width_redirect,
         node_cap,
     };
     let mut stats = Stats::default();
-    walk(&state, 0, 0, Aggr::default(), &cfg, &mut stats);
+    walk(&state, 0, 0, Aggr::default(), 0, &cfg, &mut stats);
     stats
 }
 
@@ -573,6 +639,15 @@ fn print_stats(label: &str, desc: &str, stats: &Stats, buckets: &BucketCounts) {
         println!(
             "Width-pruned    : {} 个 postflop 节点被 width cap 剪掉（连子树）",
             stats.width_pruned
+        );
+    }
+    if stats.redirect_restricted > 0 || stats.redirect_max_postflop_live > 0 {
+        println!(
+            "Redirect        : {} 个节点第(N+1)人被禁被动进场（squeeze/fold）；postflop 最大在场 {}；\
+             postflop >N 节点 {}（应≈0 = 仅 all-in 跑马）",
+            stats.redirect_restricted,
+            stats.redirect_max_postflop_live,
+            stats.redirect_postflop_over_n,
         );
     }
 
@@ -985,6 +1060,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()
         .map_err(|e| format!("WIDTH_CAP 不是 u8: {e}"))?
         .unwrap_or(255);
+    // WIDTH_REDIRECT=N（§A4 redirect，真 capped 博弈）：closing-action 优先，preflop 第 (N+1) 个
+    // entrant 禁被动进场（fold 或 squeeze），见 flop 人数收到 ≤ N。与 drop 版 WIDTH_CAP 互斥。
+    // env 不设 = 255（关）。例：FIRST_SMALL=1 WIDTH_REDIRECT=3 cargo run ...
+    let width_redirect: u8 = std::env::var("WIDTH_REDIRECT")
+        .ok()
+        .map(|s| s.parse::<u8>())
+        .transpose()
+        .map_err(|e| format!("WIDTH_REDIRECT 不是 u8: {e}"))?
+        .unwrap_or(255);
+    if width_cap != 255 && width_redirect != 255 {
+        return Err("WIDTH_CAP（drop 版）与 WIDTH_REDIRECT（redirect 版）互斥，只能设其一".into());
+    }
     // MENU（§A3/§A4 待办 f）：raise-index/街 依赖菜单选择器，优先于 argv / FIRST_SMALL。
     //   first_small       = preflop{1} postflop{0.5,1}，0.5 仅开池 Bet（= §A3 first-bet-small）
     //   turn_river_small  = preflop{1} flop{1} turn/river{0.5,1}，0.5 仅 turn/river 开池
@@ -1018,12 +1105,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         width_cap.to_string()
     };
+    let redirect_desc = if width_redirect == 255 {
+        "none".to_string()
+    } else {
+        width_redirect.to_string()
+    };
     let menu_desc = menu.as_deref().unwrap_or("(argv/FIRST_SMALL)");
     println!(
         "RNG seed = 0x{WALK_SEED:016x}   NODE_CAP = {node_cap}   RAISE_CAP = {cap_desc}   FIRST_SMALL = {first_small}   B3_SUMMARY = {b3_summary}   B3_PIN_ACTIONS = {b3_pin_actions}"
     );
     println!(
-        "WIDTH_CAP = {width_desc}   MENU = {menu_desc}   REACH_SAMPLES = {reach_samples}   SAMPLE seed = 0x{SAMPLE_SEED:016x}"
+        "WIDTH_CAP = {width_desc}   WIDTH_REDIRECT = {redirect_desc}   MENU = {menu_desc}   REACH_SAMPLES = {reach_samples}   SAMPLE seed = 0x{SAMPLE_SEED:016x}"
     );
     println!();
 
@@ -1045,6 +1137,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             false,
             b3_summary,
             b3_pin_actions,
+            255,
             255,
             node_cap,
         );
@@ -1099,7 +1192,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ),
         };
         let label = format!(
-            "6-max 100BB / {menu_label} / preflop 169 / postflop {postflop_buckets} / raise_cap {cap_desc} / width_cap {width_desc}"
+            "6-max 100BB / {menu_label} / preflop 169 / postflop {postflop_buckets} / raise_cap {cap_desc} / width_cap {width_desc} / width_redirect {redirect_desc}"
         );
         let start = std::time::Instant::now();
         let stats = measure(
@@ -1111,6 +1204,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             b3_summary,
             b3_pin_actions,
             width_cap,
+            width_redirect,
             node_cap,
         );
         print_stats(&label, &ratios_desc(per_street), &stats, &six);
