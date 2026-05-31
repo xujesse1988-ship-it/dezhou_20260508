@@ -44,9 +44,65 @@ K = 每街 (Bet+Raise) 聚合上限、all-in 不计入且永远保留；preflop 
   {fold,call,allin} 分叉 × 多街），raise cap 是**深度**杠杆、治不了**宽度**病。
 - 故原"最对症、首选"只对**大档区**成立；**保留小注必须叠 B3/B4 或按 S2 弃小注，A1 单用不够**。
 
-### A2. Public-state 规范化（transposition 折叠）
-把"到达相同 `(各家已投筹码, 该谁动, 本街已加注数)`"的不同动作序列并成同一节点。完美回忆下它们
-本是不同节点，合并后是 transposition 折叠。无损或近无损，但要算"状态等价"而非"路径"，实现复杂度高于 A1。
+### A2. Public-state 规范化（transposition 折叠）— 字段定稿（2026-05-31，待 A2_TRANSPOSE 实测）
+
+把"到达相同**精确局面**"的不同动作序列并成同一节点：不再用 `node_id`（动作路径，完美回忆，
+`src/training/nlhe_betting_tree.rs:6-9`，路径单射测试 `:296-308`）做下注维度，改用精确局面规范化 key。
+完美回忆下它们本是不同节点，合并后 = 把 betting 树折成 DAG。
+
+**定位（别当免费午餐）**：transposition table 是**完美信息**博弈技术；不完美信息下公共局面相同 ≠ 策略
+等价（两条路径带来不同对手 range，tabular blueprint 无 range 通道、infoset key 是唯一通道）。所以 A2
+**对博弈动态无损、对 range 有损**——本质仍是对下注历史的 imperfect recall，只是粒度最细（不分桶）的一档。
+DeepStack 敢在 public tree 推理是因为它同时携带 range + 对手 CFV，我们没有。
+
+**key 设计原则**：A2 key = **续局博弈动态的充分统计量**。两状态 key 相等 ⟺ 续局子博弈逐节点合法动作
+相同、逐叶收益相同。字段要不要进 key 只看这条。
+
+**字段**（公共下注部分替掉 `node_id`；私有牌 `bucket_id` + `street_tag` 沿用 v2）——全是 public state
+的整数函数，按 button 归一化（守 D-252 禁浮点）：
+
+| 类别 | 字段 | 含义 / 决定续局的什么 |
+|---|---|---|
+| 必须显式编码 | `actor`（相对 button） | 现在该谁动 → 合法动作 + 位置 + 下一个轮到谁 |
+| | 每在场座位 `committed_total` | 底池（Σ，`state.rs:331`）+ side pot 分层 / 收益（`:973,846`） |
+| | 每在场座位 `committed_this_round` | 当前注级（`:750`）+ 各家欠注 + 本轮是否结束（`:722`） |
+| | 每座位 `status`（Active/Folded/AllIn） | 谁在场 / 谁能动；Folded 不可派生（弃牌玩家有非零 committed）必须显式，AllIn 可派生顺手编码 |
+| | `last_full_raise_size` | 最小加注额 `min_to = max + 此`（`:500`），路径依赖 |
+| | `raise_option_open`（在场 bitmask） | "面对不足额 all-in 不重开加注权"规则 D-033-rev1（`:286,758`） |
+| 可派生（不进 key） | stack / pot / max_committed / to_call / SPR / 下一个 actor | 都是上面字段的函数（stack = 起始码量 − committed_total，I-001） |
+| 故意排除 | `last_aggressor` / 精确路径 / 街内次序 / 弃牌先后 | 只喂 showdown_order（不改按牌力分钱的收益 `:940,997`）→ 不改动态 = **A2 对 range 有损的出处** |
+
+**A2 相对 B3 的硬优势**：`legal_actions()`（`state.rs:252-306`）是精确 committed 的**纯函数** →
+**A2 key 相同 ⟹ 合法动作集相同（按构造）**，不需要 B3 的 `legal_action_set_id` 补丁、不可能撞 F17
+（`info.rs:73-78`）。B3 那 100 万次"同 key 不同 legal_actions"违规正是分桶（`facing_size_bucket`/
+`spr_bucket`）抹平筹码边界造成的。一句话：**A2 = 无损版的 B3，还顺手躲掉 B3 唯一那个正确性坑**。
+
+**精化本节 informal `(各家已投筹码, 该谁动, 本街已加注数)`**：`各家已投筹码`→拆 `committed_total` +
+`committed_this_round`（都要，前者管 side pot/收益、后者管当前轮）；`本街已加注数`→替换为
+`last_full_raise_size` + `raise_option_open`（NLHE 无 3-bet cap，加注次数本身不 gate 动作）。⚠ 但 A2
+**叠 §A1 raise-cap** 时，"本街加注次数（capped）"要重新进 key（cap 到顶反过来砍 sized raise）。
+
+**与 §B3 非嵌套**（不是谁包含谁）：A2 几何精确但**丢 aggressor**；B3 几何分桶却**保 aggressor 补 range**。
+谁的 range-skew 小看局面。A2 确定占优的只有"动态无损 + legal_actions 天然一致"——纠正"A2 严格最小 skew"
+的过度说法。
+
+**例**（HU turn 起手）：P = preflop SB 加注到 3 + flop 下 3 被跟；Q = preflop SB **limp 到 1** + flop 下 5
+被跟。两边 turn 起手 committed_total=(6,6)、actor=BB、committed_this_round=(0,0)、双方 Active、
+`last_full_raise_size`=BB（新街重置 `:701`）、`raise_option_open`=(true,true) 全字段相等 → **同 A2 key 合并**
+（赢）；但 SB range 一个是加注、一个是 limp，被强制共用策略（丢 = "忘了底池怎么变大的"，且 A2 不带
+aggressor 连"是否侵略过"都分不出）。
+
+**能省多少 = 待实测**：两股相反的力——pot-relative 乘法可交换（pot×f₁×f₂=pot×f₂×f₁）+ all-in 漏斗（利于
+合并）vs **固定行动顺序**（杀死换手顺序 transposition）+ 小注深多路"精确几何本就多"（不利，§A3 已证小注
+病根在底池几何）。prior：无损压缩真实但**明显小于** B3 的 39–515×（B3 头条压缩来自有损分桶不是
+transposition），A2 单独大概率喂不进 64 GiB 的 `{0.5,1.0}`。但它量出"免费部分"多大 = B3 分桶到底多扔
+多少 range（= 多大风险），按"正确性优先"上 B3 前应先拿这个数。
+
+**改动面**（比 §B3 小）：`pack_info_set_v2` 换 key 源（`node_id` → `betting_state_key(&GameState)` 整数）；
+dense indexer（`nlhe_dense.rs:9-13`）从按 `node_id` prefix-sum 改为走树收集 distinct A2 key 分配下标，或
+直接走 HashMap 后端（C5，key 空间稀疏）；**省掉** B3 的 `legal_action_set_id`。imperfect recall 收敛无
+保证 → 仍须 exploitability/LBR 对 `{1.0}` perfect-recall baseline 实测裁定，差 ≥10× 停下追"摘了什么
+value-critical 信息"（典型嫌疑：丢 aggressor → range 不分 → 加回 `last_aggressor` 退化成 §B3）。
 
 ### A3. first-bet-small（小注只当开池领打，re-raise 一律大注）— 需 ~512 GB 大机，可行
 想保住 postflop 领打的尺寸选择（0.5 vs 1pot，策略上值钱），又躲开小注的爆炸：preflop `{1.0}`、
