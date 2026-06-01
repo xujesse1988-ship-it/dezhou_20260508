@@ -11,6 +11,7 @@
 //!   `LeducHistory` + `LeducState`
 //! - [`nlhe`]：`SimplifiedNlheGame` + `SimplifiedNlheState` + type alias 桥接 stage 2
 //! - [`nlhe_eval`]：H3 blueprint-only baseline 评测 + local BR proxy
+//! - [`monitor`]：6-max 训练收敛监控（average-regret / entropy / 动作概率震荡，S4）
 //! - [`regret`]：`RegretTable` + `StrategyAccumulator`（允许 `f64` 浮点；D-379）
 //! - [`trainer`]：`Trainer` trait + `VanillaCfrTrainer` + `EsMccfrTrainer`
 //! - [`sampling`]：`derive_substream_seed` + `sample_discrete` + 6 个 op_id 常量
@@ -33,6 +34,7 @@ pub mod game;
 pub mod kuhn;
 pub mod lbr;
 pub mod leduc;
+pub mod monitor;
 pub mod nlhe;
 pub mod nlhe_betting_tree;
 pub mod nlhe_dense;
@@ -52,6 +54,7 @@ pub use game::{Game, NodeKind, PlayerId};
 pub use kuhn::{KuhnAction, KuhnGame, KuhnHistory, KuhnInfoSet, KuhnState};
 pub use lbr::{estimate_lbr, estimate_lbr_filtered, LbrConfig, LbrReport};
 pub use leduc::{LeducAction, LeducGame, LeducHistory, LeducInfoSet, LeducState, LeducStreet};
+pub use monitor::{ConvergenceMonitor, MonitorReport, StrategySnapshot};
 pub use nlhe::{
     SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
 };

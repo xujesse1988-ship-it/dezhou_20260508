@@ -428,6 +428,20 @@ impl DenseNlheTable {
             .store(1.0_f64.to_bits(), Ordering::Relaxed);
     }
 
+    /// 该 infoset 行的逐 slot 逻辑值（= raw × global_scale），不归一化。监控用：
+    /// regret 表上读出每动作的累计 regret（含负），由 [`crate::training::monitor`]
+    /// 算「平均正 regret」收敛信号。与 [`Self::average_strategy_by_info`] 同一读取
+    /// 序列、仅去掉归一化除法。未访问行恒返回全 0（full dense prealloc）。
+    pub fn row_values_by_info(&self, info: InfoSetId) -> Vec<f64> {
+        let slot = self.indexer.locate(info);
+        let start = slot.slot_start as usize;
+        let scale = self.global_scale_value();
+        self.values[start..start + slot.action_count]
+            .iter()
+            .map(|cell| f64::from_bits(cell.load(Ordering::Relaxed)) * scale)
+            .collect()
+    }
+
     /// 该 infoset 行各 slot 值之和（只读诊断）。strategy_sum 表上 `> 0` 等价 HashMap
     /// 路径「entry present 且非全零」——LBR Hybrid 退化判定 / `HasAverage` probe filter
     /// 用它做后端无关的「该 infoset 有 average 信号吗」判断。未访问行恒 0 → 0.0。

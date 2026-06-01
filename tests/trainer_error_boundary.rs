@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | `ActionCountMismatch` | `RegretTable::accumulate` / `current_strategy` / `StrategyAccumulator::accumulate` / `average_strategy` 上 InfoSet 长度不匹配 | 4 条 panic 路径 + 1 条构造 trip-wire |
 //! | `OutOfMemory` | 训练监控阈值（D-325 字面 SLO 8 GB；本变体 stage 3 路径未实际触发，留 stage 4 监控接入） | 仅构造 + Display/Debug trip-wire |
-//! | `UnsupportedBucketTable` | `SimplifiedNlheGame::new(BucketTable)` schema_version != 3 或 config != (500, 500, 500) | 构造 stub + config (100, 100, 100) → Err |
+//! | `UnsupportedBucketTable` | `SimplifiedNlheGame::new(BucketTable)` schema_version != 4 或 config 不在白名单 {200, 500, 1000}³ | 构造 stub + config (100, 100, 100) → Err |
 //! | `ProbabilitySumOutOfTolerance` | regret matching σ sum 越界 \[1 - 1e-9, 1 + 1e-9\]（D-330；本变体 stage 3 未实际触发，留 stage 4 监控接入） | 仅构造 + Display/Debug trip-wire |
 //! | `Checkpoint(...)` propagation | `Trainer::save_checkpoint` 失败时 `CheckpointError` → 通过 `#[from]` propagate 到 `TrainerError` | 构造 + `From<CheckpointError>` 路径 trip-wire |
 //!

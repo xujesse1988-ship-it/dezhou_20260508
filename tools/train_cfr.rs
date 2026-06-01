@@ -10,13 +10,24 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use poker::training::nlhe::SimplifiedNlheGame;
+use poker::training::nlhe_betting_tree::first_small_6max;
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
-use poker::training::{EsMccfrTrainer, Trainer};
-use poker::{BucketTable, ChaCha20Rng, CheckpointError, RngSource, TrainerError};
+use poker::training::{ConvergenceMonitor, EsMccfrTrainer, Game, StrategySnapshot, Trainer};
+use poker::{
+    BucketTable, ChaCha20Rng, CheckpointError, InfoSetId, RngSource, TableConfig, TrainerError,
+};
 
 #[derive(Debug)]
 struct Args {
     game: String,
+    /// game profile：`hu`（默认，HU 200BB {0.5,1,2}，byte-equal 历史行为）或
+    /// `six-max`（6-max 100BB A3×A4 first-small，配 `postflop_cap`）。S4 6-max
+    /// blueprint 训练走 `six-max`。
+    profile: String,
+    /// 仅 `--profile six-max` 生效：A3×A4 postflop width-redirect 上限 N（见
+    /// `first_small_6max`）。限 `{2, 3}`（S2/S3 验证过的 A3×A4 cap：N=3 = 8.04 GiB@200
+    /// 生产甜点、N=2 = 树小供 smoke/调试）。
+    postflop_cap: u8,
     trainer: String,
     updates: u64,
     seed: u64,
@@ -59,6 +70,8 @@ impl Default for Args {
     fn default() -> Self {
         Self {
             game: String::new(),
+            profile: "hu".to_string(),
+            postflop_cap: 3,
             trainer: "es-mccfr".to_string(),
             updates: 0,
             seed: 0,
@@ -81,7 +94,7 @@ impl Default for Args {
 /// 训练后端抽象：HashMap 与 dense 两个 trainer 的 step/checkpoint 入口同型但不共享
 /// trait（dense 是 NLHE 专属、不实现泛型 `Trainer<G>`）。本地 trait 让 CLI 的训练
 /// 主循环只写一份，两后端走同一 [`drive`]，保证 throughput / checkpoint 节奏一致。
-trait CfrBackend {
+trait CfrBackend: StrategySnapshot {
     fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError>;
     fn step_parallel(
         &mut self,
@@ -148,6 +161,20 @@ impl CfrBackend for DenseBackend {
     }
 }
 
+/// 监控只读快照委托给内层 dense trainer（`DenseNlheEsMccfrTrainer` 已在 lib 内实现
+/// `StrategySnapshot`）；`lockfree` 旗子只影响写路径，查询路径不分流。
+impl StrategySnapshot for DenseBackend {
+    fn average_strategy_for(&self, info: InfoSetId) -> Vec<f64> {
+        self.inner.average_strategy_for(info)
+    }
+    fn regret_for(&self, info: InfoSetId) -> Vec<f64> {
+        self.inner.regret_for(info)
+    }
+    fn visited_infosets(&self) -> u64 {
+        self.inner.visited_infosets()
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -197,9 +224,49 @@ fn run() -> Result<(), String> {
             args.bucket_table.display()
         )
     })?);
-    let game = SimplifiedNlheGame::new(Arc::clone(&table))
-        .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
+    // profile 分派：hu = 历史默认（byte-equal）；six-max = A3×A4 first-small N-cap 游戏。
+    // 两条路都产 `SimplifiedNlheGame`，下游 dense/HashMap 后端 + drive 主循环不分流。
+    let game = match args.profile.as_str() {
+        "hu" => SimplifiedNlheGame::new(Arc::clone(&table))
+            .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?,
+        "six-max" => {
+            if !matches!(args.postflop_cap, 2 | 3) {
+                return Err(format!(
+                    "--postflop-cap must be 2 or 3 for --profile six-max (验证过的 A3×A4 cap)，got {}",
+                    args.postflop_cap
+                ));
+            }
+            let (abs, rules) = first_small_6max(args.postflop_cap);
+            SimplifiedNlheGame::new_with_abstraction(
+                Arc::clone(&table),
+                TableConfig::default_6max_100bb(),
+                abs,
+                rules,
+            )
+            .map_err(|e| {
+                format!("SimplifiedNlheGame::new_with_abstraction (six-max) failed: {e:?}")
+            })?
+        }
+        other => return Err(format!("unknown --profile {other} (expected hu | six-max)")),
+    };
     let table_hash = hex32(&table.content_hash());
+
+    if !args.quiet {
+        eprintln!("[train_cfr] profile          = {}", args.profile);
+        if args.profile == "six-max" {
+            eprintln!(
+                "[train_cfr] postflop_cap     = {} (A3×A4 width-redirect N)",
+                args.postflop_cap
+            );
+        }
+        eprintln!("[train_cfr] n_players        = {}", game.n_players());
+        eprintln!("[train_cfr] tree_nodes       = {}", game.tree().num_nodes());
+    }
+
+    // 收敛监控器（S4）：训练前从 game 取 preflop 根节点 × 169 手型类样本，drive 主循环
+    // 在 report 间隔观测 average-regret / entropy / 动作概率震荡。HU 与 6-max 都建
+    // （HU 根 = SB 开局；监控只读不触训练状态 → byte-equal 不破）。
+    let monitor = ConvergenceMonitor::for_game(&game);
 
     // 后端选择：dense full-prealloc 表 or 默认 HashMap。两者 byte-equal（见 Args.dense
     // doc），训练主循环共用 `drive`——只构造入口不同。dense 路径下 --lockfree 进一步
@@ -215,10 +282,10 @@ fn run() -> Result<(), String> {
         } else {
             "dense-es-mccfr"
         };
-        drive(&mut trainer, &args, &table_hash, label)
+        drive(&mut trainer, &args, &table_hash, label, monitor)
     } else {
         let mut trainer = build_hashmap(&args, game)?;
-        drive(&mut trainer, &args, &table_hash, "es-mccfr")
+        drive(&mut trainer, &args, &table_hash, "es-mccfr", monitor)
     }
 }
 
@@ -280,6 +347,7 @@ fn drive<T: CfrBackend>(
     args: &Args,
     table_hash: &str,
     backend_label: &str,
+    mut monitor: ConvergenceMonitor,
 ) -> Result<(), String> {
     let start_update = trainer.update_count();
     if start_update >= args.updates {
@@ -382,6 +450,10 @@ fn drive<T: CfrBackend>(
                 "[train_cfr] update {cur} / {} elapsed={elapsed:.1}s throughput={throughput:.0}/s",
                 args.updates
             );
+            // 收敛监控（S4）：preflop 根 × 169 手型类样本上的 entropy / 平均正 regret /
+            // average-strategy L1 漂移。只读快照，不触训练状态。
+            let report = monitor.observe(cur, &*trainer);
+            eprintln!("{report}");
             while next_report <= cur {
                 next_report = next_report.saturating_add(report_every);
             }
@@ -416,6 +488,10 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--game" => out.game = next_value(&mut args, "--game")?,
+            "--profile" => out.profile = next_value(&mut args, "--profile")?,
+            "--postflop-cap" => {
+                out.postflop_cap = parse_u64(&next_value(&mut args, "--postflop-cap")?)? as u8
+            }
             "--trainer" => out.trainer = next_value(&mut args, "--trainer")?,
             "--updates" => out.updates = parse_u64(&next_value(&mut args, "--updates")?)?,
             "--iter" => {
@@ -514,6 +590,8 @@ fn print_usage() {
         "usage: cargo run --release --bin train_cfr -- \\\n\
          \t--game nlhe --trainer es-mccfr --bucket-table <path> --updates <N> [options]\n\n\
          options:\n\
+         \t--profile <hu|six-max>  (default hu; six-max = 6-max 100BB A3×A4 first-small)\n\
+         \t--postflop-cap <2|3>  (six-max only; A3×A4 width-redirect N, default 3)\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>\n\
          \t--batch-per-worker <N>  (default 16; trajectories per worker per step_parallel dispatch)\n\

@@ -61,13 +61,16 @@ pub type SimplifiedNlheAction = AbstractAction;
 pub type SimplifiedNlheInfoSet = InfoSetId;
 
 /// 简化 NLHE supported `BucketConfig`（D-313-rev）：preflop 169 lossless（不走
-/// bucket table）+ postflop production bucket 表。500/500/500 是历史 baseline；
-/// 1000/1000/1000 是 v4 feature 数据重排后的当前训练目标。
+/// bucket table）+ postflop production bucket 表。500/500/500 是 HU 历史 baseline；
+/// 1000/1000/1000 是 HU v4 重排后目标；**200/200/200 是 6-max 生产桶**（Pluribus 同档
+/// 200 桶/街；S3 实测 HU 单对手桶可复用进 A3×A4 ≤3-way → 直接用 200 表，见
+/// `six_max_nlhe_target.md` S3 决策记录）。
 fn is_supported_bucket_config(cfg: BucketConfig) -> bool {
-    cfg == BucketConfig::default_500_500_500()
-        || cfg
-            == BucketConfig::new(1000, 1000, 1000)
-                .expect("BucketConfig::new(1000,1000,1000) within D-214 range")
+    let cfg_200 = BucketConfig::new(200, 200, 200)
+        .expect("BucketConfig::new(200,200,200) within D-214 range");
+    let cfg_1000 = BucketConfig::new(1000, 1000, 1000)
+        .expect("BucketConfig::new(1000,1000,1000) within D-214 range");
+    cfg == BucketConfig::default_500_500_500() || cfg == cfg_200 || cfg == cfg_1000
 }
 
 /// 简化 NLHE expected `BucketTable` schema_version。直接锚定
