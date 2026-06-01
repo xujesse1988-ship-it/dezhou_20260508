@@ -24,6 +24,13 @@
 > wall 砍到 85–541M，详见 §A3×A4——**"要小机只能 B3"被推翻**（B3 = 改 recall 保全游戏；A3×A4 = 改游戏保全
 > recall，二选一）。④ **reached-set 仍未真测**（uniform 采样 ≠ 收敛 reached、且漏 65% 稀有 key，需真 6-max
 > trainer）。
+>
+> **2026-06-01 redirect 实测更新**（vultr `6e6acac`，待办 (i)① 闭环，详见 §A3×A4 2026-06-01 块）：A4 width cap 的
+> **真 capped 博弈（redirect 版 = closing-action 优先：第 (N+1) 进场者禁被动进场，fold-or-squeeze）**实测——
+> `first_small + N=3` = **8.04 GiB@200 / 19.97 GiB@500**（redirect 真值），**比 drop 估的 18.20 / 44.63 小 2.26×**：
+> **drop 是松上界不是下界**（原 §A4 注释说反，preflop 剪枝盖过 postflop 加回）。连带消解原③"N=3@500 余量仅 1.4×
+> 敏感"——真值 3.2× 余量。redirect 不变量实测全过（postflop 在场恒 ≤N、>N 节点 0）。下一步 = 把该规则接进真
+> `legal_actions`/`PublicBettingTree` 供训练。
 
 ## 0. 当前做法 = 显式 betting tree（完美回忆）
 
@@ -259,7 +266,8 @@ turn_river+N=2 = 62.4M、+N=3 = 326.1M。）
 
 2. **这是第一条把 perfect-recall `{0.5,1}`（保小注）塞进 64 GiB 的路**，填上 §A4「lossless 进 64 无现成*单*
    杠杆」的缺口。最省的 N=2 仅 **2.96 GiB@200 / 6.52 GiB@500**（21× / 9.8× 余量）；**更值得看 N=3**——保 ≤3-way
-   多路（非强制 heads-up）+ 双档小注 + perfect recall，**18.20 GiB@200 / 44.63 GiB@500 仍进 64**。注意这**不是
+   多路（非强制 heads-up）+ 双档小注 + perfect recall，**18.20 GiB@200 / 44.63 GiB@500 仍进 64**（本点数字均
+   drop 上界；redirect 真值更省 = N=2 0.58/1.42、N=3 8.04/19.97 GiB，见下 2026-06-01 块）。注意这**不是
    "lossless 全 6-max"**：A4 改游戏（postflop ≤N-way、丢 4+ 路），A3 限菜单（0.5 只开池不 re-raise）；但
    **recall 完整**（node_id 不合并）→ 保留 perfect-recall 的 **no-regret / regret-bound by construction**（非
    Nash——6-max 一般和本无 Nash 保证，见 §A3【验证纠正】），与 B3（imperfect recall，regret bound 仅在分桶恰好
@@ -270,16 +278,42 @@ turn_river+N=2 = 62.4M、+N=3 = 326.1M。）
    的 933.9M**——因 6-max infoset 主体是多路 width 不是 bet-size 菜单（再次印证 §A4「病根是 width」）。内存与
    wall 一并解决，(h)② VR-MCCFR 对这条路不再是必需。
 
+**【2026-06-01 redirect 版实测——真 capped 博弈，待办 (i)① 闭环】**（vultr `6e6acac`，`WIDTH_REDIRECT=N` 探针 =
+closing-action 优先：preflop 第 (N+1) 个 **entrant**（已做过 ≥1 非弃牌自愿动作者）禁被动进场——`Check`/`Call`
+删除，只剩 fold 或 squeeze——靠加注挤人把见 flop 人数收到 ≤N，slot 随 entrant 弃牌释放。上表 drop 版 = 剪子树的
+规模**上界**；本表 = 能真训练的 capped 博弈真值）：
+
+| 配置（first_small,`{0.5,1}`） | 决策节点 | max depth | 两表@200 | 两表@500 | infoset@200 | 进 64?余量 |
+|---|---|---|---|---|---|---|
+| **redirect N=3** | **1.15M** | 25 | **8.04 GiB** | **19.97 GiB** | 230.5M | **✅ ~8× / ~3.2×** |
+| **redirect N=2** | **0.079M** | 17 | **0.58 GiB** | **1.42 GiB** | 15.6M | **✅ ~110× / ~45×** |
+| 对照 drop N=3（上表） | 2.72M | 26 | 18.20 GiB | 44.63 GiB | 541.2M | ✅ 3.5× / 1.4× |
+| 对照 drop N=2（上表） | 0.444M | 22 | 2.96 GiB | 6.52 GiB | 85.4M | ✅ |
+
+**校验三过**：① HU self-check 守 240,096 节点；② drop 逐字节复现（`first_small+WIDTH_CAP=3@200` = 2,722,422 节点
+/ 18.20 GiB，= 上表）→ 改动没碰 drop；③ redirect 不变量 = 每 run `postflop 最大在场 = N`、`postflop >N 节点 = 0`
+（closing-action 精确收口，连 all-in 跑马越线都没出现）。
+
+**关键纠正：drop 是（松）上界，不是下界**。§A4 代码注释原称 drop 是"capped 博弈规模的下界"——**实测推翻**（本节
+原"drop 版偏差·方向不复证"的 hedge 是对的，现复证）：真值 **8.04 < 18.20**，redirect 比 drop **小 2.26×**（N=2 小
+5×）。机理 = drop 全枚举 preflop（含 4/5/6 人下注战、只在 flop 处剪），redirect 从源头禁宽多路 preflop → preflop
+节点 **107,042 → 14,332（7.5×↓）**，盖过 postflop 被加回的量；逐街 redirect 都更小（flop 3.9× / turn 2.7× / river
+2.0×↓）。原注释只算"postflop 加回"一股力，漏了更大的"preflop 剪枝"——后者赢。
+
+**副作用（closing-action 的定义性质，实测确认）**：① 超员 limped 池里 BB 的"过牌看 flop"算第 (N+1) entrant → 被禁
+→ BB 只能 squeeze/fold（失去免费 flop），是"≤N 见 flop + 先到先得"的应有之义；② >N 人 all-in 跑马（直接摊牌、无
+postflop 下注）实测 **0 节点**，size 上不存在。
+
 **取舍 / 待验**：
 - **改游戏程度**：N=2 = 强制 heads-up 后续街（丢全部多路，重度失真）；N=3 = max 3-way（保 3-way，失真小得多）
   → N=3 是"保多路 + 进 64 + perfect recall"的甜点。先量"≤N-way 丢多少 EV"再定 N（§A4 同款待验）。
-- **drop 版偏差**：width cap 用 drop 版（postflop 剪 >N-way 子树、preflop 全枚举）；真 capped 博弈（重定向第
-  (N+1) 进场者于 preflop fold）规模与此有偏差（preflop 枚举范围 + postflop 重定向，方向本文不复证）。N=2
-  （≥9.8× 余量）、N=3@200（3.5× 余量）对偏差稳健；唯 **N=3@500（44.63 GiB / 1.4× 余量）敏感**——若在 @500 用
-  N=3，须先实现 redirect 版精确量、或退到 N=2 / 用 @200。
+- **drop 版偏差 → 已实测解决（见上 2026-06-01 redirect 块）**：drop 版（postflop 剪 >N-way 子树、preflop 全枚举）
+  是 capped 博弈的**松上界**，非下界。真 capped 博弈（redirect = closing-action 优先，第 (N+1) 进场者禁被动进场）
+  实测 **N=3 = 8.04 GiB@200 / 19.97 GiB@500**（~8× / ~3.2× 余量）、N=2 = 0.58 / 1.42 GiB。原"**N=3@500（44.63 GiB
+  / 1.4×）敏感**"**消解**——真值 19.97 GiB / 3.2× 余量，@500 用 N=3 也稳进 64 GiB。
 - **vs B3 决策**：进 64 现有两条路——**B3**（不改游戏 / 改 recall，7.61 GiB@500，但 imperfect-recall 收敛风险
-  + F17 + InfoSetId 重写）vs **A3×A4**（改游戏 / 不改 recall，N=3 44.63 GiB@500，无收敛风险，代码改动最小 =
-  legal_actions 加 width + menu 过滤，探针已实现）。**"要小机只能 B3"不再成立**——选哪条 = 选"改 recall 保全
+  + F17 + InfoSetId 重写）vs **A3×A4**（改游戏 / 不改 recall，redirect 真值 N=3 8.04 GiB@200 / 19.97 GiB@500，
+  无收敛风险，代码改动最小 = legal_actions 加 width + menu 过滤，探针已实现）。**"要小机只能 B3"不再成立**——选哪条 = 选"改 recall 保全
   游戏"(B3) vs "改游戏保全 recall"(A3×A4)。
 
 ## B. 有损削减（用摘要替代完整序列 = 把信息抽象用在下注历史上）
@@ -479,13 +513,13 @@ enumerated 上界从没量 reached（§A3/§盲点 2）、小注 EV 小且集中
   | first-bet-small（§A3） | 224.58 GiB@200 | ✗ | ✗ | 1.57 GiB ✅ |
   | turn/river-小注（§A3 对偶） | 105.08 GiB@200 | ✗ | ✗ | 1.35 GiB ✅ |
   | WIDTH_CAP=2（heads-up 后续街） | **74.21 GiB@200** | ✗(差一点) | ✅ | 0.23 GiB ✅ |
-  | **A3×A4: first-small + N=3**（§A3×A4） | **18.20 GiB@200 / 44.63@500** | **✅** | ✅ | — |
-  | **A3×A4: first-small + N=2** | **2.96 GiB@200 / 6.52@500** | **✅** | ✅ | — |
-  | **A3×A4: turn/river-small + N=2** | **2.13 GiB@200 / 4.44@500** | **✅** | ✅ | — |
+  | **A3×A4: first-small + N=3**（§A3×A4，redirect 真值） | **8.04 GiB@200 / 19.97@500** | **✅** | ✅ | — |
+  | **A3×A4: first-small + N=2**（redirect 真值） | **0.58 GiB@200 / 1.42@500** | **✅** | ✅ | — |
+  | （drop 上界）first-small + N=3 / N=2 | 18.20 / 2.96 GiB@200 | ✅ | ✅ | — |
 
   - **perfect-recall 进 64 GiB：无单*杠杆*，但 A3×A4 双杠杆做到了**（§A3×A4）。单杠杆最接近 = WIDTH_CAP=2
-    （74 GiB，进 96，重度改游戏丢全部多路）；叠上 §A3 first-small 后 = N=2 **2.96**/ N=3 **18.20 GiB@200**
-    （@500 6.52 / 44.63）——**进 64 且 perfect recall**，代价 = A4 改游戏（postflop ≤N-way）+ A3 限菜单
+    （74 GiB，进 96，重度改游戏丢全部多路）；叠上 §A3 first-small 后（redirect 真值）= N=2 **0.58**/ N=3 **8.04 GiB@200**
+    （@500 1.42 / 19.97；drop 上界 2.96 / 18.20、6.52 / 44.63，见 §A3×A4 2026-06-01）——**进 64 且 perfect recall**，代价 = A4 改游戏（postflop ≤N-way）+ A3 限菜单
     （0.5 不 re-raise）。**不改游戏-不限菜单**的 full lossless `{0.5,1}` 仍连 512 GB 都不够（1820 GiB@200）——
     那条必须 B3 或大机。
   - **B3 进 64 GiB：精确坐实**（307,951 key / 7.61 GiB@500，~8× 余量），是唯一**不改游戏**又进小机的路
@@ -496,8 +530,8 @@ enumerated 上界从没量 reached（§A3/§盲点 2）、小注 EV 小且集中
   - **要小机（64 GiB）→ 两条路（"只能 B3"已被 §A3×A4 推翻）**：① **B3**（改 recall / 不改游戏；7.61 GiB@500，
     唯一保全 4+ 路多路的进-64 路；代价 = imperfect-recall 收敛风险 + F17 + InfoSetId 重写；重设计 = A2 exact-key
     + last_aggressor + `capped` + `legal_action_set_id` pin，先 HU 零和管线验 exploitability/LBR 再上 6-max）；
-    ② **A3×A4**（改游戏 / 不改 recall；N=3 44.63 GiB@500 / N=2 6.52 GiB@500，perfect-recall 无收敛风险，代码
-    改动最小 = legal_actions 加 width + menu 过滤，探针已实现；代价 = 丢 4+ 路 + 小 re-raise）。选哪条 = 选
+    ② **A3×A4**（改游戏 / 不改 recall；redirect 真值 N=3 8.04@200 / 19.97 GiB@500、N=2 0.58 / 1.42 GiB，perfect-recall
+    无收敛风险，代码改动最小 = legal_actions 加 width + menu 过滤，探针已实现；代价 = 丢 4+ 路 + 小 re-raise）。选哪条 = 选
     "改 recall 保全游戏"(B3) vs "改游戏保全 recall"(A3×A4)。**不改游戏-不改 recall 的全 lossless 路在 64 GiB 仍
     被 Phase 0 否掉**（full `{0.5,1}` 连 512 GB 不够）。
   - **要 lossless 全多路（不限 width）→ 唯一可行 = first-bet-small / turn-river-small + ~256–512 GB 大机**
@@ -566,9 +600,12 @@ enumerated 上界从没量 reached（§A3/§盲点 2）、小注 EV 小且集中
 - (i) ✅ **已做**（2026-05-31，vultr `eeba801`，§A3×A4 实测）：A3(first-small)×A4(width cap) 叠加 = **首个进
   64 GiB 的 perfect-recall `{0.5,1}` 路**（N=2 2.96 / N=3 18.20 GiB@200；@500 6.52 / 44.63），叠加 super-
   multiplicative（649× > 8.2×24.5 之积），且把 A3 单用 7.02B infoset 的训练-wall 砍到 85–541M。两 flag
-  （`drop_small_reraise` × `width_cap`）正交无需改代码，基线逐字节复现。**下一步候选**：① 实现 width-cap
-  **redirect 版**（当前 drop 版是近似，N=3@500 余量仅 1.4× 对此敏感）拿 capped 博弈精确规模；② 量"≤N-way 强制
-  出局丢多少 EV"定 N（N=3 保 3-way 是甜点）；③ 把 A3×A4 当 perfect-recall 候选与 B3 一起进 HU 验质量队列。
+  （`drop_small_reraise` × `width_cap`）正交无需改代码，基线逐字节复现。**下一步候选**：① ✅ **已做**
+  （2026-06-01，vultr `6e6acac`，`WIDTH_REDIRECT` = closing-action 优先）：redirect 真值 **N=3 8.04 GiB@200 /
+  19.97@500、N=2 0.58 / 1.42**，且证 **drop 是上界非下界**（真值小 2.26×，preflop 剪枝盖过 postflop 加回），
+  "N=3@500 敏感"消解（详见 §A3×A4 2026-06-01 块）；下一步 = 把该规则接进真 `legal_actions`/`PublicBettingTree`
+  供训练。② 量"≤N-way 强制出局丢多少 EV"定 N（N=3 保 3-way 是甜点）；③ 把 A3×A4 当 perfect-recall 候选与 B3
+  一起进 HU 验质量队列。
 
 ## 参考
 

@@ -343,7 +343,9 @@ struct WalkCfg<'a> {
     b3_summary: bool,
     b3_pin_actions: bool,
     /// A4 width cap：preflop 之后只允许 ≤ 此人数（`Active∪AllIn`）在场，超出的节点
-    /// 连同子树被剪掉（drop 版 = 量"多路 width"对树规模的贡献，是 capped 博弈规模下界）。
+    /// 连同子树被剪掉（drop 版 = 量"多路 width"对树规模的贡献）。**注**：drop 是 capped 博弈规模的
+    /// **上界**而非下界——实测 `WIDTH_REDIRECT` 真值更小（preflop 剪枝盖过 postflop 重定向加回，
+    /// 见 docs/temp/betting_history_abstraction_options_2026_05_31.md §A3×A4 2026-06-01）。
     /// `255` = 无 cap（max live ≤ n_seats ≤ 9，永不触发）。
     width_cap: u8,
     /// A4 redirect（真 capped 博弈，closing-action 优先）：preflop 里第 (N+1) 个 entrant
@@ -370,8 +372,9 @@ fn walk(
 
     let street = state.street() as u8;
     // A4 width cap：preflop（street 0）之后，剪掉在场人数 > cap 的节点（含整棵子树）。
-    // 直接弃这些"多路续局"线 = 量 width 病对树规模的贡献；是 capped 博弈规模的下界
-    // （真正的 capped 博弈会把这些线重定向到 ≤cap 人续局而非整段删除）。
+    // 直接弃这些"多路续局"线 = 量 width 病对树规模的贡献。真正的 capped 博弈（WIDTH_REDIRECT，
+    // closing-action 优先）从源头禁宽多路 preflop，规模反而比 drop **更小**（drop 是上界非下界：
+    // preflop 剪枝盖过 postflop 重定向加回，实测见 §A3×A4 2026-06-01）。
     if street > 0 && live_count(state) > cfg.width_cap {
         stats.width_pruned += 1;
         return;
