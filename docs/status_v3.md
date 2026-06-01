@@ -13,13 +13,16 @@ heads-up 操作细节(吞吐表 / 优化历程 / 逐 run 对照 / Slumbot+AIVAT 
 主线 = **6-max(路线 A:blueprint-only + 100BB,2026-05-30 立项)**。阶段 S1–S5 量化门槛 + 决策记录 + 亲验
 代码就绪度 → **`docs/six_max_nlhe_target.md`**(主线入口文档)。
 
-**进度(2026-06-01)**:S1 规则正确性(余 100k PokerKit 重跑)、S2 树规模 + game 参数化、S2 续 A3×A4 接进生产、
-S3 多人桶(实测 HU 单对手桶可复用)均已闭/近闭。**当前步 = S4 训练**:训练基建已落地并 vultr 验证(commit
-`5b793e9`)——`train_cfr --profile six-max --postflop-cap {2,3}` 入口 + `ConvergenceMonitor` 多人收敛监控
-(preflop 根×169:entropy/平均正regret/L1漂移/覆盖) + 200 桶表支持;N=2 dense-lockfree 真 200 表 24k update
-端到端 smoke 监控收敛(regret 3.16→1.15、漂移 0.45→0.25)、checkpoint+resume 曲线连续。**待做** = 真训练运行
-(N=3 @ 200,dense 两表 8 GiB,需 AWS ≥64 GiB 大机) + N 座 baseline 评测(S4 gate,`nlhe_eval.rs` 现硬编码 2 座
-需推广)。详见 `six_max_nlhe_target.md` S4。
+**进度(2026-06-01)**:S1–S3 均已闭/近闭(规则余 100k PokerKit 重跑;S2 树规模 + A3×A4 接进生产;S3 实测 HU
+单对手桶可复用)。**S4 训练已跑完一轮并独立复核**:N=3@200 1B dense 训练(基建 commit `5b793e9` + AWS run)
+S4 gate PASS(vs random/call-station/overly-tight,CI95 下界全 > 0)——但**「1B 已收敛」被 run log 自身推翻**:
+实 **56% 表覆盖仍线性爬**、preflop 支配对翻转 **14%** = 欠训练(`ConvergenceMonitor` 只采 169 个 preflop 根、
+看不到全表)。用户提的 **N=4(1.445B infoset)/500 桶会 backfire**(都 ×infoset → 覆盖率更差);**200 桶质量实测
+健康**(排除坏桶)。**真修法 = preflop reshape**(删非 SB 开池 limp + 加 2.25BB 开池档,commit `fdc66db`,
+`--reshape {none|nolimp|preopen}`,byte-equal 守住 cross-check):nolimp 缩树 **4.2×**(55.2M infoset/1.91GiB)、
+preopen 0.68×(157.9M/5.46GiB),都更小 → 覆盖率拉满 → 噪声塌 + 目标更近 GTO。**当前 = nolimp 1B 在 vultr 跑**
+(`artifacts/run_6max_s4_nolimp/`,63.5k/s ≈ 4.6h),preopen 待 AWS;S5 评测(强参考对手缺口 + `nlhe_eval` 推广)
+未动。详见 `six_max_nlhe_target.md` S4 / S4 续。
 
 **6-max 范式切换**:多人一般和 → CFR 不保证收敛 Nash、**LBR/exploitability 失去理论意义**(只当诊断,质量以
 实测对战为准)、无"训到 floor 就停"、无强 6-max 公开参考对手(不像 Slumbot 之于 HUNL)。详见 target 文档。

@@ -307,13 +307,82 @@ RFI，全表存 `artifacts/run_6max_s4_n3/preflop_rfi_1B.md`）：
 
 - **宏观结构正确**：RFI 与 VPIP 都随位置单调放宽（UTG 最紧 → BTN 最宽）、SB 最松、72o 各位置开池 0.00、
   溢价牌大体在前——blueprint **确实学到位置概念、没退化**。
-- **两个抽象（非训练 bug，regret 已收敛 0.0002）导致的问题**：① **过度 limp**——每位置 limp 16–21%（SB 43%），
-  真 GTO 几乎不 limp；「RFI 只有 GTO 一半」的真相是该 raise 的牌跑去 limp 了。② **溢价牌未稳定满额进攻**
-  （AA raise 0.54–0.93、KK UTG 仅 0.26），个别非单调点。
-- **根因 = A3×A4 抽象**：只有 1 个加注档（1.0pot≈3.5BB，无 iso-raise）+ capped/廉价 postflop（≤3-way、0.5 只开池、
+- **两个问题**（⚠ **2026-06-01 修正**：原括注「非训练 bug、regret 已收敛 0.0002」**判错**——见下「S4 续」，
+  实为**欠训练**[1B 仅 56% 表覆盖、仍在爬]与抽象**两因叠加**；监控的 regret/覆盖只采 169 个 preflop 根、看不到全表）：
+  ① **过度 limp**——每位置 limp 16–21%（SB 43%），真 GTO 几乎不 limp；「RFI 只有 GTO 一半」的真相是该 raise 的牌
+  跑去 limp 了。② **溢价牌未稳定满额进攻**（AA raise 0.54–0.93、KK UTG 仅 0.26），个别非单调点。
+- **根因之一 = A3×A4 抽象**（另一半 = 欠训练，见 S4 续）：只有 1 个加注档（1.0pot≈3.5BB，无 iso-raise）+ capped/廉价 postflop（≤3-way、0.5 只开池、
   width redirect）→ limp 进多人池在抽象里不被惩罚、EV 被人为抬高，连 AA/KK 的 raise-vs-limp 在此抽象里都接近
   → 混合策略。要更强 blueprint 的杠杆在**抽象层**：去 limp 选项 / 加小开池档（2.5x）/ 放宽 postflop（属 S5 / 抽象迭代）。
-- 印证 gate 的「必要非充分」：宏观对、微观受抽象限制，远非强策略。
+- 印证 gate 的「必要非充分」：宏观对、微观受抽象限制，远非强策略。**下「S4 续」据此把「去 limp / 加小开池」
+  从建议落地为代码，并用 run log 自身证伪「1B 已收敛」。**
+
+### S4 续（2026-06-01）：独立核验推翻「1B 收敛」+ preflop reshape 落地
+
+> 触发：用户「文档结论不一定对，独立思考」。复核 S4 两个 load-bearing 结论——「1B 已收敛」「更多训练没意义」
+> ——**均被 run log 自己推翻**。下面是证据、被证伪的备选方向、与已落地的修法。
+
+**① 「1B 收敛」证伪（证据 = `s4_run_monitor.log` 自身）**
+
+监控每 report 都打 `visited_infosets`，但上文只引了 `sample_active=169/169`（那是 169 个 preflop 根类的样本覆盖，
+50M 就满、无信息）。真正该看的**全表覆盖**：
+
+| update | visited_infosets | 占 230.5M |
+|---|---:|---:|
+| 50M | 43.4M | 18.8% |
+| 200M | 81.1M | 35.2% |
+| 500M | 108.0M | 46.8% |
+| **1B** | **128.2M** | **55.6%** |
+
+到 1B **44% 的 infoset 一次没访问、曲线仍线性爬**（末 50M 更新 +1.5M 新 infoset）。这不是收敛，是训到一半。
+`ConvergenceMonitor` 只采 169 个 preflop 根（各 ~75 万访问），其「稳定」≠ 全表收敛；`avg_pos_regret→0.0002` 也机械
+（分母 = 全局 update_count，对任何 visit ≪ T 的节点都趋 0，1B/10B/100B 皆然，**不构成停止判据**）。
+
+**② preflop 噪声量化 = 欠训练实锤**（`/tmp/preflop_noise.py`，域内 kicker 支配单调性）
+
+支配族内（如 suited aces AKs≻AQs≻…≻A2s，preflop equity 严格单调）收敛策略 raise 频率应单调。实测**严格支配对翻转
+14.1%**（>0.05 阈；A7o raise 0.96 vs A8o 0.01；K5s 0.93 vs K6s/K7s≈0；AQs 0.59 vs AKs 0.12），随范围变宽
+UTG→SB 升 9.6%→18.4%。机制：preflop 根访问够（~75 万），但它在对**欠训练的 postflop 续局**做最优反应 → 叶子噪声
+灌进根 →「稳定地错」。这解释了上节的非单调点：不是抽象的混合均衡，是噪声。
+
+**③ 备选方向（含用户提的 500 桶 / N=4）实测会 backfire** —— 都 ×infoset → 同预算覆盖率更差：
+
+| 方向 | 实测 | 结论 |
+|---|---|---|
+| N=4（width redirect）| sizing **1.445B infoset / 48 GiB**（6.3× N=3） | 内存够但同 1B 预算 ≈ 9% 覆盖 |
+| 500 桶 | postflop infoset ×2.5 | 同理，除非训练量同步放大 |
+| 200 桶坏了? | `bucket_quality_dump`：**0 空桶、intra-std flop .027/turn .033/river .065**（≈健康 500 桶档） | **桶健康，排除** |
+
+→ 弱点不在桶、不在 postflop 宽度，在**覆盖率 + 太平抽象**（抽象把 EV 压平 → 噪声随便填 → limp basin）。
+
+**④ 修法 = preflop reshape（落地 commit `fdc66db`）** —— 上节「去 limp / 加小开池」的建议落地为代码
+（`src/training/nlhe_betting_tree.rs`）：
+
+- `BettingAbstractionRules.no_open_limp`：preflop 未加注时删非 SB 位 open-limp `Call`（强制 raise-or-fold，
+  SB complete 保留）。
+- `first_small_preopen_6max`：preflop 菜单 `{0.5,1.0}`（0.5=2.25BB 开池档；`drop_small_reraise` 改 **raises-aware**
+  → postflop 与历史 byte-equal、preflop 0.5 开池得以保留、3bet+ 仍 1.0pot）。
+
+sizing（节点确定、机器无关、本机可信）：
+
+| profile | infoset | 两表 | vs baseline | 治 |
+|---|---:|---:|---|---|
+| baseline（现 1B 用的）| 230.5M | 8.04 GiB | — | — |
+| **nolimp**（+no_open_limp）| **55.2M** | 1.91 GiB | 0.24×（缩 4.2×）| ① limp |
+| **preopen**（+2.25BB 开池）| **157.9M** | 5.46 GiB | 0.68× | ①+② 开池档太大 |
+
+两者都比 baseline **小** → 同 1B 预算覆盖率从 56% → 接近饱和 → 噪声塌 + 目标更接近 GTO。**这是「更小且更好」，
+正打 binding constraint（覆盖率），而非用户初想的「改大/加桶」。** byte-equal 守住：240096(HU)/78852(N=2)/
+1154822(N=3)/719764 cross-check 全绿 + 结构守门 `reshape_root_drops_open_limp`（旗默认关）。`--reshape
+{none|nolimp|preopen}` 接进 `train_cfr` / `six_max_eval` / `nlhe_dense_preflop_169_dump`。
+
+**⑤ 在跑 / 待办**
+
+- **nolimp 1B @ vultr**（2026-06-01 启，`artifacts/run_6max_s4_nolimp/`，63.5k/s ≈ 4.6h）：与 baseline 同 1B / 同
+  200 桶、只换 betting 抽象的**干净对照**。判据 = preflop 噪声（14%→?）塌否 + limp 归零否 + 覆盖率。nolimp 保 3.5BB
+  单开池档 → 预期**干净但偏紧**（其作用是把「噪声=欠训练」证死，不修「开池档太大」）。
+- **preopen @ AWS**（待起机，~$2-3 / 1B ≈ 2.4h）：full fix，预期更宽、更近现代 GTO RFI（~2.25BB 开池）。
+- 两者都未验「实测对战是否更强」——属 S5（仍缺强参考对手）。reshape 只保证目标更干净 + 训得更透，不直接等于「更强」。
 
 ### S5：6-max 评测重构
 
