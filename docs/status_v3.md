@@ -13,9 +13,13 @@ heads-up 操作细节(吞吐表 / 优化历程 / 逐 run 对照 / Slumbot+AIVAT 
 主线 = **6-max(路线 A:blueprint-only + 100BB,2026-05-30 立项)**。阶段 S1–S5 量化门槛 + 决策记录 + 亲验
 代码就绪度 → **`docs/six_max_nlhe_target.md`**(主线入口文档)。
 
-**第一步 = S1:钉死 6-max 规则正确性(正确性优先,先于任何训练)**——引擎虽已 N-generic 但从没在 6-max 下像
-HU 那样验过:多人 side pot(3+ 同时 all-in)、多人 showdown 顺序、dead button、6-max 盲注/行动顺序,1M 手零
-非法 + PokerKit 跨验证。
+**进度(2026-06-01)**:S1 规则正确性(余 100k PokerKit 重跑)、S2 树规模 + game 参数化、S2 续 A3×A4 接进生产、
+S3 多人桶(实测 HU 单对手桶可复用)均已闭/近闭。**当前步 = S4 训练**:训练基建已落地并 vultr 验证(commit
+`5b793e9`)——`train_cfr --profile six-max --postflop-cap {2,3}` 入口 + `ConvergenceMonitor` 多人收敛监控
+(preflop 根×169:entropy/平均正regret/L1漂移/覆盖) + 200 桶表支持;N=2 dense-lockfree 真 200 表 24k update
+端到端 smoke 监控收敛(regret 3.16→1.15、漂移 0.45→0.25)、checkpoint+resume 曲线连续。**待做** = 真训练运行
+(N=3 @ 200,dense 两表 8 GiB,需 AWS ≥64 GiB 大机) + N 座 baseline 评测(S4 gate,`nlhe_eval.rs` 现硬编码 2 座
+需推广)。详见 `six_max_nlhe_target.md` S4。
 
 **6-max 范式切换**:多人一般和 → CFR 不保证收敛 Nash、**LBR/exploitability 失去理论意义**(只当诊断,质量以
 实测对战为准)、无"训到 floor 就停"、无强 6-max 公开参考对手(不像 Slumbot 之于 HUNL)。详见 target 文档。
