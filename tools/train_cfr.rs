@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use poker::training::nlhe::SimplifiedNlheGame;
-use poker::training::nlhe_betting_tree::first_small_6max;
+use poker::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_6max};
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{ConvergenceMonitor, EsMccfrTrainer, Game, StrategySnapshot, Trainer};
 use poker::{
@@ -28,6 +28,11 @@ struct Args {
     /// `first_small_6max`）。限 `{2, 3}`（S2/S3 验证过的 A3×A4 cap：N=3 = 8.04 GiB@200
     /// 生产甜点、N=2 = 树小供 smoke/调试）。
     postflop_cap: u8,
+    /// 仅 `--profile six-max`：betting 抽象 reshape（S4，治过度 limp + 开池档太大）。
+    /// `none`（默认）= [`first_small_6max`]（baseline，230.5M infoset）；`nolimp` = 加禁
+    /// 非 SB 开池 limp（55.2M infoset，缩树 4.2×）；`preopen` = 再加 2.25BB 开池档
+    /// （157.9M infoset，full fix；见 [`first_small_preopen_6max`]）。
+    reshape: String,
     trainer: String,
     updates: u64,
     seed: u64,
@@ -72,6 +77,7 @@ impl Default for Args {
             game: String::new(),
             profile: "hu".to_string(),
             postflop_cap: 3,
+            reshape: "none".to_string(),
             trainer: "es-mccfr".to_string(),
             updates: 0,
             seed: 0,
@@ -236,7 +242,20 @@ fn run() -> Result<(), String> {
                     args.postflop_cap
                 ));
             }
-            let (abs, rules) = first_small_6max(args.postflop_cap);
+            let (abs, rules) = match args.reshape.as_str() {
+                "none" => first_small_6max(args.postflop_cap),
+                "nolimp" => {
+                    let (a, mut r) = first_small_6max(args.postflop_cap);
+                    r.no_open_limp = true;
+                    (a, r)
+                }
+                "preopen" => first_small_preopen_6max(args.postflop_cap),
+                other => {
+                    return Err(format!(
+                        "unknown --reshape {other} (expected none | nolimp | preopen)"
+                    ))
+                }
+            };
             SimplifiedNlheGame::new_with_abstraction(
                 Arc::clone(&table),
                 TableConfig::default_6max_100bb(),
@@ -258,6 +277,7 @@ fn run() -> Result<(), String> {
                 "[train_cfr] postflop_cap     = {} (A3×A4 width-redirect N)",
                 args.postflop_cap
             );
+            eprintln!("[train_cfr] reshape          = {}", args.reshape);
         }
         eprintln!("[train_cfr] n_players        = {}", game.n_players());
         eprintln!("[train_cfr] tree_nodes       = {}", game.tree().num_nodes());
@@ -492,6 +512,7 @@ fn parse_args() -> Result<Args, String> {
             "--postflop-cap" => {
                 out.postflop_cap = parse_u64(&next_value(&mut args, "--postflop-cap")?)? as u8
             }
+            "--reshape" => out.reshape = next_value(&mut args, "--reshape")?,
             "--trainer" => out.trainer = next_value(&mut args, "--trainer")?,
             "--updates" => out.updates = parse_u64(&next_value(&mut args, "--updates")?)?,
             "--iter" => {

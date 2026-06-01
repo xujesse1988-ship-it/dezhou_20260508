@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use poker::training::nlhe::SimplifiedNlheGame;
-use poker::training::nlhe_betting_tree::first_small_6max;
+use poker::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_6max};
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{
     evaluate_blueprint_vs_baseline_multiway, Game, NlheBaselinePolicy, NlheEvaluationConfig,
@@ -46,6 +46,7 @@ struct Args {
     bucket_table: String,
     checkpoint: String,
     postflop_cap: u8,
+    reshape: String,
     hands_per_seat: u64,
     seed: u64,
 }
@@ -62,7 +63,20 @@ fn run() -> Result<bool, String> {
             args.postflop_cap
         ));
     }
-    let (abs, rules) = first_small_6max(args.postflop_cap);
+    let (abs, rules) = match args.reshape.as_str() {
+        "none" => first_small_6max(args.postflop_cap),
+        "nolimp" => {
+            let (a, mut r) = first_small_6max(args.postflop_cap);
+            r.no_open_limp = true;
+            (a, r)
+        }
+        "preopen" => first_small_preopen_6max(args.postflop_cap),
+        other => {
+            return Err(format!(
+                "unknown --reshape {other} (expected none | nolimp | preopen)"
+            ))
+        }
+    };
     let game = SimplifiedNlheGame::new_with_abstraction(
         Arc::clone(&table),
         TableConfig::default_6max_100bb(),
@@ -173,6 +187,7 @@ fn parse_args() -> Result<Args, String> {
     let mut bucket_table = String::new();
     let mut checkpoint = String::new();
     let mut postflop_cap = 3u8;
+    let mut reshape = "none".to_string();
     let mut hands_per_seat = 170_000u64;
     let mut seed = 0x3645_5641_4C5F_4556u64; // "6EVAL_EV"-ish
     let mut it = std::env::args().skip(1);
@@ -185,6 +200,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("bad --postflop-cap: {e}"))?
             }
+            "--reshape" => reshape = next(&mut it, "--reshape")?,
             "--hands-per-seat" => {
                 hands_per_seat = next(&mut it, "--hands-per-seat")?
                     .parse()
@@ -214,6 +230,7 @@ fn parse_args() -> Result<Args, String> {
         bucket_table,
         checkpoint,
         postflop_cap,
+        reshape,
         hands_per_seat,
         seed,
     })

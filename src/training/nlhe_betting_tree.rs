@@ -19,7 +19,7 @@ use crate::abstraction::action::{
 };
 use crate::abstraction::info::StreetTag;
 use crate::core::rng::ChaCha20Rng;
-use crate::core::{PlayerStatus, Street};
+use crate::core::{ChipAmount, PlayerStatus, Street};
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::PlayerId;
@@ -81,14 +81,21 @@ pub struct TreeNode {
 /// 影响）。`Default`（全关）与历史行为逐节点 byte-equal（守 240,096 / 719,764 节点）。
 #[derive(Copy, Clone, Debug)]
 pub struct BettingAbstractionRules {
-    /// A3 first-bet-small：0.5pot 只许作开池 `Bet`，禁任何 `Raise{0.5pot}`（re-raise
-    /// 一律 1pot）。无状态、逐动作过滤。配 preflop{1} postflop{0.5,1} 菜单用
-    /// （见 [`first_small_6max`]）。
+    /// A3 first-bet-small：0.5pot 只许作**首次进攻**（开池 `Bet`，或 preflop 越过 BB 的
+    /// 首个 `Raise`），任何 **re-raise**（本街已有进攻后）一律 1pot。`raises_on_street`
+    /// 感知（见 [`filter_actions`]）：postflop 行为与历史 byte-equal（postflop `Raise`
+    /// 恒有前序进攻 → `raises>0` → 照旧删 0.5 reraise），但允许 preflop 菜单含 0.5 时
+    /// 把它当 2.25BB 开池档（见 [`first_small_preopen_6max`]）。
     pub drop_small_reraise: bool,
     /// A4 width redirect（closing-action 优先）：preflop 第 (N+1) 个 entrant 禁被动
     /// 进场（删 `Check`/`Call`，只剩 fold 或 squeeze），把见 flop 人数收到 ≤ N。
     /// [`WIDTH_REDIRECT_OFF`](Self::WIDTH_REDIRECT_OFF) = 关。
     pub width_redirect: u8,
+    /// 禁非盲注位的开池 limp：preflop 未被加注（facing 仅 BB）时，删掉**非 SB**位的
+    /// `Call`（= open-limp），强制 raise-or-fold。SB 的 complete（rp==1）保留（GTO 合理）；
+    /// BB 此局面是 `Check`（无 `Call` 可删）。治 S4「UTG limp 16.6%」病 + 缩树。`false` =
+    /// 关（HU 默认 / `first_small_6max` 保持原行为，守 cross-check）。
+    pub no_open_limp: bool,
 }
 
 impl BettingAbstractionRules {
@@ -101,6 +108,7 @@ impl Default for BettingAbstractionRules {
         BettingAbstractionRules {
             drop_small_reraise: false,
             width_redirect: Self::WIDTH_REDIRECT_OFF,
+            no_open_limp: false,
         }
     }
 }
@@ -117,6 +125,29 @@ pub fn first_small_6max(width_redirect: u8) -> (StreetActionAbstraction, Betting
     let rules = BettingAbstractionRules {
         drop_small_reraise: true,
         width_redirect,
+        no_open_limp: false,
+    };
+    (abs, rules)
+}
+
+/// S4 reshape：在 [`first_small_6max`] 基础上 **加 2.25BB 开池档 + 禁非 SB 开池 limp**。
+/// preflop 菜单 `{0.5,1.0}`（drop_small_reraise raises-aware → 0.5 仅作开池 = 越过 BB 的
+/// 首个 raise ≈ 2.25BB；3bet+ 一律 1.0pot），postflop `{0.5,1.0}` 不变。`no_open_limp`
+/// 删 UTG/HJ/CO/BTN 的 open-limp（SB complete 保留）。
+///
+/// 动机（`docs/six_max_nlhe_target.md` S4 诊断 + 2026-06-01 噪声实测）：1B blueprint 的
+/// 弱点是 ① 过度 limp（UTG 16.6%）② 唯一 3.5BB 开池档太大 → 边缘手宁可 limp/fold。本 profile
+/// 两头夹：给便宜开池档（更多手能 raise-in），同时拿掉 limp 这条被噪声填满的劣化支路。
+pub fn first_small_preopen_6max(
+    width_redirect: u8,
+) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let pre = ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("preflop {0.5,1.0} 合法");
+    let post = || ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("postflop {0.5,1.0} 合法");
+    let abs = StreetActionAbstraction::per_street([pre, post(), post(), post()]);
+    let rules = BettingAbstractionRules {
+        drop_small_reraise: true,
+        width_redirect,
+        no_open_limp: true,
     };
     (abs, rules)
 }
@@ -171,8 +202,9 @@ impl PublicBettingTree {
             !state.is_terminal() && state.current_player().is_some(),
             "root state must be a Player decision node"
         );
-        // root entrants = 0：盲注是强制投入、非 voluntary（probe 同口径）。
-        tree.root_id = tree.walk(state, None, None, abs, &rules, 0);
+        // root entrants = 0：盲注是强制投入、非 voluntary（probe 同口径）。raises_on_street = 0
+        // （preflop BB 是强制盲注、非 walk 动作，不计进攻 → preflop 首个 raise 见 raises==0）。
+        tree.root_id = tree.walk(state, None, None, abs, &rules, 0, 0);
         tree
     }
 
@@ -185,12 +217,29 @@ impl PublicBettingTree {
         abs: &StreetActionAbstraction,
         rules: &BettingAbstractionRules,
         entrants: u16,
+        raises_on_street: u32,
     ) -> NodeId {
         let actor = state
             .current_player()
             .expect("walk only invoked on Player nodes")
             .0 as PlayerId;
         let my_id = self.nodes.len() as NodeId;
+
+        // no_open_limp：preflop 未被加注（max committed == BB）且 actor 非 SB（rp != 1）→
+        // 该节点的 `Call` 是 open-limp，删之（强制 raise-or-fold）。BB（rp==2）此局面是
+        // free-check 无 Call，moot；SB（rp==1）的 complete 保留（GTO 合理）。rules 关时恒 false。
+        let drop_open_limp = rules.no_open_limp && state.street() == Street::Preflop && {
+            let cfg = state.config();
+            let max_committed = state
+                .players()
+                .iter()
+                .map(|p| p.committed_this_round)
+                .max()
+                .unwrap_or(ChipAmount::ZERO);
+            let n = cfg.n_seats;
+            let rp = (actor + n - cfg.button_seat.0) % n; // BTN=0 SB=1 BB=2 UTG=3..
+            max_committed == cfg.big_blind && rp != 1
+        };
 
         // A4 redirect 不变量（closing-action 精确收口）：postflop 在场恒 ≤ N。>N 只可能
         // 是多人 all-in 跑马（无 postflop 下注，不进 walk）。debug 建树即验（= probe
@@ -207,7 +256,14 @@ impl PublicBettingTree {
         let legal_set = abs.abstract_actions(&state);
         // A3×A4 过滤（drop_small_reraise + redirect 禁被动进场）。filter 后的集合同时
         // 决定 node.legal_actions 与 children → child 下标恒对齐 legal_actions（D-209）。
-        let allowed = filter_actions(&legal_set, actor, entrants, rules);
+        let allowed = filter_actions(
+            &legal_set,
+            actor,
+            entrants,
+            rules,
+            raises_on_street,
+            drop_open_limp,
+        );
         let legal_actions: SmallVec<[AbstractActionTag; 8]> =
             allowed.iter().map(AbstractActionTag::of).collect();
 
@@ -234,6 +290,16 @@ impl PublicBettingTree {
             } else {
                 entrants | (1u16 << actor)
             };
+            // raises_on_street（A3 raises-aware）：切街清零；本街进攻（Bet/Raise/AllIn）+1；
+            // 被动（Check/Call/Fold）不变。下一节点据此判 0.5 是开池(raises==0)还是 re-raise。
+            // 用 `as u8` 比街（next 可能是 terminal Showdown，不能过 street_to_tag）。
+            let next_raises = if next_state.street() as u8 != state.street() as u8 {
+                0
+            } else if is_aggression(&action) {
+                raises_on_street + 1
+            } else {
+                raises_on_street
+            };
             let child = if next_state.is_terminal() {
                 Child::Terminal
             } else {
@@ -245,6 +311,7 @@ impl PublicBettingTree {
                     abs,
                     rules,
                     next_entrants,
+                    next_raises,
                 ))
             };
             children.push(child);
@@ -302,9 +369,22 @@ fn live_count(state: &GameState) -> u8 {
         .count() as u8
 }
 
-/// 对 `abs.abstract_actions(state)` 套 A3×A4 过滤（逐字对齐
+/// 进攻动作（推进 `raises_on_street`）：`Bet` / `Raise` / `AllIn`。把 AllIn 也计进攻，
+/// 保证任何 postflop `Raise` 必见 `raises_on_street > 0`（postflop Raise 恒有前序进攻：
+/// Bet 或越-bet 的 AllIn 都已 +1）→ raises-aware drop 与历史「删全部 Raise{0.5}」byte-equal。
+fn is_aggression(a: &AbstractAction) -> bool {
+    matches!(
+        a,
+        AbstractAction::Bet { .. } | AbstractAction::Raise { .. } | AbstractAction::AllIn { .. }
+    )
+}
+
+/// 对 `abs.abstract_actions(state)` 套 A3×A4(+S4 reshape) 过滤（A3×A4 部分逐字对齐
 /// `tools/nlhe_betting_tree_sizing.rs` 的 `WIDTH_REDIRECT` 探针 `6e6acac`）：
-/// - `drop_small_reraise`：删 `Raise{0.5pot}`（0.5 仅开池）。
+/// - `drop_small_reraise`（raises-aware）：仅当 `raises_on_street > 0` 删 `Raise{0.5pot}`
+///   （0.5 仅作首次进攻）。postflop `Raise` 恒有前序进攻 → 与历史「删全部 Raise{0.5}」
+///   byte-equal；preflop 菜单含 0.5 时其开池 Raise（raises==0）得以保留 = 2.25BB 开池档。
+/// - `drop_open_limp`（S4 no_open_limp，已在 walk 算好「preflop 未加注 + actor 非 SB」）：删 `Call`。
 /// - width redirect：第 (N+1) 个 entrant 留下 → 删 `Check`/`Call`（fold 或 squeeze）。
 ///   `e` = 当前 entrant 数；actor 已是 entrant → 留下 E 不变，否则 E+1；留下后 > N 即 gate。
 ///
@@ -312,11 +392,14 @@ fn live_count(state: &GameState) -> u8 {
 /// 结果**永不为空**：规则引擎恒供 AllIn（`stack>0`，`state.rs:304`）+ Fold（`:299`），
 /// 过滤只删 Check/Call/Raise{0.5}（注：free-check 局面抽象层已按 D-204 不发 Fold，故
 /// 超员 limped 池被 gate 的 (N+1) 进场者落在 squeeze/all-in，见设计 §7）。
+#[allow(clippy::too_many_arguments)]
 fn filter_actions(
     legal_set: &AbstractActionSet,
     actor: PlayerId,
     entrants: u16,
     rules: &BettingAbstractionRules,
+    raises_on_street: u32,
+    drop_open_limp: bool,
 ) -> SmallVec<[AbstractAction; 8]> {
     let block_passive = if rules.width_redirect != BettingAbstractionRules::WIDTH_REDIRECT_OFF {
         let e = entrants.count_ones();
@@ -330,12 +413,15 @@ fn filter_actions(
         .iter()
         .copied()
         .filter(|a| {
-            if rules.drop_small_reraise {
+            if rules.drop_small_reraise && raises_on_street > 0 {
                 if let AbstractAction::Raise { ratio_label, .. } = a {
                     if *ratio_label == BetRatio::HALF_POT {
                         return false;
                     }
                 }
+            }
+            if drop_open_limp && matches!(a, AbstractAction::Call { .. }) {
+                return false;
             }
             if block_passive && matches!(a, AbstractAction::Check | AbstractAction::Call { .. }) {
                 return false;
@@ -352,6 +438,85 @@ mod tests {
 
     fn build_default_tree() -> PublicBettingTree {
         PublicBettingTree::build(&TableConfig::default_hu_200bb())
+    }
+
+    /// S4 reshape sizing：打印 baseline / +no_limp / +preopen 三 profile 的节点·infoset·
+    /// 两表内存，对照当前 N=3 (1,154,822 / 230.5M / 8.04 GiB)。节点计数确定、机器无关 →
+    /// 本机跑可信。`cargo test --release -- --ignored --nocapture reshape_sizes`。
+    #[test]
+    #[ignore = "sizing 诊断打印；release + --ignored --nocapture 跑"]
+    fn reshape_sizes() {
+        let cfg = TableConfig::default_6max_100bb();
+        let summarize =
+            |label: &str, abs: &StreetActionAbstraction, rules: BettingAbstractionRules| {
+                let tree = PublicBettingTree::build_with_rules(&cfg, abs, rules);
+                let (mut pre_nodes, mut post_nodes, mut rows, mut slots) = (0u64, 0u64, 0u64, 0u64);
+                for id in 0..tree.num_nodes() as NodeId {
+                    let node = tree.node(id);
+                    let buckets = if node.street == StreetTag::Preflop {
+                        169
+                    } else {
+                        200
+                    };
+                    if node.street == StreetTag::Preflop {
+                        pre_nodes += 1;
+                    } else {
+                        post_nodes += 1;
+                    }
+                    rows += buckets;
+                    slots += buckets * node.legal_actions.len() as u64;
+                }
+                let two_tables_gib = (slots * 8 * 2) as f64 / (1u64 << 30) as f64;
+                println!(
+                    "{label:<26} nodes={:>9} (pre {pre_nodes}/post {post_nodes}) infosets={:>13} \
+                 two_tables={two_tables_gib:6.2} GiB",
+                    tree.num_nodes(),
+                    rows,
+                );
+            };
+
+        let (b_abs, b_rules) = first_small_6max(3);
+        summarize("baseline first_small N=3", &b_abs, b_rules);
+
+        let (nl_abs, mut nl_rules) = first_small_6max(3);
+        nl_rules.no_open_limp = true;
+        summarize("+no_open_limp N=3", &nl_abs, nl_rules);
+
+        let (pp_abs, pp_rules) = first_small_preopen_6max(3);
+        summarize("+preopen(0.5,1)+no_limp N=3", &pp_abs, pp_rules);
+    }
+
+    /// 结构守门：reshape 确实在 UTG 根删掉 open-limp Call 且给两个开池档；baseline 仍有 limp。
+    /// 证明 `no_open_limp` + preflop`{0.5,1}` 接对了（非只是树变小）。
+    #[test]
+    fn reshape_root_drops_open_limp() {
+        let cfg = TableConfig::default_6max_100bb();
+        // baseline：UTG 根有 open-limp Call。
+        let (b_abs, b_rules) = first_small_6max(3);
+        let bt = PublicBettingTree::build_with_rules(&cfg, &b_abs, b_rules);
+        let broot = bt.node(bt.root_id());
+        assert_eq!(broot.street, StreetTag::Preflop);
+        assert!(
+            broot.legal_actions.contains(&AbstractActionTag::Call),
+            "baseline UTG 根应允许 open-limp Call"
+        );
+        // preopen：UTG 根无 Call、有 2 个 Raise 档（0.5=2.25BB / 1.0=3.5BB）+ Fold + AllIn。
+        let (abs, rules) = first_small_preopen_6max(3);
+        let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+        let root = t.node(t.root_id());
+        assert_eq!(root.street, StreetTag::Preflop);
+        assert!(
+            !root.legal_actions.contains(&AbstractActionTag::Call),
+            "no_open_limp：UTG 根必须删 open-limp Call"
+        );
+        let n_raises = root
+            .legal_actions
+            .iter()
+            .filter(|t| matches!(t, AbstractActionTag::Raise(_)))
+            .count();
+        assert_eq!(n_raises, 2, "preopen：UTG 根应有 2 个开池档（0.5/1.0）");
+        assert!(root.legal_actions.contains(&AbstractActionTag::Fold));
+        assert!(root.legal_actions.contains(&AbstractActionTag::AllIn));
     }
 
     /// 默认全街 `{0.5,1,2}` 树节点数 = 240,096（与 `nlhe_betting_tree_sizing` 工具
