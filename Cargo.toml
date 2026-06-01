@@ -108,6 +108,12 @@ path = "tools/bucket_quality_dump.rs"
 name = "multiway_equity_probe"
 path = "tools/multiway_equity_probe.rs"
 
+# S3 实验 A2：flop/turn vs-1 与 vs-N 8-bin equity 直方图各跑 K=500 k-means，比 ARI
+# （含 k-means 初值噪声底）。判 vs-1 hist 桶是否已吸收多人重排 / flop/turn 须否算 vs-N hist。
+[[bin]]
+name = "multiway_hist_ari"
+path = "tools/multiway_hist_ari.rs"
+
 # 阶段 3 D-372 / API-370：CFR / MCCFR 训练 CLI。`--game {kuhn,leduc,nlhe} --trainer
 # {vanilla,es-mccfr} --iter N --seed S --checkpoint-dir DIR` 等 flag 锁在
 # `docs/pluribus_stage3_api.md` API-370。A1 \[实现\] 阶段 main body 走 stub；
