@@ -13,7 +13,7 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -125,7 +125,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn inspect_checkpoint(path: &PathBuf, bucket_table_path: &PathBuf) -> Result<Report, String> {
+fn inspect_checkpoint(path: &Path, bucket_table_path: &Path) -> Result<Report, String> {
     let mut file = File::open(path).map_err(|e| format!("open {} failed: {e}", path.display()))?;
     let actual_file_bytes = file
         .metadata()
@@ -199,7 +199,7 @@ fn inspect_checkpoint(path: &PathBuf, bucket_table_path: &PathBuf) -> Result<Rep
 }
 
 fn build_indexer(
-    bucket_table_path: &PathBuf,
+    bucket_table_path: &Path,
     expected_bucket_blake3: [u8; 32],
 ) -> Result<(PathBuf, NlheDenseIndexer), String> {
     let table = Arc::new(BucketTable::open(bucket_table_path).map_err(|e| {
@@ -225,7 +225,7 @@ fn build_indexer(
         table.bucket_count(StreetTag::River),
     ];
     Ok((
-        bucket_table_path.clone(),
+        bucket_table_path.to_path_buf(),
         NlheDenseIndexer::from_tree(game.tree(), counts),
     ))
 }

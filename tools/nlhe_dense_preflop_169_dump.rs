@@ -193,8 +193,12 @@ fn build_all_169_hands() -> Vec<(&'static str, [Card; 2], u8)> {
     use Suit::*;
 
     // 13 ranks from A down to 2
-    let ranks = [Ace, King, Queen, Jack, Ten, Nine, Eight, Seven, Six, Five, Four, Three, Two];
-    let rank_chars = ['A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2'];
+    let ranks = [
+        Ace, King, Queen, Jack, Ten, Nine, Eight, Seven, Six, Five, Four, Three, Two,
+    ];
+    let rank_chars = [
+        'A', 'K', 'Q', 'J', 'T', '9', '8', '7', '6', '5', '4', '3', '2',
+    ];
 
     let preflop = PreflopLossless169::new();
     let mut result = Vec::with_capacity(169);
