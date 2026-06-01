@@ -116,6 +116,31 @@ pub struct NlheEvaluationReport {
     pub bb_mbb_per_game: f64,
 }
 
+/// 6-max（多人）blueprint vs baseline 评测结果（S4 gate）。
+///
+/// 与 HU [`NlheEvaluationReport`] 的区别：blueprint 轮遍全部 `n_players` 座（每座
+/// `hands_per_seat` 手）vs **其余 N-1 座全打同一 baseline**，并按**相对按钮的位置**
+/// （offset 0 = 按钮 BTN、1 = SB、2 = BB、3 = UTG、4 = HJ/MP、5 = CO）拆收益——
+/// 6-max 位置差异巨大，总均值会掩盖。门槛（S4）：1,000,000 手稳定击败 random /
+/// call-station / tight-aggressive（必要非充分）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NlheMultiwayEvalReport {
+    pub baseline: NlheBaselinePolicy,
+    pub n_players: usize,
+    /// 总手数 = `hands_per_seat * n_players`。
+    pub hands: u64,
+    pub hands_per_seat: u64,
+    pub seed: u64,
+    pub blueprint_total_chips: f64,
+    pub mbb_per_game: f64,
+    pub standard_error_mbb_per_game: f64,
+    pub ci95_low_mbb_per_game: f64,
+    pub ci95_high_mbb_per_game: f64,
+    /// 按相对按钮位置 offset 拆的 mbb/g（下标 = `(seat - button) mod n_players`；
+    /// 0 = BTN、1 = SB、2 = BB、3 = UTG、...）。长度 = `n_players`。
+    pub per_position_mbb_per_game: Vec<f64>,
+}
+
 /// 历史名称，等价于 [`LbrConfig`]。LBR proxy 已 game-generic 化，新代码请直接
 /// 用 [`LbrConfig`]；此 alias 仅为保持公开 API 稳定（`NlheLbrConfig::default()` /
 /// 字段访问全部继承自 generic）。
@@ -190,6 +215,84 @@ pub fn evaluate_blueprint_vs_baseline(
         ci95_high_mbb_per_game: mean_mbb + 1.96 * se_mbb,
         sb_mbb_per_game: (sb_pnl / config.hands_per_seat as f64) * scale,
         bb_mbb_per_game: (bb_pnl / config.hands_per_seat as f64) * scale,
+    })
+}
+
+/// 6-max（多人）blueprint vs baseline 评测（S4 gate）。blueprint 依次坐遍全部
+/// `n_players` 座（每座 `hands_per_seat` 手），**其余 N-1 座全打同一 `baseline`**；
+/// 复用 [`rollout_blueprint_vs_baseline`]（已 N-generic：actor == blueprint_seat 走
+/// blueprint，否则走 baseline）。按相对按钮位置拆收益。
+///
+/// 每座、每手用 `mix3(seed, seat, hand)` 派生独立 rng → 固定 seed 可复现（S5 要求）。
+/// n_players == 2 时与 [`evaluate_blueprint_vs_baseline`] 同口径（轮遍 2 座 vs 1 对手），
+/// 只是报告形态换成 per-position（HU 那版保留 SB/BB 命名，不动）。
+pub fn evaluate_blueprint_vs_baseline_multiway(
+    game: &SimplifiedNlheGame,
+    blueprint_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
+    baseline: NlheBaselinePolicy,
+    config: &NlheEvaluationConfig,
+) -> Result<NlheMultiwayEvalReport, NlheEvaluationError> {
+    if config.hands_per_seat == 0 {
+        return Err(NlheEvaluationError::InvalidConfig {
+            reason: "hands_per_seat must be > 0".to_string(),
+        });
+    }
+    if config.max_actions_per_hand == 0 {
+        return Err(NlheEvaluationError::InvalidConfig {
+            reason: "max_actions_per_hand must be > 0".to_string(),
+        });
+    }
+
+    let n_players = game.n_players();
+    let button = game.config.button_seat.0 as usize;
+    let mut all_pnl_chips: Vec<f64> =
+        Vec::with_capacity(config.hands_per_seat as usize * n_players);
+    let mut per_pos_sum = vec![0.0_f64; n_players];
+
+    for seat_idx in 0..n_players {
+        let blueprint_seat = SeatId(seat_idx as u8);
+        // 相对按钮的位置 offset（0 = BTN、1 = SB、2 = BB、...）。
+        let offset = (seat_idx + n_players - button) % n_players;
+        for hand_idx in 0..config.hands_per_seat {
+            let seed = mix3(config.seed, seat_idx as u64, hand_idx);
+            let mut rng = ChaCha20Rng::from_seed(seed);
+            let root = game.root(&mut rng);
+            let terminal = rollout_blueprint_vs_baseline(
+                root,
+                blueprint_seat,
+                baseline,
+                blueprint_strategy,
+                &mut rng,
+                config.max_actions_per_hand,
+            )?;
+            let pnl = payoff_for_seat(&terminal, blueprint_seat)?;
+            per_pos_sum[offset] += pnl;
+            all_pnl_chips.push(pnl);
+        }
+    }
+
+    let hands = all_pnl_chips.len() as u64;
+    let bb_chips = game.config.big_blind.as_u64() as f64;
+    let scale = 1000.0 / bb_chips;
+    let stats = sample_stats(&all_pnl_chips);
+    let mean_mbb = stats.mean * scale;
+    let se_mbb = stats.standard_error * scale;
+    let per_position_mbb_per_game = per_pos_sum
+        .iter()
+        .map(|s| (s / config.hands_per_seat as f64) * scale)
+        .collect();
+    Ok(NlheMultiwayEvalReport {
+        baseline,
+        n_players,
+        hands,
+        hands_per_seat: config.hands_per_seat,
+        seed: config.seed,
+        blueprint_total_chips: all_pnl_chips.iter().sum(),
+        mbb_per_game: mean_mbb,
+        standard_error_mbb_per_game: se_mbb,
+        ci95_low_mbb_per_game: mean_mbb - 1.96 * se_mbb,
+        ci95_high_mbb_per_game: mean_mbb + 1.96 * se_mbb,
+        per_position_mbb_per_game,
     })
 }
 

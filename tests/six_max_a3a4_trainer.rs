@@ -23,7 +23,8 @@ use poker::training::nlhe::SimplifiedNlheGame;
 use poker::training::nlhe_betting_tree::first_small_6max;
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{
-    ConvergenceMonitor, EsMccfrTrainer, Game, MonitorReport, StrategySnapshot, Trainer,
+    evaluate_blueprint_vs_baseline_multiway, ConvergenceMonitor, EsMccfrTrainer, Game,
+    MonitorReport, NlheBaselinePolicy, NlheEvaluationConfig, StrategySnapshot, Trainer,
 };
 use poker::{BucketConfig, BucketTable, ChaCha20Rng, InfoSetId, RngSource, TableConfig};
 
@@ -188,6 +189,71 @@ fn six_max_a3a4_hashmap_train_monitor_checkpoint() {
     assert_report_sane(&r_resume, false);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// N 座 baseline 评测 harness（S4 gate）：blueprint 轮遍 6 座 vs 5 baseline，验
+/// 报告 shape + 按位置拆收益 + 固定 seed 可复现。用 uniform blueprint（验 harness
+/// 机制，不验质量——质量要 AWS 真训练的 ckpt）。
+#[test]
+fn six_max_multiway_eval_harness() {
+    let game = build_six_max_game();
+    // uniform blueprint：每 infoset 在 n 个动作上均匀（empty 也会被 harness 兜底成
+    // uniform，这里显式返回非空以走正常归一化路径）。
+    let uniform: &dyn Fn(&InfoSetId, usize) -> Vec<f64> = &|_info, n| vec![1.0 / n as f64; n];
+    let config = NlheEvaluationConfig {
+        hands_per_seat: 200,
+        seed: 0x6E5F_5345_4154_0001,
+        max_actions_per_hand: 512,
+    };
+
+    for baseline in [
+        NlheBaselinePolicy::Random,
+        NlheBaselinePolicy::CallStation,
+        NlheBaselinePolicy::OverlyTight,
+    ] {
+        let r = evaluate_blueprint_vs_baseline_multiway(&game, uniform, baseline, &config)
+            .expect("multiway eval");
+        assert_eq!(r.n_players, 6, "6-max n_players");
+        assert_eq!(r.hands, 200 * 6, "总手数 = hands_per_seat × n_players");
+        assert_eq!(r.hands_per_seat, 200);
+        assert_eq!(
+            r.per_position_mbb_per_game.len(),
+            6,
+            "按位置拆收益应有 6 项（BTN/SB/BB/UTG/HJ/CO）"
+        );
+        assert!(
+            r.mbb_per_game.is_finite()
+                && r.standard_error_mbb_per_game.is_finite()
+                && r.standard_error_mbb_per_game >= 0.0,
+            "mbb/g + SE 应有限非负"
+        );
+        assert!(
+            r.ci95_low_mbb_per_game <= r.mbb_per_game && r.mbb_per_game <= r.ci95_high_mbb_per_game,
+            "CI95 应包住均值：[{}, {}] ∌ {}",
+            r.ci95_low_mbb_per_game,
+            r.ci95_high_mbb_per_game,
+            r.mbb_per_game
+        );
+        assert!(
+            r.per_position_mbb_per_game.iter().all(|v| v.is_finite()),
+            "每位置 mbb/g 应有限"
+        );
+
+        // 固定 seed 可复现：同 config 再跑一次逐位相等。
+        let r2 = evaluate_blueprint_vs_baseline_multiway(&game, uniform, baseline, &config)
+            .expect("multiway eval 复跑");
+        assert_eq!(
+            r.mbb_per_game.to_bits(),
+            r2.mbb_per_game.to_bits(),
+            "固定 seed 评测应可复现（{:?}）",
+            baseline
+        );
+        assert_eq!(
+            r.blueprint_total_chips.to_bits(),
+            r2.blueprint_total_chips.to_bits(),
+            "总筹码应逐位复现"
+        );
+    }
 }
 
 /// dense 生产路径：full-prealloc 表按 6-max 树定尺寸 + LCFR + 三条写路径（单线程 /

@@ -60,8 +60,9 @@ pub use nlhe::{
 };
 pub use nlhe_eval::{
     estimate_simplified_nlhe_lbr, estimate_simplified_nlhe_lbr_filtered,
-    evaluate_blueprint_vs_baseline, NlheBaselinePolicy, NlheEvaluationConfig, NlheEvaluationReport,
-    NlheLbrConfig, NlheLbrReport,
+    evaluate_blueprint_vs_baseline, evaluate_blueprint_vs_baseline_multiway, NlheBaselinePolicy,
+    NlheEvaluationConfig, NlheEvaluationReport, NlheLbrConfig, NlheLbrReport,
+    NlheMultiwayEvalReport,
 };
 pub use regret::{RegretTable, StrategyAccumulator};
 pub use trainer::{EsMccfrTrainer, Trainer, VanillaCfrTrainer};
