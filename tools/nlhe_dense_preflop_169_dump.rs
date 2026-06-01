@@ -15,20 +15,28 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use poker::training::nlhe::SimplifiedNlheGame;
-use poker::training::nlhe_betting_tree::{AbstractActionTag, Child, NodeId};
+use poker::training::nlhe_betting_tree::{first_small_6max, AbstractActionTag, Child, NodeId};
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
-use poker::{BetRatio, BucketTable, Card, InfoSetId, PreflopLossless169, Rank, Suit};
+use poker::{BetRatio, BucketTable, Card, InfoSetId, PreflopLossless169, Rank, Suit, TableConfig};
 
 struct Args {
     checkpoint: PathBuf,
     bucket_table: PathBuf,
     output: PathBuf,
+    /// `hu`（默认，HU 200BB：SB open + BB vs limp 两 spot）或 `six-max`（6-max
+    /// 100BB A3×A4：沿 fold-chain 导出各位置 RFI 开池范围 UTG/HJ/CO/BTN/SB）。
+    profile: String,
+    /// 仅 six-max：A3×A4 postflop width-redirect cap（须与训练 ckpt 一致，否则
+    /// dense layout fingerprint 不匹配、load 失败）。
+    postflop_cap: u8,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut checkpoint: Option<PathBuf> = None;
     let mut bucket_table: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut profile = "hu".to_string();
+    let mut postflop_cap = 3u8;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut take = || -> Result<String, String> {
@@ -39,10 +47,17 @@ fn parse_args() -> Result<Args, String> {
             "--checkpoint" => checkpoint = Some(PathBuf::from(take()?)),
             "--bucket-table" | "--artifact" => bucket_table = Some(PathBuf::from(take()?)),
             "--output" => output = Some(PathBuf::from(take()?)),
+            "--profile" => profile = take()?,
+            "--postflop-cap" => {
+                postflop_cap = take()?
+                    .parse()
+                    .map_err(|e| format!("bad --postflop-cap: {e}"))?
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "usage: nlhe_dense_preflop_169_dump --checkpoint PATH \
-                     --bucket-table PATH --output PATH"
+                     --bucket-table PATH --output PATH \
+                     [--profile hu|six-max] [--postflop-cap 2|3]"
                 );
                 std::process::exit(0);
             }
@@ -53,6 +68,8 @@ fn parse_args() -> Result<Args, String> {
         checkpoint: checkpoint.ok_or("--checkpoint required")?,
         bucket_table: bucket_table.ok_or("--bucket-table required")?,
         output: output.ok_or("--output required")?,
+        profile,
+        postflop_cap,
     })
 }
 
@@ -62,8 +79,24 @@ fn run(args: Args) -> Result<(), String> {
         BucketTable::open(&args.bucket_table)
             .map_err(|e| format!("BucketTable::open failed: {e:?}"))?,
     );
-    let game = SimplifiedNlheGame::new(Arc::clone(&table))
-        .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?;
+    // profile 分派：hu = 历史默认（byte-equal）；six-max = A3×A4 first-small N-cap game。
+    // ckpt 的 dense layout 由树结构定，故构造的 game 必须与训练时同 profile/cap，否则
+    // load_checkpoint 的 layout fingerprint 校验失败。
+    let game = match args.profile.as_str() {
+        "hu" => SimplifiedNlheGame::new(Arc::clone(&table))
+            .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?,
+        "six-max" => {
+            let (abs, rules) = first_small_6max(args.postflop_cap);
+            SimplifiedNlheGame::new_with_abstraction(
+                Arc::clone(&table),
+                TableConfig::default_6max_100bb(),
+                abs,
+                rules,
+            )
+            .map_err(|e| format!("six-max game build failed: {e:?}"))?
+        }
+        other => return Err(format!("unknown --profile {other} (expected hu | six-max)")),
+    };
 
     eprintln!("[nlhe_dense_preflop_169_dump] loading dense checkpoint...");
     let trainer = DenseNlheEsMccfrTrainer::load_checkpoint(&args.checkpoint, game)
@@ -73,15 +106,40 @@ fn run(args: Args) -> Result<(), String> {
     let tree = game.tree();
     let root_id = tree.root_id();
 
-    // SB 首次行动 = root node
-    // BB facing SB limp = root → Call
-    let bb_post_limp_id = walk(tree, root_id, AbstractActionTag::Call)
-        .ok_or("root has no Call edge — abstraction broken?")?;
-
-    let spots = [
-        ("SB open (首次行动)", root_id, "SB"),
-        ("BB vs SB limp", bb_post_limp_id, "BB"),
-    ];
+    // spots 按 profile 构造（owned String label，HU/六max 统一类型）。
+    let spots: Vec<(String, NodeId, String)> = match args.profile.as_str() {
+        "hu" => {
+            // SB 首次行动 = root；BB facing SB limp = root → Call。
+            let bb_post_limp_id = walk(tree, root_id, AbstractActionTag::Call)
+                .ok_or("root has no Call edge — abstraction broken?")?;
+            vec![
+                ("SB open (首次行动)".to_string(), root_id, "SB".to_string()),
+                (
+                    "BB vs SB limp".to_string(),
+                    bb_post_limp_id,
+                    "BB".to_string(),
+                ),
+            ]
+        }
+        // six-max：沿全员 fold-chain 取各位置首次进场（RFI = raise-first-in）决策节点。
+        // root = UTG，依次 Fold → HJ → CO → BTN → SB（SB fold 后 BB 不劳而获 = terminal，
+        // walk 返回 None 终止）。button 固定 seat0（default_6max_100bb），位置名由
+        // player_acting seat 直接映射。
+        _ => {
+            let mut spots = Vec::new();
+            let mut node = root_id;
+            loop {
+                let seat = tree.node(node).player_acting;
+                let pos = six_max_position_name(seat);
+                spots.push((format!("{pos} RFI (raise-first-in)"), node, pos.to_string()));
+                match walk(tree, node, AbstractActionTag::Fold) {
+                    Some(next) => node = next,
+                    None => break,
+                }
+            }
+            spots
+        }
+    };
 
     // 构建 169 个 canonical 起手牌的标签和代表牌
     let all_169 = build_all_169_hands();
@@ -96,6 +154,16 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(out, "- checkpoint: `{}`", args.checkpoint.display()).unwrap();
     writeln!(out, "- update_count: `{}`", trainer.update_count()).unwrap();
     writeln!(out, "- bucket_table: `{}`", args.bucket_table.display()).unwrap();
+    writeln!(out, "- profile: `{}`", args.profile).unwrap();
+    if args.profile == "six-max" {
+        writeln!(out, "- postflop_cap: `{}`", args.postflop_cap).unwrap();
+        writeln!(
+            out,
+            "- RFI = raise-first-in（沿全员 fold-chain）；看 `Raise(1.0x)` 列 = 开池频率。\
+             6-max 合理性参考：UTG 最紧、向 BTN 逐位放宽；SB 因只剩 BB 范围另算。"
+        )
+        .unwrap();
+    }
     writeln!(out).unwrap();
 
     for (spot_name, node_id, position) in spots {
@@ -161,6 +229,19 @@ fn walk(
     match node.children[idx] {
         Child::Decision(id) => Some(id),
         Child::Terminal => None,
+    }
+}
+
+/// 6-max 位置名（button 固定 seat0，default_6max_100bb）：offset = seat。
+fn six_max_position_name(seat: u8) -> &'static str {
+    match seat {
+        0 => "BTN",
+        1 => "SB",
+        2 => "BB",
+        3 => "UTG",
+        4 => "HJ",
+        5 => "CO",
+        _ => "?",
     }
 }
 
