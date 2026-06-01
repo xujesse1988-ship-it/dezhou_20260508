@@ -604,7 +604,8 @@ enumerated 上界从没量 reached（§A3/§盲点 2）、小注 EV 小且集中
   （2026-06-01，vultr `6e6acac`，`WIDTH_REDIRECT` = closing-action 优先）：redirect 真值 **N=3 8.04 GiB@200 /
   19.97@500、N=2 0.58 / 1.42**，且证 **drop 是上界非下界**（真值小 2.26×，preflop 剪枝盖过 postflop 加回），
   "N=3@500 敏感"消解（详见 §A3×A4 2026-06-01 块）；下一步 = 把该规则接进真 `legal_actions`/`PublicBettingTree`
-  供训练。② 量"≤N-way 强制出局丢多少 EV"定 N（N=3 保 3-way 是甜点）；③ 把 A3×A4 当 perfect-recall 候选与 B3
+  供训练（**实现设计已出：`a3xa4_wiring_design_2026_06_01.md`** — 规则放抽象层不碰规则引擎、运行期
+  `legal_actions` 从树派生 F17-free、节点数对 probe cross-check；待写码）。② 量"≤N-way 强制出局丢多少 EV"定 N（N=3 保 3-way 是甜点）；③ 把 A3×A4 当 perfect-recall 候选与 B3
   一起进 HU 验质量队列。
 
 ## 参考

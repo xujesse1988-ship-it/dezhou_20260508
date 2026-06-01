@@ -14,11 +14,12 @@
 use smallvec::SmallVec;
 
 use crate::abstraction::action::{
-    AbstractAction, ActionAbstraction, BetRatio, StreetActionAbstraction,
+    AbstractAction, AbstractActionSet, ActionAbstraction, ActionAbstractionConfig, BetRatio,
+    StreetActionAbstraction,
 };
 use crate::abstraction::info::StreetTag;
 use crate::core::rng::ChaCha20Rng;
-use crate::core::Street;
+use crate::core::{PlayerStatus, Street};
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::PlayerId;
@@ -73,6 +74,53 @@ pub struct TreeNode {
     pub children: SmallVec<[Child; 8]>,
 }
 
+/// A3×A4 抽象层「改游戏」规则（`docs/temp/a3xa4_wiring_design_2026_06_01.md`）。
+///
+/// 全部作用在 `abs.abstract_actions(state)` 之后、建 node 之前——**不碰规则引擎**
+/// （`GameState::legal_actions` / side pot / showdown 一行不动，S1 PokerKit 跨验证不受
+/// 影响）。`Default`（全关）与历史行为逐节点 byte-equal（守 240,096 / 719,764 节点）。
+#[derive(Copy, Clone, Debug)]
+pub struct BettingAbstractionRules {
+    /// A3 first-bet-small：0.5pot 只许作开池 `Bet`，禁任何 `Raise{0.5pot}`（re-raise
+    /// 一律 1pot）。无状态、逐动作过滤。配 preflop{1} postflop{0.5,1} 菜单用
+    /// （见 [`first_small_6max`]）。
+    pub drop_small_reraise: bool,
+    /// A4 width redirect（closing-action 优先）：preflop 第 (N+1) 个 entrant 禁被动
+    /// 进场（删 `Check`/`Call`，只剩 fold 或 squeeze），把见 flop 人数收到 ≤ N。
+    /// [`WIDTH_REDIRECT_OFF`](Self::WIDTH_REDIRECT_OFF) = 关。
+    pub width_redirect: u8,
+}
+
+impl BettingAbstractionRules {
+    /// `width_redirect` 关闭哨兵（n_seats ≤ 9 < 255，永不触发 gate）。
+    pub const WIDTH_REDIRECT_OFF: u8 = 255;
+}
+
+impl Default for BettingAbstractionRules {
+    fn default() -> Self {
+        BettingAbstractionRules {
+            drop_small_reraise: false,
+            width_redirect: Self::WIDTH_REDIRECT_OFF,
+        }
+    }
+}
+
+/// A3×A4 first-bet-small 6-max profile：preflop `{1}` / postflop `{0.5,1}` 菜单 +
+/// `drop_small_reraise`（0.5 仅开池）**配对**返回，杜绝菜单/标志错配（只设菜单不设
+/// 标志 = 全程含 0.5 re-raise = 224 GiB 那版；反之标志空转）。`width_redirect` = N
+/// （2/3，[`BettingAbstractionRules::WIDTH_REDIRECT_OFF`] = 不限宽）。配
+/// `TableConfig::default_6max_100bb()` 建树即 §A3×A4 capped 博弈。
+pub fn first_small_6max(width_redirect: u8) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let pre = ActionAbstractionConfig::new(vec![1.0]).expect("preflop {1.0} 合法");
+    let post = || ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("postflop {0.5,1.0} 合法");
+    let abs = StreetActionAbstraction::per_street([pre, post(), post(), post()]);
+    let rules = BettingAbstractionRules {
+        drop_small_reraise: true,
+        width_redirect,
+    };
+    (abs, rules)
+}
+
 pub struct PublicBettingTree {
     nodes: Vec<TreeNode>,
     root_id: NodeId,
@@ -100,6 +148,19 @@ impl PublicBettingTree {
         config: &TableConfig,
         abs: &StreetActionAbstraction,
     ) -> PublicBettingTree {
+        Self::build_with_rules(config, abs, BettingAbstractionRules::default())
+    }
+
+    /// 用指定 abstraction + A3×A4 规则（[`BettingAbstractionRules`]）建树。
+    /// `rules == Default`（全关）时与 [`build_with_abstraction`](Self::build_with_abstraction)
+    /// 逐节点 byte-equal；设 `drop_small_reraise` / `width_redirect` 即 §A3×A4 capped
+    /// 博弈（见 `docs/temp/a3xa4_wiring_design_2026_06_01.md`）。同 `(config, abs, rules)`
+    /// 必出同结构（节点顺序确定）。
+    pub fn build_with_rules(
+        config: &TableConfig,
+        abs: &StreetActionAbstraction,
+        rules: BettingAbstractionRules,
+    ) -> PublicBettingTree {
         let mut tree = PublicBettingTree {
             nodes: Vec::new(),
             root_id: 0,
@@ -110,16 +171,20 @@ impl PublicBettingTree {
             !state.is_terminal() && state.current_player().is_some(),
             "root state must be a Player decision node"
         );
-        tree.root_id = tree.walk(state, None, None, abs);
+        // root entrants = 0：盲注是强制投入、非 voluntary（probe 同口径）。
+        tree.root_id = tree.walk(state, None, None, abs, &rules, 0);
         tree
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         &mut self,
         state: GameState,
         parent: Option<NodeId>,
         action_from_parent: Option<AbstractActionTag>,
         abs: &StreetActionAbstraction,
+        rules: &BettingAbstractionRules,
+        entrants: u16,
     ) -> NodeId {
         let actor = state
             .current_player()
@@ -127,9 +192,24 @@ impl PublicBettingTree {
             .0 as PlayerId;
         let my_id = self.nodes.len() as NodeId;
 
+        // A4 redirect 不变量（closing-action 精确收口）：postflop 在场恒 ≤ N。>N 只可能
+        // 是多人 all-in 跑马（无 postflop 下注，不进 walk）。debug 建树即验（= probe
+        // redirect_postflop_over_n == 0 的生产侧断言）。
+        debug_assert!(
+            rules.width_redirect == BettingAbstractionRules::WIDTH_REDIRECT_OFF
+                || state.street() == Street::Preflop
+                || live_count(&state) <= rules.width_redirect,
+            "redirect invariant 破：postflop live {} > N {}",
+            live_count(&state),
+            rules.width_redirect
+        );
+
         let legal_set = abs.abstract_actions(&state);
+        // A3×A4 过滤（drop_small_reraise + redirect 禁被动进场）。filter 后的集合同时
+        // 决定 node.legal_actions 与 children → child 下标恒对齐 legal_actions（D-209）。
+        let allowed = filter_actions(&legal_set, actor, entrants, rules);
         let legal_actions: SmallVec<[AbstractActionTag; 8]> =
-            legal_set.iter().map(AbstractActionTag::of).collect();
+            allowed.iter().map(AbstractActionTag::of).collect();
 
         // Placeholder for stable index; children backfilled after recursion.
         self.nodes.push(TreeNode {
@@ -137,21 +217,35 @@ impl PublicBettingTree {
             player_acting: actor,
             parent,
             action_from_parent,
-            legal_actions: legal_actions.clone(),
+            legal_actions,
             children: SmallVec::new(),
         });
 
         let mut children: SmallVec<[Child; 8]> = SmallVec::new();
-        for action in legal_set.iter().copied() {
+        for action in allowed.iter().copied() {
             let mut next_state = state.clone();
             next_state
                 .apply(action.to_concrete())
                 .expect("action abstraction must emit legal Actions for current state");
+            // entrants 累积（A4 redirect）：Fold 清 actor 位，其它（含 Check）置位；
+            // 跨街不清零（entrant = 谁还在这手牌里）。rules 关时不被读，零影响。
+            let next_entrants = if matches!(action, AbstractAction::Fold) {
+                entrants & !(1u16 << actor)
+            } else {
+                entrants | (1u16 << actor)
+            };
             let child = if next_state.is_terminal() {
                 Child::Terminal
             } else {
                 let next_action_tag = AbstractActionTag::of(&action);
-                Child::Decision(self.walk(next_state, Some(my_id), Some(next_action_tag), abs))
+                Child::Decision(self.walk(
+                    next_state,
+                    Some(my_id),
+                    Some(next_action_tag),
+                    abs,
+                    rules,
+                    next_entrants,
+                ))
             };
             children.push(child);
         }
@@ -199,6 +293,58 @@ fn street_to_tag(s: Street) -> StreetTag {
     }
 }
 
+/// 在场人数（`Active∪AllIn`）= A4 width 口径（all-in 玩家已见后续街、仍在底池）。
+fn live_count(state: &GameState) -> u8 {
+    state
+        .players()
+        .iter()
+        .filter(|p| matches!(p.status, PlayerStatus::Active | PlayerStatus::AllIn))
+        .count() as u8
+}
+
+/// 对 `abs.abstract_actions(state)` 套 A3×A4 过滤（逐字对齐
+/// `tools/nlhe_betting_tree_sizing.rs` 的 `WIDTH_REDIRECT` 探针 `6e6acac`）：
+/// - `drop_small_reraise`：删 `Raise{0.5pot}`（0.5 仅开池）。
+/// - width redirect：第 (N+1) 个 entrant 留下 → 删 `Check`/`Call`（fold 或 squeeze）。
+///   `e` = 当前 entrant 数；actor 已是 entrant → 留下 E 不变，否则 E+1；留下后 > N 即 gate。
+///
+/// `entrants` = 本手已做过 ≥1 非弃牌动作的座位 bitmask（含 Check；Fold 清位）。
+/// 结果**永不为空**：规则引擎恒供 AllIn（`stack>0`，`state.rs:304`）+ Fold（`:299`），
+/// 过滤只删 Check/Call/Raise{0.5}（注：free-check 局面抽象层已按 D-204 不发 Fold，故
+/// 超员 limped 池被 gate 的 (N+1) 进场者落在 squeeze/all-in，见设计 §7）。
+fn filter_actions(
+    legal_set: &AbstractActionSet,
+    actor: PlayerId,
+    entrants: u16,
+    rules: &BettingAbstractionRules,
+) -> SmallVec<[AbstractAction; 8]> {
+    let block_passive = if rules.width_redirect != BettingAbstractionRules::WIDTH_REDIRECT_OFF {
+        let e = entrants.count_ones();
+        let actor_in = (entrants >> actor) & 1 == 1;
+        let stay_e = if actor_in { e } else { e + 1 };
+        stay_e > u32::from(rules.width_redirect)
+    } else {
+        false
+    };
+    legal_set
+        .iter()
+        .copied()
+        .filter(|a| {
+            if rules.drop_small_reraise {
+                if let AbstractAction::Raise { ratio_label, .. } = a {
+                    if *ratio_label == BetRatio::HALF_POT {
+                        return false;
+                    }
+                }
+            }
+            if block_passive && matches!(a, AbstractAction::Check | AbstractAction::Call { .. }) {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +385,39 @@ mod tests {
             tree.num_nodes(),
             719_764,
             "目标 profile 树节点数偏离 sizing 工具实测 719,764"
+        );
+    }
+
+    /// A3×A4 capped 博弈（first-bet-small × width redirect）生产树节点数对
+    /// `nlhe_betting_tree_sizing` 探针（`6e6acac`，`FIRST_SMALL=1 WIDTH_REDIRECT=N`）
+    /// 实测的 cross-check：tree builder 与 sizing 工具两条独立路径对得上 = A3×A4 过滤
+    /// 接对了。N=2 在 debug 跑（78,852 < 默认 240,096，快），顺带在 debug 触发 walk 里
+    /// 的 redirect 不变量 `debug_assert`（postflop live ≤ 2）。
+    #[test]
+    fn redirect_capped_tree_n2_node_count_matches_sizing_tool() {
+        let (abs, rules) = first_small_6max(2);
+        let tree =
+            PublicBettingTree::build_with_rules(&TableConfig::default_6max_100bb(), &abs, rules);
+        assert_eq!(
+            tree.num_nodes(),
+            78_852,
+            "first_small × WIDTH_REDIRECT=2 节点数偏离 probe 实测 78,852"
+        );
+    }
+
+    /// N=3（保 3-way 的甜点）：1,154,822 节点，与 probe `FIRST_SMALL=1 WIDTH_REDIRECT=3`
+    /// 逐字对上（infoset@200 = 230.5M、max depth 25，见 §A3×A4 2026-06-01）。
+    /// `#[ignore]`：1.15M 节点 debug 建树慢，走 `cargo test --release -- --ignored`。
+    #[test]
+    #[ignore = "构建 1,154,822 节点 A3×A4 树较慢；release + --ignored 跑"]
+    fn redirect_capped_tree_n3_node_count_matches_sizing_tool() {
+        let (abs, rules) = first_small_6max(3);
+        let tree =
+            PublicBettingTree::build_with_rules(&TableConfig::default_6max_100bb(), &abs, rules);
+        assert_eq!(
+            tree.num_nodes(),
+            1_154_822,
+            "first_small × WIDTH_REDIRECT=3 节点数偏离 probe 实测 1,154,822"
         );
     }
 
