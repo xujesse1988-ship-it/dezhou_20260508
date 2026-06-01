@@ -151,7 +151,7 @@ impl SimplifiedNlheGame {
     ///
     /// 校验项（D-314-rev1）：
     /// - `BucketTable::schema_version()` == `4`（v1/v2/v3 已废弃）
-    /// - `BucketTable::config()` is supported (`500/500/500` or `1000/1000/1000`)
+    /// - `BucketTable::config()` is supported (`200/200/200`, `500/500/500` or `1000/1000/1000`)
     ///
     /// 失败路径：[`TrainerError::UnsupportedBucketTable`]。`expected` 字段
     /// 编码 `schema_version`；`got` 字段编码实际 schema_version（schema 不匹配）
@@ -173,11 +173,11 @@ impl SimplifiedNlheGame {
     /// [`first_small_6max`](crate::training::nlhe_betting_tree::first_small_6max)（返回
     /// 配对的 abstraction + rules）。
     ///
-    /// **桶表 caveat**：当前 `bucket_table` 仍是 HU 单对手 equity 桶（postflop 500/1000）；
+    /// **桶表 caveat**：当前 `bucket_table` 仍是 HU 单对手 equity 桶（postflop 200/500/1000）；
     /// 6-max 多路桶是 S3、未做。故 6-max game 的 hand_bucket 语义是 **HU 占位**——可构造、
     /// CFR 机制能跑（plumbing 验证），但**有意义的训练须等 S3 多路桶**。
     ///
-    /// 校验同 [`new`](Self::new)：bucket schema v4 + 支持的 postflop config（500/1000）。
+    /// 校验同 [`new`](Self::new)：bucket schema v4 + 支持的 postflop config（200/500/1000）。
     pub fn new_with_abstraction(
         bucket_table: Arc<BucketTable>,
         config: TableConfig,
