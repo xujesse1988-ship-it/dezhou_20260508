@@ -102,6 +102,12 @@ path = "tools/b3sum.rs"
 name = "bucket_quality_dump"
 path = "tools/bucket_quality_dump.rs"
 
+# S3 实验 A（docs/six_max_nlhe_target.md S3）：单对手 equity vs N-对手 equity 的
+# 排序保持度探针。判 HU 单对手桶能否进 6-max / 是否必须改多人特征语义。
+[[bin]]
+name = "multiway_equity_probe"
+path = "tools/multiway_equity_probe.rs"
+
 # 阶段 3 D-372 / API-370：CFR / MCCFR 训练 CLI。`--game {kuhn,leduc,nlhe} --trainer
 # {vanilla,es-mccfr} --iter N --seed S --checkpoint-dir DIR` 等 flag 锁在
 # `docs/pluribus_stage3_api.md` API-370。A1 \[实现\] 阶段 main body 走 stub；
