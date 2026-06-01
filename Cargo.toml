@@ -122,6 +122,12 @@ path = "tools/multiway_hist_ari.rs"
 name = "train_cfr"
 path = "tools/train_cfr.rs"
 
+# S4 gate runner：加载 6-max dense blueprint ckpt，跑 N 座 baseline 评测
+# （evaluate_blueprint_vs_baseline_multiway），判 1M 手是否击败 random/call-station/tight。
+[[bin]]
+name = "six_max_eval"
+path = "tools/six_max_eval.rs"
+
 # 阶段 3 F3 \[报告\]：简化 NLHE D-362 BLAKE3 byte-equal anchor 一次性 instrumentation。
 # 用户授权 F3 anchor 降标 100M 单 run → 10M × 3 run 检查；本 binary 跑 fixed_seed
 # × 3 EsMccfr 训练，比对 avg_strategy BLAKE3 byte-equal。继承 stage 2
