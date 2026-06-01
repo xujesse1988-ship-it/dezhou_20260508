@@ -182,9 +182,16 @@ fn first_small_6max(width_redirect: u8) -> (StreetActionAbstraction, BettingAbst
   **§2 运行期 derive-from-tree 推迟到 P4**：本步 `SimplifiedNlheGame` 仍建默认 HU 树，§2 在
   默认树下是恒等过滤（纯 CFR 热路径开销）且**无可测对象**（无 A3×A4 game 可跑），落 P4 与
   n_seats 一起做、一并 perf-tune。本步未碰 `nlhe.rs`。
-- **下游 P4**：`SimplifiedNlheGame` 去掉 HU 硬编码 —— `n_players()`（`nlhe.rs:329`）、
-  `config`（`:168`）、`info_set` 的 `actor < 2` 断言（`:382`）、2 槽 `info_set_cache`
-  （`:286`，扩到 6 座或换实现）。这是「**供训练**」真正要做的 plumbing。
+- **P4（已实现，commit `08b3edc`）**：`SimplifiedNlheGame` 去 HU 硬编码 —— 新增
+  `new_with_abstraction(bucket_table, config, abstraction, rules)`，`new` 委托（HU 默认、
+  byte-equal）；Game/State 携带 `abs: Arc<StreetActionAbstraction>`（`legal_actions` 用本
+  game 的 abs，非全局硬编码）；`n_players()` → `config.n_seats`；**§2 derive-from-tree 落地**
+  （`legal_actions` 过滤到 tree node tag，HU len 相等走 fast-path = byte-equal）；`info_set`
+  `n_seats>2` 早返回 uncached 分支（2-slot u64 cache 容不下 6 座，HU 分支逐字不动；multiway
+  cache 落 post-S3），位置仍由 node_id 内化 → 6-max 无碰撞、`pack_info_set_v2` 不改。smoke
+  测试：6-max A3×A4 game 构造 + 轨迹走到 terminal + 6 座 payoff 守恒 + 树==78,852；HU 全绿
+  （lib 52/0、`nlhe_infoset_semantics` T1、全 integration ok）。
+  **桶 caveat**：6-max 暂用 HU 单对手 equity 桶占位 → 可构造 + 机制跑通，但有意义训练待 S3。
 - **下游 P5 = S3**：6-max 多路 equity 桶（`equity.rs` 假设 1 对手，`six_max_nlhe_target.md`
   §S3）。**这是训练前真正的 gate**，全项目最大未知数，独立立项。
 
