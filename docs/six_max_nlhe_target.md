@@ -376,13 +376,34 @@ sizing（节点确定、机器无关、本机可信）：
 1154822(N=3)/719764 cross-check 全绿 + 结构守门 `reshape_root_drops_open_limp`（旗默认关）。`--reshape
 {none|nolimp|preopen}` 接进 `train_cfr` / `six_max_eval` / `nlhe_dense_preflop_169_dump`。
 
-**⑤ 在跑 / 待办**
+**⑤ nolimp 1B 实测结果（2026-06-01→02 完成，`artifacts/run_6max_s4_nolimp/`，wall 7.5h / 37k·s）** —— 诊断链证实、自带因果：
 
-- **nolimp 1B @ vultr**（2026-06-01 启，`artifacts/run_6max_s4_nolimp/`，63.5k/s ≈ 4.6h）：与 baseline 同 1B / 同
-  200 桶、只换 betting 抽象的**干净对照**。判据 = preflop 噪声（14%→?）塌否 + limp 归零否 + 覆盖率。nolimp 保 3.5BB
-  单开池档 → 预期**干净但偏紧**（其作用是把「噪声=欠训练」证死，不修「开池档太大」）。
-- **preopen @ AWS**（待起机，~$2-3 / 1B ≈ 2.4h）：full fix，预期更宽、更近现代 GTO RFI（~2.25BB 开池）。
-- 两者都未验「实测对战是否更强」——属 S5（仍缺强参考对手）。reshape 只保证目标更干净 + 训得更透，不直接等于「更强」。
+与 baseline 同 1B / 同 200 桶、只换 betting 抽象的干净对照。preflop 支配翻转率（域内 kicker 支配单调性，`/tmp/preflop_noise.py`）：
+
+| 位置 | baseline 1B | nolimp 200M | nolimp 1B |
+|---|---|---|---|
+| UTG | 9.6% | 3.4% | 2.3% |
+| HJ | 11.0% | 2.3% | 0.3% |
+| CO | 14.5% | 2.0% | 0.3% |
+| BTN | 17.1% | 3.7% | 0.5% |
+| SB（对照，未删 limp）| 18.4% | 19.1% | 18.5% |
+| **非 SB 合计** | **13.0%** | 2.9% | **0.85%** |
+| 总 | 14.1% | 6.1% | 4.4% |
+
+- **删 limp 的 4 个非盲位：13.0% → 0.85%（15× 干净）。** AA/KK/QQ/AKs 全 raise 1.00、limp 结构性 0；baseline
+  「KK limp 74%、QQ 84%」消失，RFI 干净单调近 GTO。**且在 200M（≈baseline-1B 的 visits/infoset 密度）就塌
+  → 是抽象不是算力。**
+- **SB（故意保留 limp 作对照）：18.4%→18.5% 纹丝不动、仍 limp AA(agg 0.43)。** 满 1B 也没救 → SB 病不是欠训练，
+  是 limp + 3.5BB 单档；残留 4.4% 总噪声里 **120/142 条来自 SB**。**对照组证因果**：动了的塌、没动的不动。
+- 覆盖率 56%→**64.5%**（树小 4.2× 的收益；非盲位 RFI 相关子树已训透，与全表 64.5% 不矛盾——剩余未访问是深层多人线）。
+- **诚实限制**：nolimp 干净**但偏紧**（BTN raise 37%、UTG 14%，窄于 GTO）——只有 3.5BB 大档，EV 划算开池范围本就窄。
+  这正是 preopen 要补的。
+
+**⑥ 待办**
+
+- **preopen @ AWS**（157.9M infoset / 5.46GiB，1B ≈ 2.4h ≈ $2-3）：加 2.25BB 开池档 → 预期同时 (a) 修干净 SB、
+  (b) 非盲位放宽近 GTO、(c) 产出可打 blueprint。SB 残留已精确指向「需要便宜开池档」。
+- 两变体都未验「实测对战是否更强」——属 S5（仍缺强参考对手）。reshape 只保证目标更干净 + 训得更透，不直接 = 更强。
 
 ### S5：6-max 评测重构
 
