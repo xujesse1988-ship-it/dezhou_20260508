@@ -3,11 +3,12 @@
 //! H3 只要求补齐简化 heads-up NLHE blueprint 训练入口；Kuhn / Leduc 仍通过
 //! 测试和专用 report 工具覆盖，不在本 CLI 中新增行为。
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use poker::training::nlhe::SimplifiedNlheGame;
 use poker::training::nlhe_betting_tree::{
@@ -18,6 +19,12 @@ use poker::training::{ConvergenceMonitor, EsMccfrTrainer, Game, StrategySnapshot
 use poker::{
     BucketTable, ChaCha20Rng, CheckpointError, InfoSetId, RngSource, TableConfig, TrainerError,
 };
+
+macro_rules! train_log {
+    ($($arg:tt)*) => {{
+        log_train(format_args!($($arg)*));
+    }};
+}
 
 #[derive(Debug)]
 struct Args {
@@ -191,7 +198,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("[train_cfr] failed: {e}");
+            train_log!("[train_cfr] failed: {e}");
             ExitCode::from(2)
         }
     }
@@ -278,16 +285,16 @@ fn run() -> Result<(), String> {
     let table_hash = hex32(&table.content_hash());
 
     if !args.quiet {
-        eprintln!("[train_cfr] profile          = {}", args.profile);
+        train_log!("[train_cfr] profile          = {}", args.profile);
         if args.profile == "six-max" {
-            eprintln!(
+            train_log!(
                 "[train_cfr] postflop_cap     = {} (A3×A4 width-redirect N)",
                 args.postflop_cap
             );
-            eprintln!("[train_cfr] reshape          = {}", args.reshape);
+            train_log!("[train_cfr] reshape          = {}", args.reshape);
         }
-        eprintln!("[train_cfr] n_players        = {}", game.n_players());
-        eprintln!("[train_cfr] tree_nodes       = {}", game.tree().num_nodes());
+        train_log!("[train_cfr] n_players        = {}", game.n_players());
+        train_log!("[train_cfr] tree_nodes       = {}", game.tree().num_nodes());
     }
 
     // 收敛监控器（S4）：训练前从 game 取 preflop 根节点 × 169 手型类样本，drive 主循环
@@ -379,9 +386,10 @@ fn drive<T: CfrBackend>(
     let start_update = trainer.update_count();
     if start_update >= args.updates {
         if !args.quiet {
-            eprintln!(
+            train_log!(
                 "[train_cfr] checkpoint already at update_count={} >= target {}; no-op",
-                start_update, args.updates
+                start_update,
+                args.updates
             );
         }
         save_checkpoint(trainer, &args.checkpoint_dir, "final")?;
@@ -389,32 +397,32 @@ fn drive<T: CfrBackend>(
     }
 
     if !args.quiet {
-        eprintln!("[train_cfr] game             = nlhe");
-        eprintln!("[train_cfr] trainer          = {backend_label}");
-        eprintln!("[train_cfr] target_updates   = {}", args.updates);
-        eprintln!("[train_cfr] start_update     = {start_update}");
-        eprintln!("[train_cfr] seed             = 0x{:016x}", args.seed);
-        eprintln!("[train_cfr] threads          = {}", args.threads);
-        eprintln!(
+        train_log!("[train_cfr] game             = nlhe");
+        train_log!("[train_cfr] trainer          = {backend_label}");
+        train_log!("[train_cfr] target_updates   = {}", args.updates);
+        train_log!("[train_cfr] start_update     = {start_update}");
+        train_log!("[train_cfr] seed             = 0x{:016x}", args.seed);
+        train_log!("[train_cfr] threads          = {}", args.threads);
+        train_log!(
             "[train_cfr] batch_per_worker = {} (effective per step_parallel = {})",
             args.batch_per_worker,
             args.threads * args.batch_per_worker,
         );
-        eprintln!(
+        train_log!(
             "[train_cfr] bucket_table     = {}",
             args.bucket_table.display()
         );
-        eprintln!("[train_cfr] bucket_blake3    = {table_hash}");
-        eprintln!(
+        train_log!("[train_cfr] bucket_blake3    = {table_hash}");
+        train_log!(
             "[train_cfr] checkpoint_dir   = {}",
             args.checkpoint_dir.display()
         );
         if let Some(report_every) = args.report_every {
-            eprintln!("[train_cfr] report_every     = {report_every}");
+            train_log!("[train_cfr] report_every     = {report_every}");
         }
         match args.lcfr_period {
-            Some(p) => eprintln!("[train_cfr] lcfr_period      = {p} (LCFR-MCCFR)"),
-            None => eprintln!("[train_cfr] lcfr_period      = none (vanilla ES-MCCFR)"),
+            Some(p) => train_log!("[train_cfr] lcfr_period      = {p} (LCFR-MCCFR)"),
+            None => train_log!("[train_cfr] lcfr_period      = none (vanilla ES-MCCFR)"),
         }
         if args.dense {
             let mode = if args.lockfree {
@@ -422,7 +430,7 @@ fn drive<T: CfrBackend>(
             } else {
                 "deterministic merge (byte-equal anchor)"
             };
-            eprintln!("[train_cfr] dense_parallel   = {mode}");
+            train_log!("[train_cfr] dense_parallel   = {mode}");
         }
     }
 
@@ -473,14 +481,14 @@ fn drive<T: CfrBackend>(
         if !args.quiet && cur >= next_report {
             let elapsed = t0.elapsed().as_secs_f64();
             let throughput = (cur - start_update) as f64 / elapsed.max(1e-9);
-            eprintln!(
+            train_log!(
                 "[train_cfr] update {cur} / {} elapsed={elapsed:.1}s throughput={throughput:.0}/s",
                 args.updates
             );
             // 收敛监控（S4）：preflop 根 × 169 手型类样本上的 entropy / 平均正 regret /
             // average-strategy L1 漂移。只读快照，不触训练状态。
             let report = monitor.observe(cur, &*trainer);
-            eprintln!("{report}");
+            train_log!("{report}");
             while next_report <= cur {
                 next_report = next_report.saturating_add(report_every);
             }
@@ -500,7 +508,7 @@ fn drive<T: CfrBackend>(
     if !args.quiet {
         let elapsed = t0.elapsed().as_secs_f64();
         let throughput = (trainer.update_count() - start_update) as f64 / elapsed.max(1e-9);
-        eprintln!(
+        train_log!(
             "[train_cfr] done update_count={} wall={elapsed:.1}s throughput={throughput:.0}/s final={}",
             trainer.update_count(),
             final_path.display()
@@ -611,6 +619,43 @@ fn mix3(seed: u64, a: u64, b: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
+}
+
+fn log_train(args: fmt::Arguments<'_>) {
+    eprintln!("[{}] {args}", timestamp_utc_now());
+}
+
+fn timestamp_utc_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_unix_utc(secs)
+}
+
+fn format_unix_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let second_of_day = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    let hour = second_of_day / 3_600;
+    let minute = (second_of_day % 3_600) / 60;
+    let second = second_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
+    // Howard Hinnant's civil-from-days algorithm, with 1970-01-01 as day 0.
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
 }
 
 fn print_usage() {
