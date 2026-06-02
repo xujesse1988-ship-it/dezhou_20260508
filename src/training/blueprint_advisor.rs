@@ -32,6 +32,8 @@
 //!
 //! crate 零网络依赖（invariant）：本模块纯计算，网络 IO 留给 Python driver（②）。
 
+use rayon::prelude::*;
+
 use crate::abstraction::action::{AbstractAction, ActionAbstraction, StreetActionAbstraction};
 use crate::abstraction::info::InfoSetId;
 use crate::core::rng::{ChaCha20Rng, RngSource};
@@ -320,10 +322,11 @@ pub fn advance_shadow_by_applied(
 /// 一个 distinct blueprint 参赛者：它的 game（树 / 抽象 / 桶）+ 策略查询面 + 标签。
 ///
 /// `strategy(info, n)` 返回该 infoset 的 `n` 维分布（空 / 全零 → 调用方按 uniform 兜底）。
-/// 通常 = `|info, _n| trainer.average_strategy(*info)`。
+/// 通常 = `|info, _n| trainer.average_strategy(*info)`。`+ Sync`：评测层 rayon 并行跑独立
+/// 手时跨线程只读共享（`DenseNlheEsMccfrTrainer::average_strategy` 是 `&self` 只读）。
 pub struct Contestant<'a> {
     pub game: &'a SimplifiedNlheGame,
-    pub strategy: &'a dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    pub strategy: &'a (dyn Fn(&InfoSetId, usize) -> Vec<f64> + Sync),
     pub label: String,
 }
 
@@ -577,15 +580,24 @@ pub fn evaluate_cross_abstraction_h2h(
     let mut per_pos_hands = vec![0u64; n];
     let mut desync_hands = 0u64;
     let mut illegal_hands = 0u64;
-    let mut attempted = 0u64;
 
-    for hero_seat in 0..n {
-        // hero 坐 hero_seat，其余座是 field。
-        let mut seat_bp = vec![1usize; n];
-        seat_bp[hero_seat] = 0;
-        let offset = (hero_seat + n - button) % n;
-        for hand_idx in 0..h2h_config.hands_per_seat {
-            attempted += 1;
+    // 每手独立（off-tree 自对弈无跨手状态）→ rayon 并行所有 (hero_seat, hand_idx)。
+    // 每手 seed 由 (seed, hero_seat, hand) 确定派生 → 结果与线程调度无关、可复现。
+    enum Outcome {
+        Pnl { offset: usize, pnl: f64 },
+        Desync,
+        Illegal,
+    }
+    let tasks: Vec<(usize, u64)> = (0..n)
+        .flat_map(|hero_seat| (0..h2h_config.hands_per_seat).map(move |h| (hero_seat, h)))
+        .collect();
+    let outcomes: Vec<Outcome> = tasks
+        .par_iter()
+        .map(|&(hero_seat, hand_idx)| {
+            // hero 坐 hero_seat，其余座是 field。
+            let mut seat_bp = vec![1usize; n];
+            seat_bp[hero_seat] = 0;
+            let offset = (hero_seat + n - button) % n;
             let hand_seed = mix3(h2h_config.seed, hero_seat as u64, hand_idx);
             let mut sample_rng = ChaCha20Rng::from_seed(mix3(hand_seed, 0xA5A5_A5A5, 1));
             match play_cross_abstraction_hand(
@@ -596,15 +608,26 @@ pub fn evaluate_cross_abstraction_h2h(
                 &mut sample_rng,
                 h2h_config.max_actions_per_hand,
             ) {
-                Ok(pnls) => {
-                    let pnl = pnls[hero_seat];
-                    hero_pnls.push(pnl);
-                    per_pos_sum[offset] += pnl;
-                    per_pos_hands[offset] += 1;
-                }
-                Err(HandError::Desync(_)) | Err(HandError::NonTerminal) => desync_hands += 1,
-                Err(HandError::Illegal(_)) => illegal_hands += 1,
+                Ok(pnls) => Outcome::Pnl {
+                    offset,
+                    pnl: pnls[hero_seat],
+                },
+                Err(HandError::Desync(_)) | Err(HandError::NonTerminal) => Outcome::Desync,
+                Err(HandError::Illegal(_)) => Outcome::Illegal,
             }
+        })
+        .collect();
+    let attempted = outcomes.len() as u64;
+    // 串行 reduce（collect 保 task 顺序 → f64 加法顺序确定、可复现）。
+    for o in &outcomes {
+        match o {
+            Outcome::Pnl { offset, pnl } => {
+                hero_pnls.push(*pnl);
+                per_pos_sum[*offset] += *pnl;
+                per_pos_hands[*offset] += 1;
+            }
+            Outcome::Desync => desync_hands += 1,
+            Outcome::Illegal => illegal_hands += 1,
         }
     }
 

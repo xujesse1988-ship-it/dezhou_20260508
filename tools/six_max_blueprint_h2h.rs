@@ -101,13 +101,14 @@ fn run() -> Result<(), String> {
     }
 
     // 策略闭包：dense average strategy（空 Vec → 引擎按 uniform 兜底）。各借自对应 trainer。
+    // `+ Sync`：评测层 rayon 并行跑独立手时跨线程只读共享（average_strategy 是 &self 只读）。
     #[allow(clippy::type_complexity)]
-    let strategies: Vec<Box<dyn Fn(&InfoSetId, usize) -> Vec<f64> + '_>> = trainers
+    let strategies: Vec<Box<dyn Fn(&InfoSetId, usize) -> Vec<f64> + Sync + '_>> = trainers
         .iter()
         .map(|(_, t)| {
             let tref = t;
             Box::new(move |info: &InfoSetId, _n: usize| tref.average_strategy(*info))
-                as Box<dyn Fn(&InfoSetId, usize) -> Vec<f64> + '_>
+                as Box<dyn Fn(&InfoSetId, usize) -> Vec<f64> + Sync + '_>
         })
         .collect();
     let contestants: Vec<Contestant> = trainers
