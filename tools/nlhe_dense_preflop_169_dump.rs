@@ -63,7 +63,7 @@ fn parse_args() -> Result<Args, String> {
                 eprintln!(
                     "usage: nlhe_dense_preflop_169_dump --checkpoint PATH \
                      --bucket-table PATH --output PATH \
-                     [--profile hu|six-max] [--postflop-cap 2|3]"
+                     [--profile hu|six-max] [--postflop-cap 2|3|4]"
                 );
                 std::process::exit(0);
             }

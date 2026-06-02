@@ -25,8 +25,10 @@ struct Args {
     /// blueprint 训练走 `six-max`。
     profile: String,
     /// 仅 `--profile six-max` 生效：A3×A4 postflop width-redirect 上限 N（见
-    /// `first_small_6max`）。限 `{2, 3}`（S2/S3 验证过的 A3×A4 cap：N=3 = 8.04 GiB@200
-    /// 生产甜点、N=2 = 树小供 smoke/调试）。
+    /// `first_small_6max`）。限 `{2, 3, 4}`：N=2 = 树小供 smoke/调试、N=3 = 8.04 GiB@200
+    /// 生产甜点（S3 桶复用精确验过 ≤3-way）；N=4 = 4-way postflop（sizing 1.445B infoset /
+    /// 48 GiB 两表，需 ≥56 GiB 机；桶复用是 A1 6-way 数据下的优雅退化外推、非精确验证；
+    /// 注意 `docs/six_max_nlhe_target.md` S4 续③ 实测 N=4 同 1B 预算仅 ~9% 覆盖率）。
     postflop_cap: u8,
     /// 仅 `--profile six-max`：betting 抽象 reshape（S4，治过度 limp + 开池档太大）。
     /// `none`（默认）= [`first_small_6max`]（baseline，230.5M infoset）；`nolimp` = 加禁
@@ -236,9 +238,9 @@ fn run() -> Result<(), String> {
         "hu" => SimplifiedNlheGame::new(Arc::clone(&table))
             .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?,
         "six-max" => {
-            if !matches!(args.postflop_cap, 2 | 3) {
+            if !matches!(args.postflop_cap, 2..=4) {
                 return Err(format!(
-                    "--postflop-cap must be 2 or 3 for --profile six-max (验证过的 A3×A4 cap)，got {}",
+                    "--postflop-cap must be 2, 3, or 4 for --profile six-max (A3×A4 cap)，got {}",
                     args.postflop_cap
                 ));
             }
@@ -612,7 +614,7 @@ fn print_usage() {
          \t--game nlhe --trainer es-mccfr --bucket-table <path> --updates <N> [options]\n\n\
          options:\n\
          \t--profile <hu|six-max>  (default hu; six-max = 6-max 100BB A3×A4 first-small)\n\
-         \t--postflop-cap <2|3>  (six-max only; A3×A4 width-redirect N, default 3)\n\
+         \t--postflop-cap <2|3|4>  (six-max only; A3×A4 width-redirect N, default 3; N=4 = 48 GiB tables)\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>\n\
          \t--batch-per-worker <N>  (default 16; trajectories per worker per step_parallel dispatch)\n\

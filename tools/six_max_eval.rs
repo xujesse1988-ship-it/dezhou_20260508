@@ -57,9 +57,9 @@ fn run() -> Result<bool, String> {
         BucketTable::open(std::path::Path::new(&args.bucket_table))
             .map_err(|e| format!("BucketTable::open({}) failed: {e:?}", args.bucket_table))?,
     );
-    if !matches!(args.postflop_cap, 2 | 3) {
+    if !matches!(args.postflop_cap, 2..=4) {
         return Err(format!(
-            "--postflop-cap must be 2 or 3, got {}",
+            "--postflop-cap must be 2, 3, or 4, got {}",
             args.postflop_cap
         ));
     }
