@@ -218,6 +218,14 @@ impl SimplifiedNlheGame {
         &self.tree
     }
 
+    /// 公开本 game 的 action abstraction（建树 + 运行期 `legal_actions` 同源）。
+    /// 跨抽象 advisor（`blueprint_advisor::outgoing_action`）的 outgoing 翻译要用它在
+    /// **真实** pot 上算同 ratio 档的 `to`；out-of-crate 工具经此 accessor 取（`abs`
+    /// 字段是 `pub(crate)`）。
+    pub fn abstraction(&self) -> &StreetActionAbstraction {
+        &self.abs
+    }
+
     /// 直接为指定的 preflop `node_id` × `hole` 构造 `InfoSetId`（绕过 `Game::info_set`
     /// 对 `SimplifiedNlheState` 的依赖）。仅 preflop 路径——postflop hand bucket 依赖
     /// `state.game_state.board()`，那条路径走完整 `info_set`。

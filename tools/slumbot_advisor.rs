@@ -23,6 +23,9 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use poker::training::blueprint_advisor::{
+    find_tag, outgoing_action, parse_cards, project_tag_onto,
+};
 use poker::training::game::{Game, NodeKind};
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::AbstractActionTag;
@@ -30,75 +33,13 @@ use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::sampling::sample_discrete;
 use poker::{
     AbstractAction, Action, ActionAbstraction, BucketTable, Card, ChaCha20Rng, ChipAmount,
-    GameState, InfoSetId, Rank, RngSource, SeatId, StreetActionAbstraction, Suit, TableConfig,
+    GameState, InfoSetId, RngSource, SeatId, StreetActionAbstraction, TableConfig,
 };
 
-// ===========================================================================
-// Card 字符串解析（"Ac" → Card；T2）
-// ===========================================================================
-
-/// 解析一张 Slumbot 牌字符串（rank 大写 + suit 小写，如 "Ac"/"Td"/"9h"/"2s"）。
-fn parse_card(s: &str) -> Result<Card, String> {
-    let b = s.as_bytes();
-    if b.len() != 2 {
-        return Err(format!("card {s:?} 必须是 2 字符（rank+suit）"));
-    }
-    let rank = match b[0] {
-        b'2' => Rank::Two,
-        b'3' => Rank::Three,
-        b'4' => Rank::Four,
-        b'5' => Rank::Five,
-        b'6' => Rank::Six,
-        b'7' => Rank::Seven,
-        b'8' => Rank::Eight,
-        b'9' => Rank::Nine,
-        b'T' => Rank::Ten,
-        b'J' => Rank::Jack,
-        b'Q' => Rank::Queen,
-        b'K' => Rank::King,
-        b'A' => Rank::Ace,
-        other => return Err(format!("非法 rank 字符 {:?} in {s:?}", other as char)),
-    };
-    let suit = match b[1] {
-        b'c' => Suit::Clubs,
-        b'd' => Suit::Diamonds,
-        b'h' => Suit::Hearts,
-        b's' => Suit::Spades,
-        other => return Err(format!("非法 suit 字符 {:?} in {s:?}", other as char)),
-    };
-    Ok(Card::new(rank, suit))
-}
-
-/// Card → Slumbot 字符串（T2 round-trip 用）。
-#[cfg(test)]
-fn card_to_string(c: Card) -> String {
-    let r = match c.rank() {
-        Rank::Two => '2',
-        Rank::Three => '3',
-        Rank::Four => '4',
-        Rank::Five => '5',
-        Rank::Six => '6',
-        Rank::Seven => '7',
-        Rank::Eight => '8',
-        Rank::Nine => '9',
-        Rank::Ten => 'T',
-        Rank::Jack => 'J',
-        Rank::Queen => 'Q',
-        Rank::King => 'K',
-        Rank::Ace => 'A',
-    };
-    let s = match c.suit() {
-        Suit::Clubs => 'c',
-        Suit::Diamonds => 'd',
-        Suit::Hearts => 'h',
-        Suit::Spades => 's',
-    };
-    format!("{r}{s}")
-}
-
-fn parse_cards(list: &[String]) -> Result<Vec<Card>, String> {
-    list.iter().map(|s| parse_card(s)).collect()
-}
+// Card 解析 / find_tag / project_tag_onto / outgoing 翻译核已抽进
+// `poker::training::blueprint_advisor`（S5 §6 共用引擎），本 binary 经 `use` 复用，
+// 行为 byte-equal（T2..T5 守门）。Slumbot 专属的 tokenize / replay / resolve_actions
+// 仍留本文件（Slumbot 字符串协议 + HU 200BB 硬编码）。
 
 // ===========================================================================
 // action 串 token 化（k/c/f/b<N>/'/'）
@@ -295,94 +236,35 @@ fn resolve_actions(
     }
 }
 
-/// 在合法动作集里找指定 tag 的 `AbstractAction`（带正确 `to` 标签）。
-fn find_tag(legal: &[AbstractAction], tag: AbstractActionTag) -> Option<AbstractAction> {
-    legal
-        .iter()
-        .copied()
-        .find(|a| AbstractActionTag::of(a) == tag)
-}
-
-/// 把 map_off_tree 选出的 tag 投影到 abs 当前合法集：tag 在则取之；不在（该 ratio
-/// 在抽象 pot 下已塌进 AllIn slot）则退到 AllIn。两者都缺 → Err（决策节点必有 ≥1 动作，
-/// 不该发生）。
-fn project_tag_onto(
-    legal: &[AbstractAction],
-    tag: AbstractActionTag,
-) -> Result<AbstractAction, String> {
-    if let Some(a) = find_tag(legal, tag) {
-        return Ok(a);
-    }
-    if let Some(a) = find_tag(legal, AbstractActionTag::AllIn) {
-        return Ok(a);
-    }
-    Err(format!(
-        "投影失败：tag {tag:?} 与 AllIn 都不在 abs 合法集 {legal:?}"
-    ))
-}
-
 // ===========================================================================
 // outgoing 翻译（以真实 pot 算尺寸；M4）
 // ===========================================================================
 
 /// 把策略选中的抽象动作翻译成 Slumbot incr 串，尺寸以**真实** state 算。
+///
+/// = 共享 [`outgoing_action`]（真实 pot 算尺寸 + bet_or_call 退化跟注判定）+ 字符串化。
+/// 两者共用同一逻辑 → 行为与历史 `outgoing_incr` byte-equal（T4 / T4b 守门）。
 fn outgoing_incr(
     real: &GameState,
     abstraction: &StreetActionAbstraction,
     chosen: AbstractAction,
 ) -> Result<String, String> {
-    match chosen {
-        AbstractAction::Fold => Ok("f".to_string()),
-        AbstractAction::Check => Ok("k".to_string()),
-        AbstractAction::Call { .. } => Ok("c".to_string()),
-        AbstractAction::AllIn { .. } => {
+    let action = outgoing_action(real, abstraction, chosen)?;
+    Ok(match action {
+        Action::Fold => "f".to_string(),
+        Action::Check => "k".to_string(),
+        Action::Call => "c".to_string(),
+        Action::Bet { to } | Action::Raise { to } => format!("b{}", to.as_u64()),
+        Action::AllIn => {
+            // all-in 的 incr to = 真实 all_in_amount（outgoing_action 已判过 to > bet_level，
+            // 否则它返回 Call → "c"）。
             let to = real
                 .legal_actions()
                 .all_in_amount
-                .ok_or("选中 AllIn 但 real 无 all_in_amount（无筹码？）")?;
-            Ok(bet_or_call(real, to.as_u64()))
+                .ok_or("AllIn outgoing 但 real 无 all_in_amount")?;
+            format!("b{}", to.as_u64())
         }
-        AbstractAction::Bet { ratio_label, .. } | AbstractAction::Raise { ratio_label, .. } => {
-            // 同一抽象作用在真实 pot 上，找同 ratio 的档取其真实 `to`。
-            let real_actions = abstraction.abstract_actions(real);
-            for a in real_actions.iter() {
-                match a {
-                    AbstractAction::Bet { to, ratio_label: r }
-                    | AbstractAction::Raise { to, ratio_label: r }
-                        if r.as_milli() == ratio_label.as_milli() =>
-                    {
-                        return Ok(bet_or_call(real, to.as_u64()));
-                    }
-                    _ => {}
-                }
-            }
-            // 该档在真实 pot 下已塌成 AllIn（被 abstract_actions 折叠）→ 发 all-in。
-            let to = real
-                .legal_actions()
-                .all_in_amount
-                .ok_or("选中 Bet/Raise 档但真实侧既无该档也无 all_in_amount")?;
-            Ok(bet_or_call(real, to.as_u64()))
-        }
-    }
-}
-
-/// 把目标 `to`（本街累计下注到）翻成 Slumbot incr：`to` **严格高于**当前下注水位
-/// （`max committed_this_round`）才构成合法 bet/raise（增量 > 0）→ `b<to>`；否则不是
-/// 加注 = 跟注 → `c`。关键 case：对手 all-in 覆盖我方时，我方"AllIn"的 to == 对手
-/// 下注水位（甚至更低，all-in for less），增量 0 会被 Slumbot 判 Illegal bet——这其实
-/// 是 all-in 跟注，应发 `c`。
-fn bet_or_call(real: &GameState, to: u64) -> String {
-    let bet_level = real
-        .players()
-        .iter()
-        .map(|p| p.committed_this_round.as_u64())
-        .max()
-        .unwrap_or(0);
-    if to > bet_level {
-        format!("b{to}")
-    } else {
-        "c".to_string()
-    }
+    })
 }
 
 // ===========================================================================
@@ -860,7 +742,9 @@ fn parse_u64(raw: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use poker::BucketConfig;
+    // parse_card / card_to_string / Rank / Suit 仅测试用（顶层非测试构建不引用，避免 unused）。
+    use poker::training::blueprint_advisor::{card_to_string, parse_card};
+    use poker::{BucketConfig, Rank, Suit};
 
     fn stub_game() -> SimplifiedNlheGame {
         let table = Arc::new(BucketTable::stub_for_postflop(
