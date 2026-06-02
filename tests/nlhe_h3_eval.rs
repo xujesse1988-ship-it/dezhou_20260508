@@ -6,8 +6,9 @@ use std::sync::Arc;
 use poker::training::game::{Game, NodeKind};
 use poker::training::nlhe::{SimplifiedNlheAction, SimplifiedNlheState};
 use poker::training::{
-    estimate_simplified_nlhe_lbr, evaluate_blueprint_vs_baseline, EsMccfrTrainer,
-    NlheBaselinePolicy, NlheEvaluationConfig, NlheEvaluationError, NlheLbrConfig, Trainer,
+    estimate_simplified_nlhe_lbr, evaluate_blueprint_vs_baseline,
+    evaluate_blueprint_vs_blueprint_multiway, EsMccfrTrainer, NlheBaselinePolicy,
+    NlheEvaluationConfig, NlheEvaluationError, NlheLbrConfig, Trainer,
 };
 use poker::{BucketTable, ChaCha20Rng, RngSource, SeatId, SimplifiedNlheGame};
 
@@ -458,6 +459,55 @@ fn h3_small_trained_evaluation_is_finite_and_deterministic() {
         r1.standard_error_mbb_per_game,
         r2.standard_error_mbb_per_game
     );
+}
+
+#[test]
+fn s5_blueprint_vs_blueprint_multiway_is_finite_deterministic_and_seat_aware() {
+    let Some(table) = load_v3_or_skip() else {
+        return;
+    };
+    // 两个不同 seed / 不同步数的 trainer → 两套不同策略（同一 game/tree）。
+    let mut trainer_a = EsMccfrTrainer::new(make_game(Arc::clone(&table)), 0x5335_5f41_0000_0000);
+    let mut trainer_b = EsMccfrTrainer::new(make_game(Arc::clone(&table)), 0x5335_5f42_0000_0000);
+    let mut rng_a = ChaCha20Rng::from_seed(0x5335_5f41_0000_0000);
+    let mut rng_b = ChaCha20Rng::from_seed(0x5335_5f42_0000_0000);
+    for _ in 0..150 {
+        trainer_a.step(&mut rng_a).expect("A train smoke");
+    }
+    for _ in 0..60 {
+        trainer_b.step(&mut rng_b).expect("B train smoke");
+    }
+    let eval_game = make_game(table);
+    let strat_a = |info: &poker::InfoSetId, _n: usize| trainer_a.average_strategy(info);
+    let strat_b = |info: &poker::InfoSetId, _n: usize| trainer_b.average_strategy(info);
+    let cfg = NlheEvaluationConfig {
+        hands_per_seat: 400,
+        seed: 0x5335_5f45_5641_4c00,
+        max_actions_per_hand: 512,
+    };
+
+    let ab1 = evaluate_blueprint_vs_blueprint_multiway(&eval_game, &strat_a, &strat_b, &cfg)
+        .expect("A vs B should pass");
+    let ab2 = evaluate_blueprint_vs_blueprint_multiway(&eval_game, &strat_a, &strat_b, &cfg)
+        .expect("A vs B should be repeatable");
+    let ba = evaluate_blueprint_vs_blueprint_multiway(&eval_game, &strat_b, &strat_a, &cfg)
+        .expect("B vs A should pass");
+
+    // plumbing：HU game → 2 座、hands = hands_per_seat × n_players、per-position 长度 = n_players。
+    assert_eq!(ab1.n_players, eval_game.n_players());
+    assert_eq!(ab1.hands, cfg.hands_per_seat * ab1.n_players as u64);
+    assert_eq!(ab1.per_position_mbb_per_game.len(), ab1.n_players);
+    assert!(ab1.mbb_per_game.is_finite());
+    assert!(ab1.standard_error_mbb_per_game.is_finite());
+    assert!(ab1.ci95_low_mbb_per_game <= ab1.ci95_high_mbb_per_game);
+
+    // determinism：固定 seed 完全可复现。
+    assert_eq!(ab1.mbb_per_game, ab2.mbb_per_game);
+    assert_eq!(ab1.per_position_mbb_per_game, ab2.per_position_mbb_per_game);
+
+    // seat-aware：交换 hero/opponent 必须改变结果——否则说明 hero_seat 分支被忽略
+    //（即 bug：两座用了同一套策略）。两 trainer 策略不同 → A-vs-B ≠ B-vs-A。
+    assert_ne!(ab1.mbb_per_game, ba.mbb_per_game);
 }
 
 #[test]

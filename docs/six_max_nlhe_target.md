@@ -447,12 +447,50 @@ preopen = nolimp + preflop `{0.5,1}`（0.5 = 2.25BB 开池档，非 SB 仍禁 li
 
 ### S5：6-max 评测重构
 
-- head-to-head 实测对战（多人 baseline）：输出 mbb/g、SE、置信区间、**按位置拆分收益**。
-- **多对手 AIVAT** 降方差（6-max 方差远大于 HU，且无 LBR 捷径 → AIVAT 比 HU 更不可或缺；现有 `aivat*.rs`
-  单对手要推广）。评测报告同时出原始与方差缩减后的 mbb/g。
-- LBR 仅作诊断指标（注明多人下的理论局限），不当质量闸门。
-- 解决"无强参考对手"：可拿 HU 训的 blueprint 摆 6 座当 baseline，或自对弈不同 6-max blueprint 互评。
-- 固定 seed 评测可复现；每个候选策略出评测报告 + 策略版本哈希。
+> **2026-06-02 定方向**：S4 已把三个 blueprint 训出来（baseline 1B、nolimp 1B、preopen 1B/2B），但**没一个被验证「更强」**
+> ——S4 gate（vs random/call-station/overly-tight）是必要非充分且非单调，reshape「只更干净不直接更强」（S4续⑦）。
+> 故 S5 的第一要务 = **证伪/证实「reshape 真的产出更强 blueprint」**。两条腿（相对 + 绝对），**共用一个 6-max off-tree advisor 引擎**（见下「关键工程发现」）。
+
+**① 相对强度 = blueprint 互评（受控 A-vs-B）**
+
+- 一张权威 `GameState`（规则引擎，N 座）跑自对弈，每座由一个 blueprint advisor 驱动；hero 坐 A、其余坐 B，
+  循环赛 {baseline, nolimp, preopen} → 按位置拆 mbb/g + CI95，固定 seed 可复现。chip-EV 桌内零和 → 「A vs 全 B」净额就是 A 对 B 的边际。
+- **复用现成**：`tools/nlhe_checkpoint_vs_checkpoint`（HU、**同树** A/B lockstep）+ `evaluate_blueprint_vs_baseline_multiway`
+  （N-generic、按位置拆）。**但 baseline/nolimp/preopen 是不同 betting tree**（nolimp 删 open-limp、preopen 加 2.25BB 档）
+  → 同树工具用不了，必须走下面的 off-tree advisor（这是真正的工作量，不是「小扩展」）。
+
+**② 绝对强度 = OpenPoker 实测场（外部真实对手）**
+
+- `openpoker.ai`（2026-06-02 发现）**正好补 line-36「无强 6-max 公开参考 bot」的缺口**，且格式与 `default_6max_100bb()` 高度对齐：
+  6-max / 默认买入 2000@10-20 = **100BB** / 虚拟筹码 chip-balance 计分 = **无 rake**（已确认）/ WebSocket API / 支持 Rust / 免费。
+- API：`wss://openpoker.ai/ws`，`Authorization: Bearer <key>`；server→bot `hand_start`/`hole_cards`/`your_turn`/`player_action`/
+  `community_cards`/`hand_result`，bot→server `join_lobby{buy_in}`/`action{hand_id,action,amount,turn_token,client_action_id}`
+  （raise `amount` = **总 to 额**，介于 valid_actions 的 min/max）。牌字符串 `Ah`/`Ts`（与 Slumbot 同）。详见
+  `docs/temp/openpoker_client_design_2026_06_02.md`。
+- 对手 = **其他开发者 bot 池 + 排行榜**（非固定强基准）→ 给「活的竞争场排名」，不是 Slumbot 式绝对基准；但对 6-max 这其实更接近真实质量。
+- **caveat**：(1) rebuy + 买入 50–250BB + 赢家越打越深 → **有效码深会偏离 100BB**，靠 off-tree 映射兜、深码精度降（买入锁 100BB）；
+  (2) 是 lobby 混合桌、非受控配对 → 测「我方最强 blueprint 对真实场强不强」，**变体之争仍归①互评**；(3) 免费号 1 bot →
+  三变体只能分时段轮换或上 Pro；(4) 120s 行动超时 / 20 msg/s / 10 conn/min/IP；turn_token 一次性防重放。
+
+**关键工程发现（①②共用一个引擎）**
+
+- 跨抽象对弈（①的 A≠B 树、②的对手任意下注）= 同一个问题：**一张权威 `GameState` + 每个 blueprint 各持「抽象影子」`SimplifiedNlheState`，
+  每个 applied 动作经 off-tree 翻译推进各自影子**。
+- **off-tree 引擎已存在**：`ActionAbstraction::map_off_tree`（`src/abstraction/action.rs`，generic）；`tools/slumbot_advisor.rs`
+  是**可工作的 HU 模板**（real+abs 两态 lockstep replay、`map_off_tree`→`project_tag_onto`→双态 apply、incoming/outgoing 翻译）。
+- 真正要做 = **把 slumbot_advisor 的 off-tree 核（`replay`/`resolve_actions`/`project_tag_onto`/`outgoing_*`）从 HU binary
+  抽进可复用 `src/` 模块 + 去 `default_hu_200bb` 硬编码、参数化 N 座/座位/TableConfig** → ①自对弈互评工具 与 ②OpenPoker WS 客户端
+  都是它的薄壳。属**正确性关键**代码（off-tree 翻译）→ **必须 vultr 跑 HU 回归 + 新 6-max 单测**后才可信。
+
+**③ 通用评测项（沿用）**
+
+- **多对手 AIVAT** 降方差（6-max 方差远大于 HU、无 LBR 捷径 → 比 HU 更刚需；现有 `aivat*.rs` 单对手要推广）。先出裸 mbb/g 拿方向，CI 太宽再上 AIVAT。
+- LBR 仅作诊断（注明多人理论局限），不当质量闸门。
+- 固定 seed 可复现；每候选出评测报告 + 策略版本哈希。
+
+**④ 已定的「不做」**
+
+- **不跑 preopen 5B**（S4续⑦：非盲位 1B 已够、SB 是 GTO 混合区 5B 也不降）。preopen-2B（覆盖 65.9%）就是进 S5 的「干净」blueprint。
 
 ### S6（非目标，parked）：实时 depth-limited search
 

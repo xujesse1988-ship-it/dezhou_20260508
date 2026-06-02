@@ -141,6 +141,26 @@ pub struct NlheMultiwayEvalReport {
     pub per_position_mbb_per_game: Vec<f64>,
 }
 
+/// 6-max blueprint A vs blueprint B 互评结果（S5①，**同 betting tree**）。
+///
+/// 与 [`NlheMultiwayEvalReport`] 的唯一区别：对手不是启发式 baseline 而是另一个
+/// blueprint 策略，故无 `baseline` 字段。mbb/g 从 **hero(A)** 视角，正数 = A 净赢 B。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NlheBlueprintH2hReport {
+    pub n_players: usize,
+    /// 总手数 = `hands_per_seat * n_players`。
+    pub hands: u64,
+    pub hands_per_seat: u64,
+    pub seed: u64,
+    pub hero_total_chips: f64,
+    pub mbb_per_game: f64,
+    pub standard_error_mbb_per_game: f64,
+    pub ci95_low_mbb_per_game: f64,
+    pub ci95_high_mbb_per_game: f64,
+    /// 按相对按钮位置 offset 拆的 mbb/g（0 = BTN、1 = SB、2 = BB、3 = UTG、...）。长度 = `n_players`。
+    pub per_position_mbb_per_game: Vec<f64>,
+}
+
 /// 历史名称，等价于 [`LbrConfig`]。LBR proxy 已 game-generic 化，新代码请直接
 /// 用 [`LbrConfig`]；此 alias 仅为保持公开 API 稳定（`NlheLbrConfig::default()` /
 /// 字段访问全部继承自 generic）。
@@ -296,6 +316,85 @@ pub fn evaluate_blueprint_vs_baseline_multiway(
     })
 }
 
+/// 6-max blueprint A vs blueprint B 互评（S5①「相对强度」，**要求 A/B 共用同一 `game`**
+/// = 同 betting tree + 同 bucket）。hero(A) 依次坐遍全部 `n_players` 座（每座
+/// `hands_per_seat` 手），其余 N-1 座全用 `opponent_strategy`(B)；按相对按钮位置拆收益。
+///
+/// 复用 [`sample_blueprint_action`]（与 baseline 版同一查询面）：actor == hero_seat 走
+/// `hero_strategy`，否则走 `opponent_strategy`。每座、每手用 `mix3(seed, seat, hand)`
+/// 派生独立 rng → 固定 seed 可复现。
+///
+/// **不能用于不同抽象**（baseline/nolimp/preopen 是不同 betting tree）——那需要
+/// off-tree advisor 引擎（单一权威 `GameState` + 每方抽象影子），见
+/// `docs/six_max_nlhe_target.md` S5 §6 / `docs/temp/openpoker_client_design_2026_06_02.md` §6。
+pub fn evaluate_blueprint_vs_blueprint_multiway(
+    game: &SimplifiedNlheGame,
+    hero_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
+    opponent_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
+    config: &NlheEvaluationConfig,
+) -> Result<NlheBlueprintH2hReport, NlheEvaluationError> {
+    if config.hands_per_seat == 0 {
+        return Err(NlheEvaluationError::InvalidConfig {
+            reason: "hands_per_seat must be > 0".to_string(),
+        });
+    }
+    if config.max_actions_per_hand == 0 {
+        return Err(NlheEvaluationError::InvalidConfig {
+            reason: "max_actions_per_hand must be > 0".to_string(),
+        });
+    }
+
+    let n_players = game.n_players();
+    let button = game.config.button_seat.0 as usize;
+    let mut all_pnl_chips: Vec<f64> =
+        Vec::with_capacity(config.hands_per_seat as usize * n_players);
+    let mut per_pos_sum = vec![0.0_f64; n_players];
+
+    for seat_idx in 0..n_players {
+        let hero_seat = SeatId(seat_idx as u8);
+        let offset = (seat_idx + n_players - button) % n_players;
+        for hand_idx in 0..config.hands_per_seat {
+            let seed = mix3(config.seed, seat_idx as u64, hand_idx);
+            let mut rng = ChaCha20Rng::from_seed(seed);
+            let root = game.root(&mut rng);
+            let terminal = rollout_blueprint_vs_blueprint(
+                root,
+                hero_seat,
+                hero_strategy,
+                opponent_strategy,
+                &mut rng,
+                config.max_actions_per_hand,
+            )?;
+            let pnl = payoff_for_seat(&terminal, hero_seat)?;
+            per_pos_sum[offset] += pnl;
+            all_pnl_chips.push(pnl);
+        }
+    }
+
+    let hands = all_pnl_chips.len() as u64;
+    let bb_chips = game.config.big_blind.as_u64() as f64;
+    let scale = 1000.0 / bb_chips;
+    let stats = sample_stats(&all_pnl_chips);
+    let mean_mbb = stats.mean * scale;
+    let se_mbb = stats.standard_error * scale;
+    let per_position_mbb_per_game = per_pos_sum
+        .iter()
+        .map(|s| (s / config.hands_per_seat as f64) * scale)
+        .collect();
+    Ok(NlheBlueprintH2hReport {
+        n_players,
+        hands,
+        hands_per_seat: config.hands_per_seat,
+        seed: config.seed,
+        hero_total_chips: all_pnl_chips.iter().sum(),
+        mbb_per_game: mean_mbb,
+        standard_error_mbb_per_game: se_mbb,
+        ci95_low_mbb_per_game: mean_mbb - 1.96 * se_mbb,
+        ci95_high_mbb_per_game: mean_mbb + 1.96 * se_mbb,
+        per_position_mbb_per_game,
+    })
+}
+
 /// 估计 H3 工程用 local best-response proxy。薄壳调用 game-generic
 /// [`estimate_lbr`]，保持公开 API 稳定。
 pub fn estimate_simplified_nlhe_lbr(
@@ -349,6 +448,38 @@ fn rollout_blueprint_vs_baseline(
                 } else {
                     baseline.select_action(&state, &actions, rng)?
                 };
+                state = SimplifiedNlheGame::next(state, action, rng);
+            }
+        }
+    }
+    Err(NlheEvaluationError::NonTerminalRollout { max_actions })
+}
+
+/// 与 [`rollout_blueprint_vs_baseline`] 同形，但非 hero 座位走第二个 blueprint 策略
+/// 而非启发式 baseline（要求两策略来自同一 `game` 的 infoset 空间）。
+fn rollout_blueprint_vs_blueprint(
+    mut state: crate::training::nlhe::SimplifiedNlheState,
+    hero_seat: SeatId,
+    hero_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
+    opponent_strategy: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
+    rng: &mut dyn RngSource,
+    max_actions: usize,
+) -> Result<crate::training::nlhe::SimplifiedNlheState, NlheEvaluationError> {
+    for _ in 0..max_actions {
+        match SimplifiedNlheGame::current(&state) {
+            NodeKind::Terminal => return Ok(state),
+            NodeKind::Chance => {
+                let dist = SimplifiedNlheGame::chance_distribution(&state);
+                let action = sample_discrete(&dist, rng);
+                state = SimplifiedNlheGame::next(state, action, rng);
+            }
+            NodeKind::Player(actor) => {
+                let strategy = if SeatId(actor) == hero_seat {
+                    hero_strategy
+                } else {
+                    opponent_strategy
+                };
+                let action = sample_blueprint_action(&state, actor, strategy, rng)?;
                 state = SimplifiedNlheGame::next(state, action, rng);
             }
         }

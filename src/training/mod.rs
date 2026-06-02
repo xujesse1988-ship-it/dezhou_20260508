@@ -60,7 +60,8 @@ pub use nlhe::{
 };
 pub use nlhe_eval::{
     estimate_simplified_nlhe_lbr, estimate_simplified_nlhe_lbr_filtered,
-    evaluate_blueprint_vs_baseline, evaluate_blueprint_vs_baseline_multiway, NlheBaselinePolicy,
+    evaluate_blueprint_vs_baseline, evaluate_blueprint_vs_baseline_multiway,
+    evaluate_blueprint_vs_blueprint_multiway, NlheBaselinePolicy, NlheBlueprintH2hReport,
     NlheEvaluationConfig, NlheEvaluationReport, NlheLbrConfig, NlheLbrReport,
     NlheMultiwayEvalReport,
 };
