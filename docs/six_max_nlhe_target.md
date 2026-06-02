@@ -309,8 +309,9 @@ RFI，全表存 `artifacts/run_6max_s4_n3/preflop_rfi_1B.md`）：
   溢价牌大体在前——blueprint **确实学到位置概念、没退化**。
 - **两个问题**（⚠ **2026-06-01 修正**：原括注「非训练 bug、regret 已收敛 0.0002」**判错**——见下「S4 续」，
   实为**欠训练**[1B 仅 56% 表覆盖、仍在爬]与抽象**两因叠加**；监控的 regret/覆盖只采 169 个 preflop 根、看不到全表）：
-  ① **过度 limp**——每位置 limp 16–21%（SB 43%），真 GTO 几乎不 limp；「RFI 只有 GTO 一半」的真相是该 raise 的牌
-  跑去 limp 了。② **溢价牌未稳定满额进攻**（AA raise 0.54–0.93、KK UTG 仅 0.26），个别非单调点。
+  ① **过度 limp**——非盲位每位置 limp 16–21%，真 GTO 几乎不 open-limp（⚠ **仅非盲位**；SB 43% **不是** 过度——
+  blind-vs-blind 真 GTO limp≈49%，是核心 GTO，见⑥/⑦ 2026-06-02 修正）；「RFI 只有 GTO 一半」的真相是非盲位该 raise
+  的牌跑去 limp 了。② **溢价牌未稳定满额进攻**（AA raise 0.54–0.93、KK UTG 仅 0.26），个别非单调点。
 - **根因之一 = A3×A4 抽象**（另一半 = 欠训练，见 S4 续）：只有 1 个加注档（1.0pot≈3.5BB，无 iso-raise）+ capped/廉价 postflop（≤3-way、0.5 只开池、
   width redirect）→ limp 进多人池在抽象里不被惩罚、EV 被人为抬高，连 AA/KK 的 raise-vs-limp 在此抽象里都接近
   → 混合策略。要更强 blueprint 的杠杆在**抽象层**：去 limp 选项 / 加小开池档（2.5x）/ 放宽 postflop（属 S5 / 抽象迭代）。
@@ -393,8 +394,9 @@ sizing（节点确定、机器无关、本机可信）：
 - **删 limp 的 4 个非盲位：13.0% → 0.85%（15× 干净）。** AA/KK/QQ/AKs 全 raise 1.00、limp 结构性 0；baseline
   「KK limp 74%、QQ 84%」消失，RFI 干净单调近 GTO。**且在 200M（≈baseline-1B 的 visits/infoset 密度）就塌
   → 是抽象不是算力。**
-- **SB（故意保留 limp 作对照）：18.4%→18.5% 纹丝不动、仍 limp AA(agg 0.43)。** 满 1B 也没救 → SB 病不是欠训练，
-  是 limp + 3.5BB 单档；残留 4.4% 总噪声里 **120/142 条来自 SB**。**对照组证因果**：动了的塌、没动的不动。
+- **SB（故意保留 limp 作对照）：18.4%→18.5% 纹丝不动、仍 limp AA(agg 0.43)。** 满 1B 也没救 → SB 翻转率高**不是欠训练**，
+  是 limp + 3.5BB 单档造的平 EV 混合区（⚠ 后经 GTO Wizard 真值证实**这是 GTO 特征、非病**——SB limp/AA-limp 本就 GTO，
+  见⑥/⑦ 2026-06-02 修正）；残留 4.4% 总噪声里 **120/142 条来自 SB**。**对照组证因果**：动了的塌、没动的不动。
 - 覆盖率 56%→**64.5%**（树小 4.2× 的收益；非盲位 RFI 相关子树已训透，与全表 64.5% 不矛盾——剩余未访问是深层多人线）。
 - **诚实限制**：nolimp 干净**但偏紧**（BTN raise 37%、UTG 14%，窄于 GTO）——只有 3.5BB 大档，EV 划算开池范围本就窄。
   这正是 preopen 要补的。
@@ -418,17 +420,30 @@ preopen = nolimp + preflop `{0.5,1}`（0.5 = 2.25BB 开池档，非 SB 仍禁 li
 - **非盲位（证据足，可下结论）**：preopen 1B 即干净（0.2–0.6%）**且范围放宽到接近 GTO**——BTN raise 37%(nolimp)→
   **44–45%**(preopen)、UTG 14%→18%。证实「加 2.25BB 开池档」修好了 nolimp 偏紧的毛病（诊断问题②）。1B→2B 无变化 =
   非盲位 1B 训练已充分。
-- **SB（证据不足，不下结论）**：便宜档让 SB limp 43%→30%、AA raise 43%→**68%**，明显改善;但**仍 limp AA ~32%、
-  翻转率 ~17%**。1B→2B 覆盖率涨 9 个点而 SB 翻转率仅 17.7%→17.1%（近乎平），**初步暗示** SB 残留可能是 limp 选项造的
-  天然宽混合区、非欠训练——但**仅 2 个数据点、未跑到 5B，远不能定论**（0.6 个点的下降也可能是仍在缓降）。
-- GTO 参照：无 rake solve 的 GTO SB limp 本就低（≈ HU 按钮，raise-or-fold 为主）;但判好坏的是**单调性**
-  （AA/KK 该 raise ~100%），不是 limp 频率等于某目标值。
+- **SB（外部 GTO 真值已可下结论，2026-06-02 修正）**：preopen 便宜档让 SB limp 43%→30%、AA raise 43%→68%、
+  仍 limp AA ~32%、翻转率 ~17%（1B→2B 17.7%→17.1% 近乎平）。**原判「SB 仍 over-limp / AA 还在 limp = 残留病」判错**
+  ——拿 GTO Wizard `Cash 100bb / 6max cEV`（chip EV 无 rake，与本 solver **同码深、同无 rake**）folded-to-SB 节点
+  交叉验证真值：
+  - 真 GTO 的 SB **就是 limp 为主**：Call(limp) **49.3%** / Raise 3.5 17.7% / Fold 32.9% / Allin 0%。
+  - 连 **AA 都 raise 52.9% / limp 47.1%**（limp-reraise 设陷 + 保护 limp range）。
+  - 推论①：本 solver 的 SB limp 30–43%、AA limp ~32% **不是过度 limp，反而比真 GTO（limp 49% / AA limp 47%）还少**
+    —— SB **没病**，宽 limp 混合（含 AA limp）是 blind-vs-blind 的核心 GTO。
+  - 推论②：SB 翻转率卡 ~17%（非盲位 →0.5%）是**平 EV 重混合区的排序噪声特征**——大量牌 limp/raise≈50/50 → 域内
+    raise 频率全挤在 50% 附近 → kicker 支配排序天然被噪声主导、即便收敛也翻。**不是欠训练，跑满 5B 也不会明显降。**
+  - caveat：GTO Wizard 抽象更细 + 带 cold-call 2.5x，49.3/47.1 非本 solver 精确目标；**定性结论稳**——SB limp 占半、
+    AA limp 占半是 GTO。
+- **GTO 参照（按位置分，纠正旧表述）**：
+  - **非盲位（UTG/HJ/CO/BTN）**：rake-free 下也几乎不 open-limp → `no_open_limp` + premium raise ~100% 正确、匹配
+    GTO（⑤已验）。
+  - **SB（blind-vs-blind）**：100bb cEV 下 limp 才是最高频（GTO Wizard 实测 SB limp 49.3% / AA limp 47.1%）。判 SB
+    好坏**不能用「limp 低 / AA raise 100%」**——那是非盲位的尺子、对 SB 正好反了；SB 的 limp 频率本就高，要看的是 limp
+    range 结构是否合理（弱牌 limp-fold、强牌混 limp-reraise），而非 limp 频率趋零。
 
 **⑦ 待办**
 
-- **SB 悬而未决**，二选一坐实：(a) 跑满 preopen 5B（须新 LCFR run）看 SB 翻转率是否继续降→欠训练，还是平→抽象;
-  (b) 加「删 SB limp」变体对照。
-- 两/三变体都未验「实测对战是否更强」——属 S5（仍缺强参考对手）。reshape 只保证目标更干净 + 训得更透，不直接 = 更强。
+- ~~**SB 悬而未决**~~ **SB 已结**（见⑥外部 GTO 真值）：SB limp / AA-limp 是 GTO、非缺陷 →
+  (a)「跑满 5B 看 SB 翻转率」**不必做**（混合区，5B 也不降）;(b)「删 SB limp」变体**不做**（会主动偏离 GTO 的 limp 49% 目标）。
+- 真正未决的只剩**实测对战是否更强**——属 S5（仍缺强参考对手）。reshape 只保证目标更干净 + 训得更透，不直接 = 更强。
 
 ### S5：6-max 评测重构
 
