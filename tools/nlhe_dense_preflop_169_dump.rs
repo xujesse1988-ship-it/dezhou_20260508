@@ -32,7 +32,8 @@ struct Args {
     /// 仅 six-max：A3×A4 postflop width-redirect cap（须与训练 ckpt 一致，否则
     /// dense layout fingerprint 不匹配、load 失败）。
     postflop_cap: u8,
-    /// 仅 six-max：betting reshape（须与训练 ckpt 一致）。`none`/`nolimp`/`preopen`。
+    /// 仅 six-max：betting reshape（须与训练 ckpt 一致）。
+    /// `none`/`nolimp`/`preopen`/`preopen-small`。
     reshape: String,
 }
 
@@ -64,7 +65,8 @@ fn parse_args() -> Result<Args, String> {
                 eprintln!(
                     "usage: nlhe_dense_preflop_169_dump --checkpoint PATH \
                      --bucket-table PATH --output PATH \
-                     [--profile hu|six-max] [--postflop-cap 2|3|4]"
+                     [--profile hu|six-max] [--postflop-cap 2|3|4] \
+                     [--reshape none|nolimp|preopen|preopen-small]"
                 );
                 std::process::exit(0);
             }
@@ -199,9 +201,11 @@ fn run(args: Args) -> Result<(), String> {
     writeln!(out, "- profile: `{}`", args.profile).unwrap();
     if args.profile == "six-max" {
         writeln!(out, "- postflop_cap: `{}`", args.postflop_cap).unwrap();
+        writeln!(out, "- reshape: `{}`", args.reshape).unwrap();
         writeln!(
             out,
-            "- RFI = raise-first-in（沿全员 fold-chain）；看 `Raise(1.0x)` 列 = 开池频率。\
+            "- RFI = raise-first-in（沿全员 fold-chain）；每个 spot 的 `rfi_raise_columns` 是开池频率列，\
+             多列时开池频率取这些 Raise 列之和。\
              6-max 合理性参考：UTG 最紧、向 BTN 逐位放宽；SB 因只剩 BB 范围另算。"
         )
         .unwrap();
@@ -221,6 +225,20 @@ fn run(args: Args) -> Result<(), String> {
             .map(label_action_tag)
             .collect::<Vec<_>>();
         writeln!(out, "- legal_actions: {}", action_labels.join(" | ")).unwrap();
+        if args.profile == "six-max" {
+            let rfi_raise_columns = node
+                .legal_actions
+                .iter()
+                .filter(|tag| matches!(tag, AbstractActionTag::Raise(_)))
+                .map(label_action_tag)
+                .collect::<Vec<_>>();
+            writeln!(
+                out,
+                "- rfi_raise_columns: `{}`",
+                rfi_raise_columns.join(" + ")
+            )
+            .unwrap();
+        }
         writeln!(out).unwrap();
 
         // 表头
