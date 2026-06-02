@@ -493,6 +493,67 @@ preopen = nolimp + preflop `{0.5,1}`（0.5 = 2.25BB 开池档，非 SB 仍禁 li
 
 - **不跑 preopen 5B**（S4续⑦：非盲位 1B 已够、SB 是 GTO 混合区 5B 也不降）。preopen-2B（覆盖 65.9%）就是进 S5 的「干净」blueprint。
 
+### S5 续（2026-06-02）：① off-tree 引擎落地 + 跨抽象 h2h + 两个正确性/方法学发现
+
+**① 共用 off-tree 引擎落地 + vultr 验证**（commits `1514ca2` 引擎 / `a93670e` 测试 / `33bcb60` 并行）：
+
+把 `tools/slumbot_advisor.rs` 的 off-tree 核抽进 `src/training/blueprint_advisor.rs`、去 HU 硬编码、参数化 N 座/
+`TableConfig`（§6 共用底座）：
+- 抽出 `parse_card`/`find_tag`/`project_tag_onto` + `outgoing_action`（concrete `Action` 版，真实 pot 算尺寸）；
+  slumbot `outgoing_incr` 改薄壳调 `outgoing_action` 再字符串化 → **byte-equal**（vultr 跑 slumbot T2..T5 8 测全绿）。
+- 新增 `advance_shadow_by_applied`（incoming：用 applied 真实动作以**影子自身几何** map_off_tree 推进单影子）+
+  `play_cross_abstraction_hand`（一张权威 `GameState` + 每 distinct blueprint 一份影子；行动者影子按字面所选动作、
+  其余按 incoming 推进）+ `evaluate_cross_abstraction_h2h`（rayon 并行独立手，~4× on vultr，bit-可复现）。
+- 工具 `tools/six_max_blueprint_h2h`：加载 ≥2 不同 betting tree 的 dense blueprint，跑有序对 (hero,field) 的
+  mbb/g + CI95 + 按位置拆 + desync 计数。
+- vultr 验证：`blueprint_advisor` 5 单测 + slumbot 8 回归全绿；并行版与串行 **bit-identical**（同 seed 同结果）。
+
+**② OpenPoker 客户端是此引擎薄壳**，待用户注册账号解锁（§7 步 3-4，需用户邮箱 + api_key）。
+
+**发现 A（正确性边界，钉进引擎）：off-tree 只忠实「下注尺寸」差异，不解决「结构性」动作集差异。**
+当两抽象动作集结构不同（典型：`baseline` 含 open-limp、`nolimp`/`preopen` `no_open_limp`），limp 进的池在
+no-limp 影子里**没有对应节点** —— 把被动 `Call`/`Check` 静默映射到 `AllIn` 是 passive→aggressive 的 kind 变，
+会污染回合顺序 / 价值。引擎对此**显式报 `HandError::Desync`**（不静默塌 AllIn），评测层计数 + 排除该手。
+实测（真 avg-strategy，N=3）：
+- **`nolimp` × `preopen`（都 no-limp、仅 preflop 开池 2.25 vs 3.5BB 尺寸差异）：desync 0–0.8%** = 纯尺寸、干净、可信。
+- 牵涉 `baseline`（含 limp）的对：limp 高发 → 大量 desync = 结构性 gap，**结果不可信**。
+→ **S5① 的受控互评只能在 `nolimp`×`preopen` 之间做干净对比**；`baseline` 的相对强度无法经 off-tree 干净测，
+须靠 ②外部实测、或重训一个 limp-representable 的 baseline（含 open-limp 节点供影子表达）。
+
+**控制实验（引擎无偏）**：`nolimp` vs `nolimp` 自对弈（同 ckpt，36k 手）= **−60.7 ± 58.5 mbb/g，CI 跨 0 ≈ 0，
+0 desync** → 孤身 hero 轮坐全 6 座 vs 同策略 field 无系统偏置（per-position：blinds 负、BTN/HJ 正，符合位置 EV）。
+（`preopen`-self 未测：vultr 11 GiB 装不下 2×preopen 5.46 GiB ≈ 11.4 GiB；需 strategy-only 加载或更大机。）
+
+**发现 B（方法学 confound）：lone-hero-vs-field 跨抽象 h2h 把「内在强度」与「抽象粒度误感知税」混在一起，
+不能干净排名 reshape 变体的*内在*强度。** 机制（粒度不对称系统性偏向细抽象 hero）：
+- Run A（`nolimp` hero vs `preopen` field）：nolimp 把 preopen 的 2.25BB 小开池误感知成 3.5BB（更大）→ 过度
+  respect → 劣势；且 nolimp 自己只开 3.5BB、被 preopen field 正确感知 → 无「小开池骗 fold」红利。
+- Run B（`preopen` hero vs `nolimp` field）：preopen 正确感知 nolimp 的 3.5BB 开池；且自己的 2.25BB 小开池被
+  nolimp field 误感知成 3.5BB → field 过度 fold → preopen 得红利。
+两效应都偏向 preopen-hero、不利 nolimp-hero —— **与「preopen 内在更强」无关，是粒度不对称的产物**。
+→ h2h 数字是**「部署场景」**（孤身 bot vs 一桌 field = ② OpenPoker 的模型）相关的**方向读数**，
+**不是干净的内在强度排名**。干净的内在强度测需要 (a) 一个能表达两者的公共细抽象（未训）、或 (b) ②外部实测
+（两者各自 vs 同一真实 field；免费号 1 bot 只能分时段轮换）。
+
+**实测 h2h（`nolimp`×`preopen`，各 100k 手/座 = 600k 手/有序对，seed 0x53354831，vultr 4 核并行，2026-06-02）**：
+
+| 有序对 | hero mbb/g | SE | CI95 | desync | 判定 |
+|---|---:|---:|---|---:|---|
+| `nolimp` hero vs `preopen` field | **−4.3** | 13.6 | [−30.9, +22.4] | 1.09% | 未分出（跨 0）|
+| `preopen` hero vs `nolimp` field | **+15.6** | 14.1 | [−12.1, +43.3] | 0.06% | 未分出（跨 0）|
+
+- **结论：600k 手/座（SE~14）下两 reshape 变体相对强度无显著差异（双向 CI 均跨 0）。** preopen-hero 点估 +15.6
+  略正、nolimp-hero −4.3 ≈0，方向略偏 preopen —— 但 (a) 均不显著、(b) 正好是「发现 B 税」系统性偏向 preopen-hero
+  的方向 → **不能归因于内在强度**。即「加便宜 2.25BB 开池档（preopen）是否产出更强 blueprint」= **受控 h2h
+  测不出显著差异，两变体强度相当**（差异上界 ~43 mbb/g，相较 blueprint 打 call-station 的 +3738 是 ~1%、可忽略）。
+- desync（1.09% / 0.06%）实测证实 nolimp×preopen 无结构 gap、对干净（1.09% 是 nolimp 把 preopen 小开池误感知后
+  在 all-in 边界的偶发尺寸 desync，被引擎检出排除，远 < 2% 可信阈）。
+
+**下一步**：①引擎 + 工具 = S5 共用底座已就位。① 干净对比受「无结构 gap」+「税 confound」双重限制 → 已得「两变体
+强度相当」的方向结论；要分辨内在强度（若差异真 < ~15 mbb/g）须靠 ②外部实测（税 confound 在 h2h 里无法消除）。
+**待用户决策**：(a) OpenPoker 账号注册解锁 ②（cleaner arbiter，§7 步 3-4）；(b) reshape 两变体强度既相当，
+部署选哪个可由 ②或其它准则（如 preopen 范围更接近 GTO，S4续⑥）定，不必再纠结 ①。
+
 ### S6（非目标，parked）：实时 depth-limited search
 
 路线 B / `pluribus_path.md` 阶段 6。Pluribus 真正赢人的机制，但占总量 30–40%、极易写错。**blueprint-only
