@@ -127,37 +127,57 @@ fn run(args: Args) -> Result<(), String> {
     let root_id = tree.root_id();
 
     // spots 按 profile 构造（owned String label，HU/六max 统一类型）。
-    let spots: Vec<(String, NodeId, String)> = match args.profile.as_str() {
-        "hu" => {
-            // SB 首次行动 = root；BB facing SB limp = root → Call。
-            let bb_post_limp_id = walk(tree, root_id, AbstractActionTag::Call)
-                .ok_or("root has no Call edge — abstraction broken?")?;
-            vec![
-                ("SB open (首次行动)".to_string(), root_id, "SB".to_string()),
-                (
-                    "BB vs SB limp".to_string(),
-                    bb_post_limp_id,
-                    "BB".to_string(),
-                ),
-            ]
+    // XV_PATH（可选）：从 root 沿逗号分隔的动作 tag 走到任意决策节点，dump 该节点 169 手策略。
+    // tag = Fold|Check|Call|AllIn|Raise0.5|Raise1.0|Bet0.5|Bet1.0。设此 env 则只 dump 该节点，
+    // 忽略默认 RFI/HU spots。例：XV_PATH="Fold,Fold,Raise0.5" = UTG弃 HJ弃 CO开2.25BB → BTN 决策。
+    let xv_path = std::env::var("XV_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let spots: Vec<(String, NodeId, String)> = if let Some(path) = xv_path {
+        let mut node = root_id;
+        for tok in path.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            node = walk(tree, node, parse_action_tag(tok)?)
+                .ok_or_else(|| format!("XV_PATH: '{tok}' 处无此边或已到 terminal"))?;
         }
-        // six-max：沿全员 fold-chain 取各位置首次进场（RFI = raise-first-in）决策节点。
-        // root = UTG，依次 Fold → HJ → CO → BTN → SB（SB fold 后 BB 不劳而获 = terminal，
-        // walk 返回 None 终止）。button 固定 seat0（default_6max_100bb），位置名由
-        // player_acting seat 直接映射。
-        _ => {
-            let mut spots = Vec::new();
-            let mut node = root_id;
-            loop {
-                let seat = tree.node(node).player_acting;
-                let pos = six_max_position_name(seat);
-                spots.push((format!("{pos} RFI (raise-first-in)"), node, pos.to_string()));
-                match walk(tree, node, AbstractActionTag::Fold) {
-                    Some(next) => node = next,
-                    None => break,
-                }
+        let seat = tree.node(node).player_acting;
+        let pos = if args.profile == "hu" {
+            format!("p{seat}")
+        } else {
+            six_max_position_name(seat).to_string()
+        };
+        eprintln!("[dump] XV_PATH=[{path}] → node {node}, actor p{seat} ({pos})");
+        vec![(format!("custom XV_PATH [{path}] → {pos}"), node, pos)]
+    } else {
+        match args.profile.as_str() {
+            "hu" => {
+                // SB 首次行动 = root；BB facing SB limp = root → Call。
+                let bb_post_limp_id = walk(tree, root_id, AbstractActionTag::Call)
+                    .ok_or("root has no Call edge — abstraction broken?")?;
+                vec![
+                    ("SB open (首次行动)".to_string(), root_id, "SB".to_string()),
+                    (
+                        "BB vs SB limp".to_string(),
+                        bb_post_limp_id,
+                        "BB".to_string(),
+                    ),
+                ]
             }
-            spots
+            // six-max：沿全员 fold-chain 取各位置首次进场（RFI = raise-first-in）决策节点。
+            // root = UTG，依次 Fold → HJ → CO → BTN → SB（SB fold 后 BB 不劳而获 = terminal）。
+            _ => {
+                let mut spots = Vec::new();
+                let mut node = root_id;
+                loop {
+                    let seat = tree.node(node).player_acting;
+                    let pos = six_max_position_name(seat);
+                    spots.push((format!("{pos} RFI (raise-first-in)"), node, pos.to_string()));
+                    match walk(tree, node, AbstractActionTag::Fold) {
+                        Some(next) => node = next,
+                        None => break,
+                    }
+                }
+                spots
+            }
         }
     };
 
@@ -250,6 +270,25 @@ fn walk(
         Child::Decision(id) => Some(id),
         Child::Terminal => None,
     }
+}
+
+/// 解析 XV_PATH 的单个动作 tag（preflop 语义：0.5=2.25BB / 1.0=3.5BB pot-raise）。
+fn parse_action_tag(s: &str) -> Result<AbstractActionTag, String> {
+    Ok(match s {
+        "Fold" => AbstractActionTag::Fold,
+        "Check" => AbstractActionTag::Check,
+        "Call" => AbstractActionTag::Call,
+        "AllIn" => AbstractActionTag::AllIn,
+        "Raise0.5" => AbstractActionTag::Raise(BetRatio::HALF_POT),
+        "Raise1.0" | "Raise1" => AbstractActionTag::Raise(BetRatio::FULL_POT),
+        "Bet0.5" => AbstractActionTag::Bet(BetRatio::HALF_POT),
+        "Bet1.0" | "Bet1" => AbstractActionTag::Bet(BetRatio::FULL_POT),
+        other => {
+            return Err(format!(
+                "未知 action tag '{other}'（支持 Fold|Check|Call|AllIn|Raise0.5|Raise1.0|Bet0.5|Bet1.0）"
+            ))
+        }
+    })
 }
 
 /// 6-max 位置名（button 固定 seat0，default_6max_100bb）：offset = seat。
