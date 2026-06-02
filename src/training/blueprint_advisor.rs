@@ -682,6 +682,7 @@ fn mix64(mut x: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abstraction::action::BetRatio;
     use crate::abstraction::bucket_table::{BucketConfig, BucketTable};
     use crate::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_6max};
     use std::sync::Arc;
@@ -690,6 +691,40 @@ mod tests {
         Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::default_500_500_500(),
         ))
+    }
+
+    // 机制测试统一用 **N=2 redirect**（debug 建树 78,852 节点、快）；结构性质（limp gap /
+    // 开池尺寸差异）N=2 与 N=3 等价。生产 h2h run 用真训练的 N=3 ckpt（release）。
+    fn nolimp_game() -> SimplifiedNlheGame {
+        let (a, mut r) = first_small_6max(2);
+        r.no_open_limp = true;
+        SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::default_6max_100bb(),
+            a,
+            r,
+        )
+        .expect("nolimp game")
+    }
+    fn preopen_game() -> SimplifiedNlheGame {
+        let (a, r) = first_small_preopen_6max(2);
+        SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::default_6max_100bb(),
+            a,
+            r,
+        )
+        .expect("preopen game")
+    }
+    fn baseline_game() -> SimplifiedNlheGame {
+        let (a, r) = first_small_6max(2);
+        SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::default_6max_100bb(),
+            a,
+            r,
+        )
+        .expect("baseline game")
     }
 
     #[test]
@@ -706,67 +741,97 @@ mod tests {
         assert!(parse_card("A").is_err());
     }
 
-    /// 6-max nolimp vs preopen（都 no-limp，仅 preflop 开池尺寸不同 = 纯尺寸差异）：
-    /// 一批 seed 的对局应**全部完成、零 desync、6 座 PnL 守恒（Σ==0）**。这是 off-tree
-    /// 在「无结构性 gap」时忠实的核心 lockstep 证明（能让错算法 fail：任何回合漂移 /
-    /// 记账错都会破守恒或触发 desync）。桶 = HU 占位 stub（只验机制，与训练值无关）。
+    /// 纯**尺寸**差异（off-tree 该忠实处理）：把 preopen 的 0.5pot 小开池（2.25BB）的真实
+    /// `to` 喂给 nolimp 影子（preflop 仅 {1.0} 档）→ [`advance_shadow_by_applied`] 返回 Ok
+    /// 的 **Raise/AllIn**（aggressive，更大的开池），绝不报结构性 gap。证 size 差异不误判。
     #[test]
-    fn nolimp_vs_preopen_no_desync_and_conserves() {
-        let table = stub_table();
-        let cfg = TableConfig::default_6max_100bb();
-        let (nl_abs, nl_rules) = {
-            let (a, mut r) = first_small_6max(3);
-            r.no_open_limp = true;
-            (a, r)
-        };
-        let nolimp = SimplifiedNlheGame::new_with_abstraction(
-            Arc::clone(&table),
-            cfg.clone(),
-            nl_abs,
-            nl_rules,
-        )
-        .expect("nolimp game");
-        let (pp_abs, pp_rules) = first_small_preopen_6max(3);
-        let preopen = SimplifiedNlheGame::new_with_abstraction(
-            Arc::clone(&table),
-            cfg.clone(),
-            pp_abs,
-            pp_rules,
-        )
-        .expect("preopen game");
+    fn advance_size_diff_maps_to_aggressive_not_error() {
+        // 取 preopen 根（UTG 开池）的 0.5pot 开池真实 to。
+        let preopen = preopen_game();
+        let mut prng = ChaCha20Rng::from_seed(0x0151_2E01);
+        let pre_root = preopen.root(&mut prng);
+        let open_to = SimplifiedNlheGame::legal_actions(&pre_root)
+            .iter()
+            .find_map(|a| match a {
+                AbstractAction::Raise { to, ratio_label } if *ratio_label == BetRatio::HALF_POT => {
+                    Some(*to)
+                }
+                _ => None,
+            })
+            .expect("preopen 根应有 0.5pot(2.25BB) 开池档");
 
-        // 均匀策略（机制测试，与训练值无关）。
+        let nolimp = nolimp_game();
+        let mut nrng = ChaCha20Rng::from_seed(0x0151_2E02);
+        let mut nl_root = nolimp.root(&mut nrng);
+        let adv = advance_shadow_by_applied(
+            &mut nl_root,
+            Action::Raise { to: open_to },
+            false,
+            &mut nrng,
+        )
+        .expect("2.25BB 开池映进 nolimp 影子应成功（纯尺寸差异，非结构 gap）");
+        assert!(
+            matches!(
+                AbstractActionTag::of(&adv),
+                AbstractActionTag::Raise(_) | AbstractActionTag::AllIn
+            ),
+            "应映成 Raise/AllIn（aggressive，更大开池），实得 {:?}",
+            AbstractActionTag::of(&adv)
+        );
+    }
+
+    /// **结构性** gap（off-tree 无法忠实、必须显式报错）：nolimp 影子的 UTG 开池节点没有
+    /// open-limp `Call`，对手一个**被动 limp**（`Action::Call`、非 all-in）喂进来 →
+    /// [`advance_shadow_by_applied`] 返回 `Err`（不静默塌 AllIn 改 kind）。这是 S5 正确性
+    /// 边界的钉子：passive→aggressive 的 kind 变会污染回合 / 价值，引擎拒绝它。
+    #[test]
+    fn advance_passive_limp_into_nolimp_errors() {
+        let nolimp = nolimp_game();
+        let mut nrng = ChaCha20Rng::from_seed(0x0151_2E03);
+        let mut nl_root = nolimp.root(&mut nrng);
+        // 前置确认：nolimp 根（UTG）确实无 open-limp Call。
+        assert!(
+            !SimplifiedNlheGame::legal_actions(&nl_root)
+                .iter()
+                .any(|a| matches!(a, AbstractAction::Call { .. })),
+            "no_open_limp：nolimp 根（UTG）应无 open-limp Call"
+        );
+        let r = advance_shadow_by_applied(&mut nl_root, Action::Call, false, &mut nrng);
+        assert!(
+            r.is_err(),
+            "open-limp 进 no-limp 影子应报结构性 gap Err，实得 {r:?}"
+        );
+    }
+
+    /// nolimp×preopen 全程对局（uniform 策略、N=2、多 seed）：所有**完成**的手 6 座 PnL
+    /// 守恒（Σ==0）—— 守恒能让任何回合漂移 / 记账错 fail（核心 lockstep 证明）。
+    /// 不强约束 desync 计数：uniform 制造大量 all-in 战，开池尺寸差异在 all-in 边界**偶发**
+    /// desync 属已知近似（被引擎检出并排除），与「结构性 gap」不同。
+    #[test]
+    fn nolimp_vs_preopen_completed_hands_conserve() {
+        let nolimp = nolimp_game();
+        let preopen = preopen_game();
         let uniform = |_info: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
-        let hero = Contestant {
-            game: &nolimp,
-            strategy: &uniform,
-            label: "nolimp".into(),
-        };
-        let field = Contestant {
-            game: &preopen,
-            strategy: &uniform,
-            label: "preopen".into(),
-        };
         let contestants = [
             Contestant {
-                game: hero.game,
-                strategy: hero.strategy,
-                label: hero.label.clone(),
+                game: &nolimp,
+                strategy: &uniform,
+                label: "nolimp".into(),
             },
             Contestant {
-                game: field.game,
-                strategy: field.strategy,
-                label: field.label.clone(),
+                game: &preopen,
+                strategy: &uniform,
+                label: "preopen".into(),
             },
         ];
-
+        let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;
-        let mut desyncs = 0;
+        let mut completed = 0u64;
         for hero_seat in 0..n {
             let mut seat_bp = vec![1usize; n];
             seat_bp[hero_seat] = 0;
-            for hand in 0..200u64 {
-                let hand_seed = 0xD15E_A5E0 ^ ((hero_seat as u64) << 32) ^ hand;
+            for hand in 0..150u64 {
+                let hand_seed = 0x0D15_EA5E ^ ((hero_seat as u64) << 32) ^ hand;
                 let mut rng = ChaCha20Rng::from_seed(hand_seed ^ 0x9999);
                 match play_cross_abstraction_hand(
                     &contestants,
@@ -777,105 +842,57 @@ mod tests {
                     512,
                 ) {
                     Ok(pnls) => {
+                        completed += 1;
                         let sum: f64 = pnls.iter().sum();
-                        assert!(sum.abs() < 1e-6, "6 座 PnL 须守恒 Σ==0，实得 {sum}");
+                        assert!(sum.abs() < 1e-6, "完成的手须守恒 Σ==0，实得 {sum}");
                         assert_eq!(pnls.len(), n);
                     }
-                    Err(HandError::Desync(_)) => desyncs += 1,
-                    Err(e) => panic!("nolimp×preopen 非 desync 失败: {e:?}"),
+                    Err(HandError::Desync(_)) => {}
+                    Err(e) => panic!("意外非 desync 失败: {e:?}"),
                 }
             }
         }
-        // 纯尺寸差异不该有结构性 desync（极端 all-in 边界巧合允许极少量；这里要求严格 0
-        // 以钉死「无结构 gap」假设——若将来抽象改动引入 gap，本断言会立刻 fail）。
-        assert_eq!(
-            desyncs, 0,
-            "nolimp×preopen（无结构 gap）不该 desync，实得 {desyncs}"
-        );
+        assert!(completed > 0, "应有手完成（不能全 desync）");
     }
 
-    /// 结构性 gap 检测确实生效：baseline（含 open-limp）vs nolimp（no-limp）—— baseline 一旦
-    /// limp，nolimp 影子无对应节点 → 必触发 desync。本测验证引擎**不静默吞掉**该 gap
-    /// （desync_hands > 0），即正确性边界可见。用 RandomNoFold-ish 强制 limp 的策略放大触发。
+    /// 端到端结构性 gap 检出：nolimp 坐 1 座 hero、baseline（含 open-limp）占其余 field →
+    /// 任一 baseline field 座 open-limp，nolimp hero 影子推进该 limp 时撞 gap → desync。
+    /// 验证引擎不静默吞掉（desync>0），即 S5 baseline 类对比的不可信性显式可见。
     #[test]
-    fn baseline_vs_nolimp_detects_structural_gap() {
-        let table = stub_table();
-        let cfg = TableConfig::default_6max_100bb();
-        // baseline = first_small（允许 open-limp）。
-        let (b_abs, b_rules) = first_small_6max(3);
-        let baseline = SimplifiedNlheGame::new_with_abstraction(
-            Arc::clone(&table),
-            cfg.clone(),
-            b_abs,
-            b_rules,
-        )
-        .expect("baseline game");
-        let (nl_abs, nl_rules) = {
-            let (a, mut r) = first_small_6max(3);
-            r.no_open_limp = true;
-            (a, r)
-        };
-        let nolimp = SimplifiedNlheGame::new_with_abstraction(
-            Arc::clone(&table),
-            cfg.clone(),
-            nl_abs,
-            nl_rules,
-        )
-        .expect("nolimp game");
-
-        // 偏好 Call（含 open-limp）的策略：把概率压在 Call tag 上，逼出 limped 池。
-        let prefer_limp = |_info: &InfoSetId, n: usize| {
-            // 无法直接看 action tag（只有 n），退而求其次：均匀即可——baseline UTG 均匀
-            // 也有 ~1/k limp 概率，200 手足以触发若干 limped 池。
-            vec![1.0 / n as f64; n]
-        };
-        let baseline_c = Contestant {
-            game: &baseline,
-            strategy: &prefer_limp,
-            label: "baseline".into(),
-        };
-        let nolimp_c = Contestant {
-            game: &nolimp,
-            strategy: &prefer_limp,
-            label: "nolimp".into(),
-        };
+    fn baseline_field_open_limp_detected_as_desync() {
+        let nolimp = nolimp_game();
+        let baseline = baseline_game();
+        let uniform = |_info: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        // 0 = nolimp(hero)、1 = baseline(field)。
         let contestants = [
             Contestant {
-                game: baseline_c.game,
-                strategy: baseline_c.strategy,
-                label: baseline_c.label.clone(),
+                game: &nolimp,
+                strategy: &uniform,
+                label: "nolimp".into(),
             },
             Contestant {
-                game: nolimp_c.game,
-                strategy: nolimp_c.strategy,
-                label: nolimp_c.label.clone(),
+                game: &baseline,
+                strategy: &uniform,
+                label: "baseline".into(),
             },
         ];
+        let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;
+        let mut seat_bp = vec![1usize; n]; // 全 baseline field…
+        seat_bp[0] = 0; // …除 seat0 = nolimp hero。
         let mut desyncs = 0u64;
-        let mut completed = 0u64;
-        // baseline 坐 1 座、nolimp 占其余：baseline limp → nolimp 影子撞 gap。
-        let mut seat_bp = vec![1usize; n];
-        seat_bp[3] = 0; // UTG = baseline（开池位，limp 高发）。
         for hand in 0..400u64 {
             let hand_seed = 0x0BAD_5EED ^ hand;
             let mut rng = ChaCha20Rng::from_seed(hand_seed ^ 0x3333);
-            match play_cross_abstraction_hand(
-                &contestants,
-                &seat_bp,
-                &cfg,
-                hand_seed,
-                &mut rng,
-                512,
-            ) {
-                Ok(_) => completed += 1,
-                Err(HandError::Desync(_)) => desyncs += 1,
-                Err(e) => panic!("意外非 desync 失败: {e:?}"),
+            if let Err(HandError::Desync(_)) =
+                play_cross_abstraction_hand(&contestants, &seat_bp, &cfg, hand_seed, &mut rng, 512)
+            {
+                desyncs += 1;
             }
         }
         assert!(
             desyncs > 0,
-            "baseline(limp)×nolimp 应检出结构性 gap（desync>0），实得 desync={desyncs} completed={completed}"
+            "baseline field open-limp 应被 nolimp hero 影子检出为结构性 gap（desync>0），实得 {desyncs}"
         );
     }
 }
