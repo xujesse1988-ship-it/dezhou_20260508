@@ -78,6 +78,12 @@ REPORT_EVERY=10000000
 KEEP_LAST=6
 RUN_NAME=""
 DO_LAUNCH=1
+# 6-max / reshape 扩展（默认空 = 沿用 HU baseline 行为）：
+BUCKET_FILE_OVERRIDE=""   # 整文件名覆盖（6-max 桶名是 bucket_table_200_200_200_...，无 default_ 前缀）
+PROFILE=""                # train_cfr --profile（hu|six-max）
+POSTFLOP_CAP=""           # train_cfr --postflop-cap（six-max only，2|3）
+RESHAPE=""                # train_cfr --reshape（none|nolimp|preopen）
+LOCKFREE=0                # train_cfr --lockfree（dense lock-free atomic 并行）
 
 usage() { sed -n '2,60p' "$0"; exit "${1:-1}"; }
 
@@ -99,7 +105,12 @@ while [ "$#" -gt 0 ]; do
         --keep-last)    KEEP_LAST="$2"; shift 2;;
         --run-name)     RUN_NAME="$2"; shift 2;;
         --bucket-schema) BUCKET_SCHEMA="$2"; shift 2;;
+        --bucket-file)  BUCKET_FILE_OVERRIDE="$2"; shift 2;;
+        --profile)      PROFILE="$2"; shift 2;;
+        --postflop-cap) POSTFLOP_CAP="$2"; shift 2;;
+        --reshape)      RESHAPE="$2"; shift 2;;
         --dense)        DENSE=1; shift;;
+        --lockfree)     LOCKFREE=1; shift;;
         --no-launch)    DO_LAUNCH=0; shift;;
         -h|--help)      usage 0;;
         *) echo "[deploy] unknown arg: $1" >&2; usage 1;;
@@ -112,6 +123,7 @@ done
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUCKET_FILE="bucket_table_default_500_500_500_seed_${BUCKET_SEED}_${BUCKET_SCHEMA}.bin"
+[ -n "$BUCKET_FILE_OVERRIDE" ] && BUCKET_FILE="$BUCKET_FILE_OVERRIDE"
 AWS="$AWS_USER@$AWS_HOST"
 SSH=(ssh -i "$AWS_KEY" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20)
 RD="$REMOTE_DIR"   # 远端 ~/dezhou_20260508
@@ -190,8 +202,8 @@ fi
 # ---------------------------------------------------------------------------
 # 4. 编译 train_cfr（首次会自动拉 1.95.0 toolchain）
 # ---------------------------------------------------------------------------
-say "编译 train_cfr --release"
-"${SSH[@]}" "$AWS" "cd ~/$RD && . \"\$HOME/.cargo/env\" && cargo build --release --bin train_cfr 2>&1 | tail -3"
+say "编译 train_cfr + nlhe_dense_preflop_169_dump + six_max_eval --release"
+"${SSH[@]}" "$AWS" "cd ~/$RD && . \"\$HOME/.cargo/env\" && cargo build --release --bin train_cfr --bin nlhe_dense_preflop_169_dump --bin six_max_eval 2>&1 | tail -3"
 "${SSH[@]}" "$AWS" "test -x ~/$RD/target/release/train_cfr" \
     || { echo "[deploy] train_cfr 编译产物缺失" >&2; exit 1; }
 say "编译完成"
@@ -202,13 +214,20 @@ say "编译完成"
 DENSE_ARG=""
 [ "$DENSE" -eq 1 ] && DENSE_ARG="--dense"
 
+# 6-max / reshape 附加 train_cfr 参数（默认空 → HU baseline 行为不变）。
+EXTRA_ARGS=""
+[ "$LOCKFREE" -eq 1 ]    && EXTRA_ARGS="$EXTRA_ARGS --lockfree"
+[ -n "$PROFILE" ]        && EXTRA_ARGS="$EXTRA_ARGS --profile $PROFILE"
+[ -n "$POSTFLOP_CAP" ]   && EXTRA_ARGS="$EXTRA_ARGS --postflop-cap $POSTFLOP_CAP"
+[ -n "$RESHAPE" ]        && EXTRA_ARGS="$EXTRA_ARGS --reshape $RESHAPE"
+
 if [ "$DO_LAUNCH" -eq 0 ]; then
     say "--no-launch：部署完成，未启动训练。"
     echo
     echo "手动启动示例："
     echo "  ssh -i $AWS_KEY $AWS"
     echo "  cd ~/$RD && . ~/.cargo/env"
-    echo "  ./target/release/train_cfr --game nlhe --trainer es-mccfr $DENSE_ARG \\"
+    echo "  ./target/release/train_cfr --game nlhe --trainer es-mccfr $DENSE_ARG$EXTRA_ARGS \\"
     echo "    --bucket-table artifacts/$BUCKET_FILE \\"
     echo "    --updates $UPDATES --seed $TRAIN_SEED --lcfr-period $LCFR_PERIOD \\"
     echo "    --threads $THREADS --batch-per-worker $BATCH \\"
@@ -228,7 +247,7 @@ mkdir -p artifacts/$RUN_NAME
 if pgrep -f 'release/train_cfr' >/dev/null; then
     echo "[remote] 已有 train_cfr 在跑，拒绝重复启动" >&2; exit 1
 fi
-setsid nohup ./target/release/train_cfr --game nlhe --trainer es-mccfr $DENSE_ARG \
+setsid nohup ./target/release/train_cfr --game nlhe --trainer es-mccfr $DENSE_ARG$EXTRA_ARGS \
     --bucket-table artifacts/$BUCKET_FILE \
     --updates $UPDATES --seed $TRAIN_SEED $LCFR_ARG \
     --threads $THREADS --batch-per-worker $BATCH \
