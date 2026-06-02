@@ -16,7 +16,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use poker::training::nlhe::SimplifiedNlheGame;
-use poker::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_6max};
+use poker::training::nlhe_betting_tree::{
+    first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
+};
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{
     evaluate_blueprint_vs_baseline_multiway, Game, NlheBaselinePolicy, NlheEvaluationConfig,
@@ -71,9 +73,10 @@ fn run() -> Result<bool, String> {
             (a, r)
         }
         "preopen" => first_small_preopen_6max(args.postflop_cap),
+        "preopen-small" => first_small_preopen_small_6max(args.postflop_cap),
         other => {
             return Err(format!(
-                "unknown --reshape {other} (expected none | nolimp | preopen)"
+                "unknown --reshape {other} (expected none | nolimp | preopen | preopen-small)"
             ))
         }
     };

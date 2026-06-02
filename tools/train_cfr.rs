@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use poker::training::nlhe::SimplifiedNlheGame;
-use poker::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_6max};
+use poker::training::nlhe_betting_tree::{
+    first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
+};
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{ConvergenceMonitor, EsMccfrTrainer, Game, StrategySnapshot, Trainer};
 use poker::{
@@ -33,7 +35,9 @@ struct Args {
     /// 仅 `--profile six-max`：betting 抽象 reshape（S4，治过度 limp + 开池档太大）。
     /// `none`（默认）= [`first_small_6max`]（baseline，230.5M infoset）；`nolimp` = 加禁
     /// 非 SB 开池 limp（55.2M infoset，缩树 4.2×）；`preopen` = 再加 2.25BB 开池档
-    /// （157.9M infoset，full fix；见 [`first_small_preopen_6max`]）。
+    /// （157.9M infoset，full fix；见 [`first_small_preopen_6max`]）；`preopen-small` = preflop
+    /// 开池收成单档（仅 2.25BB，删 3.5BB 开池）+ 禁非 SB limp，比 `preopen` 小（preflop 单开池档）、
+    /// 比 `nolimp` 开池更便宜（2.25 vs 3.5BB）；见 [`first_small_preopen_small_6max`]。
     reshape: String,
     trainer: String,
     updates: u64,
@@ -252,10 +256,11 @@ fn run() -> Result<(), String> {
                     (a, r)
                 }
                 "preopen" => first_small_preopen_6max(args.postflop_cap),
+                "preopen-small" => first_small_preopen_small_6max(args.postflop_cap),
                 other => {
                     return Err(format!(
-                        "unknown --reshape {other} (expected none | nolimp | preopen)"
-                    ))
+                    "unknown --reshape {other} (expected none | nolimp | preopen | preopen-small)"
+                ))
                 }
             };
             SimplifiedNlheGame::new_with_abstraction(

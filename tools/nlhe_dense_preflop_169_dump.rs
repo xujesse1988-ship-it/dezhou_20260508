@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use poker::training::nlhe::SimplifiedNlheGame;
 use poker::training::nlhe_betting_tree::{
-    first_small_6max, first_small_preopen_6max, AbstractActionTag, Child, NodeId,
+    first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max, AbstractActionTag,
+    Child, NodeId,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::{BetRatio, BucketTable, Card, InfoSetId, PreflopLossless169, Rank, Suit, TableConfig};
@@ -101,10 +102,11 @@ fn run(args: Args) -> Result<(), String> {
                     (a, r)
                 }
                 "preopen" => first_small_preopen_6max(args.postflop_cap),
+                "preopen-small" => first_small_preopen_small_6max(args.postflop_cap),
                 other => {
                     return Err(format!(
-                        "unknown --reshape {other} (expected none | nolimp | preopen)"
-                    ))
+                    "unknown --reshape {other} (expected none | nolimp | preopen | preopen-small)"
+                ))
                 }
             };
             SimplifiedNlheGame::new_with_abstraction(

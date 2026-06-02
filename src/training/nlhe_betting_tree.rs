@@ -96,6 +96,14 @@ pub struct BettingAbstractionRules {
     /// BB 此局面是 `Check`（无 `Call` 可删）。治 S4「UTG limp 16.6%」病 + 缩树。`false` =
     /// 关（HU 默认 / `first_small_6max` 保持原行为，守 cross-check）。
     pub no_open_limp: bool,
+    /// preflop 开池单档（仅小档）：preflop 开池（`raises_on_street == 0`，越过 BB 的**首个**
+    /// `Raise`）只保留 0.5pot（[`BetRatio::HALF_POT`] = 2.25BB）开池档，删 1.0pot
+    /// （[`BetRatio::FULL_POT`] = 3.5BB）。**仅 preflop 开池生效**：re-raise（`raises>0`）的档由
+    /// `drop_small_reraise` 收到 1.0pot，postflop 一行不动。与 `drop_small_reraise` 叠加 →
+    /// preflop 严格单档：开池 2.25BB、3bet+ 1.0pot。配 preflop`{0.5,1}` 菜单（见
+    /// [`first_small_preopen_small_6max`]）；菜单无 1.0pot 时本旗空转。`false` = 关（默认，
+    /// 保持 [`first_small_preopen_6max`] 的双开池档行为，守 cross-check）。
+    pub preflop_open_small_only: bool,
 }
 
 impl BettingAbstractionRules {
@@ -109,6 +117,7 @@ impl Default for BettingAbstractionRules {
             drop_small_reraise: false,
             width_redirect: Self::WIDTH_REDIRECT_OFF,
             no_open_limp: false,
+            preflop_open_small_only: false,
         }
     }
 }
@@ -126,6 +135,7 @@ pub fn first_small_6max(width_redirect: u8) -> (StreetActionAbstraction, Betting
         drop_small_reraise: true,
         width_redirect,
         no_open_limp: false,
+        preflop_open_small_only: false,
     };
     (abs, rules)
 }
@@ -148,7 +158,26 @@ pub fn first_small_preopen_6max(
         drop_small_reraise: true,
         width_redirect,
         no_open_limp: true,
+        preflop_open_small_only: false,
     };
+    (abs, rules)
+}
+
+/// S4 reshape 变体：在 [`first_small_preopen_6max`] 基础上 **把 preflop 开池收成单档（仅
+/// 2.25BB）**。preflop 菜单仍 `{0.5,1.0}`，但 `preflop_open_small_only` 删开池 1.0pot
+/// （3.5BB）→ 开池只剩 0.5pot（2.25BB）；`drop_small_reraise` 把 3bet+ 收到 1.0pot。
+/// 即 preflop 严格单档：**开池 2.25BB、3bet+ 1.0pot、禁非 SB limp**。postflop `{0.5,1.0}`
+/// A3 first-small 不变。
+///
+/// 动机：`preopen`（[`first_small_preopen_6max`]）给两个开池档（2.25/3.5BB），树比单档大；
+/// 而 `nolimp`（[`first_small_6max`] + no_limp）单档但开池是 3.5BB，偏紧（S4 续⑤：BTN
+/// raise 37% 窄于 GTO）。本 profile 取中间：单开池档但用便宜的 2.25BB（更宽开池范围），树比
+/// `preopen` 小（preflop 开池少一档）。
+pub fn first_small_preopen_small_6max(
+    width_redirect: u8,
+) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let (abs, mut rules) = first_small_preopen_6max(width_redirect);
+    rules.preflop_open_small_only = true;
     (abs, rules)
 }
 
@@ -253,6 +282,13 @@ impl PublicBettingTree {
             rules.width_redirect
         );
 
+        // preflop_open_small_only：preflop 开池（raises==0 = 越过 BB 的首个 Raise）只留
+        // 0.5pot 开池档，删 1.0pot（见 filter_actions）。仅 preflop 开池生效（re-raise 由
+        // drop_small_reraise 收档；postflop 不碰）。rules 关时恒 false。
+        let drop_large_open = rules.preflop_open_small_only
+            && state.street() == Street::Preflop
+            && raises_on_street == 0;
+
         let legal_set = abs.abstract_actions(&state);
         // A3×A4 过滤（drop_small_reraise + redirect 禁被动进场）。filter 后的集合同时
         // 决定 node.legal_actions 与 children → child 下标恒对齐 legal_actions（D-209）。
@@ -263,6 +299,7 @@ impl PublicBettingTree {
             rules,
             raises_on_street,
             drop_open_limp,
+            drop_large_open,
         );
         let legal_actions: SmallVec<[AbstractActionTag; 8]> =
             allowed.iter().map(AbstractActionTag::of).collect();
@@ -385,6 +422,9 @@ fn is_aggression(a: &AbstractAction) -> bool {
 ///   （0.5 仅作首次进攻）。postflop `Raise` 恒有前序进攻 → 与历史「删全部 Raise{0.5}」
 ///   byte-equal；preflop 菜单含 0.5 时其开池 Raise（raises==0）得以保留 = 2.25BB 开池档。
 /// - `drop_open_limp`（S4 no_open_limp，已在 walk 算好「preflop 未加注 + actor 非 SB」）：删 `Call`。
+/// - `drop_large_open`（S4 preflop_open_small_only，已在 walk 算好「preflop 开池 raises==0」）：删
+///   `Raise{1.0pot}`（[`BetRatio::FULL_POT`]）→ 开池只剩 0.5pot。与 drop_small_reraise 镜像
+///   （后者删 re-raise 的 0.5pot；本者删 open 的 1.0pot）。
 /// - width redirect：第 (N+1) 个 entrant 留下 → 删 `Check`/`Call`（fold 或 squeeze）。
 ///   `e` = 当前 entrant 数；actor 已是 entrant → 留下 E 不变，否则 E+1；留下后 > N 即 gate。
 ///
@@ -400,6 +440,7 @@ fn filter_actions(
     rules: &BettingAbstractionRules,
     raises_on_street: u32,
     drop_open_limp: bool,
+    drop_large_open: bool,
 ) -> SmallVec<[AbstractAction; 8]> {
     let block_passive = if rules.width_redirect != BettingAbstractionRules::WIDTH_REDIRECT_OFF {
         let e = entrants.count_ones();
@@ -422,6 +463,13 @@ fn filter_actions(
             }
             if drop_open_limp && matches!(a, AbstractAction::Call { .. }) {
                 return false;
+            }
+            if drop_large_open {
+                if let AbstractAction::Raise { ratio_label, .. } = a {
+                    if *ratio_label == BetRatio::FULL_POT {
+                        return false;
+                    }
+                }
             }
             if block_passive && matches!(a, AbstractAction::Check | AbstractAction::Call { .. }) {
                 return false;
@@ -484,6 +532,9 @@ mod tests {
 
         let (pp_abs, pp_rules) = first_small_preopen_6max(3);
         summarize("+preopen(0.5,1)+no_limp N=3", &pp_abs, pp_rules);
+
+        let (ps_abs, ps_rules) = first_small_preopen_small_6max(3);
+        summarize("+preopen-small(open0.5)+no_limp N=3", &ps_abs, ps_rules);
     }
 
     /// 结构守门：reshape 确实在 UTG 根删掉 open-limp Call 且给两个开池档；baseline 仍有 limp。
@@ -517,6 +568,64 @@ mod tests {
         assert_eq!(n_raises, 2, "preopen：UTG 根应有 2 个开池档（0.5/1.0）");
         assert!(root.legal_actions.contains(&AbstractActionTag::Fold));
         assert!(root.legal_actions.contains(&AbstractActionTag::AllIn));
+    }
+
+    /// 结构守门：`preopen-small`（[`first_small_preopen_small_6max`]）把 preflop 开池收成
+    /// **单档（仅 0.5pot/2.25BB）**，而 re-raise 仍是单档 1.0pot。证明 `preflop_open_small_only`
+    /// 接对了——开池删 1.0pot、且不渗入 re-raise（re-raise 的档由 drop_small_reraise 收）。
+    /// 用 N=2（树小，debug 快）；只读 root + 其开池子节点。
+    #[test]
+    fn reshape_preopen_small_single_open_size() {
+        let cfg = TableConfig::default_6max_100bb();
+        let (abs, rules) = first_small_preopen_small_6max(2);
+        let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+        let root = t.node(t.root_id());
+        assert_eq!(root.street, StreetTag::Preflop);
+        // UTG 开池：无 limp Call、Fold + AllIn 在、Raise 恰 1 档 = 0.5pot(HALF_POT)。
+        assert!(
+            !root.legal_actions.contains(&AbstractActionTag::Call),
+            "preopen-small：UTG 根删 open-limp Call"
+        );
+        assert!(root.legal_actions.contains(&AbstractActionTag::Fold));
+        assert!(root.legal_actions.contains(&AbstractActionTag::AllIn));
+        let open_raises: Vec<BetRatio> = root
+            .legal_actions
+            .iter()
+            .filter_map(|t| match t {
+                AbstractActionTag::Raise(r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            open_raises,
+            vec![BetRatio::HALF_POT],
+            "preopen-small：preflop 开池只剩 0.5pot 单档（删 1.0pot）"
+        );
+        // 沿 0.5pot 开池边走到下家 → 面对加注（raises==1）→ re-raise 恰 1 档 = 1.0pot(FULL_POT)。
+        let open_idx = root
+            .legal_actions
+            .iter()
+            .position(|t| matches!(t, AbstractActionTag::Raise(BetRatio::HALF_POT)))
+            .expect("UTG 根有 0.5pot 开池");
+        let child_id = match root.children[open_idx] {
+            Child::Decision(id) => id,
+            Child::Terminal => panic!("开池后不应是终局"),
+        };
+        let reraise_node = t.node(child_id);
+        assert_eq!(reraise_node.street, StreetTag::Preflop);
+        let reraise_raises: Vec<BetRatio> = reraise_node
+            .legal_actions
+            .iter()
+            .filter_map(|t| match t {
+                AbstractActionTag::Raise(r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reraise_raises,
+            vec![BetRatio::FULL_POT],
+            "preopen-small：re-raise 只剩 1.0pot 单档（drop_small_reraise；小开池旗不渗入 re-raise）"
+        );
     }
 
     /// 默认全街 `{0.5,1,2}` 树节点数 = 240,096（与 `nlhe_betting_tree_sizing` 工具
