@@ -140,8 +140,7 @@ advisor 拿 incr"。启动时 `subprocess.Popen` 拉起常驻 advisor、读 read
 
 - **用 dense 100M blueprint**（`run_dense_lcfr_100m`，4.7 GiB，LBR 1143）+ **v4 cafebabe
   500/500/500 bucket 表**。理由：与 HashMap 500M（1126）同质量（差 < SE），但 dense ckpt
-  加载 RAM ~4.6 GiB，能塞进 vultr 7.7 GiB；HashMap 500M 在 vultr 会 OOM。K=1000/2000
-  高桶表 suspect，不用。
+  加载 RAM ~4.6 GiB，能塞进 vultr 7.7 GiB；HashMap 500M 在 vultr 会 OOM。
 - advisor 跑 **vultr**（有出网 + artifact 都在本地）。**开工前验证**：dense ckpt 推理态
   RSS < 7.7 GiB（若紧张，按"高性能机按需申请"规则先问用户再起大机）。
 - ⚠️ **对外服务**（把牌局发 slumbot.com）。T6 第一次真实联机前先找用户确认；大样本可能要

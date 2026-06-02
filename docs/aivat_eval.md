@@ -21,7 +21,7 @@ for Agent Evaluation in Imperfect Information Games*, AAAI 2018 (arXiv:1612.0691
     全精度重算（见 §4.5）。两日志仅在本机，跑前 scp 到 vultr。
   - **blueprint（vultr）**：`artifacts/run_dense_lockfree/nlhe_es_mccfr_final_001000000000.ckpt`
     （1B ES-MCCFR dense，570MB）+ `artifacts/bucket_table_default_1000_1000_1000_seed_cafebabe_schemav4.bin`
-    （**重训版，质量正常**，553MB）。VF 表必须用**这同一对** ckpt+表构建。
+    （553MB）。VF 表必须用**这同一对** ckpt+表构建。
   - **该文件 raw 均值 ≈ +62 mbb/g**（**不是 −1969**；−1969 是另一次 1000 手 seed=7 跑，见
     `docs/status_v2.md`）。§7 闸门对**本文件自身** raw 均值配对比较，绝不锚外部常数。
   - **主机**：vultr（11 GiB / 4 core，已扩内存）即可建 VF + 跑估计器 + 校验，不需要 AWS。
@@ -267,7 +267,7 @@ VF 表为 `f64`（评测层，非 rules/abstraction 整数不变量路径，与 
 - 日志 `slumbot_strategy_20260529_1.jsonl` = **10000 手**（非 8378，run 续过）；**raw 均值 −85.25 mbb/g**
   （非 +62）；**0 个 fallback_uniform 决策**。client_pos 5001/4999。
 - blueprint ckpt `run_dense_lockfree/...001000000000.ckpt` = **9.3 GB**（§1 写的 570MB 错；含 regret+
-  strategy 两表）；bucket `..._1000_..._cafebabe_schemav4.bin` = **529 MB**（用户重训版，质量正常）。
+  strategy 两表）；bucket `..._1000_..._cafebabe_schemav4.bin` = **529 MB**。
 - log `info_set` 解码（node = raw>>38 / bucket = raw&0xFFFFFF）实测：postflop bucket≤999、node≤239232、
   preflop bucket≤168 → **确认**该 log 由 1B dense + 1000 桶生成。
 
