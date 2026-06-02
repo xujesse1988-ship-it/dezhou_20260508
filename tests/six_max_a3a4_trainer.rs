@@ -23,8 +23,9 @@ use poker::training::nlhe::SimplifiedNlheGame;
 use poker::training::nlhe_betting_tree::first_small_6max;
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{
-    evaluate_blueprint_vs_baseline_multiway, ConvergenceMonitor, EsMccfrTrainer, Game,
-    MonitorReport, NlheBaselinePolicy, NlheEvaluationConfig, StrategySnapshot, Trainer,
+    evaluate_blueprint_vs_baseline_multiway, evaluate_blueprint_vs_blueprint_multiway,
+    ConvergenceMonitor, EsMccfrTrainer, Game, MonitorReport, NlheBaselinePolicy,
+    NlheEvaluationConfig, StrategySnapshot, Trainer,
 };
 use poker::{BucketConfig, BucketTable, ChaCha20Rng, InfoSetId, RngSource, TableConfig};
 
@@ -254,6 +255,74 @@ fn six_max_multiway_eval_harness() {
             "总筹码应逐位复现"
         );
     }
+}
+
+/// S5① blueprint A vs blueprint B 互评原语（**同树**）：验 plumbing + 可复现 + seat-aware。
+/// 用两套确定的不同同树策略（A=uniform、B=首动作加倍）→ 无需训练、无 artifact、默认套件可跑。
+#[test]
+fn six_max_blueprint_vs_blueprint_eval_harness() {
+    let game = build_six_max_game();
+    let strat_a: &dyn Fn(&InfoSetId, usize) -> Vec<f64> = &|_info, n| vec![1.0 / n as f64; n];
+    // B：首个动作权重加倍（harness 归一化）→ 与 uniform 确定地不同。
+    let strat_b: &dyn Fn(&InfoSetId, usize) -> Vec<f64> = &|_info, n| {
+        let mut w = vec![1.0_f64; n];
+        if let Some(first) = w.first_mut() {
+            *first = 2.0;
+        }
+        w
+    };
+    let config = NlheEvaluationConfig {
+        hands_per_seat: 200,
+        seed: 0x6E5F_4232_4232_0001,
+        max_actions_per_hand: 512,
+    };
+
+    let ab1 = evaluate_blueprint_vs_blueprint_multiway(&game, strat_a, strat_b, &config)
+        .expect("A vs B 互评");
+    let ab2 = evaluate_blueprint_vs_blueprint_multiway(&game, strat_a, strat_b, &config)
+        .expect("A vs B 复跑");
+    let ba = evaluate_blueprint_vs_blueprint_multiway(&game, strat_b, strat_a, &config)
+        .expect("B vs A 互评");
+
+    // plumbing：6 座、hands = hands_per_seat × n_players、按位置拆 6 项、统计有限、CI 包住均值。
+    assert_eq!(ab1.n_players, 6, "6-max n_players");
+    assert_eq!(ab1.hands, 200 * 6, "总手数 = hands_per_seat × n_players");
+    assert_eq!(ab1.hands_per_seat, 200);
+    assert_eq!(ab1.per_position_mbb_per_game.len(), 6, "按位置拆 6 项");
+    assert!(
+        ab1.mbb_per_game.is_finite()
+            && ab1.standard_error_mbb_per_game.is_finite()
+            && ab1.standard_error_mbb_per_game >= 0.0,
+        "mbb/g + SE 应有限非负"
+    );
+    assert!(
+        ab1.ci95_low_mbb_per_game <= ab1.mbb_per_game
+            && ab1.mbb_per_game <= ab1.ci95_high_mbb_per_game,
+        "CI95 应包住均值"
+    );
+    assert!(
+        ab1.per_position_mbb_per_game.iter().all(|v| v.is_finite()),
+        "每位置 mbb/g 应有限"
+    );
+
+    // 可复现：固定 seed 逐位相等。
+    assert_eq!(
+        ab1.mbb_per_game.to_bits(),
+        ab2.mbb_per_game.to_bits(),
+        "固定 seed 应逐位复现"
+    );
+    assert_eq!(
+        ab1.hero_total_chips.to_bits(),
+        ab2.hero_total_chips.to_bits(),
+        "总筹码应逐位复现"
+    );
+
+    // seat-aware：交换 hero/opponent 必改变结果——否则 hero_seat 分支被忽略（两座用了同一套策略）。
+    assert_ne!(
+        ab1.mbb_per_game.to_bits(),
+        ba.mbb_per_game.to_bits(),
+        "A-vs-B 与 B-vs-A 应不同（策略不同 + 正确区分 hero/opponent 座位）"
+    );
 }
 
 /// dense 生产路径：full-prealloc 表按 6-max 树定尺寸 + LCFR + 三条写路径（单线程 /
