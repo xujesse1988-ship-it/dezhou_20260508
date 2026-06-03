@@ -43,10 +43,15 @@ commit `cf9efdb`,**未并入 6max**)。设计成文 `temp/realtime_search_design
 `PublicBettingTree::build_subtree`(以中途 public state 为根建 betting 子树,`nlhe_betting_tree.rs`);②**加性**
 `GameState::resample_hidden`(克隆中途态+保留公共牌/下注态+重发隐藏牌,终局走权威 `payouts()` → **S1 不受影响**,
 `rules/state.rs`);③ `SubgameNlheGame impl Game`(delegate SimplifiedNlheGame、仅重写 root()=resample+子树 →
-复用 `EsMccfrTrainer` 零改,`training/subgame.rs`)。**vultr 验证**:6 新测试全过 + 全 lib 67/67 无回归(byte-equal
-守门未破)。剩 6a 收尾 = subgame_search 接 `blueprint_advisor.rs:421`(flop-only 触发)+ 不退化 h2h 探针
-(search-on vs blueprint-only,需真 ckpt);6b(continual re-solving + biased leaf)/6c(off-tree PHM)后续。详见
-`six_max_nlhe_target.md` S6。
+复用 `EsMccfrTrainer` 零改,`training/subgame.rs`)。**6a 收尾已落地**(commit `a8f1b96`):④ `subgame_search`
+接 `blueprint_advisor.rs:421`(`should_search` flop 未起注首决策点触发 + 失败回落 blueprint;`Contestant.search`
+默认 None = byte-equal 旧行为) + `SearchObserver` 计搜索触发/fallback;⑤ 探针 `tools/six_max_search_probe`
+(同一 blueprint 拆 search-on vs search-off,出 mbb/g+CI95)。**vultr 验证**:lib 71/0/8 无回归;真 1B nolimp
+ckpt smoke(600 手)plumbing 健康——desync=0/illegal=0、search 真触发(fallback 1.5%)、加载无 OOM;mbb/g CI
+600 手太宽不可判。子树实测:6-max first_small(3) flop=4434 节点 < cap 8000(探针不被误拒)。**未闭 = step 6 大样本
+判决**(需 ~100k–1M 手上 AWS,且信号被 §2 三 confound 削弱:uniform range/无 blueprint 叶子/欠迭代噪声)→ 战略
+岔路(甲 直接 AWS 跑 confounded 探针 / 乙 先做 §5b range 去 confound)待用户拍板;6b/6c 后续。详见
+`temp/realtime_search_design_2026_06_03.md` §10.2 + `six_max_nlhe_target.md` S6。
 
 **6-max 范式切换**:多人一般和 → CFR 不保证收敛 Nash、**LBR/exploitability 失去理论意义**(只当诊断,质量以
 实测对战为准)、无"训到 floor 就停"、无强 6-max 公开参考对手(不像 Slumbot 之于 HUNL)。详见 target 文档。

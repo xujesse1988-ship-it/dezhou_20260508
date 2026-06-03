@@ -399,8 +399,8 @@ MCCFR 不改即用（`trainer.rs` 零改）。root 重发**所有**人（含 her
 | 2′ | `GameState::resample_hidden`（`rules/state.rs`，替代原 step 2 的 auth.clone uniform） | ✅ + 3 测试（保留态/无重复牌/showdown 自洽、推进终局守恒、byte-equal 可复现）|
 | 3′ | `SubgameNlheGame impl Game`：delegate + 重写 root；叶子 = 解到 subgame 终局走**真实 showdown payoff**（与 step 3 同效；求解器用 `EsMccfrTrainer` external-sampling 而非 `recurse_vanilla`——配 resample chance 更自然） | ✅ + 1 端到端 smoke（CFR 跑通 + 可复现）|
 | 5 | smoke（vultr）：6 新测试全过 + 全 lib 68/68 无回归（cf9efdb 时 67 + 审核收尾 `ceae72a` 新增 A 测试 1，byte-equal 守门未破）；本地 build/fmt/clippy `--all-targets -D warnings` 绿 | ✅ |
-| 4 | `subgame_search` 接 `blueprint_advisor.rs:421` + `should_search`（flop-only 触发）+ desync→blueprint 兜底 | ⏳ 未做（6a 收尾）|
-| 6 | 不退化 h2h 探针（search-on vs blueprint-only，需真 ckpt 如 `run_6max_s4_nolimp`）| ⏳ 未做（6a 收尾）|
+| 4 | `subgame_search` 接 `blueprint_advisor.rs:421` + `should_search`（flop-only 触发）+ desync→blueprint 兜底 | ✅ 落地（commit `a8f1b96`，§10.2）|
+| 6 | 不退化 h2h 探针（search-on vs blueprint-only，需真 ckpt 如 `run_6max_s4_nolimp`）| ◑ 工具 `tools/six_max_search_probe` + vultr smoke 已过；**大样本判决待定**（confound + AWS 预算，§10.2）|
 
 → **MVP subgame-solver 核心闭环已证**（construct → resample → CFR → 可复现），架构 blocker 解除。剩 step 4+6 =
 把它接进 live 决策点 + 真正跑「不退化探针」（§2 的 blueprint 质量判别器）。注：MVP 仍 uniform range、同抽象、解到终局
@@ -421,6 +421,24 @@ MCCFR 不改即用（`trainer.rs` 零改）。root 重发**所有**人（含 her
   re-solve 都会在 `apply` 的 action 记录 / `finalize_terminal` 历史写入 / **逐 apply 增长的 `history.actions`（使
   per-node clone 退化成 O(depth²)）** 上白付开销（CFR / `payouts` 都不读 history；`hand_history()` 在 subgame 状态上
   无意义）。3 个 `resample` 测试在新路径下复跑全过（规则层不变量 + 终局守恒未破）。
+
+### 10.2 进度（2026-06-03，分支 `6max-rts-mvp` commit `a8f1b96`，vultr 验证；**未并入 6max**）
+
+**step 4 + step 6 已落地**——MVP 实时搜索接进 live 决策环 + 不退化探针工具。具体：
+
+| 件 | 内容 | 状态 |
+|---|---|---|
+| step 4 搜索驱动 | `subgame.rs`：`SubgameSearchConfig` / `should_search`（flop **未起注**首决策点触发）/ `subtree_context`（postflop `entrants`=live bitmask、`raises_on_street`=0 现算，补 §10.1 A「遗留」的 getter 缺口）/ `subgame_search`（建 subgame→CFR→取 actor 真实手 root 策略，按 tag 对齐 `legal_abs`，任一失败回落 blueprint）/ `SubgameNlheGame::root_query` | ✅ |
+| step 4 插桩 | `blueprint_advisor.rs:421` 改 search-or-blueprint 分支（`outgoing_action`/影子推进**不变**）；`Contestant.search: Option<SubgameSearchConfig>`（默认 `None` = byte-equal 旧行为）；`decision_ordinal` 透传搜索 RNG（可复现 + 跨手独立）；`SearchObserver`（attempts/successes 原子计数，report 暴露 fallback 率）| ✅ |
+| step 4 支撑 | `SimplifiedNlheGame` 存 `rules` + `rules()`（subgame 重建子树须同规则透传）；`EsMccfrTrainer::game()` accessor | ✅ |
+| step 6 探针 | `tools/six_max_search_probe`：同一 blueprint 拆 hero(search-on) vs field(search-off)，`evaluate_cross_abstraction_h2h` 出 mbb/g + CI95 + search 触发/fallback 计数（取代 6-max 失效的 LBR 闸门）| ✅ 工具 |
+| 测试 | vultr lib **71/0/8**（+3：`should_search`/`subtree_context`、`subgame_search` 契约+可复现+tiny cap 回落、search-on 守恒+可复现；+1 ignored 诊断）；本地 build/fmt/clippy `--all-targets -D warnings` 绿 | ✅ |
+
+**实测子树尺寸**（`_measure_flop_subtree_sizes` 诊断，机器无关）：6-max `first_small(3)` flop 子树（3-way，limped/深码 = 最大情形）= **4434 节点** < 默认 `max_subtree_nodes` 8000 → 探针**不会被 cap 误拒**（修正 §5a「100–2000」低估，但默认 8000 仍有余量）。HU 默认 `{0.5,1,2}` flop 子树 = 58160（仅诊断/契约测试用大 cap；HU 非生产目标）。
+
+**smoke（vultr，真 1B nolimp ckpt `run_6max_s4_nolimp/...final_001000000000`，bucket 200/200/200，100 手/座 = 600 手）**：plumbing 健康——加载 1B ckpt 无 OOM（11Gi 机，峰值 cache ~3.5Gi）；**desync=0 / illegal=0**（同抽象自对弈，搜索路径不破 lockstep/记账）；**search 触发 66 决策点、真搜索 65（fallback 仅 1.5%）**——1500 迭代下 root 桶可靠命中，搜索确在跑（confound 是**欠迭代解的噪声**，非 fallback）；mbb/g = −667，CI95 = [−1857, +524]（600 手样本太小 → CI 巨宽、跨 0，点估为负但纯噪声，**不能据此判强弱**）。
+
+→ **step 4 plumbing 端到端证实**（construct→resample→CFR→取分布→outgoing→真实对局，desync=0、search 真触发、可复现）。**未闭 = step 6 的「大样本判决」**：需 ~100k–1M 手才有有效 CI（按 `feedback_high_perf_host_on_demand` 上 AWS），且**信号被 §2 三 confound 削弱**（uniform range / 解到真实终局无 blueprint 叶子 → 测不到「搜索放大 blueprint 偏差」、只测「均匀-range 全解 vs blueprint」/ 欠迭代噪声）。**战略岔路（待用户拍板）**：(甲) 直接上 AWS 跑 confounded 大样本探针（验「均匀-range 全解 vs blueprint」+ plumbing 规模化）；(乙) 先做 §5b range 估计（blueprint 沿历史累乘 reach 加权 resample）把探针**去 confound**、使其真能答 §2，再上大样本。MVP plumbing 是两条路的共同前置，已不浪费。
 
 ---
 
