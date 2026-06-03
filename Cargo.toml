@@ -134,6 +134,12 @@ path = "tools/six_max_eval.rs"
 name = "six_max_blueprint_h2h"
 path = "tools/six_max_blueprint_h2h.rs"
 
+# S5② OpenPoker 常驻 advisor：Python WS driver 喂每决策请求，本进程加载 6-max blueprint
+# 无状态重放→出 {action,amount}（off-tree 复用 blueprint_advisor；失败安全兜底，live 不崩）。
+[[bin]]
+name = "openpoker_advisor"
+path = "tools/openpoker_advisor.rs"
+
 # 阶段 3 F3 \[报告\]：简化 NLHE D-362 BLAKE3 byte-equal anchor 一次性 instrumentation。
 # 用户授权 F3 anchor 降标 100M 单 run → 10M × 3 run 检查；本 binary 跑 fixed_seed
 # × 3 EsMccfr 训练，比对 avg_strategy BLAKE3 byte-equal。继承 stage 2

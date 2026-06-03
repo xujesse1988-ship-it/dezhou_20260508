@@ -215,6 +215,7 @@ pub trait ActionAbstraction: Send + Sync {
 }
 
 /// 默认 5-action 抽象（D-200）。
+#[derive(Clone)]
 pub struct DefaultActionAbstraction {
     config: ActionAbstractionConfig,
 }
@@ -512,6 +513,7 @@ impl ActionAbstraction for DefaultActionAbstraction {
 /// `Street::Showdown`（terminal）不应作为决策节点进入；万一传入，落到 river 槽位的
 /// 底层 abstraction，由其 `current_player().is_none()` 守卫返回空集 / `Fold`，与
 /// `DefaultActionAbstraction` 行为一致。
+#[derive(Clone)]
 pub struct StreetActionAbstraction {
     /// index = `Street as usize`（Preflop=0, Flop=1, Turn=2, River=3）。
     by_street: [DefaultActionAbstraction; 4],
