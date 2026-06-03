@@ -16,9 +16,15 @@ driver 职责（§3）：
                （验收：advisor 全程出合法 {action,amount}、driver 组请求正确，无需账号）。
   （默认）     真实联机 openpoker.ai（需 --api-key；用户注册 POST api.openpoker.ai/api/register）。
 
-⚠ 未经 live 验证的协议假设（拿到账号后据真实消息校准，本文件内 [LIVE?] 标注）：
-  - player_action.amount 视为 raise 的**总 to 额**（OpenPoker 单位）；若实为增量需改 _on_player_action。
-  - 我方 my_seat、对手 seat 索引、turn_token/client_action_id 字段名以 §1 协议表为准。
+✓ 协议已 live 校准（2026-06-03 观测 + docs.openpoker.ai/llms-full.txt）：
+  - action 报文：client_action_id 必须**字符串**、amount 始终在场（raise=float 总 to 额、余 null）。
+    （早先用 int client_action_id 被服务端拒 invalid_message。）
+  - player_action.amount_mode=="to_total"：raise 的 amount = 总 to 额（确认，与 on_player_action 一致）。
+  - hand_start{seat,dealer_seat,blinds}；hole_cards{cards}；your_turn{valid_actions,min_raise,max_raise,
+    turn_token,seat}；community_cards{cards,street}。消息分 stream:event（离散事件，driver 用）+
+    stream:state（table_state 全量快照，driver 忽略，未来可改用它取 valid_actions 更鲁棒）。
+⚠ 固有限制：真实桌**码深漂移严重**（实测同桌 14BB–800BB），blueprint 假设 100BB → off-distribution
+  手大量走 advisor 兜底（§4 已知短板，非 bug）；买入锁 2000 + 漂出 [80,125]BB leave/rejoin 只控我方栈。
 """
 
 import argparse
@@ -259,15 +265,18 @@ def _handle_your_turn(ws, advisor, state, msg, counters, client_action_id, send,
     else:
         counters["blueprint"] += 1
     client_action_id[0] += 1
+    amt = resp.get("amount")
+    # action 报文格式（docs.openpoker.ai/llms-full.txt 校准，2026-06-03）：
+    # client_action_id 必须是**字符串**（去重 ID）；amount 始终在场（raise 为 float 总 to 额、
+    # 余为 null）。早先用 int client_action_id 被服务端拒（invalid_message）。
     out = {
         "type": "action",
         "hand_id": msg.get("hand_id", hand.hand_id),
         "action": resp["action"],
+        "amount": float(amt) if amt is not None else None,
+        "client_action_id": f"jx-{client_action_id[0]}",
         "turn_token": msg.get("turn_token"),
-        "client_action_id": client_action_id[0],
     }
-    if resp.get("amount") is not None:
-        out["amount"] = resp["amount"]
     send(ws, out)
     if log_f:
         log_f.write(json.dumps({"req": req, "resp": resp, "sent": out}, ensure_ascii=False) + "\n")
