@@ -255,16 +255,26 @@ impl GameState {
     /// blueprint range 加权 / 拒绝采样。
     ///
     /// **加性**：现有构造函数 / `apply` / `payouts` / 发牌协议全不改动；本方法只在 clone 上覆写
-    /// 卡牌字段（`hole_cards` / `runout_board` / `showdown_ranks` + track_history 下的
-    /// `history.hole_cards`）。其余字段（`board` / 街 / 筹码 / `current_player` / `raise_option_open`
-    /// / `last_*` …）逐字保留。前置：`self` 须为非终局（实时搜索从 decision 节点为根）。
-    /// 同 `(self, rng 状态)` 必出同补全（byte-equal 可复现）。
+    /// 卡牌字段（`hole_cards` / `runout_board` / `showdown_ranks`），其余下注 / 公共 / 行动权字段
+    /// （`board` / 街 / 筹码 / `current_player` / `raise_option_open` / `last_*` …）逐字保留。
+    ///
+    /// 唯一例外：返回状态强制 `track_history = false`（对齐 base `SimplifiedNlheGame::root` 的
+    /// [`with_rng_no_history`](Self::with_rng_no_history) CFR fast path）。否则从 `track_history =
+    /// true` 的权威局 clone 来时，每步 re-solve 都会在 `apply` 的 action 记录 / `finalize_terminal`
+    /// 历史写入 / 逐 apply 增长的 `history.actions`（使 per-node clone 退化成 O(depth²)）上白付开销
+    /// （CFR / `payouts` 都不读 history；`hand_history()` 在 subgame 状态上无意义）。
+    ///
+    /// 前置：`self` 须为非终局（实时搜索从 decision 节点为根）。同 `(self, rng 状态)` 必出同补全
+    /// （byte-equal 可复现）。
     pub(crate) fn resample_hidden(&self, rng: &mut dyn RngSource) -> GameState {
         debug_assert!(
             !self.terminal && self.current_player.is_some(),
             "resample_hidden 只用于非终局中途 decision 状态"
         );
         let mut state = self.clone();
+        // Subgame 状态仅供 CFR 求解：强制走 no-history fast path（见上方 doc）——避免从
+        // track_history=true 的权威局 clone 来时每步 re-solve 白付 history 开销。
+        state.track_history = false;
         let visible_len = state.board.len();
 
         // 去掉可见公共牌（board 前缀）的剩余牌堆。
@@ -318,14 +328,7 @@ impl GameState {
             })
             .collect();
 
-        // track_history 下同步 history.hole_cards，避免内部不一致（CFR / payouts 不读它，
-        // 但保持字段自洽以防 trace / replay 误读旧牌）。no-history 模式 hole_cards 为空、跳过。
-        if state.track_history && state.history.hole_cards.len() == state.players.len() {
-            for idx in 0..state.players.len() {
-                state.history.hole_cards[idx] = state.players[idx].hole_cards;
-            }
-        }
-
+        // history.hole_cards 不再同步：track_history 已置 false，subgame 不维护 history。
         state
     }
 

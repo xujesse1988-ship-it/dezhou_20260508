@@ -937,4 +937,112 @@ mod tests {
             );
         }
     }
+
+    /// **rules-ON** 的 from-interior cross-check：从中途节点重建子树时，调用方**必须传入正确的
+    /// `raises_on_street`**，否则 `drop_small_reraise` 会按错误上下文重算动作集（把 re-raise 的
+    /// 0.5pot 误当开池档保留）。这正是 [`PublicBettingTree::build_subtree`] 文档标红、而默认 rules
+    /// 的 [`build_subtree_from_interior_matches_descendant_block`] 测不到的路径（默认 rules 不读
+    /// 这俩参数，传 0/0 恒安全）。S6 step 4 接 `blueprint_advisor.rs:421` 时用的就是 rules-on
+    /// profile（`first_small_6max` 等），此测把那条路径的最大隐患提前钉死。
+    ///
+    /// 构造：HU 200BB + `{0.5,1,2}` + 仅开 `drop_small_reraise`（`width_redirect` 关 → `entrants`
+    /// 不被 [`filter_actions`] 读取，隔离出 `raises_on_street` 这一维）。路径 SB Call → BB Check →
+    /// flop 首攻 `Bet{0.5}` → 节点 K =「flop 面对下注」(`raises_on_street == 1`)：K 的菜单被
+    /// `drop_small_reraise` 删去 `Raise{0.5}`。双向钉死：
+    /// - 正确 seed `raises=1` → 子树 ≡ 全树 K 后代块；
+    /// - 错误 seed `raises=0` → 子树 root 漏删 `Raise{0.5}`、与 K 不同构（证 `raises_on_street`
+    ///   真的被 `build_subtree` 读取、不是被静默吞掉）。
+    #[test]
+    fn build_subtree_from_interior_rules_on_threads_raises_context() {
+        let cfg = TableConfig::default_hu_200bb();
+        let abs = StreetActionAbstraction::default_6_action();
+        // 仅开 drop_small_reraise（width_redirect 关 → entrants 不被读，单独测 raises 这一维）。
+        let rules = BettingAbstractionRules {
+            drop_small_reraise: true,
+            ..BettingAbstractionRules::default()
+        };
+        let full = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+
+        // 沿 [Call, Check, Bet(0.5)] 在全树定位 K（flop 面对 0.5pot 下注的 re-raise 决策点）。
+        let path = [
+            AbstractActionTag::Call,
+            AbstractActionTag::Check,
+            AbstractActionTag::Bet(BetRatio::HALF_POT),
+        ];
+        let mut k = full.root_id();
+        for &tag in &path {
+            let node = full.node(k);
+            let idx = node
+                .legal_actions
+                .iter()
+                .position(|t| *t == tag)
+                .unwrap_or_else(|| panic!("全树路径缺边 {tag:?} @ node {k}"));
+            k = match node.children[idx] {
+                Child::Decision(id) => id,
+                Child::Terminal => panic!("路径中途不该终局 @ {tag:?}"),
+            };
+        }
+        assert_eq!(full.node(k).street, StreetTag::Flop);
+        assert!(
+            !full
+                .node(k)
+                .legal_actions
+                .contains(&AbstractActionTag::Raise(BetRatio::HALF_POT)),
+            "全树 K（raises=1 re-raise）应已被 drop_small_reraise 删去 Raise{{0.5}}"
+        );
+
+        // 重建中途状态：开局 apply 同一串 concrete 动作（卡牌任意 → walk 卡牌无关）。
+        let mut rng = ChaCha20Rng::from_seed(0x5542_5452_4545_5F32); // "SUBTREE_2"
+        let mut mid = GameState::with_rng(&cfg, 0, &mut rng);
+        for &tag in &path {
+            let concrete = abs
+                .abstract_actions(&mid)
+                .iter()
+                .copied()
+                .find(|a| AbstractActionTag::of(a) == tag)
+                .unwrap_or_else(|| panic!("重建路径缺抽象动作 {tag:?}"));
+            mid.apply(concrete.to_concrete())
+                .unwrap_or_else(|_| panic!("apply {tag:?} 应合法"));
+        }
+        assert_eq!(mid.street(), Street::Flop);
+        assert!(!mid.is_terminal() && mid.current_player().is_some());
+
+        // 正确 seed（raises=1；entrants 不被读，传 0）→ 子树逐节点 ≡ 全树 K 后代块。
+        let sub = PublicBettingTree::build_subtree(&mid, &abs, rules, 0, 1);
+        assert!(
+            nodes_structurally_equal(sub.node(sub.root_id()), full.node(k)),
+            "正确 seed：子树 root 与全树 K 不同构\nsub ={:?}\nfull={:?}",
+            sub.node(sub.root_id()),
+            full.node(k)
+        );
+        assert!(
+            (k as usize) + sub.num_nodes() <= full.num_nodes(),
+            "后代块越界：K={k} + sub {} > full {}",
+            sub.num_nodes(),
+            full.num_nodes()
+        );
+        for i in 0..sub.num_nodes() as NodeId {
+            assert!(
+                nodes_structurally_equal(sub.node(i), full.node(k + i)),
+                "正确 seed：子树节点 {i} 与全树后代 {} 不同构\nsub ={:?}\nfull={:?}",
+                k + i,
+                sub.node(i),
+                full.node(k + i)
+            );
+        }
+
+        // 错误 seed（raises=0）→ root 漏删 Raise{0.5}、与 K 不同构（证 raises_on_street 真被读取）。
+        let wrong = PublicBettingTree::build_subtree(&mid, &abs, rules, 0, 0);
+        assert!(
+            wrong
+                .node(wrong.root_id())
+                .legal_actions
+                .contains(&AbstractActionTag::Raise(BetRatio::HALF_POT)),
+            "错误 seed (raises=0)：应把 re-raise 0.5pot 误当开池档保留"
+        );
+        assert!(
+            !nodes_structurally_equal(wrong.node(wrong.root_id()), full.node(k)),
+            "错误 seed 不该与全树 K 同构——否则说明 raises_on_street 未被 build_subtree 读取"
+        );
+    }
 }
