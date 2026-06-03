@@ -452,6 +452,8 @@ pub fn play_cross_abstraction_hand(
                     &auth,
                     contestants[bp_idx].game,
                     &legal_abs,
+                    node_id,
+                    contestants[bp_idx].strategy,
                     scfg,
                     hand_seed,
                     decision_ordinal as u64,
@@ -1004,6 +1006,7 @@ mod tests {
             iterations: 300,
             max_subtree_nodes: 8000,
             seed: 0x5EA2_C400_5EA2_C400,
+            use_blueprint_range: true,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;

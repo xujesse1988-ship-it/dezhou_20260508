@@ -6,32 +6,31 @@
 //! 受控对局，输出 hero（search-on）视角 mbb/g + CI95。统计金标准 = 配对差 + CI（与 S5 h2h
 //! 一致），**取代** 6-max 失去理论意义的 LBR/exploitability 闸门。
 //!
-//! 判读：
-//! - CI95 跨 0 → **不退化**（搜索没把对局打坏，plumbing 健康）。
-//! - CI95 下界 > 0 → 搜索**显著正收益**（即便均匀-range 全解都能赢 blueprint → blueprint 该
-//!   决策点偏弱）。
-//! - CI95 上界 < 0 → 搜索**显著退化**（见下方 confound：未必是 blueprint 太弱）。
+//! 判读（§5b range 去 confound 后，探针**能**有意义测 §2「搜索放大 blueprint 偏差」）：
+//! - CI95 跨 0 → 不退化（plumbing 健康；blueprint range 下全解与 blueprint 持平）。
+//! - CI95 下界 > 0 → 搜索**显著正收益**（blueprint range 下的精确 subgame 全解赢 blueprint →
+//!   基底够用、可继续堆 6b，§2 路线乙的「不退化甚至小赢」分支）。
+//! - CI95 上界 < 0 → 搜索**显著退化**（§2 实锤候选：blueprint range 本身偏 → 全解放大它；
+//!   但须先排除下方近似 #1/#3 的贡献，再判 blueprint 太弱）。
 //!
-//! # ⚠ MVP confound（务必随结果一并解读，`subgame.rs` 顶部 doc 有完整版）
+//! # 边界（务必随结果一并解读，`subgame.rs` 顶部 doc 有完整版）
 //!
-//! 本探针建在 6a **MVP** 搜索上，有三个有意为之的近似，使信号是**弱**信号：
-//! 1. **uniform range**：subgame 在「各家 flop range 均匀」的错设游戏上求解（非 blueprint 真
-//!    range）→ 退化可能源于 range 错设，**不**等于 blueprint 弱。
-//! 2. **解到真实终局、无 blueprint 续局值 / biased leaf**：搜索里**没有 blueprint**，故本 MVP
-//!    **测不到** §2 的「搜索放大 blueprint 偏差」——它测的是「均匀-range 全解 vs blueprint」。
-//! 3. **per-bucket 欠采样**：postflop 200 桶，`--search-iterations` 摊到每桶很少 → 桶策略噪声大
-//!    （CI 宽）、极端时回落 blueprint。提高迭代数才稳，但成本随手数线性放大。
+//! §5b 后 subgame 在 blueprint 真 range（非均匀）上**解到真实 showdown 终局**（小子树、无叶子
+//! 近似）。仍在的近似：
+//! 1. **range = per-seat marginal + 桶粒度**：玩家间负相关只靠采样期 card-removal 近似；
+//!    postflop range 落桶（有损）、preflop 精确。
+//! 2. **per-bucket 欠采样**：`--search-iterations` 摊到每桶有限 → 桶策略有噪声、CI 偏宽；
+//!    提高迭代数收敛（成本随手数线性放大）。`--uniform-range` 关 §5b 作 A/B 对照。
+//! 3. search 触发/fallback 计数随报告输出——fallback 率高 = 多数触发点回落 blueprint，CI 主要
+//!    由相同决策主导，须据此解读。
 //!
-//! 故：CI 跨 0 = plumbing 健康（强结论）；CI<0 退化 = 弱信号（含 range/迭代 confound，别据此
-//! 直接判 blueprint 太弱）。要把它升级成真正的 §2 判别器须接 §5b range + §5c blueprint 叶子值。
-//!
-//! 用法（vultr 小样本 smoke；真探针上 AWS）：
+//! 用法（vultr 小样本 smoke；大样本判决上 AWS）：
 //! ```bash
 //! cargo run --release --bin six_max_search_probe -- \
 //!   --bucket-table artifacts/bucket_table_200_200_200_seed_cafebabe_schemav4.bin \
 //!   --reshape nolimp --postflop-cap 3 \
 //!   --checkpoint artifacts/run_6max_s4_nolimp/nlhe_es_mccfr_final_001000000000.ckpt \
-//!   --hands-per-seat 2000 --search-iterations 1000
+//!   --hands-per-seat 2000 --search-iterations 1000   # 加 --uniform-range 跑 MVP 对照
 //! ```
 
 use std::process::ExitCode;
@@ -100,8 +99,15 @@ fn run() -> Result<(), String> {
     );
     eprintln!(
         "[six_max_search_probe] search: iterations={} max_subtree_nodes={} seed=0x{:016x} \
-         （MVP：flop 未起注首决策点触发；uniform range；解到终局无 blueprint 叶子）",
-        args.search.iterations, args.search.max_subtree_nodes, args.search.seed
+         range={} （flop 未起注首决策点触发；解到终局无 blueprint 叶子）",
+        args.search.iterations,
+        args.search.max_subtree_nodes,
+        args.search.seed,
+        if args.search.use_blueprint_range {
+            "blueprint(§5b 去 confound)"
+        } else {
+            "uniform(MVP)"
+        }
     );
 
     // 同一 trainer 的 dense average strategy，hero/field 共用（blueprint 完全相同）；
@@ -144,11 +150,11 @@ fn print_report(r: &CrossAbstractionH2hReport) {
         0.0
     };
     let verdict = if r.ci95_low_mbb_per_game > 0.0 {
-        "搜索显著正收益（CI95 下界 > 0）—— 即便均匀-range 全解都赢 blueprint，blueprint 该决策点偏弱"
+        "搜索显著正收益（CI95 下界 > 0）—— blueprint range 下精确全解赢 blueprint，基底够用、可堆 6b"
     } else if r.ci95_high_mbb_per_game < 0.0 {
-        "搜索显著退化（CI95 上界 < 0）—— ⚠ 含 range/迭代 confound，别直接判 blueprint 太弱，见 doc"
+        "搜索显著退化（CI95 上界 < 0）—— §2 实锤候选（blueprint range 偏）；先排除 marginal/迭代近似再判"
     } else {
-        "不退化（CI95 跨 0）—— plumbing 健康；搜索在该 MVP 设定下与 blueprint 持平"
+        "不退化（CI95 跨 0）—— plumbing 健康；blueprint range 下全解与 blueprint 持平"
     };
     println!(
         "=== 实时搜索不退化探针：hero=search-on vs field=search-off ({} 手计入 / {} 尝试) ===",
@@ -265,6 +271,8 @@ fn parse_args() -> Result<Args, String> {
             "--search-seed" => {
                 search.seed = parse_u64(&next(&mut it, "--search-seed")?, "--search-seed")?
             }
+            // A/B 对照：关 §5b range，回 uniform resample（MVP 旧行为）。
+            "--uniform-range" => search.use_blueprint_range = false,
             other => return Err(format!("unknown argument: {other}")),
         }
     }

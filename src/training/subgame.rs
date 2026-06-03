@@ -11,27 +11,31 @@
 //!   / `legal_actions` / `next` / `payoff` 直接转调 `SimplifiedNlheGame::*`——它们只读 state 携带的
 //!   字段，state 带的是**子树**就在子树上跑（关联函数与 Game token 无关）。
 //! - **只重写 [`Game::root`]**：不走开局 `with_rng_no_history`（uniform 全局发牌），而是
-//!   `template.resample_hidden(rng)`——保留中途 public state（街 / 公共牌前缀 / 下注 / 行动权）、
-//!   重发隐藏牌（各家底牌 + 未见 runout）。[`EsMccfrTrainer::step`] 每 step 调一次 `root` →
-//!   每 step 一个隐藏信息补全 = external chance sampling；MVP 用 uniform range。
+//!   保留中途 public state（街 / 公共牌前缀 / 下注 / 行动权）+ 重发隐藏牌（各家底牌 + 未见
+//!   runout）。§5b 后底牌按 per-seat blueprint **range 加权**采样（[`resample_hidden_with_holes`]
+//!   (crate::rules::state::GameState::resample_hidden_with_holes)），`use_blueprint_range=false`
+//!   时退 uniform（[`GameState::resample_hidden`]）。[`EsMccfrTrainer::step`] 每 step 调一次
+//!   `root` → 每 step 一个隐藏信息补全 = external chance sampling。
 //! - **终局收益仍走权威 [`GameState::payouts`]**（side pot / showdown 逻辑不改）→ S1 PokerKit
 //!   跨验证不受影响。
 //!
-//! # MVP 边界（`realtime_search_design` §10）
+//! # 边界（`realtime_search_design` §10 + §5b）
 //!
-//! - range = **uniform**（resample 任意补全），非 blueprint 加权；
+//! - range = blueprint **沿历史累乘 reach** 的 per-seat marginal（§5b 默认；uniform 留作 A/B）；
 //! - 当前街用**与 blueprint 同**的 action abstraction（finer 菜单留后续）；
-//! - depth-limit = 解到 subgame 终局（不截断、无 biased leaf；6b 再上）；
-//! - 子树 node_id 是**子树本地**索引（从 0 起），与 blueprint 全局树 node_id 不同口径——MVP 解到
-//!   终局、不查 blueprint，故子树自洽即可；6b 接 blueprint 续局值时再做 local↔global 映射。
+//! - depth-limit = 解到 subgame 真实终局（小子树、无叶子近似 / 无 biased leaf；6b 再上）；
+//! - 子树 node_id 是**子树本地**索引（从 0 起），与 blueprint 全局树 node_id 不同口径——解到
+//!   终局、不查 blueprint 值，故子树自洽即可；6b 接 blueprint 续局值时再做 local↔global 映射。
 
+use std::collections::BTreeSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use crate::abstraction::action::StreetActionAbstraction;
 use crate::abstraction::bucket_table::BucketTable;
+use crate::abstraction::info::{InfoSetId, StreetTag};
 use crate::core::rng::{ChaCha20Rng, RngSource};
-use crate::core::{PlayerStatus, Street};
+use crate::core::{Card, PlayerStatus, Street};
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::{Game, NodeKind, PlayerId};
@@ -39,8 +43,9 @@ use crate::training::nlhe::{
     SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
 };
 use crate::training::nlhe_betting_tree::{
-    AbstractActionTag, BettingAbstractionRules, PublicBettingTree,
+    AbstractActionTag, BettingAbstractionRules, NodeId, PublicBettingTree,
 };
+use crate::training::sampling::sample_discrete;
 use crate::training::trainer::{EsMccfrTrainer, Trainer};
 
 /// 以一个中途 public state 为根的 subgame `Game`（S6 6a）。
@@ -54,6 +59,12 @@ pub struct SubgameNlheGame {
     /// 中途真实状态（实时搜索里 = 权威局 `auth.clone()`）。`root` 每次 clone 它再
     /// [`GameState::resample_hidden`] 重发隐藏牌。
     template: GameState,
+    /// S6 §5b：per-seat hole **marginal range**（下标 = seat；每个长 1326、对齐
+    /// [`hole_combos`](Self::hole_combos)）。`Some` = root 按 range 加权采样各家底牌
+    /// （blueprint reach），`None` = uniform（MVP）。folded 座位的向量留空（不被读）。
+    ranges: Option<Vec<Vec<f64>>>,
+    /// range 采样用的 1326 具体底牌组合表（仅 `ranges == Some` 时非空）；下标对齐 `ranges`。
+    hole_combos: Vec<[Card; 2]>,
 }
 
 impl SubgameNlheGame {
@@ -89,12 +100,99 @@ impl SubgameNlheGame {
             abs: Arc::new(abs),
             bucket_table,
             template,
+            ranges: None,
+            hole_combos: Vec::new(),
         }
+    }
+
+    /// 同 [`new`](Self::new)，但 root 按 per-seat blueprint `ranges` 加权采样各家底牌（S6 §5b
+    /// 去 confound）。`ranges[seat]` 长 1326、对齐 [`all_hole_combos`]（folded 座位向量留空，
+    /// 不被读）。其余参数同 `new`。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_ranges(
+        bucket_table: Arc<BucketTable>,
+        config: TableConfig,
+        abs: StreetActionAbstraction,
+        rules: BettingAbstractionRules,
+        template: GameState,
+        entrants: u16,
+        raises_on_street: u32,
+        ranges: Vec<Vec<f64>>,
+    ) -> Self {
+        let mut g = Self::new(
+            bucket_table,
+            config,
+            abs,
+            rules,
+            template,
+            entrants,
+            raises_on_street,
+        );
+        debug_assert_eq!(
+            ranges.len(),
+            g.template.players().len(),
+            "ranges 长度须 == 座位数"
+        );
+        g.ranges = Some(ranges);
+        g.hole_combos = all_hole_combos();
+        g
     }
 
     /// 子树（诊断 / 评测：取 root_id 构造查询 infoset）。
     pub fn subtree(&self) -> &PublicBettingTree {
         &self.subtree
+    }
+
+    /// 按 `self.ranges` 为每个**未弃牌**座位采样一手底牌（顺序 card-removal：逐座位从
+    /// 其 range 限制到「未被 board / 已采样底牌占用」的 hole 上、归一后 [`sample_discrete`]；
+    /// 受限 range 全零 → 退均匀采可用 hole）。返回 per-seat `Option<[Card;2]>`（弃牌座 None）。
+    fn sample_holes_from_ranges(
+        &self,
+        ranges: &[Vec<f64>],
+        rng: &mut dyn RngSource,
+    ) -> Vec<Option<[Card; 2]>> {
+        let mut used: BTreeSet<u8> = self.template.board().iter().map(|c| c.to_u8()).collect();
+        let players = self.template.players();
+        let mut out: Vec<Option<[Card; 2]>> = vec![None; players.len()];
+        for (seat, player) in players.iter().enumerate() {
+            if player.hole_cards.is_none() {
+                continue; // 弃牌座：无底牌。
+            }
+            // 限制到可用 hole（不撞 used）的 (idx, weight)；weight>0 由 range 决定。
+            let mut dist: Vec<(usize, f64)> = Vec::new();
+            let mut total = 0.0_f64;
+            for (hi, hole) in self.hole_combos.iter().enumerate() {
+                let w = ranges[seat].get(hi).copied().unwrap_or(0.0);
+                if w > 0.0 && !used.contains(&hole[0].to_u8()) && !used.contains(&hole[1].to_u8()) {
+                    dist.push((hi, w));
+                    total += w;
+                }
+            }
+            let chosen_idx = if total > 0.0 {
+                // 归一（sample_discrete 要求 sum≈1）。
+                for e in dist.iter_mut() {
+                    e.1 /= total;
+                }
+                sample_discrete(&dist, rng)
+            } else {
+                // 受限 range 全零 → 退均匀采可用 hole。
+                let avail: Vec<usize> = self
+                    .hole_combos
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, h)| !used.contains(&h[0].to_u8()) && !used.contains(&h[1].to_u8()))
+                    .map(|(hi, _)| hi)
+                    .collect();
+                let p = 1.0 / avail.len() as f64;
+                let uni: Vec<(usize, f64)> = avail.into_iter().map(|hi| (hi, p)).collect();
+                sample_discrete(&uni, rng)
+            };
+            let hole = self.hole_combos[chosen_idx];
+            used.insert(hole[0].to_u8());
+            used.insert(hole[1].to_u8());
+            out[seat] = Some(hole);
+        }
+        out
     }
 
     /// 中途模板状态（决定 root 的 betting 几何 + 真实公共牌前缀）。
@@ -148,7 +246,14 @@ impl Game for SubgameNlheGame {
 
     fn root(&self, rng: &mut dyn RngSource) -> SimplifiedNlheState {
         // 唯一与 SimplifiedNlheGame 不同处：保留中途 public state、重发隐藏牌（per-step chance）。
-        let game_state = self.template.resample_hidden(rng);
+        // §5b：有 range 则按 blueprint reach 加权采样各家底牌（去 confound）；否则 uniform。
+        let game_state = match &self.ranges {
+            Some(ranges) => {
+                let holes = self.sample_holes_from_ranges(ranges, rng);
+                self.template.resample_hidden_with_holes(&holes, rng)
+            }
+            None => self.template.resample_hidden(rng),
+        };
         SimplifiedNlheState {
             game_state,
             action_history: Vec::new(),
@@ -195,27 +300,26 @@ impl Game for SubgameNlheGame {
 // 实时搜索驱动（S6 6a MVP）：触发判据 + 中途上下文现算 + subgame solve + 取分布
 // ===========================================================================
 //
-// # MVP 边界（必读 —— 决定如何解读「不退化探针」结果）
+// # 边界 + 探针解读（必读）
 //
-// 本驱动是 `realtime_search_design_2026_06_03.md` §10 的最小可行第一步，刻意**不**含
-// 后续刀（§3/§5b/§5c/6b）。三个有意为之的近似，都会影响探针信号的可解读性：
+// 本驱动 = `realtime_search_design_2026_06_03.md` §10 MVP **+ §5b range 去 confound**。
+// `use_blueprint_range`（默认 true）后，subgame 在 blueprint 沿历史累乘出的**真 range**（而非
+// 均匀先验）上求解 → 探针**能**有意义地测 §2「搜索放大 blueprint 偏差」：若 blueprint range
+// 本身偏（欠训练），solve 建在偏 range 上 → 可能更差；若 range 好 → solve 改进 blueprint 策略。
 //
-// 1. **uniform range**：[`GameState::resample_hidden`] 把**所有**未弃牌座位（含 hero）的
-//    底牌 uniform 重发——subgame 在「各家 flop range = 均匀」的**错设游戏**上求解，而非
-//    blueprint 沿历史累乘出的真实 range（§5b 是下一刀）。故搜索可能因 range 错设而非
-//    blueprint 质量退化。
-// 2. **无 blueprint 续局值 / biased leaf**：解到 subgame **真实 showdown 终局**（§10 step 3），
-//    叶子不查 blueprint EV、不做 biased continuation。→ 本 MVP **不**触及 §2 的「搜索放大
-//    blueprint 偏差」风险（搜索里根本没有 blueprint），它测的是「均匀-range 全解 vs blueprint
-//    在该决策点谁更强」，**不是** §2 宣称的 blueprint 质量判别器。
-// 3. **per-bucket 欠采样**：root 对全 range 求解、事后索引 hero 真实桶；postflop 有 200 桶，
-//    `iterations` 步 resample 摊到每桶仅 `iterations/(n_players·200)` 次更新 → 桶策略噪声大、
-//    极端时该桶从未被访问 → [`subgame_search`] 返回 `Err` → 调用方回落 blueprint。要让桶策略
-//    稳定需**远多于** smoke 的迭代数（探针 CI 会很宽）。
+// 仍在的近似（解读探针时记住）：
+// 1. **range = per-seat marginal + bucket 粒度**（§5b 陷阱②的工程折中）：玩家间负相关只靠
+//    采样期 card-removal 近似，不建联合分布；postflop range 落桶（有损），preflop 精确。
+// 2. **解到真实 showdown 终局、无 biased leaf**：MVP 子树小（6-max first_small flop ≈ 4434
+//    节点），直接解到真实终局——**无叶子近似**（不像 Pluribus 截 depth-limit 查 blueprint 值），
+//    故「无 blueprint 续局值」在这里**不是 confound**，反而是更精确的全解。biased leaf 是 6b。
+// 3. **per-bucket 欠采样**：root 对全 range 求解、事后索引 hero 真实桶；`iterations` 摊到每桶
+//    的更新数有限 → 桶策略有噪声、CI 偏宽；提高 `iterations` 收敛。`uniform`（`use_blueprint_range
+//    = false`）保留作 A/B 对照。
 //
-// 结论：本 MVP 的价值 = ①把搜索接进 live 决策环并证 plumbing（construct→resample→CFR→取分布→
-// outgoing 翻译）正确、可复现、不破对局守恒；②给一个**有上述 confound 的弱**首信号。要把它
-// 升级成真正的 §2 判别器，须接 §5b range + §5c blueprint 叶子值。
+// 价值：①plumbing（construct→estimate_range→加权 resample→CFR→取分布→outgoing）正确、可复现、
+// 不破守恒；②**去 confound 后的 §2 探针**——search-on vs blueprint-only 的 mbb/g + CI。
+// 下一步质量杠杆 = 6b（continual re-solving + biased leaf）。
 
 /// 实时搜索触发 + 求解配置（S6 6a MVP）。`Copy` → 随 `Contestant` 按值带。
 #[derive(Clone, Copy, Debug)]
@@ -229,6 +333,10 @@ pub struct SubgameSearchConfig {
     /// 搜索 RNG 基 seed。与 `(hand_seed, decision_ordinal)` 混合 → 每决策点确定派生、
     /// byte-equal 可复现，且跨手独立。
     pub seed: u64,
+    /// `true`（默认）= root 按 blueprint **沿历史累乘 reach** 估的 per-seat marginal range
+    /// 加权采样各家底牌（§5b 去 confound——subgame 在真 range 而非均匀先验上求解）；`false`
+    /// = uniform resample（MVP 旧行为，留作 A/B 对照）。
+    pub use_blueprint_range: bool,
 }
 
 impl Default for SubgameSearchConfig {
@@ -237,6 +345,7 @@ impl Default for SubgameSearchConfig {
             iterations: 1000,
             max_subtree_nodes: 8000,
             seed: 0x5347_4D45_5F53_3641, // "SGME_S6A"
+            use_blueprint_range: true,
         }
     }
 }
@@ -301,23 +410,136 @@ fn search_seed(base: u64, hand_seed: u64, ordinal: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+// --- §5b：blueprint range 估计（per-seat marginal，逐街 re-bucket，沿历史累乘 reach） ---
+
+/// 全部 1326 个具体两张底牌组合（升序 card id 对）；下标即 range 向量的 hole 索引。
+pub(crate) fn all_hole_combos() -> Vec<[Card; 2]> {
+    let mut v = Vec::with_capacity(1326);
+    for a in 0u8..52 {
+        for b in (a + 1)..52 {
+            v.push([
+                Card::from_u8(a).expect("0..52 valid"),
+                Card::from_u8(b).expect("0..52 valid"),
+            ]);
+        }
+    }
+    v
+}
+
+/// 节点所在街应取的真实 board 前缀（preflop=0 / flop=3 / turn=4 / river=5）。clamp 到
+/// `board.len()`——flop 触发下只会撞 Preflop/Flop（board.len()==3），其余街不出现。
+fn board_prefix_for_street(board: &[Card], street: StreetTag) -> &[Card] {
+    let n = match street {
+        StreetTag::Preflop => 0,
+        StreetTag::Flop => 3,
+        StreetTag::Turn => 4,
+        StreetTag::River => 5,
+    };
+    &board[..n.min(board.len())]
+}
+
+/// 从 actor 当前节点沿 parent 链回溯，收集每个**已做**决策 `(decider_node_id, action_tag,
+/// decider_seat)`（顺序无关，estimate_range 只做乘积）。
+fn decisions_on_path(
+    tree: &PublicBettingTree,
+    current_node_id: NodeId,
+) -> Vec<(NodeId, AbstractActionTag, PlayerId)> {
+    let mut out = Vec::new();
+    let mut id = current_node_id;
+    loop {
+        let node = tree.node(id);
+        match node.action_from_parent {
+            Some(tag) => {
+                let parent_id = node.parent.expect("non-root 节点须有 parent");
+                out.push((parent_id, tag, tree.node(parent_id).player_acting));
+                id = parent_id;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// 估计 `seat` 的 per-hole marginal range（reach 向量，下标对齐 `holes`，归一）。沿 `decisions`
+/// 里属于 `seat` 的决策，对每个候选 hole 累乘该 hole 在 blueprint σ 下走该动作的概率——**逐街
+/// 用 `info_set_for_cards` 注入真实 board 前缀算当前街桶**（绝不在固定桶上累乘，§5b 陷阱①）。
+/// 撞 board 的 hole reach=0；空/坏 σ 退均匀（同 `strategy_distribution`）。全零（无信号）→ 返回
+/// 全零，调用方退均匀采样。
+///
+/// **同质 blueprint 假设**：用 `game`/`strategy`（actor 的 blueprint）为所有 seat 估 range——
+/// 探针自对弈（hero/field 同 blueprint）下精确；异质 field 下是近似（§5b 陷阱②的工程折中）。
+fn estimate_range(
+    game: &SimplifiedNlheGame,
+    strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    decisions: &[(NodeId, AbstractActionTag, PlayerId)],
+    board: &[Card],
+    seat: PlayerId,
+    holes: &[[Card; 2]],
+) -> Vec<f64> {
+    let board_set: BTreeSet<u8> = board.iter().map(|c| c.to_u8()).collect();
+    let tree = game.tree();
+    let seat_decisions: Vec<(NodeId, AbstractActionTag)> = decisions
+        .iter()
+        .filter(|(_, _, s)| *s == seat)
+        .map(|(n, t, _)| (*n, *t))
+        .collect();
+    let mut range = vec![0.0_f64; holes.len()];
+    for (hi, hole) in holes.iter().enumerate() {
+        if board_set.contains(&hole[0].to_u8()) || board_set.contains(&hole[1].to_u8()) {
+            continue; // 撞 board → reach 0
+        }
+        let mut reach = 1.0_f64;
+        for (node_id, tag) in &seat_decisions {
+            let node = tree.node(*node_id);
+            let bp = board_prefix_for_street(board, node.street);
+            let info = game.info_set_for_cards(*node_id, *hole, bp);
+            let n = node.legal_actions.len();
+            let sigma = strategy(&info, n);
+            let idx = node.legal_actions.iter().position(|t| t == tag);
+            // 空/坏 σ 或维度不符 / 找不到 tag → 均匀兜底（同 strategy_distribution 容错）。
+            let p = match idx {
+                Some(i) if sigma.len() == n && sigma[i].is_finite() && sigma[i] >= 0.0 => sigma[i],
+                _ => 1.0 / n as f64,
+            };
+            reach *= p;
+            if reach == 0.0 {
+                break;
+            }
+        }
+        range[hi] = reach;
+    }
+    let sum: f64 = range.iter().sum();
+    if sum > 0.0 {
+        for r in range.iter_mut() {
+            *r /= sum;
+        }
+    }
+    range
+}
+
 /// S6 6a MVP 实时搜索：从权威中途局 `auth`（actor 待行动）建单层 subgame、跑 CFR、返回
 /// actor **真实手**在 root 的策略分布——对齐调用方 `legal_abs`（影子的合法集），可直接喂
 /// [`sample_discrete`](crate::training::sampling::sample_discrete) → `outgoing_action`。
 ///
 /// `game` = 该 actor 的 blueprint game（提供 bucket 表 / 同一 action 抽象 + A3×A4 规则，
-/// subgame 用**同一套**重建子树）。`(hand_seed, decision_ordinal)` 唯一确定本次 solve 的
-/// RNG（可复现 + 跨手独立）。
+/// subgame 用**同一套**重建子树）。`node_id` = actor 在 blueprint 树的当前节点（= 影子
+/// `current_node_id`；§5b range 估计沿其 public 决策路径累乘 reach）。`strategy` = blueprint
+/// average strategy 查询面（range 估计用；同质 blueprint 假设见 [`estimate_range`]）。
+/// `(hand_seed, decision_ordinal)` 唯一确定本次 solve 的 RNG（可复现 + 跨手独立）。
+///
+/// `cfg.use_blueprint_range`：`true` → root 按 per-seat blueprint range 加权采样底牌（§5b 去
+/// confound）；`false` → uniform resample（MVP 旧行为，A/B 对照）。
 ///
 /// 任一失败（auth 非 decision / 子树越界 / root 桶在 `iterations` 内未被访问 / 维度不符 /
 /// `legal_abs` 含 subtree root 没有的 tag = 影子与 auth 失同步 / 对齐后全零）→ `Err`，
 /// 调用方按设计 §4.1 回落 blueprint `strategy_distribution`。
-///
-/// MVP 近似见本模块顶部 doc（uniform range / 解到终局无 blueprint 叶子 / per-bucket 欠采样）。
+#[allow(clippy::too_many_arguments)]
 pub fn subgame_search(
     auth: &GameState,
     game: &SimplifiedNlheGame,
     legal_abs: &[SimplifiedNlheAction],
+    node_id: NodeId,
+    strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
     cfg: &SubgameSearchConfig,
     hand_seed: u64,
     decision_ordinal: u64,
@@ -327,16 +549,44 @@ pub fn subgame_search(
     }
     let (entrants, raises_on_street) = subtree_context(auth);
 
-    // 建 subgame：同 blueprint 的 bucket 表 / action 抽象 / A3×A4 规则，从 auth 中途态为根。
-    let sub = SubgameNlheGame::new(
-        Arc::clone(&game.bucket_table),
-        auth.config().clone(),
-        game.abstraction().clone(),
-        game.rules(),
-        auth.clone(),
-        entrants,
-        raises_on_street,
-    );
+    // 建 subgame：同 blueprint 的 bucket 表 / action 抽象 + A3×A4 规则，从 auth 中途态为根。
+    // §5b：use_blueprint_range → 为每个未弃牌座位估 marginal range，root 按其加权采样底牌；
+    // 否则 uniform。range 估计用 actor 在 blueprint 树的 `node_id` 回溯 public 决策路径。
+    let sub = if cfg.use_blueprint_range {
+        let holes = all_hole_combos();
+        let board: Vec<Card> = auth.board().to_vec();
+        let decisions = decisions_on_path(game.tree(), node_id);
+        let players = auth.players();
+        let ranges: Vec<Vec<f64>> = (0..players.len())
+            .map(|seat| {
+                if players[seat].hole_cards.is_some() {
+                    estimate_range(game, strategy, &decisions, &board, seat as PlayerId, &holes)
+                } else {
+                    Vec::new() // 弃牌座：range 不被读。
+                }
+            })
+            .collect();
+        SubgameNlheGame::new_with_ranges(
+            Arc::clone(&game.bucket_table),
+            auth.config().clone(),
+            game.abstraction().clone(),
+            game.rules(),
+            auth.clone(),
+            entrants,
+            raises_on_street,
+            ranges,
+        )
+    } else {
+        SubgameNlheGame::new(
+            Arc::clone(&game.bucket_table),
+            auth.config().clone(),
+            game.abstraction().clone(),
+            game.rules(),
+            auth.clone(),
+            entrants,
+            raises_on_street,
+        )
+    };
     let n_nodes = sub.subtree().num_nodes();
     if n_nodes == 0 || n_nodes > cfg.max_subtree_nodes {
         return Err(format!(
@@ -577,16 +827,25 @@ mod tests {
 
         // accepting cap：HU 默认 {0.5,1,2} flop 子树较大（见 _measure_flop_subtree_sizes），
         // 用大上限确保不被 cap 拒；stub 全归桶 0 → root infoset 必累积 → Ok 确定。
+        // use_blueprint_range=true 走 §5b 路径（estimate_range + 加权采样）；uniform 策略 →
+        // range 近均匀（验 range 路径不破契约 + 可复现）。
         let cfg = SubgameSearchConfig {
             iterations: 300,
             max_subtree_nodes: 1_000_000,
             seed: 0xA11C_E55E_5EED_u64,
+            use_blueprint_range: true,
         };
+        let node_id = flop.current_node_id;
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
         let mut ok_count = 0usize;
         for hand_seed in 0u64..3 {
             let ordinal = 3u64;
-            let r1 = subgame_search(&auth, &game, &legal_abs, &cfg, hand_seed, ordinal);
-            let r2 = subgame_search(&auth, &game, &legal_abs, &cfg, hand_seed, ordinal);
+            let r1 = subgame_search(
+                &auth, &game, &legal_abs, node_id, &strat, &cfg, hand_seed, ordinal,
+            );
+            let r2 = subgame_search(
+                &auth, &game, &legal_abs, node_id, &strat, &cfg, hand_seed, ordinal,
+            );
             assert_eq!(
                 r1.is_ok(),
                 r2.is_ok(),
@@ -622,9 +881,102 @@ mod tests {
             iterations: 50,
             max_subtree_nodes: 5,
             seed: 0xA11C_E55E_5EED_u64,
+            use_blueprint_range: true,
         };
-        let r = subgame_search(&auth, &game, &legal_abs, &tiny, 0, 0);
+        let r = subgame_search(&auth, &game, &legal_abs, node_id, &strat, &tiny, 0, 0);
         assert!(r.is_err(), "节点上限被触发应回落 Err，实得 {r:?}");
+    }
+
+    /// §5b [`estimate_range`]：reach 向量归一（Σ≈1）、撞 board 的 hole 恒 0、uniform 策略下
+    /// 非冲突 hole 等权（reach 不依赖 hole）。
+    #[test]
+    fn estimate_range_normalized_and_zeros_board_conflicts() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x5241_4E47_4553_5430); // "RANGEST0"
+        let board: Vec<Card> = flop.game_state.board().to_vec();
+        let board_set: BTreeSet<u8> = board.iter().map(|c| c.to_u8()).collect();
+        let holes = all_hole_combos();
+        assert_eq!(holes.len(), 1326);
+        let decisions = decisions_on_path(game.tree(), flop.current_node_id);
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let actor = flop.game_state.current_player().unwrap().0 as PlayerId;
+
+        let range = estimate_range(&game, &strat, &decisions, &board, actor, &holes);
+        assert_eq!(range.len(), 1326);
+        let sum: f64 = range.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "range 须归一，和={sum}");
+        let mut positive = 0usize;
+        for (hi, hole) in holes.iter().enumerate() {
+            let conflicts =
+                board_set.contains(&hole[0].to_u8()) || board_set.contains(&hole[1].to_u8());
+            if conflicts {
+                assert_eq!(range[hi], 0.0, "撞 board 的 hole reach 须 0");
+            } else if range[hi] > 0.0 {
+                positive += 1;
+            }
+        }
+        // uniform 策略 → 非冲突 hole 等权且全正：恰 C(49,2)=1176 个（52-3 张非 board 牌）。
+        assert_eq!(positive, 1176, "非冲突 hole 应全正且 = C(49,2)");
+        let w = range.iter().copied().find(|p| *p > 0.0).unwrap();
+        for (hi, hole) in holes.iter().enumerate() {
+            let conflicts =
+                board_set.contains(&hole[0].to_u8()) || board_set.contains(&hole[1].to_u8());
+            if !conflicts {
+                assert!(
+                    (range[hi] - w).abs() < 1e-12,
+                    "uniform 策略下非冲突 hole 须等权"
+                );
+            }
+        }
+    }
+
+    /// §5b range-weighted `root`：集中 range（seat0→hole k、seat1→hole m，cards disjoint 且不撞
+    /// board）→ root 采样的底牌恒 = 该集中 hole（card-removal 不互斥）。验 range→采样链路。
+    #[test]
+    fn range_weighted_root_respects_concentrated_range() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x5247_524F_4F54_5F30); // "RGROOT_0"
+        let template = flop.game_state.clone();
+        let board: BTreeSet<u8> = template.board().iter().map(|c| c.to_u8()).collect();
+        let holes = all_hole_combos();
+        let avail: Vec<u8> = (0u8..52).filter(|v| !board.contains(v)).collect();
+        let find = |a: u8, b: u8| {
+            holes
+                .iter()
+                .position(|h| h[0].to_u8() == a && h[1].to_u8() == b)
+                .unwrap()
+        };
+        let k = find(avail[0], avail[1]); // seat0 集中 hole
+        let m = find(avail[2], avail[3]); // seat1 集中 hole（cards disjoint）
+        let mut r0 = vec![0.0_f64; 1326];
+        r0[k] = 1.0;
+        let mut r1 = vec![0.0_f64; 1326];
+        r1[m] = 1.0;
+        let sub = SubgameNlheGame::new_with_ranges(
+            stub_table(),
+            TableConfig::default_hu_200bb(),
+            StreetActionAbstraction::default_6_action(),
+            BettingAbstractionRules::default(),
+            template,
+            0b11,
+            0,
+            vec![r0, r1],
+        );
+        let mut rng = ChaCha20Rng::from_seed(0x5247_524F_4F54_0001);
+        let drng: &mut dyn RngSource = &mut rng;
+        for _ in 0..16 {
+            let s = sub.root(drng);
+            assert_eq!(
+                s.game_state.players()[0].hole_cards,
+                Some(holes[k]),
+                "seat0 集中 range → 恒采样 hole k"
+            );
+            assert_eq!(
+                s.game_state.players()[1].hole_cards,
+                Some(holes[m]),
+                "seat1 集中 range → 恒采样 hole m"
+            );
+        }
     }
 
     /// 诊断（非门槛）：打印 HU 默认 / 6-max first_small(3) 的 flop 子树节点数，用于校准
