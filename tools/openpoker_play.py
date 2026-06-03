@@ -319,7 +319,7 @@ def run_selftest(advisor):
     print(f"[selftest 1 folds-to-BTN] resp={resp}", file=sys.stderr)
 
     # 场景 2：对手 UTG open-limp（call to=20）→ 我 HJ 决策。no-limp blueprint 应兜底（合法）。
-    hand2 = HandState("h2", button=0, my_seat=4)
+    hand2 = HandState("h2", button_seat=0, my_seat=4)
     hand2.hole = ["Qs", "Qd"]
     hand2.on_player_action(3, "call", 20)  # UTG limp
     req2 = hand2.build_request(valid)
@@ -328,7 +328,7 @@ def run_selftest(advisor):
     print(f"[selftest 2 open-limp] resp={resp2} (no-limp blueprint 预期 fallback)", file=sys.stderr)
 
     # 场景 3：flop 决策（preflop 我 raise 被 call，flop 我先动）。board 3 张。
-    hand3 = HandState("h3", button=0, my_seat=1)  # SB
+    hand3 = HandState("h3", button_seat=0, my_seat=1)  # SB
     hand3.hole = ["Jc", "Tc"]
     hand3.on_player_action(3, "fold", None)
     hand3.on_player_action(4, "fold", None)
