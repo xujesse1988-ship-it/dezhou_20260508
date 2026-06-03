@@ -237,6 +237,48 @@ impl PublicBettingTree {
         tree
     }
 
+    /// 从一个**中途** public betting 状态为根建子树（S6 实时搜索 6a：以当前决策点为根
+    /// re-solve 用）。与 [`build_with_rules`](Self::build_with_rules) 唯一不同 = root 不是
+    /// 开局 `GameState::with_rng`，而是调用方给的中途 `root_state`（实时搜索里 = 权威局
+    /// `auth.clone()`）。`walk` 本身玩家数无关、卡牌无关（只读 chip 几何 + `apply`），故
+    /// 从任意 decision 节点重启 DFS 即得该局面之后的完整抽象子树。
+    ///
+    /// **`entrants` / `raises_on_street` 必须由调用方据权威局现算**——[`TreeNode`] 不存这两个
+    /// A3×A4 上下文（见 `filter_actions`），从中途状态重启子树若不显式传入，`drop_small_reraise`
+    /// / `width_redirect` / `preflop_open_small_only` 会按错误的 (0,0) 上下文重算动作集。
+    /// `rules == Default`（全关）时这两个参数不被 `filter_actions` 读取，传 `(0, 0)` 安全。
+    ///
+    /// 不变量：从 `build_with_rules` 全树的节点 `v`（T-index `K`）对应的中途状态出发、用**同一**
+    /// `(abs, rules, entrants_at_v, raises_at_v)`，本函数产出的子树与全树 `v` 的后代块逐节点
+    /// 同构——`subtree.node(i).legal_actions == full_tree.node(K + i).legal_actions`（`walk` 确定性
+    /// DFS + 后代块连续）。`tests::build_subtree_*` 钉死。
+    pub fn build_subtree(
+        root_state: &GameState,
+        abs: &StreetActionAbstraction,
+        rules: BettingAbstractionRules,
+        entrants: u16,
+        raises_on_street: u32,
+    ) -> PublicBettingTree {
+        debug_assert!(
+            !root_state.is_terminal() && root_state.current_player().is_some(),
+            "build_subtree root must be a Player decision node"
+        );
+        let mut tree = PublicBettingTree {
+            nodes: Vec::new(),
+            root_id: 0,
+        };
+        tree.root_id = tree.walk(
+            root_state.clone(),
+            None,
+            None,
+            abs,
+            &rules,
+            entrants,
+            raises_on_street,
+        );
+        tree
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &mut self,
@@ -779,6 +821,120 @@ mod tests {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// 两节点结构等价：legal_actions / street / player_acting 逐字相等，且每条出边的
+    /// Terminal/Decision **形态**一致（子节点 id 不同——子树是 local id、全树是 global id——
+    /// 故只比形态不比 id）。
+    fn nodes_structurally_equal(a: &TreeNode, b: &TreeNode) -> bool {
+        if a.legal_actions != b.legal_actions
+            || a.street != b.street
+            || a.player_acting != b.player_acting
+            || a.children.len() != b.children.len()
+        {
+            return false;
+        }
+        a.children
+            .iter()
+            .zip(b.children.iter())
+            .all(|(x, y)| matches!(x, Child::Terminal) == matches!(y, Child::Terminal))
+    }
+
+    /// `build_subtree` 从**开局**根出发 == `build`/`build_with_rules` 全树逐节点同构。
+    /// 卡牌无关：root_state 用任意 seed 的 `with_rng` 都行（结构只依赖 chip 几何，开局对
+    /// 所有发牌都一样）。这是 `build_subtree` 的最强基线——证它与既有建树路径在 root 处等价。
+    #[test]
+    fn build_subtree_from_root_reproduces_full_tree() {
+        let cfg = TableConfig::default_hu_200bb();
+        let abs = StreetActionAbstraction::default_6_action();
+        let full = PublicBettingTree::build(&cfg);
+
+        let mut rng = ChaCha20Rng::from_seed(0x5542_5452_4545_5F30); // "SUBTREE_0"
+        let root_state = GameState::with_rng(&cfg, 0, &mut rng);
+        let sub = PublicBettingTree::build_subtree(
+            &root_state,
+            &abs,
+            BettingAbstractionRules::default(),
+            0,
+            0,
+        );
+
+        assert_eq!(
+            sub.num_nodes(),
+            full.num_nodes(),
+            "build_subtree(root) 节点数应 == 全树 {}",
+            full.num_nodes()
+        );
+        for i in 0..full.num_nodes() as NodeId {
+            assert!(
+                nodes_structurally_equal(sub.node(i), full.node(i)),
+                "build_subtree(root) 节点 {i} 与全树不同构\nsub  ={:?}\nfull ={:?}",
+                sub.node(i),
+                full.node(i)
+            );
+        }
+    }
+
+    /// `build_subtree` 从**中途**节点出发 == 全树该节点的后代块（`walk` 确定性 DFS +
+    /// 后代连续 → `sub.node(i) ≡ full.node(K + i)`）。这是 S6 实时搜索"以当前决策点为根
+    /// re-solve"的核心正确性：从权威局重建的中途状态建子树，与离线全树的对应子树逐字一致。
+    /// 路径取 root(SB) --Call--> BB 决策节点；default rules 下 entrants/raises 不被读，传 0/0。
+    #[test]
+    fn build_subtree_from_interior_matches_descendant_block() {
+        let cfg = TableConfig::default_hu_200bb();
+        let abs = StreetActionAbstraction::default_6_action();
+        let full = PublicBettingTree::build(&cfg);
+
+        // 全树 root 的 Call 出边 → BB 决策节点 K。
+        let root = full.node(full.root_id());
+        let call_idx = root
+            .legal_actions
+            .iter()
+            .position(|t| *t == AbstractActionTag::Call)
+            .expect("HU SB 根应有 Call(complete) 边");
+        let k = match root.children[call_idx] {
+            Child::Decision(id) => id,
+            Child::Terminal => panic!("SB Call 不该立即终局"),
+        };
+
+        // 重建中途状态：开局 state apply SB 的 concrete Call → BB 决策点（卡牌任意）。
+        let mut rng = ChaCha20Rng::from_seed(0x5542_5452_4545_5F31); // "SUBTREE_1"
+        let mut mid = GameState::with_rng(&cfg, 0, &mut rng);
+        let call = abs
+            .abstract_actions(&mid)
+            .iter()
+            .copied()
+            .find(|a| matches!(a, AbstractAction::Call { .. }))
+            .expect("SB 根抽象集应含 Call");
+        mid.apply(call.to_concrete()).expect("SB Call 应合法");
+        assert!(
+            !mid.is_terminal() && mid.current_player().is_some(),
+            "SB Call 后应是 BB 决策节点"
+        );
+
+        let sub =
+            PublicBettingTree::build_subtree(&mid, &abs, BettingAbstractionRules::default(), 0, 0);
+
+        assert!(
+            (k as usize) + sub.num_nodes() <= full.num_nodes(),
+            "后代块越界：K={k} + sub {} > full {}",
+            sub.num_nodes(),
+            full.num_nodes()
+        );
+        // sub 的 root 与全树 K 同构（同一 BB 决策局面）。
+        assert!(
+            nodes_structurally_equal(sub.node(sub.root_id()), full.node(k)),
+            "子树 root 与全树节点 {k} 不同构"
+        );
+        for i in 0..sub.num_nodes() as NodeId {
+            assert!(
+                nodes_structurally_equal(sub.node(i), full.node(k + i)),
+                "子树节点 {i} 与全树后代 {} 不同构\nsub ={:?}\nfull={:?}",
+                k + i,
+                sub.node(i),
+                full.node(k + i)
+            );
         }
     }
 }

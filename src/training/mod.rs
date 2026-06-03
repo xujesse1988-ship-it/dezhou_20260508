@@ -45,6 +45,7 @@ pub mod nlhe_eval;
 pub mod nlhe_replay;
 pub mod regret;
 pub mod sampling;
+pub mod subgame;
 pub mod trainer;
 
 // API-300 / API-380 顶层公开 surface（与 `docs/pluribus_stage3_api.md` §8 对齐）。
@@ -71,6 +72,7 @@ pub use nlhe_eval::{
     NlheMultiwayEvalReport,
 };
 pub use regret::{RegretTable, StrategyAccumulator};
+pub use subgame::SubgameNlheGame;
 pub use trainer::{EsMccfrTrainer, Trainer, VanillaCfrTrainer};
 
 // CheckpointError + TrainerError + TrainerVariant + GameVariant 物理位置在
