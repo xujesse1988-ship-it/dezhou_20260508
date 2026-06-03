@@ -26,8 +26,16 @@ preopen 0.68×(157.9M/5.46GiB)、preopen-small 0.45×(103.0M/3.57GiB)。**nolimp
 **preopen(加 2.25BB 开池档)已在 AWS 跑到 ~2.1B 暂停**(LCFR 不可 resume;checkpoint 1B/2B 存 vultr
 `artifacts/run_6max_s4_preopen/`):非盲位 1B 即干净(0.2-0.6%)**且范围放宽近 GTO**(BTN 37→44-45%、UTG 14→18%)
 证实开池档修好 nolimp 偏紧;**SB 改善(limp 43→30%、AA raise 43→68%)但仍 limp AA ~32%、翻转 ~17%,1B→2B 近乎平、
-证据不足不下结论**(欠训练 vs 抽象天花板未分)。待办 = SB 收尾(跑满 5B 或加删-SB-limp 变体)+ S5 评测(强参考对手缺口)。
-详见 `six_max_nlhe_target.md` S4 续 ⑥⑦。
+证据不足不下结论**(欠训练 vs 抽象天花板未分)。⚠ **2026-06-02 GTO Wizard 真值修正:SB limp / AA-limp 是 GTO 非缺陷**
+(SB 100bb cEV limp 49% / AA limp 47%)→ 不删 SB limp、不为 SB 跑 5B。
+
+**S5 进度(2026-06-03):①② 端到端打通**。off-tree advisor 引擎落地(`src/training/blueprint_advisor.rs`:一张权威
+GameState + 每 blueprint 一份抽象影子,off-tree 翻译推进;slumbot_advisor 重构为薄壳 byte-equal)。① 跨抽象 h2h
+(`tools/six_max_blueprint_h2h`)实测 **nolimp×preopen 相对强度相当(双向 CI 跨 0)**;② OpenPoker 客户端
+(`tools/openpoker_advisor.rs` + `tools/openpoker_play.py`)**live 连通性 smoke 已过**(账号 jesse_xu,4 手全 blueprint
+驱动 0 报错)。**两个边界**:off-tree 只忠实尺寸差异(结构性 limp-gap 显式 Desync/兜底)+ lone-hero 粒度税 confound
+(不能干净排内在强度);**实测码深漂移严重**(真实桌 14BB–800BB)。剩绝对强度量化(挂场数百手 + 排行榜,需用户授权时长)。
+详见 `six_max_nlhe_target.md` S4 续⑥⑦ + S5 续、`temp/openpoker_client_design_2026_06_02.md` §9。
 
 **6-max 范式切换**:多人一般和 → CFR 不保证收敛 Nash、**LBR/exploitability 失去理论意义**(只当诊断,质量以
 实测对战为准)、无"训到 floor 就停"、无强 6-max 公开参考对手(不像 Slumbot 之于 HUNL)。详见 target 文档。
@@ -57,6 +65,11 @@ InfoSetId position 已留 4 bit(支持 0..15 座,`abstraction/map/mod.rs`)、den
 重聚类桶(**最大未知数,S3 先验证**);② 评测重构——LBR `probe_idx%2`(`lbr.rs:5`)多人失义、AIVAT 单对手要
 推广多对手、要新 baseline + 解决无强参考对手。
 
+> **现状(2026-06-03,上为 05-30 初评快照)**:⚠️ 中等改动**已做**(P4 `08b3edc` 参数化 `new_with_abstraction`,
+> n_seats 由 config 驱动)。❌① **已消解**(S3 实测 HU 单对手桶可复用进 A3×A4 ≤3-way,不需重做多人 equity)。
+> ❌② **评测已重构**:S5 off-tree advisor 引擎(`blueprint_advisor.rs`)+ ① 跨抽象 h2h + ② OpenPoker 客户端
+> (强参考对手缺口已接、live smoke 已过)。剩 = AIVAT 多对手(S5③,按需) + 绝对强度量化挂场。
+
 ## 关键代码入口
 
 - CFR/LCFR-MCCFR:`src/training/trainer.rs`(`EsMccfrTrainer` / `recurse_es` / `recurse_es_parallel` /
@@ -66,6 +79,10 @@ InfoSetId position 已留 4 bit(支持 0..15 座,`abstraction/map/mod.rs`)、den
 - 抽象:preflop 169 lossless `src/abstraction/preflop.rs`;equity/OCHS `src/abstraction/equity.rs`;
   InfoSetId 打包 `src/abstraction/map/mod.rs`。
 - 评测:LBR `src/training/lbr.rs`;baseline `src/training/nlhe_eval.rs`;AIVAT `src/training/aivat*.rs`。
+- **S5 跨抽象 advisor 引擎**:`src/training/blueprint_advisor.rs`(一张权威 GameState + 每 blueprint 一份抽象影子,
+  off-tree 翻译推进:`outgoing_action` / `advance_shadow_by_applied` / `play_cross_abstraction_hand` /
+  `evaluate_cross_abstraction_h2h`)。薄壳:① h2h `tools/six_max_blueprint_h2h`;② OpenPoker
+  `tools/openpoker_advisor.rs` + `tools/openpoker_play.py`(WS driver);HU `tools/slumbot_advisor.rs`(复用同核)。
 - 规则:`src/rules/`(config / state / side pot / showdown)。
 
 代码结构:`src/{rules,hand_eval,abstraction,training}/` + `tests/`(cargo test)+ `tools/`(诊断/训练 binary)。

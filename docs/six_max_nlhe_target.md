@@ -34,6 +34,7 @@ heads-up 是二人零和 → CFR 可证收敛 Nash → exploitability/LBR 是真
    不成立。heads-up 最依赖的质量闸门到这里换成**实测对战**。
 3. **没有"训到 floor 就停"**。质量相对于对手场，无同种 floor。
 4. **没有强 6-max 公开参考 bot**（不像 Slumbot 之于 HUNL）。这是真实评测缺口，S5 要专门解决。
+   → **已接 OpenPoker 真实对手场**（连通性 smoke 已过，2026-06-03，见 S5 续）；剩绝对强度量化（码深漂移污染，须分桶标注）。
 
 ## 现有代码就绪度（亲验 file:line，2026-05-30）
 
@@ -447,6 +448,10 @@ preopen = nolimp + preflop `{0.5,1}`（0.5 = 2.25BB 开池档，非 SB 仍禁 li
 - 真正未决的只剩**实测对战是否更强**——属 S5（仍缺强参考对手）。reshape 只保证目标更干净 + 训得更透，不直接 = 更强。
 
 ### S5：6-max 评测重构
+
+> **状态（2026-06-03）：① + ② 端到端打通**（§7 步 1-4 全完成，见下「S5 续」）。① 实测 nolimp×preopen 相对强度
+> 相当（CI 跨 0）；② OpenPoker live 连通性 smoke 已过。剩「绝对强度量化」（挂场数百手 + 排行榜，码深漂移须分桶标注，
+> 需用户授权时长）。下文「S5 定方向 / 关键工程发现」是 06-02 立项，落地 + 发现见「S5 续」。
 
 > **2026-06-02 定方向**：S4 已把三个 blueprint 训出来（baseline 1B、nolimp 1B、preopen 1B/2B），但**没一个被验证「更强」**
 > ——S4 gate（vs random/call-station/overly-tight）是必要非充分且非单调，reshape「只更干净不直接更强」（S4续⑦）。
