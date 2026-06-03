@@ -149,7 +149,8 @@ pub fn first_small_6max(width_redirect: u8) -> (StreetActionAbstraction, Betting
 /// S4 reshape：在 [`first_small_6max`] 基础上 **加 2.25BB 开池档 + 禁非 SB 开池 limp**。
 /// preflop 菜单 `{0.5,1.0}`（drop_small_reraise raises-aware → 0.5 仅作开池 = 越过 BB 的
 /// 首个 raise ≈ 2.25BB；3bet+ 一律 1.0pot），postflop `{0.5,1.0}` 不变。`no_open_limp`
-/// 删 UTG/HJ/CO/BTN 的 open-limp（SB complete 保留）。
+/// 删 UTG/HJ/CO/BTN 的 open-limp（SB complete 保留）；`drop_preflop_open_allin`
+/// 删 preflop 首个进攻 AllIn。
 ///
 /// 动机（`docs/six_max_nlhe_target.md` S4 诊断 + 2026-06-01 噪声实测）：1B blueprint 的
 /// 弱点是 ① 过度 limp（UTG 16.6%）② 唯一 3.5BB 开池档太大 → 边缘手宁可 limp/fold。本 profile
@@ -165,7 +166,7 @@ pub fn first_small_preopen_6max(
         width_redirect,
         no_open_limp: true,
         preflop_open_small_only: false,
-        drop_preflop_open_allin: false,
+        drop_preflop_open_allin: true,
     };
     (abs, rules)
 }
@@ -173,7 +174,7 @@ pub fn first_small_preopen_6max(
 /// S4 reshape 变体：在 [`first_small_preopen_6max`] 基础上 **把 preflop 开池收成单档（仅
 /// 2.25BB）**。preflop 菜单仍 `{0.5,1.0}`，但 `preflop_open_small_only` 删开池 1.0pot
 /// （3.5BB）→ 开池只剩 0.5pot（2.25BB）；`drop_small_reraise` 把 3bet+ 收到 1.0pot。
-/// 同时删 preflop 首个进攻 AllIn。即 preflop 严格单档：**开池 2.25BB、3bet+ 1.0pot、
+/// 继承 `preopen` 的无开池 all-in。即 preflop 严格单档：**开池 2.25BB、3bet+ 1.0pot、
 /// 禁非 SB limp、无开池 all-in**。postflop `{0.5,1.0}` A3 first-small 不变。
 ///
 /// 动机：`preopen`（[`first_small_preopen_6max`]）给两个开池档（2.25/3.5BB），树比单档大；
@@ -185,7 +186,6 @@ pub fn first_small_preopen_small_6max(
 ) -> (StreetActionAbstraction, BettingAbstractionRules) {
     let (abs, mut rules) = first_small_preopen_6max(width_redirect);
     rules.preflop_open_small_only = true;
-    rules.drop_preflop_open_allin = true;
     (abs, rules)
 }
 
@@ -569,7 +569,7 @@ mod tests {
             broot.legal_actions.contains(&AbstractActionTag::Call),
             "baseline UTG 根应允许 open-limp Call"
         );
-        // preopen：UTG 根无 Call、有 2 个 Raise 档（0.5=2.25BB / 1.0=3.5BB）+ Fold + AllIn。
+        // preopen：UTG 根无 Call/AllIn，有 2 个 Raise 档（0.5=2.25BB / 1.0=3.5BB）+ Fold。
         let (abs, rules) = first_small_preopen_6max(3);
         let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
         let root = t.node(t.root_id());
@@ -585,7 +585,25 @@ mod tests {
             .count();
         assert_eq!(n_raises, 2, "preopen：UTG 根应有 2 个开池档（0.5/1.0）");
         assert!(root.legal_actions.contains(&AbstractActionTag::Fold));
-        assert!(root.legal_actions.contains(&AbstractActionTag::AllIn));
+        assert!(
+            !root.legal_actions.contains(&AbstractActionTag::AllIn),
+            "preopen：UTG 根应删除开池 AllIn"
+        );
+        let open_idx = root
+            .legal_actions
+            .iter()
+            .position(|t| matches!(t, AbstractActionTag::Raise(BetRatio::HALF_POT)))
+            .expect("preopen：UTG 根有 0.5pot 开池");
+        let child_id = match root.children[open_idx] {
+            Child::Decision(id) => id,
+            Child::Terminal => panic!("preopen：开池后不应是终局"),
+        };
+        assert!(
+            t.node(child_id)
+                .legal_actions
+                .contains(&AbstractActionTag::AllIn),
+            "preopen：面对开池的 AllIn 槽应保留，只删开池 AllIn"
+        );
     }
 
     /// 结构守门：`preopen-small`（[`first_small_preopen_small_6max`]）把 preflop 开池收成
