@@ -48,10 +48,14 @@ commit `cf9efdb`,**未并入 6max**)。设计成文 `temp/realtime_search_design
 默认 None = byte-equal 旧行为) + `SearchObserver` 计搜索触发/fallback;⑤ 探针 `tools/six_max_search_probe`
 (同一 blueprint 拆 search-on vs search-off,出 mbb/g+CI95)。**vultr 验证**:lib 71/0/8 无回归;真 1B nolimp
 ckpt smoke(600 手)plumbing 健康——desync=0/illegal=0、search 真触发(fallback 1.5%)、加载无 OOM;mbb/g CI
-600 手太宽不可判。子树实测:6-max first_small(3) flop=4434 节点 < cap 8000(探针不被误拒)。**未闭 = step 6 大样本
-判决**(需 ~100k–1M 手上 AWS,且信号被 §2 三 confound 削弱:uniform range/无 blueprint 叶子/欠迭代噪声)→ 战略
-岔路(甲 直接 AWS 跑 confounded 探针 / 乙 先做 §5b range 去 confound)待用户拍板;6b/6c 后续。详见
-`temp/realtime_search_design_2026_06_03.md` §10.2 + `six_max_nlhe_target.md` S6。
+600 手太宽不可判。子树实测:6-max first_small(3) flop=4434 节点 < cap 8000(探针不被误拒)。**§5b range
+去 confound 已落地**(用户选路线乙,commit `ac3968b`):root 按 blueprint 沿历史累乘 reach 的 per-seat marginal
+range 加权采样(非 uniform)→ 探针**升级成真正 §2 判别器**(解 blueprint 真 range 下子博弈);新增规则层
+`resample_hidden_with_holes` + `estimate_range`(逐街 re-bucket) + range-weighted root + `--uniform-range`
+A/B。仍在近似 = marginal/桶粒度 + 欠迭代噪声(MVP 解到真实终局、小子树无叶子近似,故「无 blueprint 叶子」非
+confound)。vultr lib 74/0/8;range-on vs uniform smoke 均 desync=0/search 触发/无 OOM(600 手 CI 仍宽)。
+**未闭 = 大样本判决**(CI 在 600 手无意义):vultr 中样本出首信号 + AWS 大样本收紧 CI;6b/6c 后续。详见
+`temp/realtime_search_design_2026_06_03.md` §10.2–10.3 + `six_max_nlhe_target.md` S6。
 
 **6-max 范式切换**:多人一般和 → CFR 不保证收敛 Nash、**LBR/exploitability 失去理论意义**(只当诊断,质量以
 实测对战为准)、无"训到 floor 就停"、无强 6-max 公开参考对手(不像 Slumbot 之于 HUNL)。详见 target 文档。

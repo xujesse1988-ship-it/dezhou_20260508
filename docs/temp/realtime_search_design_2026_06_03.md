@@ -440,6 +440,34 @@ MCCFR 不改即用（`trainer.rs` 零改）。root 重发**所有**人（含 her
 
 → **step 4 plumbing 端到端证实**（construct→resample→CFR→取分布→outgoing→真实对局，desync=0、search 真触发、可复现）。**未闭 = step 6 的「大样本判决」**：需 ~100k–1M 手才有有效 CI（按 `feedback_high_perf_host_on_demand` 上 AWS），且**信号被 §2 三 confound 削弱**（uniform range / 解到真实终局无 blueprint 叶子 → 测不到「搜索放大 blueprint 偏差」、只测「均匀-range 全解 vs blueprint」/ 欠迭代噪声）。**战略岔路（待用户拍板）**：(甲) 直接上 AWS 跑 confounded 大样本探针（验「均匀-range 全解 vs blueprint」+ plumbing 规模化）；(乙) 先做 §5b range 估计（blueprint 沿历史累乘 reach 加权 resample）把探针**去 confound**、使其真能答 §2，再上大样本。MVP plumbing 是两条路的共同前置，已不浪费。
 
+### 10.3 §5b range 去 confound 已落地（2026-06-03，commit `ac3968b`，vultr 验证；用户选路线乙）
+
+**做了什么**：subgame root 不再 uniform 重发底牌，而是按 blueprint **沿历史累乘 reach** 的
+per-seat marginal range 加权采样（顺序 card-removal）。这把探针从「均匀-range 全解 vs blueprint」
+升级成**真正的 §2 判别器**——subgame 现在解的是 blueprint 真 range 下的子博弈：blueprint range
+若偏（欠训练），全解建在偏 range 上 → 可能更差（§2 实锤）；range 好 → 全解改进策略。
+
+| 件 | 内容 | 状态 |
+|---|---|---|
+| 规则层装牌 | `GameState::resample_hidden_with_holes(holes, rng)`：装入给定底牌 + runout 从「52−board−holes」补 + 重算 showdown；终局仍走权威 `payouts()` | ✅ + 测试 |
+| range 估计 | `estimate_range`：对每候选 hole 沿该 seat 决策累乘 blueprint σ 走该动作的概率，**逐街 re-bucket**（陷阱①）；空 σ 退均匀、撞 board 置 0、归一。+ `all_hole_combos`(1326) / `decisions_on_path` / `board_prefix_for_street` | ✅ + 测试 |
+| range-weighted root | `SubgameNlheGame::new_with_ranges`；`root()` 顺序 card-removal 加权采样（`sample_discrete`，受限全零退均匀）→ `resample_hidden_with_holes` | ✅ + 测试 |
+| 接线 | `SubgameSearchConfig.use_blueprint_range`（默认 true）；`subgame_search` 加 `node_id`+`strategy`；advisor 透传；探针 `--uniform-range` 作 A/B | ✅ |
+
+**仍在的近似**（陷阱②的工程折中）：range = per-seat **marginal**（玩家间负相关只靠采样期
+card-removal 近似，不建联合分布）+ postflop **桶粒度**（有损）、preflop 精确。MVP 解到**真实
+showdown 终局**（6-max first_small flop 子树 ≈ 4434 节点、小）→ **无叶子近似**，故「无 blueprint
+续局值」在这里**不是 confound**（反而比 Pluribus 截 depth-limit 查值更精确）。
+
+**vultr 验证**：lib **74/0/8**；真 1B nolimp ckpt smoke（600 手）range-on vs `--uniform-range`
+A/B 均 plumbing 健康——desync=0/illegal=0、search 触发 66/真搜索 65（fallback 1.5%）、无 OOM；
+mbb/g range-on −520 [CI −1680,+639] vs uniform −667 [−1857,+524]，600 手 CI 巨宽两者均跨 0、
+不可分辨（去 confound 改变的是**解读**，大样本才出有效信号）。
+
+→ **探针已去 confound、可答 §2**。剩 = **大样本判决**（CI 在 600 手无意义）：vultr 中样本
+（free，~10⁴ 手）出首个真信号，AWS 大样本（~10⁵–10⁶ 手）收紧 CI。提迭代数（`--search-iterations`）
+压 per-bucket 噪声。
+
 ---
 
 ## 附：引用 + 关键 `file:line` 索引
