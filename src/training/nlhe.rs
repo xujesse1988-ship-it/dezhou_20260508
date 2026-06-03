@@ -144,6 +144,11 @@ pub struct SimplifiedNlheGame {
     /// （`legal_actions` 必须用这一份、而非全局 `nlhe_action_abstraction()`，否则 6-max
     /// 算出错的动作集）。
     pub(crate) abs: Arc<StreetActionAbstraction>,
+    /// 建 `tree` 用的 A3×A4 规则（[`new_with_abstraction`](Self::new_with_abstraction) 入参）。
+    /// 树已 baked-in 这套规则，运行期 `legal_actions` 不重读它；但 S6 实时搜索要从中途
+    /// 决策点**重建**子树（[`PublicBettingTree::build_subtree`]），须用**同一**规则透传，
+    /// 否则 `drop_small_reraise` / `width_redirect` 按错误上下文重算动作集（见 `subgame.rs`）。
+    pub(crate) rules: BettingAbstractionRules,
 }
 
 impl SimplifiedNlheGame {
@@ -209,6 +214,8 @@ impl SimplifiedNlheGame {
             config,
             abs: Arc::new(abstraction),
             tree,
+            // `rules` 是 Copy，build_with_rules 上面按值取后仍可存档（subgame 重建子树透传）。
+            rules,
         })
     }
 
@@ -224,6 +231,14 @@ impl SimplifiedNlheGame {
     /// 字段是 `pub(crate)`）。
     pub fn abstraction(&self) -> &StreetActionAbstraction {
         &self.abs
+    }
+
+    /// 本 game 建树用的 A3×A4 规则（[`BettingAbstractionRules`]，Copy）。S6 实时搜索
+    /// （`subgame.rs`）从中途决策点重建子树时须用**同一**规则透传，与 `abstraction()`
+    /// 配对——`tree` 已 baked-in 这套规则，但 [`PublicBettingTree::build_subtree`] 是独立
+    /// 调用、不读 `tree`，须显式拿回规则。
+    pub fn rules(&self) -> BettingAbstractionRules {
+        self.rules
     }
 
     /// 直接为指定的 preflop `node_id` × `hole` 构造 `InfoSetId`（绕过 `Game::info_set`

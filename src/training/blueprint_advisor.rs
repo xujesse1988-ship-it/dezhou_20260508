@@ -32,6 +32,8 @@
 //!
 //! crate 零网络依赖（invariant）：本模块纯计算，网络 IO 留给 Python driver（②）。
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rayon::prelude::*;
 
 use crate::abstraction::action::{AbstractAction, ActionAbstraction, StreetActionAbstraction};
@@ -45,6 +47,7 @@ use crate::training::game::Game;
 use crate::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use crate::training::nlhe_betting_tree::AbstractActionTag;
 use crate::training::sampling::sample_discrete;
+use crate::training::subgame::{should_search, subgame_search, SubgameSearchConfig};
 
 // ===========================================================================
 // Card 字符串解析（"Ac" → Card） —— 与 slumbot 同语义（rank 大写 + suit 小写）。
@@ -328,6 +331,20 @@ pub struct Contestant<'a> {
     pub game: &'a SimplifiedNlheGame,
     pub strategy: &'a (dyn Fn(&InfoSetId, usize) -> Vec<f64> + Sync),
     pub label: String,
+    /// S6 实时搜索（6a）：`Some` = 该参赛者在命中触发面（[`should_search`]）的决策点用
+    /// subgame re-solve 出分布、失败回落 blueprint；`None` = 纯 blueprint（默认、byte-equal
+    /// 旧行为）。用于「search-on vs search-off」不退化探针（`tools/six_max_search_probe`）。
+    pub search: Option<SubgameSearchConfig>,
+}
+
+/// 实时搜索调用计数（跨 rayon 线程共享，`Relaxed` 即可——只做总量统计、不做同步）。
+/// `attempts` = 命中触发面且配了 search 的决策点数；`successes` = 其中 [`subgame_search`]
+/// 返回 `Ok`（真用了搜索分布）的数。`attempts - successes` = 回落 blueprint 数。fallback 率
+/// 高 → 不退化 CI 主要由「与 blueprint 相同的决策」主导，须据此解读（见 `subgame.rs` confound）。
+#[derive(Default)]
+pub struct SearchObserver {
+    pub attempts: AtomicU64,
+    pub successes: AtomicU64,
 }
 
 /// 一手跨抽象对局的失败原因。
@@ -358,6 +375,7 @@ pub fn play_cross_abstraction_hand(
     hand_seed: u64,
     sample_rng: &mut dyn RngSource,
     max_actions: usize,
+    search_obs: Option<&SearchObserver>,
 ) -> Result<Vec<f64>, HandError> {
     let n = config.n_seats as usize;
     assert_eq!(seat_blueprint.len(), n, "seat_blueprint 长度须等于座位数");
@@ -372,7 +390,7 @@ pub fn play_cross_abstraction_hand(
         .map(|c| c.game.root(&mut shadow_rng))
         .collect();
 
-    for _ in 0..max_actions {
+    for decision_ordinal in 0..max_actions {
         if auth.is_terminal() {
             return finalize_payoffs(&auth, n);
         }
@@ -418,7 +436,37 @@ pub fn play_cross_abstraction_hand(
         let info = contestants[bp_idx]
             .game
             .info_set_for_cards(node_id, hole, &board);
-        let dist = strategy_distribution(&info, &legal_abs, contestants[bp_idx].strategy);
+        // S6 实时搜索插桩点（设计 §4.1）：该 actor 配了 search 且命中触发面
+        // （[`should_search`]）→ subgame re-solve 出分布；否则、或搜索失败 → 回落 blueprint
+        // average strategy。`outgoing_action`（L下方）与影子推进**完全不变**（低侵入关键）。
+        // `search_obs` 计搜索 attempts / successes（探针读 fallback 率 = 1 - succ/att，判
+        // 搜索是否真在跑还是大多回落——是解读不退化 CI 的关键，见 subgame.rs 顶部 confound）。
+        let blueprint_dist =
+            || strategy_distribution(&info, &legal_abs, contestants[bp_idx].strategy);
+        let dist = match &contestants[bp_idx].search {
+            Some(scfg) if should_search(&auth) => {
+                if let Some(o) = search_obs {
+                    o.attempts.fetch_add(1, Ordering::Relaxed);
+                }
+                match subgame_search(
+                    &auth,
+                    contestants[bp_idx].game,
+                    &legal_abs,
+                    scfg,
+                    hand_seed,
+                    decision_ordinal as u64,
+                ) {
+                    Ok(d) => {
+                        if let Some(o) = search_obs {
+                            o.successes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        d
+                    }
+                    Err(_) => blueprint_dist(),
+                }
+            }
+            _ => blueprint_dist(),
+        };
         let chosen = sample_discrete(&dist, sample_rng);
 
         // outgoing：真实 pot 算尺寸 → apply 权威局。
@@ -544,6 +592,11 @@ pub struct CrossAbstractionH2hReport {
     pub per_position_mbb_per_game: Vec<f64>,
     /// 各位置计入的手数（desync 排除后），用于读 per-position 的可信度。
     pub per_position_hands: Vec<u64>,
+    /// S6 实时搜索调用统计（[`SearchObserver`]）：`search_attempts` = 命中触发面的决策点数，
+    /// `search_successes` = 其中真用了搜索分布（[`subgame_search`] 返回 `Ok`）的数。fallback 率
+    /// = 1 - successes/attempts。两者均为 0 = 无参赛者配 search（纯 blueprint，旧行为）。
+    pub search_attempts: u64,
+    pub search_successes: u64,
 }
 
 /// hero(A) 依次坐遍全部 `n_players` 座（每座 `hands_per_seat` 手）、其余座全用 field(B)。
@@ -567,11 +620,13 @@ pub fn evaluate_cross_abstraction_h2h(
             game: hero.game,
             strategy: hero.strategy,
             label: hero.label.clone(),
+            search: hero.search,
         },
         Contestant {
             game: field.game,
             strategy: field.strategy,
             label: field.label.clone(),
+            search: field.search,
         },
     ];
 
@@ -580,6 +635,8 @@ pub fn evaluate_cross_abstraction_h2h(
     let mut per_pos_hands = vec![0u64; n];
     let mut desync_hands = 0u64;
     let mut illegal_hands = 0u64;
+    // 实时搜索调用计数（跨 rayon 线程共享原子累加；search-off 两边时恒 0）。
+    let search_obs = SearchObserver::default();
 
     // 每手独立（off-tree 自对弈无跨手状态）→ rayon 并行所有 (hero_seat, hand_idx)。
     // 每手 seed 由 (seed, hero_seat, hand) 确定派生 → 结果与线程调度无关、可复现。
@@ -607,6 +664,7 @@ pub fn evaluate_cross_abstraction_h2h(
                 hand_seed,
                 &mut sample_rng,
                 h2h_config.max_actions_per_hand,
+                Some(&search_obs),
             ) {
                 Ok(pnls) => Outcome::Pnl {
                     offset,
@@ -657,6 +715,8 @@ pub fn evaluate_cross_abstraction_h2h(
         ci95_high_mbb_per_game: mean_mbb + 1.96 * se_mbb,
         per_position_mbb_per_game,
         per_position_hands: per_pos_hands,
+        search_attempts: search_obs.attempts.load(Ordering::Relaxed),
+        search_successes: search_obs.successes.load(Ordering::Relaxed),
     }
 }
 
@@ -840,11 +900,13 @@ mod tests {
                 game: &nolimp,
                 strategy: &uniform,
                 label: "nolimp".into(),
+                search: None,
             },
             Contestant {
                 game: &preopen,
                 strategy: &uniform,
                 label: "preopen".into(),
+                search: None,
             },
         ];
         let cfg = TableConfig::default_6max_100bb();
@@ -863,6 +925,7 @@ mod tests {
                     hand_seed,
                     &mut rng,
                     512,
+                    None,
                 ) {
                     Ok(pnls) => {
                         completed += 1;
@@ -892,11 +955,13 @@ mod tests {
                 game: &nolimp,
                 strategy: &uniform,
                 label: "nolimp".into(),
+                search: None,
             },
             Contestant {
                 game: &baseline,
                 strategy: &uniform,
                 label: "baseline".into(),
+                search: None,
             },
         ];
         let cfg = TableConfig::default_6max_100bb();
@@ -907,9 +972,15 @@ mod tests {
         for hand in 0..400u64 {
             let hand_seed = 0x0BAD_5EED ^ hand;
             let mut rng = ChaCha20Rng::from_seed(hand_seed ^ 0x3333);
-            if let Err(HandError::Desync(_)) =
-                play_cross_abstraction_hand(&contestants, &seat_bp, &cfg, hand_seed, &mut rng, 512)
-            {
+            if let Err(HandError::Desync(_)) = play_cross_abstraction_hand(
+                &contestants,
+                &seat_bp,
+                &cfg,
+                hand_seed,
+                &mut rng,
+                512,
+                None,
+            ) {
                 desyncs += 1;
             }
         }
@@ -917,5 +988,84 @@ mod tests {
             desyncs > 0,
             "baseline field open-limp 应被 nolimp hero 影子检出为结构性 gap（desync>0），实得 {desyncs}"
         );
+    }
+
+    /// S6 实时搜索集成安全：seat0 search-on（[`SubgameSearchConfig`]）、其余 search-off，
+    /// 两边**同一** nolimp game（自对弈、同抽象 → 无结构 desync）。搜索只改决策分布、不碰
+    /// 筹码记账：①完成的手仍 6 座守恒（Σ==0，能让任何回合漂移 / 记账错 fail）；②同 seed
+    /// 两次跑逐手 PnL byte-equal（搜索 RNG 由 (hand_seed, decision_ordinal) 确定派生）。
+    /// 注：search 触发面 + 出合法分布由 `subgame::tests` 钉死；本测试钉的是**接进 live 决策
+    /// 环后不破对局正确性 + 可复现**。
+    #[test]
+    fn search_on_conserves_and_reproducible() {
+        let game = nolimp_game();
+        let uniform = |_info: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 8000,
+            seed: 0x5EA2_C400_5EA2_C400,
+        };
+        let cfg = TableConfig::default_6max_100bb();
+        let n = cfg.n_seats as usize;
+
+        let run = || {
+            let contestants = [
+                Contestant {
+                    game: &game,
+                    strategy: &uniform,
+                    label: "search-on".into(),
+                    search: Some(scfg),
+                },
+                Contestant {
+                    game: &game,
+                    strategy: &uniform,
+                    label: "search-off".into(),
+                    search: None,
+                },
+            ];
+            let mut seat_bp = vec![1usize; n];
+            seat_bp[0] = 0; // seat0 = search-on hero；其余 search-off。
+            let obs = SearchObserver::default(); // 顺带 exercise Some(&obs) 计数路径。
+            let mut completed = 0u64;
+            let mut pnls_all: Vec<Vec<f64>> = Vec::new();
+            for hand in 0..80u64 {
+                let hand_seed = 0x5EA2_C400 ^ hand;
+                let mut rng = ChaCha20Rng::from_seed(hand_seed ^ 0x55);
+                match play_cross_abstraction_hand(
+                    &contestants,
+                    &seat_bp,
+                    &cfg,
+                    hand_seed,
+                    &mut rng,
+                    512,
+                    Some(&obs),
+                ) {
+                    Ok(pnls) => {
+                        completed += 1;
+                        let sum: f64 = pnls.iter().sum();
+                        assert!(
+                            sum.abs() < 1e-6,
+                            "search-on 完成的手须守恒 Σ==0，实得 {sum}"
+                        );
+                        assert_eq!(pnls.len(), n);
+                        pnls_all.push(pnls);
+                    }
+                    Err(HandError::Desync(_)) => {}
+                    Err(e) => panic!("意外非 desync 失败: {e:?}"),
+                }
+            }
+            let att = obs.attempts.load(Ordering::Relaxed);
+            let succ = obs.successes.load(Ordering::Relaxed);
+            assert!(succ <= att, "successes ({succ}) 不能超 attempts ({att})");
+            (completed, pnls_all, att, succ)
+        };
+
+        let (c1, p1, a1, s1) = run();
+        let (c2, p2, a2, s2) = run();
+        assert!(c1 > 0, "应有手完成（不能全 desync）");
+        assert_eq!(c1, c2, "可复现：两次完成手数一致");
+        assert_eq!(p1, p2, "可复现：search-on 逐手 PnL byte-equal");
+        // 可复现：同 seed 两次跑搜索调用计数也一致（plumbing 确定性）。
+        assert_eq!((a1, s1), (a2, s2), "可复现：search attempts/successes 一致");
     }
 }

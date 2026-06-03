@@ -54,6 +54,7 @@ pub use best_response::{exploitability, BestResponse, KuhnBestResponse, LeducBes
 pub use blueprint_advisor::{
     advance_shadow_by_applied, evaluate_cross_abstraction_h2h, outgoing_action,
     play_cross_abstraction_hand, Contestant, CrossAbstractionH2hReport, CrossH2hConfig, HandError,
+    SearchObserver,
 };
 pub use checkpoint::Checkpoint;
 pub use game::{Game, NodeKind, PlayerId};
@@ -72,7 +73,7 @@ pub use nlhe_eval::{
     NlheMultiwayEvalReport,
 };
 pub use regret::{RegretTable, StrategyAccumulator};
-pub use subgame::SubgameNlheGame;
+pub use subgame::{should_search, subgame_search, SubgameNlheGame, SubgameSearchConfig};
 pub use trainer::{EsMccfrTrainer, Trainer, VanillaCfrTrainer};
 
 // CheckpointError + TrainerError + TrainerVariant + GameVariant 物理位置在
