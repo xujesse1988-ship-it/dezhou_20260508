@@ -37,6 +37,17 @@ GameState + 每 blueprint 一份抽象影子,off-tree 翻译推进;slumbot_advis
 (不能干净排内在强度);**实测码深漂移严重**(真实桌 14BB–800BB)。剩绝对强度量化(挂场数百手 + 排行榜,需用户授权时长)。
 详见 `six_max_nlhe_target.md` S4 续⑥⑦ + S5 续、`temp/openpoker_client_design_2026_06_02.md` §9。
 
+**S6 进度(2026-06-03):实时搜索推进,MVP subgame-solver 核心已落地 + vultr 验证**(分支 `6max-rts-mvp`
+commit `cf9efdb`,**未并入 6max**)。设计成文 `temp/realtime_search_design_2026_06_03.md`(文献调研+代码复用映射+
+对抗验证):方法定型 = Pluribus/Modicum tabular depth-limited search(非 DeepStack/ReBeL)。三件落地:①
+`PublicBettingTree::build_subtree`(以中途 public state 为根建 betting 子树,`nlhe_betting_tree.rs`);②**加性**
+`GameState::resample_hidden`(克隆中途态+保留公共牌/下注态+重发隐藏牌,终局走权威 `payouts()` → **S1 不受影响**,
+`rules/state.rs`);③ `SubgameNlheGame impl Game`(delegate SimplifiedNlheGame、仅重写 root()=resample+子树 →
+复用 `EsMccfrTrainer` 零改,`training/subgame.rs`)。**vultr 验证**:6 新测试全过 + 全 lib 67/67 无回归(byte-equal
+守门未破)。剩 6a 收尾 = subgame_search 接 `blueprint_advisor.rs:421`(flop-only 触发)+ 不退化 h2h 探针
+(search-on vs blueprint-only,需真 ckpt);6b(continual re-solving + biased leaf)/6c(off-tree PHM)后续。详见
+`six_max_nlhe_target.md` S6。
+
 **6-max 范式切换**:多人一般和 → CFR 不保证收敛 Nash、**LBR/exploitability 失去理论意义**(只当诊断,质量以
 实测对战为准)、无"训到 floor 就停"、无强 6-max 公开参考对手(不像 Slumbot 之于 HUNL)。详见 target 文档。
 
