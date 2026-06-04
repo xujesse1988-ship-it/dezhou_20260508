@@ -630,8 +630,17 @@ showdown 一行不动 → **S1 PokerKit 跨验证不受影响**）。`EsMccfrTra
   = **不退化**、range≈uniform、§2 灾难失败未现。**放宽到任意 postflop 决策点（`SearchTrigger::AllPostflop`）朴素
   实测显著退化**（24k −192 CI 上界 −8.3；12k @3000 −426 / @12000 −310 **仍负 → 结构性非噪声**，集中盲位）→ 根因 =
   MVP 从**当前决策点**重解、mid-round 撞设计 §6 #1/#2 landmine（非 round-start 重解 + 无 within-round 冻结）；
-  flop-first 因 = round-start 恰好正确。默认 trigger 设回 `FlopFirstUnraised`。**正确放宽触发面须先做 §6
-  round-start re-solve**（顶成下一必做正确性项，6b 级）。
+  flop-first 因 = round-start 恰好正确。默认 trigger 设回 `FlopFirstUnraised`。
+- **§6 #1 round-start re-solve 已落地 + 实测推翻 §10.4 归因**（设计 §10.5，commit `8fde9bc`，vultr lib **76/0/8**）：
+  实现 `ResolveRoot{CurrentDecision,RoundStart}`（默认 RoundStart：从 betting-round 起点建子树 + within-round 导航 +
+  round-stable seed 给一致性）。**主 A/B（24k@3000）**：round-start×all-postflop **−407** vs current-decision −192 —
+  round-start **更差**（5/6 位一致），根因 = **deep-node 欠训练**（ARM3 判别器：flop-first 读 root 训透 = −62 中性、
+  all-postflop 读深层节点欠训练 = −407）。**迭代扫（12k）**：两模式随 iters 改善但**收敛到负 plateau**（current-decision
+  −426/−310/−273、round-start −527/−366/−287 @{3k,12k,24k}，CI 上界仍 < 0）。**结论**：① **§6 round-start 不是退化
+  的杠杆**（不 beat current-decision）；② all-postflop 退化主要是**残余 §2 结构（~−270，iters 修不掉）**——近似
+  marginal-range + 桶粒度的子博弈在 mid-street 劣于 1B blueprint 自身响应；③ **瓶颈 = blueprint/抽象质量（§2），非
+  搜索 root**——flop-first（干净点、训透）中性不亏、all-postflop 弱基底反退化。**战略岔路（待拍板）**：甲 强化
+  blueprint / 6b biased-leaf / 丙 收尾 flop-first-only / 丁 更好 range 建模。
 
 **验收范式改写**：6-max 下 LBR/exploitability 失去理论意义 → **删 pluribus_path.md 6b「LBR 显著下降」闸门**，
 改为 `evaluate_cross_abstraction_h2h` 受控 A/B（search-on vs search-off）实测 mbb/g + CI + OpenPoker live。6a/6b/6c

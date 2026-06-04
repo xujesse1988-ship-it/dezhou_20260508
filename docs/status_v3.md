@@ -62,8 +62,19 @@ decisions_on_path 数当前街进攻,补多档计数缺口)。**实测 all-postf
 mid-round 撞 §6 #1/#2 landmine(非 round-start 重解+无 within-round 冻结);flop-first 因 = round-start 恰好正确。
 **根因已隔离**(all-postflop range vs uniform A/B):24k range −192 vs uniform −501 → ① §5b range **大幅 help +310**
 (不是退化源、反是修正,价值被放宽触发面揭示)② 残余 −192 = §6 landmine 非 range(迭代扫排噪声+本 A/B 排 range)。
-默认 trigger 设回 FlopFirstUnraised(安全),AllPostflop 留研究 opt-in。**下一必做 = §6 round-start re-solve**(正确放宽
-触发面的前置,6b 级)+ 大样本判决。详见 `temp/realtime_search_design_2026_06_03.md` §10.2–10.4 + target S6。
+默认 trigger 设回 FlopFirstUnraised(安全),AllPostflop 留研究 opt-in。详见 `temp/realtime_search_design_2026_06_03.md`
+§10.2–10.4 + target S6。
+**§10.5 round-start re-solve 已落地——实测推翻 §10.4 的 §6-landmine 归因**(commit `8fde9bc`,vultr lib **76/0/8**):
+实现 `ResolveRoot{CurrentDecision,RoundStart}`(默认 RoundStart;从 betting-round 起点建子树+within-round 导航+
+round-stable seed 给一致性)。**两 control 复现 harness**:current-decision×all-postflop=−192(=§10.4 byte-equal)、
+flop-first=−72。**主 A/B(24k@3000)**:round-start×all-postflop **−407** vs current-decision −192——round-start **更差**
+(5/6 位一致),根因 = deep-node 欠训练(ARM3 判别器:flop-first 读 root 训透=−62 中性,all-postflop 读深层节点欠训练=−407;
+fallback 6.1%>3.7%)。**迭代扫(12k)**:current-decision −426/−310/−273、round-start −527/−366/−287 @{3k,12k,24k}——
+两模式随 iters 改善但**收敛到负 plateau ~−270/−287,CI 上界仍<0**。**结论(修正 §10.4)**:① **§6 round-start **不是**退化的杠杆**
+(等迭代更差、高迭代持平,不 beat current-decision);② all-postflop 退化 = 欠训练(iters 修一截)+ **残余结构 ~−270(§2 materialized:
+近似 marginal-range+桶粒度的子博弈在 mid-street 劣于 1B blueprint 自身响应);③ **瓶颈 = blueprint/抽象质量(§2),非搜索 root**——
+flop-first(干净点、训透)中性不亏、all-postflop 弱基底反退化。**战略岔路(待拍板)**:甲 强化 blueprint / 6b biased-leaf /
+丙 收尾 flop-first-only / 丁 更好 range 建模。详见设计 §10.5。
 
 **6-max 范式切换**:多人一般和 → CFR 不保证收敛 Nash、**LBR/exploitability 失去理论意义**(只当诊断,质量以
 实测对战为准)、无"训到 floor 就停"、无强 6-max 公开参考对手(不像 Slumbot 之于 HUNL)。详见 target 文档。
