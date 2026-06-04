@@ -49,7 +49,9 @@ use poker::training::nlhe_betting_tree::{
     BettingAbstractionRules,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
-use poker::training::{ResolveRoot, SearchTrigger, SubgameSearchConfig};
+use poker::training::{
+    build_leaf_value_tables, default_continuations, ResolveRoot, SearchTrigger, SubgameSearchConfig,
+};
 use poker::{BucketTable, InfoSetId, StreetActionAbstraction, TableConfig};
 
 fn main() -> ExitCode {
@@ -70,6 +72,8 @@ struct Args {
     hands_per_seat: u64,
     seed: u64,
     search: SubgameSearchConfig,
+    /// 6b depth-limit：叶子值表每续局 self-play 手数（仅 `search.depth_limit` 时用）。
+    leaf_hands: u64,
 }
 
 fn run() -> Result<(), String> {
@@ -116,6 +120,32 @@ fn run() -> Result<(), String> {
         args.search.resolve_root
     );
 
+    // 6b depth-limit：先用同一 blueprint 跑 self-play 建叶子续局值表（unbiased + 默认 4 续局）。
+    // 只在 depth_limit 时建（6a 解到终局不需要）。
+    let leaf_values = if args.search.depth_limit {
+        let conts = default_continuations();
+        eprintln!(
+            "[six_max_search_probe] 6b depth-limit：建叶子值表（{} 续局 × {} 手 self-play）…",
+            conts.len(),
+            args.leaf_hands
+        );
+        let t = std::sync::Arc::new(build_leaf_value_tables(
+            &trainer,
+            &conts,
+            args.leaf_hands,
+            args.seed ^ 0x6C65_6166_7661_6C75, // "leafvalu"
+            512,
+        ));
+        eprintln!(
+            "[six_max_search_probe]   叶子值表项数 = {}（unbiased 覆盖 = {}）",
+            t.len(),
+            t.populated_for_cont(0)
+        );
+        Some(t)
+    } else {
+        None
+    };
+
     // 同一 trainer 的 dense average strategy，hero/field 共用（blueprint 完全相同）；
     // 唯一差异 = hero.search = Some（命中触发面则 subgame re-solve），field.search = None。
     let strat = |info: &InfoSetId, _n: usize| trainer.average_strategy(*info);
@@ -124,12 +154,14 @@ fn run() -> Result<(), String> {
         strategy: &strat,
         label: "search-on".to_string(),
         search: Some(args.search),
+        leaf_values: leaf_values.clone(),
     };
     let field = Contestant {
         game: trainer.game(),
         strategy: &strat,
         label: "search-off".to_string(),
         search: None,
+        leaf_values: None,
     };
 
     let h2h_config = CrossH2hConfig {
@@ -247,6 +279,7 @@ fn parse_args() -> Result<Args, String> {
     let mut hands_per_seat = 2000u64;
     let mut seed = 0x5835_4831_5f48_3268u64;
     let mut search = SubgameSearchConfig::default();
+    let mut leaf_hands = 200_000u64;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -279,6 +312,13 @@ fn parse_args() -> Result<Args, String> {
             }
             // A/B 对照：关 §5b range，回 uniform resample（MVP 旧行为）。
             "--uniform-range" => search.use_blueprint_range = false,
+            // 6b：depth-limit 搜索（子树街边界截断 + 叶子查 blueprint 续局值，绕开深层欠训练）。
+            "--depth-limit" => search.depth_limit = true,
+            "--leaf-hands" => {
+                leaf_hands = next(&mut it, "--leaf-hands")?
+                    .parse()
+                    .map_err(|e| format!("bad --leaf-hands: {e}"))?
+            }
             // 触发面：all-postflop（宽）vs flop-first（默认，窄 A/B 基线）。
             "--trigger" => {
                 search.trigger = match next(&mut it, "--trigger")?.as_str() {
@@ -326,6 +366,7 @@ fn parse_args() -> Result<Args, String> {
         hands_per_seat,
         seed,
         search,
+        leaf_hands,
     })
 }
 

@@ -323,6 +323,12 @@ pub struct SimplifiedNlheState {
     /// `Game::State: Sync` bound（State 实际由单 worker 拥有，Relaxed 等价普通
     /// load/store）。
     pub(crate) info_set_cache: AtomicU64,
+    /// S6 6b depth-limit：subgame 叶子续局值上下文（[`crate::training::subgame::SubgameLeafCtx`]）。
+    /// `Some` 仅当本 state 属于 depth-limit subgame（`SubgameNlheGame::new_depth_limited`）；
+    /// **base game / 6a subgame 恒 `None`**——`SimplifiedNlheGame` 自身的 `current`/`payoff`
+    /// 永不读它，故 base 路径行为/性能 byte-equal（`Option<Arc>` clone 在 `None` 下 ≈ 零成本）。
+    /// depth-limit 叶子的 `SubgameNlheGame::payoff` 才读它查 blueprint 叶子值。
+    pub(crate) leaf_ctx: Option<Arc<crate::training::subgame::SubgameLeafCtx>>,
 }
 
 impl Clone for SimplifiedNlheState {
@@ -335,6 +341,7 @@ impl Clone for SimplifiedNlheState {
             tree: Arc::clone(&self.tree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(self.info_set_cache.load(Ordering::Relaxed)),
+            leaf_ctx: self.leaf_ctx.clone(),
         }
     }
 }
@@ -367,7 +374,11 @@ fn unpack_info_set_cache(packed: u64) -> (u8, u8, u16, u16) {
 /// lookup）。= [`SimplifiedNlheGame::info_set`] HU cache-miss 分支的**同源逻辑**，供 P4
 /// 6-max uncached 分支复用。HU 分支保持逐字不动、刻意不抽取——避免动到生产热路径
 /// （byte-equal by 不-touch，nlhe_infoset_semantics T1 钉死）；代价 = 这段 ~8 行重复。
-fn compute_hand_bucket(state: &SimplifiedNlheState, actor: PlayerId, street_tag: StreetTag) -> u32 {
+pub(crate) fn compute_hand_bucket(
+    state: &SimplifiedNlheState,
+    actor: PlayerId,
+    street_tag: StreetTag,
+) -> u32 {
     let hole = state.game_state.players()[actor as usize]
         .hole_cards
         .expect("SimplifiedNlhe info_set: actor hole_cards must be present on decision node");
@@ -436,6 +447,7 @@ impl Game for SimplifiedNlheGame {
             tree: Arc::clone(&self.tree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(0),
+            leaf_ctx: None, // base game 永不走 depth-limit 叶子。
         }
     }
 

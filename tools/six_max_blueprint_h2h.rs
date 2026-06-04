@@ -119,6 +119,7 @@ fn run() -> Result<(), String> {
             strategy: s.as_ref(),
             label: label.clone(),
             search: None, // 互评工具纯 blueprint；实时搜索探针走 tools/six_max_search_probe。
+            leaf_values: None,
         })
         .collect();
 

@@ -40,13 +40,32 @@ use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::nlhe::{
-    SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
+    compute_hand_bucket, SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet,
+    SimplifiedNlheState,
 };
 use crate::training::nlhe_betting_tree::{
     AbstractActionTag, BettingAbstractionRules, Child, NodeId, PublicBettingTree,
 };
 use crate::training::sampling::sample_discrete;
+use crate::training::subgame_leaf_value::LeafValueTables;
 use crate::training::trainer::{EsMccfrTrainer, Trainer};
+
+/// S6 6b depth-limit：subgame 叶子续局值上下文（[`SimplifiedNlheState::leaf_ctx`] 携带，
+/// depth-limit 叶子的 [`SubgameNlheGame::payoff`] 读）。
+///
+/// `SubgameNlheGame::new_depth_limited` 构建：把子树每个 depth-limit 叶子（本地 `NodeId`）映射
+/// 回 **blueprint 全局树** 的街起点 `NodeId`（`global_by_local`，非叶项 = [`u32::MAX`] 哨兵），
+/// 配 `values`（[`LeafValueTables`]）+ 续局 `cont`，使叶子 `payoff` 能查 `E[U | seat, 全局节点,
+/// bucket, cont]`。弃牌座的叶子值不查表（= 固定 `−committed_total`，见 `payoff`）。
+pub struct SubgameLeafCtx {
+    /// blueprint 叶子续局值表（与构建 subgame 的 blueprint 同源）。
+    pub values: Arc<LeafValueTables>,
+    /// `global_by_local[local_node]` = 该 depth-limit 叶子对应的 blueprint 全局街起点 `NodeId`；
+    /// 非叶节点 = [`u32::MAX`]（不被读）。
+    pub global_by_local: Vec<NodeId>,
+    /// 查哪个续局（6b-3 step-1 固定 0 = unbiased；6b-4 叶子选择节点起按对手所选 cont）。
+    pub cont: usize,
+}
 
 /// 以一个中途 public state 为根的 subgame `Game`（S6 6a）。
 pub struct SubgameNlheGame {
@@ -65,6 +84,10 @@ pub struct SubgameNlheGame {
     ranges: Option<Vec<Vec<f64>>>,
     /// range 采样用的 1326 具体底牌组合表（仅 `ranges == Some` 时非空）；下标对齐 `ranges`。
     hole_combos: Vec<[Card; 2]>,
+    /// S6 6b depth-limit：`Some` = 子树用 [`PublicBettingTree::build_subtree_depth_limited`] 截断、
+    /// 叶子查 blueprint 续局值（[`SubgameLeafCtx`]）；`None`（6a）= 子树解到真实终局、走真实
+    /// showdown payoff。`root` 把它 clone 进 state（depth-limit 叶子 `payoff` 读）。
+    leaf_ctx: Option<Arc<SubgameLeafCtx>>,
 }
 
 impl SubgameNlheGame {
@@ -102,6 +125,7 @@ impl SubgameNlheGame {
             template,
             ranges: None,
             hole_combos: Vec::new(),
+            leaf_ctx: None,
         }
     }
 
@@ -136,6 +160,77 @@ impl SubgameNlheGame {
         g.ranges = Some(ranges);
         g.hole_combos = all_hole_combos();
         g
+    }
+
+    /// S6 6b：从中途 `template` 建 **depth-limit** subgame（`limit_street` 之后截断、叶子查
+    /// blueprint 续局值）。比 [`new_with_ranges`](Self::new_with_ranges) 多三件：①子树用
+    /// [`PublicBettingTree::build_subtree_depth_limited`]；②把每个 depth-limit 叶子映射回
+    /// **blueprint 全局树** 街起点 `NodeId`（沿子树 tag 路径在 `blueprint_tree` 从
+    /// `root_global_node` 导航）；③装 [`SubgameLeafCtx`]（`values` + 映射 + `cont`）。
+    ///
+    /// `root_global_node` = `template` 对应的 blueprint 全局节点（[`subgame_search`] 现算：
+    /// CurrentDecision = 当前节点 / RoundStart = 街起点）。任一叶子无法映射（同抽象下不应发生，
+    /// 防御几何漂移）→ `Err`，调用方回落 blueprint。`ranges` 同 `new_with_ranges`（`None` =
+    /// uniform）。`cont` = 查哪个续局（step-1 固定 0 = unbiased）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_depth_limited(
+        bucket_table: Arc<BucketTable>,
+        config: TableConfig,
+        abs: StreetActionAbstraction,
+        rules: BettingAbstractionRules,
+        template: GameState,
+        entrants: u16,
+        raises_on_street: u32,
+        ranges: Option<Vec<Vec<f64>>>,
+        limit_street: StreetTag,
+        blueprint_tree: &PublicBettingTree,
+        root_global_node: NodeId,
+        values: Arc<LeafValueTables>,
+        cont: usize,
+    ) -> Result<Self, String> {
+        debug_assert!(
+            !template.is_terminal() && template.current_player().is_some(),
+            "new_depth_limited: template 须是非终局 decision 节点"
+        );
+        let subtree = Arc::new(PublicBettingTree::build_subtree_depth_limited(
+            &template,
+            &abs,
+            rules,
+            entrants,
+            raises_on_street,
+            limit_street,
+        ));
+        // 叶子 → blueprint 全局街起点映射（沿子树 tag 路径在全局树从 root_global_node 导航）。
+        let mut global_by_local = vec![u32::MAX; subtree.num_nodes()];
+        for local in 0..subtree.num_nodes() as NodeId {
+            if subtree.node(local).depth_limit_leaf {
+                let tags = subtree.path_to_root(local);
+                let g = navigate_global(blueprint_tree, root_global_node, &tags)?;
+                global_by_local[local as usize] = g;
+            }
+        }
+        let leaf_ctx = Some(Arc::new(SubgameLeafCtx {
+            values,
+            global_by_local,
+            cont,
+        }));
+        let (ranges_opt, hole_combos) = match ranges {
+            Some(r) => {
+                debug_assert_eq!(r.len(), template.players().len(), "ranges 长度须 == 座位数");
+                (Some(r), all_hole_combos())
+            }
+            None => (None, Vec::new()),
+        };
+        Ok(Self {
+            config,
+            subtree,
+            abs: Arc::new(abs),
+            bucket_table,
+            template,
+            ranges: ranges_opt,
+            hole_combos,
+            leaf_ctx,
+        })
     }
 
     /// 子树（诊断 / 评测：取 root_id 构造查询 infoset）。
@@ -225,6 +320,7 @@ impl SubgameNlheGame {
             tree: Arc::clone(&self.subtree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(0),
+            leaf_ctx: None, // query 读非叶决策点策略，不查叶子值。
         };
         let info = SimplifiedNlheGame::info_set(&query, actor);
         let legal = SimplifiedNlheGame::legal_actions(&query);
@@ -305,12 +401,19 @@ impl Game for SubgameNlheGame {
             tree: Arc::clone(&self.subtree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(0),
+            // 6b depth-limit：把叶子值上下文带进 state（叶子 payoff 读）；6a/uniform = None。
+            leaf_ctx: self.leaf_ctx.clone(),
         }
     }
 
-    // 以下全部 delegate SimplifiedNlheGame——它们只读 state 携带的 tree/abs/game_state，
-    // state 带子树就在子树上跑（关联函数，与 Game token 无关）。
+    // 多数 delegate SimplifiedNlheGame——只读 state 携带的 tree/abs/game_state（关联函数，与
+    // Game token 无关）。**current/payoff 例外**：6b depth-limit 叶子由本 Game 改写（见各方法）。
     fn current(state: &SimplifiedNlheState) -> NodeKind {
+        // 6b：depth-limit 叶子（子树街边界截断点）当 Terminal——CFR 在此不展开、走 payoff 查
+        // blueprint 续局值。非 depth-limit 树该标记恒 false（base/6a 行为不变）。
+        if state.tree.node(state.current_node_id).depth_limit_leaf {
+            return NodeKind::Terminal;
+        }
         SimplifiedNlheGame::current(state)
     }
 
@@ -335,8 +438,79 @@ impl Game for SubgameNlheGame {
     }
 
     fn payoff(state: &SimplifiedNlheState, player: PlayerId) -> f64 {
+        // 6b：depth-limit 叶子查 blueprint 续局值（弃牌座 = −committed），否则走真实 showdown。
+        let node = state.tree.node(state.current_node_id);
+        if node.depth_limit_leaf {
+            return leaf_payoff(state, player, node.street);
+        }
         SimplifiedNlheGame::payoff(state, player)
     }
+}
+
+/// depth-limit 叶子的 `payoff`（[`SubgameNlheGame::payoff`] 调）。
+///
+/// **弃牌座**：净收益固定 = `−committed_total`（已投入全损、不依赖 runout，故不查值表——值表
+/// 只对仍在手座位累计，见 [`SubgameLeafCtx`]）。**在手座（Active/AllIn）**：查
+/// `values.value(player, 全局街起点节点, 该街 bucket, cont)`；该续局缺 → 退 unbiased(cont 0)；
+/// 仍缺（街起点高频、miss 罕见）→ 0（已知近似，§见模块顶部 doc）。
+fn leaf_payoff(state: &SimplifiedNlheState, player: PlayerId, leaf_street: StreetTag) -> f64 {
+    let p = &state.game_state.players()[player as usize];
+    if matches!(p.status, PlayerStatus::Folded) {
+        return -(p.committed_total.as_u64() as f64);
+    }
+    let ctx = state
+        .leaf_ctx
+        .as_ref()
+        .expect("depth-limit 叶子 state 必带 leaf_ctx");
+    let global = ctx.global_by_local[state.current_node_id as usize];
+    if global == u32::MAX {
+        // 未映射叶子（new_depth_limited 构建期已 Err 排除，此为防御兜底）。
+        return 0.0;
+    }
+    let bucket = compute_hand_bucket(state, player, leaf_street);
+    ctx.values
+        .value(player as usize, global, bucket, ctx.cont)
+        .or_else(|| ctx.values.value(player as usize, global, bucket, 0))
+        .unwrap_or(0.0)
+}
+
+/// 从 blueprint 全局树 `from` 节点沿 `tags` 导航，返回落点全局 `NodeId`（[`navigate_subtree`]
+/// 的任意起点版，用于 [`SubgameNlheGame::new_depth_limited`] 把子树叶子映射回全局街起点）。
+/// tag 不在合法集 / 导向终局 → `Err`（几何漂移，调用方回落 blueprint）。
+fn navigate_global(
+    tree: &PublicBettingTree,
+    from: NodeId,
+    tags: &[AbstractActionTag],
+) -> Result<NodeId, String> {
+    let mut id = from;
+    for tag in tags {
+        let node = tree.node(id);
+        let idx = node
+            .legal_actions
+            .iter()
+            .position(|t| t == tag)
+            .ok_or_else(|| format!("global 导航 tag {tag:?} 不在节点 {id} 合法集（几何漂移）"))?;
+        match node.children[idx] {
+            Child::Decision(next) => id = next,
+            Child::Terminal => return Err(format!("global 导航 tag {tag:?} 导向终局（不应到达）")),
+        }
+    }
+    Ok(id)
+}
+
+/// 从 `node_id` 沿 parent 链上爬到**当前街起点**（最浅的同街祖先）= RoundStart depth-limit 的
+/// subgame 根全局节点（root_state = 轮起点快照对应的全局节点）。preflop 会爬到全树 root；
+/// subgame 只在 postflop 触发，故落在 flop/turn/river 街起点。
+fn climb_to_street_start(tree: &PublicBettingTree, node_id: NodeId) -> NodeId {
+    let street = tree.node(node_id).street;
+    let mut id = node_id;
+    while let Some(p) = tree.node(id).parent {
+        if tree.node(p).street != street {
+            break; // parent 在更浅街 → id 即本街起点。
+        }
+        id = p;
+    }
+    id
 }
 
 // ===========================================================================
@@ -423,6 +597,10 @@ pub struct SubgameSearchConfig {
     /// 重解根（§6 #1）。默认 [`ResolveRoot::RoundStart`]（正确放宽触发面的前置）。
     /// `FlopFirstUnraised` 下两模式等价（当前点 = round-start）；`CurrentDecision` 保留作 A/B。
     pub resolve_root: ResolveRoot,
+    /// S6 6b：`true` = **depth-limit** 搜索——子树在当前街边界截断、叶子查 blueprint 续局值表
+    /// （绕开深层欠训练节点，§10.5 退化主因）；`false`（默认）= 6a 解到真实终局。`true` 需
+    /// [`subgame_search`] 收到 `leaf_values`（否则该次搜索 `Err` 回落 blueprint）。
+    pub depth_limit: bool,
 }
 
 impl Default for SubgameSearchConfig {
@@ -434,6 +612,7 @@ impl Default for SubgameSearchConfig {
             use_blueprint_range: true,
             trigger: SearchTrigger::FlopFirstUnraised,
             resolve_root: ResolveRoot::RoundStart,
+            depth_limit: false,
         }
     }
 }
@@ -657,6 +836,7 @@ pub fn subgame_search(
     node_id: NodeId,
     strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
     cfg: &SubgameSearchConfig,
+    leaf_values: Option<&Arc<LeafValueTables>>,
     hand_seed: u64,
     decision_ordinal: u64,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
@@ -714,28 +894,62 @@ pub fn subgame_search(
             }
         };
 
-    // 建 subgame：同 blueprint 的 bucket 表 / action 抽象 + A3×A4 规则，从 root_state 为根。
-    // §5b：use_blueprint_range → 为每个未弃牌座位估 marginal range，root 按其加权采样底牌；否则 uniform。
-    let sub = if cfg.use_blueprint_range {
+    // §5b range：use_blueprint_range → 为每个未弃牌座位估 marginal range（root 加权采样底牌）；
+    // 否则 None = uniform。depth-limit / 解到终局都复用这一份 ranges。
+    let ranges_opt: Option<Vec<Vec<f64>>> = if cfg.use_blueprint_range {
         let holes = all_hole_combos();
         let board: Vec<Card> = root_state.board().to_vec();
         let players = root_state.players();
-        let ranges: Vec<Vec<f64>> = (0..players.len())
-            .map(|seat| {
-                if players[seat].hole_cards.is_some() {
-                    estimate_range(
-                        game,
-                        strategy,
-                        &range_decisions,
-                        &board,
-                        seat as PlayerId,
-                        &holes,
-                    )
-                } else {
-                    Vec::new() // 弃牌座：range 不被读。
-                }
-            })
-            .collect();
+        Some(
+            (0..players.len())
+                .map(|seat| {
+                    if players[seat].hole_cards.is_some() {
+                        estimate_range(
+                            game,
+                            strategy,
+                            &range_decisions,
+                            &board,
+                            seat as PlayerId,
+                            &holes,
+                        )
+                    } else {
+                        Vec::new() // 弃牌座：range 不被读。
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        None
+    };
+
+    // 建 subgame：同 blueprint 的 bucket 表 / action 抽象 + A3×A4 规则，从 root_state 为根。
+    // 6b depth-limit → 子树街边界截断 + 叶子查 blueprint 续局值（new_depth_limited）；否则 6a 解到终局。
+    let sub = if cfg.depth_limit {
+        let values =
+            leaf_values.ok_or_else(|| "depth_limit=true 但未提供 leaf_values".to_string())?;
+        // root_state 的 blueprint 全局节点：CurrentDecision = 当前点（= root）；RoundStart =
+        // 当前街起点（从 node_id 沿 parent 爬到街起点）。limit_street = root 节点所在街（只解当前街）。
+        let root_global = match cfg.resolve_root {
+            ResolveRoot::CurrentDecision => node_id,
+            ResolveRoot::RoundStart => climb_to_street_start(tree, node_id),
+        };
+        let limit_street = tree.node(root_global).street;
+        SubgameNlheGame::new_depth_limited(
+            Arc::clone(&game.bucket_table),
+            root_state.config().clone(),
+            game.abstraction().clone(),
+            game.rules(),
+            root_state.clone(),
+            entrants,
+            raises_on_street,
+            ranges_opt,
+            limit_street,
+            tree,
+            root_global,
+            Arc::clone(values),
+            0, // step-1：固定 unbiased 续局；biased 选择节点 = 6b-4。
+        )?
+    } else if let Some(ranges) = ranges_opt {
         SubgameNlheGame::new_with_ranges(
             Arc::clone(&game.bucket_table),
             root_state.config().clone(),
@@ -845,6 +1059,8 @@ mod tests {
     use crate::abstraction::action::AbstractAction;
     use crate::abstraction::bucket_table::BucketConfig;
     use crate::training::nlhe_betting_tree::first_small_6max;
+    use crate::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
+    use crate::training::subgame_leaf_value::{build_leaf_value_tables, default_continuations};
 
     fn stub_table() -> Arc<BucketTable> {
         Arc::new(BucketTable::stub_for_postflop(
@@ -941,6 +1157,7 @@ mod tests {
             tree: Arc::clone(&sub.subtree),
             abs: Arc::clone(&sub.abs),
             info_set_cache: AtomicU64::new(0),
+            leaf_ctx: None,
         };
         let info = SimplifiedNlheGame::info_set(&query, actor);
         let avg = a.average_strategy(&info);
@@ -1043,6 +1260,7 @@ mod tests {
             use_blueprint_range: true,
             trigger: SearchTrigger::AllPostflop,
             resolve_root: ResolveRoot::RoundStart,
+            depth_limit: false,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -1050,10 +1268,10 @@ mod tests {
         for hand_seed in 0u64..3 {
             let ordinal = 3u64;
             let r1 = subgame_search(
-                &auth, &auth, &game, &legal_abs, node_id, &strat, &cfg, hand_seed, ordinal,
+                &auth, &auth, &game, &legal_abs, node_id, &strat, &cfg, None, hand_seed, ordinal,
             );
             let r2 = subgame_search(
-                &auth, &auth, &game, &legal_abs, node_id, &strat, &cfg, hand_seed, ordinal,
+                &auth, &auth, &game, &legal_abs, node_id, &strat, &cfg, None, hand_seed, ordinal,
             );
             assert_eq!(
                 r1.is_ok(),
@@ -1093,9 +1311,10 @@ mod tests {
             use_blueprint_range: true,
             trigger: SearchTrigger::AllPostflop,
             resolve_root: ResolveRoot::RoundStart,
+            depth_limit: false,
         };
         let r = subgame_search(
-            &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, 0, 0,
+            &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, 0, 0,
         );
         assert!(r.is_err(), "节点上限被触发应回落 Err，实得 {r:?}");
     }
@@ -1191,6 +1410,7 @@ mod tests {
             use_blueprint_range: true,
             trigger: SearchTrigger::AllPostflop,
             resolve_root: ResolveRoot::RoundStart,
+            depth_limit: false,
         };
         let d9 = subgame_search(
             &auth,
@@ -1200,6 +1420,7 @@ mod tests {
             node_id,
             &strat,
             &cfg,
+            None,
             0xABCD,
             9,
         )
@@ -1212,6 +1433,7 @@ mod tests {
             node_id,
             &strat,
             &cfg,
+            None,
             0xABCD,
             99,
         )
@@ -1325,6 +1547,115 @@ mod tests {
                 s.game_state.players()[1].hole_cards,
                 Some(holes[m]),
                 "seat1 集中 range → 恒采样 hole m"
+            );
+        }
+    }
+
+    /// S6 6b：depth-limit subgame 端到端——[`SubgameNlheGame::new_depth_limited`] 建截断子树 +
+    /// 叶子查 blueprint 续局值表，`EsMccfrTrainer` 跑通。验：①截断子树 ≪ 全子树（leaves 截断）；
+    /// ②每个 depth-limit 叶子都映射到了 blueprint 全局节点（非 [`u32::MAX`]）、≥1 个；③CFR 跑通
+    /// （不 panic、累积策略——证叶子被当 Terminal 走值表 payoff，否则空 legal_actions 会破）；
+    /// ④同 seed 两 trainer 逐 infoset byte-equal（可复现）。
+    #[test]
+    fn depth_limited_subgame_cfr_runs_through_leaf_values() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x4454_4C5F_4347_4D45); // "DTL_CGME"
+        let template = flop.game_state.clone();
+        let root_global = flop.current_node_id; // flop 决策点的 blueprint 全局节点
+        let limit = game.tree().node(root_global).street; // = Flop（只解 flop、叶子在 turn 起点）
+
+        // 叶子值表：同 game 配置的 stub trainer self-play（未训练 ≈ uniform）。
+        let trainer = DenseNlheEsMccfrTrainer::new(
+            SimplifiedNlheGame::new(stub_table()).expect("HU game"),
+            7,
+        );
+        let values = Arc::new(build_leaf_value_tables(
+            &trainer,
+            &default_continuations(),
+            800,
+            0xBEEF,
+            400,
+        ));
+
+        // 全子树（不截断）作节点数对照。
+        let full = PublicBettingTree::build_subtree(
+            &template,
+            &StreetActionAbstraction::default_6_action(),
+            BettingAbstractionRules::default(),
+            0,
+            0,
+        );
+
+        let make = || {
+            SubgameNlheGame::new_depth_limited(
+                stub_table(),
+                TableConfig::default_hu_200bb(),
+                StreetActionAbstraction::default_6_action(),
+                BettingAbstractionRules::default(),
+                template.clone(),
+                0,
+                0,
+                None, // uniform（聚焦 depth-limit + 叶子值链路）
+                limit,
+                game.tree(),
+                root_global,
+                Arc::clone(&values),
+                0,
+            )
+            .expect("build depth-limited subgame")
+        };
+
+        let sub = make();
+        assert!(
+            sub.subtree().num_nodes() < full.num_nodes(),
+            "depth-limit 子树 {} 应 < 全子树 {}（leaves 截断）",
+            sub.subtree().num_nodes(),
+            full.num_nodes()
+        );
+        let ctx = sub
+            .leaf_ctx
+            .as_ref()
+            .expect("depth-limit subgame 应有 leaf_ctx");
+        let mut mapped_leaves = 0usize;
+        for local in 0..sub.subtree().num_nodes() as NodeId {
+            if sub.subtree().node(local).depth_limit_leaf {
+                assert_ne!(
+                    ctx.global_by_local[local as usize],
+                    u32::MAX,
+                    "叶子 {local} 应已映射 blueprint 全局节点"
+                );
+                mapped_leaves += 1;
+            }
+        }
+        assert!(mapped_leaves > 0, "应有 ≥1 个 depth-limit 叶子");
+
+        // CFR 跑通 + 可复现（叶子当 Terminal 走值表 → 不会因空 legal_actions panic）。
+        let steps = 400u64;
+        let run = |seed: u64| {
+            let mut tr = EsMccfrTrainer::new(make(), seed);
+            let mut rng = ChaCha20Rng::from_seed(seed ^ 0xC0FF_EE00);
+            for _ in 0..steps {
+                tr.step(&mut rng).expect("depth-limit subgame step");
+            }
+            tr
+        };
+        let a = run(0xD1);
+        let b = run(0xD1);
+        assert_eq!(a.update_count(), steps);
+        assert!(
+            !a.strategy_sum().inner().is_empty(),
+            "depth-limit subgame CFR 应累积到 ≥1 infoset"
+        );
+        assert_eq!(
+            a.strategy_sum().inner().len(),
+            b.strategy_sum().inner().len(),
+            "同 seed 两 trainer 表大小一致"
+        );
+        for (info, _) in a.strategy_sum().inner().iter() {
+            assert_eq!(
+                a.average_strategy(info),
+                b.average_strategy(info),
+                "同 seed depth-limit subgame 策略 byte-equal @ {info:?}"
             );
         }
     }

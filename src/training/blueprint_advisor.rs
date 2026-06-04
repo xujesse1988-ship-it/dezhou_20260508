@@ -33,6 +33,7 @@
 //! crate 零网络依赖（invariant）：本模块纯计算，网络 IO 留给 Python driver（②）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -48,6 +49,7 @@ use crate::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use crate::training::nlhe_betting_tree::AbstractActionTag;
 use crate::training::sampling::sample_discrete;
 use crate::training::subgame::{should_search, subgame_search, ResolveRoot, SubgameSearchConfig};
+use crate::training::subgame_leaf_value::LeafValueTables;
 
 // ===========================================================================
 // Card 字符串解析（"Ac" → Card） —— 与 slumbot 同语义（rank 大写 + suit 小写）。
@@ -335,6 +337,10 @@ pub struct Contestant<'a> {
     /// subgame re-solve 出分布、失败回落 blueprint；`None` = 纯 blueprint（默认、byte-equal
     /// 旧行为）。用于「search-on vs search-off」不退化探针（`tools/six_max_search_probe`）。
     pub search: Option<SubgameSearchConfig>,
+    /// S6 6b：depth-limit 搜索的 blueprint 叶子续局值表（[`LeafValueTables`]）。`search` 的
+    /// `depth_limit=true` 时必须 `Some`（否则该次搜索 `Err` 回落 blueprint）；`depth_limit=false`
+    /// （6a 解到终局）时不被读，传 `None`。
+    pub leaf_values: Option<Arc<LeafValueTables>>,
 }
 
 /// 实时搜索调用计数（跨 rayon 线程共享，`Relaxed` 即可——只做总量统计、不做同步）。
@@ -475,6 +481,7 @@ pub fn play_cross_abstraction_hand(
                     node_id,
                     contestants[bp_idx].strategy,
                     scfg,
+                    contestants[bp_idx].leaf_values.as_ref(),
                     hand_seed,
                     decision_ordinal as u64,
                 ) {
@@ -643,12 +650,14 @@ pub fn evaluate_cross_abstraction_h2h(
             strategy: hero.strategy,
             label: hero.label.clone(),
             search: hero.search,
+            leaf_values: hero.leaf_values.clone(),
         },
         Contestant {
             game: field.game,
             strategy: field.strategy,
             label: field.label.clone(),
             search: field.search,
+            leaf_values: field.leaf_values.clone(),
         },
     ];
 
@@ -924,12 +933,14 @@ mod tests {
                 strategy: &uniform,
                 label: "nolimp".into(),
                 search: None,
+                leaf_values: None,
             },
             Contestant {
                 game: &preopen,
                 strategy: &uniform,
                 label: "preopen".into(),
                 search: None,
+                leaf_values: None,
             },
         ];
         let cfg = TableConfig::default_6max_100bb();
@@ -979,12 +990,14 @@ mod tests {
                 strategy: &uniform,
                 label: "nolimp".into(),
                 search: None,
+                leaf_values: None,
             },
             Contestant {
                 game: &baseline,
                 strategy: &uniform,
                 label: "baseline".into(),
                 search: None,
+                leaf_values: None,
             },
         ];
         let cfg = TableConfig::default_6max_100bb();
@@ -1032,6 +1045,7 @@ mod tests {
             use_blueprint_range: true,
             trigger: SearchTrigger::AllPostflop,
             resolve_root: ResolveRoot::RoundStart,
+            depth_limit: false,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;
@@ -1043,12 +1057,14 @@ mod tests {
                     strategy: &uniform,
                     label: "search-on".into(),
                     search: Some(scfg),
+                    leaf_values: None,
                 },
                 Contestant {
                     game: &game,
                     strategy: &uniform,
                     label: "search-off".into(),
                     search: None,
+                    leaf_values: None,
                 },
             ];
             let mut seat_bp = vec![1usize; n];
