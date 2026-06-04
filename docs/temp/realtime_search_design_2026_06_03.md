@@ -689,8 +689,20 @@ infoset-level、非 clairvoyant。`a` = 叶子 `player_acting`（下一街首 ac
    预测：**更好 blueprint 是杠杆**（好了即用它重建叶子表 + 跑完整 A/B，预期 6b 才可能 break-even/正）。
 
 **统计注意**：12k 下各臂 marginal SE ~150 → 单步 +43/+75 个体不显著、CI 重叠；但三臂**同 seed 池配对**（同手、同
-field=blueprint）→ 臂间差的方差远低于 marginal SE 所示（探针只报 marginal、未算配对差 CI）。单调趋势 + 量级
-（+118）是机制有效的**一致信号**，要钉死显著性须上 24k+ 或算配对差。
+field=blueprint）→ 臂间差的方差远低于 marginal SE 所示。**已据此加探针 `--paired-baseline` 配对差 CI**（commit
+`7de30c9`）：主臂外再跑对照臂、算「主臂 − baseline」逐手配对差，消去共同方差 → 钉死显著性，不必靠 marginal。
+
+### 11.5b 探针遥测加 leaf-miss + 配对差（commit `7de30c9`，vultr lib +1 / bin +1）+ **river 叶子覆盖软肋实测**
+
+为下次完整 A/B 可读，加两件：① **leaf-miss 计数**（`LeafValueTables` 原子 + 探针每臂报 miss 率）——之前叶子查不到
+值**静默退 0**，现可见；② **配对差 CI**（`--paired-baseline terminal|unbiased`，report 加 `per_hand_pnl` 对齐）。
+
+**真数据 smoke（all-postflop，biased，leaf-hands 20000）立即暴露大问题**：**leaf-miss 率 72.5%**（41134 查值 / 29839
+退 0）！river-start 叶子（来自 **turn 搜索**）严重欠采样 → 深街叶子值大多 = 0 兜底。**这重新解读 §11.5 的 A/B**：那轮
+leaf-hands=50000 也大概率高 miss → depth-limit 臂的深街叶子多为 0，**机制其实是在「大量 0 叶子」下还拿到 +118 减亏**
+（0 叶子至少有界，胜过解深层欠训练节点；biased 的 +75 来自被覆盖的那 ~30% 叶子）。**推论**：完整 6b 验收须 (a) leaf-hands
+大一个量级（river 覆盖），或 (b) **只对 flop 搜索用 depth-limit**（turn 叶子覆盖好）、turn/river 解到终局，或 (c) 深街叶子
+改粗粒度值抽象（pot/active/pos 而非 per-node）。配对差 smoke 同跑通（480 手 Δ+106、CI 跨 0 = 小样本噪声，但机制正确）。
 
 ### 11.6 已知近似（解读探针时记住）
 
