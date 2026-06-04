@@ -54,8 +54,14 @@ range 加权采样(非 uniform)→ 探针**升级成真正 §2 判别器**(解 b
 `resample_hidden_with_holes` + `estimate_range`(逐街 re-bucket) + range-weighted root + `--uniform-range`
 A/B。仍在近似 = marginal/桶粒度 + 欠迭代噪声(MVP 解到真实终局、小子树无叶子近似,故「无 blueprint 叶子」非
 confound)。vultr lib 74/0/8;range-on vs uniform smoke 均 desync=0/search 触发/无 OOM(600 手 CI 仍宽)。
-**未闭 = 大样本判决**(CI 在 600 手无意义):vultr 中样本出首信号 + AWS 大样本收紧 CI;6b/6c 后续。详见
-`temp/realtime_search_design_2026_06_03.md` §10.2–10.3 + `six_max_nlhe_target.md` S6。
+**vultr 中样本首信号**(24k 手,§10.3):range-on −71.6 CI[−232,+89] / uniform −81.6,两 arm CI 跨 0 = 不退化、
+range≈uniform、§2 灾难失败未现。**放宽触发面实验**(§10.4,commit `996879b`):加 `SearchTrigger{FlopFirstUnraised,
+AllPostflop}` + 任意节点现算 `(entrants,raises_on_street)`(`live_entrants`+`raises_on_current_street` 沿
+decisions_on_path 数当前街进攻,补多档计数缺口)。**实测 all-postflop 朴素放宽显著退化**(24k −192 CI[−376,−8.3];
+12k @3000 −426 / @12000 −310 仍负 → **非迭代噪声、结构性**,退化集中盲位)→ 根因 = MVP 从当前决策点独立重解、
+mid-round 撞 §6 #1/#2 landmine(非 round-start 重解+无 within-round 冻结);flop-first 因 = round-start 恰好正确。
+默认 trigger 设回 FlopFirstUnraised(安全),AllPostflop 留研究 opt-in。**未闭 = §6 round-start re-solve**(正确放宽
+触发面的前置,6b 级)+ 大样本判决。详见 `temp/realtime_search_design_2026_06_03.md` §10.2–10.4 + target S6。
 
 **6-max 范式切换**:多人一般和 → CFR 不保证收敛 Nash、**LBR/exploitability 失去理论意义**(只当诊断,质量以
 实测对战为准)、无"训到 floor 就停"、无强 6-max 公开参考对手(不像 Slumbot 之于 HUNL)。详见 target 文档。

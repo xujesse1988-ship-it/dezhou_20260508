@@ -30,7 +30,9 @@
 //!   --bucket-table artifacts/bucket_table_200_200_200_seed_cafebabe_schemav4.bin \
 //!   --reshape nolimp --postflop-cap 3 \
 //!   --checkpoint artifacts/run_6max_s4_nolimp/nlhe_es_mccfr_final_001000000000.ckpt \
-//!   --hands-per-seat 2000 --search-iterations 1000   # 加 --uniform-range 跑 MVP 对照
+//!   --hands-per-seat 2000 --search-iterations 1000
+//!   # --trigger flop-first(默认,不退化) | all-postflop(研究:朴素放宽实测退化 §10.4)；
+//!   # --uniform-range 关 §5b 作 MVP 对照
 //! ```
 
 use std::process::ExitCode;

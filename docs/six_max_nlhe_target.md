@@ -626,6 +626,12 @@ showdown 一行不动 → **S1 PokerKit 跨验证不受影响**）。`EsMccfrTra
 - **§5b 后边界**（设计 §10.3）：range = blueprint 沿历史累乘 reach 的 per-seat **marginal**（玩家间负相关靠采样期
   card-removal 近似）+ postflop **桶粒度**（有损）、preflop 精确；MVP 解到**真实终局**（小子树、无叶子近似）→ 探针
   **已能答 §2**（解 blueprint 真 range 下子博弈）。biased leaf / depth-limit 续局值是 6b。
+- **vultr 中样本首信号 + 放宽触发面实验**（设计 §10.3–10.4，commit `996879b`）：24k 手 range-on −71.6 CI[−232,+89]
+  = **不退化**、range≈uniform、§2 灾难失败未现。**放宽到任意 postflop 决策点（`SearchTrigger::AllPostflop`）朴素
+  实测显著退化**（24k −192 CI 上界 −8.3；12k @3000 −426 / @12000 −310 **仍负 → 结构性非噪声**，集中盲位）→ 根因 =
+  MVP 从**当前决策点**重解、mid-round 撞设计 §6 #1/#2 landmine（非 round-start 重解 + 无 within-round 冻结）；
+  flop-first 因 = round-start 恰好正确。默认 trigger 设回 `FlopFirstUnraised`。**正确放宽触发面须先做 §6
+  round-start re-solve**（顶成下一必做正确性项，6b 级）。
 
 **验收范式改写**：6-max 下 LBR/exploitability 失去理论意义 → **删 pluribus_path.md 6b「LBR 显著下降」闸门**，
 改为 `evaluate_cross_abstraction_h2h` 受控 A/B（search-on vs search-off）实测 mbb/g + CI + OpenPoker live。6a/6b/6c

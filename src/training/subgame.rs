@@ -322,11 +322,20 @@ impl Game for SubgameNlheGame {
 // 下一步质量杠杆 = 6b（continual re-solving + biased leaf）。
 
 /// 实时搜索触发面（[`should_search`]）。
+///
+/// **实测（2026-06-04 vultr，§10.4）**：`AllPostflop` 朴素放宽**结构性显著退化**（24k 手
+/// −192 / 12k 手 −426，CI 上界 < 0；4× 迭代仅 −426→−310 仍负 → **非迭代噪声**；退化集中在
+/// **盲位**）。根因 = MVP 从**当前决策点**独立重解，mid-round 决策撞设计 §6 #1/#2 landmine
+/// （非 betting-round 起点重解 + 无 within-round 冻结，论文明说更可剥削），在盲位（每手 postflop
+/// 决策最多）累积最重；`FlopFirstUnraised` 因 flop 首点 = round-start 而"恰好正确"（−72，CI 跨 0
+/// 不退化）。**故默认 = `FlopFirstUnraised`**；`AllPostflop` 为研究用 opt-in，正确放宽须先做
+/// §6 round-start re-solve（6b）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SearchTrigger {
-    /// 仅 flop **未起注**首决策点（MVP 旧窄触发面，A/B 基线）。
+    /// 仅 flop **未起注**首决策点（= betting-round 起点，§6 #1 下"恰好正确"，默认）。
     FlopFirstUnraised,
-    /// 任意 postflop 决策点（flop 含已起注 / turn / river）——更宽触发面，搜索影响更多决策。
+    /// 任意 postflop 决策点（flop 含已起注 / turn / river）。**朴素放宽实测退化**（见上）——
+    /// 须先实现 §6 round-start re-solve 才正确；当前仅研究 opt-in。
     AllPostflop,
 }
 
@@ -346,7 +355,8 @@ pub struct SubgameSearchConfig {
     /// 加权采样各家底牌（§5b 去 confound——subgame 在真 range 而非均匀先验上求解）；`false`
     /// = uniform resample（MVP 旧行为，留作 A/B 对照）。
     pub use_blueprint_range: bool,
-    /// 触发面（默认 [`SearchTrigger::AllPostflop`]）。
+    /// 触发面。默认 [`SearchTrigger::FlopFirstUnraised`]（验证不退化的安全窄触发面；
+    /// `AllPostflop` 朴素放宽实测结构性退化，见 [`SearchTrigger`] doc）。
     pub trigger: SearchTrigger,
 }
 
@@ -357,7 +367,7 @@ impl Default for SubgameSearchConfig {
             max_subtree_nodes: 8000,
             seed: 0x5347_4D45_5F53_3641, // "SGME_S6A"
             use_blueprint_range: true,
-            trigger: SearchTrigger::AllPostflop,
+            trigger: SearchTrigger::FlopFirstUnraised,
         }
     }
 }

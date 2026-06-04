@@ -482,6 +482,34 @@ CI 从 600 手 ±1200 收到 24k 手 ±160；要把 ~−72 的轻微负点估判
 分钟级）收到 ±40。但 MVP 触发面 = **仅 flop 首决策点**（约 11% 决策），收益被全局稀释——更大杠杆在放宽触发面
 （需先补 `subtree_context` 的多档 `raises_on_street` 计数）或上 6b（biased leaf / continual re-solving）。
 
+### 10.4 放宽触发面到任意 postflop 决策点 → **朴素放宽显著退化（结构性）**（2026-06-04，commit `996879b`，vultr）
+
+**做了什么**：`SearchTrigger {FlopFirstUnraised, AllPostflop}` + `should_search(auth, trigger)`；放宽触发面
+要求任意节点现算正确 `(entrants, raises_on_street)`——补 `live_entrants` + `raises_on_current_street`（沿
+`decisions_on_path` 数当前街进攻 tag，与 `walk` 语义逐字对齐，解决 §10.1 审核 A 的多档计数缺口）。探针 `--trigger`。
+
+**实测（真 1B nolimp ckpt，range-on）**：
+
+| trigger | hands | iters | mbb/g | CI95 | search 触发 |
+|---|---|---|---|---|---|
+| flop-first（窄） | 24k | 3000 | −71.6 | [−232, **+89**] 不退化 | 2599 |
+| all-postflop（宽） | 24k | 3000 | **−192.1** | [−376, **−8.3**] **退化** | 5903 |
+| all-postflop | 12k | 3000 | −426.5 | [−696, −157] 退化 | 2894 |
+| all-postflop | 12k | **12000** | −309.9 | [−546, −74] **仍退化** | 3249 |
+
+**结论**：朴素放宽触发面 → **显著退化**（CI 上界 < 0），且 **4× 迭代仅 −426→−310 仍深负 → 非迭代噪声、是结构性**；
+退化**集中在盲位**（SB/BB −600~−1300，BTN/UTG/HJ/CO 近 0 = 该手 postflop 决策最多的 OOP 位）。根因 = MVP 从
+**当前决策点**独立重解，mid-round 决策撞设计 **§6 #1/#2 landmine**（非 betting-round 起点重解 + 无 within-round
+range 冻结，论文明说更可剥削），在盲位累积最重；`flop-first` 因 flop 首点 = round-start 而"恰好正确"（MVP 窄触发
+面是**意外躲过** landmine，非真无此问题）。desync=0 全程（非 plumbing bug，是策略）。
+
+**未隔离**：marginal-range / 桶粒度 / blueprint-bias 的贡献未与 §6 landmine 分离（可加 all-postflop `--uniform-range`
+A/B 进一步定位）；但迭代扫已排除"纯噪声"。
+
+→ **正确放宽触发面须先做 §6 round-start re-solve**（从 betting-round 起点重解 + within-round 冻结，6b 级工作）。
+故默认 `trigger` 已设回 `FlopFirstUnraised`（不退化的安全窄面）；`AllPostflop` 留作研究 opt-in。**这是 broaden
+实验的真正价值**：证明 MVP「最近决策点重解」在放宽后撞 landmine，把 §6 round-start re-solve 顶成下一必做正确性项。
+
 ---
 
 ## 附：引用 + 关键 `file:line` 索引
