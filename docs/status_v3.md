@@ -60,7 +60,9 @@ AllPostflop}` + 任意节点现算 `(entrants,raises_on_street)`(`live_entrants`
 decisions_on_path 数当前街进攻,补多档计数缺口)。**实测 all-postflop 朴素放宽显著退化**(24k −192 CI[−376,−8.3];
 12k @3000 −426 / @12000 −310 仍负 → **非迭代噪声、结构性**,退化集中盲位)→ 根因 = MVP 从当前决策点独立重解、
 mid-round 撞 §6 #1/#2 landmine(非 round-start 重解+无 within-round 冻结);flop-first 因 = round-start 恰好正确。
-默认 trigger 设回 FlopFirstUnraised(安全),AllPostflop 留研究 opt-in。**未闭 = §6 round-start re-solve**(正确放宽
+**根因已隔离**(all-postflop range vs uniform A/B):24k range −192 vs uniform −501 → ① §5b range **大幅 help +310**
+(不是退化源、反是修正,价值被放宽触发面揭示)② 残余 −192 = §6 landmine 非 range(迭代扫排噪声+本 A/B 排 range)。
+默认 trigger 设回 FlopFirstUnraised(安全),AllPostflop 留研究 opt-in。**下一必做 = §6 round-start re-solve**(正确放宽
 触发面的前置,6b 级)+ 大样本判决。详见 `temp/realtime_search_design_2026_06_03.md` §10.2–10.4 + target S6。
 
 **6-max 范式切换**:多人一般和 → CFR 不保证收敛 Nash、**LBR/exploitability 失去理论意义**(只当诊断,质量以

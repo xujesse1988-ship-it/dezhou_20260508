@@ -503,12 +503,22 @@ CI 从 600 手 ±1200 收到 24k 手 ±160；要把 ~−72 的轻微负点估判
 range 冻结，论文明说更可剥削），在盲位累积最重；`flop-first` 因 flop 首点 = round-start 而"恰好正确"（MVP 窄触发
 面是**意外躲过** landmine，非真无此问题）。desync=0 全程（非 plumbing bug，是策略）。
 
-**未隔离**：marginal-range / 桶粒度 / blueprint-bias 的贡献未与 §6 landmine 分离（可加 all-postflop `--uniform-range`
-A/B 进一步定位）；但迭代扫已排除"纯噪声"。
+**根因隔离（all-postflop range vs uniform A/B，commit `2f6a001`）**：
+
+| all-postflop | range-on | uniform | range 效应 |
+|---|---|---|---|
+| 24k @3000 | −192 | −501 | **+310 mbb/g** |
+| 12k @3000 | −426 | −646 | +220 mbb/g |
+
+→ ① **§5b range 大幅 help**（−501→−192）：marginal-range **不是**退化来源，反而是实质修正——且其价值被放宽
+触发面**揭示**（flop-first 时 range≈uniform 仅 +10，turn/river/raised 处 range 浓缩 → +310，§5b 没白做）。
+② **即便用了好 range，all-postflop 仍显著退化**（−192，CI<0，集中盲位）→ 残余结构退化**已隔离 = §6 round-start
+landmine、非 range/桶粒度**（迭代扫已排噪声 + 本 A/B 已排 range）。
 
 → **正确放宽触发面须先做 §6 round-start re-solve**（从 betting-round 起点重解 + within-round 冻结，6b 级工作）。
-故默认 `trigger` 已设回 `FlopFirstUnraised`（不退化的安全窄面）；`AllPostflop` 留作研究 opt-in。**这是 broaden
-实验的真正价值**：证明 MVP「最近决策点重解」在放宽后撞 landmine，把 §6 round-start re-solve 顶成下一必做正确性项。
+故默认 `trigger` 已设回 `FlopFirstUnraised`（不退化的安全窄面）；`AllPostflop` 留作研究 opt-in。**broaden
+实验的真正价值**：(a) 证明 MVP「最近决策点重解」放宽后撞 §6 landmine（把 round-start re-solve 顶成下一必做正确性项）；
+(b) **隔离证明 §5b range 在有杠杆处 help +310**（之前 flop-first 看似可忽略）。
 
 ---
 
