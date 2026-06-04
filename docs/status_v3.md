@@ -134,7 +134,7 @@ InfoSetId position 已留 4 bit(支持 0..15 座,`abstraction/map/mod.rs`)、den
 
 | host | 角色 | 状态 |
 |---|---|---|
-| vultr 64.176.35.138 (4 vCPU / 7.7 GiB) | 持久存储 + 短测试 | 长期持有;**跑不动 NLHE 训练**(3M update 进 swap) |
+| vultr 64.176.35.138 (4 vCPU / 11.67 GiB) | 持久存储 + 短测试 | 长期持有;**跑不动 NLHE 训练**(3M update 进 swap) |
 | AWS(按需起/停,IP 每次变) | 训练 | HU 用 c6a.8xlarge(32 vCPU);6-max 大概率不够,待 S2 sizing 定更大机 |
 
 ## 构建 / 测试

@@ -472,12 +472,12 @@ dense 表本身不产生更强 blueprint——它只是承载 bet-size 扩张的
   vultr 充裕——dense recurse 的主验证。
 - **LCFR**（period=1000，5000 update，跨 5 个 rescale boundary）：byte-equal ✓，峰值
   **~7.33 GiB**（`rescale_all` 全提交 4.62 GiB dense + HashMap 对照表 ~2 GiB + bucket，
-  与 update 数几乎无关）。**逼近 vultr 7.7 GiB 上限、无余量**——属 ≥ ~10 GiB 机器，
-  idle vultr 勉强过（0 swap）。
+  与 update 数几乎无关）。vultr **11.67 GiB 物理**（available ≈ 11.2 GiB）下放得过、~4 GiB
+  余量、0 swap（⚠ 旧记「逼近 7.7 GiB 上限、无余量」是把 `free` 空闲列误当总量，已订正）。
 
 > **内存教训（决定 Phase 3+ 跑哪）**：当前 119.7M profile 下 full-dense 两表 4.62 GiB；
-> 一旦触发 `rescale_all`（LCFR / period boundary）就全提交，叠 HashMap 对照表后逼近
-> vultr 上限。**目标扩张 profile 两表 13.48 GiB，vultr（7.7 GiB）直接装不下。** Phase 3
+> 一旦触发 `rescale_all`（LCFR / period boundary）就全提交，叠 HashMap 对照表后峰值
+> ~7.33 GiB（vultr 11.67 GiB 物理放得下）。**目标扩张 profile 两表 13.48 GiB，vultr（11.67 GiB）直接装不下。** Phase 3
 > 并行 + 目标 profile 验证需 32–64 GB 机器（AWS c6a.8xlarge / Hetzner / vultr 大机型），
 > 不能继续压在当前 vultr 上。LCFR rescale byte-equal 本身另由 Phase 1 `nlhe_dense` 单测
 > （合成 delta vs HashMap）覆盖，所以 vultr 上只跑 vanilla 也够拿 recurse 正确性。
