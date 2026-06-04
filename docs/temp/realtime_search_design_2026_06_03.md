@@ -601,6 +601,67 @@ current-decision 计算等价）。`AllPostflop` 留研究 opt-in。
 
 ---
 
+## 11. 6b 落地：depth-limit + biased 叶子（2026-06-04，分支 `6max-rts-mvp`，用户选 6b + 并行训更好 blueprint）
+
+用户拍板走 **(6b)** 并**并行训练更好 blueprint**——6b 基建现在建、blueprint 好了即可在强基底上验真收益
+（§10.5 的瓶颈是 blueprint 质量，6b 无论如何是 S6 必经）。**核心杠杆**：§10.5 的 all-postflop 退化主因 =
+解**深层欠训练**节点；depth-limit 在**当前街边界截断**子树、叶子改查 **blueprint 续局值**（绕开深层），
+是直击该退化的机制。分四增量落地（每个独立可测、vultr 验证）：
+
+### 11.1 增量 1：betting-tree depth-limit（commit `8a63222`，vultr lib 77/0/8）
+
+`TreeNode.depth_limit_leaf` 标记 + `PublicBettingTree::build_subtree_depth_limited(.., limit_street)`：动作把
+局面推进到 > `limit_street` 的更深街且非终局 → 不展开、落叶子（保留下一街首决策点 `street`/`player_acting`
+供叶子查桶）。`limit = root 街` = 只解当前街（§6 #5「首轮搜索→叶子在下一街起点」）。非叶块与全子树逐节点
+同构、`limit=最深街` ≡ `build_subtree`（钉死）。
+
+### 11.2 增量 2：N-player 多续局叶子值表（`subgame_leaf_value.rs`；commit `b0d798e`→`9f4319e`，vultr 通过）
+
+**OOM 教训（修正设计 §8「内存不是瓶颈」）**：初版照「推广 aivat」建**全节点 dense** 表（`total_rows ×
+n_cont × n_players`）→ 6-max blueprint（`total_rows ~9e7`）× 4 续局 × 6 位 = 数十 GiB，vultr 实测 **SIGKILL**。
+设计漏算了 value 表 ×n_cont 的放大。**修正（精确、不引值抽象）**：depth-limit 叶子**只可能是街起点节点**
+（跨街后首决策点）= 全树稀疏子集 → 只在街起点累计、**HashMap 稀疏键** `(node, bucket, pos, cont)`，内存随
+覆盖度（vultr 实测峰值 4.9 GiB）。**刻意不动** `aivat_value.rs`（在产 HU AIVAT，用途不同）。
+
+`BiasKind`/`ContinuationSpec`/`apply_bias`（§6 #6：fold/call/raise ×系数再归一）+ `default_continuations`
+（unbiased + fold/call/raise ×5）；`build_leaf_value_tables` 每续局跑一遍全桌同风格 self-play，
+`value(seat, 全局街起点节点, bucket, cont)` 查 `E[U]`。
+
+### 11.3 增量 3：depth-limit + unbiased 叶子值接进 SubgameNlheGame + 搜索 + 探针（commit `6e92d07`，vultr lib 80/0/8）
+
+**可行性核验（关键 green light）**：`recurse_es` 终局只读 `payoff(traverser)`、**不强制零和** → 叶子值
+（独立 self-play 估计、不必和为 0）安全，**无需改 trainer**。
+
+- `SimplifiedNlheState` 加 `leaf_ctx: Option<Arc<SubgameLeafCtx>>`（base/6a 恒 `None` → hot path byte-equal）。
+- `SubgameLeafCtx` = `values` + 叶子本地→blueprint **全局街起点 NodeId** 映射（`navigate_global` 沿子树 tag
+  路径导航；任一失配 → `new_depth_limited` 返 `Err` 回落）+ `cont`。
+- `SubgameNlheGame` override `current`（depth-limit 叶子 = `Terminal`）+ `payoff`（**弃牌座** =
+  `−committed_total` 固定损失、不查表；**在手座** = `values.value(.., cont)`，缺退 unbiased(0)→0）。
+- `subgame_search` 加 `leaf_values` 参 + `depth_limit` 分支：root 全局节点（CurrentDecision = 当前点 /
+  RoundStart = `climb_to_street_start`）、`limit = root 街`。`Contestant.leaf_values` + advisor 透传；探针
+  `--depth-limit`/`--leaf-hands`（depth_limit 时先 self-play 建表喂 hero）。
+- 端到端测试 `depth_limited_subgame_cfr_runs_through_leaf_values`：截断子树 ≪ 全子树、叶子全映射全局节点、
+  CFR 跑通（叶子当 Terminal 走值表）、同 seed byte-equal。
+
+### 11.4 待办
+
+- **6b-4（biased 多值叶子选择节点）**：现 step-1 固定 `cont=0`（unbiased）= 等价「depth-limit 单值叶子」，
+  **还不是** Modicum/Pluribus 的鲁棒机制。6b-4 把叶子改成「对手在 N 个 biased 续局里选」的 CFR 选择节点
+  （infoset-level，§6 #3）——值表的 4 续局已就绪，缺 subgame 叶子层的选择节点 + payoff 按所选 cont 取值。
+- **6b-5（探针 + vultr 回归）**：用 `--depth-limit` 跑「depth-limit all-postflop vs §10.5 解到终局 all-postflop」
+  A/B——验 depth-limit 是否避开 §10.5 的深层欠训练退化（−407→?）。**真 A/B 正收益判决待更好 blueprint**
+  （§2：当前 blueprint 对 all-postflop 搜索太弱；6b 基建先就位）。
+
+### 11.5 已知近似（解读探针时记住）
+
+- **叶子值 = per-seat marginal range 下 self-play 均值**（同 §5b 工程折中）；街起点高频 → 覆盖好，但 miss
+  退 unbiased→0（罕见、记为已知近似）。
+- **叶子层无显式 chance**：叶子值已是「下一街起点」EV，turn/river 牌由 per-step resample 隐式积分（街起点
+  bucket 随 resample 的 runout 变）→ 自然处理 chance，无需额外节点。
+- **续局系数 ×5 是 HU/Pluribus 经验值**，6-max 多街多人须消融重标（6b-4 后）。
+
+---
+
 ## 附：引用 + 关键 `file:line` 索引
 
 **文献**
