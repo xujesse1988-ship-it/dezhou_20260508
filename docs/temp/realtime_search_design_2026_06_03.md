@@ -642,15 +642,22 @@ n_cont × n_players`）→ 6-max blueprint（`total_rows ~9e7`）× 4 续局 × 
   `--depth-limit`/`--leaf-hands`（depth_limit 时先 self-play 建表喂 hero）。
 - 端到端测试 `depth_limited_subgame_cfr_runs_through_leaf_values`：截断子树 ≪ 全子树、叶子全映射全局节点、
   CFR 跑通（叶子当 Terminal 走值表）、同 seed byte-equal。
+- **真 1B nolimp ckpt depth-limit smoke（flop-first，100 手/座 = 600 手，leaf-hands 20000）**：叶子值表从
+  1B blueprint self-play 建成 **78949 项**（unbiased 覆盖 20503）、**无 OOM**（峰值 RSS 2.6 GiB）；**desync=0 /
+  illegal=0**（depth-limit 路径在真数据上 plumbing 健康——叶子→全局映射 + 值表查询 + CFR 不破 lockstep/记账）；
+  search 触发 66 / 真搜索 65（fallback 1.5%）。mbb/g = −417（600 手 SE 564 → 纯噪声，不判强弱）。→ **depth-limit
+  端到端在真 6-max blueprint 上跑通**。
 
 ### 11.4 待办
 
 - **6b-4（biased 多值叶子选择节点）**：现 step-1 固定 `cont=0`（unbiased）= 等价「depth-limit 单值叶子」，
   **还不是** Modicum/Pluribus 的鲁棒机制。6b-4 把叶子改成「对手在 N 个 biased 续局里选」的 CFR 选择节点
   （infoset-level，§6 #3）——值表的 4 续局已就绪，缺 subgame 叶子层的选择节点 + payoff 按所选 cont 取值。
-- **6b-5（探针 + vultr 回归）**：用 `--depth-limit` 跑「depth-limit all-postflop vs §10.5 解到终局 all-postflop」
-  A/B——验 depth-limit 是否避开 §10.5 的深层欠训练退化（−407→?）。**真 A/B 正收益判决待更好 blueprint**
-  （§2：当前 blueprint 对 all-postflop 搜索太弱；6b 基建先就位）。
+- **6b-5（探针 + vultr 回归）**：smoke 已过（见 §11.3 末）。**待跑的核心 A/B** = `--depth-limit --trigger
+  all-postflop --resolve round-start` vs §10.5 解到终局 all-postflop（−407/−192）——验 depth-limit 是否避开
+  §10.5 的深层欠训练退化（解当前街浅子树 + blueprint 叶子值，不再解深层欠训练节点）。需 ~24k 手 + 更高
+  leaf-hands（turn/river 叶子覆盖）。**真 A/B 正收益判决待更好 blueprint**（§2：当前 blueprint 对 all-postflop
+  太弱；6b 基建先就位、blueprint 好了即测）。
 
 ### 11.5 已知近似（解读探针时记住）
 

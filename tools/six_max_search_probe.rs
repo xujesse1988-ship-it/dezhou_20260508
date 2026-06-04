@@ -107,7 +107,7 @@ fn run() -> Result<(), String> {
     );
     eprintln!(
         "[six_max_search_probe] search: iterations={} max_subtree_nodes={} seed=0x{:016x} \
-         range={} trigger={:?} resolve={:?} （解到终局无 blueprint 叶子）",
+         range={} trigger={:?} resolve={:?} leaf={}",
         args.search.iterations,
         args.search.max_subtree_nodes,
         args.search.seed,
@@ -117,7 +117,12 @@ fn run() -> Result<(), String> {
             "uniform(MVP)"
         },
         args.search.trigger,
-        args.search.resolve_root
+        args.search.resolve_root,
+        if args.search.depth_limit {
+            "6b depth-limit 截当前街 + blueprint 续局值"
+        } else {
+            "6a 解到终局无 blueprint 叶子"
+        }
     );
 
     // 6b depth-limit：先用同一 blueprint 跑 self-play 建叶子续局值表（unbiased + 默认 4 续局）。
