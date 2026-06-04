@@ -371,6 +371,25 @@ fn print_report(r: &CrossAbstractionH2hReport) {
         "  search: 触发 {} 决策点, 真搜索 {} (fallback {:.1}% → 回落 blueprint)",
         r.search_attempts, r.search_successes, fallback_pct
     );
+    if r.search_solves_measured > 0 && r.search_traverser_steps > 0 {
+        let waste_pct = 100.0 * r.search_wasted_steps as f64 / r.search_traverser_steps as f64;
+        let mean_eff = r.search_effective_seats_sum as f64 / r.search_solves_measured as f64;
+        let speedup = if waste_pct < 100.0 {
+            1.0 / (1.0 - waste_pct / 100.0)
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "  traverser 浪费: {}/{} 步 ({:.1}%) 落弃牌/all-in 座（零学习）; 均有效座 {:.2}/{} \
+             → 修复(traverser 只轮 live 座)潜在 effective-iters ×{:.2}",
+            r.search_wasted_steps,
+            r.search_traverser_steps,
+            waste_pct,
+            mean_eff,
+            r.n_players,
+            speedup,
+        );
+    }
     if r.search_attempts == 0 {
         println!("  ⚠ search 从未触发（flop 未起注首决策点 0 次命中）—— mbb/g 必 ≈0，探针无意义");
     } else if fallback_pct > 80.0 {

@@ -351,6 +351,39 @@ pub struct Contestant<'a> {
 pub struct SearchObserver {
     pub attempts: AtomicU64,
     pub successes: AtomicU64,
+    /// 审核遥测：subgame CFR 的 traverser 在 `[0, n_seats)` 轮转（`trainer.rs` ES `step`），但
+    /// 子树里**弃牌 / all-in 座位零决策节点**（规则引擎只让 `Active` 座当 `current_player`）→
+    /// 这些座当 traverser 的那一步纯零学习（采一条路径、算个收益、丢弃、不累积任何 regret/σ）。
+    /// 下列计数实测浪费比例：`traverser_steps` = 真跑 CFR 的 solve 的 Σ`iterations`；`wasted_steps`
+    /// = 其中 traverser 落在弃牌/all-in 座的步数；`effective_seats_sum`/`solves_measured` = 算均
+    /// 有效座位数（= 子树根仍 `Active` 的座数 = 有决策节点的充要集）。
+    pub traverser_steps: AtomicU64,
+    pub wasted_steps: AtomicU64,
+    pub effective_seats_sum: AtomicU64,
+    pub solves_measured: AtomicU64,
+}
+
+impl SearchObserver {
+    /// 记一次真跑 CFR（[`subgame_search`] 返回 `Ok`）的 subgame solve 的 traverser 浪费。
+    /// `active[seat]` = 该座在子树根仍 `Active`（= 子树里有 ≥1 决策节点的充要条件：`Active` 座
+    /// 必在本街某线行动，`Folded`/`AllIn` 座永不行动）。ES traverser 调度从 `update_count == 0`
+    /// 起 = 第 `t` 步 traverser `= t % n`，故座 `s` 摊到 `iterations/n (+1 if s < iterations%n)` 步。
+    fn record_solve_waste(&self, iterations: u64, n: usize, active: &[bool]) {
+        let mut wasted = 0u64;
+        let mut eff = 0u64;
+        for (s, &act) in active.iter().enumerate().take(n) {
+            if act {
+                eff += 1;
+            } else {
+                wasted += iterations / n as u64 + u64::from((s as u64) < iterations % n as u64);
+            }
+        }
+        self.traverser_steps
+            .fetch_add(iterations, Ordering::Relaxed);
+        self.wasted_steps.fetch_add(wasted, Ordering::Relaxed);
+        self.effective_seats_sum.fetch_add(eff, Ordering::Relaxed);
+        self.solves_measured.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// 一手跨抽象对局的失败原因。
@@ -488,6 +521,14 @@ pub fn play_cross_abstraction_hand(
                     Ok(d) => {
                         if let Some(o) = search_obs {
                             o.successes.fetch_add(1, Ordering::Relaxed);
+                            // 实测 traverser 浪费：子树根 = root_state（CurrentDecision = auth /
+                            // RoundStart = round_start）；有决策节点的座 = 根仍 Active 的座。
+                            let active: Vec<bool> = root_state
+                                .players()
+                                .iter()
+                                .map(|p| matches!(p.status, PlayerStatus::Active))
+                                .collect();
+                            o.record_solve_waste(scfg.iterations, n, &active);
                         }
                         d
                     }
@@ -626,6 +667,15 @@ pub struct CrossAbstractionH2hReport {
     /// = 1 - successes/attempts。两者均为 0 = 无参赛者配 search（纯 blueprint，旧行为）。
     pub search_attempts: u64,
     pub search_successes: u64,
+    /// 审核遥测（[`SearchObserver`]）：subgame CFR traverser 浪费——`search_traverser_steps` =
+    /// 真跑 solve 的 Σ`iterations`；`search_wasted_steps` = 其中 traverser 落弃牌/all-in 座的零
+    /// 学习步；`search_effective_seats_sum`/`search_solves_measured` = 算均有效座位数。浪费比
+    /// = `wasted/traverser_steps`，修复（traverser 只轮 live 座）的潜在 effective-iters 加速 =
+    /// `1/(1−浪费比)`。
+    pub search_traverser_steps: u64,
+    pub search_wasted_steps: u64,
+    pub search_effective_seats_sum: u64,
+    pub search_solves_measured: u64,
     /// 逐手 hero 净 PnL（chips），**对齐完整 task 列表**（`hero_seat × hand_idx`，长
     /// `hands_attempted`）：`Some(pnl)` = 计入手，`None` = desync/illegal 排除。两次同 `seed`/
     /// `hands_per_seat` 的 h2h 的本向量**逐下标同手**（同发牌+同 sample rng 流，仅搜索配置不同）→
@@ -762,6 +812,10 @@ pub fn evaluate_cross_abstraction_h2h(
         per_position_hands: per_pos_hands,
         search_attempts: search_obs.attempts.load(Ordering::Relaxed),
         search_successes: search_obs.successes.load(Ordering::Relaxed),
+        search_traverser_steps: search_obs.traverser_steps.load(Ordering::Relaxed),
+        search_wasted_steps: search_obs.wasted_steps.load(Ordering::Relaxed),
+        search_effective_seats_sum: search_obs.effective_seats_sum.load(Ordering::Relaxed),
+        search_solves_measured: search_obs.solves_measured.load(Ordering::Relaxed),
         per_hand_pnl,
     }
 }
