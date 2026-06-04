@@ -119,7 +119,11 @@ fn run() -> Result<(), String> {
         args.search.trigger,
         args.search.resolve_root,
         if args.search.depth_limit {
-            "6b depth-limit 截当前街 + blueprint 续局值"
+            if args.search.biased_leaf {
+                "6b depth-limit 截当前街 + biased 续局(下一 actor argmax)"
+            } else {
+                "6b depth-limit 截当前街 + unbiased 续局"
+            }
         } else {
             "6a 解到终局无 blueprint 叶子"
         }
@@ -319,6 +323,8 @@ fn parse_args() -> Result<Args, String> {
             "--uniform-range" => search.use_blueprint_range = false,
             // 6b：depth-limit 搜索（子树街边界截断 + 叶子查 blueprint 续局值，绕开深层欠训练）。
             "--depth-limit" => search.depth_limit = true,
+            // 6b-4：叶子续局用 biased（下一 actor argmax）= Modicum/Pluribus 鲁棒机制；否则 unbiased。
+            "--biased-leaf" => search.biased_leaf = true,
             "--leaf-hands" => {
                 leaf_hands = next(&mut it, "--leaf-hands")?
                     .parse()

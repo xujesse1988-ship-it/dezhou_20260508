@@ -50,21 +50,51 @@ use crate::training::sampling::sample_discrete;
 use crate::training::subgame_leaf_value::LeafValueTables;
 use crate::training::trainer::{EsMccfrTrainer, Trainer};
 
+/// depth-limit 叶子查哪个续局值（[`SubgameLeafCtx::cont_policy`]）。
+///
+/// # `BiasedNextActor` 为何是「叶子续局选择节点」的闭式等价（§6 #3）
+///
+/// 设计 §6 #3 要求续局的「选」是 subgame 里**由 CFR 优化的真 action、infoset-level**（非固定
+/// per-node min/max）。**关键观察**：depth-limit 叶子**无下游**（截断点之后不再展开）→ 在该叶子
+/// 插一个「下一 actor `a` 选续局」的 CFR 决策节点时，`a` 对续局 `c` 的反事实效用 = `value[a][c]`
+/// （选 c 后 a 的叶子值），**与任何下游策略无关** → `a` 的 best response 是**纯 argmax**
+/// `c* = argmax_c value[a][c]`（regret-matching 对无下游的叶子选择必收敛到纯最优）。故显式 CFR
+/// 选择节点收敛后 = 闭式 `c*`，对 traverser 的叶子值 = `value[traverser][c*]`。**二者逐点相等**
+/// （ES-MCCFR 下闭式还**去掉了 a 学习的瞬态噪声 + 采样方差** → 更快更稳）。
+///
+/// `c*` 只依赖 `a` 的 infoset（`a` 的 bucket + 叶子全局节点），**不依赖 traverser 的私牌**
+/// （非 clairvoyant）→ 满足 §6 #3「infoset-level，对手按自身信息选」。`a` = 叶子 `player_acting`
+/// （下一街首 actor，必在手）→ self-interested opponent（§1.2 endorse，非「全桌串通超级对手」
+/// min 那个过保守版）。
+///
+/// **近似（§11.5）**：值表是「全桌同用 style c」的对称 self-play 值（6b-2 的 (b) 口径），故
+/// `c*` = 「若全桌都采 style c 则 a 最优的 c」≈ a 的单边最优 style（非 Modicum 精确的「a 变、
+/// 其余 blueprint 固定」）；单 chooser（下一 actor）近似 §1.2「每个对手各自独立选」。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LeafContPolicy {
+    /// 固定续局 `cont`（6b-3 step-1：0 = unbiased = depth-limit 单值叶子）。
+    Fixed(usize),
+    /// 6b-4：叶子下一 actor `a` 按自身续局值 **argmax** 选 `c*`，traverser 取 `value[traverser][c*]`
+    /// （= 续局选择节点的闭式等价，见类型 doc）。
+    BiasedNextActor,
+}
+
 /// S6 6b depth-limit：subgame 叶子续局值上下文（[`SimplifiedNlheState::leaf_ctx`] 携带，
 /// depth-limit 叶子的 [`SubgameNlheGame::payoff`] 读）。
 ///
 /// `SubgameNlheGame::new_depth_limited` 构建：把子树每个 depth-limit 叶子（本地 `NodeId`）映射
 /// 回 **blueprint 全局树** 的街起点 `NodeId`（`global_by_local`，非叶项 = [`u32::MAX`] 哨兵），
-/// 配 `values`（[`LeafValueTables`]）+ 续局 `cont`，使叶子 `payoff` 能查 `E[U | seat, 全局节点,
-/// bucket, cont]`。弃牌座的叶子值不查表（= 固定 `−committed_total`，见 `payoff`）。
+/// 配 `values`（[`LeafValueTables`]）+ 续局策略 `cont_policy`，使叶子 `payoff` 能查
+/// `E[U | seat, 全局节点, bucket, cont]`。弃牌座的叶子值不查表（= 固定 `−committed_total`）。
 pub struct SubgameLeafCtx {
     /// blueprint 叶子续局值表（与构建 subgame 的 blueprint 同源）。
     pub values: Arc<LeafValueTables>,
     /// `global_by_local[local_node]` = 该 depth-limit 叶子对应的 blueprint 全局街起点 `NodeId`；
     /// 非叶节点 = [`u32::MAX`]（不被读）。
     pub global_by_local: Vec<NodeId>,
-    /// 查哪个续局（6b-3 step-1 固定 0 = unbiased；6b-4 叶子选择节点起按对手所选 cont）。
-    pub cont: usize,
+    /// 续局选择策略（[`LeafContPolicy::Fixed`] = step-1 固定；[`LeafContPolicy::BiasedNextActor`]
+    /// = 6b-4 下一 actor argmax）。
+    pub cont_policy: LeafContPolicy,
 }
 
 /// 以一个中途 public state 为根的 subgame `Game`（S6 6a）。
@@ -171,7 +201,7 @@ impl SubgameNlheGame {
     /// `root_global_node` = `template` 对应的 blueprint 全局节点（[`subgame_search`] 现算：
     /// CurrentDecision = 当前节点 / RoundStart = 街起点）。任一叶子无法映射（同抽象下不应发生，
     /// 防御几何漂移）→ `Err`，调用方回落 blueprint。`ranges` 同 `new_with_ranges`（`None` =
-    /// uniform）。`cont` = 查哪个续局（step-1 固定 0 = unbiased）。
+    /// uniform）。`cont_policy` = 叶子续局选择策略（[`LeafContPolicy`]）。
     #[allow(clippy::too_many_arguments)]
     pub fn new_depth_limited(
         bucket_table: Arc<BucketTable>,
@@ -186,7 +216,7 @@ impl SubgameNlheGame {
         blueprint_tree: &PublicBettingTree,
         root_global_node: NodeId,
         values: Arc<LeafValueTables>,
-        cont: usize,
+        cont_policy: LeafContPolicy,
     ) -> Result<Self, String> {
         debug_assert!(
             !template.is_terminal() && template.current_player().is_some(),
@@ -212,7 +242,7 @@ impl SubgameNlheGame {
         let leaf_ctx = Some(Arc::new(SubgameLeafCtx {
             values,
             global_by_local,
-            cont,
+            cont_policy,
         }));
         let (ranges_opt, hole_combos) = match ranges {
             Some(r) => {
@@ -449,10 +479,14 @@ impl Game for SubgameNlheGame {
 
 /// depth-limit 叶子的 `payoff`（[`SubgameNlheGame::payoff`] 调）。
 ///
-/// **弃牌座**：净收益固定 = `−committed_total`（已投入全损、不依赖 runout，故不查值表——值表
-/// 只对仍在手座位累计，见 [`SubgameLeafCtx`]）。**在手座（Active/AllIn）**：查
-/// `values.value(player, 全局街起点节点, 该街 bucket, cont)`；该续局缺 → 退 unbiased(cont 0)；
-/// 仍缺（街起点高频、miss 罕见）→ 0（已知近似，§见模块顶部 doc）。
+/// **弃牌座**：净收益固定 = `−committed_total`（已投入全损、不依赖 runout / 续局，故不查值表——
+/// 值表只对仍在手座位累计，见 [`SubgameLeafCtx`]）。**在手座（Active/AllIn）**：按
+/// [`LeafContPolicy`] 选续局 `c`，查 `values.value(player, 全局街起点节点, 该街 bucket, c)`：
+/// - `Fixed(c)`：固定续局（step-1，0 = unbiased）。
+/// - `BiasedNextActor`（6b-4）：先令叶子下一 actor `a` 按**自身**续局值 argmax 选 `c*`
+///   （= 续局选择节点的闭式等价，见 [`LeafContPolicy`] doc），再取 `value[player][c*]`。
+///
+/// 任一查询缺 → 退 unbiased(cont 0)；仍缺（街起点高频、miss 罕见）→ 0（已知近似，§模块顶部 doc）。
 fn leaf_payoff(state: &SimplifiedNlheState, player: PlayerId, leaf_street: StreetTag) -> f64 {
     let p = &state.game_state.players()[player as usize];
     if matches!(p.status, PlayerStatus::Folded) {
@@ -467,11 +501,44 @@ fn leaf_payoff(state: &SimplifiedNlheState, player: PlayerId, leaf_street: Stree
         // 未映射叶子（new_depth_limited 构建期已 Err 排除，此为防御兜底）。
         return 0.0;
     }
+    // 选续局 c：Fixed 直接用；BiasedNextActor 令下一 actor a 按自身续局值 argmax（无下游 →
+    // 纯 best response = CFR 选择节点收敛值，§见 LeafContPolicy doc）。a = 叶子 player_acting。
+    let cont = match ctx.cont_policy {
+        LeafContPolicy::Fixed(c) => c,
+        LeafContPolicy::BiasedNextActor => {
+            let a = state.tree.node(state.current_node_id).player_acting as usize;
+            let bucket_a = compute_hand_bucket(state, a as PlayerId, leaf_street);
+            argmax_cont(&ctx.values, a, global, bucket_a)
+        }
+    };
     let bucket = compute_hand_bucket(state, player, leaf_street);
     ctx.values
-        .value(player as usize, global, bucket, ctx.cont)
+        .value(player as usize, global, bucket, cont)
         .or_else(|| ctx.values.value(player as usize, global, bucket, 0))
         .unwrap_or(0.0)
+}
+
+/// 叶子下一 actor `a` 在 `(global 节点, a 的 bucket)` 上**自身**续局值最大的续局 idx（6b-4
+/// `BiasedNextActor`）。全续局都 miss（无信号）→ 0（unbiased）。**只看 a 自己的 infoset**
+/// （a 的 bucket，非 traverser 私牌）→ infoset-level、非 clairvoyant（§6 #3）。
+fn argmax_cont(values: &LeafValueTables, a: usize, global: NodeId, bucket_a: u32) -> usize {
+    let mut best_c = 0usize;
+    let mut best_v = f64::NEG_INFINITY;
+    let mut found = false;
+    for c in 0..values.n_cont() {
+        if let Some(v) = values.value(a, global, bucket_a, c) {
+            if v > best_v {
+                best_v = v;
+                best_c = c;
+                found = true;
+            }
+        }
+    }
+    if found {
+        best_c
+    } else {
+        0
+    }
 }
 
 /// 从 blueprint 全局树 `from` 节点沿 `tags` 导航，返回落点全局 `NodeId`（[`navigate_subtree`]
@@ -601,6 +668,10 @@ pub struct SubgameSearchConfig {
     /// （绕开深层欠训练节点，§10.5 退化主因）；`false`（默认）= 6a 解到真实终局。`true` 需
     /// [`subgame_search`] 收到 `leaf_values`（否则该次搜索 `Err` 回落 blueprint）。
     pub depth_limit: bool,
+    /// S6 6b-4：`true` = 叶子续局用 [`LeafContPolicy::BiasedNextActor`]（下一 actor argmax 自身续局
+    /// 值 = 续局选择节点闭式等价，Modicum/Pluribus 鲁棒机制）；`false`（默认）= [`LeafContPolicy::Fixed`]
+    /// `(0)` unbiased。仅 `depth_limit=true` 时有意义。
+    pub biased_leaf: bool,
 }
 
 impl Default for SubgameSearchConfig {
@@ -613,6 +684,7 @@ impl Default for SubgameSearchConfig {
             trigger: SearchTrigger::FlopFirstUnraised,
             resolve_root: ResolveRoot::RoundStart,
             depth_limit: false,
+            biased_leaf: false,
         }
     }
 }
@@ -934,6 +1006,12 @@ pub fn subgame_search(
             ResolveRoot::RoundStart => climb_to_street_start(tree, node_id),
         };
         let limit_street = tree.node(root_global).street;
+        // 6b-4：biased_leaf → 下一 actor argmax 选续局（鲁棒机制）；否则固定 unbiased(0)。
+        let cont_policy = if cfg.biased_leaf {
+            LeafContPolicy::BiasedNextActor
+        } else {
+            LeafContPolicy::Fixed(0)
+        };
         SubgameNlheGame::new_depth_limited(
             Arc::clone(&game.bucket_table),
             root_state.config().clone(),
@@ -947,7 +1025,7 @@ pub fn subgame_search(
             tree,
             root_global,
             Arc::clone(values),
-            0, // step-1：固定 unbiased 续局；biased 选择节点 = 6b-4。
+            cont_policy,
         )?
     } else if let Some(ranges) = ranges_opt {
         SubgameNlheGame::new_with_ranges(
@@ -1261,6 +1339,7 @@ mod tests {
             trigger: SearchTrigger::AllPostflop,
             resolve_root: ResolveRoot::RoundStart,
             depth_limit: false,
+            biased_leaf: false,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -1312,6 +1391,7 @@ mod tests {
             trigger: SearchTrigger::AllPostflop,
             resolve_root: ResolveRoot::RoundStart,
             depth_limit: false,
+            biased_leaf: false,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, 0, 0,
@@ -1411,6 +1491,7 @@ mod tests {
             trigger: SearchTrigger::AllPostflop,
             resolve_root: ResolveRoot::RoundStart,
             depth_limit: false,
+            biased_leaf: false,
         };
         let d9 = subgame_search(
             &auth,
@@ -1600,7 +1681,7 @@ mod tests {
                 game.tree(),
                 root_global,
                 Arc::clone(&values),
-                0,
+                LeafContPolicy::Fixed(0),
             )
             .expect("build depth-limited subgame")
         };
@@ -1656,6 +1737,102 @@ mod tests {
                 a.average_strategy(info),
                 b.average_strategy(info),
                 "同 seed depth-limit subgame 策略 byte-equal @ {info:?}"
+            );
+        }
+    }
+
+    /// S6 6b-4：[`argmax_cont`] 选下一 actor **自身**续局值最大的续局（确定性、受控值表）。
+    /// 用 [`LeafValueTables::from_entries_for_test`] 造 seat 0 在 (node 7, bucket 3) 续局值
+    /// [1,5,2,3] → argmax=cont 1；无信号 (seat,node,bucket) → 退 cont 0。
+    #[test]
+    fn argmax_cont_selects_next_actor_best() {
+        let values = LeafValueTables::from_entries_for_test(
+            2,
+            4,
+            0,
+            &[
+                (0, 7, 3, 0, 1.0),
+                (0, 7, 3, 1, 5.0),
+                (0, 7, 3, 2, 2.0),
+                (0, 7, 3, 3, 3.0),
+            ],
+        );
+        assert_eq!(
+            argmax_cont(&values, 0, 7, 3),
+            1,
+            "下一 actor 选自身续局值最大的 cont 1（5.0）"
+        );
+        assert_eq!(
+            argmax_cont(&values, 0, 7, 99),
+            0,
+            "该 (seat,node,bucket) 无条目（全 miss）→ 退 unbiased 0"
+        );
+        assert_eq!(argmax_cont(&values, 1, 7, 3), 0, "seat 1 无条目 → 退 0");
+    }
+
+    /// S6 6b-4：[`LeafContPolicy::BiasedNextActor`] 端到端——depth-limit subgame 叶子按下一 actor
+    /// argmax 选续局，`EsMccfrTrainer` 跑通（叶子 payoff 走 argmax_cont → value 路径不 panic）+
+    /// 同 seed byte-equal 可复现。argmax 选择正确性由 [`argmax_cont_selects_next_actor_best`] 钉死。
+    #[test]
+    fn biased_leaf_subgame_cfr_runs_and_reproducible() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x4254_4C5F_4249_4153); // "BTL_BIAS"
+        let template = flop.game_state.clone();
+        let root_global = flop.current_node_id;
+        let limit = game.tree().node(root_global).street;
+
+        let trainer = DenseNlheEsMccfrTrainer::new(
+            SimplifiedNlheGame::new(stub_table()).expect("HU game"),
+            11,
+        );
+        let values = Arc::new(build_leaf_value_tables(
+            &trainer,
+            &default_continuations(),
+            800,
+            0xB1A5,
+            400,
+        ));
+
+        let make = || {
+            SubgameNlheGame::new_depth_limited(
+                stub_table(),
+                TableConfig::default_hu_200bb(),
+                StreetActionAbstraction::default_6_action(),
+                BettingAbstractionRules::default(),
+                template.clone(),
+                0,
+                0,
+                None,
+                limit,
+                game.tree(),
+                root_global,
+                Arc::clone(&values),
+                LeafContPolicy::BiasedNextActor, // 6b-4：叶子 argmax 续局
+            )
+            .expect("build biased depth-limited subgame")
+        };
+
+        let steps = 400u64;
+        let run = |seed: u64| {
+            let mut tr = EsMccfrTrainer::new(make(), seed);
+            let mut rng = ChaCha20Rng::from_seed(seed ^ 0xB1A5_C0DE);
+            for _ in 0..steps {
+                tr.step(&mut rng).expect("biased depth-limit subgame step");
+            }
+            tr
+        };
+        let a = run(0xB4);
+        let b = run(0xB4);
+        assert_eq!(a.update_count(), steps);
+        assert!(
+            !a.strategy_sum().inner().is_empty(),
+            "biased depth-limit subgame CFR 应累积到 ≥1 infoset"
+        );
+        for (info, _) in a.strategy_sum().inner().iter() {
+            assert_eq!(
+                a.average_strategy(info),
+                b.average_strategy(info),
+                "同 seed biased 叶子 subgame 策略 byte-equal @ {info:?}"
             );
         }
     }

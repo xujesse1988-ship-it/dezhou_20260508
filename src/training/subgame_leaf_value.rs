@@ -183,6 +183,31 @@ impl LeafValueTables {
             .filter(|k| ((*k >> 56) & 0xff) as u8 == c)
             .count() as u64
     }
+
+    /// 测试用：从显式 `(seat, node, bucket, cont, value)` 条目直接造表（绕过 self-play），
+    /// 让 6b-4 `argmax_cont` / 叶子选择逻辑可在受控值下确定性测试。pos 用与 [`value`](Self::value)
+    /// 同一 `(seat+n−button)%n` 映射 + [`pack_key`]，故 `value(seat,..)` 能命中这些条目。
+    #[cfg(test)]
+    pub(crate) fn from_entries_for_test(
+        n_players: usize,
+        n_cont: usize,
+        button: u8,
+        entries: &[(usize, NodeId, u32, usize, f64)],
+    ) -> LeafValueTables {
+        let mut mean = HashMap::new();
+        for &(seat, node, bucket, cont, v) in entries {
+            let pos = ((seat + n_players - button as usize) % n_players) as u8;
+            mean.insert(pack_key(node, bucket, pos, cont as u8), v);
+        }
+        LeafValueTables {
+            n_players,
+            n_cont,
+            button,
+            update_count: 0,
+            bucket_blake3: [0u8; 32],
+            mean,
+        }
+    }
 }
 
 /// 一个节点是否**街起点**（其 parent 在更浅的街 → 本节点是跨街后的首决策点 = 唯一可能成为

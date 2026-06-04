@@ -1046,6 +1046,7 @@ mod tests {
             trigger: SearchTrigger::AllPostflop,
             resolve_root: ResolveRoot::RoundStart,
             depth_limit: false,
+            biased_leaf: false,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;
