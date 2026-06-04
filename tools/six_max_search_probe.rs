@@ -31,8 +31,10 @@
 //!   --reshape nolimp --postflop-cap 3 \
 //!   --checkpoint artifacts/run_6max_s4_nolimp/nlhe_es_mccfr_final_001000000000.ckpt \
 //!   --hands-per-seat 2000 --search-iterations 1000
-//!   # --trigger flop-first(默认,不退化) | all-postflop(研究:朴素放宽实测退化 §10.4)；
+//!   # --trigger flop-first(默认,窄) | all-postflop(宽,放宽触发面)
+//!   # --resolve round-start(默认,§6 #1 正确) | current-decision(旧 MVP,撞 landmine,A/B)
 //!   # --uniform-range 关 §5b 作 MVP 对照
+//!   # §10.5 关键 A/B：all-postflop × {round-start vs current-decision} 验 round-start 修复退化
 //! ```
 
 use std::process::ExitCode;
@@ -47,7 +49,7 @@ use poker::training::nlhe_betting_tree::{
     BettingAbstractionRules,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
-use poker::training::{SearchTrigger, SubgameSearchConfig};
+use poker::training::{ResolveRoot, SearchTrigger, SubgameSearchConfig};
 use poker::{BucketTable, InfoSetId, StreetActionAbstraction, TableConfig};
 
 fn main() -> ExitCode {
@@ -101,7 +103,7 @@ fn run() -> Result<(), String> {
     );
     eprintln!(
         "[six_max_search_probe] search: iterations={} max_subtree_nodes={} seed=0x{:016x} \
-         range={} trigger={:?} （解到终局无 blueprint 叶子）",
+         range={} trigger={:?} resolve={:?} （解到终局无 blueprint 叶子）",
         args.search.iterations,
         args.search.max_subtree_nodes,
         args.search.seed,
@@ -110,7 +112,8 @@ fn run() -> Result<(), String> {
         } else {
             "uniform(MVP)"
         },
-        args.search.trigger
+        args.search.trigger,
+        args.search.resolve_root
     );
 
     // 同一 trainer 的 dense average strategy，hero/field 共用（blueprint 完全相同）；
@@ -276,7 +279,7 @@ fn parse_args() -> Result<Args, String> {
             }
             // A/B 对照：关 §5b range，回 uniform resample（MVP 旧行为）。
             "--uniform-range" => search.use_blueprint_range = false,
-            // 触发面：all-postflop（默认，宽）vs flop-first（窄，A/B 基线）。
+            // 触发面：all-postflop（宽）vs flop-first（默认，窄 A/B 基线）。
             "--trigger" => {
                 search.trigger = match next(&mut it, "--trigger")?.as_str() {
                     "all-postflop" => SearchTrigger::AllPostflop,
@@ -284,6 +287,18 @@ fn parse_args() -> Result<Args, String> {
                     other => {
                         return Err(format!(
                             "unknown --trigger {other} (expected all-postflop | flop-first)"
+                        ))
+                    }
+                }
+            }
+            // 重解根（§6 #1）：round-start（默认，正确）vs current-decision（旧 MVP，A/B）。
+            "--resolve" => {
+                search.resolve_root = match next(&mut it, "--resolve")?.as_str() {
+                    "round-start" => ResolveRoot::RoundStart,
+                    "current-decision" => ResolveRoot::CurrentDecision,
+                    other => {
+                        return Err(format!(
+                            "unknown --resolve {other} (expected round-start | current-decision)"
                         ))
                     }
                 }

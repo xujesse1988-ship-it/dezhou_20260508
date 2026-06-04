@@ -43,7 +43,7 @@ use crate::training::nlhe::{
     SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
 };
 use crate::training::nlhe_betting_tree::{
-    AbstractActionTag, BettingAbstractionRules, NodeId, PublicBettingTree,
+    AbstractActionTag, BettingAbstractionRules, Child, NodeId, PublicBettingTree,
 };
 use crate::training::sampling::sample_discrete;
 use crate::training::trainer::{EsMccfrTrainer, Trainer};
@@ -200,24 +200,28 @@ impl SubgameNlheGame {
         &self.template
     }
 
-    /// 在 subtree root 为 **template 携带的真实手牌**构造查询 `(InfoSetId, 合法动作)`。
+    /// 在**任意 subtree 节点** `node_id` 为给定 `game_state`（提供真实手牌 + board + 当前
+    /// betting 几何）构造查询 `(InfoSetId, 合法动作)`。
     ///
-    /// 实时搜索 solve 完后用它索引 hero 真实手在 root 的策略：`template` = `auth.clone()`
-    /// 带 actor 的真实底牌 + 真实 board，故 [`SimplifiedNlheGame::info_set`] 算出的就是
-    /// hero 真实手的 bucket（"对全 range 求解、事后索引真实桶"，设计 §10.1）。返回的
-    /// 合法动作顺序与 [`Trainer::average_strategy`](crate::training::trainer::Trainer::average_strategy)
-    /// 向量逐位对齐（同一 subtree root 节点的 `legal_actions`，D-209 序）。
-    pub fn root_query(&self) -> (SimplifiedNlheInfoSet, Vec<SimplifiedNlheAction>) {
-        let actor = self
-            .template
-            .current_player()
-            .expect("subgame template 必是 decision 节点")
-            .0 as PlayerId;
+    /// 实时搜索 solve 完后用它索引 hero 真实手在该节点的策略：`game_state` 须是**当前决策点
+    /// 的权威态**（`auth`）——`info_set` 只读 board + actor 真实底牌 + `node_id` 的 betting 维度
+    /// （node.street），`legal_actions` 按 `game_state` 几何算全集再过滤到 `node_id.legal_actions`。
+    /// **不能用 round-start `template`** 当 game_state 查深层节点：round-start 几何与深层节点的
+    /// 合法集不符，会把 `legal_actions` 过滤错（round-start re-solve 关键，见 [`subgame_search`]）。
+    /// actor 由 `node_id` 的 `player_acting` 给出（= 该节点决策者）。返回的合法动作顺序与
+    /// [`Trainer::average_strategy`](crate::training::trainer::Trainer::average_strategy) 向量逐位
+    /// 对齐（同一 subtree 节点的 `legal_actions`，D-209 序）。
+    pub fn query_at(
+        &self,
+        node_id: NodeId,
+        game_state: &GameState,
+    ) -> (SimplifiedNlheInfoSet, Vec<SimplifiedNlheAction>) {
+        let actor = self.subtree.node(node_id).player_acting;
         let query = SimplifiedNlheState {
-            game_state: self.template.clone(),
+            game_state: game_state.clone(),
             action_history: Vec::new(),
             bucket_table: Arc::clone(&self.bucket_table),
-            current_node_id: self.subtree.root_id(),
+            current_node_id: node_id,
             tree: Arc::clone(&self.subtree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(0),
@@ -226,6 +230,45 @@ impl SubgameNlheGame {
         let legal = SimplifiedNlheGame::legal_actions(&query);
         (info, legal)
     }
+
+    /// 在 subtree root 为 `template` 携带的真实手牌构造查询（= [`query_at`](Self::query_at)
+    /// 在 root + template 上的特化；CurrentDecision 模式下 template = `auth`，几何一致）。
+    pub fn root_query(&self) -> (SimplifiedNlheInfoSet, Vec<SimplifiedNlheAction>) {
+        self.query_at(self.subtree.root_id(), &self.template)
+    }
+}
+
+/// 从 subtree root 沿 `tags`（round-start→当前的 within-round 抽象动作序）逐边导航，返回当前
+/// 决策节点的 subtree-local `NodeId`。`tags` 空（CurrentDecision / round-start 首决策）→ 返回 root。
+///
+/// 每步在当前节点 `legal_actions` 里按 tag 定位 edge → 取 `children[idx]`。tag 不在合法集
+/// （real-geometry subtree 与 blueprint abstract-geometry 漂移 / 影子失同步）或导向终局（不应
+/// 到达）→ `Err`，[`subgame_search`] 回落 blueprint。同质 on-tree 自对弈下 real==abstract 几何、
+/// 必命中。
+fn navigate_subtree(
+    subtree: &PublicBettingTree,
+    tags: &[AbstractActionTag],
+) -> Result<NodeId, String> {
+    let mut id = subtree.root_id();
+    for tag in tags {
+        let node = subtree.node(id);
+        let idx = node
+            .legal_actions
+            .iter()
+            .position(|t| t == tag)
+            .ok_or_else(|| {
+                format!("within-round tag {tag:?} 不在 subtree 节点 {id} 合法集（几何漂移/失同步）")
+            })?;
+        match node.children[idx] {
+            Child::Decision(next) => id = next,
+            Child::Terminal => {
+                return Err(format!(
+                    "within-round tag {tag:?} 导向 subtree 终局（不应到达）"
+                ))
+            }
+        }
+    }
+    Ok(id)
 }
 
 impl Game for SubgameNlheGame {
@@ -334,9 +377,28 @@ impl Game for SubgameNlheGame {
 pub enum SearchTrigger {
     /// 仅 flop **未起注**首决策点（= betting-round 起点，§6 #1 下"恰好正确"，默认）。
     FlopFirstUnraised,
-    /// 任意 postflop 决策点（flop 含已起注 / turn / river）。**朴素放宽实测退化**（见上）——
-    /// 须先实现 §6 round-start re-solve 才正确；当前仅研究 opt-in。
+    /// 任意 postflop 决策点（flop 含已起注 / turn / river）。配 [`ResolveRoot::RoundStart`]
+    /// 才正确（§6 #1）；配 [`ResolveRoot::CurrentDecision`]（旧 MVP）撞 landmine 实测退化（§10.4）。
     AllPostflop,
+}
+
+/// subgame 重解的**根**取在哪（设计 §6 #1：landmine #1）。
+///
+/// `AllPostflop` 触发面下，从**当前决策点**独立重解（[`CurrentDecision`](Self::CurrentDecision)）
+/// 撞 §6 #1/#2 landmine——mid-round 决策用 blueprint-at-current-point 的噪声 range、且多决策
+/// 各自重解（不同均衡）互斥 → 实测结构性退化（§10.4：all-postflop −192~−426）。
+/// [`RoundStart`](Self::RoundStart) 从 **betting-round 起点**重解、当前街 betting 落入 subgame 由
+/// CFR 解（range 用更可靠的轮起点 reach），并对同一轮的多次行动用 **round-stable seed**（街索引而
+/// 非 decision ordinal）→ within-round 多决策共享**字节相同**的 solve、读不同节点 = 一个均衡内自洽
+/// （= §6 #2「冻结」的一致性意图，无需显式 reach-pin）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolveRoot {
+    /// 从当前决策点为根（MVP 旧行为；byte-equal 保留作 A/B / 回归）。`FlopFirstUnraised` 下
+    /// 当前点 = round-start，与 `RoundStart` 等价；`AllPostflop` 下 mid-round 重解撞 landmine。
+    CurrentDecision,
+    /// 从当前 betting-round 起点为根（§6 #1，默认）。当前街 betting 进 subgame；round-stable
+    /// seed 给 within-round 一致性（§6 #2 意图）。
+    RoundStart,
 }
 
 /// 实时搜索触发 + 求解配置（S6 6a）。`Copy` → 随 `Contestant` 按值带。
@@ -356,8 +418,11 @@ pub struct SubgameSearchConfig {
     /// = uniform resample（MVP 旧行为，留作 A/B 对照）。
     pub use_blueprint_range: bool,
     /// 触发面。默认 [`SearchTrigger::FlopFirstUnraised`]（验证不退化的安全窄触发面；
-    /// `AllPostflop` 朴素放宽实测结构性退化，见 [`SearchTrigger`] doc）。
+    /// `AllPostflop` 须配 [`ResolveRoot::RoundStart`] 才正确，见 [`SearchTrigger`] doc）。
     pub trigger: SearchTrigger,
+    /// 重解根（§6 #1）。默认 [`ResolveRoot::RoundStart`]（正确放宽触发面的前置）。
+    /// `FlopFirstUnraised` 下两模式等价（当前点 = round-start）；`CurrentDecision` 保留作 A/B。
+    pub resolve_root: ResolveRoot,
 }
 
 impl Default for SubgameSearchConfig {
@@ -368,6 +433,7 @@ impl Default for SubgameSearchConfig {
             seed: 0x5347_4D45_5F53_3641, // "SGME_S6A"
             use_blueprint_range: true,
             trigger: SearchTrigger::FlopFirstUnraised,
+            resolve_root: ResolveRoot::RoundStart,
         }
     }
 }
@@ -556,25 +622,36 @@ fn estimate_range(
     range
 }
 
-/// S6 6a MVP 实时搜索：从权威中途局 `auth`（actor 待行动）建单层 subgame、跑 CFR、返回
-/// actor **真实手**在 root 的策略分布——对齐调用方 `legal_abs`（影子的合法集），可直接喂
+/// S6 实时搜索：建 subgame、跑 CFR、返回 actor **真实手**在**当前决策点**的策略分布——对齐
+/// 调用方 `legal_abs`（影子的合法集），可直接喂
 /// [`sample_discrete`](crate::training::sampling::sample_discrete) → `outgoing_action`。
 ///
-/// `game` = 该 actor 的 blueprint game（提供 bucket 表 / 同一 action 抽象 + A3×A4 规则，
-/// subgame 用**同一套**重建子树）。`node_id` = actor 在 blueprint 树的当前节点（= 影子
-/// `current_node_id`；§5b range 估计沿其 public 决策路径累乘 reach）。`strategy` = blueprint
+/// `auth` = 当前决策点的**权威**中途局（提供读 off 用的真实手 + board + betting 几何）。
+/// `root_state` = subgame **根**的状态：[`ResolveRoot::CurrentDecision`] 下调用方传 `auth`；
+/// [`ResolveRoot::RoundStart`]（默认，§6 #1）下传**当前 betting-round 起点快照**（决策环每街首
+/// 决策点的 `auth.clone()`）。`game` = 该 actor 的 blueprint game（bucket 表 / 同一 action 抽象 +
+/// A3×A4 规则，subgame 用**同一套**重建子树）。`node_id` = actor 在 blueprint 树的当前节点（= 影子
+/// `current_node_id`；range 估计 + within-round 导航沿其 public 决策路径）。`strategy` = blueprint
 /// average strategy 查询面（range 估计用；同质 blueprint 假设见 [`estimate_range`]）。
-/// `(hand_seed, decision_ordinal)` 唯一确定本次 solve 的 RNG（可复现 + 跨手独立）。
+///
+/// **RoundStart（§6 #1/#2）**：从 `root_state`（轮起点）建子树（`raises_on_street = 0`、entrants =
+/// 轮起点 live）；range 只用**当前街之前**的 reach（当前街 betting 已落入 subgame、由 CFR 解，不
+/// 重复计入 history）；seed 用**街索引**（round-stable）而非 `decision_ordinal` → 同一轮多次行动得
+/// **字节相同**的 solve；解完沿 within-round 抽象动作序导航到当前决策点、读真实手该节点策略（用
+/// `auth` 几何 query）。round-stable solve + 读不同节点 = 一个均衡内自洽（§6 #2 一致性意图）。
+/// **CurrentDecision**：从 `auth` 为根、range 用全 reach、seed 用 `decision_ordinal`、读 root（MVP
+/// 旧行为，byte-equal A/B）。
 ///
 /// `cfg.use_blueprint_range`：`true` → root 按 per-seat blueprint range 加权采样底牌（§5b 去
-/// confound）；`false` → uniform resample（MVP 旧行为，A/B 对照）。
+/// confound）；`false` → uniform resample（A/B 对照）。
 ///
-/// 任一失败（auth 非 decision / 子树越界 / root 桶在 `iterations` 内未被访问 / 维度不符 /
-/// `legal_abs` 含 subtree root 没有的 tag = 影子与 auth 失同步 / 对齐后全零）→ `Err`，
+/// 任一失败（auth/root_state 非 decision / 子树越界 / within-round 导航失同步 / 当前桶在
+/// `iterations` 内未被访问 / 维度不符 / `legal_abs` 含子树没有的 tag / 对齐后全零）→ `Err`，
 /// 调用方按设计 §4.1 回落 blueprint `strategy_distribution`。
 #[allow(clippy::too_many_arguments)]
 pub fn subgame_search(
     auth: &GameState,
+    root_state: &GameState,
     game: &SimplifiedNlheGame,
     legal_abs: &[SimplifiedNlheAction],
     node_id: NodeId,
@@ -586,24 +663,74 @@ pub fn subgame_search(
     if auth.is_terminal() || auth.current_player().is_none() {
         return Err("subgame_search: auth 非 decision 节点".to_string());
     }
-    // 沿 actor 在 blueprint 树的 public 决策路径现算（一次，供 raises + §5b range 共用）：
-    //   entrants = postflop live bitmask；raises_on_street = 当前街进攻数（任意 postflop 节点
-    //   正确，含 raised flop / turn / river——放宽触发面的关键，§10.1 审核 A 的多档计数）。
-    let decisions = decisions_on_path(game.tree(), node_id);
-    let entrants = live_entrants(auth);
-    let raises_on_street =
-        raises_on_current_street(&decisions, game.tree(), game.tree().node(node_id).street);
+    if root_state.is_terminal() || root_state.current_player().is_none() {
+        return Err("subgame_search: root_state 非 decision 节点".to_string());
+    }
+    let auth_actor = auth.current_player().expect("checked above").0 as PlayerId;
 
-    // 建 subgame：同 blueprint 的 bucket 表 / action 抽象 + A3×A4 规则，从 auth 中途态为根。
+    // 沿 actor 在 blueprint 树的 public 决策路径分流（按 resolve_root）：
+    //   - entrants：subgame 根的 live bitmask（CurrentDecision = 当前点 / RoundStart = 轮起点）。
+    //   - raises_on_street：subgame 根的当前街进攻数（CurrentDecision 现算 / RoundStart 必 0）。
+    //   - range_decisions：估 range 的决策子集（CurrentDecision 全路径 / RoundStart 只当前街之前）。
+    //   - within_round_tags：subtree root→当前点的导航序（CurrentDecision 空 = 读 root /
+    //     RoundStart = 当前街的 within-round 抽象动作，时序）。
+    //   - seed_ordinal：solve seed 的 ordinal（CurrentDecision = decision_ordinal /
+    //     RoundStart = 街索引，round-stable → within-round 多决策共享同一 solve）。
+    let tree = game.tree();
+    let decisions = decisions_on_path(tree, node_id);
+    let current_street = tree.node(node_id).street;
+    let (entrants, raises_on_street, range_decisions, within_round_tags, seed_ordinal) =
+        match cfg.resolve_root {
+            ResolveRoot::CurrentDecision => {
+                let raises = raises_on_current_street(&decisions, tree, current_street);
+                (
+                    live_entrants(root_state),
+                    raises,
+                    decisions,
+                    Vec::new(),
+                    decision_ordinal,
+                )
+            }
+            ResolveRoot::RoundStart => {
+                // 拆 decisions 为「当前街之前」（range）与「当前街内」（within-round 导航）。
+                // decisions 是 current→root 逆序，within 反转成 round-start→current 时序。
+                let mut prior = Vec::new();
+                let mut within = Vec::new();
+                for (parent_id, tag, player) in decisions {
+                    if (tree.node(parent_id).street as u8) < (current_street as u8) {
+                        prior.push((parent_id, tag, player));
+                    } else {
+                        within.push(tag);
+                    }
+                }
+                within.reverse();
+                (
+                    live_entrants(root_state),
+                    0,
+                    prior,
+                    within,
+                    current_street as u64,
+                )
+            }
+        };
+
+    // 建 subgame：同 blueprint 的 bucket 表 / action 抽象 + A3×A4 规则，从 root_state 为根。
     // §5b：use_blueprint_range → 为每个未弃牌座位估 marginal range，root 按其加权采样底牌；否则 uniform。
     let sub = if cfg.use_blueprint_range {
         let holes = all_hole_combos();
-        let board: Vec<Card> = auth.board().to_vec();
-        let players = auth.players();
+        let board: Vec<Card> = root_state.board().to_vec();
+        let players = root_state.players();
         let ranges: Vec<Vec<f64>> = (0..players.len())
             .map(|seat| {
                 if players[seat].hole_cards.is_some() {
-                    estimate_range(game, strategy, &decisions, &board, seat as PlayerId, &holes)
+                    estimate_range(
+                        game,
+                        strategy,
+                        &range_decisions,
+                        &board,
+                        seat as PlayerId,
+                        &holes,
+                    )
                 } else {
                     Vec::new() // 弃牌座：range 不被读。
                 }
@@ -611,10 +738,10 @@ pub fn subgame_search(
             .collect();
         SubgameNlheGame::new_with_ranges(
             Arc::clone(&game.bucket_table),
-            auth.config().clone(),
+            root_state.config().clone(),
             game.abstraction().clone(),
             game.rules(),
-            auth.clone(),
+            root_state.clone(),
             entrants,
             raises_on_street,
             ranges,
@@ -622,10 +749,10 @@ pub fn subgame_search(
     } else {
         SubgameNlheGame::new(
             Arc::clone(&game.bucket_table),
-            auth.config().clone(),
+            root_state.config().clone(),
             game.abstraction().clone(),
             game.rules(),
-            auth.clone(),
+            root_state.clone(),
             entrants,
             raises_on_street,
         )
@@ -638,8 +765,9 @@ pub fn subgame_search(
         ));
     }
 
-    // 跑 CFR：master seed + step rng 都由 (cfg.seed, hand_seed, decision_ordinal) 确定派生。
-    let master = search_seed(cfg.seed, hand_seed, decision_ordinal);
+    // 跑 CFR：master seed + step rng 都由 (cfg.seed, hand_seed, seed_ordinal) 确定派生。
+    // RoundStart 下 seed_ordinal = 街索引 → 同一轮多决策的 solve 字节相同（§6 #2 一致性）。
+    let master = search_seed(cfg.seed, hand_seed, seed_ordinal);
     let mut trainer = EsMccfrTrainer::new(sub, master);
     let mut srng = ChaCha20Rng::from_seed(master ^ 0xC0FF_EE00_C0FF_EE00);
     for _ in 0..cfg.iterations {
@@ -648,17 +776,29 @@ pub fn subgame_search(
             .map_err(|e| format!("subgame CFR step 失败: {e:?}"))?;
     }
 
-    // 取 actor 真实手在 subtree root 的策略（average strategy，对齐 subtree root 合法动作序）。
-    let (info, sub_legal) = trainer.game().root_query();
+    // 导航到当前决策点（within-round tags 在 subtree 上重放；CurrentDecision 时 tags 空 → root）。
+    let cur_node = navigate_subtree(trainer.game().subtree(), &within_round_tags)?;
+    // 导航落点的决策者须 == 权威当前 actor（否则读到错座的真实手 → 失同步）。
+    let cur_actor = trainer.game().subtree().node(cur_node).player_acting;
+    if cur_actor != auth_actor {
+        return Err(format!(
+            "within-round 导航落点 actor {cur_actor} ≠ 权威当前 actor {auth_actor}（失同步）"
+        ));
+    }
+    // 取 actor 真实手在 cur_node 的策略（average strategy）。**用 auth 几何 query**——cur_node 是
+    // 当前街 betting 后的深层节点，其合法集须用当前几何算（RoundStart 的 round-start template
+    // 几何不符，见 query_at doc）。读 off 的 board/真实手在 auth 与 root_state 同（同街不变）。
+    let (info, sub_legal) = trainer.game().query_at(cur_node, auth);
     let avg = trainer.average_strategy(&info);
     if avg.is_empty() {
         return Err(
-            "subgame root infoset 未被 CFR 访问（该 bucket 在 iterations 内未采样到）".to_string(),
+            "subgame 当前决策 infoset 未被 CFR 访问（该 bucket 在 iterations 内未采样到）"
+                .to_string(),
         );
     }
     if avg.len() != sub_legal.len() {
         return Err(format!(
-            "subgame root 策略维度 {} ≠ 合法动作数 {}",
+            "subgame 当前决策策略维度 {} ≠ 合法动作数 {}",
             avg.len(),
             sub_legal.len()
         ));
@@ -666,7 +806,7 @@ pub fn subgame_search(
 
     // 按 tag 把 subtree 策略对齐到调用方 legal_abs：返回的动作对象必须是**影子的**
     // （供 outgoing_action / 推进影子复用其 ratio_label/to）。tag 唯一（Bet/Raise 带 ratio），
-    // 故一一映射。legal_abs 出现 subtree root 没有的 tag = 影子与 auth 失同步 → Err 回落。
+    // 故一一映射。legal_abs 出现 cur_node 没有的 tag = 影子与 auth 失同步 → Err 回落。
     let prob_by_tag: Vec<(AbstractActionTag, f64)> = sub_legal
         .iter()
         .map(AbstractActionTag::of)
@@ -681,7 +821,7 @@ pub fn subgame_search(
             .find(|(t, _)| *t == tag)
             .map(|(_, p)| *p)
             .ok_or_else(|| {
-                format!("legal_abs tag {tag:?} 不在 subtree root 动作集（影子与 auth 失同步）")
+                format!("legal_abs tag {tag:?} 不在 cur_node 动作集（影子与 auth 失同步）")
             })?;
         if p.is_finite() && p > 0.0 {
             sum += p;
@@ -689,7 +829,7 @@ pub fn subgame_search(
         }
     }
     if !(sum.is_finite() && sum > 0.0) {
-        return Err("subgame root 策略对齐 legal_abs 后全零".to_string());
+        return Err("subgame 当前决策策略对齐 legal_abs 后全零".to_string());
     }
     for (_, p) in out.iter_mut() {
         *p /= sum;
@@ -894,12 +1034,15 @@ mod tests {
         // 用大上限确保不被 cap 拒；stub 全归桶 0 → root infoset 必累积 → Ok 确定。
         // use_blueprint_range=true 走 §5b 路径（estimate_range + 加权采样）；uniform 策略 →
         // range 近均匀（验 range 路径不破契约 + 可复现）。
+        // RoundStart（默认）+ flop 首决策点：round-start == 当前点（无本街 betting），within
+        // tags 空 → 导航回 root；root_state 传 auth（= 该轮起点）。
         let cfg = SubgameSearchConfig {
             iterations: 300,
             max_subtree_nodes: 1_000_000,
             seed: 0xA11C_E55E_5EED_u64,
             use_blueprint_range: true,
             trigger: SearchTrigger::AllPostflop,
+            resolve_root: ResolveRoot::RoundStart,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -907,10 +1050,10 @@ mod tests {
         for hand_seed in 0u64..3 {
             let ordinal = 3u64;
             let r1 = subgame_search(
-                &auth, &game, &legal_abs, node_id, &strat, &cfg, hand_seed, ordinal,
+                &auth, &auth, &game, &legal_abs, node_id, &strat, &cfg, hand_seed, ordinal,
             );
             let r2 = subgame_search(
-                &auth, &game, &legal_abs, node_id, &strat, &cfg, hand_seed, ordinal,
+                &auth, &auth, &game, &legal_abs, node_id, &strat, &cfg, hand_seed, ordinal,
             );
             assert_eq!(
                 r1.is_ok(),
@@ -949,9 +1092,149 @@ mod tests {
             seed: 0xA11C_E55E_5EED_u64,
             use_blueprint_range: true,
             trigger: SearchTrigger::AllPostflop,
+            resolve_root: ResolveRoot::RoundStart,
         };
-        let r = subgame_search(&auth, &game, &legal_abs, node_id, &strat, &tiny, 0, 0);
+        let r = subgame_search(
+            &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, 0, 0,
+        );
         assert!(r.is_err(), "节点上限被触发应回落 Err，实得 {r:?}");
+    }
+
+    /// [`navigate_subtree`]：空 tags → root；非法 tag（flop 未起注 root 必无 Call）→ 优雅 Err。
+    #[test]
+    fn navigate_subtree_empty_and_bad_tag() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x4E41_5654_4553_5430); // "NAVTEST0"
+        let sub = SubgameNlheGame::new(
+            stub_table(),
+            TableConfig::default_hu_200bb(),
+            StreetActionAbstraction::default_6_action(),
+            BettingAbstractionRules::default(),
+            flop.game_state.clone(),
+            0b11,
+            0,
+        );
+        let subtree = sub.subtree();
+        assert_eq!(
+            navigate_subtree(subtree, &[]).expect("空 tags 不应 Err"),
+            subtree.root_id(),
+            "空 tags → root"
+        );
+        let root = subtree.node(subtree.root_id());
+        assert!(
+            !root.legal_actions.contains(&AbstractActionTag::Call),
+            "前置：flop 未起注 root 无 Call"
+        );
+        assert!(
+            navigate_subtree(subtree, &[AbstractActionTag::Call]).is_err(),
+            "非法 tag → Err（不 panic）"
+        );
+    }
+
+    /// §6 #1 round-start 重解（within-round 决策点）：在**已起注** flop 决策点，RoundStart 从
+    /// 轮起点快照为根、沿 within-round tags 导航到当前决策点、读真实手该节点策略。验：
+    /// ①[`navigate_subtree`] 落点 player_acting == 当前 actor（导航正确）；②返回合法归一分布；
+    /// ③**round-stable seed**——RoundStart 用街索引而非 decision_ordinal，故不同 ordinal 字节
+    /// 相同（= §6 #2 一致性机制：同一轮多决策共享同一 solve、读不同节点自洽）。
+    #[test]
+    fn round_start_resolve_navigates_within_round_and_reproducible() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x5253_5F4E_4156_3031); // "RS_NAV01"
+        let round_start = flop.game_state.clone(); // 轮起点（flop 首决策点，无本街 betting）。
+        let rs_actor = round_start.current_player().expect("flop 有行动者");
+
+        // 推进：首行动者 Bet → 进入对手的 within-round flop 决策点。
+        let mut rng = ChaCha20Rng::from_seed(0x5253_5F4E_4156_0002);
+        let drng: &mut dyn RngSource = &mut rng;
+        let bet = SimplifiedNlheGame::legal_actions(&flop)
+            .into_iter()
+            .find(|a| matches!(AbstractActionTag::of(a), AbstractActionTag::Bet(_)))
+            .expect("flop 首决策点应有 Bet 档");
+        let sb = SimplifiedNlheGame::next(flop.clone(), bet, drng);
+        assert_eq!(sb.game_state.street(), Street::Flop, "Bet 后仍 flop");
+        assert!(!sb.game_state.is_terminal() && sb.game_state.current_player().is_some());
+        let cur_actor = sb.game_state.current_player().unwrap();
+        assert_ne!(cur_actor, rs_actor, "Bet 后换人（HU 对手面对 Bet）");
+
+        let auth = sb.game_state.clone();
+        let node_id = sb.current_node_id;
+        let legal_abs = SimplifiedNlheGame::legal_actions(&sb);
+
+        // within-round 决策点：AllPostflop 搜、FlopFirstUnraised 不搜（已起注）。
+        assert!(should_search(&auth, SearchTrigger::AllPostflop));
+        assert!(!should_search(&auth, SearchTrigger::FlopFirstUnraised));
+
+        // ① 直接验导航：从轮起点子树根沿 [Bet] 落到当前 actor 的节点。
+        let rs_sub = SubgameNlheGame::new(
+            stub_table(),
+            TableConfig::default_hu_200bb(),
+            StreetActionAbstraction::default_6_action(),
+            BettingAbstractionRules::default(),
+            round_start.clone(),
+            live_entrants(&round_start),
+            0,
+        );
+        let within_tags = [AbstractActionTag::of(&bet)];
+        let cur_node = navigate_subtree(rs_sub.subtree(), &within_tags).expect("Bet 导航");
+        assert_eq!(
+            rs_sub.subtree().node(cur_node).player_acting,
+            cur_actor.0 as PlayerId,
+            "within-round 导航落点 player_acting == 当前 actor"
+        );
+
+        // ②③ subgame_search RoundStart：root_state = 轮起点快照；round-stable seed 验。
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let cfg = SubgameSearchConfig {
+            iterations: 400,
+            max_subtree_nodes: 1_000_000,
+            seed: 0xB0B0_5EED_u64,
+            use_blueprint_range: true,
+            trigger: SearchTrigger::AllPostflop,
+            resolve_root: ResolveRoot::RoundStart,
+        };
+        let d9 = subgame_search(
+            &auth,
+            &round_start,
+            &game,
+            &legal_abs,
+            node_id,
+            &strat,
+            &cfg,
+            0xABCD,
+            9,
+        )
+        .expect("RoundStart within-round 应 Ok（stub 桶 0 必累积）");
+        let d99 = subgame_search(
+            &auth,
+            &round_start,
+            &game,
+            &legal_abs,
+            node_id,
+            &strat,
+            &cfg,
+            0xABCD,
+            99,
+        )
+        .expect("RoundStart within-round 应 Ok");
+        assert_eq!(d9.len(), d99.len(), "round-stable：维度一致");
+        for ((a9, p9), (a99, p99)) in d9.iter().zip(&d99) {
+            assert_eq!(a9, a99, "round-stable：动作逐项一致");
+            assert_eq!(
+                p9.to_bits(),
+                p99.to_bits(),
+                "round-stable seed：不同 decision_ordinal 字节相同（§6 #2 一致性）"
+            );
+        }
+        let sum: f64 = d9.iter().map(|(_, p)| *p).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "返回分布归一，和={sum}");
+        for (a, p) in &d9 {
+            assert!(*p > 0.0, "只返回正概率动作");
+            let tag = AbstractActionTag::of(a);
+            assert!(
+                legal_abs.iter().any(|l| AbstractActionTag::of(l) == tag),
+                "返回动作 {tag:?} 在 legal_abs 内"
+            );
+        }
     }
 
     /// §5b [`estimate_range`]：reach 向量归一（Σ≈1）、撞 board 的 hole 恒 0、uniform 策略下

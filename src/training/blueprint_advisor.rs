@@ -39,7 +39,7 @@ use rayon::prelude::*;
 use crate::abstraction::action::{AbstractAction, ActionAbstraction, StreetActionAbstraction};
 use crate::abstraction::info::InfoSetId;
 use crate::core::rng::{ChaCha20Rng, RngSource};
-use crate::core::{Card, ChipAmount, PlayerStatus, Rank, Suit};
+use crate::core::{Card, ChipAmount, PlayerStatus, Rank, Street, Suit};
 use crate::rules::action::Action;
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
@@ -47,7 +47,7 @@ use crate::training::game::Game;
 use crate::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use crate::training::nlhe_betting_tree::AbstractActionTag;
 use crate::training::sampling::sample_discrete;
-use crate::training::subgame::{should_search, subgame_search, SubgameSearchConfig};
+use crate::training::subgame::{should_search, subgame_search, ResolveRoot, SubgameSearchConfig};
 
 // ===========================================================================
 // Card 字符串解析（"Ac" → Card） —— 与 slumbot 同语义（rank 大写 + suit 小写）。
@@ -390,6 +390,11 @@ pub fn play_cross_abstraction_hand(
         .map(|c| c.game.root(&mut shadow_rng))
         .collect();
 
+    // round-start 快照（§6 #1 RoundStart 重解用）：每街首决策点 = 该街 betting-round 起点
+    // （postflop 首个行动者面对无本街下注）。在 apply 之前于 loop 顶 snapshot → 必是轮起点。
+    let mut round_start: Option<GameState> = None;
+    let mut round_start_street: Option<Street> = None;
+
     for decision_ordinal in 0..max_actions {
         if auth.is_terminal() {
             return finalize_payoffs(&auth, n);
@@ -399,6 +404,14 @@ pub fn play_cross_abstraction_hand(
         };
         let actor_idx = actor.0 as usize;
         let bp_idx = seat_blueprint[actor_idx];
+
+        // 维护 round-start 快照：每街首决策点 = 该街 betting-round 起点（loop 顶、apply 之前
+        // snapshot → 本街尚无下注 = 轮起点）。街变即重 snapshot；同街内复用同一快照 → 同一轮
+        // 多决策的 RoundStart 重解共享 byte-identical 输入（§6 #2 一致性）。
+        if round_start_street != Some(auth.street()) {
+            round_start = Some(auth.clone());
+            round_start_street = Some(auth.street());
+        }
 
         // sync 守门：行动者影子必须在同一座 / 同一街，否则 info_set 口径错位（甚至 panic）。
         {
@@ -448,8 +461,15 @@ pub fn play_cross_abstraction_hand(
                 if let Some(o) = search_obs {
                     o.attempts.fetch_add(1, Ordering::Relaxed);
                 }
+                // RoundStart（默认，§6 #1）：从本街 round-start 快照为根重解；CurrentDecision
+                // （A/B）：从当前权威态为根。round_start 由 loop 顶 snapshot 保证为本街轮起点。
+                let root_state: &GameState = match scfg.resolve_root {
+                    ResolveRoot::RoundStart => round_start.as_ref().unwrap_or(&auth),
+                    ResolveRoot::CurrentDecision => &auth,
+                };
                 match subgame_search(
                     &auth,
+                    root_state,
                     contestants[bp_idx].game,
                     &legal_abs,
                     node_id,
@@ -1003,12 +1023,15 @@ mod tests {
     fn search_on_conserves_and_reproducible() {
         let game = nolimp_game();
         let uniform = |_info: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        // AllPostflop + RoundStart（默认）：exercise §6 #1 round-start 重解全路径（within-round
+        // 导航 + round-stable seed），在 6-max 自对弈下钉「接 live 后不破守恒 + 可复现」。
         let scfg = SubgameSearchConfig {
             iterations: 300,
             max_subtree_nodes: 8000,
             seed: 0x5EA2_C400_5EA2_C400,
             use_blueprint_range: true,
             trigger: SearchTrigger::AllPostflop,
+            resolve_root: ResolveRoot::RoundStart,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;
