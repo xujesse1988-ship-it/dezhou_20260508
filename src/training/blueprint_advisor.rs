@@ -444,7 +444,7 @@ pub fn play_cross_abstraction_hand(
         let blueprint_dist =
             || strategy_distribution(&info, &legal_abs, contestants[bp_idx].strategy);
         let dist = match &contestants[bp_idx].search {
-            Some(scfg) if should_search(&auth) => {
+            Some(scfg) if should_search(&auth, scfg.trigger) => {
                 if let Some(o) = search_obs {
                     o.attempts.fetch_add(1, Ordering::Relaxed);
                 }
@@ -770,6 +770,7 @@ mod tests {
     use crate::abstraction::action::BetRatio;
     use crate::abstraction::bucket_table::{BucketConfig, BucketTable};
     use crate::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_6max};
+    use crate::training::subgame::SearchTrigger;
     use std::sync::Arc;
 
     fn stub_table() -> Arc<BucketTable> {
@@ -1007,6 +1008,7 @@ mod tests {
             max_subtree_nodes: 8000,
             seed: 0x5EA2_C400_5EA2_C400,
             use_blueprint_range: true,
+            trigger: SearchTrigger::AllPostflop,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;

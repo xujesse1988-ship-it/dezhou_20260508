@@ -321,7 +321,16 @@ impl Game for SubgameNlheGame {
 // 不破守恒；②**去 confound 后的 §2 探针**——search-on vs blueprint-only 的 mbb/g + CI。
 // 下一步质量杠杆 = 6b（continual re-solving + biased leaf）。
 
-/// 实时搜索触发 + 求解配置（S6 6a MVP）。`Copy` → 随 `Contestant` 按值带。
+/// 实时搜索触发面（[`should_search`]）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchTrigger {
+    /// 仅 flop **未起注**首决策点（MVP 旧窄触发面，A/B 基线）。
+    FlopFirstUnraised,
+    /// 任意 postflop 决策点（flop 含已起注 / turn / river）——更宽触发面，搜索影响更多决策。
+    AllPostflop,
+}
+
+/// 实时搜索触发 + 求解配置（S6 6a）。`Copy` → 随 `Contestant` 按值带。
 #[derive(Clone, Copy, Debug)]
 pub struct SubgameSearchConfig {
     /// CFR 迭代步数（每步 [`GameState::resample_hidden`] 一次 = per-step external chance）。
@@ -337,6 +346,8 @@ pub struct SubgameSearchConfig {
     /// 加权采样各家底牌（§5b 去 confound——subgame 在真 range 而非均匀先验上求解）；`false`
     /// = uniform resample（MVP 旧行为，留作 A/B 对照）。
     pub use_blueprint_range: bool,
+    /// 触发面（默认 [`SearchTrigger::AllPostflop`]）。
+    pub trigger: SearchTrigger,
 }
 
 impl Default for SubgameSearchConfig {
@@ -346,22 +357,25 @@ impl Default for SubgameSearchConfig {
             max_subtree_nodes: 8000,
             seed: 0x5347_4D45_5F53_3641, // "SGME_S6A"
             use_blueprint_range: true,
+            trigger: SearchTrigger::AllPostflop,
         }
     }
 }
 
-/// MVP 触发判据（设计 §10 step 4「仅 flop 第一个决策点」）：flop 街、且**本街未起注**
-/// （所有 `committed_this_round == 0`）。缩小验证面，其余决策点回 blueprint。
-///
-/// 「本街未起注」⟺ `raises_on_street == 0`（postflop 无盲注，max committed_this_round==0
-/// 即无 Bet/Raise/AllIn）→ [`subtree_context`] 在此恒返回 raises=0（正确，不会把 re-raise
-/// 的 0.5pot 误当开池档；§10.1 审核 A 的坑）。flop 多个 check 直到首次下注前都满足——验证面
-/// 仍小，且 raises 仍恒 0，正确性不受影响。
-pub fn should_search(auth: &GameState) -> bool {
+/// 触发判据。`AllPostflop`（默认）= 任意 postflop 决策点（flop 含已起注 / turn / river）；
+/// `FlopFirstUnraised` = 仅 flop 未起注首决策点（窄触发面，A/B 基线）。preflop 一律不搜
+/// （preflop 走 blueprint；且 preflop 中途 entrants ≠ live bitmask，[`live_entrants`] 不适用）。
+pub fn should_search(auth: &GameState, trigger: SearchTrigger) -> bool {
     if auth.is_terminal() || auth.current_player().is_none() {
         return false;
     }
-    auth.street() == Street::Flop && max_committed_this_round(auth) == 0
+    let postflop = matches!(auth.street(), Street::Flop | Street::Turn | Street::River);
+    match trigger {
+        SearchTrigger::AllPostflop => postflop,
+        SearchTrigger::FlopFirstUnraised => {
+            auth.street() == Street::Flop && max_committed_this_round(auth) == 0
+        }
+    }
 }
 
 /// 本街最高 `committed_this_round`（`GameState::max_committed_this_round` 是私有，这里据
@@ -374,29 +388,44 @@ fn max_committed_this_round(auth: &GameState) -> u64 {
         .unwrap_or(0)
 }
 
-/// 从权威中途局现算 [`PublicBettingTree::build_subtree`] 需要的
-/// `(entrants_bitmask, raises_on_street)`。
-///
-/// **仅 postflop 未起注决策点正确**（本 MVP 只在 flop 触发，见 [`should_search`]）：
-/// - `entrants` = 所有未弃牌（`Active|AllIn`）座位的 bitmask。到 postflop，任何未弃牌玩家
-///   都必在 preflop 做过 ≥1 非弃牌动作 → entrants bit 必置（preflop 中途有人尚未行动时
-///   不成立，故本函数不用于 preflop）。
-/// - `raises_on_street` = **0**。`GameState` 无「本街进攻数」getter；放宽触发面到「已起注」
-///   决策点前，**必须**在此实现真·多档计数，否则 `drop_small_reraise` 会把 re-raise 的
-///   0.5pot 误当开池档保留（§10.1 审核 A）。`debug_assert` 守住当前前提。
-fn subtree_context(auth: &GameState) -> (u16, u32) {
-    let mut entrants = 0u16;
+/// postflop entrants bitmask = 所有未弃牌（`Active|AllIn`）座位。到 postflop，任何未弃牌
+/// 玩家都必在 preflop 做过 ≥1 非弃牌动作 → entrants bit 必置（preflop 中途不成立，故
+/// **只用于 postflop**，与 [`should_search`] 的 preflop-不搜一致）。
+fn live_entrants(auth: &GameState) -> u16 {
+    let mut e = 0u16;
     for (i, p) in auth.players().iter().enumerate() {
         if matches!(p.status, PlayerStatus::Active | PlayerStatus::AllIn) {
-            entrants |= 1u16 << i;
+            e |= 1u16 << i;
         }
     }
-    debug_assert_eq!(
-        max_committed_this_round(auth),
-        0,
-        "subtree_context 仅支持本街未起注的决策点（raises_on_street==0）；放宽触发面须先实现多档计数"
-    );
-    (entrants, 0)
+    e
+}
+
+/// tag 是否进攻动作（推进 `raises_on_street`）：`Bet` / `Raise` / `AllIn`（同
+/// `nlhe_betting_tree::is_aggression` 的 tag 版）。
+fn tag_is_aggression(tag: &AbstractActionTag) -> bool {
+    matches!(
+        tag,
+        AbstractActionTag::Bet(_) | AbstractActionTag::Raise(_) | AbstractActionTag::AllIn
+    )
+}
+
+/// 现算当前节点的 `raises_on_street`（[`PublicBettingTree::build_subtree`] 需要）：沿 public
+/// 决策路径 `decisions`（[`decisions_on_path`]）数**当前街**上的进攻动作数。与 `walk` 的语义
+/// 逐字对齐（raises 切街清零、本街每进攻 +1）→ 与 blueprint 全树该节点的 raises 相等，故
+/// `drop_small_reraise` 在子树 root 正确判 0.5pot 是开池(0)还是 re-raise(>0)（§10.1 审核 A 的坑，
+/// 放宽触发面后由本函数精确解决）。
+fn raises_on_current_street(
+    decisions: &[(NodeId, AbstractActionTag, PlayerId)],
+    tree: &PublicBettingTree,
+    current_street: StreetTag,
+) -> u32 {
+    decisions
+        .iter()
+        .filter(|(node_id, tag, _)| {
+            tree.node(*node_id).street == current_street && tag_is_aggression(tag)
+        })
+        .count() as u32
 }
 
 /// SplitMix64 finalizer 混合 `(base, hand_seed, ordinal)` → subgame solve 的 master seed。
@@ -547,15 +576,19 @@ pub fn subgame_search(
     if auth.is_terminal() || auth.current_player().is_none() {
         return Err("subgame_search: auth 非 decision 节点".to_string());
     }
-    let (entrants, raises_on_street) = subtree_context(auth);
+    // 沿 actor 在 blueprint 树的 public 决策路径现算（一次，供 raises + §5b range 共用）：
+    //   entrants = postflop live bitmask；raises_on_street = 当前街进攻数（任意 postflop 节点
+    //   正确，含 raised flop / turn / river——放宽触发面的关键，§10.1 审核 A 的多档计数）。
+    let decisions = decisions_on_path(game.tree(), node_id);
+    let entrants = live_entrants(auth);
+    let raises_on_street =
+        raises_on_current_street(&decisions, game.tree(), game.tree().node(node_id).street);
 
     // 建 subgame：同 blueprint 的 bucket 表 / action 抽象 + A3×A4 规则，从 auth 中途态为根。
-    // §5b：use_blueprint_range → 为每个未弃牌座位估 marginal range，root 按其加权采样底牌；
-    // 否则 uniform。range 估计用 actor 在 blueprint 树的 `node_id` 回溯 public 决策路径。
+    // §5b：use_blueprint_range → 为每个未弃牌座位估 marginal range，root 按其加权采样底牌；否则 uniform。
     let sub = if cfg.use_blueprint_range {
         let holes = all_hole_combos();
         let board: Vec<Card> = auth.board().to_vec();
-        let decisions = decisions_on_path(game.tree(), node_id);
         let players = auth.players();
         let ranges: Vec<Vec<f64>> = (0..players.len())
             .map(|seat| {
@@ -769,40 +802,62 @@ mod tests {
         }
     }
 
-    /// [`should_search`] 触发面：preflop / flop 已起注 = false；flop 未起注 = true。
-    /// 顺带钉 [`subtree_context`]：HU flop 两家都 live → entrants 两 bit、raises==0。
+    /// 两触发面（[`SearchTrigger`]）+ [`raises_on_current_street`] 多档计数。
+    /// `AllPostflop` = 任意 postflop 决策点都搜；`FlopFirstUnraised` = 仅 flop 未起注首点。
+    /// raises 计数：flop Bet → 1、Bet+Raise → 2（放宽触发面后子树 root 正确判 0.5pot 档）。
     #[test]
-    fn should_search_triggers_only_flop_unraised() {
+    fn should_search_triggers_and_raises_count() {
+        use SearchTrigger::{AllPostflop, FlopFirstUnraised};
         let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
         let mut rng = ChaCha20Rng::from_seed(0x5333_4541_5243_4831); // "S3EARCH1"
         let drng: &mut dyn RngSource = &mut rng;
+        let raises_at = |st: &SimplifiedNlheState| {
+            let d = decisions_on_path(game.tree(), st.current_node_id);
+            raises_on_current_street(&d, game.tree(), game.tree().node(st.current_node_id).street)
+        };
 
-        // preflop root：非 flop → false。
+        // preflop：两触发面都不搜。
         let pre = game.root(drng);
-        assert!(!should_search(&pre.game_state), "preflop 不应触发搜索");
-
-        // 推到 flop 第一个决策点（未起注）：true。
-        let flop = hu_flop_state(&game, 0x5333_4541_5243_4832);
+        assert!(!should_search(&pre.game_state, AllPostflop), "preflop 不搜");
         assert!(
-            should_search(&flop.game_state),
-            "flop 未起注首决策点应触发搜索"
+            !should_search(&pre.game_state, FlopFirstUnraised),
+            "preflop 不搜"
         );
-        // subtree_context：HU flop 两家 live → entrants == 0b11、raises == 0。
-        let (entrants, raises) = subtree_context(&flop.game_state);
-        assert_eq!(entrants, 0b11, "HU flop 两家 live → entrants 两 bit");
-        assert_eq!(raises, 0, "flop 未起注 → raises_on_street == 0");
 
-        // flop 上打一个 Bet → 本街已起注 → false。
+        // flop 未起注首决策点：两触发面都搜；entrants=0b11、raises=0。
+        let flop = hu_flop_state(&game, 0x5333_4541_5243_4832);
+        assert!(should_search(&flop.game_state, AllPostflop));
+        assert!(should_search(&flop.game_state, FlopFirstUnraised));
+        assert_eq!(live_entrants(&flop.game_state), 0b11, "HU flop 两家 live");
+        assert_eq!(raises_at(&flop), 0, "flop 未起注 → raises==0");
+
+        // flop 打一个 Bet → 已起注：AllPostflop 仍搜、FlopFirstUnraised 不搜；raises=1。
         let bet = SimplifiedNlheGame::legal_actions(&flop)
             .into_iter()
             .find(|a| matches!(AbstractActionTag::of(a), AbstractActionTag::Bet(_)))
             .expect("flop 首决策点应有 Bet 档");
         let after_bet = SimplifiedNlheGame::next(flop.clone(), bet, drng);
-        assert_eq!(after_bet.game_state.street(), crate::core::Street::Flop);
+        assert_eq!(after_bet.game_state.street(), Street::Flop);
         assert!(
-            !should_search(&after_bet.game_state),
-            "flop 已起注（有人 Bet）不应再触发（MVP 只搜未起注首决策点）"
+            should_search(&after_bet.game_state, AllPostflop),
+            "已起注 flop：AllPostflop 仍搜（放宽触发面的关键）"
         );
+        assert!(
+            !should_search(&after_bet.game_state, FlopFirstUnraised),
+            "已起注 flop：窄触发面不搜"
+        );
+        assert_eq!(raises_at(&after_bet), 1, "1 个 flop Bet → raises==1");
+
+        // 再 Raise → raises=2（多档计数，§10.1 审核 A 的坑由 raises_on_current_street 解决）。
+        let raise = SimplifiedNlheGame::legal_actions(&after_bet)
+            .into_iter()
+            .find(|a| matches!(AbstractActionTag::of(a), AbstractActionTag::Raise(_)))
+            .expect("面对 Bet 应有 Raise 档");
+        let after_raise = SimplifiedNlheGame::next(after_bet.clone(), raise, drng);
+        if after_raise.game_state.street() == Street::Flop && !after_raise.game_state.is_terminal()
+        {
+            assert_eq!(raises_at(&after_raise), 2, "flop Bet+Raise → raises==2");
+        }
     }
 
     /// [`subgame_search`] 包装契约：①不 panic；②cap 够大时返回 `Ok`，分布归一、动作全在
@@ -819,8 +874,8 @@ mod tests {
         let flop = hu_flop_state(&game, 0x5347_5F43_4F4E_5452); // "SG_CONTR"
         let auth = flop.game_state.clone();
         assert!(
-            should_search(&auth),
-            "测试前置：auth 须是 flop 未起注决策点"
+            should_search(&auth, SearchTrigger::AllPostflop),
+            "测试前置：auth 须是 postflop 决策点"
         );
         let legal_abs = SimplifiedNlheGame::legal_actions(&flop);
         assert!(!legal_abs.is_empty(), "flop 决策点合法集非空");
@@ -834,6 +889,7 @@ mod tests {
             max_subtree_nodes: 1_000_000,
             seed: 0xA11C_E55E_5EED_u64,
             use_blueprint_range: true,
+            trigger: SearchTrigger::AllPostflop,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -882,6 +938,7 @@ mod tests {
             max_subtree_nodes: 5,
             seed: 0xA11C_E55E_5EED_u64,
             use_blueprint_range: true,
+            trigger: SearchTrigger::AllPostflop,
         };
         let r = subgame_search(&auth, &game, &legal_abs, node_id, &strat, &tiny, 0, 0);
         assert!(r.is_err(), "节点上限被触发应回落 Err，实得 {r:?}");
@@ -1045,7 +1102,13 @@ mod tests {
                 .count()
         );
         if s.game_state.street() == Street::Flop && !s.game_state.is_terminal() {
-            let (ent, rs) = subtree_context(&s.game_state);
+            let ent = live_entrants(&s.game_state);
+            let decisions = decisions_on_path(g6.tree(), s.current_node_id);
+            let rs = raises_on_current_street(
+                &decisions,
+                g6.tree(),
+                g6.tree().node(s.current_node_id).street,
+            );
             let sub6 = SubgameNlheGame::new(
                 stub_table(),
                 TableConfig::default_6max_100bb(),

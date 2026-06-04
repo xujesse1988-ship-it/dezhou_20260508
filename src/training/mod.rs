@@ -73,7 +73,9 @@ pub use nlhe_eval::{
     NlheMultiwayEvalReport,
 };
 pub use regret::{RegretTable, StrategyAccumulator};
-pub use subgame::{should_search, subgame_search, SubgameNlheGame, SubgameSearchConfig};
+pub use subgame::{
+    should_search, subgame_search, SearchTrigger, SubgameNlheGame, SubgameSearchConfig,
+};
 pub use trainer::{EsMccfrTrainer, Trainer, VanillaCfrTrainer};
 
 // CheckpointError + TrainerError + TrainerVariant + GameVariant 物理位置在

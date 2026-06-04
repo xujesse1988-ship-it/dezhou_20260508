@@ -45,7 +45,7 @@ use poker::training::nlhe_betting_tree::{
     BettingAbstractionRules,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
-use poker::training::SubgameSearchConfig;
+use poker::training::{SearchTrigger, SubgameSearchConfig};
 use poker::{BucketTable, InfoSetId, StreetActionAbstraction, TableConfig};
 
 fn main() -> ExitCode {
@@ -99,7 +99,7 @@ fn run() -> Result<(), String> {
     );
     eprintln!(
         "[six_max_search_probe] search: iterations={} max_subtree_nodes={} seed=0x{:016x} \
-         range={} （flop 未起注首决策点触发；解到终局无 blueprint 叶子）",
+         range={} trigger={:?} （解到终局无 blueprint 叶子）",
         args.search.iterations,
         args.search.max_subtree_nodes,
         args.search.seed,
@@ -107,7 +107,8 @@ fn run() -> Result<(), String> {
             "blueprint(§5b 去 confound)"
         } else {
             "uniform(MVP)"
-        }
+        },
+        args.search.trigger
     );
 
     // 同一 trainer 的 dense average strategy，hero/field 共用（blueprint 完全相同）；
@@ -273,6 +274,18 @@ fn parse_args() -> Result<Args, String> {
             }
             // A/B 对照：关 §5b range，回 uniform resample（MVP 旧行为）。
             "--uniform-range" => search.use_blueprint_range = false,
+            // 触发面：all-postflop（默认，宽）vs flop-first（窄，A/B 基线）。
+            "--trigger" => {
+                search.trigger = match next(&mut it, "--trigger")?.as_str() {
+                    "all-postflop" => SearchTrigger::AllPostflop,
+                    "flop-first" => SearchTrigger::FlopFirstUnraised,
+                    other => {
+                        return Err(format!(
+                            "unknown --trigger {other} (expected all-postflop | flop-first)"
+                        ))
+                    }
+                }
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
