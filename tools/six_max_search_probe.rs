@@ -50,9 +50,19 @@ use poker::training::nlhe_betting_tree::{
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{
-    build_leaf_value_tables, default_continuations, ResolveRoot, SearchTrigger, SubgameSearchConfig,
+    build_leaf_value_tables, default_continuations, LeafValueTables, ResolveRoot, SearchTrigger,
+    SubgameSearchConfig,
 };
 use poker::{BucketTable, InfoSetId, StreetActionAbstraction, TableConfig};
+
+/// 配对差 baseline 臂（[`run_arm`] 主臂之外再跑一个对照臂，算「主臂 − baseline」配对差 CI）。
+#[derive(Clone, Copy, Debug)]
+enum PairedBaseline {
+    /// 解到终局（depth-limit 关）= §10.5 基线；验 depth-limit 整体增益。
+    Terminal,
+    /// depth-limit unbiased（biased 关）；验 biased 续局相对 unbiased 的增益。
+    Unbiased,
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -74,6 +84,8 @@ struct Args {
     search: SubgameSearchConfig,
     /// 6b depth-limit：叶子值表每续局 self-play 手数（仅 `search.depth_limit` 时用）。
     leaf_hands: u64,
+    /// 配对差 baseline 臂（`None` = 只跑主臂）。
+    paired_baseline: Option<PairedBaseline>,
 }
 
 fn run() -> Result<(), String> {
@@ -155,24 +167,6 @@ fn run() -> Result<(), String> {
         None
     };
 
-    // 同一 trainer 的 dense average strategy，hero/field 共用（blueprint 完全相同）；
-    // 唯一差异 = hero.search = Some（命中触发面则 subgame re-solve），field.search = None。
-    let strat = |info: &InfoSetId, _n: usize| trainer.average_strategy(*info);
-    let hero = Contestant {
-        game: trainer.game(),
-        strategy: &strat,
-        label: "search-on".to_string(),
-        search: Some(args.search),
-        leaf_values: leaf_values.clone(),
-    };
-    let field = Contestant {
-        game: trainer.game(),
-        strategy: &strat,
-        label: "search-off".to_string(),
-        search: None,
-        leaf_values: None,
-    };
-
     let h2h_config = CrossH2hConfig {
         hands_per_seat: args.hands_per_seat,
         seed: args.seed,
@@ -185,9 +179,162 @@ fn run() -> Result<(), String> {
         args.seed
     );
 
-    let report = evaluate_cross_abstraction_h2h(&hero, &field, &cfg, &h2h_config);
-    print_report(&report);
+    // 同一 trainer 的 dense average strategy，所有臂 hero/field 共用（blueprint 完全相同）。
+    let strat = |info: &InfoSetId, _n: usize| trainer.average_strategy(*info);
+
+    // 主臂：按 args.search 配置（hero=search-on vs field=search-off，配对内 mbb/g）。
+    let main_report = run_arm(
+        &trainer,
+        &strat,
+        args.search,
+        leaf_values.clone(),
+        "main",
+        &cfg,
+        &h2h_config,
+    );
+    println!("\n========== 主臂 ==========");
+    print_report(&main_report);
+    print_leaf_miss(&leaf_values);
+
+    // 配对差（§11.5 统计注意）：跑一个 baseline 臂（**同 seed/同手**），算「主臂 − baseline」逐手
+    // 配对差 CI——消去 blueprint-field 共同方差，比各臂 marginal CI 紧得多 → 钉死「主臂是否显著优」。
+    if let Some(base_kind) = args.paired_baseline {
+        let (base_cfg, base_leaf, base_label) = match base_kind {
+            PairedBaseline::Terminal => {
+                let mut c = args.search;
+                c.depth_limit = false;
+                c.biased_leaf = false;
+                (c, None, "解到终局")
+            }
+            PairedBaseline::Unbiased => {
+                let mut c = args.search;
+                c.depth_limit = true;
+                c.biased_leaf = false;
+                (c, leaf_values.clone(), "depth-limit unbiased")
+            }
+        };
+        let base_report = run_arm(
+            &trainer,
+            &strat,
+            base_cfg,
+            base_leaf.clone(),
+            "base",
+            &cfg,
+            &h2h_config,
+        );
+        println!("\n========== baseline 臂（{base_label}）==========");
+        print_report(&base_report);
+        print_leaf_miss(&base_leaf);
+        print_paired_diff(&main_report, &base_report, base_label, &cfg);
+    }
     Ok(())
+}
+
+/// 跑一个臂（hero=search-on(`search_cfg`) vs field=search-off，同 blueprint），返回 h2h 报告。
+/// `leaf_values` 在 h2h 前 [`reset_eval_stats`](poker::training::LeafValueTables::reset_eval_stats)
+/// → 该臂 leaf-miss 计数独立（两臂共享同一表 Arc 时不混计）。
+#[allow(clippy::too_many_arguments)]
+fn run_arm(
+    trainer: &DenseNlheEsMccfrTrainer,
+    strat: &(dyn Fn(&InfoSetId, usize) -> Vec<f64> + Sync),
+    search_cfg: SubgameSearchConfig,
+    leaf_values: Option<Arc<LeafValueTables>>,
+    label: &str,
+    cfg: &TableConfig,
+    h2h_config: &CrossH2hConfig,
+) -> CrossAbstractionH2hReport {
+    if let Some(lv) = &leaf_values {
+        lv.reset_eval_stats();
+    }
+    let hero = Contestant {
+        game: trainer.game(),
+        strategy: strat,
+        label: format!("{label}:search-on"),
+        search: Some(search_cfg),
+        leaf_values,
+    };
+    let field = Contestant {
+        game: trainer.game(),
+        strategy: strat,
+        label: format!("{label}:search-off"),
+        search: None,
+        leaf_values: None,
+    };
+    evaluate_cross_abstraction_h2h(&hero, &field, cfg, h2h_config)
+}
+
+/// 报该臂 leaf 查值 miss 率（深街/river 叶子覆盖软肋的可见度；高 = 该臂叶子值多为 0 退化兜底）。
+fn print_leaf_miss(leaf_values: &Option<Arc<LeafValueTables>>) {
+    if let Some(lv) = leaf_values {
+        let (e, m) = lv.leaf_eval_counts();
+        if e > 0 {
+            println!(
+                "  leaf 查值 {e} 次, miss {m} ({:.1}% 退 0)——深街/river 叶子覆盖软肋；高 miss = 该臂叶子值多为 0、近似退化",
+                100.0 * m as f64 / e as f64
+            );
+        }
+    }
+}
+
+/// 「主臂 − baseline」逐手配对差 CI（两臂同 seed/同手 → per_hand_pnl 逐下标同手，只取双方都计入的手）。
+fn print_paired_diff(
+    main: &CrossAbstractionH2hReport,
+    base: &CrossAbstractionH2hReport,
+    base_label: &str,
+    cfg: &TableConfig,
+) {
+    if main.per_hand_pnl.len() != base.per_hand_pnl.len() {
+        println!(
+            "\n⚠ 配对差：两臂 task 数不一致（{} vs {}）—— 无法配对",
+            main.per_hand_pnl.len(),
+            base.per_hand_pnl.len()
+        );
+        return;
+    }
+    let diffs: Vec<f64> = main
+        .per_hand_pnl
+        .iter()
+        .zip(&base.per_hand_pnl)
+        .filter_map(|(a, b)| match (a, b) {
+            (Some(x), Some(y)) => Some(x - y),
+            _ => None,
+        })
+        .collect();
+    if diffs.is_empty() {
+        println!("\n⚠ 配对差：无双方都计入的手（differential desync？）");
+        return;
+    }
+    let n = diffs.len();
+    let (mean, se) = paired_diff_mean_se(&diffs);
+    let scale = 1000.0 / cfg.big_blind.as_u64() as f64;
+    let (mean_mbb, se_mbb) = (mean * scale, se * scale);
+    let lo = mean_mbb - 1.96 * se_mbb;
+    let hi = mean_mbb + 1.96 * se_mbb;
+    let verdict = if lo > 0.0 {
+        "主臂**显著优于** baseline（配对 CI 下界 > 0）"
+    } else if hi < 0.0 {
+        "主臂**显著劣于** baseline（配对 CI 上界 < 0）"
+    } else {
+        "主臂与 baseline 无显著差（配对 CI 跨 0）"
+    };
+    println!("\n========== 配对差：主臂 − baseline（{base_label}），{n} 手双计入 ==========");
+    println!("  Δmbb/g = {mean_mbb:+.2}  SE = {se_mbb:.2}  CI95 = [{lo:+.2}, {hi:+.2}]");
+    println!("  → {verdict}（配对消去 blueprint-field 共同方差 → 比各臂 marginal CI 紧）");
+}
+
+/// 配对差样本均值 + 标准误（CI95 = mean ± 1.96·se）。样本方差用 `n−1`；空 → `(0,0)`、单元素 → se 0。
+fn paired_diff_mean_se(diffs: &[f64]) -> (f64, f64) {
+    let n = diffs.len();
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let mean = diffs.iter().sum::<f64>() / n as f64;
+    let var = if n > 1 {
+        diffs.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1) as f64
+    } else {
+        0.0
+    };
+    (mean, (var / n as f64).sqrt())
 }
 
 fn print_report(r: &CrossAbstractionH2hReport) {
@@ -289,6 +436,7 @@ fn parse_args() -> Result<Args, String> {
     let mut seed = 0x5835_4831_5f48_3268u64;
     let mut search = SubgameSearchConfig::default();
     let mut leaf_hands = 200_000u64;
+    let mut paired_baseline: Option<PairedBaseline> = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -329,6 +477,19 @@ fn parse_args() -> Result<Args, String> {
                 leaf_hands = next(&mut it, "--leaf-hands")?
                     .parse()
                     .map_err(|e| format!("bad --leaf-hands: {e}"))?
+            }
+            // 配对差对照臂：terminal（vs 解到终局，验 depth-limit 总增益）| unbiased（vs depth-limit
+            // unbiased，验 biased 增益）。
+            "--paired-baseline" => {
+                paired_baseline = Some(match next(&mut it, "--paired-baseline")?.as_str() {
+                    "terminal" => PairedBaseline::Terminal,
+                    "unbiased" => PairedBaseline::Unbiased,
+                    other => {
+                        return Err(format!(
+                            "unknown --paired-baseline {other} (expected terminal | unbiased)"
+                        ))
+                    }
+                })
             }
             // 触发面：all-postflop（宽）vs flop-first（默认，窄 A/B 基线）。
             "--trigger" => {
@@ -378,6 +539,7 @@ fn parse_args() -> Result<Args, String> {
         seed,
         search,
         leaf_hands,
+        paired_baseline,
     })
 }
 
@@ -390,4 +552,19 @@ fn parse_u64(raw: &str, name: &str) -> Result<u64, String> {
 
 fn next(it: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
     it.next().ok_or_else(|| format!("{name} requires a value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 配对差 mean/se 数学：[1..5] mean 3、sample var 2.5、se √(2.5/5)=√0.5；单元素 se 0；空 (0,0)。
+    #[test]
+    fn paired_diff_mean_se_basic() {
+        let (m, se) = paired_diff_mean_se(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert!((m - 3.0).abs() < 1e-12);
+        assert!((se - 0.5_f64.sqrt()).abs() < 1e-12);
+        assert_eq!(paired_diff_mean_se(&[7.0]), (7.0, 0.0));
+        assert_eq!(paired_diff_mean_se(&[]), (0.0, 0.0));
+    }
 }

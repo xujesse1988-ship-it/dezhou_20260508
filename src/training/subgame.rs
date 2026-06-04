@@ -512,10 +512,13 @@ fn leaf_payoff(state: &SimplifiedNlheState, player: PlayerId, leaf_street: Stree
         }
     };
     let bucket = compute_hand_bucket(state, player, leaf_street);
-    ctx.values
+    let v = ctx
+        .values
         .value(player as usize, global, bucket, cont)
-        .or_else(|| ctx.values.value(player as usize, global, bucket, 0))
-        .unwrap_or(0.0)
+        .or_else(|| ctx.values.value(player as usize, global, bucket, 0));
+    // leaf-miss 遥测：both cont + unbiased 查不到 → 退 0（深街/river 叶子覆盖软肋的可见度）。
+    ctx.values.record_leaf_eval(v.is_none());
+    v.unwrap_or(0.0)
 }
 
 /// 叶子下一 actor `a` 在 `(global 节点, a 的 bucket)` 上**自身**续局值最大的续局 idx（6b-4

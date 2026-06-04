@@ -28,6 +28,7 @@
 //! 个续局值优化。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abstraction::info::InfoSetId;
 use crate::core::rng::{ChaCha20Rng, RngSource};
@@ -140,6 +141,11 @@ pub struct LeafValueTables {
     /// `mean[pack_key(node,bucket,pos,cont)]` = `E[U | pos, node, bucket, cont]`（已 finalize，
     /// 仅含 count>0 项）。
     mean: HashMap<u64, f64>,
+    /// 叶子查值遥测（在手座 leaf payoff 计数；探针报 leaf-miss 率 = 深街叶子覆盖软肋的可见度）。
+    /// 跨 rayon 线程共享原子累加（`Relaxed`，只做计数）；探针**每臂前 [`reset_eval_stats`] 复位**
+    /// （表 Arc 在两臂共享时不混计）。
+    leaf_evals: AtomicU64,
+    leaf_misses: AtomicU64,
 }
 
 impl LeafValueTables {
@@ -184,6 +190,40 @@ impl LeafValueTables {
             .count() as u64
     }
 
+    /// 记一次在手座 leaf payoff（`missed` = 该 (seat,node,bucket) 在 cont + unbiased 都查不到 →
+    /// 退 0）。`leaf_payoff` 调（深街/river 叶子覆盖软肋 → miss 率高 = 解读探针的关键，否则静默退 0）。
+    #[inline]
+    pub fn record_leaf_eval(&self, missed: bool) {
+        self.leaf_evals.fetch_add(1, Ordering::Relaxed);
+        if missed {
+            self.leaf_misses.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// leaf 查值次数 / miss 次数（探针读，每臂前 [`reset_eval_stats`] 复位）。
+    pub fn leaf_eval_counts(&self) -> (u64, u64) {
+        (
+            self.leaf_evals.load(Ordering::Relaxed),
+            self.leaf_misses.load(Ordering::Relaxed),
+        )
+    }
+
+    /// miss 率（miss/evals；evals==0 → 0）。
+    pub fn leaf_miss_rate(&self) -> f64 {
+        let (e, m) = self.leaf_eval_counts();
+        if e == 0 {
+            0.0
+        } else {
+            m as f64 / e as f64
+        }
+    }
+
+    /// 复位查值遥测（探针在每臂 h2h 前调；表 Arc 两臂共享时避免混计）。
+    pub fn reset_eval_stats(&self) {
+        self.leaf_evals.store(0, Ordering::Relaxed);
+        self.leaf_misses.store(0, Ordering::Relaxed);
+    }
+
     /// 测试用：从显式 `(seat, node, bucket, cont, value)` 条目直接造表（绕过 self-play），
     /// 让 6b-4 `argmax_cont` / 叶子选择逻辑可在受控值下确定性测试。pos 用与 [`value`](Self::value)
     /// 同一 `(seat+n−button)%n` 映射 + [`pack_key`]，故 `value(seat,..)` 能命中这些条目。
@@ -206,6 +246,8 @@ impl LeafValueTables {
             update_count: 0,
             bucket_blake3: [0u8; 32],
             mean,
+            leaf_evals: AtomicU64::new(0),
+            leaf_misses: AtomicU64::new(0),
         }
     }
 }
@@ -315,6 +357,8 @@ pub fn build_leaf_value_tables(
         update_count: trainer.update_count(),
         bucket_blake3: game.bucket_table_blake3(),
         mean,
+        leaf_evals: AtomicU64::new(0),
+        leaf_misses: AtomicU64::new(0),
     }
 }
 
@@ -469,6 +513,21 @@ mod tests {
         let mut p = vec![0.2, 0.3, 0.5];
         apply_bias(&mut p, &acts, ContinuationSpec::unbiased());
         assert_eq!(p, vec![0.2, 0.3, 0.5]);
+    }
+
+    /// leaf-miss 遥测：record_leaf_eval 累加 evals/misses、miss_rate 正确、reset 清零。
+    #[test]
+    fn leaf_eval_stats_counts_and_resets() {
+        let t = LeafValueTables::from_entries_for_test(2, 4, 0, &[(0, 5, 1, 0, 2.0)]);
+        assert_eq!(t.leaf_eval_counts(), (0, 0));
+        t.record_leaf_eval(false);
+        t.record_leaf_eval(true);
+        t.record_leaf_eval(true);
+        assert_eq!(t.leaf_eval_counts(), (3, 2));
+        assert!((t.leaf_miss_rate() - 2.0 / 3.0).abs() < 1e-12);
+        t.reset_eval_stats();
+        assert_eq!(t.leaf_eval_counts(), (0, 0));
+        assert_eq!(t.leaf_miss_rate(), 0.0);
     }
 
     fn stub_trainer() -> DenseNlheEsMccfrTrainer {

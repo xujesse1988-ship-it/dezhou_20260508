@@ -626,6 +626,11 @@ pub struct CrossAbstractionH2hReport {
     /// = 1 - successes/attempts。两者均为 0 = 无参赛者配 search（纯 blueprint，旧行为）。
     pub search_attempts: u64,
     pub search_successes: u64,
+    /// 逐手 hero 净 PnL（chips），**对齐完整 task 列表**（`hero_seat × hand_idx`，长
+    /// `hands_attempted`）：`Some(pnl)` = 计入手，`None` = desync/illegal 排除。两次同 `seed`/
+    /// `hands_per_seat` 的 h2h 的本向量**逐下标同手**（同发牌+同 sample rng 流，仅搜索配置不同）→
+    /// 探针据此算**配对差 CI**（臂间差方差远低于 marginal，§11.5 统计注意）。
+    pub per_hand_pnl: Vec<Option<f64>>,
 }
 
 /// hero(A) 依次坐遍全部 `n_players` 座（每座 `hands_per_seat` 手）、其余座全用 field(B)。
@@ -707,16 +712,25 @@ pub fn evaluate_cross_abstraction_h2h(
         })
         .collect();
     let attempted = outcomes.len() as u64;
-    // 串行 reduce（collect 保 task 顺序 → f64 加法顺序确定、可复现）。
+    // 串行 reduce（collect 保 task 顺序 → f64 加法顺序确定、可复现）。per_hand_pnl 对齐**完整
+    // task 列表**（Some=计入 / None=desync/illegal）→ 跨两臂逐下标同手，供探针配对差。
+    let mut per_hand_pnl: Vec<Option<f64>> = Vec::with_capacity(outcomes.len());
     for o in &outcomes {
         match o {
             Outcome::Pnl { offset, pnl } => {
                 hero_pnls.push(*pnl);
                 per_pos_sum[*offset] += *pnl;
                 per_pos_hands[*offset] += 1;
+                per_hand_pnl.push(Some(*pnl));
             }
-            Outcome::Desync => desync_hands += 1,
-            Outcome::Illegal => illegal_hands += 1,
+            Outcome::Desync => {
+                desync_hands += 1;
+                per_hand_pnl.push(None);
+            }
+            Outcome::Illegal => {
+                illegal_hands += 1;
+                per_hand_pnl.push(None);
+            }
         }
     }
 
@@ -748,6 +762,7 @@ pub fn evaluate_cross_abstraction_h2h(
         per_position_hands: per_pos_hands,
         search_attempts: search_obs.attempts.load(Ordering::Relaxed),
         search_successes: search_obs.successes.load(Ordering::Relaxed),
+        per_hand_pnl,
     }
 }
 
