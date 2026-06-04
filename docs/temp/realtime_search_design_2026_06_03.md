@@ -668,13 +668,29 @@ infoset-level、非 clairvoyant。`a` = 叶子 `player_acting`（下一街首 ac
 > a 最优」≈ a 单边最优 style（非 Modicum 精确「a 变、其余 blueprint 固定」）；单 chooser（下一 actor）近似
 > §1.2「每个对手各自独立选」。要更精确须 asymmetric 值表（a=biased / 其余=blueprint），后置。
 
-### 11.5 待办：6b-5 核心 A/B（待用户更好 blueprint）
+### 11.5 6b-5 机制 A/B 首跑（2026-06-04，当前 1B nolimp blueprint，vultr，all-postflop × round-start × range-on）
 
-**6b 实现已全落地**（增量 1-4 + 真数据 smoke）。剩**核心验收 A/B** = `--depth-limit --biased-leaf --trigger
-all-postflop --resolve round-start` vs §10.5 解到终局 all-postflop（−407/−192）——验**完整 6b**（depth-limit +
-biased 叶子）是否避开 §10.5 的深层欠训练退化（解当前街浅子树 + blueprint 续局值，不再解深层欠训练节点）。需
-~24k 手 + 更高 leaf-hands（turn/river 叶子覆盖）。**真正收益判决待用户并行训练的更好 blueprint**（§2：当前
-blueprint 对 all-postflop 太弱；6b 基建已就位、blueprint 好了即用它重建叶子值表 + 跑完整 A/B）。
+**12k 手 @3000 iters，三臂同 seed 池配对**（leaf-hands 50000 → 叶子表 150388 项 / unbiased 覆盖 39096）：
+
+| 臂 | hero(search-on) mbb/g | CI95 | desync | fallback |
+|---|---|---|---|---|
+| A 解到终局（control）| **−527** | [−811, −243] | 0 | 6.2% |
+| B depth-limit unbiased | **−484** | [−778, −190] | 0 | 3.2% |
+| C depth-limit + biased（完整 6b）| **−409** | [−704, −113] | 0 | 3.6% |
+
+**结论**：
+1. **control 复现 §10.5**：Arm A −527 ≈ §10.5 round-start×all-postflop @12k@3000 的 −527 → harness 一致，6b 改动
+   **未破** 非 depth-limit 路径（强回归证据，补 lib 测试的 byte-equal 契约）。
+2. **机制按设计方向起作用（suggestive）**：**单调改善** A(−527)→B(−484,+43)→C(−409,**+118 总 / ~22% 减亏**），
+   方向正是预测的——depth-limit 避开深层欠训练节点（+43）、biased 续局加鲁棒（再 +75）；fallback 随 depth-limit
+   降（6.2%→3.6%，子树更小、当前桶更可靠命中）。
+3. **但仍 CI<0（搜索仍输 blueprint）= §2 实锤**：完整 6b 在**当前弱 blueprint** 上仍 −409，未达 break-even。
+   叶子值建在同一弱 blueprint 上 → 继承其偏。**机制 help、但 blueprint 质量是绝对水平的 cap**——正是 §2/§10.5
+   预测：**更好 blueprint 是杠杆**（好了即用它重建叶子表 + 跑完整 A/B，预期 6b 才可能 break-even/正）。
+
+**统计注意**：12k 下各臂 marginal SE ~150 → 单步 +43/+75 个体不显著、CI 重叠；但三臂**同 seed 池配对**（同手、同
+field=blueprint）→ 臂间差的方差远低于 marginal SE 所示（探针只报 marginal、未算配对差 CI）。单调趋势 + 量级
+（+118）是机制有效的**一致信号**，要钉死显著性须上 24k+ 或算配对差。
 
 ### 11.6 已知近似（解读探针时记住）
 
