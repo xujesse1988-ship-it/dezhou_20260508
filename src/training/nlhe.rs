@@ -144,6 +144,11 @@ pub struct SimplifiedNlheGame {
     /// （`legal_actions` 必须用这一份、而非全局 `nlhe_action_abstraction()`，否则 6-max
     /// 算出错的动作集）。
     pub(crate) abs: Arc<StreetActionAbstraction>,
+    /// 建 `tree` 用的 A3×A4 规则（[`new_with_abstraction`](Self::new_with_abstraction) 入参）。
+    /// 树已 baked-in 这套规则，运行期 `legal_actions` 不重读它；但 S6 实时搜索要从中途
+    /// 决策点**重建**子树（[`PublicBettingTree::build_subtree`]），须用**同一**规则透传，
+    /// 否则 `drop_small_reraise` / `width_redirect` 按错误上下文重算动作集（见 `subgame.rs`）。
+    pub(crate) rules: BettingAbstractionRules,
 }
 
 impl SimplifiedNlheGame {
@@ -209,6 +214,8 @@ impl SimplifiedNlheGame {
             config,
             abs: Arc::new(abstraction),
             tree,
+            // `rules` 是 Copy，build_with_rules 上面按值取后仍可存档（subgame 重建子树透传）。
+            rules,
         })
     }
 
@@ -224,6 +231,14 @@ impl SimplifiedNlheGame {
     /// 字段是 `pub(crate)`）。
     pub fn abstraction(&self) -> &StreetActionAbstraction {
         &self.abs
+    }
+
+    /// 本 game 建树用的 A3×A4 规则（[`BettingAbstractionRules`]，Copy）。S6 实时搜索
+    /// （`subgame.rs`）从中途决策点重建子树时须用**同一**规则透传，与 `abstraction()`
+    /// 配对——`tree` 已 baked-in 这套规则，但 [`PublicBettingTree::build_subtree`] 是独立
+    /// 调用、不读 `tree`，须显式拿回规则。
+    pub fn rules(&self) -> BettingAbstractionRules {
+        self.rules
     }
 
     /// 直接为指定的 preflop `node_id` × `hole` 构造 `InfoSetId`（绕过 `Game::info_set`
@@ -308,6 +323,12 @@ pub struct SimplifiedNlheState {
     /// `Game::State: Sync` bound（State 实际由单 worker 拥有，Relaxed 等价普通
     /// load/store）。
     pub(crate) info_set_cache: AtomicU64,
+    /// S6 6b depth-limit：subgame 叶子续局值上下文（[`crate::training::subgame::SubgameLeafCtx`]）。
+    /// `Some` 仅当本 state 属于 depth-limit subgame（`SubgameNlheGame::new_depth_limited`）；
+    /// **base game / 6a subgame 恒 `None`**——`SimplifiedNlheGame` 自身的 `current`/`payoff`
+    /// 永不读它，故 base 路径行为/性能 byte-equal（`Option<Arc>` clone 在 `None` 下 ≈ 零成本）。
+    /// depth-limit 叶子的 `SubgameNlheGame::payoff` 才读它查 blueprint 叶子值。
+    pub(crate) leaf_ctx: Option<Arc<crate::training::subgame::SubgameLeafCtx>>,
 }
 
 impl Clone for SimplifiedNlheState {
@@ -320,6 +341,7 @@ impl Clone for SimplifiedNlheState {
             tree: Arc::clone(&self.tree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(self.info_set_cache.load(Ordering::Relaxed)),
+            leaf_ctx: self.leaf_ctx.clone(),
         }
     }
 }
@@ -352,7 +374,11 @@ fn unpack_info_set_cache(packed: u64) -> (u8, u8, u16, u16) {
 /// lookup）。= [`SimplifiedNlheGame::info_set`] HU cache-miss 分支的**同源逻辑**，供 P4
 /// 6-max uncached 分支复用。HU 分支保持逐字不动、刻意不抽取——避免动到生产热路径
 /// （byte-equal by 不-touch，nlhe_infoset_semantics T1 钉死）；代价 = 这段 ~8 行重复。
-fn compute_hand_bucket(state: &SimplifiedNlheState, actor: PlayerId, street_tag: StreetTag) -> u32 {
+pub(crate) fn compute_hand_bucket(
+    state: &SimplifiedNlheState,
+    actor: PlayerId,
+    street_tag: StreetTag,
+) -> u32 {
     let hole = state.game_state.players()[actor as usize]
         .hole_cards
         .expect("SimplifiedNlhe info_set: actor hole_cards must be present on decision node");
@@ -421,6 +447,7 @@ impl Game for SimplifiedNlheGame {
             tree: Arc::clone(&self.tree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(0),
+            leaf_ctx: None, // base game 永不走 depth-limit 叶子。
         }
     }
 

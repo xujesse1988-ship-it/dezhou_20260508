@@ -398,6 +398,13 @@ impl<G: Game> EsMccfrTrainer<G> {
         &self.regret
     }
 
+    /// 只读访问内部 `game`。S6 实时搜索用：subgame solve 完后用 game 在 subtree root
+    /// 为 hero 真实手构造查询 infoset / 合法动作（见
+    /// [`crate::training::subgame::subgame_search`]）。
+    pub fn game(&self) -> &G {
+        &self.game
+    }
+
     /// 多线程并发 step（D-321-rev1 lock + E2-rev1 \[实现\] 优化）。
     ///
     /// **E2-rev1 \[实现\] 形态（rayon long-lived pool + append-only delta，

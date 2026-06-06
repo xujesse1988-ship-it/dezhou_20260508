@@ -166,7 +166,7 @@ all-in 时被规则引擎补满、弃牌时不补——也不由动作串里的 
   - 含 root → 同时给 VF-1（`V₁ = V_info[i, root, preflop169]`，带位置下标 `i`）。
   - **表规模**：行数 ≈ `NlheDenseIndexer::total_rows()`，`f64` 存储，**与 dense 策略表同量级
     （多 GB）**。在 AWS c6a.8xlarge（32–64 GB）建 + 评（评测器还要同时装 blueprint 算 σ）；
-    **vultr 7.7 GB 装不下** blueprint + VF。
+    **vultr 11.67 GiB 装不下** blueprint + VF。
 - **VF-2 `V_root_both[class_us, class_opp, i]`**：每条 rollout 在根记 `(我方169类, 对方169类,
   位置) → 最终 U`，均值。`169×169×2 ≈ 57k` 格，每格数百 rollout 即低噪。
 - **VF-4**（§4.4 用）：不建表，按手 clone GameState + 枚举补全即时算。

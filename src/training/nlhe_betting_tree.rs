@@ -70,8 +70,16 @@ pub struct TreeNode {
     pub action_from_parent: Option<AbstractActionTag>,
     /// 节点合法动作集 tag 序列，**顺序与 [`StreetActionAbstraction::abstract_actions`]
     /// 输出严格对齐**（D-209）。`children[i]` 对应 `legal_actions[i]` 这条边。
+    /// depth-limit 叶子（[`depth_limit_leaf`](Self::depth_limit_leaf)）为空（无动作）。
     pub legal_actions: SmallVec<[AbstractActionTag; 8]>,
     pub children: SmallVec<[Child; 8]>,
+    /// S6 6b depth-limit 叶子标记（[`PublicBettingTree::build_subtree_depth_limited`]）：
+    /// `true` = 本节点是 subgame 的 depth-limit 截断点（下注轮越过 `limit_street` 进下一街
+    /// 的首决策点），CFR 在此**不展开**、改查 blueprint 续局值（`subgame.rs` 的
+    /// `SubgameNlheGame::current` 把它当 Terminal、`payoff` 查叶子值表）。非 depth-limit 树
+    /// （`build`/`build_with_rules`/`build_subtree`）恒 `false`。叶子的 `legal_actions`/
+    /// `children` 为空，但保留真实 `street`/`player_acting`（= 下一街首 actor，叶子值查桶用）。
+    pub depth_limit_leaf: bool,
 }
 
 /// A3×A4 抽象层「改游戏」规则（`docs/temp/a3xa4_wiring_design_2026_06_01.md`）。
@@ -241,7 +249,93 @@ impl PublicBettingTree {
         );
         // root entrants = 0：盲注是强制投入、非 voluntary（probe 同口径）。raises_on_street = 0
         // （preflop BB 是强制盲注、非 walk 动作，不计进攻 → preflop 首个 raise 见 raises==0）。
-        tree.root_id = tree.walk(state, None, None, abs, &rules, 0, 0);
+        tree.root_id = tree.walk(state, None, None, abs, &rules, 0, 0, None);
+        tree
+    }
+
+    /// 从一个**中途** public betting 状态为根建子树（S6 实时搜索 6a：以当前决策点为根
+    /// re-solve 用）。与 [`build_with_rules`](Self::build_with_rules) 唯一不同 = root 不是
+    /// 开局 `GameState::with_rng`，而是调用方给的中途 `root_state`（实时搜索里 = 权威局
+    /// `auth.clone()`）。`walk` 本身玩家数无关、卡牌无关（只读 chip 几何 + `apply`），故
+    /// 从任意 decision 节点重启 DFS 即得该局面之后的完整抽象子树。
+    ///
+    /// **`entrants` / `raises_on_street` 必须由调用方据权威局现算**——[`TreeNode`] 不存这两个
+    /// A3×A4 上下文（见 `filter_actions`），从中途状态重启子树若不显式传入，`drop_small_reraise`
+    /// / `width_redirect` / `preflop_open_small_only` 会按错误的 (0,0) 上下文重算动作集。
+    /// `rules == Default`（全关）时这两个参数不被 `filter_actions` 读取，传 `(0, 0)` 安全。
+    ///
+    /// 不变量：从 `build_with_rules` 全树的节点 `v`（T-index `K`）对应的中途状态出发、用**同一**
+    /// `(abs, rules, entrants_at_v, raises_at_v)`，本函数产出的子树与全树 `v` 的后代块逐节点
+    /// 同构——`subtree.node(i).legal_actions == full_tree.node(K + i).legal_actions`（`walk` 确定性
+    /// DFS + 后代块连续）。`tests::build_subtree_*` 钉死。
+    pub fn build_subtree(
+        root_state: &GameState,
+        abs: &StreetActionAbstraction,
+        rules: BettingAbstractionRules,
+        entrants: u16,
+        raises_on_street: u32,
+    ) -> PublicBettingTree {
+        debug_assert!(
+            !root_state.is_terminal() && root_state.current_player().is_some(),
+            "build_subtree root must be a Player decision node"
+        );
+        let mut tree = PublicBettingTree {
+            nodes: Vec::new(),
+            root_id: 0,
+        };
+        tree.root_id = tree.walk(
+            root_state.clone(),
+            None,
+            None,
+            abs,
+            &rules,
+            entrants,
+            raises_on_street,
+            None,
+        );
+        tree
+    }
+
+    /// 同 [`build_subtree`](Self::build_subtree)，但 **depth-limit 截断**（S6 6b）：任何动作把
+    /// 牌局推进到比 `limit_street` 更深的街（`next_state.street() as u8 > limit_street as u8`）时，
+    /// 不再展开该子树，而是落一个 [`TreeNode::depth_limit_leaf`] 叶子（保留下一街首决策点的
+    /// `street`/`player_acting`，供叶子值查桶）。`limit_street == root_state.street()` = **只解当前
+    /// 街**（叶子在下一街起点 chance，= 设计 §6 #5「首轮搜索→叶子在第二轮起点」）。
+    ///
+    /// 与非截断 [`build_subtree`](Self::build_subtree) 的关系：截断树的**非叶子块**（街 ≤
+    /// `limit_street`）与全子树逐节点同构（同一 DFS、同一过滤）；只是把跨街子孙换成叶子 →
+    /// 节点数大减（设计 §10.5：避免解深层欠训练节点）。`limit_street` 取最深街（flop root 取
+    /// `River`）时无截断、≡ `build_subtree`。`tests::build_subtree_depth_limited_*` 钉死。
+    pub fn build_subtree_depth_limited(
+        root_state: &GameState,
+        abs: &StreetActionAbstraction,
+        rules: BettingAbstractionRules,
+        entrants: u16,
+        raises_on_street: u32,
+        limit_street: StreetTag,
+    ) -> PublicBettingTree {
+        debug_assert!(
+            !root_state.is_terminal() && root_state.current_player().is_some(),
+            "build_subtree_depth_limited root must be a Player decision node"
+        );
+        debug_assert!(
+            street_to_tag(root_state.street()) as u8 <= limit_street as u8,
+            "limit_street 不能浅于 root 街（否则 root 即被截断）"
+        );
+        let mut tree = PublicBettingTree {
+            nodes: Vec::new(),
+            root_id: 0,
+        };
+        tree.root_id = tree.walk(
+            root_state.clone(),
+            None,
+            None,
+            abs,
+            &rules,
+            entrants,
+            raises_on_street,
+            Some(limit_street),
+        );
         tree
     }
 
@@ -255,6 +349,7 @@ impl PublicBettingTree {
         rules: &BettingAbstractionRules,
         entrants: u16,
         raises_on_street: u32,
+        depth_limit: Option<StreetTag>,
     ) -> NodeId {
         let actor = state
             .current_player()
@@ -324,6 +419,7 @@ impl PublicBettingTree {
             action_from_parent,
             legal_actions,
             children: SmallVec::new(),
+            depth_limit_leaf: false,
         });
 
         let mut children: SmallVec<[Child; 8]> = SmallVec::new();
@@ -349,10 +445,33 @@ impl PublicBettingTree {
             } else {
                 raises_on_street
             };
+            let next_action_tag = AbstractActionTag::of(&action);
+            let crosses_limit = depth_limit.is_some_and(|limit| {
+                // next_state 非终局（下方 is_terminal 分支已排除终局）→ 非 Showdown，
+                // street_to_tag 安全。越过 limit_street 进更深街 = 截断点。
+                !next_state.is_terminal() && street_to_tag(next_state.street()) as u8 > limit as u8
+            });
             let child = if next_state.is_terminal() {
                 Child::Terminal
+            } else if crosses_limit {
+                // depth-limit 叶子：保留下一街首决策点的 street/player_acting（叶子值查桶用），
+                // legal_actions/children 空。CFR（SubgameNlheGame）把它当 Terminal、查 blueprint 值。
+                let leaf_actor = next_state
+                    .current_player()
+                    .expect("非终局跨街态必有行动者")
+                    .0 as PlayerId;
+                let leaf_id = self.nodes.len() as NodeId;
+                self.nodes.push(TreeNode {
+                    street: street_to_tag(next_state.street()),
+                    player_acting: leaf_actor,
+                    parent: Some(my_id),
+                    action_from_parent: Some(next_action_tag),
+                    legal_actions: SmallVec::new(),
+                    children: SmallVec::new(),
+                    depth_limit_leaf: true,
+                });
+                Child::Decision(leaf_id)
             } else {
-                let next_action_tag = AbstractActionTag::of(&action);
                 Child::Decision(self.walk(
                     next_state,
                     Some(my_id),
@@ -361,6 +480,7 @@ impl PublicBettingTree {
                     rules,
                     next_entrants,
                     next_raises,
+                    depth_limit,
                 ))
             };
             children.push(child);
@@ -849,6 +969,360 @@ mod tests {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// 两节点结构等价：legal_actions / street / player_acting 逐字相等，且每条出边的
+    /// Terminal/Decision **形态**一致（子节点 id 不同——子树是 local id、全树是 global id——
+    /// 故只比形态不比 id）。
+    fn nodes_structurally_equal(a: &TreeNode, b: &TreeNode) -> bool {
+        if a.legal_actions != b.legal_actions
+            || a.street != b.street
+            || a.player_acting != b.player_acting
+            || a.children.len() != b.children.len()
+        {
+            return false;
+        }
+        a.children
+            .iter()
+            .zip(b.children.iter())
+            .all(|(x, y)| matches!(x, Child::Terminal) == matches!(y, Child::Terminal))
+    }
+
+    /// `build_subtree` 从**开局**根出发 == `build`/`build_with_rules` 全树逐节点同构。
+    /// 卡牌无关：root_state 用任意 seed 的 `with_rng` 都行（结构只依赖 chip 几何，开局对
+    /// 所有发牌都一样）。这是 `build_subtree` 的最强基线——证它与既有建树路径在 root 处等价。
+    #[test]
+    fn build_subtree_from_root_reproduces_full_tree() {
+        let cfg = TableConfig::default_hu_200bb();
+        let abs = StreetActionAbstraction::default_6_action();
+        let full = PublicBettingTree::build(&cfg);
+
+        let mut rng = ChaCha20Rng::from_seed(0x5542_5452_4545_5F30); // "SUBTREE_0"
+        let root_state = GameState::with_rng(&cfg, 0, &mut rng);
+        let sub = PublicBettingTree::build_subtree(
+            &root_state,
+            &abs,
+            BettingAbstractionRules::default(),
+            0,
+            0,
+        );
+
+        assert_eq!(
+            sub.num_nodes(),
+            full.num_nodes(),
+            "build_subtree(root) 节点数应 == 全树 {}",
+            full.num_nodes()
+        );
+        for i in 0..full.num_nodes() as NodeId {
+            assert!(
+                nodes_structurally_equal(sub.node(i), full.node(i)),
+                "build_subtree(root) 节点 {i} 与全树不同构\nsub  ={:?}\nfull ={:?}",
+                sub.node(i),
+                full.node(i)
+            );
+        }
+    }
+
+    /// `build_subtree` 从**中途**节点出发 == 全树该节点的后代块（`walk` 确定性 DFS +
+    /// 后代连续 → `sub.node(i) ≡ full.node(K + i)`）。这是 S6 实时搜索"以当前决策点为根
+    /// re-solve"的核心正确性：从权威局重建的中途状态建子树，与离线全树的对应子树逐字一致。
+    /// 路径取 root(SB) --Call--> BB 决策节点；default rules 下 entrants/raises 不被读，传 0/0。
+    #[test]
+    fn build_subtree_from_interior_matches_descendant_block() {
+        let cfg = TableConfig::default_hu_200bb();
+        let abs = StreetActionAbstraction::default_6_action();
+        let full = PublicBettingTree::build(&cfg);
+
+        // 全树 root 的 Call 出边 → BB 决策节点 K。
+        let root = full.node(full.root_id());
+        let call_idx = root
+            .legal_actions
+            .iter()
+            .position(|t| *t == AbstractActionTag::Call)
+            .expect("HU SB 根应有 Call(complete) 边");
+        let k = match root.children[call_idx] {
+            Child::Decision(id) => id,
+            Child::Terminal => panic!("SB Call 不该立即终局"),
+        };
+
+        // 重建中途状态：开局 state apply SB 的 concrete Call → BB 决策点（卡牌任意）。
+        let mut rng = ChaCha20Rng::from_seed(0x5542_5452_4545_5F31); // "SUBTREE_1"
+        let mut mid = GameState::with_rng(&cfg, 0, &mut rng);
+        let call = abs
+            .abstract_actions(&mid)
+            .iter()
+            .copied()
+            .find(|a| matches!(a, AbstractAction::Call { .. }))
+            .expect("SB 根抽象集应含 Call");
+        mid.apply(call.to_concrete()).expect("SB Call 应合法");
+        assert!(
+            !mid.is_terminal() && mid.current_player().is_some(),
+            "SB Call 后应是 BB 决策节点"
+        );
+
+        let sub =
+            PublicBettingTree::build_subtree(&mid, &abs, BettingAbstractionRules::default(), 0, 0);
+
+        assert!(
+            (k as usize) + sub.num_nodes() <= full.num_nodes(),
+            "后代块越界：K={k} + sub {} > full {}",
+            sub.num_nodes(),
+            full.num_nodes()
+        );
+        // sub 的 root 与全树 K 同构（同一 BB 决策局面）。
+        assert!(
+            nodes_structurally_equal(sub.node(sub.root_id()), full.node(k)),
+            "子树 root 与全树节点 {k} 不同构"
+        );
+        for i in 0..sub.num_nodes() as NodeId {
+            assert!(
+                nodes_structurally_equal(sub.node(i), full.node(k + i)),
+                "子树节点 {i} 与全树后代 {} 不同构\nsub ={:?}\nfull={:?}",
+                k + i,
+                sub.node(i),
+                full.node(k + i)
+            );
+        }
+    }
+
+    /// **rules-ON** 的 from-interior cross-check：从中途节点重建子树时，调用方**必须传入正确的
+    /// `raises_on_street`**，否则 `drop_small_reraise` 会按错误上下文重算动作集（把 re-raise 的
+    /// 0.5pot 误当开池档保留）。这正是 [`PublicBettingTree::build_subtree`] 文档标红、而默认 rules
+    /// 的 [`build_subtree_from_interior_matches_descendant_block`] 测不到的路径（默认 rules 不读
+    /// 这俩参数，传 0/0 恒安全）。S6 step 4 接 `blueprint_advisor.rs:421` 时用的就是 rules-on
+    /// profile（`first_small_6max` 等），此测把那条路径的最大隐患提前钉死。
+    ///
+    /// 构造：HU 200BB + `{0.5,1,2}` + 仅开 `drop_small_reraise`（`width_redirect` 关 → `entrants`
+    /// 不被 [`filter_actions`] 读取，隔离出 `raises_on_street` 这一维）。路径 SB Call → BB Check →
+    /// flop 首攻 `Bet{0.5}` → 节点 K =「flop 面对下注」(`raises_on_street == 1`)：K 的菜单被
+    /// `drop_small_reraise` 删去 `Raise{0.5}`。双向钉死：
+    /// - 正确 seed `raises=1` → 子树 ≡ 全树 K 后代块；
+    /// - 错误 seed `raises=0` → 子树 root 漏删 `Raise{0.5}`、与 K 不同构（证 `raises_on_street`
+    ///   真的被 `build_subtree` 读取、不是被静默吞掉）。
+    #[test]
+    fn build_subtree_from_interior_rules_on_threads_raises_context() {
+        let cfg = TableConfig::default_hu_200bb();
+        let abs = StreetActionAbstraction::default_6_action();
+        // 仅开 drop_small_reraise（width_redirect 关 → entrants 不被读，单独测 raises 这一维）。
+        let rules = BettingAbstractionRules {
+            drop_small_reraise: true,
+            ..BettingAbstractionRules::default()
+        };
+        let full = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+
+        // 沿 [Call, Check, Bet(0.5)] 在全树定位 K（flop 面对 0.5pot 下注的 re-raise 决策点）。
+        let path = [
+            AbstractActionTag::Call,
+            AbstractActionTag::Check,
+            AbstractActionTag::Bet(BetRatio::HALF_POT),
+        ];
+        let mut k = full.root_id();
+        for &tag in &path {
+            let node = full.node(k);
+            let idx = node
+                .legal_actions
+                .iter()
+                .position(|t| *t == tag)
+                .unwrap_or_else(|| panic!("全树路径缺边 {tag:?} @ node {k}"));
+            k = match node.children[idx] {
+                Child::Decision(id) => id,
+                Child::Terminal => panic!("路径中途不该终局 @ {tag:?}"),
+            };
+        }
+        assert_eq!(full.node(k).street, StreetTag::Flop);
+        assert!(
+            !full
+                .node(k)
+                .legal_actions
+                .contains(&AbstractActionTag::Raise(BetRatio::HALF_POT)),
+            "全树 K（raises=1 re-raise）应已被 drop_small_reraise 删去 Raise{{0.5}}"
+        );
+
+        // 重建中途状态：开局 apply 同一串 concrete 动作（卡牌任意 → walk 卡牌无关）。
+        let mut rng = ChaCha20Rng::from_seed(0x5542_5452_4545_5F32); // "SUBTREE_2"
+        let mut mid = GameState::with_rng(&cfg, 0, &mut rng);
+        for &tag in &path {
+            let concrete = abs
+                .abstract_actions(&mid)
+                .iter()
+                .copied()
+                .find(|a| AbstractActionTag::of(a) == tag)
+                .unwrap_or_else(|| panic!("重建路径缺抽象动作 {tag:?}"));
+            mid.apply(concrete.to_concrete())
+                .unwrap_or_else(|_| panic!("apply {tag:?} 应合法"));
+        }
+        assert_eq!(mid.street(), Street::Flop);
+        assert!(!mid.is_terminal() && mid.current_player().is_some());
+
+        // 正确 seed（raises=1；entrants 不被读，传 0）→ 子树逐节点 ≡ 全树 K 后代块。
+        let sub = PublicBettingTree::build_subtree(&mid, &abs, rules, 0, 1);
+        assert!(
+            nodes_structurally_equal(sub.node(sub.root_id()), full.node(k)),
+            "正确 seed：子树 root 与全树 K 不同构\nsub ={:?}\nfull={:?}",
+            sub.node(sub.root_id()),
+            full.node(k)
+        );
+        assert!(
+            (k as usize) + sub.num_nodes() <= full.num_nodes(),
+            "后代块越界：K={k} + sub {} > full {}",
+            sub.num_nodes(),
+            full.num_nodes()
+        );
+        for i in 0..sub.num_nodes() as NodeId {
+            assert!(
+                nodes_structurally_equal(sub.node(i), full.node(k + i)),
+                "正确 seed：子树节点 {i} 与全树后代 {} 不同构\nsub ={:?}\nfull={:?}",
+                k + i,
+                sub.node(i),
+                full.node(k + i)
+            );
+        }
+
+        // 错误 seed（raises=0）→ root 漏删 Raise{0.5}、与 K 不同构（证 raises_on_street 真被读取）。
+        let wrong = PublicBettingTree::build_subtree(&mid, &abs, rules, 0, 0);
+        assert!(
+            wrong
+                .node(wrong.root_id())
+                .legal_actions
+                .contains(&AbstractActionTag::Raise(BetRatio::HALF_POT)),
+            "错误 seed (raises=0)：应把 re-raise 0.5pot 误当开池档保留"
+        );
+        assert!(
+            !nodes_structurally_equal(wrong.node(wrong.root_id()), full.node(k)),
+            "错误 seed 不该与全树 K 同构——否则说明 raises_on_street 未被 build_subtree 读取"
+        );
+    }
+
+    /// S6 6b depth-limit：[`PublicBettingTree::build_subtree_depth_limited`] 在街边界截断。
+    /// 从 HU flop 中途局出发、`limit_street=Flop`（只解 flop）：
+    /// ① 截断树节点数 ≪ 全子树；
+    /// ② 每个 `depth_limit_leaf` 在 Turn（Flop+1）、`legal_actions`/`children` 空、其 parent 在 Flop；
+    /// ③ 每个非叶节点在 Flop，且沿其 tag 路径在**全子树**定位到结构同构节点（证非叶块 = 全树忠实子结构）；
+    /// ④ 每个叶子沿其 tag 路径在全树落到真实 Turn 决策点（证"把深层子树剪成叶子"，非误删/误终局）；
+    /// ⑤ `limit_street=River`（flop root 最深可达街）→ 无截断、逐节点 ≡ `build_subtree`（no-op 边界）。
+    #[test]
+    fn build_subtree_depth_limited_truncates_at_street_boundary() {
+        let cfg = TableConfig::default_hu_200bb();
+        let abs = StreetActionAbstraction::default_6_action();
+        let rules = BettingAbstractionRules::default();
+
+        // 驱动到 flop 首决策点：SB complete（Call）→ BB option check → flop。
+        let mut rng = ChaCha20Rng::from_seed(0x4454_4C5F_464C_5031); // "DTL_FLP1"
+        let mut mid = GameState::with_rng(&cfg, 0, &mut rng);
+        let call = abs
+            .abstract_actions(&mid)
+            .iter()
+            .copied()
+            .find(|a| matches!(a, AbstractAction::Call { .. }))
+            .expect("SB 根应有 Call(complete)");
+        mid.apply(call.to_concrete()).expect("SB Call 应合法");
+        let check = abs
+            .abstract_actions(&mid)
+            .iter()
+            .copied()
+            .find(|a| matches!(a, AbstractAction::Check))
+            .expect("BB option 应有 Check");
+        mid.apply(check.to_concrete()).expect("BB Check 应合法");
+        assert_eq!(mid.street(), Street::Flop, "应进 flop");
+        assert!(!mid.is_terminal() && mid.current_player().is_some());
+
+        let full = PublicBettingTree::build_subtree(&mid, &abs, rules, 0, 0);
+        let limited = PublicBettingTree::build_subtree_depth_limited(
+            &mid,
+            &abs,
+            rules,
+            0,
+            0,
+            StreetTag::Flop,
+        );
+
+        assert!(
+            limited.num_nodes() < full.num_nodes(),
+            "截断树 {} 应远小于全子树 {}",
+            limited.num_nodes(),
+            full.num_nodes()
+        );
+
+        // 沿 tags 从 tree.root 导航；中途遇 Terminal → None。
+        let nav = |tree: &PublicBettingTree, tags: &[AbstractActionTag]| -> Option<NodeId> {
+            let mut id = tree.root_id();
+            for &tag in tags {
+                let node = tree.node(id);
+                let idx = node.legal_actions.iter().position(|t| *t == tag)?;
+                match node.children[idx] {
+                    Child::Decision(n) => id = n,
+                    Child::Terminal => return None,
+                }
+            }
+            Some(id)
+        };
+
+        let mut leaf_count = 0usize;
+        for i in 0..limited.num_nodes() as NodeId {
+            let node = limited.node(i);
+            let tags = limited.path_to_root(i);
+            if node.depth_limit_leaf {
+                leaf_count += 1;
+                assert_eq!(
+                    node.street,
+                    StreetTag::Turn,
+                    "叶子在 Flop+1=Turn（节点 {i}）"
+                );
+                assert!(
+                    node.legal_actions.is_empty() && node.children.is_empty(),
+                    "depth-limit 叶子无动作/子节点（节点 {i}）"
+                );
+                let p = node.parent.expect("叶子有 parent");
+                assert_eq!(
+                    limited.node(p).street,
+                    StreetTag::Flop,
+                    "叶子 parent 在 Flop"
+                );
+                // 全树同路径落到真实展开的 Turn 决策点（非剪枝）。
+                let f = nav(&full, &tags).expect("叶子路径在全树应可达决策点");
+                assert_eq!(
+                    full.node(f).street,
+                    StreetTag::Turn,
+                    "全树对应点是 Turn 决策"
+                );
+                assert!(
+                    !full.node(f).depth_limit_leaf && !full.node(f).legal_actions.is_empty(),
+                    "全树对应点是展开的真实决策点（非叶）"
+                );
+            } else {
+                assert_eq!(node.street, StreetTag::Flop, "非叶节点在 Flop（节点 {i}）");
+                let f = nav(&full, &tags).expect("非叶路径在全树应可达");
+                assert!(
+                    nodes_structurally_equal(node, full.node(f)),
+                    "非叶节点 {i} 与全树对应点不同构\nlim ={:?}\nfull={:?}",
+                    node,
+                    full.node(f)
+                );
+            }
+        }
+        assert!(leaf_count > 0, "应有 ≥1 个 depth-limit 叶子");
+
+        // ⑤ limit=River（flop root 最深可达街）→ 无截断 ≡ build_subtree。
+        let noop = PublicBettingTree::build_subtree_depth_limited(
+            &mid,
+            &abs,
+            rules,
+            0,
+            0,
+            StreetTag::River,
+        );
+        assert_eq!(
+            noop.num_nodes(),
+            full.num_nodes(),
+            "limit=River 应无截断（节点数 == 全子树）"
+        );
+        for i in 0..full.num_nodes() as NodeId {
+            assert!(
+                nodes_structurally_equal(noop.node(i), full.node(i))
+                    && !noop.node(i).depth_limit_leaf,
+                "limit=River 节点 {i} 应 ≡ 全子树且无叶标记"
+            );
         }
     }
 }

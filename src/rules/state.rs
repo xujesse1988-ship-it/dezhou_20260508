@@ -243,6 +243,178 @@ impl GameState {
         state
     }
 
+    /// 重采样隐藏信息（S6 实时搜索 subgame 发牌）。克隆本**中途**状态，**保留**公共牌前缀
+    /// （`board` = 已亮出的 flop/turn/river）+ 全部下注 / 筹码 / 街 / 行动权状态，**重发**所有
+    /// 未弃牌座位的底牌 + 未见的 runout 公共牌后缀（从去掉可见牌的牌堆里 Fisher-Yates 抽），
+    /// 据新发的牌重算 `showdown_ranks`。弃牌座位 `hole_cards` 保持 `None`（保留弃牌结构）。
+    ///
+    /// 用途：subgame CFR 在固定 public state 下对各家 range 做期望——每次 CFR `step` 由
+    /// `Game::root` 调本函数得一个隐藏信息的随机补全（external chance sampling），betting 子树
+    /// 照常 `apply` 推进，终局收益仍走**权威** [`payouts`](Self::payouts)（side pot / showdown
+    /// 逻辑一行不动 → S1 PokerKit 跨验证不受影响）。MVP 用 uniform range（任意补全）；后续可按
+    /// blueprint range 加权 / 拒绝采样。
+    ///
+    /// **加性**：现有构造函数 / `apply` / `payouts` / 发牌协议全不改动；本方法只在 clone 上覆写
+    /// 卡牌字段（`hole_cards` / `runout_board` / `showdown_ranks`），其余下注 / 公共 / 行动权字段
+    /// （`board` / 街 / 筹码 / `current_player` / `raise_option_open` / `last_*` …）逐字保留。
+    ///
+    /// 唯一例外：返回状态强制 `track_history = false`（对齐 base `SimplifiedNlheGame::root` 的
+    /// [`with_rng_no_history`](Self::with_rng_no_history) CFR fast path）。否则从 `track_history =
+    /// true` 的权威局 clone 来时，每步 re-solve 都会在 `apply` 的 action 记录 / `finalize_terminal`
+    /// 历史写入 / 逐 apply 增长的 `history.actions`（使 per-node clone 退化成 O(depth²)）上白付开销
+    /// （CFR / `payouts` 都不读 history；`hand_history()` 在 subgame 状态上无意义）。
+    ///
+    /// 前置：`self` 须为非终局（实时搜索从 decision 节点为根）。同 `(self, rng 状态)` 必出同补全
+    /// （byte-equal 可复现）。
+    pub(crate) fn resample_hidden(&self, rng: &mut dyn RngSource) -> GameState {
+        debug_assert!(
+            !self.terminal && self.current_player.is_some(),
+            "resample_hidden 只用于非终局中途 decision 状态"
+        );
+        let mut state = self.clone();
+        // Subgame 状态仅供 CFR 求解：强制走 no-history fast path（见上方 doc）——避免从
+        // track_history=true 的权威局 clone 来时每步 re-solve 白付 history 开销。
+        state.track_history = false;
+        let visible_len = state.board.len();
+
+        // 去掉可见公共牌（board 前缀）的剩余牌堆。
+        let visible: BTreeSet<u8> = state.board.iter().map(|c| c.to_u8()).collect();
+        let mut deck: Vec<Card> = (0u8..52)
+            .filter(|v| !visible.contains(v))
+            .map(|v| Card::from_u8(v).expect("0..52 are valid cards"))
+            .collect();
+        // Fisher-Yates（同 `with_rng_opts` 抽法：尾部缩小，`next_u64 % range`）。
+        let len = deck.len();
+        for i in 0..len.saturating_sub(1) {
+            let j = i + (rng.next_u64() % ((len - i) as u64)) as usize;
+            deck.swap(i, j);
+        }
+
+        // 重发未弃牌座位底牌（seat index 序，确定性），再发 runout 后缀。
+        let mut cursor = 0usize;
+        for idx in 0..state.players.len() {
+            if state.players[idx].hole_cards.is_some() {
+                state.players[idx].hole_cards = Some([deck[cursor], deck[cursor + 1]]);
+                cursor += 2;
+            }
+        }
+        // runout：前缀 = 已亮公共牌（强制与 board 一致），后缀从牌堆补。
+        let mut runout = state.runout_board;
+        for (i, slot) in runout.iter_mut().enumerate() {
+            if i < visible_len {
+                *slot = state.board[i];
+            } else {
+                *slot = deck[cursor];
+                cursor += 1;
+            }
+        }
+        debug_assert!(
+            cursor <= deck.len(),
+            "resample_hidden 抽牌越界：cursor={cursor} > deck {}",
+            deck.len()
+        );
+        state.runout_board = runout;
+
+        // 重算 showdown_ranks（同 `with_rng_opts`：hole + 全 5 runout）。
+        state.showdown_ranks = state
+            .players
+            .iter()
+            .map(|p| {
+                p.hole_cards.map(|hole| {
+                    eval::eval7(&[
+                        hole[0], hole[1], runout[0], runout[1], runout[2], runout[3], runout[4],
+                    ])
+                })
+            })
+            .collect();
+
+        // history.hole_cards 不再同步：track_history 已置 false，subgame 不维护 history。
+        state
+    }
+
+    /// 同 [`resample_hidden`](Self::resample_hidden)，但未弃牌座位的底牌由调用方**给定**
+    /// （S6 §5b：subgame root 按 blueprint range 加权采样的结果——range 估计 + 采样是训练层
+    /// 逻辑，本方法只做规则层的「装牌 + 补 runout + 重算 showdown」，不含 blueprint 知识）。
+    ///
+    /// `holes[seat]` 须与 `self` 的 live 模式一致：未弃牌座位 `Some([c0,c1])`、已弃 `None`。
+    /// runout 后缀从「52 − 公共牌 − 全部给定底牌」的剩余牌堆补；`showdown_ranks` 重算；与
+    /// [`resample_hidden`](Self::resample_hidden) 一样强制 `track_history = false`。终局收益仍走
+    /// 权威 [`payouts`](Self::payouts)（side pot / showdown 一行不动 → S1 跨验证不受影响）。
+    ///
+    /// 调用方须保证 `holes` 两两不冲突且不撞 board（range 采样的 card-removal 负责）；debug 下
+    /// 断言无冲突，release 下 `used` 仍正确排除（runout 不会重复发牌）。
+    pub(crate) fn resample_hidden_with_holes(
+        &self,
+        holes: &[Option<[Card; 2]>],
+        rng: &mut dyn RngSource,
+    ) -> GameState {
+        debug_assert!(
+            !self.terminal && self.current_player.is_some(),
+            "resample_hidden_with_holes 只用于非终局中途 decision 状态"
+        );
+        debug_assert_eq!(holes.len(), self.players.len(), "holes 长度须 == 座位数");
+        let mut state = self.clone();
+        state.track_history = false;
+        let visible_len = state.board.len();
+
+        // 装入给定底牌（live 模式须与 template 一致）；`used` 累积 board + 全部底牌。
+        let mut used: BTreeSet<u8> = state.board.iter().map(|c| c.to_u8()).collect();
+        for (idx, hole) in holes.iter().enumerate() {
+            debug_assert_eq!(
+                hole.is_some(),
+                state.players[idx].hole_cards.is_some(),
+                "holes[{idx}] live 模式须与 template 一致"
+            );
+            if let Some(h) = hole {
+                state.players[idx].hole_cards = Some(*h);
+                // insert 必须在 debug_assert 外（release 也要排除，否则 runout 重复发牌）。
+                let a = used.insert(h[0].to_u8());
+                let b = used.insert(h[1].to_u8());
+                debug_assert!(a && b, "底牌与 board/其它底牌冲突 @ seat {idx}");
+            }
+        }
+
+        // 剩余牌堆 = 52 − used；Fisher-Yates（同 resample_hidden 抽法）；补 runout 后缀。
+        let mut deck: Vec<Card> = (0u8..52)
+            .filter(|v| !used.contains(v))
+            .map(|v| Card::from_u8(v).expect("0..52 are valid cards"))
+            .collect();
+        let len = deck.len();
+        for i in 0..len.saturating_sub(1) {
+            let j = i + (rng.next_u64() % ((len - i) as u64)) as usize;
+            deck.swap(i, j);
+        }
+        let mut runout = state.runout_board;
+        let mut cursor = 0usize;
+        for (i, slot) in runout.iter_mut().enumerate() {
+            if i < visible_len {
+                *slot = state.board[i];
+            } else {
+                *slot = deck[cursor];
+                cursor += 1;
+            }
+        }
+        debug_assert!(
+            cursor <= deck.len(),
+            "resample_hidden_with_holes 抽牌越界：cursor={cursor} > deck {}",
+            deck.len()
+        );
+        state.runout_board = runout;
+
+        state.showdown_ranks = state
+            .players
+            .iter()
+            .map(|p| {
+                p.hole_cards.map(|hole| {
+                    eval::eval7(&[
+                        hole[0], hole[1], runout[0], runout[1], runout[2], runout[3], runout[4],
+                    ])
+                })
+            })
+            .collect();
+        state
+    }
+
     /// 当前要行动的玩家。手牌结束 / 全员 all-in 跳轮时返回 `None`。
     pub fn current_player(&self) -> Option<SeatId> {
         self.current_player
@@ -1086,4 +1258,222 @@ fn seat_order(button: SeatId, n: usize, start_offset: usize) -> Vec<SeatId> {
     (0..n)
         .map(|offset| SeatId(((button.0 as usize + start_offset + offset) % n) as u8))
         .collect()
+}
+
+#[cfg(test)]
+mod resample_tests {
+    //! `resample_hidden`（S6 subgame 发牌）的规则层不变量：保留下注/公共牌状态、重发隐藏牌、
+    //! 无重复牌、showdown_ranks 与新牌自洽、可推进到权威终局且筹码守恒、byte-equal 可复现。
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// 构造一个 flop 中途状态（HU 200BB：SB complete → BB check → flop，双方 Active、board 3 张）。
+    fn flop_mid_state(seed: u64) -> GameState {
+        let cfg = TableConfig::default_hu_200bb();
+        let mut s = GameState::new(&cfg, seed);
+        s.apply(Action::Call).expect("SB complete 合法"); // SB(button) 先动
+        s.apply(Action::Check).expect("BB check 合法"); // BB option check → flop
+        assert_eq!(s.street(), Street::Flop, "应进 flop");
+        assert_eq!(s.board().len(), 3, "flop 板 3 张");
+        assert!(!s.is_terminal() && s.current_player().is_some());
+        s
+    }
+
+    /// 被动推进到终局（check 优先 → call → fold → all-in），用于走到 showdown 验证守恒。
+    fn play_passive_to_terminal(state: &mut GameState) {
+        let mut guard = 0;
+        while !state.is_terminal() {
+            let la = state.legal_actions();
+            let action = if la.check {
+                Action::Check
+            } else if la.call.is_some() {
+                Action::Call
+            } else if la.fold {
+                Action::Fold
+            } else {
+                Action::AllIn
+            };
+            state.apply(action).expect("passive 动作应合法");
+            guard += 1;
+            assert!(guard < 64, "被动推进未终止（死循环）");
+        }
+    }
+
+    /// 主不变量：保留态 + 公共牌前缀 + 无重复牌 + showdown_ranks 自洽。
+    #[test]
+    fn resample_invariants() {
+        let base = flop_mid_state(0xA11CE);
+        let mut rng = ChaCha20Rng::from_seed(0x5245_5341_4D50_4C45); // "RESAMPLE"
+        let r = base.resample_hidden(&mut rng);
+
+        // 保留：街 / 公共牌 / 当前行动者 / 每座筹码与状态 / pot。
+        assert_eq!(r.street(), base.street());
+        assert_eq!(r.board(), base.board(), "公共牌前缀必须保留");
+        assert_eq!(r.current_player(), base.current_player());
+        assert_eq!(r.pot(), base.pot());
+        assert_eq!(r.players().len(), base.players().len());
+        for (a, b) in r.players().iter().zip(base.players().iter()) {
+            assert_eq!(a.seat, b.seat);
+            assert_eq!(a.stack, b.stack, "stack 不应被 resample 改动");
+            assert_eq!(a.committed_this_round, b.committed_this_round);
+            assert_eq!(a.committed_total, b.committed_total);
+            assert_eq!(a.status, b.status, "弃牌/在场结构必须保留");
+        }
+
+        // runout 前缀 == 可见公共牌。
+        let vis = r.board().len();
+        for i in 0..vis {
+            assert_eq!(r.runout_board[i], r.board()[i], "runout 前缀须等于可见板");
+        }
+
+        // 无重复牌（I-003）：所有非弃牌底牌 + 全 5 runout 互不相同。
+        let mut seen: BTreeSet<u8> = BTreeSet::new();
+        let mut count = 0usize;
+        for p in r.players() {
+            if let Some(h) = p.hole_cards {
+                for c in h {
+                    assert!(seen.insert(c.to_u8()), "底牌与他牌重复：{c:?}");
+                    count += 1;
+                }
+            }
+        }
+        for c in r.runout_board {
+            assert!(seen.insert(c.to_u8()), "runout 与他牌重复：{c:?}");
+            count += 1;
+        }
+        assert_eq!(seen.len(), count, "存在重复牌");
+
+        // showdown_ranks 与新发牌自洽（= eval7(hole + 全 5 runout)）。
+        for (idx, p) in r.players().iter().enumerate() {
+            match p.hole_cards {
+                Some(h) => {
+                    let expect = eval::eval7(&[
+                        h[0],
+                        h[1],
+                        r.runout_board[0],
+                        r.runout_board[1],
+                        r.runout_board[2],
+                        r.runout_board[3],
+                        r.runout_board[4],
+                    ]);
+                    assert_eq!(
+                        r.showdown_ranks[idx],
+                        Some(expect),
+                        "座 {idx} showdown_rank 与重发牌不一致"
+                    );
+                }
+                None => assert_eq!(r.showdown_ranks[idx], None, "弃牌座 rank 应为 None"),
+            }
+        }
+    }
+
+    /// resample 后的状态可经**权威** apply 推进到 showdown 终局，且 per-seat 净 PnL 守恒（Σ==0）。
+    /// 终局收益由重发的 showdown_ranks 决定（走 `payouts()`，side pot/showdown 逻辑未改）。
+    #[test]
+    fn resample_plays_to_terminal_conserves() {
+        let base = flop_mid_state(0xBEEF);
+        let mut rng = ChaCha20Rng::from_seed(0x0DDC_0FFE_E0DD_F00D);
+        let mut r = base.resample_hidden(&mut rng);
+        play_passive_to_terminal(&mut r);
+        assert!(r.is_terminal());
+        let payouts = r.payouts().expect("终局应有 payouts");
+        let sum: i64 = payouts.iter().map(|(_, pnl)| *pnl).sum();
+        assert_eq!(sum, 0, "per-seat 净 PnL 必须守恒 Σ==0");
+        assert_eq!(payouts.len(), base.players().len());
+    }
+
+    /// 同 (状态, rng seed) → 同补全（byte-equal 可复现：CFR 可复现的前提）。
+    #[test]
+    fn resample_is_deterministic() {
+        let base = flop_mid_state(0xF00D);
+        let mut rng_a = ChaCha20Rng::from_seed(0x1234_5678_9ABC_DEF0);
+        let mut rng_b = ChaCha20Rng::from_seed(0x1234_5678_9ABC_DEF0);
+        let a = base.resample_hidden(&mut rng_a);
+        let b = base.resample_hidden(&mut rng_b);
+        for (pa, pb) in a.players().iter().zip(b.players().iter()) {
+            assert_eq!(pa.hole_cards, pb.hole_cards, "同 seed resample 底牌须一致");
+        }
+        assert_eq!(
+            a.runout_board, b.runout_board,
+            "同 seed resample runout 须一致"
+        );
+        assert_eq!(a.showdown_ranks, b.showdown_ranks);
+    }
+
+    /// `resample_hidden_with_holes`（S6 §5b 装牌路径）：给定底牌被精确装入、保留态不变、
+    /// runout 不撞给定底牌、showdown 自洽、可推进到终局且守恒。
+    #[test]
+    fn resample_with_holes_installs_runout_disjoint_and_conserves() {
+        let base = flop_mid_state(0xC0DE);
+        assert!(
+            base.players().iter().all(|p| p.hole_cards.is_some()),
+            "HU flop 两座都 live"
+        );
+        // 选 4 张不撞 board 的牌作两手底牌。
+        let board: BTreeSet<u8> = base.board().iter().map(|c| c.to_u8()).collect();
+        let avail: Vec<u8> = (0u8..52).filter(|v| !board.contains(v)).collect();
+        let h0 = [
+            Card::from_u8(avail[0]).unwrap(),
+            Card::from_u8(avail[1]).unwrap(),
+        ];
+        let h1 = [
+            Card::from_u8(avail[2]).unwrap(),
+            Card::from_u8(avail[3]).unwrap(),
+        ];
+        let holes = vec![Some(h0), Some(h1)];
+
+        let mut rng = ChaCha20Rng::from_seed(0x5749_5448_4F4C_4553); // "WITHOLES"
+        let mut r = base.resample_hidden_with_holes(&holes, &mut rng);
+
+        // 给定底牌精确装入。
+        assert_eq!(r.players()[0].hole_cards, Some(h0), "seat0 底牌须 == 给定");
+        assert_eq!(r.players()[1].hole_cards, Some(h1), "seat1 底牌须 == 给定");
+        // 保留态。
+        assert_eq!(r.street(), base.street());
+        assert_eq!(r.board(), base.board(), "公共牌前缀保留");
+        assert_eq!(r.current_player(), base.current_player());
+        assert_eq!(r.pot(), base.pot());
+        // runout 前缀 == board；无重复牌（底牌 + runout disjoint）。
+        for i in 0..r.board().len() {
+            assert_eq!(r.runout_board[i], r.board()[i]);
+        }
+        let mut seen: BTreeSet<u8> = BTreeSet::new();
+        for p in r.players() {
+            if let Some(h) = p.hole_cards {
+                for c in h {
+                    assert!(seen.insert(c.to_u8()), "底牌重复：{c:?}");
+                }
+            }
+        }
+        for c in r.runout_board {
+            assert!(seen.insert(c.to_u8()), "runout 撞底牌/board：{c:?}");
+        }
+        // showdown 自洽。
+        for (idx, p) in r.players().iter().enumerate() {
+            if let Some(h) = p.hole_cards {
+                let expect = eval::eval7(&[
+                    h[0],
+                    h[1],
+                    r.runout_board[0],
+                    r.runout_board[1],
+                    r.runout_board[2],
+                    r.runout_board[3],
+                    r.runout_board[4],
+                ]);
+                assert_eq!(
+                    r.showdown_ranks[idx],
+                    Some(expect),
+                    "座 {idx} showdown 不自洽"
+                );
+            }
+        }
+        // 可推进到权威终局 + 守恒。
+        play_passive_to_terminal(&mut r);
+        let payouts = r.payouts().expect("终局应有 payouts");
+        assert_eq!(
+            payouts.iter().map(|(_, pnl)| *pnl).sum::<i64>(),
+            0,
+            "per-seat 净 PnL 须守恒 Σ==0"
+        );
+    }
 }

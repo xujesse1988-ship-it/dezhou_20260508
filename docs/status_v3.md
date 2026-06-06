@@ -37,6 +37,45 @@ GameState + 每 blueprint 一份抽象影子,off-tree 翻译推进;slumbot_advis
 (不能干净排内在强度);**实测码深漂移严重**(真实桌 14BB–800BB)。剩绝对强度量化(挂场数百手 + 排行榜,需用户授权时长)。
 详见 `six_max_nlhe_target.md` S4 续⑥⑦ + S5 续、`temp/openpoker_client_design_2026_06_02.md` §9。
 
+**S6 进度(2026-06-03):实时搜索推进,MVP subgame-solver 核心已落地 + vultr 验证**(分支 `6max-rts-mvp`
+commit `cf9efdb`,**未并入 6max**)。设计成文 `temp/realtime_search_design_2026_06_03.md`(文献调研+代码复用映射+
+对抗验证):方法定型 = Pluribus/Modicum tabular depth-limited search(非 DeepStack/ReBeL)。三件落地:①
+`PublicBettingTree::build_subtree`(以中途 public state 为根建 betting 子树,`nlhe_betting_tree.rs`);②**加性**
+`GameState::resample_hidden`(克隆中途态+保留公共牌/下注态+重发隐藏牌,终局走权威 `payouts()` → **S1 不受影响**,
+`rules/state.rs`);③ `SubgameNlheGame impl Game`(delegate SimplifiedNlheGame、仅重写 root()=resample+子树 →
+复用 `EsMccfrTrainer` 零改,`training/subgame.rs`)。**6a 收尾已落地**(commit `a8f1b96`):④ `subgame_search`
+接 `blueprint_advisor.rs:421`(`should_search` flop 未起注首决策点触发 + 失败回落 blueprint;`Contestant.search`
+默认 None = byte-equal 旧行为) + `SearchObserver` 计搜索触发/fallback;⑤ 探针 `tools/six_max_search_probe`
+(同一 blueprint 拆 search-on vs search-off,出 mbb/g+CI95)。**vultr 验证**:lib 71/0/8 无回归;真 1B nolimp
+ckpt smoke(600 手)plumbing 健康——desync=0/illegal=0、search 真触发(fallback 1.5%)、加载无 OOM;mbb/g CI
+600 手太宽不可判。子树实测:6-max first_small(3) flop=4434 节点 < cap 8000(探针不被误拒)。**§5b range
+去 confound 已落地**(用户选路线乙,commit `ac3968b`):root 按 blueprint 沿历史累乘 reach 的 per-seat marginal
+range 加权采样(非 uniform)→ 探针**升级成真正 §2 判别器**(解 blueprint 真 range 下子博弈);新增规则层
+`resample_hidden_with_holes` + `estimate_range`(逐街 re-bucket) + range-weighted root + `--uniform-range`
+A/B。仍在近似 = marginal/桶粒度 + 欠迭代噪声(MVP 解到真实终局、小子树无叶子近似,故「无 blueprint 叶子」非
+confound)。vultr lib 74/0/8;range-on vs uniform smoke 均 desync=0/search 触发/无 OOM(600 手 CI 仍宽)。
+**vultr 中样本首信号**(24k 手,§10.3):range-on −71.6 CI[−232,+89] / uniform −81.6,两 arm CI 跨 0 = 不退化、
+range≈uniform、§2 灾难失败未现。**放宽触发面实验**(§10.4,commit `996879b`):加 `SearchTrigger{FlopFirstUnraised,
+AllPostflop}` + 任意节点现算 `(entrants,raises_on_street)`(`live_entrants`+`raises_on_current_street` 沿
+decisions_on_path 数当前街进攻,补多档计数缺口)。**实测 all-postflop 朴素放宽显著退化**(24k −192 CI[−376,−8.3];
+12k @3000 −426 / @12000 −310 仍负 → **非迭代噪声、结构性**,退化集中盲位)→ 根因 = MVP 从当前决策点独立重解、
+mid-round 撞 §6 #1/#2 landmine(非 round-start 重解+无 within-round 冻结);flop-first 因 = round-start 恰好正确。
+**根因已隔离**(all-postflop range vs uniform A/B):24k range −192 vs uniform −501 → ① §5b range **大幅 help +310**
+(不是退化源、反是修正,价值被放宽触发面揭示)② 残余 −192 = §6 landmine 非 range(迭代扫排噪声+本 A/B 排 range)。
+默认 trigger 设回 FlopFirstUnraised(安全),AllPostflop 留研究 opt-in。详见 `temp/realtime_search_design_2026_06_03.md`
+§10.2–10.4 + target S6。
+**§10.5 round-start re-solve 已落地——实测推翻 §10.4 的 §6-landmine 归因**(commit `8fde9bc`,vultr lib **76/0/8**):
+实现 `ResolveRoot{CurrentDecision,RoundStart}`(默认 RoundStart;从 betting-round 起点建子树+within-round 导航+
+round-stable seed 给一致性)。**两 control 复现 harness**:current-decision×all-postflop=−192(=§10.4 byte-equal)、
+flop-first=−72。**主 A/B(24k@3000)**:round-start×all-postflop **−407** vs current-decision −192——round-start **更差**
+(5/6 位一致),根因 = deep-node 欠训练(ARM3 判别器:flop-first 读 root 训透=−62 中性,all-postflop 读深层节点欠训练=−407;
+fallback 6.1%>3.7%)。**迭代扫(12k)**:current-decision −426/−310/−273、round-start −527/−366/−287 @{3k,12k,24k}——
+两模式随 iters 改善但**收敛到负 plateau ~−270/−287,CI 上界仍<0**。**结论(修正 §10.4)**:① **§6 round-start **不是**退化的杠杆**
+(等迭代更差、高迭代持平,不 beat current-decision);② all-postflop 退化 = 欠训练(iters 修一截)+ **残余结构 ~−270(§2 materialized:
+近似 marginal-range+桶粒度的子博弈在 mid-street 劣于 1B blueprint 自身响应);③ **瓶颈 = blueprint/抽象质量(§2),非搜索 root**——
+flop-first(干净点、训透)中性不亏、all-postflop 弱基底反退化。**战略岔路(待拍板)**:甲 强化 blueprint / 6b biased-leaf /
+丙 收尾 flop-first-only / 丁 更好 range 建模。详见设计 §10.5。
+
 **6-max 范式切换**:多人一般和 → CFR 不保证收敛 Nash、**LBR/exploitability 失去理论意义**(只当诊断,质量以
 实测对战为准)、无"训到 floor 就停"、无强 6-max 公开参考对手(不像 Slumbot 之于 HUNL)。详见 target 文档。
 
@@ -95,7 +134,7 @@ InfoSetId position 已留 4 bit(支持 0..15 座,`abstraction/map/mod.rs`)、den
 
 | host | 角色 | 状态 |
 |---|---|---|
-| vultr 64.176.35.138 (4 vCPU / 7.7 GiB) | 持久存储 + 短测试 | 长期持有;**跑不动 NLHE 训练**(3M update 进 swap) |
+| vultr 64.176.35.138 (4 vCPU / 11.67 GiB) | 持久存储 + 短测试 | 长期持有;**跑不动 NLHE 训练**(3M update 进 swap) |
 | AWS(按需起/停,IP 每次变) | 训练 | HU 用 c6a.8xlarge(32 vCPU);6-max 大概率不够,待 S2 sizing 定更大机 |
 
 ## 构建 / 测试

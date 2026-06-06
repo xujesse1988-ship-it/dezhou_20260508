@@ -45,6 +45,8 @@ pub mod nlhe_eval;
 pub mod nlhe_replay;
 pub mod regret;
 pub mod sampling;
+pub mod subgame;
+pub mod subgame_leaf_value;
 pub mod trainer;
 
 // API-300 / API-380 顶层公开 surface（与 `docs/pluribus_stage3_api.md` §8 对齐）。
@@ -53,6 +55,7 @@ pub use best_response::{exploitability, BestResponse, KuhnBestResponse, LeducBes
 pub use blueprint_advisor::{
     advance_shadow_by_applied, evaluate_cross_abstraction_h2h, outgoing_action,
     play_cross_abstraction_hand, Contestant, CrossAbstractionH2hReport, CrossH2hConfig, HandError,
+    SearchObserver,
 };
 pub use checkpoint::Checkpoint;
 pub use game::{Game, NodeKind, PlayerId};
@@ -71,6 +74,12 @@ pub use nlhe_eval::{
     NlheMultiwayEvalReport,
 };
 pub use regret::{RegretTable, StrategyAccumulator};
+pub use subgame::{
+    should_search, subgame_search, ResolveRoot, SearchTrigger, SubgameNlheGame, SubgameSearchConfig,
+};
+pub use subgame_leaf_value::{
+    build_leaf_value_tables, default_continuations, BiasKind, ContinuationSpec, LeafValueTables,
+};
 pub use trainer::{EsMccfrTrainer, Trainer, VanillaCfrTrainer};
 
 // CheckpointError + TrainerError + TrainerVariant + GameVariant 物理位置在
