@@ -450,6 +450,26 @@ preopen = nolimp + preflop `{0.5,1}`（0.5 = 2.25BB 开池档，非 SB 仍禁 li
   (a)「跑满 5B 看 SB 翻转率」**不必做**（混合区，5B 也不降）;(b)「删 SB limp」变体**不做**（会主动偏离 GTO 的 limp 49% 目标）。
 - 真正未决的只剩**实测对战是否更强**——属 S5（仍缺强参考对手）。reshape 只保证目标更干净 + 训得更透，不直接 = 更强。
 
+**⑧ 10B preopen 收敛诊断（2026-06-07，实测确认⑥⑦ 预测 + 修正「更多训练无用」）**
+
+训了个 10B preopen blueprint（`artifacts/run_6max_s4_preopen_n3_10b/nlhe_es_mccfr_final_010000000000.ckpt`，N=3 /
+200 桶 / all-in-deleted preopen 树 157.85M infoset；vultr 训练 commit `39906d8`，= origin/6max 祖先，`first_small_preopen_6max`
+含 `drop_preflop_open_allin`）。诊断工具：`nlhe_dense_preflop_169_dump --reshape preopen` + `scripts/conv_diag_10b.py`
+（翻转率脚本经 doc `temp/sb_rfi_preopen_1b_2b_2026_06_02.md` 的 SB-2B 数据校准、复现 17.1% + 漂移 0.284）+ 临时给 dump 插
+`regret_table().touched_count()/.indexer().total_rows()` 测 coverage（跑完 git checkout 还原）。
+
+- **coverage：56.6%(1B) → 65.9%(2B) → 82.55%(10B)**（130.3M/157.85M visited）。⇒ ⑥ 的「非盲位 1B 已够、更多训练对 preflop
+  没用」对，但**对 coverage 错**——8B 额外更新真把 S4续① 那个 binding constraint（覆盖率）从 65.9% 推到 82.55%（仍爬但
+  强减速 9.3→2.1 pts/B，残 17.4% = 深层多人 off-path 线）。「更多训练不是杠杆」只对 preflop 成立。
+- **非盲位 preflop（UTG/HJ/CO/BTN）：完全收敛 = preopen-2B**。翻转率 0–0.3%（2B 0.2–0.5%）、溢价 AA/KK/QQ/JJ/AKs/AKo
+  全 raise 1.00、combo-weighted RFI UTG 18.2% / BTN 45.2% ≈ ⑥ preopen 18% / 44–45%。更多训练在这没改进 = 本就收敛。
+- **SB：翻转率 2B 17.1% → 10B 17.4%，5× 训练量纹丝不动 → 抽象天花板确诊**，闭掉⑦ 悬案（实证⑥「跑满 5B 也不降」预测）。
+  AA raise 0.59 / limp 0.41 ≈ GTO Wizard 真值 53/47。两独立 run（2B 旧树 / 10B 新树）都落 ~17% flip + VPIP ~63%、但每手
+  L1 差 0.393（> 1B→2B 的 0.284）→ SB 无唯一稳定点（平 EV limp basin），结构性 churn 非欠训练。**跑 20B/50B 也不降 SB flip。**
+  （caveat：0.393 是跨 run/seed/树三重混合，非干净同轨迹漂移；load-bearing 证据是单 ckpt 内在的翻转率 17.1→17.4 不动。）
+- **对 S6 的意义**：这个 82.55%-coverage blueprint 远强于 §10.5 / 设计 §11.5 判「瓶颈 = blueprint 质量」时用的 1B（56%）
+  blueprint → 用它重测 6b-5 机制 A/B（设计 §11.5 预测「更好 blueprint 是杠杆」），详见设计 §11.5c（blueprint 已就绪、A/B 待跑）。
+
 ### S5：6-max 评测重构
 
 > **状态（2026-06-03）：① + ② 端到端打通**（§7 步 1-4 全完成，见下「S5 续」）。① 实测 nolimp×preopen 相对强度
@@ -641,6 +661,9 @@ showdown 一行不动 → **S1 PokerKit 跨验证不受影响**）。`EsMccfrTra
   marginal-range + 桶粒度的子博弈在 mid-street 劣于 1B blueprint 自身响应；③ **瓶颈 = blueprint/抽象质量（§2），非
   搜索 root**——flop-first（干净点、训透）中性不亏、all-postflop 弱基底反退化。**战略岔路（待拍板）**：甲 强化
   blueprint / 6b biased-leaf / 丙 收尾 flop-first-only / 丁 更好 range 建模。
+- **进展（2026-06-07）**：(甲/丁) 已训 + 诊断 10B preopen blueprint（coverage 82.55%，非盲位 preflop 全收敛，
+  见 S4续⑧）——正是本节判「瓶颈 = blueprint 质量」时所缺的强基底（当时只有 56%-coverage 的 1B）。下一步即用它重测
+  6b-5 机制 A/B（设计 §11.5c：blueprint 已就绪、A/B 待跑）。
 
 **验收范式改写**：6-max 下 LBR/exploitability 失去理论意义 → **删 pluribus_path.md 6b「LBR 显著下降」闸门**，
 改为 `evaluate_cross_abstraction_h2h` 受控 A/B（search-on vs search-off）实测 mbb/g + CI + OpenPoker live。6a/6b/6c

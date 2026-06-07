@@ -704,6 +704,23 @@ leaf-hands=50000 也大概率高 miss → depth-limit 臂的深街叶子多为 0
 大一个量级（river 覆盖），或 (b) **只对 flop 搜索用 depth-limit**（turn 叶子覆盖好）、turn/river 解到终局，或 (c) 深街叶子
 改粗粒度值抽象（pot/active/pos 而非 per-node）。配对差 smoke 同跑通（480 手 Δ+106、CI 跨 0 = 小样本噪声，但机制正确）。
 
+### 11.5c 更好 blueprint 就绪：10B preopen（coverage 82.55%）—— §11.5「杠杆」前提已满足，完整 A/B 待跑（2026-06-07）
+
+§11.5 的判决卡在「叶子值建在弱 1B blueprint 上 → 继承其偏；机制 help、但 blueprint 质量是绝对水平的 cap」，并预测
+**「更好 blueprint 是杠杆」**。该前提现已满足：训了 10B preopen blueprint 并独立诊断（详见 target 文档 S4续⑧）：
+
+- coverage **56.6%(1B) → 65.9%(2B) → 82.55%(10B)**——远高于 §11.5 / §10.5 判瓶颈时用的 1B（56%）。非盲位 preflop 全
+  收敛（翻转率 0–0.3%、溢价全 raise 1.00）；SB 残留 17% 翻转确诊 = 抽象天花板（GTO limp 混合区）非欠训练（5× 训练量不动）。
+- ckpt `artifacts/run_6max_s4_preopen_n3_10b/nlhe_es_mccfr_final_010000000000.ckpt`（N=3 / 200 桶 / all-in-deleted
+  preopen 树 157.85M infoset，训练 commit `39906d8` = origin/6max 祖先）。`six_max_search_probe` 已支持 `--reshape preopen`
+  直接吃，dense layout fingerprint 对上 = 树 byte-identical。
+
+**重测计划（待跑——用户 2026-06-07 暂停在「先回写文档、不重测」）**：用 10B preopen 重跑 §11.5 三臂机制 A/B（A 解到
+终局 / B depth-limit unbiased / C depth-limit+biased），同 seed 池配对、`--trigger all-postflop --resolve round-start`、
+`--reshape preopen --postflop-cap 3`。**关键：须按 §11.5b 把 leaf-hands 大一个量级**（50000 仍 leaf-miss 72.5%）以覆盖
+river 叶子，否则 depth-limit 臂仍在「大量 0 叶子」下测、污染判决。预期（§11.5 推断）：强基底下 6b 才可能把最佳臂从
+−409 推向 break-even/正；若仍显著负，则印证「blueprint-only + 单层 6b 在本抽象下达不到」、回到 S5 实测对战定调。
+
 ### 11.6 已知近似（解读探针时记住）
 
 - **叶子值 = per-seat marginal range 下 self-play 均值**（同 §5b 工程折中）；街起点高频 → 覆盖好，但 miss
