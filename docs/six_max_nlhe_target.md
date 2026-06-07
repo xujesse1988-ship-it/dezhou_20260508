@@ -662,8 +662,18 @@ showdown 一行不动 → **S1 PokerKit 跨验证不受影响**）。`EsMccfrTra
   搜索 root**——flop-first（干净点、训透）中性不亏、all-postflop 弱基底反退化。**战略岔路（待拍板）**：甲 强化
   blueprint / 6b biased-leaf / 丙 收尾 flop-first-only / 丁 更好 range 建模。
 - **进展（2026-06-07）**：(甲/丁) 已训 + 诊断 10B preopen blueprint（coverage 82.55%，非盲位 preflop 全收敛，
-  见 S4续⑧）——正是本节判「瓶颈 = blueprint 质量」时所缺的强基底（当时只有 56%-coverage 的 1B）。下一步即用它重测
-  6b-5 机制 A/B（设计 §11.5c：blueprint 已就绪、A/B 待跑）。
+  见 S4续⑧）——正是本节判「瓶颈 = blueprint 质量」时所缺的强基底（当时只有 56%-coverage 的 1B）。
+- **6b-5 完整 A/B 重测已跑（2026-06-07，vultr，详见设计 §11.5d）——§11.5c 预测「更好 blueprint 是杠杆」被推翻**：
+  10B preopen 三臂（all-postflop × round-start × range-on，48k 手/臂 @3000，配对差 CI）+ 1B-nolimp 同设置配对对照。
+  ① **§11.5「机制 help（+118）」不复现**——配对差下 C(depth-limit+biased) − A(解到终局) 两 blueprint 都为负
+  （−107 preopen / −64 nolimp，CI 跨 0），C 反成最差；§11.5 的伪信号 = 分离 marginal（不显著、CI 重叠）+ leaf-hands=50000
+  的「大量 0 叶子」恰好胜过解欠训练深层。② **唯一稳健信号 = biased 叶子净有害**（配对 C−B 两 blueprint 都负 −64/−92）；
+  depth-limit unbiased vs 终局是 wash。③ **leaf 覆盖不是 cap**：C@500k(miss 47%) ≈ C@2M(miss 36%)，「×10 leaf-hands
+  补 river」对绝对水平零效应。④ **更强 blueprint 反更负**（preopen −652~−759 vs nolimp −426~−490）= **probe 自身 confound
+  显形**：search-on vs 同一 blueprint 当 field → blueprint 越强 = field 越硬 = 自对弈偏移亏越多，**与「加搜索绝对是否更强」
+  无关** → search-vs-self 探针**结构上答不了**该问题，须 S5 外部实测。⑤ plumbing 全程健康（desync=0、C byte-identical 复现）、
+  vultr 4 核够（峰值 RSS 6.5 GiB）。**定调**：6b 基建正确但机制在本抽象 + all-postflop 下不产收益；强弱判据回 S5（OpenPoker/
+  固定参考）；flop-first 中性不亏仍是 S6 MVP 安全终点。
 
 **验收范式改写**：6-max 下 LBR/exploitability 失去理论意义 → **删 pluribus_path.md 6b「LBR 显著下降」闸门**，
 改为 `evaluate_cross_abstraction_h2h` 受控 A/B（search-on vs search-off）实测 mbb/g + CI + OpenPoker live。6a/6b/6c

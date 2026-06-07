@@ -721,6 +721,69 @@ leaf-hands=50000 也大概率高 miss → depth-limit 臂的深街叶子多为 0
 river 叶子，否则 depth-limit 臂仍在「大量 0 叶子」下测、污染判决。预期（§11.5 推断）：强基底下 6b 才可能把最佳臂从
 −409 推向 break-even/正；若仍显著负，则印证「blueprint-only + 单层 6b 在本抽象下达不到」、回到 S5 实测对战定调。
 
+### 11.5d 6b-5 完整 A/B 重测（已跑，2026-06-07，vultr）——§11.5「机制 help」不复现 + biased 叶子实锤有害 + probe confound 显形
+
+§11.5c 预测「更好 blueprint 是杠杆 → 强基底下 6b 才可能 break-even」。用 10B preopen（coverage 82.55%）重跑三臂、并加
+**1B-nolimp 同设置配对对照**（隔离 blueprint 强度）—— **预测被推翻**。
+
+**设置**：all-postflop × round-start × range-on（§5b），**48k 手/臂**（hps=8000）@3000 iters、同 §11.5 seed。三臂同 trainer 拆
+hero(search-on) vs field(search-off)；用 §11.5b 的 `--paired-baseline` 出**配对差 CI**（消去 blueprint-field 共同方差，远比 marginal
+紧）。leaf-hands=500k（§11.5b「×10」），另跑 C@leaf-hands=2M 验 leaf 覆盖敏感度。**vultr 4 核足够**：峰值 RSS **6.5 GiB**
+（dense 5.46 + 桶 0.55 + 稀疏叶子表 ~0.5），每 invocation ~10–18 min；无需更大机。plumbing 全程健康（desync=0/illegal=0、
+C 两 invocation **byte-identical 复现** −758.71 / −490.02）。
+
+**10B preopen（强，coverage 82.55%）**：
+
+| 臂 | mbb/g | CI95 | leaf-miss | 配对差 |
+|---|---|---|---|---|
+| A 解到终局 | −652 | [−802, −502] | —（13.5% fallback：终局子树撞 8000 节点 cap 多回落）| — |
+| B depth-limit unbiased | −695 | [−851, −539] | 57.5% | — |
+| C depth-limit + biased | **−759** | [−916, −602] | 47.2% | C−A **−107** [−238,+25] / C−B **−64** [−183,+55] |
+| C @ leaf-hands 2M | −753 | [−910, −596] | 36.1% | （≈ C@500k） |
+
+**1B-nolimp（弱，coverage 64.5%）同设置配对对照**：
+
+| 臂 | mbb/g | CI95 | 配对差 |
+|---|---|---|---|
+| A 解到终局 | −426 | [−569, −284] | — |
+| B depth-limit unbiased | **−398**（marginal 最优）| [−544, −252] | — |
+| C depth-limit + biased | −490 | [−635, −345] | C−A **−64** [−173,+46] / C−B **−92** [−198,+14] |
+
+**结论（推翻 §11.5c 预测、修正 §11.5 narrative）**：
+
+1. **§11.5「monotone A<B<C，+118 = 机制 help」不复现**。两个 §11.5 的伪信号根源：① 三臂是**分离 marginal**（配对差 §11.5b
+   才加）、SE~150、§11.5 自承「单步 +43/+75 不显著、CI 重叠」；② leaf-hands=50000（miss 72.5%）→ depth-limit 臂叶子**大多 = 0**，
+   "depth-limit" 退化成"截深层→~0"恰好胜过解欠训练深层节点（§11.5b 已疑）。**在合理 leaf 覆盖（500k，miss 35–47%）+ 配对差下，
+   C−A 两 blueprint 都为负**（−107 preopen / −64 nolimp，CI 跨 0）—— C 不再是最好、反成最差。
+
+2. **唯一跨 blueprint 稳健信号 = biased 叶子（6b-4）净有害**：配对 C−B 两 blueprint 都负（−64 preopen / −92 nolimp）。next-actor
+   argmax 在**粗糙**（marginal-range + 36–57% 退 0）叶子值上选续局 → 系统性选偏 → 比 unbiased 差。而 depth-limit unbiased（B）vs
+   终局（A）是 **wash**（nolimp B 略好 +28、preopen B 略差 −43 marginal，均不配对显著）→ **截断本身既不明显 help 也不明显 hurt，
+   biased 那层是净负。**
+
+3. **leaf 覆盖不是 cap**：C@500k(−759, miss 47%) ≈ C@2M(−753, miss 36%)，4× leaf-hands 零效应（Δ5.6 ≪ SE 80）。
+   **§11.5b/§11.5c「river 叶子覆盖软肋 → ×10 leaf-hands」对绝对水平是 red herring**：更多覆盖让叶子值更接近"blueprint 自身的
+   偏"，但那个偏本就不如解到终局。cap 是结构性（depth-limit 近似 + 下条 probe confound），非覆盖。
+
+4. **更强 blueprint 没把水平推向 break-even、反更负**（preopen −652~−759 vs nolimp −426~−490）。根因 = **probe 自身 confound
+   （本次实测显形，重要）**：探针测 search-on **vs 同一 blueprint 当 field**。CFR 非均衡但 blueprint 越接近"自对弈不动点"，惩罚
+   任何自对弈偏移越狠 → blueprint 越强（10B preopen 82.55% ≫ 1B nolimp 64.5%）= field 越硬 → search 的**近似偏移**亏得越多，
+   **与"加搜索绝对是否更强"无关**。⇒ **search-vs-self 探针结构上答不了"加搜索是否更强"**（强 blueprint = 强 field），只能答
+   "搜索是否偏离 blueprint"。绝对强度判据**只能靠外部对手**（S5 OpenPoker / 固定参考）—— 正是 §11.5c 的 fallback。
+   （caveat：absolute 更负也部分是 nolimp→preopen 抽象变难，probe 分不开；但 confound 是 search-vs-self 的**结构**性质，不靠这个分离。）
+
+5. **退化集中盲位**（两 blueprint 一致，沿 §10.4/§10.5）：非盲位（BTN/HJ/CO/UTG）近 0 甚至略正（nolimp B：HJ +115、BTN +79），
+   SB/BB 大亏（BB −1436~−2015）。OOP 多人 all-postflop = marginal-range 近似最差处 + round-start 对 OOP 边际最小。
+
+**对 S6 的定调（修正 §10.5「下一步」+ §11.5c）**：
+- **(甲) 强化 blueprint 不是杠杆**：10B（82.55% coverage、preflop 全收敛）证明——更强 blueprint 在 search-vs-self 探针下只会更负
+  （confound），且不改变"6b 机制不 beat 终局"。「更好 blueprint 是杠杆」证伪。
+- **(6b) depth-limit/biased 在本抽象 + all-postflop 下不 help**：biased 净负、depth-limit wash。6b 基建正确（plumbing 健康、可复现），
+  但**机制在这个 regime 不产收益**。
+- **真正未答 = 加搜索对外部对手是否更强**——本探针**结构上测不了**（强 blueprint = 强 field）→ 回 §11.5c fallback：S6 单层 6b 在
+  blueprint-only 探针下达不到 break-even，强弱判据须 **S5 外部实测**（OpenPoker / 固定参考）。flop-first（窄、干净点）中性不亏仍是
+  S6 MVP 的安全终点（§10.5）。
+
 ### 11.6 已知近似（解读探针时记住）
 
 - **叶子值 = per-seat marginal range 下 self-play 均值**（同 §5b 工程折中）；街起点高频 → 覆盖好，但 miss
