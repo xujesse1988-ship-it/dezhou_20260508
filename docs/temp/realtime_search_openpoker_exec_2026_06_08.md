@@ -41,7 +41,12 @@
 **两点直接推论，贯穿全文：**
 1. **绝对强弱只能靠外部对手判**（OpenPoker / 固定参考），不靠自对弈探针。验证锚到
    **off-stack / 多人 × 外部对手**。
-2. **短码先做**：短码树小、能解到终局，天然不依赖叶子值近似——这是确定性最高、可证伪的第一个胜仗。
+2. **短码先做，且它是唯一能离线验证的格子**：短码树小 → 能解到终局（不依赖叶子值近似）；更关键的是
+   树小到可以**离线 CFR 跑到收敛当真值、并算出可被剥削度（exploitability，HU 下是干净标量）**。于是短码
+   （尤其 HU）上 OpenPoker **之前**就能离线验两件事：①实时解出的策略 ≈ 收敛真值（引擎正确）②100BB
+   blueprint 在短码状态的 EV 损失 / 可被剥削度有多大（证明有肉可吃、搜索该补多少）。这跟被否定的"自对弈
+   探针"是两回事——前者比对真实小树的**真值**，后者比对的是 blueprint 当 field。**live 只做最终 EV 确认、
+   不做调试**。（此离线锚随 3-way → 多人 → 深码迅速变弱，这本身又是"短码/HU 先做"的理由。）
 
 ### 0.4 剥削 = 可选外挂（后置）
 
@@ -63,7 +68,8 @@
   1. 读真实状态：真码深（各家不等）/ 真在场人数 / 真 board / 真下注历史
   2. 在真实状态上建子树（build_subtree，真 SPR / 真人数）
   3. 取对手 range/续局值：默认来自 blueprint；有可靠对手数据时替换为实测（剥削外挂，后置）
-  4. 在 time_budget 内求解子树（anytime CFR），解不动则优雅回落 blueprint
+  4. 在 time_budget 内求解子树（anytime CFR）；解不动则降级——但降级须留在真实状态上
+     （收窄菜单 / 加深 depth-limit 后的真实树粗解 / 稳健启发式），blueprint 仅在其训练格子内才作兜底
   5. 返回动作（off-tree 尺寸经 map_off_tree 翻译）
 持续：
   记全桌动作 + 摊牌（HH 日志）→ ①量真实分布覆盖热力图 ②攒对手数据（外挂用）
@@ -101,8 +107,11 @@
 
 - 现状：`SubgameSearchConfig`（`subgame.rs:650`）只有固定 `iterations`（默认 1000）+ `max_subtree_nodes`
   （默认 8000），**没有 time_budget 字段**——不是按墙钟的 anytime 求解器。
-- 要补：建树 → 解到墙钟预算用完 → 返回当前 `average_strategy` → 桶未被访问 / 超 cap 则优雅 `Err`
-  回落 blueprint（`subgame.rs:1056` / `:1090` 已有回落口）。短树预算内解透；深/多人树用预算尽量迭代。
+- 要补：①**按预算选树粒度**——树太大就先收窄下注菜单 / 加深 depth-limit，让**真实状态的树**能在预算内
+  解出有意义的策略，而不是"硬解 → 失败 → 回落"。②解到墙钟预算用完 → 返回当前 `average_strategy`。
+- **兜底必须留在真实状态上**：blueprint 只在它训练过的格子（≤3-way、近 100BB）才是有效兜底；在它缺席的
+  格子（4-way flop、深码）回落 blueprint = 回落到一个**解错了游戏**的策略，无意义。那里的降级顺序 =
+  真实树粗解 → 多人 equity / push-fold 等稳健启发式 → blueprint 仅作最后无奈项（且标注已知不可靠）。
 - 单决策 wall **从未隔离测过**（现有数据全是整臂），须实测（见 §5 Go-NoGo）。
 
 ## 3. 现有底座 / 缺口
@@ -119,7 +128,8 @@
 
 ### 3.2 缺口（须新写 / 改造）
 
-1. **anytime 限时求解器**：给 `SubgameSearchConfig` 加 `time_budget`，按墙钟中断返回当前最优。
+1. **anytime 限时求解器**：给 `SubgameSearchConfig` 加 `time_budget`，按墙钟中断返回当前最优；并**按预算
+   自适应选树粒度**（收窄菜单 / 加深 depth-limit 让真实树能解），off-tree 格子的兜底用稳健启发式而非 blueprint。
 2. **生产 advisor 接搜索**：`openpoker_advisor.rs` 现完全不调 `subgame_search`、硬编码
    `default_6max_100bb`（`:191`）；要在插桩点 `blueprint_advisor.rs:421` 改成 search-or-blueprint。
 3. **off-stack 叶子续局值**：深码下 100BB 叶子值 off-distribution。短码解到终局可绕开（先做短码）。
@@ -147,7 +157,7 @@
 | 步 | 做什么 | Go 判据 |
 |---|---|---|
 | **A** | Phase 0 HH 日志 + 挂场数百–数千手，出**覆盖热力图** + 真实 fallback 率 | 字段齐、摊牌 / 名字捕到；得出每格 blueprint 缺席率 |
-| **B** | **短码 ≤3-way 实时搜索**：解到终局 + anytime 限时求解器，接生产 advisor | 单决策 wall ≤ time_budget；no-panic / 归一；OpenPoker 短码桌总 mbb/100 显著 > blueprint-only |
+| **B** | **短码 ≤3-way 实时搜索**：解到终局 + anytime 限时求解器，接生产 advisor | **离线（先）**：实时解 ≈ 该状态 CFR 收敛真值、exploitability 低；量出 100BB blueprint 在短码的可剥削度（证明有肉）。**live（后）**：单决策 wall ≤ budget；no-panic / 归一；OpenPoker 短码桌总 mbb/100 显著 > blueprint-only |
 | **C** | 深码叶子续局值（off-stack leaf value），biased 叶子须消融 | 深码桶 mbb/100 不劣于 blueprint-only |
 | **D** | 多人 >3：立项选甲（扩抽象 4-way）/ 乙（实时 N-way 解 + 多人 equity 叶子值） | 4+way 见 flop 桶有忠实树；mbb/100 显著 > blueprint-only |
 | **E**（后置可选） | 剥削外挂：置信度门控替换对手 range 数据源 | 数据足的对手上增量为正；vs 池中最鲁棒对手分项不亏（防反剥削） |
