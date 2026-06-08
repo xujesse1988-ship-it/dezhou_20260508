@@ -872,3 +872,8 @@ no-panic）✓（1M `--ignored` 待长跑确认）；③④⑤（on/off-tree 策
 - GameState 构造约束：`src/rules/state.rs:34-75`（全字段私有）/`83-244`（仅 deal-from-scratch，无中途构造入口）
 - 抽象/桶：`src/abstraction/info.rs`（InfoSetId：bucket 24b/pos 4b/stack 4b/betting_state 3b/street 3b）/`map/mod.rs:22-102`
 - 门槛文档：`docs/temp/pluribus_path.md:129-170`（6a/6b/6c）
+
+---
+
+> **执行 runbook 见独立文档** `docs/temp/realtime_search_openpoker_exec_2026_06_08.md`（用户 2026-06-08 拍板：
+> 按用户指定 postflop 实时搜索配置落地 + OpenPoker 外部对手验证、去 8000 cap、禁自对弈探针强度重跑）。
