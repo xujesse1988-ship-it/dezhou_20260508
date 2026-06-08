@@ -794,6 +794,61 @@ C 两 invocation **byte-identical 复现** −758.71 / −490.02）。
 
 ---
 
+## 12. 6c off-tree 映射落地：pseudo-harmonic randomized rounding（2026-06-08，commit `f694048`，分支 `6max`，vultr 验证）
+
+§5.e / §7 阶段 6c 的核心件落地：`map_off_tree`（`src/abstraction/action.rs`）从 D-201
+nearest-ratio stub 升级为 **pseudo-harmonic randomized rounding**（Ganzfried-Sandholm）。
+
+**算法**：实际下注 `real_to` 折成 pot-fraction `x`（= raise-above-call / pot_after_call，
+与 `target_to` 同坐标系）；落在相邻两档 ratio `A < x < B` 之间时，按概率
+`f_A(x) = (B-x)(1+A)/((B-A)(1+x))` 随机 round 到 A 或 B，50% 交叉点
+`x* = (A+B+2AB)/(A+B+2)`（**非**算术中点、**非**几何均值——后两者更可剥削，§5.e）。
+落在菜单端点之外 → 就近 clamp（保留 raise 语义，不下塌 Call：real_to 已投入，A=0
+虚拟下邻会丢 chips）。全整数 milli 运算（`1` pot = `1000` milli），无浮点
+（invariants §1 抽象层禁浮点）；`saturating_mul` + 受限左移使任意配置 no-panic。
+
+**关键设计偏差（独立判断，与 §5.e「走 RngSource」的字面不同）——保持纯函数、draw
+走局面派生种子而非外部 session rng**：6c 门槛②「映射稳定可复现」+ 既有
+`map_off_tree` 二次调用 `m1 == m2` 契约（`off_tree_action_boundary` I1 /
+`abstraction_fuzz`）+ AIVAT/replay「无状态重放一致」（`aivat_nlhe` §4.5：replay 重跑
+`map_off_tree` 反推节点轨迹，须与 advisor 当时一致）**三处都要求 `map_off_tree` 是
+`(state, real_to)` 的纯函数**。若按字面把 `&mut dyn RngSource` 串进签名，外部 rng 会在
+二次调用间推进 → `m1 != m2` → 破上述契约 + 破 AIVAT。故 draw 改由
+`phm_round_seed(state, real_to)`（splitmix64 混 街/底池/各家本轮投入与码量/board +
+real_to）种子驱动的**局部 `ChaCha20Rng`**（仍是 RngSource，byte-equal 可复现）。性质：
+- **纯函数** → 满足上述三契约（零调用方改动、签名不变、AIVAT/replay 不破）。
+- **局面相关** → 把 rounding 边界在不同决策点之间打散（board/pot/街/码深变 → 种子变）
+  → 抗「卡边界对手」（gate④）。
+
+**已知局限（诚实标注）**：种子只取**公共**局面（不含底牌）→ 完全相同的公共节点
+（典型：preflop 同一 betting 线、无 board）会**确定性** round 同一侧。但 (a) 1M 手评测里
+公共节点随 board/pot/码深大量变化 → 聚合层边界已打散；(b) 在交叉点 `x*` 两档 EV 近似
+等价，确定性 round 收益≈0，可剥削性来自**远离**边界的错配、那里 PHM 高概率给近档（正确）。
+要彻底消 preflop-repeat 残余须 per-decision 真随机（session rng）——但那与 gate②
+「稳定可复现」直接冲突，故不取。
+
+**测试（vultr，`off_tree_action_boundary` 16 测试全过 + 全默认套件无回归）**：
+- 既有 I1–I5 off-tree 不变量（确定性 / no-panic / LA-002 / `AllIn.to=cap` /
+  `ratio∈config`）在新算法下**不变**（纯函数 + 同 Bet/Raise 分支 + chosen∈menu）。
+- 新增 (G) 6c 行为测试：**G1** 纯函数可复现（同输入 64 次 byte-equal）；**G2** 概率偏向
+  近档（x 近 0.5 档多 round→0.5、近 1.0 档多 round→1.0，跨 8 board 聚合）；**G3**（核心
+  抗剥削单元证据）x=750 算术中点跨 96 board **两侧都出现**——旧 nearest-ratio 在该点
+  tie→恒 0.5（cliff），新算法打散。
+- `OFF_TREE_MAP_ALGORITHM = "pseudo-harmonic-randomized-rounding-v1"` 版本常量
+  （gate① 写入元数据）+ crate root 导出。
+
+**门槛覆盖现状（pluribus_path.md 6c 五条）**：①算法选定 + 版本常量 ✓；②映射稳定可复现 +
+无非法/越界（既有 1M fuzz `random_boundary_real_to_full_1m` + I1–I5 守，新算法纯函数/
+no-panic）✓（1M `--ignored` 待长跑确认）；③④⑤（on/off-tree 策略差异分布、卡边界对手 1M
+手实测可剥削性、路径覆盖率报告）= **评测 harness 件，须真 blueprint + 主机长跑**，未做
+（与 §11.5d 定调一致：绝对强弱判据须 S5 外部对手，本仓自评探针结构上答不了）。
+
+**nested AddAction（§5.e 可选增量）未做**：现仍纯 translation。设计 §5.e 引 DeepStack §7
+「translation 比 nested 差 ~12×」→ 若③④门槛实测不过，再补 nested（对手抽象外 size 注入
+影子合法集从本街根重解）。
+
+---
+
 ## 附：引用 + 关键 `file:line` 索引
 
 **文献**
