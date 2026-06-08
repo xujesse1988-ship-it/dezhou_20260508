@@ -8,6 +8,7 @@
 
 use thiserror::Error;
 
+use crate::core::rng::{ChaCha20Rng, RngSource};
 use crate::core::ChipAmount;
 use crate::core::Street;
 use crate::rules::action::Action;
@@ -204,14 +205,102 @@ pub trait ActionAbstraction: Send + Sync {
     /// 给定当前 `GameState`，返回抽象动作集合（D-200..D-209 全部 fallback 已应用）。
     fn abstract_actions(&self, state: &GameState) -> AbstractActionSet;
 
-    /// off-tree action 映射（D-201 PHM stub；stage 2 仅占位实现，stage 6c 完整数值验证）。
+    /// off-tree action 映射（stage 6c：pseudo-harmonic randomized rounding，
+    /// 算法版本见 [`OFF_TREE_MAP_ALGORITHM`]）。
     ///
     /// `real_to` 是对手实际下注的 `to` 字段（绝对金额，与 stage 1
     /// `Action::Bet/Raise { to }` 同语义）。
+    ///
+    /// **纯函数契约**：同 `(state, real_to)` → 同输出（rounding 的随机 draw 由
+    /// 局面派生种子驱动，不消费外部 rng）。这是 6c 门槛②「映射结果稳定可复现」
+    /// 以及 AIVAT/replay「无状态重放一致」（`aivat_nlhe` §4.5）的硬约束——
+    /// 故签名**不**接受 `&mut dyn RngSource`（外部 rng 会在二次调用间推进、破坏可复现）。
     fn map_off_tree(&self, state: &GameState, real_to: ChipAmount) -> AbstractAction;
 
     /// 配置只读访问。
     fn config(&self) -> &ActionAbstractionConfig;
+}
+
+/// 6c off-tree 映射算法的版本标识，写入策略服务版本元数据
+/// （`docs/temp/pluribus_path.md` 阶段 6c 门槛①「显式选定 off-tree 映射算法
+/// 并写入版本元数据」）。`map_off_tree` 落 `Bet/Raise` 区间时走此算法。
+pub const OFF_TREE_MAP_ALGORITHM: &str = "pseudo-harmonic-randomized-rounding-v1";
+
+/// 6c：pseudo-harmonic randomized rounding 的确定性种子。
+///
+/// 把当前**公共**局面（街 / 底池 / 各家本轮投入与剩余筹码 / board）连同
+/// `real_to` 整数混进一个 `u64`。两条性质同时成立：
+/// - **纯函数**（同 `(state, real_to)` → 同种子 → 同 draw）→ 满足 6c 门槛②
+///   「映射结果稳定可复现」+ 既有 `map_off_tree` 二次调用 `m1 == m2` 契约 +
+///   AIVAT/replay 的「无状态重放一致」（`aivat_nlhe` §4.5）。
+/// - **局面相关**→ 把 rounding 边界在不同决策点之间打散，使「卡边界对手」
+///   无法对单一算术中点 cliff 系统性套利（6c 门槛④抗剥削证据）。
+///
+/// 纯整数混合（splitmix64 finalizer），无浮点（invariants §1：抽象层禁浮点）。
+fn phm_round_seed(state: &GameState, real_to: ChipAmount) -> u64 {
+    #[inline]
+    fn mix(z: u64) -> u64 {
+        let z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    let street_code: u64 = match state.street() {
+        Street::Preflop => 1,
+        Street::Flop => 2,
+        Street::Turn => 3,
+        Street::River => 4,
+        Street::Showdown => 5,
+    };
+    let mut acc = mix(real_to.as_u64() ^ 0x9e37_79b9_7f4a_7c15);
+    acc = mix(acc ^ street_code);
+    acc = mix(acc ^ state.pot().as_u64());
+    for p in state.players() {
+        acc = mix(acc.rotate_left(7) ^ p.committed_this_round.as_u64());
+        acc = mix(acc.rotate_left(13) ^ p.stack.as_u64());
+    }
+    for (i, card) in state.board().iter().enumerate() {
+        acc = mix(acc ^ ((card.to_u8() as u64) << ((i % 8) * 8)));
+    }
+    acc
+}
+
+/// 6c：在相邻两档 abstract ratio `lower < upper` 之间做 pseudo-harmonic
+/// randomized rounding（Ganzfried-Sandholm）。调用前提 `a < x < b`（严格落在
+/// 两档之间；命中端点由调用方按确定性分支处理）。
+///
+/// `x_milli` = 实际 raise-above-call 占 `pot_after_call` 的 milli 比例
+/// （与 `target_to(r) = max_committed + r_milli × pot / 1000` 同坐标系）。
+/// 映射到 `lower`（较小档）的概率
+/// `f_lower(x) = (B - x)(1 + A) / ((B - A)(1 + x))`，其 50% 交叉点
+/// `x* = (A + B + 2AB)/(A + B + 2)`（**不是**算术中点、**不是**几何均值——
+/// 后两者更可剥削，见设计 §5.e）。draw 由 [`phm_round_seed`] 确定性种子驱动的
+/// `ChaCha20Rng`（`RngSource`，byte-equal 可复现）。
+///
+/// 全整数 milli 运算（`1` pot = `1000` milli），无浮点；`saturating_mul` +
+/// 受限左移使任意配置都 no-panic（6c 门槛②「无非法/越界」）。
+fn pseudo_harmonic_pick(
+    lower: BetRatio,
+    upper: BetRatio,
+    x_milli: u64,
+    state: &GameState,
+    real_to: ChipAmount,
+) -> BetRatio {
+    let a = lower.as_milli() as u128;
+    let b = upper.as_milli() as u128;
+    let x = x_milli as u128;
+    // den > 0（b > a）；num ∈ (0, den)（a < x < b）→ f_lower ∈ (0, 1)。
+    // num = P(map→lower) 分子；den = 分母。
+    let num = (b - x) * (1000 + a);
+    let den = (b - a) * (1000 + x);
+    // r ∈ [0, 2^64)；map→lower ⟺ r/2^64 < num/den ⟺ r·den < num·2^64。
+    let r = ChaCha20Rng::from_seed(phm_round_seed(state, real_to)).next_u64() as u128;
+    let lhs = r.saturating_mul(den);
+    let rhs = num << 64; // shift amount 64 < 128 → 不 panic；realistic ratio 下无丢位。
+    if lhs < rhs {
+        lower
+    } else {
+        upper
+    }
 }
 
 /// 默认 5-action 抽象（D-200）。
@@ -385,19 +474,19 @@ impl ActionAbstraction for DefaultActionAbstraction {
     }
 
     fn map_off_tree(&self, state: &GameState, real_to: ChipAmount) -> AbstractAction {
-        // D-201 PHM stub（issue #8 §出口）。stage 2 占位实现，stage 6c 替换为
-        // Pluribus §S2 完整 pseudo-harmonic mapping。要求：相同 (state, real_to)
-        // → 相同输出（确定性 + no-panic），数值正确性留 stage 6c。
+        // stage 6c：pseudo-harmonic randomized rounding（Ganzfried-Sandholm，
+        // 算法版本 OFF_TREE_MAP_ALGORITHM）。纯函数（同 (state, real_to) → 同输出，
+        // 见 trait 文档「纯函数契约」），no-panic。
         //
         // 算法：
         //   ① real_to ≥ cap                → AllIn { to: cap }
         //   ② real_to ≤ max_committed      → Call (或 Check / Fold 兜底)
         //   ③ 无 bet_range / raise_range   → Call / Fold 兜底（防御）
-        //   ④ 否则 pick `raise_pot_ratios` 中 target_to 与 real_to 最接近的 ratio：
-        //         target_to(r) = max_committed + ceil(r.milli × pot_after_call / 1000)
-        //      tie-break：milli 较小者先（与 AA-004-rev1 同 to 折叠 ratio_label
-        //      较小一致）。输出 `Bet | Raise { to: real_to, ratio_label }`（LA-002
-        //      互斥：bet_range Some → Bet，否则 Raise）。
+        //   ④ 把 real_to 折成 pot-fraction x，落在相邻两档 ratio A<x<B 之间时按
+        //      pseudo-harmonic 概率 f_A(x) 随机 round 到 A 或 B（draw 由局面派生
+        //      种子驱动，见 pseudo_harmonic_pick）；落在菜单端点之外就近 clamp。
+        //      输出 `Bet | Raise { to: real_to, ratio_label }`（LA-002 互斥：
+        //      bet_range Some → Bet，否则 Raise）。
 
         let Some(actor_seat) = state.current_player() else {
             return AbstractAction::Fold;
@@ -442,7 +531,9 @@ impl ActionAbstraction for DefaultActionAbstraction {
             return AbstractAction::Fold;
         }
 
-        // ④ 找最近 ratio。pot_after_call = pot() + (max_committed - committed_this_round)。
+        // ④ pseudo-harmonic randomized rounding。
+        //    pot_after_call = pot() + (max_committed - committed_this_round)，与
+        //    target_to(r) = max_committed + r_milli × pot_after_call / 1000 同坐标系。
         let pot_before = state.pot();
         let to_call_delta = if max_committed > committed_this_round {
             max_committed - committed_this_round
@@ -450,34 +541,48 @@ impl ActionAbstraction for DefaultActionAbstraction {
             ChipAmount::ZERO
         };
         let pot_after_call = pot_before + to_call_delta;
-
-        let real_to_chips = real_to.as_u64();
-        let max_committed_chips = max_committed.as_u64();
         let pot_chips = pot_after_call.as_u64();
 
-        // best = (ratio, distance)；遍历显式 tie-break smaller milli first。
-        let mut best: Option<(BetRatio, u64)> = None;
-        for &ratio in &self.config.raise_pot_ratios {
-            let milli = ratio.as_milli() as u128;
-            let scaled = milli * (pot_chips as u128);
-            let ratio_part_ceil = scaled.div_ceil(1000) as u64;
-            let target_to_chips = max_committed_chips.saturating_add(ratio_part_ceil);
-            let distance = target_to_chips.abs_diff(real_to_chips);
-            match best {
-                None => best = Some((ratio, distance)),
-                Some((existing_ratio, existing_distance)) => {
-                    if distance < existing_distance
-                        || (distance == existing_distance
-                            && ratio.as_milli() < existing_ratio.as_milli())
-                    {
-                        best = Some((ratio, distance));
-                    }
-                }
-            }
-        }
-        let chosen_ratio = best
-            .expect("raise_pot_ratios 非空 (D-202 长度 ∈ [1, 14])")
-            .0;
+        // x = raise-above-call 占 pot_after_call 的 milli 比例（floor 量化）。
+        // case ② 已挡 real_to ≤ max_committed → 此处 real_to > max_committed；
+        // pot_chips == 0 真实局面不可达，checked_div 防御性退到最小 x（落最小档）。
+        let x_milli = real_to
+            .as_u64()
+            .saturating_sub(max_committed.as_u64())
+            .saturating_mul(1000)
+            .checked_div(pot_chips)
+            .unwrap_or(0);
+
+        // 相邻两档：lower = milli ≤ x 的最大档；upper = milli ≥ x 的最小档。
+        // ratio 菜单非排序（ActionAbstractionConfig::new 按输入序去重）→ 全扫。
+        let lower = self
+            .config
+            .raise_pot_ratios
+            .iter()
+            .copied()
+            .filter(|r| (r.as_milli() as u64) <= x_milli)
+            .max_by_key(|r| r.as_milli());
+        let upper = self
+            .config
+            .raise_pot_ratios
+            .iter()
+            .copied()
+            .filter(|r| (r.as_milli() as u64) >= x_milli)
+            .min_by_key(|r| r.as_milli());
+
+        let chosen_ratio = match (lower, upper) {
+            // 命中某档（x 恰等该 milli，lower==upper）→ 该档（确定性）。
+            (Some(a), Some(b)) if a.as_milli() == b.as_milli() => a,
+            // 严格落在 a < x < b 之间 → pseudo-harmonic randomized rounding。
+            (Some(a), Some(b)) => pseudo_harmonic_pick(a, b, x_milli, state, real_to),
+            // x 低于最小档 → clamp 到最小档（保留 raise 语义：real_to 已投入，不下塌
+            //   为 Call；A=0 虚拟下邻会丢失 real_to chips，见设计 §5.e）。
+            (None, Some(b)) => b,
+            // x 高于最大档（但 < cap，已在 ① 处理）→ clamp 到最大档。
+            (Some(a), None) => a,
+            // ratio 菜单非空（D-202 长度 ∈ [1,14]）→ 不可达；防御退首档不 panic。
+            (None, None) => self.config.raise_pot_ratios[0],
+        };
 
         if la.bet_range.is_some() {
             AbstractAction::Bet {

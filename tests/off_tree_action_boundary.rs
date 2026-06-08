@@ -487,3 +487,176 @@ fn fresh_preflop_state_invariants_hold() {
     );
     assert!(!la.check, "preflop UTG facing BB 不能 Check（BB raised）");
 }
+
+// ============================================================================
+// (G) 6c：pseudo-harmonic randomized rounding 行为验收
+//
+// 这一段验的是 6c **新算法**（取代旧 nearest-ratio stub）的两条关键性质，旧 stub
+// 过不了第 (G2)(G3) 条：
+//   G1 纯函数可复现（gate②「映射结果稳定可复现」+ AIVAT/replay 无状态重放一致）。
+//   G2 概率方向：x 越靠近某档，越大概率 round 到该档（pseudo-harmonic f_A(x)）。
+//   G3 边界打散（抗剥削，gate④）：同一笔「卡中点」off-tree 下注，在不同 board 下
+//      被 round 到**两侧都出现**——旧 nearest-ratio 在算术中点恒定 round 一侧
+//      （cliff，可被卡边界对手系统性套利），新算法把它打散。
+// ============================================================================
+
+/// 推进到 flop 起手（board 3 张、本街未起注 → max_committed=0、bet_range Some →
+/// `map_off_tree` 落 case ④）。全 Check/Call 线，不会中途 terminal。
+/// 返回 false 表示意外提前终局（调用方跳过该 seed）。
+fn advance_to_flop_start(state: &mut GameState) -> bool {
+    for _ in 0..24 {
+        if state.board().len() >= 3 {
+            return true;
+        }
+        if state.is_terminal() {
+            return false;
+        }
+        let la = state.legal_actions();
+        if la.check {
+            state.apply(Action::Check).expect("Check legal then apply");
+        } else if la.call.is_some() {
+            state.apply(Action::Call).expect("Call legal then apply");
+        } else {
+            return false;
+        }
+    }
+    state.board().len() >= 3
+}
+
+/// flop 起手处：max_committed=0、pot_after_call=pot。给定目标 pot-fraction
+/// `x_milli`，算对应 off-tree raise 的 `real_to = x_milli × pot / 1000`。
+fn real_to_for_x(state: &GameState, x_milli: u64) -> ChipAmount {
+    let pot = state.pot().as_u64();
+    ChipAmount::new(x_milli.saturating_mul(pot) / 1000)
+}
+
+/// 取 `map_off_tree` 输出的 Bet/Raise ratio_label milli；非 Bet/Raise → None。
+fn off_tree_ratio_milli(m: AbstractAction) -> Option<u32> {
+    match m {
+        AbstractAction::Bet { ratio_label, .. } | AbstractAction::Raise { ratio_label, .. } => {
+            Some(ratio_label.as_milli())
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn phm_off_tree_is_pure_reproducible_6c() {
+    // G1：同 (state, real_to) → 64 次调用 byte-equal（纯函数契约）。
+    let aa = DefaultActionAbstraction::default_6_action();
+    let mut state = fresh_state(F1_MASTER_SEED ^ 0x6C01);
+    assert!(advance_to_flop_start(&mut state), "应能推进到 flop 起手");
+    // x=720 落在 (500,1000) 内、靠近 50% 交叉点 x*≈714 → 是随机 draw 的真实命中点。
+    let real_to = real_to_for_x(&state, 720);
+    let first = aa.map_off_tree(&state, real_to);
+    for i in 0..64 {
+        let again = aa.map_off_tree(&state, real_to);
+        assert_eq!(first, again, "G1 纯函数破：第 {i} 次 map_off_tree 不一致");
+    }
+    // 落在 0.5/1.0 档之间 → 必是 Bet（flop 起手无前序 bet）的两档之一。
+    let milli = off_tree_ratio_milli(first).expect("flop 起手 raise → Bet ratio_label");
+    assert!(
+        milli == 500 || milli == 1000,
+        "x=720 应 round 到 0.5 或 1.0 档，得 {milli}"
+    );
+}
+
+#[test]
+fn phm_off_tree_probability_biases_toward_nearer_ratio_6c() {
+    // G2：在 (0.5,1.0) 档之间扫 x；x 靠近 0.5 档时多 round→0.5，靠近 1.0 档时多
+    // round→1.0（pseudo-harmonic f_lower(x) 单调递减）。跨 8 个 board 聚合降方差。
+    let aa = DefaultActionAbstraction::default_6_action();
+
+    // (lower_count, total) for 两个 sub-range。
+    let mut lower_third_to_500 = 0u32;
+    let mut lower_third_total = 0u32;
+    let mut upper_third_to_500 = 0u32;
+    let mut upper_third_total = 0u32;
+
+    for s in 0..8u64 {
+        let mut state = fresh_state(F1_MASTER_SEED.wrapping_add(0x6C20 + s));
+        if !advance_to_flop_start(&mut state) {
+            continue;
+        }
+        // lower third x ∈ [550,650]，upper third x ∈ [850,950]（避开端点）。
+        for x in (550..=650).step_by(2) {
+            let m = aa.map_off_tree(&state, real_to_for_x(&state, x));
+            if let Some(milli) = off_tree_ratio_milli(m) {
+                lower_third_total += 1;
+                if milli == 500 {
+                    lower_third_to_500 += 1;
+                }
+            }
+        }
+        for x in (850..=950).step_by(2) {
+            let m = aa.map_off_tree(&state, real_to_for_x(&state, x));
+            if let Some(milli) = off_tree_ratio_milli(m) {
+                upper_third_total += 1;
+                if milli == 500 {
+                    upper_third_to_500 += 1;
+                }
+            }
+        }
+    }
+
+    assert!(
+        lower_third_total > 100 && upper_third_total > 100,
+        "样本不足：lower={lower_third_total} upper={upper_third_total}"
+    );
+    // f_lower 在 lower third 均值 ~0.74、upper third 均值 ~0.16 → 宽容门槛。
+    let lo_frac = lower_third_to_500 as f64 / lower_third_total as f64;
+    let up_frac = upper_third_to_500 as f64 / upper_third_total as f64;
+    assert!(
+        lo_frac > 0.55,
+        "G2 破：x 近 0.5 档却只有 {lo_frac:.3} round→0.5（应偏向近档）"
+    );
+    assert!(
+        up_frac < 0.45,
+        "G2 破：x 近 1.0 档却有 {up_frac:.3} round→0.5（应偏向远离 0.5）"
+    );
+    assert!(
+        lo_frac > up_frac,
+        "G2 破：round→0.5 比例应随 x 增大单调下降（lo={lo_frac:.3} up={up_frac:.3}）"
+    );
+}
+
+#[test]
+fn phm_off_tree_smears_midpoint_boundary_anti_exploit_6c() {
+    // G3（核心抗剥削证据）：x=750 = 0.5/1.0 档的**算术中点**——旧 nearest-ratio 在此
+    // 恒 round 到同一档（tie→smaller milli=0.5，cliff）。新算法按 board 派生种子打散
+    // → 跨 board 两侧都出现，卡中点对手拿不到确定方向。
+    let aa = DefaultActionAbstraction::default_6_action();
+    let mut seen_500 = false;
+    let mut seen_1000 = false;
+    let mut samples = 0u32;
+
+    for s in 0..96u64 {
+        let mut state = fresh_state(F1_MASTER_SEED.wrapping_add(0x6C40 + s));
+        if !advance_to_flop_start(&mut state) {
+            continue;
+        }
+        let m = aa.map_off_tree(&state, real_to_for_x(&state, 750));
+        match off_tree_ratio_milli(m) {
+            Some(500) => seen_500 = true,
+            Some(1000) => seen_1000 = true,
+            _ => {}
+        }
+        samples += 1;
+    }
+
+    assert!(samples > 50, "样本不足：{samples}");
+    assert!(
+        seen_500 && seen_1000,
+        "G3 破（退化成确定性 cliff）：x=750 中点跨 {samples} 个 board 只 round 到一侧 \
+         (seen_500={seen_500}, seen_1000={seen_1000}) —— 抗剥削打散失效"
+    );
+}
+
+#[test]
+fn off_tree_map_algorithm_version_recorded_6c() {
+    // gate①：算法版本标识写入（供策略服务版本元数据引用）。
+    assert_eq!(
+        poker::OFF_TREE_MAP_ALGORITHM,
+        "pseudo-harmonic-randomized-rounding-v1"
+    );
+}
