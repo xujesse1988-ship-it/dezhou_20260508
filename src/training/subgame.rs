@@ -2164,8 +2164,18 @@ mod tests {
 
     /// 用 default {0.5,1,2} 抽象 + 默认 rules 从 `template` 建解到终局的 subgame（A① 守恒/wall 共用）。
     fn build_base_subgame(template: &GameState) -> SubgameNlheGame {
+        build_base_subgame_with_table(template, stub_table())
+    }
+
+    /// 同 [`build_base_subgame`] 但用指定桶表。ε/δ_conv **真阈值**标定要真 schema-v4 桶表
+    /// （`info_set` postflop 走 `bucket_table.lookup` → per-hand 真桶；stub 全归桶 0 = 退化 ε，
+    /// 见 [`_measure_convergence_calibration`]）；其余调用方（守恒 / wall 诊断，bucket-无关）仍走 stub。
+    fn build_base_subgame_with_table(
+        template: &GameState,
+        table: Arc<BucketTable>,
+    ) -> SubgameNlheGame {
         SubgameNlheGame::new(
-            stub_table(),
+            table,
             template.config().clone(),
             StreetActionAbstraction::default_6_action(),
             BettingAbstractionRules::default(),
@@ -2537,20 +2547,46 @@ mod tests {
         }
     }
 
-    /// 诊断（非门槛，exec §4.1 A 收尾①）：ε/δ_conv 收敛距离**机制**——在 **river/turn 小可枚举
-    /// 子树**上量 ① per-infoset 平均策略 L1（vs M=50000 参考）+ ② **root EV 差 δ_conv**（avg-vs-avg
-    /// MC）。river/turn 子树小、CFR 收敛快 → L1/EV 有意义（大 flop 子树欠采样不适合定阈，§4.1，故
-    /// 移出 `_measure_subgame_wall_and_convergence` 的粗 sanity）。
+    /// 诊断（非门槛，exec §4.1 A 收尾① / §8 下一步①）：ε/δ_conv 收敛距离**真阈值**——在
+    /// **river/turn 小可枚举子树**上量 ① per-infoset 平均策略 L1（vs M 参考）+ ② **root EV 差
+    /// δ_conv**（avg-vs-avg MC）。river/turn 子树小、CFR 收敛快 → L1/EV 有意义（大 flop 子树欠采样
+    /// 不适合定阈，§4.1，故移出 `_measure_subgame_wall_and_convergence` 的粗 sanity）。
     ///
-    /// ⚠ **stub 桶表 = 退化 ε**：postflop 全归桶 0 → 同街只有少数 infoset、无 per-hand 变化 →
-    /// L1/EV 偏乐观。**最终 ε/δ_conv 阈值须在真桶表上跑**（`stub_table()` 换 `BucketTable::open` +
-    /// river/turn 真 board，一行 + 一个 artifact 路径）。本诊断只钉「机制正确 + L1 随迭代降 + EV 差
-    /// 随迭代收」。`cargo test -p poker --lib --release -- --ignored --nocapture
+    /// **桶表**：默认读 `SUBGAME_CAL_BUCKET_TABLE`（缺省
+    /// `artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin`，vultr 已有）的**真
+    /// schema-v4 桶表** → postflop per-hand 真桶 → 非退化 ε。打不开（如本机无 artifact）则**退回
+    /// stub**（postflop 全归桶 0 = 退化 ε，仅机制）——保证本测试在无 artifact 机器上
+    /// （`cargo test --release -- --ignored`）不 panic；`bucket_mode` 列自报 real/stub。
+    /// 注意 L1 沿**同一 seed 单轨**（同 seed → ladder@K == 参考前 K 步）量「实时预算 K 迭代离长解
+    /// M 还差多少」、即 strategy@K↔@M 位移；ε 读在预算可达的 K 上。真桶 per-hand infoset 数远超
+    /// stub（最多 ~500×/街）→ 需远多迭代才收敛，故 ladder 拉到 300..300k、参考 M=1_000_000（不够
+    /// 看到 L1 收敛尾则下次调大）。`cargo test -p poker --lib --release -- --ignored --nocapture
     /// _measure_convergence_calibration`（须 --release）。
     #[test]
-    #[ignore = "诊断：river/turn 收敛 L1 + root-EV 差（机制；真阈值需真桶表）；--release --ignored 跑"]
+    #[ignore = "诊断：river/turn 收敛 L1 + root-EV 差（真桶表 ε/δ_conv；无 artifact 退 stub）；--release --ignored 跑"]
     fn _measure_convergence_calibration() {
+        // exec §8 下一步①：真桶表 → 非退化 ε；打不开退 stub（无 artifact 机器不 panic）。
+        let bucket_path = std::env::var("SUBGAME_CAL_BUCKET_TABLE").unwrap_or_else(|_| {
+            "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin".to_string()
+        });
+        let opened = BucketTable::open(std::path::Path::new(&bucket_path));
+        let (table, bucket_mode): (Arc<BucketTable>, &str) = match opened {
+            Ok(t) => (Arc::new(t), "real"),
+            Err(e) => {
+                eprintln!(
+                    "[A1-cal] WARN 打不开真桶表 {bucket_path}: {e:?} → 退 stub（退化 ε，仅机制）"
+                );
+                (stub_table(), "stub")
+            }
+        };
+        eprintln!("[A1-cal] bucket_mode={bucket_mode} path={bucket_path}");
+
+        const REF_ITERS: u64 = 1_000_000;
+        const LADDER: [u64; 7] = [300, 1_000, 3_000, 10_000, 30_000, 100_000, 300_000];
+        const EV_ROLLOUTS: usize = 100_000; // MC 噪声 ~ pot/√rollouts；真桶下增 rollouts 压噪
+
         let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        // state 生成 bucket-无关（passive 推进只看 legal_actions / 转移）；真桶只在建 subgame 时作用。
         let turn = hu_state_at(&game, 0x5455_524E_0000_0001, Street::Turn) // "TURN"
             .game_state
             .clone();
@@ -2561,23 +2597,31 @@ mod tests {
             [("hu_turn_subtree", &turn), ("hu_river_subtree", &river)];
 
         eprintln!(
-            "[A1-cal] target,nodes,iters,ref,mean_l1,max_l1,ev_short,ev_ref,ev_abs_diff,infosets"
+            "[A1-cal] bucket_mode,target,nodes,iters,ref,mean_l1,max_l1,ev_short,ev_ref,ev_abs_diff,infosets"
         );
         for (name, tmpl) in targets {
-            let nodes = build_base_subgame(tmpl).subtree().num_nodes();
+            let nodes = build_base_subgame_with_table(tmpl, table.clone())
+                .subtree()
+                .num_nodes();
             // root EV 的 traverser = root 决策者（postflop HU = BB 先动），便于解读。
             let root_actor = tmpl.current_player().expect("非终局").0 as PlayerId;
             let reference = {
-                let mut tr = EsMccfrTrainer::new(build_base_subgame(tmpl), 0xCA1B_0000);
+                let mut tr = EsMccfrTrainer::new(
+                    build_base_subgame_with_table(tmpl, table.clone()),
+                    0xCA1B_0000,
+                );
                 let mut rng = ChaCha20Rng::from_seed(0xCA1B_0000 ^ 0xC0FF_EE00);
-                for _ in 0..50_000 {
+                for _ in 0..REF_ITERS {
                     tr.step(&mut rng).expect("ref step");
                 }
                 tr
             };
-            let ev_ref = mc_root_ev(&reference, root_actor, 50_000, 0x00E7_0000);
-            for &iters in &[300u64, 1_000, 3_000, 10_000] {
-                let mut tr = EsMccfrTrainer::new(build_base_subgame(tmpl), 0xCA1B_0000);
+            let ev_ref = mc_root_ev(&reference, root_actor, EV_ROLLOUTS, 0x00E7_0000);
+            for &iters in &LADDER {
+                let mut tr = EsMccfrTrainer::new(
+                    build_base_subgame_with_table(tmpl, table.clone()),
+                    0xCA1B_0000,
+                );
                 let mut rng = ChaCha20Rng::from_seed(0xCA1B_0000 ^ 0xC0FF_EE00);
                 for _ in 0..iters {
                     tr.step(&mut rng).expect("step");
@@ -2593,9 +2637,9 @@ mod tests {
                         n += 1;
                     }
                 }
-                let ev_short = mc_root_ev(&tr, root_actor, 50_000, 0x00E7_0000);
+                let ev_short = mc_root_ev(&tr, root_actor, EV_ROLLOUTS, 0x00E7_0000);
                 eprintln!(
-                    "[A1-cal] {name},{nodes},{iters},50000,{:.4},{:.4},{:.2},{:.2},{:.4},{n}",
+                    "[A1-cal] {bucket_mode},{name},{nodes},{iters},{REF_ITERS},{:.4},{:.4},{:.2},{:.2},{:.4},{n}",
                     if n > 0 { sum_l1 / n as f64 } else { 0.0 },
                     max_l1,
                     ev_short,
