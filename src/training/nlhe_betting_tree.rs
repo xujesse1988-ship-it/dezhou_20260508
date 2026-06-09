@@ -197,6 +197,26 @@ pub fn first_small_preopen_small_6max(
     (abs, rules)
 }
 
+/// S6 实时搜索深码档（`realtime_search_openpoker_exec` §2.1 / 缺口③）：**全街单一 {1pot}**
+/// 下注菜单——每决策点只剩 `{fold, check/call, bet/raise 1pot, all-in}`。fold/check/call/all-in
+/// 由规则引擎合法集自带（非 ratio），ratio 只配 1.0pot 单档；这就是文档「深码把下注菜单收到
+/// 单一 {1pot}（外加 fold / call / all-in）」。
+///
+/// 用途 = 把深码（150–800BB）**解到终局**的树压到可解：深 SPR 下到终局层数多，靠单档而非
+/// 多档把每节点分叉收窄（控树**只**靠菜单宽度、不 depth-limit、不要叶子续局值，§2.1 / §6 #2）。
+/// 短码树小、可放宽到多档（用 `first_small_*` 之类更宽的菜单），故本档专给深码。
+///
+/// **rules = `Default`（width_redirect 关）**：子树从真实**中途 postflop** 态为根建（人数已定、
+/// preflop 已结束），不需要 preflop 收宽 / no-limp 那套；default rules 下 `build_subtree` 的
+/// `(entrants, raises_on_street)` 不被读，传 `(0, 0)` 安全（见 [`PublicBettingTree::build_subtree`]）。
+/// 子树菜单与 blueprint 菜单解耦不引偏差：桶表按 (cards,board) 归桶、与菜单无关，子树自洽即可
+/// （建树与运行期 `legal_actions` 同一 `abs`）。
+pub fn deep_single_pot() -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let one = || ActionAbstractionConfig::new(vec![1.0]).expect("{1.0} 单档合法");
+    let abs = StreetActionAbstraction::per_street([one(), one(), one(), one()]);
+    (abs, BettingAbstractionRules::default())
+}
+
 pub struct PublicBettingTree {
     nodes: Vec<TreeNode>,
     root_id: NodeId,
@@ -828,6 +848,40 @@ mod tests {
             tree.num_nodes(),
             240_096,
             "默认 6-action 树节点数偏离实测 240,096——build 路由或 abstraction 改了行为"
+        );
+    }
+
+    /// [`deep_single_pot`] 菜单契约（缺口③ 的 crux）：全树**任何** Bet/Raise tag 必是 1.0pot
+    /// 单档（[`BetRatio::FULL_POT`]）——若有人把 `vec![1.0]` 误改回多档，本测试 fail。用短码 HU
+    /// （6BB，树小、debug 快）建全树扫描；菜单单档性与码深无关，故短码即可证。
+    #[test]
+    fn deep_single_pot_menu_is_single_full_pot() {
+        let cfg = TableConfig {
+            n_seats: 2,
+            starting_stacks: vec![ChipAmount::new(600), ChipAmount::new(600)], // 6BB 短码
+            small_blind: ChipAmount::new(50),
+            big_blind: ChipAmount::new(100),
+            ante: ChipAmount::ZERO,
+            button_seat: crate::core::SeatId(0),
+        };
+        let (abs, rules) = deep_single_pot();
+        let tree = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+        let mut saw_bet_or_raise = false;
+        for id in 0..tree.num_nodes() as NodeId {
+            for tag in tree.node(id).legal_actions.iter() {
+                if let AbstractActionTag::Bet(r) | AbstractActionTag::Raise(r) = tag {
+                    assert_eq!(
+                        *r,
+                        BetRatio::FULL_POT,
+                        "deep_single_pot 只许 1.0pot 单档，得 {r:?} @ node {id}"
+                    );
+                    saw_bet_or_raise = true;
+                }
+            }
+        }
+        assert!(
+            saw_bet_or_raise,
+            "应至少有一个 1.0pot Bet/Raise 档（证菜单非空）"
         );
     }
 

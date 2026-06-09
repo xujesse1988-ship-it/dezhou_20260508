@@ -30,6 +30,7 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::abstraction::action::StreetActionAbstraction;
 use crate::abstraction::bucket_table::BucketTable;
@@ -684,6 +685,17 @@ pub struct SubgameSearchConfig {
     /// 两条路都确定性（固定迭代 + seed）→ 接 LCFR 后静态选粒度路径仍 byte-equal（设计 §5）。
     /// wall / 收敛曲线 vanilla 与 LCFR 各量一条（A②），故是 config 旗而非写死默认。
     pub lcfr: bool,
+    /// 缺口①本体（`realtime_search_openpoker_exec` §2.3 / §4.1 A 收尾③）：`Some(d)` = **墙钟
+    /// anytime**——求解循环跑到 [`iterations`](Self::iterations) 上限**或** wall 达 `d` 就停、
+    /// 返回当前平均策略（限时打法）。`None`（默认）= 跑满固定 `iterations`（今天的行为，
+    /// **保持既有 probe / advisor / §11.5 基线逐 infoset byte-equal、不改生产行为**）。
+    ///
+    /// budgeted 路径的迭代数取决于机器速度 / 负载（同 `(state,seed)` 可产出不同迭代数）→
+    /// **原理上做不到 byte-equal**（§2.3）；可复现性靠 seeded RNG（仅固定迭代档保 byte-equal）+
+    /// replay / AIVAT 一致。连一轮迭代都跑不完（`iterations==0`）→ `Err`、调用方直接 fold
+    /// （§2.3 降级，不回落 blueprint）；够不够*有用*迭代仍由既有「当前桶未被访问 → `Err`」兜。
+    /// `Duration` 是 `Copy`，不破本结构 `derive(Copy)`。
+    pub time_budget: Option<Duration>,
 }
 
 impl Default for SubgameSearchConfig {
@@ -698,6 +710,7 @@ impl Default for SubgameSearchConfig {
             depth_limit: false,
             biased_leaf: false,
             lcfr: false,
+            time_budget: None,
         }
     }
 }
@@ -1084,10 +1097,26 @@ pub fn subgame_search(
         base
     };
     let mut srng = ChaCha20Rng::from_seed(master ^ 0xC0FF_EE00_C0FF_EE00);
+    // 缺口①本体（§2.3）：time_budget=Some → 墙钟 anytime（跑到 iterations 上限或 wall 达预算就停，
+    // 此时 iterations 退为安全上界）；None → 跑满固定 iterations（既有行为，byte-equal）。budgeted
+    // 下迭代数随机器速度/负载变 → 不可 byte-equal（§2.3），可复现靠固定迭代档 + seeded RNG。
+    let deadline = cfg.time_budget.map(|_| Instant::now());
+    let mut done: u64 = 0;
     for _ in 0..cfg.iterations {
         trainer
             .step(&mut srng)
             .map_err(|e| format!("subgame CFR step 失败: {e:?}"))?;
+        done += 1;
+        if let (Some(start), Some(budget)) = (deadline, cfg.time_budget) {
+            if start.elapsed() >= budget {
+                break;
+            }
+        }
+    }
+    if cfg.time_budget.is_some() && done == 0 {
+        // 连一轮 CFR 迭代都没完成（iterations==0 的退化配置）→ 直接 fold（§2.3 降级，不回落
+        // blueprint）。够不够*有用*迭代由下方「当前桶未被访问 → Err」继续兜。
+        return Err("time_budget 内连一轮 CFR 迭代都未完成（→ fold）".to_string());
     }
 
     // 导航到当前决策点（within-round tags 在 subtree 上重放；CurrentDecision 时 tags 空 → root）。
@@ -1160,7 +1189,7 @@ mod tests {
     use crate::abstraction::bucket_table::BucketConfig;
     use crate::core::{ChipAmount, SeatId};
     use crate::rules::action::Action;
-    use crate::training::nlhe_betting_tree::first_small_6max;
+    use crate::training::nlhe_betting_tree::{deep_single_pot, first_small_6max};
     use crate::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
     use crate::training::subgame_leaf_value::{build_leaf_value_tables, default_continuations};
 
@@ -1365,6 +1394,7 @@ mod tests {
             depth_limit: false,
             biased_leaf: false,
             lcfr: false,
+            time_budget: None,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -1418,6 +1448,7 @@ mod tests {
             depth_limit: false,
             biased_leaf: false,
             lcfr: false,
+            time_budget: None,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, 0, 0,
@@ -1519,6 +1550,7 @@ mod tests {
             depth_limit: false,
             biased_leaf: false,
             lcfr: false,
+            time_budget: None,
         };
         let d9 = subgame_search(
             &auth,
@@ -1889,6 +1921,7 @@ mod tests {
             depth_limit: false,
             biased_leaf: false,
             lcfr: true,
+            time_budget: None,
         };
         let run = |cfg: &SubgameSearchConfig| {
             subgame_search(
@@ -1931,6 +1964,82 @@ mod tests {
             differ,
             "开/关 LCFR 应出不同分布（证 lcfr 旗真接进子树解、非 no-op）"
         );
+    }
+
+    /// 缺口①本体（exec §2.3 / §4.1 A 收尾③）：`time_budget` 墙钟 anytime 求解路径。验
+    /// ① **预算不绑定**（远大于实际 wall）时退化为固定迭代路径、与 `time_budget=None` 逐项
+    /// byte-equal——这就是「默认 None 不改既有 probe/advisor/§11.5 基线」承诺的硬证；
+    /// ② **预算极小绑定**时优雅停（no-panic）、若 `Ok` 则归一 + 动作合法。限时打法迭代数随机器
+    /// 变、原理上做不到 byte-equal（§2.3），故 budgeted 路径只验合法性 + 不 panic，不验可复现。
+    #[test]
+    fn time_budget_anytime_stops_and_is_valid() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x5447_4254_5F41_3242); // "TGBT_A2B"
+        let auth = flop.game_state.clone();
+        let legal_abs = SimplifiedNlheGame::legal_actions(&flop);
+        let node_id = flop.current_node_id;
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+
+        // 基准：固定 300 迭代、time_budget=None（uniform range 聚焦 time_budget 机制本身）。
+        let none_cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            seed: 0x7B0D_6E7A_5EED_u64,
+            use_blueprint_range: false,
+            trigger: SearchTrigger::AllPostflop,
+            resolve_root: ResolveRoot::RoundStart,
+            depth_limit: false,
+            biased_leaf: false,
+            lcfr: false,
+            time_budget: None,
+        };
+        let base = subgame_search(
+            &auth, &auth, &game, &legal_abs, node_id, &strat, &none_cfg, None, 0x55, 4,
+        )
+        .expect("None 路径应 Ok（stub 桶 0 → root infoset 必累积）");
+
+        // ① 预算 60s 远不绑定（300 迭代 HU flop ~数十 ms）→ 跑满 300 迭代、deadline 从不触发 →
+        // 与 None 路径逐项 byte-equal（Instant 只读不入 RNG/trainer，不引入非确定性）。
+        let loose_cfg = SubgameSearchConfig {
+            time_budget: Some(Duration::from_secs(60)),
+            ..none_cfg
+        };
+        let loose = subgame_search(
+            &auth, &auth, &game, &legal_abs, node_id, &strat, &loose_cfg, None, 0x55, 4,
+        )
+        .expect("预算不绑定路径应 Ok");
+        assert_eq!(base.len(), loose.len(), "预算不绑定 → 与 None 路径同维度");
+        for ((a1, p1), (a2, p2)) in base.iter().zip(&loose) {
+            assert_eq!(a1, a2, "预算不绑定 → 动作逐项 == None 路径");
+            assert_eq!(
+                p1.to_bits(),
+                p2.to_bits(),
+                "预算不绑定 → 概率 byte-equal == None 路径（默认 None 不改既有行为的硬证）"
+            );
+        }
+
+        // ② 预算 1ns 极小绑定：每 step 后检查 elapsed → 跑 1 迭代即停。no-panic；若 Ok 则归一 + 合法。
+        let tight_cfg = SubgameSearchConfig {
+            iterations: 1_000_000,
+            time_budget: Some(Duration::from_nanos(1)),
+            ..none_cfg
+        };
+        let tight = subgame_search(
+            &auth, &auth, &game, &legal_abs, node_id, &strat, &tight_cfg, None, 0x55, 4,
+        );
+        // Err 合法（限时太紧 → 当前桶未访问 → 调用方 fold，§2.3）；不 panic 已由执行到此处证。
+        if let Ok(d) = tight {
+            let sum: f64 = d.iter().map(|(_, p)| *p).sum();
+            assert!((sum - 1.0).abs() < 1e-9, "限时停后若 Ok 须归一，和={sum}");
+            for (act, p) in &d {
+                assert!(*p > 0.0, "只返回正概率动作");
+                let tag = AbstractActionTag::of(act);
+                assert!(
+                    legal_abs.iter().any(|l| AbstractActionTag::of(l) == tag),
+                    "返回动作 {tag:?} 在 legal_abs 内"
+                );
+            }
+        }
     }
 
     // ======================================================================
@@ -2009,6 +2118,50 @@ mod tests {
         gs
     }
 
+    /// N 座**等栈 limped flop**（A 收尾② 多人目标树）：preflop 全员 limp/complete、BB check →
+    /// 见 flop 时 N 人全 live（无 side pot、干净多人 postflop 决策点）。驱动直接 apply 到**真
+    /// `GameState`**（不过抽象层 width_redirect——否则第 (N+1) entrant 会被 redirect fold，见
+    /// `nlhe_betting_tree::filter_actions`）。给 wall/conv 量「实时解 N-way 子树」的多人维度。
+    fn nway_limped_flop_state(n_seats: u8, stack: u64, seed: u64) -> GameState {
+        let cfg = TableConfig {
+            n_seats,
+            starting_stacks: vec![ChipAmount::new(stack); n_seats as usize],
+            small_blind: ChipAmount::new(50),
+            big_blind: ChipAmount::new(100),
+            ante: ChipAmount::ZERO,
+            button_seat: SeatId(0),
+        };
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        let mut gs = GameState::with_rng(&cfg, seed, &mut rng);
+        let mut guard = 0;
+        while gs.street() == Street::Preflop && !gs.is_terminal() {
+            // 能 check 就 check（BB option），否则 call（limp/complete）；limp-only 线两者其一必有。
+            let la = gs.legal_actions();
+            let action = if la.check {
+                Action::Check
+            } else if la.call.is_some() {
+                Action::Call
+            } else {
+                break; // 退化（不该在 limp 线发生）→ 跳出，下方断言暴露。
+            };
+            gs.apply(action).expect("limp/complete/check 应合法");
+            guard += 1;
+            assert!(guard < 64, "preflop 驱动未在 64 步内进 flop");
+        }
+        assert_eq!(gs.street(), Street::Flop, "全员 limp → 见 flop");
+        assert!(
+            !gs.is_terminal() && gs.current_player().is_some(),
+            "flop 多人决策点"
+        );
+        let live = gs
+            .players()
+            .iter()
+            .filter(|p| matches!(p.status, PlayerStatus::Active | PlayerStatus::AllIn))
+            .count();
+        assert_eq!(live, n_seats as usize, "limped flop 应 N 人全 live");
+        gs
+    }
+
     /// 用 default {0.5,1,2} 抽象 + 默认 rules 从 `template` 建解到终局的 subgame（A① 守恒/wall 共用）。
     fn build_base_subgame(template: &GameState) -> SubgameNlheGame {
         SubgameNlheGame::new(
@@ -2020,6 +2173,85 @@ mod tests {
             0,
             0,
         )
+    }
+
+    /// 把 HU 默认 game 用 **passive 推进**（check 优先、否则 call/complete）驱动到 `target` 街的
+    /// 首决策点（ε 标定用 river/turn 小子树）。`target == Flop` 等价 [`hu_flop_state`]，更深街多走
+    /// 几轮 check-check。返回该 `SimplifiedNlheState`（其 `game_state` 作 subgame template）。
+    fn hu_state_at(game: &SimplifiedNlheGame, seed: u64, target: Street) -> SimplifiedNlheState {
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        let rng: &mut dyn RngSource = &mut rng;
+        let mut state = game.root(rng);
+        let mut guard = 0;
+        while state.game_state.street() != target && !state.game_state.is_terminal() {
+            let la = SimplifiedNlheGame::legal_actions(&state);
+            let pick = la
+                .iter()
+                .copied()
+                .find(|a| matches!(a, AbstractAction::Check))
+                .or_else(|| {
+                    la.iter()
+                        .copied()
+                        .find(|a| AbstractActionTag::of(a) == AbstractActionTag::Call)
+                })
+                .expect("passive check/call 应可用（推进到下一街）");
+            state = SimplifiedNlheGame::next(state, pick, rng);
+            guard += 1;
+            assert!(guard < 32, "未在 32 步内到 {target:?}");
+        }
+        assert_eq!(state.game_state.street(), target, "应到目标街");
+        assert!(!state.game_state.is_terminal() && state.game_state.current_player().is_some());
+        state
+    }
+
+    /// `traverser` 在 subgame root 的 **MC root EV**（δ_conv 度量）：两家都按 `trainer` 的**平均
+    /// 策略**行动（infoset 未访问 → uniform）、root 每次重发隐藏牌，平均 `rollouts` 次终局 payoff。
+    /// CFR 收敛时 avg-vs-avg root EV → 子博弈值，故 `|EV(短解) − EV(M 参考)|` 量收敛距离。
+    /// 注：独立 RNG、未做 common-random-numbers → EV 差带 MC 噪声（~pot/√rollouts），真阈值标定
+    /// 在真桶表 + 更大 rollouts 上做（本诊断为机制）。
+    fn mc_root_ev(
+        trainer: &EsMccfrTrainer<SubgameNlheGame>,
+        traverser: PlayerId,
+        rollouts: usize,
+        seed: u64,
+    ) -> f64 {
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        let mut total = 0.0_f64;
+        for _ in 0..rollouts {
+            let mut st = trainer.game().root(&mut rng);
+            let mut guard = 0;
+            loop {
+                match SubgameNlheGame::current(&st) {
+                    NodeKind::Terminal => break,
+                    NodeKind::Chance => {
+                        // subgame root 已重发全部隐藏牌 → 正常无 mid-hand chance；防御性按分布采。
+                        let dist = SubgameNlheGame::chance_distribution(&st);
+                        let pairs: Vec<(usize, f64)> =
+                            dist.iter().enumerate().map(|(i, (_, p))| (i, *p)).collect();
+                        let idx = sample_discrete(&pairs, &mut rng);
+                        st = SubgameNlheGame::next(st, dist[idx].0, &mut rng);
+                    }
+                    NodeKind::Player(actor) => {
+                        let info = SubgameNlheGame::info_set(&st, actor);
+                        let actions = SubgameNlheGame::legal_actions(&st);
+                        let n = actions.len();
+                        let avg = trainer.average_strategy(&info);
+                        let dist: Vec<(usize, f64)> = if avg.len() == n {
+                            avg.iter().enumerate().map(|(i, p)| (i, *p)).collect()
+                        } else {
+                            let u = 1.0 / n as f64;
+                            (0..n).map(|i| (i, u)).collect()
+                        };
+                        let idx = sample_discrete(&dist, &mut rng);
+                        st = SubgameNlheGame::next(st, actions[idx], &mut rng);
+                    }
+                }
+                guard += 1;
+                assert!(guard < 256, "MC rollout 未在 256 步终止");
+            }
+            total += SubgameNlheGame::payoff(&st, traverser);
+        }
+        total / rollouts as f64
     }
 
     /// 从 subgame root uniform-random 走子树到真实终局，返回终局 GameState（读 payouts 守恒）。
@@ -2146,37 +2378,88 @@ mod tests {
         assert_conserves_over_rollouts(&sub, 32);
     }
 
-    /// 诊断（非门槛，exec §4.1 A②）：子树解 **单决策 wall 回归曲线**（vanilla vs LCFR）+
-    /// **收敛距离**（实时解 ≈ 同 game 离线高迭代解的 per-infoset 平均策略 L1）。在 A① 的深码 /
-    /// 多人目标树上量，给 5/10/20s 时限可行性 + ε 标定提供初值。wall 用 `Instant`（仅测量，不入
-    /// 确定性求解路径）。`cargo test -p poker --lib --release -- --ignored --nocapture
-    /// _measure_subgame_wall_and_convergence`（须 --release，wall 才有意义）。
+    /// 诊断（非门槛，exec §4.1 A 收尾②）：子树解 **单决策 wall 回归曲线**（vanilla vs LCFR）+
+    /// **收敛距离**（实时解 ≈ 同 game 离线高迭代解的 per-infoset 平均策略 L1）。目标树 = 中等
+    /// （HU 200BB / 200v60 / 3way side-pot，default {0.5,1,2}）+ **真目标树**（HU 500BB / 4way /
+    /// 5way，`deep_single_pot` {1pot} 解到终局，缺口③④）——直接回答「5/10/20s 在真深码/多人树上
+    /// 能解到多少迭代」。节点数 > `HEAVY_NODE_CAP` 的树只报节点数 + 短探针 µs/iter、跳满 ladder
+    /// （明确 log、不静默截断；节点数本身即「单线程是否可解」的结论）。wall 用 `Instant`（仅测量，
+    /// 不入确定性求解路径）。`cargo test -p poker --lib --release -- --ignored --nocapture
+    /// _measure_subgame_wall_and_convergence`（须 --release，wall 才有意义；多人树较大、跑较久）。
     #[test]
     #[ignore = "诊断：子树解 wall（vanilla/LCFR）+ 收敛 L1；--release --ignored --nocapture 跑"]
     fn _measure_subgame_wall_and_convergence() {
-        use std::time::Instant;
-        let deep = hu_game_with_stacks([20_000, 20_000]); // HU 200BB
-        let deep_flop = hu_flop_state(&deep, 0xDEE9_5747_0000_0001)
+        let deep200 = hu_game_with_stacks([20_000, 20_000]); // HU 200BB
+        let deep200_flop = hu_flop_state(&deep200, 0xDEE9_5747_0000_0001)
             .game_state
             .clone();
         let asym = hu_game_with_stacks([20_000, 6_000]); // 200 vs 60
         let asym_flop = hu_flop_state(&asym, 0xA59E_0000_0000_0001)
             .game_state
             .clone();
-        let mw_flop = multiway_side_pot_flop_state(0x6D77_0000_0000_0001);
-        let targets: [(&str, &GameState); 3] = [
-            ("hu_200bb_flop", &deep_flop),
-            ("asym_200v60_flop", &asym_flop),
-            ("multiway_3way_sidepot_flop", &mw_flop),
+        let mw3_flop = multiway_side_pot_flop_state(0x6D77_0000_0000_0001);
+        // A 收尾②（缺口③④）真目标树：HU 500BB {1pot} 解到终局 + 4/5-way limped {1pot}。多人
+        // 取中等码深（4way 100BB / 5way 60BB）——深码×多人叠加是单独设计（§2.2），首测不堆满。
+        let deep500 = hu_game_with_stacks([50_000, 50_000]); // HU 500BB
+        let deep500_flop = hu_flop_state(&deep500, 0xD509_0000_0000_0001)
+            .game_state
+            .clone();
+        let mw4_flop = nway_limped_flop_state(4, 10_000, 0x6D34_0000_0000_0001);
+        let mw5_flop = nway_limped_flop_state(5, 6_000, 0x6D35_0000_0000_0001);
+        // deep=true → deep_single_pot {1pot} 菜单（缺口③）；false → 既有 default {0.5,1,2}。
+        let build = |tmpl: &GameState, deep: bool| -> SubgameNlheGame {
+            let (abs, rules) = if deep {
+                deep_single_pot()
+            } else {
+                (
+                    StreetActionAbstraction::default_6_action(),
+                    BettingAbstractionRules::default(),
+                )
+            };
+            SubgameNlheGame::new(
+                stub_table(),
+                tmpl.config().clone(),
+                abs,
+                rules,
+                tmpl.clone(),
+                0,
+                0,
+            )
+        };
+        let targets: [(&str, &GameState, bool); 6] = [
+            ("hu_200bb_flop", &deep200_flop, false),
+            ("asym_200v60_flop", &asym_flop, false),
+            ("mw_3way_sidepot_flop", &mw3_flop, false),
+            ("hu_500bb_flop_1pot", &deep500_flop, true),
+            ("mw_4way_100bb_flop_1pot", &mw4_flop, true),
+            ("mw_5way_60bb_flop_1pot", &mw5_flop, true),
         ];
+        // 树太大（>cap）→ 单线程跑满 ladder 不现实：只报节点数 + 短探针 µs/iter、明确 log 跳过
+        // （不静默截断）。external-sampling 每迭代是一条轨迹、µs/iter 仍可测；node 计数本身即结论。
+        const HEAVY_NODE_CAP: usize = 2_000_000;
 
         // --- wall：(nodes, iters) → 单决策 wall，vanilla 与 LCFR 各一条 ---
         eprintln!("[A2-wall] target,nodes,iters,variant,wall_ms,us_per_iter");
-        for (name, tmpl) in targets {
-            let nodes = build_base_subgame(tmpl).subtree().num_nodes();
+        for (name, tmpl, deep) in targets {
+            let nodes = build(tmpl, deep).subtree().num_nodes();
+            if nodes > HEAVY_NODE_CAP {
+                let mut tr = EsMccfrTrainer::new(build(tmpl, deep), 0xA5A5_0000);
+                let mut rng = ChaCha20Rng::from_seed(0xA5A5_0000 ^ 0xC0FF_EE00);
+                let t0 = Instant::now();
+                for _ in 0..300u64 {
+                    tr.step(&mut rng).expect("probe step");
+                }
+                let wall = t0.elapsed();
+                eprintln!(
+                    "[A2-wall] {name},{nodes},300,probe_only,{:.3},{:.3} (nodes>{HEAVY_NODE_CAP} → 跳满 ladder + conv)",
+                    wall.as_secs_f64() * 1e3,
+                    wall.as_micros() as f64 / 300.0,
+                );
+                continue;
+            }
             for &iters in &[300u64, 1_000, 3_000, 10_000, 30_000] {
                 for lcfr in [false, true] {
-                    let base = EsMccfrTrainer::new(build_base_subgame(tmpl), 0xA5A5_0000);
+                    let base = EsMccfrTrainer::new(build(tmpl, deep), 0xA5A5_0000);
                     let mut tr = if lcfr {
                         base.with_lcfr_period((iters / 50).max(1))
                     } else {
@@ -2198,11 +2481,17 @@ mod tests {
             }
         }
 
-        // --- 收敛距离：实时解(N) vs 离线参考(M=50000)，沿同一 (seed) 轨迹的 per-infoset 平均策略 L1 ---
+        // --- 收敛距离（粗 sanity）：实时解(N) vs 离线参考(M=50000) per-infoset 平均策略 L1。
+        //     ε/δ_conv 精确阈值改用 river/turn 小可枚举子树（见 _measure_convergence_calibration）
+        //     ——大 flop 子树欠采样不适合定阈（§4.1）。这里只看 L1 是否随迭代单调降。---
         eprintln!("[A1-conv] target,iters,ref,mean_l1,max_l1,infosets");
-        for (name, tmpl) in targets {
+        for (name, tmpl, deep) in targets {
+            if build(tmpl, deep).subtree().num_nodes() > HEAVY_NODE_CAP {
+                eprintln!("[A1-conv] {name} 跳过（nodes > {HEAVY_NODE_CAP}）");
+                continue;
+            }
             let reference = {
-                let mut tr = EsMccfrTrainer::new(build_base_subgame(tmpl), 0xC0DE_0000);
+                let mut tr = EsMccfrTrainer::new(build(tmpl, deep), 0xC0DE_0000);
                 let mut rng = ChaCha20Rng::from_seed(0xC0DE_0000 ^ 0xC0FF_EE00);
                 for _ in 0..50_000 {
                     tr.step(&mut rng).expect("ref step");
@@ -2210,7 +2499,7 @@ mod tests {
                 tr
             };
             for &iters in &[300u64, 1_000, 3_000, 10_000] {
-                let mut tr = EsMccfrTrainer::new(build_base_subgame(tmpl), 0xC0DE_0000);
+                let mut tr = EsMccfrTrainer::new(build(tmpl, deep), 0xC0DE_0000);
                 let mut rng = ChaCha20Rng::from_seed(0xC0DE_0000 ^ 0xC0FF_EE00);
                 for _ in 0..iters {
                     tr.step(&mut rng).expect("step");
@@ -2230,6 +2519,75 @@ mod tests {
                     "[A1-conv] {name},{iters},50000,{:.4},{:.4},{n}",
                     if n > 0 { sum_l1 / n as f64 } else { 0.0 },
                     max_l1,
+                );
+            }
+        }
+    }
+
+    /// 诊断（非门槛，exec §4.1 A 收尾①）：ε/δ_conv 收敛距离**机制**——在 **river/turn 小可枚举
+    /// 子树**上量 ① per-infoset 平均策略 L1（vs M=50000 参考）+ ② **root EV 差 δ_conv**（avg-vs-avg
+    /// MC）。river/turn 子树小、CFR 收敛快 → L1/EV 有意义（大 flop 子树欠采样不适合定阈，§4.1，故
+    /// 移出 `_measure_subgame_wall_and_convergence` 的粗 sanity）。
+    ///
+    /// ⚠ **stub 桶表 = 退化 ε**：postflop 全归桶 0 → 同街只有少数 infoset、无 per-hand 变化 →
+    /// L1/EV 偏乐观。**最终 ε/δ_conv 阈值须在真桶表上跑**（`stub_table()` 换 `BucketTable::open` +
+    /// river/turn 真 board，一行 + 一个 artifact 路径）。本诊断只钉「机制正确 + L1 随迭代降 + EV 差
+    /// 随迭代收」。`cargo test -p poker --lib --release -- --ignored --nocapture
+    /// _measure_convergence_calibration`（须 --release）。
+    #[test]
+    #[ignore = "诊断：river/turn 收敛 L1 + root-EV 差（机制；真阈值需真桶表）；--release --ignored 跑"]
+    fn _measure_convergence_calibration() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let turn = hu_state_at(&game, 0x5455_524E_0000_0001, Street::Turn) // "TURN"
+            .game_state
+            .clone();
+        let river = hu_state_at(&game, 0x5249_5645_0000_0001, Street::River) // "RIVE"
+            .game_state
+            .clone();
+        let targets: [(&str, &GameState); 2] =
+            [("hu_turn_subtree", &turn), ("hu_river_subtree", &river)];
+
+        eprintln!(
+            "[A1-cal] target,nodes,iters,ref,mean_l1,max_l1,ev_short,ev_ref,ev_abs_diff,infosets"
+        );
+        for (name, tmpl) in targets {
+            let nodes = build_base_subgame(tmpl).subtree().num_nodes();
+            // root EV 的 traverser = root 决策者（postflop HU = BB 先动），便于解读。
+            let root_actor = tmpl.current_player().expect("非终局").0 as PlayerId;
+            let reference = {
+                let mut tr = EsMccfrTrainer::new(build_base_subgame(tmpl), 0xCA1B_0000);
+                let mut rng = ChaCha20Rng::from_seed(0xCA1B_0000 ^ 0xC0FF_EE00);
+                for _ in 0..50_000 {
+                    tr.step(&mut rng).expect("ref step");
+                }
+                tr
+            };
+            let ev_ref = mc_root_ev(&reference, root_actor, 50_000, 0x00E7_0000);
+            for &iters in &[300u64, 1_000, 3_000, 10_000] {
+                let mut tr = EsMccfrTrainer::new(build_base_subgame(tmpl), 0xCA1B_0000);
+                let mut rng = ChaCha20Rng::from_seed(0xCA1B_0000 ^ 0xC0FF_EE00);
+                for _ in 0..iters {
+                    tr.step(&mut rng).expect("step");
+                }
+                let (mut sum_l1, mut max_l1, mut n) = (0.0f64, 0.0f64, 0usize);
+                for (info, _) in tr.strategy_sum().inner().iter() {
+                    let a = tr.average_strategy(info);
+                    let b = reference.average_strategy(info);
+                    if !b.is_empty() && a.len() == b.len() {
+                        let l1: f64 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum();
+                        sum_l1 += l1;
+                        max_l1 = max_l1.max(l1);
+                        n += 1;
+                    }
+                }
+                let ev_short = mc_root_ev(&tr, root_actor, 50_000, 0x00E7_0000);
+                eprintln!(
+                    "[A1-cal] {name},{nodes},{iters},50000,{:.4},{:.4},{:.2},{:.2},{:.4},{n}",
+                    if n > 0 { sum_l1 / n as f64 } else { 0.0 },
+                    max_l1,
+                    ev_short,
+                    ev_ref,
+                    (ev_short - ev_ref).abs(),
                 );
             }
         }
