@@ -430,19 +430,32 @@ impl Invariants {
                     ));
                 }
             }
-            // LA-007: all_in_amount 当且仅当 stack > 0
+            // LA-007（精化）：all_in_amount 当且仅当 all-in 是**合法动作**时为 Some，其值 = cap
+            // （committed_this_round + stack）。合法性**无法仅凭公开 LegalActionSet 判定**——合法的
+            // all-in-for-less raise（raise_option_open 仍 true、cap<min_full_raise）与非法的 all-in
+            // （raise 未重开）在公开字段同形（raise_range 皆 None），唯一区别是私有 raise_option_open。
+            // 故用**与 apply 的一致性**验证（最强形式，能抓「该 Some 却 None / 该 None 却 Some」两向）：
+            // clone 后 apply(AllIn) 成功 ⟺ all_in_amount 应为 Some。
             let stack_pos = p.stack > ChipAmount::ZERO;
-            if stack_pos && la.all_in_amount.is_none() {
-                return Err("LA-007 violated: stack > 0 but all_in_amount = None".into());
-            }
-            if !stack_pos && la.all_in_amount.is_some() {
+            if stack_pos {
+                let mut probe = state.clone();
+                let apply_ok = probe.apply(Action::AllIn).is_ok();
+                if apply_ok && la.all_in_amount.is_none() {
+                    return Err("LA-007 violated: apply(AllIn) 合法但 all_in_amount = None".into());
+                }
+                if !apply_ok && la.all_in_amount.is_some() {
+                    return Err(
+                        "LA-007 violated: apply(AllIn) 非法但 all_in_amount = Some（非法 raise 形态）"
+                            .into(),
+                    );
+                }
+            } else if la.all_in_amount.is_some() {
                 return Err("LA-007 violated: stack == 0 but all_in_amount = Some".into());
             }
             if let Some(amt) = la.all_in_amount {
-                if amt != p.committed_this_round + p.stack {
+                if amt != cap {
                     return Err(format!(
-                        "LA-007 violated: all_in_amount={amt:?} != committed+stack={:?}",
-                        p.committed_this_round + p.stack
+                        "LA-007 violated: all_in_amount={amt:?} != committed+stack={cap:?}"
                     ));
                 }
             }
