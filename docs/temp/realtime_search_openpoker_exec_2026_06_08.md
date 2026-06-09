@@ -134,8 +134,6 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 
 ### 2.2 人数 >3（最难的结构问题，正面解决）
 
-- `width_redirect`（`nlhe_betting_tree.rs:101`、断言 `:379`）= 把第 N+1 个进场的人收口成 squeeze / fold 的
-  **多路收口机制**（N=3 是当前最划算的点），让 ≤3-way 子树可枚举。**≤3-way 是当前抽象的限制、是主目标要克服的对象，不是终点。**
 - **打法 = 实时解 N-way 子树**：多人解到终局时，摊牌值由真实 `GameState::payouts()` 的 N-way side-pot showdown 精确给出。
 - **深码 × 多人是两个难点叠加、最难**，要单独出设计；但真实牌局里这种情况最常见，正是要主攻的地方，不回避。
 
@@ -206,7 +204,8 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 3. **深码窄菜单解到终局**：深码 = 把下注菜单收到**单一 {1pot}**（短码可放宽）、解到终局用真实 `payouts()`，在 `time_budget`
    内尽力解、不保证收敛（anytime + LCFR，缺口①）。核心工程 = 「**时限内把 {1pot} 窄树解到终局**」（不重建叶子值，缘由见 §6 #2）。
 4. **多人 >3 的树**：见 §2.2，**实时解 N-way 子树**——解到终局、用真实 N-way side-pot `payouts()`，
-   **不需要 N-way 叶子值**（原 N-way 叶子值需求随放弃 depth-limit 一并消除）。
+   **不需要 N-way 叶子值**（原 N-way 叶子值需求随放弃 depth-limit 一并消除）。注意现有 `width_redirect` N=3
+   （`nlhe_betting_tree.rs:101`）把 4+way 收口成 ≤3-way，C 要建真 N-way 树、不走收口。
 5. **真实分布覆盖度量**：见 §4.2（HH 日志 + 覆盖热力图，都还没建）。
 6. **多人 AIVAT 降方差**：`aivat_nlhe.rs` 现在是 HU 单对手（两人写死），要推广到 N 座。单边 P_a={chance, 我方}
    就无偏（不需要对手策略，用 blueprint 当值函数也合法），预期能把 SD 缩到 1/2–1/3 → 所需手数降到 1/4–1/9。这是 §4 live
@@ -228,24 +227,19 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 | **C**（多人 >3） | **实时解 N-way 子树**（§2.2）：解到终局用真实 N-way side-pot `payouts()`、**不要 N-way 叶子值**（**无「建叶子值」这一步**——随放弃 depth-limit 消除）；接生产 + live | 4 人及以上见 flop 有可靠、可解的子树（离线核：守恒 + N-way side-pot payouts 正确）+ live 不退化（同 B，功效不足 → 过 ≠ 兑现多人核心，只兑现“解真游戏 + 不退化”） |
 | **D**（后置可选） | 剥削加分项：按置信度门控替换对手 range 的数据源 | **前置**：对手 name 稳定可追踪（§4.2 已验）；数据足够的对手上增量为正（同样受 live 功效限制，复用下面的护栏）；对池中最稳健的对手分项不亏（防被反剥削） |
 
-**步 A 进度（2026-06-09，commit `ce25ee6`→`61c3d14`，vultr 全绿 468 passed / 0 failed / 90 ignored）**：
+**步 A 进度（2026-06-09，commit `ce25ee6`→`61c3d14`，vultr 全绿）**：
 
 - **缺口① LCFR 已接**（A② 第一杠杆，见 §3.1/§3.2）。
 - **A① 引擎在各种码深下都正确——离线半已交付**（`subgame.rs` / `state.rs` 新测试）：
-  - 守恒（`payouts()` Σ==0）+ resample 保几何 + I-001 在**深码（HU 200BB）/ 不对称（hero 200BB vs 60BB）/
+  - 守恒（`payouts()` Σ==0）+ 重采样保牌分布 + 不变量检查 在**深码（HU 200BB）/ 不对称（hero 200BB vs 60BB）/
     多人 side-pot 中途根（3 座短码 BB all-in）**经 `build_subtree` 那条路全过；byte-equal 可复现。
   - **SPR / all-in 阈值 = 真实 per-seat 栈**：不对称局短码 all-in 额 = 其 `committed_this_round + stack` 且严格 <
     深码栈（证引擎按真码深算、非「都当 100BB」；§0.3 现场求解处理不对称栈的前提现已硬验）。
-  - ⚠ **A① 揪出并修了一个真实规则 bug**：`legal_actions().all_in_amount` 此前在「面对 bet、raise 未重开、cap >
-    call 额」的不对称 / 短码 all-in-for-less 线误报 `Some`（= 非法 raise），`abstract_actions` 忠实发出 → `build_subtree`
-    panic（`RaiseOptionNotReopened`）。规则层修复（LA-007 加合法性门，commit `f6c1a26`）；**对称树 byte-equal 确证不破
-    S1/S2/S3**——240,096 / 78,852 / 719,764 / **1,154,822（N=3 A3×A4）节点数全不变**；harness LA-007 升级成 apply-consistency
-    校验（`61c3d14`，比旧「Some iff stack>0」更强）。这是 §2.1「引擎天生处理不对称栈」从「代码核验过」升级到「实测验过」时
-    才暴露的、且是 §0.3 结论的反例补丁——**引擎现在才真的对不对称栈正确**。
+  - ⚠ **过程中修了一个真实规则 bug**：`all_in_amount` 在不对称 / 短码 all-in-for-less 线误报非法 all-in（commit `f6c1a26`），
+    对称树 byte-equal 确证不破 S1/S2/S3。这是「引擎天生处理不对称栈」从代码核验升级到实测时才暴露的——引擎现在才真的对不对称栈正确。
   - **实时解 ≈ 离线 CFR 收敛（A① 第三判据）= 机制已验**：实时解 vs 离线 M=50000 参考的 per-infoset 平均策略 L1 随迭代
     **单调下降**（HU 0.34→0.13、不对称 0.42→0.18 @300→10000 iter）；小可枚举 multiway 子树 **0.026→0.0006**（干净收敛）。
-    建树 / resample / 索引 hero 真桶链路无系统偏差。**ε/δ_conv 精确标定**（在 river/turn 小可枚举子树 + 真桶表上，而非欠采样
-    的大 flop 子树）= 下一步细化，不卡步 A 离线半。
+    **ε/δ_conv 精确标定**（在 river/turn 小可枚举子树 + 真桶表上，而非欠采样的大 flop 子树）= 下一步细化，不卡步 A 离线半。
 - **A② wall 曲线初测**（vanilla / LCFR 各一条，单线程 4-core vultr）：中等树上 **5s 单线程可行**——HU 200BB flop（58,160 节点）
   ~155ms/1000 iter、~3.7s/30000 iter；短码 3way（12 节点）~4ms/1000 iter。LCFR wall ≈ vanilla（其杠杆是每迭代收敛、非每迭代 wall）。
   ⚠ **未做**：画到**真正的深码（500BB+，{1pot} 菜单、解到终局）/ 4–5way 目标树**（需缺口③④的深码抽象 + 更大树）+ 按**部署机**核数外推（§7：别拿测试机当部署结论）。
