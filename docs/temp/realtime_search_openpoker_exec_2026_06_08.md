@@ -203,9 +203,7 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
    search 分派 + 重写 outgoing（见 §1）——是整条管线重建，不是接一行。
 3. **深码窄菜单解到终局**：深码 = 把下注菜单收到**单一 {1pot}**（短码可放宽）、解到终局用真实 `payouts()`，在 `time_budget`
    内尽力解、不保证收敛（anytime + LCFR，缺口①）。核心工程 = 「**时限内把 {1pot} 窄树解到终局**」（不重建叶子值，缘由见 §6 #2）。
-4. **多人 >3 的树**：见 §2.2，**实时解 N-way 子树**——解到终局、用真实 N-way side-pot `payouts()`，
-   **不需要 N-way 叶子值**（原 N-way 叶子值需求随放弃 depth-limit 一并消除）。注意现有 `width_redirect` N=3
-   （`nlhe_betting_tree.rs:101`）把 4+way 收口成 ≤3-way，C 要建真 N-way 树、不走收口。
+4. **多人 >3 的树**：见 §2.2，**实时解 N-way 子树**——解到终局、用真实 N-way side-pot `payouts()`。
 5. **真实分布覆盖度量**：见 §4.2（HH 日志 + 覆盖热力图，都还没建）。
 6. **多人 AIVAT 降方差**：`aivat_nlhe.rs` 现在是 HU 单对手（两人写死），要推广到 N 座。单边 P_a={chance, 我方}
    就无偏（不需要对手策略，用 blueprint 当值函数也合法），预期能把 SD 缩到 1/2–1/3 → 所需手数降到 1/4–1/9。这是 §4 live
