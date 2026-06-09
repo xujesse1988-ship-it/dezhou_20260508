@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::ExitCode;
 
 use poker::{
-    AbstractAction, ActionAbstraction, ActionAbstractionConfig, BetRatio, ChaCha20Rng,
+    AbstractAction, ActionAbstraction, ActionAbstractionConfig, BetRatio, ChaCha20Rng, ChipAmount,
     DefaultActionAbstraction, GameState, PlayerStatus, RngSource, TableConfig,
 };
 
@@ -1096,6 +1096,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()
         .map_err(|e| format!("NODE_CAP 不是 u64: {e}"))?
         .unwrap_or(NODE_CAP_DEFAULT);
+    // HU_STACK_BB=14,20,25,...（步 A① 短码 BR 可行性 sizing）：对每个 BB 深度建一棵短码
+    // HU 抽象树（{0.5,1,2} 全街、BB=100 → chips=bb×100），打印决策节点 / 按街 / infoset。
+    // 空/不设 = 跳过（200BB self-check 不变）。短码 → AllIn 提前触顶 → 树规模骤降，把
+    // exec §2.1「短码树小→可解到终局」从断言变实测（步 A① infoset 规模可承受性的前置）。
+    let hu_stack_bb: Vec<u64> = std::env::var("HU_STACK_BB")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.split(',')
+                .map(|x| {
+                    x.trim()
+                        .parse::<u64>()
+                        .map_err(|e| format!("HU_STACK_BB 项 '{x}' 不是 u64: {e}"))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     println!("=== Simplified NLHE Abstract Betting Tree Sizing ===");
     let cap_desc = if raise_cap == u32::MAX {
@@ -1151,6 +1169,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             &hu,
         );
         println!("walk wall time  : {:.3}s\n", start.elapsed().as_secs_f64());
+    }
+
+    // (1b) HU 短码 sizing（步 A① BR 可行性前置）：对每个 HU_STACK_BB 深度量树规模。
+    // 用 HU 生产抽象 {0.5,1,2} 全街、postflop 桶数取 XV_POSTFLOP（默认 200 = 6-max 生产桶，
+    // 与短码 BR 要剥削的 100BB blueprint 同桶口径）。短码 → 树骤小、可解到终局，这是
+    // exec §2.1 短码先做的承重前提，此前只断言未实测。infoset 数 = 步 A① 「全树 PI infoset
+    // 规模 ≤ N」放行判据的直接输入（这里给 betting-tree × 桶 那一维；牌局 chance 维另算）。
+    if !hu_stack_bb.is_empty() {
+        let buckets = BucketCounts {
+            preflop: 169,
+            postflop: postflop_buckets,
+        };
+        for &bb in &hu_stack_bb {
+            let mut cfg = TableConfig::default_hu_200bb();
+            cfg.starting_stacks = vec![ChipAmount::new(bb * 100); 2]; // BB=100 chips → bb×100
+            let start = std::time::Instant::now();
+            let stats = measure(
+                &cfg,
+                [R3, R3, R3, R3],
+                &buckets,
+                u32::MAX,
+                false,
+                b3_summary,
+                b3_pin_actions,
+                255,
+                255,
+                node_cap,
+            );
+            print_stats(
+                &format!("HU {bb}BB 短码 sizing (步 A①；postflop {postflop_buckets} 桶)"),
+                &ratios_desc([R3, R3, R3, R3]),
+                &stats,
+                &buckets,
+            );
+            println!("walk wall time  : {:.3}s\n", start.elapsed().as_secs_f64());
+        }
     }
 
     // (2) 6-max S2 探针：argv raise 集 / env postflop 桶数 / preflop 169。
