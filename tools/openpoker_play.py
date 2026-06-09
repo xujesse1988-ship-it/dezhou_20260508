@@ -386,7 +386,29 @@ def run_selftest(advisor):
     _assert_legal(resp3, valid_flop, "flop")
     print(f"[selftest 3 flop] resp={resp3}", file=sys.stderr)
 
-    print("OK: 3 个 canned 场景跑通，advisor 全程出合法动作、driver 组请求/动作包正常。", file=sys.stderr)
+    # 场景 4（缺口②）：flop 首点未起注 + **真栈**（非对称深码 SB 600BB / BB 200BB）。验 driver 回推
+    # hand-start 真栈 → request 带 stacks[6]；advisor 路径合法（开 --search 时走实时搜索 source=search /
+    # search_fold:*，否则 blueprint）。SB complete + BB check 在 nolimp/preopen 都是 on-tree（无 limp gap）。
+    hand4 = HandState("h4", button_seat=0, my_seat=1)  # SB 先动 flop
+    hand4.hole = ["Ah", "Kd"]
+    for s in [3, 4, 5, 0]:
+        hand4.on_player_action(s, "fold", None)
+    hand4.on_player_action(1, "call", 20)  # SB complete
+    hand4.on_player_action(2, "check", None)  # BB check → flop
+    hand4.on_community(["7h", "2c", "Ks"], "flop")
+    # your_turn.players[].stack 决策时 remaining（非对称）→ 滚动记录全 6 座。
+    for s, stk in zip(range(NUM_SEATS), [2000, 12000, 4000, 2000, 2000, 2000]):
+        hand4.update_stacks(s, stk)
+    req4 = hand4.build_request(valid_flop)
+    if "stacks" not in req4 or len(req4["stacks"]) != NUM_SEATS:
+        raise RuntimeError(f"[stacks] 真栈全已知时 build_request 须带 stacks[6]，得 {req4.get('stacks')}")
+    resp4 = advisor.decide(req4)
+    _assert_legal(resp4, valid_flop, "flop+stacks")
+    print(f"[selftest 4 flop+真栈] stacks={req4['stacks']} resp={resp4} "
+          f"(--search 开则 source=search/search_fold:*，否则 blueprint)", file=sys.stderr)
+
+    print("OK: 4 个 canned 场景跑通，advisor 全程出合法动作、driver 组请求/动作包（含真栈 stacks）正常。",
+          file=sys.stderr)
 
 
 def _assert_legal(resp, valid, tag):

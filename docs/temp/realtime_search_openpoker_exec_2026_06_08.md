@@ -106,10 +106,12 @@ trigger 都返回 false、测试断言「preflop 不搜」`:1269`，注释也写
 
 **把搜索接进去是整条管线重建，不是改一行。** 生产入口 `openpoker_advisor.rs` 是无状态的单决策重放模型，
 和 `play_cross_abstraction_hand`（整手自对弈 harness）结构对不上；要接进生产得做三件事：
-①协议 / 解析层捕获各家的真实栈（现在 `Request` 结构 `:84-96` 没有 per-seat stack 字段 → 真码深从入口就丢了）；
-②`decide()` 里新建 search 分派；③重写 outgoing（现在是「100BB 解 → ÷scale → clamp 进真实区间」，
+①协议 / 解析层捕获各家的真实栈（原 `Request` 结构没有 per-seat stack 字段 → 真码深从入口就丢了）；
+②`decide()` 里新建 search 分派；③重写 outgoing（原来是「100BB 解 → ÷scale → clamp 进真实区间」，
 不是按真码深算尺寸）。在这之前，生产 bot 在非 100BB 局面**悄悄解的是错的游戏**（短码 all-in 被当成小注、也没有
-fallback 标记），这正是 §0.1 维度 2 要修的毛病。
+fallback 标记），这正是 §0.1 维度 2 要修的毛病。**这三件已落地（2026-06-09，commit `7413da2`，缺口②，见 §3.2）**：
+`Request` 加 optional `stacks[6]`、`decide()` 真栈 search 分派（`build_real_auth` + `GameState::inject_external_cards`）、
+outgoing 按真栈算尺寸；非 100BB 不再悄悄解错游戏（搜索区解不出来直接 fold、不回落 blueprint）。守 `search=None` byte-equal。
 
 ## 2. 三个真实维度 + 各自打法
 
@@ -202,6 +204,19 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 2. **生产 advisor 接搜索**：`openpoker_advisor.rs` 现在完全不调 `subgame_search`、写死了
    `default_6max_100bb`（`:191`）、`Request`（`:84-96`）也没有 per-seat stack 字段。要捕获真实栈 + 在 `decide()` 里新建
    search 分派 + 重写 outgoing（见 §1）——是整条管线重建，不是接一行。
+   - **已落地（2026-06-09，commit `7413da2`，vultr 全绿）**：`decide()` 从纯 blueprint 单决策重放扩成
+     **blueprint / search 双路**：①`Request` 加 optional `stacks[6]`（hand-start 真栈，OpenPoker 单位）；②`--search`
+     开 + 命中触发面（`should_search`，postflop）→ 新增 `build_real_auth` 在**真码深** `TableConfig`（各座
+     `stack×scale`）上重放本手 → 新增 `GameState::inject_external_cards` 注入真实 board + hero 底牌（`query_at` 索引
+     hero 真桶必需）→ `subgame_search` 解到终局（`time_budget` / LCFR 经 CLI）；③outgoing 按**真栈 auth** 算尺寸
+     （非「100BB 解 ÷scale」）。**解不出来 = 直接 fold**（建不了真栈树 / 子博弈 `Err`），**不回落 blueprint**（§2.3；
+     `source=search_fold:*` 与 blueprint `fallback:*` 分两类，对齐 §4.1 fallback 护栏）。④python driver 跟
+     `committed_total` + 各座 remaining（`your_turn.players` / `player_action.stack`）→ 回推 hand-start 真栈送进 `stacks`。
+   - **守 `search=None` byte-equal（硬不变量，测试 `search_off_byte_equal_blueprint`）**：未开 `--search` / preflop /
+     未触发的 postflop 决策一律走原 100BB blueprint 路径、逐字节等价旧行为；search 只在触发点改输出。
+   - **v1 边界（已知、写进代码 doc）**：①取 `node_id` / `legal_abs` 仍靠 **100BB 影子重放**——**off-stack all-in 线**
+     影子与真栈失同步时拿不到 node_id → fold（深码**无 all-in 的 on-tree-preflop 线**是 v1 可搜主场景，覆盖
+     深码 200–500BB SPR）；②子树用 blueprint 的下注菜单（非深码 {1pot}）；深码窄菜单 = **缺口③**（与本缺口正交）。
 3. **深码窄菜单解到终局**：深码 = 把下注菜单收到**单一 {1pot}**（短码可放宽）、解到终局用真实 `payouts()`，在 `time_budget`
    内尽力解、不保证收敛（anytime + LCFR，缺口①）。核心工程 = 「**时限内把 {1pot} 窄树解到终局**」（不重建叶子值，缘由见 §6 #2）。
 4. **多人 >3 的树**：见 §2.2，**实时解 N-way 子树**——解到终局、用真实 N-way side-pot `payouts()`。
@@ -434,11 +449,16 @@ A①引擎在深码 / 不对称 / 多人 side-pot 上经 `build_subtree` 守恒 
 可建（最大 6-way 500BB = 7.73M 节点 < 1GB、**内存不是瓶颈**）、迭代吞吐全程 ~11–33 µs/iter（**也不是瓶颈**）；**真瓶颈 = 单线程
 建树时间**——5s 可行前沿 = 3/4-way 全码深 + 5-way ≤400BB + 6-way ≤150BB；**6-way ≥200BB 建树就 >5s**（20.4s@500BB 连 20s 都
 超），杠杆在 **build 侧**（建树并行 / 增量 apply），**非 solve；§7「按核数外推」对 build 不成立**（build 单线程，只随单核速度缩放）。
-残留 = build 侧优化（若要把 6-way 深码拉进 5s 必走）。③ **转 B/C：
-缺口② 生产 advisor 重建**（`openpoker_advisor` Request 加 per-seat 栈 + `decide()` 分派 `subgame_search` 喂真栈 + outgoing 按真码深 +
-改 python driver 协议；守 `search=None` byte-equal）。**B-vs-C 不再由「能否解出来」单一决定**（B 深码 ≤3-way 全可解；C 多人 ≤5-way≤400BB / 6-way≤150BB 可解，仅 **6-way 深码角落
-建树 >5s、待 build 优化**）——改由 §4.2「EV 损失 × 频率」+ live 功效预算决定先攻哪格。live 功效预算（统一 mbb/g + 多人 AIVAT 缺口⑥）随 live 半段在步 B/C 前算。数据管道（§4.2）=
-可并行后台采集，不卡 A/B/C、随时可起。**
+残留 = build 侧优化（若要把 6-way 深码拉进 5s 必走）。③ **缺口② 生产 advisor 重建——已落地（2026-06-09，commit `7413da2`，
+vultr 全绿）**：`openpoker_advisor` Request 加 optional `stacks[6]` + `decide()` 分派 `subgame_search`（`build_real_auth` 真栈
+重放 + `GameState::inject_external_cards` 注入真牌）+ outgoing 按真码深 + 解不出来 fold 不回落 + python driver 回推 hand-start
+真栈送 `stacks`；守 `search=None` / preflop / 未触发 byte-equal（测试钉死，§3.2 缺口②）。**v1 边界**：node_id 仍靠 100BB 影子
+（off-stack all-in 线失同步 → fold；深码无 all-in 的 on-tree-preflop 线可搜）；子树用 blueprint 菜单（深码 {1pot} = 缺口③）。
+④ **转 B/C（下一步真正的推进）**：B-vs-C **不再由「能否解出来」单一决定**（B 深码 ≤3-way 全可解；C 多人 ≤5-way≤400BB /
+6-way≤150BB 可解，仅 **6-way 深码角落建树 >5s、待 build 优化**）——改由 §4.2「EV 损失 × 频率」+ live 功效预算决定先攻哪格。
+缺口② 落地后**生产 bot 已能在真码深局面解真游戏**；接下来 = 缺口③（深码 {1pot} 窄菜单接进 advisor 子树）+ live 功效预算
+（统一 mbb/g + 多人 AIVAT 缺口⑥）+ off-stack all-in 线的 node_id 来源（脱离 100BB 影子）。live 功效预算随 live 半段在步 B/C
+前算。数据管道（§4.2）= 可并行后台采集，不卡 A/B/C、随时可起。**
 
 ---
 
