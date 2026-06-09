@@ -179,7 +179,7 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 | 构件 | `file:line` | 状态 |
 |---|---|---|
 | 真实状态建子树 | `nlhe_betting_tree.rs:271 build_subtree` / `:309 depth_limited` | ✅ 可接任意中途 `GameState` 作 root |
-| CFR 子博弈求解 | `subgame.rs:650 SubgameSearchConfig` / `:1066 EsMccfrTrainer` | ✅ 解到终局；超 cap / 未访问安全回落（`depth_limit` 字段仍在，但深码 / 多人不用它——解到终局、控树靠下注尺寸抽象，§2.1）。**缺口① 已接（2026-06-09，commit `ce25ee6`）**：`SubgameSearchConfig.lcfr`（默认 false = vanilla，既有 probe/advisor/§11.5 基线 byte-equal）；`lcfr=true` → `.with_lcfr_period((iterations/50).max(1))`，零新核（机制在 `trainer.rs:332`）。仍固定迭代、无 `time_budget`（限时求解器本体待建） |
+| CFR 子博弈求解 | `subgame.rs:650 SubgameSearchConfig` / `:1066 EsMccfrTrainer` | ✅ 解到终局；超 cap / 未访问安全回落（`depth_limit` 字段仍在，但深码 / 多人不用它——解到终局、控树靠下注尺寸抽象，§2.1）。**缺口① 已接（2026-06-09，commit `ce25ee6`）**：`SubgameSearchConfig.lcfr`（默认 false = vanilla，既有 probe/advisor/§11.5 基线 byte-equal）；`lcfr=true` → `.with_lcfr_period((iterations/50).max(1))`，零新核（机制在 `trainer.rs:332`）。**`time_budget` 墙钟 anytime 已接（commit `c9dd154`）**：`SubgameSearchConfig.time_budget: Option<Duration>`，跑到 iterations 上限或 wall 达预算就停；默认 `None` = 既有固定迭代、逐 infoset byte-equal 不变；`iterations==0` 退化 → `Err`=fold。**仍未做**：随求解循环周期性查 deadline 的更细粒度截断（现每迭代查一次，µs 级树足够）+ 按部署机核数外推 |
 | off-tree 尺寸映射 | `action.rs:476 map_off_tree`（pseudo-harmonic randomized rounding） | ✅ 任意下注尺寸；纯函数可复现 |
 | blueprint 加载 / 兜底 / fallback 统计 | `nlhe_dense_trainer.rs` / `openpoker_advisor.rs:119 safe_fallback` | ✅ 冷启动 / 失败退路 |
 | 多人 equity | `tools/multiway_equity_probe.rs:197 multiway_equity_mc` | 🟡 离线私有函数；主路径解到终局用真实 `payouts()`、**生产不需要它**（§2.2；降级是直接 fold，也不用它） |
@@ -193,11 +193,12 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
    **外加：把 LCFR 接进子树解**（`subgame.rs:1066` 那行 `EsMccfrTrainer::new` 后补 `.with_lcfr_period(...)`，period 按
    `cfg.iterations` 现算小值 ≈ `iterations/50`；机制已在 `trainer.rs:332`、零新核）——同 wall 收敛更快是限时的第一杠杆；
    wall / 收敛曲线要 **vanilla 与 LCFR 各量一条**，「5s 能否解到有用迭代数」按开了 LCFR 的那条判。
-   - **进度（2026-06-09，commit `ce25ee6`/`61c3d14`）**：✅ **LCFR 已接**（`SubgameSearchConfig.lcfr`，零新核）；
-     ✅ **wall / 收敛曲线初测脚手架**（`subgame.rs` ignored 诊断 `_measure_subgame_wall_and_convergence`，vanilla
-     与 LCFR 各一条 + 收敛 L1）已落地并在 vultr 跑出初值（见步 A 表）。**仍未做**：`time_budget`（随时可停的求解器本体；解不出来直接 fold，不再建启发式兜底）、
-     wall 曲线画到**真正的深码（500BB+，
-     {1pot} 菜单、解到终局）/ 4–5way 目标树**上（现初测的是中等树：HU 200BB / 200v60 / 短码 3way）+ 按部署机核数外推。
+   - **进度（2026-06-09，commit `ce25ee6`→`c9dd154`，vultr 全绿）**：✅ **LCFR 已接**（`SubgameSearchConfig.lcfr`，零新核）；
+     ✅ **`time_budget` 墙钟 anytime 本体已接**（`Option<Duration>`，跑到 iterations 上限或 wall 达预算就停；默认 `None`
+     逐 infoset byte-equal；`iterations==0` → `Err`=fold）；✅ **wall 曲线已画到真目标树**（`_measure_subgame_wall_and_convergence`
+     扩到 HU 500BB {1pot} 解到终局 + 4/5way limped {1pot}，用 `deep_single_pot()` 菜单）+ ✅ **ε/δ_conv 机制**（新
+     `_measure_convergence_calibration`：river/turn 子树 L1 + root-EV 差 MC）。**仍未做**：① ε/δ_conv **真阈值**须在**真桶表**上跑
+     （stub 桶全归桶 0 = 退化 ε，换 `BucketTable::open` + river/turn 真 board 即可）；② 深码×多人**叠加**大树 + 按**部署机**核数外推。
 2. **生产 advisor 接搜索**：`openpoker_advisor.rs` 现在完全不调 `subgame_search`、写死了
    `default_6max_100bb`（`:191`）、`Request`（`:84-96`）也没有 per-seat stack 字段。要捕获真实栈 + 在 `decide()` 里新建
    search 分派 + 重写 outgoing（见 §1）——是整条管线重建，不是接一行。
@@ -225,9 +226,11 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 | **C**（多人 >3） | **实时解 N-way 子树**（§2.2）：解到终局用真实 N-way side-pot `payouts()`、**不要 N-way 叶子值**（**无「建叶子值」这一步**——随放弃 depth-limit 消除）；接生产 + live | 4 人及以上见 flop 有可靠、可解的子树（离线核：守恒 + N-way side-pot payouts 正确）+ live 不退化（同 B，功效不足 → 过 ≠ 兑现多人核心，只兑现“解真游戏 + 不退化”） |
 | **D**（后置可选） | 剥削加分项：按置信度门控替换对手 range 的数据源 | **前置**：对手 name 稳定可追踪（§4.2 已验）；数据足够的对手上增量为正（同样受 live 功效限制，复用下面的护栏）；对池中最稳健的对手分项不亏（防被反剥削） |
 
-**步 A 进度（2026-06-09，commit `ce25ee6`→`61c3d14`，vultr 全绿）**：
+**步 A 进度（2026-06-09，commit `ce25ee6`→`c9dd154`，vultr 全绿）**：
 
-- **缺口① LCFR 已接**（A② 第一杠杆，见 §3.1/§3.2）。
+- **缺口① LCFR + `time_budget` 本体均已接**（A② 第一杠杆 + 限时打法，见 §3.1/§3.2）：`time_budget` 墙钟 anytime
+  默认 `None` 逐 infoset byte-equal（测试 `time_budget_anytime_stops_and_is_valid` 硬证不绑定档 == None 路径）。
+- **缺口③ {1pot} 深码菜单已接**（`nlhe_betting_tree::deep_single_pot`，测试 `deep_single_pot_menu_is_single_full_pot` 锁单档契约）。
 - **A① 引擎在各种码深下都正确——离线半已交付**（`subgame.rs` / `state.rs` 新测试）：
   - 守恒（`payouts()` Σ==0）+ 重采样保牌分布 + 不变量检查 在**深码（HU 200BB）/ 不对称（hero 200BB vs 60BB）/
     多人 side-pot 中途根（3 座短码 BB all-in）**经 `build_subtree` 那条路全过；byte-equal 可复现。
@@ -238,9 +241,15 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
   - **实时解 ≈ 离线 CFR 收敛（A① 第三判据）= 机制已验**：实时解 vs 离线 M=50000 参考的 per-infoset 平均策略 L1 随迭代
     **单调下降**（HU 0.34→0.13、不对称 0.42→0.18 @300→10000 iter）；小可枚举 multiway 子树 **0.026→0.0006**（干净收敛）。
     **ε/δ_conv 精确标定**（在 river/turn 小可枚举子树 + 真桶表上，而非欠采样的大 flop 子树）= 下一步细化，不卡步 A 离线半。
-- **A② wall 曲线初测**（vanilla / LCFR 各一条，单线程 4-core vultr）：中等树上 **5s 单线程可行**——HU 200BB flop（58,160 节点）
-  ~155ms/1000 iter、~3.7s/30000 iter；短码 3way（12 节点）~4ms/1000 iter。LCFR wall ≈ vanilla（其杠杆是每迭代收敛、非每迭代 wall）。
-  ⚠ **未做**：画到**真正的深码（500BB+，{1pot} 菜单、解到终局）/ 4–5way 目标树**（需缺口③④的深码抽象 + 更大树）+ 按**部署机**核数外推（§7：别拿测试机当部署结论）。
+- **A② wall 曲线已画到真目标树**（vanilla / LCFR 各一条，单线程 4-core vultr，commit `c9dd154`）：**结论 = {1pot} 解到终局
+  把深码 / 多人树压得很小、5s 单线程极宽裕**——
+  - HU **500BB** {1pot} 解到终局 = **752 节点**、~13–28 µs/iter；4way **100BB** {1pot} = **45,440 节点**、~12–19 µs/iter；
+    5way **60BB** {1pot} = **82,270 节点**、~12–16 µs/iter（对照：HU 200BB default`{0.5,1,2}` 58,160 节点 ~120–200 µs/iter）。
+  - **~15 µs/iter → 5s 单线程 ≈ 330k 迭代**，远超收敛所需（[A1-conv] L1 在 10k 迭代已大幅降）。{1pot} 是把树压小的关键——
+    深 SPR 下 pot-size 单档把分叉收窄，**「时限内把窄树解到终局」对深码 / 中等多人不再是瓶颈**（§6 #2/#4 的核心担忧在这两档上消解）。
+  - LCFR wall ≈ vanilla（杠杆是每迭代收敛、非每迭代 wall）。
+  ⚠ **仍未做**：① **深码×多人叠加**的大树（首测多人用了中等码深 100/60BB，§2.2 深×多是单独设计；这才是真正可能超时的格子）；
+  ② 按**部署机**核数外推（§7：测试机 4-core 只是开发参照，别当部署结论）；③ {1pot} 单档对**深码策略质量**够不够 = B 阶段 / live 问题（与可解性无关）。
 
 **放行判据定义（必须能判，不留含糊）**：
 
@@ -384,16 +393,20 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
 - **起按需高性能机器前，要先给该步列 wall + $、向用户报预算再起机**（§6 #7 硬前提）。
 - 各步 wall + $ 估算 = 立项前要补齐的（§6 #7）。
 
-**步 A 离线半已大体交付（2026-06-09，见 §4.1「步 A 进度」）**：缺口① LCFR 已接；引擎在深码 / 不对称 / 多人 side-pot 上
-经 `build_subtree` 守恒 + SPR/all-in 阈值 = 真 per-seat 栈 + byte-equal 实测验过（过程中修了 LA-007 一个真实规则 bug，对称
-树 byte-equal 确证不破 S1/S2/S3）；实时解≈离线CFR 收敛的**机制**已验（L1 随迭代单调降）；wall 曲线初测（中等树 5s 单线程可行）。
+**步 A 离线半基本闭（2026-06-09，commit `ce25ee6`→`c9dd154`，vultr 全绿，见 §4.1「步 A 进度」）**：
+A①引擎在深码 / 不对称 / 多人 side-pot 上经 `build_subtree` 守恒 + SPR/all-in 阈值 = 真 per-seat 栈 + byte-equal 实测验过
+（过程中修了 LA-007 一个真实规则 bug，对称树 byte-equal 确证不破 S1/S2/S3）；实时解≈离线CFR 收敛**机制**已验（L1 随迭代单调降）。
+**A②/A③（本轮新落地）**：缺口① LCFR + `time_budget` 墙钟 anytime 本体已接（默认 None byte-equal）；缺口③ `deep_single_pot`
+{1pot} 菜单已接；**A② wall 已画到真目标树并下硬结论**——{1pot} 解到终局把 HU 500BB（752 节点）/ 4way 100BB（45k）/ 5way 60BB
+（82k）压到 ~12–28 µs/iter，5s 单线程 ≈ 330k 迭代，**「时限内解窄树」对深码 / 中等多人不是瓶颈**；ε/δ_conv **机制**已落地
+（`_measure_convergence_calibration`，river/turn L1 + root-EV 差）。
 
-**下一步（A 收尾 → B）**：① **ε/δ_conv 精确标定** = 在 river/turn 小可枚举子树 + 真桶表上跑收敛距离（大 flop 子树欠采样不适合定阈）；
-② **wall 画到真深码（500BB+）/ 4–5way 目标树** + 按部署机核数外推（缺口③④的深码抽象就绪后；§7 别拿测试机当部署结论）；
-③ **限时求解器本体** = `time_budget`（随时可停）；解不出来直接 fold（不再建启发式兜底）。
-A 收尾后开深码（步 B = {1pot} 菜单解到终局 + 接生产 `openpoker_advisor` 喂真 per-seat 栈 + live 不退化确认）或多人（步 C，入口
-由 §4.2 数据触发）。live 功效预算（统一 mbb/g + 多人 AIVAT 缺口⑥）随 live 半段在步 B/C 前算。数据管道（§4.2）= 可并行后台采集，
-不卡 A/B/C、随时可起。**
+**下一步**：① **ε/δ_conv 真阈值** = 把 `_measure_convergence_calibration` 的 `stub_table()` 换成 `BucketTable::open` + river/turn
+真 board 跑一次（小活、小机器；stub 桶是退化 ε）——这是 A 收尾唯一剩的离线小尾巴。② **深码×多人叠加大树** wall（§2.2 单独设计）+
+按**部署机**核数外推（§7）——唯一可能超时的格子。③ **转 B/C：缺口② 生产 advisor 重建**（`openpoker_advisor` Request 加 per-seat 栈 +
+`decide()` 分派 `subgame_search` 喂真栈 + outgoing 按真码深 + 改 python driver 协议；守 `search=None` byte-equal）。
+**B-vs-C 不再由「能否解出来」决定**（wall 证两档都可解）——改由 §4.2「EV 损失 × 频率」+ live 功效预算决定先攻哪格。
+live 功效预算（统一 mbb/g + 多人 AIVAT 缺口⑥）随 live 半段在步 B/C 前算。数据管道（§4.2）= 可并行后台采集，不卡 A/B/C、随时可起。**
 
 ---
 
