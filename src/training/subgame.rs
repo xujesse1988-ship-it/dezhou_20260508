@@ -2236,8 +2236,21 @@ mod tests {
                         let actions = SubgameNlheGame::legal_actions(&st);
                         let n = actions.len();
                         let avg = trainer.average_strategy(&info);
+                        // average strategy 常含**零**分量（纯策略不打的动作）；sample_discrete 要求
+                        // 全 > 0 → 必须剔零并**重归一**（同 advisor decide，防 FP 和漂移超 1e-12 容差）。
+                        // 未访问 / 维度不符 / 剔零后空 → uniform 兜底。
                         let dist: Vec<(usize, f64)> = if avg.len() == n {
-                            avg.iter().enumerate().map(|(i, p)| (i, *p)).collect()
+                            let s: f64 = avg.iter().filter(|p| p.is_finite() && **p > 0.0).sum();
+                            if s > 0.0 {
+                                avg.iter()
+                                    .enumerate()
+                                    .filter(|(_, p)| p.is_finite() && **p > 0.0)
+                                    .map(|(i, p)| (i, *p / s))
+                                    .collect()
+                            } else {
+                                let u = 1.0 / n as f64;
+                                (0..n).map(|i| (i, u)).collect()
+                            }
                         } else {
                             let u = 1.0 / n as f64;
                             (0..n).map(|i| (i, u)).collect()
