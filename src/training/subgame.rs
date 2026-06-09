@@ -45,7 +45,7 @@ use crate::training::nlhe::{
     SimplifiedNlheState,
 };
 use crate::training::nlhe_betting_tree::{
-    AbstractActionTag, BettingAbstractionRules, Child, NodeId, PublicBettingTree,
+    deep_single_pot, AbstractActionTag, BettingAbstractionRules, Child, NodeId, PublicBettingTree,
 };
 use crate::training::sampling::sample_discrete;
 use crate::training::subgame_leaf_value::LeafValueTables;
@@ -696,6 +696,20 @@ pub struct SubgameSearchConfig {
     /// （§2.3 降级，不回落 blueprint）；够不够*有用*迭代仍由既有「当前桶未被访问 → `Err`」兜。
     /// `Duration` 是 `Copy`，不破本结构 `derive(Copy)`。
     pub time_budget: Option<Duration>,
+    /// 缺口③（`realtime_search_openpoker_exec` §2.1 / §3.2）：`true` = 子树下注菜单收到
+    /// **单一 {1pot}**（[`deep_single_pot`]）——深码 / 多人解到终局时把树压到可解（深 SPR 下到
+    /// 终局层数多，靠单档而非多档收窄每节点分叉）。与 blueprint 菜单**解耦不引偏差**：桶表按
+    /// (cards,board) 归桶、与菜单无关，子树自洽即可（建树与运行期 `legal_actions` 同一 `abs`，
+    /// §2.1）。`false`（默认）= 子树沿用 blueprint 自身 abstraction/rules（既有行为，**保持
+    /// probe / advisor / §11.5 基线逐 infoset byte-equal、不改生产行为**）。
+    ///
+    /// **deep_menu 下返回子树自身合法集上的分布**（{1pot} 动作对象，携带按 `auth` 真实 pot 算出
+    /// 的 `to`/`ratio_label`），**不对齐调用方 `legal_abs`**——菜单不同（{1pot} ⊊ blueprint），
+    /// 强行对齐必失败。调用方须用 {1pot} 抽象做 outgoing（advisor deep 路径）。与 [`depth_limit`]
+    /// **互斥**（深码解到终局、无叶子续局值，§2.1 / §6 #2）：两者同开 → [`subgame_search`] `Err`。
+    ///
+    /// [`depth_limit`]: Self::depth_limit
+    pub deep_menu: bool,
 }
 
 impl Default for SubgameSearchConfig {
@@ -711,6 +725,7 @@ impl Default for SubgameSearchConfig {
             biased_leaf: false,
             lcfr: false,
             time_budget: None,
+            deep_menu: false,
         }
     }
 }
@@ -922,9 +937,15 @@ fn estimate_range(
 /// `cfg.use_blueprint_range`：`true` → root 按 per-seat blueprint range 加权采样底牌（§5b 去
 /// confound）；`false` → uniform resample（A/B 对照）。
 ///
+/// `cfg.deep_menu`（缺口③，§2.1）：`true` → 子树用 {1pot} 单档菜单（[`deep_single_pot`]）建+解，
+/// **返回子树自身合法集上的分布**（不对齐 `legal_abs`——菜单不同，{1pot} ⊊ blueprint）；调用方须
+/// 用 {1pot} 抽象 outgoing。`false`（默认）→ 子树用 blueprint 自身菜单、返回**对齐 `legal_abs`** 的
+/// 分布（既有契约，byte-equal）。deep_menu 与 depth_limit 互斥（早 Err）。
+///
 /// 任一失败（auth/root_state 非 decision / 子树越界 / within-round 导航失同步 / 当前桶在
-/// `iterations` 内未被访问 / 维度不符 / `legal_abs` 含子树没有的 tag / 对齐后全零）→ `Err`，
-/// 调用方按设计 §4.1 回落 blueprint `strategy_distribution`。
+/// `iterations` 内未被访问 / 维度不符 / 非 deep_menu 路径 `legal_abs` 含子树没有的 tag / 对齐后
+/// 全零 / deep_menu+depth_limit 同开）→ `Err`，调用方按设计 §4.1 降级（深码搜索区 check-when-free，
+/// 不回落 blueprint）。
 #[allow(clippy::too_many_arguments)]
 pub fn subgame_search(
     auth: &GameState,
@@ -945,6 +966,14 @@ pub fn subgame_search(
         return Err("subgame_search: root_state 非 decision 节点".to_string());
     }
     let auth_actor = auth.current_player().expect("checked above").0 as PlayerId;
+    // 缺口③：deep_menu（{1pot} 解到终局）与 depth_limit（街边界截断 + 叶子续局值）互斥
+    // （§2.1 / §6 #2：深码不重建叶子值、改解到终局）。两者同开是配置错误 → 早 Err（不静默择一）。
+    if cfg.deep_menu && cfg.depth_limit {
+        return Err(
+            "subgame_search: deep_menu 与 depth_limit 互斥（深码解到终局、无叶子值，§2.1）"
+                .to_string(),
+        );
+    }
 
     // 沿 actor 在 blueprint 树的 public 决策路径分流（按 resolve_root）：
     //   - entrants：subgame 根的 live bitmask（CurrentDecision = 当前点 / RoundStart = 轮起点）。
@@ -1020,7 +1049,18 @@ pub fn subgame_search(
         None
     };
 
-    // 建 subgame：同 blueprint 的 bucket 表 / action 抽象 + A3×A4 规则，从 root_state 为根。
+    // 缺口③（§2.1 / §3.2）：deep_menu → 子树下注菜单收到单一 {1pot}（deep_single_pot），把深码 /
+    // 多人解到终局的树压到可解；与 blueprint 菜单解耦不引偏差（桶表按 cards/board 归桶、与菜单无关，
+    // 建树与运行期 legal_actions 同一 abs，§2.1）。false（默认）= 用 blueprint 自身 abstraction/rules
+    // （既有行为，byte-equal）。deep_menu 与 depth_limit 互斥已在函数顶 guard：故 depth_limit 分支
+    // 必 deep_menu=false，sub_abs/sub_rules == blueprint 自身（与 game.tree() 抽象一致，叶子映射不破）。
+    let (sub_abs, sub_rules) = if cfg.deep_menu {
+        deep_single_pot()
+    } else {
+        (game.abstraction().clone(), game.rules())
+    };
+
+    // 建 subgame：bucket 表 + 上面选定的 action 抽象（sub_abs/sub_rules），从 root_state 为根。
     // 6b depth-limit → 子树街边界截断 + 叶子查 blueprint 续局值（new_depth_limited）；否则 6a 解到终局。
     let sub = if cfg.depth_limit {
         let values =
@@ -1041,8 +1081,8 @@ pub fn subgame_search(
         SubgameNlheGame::new_depth_limited(
             Arc::clone(&game.bucket_table),
             root_state.config().clone(),
-            game.abstraction().clone(),
-            game.rules(),
+            sub_abs,
+            sub_rules,
             root_state.clone(),
             entrants,
             raises_on_street,
@@ -1057,8 +1097,8 @@ pub fn subgame_search(
         SubgameNlheGame::new_with_ranges(
             Arc::clone(&game.bucket_table),
             root_state.config().clone(),
-            game.abstraction().clone(),
-            game.rules(),
+            sub_abs,
+            sub_rules,
             root_state.clone(),
             entrants,
             raises_on_street,
@@ -1068,8 +1108,8 @@ pub fn subgame_search(
         SubgameNlheGame::new(
             Arc::clone(&game.bucket_table),
             root_state.config().clone(),
-            game.abstraction().clone(),
-            game.rules(),
+            sub_abs,
+            sub_rules,
             root_state.clone(),
             entrants,
             raises_on_street,
@@ -1147,6 +1187,29 @@ pub fn subgame_search(
         ));
     }
 
+    // 缺口③ deep_menu（§2.1）：子树菜单（{1pot}）与调用方 blueprint `legal_abs` 不同
+    // （{1pot} ⊊ blueprint），**不能对齐 legal_abs**（强行对齐时 blueprint 多出的档如 0.5pot
+    // 找不到对应 = 必 Err）。直接返回**子树自身合法集** `sub_legal` 上的分布：动作对象携带按
+    // `auth` 真实 pot 算出的 `to`/`ratio_label`（query_at 用 auth 几何，§query_at doc），调用方
+    // 用 {1pot} 抽象 outgoing（advisor deep 路径）即自洽。只保留正概率动作 + 归一（同非 deep 路径）。
+    if cfg.deep_menu {
+        let mut out: Vec<(SimplifiedNlheAction, f64)> = Vec::with_capacity(sub_legal.len());
+        let mut sum = 0.0_f64;
+        for (a, &p) in sub_legal.iter().zip(avg.iter()) {
+            if p.is_finite() && p > 0.0 {
+                sum += p;
+                out.push((*a, p));
+            }
+        }
+        if !(sum.is_finite() && sum > 0.0) {
+            return Err("subgame(deep_menu) 当前决策策略全零".to_string());
+        }
+        for (_, p) in out.iter_mut() {
+            *p /= sum;
+        }
+        return Ok(out);
+    }
+
     // 按 tag 把 subtree 策略对齐到调用方 legal_abs：返回的动作对象必须是**影子的**
     // （供 outgoing_action / 推进影子复用其 ratio_label/to）。tag 唯一（Bet/Raise 带 ratio），
     // 故一一映射。legal_abs 出现 cur_node 没有的 tag = 影子与 auth 失同步 → Err 回落。
@@ -1189,7 +1252,7 @@ mod tests {
     use crate::abstraction::bucket_table::BucketConfig;
     use crate::core::{ChipAmount, SeatId};
     use crate::rules::action::Action;
-    use crate::training::nlhe_betting_tree::{deep_single_pot, first_small_6max};
+    use crate::training::nlhe_betting_tree::first_small_6max;
     use crate::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
     use crate::training::subgame_leaf_value::{build_leaf_value_tables, default_continuations};
 
@@ -1395,6 +1458,7 @@ mod tests {
             biased_leaf: false,
             lcfr: false,
             time_budget: None,
+            deep_menu: false,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -1449,11 +1513,102 @@ mod tests {
             biased_leaf: false,
             lcfr: false,
             time_budget: None,
+            deep_menu: false,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, 0, 0,
         );
         assert!(r.is_err(), "节点上限被触发应回落 Err，实得 {r:?}");
+    }
+
+    /// 缺口③：`deep_menu` 子树用 {1pot} 单档菜单（[`deep_single_pot`]）——验
+    /// ①**不因菜单不匹配而 Err**（{1pot} ⊊ blueprint `{0.5,1,2}`，旧契约对齐 `legal_abs` 必失败）；
+    /// ②返回分布的 Bet/Raise **只含 1.0pot 档**（证 {1pot} 菜单确在子树生效）；③归一 / 正概率 / 可复现。
+    #[test]
+    fn subgame_search_deep_menu_single_pot() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x4445_4550_315F_5054); // "DEEP1_PT"
+        let auth = flop.game_state.clone();
+        let legal_abs = SimplifiedNlheGame::legal_actions(&flop);
+        // 前置：blueprint legal_abs 含非 1.0pot 档（0.5/2.0）→ 证明菜单不同（旧对齐会在这些档上 Err）。
+        let has_non_full_pot = legal_abs.iter().any(|a| {
+            matches!(a,
+                AbstractAction::Bet { ratio_label, .. } | AbstractAction::Raise { ratio_label, .. }
+                if ratio_label.as_milli() != 1000)
+        });
+        assert!(
+            has_non_full_pot,
+            "前置：default 菜单 legal_abs 应含非 1.0pot 档，得 {legal_abs:?}"
+        );
+
+        // AllPostflop + RoundStart：flop 首点 round-start == 当前点（within tags 空 → 导航回 root）。
+        let cfg = SubgameSearchConfig {
+            iterations: 400,
+            max_subtree_nodes: 1_000_000,
+            trigger: SearchTrigger::AllPostflop,
+            resolve_root: ResolveRoot::RoundStart,
+            deep_menu: true,
+            ..SubgameSearchConfig::default()
+        };
+        let node_id = flop.current_node_id;
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let d1 = subgame_search(
+            &auth, &auth, &game, &legal_abs, node_id, &strat, &cfg, None, 7, 3,
+        )
+        .expect("deep_menu 子树解应 Ok（不因菜单不匹配 Err）");
+        let sum: f64 = d1.iter().map(|(_, p)| *p).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "返回分布须归一，和={sum}");
+        for (a, p) in &d1 {
+            assert!(*p > 0.0, "只返回正概率动作");
+            if let AbstractAction::Bet { ratio_label, .. }
+            | AbstractAction::Raise { ratio_label, .. } = a
+            {
+                assert_eq!(
+                    ratio_label.as_milli(),
+                    1000,
+                    "deep_menu 子树只许 1.0pot 档，得 {a:?}"
+                );
+            }
+        }
+        // 可复现：同 (hand_seed, ordinal) 两次逐项 byte-equal。
+        let d2 = subgame_search(
+            &auth, &auth, &game, &legal_abs, node_id, &strat, &cfg, None, 7, 3,
+        )
+        .expect("可复现：第二次也应 Ok");
+        assert_eq!(d1.len(), d2.len(), "可复现：维度一致");
+        for ((a1, p1), (a2, p2)) in d1.iter().zip(&d2) {
+            assert_eq!(a1, a2, "可复现：动作一致");
+            assert_eq!(p1.to_bits(), p2.to_bits(), "可复现：概率 byte-equal");
+        }
+    }
+
+    /// 缺口③ guard：`deep_menu` 与 `depth_limit` 同开 = 配置错误 → `Err`（不静默择一）。
+    #[test]
+    fn deep_menu_and_depth_limit_mutually_exclusive() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x4D55_5445_5845_5843); // "MUTEXEXC"
+        let auth = flop.game_state.clone();
+        let legal_abs = SimplifiedNlheGame::legal_actions(&flop);
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let cfg = SubgameSearchConfig {
+            iterations: 50,
+            deep_menu: true,
+            depth_limit: true,
+            ..SubgameSearchConfig::default()
+        };
+        let r = subgame_search(
+            &auth,
+            &auth,
+            &game,
+            &legal_abs,
+            flop.current_node_id,
+            &strat,
+            &cfg,
+            None,
+            0,
+            0,
+        );
+        assert!(r.is_err(), "deep_menu+depth_limit 同开应 Err，得 {r:?}");
     }
 
     /// [`navigate_subtree`]：空 tags → root；非法 tag（flop 未起注 root 必无 Call）→ 优雅 Err。
@@ -1551,6 +1706,7 @@ mod tests {
             biased_leaf: false,
             lcfr: false,
             time_budget: None,
+            deep_menu: false,
         };
         let d9 = subgame_search(
             &auth,
@@ -1922,6 +2078,7 @@ mod tests {
             biased_leaf: false,
             lcfr: true,
             time_budget: None,
+            deep_menu: false,
         };
         let run = |cfg: &SubgameSearchConfig| {
             subgame_search(
@@ -1992,6 +2149,7 @@ mod tests {
             biased_leaf: false,
             lcfr: false,
             time_budget: None,
+            deep_menu: false,
         };
         let base = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &none_cfg, None, 0x55, 4,

@@ -1118,6 +1118,7 @@ mod tests {
             biased_leaf: false,
             lcfr: false,
             time_budget: None,
+            deep_menu: false,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;

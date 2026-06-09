@@ -24,8 +24,9 @@
 //! `--search` 开启后，**postflop 命中触发面**（[`should_search`]）的决策点改用真码深子博弈
 //! re-solve：driver 多送 `stacks[6]`（各座 hand-start 真栈），[`build_real_auth`] 在**真实
 //! per-seat 栈** config 上重放本手 → 注入真实牌（[`GameState::inject_external_cards`]）→
-//! [`subgame_search`] 解到终局（`time_budget` 墙钟 anytime / 可选 LCFR）；outgoing 按**真码深**
-//! `auth` 算尺寸（非「100BB 解 ÷scale」）。**搜索区解不出来 = check-when-free**（能 check 就 check、
+//! [`subgame_search`] 解到终局（`time_budget` 墙钟 anytime / 可选 LCFR；**`--search-deep-menu` →
+//! 子树菜单收到单一 {1pot}**，缺口③ §2.1）；outgoing 按**真码深** `auth` 算尺寸（非「100BB 解
+//! ÷scale」）。**搜索区解不出来 = check-when-free**（能 check 就 check、
 //! 否则 fold；建不了真栈树 / 子博弈 `Err`），**不回落 blueprint**（off-distribution 下 blueprint 解的是
 //! 错游戏，§2.3）。`source=search_giveup:*` 与 blueprint `fallback:*` 分桶。
 //!
@@ -35,7 +36,9 @@
 //!
 //! **当前边界（v1）**：①取 `node_id` / `legal_abs` 仍靠 100BB 影子重放——**off-stack all-in 线**
 //! 影子与真栈失同步时拿不到 node_id → 走 100BB fallback / fold（深码无 all-in 的 on-tree-preflop
-//! 线是 v1 可搜的主场景）。②子树用 blueprint 的下注菜单（非深码 {1pot}）；深码窄菜单 = 缺口③。
+//! 线是 v1 可搜的主场景）。②子树下注菜单：默认沿用 blueprint 菜单；**`--search-deep-menu`（缺口③，
+//! 2026-06-09）→ 收到单一 {1pot}**（[`deep_single_pot`]，深码 / 多人解到终局控树，§2.1），此时
+//! outgoing 也用 {1pot} 抽象算尺寸。
 //!
 //! # 已知限制（blueprint 路径，`...client_design...` §4）
 //!
@@ -55,7 +58,7 @@ use poker::training::blueprint_advisor::{advance_shadow_by_applied, outgoing_act
 use poker::training::game::Game;
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::{
-    first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
+    deep_single_pot, first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::sampling::sample_discrete;
@@ -199,8 +202,9 @@ fn hist_to_concrete(
 
 /// 一次决策：重放本手历史（100BB real + abs 两态 lockstep）→ 我方决策点。`search == None` 时
 /// 查 blueprint → outgoing（旧行为，byte-equal）；`search == Some` 且命中触发面（[`should_search`]）
-/// 时建**真码深** subgame re-solve（[`subgame_search`]）→ outgoing 按真栈算尺寸，解不出来直接
-/// fold（不回落 blueprint，§2.3）。任何**前置 / blueprint 路径**失败返回安全兜底（不 panic）。
+/// 时建**真码深** subgame re-solve（[`subgame_search`]；`deep_menu` → 子树用 {1pot} 单档菜单 +
+/// outgoing 用 {1pot} 抽象算尺寸，缺口③）→ outgoing 按真栈算尺寸，解不出来 = check-when-free
+/// （能 check 就 check、否则 fold；不回落 blueprint，§2.3）。任何**前置 / blueprint 路径**失败返回安全兜底（不 panic）。
 fn decide(
     game: &SimplifiedNlheGame,
     abstraction: &StreetActionAbstraction,
@@ -291,6 +295,9 @@ fn decide(
     // —— gating（设计 §1）：仅 `--search` 开 + 命中触发面才搜索；否则 blueprint。
     // should_search 只读街 + 本街是否已起注（与码深无关）→ 在 100BB `real` 上判等价真栈 auth。
     let want_search = matches!(search, Some(scfg) if should_search(&real, scfg.trigger));
+    // 缺口③（§2.1）：命中搜索且 scfg.deep_menu → 子树用单一 {1pot} 菜单（subgame_search 内置）+
+    // outgoing 也用 {1pot} 抽象（ratio 1.0 在真实 pot 上重算 to，与子树解自洽，见下 outgoing_abs）。
+    let want_deep = want_search && search.is_some_and(|s| s.deep_menu);
 
     // dist + outgoing 基准态：默认 = blueprint 分布 + 100BB real 算尺寸（search=None / 未触发，
     // byte-equal 旧行为）；搜索触发 = 真码深 auth 子博弈解 + auth 算尺寸（失败 → check-when-free，不回落）。
@@ -333,13 +340,18 @@ fn decide(
 
     // outgoing 基准态：搜索 → 真栈 auth（真码深尺寸）；blueprint → 100BB real（旧行为）。
     let outgoing_state: &GameState = auth_holder.as_ref().unwrap_or(&real);
+    // outgoing 抽象：缺口③ 深码搜索（want_deep）→ 用 {1pot} 抽象（与子树菜单一致：subgame 返回的
+    // chosen 是 {1pot} 动作，ratio 1.0 须在 deep_single_pot 抽象下于真实 pot 重算 to）；否则
+    // blueprint 抽象（旧行为；search=None / 非 deep 路径 byte-equal 不受影响）。
+    let deep_abs: Option<StreetActionAbstraction> = want_deep.then(|| deep_single_pot().0);
+    let outgoing_abs: &StreetActionAbstraction = deep_abs.as_ref().unwrap_or(abstraction);
 
     // per-decision 确定性采样（保混合策略 + 可复现；seed 与搜索与否无关 → search=None byte-equal）。
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed));
     let chosen = sample_discrete(&dist, &mut sample_rng);
 
     // —— outgoing：solver Action → OpenPoker {action, amount}（blueprint / search 共享映射）——
-    let solver_action = match outgoing_action(outgoing_state, abstraction, chosen) {
+    let solver_action = match outgoing_action(outgoing_state, outgoing_abs, chosen) {
         Ok(a) => a,
         Err(_) => return safe_fallback(&req.valid, "outgoing_failed"),
     };
@@ -697,8 +709,8 @@ fn run() -> Result<(), String> {
     };
     if let Some(scfg) = &args.search {
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} max_nodes={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.max_subtree_nodes
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} max_nodes={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.max_subtree_nodes
         );
     }
     eprintln!(
@@ -761,6 +773,7 @@ fn parse_args() -> Result<Args, String> {
     let mut search_trigger = SearchTrigger::FlopFirstUnraised;
     let mut search_time_budget_ms: Option<u64> = None;
     let mut search_lcfr = false;
+    let mut search_deep_menu = false;
     let mut search_max_nodes: usize = SubgameSearchConfig::default().max_subtree_nodes;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -803,6 +816,7 @@ fn parse_args() -> Result<Args, String> {
                 )
             }
             "--search-lcfr" => search_lcfr = true,
+            "--search-deep-menu" => search_deep_menu = true,
             "--search-max-nodes" => {
                 search_max_nodes = next_val(&mut it, &arg)?
                     .parse()
@@ -819,6 +833,8 @@ fn parse_args() -> Result<Args, String> {
             trigger: search_trigger,
             lcfr: search_lcfr,
             time_budget: search_time_budget_ms.map(Duration::from_millis),
+            // 缺口③：深码窄菜单——子树下注菜单收到单一 {1pot}（深码 / 多人解到终局控树，§2.1）。
+            deep_menu: search_deep_menu,
             // 解到终局（深码 / 多人 §2.1）：depth_limit / biased_leaf 均 false（默认）；
             // resolve_root / use_blueprint_range / seed 用默认（RoundStart / true / 固定基）。
             ..SubgameSearchConfig::default()
@@ -828,6 +844,7 @@ fn parse_args() -> Result<Args, String> {
             || search_trigger != SearchTrigger::FlopFirstUnraised
             || search_time_budget_ms.is_some()
             || search_lcfr
+            || search_deep_menu
             || search_max_nodes != SubgameSearchConfig::default().max_subtree_nodes
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
@@ -1186,5 +1203,35 @@ mod tests {
             resp.source.starts_with("search_giveup:"),
             "降级 source 须 search_giveup:*（不回落 blueprint），得 {resp:?}"
         );
+    }
+
+    /// 缺口③ 端到端：`--search-deep-menu`（deep_menu）下，深码不对称栈的搜索区子树用 {1pot} 单档
+    /// 菜单仍出**合法**动作 + **source=search**（菜单与 blueprint legal_abs 不同也不降级——证
+    /// subgame_search deep_menu 返回子树自身分布、advisor 用 {1pot} 抽象 outgoing 自洽）+ 可复现。
+    #[test]
+    fn search_deep_menu_legal_and_reproducible() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        // 深码不对称：我(SB seat1) 12000(600BB) vs BB(seat2) 4000(200BB)，其余 2000。
+        let req = flop_first_unraised_req(vec![2000, 12000, 4000, 2000, 2000, 2000]);
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            deep_menu: true,              // 缺口③：子树用 {1pot} 单档菜单。
+            max_subtree_nodes: 4_000_000, // 深码 SPR 大，放宽 cap（{1pot} 仍小，不会爆）。
+            ..SubgameSearchConfig::default()
+        };
+        let resp = decide(&game, &abs, &uniform, &req, 0xDEE9, Some(&scfg));
+        assert!(
+            is_legal(&resp, &req.valid),
+            "深码 {{1pot}} 搜索动作须合法，得 {resp:?}"
+        );
+        assert_eq!(
+            resp.source, "search",
+            "deep_menu 应解出（{{1pot}} 子树小、stub 桶 root 必累积）= source search，得 {resp:?}"
+        );
+        let again = decide(&game, &abs, &uniform, &req, 0xDEE9, Some(&scfg));
+        assert_eq!(resp, again, "同 seed deep_menu 搜索须确定性（可复现）");
     }
 }
