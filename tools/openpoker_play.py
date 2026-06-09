@@ -49,11 +49,13 @@ _BOARD_LEN = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 # 常驻 advisor 子进程（stdio JSON-lines，同 slumbot_play.Advisor）
 # ===========================================================================
 class Advisor:
-    def __init__(self, binary, checkpoint, bucket_table, reshape, postflop_cap, seed):
+    def __init__(self, binary, checkpoint, bucket_table, reshape, postflop_cap, seed,
+                 extra_args=None):
+        cmd = [binary, "--checkpoint", checkpoint, "--bucket-table", bucket_table,
+               "--reshape", reshape, "--postflop-cap", str(postflop_cap), "--seed", str(seed)]
+        cmd += list(extra_args or [])  # 缺口②：--search / --search-* 透传给 Rust advisor。
         self.proc = subprocess.Popen(
-            [binary, "--checkpoint", checkpoint, "--bucket-table", bucket_table,
-             "--reshape", reshape, "--postflop-cap", str(postflop_cap), "--seed", str(seed)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
         )
         line = self.proc.stdout.readline()
         if not line:
@@ -98,18 +100,25 @@ class HandState:
         self.board = []
         self.street = "preflop"
         self.actions = []  # [{seat, action, to?}]，按时间序
-        # 本街每座累计投入（preflop 含盲注）。
+        # 本街每座累计投入（preflop 含盲注）；新街清零。
         self.committed = {s: 0 for s in range(NUM_SEATS)}
         self.committed[(button_seat + 1) % NUM_SEATS] = SMALL_BLIND_OP  # SB
         self.committed[(button_seat + 2) % NUM_SEATS] = BIG_BLIND_OP    # BB
+        # 缺口②：本手累计投入（跨街**不清零**，含盲注）→ 回推 hand-start 真栈：
+        # hand_start[s] = your_turn 给的当前 remaining[s] + committed_total[s]。
+        self.committed_total = dict(self.committed)
+        # 各座当前 remaining 栈（OpenPoker 单位）；从 your_turn.players[].stack / player_action.stack
+        # 滚动更新（None = 还没观测到该座栈）。
+        self.stacks_now = {s: None for s in range(NUM_SEATS)}
 
     def on_player_action(self, seat, action, amount):
         """记一条对手 / 我方已确认动作。to = 该座本街累计到额（raise/bet 才需）。"""
         a = (action or "").lower()
+        prev = self.committed.get(seat, 0)
         to = None
         if a in ("raise", "bet"):
             # [LIVE?] 视 amount 为总 to 额；若实为增量改成 self.committed[seat] + amount。
-            self.committed[seat] = amount if amount is not None else self.committed[seat]
+            self.committed[seat] = amount if amount is not None else prev
             to = self.committed[seat]
         elif a == "call":
             self.committed[seat] = max(self.committed.values())
@@ -117,17 +126,33 @@ class HandState:
             if amount is not None:
                 self.committed[seat] = amount
         # check/fold：committed 不变。
+        # 缺口②：本手累计投入 += 本动作增量（本街新 committed − 旧）。all_in 无 amount → 增量 0
+        # （信息缺，advisor 真栈重放会因 apply 非法回落 fold，不污染 blueprint 路径）。
+        self.committed_total[seat] = self.committed_total.get(seat, 0) + (self.committed[seat] - prev)
         self.actions.append({"seat": seat, "action": a, **({"to": to} if to is not None else {})})
+
+    def update_stacks(self, seat, stack):
+        """从 player_action.stack / your_turn.players[].stack 滚动记各座当前 remaining 栈。"""
+        if seat is not None and stack is not None and 0 <= seat < NUM_SEATS:
+            self.stacks_now[seat] = stack
+
+    def hand_start_stacks(self):
+        """回推各座 hand-start 真栈（OpenPoker 单位）= 当前 remaining + 本手累计投入。全 6 座栈都
+        已观测到才返回长 6 list（喂 advisor 实时搜索）；否则 None（advisor 退对称 100BB）。"""
+        if any(self.stacks_now[s] is None for s in range(NUM_SEATS)):
+            return None
+        return [self.stacks_now[s] + self.committed_total.get(s, 0) for s in range(NUM_SEATS)]
 
     def on_community(self, cards, street):
         self.board = cards
         self.street = street
-        # 新街：本街投入清零（§3）。
+        # 新街：本街投入清零（§3）；committed_total 跨街保留（缺口②）。
         self.committed = {s: 0 for s in range(NUM_SEATS)}
 
     def build_request(self, valid):
-        """组 advisor 请求（openpoker_advisor::Request）。"""
-        return {
+        """组 advisor 请求（openpoker_advisor::Request）。`stacks` 仅在全 6 座真栈已知时附带
+        （缺口②实时搜索读；缺省 → advisor 退对称 100BB blueprint，byte-equal）。"""
+        req = {
             "hole": self.hole,
             "board": self.board,
             "button_seat": self.button_seat,
@@ -138,6 +163,10 @@ class HandState:
             "actions": self.actions,
             "valid": valid,
         }
+        stacks = self.hand_start_stacks()
+        if stacks is not None:
+            req["stacks"] = stacks
+        return req
 
 
 def parse_valid_actions(your_turn):
@@ -201,6 +230,7 @@ def run_real(advisor, api_key, num_hands, action_log=None):
         elif t == "player_action":
             if state["hand"]:
                 state["hand"].on_player_action(msg.get("seat"), msg.get("action"), msg.get("amount"))
+                state["hand"].update_stacks(msg.get("seat"), msg.get("stack"))
         elif t == "community_cards":
             if state["hand"]:
                 state["hand"].on_community(msg.get("cards", []), _street_name(msg.get("street")))
@@ -252,6 +282,10 @@ def _handle_your_turn(ws, advisor, state, msg, counters, client_action_id, send,
     # board / street 以 your_turn 为准（更新累计）。
     if "community_cards" in msg:
         hand.board = msg["community_cards"]
+    # 缺口②：your_turn 携 players:[{seat,name,stack}] = 各座决策时 remaining 栈 → 滚动记录，
+    # build_request 回推 hand-start 真栈喂实时搜索（缺则不附 stacks，advisor 退 100BB）。
+    for p in msg.get("players", []) or []:
+        hand.update_stacks(p.get("seat"), p.get("stack"))
     valid = parse_valid_actions(msg)
     req = hand.build_request(valid)
     try:
@@ -385,10 +419,31 @@ def main():
     p.add_argument("--action-log", default="openpoker_actions.jsonl",
                    help="每决策落 {req,resp,sent} JSONL；空串关闭")
     p.add_argument("--selftest", action="store_true", help="离线验 IPC，不连网（无需账号）")
+    # 缺口② 实时搜索（透传给 Rust advisor；开了才送 stacks 真栈、postflop 触发面 re-solve）。
+    p.add_argument("--search", action="store_true",
+                   help="开实时子博弈搜索（postflop 触发面用真码深 re-solve；缺省纯 blueprint）")
+    p.add_argument("--search-iterations", type=int, default=None)
+    p.add_argument("--search-trigger", choices=["flop-first-unraised", "all-postflop"], default=None)
+    p.add_argument("--search-time-budget-ms", type=int, default=None)
+    p.add_argument("--search-lcfr", action="store_true")
+    p.add_argument("--search-max-nodes", type=int, default=None)
     args = p.parse_args()
 
+    extra = []
+    if args.search:
+        extra.append("--search")
+        if args.search_iterations is not None:
+            extra += ["--search-iterations", str(args.search_iterations)]
+        if args.search_trigger is not None:
+            extra += ["--search-trigger", args.search_trigger]
+        if args.search_time_budget_ms is not None:
+            extra += ["--search-time-budget-ms", str(args.search_time_budget_ms)]
+        if args.search_lcfr:
+            extra.append("--search-lcfr")
+        if args.search_max_nodes is not None:
+            extra += ["--search-max-nodes", str(args.search_max_nodes)]
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
-                      args.reshape, args.postflop_cap, args.seed)
+                      args.reshape, args.postflop_cap, args.seed, extra_args=extra)
     try:
         if args.selftest:
             run_selftest(advisor)

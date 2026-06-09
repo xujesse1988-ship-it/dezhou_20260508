@@ -415,6 +415,98 @@ impl GameState {
         state
     }
 
+    /// 实时搜索生产入口（`tools/openpoker_advisor` 缺口②）：把**外部牌局**（OpenPoker 服务端）
+    /// 的真实公共牌 + hero 真实底牌注入一个**重放出**的中途 decision 状态。betting 几何来自重放
+    /// （`apply` 历史动作还原下注 / 筹码 / 行动权），但牌来自外部——**不是本方 seed 发的**。
+    ///
+    /// 与 [`resample_hidden_with_holes`](Self::resample_hidden_with_holes) 的区别：后者**保留**
+    /// `self.board`、只重发未见 runout 后缀；本方法**覆写**可见 board 为外部真实 board（外部牌局
+    /// 的板不由我方 seed 决定），并把 hero 座位底牌设成外部真实底牌——这是 `subgame_search` 的
+    /// `query_at` 索引 hero 真实桶所必需（否则读到 seed 发的随机牌 = 错桶 → 搜索解错牌力）。
+    ///
+    /// 其余**未弃牌**座位（对手）发占位底牌（剩余牌堆按 id 升序取）——subgame solve 每 step 会按
+    /// blueprint range 重采样覆盖，故占位值不影响求解；只需合法（不撞 board / hero / 彼此）以保
+    /// [`I-003`](GameState) 无重复牌 + `showdown_ranks` 可算。已弃座 `hole_cards` 保持 `None`。
+    /// 强制 `track_history = false`（同 `resample_hidden*`：subgame 状态只供求解）。
+    ///
+    /// 错误（外部数据可能脏 → 返回 `Err`、调用方 fold，**绝不 panic**）：
+    /// - `board.len()` ≠ `self.board.len()`（外部 board 与重放街公共牌数不一致）；
+    /// - `hero_seat` 越界或已弃牌（无底牌）；
+    /// - board + hero 底牌互相冲突。
+    pub fn inject_external_cards(
+        &self,
+        hero_seat: SeatId,
+        hero_hole: [Card; 2],
+        board: &[Card],
+    ) -> Result<GameState, String> {
+        if board.len() != self.board.len() {
+            return Err(format!(
+                "inject_external_cards: 外部 board 长 {} ≠ 重放街公共牌数 {}",
+                board.len(),
+                self.board.len()
+            ));
+        }
+        let hero_idx = hero_seat.0 as usize;
+        if hero_idx >= self.players.len() || self.players[hero_idx].hole_cards.is_none() {
+            return Err(format!(
+                "inject_external_cards: hero 座 {hero_idx} 越界或已弃牌（无底牌）"
+            ));
+        }
+
+        // used = board + hero 底牌；任何重复 = 外部数据脏 → Err（不 panic）。
+        let mut used: BTreeSet<u8> = BTreeSet::new();
+        for c in board.iter().chain(hero_hole.iter()) {
+            if !used.insert(c.to_u8()) {
+                return Err(format!("inject_external_cards: 外部牌重复 {c:?}"));
+            }
+        }
+
+        let mut state = self.clone();
+        state.track_history = false;
+        // 覆写可见 board（外部真实板）+ hero 真实底牌。
+        state.board = board.iter().copied().collect();
+        state.players[hero_idx].hole_cards = Some(hero_hole);
+
+        // 剩余牌堆（52 − board − hero）：占位底牌 + runout 后缀均从此按序取（cursor 保两两不撞）。
+        let deck: Vec<Card> = (0u8..52)
+            .filter(|v| !used.contains(v))
+            .map(|v| Card::from_u8(v).expect("0..52 are valid cards"))
+            .collect();
+        let mut cursor = 0usize;
+        for idx in 0..state.players.len() {
+            if idx == hero_idx || state.players[idx].hole_cards.is_none() {
+                continue; // hero 已设；弃牌座保持 None。
+            }
+            state.players[idx].hole_cards = Some([deck[cursor], deck[cursor + 1]]);
+            cursor += 2;
+        }
+        // runout：前缀 = 真实 board，后缀占位（subgame 每 step 重发 → 不影响求解）。
+        let mut runout = state.runout_board;
+        for (i, slot) in runout.iter_mut().enumerate() {
+            if i < board.len() {
+                *slot = board[i];
+            } else {
+                *slot = deck[cursor];
+                cursor += 1;
+            }
+        }
+        debug_assert!(cursor <= deck.len(), "inject_external_cards 抽牌越界");
+        state.runout_board = runout;
+        // 重算 showdown_ranks（hole + 全 5 runout；同 resample_hidden）。
+        state.showdown_ranks = state
+            .players
+            .iter()
+            .map(|p| {
+                p.hole_cards.map(|hole| {
+                    eval::eval7(&[
+                        hole[0], hole[1], runout[0], runout[1], runout[2], runout[3], runout[4],
+                    ])
+                })
+            })
+            .collect();
+        Ok(state)
+    }
+
     /// 当前要行动的玩家。手牌结束 / 全员 all-in 跳轮时返回 `None`。
     pub fn current_player(&self) -> Option<SeatId> {
         self.current_player
@@ -1488,6 +1580,102 @@ mod resample_tests {
             0,
             "per-seat 净 PnL 须守恒 Σ==0"
         );
+    }
+
+    /// `inject_external_cards`（缺口② 生产入口）：覆写可见 board + hero 真实底牌、保留 betting
+    /// 几何、其余 live 座占位且无重复牌、showdown 自洽；脏外部数据（board 长不符 / 撞牌 / 弃牌
+    /// hero）返回 `Err` 不 panic。
+    #[test]
+    fn inject_external_cards_overwrites_board_and_hero_hole() {
+        let base = flop_mid_state(0xBEEF); // HU 200BB flop，双方 live、board 3 张。
+        let hero = base.current_player().expect("flop 有行动者");
+        // 选 5 张互不相同、确定的牌作「外部」board(3) + hero 底牌(2)；故意 != base 发的牌。
+        let ext_board = [
+            Card::from_u8(0).unwrap(),
+            Card::from_u8(1).unwrap(),
+            Card::from_u8(2).unwrap(),
+        ];
+        let hero_hole = [Card::from_u8(3).unwrap(), Card::from_u8(4).unwrap()];
+        let r = base
+            .inject_external_cards(hero, hero_hole, &ext_board)
+            .expect("干净外部牌应注入成功");
+
+        // 可见 board 覆写为外部板；hero 底牌 = 外部底牌。
+        assert_eq!(r.board(), &ext_board, "可见 board 须覆写为外部真实板");
+        assert_eq!(
+            r.players()[hero.0 as usize].hole_cards,
+            Some(hero_hole),
+            "hero 底牌须 == 外部真实底牌"
+        );
+        // betting 几何保留（街 / 行动权 / pot / 各座筹码）。
+        assert_eq!(r.street(), base.street());
+        assert_eq!(r.current_player(), base.current_player());
+        assert_eq!(r.pot(), base.pot());
+        for (a, b) in r.players().iter().zip(base.players()) {
+            assert_eq!(a.stack, b.stack, "各座栈保留");
+            assert_eq!(a.committed_this_round, b.committed_this_round);
+            assert_eq!(a.status, b.status, "弃牌结构保留");
+        }
+        // runout 前缀 == 外部 board；全牌（底牌 + runout）无重复（I-003）。
+        for (i, &c) in ext_board.iter().enumerate() {
+            assert_eq!(r.runout_board[i], c);
+        }
+        let mut seen: BTreeSet<u8> = BTreeSet::new();
+        for p in r.players() {
+            if let Some(h) = p.hole_cards {
+                for c in h {
+                    assert!(seen.insert(c.to_u8()), "底牌重复：{c:?}");
+                }
+            }
+        }
+        for c in r.runout_board {
+            assert!(seen.insert(c.to_u8()), "runout 撞底牌：{c:?}");
+        }
+        // showdown_ranks 与新牌自洽。
+        for (idx, p) in r.players().iter().enumerate() {
+            if let Some(h) = p.hole_cards {
+                let expect = eval::eval7(&[
+                    h[0],
+                    h[1],
+                    r.runout_board[0],
+                    r.runout_board[1],
+                    r.runout_board[2],
+                    r.runout_board[3],
+                    r.runout_board[4],
+                ]);
+                assert_eq!(
+                    r.showdown_ranks[idx],
+                    Some(expect),
+                    "座 {idx} showdown 不自洽"
+                );
+            }
+        }
+    }
+
+    /// 脏外部数据各分支返回 `Err`、不 panic（live 不能崩；调用方 fold）。
+    #[test]
+    fn inject_external_cards_rejects_dirty_input() {
+        let base = flop_mid_state(0xF00D);
+        let hero = base.current_player().expect("flop 有行动者");
+        let hole = [Card::from_u8(10).unwrap(), Card::from_u8(11).unwrap()];
+        // board 长 != 当前街公共牌数（flop=3，这里给 4）。
+        let bad_len = [
+            Card::from_u8(0).unwrap(),
+            Card::from_u8(1).unwrap(),
+            Card::from_u8(2).unwrap(),
+            Card::from_u8(3).unwrap(),
+        ];
+        assert!(base.inject_external_cards(hero, hole, &bad_len).is_err());
+        // hero 底牌撞 board。
+        let board = [
+            Card::from_u8(0).unwrap(),
+            Card::from_u8(1).unwrap(),
+            Card::from_u8(2).unwrap(),
+        ];
+        let collide = [Card::from_u8(0).unwrap(), Card::from_u8(5).unwrap()];
+        assert!(base.inject_external_cards(hero, collide, &board).is_err());
+        // 越界 hero 座。
+        assert!(base.inject_external_cards(SeatId(9), hole, &board).is_err());
     }
 }
 
