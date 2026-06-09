@@ -226,7 +226,7 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 | **C**（多人 >3） | **实时解 N-way 子树**（§2.2）：解到终局用真实 N-way side-pot `payouts()`、**不要 N-way 叶子值**（**无「建叶子值」这一步**——随放弃 depth-limit 消除）；接生产 + live | 4 人及以上见 flop 有可靠、可解的子树（离线核：守恒 + N-way side-pot payouts 正确）+ live 不退化（同 B，功效不足 → 过 ≠ 兑现多人核心，只兑现“解真游戏 + 不退化”） |
 | **D**（后置可选） | 剥削加分项：按置信度门控替换对手 range 的数据源 | **前置**：对手 name 稳定可追踪（§4.2 已验）；数据足够的对手上增量为正（同样受 live 功效限制，复用下面的护栏）；对池中最稳健的对手分项不亏（防被反剥削） |
 
-**步 A 进度（2026-06-09，commit `ce25ee6`→`c9dd154`，vultr 全绿）**：
+**步 A 进度（2026-06-09，commit `ce25ee6`→`ef071f3`，vultr 全绿）**：
 
 - **缺口① LCFR + `time_budget` 本体均已接**（A② 第一杠杆 + 限时打法，见 §3.1/§3.2）：`time_budget` 墙钟 anytime
   默认 `None` 逐 infoset byte-equal（测试 `time_budget_anytime_stops_and_is_valid` 硬证不绑定档 == None 路径）。
@@ -238,9 +238,17 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
     深码栈（证引擎按真码深算、非「都当 100BB」；§0.3 现场求解处理不对称栈的前提现已硬验）。
   - ⚠ **过程中修了一个真实规则 bug**：`all_in_amount` 在不对称 / 短码 all-in-for-less 线误报非法 all-in（commit `f6c1a26`），
     对称树 byte-equal 确证不破 S1/S2/S3。这是「引擎天生处理不对称栈」从代码核验升级到实测时才暴露的——引擎现在才真的对不对称栈正确。
-  - **实时解 ≈ 离线 CFR 收敛（A① 第三判据）= 机制已验**：实时解 vs 离线 M=50000 参考的 per-infoset 平均策略 L1 随迭代
-    **单调下降**（HU 0.34→0.13、不对称 0.42→0.18 @300→10000 iter）；小可枚举 multiway 子树 **0.026→0.0006**（干净收敛）。
-    **ε/δ_conv 精确标定**（在 river/turn 小可枚举子树 + 真桶表上，而非欠采样的大 flop 子树）= 下一步细化，不卡步 A 离线半。
+  - **实时解 ≈ 离线 CFR 收敛（A① 第三判据）= 机制已验**：实时解 vs 离线参考的 per-infoset 平均策略 L1 随迭代
+    **单调下降**（早期 stub 桶：HU 0.34→0.13、不对称 0.42→0.18 @300→10000 iter；小可枚举 multiway 0.026→0.0006）。
+  - **ε/δ_conv 真阈值已在真 schema-v4 桶表上标定（commit `453c1ba`→`ef071f3`，vultr 全绿；`_measure_convergence_calibration`
+    换真桶 + 两菜单）**：**river（单街）干净收敛 → ε≈0.05（mean per-infoset L1，实测 floor 0.029–0.045）/ δ_conv≈1 chip
+    （root EV 差，floor 0.01–0.35 chip ≈ 0 vs pot）**，~100–300k 迭代可达、1M 参考已饱和收敛（infoset 数饱和、EV 差→0），
+    default 与 {1pot} 两菜单一致。**这就是步 A① 收敛判据要的非退化真阈，A① 离线半收敛判据闭合。**
+  - ⚠ **多街到终局树收敛比单街慢得多（真发现，连带细化 A② 结论）**：真桶下 **default-menu turn infoset 爆炸到 29.5 万+**
+    （river 跑出 ×46 × 真 river 桶 ~500）、1M 参考欠收敛、不是干净锚；**{1pot} 把 turn 压到 120 节点 / ~5742 infoset、river 压到
+    20 节点 / 40 infoset**（生产菜单让多街可解）——但 **{1pot} turn @300k 迭代 mean_l1≈0.15**（仍 ~10× river floor、还在降，要数百万
+    迭代才到 0.05）。**即 A② 的「330k 迭代塞进 5s」对多街到终局树是「塞得进」非「已收敛」——5s 给的是 L1≈0.15 的偏收敛解。**
+    这偏收敛够不够打 = 步 B 质量问题（非 A① 门槛）；A② 的「时限内解窄树不是瓶颈」细化为「**wall 不是瓶颈，多街收敛深度才是 B 要盯的**」。
 - **A② wall 曲线已画到真目标树**（vanilla / LCFR 各一条，单线程 4-core vultr，commit `c9dd154`）：**结论 = {1pot} 解到终局
   把深码 / 多人树压得很小、5s 单线程极宽裕**——
   - HU **500BB** {1pot} 解到终局 = **752 节点**、~13–28 µs/iter；4way **100BB** {1pot} = **45,440 节点**、~12–19 µs/iter；
@@ -253,7 +261,7 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 
 **放行判据定义（必须能判，不留含糊）**：
 
-- **收敛（步 A①）= 距离达阈**：实时解和离线 CFR（≥ M 迭代）的 per-infoset 平均策略 L1 距离均值 < ε，且 root EV 差 < δ_conv（ε / δ_conv 在步 A 标定）。这是 **CFR 对 CFR 的一致性、不是 best-response**，抓的是实时路径特有的偏差（建树 / resample / 限时截断 / 索引 hero 真桶错位）；**任何能枚举的真实子树（深码 ≤3-way 的 river/turn 子博弈就行）都能跑**。
+- **收敛（步 A①）= 距离达阈（已标定，commit `ef071f3`）**：实时解和离线 CFR（≥ M 迭代）的 per-infoset 平均策略 L1 距离均值 < **ε≈0.05**，且 root EV 差 < **δ_conv≈1 chip**（真 schema-v4 桶表 river 子树标定：floor L1 0.03 / EV 差 ≈0；~100–300k 迭代可达）。这是 **CFR 对 CFR 的一致性、不是 best-response**，抓的是实时路径特有的偏差（建树 / resample / 限时截断 / 索引 hero 真桶错位）。**干净锚 = 单街（river）子博弈**（小、1M 参考即饱和收敛）；**多街到终局子树（turn 及更深）收敛慢得多**（真桶下 {1pot} turn @300k 迭代仍 L1≈0.15、default-menu turn infoset 爆炸 1M 参考都欠收敛）——能枚举但定 floor 要数百万迭代，故 **ε 锚在 river**、多街偏收敛是步 B 质量问题不是 A① 门槛。
 - **深码 / 多人非劣性 margin δ（步 B / C1）**：放行 = 在功效范围内能排除「劣化超过 δ」（CI 下界 > −δ），不是「CI 跨 0」——后者会把「真的不劣」和「样本不够、测不出」一起判成 PASS（等于接受零假设）。δ 要连同「账号能打到的手数内能分辨的最小 δ」一起给；如果能分辨的 δ 远大于有意义的阈值，就老实标注「这一格 live 在当前手数下判不动」、**放行主要靠离线的结构性正确（解真游戏 + 引擎正确），不靠 live**。
 
 **限时可行性是整张表的前提**（是主目标的核心难点，不只是 §6 的风险）：`subgame.rs` 求解器现在固定迭代、没有 `time_budget`，单决策
@@ -393,20 +401,24 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
 - **起按需高性能机器前，要先给该步列 wall + $、向用户报预算再起机**（§6 #7 硬前提）。
 - 各步 wall + $ 估算 = 立项前要补齐的（§6 #7）。
 
-**步 A 离线半基本闭（2026-06-09，commit `ce25ee6`→`c9dd154`，vultr 全绿，见 §4.1「步 A 进度」）**：
+**步 A 离线半基本闭（2026-06-09，commit `ce25ee6`→`ef071f3`，vultr 全绿，见 §4.1「步 A 进度」）**：
 A①引擎在深码 / 不对称 / 多人 side-pot 上经 `build_subtree` 守恒 + SPR/all-in 阈值 = 真 per-seat 栈 + byte-equal 实测验过
 （过程中修了 LA-007 一个真实规则 bug，对称树 byte-equal 确证不破 S1/S2/S3）；实时解≈离线CFR 收敛**机制**已验（L1 随迭代单调降）。
 **A②/A③（本轮新落地）**：缺口① LCFR + `time_budget` 墙钟 anytime 本体已接（默认 None byte-equal）；缺口③ `deep_single_pot`
 {1pot} 菜单已接；**A② wall 已画到真目标树并下硬结论**——{1pot} 解到终局把 HU 500BB（752 节点）/ 4way 100BB（45k）/ 5way 60BB
-（82k）压到 ~12–28 µs/iter，5s 单线程 ≈ 330k 迭代，**「时限内解窄树」对深码 / 中等多人不是瓶颈**；ε/δ_conv **机制**已落地
-（`_measure_convergence_calibration`，river/turn L1 + root-EV 差）。
+（82k）压到 ~12–28 µs/iter，5s 单线程 ≈ 330k 迭代，**「时限内解窄树」对深码 / 中等多人不是瓶颈**。**ε/δ_conv 真阈值已标定**
+（`_measure_convergence_calibration` 换真 schema-v4 桶表 + default/{1pot} 两菜单，commit `453c1ba`→`ef071f3`）：**river 子树 →
+ε≈0.05 / δ_conv≈1 chip**，A① 收敛判据闭合；连带细化 A②——**多街到终局树收敛比单街慢，5s/330k 迭代是「塞得进」非「已收敛」
+（{1pot} turn @300k 仍 L1≈0.15）**，多街收敛深度留作步 B 质量项。
 
-**下一步**：① **ε/δ_conv 真阈值** = 把 `_measure_convergence_calibration` 的 `stub_table()` 换成 `BucketTable::open` + river/turn
-真 board 跑一次（小活、小机器；stub 桶是退化 ε）——这是 A 收尾唯一剩的离线小尾巴。② **深码×多人叠加大树** wall（§2.2 单独设计）+
-按**部署机**核数外推（§7）——唯一可能超时的格子。③ **转 B/C：缺口② 生产 advisor 重建**（`openpoker_advisor` Request 加 per-seat 栈 +
-`decide()` 分派 `subgame_search` 喂真栈 + outgoing 按真码深 + 改 python driver 协议；守 `search=None` byte-equal）。
-**B-vs-C 不再由「能否解出来」决定**（wall 证两档都可解）——改由 §4.2「EV 损失 × 频率」+ live 功效预算决定先攻哪格。
-live 功效预算（统一 mbb/g + 多人 AIVAT 缺口⑥）随 live 半段在步 B/C 前算。数据管道（§4.2）= 可并行后台采集，不卡 A/B/C、随时可起。**
+**下一步**：① **ε/δ_conv 真阈值——已完成（commit `453c1ba`→`ef071f3`，vultr 全绿）**：真 schema-v4 桶表 river 子树标定出
+**ε≈0.05 / δ_conv≈1 chip**（~100–300k 迭代可达），A① 收敛判据闭合（见 §4.1「步 A 进度」）；连带发现 **多街到终局树收敛比单街慢
+（{1pot} 把 turn 压到 120 节点 /~5742 infoset 但 @300k 仍 L1≈0.15）→ A② 的「330k 塞进 5s」是「塞得进」非「已收敛」**，多街收敛
+深度留作步 B 质量项。② **深码×多人叠加大树** wall（§2.2 单独设计）+ 按**部署机**核数外推（§7）——唯一可能超时的格子。③ **转 B/C：
+缺口② 生产 advisor 重建**（`openpoker_advisor` Request 加 per-seat 栈 + `decide()` 分派 `subgame_search` 喂真栈 + outgoing 按真码深 +
+改 python driver 协议；守 `search=None` byte-equal）。**B-vs-C 不再由「能否解出来」决定**（wall 证两档都可解）——改由 §4.2「EV 损失
+× 频率」+ live 功效预算决定先攻哪格。live 功效预算（统一 mbb/g + 多人 AIVAT 缺口⑥）随 live 半段在步 B/C 前算。数据管道（§4.2）=
+可并行后台采集，不卡 A/B/C、随时可起。**
 
 ---
 
