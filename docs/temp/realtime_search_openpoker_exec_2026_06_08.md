@@ -168,19 +168,16 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
   （`subgame.rs:1066`）补一个 `.with_lcfr_period(...)`，**不是新写求解核**。**唯一要重标的是 period 粒度**：blueprint 的
   period（千万–亿级 update）放进子树解的几千迭代里**一次都不会触发**——`trainer.rs:332` 的 doc 注明 period 要让
   `总更新 / period` 落在 20–100，否则线性权重不充分；所以子树解得按 `cfg.iterations` 现算一个小 period（例如 `iterations/50`），
-  否则等于没开。两条限时路都受益：静态选粒度路同 wall 能解更细的树，墙钟 anytime 路同时限解得更准。
+  否则等于没开。这直接让墙钟 anytime 同时限解得更准（每迭代更接近收敛），正是 5s 预算最缺的。
 
-- **byte-equal 在做不到的地方就不强求，所以限时打法不被它锁死，按实现成本在两条路里选。** 「解到时间用完就返回当前策略」
-  会让迭代数取决于机器速度 / 负载，同一个 `(state,seed)` 会产出不同策略，**从原理上就做不到 byte-equal**。两条路：
-  - **① 墙钟 anytime（解到时限就停）**：最简单，不要求 byte-equal，靠 seeded RNG（用局面派生种子）+ replay / AIVAT
-    一致性来保证可复现（须说明 G1–G3 怎么过）。
-  - **② 按预算静态选树粒度**：把「预算 → 粒度」做成建树前的静态决策、保持固定迭代数，wall 可预测、byte-equal 也仍然成立；
-    但要先离线产出「(节点数, 迭代数) → 单决策 wall」的回归曲线（= §4 步 A 的 wall 量化），据此把 5/10/20s 预算
-    **反解成 下注菜单档数 + 迭代上限**（**不含 limit_street**——解到终局、不 depth-limit，控树只靠菜单宽度，§2.1）——
-    而这个「预算 → 粒度」模型现在还不存在，是要立项的研究项。
+- **限时打法 = 墙钟 anytime（解到时限就停、返回当前平均策略）。** 「解到时间用完就返回当前策略」会让迭代数取决于
+  机器速度 / 负载，同一个 `(state,seed)` 会产出不同策略，**从原理上就做不到 byte-equal**——所以限时求解器**不靠 byte-equal**，
+  改靠 seeded RNG（用局面派生种子）+ replay / AIVAT 一致性来保证可复现（须说明 G1–G3 怎么过）。仍要先离线产出
+  「(节点数, 迭代数) → 单决策 wall」的回归曲线（= §4 步 A 的 wall 量化），用来判 5/10/20s 在目标树上大概能跑到多少迭代、
+  够不够用（控树只靠下注菜单宽度、解到终局、不 depth-limit / 不 limit_street，§2.1）。
 
-  byte-equal 仍是发现算法 bug 的便宜检查手段（`invariants.md §2`），在**能做到**的路径上保留（静态选粒度 /
-  `search=None` 回归 / HH 日志隔离，见 §5）；只在墙钟 anytime 这种**做不到**的地方不强求。
+  byte-equal 仍是发现算法 bug 的便宜检查手段（`invariants.md §2`），但只在**不限时**的路径上保留
+  （`search=None` 回归 / HH 日志隔离 / 对称树引擎正确性 fixture，见 §5）；限时求解本身做不到、也不强求。
 
 - **降级也必须留在真实状态上，但目前真实状态的兜底阶梯几乎是空的。** blueprint 只在它训练过的情况里
   （≤3-way、接近 100BB）才是有效兜底；在它没覆盖的情况里回落 blueprint = 回落到一个**解错了游戏**的策略。
@@ -210,10 +207,10 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 
 ### 3.2 缺口（须新写 / 改造）
 
-1. **限时求解器**：两条路按实现成本选（byte-equal 做不到的地方不强求，§2.3）——① 墙钟 anytime（最简单、不要求
-   byte-equal、靠 seeded-RNG + replay/AIVAT 保持可复现）；② 按预算静态选树粒度（先离线产出「(节点数, 迭代数) → 单决策 wall」
-   回归曲线，反解 limit_street + 菜单档数 + 迭代上限，保持固定迭代 / byte-equal、wall 可预测）。off-tree 情况下的兜底用
-   稳健启发式、而不是 blueprint（这层启发式现在不存在，要一并建）。**wall 曲线要直接画在深码 / 多人的目标树上**（不是最省事的小树）。
+1. **限时求解器**：用墙钟 anytime（解到时限就停、返回当前平均策略，§2.3）——不要求 byte-equal（限时求解原理上做不到），
+   靠 seeded-RNG + replay/AIVAT 保持可复现。仍要离线产出「(节点数, 迭代数) → 单决策 wall」回归曲线，判 5/10/20s 在目标树上
+   够不够迭代。off-tree 情况下的兜底用稳健启发式、而不是 blueprint（这层启发式现在不存在，要一并建）。**wall 曲线要直接
+   画在深码 / 多人的目标树上**（不是最省事的小树）。
    **外加：把 LCFR 接进子树解**（`subgame.rs:1066` 那行 `EsMccfrTrainer::new` 后补 `.with_lcfr_period(...)`，period 按
    `cfg.iterations` 现算小值 ≈ `iterations/50`；机制已在 `trainer.rs:332`、零新核）——同 wall 收敛更快是限时的第一杠杆；
    wall / 收敛曲线要 **vanilla 与 LCFR 各量一条**，「5s 能否解到有用迭代数」按开了 LCFR 的那条判。
@@ -248,7 +245,7 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 | 步 | 做什么 | 放行判据 |
 |---|---|---|
 | **A**（前置 / 离线） | **两件都要从零做**：① **引擎在各种码深下都正确**：守恒（`payouts()` Σ==0）/ byte-equal / 和 PokerKit 自洽 / 实时解 ≈ 同状态离线 CFR 收敛解，**样例必须含深码中途根 + per-seat 不对称栈 + 多人 side-pot 中途根**（不是只测对称 100BB）；② 「(节点数, 迭代数) → 单决策 wall」回归曲线 + **在真实深码 / 多人目标树上**判定 5/10/20s 时限可行性（缺口①前置；曲线 **vanilla 与 LCFR 各一条**——LCFR 同迭代更接近收敛、直接决定 5s 能否解到有用迭代数） | ① 守恒 + byte-equal + 收敛距离达阈（见下「判据定义」）；② wall 曲线产出 + **深码 / 多人目标树在 5s 预算下能解到有用的迭代数**（按开了 LCFR 的那条曲线判；否则先把时限收到 10–20s 或换更强机器，再开 B/C）。**注意：核心区没有干净的离线 EV 标尺（§0.3），A 验的是“解的是真游戏、而且解得动”，不验“赚多少”——后者留给 live** |
-| **B**（深码实时搜索） | **解到终局（不 depth-limit、不要叶子续局值）**+ 把下注菜单收到**单一 {1pot}** 控树（缺口③；§2.1）；接生产 advisor（缺口②，管线重建、**把各家真实栈喂进去**）；限时求解器（缺口①，按 §2.3 两条路选一条，**时限内尽力、不保证收敛**） | **离线（硬性放行）**：终局摊牌值 = 真实 `payouts()`（零叶子近似）+ 守恒 + byte-equal（在能做到的路径上；墙钟 anytime 路径改用 seeded-RNG + replay/AIVAT 一致，§2.3）；**advisor 真的喂入 per-seat starting_stacks（不再写死 100BB）**；**含不对称栈样例（如 hero 200BB vs 对手 60BB）的深码守恒 + SPR/all-in 阈值和真实栈一致**；no-panic / 归一；单决策 wall ≤ budget（{1pot} 窄树能在 time_budget 内解到有用迭代数）；**限时解不出来时降级 = 返回 anytime 当前策略 / 真实状态启发式、不回落 100BB blueprint**。**live（观察项，不作放行）**：见下「live 功效预算」——降为“别打更差”的护栏 |
+| **B**（深码实时搜索） | **解到终局（不 depth-limit、不要叶子续局值）**+ 把下注菜单收到**单一 {1pot}** 控树（缺口③；§2.1）；接生产 advisor（缺口②，管线重建、**把各家真实栈喂进去**）；限时求解器（缺口①，墙钟 anytime，§2.3，**时限内尽力、不保证收敛**） | **离线（硬性放行）**：终局摊牌值 = 真实 `payouts()`（零叶子近似）+ 守恒 + byte-equal（用于 `search=None` 回归 / 引擎正确性 fixture；限时求解本身改用 seeded-RNG + replay/AIVAT 一致，§2.3）；**advisor 真的喂入 per-seat starting_stacks（不再写死 100BB）**；**含不对称栈样例（如 hero 200BB vs 对手 60BB）的深码守恒 + SPR/all-in 阈值和真实栈一致**；no-panic / 归一；单决策 wall ≤ budget（{1pot} 窄树能在 time_budget 内解到有用迭代数）；**限时解不出来时降级 = 返回 anytime 当前策略 / 真实状态启发式、不回落 100BB blueprint**。**live（观察项，不作放行）**：见下「live 功效预算」——降为“别打更差”的护栏 |
 | **C**（多人 >3） | **实时解 N-way 子树**（§2.2）：解到终局用真实 N-way side-pot `payouts()`、**不要 N-way 叶子值**（**无「建叶子值」这一步**——随放弃 depth-limit 消除）；接生产 + live | 4 人及以上见 flop 有可靠、可解的子树（离线核：守恒 + N-way side-pot payouts 正确）+ live 不退化（同 B，功效不足 → 过 ≠ 兑现多人核心，只兑现“解真游戏 + 不退化”） |
 | **D**（后置可选） | 剥削加分项：按置信度门控替换对手 range 的数据源 | **前置**：对手 name 稳定可追踪（§4.2 已验）；数据足够的对手上增量为正（同样受 live 功效限制，复用下面的护栏）；对池中最稳健的对手分项不亏（防被反剥削） |
 
@@ -354,10 +351,11 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
 ## 5. 正确性 smoke / invariants 把关
 
 - **HH 日志**：selftest 不破坏 advisor 路径（挂 / 不挂 byte-equal）；真挂上时字段齐、摊牌 / 名字捕到。
-- **限时求解器**：静态选粒度路径保 byte-equal（固定迭代）；**墙钟 anytime 路径做不到 byte-equal、也不要求**，改用
-  seeded `RngSource`（局面派生种子）+ replay / AIVAT 一致性来保证可复现（须说明 G1–G3 怎么过）；两条路都要 no-panic /
+- **限时求解器（墙钟 anytime）**：**做不到 byte-equal、也不要求**（迭代数随机器速度 / 负载变，§2.3），改用
+  seeded `RngSource`（局面派生种子）+ replay / AIVAT 一致性来保证可复现（须说明 G1–G3 怎么过）；仍要 no-panic /
   策略归一 / 输出动作合法（不破规则层）。接 LCFR 不破这些：`maybe_lcfr_rescale`（`trainer.rs:352`）同比缩放 regret +
-  strategy_sum、是确定性的（固定迭代 + seed），所以静态选粒度路径接 LCFR 后**仍 byte-equal**、归一也不变。
+  strategy_sum、是确定性的，所以在**固定迭代的离线路径**（`search=None` 回归 / 步 A 诊断 / 主线 blueprint 训练）上接 LCFR
+  后**仍 byte-equal**、归一也不变。
 - **接生产回归**：`Contestant.search=None` ⇒ 输出 byte-equal 当前 blueprint（守住已验证的 advisor 薄壳成果，能做到就必须守）；
   search-or-blueprint 分支不破坏影子推进的 lockstep（配测试，不只是声明）。
 - **引擎在各种码深下都正确**：补「**深码中途根 + per-seat 不对称栈（如 hero 200BB vs 对手 60BB）+ 多人 side-pot
@@ -384,8 +382,9 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
    biased 更偏离）正是放弃 depth-limit 的旁证——结论不是「叶子值要重建」，而是「这条路本身不该走」。
 3. **多人 >3 没有免费的好处**：实时解 N-way 吃时限 / 难度——窄树（{1pot}）在多人下仍大，5s 内解到有用迭代数是核数的函数（§2.3 / §4 步 A②）。
 4. **限时**：深 / 多人树在 5s 内解不解得出来还不知道（wall 是核数的函数、随机器变；§8：要在目标部署机上实测，不拿开发 /
-   测试机的数当部署结论）；要实测单决策 wall。墙钟 anytime 和 byte-equal 互斥，但 byte-equal 做不到的地方不强求（§2.3），所以墙钟 anytime /
-   静态选粒度按实现成本选一条。**5s 解不出来 → 收时限范围 / 换更强机器**是 §4.1 步 A② / B / C 的明确决策点，不能默默当作做到了。
+   测试机的数当部署结论）；要实测单决策 wall。限时求解用墙钟 anytime（解到时限就停），它和 byte-equal 互斥——限时求解做不到
+   byte-equal 也不强求（§2.3），靠 seeded-RNG + replay/AIVAT 可复现。**5s 解不出来 → 收时限范围 / 换更强机器**是 §4.1 步 A② / B / C
+   的明确决策点，不能默默当作做到了。
 5. **验证闭环慢且脆**：放弃自对弈真值后，核心区离线只剩**结构性正确**（守恒 / byte-equal / PokerKit / 实时解≈离线CFR /
    解真游戏的 SPR-all-in 一致），EV 量级只剩 OpenPoker live（不能配对、功效低）。别指望有便宜的离线判别器——「把高频对手聚成
    粗粒度 HUD bot 做离线 A/B」既没实现、真做也会引新 confound（HUD ≠ 真 bot / 在 100BB 对称模拟器里测 = 测错情况）。
