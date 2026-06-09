@@ -79,14 +79,27 @@
 ```
 每决策：
   1. 读真实状态：真码深（各家不等）/ 真在场人数 / 真 board / 真下注历史
-  2. 在真实状态上建子树（build_subtree，真 SPR / 真人数）
-  3. 取对手 range/续局值：默认来自 blueprint；有可靠对手数据时换成实测（剥削加分项，后置）
-  4. 在预算内求解子树（限时打法见 §2.3）；解不动就降级——但降级也要留在真实状态上
+  2. gating：先决定走 blueprint 还是搜索（should_search，subgame.rs:702）
+       · preflop → 直接用 blueprint 策略，不搜索（现有 SearchTrigger 全是 postflop 触发）
+       · postflop 且结构接近 blueprint 练过的 infoset（≈100BB / ≤3-way / 下注线 on-tree）→ 仍用 blueprint 策略
+       · 否则（off-100BB / 4+way / off-tree——blueprint 解的是错游戏）→ 实时搜索，走 3–6 步（§0.1 主目标区）
+  3. 在真实状态上建子树（build_subtree，真 SPR / 真人数）
+  4. 取对手 range/续局值：默认来自 blueprint；有可靠对手数据时换成实测（剥削加分项，后置）
+  5. 在预算内求解子树（限时打法见 §2.3）；解不动就降级——但降级也要留在真实状态上
      （收窄下注菜单 / 加深 depth-limit 后对真实树粗解 / 稳健启发式），blueprint 只在它训练过的情况里才作兜底
-  5. 返回动作（off-tree 尺寸经 map_off_tree 翻译）
+  6. 返回动作（off-tree 尺寸经 map_off_tree 翻译）
 持续：
   记全桌动作 + 摊牌（HH 日志）→ ①统计真实分布覆盖热力图 ②攒对手数据（加分项用）
 ```
+
+**gating = 把 §0.3 的可靠边界落到决策环里，不是新机制。** blueprint 只在它练过的条件（≈100BB、≤3-way、on-tree）下可靠，
+所以这些局面 + 全部 preflop 直接用 blueprint 策略，搜索只接管 blueprint 解错游戏的区域（off-100BB / 4+way / off-tree，§0.1 主目标区）
+——**搜索是对 blueprint 的增量、不是替换**：能用 blueprint 的地方继续用，省算力也避开搜索的近似偏差（§0.3：blueprint 越强、
+搜索近似越亏）。注意 blueprint 因此担两个角色、别混：① gating 里它是 preflop + 近 blueprint 局面的**主答案**；② 第 5 步降级里它只是
+搜索解不动、且仅在它练过的情况下的**最后兜底**。preflop 不搜**已经是代码现状**（`should_search`（`subgame.rs:702`）对 preflop 两个
+trigger 都返回 false、测试断言「preflop 不搜」`:1269`，注释也写明「preflop 走 blueprint」`:697`）；要补的是 postflop 那条
+「结构接近 blueprint infoset」的判据——现在只由窄触发面 `FlopFirstUnraised` 粗略代理（只搜 flop 未起注首点这类覆盖好的局面），
+把「≈100BB / on-tree」量准要复用 §4.2 那套「可靠 vs Desync vs 乱映射」分类，还没建。
 
 主干不写新的求解核心：root 在真实状态重发隐藏牌、对全 range 求解、事后再索引 hero 的真实桶
 （`subgame.rs:416` root / `:331` query_at）。决策环里真正的 search-or-blueprint 分支在
