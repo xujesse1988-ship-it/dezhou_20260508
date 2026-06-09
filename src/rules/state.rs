@@ -467,13 +467,26 @@ impl GameState {
             None
         };
 
+        // all-in 合法性（LA-007，与 bet_range/raise_range 同口径）：all-in 投入超过 call 额
+        // （`cap > max_committed`）即构成 raise；若此时面对 bet（`max_committed > 0`）且 raise
+        // 未重开（`!raise_option_open[idx]`，前序 all-in-for-less 没重开下注）→ all-in 会被规则
+        // 当**非法 raise** 拒（`RaiseOptionNotReopened`），故不列入合法集（actor 只能 Call/Fold）。
+        // 其余 all-in 都合法、照列：开池 all-in（`max_committed==0`）/ 合法 all-in raise（含
+        // raise-for-less，`raise_option_open` 仍 true 而 `cap<min_to`）/ all-in call-for-less
+        // （`cap<=max_committed`）。symmetric 等栈下面对 all-in 时 `cap<=max_committed`，本判恒
+        // false → 既有行为 byte-equal、S1/PokerKit 不受影响；仅修不对称 / 短码线（步 A①）。
+        let all_in_is_illegal_raise =
+            max_committed > ChipAmount::ZERO && !self.raise_option_open[idx] && cap > max_committed;
+        let all_in_amount =
+            (player.stack > ChipAmount::ZERO && !all_in_is_illegal_raise).then_some(cap);
+
         LegalActionSet {
             fold: true,
             check,
             call,
             bet_range,
             raise_range,
-            all_in_amount: (player.stack > ChipAmount::ZERO).then_some(cap),
+            all_in_amount,
         }
     }
 
@@ -1474,6 +1487,108 @@ mod resample_tests {
             payouts.iter().map(|(_, pnl)| *pnl).sum::<i64>(),
             0,
             "per-seat 净 PnL 须守恒 Σ==0"
+        );
+    }
+}
+
+#[cfg(test)]
+mod legal_action_tests {
+    //! LA-007（all-in 合法性）：all-in 构成**非法 raise**（面对 bet、raise 未重开、cap > call 额）
+    //! 时 `all_in_amount == None`；而**合法 all-in-for-less raise**（raise 未被堵、cap < 最小 full
+    //! raise）仍 `Some`。步 A① 不对称 / 短码线的根因修复（`build_subtree` 不再 panic
+    //! `RaiseOptionNotReopened`）。symmetric 等栈行为不变（回归测试 + betting-tree byte-equal 守门）。
+    use super::*;
+
+    fn cfg_3way(stacks: [u64; 3]) -> TableConfig {
+        TableConfig {
+            n_seats: 3,
+            starting_stacks: stacks.iter().map(|&c| ChipAmount::new(c)).collect(),
+            small_blind: ChipAmount::new(50),
+            big_blind: ChipAmount::new(100),
+            ante: ChipAmount::ZERO,
+            button_seat: SeatId(0),
+        }
+    }
+
+    /// 短码 all-in-for-less raise 不重开下注 → 深码开池者只能 Call/Fold，all-in（= 非法 raise）
+    /// 不列入；而短码 shover 自己的 all-in-for-less **是合法 raise**、照列。一致性：深码侧
+    /// `apply(AllIn)` 确实被规则拒（legal set 与 apply 同口径）。
+    #[test]
+    fn allin_that_would_be_illegal_raise_is_not_offered() {
+        // seat0=BTN 深码 200BB, seat1=SB, seat2=BB 短码 10BB。
+        let cfg = cfg_3way([20_000, 20_000, 1_000]);
+        let mut s = GameState::new(&cfg, 0xA11C_0DE5_u64);
+        // preflop（3-handed UTG=BTN=seat0 先动）：seat0 open 到 600（6BB，min_full_raise=500）。
+        assert_eq!(s.current_player(), Some(SeatId(0)));
+        s.apply(Action::Raise {
+            to: ChipAmount::new(600),
+        })
+        .expect("btn open 600");
+        // seat1(SB) fold。
+        assert_eq!(s.current_player(), Some(SeatId(1)));
+        s.apply(Action::Fold).expect("sb fold");
+        // seat2(BB, 短码 1000) 面对 600：min full-raise=1100 > cap 1000 → 不能 full-raise，
+        // 但 all-in-for-less(=1000) 是**合法 raise** → all_in_amount=Some(1000)、raise_range=None。
+        assert_eq!(s.current_player(), Some(SeatId(2)));
+        let bb_la = s.legal_actions();
+        assert!(
+            bb_la.raise_range.is_none(),
+            "短码无法 full-raise（cap 1000 < min_to 1100）"
+        );
+        assert_eq!(
+            bb_la.all_in_amount,
+            Some(ChipAmount::new(1_000)),
+            "合法 all-in-for-less raise 须照列（不可过度抑制）"
+        );
+        // seat2 all-in 到 1000（raise-for-less，差额 400 < 500 → 不重开）。
+        s.apply(Action::AllIn).expect("bb all-in-for-less raise");
+        // 回 seat0：面对 1000、raise 未重开 → 只能 Call(1000)/Fold；all-in(20000=非法 raise) 不列入。
+        assert_eq!(s.current_player(), Some(SeatId(0)));
+        let btn_la = s.legal_actions();
+        assert_eq!(
+            btn_la.call,
+            Some(ChipAmount::new(1_000)),
+            "深码 call 到 1000"
+        );
+        assert!(btn_la.raise_range.is_none(), "raise 未重开 → 无 raise");
+        assert_eq!(
+            btn_la.all_in_amount, None,
+            "LA-007：all-in 会是非法 raise（cap>call 且 raise 未重开）→ 不列入合法集"
+        );
+        // 一致性：apply(AllIn) 在此确实被规则拒。
+        assert!(
+            s.apply(Action::AllIn).is_err(),
+            "深码 all-in 应被拒（RaiseOptionNotReopened）——legal set 已正确不列入"
+        );
+    }
+
+    /// 回归：symmetric 等栈面对 all-in 时 cap == max_committed（all-in = call、非 raise）→
+    /// `all_in_amount` 仍 `Some`（LA-007 附加条件恒 false）；保证修复不动既有对称行为。
+    #[test]
+    fn symmetric_facing_allin_still_offers_allin() {
+        let cfg = TableConfig {
+            n_seats: 2,
+            starting_stacks: vec![ChipAmount::new(1_000); 2], // 等栈 10BB
+            small_blind: ChipAmount::new(50),
+            big_blind: ChipAmount::new(100),
+            ante: ChipAmount::ZERO,
+            button_seat: SeatId(0),
+        };
+        let mut s = GameState::new(&cfg, 0x5117_u64);
+        // HU preflop：button=SB=seat0 先动 → all-in 到 1000（full raise，重开）。
+        assert_eq!(s.current_player(), Some(SeatId(0)));
+        s.apply(Action::AllIn).expect("sb all-in 1000");
+        // seat1(BB) 面对 1000，cap==1000==max_committed → all-in = call（非 raise）→ 仍 Some。
+        assert_eq!(s.current_player(), Some(SeatId(1)));
+        let la = s.legal_actions();
+        assert_eq!(
+            la.all_in_amount,
+            Some(ChipAmount::new(1_000)),
+            "等栈面对 all-in：all-in=call → all_in_amount 仍 Some（附加条件 false）"
+        );
+        assert!(
+            la.raise_range.is_none(),
+            "等栈无法 re-raise（cap==max_committed）"
         );
     }
 }

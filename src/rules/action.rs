@@ -44,8 +44,14 @@ pub enum Action {
 ///   满足 D-035 链式 min raise 约束。
 /// - **LA-006** `bet_range / raise_range` 的 `max_to <= committed_this_round
 ///   + stack`（不可下注超出剩余筹码 + 本轮已投入）。
-/// - **LA-007** `all_in_amount` 当且仅当 `stack > 0` 时为 `Some`；其值
-///   `= committed_this_round + stack`。
+/// - **LA-007** `all_in_amount` = 全 all-in 的等效 `to`（`= committed_this_round +
+///   stack`），当且仅当 **all-in 是合法动作**时为 `Some`：需 `stack > 0`，且 all-in
+///   不构成**非法 raise**——排除「面对 bet（`max_committed > 0`）、raise 未重开
+///   （前序 all-in-for-less 未重开下注，`!raise_option_open`）、且 `cap > max_committed`
+///   （all-in 超过 call 额 = raise）」这一情形（此时 `apply` 会以 `RaiseOptionNotReopened`
+///   拒之，actor 只能 Call/Fold）。开池 all-in / 合法 all-in raise（含 raise-for-less）/
+///   all-in call-for-less（`cap <= max_committed`）均为 `Some`。symmetric 等栈面对 all-in
+///   时 `cap <= max_committed`，附加条件恒 false → 退化回「`Some` iff `stack > 0`」。
 /// - **LA-008** `current_player() == None`（terminal / all-in 跳轮）时所有
 ///   字段为 `false / None`（"空集合"）。
 #[derive(Clone, Debug)]
@@ -58,6 +64,7 @@ pub struct LegalActionSet {
     pub bet_range: Option<(ChipAmount, ChipAmount)>,
     /// `(min_to, max_to)`。本轮已有前序 bet 时使用，含 short all-in 不重开 raise 的约束（D-033）。
     pub raise_range: Option<(ChipAmount, ChipAmount)>,
-    /// 全 all-in 时的等效 `to` 值；`stack > 0` 时为 `Some`。
+    /// 全 all-in 时的等效 `to` 值；当且仅当 all-in 合法时为 `Some`（LA-007：`stack > 0` 且
+    /// 不构成非法 raise，详见上方不变量）。
     pub all_in_amount: Option<ChipAmount>,
 }
