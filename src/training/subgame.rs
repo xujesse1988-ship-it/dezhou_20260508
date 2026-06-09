@@ -2164,18 +2164,8 @@ mod tests {
 
     /// 用 default {0.5,1,2} 抽象 + 默认 rules 从 `template` 建解到终局的 subgame（A① 守恒/wall 共用）。
     fn build_base_subgame(template: &GameState) -> SubgameNlheGame {
-        build_base_subgame_with_table(template, stub_table())
-    }
-
-    /// 同 [`build_base_subgame`] 但用指定桶表。ε/δ_conv **真阈值**标定要真 schema-v4 桶表
-    /// （`info_set` postflop 走 `bucket_table.lookup` → per-hand 真桶；stub 全归桶 0 = 退化 ε，
-    /// 见 [`_measure_convergence_calibration`]）；其余调用方（守恒 / wall 诊断，bucket-无关）仍走 stub。
-    fn build_base_subgame_with_table(
-        template: &GameState,
-        table: Arc<BucketTable>,
-    ) -> SubgameNlheGame {
         SubgameNlheGame::new(
-            table,
+            stub_table(),
             template.config().clone(),
             StreetActionAbstraction::default_6_action(),
             BettingAbstractionRules::default(),
@@ -2548,9 +2538,16 @@ mod tests {
     }
 
     /// 诊断（非门槛，exec §4.1 A 收尾① / §8 下一步①）：ε/δ_conv 收敛距离**真阈值**——在
-    /// **river/turn 小可枚举子树**上量 ① per-infoset 平均策略 L1（vs M 参考）+ ② **root EV 差
-    /// δ_conv**（avg-vs-avg MC）。river/turn 子树小、CFR 收敛快 → L1/EV 有意义（大 flop 子树欠采样
-    /// 不适合定阈，§4.1，故移出 `_measure_subgame_wall_and_convergence` 的粗 sanity）。
+    /// **river/turn 子树**上量 ① per-infoset 平均策略 L1（vs M 参考）+ ② **root EV 差 δ_conv**
+    /// （avg-vs-avg MC）。**实测（commit `453c1ba`，真桶）**：river（单街、~1690 infoset、912 节点）
+    /// 1M 参考干净收敛 → L1→0.03 / EV 差→0.01 chip @300k = **真 ε≈0.05 / δ_conv≈1 chip**；turn
+    /// （多街 + river 跑出 → 真桶 infoset 爆炸到 29.5 万+ 且 300k 迭代仍在涨）**1M 参考欠收敛**、不是
+    /// 干净锚（exec §4.1）。故 river 是 ε 锚；大 flop 子树同理欠采样（§4.1，故移出
+    /// `_measure_subgame_wall_and_convergence` 的粗 sanity）。
+    ///
+    /// **两套菜单**：default {0.5,1,2}（对照）+ {1pot}（`deep_single_pot`，生产深码/多人解到终局
+    /// 所用，缺口③）——量「A② wall 证『330k 迭代塞进 5s』之外的真问题：多街到终局树在该迭代数内
+    /// 收不收敛」。
     ///
     /// **桶表**：默认读 `SUBGAME_CAL_BUCKET_TABLE`（缺省
     /// `artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin`，vultr 已有）的**真
@@ -2595,57 +2592,75 @@ mod tests {
             .clone();
         let targets: [(&str, &GameState); 2] =
             [("hu_turn_subtree", &turn), ("hu_river_subtree", &river)];
+        // 两套下注菜单：default {0.5,1,2}（对照）+ {1pot}（生产深码/多人解到终局所用，缺口③）。
+        // {1pot} 单档收窄分叉 → 直接量「多街到终局树在 5s 预算迭代数内收不收敛」= A② wall
+        // 「塞得进」之外的真问题（river=单街已干净收敛，turn=多街+river 跑出 → infoset 爆炸）。
+        let menus: [(&str, bool); 2] = [("default", false), ("1pot", true)];
 
         eprintln!(
-            "[A1-cal] bucket_mode,target,nodes,iters,ref,mean_l1,max_l1,ev_short,ev_ref,ev_abs_diff,infosets"
+            "[A1-cal] bucket_mode,menu,target,nodes,iters,ref,mean_l1,max_l1,ev_short,ev_ref,ev_abs_diff,infosets"
         );
-        for (name, tmpl) in targets {
-            let nodes = build_base_subgame_with_table(tmpl, table.clone())
-                .subtree()
-                .num_nodes();
-            // root EV 的 traverser = root 决策者（postflop HU = BB 先动），便于解读。
-            let root_actor = tmpl.current_player().expect("非终局").0 as PlayerId;
-            let reference = {
-                let mut tr = EsMccfrTrainer::new(
-                    build_base_subgame_with_table(tmpl, table.clone()),
-                    0xCA1B_0000,
-                );
-                let mut rng = ChaCha20Rng::from_seed(0xCA1B_0000 ^ 0xC0FF_EE00);
-                for _ in 0..REF_ITERS {
-                    tr.step(&mut rng).expect("ref step");
-                }
-                tr
+        for (menu_name, one_pot) in menus {
+            // 每次现造菜单（StreetActionAbstraction/Rules 非 Copy）→ 无需 Clone、确定性不变。
+            let build = |tmpl: &GameState| {
+                let (abs, rules) = if one_pot {
+                    deep_single_pot()
+                } else {
+                    (
+                        StreetActionAbstraction::default_6_action(),
+                        BettingAbstractionRules::default(),
+                    )
+                };
+                SubgameNlheGame::new(
+                    table.clone(),
+                    tmpl.config().clone(),
+                    abs,
+                    rules,
+                    tmpl.clone(),
+                    0,
+                    0,
+                )
             };
-            let ev_ref = mc_root_ev(&reference, root_actor, EV_ROLLOUTS, 0x00E7_0000);
-            for &iters in &LADDER {
-                let mut tr = EsMccfrTrainer::new(
-                    build_base_subgame_with_table(tmpl, table.clone()),
-                    0xCA1B_0000,
-                );
-                let mut rng = ChaCha20Rng::from_seed(0xCA1B_0000 ^ 0xC0FF_EE00);
-                for _ in 0..iters {
-                    tr.step(&mut rng).expect("step");
-                }
-                let (mut sum_l1, mut max_l1, mut n) = (0.0f64, 0.0f64, 0usize);
-                for (info, _) in tr.strategy_sum().inner().iter() {
-                    let a = tr.average_strategy(info);
-                    let b = reference.average_strategy(info);
-                    if !b.is_empty() && a.len() == b.len() {
-                        let l1: f64 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum();
-                        sum_l1 += l1;
-                        max_l1 = max_l1.max(l1);
-                        n += 1;
+            for (name, tmpl) in targets {
+                let nodes = build(tmpl).subtree().num_nodes();
+                // root EV 的 traverser = root 决策者（postflop HU = BB 先动），便于解读。
+                let root_actor = tmpl.current_player().expect("非终局").0 as PlayerId;
+                let reference = {
+                    let mut tr = EsMccfrTrainer::new(build(tmpl), 0xCA1B_0000);
+                    let mut rng = ChaCha20Rng::from_seed(0xCA1B_0000 ^ 0xC0FF_EE00);
+                    for _ in 0..REF_ITERS {
+                        tr.step(&mut rng).expect("ref step");
                     }
+                    tr
+                };
+                let ev_ref = mc_root_ev(&reference, root_actor, EV_ROLLOUTS, 0x00E7_0000);
+                for &iters in &LADDER {
+                    let mut tr = EsMccfrTrainer::new(build(tmpl), 0xCA1B_0000);
+                    let mut rng = ChaCha20Rng::from_seed(0xCA1B_0000 ^ 0xC0FF_EE00);
+                    for _ in 0..iters {
+                        tr.step(&mut rng).expect("step");
+                    }
+                    let (mut sum_l1, mut max_l1, mut n) = (0.0f64, 0.0f64, 0usize);
+                    for (info, _) in tr.strategy_sum().inner().iter() {
+                        let a = tr.average_strategy(info);
+                        let b = reference.average_strategy(info);
+                        if !b.is_empty() && a.len() == b.len() {
+                            let l1: f64 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum();
+                            sum_l1 += l1;
+                            max_l1 = max_l1.max(l1);
+                            n += 1;
+                        }
+                    }
+                    let ev_short = mc_root_ev(&tr, root_actor, EV_ROLLOUTS, 0x00E7_0000);
+                    eprintln!(
+                        "[A1-cal] {bucket_mode},{menu_name},{name},{nodes},{iters},{REF_ITERS},{:.4},{:.4},{:.2},{:.2},{:.4},{n}",
+                        if n > 0 { sum_l1 / n as f64 } else { 0.0 },
+                        max_l1,
+                        ev_short,
+                        ev_ref,
+                        (ev_short - ev_ref).abs(),
+                    );
                 }
-                let ev_short = mc_root_ev(&tr, root_actor, EV_ROLLOUTS, 0x00E7_0000);
-                eprintln!(
-                    "[A1-cal] {bucket_mode},{name},{nodes},{iters},{REF_ITERS},{:.4},{:.4},{:.2},{:.2},{:.4},{n}",
-                    if n > 0 { sum_l1 / n as f64 } else { 0.0 },
-                    max_l1,
-                    ev_short,
-                    ev_ref,
-                    (ev_short - ev_ref).abs(),
-                );
             }
         }
     }
