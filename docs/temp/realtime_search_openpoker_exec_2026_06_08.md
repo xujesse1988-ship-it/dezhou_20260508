@@ -220,9 +220,23 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
    - **v1 边界（已知、写进代码 doc）**：①取 `node_id` / `legal_abs` 仍靠 **100BB 影子重放**——**off-stack all-in 线**
      影子失同步时走 100BB 影子 fallback（`safe_fallback` = check-when-free），拿到 node_id 但真栈树建不了则搜索降级
      （`search_giveup` = check-when-free）——两者都不回落 blueprint（深码**无 all-in 的 on-tree-preflop 线**是 v1 可搜
-     主场景，覆盖深码 200–500BB SPR）；②子树用 blueprint 的下注菜单（非深码 {1pot}）；深码窄菜单 = **缺口③**（与本缺口正交）。
+     主场景，覆盖深码 200–500BB SPR）；②子树菜单：默认沿用 blueprint 菜单，**`--search-deep-menu` → 单一 {1pot}**（深码窄菜单 =
+     **缺口③ 已落地**，2026-06-09 commit `0fb41da`，见下缺口③）。
 3. **深码窄菜单解到终局**：深码 = 把下注菜单收到**单一 {1pot}**（短码可放宽）、解到终局用真实 `payouts()`，在 `time_budget`
    内尽力解、不保证收敛（anytime + LCFR，缺口①）。核心工程 = 「**时限内把 {1pot} 窄树解到终局**」（不重建叶子值，缘由见 §6 #2）。
+   - **已落地（2026-06-09，commit `0fb41da`，vultr 全绿）**：`{1pot}` 菜单（`deep_single_pot`）**接进 `subgame_search` + 生产
+     advisor**。`SubgameSearchConfig.deep_menu`（默认 `false` = 既有行为 byte-equal）：`true` → 子树用 `deep_single_pot()` 单档
+     菜单建+解，**与 blueprint 菜单解耦**（桶表按 cards/board 归桶、与菜单无关，§2.1）。关键工程坑 = **菜单不匹配**：`{1pot}` ⊊
+     blueprint `{0.5,1,2}`，旧 `subgame_search` 把子树策略**对齐 `legal_abs`（blueprint 影子合法集）必失败**（多出的 0.5pot 找不到
+     对应 → `Err` → 降级）；故 deep_menu 路径改为**返回子树自身合法集上的分布**（`{1pot}` 动作携带按 `auth` 真实 pot 算的 `to`），
+     advisor 端 outgoing 也用 `{1pot}` 抽象算尺寸（自洽）。`openpoker_advisor` 加 `--search-deep-menu` flag（拒绝静默 guard 同
+     `--search-lcfr`）。deep_menu 与 depth_limit **互斥**（早 `Err`，深码无叶子值 §6 #2）。测试：`subgame_search_deep_menu_single_pot`
+     （只含 1.0pot 档 + 不因菜单不匹配 `Err` + 可复现）/ `deep_menu_and_depth_limit_mutually_exclusive` /
+     `search_deep_menu_legal_and_reproducible`（深码不对称栈 600BB vs 200BB 端到端 `source=search`）；守 `search=None` / 非 deep
+     路径逐 infoset byte-equal。**仍未做**：①`{1pot}` 单档对**深码 / 多人策略质量**够不够 = B/live 问题（与可解性无关，§4.1 A② 续）；
+     ②**SPR 自适应菜单宽度**（短码可放宽到多档，§2.1）= v2 细化，v1 deep_menu 一律 `{1pot}`；③deep_menu 当前只在 `FlopFirstUnraised`
+     验过（within-round tags 空 → 导航回 root）；配 `AllPostflop` 时 within-round 导航可能撞 `{1pot}` 子树没有的 blueprint tag → 安全
+     降级（check-when-free），非主场景。
 4. **多人 >3 的树**：见 §2.2，**实时解 N-way 子树**——解到终局、用真实 N-way side-pot `payouts()`。
 5. **真实分布覆盖度量**：见 §4.2（HH 日志 + 覆盖热力图，都还没建）。
 6. **多人 AIVAT 降方差**：`aivat_nlhe.rs` 现在是 HU 单对手（两人写死），要推广到 N 座。单边 P_a={chance, 我方}
@@ -250,6 +264,8 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 - **缺口① LCFR + `time_budget` 本体均已接**（A② 第一杠杆 + 限时打法，见 §3.1/§3.2）：`time_budget` 墙钟 anytime
   默认 `None` 逐 infoset byte-equal（测试 `time_budget_anytime_stops_and_is_valid` 硬证不绑定档 == None 路径）。
 - **缺口③ {1pot} 深码菜单已接**（`nlhe_betting_tree::deep_single_pot`，测试 `deep_single_pot_menu_is_single_full_pot` 锁单档契约）。
+  **2026-06-09 续：菜单已从「树层函数存在」推进到「接进 `subgame_search` + 生产 advisor」**（commit `0fb41da`，`SubgameSearchConfig.deep_menu`
+  + `--search-deep-menu`，菜单不匹配坑已解——deep 路径返回子树自身分布、不对齐 blueprint `legal_abs`；见 §3.2 缺口③）。
 - **A① 引擎在各种码深下都正确——离线半已交付**（`subgame.rs` / `state.rs` 新测试）：
   - 守恒（`payouts()` Σ==0）+ 重采样保牌分布 + 不变量检查 在**深码（HU 200BB）/ 不对称（hero 200BB vs 60BB）/
     多人 side-pot 中途根（3 座短码 BB all-in）**经 `build_subtree` 那条路全过；byte-equal 可复现。
@@ -460,9 +476,11 @@ vultr 全绿）**：`openpoker_advisor` Request 加 optional `stacks[6]` + `deci
 （off-stack all-in 线失同步 → 降级 check-when-free；深码无 all-in 的 on-tree-preflop 线可搜）；子树用 blueprint 菜单（深码 {1pot} = 缺口③）。
 ④ **转 B/C（下一步真正的推进）**：B-vs-C **不再由「能否解出来」单一决定**（B 深码 ≤3-way 全可解；C 多人 ≤5-way≤400BB /
 6-way≤150BB 可解，仅 **6-way 深码角落建树 >5s、待 build 优化**）——改由 §4.2「EV 损失 × 频率」+ live 功效预算决定先攻哪格。
-缺口② 落地后**生产 bot 已能在真码深局面解真游戏**；接下来 = 缺口③（深码 {1pot} 窄菜单接进 advisor 子树）+ live 功效预算
-（统一 mbb/g + 多人 AIVAT 缺口⑥）+ off-stack all-in 线的 node_id 来源（脱离 100BB 影子）。live 功效预算随 live 半段在步 B/C
-前算。数据管道（§4.2）= 可并行后台采集，不卡 A/B/C、随时可起。**
+缺口② 落地后**生产 bot 已能在真码深局面解真游戏**；**缺口③ 也已落地（2026-06-09，commit `0fb41da`，vultr 全绿）——
+`--search-deep-menu` 把子树菜单收到单一 {1pot} 接进 advisor，深码 {1pot} 解到终局端到端跑通**（菜单解耦 + 不匹配坑已解，见 §3.2
+缺口③）。接下来 = live 功效预算（统一 mbb/g + 多人 AIVAT 缺口⑥）+ off-stack all-in 线的 node_id 来源（脱离 100BB 影子，v1 边界①）
++ deep_menu 的两个细化（SPR 自适应菜单宽度 / 配 `AllPostflop` 的 within-round 导航，§3.2 缺口③「仍未做」）。live 功效预算随
+live 半段在步 B/C 前算。数据管道（§4.2）= 可并行后台采集，不卡 A/B/C、随时可起。**
 
 ---
 
