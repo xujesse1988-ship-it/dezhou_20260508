@@ -2537,6 +2537,82 @@ mod tests {
         }
     }
 
+    /// 诊断（非门槛，exec §4.1 A 收尾② / §2.2 深码×多人叠加 / §8「下一步②」）：补
+    /// [`_measure_subgame_wall_and_convergence`] **刻意避开**的角落——它多人只取中等码深
+    /// （4way 100BB / 5way 60BB，注释明写「深码×多人叠加是单独设计，首测不堆满」）。本测把
+    /// **深码 × 多人两个难点同时拉满**：N-way（3..6）limped flop × 码深 100..500BB、
+    /// `deep_single_pot` {1pot} 解到终局。直接回答②「唯一可能超时 / 建不出来的格子」——每格报
+    /// **节点数 + 建树 wall + µs/iter（300-iter vanilla 探针）+ 5s 单线程可达迭代数**，画出
+    /// 「深码×多人单机可解前沿」。LCFR wall ≈ vanilla（杠杆是每迭代收敛、非每迭代 wall，姊妹
+    /// 函数已定论），故探针只跑 vanilla。
+    ///
+    /// **收敛深度不在本测范围**：多街到终局大树的 per-infoset L1 收敛是步 B 质量项——姊妹函数已
+    /// 定「{1pot} turn @300k 仍 L1≈0.15、default-menu turn 1M 参考都欠收敛」；深码×多人 flop 树
+    /// infoset 空间更大、参考更不可能干净收敛，量不出干净 ε。故这里只答「**建不建得出来 + 5s
+    /// 塞得进多少迭代**」（可解性 / wall），收敛深度留步 B（exec §4.1）。
+    ///
+    /// **OOM 防护（不改核心建树器，避 byte-equal 风险）**：`walk` 是 eager DFS 全推进
+    /// `Vec<TreeNode>`（~120 B/node），深码×多人树可能几千万节点。每行（固定 n）按栈**升序**扫，
+    /// 单格节点数超 `SAFE_NODE_CEIL` 即 `break` 该行更深栈（**不建下一个更大的树**）→ 峰值内存 =
+    /// 首个越阈格 ≤ `SAFE_NODE_CEIL` × 单步比，远低于 vultr 物理。越阈点**明确 log**（不静默
+    /// 截断；节点数本身即「单机能否建 / 解」的结论——超不出来的角落 = §2.2 单独设计 / 换更强机器，
+    /// §6 #4 决策点）。wall 用 `Instant`（仅测量，不入确定性求解路径）。
+    /// `cargo test -p poker --lib --release -- --ignored --nocapture _measure_deep_multiway_wall`
+    /// （须 --release，wall 才有意义；大树跑较久）。
+    #[test]
+    #[ignore = "诊断：深码×多人 {1pot} 解到终局 wall（节点/建树/µs-iter/5s-iters）；--release --ignored --nocapture 跑"]
+    fn _measure_deep_multiway_wall() {
+        // ~120 B/node，越阈即 break（不建更大树）→ 峰值 ≈ 首个越阈格 ≤ CEIL×单步比。CEIL=15M
+        // → 越阈格至多 ~37M（~4.5GB @120B/node），远低于 vultr 11GB；{1pot} 栈 1.25× 步进下
+        // 节点单步比 ~1.5–2.5×，不会一步跳到 OOM。CEIL 也是「单机可解前沿」读数本身。
+        const SAFE_NODE_CEIL: usize = 15_000_000;
+        eprintln!("[A2-deepmw] n_seats,stack_bb,nodes,build_ms,us_per_iter,iters_in_5s,over_ceil");
+        for n in [3u8, 4, 5, 6] {
+            for &stack_bb in &[100u64, 150, 200, 250, 300, 400, 500] {
+                let stack = stack_bb * 100; // BB = 100 chips
+                let seed = 0x6D77_0000_0000_0000_u64 ^ ((n as u64) << 24) ^ stack_bb;
+                let flop = nway_limped_flop_state(n, stack, seed);
+                let (abs, rules) = deep_single_pot();
+                let tb = Instant::now();
+                let game = SubgameNlheGame::new(
+                    stub_table(),
+                    flop.config().clone(),
+                    abs,
+                    rules,
+                    flop.clone(),
+                    0,
+                    0,
+                );
+                let build_ms = tb.elapsed().as_secs_f64() * 1e3;
+                let nodes = game.subtree().num_nodes();
+                // µs/iter：300-iter vanilla 探针。external sampling 每迭代一条轨迹、µs/iter 主要
+                // 随树**深**（路径上决策数）而非总节点数 → 即便大树也可测、且 5s 可达迭代数有意义。
+                let mut tr = EsMccfrTrainer::new(game, seed ^ 0xA5A5_0000);
+                let mut rng = ChaCha20Rng::from_seed(seed ^ 0xC0FF_EE00);
+                let t0 = Instant::now();
+                for _ in 0..300u64 {
+                    tr.step(&mut rng).expect("probe step");
+                }
+                let us_per_iter = t0.elapsed().as_micros() as f64 / 300.0;
+                let iters_5s = if us_per_iter > 0.0 {
+                    (5_000_000.0 / us_per_iter) as u64
+                } else {
+                    u64::MAX
+                };
+                let over = nodes > SAFE_NODE_CEIL;
+                eprintln!(
+                    "[A2-deepmw] {n},{stack_bb},{nodes},{build_ms:.1},{us_per_iter:.3},{iters_5s},{over}"
+                );
+                if over {
+                    eprintln!(
+                        "[A2-deepmw] n={n}: {stack_bb}BB nodes={nodes} > SAFE_NODE_CEIL={SAFE_NODE_CEIL} → break 该行更深栈（OOM 防护，不建更大树）"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
     /// 诊断（非门槛，exec §4.1 A 收尾① / §8 下一步①）：ε/δ_conv 收敛距离**真阈值**——在
     /// **river/turn 子树**上量 ① per-infoset 平均策略 L1（vs M 参考）+ ② **root EV 差 δ_conv**
     /// （avg-vs-avg MC）。**实测（commit `453c1ba`，真桶）**：river（单街、~1690 infoset、912 节点）
