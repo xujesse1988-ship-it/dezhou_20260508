@@ -26,7 +26,8 @@
 **blueprint 是提前算好、固定不变的一张表，覆盖不了「码深 × 人数」这个连续变化的空间。** 你不可能为每个码深
 （14…800BB）× 每种人数 × 每种不对称的栈组合都预存一张表。**唯一能覆盖这个连续空间的办法，是在每次决策时
 按真实牌局（真码深、真人数、真 board）现场建子树、现场求解——也就是实时子博弈搜索。** blueprint 退到次要位置，
-只当**先验 + 叶子续局值 + 兜底**，不当最终答案。这个结论是独立的工程判断，不依赖任何对战实测。
+只当**先验（对手 range）+ 兜底**，不当最终答案——子树一律**解到终局**、用真实摊牌值，blueprint 不再充当叶子续局值
+（深码下它根本给不出，§2.1）。这个结论是独立的工程判断，不依赖任何对战实测。
 
 主干**复用现有的 CFR 子博弈求解器**（`subgame.rs`：`EsMccfrTrainer` + `build_subtree`），
 **不引入新的求解核心**——包括把主线 blueprint 已在用的 LCFR 加权接进子树解（加速收敛、是限时的第一杠杆，
@@ -69,10 +70,10 @@
 剥削是后面的加分项，整体**后置**（上线注意事项见 §6）。
 
 > 注意区分：这里说的「剥削」专指**对手建模**（换对手 range 的数据源）。它和设计 §11.4 的 biased 叶子续局机制
-> 是两回事——后者在设计 §11.5d 的 search-vs-self 配对实验里，C−B 在两个 blueprint 上符号一致为负
-> （−64 / −92 mbb/g，但两条 CI 都跨 0、单独都不显著）；而那个实验只能测「偏离 blueprint 多少」，测不了对外部
-> 对手的绝对强弱。所以**本方案默认不开 biased 叶子，是个保守选择**（在「尽量少偏离」的前提下合理），不是「已证实
-> 一定有害」；如果要重新启用，得在外部对手上单独做消融，深码还得先按真实码深重新标定叶子值（§2.1 / §4 步 B）。
+> 是两回事。而 biased / unbiased 叶子的取舍，在本方案主路径上**根本不出现**——子树一律解到终局、没有「叶子续局值」
+> 这一环（§2.1）。设计 §11.5d 的 search-vs-self 配对实验当年比的就是 depth-limit 叶子的两种取法（C−B 符号一致为负、
+> −64 / −92 mbb/g、两条 CI 都跨 0），它**侧面印证了 depth-limit + 叶子续局值不是深码的出路**；本方案据此干脆放弃
+> depth-limit、改解到终局（理由见 §2.1：深码下没有可用的叶子值、也没有可锚的离线真值去重建一张）。
 
 ## 1. 架构（实时搜索为主干，剥削为可选加分项）
 
@@ -83,10 +84,10 @@
        · preflop → 直接用 blueprint 策略，不搜索（现有 SearchTrigger 全是 postflop 触发）
        · postflop 且结构接近 blueprint 练过的 infoset（≈100BB / ≤3-way / 下注线 on-tree）→ 仍用 blueprint 策略
        · 否则（off-100BB / 4+way / off-tree——blueprint 解的是错游戏）→ 实时搜索，走 3–6 步（§0.1 主目标区）
-  3. 在真实状态上建子树（build_subtree，真 SPR / 真人数）
-  4. 取对手 range/续局值：默认来自 blueprint；有可靠对手数据时换成实测（剥削加分项，后置）
+  3. 在真实状态上建子树（build_subtree，真 SPR / 真人数）；建到终局、不 depth-limit，下注菜单按码深缩放（深码单一 {1pot}、短码可多档）
+  4. 取对手 range：默认来自 blueprint；有可靠对手数据时换成实测（剥削加分项，后置）。无叶子续局值——子树解到终局
   5. 在预算内求解子树（限时打法见 §2.3）；解不动就降级——但降级也要留在真实状态上
-     （收窄下注菜单 / 加深 depth-limit 后对真实树粗解 / 稳健启发式），blueprint 只在它训练过的情况里才作兜底
+     （收窄下注菜单到地板 {1pot} / 返回 anytime 到点时的当前策略 / 稳健启发式），blueprint 只在它训练过的情况里才作兜底
   6. 返回动作（off-tree 尺寸经 map_off_tree 翻译）
 持续：
   记全桌动作 + 摊牌（HH 日志）→ ①统计真实分布覆盖热力图 ②攒对手数据（加分项用）
@@ -124,19 +125,24 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 **「现场求解天生能处理不对称栈」在机制层成立，预计算表做不到。** 但这只说明「引擎能做」，生产 advisor 还没把真实栈喂进去
 （见 §1 / §3.2 缺口②）。
 
-- **深码（150–800BB）= 真正难、是主目标核心、直接攻**：树大 → 必须 depth-limit + 叶子续局值，而 100BB 训出来的
-  叶子值用在 500BB 上属于 off-distribution（不可靠）。设计 §11.5d 在 100BB 抽象 + all-postflop 下测过：depth-limit unbiased
-  和解到终局是 **wash**（既不明显更好、也不明显更差）、biased 续局值比 unbiased 更偏离 blueprint
-  （C−B 符号一致为负、CI 跨 0）——注意这是 search-vs-self 实验里的*相对偏离*读数，不是对外部对手的绝对强弱。
-  即便如此，depth-limit = wash 本身就说明「深码靠 depth-limit + 叶子值拿净收益」证据偏弱：深码必须把叶子值
-  **按真实码深重建 / 重标**（不能直接用 100BB 表）、别照搬经验系数，而且收益要到外部对手上才算数。这是码深维度
-  最难的工程，**v1 直接做、不绕开。**
+- **深码（150–800BB）= 真正难、是主目标核心、直接攻**：树大，但**不能走 depth-limit + 叶子续局值这条路**——深码下根本
+  **没有可用的叶子值**：blueprint 是 100BB 训的，用在 500BB 上是 off-distribution（≈没有），查表给不出深码叶子续局值；
+  「重建一张深码叶子值表」也没有可靠的离线真值可锚（深码没有干净的 EV 尺，§0.3）。**正确做法 = 直接解到终局**——
+  终局摊牌值由真实 `GameState::payouts()` 精确给出（零叶子近似）。控制树大小的杠杆从「depth-limit」换成「**下注尺寸
+  抽象**」：深码被迫把下注菜单收到**单一 {1pot}**（外加 fold / call / all-in），靠窄菜单把「到终局」的树压到可解；
+  时限内**尽力解、不保证收敛**（anytime 求解器到点就停、返回当前平均策略，LCFR 是每迭代更接近收敛的杠杆，§2.3）。
+  设计 §11.5d 在 100BB 抽象 + all-postflop 下测过 depth-limit：unbiased 和解到终局是 **wash**、biased 续局值比 unbiased
+  更偏离 blueprint（C−B 符号一致为负、CI 跨 0；注意这是 search-vs-self 实验里的*相对偏离*读数，不是对外部对手的绝对
+  强弱）。这组读数**侧面印证 depth-limit + 叶子值不是深码的出路**——它连 wash 都只是勉强，而深码又拿不出可靠叶子值，
+  就干脆放弃它、解到终局。深码的核心工程因此不再是「重建叶子值」，而是「**在时限内把 {1pot} 窄树解到终局**」
+  （anytime + LCFR，缺口①/③）。这是码深维度最难的工程，**v1 直接做、不绕开。**
 - **不对称栈 = 码深维度里最常见的形态、也是关键前提**：现场求解天生能处理（建真树就行），预计算表做不到。但必须先验证
   引擎在不对称栈下守恒 + SPR / all-in 阈值和真实栈一致（§5），才能把「现场求解天生处理不对称栈」当成前提用。
-- **短码（14–30BB）= 同一个引擎的小树特例，顺手就覆盖了**：树小 → 能解到终局（不用叶子值近似、不用 depth-limit），
-  是码深维度里*最省事*的一档；引擎在深码上做对了，短码自动落在能力范围内，不必单独列。注意 100BB blueprint 在短码上
-  **同样解的是错的游戏**（SPR / all-in 树形错 + range 先验不分栈、也错），所以短码真出现在牌桌上，应由实时搜索
-  现场解、而不是回落到 blueprint。
+- **短码（14–30BB）= 同一套打法、树小所以菜单可以更宽**：和深码**完全一样直接解到终局**（同样零叶子近似、零
+  depth-limit），唯一区别是树小——短码很快就 all-in、到终局的层数少，所以**能负担更丰富的下注尺寸菜单**（深码被迫
+  收到单一 {1pot}，短码可以多档），反而是码深维度里*最省事*的一档；引擎在深码上做对了，短码自动落在能力范围内，
+  不必单独列。注意 100BB blueprint 在短码上**同样解的是错的游戏**（SPR / all-in 树形错 + range 先验不分栈、也错），
+  所以短码真出现在牌桌上，应由实时搜索现场解、而不是回落到 blueprint。
 
 ### 2.2 人数 >3（最难的结构问题，正面解决）
 
@@ -147,16 +153,17 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 - 两条路（须立项选）：
   - **(甲) 把抽象 / 训练扩到 4-way**：N=4 已实测 = **1.445B infoset / 48 GiB**（≈6.3× N=3 的 8.04GiB@200，
     需要 ≥56GiB 的机器；同样 1B 预算只能覆盖 ~9% → 大概率反而更差）；≥5-way 仍然没覆盖。
-  - **(乙) 实时解 N-way 子树**：**多人解到终局时，摊牌值由真实 `GameState::payouts()` 的 N-way side-pot
-    showdown 精确给出，不需要 equity 估计**（`multiway_equity_mc` 只在 `tools/multiway_equity_probe.rs:197` 的
-    私有离线函数里，生产不能调）。`multiway_equity_mc` 只有在**深码 depth-limit 叶子**上才用得到，而且语义更粗
-    （叶子之后假设全员摊牌、不再下注），需要新接线 + 评估它的方差 / 速度 / side-pot 语义——是缺口，不是现成件。
-    深码多人还需要 **N-way 叶子续局值**（blueprint 给不了），是真正难做的部分。
+  - **(乙) 实时解 N-way 子树**：**多人也一律解到终局，摊牌值由真实 `GameState::payouts()` 的 N-way side-pot
+    showdown 精确给出，不需要 equity 估计、也不需要任何叶子续局值**（`multiway_equity_mc` 只在
+    `tools/multiway_equity_probe.rs:197` 的私有离线函数里，本来只为「深码 depth-limit 叶子」服务——既然放弃 depth-limit、
+    改解到终局，它在生产路径上**不再需要**，连带省掉了它语义粗、方差 / 速度未评估的麻烦）。深码 × 多人的难点因此回到
+    **同一处：在时限内把窄菜单（{1pot}）N-way 树解到终局**，而不是「重建 N-way 叶子值」（那条路本就没有可靠真值可锚）。
 - **深码 × 多人是两个难点叠加、最难**，要单独出设计；但真实牌局里这种情况最常见，正是要主攻的地方，不回避。
 
 ### 2.3 限时（必须先打好的地基）
 
-- 现状：`SubgameSearchConfig`（`subgame.rs:650`）有 8 个字段（含 `depth_limit` / `biased_leaf` 等机制开关），
+- 现状：`SubgameSearchConfig`（`subgame.rs:650`）有 8 个字段（含 `depth_limit` / `biased_leaf` 等机制开关——
+  **本方案深码 / 多人都不用这两个**：放弃 depth-limit、改解到终局，控树靠下注尺寸抽象，§2.1），
   但**没有 `time_budget`**、也**没有 CFR 变体开关**——`subgame.rs:1066` 直接 `EsMccfrTrainer::new`、跑的是
   vanilla ES-MCCFR（不加权）；求解循环 `:1068` 是固定的 `for _ in 0..iterations`、不会按时间中断——还不是随时可停的求解器。
   单决策耗时（wall）**从来没单独测过**（现有数据全是整条手臂的）。
@@ -176,15 +183,18 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
     一致性来保证可复现（须说明 G1–G3 怎么过）。
   - **② 按预算静态选树粒度**：把「预算 → 粒度」做成建树前的静态决策、保持固定迭代数，wall 可预测、byte-equal 也仍然成立；
     但要先离线产出「(节点数, 迭代数) → 单决策 wall」的回归曲线（= §4 步 A 的 wall 量化），据此把 5/10/20s 预算
-    **反解成 limit_street + 菜单档数 + 迭代上限**——而这个「预算 → 粒度」模型现在还不存在，是要立项的研究项。
+    **反解成 下注菜单档数 + 迭代上限**（**不含 limit_street**——解到终局、不 depth-limit，控树只靠菜单宽度，§2.1）——
+    而这个「预算 → 粒度」模型现在还不存在，是要立项的研究项。
 
   byte-equal 仍是发现算法 bug 的便宜检查手段（`invariants.md §2`），在**能做到**的路径上保留（静态选粒度 /
   `search=None` 回归 / HH 日志隔离，见 §5）；只在墙钟 anytime 这种**做不到**的地方不强求。
 
 - **降级也必须留在真实状态上，但目前真实状态的兜底阶梯几乎是空的。** blueprint 只在它训练过的情况里
   （≤3-way、接近 100BB）才是有效兜底；在它没覆盖的情况里回落 blueprint = 回落到一个**解错了游戏**的策略。
-  方案里承诺的降级阶梯「真实树粗解 → 多人 equity / push-fold 启发式 → blueprint 作最后兜底」中：收窄菜单会碰上
-  abstraction 与 blueprint 的桶 / 叶子值耦合（`subgame.rs:126`）、加深 depth-limit 又落回 §11.5d 那种 off-distribution 叶子值、
+  方案里承诺的降级阶梯在新框架下是「**anytime 求解器返回当前（未收敛）平均策略 → 多人 equity / push-fold 启发式 →
+  blueprint 仅在它练过的情况作最后兜底**」：深码下注菜单已经在地板上（单一 {1pot}）、收无可收，所以**第一档降级就是
+  直接返回 anytime 到点时的当前策略**（解到终局的窄树、只是迭代没跑够），**不再有「加深 depth-limit / 换叶子值」这一档**
+  （已放弃 depth-limit，§2.1）；hero 真桶索引仍耦合 blueprint 抽象（`subgame.rs:126`，但只剩桶、无叶子值耦合），而
   **中间那层稳健启发式（多人 equity / push-fold）在 `src/` 里根本不存在**。要把「off-tree 情况下的真实状态兜底」
   当成缺口①的必做子项一起做，否则限时解不出来时就只剩回落 blueprint。
 
@@ -200,10 +210,10 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 | 构件 | `file:line` | 状态 |
 |---|---|---|
 | 真实状态建子树 | `nlhe_betting_tree.rs:271 build_subtree` / `:309 depth_limited` | ✅ 可接任意中途 `GameState` 作 root |
-| CFR 子博弈求解 | `subgame.rs:650 SubgameSearchConfig` / `:1066 EsMccfrTrainer` | ✅ 解到终局或 depth-limit；超 cap / 未访问安全回落。**缺口① 已接（2026-06-09，commit `ce25ee6`）**：`SubgameSearchConfig.lcfr`（默认 false = vanilla，既有 probe/advisor/§11.5 基线 byte-equal）；`lcfr=true` → `.with_lcfr_period((iterations/50).max(1))`，零新核（机制在 `trainer.rs:332`）。仍固定迭代、无 `time_budget`（限时求解器本体待建） |
+| CFR 子博弈求解 | `subgame.rs:650 SubgameSearchConfig` / `:1066 EsMccfrTrainer` | ✅ 解到终局；超 cap / 未访问安全回落（`depth_limit` 字段仍在，但深码 / 多人不用它——解到终局、控树靠下注尺寸抽象，§2.1）。**缺口① 已接（2026-06-09，commit `ce25ee6`）**：`SubgameSearchConfig.lcfr`（默认 false = vanilla，既有 probe/advisor/§11.5 基线 byte-equal）；`lcfr=true` → `.with_lcfr_period((iterations/50).max(1))`，零新核（机制在 `trainer.rs:332`）。仍固定迭代、无 `time_budget`（限时求解器本体待建） |
 | off-tree 尺寸映射 | `action.rs:476 map_off_tree`（pseudo-harmonic randomized rounding） | ✅ 任意下注尺寸；纯函数可复现 |
 | blueprint 加载 / 兜底 / fallback 统计 | `nlhe_dense_trainer.rs` / `openpoker_advisor.rs:119 safe_fallback` | ✅ 冷启动 / 失败退路 |
-| 多人 equity | `tools/multiway_equity_probe.rs:197 multiway_equity_mc` | 🟡 离线私有函数，没接进生产、也没做 N-way 叶子值表（见缺口④） |
+| 多人 equity | `tools/multiway_equity_probe.rs:197 multiway_equity_mc` | 🟡 离线私有函数；本只为 depth-limit 叶子服务——放弃 depth-limit、改解到终局后**生产路径不再需要它**（终局用真实 `payouts()`，§2.2），仅可能留作降级启发式之一 |
 
 ### 3.2 缺口（须新写 / 改造）
 
@@ -217,20 +227,23 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
    - **进度（2026-06-09，commit `ce25ee6`/`61c3d14`）**：✅ **LCFR 已接**（`SubgameSearchConfig.lcfr`，零新核）；
      ✅ **wall / 收敛曲线初测脚手架**（`subgame.rs` ignored 诊断 `_measure_subgame_wall_and_convergence`，vanilla
      与 LCFR 各一条 + 收敛 L1）已落地并在 vultr 跑出初值（见步 A 表）。**仍未做**：`time_budget`（随时可停的求解器本体）、
-     off-tree 真实状态兜底的稳健启发式（多人 equity / push-fold，`src/` 里仍不存在）、wall 曲线画到**真正的深码（500BB+）/
-     4–5way 目标树**上（现初测的是中等树：HU 200BB / 200v60 / 短码 3way）+ 按部署机核数外推。
+     off-tree 真实状态兜底的稳健启发式（多人 equity / push-fold，`src/` 里仍不存在）、wall 曲线画到**真正的深码（500BB+，
+     {1pot} 菜单、解到终局）/ 4–5way 目标树**上（现初测的是中等树：HU 200BB / 200v60 / 短码 3way）+ 按部署机核数外推。
 2. **生产 advisor 接搜索**：`openpoker_advisor.rs` 现在完全不调 `subgame_search`、写死了
    `default_6max_100bb`（`:191`）、`Request`（`:84-96`）也没有 per-seat stack 字段。要捕获真实栈 + 在 `decide()` 里新建
    search 分派 + 重写 outgoing（见 §1）——是整条管线重建，不是接一行。
-3. **off-stack 叶子续局值**：深码下 100BB 的叶子值属于 off-distribution，要按真实码深重建。小树解到终局可以绕开叶子近似，
-   但小树不是主目标——**深码必须正面重建叶子值，这是 v1 的核心工程**。
-4. **多人 >3 的树 + N-way 叶子值**：见 §2.2，立项选甲 / 乙。
+3. **深码窄菜单解到终局（取代「叶子续局值重建」）**：深码下 100BB 叶子值是 off-distribution、重建也没有可靠离线真值可锚——
+   所以**不重建叶子值，改直接解到终局**：终局用真实 `payouts()`，控树靠把下注菜单收到**单一 {1pot}**（短码可放宽），
+   在 `time_budget` 内尽力解、不保证收敛（anytime + LCFR，缺口①）。v1 的核心工程因此是「**时限内把 {1pot} 窄树解到终局**」，
+   不是「重建一张深码叶子值表」。
+4. **多人 >3 的树**：见 §2.2，立项选甲 / 乙。乙（实时 N-way 解）同样解到终局、用真实 N-way side-pot `payouts()`，
+   **不需要 N-way 叶子值**（原 N-way 叶子值需求随放弃 depth-limit 一并消除）。
 5. **真实分布覆盖度量**：见 §4.2（HH 日志 + 覆盖热力图，都还没建）。
 6. **多人 AIVAT 降方差**：`aivat_nlhe.rs` 现在是 HU 单对手（两人写死），要推广到 N 座。单边 P_a={chance, 我方}
    就无偏（不需要对手策略，用 blueprint 当值函数也合法），预期能把 SD 缩到 1/2–1/3 → 所需手数降到 1/4–1/9。这是 §4 live
    功效预算里唯一不需要配对的降方差手段（OpenPoker 不能配对，配对带来的方差缩减用不上）；不补它，§4 的 live 功效
-   结论是在「没有降方差」假设下算的、过于悲观。注意要和设计 §5.c 的 `aivat_value` N-player 推广（用于搜索叶子值函数）
-   区分开——复用同一套基建，但目的不同。
+   结论是在「没有降方差」假设下算的、过于悲观。缺口⑥**纯用于评测降方差**；设计 §5.c 里那个把 `aivat_value`
+   当「搜索叶子值函数」的用法，随放弃 depth-limit / 改解到终局已**不在本方案内**（主路径无叶子值函数，§2.1）。
 
 ## 4. 落地（分步验收）
 
@@ -242,8 +255,8 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 | 步 | 做什么 | 放行判据 |
 |---|---|---|
 | **A**（前置 / 离线） | **两件都要从零做**：① **引擎在各种码深下都正确**：守恒（`payouts()` Σ==0）/ byte-equal / 和 PokerKit 自洽 / 实时解 ≈ 同状态离线 CFR 收敛解，**样例必须含深码中途根 + per-seat 不对称栈 + 多人 side-pot 中途根**（不是只测对称 100BB）；② 「(节点数, 迭代数) → 单决策 wall」回归曲线 + **在真实深码 / 多人目标树上**判定 5/10/20s 时限可行性（缺口①前置；曲线 **vanilla 与 LCFR 各一条**——LCFR 同迭代更接近收敛、直接决定 5s 能否解到有用迭代数） | ① 守恒 + byte-equal + 收敛距离达阈（见下「判据定义」）；② wall 曲线产出 + **深码 / 多人目标树在 5s 预算下能解到有用的迭代数**（按开了 LCFR 的那条曲线判；否则先把时限收到 10–20s 或换更强机器，再开 B/C）。**注意：核心区没有干净的离线 EV 标尺（§0.3），A 验的是“解的是真游戏、而且解得动”，不验“赚多少”——后者留给 live** |
-| **B**（深码实时搜索） | depth-limit + 叶子续局值**按真实码深重建**（缺口③；biased 默认不用，是保守选择、不是“已证实有害”，§2.1）；接生产 advisor（缺口②，管线重建、**把各家真实栈喂进去**）；限时求解器（缺口①，按 §2.3 两条路选一条） | **离线（硬性放行）**：叶子值按真实码深重建 + 守恒 + byte-equal（在能做到的路径上；墙钟 anytime 路径改用 seeded-RNG + replay/AIVAT 一致，§2.3）；**advisor 真的喂入 per-seat starting_stacks（不再写死 100BB）**；**含不对称栈样例（如 hero 200BB vs 对手 60BB）的深码守恒 + SPR/all-in 阈值和真实栈一致**；no-panic / 归一；单决策 wall ≤ budget；**限时解不出来时降级动作来自真实状态的启发式、不回落 100BB blueprint**。**live（观察项，不作放行）**：见下「live 功效预算」——降为“别打更差”的护栏 |
-| **C**（多人 >3） | 拆两步：**C0** 立项选甲（扩抽象 4-way，48GiB）/ 乙（实时 N-way 解，解到终局用真实 `payouts()`、深码要 N-way 叶子值）→ **C1** 建 N-way 叶子值 + live | **C0**：甲 / 乙取舍定案；**C1**：4 人及以上见 flop 有可靠、可解的子树（离线核：守恒 + N-way side-pot payouts 正确）+ live 不退化（同 B，功效不足 → 过 ≠ 兑现多人核心，只兑现“解真游戏 + 不退化”） |
+| **B**（深码实时搜索） | **解到终局（不 depth-limit、不要叶子续局值）**+ 把下注菜单收到**单一 {1pot}** 控树（缺口③；§2.1）；接生产 advisor（缺口②，管线重建、**把各家真实栈喂进去**）；限时求解器（缺口①，按 §2.3 两条路选一条，**时限内尽力、不保证收敛**） | **离线（硬性放行）**：终局摊牌值 = 真实 `payouts()`（零叶子近似）+ 守恒 + byte-equal（在能做到的路径上；墙钟 anytime 路径改用 seeded-RNG + replay/AIVAT 一致，§2.3）；**advisor 真的喂入 per-seat starting_stacks（不再写死 100BB）**；**含不对称栈样例（如 hero 200BB vs 对手 60BB）的深码守恒 + SPR/all-in 阈值和真实栈一致**；no-panic / 归一；单决策 wall ≤ budget（{1pot} 窄树能在 time_budget 内解到有用迭代数）；**限时解不出来时降级 = 返回 anytime 当前策略 / 真实状态启发式、不回落 100BB blueprint**。**live（观察项，不作放行）**：见下「live 功效预算」——降为“别打更差”的护栏 |
+| **C**（多人 >3） | 拆两步：**C0** 立项选甲（扩抽象 4-way，48GiB）/ 乙（实时 N-way 解，**解到终局用真实 N-way side-pot `payouts()`、不要 N-way 叶子值**）→ **C1** 接生产 + live（**不再有「建 N-way 叶子值」这一步**——随放弃 depth-limit 消除） | **C0**：甲 / 乙取舍定案；**C1**：4 人及以上见 flop 有可靠、可解的子树（离线核：守恒 + N-way side-pot payouts 正确）+ live 不退化（同 B，功效不足 → 过 ≠ 兑现多人核心，只兑现“解真游戏 + 不退化”） |
 | **D**（后置可选） | 剥削加分项：按置信度门控替换对手 range 的数据源 | **前置**：对手 name 稳定可追踪（§4.2 已验）；数据足够的对手上增量为正（同样受 live 功效限制，复用下面的护栏）；对池中最稳健的对手分项不亏（防被反剥削） |
 
 **步 A 进度（2026-06-09，commit `ce25ee6`→`61c3d14`，vultr 全绿 468 passed / 0 failed / 90 ignored）**：
@@ -266,7 +279,7 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
     的大 flop 子树）= 下一步细化，不卡步 A 离线半。
 - **A② wall 曲线初测**（vanilla / LCFR 各一条，单线程 4-core vultr）：中等树上 **5s 单线程可行**——HU 200BB flop（58,160 节点）
   ~155ms/1000 iter、~3.7s/30000 iter；短码 3way（12 节点）~4ms/1000 iter。LCFR wall ≈ vanilla（其杠杆是每迭代收敛、非每迭代 wall）。
-  ⚠ **未做**：画到**真正的深码（500BB+）/ 4–5way 目标树**（需缺口③④的深码抽象 + 更大树）+ 按**部署机**核数外推（§7：别拿测试机当部署结论）。
+  ⚠ **未做**：画到**真正的深码（500BB+，{1pot} 菜单、解到终局）/ 4–5way 目标树**（需缺口③④的深码抽象 + 更大树）+ 按**部署机**核数外推（§7：别拿测试机当部署结论）。
 
 **放行判据定义（必须能判，不留含糊）**：
 
@@ -356,8 +369,8 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
   search-or-blueprint 分支不破坏影子推进的 lockstep（配测试，不只是声明）。
 - **引擎在各种码深下都正确**：补「**深码中途根 + per-seat 不对称栈（如 hero 200BB vs 对手 60BB）+ 多人 side-pot
   中途根**」的 `build_subtree` + subgame solve → `payouts()` per-seat PnL Σ==0，且和 PokerKit / 解到终局口径自洽的
-  cross-check（现有守恒测试只覆盖对称 base 态 `state.rs:1370`；不对称栈 + 多人 side-pot 中途根 + 深码 depth-limit
-  根都没单独验过；`tests/side_pots.rs` 已覆盖不等栈守恒，但走的是直接 apply、不是 `build_subtree`，可以当 oracle 复用）。不对称栈
+  cross-check（现有守恒测试只覆盖对称 base 态 `state.rs:1370`；不对称栈 + 多人 side-pot 中途根 + 深码中途根
+  解到终局都没单独验过；`tests/side_pots.rs` 已覆盖不等栈守恒，但走的是直接 apply、不是 `build_subtree`，可以当 oracle 复用）。不对称栈
   是码深维度里最常见的形态、又是「现场求解天生处理、预计算表做不到」（§2.1）的关键前提，**必须验过才能当前提用**。小树守恒是
   这套 fixture 的*便宜子集*、顺带就覆盖了，但 fixture 的目标是**深码 / 多人正确**。
 - **求解核均衡正确性**：另外锚到现有的 Kuhn/Leduc exploitability 真值 + 小子树和 PokerKit 口径自洽——核心区判强弱不依赖
@@ -371,11 +384,12 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
    它的离线前提 = **引擎正确（解真游戏）+ 结构性论证（blueprint 在 off-100BB / 4+way 解错游戏，能硬证）**，也就是**步 A**；
    live 这条锚依赖还没算的功效预算。在 A 和功效预算落地前，B/C 的 **live 半**是 0% 可执行、不是“待跑”；但 A 的**离线半**
    （引擎正确 + wall/时限）现在就能开。
-2. **深码 / 多人叶子值 = 真正难做的部分**：100BB blueprint 的值不能迁移，**深码 / 多人必须正面重建叶子值（缺口③④），这是
-   v1 核心、不是可绕开项**。biased 叶子在 §11.5d 实验里更偏离 blueprint（相对读数、不是绝对有害），默认不用是保守
-   选择；而且 depth-limit unbiased 本身只是 wash → 深码靠它拿净收益证据偏弱，要把叶子值按真实码深重建 / 重标，收益要到
-   外部对手上才算数。
-3. **多人 >3 没有免费的好处**：甲（扩抽象）吃内存（N=4=48GiB 已测）、乙（N-way 叶子值）吃难度。要立项明确取舍。
+2. **深码 / 多人「时限内把窄树解到终局」= 真正难做的部分**：100BB blueprint 的值不能迁移，深码下也**没有可靠的离线
+   叶子值真值可重建**——所以本方案**不重建叶子值、也不 depth-limit，改直接解到终局**（缺口③④），终局用真实 `payouts()`，
+   控树靠把下注菜单收到单一 {1pot}（短码可放宽）。难点因此从「重建叶子值」转成「**big 窄树在 time_budget 内解到有用迭代数**」
+   （anytime + LCFR；5s 能否解动是部署机核数的函数，§4 步 A② / §6 #4）。§11.5d 的 depth-limit 读数（unbiased 只是 wash、
+   biased 更偏离）正是放弃 depth-limit 的旁证——结论不是「叶子值要重建」，而是「这条路本身不该走」。
+3. **多人 >3 没有免费的好处**：甲（扩抽象）吃内存（N=4=48GiB 已测）、乙（实时 N-way 解到终局）吃时限 / 难度（窄树也大）。要立项明确取舍。
 4. **限时**：深 / 多人树在 5s 内解不解得出来还不知道（wall 是核数的函数、随机器变；§8：要在目标部署机上实测，不拿开发 /
    测试机的数当部署结论）；要实测单决策 wall。墙钟 anytime 和 byte-equal 互斥，但 byte-equal 做不到的地方不强求（§2.3），所以墙钟 anytime /
    静态选粒度按实现成本选一条。**5s 解不出来 → 收时限范围 / 换更强机器**是 §4.1 步 A② / B / C 的明确决策点，不能默默当作做到了。
@@ -401,8 +415,9 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
 ## 8. 排期（待补）
 
 - **优先级**：引擎在各种码深下都正确（步 A①，离线小机器可跑）→ 限时求解器（含把 LCFR 接进子树解）+ wall 曲线 + **深码 / 多人目标树**
-  5s 时限可行性判定（缺口①，步 A②）→ 生产接线（缺口②，含喂真栈）→ 深码叶子值重建（缺口③，步 B）/ 多人
-  （缺口④ N-way 叶子值，步 C）→ live（含多人 AIVAT 缺口⑥降方差）。
+  5s 时限可行性判定（缺口①，步 A②）→ 生产接线（缺口②，含喂真栈）→ 深码窄树解到终局（缺口③ = {1pot} 菜单 + 解到终局 +
+  时限求解，步 B；**非「叶子值重建」**）/ 多人（缺口④ N-way 树，步 C；解到终局用真实 N-way `payouts()`、**无 N-way 叶子值**）
+  → live（含多人 AIVAT 缺口⑥降方差）。
 - **起按需高性能机器前，要先给该步列 wall + $、向用户报预算再起机**（§6 #7 硬前提）。
 - 各步 wall + $ 估算 = 立项前要补齐的（§6 #7）。
 
@@ -413,7 +428,7 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
 **下一步（A 收尾 → B）**：① **ε/δ_conv 精确标定** = 在 river/turn 小可枚举子树 + 真桶表上跑收敛距离（大 flop 子树欠采样不适合定阈）；
 ② **wall 画到真深码（500BB+）/ 4–5way 目标树** + 按部署机核数外推（缺口③④的深码抽象就绪后；§7 别拿测试机当部署结论）；
 ③ **限时求解器本体** = `time_budget`（随时可停）+ off-tree 真实状态的稳健启发式兜底（多人 equity / push-fold，`src/` 仍无）。
-A 收尾后开深码（步 B = 叶子值按真码深重建 + 接生产 `openpoker_advisor` 喂真 per-seat 栈 + live 不退化确认）或多人（步 C，入口
+A 收尾后开深码（步 B = {1pot} 菜单解到终局 + 接生产 `openpoker_advisor` 喂真 per-seat 栈 + live 不退化确认）或多人（步 C，入口
 由 §4.2 数据触发）。live 功效预算（统一 mbb/g + 多人 AIVAT 缺口⑥）随 live 半段在步 B/C 前算。数据管道（§4.2）= 可并行后台采集，
 不卡 A/B/C、随时可起。**
 
