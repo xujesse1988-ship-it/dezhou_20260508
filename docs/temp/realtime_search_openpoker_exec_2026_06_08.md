@@ -29,7 +29,8 @@
 只当**先验 + 叶子续局值 + 兜底**，不当最终答案。这个结论是独立的工程判断，不依赖任何对战实测。
 
 主干**复用现有的 CFR 子博弈求解器**（`subgame.rs`：`EsMccfrTrainer` + `build_subtree`），
-**不引入新的求解核心**。要补的只有 §3 列的那些缺口。
+**不引入新的求解核心**——包括把主线 blueprint 已在用的 LCFR 加权接进子树解（加速收敛、是限时的第一杠杆，
+机制已在共享 `EsMccfrTrainer` 里、零新核，见 §2.3 / 缺口①）。要补的只有 §3 列的那些缺口。
 
 ### 0.3 实时搜索的适用边界（为什么它是主干）
 
@@ -143,8 +144,18 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 ### 2.3 限时（必须先打好的地基）
 
 - 现状：`SubgameSearchConfig`（`subgame.rs:650`）有 8 个字段（含 `depth_limit` / `biased_leaf` 等机制开关），
-  但**没有 `time_budget`**；求解循环 `:1068` 是固定的 `for _ in 0..iterations`、不会按时间中断——还不是随时可停的求解器。
+  但**没有 `time_budget`**、也**没有 CFR 变体开关**——`subgame.rs:1066` 直接 `EsMccfrTrainer::new`、跑的是
+  vanilla ES-MCCFR（不加权）；求解循环 `:1068` 是固定的 `for _ in 0..iterations`、不会按时间中断——还不是随时可停的求解器。
   单决策耗时（wall）**从来没单独测过**（现有数据全是整条手臂的）。
+
+- **收敛加速 = LCFR（先接进子树解，是限时的第一杠杆）**：限时的本质矛盾是「迭代数 ↔ 解得多准」，LCFR 直接改善这个兑换比。
+  LCFR = 按迭代序号线性加权（越靠后的迭代权重越大，Brown & Sandholm 2018），**相同迭代数 / 相同 wall 下离收敛更近**——
+  正是 5s 预算最缺的。机制**已经在共享的 `EsMccfrTrainer` 里**（`with_lcfr_period` → `maybe_lcfr_rescale`，
+  `trainer.rs:332/352`，主线 blueprint 训练用的就是它），子树解只是没接；接进来 = `subgame_search` 构 trainer 那行
+  （`subgame.rs:1066`）补一个 `.with_lcfr_period(...)`，**不是新写求解核**。**唯一要重标的是 period 粒度**：blueprint 的
+  period（千万–亿级 update）放进子树解的几千迭代里**一次都不会触发**——`trainer.rs:332` 的 doc 注明 period 要让
+  `总更新 / period` 落在 20–100，否则线性权重不充分；所以子树解得按 `cfg.iterations` 现算一个小 period（例如 `iterations/50`），
+  否则等于没开。两条限时路都受益：静态选粒度路同 wall 能解更细的树，墙钟 anytime 路同时限解得更准。
 
 - **byte-equal 在做不到的地方就不强求，所以限时打法不被它锁死，按实现成本在两条路里选。** 「解到时间用完就返回当前策略」
   会让迭代数取决于机器速度 / 负载，同一个 `(state,seed)` 会产出不同策略，**从原理上就做不到 byte-equal**。两条路：
@@ -175,7 +186,7 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 | 构件 | `file:line` | 状态 |
 |---|---|---|
 | 真实状态建子树 | `nlhe_betting_tree.rs:271 build_subtree` / `:309 depth_limited` | ✅ 可接任意中途 `GameState` 作 root |
-| CFR 子博弈求解 | `subgame.rs:650 SubgameSearchConfig` / `:1066 EsMccfrTrainer` | ✅ 解到终局或 depth-limit；超 cap / 未访问安全回落 |
+| CFR 子博弈求解 | `subgame.rs:650 SubgameSearchConfig` / `:1066 EsMccfrTrainer` | ✅ 解到终局或 depth-limit；超 cap / 未访问安全回落。🟡 现跑 **vanilla ES-MCCFR（不加权）**；LCFR 加权已在共享 `EsMccfrTrainer`（`trainer.rs:332 with_lcfr_period`）、子树解未接 → 缺口① |
 | off-tree 尺寸映射 | `action.rs:476 map_off_tree`（pseudo-harmonic randomized rounding） | ✅ 任意下注尺寸；纯函数可复现 |
 | blueprint 加载 / 兜底 / fallback 统计 | `nlhe_dense_trainer.rs` / `openpoker_advisor.rs:119 safe_fallback` | ✅ 冷启动 / 失败退路 |
 | 多人 equity | `tools/multiway_equity_probe.rs:197 multiway_equity_mc` | 🟡 离线私有函数，没接进生产、也没做 N-way 叶子值表（见缺口④） |
@@ -186,6 +197,9 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
    byte-equal、靠 seeded-RNG + replay/AIVAT 保持可复现）；② 按预算静态选树粒度（先离线产出「(节点数, 迭代数) → 单决策 wall」
    回归曲线，反解 limit_street + 菜单档数 + 迭代上限，保持固定迭代 / byte-equal、wall 可预测）。off-tree 情况下的兜底用
    稳健启发式、而不是 blueprint（这层启发式现在不存在，要一并建）。**wall 曲线要直接画在深码 / 多人的目标树上**（不是最省事的小树）。
+   **外加：把 LCFR 接进子树解**（`subgame.rs:1066` 那行 `EsMccfrTrainer::new` 后补 `.with_lcfr_period(...)`，period 按
+   `cfg.iterations` 现算小值 ≈ `iterations/50`；机制已在 `trainer.rs:332`、零新核）——同 wall 收敛更快是限时的第一杠杆；
+   wall / 收敛曲线要 **vanilla 与 LCFR 各量一条**，「5s 能否解到有用迭代数」按开了 LCFR 的那条判。
 2. **生产 advisor 接搜索**：`openpoker_advisor.rs` 现在完全不调 `subgame_search`、写死了
    `default_6max_100bb`（`:191`）、`Request`（`:84-96`）也没有 per-seat stack 字段。要捕获真实栈 + 在 `decide()` 里新建
    search 分派 + 重写 outgoing（见 §1）——是整条管线重建，不是接一行。
@@ -208,7 +222,7 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
 
 | 步 | 做什么 | 放行判据 |
 |---|---|---|
-| **A**（前置 / vultr，离线） | **两件都要从零做**：① **引擎在各种码深下都正确**：守恒（`payouts()` Σ==0）/ byte-equal / 和 PokerKit 自洽 / 实时解 ≈ 同状态离线 CFR 收敛解，**样例必须含深码中途根 + per-seat 不对称栈 + 多人 side-pot 中途根**（不是只测对称 100BB）；② 「(节点数, 迭代数) → 单决策 wall」回归曲线 + **在真实深码 / 多人目标树上**判定 5/10/20s 时限可行性（缺口①前置） | ① 守恒 + byte-equal + 收敛距离达阈（见下「判据定义」）；② wall 曲线产出 + **深码 / 多人目标树在 5s 预算下能解到有用的迭代数**（否则先把时限收到 10–20s 或申请多核，再开 B/C）。**注意：核心区没有干净的离线 EV 标尺（§0.3），A 验的是“解的是真游戏、而且解得动”，不验“赚多少”——后者留给 live** |
+| **A**（前置 / vultr，离线） | **两件都要从零做**：① **引擎在各种码深下都正确**：守恒（`payouts()` Σ==0）/ byte-equal / 和 PokerKit 自洽 / 实时解 ≈ 同状态离线 CFR 收敛解，**样例必须含深码中途根 + per-seat 不对称栈 + 多人 side-pot 中途根**（不是只测对称 100BB）；② 「(节点数, 迭代数) → 单决策 wall」回归曲线 + **在真实深码 / 多人目标树上**判定 5/10/20s 时限可行性（缺口①前置；曲线 **vanilla 与 LCFR 各一条**——LCFR 同迭代更接近收敛、直接决定 5s 能否解到有用迭代数） | ① 守恒 + byte-equal + 收敛距离达阈（见下「判据定义」）；② wall 曲线产出 + **深码 / 多人目标树在 5s 预算下能解到有用的迭代数**（按开了 LCFR 的那条曲线判；否则先把时限收到 10–20s 或申请多核，再开 B/C）。**注意：核心区没有干净的离线 EV 标尺（§0.3），A 验的是“解的是真游戏、而且解得动”，不验“赚多少”——后者留给 live** |
 | **B**（深码实时搜索） | depth-limit + 叶子续局值**按真实码深重建**（缺口③；biased 默认不用，是保守选择、不是“已证实有害”，§2.1）；接生产 advisor（缺口②，管线重建、**把各家真实栈喂进去**）；限时求解器（缺口①，按 §2.3 两条路选一条） | **离线（硬性放行）**：叶子值按真实码深重建 + 守恒 + byte-equal（在能做到的路径上；墙钟 anytime 路径改用 seeded-RNG + replay/AIVAT 一致，§2.3）；**advisor 真的喂入 per-seat starting_stacks（不再写死 100BB）**；**含不对称栈样例（如 hero 200BB vs 对手 60BB）的深码守恒 + SPR/all-in 阈值和真实栈一致**；no-panic / 归一；单决策 wall ≤ budget；**限时解不出来时降级动作来自真实状态的启发式、不回落 100BB blueprint**。**live（观察项，不作放行）**：见下「live 功效预算」——降为“别打更差”的护栏 |
 | **C**（多人 >3） | 拆两步：**C0** 立项选甲（扩抽象 4-way，48GiB）/ 乙（实时 N-way 解，解到终局用真实 `payouts()`、深码要 N-way 叶子值）→ **C1** 建 N-way 叶子值 + live | **C0**：甲 / 乙取舍定案；**C1**：4 人及以上见 flop 有可靠、可解的子树（离线核：守恒 + N-way side-pot payouts 正确）+ live 不退化（同 B，功效不足 → 过 ≠ 兑现多人核心，只兑现“解真游戏 + 不退化”） |
 | **D**（后置可选） | 剥削加分项：按置信度门控替换对手 range 的数据源 | **前置**：对手 name 稳定可追踪（§4.2 已验）；数据足够的对手上增量为正（同样受 live 功效限制，复用下面的护栏）；对池中最稳健的对手分项不亏（防被反剥削） |
@@ -295,7 +309,8 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
 - **HH 日志**：selftest 不破坏 advisor 路径（挂 / 不挂 byte-equal）；真挂上时字段齐、摊牌 / 名字捕到。
 - **限时求解器**：静态选粒度路径保 byte-equal（固定迭代）；**墙钟 anytime 路径做不到 byte-equal、也不要求**，改用
   seeded `RngSource`（局面派生种子）+ replay / AIVAT 一致性来保证可复现（须说明 G1–G3 怎么过）；两条路都要 no-panic /
-  策略归一 / 输出动作合法（不破规则层）。
+  策略归一 / 输出动作合法（不破规则层）。接 LCFR 不破这些：`maybe_lcfr_rescale`（`trainer.rs:352`）同比缩放 regret +
+  strategy_sum、是确定性的（固定迭代 + seed），所以静态选粒度路径接 LCFR 后**仍 byte-equal**、归一也不变。
 - **接生产回归**：`Contestant.search=None` ⇒ 输出 byte-equal 当前 blueprint（守住已验证的 advisor 薄壳成果，能做到就必须守）；
   slumbot HU 复用同一个核、不受影响；search-or-blueprint 分支不破坏影子推进的 lockstep（配测试，不只是声明）。
 - **引擎在各种码深下都正确**：补「**深码中途根 + per-seat 不对称栈（如 hero 200BB vs 对手 60BB）+ 多人 side-pot
@@ -305,7 +320,8 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
   是码深维度里最常见的形态、又是「现场求解天生处理、预计算表做不到」（§2.1）的关键前提，**必须验过才能当前提用**。小树守恒是
   这套 fixture 的*便宜子集*、顺带就覆盖了，但 fixture 的目标是**深码 / 多人正确**。
 - **求解核均衡正确性**：另外锚到现有的 Kuhn/Leduc exploitability 真值 + 小子树和 PokerKit 口径自洽——核心区判强弱不依赖
-  NLHE best-response（不用新写）。
+  NLHE best-response（不用新写）。LCFR 接进子树解后同样过这套 Kuhn/Leduc 锚，并验它**收敛方向与 vanilla 一致、达同精度更快**
+  （LCFR 在主线 blueprint 已是成熟变体，但子树解是新接线，得在小博弈上确认加速真出现、period 粒度选对了）。
 - **正确性优先**（CLAUDE.md）：搜索接进实战前，off-stack 树形要和真实 `GameState` 的 SPR / all-in 阈值一致（含不对称栈）。
 
 ## 6. 已知风险（诚实）
@@ -341,7 +357,7 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
 
 ## 8. 排期（待补）
 
-- **优先级**：引擎在各种码深下都正确（步 A①，vultr 可跑）→ 限时求解器 + wall 曲线 + **深码 / 多人目标树**
+- **优先级**：引擎在各种码深下都正确（步 A①，vultr 可跑）→ 限时求解器（含把 LCFR 接进子树解）+ wall 曲线 + **深码 / 多人目标树**
   5s 时限可行性判定（缺口①，步 A②）→ 生产接线（缺口②，含喂真栈）→ 深码叶子值重建（缺口③，步 B）/ 多人
   （缺口④ N-way 叶子值，步 C）→ live（含多人 AIVAT 缺口⑥降方差）。
 - **上 AWS 前，要先定和 preopen 续训抢机的取舍**（§6 #7 硬前提）。
