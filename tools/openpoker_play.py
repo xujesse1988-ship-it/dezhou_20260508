@@ -199,7 +199,7 @@ def run_real(advisor, api_key, num_hands, action_log=None):
     import websocket  # 延迟 import：离线 selftest 不需要 websocket-client
 
     log_f = open(action_log, "w") if action_log else None
-    counters = {"hands": 0, "decisions": 0, "blueprint": 0, "fallback": 0, "net_chips": 0}
+    counters = {"hands": 0, "decisions": 0, "blueprint": 0, "search": 0, "fallback": 0, "net_chips": 0}
     client_action_id = [0]
 
     def send(ws, obj):
@@ -294,7 +294,12 @@ def _handle_your_turn(ws, advisor, state, msg, counters, client_action_id, send,
         print(f"  [advisor 异常] {e} → fold 兜底", file=sys.stderr)
         resp = {"action": "fold", "source": "fallback:advisor_exception"}
     counters["decisions"] += 1
-    if str(resp.get("source", "")).startswith("fallback"):
+    # source 分桶（缺口②）：blueprint=blueprint 策略；search=实时搜索解出；fallback=兜底（blueprint
+    # 结构性 fallback:* + 搜索解不出来 search_giveup:* 都算「兜底」§4.1 护栏）。
+    src = str(resp.get("source", ""))
+    if src == "search":
+        counters["search"] += 1
+    elif src.startswith("fallback") or src.startswith("search_giveup"):
         counters["fallback"] += 1
     else:
         counters["blueprint"] += 1
@@ -335,7 +340,7 @@ def _report(counters):
     d = counters["decisions"]
     fb = counters["fallback"]
     print(f"hands={counters['hands']} decisions={d} "
-          f"blueprint={counters['blueprint']} fallback={fb} "
+          f"blueprint={counters['blueprint']} search={counters.get('search', 0)} fallback={fb} "
           f"({100.0 * fb / d if d else 0:.1f}% 兜底)", file=sys.stderr)
 
 
@@ -388,7 +393,7 @@ def run_selftest(advisor):
 
     # 场景 4（缺口②）：flop 首点未起注 + **真栈**（非对称深码 SB 600BB / BB 200BB）。验 driver 回推
     # hand-start 真栈 → request 带 stacks[6]；advisor 路径合法（开 --search 时走实时搜索 source=search /
-    # search_fold:*，否则 blueprint）。SB complete + BB check 在 nolimp/preopen 都是 on-tree（无 limp gap）。
+    # search_giveup:*，否则 blueprint）。SB complete + BB check 在 nolimp/preopen 都是 on-tree（无 limp gap）。
     hand4 = HandState("h4", button_seat=0, my_seat=1)  # SB 先动 flop
     hand4.hole = ["Ah", "Kd"]
     for s in [3, 4, 5, 0]:
@@ -405,7 +410,7 @@ def run_selftest(advisor):
     resp4 = advisor.decide(req4)
     _assert_legal(resp4, valid_flop, "flop+stacks")
     print(f"[selftest 4 flop+真栈] stacks={req4['stacks']} resp={resp4} "
-          f"(--search 开则 source=search/search_fold:*，否则 blueprint)", file=sys.stderr)
+          f"(--search 开则 source=search/search_giveup:*，否则 blueprint)", file=sys.stderr)
 
     print("OK: 4 个 canned 场景跑通，advisor 全程出合法动作、driver 组请求/动作包（含真栈 stacks）正常。",
           file=sys.stderr)

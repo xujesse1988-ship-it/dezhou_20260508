@@ -25,8 +25,9 @@
 //! re-solve：driver 多送 `stacks[6]`（各座 hand-start 真栈），[`build_real_auth`] 在**真实
 //! per-seat 栈** config 上重放本手 → 注入真实牌（[`GameState::inject_external_cards`]）→
 //! [`subgame_search`] 解到终局（`time_budget` 墙钟 anytime / 可选 LCFR）；outgoing 按**真码深**
-//! `auth` 算尺寸（非「100BB 解 ÷scale」）。**搜索区解不出来 = 直接 fold**（建不了真栈树 / 子博弈
-//! `Err`），**不回落 blueprint**（off-distribution 下 blueprint 解的是错游戏，§2.3）。
+//! `auth` 算尺寸（非「100BB 解 ÷scale」）。**搜索区解不出来 = check-when-free**（能 check 就 check、
+//! 否则 fold；建不了真栈树 / 子博弈 `Err`），**不回落 blueprint**（off-distribution 下 blueprint 解的是
+//! 错游戏，§2.3）。`source=search_giveup:*` 与 blueprint `fallback:*` 分桶。
 //!
 //! **守恒不变量**：`--search` **未开**（`search=None`）时 `decide` 走原 100BB blueprint 路径、
 //! 逐字节等价旧行为（测试 `search_off_byte_equal_blueprint` 钉死）。preflop + 未触发的 postflop
@@ -292,15 +293,15 @@ fn decide(
     let want_search = matches!(search, Some(scfg) if should_search(&real, scfg.trigger));
 
     // dist + outgoing 基准态：默认 = blueprint 分布 + 100BB real 算尺寸（search=None / 未触发，
-    // byte-equal 旧行为）；搜索触发 = 真码深 auth 子博弈解 + auth 算尺寸（失败 → fold，不回落）。
+    // byte-equal 旧行为）；搜索触发 = 真码深 auth 子博弈解 + auth 算尺寸（失败 → check-when-free，不回落）。
     let mut auth_holder: Option<GameState> = None;
     let dist: Vec<(AbstractAction, f64)> = if want_search {
         let scfg = search.expect("want_search ⇒ search.is_some()");
-        // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ fold。
+        // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ 安全降级。
         let (auth, round_start) =
             match build_real_auth(req, &solver_cfg, scale, my_seat_solver, hole, &board) {
                 Ok(pair) => pair,
-                Err(reason) => return fold_response(&format!("search_build:{reason}")),
+                Err(reason) => return search_giveup(&req.valid, &format!("build:{reason}")),
             };
         let root_state: &GameState = match scfg.resolve_root {
             ResolveRoot::RoundStart => &round_start,
@@ -323,8 +324,8 @@ fn decide(
                 auth_holder = Some(auth); // outgoing 用真栈 auth 算尺寸。
                 d
             }
-            // 解不出来（建不了/未访问/失同步/限时连一轮迭代都未完成）→ fold，不回落 blueprint。
-            Err(reason) => return fold_response(&format!("search_unsolved:{reason}")),
+            // 解不出来（建不了/未访问/失同步/限时连一轮迭代都未完成）→ check-when-free，不回落 blueprint。
+            Err(reason) => return search_giveup(&req.valid, &format!("unsolved:{reason}")),
         }
     } else {
         blueprint_distribution(&info, &legal_abs, strategy_fn)
@@ -441,13 +442,16 @@ fn action_to_response(action: Action, scale: u64, valid: &ValidActions) -> Respo
     }
 }
 
-/// 搜索区降级（设计 §2.3）：真解不出来（建不了真栈树 / 子博弈 `Err`）→ **直接 fold**，
-/// **不回落 blueprint**（off-distribution 下 blueprint 解错游戏）。`source = search_fold:<reason>`
-/// 与 blueprint 路径的 `fallback:...` 区分（driver 据此分两类统计，§4.1 fallback 护栏）。
-fn fold_response(reason: &str) -> Response {
+/// 搜索区降级（设计 §2.3，2026-06-09 改 check-when-free）：真解不出来（建不了真栈树 / 子博弈
+/// `Err`）→ 取**安全合法动作**（能 check 就 check、否则 fold——紧、不漏筹码），**不回落 blueprint**
+/// （off-distribution 下 blueprint 解的是错游戏）。原「直接 fold」会在可 check 的局面（如 flop 首点）
+/// 白丢免费 check，故 check-优先（严格不劣，且仍绝不打 blueprint 的错游戏动作）。`source =
+/// search_giveup:<reason>` 与 blueprint 路径的 `fallback:...` 区分（driver 分桶统计，§4.1 fallback 护栏）。
+fn search_giveup(valid: &ValidActions, reason: &str) -> Response {
+    let action = if valid.can_check { "check" } else { "fold" };
     Response {
-        action: "fold".into(),
-        source: format!("search_fold:{reason}"),
+        action: action.to_string(),
+        source: format!("search_giveup:{reason}"),
         ..Default::default()
     }
 }
@@ -1123,10 +1127,10 @@ mod tests {
         };
         let resp = decide(&game, &abs, &uniform, &req, 0xA11CE, Some(&scfg));
         assert!(is_legal(&resp, &req.valid), "搜索动作须合法，得 {resp:?}");
-        // source 要么 search（解成功），要么 search_fold:*（罕见解不出来），绝不静默 blueprint。
+        // source 要么 search（解成功），要么 search_giveup:*（罕见解不出来 → check-when-free），绝不静默 blueprint。
         assert!(
-            resp.source == "search" || resp.source.starts_with("search_fold:"),
-            "搜索区 source 须 search / search_fold:*，得 {resp:?}"
+            resp.source == "search" || resp.source.starts_with("search_giveup:"),
+            "搜索区 source 须 search / search_giveup:*，得 {resp:?}"
         );
         let again = decide(&game, &abs, &uniform, &req, 0xA11CE, Some(&scfg));
         assert_eq!(resp, again, "同 seed 搜索须确定性（byte-equal 可复现）");
@@ -1153,8 +1157,34 @@ mod tests {
             "深码搜索动作须合法，得 {resp:?}"
         );
         assert!(
-            resp.source == "search" || resp.source.starts_with("search_fold:"),
+            resp.source == "search" || resp.source.starts_with("search_giveup:"),
             "搜索区 source，得 {resp:?}"
+        );
+    }
+
+    /// 搜索降级 = **check-when-free**（非直接 fold）：强制子博弈失败（`max_subtree_nodes=1` →
+    /// 子树越界 `Err`），在可 check 的 flop 首点须出 **check**（不白丢免费 check），source=search_giveup:*
+    /// （不回落 blueprint）。锁住 2026-06-09 「fold → check-when-free」的行为改动。
+    #[test]
+    fn search_giveup_checks_when_free() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let req = flop_first_unraised_req(vec![2000; 6]); // flop 首点 can_check=true。
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1, // 任何 flop 子树 >1 节点 → subgame_search Err → 降级。
+            ..SubgameSearchConfig::default()
+        };
+        let resp = decide(&game, &abs, &uniform, &req, 0xF01D, Some(&scfg));
+        assert_eq!(
+            resp.action, "check",
+            "可 check 的局面降级应 check（非 fold），得 {resp:?}"
+        );
+        assert!(
+            resp.source.starts_with("search_giveup:"),
+            "降级 source 须 search_giveup:*（不回落 blueprint），得 {resp:?}"
         );
     }
 }
