@@ -628,7 +628,8 @@ fn remaining_deck(our: &[Card; 2], opp: &[Card; 2], board: &[Card]) -> Vec<Card>
 }
 
 /// 枚举 `deck` 的全部 `C(deck.len(), k)` 组合，逐个回调（复用 `combo` 缓冲，零分配/组合）。
-fn enumerate_combinations(deck: &[Card], k: usize, f: &mut dyn FnMut(&[Card])) {
+/// `pub(crate)`：多人估计器 [`crate::training::aivat_multiway`] 复用（E_runout 逐补全枚举）。
+pub(crate) fn enumerate_combinations(deck: &[Card], k: usize, f: &mut dyn FnMut(&[Card])) {
     let n = deck.len();
     if k == 0 {
         f(&[]);

@@ -507,6 +507,117 @@ impl GameState {
         Ok(state)
     }
 
+    /// 多人 AIVAT 评测入口（缺口⑥，[`crate::training::aivat_multiway`]）：把**外部已知**底牌
+    /// （可多座）+ 真实可见 board + **指定** runout 后缀装进一个重放出的中途 decision 状态——
+    /// E_runout 逐补全精确枚举用（评测层，非随机抽样）。
+    ///
+    /// 与 [`inject_external_cards`](Self::inject_external_cards) 的区别：①底牌可装**多座**
+    /// （`holes[seat] = Some`）；未给（`None`）的未弃牌座发占位牌（剩余牌堆按 id 升序取，
+    /// **保证不与 board / 后缀 / 已知底牌冲突**）——评测方须自行保证这些座位在摊牌前弃牌，
+    /// 否则 `payouts` 会读到占位牌 = 错值；②runout 后缀由调用方**指定**（`board ++ suffix`
+    /// 共 5 张），不从牌堆随机补。
+    ///
+    /// 错误（外部数据可能脏 → `Err`，**绝不 panic**）：`holes` 长度 ≠ 座位数 /
+    /// `board.len()` ≠ 重放街公共牌数 / `board+suffix` ≠ 5 张 / 已弃座给了底牌 / 牌重复。
+    /// 强制 `track_history = false`（同 `resample_hidden*`：仅供评测 `apply` + `payouts`）。
+    pub fn with_external_cards_and_runout(
+        &self,
+        holes: &[Option<[Card; 2]>],
+        board: &[Card],
+        runout_suffix: &[Card],
+    ) -> Result<GameState, String> {
+        if holes.len() != self.players.len() {
+            return Err(format!(
+                "with_external_cards_and_runout: holes 长度 {} ≠ 座位数 {}",
+                holes.len(),
+                self.players.len()
+            ));
+        }
+        if board.len() != self.board.len() {
+            return Err(format!(
+                "with_external_cards_and_runout: 外部 board 长 {} ≠ 重放街公共牌数 {}",
+                board.len(),
+                self.board.len()
+            ));
+        }
+        if board.len() + runout_suffix.len() != 5 {
+            return Err(format!(
+                "with_external_cards_and_runout: board {} + 后缀 {} ≠ 5 张",
+                board.len(),
+                runout_suffix.len()
+            ));
+        }
+
+        // used = board + 后缀 + 全部给定底牌；任何重复 = 外部数据脏 → Err。
+        let mut used: BTreeSet<u8> = BTreeSet::new();
+        for c in board.iter().chain(runout_suffix.iter()) {
+            if !used.insert(c.to_u8()) {
+                return Err(format!("with_external_cards_and_runout: 公共牌重复 {c:?}"));
+            }
+        }
+        for (idx, hole) in holes.iter().enumerate() {
+            if let Some(h) = hole {
+                if self.players[idx].hole_cards.is_none() {
+                    return Err(format!(
+                        "with_external_cards_and_runout: 已弃座 {idx} 不应给底牌"
+                    ));
+                }
+                for c in h {
+                    if !used.insert(c.to_u8()) {
+                        return Err(format!(
+                            "with_external_cards_and_runout: 底牌重复 {c:?} @ seat {idx}"
+                        ));
+                    }
+                }
+            }
+        }
+
+        let mut state = self.clone();
+        state.track_history = false;
+        state.board = board.iter().copied().collect();
+
+        // 装入给定底牌；未给的未弃牌座发占位（剩余牌堆按 id 升序，used 已含后缀 → 不冲突）。
+        let deck: Vec<Card> = (0u8..52)
+            .filter(|v| !used.contains(v))
+            .map(|v| Card::from_u8(v).expect("0..52 are valid cards"))
+            .collect();
+        let mut cursor = 0usize;
+        for (player, hole) in state.players.iter_mut().zip(holes.iter()) {
+            if player.hole_cards.is_none() {
+                continue; // 弃牌座保持 None。
+            }
+            if let Some(h) = hole {
+                player.hole_cards = Some(*h);
+            } else {
+                player.hole_cards = Some([deck[cursor], deck[cursor + 1]]);
+                cursor += 2;
+            }
+        }
+
+        // runout = 真实 board 前缀 + 指定后缀；重算 showdown_ranks（同 resample_hidden）。
+        let mut runout = state.runout_board;
+        for (i, slot) in runout.iter_mut().enumerate() {
+            if i < board.len() {
+                *slot = board[i];
+            } else {
+                *slot = runout_suffix[i - board.len()];
+            }
+        }
+        state.runout_board = runout;
+        state.showdown_ranks = state
+            .players
+            .iter()
+            .map(|p| {
+                p.hole_cards.map(|hole| {
+                    eval::eval7(&[
+                        hole[0], hole[1], runout[0], runout[1], runout[2], runout[3], runout[4],
+                    ])
+                })
+            })
+            .collect();
+        Ok(state)
+    }
+
     /// 当前要行动的玩家。手牌结束 / 全员 all-in 跳轮时返回 `None`。
     pub fn current_player(&self) -> Option<SeatId> {
         self.current_player

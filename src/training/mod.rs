@@ -26,6 +26,7 @@
 //! 与 API-380 / API-350 公开路径一致。
 
 pub mod aivat;
+pub mod aivat_multiway;
 pub mod aivat_nlhe;
 pub mod aivat_value;
 pub mod best_response;
