@@ -694,12 +694,17 @@ fn hand_seed_for(req: &Request, base_seed: u64) -> u64 {
 }
 
 /// solver raise-to → OpenPoker raise-to：÷scale 四舍五入，夹进 [min_raise, max_raise]。
-/// 无 raise 区间（不能加注）→ None（caller 兜底）。
+/// 无 raise 区间（不能加注）或区间不自洽（min > max，脏 valid_actions）→ None（caller 兜底）。
 fn raise_to_op(to_solver: u64, scale: u64, valid: &ValidActions) -> Option<u64> {
     if !valid.can_raise {
         return None;
     }
     let (min, max) = (valid.min_raise?, valid.max_raise?);
+    if min > max {
+        // 脏区间：u64::clamp 在 min > max 时 panic，会杀死常驻进程（driver 此后每决策
+        // fold = 永久弃牌机）。当作 raise 不可用 → caller safe_fallback（live 不能崩）。
+        return None;
+    }
     let mut op_to = (to_solver + scale / 2) / scale; // round-half-up
     op_to = op_to.clamp(min, max);
     Some(op_to)
@@ -1061,6 +1066,30 @@ mod tests {
             },
             _ => false,
         }
+    }
+
+    /// 脏 valid_actions（min_raise > max_raise）不能 panic 杀死常驻进程（「live 不能崩」）：
+    /// `raise_to_op` 须返回 None（caller 走 safe_fallback）。修前 `u64::clamp(min>max)` panic，
+    /// driver 此后每决策 fold = 永久弃牌机。
+    #[test]
+    fn raise_to_op_inconsistent_interval_no_panic() {
+        let dirty = ValidActions {
+            can_check: false,
+            can_call: true,
+            can_raise: true,
+            min_raise: Some(400),
+            max_raise: Some(300),
+        };
+        assert_eq!(raise_to_op(1650, 5, &dirty), None);
+        // 自洽区间行为不变：1650 solver ÷5 = 330 op，落在 [20, 1840] 内原样返回。
+        let ok = ValidActions {
+            can_check: true,
+            can_call: false,
+            can_raise: true,
+            min_raise: Some(20),
+            max_raise: Some(1840),
+        };
+        assert_eq!(raise_to_op(1650, 5, &ok), Some(330));
     }
 
     /// folds-to-BTN：UTG/HJ/CO fold → BTN(我) 决策。faithful 路径出**合法** raise/fold
