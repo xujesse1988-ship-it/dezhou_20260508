@@ -1493,4 +1493,87 @@ mod tests {
         );
         assert!(on.source.starts_with("fallback:"), "得 {on:?}");
     }
+
+    /// **limp 池进搜索**（脱影子的重要副作用，S5 结构 gap 在触发区收口）：UTG open-limp 在
+    /// nolimp 影子上 preflop 即 structural_gap（旧路径整手只能兜底），但 limp 在真栈重放里
+    /// 完全合法 → flop 触发点现在走脱影子搜索（source=search:unanchored）。limp 多人池是
+    /// 真实分布最常见形态——这是脱影子带来的最大覆盖增量，钉死别回退。
+    #[test]
+    fn limped_pot_flop_searches_unanchored() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        // UTG(3) open-limp → HJ/CO/BTN fold → SB(我) complete → BB check → flop 3-way，
+        // SB 首个行动、未起注（FlopFirstUnraised 命中）。
+        let req = Request {
+            hole: vec!["Ah".into(), "Kd".into()],
+            board: vec!["7h".into(), "2c".into(), "Ks".into()],
+            button_seat: 0,
+            my_seat: 1,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                HistAction {
+                    seat: 3,
+                    action: "call".into(),
+                    to: Some(20),
+                },
+                HistAction {
+                    seat: 4,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 5,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 0,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 1,
+                    action: "call".into(),
+                    to: Some(20),
+                },
+                HistAction {
+                    seat: 2,
+                    action: "check".into(),
+                    to: None,
+                },
+            ],
+            valid: ValidActions {
+                can_check: true,
+                can_call: false,
+                can_raise: true,
+                min_raise: Some(20),
+                max_raise: Some(1980),
+            },
+            stacks: vec![2000; 6],
+        };
+        // 前提确证：旧路径在 limp 池上必兜底（结构 gap）。
+        let off = decide(&game, &abs, &uniform, &req, 0x11B9, None);
+        assert!(
+            off.source.starts_with("fallback:"),
+            "limp 进 nolimp 影子应 structural_gap → 兜底，得 {off:?}"
+        );
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let resp = decide(&game, &abs, &uniform, &req, 0x11B9, Some(&scfg));
+        assert!(
+            is_legal(&resp, &req.valid),
+            "limp 池搜索动作须合法，得 {resp:?}"
+        );
+        assert_eq!(
+            resp.source, "search:unanchored",
+            "limp 池 flop 触发点应由脱影子搜索接管，得 {resp:?}"
+        );
+    }
 }
