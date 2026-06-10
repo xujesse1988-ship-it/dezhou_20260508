@@ -571,7 +571,8 @@ traverser 只轮**子树根仍 Active** 的座（弃牌 / all-in 座零决策节
 advisor `--search-live-traversers`（机制 / 测试见 §3.2 缺口① 进度末条）。
 接下来 = **live 半段数据管道（§4.2 HH 日志升级：driver 落 shown_cards / winnings / 对手 name → 接 `MultiwayHandInput`，
 mbb/g 统一经 `chips_to_mbb_per_hand`）** + 真 blueprint 自对弈 VF-1 小表（169×6）+ 脱锚 range 细化（部分前缀 reach /
-对手数据，后置）。数据管道 = 可并行后台采集，不卡 B/C、随时可起。**
+对手数据，后置；**设计探索已记 `unanchored_range_design_2026_06_10.md`**——三档方案 + AllIn-tag 坑 + 实现要点）。
+数据管道 = 可并行后台采集，不卡 B/C、随时可起。**
 
 ---
 
