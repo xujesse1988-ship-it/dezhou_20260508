@@ -309,8 +309,15 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      **SE 缩减 1.33×（方差 1.77×）**（合成自对弈、postflop all-in 频率偏高，live 实测会更低）。
    - **预期修正（对上面"SD 缩到 1/2–1/3"的下修）**：那是论文全知设定；HU 生产实测推荐集只有 1.10×、本合成闸门 1.33×
      → **AIVAT 白拿一截 CI 收窄但救不动 live 功效**（§4.1 结论不变、反而更稳）。
-   - **仍未做**：接真实 HH 日志（§4.2 数据管道：driver 落 `shown_cards`/`winnings` → `MultiwayHandInput`，单位经
-     `chips_to_mbb_per_hand` 统一 mbb/g）+ 真 blueprint 自对弈 VF-1 小表（169×6，自对弈 harness 现成）+ c_act v2（需 σ 日志）。
+   - ~~接真实 HH 日志 + VF-1 小表~~——**已落地（2026-06-10，commit `e9b5738`，vultr 模块/集成/真 1B selftest 全绿）**：
+     ①driver `--hh-log`（默认开、append）每手落全桌 HH JSONL → ②`src/training/openpoker_hh.rs::hh_to_multiway_input`
+     （×scale + 动作转换重放 + U=(final−start)×scale，全不一致 loud Err）→ ③新 bin `openpoker_hh_aivat` 出 raw/AIVAT
+     mean±SE（mbb/g）；④VF-1 = `Vf1DealTable`（169×N JSON artifact）+ 新 bin `vf1_deal_table_build`（blueprint 自对弈，
+     holes 由同 hand_seed `GameState::new` 复现）——**正式表已产**：preopen 10B 自对弈 1M 手 → vultr
+     `artifacts/vf1_deal_table_preopen10b.json`（0 desync、1014/1014 格全覆盖、最薄格 2888 样本、wall 20s；数值合理性
+     抽查过：AA@BTN +13.2BB、72o 非盲位恰 0 / SB 恰 −0.5BB、零和加权总均值精确 0、BTN 位置均值最优 / BB 最差）。
+     详见 §4.2 进度。
+   - **仍未做**：c_act v2（需 σ 日志）+ live 真数据采集（HH 管道已就绪，等账号上场实跑）。
 
 ## 4. 落地（分步验收）
 
@@ -435,11 +442,15 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
 
 **做什么**：把 OpenPoker 客户端日志从「只记我方决策点」升级成「**全桌手牌历史（HH）**」。分两件、工作量不同：
 
-- **日志升级（解析并落盘的轻活）**：driver 现在**收到了但丢掉**了 name / winners / shown_cards
-  （`openpoker_play.py` `_handle_hand_result` 只用 final_stacks 做 leave/rejoin），落进新增的独立 `--hh-log` 就行。
-  **要隔离 advisor 路径**：`build_request` 不消费 name / 摊牌（现在 `:128-140` 字段就是这样），保持 advisor 输出 byte-identical
-  ——这是**要把关的目标性质**（真加日志时，如果为了持久化重排了消息时序，仍可能间接动到 `HandState.actions`），
-  得配 invariant 测试（挂 / 不挂 HH 日志，advisor 输出 byte-equal）。
+- **日志升级（解析并落盘的轻活）——已落地（2026-06-10，commit `e9b5738`）**：driver `--hh-log`（默认开、append 跨重连
+  累积）每手 `hand_result` 落一行全桌 HH JSONL：整手 `actions` + `actions_ext`（player_action 原始字段子集
+  `contribution_delta`/`stack_before` 等——live 校准字段，比 driver 自跟 committed 更稳，留作 all_in 无 amount 缺口的
+  修复材料）+ board + 对手 name（`your_turn.players`）+ 回推 hand-start 真栈 + winners/final_stacks/shown_cards **原样**。
+  消息路由抽成 `Session` 类——run_real 与 selftest canned 序列**共用同一条真实路径**，byte-equal 隔离测试才测得到真代码。
+  **invariant 测试已配（selftest 场景 5）**：同一 canned 整手序列（到摊牌）挂 / 不挂 `--hh-log` 各跑一遍，advisor
+  请求/响应流 + 发出的 action 包**逐字节一致** + HH 行字段齐；请求流 byte-equal ⟹ 同 seed 无状态真 advisor 输出也
+  byte-equal。Rust 侧解析（`openpoker_hh.rs`，canned 记录与 python 同一手互为 oracle）+ `openpoker_hh_aivat` 报表
+  见 §3.2 #6 进度；canned→HH→报表端到端 vultr 实测对账（+40 op 净赢 = +2000 mbb/g）。
 - **覆盖热力图（不是轻活）**：码深桶（14–30 / 30–60 / 60–150 / 150–400 / 400–800BB）× 见 flop 人数
   （2/3/4/5/6）× 街，每格统计 blueprint 有没有可靠策略 / 在 fallback / 在乱映射——要判「可靠 vs Desync vs 乱映射」
   得复用 shadow/off-tree 的分类逻辑，不是单纯 parse。
@@ -569,10 +580,15 @@ solve 全部输入做 key（`SubgameSolveCache`，solve 边界现算、不从请
 traverser 只轮**子树根仍 Active** 的座（弃牌 / all-in 座零决策节点 = 零学习迭代；fold 剩 2-3 人的最常见局面浪费
 50-67% → 同 wall 有效迭代 ×2-3，与 LCFR 正交、与 ⑦ 叠加）。默认 false 全部基线 byte-equal；旗进 solve 缓存 key；
 advisor `--search-live-traversers`（机制 / 测试见 §3.2 缺口① 进度末条）。
-接下来 = **live 半段数据管道（§4.2 HH 日志升级：driver 落 shown_cards / winnings / 对手 name → 接 `MultiwayHandInput`，
-mbb/g 统一经 `chips_to_mbb_per_hand`）** + 真 blueprint 自对弈 VF-1 小表（169×6）+ 脱锚 range 细化（部分前缀 reach /
-对手数据，后置；**设计探索已记 `unanchored_range_design_2026_06_10.md`**——三档方案 + AllIn-tag 坑 + 实现要点）。
-数据管道 = 可并行后台采集，不卡 B/C、随时可起。**
+⑨ **live 半段数据管道（HH 日志升级 + HH→AIVAT 解析报表 + VF-1 小表）——已落地（2026-06-10，commit `e9b5738`，
+vultr 模块/集成/真 1B selftest 全绿 + 端到端对账）**：driver `--hh-log` 全桌 HH JSONL（actions_ext / names / 回推真栈 /
+hand_result 原样；`Session` 抽路由，selftest 场景 5 钉死挂/不挂 advisor 请求流 byte-equal）→
+`openpoker_hh::hh_to_multiway_input`（×scale + 动作转换重放 + loud Err）→ 新 bin `openpoker_hh_aivat`（raw/AIVAT
+mean±SE mbb/g）；VF-1 = `Vf1DealTable` + 新 bin `vf1_deal_table_build`，**正式表 = preopen 10B 自对弈 1M 手**
+（vultr `artifacts/vf1_deal_table_preopen10b.json`，0 desync、1014/1014 全覆盖、数值合理性抽查过，§3.2 #6 / §4.2）。
+接下来 = **live 实跑采集（HH 管道就绪，等账号上场）** + 覆盖热力图（§4.2 非轻活半段，分类逻辑复用 shadow/off-tree）
++ 脱锚 range 细化（部分前缀 reach / 对手数据，后置；**设计探索已记 `unanchored_range_design_2026_06_10.md`**——
+三档方案 + AllIn-tag 坑 + 实现要点）+ 6-way 深码 build 侧优化（条件项）。**
 
 ---
 
