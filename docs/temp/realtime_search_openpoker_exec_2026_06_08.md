@@ -112,6 +112,8 @@ trigger 都返回 false、测试断言「preflop 不搜」`:1269`，注释也写
 fallback 标记），这正是 §0.1 维度 2 要修的毛病。**这三件已落地（2026-06-09，commit `7413da2`，缺口②，见 §3.2）**：
 `Request` 加 optional `stacks[6]`、`decide()` 真栈 search 分派（`build_real_auth` + `GameState::inject_external_cards`）、
 outgoing 按真栈算尺寸；非 100BB 不再悄悄解错游戏（搜索区解不出来 check-when-free、不回落 blueprint）。守 `search=None` byte-equal。
+**2026-06-10 续：影子失同步区也接入搜索**——off-stack all-in 线 / 真实 4+way / limp 池的触发点不再止步于兜底，走脱影子
+`subgame_search_unanchored`（node_id / 触发 / 子树全来自真栈，range 退 uniform；§3.2 缺口② v1 边界① 已收口）。
 
 ## 2. 三个真实维度 + 各自打法
 
@@ -217,11 +219,24 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      `committed_total` + 各座 remaining（`your_turn.players` / `player_action.stack`）→ 回推 hand-start 真栈送进 `stacks`。
    - **守 `search=None` byte-equal（硬不变量，测试 `search_off_byte_equal_blueprint`）**：未开 `--search` / preflop /
      未触发的 postflop 决策一律走原 100BB blueprint 路径、逐字节等价旧行为；search 只在触发点改输出。
-   - **v1 边界（已知、写进代码 doc）**：①取 `node_id` / `legal_abs` 仍靠 **100BB 影子重放**——**off-stack all-in 线**
-     影子失同步时走 100BB 影子 fallback（`safe_fallback` = check-when-free），拿到 node_id 但真栈树建不了则搜索降级
-     （`search_giveup` = check-when-free）——两者都不回落 blueprint（深码**无 all-in 的 on-tree-preflop 线**是 v1 可搜
-     主场景，覆盖深码 200–500BB SPR）；②子树菜单：默认沿用 blueprint 菜单，**`--search-deep-menu` → 单一 {1pot}**（深码窄菜单 =
-     **缺口③ 已落地**，2026-06-09 commit `0fb41da`，见下缺口③）。
+   - **v1 边界（①已收口）**：①~~取 `node_id` / `legal_abs` 仍靠 100BB 影子重放~~——**已收口（2026-06-10，
+     commit `5c43dd8`/`be4a389`，vultr 全套件 486 passed / 0 failed，脱影子搜索）**。根因核验：off-stack all-in 线的失同步是**结构级**的——blueprint
+     全局树按 100BB 对称栈建，短码 shove 在树里是全栈 all-in，「raise-over / call 完还活着」的后续节点**根本不
+     存在**，影子导航再鲁棒也修不了。修法 = 搜索路径不再要 blueprint 锚：`subgame_search_unanchored`（子树根 /
+     entrants 从真栈轮起点现算 + within-round 导航用当前街真实动作序在子树上重放（tag 以真栈几何经 `map_off_tree`
+     现算、每步 actor 校验）+ **range 先验退 uniform**（§5b 留作 A/B 的那条路；off-100BB 下 blueprint range 本就是
+     「假设 100BB 的 range」§0.3，诚实退化）+ 返回子树自身合法集分布（deep_menu 同契约））。advisor 侧：lockstep
+     失同步且 `--search` 开且 postflop → `decide_search_unanchored`（真栈 auth 判触发 → 脱锚搜索 → outgoing 按真栈 +
+     子树抽象；`source=search:unanchored`）；影子可用时仍走原锚定路径（blueprint range 先验更好）；preflop / 未开
+     搜索维持旧兜底（`search=None` byte-equal 不破）。**连带把 A4 width_redirect 在脱锚子树里关掉**（它是 blueprint
+     训练期的 preflop 收口装置，>N-way 真实局会触发 `build_subtree` 的 ≤N 断言 panic；关掉后解**真游戏宽度**，树宽由
+     `max_subtree_nodes` cap 兜底）→ **真实 4+way 见 flop 的触发点现在可搜**。**重要副作用：limp 池进搜索**——
+     open-limp 在 nolimp 影子上 preflop 即 structural_gap（旧路径整手只能兜底），但 limp 在真栈重放里完全合法 →
+     limp 多人池（真实分布最常见形态）的 flop 触发点从 check-when-free 变成真搜索（测试
+     `limped_pot_flop_searches_unanchored` 钉死）。**残留边界**：脱锚搜索 range = uniform（对手建模 / 部分前缀 reach
+     是后续细化）；blueprint 区（preflop + 未触发 postflop）的影子失同步仍走旧兜底（修不了、也不该用搜索接管）。
+     ②子树菜单：默认沿用 blueprint 菜单，**`--search-deep-menu` → 单一 {1pot}**（深码窄菜单 = **缺口③ 已落地**，
+     2026-06-09 commit `0fb41da`，见下缺口③；脱锚路径同样支持 deep_menu）。
 3. **深码窄菜单解到终局**：深码 = 把下注菜单收到**单一 {1pot}**（短码可放宽）、解到终局用真实 `payouts()`，在 `time_budget`
    内尽力解、不保证收敛（anytime + LCFR，缺口①）。核心工程 = 「**时限内把 {1pot} 窄树解到终局**」（不重建叶子值，缘由见 §6 #2）。
    - **已落地（2026-06-09，commit `0fb41da`，vultr 全绿）**：`{1pot}` 菜单（`deep_single_pot`）**接进 `subgame_search` + 生产
@@ -375,10 +390,9 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
 
 **两个目的：**
 1. **统计真实分布覆盖热力图**：给出**频率先验**。注意频率 ≠ EV 影响——一个罕见但高 EV 的情况（比如深码 SPR 转折点 /
-   4-way squeeze 阈值）该先做、但频率低。优先级真正的判据 = blueprint 在该格的 EV 损失（能从结构上证它“解错游戏”）× 频率；
-   热力图和 §0.3 那套确定性 / 可证伪的先验**一起**排序，不单靠某一个定死优先级。这条联合排序也决定 **A 闭环后先攻深码（B）
-   还是多人（C）的分叉**：由「EV 损失 × 频率」最高、且离线锚 / 功效预算就绪的那一格决定，而不是 §4.1 表里
-   B 在 C 前的固定枚举。
+   4-way squeeze 阈值）该先做、但频率低。**（2026-06-10 用户拍板修正：B/C 直接推进、不等这条排序）**——原定「『EV 损失
+   × 频率』联合排序决定先攻深码（B）还是多人（C）」不再作为 B/C 的前置：热力图降级为**并行参考**（之后用于校准触发面 /
+   读数分桶），B/C 按工程就绪度直接推进，不被数据管道卡住。
 2. **攒对手数据**（剥削加分项后置用）+ 验证对手 name 是否稳定可追踪（稳 → 逐个对手建模；不稳 → 按 population 建模）。
 
 **放行判据**：字段齐 / 摊牌名字捕到；advisor 挂 / 不挂 HH 日志 byte-equal；每格 blueprint 缺席率 + fallback 率出图。
@@ -472,15 +486,21 @@ A①引擎在深码 / 不对称 / 多人 side-pot 上经 `build_subtree` 守恒 
 残留 = build 侧优化（若要把 6-way 深码拉进 5s 必走）。③ **缺口② 生产 advisor 重建——已落地（2026-06-09，commit `7413da2`，
 vultr 全绿）**：`openpoker_advisor` Request 加 optional `stacks[6]` + `decide()` 分派 `subgame_search`（`build_real_auth` 真栈
 重放 + `GameState::inject_external_cards` 注入真牌）+ outgoing 按真码深 + 解不出来 check-when-free 不回落 + python driver 回推 hand-start
-真栈送 `stacks`；守 `search=None` / preflop / 未触发 byte-equal（测试钉死，§3.2 缺口②）。**v1 边界**：node_id 仍靠 100BB 影子
-（off-stack all-in 线失同步 → 降级 check-when-free；深码无 all-in 的 on-tree-preflop 线可搜）；子树用 blueprint 菜单（深码 {1pot} = 缺口③）。
-④ **转 B/C（下一步真正的推进）**：B-vs-C **不再由「能否解出来」单一决定**（B 深码 ≤3-way 全可解；C 多人 ≤5-way≤400BB /
-6-way≤150BB 可解，仅 **6-way 深码角落建树 >5s、待 build 优化**）——改由 §4.2「EV 损失 × 频率」+ live 功效预算决定先攻哪格。
-缺口② 落地后**生产 bot 已能在真码深局面解真游戏**；**缺口③ 也已落地（2026-06-09，commit `0fb41da`，vultr 全绿）——
-`--search-deep-menu` 把子树菜单收到单一 {1pot} 接进 advisor，深码 {1pot} 解到终局端到端跑通**（菜单解耦 + 不匹配坑已解，见 §3.2
-缺口③）。接下来 = live 功效预算（统一 mbb/g + 多人 AIVAT 缺口⑥）+ off-stack all-in 线的 node_id 来源（脱离 100BB 影子，v1 边界①）
-+ deep_menu 的两个细化（SPR 自适应菜单宽度 / 配 `AllPostflop` 的 within-round 导航，§3.2 缺口③「仍未做」）。live 功效预算随
-live 半段在步 B/C 前算。数据管道（§4.2）= 可并行后台采集，不卡 A/B/C、随时可起。**
+真栈送 `stacks`；守 `search=None` / preflop / 未触发 byte-equal（测试钉死，§3.2 缺口②）。**v1 边界（当时）**：node_id 仍靠 100BB 影子
+（off-stack all-in 线失同步 → 降级 check-when-free；深码无 all-in 的 on-tree-preflop 线可搜）——**边界① 已由下面 ⑤ 收口（2026-06-10）**；
+子树用 blueprint 菜单（深码 {1pot} = 缺口③）。
+④ **转 B/C（下一步真正的推进）**：**2026-06-10 用户拍板：B/C 直接推进、不等「EV 损失 × 频率」排序**（原定由 §4.2
+热力图 + 功效预算决定先攻哪格；现热力图降为并行参考，不卡 B/C）。可解性边界仍是：B 深码 ≤3-way 全可解；C 多人
+≤5-way≤400BB / 6-way≤150BB 可解，仅 **6-way 深码角落建树 >5s、待 build 优化**。缺口② 落地后**生产 bot 已能在真码深
+局面解真游戏**；**缺口③ 也已落地（2026-06-09，commit `0fb41da`，vultr 全绿）——`--search-deep-menu` 把子树菜单收到单一
+{1pot} 接进 advisor，深码 {1pot} 解到终局端到端跑通**（菜单解耦 + 不匹配坑已解，见 §3.2 缺口③）。
+⑤ **off-stack all-in 线 node_id 脱影子——已落地（2026-06-10，commit `5c43dd8`/`be4a389`，vultr 全绿 486/0，v1 边界① 收口）**：
+`subgame_search_unanchored` + advisor `decide_search_unanchored`（机制 / 根因 / 残留边界见 §3.2 缺口② v1 边界①）。
+覆盖增量 = off-stack all-in 线 + **真实 4+way 触发点**（脱锚子树关 width_redirect、解真游戏宽度）+ **limp 多人池触发点**
+（真实分布最常见形态，原 S5 结构 gap 在触发区收口）；range 先验退 uniform 是已知代价。
+接下来 = live 功效预算（统一 mbb/g + 多人 AIVAT 缺口⑥，B/C live 半的前提）+ deep_menu 的两个细化（SPR 自适应菜单宽度 /
+配 `AllPostflop` 的 within-round 导航，§3.2 缺口③「仍未做」）+ 脱锚 range 细化（部分前缀 reach / 对手数据，后置）。
+live 功效预算随 live 半段在步 B/C 前算。数据管道（§4.2）= 可并行后台采集，不卡 A/B/C、随时可起。**
 
 ---
 
