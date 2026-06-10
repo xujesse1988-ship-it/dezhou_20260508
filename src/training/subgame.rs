@@ -32,11 +32,12 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::abstraction::action::StreetActionAbstraction;
+use crate::abstraction::action::{ActionAbstraction, StreetActionAbstraction};
 use crate::abstraction::bucket_table::BucketTable;
 use crate::abstraction::info::{InfoSetId, StreetTag};
 use crate::core::rng::{ChaCha20Rng, RngSource};
 use crate::core::{Card, PlayerStatus, Street};
+use crate::rules::action::Action;
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::{Game, NodeKind, PlayerId};
@@ -1115,99 +1116,23 @@ pub fn subgame_search(
             raises_on_street,
         )
     };
-    let n_nodes = sub.subtree().num_nodes();
-    if n_nodes == 0 || n_nodes > cfg.max_subtree_nodes {
-        return Err(format!(
-            "subtree 节点数 {n_nodes} 越界（cap {}）",
-            cfg.max_subtree_nodes
-        ));
-    }
-
     // 跑 CFR：master seed + step rng 都由 (cfg.seed, hand_seed, seed_ordinal) 确定派生。
     // RoundStart 下 seed_ordinal = 街索引 → 同一轮多决策的 solve 字节相同（§6 #2 一致性）。
     let master = search_seed(cfg.seed, hand_seed, seed_ordinal);
-    // 缺口①：LCFR 加权（限时第一杠杆，A②）。period 按 cfg.iterations 现算小值（≈ iterations/50，
-    // 落进 with_lcfr_period 要求的 总更新/period∈[20,100]，见 trainer.rs:332）；iterations<50 →
-    // clamp 1。fresh trainer（update_count==0）→ with_lcfr_period 前置满足。LCFR rescale 确定性
-    // （固定迭代 + seed）→ 仍 byte-equal 可复现；vanilla（默认）保持既有行为不变。
-    let base = EsMccfrTrainer::new(sub, master);
-    let mut trainer = if cfg.lcfr {
-        base.with_lcfr_period((cfg.iterations / 50).max(1))
-    } else {
-        base
-    };
-    let mut srng = ChaCha20Rng::from_seed(master ^ 0xC0FF_EE00_C0FF_EE00);
-    // 缺口①本体（§2.3）：time_budget=Some → 墙钟 anytime（跑到 iterations 上限或 wall 达预算就停，
-    // 此时 iterations 退为安全上界）；None → 跑满固定 iterations（既有行为，byte-equal）。budgeted
-    // 下迭代数随机器速度/负载变 → 不可 byte-equal（§2.3），可复现靠固定迭代档 + seeded RNG。
-    let deadline = cfg.time_budget.map(|_| Instant::now());
-    let mut done: u64 = 0;
-    for _ in 0..cfg.iterations {
-        trainer
-            .step(&mut srng)
-            .map_err(|e| format!("subgame CFR step 失败: {e:?}"))?;
-        done += 1;
-        if let (Some(start), Some(budget)) = (deadline, cfg.time_budget) {
-            if start.elapsed() >= budget {
-                break;
-            }
-        }
-    }
-    if cfg.time_budget.is_some() && done == 0 {
-        // 连一轮 CFR 迭代都没完成（iterations==0 的退化配置）→ 直接 fold（§2.3 降级，不回落
-        // blueprint）。够不够*有用*迭代由下方「当前桶未被访问 → Err」继续兜。
-        return Err("time_budget 内连一轮 CFR 迭代都未完成（→ fold）".to_string());
-    }
+    let trainer = solve_subgame(sub, cfg, master)?;
 
-    // 导航到当前决策点（within-round tags 在 subtree 上重放；CurrentDecision 时 tags 空 → root）。
+    // 导航到当前决策点（within-round tags 在 subtree 上重放；CurrentDecision 时 tags 空 → root），
+    // 用 auth 几何读真实手在落点的平均策略（actor 校验 + 维度检查见 read_current_strategy）。
     let cur_node = navigate_subtree(trainer.game().subtree(), &within_round_tags)?;
-    // 导航落点的决策者须 == 权威当前 actor（否则读到错座的真实手 → 失同步）。
-    let cur_actor = trainer.game().subtree().node(cur_node).player_acting;
-    if cur_actor != auth_actor {
-        return Err(format!(
-            "within-round 导航落点 actor {cur_actor} ≠ 权威当前 actor {auth_actor}（失同步）"
-        ));
-    }
-    // 取 actor 真实手在 cur_node 的策略（average strategy）。**用 auth 几何 query**——cur_node 是
-    // 当前街 betting 后的深层节点，其合法集须用当前几何算（RoundStart 的 round-start template
-    // 几何不符，见 query_at doc）。读 off 的 board/真实手在 auth 与 root_state 同（同街不变）。
-    let (info, sub_legal) = trainer.game().query_at(cur_node, auth);
-    let avg = trainer.average_strategy(&info);
-    if avg.is_empty() {
-        return Err(
-            "subgame 当前决策 infoset 未被 CFR 访问（该 bucket 在 iterations 内未采样到）"
-                .to_string(),
-        );
-    }
-    if avg.len() != sub_legal.len() {
-        return Err(format!(
-            "subgame 当前决策策略维度 {} ≠ 合法动作数 {}",
-            avg.len(),
-            sub_legal.len()
-        ));
-    }
+    let (avg, sub_legal) = read_current_strategy(&trainer, cur_node, auth, auth_actor)?;
 
     // 缺口③ deep_menu（§2.1）：子树菜单（{1pot}）与调用方 blueprint `legal_abs` 不同
     // （{1pot} ⊊ blueprint），**不能对齐 legal_abs**（强行对齐时 blueprint 多出的档如 0.5pot
     // 找不到对应 = 必 Err）。直接返回**子树自身合法集** `sub_legal` 上的分布：动作对象携带按
     // `auth` 真实 pot 算出的 `to`/`ratio_label`（query_at 用 auth 几何，§query_at doc），调用方
-    // 用 {1pot} 抽象 outgoing（advisor deep 路径）即自洽。只保留正概率动作 + 归一（同非 deep 路径）。
+    // 用 {1pot} 抽象 outgoing（advisor deep 路径）即自洽（self_distribution）。
     if cfg.deep_menu {
-        let mut out: Vec<(SimplifiedNlheAction, f64)> = Vec::with_capacity(sub_legal.len());
-        let mut sum = 0.0_f64;
-        for (a, &p) in sub_legal.iter().zip(avg.iter()) {
-            if p.is_finite() && p > 0.0 {
-                sum += p;
-                out.push((*a, p));
-            }
-        }
-        if !(sum.is_finite() && sum > 0.0) {
-            return Err("subgame(deep_menu) 当前决策策略全零".to_string());
-        }
-        for (_, p) in out.iter_mut() {
-            *p /= sum;
-        }
-        return Ok(out);
+        return self_distribution(&sub_legal, &avg);
     }
 
     // 按 tag 把 subtree 策略对齐到调用方 legal_abs：返回的动作对象必须是**影子的**
@@ -1241,6 +1166,283 @@ pub fn subgame_search(
         *p /= sum;
     }
     Ok(out)
+}
+
+/// 共享求解段（[`subgame_search`] blueprint 锚 / [`subgame_search_unanchored`] 真栈锚共用）：
+/// 子树节点数 cap → 建 trainer（LCFR 可选）→ 求解（固定迭代或墙钟 anytime）。逐字保持原
+/// `subgame_search` 求解段的操作顺序 / RNG 流（既有 probe / advisor / §11.5 基线 byte-equal）。
+fn solve_subgame(
+    sub: SubgameNlheGame,
+    cfg: &SubgameSearchConfig,
+    master: u64,
+) -> Result<EsMccfrTrainer<SubgameNlheGame>, String> {
+    let n_nodes = sub.subtree().num_nodes();
+    if n_nodes == 0 || n_nodes > cfg.max_subtree_nodes {
+        return Err(format!(
+            "subtree 节点数 {n_nodes} 越界（cap {}）",
+            cfg.max_subtree_nodes
+        ));
+    }
+    // 缺口①：LCFR 加权（限时第一杠杆，A②）。period 按 cfg.iterations 现算小值（≈ iterations/50，
+    // 落进 with_lcfr_period 要求的 总更新/period∈[20,100]，见 trainer.rs:332）；iterations<50 →
+    // clamp 1。fresh trainer（update_count==0）→ with_lcfr_period 前置满足。LCFR rescale 确定性
+    // （固定迭代 + seed）→ 仍 byte-equal 可复现；vanilla（默认）保持既有行为不变。
+    let base = EsMccfrTrainer::new(sub, master);
+    let mut trainer = if cfg.lcfr {
+        base.with_lcfr_period((cfg.iterations / 50).max(1))
+    } else {
+        base
+    };
+    let mut srng = ChaCha20Rng::from_seed(master ^ 0xC0FF_EE00_C0FF_EE00);
+    // 缺口①本体（§2.3）：time_budget=Some → 墙钟 anytime（跑到 iterations 上限或 wall 达预算就停，
+    // 此时 iterations 退为安全上界）；None → 跑满固定 iterations（既有行为，byte-equal）。budgeted
+    // 下迭代数随机器速度/负载变 → 不可 byte-equal（§2.3），可复现靠固定迭代档 + seeded RNG。
+    let deadline = cfg.time_budget.map(|_| Instant::now());
+    let mut done: u64 = 0;
+    for _ in 0..cfg.iterations {
+        trainer
+            .step(&mut srng)
+            .map_err(|e| format!("subgame CFR step 失败: {e:?}"))?;
+        done += 1;
+        if let (Some(start), Some(budget)) = (deadline, cfg.time_budget) {
+            if start.elapsed() >= budget {
+                break;
+            }
+        }
+    }
+    if cfg.time_budget.is_some() && done == 0 {
+        // 连一轮 CFR 迭代都没完成（iterations==0 的退化配置）→ 直接 fold（§2.3 降级，不回落
+        // blueprint）。够不够*有用*迭代由「当前桶未被访问 → Err」（read_current_strategy）继续兜。
+        return Err("time_budget 内连一轮 CFR 迭代都未完成（→ fold）".to_string());
+    }
+    Ok(trainer)
+}
+
+/// 读当前决策点策略（共享）：导航落点的决策者须 == 权威当前 actor（否则读到错座的真实手 →
+/// 失同步）；取 actor 真实手在 cur_node 的 average strategy。**用 auth 几何 query**——cur_node
+/// 是当前街 betting 后的深层节点，其合法集须用当前几何算（RoundStart 的 round-start template
+/// 几何不符，见 [`SubgameNlheGame::query_at`] doc）。
+fn read_current_strategy(
+    trainer: &EsMccfrTrainer<SubgameNlheGame>,
+    cur_node: NodeId,
+    auth: &GameState,
+    auth_actor: PlayerId,
+) -> Result<(Vec<f64>, Vec<SimplifiedNlheAction>), String> {
+    let cur_actor = trainer.game().subtree().node(cur_node).player_acting;
+    if cur_actor != auth_actor {
+        return Err(format!(
+            "within-round 导航落点 actor {cur_actor} ≠ 权威当前 actor {auth_actor}（失同步）"
+        ));
+    }
+    let (info, sub_legal) = trainer.game().query_at(cur_node, auth);
+    let avg = trainer.average_strategy(&info);
+    if avg.is_empty() {
+        return Err(
+            "subgame 当前决策 infoset 未被 CFR 访问（该 bucket 在 iterations 内未采样到）"
+                .to_string(),
+        );
+    }
+    if avg.len() != sub_legal.len() {
+        return Err(format!(
+            "subgame 当前决策策略维度 {} ≠ 合法动作数 {}",
+            avg.len(),
+            sub_legal.len()
+        ));
+    }
+    Ok((avg, sub_legal))
+}
+
+/// 子树**自身合法集**上的归一分布（deep_menu / unanchored 共用的返回契约）：只保留正概率
+/// 动作 + 归一。动作对象携带按 `auth` 真实 pot 算出的 `to`/`ratio_label`（query_at 用 auth
+/// 几何），调用方须用与子树同一抽象做 outgoing。
+fn self_distribution(
+    sub_legal: &[SimplifiedNlheAction],
+    avg: &[f64],
+) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    let mut out: Vec<(SimplifiedNlheAction, f64)> = Vec::with_capacity(sub_legal.len());
+    let mut sum = 0.0_f64;
+    for (a, &p) in sub_legal.iter().zip(avg.iter()) {
+        if p.is_finite() && p > 0.0 {
+            sum += p;
+            out.push((*a, p));
+        }
+    }
+    if !(sum.is_finite() && sum > 0.0) {
+        return Err("subgame 当前决策策略（子树自身合法集）全零".to_string());
+    }
+    for (_, p) in out.iter_mut() {
+        *p /= sum;
+    }
+    Ok(out)
+}
+
+/// 真栈版 within-round 导航（缺口②续：node_id 来源脱离 100BB 影子）：从 subtree root 起，把
+/// 当前街**真实动作序**逐个译成抽象 tag 并沿边推进——tag 以**真栈几何**现算（aggressive 经
+/// [`ActionAbstraction::map_off_tree`]，状态从 `root_real` 沿真实动作 apply 推进），不读 blueprint
+/// 全局树。每步校验子树节点决策者 == 真实状态当前行动者（错位 = 失同步 → `Err`，拒绝静默走错
+/// 路径）。子树与 tag 建在**同一**真栈几何上 → on-menu 动作必命中；真 all-in / 最近档在该几何
+/// 塌进 AllIn 槽 → AllIn（与 [`advance_shadow_by_applied`] incoming 同义，参考系换成真栈）。
+///
+/// [`advance_shadow_by_applied`]: crate::training::blueprint_advisor::advance_shadow_by_applied
+fn navigate_subtree_by_real_actions(
+    subtree: &PublicBettingTree,
+    abs: &StreetActionAbstraction,
+    root_real: &GameState,
+    actions: &[(Action, bool)],
+) -> Result<NodeId, String> {
+    let mut state = root_real.clone();
+    let mut id = subtree.root_id();
+    for (applied, applied_is_all_in) in actions {
+        let node = subtree.node(id);
+        let cur = state
+            .current_player()
+            .ok_or("真栈导航：中途状态无行动者（与动作序不符）")?;
+        if node.player_acting != cur.0 as PlayerId {
+            return Err(format!(
+                "真栈导航：子树节点决策者 {} ≠ 真实行动者 {}（失同步）",
+                node.player_acting, cur.0
+            ));
+        }
+        let has = |t: AbstractActionTag| node.legal_actions.contains(&t);
+        let tag = match applied {
+            Action::Fold => AbstractActionTag::Fold,
+            Action::Check => AbstractActionTag::Check,
+            Action::Call => {
+                if has(AbstractActionTag::Call) {
+                    AbstractActionTag::Call
+                } else if *applied_is_all_in && has(AbstractActionTag::AllIn) {
+                    // all-in 跟注：该 Call 在子树折进 AllIn 槽（AA-004-rev1，advance_shadow 同义）。
+                    AbstractActionTag::AllIn
+                } else {
+                    return Err("真栈导航：被动 Call 在子树无对应（结构性 gap）".to_string());
+                }
+            }
+            Action::AllIn => AbstractActionTag::AllIn,
+            Action::Bet { to } | Action::Raise { to } => {
+                let raw = AbstractActionTag::of(&abs.map_off_tree(&state, *to));
+                if *applied_is_all_in || !has(raw) {
+                    // 真 all-in / 最近档不在子树合法集（该档在此几何塌进 AllIn 槽）→ AllIn。
+                    AbstractActionTag::AllIn
+                } else {
+                    raw
+                }
+            }
+        };
+        let idx = node
+            .legal_actions
+            .iter()
+            .position(|t| *t == tag)
+            .ok_or_else(|| format!("真栈导航：tag {tag:?} 不在子树节点 {id} 合法集（失同步）"))?;
+        match node.children[idx] {
+            Child::Decision(next) => id = next,
+            Child::Terminal => {
+                return Err(format!("真栈导航：tag {tag:?} 导向子树终局（不应到达）"))
+            }
+        }
+        state
+            .apply(*applied)
+            .map_err(|e| format!("真栈导航：apply({applied:?}) 非法: {e:?}"))?;
+    }
+    Ok(id)
+}
+
+/// 缺口②续（exec 文档 v1 边界①）：**真栈锚**子博弈搜索——node_id 不再来自 100BB 影子 /
+/// blueprint 全局树。off-stack all-in 线上 blueprint 树**结构性缺节点**（树按 100BB 对称栈建：
+/// 短码 30BB shove 在 100BB 树里是全栈 all-in，「raise-over / call 完还活着」的后续节点根本
+/// 不存在），影子导航再鲁棒也修不了 → 本入口把搜索需要的全部上下文改从**真栈**取：
+///
+/// - 子树根 = `root_state`（当前街轮起点快照，[`ResolveRoot::RoundStart`]）；entrants = 轮起点
+///   live bitmask；raises_on_street = 0（轮起点）；
+/// - within-round 导航 = 当前街真实动作序在子树上重放（[`navigate_subtree_by_real_actions`]，
+///   tag 以真栈几何现算）；`within_round` 元素 = `(动作, 该动作是否令行动者 all-in)`；
+/// - **range 先验退 uniform**（`cfg.use_blueprint_range` 被忽略）：blueprint reach 要沿全局树
+///   路径累乘，而该路径在 off-stack 线上不存在；uniform 即 §5b 留作 A/B 的那条路，且 off-100BB
+///   下 blueprint range 本就是「假设 100BB 的 range」（exec 文档 §0.3）——诚实退化、不假装有先验；
+/// - 返回**子树自身合法集**上的分布（同 `deep_menu` 契约，[`self_distribution`]）：调用方用与
+///   子树同一抽象（`deep_menu` → {1pot}，否则 blueprint 菜单）按 `auth` 真实几何做 outgoing。
+///
+/// 仅支持 postflop + [`ResolveRoot::RoundStart`]（preflop 走 blueprint，§1 gating；
+/// `CurrentDecision` 是影子锚的 A/B 旧模式、不在生产路径）；`depth_limit` 需要 blueprint 树锚做
+/// 叶子映射 → 不支持。失败语义同 [`subgame_search`]：`Err` → 调用方降级 check-when-free、不回落
+/// blueprint（§2.3）。
+pub fn subgame_search_unanchored(
+    auth: &GameState,
+    root_state: &GameState,
+    game: &SimplifiedNlheGame,
+    within_round: &[(Action, bool)],
+    cfg: &SubgameSearchConfig,
+    hand_seed: u64,
+) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    if auth.is_terminal() || auth.current_player().is_none() {
+        return Err("subgame_search_unanchored: auth 非 decision 节点".to_string());
+    }
+    if root_state.is_terminal() || root_state.current_player().is_none() {
+        return Err("subgame_search_unanchored: root_state 非 decision 节点".to_string());
+    }
+    if cfg.depth_limit {
+        return Err(
+            "subgame_search_unanchored: depth_limit 需要 blueprint 树锚（叶子映射），不支持"
+                .to_string(),
+        );
+    }
+    if cfg.resolve_root != ResolveRoot::RoundStart {
+        return Err(
+            "subgame_search_unanchored: 仅支持 RoundStart（CurrentDecision 是影子锚的 A/B 旧模式）"
+                .to_string(),
+        );
+    }
+    let auth_actor = auth.current_player().expect("checked above").0 as PlayerId;
+    if root_state.street() != auth.street() {
+        return Err("subgame_search_unanchored: root_state 与 auth 不同街".to_string());
+    }
+    // postflop 限定（preflop 走 blueprint，§1 gating；StreetTag 无 Showdown）。street_tag 兼作
+    // round-stable seed ordinal——与 anchored RoundStart 同口径（同手同街 → 同 solve）。
+    let street_tag = match auth.street() {
+        Street::Flop => StreetTag::Flop,
+        Street::Turn => StreetTag::Turn,
+        Street::River => StreetTag::River,
+        _ => {
+            return Err(
+                "subgame_search_unanchored: 仅 postflop（preflop 走 blueprint）".to_string(),
+            )
+        }
+    };
+
+    // 子树菜单：deep_menu → {1pot} 单档（缺口③）；否则 blueprint 自身抽象/规则（与 anchored 一致）。
+    let (sub_abs, mut sub_rules) = if cfg.deep_menu {
+        deep_single_pot()
+    } else {
+        (game.abstraction().clone(), game.rules())
+    };
+    // 真栈子树解**真游戏宽度**：A4 width_redirect 是 blueprint 训练期的 preflop 收口装置
+    // （>N-way 历史在 100BB 影子上必 desync、根本到不了锚定路径），真实牌局 4+way 见 flop 合法
+    // 且常见（主目标分布，§2.2）。脱影子子树从 postflop 根建——redirect 只影响 preflop 菜单 +
+    // 触发 build_subtree 的 ≤N 断言（panic，live 不可崩）——关掉它让真 N-way 子树可建，树宽由
+    // max_subtree_nodes cap 兜底（越界 → Err → check-when-free）。deep_single_pot 的 rules 本即
+    // default（无 redirect），两路一致。
+    sub_rules.width_redirect = BettingAbstractionRules::WIDTH_REDIRECT_OFF;
+    // 真栈锚上下文：entrants = 轮起点 live bitmask；raises_on_street = 0（轮起点）；range =
+    // uniform（SubgameNlheGame::new 的 root uniform resample，无 ranges）。
+    let entrants = live_entrants(root_state);
+    let sub = SubgameNlheGame::new(
+        Arc::clone(&game.bucket_table),
+        root_state.config().clone(),
+        sub_abs.clone(), // 真栈导航还要同一抽象现算 tag
+        sub_rules,
+        root_state.clone(),
+        entrants,
+        0,
+    );
+    let master = search_seed(cfg.seed, hand_seed, street_tag as u64);
+    let trainer = solve_subgame(sub, cfg, master)?;
+    let cur_node = navigate_subtree_by_real_actions(
+        trainer.game().subtree(),
+        &sub_abs,
+        root_state,
+        within_round,
+    )?;
+    let (avg, sub_legal) = read_current_strategy(&trainer, cur_node, auth, auth_actor)?;
+    self_distribution(&sub_legal, &avg)
 }
 
 #[cfg(test)]
@@ -2987,5 +3189,126 @@ mod tests {
                 ent
             );
         }
+    }
+
+    // —— 缺口②续：subgame_search_unanchored（node_id 脱离 100BB 影子）——
+
+    /// 6-max nolimp（N=2 redirect、stub 桶）game：unanchored 只用它的桶表 + 抽象/规则，
+    /// 不读它的 100BB 全局树（这正是被测性质）。
+    fn nolimp_6max_game() -> SimplifiedNlheGame {
+        let (a, mut r) = first_small_6max(2);
+        r.no_open_limp = true;
+        SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::default_6max_100bb(),
+            a,
+            r,
+        )
+        .expect("6max nolimp game")
+    }
+
+    /// 构造一个 **off-stack all-in 线**的真栈中途局（blueprint 100BB 树上结构性缺节点的目标
+    /// 场景）：UTG 短码 30BB open-shove → HJ/CO/BTN fold → SB raise-over 到 60BB → BB call →
+    /// flop（UTG capped all-in，SB/BB live，SB 首个行动、未起注）。100BB 对称树上「raise-over
+    /// 全栈 all-in 后还有人活着行动」的节点不存在 → 影子 / 全局树导航必失同步。
+    fn offstack_allin_flop_state() -> GameState {
+        let mut cfg = TableConfig::default_6max_100bb();
+        cfg.starting_stacks[3] = ChipAmount::new(3_000); // UTG 短码 30BB（bb=100）。
+        let mut st = GameState::new(&cfg, 0x0FF5_7ACC);
+        assert_eq!(
+            st.current_player(),
+            Some(SeatId(3)),
+            "6-max preflop 首行动 UTG"
+        );
+        st.apply(Action::AllIn).expect("UTG shove 30BB");
+        st.apply(Action::Fold).expect("HJ fold");
+        st.apply(Action::Fold).expect("CO fold");
+        st.apply(Action::Fold).expect("BTN fold");
+        st.apply(Action::Raise {
+            to: ChipAmount::new(6_000),
+        })
+        .expect("SB raise-over 短码 all-in 到 60BB（真栈下合法）");
+        st.apply(Action::Call).expect("BB call 60BB");
+        assert_eq!(
+            st.street(),
+            Street::Flop,
+            "UTG capped、SB/BB matched → flop"
+        );
+        assert_eq!(st.current_player(), Some(SeatId(1)), "flop 首行动 = SB");
+        st
+    }
+
+    /// unanchored 在 off-stack all-in 线上可解 + 分布归一 + 同 seed 可复现（核心契约：这条线
+    /// 在 100BB 影子上拿不到 node_id，真栈锚是唯一入口）。
+    #[test]
+    fn unanchored_offstack_allin_line_solves_and_reproducible() {
+        let game = nolimp_6max_game();
+        let auth = offstack_allin_flop_state();
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        // flop 首决策点：round-start == 当前点，within-round 动作序空。
+        let run = || subgame_search_unanchored(&auth, &auth, &game, &[], &cfg, 0xD15C);
+        let d1 = run().expect("off-stack all-in 线 unanchored 应可解");
+        let sum: f64 = d1.iter().map(|(_, p)| p).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "分布应归一，和={sum}");
+        assert!(d1.iter().all(|(_, p)| *p > 0.0 && p.is_finite()));
+        let d2 = run().expect("再跑一次");
+        assert_eq!(
+            format!("{d1:?}"),
+            format!("{d2:?}"),
+            "同 seed unanchored 须可复现"
+        );
+    }
+
+    /// within-round 真实动作导航：SB check 后 BB 决策——round-start 重解 + [(Check, false)]
+    /// 导航到 check 后节点、读 BB 策略（钉 navigate_subtree_by_real_actions 的非空路径）。
+    #[test]
+    fn unanchored_within_round_real_actions_navigate() {
+        let game = nolimp_6max_game();
+        let round_start = offstack_allin_flop_state();
+        let mut auth = round_start.clone();
+        auth.apply(Action::Check).expect("SB check");
+        assert_eq!(auth.current_player(), Some(SeatId(2)), "check 后 BB 行动");
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let within = [(Action::Check, false)];
+        let d = subgame_search_unanchored(&auth, &round_start, &game, &within, &cfg, 0xD15D)
+            .expect("within-round check 导航应成功");
+        let sum: f64 = d.iter().map(|(_, p)| p).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "分布应归一，和={sum}");
+    }
+
+    /// 不支持的配置显式 `Err`（不静默择一）：depth_limit（要 blueprint 树锚）/ CurrentDecision
+    /// （影子锚 A/B 旧模式）/ preflop（走 blueprint，§1 gating）。
+    #[test]
+    fn unanchored_rejects_unsupported_configs() {
+        let game = nolimp_6max_game();
+        let auth = offstack_allin_flop_state();
+        let dl = SubgameSearchConfig {
+            depth_limit: true,
+            ..SubgameSearchConfig::default()
+        };
+        assert!(subgame_search_unanchored(&auth, &auth, &game, &[], &dl, 1).is_err());
+        let cd = SubgameSearchConfig {
+            resolve_root: ResolveRoot::CurrentDecision,
+            ..SubgameSearchConfig::default()
+        };
+        assert!(subgame_search_unanchored(&auth, &auth, &game, &[], &cd, 1).is_err());
+        let pre = GameState::new(&TableConfig::default_6max_100bb(), 7);
+        assert!(subgame_search_unanchored(
+            &pre,
+            &pre,
+            &game,
+            &[],
+            &SubgameSearchConfig::default(),
+            1
+        )
+        .is_err());
     }
 }

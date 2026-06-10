@@ -34,11 +34,14 @@
 //! 逐字节等价旧行为（测试 `search_off_byte_equal_blueprint` 钉死）。preflop + 未触发的 postflop
 //! 决策即便开了 `--search` 也走 blueprint 路径（与未开等价）。
 //!
-//! **当前边界（v1）**：①取 `node_id` / `legal_abs` 仍靠 100BB 影子重放——**off-stack all-in 线**
-//! 影子与真栈失同步时拿不到 node_id → 走 100BB fallback / fold（深码无 all-in 的 on-tree-preflop
-//! 线是 v1 可搜的主场景）。②子树下注菜单：默认沿用 blueprint 菜单；**`--search-deep-menu`（缺口③，
-//! 2026-06-09）→ 收到单一 {1pot}**（[`deep_single_pot`]，深码 / 多人解到终局控树，§2.1），此时
-//! outgoing 也用 {1pot} 抽象算尺寸。
+//! **当前边界（v1，①已收口）**：①~~取 `node_id` / `legal_abs` 仍靠 100BB 影子重放~~——
+//! **已收口（2026-06-10，缺口②续）**：影子失同步（off-stack all-in 线：blueprint 树按 100BB 对称
+//! 栈建、该线**结构性缺节点**，影子导航再鲁棒也修不了）且命中触发面 → 走**脱影子**搜索
+//! （[`decide_search_unanchored`]→[`subgame_search_unanchored`]：触发 / 子树根 / within-round 导航
+//! 全来自真栈重放，**range 先验退 uniform**、返回子树自身合法集分布，`source=search:unanchored`）；
+//! 影子可用时仍走原锚定路径（blueprint range 先验更好）。②子树下注菜单：默认沿用 blueprint 菜单；
+//! **`--search-deep-menu`（缺口③，2026-06-09）→ 收到单一 {1pot}**（[`deep_single_pot`]，深码 /
+//! 多人解到终局控树，§2.1），此时 outgoing 也用 {1pot} 抽象算尺寸（脱影子路径同样适用）。
 //!
 //! # 已知限制（blueprint 路径，`...client_design...` §4）
 //!
@@ -63,7 +66,8 @@ use poker::training::nlhe_betting_tree::{
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
-    should_search, subgame_search, ResolveRoot, SearchTrigger, SubgameSearchConfig,
+    should_search, subgame_search, subgame_search_unanchored, ResolveRoot, SearchTrigger,
+    SubgameSearchConfig,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, InfoSetId,
@@ -204,7 +208,9 @@ fn hist_to_concrete(
 /// 查 blueprint → outgoing（旧行为，byte-equal）；`search == Some` 且命中触发面（[`should_search`]）
 /// 时建**真码深** subgame re-solve（[`subgame_search`]；`deep_menu` → 子树用 {1pot} 单档菜单 +
 /// outgoing 用 {1pot} 抽象算尺寸，缺口③）→ outgoing 按真栈算尺寸，解不出来 = check-when-free
-/// （能 check 就 check、否则 fold；不回落 blueprint，§2.3）。任何**前置 / blueprint 路径**失败返回安全兜底（不 panic）。
+/// （能 check 就 check、否则 fold；不回落 blueprint，§2.3）。**lockstep 失同步**（off-stack all-in
+/// 线等）且 `search == Some` 且 postflop → 脱影子搜索（[`decide_search_unanchored`]，缺口②续）；
+/// 其余**前置 / blueprint 路径**失败返回安全兜底（不 panic）。
 fn decide(
     game: &SimplifiedNlheGame,
     abstraction: &StreetActionAbstraction,
@@ -249,46 +255,76 @@ fn decide(
         |op_seat: u8| -> u8 { (op_seat + N_SEATS as u8 - req.button_seat) % N_SEATS as u8 };
     let my_seat_solver = SeatId(bsolver(req.my_seat));
 
-    // —— 两态 lockstep 重放 ——
-    let mut real = poker::GameState::new(&solver_cfg, REAL_REPLAY_SEED);
-    let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
-    let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
-
-    for h in &req.actions {
-        let actor = bsolver(h.seat);
-        if real.current_player() != Some(SeatId(actor)) {
-            // 码深漂移 / 历史错位 → 重放对不上回合 → 兜底。
-            return safe_fallback(&req.valid, "replay_seat_mismatch");
+    // —— 两态 lockstep 重放（blueprint 路径 + 锚定搜索的 node_id / legal_abs 来源）——
+    let lockstep =
+        (|| -> Result<(poker::GameState, SimplifiedNlheState, Vec<AbstractAction>), String> {
+            let mut real = poker::GameState::new(&solver_cfg, REAL_REPLAY_SEED);
+            let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
+            let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
+            for h in &req.actions {
+                let actor = bsolver(h.seat);
+                if real.current_player() != Some(SeatId(actor)) {
+                    // 码深漂移 / 历史错位 → 重放对不上回合。
+                    return Err("replay_seat_mismatch".into());
+                }
+                let to_solver = h.to.map(|t| t * scale);
+                let Some(concrete) = hist_to_concrete(&real, &h.action, to_solver) else {
+                    return Err("bad_hist_action".into());
+                };
+                if real.apply(concrete).is_err() {
+                    return Err("replay_illegal".into());
+                }
+                let is_all_in = real.players()[actor as usize].status == poker::PlayerStatus::AllIn;
+                if advance_shadow_by_applied(&mut abs, concrete, is_all_in, &mut abs_rng).is_err() {
+                    // 结构性 gap（如 open-limp 进 no-limp 影子）→ 失同步（不静默改 kind）。
+                    return Err("structural_gap".into());
+                }
+                if abs.game_state.current_player() != real.current_player() {
+                    return Err("lockstep_drift".into());
+                }
+            }
+            // —— 到我方决策点 ——
+            if real.current_player() != Some(my_seat_solver) {
+                return Err("not_my_turn".into());
+            }
+            let street = real.street();
+            if abs.game_state.street() != street || board.len() != expected_board_len(street) {
+                return Err("street_board_mismatch".into());
+            }
+            let legal_abs = SimplifiedNlheGame::legal_actions(&abs);
+            if legal_abs.is_empty() {
+                return Err("empty_legal".into());
+            }
+            Ok((real, abs, legal_abs))
+        })();
+    let (real, abs, legal_abs) = match lockstep {
+        Ok(t) => t,
+        Err(reason) => {
+            // 100BB 影子失同步（off-stack all-in 线等：blueprint 树按 100BB 对称栈建、该线结构性
+            // 缺节点）：缺口②续——`--search` 开且 postflop → **脱影子**搜索（触发 / 子树根 /
+            // within-round 导航全来自真栈重放，[`subgame_search_unanchored`]）；preflop / 未开
+            // 搜索 → 维持旧兜底（preflop 走 blueprint 的 gating 不变，§1；search=None byte-equal）。
+            if let Some(scfg) = search {
+                if board.len() >= 3 {
+                    return decide_search_unanchored(
+                        game,
+                        abstraction,
+                        req,
+                        base_seed,
+                        scfg,
+                        &solver_cfg,
+                        scale,
+                        my_seat_solver,
+                        hole,
+                        &board,
+                        &reason,
+                    );
+                }
+            }
+            return safe_fallback(&req.valid, &reason);
         }
-        let to_solver = h.to.map(|t| t * scale);
-        let Some(concrete) = hist_to_concrete(&real, &h.action, to_solver) else {
-            return safe_fallback(&req.valid, "bad_hist_action");
-        };
-        if real.apply(concrete).is_err() {
-            return safe_fallback(&req.valid, "replay_illegal");
-        }
-        let is_all_in = real.players()[actor as usize].status == poker::PlayerStatus::AllIn;
-        if advance_shadow_by_applied(&mut abs, concrete, is_all_in, &mut abs_rng).is_err() {
-            // 结构性 gap（如 open-limp 进 no-limp 影子）→ 兜底（不静默改 kind）。
-            return safe_fallback(&req.valid, "structural_gap");
-        }
-        if abs.game_state.current_player() != real.current_player() {
-            return safe_fallback(&req.valid, "lockstep_drift");
-        }
-    }
-
-    // —— 到我方决策点 ——
-    if real.current_player() != Some(my_seat_solver) {
-        return safe_fallback(&req.valid, "not_my_turn");
-    }
+    };
     let street = real.street();
-    if abs.game_state.street() != street || board.len() != expected_board_len(street) {
-        return safe_fallback(&req.valid, "street_board_mismatch");
-    }
-    let legal_abs = SimplifiedNlheGame::legal_actions(&abs);
-    if legal_abs.is_empty() {
-        return safe_fallback(&req.valid, "empty_legal");
-    }
     let node_id = abs.current_node_id;
     let info = game.info_set_for_cards(node_id, hole, &board);
 
@@ -305,9 +341,10 @@ fn decide(
     let dist: Vec<(AbstractAction, f64)> = if want_search {
         let scfg = search.expect("want_search ⇒ search.is_some()");
         // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ 安全降级。
-        let (auth, round_start) =
+        // within-round 动作序仅脱影子路径用（这里 node_id 来自影子，导航走 blueprint 树路径）。
+        let (auth, round_start, _within) =
             match build_real_auth(req, &solver_cfg, scale, my_seat_solver, hole, &board) {
-                Ok(pair) => pair,
+                Ok(t) => t,
                 Err(reason) => return search_giveup(&req.valid, &format!("build:{reason}")),
             };
         let root_state: &GameState = match scfg.resolve_root {
@@ -468,9 +505,12 @@ fn search_giveup(valid: &ValidActions, reason: &str) -> Response {
     }
 }
 
-/// 缺口②：在**真码深** config 上重放本手 → 注入真实牌，产 `(auth, round_start)` 喂
-/// [`subgame_search`]。`auth` = 当前决策点真栈态（query_at 索引 hero 真桶用）；`round_start` =
-/// 当前街起点快照（[`ResolveRoot::RoundStart`] 子树根）。重放对不上 / 注入失败 → `Err`（caller fold）。
+/// 缺口②：在**真码深** config 上重放本手 → 注入真实牌，产 `(auth, round_start, within)` 喂
+/// [`subgame_search`] / [`subgame_search_unanchored`]。`auth` = 当前决策点真栈态（query_at 索引
+/// hero 真桶用）；`round_start` = 当前街起点快照（[`ResolveRoot::RoundStart`] 子树根）；`within` =
+/// **当前街**真实动作序 `(动作, 是否令行动者 all-in)`（街变清空；脱影子路径的 within-round 导航
+/// 输入，锚定路径不读）。重放对不上 / 注入失败 → `Err`（caller 安全降级）。
+#[allow(clippy::type_complexity)]
 fn build_real_auth(
     req: &Request,
     solver_cfg: &TableConfig,
@@ -478,7 +518,7 @@ fn build_real_auth(
     my_seat_solver: SeatId,
     hole: [Card; 2],
     board: &[Card],
-) -> Result<(GameState, GameState), String> {
+) -> Result<(GameState, GameState, Vec<(Action, bool)>), String> {
     let real_cfg = real_stacks_config(req, solver_cfg, scale)?;
     let bsolver =
         |op_seat: u8| -> u8 { (op_seat + N_SEATS as u8 - req.button_seat) % N_SEATS as u8 };
@@ -487,6 +527,7 @@ fn build_real_auth(
     // round_start 快照：街变即重 snapshot（postflop 街起点）；初始 = preflop 起点（不被搜索读）。
     let mut round_start = auth.clone();
     let mut rs_street = auth.street();
+    let mut within: Vec<(Action, bool)> = Vec::new();
     for h in &req.actions {
         let actor = bsolver(h.seat);
         if auth.current_player() != Some(SeatId(actor)) {
@@ -504,9 +545,14 @@ fn build_real_auth(
         if auth.apply(concrete).is_err() {
             return Err("auth_replay_illegal".into());
         }
+        let became_all_in = auth.players()[actor as usize].status == poker::PlayerStatus::AllIn;
         if auth.street() != rs_street {
+            // 收街动作属上一街：清空 within（新街从空动作序开始）、重 snapshot。
             round_start = auth.clone();
             rs_street = auth.street();
+            within.clear();
+        } else {
+            within.push((concrete, became_all_in));
         }
     }
     if auth.current_player() != Some(my_seat_solver) {
@@ -515,7 +561,65 @@ fn build_real_auth(
     // 注入真实牌（hero hole + board）到当前点 + 街起点（subgame solve / query_at 读真牌）。
     let auth = auth.inject_external_cards(my_seat_solver, hole, board)?;
     let round_start = round_start.inject_external_cards(my_seat_solver, hole, board)?;
-    Ok((auth, round_start))
+    Ok((auth, round_start, within))
+}
+
+/// 缺口②续（v1 边界①收口）：**影子失同步区**的脱影子搜索。off-stack all-in 线上 100BB 影子 /
+/// blueprint 全局树**结构性缺节点**（树按 100BB 对称栈建：短码 shove 在树里是全栈 all-in，
+/// 「raise-over / call 完还活着」的后续节点不存在）→ lockstep 重放必失同步、拿不到 node_id。
+/// 本路径把触发判定 / 子树根 / within-round 导航全改从**真栈重放**取
+/// （[`subgame_search_unanchored`]，range 先验退 uniform），返回子树自身合法集分布，outgoing 按
+/// 真栈 `auth` + 与子树同一抽象算尺寸（`source = search:unanchored`）。非搜索区（真栈判未命中
+/// 触发面）→ 维持旧兜底 `fallback:<lockstep 原因>`（blueprint 区由影子承载、这里修不了）；
+/// 真解不出来 → check-when-free（`search_giveup:*`，不回落 blueprint，§2.3）。
+#[allow(clippy::too_many_arguments)]
+fn decide_search_unanchored(
+    game: &SimplifiedNlheGame,
+    abstraction: &StreetActionAbstraction,
+    req: &Request,
+    base_seed: u64,
+    scfg: &SubgameSearchConfig,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    my_seat_solver: SeatId,
+    hole: [Card; 2],
+    board: &[Card],
+    shadow_reason: &str,
+) -> Response {
+    // 真栈重放（auth / 轮起点快照 / 当前街真实动作序）。建不了 = §2.3「建不了树」→ 安全降级。
+    let (auth, round_start, within) =
+        match build_real_auth(req, solver_cfg, scale, my_seat_solver, hole, board) {
+            Ok(t) => t,
+            Err(reason) => return search_giveup(&req.valid, &format!("unanchored_build:{reason}")),
+        };
+    // gating 在真栈 auth 上判（影子失同步、100BB real 不可得；should_search 只读街+本街是否起注）。
+    // 未命中 / board 与真栈街对不上 → 维持旧兜底（非搜索区，labels 与 search=None 同）。
+    if !should_search(&auth, scfg.trigger) || board.len() != expected_board_len(auth.street()) {
+        return safe_fallback(&req.valid, shadow_reason);
+    }
+    let hand_seed = hand_seed_for(req, base_seed);
+    let dist = match subgame_search_unanchored(&auth, &round_start, game, &within, scfg, hand_seed)
+    {
+        Ok(d) => d,
+        Err(reason) => return search_giveup(&req.valid, &format!("unanchored:{reason}")),
+    };
+    // outgoing：真栈 auth + 与子树同一抽象（deep_menu → {1pot}，否则 blueprint 菜单）——
+    // 子树自身合法集契约（同 deep 路径）：chosen 的 ratio 在真实 pot 上重算 to，自洽。
+    let deep_abs: Option<StreetActionAbstraction> = scfg.deep_menu.then(|| deep_single_pot().0);
+    let outgoing_abs: &StreetActionAbstraction = deep_abs.as_ref().unwrap_or(abstraction);
+    let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed));
+    let chosen = sample_discrete(&dist, &mut sample_rng);
+    let solver_action = match outgoing_action(&auth, outgoing_abs, chosen) {
+        Ok(a) => a,
+        Err(_) => return safe_fallback(&req.valid, "outgoing_failed"),
+    };
+    let mut resp = action_to_response(solver_action, scale, &req.valid);
+    if resp.source.is_empty() {
+        resp.source = "search:unanchored".into();
+        resp.street = Some(street_label(auth.street()).into());
+        resp.chosen = Some(action_label(&chosen));
+    }
+    resp
 }
 
 /// 真码深 [`TableConfig`]：各座起始栈 = OpenPoker hand-start 栈 × `scale`（座位按相对 button
@@ -1233,5 +1337,160 @@ mod tests {
         );
         let again = decide(&game, &abs, &uniform, &req, 0xDEE9, Some(&scfg));
         assert_eq!(resp, again, "同 seed deep_menu 搜索须确定性（可复现）");
+    }
+
+    // —— 缺口②续：脱影子搜索（off-stack all-in 线，v1 边界①收口）——
+
+    /// **off-stack all-in 线**请求：UTG 短码 30BB（600op）open-shove → HJ/CO/BTN fold →
+    /// SB raise-over 到 60BB（1200op，真栈下合法）→ BB call → flop（UTG capped、SB/BB live、
+    /// SB=我 首个行动、未起注）。100BB 影子里 UTG 的 all-in 是全栈（10000 solver）→ SB 的
+    /// raise to 6000 < 10000 非法 → lockstep 必失同步（replay_illegal），旧路径拿不到 node_id。
+    fn offstack_allin_req() -> Request {
+        Request {
+            hole: vec!["Ah".into(), "Kd".into()],
+            board: vec!["7h".into(), "2c".into(), "Ks".into()],
+            button_seat: 0,
+            my_seat: 1,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                HistAction {
+                    seat: 3,
+                    action: "all_in".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 4,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 5,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 0,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 1,
+                    action: "raise".into(),
+                    to: Some(1200),
+                },
+                HistAction {
+                    seat: 2,
+                    action: "call".into(),
+                    to: None,
+                },
+            ],
+            valid: ValidActions {
+                can_check: true,
+                can_call: false,
+                can_raise: true,
+                min_raise: Some(20),
+                max_raise: Some(2800),
+            },
+            // op 单位 hand-start 真栈：UTG 600=30BB、SB/BB 4000=200BB、其余 2000=100BB。
+            stacks: vec![2000, 4000, 4000, 600, 2000, 2000],
+        }
+    }
+
+    /// 端到端钉缺口②续：off-stack all-in 线上 ①search=None（旧路径）确证 lockstep 失同步 →
+    /// 兜底（这条线在 100BB 影子上**拿不到 node_id**，测试前提）；②`--search` 开 → 脱影子真栈
+    /// 搜索接管（source=search:unanchored、动作合法、同 seed 可复现）。
+    #[test]
+    fn offstack_allin_line_searches_unanchored() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let req = offstack_allin_req();
+        // 前提确证：旧路径（search=None）必兜底。
+        let off = decide(&game, &abs, &uniform, &req, 0x0FF5, None);
+        assert!(
+            off.source.starts_with("fallback:"),
+            "100BB 影子在 raise-over 短码 all-in 线上应失同步 → 兜底，得 {off:?}"
+        );
+        // --search 开：脱影子搜索接管（FlopFirstUnraised 在真栈 auth 上命中）。
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let resp = decide(&game, &abs, &uniform, &req, 0x0FF5, Some(&scfg));
+        assert!(
+            is_legal(&resp, &req.valid),
+            "脱影子搜索动作须合法，得 {resp:?}"
+        );
+        assert_eq!(
+            resp.source, "search:unanchored",
+            "off-stack all-in 线应由脱影子搜索接管（stub 桶 root 必累积），得 {resp:?}"
+        );
+        let again = decide(&game, &abs, &uniform, &req, 0x0FF5, Some(&scfg));
+        assert_eq!(resp, again, "同 seed 脱影子搜索须确定性（可复现）");
+    }
+
+    /// 脱影子 × 缺口③ deep_menu：同一 off-stack all-in 线，{1pot} 单档子树仍解出 + 合法 +
+    /// source=search:unanchored（子树抽象与 outgoing 自洽，{1pot} 在真栈 pot 上重算 to）。
+    #[test]
+    fn offstack_allin_unanchored_deep_menu_legal() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let req = offstack_allin_req();
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            deep_menu: true,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let resp = decide(&game, &abs, &uniform, &req, 0x0FF6, Some(&scfg));
+        assert!(
+            is_legal(&resp, &req.valid),
+            "脱影子 {{1pot}} 搜索动作须合法，得 {resp:?}"
+        );
+        assert_eq!(resp.source, "search:unanchored", "得 {resp:?}");
+    }
+
+    /// 影子失同步但 **preflop**（结构 gap：open-limp 进 nolimp）：即便开 `--search` 也不搜
+    /// （preflop 走 blueprint 的 gating 不变，§1）→ 与 search=None 完全相同的旧兜底（byte-equal）。
+    #[test]
+    fn preflop_shadow_gap_with_search_still_falls_back() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        // 同 opponent_open_limp_into_nolimp_falls_back：UTG open-limp → 结构性 gap。
+        let req = Request {
+            hole: vec!["Ah".into(), "Kd".into()],
+            board: vec![],
+            button_seat: 0,
+            my_seat: 4,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![HistAction {
+                seat: 3,
+                action: "call".into(),
+                to: Some(20),
+            }],
+            valid: full_valid(),
+            stacks: vec![],
+        };
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        };
+        let off = decide(&game, &abs, &uniform, &req, 1, None);
+        let on = decide(&game, &abs, &uniform, &req, 1, Some(&scfg));
+        assert_eq!(
+            off, on,
+            "preflop 影子失同步：开关搜索须 byte-equal（都旧兜底）"
+        );
+        assert!(on.source.starts_with("fallback:"), "得 {on:?}");
     }
 }

@@ -294,13 +294,14 @@ def _handle_your_turn(ws, advisor, state, msg, counters, client_action_id, send,
         print(f"  [advisor 异常] {e} → fold 兜底", file=sys.stderr)
         resp = {"action": "fold", "source": "fallback:advisor_exception"}
     counters["decisions"] += 1
-    # source 分桶（缺口②）：blueprint=blueprint 策略；search=实时搜索解出；fallback=兜底（blueprint
-    # 结构性 fallback:* + 搜索解不出来 search_giveup:* 都算「兜底」§4.1 护栏）。
+    # source 分桶（缺口②）：blueprint=blueprint 策略；search=实时搜索解出（含脱影子
+    # search:unanchored，缺口②续）；fallback=兜底（blueprint 结构性 fallback:* + 搜索解不出来
+    # search_giveup:* 都算「兜底」§4.1 护栏）。注意顺序：search_giveup 也以 "search" 开头，先判兜底。
     src = str(resp.get("source", ""))
-    if src == "search":
-        counters["search"] += 1
-    elif src.startswith("fallback") or src.startswith("search_giveup"):
+    if src.startswith("fallback") or src.startswith("search_giveup"):
         counters["fallback"] += 1
+    elif src.startswith("search"):
+        counters["search"] += 1
     else:
         counters["blueprint"] += 1
     client_action_id[0] += 1
