@@ -219,6 +219,19 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      byte-equal 不动；锚定 / 脱锚两路都吃缓存，kind 进 key 不串条目；depth_limit 路径不缓存——key 须带 blueprint 树
      叶子映射身份，非生产路径）。固定迭代下命中输出 byte-equal 从头重解（测试钉死：hit/miss 计数硬证不重解 + 换
      hand_seed / iterations / root 几何必 miss + advisor 端到端 mid-round 命中 `search_within_round_cache_hits_and_byte_equal`）。
+   - **live_traversers 已落地（2026-06-10，commit `7546c0b`，vultr 全绿 500/0，限时杠杆②、与 LCFR 正交）**：
+     `EsMccfrTrainer::step` 的 alternating traverser 按 `config.n_seats`（=6）全座轮转，而子树里**弃牌 / all-in 座
+     零决策节点**（规则引擎只让 `Active` 座当 `current_player`、σ/regret 都只在 `actor == traverser` 节点累积）→
+     轮到它们的迭代**纯零学习**、成本照付（root resample + 路径遍历）。浪费比 = `(n_seats−n_active)/n_seats`：
+     fold 剩 3 人 = 50%、剩 2 人（live 最常见形态）= **67% → 修复后同 wall 有效迭代 ×2-3**（h2h `SearchObserver`
+     的浪费遥测量的就是它，现已感知该旗：开修复浪费记 0）。实现 = `EsMccfrTrainer::with_traverser_rotation`
+     （默认 `None` = 既有全座轮转逐位不变、不存 checkpoint；轮转 = 全集时与默认**逐位等价**，测试钉死「只换
+     选择来源、不引入行为差」）+ `SubgameSearchConfig.live_traversers`（默认 `false` = 全部基线 byte-equal；
+     `solve_subgame` 从子树根现算 Active 座轮转表；**旗进 solve 缓存 key**——两种轮转是不同 rng 流的均衡，
+     串读 = 读错均衡）+ advisor `--search-live-traversers`。开旗后 rng 消费序列改变 → 与 false 基线不 byte-equal
+     （固定迭代 + seed 自身仍确定性可复现）。测试：Kuhn 轮转 `[1]` → 座 0 σ 无条目 + regret 恒零（零学习机制
+     本体）/ 全集 ≡ 默认逐位 / off-stack 6 座 2 Active 端到端 + 翻旗必 cache miss。与 within-round solve 缓存
+     叠加：缓存省 mid-round 重解，本旗省首决策 solve 内部的零学习步（time_budget 等效 ×2-3）。
 2. **生产 advisor 接搜索**：`openpoker_advisor.rs` 现在完全不调 `subgame_search`、写死了
    `default_6max_100bb`（`:191`）、`Request`（`:84-96`）也没有 per-seat stack 字段。要捕获真实栈 + 在 `decide()` 里新建
    search 分派 + 重写 outgoing（见 §1）——是整条管线重建，不是接一行。
@@ -552,6 +565,10 @@ solve 全部输入做 key（`SubgameSolveCache`，solve 边界现算、不从请
 只重导航——恢复 §6 #2「每轮恰好一个 solve」一致性（`time_budget` anytime 下逐决策重解会停在不同迭代数 = 读不同
 均衡）、mid-round 决策 wall ≈ 0、首决策可放心用满 time_budget（机制 / key 覆盖面 / byte-equal 守护见 §3.2 缺口①
 进度末条）。
+⑧ **live_traversers——已落地（2026-06-10，commit `7546c0b`，vultr 全绿 500/0，限时杠杆②）**：subgame solve 的
+traverser 只轮**子树根仍 Active** 的座（弃牌 / all-in 座零决策节点 = 零学习迭代；fold 剩 2-3 人的最常见局面浪费
+50-67% → 同 wall 有效迭代 ×2-3，与 LCFR 正交、与 ⑦ 叠加）。默认 false 全部基线 byte-equal；旗进 solve 缓存 key；
+advisor `--search-live-traversers`（机制 / 测试见 §3.2 缺口① 进度末条）。
 接下来 = **live 半段数据管道（§4.2 HH 日志升级：driver 落 shown_cards / winnings / 对手 name → 接 `MultiwayHandInput`，
 mbb/g 统一经 `chips_to_mbb_per_hand`）** + 真 blueprint 自对弈 VF-1 小表（169×6）+ 脱锚 range 细化（部分前缀 reach /
 对手数据，后置）。数据管道 = 可并行后台采集，不卡 B/C、随时可起。**
