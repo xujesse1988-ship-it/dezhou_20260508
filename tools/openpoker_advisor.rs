@@ -40,7 +40,8 @@
 //! （[`decide_search_unanchored`]→[`subgame_search_unanchored`]：触发 / 子树根 / within-round 导航
 //! 全来自真栈重放，**range 先验退 uniform**、返回子树自身合法集分布，`source=search:unanchored`）；
 //! 影子可用时仍走原锚定路径（blueprint range 先验更好）。②子树下注菜单：默认沿用 blueprint 菜单；
-//! **`--search-deep-menu`（缺口③，2026-06-09）→ 收到单一 {1pot}**（[`deep_single_pot`]，深码 /
+//! **`--search-deep-menu`（缺口③，2026-06-09；2026-06-10 v2 细化 = SPR 自适应）→ 子树菜单按根
+//! SPR 选宽（[`deep_menu_for`]：深 {1pot} 单档 / 浅 ≤4×pot 放宽 {0.5,1} 两档）**（深码 /
 //! 多人解到终局控树，§2.1），此时 outgoing 也用 {1pot} 抽象算尺寸（脱影子路径同样适用）。
 //!
 //! # 已知限制（blueprint 路径，`...client_design...` §4）
@@ -61,7 +62,7 @@ use poker::training::blueprint_advisor::{advance_shadow_by_applied, outgoing_act
 use poker::training::game::Game;
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::{
-    deep_single_pot, first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
+    deep_menu_for, first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::sampling::sample_discrete;
@@ -331,18 +332,16 @@ fn decide(
     // —— gating（设计 §1）：仅 `--search` 开 + 命中触发面才搜索；否则 blueprint。
     // should_search 只读街 + 本街是否已起注（与码深无关）→ 在 100BB `real` 上判等价真栈 auth。
     let want_search = matches!(search, Some(scfg) if should_search(&real, scfg.trigger));
-    // 缺口③（§2.1）：命中搜索且 scfg.deep_menu → 子树用单一 {1pot} 菜单（subgame_search 内置）+
-    // outgoing 也用 {1pot} 抽象（ratio 1.0 在真实 pot 上重算 to，与子树解自洽，见下 outgoing_abs）。
-    let want_deep = want_search && search.is_some_and(|s| s.deep_menu);
-
     // dist + outgoing 基准态：默认 = blueprint 分布 + 100BB real 算尺寸（search=None / 未触发，
     // byte-equal 旧行为）；搜索触发 = 真码深 auth 子博弈解 + auth 算尺寸（失败 → check-when-free，不回落）。
+    // deep_abs_holder：缺口③ deep 搜索成功时记下与子树**同一**菜单（deep_menu_for(root_state)，
+    // SPR 自适应：深 {1pot} / 浅 {0.5,1}）——outgoing 用它在真实 pot 上重算 to，与子树解自洽。
     let mut auth_holder: Option<GameState> = None;
+    let mut deep_abs_holder: Option<StreetActionAbstraction> = None;
     let dist: Vec<(AbstractAction, f64)> = if want_search {
         let scfg = search.expect("want_search ⇒ search.is_some()");
         // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ 安全降级。
-        // within-round 动作序仅脱影子路径用（这里 node_id 来自影子，导航走 blueprint 树路径）。
-        let (auth, round_start, _within) =
+        let (auth, round_start, within) =
             match build_real_auth(req, &solver_cfg, scale, my_seat_solver, hole, &board) {
                 Ok(t) => t,
                 Err(reason) => return search_giveup(&req.valid, &format!("build:{reason}")),
@@ -361,10 +360,15 @@ fn decide(
             strategy_fn,
             scfg,
             None, // depth_limit=false 解到终局 → 无 leaf_values（§2.1）。
+            // deep_menu mid-round（AllPostflop）导航：当前街真实动作序在子树上重放（缺口③细化）。
+            Some(&within),
             hand_seed,
             req.actions.len() as u64,
         ) {
             Ok(d) => {
+                if scfg.deep_menu {
+                    deep_abs_holder = Some(deep_menu_for(root_state).0);
+                }
                 auth_holder = Some(auth); // outgoing 用真栈 auth 算尺寸。
                 d
             }
@@ -377,11 +381,9 @@ fn decide(
 
     // outgoing 基准态：搜索 → 真栈 auth（真码深尺寸）；blueprint → 100BB real（旧行为）。
     let outgoing_state: &GameState = auth_holder.as_ref().unwrap_or(&real);
-    // outgoing 抽象：缺口③ 深码搜索（want_deep）→ 用 {1pot} 抽象（与子树菜单一致：subgame 返回的
-    // chosen 是 {1pot} 动作，ratio 1.0 须在 deep_single_pot 抽象下于真实 pot 重算 to）；否则
+    // outgoing 抽象：缺口③ 深码搜索 → 与子树同一菜单（deep_abs_holder，SPR 自适应）；否则
     // blueprint 抽象（旧行为；search=None / 非 deep 路径 byte-equal 不受影响）。
-    let deep_abs: Option<StreetActionAbstraction> = want_deep.then(|| deep_single_pot().0);
-    let outgoing_abs: &StreetActionAbstraction = deep_abs.as_ref().unwrap_or(abstraction);
+    let outgoing_abs: &StreetActionAbstraction = deep_abs_holder.as_ref().unwrap_or(abstraction);
 
     // per-decision 确定性采样（保混合策略 + 可复现；seed 与搜索与否无关 → search=None byte-equal）。
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed));
@@ -603,9 +605,11 @@ fn decide_search_unanchored(
         Ok(d) => d,
         Err(reason) => return search_giveup(&req.valid, &format!("unanchored:{reason}")),
     };
-    // outgoing：真栈 auth + 与子树同一抽象（deep_menu → {1pot}，否则 blueprint 菜单）——
-    // 子树自身合法集契约（同 deep 路径）：chosen 的 ratio 在真实 pot 上重算 to，自洽。
-    let deep_abs: Option<StreetActionAbstraction> = scfg.deep_menu.then(|| deep_single_pot().0);
+    // outgoing：真栈 auth + 与子树同一抽象（deep_menu → deep_menu_for(round_start)，SPR 自适应：
+    // 深 {1pot} / 浅 {0.5,1}；否则 blueprint 菜单）——子树自身合法集契约（同 deep 路径）：
+    // chosen 的 ratio 在真实 pot 上重算 to，自洽。round_start = unanchored 子树根（同一 SPR 输入）。
+    let deep_abs: Option<StreetActionAbstraction> =
+        scfg.deep_menu.then(|| deep_menu_for(&round_start).0);
     let outgoing_abs: &StreetActionAbstraction = deep_abs.as_ref().unwrap_or(abstraction);
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed));
     let chosen = sample_discrete(&dist, &mut sample_rng);
@@ -1337,6 +1341,46 @@ mod tests {
         );
         let again = decide(&game, &abs, &uniform, &req, 0xDEE9, Some(&scfg));
         assert_eq!(resp, again, "同 seed deep_menu 搜索须确定性（可复现）");
+    }
+
+    /// 缺口③ v2 细化端到端：浅 SPR（9BB 栈，flop 第二大 Active 栈 = 4×pot 恰在边界）下
+    /// `--search-deep-menu` 的子树菜单经 [`deep_menu_for`] 放宽到 {0.5,1} 两档——advisor outgoing
+    /// 必须用**同一**自适应菜单（deep_abs_holder）算尺寸，否则 0.5pot 档在 {1pot} 抽象下找不到
+    /// 对应、会塌成 all-in（错动作）。验：合法 + source=search/giveup + 可复现，且若出 raise，
+    /// 尺寸在 valid 区间内（非无脑 all-in 才有意义——can_check 时 raise 须有界）。
+    #[test]
+    fn search_deep_menu_shallow_spr_wide_menu_legal() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        // 全员 180op（9BB）：folds-to-SB，complete+check 进 flop → pot 40op=200 solver，
+        // SB/BB 各剩 160op=800 solver = 4×pot（恰边界 → 宽菜单）。
+        let mut req = flop_first_unraised_req(vec![180; 6]);
+        req.valid = ValidActions {
+            can_check: true,
+            can_call: false,
+            can_raise: true,
+            min_raise: Some(20),
+            max_raise: Some(160),
+        };
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            deep_menu: true,
+            max_subtree_nodes: 4_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let resp = decide(&game, &abs, &uniform, &req, 0xDEEA, Some(&scfg));
+        assert!(
+            is_legal(&resp, &req.valid),
+            "浅码宽菜单搜索动作须合法，得 {resp:?}"
+        );
+        assert!(
+            resp.source == "search" || resp.source.starts_with("search_giveup:"),
+            "搜索区 source 须 search / search_giveup:*，得 {resp:?}"
+        );
+        let again = decide(&game, &abs, &uniform, &req, 0xDEEA, Some(&scfg));
+        assert_eq!(resp, again, "同 seed 浅码宽菜单搜索须确定性（可复现）");
     }
 
     // —— 缺口②续：脱影子搜索（off-stack all-in 线，v1 边界①收口）——

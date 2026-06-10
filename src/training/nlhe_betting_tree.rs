@@ -217,6 +217,57 @@ pub fn deep_single_pot() -> (StreetActionAbstraction, BettingAbstractionRules) {
     (abs, BettingAbstractionRules::default())
 }
 
+/// [`deep_menu_for`] 的宽菜单档（短码）：全街 `{0.5, 1.0}` 两档 + `drop_small_reraise`
+/// （A3 first-bet-small 口径：0.5pot 仅作首攻、re-raise 一律 1pot，与 6-max blueprint 的
+/// postflop 菜单语义一致）。SPR 低时到终局的下注层数少、树小，可负担首攻多一个半 pot 档
+/// （短码常见的 commit / 控池粒度正落在 0.5–1pot 之间）。rules 其余 = `Default`（与
+/// [`deep_single_pot`] 一致：postflop 子树不需要 preflop 收宽那套，`width_redirect` 关）。
+pub fn deep_wide_half_pot() -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let two = || ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("{0.5,1.0} 合法");
+    let abs = StreetActionAbstraction::per_street([two(), two(), two(), two()]);
+    let rules = BettingAbstractionRules {
+        drop_small_reraise: true,
+        ..BettingAbstractionRules::default()
+    };
+    (abs, rules)
+}
+
+/// [`deep_menu_for`] 的 SPR 阈值：第二大 Active 剩余栈 ≤ `4 × pot` → 短码宽菜单。
+/// 量级依据：1pot 注每层把 pot 推到 ~3×，SPR ≤ 4 时 ~2 层进攻即触 all-in、到终局层数
+/// 有限，宽一档不致树爆炸（边界树大小由 `deep_menu_spr_boundary_tree_bounded` 测试钉住，
+/// 越界仍有 `max_subtree_nodes` cap 兜底 → Err → check-when-free，不 panic）。
+pub const DEEP_MENU_SPR_WIDE_MAX: u64 = 4;
+
+/// 缺口③ v2 细化（SPR 自适应菜单宽度，exec 文档 §2.1「深码单档、短码可放宽」/ §3.2 缺口③
+/// 「仍未做②」）：按子树根（轮起点）的 SPR 选深码搜索菜单——深 SPR 维持单一 {1pot}
+/// （[`deep_single_pot`]，控树），浅 SPR（≤ [`DEEP_MENU_SPR_WIDE_MAX`]×pot）放宽到
+/// `{0.5, 1.0}` 两档（[`deep_wide_half_pot`]，树小可负担）。
+///
+/// **纯函数 + 整数比较**（只读 `root_state` 的 chip 几何）——`subgame_search*` 选子树菜单
+/// 与 advisor 算 outgoing 尺寸必须**各自重算出同一菜单**，故选单逻辑共享于此、且对同一
+/// `root_state` 确定。SPR 的「有效栈」取**第二大 Active（还能行动）座位的剩余栈**：raise
+/// 战最多打到只剩一人有筹码，最大栈超出第二大的部分会被退注、不产生额外决策层；HU 下即
+/// 双方剩余栈的较小者。Active 不足 2 座（其余全 all-in/弃牌）→ 有效栈 0 → 宽菜单（树必小）。
+pub fn deep_menu_for(root_state: &GameState) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let mut top2 = [0u64; 2]; // [最大, 第二大] Active 剩余栈
+    for p in root_state.players() {
+        if p.status == PlayerStatus::Active {
+            let s = p.stack.as_u64();
+            if s > top2[0] {
+                top2 = [s, top2[0]];
+            } else if s > top2[1] {
+                top2[1] = s;
+            }
+        }
+    }
+    let pot = root_state.pot().as_u64();
+    if top2[1] <= DEEP_MENU_SPR_WIDE_MAX.saturating_mul(pot) {
+        deep_wide_half_pot()
+    } else {
+        deep_single_pot()
+    }
+}
+
 pub struct PublicBettingTree {
     nodes: Vec<TreeNode>,
     root_id: NodeId,

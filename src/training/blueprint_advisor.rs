@@ -431,8 +431,12 @@ pub fn play_cross_abstraction_hand(
 
     // round-start 快照（§6 #1 RoundStart 重解用）：每街首决策点 = 该街 betting-round 起点
     // （postflop 首个行动者面对无本街下注）。在 apply 之前于 loop 顶 snapshot → 必是轮起点。
+    // round_within = 当前街 round-start 以来的真实动作序 (动作, 是否令行动者 all-in)——
+    // deep_menu mid-round 在子树上重放导航用（subgame_search within_round_real，缺口③细化）；
+    // 街变清空（收街动作属上一街，与 openpoker_advisor::build_real_auth 同口径）。
     let mut round_start: Option<GameState> = None;
     let mut round_start_street: Option<Street> = None;
+    let mut round_within: Vec<(Action, bool)> = Vec::new();
 
     for decision_ordinal in 0..max_actions {
         if auth.is_terminal() {
@@ -450,6 +454,7 @@ pub fn play_cross_abstraction_hand(
         if round_start_street != Some(auth.street()) {
             round_start = Some(auth.clone());
             round_start_street = Some(auth.street());
+            round_within.clear();
         }
 
         // sync 守门：行动者影子必须在同一座 / 同一街，否则 info_set 口径错位（甚至 panic）。
@@ -515,6 +520,7 @@ pub fn play_cross_abstraction_hand(
                     contestants[bp_idx].strategy,
                     scfg,
                     contestants[bp_idx].leaf_values.as_ref(),
+                    Some(&round_within),
                     hand_seed,
                     decision_ordinal as u64,
                 ) {
@@ -545,6 +551,10 @@ pub fn play_cross_abstraction_hand(
         auth.apply(applied)
             .map_err(|e| HandError::Illegal(format!("权威 apply({applied:?}) 非法: {e:?}")))?;
         let applied_is_all_in = auth.players()[actor_idx].status == PlayerStatus::AllIn;
+        // 收街动作属上一街（street 已变 → 不入序；loop 顶将重 snapshot + 清空）。
+        if round_start_street == Some(auth.street()) {
+            round_within.push((applied, applied_is_all_in));
+        }
 
         // 推进所有影子：行动者影子按字面所选动作，其余按 incoming 翻译。
         for (idx, sh) in shadows.iter_mut().enumerate() {
