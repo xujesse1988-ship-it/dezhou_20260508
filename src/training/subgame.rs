@@ -917,6 +917,228 @@ fn estimate_range(
     range
 }
 
+// ===========================================================================
+// within-round solve 缓存（exec 文档 §6 #2：「每轮恰好一个 solve」落到常驻 advisor）
+// ===========================================================================
+
+/// 已求解的子博弈（[`SubgameSolveCache`] 的条目）：solve 段产物 + 子树自身抽象——deep_menu /
+/// unanchored 的 mid-round 真实动作导航须用与 solve **同一份**菜单现算 tag（命中时不重算
+/// `deep_menu_for`，直接读存下的）。
+struct SolvedSubgame {
+    trainer: EsMccfrTrainer<SubgameNlheGame>,
+    sub_abs: StreetActionAbstraction,
+}
+
+/// within-round solve 缓存（容量 1，advisor 常驻进程持有、跨请求传入）。
+///
+/// **动机（exec 文档 §6 #2）**：RoundStart + round-stable seed 的设计本意是「同一街多次决策
+/// 共享字节相同的 solve、读不同节点 = 一个均衡内自洽」。固定迭代下成立，但 advisor 逐决策
+/// 无状态重解：(a) 同街第二次决策从头重建重解一遍字节相同的子博弈 = 纯浪费 wall（build 是
+/// 深码×多人的真瓶颈，§4.1 A②）；(b) 开 `time_budget`（生产限时路径）后该保证悄悄破了——
+/// anytime 迭代数随机器负载变，同街两次重解可停在不同迭代数 → 两次决策读的是**不同均衡**
+/// （§6 #2 想避免的 mid-round 不一致部分回来）。缓存命中 → 复用 solve、只重做导航/读数：
+/// 一致性恢复「每轮恰好一个 solve」，mid-round wall ≈ 0，首决策因此可放心用满 time_budget。
+///
+/// **key 必须覆盖 solve 的全部输入**（本机制唯一认真风险：漏一项 = 读错均衡）——故 key 不从
+/// 请求层推导，而在 solve 边界由实际构造输入现算（[`solve_cache_key`]）。固定迭代路径命中
+/// 输出与从头重解 byte-equal（确定性 solve 同输入同输出，缓存只省 wall）；命中不重试 solve
+/// （即便上次因 time_budget 偏收敛）——这正是「每轮一个 solve」语义。容量 1 够用：生产是顺序
+/// 决策流，同手同街连续命中、跨街 / 跨手 key 自然变化即替换。depth_limit 路径不缓存
+/// （key 须带 blueprint 树叶子映射身份，非生产路径，见 [`subgame_search_cached`]）。
+pub struct SubgameSolveCache {
+    entry: Option<([u8; 32], SolvedSubgame)>,
+    hits: u64,
+    misses: u64,
+}
+
+impl SubgameSolveCache {
+    pub fn new() -> SubgameSolveCache {
+        SubgameSolveCache {
+            entry: None,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// 命中次数（诊断 / 测试：钉「同街第二决策不重解」）。
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// 未命中次数（≥ 实际跑的 solve 数；solve 失败也计 miss、不 store）。
+    pub fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    /// key 是否命中（计数）。未命中后 caller 须 [`store`](Self::store)（或失败丢弃）。
+    fn lookup(&mut self, key: [u8; 32]) -> bool {
+        match &self.entry {
+            Some((k, _)) if *k == key => {
+                self.hits += 1;
+                true
+            }
+            _ => {
+                self.misses += 1;
+                false
+            }
+        }
+    }
+
+    fn store(&mut self, key: [u8; 32], solved: SolvedSubgame) {
+        self.entry = Some((key, solved));
+    }
+
+    fn entry(&self, key: [u8; 32]) -> Option<&SolvedSubgame> {
+        self.entry
+            .as_ref()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, s)| s)
+    }
+}
+
+impl Default for SubgameSolveCache {
+    fn default() -> SubgameSolveCache {
+        SubgameSolveCache::new()
+    }
+}
+
+/// 缓存 key 的路径判别（anchored 与 unanchored 不串条目——即便其余输入碰巧相同也分开，
+/// 读数契约 / rules 处理不同，保守隔离）。
+const KEY_KIND_ANCHORED: u8 = 0;
+const KEY_KIND_UNANCHORED: u8 = 1;
+
+/// solve 缓存 key = blake3(solve 的**全部**实际构造输入)。在 solve 边界现算（非请求层推导）：
+/// 喂进 [`SubgameNlheGame`] 构造 + [`solve_subgame`] 的每个输入要么逐字段哈希，要么经进程内
+/// 身份哈希——逐项对应：
+///
+/// - 桶表：content hash（跨进程稳定）+ `Arc` 指针（区分 content hash 同为全 0 的 stub 表；
+///   缓存条目经 trainer 持有该 Arc → 条目存活期内指针不可能被释放复用）；
+/// - `cfg` 全字段（iterations / max_subtree_nodes / seed / use_blueprint_range / trigger /
+///   resolve_root / depth_limit / biased_leaf / lcfr / time_budget / deep_menu——含不影响
+///   solve 的 trigger：过覆盖只丢命中、欠覆盖读错均衡）；
+/// - `(hand_seed, seed_ordinal)`：与 `cfg.seed` 共同决定 master seed（RoundStart 下
+///   seed_ordinal = 街索引 = round-stable）；
+/// - root 几何：`root_state` 的全部可见面（`TableConfig` 各字段 + 街 / board / pot /
+///   当前行动者 + 每座 stack / committed / status / hole_cards）——`resample_hidden*` 与建树
+///   只读这些 + 外部 RNG，故可见面相等 ⇒ solve 输入相等；
+/// - `entrants` / `raises_on_street`（子树根上下文）；
+/// - range 先验：直接哈希**算出的** per-seat reach 向量（覆盖 strategy_fn + 前街历史的全部
+///   影响，不依赖上游推导）；
+/// - 子树菜单 + 规则：各街 raise 档 milli（`DefaultActionAbstraction` 行为仅由 ratio 集决定）
+///   + [`BettingAbstractionRules`] 5 字段。
+#[allow(clippy::too_many_arguments)]
+fn solve_cache_key(
+    kind: u8,
+    game: &SimplifiedNlheGame,
+    root_state: &GameState,
+    entrants: u16,
+    raises_on_street: u32,
+    ranges: Option<&[Vec<f64>]>,
+    sub_abs: &StreetActionAbstraction,
+    sub_rules: &BettingAbstractionRules,
+    cfg: &SubgameSearchConfig,
+    hand_seed: u64,
+    seed_ordinal: u64,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(&[kind]);
+    h.update(&game.bucket_table.content_hash());
+    h.update(&(Arc::as_ptr(&game.bucket_table) as usize as u64).to_le_bytes());
+    // cfg 全字段。
+    h.update(&cfg.iterations.to_le_bytes());
+    h.update(&(cfg.max_subtree_nodes as u64).to_le_bytes());
+    h.update(&cfg.seed.to_le_bytes());
+    h.update(&[
+        cfg.use_blueprint_range as u8,
+        match cfg.trigger {
+            SearchTrigger::AllPostflop => 0,
+            SearchTrigger::FlopFirstUnraised => 1,
+        },
+        match cfg.resolve_root {
+            ResolveRoot::CurrentDecision => 0,
+            ResolveRoot::RoundStart => 1,
+        },
+        cfg.depth_limit as u8,
+        cfg.biased_leaf as u8,
+        cfg.lcfr as u8,
+        cfg.deep_menu as u8,
+        cfg.time_budget.is_some() as u8,
+    ]);
+    h.update(
+        &cfg.time_budget
+            .map_or(0u128, |d| d.as_nanos())
+            .to_le_bytes(),
+    );
+    h.update(&hand_seed.to_le_bytes());
+    h.update(&seed_ordinal.to_le_bytes());
+    h.update(&entrants.to_le_bytes());
+    h.update(&raises_on_street.to_le_bytes());
+    // root 几何（config + 公共面 + 每座状态）。
+    let rc = root_state.config();
+    h.update(&[rc.n_seats]);
+    for s in &rc.starting_stacks {
+        h.update(&s.as_u64().to_le_bytes());
+    }
+    h.update(&rc.small_blind.as_u64().to_le_bytes());
+    h.update(&rc.big_blind.as_u64().to_le_bytes());
+    h.update(&rc.ante.as_u64().to_le_bytes());
+    h.update(&[rc.button_seat.0]);
+    h.update(&[root_state.street() as u8]);
+    h.update(&[root_state.board().len() as u8]);
+    for c in root_state.board() {
+        h.update(&[c.to_u8()]);
+    }
+    h.update(&root_state.pot().as_u64().to_le_bytes());
+    h.update(&[root_state.current_player().map_or(0xFF, |s| s.0)]);
+    for p in root_state.players() {
+        h.update(&p.stack.as_u64().to_le_bytes());
+        h.update(&p.committed_this_round.as_u64().to_le_bytes());
+        h.update(&p.committed_total.as_u64().to_le_bytes());
+        h.update(&[match p.status {
+            PlayerStatus::Active => 0,
+            PlayerStatus::AllIn => 1,
+            PlayerStatus::Folded => 2,
+            PlayerStatus::SittingOut => 3,
+        }]);
+        match p.hole_cards {
+            Some([a, b]) => h.update(&[1, a.to_u8(), b.to_u8()]),
+            None => h.update(&[0, 0xFF, 0xFF]),
+        };
+    }
+    // range 先验（§5b reach 向量，f64 逐位）。
+    match ranges {
+        None => {
+            h.update(&[0]);
+        }
+        Some(rs) => {
+            h.update(&[1]);
+            h.update(&(rs.len() as u64).to_le_bytes());
+            for r in rs {
+                h.update(&(r.len() as u64).to_le_bytes());
+                for v in r {
+                    h.update(&v.to_le_bytes());
+                }
+            }
+        }
+    }
+    // 子树菜单（各街 raise 档 milli）+ 规则。
+    for street in [Street::Preflop, Street::Flop, Street::Turn, Street::River] {
+        let ratios = &sub_abs.config_for(street).raise_pot_ratios;
+        h.update(&(ratios.len() as u64).to_le_bytes());
+        for r in ratios {
+            h.update(&r.as_milli().to_le_bytes());
+        }
+    }
+    h.update(&[
+        sub_rules.drop_small_reraise as u8,
+        sub_rules.width_redirect,
+        sub_rules.no_open_limp as u8,
+        sub_rules.preflop_open_small_only as u8,
+        sub_rules.drop_preflop_open_allin as u8,
+    ]);
+    *h.finalize().as_bytes()
+}
+
 /// S6 实时搜索：建 subgame、跑 CFR、返回 actor **真实手**在**当前决策点**的策略分布——对齐
 /// 调用方 `legal_abs`（影子的合法集），可直接喂
 /// [`sample_discrete`](crate::training::sampling::sample_discrete) → `outgoing_action`。
@@ -960,6 +1182,43 @@ fn estimate_range(
 /// 不回落 blueprint）。
 #[allow(clippy::too_many_arguments)]
 pub fn subgame_search(
+    auth: &GameState,
+    root_state: &GameState,
+    game: &SimplifiedNlheGame,
+    legal_abs: &[SimplifiedNlheAction],
+    node_id: NodeId,
+    strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    cfg: &SubgameSearchConfig,
+    leaf_values: Option<&Arc<LeafValueTables>>,
+    within_round_real: Option<&[(Action, bool)]>,
+    hand_seed: u64,
+    decision_ordinal: u64,
+) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    subgame_search_cached(
+        None,
+        auth,
+        root_state,
+        game,
+        legal_abs,
+        node_id,
+        strategy,
+        cfg,
+        leaf_values,
+        within_round_real,
+        hand_seed,
+        decision_ordinal,
+    )
+}
+
+/// [`subgame_search`] 的缓存版（within-round solve 缓存，[`SubgameSolveCache`] doc）：
+/// `cache = Some` 且 key（solve 全部输入，[`solve_cache_key`]）命中 → 跳过建树 + 求解，复用
+/// 已解 trainer、只重做导航 / 读数——同手同街多决策恢复「每轮恰好一个 solve」（time_budget
+/// anytime 下重解会读不同均衡，§6 #2），mid-round wall ≈ 0。`cache = None` = 原行为
+/// （逐 infoset byte-equal，[`subgame_search`] 即此薄壳）。**depth_limit 路径不缓存**（key 须带
+/// blueprint 树叶子映射身份 / root_global，非生产路径不值得）——自动退 `None` 语义。
+#[allow(clippy::too_many_arguments)]
+pub fn subgame_search_cached(
+    cache: Option<&mut SubgameSolveCache>,
     auth: &GameState,
     root_state: &GameState,
     game: &SimplifiedNlheGame,
@@ -1073,88 +1332,121 @@ pub fn subgame_search(
     } else {
         (game.abstraction().clone(), game.rules())
     };
-    // deep_menu mid-round 导航要在子树自身抽象下现算 tag（见下 cur_node 分支）；构造器拿走
-    // sub_abs，故先留一份。非 deep 路径不留（byte-equal 不变）。
-    let nav_abs = cfg.deep_menu.then(|| sub_abs.clone());
 
-    // 建 subgame：bucket 表 + 上面选定的 action 抽象（sub_abs/sub_rules），从 root_state 为根。
-    // 6b depth-limit → 子树街边界截断 + 叶子查 blueprint 续局值（new_depth_limited）；否则 6a 解到终局。
-    let sub = if cfg.depth_limit {
-        let values =
-            leaf_values.ok_or_else(|| "depth_limit=true 但未提供 leaf_values".to_string())?;
-        // root_state 的 blueprint 全局节点：CurrentDecision = 当前点（= root）；RoundStart =
-        // 当前街起点（从 node_id 沿 parent 爬到街起点）。limit_street = root 节点所在街（只解当前街）。
-        let root_global = match cfg.resolve_root {
-            ResolveRoot::CurrentDecision => node_id,
-            ResolveRoot::RoundStart => climb_to_street_start(tree, node_id),
-        };
-        let limit_street = tree.node(root_global).street;
-        // 6b-4：biased_leaf → 下一 actor argmax 选续局（鲁棒机制）；否则固定 unbiased(0)。
-        let cont_policy = if cfg.biased_leaf {
-            LeafContPolicy::BiasedNextActor
-        } else {
-            LeafContPolicy::Fixed(0)
-        };
-        SubgameNlheGame::new_depth_limited(
-            Arc::clone(&game.bucket_table),
-            root_state.config().clone(),
-            sub_abs,
-            sub_rules,
-            root_state.clone(),
-            entrants,
-            raises_on_street,
-            ranges_opt,
-            limit_street,
-            tree,
-            root_global,
-            Arc::clone(values),
-            cont_policy,
-        )?
-    } else if let Some(ranges) = ranges_opt {
-        SubgameNlheGame::new_with_ranges(
-            Arc::clone(&game.bucket_table),
-            root_state.config().clone(),
-            sub_abs,
-            sub_rules,
-            root_state.clone(),
-            entrants,
-            raises_on_street,
-            ranges,
-        )
-    } else {
-        SubgameNlheGame::new(
-            Arc::clone(&game.bucket_table),
-            root_state.config().clone(),
-            sub_abs,
-            sub_rules,
-            root_state.clone(),
-            entrants,
-            raises_on_street,
-        )
-    };
-    // 跑 CFR：master seed + step rng 都由 (cfg.seed, hand_seed, seed_ordinal) 确定派生。
-    // RoundStart 下 seed_ordinal = 街索引 → 同一轮多决策的 solve 字节相同（§6 #2 一致性）。
+    // 跑 CFR 的 master seed：(cfg.seed, hand_seed, seed_ordinal) 确定派生。RoundStart 下
+    // seed_ordinal = 街索引 → 同一轮多决策的 solve 字节相同（§6 #2 一致性）。
     let master = search_seed(cfg.seed, hand_seed, seed_ordinal);
-    let trainer = solve_subgame(sub, cfg, master)?;
+    // within-round solve 缓存：key 在 solve 边界按实际构造输入现算（solve_cache_key doc）。
+    // depth_limit 路径不缓存（key 须带 blueprint 树叶子映射身份 + root_global，非生产路径）。
+    let cache = if cfg.depth_limit { None } else { cache };
+    let key = cache.as_ref().map(|_| {
+        solve_cache_key(
+            KEY_KIND_ANCHORED,
+            game,
+            root_state,
+            entrants,
+            raises_on_street,
+            ranges_opt.as_deref(),
+            &sub_abs,
+            &sub_rules,
+            cfg,
+            hand_seed,
+            seed_ordinal,
+        )
+    });
+    // 建 subgame + 求解（仅 miss / 无缓存时跑）：bucket 表 + 上面选定的 action 抽象
+    // （sub_abs/sub_rules），从 root_state 为根。6b depth-limit → 子树街边界截断 + 叶子查
+    // blueprint 续局值（new_depth_limited）；否则 6a 解到终局。
+    let build_and_solve = move || -> Result<SolvedSubgame, String> {
+        let sub = if cfg.depth_limit {
+            let values =
+                leaf_values.ok_or_else(|| "depth_limit=true 但未提供 leaf_values".to_string())?;
+            // root_state 的 blueprint 全局节点：CurrentDecision = 当前点（= root）；RoundStart =
+            // 当前街起点（从 node_id 沿 parent 爬到街起点）。limit_street = root 节点所在街（只解当前街）。
+            let root_global = match cfg.resolve_root {
+                ResolveRoot::CurrentDecision => node_id,
+                ResolveRoot::RoundStart => climb_to_street_start(tree, node_id),
+            };
+            let limit_street = tree.node(root_global).street;
+            // 6b-4：biased_leaf → 下一 actor argmax 选续局（鲁棒机制）；否则固定 unbiased(0)。
+            let cont_policy = if cfg.biased_leaf {
+                LeafContPolicy::BiasedNextActor
+            } else {
+                LeafContPolicy::Fixed(0)
+            };
+            SubgameNlheGame::new_depth_limited(
+                Arc::clone(&game.bucket_table),
+                root_state.config().clone(),
+                sub_abs.clone(),
+                sub_rules,
+                root_state.clone(),
+                entrants,
+                raises_on_street,
+                ranges_opt,
+                limit_street,
+                tree,
+                root_global,
+                Arc::clone(values),
+                cont_policy,
+            )?
+        } else if let Some(ranges) = ranges_opt {
+            SubgameNlheGame::new_with_ranges(
+                Arc::clone(&game.bucket_table),
+                root_state.config().clone(),
+                sub_abs.clone(),
+                sub_rules,
+                root_state.clone(),
+                entrants,
+                raises_on_street,
+                ranges,
+            )
+        } else {
+            SubgameNlheGame::new(
+                Arc::clone(&game.bucket_table),
+                root_state.config().clone(),
+                sub_abs.clone(),
+                sub_rules,
+                root_state.clone(),
+                entrants,
+                raises_on_street,
+            )
+        };
+        let trainer = solve_subgame(sub, cfg, master)?;
+        Ok(SolvedSubgame { trainer, sub_abs })
+    };
+    let solved_fresh: SolvedSubgame;
+    let solved: &SolvedSubgame = match (cache, key) {
+        (Some(c), Some(key)) => {
+            if !c.lookup(key) {
+                c.store(key, build_and_solve()?);
+            }
+            c.entry(key).expect("lookup 命中或刚 store")
+        }
+        _ => {
+            solved_fresh = build_and_solve()?;
+            &solved_fresh
+        }
+    };
+    let trainer = &solved.trainer;
 
     // 导航到当前决策点（CurrentDecision / round-start 首决策点 tags 空 → root），用 auth 几何读
     // 真实手在落点的平均策略（actor 校验 + 维度检查见 read_current_strategy）。
     // 缺口③「仍未做③」：deep_menu mid-round（tags 非空）时子树菜单 ≠ blueprint 菜单，blueprint
     // tags 必失配（{1pot} 子树没有 0.5pot 档）→ 改用当前街真实动作序在子树上重放
     // （navigate_subtree_by_real_actions，tag 以真栈几何在子树自身抽象下现算，与 unanchored
-    // 同口径）；调用方未提供动作序 → Err 降级（与旧「tag 失配 Err」同语义、原因更明确）。
-    // 非 deep_menu 路径仍走 blueprint tags 导航（byte-equal 不变）。
-    let cur_node = match &nav_abs {
-        Some(abs) if !within_round_tags.is_empty() => {
-            let wr = within_round_real.ok_or_else(|| {
-                "deep_menu mid-round 导航需要当前街真实动作序（调用方未提供 within_round_real）"
-                    .to_string()
-            })?;
-            navigate_subtree_by_real_actions(trainer.game().subtree(), abs, root_state, wr)?
-        }
-        _ => navigate_subtree(trainer.game().subtree(), &within_round_tags)?,
+    // 同口径；缓存命中时菜单取 solve 时存下的同一份 sub_abs）；调用方未提供动作序 → Err 降级
+    // （与旧「tag 失配 Err」同语义、原因更明确）。非 deep_menu 路径仍走 blueprint tags 导航
+    // （byte-equal 不变）。
+    let cur_node = if cfg.deep_menu && !within_round_tags.is_empty() {
+        let wr = within_round_real.ok_or_else(|| {
+            "deep_menu mid-round 导航需要当前街真实动作序（调用方未提供 within_round_real）"
+                .to_string()
+        })?;
+        navigate_subtree_by_real_actions(trainer.game().subtree(), &solved.sub_abs, root_state, wr)?
+    } else {
+        navigate_subtree(trainer.game().subtree(), &within_round_tags)?
     };
-    let (avg, sub_legal) = read_current_strategy(&trainer, cur_node, auth, auth_actor)?;
+    let (avg, sub_legal) = read_current_strategy(trainer, cur_node, auth, auth_actor)?;
 
     // 缺口③ deep_menu（§2.1）：子树菜单（{1pot}）与调用方 blueprint `legal_abs` 不同
     // （{1pot} ⊊ blueprint），**不能对齐 legal_abs**（强行对齐时 blueprint 多出的档如 0.5pot
@@ -1404,6 +1696,22 @@ pub fn subgame_search_unanchored(
     cfg: &SubgameSearchConfig,
     hand_seed: u64,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    subgame_search_unanchored_cached(None, auth, root_state, game, within_round, cfg, hand_seed)
+}
+
+/// [`subgame_search_unanchored`] 的缓存版（与 [`subgame_search_cached`] 同语义）：`cache = Some`
+/// 且 key 命中（同手同街，[`solve_cache_key`]）→ 复用已解 trainer、只重做 within-round 真实
+/// 动作导航 + 读数（导航用 solve 时存下的同一份 sub_abs）。`cache = None` = 原行为。
+#[allow(clippy::too_many_arguments)]
+pub fn subgame_search_unanchored_cached(
+    cache: Option<&mut SubgameSolveCache>,
+    auth: &GameState,
+    root_state: &GameState,
+    game: &SimplifiedNlheGame,
+    within_round: &[(Action, bool)],
+    cfg: &SubgameSearchConfig,
+    hand_seed: u64,
+) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
     if auth.is_terminal() || auth.current_player().is_none() {
         return Err("subgame_search_unanchored: auth 非 decision 节点".to_string());
     }
@@ -1457,24 +1765,56 @@ pub fn subgame_search_unanchored(
     // 真栈锚上下文：entrants = 轮起点 live bitmask；raises_on_street = 0（轮起点）；range =
     // uniform（SubgameNlheGame::new 的 root uniform resample，无 ranges）。
     let entrants = live_entrants(root_state);
-    let sub = SubgameNlheGame::new(
-        Arc::clone(&game.bucket_table),
-        root_state.config().clone(),
-        sub_abs.clone(), // 真栈导航还要同一抽象现算 tag
-        sub_rules,
-        root_state.clone(),
-        entrants,
-        0,
-    );
     let master = search_seed(cfg.seed, hand_seed, street_tag as u64);
-    let trainer = solve_subgame(sub, cfg, master)?;
+    let key = cache.as_ref().map(|_| {
+        solve_cache_key(
+            KEY_KIND_UNANCHORED,
+            game,
+            root_state,
+            entrants,
+            0,
+            None,
+            &sub_abs,
+            &sub_rules,
+            cfg,
+            hand_seed,
+            street_tag as u64,
+        )
+    });
+    let build_and_solve = move || -> Result<SolvedSubgame, String> {
+        let sub = SubgameNlheGame::new(
+            Arc::clone(&game.bucket_table),
+            root_state.config().clone(),
+            sub_abs.clone(), // 真栈导航还要同一抽象现算 tag
+            sub_rules,
+            root_state.clone(),
+            entrants,
+            0,
+        );
+        let trainer = solve_subgame(sub, cfg, master)?;
+        Ok(SolvedSubgame { trainer, sub_abs })
+    };
+    let solved_fresh: SolvedSubgame;
+    let solved: &SolvedSubgame = match (cache, key) {
+        (Some(c), Some(key)) => {
+            if !c.lookup(key) {
+                c.store(key, build_and_solve()?);
+            }
+            c.entry(key).expect("lookup 命中或刚 store")
+        }
+        _ => {
+            solved_fresh = build_and_solve()?;
+            &solved_fresh
+        }
+    };
+    let trainer = &solved.trainer;
     let cur_node = navigate_subtree_by_real_actions(
         trainer.game().subtree(),
-        &sub_abs,
+        &solved.sub_abs,
         root_state,
         within_round,
     )?;
-    let (avg, sub_legal) = read_current_strategy(&trainer, cur_node, auth, auth_actor)?;
+    let (avg, sub_legal) = read_current_strategy(trainer, cur_node, auth, auth_actor)?;
     self_distribution(&sub_legal, &avg)
 }
 
@@ -3550,5 +3890,267 @@ mod tests {
             1
         )
         .is_err());
+    }
+
+    // —— within-round solve 缓存（§6 #2「每轮恰好一个 solve」）——
+
+    /// 同手同街（RoundStart + round-stable seed）两个决策点共享缓存：第二决策命中（不重解，
+    /// hits/misses 计数硬证）、命中输出与无缓存从头重解 byte-equal（固定迭代确定性 → 缓存只省
+    /// wall 不改结果）；换 hand_seed / 换 iterations / 换 root 几何 → key 变 → miss
+    /// （漏 key 输入 = 读错均衡，这里钉关键输入都进了 key）。
+    #[test]
+    fn solve_cache_within_round_hit_and_key_sensitivity() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x5343_4143_4845_3031); // "SCACHE01"
+        let round_start = flop.game_state.clone();
+        // 决策 1 = 轮起点首决策（within 空）；决策 2 = 首行动者 Bet 后的 mid-round 决策点。
+        let mut rng = ChaCha20Rng::from_seed(0x5343_4143_4845_0002);
+        let drng: &mut dyn RngSource = &mut rng;
+        let bet = SimplifiedNlheGame::legal_actions(&flop)
+            .into_iter()
+            .find(|a| matches!(AbstractActionTag::of(a), AbstractActionTag::Bet(_)))
+            .expect("flop 首决策点应有 Bet 档");
+        let mid = SimplifiedNlheGame::next(flop.clone(), bet, drng);
+        let cfg = SubgameSearchConfig {
+            iterations: 400,
+            max_subtree_nodes: 1_000_000,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+
+        let mut cache = SubgameSolveCache::new();
+        let d1 = subgame_search_cached(
+            Some(&mut cache),
+            &flop.game_state,
+            &round_start,
+            &game,
+            &SimplifiedNlheGame::legal_actions(&flop),
+            flop.current_node_id,
+            &strat,
+            &cfg,
+            None,
+            None,
+            0xABCD,
+            0,
+        )
+        .expect("决策 1 应 Ok");
+        assert!(!d1.is_empty());
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 0),
+            "决策 1 = 首 solve（miss）"
+        );
+
+        let d2 = subgame_search_cached(
+            Some(&mut cache),
+            &mid.game_state,
+            &round_start,
+            &game,
+            &SimplifiedNlheGame::legal_actions(&mid),
+            mid.current_node_id,
+            &strat,
+            &cfg,
+            None,
+            None,
+            0xABCD,
+            7,
+        )
+        .expect("决策 2（mid-round）应 Ok");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "同手同街第二决策须命中、不重解"
+        );
+        // 命中输出 byte-equal 无缓存从头重解（同 solve 输入确定性）。
+        let d2_fresh = subgame_search(
+            &mid.game_state,
+            &round_start,
+            &game,
+            &SimplifiedNlheGame::legal_actions(&mid),
+            mid.current_node_id,
+            &strat,
+            &cfg,
+            None,
+            None,
+            0xABCD,
+            7,
+        )
+        .expect("无缓存重解应 Ok");
+        assert_eq!(
+            format!("{d2:?}"),
+            format!("{d2_fresh:?}"),
+            "命中输出须 byte-equal 从头重解"
+        );
+
+        // key 敏感性（每次换一个 solve 输入 → 必 miss）：
+        // (a) hand_seed（换手）。
+        subgame_search_cached(
+            Some(&mut cache),
+            &mid.game_state,
+            &round_start,
+            &game,
+            &SimplifiedNlheGame::legal_actions(&mid),
+            mid.current_node_id,
+            &strat,
+            &cfg,
+            None,
+            None,
+            0xABCE,
+            7,
+        )
+        .expect("换 hand_seed 仍 Ok");
+        assert_eq!(cache.misses(), 2, "hand_seed 变 → miss");
+        // (b) cfg.iterations。
+        let cfg_more = SubgameSearchConfig {
+            iterations: 500,
+            ..cfg
+        };
+        subgame_search_cached(
+            Some(&mut cache),
+            &mid.game_state,
+            &round_start,
+            &game,
+            &SimplifiedNlheGame::legal_actions(&mid),
+            mid.current_node_id,
+            &strat,
+            &cfg_more,
+            None,
+            None,
+            0xABCE,
+            7,
+        )
+        .expect("换 iterations 仍 Ok");
+        assert_eq!(cache.misses(), 3, "iterations 变 → miss");
+        // (c) root 几何（另一手牌局 → board / 底牌 / 状态全变）。
+        let flop2 = hu_flop_state(&game, 0x5343_4143_4845_3032); // "SCACHE02"
+        let rs2 = flop2.game_state.clone();
+        subgame_search_cached(
+            Some(&mut cache),
+            &flop2.game_state,
+            &rs2,
+            &game,
+            &SimplifiedNlheGame::legal_actions(&flop2),
+            flop2.current_node_id,
+            &strat,
+            &cfg_more,
+            None,
+            None,
+            0xABCE,
+            0,
+        )
+        .expect("换 root 几何仍 Ok");
+        assert_eq!(cache.misses(), 4, "root 几何变 → miss");
+    }
+
+    /// time_budget（墙钟 anytime）下的 within-round 一致性：anytime 迭代数随机器负载变、原理上
+    /// 不可 byte-equal（§2.3）——同街第二次**重解**可能停在不同迭代数 = 两次决策读不同均衡。
+    /// 缓存命中 = 直接复用第一次的 solve（hits 计数硬证没有第二次 solve）→「每轮恰好一个
+    /// solve」恢复；同节点再读逐位相同。
+    #[test]
+    fn solve_cache_time_budget_one_solve_per_round() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x5343_4143_4845_3033); // "SCACHE03"
+        let round_start = flop.game_state.clone();
+        let cfg = SubgameSearchConfig {
+            iterations: 2000,
+            max_subtree_nodes: 1_000_000,
+            trigger: SearchTrigger::AllPostflop,
+            time_budget: Some(Duration::from_millis(50)),
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let legal = SimplifiedNlheGame::legal_actions(&flop);
+        let mut cache = SubgameSolveCache::new();
+        let run = |cache: &mut SubgameSolveCache| {
+            subgame_search_cached(
+                Some(cache),
+                &flop.game_state,
+                &round_start,
+                &game,
+                &legal,
+                flop.current_node_id,
+                &strat,
+                &cfg,
+                None,
+                None,
+                0xB07,
+                0,
+            )
+            .expect("time_budget 决策应 Ok")
+        };
+        let d1 = run(&mut cache);
+        let d1b = run(&mut cache);
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "time_budget 下同街第二决策须命中（每轮恰好一个 solve）"
+        );
+        for ((a1, p1), (a1b, p1b)) in d1.iter().zip(&d1b) {
+            assert_eq!(a1, a1b);
+            assert_eq!(p1.to_bits(), p1b.to_bits(), "命中 = 读同一均衡（逐位相同）");
+        }
+    }
+
+    /// unanchored 路径同样吃缓存：同手同街 mid-round 命中（导航用 solve 时存的同一份 sub_abs）、
+    /// 命中输出 byte-equal 无缓存版；换 hand_seed → miss。
+    #[test]
+    fn solve_cache_unanchored_within_round_hit() {
+        let game = nolimp_6max_game();
+        let round_start = offstack_allin_flop_state();
+        let mut auth = round_start.clone();
+        auth.apply(Action::Check).expect("SB check");
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let mut cache = SubgameSolveCache::new();
+        let d1 = subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &round_start,
+            &round_start,
+            &game,
+            &[],
+            &cfg,
+            0xD15E,
+        )
+        .expect("首决策应 Ok");
+        assert!(!d1.is_empty());
+        let within = [(Action::Check, false)];
+        let d2 = subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &auth,
+            &round_start,
+            &game,
+            &within,
+            &cfg,
+            0xD15E,
+        )
+        .expect("mid-round 应 Ok");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "unanchored 同手同街第二决策须命中"
+        );
+        let d2_fresh = subgame_search_unanchored(&auth, &round_start, &game, &within, &cfg, 0xD15E)
+            .expect("无缓存重解应 Ok");
+        assert_eq!(
+            format!("{d2:?}"),
+            format!("{d2_fresh:?}"),
+            "命中输出须 byte-equal 从头重解"
+        );
+        // 换 hand_seed → miss（key 覆盖 master seed 输入）。
+        subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &round_start,
+            &round_start,
+            &game,
+            &[],
+            &cfg,
+            0xD15F,
+        )
+        .expect("换 hand_seed 仍 Ok");
+        assert_eq!(cache.misses(), 2, "hand_seed 变 → miss");
     }
 }

@@ -30,6 +30,11 @@
 //! 否则 fold；建不了真栈树 / 子博弈 `Err`），**不回落 blueprint**（off-distribution 下 blueprint 解的是
 //! 错游戏，§2.3）。`source=search_giveup:*` 与 blueprint `fallback:*` 分桶。
 //!
+//! **within-round solve 缓存（§6 #2）**：本进程常驻（driver IPC 喂请求），main loop 持有
+//! [`SubgameSolveCache`]——同手同街第二次决策按「solve 全部输入」的 key 命中 → 复用已解子博弈、
+//! 只重做导航：恢复「每轮恰好一个 solve」（`time_budget` anytime 下逐决策重解会停在不同迭代数 =
+//! 同街两决策读不同均衡），mid-round 决策 wall ≈ 0，首决策可放心用满 time_budget。
+//!
 //! **守恒不变量**：`--search` **未开**（`search=None`）时 `decide` 走原 100BB blueprint 路径、
 //! 逐字节等价旧行为（测试 `search_off_byte_equal_blueprint` 钉死）。preflop + 未触发的 postflop
 //! 决策即便开了 `--search` 也走 blueprint 路径（与未开等价）。
@@ -68,8 +73,8 @@ use poker::training::nlhe_betting_tree::{
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
-    should_search, subgame_search, subgame_search_unanchored, ResolveRoot, SearchTrigger,
-    SubgameSearchConfig,
+    should_search, subgame_search_cached, subgame_search_unanchored_cached, ResolveRoot,
+    SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, InfoSetId,
@@ -208,11 +213,16 @@ fn hist_to_concrete(
 
 /// 一次决策：重放本手历史（100BB real + abs 两态 lockstep）→ 我方决策点。`search == None` 时
 /// 查 blueprint → outgoing（旧行为，byte-equal）；`search == Some` 且命中触发面（[`should_search`]）
-/// 时建**真码深** subgame re-solve（[`subgame_search`]；`deep_menu` → 子树用 {1pot} 单档菜单 +
+/// 时建**真码深** subgame re-solve（[`subgame_search_cached`]；`deep_menu` → 子树用 {1pot} 单档菜单 +
 /// outgoing 用 {1pot} 抽象算尺寸，缺口③）→ outgoing 按真栈算尺寸，解不出来 = check-when-free
 /// （能 check 就 check、否则 fold；不回落 blueprint，§2.3）。**lockstep 失同步**（off-stack all-in
 /// 线等）且 `search == Some` 且 postflop → 脱影子搜索（[`decide_search_unanchored`]，缺口②续）；
 /// 其余**前置 / blueprint 路径**失败返回安全兜底（不 panic）。
+///
+/// `solve_cache` = within-round solve 缓存（[`SubgameSolveCache`] doc）：常驻 main loop 持有、
+/// 跨请求传入——同手同街第二次决策命中即复用 solve、只重做导航（恢复「每轮恰好一个 solve」，
+/// time_budget anytime 下逐决策重解会读不同均衡；mid-round wall ≈ 0）。key 覆盖 solve 全部输入
+/// （solve 边界现算），跨手 / 跨街自然替换；blueprint 路径不读不写它（byte-equal 不受影响）。
 fn decide(
     game: &SimplifiedNlheGame,
     abstraction: &StreetActionAbstraction,
@@ -220,6 +230,7 @@ fn decide(
     req: &Request,
     base_seed: u64,
     search: Option<&SubgameSearchConfig>,
+    solve_cache: &mut SubgameSolveCache,
 ) -> Response {
     // —— 前置校验（不满足 = 兜底）——
     if req.hole.len() != 2 {
@@ -320,6 +331,7 @@ fn decide(
                         hole,
                         &board,
                         &reason,
+                        solve_cache,
                     );
                 }
             }
@@ -352,7 +364,8 @@ fn decide(
             ResolveRoot::CurrentDecision => &auth,
         };
         let hand_seed = hand_seed_for(req, base_seed);
-        match subgame_search(
+        match subgame_search_cached(
+            Some(solve_cache), // within-round solve 缓存：同手同街命中 → 复用 solve 只重导航。
             &auth,
             root_state,
             game,
@@ -588,6 +601,7 @@ fn decide_search_unanchored(
     hole: [Card; 2],
     board: &[Card],
     shadow_reason: &str,
+    solve_cache: &mut SubgameSolveCache,
 ) -> Response {
     // 真栈重放（auth / 轮起点快照 / 当前街真实动作序）。建不了 = §2.3「建不了树」→ 安全降级。
     let (auth, round_start, within) =
@@ -601,8 +615,15 @@ fn decide_search_unanchored(
         return safe_fallback(&req.valid, shadow_reason);
     }
     let hand_seed = hand_seed_for(req, base_seed);
-    let dist = match subgame_search_unanchored(&auth, &round_start, game, &within, scfg, hand_seed)
-    {
+    let dist = match subgame_search_unanchored_cached(
+        Some(solve_cache), // within-round solve 缓存（同锚定路径；kind 进 key、两路不串条目）。
+        &auth,
+        &round_start,
+        game,
+        &within,
+        scfg,
+        hand_seed,
+    ) {
         Ok(d) => d,
         Err(reason) => return search_giveup(&req.valid, &format!("unanchored:{reason}")),
     };
@@ -837,6 +858,10 @@ fn run() -> Result<(), String> {
 
     let strategy_fn = |info: &InfoSetId, _n: usize| -> Vec<f64> { trainer.average_strategy(*info) };
 
+    // within-round solve 缓存（进程常驻，跨请求）：同手同街第二次决策命中 → 复用 solve 只重
+    // 导航——恢复「每轮恰好一个 solve」一致性（time_budget anytime 下重解会读不同均衡）+
+    // mid-round wall ≈ 0。容量 1，跨手 / 跨街 key 自然替换。
+    let mut solve_cache = SubgameSolveCache::new();
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -851,6 +876,7 @@ fn run() -> Result<(), String> {
                 &req,
                 args.seed,
                 args.search.as_ref(),
+                &mut solve_cache,
             ),
             // 解析失败也不崩：出 fold（最保守；没有 valid 信息可用）。
             Err(e) => Response {
@@ -1067,14 +1093,30 @@ mod tests {
             valid: full_valid(),
             stacks: vec![],
         };
-        let resp = decide(&game, &abs, &uniform, &req, 0xC0FFEE, None);
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xC0FFEE,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
         assert!(is_legal(&resp, &req.valid), "BTN 决策应合法，得 {resp:?}");
         assert_eq!(
             resp.source, "blueprint",
             "faithful 路径应由 blueprint 驱动，得 {resp:?}"
         );
         // 确定性：同输入同输出。
-        let again = decide(&game, &abs, &uniform, &req, 0xC0FFEE, None);
+        let again = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xC0FFEE,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
         assert_eq!(resp, again, "同 seed 同输入应确定性");
     }
 
@@ -1102,7 +1144,15 @@ mod tests {
             valid: full_valid(),
             stacks: vec![],
         };
-        let resp = decide(&game, &abs, &uniform, &req, 1, None);
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            1,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
         assert!(resp.source.starts_with("fallback:"), "应兜底，得 {resp:?}");
         assert!(is_legal(&resp, &req.valid), "兜底动作须合法，得 {resp:?}");
     }
@@ -1128,7 +1178,15 @@ mod tests {
             },
             stacks: vec![],
         };
-        let resp = decide(&game, &abs, &uniform, &req, 0, None);
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
         assert_eq!(resp.source, "fallback:not_6max");
         assert!(is_legal(&resp, &req.valid));
     }
@@ -1229,8 +1287,24 @@ mod tests {
             trigger: SearchTrigger::AllPostflop, // 即便最宽触发面，preflop 仍不搜。
             ..SubgameSearchConfig::default()
         };
-        let off = decide(&game, &abs, &uniform, &req, 0x5EED, None);
-        let on_untriggered = decide(&game, &abs, &uniform, &req, 0x5EED, Some(&scfg));
+        let off = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x5EED,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        let on_untriggered = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x5EED,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert_eq!(
             off, on_untriggered,
             "preflop（未触发）：search=Some 须与 search=None byte-equal，得 {off:?} vs {on_untriggered:?}"
@@ -1251,14 +1325,30 @@ mod tests {
             trigger: SearchTrigger::FlopFirstUnraised,
             ..SubgameSearchConfig::default()
         };
-        let resp = decide(&game, &abs, &uniform, &req, 0xA11CE, Some(&scfg));
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xA11CE,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert!(is_legal(&resp, &req.valid), "搜索动作须合法，得 {resp:?}");
         // source 要么 search（解成功），要么 search_giveup:*（罕见解不出来 → check-when-free），绝不静默 blueprint。
         assert!(
             resp.source == "search" || resp.source.starts_with("search_giveup:"),
             "搜索区 source 须 search / search_giveup:*，得 {resp:?}"
         );
-        let again = decide(&game, &abs, &uniform, &req, 0xA11CE, Some(&scfg));
+        let again = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xA11CE,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert_eq!(resp, again, "同 seed 搜索须确定性（byte-equal 可复现）");
     }
 
@@ -1277,7 +1367,15 @@ mod tests {
             max_subtree_nodes: 4_000_000, // 深码 SPR 大、树更大，放宽 cap（不爆即可）。
             ..SubgameSearchConfig::default()
         };
-        let resp = decide(&game, &abs, &uniform, &req, 0xDEE7, Some(&scfg));
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xDEE7,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert!(
             is_legal(&resp, &req.valid),
             "深码搜索动作须合法，得 {resp:?}"
@@ -1303,7 +1401,15 @@ mod tests {
             max_subtree_nodes: 1, // 任何 flop 子树 >1 节点 → subgame_search Err → 降级。
             ..SubgameSearchConfig::default()
         };
-        let resp = decide(&game, &abs, &uniform, &req, 0xF01D, Some(&scfg));
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xF01D,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert_eq!(
             resp.action, "check",
             "可 check 的局面降级应 check（非 fold），得 {resp:?}"
@@ -1331,7 +1437,15 @@ mod tests {
             max_subtree_nodes: 4_000_000, // 深码 SPR 大，放宽 cap（{1pot} 仍小，不会爆）。
             ..SubgameSearchConfig::default()
         };
-        let resp = decide(&game, &abs, &uniform, &req, 0xDEE9, Some(&scfg));
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xDEE9,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert!(
             is_legal(&resp, &req.valid),
             "深码 {{1pot}} 搜索动作须合法，得 {resp:?}"
@@ -1340,7 +1454,15 @@ mod tests {
             resp.source, "search",
             "deep_menu 应解出（{{1pot}} 子树小、stub 桶 root 必累积）= source search，得 {resp:?}"
         );
-        let again = decide(&game, &abs, &uniform, &req, 0xDEE9, Some(&scfg));
+        let again = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xDEE9,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert_eq!(resp, again, "同 seed deep_menu 搜索须确定性（可复现）");
     }
 
@@ -1371,7 +1493,15 @@ mod tests {
             max_subtree_nodes: 4_000_000,
             ..SubgameSearchConfig::default()
         };
-        let resp = decide(&game, &abs, &uniform, &req, 0xDEEA, Some(&scfg));
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xDEEA,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert!(
             is_legal(&resp, &req.valid),
             "浅码宽菜单搜索动作须合法，得 {resp:?}"
@@ -1380,8 +1510,96 @@ mod tests {
             resp.source == "search" || resp.source.starts_with("search_giveup:"),
             "搜索区 source 须 search / search_giveup:*，得 {resp:?}"
         );
-        let again = decide(&game, &abs, &uniform, &req, 0xDEEA, Some(&scfg));
+        let again = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xDEEA,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert_eq!(resp, again, "同 seed 浅码宽菜单搜索须确定性（可复现）");
+    }
+
+    /// within-round solve 缓存端到端（§6 #2「每轮恰好一个 solve」）：同手同街两个决策
+    /// （flop 首点我 check → BB bet 1pot → 回到我）共享常驻缓存——第二决策**命中**（hits 计数
+    /// 硬证不重解、只重导航），且命中输出与从头重解 **byte-equal**（固定迭代确定性 → 缓存不改
+    /// 任何输出，只省 wall；time_budget 下则额外恢复「同街读同一均衡」的一致性）。
+    #[test]
+    fn search_within_round_cache_hits_and_byte_equal() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let req1 = flop_first_unraised_req(vec![2000; 6]);
+        // 决策 2 = 同街 mid-round：我(SB) check、BB bet to 40op（=200 solver = 1.0pot，on-menu）。
+        let mut req2 = flop_first_unraised_req(vec![2000; 6]);
+        req2.actions.push(HistAction {
+            seat: 1,
+            action: "check".into(),
+            to: None,
+        });
+        req2.actions.push(HistAction {
+            seat: 2,
+            action: "bet".into(),
+            to: Some(40),
+        });
+        req2.valid = ValidActions {
+            can_check: false,
+            can_call: true,
+            can_raise: true,
+            min_raise: Some(80),
+            max_raise: Some(1980),
+        };
+        let scfg = SubgameSearchConfig {
+            iterations: 400,
+            trigger: SearchTrigger::AllPostflop, // mid-round 也触发（RoundStart 默认）。
+            ..SubgameSearchConfig::default()
+        };
+        let mut cache = SubgameSolveCache::new();
+        let r1 = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req1,
+            0xCAC4E,
+            Some(&scfg),
+            &mut cache,
+        );
+        assert_eq!(r1.source, "search", "决策 1 应解出，得 {r1:?}");
+        assert_eq!((cache.misses(), cache.hits()), (1, 0), "决策 1 = 首 solve");
+        let r2_shared = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req2,
+            0xCAC4E,
+            Some(&scfg),
+            &mut cache,
+        );
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "同手同街第二决策须命中缓存（不重解）"
+        );
+        assert_eq!(
+            r2_shared.source, "search",
+            "决策 2 应解出，得 {r2_shared:?}"
+        );
+        assert!(is_legal(&r2_shared, &req2.valid), "得 {r2_shared:?}");
+        let r2_fresh = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req2,
+            0xCAC4E,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(
+            r2_shared, r2_fresh,
+            "缓存命中输出须 byte-equal 从头重解（固定迭代）"
+        );
     }
 
     // —— 缺口②续：脱影子搜索（off-stack all-in 线，v1 边界①收口）——
@@ -1453,7 +1671,15 @@ mod tests {
         let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
         let req = offstack_allin_req();
         // 前提确证：旧路径（search=None）必兜底。
-        let off = decide(&game, &abs, &uniform, &req, 0x0FF5, None);
+        let off = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x0FF5,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
         assert!(
             off.source.starts_with("fallback:"),
             "100BB 影子在 raise-over 短码 all-in 线上应失同步 → 兜底，得 {off:?}"
@@ -1465,7 +1691,15 @@ mod tests {
             max_subtree_nodes: 1_000_000,
             ..SubgameSearchConfig::default()
         };
-        let resp = decide(&game, &abs, &uniform, &req, 0x0FF5, Some(&scfg));
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x0FF5,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert!(
             is_legal(&resp, &req.valid),
             "脱影子搜索动作须合法，得 {resp:?}"
@@ -1474,7 +1708,15 @@ mod tests {
             resp.source, "search:unanchored",
             "off-stack all-in 线应由脱影子搜索接管（stub 桶 root 必累积），得 {resp:?}"
         );
-        let again = decide(&game, &abs, &uniform, &req, 0x0FF5, Some(&scfg));
+        let again = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x0FF5,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert_eq!(resp, again, "同 seed 脱影子搜索须确定性（可复现）");
     }
 
@@ -1493,7 +1735,15 @@ mod tests {
             max_subtree_nodes: 1_000_000,
             ..SubgameSearchConfig::default()
         };
-        let resp = decide(&game, &abs, &uniform, &req, 0x0FF6, Some(&scfg));
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x0FF6,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert!(
             is_legal(&resp, &req.valid),
             "脱影子 {{1pot}} 搜索动作须合法，得 {resp:?}"
@@ -1530,8 +1780,24 @@ mod tests {
             trigger: SearchTrigger::AllPostflop,
             ..SubgameSearchConfig::default()
         };
-        let off = decide(&game, &abs, &uniform, &req, 1, None);
-        let on = decide(&game, &abs, &uniform, &req, 1, Some(&scfg));
+        let off = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            1,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        let on = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            1,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert_eq!(
             off, on,
             "preflop 影子失同步：开关搜索须 byte-equal（都旧兜底）"
@@ -1600,7 +1866,15 @@ mod tests {
             stacks: vec![2000; 6],
         };
         // 前提确证：旧路径在 limp 池上必兜底（结构 gap）。
-        let off = decide(&game, &abs, &uniform, &req, 0x11B9, None);
+        let off = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x11B9,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
         assert!(
             off.source.starts_with("fallback:"),
             "limp 进 nolimp 影子应 structural_gap → 兜底，得 {off:?}"
@@ -1611,7 +1885,15 @@ mod tests {
             max_subtree_nodes: 1_000_000,
             ..SubgameSearchConfig::default()
         };
-        let resp = decide(&game, &abs, &uniform, &req, 0x11B9, Some(&scfg));
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x11B9,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
         assert!(
             is_legal(&resp, &req.valid),
             "limp 池搜索动作须合法，得 {resp:?}"
