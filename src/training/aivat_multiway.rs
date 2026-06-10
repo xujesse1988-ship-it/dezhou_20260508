@@ -101,6 +101,78 @@ pub trait MultiwayDealValueFn {
     fn v_deal(&self, rel_pos: usize, class169: usize) -> Option<f64>;
 }
 
+/// VF-1 小表（169×N）：blueprint **自对弈**按 `(rel_pos, preflop 169 类)` 聚合的
+/// `E[U]`（**solver chips**，BB=100）。由 `tools/vf1_deal_table_build` 产 JSON；
+/// 表是评测前固定的 artifact → 无偏性与表的好坏无关（模块 doc），`count == 0` 格
+/// 返回 `None`（估计器按 0 计）。
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct Vf1DealTable {
+    pub n_seats: usize,
+    /// 表的单位锚（须 = solver BB 100；load 校验）。
+    pub big_blind_chips: u64,
+    pub blueprint: String,
+    pub reshape: String,
+    pub hands_played: u64,
+    pub hands_skipped: u64,
+    pub seed: u64,
+    /// `[rel_pos][class169]` 均值（chips）；`counts == 0` 的格无意义（任意值）。
+    pub means: Vec<Vec<f64>>,
+    pub counts: Vec<Vec<u64>>,
+}
+
+impl Vf1DealTable {
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("读 VF-1 表 {} 失败: {e}", path.display()))?;
+        let t: Vf1DealTable =
+            serde_json::from_str(&raw).map_err(|e| format!("VF-1 表 JSON 解析失败: {e}"))?;
+        t.validate()?;
+        Ok(t)
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        self.validate()?;
+        let s = serde_json::to_string_pretty(self).map_err(|e| format!("序列化失败: {e}"))?;
+        std::fs::write(path, s).map_err(|e| format!("写 {} 失败: {e}", path.display()))
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.big_blind_chips != 100 {
+            return Err(format!(
+                "VF-1 表单位 BB={} ≠ solver 100（与估计器输入不同量纲）",
+                self.big_blind_chips
+            ));
+        }
+        if self.means.len() != self.n_seats || self.counts.len() != self.n_seats {
+            return Err(format!(
+                "VF-1 表维度错：means {} / counts {} ≠ n_seats {}",
+                self.means.len(),
+                self.counts.len(),
+                self.n_seats
+            ));
+        }
+        for (i, (m, c)) in self.means.iter().zip(&self.counts).enumerate() {
+            if m.len() != 169 || c.len() != 169 {
+                return Err(format!(
+                    "VF-1 表第 {i} 行长度 {}/{} ≠ 169",
+                    m.len(),
+                    c.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl MultiwayDealValueFn for Vf1DealTable {
+    fn v_deal(&self, rel_pos: usize, class169: usize) -> Option<f64> {
+        if *self.counts.get(rel_pos)?.get(class169)? == 0 {
+            return None;
+        }
+        Some(*self.means.get(rel_pos)?.get(class169)?)
+    }
+}
+
 /// chips → mbb/g（统一评测量纲：1 mbb = BB/1000）。
 pub fn chips_to_mbb_per_hand(chips: f64, big_blind_chips: u64) -> f64 {
     chips * 1000.0 / big_blind_chips as f64
@@ -397,6 +469,88 @@ mod tests {
             ..input
         };
         assert!(est.estimate_hand(&bad).is_err(), "U 校验失败应 Err");
+    }
+
+    fn vf1_const(n_seats: usize, v: f64) -> Vf1DealTable {
+        Vf1DealTable {
+            n_seats,
+            big_blind_chips: 100,
+            blueprint: "test".into(),
+            reshape: "none".into(),
+            hands_played: 1,
+            hands_skipped: 0,
+            seed: 0,
+            means: vec![vec![v; 169]; n_seats],
+            counts: vec![vec![1; 169]; n_seats],
+        }
+    }
+
+    /// VF-1 表：count==0 格 None；维度/单位校验 loud；常数表 → c_deal_us 恒 0（realized −
+    /// 全 1326 组合均值，常数差为零——固定 VF 的无偏锚最便宜的检查）。
+    #[test]
+    fn vf1_table_lookup_and_constant_is_zero_correction() {
+        let mut t = vf1_const(3, 7.5);
+        t.counts[1][42] = 0;
+        assert_eq!(t.v_deal(0, 0), Some(7.5));
+        assert_eq!(t.v_deal(1, 42), None, "count==0 → None");
+        assert_eq!(t.v_deal(3, 0), None, "rel_pos 越界 → None");
+
+        let bad = Vf1DealTable {
+            big_blind_chips: 20,
+            ..vf1_const(3, 0.0)
+        };
+        assert!(bad.validate().is_err(), "单位 ≠ 100 应 Err");
+
+        // 常数表 → c_deal_us == 0（fold 终局手）。
+        let cfg = cfg_3max([10_000, 10_000, 10_000]);
+        let input = MultiwayHandInput {
+            config: cfg,
+            our_seat: SeatId(2),
+            our_hole: [c("Ah"), c("Kd")],
+            revealed: vec![None, None, None],
+            board: vec![],
+            actions: vec![(SeatId(0), Action::Fold), (SeatId(1), Action::Fold)],
+            winnings: 50,
+        };
+        let vf = vf1_const(3, 7.5);
+        let est = MultiwayAivatEstimator::new(Some(&vf));
+        let r = est.estimate_hand(&input).expect("Ok");
+        assert!(
+            r.c_deal_us.abs() < 1e-9,
+            "常数 VF 修正应为 0，得 {}",
+            r.c_deal_us
+        );
+        assert_eq!(r.aivat, r.raw);
+    }
+
+    /// 只给我方 169 类（AKo，12 个组合）赋值 v 的表：c_deal_us = v − v·12/1326（解析真值）。
+    #[test]
+    fn vf1_single_class_correction_matches_closed_form() {
+        let pf = PreflopLossless169::new();
+        let class_ako = usize::from(pf.hand_class([c("Ah"), c("Kd")]));
+        let v = 100.0;
+        let mut t = vf1_const(3, 0.0);
+        t.means[2][class_ako] = v;
+
+        let cfg = cfg_3max([10_000, 10_000, 10_000]);
+        let input = MultiwayHandInput {
+            config: cfg,
+            our_seat: SeatId(2), // rel_pos = 2
+            our_hole: [c("Ah"), c("Kd")],
+            revealed: vec![None, None, None],
+            board: vec![],
+            actions: vec![(SeatId(0), Action::Fold), (SeatId(1), Action::Fold)],
+            winnings: 50,
+        };
+        let est = MultiwayAivatEstimator::new(Some(&t));
+        let r = est.estimate_hand(&input).expect("Ok");
+        let expect = v - v * 12.0 / 1326.0;
+        assert!(
+            (r.c_deal_us - expect).abs() < 1e-9,
+            "c_deal_us {} ≠ 解析 {}",
+            r.c_deal_us,
+            expect
+        );
     }
 
     /// 摊牌参与者底牌缺失 → Err（数据管道问题必须暴露，不静默跳过——选择性跳过 = selection bias）。

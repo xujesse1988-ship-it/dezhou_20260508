@@ -71,6 +71,7 @@ use poker::training::nlhe_betting_tree::{
     deep_menu_for, first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
+use poker::training::openpoker_hh::hist_to_concrete;
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
     should_search, subgame_search_cached, subgame_search_unanchored_cached, ResolveRoot,
@@ -184,30 +185,6 @@ fn expected_board_len(s: poker::Street) -> usize {
         poker::Street::Flop => 3,
         poker::Street::Turn => 4,
         poker::Street::River | poker::Street::Showdown => 5,
-    }
-}
-
-/// 把一条历史动作（已 rotate 到 solver 座、`to` 已 ×scale）译成 stage-1 [`Action`]。
-/// raise/bet 按 real 当前 legal（LA-002：无前序 bet → Bet，否则 Raise）选种类。
-fn hist_to_concrete(
-    real: &poker::GameState,
-    action: &str,
-    to_solver: Option<u64>,
-) -> Option<Action> {
-    match action {
-        "fold" => Some(Action::Fold),
-        "check" => Some(Action::Check),
-        "call" => Some(Action::Call),
-        "all_in" | "allin" => Some(Action::AllIn),
-        "raise" | "bet" => {
-            let to = ChipAmount::new(to_solver?);
-            if real.legal_actions().bet_range.is_some() {
-                Some(Action::Bet { to })
-            } else {
-                Some(Action::Raise { to })
-            }
-        }
-        _ => None,
     }
 }
 

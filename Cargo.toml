@@ -146,6 +146,16 @@ path = "tools/six_max_search_probe.rs"
 name = "openpoker_advisor"
 path = "tools/openpoker_advisor.rs"
 
+# §4.2 live 半段数据管道：OpenPoker HH JSONL（driver --hh-log）→ 多人 AIVAT 报表（缺口⑥）。
+[[bin]]
+name = "openpoker_hh_aivat"
+path = "tools/openpoker_hh_aivat.rs"
+
+# VF-1 小表（169×6）：blueprint 自对弈 E[U | rel_pos, 169 类]，aivat_multiway c_deal_us 值函数。
+[[bin]]
+name = "vf1_deal_table_build"
+path = "tools/vf1_deal_table_build.rs"
+
 # 阶段 3 F3 \[报告\]：简化 NLHE D-362 BLAKE3 byte-equal anchor 一次性 instrumentation。
 # 用户授权 F3 anchor 降标 100M 单 run → 10M × 3 run 检查；本 binary 跑 fixed_seed
 # × 3 EsMccfr 训练，比对 avg_strategy BLAKE3 byte-equal。继承 stage 2

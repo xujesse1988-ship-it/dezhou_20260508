@@ -44,6 +44,7 @@ pub mod nlhe_dense_checkpoint;
 pub mod nlhe_dense_trainer;
 pub mod nlhe_eval;
 pub mod nlhe_replay;
+pub mod openpoker_hh;
 pub mod regret;
 pub mod sampling;
 pub mod subgame;
