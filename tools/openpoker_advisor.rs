@@ -41,7 +41,8 @@
 //! 全来自真栈重放，**range 先验退 uniform**、返回子树自身合法集分布，`source=search:unanchored`）；
 //! 影子可用时仍走原锚定路径（blueprint range 先验更好）。②子树下注菜单：默认沿用 blueprint 菜单；
 //! **`--search-deep-menu`（缺口③，2026-06-09；2026-06-10 v2 细化 = SPR 自适应）→ 子树菜单按根
-//! SPR 选宽（[`deep_menu_for`]：深 {1pot} 单档 / 浅 ≤4×pot 放宽 {0.5,1} 两档）**（深码 /
+//! SPR + 人数选宽（[`deep_menu_for`]：深 {1pot} 单档 / 浅 ≤4×pot 且 ≤3 Active 放宽
+//! {0.5,1} 两档）**（深码 /
 //! 多人解到终局控树，§2.1），此时 outgoing 也用 {1pot} 抽象算尺寸（脱影子路径同样适用）。
 //!
 //! # 已知限制（blueprint 路径，`...client_design...` §4）

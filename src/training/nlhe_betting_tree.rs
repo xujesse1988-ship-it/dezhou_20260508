@@ -232,16 +232,25 @@ pub fn deep_wide_half_pot() -> (StreetActionAbstraction, BettingAbstractionRules
     (abs, rules)
 }
 
-/// [`deep_menu_for`] 的 SPR 阈值：第二大 Active 剩余栈 ≤ `4 × pot` → 短码宽菜单。
-/// 量级依据：1pot 注每层把 pot 推到 ~3×，SPR ≤ 4 时 ~2 层进攻即触 all-in、到终局层数
-/// 有限，宽一档不致树爆炸（边界树大小由 `deep_menu_spr_boundary_tree_bounded` 测试钉住，
-/// 越界仍有 `max_subtree_nodes` cap 兜底 → Err → check-when-free，不 panic）。
+/// [`deep_menu_for`] 的 SPR 阈值：第二大 Active 剩余栈 ≤ `4 × pot` → 短码宽菜单（还须
+/// 过人数闸，见 [`DEEP_MENU_WIDE_MAX_ACTIVE`]）。量级依据：1pot 注每层把 pot 推到 ~3×，
+/// SPR ≤ 4 时 ~2 层进攻即触 all-in、到终局层数有限。
 pub const DEEP_MENU_SPR_WIDE_MAX: u64 = 4;
 
+/// [`deep_menu_for`] 的人数闸：Active 座位数 ≤ 3 才许宽菜单。**实测依据（2026-06-10
+/// vultr）**：6-way 25BB limped flop（恰 4×pot 边界）宽档子树 = **558,360 节点** vs {1pot}
+/// 27,108（20.6×）——多人格的菜单加宽是乘性爆炸、吃光 5s 建树预算（A② 建树 ~2.6ms/千节点
+/// → ~1.5s），而 live 浅码池绝大多数是 fold 剩 2–3 家的小池；4+way 浅码维持 {1pot}（
+/// fold/call/1pot/all-in 已覆盖 commit 决策）。3-way 边界树大小由
+/// `deep_menu_spr_adaptive_selection_and_boundary_tree_bounded` 钉住；任何越界仍有
+/// `max_subtree_nodes` cap 兜底 → Err → check-when-free，不 panic。
+pub const DEEP_MENU_WIDE_MAX_ACTIVE: usize = 3;
+
 /// 缺口③ v2 细化（SPR 自适应菜单宽度，exec 文档 §2.1「深码单档、短码可放宽」/ §3.2 缺口③
-/// 「仍未做②」）：按子树根（轮起点）的 SPR 选深码搜索菜单——深 SPR 维持单一 {1pot}
-/// （[`deep_single_pot`]，控树），浅 SPR（≤ [`DEEP_MENU_SPR_WIDE_MAX`]×pot）放宽到
-/// `{0.5, 1.0}` 两档（[`deep_wide_half_pot`]，树小可负担）。
+/// 「仍未做②」）：按子树根（轮起点）的 SPR + 人数选深码搜索菜单——**浅 SPR
+/// （≤ [`DEEP_MENU_SPR_WIDE_MAX`]×pot）且 Active ≤ [`DEEP_MENU_WIDE_MAX_ACTIVE`]** →
+/// 放宽到 `{0.5, 1.0}` 两档（[`deep_wide_half_pot`]，树小可负担）；否则维持单一 {1pot}
+/// （[`deep_single_pot`]，控树）。
 ///
 /// **纯函数 + 整数比较**（只读 `root_state` 的 chip 几何）——`subgame_search*` 选子树菜单
 /// 与 advisor 算 outgoing 尺寸必须**各自重算出同一菜单**，故选单逻辑共享于此、且对同一
@@ -250,8 +259,10 @@ pub const DEEP_MENU_SPR_WIDE_MAX: u64 = 4;
 /// 双方剩余栈的较小者。Active 不足 2 座（其余全 all-in/弃牌）→ 有效栈 0 → 宽菜单（树必小）。
 pub fn deep_menu_for(root_state: &GameState) -> (StreetActionAbstraction, BettingAbstractionRules) {
     let mut top2 = [0u64; 2]; // [最大, 第二大] Active 剩余栈
+    let mut n_active = 0usize;
     for p in root_state.players() {
         if p.status == PlayerStatus::Active {
+            n_active += 1;
             let s = p.stack.as_u64();
             if s > top2[0] {
                 top2 = [s, top2[0]];
@@ -261,7 +272,9 @@ pub fn deep_menu_for(root_state: &GameState) -> (StreetActionAbstraction, Bettin
         }
     }
     let pot = root_state.pot().as_u64();
-    if top2[1] <= DEEP_MENU_SPR_WIDE_MAX.saturating_mul(pot) {
+    if n_active <= DEEP_MENU_WIDE_MAX_ACTIVE
+        && top2[1] <= DEEP_MENU_SPR_WIDE_MAX.saturating_mul(pot)
+    {
         deep_wide_half_pot()
     } else {
         deep_single_pot()

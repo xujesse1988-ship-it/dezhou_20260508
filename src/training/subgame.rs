@@ -700,8 +700,8 @@ pub struct SubgameSearchConfig {
     /// 缺口③（`realtime_search_openpoker_exec` §2.1 / §3.2）：`true` = 子树下注菜单按
     /// 子树根 SPR 自适应选宽（[`deep_menu_for`]，缺口③ v2 细化）——深 SPR 收到**单一
     /// {1pot}**（`deep_single_pot`，把深码 / 多人解到终局的树压到可解：到终局层数多，靠单档
-    /// 收窄每节点分叉）；浅 SPR（≤ 4×pot，树小可负担）放宽到 `{0.5,1}` 两档
-    /// （`deep_wide_half_pot`）。与 blueprint 菜单**解耦不引偏差**：桶表按
+    /// 收窄每节点分叉）；浅 SPR（≤ 4×pot）且 ≤3 Active（小池树小可负担；多人加宽是乘性
+    /// 爆炸，实测 6-way 边界 20.6×）放宽到 `{0.5,1}` 两档（`deep_wide_half_pot`）。与 blueprint 菜单**解耦不引偏差**：桶表按
     /// (cards,board) 归桶、与菜单无关，子树自洽即可（建树与运行期 `legal_actions` 同一 `abs`，
     /// §2.1）。`false`（默认）= 子树沿用 blueprint 自身 abstraction/rules（既有行为，**保持
     /// probe / advisor / §11.5 基线逐 infoset byte-equal、不改生产行为**）。
@@ -941,7 +941,7 @@ fn estimate_range(
 /// confound）；`false` → uniform resample（A/B 对照）。
 ///
 /// `cfg.deep_menu`（缺口③，§2.1）：`true` → 子树菜单按根 SPR 自适应（[`deep_menu_for`]：深
-/// SPR = {1pot} 单档 / 浅 SPR = {0.5,1} 两档，缺口③ v2 细化）建+解，**返回子树自身合法集上的
+/// SPR = {1pot} 单档 / 浅 SPR 且 ≤3 Active = {0.5,1} 两档，缺口③ v2 细化）建+解，**返回子树自身合法集上的
 /// 分布**（不对齐 `legal_abs`——菜单不同，{1pot} ⊊ blueprint）；调用方须用**同一** `deep_menu_for
 /// (root_state)` 抽象 outgoing。`false`（默认）→ 子树用 blueprint 自身菜单、返回**对齐
 /// `legal_abs`** 的分布（既有契约，byte-equal）。deep_menu 与 depth_limit 互斥（早 Err）。
@@ -1063,7 +1063,7 @@ pub fn subgame_search(
     };
 
     // 缺口③（§2.1 / §3.2）：deep_menu → 子树下注菜单按根 SPR 自适应（deep_menu_for：深 SPR =
-    // {1pot} 单档控树 / 浅 SPR = {0.5,1} 两档，v2 细化），把深码 / 多人解到终局的树压到可解；
+    // {1pot} 单档控树 / 浅 SPR 且 ≤3 Active = {0.5,1} 两档，v2 细化），把深码 / 多人解到终局的树压到可解；
     // 与 blueprint 菜单解耦不引偏差（桶表按 cards/board 归桶、与菜单无关，建树与运行期
     // legal_actions 同一 abs，§2.1）。false（默认）= 用 blueprint 自身 abstraction/rules
     // （既有行为，byte-equal）。deep_menu 与 depth_limit 互斥已在函数顶 guard：故 depth_limit 分支
@@ -1851,65 +1851,69 @@ mod tests {
         assert!(r.is_err(), "deep_menu+depth_limit 同开应 Err，得 {r:?}");
     }
 
-    /// 缺口③ v2 细化（SPR 自适应菜单宽度，exec §2.1「深码单档、短码可放宽」）：
+    /// 缺口③ v2 细化（SPR + 人数自适应菜单宽度，exec §2.1「深码单档、短码可放宽」）：
     /// ① [`deep_menu_for`] 深 SPR（HU 200BB limped flop ≈ 99×pot）→ {1pot} 单档；
-    /// ② 浅 SPR（6-way 25BB limped flop：第二大 Active 栈 2400 == 4×pot 600，恰在边界）→
-    ///   {0.5,1} 两档（边界含等号取宽档）；
-    /// ③ 宽档**边界子树**节点数有界——不致把今天 {1pot} 能解的浅码点变成 cap-Err 降级
-    ///   （绝对护栏 + 相对 {1pot} 的放大倍数护栏，真实数值随断言消息暴露）。
+    /// ② 浅 SPR 小池（3-way 13BB limped flop：第二大 Active 栈 1200 == 4×pot 300，恰在
+    ///   边界）→ {0.5,1} 两档（边界含等号取宽档）；
+    /// ③ 浅 SPR **多人**（6-way 25BB：SPR 同样恰 4×pot、但 6 Active）→ 人数闸回 {1pot}
+    ///   ——实测 6-way 边界宽档 = 558,360 节点 vs {1pot} 27,108（20.6×，2026-06-10 vultr），
+    ///   多人加宽是乘性爆炸、吃光建树预算（[`DEEP_MENU_WIDE_MAX_ACTIVE`] 的依据）；
+    /// ④ 3-way SPR 刚过阈值（14BB → 1300 > 1200）→ 回 {1pot}；
+    /// ⑤ 宽档**边界子树**节点数有界（绝对护栏 200k，真实数值 eprintln 暴露）。
     #[test]
     fn deep_menu_spr_adaptive_selection_and_boundary_tree_bounded() {
+        let bet_ratios = |abs: &StreetActionAbstraction, st: &GameState| -> Vec<u32> {
+            abs.abstract_actions(st)
+                .iter()
+                .filter_map(|a| match a {
+                    AbstractAction::Bet { ratio_label, .. }
+                    | AbstractAction::Raise { ratio_label, .. } => Some(ratio_label.as_milli()),
+                    _ => None,
+                })
+                .collect()
+        };
         let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
         // ① 深：{1pot} 单档。
         let deep_state = hu_flop_state(&game, 0x5350_525F_4D4E_5530).game_state; // "SPR_MNU0"
         let (deep_abs, _) = deep_menu_for(&deep_state);
-        let deep_ratios: Vec<u32> = deep_abs
-            .abstract_actions(&deep_state)
-            .iter()
-            .filter_map(|a| match a {
-                AbstractAction::Bet { ratio_label, .. }
-                | AbstractAction::Raise { ratio_label, .. } => Some(ratio_label.as_milli()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(deep_ratios, vec![1000], "深 SPR 应选 {{1pot}} 单档");
-
-        // ② 浅（边界）：{0.5,1} 两档。6-way 25BB：limped flop pot=600、各家剩 2400 = 4×600。
-        let shallow = nway_limped_flop_state(6, 2_500, 0x5350_525F_4D4E_5531);
-        let (wide_abs, wide_rules) = deep_menu_for(&shallow);
-        let wide_ratios: Vec<u32> = wide_abs
-            .abstract_actions(&shallow)
-            .iter()
-            .filter_map(|a| match a {
-                AbstractAction::Bet { ratio_label, .. }
-                | AbstractAction::Raise { ratio_label, .. } => Some(ratio_label.as_milli()),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            wide_ratios,
+            bet_ratios(&deep_abs, &deep_state),
+            vec![1000],
+            "深 SPR 应选 {{1pot}} 单档"
+        );
+
+        // ② 浅小池（边界）：3-way 13BB：limped flop pot=300、各家剩 1200 = 4×300。
+        let shallow = nway_limped_flop_state(3, 1_300, 0x5350_525F_4D4E_5531);
+        let (wide_abs, wide_rules) = deep_menu_for(&shallow);
+        assert_eq!(
+            bet_ratios(&wide_abs, &shallow),
             vec![500, 1000],
-            "浅 SPR（边界）应选 {{0.5,1}} 两档"
+            "浅 SPR ≤3-way（边界）应选 {{0.5,1}} 两档"
         );
         assert!(
             wide_rules.drop_small_reraise,
             "宽档须带 first-bet-small 口径（0.5 仅首攻）"
         );
-        // 边界外一格（26BB → 第二大 Active 栈 2500 > 4×600）→ 回 {1pot}。
-        let just_deep = nway_limped_flop_state(6, 2_600, 0x5350_525F_4D4E_5532);
-        let (jd_abs, _) = deep_menu_for(&just_deep);
-        let jd_ratios: Vec<u32> = jd_abs
-            .abstract_actions(&just_deep)
-            .iter()
-            .filter_map(|a| match a {
-                AbstractAction::Bet { ratio_label, .. }
-                | AbstractAction::Raise { ratio_label, .. } => Some(ratio_label.as_milli()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(jd_ratios, vec![1000], "SPR 刚过阈值应回 {{1pot}}");
 
-        // ③ 边界树大小护栏：6-way 边界宽档 vs 同状态 {1pot}。
+        // ③ 浅多人：6-way 25BB（剩 2400 = 4×600 同样恰边界）→ 人数闸回 {1pot}。
+        let shallow_multiway = nway_limped_flop_state(6, 2_500, 0x5350_525F_4D4E_5533);
+        let (mw_abs, _) = deep_menu_for(&shallow_multiway);
+        assert_eq!(
+            bet_ratios(&mw_abs, &shallow_multiway),
+            vec![1000],
+            "浅 SPR 但 >3 Active 应被人数闸拦回 {{1pot}}（6-way 宽档实测 558k 节点）"
+        );
+
+        // ④ 3-way SPR 刚过阈值（14BB → 剩 1300 > 1200）→ 回 {1pot}。
+        let just_deep = nway_limped_flop_state(3, 1_400, 0x5350_525F_4D4E_5532);
+        let (jd_abs, _) = deep_menu_for(&just_deep);
+        assert_eq!(
+            bet_ratios(&jd_abs, &just_deep),
+            vec![1000],
+            "SPR 刚过阈值应回 {{1pot}}"
+        );
+
+        // ⑤ 边界树大小护栏：3-way 边界宽档 vs 同状态 {1pot}。
         let entrants = live_entrants(&shallow);
         let make = |menu: (StreetActionAbstraction, BettingAbstractionRules)| {
             SubgameNlheGame::new(
@@ -1926,13 +1930,13 @@ mod tests {
         };
         let wide_nodes = make(deep_wide_half_pot());
         let narrow_nodes = make(deep_single_pot());
-        assert!(
-            wide_nodes <= 400_000,
-            "宽档边界子树过大：wide={wide_nodes}（绝对护栏 400k；narrow={narrow_nodes}）"
+        eprintln!(
+            "[deep_menu SPR 边界] 3-way 13BB limped flop（恰 4×pot）：wide{{0.5,1}}={wide_nodes} \
+             节点 vs narrow{{1pot}}={narrow_nodes} 节点"
         );
         assert!(
-            wide_nodes <= narrow_nodes.max(1) * 8,
-            "宽档相对 {{1pot}} 放大超 8×：wide={wide_nodes} narrow={narrow_nodes}"
+            wide_nodes <= 200_000,
+            "宽档边界子树过大：wide={wide_nodes}（绝对护栏 200k；narrow={narrow_nodes}）"
         );
     }
 
