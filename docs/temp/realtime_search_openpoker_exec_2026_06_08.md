@@ -206,6 +206,19 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      扩到 HU 500BB {1pot} 解到终局 + 4/5way limped {1pot}，用 `deep_single_pot()` 菜单）+ ✅ **ε/δ_conv 机制**（新
      `_measure_convergence_calibration`：river/turn 子树 L1 + root-EV 差 MC）。**仍未做**：① ε/δ_conv **真阈值**须在**真桶表**上跑
      （stub 桶全归桶 0 = 退化 ε，换 `BucketTable::open` + river/turn 真 board 即可）；② 深码×多人**叠加**大树 + 按**部署机**核数外推。
+   - **within-round solve 缓存已落地（2026-06-10，commit `c0bce25`，vultr 全绿 497/0）**：RoundStart + round-stable seed
+     的「同街多决策共享字节相同 solve = 一个均衡内自洽」（§6 #2）只在固定迭代下成立——advisor 逐决策无状态重解，
+     (a) 同街第二决策重建重解一遍字节相同的子博弈 = 纯浪费 wall；(b) 开 `time_budget` 后 anytime 迭代数随机器负载变 →
+     同街两次重解可停在不同迭代数 = 读**不同均衡**（§6 #2 想避免的 mid-round 不一致部分回来，正是当年 AllPostflop
+     朴素放宽实测退化的机制根源）。修法 = advisor 常驻进程持 `SubgameSolveCache`（容量 1）：key = solve **全部**实际
+     构造输入在 solve 边界现算 blake3（桶表身份 / cfg 全字段 / hand_seed+街 ordinal / root 几何全可见面 /
+     entrants+raises / §5b reach 向量逐位 / 子树菜单+规则——漏一项 = 读错均衡是唯一认真风险，故不从请求层推导）；
+     命中 → 复用 trainer 只重导航（mid-round 导航用 solve 时存下的同一份 sub_abs）。效果：「每轮恰好一个 solve」恢复
+     （time_budget 下同街读同一均衡）+ mid-round 决策 wall ≈ 0（免建树+求解，build 正是深码×多人真瓶颈 A②）+ 首决策
+     可放心把 time_budget 用满。`subgame_search*` 拆薄壳 + `*_cached` 变体（cache=None = 原行为，既有调用点逐 infoset
+     byte-equal 不动；锚定 / 脱锚两路都吃缓存，kind 进 key 不串条目；depth_limit 路径不缓存——key 须带 blueprint 树
+     叶子映射身份，非生产路径）。固定迭代下命中输出 byte-equal 从头重解（测试钉死：hit/miss 计数硬证不重解 + 换
+     hand_seed / iterations / root 几何必 miss + advisor 端到端 mid-round 命中 `search_within_round_cache_hits_and_byte_equal`）。
 2. **生产 advisor 接搜索**：`openpoker_advisor.rs` 现在完全不调 `subgame_search`、写死了
    `default_6max_100bb`（`:191`）、`Request`（`:84-96`）也没有 per-seat stack 字段。要捕获真实栈 + 在 `decide()` 里新建
    search 分派 + 重写 outgoing（见 §1）——是整条管线重建，不是接一行。
@@ -534,6 +547,11 @@ vultr 全绿）**：`openpoker_advisor` Request 加 optional `stacks[6]` + `deci
 （原「SD 缩到 1/2–1/3」系论文全知设定，已下修，§3.2 #6 / §4.1）；(b) deep_menu SPR + 人数自适应菜单
 （`deep_menu_for`：浅 ≤4×pot 且 ≤3 Active → {0.5,1}，实测 6-way 边界宽档 558k 节点 = 20.6× 爆炸 → 人数闸）+
 `AllPostflop` mid-round 真实动作导航（`within_round_real`，§3.2 缺口③ v2）。
+⑦ **within-round solve 缓存——已落地（2026-06-10，commit `c0bce25`，vultr 全绿 497/0）**：advisor 常驻进程按
+solve 全部输入做 key（`SubgameSolveCache`，solve 边界现算、不从请求层推导），同手同街第二决策命中 → 复用 solve
+只重导航——恢复 §6 #2「每轮恰好一个 solve」一致性（`time_budget` anytime 下逐决策重解会停在不同迭代数 = 读不同
+均衡）、mid-round 决策 wall ≈ 0、首决策可放心用满 time_budget（机制 / key 覆盖面 / byte-equal 守护见 §3.2 缺口①
+进度末条）。
 接下来 = **live 半段数据管道（§4.2 HH 日志升级：driver 落 shown_cards / winnings / 对手 name → 接 `MultiwayHandInput`，
 mbb/g 统一经 `chips_to_mbb_per_hand`）** + 真 blueprint 自对弈 VF-1 小表（169×6）+ 脱锚 range 细化（部分前缀 reach /
 对手数据，后置）。数据管道 = 可并行后台采集，不卡 B/C、随时可起。**
