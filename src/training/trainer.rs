@@ -303,6 +303,14 @@ pub struct EsMccfrTrainer<G: Game> {
     /// LCFR rescale 是否同时作用于 regret 表（Brown 2018 默认 true）；false 时
     /// 仅 rescale strategy_sum（对照实验入口，见 [`Self::with_lcfr_period_strategy_only`]）。
     pub(crate) lcfr_rescale_regret: bool,
+    /// traverser 轮转座位表（S6 实时搜索 subgame solve 专用）。`None`（默认）= 既有行为：
+    /// traverser = `update_count % n_players` 轮**全部**座位。`Some(seats)` = 第 t 个 update 的
+    /// traverser = `seats[t % seats.len()]`——子树里弃牌 / all-in 座**零决策节点**（规则引擎只让
+    /// `Active` 座当 `current_player`），轮到它们的迭代纯零学习（σ / regret 都只在
+    /// `actor == traverser` 的节点累积，见 [`recurse_es`]）→ 只轮 Active 座 = 同 wall 有效迭代
+    /// ×`n_seats/n_active`。**不存 checkpoint**（subgame 实时一次性求解不落盘；主线训练不用，
+    /// resume 后恒 `None`）。
+    pub(crate) traverser_rotation: Option<Vec<PlayerId>>,
 }
 
 impl<G: Game> EsMccfrTrainer<G> {
@@ -321,7 +329,36 @@ impl<G: Game> EsMccfrTrainer<G> {
             lcfr_period_size: None,
             lcfr_periods_completed: 0,
             lcfr_rescale_regret: true,
+            traverser_rotation: None,
         }
+    }
+
+    /// 限定 traverser 轮转座位集（缺口①续，限时杠杆：S6 实时搜索 subgame solve 只轮**子树根
+    /// 仍 Active** 的座——弃牌 / all-in 座零决策节点，轮到 = 零学习迭代；浪费比
+    /// `(n_seats−n_active)/n_seats`，修复加速 `1/(1−浪费比)`，fold 剩 2-3 人的最常见局面
+    /// 2-3×）。空集 / 座位越界 / `update_count > 0` panic（与 [`with_lcfr_period`]
+    /// (Self::with_lcfr_period) 同风格：训练开始前配置）。
+    ///
+    /// 注意：开启后 rng 消费序列与默认全座轮转不同 → 与既有基线**不 byte-equal**（固定迭代 +
+    /// 固定 seed 下自身仍确定性可复现）；`None`（默认 / 不调用）保持既有行为逐位不变。
+    /// 轮转 = **全部**座位时与默认轮转**逐位等价**（同 traverser 序列、同 rng 流）。
+    pub fn with_traverser_rotation(mut self, seats: Vec<PlayerId>) -> Self {
+        assert!(
+            !seats.is_empty(),
+            "traverser rotation must be non-empty（root 是 decision 节点 ⇒ 至少 1 座 Active）"
+        );
+        let n = self.game.n_players();
+        assert!(
+            seats.iter().all(|&s| (s as usize) < n),
+            "traverser rotation seat out of range (n_players = {n})"
+        );
+        assert_eq!(
+            self.update_count, 0,
+            "traverser rotation must be configured before any step (update_count = {} != 0)",
+            self.update_count
+        );
+        self.traverser_rotation = Some(seats);
+        self
     }
 
     /// 启用 LCFR-MCCFR period rescale（Brown & Sandholm 2018 §Discounted Monte
@@ -480,6 +517,8 @@ impl<G: Game> EsMccfrTrainer<G> {
 
         let game = &self.game;
         let shared_regret: &RegretTable<G::InfoSet> = &self.regret;
+        // traverser 轮转表（同 `step`）：None = 既有全座轮转（主线训练路径，行为不变）。
+        let rotation: Option<&[PlayerId]> = self.traverser_rotation.as_deref();
 
         // rayon 全局 pool dispatch：`par_iter_mut().enumerate()` 是
         // `IndexedParallelIterator`，`.collect()` 保 input index 顺序，因此
@@ -496,8 +535,11 @@ impl<G: Game> EsMccfrTrainer<G> {
                     let rng = rng_slot.as_mut();
                     for batch_idx in 0..batch_per_worker {
                         let trajectory_index = batch_idx as u64 * n_active as u64 + tid as u64;
-                        let traverser =
-                            ((base_update_count + trajectory_index) % n_players) as PlayerId;
+                        let t = base_update_count + trajectory_index;
+                        let traverser = match rotation {
+                            Some(rot) => rot[(t % rot.len() as u64) as usize],
+                            None => (t % n_players) as PlayerId,
+                        };
                         let root = game.root(rng);
                         recurse_es_parallel::<G>(
                             root,
@@ -535,9 +577,13 @@ impl<G: Game> EsMccfrTrainer<G> {
 
 impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
     fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError> {
-        // D-307 alternating traverser：iter t 上 traverser = (t mod n_players)。
+        // D-307 alternating traverser：iter t 上 traverser = (t mod n_players)；
+        // 配 traverser_rotation 时只在表内轮转（= seats[t % len]，S6 subgame 只轮 Active 座）。
         let n_players = self.game.n_players() as u64;
-        let traverser = (self.update_count % n_players) as PlayerId;
+        let traverser = match &self.traverser_rotation {
+            Some(rot) => rot[(self.update_count % rot.len() as u64) as usize],
+            None => (self.update_count % n_players) as PlayerId,
+        };
         let root = self.game.root(rng);
         recurse_es::<G>(
             root,
@@ -629,6 +675,8 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             lcfr_period_size: None,
             lcfr_periods_completed: 0,
             lcfr_rescale_regret: true,
+            // traverser 轮转同样不存 checkpoint（subgame 实时求解不落盘；resume 恒默认轮转）。
+            traverser_rotation: None,
         })
     }
 }
@@ -919,4 +967,81 @@ where
         acc.accumulate(k, &v);
     }
     Ok(acc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::rng::ChaCha20Rng;
+    use crate::training::kuhn::KuhnGame;
+
+    fn run_kuhn(rotation: Option<Vec<PlayerId>>) -> EsMccfrTrainer<KuhnGame> {
+        let mut t = EsMccfrTrainer::new(KuhnGame, 0x7472_7674); // "trvt"
+        if let Some(rot) = rotation {
+            t = t.with_traverser_rotation(rot);
+        }
+        let mut rng = ChaCha20Rng::from_seed(0x7472_7675);
+        for _ in 0..400 {
+            t.step(&mut rng).expect("kuhn step");
+        }
+        t
+    }
+
+    /// 轮转表 = **全部**座位 ≡ 默认轮转：traverser 序列相同（`[0,1][t%2] == t%2`）、rng 消费
+    /// 序列相同 → 每个 infoset 的 average strategy **逐位**相同。钉「rotation 只换选择来源、
+    /// 不引入任何行为差」——默认 None 路径（主线训练 / 既有 subgame 基线）byte-equal 由此保证。
+    #[test]
+    fn traverser_rotation_full_set_byte_equal_default() {
+        let base = run_kuhn(None);
+        let full = run_kuhn(Some(vec![0, 1]));
+        let base_keys: Vec<_> = base.strategy_sum.inner().keys().cloned().collect();
+        assert_eq!(
+            base_keys.len(),
+            full.strategy_sum.inner().len(),
+            "σ 条目数须一致"
+        );
+        for info in &base_keys {
+            let a = base.average_strategy(info);
+            let b = full.average_strategy(info);
+            assert_eq!(a.len(), b.len(), "维度一致 {info:?}");
+            for (x, y) in a.iter().zip(&b) {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "全集轮转必须与默认逐位相同 {info:?}"
+                );
+            }
+        }
+    }
+
+    /// 子集轮转 `[1]`：座 0 永不当 traverser → (a) σ 只在 traverser 节点累积 ⇒ strategy_sum
+    /// 全部 key 的 actor == 1；(b) 座 0 的 regret 槽（路径访问 get_or_init 建出）恒为零向量
+    /// （regret 也只在 actor == traverser 节点累积）。这就是「弃牌座当 traverser = 零学习」的
+    /// 机制本体——S6 subgame 用 Active 座轮转表跳过它们。
+    #[test]
+    fn traverser_rotation_subset_never_traverses_excluded_seat() {
+        let only_p1 = run_kuhn(Some(vec![1]));
+        assert!(
+            !only_p1.strategy_sum.inner().is_empty(),
+            "座 1 当 traverser 应有 σ 累积"
+        );
+        assert!(
+            only_p1.strategy_sum.inner().keys().all(|i| i.actor == 1),
+            "σ 只应出现在轮转表内座位（actor == 1）"
+        );
+        let mut p0_slots = 0usize;
+        for (info, regrets) in only_p1.regret.inner().iter() {
+            if info.actor == 0 {
+                p0_slots += 1;
+                assert!(
+                    regrets.iter().all(|r| *r == 0.0),
+                    "座 0 永不当 traverser → regret 恒零，{info:?} 得 {regrets:?}"
+                );
+            }
+        }
+        assert!(
+            p0_slots > 0,
+            "座 0 节点在采样路径上被访问（get_or_init 建槽）"
+        );
+    }
 }

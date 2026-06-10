@@ -713,6 +713,16 @@ pub struct SubgameSearchConfig {
     ///
     /// [`depth_limit`]: Self::depth_limit
     pub deep_menu: bool,
+    /// 缺口①续（限时杠杆②，与 LCFR 正交）：`true` = subgame solve 的 traverser 只轮**子树根
+    /// 仍 `Active`** 的座位（[`EsMccfrTrainer::with_traverser_rotation`]）。弃牌 / all-in 座在
+    /// 子树里**零决策节点**（规则引擎只让 `Active` 座当 `current_player`）→ 默认 `0..n_seats`
+    /// 轮转下轮到它们的迭代纯零学习（σ / regret 都只在 `actor == traverser` 节点累积，
+    /// `trainer.rs` `recurse_es`）；只轮 Active 座 = 同 wall 有效迭代 ×`n_seats/n_active`
+    /// （fold 剩 2-3 人的最常见局面 2-3×，h2h `SearchObserver` 的浪费遥测即量此）。
+    /// `false`（默认）= 既有全座轮转——**保持全部既有基线逐 infoset byte-equal、不改生产行为**。
+    /// 开启后 rng 消费序列改变 → 与 `false` 基线不 byte-equal（固定迭代 + 固定 seed 下自身仍
+    /// 确定性可复现；本字段进 within-round solve 缓存 key）。
+    pub live_traversers: bool,
 }
 
 impl Default for SubgameSearchConfig {
@@ -729,6 +739,7 @@ impl Default for SubgameSearchConfig {
             lcfr: false,
             time_budget: None,
             deep_menu: false,
+            live_traversers: false,
         }
     }
 }
@@ -1062,6 +1073,7 @@ fn solve_cache_key(
         cfg.biased_leaf as u8,
         cfg.lcfr as u8,
         cfg.deep_menu as u8,
+        cfg.live_traversers as u8,
         cfg.time_budget.is_some() as u8,
     ]);
     h.update(
@@ -1505,6 +1517,19 @@ fn solve_subgame(
             cfg.max_subtree_nodes
         ));
     }
+    // 缺口①续（限时杠杆②）：live_traversers → traverser 只轮子树根仍 Active 的座
+    // （弃牌 / all-in 座零决策节点，轮到 = 零学习迭代）。root 是 decision 节点 ⇒ 至少
+    // current_player 一座 Active ⇒ 轮转表非空（with_traverser_rotation 的非空断言满足）。
+    // 默认 false = 既有全座轮转，逐位不变。
+    let rotation: Option<Vec<PlayerId>> = cfg.live_traversers.then(|| {
+        sub.template()
+            .players()
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.status == PlayerStatus::Active)
+            .map(|(i, _)| i as PlayerId)
+            .collect()
+    });
     // 缺口①：LCFR 加权（限时第一杠杆，A②）。period 按 cfg.iterations 现算小值（≈ iterations/50，
     // 落进 with_lcfr_period 要求的 总更新/period∈[20,100]，见 trainer.rs:332）；iterations<50 →
     // clamp 1。fresh trainer（update_count==0）→ with_lcfr_period 前置满足。LCFR rescale 确定性
@@ -1515,6 +1540,9 @@ fn solve_subgame(
     } else {
         base
     };
+    if let Some(rot) = rotation {
+        trainer = trainer.with_traverser_rotation(rot);
+    }
     let mut srng = ChaCha20Rng::from_seed(master ^ 0xC0FF_EE00_C0FF_EE00);
     // 缺口①本体（§2.3）：time_budget=Some → 墙钟 anytime（跑到 iterations 上限或 wall 达预算就停，
     // 此时 iterations 退为安全上界）；None → 跑满固定 iterations（既有行为，byte-equal）。budgeted
@@ -2036,6 +2064,7 @@ mod tests {
             lcfr: false,
             time_budget: None,
             deep_menu: false,
+            live_traversers: false,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -2093,6 +2122,7 @@ mod tests {
             lcfr: false,
             time_budget: None,
             deep_menu: false,
+            live_traversers: false,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, None, 0, 0,
@@ -2487,6 +2517,7 @@ mod tests {
             lcfr: false,
             time_budget: None,
             deep_menu: false,
+            live_traversers: false,
         };
         let d9 = subgame_search(
             &auth,
@@ -2861,6 +2892,7 @@ mod tests {
             lcfr: true,
             time_budget: None,
             deep_menu: false,
+            live_traversers: false,
         };
         let run = |cfg: &SubgameSearchConfig| {
             subgame_search(
@@ -2932,6 +2964,7 @@ mod tests {
             lcfr: false,
             time_budget: None,
             deep_menu: false,
+            live_traversers: false,
         };
         let base = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &none_cfg, None, None, 0x55, 4,
@@ -4152,5 +4185,45 @@ mod tests {
         )
         .expect("换 hand_seed 仍 Ok");
         assert_eq!(cache.misses(), 2, "hand_seed 变 → miss");
+    }
+    // —— 缺口①续：live_traversers（traverser 只轮子树根仍 Active 的座）——
+
+    /// live_traversers 端到端：off-stack 线（6 座中 3 弃牌 + UTG all-in → 仅 SB/BB Active，
+    /// 默认轮转下 4/6 迭代零学习）开旗求解 Ok + 分布归一 + 同 seed 可复现（rng 消费序列与
+    /// 默认轮转不同，但固定迭代下自身确定性）；且旗进 within-round solve 缓存 key
+    /// （翻转必 miss——两种轮转解出的是不同 rng 流的均衡，串读 = 读错均衡）。
+    #[test]
+    fn live_traversers_solves_reproducible_and_keyed() {
+        let game = nolimp_6max_game();
+        let auth = offstack_allin_flop_state();
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            live_traversers: true,
+            ..SubgameSearchConfig::default()
+        };
+        let run = || subgame_search_unanchored(&auth, &auth, &game, &[], &cfg, 0x7261);
+        let d1 = run().expect("live_traversers 求解应 Ok");
+        let sum: f64 = d1.iter().map(|(_, p)| p).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "分布应归一，和={sum}");
+        assert!(d1.iter().all(|(_, p)| *p > 0.0 && p.is_finite()));
+        let d2 = run().expect("再跑一次");
+        assert_eq!(format!("{d1:?}"), format!("{d2:?}"), "同 seed 须可复现");
+
+        // 旗进缓存 key：off 先 solve，翻 on 必 miss（key 覆盖 live_traversers）。
+        let mut cache = SubgameSolveCache::new();
+        let off = SubgameSearchConfig {
+            live_traversers: false,
+            ..cfg
+        };
+        subgame_search_unanchored_cached(Some(&mut cache), &auth, &auth, &game, &[], &off, 0x7261)
+            .expect("off 应 Ok");
+        subgame_search_unanchored_cached(Some(&mut cache), &auth, &auth, &game, &[], &cfg, 0x7261)
+            .expect("on 应 Ok");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (2, 0),
+            "live_traversers 翻转须 miss（key 覆盖该旗）"
+        );
     }
 }

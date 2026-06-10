@@ -839,8 +839,8 @@ fn run() -> Result<(), String> {
     };
     if let Some(scfg) = &args.search {
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} max_nodes={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.max_subtree_nodes
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes
         );
     }
     eprintln!(
@@ -909,6 +909,7 @@ fn parse_args() -> Result<Args, String> {
     let mut search_time_budget_ms: Option<u64> = None;
     let mut search_lcfr = false;
     let mut search_deep_menu = false;
+    let mut search_live_traversers = false;
     let mut search_max_nodes: usize = SubgameSearchConfig::default().max_subtree_nodes;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -952,6 +953,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--search-lcfr" => search_lcfr = true,
             "--search-deep-menu" => search_deep_menu = true,
+            "--search-live-traversers" => search_live_traversers = true,
             "--search-max-nodes" => {
                 search_max_nodes = next_val(&mut it, &arg)?
                     .parse()
@@ -970,6 +972,9 @@ fn parse_args() -> Result<Args, String> {
             time_budget: search_time_budget_ms.map(Duration::from_millis),
             // 缺口③：深码窄菜单——子树下注菜单收到单一 {1pot}（深码 / 多人解到终局控树，§2.1）。
             deep_menu: search_deep_menu,
+            // 缺口①续（限时杠杆②）：traverser 只轮子树根仍 Active 的座（弃牌/all-in 座零学习
+            // 迭代跳过，同 wall 有效迭代 ×n_seats/n_active）。
+            live_traversers: search_live_traversers,
             // 解到终局（深码 / 多人 §2.1）：depth_limit / biased_leaf 均 false（默认）；
             // resolve_root / use_blueprint_range / seed 用默认（RoundStart / true / 固定基）。
             ..SubgameSearchConfig::default()
@@ -980,6 +985,7 @@ fn parse_args() -> Result<Args, String> {
             || search_time_budget_ms.is_some()
             || search_lcfr
             || search_deep_menu
+            || search_live_traversers
             || search_max_nodes != SubgameSearchConfig::default().max_subtree_nodes
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());

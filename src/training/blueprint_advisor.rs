@@ -368,13 +368,21 @@ impl SearchObserver {
     /// `active[seat]` = 该座在子树根仍 `Active`（= 子树里有 ≥1 决策节点的充要条件：`Active` 座
     /// 必在本街某线行动，`Folded`/`AllIn` 座永不行动）。ES traverser 调度从 `update_count == 0`
     /// 起 = 第 `t` 步 traverser `= t % n`，故座 `s` 摊到 `iterations/n (+1 if s < iterations%n)` 步。
-    fn record_solve_waste(&self, iterations: u64, n: usize, active: &[bool]) {
+    /// `live_traversers` = solve 已开 `SubgameSearchConfig::live_traversers`（traverser 只轮
+    /// Active 座，缺口①续修复）→ 浪费恒 0（effective seats 照记，作修复前后对照）。
+    fn record_solve_waste(
+        &self,
+        iterations: u64,
+        n: usize,
+        active: &[bool],
+        live_traversers: bool,
+    ) {
         let mut wasted = 0u64;
         let mut eff = 0u64;
         for (s, &act) in active.iter().enumerate().take(n) {
             if act {
                 eff += 1;
-            } else {
+            } else if !live_traversers {
                 wasted += iterations / n as u64 + u64::from((s as u64) < iterations % n as u64);
             }
         }
@@ -534,7 +542,7 @@ pub fn play_cross_abstraction_hand(
                                 .iter()
                                 .map(|p| matches!(p.status, PlayerStatus::Active))
                                 .collect();
-                            o.record_solve_waste(scfg.iterations, n, &active);
+                            o.record_solve_waste(scfg.iterations, n, &active, scfg.live_traversers);
                         }
                         d
                     }
@@ -1129,6 +1137,7 @@ mod tests {
             lcfr: false,
             time_budget: None,
             deep_menu: false,
+            live_traversers: false,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;
