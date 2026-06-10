@@ -246,7 +246,10 @@ impl<'a> MultiwayAivatEstimator<'a> {
         // 我方在锁定前已弃 → U = −committed_total 与 runout 无关 → c_runout 恒 0，跳过枚举。
         if showdown && contenders.contains(&our) && pre_final.board().len() < 5 {
             res.has_runout = true;
-            let prefix: Vec<Card> = pre_final.board().to_vec();
+            // prefix = **真实**已发公共牌（input.board 前缀）——pre_final 是 REPLAY_SEED 重放态、
+            // 其 board() 是随机牌，只可用其 *长度*（锁定街）；用它的牌会让 E_runout 条件在错误
+            // 的 board 上 = 有偏（2026-06-10 全量闸门撞出，oracle 测试现钉死此口径）。
+            let prefix: Vec<Card> = input.board[..pre_final.board().len()].to_vec();
             res.n_unknown_folded = (0..n)
                 .filter(|&i| {
                     i != our

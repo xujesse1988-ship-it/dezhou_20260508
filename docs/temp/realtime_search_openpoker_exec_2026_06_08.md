@@ -248,10 +248,19 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      `--search-lcfr`）。deep_menu 与 depth_limit **互斥**（早 `Err`，深码无叶子值 §6 #2）。测试：`subgame_search_deep_menu_single_pot`
      （只含 1.0pot 档 + 不因菜单不匹配 `Err` + 可复现）/ `deep_menu_and_depth_limit_mutually_exclusive` /
      `search_deep_menu_legal_and_reproducible`（深码不对称栈 600BB vs 200BB 端到端 `source=search`）；守 `search=None` / 非 deep
-     路径逐 infoset byte-equal。**仍未做**：①`{1pot}` 单档对**深码 / 多人策略质量**够不够 = B/live 问题（与可解性无关，§4.1 A② 续）；
-     ②**SPR 自适应菜单宽度**（短码可放宽到多档，§2.1）= v2 细化，v1 deep_menu 一律 `{1pot}`；③deep_menu 当前只在 `FlopFirstUnraised`
-     验过（within-round tags 空 → 导航回 root）；配 `AllPostflop` 时 within-round 导航可能撞 `{1pot}` 子树没有的 blueprint tag → 安全
-     降级（check-when-free），非主场景。
+     路径逐 infoset byte-equal。
+   - **v2 两细化已落地（2026-06-10，commit `2c29df4`→`f1e0455`，vultr 全绿）**：
+     ②**SPR + 人数自适应菜单宽度**（`deep_menu_for`，纯函数——`subgame_search*` 选子树菜单与 advisor outgoing 必须各自重算出
+     **同一**菜单，否则 0.5pot 档在 {1pot} 抽象下塌成 all-in = 错动作）：浅 SPR（第二大 Active 剩余栈 ≤ 4×pot）**且 ≤3 Active**
+     → `{0.5,1}` 两档（`deep_wide_half_pot`，first-bet-small 口径）；否则维持 {1pot}。**人数闸是 vultr 首跑实测逼出来的**：
+     6-way 25BB 恰边界宽档子树 = **558,360 节点 vs {1pot} 27,108（20.6×）**——多人加宽是乘性爆炸、单建树 ~1.5s 吃掉 5s 预算
+     大半；live 浅码池最常见形态本就是 fold 剩 2–3 家的小池，4+way 浅码维持 {1pot}。3-way 13BB 边界树大小测试钉死 + 200k 绝对护栏。
+     ③**deep_menu 配 `AllPostflop` 的 within-round 导航**：deep 菜单 ≠ blueprint 菜单 → blueprint tags 在子树上必失配，mid-round
+     改用**当前街真实动作序**在子树上重放导航（`navigate_subtree_by_real_actions`，与脱锚路径同口径；`subgame_search` 加
+     `within_round_real` 参数，openpoker_advisor 把 `build_real_auth` 已产出的 `within` 喂进去、blueprint_advisor h2h 维护
+     `round_within`）；未提供动作序 → `Err` 安全降级。测试 `deep_menu_allpostflop_midround_navigates_by_real_actions`
+     （0.5pot mid-round：提供动作序 Ok / 不提供 Err / byte-equal 可复现）。
+     **仍未做**：①`{1pot}`（及浅码 `{0.5,1}`）对**深码 / 多人策略质量**够不够 = B/live 问题（与可解性无关，§4.1 A② 续）。
 4. **多人 >3 的树**：见 §2.2，**实时解 N-way 子树**——解到终局、用真实 N-way side-pot `payouts()`。
 5. **真实分布覆盖度量**：见 §4.2（HH 日志 + 覆盖热力图，都还没建）。
 6. **多人 AIVAT 降方差**：`aivat_nlhe.rs` 现在是 HU 单对手（两人写死），要推广到 N 座。单边 P_a={chance, 我方}

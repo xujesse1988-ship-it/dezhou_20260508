@@ -54,7 +54,7 @@ fn dealing_perm(cfg: &TableConfig) -> Vec<usize> {
         })
         .collect();
     let used: HashSet<u8> = (0..2 * n as u8).collect();
-    let rest = pick_unused_padding(&used, 52 - 2 * n - 5);
+    let rest = pick_unused_padding(&used, 52 - 2 * n);
     let (board5, padding) = rest.split_at(5);
     let deck = build_dealing_order(
         n,
