@@ -1502,6 +1502,23 @@ pub fn subgame_search_cached(
     Ok(out)
 }
 
+/// LCFR period（[`solve_subgame`] 用）：≈ iterations/50，落进 with_lcfr_period 要求的
+/// 总更新/period∈[20,100]（trainer.rs:364 doc）；iterations<50 → clamp 1。
+///
+/// time_budget anytime 下 iterations 只是安全上界（advisor 默认抬到 `u64::MAX`，求解由墙钟
+/// 截断）、实际 update 数由 wall 决定 → period 不能挂在 iterations 上（u64::MAX/50 = 永不
+/// rescale = LCFR 静默退化 vanilla）。cap 取 10_000：5s 档实测 ~11–33µs/iter ≈ 150–450k
+/// updates → 15–45 个 period；iterations ≤ 500k 时公式与 None 路径相同 → 「预算不绑定 ==
+/// 固定迭代」契约（time_budget_anytime_stops_and_is_valid）在其测试档位不破。
+fn lcfr_period(cfg: &SubgameSearchConfig) -> u64 {
+    let by_iters = (cfg.iterations / 50).max(1);
+    if cfg.time_budget.is_some() {
+        by_iters.min(10_000)
+    } else {
+        by_iters
+    }
+}
+
 /// 共享求解段（[`subgame_search`] blueprint 锚 / [`subgame_search_unanchored`] 真栈锚共用）：
 /// 子树节点数 cap → 建 trainer（LCFR 可选）→ 求解（固定迭代或墙钟 anytime）。逐字保持原
 /// `subgame_search` 求解段的操作顺序 / RNG 流（既有 probe / advisor / §11.5 基线 byte-equal）。
@@ -1530,13 +1547,12 @@ fn solve_subgame(
             .map(|(i, _)| i as PlayerId)
             .collect()
     });
-    // 缺口①：LCFR 加权（限时第一杠杆，A②）。period 按 cfg.iterations 现算小值（≈ iterations/50，
-    // 落进 with_lcfr_period 要求的 总更新/period∈[20,100]，见 trainer.rs:332）；iterations<50 →
-    // clamp 1。fresh trainer（update_count==0）→ with_lcfr_period 前置满足。LCFR rescale 确定性
-    // （固定迭代 + seed）→ 仍 byte-equal 可复现；vanilla（默认）保持既有行为不变。
+    // 缺口①：LCFR 加权（限时第一杠杆，A②）。period 见 [`lcfr_period`]。fresh trainer
+    // （update_count==0）→ with_lcfr_period 前置满足。LCFR rescale 确定性（固定迭代 + seed）→
+    // 仍 byte-equal 可复现；vanilla（默认）保持既有行为不变。
     let base = EsMccfrTrainer::new(sub, master);
     let mut trainer = if cfg.lcfr {
-        base.with_lcfr_period((cfg.iterations / 50).max(1))
+        base.with_lcfr_period(lcfr_period(cfg))
     } else {
         base
     };
@@ -3013,6 +3029,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// LCFR period 在 time_budget anytime 下不能挂在 iterations 上（advisor 把 iterations
+    /// 默认抬到 `u64::MAX` 当安全上界后，iterations/50 = 永不 rescale = LCFR 静默退化
+    /// vanilla）。钉 [`lcfr_period`]：budgeted 大迭代档 cap 到 10_000；小迭代档与 None
+    /// 公式一致（保 time_budget_anytime_stops_and_is_valid 的 == 契约）。
+    #[test]
+    fn lcfr_period_capped_under_time_budget() {
+        let mut cfg = SubgameSearchConfig {
+            iterations: u64::MAX,
+            time_budget: Some(Duration::from_secs(5)),
+            ..SubgameSearchConfig::default()
+        };
+        assert_eq!(lcfr_period(&cfg), 10_000, "budgeted + 巨大上界 → cap 10k");
+        cfg.iterations = 300;
+        assert_eq!(lcfr_period(&cfg), 6, "budgeted 小迭代档 == iterations/50");
+        cfg.time_budget = None;
+        assert_eq!(lcfr_period(&cfg), 6, "None 路径公式不变");
+        cfg.iterations = u64::MAX;
+        assert_eq!(
+            lcfr_period(&cfg),
+            u64::MAX / 50,
+            "None 路径不 cap（固定迭代档行为逐位保留）"
+        );
+    }
+
+    /// advisor budget 模式实配（iterations=`u64::MAX` 安全上界 + lcfr）端到端：求解须在
+    /// 预算量级内终止（不挂死在 u64::MAX 循环上）且出合法归一分布。
+    #[test]
+    fn time_budget_with_unbounded_iterations_terminates() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x5447_4254_5F41_3242);
+        let auth = flop.game_state.clone();
+        let legal_abs = SimplifiedNlheGame::legal_actions(&flop);
+        let node_id = flop.current_node_id;
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let cfg = SubgameSearchConfig {
+            iterations: u64::MAX,
+            max_subtree_nodes: 1_000_000,
+            seed: 0x7B0D_6E7A_5EED_u64,
+            use_blueprint_range: false,
+            trigger: SearchTrigger::AllPostflop,
+            resolve_root: ResolveRoot::RoundStart,
+            lcfr: true,
+            time_budget: Some(Duration::from_millis(200)),
+            ..SubgameSearchConfig::default()
+        };
+        let t0 = Instant::now();
+        let d = subgame_search(
+            &auth, &auth, &game, &legal_abs, node_id, &strat, &cfg, None, None, 0x55, 4,
+        )
+        .expect("200ms 预算足够采样 root infoset → Ok");
+        // 终止性：每迭代查一次 deadline，HU flop 单迭代 µs 级 → 总 wall ≈ 预算。10× 余量防慢机。
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "u64::MAX 上界下须由墙钟截断（实测 {:?}）",
+            t0.elapsed()
+        );
+        let sum: f64 = d.iter().map(|(_, p)| *p).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "归一，和={sum}");
     }
 
     // ======================================================================

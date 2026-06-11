@@ -1044,6 +1044,10 @@ fn run() -> Result<(), String> {
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut checkpoint: Option<PathBuf> = None;
     let mut bucket_table: Option<PathBuf> = None;
     let mut reshape = "preopen".to_string();
@@ -1051,14 +1055,13 @@ fn parse_args() -> Result<Args, String> {
     let mut seed: u64 = 0;
     // 缺口② 实时搜索 flag（仅 --search 开时打包成 SubgameSearchConfig）。
     let mut search_on = false;
-    let mut search_iters: u64 = 1000;
+    let mut search_iters: Option<u64> = None;
     let mut search_trigger = SearchTrigger::FlopFirstUnraised;
     let mut search_time_budget_ms: Option<u64> = None;
     let mut search_lcfr = false;
     let mut search_deep_menu = false;
     let mut search_live_traversers = false;
     let mut search_max_nodes: usize = SubgameSearchConfig::default().max_subtree_nodes;
-    let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -1079,9 +1082,11 @@ fn parse_args() -> Result<Args, String> {
             }
             "--search" => search_on = true,
             "--search-iterations" => {
-                search_iters = next_val(&mut it, &arg)?
-                    .parse()
-                    .map_err(|e| format!("bad search-iterations: {e}"))?
+                search_iters = Some(
+                    next_val(&mut it, &arg)?
+                        .parse()
+                        .map_err(|e| format!("bad search-iterations: {e}"))?,
+                )
             }
             "--search-trigger" => {
                 let v = next_val(&mut it, &arg)?;
@@ -1111,8 +1116,17 @@ fn parse_args() -> Result<Args, String> {
     }
     // --search-* flag 仅在 --search 开时生效，避免「设了参数却忘开搜索」静默跑 blueprint。
     let search = if search_on {
+        // 设了 time_budget 而未显式给 --search-iterations → iterations 抬到 u64::MAX 当纯安全
+        // 上界、求解全由墙钟截断（老默认 1000 在 ~10–30ms 处先撞迭代上限，预算永远绑不上 =
+        // 静默失效；2026-06-11 live searchon50 实撞）。LCFR period 不随之爆炸：solve_subgame
+        // 在 budgeted 下 cap period（subgame.rs lcfr_period）。
+        let iterations = search_iters.unwrap_or(if search_time_budget_ms.is_some() {
+            u64::MAX
+        } else {
+            1000
+        });
         Some(SubgameSearchConfig {
-            iterations: search_iters,
+            iterations,
             max_subtree_nodes: search_max_nodes,
             trigger: search_trigger,
             lcfr: search_lcfr,
@@ -1127,7 +1141,7 @@ fn parse_args() -> Result<Args, String> {
             ..SubgameSearchConfig::default()
         })
     } else {
-        if search_iters != 1000
+        if search_iters.is_some()
             || search_trigger != SearchTrigger::FlopFirstUnraised
             || search_time_budget_ms.is_some()
             || search_lcfr
@@ -2447,5 +2461,37 @@ mod tests {
         );
         assert_eq!(implicit, explicit, "满桌 dealt 显式/缺省须 byte-equal");
         assert_eq!(implicit.source, "blueprint");
+    }
+
+    /// `--search-time-budget-ms` 不配显式 `--search-iterations` 时 iterations 须抬到
+    /// `u64::MAX`（纯墙钟截断）。老默认 1000 让预算静默失效（solve 在 ~10–30ms 撞迭代
+    /// 上限，2026-06-11 live searchon50 实撞：5s 预算下还出「iterations 内未采样到」giveup）。
+    #[test]
+    fn parse_args_time_budget_defaults_iterations_unbounded() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        // budget 无显式 iterations → u64::MAX（墙钟是唯一截断）。
+        let a = parse(&["--search", "--search-time-budget-ms", "5000"]).expect("parse Ok");
+        assert_eq!(a.search.expect("search on").iterations, u64::MAX);
+        // 显式 iterations 优先于 budget 默认。
+        let a = parse(&[
+            "--search",
+            "--search-time-budget-ms",
+            "5000",
+            "--search-iterations",
+            "2000000",
+        ])
+        .expect("parse Ok");
+        assert_eq!(a.search.expect("search on").iterations, 2_000_000);
+        // 无 budget → 固定迭代老默认 1000（既有行为不变）。
+        let a = parse(&["--search"]).expect("parse Ok");
+        assert_eq!(a.search.expect("search on").iterations, 1000);
+        // 拒绝静默 guard 对显式 iterations（含恰好 1000）仍生效。
+        assert!(parse(&["--search-iterations", "1000"]).is_err());
     }
 }
