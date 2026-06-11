@@ -54,7 +54,10 @@
 //!
 //! - 码深 ≠ 100BB 且**未开搜索 / 未触发**：solver 树/SPR 都按 100BB 解；real `GameState` 用
 //!   `default_6max_100bb`（10000 筹码）近似，driver 靠买入锁 2000 + 栈漂出 [80,125]BB leave/rejoin 兜。
-//! - 非 6 人桌 / 对手 open-limp：no-limp blueprint 无对应节点 → 走兜底（见上）。
+//! - 对手 open-limp：no-limp blueprint 无对应节点 → 走兜底（见上）。
+//! - 短桌手（6 座只发 k<6 家）：driver 送 `dealt_seats`（`table_state.seats[].in_hand` 推断）时
+//!   走**幻影座映射**（[`seat_map`]：k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的真实节点、
+//!   盲注对齐）；占座不可判（无 table_state）/ k=2（HU button 兼 SB 映不进）→ 仍兜底。
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -133,9 +136,18 @@ struct Request {
     /// 缺口②：各座 **hand-start 真栈**（OpenPoker 单位，下标 = OpenPoker 座位号；driver 从
     /// `your_turn.players[].stack` + 累计本手投入还原）。**仅实时搜索读**——`--search` 开且命中
     /// 触发面时，[`build_real_auth`] 据它建真码深 `GameState`。缺省（空 = 旧 driver / 无 players
-    /// 字段）→ 退对称 100BB（blueprint 路径不读它，byte-equal 不受影响）。
+    /// 字段）→ 退对称 100BB（blueprint 路径不读它，byte-equal 不受影响）。短桌手非发牌座的
+    /// 条目是 driver 的 placeholder，按 `dealt_seats` 忽略（幻影座保持 solver 默认 100BB）。
     #[serde(default)]
     stacks: Vec<u64>,
+    /// 短桌幻影座映射（exec 文档「短桌 seat_mismatch ~2.4% 兜底」修复）：本手**实际发牌**的
+    /// OpenPoker 座位（升序）。缺省 / 全 6 座 = 满桌（旧行为 byte-equal）。k∈[3,5] →
+    /// [`seat_map`] 把 k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的真实节点（盲注对齐：
+    /// 真实 BTN/SB/BB → 树座 0/1/2）。k=2 映不进（真实 HU button 兼 SB、postflop 行动序与
+    /// 树上 SB-vs-BB 相反）→ 兜底。driver 从 `table_state.seats[].in_hand` ∪ 已行动座推断，
+    /// 仅本手收到过 table_state 时才发（决策时占座唯一可判才启用）。
+    #[serde(default)]
+    dealt_seats: Vec<u8>,
 }
 
 /// advisor → driver 一行响应。`amount` 仅 raise 携带（= OpenPoker 单位的 raise-to 额）。
@@ -186,6 +198,88 @@ fn expected_board_len(s: poker::Street) -> usize {
         poker::Street::Turn => 4,
         poker::Street::River | poker::Street::Showdown => 5,
     }
+}
+
+/// OpenPoker 座 → solver 树座的映射（满桌 = 旧 rotate 公式；短桌 = 幻影座映射）。
+struct SeatMap {
+    /// 下标 = OpenPoker 座位号；`None` = 本手未发牌（空座 / 等下一手的玩家）。
+    to_tree: [Option<u8>; N_SEATS],
+    /// 幻影座数 = 6 − k。幻影树座 = `3..3+n_phantom`（UTG 起最早行动位），preflop 开局先 fold。
+    n_phantom: u8,
+}
+
+impl SeatMap {
+    fn tree_seat(&self, op_seat: u8) -> Result<u8, String> {
+        self.to_tree
+            .get(op_seat as usize)
+            .copied()
+            .flatten()
+            .ok_or_else(|| "actor_not_dealt".to_string())
+    }
+
+    /// 重放序列开头要先 fold 的幻影树座（preflop 行动序从树座 3 起，恰好最先轮到它们）。
+    fn phantom_tree_seats(&self) -> std::ops::Range<u8> {
+        3..3 + self.n_phantom
+    }
+}
+
+/// 建座位映射。`dealt_seats` 缺省 / 全 6 座 → 满桌恒等（旧 `(op + 6 − button) % 6` 公式，
+/// byte-equal）。k∈[3,5] → **短桌幻影座映射**：真实 BTN/SB/BB → 树座 0/1/2（6-max 树的
+/// SB/BB 固定在 button+1/+2 且必须发盲，树上不存在「盲注位发盲前 fold」节点，所以不能在
+/// 空座原位插 fold、必须重映环序对齐盲注），其余真实玩家按环序占 CO 侧靠后位置
+/// （ring 序 j≥3 → 树座 j+6−k），幻影座占 UTG 起最早行动位、开局先 fold——k 人桌首个
+/// 行动者 ≡ 6-max 前 6−k 位弃牌后的同位置（标准短桌位置等价，blueprint 真实训练过的节点；
+/// preflop 3,4,5,0,1,2 与 postflop 从 SB 顺时针两序在 k=3/4/5 下都与真实短桌严格吻合）。
+/// k=2 映不进：真实 HU button 兼 SB、preflop 先动 postflop 后动，而树上 fold 到 SB-vs-BB
+/// 后 postflop SB 先动——没有座位映射能同时对齐两条街 → `Err`（caller 兜底）。
+fn seat_map(req: &Request) -> Result<SeatMap, String> {
+    let full = || {
+        let mut m = [None; N_SEATS];
+        for (op, slot) in m.iter_mut().enumerate() {
+            *slot = Some(((op + N_SEATS - req.button_seat as usize) % N_SEATS) as u8);
+        }
+        SeatMap {
+            to_tree: m,
+            n_phantom: 0,
+        }
+    };
+    if req.dealt_seats.is_empty() {
+        return Ok(full());
+    }
+    let dealt = &req.dealt_seats;
+    let k = dealt.len();
+    if k > N_SEATS
+        || dealt.windows(2).any(|w| w[0] >= w[1])
+        || dealt.iter().any(|&s| s as usize >= N_SEATS)
+    {
+        return Err("bad_dealt_seats".into());
+    }
+    if !dealt.contains(&req.button_seat) || !dealt.contains(&req.my_seat) {
+        return Err("dealt_missing_btn_or_me".into());
+    }
+    if k == N_SEATS {
+        return Ok(full());
+    }
+    if k == 2 {
+        return Err("short_hu".into());
+    }
+    if k < 2 {
+        return Err("bad_dealt_seats".into());
+    }
+    let btn_idx = dealt
+        .iter()
+        .position(|&s| s == req.button_seat)
+        .expect("上面 contains 已校验");
+    let mut m = [None; N_SEATS];
+    for j in 0..k {
+        let op = dealt[(btn_idx + j) % k] as usize;
+        let tree = if j < 3 { j } else { j + (N_SEATS - k) };
+        m[op] = Some(tree as u8);
+    }
+    Ok(SeatMap {
+        to_tree: m,
+        n_phantom: (N_SEATS - k) as u8,
+    })
 }
 
 /// 一次决策：重放本手历史（100BB real + abs 两态 lockstep）→ 我方决策点。`search == None` 时
@@ -240,10 +334,45 @@ fn decide(
         Err(_) => return safe_fallback(&req.valid, "bad_board"),
     };
 
-    // —— rotate 到 solver 座（OpenPoker button → solver 座 0，对齐 default_6max_100bb）——
-    let bsolver =
-        |op_seat: u8| -> u8 { (op_seat + N_SEATS as u8 - req.button_seat) % N_SEATS as u8 };
-    let my_seat_solver = SeatId(bsolver(req.my_seat));
+    // —— 座位映射（满桌 = 旧 rotate 公式；短桌 = 幻影座映射，[`seat_map`]）——
+    let smap = match seat_map(req) {
+        Ok(m) => m,
+        Err(reason) => return safe_fallback(&req.valid, &reason),
+    };
+    let my_seat_solver = match smap.tree_seat(req.my_seat) {
+        Ok(t) => SeatId(t),
+        Err(reason) => return safe_fallback(&req.valid, &reason),
+    };
+
+    /// 两态 lockstep 单步（真实动作与幻影 fold 共用，保两路不漂）。
+    fn lockstep_step(
+        real: &mut poker::GameState,
+        abs: &mut SimplifiedNlheState,
+        abs_rng: &mut ChaCha20Rng,
+        actor: u8,
+        action: &str,
+        to_solver: Option<u64>,
+    ) -> Result<(), String> {
+        if real.current_player() != Some(SeatId(actor)) {
+            // 码深漂移 / 历史错位 → 重放对不上回合。
+            return Err("replay_seat_mismatch".into());
+        }
+        let Some(concrete) = hist_to_concrete(real, action, to_solver) else {
+            return Err("bad_hist_action".into());
+        };
+        if real.apply(concrete).is_err() {
+            return Err("replay_illegal".into());
+        }
+        let is_all_in = real.players()[actor as usize].status == poker::PlayerStatus::AllIn;
+        if advance_shadow_by_applied(abs, concrete, is_all_in, abs_rng).is_err() {
+            // 结构性 gap（如 open-limp 进 no-limp 影子）→ 失同步（不静默改 kind）。
+            return Err("structural_gap".into());
+        }
+        if abs.game_state.current_player() != real.current_player() {
+            return Err("lockstep_drift".into());
+        }
+        Ok(())
+    }
 
     // —— 两态 lockstep 重放（blueprint 路径 + 锚定搜索的 node_id / legal_abs 来源）——
     let lockstep =
@@ -251,27 +380,22 @@ fn decide(
             let mut real = poker::GameState::new(&solver_cfg, REAL_REPLAY_SEED);
             let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
             let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
+            // 短桌：幻影座（UTG 起的前 6−k 位）开局先 fold → 走到 blueprint 树的真实节点。
+            for t in smap.phantom_tree_seats() {
+                lockstep_step(&mut real, &mut abs, &mut abs_rng, t, "fold", None)
+                    .map_err(|e| format!("phantom_{e}"))?;
+            }
             for h in &req.actions {
-                let actor = bsolver(h.seat);
-                if real.current_player() != Some(SeatId(actor)) {
-                    // 码深漂移 / 历史错位 → 重放对不上回合。
-                    return Err("replay_seat_mismatch".into());
-                }
+                let actor = smap.tree_seat(h.seat)?;
                 let to_solver = h.to.map(|t| t * scale);
-                let Some(concrete) = hist_to_concrete(&real, &h.action, to_solver) else {
-                    return Err("bad_hist_action".into());
-                };
-                if real.apply(concrete).is_err() {
-                    return Err("replay_illegal".into());
-                }
-                let is_all_in = real.players()[actor as usize].status == poker::PlayerStatus::AllIn;
-                if advance_shadow_by_applied(&mut abs, concrete, is_all_in, &mut abs_rng).is_err() {
-                    // 结构性 gap（如 open-limp 进 no-limp 影子）→ 失同步（不静默改 kind）。
-                    return Err("structural_gap".into());
-                }
-                if abs.game_state.current_player() != real.current_player() {
-                    return Err("lockstep_drift".into());
-                }
+                lockstep_step(
+                    &mut real,
+                    &mut abs,
+                    &mut abs_rng,
+                    actor,
+                    &h.action,
+                    to_solver,
+                )?;
             }
             // —— 到我方决策点 ——
             if real.current_player() != Some(my_seat_solver) {
@@ -304,6 +428,7 @@ fn decide(
                         scfg,
                         &solver_cfg,
                         scale,
+                        &smap,
                         my_seat_solver,
                         hole,
                         &board,
@@ -332,7 +457,7 @@ fn decide(
         let scfg = search.expect("want_search ⇒ search.is_some()");
         // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ 安全降级。
         let (auth, round_start, within) =
-            match build_real_auth(req, &solver_cfg, scale, my_seat_solver, hole, &board) {
+            match build_real_auth(req, &solver_cfg, scale, &smap, my_seat_solver, hole, &board) {
                 Ok(t) => t,
                 Err(reason) => return search_giveup(&req.valid, &format!("build:{reason}")),
             };
@@ -508,31 +633,45 @@ fn build_real_auth(
     req: &Request,
     solver_cfg: &TableConfig,
     scale: u64,
+    smap: &SeatMap,
     my_seat_solver: SeatId,
     hole: [Card; 2],
     board: &[Card],
 ) -> Result<(GameState, GameState, Vec<(Action, bool)>), String> {
-    let real_cfg = real_stacks_config(req, solver_cfg, scale)?;
-    let bsolver =
-        |op_seat: u8| -> u8 { (op_seat + N_SEATS as u8 - req.button_seat) % N_SEATS as u8 };
+    let real_cfg = real_stacks_config(req, solver_cfg, scale, smap)?;
 
     let mut auth = GameState::new(&real_cfg, REAL_REPLAY_SEED);
     // round_start 快照：街变即重 snapshot（postflop 街起点）；初始 = preflop 起点（不被搜索读）。
     let mut round_start = auth.clone();
     let mut rs_street = auth.street();
     let mut within: Vec<(Action, bool)> = Vec::new();
-    for h in &req.actions {
-        let actor = bsolver(h.seat);
+    // 短桌幻影 fold + 真实动作走同一条重放（[`seat_map`]；幻影 fold 在 preflop 开局，
+    // 不可能收街——k≥3 时盲注两座还没行动，within 推进与真实动作同口径即可）。
+    let phantom = smap
+        .phantom_tree_seats()
+        .map(|t| (t, "fold".to_string(), None));
+    let acts = req
+        .actions
+        .iter()
+        .map(|h| {
+            Ok((
+                smap.tree_seat(h.seat).map_err(|e| format!("auth_{e}"))?,
+                h.action.clone(),
+                h.to,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for (actor, action, to_op) in phantom.chain(acts) {
         if auth.current_player() != Some(SeatId(actor)) {
             return Err("auth_seat_mismatch".into());
         }
-        let to_solver = h.to.map(|t| t.checked_mul(scale).ok_or("to_overflow"));
+        let to_solver = to_op.map(|t| t.checked_mul(scale).ok_or("to_overflow"));
         let to_solver = match to_solver {
             Some(Ok(v)) => Some(v),
             Some(Err(e)) => return Err(e.into()),
             None => None,
         };
-        let Some(concrete) = hist_to_concrete(&auth, &h.action, to_solver) else {
+        let Some(concrete) = hist_to_concrete(&auth, &action, to_solver) else {
             return Err("auth_bad_hist".into());
         };
         if auth.apply(concrete).is_err() {
@@ -574,6 +713,7 @@ fn decide_search_unanchored(
     scfg: &SubgameSearchConfig,
     solver_cfg: &TableConfig,
     scale: u64,
+    smap: &SeatMap,
     my_seat_solver: SeatId,
     hole: [Card; 2],
     board: &[Card],
@@ -582,7 +722,7 @@ fn decide_search_unanchored(
 ) -> Response {
     // 真栈重放（auth / 轮起点快照 / 当前街真实动作序）。建不了 = §2.3「建不了树」→ 安全降级。
     let (auth, round_start, within) =
-        match build_real_auth(req, solver_cfg, scale, my_seat_solver, hole, board) {
+        match build_real_auth(req, solver_cfg, scale, smap, my_seat_solver, hole, board) {
             Ok(t) => t,
             Err(reason) => return search_giveup(&req.valid, &format!("unanchored_build:{reason}")),
         };
@@ -625,13 +765,16 @@ fn decide_search_unanchored(
     resp
 }
 
-/// 真码深 [`TableConfig`]：各座起始栈 = OpenPoker hand-start 栈 × `scale`（座位按相对 button
-/// rotate 到 solver 座）。盲注 / 座数 / button 沿用 `solver_cfg`（对齐 blueprint）。`stacks` 缺省
-/// （旧 driver / 无 players 字段）→ 退 `solver_cfg` 对称 100BB。脏数据（长度 / 0 栈 / 溢出）→ `Err`。
+/// 真码深 [`TableConfig`]：各座起始栈 = OpenPoker hand-start 栈 × `scale`（座位按 [`seat_map`]
+/// 映到 solver 座）。盲注 / 座数 / button 沿用 `solver_cfg`（对齐 blueprint）。`stacks` 缺省
+/// （旧 driver / 无 players 字段）→ 退 `solver_cfg` 对称 100BB。短桌：非发牌座的条目是 driver
+/// placeholder、跳过不读；幻影树座保持 solver 默认 100BB（开局即 fold，不影响底池）。
+/// 脏数据（长度 / 发牌座 0 栈 / 溢出）→ `Err`。
 fn real_stacks_config(
     req: &Request,
     solver_cfg: &TableConfig,
     scale: u64,
+    smap: &SeatMap,
 ) -> Result<TableConfig, String> {
     let mut cfg = solver_cfg.clone();
     if req.stacks.is_empty() {
@@ -640,15 +783,16 @@ fn real_stacks_config(
     if req.stacks.len() != N_SEATS {
         return Err("stacks_len".into());
     }
-    let bsolver =
-        |op_seat: usize| -> usize { (op_seat + N_SEATS - req.button_seat as usize) % N_SEATS };
-    let mut stacks = vec![ChipAmount::ZERO; N_SEATS];
+    let mut stacks = cfg.starting_stacks.clone();
     for (op_seat, &op_stack) in req.stacks.iter().enumerate() {
+        let Some(tree) = smap.to_tree[op_seat] else {
+            continue; // 非发牌座（短桌空座 / 等局玩家）：placeholder 不读。
+        };
         let s = op_stack.checked_mul(scale).ok_or("stack_overflow")?;
         if s == 0 {
-            return Err("zero_stack".into()); // 空座 / 已破产 → 不解（边界，fold）。
+            return Err("zero_stack".into()); // 发牌座 0 栈 → 不解（边界，fold）。
         }
-        stacks[bsolver(op_seat)] = ChipAmount::new(s);
+        stacks[tree as usize] = ChipAmount::new(s);
     }
     cfg.starting_stacks = stacks;
     Ok(cfg)
@@ -665,6 +809,10 @@ fn hand_seed_for(req: &Request, base_seed: u64) -> u64 {
     hasher.update(&[req.button_seat, req.my_seat, req.num_seats]);
     hasher.update(&req.small_blind.to_le_bytes());
     hasher.update(&req.big_blind.to_le_bytes());
+    if !req.dealt_seats.is_empty() && req.dealt_seats.len() != N_SEATS {
+        // 短桌：占座不同 = 不同局面（满桌不掺、保旧 seed byte-equal）。
+        hasher.update(&req.dealt_seats);
+    }
     hasher.update(&base_seed.to_le_bytes());
     let d = hasher.finalize();
     u64::from_le_bytes(d.as_bytes()[..8].try_into().expect("blake3 ≥ 8 bytes"))
@@ -716,6 +864,10 @@ fn sample_seed(req: &Request, base_seed: u64) -> u64 {
         hasher.update(&[h.seat]);
         hasher.update(h.action.as_bytes());
         hasher.update(&h.to.unwrap_or(0).to_le_bytes());
+    }
+    if !req.dealt_seats.is_empty() && req.dealt_seats.len() != N_SEATS {
+        // 短桌：占座不同 = 不同局面（满桌不掺、保旧 seed byte-equal）。
+        hasher.update(&req.dealt_seats);
     }
     hasher.update(&base_seed.to_le_bytes());
     let d = hasher.finalize();
@@ -1104,6 +1256,7 @@ mod tests {
             ],
             valid: full_valid(),
             stacks: vec![],
+            dealt_seats: vec![],
         };
         let resp = decide(
             &game,
@@ -1155,6 +1308,7 @@ mod tests {
             }],
             valid: full_valid(),
             stacks: vec![],
+            dealt_seats: vec![],
         };
         let resp = decide(
             &game,
@@ -1189,6 +1343,7 @@ mod tests {
                 ..full_valid()
             },
             stacks: vec![],
+            dealt_seats: vec![],
         };
         let resp = decide(
             &game,
@@ -1258,6 +1413,7 @@ mod tests {
                 max_raise: Some(1980),
             },
             stacks,
+            dealt_seats: vec![],
         }
     }
 
@@ -1670,6 +1826,7 @@ mod tests {
             },
             // op 单位 hand-start 真栈：UTG 600=30BB、SB/BB 4000=200BB、其余 2000=100BB。
             stacks: vec![2000, 4000, 4000, 600, 2000, 2000],
+            dealt_seats: vec![],
         }
     }
 
@@ -1786,6 +1943,7 @@ mod tests {
             }],
             valid: full_valid(),
             stacks: vec![],
+            dealt_seats: vec![],
         };
         let scfg = SubgameSearchConfig {
             iterations: 200,
@@ -1876,6 +2034,7 @@ mod tests {
                 max_raise: Some(1980),
             },
             stacks: vec![2000; 6],
+            dealt_seats: vec![],
         };
         // 前提确证：旧路径在 limp 池上必兜底（结构 gap）。
         let off = decide(
@@ -1914,5 +2073,310 @@ mod tests {
             resp.source, "search:unanchored",
             "limp 池 flop 触发点应由脱影子搜索接管，得 {resp:?}"
         );
+    }
+
+    // —— 短桌幻影座映射测试（exec 文档「短桌 seat_mismatch ~2.4% 兜底」修复）——
+
+    fn hist(seat: u8, action: &str, to: Option<u64>) -> HistAction {
+        HistAction {
+            seat,
+            action: action.into(),
+            to,
+        }
+    }
+
+    /// 短桌 k=4 preflop：两种不同空座布局（空座在 BB 后 / 空座夹在盲注位之间）都必须映到
+    /// 与「满桌 UTG/HJ 先 fold、轮到 CO」**同一个树节点**（info_set 相等 = 映射逐位钉死；
+    /// 动作可因 sample_seed 不同而不同，不比动作）。修前这两个请求都是 fallback:replay_seat_mismatch。
+    #[test]
+    fn short_handed_maps_to_phantom_fold_node() {
+        let game = preopen_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let mut cache = SubgameSolveCache::new();
+        // 满桌等价基准：button=0，UTG(3)/HJ(4) fold → CO(5)=我 决策。
+        let full = Request {
+            hole: vec!["Ah".into(), "Kd".into()],
+            board: vec![],
+            button_seat: 0,
+            my_seat: 5,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![hist(3, "fold", None), hist(4, "fold", None)],
+            valid: full_valid(),
+            stacks: vec![],
+            dealt_seats: vec![],
+        };
+        let full_resp = decide(&game, &abs, &uniform, &full, 7, None, &mut cache);
+        assert_eq!(
+            full_resp.source, "blueprint",
+            "基准应走通，得 {full_resp:?}"
+        );
+
+        // 短桌 A：dealt={0,2,4,5}，button=4 → 环序 4(BTN),5(SB),0(BB),2(j=3→树5)。我=op2。
+        // 4 人桌首个行动者 ≡ 满桌 UTG/HJ 弃牌后的 CO（位置等价）。
+        let short_a = Request {
+            my_seat: 2,
+            button_seat: 4,
+            actions: vec![],
+            dealt_seats: vec![0, 2, 4, 5],
+            hole: full.hole.clone(),
+            board: vec![],
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            valid: full_valid(),
+            stacks: vec![],
+        };
+        let resp_a = decide(&game, &abs, &uniform, &short_a, 7, None, &mut cache);
+        assert_eq!(
+            resp_a.source, "blueprint",
+            "短桌 A 应走 blueprint，得 {resp_a:?}"
+        );
+        assert!(is_legal(&resp_a, &short_a.valid), "得 {resp_a:?}");
+        assert_eq!(
+            resp_a.info_set, full_resp.info_set,
+            "短桌 A 必须映到满桌等价节点"
+        );
+
+        // 短桌 B（盲注对齐关键例）：dealt={0,3,4,5}，button=5 → SB=op0、BB=op3，**空座
+        // op1/op2 夹在 SB 与 BB 之间**——原位插 fold 在树上非法，必须重映环序。我=op4（树5）。
+        let short_b = Request {
+            my_seat: 4,
+            button_seat: 5,
+            actions: vec![],
+            dealt_seats: vec![0, 3, 4, 5],
+            hole: full.hole.clone(),
+            board: vec![],
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            valid: full_valid(),
+            stacks: vec![],
+        };
+        let resp_b = decide(&game, &abs, &uniform, &short_b, 7, None, &mut cache);
+        assert_eq!(
+            resp_b.source, "blueprint",
+            "短桌 B 应走 blueprint，得 {resp_b:?}"
+        );
+        assert_eq!(
+            resp_b.info_set, full_resp.info_set,
+            "短桌 B（盲注间空座）必须映到同一节点"
+        );
+    }
+
+    /// 短桌 flop（多街 lockstep 贯通）：4 人桌 preflop 真实动作 + 幻影 fold 重放进 flop，
+    /// info_set 与满桌等价请求（folds-to-SB complete + BB check）一致。
+    #[test]
+    fn short_handed_flop_blueprint_matches_full_equivalent() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let mut cache = SubgameSolveCache::new();
+        let full = flop_first_unraised_req(vec![]);
+        let full_resp = decide(&game, &abs, &uniform, &full, 7, None, &mut cache);
+        assert_eq!(
+            full_resp.source, "blueprint",
+            "基准应走通，得 {full_resp:?}"
+        );
+        // 短桌：dealt={0,1,2,5}，button=0 → 首个行动者 op5（树5），BTN/SB/BB = op0/1/2 原位。
+        let short = Request {
+            my_seat: 1,
+            actions: vec![
+                hist(5, "fold", None),
+                hist(0, "fold", None),
+                hist(1, "call", Some(20)),
+                hist(2, "check", None),
+            ],
+            dealt_seats: vec![0, 1, 2, 5],
+            hole: full.hole.clone(),
+            board: full.board.clone(),
+            button_seat: 0,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            valid: full.valid.clone(),
+            stacks: vec![],
+        };
+        let resp = decide(&game, &abs, &uniform, &short, 7, None, &mut cache);
+        assert_eq!(
+            resp.source, "blueprint",
+            "短桌 flop 应走 blueprint，得 {resp:?}"
+        );
+        assert_eq!(
+            resp.info_set, full_resp.info_set,
+            "短桌 flop 必须映到满桌等价节点（多街 lockstep 贯通）"
+        );
+    }
+
+    /// 短桌搜索路径：真栈（非发牌座 placeholder 必须被忽略）+ 幻影 fold 进 build_real_auth，
+    /// flop 触发点解出合法动作且同 seed 确定性。
+    #[test]
+    fn short_handed_search_flop_legal_and_reproducible() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let mut full = flop_first_unraised_req(vec![2000, 12000, 4000, 2000, 2000, 2000]);
+        full.my_seat = 1;
+        full.actions = vec![
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "call", Some(20)),
+            hist(2, "check", None),
+        ];
+        full.dealt_seats = vec![0, 1, 2, 5]; // 空座 3/4 的 stacks=2000 是 placeholder。
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 4_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &full,
+            0xA11CE,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(is_legal(&resp, &full.valid), "得 {resp:?}");
+        assert!(
+            resp.source == "search" || resp.source.starts_with("search_giveup:"),
+            "短桌搜索区 source 须 search / search_giveup:*，得 {resp:?}"
+        );
+        let again = decide(
+            &game,
+            &abs,
+            &uniform,
+            &full,
+            0xA11CE,
+            Some(&scfg),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(resp, again, "同 seed 短桌搜索须确定性");
+    }
+
+    /// k=2 映不进（HU button 兼 SB、postflop 行动序与树相反）→ 显式兜底，不静默映错节点。
+    /// 占座表自相矛盾（button / 行动者不在 dealt）同样兜底。
+    #[test]
+    fn short_handed_hu_and_bad_dealt_fall_back() {
+        let game = preopen_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let mut cache = SubgameSolveCache::new();
+        let base = Request {
+            hole: vec!["Ah".into(), "Kd".into()],
+            board: vec![],
+            button_seat: 1,
+            my_seat: 4,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![],
+            valid: full_valid(),
+            stacks: vec![],
+            dealt_seats: vec![1, 4],
+        };
+        let resp = decide(&game, &abs, &uniform, &base, 0, None, &mut cache);
+        assert_eq!(resp.source, "fallback:short_hu");
+        assert!(is_legal(&resp, &base.valid));
+
+        // button 不在 dealt：
+        let bad_btn = Request {
+            dealt_seats: vec![0, 4, 5],
+            button_seat: 1,
+            my_seat: 4,
+            hole: base.hole.clone(),
+            board: vec![],
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![],
+            valid: full_valid(),
+            stacks: vec![],
+        };
+        let resp = decide(&game, &abs, &uniform, &bad_btn, 0, None, &mut cache);
+        assert_eq!(resp.source, "fallback:dealt_missing_btn_or_me");
+
+        // 行动者不在 dealt（占座推断漏了人）→ 重放期 loud 兜底：
+        let bad_actor = Request {
+            dealt_seats: vec![0, 1, 2, 5],
+            button_seat: 0,
+            my_seat: 1,
+            actions: vec![hist(3, "fold", None)],
+            hole: base.hole.clone(),
+            board: vec![],
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            valid: full_valid(),
+            stacks: vec![],
+        };
+        let resp = decide(&game, &abs, &uniform, &bad_actor, 0, None, &mut cache);
+        assert_eq!(resp.source, "fallback:actor_not_dealt");
+
+        // 乱序 / 重复：
+        let unsorted = Request {
+            dealt_seats: vec![2, 0, 5],
+            button_seat: 0,
+            my_seat: 2,
+            hole: base.hole.clone(),
+            board: vec![],
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![],
+            valid: full_valid(),
+            stacks: vec![],
+        };
+        let resp = decide(&game, &abs, &uniform, &unsorted, 0, None, &mut cache);
+        assert_eq!(resp.source, "fallback:bad_dealt_seats");
+    }
+
+    /// 满桌显式送 `dealt_seats=[0..5]` 必须与缺省**逐字节**一致（含 sample_seed 不掺 dealt）。
+    #[test]
+    fn full_table_explicit_dealt_byte_equal() {
+        let game = preopen_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let make = |dealt: Vec<u8>| Request {
+            hole: vec!["Ah".into(), "Kd".into()],
+            board: vec![],
+            button_seat: 2,
+            my_seat: 2,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                hist(5, "fold", None),
+                hist(0, "fold", None),
+                hist(1, "fold", None),
+            ],
+            valid: full_valid(),
+            stacks: vec![],
+            dealt_seats: dealt,
+        };
+        let implicit = decide(
+            &game,
+            &abs,
+            &uniform,
+            &make(vec![]),
+            0xBEEF,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        let explicit = decide(
+            &game,
+            &abs,
+            &uniform,
+            &make(vec![0, 1, 2, 3, 4, 5]),
+            0xBEEF,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(implicit, explicit, "满桌 dealt 显式/缺省须 byte-equal");
+        assert_eq!(implicit.source, "blueprint");
     }
 }

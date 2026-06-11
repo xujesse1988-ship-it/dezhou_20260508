@@ -101,6 +101,24 @@ class Advisor:
 # ===========================================================================
 # 单手状态累计（§3：OpenPoker 有状态推送 → driver 自己累计成 advisor 要的历史）
 # ===========================================================================
+def _commit_step(committed, seat, a, amount):
+    """单步本街 committed 转移（on_player_action 增量路径与短桌投入重算共用，保两边不漂）。
+    返回 (to, delta)：to = raise/bet 的本街累计到额；delta = 本动作投入增量。"""
+    prev = committed.get(seat, 0)
+    to = None
+    if a in ("raise", "bet"):
+        # [LIVE?] 视 amount 为总 to 额；若实为增量改成 committed[seat] + amount。
+        committed[seat] = amount if amount is not None else prev
+        to = committed[seat]
+    elif a == "call":
+        committed[seat] = max(committed.values())
+    elif a == "all_in":
+        if amount is not None:
+            committed[seat] = amount
+    # check/fold：committed 不变。
+    return to, committed.get(seat, 0) - prev
+
+
 class HandState:
     """累计一手：button / my_seat / hole / board / 本手历史动作（含本街 to 额）。
     committed_this_street[seat] 跟每座本街累计投入（OpenPoker 单位）→ raise 的 to。"""
@@ -117,7 +135,8 @@ class HandState:
         # seat→name。advisor 的 build_request 不读这两个（byte-equal 隔离，selftest 5 钉死）。
         self.actions_ext = []
         self.names = {}
-        # 本街每座累计投入（preflop 含盲注）；新街清零。
+        # 本街每座累计投入（preflop 含盲注）；新街清零。盲注 seeding 按满桌 btn+1/+2 ——
+        # **短桌手必错**（盲注跳空座），短桌路径不读它、用 _committed_total_for 按 dealt 重算。
         self.committed = {s: 0 for s in range(NUM_SEATS)}
         self.committed[(button_seat + 1) % NUM_SEATS] = SMALL_BLIND_OP  # SB
         self.committed[(button_seat + 2) % NUM_SEATS] = BIG_BLIND_OP    # BB
@@ -127,28 +146,28 @@ class HandState:
         # 各座当前 remaining 栈（OpenPoker 单位）；从 your_turn.players[].stack / player_action.stack
         # 滚动更新（None = 还没观测到该座栈）。
         self.stacks_now = {s: None for s in range(NUM_SEATS)}
+        # 短桌占座推断（幻影座映射，exec §3.2）：本手发牌座 = table_state.seats[].in_hand 累计
+        # ∪ 已行动座 ∪ {我, button}。your_turn.players 含「在座未发牌」的等局玩家（live 625 手
+        # 实测 20 手虚座）不可作依据；仅本手收到过 table_state（dealt_confirmed）才可判。
+        self.in_hand_seen = set()
+        self.acted = set()
+        self.dealt_confirmed = False
+        # 原始动作事件流（("act",seat,action,amount) / 街变 ("street",)）：短桌投入重算的输入。
+        self._raw_events = []
 
     def on_player_action(self, seat, action, amount, ext=None):
         """记一条对手 / 我方已确认动作。to = 该座本街累计到额（raise/bet 才需）。
         ext = player_action 原始字段子集（HH 日志用，advisor 不读）。"""
         a = (action or "").lower()
-        prev = self.committed.get(seat, 0)
-        to = None
-        if a in ("raise", "bet"):
-            # [LIVE?] 视 amount 为总 to 额；若实为增量改成 self.committed[seat] + amount。
-            self.committed[seat] = amount if amount is not None else prev
-            to = self.committed[seat]
-        elif a == "call":
-            self.committed[seat] = max(self.committed.values())
-        elif a == "all_in":
-            if amount is not None:
-                self.committed[seat] = amount
-        # check/fold：committed 不变。
+        to, delta = _commit_step(self.committed, seat, a, amount)
         # 缺口②：本手累计投入 += 本动作增量（本街新 committed − 旧）。all_in 无 amount → 增量 0
         # （信息缺，advisor 真栈重放会因 apply 非法回落 fold，不污染 blueprint 路径）。
-        self.committed_total[seat] = self.committed_total.get(seat, 0) + (self.committed[seat] - prev)
+        self.committed_total[seat] = self.committed_total.get(seat, 0) + delta
         self.actions.append({"seat": seat, "action": a, **({"to": to} if to is not None else {})})
         self.actions_ext.append(dict(ext) if ext else {})
+        if seat is not None:
+            self.acted.add(seat)
+        self._raw_events.append(("act", seat, a, amount))
 
     def update_stacks(self, seat, stack):
         """从 player_action.stack / your_turn.players[].stack 滚动记各座当前 remaining 栈。
@@ -161,22 +180,75 @@ class HandState:
         if seat is not None and name is not None and 0 <= seat < NUM_SEATS:
             self.names[seat] = name
 
-    def hand_start_stacks(self):
-        """回推各座 hand-start 真栈（OpenPoker 单位）= 当前 remaining + 本手累计投入。全 6 座栈都
-        已观测到才返回长 6 list（喂 advisor 实时搜索）；否则 None（advisor 退对称 100BB）。"""
-        if any(self.stacks_now[s] is None for s in range(NUM_SEATS)):
+    def dealt_now(self):
+        """决策时占座推断（短桌幻影座映射）。None = 不可判（本手没收到过 table_state）→
+        维持满桌假设（advisor 走旧路径，短桌手照旧 seat_mismatch 兜底）。"""
+        if not self.dealt_confirmed:
             return None
-        return [self.stacks_now[s] + self.committed_total.get(s, 0) for s in range(NUM_SEATS)]
+        d = set(self.in_hand_seen) | set(self.acted)
+        if self.my_seat is not None:
+            d.add(self.my_seat)
+        if self.button_seat is not None:
+            d.add(self.button_seat)  # live 625 手实测 button 恒为发牌座（HH remap 0 失败）。
+        return {s for s in d if isinstance(s, int) and 0 <= s < NUM_SEATS}
+
+    def _blind_seats(self, dealt_sorted):
+        """短桌真实盲注座 = button 起顺时针前两个**发牌座**（与 openpoker_hh 紧凑 ring 同口径；
+        k=2 button 兼 SB）。button 不在 dealt → ValueError（caller 退满桌假设）。"""
+        k = len(dealt_sorted)
+        bi = dealt_sorted.index(self.button_seat)
+        if k == 2:
+            return dealt_sorted[bi], dealt_sorted[(bi + 1) % k]
+        return dealt_sorted[(bi + 1) % k], dealt_sorted[(bi + 2) % k]
+
+    def _committed_total_for(self, sb_seat, bb_seat):
+        """按给定盲注座从原始事件流重算本手累计投入（短桌：__init__ 的满桌 btn+1/+2 seeding
+        必错，按 dealt 事后重算；满桌路径不读本函数）。转移与 on_player_action 共用 _commit_step。"""
+        committed = {s: 0 for s in range(NUM_SEATS)}
+        committed[sb_seat] += SMALL_BLIND_OP
+        committed[bb_seat] += BIG_BLIND_OP
+        total = dict(committed)
+        for ev in self._raw_events:
+            if ev[0] == "street":
+                committed = {s: 0 for s in range(NUM_SEATS)}
+                continue
+            _, seat, a, amount = ev
+            _, delta = _commit_step(committed, seat, a, amount)
+            total[seat] = total.get(seat, 0) + delta
+        return total
+
+    def hand_start_stacks(self):
+        """回推各座 hand-start 真栈（OpenPoker 单位）= 当前 remaining + 本手累计投入。
+        满桌（或占座不可判）：全 6 座栈都已观测到才返回长 6 list（旧行为，byte-equal）。
+        短桌（dealt 可判且 k<6）：只需**发牌座**已观测；投入按 dealt ring 的真实盲注座重算；
+        非发牌座填 BUY_IN placeholder（advisor 按 dealt_seats 忽略，HH 解析侧短桌本就不读）。"""
+        dealt = self.dealt_now()
+        if dealt is None or len(dealt) >= NUM_SEATS:
+            if any(self.stacks_now[s] is None for s in range(NUM_SEATS)):
+                return None
+            return [self.stacks_now[s] + self.committed_total.get(s, 0) for s in range(NUM_SEATS)]
+        ds = sorted(dealt)
+        if len(ds) < 2 or any(self.stacks_now[s] is None for s in ds):
+            return None
+        try:
+            sb_seat, bb_seat = self._blind_seats(ds)
+        except ValueError:
+            return None
+        total = self._committed_total_for(sb_seat, bb_seat)
+        return [(self.stacks_now[s] + total.get(s, 0)) if s in dealt else BUY_IN
+                for s in range(NUM_SEATS)]
 
     def on_community(self, cards, street):
         self.board = cards
         self.street = street
         # 新街：本街投入清零（§3）；committed_total 跨街保留（缺口②）。
         self.committed = {s: 0 for s in range(NUM_SEATS)}
+        self._raw_events.append(("street",))
 
     def build_request(self, valid):
-        """组 advisor 请求（openpoker_advisor::Request）。`stacks` 仅在全 6 座真栈已知时附带
-        （缺口②实时搜索读；缺省 → advisor 退对称 100BB blueprint，byte-equal）。"""
+        """组 advisor 请求（openpoker_advisor::Request）。`stacks` 仅在真栈已知时附带
+        （缺口②实时搜索读；缺省 → advisor 退对称 100BB blueprint，byte-equal）。
+        `dealt_seats` 仅短桌且占座可判时附带（幻影座映射；满桌不带 = 请求 byte-equal 旧行为）。"""
         req = {
             "hole": self.hole,
             "board": self.board,
@@ -191,11 +263,22 @@ class HandState:
         stacks = self.hand_start_stacks()
         if stacks is not None:
             req["stacks"] = stacks
+        dealt = self.dealt_now()
+        if dealt is not None and len(dealt) < NUM_SEATS:
+            req["dealt_seats"] = sorted(dealt)
         return req
 
     def hh_record(self, hand_result_msg):
         """一手 HH JSONL 记录（§4.2 数据管道）。hand_result 的 winners/final_stacks/
-        shown_cards/pot **原样保留**（不做有损映射，单位换算在 Rust 解析侧）；只读状态不写。"""
+        shown_cards/pot **原样保留**（不做有损映射，单位换算在 Rust 解析侧）；只读状态不写。
+        dealt_est = 决策时占座推断（事后可对 final_stacks 键集验证推断质量）。"""
+        dealt = self.dealt_now()
+        committed_total = self.committed_total
+        if dealt is not None and 2 <= len(dealt) < NUM_SEATS:
+            try:
+                committed_total = self._committed_total_for(*self._blind_seats(sorted(dealt)))
+            except ValueError:
+                pass  # button 不在推断 dealt 内：保留满桌口径（解析侧短桌本就不读）。
         return {
             "hh": 1,
             "ts": round(time.time(), 3),
@@ -212,7 +295,8 @@ class HandState:
             "actions_ext": self.actions_ext,
             "names": self.names,
             "stacks_start": self.hand_start_stacks(),
-            "committed_total": self.committed_total,
+            "committed_total": committed_total,
+            "dealt_est": sorted(dealt) if dealt is not None else None,
             "hand_result": {k: hand_result_msg.get(k)
                             for k in ("winners", "final_stacks", "shown_cards", "pot")},
         }
@@ -252,7 +336,7 @@ class Session:
     # 移桌这类**沉默事件**的真实报文——live 实测 2026-06-11 曾被移出桌后空等）。
     _KNOWN_TYPES = ("connected", "error", "hand_start", "hole_cards", "player_action",
                     "community_cards", "your_turn", "hand_result",
-                    "lobby_joined", "table_joined")
+                    "lobby_joined", "table_joined", "table_state")
 
     def __init__(self, advisor, send, num_hands, log_f=None, hh_f=None):
         self.advisor = advisor
@@ -339,6 +423,18 @@ class Session:
             if self.state["hand"]:
                 self.state["hand"].on_community(msg.get("cards", []),
                                                 _street_name(msg.get("street")))
+        elif t == "table_state":
+            # 短桌占座推断（幻影座映射）：stream:state 全量快照的 seats[].in_hand 是发牌的
+            # 权威信号（your_turn.players 含等局玩家，不可用）。已弃牌者会翻 false → 并集
+            # 累计整手；hand_id 必须对上当前手（手间快照不算）。
+            hand = self.state["hand"]
+            seats = msg.get("seats")
+            if hand is not None and isinstance(seats, list) and msg.get("hand_id") == hand.hand_id:
+                for s in seats:
+                    if s.get("in_hand") and isinstance(s.get("seat"), int) \
+                            and 0 <= s["seat"] < NUM_SEATS:
+                        hand.in_hand_seen.add(s["seat"])
+                hand.dealt_confirmed = True
         elif t == "your_turn":
             self._handle_your_turn(ws, msg)
         elif t == "hand_result":
@@ -574,8 +670,12 @@ def run_selftest(advisor):
     # 各跑一遍，advisor 请求/响应流 + 发出的 action 包必须逐字节一致；HH 行字段齐。
     _selftest_hh_byte_equal()
 
-    print("OK: 5 个 canned 场景跑通：advisor 全程出合法动作、driver 组请求/动作包（含真栈 stacks）"
-          "正常、HH 日志 byte-equal 隔离成立。", file=sys.stderr)
+    # 场景 6（短桌幻影座映射）：table_state.in_hand 占座推断 → dealt_seats / placeholder 栈 /
+    # 盲注座重算 / HH dealt_est。
+    _selftest_short_handed()
+
+    print("OK: 6 个 canned 场景跑通：advisor 全程出合法动作、driver 组请求/动作包（含真栈 stacks"
+          " + 短桌 dealt_seats）正常、HH 日志 byte-equal 隔离成立。", file=sys.stderr)
 
 
 def _assert_legal(resp, valid, tag):
@@ -733,8 +833,84 @@ def _selftest_hh_byte_equal():
     # 决策点真用到了真栈（your_turn 后请求带 stacks[6]）：
     if '"stacks"' not in t_on[0][0]:
         raise RuntimeError("[hh] 首决策请求应带 stacks（全 6 座已观测）")
+    # 满桌（无 table_state 证实 / 6 家全发）请求**不带** dealt_seats（旧请求 byte-equal）：
+    if any('"dealt_seats"' in req for req, _ in t_on):
+        raise RuntimeError("[hh] 满桌请求不应带 dealt_seats")
     print("[selftest 5 HH byte-equal] 挂/不挂 --hh-log：advisor 请求/响应 + action 包逐字节一致；"
           "HH 1 行字段齐（12 动作 + names + stacks_start + 摊牌原样）。", file=sys.stderr)
+
+
+def _selftest_short_handed():
+    """场景 6（短桌幻影座映射，exec §3.2）：canned 4 人短桌手走 Session 真实消息路径——
+    table_state.seats[].in_hand 推断占座（in_hand=false 的等局玩家必须排除）、请求带
+    dealt_seats + 非发牌座 placeholder 栈、投入按 dealt ring 真实盲注座重算（button=2 →
+    真实 SB/BB = 5/0，满桌假设的 3/4 恰好都是非发牌座 = 重算分歧最大例）、HH 落 dealt_est。"""
+    import os
+    import tempfile
+
+    # button=2，发牌 {0,1,2,5}（环序 2→5→0→1：SB=5、BB=0、UTG=1），我=BB(0)。座 3 是
+    # 等下一手的玩家（in_hand=false、栈 777 = 不许被读）；座 4 真空。op5 起始栈 1500（非对称，
+    # 钉 placeholder 与真栈不混）。preflop：UTG(1) fold → BTN(2) fold → SB(5) call → 我(BB)。
+    msgs = [
+        {"type": "hand_start", "hand_id": "sh-1", "seat": 0, "dealer_seat": 2,
+         "table_id": "tbl-sh", "blinds": {"small_blind": 10, "big_blind": 20}},
+        {"type": "hole_cards", "cards": ["Ah", "Kd"]},
+        {"type": "table_state", "hand_id": "sh-1", "street": "preflop",
+         "seats": [
+             {"seat": 0, "name": "me", "stack": 1980, "in_hand": True, "status": "active"},
+             {"seat": 1, "name": "bot1", "stack": 2000, "in_hand": True, "status": "active"},
+             {"seat": 2, "name": "bot2", "stack": 2000, "in_hand": True, "status": "active"},
+             {"seat": 3, "name": "waiter", "stack": 777, "in_hand": False, "status": "waiting"},
+             {"seat": 5, "name": "bot5", "stack": 1490, "in_hand": True, "status": "active"},
+         ]},
+        {"type": "player_action", "seat": 1, "action": "fold", "amount": None,
+         "street": "preflop", "stack": 2000, "contribution_delta": 0},
+        {"type": "player_action", "seat": 2, "action": "fold", "amount": None,
+         "street": "preflop", "stack": 2000, "contribution_delta": 0},
+        {"type": "player_action", "seat": 5, "action": "call", "amount": 20,
+         "street": "preflop", "stack": 1480, "contribution_delta": 10},
+        {"type": "your_turn", "hand_id": "sh-1", "turn_token": "tt-sh", "seat": 0,
+         "players": [{"seat": 0, "name": "me", "stack": 1980},
+                     {"seat": 1, "name": "bot1", "stack": 2000},
+                     {"seat": 2, "name": "bot2", "stack": 2000},
+                     {"seat": 3, "name": "waiter", "stack": 777},
+                     {"seat": 5, "name": "bot5", "stack": 1480}],
+         "valid_actions": [{"action": "check"}, {"action": "raise", "min": 40, "max": 1980}],
+         "min_raise": 40, "max_raise": 1980},
+        {"type": "hand_result", "pot": 40,
+         "winners": [{"seat": 0, "stack": 2020, "amount": 20, "hand_description": "x"}],
+         "final_stacks": {"0": 2020, "1": 2000, "2": 2000, "5": 1480},
+         "shown_cards": None},
+    ]
+    stub = _StubAdvisor()
+    with tempfile.TemporaryDirectory() as d:
+        hh_path = os.path.join(d, "hh.jsonl")
+        hh_f = open(hh_path, "a")
+        session = Session(stub, send=lambda ws, obj: None, num_hands=10 ** 9,
+                          log_f=None, hh_f=hh_f)
+        ws = _FakeWs()
+        for m in msgs:
+            session.handle_message(ws, m)
+        hh_f.close()
+        with open(hh_path) as f:
+            lines = [json.loads(line) for line in f]
+
+    req = json.loads(stub.transcript[0][0])
+    if req.get("dealt_seats") != [0, 1, 2, 5]:
+        raise RuntimeError(f"[short] dealt_seats 应 [0,1,2,5]（等局玩家 3 必须排除），"
+                           f"得 {req.get('dealt_seats')}")
+    # 真栈回推：SB=5 投 20（盲 10+call 10）→ 1480+20=1500；BB=0 投 20 → 1980+20=2000；
+    # 非发牌座 3/4 = BUY_IN placeholder（777 不许泄进来）。满桌假设（盲注 seed 在 3/4）会把
+    # 座 0 错算成 1980 —— 此断言钉死盲注座重算。
+    if req.get("stacks") != [2000, 2000, 2000, BUY_IN, BUY_IN, 1500]:
+        raise RuntimeError(f"[short] 短桌真栈回推错: {req.get('stacks')}")
+    if len(lines) != 1 or lines[0].get("dealt_est") != [0, 1, 2, 5]:
+        raise RuntimeError(f"[short] HH 应落 dealt_est=[0,1,2,5]，得 {lines[:1]}")
+    ct = lines[0]["committed_total"]
+    if ct.get("5") != 20 or ct.get("0") != 20 or ct.get("3", 0) != 0:
+        raise RuntimeError(f"[short] 短桌 committed_total 应按真实盲注座（5/0）重算: {ct}")
+    print("[selftest 6 短桌幻影座] table_state.in_hand 占座推断（排除等局玩家）→ dealt_seats + "
+          "placeholder 栈 + 盲注座重算 + HH dealt_est 全对。", file=sys.stderr)
 
 
 # ===========================================================================
