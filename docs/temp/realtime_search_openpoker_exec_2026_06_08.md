@@ -338,9 +338,19 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      变纯 allin——跨 session 映射不保证一致，设计内）。位置切片 BB −837 mbb/g 最差；见 flop 人数
      2-way +1211 / 3-way −218 / 4-way −534（多人更差，与 ≤3-way 训练边界一致，样本小只看方向）。
      真实尺寸重解正是搜索臂的主场 → 下一步 = 同条件 search-on 500 手对比臂。
-   - **仍未做**：c_act v2（需 σ 日志）+ U-fail 5 手的对手栈重建修复（见发现①）+ 短桌幻影座映射
-     （k 人局映成 6-max 树「前 6−k 位先 fold」的真实节点、盲注对齐；决策时占座推断只在唯一可判时启用；
-     ~2.4% 决策损耗，advisor 与 `build_real_auth` 同款问题一并修）。
+   - ~~短桌幻影座映射~~——**已落地（2026-06-11，commit `a60ffda`，vultr 测试 + 真 1B selftest 全绿）**：
+     k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的真实节点。关键设计：①**不能在空座原位插
+     fold**——树上 SB/BB 固定 button+1/+2 且必须发盲，必须重映环序（真实 BTN/SB/BB → 树座
+     0/1/2、其余真实玩家按环序占 CO 侧靠后位 = 标准短桌位置等价）；②**k=2 映不进**（真实 HU
+     button 兼 SB、postflop 行动序与树 SB-vs-BB 相反，两条街无法同时对齐）→ 显式
+     `fallback:short_hu`；③**占座推断只认 table_state.seats[].in_hand**（live 625 手实测：
+     `your_turn.players` 有 20 手含「在座未发牌」等局虚座、不可作依据；已弃牌者 1019/1019 留在
+     players[]）∪ 已行动座 ∪ {我, button}，本手收到过 table_state 才送 `dealt_seats`（唯一可判门，
+     判不清维持旧兜底）。advisor `decide` 两态 lockstep 与 `build_real_auth`（搜索路径）同款接入；
+     短桌真栈回推按 dealt ring 重算盲注座（满桌 btn+1/+2 seeding 短桌必错）、非发牌座 placeholder；
+     HH 落 `dealt_est` 供事后对 `final_stacks` 键集验证推断质量。测试钉法 = 短桌请求与满桌等价
+     请求（前 6−k 位真 fold）**info_set 相等**（两种空座布局 + flop 多街贯通）。
+   - **仍未做**：c_act v2（需 σ 日志）+ U-fail 5 手的对手栈重建修复（见发现①）。
 
 ## 4. 落地（分步验收）
 
