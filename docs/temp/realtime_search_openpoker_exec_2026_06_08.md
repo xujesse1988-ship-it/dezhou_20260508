@@ -338,19 +338,29 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      变纯 allin——跨 session 映射不保证一致，设计内）。位置切片 BB −837 mbb/g 最差；见 flop 人数
      2-way +1211 / 3-way −218 / 4-way −534（多人更差，与 ≤3-way 训练边界一致，样本小只看方向）。
      真实尺寸重解正是搜索臂的主场 → 下一步 = 同条件 search-on 500 手对比臂。
-   - ~~短桌幻影座映射~~——**已落地（2026-06-11，commit `a60ffda`，vultr 测试 + 真 1B selftest 全绿）**：
-     k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的真实节点。关键设计：①**不能在空座原位插
-     fold**——树上 SB/BB 固定 button+1/+2 且必须发盲，必须重映环序（真实 BTN/SB/BB → 树座
-     0/1/2、其余真实玩家按环序占 CO 侧靠后位 = 标准短桌位置等价）；②**k=2 映不进**（真实 HU
-     button 兼 SB、postflop 行动序与树 SB-vs-BB 相反，两条街无法同时对齐）→ 显式
-     `fallback:short_hu`；③**占座推断只认 table_state.seats[].in_hand**（live 625 手实测：
+   - ~~短桌幻影座映射~~——**已落地（2026-06-11，commit `a60ffda`→`0fe6852`，vultr 测试 + 真 10B
+     selftest 全绿 + 25 手 live smoke 实证）**：k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的
+     真实节点。关键设计：①**不能在空座原位插 fold**——树上 SB/BB 固定 button+1/+2 且必须发盲，
+     必须重映环序（真实 BTN/SB/BB → 树座 0/1/2、其余真实玩家按环序占 CO 侧靠后位 = 标准短桌
+     位置等价）；②**占座推断只认 table_state.seats[].in_hand**（live 625 手实测：
      `your_turn.players` 有 20 手含「在座未发牌」等局虚座、不可作依据；已弃牌者 1019/1019 留在
      players[]）∪ 已行动座 ∪ {我, button}，本手收到过 table_state 才送 `dealt_seats`（唯一可判门，
      判不清维持旧兜底）。advisor `decide` 两态 lockstep 与 `build_real_auth`（搜索路径）同款接入；
      短桌真栈回推按 dealt ring 重算盲注座（满桌 btn+1/+2 seeding 短桌必错）、非发牌座 placeholder；
      HH 落 `dealt_est` 供事后对 `final_stacks` 键集验证推断质量。测试钉法 = 短桌请求与满桌等价
-     请求（前 6−k 位真 fold）**info_set 相等**（两种空座布局 + flop 多街贯通）。
-   - **仍未做**：c_act v2（需 σ 日志）+ U-fail 5 手的对手栈重建修复（见发现①）。
+     请求（前 6−k 位真 fold）**info_set 相等**（两种空座布局 + flop 多街贯通 + HU）。
+     **③k=2 也能映（`0fe6852`，smoke 校准推翻初版「映不进」结论）**：25 手 smoke 落在 HU 桌
+     （24×k=2 + 1×k=3，占座推断 25/25 精确、table_state 每手必达），数据钉死 **OpenPoker 的 HU
+     是满桌环规则跳空座的自然推广——button 发 BB、非 button 发 SB 且 preflop 先动（非标准 HU；
+     标准 = button 兼 SB）**。按真实约定 SB→树座 1 / BB(button)→树座 2 / 幻影 [3,4,5,0] 先
+     fold，preflop（SB 先）与 postflop（环规则 SB 先）两条街都对齐；若服务端 HU postflop 实为
+     标准序（BB 先）则重放 loud 兜底不腐蚀（smoke 全 preflop 结束、待真数据）。HU 桌是 live
+     最大出血点（smoke 87.5% 兜底、−2200 mbb/g 全是 `fallback:short_hu` 被盲注磨）→ 现走
+     blueprint 真实节点。**同根因连修 `openpoker_hh` 解析器**：原「n_dealt==2：button=SB」假设
+     令 smoke 24/25 HU 手转换全挂 → 改统一环规则盲注 + 引擎 button 设为 OpenPoker 的 SB 座
+     对齐（引擎 n=2 走标准 HU）；已知残留 = HU 手打进 postflop 行动序仍相反 → loud Err 计数。
+   - **仍未做**：c_act v2（需 σ 日志）+ U-fail 5 手的对手栈重建修复（见发现①）+ HU postflop
+     行动序真数据校准（见上 ③ 残留）。
 
 ## 4. 落地（分步验收）
 
