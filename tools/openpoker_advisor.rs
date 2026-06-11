@@ -166,6 +166,11 @@ struct Response {
     info_set: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chosen: Option<String>,
+    /// 决策点完整策略分布 `[(动作, 概率)]`（正概率支撑，label 同 `chosen`；`chosen` 即从中采样）。
+    /// 仅合法动作路径填（blueprint / search / search:unanchored）；fallback / giveup 是强制动作、
+    /// 无分布不填。为 c_act（AIVAT v2）与人工复盘留的原始数据。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probs: Option<Vec<(String, f64)>>,
 }
 
 // ===========================================================================
@@ -533,6 +538,7 @@ fn decide(
         resp.street = Some(street_label(street).into());
         resp.info_set = Some(info.raw());
         resp.chosen = Some(action_label(&chosen));
+        resp.probs = Some(dist.iter().map(|(a, p)| (action_label(a), *p)).collect());
     }
     resp
 }
@@ -774,6 +780,7 @@ fn decide_search_unanchored(
         resp.source = "search:unanchored".into();
         resp.street = Some(street_label(auth.street()).into());
         resp.chosen = Some(action_label(&chosen));
+        resp.probs = Some(dist.iter().map(|(a, p)| (action_label(a), *p)).collect());
     }
     resp
 }
@@ -1535,6 +1542,15 @@ mod tests {
             resp.source == "search" || resp.source.starts_with("search_giveup:"),
             "搜索区 source 须 search / search_giveup:*，得 {resp:?}"
         );
+        if resp.source == "search" {
+            let probs = resp.probs.as_ref().expect("search 决策须带策略分布");
+            let sum: f64 = probs.iter().map(|(_, p)| *p).sum();
+            assert!((sum - 1.0).abs() < 1e-9, "probs 须归一，和={sum}");
+            assert!(
+                probs.iter().any(|(a, _)| Some(a) == resp.chosen.as_ref()),
+                "chosen 须在 probs 支撑内，得 {resp:?}"
+            );
+        }
         let again = decide(
             &game,
             &abs,
@@ -2461,6 +2477,15 @@ mod tests {
         );
         assert_eq!(implicit, explicit, "满桌 dealt 显式/缺省须 byte-equal");
         assert_eq!(implicit.source, "blueprint");
+        let probs = implicit.probs.as_ref().expect("blueprint 决策须带策略分布");
+        let sum: f64 = probs.iter().map(|(_, p)| *p).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "probs 须归一，和={sum}");
+        assert!(
+            probs
+                .iter()
+                .any(|(a, _)| Some(a) == implicit.chosen.as_ref()),
+            "chosen 须在 probs 支撑内，得 {implicit:?}"
+        );
     }
 
     /// `--search-time-budget-ms` 不配显式 `--search-iterations` 时 iterations 须抬到
