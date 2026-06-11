@@ -74,14 +74,24 @@ pub struct HhWinner {
     pub amount: Option<f64>,
 }
 
+/// 服务端会发**显式 `null`**（live 实测：非摊牌手 `shown_cards: null`；driver 对缺失键也落
+/// null）——`#[serde(default)]` 只兜缺失不兜 null，map/list 字段一律配本函数。
+fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 /// `hand_result` 原样字段（driver 不做有损映射）。座位键是字符串（JSON object key）。
 #[derive(Deserialize, Debug, Clone)]
 pub struct HhHandResult {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub winners: Vec<HhWinner>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub final_stacks: BTreeMap<String, f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub shown_cards: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub pot: Option<f64>,
@@ -100,15 +110,15 @@ pub struct HhRecord {
     pub big_blind: u64,
     #[serde(default)]
     pub hole: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub board: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub actions: Vec<HhAction>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub names: BTreeMap<String, String>,
     #[serde(default)]
     pub stacks_start: Option<Vec<f64>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub committed_total: BTreeMap<String, f64>,
     pub hand_result: HhHandResult,
 }
@@ -433,6 +443,37 @@ mod tests {
         let r = est.estimate_hand(&conv.input).expect("estimate");
         assert_eq!(r.raw, 50.0);
         assert!(!r.has_runout);
+    }
+
+    /// 服务端发**显式 null**（live 实测 2026-06-11 首手：非摊牌 `shown_cards: null`，
+    /// winners 条目还带 `name`/`hand_description: null`）→ 必须照吃，不许 parse Err。
+    #[test]
+    fn explicit_null_fields_tolerated() {
+        let line = r#"{
+          "button_seat": 0, "my_seat": 2, "num_seats": 6,
+          "small_blind": 10, "big_blind": 20,
+          "hole": ["Ah", "Kd"],
+          "board": [],
+          "actions": [
+            {"seat": 3, "action": "fold"}, {"seat": 4, "action": "fold"},
+            {"seat": 5, "action": "fold"}, {"seat": 0, "action": "fold"},
+            {"seat": 1, "action": "fold"}
+          ],
+          "names": null,
+          "stacks_start": [2000, 2000, 2000, 2000, 2000, 2000],
+          "committed_total": null,
+          "hand_result": {
+            "winners": [{"seat": 2, "amount": 30, "name": "jesse_xu", "hand_description": null}],
+            "pot": 30,
+            "final_stacks": {"0": 2000, "1": 1990, "2": 2010, "3": 2000, "4": 2000, "5": 2000},
+            "shown_cards": null
+          }
+        }"#;
+        let rec: HhRecord = serde_json::from_str(line).expect("显式 null 应照吃");
+        let conv = hh_to_multiway_input(&rec).expect("convert");
+        assert_eq!(conv.input.winnings, 50);
+        let est = MultiwayAivatEstimator::new(None);
+        assert!(est.estimate_hand(&conv.input).is_ok());
     }
 
     /// 服务端 JSON 常给 float（2000.0）：整数值的 float 必须照吃，真分数才 Err。
