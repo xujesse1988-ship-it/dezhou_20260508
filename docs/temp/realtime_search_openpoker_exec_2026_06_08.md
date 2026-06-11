@@ -317,7 +317,14 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      `artifacts/vf1_deal_table_preopen10b.json`（0 desync、1014/1014 格全覆盖、最薄格 2888 样本、wall 20s；数值合理性
      抽查过：AA@BTN +13.2BB、72o 非盲位恰 0 / SB 恰 −0.5BB、零和加权总均值精确 0、BTN 位置均值最优 / BB 最差）。
      详见 §4.2 进度。
-   - **仍未做**：c_act v2（需 σ 日志）+ live 真数据采集（HH 管道已就绪，等账号上场实跑）。
+   - **live 真数据采集已开（2026-06-11，api_key 到手）**：smoke 10 手（preopen 10B，blueprint-only）全绿——
+     并用真数据校准掉解析侧三个约定假设（commit `f65fcc5`/`b4a7b9f`）：①服务端发显式 `null`（非摊牌
+     `shown_cards:null`）；②**短桌手**（6 座只发 4 家，`final_stacks` 键集 = 发牌座位，盲注跳过空座 → driver 满桌
+     seeding 的 stacks_start 短桌必错）→ 解析器重映射到 0..n_dealt 紧凑 ring + `actions_ext.contribution_delta`
+     重建投入；③`winners.amount` = **净赢**（对账两手实测）→ 回推公式改 net 约定。smoke 9 手 HH 全链路
+     0 失败（short_handed=1 正确重映射、VF-1 修正 9/9 生效）。**500 手长跑采集进行中**（vultr nohup，
+     `openpoker_hh_live.jsonl` 累积；读数 = `openpoker_hh_aivat --hh-log ... --vf1 ...`）。
+   - **仍未做**：c_act v2（需 σ 日志）。
 
 ## 4. 落地（分步验收）
 
@@ -586,7 +593,8 @@ hand_result 原样；`Session` 抽路由，selftest 场景 5 钉死挂/不挂 ad
 `openpoker_hh::hh_to_multiway_input`（×scale + 动作转换重放 + loud Err）→ 新 bin `openpoker_hh_aivat`（raw/AIVAT
 mean±SE mbb/g）；VF-1 = `Vf1DealTable` + 新 bin `vf1_deal_table_build`，**正式表 = preopen 10B 自对弈 1M 手**
 （vultr `artifacts/vf1_deal_table_preopen10b.json`，0 desync、1014/1014 全覆盖、数值合理性抽查过，§3.2 #6 / §4.2）。
-接下来 = **live 实跑采集（HH 管道就绪，等账号上场）** + 覆盖热力图（§4.2 非轻活半段，分类逻辑复用 shadow/off-tree）
+接下来 = **live 实跑采集已开（2026-06-11 api_key 到手：smoke 10 手全绿 + 解析约定 live 校准 `f65fcc5`/`b4a7b9f`
+（短桌重映射 / net 结算 / null 容忍）+ 500 手长跑进行中，见 §3.2 #6）** + 覆盖热力图（§4.2 非轻活半段，分类逻辑复用 shadow/off-tree）
 + 脱锚 range 细化（部分前缀 reach / 对手数据，后置；**设计探索已记 `unanchored_range_design_2026_06_10.md`**——
 三档方案 + AllIn-tag 坑 + 实现要点）+ 6-way 深码 build 侧优化（条件项）。**
 
