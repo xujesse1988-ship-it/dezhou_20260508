@@ -262,6 +262,10 @@ class Session:
     def handle_message(self, ws, msg):
         t = msg.get("type")
         if "table_id" in msg:
+            # 换桌（或首次入桌）时打观战链接（arena 页面按 table_id 路由）。
+            if msg["table_id"] and msg["table_id"] != self.state["table_id"]:
+                print(f"  [table] table_id={msg['table_id']} "
+                      f"观战: https://openpoker.ai/zh/arena/{msg['table_id']}", file=sys.stderr)
             self.state["table_id"] = msg["table_id"]
         if "table_seq" in msg:
             self.state["last_seq"] = msg["table_seq"]
@@ -355,7 +359,10 @@ class Session:
         # 不动 advisor 消费的任何字段（byte-equal 由 selftest 5 钉死）。
         if self.hh_f is not None:
             if hand is not None:
-                self.hh_f.write(json.dumps(hand.hh_record(msg), ensure_ascii=False) + "\n")
+                rec = hand.hh_record(msg)
+                # table_id 是会话态非单手态 → 在落盘点补（按桌分析对手池用；Rust 解析侧忽略）。
+                rec["table_id"] = self.state["table_id"]
+                self.hh_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 self.hh_f.flush()
                 self.counters["hh_hands"] += 1
             else:
@@ -577,7 +584,7 @@ def _canned_hh_messages():
     b5 = b4 + ["9c"]
     return [
         {"type": "hand_start", "hand_id": "hh-selftest-1", "seat": 2, "dealer_seat": 0,
-         "blinds": {"small_blind": 10, "big_blind": 20}},
+         "table_id": "tbl-selftest-1", "blinds": {"small_blind": 10, "big_blind": 20}},
         {"type": "hole_cards", "cards": ["Ah", "Kd"]},
         pa(3, "fold", None, "preflop", 2000, 0),
         pa(4, "fold", None, "preflop", 2000, 0),
@@ -647,9 +654,11 @@ def _selftest_hh_byte_equal():
         raise RuntimeError(f"[hh] 应落 1 行 HH，得 {len(lines)} 行 (counters={counters_on})")
     rec = lines[0]
     for k in ("hand_id", "button_seat", "my_seat", "hole", "board", "actions", "actions_ext",
-              "names", "stacks_start", "committed_total", "hand_result"):
+              "names", "stacks_start", "committed_total", "hand_result", "table_id"):
         if k not in rec:
             raise RuntimeError(f"[hh] 记录缺字段 {k}")
+    if rec["table_id"] != "tbl-selftest-1":
+        raise RuntimeError(f"[hh] table_id 未落盘: {rec['table_id']!r}")
     if len(rec["actions"]) != 12 or len(rec["actions_ext"]) != 12:
         raise RuntimeError(f"[hh] actions/actions_ext 应各 12 条，得 "
                            f"{len(rec['actions'])}/{len(rec['actions_ext'])}")
