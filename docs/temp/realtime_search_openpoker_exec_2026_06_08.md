@@ -324,7 +324,21 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      重建投入；③`winners.amount` = **净赢**（对账两手实测）→ 回推公式改 net 约定。smoke 9 手 HH 全链路
      0 失败（short_handed=1 正确重映射、VF-1 修正 9/9 生效）。**500 手长跑采集进行中**（vultr nohup，
      `openpoker_hh_live.jsonl` 累积；读数 = `openpoker_hh_aivat --hh-log ... --vf1 ...`）。
-   - **仍未做**：c_act v2（需 σ 日志）。
+   - **首轮 500 手长跑已完成（2026-06-11，blueprint-only 基线臂，preopen 10B，账号 jesse_xu）**：
+     HH 共 625 手（runs 1-3）、500/500 捕获 0 丢失、watchdog 0 触发。**真值总账（服务端 final−start 口径，
+     不依赖重放）= +348BB，raw +558 ± 640 mbb/g，CI95 [−697, +1812] 跨 0**——方向为正、判不动显著性，
+     与 §4.1 功效预算预期一致。决策面：8.6% 兜底（limp structural_gap ~6% + 短桌 seat_mismatch ~2.4%）。
+     **发现①（管道修复项，高优先）**：5 手 all-in 大锅（合计 +533BB）U 重放校验失败被 AIVAT 报表剔除 →
+     报表均值被拉负（−289）；根因 = 对手 hand-start 栈回推误差（committed_total 的 all_in 缺口）→
+     all-in-for-less 退注几何错位。修法 = 解析侧改用 `actions_ext.stack_before/after` 重建对手栈
+     （原始数据已在 HH 里，5 手可追溯修复；修完 AIVAT 才能吃 all-in 手 = c_runout 主场）。
+     **发现②（策略证据，喂 B/C 搜索臂立项)**：BB 防守系统性过紧——重放探针（200×）证实
+     AJo@BB 对 UTG 3.2x+2 跟 = **纯弃**；KTs 顶对好踢脚对 min-check-raise = **纯弃**（seed 1/2/3/42
+     同 infoset 一致；min-raise 被 off-tree 映成 ≥0.5pot 档 = 粒度税实锤，seed=99 哈希舍入映到另一节点
+     变纯 allin——跨 session 映射不保证一致，设计内）。位置切片 BB −837 mbb/g 最差；见 flop 人数
+     2-way +1211 / 3-way −218 / 4-way −534（多人更差，与 ≤3-way 训练边界一致，样本小只看方向）。
+     真实尺寸重解正是搜索臂的主场 → 下一步 = 同条件 search-on 500 手对比臂。
+   - **仍未做**：c_act v2（需 σ 日志）+ U-fail 5 手的对手栈重建修复（见发现①）。
 
 ## 4. 落地（分步验收）
 
