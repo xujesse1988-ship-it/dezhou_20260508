@@ -193,12 +193,12 @@ class HandState:
         return {s for s in d if isinstance(s, int) and 0 <= s < NUM_SEATS}
 
     def _blind_seats(self, dealt_sorted):
-        """短桌真实盲注座 = button 起顺时针前两个**发牌座**（与 openpoker_hh 紧凑 ring 同口径；
-        k=2 button 兼 SB）。button 不在 dealt → ValueError（caller 退满桌假设）。"""
+        """短桌真实盲注座 = button 起顺时针前两个**发牌座**。OpenPoker 对 k=2 也用统一环规则
+        （live 校准 2026-06-11 smoke：HU 时 button 发 BB、非 button 发 SB 先动——非标准 HU），
+        所以不设特例：k=2 时 (btn+1)%2=对手=SB、(btn+2)%2=button=BB。
+        button 不在 dealt → ValueError（caller 退满桌假设）。"""
         k = len(dealt_sorted)
         bi = dealt_sorted.index(self.button_seat)
-        if k == 2:
-            return dealt_sorted[bi], dealt_sorted[(bi + 1) % k]
         return dealt_sorted[(bi + 1) % k], dealt_sorted[(bi + 2) % k]
 
     def _committed_total_for(self, sb_seat, bb_seat):

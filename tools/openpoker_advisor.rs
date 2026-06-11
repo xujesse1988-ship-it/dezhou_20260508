@@ -57,7 +57,8 @@
 //! - 对手 open-limp：no-limp blueprint 无对应节点 → 走兜底（见上）。
 //! - 短桌手（6 座只发 k<6 家）：driver 送 `dealt_seats`（`table_state.seats[].in_hand` 推断）时
 //!   走**幻影座映射**（[`seat_map`]：k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的真实节点、
-//!   盲注对齐）；占座不可判（无 table_state）/ k=2（HU button 兼 SB 映不进）→ 仍兜底。
+//!   盲注对齐；k=2 按 OpenPoker 实测 HU 约定 button=BB 映 SB/BB→树座 1/2）；占座不可判
+//!   （无 table_state）→ 仍兜底。
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -141,10 +142,10 @@ struct Request {
     #[serde(default)]
     stacks: Vec<u64>,
     /// 短桌幻影座映射（exec 文档「短桌 seat_mismatch ~2.4% 兜底」修复）：本手**实际发牌**的
-    /// OpenPoker 座位（升序）。缺省 / 全 6 座 = 满桌（旧行为 byte-equal）。k∈[3,5] →
+    /// OpenPoker 座位（升序）。缺省 / 全 6 座 = 满桌（旧行为 byte-equal）。k∈[2,5] →
     /// [`seat_map`] 把 k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的真实节点（盲注对齐：
-    /// 真实 BTN/SB/BB → 树座 0/1/2）。k=2 映不进（真实 HU button 兼 SB、postflop 行动序与
-    /// 树上 SB-vs-BB 相反）→ 兜底。driver 从 `table_state.seats[].in_hand` ∪ 已行动座推断，
+    /// 真实 BTN/SB/BB → 树座 0/1/2；k=2 按 OpenPoker 实测 HU 约定 button=BB → SB/BB 映树座
+    /// 1/2、幻影 [3,4,5,0]）。driver 从 `table_state.seats[].in_hand` ∪ 已行动座推断，
     /// 仅本手收到过 table_state 时才发（决策时占座唯一可判才启用）。
     #[serde(default)]
     dealt_seats: Vec<u8>,
@@ -204,8 +205,9 @@ fn expected_board_len(s: poker::Street) -> usize {
 struct SeatMap {
     /// 下标 = OpenPoker 座位号；`None` = 本手未发牌（空座 / 等下一手的玩家）。
     to_tree: [Option<u8>; N_SEATS],
-    /// 幻影座数 = 6 − k。幻影树座 = `3..3+n_phantom`（UTG 起最早行动位），preflop 开局先 fold。
-    n_phantom: u8,
+    /// 重放序列开头按序先 fold 的幻影树座（preflop 行动序）。k∈[3,5] = `3..3+(6−k)`
+    /// （UTG 起最早行动位，恰好最先轮到）；k=2 = `[3,4,5,0]`（BTN 位也是幻影）。
+    phantoms: Vec<u8>,
 }
 
 impl SeatMap {
@@ -216,11 +218,6 @@ impl SeatMap {
             .flatten()
             .ok_or_else(|| "actor_not_dealt".to_string())
     }
-
-    /// 重放序列开头要先 fold 的幻影树座（preflop 行动序从树座 3 起，恰好最先轮到它们）。
-    fn phantom_tree_seats(&self) -> std::ops::Range<u8> {
-        3..3 + self.n_phantom
-    }
 }
 
 /// 建座位映射。`dealt_seats` 缺省 / 全 6 座 → 满桌恒等（旧 `(op + 6 − button) % 6` 公式，
@@ -230,8 +227,12 @@ impl SeatMap {
 /// （ring 序 j≥3 → 树座 j+6−k），幻影座占 UTG 起最早行动位、开局先 fold——k 人桌首个
 /// 行动者 ≡ 6-max 前 6−k 位弃牌后的同位置（标准短桌位置等价，blueprint 真实训练过的节点；
 /// preflop 3,4,5,0,1,2 与 postflop 从 SB 顺时针两序在 k=3/4/5 下都与真实短桌严格吻合）。
-/// k=2 映不进：真实 HU button 兼 SB、preflop 先动 postflop 后动，而树上 fold 到 SB-vs-BB
-/// 后 postflop SB 先动——没有座位映射能同时对齐两条街 → `Err`（caller 兜底）。
+///
+/// k=2：OpenPoker 的 HU 是满桌环规则的自然推广（**live 校准 2026-06-11 smoke**：button 发
+/// BB、非 button 发 SB 且 preflop 先动——**非标准 HU**，标准是 button=SB）→ 恰好能映：
+/// 真实 SB（非 button）→ 树座 1、真实 BB（button）→ 树座 2，幻影 `[3,4,5,0]` 先 fold；
+/// 树上 preflop（SB 先）与 postflop（环规则 SB 先）都与该约定对齐。若服务端 HU postflop
+/// 实为标准序（BB 先），重放在首个 postflop 动作 seat_mismatch → loud 兜底，不腐蚀。
 fn seat_map(req: &Request) -> Result<SeatMap, String> {
     let full = || {
         let mut m = [None; N_SEATS];
@@ -240,7 +241,7 @@ fn seat_map(req: &Request) -> Result<SeatMap, String> {
         }
         SeatMap {
             to_tree: m,
-            n_phantom: 0,
+            phantoms: Vec::new(),
         }
     };
     if req.dealt_seats.is_empty() {
@@ -248,7 +249,7 @@ fn seat_map(req: &Request) -> Result<SeatMap, String> {
     }
     let dealt = &req.dealt_seats;
     let k = dealt.len();
-    if k > N_SEATS
+    if !(2..=N_SEATS).contains(&k)
         || dealt.windows(2).any(|w| w[0] >= w[1])
         || dealt.iter().any(|&s| s as usize >= N_SEATS)
     {
@@ -260,17 +261,19 @@ fn seat_map(req: &Request) -> Result<SeatMap, String> {
     if k == N_SEATS {
         return Ok(full());
     }
-    if k == 2 {
-        return Err("short_hu".into());
-    }
-    if k < 2 {
-        return Err("bad_dealt_seats".into());
-    }
     let btn_idx = dealt
         .iter()
         .position(|&s| s == req.button_seat)
         .expect("上面 contains 已校验");
     let mut m = [None; N_SEATS];
+    if k == 2 {
+        m[req.button_seat as usize] = Some(2); // OpenPoker HU：button 发 BB → 树座 2。
+        m[dealt[1 - btn_idx] as usize] = Some(1); // 非 button 发 SB 先动 → 树座 1。
+        return Ok(SeatMap {
+            to_tree: m,
+            phantoms: vec![3, 4, 5, 0],
+        });
+    }
     for j in 0..k {
         let op = dealt[(btn_idx + j) % k] as usize;
         let tree = if j < 3 { j } else { j + (N_SEATS - k) };
@@ -278,7 +281,7 @@ fn seat_map(req: &Request) -> Result<SeatMap, String> {
     }
     Ok(SeatMap {
         to_tree: m,
-        n_phantom: (N_SEATS - k) as u8,
+        phantoms: (3..3 + (N_SEATS - k) as u8).collect(),
     })
 }
 
@@ -380,8 +383,8 @@ fn decide(
             let mut real = poker::GameState::new(&solver_cfg, REAL_REPLAY_SEED);
             let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
             let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
-            // 短桌：幻影座（UTG 起的前 6−k 位）开局先 fold → 走到 blueprint 树的真实节点。
-            for t in smap.phantom_tree_seats() {
+            // 短桌：幻影座（UTG 起的最早行动位）开局先 fold → 走到 blueprint 树的真实节点。
+            for &t in &smap.phantoms {
                 lockstep_step(&mut real, &mut abs, &mut abs_rng, t, "fold", None)
                     .map_err(|e| format!("phantom_{e}"))?;
             }
@@ -646,10 +649,8 @@ fn build_real_auth(
     let mut rs_street = auth.street();
     let mut within: Vec<(Action, bool)> = Vec::new();
     // 短桌幻影 fold + 真实动作走同一条重放（[`seat_map`]；幻影 fold 在 preflop 开局，
-    // 不可能收街——k≥3 时盲注两座还没行动，within 推进与真实动作同口径即可）。
-    let phantom = smap
-        .phantom_tree_seats()
-        .map(|t| (t, "fold".to_string(), None));
+    // 不可能收街——盲注两座还没行动，within 推进与真实动作同口径即可）。
+    let phantom = smap.phantoms.iter().map(|&t| (t, "fold".to_string(), None));
     let acts = req
         .actions
         .iter()
@@ -2258,37 +2259,71 @@ mod tests {
         assert_eq!(resp, again, "同 seed 短桌搜索须确定性");
     }
 
-    /// k=2 映不进（HU button 兼 SB、postflop 行动序与树相反）→ 显式兜底，不静默映错节点。
-    /// 占座表自相矛盾（button / 行动者不在 dealt）同样兜底。
+    /// k=2（OpenPoker HU 约定 = button 发 BB、非 button 发 SB 先动，live 2026-06-11 smoke
+    /// 校准）：HU 手映到「满桌 fold 到 SB-vs-BB」的真实节点——info_set 与满桌等价请求一致。
+    /// 占座表自相矛盾（button / 行动者不在 dealt）兜底。
     #[test]
-    fn short_handed_hu_and_bad_dealt_fall_back() {
+    fn short_handed_hu_maps_and_bad_dealt_falls_back() {
         let game = preopen_game();
         let abs = game.abstraction().clone();
         let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
         let mut cache = SubgameSolveCache::new();
-        let base = Request {
+        // 满桌等价基准：button=0，UTG/HJ/CO/BTN fold → SB(1)=我 决策（facing BB）。
+        let full = Request {
             hole: vec!["Ah".into(), "Kd".into()],
             board: vec![],
-            button_seat: 1,
-            my_seat: 4,
+            button_seat: 0,
+            my_seat: 1,
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
-            actions: vec![],
+            actions: vec![
+                hist(3, "fold", None),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+                hist(0, "fold", None),
+            ],
             valid: full_valid(),
             stacks: vec![],
-            dealt_seats: vec![1, 4],
+            dealt_seats: vec![],
         };
-        let resp = decide(&game, &abs, &uniform, &base, 0, None, &mut cache);
-        assert_eq!(resp.source, "fallback:short_hu");
-        assert!(is_legal(&resp, &base.valid));
+        let full_resp = decide(&game, &abs, &uniform, &full, 9, None, &mut cache);
+        assert_eq!(
+            full_resp.source, "blueprint",
+            "基准应走通，得 {full_resp:?}"
+        );
+        // HU：dealt={1,4}，button=4（OpenPoker 约定 = button 发 BB → 树座 2），我=op1
+        // （非 button = SB 先动 → 树座 1）。actions=[] = 幻影 [3,4,5,0] fold 后轮我。
+        let hu = Request {
+            button_seat: 4,
+            my_seat: 1,
+            dealt_seats: vec![1, 4],
+            actions: vec![],
+            hole: full.hole.clone(),
+            board: vec![],
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            valid: full_valid(),
+            stacks: vec![],
+        };
+        let resp = decide(&game, &abs, &uniform, &hu, 9, None, &mut cache);
+        assert_eq!(
+            resp.source, "blueprint",
+            "HU 应映进树走 blueprint，得 {resp:?}"
+        );
+        assert!(is_legal(&resp, &hu.valid));
+        assert_eq!(
+            resp.info_set, full_resp.info_set,
+            "HU 必须映到满桌 fold-to-SB 等价节点"
+        );
 
         // button 不在 dealt：
         let bad_btn = Request {
             dealt_seats: vec![0, 4, 5],
             button_seat: 1,
             my_seat: 4,
-            hole: base.hole.clone(),
+            hole: full.hole.clone(),
             board: vec![],
             num_seats: 6,
             small_blind: 10,
@@ -2306,7 +2341,7 @@ mod tests {
             button_seat: 0,
             my_seat: 1,
             actions: vec![hist(3, "fold", None)],
-            hole: base.hole.clone(),
+            hole: full.hole.clone(),
             board: vec![],
             num_seats: 6,
             small_blind: 10,
@@ -2322,7 +2357,7 @@ mod tests {
             dealt_seats: vec![2, 0, 5],
             button_seat: 0,
             my_seat: 2,
-            hole: base.hole.clone(),
+            hole: full.hole.clone(),
             board: vec![],
             num_seats: 6,
             small_blind: 10,

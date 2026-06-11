@@ -228,12 +228,16 @@ pub fn hh_to_multiway_input(rec: &HhRecord) -> Result<HhConverted, String> {
     let btn_new = remap(rec.button_seat as usize)?;
     let my_new = remap(our)?;
 
-    // 引擎同口径盲注（n_dealt==2：button=SB），在重映射 ring 上算。
-    let (sb_new, bb_new) = if n_dealt == 2 {
-        (btn_new, (btn_new + 1) % 2)
-    } else {
-        ((btn_new + 1) % n_dealt, (btn_new + 2) % n_dealt)
-    };
+    // 盲注 = button 起顺时针前两个发牌座。OpenPoker 对 HU 也用统一环规则（live 校准
+    // 2026-06-11 smoke 实测：button 发 BB、非 button 发 SB 且先动——**非标准 HU**，原
+    // 「n_dealt==2：button=SB」假设错，导致 HU 手全部转换失败）→ 不设特例：n_dealt==2 时
+    // sb=(btn+1)%2=非 button、bb=button。
+    let (sb_new, bb_new) = ((btn_new + 1) % n_dealt, (btn_new + 2) % n_dealt);
+    // 引擎 n=2 走标准 HU（button=SB 先动，D-022b-rev1）→ 把**引擎 button 设为 OpenPoker 的
+    // SB 座**对齐：盲注 / preflop 行动序全同（只是 button 标签贴在谁头上不同）。已知残留：
+    // HU 手若打进 postflop，OpenPoker（环规则 = SB 先动）与引擎标准 HU（BB 先动）行动序
+    // 相反 → 重放 loud Err 计数（smoke 24 手 HU 全 preflop 结束；postflop HU 等真数据定夺）。
+    let engine_btn = if n_dealt == 2 { sb_new } else { btn_new };
 
     // ---- hand-start 真栈（OP 单位，按新 id 索引）----
     // 满桌且 driver 已回推 → 可信（盲注 seeding 正确）。否则（短桌手 / walk 手无 your_turn）
@@ -320,7 +324,7 @@ pub fn hh_to_multiway_input(rec: &HhRecord) -> Result<HhConverted, String> {
         small_blind: ChipAmount::new(SOLVER_SB),
         big_blind: ChipAmount::new(SOLVER_BB),
         ante: ChipAmount::ZERO,
-        button_seat: SeatId(btn_new as u8),
+        button_seat: SeatId(engine_btn as u8),
     };
 
     // ---- 动作转换重放（座位重映射；actor 逐步校验；Bet/Raise 种类按重放态合法集判）----
@@ -492,6 +496,43 @@ mod tests {
         assert_eq!(r.n_runout_completions, 44);
         assert_eq!(r.aivat, r.raw - r.c_runout);
         assert!(r.c_runout.abs() < 10_000.0 + 1e-9);
+    }
+
+    /// HU 短桌手（live 2026-06-11 smoke 真实手 9d818d2b 的数字）：OpenPoker HU 是环规则
+    /// 推广——button(op1) 发 BB、非 button(op0) 发 SB 且先动（**非标准 HU**）。引擎 n=2 走
+    /// 标准 HU（button=SB）→ 引擎 button 须设为 OpenPoker 的 SB 座对齐。修前按
+    /// 「n_dealt==2：button=SB」假设，本手第 0 步就 seat mismatch（smoke 24/25 全挂）。
+    #[test]
+    fn hu_hand_openpoker_ring_convention_converts() {
+        let line = r#"{
+          "button_seat": 1, "my_seat": 1, "num_seats": 6,
+          "small_blind": 10, "big_blind": 20,
+          "hole": ["Ah", "Kd"],
+          "board": [],
+          "actions": [
+            {"seat": 0, "action": "raise", "to": 50}, {"seat": 1, "action": "fold"}
+          ],
+          "actions_ext": [{"contribution_delta": 40}, {"contribution_delta": 0}],
+          "stacks_start": null,
+          "committed_total": {"0": 0, "1": 0},
+          "hand_result": {
+            "winners": [{"seat": 0, "amount": 20}],
+            "pot": 70,
+            "final_stacks": {"0": 2030, "1": 1970}
+          }
+        }"#;
+        let rec: HhRecord = serde_json::from_str(line).expect("parse");
+        let conv = hh_to_multiway_input(&rec).expect("convert");
+        assert_eq!(conv.n_dealt, 2);
+        // 引擎 button = OpenPoker 的 SB 座（新 id 0）：引擎标准 HU 下 button=SB 先动 ✓。
+        assert_eq!(conv.input.config.button_seat, SeatId(0));
+        // 回推 start：SB(op0) = 2030 − 20(净赢) = 2010；BB(op1) = 1970 + 20(盲) = 1990。
+        assert_eq!(conv.input.config.starting_stacks[0].as_u64(), 10_050);
+        assert_eq!(conv.input.config.starting_stacks[1].as_u64(), 9_950);
+        assert_eq!(conv.input.winnings, -100, "我=BB 丢 20 op × 5");
+        let est = MultiwayAivatEstimator::new(None);
+        let r = est.estimate_hand(&conv.input).expect("estimate");
+        assert_eq!(r.raw, -100.0);
     }
 
     /// final_stacks 被篡改 → U 与重放结算不一致 → 估计器 loud Err（不静默给偏样本）。
