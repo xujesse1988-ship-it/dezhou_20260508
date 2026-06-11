@@ -251,7 +251,8 @@ class Session:
     # handle_message 显式处理的消息类型；其余类型首见时打 stderr（看清被踢 / 桌散 /
     # 移桌这类**沉默事件**的真实报文——live 实测 2026-06-11 曾被移出桌后空等）。
     _KNOWN_TYPES = ("connected", "error", "hand_start", "hole_cards", "player_action",
-                    "community_cards", "your_turn", "hand_result")
+                    "community_cards", "your_turn", "hand_result",
+                    "lobby_joined", "table_joined")
 
     def __init__(self, advisor, send, num_hands, log_f=None, hh_f=None):
         self.advisor = advisor
@@ -316,6 +317,12 @@ class Session:
             elif msg.get("code") == "already_seated":
                 # 上个进程的座位被服务端保留（live 实测）：可能在死桌上——主动换干净座位。
                 self.rejoin(ws, "already_seated（继承了旧进程的座位，可能是死桌）")
+        elif t in ("lobby_joined", "table_joined"):
+            # 排队 / 入座流程中没有 hand_result 是正常状态——喂狗，免得看门狗在大厅队列里
+            # 误触发 rejoin（会被重排队尾、可能循环）。
+            self.last_hand_ts = time.time()
+            print(f"  [{t}] position={msg.get('position')} wait={msg.get('estimated_wait')} "
+                  f"seat={msg.get('seat')}", file=sys.stderr)
         elif t == "hand_start":
             self.state["hand"] = HandState(msg.get("hand_id"), msg.get("dealer_seat"),
                                            msg.get("seat"))
