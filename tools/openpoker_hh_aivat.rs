@@ -75,6 +75,7 @@ fn run() -> Result<(), String> {
     let mut runout_completions = 0u64;
     let mut unknown_folded = 0u64;
     let mut c_deal_used = 0u64;
+    let mut n_short = 0u64;
 
     for (lineno, line) in reader.lines().enumerate() {
         let lineno = lineno + 1;
@@ -104,6 +105,9 @@ fn run() -> Result<(), String> {
                 continue;
             }
         };
+        if conv.n_dealt < rec.num_seats as usize {
+            n_short += 1;
+        }
         match estimator.estimate_hand(&conv.input) {
             Ok(r) => {
                 raw_mbb.push(chips_to_mbb_per_hand(r.raw, SOLVER_BB));
@@ -138,7 +142,7 @@ fn run() -> Result<(), String> {
         return Err("没有可估计的手（全部失败？检查上面的失败原因）".to_string());
     }
     println!(
-        "runout_hands={n_runout} (avg completions {:.0}) unknown_folded_total={unknown_folded} c_deal_active={c_deal_used}",
+        "short_handed={n_short} runout_hands={n_runout} (avg completions {:.0}) unknown_folded_total={unknown_folded} c_deal_active={c_deal_used}",
         if n_runout > 0 {
             runout_completions as f64 / n_runout as f64
         } else {
