@@ -349,18 +349,21 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      短桌真栈回推按 dealt ring 重算盲注座（满桌 btn+1/+2 seeding 短桌必错）、非发牌座 placeholder；
      HH 落 `dealt_est` 供事后对 `final_stacks` 键集验证推断质量。测试钉法 = 短桌请求与满桌等价
      请求（前 6−k 位真 fold）**info_set 相等**（两种空座布局 + flop 多街贯通 + HU）。
-     **③k=2 也能映（`0fe6852`，smoke 校准推翻初版「映不进」结论）**：25 手 smoke 落在 HU 桌
-     （24×k=2 + 1×k=3，占座推断 25/25 精确、table_state 每手必达），数据钉死 **OpenPoker 的 HU
-     是满桌环规则跳空座的自然推广——button 发 BB、非 button 发 SB 且 preflop 先动（非标准 HU；
-     标准 = button 兼 SB）**。按真实约定 SB→树座 1 / BB(button)→树座 2 / 幻影 [3,4,5,0] 先
-     fold，preflop（SB 先）与 postflop（环规则 SB 先）两条街都对齐；若服务端 HU postflop 实为
-     标准序（BB 先）则重放 loud 兜底不腐蚀（smoke 全 preflop 结束、待真数据）。HU 桌是 live
-     最大出血点（smoke 87.5% 兜底、−2200 mbb/g 全是 `fallback:short_hu` 被盲注磨）→ 现走
-     blueprint 真实节点。**同根因连修 `openpoker_hh` 解析器**：原「n_dealt==2：button=SB」假设
-     令 smoke 24/25 HU 手转换全挂 → 改统一环规则盲注 + 引擎 button 设为 OpenPoker 的 SB 座
-     对齐（引擎 n=2 走标准 HU）；已知残留 = HU 手打进 postflop 行动序仍相反 → loud Err 计数。
+     **③k=2 = preflop 可映 / postflop 映不进（`0fe6852`→两轮 smoke 40 手 HU 实测校准）**：
+     数据钉死 **OpenPoker HU 的盲注按环规则贴（button 发 BB、非 button 发 SB——非标准 HU），
+     但行动序是角色序（preflop SB 先、postflop BB 先 = 标准 HU 的角色顺序）**；注意
+     `player_action.street` 是**动作后**的街标签（收街动作挂下一街名），裸看会误判行动序。
+     advisor：preflop 按 SB→树座 1 / BB(button)→树座 2 / 幻影 [3,4,5,0] 先 fold 映到真实节点
+     （smoke2 实测 19 决策 blueprint）；postflop 树是环序（SB 先）表达不了跨街反转 → 显式
+     `fallback:short_hu_postflop`（顺序错位本会被重放 seat 校验拦下、smoke2 实测 0 漏网，门只是
+     把原因标清楚）。HU 桌是 live 最大出血点（smoke1 87.5% 兜底、−2200 mbb/g 全是被盲注磨）→
+     preflop 现走 blueprint。**同根因连修 `openpoker_hh` 解析器**：原「n_dealt==2：button=SB」
+     假设令 smoke1 24/25 HU 手转换全挂 → 统一环规则盲注 + **引擎 button 设为 OpenPoker 的 SB
+     座做 role-for-role 对齐**（引擎 n=2 标准 HU 的角色序与 OpenPoker 一致）→ 连 postflop 都对
+     （smoke2 含打满 5 街 HU 手 15/15 全转换+估计；两轮 smoke 40/40 hands_ok）。占座推断两轮
+     40/40 精确（dealt_est == final_stacks 键集）、table_state 每手必达。
    - **仍未做**：c_act v2（需 σ 日志）+ U-fail 5 手的对手栈重建修复（见发现①）+ HU postflop
-     行动序真数据校准（见上 ③ 残留）。
+     若要真打需 n=2 真栈子博弈搜索路径（引擎能表达、6-max 树不能；条件项，HU 桌占比说话）。
 
 ## 4. 落地（分步验收）
 

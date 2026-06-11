@@ -145,8 +145,9 @@ struct Request {
     /// OpenPoker 座位（升序）。缺省 / 全 6 座 = 满桌（旧行为 byte-equal）。k∈[2,5] →
     /// [`seat_map`] 把 k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的真实节点（盲注对齐：
     /// 真实 BTN/SB/BB → 树座 0/1/2；k=2 按 OpenPoker 实测 HU 约定 button=BB → SB/BB 映树座
-    /// 1/2、幻影 [3,4,5,0]）。driver 从 `table_state.seats[].in_hand` ∪ 已行动座推断，
-    /// 仅本手收到过 table_state 时才发（决策时占座唯一可判才启用）。
+    /// 1/2、幻影 [3,4,5,0]，**仅 preflop**——postflop 行动序角色反转映不进、显式兜底）。
+    /// driver 从 `table_state.seats[].in_hand` ∪ 已行动座推断，仅本手收到过 table_state 时
+    /// 才发（决策时占座唯一可判才启用）。
     #[serde(default)]
     dealt_seats: Vec<u8>,
 }
@@ -208,6 +209,8 @@ struct SeatMap {
     /// 重放序列开头按序先 fold 的幻影树座（preflop 行动序）。k∈[3,5] = `3..3+(6−k)`
     /// （UTG 起最早行动位，恰好最先轮到）；k=2 = `[3,4,5,0]`（BTN 位也是幻影）。
     phantoms: Vec<u8>,
+    /// k==2：HU 映射只对 preflop 成立（caller 在 postflop 显式兜底，见 [`seat_map`] doc）。
+    hu: bool,
 }
 
 impl SeatMap {
@@ -228,11 +231,12 @@ impl SeatMap {
 /// 行动者 ≡ 6-max 前 6−k 位弃牌后的同位置（标准短桌位置等价，blueprint 真实训练过的节点；
 /// preflop 3,4,5,0,1,2 与 postflop 从 SB 顺时针两序在 k=3/4/5 下都与真实短桌严格吻合）。
 ///
-/// k=2：OpenPoker 的 HU 是满桌环规则的自然推广（**live 校准 2026-06-11 smoke**：button 发
-/// BB、非 button 发 SB 且 preflop 先动——**非标准 HU**，标准是 button=SB）→ 恰好能映：
-/// 真实 SB（非 button）→ 树座 1、真实 BB（button）→ 树座 2，幻影 `[3,4,5,0]` 先 fold；
-/// 树上 preflop（SB 先）与 postflop（环规则 SB 先）都与该约定对齐。若服务端 HU postflop
-/// 实为标准序（BB 先），重放在首个 postflop 动作 seat_mismatch → loud 兜底，不腐蚀。
+/// k=2：OpenPoker 的 HU 盲注按环规则贴（**live 校准 2026-06-11 两轮 smoke**：button 发
+/// BB、非 button 发 SB——非标准 HU），但**行动序是角色序**（preflop SB 先、postflop BB
+/// 先 = 标准 HU 的角色顺序）。树是环序（fold 到 SB-vs-BB 后两条街都 SB 先），跨街反转
+/// 表达不了 → **只映 preflop**（真实 SB → 树座 1、真实 BB(button) → 树座 2、幻影
+/// `[3,4,5,0]` 先 fold，preflop 行动序严格吻合）；postflop 由 caller 显式兜底
+/// `short_hu_postflop`（实测顺序错位必被重放 seat 校验拦下、0 漏网，门只是把原因标清楚）。
 fn seat_map(req: &Request) -> Result<SeatMap, String> {
     let full = || {
         let mut m = [None; N_SEATS];
@@ -242,6 +246,7 @@ fn seat_map(req: &Request) -> Result<SeatMap, String> {
         SeatMap {
             to_tree: m,
             phantoms: Vec::new(),
+            hu: false,
         }
     };
     if req.dealt_seats.is_empty() {
@@ -272,6 +277,7 @@ fn seat_map(req: &Request) -> Result<SeatMap, String> {
         return Ok(SeatMap {
             to_tree: m,
             phantoms: vec![3, 4, 5, 0],
+            hu: true,
         });
     }
     for j in 0..k {
@@ -282,6 +288,7 @@ fn seat_map(req: &Request) -> Result<SeatMap, String> {
     Ok(SeatMap {
         to_tree: m,
         phantoms: (3..3 + (N_SEATS - k) as u8).collect(),
+        hu: false,
     })
 }
 
@@ -342,6 +349,11 @@ fn decide(
         Ok(m) => m,
         Err(reason) => return safe_fallback(&req.valid, &reason),
     };
+    if smap.hu && !board.is_empty() {
+        // OpenPoker HU 行动序是角色序（postflop BB 先），树是环序（SB 先）→ postflop 映不进
+        // （[`seat_map`] doc）。顺序错位本会被重放 seat 校验拦下，这里只是把原因标清楚。
+        return safe_fallback(&req.valid, "short_hu_postflop");
+    }
     let my_seat_solver = match smap.tree_seat(req.my_seat) {
         Ok(t) => SeatId(t),
         Err(reason) => return safe_fallback(&req.valid, &reason),
@@ -2317,6 +2329,28 @@ mod tests {
             resp.info_set, full_resp.info_set,
             "HU 必须映到满桌 fold-to-SB 等价节点"
         );
+
+        // HU postflop：OpenPoker 行动序是角色序（postflop BB 先），树是环序（SB 先），
+        // 跨街反转映不进 → 显式兜底（live smoke2 实测 10 决策全被该门/重放校验拦下）。
+        let hu_flop = Request {
+            board: vec!["7h".into(), "2c".into(), "Ks".into()],
+            actions: vec![hist(1, "call", None), hist(4, "check", None)],
+            hole: full.hole.clone(),
+            button_seat: 4,
+            my_seat: 1,
+            dealt_seats: vec![1, 4],
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            valid: ValidActions {
+                can_check: true,
+                ..full_valid()
+            },
+            stacks: vec![],
+        };
+        let resp = decide(&game, &abs, &uniform, &hu_flop, 9, None, &mut cache);
+        assert_eq!(resp.source, "fallback:short_hu_postflop");
+        assert!(is_legal(&resp, &hu_flop.valid));
 
         // button 不在 dealt：
         let bad_btn = Request {

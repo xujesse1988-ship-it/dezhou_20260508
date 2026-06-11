@@ -228,15 +228,16 @@ pub fn hh_to_multiway_input(rec: &HhRecord) -> Result<HhConverted, String> {
     let btn_new = remap(rec.button_seat as usize)?;
     let my_new = remap(our)?;
 
-    // 盲注 = button 起顺时针前两个发牌座。OpenPoker 对 HU 也用统一环规则（live 校准
-    // 2026-06-11 smoke 实测：button 发 BB、非 button 发 SB 且先动——**非标准 HU**，原
+    // 盲注 = button 起顺时针前两个发牌座。OpenPoker 的 HU 盲注按环规则贴（live 校准
+    // 2026-06-11 两轮 smoke 实测：button 发 BB、非 button 发 SB——**非标准 HU**，原
     // 「n_dealt==2：button=SB」假设错，导致 HU 手全部转换失败）→ 不设特例：n_dealt==2 时
     // sb=(btn+1)%2=非 button、bb=button。
     let (sb_new, bb_new) = ((btn_new + 1) % n_dealt, (btn_new + 2) % n_dealt);
-    // 引擎 n=2 走标准 HU（button=SB 先动，D-022b-rev1）→ 把**引擎 button 设为 OpenPoker 的
-    // SB 座**对齐：盲注 / preflop 行动序全同（只是 button 标签贴在谁头上不同）。已知残留：
-    // HU 手若打进 postflop，OpenPoker（环规则 = SB 先动）与引擎标准 HU（BB 先动）行动序
-    // 相反 → 重放 loud Err 计数（smoke 24 手 HU 全 preflop 结束；postflop HU 等真数据定夺）。
+    // OpenPoker HU 的**行动序是角色序**（preflop SB 先、postflop BB 先 = 标准 HU 的角色
+    // 顺序，只是盲注角色贴错了 button）→ 把**引擎 button 设为 OpenPoker 的 SB 座**做
+    // role-for-role 对齐（引擎 n=2 标准 HU：button=SB preflop 先动、BB postflop 先动，
+    // D-022b-rev1），盲注与两条街行动序全同（只是 button 标签贴在谁头上不同）。
+    // postflop HU 手 live 实证可重放（smoke2 打满 5 街的 HU 手转换 15/15 全过）。
     let engine_btn = if n_dealt == 2 { sb_new } else { btn_new };
 
     // ---- hand-start 真栈（OP 单位，按新 id 索引）----
@@ -533,6 +534,52 @@ mod tests {
         let est = MultiwayAivatEstimator::new(None);
         let r = est.estimate_hand(&conv.input).expect("estimate");
         assert_eq!(r.raw, -100.0);
+    }
+
+    /// HU 手打满 5 街（live 2026-06-11 smoke2 真实手 072b89a9 的数字）：OpenPoker HU 行动序
+    /// 是**角色序**（preflop SB 先、postflop BB 先）→ 引擎 button=SB 座的 role-for-role 对齐
+    /// 连 postflop 都成立。preflop：SB limp、BB raise 44、SB call；flop/turn/river 全 check
+    /// （每街 BB=op0 先动）；摊牌 BB 的 JJ+33 胜。
+    #[test]
+    fn hu_postflop_role_order_converts_and_estimates() {
+        let line = r#"{
+          "button_seat": 0, "my_seat": 1, "num_seats": 6,
+          "small_blind": 10, "big_blind": 20,
+          "hole": ["Kd", "Qh"],
+          "board": ["Jc", "3s", "9c", "3h", "2h"],
+          "actions": [
+            {"seat": 1, "action": "call"}, {"seat": 0, "action": "raise", "to": 44},
+            {"seat": 1, "action": "call"}, {"seat": 0, "action": "check"},
+            {"seat": 1, "action": "check"}, {"seat": 0, "action": "check"},
+            {"seat": 1, "action": "check"}, {"seat": 0, "action": "check"},
+            {"seat": 1, "action": "check"}
+          ],
+          "actions_ext": [
+            {"contribution_delta": 10}, {"contribution_delta": 24}, {"contribution_delta": 24},
+            {"contribution_delta": 0}, {"contribution_delta": 0}, {"contribution_delta": 0},
+            {"contribution_delta": 0}, {"contribution_delta": 0}, {"contribution_delta": 0}
+          ],
+          "stacks_start": null,
+          "committed_total": {"0": 0, "1": 0},
+          "hand_result": {
+            "winners": [{"seat": 0, "amount": 44}],
+            "pot": 88,
+            "final_stacks": {"0": 5044, "1": 1876},
+            "shown_cards": {"0": ["6d", "Jd"], "1": ["Kd", "Qh"]}
+          }
+        }"#;
+        let rec: HhRecord = serde_json::from_str(line).expect("parse");
+        let conv = hh_to_multiway_input(&rec).expect("convert（修前 postflop 行动序对不上）");
+        assert_eq!(conv.n_dealt, 2);
+        assert_eq!(
+            conv.input.config.button_seat,
+            SeatId(1),
+            "引擎 button = SB 座"
+        );
+        assert_eq!(conv.input.winnings, -220, "我=SB 丢 44 op × 5");
+        let est = MultiwayAivatEstimator::new(None);
+        let r = est.estimate_hand(&conv.input).expect("estimate");
+        assert_eq!(r.raw, -220.0);
     }
 
     /// final_stacks 被篡改 → U 与重放结算不一致 → 估计器 loud Err（不静默给偏样本）。
