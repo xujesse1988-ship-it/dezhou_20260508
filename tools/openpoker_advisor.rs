@@ -168,9 +168,18 @@ struct Response {
     chosen: Option<String>,
     /// 决策点完整策略分布 `[(动作, 概率)]`（正概率支撑，label 同 `chosen`；`chosen` 即从中采样）。
     /// 仅合法动作路径填（blueprint / search / search:unanchored）；fallback / giveup 是强制动作、
-    /// 无分布不填。为 c_act（AIVAT v2）与人工复盘留的原始数据。
+    /// 无分布不填。为 c_act（AIVAT v2）与人工复盘留的原始数据。概率经 [`probs_log`] 四舍五入到
+    /// 4 位小数（日志可读性；<0.00005 的尾巴显示为 0.0，和可偏 1 至多 ±n×5e-5）。
     #[serde(skip_serializing_if = "Option::is_none")]
     probs: Option<Vec<(String, f64)>>,
+}
+
+/// 策略分布 → 日志格式：label 同 `chosen`，概率四舍五入 4 位小数（采样仍用全精度 `dist`，
+/// 只影响落盘显示）。
+fn probs_log(dist: &[(AbstractAction, f64)]) -> Vec<(String, f64)> {
+    dist.iter()
+        .map(|(a, p)| (action_label(a), (p * 1e4).round() / 1e4))
+        .collect()
 }
 
 // ===========================================================================
@@ -538,7 +547,7 @@ fn decide(
         resp.street = Some(street_label(street).into());
         resp.info_set = Some(info.raw());
         resp.chosen = Some(action_label(&chosen));
-        resp.probs = Some(dist.iter().map(|(a, p)| (action_label(a), *p)).collect());
+        resp.probs = Some(probs_log(&dist));
     }
     resp
 }
@@ -780,7 +789,7 @@ fn decide_search_unanchored(
         resp.source = "search:unanchored".into();
         resp.street = Some(street_label(auth.street()).into());
         resp.chosen = Some(action_label(&chosen));
-        resp.probs = Some(dist.iter().map(|(a, p)| (action_label(a), *p)).collect());
+        resp.probs = Some(probs_log(&dist));
     }
     resp
 }
@@ -1545,7 +1554,11 @@ mod tests {
         if resp.source == "search" {
             let probs = resp.probs.as_ref().expect("search 决策须带策略分布");
             let sum: f64 = probs.iter().map(|(_, p)| *p).sum();
-            assert!((sum - 1.0).abs() < 1e-9, "probs 须归一，和={sum}");
+            // 4 位舍入（probs_log）后和可偏 ±n×5e-5 → 容差 1e-3。
+            assert!(
+                (sum - 1.0).abs() < 1e-3,
+                "probs 须归一（舍入容差内），和={sum}"
+            );
             assert!(
                 probs.iter().any(|(a, _)| Some(a) == resp.chosen.as_ref()),
                 "chosen 须在 probs 支撑内，得 {resp:?}"
@@ -2479,7 +2492,11 @@ mod tests {
         assert_eq!(implicit.source, "blueprint");
         let probs = implicit.probs.as_ref().expect("blueprint 决策须带策略分布");
         let sum: f64 = probs.iter().map(|(_, p)| *p).sum();
-        assert!((sum - 1.0).abs() < 1e-9, "probs 须归一，和={sum}");
+        // 4 位舍入（probs_log）后和可偏 ±n×5e-5 → 容差 1e-3。
+        assert!(
+            (sum - 1.0).abs() < 1e-3,
+            "probs 须归一（舍入容差内），和={sum}"
+        );
         assert!(
             probs
                 .iter()
