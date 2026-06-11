@@ -248,6 +248,11 @@ def parse_valid_actions(your_turn):
 class Session:
     """跨手状态 + 消息分发。`send(ws, obj)` 由调用方注入（真实 = ws.send；canned = 收集）。"""
 
+    # handle_message 显式处理的消息类型；其余类型首见时打 stderr（看清被踢 / 桌散 /
+    # 移桌这类**沉默事件**的真实报文——live 实测 2026-06-11 曾被移出桌后空等）。
+    _KNOWN_TYPES = ("connected", "error", "hand_start", "hole_cards", "player_action",
+                    "community_cards", "your_turn", "hand_result")
+
     def __init__(self, advisor, send, num_hands, log_f=None, hh_f=None):
         self.advisor = advisor
         self.send = send
@@ -255,12 +260,37 @@ class Session:
         self.log_f = log_f
         self.hh_f = hh_f
         self.counters = {"hands": 0, "decisions": 0, "blueprint": 0, "search": 0,
-                         "fallback": 0, "net_chips": 0, "hh_hands": 0, "hh_skipped": 0}
+                         "fallback": 0, "net_chips": 0, "hh_hands": 0, "hh_skipped": 0,
+                         "watchdog_rejoins": 0}
         self.state = {"hand": None, "table_id": None, "last_seq": 0}
         self.client_action_id = [0]
+        # 看门狗（run_real 的后台线程读写）：最近一次 hand_result / 任意消息的时刻 + 当前 ws。
+        self.last_hand_ts = time.time()
+        self._ws = None
+        self._seen_types = set()
+
+    def rejoin(self, ws, why):
+        """leave + 重新 join_lobby 拿干净座位（已不在桌 / 卡死自救；服务端对未坐桌的
+        leave_table 容忍）。"""
+        print(f"  [rejoin] {why} → leave_table + join_lobby", file=sys.stderr)
+        self.send(ws, {"type": "leave_table"})
+        self.send(ws, {"type": "join_lobby", "buy_in": BUY_IN})
+
+    def watchdog_check(self, stale_after=300):
+        """run_real 后台线程每 30s 调一次：超过 stale_after 秒没有 hand_result（正常节奏
+        ~1 手/分钟）≈ 被移出桌 / 桌散后空等（live 实测 2026-06-11：driver 只在 connected
+        时 join 一次，被移出后会永远空等）→ leave+rejoin 自救。"""
+        if self._ws is not None and time.time() - self.last_hand_ts > stale_after:
+            self.counters["watchdog_rejoins"] += 1
+            self.last_hand_ts = time.time()  # 防重入桌等待期间连环触发
+            try:
+                self.rejoin(self._ws, f"{stale_after}s 无 hand_result（watchdog）")
+            except Exception as e:
+                print(f"  [watchdog] rejoin 发送失败: {e}", file=sys.stderr)
 
     def handle_message(self, ws, msg):
         t = msg.get("type")
+        self._ws = ws
         if "table_id" in msg:
             # 换桌（或首次入桌）时打观战链接（arena 页面按 table_id 路由）。
             if msg["table_id"] and msg["table_id"] != self.state["table_id"]:
@@ -269,15 +299,23 @@ class Session:
             self.state["table_id"] = msg["table_id"]
         if "table_seq" in msg:
             self.state["last_seq"] = msg["table_seq"]
+        if t not in self._seen_types:
+            self._seen_types.add(t)
+            if t not in self._KNOWN_TYPES:
+                print(f"  [msg] 未处理消息类型 {t!r} keys={sorted(msg.keys())}", file=sys.stderr)
 
         if t == "connected":
             print(f"  connected agent_id={msg.get('agent_id')} name={msg.get('name')}",
                   file=sys.stderr)
+            self.last_hand_ts = time.time()
             self.send(ws, {"type": "join_lobby", "buy_in": BUY_IN})
         elif t == "error":
             print(f"  [error] {msg}", file=sys.stderr)
             if msg.get("code") == "auth_failed":
                 ws.close()
+            elif msg.get("code") == "already_seated":
+                # 上个进程的座位被服务端保留（live 实测）：可能在死桌上——主动换干净座位。
+                self.rejoin(ws, "already_seated（继承了旧进程的座位，可能是死桌）")
         elif t == "hand_start":
             self.state["hand"] = HandState(msg.get("hand_id"), msg.get("dealer_seat"),
                                            msg.get("seat"))
@@ -354,6 +392,7 @@ class Session:
             self.log_f.flush()
 
     def _handle_hand_result(self, ws, msg):
+        self.last_hand_ts = time.time()
         hand = self.state["hand"]
         # HH 日志（§4.2）：整手落一行（在清空 hand 之前）。只读已累计状态 + hand_result 原样，
         # 不动 advisor 消费的任何字段（byte-equal 由 selftest 5 钉死）。
@@ -389,12 +428,23 @@ def _ws_send(ws, obj):
 
 
 def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None):
+    import threading
+
     import websocket  # 延迟 import：离线 selftest 不需要 websocket-client
 
     log_f = open(action_log, "w") if action_log else None
     # HH 用 append：贯穿全程的后台采集（§4.2），跨重连 / 多次运行累积同一个文件。
     hh_f = open(hh_log, "a") if hh_log else None
     session = Session(advisor, send=_ws_send, num_hands=num_hands, log_f=log_f, hh_f=hh_f)
+
+    # 看门狗线程：被移出桌 / 桌散后服务端不再推任何消息，回调模型里没有别的唤醒点。
+    stop_watchdog = threading.Event()
+
+    def watchdog_loop():
+        while not stop_watchdog.wait(30):
+            session.watchdog_check()
+
+    threading.Thread(target=watchdog_loop, daemon=True).start()
 
     def on_message(ws, raw):
         session.handle_message(ws, json.loads(raw))
@@ -419,6 +469,7 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None):
             print(f"  断线，3s 后重连（attempt {attempts}）…", file=sys.stderr)
             time.sleep(3)
 
+    stop_watchdog.set()
     if log_f:
         log_f.close()
     if hh_f:
@@ -439,7 +490,8 @@ def _report(counters):
     print(f"hands={counters['hands']} decisions={d} "
           f"blueprint={counters['blueprint']} search={counters.get('search', 0)} fallback={fb} "
           f"({100.0 * fb / d if d else 0:.1f}% 兜底) "
-          f"hh={counters.get('hh_hands', 0)}(+{counters.get('hh_skipped', 0)} skipped)",
+          f"hh={counters.get('hh_hands', 0)}(+{counters.get('hh_skipped', 0)} skipped) "
+          f"watchdog_rejoins={counters.get('watchdog_rejoins', 0)}",
           file=sys.stderr)
 
 
