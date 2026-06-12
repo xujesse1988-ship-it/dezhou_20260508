@@ -358,6 +358,15 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      报表均值被拉负（−289）；根因 = 对手 hand-start 栈回推误差（committed_total 的 all_in 缺口）→
      all-in-for-less 退注几何错位。修法 = 解析侧改用 `actions_ext.stack_before/after` 重建对手栈
      （原始数据已在 HH 里，5 手可追溯修复；修完 AIVAT 才能吃 all-in 手 = c_runout 主场）。
+     **——已修（2026-06-12，commit `3a1dff9`，vultr openpoker_hh 11 测试全绿）**：逐座覆盖
+     `start = actions_ext.stack_before(首动作) + 该座盲注`（首动作前投入恒 = 盲注的不变量；服务端权威值，
+     关掉 stacks_start / net 结算两条回推路的 all-in 缺口；缺 ext / 无动作座维持原回推），正负对照测试钉死
+     bug 机制。**基线 625 手重算：5 手 U-fail 全回表（estimate 失败 5→0，剩 1 手 convert 失败 = HH 不完整
+     丢消息另一类，0.16%）；raw +564.8 ± 640.9 与服务端真值总账对齐（修复正确性硬证）；AIVAT 首次在 live
+     真数据上吃到 c_runout 主场（runout 5 手、平均 51 万补全精确枚举跑得动）→ SE 缩减 ×2.11（641→304），
+     远超合成闸门 1.33×——校正后基线臂 −7.9 ± 303.7 mbb/g ≈ break-even（raw +565 的大头是 runout 运气
+     非技能）。两个改写：①基线臂真实强度 ≈ 打平；②AIVAT live 功效比「救不动」的下修预期好（同 CI 手数
+     需求 ÷4.4），search 臂对比以 AIVAT 口径为主读数。**
      **发现②（策略证据，喂 B/C 搜索臂立项)**：BB 防守系统性过紧——重放探针（200×）证实
      AJo@BB 对 UTG 3.2x+2 跟 = **纯弃**；KTs 顶对好踢脚对 min-check-raise = **纯弃**（seed 1/2/3/42
      同 infoset 一致；min-raise 被 off-tree 映成 ≥0.5pot 档 = 粒度税实锤，seed=99 哈希舍入映到另一节点
@@ -388,7 +397,8 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      座做 role-for-role 对齐**（引擎 n=2 标准 HU 的角色序与 OpenPoker 一致）→ 连 postflop 都对
      （smoke2 含打满 5 街 HU 手 15/15 全转换+估计；两轮 smoke 40/40 hands_ok）。占座推断两轮
      40/40 精确（dealt_est == final_stacks 键集）、table_state 每手必达。
-   - **仍未做**：c_act v2（需 σ 日志）+ U-fail 5 手的对手栈重建修复（见发现①）+ HU postflop
+   - **仍未做**：c_act v2（需 σ 日志，probs 字段 `a126bf1` 已在攒）~~+ U-fail 5 手的对手栈重建修复~~
+     （**已修** `3a1dff9`，见发现①处）+ HU postflop
      若要真打需 n=2 真栈子博弈搜索路径（引擎能表达、6-max 树不能；条件项，HU 桌占比说话）。
 
 ## 4. 落地（分步验收）
