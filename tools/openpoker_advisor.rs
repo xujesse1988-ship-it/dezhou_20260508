@@ -90,6 +90,12 @@ use poker::{
 const N_SEATS: usize = 6;
 const REAL_REPLAY_SEED: u64 = 0x5245_414c_3645_4d58; // "REAL6EMX"
 const ABS_REPLAY_SEED: u64 = 0x4142_5336_454d_5800; // "ABS6EMX\0"
+/// 搜索 range 先验平滑 λ 的生产默认（`SubgameSearchConfig::range_uniform_mix` 字段 doc）：
+/// 薄线 blueprint reach 噪声 range 被无约束重解放大成 max-exploit（2026-06-12 searchon50
+/// 实撞：空气桶 99.98% 下注 / 73% 超池 jam，对手 range 塌缩到有效 50 组合），λ 混合 uniform
+/// 保底回拉剥削度。0.25 = 同点实测把空气 jam 从 0.73 拉回 ~0.3 且 check 频率恢复的最小档
+/// （λ sweep 见 docs/temp/realtime_search_openpoker_exec_2026_06_08.md §3.2）。
+const DEFAULT_SEARCH_RANGE_UNIFORM_MIX: f64 = 0.25;
 
 // ===========================================================================
 // driver ↔ advisor JSON 协议（§2）
@@ -1101,8 +1107,8 @@ fn run() -> Result<(), String> {
     };
     if let Some(scfg) = &args.search {
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix
         );
     }
     eprintln!(
@@ -1177,6 +1183,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_deep_menu = false;
     let mut search_live_traversers = false;
     let mut search_max_nodes: usize = SubgameSearchConfig::default().max_subtree_nodes;
+    let mut search_range_uniform_mix: Option<f64> = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -1226,6 +1233,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     .parse()
                     .map_err(|e| format!("bad search-max-nodes: {e}"))?
             }
+            "--search-range-uniform-mix" => {
+                let v: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad search-range-uniform-mix: {e}"))?;
+                if !(0.0..=1.0).contains(&v) {
+                    return Err(format!("--search-range-uniform-mix 须在 [0,1]，得 {v}"));
+                }
+                search_range_uniform_mix = Some(v);
+            }
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -1251,6 +1267,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             // 缺口①续（限时杠杆②）：traverser 只轮子树根仍 Active 的座（弃牌/all-in 座零学习
             // 迭代跳过，同 wall 有效迭代 ×n_seats/n_active）。
             live_traversers: search_live_traversers,
+            // range 先验平滑（2026-06-12 searchon50 修复，SubgameSearchConfig 字段 doc）：薄线
+            // blueprint reach 噪声 range 会被无约束重解放大成 max-exploit（空气 99.98% 下注 /
+            // 73% jam 实撞），λ 混合 uniform 给合法组合保底权重。生产默认开
+            // （DEFAULT_SEARCH_RANGE_UNIFORM_MIX）；--search-range-uniform-mix 0 显式关。
+            range_uniform_mix: search_range_uniform_mix.unwrap_or(DEFAULT_SEARCH_RANGE_UNIFORM_MIX),
             // 解到终局（深码 / 多人 §2.1）：depth_limit / biased_leaf 均 false（默认）；
             // resolve_root / use_blueprint_range / seed 用默认（RoundStart / true / 固定基）。
             ..SubgameSearchConfig::default()
@@ -1263,6 +1284,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_deep_menu
             || search_live_traversers
             || search_max_nodes != SubgameSearchConfig::default().max_subtree_nodes
+            || search_range_uniform_mix.is_some()
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
         }
@@ -2725,5 +2747,36 @@ mod tests {
         assert_eq!(a.search.expect("search on").iterations, 1000);
         // 拒绝静默 guard 对显式 iterations（含恰好 1000）仍生效。
         assert!(parse(&["--search-iterations", "1000"]).is_err());
+    }
+
+    /// `--search-range-uniform-mix`（range 先验平滑 λ）：生产默认 = 开
+    /// （DEFAULT_SEARCH_RANGE_UNIFORM_MIX）、显式 0 = 关、出 [0,1] 拒收、未开 --search 拒收
+    /// （拒绝静默 guard）。
+    #[test]
+    fn parse_args_range_uniform_mix() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        // 默认（未给 flag）= 生产默认开。
+        let a = parse(&["--search"]).expect("parse Ok");
+        assert_eq!(
+            a.search.expect("search on").range_uniform_mix,
+            DEFAULT_SEARCH_RANGE_UNIFORM_MIX
+        );
+        // 显式 0 = 关（旧行为 A/B 用）。
+        let a = parse(&["--search", "--search-range-uniform-mix", "0"]).expect("parse Ok");
+        assert_eq!(a.search.expect("search on").range_uniform_mix, 0.0);
+        // 显式覆盖。
+        let a = parse(&["--search", "--search-range-uniform-mix", "0.5"]).expect("parse Ok");
+        assert_eq!(a.search.expect("search on").range_uniform_mix, 0.5);
+        // 出 [0,1] 拒收。
+        assert!(parse(&["--search", "--search-range-uniform-mix", "1.5"]).is_err());
+        assert!(parse(&["--search", "--search-range-uniform-mix", "-0.1"]).is_err());
+        // 拒绝静默 guard：设了 flag 未开 --search → Err。
+        assert!(parse(&["--search-range-uniform-mix", "0.25"]).is_err());
     }
 }

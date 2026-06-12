@@ -723,6 +723,20 @@ pub struct SubgameSearchConfig {
     /// 开启后 rng 消费序列改变 → 与 `false` 基线不 byte-equal（固定迭代 + 固定 seed 下自身仍
     /// 确定性可复现；本字段进 within-round solve 缓存 key）。
     pub live_traversers: bool,
+    /// range 先验平滑 λ（2026-06-12 searchon50 实跑修复）：把 [`estimate_range`] 估出的
+    /// blueprint reach 与「非撞 board 组合上的 uniform」混合，`r' = (1−λ)·r + λ·u`。
+    ///
+    /// 动机：多街薄线上 blueprint σ 欠训练 → reach 估计塌缩成噪声窄 range（实测 river 对手
+    /// range 有效组合 50、单牌类占 36%、几乎无同花 = 被钉死「封顶」），无约束重解将其放大成
+    /// max-exploit——对手在解内对 jam 弃 72.6% → 空气桶 99.98% 下注 / 73% 超池 jam，且预算
+    /// 越足越极端（20s → 0.91，是收敛而非噪声）；uniform 先验 A/B 同局面回 check 0.31 =
+    /// 机制实锤在 range 先验。混合给每个合法组合保底 `λ/n_valid` 权重 → 对手 range 永不
+    /// 被钉死，剥削度随 λ 连续回拉（`λ=1` ≡ uniform 先验）。
+    ///
+    /// `0.0`（默认）= 不混合，既有 probe / §11.5 基线逐位 byte-equal；生产 advisor 另有自己的
+    /// 默认（`openpoker_advisor --search-range-uniform-mix`）。仅 `use_blueprint_range=true`
+    /// 时有意义。进 solve 缓存 key（cfg 字段 + 混合后 reach 向量双重覆盖）。clamp 到 [0,1]。
+    pub range_uniform_mix: f64,
 }
 
 impl Default for SubgameSearchConfig {
@@ -740,6 +754,7 @@ impl Default for SubgameSearchConfig {
             time_budget: None,
             deep_menu: false,
             live_traversers: false,
+            range_uniform_mix: 0.0,
         }
     }
 }
@@ -928,6 +943,32 @@ fn estimate_range(
     range
 }
 
+/// range 先验平滑（[`SubgameSearchConfig::range_uniform_mix`]）：`r' = (1−λ)·r + λ·u`，
+/// `u` = 非撞 board 组合上的 uniform。前置：`range` 已归一（[`estimate_range`] 的 sum>0 路径），
+/// 混合后和仍为 1。**全零（无信号）保持全零**——下游 [`sample_holes_from_ranges`]
+/// (SubgameNlheGame::sample_holes_from_ranges) 的「受限 range 全零 → 退均匀」兜底语义不变，
+/// 混入 λ·u 会把「无信号」伪装成「有 range」。撞 board 组合两边都是 0 → 混合后仍 0
+/// （card-removal 不变）。
+fn mix_range_with_uniform(range: &mut [f64], holes: &[[Card; 2]], board: &[Card], lambda: f64) {
+    let lambda = lambda.clamp(0.0, 1.0);
+    if lambda <= 0.0 || range.iter().sum::<f64>() <= 0.0 {
+        return;
+    }
+    let board_set: BTreeSet<u8> = board.iter().map(|c| c.to_u8()).collect();
+    let valid: Vec<bool> = holes
+        .iter()
+        .map(|h| !board_set.contains(&h[0].to_u8()) && !board_set.contains(&h[1].to_u8()))
+        .collect();
+    let n_valid = valid.iter().filter(|v| **v).count();
+    if n_valid == 0 {
+        return;
+    }
+    let u = lambda / n_valid as f64;
+    for (w, ok) in range.iter_mut().zip(valid.iter()) {
+        *w = if *ok { (1.0 - lambda) * *w + u } else { 0.0 };
+    }
+}
+
 // ===========================================================================
 // within-round solve 缓存（exec 文档 §6 #2：「每轮恰好一个 solve」落到常驻 advisor）
 // ===========================================================================
@@ -1025,8 +1066,9 @@ const KEY_KIND_UNANCHORED: u8 = 1;
 /// - 桶表：content hash（跨进程稳定）+ `Arc` 指针（区分 content hash 同为全 0 的 stub 表；
 ///   缓存条目经 trainer 持有该 Arc → 条目存活期内指针不可能被释放复用）；
 /// - `cfg` 全字段（iterations / max_subtree_nodes / seed / use_blueprint_range / trigger /
-///   resolve_root / depth_limit / biased_leaf / lcfr / time_budget / deep_menu——含不影响
-///   solve 的 trigger：过覆盖只丢命中、欠覆盖读错均衡）；
+///   resolve_root / depth_limit / biased_leaf / lcfr / time_budget / deep_menu /
+///   live_traversers / range_uniform_mix——含不影响 solve 的 trigger：过覆盖只丢命中、
+///   欠覆盖读错均衡）；
 /// - `(hand_seed, seed_ordinal)`：与 `cfg.seed` 共同决定 master seed（RoundStart 下
 ///   seed_ordinal = 街索引 = round-stable）；
 /// - root 几何：`root_state` 的全部可见面（`TableConfig` 各字段 + 街 / board / pot /
@@ -1081,6 +1123,7 @@ fn solve_cache_key(
             .map_or(0u128, |d| d.as_nanos())
             .to_le_bytes(),
     );
+    h.update(&cfg.range_uniform_mix.to_le_bytes());
     h.update(&hand_seed.to_le_bytes());
     h.update(&seed_ordinal.to_le_bytes());
     h.update(&entrants.to_le_bytes());
@@ -1315,14 +1358,17 @@ pub fn subgame_search_cached(
             (0..players.len())
                 .map(|seat| {
                     if players[seat].hole_cards.is_some() {
-                        estimate_range(
+                        let mut r = estimate_range(
                             game,
                             strategy,
                             &range_decisions,
                             &board,
                             seat as PlayerId,
                             &holes,
-                        )
+                        );
+                        // range 先验平滑（薄线 reach 噪声 → max-exploit 修复，字段 doc）。
+                        mix_range_with_uniform(&mut r, &holes, &board, cfg.range_uniform_mix);
+                        r
                     } else {
                         Vec::new() // 弃牌座：range 不被读。
                     }
@@ -2081,6 +2127,7 @@ mod tests {
             time_budget: None,
             deep_menu: false,
             live_traversers: false,
+            range_uniform_mix: 0.0,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -2139,6 +2186,7 @@ mod tests {
             time_budget: None,
             deep_menu: false,
             live_traversers: false,
+            range_uniform_mix: 0.0,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, None, 0, 0,
@@ -2534,6 +2582,7 @@ mod tests {
             time_budget: None,
             deep_menu: false,
             live_traversers: false,
+            range_uniform_mix: 0.0,
         };
         let d9 = subgame_search(
             &auth,
@@ -2623,6 +2672,69 @@ mod tests {
                     (range[hi] - w).abs() < 1e-12,
                     "uniform 策略下非冲突 hole 须等权"
                 );
+            }
+        }
+    }
+
+    /// [`mix_range_with_uniform`]：集中 range 混合后每个合法组合有保底 `λ/n_valid`、撞 board
+    /// 恒 0、和保持 1；λ=0 不动；全零（无信号）保持全零；λ=1（及 >1 clamp）= 精确 uniform。
+    /// 错的混合（漏保底 / 撞 board 渗权 / 破归一）任一条都 fail。
+    #[test]
+    fn mix_range_with_uniform_floor_and_normalization() {
+        let holes = all_hole_combos();
+        // board = 2c 3d 4h（u8: 0 / 5 / 10）。
+        let board: Vec<Card> = [0u8, 5, 10]
+            .iter()
+            .map(|v| Card::from_u8(*v).expect("<52"))
+            .collect();
+        let board_set: BTreeSet<u8> = board.iter().map(|c| c.to_u8()).collect();
+        let valid: Vec<bool> = holes
+            .iter()
+            .map(|h| !board_set.contains(&h[0].to_u8()) && !board_set.contains(&h[1].to_u8()))
+            .collect();
+        let n_valid = valid.iter().filter(|v| **v).count();
+        assert_eq!(n_valid, 1176, "C(49,2)");
+        let k = valid.iter().position(|v| *v).expect("有合法 hole");
+
+        // 集中 range：全部权重在 hole k。
+        let mut r = vec![0.0_f64; holes.len()];
+        r[k] = 1.0;
+        mix_range_with_uniform(&mut r, &holes, &board, 0.25);
+        let sum: f64 = r.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "混合后须归一，和={sum}");
+        let floor = 0.25 / n_valid as f64;
+        assert!(
+            (r[k] - (0.75 + floor)).abs() < 1e-12,
+            "集中 hole = 0.75+保底"
+        );
+        for (hi, ok) in valid.iter().enumerate() {
+            if *ok {
+                assert!(r[hi] >= floor - 1e-15, "合法 hole 须有保底权重");
+            } else {
+                assert_eq!(r[hi], 0.0, "撞 board 的 hole 混合后须仍 0");
+            }
+        }
+
+        // λ=0 不动（byte-equal 路径）。
+        let mut r0 = vec![0.0_f64; holes.len()];
+        r0[k] = 1.0;
+        mix_range_with_uniform(&mut r0, &holes, &board, 0.0);
+        assert_eq!(r0[k], 1.0);
+        assert_eq!(r0.iter().filter(|w| **w > 0.0).count(), 1);
+
+        // 全零（无信号）保持全零——sample_holes_from_ranges 的退均匀兜底语义不变。
+        let mut rz = vec![0.0_f64; holes.len()];
+        mix_range_with_uniform(&mut rz, &holes, &board, 0.5);
+        assert!(rz.iter().all(|w| *w == 0.0), "无信号须保持全零");
+
+        // λ=1（及 >1 clamp）= 精确 uniform。
+        for lambda in [1.0, 1.5] {
+            let mut r1 = vec![0.0_f64; holes.len()];
+            r1[k] = 1.0;
+            mix_range_with_uniform(&mut r1, &holes, &board, lambda);
+            for (hi, ok) in valid.iter().enumerate() {
+                let expect = if *ok { 1.0 / n_valid as f64 } else { 0.0 };
+                assert!((r1[hi] - expect).abs() < 1e-15, "λ={lambda} 须精确 uniform");
             }
         }
     }
@@ -2909,6 +3021,7 @@ mod tests {
             time_budget: None,
             deep_menu: false,
             live_traversers: false,
+            range_uniform_mix: 0.0,
         };
         let run = |cfg: &SubgameSearchConfig| {
             subgame_search(
@@ -2981,6 +3094,7 @@ mod tests {
             time_budget: None,
             deep_menu: false,
             live_traversers: false,
+            range_uniform_mix: 0.0,
         };
         let base = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &none_cfg, None, None, 0x55, 4,
@@ -4150,6 +4264,28 @@ mod tests {
         )
         .expect("换 root 几何仍 Ok");
         assert_eq!(cache.misses(), 4, "root 几何变 → miss");
+        // (d) cfg.range_uniform_mix（range 先验平滑 λ；stub 桶 + uniform σ 下混合后 reach 向量
+        // 可能数值不变，key 须经 cfg 字段哈希仍区分——串读 = 读错均衡）。
+        let cfg_mix = SubgameSearchConfig {
+            range_uniform_mix: 0.25,
+            ..cfg_more
+        };
+        subgame_search_cached(
+            Some(&mut cache),
+            &flop2.game_state,
+            &rs2,
+            &game,
+            &SimplifiedNlheGame::legal_actions(&flop2),
+            flop2.current_node_id,
+            &strat,
+            &cfg_mix,
+            None,
+            None,
+            0xABCE,
+            0,
+        )
+        .expect("换 range_uniform_mix 仍 Ok");
+        assert_eq!(cache.misses(), 5, "range_uniform_mix 变 → miss");
     }
 
     /// time_budget（墙钟 anytime）下的 within-round 一致性：anytime 迭代数随机器负载变、原理上
