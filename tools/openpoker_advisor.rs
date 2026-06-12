@@ -1172,8 +1172,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} bucket_table={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} bucket_table={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
     }
@@ -1251,6 +1251,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_max_nodes: usize = SubgameSearchConfig::default().max_subtree_nodes;
     let mut search_range_uniform_mix: Option<f64> = None;
     let mut search_bucket_table: Option<PathBuf> = None;
+    let mut search_solve_threads: Option<usize> = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -1312,6 +1313,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             "--search-bucket-table" => {
                 search_bucket_table = Some(PathBuf::from(next_val(&mut it, &arg)?))
             }
+            "--search-solve-threads" => {
+                let v: usize = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad search-solve-threads: {e}"))?;
+                if v == 0 {
+                    return Err("--search-solve-threads 须 ≥1（1 = 单线程既有行为）".to_string());
+                }
+                search_solve_threads = Some(v);
+            }
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -1342,6 +1352,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             // 73% jam 实撞），λ 混合 uniform 给合法组合保底权重。生产默认开
             // （DEFAULT_SEARCH_RANGE_UNIFORM_MIX）；--search-range-uniform-mix 0 显式关。
             range_uniform_mix: search_range_uniform_mix.unwrap_or(DEFAULT_SEARCH_RANGE_UNIFORM_MIX),
+            // 限时杠杆③：solve update 并行（SubgameSearchConfig::solve_threads doc）。同预算
+            // update 数 ≈ ×核数；只助 solve 侧，建树仍单线程。默认 1 = 既有单线程 byte-equal。
+            solve_threads: search_solve_threads.unwrap_or(1),
             // 解到终局（深码 / 多人 §2.1）：depth_limit / biased_leaf 均 false（默认）；
             // resolve_root / use_blueprint_range / seed 用默认（RoundStart / true / 固定基）。
             ..SubgameSearchConfig::default()
@@ -1356,6 +1369,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_max_nodes != SubgameSearchConfig::default().max_subtree_nodes
             || search_range_uniform_mix.is_some()
             || search_bucket_table.is_some()
+            || search_solve_threads.is_some()
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
         }
@@ -2883,5 +2897,28 @@ mod tests {
         );
         // 拒绝静默 guard：设了表未开 --search → Err。
         assert!(parse(&["--search-bucket-table", "fine_500.bin"]).is_err());
+    }
+
+    /// `--search-solve-threads`（solve update 并行，限时杠杆③）：默认 1（单线程既有行为）、
+    /// 显式给 = 进 cfg、0 拒收（无意义档位）、未开 --search 拒收（拒绝静默 guard）。
+    #[test]
+    fn parse_args_search_solve_threads() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        // 默认 = 1（单线程，与既有基线 byte-equal）。
+        let a = parse(&["--search"]).expect("parse Ok");
+        assert_eq!(a.search.expect("search on").solve_threads, 1);
+        // 显式给 → 进 cfg。
+        let a = parse(&["--search", "--search-solve-threads", "4"]).expect("parse Ok");
+        assert_eq!(a.search.expect("search on").solve_threads, 4);
+        // 0 拒收。
+        assert!(parse(&["--search", "--search-solve-threads", "0"]).is_err());
+        // 拒绝静默 guard：设了 flag 未开 --search → Err。
+        assert!(parse(&["--search-solve-threads", "4"]).is_err());
     }
 }

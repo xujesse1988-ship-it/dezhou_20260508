@@ -949,6 +949,8 @@ def main():
     p.add_argument("--search-deep-menu", action="store_true")
     # 子树独立桶表（如 500/500/500；blueprint 仍用 --bucket-table 的表）。
     p.add_argument("--search-bucket-table", default=None)
+    # solve update 并行线程数（同预算 update ≈ ×核数；只助 solve 侧，建树仍单线程）。
+    p.add_argument("--search-solve-threads", type=int, default=None)
     args = p.parse_args()
 
     extra = []
@@ -970,6 +972,8 @@ def main():
             extra.append("--search-deep-menu")
         if args.search_bucket_table:
             extra += ["--search-bucket-table", args.search_bucket_table]
+        if args.search_solve_threads is not None:
+            extra += ["--search-solve-threads", str(args.search_solve_threads)]
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
                       args.reshape, args.postflop_cap, args.seed, extra_args=extra)
     try:

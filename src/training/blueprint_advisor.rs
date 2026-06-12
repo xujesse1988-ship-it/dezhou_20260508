@@ -1139,6 +1139,7 @@ mod tests {
             deep_menu: false,
             live_traversers: false,
             range_uniform_mix: 0.0,
+            solve_threads: 1,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;

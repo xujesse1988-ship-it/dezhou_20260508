@@ -832,6 +832,18 @@ pub struct SubgameSearchConfig {
     /// 默认（`openpoker_advisor --search-range-uniform-mix`）。仅 `use_blueprint_range=true`
     /// 时有意义。进 solve 缓存 key（cfg 字段 + 混合后 reach 向量双重覆盖）。clamp 到 [0,1]。
     pub range_uniform_mix: f64,
+    /// solve update 并行线程数（2026-06-12 限时杠杆③）：`>1` = 子树 CFR 走
+    /// [`EsMccfrTrainer::step_parallel`]（rayon pool + thread-local delta 确定性合并，
+    /// blueprint 训练已验证的同一路径）——同 wall 预算 update 数 ≈ ×核数，给 deep_menu
+    /// 加宽下注档（infoset 乘性变多 → per-bucket 样本变稀）换回采样密度。**注意杠杆边界**：
+    /// 并行只助 solve 侧；深码×多人的真瓶颈是单线程建树（exec 文档 §4.1 A②），build wall
+    /// 不随本字段缩放。
+    ///
+    /// `1`（默认）/ `0` = 既有单线程 `step`——保持全部既有基线逐 infoset byte-equal。
+    /// `>1` 与单线程不 byte-equal（per-tid rng 流 + 批内 stale-σ 语义，`step_parallel` doc），
+    /// 但固定迭代 + 固定 seed 下自身仍确定性可复现（批调度是 `(iterations, threads, batch)`
+    /// 纯函数、delta 合并按 tid 序确定）→ m1==m2 契约不破。进 solve 缓存 key。
+    pub solve_threads: usize,
 }
 
 impl Default for SubgameSearchConfig {
@@ -850,6 +862,7 @@ impl Default for SubgameSearchConfig {
             deep_menu: false,
             live_traversers: false,
             range_uniform_mix: 0.0,
+            solve_threads: 1,
         }
     }
 }
@@ -930,6 +943,15 @@ fn search_seed(base: u64, hand_seed: u64, ordinal: u64) -> u64 {
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
 }
+
+/// solve 并行 per-tid rng 派生盐（"THRD"，与 `train_cfr` rng_pool 同型：
+/// `search_seed(master, SALT, tid)`）。与单线程档的 `master ^ 0xC0FF…` 流天然不同。
+const SOLVE_THREADS_RNG_SALT: u64 = 0x5448_5244;
+
+/// [`EsMccfrTrainer::step_parallel`] 每 worker 每批 trajectory 数（调度摊薄 knob，
+/// `train_cfr` 默认同值；详 trainer.rs「为什么需要 batching」）。deadline 检查粒度 =
+/// `solve_threads × 本值` 个 update（~11–33 µs/update → 数百 µs 一批）。
+const SOLVE_PARALLEL_BATCH: u64 = 16;
 
 // --- §5b：blueprint range 估计（per-seat marginal，逐街 re-bucket，沿历史累乘 reach） ---
 
@@ -1186,8 +1208,8 @@ const KEY_KIND_UNANCHORED: u8 = 1;
 ///   条目存活期内指针不可能被释放复用）；
 /// - `cfg` 全字段（iterations / max_subtree_nodes / seed / use_blueprint_range / trigger /
 ///   resolve_root / depth_limit / biased_leaf / lcfr / time_budget / deep_menu /
-///   live_traversers / range_uniform_mix——含不影响 solve 的 trigger：过覆盖只丢命中、
-///   欠覆盖读错均衡）；
+///   live_traversers / range_uniform_mix / solve_threads——含不影响 solve 的 trigger：
+///   过覆盖只丢命中、欠覆盖读错均衡）；
 /// - `(hand_seed, seed_ordinal)`：与 `cfg.seed` 共同决定 master seed（RoundStart 下
 ///   seed_ordinal = 街索引 = round-stable）；
 /// - root 几何：`root_state` 的全部可见面（`TableConfig` 各字段 + 街 / board / pot /
@@ -1243,6 +1265,8 @@ fn solve_cache_key(
             .to_le_bytes(),
     );
     h.update(&cfg.range_uniform_mix.to_le_bytes());
+    // 生效线程数（0 与 1 都走单线程 step、solve 输出相同 → 同 key 不丢命中）。
+    h.update(&(cfg.solve_threads.max(1) as u64).to_le_bytes());
     h.update(&hand_seed.to_le_bytes());
     h.update(&seed_ordinal.to_le_bytes());
     h.update(&entrants.to_le_bytes());
@@ -1755,20 +1779,59 @@ fn solve_subgame(
     if let Some(rot) = rotation {
         trainer = trainer.with_traverser_rotation(rot);
     }
-    let mut srng = ChaCha20Rng::from_seed(master ^ 0xC0FF_EE00_C0FF_EE00);
     // 缺口①本体（§2.3）：time_budget=Some → 墙钟 anytime（跑到 iterations 上限或 wall 达预算就停，
     // 此时 iterations 退为安全上界）；None → 跑满固定 iterations（既有行为，byte-equal）。budgeted
     // 下迭代数随机器速度/负载变 → 不可 byte-equal（§2.3），可复现靠固定迭代档 + seeded RNG。
     let deadline = cfg.time_budget.map(|_| Instant::now());
     let mut done: u64 = 0;
-    for _ in 0..cfg.iterations {
-        trainer
-            .step(&mut srng)
-            .map_err(|e| format!("subgame CFR step 失败: {e:?}"))?;
-        done += 1;
-        if let (Some(start), Some(budget)) = (deadline, cfg.time_budget) {
-            if start.elapsed() >= budget {
-                break;
+    if cfg.solve_threads > 1 {
+        // solve update 并行（限时杠杆③，[`SubgameSearchConfig::solve_threads`] doc）：复用
+        // blueprint 训练的 step_parallel（rayon + thread-local delta 确定性合并）。per-tid rng
+        // 从 master 加盐派生（train_cfr rng_pool 同型）；批调度是 (iterations, threads, batch)
+        // 纯函数 + 合并按 tid 序 → 固定迭代档同输入同输出（m1==m2）。deadline 检查在批间，
+        // 粒度 = threads × batch 个 update（~数百 µs wall，对 ms 级预算过冲可忽略）。
+        let n = cfg.solve_threads;
+        let mut pool: Vec<Box<dyn RngSource>> = (0..n as u64)
+            .map(|tid| {
+                Box::new(ChaCha20Rng::from_seed(search_seed(
+                    master,
+                    SOLVE_THREADS_RNG_SALT,
+                    tid,
+                ))) as Box<dyn RngSource>
+            })
+            .collect();
+        while done < cfg.iterations {
+            let remaining = cfg.iterations - done;
+            let batch = (remaining / n as u64).min(SOLVE_PARALLEL_BATCH) as usize;
+            if batch == 0 {
+                // remaining < threads：整批放不下，退单线程 step 收尾（不超 iterations 上限）。
+                trainer
+                    .step(pool[0].as_mut())
+                    .map_err(|e| format!("subgame CFR step 失败: {e:?}"))?;
+                done += 1;
+            } else {
+                trainer
+                    .step_parallel(&mut pool, n, batch)
+                    .map_err(|e| format!("subgame CFR step_parallel 失败: {e:?}"))?;
+                done += n as u64 * batch as u64;
+            }
+            if let (Some(start), Some(budget)) = (deadline, cfg.time_budget) {
+                if start.elapsed() >= budget {
+                    break;
+                }
+            }
+        }
+    } else {
+        let mut srng = ChaCha20Rng::from_seed(master ^ 0xC0FF_EE00_C0FF_EE00);
+        for _ in 0..cfg.iterations {
+            trainer
+                .step(&mut srng)
+                .map_err(|e| format!("subgame CFR step 失败: {e:?}"))?;
+            done += 1;
+            if let (Some(start), Some(budget)) = (deadline, cfg.time_budget) {
+                if start.elapsed() >= budget {
+                    break;
+                }
             }
         }
     }
@@ -2293,6 +2356,7 @@ mod tests {
             deep_menu: false,
             live_traversers: false,
             range_uniform_mix: 0.0,
+            solve_threads: 1,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -2352,6 +2416,7 @@ mod tests {
             deep_menu: false,
             live_traversers: false,
             range_uniform_mix: 0.0,
+            solve_threads: 1,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, None, 0, 0,
@@ -2748,6 +2813,7 @@ mod tests {
             deep_menu: false,
             live_traversers: false,
             range_uniform_mix: 0.0,
+            solve_threads: 1,
         };
         let d9 = subgame_search(
             &auth,
@@ -3507,6 +3573,7 @@ mod tests {
             deep_menu: false,
             live_traversers: false,
             range_uniform_mix: 0.0,
+            solve_threads: 1,
         };
         let run = |cfg: &SubgameSearchConfig| {
             subgame_search(
@@ -3580,6 +3647,7 @@ mod tests {
             deep_menu: false,
             live_traversers: false,
             range_uniform_mix: 0.0,
+            solve_threads: 1,
         };
         let base = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &none_cfg, None, None, 0x55, 4,
@@ -4777,6 +4845,149 @@ mod tests {
         )
         .expect("换 range_uniform_mix 仍 Ok");
         assert_eq!(cache.misses(), 5, "range_uniform_mix 变 → miss");
+        // (e) cfg.solve_threads（并行档 rng 流 + stale-σ 语义不同 → 不同均衡，串读 = 读错均衡）。
+        let cfg_par = SubgameSearchConfig {
+            solve_threads: 2,
+            ..cfg_mix
+        };
+        subgame_search_cached(
+            Some(&mut cache),
+            &flop2.game_state,
+            &rs2,
+            &game,
+            &SimplifiedNlheGame::legal_actions(&flop2),
+            flop2.current_node_id,
+            &strat,
+            &cfg_par,
+            None,
+            None,
+            None,
+            0xABCE,
+            0,
+        )
+        .expect("换 solve_threads 仍 Ok");
+        assert_eq!(cache.misses(), 6, "solve_threads 变 → miss");
+    }
+
+    /// 限时杠杆③（[`SubgameSearchConfig::solve_threads`]）：`>1` 走 `step_parallel` 并行
+    /// solve。钉三件事：①固定迭代 + 固定 seed 下并行档自身**确定性可复现**（批调度纯函数 +
+    /// delta 按 tid 序合并 → m1==m2 契约对并行档继续成立）；②输出分布契约不破（归一 / 正
+    /// 概率 / 动作在 legal_abs 内）；③与单线程档**确实分流**（rng 流不同 → 分布不同位；若
+    /// 两档 byte-equal，说明并行分支是死代码——trip-wire）。
+    #[test]
+    fn solve_threads_parallel_reproducible_and_valid() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x5354_4852_4431_5054); // "STHRD1PT"
+        let auth = flop.game_state.clone();
+        let legal_abs = SimplifiedNlheGame::legal_actions(&flop);
+        let base = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        };
+        // iterations=300 不是 threads×batch=2×16 的整数倍（300 = 9×32 + 12）→ 同时覆盖
+        // 整批路径 + 「remaining < 整批退单线程 step 收尾」的尾段路径。
+        let par = SubgameSearchConfig {
+            solve_threads: 2,
+            ..base
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let run = |cfg: &SubgameSearchConfig| {
+            subgame_search(
+                &auth,
+                &auth,
+                &game,
+                &legal_abs,
+                flop.current_node_id,
+                &strat,
+                cfg,
+                None,
+                None,
+                0x7777,
+                3,
+            )
+            .expect("stub 桶 0 → root infoset 必累积 → Ok")
+        };
+        // ① 并行档 m1==m2。
+        let p1 = run(&par);
+        let p2 = run(&par);
+        assert_eq!(p1.len(), p2.len(), "并行档可复现：维度一致");
+        for ((a1, q1), (a2, q2)) in p1.iter().zip(&p2) {
+            assert_eq!(a1, a2, "并行档可复现：动作逐项一致");
+            assert_eq!(q1.to_bits(), q2.to_bits(), "并行档可复现：概率 byte-equal");
+        }
+        // ② 分布契约。
+        let sum: f64 = p1.iter().map(|(_, p)| *p).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "并行档分布须归一，和={sum}");
+        for (a, p) in &p1 {
+            assert!(*p > 0.0, "只返回正概率动作");
+            let tag = AbstractActionTag::of(a);
+            assert!(
+                legal_abs.iter().any(|l| AbstractActionTag::of(l) == tag),
+                "返回动作 {tag:?} 须在 legal_abs 内"
+            );
+        }
+        // ③ 与单线程档分流（死代码 trip-wire；两边都确定性 → 本断言不引入 flake）。
+        let s1 = run(&base);
+        let bitwise_equal = s1.len() == p1.len()
+            && s1
+                .iter()
+                .zip(&p1)
+                .all(|((a1, q1), (a2, q2))| a1 == a2 && q1.to_bits() == q2.to_bits());
+        assert!(
+            !bitwise_equal,
+            "solve_threads=2 与 =1 输出逐位相同：并行分支疑似未生效"
+        );
+    }
+
+    /// 限时杠杆③吞吐实测（vultr 4-core 跑：`cargo test --release -- --ignored \
+    /// _measure_solve_threads_throughput --nocapture`）：同 time_budget 下 solve_threads=1 vs 4
+    /// 的 update 数（经 [`SubgameSolveCache::entry_update_count`] 读数）。预期 ≈ ×3（rayon
+    /// 4 worker 减调度/合并开销）；本测试只打印不断言比值（吞吐受机器负载影响，断言留给读数）。
+    #[test]
+    #[ignore]
+    fn _measure_solve_threads_throughput() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x5354_4852_4D45_4153); // "STHRMEAS"
+        let auth = flop.game_state.clone();
+        let legal_abs = SimplifiedNlheGame::legal_actions(&flop);
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        for threads in [1usize, 2, 4] {
+            let cfg = SubgameSearchConfig {
+                iterations: u64::MAX,
+                max_subtree_nodes: 1_000_000,
+                trigger: SearchTrigger::AllPostflop,
+                time_budget: Some(Duration::from_millis(1000)),
+                solve_threads: threads,
+                ..SubgameSearchConfig::default()
+            };
+            let mut cache = SubgameSolveCache::new();
+            let t0 = Instant::now();
+            subgame_search_cached(
+                Some(&mut cache),
+                &auth,
+                &auth,
+                &game,
+                &legal_abs,
+                flop.current_node_id,
+                &strat,
+                &cfg,
+                None,
+                None,
+                None,
+                0x1234,
+                3,
+            )
+            .expect("预算 1s 充裕应 Ok");
+            let wall = t0.elapsed();
+            let updates = cache.entry_update_count().expect("solve 已入缓存");
+            println!(
+                "[measure] solve_threads={threads}: updates={updates} wall={wall:?} \
+                 ({:.1}k updates/s)",
+                updates as f64 / wall.as_secs_f64() / 1e3
+            );
+        }
     }
 
     /// time_budget（墙钟 anytime）下的 within-round 一致性：anytime 迭代数随机器负载变、原理上
