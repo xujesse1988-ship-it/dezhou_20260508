@@ -281,7 +281,14 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      半任意）。**λ 平滑的诚实定位 = 对手 range 永不缺关键组合的尾部保险（0.25 实测有效组合 50→86.5），不承诺改写
      激进度**；激进度后续杠杆（未做）= 对手真实动作在解内频率过低时降信 / 输出向 blueprint 分布回拉 /
      per-bucket 噪声购更多迭代或 purification。**连带发现**：range 加权采样吞吐 ~7× 掉速（同 5s 预算 145k vs 993k
-     updates，`sample_holes_from_ranges` 每 root 采样 O(1326×座位)）= 后续可收的限时杠杆。
+     updates，`sample_holes_from_ranges` 每 root 采样 O(1326×座位)）= 后续可收的限时杠杆——**已收（2026-06-12，
+     commit `f3edf4b`，vultr subgame 模块 + blueprint_advisor + openpoker_advisor + six_max_search_probe 全绿）**：
+     构造期预计算 per-seat 归一 CDF + 52-bit 牌位掩码，热路径 = 二分 + 撞牌拒绝重采（拒绝采样 = 受限重归一分布的
+     **精确**采样，与旧逐组合扫描同分布——新旧实现边际 TV oracle 测试钉死；连拒 32 次 / range 全零 → 原精确扫描兜底，
+     退均匀语义不变）。vultr 实测：采样本体 89.9µs → 0.37µs/call（244×）；端到端 6-way limped flop {1pot} 子树
+     **range 税 13.49 vs 13.63 µs/iter = 0.99×（归零）**——同 5s 预算 range 加权搜索的有效迭代恢复 ~7×，per-bucket
+     均衡噪声的「购更多迭代」杠杆免费拿到。代价 = rng 消费序改变 → range 加权 solve 与旧基线不 byte-equal
+     （同 seed 自可复现不变，§2.3 口径；`ranges=None` uniform 路径未动）。
 3. **深码窄菜单解到终局**：深码 = 把下注菜单收到**单一 {1pot}**（短码可放宽）、解到终局用真实 `payouts()`，在 `time_budget`
    内尽力解、不保证收敛（anytime + LCFR，缺口①）。核心工程 = 「**时限内把 {1pot} 窄树解到终局**」（不重建叶子值，缘由见 §6 #2）。
    - **已落地（2026-06-09，commit `0fb41da`，vultr 全绿）**：`{1pot}` 菜单（`deep_single_pot`）**接进 `subgame_search` + 生产
