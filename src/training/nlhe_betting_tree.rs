@@ -217,19 +217,18 @@ pub fn deep_single_pot() -> (StreetActionAbstraction, BettingAbstractionRules) {
     (abs, BettingAbstractionRules::default())
 }
 
-/// [`deep_menu_for`] 的宽菜单档（短码）：全街 `{0.5, 1.0}` 两档 + `drop_small_reraise`
-/// （A3 first-bet-small 口径：0.5pot 仅作首攻、re-raise 一律 1pot，与 6-max blueprint 的
-/// postflop 菜单语义一致）。SPR 低时到终局的下注层数少、树小，可负担首攻多一个半 pot 档
-/// （短码常见的 commit / 控池粒度正落在 0.5–1pot 之间）。rules 其余 = `Default`（与
-/// [`deep_single_pot`] 一致：postflop 子树不需要 preflop 收宽那套，`width_redirect` 关）。
+/// [`deep_menu_for`] 的宽菜单档（短码）：全街 `{0.5, 1.0}` 两档，**全层级可用**——含
+/// re-raise（`drop_small_reraise` 关；2026-06-12 用户拍板从 first-bet-small 口径放开）。
+/// 缘由：①浅 SPR 且 ≤3 Active 的树本就小、到终局层数有限（1pot 注每层把 pot 推 ~3×，
+/// ~2 层进攻即触 all-in），付得起 re-raise 多一个 0.5pot 档；②live 发现②的 min-raise
+/// 粒度税正中 re-raise 档过粗——对手 min-raise 经 off-tree 映成 ≥0.5pot 档后，我方回应
+/// 菜单若只剩 {1pot, all-in} 更糙。树大小由边界测试 + 200k 绝对护栏钉住。rules =
+/// `Default`（与 [`deep_single_pot`] 一致：postflop 子树不需要 preflop 收宽那套，
+/// `width_redirect` 关）。
 pub fn deep_wide_half_pot() -> (StreetActionAbstraction, BettingAbstractionRules) {
     let two = || ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("{0.5,1.0} 合法");
     let abs = StreetActionAbstraction::per_street([two(), two(), two(), two()]);
-    let rules = BettingAbstractionRules {
-        drop_small_reraise: true,
-        ..BettingAbstractionRules::default()
-    };
-    (abs, rules)
+    (abs, BettingAbstractionRules::default())
 }
 
 /// [`deep_menu_for`] 的 SPR 阈值：第二大 Active 剩余栈 ≤ `4 × pot` → 短码宽菜单（还须

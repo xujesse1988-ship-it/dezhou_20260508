@@ -2003,7 +2003,7 @@ pub fn subgame_search_unanchored_cached(
     // 且常见（主目标分布，§2.2）。脱影子子树从 postflop 根建——redirect 只影响 preflop 菜单 +
     // 触发 build_subtree 的 ≤N 断言（panic，live 不可崩）——关掉它让真 N-way 子树可建，树宽由
     // max_subtree_nodes cap 兜底（越界 → Err → check-when-free）。deep_menu_for 两档的 rules
-    // 本即 redirect 关（deep_single_pot=Default / deep_wide_half_pot 仅 drop_small_reraise），
+    // 本即 redirect 关（deep_single_pot / deep_wide_half_pot 的 rules 都是 Default），
     // 两路一致。
     sub_rules.width_redirect = BettingAbstractionRules::WIDTH_REDIRECT_OFF;
     // 真栈锚上下文：entrants = 轮起点 live bitmask；raises_on_street = 0（轮起点）；range =
@@ -2482,8 +2482,8 @@ mod tests {
             "浅 SPR ≤3-way（边界）应选 {{0.5,1}} 两档"
         );
         assert!(
-            wide_rules.drop_small_reraise,
-            "宽档须带 first-bet-small 口径（0.5 仅首攻）"
+            !wide_rules.drop_small_reraise,
+            "宽档 0.5pot 须全层级可用（含 re-raise，2026-06-12 放开 first-bet-small 口径）"
         );
 
         // ③ 浅多人：6-way 25BB（剩 2400 = 4×600 同样恰边界）→ 人数闸回 {1pot}。
