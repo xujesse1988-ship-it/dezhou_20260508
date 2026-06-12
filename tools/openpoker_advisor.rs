@@ -91,10 +91,13 @@ const N_SEATS: usize = 6;
 const REAL_REPLAY_SEED: u64 = 0x5245_414c_3645_4d58; // "REAL6EMX"
 const ABS_REPLAY_SEED: u64 = 0x4142_5336_454d_5800; // "ABS6EMX\0"
 /// 搜索 range 先验平滑 λ 的生产默认（`SubgameSearchConfig::range_uniform_mix` 字段 doc）：
-/// 薄线 blueprint reach 噪声 range 被无约束重解放大成 max-exploit（2026-06-12 searchon50
-/// 实撞：空气桶 99.98% 下注 / 73% 超池 jam，对手 range 塌缩到有效 50 组合），λ 混合 uniform
-/// 保底回拉剥削度。0.25 = 同点实测把空气 jam 从 0.73 拉回 ~0.3 且 check 频率恢复的最小档
-/// （λ sweep 见 docs/temp/realtime_search_openpoker_exec_2026_06_08.md §3.2）。
+/// 对手 reach 估计在薄线上会塌缩成噪声窄 range（2026-06-12 searchon50 实撞：river 对手 range
+/// 有效 50 组合、近乎无同花 = 封顶），λ 保底让对手 range 永不缺关键组合（0.25 实测有效组合
+/// 50→86.5）= 防尾部错误的便宜保险。**诚实边界（判决 sweep：固定 150k 迭代 ×5 seeds）**：
+/// 诊断点位的激进度对 λ 不敏感（对手面对 jam 弃牌率 0.73→0.76 平，对手全 uniform 仍弃 ~0.76；
+/// 空气桶 jam 份额 0.44–0.95 全 λ 区间随 seed 乱跳）——该点位 jam 偏好由 hero 自身 reach range
+/// 的坚果占比（同花成牌河）+ per-bucket 均衡选择噪声驱动，平滑不承诺改写它；激进度的后续杠杆
+/// 见 exec 文档 §3.2（低频动作降信 / 向 blueprint 回拉）。
 const DEFAULT_SEARCH_RANGE_UNIFORM_MIX: f64 = 0.25;
 
 // ===========================================================================

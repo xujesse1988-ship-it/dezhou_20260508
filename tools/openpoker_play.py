@@ -943,6 +943,8 @@ def main():
     p.add_argument("--search-time-budget-ms", type=int, default=None)
     p.add_argument("--search-lcfr", action="store_true")
     p.add_argument("--search-max-nodes", type=int, default=None)
+    # range 先验平滑 λ（advisor 默认开 0.25；显式 0 = 关，A/B 对照臂用）。
+    p.add_argument("--search-range-uniform-mix", type=float, default=None)
     args = p.parse_args()
 
     extra = []
@@ -958,6 +960,8 @@ def main():
             extra.append("--search-lcfr")
         if args.search_max_nodes is not None:
             extra += ["--search-max-nodes", str(args.search_max_nodes)]
+        if args.search_range_uniform_mix is not None:
+            extra += ["--search-range-uniform-mix", str(args.search_range_uniform_mix)]
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
                       args.reshape, args.postflop_cap, args.seed, extra_args=extra)
     try:

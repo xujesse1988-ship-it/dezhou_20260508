@@ -263,6 +263,25 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      是后续细化）；blueprint 区（preflop + 未触发 postflop）的影子失同步仍走旧兜底（修不了、也不该用搜索接管）。
      ②子树菜单：默认沿用 blueprint 菜单，**`--search-deep-menu` → 单一 {1pot}**（深码窄菜单 = **缺口③ 已落地**，
      2026-06-09 commit `0fb41da`，见下缺口③；脱锚路径同样支持 deep_menu）。
+   - **range 先验平滑已落地 + 搜索激进度根因细化（2026-06-12，commit `7fac852`→`d18c2da` + 收尾，vultr 受影响测试全绿）**：
+     searchon50 实跑撞出锚定搜索极端激进——97o 河牌空气（`6h 8c 2c 2h 3c`）面对 check 给 check 0.0002 / allin 0.7265
+     （20s 预算更极端 0.91 = 收敛非噪声；turn 同手 allin 0.58；实战被三条 call）。诊断（`origin/debug/subgame-dump` 分支
+     `POKER_SUBGAME_DEBUG` dump + `POKER_SUBGAME_UNIFORM` A/B）：对手 river reach 塌缩（有效 50 组合、78 一类占 36%、
+     近乎无同花 = 封顶），解内对 jam 弃 72.6% > 65.7% 盈亏平衡 → 空气 jam 印钞。
+     **修法 = `SubgameSearchConfig.range_uniform_mix`**：**对手**座位 reach 与非撞 board 组合 uniform 按 `r'=(1−λ)r+λu`
+     混合；**hero 保持原 reach**——对称混合实测方向反掉（hero range 灌入强牌 → 对手被迫更尊重下注 → 弃牌率虚增，
+     λ=0.5 比 λ=0 还激进），理论同向：只有对手 range 的不确定性有「向 uniform 回拉」的正当性，hero 自己的 range 是
+     「实际怎么走到这条线」的自一致输入。默认 0 = 全部既有基线 byte-equal；生产 advisor 默认 0.25
+     （`--search-range-uniform-mix`，driver 透传；显式 0 = 关）。λ 进 solve 缓存 key（cfg 字段 + 混合后 reach 向量双重覆盖）。
+     **判决 sweep（固定 150k 迭代 ×5 seeds，直接读「对手面对 jam 的解内弃牌率」）把根因细化成三层**：
+     ①对手 prior 影响比初判小——λ∈{0,0.25,0.5,1} 弃牌率 0.73→0.76 平，对手全 uniform（同花/三条全在）仍弃 ~0.76；
+     ②该点位 jam 偏好的主驱动 = **hero 自身 reach range 在同花成牌河的坚果占比**（polar 超池 jam 结构性近均衡；
+     早先 sym-uniform A/B 的「回 check 0.31」来自 hero range 被 uniform 化 = 解错游戏，不是对手 range 的功劳）；
+     ③**per-bucket 均衡选择噪声巨大**（同配置换 seed，空气桶 jam 0.44↔0.91——近无差异下注档之间 CFR 平均策略落点
+     半任意）。**λ 平滑的诚实定位 = 对手 range 永不缺关键组合的尾部保险（0.25 实测有效组合 50→86.5），不承诺改写
+     激进度**；激进度后续杠杆（未做）= 对手真实动作在解内频率过低时降信 / 输出向 blueprint 分布回拉 /
+     per-bucket 噪声购更多迭代或 purification。**连带发现**：range 加权采样吞吐 ~7× 掉速（同 5s 预算 145k vs 993k
+     updates，`sample_holes_from_ranges` 每 root 采样 O(1326×座位)）= 后续可收的限时杠杆。
 3. **深码窄菜单解到终局**：深码 = 把下注菜单收到**单一 {1pot}**（短码可放宽）、解到终局用真实 `payouts()`，在 `time_budget`
    内尽力解、不保证收敛（anytime + LCFR，缺口①）。核心工程 = 「**时限内把 {1pot} 窄树解到终局**」（不重建叶子值，缘由见 §6 #2）。
    - **已落地（2026-06-09，commit `0fb41da`，vultr 全绿）**：`{1pot}` 菜单（`deep_single_pot`）**接进 `subgame_search` + 生产
