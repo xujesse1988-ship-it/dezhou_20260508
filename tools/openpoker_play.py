@@ -945,6 +945,10 @@ def main():
     p.add_argument("--search-max-nodes", type=int, default=None)
     # range 先验平滑 λ（advisor 默认开 0.25；显式 0 = 关，A/B 对照臂用）。
     p.add_argument("--search-range-uniform-mix", type=float, default=None)
+    # 深码 SPR 自适应菜单（deep_menu_for：深 {1pot} / 浅 ≤3-way {0.5,1} 全层级）。
+    p.add_argument("--search-deep-menu", action="store_true")
+    # 子树独立桶表（如 500/500/500；blueprint 仍用 --bucket-table 的表）。
+    p.add_argument("--search-bucket-table", default=None)
     args = p.parse_args()
 
     extra = []
@@ -962,6 +966,10 @@ def main():
             extra += ["--search-max-nodes", str(args.search_max_nodes)]
         if args.search_range_uniform_mix is not None:
             extra += ["--search-range-uniform-mix", str(args.search_range_uniform_mix)]
+        if args.search_deep_menu:
+            extra.append("--search-deep-menu")
+        if args.search_bucket_table:
+            extra += ["--search-bucket-table", args.search_bucket_table]
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
                       args.reshape, args.postflop_cap, args.seed, extra_args=extra)
     try:

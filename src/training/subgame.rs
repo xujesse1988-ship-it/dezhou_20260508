@@ -1131,6 +1131,14 @@ impl SubgameSolveCache {
         self.misses
     }
 
+    /// 当前缓存条目 solve 的更新数（[`Trainer::update_count`]，ES-MCCFR 每 `step` 一次
+    /// traverser 递归 +1）。`time_budget` anytime 下这就是「预算内实际完成多少 update」的
+    /// 读数口（advisor 遥测）；命中时返回被复用 solve 的原始计数（同街共享同一 solve 的
+    /// 语义一致）。无条目 → `None`。
+    pub fn entry_update_count(&self) -> Option<u64> {
+        self.entry.as_ref().map(|(_, s)| s.trainer.update_count())
+    }
+
     /// key 是否命中（计数）。未命中后 caller 须 [`store`](Self::store)（或失败丢弃）。
     fn lookup(&mut self, key: [u8; 32]) -> bool {
         match &self.entry {

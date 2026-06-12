@@ -182,6 +182,12 @@ struct Response {
     /// 4 位小数（日志可读性；<0.00005 的尾巴显示为 0.0，和可偏 1 至多 ±n×5e-5）。
     #[serde(skip_serializing_if = "Option::is_none")]
     probs: Option<Vec<(String, f64)>>,
+    /// 实时搜索 solve 的更新数（[`SubgameSolveCache::entry_update_count`]；`time_budget`
+    /// anytime 下 = 预算内实际完成的 ES-MCCFR update 数）。仅 search / search:unanchored
+    /// 决策填；缓存命中 = 被复用 solve 的原始计数。blueprint / fallback 路径恒 `None`
+    /// （serde skip → 旧输出 byte-equal）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    solve_updates: Option<u64>,
 }
 
 /// 策略分布 → 日志格式：label 同 `chosen`，概率四舍五入 4 位小数（采样仍用全精度 `dist`，
@@ -510,6 +516,7 @@ fn decide(
     // SPR 自适应：深 {1pot} / 浅 {0.5,1}）——outgoing 用它在真实 pot 上重算 to，与子树解自洽。
     let mut auth_holder: Option<GameState> = None;
     let mut deep_abs_holder: Option<StreetActionAbstraction> = None;
+    let mut solve_updates: Option<u64> = None;
     let dist: Vec<(AbstractAction, f64)> = if want_search {
         let rt = search.expect("want_search ⇒ search.is_some()");
         let scfg = &rt.cfg;
@@ -542,6 +549,16 @@ fn decide(
             req.actions.len() as u64,
         ) {
             Ok(d) => {
+                // 遥测：本次决策用到的 solve 实际跑了多少 update（time_budget anytime 下
+                // 即「5s 内迭代数」；命中 = 复用 solve 的原始计数）。
+                solve_updates = solve_cache.entry_update_count();
+                eprintln!(
+                    "[openpoker_advisor] search solve updates={} street={} cache={}hit/{}miss",
+                    solve_updates.unwrap_or(0),
+                    street_label(street),
+                    solve_cache.hits(),
+                    solve_cache.misses()
+                );
                 if scfg.deep_menu {
                     deep_abs_holder = Some(deep_menu_for(root_state).0);
                 }
@@ -579,6 +596,7 @@ fn decide(
         resp.info_set = Some(info.raw());
         resp.chosen = Some(action_label(&chosen));
         resp.probs = Some(probs_log(&dist));
+        resp.solve_updates = solve_updates; // blueprint 路径恒 None（serde skip，byte-equal）。
     }
     resp
 }
@@ -896,6 +914,14 @@ fn decide_search_unanchored(
         Ok(d) => d,
         Err(reason) => return search_giveup(&req.valid, &format!("unanchored:{reason}")),
     };
+    let solve_updates = solve_cache.entry_update_count();
+    eprintln!(
+        "[openpoker_advisor] search solve updates={} street={} cache={}hit/{}miss (unanchored)",
+        solve_updates.unwrap_or(0),
+        street_label(auth.street()),
+        solve_cache.hits(),
+        solve_cache.misses()
+    );
     // outgoing：真栈 auth + 与子树同一抽象（deep_menu → deep_menu_for(round_start)，SPR 自适应：
     // 深 {1pot} / 浅 {0.5,1}；否则 blueprint 菜单）——子树自身合法集契约（同 deep 路径）：
     // chosen 的 ratio 在真实 pot 上重算 to，自洽。round_start = unanchored 子树根（同一 SPR 输入）。
@@ -914,6 +940,7 @@ fn decide_search_unanchored(
         resp.street = Some(street_label(auth.street()).into());
         resp.chosen = Some(action_label(&chosen));
         resp.probs = Some(probs_log(&dist));
+        resp.solve_updates = solve_updates;
     }
     resp
 }
