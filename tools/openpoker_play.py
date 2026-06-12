@@ -729,8 +729,10 @@ def run_selftest(advisor):
     # 场景 7（RoundStart 预热）：街起点（hero=BB 行动前）发 prewarm（不等响应）→ hero 决策
     # decide 先 drain 预热响应再读决策响应——验 IPC 锁步对齐不串行 + 动作仍合法。
     # search off 时 advisor 回 prewarm:skip:search_off，机制同样走通（drain 只数行数）。
+    # hole 取 BB 高频 check-back 的中弱手（QQ/AK 这类 BB 几乎必加注 → 该线 reach≈0 → range 加权
+    # 采样抽不到其桶 →「当前桶未被访问」giveup，看不到命中；9d8d 在 check 线 reach 高）。
     hand7 = HandState("h7", button_seat=0, my_seat=2)  # BB：flop 首行动者是 SB → 预热在 hero 行动前
-    hand7.hole = ["Qs", "Qd"]
+    hand7.hole = ["9d", "8d"]
     for s in [3, 4, 5, 0]:
         hand7.on_player_action(s, "fold", None)
     hand7.on_player_action(1, "call", 20)   # SB complete
