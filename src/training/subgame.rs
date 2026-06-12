@@ -1441,13 +1441,61 @@ pub fn subgame_search_cached(
     hand_seed: u64,
     decision_ordinal: u64,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    subgame_search_cached_inner(
+        cache,
+        auth,
+        root_state,
+        game,
+        legal_abs,
+        node_id,
+        strategy,
+        cfg,
+        bucket_override,
+        leaf_values,
+        within_round_real,
+        hand_seed,
+        decision_ordinal,
+        None,
+        false,
+    )
+}
+
+/// [`subgame_search_cached`] 本体 + 预热钩子（RoundStart 预热方案，2026-06-12）。
+///
+/// `actor_override`：`Some(seat)` = range 平滑的「hero 不混」座位（[`mix_lambda_for_seat`]）
+/// 以及读数 actor 用它而非 `auth.current_player()`。预热在该街 hero 行动**之前**发起，
+/// `auth = round_start`、current_player = 该街首行动者 ≠ hero——若按 current_player 混合，
+/// ranges 向量与决策时（actor = hero）不同 → 缓存 key 必 miss、预热静默失效。`None` =
+/// 既有行为（决策路径，逐位 byte-equal）。
+///
+/// `solve_only`：`true` = 建树 + 求解 + 入缓存后**直接返回空 vec**，跳过导航/读数（预热
+/// 没有 hero 决策点可读；读首行动者的「重放占位牌」策略是垃圾读数）。`false` = 既有行为。
+#[allow(clippy::too_many_arguments)]
+fn subgame_search_cached_inner(
+    cache: Option<&mut SubgameSolveCache>,
+    auth: &GameState,
+    root_state: &GameState,
+    game: &SimplifiedNlheGame,
+    legal_abs: &[SimplifiedNlheAction],
+    node_id: NodeId,
+    strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
+    leaf_values: Option<&Arc<LeafValueTables>>,
+    within_round_real: Option<&[(Action, bool)]>,
+    hand_seed: u64,
+    decision_ordinal: u64,
+    actor_override: Option<PlayerId>,
+    solve_only: bool,
+) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
     if auth.is_terminal() || auth.current_player().is_none() {
         return Err("subgame_search: auth 非 decision 节点".to_string());
     }
     if root_state.is_terminal() || root_state.current_player().is_none() {
         return Err("subgame_search: root_state 非 decision 节点".to_string());
     }
-    let auth_actor = auth.current_player().expect("checked above").0 as PlayerId;
+    let auth_actor = actor_override
+        .unwrap_or_else(|| auth.current_player().expect("checked above").0 as PlayerId);
     // 缺口③：deep_menu（{1pot} 解到终局）与 depth_limit（街边界截断 + 叶子续局值）互斥
     // （§2.1 / §6 #2：深码不重建叶子值、改解到终局）。两者同开是配置错误 → 早 Err（不静默择一）。
     if cfg.deep_menu && cfg.depth_limit {
@@ -1659,6 +1707,10 @@ pub fn subgame_search_cached(
             &solved_fresh
         }
     };
+    // 预热（solve_only）：solve 已入缓存即达成目的，跳过导航/读数（hero 决策点尚不存在）。
+    if solve_only {
+        return Ok(Vec::new());
+    }
     let trainer = &solved.trainer;
 
     // 导航到当前决策点（CurrentDecision / round-start 首决策点 tags 空 → root），用 auth 几何读
@@ -2027,6 +2079,34 @@ pub fn subgame_search_unanchored_cached(
     bucket_override: Option<&Arc<BucketTable>>,
     hand_seed: u64,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    subgame_search_unanchored_cached_inner(
+        cache,
+        auth,
+        root_state,
+        game,
+        within_round,
+        cfg,
+        bucket_override,
+        hand_seed,
+        false,
+    )
+}
+
+/// [`subgame_search_unanchored_cached`] 本体 + 预热钩子。`solve_only` 语义同
+/// [`subgame_search_cached_inner`]；本路径 range 恒 uniform（不查 blueprint σ）→ solve 输入
+/// 不依赖 `auth` 的 current actor，无需 actor_override（预热传 `auth = root_state` 即可同 key）。
+#[allow(clippy::too_many_arguments)]
+fn subgame_search_unanchored_cached_inner(
+    cache: Option<&mut SubgameSolveCache>,
+    auth: &GameState,
+    root_state: &GameState,
+    game: &SimplifiedNlheGame,
+    within_round: &[(Action, bool)],
+    cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
+    hand_seed: u64,
+    solve_only: bool,
+) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
     if auth.is_terminal() || auth.current_player().is_none() {
         return Err("subgame_search_unanchored: auth 非 decision 节点".to_string());
     }
@@ -2125,6 +2205,10 @@ pub fn subgame_search_unanchored_cached(
             &solved_fresh
         }
     };
+    // 预热（solve_only）：solve 已入缓存即达成目的，跳过导航/读数。
+    if solve_only {
+        return Ok(Vec::new());
+    }
     let trainer = &solved.trainer;
     let cur_node = navigate_subtree_by_real_actions(
         trainer.game().subtree(),
@@ -2134,6 +2218,93 @@ pub fn subgame_search_unanchored_cached(
     )?;
     let (avg, sub_legal) = read_current_strategy(trainer, cur_node, auth, auth_actor)?;
     self_distribution(&sub_legal, &avg)
+}
+
+// ===========================================================================
+// RoundStart 预热（2026-06-12）：该街 hero 行动前把 solve 提前算进缓存
+// ===========================================================================
+
+/// RoundStart 预热（**锚定**路径）：街起点一确定（板发出、对手还在行动），就用街起点快照把
+/// build+solve 提前算进 [`SubgameSolveCache`]——hero 首决策时 key 命中、只做导航/读数，
+/// build+solve wall 藏进对手思考时间（既有「mid-round wall ≈ 0」机制经此扩到首决策）。
+///
+/// 成立的根基 = [`ResolveRoot::RoundStart`] 设计：solve 的**全部**输入（root_state / entrants /
+/// raises=0 / ranges（只依赖之前街）/ seed_ordinal=街索引 / hand_seed（不含 actions/board））在
+/// 街开始那一刻已知、与街内后续动作无关。`hero` = 之后读数的座位——range 平滑的「hero 不混」
+/// 座位必须按它算而非街首行动者（[`subgame_search_cached_inner`] `actor_override` doc，否则
+/// ranges 不同 → key 必 miss、预热静默失效）。`node_id` = **街起点**影子节点（与决策时 hero
+/// 节点同路径前缀 → RoundStart 推导逐项相等 → 同 key）。
+///
+/// **失败无害**：预热没成（Err / key 对不上）只丢 wall 收益，hero 决策时现解——key 覆盖 solve
+/// 全部输入，错配 = miss = 现解，不可能读错均衡。仅支持 RoundStart + 非 depth_limit
+/// （depth_limit 路径不入缓存，预热无处可存）。
+#[allow(clippy::too_many_arguments)]
+pub fn subgame_search_prewarm(
+    cache: &mut SubgameSolveCache,
+    hero: PlayerId,
+    round_start: &GameState,
+    game: &SimplifiedNlheGame,
+    node_id: NodeId,
+    strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
+    hand_seed: u64,
+) -> Result<(), String> {
+    if cfg.resolve_root != ResolveRoot::RoundStart {
+        return Err(
+            "subgame_search_prewarm: 仅 RoundStart（CurrentDecision 逐决策独立重解，无预热意义）"
+                .to_string(),
+        );
+    }
+    if cfg.depth_limit {
+        return Err(
+            "subgame_search_prewarm: depth_limit 路径不入缓存（subgame_search_cached doc）"
+                .to_string(),
+        );
+    }
+    subgame_search_cached_inner(
+        Some(cache),
+        round_start,
+        round_start,
+        game,
+        &[],
+        node_id,
+        strategy,
+        cfg,
+        bucket_override,
+        None,
+        None,
+        hand_seed,
+        0, // RoundStart 的 seed_ordinal = 街索引，本参数不被读。
+        Some(hero),
+        true,
+    )
+    .map(|_| ())
+}
+
+/// RoundStart 预热（**脱影子**路径）：语义同 [`subgame_search_prewarm`]。本路径 range 恒
+/// uniform → solve 输入不依赖读数 actor，无需 hero 座位；`round_start` 兼作 auth（街起点是
+/// decision 节点）。失败无害（同上）。
+pub fn subgame_search_unanchored_prewarm(
+    cache: &mut SubgameSolveCache,
+    round_start: &GameState,
+    game: &SimplifiedNlheGame,
+    cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
+    hand_seed: u64,
+) -> Result<(), String> {
+    subgame_search_unanchored_cached_inner(
+        Some(cache),
+        round_start,
+        round_start,
+        game,
+        &[],
+        cfg,
+        bucket_override,
+        hand_seed,
+        true,
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -5130,6 +5301,185 @@ mod tests {
         )
         .expect("换 hand_seed 仍 Ok");
         assert_eq!(cache.misses(), 2, "hand_seed 变 → miss");
+    }
+
+    // —— RoundStart 预热：hero 行动前把 solve 提前算进缓存（build+solve wall 藏进对手行动时间）——
+
+    /// 锚定预热：街起点（hero 行动**前**、首行动者 ≠ hero）预热 → hero 首决策 key 命中、不重解；
+    /// 命中输出 byte-equal 无缓存现解。`range_uniform_mix=0.25`（生产默认档）+ **非均匀** σ 钉
+    /// actor_override 修复：预热时 current_player = 街首行动者，若 range 平滑的「不混」座位按它
+    /// 算（而非 hero），ranges 向量不同 → key 必 miss——回归即命中断言 fail。（均匀 σ 下 reach
+    /// 本就均匀、混不混向量相同，钉不住，故 σ 必须非均匀。）
+    #[test]
+    fn prewarm_anchored_first_decision_hits() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x5052_4557_4D31_5F41); // "PREWM1_A"
+        let round_start = flop.game_state.clone();
+        let first_actor = round_start.current_player().expect("decision").0 as PlayerId;
+        // 首行动者 Check → hero（第二行动座）的首决策点。
+        let mut rng = ChaCha20Rng::from_seed(0x5052_4557_4D31_5F42);
+        let drng: &mut dyn RngSource = &mut rng;
+        let check = SimplifiedNlheGame::legal_actions(&flop)
+            .into_iter()
+            .find(|a| matches!(a, AbstractAction::Check))
+            .expect("flop 首决策点应可 Check");
+        let mid = SimplifiedNlheGame::next(flop.clone(), check, drng);
+        let hero = mid.game_state.current_player().expect("decision").0 as PlayerId;
+        assert_ne!(hero, first_actor, "测试前置：hero 须是第二行动座");
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            trigger: SearchTrigger::AllPostflop,
+            range_uniform_mix: 0.25,
+            ..SubgameSearchConfig::default()
+        };
+        // 非均匀 σ（按 info 偏斜，确定性）→ reach 非均匀 → mix 的「不混」座位可分辨。
+        let strat = |i: &InfoSetId, n: usize| {
+            let mut v: Vec<f64> = (0..n)
+                .map(|k| 1.0 + k as f64 + (i.raw() % 7) as f64 * 0.1)
+                .collect();
+            let s: f64 = v.iter().sum();
+            v.iter_mut().for_each(|x| *x /= s);
+            v
+        };
+        let mut cache = SubgameSolveCache::new();
+        subgame_search_prewarm(
+            &mut cache,
+            hero,
+            &round_start,
+            &game,
+            flop.current_node_id,
+            &strat,
+            &cfg,
+            None,
+            0xFEED,
+        )
+        .expect("预热应 Ok（stub 桶 + accepting cap）");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 0),
+            "预热 = 首 solve（miss + store）"
+        );
+
+        let legal_mid = SimplifiedNlheGame::legal_actions(&mid);
+        let d = subgame_search_cached(
+            Some(&mut cache),
+            &mid.game_state,
+            &round_start,
+            &game,
+            &legal_mid,
+            mid.current_node_id,
+            &strat,
+            &cfg,
+            None,
+            None,
+            None,
+            0xFEED,
+            5,
+        )
+        .expect("hero 首决策应 Ok");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "hero 首决策须命中预热 solve——actor_override 回归时此处 fail"
+        );
+        // 命中输出 byte-equal 无缓存现解（预热只省 wall、不改读数）。
+        let d_fresh = subgame_search(
+            &mid.game_state,
+            &round_start,
+            &game,
+            &legal_mid,
+            mid.current_node_id,
+            &strat,
+            &cfg,
+            None,
+            None,
+            0xFEED,
+            5,
+        )
+        .expect("无缓存现解应 Ok");
+        assert_eq!(
+            format!("{d:?}"),
+            format!("{d_fresh:?}"),
+            "命中输出须 byte-equal 现解"
+        );
+
+        // 配置守卫：CurrentDecision / depth_limit → 早 Err（无处预热）。
+        let cd = SubgameSearchConfig {
+            resolve_root: ResolveRoot::CurrentDecision,
+            ..cfg
+        };
+        assert!(subgame_search_prewarm(
+            &mut cache,
+            hero,
+            &round_start,
+            &game,
+            flop.current_node_id,
+            &strat,
+            &cd,
+            None,
+            0xFEED,
+        )
+        .is_err());
+        let dl = SubgameSearchConfig {
+            depth_limit: true,
+            ..cfg
+        };
+        assert!(subgame_search_prewarm(
+            &mut cache,
+            hero,
+            &round_start,
+            &game,
+            flop.current_node_id,
+            &strat,
+            &dl,
+            None,
+            0xFEED,
+        )
+        .is_err());
+    }
+
+    /// 脱影子预热：同语义（range 恒 uniform → 无需 hero 座位）。预热 → mid-round 首决策命中、
+    /// 输出 byte-equal 无缓存现解。
+    #[test]
+    fn prewarm_unanchored_first_decision_hits() {
+        let game = nolimp_6max_game();
+        let round_start = offstack_allin_flop_state();
+        let mut auth = round_start.clone();
+        auth.apply(Action::Check).expect("SB check");
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let mut cache = SubgameSolveCache::new();
+        subgame_search_unanchored_prewarm(&mut cache, &round_start, &game, &cfg, None, 0xD15E)
+            .expect("预热应 Ok");
+        assert_eq!((cache.misses(), cache.hits()), (1, 0));
+        let within = [(Action::Check, false)];
+        let d = subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &auth,
+            &round_start,
+            &game,
+            &within,
+            &cfg,
+            None,
+            0xD15E,
+        )
+        .expect("首决策应 Ok");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "首决策须命中预热 solve"
+        );
+        let d_fresh = subgame_search_unanchored(&auth, &round_start, &game, &within, &cfg, 0xD15E)
+            .expect("无缓存现解应 Ok");
+        assert_eq!(
+            format!("{d:?}"),
+            format!("{d_fresh:?}"),
+            "命中输出须 byte-equal 现解"
+        );
     }
 
     // —— bucket_override：子树 solve 独立换桶表（搜索区分辨率与 blueprint 表解耦）——

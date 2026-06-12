@@ -70,7 +70,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use poker::training::blueprint_advisor::{advance_shadow_by_applied, outgoing_action, parse_card};
-use poker::training::game::Game;
+use poker::training::game::{Game, PlayerId};
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::{
     deep_menu_for, first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
@@ -79,8 +79,9 @@ use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::openpoker_hh::hist_to_concrete;
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
-    should_search, subgame_search_cached, subgame_search_unanchored_cached, ResolveRoot,
-    SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
+    should_search, subgame_search_cached, subgame_search_prewarm, subgame_search_unanchored_cached,
+    subgame_search_unanchored_prewarm, ResolveRoot, SearchTrigger, SubgameSearchConfig,
+    SubgameSolveCache,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, InfoSetId,
@@ -131,7 +132,7 @@ struct ValidActions {
     max_raise: Option<u64>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct Request {
     hole: Vec<String>,
     #[serde(default)]
@@ -160,6 +161,16 @@ struct Request {
     /// 才发（决策时占座唯一可判才启用）。
     #[serde(default)]
     dealt_seats: Vec<u8>,
+}
+
+/// 请求信封判别（与 [`Request`] 分开解析；serde 忽略未知字段 → 同一行 JSON 两个结构都能读，
+/// `Request` 不加字段、既有构造/测试零改动）：`prewarm = true` → RoundStart 预热请求
+/// （driver `--search-prewarm` 在街起点、hero 行动**前**发，[`prewarm`]——不出动作、只暖
+/// solve 缓存，响应仅遥测、driver 丢弃）。缺省 `false` = 决策请求（旧 driver byte-equal）。
+#[derive(Deserialize)]
+struct RequestEnvelope {
+    #[serde(default)]
+    prewarm: bool,
 }
 
 /// advisor → driver 一行响应。`amount` 仅 raise 携带（= OpenPoker 单位的 raise-to 额）。
@@ -333,6 +344,225 @@ struct SearchRuntime {
     bucket_table: Option<Arc<BucketTable>>,
 }
 
+/// RoundStart 预热（`Request.prewarm = true`，driver `--search-prewarm` 在街起点、hero 行动
+/// **前**发）：把该街的 build+solve 提前算进 solve 缓存（[`subgame_search_prewarm`] doc——
+/// RoundStart 下 solve 全部输入在街开始即已知），hero 首决策 key 命中 → 只做导航/读数，
+/// build+solve wall 藏进对手行动时间。
+///
+/// **失败无害 / 永不出动作**：任何前置不满足 → `prewarm:skip:*`；建树/求解失败 →
+/// `prewarm:err:*`——都只是放弃预热，hero 决策时 miss 现解（key 覆盖 solve 全部输入，
+/// 错配不可能读错均衡）。响应仅遥测（`action="none"`，driver 丢弃），且必有一行（IPC 锁步）。
+///
+/// 路径分类与 [`decide`] 同源（[`lockstep_replay`]）：重放 Ok → 锚定（node_id = 街起点影子
+/// 节点，hero 座位显式传入——range 平滑「不混」座按 hero 算，见 `subgame_search_prewarm`）；
+/// 重放 Err（off-stack / limp 线失同步）→ 脱影子预热。gating 在街起点判（FlopFirstUnraised
+/// 街起点恒未起注；街内后续起注与否未知 → 可能白预热，无害）。
+fn prewarm(
+    game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    req: &Request,
+    base_seed: u64,
+    search: Option<&SearchRuntime>,
+    solve_cache: &mut SubgameSolveCache,
+) -> Response {
+    let mk = |source: String| Response {
+        action: "none".into(),
+        source,
+        ..Default::default()
+    };
+    let Some(rt) = search else {
+        return mk("prewarm:skip:search_off".into());
+    };
+    let scfg = &rt.cfg;
+    if scfg.resolve_root != ResolveRoot::RoundStart {
+        return mk("prewarm:skip:not_round_start".into());
+    }
+    // —— 前置校验（同 decide 的口径；失败 = skip 不预热）——
+    if req.hole.len() != 2 {
+        return mk("prewarm:skip:hole_not_2".into());
+    }
+    if req.num_seats as usize != N_SEATS {
+        return mk("prewarm:skip:not_6max".into());
+    }
+    if req.big_blind == 0 {
+        return mk("prewarm:skip:bad_bb".into());
+    }
+    let solver_cfg = TableConfig::default_6max_100bb();
+    let solver_bb = solver_cfg.big_blind.as_u64();
+    if solver_bb % req.big_blind != 0 {
+        return mk("prewarm:skip:scale_not_integer".into());
+    }
+    let scale = solver_bb / req.big_blind;
+    if req.small_blind * scale != solver_cfg.small_blind.as_u64() {
+        return mk("prewarm:skip:blind_ratio_mismatch".into());
+    }
+    let hole = match (parse_card(&req.hole[0]), parse_card(&req.hole[1])) {
+        (Ok(a), Ok(b)) => [a, b],
+        _ => return mk("prewarm:skip:bad_hole".into()),
+    };
+    let board: Vec<Card> = match req.board.iter().map(|s| parse_card(s)).collect() {
+        Ok(b) => b,
+        Err(_) => return mk("prewarm:skip:bad_board".into()),
+    };
+    if board.len() < 3 {
+        return mk("prewarm:skip:preflop".into()); // preflop 不搜（§1 gating），无预热对象。
+    }
+    let smap = match seat_map(req) {
+        Ok(m) => m,
+        Err(reason) => return mk(format!("prewarm:skip:{reason}")),
+    };
+    if smap.hu {
+        return mk("prewarm:skip:short_hu_postflop".into()); // HU 映射仅 preflop（seat_map doc）。
+    }
+    let my_seat_solver = match smap.tree_seat(req.my_seat) {
+        Ok(t) => SeatId(t),
+        Err(reason) => return mk(format!("prewarm:skip:{reason}")),
+    };
+    // 真栈轮起点快照（require_my_turn=false：预热正是在 hero 行动前）。
+    let (_auth, round_start, _within) = match build_real_auth(
+        req,
+        &solver_cfg,
+        scale,
+        &smap,
+        my_seat_solver,
+        hole,
+        &board,
+        false,
+    ) {
+        Ok(t) => t,
+        Err(reason) => return mk(format!("prewarm:err:build:{reason}")),
+    };
+    // gating：街起点视角（真栈快照；should_search 只读街 + 本街是否已起注——街起点恒未起注，
+    // FlopFirstUnraised 即「仅 flop 预热」）。街内后续是否起注未知 → 可能白预热，无害。
+    if !should_search(&round_start, scfg.trigger) {
+        return mk("prewarm:skip:not_triggered".into());
+    }
+    if expected_board_len(round_start.street()) != board.len() {
+        return mk("prewarm:skip:street_board_mismatch".into());
+    }
+    // hero 须还 Active（弃牌 / all-in = 本街不会再有 hero 决策，预热纯浪费）。
+    let hero_pid = my_seat_solver.0 as PlayerId;
+    if round_start.players()[hero_pid as usize].status != poker::PlayerStatus::Active {
+        return mk("prewarm:skip:hero_not_active".into());
+    }
+    let hand_seed = hand_seed_for(req, base_seed);
+    // —— 路径分类与 decide 同源：lockstep Ok → 锚定；Err（off-stack / limp 线）→ 脱影子 ——
+    let result = match lockstep_replay(game, &solver_cfg, &smap, req, scale, board.len(), None) {
+        Ok((_real, abs)) => subgame_search_prewarm(
+            solve_cache,
+            hero_pid,
+            &round_start,
+            game,
+            abs.current_node_id,
+            strategy_fn,
+            scfg,
+            rt.bucket_table.as_ref(),
+            hand_seed,
+        ),
+        Err(_) => subgame_search_unanchored_prewarm(
+            solve_cache,
+            &round_start,
+            game,
+            scfg,
+            rt.bucket_table.as_ref(),
+            hand_seed,
+        ),
+    };
+    match result {
+        Ok(()) => {
+            let updates = solve_cache.entry_update_count();
+            eprintln!(
+                "[openpoker_advisor] prewarm stored street={} updates={} cache={}hit/{}miss",
+                street_label(round_start.street()),
+                updates.unwrap_or(0),
+                solve_cache.hits(),
+                solve_cache.misses()
+            );
+            let mut resp = mk("prewarm:stored".into());
+            resp.street = Some(street_label(round_start.street()).into());
+            resp.solve_updates = updates;
+            resp
+        }
+        Err(reason) => mk(format!("prewarm:err:{reason}")),
+    }
+}
+
+/// 两态 lockstep 单步（真实动作与幻影 fold 共用，保两路不漂）。
+fn lockstep_step(
+    real: &mut poker::GameState,
+    abs: &mut SimplifiedNlheState,
+    abs_rng: &mut ChaCha20Rng,
+    actor: u8,
+    action: &str,
+    to_solver: Option<u64>,
+) -> Result<(), String> {
+    if real.current_player() != Some(SeatId(actor)) {
+        // 码深漂移 / 历史错位 → 重放对不上回合。
+        return Err("replay_seat_mismatch".into());
+    }
+    let Some(concrete) = hist_to_concrete(real, action, to_solver) else {
+        return Err("bad_hist_action".into());
+    };
+    if real.apply(concrete).is_err() {
+        return Err("replay_illegal".into());
+    }
+    let is_all_in = real.players()[actor as usize].status == poker::PlayerStatus::AllIn;
+    if advance_shadow_by_applied(abs, concrete, is_all_in, abs_rng).is_err() {
+        // 结构性 gap（如 open-limp 进 no-limp 影子）→ 失同步（不静默改 kind）。
+        return Err("structural_gap".into());
+    }
+    if abs.game_state.current_player() != real.current_player() {
+        return Err("lockstep_drift".into());
+    }
+    Ok(())
+}
+
+/// 两态 lockstep 重放（[`decide`] 决策路径与 [`prewarm`] 预热共用——**锚定/脱影子分类与
+/// node_id 必须同源**，否则预热可能走错路径 / 推错 key 静默失效）。`my_turn = Some(seat)` →
+/// 末尾校验轮到该座（决策路径，旧行为逐字保留）；`None` → 重放到历史末尾即可（预热：该街
+/// hero 行动前，轮到的是首行动者）。
+fn lockstep_replay(
+    game: &SimplifiedNlheGame,
+    solver_cfg: &TableConfig,
+    smap: &SeatMap,
+    req: &Request,
+    scale: u64,
+    board_len: usize,
+    my_turn: Option<SeatId>,
+) -> Result<(poker::GameState, SimplifiedNlheState), String> {
+    let mut real = poker::GameState::new(solver_cfg, REAL_REPLAY_SEED);
+    let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
+    let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
+    // 短桌：幻影座（UTG 起的最早行动位）开局先 fold → 走到 blueprint 树的真实节点。
+    for &t in &smap.phantoms {
+        lockstep_step(&mut real, &mut abs, &mut abs_rng, t, "fold", None)
+            .map_err(|e| format!("phantom_{e}"))?;
+    }
+    for h in &req.actions {
+        let actor = smap.tree_seat(h.seat)?;
+        let to_solver = h.to.map(|t| t * scale);
+        lockstep_step(
+            &mut real,
+            &mut abs,
+            &mut abs_rng,
+            actor,
+            &h.action,
+            to_solver,
+        )?;
+    }
+    // —— 到我方决策点（决策路径）/ 历史末尾（预热）——
+    if let Some(seat) = my_turn {
+        if real.current_player() != Some(seat) {
+            return Err("not_my_turn".into());
+        }
+    }
+    let street = real.street();
+    if abs.game_state.street() != street || board_len != expected_board_len(street) {
+        return Err("street_board_mismatch".into());
+    }
+    Ok((real, abs))
+}
+
 /// 一次决策：重放本手历史（100BB real + abs 两态 lockstep）→ 我方决策点。`search == None` 时
 /// 查 blueprint → outgoing（旧行为，byte-equal）；`search == Some` 且命中触发面（[`should_search`]）
 /// 时建**真码深** subgame re-solve（[`subgame_search_cached`]；`deep_menu` → 子树用 {1pot} 单档菜单 +
@@ -400,73 +630,24 @@ fn decide(
         Err(reason) => return safe_fallback(&req.valid, &reason),
     };
 
-    /// 两态 lockstep 单步（真实动作与幻影 fold 共用，保两路不漂）。
-    fn lockstep_step(
-        real: &mut poker::GameState,
-        abs: &mut SimplifiedNlheState,
-        abs_rng: &mut ChaCha20Rng,
-        actor: u8,
-        action: &str,
-        to_solver: Option<u64>,
-    ) -> Result<(), String> {
-        if real.current_player() != Some(SeatId(actor)) {
-            // 码深漂移 / 历史错位 → 重放对不上回合。
-            return Err("replay_seat_mismatch".into());
+    // —— 两态 lockstep 重放（blueprint 路径 + 锚定搜索的 node_id / legal_abs 来源；与
+    // prewarm 共用 [`lockstep_replay`]，分类 / node_id 同源）——
+    let lockstep = lockstep_replay(
+        game,
+        &solver_cfg,
+        &smap,
+        req,
+        scale,
+        board.len(),
+        Some(my_seat_solver),
+    )
+    .and_then(|(real, abs)| {
+        let legal_abs = SimplifiedNlheGame::legal_actions(&abs);
+        if legal_abs.is_empty() {
+            return Err("empty_legal".into());
         }
-        let Some(concrete) = hist_to_concrete(real, action, to_solver) else {
-            return Err("bad_hist_action".into());
-        };
-        if real.apply(concrete).is_err() {
-            return Err("replay_illegal".into());
-        }
-        let is_all_in = real.players()[actor as usize].status == poker::PlayerStatus::AllIn;
-        if advance_shadow_by_applied(abs, concrete, is_all_in, abs_rng).is_err() {
-            // 结构性 gap（如 open-limp 进 no-limp 影子）→ 失同步（不静默改 kind）。
-            return Err("structural_gap".into());
-        }
-        if abs.game_state.current_player() != real.current_player() {
-            return Err("lockstep_drift".into());
-        }
-        Ok(())
-    }
-
-    // —— 两态 lockstep 重放（blueprint 路径 + 锚定搜索的 node_id / legal_abs 来源）——
-    let lockstep =
-        (|| -> Result<(poker::GameState, SimplifiedNlheState, Vec<AbstractAction>), String> {
-            let mut real = poker::GameState::new(&solver_cfg, REAL_REPLAY_SEED);
-            let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
-            let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
-            // 短桌：幻影座（UTG 起的最早行动位）开局先 fold → 走到 blueprint 树的真实节点。
-            for &t in &smap.phantoms {
-                lockstep_step(&mut real, &mut abs, &mut abs_rng, t, "fold", None)
-                    .map_err(|e| format!("phantom_{e}"))?;
-            }
-            for h in &req.actions {
-                let actor = smap.tree_seat(h.seat)?;
-                let to_solver = h.to.map(|t| t * scale);
-                lockstep_step(
-                    &mut real,
-                    &mut abs,
-                    &mut abs_rng,
-                    actor,
-                    &h.action,
-                    to_solver,
-                )?;
-            }
-            // —— 到我方决策点 ——
-            if real.current_player() != Some(my_seat_solver) {
-                return Err("not_my_turn".into());
-            }
-            let street = real.street();
-            if abs.game_state.street() != street || board.len() != expected_board_len(street) {
-                return Err("street_board_mismatch".into());
-            }
-            let legal_abs = SimplifiedNlheGame::legal_actions(&abs);
-            if legal_abs.is_empty() {
-                return Err("empty_legal".into());
-            }
-            Ok((real, abs, legal_abs))
-        })();
+        Ok((real, abs, legal_abs))
+    });
     let (real, abs, legal_abs) = match lockstep {
         Ok(t) => t,
         Err(reason) => {
@@ -521,11 +702,19 @@ fn decide(
         let rt = search.expect("want_search ⇒ search.is_some()");
         let scfg = &rt.cfg;
         // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ 安全降级。
-        let (auth, round_start, within) =
-            match build_real_auth(req, &solver_cfg, scale, &smap, my_seat_solver, hole, &board) {
-                Ok(t) => t,
-                Err(reason) => return search_giveup(&req.valid, &format!("build:{reason}")),
-            };
+        let (auth, round_start, within) = match build_real_auth(
+            req,
+            &solver_cfg,
+            scale,
+            &smap,
+            my_seat_solver,
+            hole,
+            &board,
+            true,
+        ) {
+            Ok(t) => t,
+            Err(reason) => return search_giveup(&req.valid, &format!("build:{reason}")),
+        };
         let root_state: &GameState = match scfg.resolve_root {
             ResolveRoot::RoundStart => &round_start,
             ResolveRoot::CurrentDecision => &auth,
@@ -798,7 +987,10 @@ fn limp_heuristic(req: &Request, hole: [Card; 2]) -> Option<Response> {
 /// hero 真桶用）；`round_start` = 当前街起点快照（[`ResolveRoot::RoundStart`] 子树根）；`within` =
 /// **当前街**真实动作序 `(动作, 是否令行动者 all-in)`（街变清空；脱影子路径的 within-round 导航
 /// 输入，锚定路径不读）。重放对不上 / 注入失败 → `Err`（caller 安全降级）。
-#[allow(clippy::type_complexity)]
+///
+/// `require_my_turn`：决策路径 `true`（重放末尾须轮到 hero，旧行为）；[`prewarm`] 传 `false`
+/// （预热在 hero 行动**前**，轮到的是该街首行动者——只取 `round_start` 快照）。
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn build_real_auth(
     req: &Request,
     solver_cfg: &TableConfig,
@@ -807,6 +999,7 @@ fn build_real_auth(
     my_seat_solver: SeatId,
     hole: [Card; 2],
     board: &[Card],
+    require_my_turn: bool,
 ) -> Result<(GameState, GameState, Vec<(Action, bool)>), String> {
     let real_cfg = real_stacks_config(req, solver_cfg, scale, smap)?;
 
@@ -855,8 +1048,11 @@ fn build_real_auth(
             within.push((concrete, became_all_in));
         }
     }
-    if auth.current_player() != Some(my_seat_solver) {
+    if require_my_turn && auth.current_player() != Some(my_seat_solver) {
         return Err("auth_not_my_turn".into());
+    }
+    if auth.is_terminal() || auth.current_player().is_none() {
+        return Err("auth_terminal".into()); // 预热路径防御（决策路径被上一检查覆盖）。
     }
     // 注入真实牌（hero hole + board）到当前点 + 街起点（subgame solve / query_at 读真牌）。
     let auth = auth.inject_external_cards(my_seat_solver, hole, board)?;
@@ -890,11 +1086,19 @@ fn decide_search_unanchored(
 ) -> Response {
     let scfg = &rt.cfg;
     // 真栈重放（auth / 轮起点快照 / 当前街真实动作序）。建不了 = §2.3「建不了树」→ 安全降级。
-    let (auth, round_start, within) =
-        match build_real_auth(req, solver_cfg, scale, smap, my_seat_solver, hole, board) {
-            Ok(t) => t,
-            Err(reason) => return search_giveup(&req.valid, &format!("unanchored_build:{reason}")),
-        };
+    let (auth, round_start, within) = match build_real_auth(
+        req,
+        solver_cfg,
+        scale,
+        smap,
+        my_seat_solver,
+        hole,
+        board,
+        true,
+    ) {
+        Ok(t) => t,
+        Err(reason) => return search_giveup(&req.valid, &format!("unanchored_build:{reason}")),
+    };
     // gating 在真栈 auth 上判（影子失同步、100BB real 不可得；should_search 只读街+本街是否起注）。
     // 未命中 / board 与真栈街对不上 → 维持旧兜底（非搜索区，labels 与 search=None 同）。
     if !should_search(&auth, scfg.trigger) || board.len() != expected_board_len(auth.street()) {
@@ -1202,7 +1406,20 @@ fn run() -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
+        // 信封判别（RequestEnvelope doc）：prewarm 请求不出动作、只暖 solve 缓存；
+        // 必有一行响应（IPC 锁步）。
+        let is_prewarm = serde_json::from_str::<RequestEnvelope>(&line)
+            .map(|e| e.prewarm)
+            .unwrap_or(false);
         let resp = match serde_json::from_str::<Request>(&line) {
+            Ok(req) if is_prewarm => prewarm(
+                game,
+                &strategy_fn,
+                &req,
+                args.seed,
+                search_rt.as_ref(),
+                &mut solve_cache,
+            ),
             Ok(req) => decide(
                 game,
                 &abstraction,
@@ -2127,6 +2344,130 @@ mod tests {
             r2_shared, r2_fresh,
             "缓存命中输出须 byte-equal 从头重解（固定迭代）"
         );
+    }
+
+    // —— RoundStart 预热（street-start prewarm：hero 行动前暖 solve 缓存）——
+
+    /// 锚定预热端到端：街起点（SB 先行动、hero=BB **未轮到**）发预热 → 首 solve 入缓存；
+    /// SB check 后 hero 首决策**命中**（misses 不增）、输出 byte-equal 无预热现解。
+    /// `range_uniform_mix=0.25` + 非均匀 σ 钉「『不混』座 = hero（my_seat）而非街首行动者」
+    /// 在 advisor 层接对（接错 → ranges 不同 → key miss → 命中断言 fail）。
+    #[test]
+    fn prewarm_anchored_then_decision_hits_cache() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        // 非均匀 σ（确定性）：均匀 σ 下 reach 均匀、混不混向量相同，钉不住 hero 接线。
+        let skew = |i: &InfoSetId, n: usize| {
+            let mut v: Vec<f64> = (0..n)
+                .map(|k| 1.0 + k as f64 + (i.raw() % 7) as f64 * 0.1)
+                .collect();
+            let s: f64 = v.iter().sum();
+            v.iter_mut().for_each(|x| *x /= s);
+            v
+        };
+        let scfg = SubgameSearchConfig {
+            iterations: 400,
+            trigger: SearchTrigger::AllPostflop,
+            range_uniform_mix: 0.25,
+            ..SubgameSearchConfig::default()
+        };
+        // hero = BB（seat 2）：flop 首行动者是 SB（seat 1）→ 预热请求 = 街起点历史、未轮到 hero。
+        let mut pre = flop_first_unraised_req(vec![2000; 6]);
+        pre.my_seat = 2;
+        pre.hole = vec!["Qs".into(), "Qd".into()];
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(&game, &skew, &pre, 0xCAC4E, Some(&rt(scfg)), &mut cache);
+        assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+        assert_eq!((cache.misses(), cache.hits()), (1, 0), "预热 = 首 solve");
+
+        // 决策：SB check → 轮到 hero（BB）。
+        let mut req = flop_first_unraised_req(vec![2000; 6]);
+        req.my_seat = 2;
+        req.hole = vec!["Qs".into(), "Qd".into()];
+        req.actions.push(HistAction {
+            seat: 1,
+            action: "check".into(),
+            to: None,
+        });
+        let r = decide(
+            &game,
+            &abs,
+            &skew,
+            &req,
+            0xCAC4E,
+            Some(&rt(scfg)),
+            &mut cache,
+        );
+        assert_eq!(r.source, "search", "得 {r:?}");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "hero 首决策须命中预热 solve（hero 接线回归时此处 fail）"
+        );
+        let r_fresh = decide(
+            &game,
+            &abs,
+            &skew,
+            &req,
+            0xCAC4E,
+            Some(&rt(scfg)),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r, r_fresh, "预热只省 wall、不改输出（byte-equal 现解）");
+
+        // 边界：search off → skip；preflop（board 空）→ skip。
+        let off = prewarm(&game, &skew, &pre, 0xCAC4E, None, &mut cache);
+        assert_eq!(off.source, "prewarm:skip:search_off");
+        let mut pre_pf = pre.clone();
+        pre_pf.board = vec![];
+        pre_pf.actions.truncate(4); // 只剩 folds-to-SB，preflop 中途。
+        let pf = prewarm(&game, &skew, &pre_pf, 0xCAC4E, Some(&rt(scfg)), &mut cache);
+        assert_eq!(pf.source, "prewarm:skip:preflop");
+    }
+
+    /// 脱影子预热端到端：off-stack all-in 线（lockstep 必失同步）→ 预热走 unanchored 路径
+    /// 入缓存；决策（`search:unanchored`）命中、输出 byte-equal 无预热现解。
+    #[test]
+    fn prewarm_unanchored_then_decision_hits_cache() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let req = offstack_allin_req();
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(&game, &uniform, &req, 0x0FF7, Some(&rt(scfg)), &mut cache);
+        assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+        assert_eq!((cache.misses(), cache.hits()), (1, 0), "预热 = 首 solve");
+        let r = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x0FF7,
+            Some(&rt(scfg)),
+            &mut cache,
+        );
+        assert_eq!(r.source, "search:unanchored", "得 {r:?}");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "脱影子首决策须命中预热 solve"
+        );
+        let r_fresh = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x0FF7,
+            Some(&rt(scfg)),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r, r_fresh, "预热只省 wall、不改输出（byte-equal 现解）");
     }
 
     // —— 缺口②续：脱影子搜索（off-stack all-in 线，v1 边界①收口）——

@@ -76,10 +76,31 @@ class Advisor:
         self.ready = json.loads(line)
         if not self.ready.get("ready"):
             raise RuntimeError(f"advisor ready 异常: {line!r}")
+        # 未读取的 prewarm 响应行数（prewarm 先发后弃响应；管道有序 → decide 前按计数 drain
+        # 即可对齐，不会把预热响应误当决策响应）。
+        self._pending_prewarms = 0
+
+    def prewarm(self, req):
+        """RoundStart 预热（--search-prewarm）：街起点、hero 行动**前**发 prewarm 请求，让
+        advisor 把该街 solve 提前算进缓存（build+solve wall 藏进对手行动时间）。**不等响应**
+        （等 = 阻塞 WS 消息处理，预热就白做了）；响应行在下次 decide 前 drain 丢弃。"""
+        payload = dict(req)
+        payload["prewarm"] = True
+        self.proc.stdin.write(json.dumps(payload) + "\n")
+        self.proc.stdin.flush()
+        self._pending_prewarms += 1
+
+    def _drain_pending(self):
+        while self._pending_prewarms > 0:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError("advisor 无响应（退出？）")
+            self._pending_prewarms -= 1
 
     def decide(self, req):
         """req = dict（见 openpoker_advisor::Request）。返回 advisor 响应 dict
         {action, amount?, source, ...}。"""
+        self._drain_pending()
         self.proc.stdin.write(json.dumps(req) + "\n")
         self.proc.stdin.flush()
         line = self.proc.stdout.readline()
@@ -338,14 +359,16 @@ class Session:
                     "community_cards", "your_turn", "hand_result",
                     "lobby_joined", "table_joined", "table_state")
 
-    def __init__(self, advisor, send, num_hands, log_f=None, hh_f=None):
+    def __init__(self, advisor, send, num_hands, log_f=None, hh_f=None, prewarm=False):
         self.advisor = advisor
         self.send = send
         self.num_hands = num_hands
         self.log_f = log_f
         self.hh_f = hh_f
+        self.prewarm = prewarm  # --search-prewarm：街起点预热（缺省关 = 请求流 byte-equal）
         self.counters = {"hands": 0, "decisions": 0, "blueprint": 0, "search": 0,
                          "limp_heuristic": 0, "fallback": 0, "net_chips": 0,
+                         "prewarms": 0,
                          "hh_hands": 0, "hh_skipped": 0, "watchdog_rejoins": 0}
         self.state = {"hand": None, "table_id": None, "last_seq": 0}
         self.client_action_id = [0]
@@ -423,6 +446,7 @@ class Session:
             if self.state["hand"]:
                 self.state["hand"].on_community(msg.get("cards", []),
                                                 _street_name(msg.get("street")))
+                self._maybe_prewarm()
         elif t == "table_state":
             # 短桌占座推断（幻影座映射）：stream:state 全量快照的 seats[].in_hand 是发牌的
             # 权威信号（your_turn.players 含等局玩家，不可用）。已弃牌者会翻 false → 并集
@@ -443,6 +467,28 @@ class Session:
             if self.counters["hands"] >= self.num_hands:
                 print(f"  打满 {self.num_hands} 手，离场。", file=sys.stderr)
                 ws.close()
+
+    def _maybe_prewarm(self):
+        """街起点预热（--search-prewarm）：板发出、hero 行动**前**让 advisor 后台把该街
+        solve 提前算进缓存（RoundStart 下 solve 全部输入在街起点已知）。只在 hero 本街还
+        可能有决策时发（已 fold / all_in 跳过——粗判，advisor 侧 hero_not_active 再兜）；
+        发错无害：advisor skip / key miss 时决策现解，正确性不受影响。"""
+        if not self.prewarm:
+            return
+        hand = self.state["hand"]
+        if hand is None or not hand.hole or len(hand.board or []) < 3:
+            return
+        for a in hand.actions:
+            if a.get("seat") == hand.my_seat and a.get("action") in ("fold", "all_in"):
+                return
+        valid_stub = {"can_check": False, "can_call": False, "can_raise": False,
+                      "min_raise": None, "max_raise": None}
+        req = hand.build_request(valid_stub)
+        try:
+            self.advisor.prewarm(req)
+            self.counters["prewarms"] += 1
+        except Exception as e:
+            print(f"  [prewarm 异常] {e}（忽略：决策时现解）", file=sys.stderr)
 
     def _handle_your_turn(self, ws, msg):
         hand = self.state["hand"]
@@ -533,7 +579,7 @@ def _ws_send(ws, obj):
     ws.send(json.dumps(obj))
 
 
-def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None):
+def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=False):
     import threading
 
     import websocket  # 延迟 import：离线 selftest 不需要 websocket-client
@@ -541,7 +587,8 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None):
     log_f = open(action_log, "w") if action_log else None
     # HH 用 append：贯穿全程的后台采集（§4.2），跨重连 / 多次运行累积同一个文件。
     hh_f = open(hh_log, "a") if hh_log else None
-    session = Session(advisor, send=_ws_send, num_hands=num_hands, log_f=log_f, hh_f=hh_f)
+    session = Session(advisor, send=_ws_send, num_hands=num_hands, log_f=log_f, hh_f=hh_f,
+                      prewarm=prewarm)
 
     # 看门狗线程：被移出桌 / 桌散后服务端不再推任何消息，回调模型里没有别的唤醒点。
     stop_watchdog = threading.Event()
@@ -597,6 +644,7 @@ def _report(counters):
           f"blueprint={counters['blueprint']} search={counters.get('search', 0)} "
           f"limp_heuristic={counters.get('limp_heuristic', 0)} fallback={fb} "
           f"({100.0 * fb / d if d else 0:.1f}% 兜底) "
+          f"prewarms={counters.get('prewarms', 0)} "
           f"hh={counters.get('hh_hands', 0)}(+{counters.get('hh_skipped', 0)} skipped) "
           f"watchdog_rejoins={counters.get('watchdog_rejoins', 0)}",
           file=sys.stderr)
@@ -678,8 +726,32 @@ def run_selftest(advisor):
     # 盲注座重算 / HH dealt_est。
     _selftest_short_handed()
 
-    print("OK: 6 个 canned 场景跑通：advisor 全程出合法动作、driver 组请求/动作包（含真栈 stacks"
-          " + 短桌 dealt_seats）正常、HH 日志 byte-equal 隔离成立。", file=sys.stderr)
+    # 场景 7（RoundStart 预热）：街起点（hero=BB 行动前）发 prewarm（不等响应）→ hero 决策
+    # decide 先 drain 预热响应再读决策响应——验 IPC 锁步对齐不串行 + 动作仍合法。
+    # search off 时 advisor 回 prewarm:skip:search_off，机制同样走通（drain 只数行数）。
+    hand7 = HandState("h7", button_seat=0, my_seat=2)  # BB：flop 首行动者是 SB → 预热在 hero 行动前
+    hand7.hole = ["Qs", "Qd"]
+    for s in [3, 4, 5, 0]:
+        hand7.on_player_action(s, "fold", None)
+    hand7.on_player_action(1, "call", 20)   # SB complete
+    hand7.on_player_action(2, "check", None)  # BB check → flop
+    hand7.on_community(["7h", "2c", "Ks"], "flop")
+    valid_stub = {"can_check": False, "can_call": False, "can_raise": False,
+                  "min_raise": None, "max_raise": None}
+    advisor.prewarm(hand7.build_request(valid_stub))
+    if advisor._pending_prewarms != 1:
+        raise RuntimeError(f"[prewarm] 发出后应有 1 条待 drain 响应，得 {advisor._pending_prewarms}")
+    hand7.on_player_action(1, "check", None)  # SB check → 轮到 hero(BB)
+    req7 = hand7.build_request(valid_flop)
+    resp7 = advisor.decide(req7)
+    if advisor._pending_prewarms != 0:
+        raise RuntimeError(f"[prewarm] decide 后待 drain 应清零，得 {advisor._pending_prewarms}")
+    _assert_legal(resp7, valid_flop, "prewarm+decision")
+    print(f"[selftest 7 prewarm] resp={resp7} "
+          f"(--search 开则预热入缓存、决策命中；off 则 skip——两者 IPC 锁步都须对齐)", file=sys.stderr)
+
+    print("OK: 7 个 canned 场景跑通：advisor 全程出合法动作、driver 组请求/动作包（含真栈 stacks"
+          " + 短桌 dealt_seats）正常、HH 日志 byte-equal 隔离成立、prewarm IPC 锁步对齐。", file=sys.stderr)
 
 
 def _assert_legal(resp, valid, tag):
@@ -951,6 +1023,9 @@ def main():
     p.add_argument("--search-bucket-table", default=None)
     # solve update 并行线程数（同预算 update ≈ ×核数；只助 solve 侧，建树仍单线程）。
     p.add_argument("--search-solve-threads", type=int, default=None)
+    # RoundStart 预热：街起点（hero 行动前）让 advisor 提前 build+solve 暖缓存，
+    # wall 藏进对手行动时间。driver 侧行为（advisor 按请求响应，无需自己的 flag）。
+    p.add_argument("--search-prewarm", action="store_true")
     args = p.parse_args()
 
     extra = []
@@ -974,6 +1049,8 @@ def main():
             extra += ["--search-bucket-table", args.search_bucket_table]
         if args.search_solve_threads is not None:
             extra += ["--search-solve-threads", str(args.search_solve_threads)]
+    if args.search_prewarm and not args.search:
+        raise SystemExit("--search-prewarm 需配 --search（拒绝静默：没有搜索就没有可预热的 solve）")
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
                       args.reshape, args.postflop_cap, args.seed, extra_args=extra)
     try:
@@ -985,7 +1062,8 @@ def main():
                                  "或 --selftest 离线验 IPC")
             log = args.action_log if args.action_log else None
             run_real(advisor, args.api_key, args.num_hands, action_log=log,
-                     hh_log=args.hh_log if args.hh_log else None)
+                     hh_log=args.hh_log if args.hh_log else None,
+                     prewarm=args.search_prewarm)
     finally:
         advisor.close()
 
