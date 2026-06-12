@@ -723,15 +723,17 @@ pub struct SubgameSearchConfig {
     /// 开启后 rng 消费序列改变 → 与 `false` 基线不 byte-equal（固定迭代 + 固定 seed 下自身仍
     /// 确定性可复现；本字段进 within-round solve 缓存 key）。
     pub live_traversers: bool,
-    /// range 先验平滑 λ（2026-06-12 searchon50 实跑修复）：把 [`estimate_range`] 估出的
-    /// blueprint reach 与「非撞 board 组合上的 uniform」混合，`r' = (1−λ)·r + λ·u`。
+    /// range 先验平滑 λ（2026-06-12 searchon50 实跑修复）：把**对手**座位经 [`estimate_range`]
+    /// 估出的 blueprint reach 与「非撞 board 组合上的 uniform」混合，`r' = (1−λ)·r + λ·u`；
+    /// **hero（当前决策 actor）的 range 不混**，保持原 reach（[`mix_lambda_for_seat`] doc：
+    /// 混 hero range 会虚增弃牌率、实测方向反掉）。
     ///
     /// 动机：多街薄线上 blueprint σ 欠训练 → reach 估计塌缩成噪声窄 range（实测 river 对手
     /// range 有效组合 50、单牌类占 36%、几乎无同花 = 被钉死「封顶」），无约束重解将其放大成
     /// max-exploit——对手在解内对 jam 弃 72.6% → 空气桶 99.98% 下注 / 73% 超池 jam，且预算
     /// 越足越极端（20s → 0.91，是收敛而非噪声）；uniform 先验 A/B 同局面回 check 0.31 =
-    /// 机制实锤在 range 先验。混合给每个合法组合保底 `λ/n_valid` 权重 → 对手 range 永不
-    /// 被钉死，剥削度随 λ 连续回拉（`λ=1` ≡ uniform 先验）。
+    /// 机制实锤在 range 先验。混合给对手每个合法组合保底 `λ/n_valid` 权重 → 对手 range 永不
+    /// 被钉死「封顶」，剥削度随 λ 连续回拉（`λ=1` = 对手 uniform 先验、hero 仍 blueprint reach）。
     ///
     /// `0.0`（默认）= 不混合，既有 probe / §11.5 基线逐位 byte-equal；生产 advisor 另有自己的
     /// 默认（`openpoker_advisor --search-range-uniform-mix`）。仅 `use_blueprint_range=true`
@@ -949,6 +951,20 @@ fn estimate_range(
 /// (SubgameNlheGame::sample_holes_from_ranges) 的「受限 range 全零 → 退均匀」兜底语义不变，
 /// 混入 λ·u 会把「无信号」伪装成「有 range」。撞 board 组合两边都是 0 → 混合后仍 0
 /// （card-removal 不变）。
+/// range 平滑只作用于**对手**座位：hero（`auth_actor`）的 range 保持原 blueprint reach。
+/// 缘由：①对手 range 的「不确定性 → 向 uniform 回拉」有正当性；hero 自己的 range 是
+/// 「hero 实际怎么走到这条线」的自一致输入，混 uniform = 解错游戏；②实测（2026-06-12
+/// vultr 固定 150k 迭代 ×3 seeds）对称混合把 hero range 也灌入强牌组合 → 对手在解内被迫
+/// 更尊重 hero 下注 → 弃牌率虚增 → λ=0.5 比 λ=0 还激进（river 空气 allin 0.92/0.74/0.60
+/// vs 0.46/0.91/0.53），方向直接反掉。
+fn mix_lambda_for_seat(seat: PlayerId, hero: PlayerId, lambda: f64) -> f64 {
+    if seat == hero {
+        0.0
+    } else {
+        lambda
+    }
+}
+
 fn mix_range_with_uniform(range: &mut [f64], holes: &[[Card; 2]], board: &[Card], lambda: f64) {
     let lambda = lambda.clamp(0.0, 1.0);
     if lambda <= 0.0 || range.iter().sum::<f64>() <= 0.0 {
@@ -1349,7 +1365,8 @@ pub fn subgame_search_cached(
         };
 
     // §5b range：use_blueprint_range → 为每个未弃牌座位估 marginal range（root 加权采样底牌）；
-    // 否则 None = uniform。depth-limit / 解到终局都复用这一份 ranges。
+    // 否则 None = uniform。depth-limit / 解到终局都复用这一份 ranges。对手座位做 uniform 平滑
+    // （range_uniform_mix 字段 doc），hero（auth_actor）保持原 reach（mix_lambda_for_seat doc）。
     let ranges_opt: Option<Vec<Vec<f64>>> = if cfg.use_blueprint_range {
         let holes = all_hole_combos();
         let board: Vec<Card> = root_state.board().to_vec();
@@ -1366,8 +1383,16 @@ pub fn subgame_search_cached(
                             seat as PlayerId,
                             &holes,
                         );
-                        // range 先验平滑（薄线 reach 噪声 → max-exploit 修复，字段 doc）。
-                        mix_range_with_uniform(&mut r, &holes, &board, cfg.range_uniform_mix);
+                        mix_range_with_uniform(
+                            &mut r,
+                            &holes,
+                            &board,
+                            mix_lambda_for_seat(
+                                seat as PlayerId,
+                                auth_actor,
+                                cfg.range_uniform_mix,
+                            ),
+                        );
                         r
                     } else {
                         Vec::new() // 弃牌座：range 不被读。
@@ -2737,6 +2762,10 @@ mod tests {
                 assert!((r1[hi] - expect).abs() < 1e-15, "λ={lambda} 须精确 uniform");
             }
         }
+
+        // 平滑只作用于对手：hero 座 λ 恒 0（混 hero range = 虚增弃牌率，mix_lambda_for_seat doc）。
+        assert_eq!(mix_lambda_for_seat(2, 2, 0.25), 0.0, "hero 座不混");
+        assert_eq!(mix_lambda_for_seat(1, 2, 0.25), 0.25, "对手座混 λ");
     }
 
     /// §5b range-weighted `root`：集中 range（seat0→hole k、seat1→hole m，cards disjoint 且不撞
