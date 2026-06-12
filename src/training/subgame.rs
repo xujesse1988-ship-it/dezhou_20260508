@@ -986,6 +986,172 @@ fn mix_range_with_uniform(range: &mut [f64], holes: &[[Card; 2]], board: &[Card]
 }
 
 // ===========================================================================
+// 一次性诊断 dump（POKER_SUBGAME_DEBUG=1）：排查搜索分布异常用，stderr only、不进生产输出
+// ===========================================================================
+
+/// "9d" 风格短牌名（与 OpenPoker 日志一致，便于直接比对）。
+fn dbg_card(c: Card) -> String {
+    let r = b"23456789TJQKA"[(c.to_u8() / 4) as usize] as char;
+    let s = b"cdhs"[(c.to_u8() % 4) as usize] as char;
+    format!("{r}{s}")
+}
+
+/// 给 `actor` 装候选 hole、其余已发座位装定值非冲突 filler（info_set 只读 actor 的 hole，
+/// filler 不影响读数；模式须与 template 一致——resample_hidden_with_holes 的 live 断言）。
+fn dbg_filler_holes(
+    template: &GameState,
+    actor: usize,
+    cand: [Card; 2],
+) -> Option<Vec<Option<[Card; 2]>>> {
+    let mut used: BTreeSet<u8> = template.board().iter().map(|c| c.to_u8()).collect();
+    if !used.insert(cand[0].to_u8()) || !used.insert(cand[1].to_u8()) {
+        return None; // 撞 board（range 已置 0，防御）
+    }
+    let mut pool = (0u8..52).filter(|v| !used.contains(v));
+    let mut out = Vec::with_capacity(template.players().len());
+    for (i, p) in template.players().iter().enumerate() {
+        if p.hole_cards.is_none() {
+            out.push(None);
+        } else if i == actor {
+            out.push(Some(cand));
+        } else {
+            let a = pool.next()?;
+            let b = pool.next()?;
+            out.push(Some([
+                Card::from_u8(a).expect("<52"),
+                Card::from_u8(b).expect("<52"),
+            ]));
+        }
+    }
+    Some(out)
+}
+
+/// 子树几何 + per-seat range + 浅层（深 ≤3）节点的 range 加权平均策略 dump 到 stderr。
+/// 仅 POKER_SUBGAME_DEBUG 设置时由 [`subgame_search_cached`] 调用。
+fn debug_dump_subgame(
+    solved: &SolvedSubgame,
+    root_state: &GameState,
+    ranges: Option<&[Vec<f64>]>,
+) {
+    use std::collections::VecDeque;
+    use std::fmt::Write as _;
+    let trainer = &solved.trainer;
+    let game = trainer.game();
+    let sub = game.subtree();
+    let board: String = root_state
+        .board()
+        .iter()
+        .map(|c| dbg_card(*c) + " ")
+        .collect();
+    eprintln!(
+        "[subgame-debug] nodes={} updates={} street={:?} pot={:?} board={}",
+        sub.num_nodes(),
+        trainer.update_count(),
+        root_state.street(),
+        root_state.pot(),
+        board
+    );
+    for (seat, p) in root_state.players().iter().enumerate() {
+        eprintln!(
+            "[subgame-debug] seat{seat} status={:?} stack={:?} committed_total={:?} dealt={}",
+            p.status,
+            p.stack,
+            p.committed_total,
+            p.hole_cards.is_some()
+        );
+    }
+    let holes = all_hole_combos();
+    let Some(ranges) = ranges else {
+        eprintln!("[subgame-debug] ranges=None (uniform)");
+        return;
+    };
+    for (seat, r) in ranges.iter().enumerate() {
+        if r.is_empty() {
+            continue;
+        }
+        let mut idx: Vec<usize> = (0..r.len()).filter(|&i| r[i] > 0.0).collect();
+        idx.sort_by(|&a, &b| r[b].total_cmp(&r[a]));
+        let eff = 1.0 / r.iter().map(|w| w * w).sum::<f64>();
+        let mut top = String::new();
+        for &i in idx.iter().take(25) {
+            let _ = write!(
+                top,
+                "{}{}:{:.4} ",
+                dbg_card(holes[i][0]),
+                dbg_card(holes[i][1]),
+                r[i]
+            );
+        }
+        eprintln!(
+            "[subgame-debug] range seat{seat}: combos={} eff={eff:.1} top25: {top}",
+            idx.len()
+        );
+    }
+    // 浅层 BFS：每个决策节点 actor 的 range 加权平均策略（看「对手面对 jam 弃多少」之类的总量）。
+    let mut rng = ChaCha20Rng::from_seed(0xDEB6_0001);
+    let mut queue: VecDeque<(NodeId, String, usize)> = VecDeque::new();
+    queue.push_back((sub.root_id(), "root".to_string(), 0));
+    let mut printed = 0usize;
+    while let Some((id, path, depth)) = queue.pop_front() {
+        if printed >= 40 {
+            break;
+        }
+        let node = sub.node(id);
+        let actor = node.player_acting as usize;
+        let r = match ranges.get(actor) {
+            Some(r) if !r.is_empty() => r,
+            _ => continue,
+        };
+        let n = node.legal_actions.len();
+        let mut acc = vec![0.0_f64; n];
+        let mut vis_w = 0.0_f64;
+        let mut unvis_w = 0.0_f64;
+        for (hi, hole) in holes.iter().enumerate() {
+            let w = r[hi];
+            if w <= 0.0 {
+                continue;
+            }
+            let Some(hv) = dbg_filler_holes(root_state, actor, *hole) else {
+                unvis_w += w;
+                continue;
+            };
+            let st = root_state.resample_hidden_with_holes(&hv, &mut rng);
+            let (info, _) = game.query_at(id, &st);
+            let avg = trainer.average_strategy(&info);
+            if avg.len() == n {
+                let s: f64 = avg.iter().sum();
+                if s > 0.0 {
+                    for (a, v) in acc.iter_mut().zip(avg.iter()) {
+                        *a += w * v / s;
+                    }
+                    vis_w += w;
+                    continue;
+                }
+            }
+            unvis_w += w;
+        }
+        let mut line = String::new();
+        if vis_w > 0.0 {
+            for (tag, a) in node.legal_actions.iter().zip(acc.iter()) {
+                let _ = write!(line, "{tag:?}:{:.3} ", a / vis_w);
+            }
+        }
+        eprintln!(
+            "[subgame-debug] node {path} (id={id} actor=seat{actor} street={:?}) visited_w={vis_w:.3} unvisited_w={unvis_w:.3} avg: {line}",
+            node.street
+        );
+        printed += 1;
+        if depth < 3 {
+            for (tag, ch) in node.legal_actions.iter().zip(node.children.iter()) {
+                if let Child::Decision(next) = ch {
+                    queue.push_back((*next, format!("{path}->{tag:?}"), depth + 1));
+                }
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // within-round solve 缓存（exec 文档 §6 #2：「每轮恰好一个 solve」落到常驻 advisor）
 // ===========================================================================
 
@@ -1404,6 +1570,13 @@ pub fn subgame_search_cached(
         None
     };
 
+    // 一次性诊断（POKER_SUBGAME_DEBUG=1）：ranges_opt 即将 move 进 build_and_solve，先克隆。
+    let dbg_ranges: Option<Vec<Vec<f64>>> = if std::env::var_os("POKER_SUBGAME_DEBUG").is_some() {
+        ranges_opt.clone()
+    } else {
+        None
+    };
+
     // 缺口③（§2.1 / §3.2）：deep_menu → 子树下注菜单按根 SPR 自适应（deep_menu_for：深 SPR =
     // {1pot} 单档控树 / 浅 SPR 且 ≤3 Active = {0.5,1} 两档，v2 细化），把深码 / 多人解到终局的树压到可解；
     // 与 blueprint 菜单解耦不引偏差（桶表按 cards/board 归桶、与菜单无关，建树与运行期
@@ -1511,6 +1684,9 @@ pub fn subgame_search_cached(
         }
     };
     let trainer = &solved.trainer;
+    if std::env::var_os("POKER_SUBGAME_DEBUG").is_some() {
+        debug_dump_subgame(solved, root_state, dbg_ranges.as_deref());
+    }
 
     // 导航到当前决策点（CurrentDecision / round-start 首决策点 tags 空 → root），用 auth 几何读
     // 真实手在落点的平均策略（actor 校验 + 维度检查见 read_current_strategy）。
