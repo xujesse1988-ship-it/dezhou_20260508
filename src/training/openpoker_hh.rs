@@ -13,9 +13,12 @@
 //! 3. **结算映射（live 校准 2026-06-11）**：本手**发牌座位 = `final_stacks` 的键**（真实桌常
 //!    短桌：6 座只发 4 家，盲注跳过空座）→ 整手重映射到 0..n_dealt 紧凑 ring（driver 按满桌
 //!    猜的盲注/`stacks_start` 在短桌手必错、被忽略）。`U = (final_stacks[我] − hand_start[我])
-//!    × scale`；hand-start 真栈：满桌且 driver 已回推 → 取 `stacks_start`，否则按 **net 结算
-//!    约定**重建（实测 `winners.amount` = 净赢：赢家 start = final − Σamount、非赢家 =
-//!    final + 盲注 + Σ`contribution_delta`）。错值会被
+//!    × scale`；hand-start 真栈分两层：先按回推路给底值——满桌且 driver 已回推 → 取
+//!    `stacks_start`，否则按 **net 结算约定**重建（实测 `winners.amount` = 净赢：赢家 start =
+//!    final − Σamount、非赢家 = final + 盲注 + Σ`contribution_delta`）——再用
+//!    `actions_ext.stack_before` **直读逐座覆盖**（U-fail 修复 2026-06-12：座位首动作前投入
+//!    恒 = 盲注 → start = stack_before + 盲注，权威值，关掉两条回推路的 all-in 缺口）。
+//!    残余错值仍被
 //!    [`MultiwayAivatEstimator`](crate::training::aivat_multiway::MultiwayAivatEstimator)
 //!    的 U 重放校验 loud 拦下，不会静默给偏样本。
 //!
@@ -102,11 +105,15 @@ pub struct HhHandResult {
 
 /// `actions_ext` 条目（driver 平行落的 player_action 原始字段子集；只解析要用的——
 /// `contribution_delta` = 该动作的真实投入增量，重建 hand-start 真栈用，比 driver 自跟
-/// committed 可靠：driver 盲注 seeding 按满桌 (btn+1/+2) 推、**短桌手必错**）。
+/// committed 可靠：driver 盲注 seeding 按满桌 (btn+1/+2) 推、**短桌手必错**；
+/// `stack_before` = 该动作前该座真实剩余栈（服务端权威），hand-start 直读覆盖用
+/// （U-fail 修复 2026-06-12，见 [`hh_to_multiway_input`] 栈重建段）。
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct HhActionExt {
     #[serde(default)]
     pub contribution_delta: Option<f64>,
+    #[serde(default)]
+    pub stack_before: Option<f64>,
 }
 
 /// 一手 HH JSONL 记录（driver `HandState::hh_record` 口径；未列字段 serde 忽略）。
@@ -248,7 +255,15 @@ pub fn hh_to_multiway_input(rec: &HhRecord) -> Result<HhConverted, String> {
     // 缺 delta 时满桌退 driver committed_total，短桌无可退 → Err）。
     // 已知角落：bet 被 all-in-for-less 跟注后的超额返还不在 delta 里（非赢家 start 高估）→
     // 被估计器 U 重放校验 loud 拦下（计数，不静默偏样本）。
-    let start_op: Vec<u64> = match &rec.stacks_start {
+    // 两条回推路之上还有 stack_before 直读逐座覆盖，见下方 override 段。
+    if !rec.actions_ext.is_empty() && rec.actions_ext.len() != rec.actions.len() {
+        return Err(format!(
+            "actions_ext 长度 {} ≠ actions {}",
+            rec.actions_ext.len(),
+            rec.actions.len()
+        ));
+    }
+    let mut start_op: Vec<u64> = match &rec.stacks_start {
         Some(ss) if n_dealt == n => {
             if ss.len() != n {
                 return Err(format!("stacks_start 长度 {} ≠ {n}", ss.len()));
@@ -259,13 +274,6 @@ pub fn hh_to_multiway_input(rec: &HhRecord) -> Result<HhConverted, String> {
                 .collect::<Result<_, _>>()?
         }
         _ => {
-            if !rec.actions_ext.is_empty() && rec.actions_ext.len() != rec.actions.len() {
-                return Err(format!(
-                    "actions_ext 长度 {} ≠ actions {}",
-                    rec.actions_ext.len(),
-                    rec.actions.len()
-                ));
-            }
             let mut contributed: Vec<f64> = (0..n_dealt)
                 .map(|j| {
                     if j == sb_new {
@@ -315,6 +323,37 @@ pub fn hh_to_multiway_input(rec: &HhRecord) -> Result<HhConverted, String> {
                 .collect::<Result<_, _>>()?
         }
     };
+    // ---- stack_before 直读逐座覆盖（U-fail 修复 2026-06-12，基线臂发现①）----
+    // 服务端 `player_action.stack_before` = 该动作前该座真实剩余栈（OP 单位、权威）。任一座
+    // **首个动作**前的投入恒 = 自己的盲注（任何更多投入都必经一次动作）→ start =
+    // stack_before(首动作) + 盲注。两条回推路都有已知缺口（driver stacks_start 的 committed
+    // 跟踪在 all_in 无 amount 线漏记 = 基线 5 手 +533BB 大锅 U-fail 根因；net 结算回推在
+    // bet 被 all-in-for-less 跟注的超额返还角落高估），直读没有。缺 ext（旧日志）/ 无动作
+    // 的座（walk / 盲注全下）维持原回推；盲注全下座 posted < 盲注但它必无动作、不会被
+    // 错误加回整额盲注。
+    {
+        let mut seen = vec![false; n_dealt];
+        for (i, h) in rec.actions.iter().enumerate() {
+            let j = remap(h.seat as usize)?;
+            if seen[j] {
+                continue;
+            }
+            seen[j] = true;
+            if let Some(sb_val) = rec.actions_ext.get(i).and_then(|e| e.stack_before) {
+                let blind = if j == sb_new {
+                    rec.small_blind as f64
+                } else if j == bb_new {
+                    rec.big_blind as f64
+                } else {
+                    0.0
+                };
+                start_op[j] = to_chip(
+                    sb_val + blind,
+                    &format!("stack_before 直读 start[seat{}]", h.seat),
+                )?;
+            }
+        }
+    }
 
     let config = TableConfig {
         n_seats: n_dealt as u8,
@@ -497,6 +536,76 @@ mod tests {
         assert_eq!(r.n_runout_completions, 44);
         assert_eq!(r.aivat, r.raw - r.c_runout);
         assert!(r.c_runout.abs() < 10_000.0 + 1e-9);
+    }
+
+    /// U-fail 修复（2026-06-12，基线臂发现①）：all-in-for-less 大锅 + driver `stacks_start`
+    /// 对短码对手错值（committed 跟踪的 all_in 缺口）→ `actions_ext.stack_before` 直读覆盖修正
+    /// （首动作前投入恒 = 盲注：SB 座 990+10=1000）。**负对照**：剥掉 stack_before（模拟旧日志）
+    /// → 沿用错的 stacks_start → 估计器 U 重放校验必 `Err`（= 基线 5 手 +533BB 被剔的机制）；
+    /// 正路径转换 + 估计全过且 start 取直读值。两边都断言，证 override 真在修这个 bug。
+    #[test]
+    fn allin_for_less_stack_before_override_fixes_ufail() {
+        // 真值：SB(1) 实际 1000 起手、turn all-in-for-less；BB(2,我) 2000 起手 call 后摊牌胜。
+        // driver stacks_start 把 seat1 错记成 1280（all_in 无 amount 的 committed 缺口）。
+        let line = r#"{
+          "button_seat": 0, "my_seat": 2, "num_seats": 6,
+          "small_blind": 10, "big_blind": 20,
+          "hole": ["Ah", "Kd"],
+          "board": ["7h", "2c", "Ks", "5d", "9c"],
+          "actions": [
+            {"seat": 3, "action": "fold"}, {"seat": 4, "action": "fold"},
+            {"seat": 5, "action": "fold"}, {"seat": 0, "action": "fold"},
+            {"seat": 1, "action": "call"}, {"seat": 2, "action": "check"},
+            {"seat": 1, "action": "check"}, {"seat": 2, "action": "check"},
+            {"seat": 1, "action": "all_in"}, {"seat": 2, "action": "call"}
+          ],
+          "actions_ext": [
+            {"stack_before": 2000, "contribution_delta": 0},
+            {"stack_before": 2000, "contribution_delta": 0},
+            {"stack_before": 2000, "contribution_delta": 0},
+            {"stack_before": 2000, "contribution_delta": 0},
+            {"stack_before": 990, "contribution_delta": 10},
+            {"stack_before": 1980, "contribution_delta": 0},
+            {"stack_before": 980, "contribution_delta": 0},
+            {"stack_before": 1980, "contribution_delta": 0},
+            {"stack_before": 980, "contribution_delta": 980},
+            {"stack_before": 1980, "contribution_delta": 980}
+          ],
+          "stacks_start": [2000, 1280, 2000, 2000, 2000, 2000],
+          "committed_total": {"0": 0, "1": 1000, "2": 1000, "3": 0, "4": 0, "5": 0},
+          "hand_result": {
+            "winners": [{"seat": 2, "amount": 1000}],
+            "pot": 2000,
+            "final_stacks": {"0": 2000, "1": 0, "2": 3000, "3": 2000, "4": 2000, "5": 2000},
+            "shown_cards": {"1": ["Qs", "Qd"], "2": ["Ah", "Kd"]}
+          }
+        }"#;
+        let rec: HhRecord = serde_json::from_str(line).expect("parse");
+        let conv = hh_to_multiway_input(&rec).expect("convert");
+        // override 生效：seat1 = 990+10(SB)=1000、我(BB) = 1980+20=2000（×5 solver 单位）。
+        assert_eq!(conv.input.config.starting_stacks[1].as_u64(), 5_000);
+        assert_eq!(conv.input.config.starting_stacks[2].as_u64(), 10_000);
+        assert_eq!(conv.input.winnings, 5_000, "净 +1000 op × 5");
+        let est = MultiwayAivatEstimator::new(None);
+        let r = est.estimate_hand(&conv.input).expect("estimate");
+        assert_eq!(r.raw, 5_000.0);
+        assert!(r.has_runout, "turn 锁定 → river 纯发牌段");
+
+        // 负对照：剥 stack_before（旧日志形态）→ 退错的 stacks_start → U 重放校验必拦。
+        let mut rec_old = rec.clone();
+        for e in rec_old.actions_ext.iter_mut() {
+            e.stack_before = None;
+        }
+        let conv_old = hh_to_multiway_input(&rec_old).expect("convert（错 start 在估计层才暴露）");
+        assert_eq!(
+            conv_old.input.config.starting_stacks[1].as_u64(),
+            6_400,
+            "无直读 → 沿用 driver 错值 1280×5"
+        );
+        let err = est
+            .estimate_hand(&conv_old.input)
+            .expect_err("错 start 必被 U 重放校验拦下");
+        assert!(err.contains("U 校验"), "应是 U 校验失败，实得: {err}");
     }
 
     /// HU 短桌手（live 2026-06-11 smoke 真实手 9d818d2b 的数字）：OpenPoker HU 是环规则
