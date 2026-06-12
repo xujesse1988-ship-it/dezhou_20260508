@@ -1262,6 +1262,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             trigger: search_trigger,
             lcfr: search_lcfr,
             time_budget: search_time_budget_ms.map(Duration::from_millis),
+            // 一次性诊断 A/B（POKER_SUBGAME_UNIFORM=1）：range 先验退 uniform（对照 blueprint
+            // reach），排查搜索分布异常用。
+            use_blueprint_range: std::env::var_os("POKER_SUBGAME_UNIFORM").is_none(),
             // 缺口③：深码窄菜单——子树下注菜单收到单一 {1pot}（深码 / 多人解到终局控树，§2.1）。
             deep_menu: search_deep_menu,
             // 缺口①续（限时杠杆②）：traverser 只轮子树根仍 Active 的座（弃牌/all-in 座零学习
