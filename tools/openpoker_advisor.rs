@@ -54,7 +54,8 @@
 //!
 //! - 码深 ≠ 100BB 且**未开搜索 / 未触发**：solver 树/SPR 都按 100BB 解；real `GameState` 用
 //!   `default_6max_100bb`（10000 筹码）近似，driver 靠买入锁 2000 + 栈漂出 [80,125]BB leave/rejoin 兜。
-//! - 对手 open-limp：no-limp blueprint 无对应节点 → 走兜底（见上）。
+//! - 对手 open-limp：no-limp blueprint 无对应节点 → preflop 走 [`limp_heuristic`] 矩阵
+//!   （好牌 iso-raise / 顶级面对加注 call / 其余免费 check 或 fold）；postflop 由脱锚搜索接管。
 //! - 短桌手（6 座只发 k<6 家）：driver 送 `dealt_seats`（`table_state.seats[].in_hand` 推断）时
 //!   走**幻影座映射**（[`seat_map`]：k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的真实节点、
 //!   盲注对齐；k=2 按 OpenPoker 实测 HU 约定 button=BB 映 SB/BB→树座 1/2）；占座不可判
@@ -466,6 +467,13 @@ fn decide(
                     );
                 }
             }
+            // preflop open-limp 结构 gap → 启发式矩阵（[`limp_heuristic`]）；历史无 limp 的
+            // 其他结构 gap / 其余 desync 原因维持原兜底。
+            if reason == "structural_gap" && board.is_empty() {
+                if let Some(resp) = limp_heuristic(req, hole) {
+                    return resp;
+                }
+            }
             return safe_fallback(&req.valid, &reason);
         }
     };
@@ -651,6 +659,97 @@ fn search_giveup(valid: &ValidActions, reason: &str) -> Response {
         source: format!("search_giveup:{reason}"),
         ..Default::default()
     }
+}
+
+// ===========================================================================
+// preflop open-limp 池启发式（结构 gap 残余收口，2026-06-12 矩阵）
+// ===========================================================================
+
+/// 手牌档位（169 类，写死常识集合）：`2` = P 档（AA KK QQ AKs AKo，面对加注继续）；
+/// `1` = S∖P（JJ TT 99 / AQs AJs ATs KQs / AQo，连同 P 构成 iso-raise 档 ≈ 前 9%）；`0` = 其余。
+fn limp_hand_tier(hole: [Card; 2]) -> u8 {
+    use poker::Rank::{Ace, King, Nine, Queen, Ten};
+    let (mut hi, mut lo) = (hole[0].rank(), hole[1].rank());
+    if hi < lo {
+        std::mem::swap(&mut hi, &mut lo);
+    }
+    let suited = hole[0].suit() == hole[1].suit();
+    let pair = hi == lo;
+    if (pair && hi >= Queen) || (hi == Ace && lo == King) {
+        return 2;
+    }
+    let s = (pair && hi >= Nine)
+        || (hi == Ace && lo == Queen)
+        || (hi == Ace && lo >= Ten && suited)
+        || (hi == King && lo == Queen && suited);
+    if s {
+        1
+    } else {
+        0
+    }
+}
+
+/// preflop open-limp 池启发式：blueprint 树不含 open-limp 节点（no-limp 抽象），preflop 撞
+/// `structural_gap` 后原兜底（check-when-free/fold）会把 JJ@BB 这类好牌白扔。preflop 子树
+/// 搜索（建树规模）与 limp 线重训（树预算）均不可行 → 显式启发式收口，职责一句话：
+/// **别把好牌扔掉、别用烂牌烧钱，把局面送进 flop 交给脱锚搜索**（limp 池 postflop 已由
+/// [`subgame_search_unanchored`] 接管）。
+///
+/// 矩阵（档位见 [`limp_hand_tier`]）：
+/// - **没人加注**：S（tier≥1）→ iso-raise to `(4+limper 数)×BB`（clamp 进 [min,max]）；
+///   其余 can_check（BB）→ check 免费，否则 fold（SB 损 0.5BB 死盲认了）。
+/// - **有人加注**（含 hero 启发式 raise 后被 re-raise 又轮回——同分支处理，递归自然终止）：
+///   P（tier==2）→ call（不设金额 cap，对 bot 池先收数据再调）；其余 → fold。
+///
+/// 返回 `None` = 历史里没有 open-limp（其他结构 gap 误入的防御）→ caller 维持原兜底。
+/// `source = limp_heuristic:{raise,check,call,fold}`（driver 单独分桶，不混 blueprint/search）。
+fn limp_heuristic(req: &Request, hole: [Card; 2]) -> Option<Response> {
+    let mut limps = 0u64;
+    let mut raised = false;
+    for h in &req.actions {
+        match h.action.as_str() {
+            "call" if !raised => limps += 1, // 首个 raise 前的 call = open-limp / over-limp
+            "raise" | "all_in" | "bet" => raised = true,
+            _ => {}
+        }
+    }
+    if limps == 0 {
+        return None;
+    }
+    let tier = limp_hand_tier(hole);
+    let valid = &req.valid;
+    let mk = |action: &str, amount: Option<u64>, case: &str| Response {
+        action: action.into(),
+        amount,
+        source: format!("limp_heuristic:{case}"),
+        street: Some("preflop".into()),
+        ..Default::default()
+    };
+    if !raised {
+        if tier >= 1 && valid.can_raise {
+            if let (Some(min), Some(max)) = (valid.min_raise, valid.max_raise) {
+                if min <= max {
+                    // OpenPoker raise amount = 总 to 额；脏区间（min>max）走下面被动分支。
+                    let to = (4 + limps) * req.big_blind;
+                    return Some(mk("raise", Some(to.clamp(min, max)), "raise"));
+                }
+            }
+        }
+        // 非 S 档（或 raise 不可用的防御）：BB 免费 check，否则 fold。
+        return Some(if valid.can_check {
+            mk("check", None, "check")
+        } else {
+            mk("fold", None, "fold")
+        });
+    }
+    if tier == 2 && valid.can_call {
+        return Some(mk("call", None, "call"));
+    }
+    Some(if valid.can_check {
+        mk("check", None, "check") // 防御（preflop 面对加注不该 can_check）
+    } else {
+        mk("fold", None, "fold")
+    })
 }
 
 /// 缺口②：在**真码深** config 上重放本手 → 注入真实牌，产 `(auth, round_start, within)` 喂
@@ -1329,15 +1428,16 @@ mod tests {
     }
 
     /// 结构性 gap：对手 UTG open-limp（call to=20）→ nolimp blueprint 影子无对应节点 →
-    /// 兜底（source=fallback:structural_gap、动作合法），不 panic、不静默乱出。
+    /// preflop 走 [`limp_heuristic`] 矩阵（2026-06-12）。**没人加注**分支三格：S 档 iso-raise
+    /// to (4+limper 数)×BB、非 S 档 BB 免费 check、非 S 档非盲位 fold。
     #[test]
-    fn opponent_open_limp_into_nolimp_falls_back() {
+    fn opponent_open_limp_heuristic_no_raise_cells() {
         let game = nolimp_game();
         let abs = game.abstraction().clone();
         let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
         // my_seat=4(HJ)；UTG(3) open-limp call to=20 → 我(HJ) 决策时重放撞 gap。
-        let req = Request {
-            hole: vec!["Ah".into(), "Kd".into()],
+        let make = |hole: [&str; 2], valid: ValidActions| Request {
+            hole: vec![hole[0].into(), hole[1].into()],
             board: vec![],
             button_seat: 0,
             my_seat: 4,
@@ -1349,21 +1449,107 @@ mod tests {
                 action: "call".into(),
                 to: Some(20),
             }],
+            valid,
+            stacks: vec![],
+            dealt_seats: vec![],
+        };
+        let decide_one = |req: &Request| {
+            decide(
+                &game,
+                &abs,
+                &uniform,
+                req,
+                1,
+                None,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        // S 档（AKo）→ iso-raise to (4+1)×20=100。
+        let req = make(["Ah", "Kd"], full_valid());
+        let resp = decide_one(&req);
+        assert_eq!(resp.source, "limp_heuristic:raise", "得 {resp:?}");
+        assert_eq!(resp.amount, Some(100), "iso 尺寸 (4+1)×BB，得 {resp:?}");
+        assert!(is_legal(&resp, &req.valid), "须合法，得 {resp:?}");
+        // 非 S 档（72o）非盲位（can_check=false）→ fold。
+        let resp = decide_one(&make(["7h", "2d"], full_valid()));
+        assert_eq!(resp.source, "limp_heuristic:fold", "得 {resp:?}");
+        assert_eq!(resp.action, "fold");
+        // 非 S 档 BB（can_check=true）→ 免费 check，绝不 fold。
+        let bb_valid = ValidActions {
+            can_check: true,
+            ..full_valid()
+        };
+        let resp = decide_one(&make(["7h", "2d"], bb_valid));
+        assert_eq!(resp.source, "limp_heuristic:check", "得 {resp:?}");
+        assert_eq!(resp.action, "check");
+        // 历史无 limp → 启发式不接（None 防御）；构造不出无 limp 的 preflop 结构 gap，
+        // 直接钉 limp_heuristic 单元行为。
+        let mut nl = make(["Ah", "Kd"], full_valid());
+        nl.actions.clear();
+        assert!(
+            limp_heuristic(&nl, [parse_card("Ah").unwrap(), parse_card("Kd").unwrap()]).is_none(),
+            "无 limp 历史须返回 None → 维持原兜底"
+        );
+    }
+
+    /// [`limp_heuristic`] **有人加注**分支（含 hero raise 后被 re-raise 的递归终止格）：
+    /// P 档 call、S∖P fold、烂牌 fold。
+    #[test]
+    fn opponent_limp_raise_heuristic_vs_raise_cells() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        // UTG(3) limp → CO(5) raise to 120 → 我(BTN=0) 面对加注。
+        let make = |hole: [&str; 2]| Request {
+            hole: vec![hole[0].into(), hole[1].into()],
+            board: vec![],
+            button_seat: 0,
+            my_seat: 0,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                HistAction {
+                    seat: 3,
+                    action: "call".into(),
+                    to: Some(20),
+                },
+                HistAction {
+                    seat: 4,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 5,
+                    action: "raise".into(),
+                    to: Some(120),
+                },
+            ],
             valid: full_valid(),
             stacks: vec![],
             dealt_seats: vec![],
         };
-        let resp = decide(
-            &game,
-            &abs,
-            &uniform,
-            &req,
-            1,
-            None,
-            &mut SubgameSolveCache::new(),
-        );
-        assert!(resp.source.starts_with("fallback:"), "应兜底，得 {resp:?}");
-        assert!(is_legal(&resp, &req.valid), "兜底动作须合法，得 {resp:?}");
+        let decide_one = |req: &Request| {
+            decide(
+                &game,
+                &abs,
+                &uniform,
+                req,
+                1,
+                None,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        // P 档（AA）→ call（不设金额 cap）。
+        let resp = decide_one(&make(["As", "Ad"]));
+        assert_eq!(resp.source, "limp_heuristic:call", "得 {resp:?}");
+        assert_eq!(resp.action, "call");
+        // S∖P（JJ）→ fold（iso 档面对加注不继续）。
+        let resp = decide_one(&make(["Jh", "Jc"]));
+        assert_eq!(resp.source, "limp_heuristic:fold", "得 {resp:?}");
+        // 烂牌（94o）→ fold。
+        let resp = decide_one(&make(["9h", "4c"]));
+        assert_eq!(resp.source, "limp_heuristic:fold", "得 {resp:?}");
     }
 
     /// 非 6 人桌 → 兜底（不崩）。
@@ -1977,7 +2163,8 @@ mod tests {
     }
 
     /// 影子失同步但 **preflop**（结构 gap：open-limp 进 nolimp）：即便开 `--search` 也不搜
-    /// （preflop 走 blueprint 的 gating 不变，§1）→ 与 search=None 完全相同的旧兜底（byte-equal）。
+    /// （preflop 走 blueprint 的 gating 不变，§1）→ 与 search=None 完全相同的处理（byte-equal；
+    /// 2026-06-12 起两边都走 [`limp_heuristic`]，启发式与搜索开关无关）。
     #[test]
     fn preflop_shadow_gap_with_search_still_falls_back() {
         let game = nolimp_game();
@@ -2026,9 +2213,12 @@ mod tests {
         );
         assert_eq!(
             off, on,
-            "preflop 影子失同步：开关搜索须 byte-equal（都旧兜底）"
+            "preflop 影子失同步：开关搜索须 byte-equal（都走 limp 启发式）"
         );
-        assert!(on.source.starts_with("fallback:"), "得 {on:?}");
+        assert_eq!(
+            on.source, "limp_heuristic:raise",
+            "preflop limp 池 S 档（AKo）→ iso-raise，得 {on:?}"
+        );
     }
 
     /// **limp 池进搜索**（脱影子的重要副作用，S5 结构 gap 在触发区收口）：UTG open-limp 在

@@ -345,8 +345,8 @@ class Session:
         self.log_f = log_f
         self.hh_f = hh_f
         self.counters = {"hands": 0, "decisions": 0, "blueprint": 0, "search": 0,
-                         "fallback": 0, "net_chips": 0, "hh_hands": 0, "hh_skipped": 0,
-                         "watchdog_rejoins": 0}
+                         "limp_heuristic": 0, "fallback": 0, "net_chips": 0,
+                         "hh_hands": 0, "hh_skipped": 0, "watchdog_rejoins": 0}
         self.state = {"hand": None, "table_id": None, "last_seq": 0}
         self.client_action_id = [0]
         # 看门狗（run_real 的后台线程读写）：最近一次 hand_result / 任意消息的时刻 + 当前 ws。
@@ -466,13 +466,16 @@ class Session:
             resp = {"action": "fold", "source": "fallback:advisor_exception"}
         self.counters["decisions"] += 1
         # source 分桶（缺口②）：blueprint=blueprint 策略；search=实时搜索解出（含脱影子
-        # search:unanchored，缺口②续）；fallback=兜底（blueprint 结构性 fallback:* + 搜索解不出来
-        # search_giveup:* 都算「兜底」§4.1 护栏）。注意顺序：search_giveup 也以 "search" 开头，先判兜底。
+        # search:unanchored，缺口②续）；limp_heuristic=preflop open-limp 池启发式矩阵；
+        # fallback=兜底（blueprint 结构性 fallback:* + 搜索解不出来 search_giveup:* 都算「兜底」
+        # §4.1 护栏）。注意顺序：search_giveup 也以 "search" 开头，先判兜底。
         src = str(resp.get("source", ""))
         if src.startswith("fallback") or src.startswith("search_giveup"):
             self.counters["fallback"] += 1
         elif src.startswith("search"):
             self.counters["search"] += 1
+        elif src.startswith("limp_heuristic"):
+            self.counters["limp_heuristic"] += 1
         else:
             self.counters["blueprint"] += 1
         self.client_action_id[0] += 1
@@ -591,7 +594,8 @@ def _report(counters):
     d = counters["decisions"]
     fb = counters["fallback"]
     print(f"hands={counters['hands']} decisions={d} "
-          f"blueprint={counters['blueprint']} search={counters.get('search', 0)} fallback={fb} "
+          f"blueprint={counters['blueprint']} search={counters.get('search', 0)} "
+          f"limp_heuristic={counters.get('limp_heuristic', 0)} fallback={fb} "
           f"({100.0 * fb / d if d else 0:.1f}% 兜底) "
           f"hh={counters.get('hh_hands', 0)}(+{counters.get('hh_skipped', 0)} skipped) "
           f"watchdog_rejoins={counters.get('watchdog_rejoins', 0)}",
