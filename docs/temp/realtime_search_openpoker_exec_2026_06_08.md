@@ -304,7 +304,11 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
    - **v2 两细化已落地（2026-06-10，commit `2c29df4`→`f1e0455`，vultr 全绿）**：
      ②**SPR + 人数自适应菜单宽度**（`deep_menu_for`，纯函数——`subgame_search*` 选子树菜单与 advisor outgoing 必须各自重算出
      **同一**菜单，否则 0.5pot 档在 {1pot} 抽象下塌成 all-in = 错动作）：浅 SPR（第二大 Active 剩余栈 ≤ 4×pot）**且 ≤3 Active**
-     → `{0.5,1}` 两档（`deep_wide_half_pot`，first-bet-small 口径）；否则维持 {1pot}。**人数闸是 vultr 首跑实测逼出来的**：
+     → `{0.5,1}` 两档（`deep_wide_half_pot`）；否则维持 {1pot}。**v3（2026-06-12，commit `4893af9`，用户拍板）：宽档 0.5pot
+     从 first-bet-small 口径放开到全层级（含 re-raise，`drop_small_reraise` 关）**——浅 SPR 小树付得起（3-way 13BB 恰边界子树
+     2,928→4,794 节点 = 1.64×，离 200k 护栏 40×，建树 ~12ms），且 live 发现②的 min-raise 粒度税正中 re-raise 档过粗（对手
+     min-raise 映成 ≥0.5pot 后我方回应只剩 {1pot,all-in} 更糙）；深 SPR / >3 Active 的 {1pot} 单档与 deep_menu=false（当前
+     live 臂配置）不受影响。**人数闸是 vultr 首跑实测逼出来的**：
      6-way 25BB 恰边界宽档子树 = **558,360 节点 vs {1pot} 27,108（20.6×）**——多人加宽是乘性爆炸、单建树 ~1.5s 吃掉 5s 预算
      大半；live 浅码池最常见形态本就是 fold 剩 2–3 家的小池，4+way 浅码维持 {1pot}。3-way 13BB 边界树大小测试钉死 + 200k 绝对护栏。
      ③**deep_menu 配 `AllPostflop` 的 within-round 导航**：deep 菜单 ≠ blueprint 菜单 → blueprint tags 在子树上必失配，mid-round
