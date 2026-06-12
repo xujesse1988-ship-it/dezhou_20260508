@@ -4950,6 +4950,11 @@ mod tests {
     /// `_measure_convergence_calibration` 同款 500/500/500，vultr 已有；per-hand 真桶 →
     /// 每 update 计算更重 / 合并占比更小 = 接近生产）。两档都打（真表打不开只打 stub 档），
     /// 只打印不断言比值（吞吐受机器负载影响，结论留给读数）。
+    ///
+    /// **实测（2026-06-12 vultr，4 vCPU = 2 物理核 ×SMT2）**：真表 1s 预算 update
+    /// 3.8k→4.8k→7.3k/s @1/2/4t = **×1.92@4t ≈ 该机 SMT 上限**（2 物理核 ×~1.2 SMT 增益
+    /// ≈ ×2.4 理论顶）；stub 档 ×1.2@4t（2t 倒挂 ≈1.0，合并密度放大实锤悲观下界）。物理核
+    /// 多的部署机按 `step_parallel` 在 blueprint 训练已验证的曲线涨（c6a.8xlarge 32t 8–10×）。
     #[test]
     #[ignore]
     fn _measure_solve_threads_throughput() {

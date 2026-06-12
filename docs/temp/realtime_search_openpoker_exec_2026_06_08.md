@@ -615,8 +615,13 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
 3. **多人 >3 没有免费的好处**：实时解 N-way 吃时限 / 难度——窄树（{1pot}）在多人下仍大，5s 内解到有用迭代数是核数的函数（§2.3 / §4 步 A②）。
 4. **限时（深码×多人已部分实测，commit `31cf7ab`）**：深码×多人树 5s 可解性已测——**真约束是单线程**建树**时间，非迭代吞吐、
    非内存**（6-way 500BB 建树 20.4s ≫ 5s；5s 可行前沿 = 3/4-way 全码深 + 5-way ≤400BB + 6-way ≤150BB，见 §4.1 A② 续）。这**修正**了
-   「wall 是核数的函数」：建树**单线程** → wall 的建树部分**不随核数缩放**、只随单核速度（求解部分若并行才吃核数）；6-way 深码要进 5s
-   靠 **build 侧优化**（并行 / 增量 apply），换核数无用。仍要在目标部署机上实测、不拿测试机数当部署结论。限时求解用墙钟 anytime
+   「wall 是核数的函数」：建树**单线程** → wall 的建树部分**不随核数缩放**、只随单核速度；6-way 深码要进 5s
+   靠 **build 侧优化**（并行 / 增量 apply），换核数无用。**求解部分并行已落地（2026-06-12，commit `54912f9`→`dcde638`）**：
+   `SubgameSearchConfig::solve_threads` 接 blueprint 训练同一条 `EsMccfrTrainer::step_parallel`（advisor
+   `--search-solve-threads`、driver 透传；默认 1 = 单线程 byte-equal，进 solve 缓存 key），同预算 update ≈ ×物理核数——
+   「按核数外推」对 solve 现在成立、对 build 仍不成立。vultr 实测（4 vCPU = 2 物理核 ×SMT2，真 500 桶表 1s 预算）：
+   update ×1.92@4t ≈ 该机 SMT 上限；动机 = deep_menu 加宽下注档（infoset 乘性变多 → per-bucket 样本变稀）用并行换回采样密度。
+   仍要在目标部署机上实测、不拿测试机数当部署结论。限时求解用墙钟 anytime
    （解到时限就停），它和 byte-equal 互斥——限时求解做不到 byte-equal 也不强求（§2.3），靠 seeded-RNG + replay/AIVAT 可复现。
    **5s 解不出来 → 收时限范围 / 换更强单核 / build 优化**是 §4.1 步 A② / B / C 的明确决策点，不能默默当作做到了。
 5. **验证闭环慢且脆**：放弃自对弈真值后，核心区离线只剩**结构性正确**（守恒 / byte-equal / PokerKit / 实时解≈离线CFR /
@@ -666,7 +671,8 @@ A①引擎在深码 / 不对称 / 多人 side-pot 上经 `build_subtree` 守恒 
 可建（最大 6-way 500BB = 7.73M 节点 < 1GB、**内存不是瓶颈**）、迭代吞吐全程 ~11–33 µs/iter（**也不是瓶颈**）；**真瓶颈 = 单线程
 建树时间**——5s 可行前沿 = 3/4-way 全码深 + 5-way ≤400BB + 6-way ≤150BB；**6-way ≥200BB 建树就 >5s**（20.4s@500BB 连 20s 都
 超），杠杆在 **build 侧**（建树并行 / 增量 apply），**非 solve；§7「按核数外推」对 build 不成立**（build 单线程，只随单核速度缩放）。
-残留 = build 侧优化（若要把 6-way 深码拉进 5s 必走）。③ **缺口② 生产 advisor 重建——已落地（2026-06-09，commit `7413da2`，
+残留 = build 侧优化（若要把 6-way 深码拉进 5s 必走）。**solve 侧并行已另行落地（2026-06-12，`solve_threads`，见 §6 #4）**——
+同预算 update ≈ ×物理核数、给 deep_menu 宽档换回 per-bucket 采样密度，但**不动 build 瓶颈**，本条残留不变。③ **缺口② 生产 advisor 重建——已落地（2026-06-09，commit `7413da2`，
 vultr 全绿）**：`openpoker_advisor` Request 加 optional `stacks[6]` + `decide()` 分派 `subgame_search`（`build_real_auth` 真栈
 重放 + `GameState::inject_external_cards` 注入真牌）+ outgoing 按真码深 + 解不出来 check-when-free 不回落 + python driver 回推 hand-start
 真栈送 `stacks`；守 `search=None` / preflop / 未触发 byte-equal（测试钉死，§3.2 缺口②）。**v1 边界（当时）**：node_id 仍靠 100BB 影子
