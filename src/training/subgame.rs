@@ -116,11 +116,57 @@ pub struct SubgameNlheGame {
     ranges: Option<Vec<Vec<f64>>>,
     /// range 采样用的 1326 具体底牌组合表（仅 `ranges == Some` 时非空）；下标对齐 `ranges`。
     hole_combos: Vec<[Card; 2]>,
+    /// per-seat 归一前缀和 CDF（构造期建，[`sample_holes_from_ranges`]
+    /// (Self::sample_holes_from_ranges) 热路径二分用）；`None` = 该座 range 总权重 0（无信号，
+    /// 直接走精确扫描兜底）。下标对齐 `ranges`，仅 `ranges == Some` 时非空。
+    range_cdfs: Vec<Option<SeatRangeCdf>>,
+    /// 每个 hole 组合的 52-bit 牌位掩码（两张 `1<<card.to_u8()` OR）；下标对齐 `hole_combos`，
+    /// 撞牌检查 = 一次 AND（仅 `ranges == Some` 时非空）。
+    hole_masks: Vec<u64>,
     /// S6 6b depth-limit：`Some` = 子树用 [`PublicBettingTree::build_subtree_depth_limited`] 截断、
     /// 叶子查 blueprint 续局值（[`SubgameLeafCtx`]）；`None`（6a）= 子树解到真实终局、走真实
     /// showdown payoff。`root` 把它 clone 进 state（depth-limit 叶子 `payoff` 读）。
     leaf_ctx: Option<Arc<SubgameLeafCtx>>,
 }
+
+/// 单座位 range 的归一前缀和（[`SubgameNlheGame::sample_holes_from_ranges`] 热路径）。
+struct SeatRangeCdf {
+    /// `cum[i] = Σ_{j≤i} w_j / total`（单调非降、尾项 ≈ 1）。零权 hole 的区间宽 0，
+    /// 二分（`partition_point(c <= u)`）不会命中。
+    cum: Vec<f64>,
+    /// 最大正权下标：`u` 落在尾部浮点缝隙（≥ `cum.last()`）时的保底（与
+    /// [`sample_discrete`] 的「保底走最后一个 outcome」同型语义）。
+    last_positive: usize,
+}
+
+/// 为每个座位建 [`SeatRangeCdf`]（总权重 0 → `None`，采样时直接走精确扫描兜底）。
+fn build_range_cdfs(ranges: &[Vec<f64>]) -> Vec<Option<SeatRangeCdf>> {
+    ranges
+        .iter()
+        .map(|r| {
+            let total: f64 = r.iter().sum();
+            if !total.is_finite() || total <= 0.0 {
+                return None; // 全零 / 空向量（folded 座留空）/ NaN / inf 防御。
+            }
+            let mut cum = Vec::with_capacity(r.len());
+            let mut acc = 0.0_f64;
+            let mut last_positive = 0usize;
+            for (i, &w) in r.iter().enumerate() {
+                debug_assert!(w >= 0.0, "range 权重须非负，seat range[{i}]={w}");
+                if w > 0.0 {
+                    last_positive = i;
+                }
+                acc += w;
+                cum.push(acc / total);
+            }
+            Some(SeatRangeCdf { cum, last_positive })
+        })
+        .collect()
+}
+
+/// 拒绝采样重试上限：worst-case（river 6-way，~15/52 张已用）接受率仍 ≥ ~0.5 →
+/// 连拒 32 次概率 ~2⁻³²；真打满只剩病态角（range 质量几乎全在已用牌上），走精确兜底。
+const RANGE_REJECTION_RETRY_CAP: usize = 32;
 
 impl SubgameNlheGame {
     /// 从中途 `template` 状态 + action `abs` + A3×A4 `rules` 建 subgame。`entrants` /
@@ -157,8 +203,29 @@ impl SubgameNlheGame {
             template,
             ranges: None,
             hole_combos: Vec::new(),
+            range_cdfs: Vec::new(),
+            hole_masks: Vec::new(),
             leaf_ctx: None,
         }
+    }
+
+    /// 装上 per-seat `ranges` 并预计算采样结构（CDF + 牌位掩码）。两个带 range 的构造路径
+    /// （[`new_with_ranges`](Self::new_with_ranges) / [`new_depth_limited`](Self::new_depth_limited)）
+    /// 共用，保证 `ranges` 与预计算结构永远同步。
+    fn attach_ranges(&mut self, ranges: Vec<Vec<f64>>) {
+        debug_assert_eq!(
+            ranges.len(),
+            self.template.players().len(),
+            "ranges 长度须 == 座位数"
+        );
+        self.range_cdfs = build_range_cdfs(&ranges);
+        self.ranges = Some(ranges);
+        self.hole_combos = all_hole_combos();
+        self.hole_masks = self
+            .hole_combos
+            .iter()
+            .map(|h| (1u64 << h[0].to_u8()) | (1u64 << h[1].to_u8()))
+            .collect();
     }
 
     /// 同 [`new`](Self::new)，但 root 按 per-seat blueprint `ranges` 加权采样各家底牌（S6 §5b
@@ -184,13 +251,7 @@ impl SubgameNlheGame {
             entrants,
             raises_on_street,
         );
-        debug_assert_eq!(
-            ranges.len(),
-            g.template.players().len(),
-            "ranges 长度须 == 座位数"
-        );
-        g.ranges = Some(ranges);
-        g.hole_combos = all_hole_combos();
+        g.attach_ranges(ranges);
         g
     }
 
@@ -246,23 +307,22 @@ impl SubgameNlheGame {
             global_by_local,
             cont_policy,
         }));
-        let (ranges_opt, hole_combos) = match ranges {
-            Some(r) => {
-                debug_assert_eq!(r.len(), template.players().len(), "ranges 长度须 == 座位数");
-                (Some(r), all_hole_combos())
-            }
-            None => (None, Vec::new()),
-        };
-        Ok(Self {
+        let mut g = Self {
             config,
             subtree,
             abs: Arc::new(abs),
             bucket_table,
             template,
-            ranges: ranges_opt,
-            hole_combos,
+            ranges: None,
+            hole_combos: Vec::new(),
+            range_cdfs: Vec::new(),
+            hole_masks: Vec::new(),
             leaf_ctx,
-        })
+        };
+        if let Some(r) = ranges {
+            g.attach_ranges(r);
+        }
+        Ok(g)
     }
 
     /// 子树（诊断 / 评测：取 root_id 构造查询 infoset）。
@@ -270,56 +330,89 @@ impl SubgameNlheGame {
         &self.subtree
     }
 
-    /// 按 `self.ranges` 为每个**未弃牌**座位采样一手底牌（顺序 card-removal：逐座位从
-    /// 其 range 限制到「未被 board / 已采样底牌占用」的 hole 上、归一后 [`sample_discrete`]；
-    /// 受限 range 全零 → 退均匀采可用 hole）。返回 per-seat `Option<[Card;2]>`（弃牌座 None）。
+    /// 按 `self.ranges` 为每个**未弃牌**座位采样一手底牌（顺序 card-removal：逐座位限制到
+    /// 「未被 board / 已采样底牌占用」的 hole 上按权采样）。返回 per-seat `Option<[Card;2]>`
+    /// （弃牌座 None）。
+    ///
+    /// 热路径 = 构造期预计算的 [`SeatRangeCdf`] 上二分 + 撞牌拒绝重采：被拒后重抽采到的
+    /// 正是「受限重归一分布」的精确样本（拒绝采样恒等，非近似），与旧实现（逐组合过滤 +
+    /// 归一 + [`sample_discrete`]）**同分布**，把每 root 每座位 O(1326) 扫描挪出热路径
+    /// （它吃掉 range 加权搜索 ~7× 迭代吞吐）。连拒 [`RANGE_REJECTION_RETRY_CAP`] 次
+    /// （range 质量几乎全在已用牌上的病态角）或该座 range 总权重 0 → 走
+    /// [`sample_hole_exact`](Self::sample_hole_exact) 精确扫描；兜底切换不引入分布偏差
+    /// （兜底本身也是受限分布的精确采样）。rng 消费序与旧实现不同（每座 1 次 → 1+拒绝数次），
+    /// 同 seed 自可复现不变。
     fn sample_holes_from_ranges(
         &self,
         ranges: &[Vec<f64>],
         rng: &mut dyn RngSource,
     ) -> Vec<Option<[Card; 2]>> {
-        let mut used: BTreeSet<u8> = self.template.board().iter().map(|c| c.to_u8()).collect();
+        let mut used: u64 = self
+            .template
+            .board()
+            .iter()
+            .fold(0u64, |m, c| m | (1u64 << c.to_u8()));
         let players = self.template.players();
         let mut out: Vec<Option<[Card; 2]>> = vec![None; players.len()];
         for (seat, player) in players.iter().enumerate() {
             if player.hole_cards.is_none() {
                 continue; // 弃牌座：无底牌。
             }
-            // 限制到可用 hole（不撞 used）的 (idx, weight)；weight>0 由 range 决定。
-            let mut dist: Vec<(usize, f64)> = Vec::new();
-            let mut total = 0.0_f64;
-            for (hi, hole) in self.hole_combos.iter().enumerate() {
-                let w = ranges[seat].get(hi).copied().unwrap_or(0.0);
-                if w > 0.0 && !used.contains(&hole[0].to_u8()) && !used.contains(&hole[1].to_u8()) {
-                    dist.push((hi, w));
-                    total += w;
+            let mut chosen: Option<usize> = None;
+            if let Some(cdf) = self.range_cdfs[seat].as_ref() {
+                for _ in 0..RANGE_REJECTION_RETRY_CAP {
+                    // 与 sample_discrete 同型的 53-bit 单位均匀采样。
+                    let u = (rng.next_u64() >> 11) as f64 / ((1u64 << 53) as f64);
+                    let mut idx = cdf.cum.partition_point(|&c| c <= u);
+                    if idx >= cdf.cum.len() {
+                        idx = cdf.last_positive; // 尾部浮点缝隙（u ≥ cum.last()）保底。
+                    }
+                    if self.hole_masks[idx] & used == 0 {
+                        chosen = Some(idx);
+                        break;
+                    }
                 }
             }
-            let chosen_idx = if total > 0.0 {
-                // 归一（sample_discrete 要求 sum≈1）。
-                for e in dist.iter_mut() {
-                    e.1 /= total;
-                }
-                sample_discrete(&dist, rng)
-            } else {
-                // 受限 range 全零 → 退均匀采可用 hole。
-                let avail: Vec<usize> = self
-                    .hole_combos
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, h)| !used.contains(&h[0].to_u8()) && !used.contains(&h[1].to_u8()))
-                    .map(|(hi, _)| hi)
-                    .collect();
-                let p = 1.0 / avail.len() as f64;
-                let uni: Vec<(usize, f64)> = avail.into_iter().map(|hi| (hi, p)).collect();
-                sample_discrete(&uni, rng)
-            };
-            let hole = self.hole_combos[chosen_idx];
-            used.insert(hole[0].to_u8());
-            used.insert(hole[1].to_u8());
-            out[seat] = Some(hole);
+            let chosen_idx =
+                chosen.unwrap_or_else(|| self.sample_hole_exact(&ranges[seat], used, rng));
+            used |= self.hole_masks[chosen_idx];
+            out[seat] = Some(self.hole_combos[chosen_idx]);
         }
         out
+    }
+
+    /// 单座位精确扫描采样（旧实现路径，留作拒绝采样的兜底）：限制到「不撞 `used`」的正权
+    /// hole 归一后 [`sample_discrete`]；受限全零（该座 range 全零 / 正权质量全在已用牌上）→
+    /// 退均匀采可用 hole。
+    fn sample_hole_exact(&self, range: &[f64], used: u64, rng: &mut dyn RngSource) -> usize {
+        let mut dist: Vec<(usize, f64)> = Vec::new();
+        let mut total = 0.0_f64;
+        for (hi, &mask) in self.hole_masks.iter().enumerate() {
+            let w = range.get(hi).copied().unwrap_or(0.0);
+            if w > 0.0 && mask & used == 0 {
+                dist.push((hi, w));
+                total += w;
+            }
+        }
+        if total > 0.0 {
+            // 归一（sample_discrete 要求 sum≈1）。
+            for e in dist.iter_mut() {
+                e.1 /= total;
+            }
+            sample_discrete(&dist, rng)
+        } else {
+            // 受限 range 全零 → 退均匀采可用 hole。
+            let avail: Vec<usize> = self
+                .hole_masks
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| **m & used == 0)
+                .map(|(hi, _)| hi)
+                .collect();
+            let p = 1.0 / avail.len() as f64;
+            let uni: Vec<(usize, f64)> = avail.into_iter().map(|hi| (hi, p)).collect();
+            sample_discrete(&uni, rng)
+        }
     }
 
     /// 中途模板状态（决定 root 的 betting 几何 + 真实公共牌前缀）。
@@ -2815,6 +2908,322 @@ mod tests {
                 "seat1 集中 range → 恒采样 hole m"
             );
         }
+    }
+
+    /// 旧 range 采样实现（逐组合过滤 + 归一 + [`sample_discrete`]，commit `d18c2da` 时点）的
+    /// 忠实拷贝——新拒绝采样路径的**分布 oracle** 兼 wall 基线
+    /// （[`_measure_range_sampling_wall`]）。
+    fn sample_holes_reference(
+        template: &GameState,
+        ranges: &[Vec<f64>],
+        hole_combos: &[[Card; 2]],
+        rng: &mut dyn RngSource,
+    ) -> Vec<Option<[Card; 2]>> {
+        let mut used: BTreeSet<u8> = template.board().iter().map(|c| c.to_u8()).collect();
+        let players = template.players();
+        let mut out: Vec<Option<[Card; 2]>> = vec![None; players.len()];
+        for (seat, player) in players.iter().enumerate() {
+            if player.hole_cards.is_none() {
+                continue;
+            }
+            let mut dist: Vec<(usize, f64)> = Vec::new();
+            let mut total = 0.0_f64;
+            for (hi, hole) in hole_combos.iter().enumerate() {
+                let w = ranges[seat].get(hi).copied().unwrap_or(0.0);
+                if w > 0.0 && !used.contains(&hole[0].to_u8()) && !used.contains(&hole[1].to_u8()) {
+                    dist.push((hi, w));
+                    total += w;
+                }
+            }
+            let chosen_idx = if total > 0.0 {
+                for e in dist.iter_mut() {
+                    e.1 /= total;
+                }
+                sample_discrete(&dist, rng)
+            } else {
+                let avail: Vec<usize> = hole_combos
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, h)| !used.contains(&h[0].to_u8()) && !used.contains(&h[1].to_u8()))
+                    .map(|(hi, _)| hi)
+                    .collect();
+                let p = 1.0 / avail.len() as f64;
+                let uni: Vec<(usize, f64)> = avail.into_iter().map(|hi| (hi, p)).collect();
+                sample_discrete(&uni, rng)
+            };
+            let hole = hole_combos[chosen_idx];
+            used.insert(hole[0].to_u8());
+            used.insert(hole[1].to_u8());
+            out[seat] = Some(hole);
+        }
+        out
+    }
+
+    /// 新拒绝采样热路径与旧逐组合扫描**同分布**（边际频率 TV 距离 oracle 对照）+ 支撑正确 +
+    /// 同 seed 可复现。3-way flop：座 0/1 用**同一份**稀疏加权 range（~58 个正权组合、权重
+    /// 1..=16，且**不剔除**撞 board 的正权条目——旧路径靠过滤、新路径靠拒绝，正是要对照的
+    /// 两种实现；座间共享组合 = card-removal 强耦合），座 2 全零（退均匀兜底分派）。错的
+    /// 二分（off-by-one → 命中零权组合，支撑断言抓）/ 错的掩码 / 漏拒绝 / 权重读错（如退化
+    /// 均匀，TV ≈ 0.24 ≫ 阈 0.06）任一条都 fail；TV 在固定 seed 下是确定数（阈含 ~2.4×
+    /// 采样噪声余量，不 flaky）。
+    #[test]
+    fn range_sampling_rejection_matches_exact_scan_distribution() {
+        let template = nway_limped_flop_state(3, 10_000, 0x5253_414D_504C_4531); // "RSAMPLE1"
+        let holes = all_hole_combos();
+        // hole [a<b] → 下标的平面查找表（统计计数用）。
+        let mut idx_of = vec![usize::MAX; 52 * 52];
+        for (hi, h) in holes.iter().enumerate() {
+            idx_of[h[0].to_u8() as usize * 52 + h[1].to_u8() as usize] = hi;
+        }
+
+        // 稀疏加权 range：每 23 个组合取 1 个、权重 1..=16 循环。
+        let mut r = vec![0.0_f64; 1326];
+        for hi in (0..1326).step_by(23) {
+            r[hi] = ((hi / 23) % 16 + 1) as f64;
+        }
+        let ranges_vec = vec![r.clone(), r, vec![0.0_f64; 1326]];
+
+        let (abs, rules) = deep_single_pot();
+        let sub = SubgameNlheGame::new_with_ranges(
+            stub_table(),
+            template.config().clone(),
+            abs,
+            rules,
+            template.clone(),
+            0,
+            0,
+            ranges_vec.clone(),
+        );
+
+        let n = 30_000usize;
+        let n_seats = template.players().len();
+        let mut cnt_new = vec![vec![0u32; 1326]; n_seats];
+        let mut cnt_ref = vec![vec![0u32; 1326]; n_seats];
+        let board_mask: u64 = template
+            .board()
+            .iter()
+            .fold(0u64, |m, c| m | (1u64 << c.to_u8()));
+        // 支撑断言（两套实现同测）：不撞 board / 座间不撞 / 正权座只出正权组合。
+        let tally = |out: &[Option<[Card; 2]>], cnt: &mut [Vec<u32>]| {
+            let mut used = board_mask;
+            for (seat, hole) in out.iter().enumerate() {
+                let h = hole.expect("3-way limped flop 全员未弃牌，应都有底牌");
+                let mask = (1u64 << h[0].to_u8()) | (1u64 << h[1].to_u8());
+                assert_eq!(mask & used, 0, "seat{seat} 采样撞牌（board / 前序座位）");
+                used |= mask;
+                let hi = idx_of[h[0].to_u8() as usize * 52 + h[1].to_u8() as usize];
+                assert_ne!(hi, usize::MAX, "采样组合须在 hole_combos 表内");
+                if seat < 2 {
+                    assert!(
+                        ranges_vec[seat][hi] > 0.0,
+                        "seat{seat} 有正权 range，采样组合权重须 > 0（hi={hi}）"
+                    );
+                }
+                cnt[seat][hi] += 1;
+            }
+        };
+        let mut rng_new = ChaCha20Rng::from_seed(0x5253_4E45_5700_0001);
+        let mut rng_ref = ChaCha20Rng::from_seed(0x5253_5245_4600_0002);
+        for _ in 0..n {
+            let o_new = sub.sample_holes_from_ranges(sub.ranges.as_ref().unwrap(), &mut rng_new);
+            tally(&o_new, &mut cnt_new);
+            let o_ref = sample_holes_reference(&template, &ranges_vec, &holes, &mut rng_ref);
+            tally(&o_ref, &mut cnt_ref);
+        }
+        // 座 0/1（加权热路径）边际 TV；座 2 走与旧代码同一条均匀兜底（sample_discrete），
+        // 支撑断言已覆盖、不重复量 TV（1326 桶下 TV 噪声 ~0.12，量了也判不动）。
+        for seat in 0..2 {
+            let tv: f64 = (0..1326)
+                .map(|hi| (cnt_new[seat][hi] as f64 - cnt_ref[seat][hi] as f64).abs())
+                .sum::<f64>()
+                / (2.0 * n as f64);
+            assert!(
+                tv < 0.06,
+                "seat{seat} 新旧采样边际 TV={tv:.4} 超阈 0.06（分布应一致）"
+            );
+        }
+        // 同 seed 可复现：两条独立 rng 流逐 draw 相等。
+        let mut ra = ChaCha20Rng::from_seed(0x5253_4445_5400_0003);
+        let mut rb = ChaCha20Rng::from_seed(0x5253_4445_5400_0003);
+        for i in 0..50 {
+            let a = sub.sample_holes_from_ranges(sub.ranges.as_ref().unwrap(), &mut ra);
+            let b = sub.sample_holes_from_ranges(sub.ranges.as_ref().unwrap(), &mut rb);
+            assert_eq!(a, b, "同 seed 第 {i} 次采样须逐位一致");
+        }
+    }
+
+    /// 拒绝重试打满的病态角：座 0 正权质量**全部**在撞 board[0] 的组合上（受限全零）→ 连拒
+    /// [`RANGE_REJECTION_RETRY_CAP`] 次后走精确扫描兜底 → 退均匀采可用 hole（旧语义不变，
+    /// 采到的组合 range 权重必为 0 = 硬证走的是均匀兜底而非加权热路径）；不 panic、不撞牌、
+    /// 同 seed 可复现。
+    #[test]
+    fn range_sampling_blocked_mass_falls_back_uniform() {
+        let template = nway_limped_flop_state(3, 10_000, 0x5253_424C_4F43_4B31); // "RSBLOCK1"
+        let holes = all_hole_combos();
+        let board0 = template.board()[0].to_u8();
+        let board_mask: u64 = template
+            .board()
+            .iter()
+            .fold(0u64, |m, c| m | (1u64 << c.to_u8()));
+        // 座 0：全部质量在含 board[0] 的 51 个组合上（受限后全零）。
+        let mut r0 = vec![0.0_f64; 1326];
+        for (hi, h) in holes.iter().enumerate() {
+            if h[0].to_u8() == board0 || h[1].to_u8() == board0 {
+                r0[hi] = 1.0;
+            }
+        }
+        // 座 1：非撞 board 均权（验后续座位不被座 0 的兜底打乱）；座 2：全零。
+        let r1: Vec<f64> = holes
+            .iter()
+            .map(|h| {
+                let m = (1u64 << h[0].to_u8()) | (1u64 << h[1].to_u8());
+                if m & board_mask == 0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let ranges_vec = vec![r0.clone(), r1, vec![0.0_f64; 1326]];
+        let (abs, rules) = deep_single_pot();
+        let sub = SubgameNlheGame::new_with_ranges(
+            stub_table(),
+            template.config().clone(),
+            abs,
+            rules,
+            template.clone(),
+            0,
+            0,
+            ranges_vec,
+        );
+        let mut idx_of = vec![usize::MAX; 52 * 52];
+        for (hi, h) in holes.iter().enumerate() {
+            idx_of[h[0].to_u8() as usize * 52 + h[1].to_u8() as usize] = hi;
+        }
+        let mut rng = ChaCha20Rng::from_seed(0x5253_424C_4B00_0001);
+        for _ in 0..200 {
+            let out = sub.sample_holes_from_ranges(sub.ranges.as_ref().unwrap(), &mut rng);
+            let mut used = board_mask;
+            for (seat, hole) in out.iter().enumerate() {
+                let h = hole.expect("全员未弃牌");
+                let mask = (1u64 << h[0].to_u8()) | (1u64 << h[1].to_u8());
+                assert_eq!(mask & used, 0, "seat{seat} 兜底采样撞牌");
+                used |= mask;
+            }
+            // 座 0 采到的组合在其 range 里权重必为 0（质量全被 board 封死 → 均匀兜底）。
+            let h0 = out[0].unwrap();
+            let hi0 = idx_of[h0[0].to_u8() as usize * 52 + h0[1].to_u8() as usize];
+            assert_eq!(
+                r0[hi0], 0.0,
+                "座 0 受限全零，采样必来自均匀兜底（采到正权组合 = 拒绝逻辑漏撞牌）"
+            );
+        }
+        let mut ra = ChaCha20Rng::from_seed(0x5253_424C_4B00_0002);
+        let mut rb = ChaCha20Rng::from_seed(0x5253_424C_4B00_0002);
+        for i in 0..20 {
+            let a = sub.sample_holes_from_ranges(sub.ranges.as_ref().unwrap(), &mut ra);
+            let b = sub.sample_holes_from_ranges(sub.ranges.as_ref().unwrap(), &mut rb);
+            assert_eq!(a, b, "同 seed 第 {i} 次兜底采样须逐位一致");
+        }
+    }
+
+    /// 诊断（exec §3.2 缺口② range 平滑连带发现「range 加权采样 ~7× 掉速」的修复读数）：
+    /// ① `sample_holes_from_ranges` 本体 ns/call——新拒绝采样 vs 旧逐组合扫描
+    /// （[`sample_holes_reference`]）；② 端到端 µs/iter——同一 6-way limped flop {1pot} 子树，
+    /// uniform root（无 ranges）vs range 加权 root（λ 混合生产形态：非撞 board 组合全正）。
+    /// 修复后 ② 两行应基本持平（range 税收掉）。
+    #[test]
+    #[ignore = "诊断：range 加权采样 wall（新拒绝采样 vs 旧扫描 + 端到端 µs/iter）；--release --ignored --nocapture 跑"]
+    fn _measure_range_sampling_wall() {
+        let template = nway_limped_flop_state(6, 10_000, 0x5253_5741_4C4C_5F30); // "RSWALL_0"
+        let holes = all_hole_combos();
+        let board_mask: u64 = template
+            .board()
+            .iter()
+            .fold(0u64, |m, c| m | (1u64 << c.to_u8()));
+        // λ 混合后的生产形态：非撞 board 组合全正（近均匀 + 锯齿权重，座间 salt 不同）。
+        let mk = |salt: u64| -> Vec<f64> {
+            holes
+                .iter()
+                .enumerate()
+                .map(|(hi, h)| {
+                    let m = (1u64 << h[0].to_u8()) | (1u64 << h[1].to_u8());
+                    if m & board_mask != 0 {
+                        0.0
+                    } else {
+                        1.0 + ((hi as u64 ^ salt) % 7) as f64 / 7.0
+                    }
+                })
+                .collect()
+        };
+        let ranges_vec: Vec<Vec<f64>> = (0..6u64).map(mk).collect();
+        let (abs, rules) = deep_single_pot();
+        let sub = SubgameNlheGame::new_with_ranges(
+            stub_table(),
+            template.config().clone(),
+            abs.clone(),
+            rules,
+            template.clone(),
+            0,
+            0,
+            ranges_vec.clone(),
+        );
+
+        // ① 采样本体 ns/call。
+        let m_new = 200_000u32;
+        let mut rng = ChaCha20Rng::from_seed(0x5253_574E_4557_0001);
+        let t0 = Instant::now();
+        for _ in 0..m_new {
+            std::hint::black_box(
+                sub.sample_holes_from_ranges(sub.ranges.as_ref().unwrap(), &mut rng),
+            );
+        }
+        let ns_new = t0.elapsed().as_nanos() as f64 / m_new as f64;
+        let m_ref = 20_000u32;
+        let mut rng = ChaCha20Rng::from_seed(0x5253_5752_4546_0002);
+        let t1 = Instant::now();
+        for _ in 0..m_ref {
+            std::hint::black_box(sample_holes_reference(
+                &template,
+                &ranges_vec,
+                &holes,
+                &mut rng,
+            ));
+        }
+        let ns_ref = t1.elapsed().as_nanos() as f64 / m_ref as f64;
+        eprintln!(
+            "[range-wall] sample ns/call: new={ns_new:.0} ref={ns_ref:.0} speedup={:.1}x",
+            ns_ref / ns_new
+        );
+
+        // ② 端到端 µs/iter：uniform root vs range 加权 root（同子树、同迭代数）。
+        let iters = 20_000u64;
+        let run = |game: SubgameNlheGame, label: &str| {
+            let mut tr = EsMccfrTrainer::new(game, 0x5253_5741_4C4C ^ 0xA5A5);
+            let mut rng = ChaCha20Rng::from_seed(0x5253_5741_4C4C_0003);
+            let t = Instant::now();
+            for _ in 0..iters {
+                tr.step(&mut rng).expect("probe step");
+            }
+            let us = t.elapsed().as_micros() as f64 / iters as f64;
+            eprintln!("[range-wall] e2e {label}: {us:.2} µs/iter");
+            us
+        };
+        let uniform_game = SubgameNlheGame::new(
+            stub_table(),
+            template.config().clone(),
+            abs,
+            rules,
+            template.clone(),
+            0,
+            0,
+        );
+        let us_uniform = run(uniform_game, "uniform-root");
+        let us_ranges = run(sub, "ranges-root ");
+        eprintln!(
+            "[range-wall] range 税 = {:.2}x（修复前 sweep 实测 ~7x）",
+            us_ranges / us_uniform
+        );
     }
 
     /// S6 6b：depth-limit subgame 端到端——[`SubgameNlheGame::new_depth_limited`] 建截断子树 +
