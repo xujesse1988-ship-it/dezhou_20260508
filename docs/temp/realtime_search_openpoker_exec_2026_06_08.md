@@ -386,6 +386,23 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      （3.5%），field 构成显著不同（§4.1 早已预警的系统偏差，√n 压不掉）；按桌型/人数切片对照是后续
      细读项。结论：护栏「别打更差」通过（AIVAT CI 下界 −182 ≈ 0、giveup 0.3%），方向性证据支持搜索，
      显著性按预算老实留给更多手数。
+   - **search 子树独立桶表已落地（2026-06-12，commit `2762c87`，vultr subgame 37 + blueprint_advisor 6 +
+     openpoker_advisor 24 全绿 + 真 10B/真两表端到端 smoke）**：`openpoker_advisor --search-bucket-table <path>`
+     （拒绝静默 guard 同其余 `--search-*`）——子树 re-solve（CFR infoset 归桶）+ 解完后 hero 读数（`query_at`）
+     换独立桶表（生产意图 = `bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin`，比 blueprint 的
+     200/200/200 细 2.5×），blueprint 路径 / checkpoint 加载只认 `--bucket-table` 的 200 表不动。**为什么解耦
+     是干净的**：子树是独立一次性求解、桶空间不触 blueprint checkpoint；range 估计（`estimate_range`）查
+     blueprint σ 必须留 blueprint 表（不受 flag 影响）；range 本身 1326 具体组合粒度、加权采样不经桶表。
+     底层 = `subgame_search_cached` / `subgame_search_unanchored_cached` 加 `bucket_override`（`None` = 旧行为
+     byte-equal；锚定/脱锚两路都吃；解析后的表进 solve 缓存 key = content hash + Arc 指针；与 `depth_limit`
+     互斥早 `Err`——叶子续局值表按 blueprint 桶空间键）。测试：同表 override ≡ `None`（命中缓存 + byte-equal）/
+     换表必 miss / 白盒钉缓存 trainer 真持有 override 表 / CLI parse 三态。**真表 smoke（vultr，10B preopen +
+     200 表 blueprint，AKo@SB limp 池 flop K72r 首点，同 seed/2s 预算）**：两臂都 `source=search` 且 blueprint
+     口径 `info_set` 相同（blueprint 表确没被动）；分布实变——bet0.5pot 0.16→0.03 / bet1pot 0.005→0.10
+     （500 表把同一手解进了更细的桶）。**诚实代价（A/B 要盯的）**：同
+     时限预算下桶细 2.5× → per-bucket 采样更稀，「当前桶未被访问 → `Err` → check-when-free」的
+     `search_giveup` 率可能从 0.3% 上抬；且这把刀只动**手牌**分辨率，发现②的 min-raise 粒度税是**动作**
+     菜单分辨率、不在本 flag 射程内。
    - ~~短桌幻影座映射~~——**已落地（2026-06-11，commit `a60ffda`→`0fe6852`，vultr 测试 + 真 10B
      selftest 全绿 + 25 手 live smoke 实证）**：k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的
      真实节点。关键设计：①**不能在空座原位插 fold**——树上 SB/BB 固定 button+1/+2 且必须发盲，
