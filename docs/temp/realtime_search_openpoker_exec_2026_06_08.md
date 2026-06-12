@@ -373,6 +373,19 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
      变纯 allin——跨 session 映射不保证一致，设计内）。位置切片 BB −837 mbb/g 最差；见 flop 人数
      2-way +1211 / 3-way −218 / 4-way −534（多人更差，与 ≤3-way 训练边界一致，样本小只看方向）。
      真实尺寸重解正是搜索臂的主场 → 下一步 = 同条件 search-on 500 手对比臂。
+   - **search-on 500 手对比臂已完成（2026-06-12，searchon50_v6 同款配置：AllPostflop/5s/LCFR/4M/λ=0.25，
+     preopen 10B，唯一代码差 = `f3edf4b` 采样修复 = 同预算有效迭代 ~7×）**：500/500 打满、watchdog 0、
+     HH 498（+2 跳过）、497 过报表（1 手 convert 失败 = 重放 Raise 非法另一罕见类，line 301）。
+     **决策面（护栏全过）**：686 决策 / search 180（26.2%，锚定 168 + 脱锚 12）/ **search_giveup 仅 2（0.3%）** /
+     **兜底 2.0%（基线 8.6%）**——limp 启发式 + 短桌幻影座 + limp 池脱锚搜索三个收口全生效。
+     **EV 读数（U-fail 修复后口径，对照基线 624 手重算）**：raw 基线 +564.8±640.9 vs search −93.2±567.0；
+     **AIVAT 基线 −7.9±303.7 vs search +832.6±517.5 → 差值 +840±600 mbb/g（z≈1.4，CI95 [−336,+2017]，
+     跨 0 = 功效预算预期内判不动显著性，方向利好 search）**。raw 与 AIVAT 方向相反 = runout 运气主导 raw
+     （search 臂 5 手大锅运气差被 c_runout 校正回来）——AIVAT 口径作主读数的必要性实证。
+     **诚实 confound**：两臂不配对 + bot 池漂移实锤——search 臂短桌手 103/497（20.7%）vs 基线 22/624
+     （3.5%），field 构成显著不同（§4.1 早已预警的系统偏差，√n 压不掉）；按桌型/人数切片对照是后续
+     细读项。结论：护栏「别打更差」通过（AIVAT CI 下界 −182 ≈ 0、giveup 0.3%），方向性证据支持搜索，
+     显著性按预算老实留给更多手数。
    - ~~短桌幻影座映射~~——**已落地（2026-06-11，commit `a60ffda`→`0fe6852`，vultr 测试 + 真 10B
      selftest 全绿 + 25 手 live smoke 实证）**：k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的
      真实节点。关键设计：①**不能在空座原位插 fold**——树上 SB/BB 固定 button+1/+2 且必须发盲，
