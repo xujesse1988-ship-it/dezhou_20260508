@@ -1172,8 +1172,10 @@ const KEY_KIND_UNANCHORED: u8 = 1;
 /// 喂进 [`SubgameNlheGame`] 构造 + [`solve_subgame`] 的每个输入要么逐字段哈希，要么经进程内
 /// 身份哈希——逐项对应：
 ///
-/// - 桶表：content hash（跨进程稳定）+ `Arc` 指针（区分 content hash 同为全 0 的 stub 表；
-///   缓存条目经 trainer 持有该 Arc → 条目存活期内指针不可能被释放复用）；
+/// - 桶表：**子树 solve 实际用的表**（`bucket_override` 解析后；blueprint 表对 solve 的全部
+///   影响经 range——而 range 已按算出的 reach 向量逐位哈希）：content hash（跨进程稳定）+
+///   `Arc` 指针（区分 content hash 同为全 0 的 stub 表；缓存条目经 trainer 持有该 Arc →
+///   条目存活期内指针不可能被释放复用）；
 /// - `cfg` 全字段（iterations / max_subtree_nodes / seed / use_blueprint_range / trigger /
 ///   resolve_root / depth_limit / biased_leaf / lcfr / time_budget / deep_menu /
 ///   live_traversers / range_uniform_mix——含不影响 solve 的 trigger：过覆盖只丢命中、
@@ -1191,7 +1193,7 @@ const KEY_KIND_UNANCHORED: u8 = 1;
 #[allow(clippy::too_many_arguments)]
 fn solve_cache_key(
     kind: u8,
-    game: &SimplifiedNlheGame,
+    sub_table: &Arc<BucketTable>,
     root_state: &GameState,
     entrants: u16,
     raises_on_street: u32,
@@ -1204,8 +1206,8 @@ fn solve_cache_key(
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(&[kind]);
-    h.update(&game.bucket_table.content_hash());
-    h.update(&(Arc::as_ptr(&game.bucket_table) as usize as u64).to_le_bytes());
+    h.update(&sub_table.content_hash());
+    h.update(&(Arc::as_ptr(sub_table) as usize as u64).to_le_bytes());
     // cfg 全字段。
     h.update(&cfg.iterations.to_le_bytes());
     h.update(&(cfg.max_subtree_nodes as u64).to_le_bytes());
@@ -1367,6 +1369,7 @@ pub fn subgame_search(
         node_id,
         strategy,
         cfg,
+        None,
         leaf_values,
         within_round_real,
         hand_seed,
@@ -1380,6 +1383,16 @@ pub fn subgame_search(
 /// anytime 下重解会读不同均衡，§6 #2），mid-round wall ≈ 0。`cache = None` = 原行为
 /// （逐 infoset byte-equal，[`subgame_search`] 即此薄壳）。**depth_limit 路径不缓存**（key 须带
 /// blueprint 树叶子映射身份 / root_global，非生产路径不值得）——自动退 `None` 语义。
+///
+/// `bucket_override`：`Some` = 子树 solve（CFR infoset 归桶）+ 解完后 hero 读数（[`query_at`]
+/// (SubgameNlheGame::query_at)）改用这张表——两处同表即自洽，子树是独立一次性求解、不触
+/// blueprint checkpoint 的桶空间，故可换**更细**的表（如 500/500/500 vs blueprint 200）换
+/// 搜索区分辨率。**range 估计（[`estimate_range`]）不受影响**：它查 blueprint σ、必须留在
+/// `game.bucket_table`（blueprint 桶空间）；range 本身是 1326 具体组合粒度、加权采样不经过
+/// 桶表。代价 = 同迭代预算下桶更细 → per-bucket 样本更稀，「当前桶未被访问 → `Err`」降级
+/// 概率上升。与 `depth_limit` **不兼容**（叶子续局值表按 blueprint 桶空间键，换表 = 查错
+/// 桶 → 早 `Err`）。`None`（默认）= 沿用 `game.bucket_table`（既有行为 byte-equal）。
+/// 解析后的表进 solve 缓存 key（content hash + Arc 指针，[`solve_cache_key`]）。
 #[allow(clippy::too_many_arguments)]
 pub fn subgame_search_cached(
     cache: Option<&mut SubgameSolveCache>,
@@ -1390,6 +1403,7 @@ pub fn subgame_search_cached(
     node_id: NodeId,
     strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
     cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
     leaf_values: Option<&Arc<LeafValueTables>>,
     within_round_real: Option<&[(Action, bool)]>,
     hand_seed: u64,
@@ -1410,6 +1424,16 @@ pub fn subgame_search_cached(
                 .to_string(),
         );
     }
+    if bucket_override.is_some() && cfg.depth_limit {
+        return Err(
+            "subgame_search: bucket_override 与 depth_limit 不兼容（叶子续局值表按 blueprint \
+             桶空间键，换表查错桶）"
+                .to_string(),
+        );
+    }
+    // 子树 solve 实际用表：override 优先（搜索区独立换粒度），否则 blueprint 表（byte-equal）。
+    let sub_table: Arc<BucketTable> =
+        bucket_override.map_or_else(|| Arc::clone(&game.bucket_table), Arc::clone);
 
     // 沿 actor 在 blueprint 树的 public 决策路径分流（按 resolve_root）：
     //   - entrants：subgame 根的 live bitmask（CurrentDecision = 当前点 / RoundStart = 轮起点）。
@@ -1518,7 +1542,7 @@ pub fn subgame_search_cached(
     let key = cache.as_ref().map(|_| {
         solve_cache_key(
             KEY_KIND_ANCHORED,
-            game,
+            &sub_table,
             root_state,
             entrants,
             raises_on_street,
@@ -1551,7 +1575,7 @@ pub fn subgame_search_cached(
                 LeafContPolicy::Fixed(0)
             };
             SubgameNlheGame::new_depth_limited(
-                Arc::clone(&game.bucket_table),
+                Arc::clone(&sub_table),
                 root_state.config().clone(),
                 sub_abs.clone(),
                 sub_rules,
@@ -1567,7 +1591,7 @@ pub fn subgame_search_cached(
             )?
         } else if let Some(ranges) = ranges_opt {
             SubgameNlheGame::new_with_ranges(
-                Arc::clone(&game.bucket_table),
+                Arc::clone(&sub_table),
                 root_state.config().clone(),
                 sub_abs.clone(),
                 sub_rules,
@@ -1578,7 +1602,7 @@ pub fn subgame_search_cached(
             )
         } else {
             SubgameNlheGame::new(
-                Arc::clone(&game.bucket_table),
+                Arc::clone(&sub_table),
                 root_state.config().clone(),
                 sub_abs.clone(),
                 sub_rules,
@@ -1904,12 +1928,23 @@ pub fn subgame_search_unanchored(
     cfg: &SubgameSearchConfig,
     hand_seed: u64,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
-    subgame_search_unanchored_cached(None, auth, root_state, game, within_round, cfg, hand_seed)
+    subgame_search_unanchored_cached(
+        None,
+        auth,
+        root_state,
+        game,
+        within_round,
+        cfg,
+        None,
+        hand_seed,
+    )
 }
 
 /// [`subgame_search_unanchored`] 的缓存版（与 [`subgame_search_cached`] 同语义）：`cache = Some`
 /// 且 key 命中（同手同街，[`solve_cache_key`]）→ 复用已解 trainer、只重做 within-round 真实
 /// 动作导航 + 读数（导航用 solve 时存下的同一份 sub_abs）。`cache = None` = 原行为。
+/// `bucket_override` 语义同 [`subgame_search_cached`]（本路径 range 本就 uniform、不查
+/// blueprint σ，换表只动子树归桶 + hero 读数；depth_limit 本路径恒不支持，无兼容性问题）。
 #[allow(clippy::too_many_arguments)]
 pub fn subgame_search_unanchored_cached(
     cache: Option<&mut SubgameSolveCache>,
@@ -1918,6 +1953,7 @@ pub fn subgame_search_unanchored_cached(
     game: &SimplifiedNlheGame,
     within_round: &[(Action, bool)],
     cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
     hand_seed: u64,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
     if auth.is_terminal() || auth.current_player().is_none() {
@@ -1973,11 +2009,14 @@ pub fn subgame_search_unanchored_cached(
     // 真栈锚上下文：entrants = 轮起点 live bitmask；raises_on_street = 0（轮起点）；range =
     // uniform（SubgameNlheGame::new 的 root uniform resample，无 ranges）。
     let entrants = live_entrants(root_state);
+    // 子树 solve 实际用表（同 anchored：override 优先，否则 blueprint 表 byte-equal）。
+    let sub_table: Arc<BucketTable> =
+        bucket_override.map_or_else(|| Arc::clone(&game.bucket_table), Arc::clone);
     let master = search_seed(cfg.seed, hand_seed, street_tag as u64);
     let key = cache.as_ref().map(|_| {
         solve_cache_key(
             KEY_KIND_UNANCHORED,
-            game,
+            &sub_table,
             root_state,
             entrants,
             0,
@@ -1991,7 +2030,7 @@ pub fn subgame_search_unanchored_cached(
     });
     let build_and_solve = move || -> Result<SolvedSubgame, String> {
         let sub = SubgameNlheGame::new(
-            Arc::clone(&game.bucket_table),
+            Arc::clone(&sub_table),
             root_state.config().clone(),
             sub_abs.clone(), // 真栈导航还要同一抽象现算 tag
             sub_rules,
@@ -4592,6 +4631,7 @@ mod tests {
             &cfg,
             None,
             None,
+            None,
             0xABCD,
             0,
         )
@@ -4612,6 +4652,7 @@ mod tests {
             mid.current_node_id,
             &strat,
             &cfg,
+            None,
             None,
             None,
             0xABCD,
@@ -4657,6 +4698,7 @@ mod tests {
             &cfg,
             None,
             None,
+            None,
             0xABCE,
             7,
         )
@@ -4678,6 +4720,7 @@ mod tests {
             &cfg_more,
             None,
             None,
+            None,
             0xABCE,
             7,
         )
@@ -4695,6 +4738,7 @@ mod tests {
             flop2.current_node_id,
             &strat,
             &cfg_more,
+            None,
             None,
             None,
             0xABCE,
@@ -4717,6 +4761,7 @@ mod tests {
             flop2.current_node_id,
             &strat,
             &cfg_mix,
+            None,
             None,
             None,
             0xABCE,
@@ -4755,6 +4800,7 @@ mod tests {
                 flop.current_node_id,
                 &strat,
                 &cfg,
+                None,
                 None,
                 None,
                 0xB07,
@@ -4796,6 +4842,7 @@ mod tests {
             &game,
             &[],
             &cfg,
+            None,
             0xD15E,
         )
         .expect("首决策应 Ok");
@@ -4808,6 +4855,7 @@ mod tests {
             &game,
             &within,
             &cfg,
+            None,
             0xD15E,
         )
         .expect("mid-round 应 Ok");
@@ -4831,11 +4879,194 @@ mod tests {
             &game,
             &[],
             &cfg,
+            None,
             0xD15F,
         )
         .expect("换 hand_seed 仍 Ok");
         assert_eq!(cache.misses(), 2, "hand_seed 变 → miss");
     }
+
+    // —— bucket_override：子树 solve 独立换桶表（搜索区分辨率与 blueprint 表解耦）——
+
+    /// anchored 路径 bucket_override 三件套：① `Some(blueprint 自身表)` ≡ `None`（解析到同一
+    /// Arc → 同 key 命中缓存 + 输出 byte-equal，钉「override 的是解析结果而非 Option 形状」）；
+    /// ② 换成**另一张表**（stub content hash 同为全 0，仅 Arc 指针不同）→ 必 miss（key 经
+    /// 指针区分，串读 = 在错误桶空间读均衡）；③ 白盒钉**真接线**：miss 后缓存里 trainer 持有
+    /// 的子树桶表 ptr == override 表（漏接线时 solve 仍用 blueprint 表，仅靠 key 测不出来）。
+    #[test]
+    fn bucket_override_anchored_keys_and_wires_subtree_table() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x4F56_5252_4944_4531); // "OVRRIDE1"
+        let round_start = flop.game_state.clone();
+        let legal = SimplifiedNlheGame::legal_actions(&flop);
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let mut cache = SubgameSolveCache::new();
+        let d1 = subgame_search_cached(
+            Some(&mut cache),
+            &flop.game_state,
+            &round_start,
+            &game,
+            &legal,
+            flop.current_node_id,
+            &strat,
+            &cfg,
+            None,
+            None,
+            None,
+            0xB0CA,
+            0,
+        )
+        .expect("override=None 应 Ok");
+        // ① Some(blueprint 自身表)：解析到同一 Arc → 同 key 命中 + byte-equal。
+        let d2 = subgame_search_cached(
+            Some(&mut cache),
+            &flop.game_state,
+            &round_start,
+            &game,
+            &legal,
+            flop.current_node_id,
+            &strat,
+            &cfg,
+            Some(&game.bucket_table),
+            None,
+            None,
+            0xB0CA,
+            0,
+        )
+        .expect("override=Some(同表) 应 Ok");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "Some(blueprint 自身表) 须与 None 同 key（命中）"
+        );
+        assert_eq!(format!("{d1:?}"), format!("{d2:?}"), "同表 override ≡ None");
+        // ②③ 换另一张表：miss + 缓存 trainer 真持有 override 表。
+        let other = stub_table();
+        let d3 = subgame_search_cached(
+            Some(&mut cache),
+            &flop.game_state,
+            &round_start,
+            &game,
+            &legal,
+            flop.current_node_id,
+            &strat,
+            &cfg,
+            Some(&other),
+            None,
+            None,
+            0xB0CA,
+            0,
+        )
+        .expect("override=Some(另一表) 应 Ok");
+        assert!(!d3.is_empty());
+        assert_eq!(cache.misses(), 2, "换表（仅指针不同）→ 必 miss");
+        let (_, solved) = cache.entry.as_ref().expect("miss 后须 store");
+        assert!(
+            Arc::ptr_eq(&solved.trainer.game().bucket_table, &other),
+            "子树 solve 须真用 override 表（接线，非仅 key）"
+        );
+    }
+
+    /// unanchored（生产脱影子路径）同三件套：同表 override 命中 + byte-equal；换表 miss +
+    /// trainer 真持有 override 表 + 分布仍归一。
+    #[test]
+    fn bucket_override_unanchored_keys_and_wires() {
+        let game = nolimp_6max_game();
+        let auth = offstack_allin_flop_state();
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let mut cache = SubgameSolveCache::new();
+        let d1 = subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &auth,
+            &auth,
+            &game,
+            &[],
+            &cfg,
+            None,
+            0xB0CB,
+        )
+        .expect("override=None 应 Ok");
+        let d2 = subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &auth,
+            &auth,
+            &game,
+            &[],
+            &cfg,
+            Some(&game.bucket_table),
+            0xB0CB,
+        )
+        .expect("override=Some(同表) 应 Ok");
+        assert_eq!((cache.misses(), cache.hits()), (1, 1), "同表 → 命中");
+        assert_eq!(format!("{d1:?}"), format!("{d2:?}"), "同表 override ≡ None");
+        let other = stub_table();
+        let d3 = subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &auth,
+            &auth,
+            &game,
+            &[],
+            &cfg,
+            Some(&other),
+            0xB0CB,
+        )
+        .expect("override=Some(另一表) 应 Ok");
+        assert_eq!(cache.misses(), 2, "换表 → 必 miss");
+        let sum: f64 = d3.iter().map(|(_, p)| p).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "override 解分布应归一，和={sum}");
+        let (_, solved) = cache.entry.as_ref().expect("miss 后须 store");
+        assert!(
+            Arc::ptr_eq(&solved.trainer.game().bucket_table, &other),
+            "unanchored 子树 solve 须真用 override 表"
+        );
+    }
+
+    /// bucket_override 与 depth_limit 互斥（叶子续局值表按 blueprint 桶空间键，换表 = 查错桶）
+    /// → 早 `Err`，不静默择一。
+    #[test]
+    fn bucket_override_depth_limit_rejected() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let flop = hu_flop_state(&game, 0x4F56_5252_4944_4532); // "OVRRIDE2"
+        let round_start = flop.game_state.clone();
+        let legal = SimplifiedNlheGame::legal_actions(&flop);
+        let cfg_dl = SubgameSearchConfig {
+            depth_limit: true,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let other = stub_table();
+        let err = subgame_search_cached(
+            None,
+            &flop.game_state,
+            &round_start,
+            &game,
+            &legal,
+            flop.current_node_id,
+            &strat,
+            &cfg_dl,
+            Some(&other),
+            None,
+            None,
+            1,
+            0,
+        )
+        .expect_err("depth_limit + bucket_override 须 Err");
+        assert!(
+            err.contains("bucket_override 与 depth_limit 不兼容"),
+            "错误须指明互斥原因，得：{err}"
+        );
+    }
+
     // —— 缺口①续：live_traversers（traverser 只轮子树根仍 Active 的座）——
 
     /// live_traversers 端到端：off-stack 线（6 座中 3 弃牌 + UTG all-in → 仅 SB/BB Active，
@@ -4866,10 +5097,28 @@ mod tests {
             live_traversers: false,
             ..cfg
         };
-        subgame_search_unanchored_cached(Some(&mut cache), &auth, &auth, &game, &[], &off, 0x7261)
-            .expect("off 应 Ok");
-        subgame_search_unanchored_cached(Some(&mut cache), &auth, &auth, &game, &[], &cfg, 0x7261)
-            .expect("on 应 Ok");
+        subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &auth,
+            &auth,
+            &game,
+            &[],
+            &off,
+            None,
+            0x7261,
+        )
+        .expect("off 应 Ok");
+        subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &auth,
+            &auth,
+            &game,
+            &[],
+            &cfg,
+            None,
+            0x7261,
+        )
+        .expect("on 应 Ok");
         assert_eq!(
             (cache.misses(), cache.hits()),
             (2, 0),

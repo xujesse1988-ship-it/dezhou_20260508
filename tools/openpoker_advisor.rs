@@ -316,6 +316,17 @@ fn seat_map(req: &Request) -> Result<SeatMap, String> {
     })
 }
 
+/// 实时搜索运行时 = 触发/求解配置 + 可选**子树独立桶表**。`SubgameSearchConfig` 是 `Copy` 纯
+/// 配置；桶表是资源（`Arc`），分开放避免把 Arc 塞进到处按值带的 config。
+struct SearchRuntime {
+    cfg: SubgameSearchConfig,
+    /// `--search-bucket-table`：子树 solve + hero 读数用的独立桶表（如 500/500/500，比
+    /// blueprint 200 更细——子树是独立一次性求解、桶空间与 blueprint checkpoint 解耦，见
+    /// [`subgame_search_cached`] `bucket_override` doc）。`None` = 沿用 blueprint 表（旧行为
+    /// byte-equal）。blueprint 路径 / range 估计永远用 blueprint 表，不受此影响。
+    bucket_table: Option<Arc<BucketTable>>,
+}
+
 /// 一次决策：重放本手历史（100BB real + abs 两态 lockstep）→ 我方决策点。`search == None` 时
 /// 查 blueprint → outgoing（旧行为，byte-equal）；`search == Some` 且命中触发面（[`should_search`]）
 /// 时建**真码深** subgame re-solve（[`subgame_search_cached`]；`deep_menu` → 子树用 {1pot} 单档菜单 +
@@ -334,7 +345,7 @@ fn decide(
     strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
     req: &Request,
     base_seed: u64,
-    search: Option<&SubgameSearchConfig>,
+    search: Option<&SearchRuntime>,
     solve_cache: &mut SubgameSolveCache,
 ) -> Response {
     // —— 前置校验（不满足 = 兜底）——
@@ -457,14 +468,14 @@ fn decide(
             // 缺节点）：缺口②续——`--search` 开且 postflop → **脱影子**搜索（触发 / 子树根 /
             // within-round 导航全来自真栈重放，[`subgame_search_unanchored`]）；preflop / 未开
             // 搜索 → 维持旧兜底（preflop 走 blueprint 的 gating 不变，§1；search=None byte-equal）。
-            if let Some(scfg) = search {
+            if let Some(rt) = search {
                 if board.len() >= 3 {
                     return decide_search_unanchored(
                         game,
                         abstraction,
                         req,
                         base_seed,
-                        scfg,
+                        rt,
                         &solver_cfg,
                         scale,
                         &smap,
@@ -492,7 +503,7 @@ fn decide(
 
     // —— gating（设计 §1）：仅 `--search` 开 + 命中触发面才搜索；否则 blueprint。
     // should_search 只读街 + 本街是否已起注（与码深无关）→ 在 100BB `real` 上判等价真栈 auth。
-    let want_search = matches!(search, Some(scfg) if should_search(&real, scfg.trigger));
+    let want_search = matches!(search, Some(rt) if should_search(&real, rt.cfg.trigger));
     // dist + outgoing 基准态：默认 = blueprint 分布 + 100BB real 算尺寸（search=None / 未触发，
     // byte-equal 旧行为）；搜索触发 = 真码深 auth 子博弈解 + auth 算尺寸（失败 → check-when-free，不回落）。
     // deep_abs_holder：缺口③ deep 搜索成功时记下与子树**同一**菜单（deep_menu_for(root_state)，
@@ -500,7 +511,8 @@ fn decide(
     let mut auth_holder: Option<GameState> = None;
     let mut deep_abs_holder: Option<StreetActionAbstraction> = None;
     let dist: Vec<(AbstractAction, f64)> = if want_search {
-        let scfg = search.expect("want_search ⇒ search.is_some()");
+        let rt = search.expect("want_search ⇒ search.is_some()");
+        let scfg = &rt.cfg;
         // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ 安全降级。
         let (auth, round_start, within) =
             match build_real_auth(req, &solver_cfg, scale, &smap, my_seat_solver, hole, &board) {
@@ -521,6 +533,8 @@ fn decide(
             node_id,
             strategy_fn,
             scfg,
+            // --search-bucket-table：子树 solve + hero 读数换独立桶表（None = blueprint 表）。
+            rt.bucket_table.as_ref(),
             None, // depth_limit=false 解到终局 → 无 leaf_values（§2.1）。
             // deep_menu mid-round（AllPostflop）导航：当前街真实动作序在子树上重放（缺口③细化）。
             Some(&within),
@@ -846,7 +860,7 @@ fn decide_search_unanchored(
     abstraction: &StreetActionAbstraction,
     req: &Request,
     base_seed: u64,
-    scfg: &SubgameSearchConfig,
+    rt: &SearchRuntime,
     solver_cfg: &TableConfig,
     scale: u64,
     smap: &SeatMap,
@@ -856,6 +870,7 @@ fn decide_search_unanchored(
     shadow_reason: &str,
     solve_cache: &mut SubgameSolveCache,
 ) -> Response {
+    let scfg = &rt.cfg;
     // 真栈重放（auth / 轮起点快照 / 当前街真实动作序）。建不了 = §2.3「建不了树」→ 安全降级。
     let (auth, round_start, within) =
         match build_real_auth(req, solver_cfg, scale, smap, my_seat_solver, hole, board) {
@@ -875,6 +890,7 @@ fn decide_search_unanchored(
         game,
         &within,
         scfg,
+        rt.bucket_table.as_ref(), // --search-bucket-table：子树独立桶表（None = blueprint 表）。
         hand_seed,
     ) {
         Ok(d) => d,
@@ -1024,6 +1040,9 @@ struct Args {
     /// 缺口②实时搜索：`Some` = `--search` 开（postflop 触发面 re-solve 真码深子博弈）；`None`
     /// （默认）= 纯 blueprint（旧行为 byte-equal）。其余 search 字段由 `--search-*` flag 填。
     search: Option<SubgameSearchConfig>,
+    /// `--search-bucket-table`：子树 solve 用的独立桶表路径（[`SearchRuntime`] doc；`None` =
+    /// 沿用 `--bucket-table`）。仅 `--search` 开时可设（同其余 `--search-*` 的拒静默 guard）。
+    search_bucket_table: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -1101,17 +1120,34 @@ fn run() -> Result<(), String> {
     let game = trainer.game();
     let abstraction = game.abstraction().clone();
 
+    // --search-bucket-table：子树 solve 的独立桶表（SearchRuntime doc）。启动期 open（坏路径
+    // 早 fail，不等首次搜索才炸）；blueprint 表 / range 估计不受影响。
+    let search_rt: Option<SearchRuntime> = match args.search {
+        Some(cfg) => {
+            let bucket_table = match &args.search_bucket_table {
+                Some(p) => Some(Arc::new(BucketTable::open(p).map_err(|e| {
+                    format!("BucketTable::open({}) failed: {e:?}", p.display())
+                })?)),
+                None => None,
+            };
+            Some(SearchRuntime { cfg, bucket_table })
+        }
+        None => None,
+    };
+
     let ready = ReadyLine {
         ready: true,
         update_count: trainer.update_count(),
         reshape: args.reshape.clone(),
         n_seats: N_SEATS,
-        search: args.search.is_some(),
+        search: search_rt.is_some(),
     };
-    if let Some(scfg) = &args.search {
+    if let Some(rt) = &search_rt {
+        let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} bucket_table={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix,
+            args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
     }
     eprintln!(
@@ -1146,7 +1182,7 @@ fn run() -> Result<(), String> {
                 &strategy_fn,
                 &req,
                 args.seed,
-                args.search.as_ref(),
+                search_rt.as_ref(),
                 &mut solve_cache,
             ),
             // 解析失败也不崩：出 fold（最保守；没有 valid 信息可用）。
@@ -1187,6 +1223,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_live_traversers = false;
     let mut search_max_nodes: usize = SubgameSearchConfig::default().max_subtree_nodes;
     let mut search_range_uniform_mix: Option<f64> = None;
+    let mut search_bucket_table: Option<PathBuf> = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -1245,6 +1282,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 }
                 search_range_uniform_mix = Some(v);
             }
+            "--search-bucket-table" => {
+                search_bucket_table = Some(PathBuf::from(next_val(&mut it, &arg)?))
+            }
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -1288,6 +1328,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_live_traversers
             || search_max_nodes != SubgameSearchConfig::default().max_subtree_nodes
             || search_range_uniform_mix.is_some()
+            || search_bucket_table.is_some()
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
         }
@@ -1300,6 +1341,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         postflop_cap,
         seed,
         search,
+        search_bucket_table,
     })
 }
 
@@ -1315,6 +1357,15 @@ fn next_val(it: &mut impl Iterator<Item = String>, name: &str) -> Result<String,
 mod tests {
     use super::*;
     use poker::BucketConfig;
+
+    /// 把纯 config 包成 [`SearchRuntime`]（子树桶表 = None，沿用 blueprint 表——既有搜索测试
+    /// 全不换表，行为与改前 byte-equal）。
+    fn rt(cfg: SubgameSearchConfig) -> SearchRuntime {
+        SearchRuntime {
+            cfg,
+            bucket_table: None,
+        }
+    }
 
     // N=2 redirect（debug 建树快、6 座不变）；preopen 含 0.5/1.0 开池档。
     fn preopen_game() -> SimplifiedNlheGame {
@@ -1724,7 +1775,7 @@ mod tests {
             &uniform,
             &req,
             0x5EED,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(
@@ -1753,7 +1804,7 @@ mod tests {
             &uniform,
             &req,
             0xA11CE,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert!(is_legal(&resp, &req.valid), "搜索动作须合法，得 {resp:?}");
@@ -1781,7 +1832,7 @@ mod tests {
             &uniform,
             &req,
             0xA11CE,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(resp, again, "同 seed 搜索须确定性（byte-equal 可复现）");
@@ -1808,7 +1859,7 @@ mod tests {
             &uniform,
             &req,
             0xDEE7,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert!(
@@ -1842,7 +1893,7 @@ mod tests {
             &uniform,
             &req,
             0xF01D,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(
@@ -1878,7 +1929,7 @@ mod tests {
             &uniform,
             &req,
             0xDEE9,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert!(
@@ -1895,7 +1946,7 @@ mod tests {
             &uniform,
             &req,
             0xDEE9,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(resp, again, "同 seed deep_menu 搜索须确定性（可复现）");
@@ -1934,7 +1985,7 @@ mod tests {
             &uniform,
             &req,
             0xDEEA,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert!(
@@ -1951,7 +2002,7 @@ mod tests {
             &uniform,
             &req,
             0xDEEA,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(resp, again, "同 seed 浅码宽菜单搜索须确定性（可复现）");
@@ -1998,7 +2049,7 @@ mod tests {
             &uniform,
             &req1,
             0xCAC4E,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut cache,
         );
         assert_eq!(r1.source, "search", "决策 1 应解出，得 {r1:?}");
@@ -2009,7 +2060,7 @@ mod tests {
             &uniform,
             &req2,
             0xCAC4E,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut cache,
         );
         assert_eq!(
@@ -2028,7 +2079,7 @@ mod tests {
             &uniform,
             &req2,
             0xCAC4E,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(
@@ -2133,7 +2184,7 @@ mod tests {
             &uniform,
             &req,
             0x0FF5,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert!(
@@ -2150,7 +2201,7 @@ mod tests {
             &uniform,
             &req,
             0x0FF5,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(resp, again, "同 seed 脱影子搜索须确定性（可复现）");
@@ -2177,7 +2228,7 @@ mod tests {
             &uniform,
             &req,
             0x0FF6,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert!(
@@ -2233,7 +2284,7 @@ mod tests {
             &uniform,
             &req,
             1,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(
@@ -2333,7 +2384,7 @@ mod tests {
             &uniform,
             &req,
             0x11B9,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert!(
@@ -2509,7 +2560,7 @@ mod tests {
             &uniform,
             &full,
             0xA11CE,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert!(is_legal(&resp, &full.valid), "得 {resp:?}");
@@ -2523,7 +2574,7 @@ mod tests {
             &uniform,
             &full,
             0xA11CE,
-            Some(&scfg),
+            Some(&rt(scfg)),
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(resp, again, "同 seed 短桌搜索须确定性");
@@ -2781,5 +2832,29 @@ mod tests {
         assert!(parse(&["--search", "--search-range-uniform-mix", "-0.1"]).is_err());
         // 拒绝静默 guard：设了 flag 未开 --search → Err。
         assert!(parse(&["--search-range-uniform-mix", "0.25"]).is_err());
+    }
+
+    /// `--search-bucket-table`（子树独立桶表路径）：默认 None（沿用 blueprint 表）、显式给 =
+    /// 透传路径、未开 --search 拒收（拒绝静默 guard——设了表却跑纯 blueprint 是配置错误）。
+    #[test]
+    fn parse_args_search_bucket_table() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        // 默认 = None（搜索沿用 blueprint 表，旧行为）。
+        let a = parse(&["--search"]).expect("parse Ok");
+        assert!(a.search_bucket_table.is_none());
+        // 显式给 → 路径透传。
+        let a = parse(&["--search", "--search-bucket-table", "fine_500.bin"]).expect("parse Ok");
+        assert_eq!(
+            a.search_bucket_table.as_deref(),
+            Some(std::path::Path::new("fine_500.bin"))
+        );
+        // 拒绝静默 guard：设了表未开 --search → Err。
+        assert!(parse(&["--search-bucket-table", "fine_500.bin"]).is_err());
     }
 }
