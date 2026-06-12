@@ -4942,9 +4942,14 @@ mod tests {
     }
 
     /// 限时杠杆③吞吐实测（vultr 4-core 跑：`cargo test --release -- --ignored \
-    /// _measure_solve_threads_throughput --nocapture`）：同 time_budget 下 solve_threads=1 vs 4
-    /// 的 update 数（经 [`SubgameSolveCache::entry_update_count`] 读数）。预期 ≈ ×3（rayon
-    /// 4 worker 减调度/合并开销）；本测试只打印不断言比值（吞吐受机器负载影响，断言留给读数）。
+    /// _measure_solve_threads_throughput --nocapture`）：同 time_budget 下 solve_threads=1/2/4
+    /// 的 update 数（经 [`SubgameSolveCache::entry_update_count`] 读数）。
+    ///
+    /// **桶表两档**：stub（postflop 全归桶 0 → infoset 极少 = delta 合并密度被人为放大，
+    /// 并行 scaling 的**悲观下界**）+ 真 schema-v4 表（`SUBGAME_CAL_BUCKET_TABLE`，缺省
+    /// `_measure_convergence_calibration` 同款 500/500/500，vultr 已有；per-hand 真桶 →
+    /// 每 update 计算更重 / 合并占比更小 = 接近生产）。两档都打（真表打不开只打 stub 档），
+    /// 只打印不断言比值（吞吐受机器负载影响，结论留给读数）。
     #[test]
     #[ignore]
     fn _measure_solve_threads_throughput() {
@@ -4953,40 +4958,57 @@ mod tests {
         let auth = flop.game_state.clone();
         let legal_abs = SimplifiedNlheGame::legal_actions(&flop);
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
-        for threads in [1usize, 2, 4] {
-            let cfg = SubgameSearchConfig {
-                iterations: u64::MAX,
-                max_subtree_nodes: 1_000_000,
-                trigger: SearchTrigger::AllPostflop,
-                time_budget: Some(Duration::from_millis(1000)),
-                solve_threads: threads,
-                ..SubgameSearchConfig::default()
+        let bucket_path = std::env::var("SUBGAME_CAL_BUCKET_TABLE").unwrap_or_else(|_| {
+            "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin".to_string()
+        });
+        let real: Option<Arc<BucketTable>> =
+            match BucketTable::open(std::path::Path::new(&bucket_path)) {
+                Ok(t) => Some(Arc::new(t)),
+                Err(e) => {
+                    eprintln!("[measure] WARN 打不开真桶表 {bucket_path}: {e:?} → 只打 stub 档");
+                    None
+                }
             };
-            let mut cache = SubgameSolveCache::new();
-            let t0 = Instant::now();
-            subgame_search_cached(
-                Some(&mut cache),
-                &auth,
-                &auth,
-                &game,
-                &legal_abs,
-                flop.current_node_id,
-                &strat,
-                &cfg,
-                None,
-                None,
-                None,
-                0x1234,
-                3,
-            )
-            .expect("预算 1s 充裕应 Ok");
-            let wall = t0.elapsed();
-            let updates = cache.entry_update_count().expect("solve 已入缓存");
-            println!(
-                "[measure] solve_threads={threads}: updates={updates} wall={wall:?} \
-                 ({:.1}k updates/s)",
-                updates as f64 / wall.as_secs_f64() / 1e3
-            );
+        let modes: Vec<(&str, Option<&Arc<BucketTable>>)> = match &real {
+            Some(t) => vec![("stub", None), ("real500", Some(t))],
+            None => vec![("stub", None)],
+        };
+        for (mode, table_override) in modes {
+            for threads in [1usize, 2, 4] {
+                let cfg = SubgameSearchConfig {
+                    iterations: u64::MAX,
+                    max_subtree_nodes: 1_000_000,
+                    trigger: SearchTrigger::AllPostflop,
+                    time_budget: Some(Duration::from_millis(1000)),
+                    solve_threads: threads,
+                    ..SubgameSearchConfig::default()
+                };
+                let mut cache = SubgameSolveCache::new();
+                let t0 = Instant::now();
+                subgame_search_cached(
+                    Some(&mut cache),
+                    &auth,
+                    &auth,
+                    &game,
+                    &legal_abs,
+                    flop.current_node_id,
+                    &strat,
+                    &cfg,
+                    table_override,
+                    None,
+                    None,
+                    0x1234,
+                    3,
+                )
+                .expect("预算 1s 充裕应 Ok");
+                let wall = t0.elapsed();
+                let updates = cache.entry_update_count().expect("solve 已入缓存");
+                println!(
+                    "[measure] bucket={mode} solve_threads={threads}: updates={updates} \
+                     wall={wall:?} ({:.1}k updates/s)",
+                    updates as f64 / wall.as_secs_f64() / 1e3
+                );
+            }
         }
     }
 
