@@ -1089,6 +1089,7 @@ fn debug_dump_subgame(
     }
     // 浅层 BFS：每个决策节点 actor 的 range 加权平均策略（看「对手面对 jam 弃多少」之类的总量）。
     let mut rng = ChaCha20Rng::from_seed(0xDEB6_0001);
+    let root_street = sub.node(sub.root_id()).street;
     let mut queue: VecDeque<(NodeId, String, usize)> = VecDeque::new();
     queue.push_back((sub.root_id(), "root".to_string(), 0));
     let mut printed = 0usize;
@@ -1097,6 +1098,11 @@ fn debug_dump_subgame(
             break;
         }
         let node = sub.node(id);
+        // 只 dump root 街内节点：跨街节点要真实发牌后的 board，query 用 root_state 会撞
+        // canonical_observation_id 的 board 长度断言（诊断代码自身限制，与生产无关）。
+        if node.street != root_street {
+            continue;
+        }
         let actor = node.player_acting as usize;
         let r = match ranges.get(actor) {
             Some(r) if !r.is_empty() => r,
