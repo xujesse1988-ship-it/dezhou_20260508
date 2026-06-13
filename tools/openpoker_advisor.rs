@@ -100,10 +100,18 @@ const ABS_REPLAY_SEED: u64 = 0x4142_5336_454d_5800; // "ABS6EMX\0"
 /// 的坚果占比（同花成牌河）+ per-bucket 均衡选择噪声驱动，平滑不承诺改写它；激进度的后续杠杆
 /// 见 exec 文档 §3.2（低频动作降信 / 向 blueprint 回拉）。
 const DEFAULT_SEARCH_RANGE_UNIFORM_MIX: f64 = 0.25;
-/// 单决策搜索墙钟告警阈（ms）：预期最坏 = 单线程建树（4-way@20× 宽档 ~2.7s）+ time_budget（5s）
-/// ≈ 7.7s；> 此值 = 异常（树比闸允许的更大 / 机器争用 / 预热没命中在现解）→ stderr 打 `SLOW`
-/// 便于 `grep SLOW`。监控用、不改行为。
-const SEARCH_WALL_SLOW_MS: u128 = 8000;
+/// 搜索墙钟告警阈的建树余量（ms）：最坏单线程建树 ≈ 4-way@20× 宽档 ~2.7s，留 3s。
+const SEARCH_WALL_BUILD_MARGIN_MS: u128 = 3000;
+/// 无 `time_budget`（固定迭代）时的告警阈回落（ms）。
+const SEARCH_WALL_SLOW_FALLBACK_MS: u128 = 8000;
+/// 单决策搜索墙钟告警阈：`time_budget + 建树余量`——即「比满预算 solve + 最坏建树**还**慢」才
+/// 算异常（树超闸 / 近 cap 大树 / 机器争用），**不把每个满预算 cache-MISS 都误报 SLOW**（这正是
+/// 8s 预算下硬编码 8000 会犯的错）。`grep SLOW` 定位真正慢的手。监控用、不改行为。
+fn search_wall_slow_ms(cfg: &SubgameSearchConfig) -> u128 {
+    cfg.time_budget
+        .map(|d| d.as_millis() + SEARCH_WALL_BUILD_MARGIN_MS)
+        .unwrap_or(SEARCH_WALL_SLOW_FALLBACK_MS)
+}
 
 // ===========================================================================
 // driver ↔ advisor JSON 协议（§2）
@@ -240,13 +248,14 @@ fn street_label(s: poker::Street) -> &'static str {
 
 /// 每次搜索决策的监控行（stderr）：solve 实际 update 数 / 街 / 本决策墙钟（build+solve；预热
 /// 命中时 ≈0）/ 本决策是否命中缓存（HIT=复用预热/同街 solve；MISS=现 build+solve）/ 累计命中。
-/// `wall_ms > SEARCH_WALL_SLOW_MS` 追加 ` SLOW`（长跑监控 `grep SLOW`）。纯日志、不改决策。
+/// `wall_ms > slow_ms`（[`search_wall_slow_ms`]）追加 ` SLOW`（长跑监控 `grep SLOW`）。纯日志。
 #[allow(clippy::too_many_arguments)]
 fn log_search_wall(
     tag: &str,
     street: poker::Street,
     updates: u64,
     wall_ms: u128,
+    slow_ms: u128,
     hit: bool,
     hits: u64,
     misses: u64,
@@ -260,7 +269,7 @@ fn log_search_wall(
         if hit { "HIT" } else { "MISS" },
         hits,
         misses,
-        if wall_ms > SEARCH_WALL_SLOW_MS { " SLOW" } else { "" },
+        if wall_ms > slow_ms { " SLOW" } else { "" },
     );
 }
 
@@ -511,7 +520,7 @@ fn prewarm(
                 wall_ms,
                 solve_cache.hits(),
                 solve_cache.misses(),
-                if wall_ms > SEARCH_WALL_SLOW_MS { " SLOW" } else { "" },
+                if wall_ms > search_wall_slow_ms(scfg) { " SLOW" } else { "" },
             );
             let mut resp = mk("prewarm:stored".into());
             resp.street = Some(street_label(round_start.street()).into());
@@ -786,6 +795,7 @@ fn decide(
                     street,
                     solve_updates.unwrap_or(0),
                     wall_ms,
+                    search_wall_slow_ms(scfg),
                     hit,
                     solve_cache.hits(),
                     solve_cache.misses(),
@@ -1170,6 +1180,7 @@ fn decide_search_unanchored(
         auth.street(),
         solve_updates.unwrap_or(0),
         wall_ms,
+        search_wall_slow_ms(scfg),
         hit,
         solve_cache.hits(),
         solve_cache.misses(),
