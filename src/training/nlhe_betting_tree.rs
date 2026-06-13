@@ -236,14 +236,16 @@ pub fn deep_wide_half_pot() -> (StreetActionAbstraction, BettingAbstractionRules
 /// SPR ≤ 4 时 ~2 层进攻即触 all-in、到终局层数有限。
 pub const DEEP_MENU_SPR_WIDE_MAX: u64 = 4;
 
-/// [`deep_menu_for`] 的人数闸：Active 座位数 ≤ 3 才许宽菜单。**实测依据（2026-06-10
-/// vultr）**：6-way 25BB limped flop（恰 4×pot 边界）宽档子树 = **558,360 节点** vs {1pot}
-/// 27,108（20.6×）——多人格的菜单加宽是乘性爆炸、吃光 5s 建树预算（A② 建树 ~2.6ms/千节点
-/// → ~1.5s），而 live 浅码池绝大多数是 fold 剩 2–3 家的小池；4+way 浅码维持 {1pot}（
-/// fold/call/1pot/all-in 已覆盖 commit 决策）。3-way 边界树大小由
-/// `deep_menu_spr_adaptive_selection_and_boundary_tree_bounded` 钉住；任何越界仍有
-/// `max_subtree_nodes` cap 兜底 → Err → check-when-free，不 panic。
-pub const DEEP_MENU_WIDE_MAX_ACTIVE: usize = 3;
+/// [`deep_menu_for`] 的人数闸：Active 座位数 ≤ 4 才许宽菜单（2026-06-13 从 3 放宽到 4——
+/// 4-way 浅码也吃宽 `{0.5,1}` 档）。**实测依据（2026-06-10/06-13 vultr，恰 4×pot 边界
+/// limped flop 宽档子树节点数）**：3-way = 边界 ≤200k / **4-way = 见
+/// `deep_menu_spr_adaptive_selection_and_boundary_tree_bounded` ⑤ 实测** / 6-way = 558,360
+/// （vs 同状态 {1pot} 27,108，20.6×）——菜单加宽随人数乘性爆炸、5+way 吃光 5s 建树预算
+/// （A② 建树 ~2.6ms/千节点），故 5+way 浅码维持 {1pot}（fold/call/1pot/all-in 已覆盖 commit
+/// 决策）。4-way 边界树大小由 `deep_menu_spr_adaptive_selection_and_boundary_tree_bounded`
+/// 钉住（须 < 生产 `max_subtree_nodes` 4M，留足建树预算）；任何越界仍有 `max_subtree_nodes`
+/// cap 兜底 → Err → check-when-free，不 panic。
+pub const DEEP_MENU_WIDE_MAX_ACTIVE: usize = 4;
 
 /// 缺口③ v2 细化（SPR 自适应菜单宽度，exec 文档 §2.1「深码单档、短码可放宽」/ §3.2 缺口③
 /// 「仍未做②」）：按子树根（轮起点）的 SPR + 人数选深码搜索菜单——**浅 SPR
