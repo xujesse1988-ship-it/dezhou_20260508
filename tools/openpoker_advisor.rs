@@ -65,7 +65,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +100,10 @@ const ABS_REPLAY_SEED: u64 = 0x4142_5336_454d_5800; // "ABS6EMX\0"
 /// 的坚果占比（同花成牌河）+ per-bucket 均衡选择噪声驱动，平滑不承诺改写它；激进度的后续杠杆
 /// 见 exec 文档 §3.2（低频动作降信 / 向 blueprint 回拉）。
 const DEFAULT_SEARCH_RANGE_UNIFORM_MIX: f64 = 0.25;
+/// 单决策搜索墙钟告警阈（ms）：预期最坏 = 单线程建树（4-way@20× 宽档 ~2.7s）+ time_budget（5s）
+/// ≈ 7.7s；> 此值 = 异常（树比闸允许的更大 / 机器争用 / 预热没命中在现解）→ stderr 打 `SLOW`
+/// 便于 `grep SLOW`。监控用、不改行为。
+const SEARCH_WALL_SLOW_MS: u128 = 8000;
 
 // ===========================================================================
 // driver ↔ advisor JSON 协议（§2）
@@ -232,6 +236,32 @@ fn street_label(s: poker::Street) -> &'static str {
         poker::Street::River => "river",
         poker::Street::Showdown => "showdown",
     }
+}
+
+/// 每次搜索决策的监控行（stderr）：solve 实际 update 数 / 街 / 本决策墙钟（build+solve；预热
+/// 命中时 ≈0）/ 本决策是否命中缓存（HIT=复用预热/同街 solve；MISS=现 build+solve）/ 累计命中。
+/// `wall_ms > SEARCH_WALL_SLOW_MS` 追加 ` SLOW`（长跑监控 `grep SLOW`）。纯日志、不改决策。
+#[allow(clippy::too_many_arguments)]
+fn log_search_wall(
+    tag: &str,
+    street: poker::Street,
+    updates: u64,
+    wall_ms: u128,
+    hit: bool,
+    hits: u64,
+    misses: u64,
+) {
+    eprintln!(
+        "[openpoker_advisor] search{} solve updates={} street={} wall_ms={} cache={} ({}hit/{}miss){}",
+        tag,
+        updates,
+        street_label(street),
+        wall_ms,
+        if hit { "HIT" } else { "MISS" },
+        hits,
+        misses,
+        if wall_ms > SEARCH_WALL_SLOW_MS { " SLOW" } else { "" },
+    );
 }
 
 fn expected_board_len(s: poker::Street) -> usize {
@@ -446,6 +476,8 @@ fn prewarm(
         return mk("prewarm:skip:hero_not_active".into());
     }
     let hand_seed = hand_seed_for(req, base_seed);
+    // 监控：预热 build+solve 墙钟（= 藏进对手思考时间的成本；> 对手用时则 hero 决策仍会 MISS 现解）。
+    let t0 = Instant::now();
     // —— 路径分类与 decide 同源：lockstep Ok → 锚定；Err（off-stack / limp 线）→ 脱影子 ——
     let result = match lockstep_replay(game, &solver_cfg, &smap, req, scale, board.len(), None) {
         Ok((_real, abs)) => subgame_search_prewarm(
@@ -470,13 +502,16 @@ fn prewarm(
     };
     match result {
         Ok(()) => {
+            let wall_ms = t0.elapsed().as_millis();
             let updates = solve_cache.entry_update_count();
             eprintln!(
-                "[openpoker_advisor] prewarm stored street={} updates={} cache={}hit/{}miss",
+                "[openpoker_advisor] prewarm stored street={} updates={} wall_ms={} cache={}hit/{}miss{}",
                 street_label(round_start.street()),
                 updates.unwrap_or(0),
+                wall_ms,
                 solve_cache.hits(),
-                solve_cache.misses()
+                solve_cache.misses(),
+                if wall_ms > SEARCH_WALL_SLOW_MS { " SLOW" } else { "" },
             );
             let mut resp = mk("prewarm:stored".into());
             resp.street = Some(street_label(round_start.street()).into());
@@ -720,6 +755,9 @@ fn decide(
             ResolveRoot::CurrentDecision => &auth,
         };
         let hand_seed = hand_seed_for(req, base_seed);
+        // 监控：本决策搜索墙钟（build+solve；预热命中 ≈0）+ 是否现 build（misses 涨 = MISS）。
+        let t0 = Instant::now();
+        let misses_before = solve_cache.misses();
         match subgame_search_cached(
             Some(solve_cache), // within-round solve 缓存：同手同街命中 → 复用 solve 只重导航。
             &auth,
@@ -739,14 +777,18 @@ fn decide(
         ) {
             Ok(d) => {
                 // 遥测：本次决策用到的 solve 实际跑了多少 update（time_budget anytime 下
-                // 即「5s 内迭代数」；命中 = 复用 solve 的原始计数）。
+                // 即「5s 内迭代数」；命中 = 复用 solve 的原始计数）+ 墙钟 + 缓存命中。
+                let wall_ms = t0.elapsed().as_millis();
+                let hit = solve_cache.misses() == misses_before;
                 solve_updates = solve_cache.entry_update_count();
-                eprintln!(
-                    "[openpoker_advisor] search solve updates={} street={} cache={}hit/{}miss",
+                log_search_wall(
+                    "",
+                    street,
                     solve_updates.unwrap_or(0),
-                    street_label(street),
+                    wall_ms,
+                    hit,
                     solve_cache.hits(),
-                    solve_cache.misses()
+                    solve_cache.misses(),
                 );
                 if scfg.deep_menu {
                     deep_abs_holder = Some(deep_menu_for(root_state).0);
@@ -1105,6 +1147,8 @@ fn decide_search_unanchored(
         return safe_fallback(&req.valid, shadow_reason);
     }
     let hand_seed = hand_seed_for(req, base_seed);
+    let t0 = Instant::now();
+    let misses_before = solve_cache.misses();
     let dist = match subgame_search_unanchored_cached(
         Some(solve_cache), // within-round solve 缓存（同锚定路径；kind 进 key、两路不串条目）。
         &auth,
@@ -1118,13 +1162,17 @@ fn decide_search_unanchored(
         Ok(d) => d,
         Err(reason) => return search_giveup(&req.valid, &format!("unanchored:{reason}")),
     };
+    let wall_ms = t0.elapsed().as_millis();
+    let hit = solve_cache.misses() == misses_before;
     let solve_updates = solve_cache.entry_update_count();
-    eprintln!(
-        "[openpoker_advisor] search solve updates={} street={} cache={}hit/{}miss (unanchored)",
+    log_search_wall(
+        ":unanchored",
+        auth.street(),
         solve_updates.unwrap_or(0),
-        street_label(auth.street()),
+        wall_ms,
+        hit,
         solve_cache.hits(),
-        solve_cache.misses()
+        solve_cache.misses(),
     );
     // outgoing：真栈 auth + 与子树同一抽象（deep_menu → deep_menu_for(round_start)，SPR 自适应：
     // 深 {1pot} / 浅 {0.5,1}；否则 blueprint 菜单）——子树自身合法集契约（同 deep 路径）：

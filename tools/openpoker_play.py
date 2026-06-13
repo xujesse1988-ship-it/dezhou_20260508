@@ -370,6 +370,9 @@ class Session:
                          "limp_heuristic": 0, "fallback": 0, "net_chips": 0,
                          "prewarms": 0,
                          "hh_hands": 0, "hh_skipped": 0, "watchdog_rejoins": 0}
+        # 兜底/giveup 原因直方图（监控长跑异常点）：key = source 前 80 字符（同类归并、类别区分），
+        # 首次见某 key 时打 [new-fallback] 提醒——新失败模式（如 Call 塌缩）立刻冒泡、不必事后 grep。
+        self.fallback_reasons = {}
         self.state = {"hand": None, "table_id": None, "last_seq": 0}
         self.client_action_id = [0]
         # 看门狗（run_real 的后台线程读写）：最近一次 hand_result / 任意消息的时刻 + 当前 ws。
@@ -464,6 +467,15 @@ class Session:
         elif t == "hand_result":
             self._handle_hand_result(ws, msg)
             self.counters["hands"] += 1
+            # 长跑心跳（每 25 手）：tail -f 可见进度 + 兜底率漂移 + top-3 兜底原因，不必等收尾。
+            if self.counters["hands"] % 25 == 0 and self.counters["hands"] < self.num_hands:
+                c = self.counters
+                top = sorted(self.fallback_reasons.items(), key=lambda kv: -kv[1])[:3]
+                top_s = "; ".join(f"{v}× {k}" for k, v in top) or "—"
+                print(f"  [♥ {c['hands']}h] dec={c['decisions']} bp={c['blueprint']} "
+                      f"search={c['search']} fb={c['fallback']}"
+                      f"({100.0 * c['fallback'] / c['decisions'] if c['decisions'] else 0:.1f}%) "
+                      f"net={c['net_chips']} | top-fb: {top_s}", file=sys.stderr)
             if self.counters["hands"] >= self.num_hands:
                 print(f"  打满 {self.num_hands} 手，离场。", file=sys.stderr)
                 ws.close()
@@ -518,6 +530,11 @@ class Session:
         src = str(resp.get("source", ""))
         if src.startswith("fallback") or src.startswith("search_giveup"):
             self.counters["fallback"] += 1
+            key = src[:80]
+            if key not in self.fallback_reasons:
+                print(f"  [new-fallback decisions={self.counters['decisions']}] {src}",
+                      file=sys.stderr)
+            self.fallback_reasons[key] = self.fallback_reasons.get(key, 0) + 1
         elif src.startswith("search"):
             self.counters["search"] += 1
         elif src.startswith("limp_heuristic"):
@@ -627,7 +644,7 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
         log_f.close()
     if hh_f:
         hh_f.close()
-    _report(session.counters)
+    _report(session.counters, session.fallback_reasons)
 
 
 def _street_name(s):
@@ -637,7 +654,7 @@ def _street_name(s):
     return ["preflop", "flop", "turn", "river"][s] if isinstance(s, int) and 0 <= s <= 3 else "preflop"
 
 
-def _report(counters):
+def _report(counters, fallback_reasons=None):
     d = counters["decisions"]
     fb = counters["fallback"]
     print(f"hands={counters['hands']} decisions={d} "
@@ -648,6 +665,11 @@ def _report(counters):
           f"hh={counters.get('hh_hands', 0)}(+{counters.get('hh_skipped', 0)} skipped) "
           f"watchdog_rejoins={counters.get('watchdog_rejoins', 0)}",
           file=sys.stderr)
+    # 兜底/giveup 原因直方图（降序）：长跑收尾一眼看清白丢手的成因构成（新失败模式 / 粒度税 / 短桌等）。
+    if fallback_reasons:
+        print("  兜底/giveup 原因（降序）:", file=sys.stderr)
+        for k, v in sorted(fallback_reasons.items(), key=lambda kv: -kv[1]):
+            print(f"    {v:>5}× {k}", file=sys.stderr)
 
 
 # ===========================================================================
