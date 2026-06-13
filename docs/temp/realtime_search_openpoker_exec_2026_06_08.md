@@ -621,7 +621,15 @@ EV 标尺，只有 live 这一个弱 EV 判据 + 结构性正确性论证。**
    `--search-solve-threads`、driver 透传；默认 1 = 单线程 byte-equal，进 solve 缓存 key），同预算 update ≈ ×物理核数——
    「按核数外推」对 solve 现在成立、对 build 仍不成立。vultr 实测（4 vCPU = 2 物理核 ×SMT2，真 500 桶表 1s 预算）：
    update ×1.92@4t ≈ 该机 SMT 上限；动机 = deep_menu 加宽下注档（infoset 乘性变多 → per-bucket 样本变稀）用并行换回采样密度。
-   仍要在目标部署机上实测、不拿测试机数当部署结论。限时求解用墙钟 anytime
+   仍要在目标部署机上实测、不拿测试机数当部署结论。**RoundStart 预热也已落地（2026-06-12，commit `4a62655`→`8ad7d84`，
+   vultr 40+27+6/0 + 真 1B nolimp selftest 端到端命中实证 = 决策 `solve_updates` 与预热逐数相同）**：RoundStart 设计下子树
+   solve 的全部输入（root_state / entrants / raises=0 / ranges 只依赖之前街 / seed_ordinal=街索引 / hand_seed 不含 actions）
+   在街开始即已知 → driver `--search-prewarm` 在 community_cards 到达、hero 行动**前**发预热请求（发后不等响应、decide 前按
+   计数 drain），advisor 提前 build+solve 暖 `SubgameSolveCache`，hero 首决策 key 命中只做导航/读数——**build+solve wall 藏进
+   对手思考时间**（既有「mid-round wall ≈ 0」扩到首决策）。正确性由 key 兜底（错配 = miss 现解）；关键坑 = range 平滑「不混」
+   座必须按 hero 算而非街首行动者（`subgame_search_prewarm` 的 actor_override，λ=0.25 生产默认下接错 → key 必 miss 静默失效，
+   λ>0 + 非均匀 σ 的回归测试钉死）。注意它**隐藏**等待、不缩短 build 本身——6-way 深码 20s 建树仍超对手常见思考时间，build
+   侧优化不被替代。限时求解用墙钟 anytime
    （解到时限就停），它和 byte-equal 互斥——限时求解做不到 byte-equal 也不强求（§2.3），靠 seeded-RNG + replay/AIVAT 可复现。
    **5s 解不出来 → 收时限范围 / 换更强单核 / build 优化**是 §4.1 步 A② / B / C 的明确决策点，不能默默当作做到了。
 5. **验证闭环慢且脆**：放弃自对弈真值后，核心区离线只剩**结构性正确**（守恒 / byte-equal / PokerKit / 实时解≈离线CFR /
