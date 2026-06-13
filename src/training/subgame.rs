@@ -1905,7 +1905,8 @@ fn read_current_strategy(
     auth: &GameState,
     auth_actor: PlayerId,
 ) -> Result<(Vec<f64>, Vec<SimplifiedNlheAction>), String> {
-    let cur_actor = trainer.game().subtree().node(cur_node).player_acting;
+    let node = trainer.game().subtree().node(cur_node);
+    let cur_actor = node.player_acting;
     if cur_actor != auth_actor {
         return Err(format!(
             "within-round 导航落点 actor {cur_actor} ≠ 权威当前 actor {auth_actor}（失同步）"
@@ -1919,14 +1920,84 @@ fn read_current_strategy(
                 .to_string(),
         );
     }
-    if avg.len() != sub_legal.len() {
+    // `avg` 按子树节点**建树几何** tag 序索引（CFR 解的维度恒 == node.legal_actions 长度——CFR
+    // 首访该 infoset 时按 `legal_actions(state)` 注册动作槽，子树 solve 几何 == build 几何 →
+    // 槽数 == 建树 tag 数）。不等 = CFR 索引契约破，硬 Err。
+    if avg.len() != node.legal_actions.len() {
         return Err(format!(
-            "subgame 当前决策策略维度 {} ≠ 合法动作数 {}",
+            "subgame 解维度 {} ≠ 子树节点 tag 数 {}（CFR 索引契约破）",
             avg.len(),
-            sub_legal.len()
+            node.legal_actions.len()
         ));
     }
-    Ok((avg, sub_legal))
+    // 真栈（auth）几何下加注档可能塌进 all-in（hero 响应**真实大注**、SPR 比建树期映小的对手注
+    // 更浅 → `candidate_to ≥ cap` 被 AllIn 槽吸收，见 abstract_actions AA-004-rev1），故 query_at
+    // 的 `sub_legal` 会比建树 tag 少（deep-wide `{0.5,1}` 菜单最易触发：4 维解 vs 3 合法 → 旧版
+    // 在此硬 Err → giveup → 白丢牌）。按 tag 把策略投影到 `sub_legal`：命中直接对位，建树期独立
+    // 的加注档塌缩则 mass 并入 AllIn（保总概率）。返回向量与 `sub_legal` 同长、按位对齐 →
+    // self_distribution / legal_abs 对齐两路调用方零改动复用。无塌缩时为恒等映射（byte-equal）。
+    let projected = project_strategy_onto_auth_legal(&node.legal_actions, &avg, &sub_legal)?;
+    Ok((projected, sub_legal))
+}
+
+/// 把建树几何 tag 序的策略 `avg`（与子树节点 `node_tags` 一一对应、同长）投影到 **auth 真栈
+/// 几何**的合法集 `sub_legal` 上，返回与 `sub_legal` 同长、**按位对齐**的概率向量。
+///
+/// `query_at` 的 `sub_legal` 由 `abstract_actions(auth).filter(tag ∈ node_tags)` 得 → 其 tag 恒
+/// **⊆ `node_tags`**（只会因真栈更浅而收缩、不会凭空多档）。收缩的唯一合法成因 = 加注档
+/// `candidate_to ≥ cap` 被 AllIn 槽吸收（abstract_actions 的 `candidate_to >= cap` 跳过分支与
+/// AA-004-rev1 折叠）；abstract 几何里 0.5pot/1.0pot 两档不会互相塌成同 `to`（1.0pot 候选恒
+/// `> min_to`，postflop `pot_after_call ≥ to_call` ⇒ 不 floor 到 min_to），故缺失的建树加注 tag
+/// 必然塌进 all-in，mass 并入 `sub_legal` 的 AllIn 槽即与真栈语义一致。
+///
+/// 建树非加注 tag 缺失（Fold/Check/Call 在真栈合法集找不到落点）/ 加注缺失但 `sub_legal` 无
+/// AllIn 槽 = 结构性失配（不可能由塌缩产生）→ `Err`，调用方降级（§2.3 check-when-free）。
+/// 投影保总概率（塌缩只搬运 mass、不丢弃）。
+fn project_strategy_onto_auth_legal(
+    node_tags: &[AbstractActionTag],
+    avg: &[f64],
+    sub_legal: &[SimplifiedNlheAction],
+) -> Result<Vec<f64>, String> {
+    debug_assert_eq!(
+        node_tags.len(),
+        avg.len(),
+        "project: node_tags 与 avg 必同长（CFR 索引契约，调用方已校验）"
+    );
+    let mut out = vec![0.0_f64; sub_legal.len()];
+    // sub_legal 的 AllIn 落点（塌缩并入用）；hero 无 all-in 槽时为 None（则任何塌缩 = 结构失配）。
+    let all_in_idx = sub_legal
+        .iter()
+        .position(|a| matches!(AbstractActionTag::of(a), AbstractActionTag::AllIn));
+    for (tag, &p) in node_tags.iter().zip(avg.iter()) {
+        if let Some(j) = sub_legal
+            .iter()
+            .position(|a| AbstractActionTag::of(a) == *tag)
+        {
+            out[j] += p; // tag 命中真栈合法集 → 直接对位。
+        } else {
+            match tag {
+                AbstractActionTag::Bet(_) | AbstractActionTag::Raise(_) => {
+                    // 建树独立加注档在真栈塌进 all-in → mass 并入 AllIn 槽。
+                    let j = all_in_idx.ok_or_else(|| {
+                        format!(
+                            "subgame 投影：建树加注 tag {tag:?} 真栈塌缩但合法集无 AllIn 槽（结构失配）"
+                        )
+                    })?;
+                    out[j] += p;
+                }
+                _ => {
+                    return Err(format!(
+                        "subgame 投影：建树 tag {tag:?} 在真栈合法集无落点（非加注、不可塌缩 → 失同步）"
+                    ))
+                }
+            }
+        }
+    }
+    debug_assert!(
+        (out.iter().sum::<f64>() - avg.iter().sum::<f64>()).abs() < 1e-9,
+        "project: 投影须保总概率（塌缩只搬运 mass）"
+    );
+    Ok(out)
 }
 
 /// 子树**自身合法集**上的归一分布（deep_menu / unanchored 共用的返回契约）：只保留正概率
@@ -2326,6 +2397,122 @@ mod tests {
         Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::default_500_500_500(),
         ))
+    }
+
+    // ---- project_strategy_onto_auth_legal（deep-wide 菜单维度漂移修复）----
+    // 复现 OpenPoker AK turn 弃牌的根因：deep-wide `{0.5,1}` 子树 4 维解，真栈下 0.5pot 加注塌
+    // 进 all-in → query_at 只剩 3 合法动作。旧版在 read_current_strategy 硬 Err → giveup → 弃牌；
+    // 新版按 tag 投影、塌缩 mass 并入 AllIn。直接喂合成输入（不必跑 CFR），错算法（旧的「维度不
+    // 等就 Err」/ 把塌缩 mass 丢掉）都会 fail。
+    use crate::abstraction::action::BetRatio;
+
+    fn t_raise(r: BetRatio) -> AbstractActionTag {
+        AbstractActionTag::Raise(r)
+    }
+    fn a_call(to: u64) -> SimplifiedNlheAction {
+        AbstractAction::Call {
+            to: ChipAmount::new(to),
+        }
+    }
+    fn a_raise(to: u64, r: BetRatio) -> SimplifiedNlheAction {
+        AbstractAction::Raise {
+            to: ChipAmount::new(to),
+            ratio_label: r,
+        }
+    }
+    fn a_allin(to: u64) -> SimplifiedNlheAction {
+        AbstractAction::AllIn {
+            to: ChipAmount::new(to),
+        }
+    }
+
+    #[test]
+    fn project_identity_when_no_collapse() {
+        // 真栈合法集 tag 与建树 tag 完全一致 → 投影 = 恒等（byte-equal 既有路径）。
+        let node_tags = vec![
+            AbstractActionTag::Fold,
+            AbstractActionTag::Call,
+            t_raise(BetRatio::HALF_POT),
+            AbstractActionTag::AllIn,
+        ];
+        let avg = vec![0.1, 0.2, 0.3, 0.4];
+        let sub_legal = vec![
+            AbstractAction::Fold,
+            a_call(746),
+            a_raise(1554, BetRatio::HALF_POT),
+            a_allin(1598),
+        ];
+        let out = project_strategy_onto_auth_legal(&node_tags, &avg, &sub_legal).expect("不应 Err");
+        assert_eq!(out, avg, "无塌缩须恒等");
+    }
+
+    #[test]
+    fn project_merges_collapsed_raise_into_allin() {
+        // AK turn 复现：建树 [Fold,Call,Raise0.5,AllIn]（4 维），真栈 0.5pot 塌进 all-in →
+        // sub_legal [Fold,Call,AllIn]（3 档）。Raise0.5 的 mass 0.3 须并入 AllIn 的 0.4 = 0.7。
+        let node_tags = vec![
+            AbstractActionTag::Fold,
+            AbstractActionTag::Call,
+            t_raise(BetRatio::HALF_POT),
+            AbstractActionTag::AllIn,
+        ];
+        let avg = vec![0.1, 0.2, 0.3, 0.4];
+        let sub_legal = vec![AbstractAction::Fold, a_call(746), a_allin(1598)];
+        let out = project_strategy_onto_auth_legal(&node_tags, &avg, &sub_legal).expect("不应 Err");
+        assert_eq!(out.len(), 3);
+        assert!((out[0] - 0.1).abs() < 1e-12, "Fold 不动");
+        assert!((out[1] - 0.2).abs() < 1e-12, "Call 不动");
+        assert!((out[2] - 0.7).abs() < 1e-12, "Raise0.5 ⊕ AllIn = 0.7");
+        assert!(
+            (out.iter().sum::<f64>() - 1.0).abs() < 1e-12,
+            "投影保总概率"
+        );
+    }
+
+    #[test]
+    fn project_merges_two_collapsed_raises() {
+        // 建树双加注档 {0.5,1.0} 真栈双塌 → 两份 mass 都进 AllIn。
+        let node_tags = vec![
+            AbstractActionTag::Fold,
+            AbstractActionTag::Call,
+            t_raise(BetRatio::HALF_POT),
+            t_raise(BetRatio::FULL_POT),
+            AbstractActionTag::AllIn,
+        ];
+        let avg = vec![0.1, 0.2, 0.25, 0.15, 0.3];
+        let sub_legal = vec![AbstractAction::Fold, a_call(900), a_allin(1598)];
+        let out = project_strategy_onto_auth_legal(&node_tags, &avg, &sub_legal).expect("不应 Err");
+        assert!(
+            (out[2] - 0.7).abs() < 1e-12,
+            "0.25+0.15+0.3 = 0.7 全进 AllIn"
+        );
+        assert!((out.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn project_errs_when_raise_collapses_but_no_allin_slot() {
+        // 加注档缺失却无 AllIn 落点 = 结构失配（塌缩不可能产生此形）→ Err 降级，不静默丢 mass。
+        let node_tags = vec![
+            AbstractActionTag::Fold,
+            AbstractActionTag::Call,
+            t_raise(BetRatio::HALF_POT),
+        ];
+        let avg = vec![0.3, 0.3, 0.4];
+        let sub_legal = vec![AbstractAction::Fold, a_call(746)];
+        assert!(project_strategy_onto_auth_legal(&node_tags, &avg, &sub_legal).is_err());
+    }
+
+    #[test]
+    fn project_errs_when_non_raise_tag_missing() {
+        // 非加注 tag（Call）在真栈合法集缺失 = 失同步（不可能由 all-in 塌缩产生）→ Err。
+        let node_tags = vec![
+            AbstractActionTag::Fold,
+            AbstractActionTag::Call,
+            AbstractActionTag::AllIn,
+        ];
+        let avg = vec![0.3, 0.3, 0.4];
+        let sub_legal = vec![AbstractAction::Fold, a_allin(1598)];
+        assert!(project_strategy_onto_auth_legal(&node_tags, &avg, &sub_legal).is_err());
     }
 
     /// 把 HU 默认 game 推到一个 flop 中途状态（SB complete → BB check → flop），返回该
