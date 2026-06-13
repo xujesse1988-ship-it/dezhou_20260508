@@ -238,9 +238,9 @@ pub const DEEP_MENU_SPR_WIDE_MAX: u64 = 4;
 
 /// [`deep_menu_for`] 的人数闸：Active 座位数 ≤ 4 才许宽菜单（2026-06-13 从 3 放宽到 4——
 /// 4-way 浅码也吃宽 `{0.5,1}` 档）。**实测依据（2026-06-10/06-13 vultr，恰 4×pot 边界
-/// limped flop 宽档子树节点数）**：3-way = 边界 ≤200k / **4-way = 见
-/// `deep_menu_spr_adaptive_selection_and_boundary_tree_bounded` ⑤ 实测** / 6-way = 558,360
-/// （vs 同状态 {1pot} 27,108，20.6×）——菜单加宽随人数乘性爆炸、5+way 吃光 5s 建树预算
+/// limped flop 宽档子树节点数）**：3-way = 4,794 / **4-way = 37,728**（vs {1pot} 1,512，
+/// ~98ms 建树、占 4M cap 的 0.9% = 可行）/ 6-way = 558,360（vs {1pot} 27,108，20.6×）
+/// ——菜单加宽随人数乘性爆炸、5+way 吃光 5s 建树预算
 /// （A② 建树 ~2.6ms/千节点），故 5+way 浅码维持 {1pot}（fold/call/1pot/all-in 已覆盖 commit
 /// 决策）。4-way 边界树大小由 `deep_menu_spr_adaptive_selection_and_boundary_tree_bounded`
 /// 钉住（须 < 生产 `max_subtree_nodes` 4M，留足建树预算）；任何越界仍有 `max_subtree_nodes`

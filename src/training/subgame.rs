@@ -2690,8 +2690,8 @@ mod tests {
     /// ① [`deep_menu_for`] 深 SPR（HU 200BB limped flop ≈ 99×pot）→ {1pot} 单档；
     /// ② 浅 SPR 小池（3-way 13BB limped flop：第二大 Active 栈 1200 == 4×pot 300，恰在
     ///   边界）→ {0.5,1} 两档（边界含等号取宽档）；
-    /// ③ 浅 SPR **4-way**（4-way 25BB：SPR 同样恰 4×pot、4 Active）→ 2026-06-13 人数闸放宽到 4 后
-    ///   选 {0.5,1} 两档（边界宽档树大小由 ⑤ 钉住 < 4M 生产 cap）；
+    /// ③ 浅 SPR **4-way**（4-way 17BB：恰 4×pot、4 Active）→ 2026-06-13 人数闸放宽到 4 后
+    ///   选 {0.5,1} 两档（边界宽档实测 37,728 节点 vs {1pot} 1,512，远 < 4M 生产 cap，由 ⑤ 钉住）；
     /// ③' 浅 SPR **5+way**（6-way 25BB：SPR 同样恰 4×pot、但 6 Active）→ 人数闸回 {1pot}
     ///   ——实测 6-way 边界宽档 = 558,360 节点 vs {1pot} 27,108（20.6×，2026-06-10 vultr），
     ///   多人加宽是乘性爆炸、吃光建树预算（[`DEEP_MENU_WIDE_MAX_ACTIVE`] 的依据）；
@@ -2783,7 +2783,7 @@ mod tests {
         let narrow4_nodes = nodes_for(&shallow_4way, deep_single_pot());
         eprintln!(
             "[deep_menu SPR 边界] 3-way 13BB（恰 4×pot）：wide{{0.5,1}}={wide_nodes} vs \
-             narrow{{1pot}}={narrow_nodes}；4-way 25BB（恰 4×pot）：wide={wide4_nodes} vs \
+             narrow{{1pot}}={narrow_nodes}；4-way 17BB（恰 4×pot）：wide={wide4_nodes} vs \
              narrow={narrow4_nodes}"
         );
         const PROD_CAP: usize = 4_000_000; // openpoker_advisor --search-max-nodes 生产值
