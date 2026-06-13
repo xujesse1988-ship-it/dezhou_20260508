@@ -2210,8 +2210,8 @@ mod tests {
         assert_eq!(resp, again, "同 seed deep_menu 搜索须确定性（可复现）");
     }
 
-    /// 缺口③ v2 细化端到端：浅 SPR（9BB 栈，flop 第二大 Active 栈 = 4×pot 恰在边界）下
-    /// `--search-deep-menu` 的子树菜单经 [`deep_menu_for`] 放宽到 {0.5,1} 两档——advisor outgoing
+    /// 缺口③ v2 细化端到端：浅 SPR（9BB 栈，flop 第二大 Active 栈 = 4×pot，远 < ≤3-way 的
+    /// 40×pot 阈值）下 `--search-deep-menu` 的子树菜单经 [`deep_menu_for`] 放宽到 {0.5,1} 两档——advisor outgoing
     /// 必须用**同一**自适应菜单（deep_abs_holder）算尺寸，否则 0.5pot 档在 {1pot} 抽象下找不到
     /// 对应、会塌成 all-in（错动作）。验：合法 + source=search/giveup + 可复现，且若出 raise，
     /// 尺寸在 valid 区间内（非无脑 all-in 才有意义——can_check 时 raise 须有界）。

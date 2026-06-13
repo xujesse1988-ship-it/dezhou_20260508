@@ -2686,18 +2686,17 @@ mod tests {
         assert!(r.is_err(), "deep_menu+depth_limit 同开应 Err，得 {r:?}");
     }
 
-    /// 缺口③ v2 细化（SPR + 人数自适应菜单宽度，exec §2.1「深码单档、短码可放宽」）：
-    /// ① [`deep_menu_for`] 深 SPR（HU 200BB limped flop ≈ 99×pot）→ {1pot} 单档；
-    /// ② 浅 SPR 小池（3-way 13BB limped flop：第二大 Active 栈 1200 == 4×pot 300，恰在
-    ///   边界）→ {0.5,1} 两档（边界含等号取宽档）；
-    /// ③ 浅 SPR **4-way**（4-way 17BB：恰 4×pot、4 Active）→ 2026-06-13 人数闸放宽到 4 后
-    ///   选 {0.5,1} 两档（边界宽档实测 37,728 节点 vs {1pot} 1,512，远 < 4M 生产 cap，由 ⑤ 钉住）；
-    /// ③' 浅 SPR **5+way**（6-way 25BB：SPR 同样恰 4×pot、但 6 Active）→ 人数闸回 {1pot}
-    ///   ——实测 6-way 边界宽档 = 558,360 节点 vs {1pot} 27,108（20.6×，2026-06-10 vultr），
-    ///   多人加宽是乘性爆炸、吃光建树预算（[`DEEP_MENU_WIDE_MAX_ACTIVE`] 的依据）；
-    /// ④ 3-way SPR 刚过阈值（14BB → 1300 > 1200）→ 回 {1pot}；
-    /// ⑤ 宽档**边界子树**节点数有界（3-way + 4-way 都量；绝对护栏 = 生产 max_subtree_nodes 4M，
-    ///   真实数值 eprintln 暴露——4-way 放宽的可行性硬证）。
+    /// 缺口③ v2 细化（SPR + 人数自适应菜单宽度，exec §2.1「深码单档、短码可放宽」）。
+    /// **2026-06-13 阈值：≤3-way = 40×pot / 4-way = 20×pot / 5+way = 一律 {1pot}**（按
+    /// `_measure_deep_wide_menu_tree_sizes` 实测分档，控建树 wall + 不撑爆 4M cap）：
+    /// ① 极深 SPR（HU ≈ 99×pot > 40）→ {1pot} 单档；
+    /// ② 3-way 40×pot 边界 → {0.5,1} 两档（边界含等号取宽）；
+    /// ③ 3-way 刚过 40×pot → 回 {1pot}；
+    /// ④ 4-way 20×pot 边界 → {0.5,1} 两档；
+    /// ⑤ 4-way 刚过 20×pot → 回 {1pot}（4-way 更深 = SPR40 树 3.98M 贴满 cap，故阈值更低）；
+    /// ⑥ 5+way（6-way 浅 4×pot）→ 人数闸一律 {1pot}（6-way 宽档实测 558k，乘性爆炸）；
+    /// ⑦ 生产边界宽档树大小护栏：两档最大宽树（3-way@40× + 4-way@20×）实测 < 4M cap
+    ///   （越界即 live giveup → 测试失败逼回滚），真实数值 eprintln。
     #[test]
     fn deep_menu_spr_adaptive_selection_and_boundary_tree_bounded() {
         let bet_ratios = |abs: &StreetActionAbstraction, st: &GameState| -> Vec<u32> {
@@ -2711,90 +2710,83 @@ mod tests {
                 .collect()
         };
         let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
-        // ① 深：{1pot} 单档。
+        // ① 极深 SPR（HU limped ≈ 99×pot > 40）→ {1pot} 单档。
         let deep_state = hu_flop_state(&game, 0x5350_525F_4D4E_5530).game_state; // "SPR_MNU0"
         let (deep_abs, _) = deep_menu_for(&deep_state);
         assert_eq!(
             bet_ratios(&deep_abs, &deep_state),
             vec![1000],
-            "深 SPR 应选 {{1pot}} 单档"
+            "极深 SPR（>40×pot）应选 {{1pot}} 单档"
         );
 
-        // ② 浅小池（边界）：3-way 13BB：limped flop pot=300、各家剩 1200 = 4×300。
-        let shallow = nway_limped_flop_state(3, 1_300, 0x5350_525F_4D4E_5531);
-        let (wide_abs, wide_rules) = deep_menu_for(&shallow);
+        // ② 3-way 40×pot 边界：limped pot=300、各家剩 12000 = 40×300（stack=12100）。
+        let b3_wide = nway_limped_flop_state(3, 12_100, 0x5350_525F_4D4E_5531);
+        let (w3_abs, w3_rules) = deep_menu_for(&b3_wide);
         assert_eq!(
-            bet_ratios(&wide_abs, &shallow),
+            bet_ratios(&w3_abs, &b3_wide),
             vec![500, 1000],
-            "浅 SPR ≤3-way（边界）应选 {{0.5,1}} 两档"
+            "3-way 40×pot 边界应选 {{0.5,1}} 两档"
         );
         assert!(
-            !wide_rules.drop_small_reraise,
-            "宽档 0.5pot 须全层级可用（含 re-raise，2026-06-12 放开 first-bet-small 口径）"
+            !w3_rules.drop_small_reraise,
+            "宽档 0.5pot 须全层级可用（含 re-raise）"
         );
 
-        // ③ 浅 4-way：17BB（limped pot=400、各家剩 1600 = 4×400 恰边界）→ 人数闸放宽到 4 后
-        // 选 {0.5,1} 两档。
-        let shallow_4way = nway_limped_flop_state(4, 1_700, 0x5350_525F_4D4E_5534);
-        let (mw4_abs, _) = deep_menu_for(&shallow_4way);
+        // ③ 3-way 刚过 40×pot（剩 12100 > 12000）→ 回 {1pot}。
+        let b3_narrow = nway_limped_flop_state(3, 12_200, 0x5350_525F_4D4E_5532);
         assert_eq!(
-            bet_ratios(&mw4_abs, &shallow_4way),
+            bet_ratios(&deep_menu_for(&b3_narrow).0, &b3_narrow),
+            vec![1000],
+            "3-way 刚过 40×pot 应回 {{1pot}}"
+        );
+
+        // ④ 4-way 20×pot 边界：limped pot=400、各家剩 8000 = 20×400（stack=8100）。
+        let b4_wide = nway_limped_flop_state(4, 8_100, 0x5350_525F_4D4E_5534);
+        assert_eq!(
+            bet_ratios(&deep_menu_for(&b4_wide).0, &b4_wide),
             vec![500, 1000],
-            "浅 SPR 4-way 应选 {{0.5,1}} 两档（2026-06-13 人数闸 3→4）"
+            "4-way 20×pot 边界应选 {{0.5,1}} 两档"
         );
 
-        // ③' 浅 5+way：6-way 25BB（剩 2400 = 4×600 同样恰边界）→ 人数闸仍拦回 {1pot}。
-        let shallow_multiway = nway_limped_flop_state(6, 2_500, 0x5350_525F_4D4E_5533);
-        let (mw_abs, _) = deep_menu_for(&shallow_multiway);
+        // ⑤ 4-way 刚过 20×pot（剩 8100 > 8000）→ 回 {1pot}（4-way 阈值更低，见 SPR sweep）。
+        let b4_narrow = nway_limped_flop_state(4, 8_200, 0x5350_525F_4D4E_5535);
         assert_eq!(
-            bet_ratios(&mw_abs, &shallow_multiway),
+            bet_ratios(&deep_menu_for(&b4_narrow).0, &b4_narrow),
             vec![1000],
-            "浅 SPR 但 >4 Active 应被人数闸拦回 {{1pot}}（6-way 宽档实测 558k 节点）"
+            "4-way 刚过 20×pot 应回 {{1pot}}（4-way SPR40 树 3.98M 贴满 cap）"
         );
 
-        // ④ 3-way SPR 刚过阈值（14BB → 剩 1300 > 1200）→ 回 {1pot}。
-        let just_deep = nway_limped_flop_state(3, 1_400, 0x5350_525F_4D4E_5532);
-        let (jd_abs, _) = deep_menu_for(&just_deep);
+        // ⑥ 5+way：6-way 浅 4×pot → 人数闸一律 {1pot}。
+        let mw6 = nway_limped_flop_state(6, 2_500, 0x5350_525F_4D4E_5533);
         assert_eq!(
-            bet_ratios(&jd_abs, &just_deep),
+            bet_ratios(&deep_menu_for(&mw6).0, &mw6),
             vec![1000],
-            "SPR 刚过阈值应回 {{1pot}}"
+            ">4 Active 应被人数闸拦回 {{1pot}}（6-way 宽档实测 558k 节点）"
         );
 
-        // ⑤ 边界树大小护栏：3-way + 4-way 边界宽档 vs 同状态 {1pot}。护栏 = 生产
-        // max_subtree_nodes 4M（越界即 live giveup）；4-way 放宽的可行性硬证。
-        let nodes_for =
-            |st: &GameState, menu: (StreetActionAbstraction, BettingAbstractionRules)| {
-                SubgameNlheGame::new(
-                    stub_table(),
-                    st.config().clone(),
-                    menu.0,
-                    menu.1,
-                    st.clone(),
-                    live_entrants(st),
-                    0,
-                )
-                .subtree()
-                .num_nodes()
-            };
-        let wide_nodes = nodes_for(&shallow, deep_wide_half_pot());
-        let narrow_nodes = nodes_for(&shallow, deep_single_pot());
-        let wide4_nodes = nodes_for(&shallow_4way, deep_wide_half_pot());
-        let narrow4_nodes = nodes_for(&shallow_4way, deep_single_pot());
+        // ⑦ 生产边界宽档树大小护栏：两档最大宽树 < 4M cap（越界即 live giveup）。
+        let wide_nodes = |st: &GameState| {
+            SubgameNlheGame::new(
+                stub_table(),
+                st.config().clone(),
+                deep_wide_half_pot().0,
+                deep_wide_half_pot().1,
+                st.clone(),
+                live_entrants(st),
+                0,
+            )
+            .subtree()
+            .num_nodes()
+        };
+        let n3 = wide_nodes(&b3_wide);
+        let n4 = wide_nodes(&b4_wide);
         eprintln!(
-            "[deep_menu SPR 边界] 3-way 13BB（恰 4×pot）：wide{{0.5,1}}={wide_nodes} vs \
-             narrow{{1pot}}={narrow_nodes}；4-way 17BB（恰 4×pot）：wide={wide4_nodes} vs \
-             narrow={narrow4_nodes}"
+            "[deep_menu SPR 边界] 生产最大宽树：3-way@40×pot={n3} / 4-way@20×pot={n4}（cap 4M）"
         );
         const PROD_CAP: usize = 4_000_000; // openpoker_advisor --search-max-nodes 生产值
         assert!(
-            wide_nodes <= 200_000,
-            "3-way 宽档边界子树过大：wide={wide_nodes}（绝对护栏 200k）"
-        );
-        assert!(
-            wide4_nodes < PROD_CAP,
-            "4-way 宽档边界子树撑爆生产 cap：wide={wide4_nodes} ≥ {PROD_CAP}（4-way 放宽不可行 → \
-             回滚 DEEP_MENU_WIDE_MAX_ACTIVE=3）"
+            n3 < PROD_CAP && n4 < PROD_CAP,
+            "边界宽档撑爆生产 cap：3-way@40×={n3} / 4-way@20×={n4} ≥ {PROD_CAP}（阈值不可行 → 调低）"
         );
     }
 

@@ -231,10 +231,21 @@ pub fn deep_wide_half_pot() -> (StreetActionAbstraction, BettingAbstractionRules
     (abs, BettingAbstractionRules::default())
 }
 
-/// [`deep_menu_for`] 的 SPR 阈值：第二大 Active 剩余栈 ≤ `4 × pot` → 短码宽菜单（还须
-/// 过人数闸，见 [`DEEP_MENU_WIDE_MAX_ACTIVE`]）。量级依据：1pot 注每层把 pot 推到 ~3×，
-/// SPR ≤ 4 时 ~2 层进攻即触 all-in、到终局层数有限。
-pub const DEEP_MENU_SPR_WIDE_MAX: u64 = 4;
+/// [`deep_menu_for`] 的 SPR 阈值（**≤3-way**）：第二大 Active 剩余栈 ≤ `40 × pot` → 宽菜单
+/// `{0.5,1}`（还须过人数闸 [`DEEP_MENU_WIDE_MAX_ACTIVE`]）。2026-06-13 从 4 放宽到 40——深码
+/// 单加注池（如 HU 100BB SPR≈19）也吃 0.5pot 档。**实测可行（vultr SPR sweep，
+/// `_measure_deep_wide_menu_tree_sizes`）**：宽档节点数随 SPR/人数乘性增长，但 ≤3-way 全程
+/// 远 < 生产 cap 4M——HU SPR99=26,600 / 3-way SPR40=307k / 3-way SPR99=1.39M（~3.6s 建树）。
+/// 4-way 单列更低阈值（[`DEEP_MENU_SPR_WIDE_MAX_4WAY`]）：4-way SPR40=3.98M 贴满 cap、~10s 建树
+/// 不可行。
+pub const DEEP_MENU_SPR_WIDE_MAX: u64 = 40;
+
+/// [`deep_menu_for`] 的 SPR 阈值（**4-way**）：4-way 宽档树随 SPR 比 ≤3-way 陡得多
+/// （**实测 vultr**：4-way SPR20=1.04M（~2.7s 建树，安全）/ SPR40=**3.98M 贴满 4M cap、~10s
+/// 建树**（吃光预算）/ SPR99=22.8M（5.7× 越 cap → giveup））。故 4-way 宽档只到 SPR≤20——
+/// 仍是旧 4× 的 5 倍扩张、建树 <3s、无 giveup 回归；更深 4-way 回 {1pot}（70k 节点、秒解、
+/// 正常打，非弃牌）。
+pub const DEEP_MENU_SPR_WIDE_MAX_4WAY: u64 = 20;
 
 /// [`deep_menu_for`] 的人数闸：Active 座位数 ≤ 4 才许宽菜单（2026-06-13 从 3 放宽到 4——
 /// 4-way 浅码也吃宽 `{0.5,1}` 档）。**实测依据（2026-06-10/06-13 vultr，恰 4×pot 边界
@@ -248,10 +259,10 @@ pub const DEEP_MENU_SPR_WIDE_MAX: u64 = 4;
 pub const DEEP_MENU_WIDE_MAX_ACTIVE: usize = 4;
 
 /// 缺口③ v2 细化（SPR 自适应菜单宽度，exec 文档 §2.1「深码单档、短码可放宽」/ §3.2 缺口③
-/// 「仍未做②」）：按子树根（轮起点）的 SPR + 人数选深码搜索菜单——**浅 SPR
-/// （≤ [`DEEP_MENU_SPR_WIDE_MAX`]×pot）且 Active ≤ [`DEEP_MENU_WIDE_MAX_ACTIVE`]** →
-/// 放宽到 `{0.5, 1.0}` 两档（[`deep_wide_half_pot`]，树小可负担）；否则维持单一 {1pot}
-/// （[`deep_single_pot`]，控树）。
+/// 「仍未做②」）：按子树根（轮起点）的 SPR + 人数选深码搜索菜单——**SPR ≤ 阈值×pot
+/// （≤3-way = [`DEEP_MENU_SPR_WIDE_MAX`] / 4-way = [`DEEP_MENU_SPR_WIDE_MAX_4WAY`]）且
+/// Active ≤ [`DEEP_MENU_WIDE_MAX_ACTIVE`]** → 放宽到 `{0.5, 1.0}` 两档
+/// （[`deep_wide_half_pot`]，树可负担）；否则维持单一 {1pot}（[`deep_single_pot`]，控树）。
 ///
 /// **纯函数 + 整数比较**（只读 `root_state` 的 chip 几何）——`subgame_search*` 选子树菜单
 /// 与 advisor 算 outgoing 尺寸必须**各自重算出同一菜单**，故选单逻辑共享于此、且对同一
@@ -273,9 +284,14 @@ pub fn deep_menu_for(root_state: &GameState) -> (StreetActionAbstraction, Bettin
         }
     }
     let pot = root_state.pot().as_u64();
-    if n_active <= DEEP_MENU_WIDE_MAX_ACTIVE
-        && top2[1] <= DEEP_MENU_SPR_WIDE_MAX.saturating_mul(pot)
-    {
+    // SPR 阈值按人数分档：4-way 宽档树随 SPR 远比 ≤3-way 陡（实测 4-way SPR40=3.98M 贴满
+    // cap）→ 4-way 用更低阈值（[`DEEP_MENU_SPR_WIDE_MAX_4WAY`]），≤3-way 用 [`DEEP_MENU_SPR_WIDE_MAX`]。
+    let spr_cap = if n_active >= 4 {
+        DEEP_MENU_SPR_WIDE_MAX_4WAY
+    } else {
+        DEEP_MENU_SPR_WIDE_MAX
+    };
+    if n_active <= DEEP_MENU_WIDE_MAX_ACTIVE && top2[1] <= spr_cap.saturating_mul(pot) {
         deep_wide_half_pot()
     } else {
         deep_single_pot()
