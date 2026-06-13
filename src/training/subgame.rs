@@ -1944,15 +1944,21 @@ fn read_current_strategy(
 /// 几何**的合法集 `sub_legal` 上，返回与 `sub_legal` 同长、**按位对齐**的概率向量。
 ///
 /// `query_at` 的 `sub_legal` 由 `abstract_actions(auth).filter(tag ∈ node_tags)` 得 → 其 tag 恒
-/// **⊆ `node_tags`**（只会因真栈更浅而收缩、不会凭空多档）。收缩的唯一合法成因 = 加注档
-/// `candidate_to ≥ cap` 被 AllIn 槽吸收（abstract_actions 的 `candidate_to >= cap` 跳过分支与
-/// AA-004-rev1 折叠）；abstract 几何里 0.5pot/1.0pot 两档不会互相塌成同 `to`（1.0pot 候选恒
-/// `> min_to`，postflop `pot_after_call ≥ to_call` ⇒ 不 floor 到 min_to），故缺失的建树加注 tag
-/// 必然塌进 all-in，mass 并入 `sub_legal` 的 AllIn 槽即与真栈语义一致。
+/// **⊆ `node_tags`**（只会因真栈更浅而收缩、不会凭空多档）。收缩有**两个**合法成因，都把
+/// mass 并入 `sub_legal` 的 AllIn 槽（与真栈语义一致）：
+///  1. **加注档塌缩**：`candidate_to ≥ cap` 被 AllIn 槽吸收（abstract_actions 的
+///     `candidate_to >= cap` 跳过分支与 AA-004-rev1 折叠）；abstract 几何里 0.5pot/1.0pot 两档
+///     不会互相塌成同 `to`（1.0pot 候选恒 `> min_to`，postflop `pot_after_call ≥ to_call` ⇒ 不
+///     floor 到 min_to），故缺失的建树加注 tag 必然塌进 all-in。
+///  2. **跟注塌缩（all-in-for-less）**：对手真实注 ≥ hero 剩余栈时，真栈下 hero 的跟注**即
+///     all-in**，`query_at` 把它折进 AllIn 槽、无独立 `Call`（与
+///     [`navigate_subtree_by_real_actions`] 的被动 Call→AllIn 同义）。而建树期对手注被 off-tree
+///     映小（`{0.5,1}` 宽档最易：真实 0.8pot 注映成 0.5pot < hero 栈）→ 建树 Call 非 all-in、
+///     真栈 Call = all-in → 建树 `Call` tag 缺失于 `sub_legal`、须并入 AllIn。
 ///
-/// 建树非加注 tag 缺失（Fold/Check/Call 在真栈合法集找不到落点）/ 加注缺失但 `sub_legal` 无
-/// AllIn 槽 = 结构性失配（不可能由塌缩产生）→ `Err`，调用方降级（§2.3 check-when-free）。
-/// 投影保总概率（塌缩只搬运 mass、不丢弃）。
+/// `Fold`/`Check` 缺失（不可能由塌缩产生——二者无金额、不随真栈变）/ 任一档塌缩但 `sub_legal`
+/// 无 AllIn 槽 = 结构性失配 → `Err`，调用方降级（§2.3 check-when-free）。投影保总概率（塌缩只
+/// 搬运 mass、不丢弃）。
 fn project_strategy_onto_auth_legal(
     node_tags: &[AbstractActionTag],
     avg: &[f64],
@@ -1976,18 +1982,25 @@ fn project_strategy_onto_auth_legal(
             out[j] += p; // tag 命中真栈合法集 → 直接对位。
         } else {
             match tag {
-                AbstractActionTag::Bet(_) | AbstractActionTag::Raise(_) => {
-                    // 建树独立加注档在真栈塌进 all-in → mass 并入 AllIn 槽。
+                AbstractActionTag::Bet(_)
+                | AbstractActionTag::Raise(_)
+                | AbstractActionTag::Call => {
+                    // 真栈几何下该档塌进 all-in → mass 并入 AllIn 槽（保总概率）：
+                    //  · Bet/Raise：candidate_to ≥ cap 被 AllIn 吸收；
+                    //  · Call：对手真实注 ≥ hero 剩余栈 → 跟注即 all-in-for-less，真栈合法集只
+                    //    剩 AllIn 槽（query_at 把跟注折进 AllIn，与 navigate_subtree_by_real_actions
+                    //    被动 Call→AllIn 同义）。建树期对手注被 off-tree 映小（{0.5,1} 宽档最易）
+                    //    → 建树 Call 非 all-in、真栈 Call = all-in。
                     let j = all_in_idx.ok_or_else(|| {
                         format!(
-                            "subgame 投影：建树加注 tag {tag:?} 真栈塌缩但合法集无 AllIn 槽（结构失配）"
+                            "subgame 投影：建树 tag {tag:?} 真栈塌缩但合法集无 AllIn 槽（结构失配）"
                         )
                     })?;
                     out[j] += p;
                 }
                 _ => {
                     return Err(format!(
-                        "subgame 投影：建树 tag {tag:?} 在真栈合法集无落点（非加注、不可塌缩 → 失同步）"
+                        "subgame 投影：建树 tag {tag:?} 在真栈合法集无落点（Fold/Check 不可塌缩 → 失同步）"
                     ))
                 }
             }
@@ -2503,8 +2516,12 @@ mod tests {
     }
 
     #[test]
-    fn project_errs_when_non_raise_tag_missing() {
-        // 非加注 tag（Call）在真栈合法集缺失 = 失同步（不可能由 all-in 塌缩产生）→ Err。
+    fn project_merges_collapsed_call_into_allin() {
+        // KK river all-in-for-less 复现（live searchon100 弃 KsKc 的根因）：对手真实注 ≥ hero
+        // 剩余栈 → 真栈下 hero 跟注即 all-in，query_at 把跟注折进 AllIn 槽（无独立 Call）。而
+        // 建树期对手注被 {0.5,1} 宽档 off-tree 映小 → 建树 hero 节点 [Fold,Call,AllIn]（3 维解，
+        // Call 非 all-in）。真栈 sub_legal [Fold,AllIn]（2 档）→ Call 的 mass 0.3 须并入 AllIn 的
+        // 0.4 = 0.7（旧版在此把 Call 当不可塌缩硬 Err → giveup → 弃 KK）。
         let node_tags = vec![
             AbstractActionTag::Fold,
             AbstractActionTag::Call,
@@ -2512,7 +2529,34 @@ mod tests {
         ];
         let avg = vec![0.3, 0.3, 0.4];
         let sub_legal = vec![AbstractAction::Fold, a_allin(1598)];
-        assert!(project_strategy_onto_auth_legal(&node_tags, &avg, &sub_legal).is_err());
+        let out = project_strategy_onto_auth_legal(&node_tags, &avg, &sub_legal).expect("不应 Err");
+        assert_eq!(out.len(), 2);
+        assert!((out[0] - 0.3).abs() < 1e-12, "Fold 不动");
+        assert!(
+            (out[1] - 0.7).abs() < 1e-12,
+            "Call ⊕ AllIn = 0.7（all-in-for-less）"
+        );
+        assert!(
+            (out.iter().sum::<f64>() - 1.0).abs() < 1e-12,
+            "投影保总概率"
+        );
+    }
+
+    #[test]
+    fn project_errs_when_uncollapsible_tag_missing() {
+        // Fold/Check 无金额、不随真栈变 → 缺失只能是真失同步（非 all-in 塌缩）→ Err 降级。
+        // 这里 Check 在真栈合法集缺失（建树以为可 check、真栈面对注）→ 不可塌缩 → Err。
+        let node_tags = vec![
+            AbstractActionTag::Check,
+            t_raise(BetRatio::HALF_POT),
+            AbstractActionTag::AllIn,
+        ];
+        let avg = vec![0.5, 0.2, 0.3];
+        let sub_legal = vec![a_call(746), a_allin(1598)];
+        assert!(
+            project_strategy_onto_auth_legal(&node_tags, &avg, &sub_legal).is_err(),
+            "Check 缺失（不可塌缩）须 Err"
+        );
     }
 
     /// 把 HU 默认 game 推到一个 flop 中途状态（SB complete → BB check → flop），返回该
