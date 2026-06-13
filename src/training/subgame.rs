@@ -4072,6 +4072,43 @@ mod tests {
         gs
     }
 
+    /// 可行性实测（`--ignored --nocapture`）：deep_menu 宽档 `{0.5,1}` 子树节点数随 **SPR**
+    /// 增长——SPR 闸从 4 放宽前先量「深 SPR 宽档会不会撑爆生产 cap 4M（→ live giveup）」。
+    /// 各 SPR 用对称 limped flop 反推起始栈（SPR=(stack-100)/(n×100)）。打印 HU/3-way/4-way 在
+    /// SPR∈{4,10,20,40,99} 的宽档节点数 + 是否越 4M。
+    #[test]
+    #[ignore]
+    fn _measure_deep_wide_menu_tree_sizes() {
+        const CAP: usize = 4_000_000;
+        eprintln!("[deep_wide SPR sweep] n_active,SPR,stack,wide{{0.5,1}}_nodes,narrow{{1pot}}_nodes,over_4M");
+        for n in [2u8, 3, 4] {
+            for spr in [4u64, 10, 20, 40, 99] {
+                let stack = spr * (n as u64) * 100 + 100; // SPR=(stack-100)/(n*100)
+                let st = nway_limped_flop_state(n, stack, 0xD1_5E_A5_E0 ^ (n as u64) ^ (spr << 8));
+                let entrants = live_entrants(&st);
+                let nodes = |menu: (StreetActionAbstraction, BettingAbstractionRules)| {
+                    SubgameNlheGame::new(
+                        stub_table(),
+                        st.config().clone(),
+                        menu.0,
+                        menu.1,
+                        st.clone(),
+                        entrants,
+                        0,
+                    )
+                    .subtree()
+                    .num_nodes()
+                };
+                let wide = nodes(deep_wide_half_pot());
+                let narrow = nodes(deep_single_pot());
+                eprintln!(
+                    "[deep_wide SPR sweep] {n},{spr},{stack},{wide},{narrow},{}",
+                    if wide >= CAP { "OVER" } else { "ok" }
+                );
+            }
+        }
+    }
+
     /// 用 default {0.5,1,2} 抽象 + 默认 rules 从 `template` 建解到终局的 subgame（A① 守恒/wall 共用）。
     fn build_base_subgame(template: &GameState) -> SubgameNlheGame {
         SubgameNlheGame::new(
