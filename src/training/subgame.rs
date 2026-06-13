@@ -2733,8 +2733,9 @@ mod tests {
             "宽档 0.5pot 须全层级可用（含 re-raise，2026-06-12 放开 first-bet-small 口径）"
         );
 
-        // ③ 浅 4-way：25BB（剩 2400 = 4×600 恰边界）→ 人数闸放宽到 4 后选 {0.5,1} 两档。
-        let shallow_4way = nway_limped_flop_state(4, 2_500, 0x5350_525F_4D4E_5534);
+        // ③ 浅 4-way：17BB（limped pot=400、各家剩 1600 = 4×400 恰边界）→ 人数闸放宽到 4 后
+        // 选 {0.5,1} 两档。
+        let shallow_4way = nway_limped_flop_state(4, 1_700, 0x5350_525F_4D4E_5534);
         let (mw4_abs, _) = deep_menu_for(&shallow_4way);
         assert_eq!(
             bet_ratios(&mw4_abs, &shallow_4way),
