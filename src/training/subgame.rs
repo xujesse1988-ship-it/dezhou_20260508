@@ -5384,6 +5384,81 @@ mod tests {
         );
     }
 
+    /// 档一前缀 reach × 脱影子预热：前缀开时预热与首决策须算出**同一份 ranges**（同一前缀经两个
+    /// 入口 [`subgame_search_unanchored_prewarm`] / [`subgame_search_unanchored_cached`]）→ 同 key
+    /// → 决策命中预热 solve（不重解）+ 命中输出 byte-equal 无缓存现解。任一入口前缀过滤 / range
+    /// 计算不一致 → ranges 不同 → key miss → 命中断言 fail。
+    #[test]
+    fn prewarm_unanchored_prefix_reach_first_decision_hits() {
+        let game = nolimp_6max_game();
+        let round_start = offstack_allin_flop_state();
+        // SB 首决策（auth = round_start，within 空）→ hero = SB = auth.current_player()。
+        let hero = round_start.current_player().expect("decision").0 as PlayerId;
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let decisions = offstack_synced_prefix(&game);
+        let mut cache = SubgameSolveCache::new();
+        subgame_search_unanchored_prewarm(
+            &mut cache,
+            hero,
+            &round_start,
+            &game,
+            Some(PrefixReach {
+                strategy: &strat,
+                decisions: &decisions,
+            }),
+            &cfg,
+            None,
+            0xE555,
+        )
+        .expect("前缀 reach 预热应 Ok");
+        assert_eq!((cache.misses(), cache.hits()), (1, 0), "预热 = 首 solve");
+        let d = subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &round_start,
+            &round_start,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(PrefixReach {
+                strategy: &strat,
+                decisions: &decisions,
+            }),
+            0xE555,
+        )
+        .expect("首决策应 Ok");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "前缀 reach 首决策须命中预热（预热/决策 ranges 一致 → 同 key）"
+        );
+        let d_fresh = subgame_search_unanchored_cached(
+            None,
+            &round_start,
+            &round_start,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(PrefixReach {
+                strategy: &strat,
+                decisions: &decisions,
+            }),
+            0xE555,
+        )
+        .expect("无缓存现解应 Ok");
+        assert_eq!(
+            format!("{d:?}"),
+            format!("{d_fresh:?}"),
+            "命中输出须 byte-equal 现解"
+        );
+    }
+
     /// 档一核心机制（[`estimate_range`] `skip_all_in`）：①AllIn-tag 决策按因子 1 跳过
     /// （skip=true ≡ 删该决策）；②无 AllIn 的座 skip 不影响；③非 AllIn 决策（Raise）→ range
     /// 非 uniform、AllIn 被处理（skip=false）时 range 非 uniform。①②是任意桶都成立的结构等式；
