@@ -516,7 +516,7 @@ fn prewarm(
             hand_seed,
         ),
         Err(LockstepErr { synced_node, .. }) => {
-            // 档一前缀 reach（默认关）：用已同步前缀估 range——须与决策时算出同一份 ranges 才能
+            // 档一前缀 reach（生产默认开）：用已同步前缀估 range——须与决策时算出同一份 ranges 才能
             // 命中 key（hero 显式传入：range 平滑「不混」座按 hero 算，见 subgame_search_unanchored_prewarm）。
             let prefix_decisions = rt
                 .unanchored_prefix_reach
@@ -1233,7 +1233,7 @@ fn decide_search_unanchored(
         return safe_fallback(&req.valid, shadow_reason);
     }
     let hand_seed = hand_seed_for(req, base_seed);
-    // 档一前缀 reach（默认关）：用已同步前缀估 range；关 → None = uniform（byte-equal 旧行为）。
+    // 档一前缀 reach（生产默认开）：用已同步前缀估 range；off → None = uniform（byte-equal 旧行为）。
     let prefix_decisions = rt
         .unanchored_prefix_reach
         .then(|| synced_prefix_decisions(game, synced_node));
@@ -1787,7 +1787,8 @@ mod tests {
     use poker::BucketConfig;
 
     /// 把纯 config 包成 [`SearchRuntime`]（子树桶表 = None，沿用 blueprint 表——既有搜索测试
-    /// 全不换表，行为与改前 byte-equal）。前缀 reach 默认关（uniform）= 既有脱影子行为。
+    /// 全不换表，行为与改前 byte-equal）。前缀 reach 取关（uniform）= 既有脱影子行为（生产默认已
+    /// 改开，测试辅助仍取关以保持既有用例 byte-equal；开档一用 [`rt_prefix_reach`]）。
     fn rt(cfg: SubgameSearchConfig) -> SearchRuntime {
         SearchRuntime {
             cfg,
