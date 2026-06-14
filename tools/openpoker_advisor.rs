@@ -74,14 +74,15 @@ use poker::training::game::{Game, PlayerId};
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::{
     deep_menu_for, first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
+    NodeId,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::openpoker_hh::hist_to_concrete;
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
     should_search, subgame_search_cached, subgame_search_prewarm, subgame_search_unanchored_cached,
-    subgame_search_unanchored_prewarm, ResolveRoot, SearchTrigger, SubgameSearchConfig,
-    SubgameSolveCache,
+    subgame_search_unanchored_prewarm, synced_prefix_decisions, PrefixReach, ResolveRoot,
+    SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, InfoSetId,
@@ -381,6 +382,11 @@ struct SearchRuntime {
     /// [`subgame_search_cached`] `bucket_override` doc）。`None` = 沿用 blueprint 表（旧行为
     /// byte-equal）。blueprint 路径 / range 估计永远用 blueprint 表，不受此影响。
     bucket_table: Option<Arc<BucketTable>>,
+    /// `--search-unanchored-prefix-reach`（脱锚搜索档一，`unanchored_range_design` §1）：`true` =
+    /// 脱影子搜索用**已同步前缀**估 per-seat range 替代 uniform（跳过 AllIn-tag）；`false`（默认）
+    /// = uniform（既有行为）。强弱走 h2h A/B、不默认上生产，故默认关。range 估计用 blueprint σ /
+    /// blueprint 表（同 `bucket_table` 注解：换表不影响 range 估计）。
+    unanchored_prefix_reach: bool,
 }
 
 /// RoundStart 预热（`Request.prewarm = true`，driver `--search-prewarm` 在街起点、hero 行动
@@ -500,14 +506,27 @@ fn prewarm(
             rt.bucket_table.as_ref(),
             hand_seed,
         ),
-        Err(_) => subgame_search_unanchored_prewarm(
-            solve_cache,
-            &round_start,
-            game,
-            scfg,
-            rt.bucket_table.as_ref(),
-            hand_seed,
-        ),
+        Err(LockstepErr { synced_node, .. }) => {
+            // 档一前缀 reach（默认关）：用已同步前缀估 range——须与决策时算出同一份 ranges 才能
+            // 命中 key（hero 显式传入：range 平滑「不混」座按 hero 算，见 subgame_search_unanchored_prewarm）。
+            let prefix_decisions = rt
+                .unanchored_prefix_reach
+                .then(|| synced_prefix_decisions(game, synced_node));
+            let prefix_reach = prefix_decisions.as_ref().map(|d| PrefixReach {
+                strategy: strategy_fn,
+                decisions: d,
+            });
+            subgame_search_unanchored_prewarm(
+                solve_cache,
+                hero_pid,
+                &round_start,
+                game,
+                prefix_reach,
+                scfg,
+                rt.bucket_table.as_ref(),
+                hand_seed,
+            )
+        }
     };
     match result {
         Ok(()) => {
@@ -561,10 +580,19 @@ fn lockstep_step(
     Ok(())
 }
 
+/// lockstep 失同步结果：原因 + **已同步前缀**的影子节点（断点**之前**最后一个对齐的
+/// `current_node_id`）。脱影子搜索的档一前缀 reach 用它取已同步前缀的决策三元组
+/// （[`synced_prefix_decisions`]）估 range（`unanchored_range_design` §1）。`synced_node` 在每步
+/// 失败**前**捕获 = 所有成功步之后的影子节点（断点动作及其后按无信息处理，因子 1）。
+struct LockstepErr {
+    reason: String,
+    synced_node: NodeId,
+}
+
 /// 两态 lockstep 重放（[`decide`] 决策路径与 [`prewarm`] 预热共用——**锚定/脱影子分类与
 /// node_id 必须同源**，否则预热可能走错路径 / 推错 key 静默失效）。`my_turn = Some(seat)` →
 /// 末尾校验轮到该座（决策路径，旧行为逐字保留）；`None` → 重放到历史末尾即可（预热：该街
-/// hero 行动前，轮到的是首行动者）。
+/// hero 行动前，轮到的是首行动者）。失同步返回 [`LockstepErr`]（原因 + 已同步前缀节点）。
 fn lockstep_replay(
     game: &SimplifiedNlheGame,
     solver_cfg: &TableConfig,
@@ -573,17 +601,28 @@ fn lockstep_replay(
     scale: u64,
     board_len: usize,
     my_turn: Option<SeatId>,
-) -> Result<(poker::GameState, SimplifiedNlheState), String> {
+) -> Result<(poker::GameState, SimplifiedNlheState), LockstepErr> {
     let mut real = poker::GameState::new(solver_cfg, REAL_REPLAY_SEED);
     let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
     let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
+    // synced_node 在每步**前**捕获（abs 只在 lockstep_step 内推进）→ 失败时 = 断点前最后对齐节点
+    // （所有成功步之后的影子节点；断点动作及其后按无信息处理，因子 1）。
     // 短桌：幻影座（UTG 起的最早行动位）开局先 fold → 走到 blueprint 树的真实节点。
     for &t in &smap.phantoms {
-        lockstep_step(&mut real, &mut abs, &mut abs_rng, t, "fold", None)
-            .map_err(|e| format!("phantom_{e}"))?;
+        let synced_node = abs.current_node_id;
+        lockstep_step(&mut real, &mut abs, &mut abs_rng, t, "fold", None).map_err(|e| {
+            LockstepErr {
+                reason: format!("phantom_{e}"),
+                synced_node,
+            }
+        })?;
     }
     for h in &req.actions {
-        let actor = smap.tree_seat(h.seat)?;
+        let synced_node = abs.current_node_id;
+        let actor = smap.tree_seat(h.seat).map_err(|e| LockstepErr {
+            reason: e,
+            synced_node,
+        })?;
         let to_solver = h.to.map(|t| t * scale);
         lockstep_step(
             &mut real,
@@ -592,17 +631,27 @@ fn lockstep_replay(
             actor,
             &h.action,
             to_solver,
-        )?;
+        )
+        .map_err(|e| LockstepErr {
+            reason: e,
+            synced_node,
+        })?;
     }
     // —— 到我方决策点（决策路径）/ 历史末尾（预热）——
     if let Some(seat) = my_turn {
         if real.current_player() != Some(seat) {
-            return Err("not_my_turn".into());
+            return Err(LockstepErr {
+                reason: "not_my_turn".into(),
+                synced_node: abs.current_node_id,
+            });
         }
     }
     let street = real.street();
     if abs.game_state.street() != street || board_len != expected_board_len(street) {
-        return Err("street_board_mismatch".into());
+        return Err(LockstepErr {
+            reason: "street_board_mismatch".into(),
+            synced_node: abs.current_node_id,
+        });
     }
     Ok((real, abs))
 }
@@ -688,22 +737,31 @@ fn decide(
     .and_then(|(real, abs)| {
         let legal_abs = SimplifiedNlheGame::legal_actions(&abs);
         if legal_abs.is_empty() {
-            return Err("empty_legal".into());
+            // empty_legal = 终局态（非失同步）；synced_node 取当前节点（前缀走旧分流即可）。
+            return Err(LockstepErr {
+                reason: "empty_legal".into(),
+                synced_node: abs.current_node_id,
+            });
         }
         Ok((real, abs, legal_abs))
     });
     let (real, abs, legal_abs) = match lockstep {
         Ok(t) => t,
-        Err(reason) => {
+        Err(LockstepErr {
+            reason,
+            synced_node,
+        }) => {
             // 100BB 影子失同步（off-stack all-in 线等：blueprint 树按 100BB 对称栈建、该线结构性
             // 缺节点）：缺口②续——`--search` 开且 postflop → **脱影子**搜索（触发 / 子树根 /
-            // within-round 导航全来自真栈重放，[`subgame_search_unanchored`]）；preflop / 未开
-            // 搜索 → 维持旧兜底（preflop 走 blueprint 的 gating 不变，§1；search=None byte-equal）。
+            // within-round 导航全来自真栈重放，[`subgame_search_unanchored`]；档一前缀 reach 用
+            // synced_node 取已同步前缀估 range）；preflop / 未开搜索 → 维持旧兜底（preflop 走
+            // blueprint 的 gating 不变，§1；search=None byte-equal）。
             if let Some(rt) = search {
                 if board.len() >= 3 {
                     return decide_search_unanchored(
                         game,
                         abstraction,
+                        strategy_fn,
                         req,
                         base_seed,
                         rt,
@@ -714,6 +772,7 @@ fn decide(
                         hole,
                         &board,
                         &reason,
+                        synced_node,
                         solve_cache,
                     );
                 }
@@ -1116,14 +1175,21 @@ fn build_real_auth(
 /// blueprint 全局树**结构性缺节点**（树按 100BB 对称栈建：短码 shove 在树里是全栈 all-in，
 /// 「raise-over / call 完还活着」的后续节点不存在）→ lockstep 重放必失同步、拿不到 node_id。
 /// 本路径把触发判定 / 子树根 / within-round 导航全改从**真栈重放**取
-/// （[`subgame_search_unanchored`]，range 先验退 uniform），返回子树自身合法集分布，outgoing 按
-/// 真栈 `auth` + 与子树同一抽象算尺寸（`source = search:unanchored`）。非搜索区（真栈判未命中
-/// 触发面）→ 维持旧兜底 `fallback:<lockstep 原因>`（blueprint 区由影子承载、这里修不了）；
-/// 真解不出来 → check-when-free（`search_giveup:*`，不回落 blueprint，§2.3）。
+/// （[`subgame_search_unanchored`]），返回子树自身合法集分布，outgoing 按真栈 `auth` + 与子树
+/// 同一抽象算尺寸（`source = search:unanchored`）。非搜索区（真栈判未命中触发面）→ 维持旧兜底
+/// `fallback:<lockstep 原因>`（blueprint 区由影子承载、这里修不了）；真解不出来 → check-when-free
+/// （`search_giveup:*`，不回落 blueprint，§2.3）。
+///
+/// **range 先验**：`rt.unanchored_prefix_reach` 关（默认）= uniform（既有行为）；开 = 档一前缀
+/// reach——用 `synced_node`（失同步前已同步的影子节点）取已同步前缀的决策三元组
+/// （[`synced_prefix_decisions`]）+ `strategy_fn`（blueprint σ）估 per-seat range 替代 uniform
+/// （[`PrefixReach`]）。算出的 reach 进 solve 缓存 key，开/关自动 cache miss。强弱走 h2h A/B、
+/// 不默认上生产（`unanchored_range_design` §3）。
 #[allow(clippy::too_many_arguments)]
 fn decide_search_unanchored(
     game: &SimplifiedNlheGame,
     abstraction: &StreetActionAbstraction,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
     req: &Request,
     base_seed: u64,
     rt: &SearchRuntime,
@@ -1134,6 +1200,7 @@ fn decide_search_unanchored(
     hole: [Card; 2],
     board: &[Card],
     shadow_reason: &str,
+    synced_node: NodeId,
     solve_cache: &mut SubgameSolveCache,
 ) -> Response {
     let scfg = &rt.cfg;
@@ -1157,6 +1224,14 @@ fn decide_search_unanchored(
         return safe_fallback(&req.valid, shadow_reason);
     }
     let hand_seed = hand_seed_for(req, base_seed);
+    // 档一前缀 reach（默认关）：用已同步前缀估 range；关 → None = uniform（byte-equal 旧行为）。
+    let prefix_decisions = rt
+        .unanchored_prefix_reach
+        .then(|| synced_prefix_decisions(game, synced_node));
+    let prefix_reach = prefix_decisions.as_ref().map(|d| PrefixReach {
+        strategy: strategy_fn,
+        decisions: d,
+    });
     let t0 = Instant::now();
     let misses_before = solve_cache.misses();
     let dist = match subgame_search_unanchored_cached(
@@ -1167,6 +1242,7 @@ fn decide_search_unanchored(
         &within,
         scfg,
         rt.bucket_table.as_ref(), // --search-bucket-table：子树独立桶表（None = blueprint 表）。
+        prefix_reach,
         hand_seed,
     ) {
         Ok(d) => d,
@@ -1333,6 +1409,9 @@ struct Args {
     /// `--search-bucket-table`：子树 solve 用的独立桶表路径（[`SearchRuntime`] doc；`None` =
     /// 沿用 `--bucket-table`）。仅 `--search` 开时可设（同其余 `--search-*` 的拒静默 guard）。
     search_bucket_table: Option<PathBuf>,
+    /// `--search-unanchored-prefix-reach`（档一，[`SearchRuntime`] doc）：脱影子搜索 range 先验从
+    /// uniform 升级为已同步前缀 reach。默认 `false`（uniform，A/B 前不上生产）。
+    search_unanchored_prefix_reach: bool,
 }
 
 #[derive(Serialize)]
@@ -1420,7 +1499,11 @@ fn run() -> Result<(), String> {
                 })?)),
                 None => None,
             };
-            Some(SearchRuntime { cfg, bucket_table })
+            Some(SearchRuntime {
+                cfg,
+                bucket_table,
+                unanchored_prefix_reach: args.search_unanchored_prefix_reach,
+            })
         }
         None => None,
     };
@@ -1435,8 +1518,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} bucket_table={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} bucket_table={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
     }
@@ -1528,6 +1611,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_range_uniform_mix: Option<f64> = None;
     let mut search_bucket_table: Option<PathBuf> = None;
     let mut search_solve_threads: Option<usize> = None;
+    let mut search_unanchored_prefix_reach = false;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -1598,6 +1682,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 }
                 search_solve_threads = Some(v);
             }
+            "--search-unanchored-prefix-reach" => search_unanchored_prefix_reach = true,
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -1646,6 +1731,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_range_uniform_mix.is_some()
             || search_bucket_table.is_some()
             || search_solve_threads.is_some()
+            || search_unanchored_prefix_reach
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
         }
@@ -1659,6 +1745,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         seed,
         search,
         search_bucket_table,
+        search_unanchored_prefix_reach,
     })
 }
 
@@ -1676,11 +1763,21 @@ mod tests {
     use poker::BucketConfig;
 
     /// 把纯 config 包成 [`SearchRuntime`]（子树桶表 = None，沿用 blueprint 表——既有搜索测试
-    /// 全不换表，行为与改前 byte-equal）。
+    /// 全不换表，行为与改前 byte-equal）。前缀 reach 默认关（uniform）= 既有脱影子行为。
     fn rt(cfg: SubgameSearchConfig) -> SearchRuntime {
         SearchRuntime {
             cfg,
             bucket_table: None,
+            unanchored_prefix_reach: false,
+        }
+    }
+
+    /// 同 [`rt`] 但开档一前缀 reach（脱影子 range 先验 = 已同步前缀，A/B 用）。
+    fn rt_prefix_reach(cfg: SubgameSearchConfig) -> SearchRuntime {
+        SearchRuntime {
+            cfg,
+            bucket_table: None,
+            unanchored_prefix_reach: true,
         }
     }
 
@@ -2648,6 +2745,73 @@ mod tests {
         assert_eq!(resp, again, "同 seed 脱影子搜索须确定性（可复现）");
     }
 
+    /// 档一前缀 reach 端到端（`--search-unanchored-prefix-reach`）：off-stack all-in 线 → ①前缀
+    /// 关（uniform）仍由脱影子搜索接管；②前缀开 → 已同步前缀（UTG all-in + 3 fold，全 preflop）
+    /// 非空 → ranges 进 solve 缓存 key → 同一 cache 与 uniform 不同 key 必 miss（证前缀真流进
+    /// solve、非 no-op；stub 桶下 ranges≈uniform，key 差异仍可证）；③前缀开同 seed 可复现、合法、
+    /// source=search:unanchored（不回落 blueprint）。
+    #[test]
+    fn unanchored_prefix_reach_flows_into_solve_key() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let req = offstack_allin_req();
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let mut cache = SubgameSolveCache::new();
+        // ① 前缀关（uniform）→ 脱影子搜索接管（miss + store）。
+        let off = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x0FF5,
+            Some(&rt(scfg)),
+            &mut cache,
+        );
+        assert_eq!(
+            off.source, "search:unanchored",
+            "前缀关：脱影子搜索接管，得 {off:?}"
+        );
+        assert!(is_legal(&off, &req.valid), "前缀关动作须合法，得 {off:?}");
+        let misses_off = cache.misses();
+        // ② 前缀开（同 cache）→ ranges 进 key → 必 miss（不复用 uniform 解）。
+        let on = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x0FF5,
+            Some(&rt_prefix_reach(scfg)),
+            &mut cache,
+        );
+        assert_eq!(
+            on.source, "search:unanchored",
+            "前缀开：仍脱影子搜索接管，得 {on:?}"
+        );
+        assert!(is_legal(&on, &req.valid), "前缀开动作须合法，得 {on:?}");
+        assert!(
+            cache.misses() > misses_off,
+            "前缀 reach 开 → ranges 进 key → 必 miss（前缀真流进 solve），misses {misses_off}→{}",
+            cache.misses()
+        );
+        // ③ 前缀开同 seed 可复现（独立 cache）。
+        let on2 = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x0FF5,
+            Some(&rt_prefix_reach(scfg)),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(on, on2, "前缀 reach 同 seed 须可复现");
+    }
+
     /// 脱影子 × 缺口③ deep_menu：同一 off-stack all-in 线，{1pot} 单档子树仍解出 + 合法 +
     /// source=search:unanchored（子树抽象与 outgoing 自洽，{1pot} 在真栈 pot 上重算 to）。
     #[test]
@@ -3320,5 +3484,25 @@ mod tests {
         assert!(parse(&["--search", "--search-solve-threads", "0"]).is_err());
         // 拒绝静默 guard：设了 flag 未开 --search → Err。
         assert!(parse(&["--search-solve-threads", "4"]).is_err());
+    }
+
+    /// `--search-unanchored-prefix-reach`（档一）：默认关、显式开置位、未开 --search 拒收。
+    #[test]
+    fn parse_args_unanchored_prefix_reach() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        // 默认关（uniform 先验，A/B 前不上生产）。
+        let a = parse(&["--search"]).expect("parse Ok");
+        assert!(!a.search_unanchored_prefix_reach, "默认关");
+        // 显式开 → 置位。
+        let a = parse(&["--search", "--search-unanchored-prefix-reach"]).expect("parse Ok");
+        assert!(a.search_unanchored_prefix_reach, "显式开应置位");
+        // 拒绝静默 guard：设了 flag 未开 --search → Err。
+        assert!(parse(&["--search-unanchored-prefix-reach"]).is_err());
     }
 }

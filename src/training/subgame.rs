@@ -1003,6 +1003,32 @@ fn decisions_on_path(
     out
 }
 
+/// 脱锚搜索档一（前缀 reach，`unanchored_range_design_2026_06_10` §1）的 range 先验输入：
+/// 失同步时**已同步前缀**的决策三元组列表 + blueprint σ 查询面。失同步发生在某个具体动作上，
+/// 之前每一步影子都走通了、有精确的 blueprint 节点（不是近似）——把这段前缀喂
+/// [`estimate_range`]（`skip_all_in=true`，跳过 100BB-shove 语义的 AllIn-tag）即得**更粗但
+/// 合法**的 per-seat range 先验（「给定已同步前缀的 range」），替代脱锚默认的 uniform。
+///
+/// `decisions` = 全路径决策三元组（[`synced_prefix_decisions`] 从失同步影子节点取）；脱锚搜索
+/// 内部按 [`ResolveRoot::RoundStart`] 只用**当前街之前**的决策（当前街 betting 由 CFR 解，§2）。
+/// `strategy` = actor 的 blueprint average strategy（同质 blueprint 假设，[`estimate_range`] doc）。
+/// `None` = uniform 先验（既有行为，byte-equal）。
+pub struct PrefixReach<'a> {
+    pub strategy: &'a dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    pub decisions: &'a [(NodeId, AbstractActionTag, PlayerId)],
+}
+
+/// 档一前缀 reach：从失同步时**已同步**的影子 `synced_node`（lockstep 闭包在断点前的
+/// `current_node_id`）取已同步前缀的决策三元组列表（[`decisions_on_path`] 在 blueprint 全局树上
+/// 回溯）。结果喂 [`PrefixReach`]。`synced_node` 之后的（断点 + 其后）决策不在列表里 = 按无
+/// 信息处理（因子 1，`unanchored_range_design` §1）。
+pub fn synced_prefix_decisions(
+    game: &SimplifiedNlheGame,
+    synced_node: NodeId,
+) -> Vec<(NodeId, AbstractActionTag, PlayerId)> {
+    decisions_on_path(game.tree(), synced_node)
+}
+
 /// 估计 `seat` 的 per-hole marginal range（reach 向量，下标对齐 `holes`，归一）。沿 `decisions`
 /// 里属于 `seat` 的决策，对每个候选 hole 累乘该 hole 在 blueprint σ 下走该动作的概率——**逐街
 /// 用 `info_set_for_cards` 注入真实 board 前缀算当前街桶**（绝不在固定桶上累乘，§5b 陷阱①）。
@@ -1011,6 +1037,12 @@ fn decisions_on_path(
 ///
 /// **同质 blueprint 假设**：用 `game`/`strategy`（actor 的 blueprint）为所有 seat 估 range——
 /// 探针自对弈（hero/field 同 blueprint）下精确；异质 field 下是近似（§5b 陷阱②的工程折中）。
+///
+/// `skip_all_in`（脱锚搜索档一前缀 reach，`unanchored_range_design_2026_06_10` §1）：`true` =
+/// **跳过 `AllIn`-tag 决策**（按因子 1 处理、不乘进 reach）。理由：AllIn-tag 的 σ 语义是
+/// 「100BB 全栈 shove」，off-100BB 真栈下撒谎最狠（blueprint RFI 在 100BB 几乎不开池 shove，
+/// 真 30BB shove 的 range 宽得多）——乘进去会把 shover 错收成「100BB shove range」，比 uniform
+/// 更糟。`false`（anchored 路径，栈≈100BB、AllIn = 真 100BB shove）= 不跳，逐位 byte-equal。
 fn estimate_range(
     game: &SimplifiedNlheGame,
     strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
@@ -1018,6 +1050,7 @@ fn estimate_range(
     board: &[Card],
     seat: PlayerId,
     holes: &[[Card; 2]],
+    skip_all_in: bool,
 ) -> Vec<f64> {
     let board_set: BTreeSet<u8> = board.iter().map(|c| c.to_u8()).collect();
     let tree = game.tree();
@@ -1033,6 +1066,9 @@ fn estimate_range(
         }
         let mut reach = 1.0_f64;
         for (node_id, tag) in &seat_decisions {
+            if skip_all_in && *tag == AbstractActionTag::AllIn {
+                continue; // 档一 v1：AllIn-tag 按因子 1 处理（σ 是 100BB shove，off-100BB 撒谎）。
+            }
             let node = tree.node(*node_id);
             let bp = board_prefix_for_street(board, node.street);
             let info = game.info_set_for_cards(*node_id, *hole, bp);
@@ -1579,6 +1615,7 @@ fn subgame_search_cached_inner(
                             &board,
                             seat as PlayerId,
                             &holes,
+                            false, // anchored：栈≈100BB，AllIn = 真 100BB shove，不跳过（byte-equal）。
                         );
                         mix_range_with_uniform(
                             &mut r,
@@ -2116,9 +2153,13 @@ fn navigate_subtree_by_real_actions(
 ///   live bitmask；raises_on_street = 0（轮起点）；
 /// - within-round 导航 = 当前街真实动作序在子树上重放（[`navigate_subtree_by_real_actions`]，
 ///   tag 以真栈几何现算）；`within_round` 元素 = `(动作, 该动作是否令行动者 all-in)`；
-/// - **range 先验退 uniform**（`cfg.use_blueprint_range` 被忽略）：blueprint reach 要沿全局树
-///   路径累乘，而该路径在 off-stack 线上不存在；uniform 即 §5b 留作 A/B 的那条路，且 off-100BB
-///   下 blueprint range 本就是「假设 100BB 的 range」（exec 文档 §0.3）——诚实退化、不假装有先验；
+/// - **range 先验**：默认退 uniform（`cfg.use_blueprint_range` 被忽略）——blueprint reach 要沿
+///   全局树路径累乘，而该路径在 off-stack 线上不存在；uniform 即 §5b 留作 A/B 的那条路，且
+///   off-100BB 下 blueprint range 本就是「假设 100BB 的 range」（exec 文档 §0.3）——诚实退化、
+///   不假装有先验。**档一前缀 reach**（[`subgame_search_unanchored_cached`] 的 `prefix_reach =
+///   Some`，`unanchored_range_design` §1）= 用**已同步前缀**（断点之前的精确 blueprint 决策，
+///   跳过 AllIn-tag）估 per-seat range（[`estimate_range`] + [`PrefixReach`]）替代 uniform——更粗
+///   但合法的条件化，非错条件化。本无缓存入口恒 uniform（`prefix_reach = None`）；
 /// - 返回**子树自身合法集**上的分布（同 `deep_menu` 契约，[`self_distribution`]）：调用方用与
 ///   子树同一抽象（`deep_menu` → [`deep_menu_for`]`(root_state)`，否则 blueprint 菜单）按
 ///   `auth` 真实几何做 outgoing。
@@ -2143,6 +2184,7 @@ pub fn subgame_search_unanchored(
         within_round,
         cfg,
         None,
+        None,
         hand_seed,
     )
 }
@@ -2150,8 +2192,14 @@ pub fn subgame_search_unanchored(
 /// [`subgame_search_unanchored`] 的缓存版（与 [`subgame_search_cached`] 同语义）：`cache = Some`
 /// 且 key 命中（同手同街，[`solve_cache_key`]）→ 复用已解 trainer、只重做 within-round 真实
 /// 动作导航 + 读数（导航用 solve 时存下的同一份 sub_abs）。`cache = None` = 原行为。
-/// `bucket_override` 语义同 [`subgame_search_cached`]（本路径 range 本就 uniform、不查
-/// blueprint σ，换表只动子树归桶 + hero 读数；depth_limit 本路径恒不支持，无兼容性问题）。
+/// `bucket_override` 语义同 [`subgame_search_cached`]（换表只动子树归桶 + hero 读数；depth_limit
+/// 本路径恒不支持，无兼容性问题）。
+///
+/// `prefix_reach`（档一，`unanchored_range_design` §1）：`Some` = 用**已同步前缀**估 per-seat
+/// range 先验替代 uniform（[`PrefixReach`] doc）。算出的 reach 向量进 solve 缓存 key
+/// （[`solve_cache_key`] 的 ranges 项）→ 开/关前缀 reach 自动 cache miss，不会读错均衡。
+/// `None`（默认）= uniform（既有行为，**逐 infoset byte-equal、不改既有调用点**）。**前缀里没有
+/// 当前街之前的决策**（如 limp 池在首动作即失同步 → 前缀为空）→ 退 uniform 路径（byte-equal）。
 #[allow(clippy::too_many_arguments)]
 pub fn subgame_search_unanchored_cached(
     cache: Option<&mut SubgameSolveCache>,
@@ -2161,6 +2209,7 @@ pub fn subgame_search_unanchored_cached(
     within_round: &[(Action, bool)],
     cfg: &SubgameSearchConfig,
     bucket_override: Option<&Arc<BucketTable>>,
+    prefix_reach: Option<PrefixReach<'_>>,
     hand_seed: u64,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
     subgame_search_unanchored_cached_inner(
@@ -2171,14 +2220,20 @@ pub fn subgame_search_unanchored_cached(
         within_round,
         cfg,
         bucket_override,
+        prefix_reach,
+        None,
         hand_seed,
         false,
     )
 }
 
 /// [`subgame_search_unanchored_cached`] 本体 + 预热钩子。`solve_only` 语义同
-/// [`subgame_search_cached_inner`]；本路径 range 恒 uniform（不查 blueprint σ）→ solve 输入
-/// 不依赖 `auth` 的 current actor，无需 actor_override（预热传 `auth = root_state` 即可同 key）。
+/// [`subgame_search_cached_inner`]。`actor_override`：`Some(hero)` = range 平滑的「hero 不混」
+/// 座（[`mix_lambda_for_seat`]）按它算而非 `auth.current_player()`——前缀 reach 预热在该街 hero
+/// 行动**前**（`auth = round_start`、current_player = 首行动者 ≠ hero），不传 hero 则混错座、
+/// ranges 与决策时不同 → key 必 miss、预热静默失效（同 anchored [`subgame_search_cached_inner`]
+/// 的 actor_override）。`None`（决策路径）= `auth.current_player()`（= hero，require_my_turn）。
+/// `prefix_reach = None` 时本参数不被读（uniform 无混合）。
 #[allow(clippy::too_many_arguments)]
 fn subgame_search_unanchored_cached_inner(
     cache: Option<&mut SubgameSolveCache>,
@@ -2188,6 +2243,8 @@ fn subgame_search_unanchored_cached_inner(
     within_round: &[(Action, bool)],
     cfg: &SubgameSearchConfig,
     bucket_override: Option<&Arc<BucketTable>>,
+    prefix_reach: Option<PrefixReach<'_>>,
+    actor_override: Option<PlayerId>,
     hand_seed: u64,
     solve_only: bool,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
@@ -2209,7 +2266,8 @@ fn subgame_search_unanchored_cached_inner(
                 .to_string(),
         );
     }
-    let auth_actor = auth.current_player().expect("checked above").0 as PlayerId;
+    let auth_actor = actor_override
+        .unwrap_or_else(|| auth.current_player().expect("checked above").0 as PlayerId);
     if root_state.street() != auth.street() {
         return Err("subgame_search_unanchored: root_state 与 auth 不同街".to_string());
     }
@@ -2241,9 +2299,63 @@ fn subgame_search_unanchored_cached_inner(
     // 本即 redirect 关（deep_single_pot / deep_wide_half_pot 的 rules 都是 Default），
     // 两路一致。
     sub_rules.width_redirect = BettingAbstractionRules::WIDTH_REDIRECT_OFF;
-    // 真栈锚上下文：entrants = 轮起点 live bitmask；raises_on_street = 0（轮起点）；range =
-    // uniform（SubgameNlheGame::new 的 root uniform resample，无 ranges）。
+    // 真栈锚上下文：entrants = 轮起点 live bitmask；raises_on_street = 0（轮起点）。
     let entrants = live_entrants(root_state);
+
+    // 档一前缀 reach（PrefixReach=Some 且有当前街之前的前缀决策）→ 为每个未弃牌座位估 marginal
+    // range（new_with_ranges 加权采样底牌），替代 uniform（SubgameNlheGame::new 的 root uniform
+    // resample）。只用**当前街之前**的决策（当前街 betting 在子博弈内由 CFR 解，§2）；AllIn-tag
+    // 跳过（estimate_range skip_all_in=true，档一 v1）；对手座位做 uniform 平滑（range_uniform_mix），
+    // hero（auth_actor）不混（mix_lambda_for_seat）。**前缀里无当前街之前的决策（如 limp 池首动作
+    // 即失同步）→ ranges=None 退 uniform 路径**（与既有 byte-equal，不走 new_with_ranges 的均匀
+    // 向量——那是不同采样路径、不 byte-equal）。
+    let ranges_opt: Option<Vec<Vec<f64>>> = prefix_reach.and_then(|pr| {
+        let tree = game.tree();
+        let cur = root_state.street() as u8;
+        let prior: Vec<(NodeId, AbstractActionTag, PlayerId)> = pr
+            .decisions
+            .iter()
+            .filter(|(nid, _, _)| (tree.node(*nid).street as u8) < cur)
+            .copied()
+            .collect();
+        if prior.is_empty() {
+            return None; // 前缀无当前街之前的决策 → 退 uniform（byte-equal）。
+        }
+        let holes = all_hole_combos();
+        let board: Vec<Card> = root_state.board().to_vec();
+        let players = root_state.players();
+        Some(
+            (0..players.len())
+                .map(|seat| {
+                    if players[seat].hole_cards.is_some() {
+                        let mut r = estimate_range(
+                            game,
+                            pr.strategy,
+                            &prior,
+                            &board,
+                            seat as PlayerId,
+                            &holes,
+                            true, // 档一：跳过 AllIn-tag（100BB shove 语义，off-100BB 撒谎）。
+                        );
+                        mix_range_with_uniform(
+                            &mut r,
+                            &holes,
+                            &board,
+                            mix_lambda_for_seat(
+                                seat as PlayerId,
+                                auth_actor,
+                                cfg.range_uniform_mix,
+                            ),
+                        );
+                        r
+                    } else {
+                        Vec::new() // 弃牌座：range 不被读。
+                    }
+                })
+                .collect(),
+        )
+    });
+
     // 子树 solve 实际用表（同 anchored：override 优先，否则 blueprint 表 byte-equal）。
     let sub_table: Arc<BucketTable> =
         bucket_override.map_or_else(|| Arc::clone(&game.bucket_table), Arc::clone);
@@ -2255,7 +2367,7 @@ fn subgame_search_unanchored_cached_inner(
             root_state,
             entrants,
             0,
-            None,
+            ranges_opt.as_deref(),
             &sub_abs,
             &sub_rules,
             cfg,
@@ -2264,15 +2376,28 @@ fn subgame_search_unanchored_cached_inner(
         )
     });
     let build_and_solve = move || -> Result<SolvedSubgame, String> {
-        let sub = SubgameNlheGame::new(
-            Arc::clone(&sub_table),
-            root_state.config().clone(),
-            sub_abs.clone(), // 真栈导航还要同一抽象现算 tag
-            sub_rules,
-            root_state.clone(),
-            entrants,
-            0,
-        );
+        let sub = if let Some(ranges) = ranges_opt {
+            SubgameNlheGame::new_with_ranges(
+                Arc::clone(&sub_table),
+                root_state.config().clone(),
+                sub_abs.clone(), // 真栈导航还要同一抽象现算 tag
+                sub_rules,
+                root_state.clone(),
+                entrants,
+                0,
+                ranges,
+            )
+        } else {
+            SubgameNlheGame::new(
+                Arc::clone(&sub_table),
+                root_state.config().clone(),
+                sub_abs.clone(),
+                sub_rules,
+                root_state.clone(),
+                entrants,
+                0,
+            )
+        };
         let trainer = solve_subgame(sub, cfg, master)?;
         Ok(SolvedSubgame { trainer, sub_abs })
     };
@@ -2366,13 +2491,18 @@ pub fn subgame_search_prewarm(
     .map(|_| ())
 }
 
-/// RoundStart 预热（**脱影子**路径）：语义同 [`subgame_search_prewarm`]。本路径 range 恒
-/// uniform → solve 输入不依赖读数 actor，无需 hero 座位；`round_start` 兼作 auth（街起点是
-/// decision 节点）。失败无害（同上）。
+/// RoundStart 预热（**脱影子**路径）：语义同 [`subgame_search_prewarm`]。`round_start` 兼作 auth
+/// （街起点是 decision 节点）。`prefix_reach`（档一）= `Some` 时用已同步前缀估 range——预热须与
+/// 决策时**算出同一份 ranges** 才能命中 key，故须传 `hero`（range 平滑「不混」座按它算而非街首
+/// 行动者，否则 ranges 不同 → key miss → 预热静默失效；同 anchored [`subgame_search_prewarm`]）。
+/// `prefix_reach = None` = uniform（`hero` 不被读、传任意值即可）。失败无害（同上）。
+#[allow(clippy::too_many_arguments)]
 pub fn subgame_search_unanchored_prewarm(
     cache: &mut SubgameSolveCache,
+    hero: PlayerId,
     round_start: &GameState,
     game: &SimplifiedNlheGame,
+    prefix_reach: Option<PrefixReach<'_>>,
     cfg: &SubgameSearchConfig,
     bucket_override: Option<&Arc<BucketTable>>,
     hand_seed: u64,
@@ -2385,6 +2515,8 @@ pub fn subgame_search_unanchored_prewarm(
         &[],
         cfg,
         bucket_override,
+        prefix_reach,
+        Some(hero),
         hand_seed,
         true,
     )
@@ -3295,7 +3427,7 @@ mod tests {
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
         let actor = flop.game_state.current_player().unwrap().0 as PlayerId;
 
-        let range = estimate_range(&game, &strat, &decisions, &board, actor, &holes);
+        let range = estimate_range(&game, &strat, &decisions, &board, actor, &holes, false);
         assert_eq!(range.len(), 1326);
         let sum: f64 = range.iter().sum();
         assert!((sum - 1.0).abs() < 1e-9, "range 须归一，和={sum}");
@@ -5094,6 +5226,255 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-9, "分布应归一，和={sum}");
     }
 
+    // —— 脱锚搜索档一：同步前缀 reach（unanchored_range_design §1）——
+
+    /// off-stack all-in 线（[`offstack_allin_flop_state`]）在 100BB 影子上**已同步前缀**：UTG
+    /// all-in + HJ/CO/BTN fold（断点 = SB raise-over，影子拿不到）→ synced_node = SB 决策节点。
+    /// 返回前缀决策三元组（全 preflop）。供前缀 reach 测试用（与脱锚 root = offstack flop 配对）。
+    fn offstack_synced_prefix(
+        game: &SimplifiedNlheGame,
+    ) -> Vec<(NodeId, AbstractActionTag, PlayerId)> {
+        let mut rng = ChaCha20Rng::from_seed(0x4F46_4653_5953_4E43); // "OFFSYSNC"
+        let drng: &mut dyn RngSource = &mut rng;
+        let mut abs = game.root(drng);
+        assert_eq!(
+            abs.game_state.current_player(),
+            Some(SeatId(3)),
+            "UTG 首行动"
+        );
+        let allin = SimplifiedNlheGame::legal_actions(&abs)
+            .into_iter()
+            .find(|a| AbstractActionTag::of(a) == AbstractActionTag::AllIn)
+            .expect("UTG 根应有 AllIn 档");
+        abs = SimplifiedNlheGame::next(abs, allin, drng);
+        for _ in 0..3 {
+            let fold = SimplifiedNlheGame::legal_actions(&abs)
+                .into_iter()
+                .find(|a| matches!(a, AbstractAction::Fold))
+                .expect("HJ/CO/BTN 应可 fold");
+            abs = SimplifiedNlheGame::next(abs, fold, drng);
+        }
+        assert_eq!(
+            abs.game_state.current_player(),
+            Some(SeatId(1)),
+            "前缀末 = SB 决策点（断点前）"
+        );
+        let prefix = synced_prefix_decisions(game, abs.current_node_id);
+        assert!(
+            !prefix.is_empty()
+                && prefix
+                    .iter()
+                    .all(|(nid, _, _)| game.tree().node(*nid).street == StreetTag::Preflop),
+            "off-stack 前缀须非空且全 preflop"
+        );
+        prefix
+    }
+
+    /// 档一：前缀**为空**（如 limp 池首动作即失同步 → synced_node = root → 无当前街之前的
+    /// 决策）→ 脱锚搜索退 uniform 路径，与 `prefix_reach = None` **byte-equal**（不走
+    /// `new_with_ranges` 的均匀向量——那是不同采样路径、不 byte-equal）。
+    #[test]
+    fn unanchored_prefix_reach_empty_is_uniform_byte_equal() {
+        let game = nolimp_6max_game();
+        let auth = offstack_allin_flop_state();
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let empty: Vec<(NodeId, AbstractActionTag, PlayerId)> = Vec::new();
+        let prefix = PrefixReach {
+            strategy: &strat,
+            decisions: &empty,
+        };
+        let with_empty = subgame_search_unanchored_cached(
+            None,
+            &auth,
+            &auth,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(prefix),
+            0xE111,
+        )
+        .expect("空前缀应 Ok");
+        let uniform = subgame_search_unanchored(&auth, &auth, &game, &[], &cfg, 0xE111)
+            .expect("uniform 应 Ok");
+        assert_eq!(
+            format!("{with_empty:?}"),
+            format!("{uniform:?}"),
+            "空前缀须与 uniform 路径 byte-equal"
+        );
+    }
+
+    /// 档一：前缀**非空**（off-stack 已同步前缀 = UTG all-in + 3 fold，全 preflop）→ 算出的
+    /// reach 进 solve 缓存 key → 与 uniform（`prefix_reach = None`）不同 key → 同一 cache 必 miss
+    /// （开/关前缀 reach 不串均衡，验收 ③）。stub 桶下 ranges 本身 ≈ uniform，但 Some(ranges)≠None
+    /// 的 key 差异即证前缀真进 key；解归一 + 同 seed 可复现。
+    #[test]
+    fn unanchored_prefix_reach_ranges_enter_cache_key() {
+        let game = nolimp_6max_game();
+        let auth = offstack_allin_flop_state();
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let decisions = offstack_synced_prefix(&game);
+        let mut cache = SubgameSolveCache::new();
+        // uniform（prefix=None）→ miss + store。
+        subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &auth,
+            &auth,
+            &game,
+            &[],
+            &cfg,
+            None,
+            None,
+            0xE333,
+        )
+        .expect("uniform 应 Ok");
+        // prefix reach（同 cache）→ ranges 进 key → 必 miss（不复用 uniform 解）。
+        let d_pre = subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &auth,
+            &auth,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(PrefixReach {
+                strategy: &strat,
+                decisions: &decisions,
+            }),
+            0xE333,
+        )
+        .expect("prefix reach 应 Ok");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (2, 0),
+            "开/关前缀 reach → ranges 进 key → 必 miss（不串均衡）"
+        );
+        let sum: f64 = d_pre.iter().map(|(_, p)| p).sum();
+        assert!((sum - 1.0).abs() < 1e-9, "前缀 reach 分布须归一，和={sum}");
+        // 同 seed 可复现（无缓存现解）。
+        let d_pre2 = subgame_search_unanchored_cached(
+            None,
+            &auth,
+            &auth,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(PrefixReach {
+                strategy: &strat,
+                decisions: &decisions,
+            }),
+            0xE333,
+        )
+        .expect("再跑一次");
+        assert_eq!(
+            format!("{d_pre:?}"),
+            format!("{d_pre2:?}"),
+            "前缀 reach 同 seed 须可复现"
+        );
+    }
+
+    /// 档一核心机制（[`estimate_range`] `skip_all_in`）：①AllIn-tag 决策按因子 1 跳过
+    /// （skip=true ≡ 删该决策）；②无 AllIn 的座 skip 不影响；③非 AllIn 决策（Raise）→ range
+    /// 非 uniform、AllIn 被处理（skip=false）时 range 非 uniform。①②是任意桶都成立的结构等式；
+    /// ③的「非 uniform」需**真桶表**（stub 全归桶 0 → 任何 σ 都让 range uniform，机制不可观测）：
+    /// 默认读 `SUBGAME_CAL_BUCKET_TABLE`（缺省 vultr 已有的 schema-v4 表），打不开退 stub
+    /// （仅验①②，③跳过）。`bucket_mode` 自报。
+    #[test]
+    fn unanchored_prefix_reach_skips_all_in_tag() {
+        let bucket_path = std::env::var("SUBGAME_CAL_BUCKET_TABLE").unwrap_or_else(|_| {
+            "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin".to_string()
+        });
+        let (table, is_real): (Arc<BucketTable>, bool) = match BucketTable::open(
+            std::path::Path::new(&bucket_path),
+        ) {
+            Ok(t) => (Arc::new(t), true),
+            Err(e) => {
+                eprintln!("[prefix-reach] WARN 打不开真桶表 {bucket_path}: {e:?} → 退 stub（仅验结构等式）");
+                (stub_table(), false)
+            }
+        };
+        eprintln!(
+            "[prefix-reach] bucket_mode={}",
+            if is_real { "real" } else { "stub" }
+        );
+        let (a, mut r) = first_small_6max(2);
+        r.no_open_limp = true;
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            table,
+            TableConfig::default_6max_100bb(),
+            a,
+            r,
+        )
+        .expect("6max game");
+        // 影子前缀：UTG(3) raise（非 all-in）→ HJ(4) all-in（断点无关，这里只取前缀决策）。
+        let mut rng = ChaCha20Rng::from_seed(0x534B_4950_414C_4C49); // "SKIPALLI"
+        let drng: &mut dyn RngSource = &mut rng;
+        let mut abs = game.root(drng);
+        let utg = abs.game_state.current_player().expect("decision").0 as PlayerId;
+        let raise = SimplifiedNlheGame::legal_actions(&abs)
+            .into_iter()
+            .find(|x| matches!(AbstractActionTag::of(x), AbstractActionTag::Raise(_)))
+            .expect("UTG 根应有 Raise 档");
+        abs = SimplifiedNlheGame::next(abs, raise, drng);
+        let hj = abs.game_state.current_player().expect("decision").0 as PlayerId;
+        let allin = SimplifiedNlheGame::legal_actions(&abs)
+            .into_iter()
+            .find(|x| AbstractActionTag::of(x) == AbstractActionTag::AllIn)
+            .expect("HJ 应有 AllIn 档");
+        abs = SimplifiedNlheGame::next(abs, allin, drng);
+        let decisions = synced_prefix_decisions(&game, abs.current_node_id);
+        // 非均匀 σ（按 info.raw 偏斜，确定性）→ 真桶下 reach 非 uniform。
+        let strat = |i: &InfoSetId, n: usize| {
+            let mut v: Vec<f64> = (0..n)
+                .map(|k| 1.0 + k as f64 + (i.raw() % 7) as f64 * 0.1)
+                .collect();
+            let s: f64 = v.iter().sum();
+            v.iter_mut().for_each(|x| *x /= s);
+            v
+        };
+        let holes = all_hole_combos();
+        let board: Vec<Card> = Vec::new();
+        let empty: Vec<(NodeId, AbstractActionTag, PlayerId)> = Vec::new();
+
+        // ① UTG（只有 Raise，无 AllIn）→ skip 不影响（任意桶）。
+        let utg_skip = estimate_range(&game, &strat, &decisions, &board, utg, &holes, true);
+        let utg_noskip = estimate_range(&game, &strat, &decisions, &board, utg, &holes, false);
+        assert_eq!(utg_skip, utg_noskip, "UTG 无 AllIn-tag → skip 不影响");
+        // ② HJ（只有 AllIn）→ skip=true ≡ 删该决策（= 空决策，任意桶）。
+        let hj_skip = estimate_range(&game, &strat, &decisions, &board, hj, &holes, true);
+        let hj_empty = estimate_range(&game, &strat, &empty, &board, hj, &holes, false);
+        assert_eq!(
+            hj_skip, hj_empty,
+            "skip=true 跳 AllIn-tag ≡ 删该决策（因子 1）"
+        );
+
+        if is_real {
+            // ③ 真桶：AllIn 被处理（skip=false）→ reach 非 uniform → 与 skip=true(uniform) 不同。
+            let hj_noskip = estimate_range(&game, &strat, &decisions, &board, hj, &holes, false);
+            assert_ne!(
+                hj_noskip, hj_skip,
+                "真桶：skip=false 处理 AllIn → 非 uniform，与 skip=true 不同"
+            );
+            // 非 AllIn 决策（Raise）→ UTG range 非 uniform。
+            let w0 = utg_skip.iter().copied().find(|w| *w > 0.0).expect("有正权");
+            assert!(
+                utg_skip.iter().any(|w| *w > 0.0 && (*w - w0).abs() > 1e-12),
+                "真桶：Raise 条件化 → UTG range 非 uniform"
+            );
+        }
+    }
+
     /// 不支持的配置显式 `Err`（不静默择一）：depth_limit（要 blueprint 树锚）/ CurrentDecision
     /// （影子锚 A/B 旧模式）/ preflop（走 blueprint，§1 gating）。
     #[test]
@@ -5543,6 +5924,7 @@ mod tests {
             &[],
             &cfg,
             None,
+            None,
             0xD15E,
         )
         .expect("首决策应 Ok");
@@ -5555,6 +5937,7 @@ mod tests {
             &game,
             &within,
             &cfg,
+            None,
             None,
             0xD15E,
         )
@@ -5579,6 +5962,7 @@ mod tests {
             &game,
             &[],
             &cfg,
+            None,
             None,
             0xD15F,
         )
@@ -5722,7 +6106,7 @@ mod tests {
         .is_err());
     }
 
-    /// 脱影子预热：同语义（range 恒 uniform → 无需 hero 座位）。预热 → mid-round 首决策命中、
+    /// 脱影子预热（uniform 先验，prefix_reach=None → hero 不被读）：预热 → mid-round 首决策命中、
     /// 输出 byte-equal 无缓存现解。
     #[test]
     fn prewarm_unanchored_first_decision_hits() {
@@ -5735,9 +6119,19 @@ mod tests {
             max_subtree_nodes: 1_000_000,
             ..SubgameSearchConfig::default()
         };
+        let hero = round_start.current_player().expect("decision").0 as PlayerId;
         let mut cache = SubgameSolveCache::new();
-        subgame_search_unanchored_prewarm(&mut cache, &round_start, &game, &cfg, None, 0xD15E)
-            .expect("预热应 Ok");
+        subgame_search_unanchored_prewarm(
+            &mut cache,
+            hero,
+            &round_start,
+            &game,
+            None,
+            &cfg,
+            None,
+            0xD15E,
+        )
+        .expect("预热应 Ok");
         assert_eq!((cache.misses(), cache.hits()), (1, 0));
         let within = [(Action::Check, false)];
         let d = subgame_search_unanchored_cached(
@@ -5747,6 +6141,7 @@ mod tests {
             &game,
             &within,
             &cfg,
+            None,
             None,
             0xD15E,
         )
@@ -5872,6 +6267,7 @@ mod tests {
             &[],
             &cfg,
             None,
+            None,
             0xB0CB,
         )
         .expect("override=None 应 Ok");
@@ -5883,6 +6279,7 @@ mod tests {
             &[],
             &cfg,
             Some(&game.bucket_table),
+            None,
             0xB0CB,
         )
         .expect("override=Some(同表) 应 Ok");
@@ -5897,6 +6294,7 @@ mod tests {
             &[],
             &cfg,
             Some(&other),
+            None,
             0xB0CB,
         )
         .expect("override=Some(另一表) 应 Ok");
@@ -5984,6 +6382,7 @@ mod tests {
             &[],
             &off,
             None,
+            None,
             0x7261,
         )
         .expect("off 应 Ok");
@@ -5994,6 +6393,7 @@ mod tests {
             &game,
             &[],
             &cfg,
+            None,
             None,
             0x7261,
         )
