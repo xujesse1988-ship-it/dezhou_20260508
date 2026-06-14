@@ -2267,6 +2267,65 @@ mod tests {
         assert_eq!(r.source, "fallback:z:nut_call", "得 {r:?}");
     }
 
+    /// 真实 live 手回归（2026-06-14 用户报）：KK（BB）对超深码对手（seat4=99614 ≈ 5000BB）
+    /// 3bet→4bet→5bet 后面对其全下。100BB 影子栈 10000 表示不了 5000BB shove（raise 到
+    /// 99614×scale(5) ≫ 10000）→ `real.apply` 失败 → lockstep `replay_illegal`（site 796 失同步）。
+    /// **修前**兜底 check-when-free 面对全下 = fold → 把 KK 白弃（live 实测 `fallback:replay_illegal`
+    /// + fold）；**地板**（preflop tier-2 facing bet）须把它改成 call。
+    #[test]
+    fn live_deep_stack_kk_replay_illegal_calls_not_folds() {
+        let game = preopen_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let req = Request {
+            hole: vec!["Ks".into(), "Kd".into()],
+            board: vec![],
+            button_seat: 0,
+            my_seat: 2,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                hist(3, "fold", None),
+                hist(4, "raise", Some(50)),
+                hist(5, "fold", None),
+                hist(0, "fold", None),
+                hist(1, "fold", None),
+                hist(2, "raise", Some(160)),
+                hist(4, "raise", Some(435)),
+                hist(2, "raise", Some(1315)),
+                hist(4, "raise", Some(99614)),
+            ],
+            valid: ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: false,
+                min_raise: None,
+                max_raise: None,
+            },
+            stacks: vec![2302, 1420, 1917, 628, 99614, 722],
+            dealt_seats: vec![],
+        };
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            7,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(
+            resp.source, "fallback:replay_illegal:premium_call",
+            "KK 超深码 shove 前 replay_illegal 失同步须命中地板，得 {resp:?}"
+        );
+        assert_eq!(
+            resp.action, "call",
+            "KK 面对全下须 call、不白弃，得 {resp:?}"
+        );
+        assert!(is_legal(&resp, &req.valid));
+    }
+
     /// 非 6 人桌 → 兜底（不崩）。
     #[test]
     fn non_6max_falls_back() {
