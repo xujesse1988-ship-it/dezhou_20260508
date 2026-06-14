@@ -87,6 +87,9 @@ struct Args {
 /// 自对弈遥测（跨 rayon 线程原子累加）。
 #[derive(Default)]
 struct ProbeObs {
+    hands_total: AtomicU64,          // 跑过的手数
+    hands_reached_flop: AtomicU64,   // 至少一个 postflop 决策的手数
+    postflop_decisions: AtomicU64,   // postflop 决策总数（同步 + 脱锚）
     hands_unanchored: AtomicU64,     // 进入脱锚模式的手数
     unanchored_decisions: AtomicU64, // 脱锚模式下的决策总数
     search_fired: AtomicU64,         // 脱锚 postflop 触发的搜索次数
@@ -265,8 +268,10 @@ fn play_hand(
     let mut shadow: SimplifiedNlheState = game.root(&mut shadow_rng);
     let mut sample_rng = ChaCha20Rng::from_seed(SAMPLE_SEED ^ hand_seed);
 
+    obs.hands_total.fetch_add(1, Ordering::Relaxed);
     let mut unanchored = false;
     let mut counted_unanchored = false; // 本手是否已计入 hands_unanchored
+    let mut reached_flop = false; // 本手是否已计入 hands_reached_flop
     let mut synced_node: NodeId = shadow.current_node_id;
     let mut round_start: Option<GameState> = None;
     let mut round_start_street: Option<Street> = None;
@@ -303,6 +308,13 @@ fn play_hand(
             .hole_cards
             .ok_or_else(|| format!("actor {actor:?} 无手牌"))?;
         let board: Vec<Card> = auth.board().to_vec();
+        if board.len() >= 3 {
+            obs.postflop_decisions.fetch_add(1, Ordering::Relaxed);
+            if !reached_flop {
+                reached_flop = true;
+                obs.hands_reached_flop.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         // 决策 → applied Action（+ outgoing 抽象）。
         let applied: Action = if !unanchored {
@@ -535,6 +547,9 @@ fn print_arm(label: &str, r: &ArmReport, cfg: &TableConfig) {
 }
 
 fn print_obs(obs: &ProbeObs) {
+    let ht = obs.hands_total.load(Ordering::Relaxed);
+    let hf = obs.hands_reached_flop.load(Ordering::Relaxed);
+    let pd = obs.postflop_decisions.load(Ordering::Relaxed);
     let hu = obs.hands_unanchored.load(Ordering::Relaxed);
     let ud = obs.unanchored_decisions.load(Ordering::Relaxed);
     let sf = obs.search_fired.load(Ordering::Relaxed);
@@ -543,6 +558,14 @@ fn print_obs(obs: &ProbeObs) {
     let dcf = obs.hero_dc_flipped.load(Ordering::Relaxed);
     let tv = obs.hero_tv_micro_sum.load(Ordering::Relaxed);
     println!("\n== 触发遥测（前缀臂）==");
+    println!(
+        "  手数 = {ht}, 到 flop 手 = {hf} ({:.1}%), postflop 决策 = {pd}",
+        if ht > 0 {
+            100.0 * hf as f64 / ht as f64
+        } else {
+            0.0
+        }
+    );
     println!("  失同步手 = {hu}（脱锚模式手数；=0 → 无 off-tree 触发，A/B 无意义、需调栈型）");
     println!("  脱锚决策 = {ud}, 其中 postflop 触发搜索 = {sf}, giveup→stay = {sg}");
     if dcm > 0 {
