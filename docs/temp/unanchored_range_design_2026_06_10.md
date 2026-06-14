@@ -1,8 +1,22 @@
 # 脱锚搜索的 range 先验：从 uniform 升级的设计探索（2026-06-10）
 
-> 状态：**探索结论记录，未实现**。背景见 `realtime_search_openpoker_exec_2026_06_08.md` §3.2 缺口②续
-> （脱锚搜索落地时把 range 诚实退化为 uniform，「脱锚 range 细化」列为后置项）。本文把 2026-06-10
-> 讨论出的可行路线 / 坑 / 实现要点钉下来，避免捡起来时重推导。
+> 状态：**档一已实现（2026-06-14，commit `c5a0363`→`ff9348e`，vultr subgame 50/0 + advisor 29/0
+> 全绿）**；档二′（失同步动作真栈子树 σ 条件化）仍未做。背景见
+> `realtime_search_openpoker_exec_2026_06_08.md` §3.2 缺口②续（脱锚搜索落地时把 range 诚实退化为
+> uniform，「脱锚 range 细化」列为后置项）。本文把 2026-06-10 讨论出的可行路线 / 坑 / 实现要点钉
+> 下来，避免捡起来时重推导。
+>
+> **档一落地要点（实现与本文设计的差异）**：lockstep 闭包失同步时透传的是**已同步影子节点**
+> （`NodeId`，`LockstepErr.synced_node`）而非决策三元组列表——`decide_search_unanchored` /
+> `prewarm` 用 `synced_prefix_decisions(game, synced_node)`（导出的 `decisions_on_path` 包装）现取
+> 三元组，再包成 `PrefixReach{strategy, decisions}` 喂 `subgame_search_unanchored_cached`
+> （新增 `Option<PrefixReach>` 参数）。`estimate_range` 加 `skip_all_in`（档一 v1 跳 AllIn-tag）。
+> 默认关：CLI `--search-unanchored-prefix-reach`（`SearchRuntime.unanchored_prefix_reach`，默认
+> false）→ 强弱走 h2h A/B、不默认上生产。**前缀里无当前街之前的决策（limp 池首动作即失同步 →
+> synced_node=root → prior 空）→ 退 uniform（`ranges=None`，与既有 byte-equal）**，不走
+> `new_with_ranges` 的均匀向量（那是不同采样路径）。预热（脱影子）也接前缀：`subgame_search_
+> unanchored_prewarm` 加 `hero` + `prefix_reach`（hero 经 actor_override 让 range 平滑「不混」座
+> 与决策一致 → 同 key 命中，否则预热静默失效）。算出的 reach 进 solve 缓存 key（开/关自动 miss）。
 
 ## 0. 现状与问题
 
@@ -126,8 +140,9 @@ range（真人 limp 偏离均衡是常态），长期答案不变 = 对手数据
 
 分两步走，第二步以第一步为输入：
 
-1. **档一（前缀 reach + 跳过 AllIn tag）先做**——便宜、干净，且前缀 ranges 正是档二′在失同步点
-   建子树时的 root range 输入（档一是档二′的前置，不是互斥方案）。
+1. **档一（前缀 reach + 跳过 AllIn tag）——✅ 已做（2026-06-14）**：便宜、干净，且前缀 ranges 正是
+   档二′在失同步点建子树时的 root range 输入（档一是档二′的前置，不是互斥方案）。落地见本文头部状态
+   栏；下一步 = h2h A/B（uniform vs 前缀 reach，off-stack 触发场景集）拿证据再决定生产默认。
 2. **档二′（失同步动作的真栈子树 σ 条件化）作为第二步**——文献标准做法（DeepStack/ReBeL/Pluribus
    的 belief 更新全部用搜索解而非 blueprint 查表），同时覆盖 off-stack all-in、真 4+way、limp 池
    三类场景，并使档一的 AllIn-tag 补丁失效（被更正确的机制取代）。代价 = 每次失同步多一次粗解，
