@@ -1155,6 +1155,9 @@ def main():
     p.add_argument("--search-max-nodes", type=int, default=None)
     # range 先验平滑 λ（advisor 默认开 0.25；显式 0 = 关，A/B 对照臂用）。
     p.add_argument("--search-range-uniform-mix", type=float, default=None)
+    # 脱锚搜索档一前缀 reach（advisor 默认 on；off = A/B 对照臂 / 回退到 uniform 先验）。
+    # 不传 = 不透传，吃 advisor 默认（ON）。
+    p.add_argument("--search-unanchored-prefix-reach", choices=["on", "off"], default=None)
     # 深码 SPR 自适应菜单（deep_menu_for：深 {1pot} / 浅 ≤3-way {0.5,1} 全层级）。
     p.add_argument("--search-deep-menu", action="store_true")
     # 子树独立桶表（如 500/500/500；blueprint 仍用 --bucket-table 的表）。
@@ -1181,6 +1184,8 @@ def main():
             extra += ["--search-max-nodes", str(args.search_max_nodes)]
         if args.search_range_uniform_mix is not None:
             extra += ["--search-range-uniform-mix", str(args.search_range_uniform_mix)]
+        if args.search_unanchored_prefix_reach is not None:
+            extra += ["--search-unanchored-prefix-reach", args.search_unanchored_prefix_reach]
         if args.search_deep_menu:
             extra.append("--search-deep-menu")
         if args.search_bucket_table:
@@ -1189,6 +1194,9 @@ def main():
             extra += ["--search-solve-threads", str(args.search_solve_threads)]
     if args.search_prewarm and not args.search:
         raise SystemExit("--search-prewarm 需配 --search（拒绝静默：没有搜索就没有可预热的 solve）")
+    if args.search_unanchored_prefix_reach is not None and not args.search:
+        raise SystemExit("--search-unanchored-prefix-reach 需配 --search"
+                         "（拒绝静默：没有搜索就没有脱锚 range 先验，否则误以为在跑 off 臂实则纯 blueprint）")
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
                       args.reshape, args.postflop_cap, args.seed, extra_args=extra)
     try:
