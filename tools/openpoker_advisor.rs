@@ -1989,13 +1989,17 @@ mod tests {
         assert_eq!(raise_to_op(1650, 5, &ok), Some(330));
     }
 
-    /// 复现 + 定位（生产实采，2026-06-14）：TT 在 UTG-open → SB-3bet → UTG-4bet 这条标准
-    /// preflop 线上 `lockstep_drift`（advisor 先 blueprint 3bet TT、面对 4bet 时影子失同步
-    /// → fallback 盲弃）。lockstep 重放只依赖下注树结构 + 固定 seed（与 blueprint 策略 / 桶表
-    /// 无关），故无需真 checkpoint 即可逐字节复现。本测试逐步镜像 [`lockstep_step`] 打印影子
-    /// vs 真实 `current_player` + 玩家状态，钉死漂移点；遍历生产可能 cap。
+    /// 回归（生产实采，2026-06-14）：TT@SB 在 UTG-open → SB-3bet → UTG-4bet 这条标准 preflop
+    /// 线上**不再** `lockstep_drift`。修前：小 3bet 被 [`map_off_tree`] 选 0.5pot 档、
+    /// [`project_tag_onto`] 误塌 AllIn → 影子比真实多一个 all-in → 影子提前进 Showdown、真实仍
+    /// 轮到 hero → `current_player` 失同步 → fallback 盲弃 TT。修后：被剪的 0.5pot 档向上投到
+    /// 合法的 1.0pot → 重放 Ok、决策走 blueprint。lockstep 只依赖下注树结构 + 固定 seed（与
+    /// blueprint 策略 / 桶表无关），故 stub 桶 + uniform 策略即可锁死。遍历生产可能 cap。
+    ///
+    /// [`map_off_tree`]: poker::abstraction::action::ActionAbstraction::map_off_tree
+    /// [`project_tag_onto`]: poker::training::blueprint_advisor::project_tag_onto
     #[test]
-    fn repro_tt_3bet_4bet_lockstep_drift() {
+    fn three_bet_four_bet_no_lockstep_drift() {
         let mk_req = || Request {
             hole: vec!["Td".into(), "Th".into()],
             board: vec![],
@@ -2005,13 +2009,41 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             actions: vec![
-                HistAction { seat: 3, action: "raise".into(), to: Some(56) },
-                HistAction { seat: 4, action: "fold".into(), to: None },
-                HistAction { seat: 5, action: "fold".into(), to: None },
-                HistAction { seat: 0, action: "fold".into(), to: None },
-                HistAction { seat: 1, action: "raise".into(), to: Some(188) },
-                HistAction { seat: 2, action: "fold".into(), to: None },
-                HistAction { seat: 3, action: "raise".into(), to: Some(396) },
+                HistAction {
+                    seat: 3,
+                    action: "raise".into(),
+                    to: Some(56),
+                },
+                HistAction {
+                    seat: 4,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 5,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 0,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 1,
+                    action: "raise".into(),
+                    to: Some(188),
+                },
+                HistAction {
+                    seat: 2,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 3,
+                    action: "raise".into(),
+                    to: Some(396),
+                },
             ],
             valid: ValidActions {
                 can_check: false,
@@ -2025,6 +2057,7 @@ mod tests {
         };
         let solver_cfg = TableConfig::default_6max_100bb();
         let scale = solver_cfg.big_blind.as_u64() / 20; // 5
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
 
         for cap in [2u8, 3, 4] {
             let table = Arc::new(BucketTable::stub_for_postflop(
@@ -2038,55 +2071,40 @@ mod tests {
                 rules,
             )
             .expect("preopen game");
+            let abstraction = game.abstraction().clone();
             let req = mk_req();
             let smap = seat_map(&req).expect("seat_map");
-
-            eprintln!("\n===== cap={cap} =====");
-            let mut real = poker::GameState::new(&solver_cfg, REAL_REPLAY_SEED);
-            let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
-            let mut shadow: SimplifiedNlheState = game.root(&mut abs_rng);
-            for (i, h) in req.actions.iter().enumerate() {
-                let actor = smap.tree_seat(h.seat).expect("tree_seat");
-                let to_solver = h.to.map(|t| t * scale);
-                assert_eq!(
-                    real.current_player(),
-                    Some(SeatId(actor)),
-                    "cap{cap} step{i} real seat mismatch"
-                );
-                let concrete = hist_to_concrete(&real, &h.action, to_solver)
-                    .unwrap_or_else(|| panic!("cap{cap} step{i} bad_hist_action"));
-                real.apply(concrete)
-                    .unwrap_or_else(|_| panic!("cap{cap} step{i} replay_illegal"));
-                let is_all_in =
-                    real.players()[actor as usize].status == poker::PlayerStatus::AllIn;
-                let abs_action =
-                    advance_shadow_by_applied(&mut shadow, concrete, is_all_in, &mut abs_rng);
-                let real_st: Vec<_> = real.players().iter().map(|p| p.status).collect();
-                let abs_st: Vec<_> =
-                    shadow.game_state.players().iter().map(|p| p.status).collect();
-                eprintln!(
-                    "[step{i}] op={} tree={} {} to={:?} concrete={:?} all_in={} abs_action={:?}",
-                    h.seat, actor, h.action, to_solver, concrete, is_all_in, abs_action
-                );
-                eprintln!(
-                    "         real.cp={:?} abs.cp={:?} MATCH={}",
-                    real.current_player(),
-                    shadow.game_state.current_player(),
-                    real.current_player() == shadow.game_state.current_player(),
-                );
-                eprintln!("         real.status={real_st:?}");
-                eprintln!("         abs.status ={abs_st:?}");
-            }
-            eprintln!(
-                "[end] real.street={:?} abs.street={:?}",
-                real.street(),
-                shadow.game_state.street()
-            );
             let my = SeatId(smap.tree_seat(req.my_seat).unwrap());
-            match lockstep_replay(&game, &solver_cfg, &smap, &req, scale, req.board.len(), Some(my)) {
-                Ok(_) => eprintln!("[lockstep_replay cap{cap}] Ok (no drift)"),
-                Err(e) => eprintln!("[lockstep_replay cap{cap}] Err reason={}", e.reason),
-            }
+
+            // lockstep 不再 drift。
+            assert!(
+                lockstep_replay(
+                    &game,
+                    &solver_cfg,
+                    &smap,
+                    &req,
+                    scale,
+                    req.board.len(),
+                    Some(my)
+                )
+                .is_ok(),
+                "cap{cap}: 标准 3bet/4bet 线 lockstep 不该 drift"
+            );
+            // 端到端：决策走 blueprint（不再 fallback 盲弃），且合法。
+            let resp = decide(
+                &game,
+                &abstraction,
+                &uniform,
+                &req,
+                1,
+                None,
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(
+                resp.source, "blueprint",
+                "cap{cap}: 应走 blueprint，得 {resp:?}"
+            );
+            assert!(is_legal(&resp, &req.valid), "cap{cap}: 须合法，得 {resp:?}");
         }
     }
 

@@ -261,8 +261,11 @@ pub fn find_tag(legal: &[AbstractAction], tag: AbstractActionTag) -> Option<Abst
         .find(|a| AbstractActionTag::of(a) == tag)
 }
 
-/// 把 `map_off_tree` 选出的 tag 投影到 abs 当前合法集：tag 在则取之；不在（该 ratio
-/// 在抽象 pot 下塌进 AllIn slot）则退到 AllIn。两者都缺 → Err（决策节点必有 ≥1 动作）。
+/// 把 `map_off_tree` 选出的 tag 投影到 abs 当前合法集：tag 在则取之。不在时分两种：
+/// **① 被规则剪掉的加注档**（节点仍有更大合法加注）→ 在合法加注阶梯上向上取最近一档（ratio
+/// ≥ 选中档的最小合法加注）；**② 选中档塌进 AllIn**（短码：比所有合法加注都大）→ 退 AllIn。
+/// 两者都缺 → Err（决策节点必有 ≥1 动作）。与 [`crate::training::blueprint_advisor::project_tag_onto`]
+/// 同逻辑（off-tree 投影单一源；Slumbot `default_6_action` 无剪档 → ① 永不触发 = byte-equal）。
 pub fn project_tag_onto(
     legal: &[AbstractAction],
     tag: AbstractActionTag,
@@ -270,6 +273,25 @@ pub fn project_tag_onto(
     if let Some(a) = find_tag(legal, tag) {
         return Ok(a);
     }
+    // ① 剪档：向上投到 ratio ≥ 选中档的最小合法加注（Bet/Raise），而非塌 AllIn。
+    if let AbstractActionTag::Bet(r) | AbstractActionTag::Raise(r) = tag {
+        let target = r.as_milli();
+        let up = legal
+            .iter()
+            .copied()
+            .filter_map(|a| match a {
+                AbstractAction::Bet { ratio_label, .. }
+                | AbstractAction::Raise { ratio_label, .. } => Some((ratio_label.as_milli(), a)),
+                _ => None,
+            })
+            .filter(|(m, _)| *m >= target)
+            .min_by_key(|(m, _)| *m)
+            .map(|(_, a)| a);
+        if let Some(a) = up {
+            return Ok(a);
+        }
+    }
+    // ② 塌全下（或无更大合法加注）→ AllIn 兜底。
     if let Some(a) = find_tag(legal, AbstractActionTag::AllIn) {
         return Ok(a);
     }
