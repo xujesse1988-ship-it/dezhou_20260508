@@ -5434,10 +5434,16 @@ mod tests {
             .expect("HJ 应有 AllIn 档");
         abs = SimplifiedNlheGame::next(abs, allin, drng);
         let decisions = synced_prefix_decisions(&game, abs.current_node_id);
-        // 非均匀 σ（按 info.raw 偏斜，确定性）→ 真桶下 reach 非 uniform。
+        // 非均匀 σ：σ[k] 按 hash(raw,k) 偏斜（确定性）→ 真桶下不同 hole 桶 → σ 不同 → reach 非
+        // uniform。**用 hash 而非 `1+k+c` 线性**：线性形式下 n 档某一档的 σ 会代数退化成常数
+        // （n=3 时 σ[1]=(2+c)/(6+3c)=1/3 恒定，恰是 Raise 档）→ 该档条件化假性 uniform。
         let strat = |i: &InfoSetId, n: usize| {
+            let r = i.raw();
             let mut v: Vec<f64> = (0..n)
-                .map(|k| 1.0 + k as f64 + (i.raw() % 7) as f64 * 0.1)
+                .map(|k| {
+                    let h = (r ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) % 97;
+                    1.0 + h as f64
+                })
                 .collect();
             let s: f64 = v.iter().sum();
             v.iter_mut().for_each(|x| *x /= s);
