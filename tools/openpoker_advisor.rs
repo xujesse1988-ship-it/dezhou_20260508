@@ -3499,7 +3499,9 @@ mod tests {
         let resp = decide(&game, &abs, &uniform, &bad_btn, 0, None, &mut cache);
         assert_eq!(resp.source, "fallback:dealt_missing_btn_or_me");
 
-        // 行动者不在 dealt（占座推断漏了人）→ 重放期 loud 兜底：
+        // 行动者不在 dealt（占座推断漏了人）→ 重放期失同步兜底（site 796 lockstep desync）。
+        // hole = AKo（premium）且 facing bet → 「别扔好牌」地板把 fold 改成 call（valid/hole 来自
+        // 服务端 your_turn、重放失同步也可信）；source 前缀仍含 actor_not_dealt（失同步检测不变）。
         let bad_actor = Request {
             dealt_seats: vec![0, 1, 2, 5],
             button_seat: 0,
@@ -3514,7 +3516,9 @@ mod tests {
             stacks: vec![],
         };
         let resp = decide(&game, &abs, &uniform, &bad_actor, 0, None, &mut cache);
-        assert_eq!(resp.source, "fallback:actor_not_dealt");
+        assert_eq!(resp.source, "fallback:actor_not_dealt:premium_call");
+        assert_eq!(resp.action, "call");
+        assert!(is_legal(&resp, &bad_actor.valid));
 
         // 乱序 / 重复：
         let unsorted = Request {
