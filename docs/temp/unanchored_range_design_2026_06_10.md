@@ -1,9 +1,11 @@
 # 脱锚搜索的 range 先验：从 uniform 升级的设计探索（2026-06-10）
 
-> 状态：**档一已实现（2026-06-14，commit `c5a0363`→`ff9348e`，vultr subgame 50/0 + advisor 29/0
-> 全绿）；A/B 结论（§5）：自对弈触发率 ~0（测不动），但真实 live 触发手上档一把「uniform 先验
-> 导致 stack-off 漏洞」改成正确弃牌、单点 EV 摆动数十 BB（§5.1，3 seeds 一致）→ 决策级证据强烈
-> 支持，建议开 live search-on + 前缀 reach 臂真量 EV；上生产默认前仍需 live 多手确认（别凭单手翻）。**
+> 状态：**档一已实现 + 生产默认已改 ON（2026-06-14，commit `c5a0363`→`ded2756`，vultr subgame
+> 50/0 + advisor 29/0 全绿）。** A/B 结论（§5）：自对弈触发率 ~0（测不动），但真实 live 触发手上
+> 档一把「uniform 先验导致 stack-off 漏洞」改成正确弃牌、单点 EV 摆动数十 BB（§5.1，3 seeds 一致）
+> → **用户据此拍板把 `--search-unanchored-prefix-reach` 生产默认改 ON**（`off` 显式关 = A/B 对照臂 /
+> 回退；`DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH=true`）。**仍 pending = live 多手 EV 确认**（§5.1 是
+> n=1 决策级证据；正确性早单测硬证、守护 search=None byte-equal，故默认开可放心、随时可 off）。
 > 档二′（失同步动作真栈子树 σ 条件化）仍未做。背景见
 > `realtime_search_openpoker_exec_2026_06_08.md` §3.2 缺口②续（脱锚搜索落地时把 range 诚实退化为
 > uniform，「脱锚 range 细化」列为后置项）。本文把 2026-06-10 讨论出的可行路线 / 坑 / 实现要点钉
@@ -221,10 +223,13 @@ hero check → BTN bet → hero raise → **BTN re-raise**（此处 100BB 影子
 
 **改写判定**：脱锚路径在自对弈罕见、但**在 live 真实触发的深码 / 3bet 池 off-tree 点上，档一能挡住
 uniform 先验导致的 stack-off 漏洞，单点 EV 摆动可达数十 BB**。这不再是「可忽略的窄边缘先验」。
-**新建议**：① 决策级证据已足够强 → 值得开一条 **live search-on + 前缀 reach 臂**（vs 现 uniform 臂）
-真量 EV（live 是核心区唯一 EV 判据，§0.3）；② n=1（用户选的手）+ 精确频率有噪声 + 此手是「干净 3bet
-range 前缀」最优情形——上生产默认前仍需 live 多手确认（别凭单手翻默认）。**正确性早已单测硬证、
-是守护默认关不会变坏的旗**，所以 live A/B 可以放心开臂。
+**决定（2026-06-14，用户拍板）**：据此机制（uniform off-tree 先验 = stack-off 漏洞，档一是原则性
+修法、λ 单独治不动）+ §5.1 决策级证据，**把 `--search-unanchored-prefix-reach` 生产默认改 ON**
+（commit `ded2756`；flag 改取值 `on|off`，`off` = 对照臂 / 回退；正确性早单测硬证、守护 search=None
+byte-equal，故默认开可放心、随时可 off）。**仍 pending（诚实）**：n=1（用户选的手）+ 精确弃牌频率有
+per-bucket 噪声 + 此手是「干净 3bet range 前缀」最优情形 → **live 多手 EV 确认仍要做**（开 `off` 对照
+臂跑 live、按脱锚触发手分桶比 EV；§0.3 live 是核心区唯一 EV 判据）。即「据强机制 + 强单点证据先开、
+live 多手回填确认」，不是「单手就完事」。
 
 ### 5.2 自对弈测不动的判定组合（核心区无干净离线 EV 标尺，§0.3）
 - 自对弈 EV 路线**测不动**（无触发，CI 无从谈起）——但 §5.1 证明这是「自对弈生成不出触发手」、
