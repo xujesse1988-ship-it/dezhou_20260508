@@ -1068,7 +1068,7 @@ fn current_board_nuttiness(hole: [Card; 2], board: &[Card]) -> f64 {
 }
 
 /// 决策阶段兜底动作 + 「别扔好牌」地板（用户 2026-06-14）。**只在面对下注**（不能免费 check
-/// 且能 call）时把 fold 改成 call：preflop 拿 AA/KK/QQ/AK（[`limp_hand_tier`]==2）→ call；
+/// 且能 call）时把 fold 改成 call：preflop 拿 AA/KK/QQ/JJ/AK/AQ（[`limp_hand_tier`]==2）→ call；
 /// postflop 手牌坚果度 ≥ [`NUT_CALL_THRESHOLD`] → call。其余一律原 check-when-free（能 check
 /// 就 check、否则 fold——紧、不漏筹码）；能免费 check 的局面不为这条地板主动下注（用户只要
 /// 「别扔/跟注」）。命中时 `source` 在 caller 给的完整 source 后追加 `:premium_call`（preflop）
@@ -1108,21 +1108,23 @@ fn fallback_with_floor(
 // preflop open-limp 池启发式（结构 gap 残余收口，2026-06-12 矩阵）
 // ===========================================================================
 
-/// 手牌档位（169 类，写死常识集合）：`2` = P 档（AA KK QQ AKs AKo，面对加注继续）；
-/// `1` = S∖P（JJ TT 99 / AQs AJs ATs KQs / AQo，连同 P 构成 iso-raise 档 ≈ 前 9%）；`0` = 其余。
+/// 手牌档位（169 类，写死常识集合）：`2` = P 档（AA KK QQ JJ / AKs AKo / AQs AQo，面对加注
+/// 继续 call——2026-06-14 补 JJ/AQ，原只 AA/KK/QQ/AK，fallback/limp 路径会白弃 JJ/AQ）；
+/// `1` = S∖P（TT 99 / AJs ATs / KQs，连同 P 构成 iso-raise 档）；`0` = 其余。
 fn limp_hand_tier(hole: [Card; 2]) -> u8 {
-    use poker::Rank::{Ace, King, Nine, Queen, Ten};
+    use poker::Rank::{Ace, Jack, King, Nine, Queen, Ten};
     let (mut hi, mut lo) = (hole[0].rank(), hole[1].rank());
     if hi < lo {
         std::mem::swap(&mut hi, &mut lo);
     }
     let suited = hole[0].suit() == hole[1].suit();
     let pair = hi == lo;
-    if (pair && hi >= Queen) || (hi == Ace && lo == King) {
+    // P 档（面对加注继续 call）：QQ+ 与 JJ、AK、AQ（2026-06-14 补 JJ/AQ）。
+    if (pair && hi >= Jack) || (hi == Ace && (lo == King || lo == Queen)) {
         return 2;
     }
+    // S∖P（连同 P 构成 iso-raise 档）：TT/99、ATs/AJs、KQs（JJ+/AQ 已 return 2）。
     let s = (pair && hi >= Nine)
-        || (hi == Ace && lo == Queen)
         || (hi == Ace && lo >= Ten && suited)
         || (hi == King && lo == Queen && suited);
     if s {
@@ -2164,12 +2166,14 @@ mod tests {
                 &mut SubgameSolveCache::new(),
             )
         };
-        // P 档（AA）→ call（不设金额 cap）。
-        let resp = decide_one(&make(["As", "Ad"]));
-        assert_eq!(resp.source, "limp_heuristic:call", "得 {resp:?}");
-        assert_eq!(resp.action, "call");
-        // S∖P（JJ）→ fold（iso 档面对加注不继续）。
-        let resp = decide_one(&make(["Jh", "Jc"]));
+        // P 档（AA / JJ / AQ，2026-06-14 补 JJ/AQ）→ call（不设金额 cap）。
+        for hole in [["As", "Ad"], ["Jh", "Jc"], ["Ah", "Qd"]] {
+            let resp = decide_one(&make(hole));
+            assert_eq!(resp.source, "limp_heuristic:call", "{hole:?} 得 {resp:?}");
+            assert_eq!(resp.action, "call", "{hole:?}");
+        }
+        // S∖P（TT）→ fold（iso 档面对加注不继续）。
+        let resp = decide_one(&make(["Th", "Tc"]));
         assert_eq!(resp.source, "limp_heuristic:fold", "得 {resp:?}");
         // 烂牌（94o）→ fold。
         let resp = decide_one(&make(["9h", "4c"]));
@@ -2177,7 +2181,7 @@ mod tests {
     }
 
     /// 兜底「别扔好牌」地板（用户 2026-06-14）：面对下注（!can_check && can_call）时
-    /// preflop AA/KK/QQ/AK → call、postflop（接近）坚果 → call；其余 fold；能免费 check
+    /// preflop AA/KK/QQ/JJ/AK/AQ → call、postflop（接近）坚果 → call；其余 fold；能免费 check
     /// → check（地板不触发）。直接钉 [`fallback_with_floor`] / [`current_board_nuttiness`]
     /// 单元行为（纯函数，确定性）。
     #[test]
@@ -2199,13 +2203,17 @@ mod tests {
         };
 
         // —— preflop（board 空）——
-        // AA / KK / QQ / AKs / AKo 面对下注 → call（:premium_call）。
+        // AA / KK / QQ / JJ / AKs / AKo / AQs / AQo 面对下注 → call（:premium_call）。
+        // （2026-06-14 补 JJ/AQ：原只 AA/KK/QQ/AK，fallback/limp 路径白弃 JJ/AQ。）
         for (a, b) in [
             ("As", "Ad"),
             ("Kh", "Kc"),
             ("Qh", "Qs"),
+            ("Jh", "Jc"),
             ("Ah", "Kh"),
             ("Ad", "Ks"),
+            ("Ah", "Qd"),
+            ("As", "Qs"),
         ] {
             let r = fallback_with_floor(&facing_bet, hole(a, b), &[], "fallback:x".into());
             assert_eq!(r.action, "call", "{a}{b} 面对下注须 call，得 {r:?}");
@@ -2214,8 +2222,8 @@ mod tests {
                 "{a}{b} source，得 {r:?}"
             );
         }
-        // 非 premium（JJ / AQ / 72o）面对下注 → fold（前缀不变、无后缀）。
-        for (a, b) in [("Jh", "Jc"), ("Ah", "Qd"), ("7h", "2d")] {
+        // 非 premium（TT / KQo / 72o）面对下注 → fold（前缀不变、无后缀）。
+        for (a, b) in [("Th", "Tc"), ("Kh", "Qd"), ("7h", "2d")] {
             let r = fallback_with_floor(&facing_bet, hole(a, b), &[], "fallback:x".into());
             assert_eq!(r.action, "fold", "{a}{b} 非 premium 须 fold，得 {r:?}");
             assert_eq!(r.source, "fallback:x", "{a}{b} 不该加后缀，得 {r:?}");
