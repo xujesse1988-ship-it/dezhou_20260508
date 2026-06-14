@@ -2200,10 +2200,19 @@ mod tests {
 
         // —— preflop（board 空）——
         // AA / KK / QQ / AKs / AKo 面对下注 → call（:premium_call）。
-        for (a, b) in [("As", "Ad"), ("Kh", "Kc"), ("Qh", "Qs"), ("Ah", "Kh"), ("Ad", "Ks")] {
+        for (a, b) in [
+            ("As", "Ad"),
+            ("Kh", "Kc"),
+            ("Qh", "Qs"),
+            ("Ah", "Kh"),
+            ("Ad", "Ks"),
+        ] {
             let r = fallback_with_floor(&facing_bet, hole(a, b), &[], "fallback:x".into());
             assert_eq!(r.action, "call", "{a}{b} 面对下注须 call，得 {r:?}");
-            assert_eq!(r.source, "fallback:x:premium_call", "{a}{b} source，得 {r:?}");
+            assert_eq!(
+                r.source, "fallback:x:premium_call",
+                "{a}{b} source，得 {r:?}"
+            );
         }
         // 非 premium（JJ / AQ / 72o）面对下注 → fold（前缀不变、无后缀）。
         for (a, b) in [("Jh", "Jc"), ("Ah", "Qd"), ("7h", "2d")] {
