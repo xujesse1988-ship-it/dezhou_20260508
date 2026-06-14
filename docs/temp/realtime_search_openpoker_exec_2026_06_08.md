@@ -172,7 +172,17 @@ per-seat `cap = committed + stack`（`state.rs:438/476`），`build_subtree` 从
   能 check 就 check、否则 fold**（不回落 blueprint——off-distribution 下它解的是错游戏）。原定「直接 fold」在**可 check 的局面**
   （搜索触发面 `FlopFirstUnraised` 全是 flop 首点 = 必可 check）会白丢一个免费 check（严格劣于 check），故改 check-优先；
   check / fold 都**绝不会打出「错游戏」动作**、也都不回落 blueprint，省掉「建 off-tree 兜底启发式」这个子项（缺口①）。
-  生产实现 = `openpoker_advisor::search_giveup`（`source=search_giveup:*`，与 blueprint `fallback:*` 分桶）。
+  生产实现 = `openpoker_advisor::fallback_with_floor`（`source=search_giveup:*` / `fallback:*` 分桶，旧 `search_giveup` 函数已并入）。
+
+- **「别扔好牌」地板（2026-06-14，用户拍板）：check-when-free 之上加一层下限。** 实测 §4.1：~8.6% 决策走兜底、且面对下注时
+  check-when-free 会**白弃 AA / 河牌坚果**这类怪兽。`fallback_with_floor` 只在**面对下注**（`!can_check && can_call`）时把
+  fold 改成 **call**：preflop 拿 AA/KK/QQ/AK（复用 `limp_hand_tier==2`）→ call；postflop 手牌在**当前 board**上击败-或-打平
+  **≥95%** 的对手两张组合（`current_board_nuttiness`，只算当前 board、不预判后续公牌）→ call。能免费 check 的局面照旧 check
+  （不为地板主动下注）。这是 `limp_heuristic`（已 call AA/KK/QQ/AK）先例的自然推广，且 call 合法下注**从不打「错游戏」动作、
+  不回落 blueprint**，§2.3 正确性原则不破（`valid`/`hole` 来自服务端 `your_turn`、重放失同步也可信）。**适用边界**：只接**决策阶段**
+  兜底（lockstep 失同步 / search build/unsolved / outgoing_failed / 脱锚 giveup）；座位映射 / 入参校验失败仍走原
+  `safe_fallback`（状态不可信）。`source` 命中加 `:premium_call` / `:nut_call` 后缀、前缀不变（driver 分桶护栏保持）。
+  ⚠ live 多手 EV 确认 pending（开 off 对照前后跑 live 回填）。
 
 - 算力参照：Pluribus 实时搜索用 28-core/128GB、**平均 ~20s/手**——单决策 wall 是（树大小 × 迭代数 × **核数**）的函数。
   **本方案不锚定某台机器**：开发 / 测试机和真实部署机不是一回事，部署机可能强得多。所以先在手头能跑的机器上测出 wall 曲线，
