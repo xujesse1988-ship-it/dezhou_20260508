@@ -140,6 +140,12 @@ path = "tools/six_max_blueprint_h2h.rs"
 name = "six_max_search_probe"
 path = "tools/six_max_search_probe.rs"
 
+# 脱锚搜索档一 A/B：uniform vs 前缀 reach。自对弈到 off-tree（off-stack/4+way）postflop 后所有座
+# 走脱锚搜索，hero 前缀 reach vs field uniform，配对差 CI + 触发率 + 决策改变率（TV/argmax flip）。
+[[bin]]
+name = "six_max_unanchored_prefix_ab"
+path = "tools/six_max_unanchored_prefix_ab.rs"
+
 # S5② OpenPoker 常驻 advisor：Python WS driver 喂每决策请求，本进程加载 6-max blueprint
 # 无状态重放→出 {action,amount}（off-tree 复用 blueprint_advisor；失败安全兜底，live 不崩）。
 [[bin]]
