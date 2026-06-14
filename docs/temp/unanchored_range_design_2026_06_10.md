@@ -1,7 +1,8 @@
 # 脱锚搜索的 range 先验：从 uniform 升级的设计探索（2026-06-10）
 
 > 状态：**档一已实现（2026-06-14，commit `c5a0363`→`ff9348e`，vultr subgame 50/0 + advisor 29/0
-> 全绿）**；档二′（失同步动作真栈子树 σ 条件化）仍未做。背景见
+> 全绿）；h2h A/B 实跑 = 自对弈触发率 ~0、EV 路线证伪 → default 维持 OFF**（详见文末「§5 h2h
+> A/B 实跑结论」）。档二′（失同步动作真栈子树 σ 条件化）仍未做。背景见
 > `realtime_search_openpoker_exec_2026_06_08.md` §3.2 缺口②续（脱锚搜索落地时把 range 诚实退化为
 > uniform，「脱锚 range 细化」列为后置项）。本文把 2026-06-10 讨论出的可行路线 / 坑 / 实现要点钉
 > 下来，避免捡起来时重推导。
@@ -150,3 +151,45 @@ range（真人 limp 偏离均衡是常态），长期答案不变 = 对手数据
 
 档二（代理节点映射）被档二′取代，不再考虑；limp 池长期答案仍是对手数据（步 D），档二′提供过渡
 先验。两步各自走 h2h A/B（uniform vs 档一 vs 档一+档二′）拿证据，不凭直觉上生产。
+
+## 5. h2h A/B 实跑结论（2026-06-14）
+
+**结论：自对弈无法给 EV 判决——脱锚路径在 blueprint 自对弈里触发率 ~0；default 维持 OFF。**
+
+**为什么既有 h2h harness 用不了**：`evaluate_cross_abstraction_h2h` 用**常驻影子**、失同步即
+`HandError::Desync` 排除整手——**结构上到不了脱锚路径**、也表达不了前缀 reach。故新建自对弈探针
+`tools/six_max_unanchored_prefix_ab.rs`（commit `f6c18da`→`7326ae6`）：单影子追 auth（game/影子
+对称 100BB、auth 用 `--stacks` 不等码深），失同步后所有座走脱锚搜索，hero=前缀 reach vs
+field=uniform，配对差 CI + 触发遥测 + 决策改变率（前缀臂 hero 搜索点额外算 uniform 分布记 TV /
+argmax flip）。复用与生产 advisor **同一** `advance_shadow_by_applied` 失同步机制 → 触发判定同口径。
+
+**实测（vultr，真 nolimp 1B / preopen 10B blueprint，5 种栈型 / ~1500 手）**：
+
+| 栈型（BB） | reshape | 手数 | 到 flop | postflop 决策 | **失同步手** |
+|---|---|---:|---:|---:|---:|
+| 100 对称 | preopen | 120 | — | — | **0** |
+| 100,80,60,40,25,15 | nolimp | 600 | — | — | **0** |
+| 5×100 + 20 | nolimp | 300 | 124 (41%) | 604 | **0** |
+| 3×100 + 3×30 | nolimp | 600 | 214 (36%) | 1127 | **0** |
+
+flop **被到达**（35–41% 手有 postflop 决策），但**全在 on-tree**（同步）——0 个 off-tree flop。
+根因：脱锚 postflop 路径需要**有 flop 决策的 off-tree 局面**，而 ① off-stack all-in 线多在 preflop
+就解决（全下摊牌）或**单挑 vs all-in（无 flop 下注，引擎直接发到摊牌）→ 无 flop 决策**；② 真正需要
+脱锚 postflop 决策的形态 = **多人短码边池**（短码 all-in + ≥2 个深码跟到 flop）或**真 4+way**，二者
+在偏紧的 blueprint 自对弈里都罕见（getting 2 callers of a shove / 4 人入池）。即：blueprint 自对弈
+几乎不产生承载前缀 reach 信号的牌局。
+
+**与单测一致**：前缀 reach 只在**入池者有非-AllIn 同步决策**时才改 range（`unanchored_prefix_reach
+_skips_all_in_tag` 真桶测试钉死：Raise 前缀 → range 非 uniform；canonical UTG-shove off-stack 线
+shover 的 AllIn 被跳 → 前缀 ≈ uniform）。所以这是个**窄边缘先验**，EV 影响面本就小。
+
+**判定组合（核心区无干净离线 EV 标尺，§0.3）**：
+- 自对弈 EV 路线**证伪**（无触发，CI 无从谈起）。
+- 构造场景 + 价值基线（强行造 off-tree flop 量 per-scenario EV）需额外工程，且核心区**没有干净的
+  离线 EV 真值**（多人非零和），只能量决策改变（已由单测覆盖：会改、但仅窄线）。
+- live OpenPoker 数据按「脱锚触发手」过滤 → 需海量样本（脱锚手本就稀），功效预算下判不动。
+
+**所以 default 维持 OFF**：档一**正确性**由单测硬证（空前缀 byte-equal / ranges 进 key / skip
+AllIn / 预热一致），是个**守护默认关、不会变坏**的 A/B 旗（开了也只在罕见脱锚 postflop 点改先验）。
+没有可翻默认的 EV 证据，就不翻。**重估时机** = live 数据显示脱锚 postflop 手占比 + 亏损值得救
+（届时按真实触发分布构造场景或直接 live A/B），或档二′落地后一并量（档二′覆盖面更广）。
