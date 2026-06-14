@@ -108,17 +108,20 @@ fn run() -> Result<(), String> {
         BucketTable::open(std::path::Path::new(&args.bucket_table))
             .map_err(|e| format!("BucketTable::open({}) failed: {e:?}", args.bucket_table))?,
     );
-    // 桌配置：默认 100BB 对称；--stacks 给不等码深（逼 off-stack 线）。
-    let mut cfg = TableConfig::default_6max_100bb();
-    let bb = cfg.big_blind.as_u64();
+    // **game/shadow 用对称 100BB**（= blueprint 训练树，dense ckpt layout 按它键，不对称会
+    // fingerprint mismatch）；**auth（真自对弈）才用 --stacks 不等码深**（逼 off-stack 线）。
+    // 这正是生产口径：blueprint 100BB 对称、真局不等栈、影子 100BB、auth 真栈（advisor lockstep）。
+    let game_cfg = TableConfig::default_6max_100bb();
+    let bb = game_cfg.big_blind.as_u64();
     let stacks = args.stacks_bb.unwrap_or([100, 100, 100, 40, 30, 100]);
+    let mut auth_cfg = game_cfg.clone();
     for (seat, &s_bb) in stacks.iter().enumerate() {
-        cfg.starting_stacks[seat] = ChipAmount::new(s_bb * bb);
+        auth_cfg.starting_stacks[seat] = ChipAmount::new(s_bb * bb);
     }
 
     let (abs, rules) = reshape_profile(&args.reshape, args.postflop_cap)?;
     let game =
-        SimplifiedNlheGame::new_with_abstraction(Arc::clone(&table), cfg.clone(), abs, rules)
+        SimplifiedNlheGame::new_with_abstraction(Arc::clone(&table), game_cfg.clone(), abs, rules)
             .map_err(|e| format!("build game failed: {e:?}"))?;
     let trainer =
         DenseNlheEsMccfrTrainer::load_checkpoint(std::path::Path::new(&args.checkpoint), game)
@@ -142,13 +145,20 @@ fn run() -> Result<(), String> {
     let game_ref = trainer.game();
     // 前缀臂（hero 前缀 reach + 量决策改变） + uniform 臂（hero uniform），同 seed/同手 → 配对差。
     let obs = ProbeObs::default();
-    let arm_prefix = run_arm(game_ref, &strat, &cfg, &args, true, &obs);
-    let arm_uniform = run_arm(game_ref, &strat, &cfg, &args, false, &ProbeObs::default());
+    let arm_prefix = run_arm(game_ref, &strat, &auth_cfg, &args, true, &obs);
+    let arm_uniform = run_arm(
+        game_ref,
+        &strat,
+        &auth_cfg,
+        &args,
+        false,
+        &ProbeObs::default(),
+    );
 
-    print_arm("前缀 reach 臂", &arm_prefix, &cfg);
-    print_arm("uniform 臂", &arm_uniform, &cfg);
+    print_arm("前缀 reach 臂", &arm_prefix, &auth_cfg);
+    print_arm("uniform 臂", &arm_uniform, &auth_cfg);
     print_obs(&obs);
-    print_paired_diff(&arm_prefix, &arm_uniform, &cfg);
+    print_paired_diff(&arm_prefix, &arm_uniform, &auth_cfg);
     Ok(())
 }
 
