@@ -101,6 +101,14 @@ const ABS_REPLAY_SEED: u64 = 0x4142_5336_454d_5800; // "ABS6EMX\0"
 /// 的坚果占比（同花成牌河）+ per-bucket 均衡选择噪声驱动，平滑不承诺改写它；激进度的后续杠杆
 /// 见 exec 文档 §3.2（低频动作降信 / 向 blueprint 回拉）。
 const DEFAULT_SEARCH_RANGE_UNIFORM_MIX: f64 = 0.25;
+/// 脱锚搜索档一前缀 reach 的生产默认（`unanchored_range_design_2026_06_10` §5.1 实测拍板）：
+/// 真 live 触发的深码 / 3bet 池 off-tree 点上，uniform 先验会让搜索拿中等牌 stack off 进对手窄
+/// 价值 range（88 在 A 高面对 3bettor 的 flop 加注战，uniform 几乎从不弃牌、档一弃 0.63–1.0，
+/// 3 seeds 一致、单点 EV 数十 BB）；`range_uniform_mix` 单独治不动（脱锚区先验本就 uniform，λ 只
+/// 给地板、档一直接换真前缀 range）。`--search-unanchored-prefix-reach off` 显式关（live A/B 对照
+/// 臂 / 回退）。注意 §5.1 仍是 n=1 决策级证据 → live 多手 EV 确认仍在进行（开默认是据机制 + 该证据
+/// 拍板，正确性早单测硬证、是守护默认关不会变坏的旗）。
+const DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH: bool = true;
 /// 搜索墙钟告警阈的建树余量（ms）：最坏单线程建树 ≈ 4-way@20× 宽档 ~2.7s，留 3s。
 const SEARCH_WALL_BUILD_MARGIN_MS: u128 = 3000;
 /// 无 `time_budget`（固定迭代）时的告警阈回落（ms）。
@@ -382,10 +390,11 @@ struct SearchRuntime {
     /// [`subgame_search_cached`] `bucket_override` doc）。`None` = 沿用 blueprint 表（旧行为
     /// byte-equal）。blueprint 路径 / range 估计永远用 blueprint 表，不受此影响。
     bucket_table: Option<Arc<BucketTable>>,
-    /// `--search-unanchored-prefix-reach`（脱锚搜索档一，`unanchored_range_design` §1）：`true` =
-    /// 脱影子搜索用**已同步前缀**估 per-seat range 替代 uniform（跳过 AllIn-tag）；`false`（默认）
-    /// = uniform（既有行为）。强弱走 h2h A/B、不默认上生产，故默认关。range 估计用 blueprint σ /
-    /// blueprint 表（同 `bucket_table` 注解：换表不影响 range 估计）。
+    /// `--search-unanchored-prefix-reach`（脱锚搜索档一，`unanchored_range_design` §1/§5.1）：`true`
+    /// （**生产默认**，[`DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH`]）= 脱影子搜索用**已同步前缀**估
+    /// per-seat range 替代 uniform（跳过 AllIn-tag）；`off` 显式关 = uniform（live A/B 对照臂 / 回退）。
+    /// §5.1 实测：真 live off-tree 深码 / 3bet 池上 uniform 先验致 stack-off 漏洞、档一改正确弃牌。
+    /// range 估计用 blueprint σ / blueprint 表（同 `bucket_table` 注解：换表不影响 range 估计）。
     unanchored_prefix_reach: bool,
 }
 
@@ -1180,11 +1189,11 @@ fn build_real_auth(
 /// `fallback:<lockstep 原因>`（blueprint 区由影子承载、这里修不了）；真解不出来 → check-when-free
 /// （`search_giveup:*`，不回落 blueprint，§2.3）。
 ///
-/// **range 先验**：`rt.unanchored_prefix_reach` 关（默认）= uniform（既有行为）；开 = 档一前缀
+/// **range 先验**：`rt.unanchored_prefix_reach` 开（**生产默认**，§5.1 实测拍板）= 档一前缀
 /// reach——用 `synced_node`（失同步前已同步的影子节点）取已同步前缀的决策三元组
 /// （[`synced_prefix_decisions`]）+ `strategy_fn`（blueprint σ）估 per-seat range 替代 uniform
-/// （[`PrefixReach`]）。算出的 reach 进 solve 缓存 key，开/关自动 cache miss。强弱走 h2h A/B、
-/// 不默认上生产（`unanchored_range_design` §3）。
+/// （[`PrefixReach`]）；`off`（A/B 对照臂）= uniform（既有行为）。算出的 reach 进 solve 缓存 key，
+/// 开/关自动 cache miss（`unanchored_range_design` §1/§5.1）。
 #[allow(clippy::too_many_arguments)]
 fn decide_search_unanchored(
     game: &SimplifiedNlheGame,
@@ -1409,8 +1418,9 @@ struct Args {
     /// `--search-bucket-table`：子树 solve 用的独立桶表路径（[`SearchRuntime`] doc；`None` =
     /// 沿用 `--bucket-table`）。仅 `--search` 开时可设（同其余 `--search-*` 的拒静默 guard）。
     search_bucket_table: Option<PathBuf>,
-    /// `--search-unanchored-prefix-reach`（档一，[`SearchRuntime`] doc）：脱影子搜索 range 先验从
-    /// uniform 升级为已同步前缀 reach。默认 `false`（uniform，A/B 前不上生产）。
+    /// `--search-unanchored-prefix-reach on|off`（档一，[`SearchRuntime`] doc）：脱影子搜索 range
+    /// 先验从 uniform 升级为已同步前缀 reach。**默认 `true`**（[`DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH`]，
+    /// §5.1 实测拍板）；`off` 显式关（A/B 对照臂 / 回退）。
     search_unanchored_prefix_reach: bool,
 }
 
@@ -1611,7 +1621,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_range_uniform_mix: Option<f64> = None;
     let mut search_bucket_table: Option<PathBuf> = None;
     let mut search_solve_threads: Option<usize> = None;
-    let mut search_unanchored_prefix_reach = false;
+    let mut search_unanchored_prefix_reach: Option<bool> = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -1682,7 +1692,19 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 }
                 search_solve_threads = Some(v);
             }
-            "--search-unanchored-prefix-reach" => search_unanchored_prefix_reach = true,
+            "--search-unanchored-prefix-reach" => {
+                // 默认开（DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH）；取值 on|off 显式覆盖（A/B 用）。
+                let v = next_val(&mut it, &arg)?;
+                search_unanchored_prefix_reach = Some(match v.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(format!(
+                            "--search-unanchored-prefix-reach 须 on|off，得 {other}"
+                        ))
+                    }
+                });
+            }
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -1731,7 +1753,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_range_uniform_mix.is_some()
             || search_bucket_table.is_some()
             || search_solve_threads.is_some()
-            || search_unanchored_prefix_reach
+            || search_unanchored_prefix_reach.is_some()
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
         }
@@ -1745,7 +1767,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         seed,
         search,
         search_bucket_table,
-        search_unanchored_prefix_reach,
+        // 默认开（§5.1 实测拍板）；--search-unanchored-prefix-reach off 显式关。
+        search_unanchored_prefix_reach: search_unanchored_prefix_reach
+            .unwrap_or(DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH),
     })
 }
 
@@ -3486,7 +3510,8 @@ mod tests {
         assert!(parse(&["--search-solve-threads", "4"]).is_err());
     }
 
-    /// `--search-unanchored-prefix-reach`（档一）：默认关、显式开置位、未开 --search 拒收。
+    /// `--search-unanchored-prefix-reach on|off`（档一，§5.1 拍板默认开）：默认开、off 显式关、
+    /// on 显式开、坏值拒收、未开 --search 拒收。
     #[test]
     fn parse_args_unanchored_prefix_reach() {
         let parse = |extra: &[&str]| {
@@ -3496,13 +3521,18 @@ mod tests {
                 .map(|s| s.to_string());
             parse_args_from(argv)
         };
-        // 默认关（uniform 先验，A/B 前不上生产）。
+        // 默认开（§5.1 实测拍板：脱锚 off-tree 点 uniform 先验致 stack-off 漏洞）。
         let a = parse(&["--search"]).expect("parse Ok");
-        assert!(!a.search_unanchored_prefix_reach, "默认关");
-        // 显式开 → 置位。
-        let a = parse(&["--search", "--search-unanchored-prefix-reach"]).expect("parse Ok");
-        assert!(a.search_unanchored_prefix_reach, "显式开应置位");
+        assert!(a.search_unanchored_prefix_reach, "默认开");
+        // off 显式关（A/B 对照臂）。
+        let a = parse(&["--search", "--search-unanchored-prefix-reach", "off"]).expect("parse Ok");
+        assert!(!a.search_unanchored_prefix_reach, "off 应关");
+        // on 显式开。
+        let a = parse(&["--search", "--search-unanchored-prefix-reach", "on"]).expect("parse Ok");
+        assert!(a.search_unanchored_prefix_reach, "on 应开");
+        // 坏值拒收。
+        assert!(parse(&["--search", "--search-unanchored-prefix-reach", "maybe"]).is_err());
         // 拒绝静默 guard：设了 flag 未开 --search → Err。
-        assert!(parse(&["--search-unanchored-prefix-reach"]).is_err());
+        assert!(parse(&["--search-unanchored-prefix-reach", "off"]).is_err());
     }
 }
