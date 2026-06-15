@@ -794,7 +794,14 @@ fn decide(
                     return resp;
                 }
             }
-            return fallback_with_floor(&req.valid, hole, &board, format!("fallback:{reason}"));
+            // 无 auth（未建真栈）→ pot_odds=None（该兜底点不触发底池赔率 floor）。
+            return fallback_with_floor(
+                &req.valid,
+                hole,
+                &board,
+                None,
+                format!("fallback:{reason}"),
+            );
         }
     };
     let street = real.street();
@@ -827,12 +834,14 @@ fn decide(
         ) {
             Ok(t) => t,
             Err(reason) => {
+                // build 失败 → 无 auth → pot_odds=None。
                 return fallback_with_floor(
                     &req.valid,
                     hole,
                     &board,
+                    None,
                     format!("search_giveup:build:{reason}"),
-                )
+                );
             }
         };
         let root_state: &GameState = match scfg.resolve_root {
@@ -884,12 +893,14 @@ fn decide(
             }
             // 解不出来（建不了/未访问/失同步/限时连一轮迭代都未完成）→ check-when-free，不回落 blueprint。
             Err(reason) => {
+                // auth 已建（此 Err 分支未 move 走）→ 喂底池赔率 floor。
                 return fallback_with_floor(
                     &req.valid,
                     hole,
                     &board,
+                    pot_odds_from_auth(&auth, &solver_cfg),
                     format!("search_giveup:unsolved:{reason}"),
-                )
+                );
             }
         }
     } else {
@@ -910,7 +921,16 @@ fn decide(
     let solver_action = match outgoing_action(outgoing_state, outgoing_abs, chosen) {
         Ok(a) => a,
         Err(_) => {
-            return fallback_with_floor(&req.valid, hole, &board, "fallback:outgoing_failed".into())
+            // 搜索路径有真栈 auth（auth_holder）→ 喂底池赔率 floor；blueprint 路径无 → None。
+            return fallback_with_floor(
+                &req.valid,
+                hole,
+                &board,
+                auth_holder
+                    .as_ref()
+                    .and_then(|a| pot_odds_from_auth(a, &solver_cfg)),
+                "fallback:outgoing_failed".into(),
+            );
         }
     };
     let mut resp = action_to_response(solver_action, scale, &req.valid);
@@ -1023,9 +1043,9 @@ fn action_to_response(action: Action, scale: u64, valid: &ValidActions) -> Respo
 // 路径的 `fallback:...` 仍分桶（driver §4.1 护栏不变）；地板未命中时行为 = 旧 search_giveup
 // （能 check 就 check、否则 fold——紧、不漏筹码、不回落 blueprint）。
 
-/// postflop 兜底地板的「接近坚果」阈值（用户 2026-06-14 拍板 ≥95%）：hero 在**当前 board**
-/// 上击败-或-打平的对手两张组合占比 ≥ 此值 → 面对下注时改 fold 为 call。
-const NUT_CALL_THRESHOLD: f64 = 0.95;
+/// postflop 兜底地板的「接近坚果」阈值（用户 2026-06-14 拍板 ≥95%，2026-06-15 下调为 **>93%**）：
+/// hero 在**当前 board**上击败-或-打平的对手两张组合占比 **>** 此值 → 面对下注时改 fold 为 call。
+const NUT_CALL_THRESHOLD: f64 = 0.93;
 
 /// hero 手牌在**当前 board**上的「坚果度」：hero 最强 5/6/7-card 牌力 **击败-或-打平**的
 /// 对手两张组合（从剩余牌堆取，排除 hole + board）占全部组合的比例。**只算当前 board，不
@@ -1067,27 +1087,69 @@ fn current_board_nuttiness(hole: [Card; 2], board: &[Card]) -> f64 {
     }
 }
 
-/// 决策阶段兜底动作 + 「别扔好牌」地板（用户 2026-06-14）。**只在面对下注**（不能免费 check
-/// 且能 call）时把 fold 改成 call：preflop 拿 AA/KK/QQ/JJ/AK/AQ（[`limp_hand_tier`]==2）→ call；
-/// postflop 手牌坚果度 ≥ [`NUT_CALL_THRESHOLD`] → call。其余一律原 check-when-free（能 check
-/// 就 check、否则 fold——紧、不漏筹码）；能免费 check 的局面不为这条地板主动下注（用户只要
-/// 「别扔/跟注」）。命中时 `source` 在 caller 给的完整 source 后追加 `:premium_call`（preflop）
-/// / `:nut_call`（postflop），**前缀不变**（driver 仍按 `fallback:` / `search_giveup:` 分桶，
-/// `starts_with` 不变量保持）。`source` 由 caller 拼好（如 `fallback:{reason}` /
-/// `search_giveup:{reason}`）。仅用于已完成座位映射的决策阶段兜底（座位映射 / 入参校验失败仍走
-/// 原 [`safe_fallback`]，那里状态不可信、且 exact-source 测试在守）。
+/// fallback「底池赔率」floor 的输入（2026-06-15 用户加）：facing bet 时若 `pot/to_call > 4`
+/// 且 `to_call ≤ 30BB` → call（好赔率 + 注额不大就别白弃）。`pot` / `to_call` / `big_blind` 同
+/// 单位（solver chip）—— 比值 `pot/to_call` 与单位无关、`to_call` vs `30×BB` 同单位 → 自洽。
+/// `pot` 取真栈 pot（含对手当前注），call-for-less（封顶全下跟）时含未被跟到的余注 → 略偏乐观，
+/// 对「别白弃」这条 floor 方向一致、可接受（不做侧池/退注精算）。
+#[derive(Copy, Clone, Debug)]
+struct PotOdds {
+    pot: u64,
+    to_call: u64,
+    big_blind: u64,
+}
+
+/// 从真栈 `auth` 状态取底池赔率 floor 输入（solver 单位）。当前行动者面对下注（`call` 合法、
+/// 需补差 `> 0`）才返回 `Some`；能 check / 已盖牌 / 终局 → `None`（该 floor 不触发）。仅在能重建
+/// `auth` 的兜底点可调；build 失败 / 无 `auth` 的兜底点传 `None`。
+fn pot_odds_from_auth(auth: &GameState, solver_cfg: &TableConfig) -> Option<PotOdds> {
+    let seat = auth.current_player()?;
+    // `legal_actions().call` = 绝对跟注额（call-to 总额，封顶全下时 = cap）；补差 = 减本街已投入。
+    let call_to = auth.legal_actions().call?;
+    let committed = auth.players()[seat.0 as usize].committed_this_round;
+    let to_call = call_to.as_u64().checked_sub(committed.as_u64())?;
+    (to_call > 0).then_some(PotOdds {
+        pot: auth.pot().as_u64(),
+        to_call,
+        big_blind: solver_cfg.big_blind.as_u64(),
+    })
+}
+
+/// 决策阶段兜底动作 + 「别扔好牌」地板（用户 2026-06-14；2026-06-15 加底池赔率 floor）。
+/// **只在面对下注**（不能免费 check 且能 call）时把 fold 改成 call，两条 floor 依次判：
+///  ① preflop 拿 AA/KK/QQ/JJ/AK/AQ（[`limp_hand_tier`]==2）→ call；postflop 手牌坚果度
+///     **>** [`NUT_CALL_THRESHOLD`] → call。
+///  ② ①不命中时看底池赔率（[`PotOdds`]，2026-06-15 用户加）：`pot/to_call > 4` 且
+///     `to_call ≤ 30BB` → call（`pot_odds=None` 的兜底点不触发，行为同改前）。
+/// 其余一律原 check-when-free（能 check 就 check、否则 fold——紧、不漏筹码）；能免费 check 的
+/// 局面不为这两条地板主动下注（用户只要「别扔/跟注」）。命中时 `source` 在 caller 给的完整
+/// source 后追加 `:premium_call` / `:nut_call`（①）或 `:pot_odds_call`（②），**前缀不变**
+/// （driver 仍按 `fallback:` / `search_giveup:` 分桶，`starts_with` 不变量保持）。仅用于已完成
+/// 座位映射的决策阶段兜底（座位映射 / 入参校验失败仍走原 [`safe_fallback`]，那里状态不可信）。
 fn fallback_with_floor(
     valid: &ValidActions,
     hole: [Card; 2],
     board: &[Card],
+    pot_odds: Option<PotOdds>,
     source: String,
 ) -> Response {
     if !valid.can_check && valid.can_call {
-        let suffix = if board.is_empty() {
+        // ① 坚果度 / preflop premium。
+        let nut = if board.is_empty() {
             (limp_hand_tier(hole) == 2).then_some("premium_call")
         } else {
-            (current_board_nuttiness(hole, board) >= NUT_CALL_THRESHOLD).then_some("nut_call")
+            (current_board_nuttiness(hole, board) > NUT_CALL_THRESHOLD).then_some("nut_call")
         };
+        // ② 底池赔率（①不命中才看）。
+        let suffix = nut.or_else(|| {
+            pot_odds
+                .filter(|po| {
+                    po.to_call > 0
+                        && po.pot as f64 > 4.0 * po.to_call as f64
+                        && po.to_call <= 30 * po.big_blind
+                })
+                .map(|_| "pot_odds_call")
+        });
         if let Some(sfx) = suffix {
             return Response {
                 action: "call".into(),
@@ -1321,18 +1383,26 @@ fn decide_search_unanchored(
     ) {
         Ok(t) => t,
         Err(reason) => {
+            // build 失败 → 无 auth → pot_odds=None。
             return fallback_with_floor(
                 &req.valid,
                 hole,
                 board,
+                None,
                 format!("search_giveup:unanchored_build:{reason}"),
-            )
+            );
         }
     };
     // gating 在真栈 auth 上判（影子失同步、100BB real 不可得；should_search 只读街+本街是否起注）。
     // 未命中 / board 与真栈街对不上 → 维持旧兜底（非搜索区，labels 与 search=None 同）。
     if !should_search(&auth, scfg.trigger) || board.len() != expected_board_len(auth.street()) {
-        return fallback_with_floor(&req.valid, hole, board, format!("fallback:{shadow_reason}"));
+        return fallback_with_floor(
+            &req.valid,
+            hole,
+            board,
+            pot_odds_from_auth(&auth, solver_cfg),
+            format!("fallback:{shadow_reason}"),
+        );
     }
     let hand_seed = hand_seed_for(req, base_seed);
     // 档一前缀 reach（生产默认开）：用已同步前缀估 range；off → None = uniform（byte-equal 旧行为）。
@@ -1358,12 +1428,14 @@ fn decide_search_unanchored(
     ) {
         Ok(d) => d,
         Err(reason) => {
+            // auth 已建（真栈河牌决策态）→ 喂底池赔率 floor（用户场景：河牌 giveup 被它接住）。
             return fallback_with_floor(
                 &req.valid,
                 hole,
                 board,
+                pot_odds_from_auth(&auth, solver_cfg),
                 format!("search_giveup:unanchored:{reason}"),
-            )
+            );
         }
     };
     let wall_ms = t0.elapsed().as_millis();
@@ -1390,7 +1462,13 @@ fn decide_search_unanchored(
     let solver_action = match outgoing_action(&auth, outgoing_abs, chosen) {
         Ok(a) => a,
         Err(_) => {
-            return fallback_with_floor(&req.valid, hole, board, "fallback:outgoing_failed".into())
+            return fallback_with_floor(
+                &req.valid,
+                hole,
+                board,
+                pot_odds_from_auth(&auth, solver_cfg),
+                "fallback:outgoing_failed".into(),
+            )
         }
     };
     let mut resp = action_to_response(solver_action, scale, &req.valid);
@@ -2334,7 +2412,7 @@ mod tests {
             ("Ah", "Qd"),
             ("As", "Qs"),
         ] {
-            let r = fallback_with_floor(&facing_bet, hole(a, b), &[], "fallback:x".into());
+            let r = fallback_with_floor(&facing_bet, hole(a, b), &[], None, "fallback:x".into());
             assert_eq!(r.action, "call", "{a}{b} 面对下注须 call，得 {r:?}");
             assert_eq!(
                 r.source, "fallback:x:premium_call",
@@ -2343,12 +2421,12 @@ mod tests {
         }
         // 非 premium（TT / KQo / 72o）面对下注 → fold（前缀不变、无后缀）。
         for (a, b) in [("Th", "Tc"), ("Kh", "Qd"), ("7h", "2d")] {
-            let r = fallback_with_floor(&facing_bet, hole(a, b), &[], "fallback:x".into());
+            let r = fallback_with_floor(&facing_bet, hole(a, b), &[], None, "fallback:x".into());
             assert_eq!(r.action, "fold", "{a}{b} 非 premium 须 fold，得 {r:?}");
             assert_eq!(r.source, "fallback:x", "{a}{b} 不该加后缀，得 {r:?}");
         }
         // AA 但能免费 check → check（地板只改 fold，不为它主动下注）。
-        let r = fallback_with_floor(&free, hole("As", "Ad"), &[], "fallback:x".into());
+        let r = fallback_with_floor(&free, hole("As", "Ad"), &[], None, "fallback:x".into());
         assert_eq!(r.action, "check", "免费局面须 check，得 {r:?}");
         assert_eq!(r.source, "fallback:x", "免费 check 不加后缀，得 {r:?}");
 
@@ -2364,6 +2442,7 @@ mod tests {
             &facing_bet,
             royal_hole,
             &royal_board,
+            None,
             "search_giveup:unsolved:foo".into(),
         );
         assert_eq!(r.action, "call", "坚果面对下注须 call，得 {r:?}");
@@ -2378,7 +2457,13 @@ mod tests {
             current_board_nuttiness(trash_hole, &royal_board) < NUT_CALL_THRESHOLD,
             "空气坚果度须 < 阈值"
         );
-        let r = fallback_with_floor(&facing_bet, trash_hole, &royal_board, "fallback:y".into());
+        let r = fallback_with_floor(
+            &facing_bet,
+            trash_hole,
+            &royal_board,
+            None,
+            "fallback:y".into(),
+        );
         assert_eq!(r.action, "fold", "空气面对下注须 fold，得 {r:?}");
         assert_eq!(r.source, "fallback:y", "未命中不加后缀，得 {r:?}");
         // flop 顶 set（A-K-Q rainbow 上的 AA）= 接近坚果（≥95%）→ call。
@@ -2389,9 +2474,132 @@ mod tests {
             "broadway 顶 set 须 ≥ 阈值，得 {}",
             current_board_nuttiness(set_hole, &set_board)
         );
-        let r = fallback_with_floor(&facing_bet, set_hole, &set_board, "fallback:z".into());
+        let r = fallback_with_floor(&facing_bet, set_hole, &set_board, None, "fallback:z".into());
         assert_eq!(r.action, "call", "顶 set 接近坚果须 call，得 {r:?}");
         assert_eq!(r.source, "fallback:z:nut_call", "得 {r:?}");
+    }
+
+    /// 坚果度阈值 2026-06-15 下调为 **>93%** + 底池赔率 floor（用户报的 4h5h@8h6d7c7h3d 河牌 giveup）。
+    #[test]
+    fn fallback_floor_93pct_and_pot_odds() {
+        let card = |s: &str| parse_card(s).unwrap();
+        let hole = |a: &str, b: &str| [card(a), card(b)];
+        let facing_bet = ValidActions {
+            can_check: false,
+            can_call: true,
+            can_raise: true,
+            min_raise: Some(40),
+            max_raise: Some(2000),
+        };
+        let free = ValidActions {
+            can_check: true,
+            ..facing_bet.clone()
+        };
+
+        // —— ① 坚果度 >93%：用户那手 4h5h@8h6d7c7h3d（带对子面 8 高顺）实测 ≈0.9434。
+        // 旧 0.95 阈值会 fold、新 >0.93 → call（:nut_call）。卡在 (0.93, 0.95) 之间正是阈值改动有效区。
+        let board45 = [card("8h"), card("6d"), card("7c"), card("7h"), card("3d")];
+        let nut45 = current_board_nuttiness(hole("4h", "5h"), &board45);
+        assert!(
+            (0.93..0.95).contains(&nut45),
+            "4h5h 坚果度须落在 (0.93,0.95)，得 {nut45}"
+        );
+        let r = fallback_with_floor(
+            &facing_bet,
+            hole("4h", "5h"),
+            &board45,
+            None,
+            "search_giveup:unanchored:foo".into(),
+        );
+        assert_eq!(r.action, "call", "4h5h >93% 须 call，得 {r:?}");
+        assert_eq!(
+            r.source, "search_giveup:unanchored:foo:nut_call",
+            "得 {r:?}"
+        );
+
+        // —— ② 底池赔率 floor：非坚果手（空气）+ 好赔率 + 注额 ≤30BB → call（:pot_odds_call）。
+        // pot/to_call = 700/100 = 7 > 4，to_call 100 ≤ 30×bb(20)=600。坚果度不命中（空气）→ 看 ②。
+        let air = hole("2s", "8d");
+        let air_board = [card("Ah"), card("Kh"), card("Qh"), card("2c"), card("7d")];
+        assert!(current_board_nuttiness(air, &air_board) <= NUT_CALL_THRESHOLD);
+        let po = Some(PotOdds {
+            pot: 700,
+            to_call: 100,
+            big_blind: 20,
+        });
+        let r = fallback_with_floor(&facing_bet, air, &air_board, po, "fallback:g".into());
+        assert_eq!(r.action, "call", "好赔率小注须 call，得 {r:?}");
+        assert_eq!(r.source, "fallback:g:pot_odds_call", "得 {r:?}");
+
+        // pot/to_call 恰 = 4（严格 >4 不含）→ 不触发 → fold。
+        let exactly4 = Some(PotOdds {
+            pot: 400,
+            to_call: 100,
+            big_blind: 20,
+        });
+        let r = fallback_with_floor(&facing_bet, air, &air_board, exactly4, "fallback:g".into());
+        assert_eq!(r.action, "fold", "赔率恰 4:1（非 >4）须 fold，得 {r:?}");
+        assert_eq!(r.source, "fallback:g", "未命中不加后缀，得 {r:?}");
+
+        // 赔率够但注额 >30BB（to_call 100 > 30×bb(3)=90）→ 不触发 → fold。
+        let too_big = Some(PotOdds {
+            pot: 700,
+            to_call: 100,
+            big_blind: 3,
+        });
+        let r = fallback_with_floor(&facing_bet, air, &air_board, too_big, "fallback:g".into());
+        assert_eq!(r.action, "fold", "注额 >30BB 须 fold，得 {r:?}");
+
+        // 注额恰 = 30BB（to_call 600 ≤ 30×bb(20)=600，含）+ 好赔率 → call（用户场景边界：河牌 to_call=600）。
+        let boundary = Some(PotOdds {
+            pot: 6345,
+            to_call: 600,
+            big_blind: 20,
+        });
+        let r = fallback_with_floor(&facing_bet, air, &air_board, boundary, "fallback:g".into());
+        assert_eq!(r.action, "call", "注额恰 30BB（含）须 call，得 {r:?}");
+        assert_eq!(r.source, "fallback:g:pot_odds_call", "得 {r:?}");
+
+        // 能免费 check（!facing bet）→ 两条 floor 都不主动下注，check。
+        let r = fallback_with_floor(&free, air, &air_board, po, "fallback:g".into());
+        assert_eq!(r.action, "check", "免费局面须 check，得 {r:?}");
+        assert_eq!(r.source, "fallback:g", "免费 check 不加后缀，得 {r:?}");
+    }
+
+    /// [`pot_odds_from_auth`] 从真栈 `GameState` 正确提取 pot / to_call（座位索引 +
+    /// `call_to − committed_this_round` 口径）。
+    #[test]
+    fn pot_odds_from_auth_extracts_correctly() {
+        let cfg = TableConfig::default_6max_100bb(); // SB 50 / BB 100 / 10000 栈。
+        let bb = cfg.big_blind.as_u64();
+        // UTG 先动开池到 300（min full-raise to = 100+100 = 200，合法）。
+        let mut gs = GameState::new(&cfg, 7);
+        gs.apply(Action::Raise {
+            to: ChipAmount::new(300),
+        })
+        .expect("UTG open 300 合法");
+        // 下一行动者（非盲位、本街已投入 0）面对 300：to_call = call_to(300) − committed(0) = 300；
+        // pot = SB 50 + BB 100 + open 300 = 450。
+        let po = pot_odds_from_auth(&gs, &cfg).expect("面对下注 → Some");
+        assert_eq!(po.pot, 450, "pot = SB50 + BB100 + open300");
+        assert_eq!(po.to_call, 300, "to_call = call_to(300) − committed(0)");
+        assert_eq!(po.big_blind, bb);
+        // 该手 pot/to_call = 450/300 = 1.5 < 4 → floor 不触发（验证比值口径端到端接得通）。
+        let facing = ValidActions {
+            can_check: false,
+            can_call: true,
+            can_raise: true,
+            min_raise: Some(400),
+            max_raise: Some(10000),
+        };
+        let r = fallback_with_floor(
+            &facing,
+            [parse_card("7h").unwrap(), parse_card("2d").unwrap()], // 72o 非 premium
+            &[],
+            Some(po),
+            "fallback:e".into(),
+        );
+        assert_eq!(r.action, "fold", "1.5:1（<4）须 fold，得 {r:?}");
     }
 
     /// 真实 live 手回归（2026-06-14 用户报）：KK（BB）对超深码对手（seat4=99614 ≈ 5000BB）
