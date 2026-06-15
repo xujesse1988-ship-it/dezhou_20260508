@@ -631,8 +631,8 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
 
     import websocket  # 延迟 import：离线 selftest 不需要 websocket-client
 
-    log_f = open(action_log, "w") if action_log else None
-    # HH 用 append：贯穿全程的后台采集（§4.2），跨重连 / 多次运行累积同一个文件。
+    # action / HH 均用 append：贯穿全程的后台采集（§4.2），跨重连 / 多次运行累积同一个文件。
+    log_f = open(action_log, "a") if action_log else None
     hh_f = open(hh_log, "a") if hh_log else None
     session = Session(advisor, send=_ws_send, num_hands=num_hands, log_f=log_f, hh_f=hh_f,
                       prewarm=prewarm)
