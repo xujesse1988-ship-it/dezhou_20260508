@@ -23,16 +23,30 @@ pub struct TableConfig {
 }
 
 impl TableConfig {
-    /// 6-max 100BB 的默认配置：6 座、起始 100BB、SB=50、BB=100、ante=0、按钮在座位 0。
-    pub fn default_6max_100bb() -> TableConfig {
+    /// 6-max，起始码深 = `stack_bb` 个大盲（BB=100 chips、SB=50、ante=0、按钮在座位 0）。
+    /// `default_6max_100bb()` == `six_max_at_bb(100)`，逐字段一致。
+    ///
+    /// 深浅 grid 训练（`train_cfr --reshape preopen-1pot --stack-bb <N>`）传 50/100/200/300/400
+    /// 等建对应码深的树：betting tree 只按 `AbstractActionTag` 分叉、all-in 阈值在运行期按真实
+    /// per-seat `committed + stack` 现算，故更深的 `starting_stacks` 自动多出后续加注层（深码
+    /// preflop 多 4bet/5bet 层、postflop 高 SPR 多街），无需改建树代码。注意：深码树更大，
+    /// node_id 上界 2^26（见 `nlhe_betting_tree` v2 packing），实际节点数看 train_cfr 的
+    /// `tree_nodes` 日志。
+    pub fn six_max_at_bb(stack_bb: u32) -> TableConfig {
         TableConfig {
             n_seats: 6,
-            starting_stacks: vec![ChipAmount::new(10_000); 6],
+            // 100 chips = 1BB（与 default 一致：100BB = 10_000 chips）。
+            starting_stacks: vec![ChipAmount::new(u64::from(stack_bb) * 100); 6],
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
             button_seat: SeatId(0),
         }
+    }
+
+    /// 6-max 100BB 的默认配置：6 座、起始 100BB、SB=50、BB=100、ante=0、按钮在座位 0。
+    pub fn default_6max_100bb() -> TableConfig {
+        Self::six_max_at_bb(100)
     }
 
     /// Heads-up 200BB 的默认配置：2 座、起始 200BB、SB=50、BB=100、ante=0、按钮在座位 0。

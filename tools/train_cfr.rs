@@ -12,7 +12,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use poker::training::nlhe::SimplifiedNlheGame;
 use poker::training::nlhe_betting_tree::{
-    first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
+    first_small_6max, first_small_preopen_1pot_6max, first_small_preopen_6max,
+    first_small_preopen_small_6max,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{ConvergenceMonitor, EsMccfrTrainer, Game, StrategySnapshot, Trainer};
@@ -45,7 +46,14 @@ struct Args {
     /// （157.9M infoset，full fix；见 [`first_small_preopen_6max`]）；`preopen-small` = preflop
     /// 开池收成单档（仅 2.25BB，删 3.5BB 开池）+ 禁非 SB limp，比 `preopen` 小（preflop 单开池档）、
     /// 比 `nolimp` 开池更便宜（2.25 vs 3.5BB）；见 [`first_small_preopen_small_6max`]。
+    /// `preopen-1pot` = `preopen` 的 preflop / 规则不变、**postflop 收成单一 {1pot}**（深码可训 /
+    /// 可解，配 `--stack-bb` 做「懂深浅」深浅 grid；见 [`first_small_preopen_1pot_6max`]）。
     reshape: String,
+    /// 仅 `--profile six-max`：起始码深（每座大盲数，对称）。默认 100（== 历史
+    /// `default_6max_100bb`，byte-equal）。配 `--reshape preopen-1pot` 在 50/100/200/300/400
+    /// 等码深各训一张 = 深浅 grid。深码树更大（多加注层）→ wall / RAM 随码深涨；node_id 上界
+    /// 2^26，实际节点数看下方 `tree_nodes` 日志。`--profile hu` 忽略本参数。
+    stack_bb: u32,
     trainer: String,
     updates: u64,
     seed: u64,
@@ -91,6 +99,7 @@ impl Default for Args {
             profile: "hu".to_string(),
             postflop_cap: 3,
             reshape: "none".to_string(),
+            stack_bb: 100,
             trainer: "es-mccfr".to_string(),
             updates: 0,
             seed: 0,
@@ -255,6 +264,14 @@ fn run() -> Result<(), String> {
                     args.postflop_cap
                 ));
             }
+            // 起始码深合法性：下界 2BB（要够发盲注 + 至少一档动作），上界 1000BB（再深易撞
+            // node_id 2^26 上界 / RAM；真实节点数看 tree_nodes 日志，越界 build 会触 debug_assert）。
+            if !(2..=1000).contains(&args.stack_bb) {
+                return Err(format!(
+                    "--stack-bb must be in [2, 1000] BB for --profile six-max, got {}",
+                    args.stack_bb
+                ));
+            }
             let (abs, rules) = match args.reshape.as_str() {
                 "none" => first_small_6max(args.postflop_cap),
                 "nolimp" => {
@@ -264,15 +281,17 @@ fn run() -> Result<(), String> {
                 }
                 "preopen" => first_small_preopen_6max(args.postflop_cap),
                 "preopen-small" => first_small_preopen_small_6max(args.postflop_cap),
+                "preopen-1pot" => first_small_preopen_1pot_6max(args.postflop_cap),
                 other => {
                     return Err(format!(
-                    "unknown --reshape {other} (expected none | nolimp | preopen | preopen-small)"
-                ))
+                        "unknown --reshape {other} \
+                         (expected none | nolimp | preopen | preopen-small | preopen-1pot)"
+                    ))
                 }
             };
             SimplifiedNlheGame::new_with_abstraction(
                 Arc::clone(&table),
-                TableConfig::default_6max_100bb(),
+                TableConfig::six_max_at_bb(args.stack_bb),
                 abs,
                 rules,
             )
@@ -292,6 +311,10 @@ fn run() -> Result<(), String> {
                 args.postflop_cap
             );
             train_log!("[train_cfr] reshape          = {}", args.reshape);
+            train_log!(
+                "[train_cfr] stack_bb         = {} (per-seat starting stack, BB)",
+                args.stack_bb
+            );
         }
         train_log!("[train_cfr] n_players        = {}", game.n_players());
         train_log!("[train_cfr] tree_nodes       = {}", game.tree().num_nodes());
@@ -528,6 +551,7 @@ fn parse_args() -> Result<Args, String> {
                 out.postflop_cap = parse_u64(&next_value(&mut args, "--postflop-cap")?)? as u8
             }
             "--reshape" => out.reshape = next_value(&mut args, "--reshape")?,
+            "--stack-bb" => out.stack_bb = parse_u64(&next_value(&mut args, "--stack-bb")?)? as u32,
             "--trainer" => out.trainer = next_value(&mut args, "--trainer")?,
             "--updates" => out.updates = parse_u64(&next_value(&mut args, "--updates")?)?,
             "--iter" => {
@@ -665,6 +689,8 @@ fn print_usage() {
          options:\n\
          \t--profile <hu|six-max>  (default hu; six-max = 6-max 100BB A3×A4 first-small)\n\
          \t--postflop-cap <2|3|4>  (six-max only; A3×A4 width-redirect N, default 3; N=4 = 48 GiB tables)\n\
+         \t--reshape <none|nolimp|preopen|preopen-small|preopen-1pot>  (six-max only; preopen-1pot = preopen preflop + {{1pot}} postflop, for depth grid)\n\
+         \t--stack-bb <N>          (six-max only; per-seat starting stack in BB, default 100; pair with --reshape preopen-1pot)\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>\n\
          \t--batch-per-worker <N>  (default 16; trajectories per worker per step_parallel dispatch)\n\

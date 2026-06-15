@@ -197,6 +197,27 @@ pub fn first_small_preopen_small_6max(
     (abs, rules)
 }
 
+/// `preopen` 的深码训练变体：preflop 菜单 / 规则与 [`first_small_preopen_6max`] **完全一致**
+/// （`{0.5,1}` 开池、`no_open_limp`、`drop_preflop_open_allin`、`drop_small_reraise`），但
+/// **postflop 三街收成单一 `{1.0}`**（同 [`deep_single_pot`] 的控树思路：深码多加注层 + 高 SPR
+/// 多街用单 {1pot} 把树压到可解 / 可训）。配 [`TableConfig::six_max_at_bb`] 在 50/100/200/300/400BB
+/// 等码深各训一张 = 「懂深浅的翻牌前」深浅 grid 的每一档。
+///
+/// **必须另立 reshape、不能就地改 `preopen` 本体**：`first_small_preopen_6max` 是训练与推理的
+/// **共享**树定义——`openpoker_advisor` 按 `--reshape` 重建同一棵树去索引 checkpoint。就地把它的
+/// postflop 改成 {1} 会让现网 preopen-10B `.bin`（{0.5,1} postflop 训练）与重建出的 {1} 树
+/// node_id 全错位 = 索引到错的 infoset。故另开一档，老 `preopen` 逐字节不动。
+pub fn first_small_preopen_1pot_6max(
+    width_redirect: u8,
+) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    // 复用 preopen 的 rules（preflop 旗标全一致），只把 abstraction 的 postflop 收成单 {1pot}。
+    let (_, rules) = first_small_preopen_6max(width_redirect);
+    let pre = ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("preflop {0.5,1.0} 合法");
+    let post = || ActionAbstractionConfig::new(vec![1.0]).expect("postflop {1.0} 单档合法");
+    let abs = StreetActionAbstraction::per_street([pre, post(), post(), post()]);
+    (abs, rules)
+}
+
 /// S6 实时搜索深码档（`realtime_search_openpoker_exec` §2.1 / 缺口③）：**全街单一 {1pot}**
 /// 下注菜单——每决策点只剩 `{fold, check/call, bet/raise 1pot, all-in}`。fold/check/call/all-in
 /// 由规则引擎合法集自带（非 ratio），ratio 只配 1.0pot 单档；这就是文档「深码把下注菜单收到
