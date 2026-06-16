@@ -1816,13 +1816,15 @@ fn subgame_search_cached_inner(
 ///
 /// time_budget anytime 下 iterations 只是安全上界（advisor 默认抬到 `u64::MAX`，求解由墙钟
 /// 截断）、实际 update 数由 wall 决定 → period 不能挂在 iterations 上（u64::MAX/50 = 永不
-/// rescale = LCFR 静默退化 vanilla）。cap 取 10_000：5s 档实测 ~11–33µs/iter ≈ 150–450k
-/// updates → 15–45 个 period；iterations ≤ 500k 时公式与 None 路径相同 → 「预算不绑定 ==
-/// 固定迭代」契约（time_budget_anytime_stops_and_is_valid）在其测试档位不破。
+/// rescale = LCFR 静默退化 vanilla）。cap 取 30_000：5s 档实测 ~11–33µs/iter ≈ 150–450k
+/// updates → 5–15 个 period（比 with_lcfr_period 建议的 20–100 区间粗：换更少 rescale 抖动 /
+/// 更大 strategy_sum total，linear 权重相应变粗）；iterations ≤ 1_500_000 时公式与 None 路径
+/// 相同 → 「预算不绑定 == 固定迭代」契约（time_budget_anytime_stops_and_is_valid）在其测试
+/// 档位不破。
 fn lcfr_period(cfg: &SubgameSearchConfig) -> u64 {
     let by_iters = (cfg.iterations / 50).max(1);
     if cfg.time_budget.is_some() {
-        by_iters.min(10_000)
+        by_iters.min(30_000)
     } else {
         by_iters
     }
@@ -4249,7 +4251,7 @@ mod tests {
 
     /// LCFR period 在 time_budget anytime 下不能挂在 iterations 上（advisor 把 iterations
     /// 默认抬到 `u64::MAX` 当安全上界后，iterations/50 = 永不 rescale = LCFR 静默退化
-    /// vanilla）。钉 [`lcfr_period`]：budgeted 大迭代档 cap 到 10_000；小迭代档与 None
+    /// vanilla）。钉 [`lcfr_period`]：budgeted 大迭代档 cap 到 30_000；小迭代档与 None
     /// 公式一致（保 time_budget_anytime_stops_and_is_valid 的 == 契约）。
     #[test]
     fn lcfr_period_capped_under_time_budget() {
@@ -4258,7 +4260,7 @@ mod tests {
             time_budget: Some(Duration::from_secs(5)),
             ..SubgameSearchConfig::default()
         };
-        assert_eq!(lcfr_period(&cfg), 10_000, "budgeted + 巨大上界 → cap 10k");
+        assert_eq!(lcfr_period(&cfg), 30_000, "budgeted + 巨大上界 → cap 30k");
         cfg.iterations = 300;
         assert_eq!(lcfr_period(&cfg), 6, "budgeted 小迭代档 == iterations/50");
         cfg.time_budget = None;
