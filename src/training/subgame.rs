@@ -1674,6 +1674,21 @@ fn subgame_search_cached_inner(
     // 建 subgame + 求解（仅 miss / 无缓存时跑）：bucket 表 + 上面选定的 action 抽象
     // （sub_abs/sub_rules），从 root_state 为根。6b depth-limit → 子树街边界截断 + 叶子查
     // blueprint 续局值（new_depth_limited）；否则 6a 解到终局。
+    // 实验仪表（env SIX_MAX_TURN_TRACE_EVERY=<updates>，临时收敛诊断 2026-06-16）：solve 过程中
+    // 每 N 个 update 把当前决策点平均策略打到 stderr。未设 env → 不 trace、solve 循环逐位 byte-equal。
+    // 仅支持 round-start（within_round_tags 空）+ deep_menu 读数（self_distribution，与最终 probs 同源）。
+    let trace_every: Option<u64> = std::env::var("SIX_MAX_TURN_TRACE_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| v > 0);
+    let trace_round_start = within_round_tags.is_empty();
+    if trace_every.is_some() && !(trace_round_start && cfg.deep_menu) {
+        eprintln!(
+            "TRACE_TURN\tunsupported (deep_menu={}, within_round_tags={})",
+            cfg.deep_menu,
+            within_round_tags.len()
+        );
+    }
     let build_and_solve = move || -> Result<SolvedSubgame, String> {
         let sub = if cfg.depth_limit {
             let values =
@@ -1728,7 +1743,37 @@ fn subgame_search_cached_inner(
                 raises_on_street,
             )
         };
-        let trainer = solve_subgame(sub, cfg, master)?;
+        // 实验仪表 trace 闭包（SIX_MAX_TURN_TRACE_EVERY）：round-start + deep_menu 下导航到子树根、
+        // 用 read_current_strategy + self_distribution 读当前决策点平均策略——与本函数末尾最终
+        // probs 完全同源（故末次快照 == advisor 正常输出，自带校验）。其余路径上面已打 unsupported。
+        let mut trace_closure;
+        let trace_arg: Option<&mut SolveTraceFn<'_>> =
+            if let (Some(every), true) = (trace_every, trace_round_start && cfg.deep_menu) {
+                let mut next = every;
+                trace_closure = move |done: u64, trainer: &EsMccfrTrainer<SubgameNlheGame>| {
+                    if done < next {
+                        return;
+                    }
+                    next += every;
+                    let cur = match navigate_subtree(trainer.game().subtree(), &[]) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("TRACE_TURN\t{done}\tnav_err={e}");
+                            return;
+                        }
+                    };
+                    match read_current_strategy(trainer, cur, auth, auth_actor)
+                        .and_then(|(avg, sub_legal)| self_distribution(&sub_legal, &avg))
+                    {
+                        Ok(d) => eprintln!("TRACE_TURN\t{done}\t{d:?}"),
+                        Err(e) => eprintln!("TRACE_TURN\t{done}\tread_err={e}"),
+                    }
+                };
+                Some(&mut trace_closure)
+            } else {
+                None
+            };
+        let trainer = solve_subgame(sub, cfg, master, trace_arg)?;
         Ok(SolvedSubgame { trainer, sub_abs })
     };
     let solved_fresh: SolvedSubgame;
@@ -1833,10 +1878,16 @@ fn lcfr_period(cfg: &SubgameSearchConfig) -> u64 {
 /// 共享求解段（[`subgame_search`] blueprint 锚 / [`subgame_search_unanchored`] 真栈锚共用）：
 /// 子树节点数 cap → 建 trainer（LCFR 可选）→ 求解（固定迭代或墙钟 anytime）。逐字保持原
 /// `subgame_search` 求解段的操作顺序 / RNG 流（既有 probe / advisor / §11.5 基线 byte-equal）。
+/// 实验仪表 trace 回调（[`solve_subgame`] 的 `trace` 参数，临时收敛诊断）：`(done, &trainer)`。
+type SolveTraceFn<'a> = dyn FnMut(u64, &EsMccfrTrainer<SubgameNlheGame>) + 'a;
+
 fn solve_subgame(
     sub: SubgameNlheGame,
     cfg: &SubgameSearchConfig,
     master: u64,
+    // 实验仪表（SIX_MAX_TURN_TRACE_EVERY，临时收敛诊断）：每个 update 批后回调当前 `done` +
+    // 解中 trainer，让 caller 打中途策略快照。`None`（生产路径）= 不调用、循环逐位 byte-equal。
+    mut trace: Option<&mut SolveTraceFn<'_>>,
 ) -> Result<EsMccfrTrainer<SubgameNlheGame>, String> {
     let n_nodes = sub.subtree().num_nodes();
     if n_nodes == 0 || n_nodes > cfg.max_subtree_nodes {
@@ -1906,6 +1957,9 @@ fn solve_subgame(
                     .map_err(|e| format!("subgame CFR step_parallel 失败: {e:?}"))?;
                 done += n as u64 * batch as u64;
             }
+            if let Some(f) = trace.as_mut() {
+                f(done, &trainer);
+            }
             if let (Some(start), Some(budget)) = (deadline, cfg.time_budget) {
                 if start.elapsed() >= budget {
                     break;
@@ -1919,6 +1973,9 @@ fn solve_subgame(
                 .step(&mut srng)
                 .map_err(|e| format!("subgame CFR step 失败: {e:?}"))?;
             done += 1;
+            if let Some(f) = trace.as_mut() {
+                f(done, &trainer);
+            }
             if let (Some(start), Some(budget)) = (deadline, cfg.time_budget) {
                 if start.elapsed() >= budget {
                     break;
@@ -1930,6 +1987,9 @@ fn solve_subgame(
         // 连一轮 CFR 迭代都没完成（iterations==0 的退化配置）→ 直接 fold（§2.3 降级，不回落
         // blueprint）。够不够*有用*迭代由「当前桶未被访问 → Err」（read_current_strategy）继续兜。
         return Err("time_budget 内连一轮 CFR 迭代都未完成（→ fold）".to_string());
+    }
+    if let Some(f) = trace.as_mut() {
+        f(done, &trainer);
     }
     Ok(trainer)
 }
@@ -2400,7 +2460,7 @@ fn subgame_search_unanchored_cached_inner(
                 0,
             )
         };
-        let trainer = solve_subgame(sub, cfg, master)?;
+        let trainer = solve_subgame(sub, cfg, master, None)?;
         Ok(SolvedSubgame { trainer, sub_abs })
     };
     let solved_fresh: SolvedSubgame;
