@@ -3129,13 +3129,15 @@ mod tests {
             ">4 Active 应被人数闸拦回 {{1pot}}（6-way 宽档实测 558k 节点）"
         );
 
-        // ⑦ 生产边界宽档树大小护栏：两档最大宽树 < 4M cap（越界即 live giveup）。
+        // ⑦ 生产边界宽档树大小护栏：按 deep_menu_for 选的**生产菜单**（当前街宽 + 下游 {1pot}，
+        //    deep_wide_then_single_pot）建的子树 < 4M cap（越界即 live giveup）。
         let wide_nodes = |st: &GameState| {
+            let (abs, rules) = deep_menu_for(st);
             SubgameNlheGame::new(
                 stub_table(),
                 st.config().clone(),
-                deep_wide_half_pot().0,
-                deep_wide_half_pot().1,
+                abs,
+                rules,
                 st.clone(),
                 live_entrants(st),
                 0,
@@ -3146,12 +3148,71 @@ mod tests {
         let n3 = wide_nodes(&b3_wide);
         let n4 = wide_nodes(&b4_wide);
         eprintln!(
-            "[deep_menu SPR 边界] 生产最大宽树：3-way@40×pot={n3} / 4-way@20×pot={n4}（cap 4M）"
+            "[deep_menu SPR 边界] 生产宽树（当前街宽+下游1pot）：3-way@40×pot={n3} / 4-way@20×pot={n4}（cap 4M）"
         );
         const PROD_CAP: usize = 4_000_000; // openpoker_advisor --search-max-nodes 生产值
         assert!(
             n3 < PROD_CAP && n4 < PROD_CAP,
             "边界宽档撑爆生产 cap：3-way@40×={n3} / 4-way@20×={n4} ≥ {PROD_CAP}（阈值不可行 → 调低）"
+        );
+    }
+
+    /// 缺口③（2026-06-16 用户拍板）：`--search-deep-menu` 宽档**只放当前街**——子树根所在街用
+    /// `{0.5,1}`，下一街起一律收回 {1pot}（把宽档随街乘性叠加的建树开销锁在一条街）。建一棵浅
+    /// 3-way limped flop（[`deep_menu_for`] 判宽）的真实子树，逐节点按 `StreetTag` 扫：Flop 节点的
+    /// Bet/Raise 含 0.5pot 档、Turn/River 节点的 Bet/Raise **只**含 1.0pot 档——若有人把下游街改回
+    /// 宽档（或 `deep_wide_then_single_pot` 写错），本测试 fail。
+    #[test]
+    fn deep_menu_wide_collapses_downstream_streets_to_single_pot() {
+        use crate::abstraction::info::StreetTag;
+        // 3-way 浅 limped flop（40×pot 边界内，与上一测 ② 同参）→ deep_menu_for 判宽。
+        let b3_wide = nway_limped_flop_state(3, 12_100, 0x4457_4E53_5452_4D31); // "DWNSTRM1"
+        let (abs, rules) = deep_menu_for(&b3_wide);
+        let sub = SubgameNlheGame::new(
+            stub_table(),
+            b3_wide.config().clone(),
+            abs,
+            rules,
+            b3_wide.clone(),
+            live_entrants(&b3_wide),
+            0,
+        );
+        let tree = sub.subtree();
+        let mut saw_flop_half = false;
+        let mut saw_downstream_bet = false;
+        for id in 0..tree.num_nodes() as NodeId {
+            let node = tree.node(id);
+            for tag in node.legal_actions.iter() {
+                let r = match tag {
+                    AbstractActionTag::Bet(r) | AbstractActionTag::Raise(r) => *r,
+                    _ => continue,
+                };
+                match node.street {
+                    StreetTag::Flop => {
+                        if r.as_milli() == 500 {
+                            saw_flop_half = true;
+                        }
+                    }
+                    StreetTag::Turn | StreetTag::River => {
+                        assert_eq!(
+                            r.as_milli(),
+                            1000,
+                            "下一街起只许 {{1pot}}，得 {} milli @ {:?} node {id}",
+                            r.as_milli(),
+                            node.street
+                        );
+                        saw_downstream_bet = true;
+                    }
+                    StreetTag::Preflop => {
+                        panic!("flop 根子树不应含 preflop 节点 @ node {id}")
+                    }
+                }
+            }
+        }
+        assert!(saw_flop_half, "当前街（flop）宽档应含 0.5pot 档");
+        assert!(
+            saw_downstream_bet,
+            "子树应展开到 turn/river 且含 Bet/Raise 节点（证下游真被扫到、非空真空通过）"
         );
     }
 

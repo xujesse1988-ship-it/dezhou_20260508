@@ -238,17 +238,45 @@ pub fn deep_single_pot() -> (StreetActionAbstraction, BettingAbstractionRules) {
     (abs, BettingAbstractionRules::default())
 }
 
-/// [`deep_menu_for`] 的宽菜单档（短码）：全街 `{0.5, 1.0}` 两档，**全层级可用**——含
-/// re-raise（`drop_small_reraise` 关；2026-06-12 用户拍板从 first-bet-small 口径放开）。
-/// 缘由：①浅 SPR 且 ≤3 Active 的树本就小、到终局层数有限（1pot 注每层把 pot 推 ~3×，
-/// ~2 层进攻即触 all-in），付得起 re-raise 多一个 0.5pot 档；②live 发现②的 min-raise
-/// 粒度税正中 re-raise 档过粗——对手 min-raise 经 off-tree 映成 ≥0.5pot 档后，我方回应
-/// 菜单若只剩 {1pot, all-in} 更糙。树大小由边界测试 + 200k 绝对护栏钉住。rules =
-/// `Default`（与 [`deep_single_pot`] 一致：postflop 子树不需要 preflop 收宽那套，
-/// `width_redirect` 关）。
+/// **全街** `{0.5, 1.0}` 两档（**全层级可用**——含 re-raise，`drop_small_reraise` 关；
+/// 2026-06-12 用户拍板从 first-bet-small 口径放开）。**注意**：自 2026-06-16 起
+/// [`deep_menu_for`] 的生产路径不再直接用本档，而是 [`deep_wide_then_single_pot`]——只把
+/// **当前街**放宽、下一街起收回 {1pot}。本「全街宽」档保留作建块 + 树大小 **worst-case 上界**
+/// 参照（`_measure_deep_wide_menu_tree_sizes` 仍按它量）。缘由（宽档为何 0.5pot 全层级）：
+/// ①浅 SPR 且 ≤3 Active 的树本就小、到终局层数有限（1pot 注每层把 pot 推 ~3×，~2 层进攻
+/// 即触 all-in），付得起 re-raise 多一个 0.5pot 档；②live 发现②的 min-raise 粒度税正中
+/// re-raise 档过粗——对手 min-raise 经 off-tree 映成 ≥0.5pot 档后，我方回应菜单若只剩
+/// {1pot, all-in} 更糙。rules = `Default`（与 [`deep_single_pot`] 一致：postflop 子树不需要
+/// preflop 收宽那套，`width_redirect` 关）。
 pub fn deep_wide_half_pot() -> (StreetActionAbstraction, BettingAbstractionRules) {
     let two = || ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("{0.5,1.0} 合法");
     let abs = StreetActionAbstraction::per_street([two(), two(), two(), two()]);
+    (abs, BettingAbstractionRules::default())
+}
+
+/// [`deep_menu_for`] 宽档的**生产形态**（2026-06-16 用户拍板）：子树根所在街 `current` 用
+/// `{0.5,1.0}` 两档、**下一街起一律收回 {1pot}**——`--search-deep-menu` 只让当前街吃宽档，
+/// 把宽档随街乘性叠加的建树开销锁在一条街（在翻牌建子树 → 转牌/河牌只 1pot；在转牌建子树 →
+/// 河牌只 1pot）。子树从真实中途 postflop 态为根建，根街之前的街不可达（设什么都不被走到），
+/// 这里一并填 {1pot}。节点数 ≤ [`deep_wide_half_pot`] 的全街宽档（下游塌成单档），故既有
+/// SPR/人数阈值 + 4M cap 对它仍是保守上界。rules = `Default`（同 [`deep_single_pot`] /
+/// [`deep_wide_half_pot`]：postflop 子树不需 preflop 收宽，`width_redirect` 关）。
+pub fn deep_wide_then_single_pot(
+    current: Street,
+) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let one = || ActionAbstractionConfig::new(vec![1.0]).expect("{1.0} 单档合法");
+    let two = || ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("{0.5,1.0} 合法");
+    // per_street 顺序 = [Preflop, Flop, Turn, River]；只当前街放宽，其余（含从根不可达的
+    // 前序街）维持 {1pot}。
+    let cur_idx = match current {
+        Street::Preflop => 0,
+        Street::Flop => 1,
+        Street::Turn => 2,
+        Street::River | Street::Showdown => 3,
+    };
+    let mut configs = [one(), one(), one(), one()];
+    configs[cur_idx] = two();
+    let abs = StreetActionAbstraction::per_street(configs);
     (abs, BettingAbstractionRules::default())
 }
 
@@ -258,7 +286,8 @@ pub fn deep_wide_half_pot() -> (StreetActionAbstraction, BettingAbstractionRules
 /// `_measure_deep_wide_menu_tree_sizes`）**：宽档节点数随 SPR/人数乘性增长，但 ≤3-way 全程
 /// 远 < 生产 cap 4M——HU SPR99=26,600 / 3-way SPR40=307k / 3-way SPR99=1.39M（~3.6s 建树）。
 /// 4-way 单列更低阈值（[`DEEP_MENU_SPR_WIDE_MAX_4WAY`]）：4-way SPR40=3.98M 贴满 cap、~10s 建树
-/// 不可行。
+/// 不可行。**这些节点数都按全街宽档（[`deep_wide_half_pot`]）量**——2026-06-16 起生产宽档只放
+/// 当前街、下游塌 {1pot}（[`deep_wide_then_single_pot`]），实树更小，故这些阈值现是保守上界。
 pub const DEEP_MENU_SPR_WIDE_MAX: u64 = 40;
 
 /// [`deep_menu_for`] 的 SPR 阈值（**4-way**）：4-way 宽档树随 SPR 比 ≤3-way 陡得多
@@ -282,8 +311,9 @@ pub const DEEP_MENU_WIDE_MAX_ACTIVE: usize = 4;
 /// 缺口③ v2 细化（SPR 自适应菜单宽度，exec 文档 §2.1「深码单档、短码可放宽」/ §3.2 缺口③
 /// 「仍未做②」）：按子树根（轮起点）的 SPR + 人数选深码搜索菜单——**SPR ≤ 阈值×pot
 /// （≤3-way = [`DEEP_MENU_SPR_WIDE_MAX`] / 4-way = [`DEEP_MENU_SPR_WIDE_MAX_4WAY`]）且
-/// Active ≤ [`DEEP_MENU_WIDE_MAX_ACTIVE`]** → 放宽到 `{0.5, 1.0}` 两档
-/// （[`deep_wide_half_pot`]，树可负担）；否则维持单一 {1pot}（[`deep_single_pot`]，控树）。
+/// Active ≤ [`DEEP_MENU_WIDE_MAX_ACTIVE`]** → **当前街**放宽到 `{0.5, 1.0}` 两档、下一街起
+/// 收回 {1pot}（[`deep_wide_then_single_pot`]，2026-06-16 用户拍板把宽档锁在一条街）；否则
+/// 全街维持单一 {1pot}（[`deep_single_pot`]，控树）。
 ///
 /// **纯函数 + 整数比较**（只读 `root_state` 的 chip 几何）——`subgame_search*` 选子树菜单
 /// 与 advisor 算 outgoing 尺寸必须**各自重算出同一菜单**，故选单逻辑共享于此、且对同一
@@ -313,7 +343,8 @@ pub fn deep_menu_for(root_state: &GameState) -> (StreetActionAbstraction, Bettin
         DEEP_MENU_SPR_WIDE_MAX
     };
     if n_active <= DEEP_MENU_WIDE_MAX_ACTIVE && top2[1] <= spr_cap.saturating_mul(pot) {
-        deep_wide_half_pot()
+        // 宽档只放当前街（根所在街），下一街起收回 {1pot}（2026-06-16，[`deep_wide_then_single_pot`]）。
+        deep_wide_then_single_pot(root_state.street())
     } else {
         deep_single_pot()
     }
