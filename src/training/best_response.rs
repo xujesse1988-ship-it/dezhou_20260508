@@ -232,3 +232,238 @@ where
     let (_, br_p1) = BR::compute(game, strategy, 1);
     (br_p0 + br_p1) / 2.0
 }
+
+// ===========================================================================
+// Deal-integrated Monte-Carlo best response / exploitability
+// （S6 subgame 收敛诊断，临时 2026-06-16）。
+//
+// 既有 `exploitability::<G,BR>` 走 in-tree chance 枚举，对 Kuhn/Leduc 精确。但
+// `SubgameNlheGame` 把整条 board（含 river）+ 双方底牌一次性发在 `root()` 里、树内
+// 无 chance 节点（`chance_distribution` panic），既有枚举路径不可用——单次 walk 只
+// 评估一个**已知 runout** = "开天眼" best response，跨 deal 平均得 E[max]（上界，有
+// Jensen gap），不是 exploitability。本节按 deal 采样积分：采 K 个 `root()`（= K 个
+// (双方底牌, runout)），把 per-(infoset,action) cfv 累进**同一张** bucket-key 表，
+// policy iteration 收敛到 deal-积分 best response（每桶提交单一动作，非开天眼）；再在
+// **独立 eval deal** 上评估值（去 in-sample 过拟合）。
+//
+// `exploitability(σ) = Σ_i [ BR_i(σ_{-i}) − u_i(σ) ] ≥ 0`，NE 处 → 0。用 `(BR − u)`
+// 差值而非 `(BR0+BR1)/2`，故对**非零和**（子博弈含弃牌座 dead money = 常和）也成立。
+// in-tree-chance 的游戏 `root()` 不消费 rng → 任何 K 精确（单测对
+// `exploitability::<KuhnGame,KuhnBestResponse>` 钉死，差值只来自 zero-sum 下 u0+u1=0
+// → 本式 = 2×(BR0+BR1)/2）。
+// ===========================================================================
+
+/// profile σ（所有 actor 同一 `strat` 闭包）下 `player` 视角 EV。chance 枚举。
+/// 用于算 exploitability 基线 `u_player(σ)`（profile 下该玩家收益）。
+fn value_under_profile<G: Game>(
+    state: &G::State,
+    player: PlayerId,
+    strat: &dyn Fn(&G::InfoSet, usize) -> Vec<f64>,
+) -> f64 {
+    match G::current(state) {
+        NodeKind::Terminal => G::payoff(state, player),
+        NodeKind::Chance => {
+            let mut rng = ChaCha20Rng::from_seed(0);
+            G::chance_distribution(state)
+                .into_iter()
+                .map(|(a, p)| {
+                    let next = G::next(state.clone(), a, &mut rng);
+                    p * value_under_profile::<G>(&next, player, strat)
+                })
+                .sum()
+        }
+        NodeKind::Player(actor) => {
+            let info = G::info_set(state, actor);
+            let actions = G::legal_actions(state);
+            let sigma = strat(&info, actions.len());
+            let mut rng = ChaCha20Rng::from_seed(0);
+            actions
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let next = G::next(state.clone(), *a, &mut rng);
+                    sigma[i] * value_under_profile::<G>(&next, player, strat)
+                })
+                .sum()
+        }
+    }
+}
+
+/// deal-积分 best response（对 `target`，对手按 `opp`）。在**固定** `deal_seeds` 上
+/// policy iteration：每轮把所有 deal 的 cfv 累进同一张表 → per-infoset argmax 提交单
+/// 动作（chance/range 已被 deal 采样积分掉，非开天眼）。返回收敛（或 max_iter 内 train
+/// -EV 最优）的 one-hot 策略表。
+fn mc_br_strategy<G: Game>(
+    game: &G,
+    opp: &dyn Fn(&G::InfoSet, usize) -> Vec<f64>,
+    target: PlayerId,
+    deal_seeds: &[u64],
+) -> HashMap<G::InfoSet, Vec<f64>>
+where
+    G::InfoSet: Hash + Eq,
+{
+    let max_iter = 100;
+    let mut target_strategy: HashMap<G::InfoSet, Vec<f64>> = HashMap::new();
+    let mut best_strategy = target_strategy.clone();
+    let mut best_value = f64::NEG_INFINITY;
+    for _ in 0..max_iter {
+        let mut cfv: HashMap<G::InfoSet, Vec<f64>> = HashMap::new();
+        let mut train_value = 0.0;
+        for &ds in deal_seeds {
+            let mut rng = ChaCha20Rng::from_seed(ds);
+            let root = game.root(&mut rng);
+            train_value += walk_cfv::<G>(&root, 1.0, target, opp, &target_strategy, &mut cfv);
+        }
+        if train_value > best_value {
+            best_value = train_value;
+            best_strategy = target_strategy.clone();
+        }
+        let mut new_strategy: HashMap<G::InfoSet, Vec<f64>> = HashMap::new();
+        for (info, vals) in cfv.iter() {
+            let mut best_idx = 0usize;
+            let mut best = vals[0];
+            for (i, &v) in vals.iter().enumerate().skip(1) {
+                if v > best {
+                    best = v;
+                    best_idx = i;
+                }
+            }
+            let mut one_hot = vec![0.0; vals.len()];
+            one_hot[best_idx] = 1.0;
+            new_strategy.insert(info.clone(), one_hot);
+        }
+        if new_strategy == target_strategy {
+            return new_strategy;
+        }
+        target_strategy = new_strategy;
+    }
+    best_strategy
+}
+
+/// 在 `eval_seeds` 个独立 deal 上评估固定 `target_strategy`（对 `opp`）的 `target` EV。
+fn mc_strategy_value<G: Game>(
+    game: &G,
+    opp: &dyn Fn(&G::InfoSet, usize) -> Vec<f64>,
+    target: PlayerId,
+    target_strategy: &HashMap<G::InfoSet, Vec<f64>>,
+    eval_seeds: &[u64],
+) -> f64
+where
+    G::InfoSet: Hash + Eq,
+{
+    let mut total = 0.0;
+    for &ds in eval_seeds {
+        let mut rng = ChaCha20Rng::from_seed(ds);
+        let root = game.root(&mut rng);
+        let mut cfv: HashMap<G::InfoSet, Vec<f64>> = HashMap::new();
+        total += walk_cfv::<G>(&root, 1.0, target, opp, target_strategy, &mut cfv);
+    }
+    total / eval_seeds.len() as f64
+}
+
+/// 在 `eval_seeds` 个独立 deal 上评估 profile σ 下 `player` 的 EV（= `u_player(σ)`）。
+fn mc_profile_value<G: Game>(
+    game: &G,
+    profile: &dyn Fn(&G::InfoSet, usize) -> Vec<f64>,
+    player: PlayerId,
+    eval_seeds: &[u64],
+) -> f64 {
+    let mut total = 0.0;
+    for &ds in eval_seeds {
+        let mut rng = ChaCha20Rng::from_seed(ds);
+        let root = game.root(&mut rng);
+        total += value_under_profile::<G>(&root, player, profile);
+    }
+    total / eval_seeds.len() as f64
+}
+
+/// deal-积分 MC exploitability of profile `avg`，对 `players` 求和：
+/// `Σ_i [ BR_i(avg_{-i}) − u_i(avg) ] ≥ 0`，NE 处 → 0。`k_train` 个 deal 求 BR，
+/// **独立** `k_eval` 个 deal 评估值（去 in-sample 过拟合）。返回
+/// `(expl_sum, per_player[(player, br_value, profile_value)])`。
+#[allow(clippy::too_many_arguments)]
+pub fn mc_exploitability<G: Game>(
+    game: &G,
+    avg: &dyn Fn(&G::InfoSet, usize) -> Vec<f64>,
+    players: &[PlayerId],
+    k_train: usize,
+    k_eval: usize,
+    seed: u64,
+) -> (f64, Vec<(PlayerId, f64, f64)>)
+where
+    G::InfoSet: Hash + Eq,
+{
+    let mix = |salt: u64, i: u64| {
+        seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ salt.wrapping_mul(0xD1B5_4A32_D192_ED03)
+            ^ i.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    };
+    let train: Vec<u64> = (0..k_train as u64).map(|i| mix(0xA1, i)).collect();
+    let eval: Vec<u64> = (0..k_eval as u64).map(|i| mix(0xE2, i)).collect();
+
+    let mut per_player = Vec::with_capacity(players.len());
+    let mut expl = 0.0;
+    for &p in players {
+        let br = mc_br_strategy::<G>(game, avg, p, &train);
+        let br_val = mc_strategy_value::<G>(game, avg, p, &br, &eval);
+        let u_val = mc_profile_value::<G>(game, avg, p, &eval);
+        expl += br_val - u_val;
+        per_player.push((p, br_val, u_val));
+    }
+    (expl, per_player)
+}
+
+#[cfg(test)]
+mod mc_tests {
+    use super::*;
+    use crate::core::rng::ChaCha20Rng;
+    use crate::training::kuhn::KuhnGame;
+    use crate::training::trainer::{EsMccfrTrainer, Trainer};
+
+    /// 对 in-tree-chance 的 Kuhn，`root()` 不消费 rng → deal 由 chance 枚举，任何 K 精确。
+    /// 故 deal-积分 MC exploitability（K=1）必须逐数匹配既有精确
+    /// `exploitability::<KuhnGame,KuhnBestResponse>`：zero-sum 下 u0+u1=0，本式 = BR0+BR1
+    /// = 2×参考值，故比较 `mc/2 ≈ exact`。钉死 BR/exploitability 逻辑正确（再用到子博弈）。
+    #[test]
+    fn mc_exploitability_matches_exact_kuhn() {
+        let game = KuhnGame;
+
+        // (a) uniform profile
+        let uniform = |_: &<KuhnGame as Game>::InfoSet, n: usize| vec![1.0 / n as f64; n];
+        let exact = exploitability::<KuhnGame, KuhnBestResponse>(&game, &uniform);
+        let (mc, _) = mc_exploitability::<KuhnGame>(&game, &uniform, &[0, 1], 1, 1, 12345);
+        assert!(
+            (mc / 2.0 - exact).abs() < 1e-9,
+            "uniform: mc/2={} exact={}",
+            mc / 2.0,
+            exact
+        );
+
+        // (b) CFR-trained profile（应接近 NE → exploitability 小）
+        let mut t = EsMccfrTrainer::new(KuhnGame, 0xABCD);
+        let mut rng = ChaCha20Rng::from_seed(0x1234);
+        for _ in 0..50_000 {
+            t.step(&mut rng).unwrap();
+        }
+        let avg = |info: &<KuhnGame as Game>::InfoSet, n: usize| {
+            let v = t.average_strategy(info);
+            if v.len() == n {
+                v
+            } else {
+                vec![1.0 / n as f64; n]
+            }
+        };
+        let exact2 = exploitability::<KuhnGame, KuhnBestResponse>(&game, &avg);
+        let (mc2, _) = mc_exploitability::<KuhnGame>(&game, &avg, &[0, 1], 1, 1, 999);
+        assert!(
+            (mc2 / 2.0 - exact2).abs() < 1e-9,
+            "trained: mc/2={} exact={}",
+            mc2 / 2.0,
+            exact2
+        );
+        assert!(
+            exact2 < 0.05,
+            "trained Kuhn exploitability should be small: {exact2}"
+        );
+    }
+}

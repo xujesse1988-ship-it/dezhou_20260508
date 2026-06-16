@@ -1774,6 +1774,49 @@ fn subgame_search_cached_inner(
                 None
             };
         let trainer = solve_subgame(sub, cfg, master, trace_arg)?;
+        // 实验仪表（env SIX_MAX_EXPLOIT_KDEALS=<deal 数>，临时 2026-06-16）：解完后对
+        // σ̄（average strategy）算 deal-积分 MC exploitability（Σ_i [BR_i − u_i] ≥ 0，NE→0），
+        // 判「跨 seed 不一致 = 非唯一均衡(良性) vs 真没收敛」。targets = 子树仍 Active 座
+        // （弃牌/all-in 座无决策）。未设 env → 不算、行为不变。SIX_MAX_EXPLOIT_KEVAL 可选（默认 = KDEALS）。
+        if let Some(kd) = std::env::var("SIX_MAX_EXPLOIT_KDEALS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&k| k > 0)
+        {
+            let keval = std::env::var("SIX_MAX_EXPLOIT_KEVAL")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(kd);
+            let active: Vec<PlayerId> = trainer
+                .game()
+                .template()
+                .players()
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| matches!(p.status, PlayerStatus::Active))
+                .map(|(i, _)| i as PlayerId)
+                .collect();
+            let avg = |info: &SimplifiedNlheInfoSet, n: usize| {
+                let v = Trainer::average_strategy(&trainer, info);
+                if v.len() == n {
+                    v
+                } else {
+                    vec![1.0 / n as f64; n]
+                }
+            };
+            let updates = trainer.update_count();
+            let (expl, pp) = crate::training::best_response::mc_exploitability(
+                trainer.game(),
+                &avg,
+                &active,
+                kd,
+                keval,
+                master,
+            );
+            eprintln!(
+                "EXPLOIT_TURN\tupdates={updates}\tactive={active:?}\tk_train={kd}\tk_eval={keval}\texpl_sum={expl:.4}\tdetail={pp:?}"
+            );
+        }
         Ok(SolvedSubgame { trainer, sub_abs })
     };
     let solved_fresh: SolvedSubgame;
