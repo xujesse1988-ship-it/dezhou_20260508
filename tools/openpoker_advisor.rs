@@ -787,19 +787,34 @@ fn decide(
                     );
                 }
             }
-            // preflop open-limp 结构 gap → 启发式矩阵（[`limp_heuristic`]）；历史无 limp 的
-            // 其他结构 gap / 其余 desync 原因维持原兜底。
+            // preflop 失同步底池赔率 floor（2026-06-16 用户加）：真栈重放算 pot/to_call（限
+            // preflop——postflop 失同步上面已 return 脱影子搜索 / 维持旧兜底，board 非空 → None）。
+            let pre_pot_odds = if board.is_empty() {
+                preflop_pot_odds(req, &solver_cfg, scale, &smap, my_seat_solver, hole)
+            } else {
+                None
+            };
+            // preflop open-limp 结构 gap → 启发式矩阵（[`limp_heuristic`]）；其 fold 出口（facing
+            // bet）若底池赔率 floor 命中 → 改 call（保 `limp_heuristic:` 前缀，driver 分桶不变）。
             if reason == "structural_gap" && board.is_empty() {
-                if let Some(resp) = limp_heuristic(req, hole) {
+                if let Some(mut resp) = limp_heuristic(req, hole) {
+                    if resp.action == "fold"
+                        && pre_pot_odds.as_ref().is_some_and(pot_odds_floor_hit)
+                    {
+                        resp.action = "call".into();
+                        resp.amount = None;
+                        resp.source = "limp_heuristic:pot_odds_call".into();
+                    }
                     return resp;
                 }
             }
-            // 无 auth（未建真栈）→ pot_odds=None（该兜底点不触发底池赔率 floor）。
+            // 历史无 limp 的其他结构 gap / 其余 desync：喂 pre_pot_odds（preflop 命中 floor →
+            // call；postflop = None，行为同改前）。
             return fallback_with_floor(
                 &req.valid,
                 hole,
                 &board,
-                None,
+                pre_pot_odds,
                 format!("fallback:{reason}"),
             );
         }
@@ -921,14 +936,24 @@ fn decide(
     let solver_action = match outgoing_action(outgoing_state, outgoing_abs, chosen) {
         Ok(a) => a,
         Err(_) => {
-            // 搜索路径有真栈 auth（auth_holder）→ 喂底池赔率 floor；blueprint 路径无 → None。
+            // 搜索路径有真栈 auth（auth_holder）→ 喂底池赔率 floor；blueprint 路径无 auth，
+            // preflop 现建真栈算（postflop blueprint outgoing 失败保持 None，byte-equal）。
+            let pot_odds = auth_holder
+                .as_ref()
+                .and_then(|a| pot_odds_from_auth(a, &solver_cfg))
+                .or_else(|| {
+                    board
+                        .is_empty()
+                        .then(|| {
+                            preflop_pot_odds(req, &solver_cfg, scale, &smap, my_seat_solver, hole)
+                        })
+                        .flatten()
+                });
             return fallback_with_floor(
                 &req.valid,
                 hole,
                 &board,
-                auth_holder
-                    .as_ref()
-                    .and_then(|a| pot_odds_from_auth(a, &solver_cfg)),
+                pot_odds,
                 "fallback:outgoing_failed".into(),
             );
         }
@@ -1115,6 +1140,41 @@ fn pot_odds_from_auth(auth: &GameState, solver_cfg: &TableConfig) -> Option<PotO
     })
 }
 
+/// 底池赔率 floor 判据（[`PotOdds`]，2026-06-15 用户加；2026-06-16 扩到 preflop）：facing bet
+/// 时 `pot/to_call > 4` 且 `to_call ≤ 30BB` → 命中（好赔率 + 注额不大 → 别白弃）。**单一口径
+/// 来源**——[`fallback_with_floor`] 的 ② 与 preflop [`limp_heuristic`] 拦截层共用，避免 `>4` /
+/// `≤30BB` 两处漂移。
+fn pot_odds_floor_hit(po: &PotOdds) -> bool {
+    po.to_call > 0 && po.pot as f64 > 4.0 * po.to_call as f64 && po.to_call <= 30 * po.big_blind
+}
+
+/// preflop 失同步/兜底点的底池赔率 floor 输入：真栈重放（limp 池真栈合法可建；off-stack 等
+/// 建不了 → `None` 不触发，安全降级，同现有 postflop floor「无 auth 不触发」）→
+/// [`pot_odds_from_auth`]。**仅 preflop 调**（board 必空；postflop 失同步走脱影子搜索或维持
+/// 旧兜底，不喂此值，byte-equal 不受影响）。无 `req.stacks` 时 [`real_stacks_config`] 退对称
+/// 100BB，pot/to_call 比值仍正确。
+fn preflop_pot_odds(
+    req: &Request,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    my_seat_solver: SeatId,
+    hole: [Card; 2],
+) -> Option<PotOdds> {
+    build_real_auth(
+        req,
+        solver_cfg,
+        scale,
+        smap,
+        my_seat_solver,
+        hole,
+        &[],
+        true,
+    )
+    .ok()
+    .and_then(|(auth, _, _)| pot_odds_from_auth(&auth, solver_cfg))
+}
+
 /// 决策阶段兜底动作 + 「别扔好牌」地板（用户 2026-06-14；2026-06-15 加底池赔率 floor）。
 /// **只在面对下注**（不能免费 check 且能 call）时把 fold 改成 call，两条 floor 依次判：
 ///  ① preflop 拿 AA/KK/QQ/JJ/AK/AQ（[`limp_hand_tier`]==2）→ call；postflop 手牌坚果度
@@ -1141,15 +1201,7 @@ fn fallback_with_floor(
             (current_board_nuttiness(hole, board) > NUT_CALL_THRESHOLD).then_some("nut_call")
         };
         // ② 底池赔率（①不命中才看）。
-        let suffix = nut.or_else(|| {
-            pot_odds
-                .filter(|po| {
-                    po.to_call > 0
-                        && po.pot as f64 > 4.0 * po.to_call as f64
-                        && po.to_call <= 30 * po.big_blind
-                })
-                .map(|_| "pot_odds_call")
-        });
+        let suffix = nut.or_else(|| pot_odds.filter(pot_odds_floor_hit).map(|_| "pot_odds_call"));
         if let Some(sfx) = suffix {
             return Response {
                 action: "call".into(),
@@ -2564,6 +2616,20 @@ mod tests {
         let r = fallback_with_floor(&free, air, &air_board, po, "fallback:g".into());
         assert_eq!(r.action, "check", "免费局面须 check，得 {r:?}");
         assert_eq!(r.source, "fallback:g", "免费 check 不加后缀，得 {r:?}");
+
+        // —— preflop（board 空）也吃底池赔率 floor（2026-06-16 加）：非 premium（72o，tier 0）
+        // + 好赔率小注 → pot_odds_call（① premium 不命中才看 ②）。
+        let trash_pf = hole("7h", "2d");
+        assert_eq!(limp_hand_tier(trash_pf), 0, "72o 须非 premium（tier 0）");
+        let r = fallback_with_floor(&facing_bet, trash_pf, &[], po, "fallback:h".into());
+        assert_eq!(r.action, "call", "preflop 好赔率小注须 call，得 {r:?}");
+        assert_eq!(r.source, "fallback:h:pot_odds_call", "得 {r:?}");
+        // preflop premium（AA）仍走 ①（premium_call 优先于 pot_odds_call）。
+        let r = fallback_with_floor(&facing_bet, hole("As", "Ad"), &[], po, "fallback:h".into());
+        assert_eq!(
+            r.source, "fallback:h:premium_call",
+            "preflop premium 走 ①，得 {r:?}"
+        );
     }
 
     /// [`pot_odds_from_auth`] 从真栈 `GameState` 正确提取 pot / to_call（座位索引 +
@@ -3519,6 +3585,88 @@ mod tests {
             on.source, "limp_heuristic:raise",
             "preflop limp 池 S 档（AKo）→ iso-raise，得 {on:?}"
         );
+    }
+
+    /// preflop limp 池底池赔率 floor（2026-06-16 用户加）：[`limp_heuristic`] 在 raised 分支对非
+    /// P 档牌（72o）本会 fold，但 facing bet 的底池赔率 floor 命中（`pot/to_call>4` 且
+    /// `to_call≤30BB`，真栈重放算）→ 改 call（`source=limp_heuristic:pot_odds_call`，前缀不变）；
+    /// 坏赔率仍维持 fold。`pre_pot_odds` 经 [`build_real_auth`] 真栈重放（limp 池合法可建）。
+    #[test]
+    fn preflop_limp_pot_odds_floor_intercepts_fold() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        // 座位 0=BTN 1=SB(hero) 2=BB 3=UTG 4=HJ 5=CO。UTG/HJ/CO open-limp → BTN raise → SB facing。
+        let mk_req = |btn_to: u64| Request {
+            hole: vec!["7h".into(), "2d".into()], // 72o，非 P 档（tier 0）
+            board: vec![],
+            button_seat: 0,
+            my_seat: 1,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                HistAction {
+                    seat: 3,
+                    action: "call".into(),
+                    to: Some(20),
+                },
+                HistAction {
+                    seat: 4,
+                    action: "call".into(),
+                    to: Some(20),
+                },
+                HistAction {
+                    seat: 5,
+                    action: "call".into(),
+                    to: Some(20),
+                },
+                HistAction {
+                    seat: 0,
+                    action: "raise".into(),
+                    to: Some(btn_to),
+                },
+            ],
+            valid: ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: true,
+                min_raise: Some(btn_to * 2),
+                max_raise: Some(2000),
+            },
+            stacks: vec![2000; 6],
+            dealt_seats: vec![],
+        };
+        // 命中：BTN min-raise to 40 → pot=130、SB to_call=30（已投 10），130/30≈4.33>4、30=1.5BB≤30BB。
+        let hit = decide(
+            &game,
+            &abs,
+            &uniform,
+            &mk_req(40),
+            0x5A1,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(
+            hit.action, "call",
+            "好赔率 limp 池非 P 档须 call，得 {hit:?}"
+        );
+        assert_eq!(
+            hit.source, "limp_heuristic:pot_odds_call",
+            "floor 命中须改 call、保前缀，得 {hit:?}"
+        );
+        // 不命中：BTN raise to 600 → pot=690、to_call=590，690/590≈1.17<4 → 维持 fold。
+        let miss = decide(
+            &game,
+            &abs,
+            &uniform,
+            &mk_req(600),
+            0x5A1,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(miss.action, "fold", "坏赔率须维持 fold，得 {miss:?}");
+        assert_eq!(miss.source, "limp_heuristic:fold", "得 {miss:?}");
     }
 
     /// **limp 池进搜索**（脱影子的重要副作用，S5 结构 gap 在触发区收口）：UTG open-limp 在
