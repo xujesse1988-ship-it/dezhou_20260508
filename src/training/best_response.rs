@@ -293,11 +293,16 @@ fn value_under_profile<G: Game>(
 /// policy iteration：每轮把所有 deal 的 cfv 累进同一张表 → per-infoset argmax 提交单
 /// 动作（chance/range 已被 deal 采样积分掉，非开天眼）。返回收敛（或 max_iter 内 train
 /// -EV 最优）的 one-hot 策略表。
+/// `allow_br(info)==false` 的 infoset 不许 BR 偏离 → 强制打 `fallback`（= profile σ̄），
+/// 用于按子集（如某条街）拆 exploitability 来源。`allow_br=|_|true` = 全树 BR。
+#[allow(clippy::too_many_arguments)]
 fn mc_br_strategy<G: Game>(
     game: &G,
     opp: &dyn Fn(&G::InfoSet, usize) -> Vec<f64>,
     target: PlayerId,
     deal_seeds: &[u64],
+    allow_br: &dyn Fn(&G::InfoSet) -> bool,
+    fallback: &dyn Fn(&G::InfoSet, usize) -> Vec<f64>,
 ) -> HashMap<G::InfoSet, Vec<f64>>
 where
     G::InfoSet: Hash + Eq,
@@ -320,17 +325,22 @@ where
         }
         let mut new_strategy: HashMap<G::InfoSet, Vec<f64>> = HashMap::new();
         for (info, vals) in cfv.iter() {
-            let mut best_idx = 0usize;
-            let mut best = vals[0];
-            for (i, &v) in vals.iter().enumerate().skip(1) {
-                if v > best {
-                    best = v;
-                    best_idx = i;
+            let strat = if allow_br(info) {
+                let mut best_idx = 0usize;
+                let mut best = vals[0];
+                for (i, &v) in vals.iter().enumerate().skip(1) {
+                    if v > best {
+                        best = v;
+                        best_idx = i;
+                    }
                 }
-            }
-            let mut one_hot = vec![0.0; vals.len()];
-            one_hot[best_idx] = 1.0;
-            new_strategy.insert(info.clone(), one_hot);
+                let mut one_hot = vec![0.0; vals.len()];
+                one_hot[best_idx] = 1.0;
+                one_hot
+            } else {
+                fallback(info, vals.len())
+            };
+            new_strategy.insert(info.clone(), strat);
         }
         if new_strategy == target_strategy {
             return new_strategy;
@@ -393,6 +403,25 @@ pub fn mc_exploitability<G: Game>(
 where
     G::InfoSet: Hash + Eq,
 {
+    mc_exploitability_restricted::<G>(game, avg, players, k_train, k_eval, seed, &|_| true)
+}
+
+/// 同 [`mc_exploitability`]，但 best response 只允许在 `allow_br(info)==true` 的 infoset
+/// 偏离（其余 infoset 强制打 profile σ̄）→ 拆「只在某子集（如某条街）纠偏能榨多少」=
+/// exploitability 的来源归因。`allow_br=|_|true` 时与 [`mc_exploitability`] 完全等价。
+#[allow(clippy::too_many_arguments)]
+pub fn mc_exploitability_restricted<G: Game>(
+    game: &G,
+    avg: &dyn Fn(&G::InfoSet, usize) -> Vec<f64>,
+    players: &[PlayerId],
+    k_train: usize,
+    k_eval: usize,
+    seed: u64,
+    allow_br: &dyn Fn(&G::InfoSet) -> bool,
+) -> (f64, Vec<(PlayerId, f64, f64)>)
+where
+    G::InfoSet: Hash + Eq,
+{
     let mix = |salt: u64, i: u64| {
         seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
             ^ salt.wrapping_mul(0xD1B5_4A32_D192_ED03)
@@ -404,7 +433,7 @@ where
     let mut per_player = Vec::with_capacity(players.len());
     let mut expl = 0.0;
     for &p in players {
-        let br = mc_br_strategy::<G>(game, avg, p, &train);
+        let br = mc_br_strategy::<G>(game, avg, p, &train, allow_br, avg);
         let br_val = mc_strategy_value::<G>(game, avg, p, &br, &eval);
         let u_val = mc_profile_value::<G>(game, avg, p, &eval);
         expl += br_val - u_val;

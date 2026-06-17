@@ -1816,6 +1816,99 @@ fn subgame_search_cached_inner(
             eprintln!(
                 "EXPLOIT_TURN\tupdates={updates}\tactive={active:?}\tk_train={kd}\tk_eval={keval}\texpl_sum={expl:.4}\tdetail={pp:?}"
             );
+
+            // —— 饿死机制诊断（同 env，2026-06-17）——
+            // (1) current strategy 的 exploitability vs average：正常 CFR average≪current；
+            //     若 average ≳ current = 平均被饿死（A3hh 机制）而非慢收敛。
+            let cur = |info: &SimplifiedNlheInfoSet, n: usize| {
+                let v = Trainer::current_strategy(&trainer, info);
+                if v.len() == n {
+                    v
+                } else {
+                    vec![1.0 / n as f64; n]
+                }
+            };
+            let (expl_cur, pp_cur) = crate::training::best_response::mc_exploitability(
+                trainer.game(),
+                &cur,
+                &active,
+                kd,
+                keval,
+                master,
+            );
+            eprintln!("EXPLOIT_CUR\texpl_sum={expl_cur:.4}\tdetail={pp_cur:?}");
+
+            // (2) 按街拆 average exploitability：BR 只许在 turn / 只许在 river 偏离（其余打 σ̄）。
+            //     哪条街 recover 出 full 的大头 = exploitability 的来源街。
+            let turn_only = |info: &SimplifiedNlheInfoSet| {
+                info.street_tag() == crate::abstraction::info::StreetTag::Turn
+            };
+            let river_only = |info: &SimplifiedNlheInfoSet| {
+                info.street_tag() == crate::abstraction::info::StreetTag::River
+            };
+            let (expl_turn, _) = crate::training::best_response::mc_exploitability_restricted(
+                trainer.game(),
+                &avg,
+                &active,
+                kd,
+                keval,
+                master,
+                &turn_only,
+            );
+            let (expl_river, _) = crate::training::best_response::mc_exploitability_restricted(
+                trainer.game(),
+                &avg,
+                &active,
+                kd,
+                keval,
+                master,
+                &river_only,
+            );
+            eprintln!(
+                "EXPLOIT_STREET\tfull={expl:.4}\tturn_only={expl_turn:.4}\triver_only={expl_river:.4}"
+            );
+
+            // (3) 按街拆 strategy_sum 质量 + average/current 归一熵（1=均匀=饿死）。
+            //     饿死签名 = river infoset:ss_mass 极小 + avg 熵高(近均匀) 但 cur 熵低(锐利)。
+            let norm_ent = |p: &[f64]| -> f64 {
+                let n = p.len();
+                if n <= 1 {
+                    return 0.0;
+                }
+                let h: f64 = p.iter().filter(|&&x| x > 0.0).map(|&x| -x * x.ln()).sum();
+                h / (n as f64).ln()
+            };
+            // 街 0..4 各:[count, Σss_mass, Σavg_ent, Σcur_ent, #avg近均匀(ent>0.9)]
+            let mut acc: [[f64; 5]; 4] = [[0.0; 5]; 4];
+            for (info, ss) in trainer.strategy_sum().inner().iter() {
+                let st = info.street_tag() as usize;
+                if st >= 4 {
+                    continue;
+                }
+                let ss_total: f64 = ss.iter().sum();
+                let ae = norm_ent(&Trainer::average_strategy(&trainer, info));
+                let ce = norm_ent(&Trainer::current_strategy(&trainer, info));
+                acc[st][0] += 1.0;
+                acc[st][1] += ss_total;
+                acc[st][2] += ae;
+                acc[st][3] += ce;
+                if ae > 0.9 {
+                    acc[st][4] += 1.0;
+                }
+            }
+            for (st, row) in acc.iter().enumerate() {
+                let cnt = row[0];
+                if cnt == 0.0 {
+                    continue;
+                }
+                eprintln!(
+                    "EXPLOIT_STREETSTATS\tstreet={st}\tinfosets={cnt:.0}\tmean_ss_mass={:.5}\tmean_avg_entropy={:.4}\tmean_cur_entropy={:.4}\tfrac_avg_near_uniform={:.3}",
+                    row[1] / cnt,
+                    row[2] / cnt,
+                    row[3] / cnt,
+                    row[4] / cnt
+                );
+            }
         }
         Ok(SolvedSubgame { trainer, sub_abs })
     };
