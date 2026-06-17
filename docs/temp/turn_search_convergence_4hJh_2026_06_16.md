@@ -212,6 +212,8 @@ vultr 上的原始产物：
 
 一句话：**求解器无 code bug；这个双人子博弈在生产级预算下严重欠收敛，且 exploitability 随迭代不降（结构性地板）。跨 seed 不一致 = 两个都远离均衡的欠收敛点，不是「非唯一均衡」。**
 
+> ⚠️ **更正（见 §11，2026-06-17）**：§10.4 / §10.5 把地板**主因猜成「深层 infoset π_trav-加权饿死」**——这条已被 §11 的按街拆解**证伪**。真相：~200 的可剥削度**全来自 turn（浅层 / 子树根 / π_trav=1），河牌（深层）榨不出**；average 比 current 好 5×（averaging 正常、没饿死）。故 §10.5 的「重锚子树根 / 换非-π_trav 平均」修法**对本 spot 无效**。§10.1–10.3 的事实（无 bug、工具、地板数据）不变；§10.4/10.5 的机制推断以 §11 为准。
+
 ### 10.1 代码审计：无 bug
 
 19-agent 对抗审计 5 区域全部核为正确：
@@ -257,3 +259,44 @@ vultr 上的原始产物：
 - 工具 + env：branch `tmp-subgame-exploit`（origin 已推；= `tmp-turn-trace` + `mc_exploitability` + `subgame.rs` 的 `SIX_MAX_EXPLOIT_KDEALS` 钩子）。命令同 §8，改 `--search-solve-threads 1`、去 `--search-lcfr`、设 `--search-iterations N`，并 export `SIX_MAX_EXPLOIT_KDEALS=8000`（可选 `SIX_MAX_EXPLOIT_KEVAL`）；exploitability 打在 stderr 的 `EXPLOIT_TURN` 行。
 - Kuhn 逻辑验证：`cargo test --lib mc_exploitability_matches_exact_kuhn`。
 - vultr 原始产物：`/tmp/B_expl_s2_100M.err`、`/tmp/B_expl_s3_300M.err`、`/tmp/B_expl_s3_600M.err`（含 `TRACE_TURN` + `EXPLOIT_TURN`）。
+
+## 11. 饿死机制：证伪 + 重定向（2026-06-17）
+
+为定位 §10 的 ~200 地板成因，给 exploitability 工具加三诊断（branch `tmp-subgame-exploit`，commit `9ce664f`，同 env `SIX_MAX_EXPLOIT_KDEALS`）：
+- `mc_exploitability_restricted`（BR 只许在 `allow_br(info)` 子集偏离、其余强制打 σ̄）→ 按街拆 exploitability 来源；
+- `EXPLOIT_CUR` = **current strategy** 的 exploitability（对比 average）；
+- `EXPLOIT_STREETSTATS` = 按街 `strategy_sum` 质量 + average/current 归一熵。
+
+### 11.0 实测（seed3 @ 100M，单线程，uniform，8000 train / 8000 eval deals）
+
+```
+EXPLOIT_TURN   (average) = 199.85          ← = §10.3 复现，sanity ✓
+EXPLOIT_CUR    (current) = 1091.29
+EXPLOIT_STREET full=199.85  turn_only=213.3  river_only=−1.86
+STREETSTATS turn (街2): 3389 infoset, ss_mass 10999.97, avg熵 0.611, cur熵 0.076, 近均匀占比 0.442
+STREETSTATS river(街3):16010 infoset, ss_mass  1655.75, avg熵 0.616, cur熵 0.058, 近均匀占比 0.498
+```
+
+### 11.1 饿死假设（§10.4/10.5）被证伪 —— 三条独立证据
+
+1. **average(200) ≪ current(1091)**：平均**没**被饿死，反比单迭代好 5×，averaging 正常工作。（饿死预测 average ≳ current。）
+2. **river_only ≈ 0（−1.86）、turn_only ≈ full（213≈200）**：~200 全来自 **turn（浅层）**，河牌（深层）几乎榨不出 → 与「深层 river 饿死」**完全相反**。（`turn_only` 略高于 `full` 是 train/eval 拆分下 full 多一维 river 偏离的过拟合噪声，~±15。）
+3. **river average 不比 turn 更饿**：两街 avg 熵都 ~0.61、近均匀占比都 ~0.45–0.50。river 的 `ss_mass`（1656）确比 turn（11000）小 6.6×（**π_trav 下权是真的**），**但没转化成可剥削度**（river_only≈0）→ 下权存在、但不是地板成因。
+
+### 11.2 结论修正
+
+- **leak 在 turn = 子树根 = 最浅 = π_trav=1 = 被访问最多的街**，而非深层。这恰是 CFR 本该收敛**最好**的地方，却卡 ~200、6× 迭代不降。
+- **§10.5 的修法对本 spot 无效**：4hJh 决策本来就是根（已 π_trav=1），没有可「重锚」的深度；换非-π_trav 平均也救不了「averaging 本就正常」的局面。重锚 / 换平均可能对 A3hh 那种**深层**决策（π_trav 小）有用，但不解释 4hJh。
+- 可剥削度**高度不对称**（player2 BR gain ~180 vs player0 ~8–56）且全在 turn → **某一座的 turn 策略**离均衡远，不是普遍深层问题。
+- 与 A3hh 关系：A3hh 是 turn 内 3 手之后的**深层**节点（starvation 适用）；4hJh 是**根**（starvation 不适用）。两者机制不同；「starvation 统一解释一切」（A3hh 自己 §5 E5 已自警过度统一）在此被否。
+
+### 11.3 真正的开放问题 + 下一探针
+
+谜变成：**为何最浅、最常访问的 turn 街，CFR 平均卡 ~200 可剥削、6× 迭代不降？** 候选探针：
+- **(a)** dump turn per-infoset BR gain + 把 internal idx 0/2 映回 BTN/BB —— 漏在少数高 reach turn 节点，还是整个某座的 turn range。（最直接）
+- **(b)** λ=0（双方 raw reach、去对手 range uniform 平滑）重解，看不对称 / 地板变不变。
+- **(c)** turn 子树够小 → vanilla 全树 CFR 当真值，看 turn 可剥削度能否压到 ~0（区分 ES 方差 vs 真地板）。
+
+### 11.4 复现
+
+branch `tmp-subgame-exploit`（`9ce664f`，已推）。命令同 §10.6，加 env `SIX_MAX_EXPLOIT_KDEALS=8000`（`KEVAL` 可选）即同时打 `EXPLOIT_TURN/CUR/STREET/STREETSTATS`。产物 `/tmp/C_decomp_s3_100M.err`。
