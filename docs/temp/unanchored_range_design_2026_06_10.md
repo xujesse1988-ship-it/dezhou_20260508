@@ -6,7 +6,8 @@
 > → **用户据此拍板把 `--search-unanchored-prefix-reach` 生产默认改 ON**（`off` 显式关 = A/B 对照臂 /
 > 回退；`DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH=true`）。**仍 pending = live 多手 EV 确认**（§5.1 是
 > n=1 决策级证据；正确性早单测硬证、守护 search=None byte-equal，故默认开可放心、随时可 off）。
-> 档二′（失同步动作真栈子树 σ 条件化）仍未做。背景见
+> 档二′（失同步动作真栈子树 σ 条件化）仍未做（**2026-06-18 讨论补了它最便宜的「跨街复用」特例**：
+> 上一街 unanchored 时复用已解子树 σ 估下一街 range，§1 末「档二′-跨街复用」+ §4）。背景见
 > `realtime_search_openpoker_exec_2026_06_08.md` §3.2 缺口②续（脱锚搜索落地时把 range 诚实退化为
 > uniform，「脱锚 range 细化」列为后置项）。本文把 2026-06-10 讨论出的可行路线 / 坑 / 实现要点钉
 > 下来，避免捡起来时重推导。
@@ -108,6 +109,52 @@ blueprint，用搜索自己解出的策略更新 belief**：
 - KLSS / opponent-limited search（arXiv 2106.06068，ICML'23 liu23k）解决的是 common-knowledge
   closure 爆炸——本仓库子树根在局部闭包，本来就是 1-KLSS 形态，无新增益。
 
+### 档二′-跨街复用：上一街已解的真栈子树 σ → 下一街 range —— 档二′ 最便宜的形态（2026-06-18 讨论）
+
+档二′ 上面框成「每个失同步动作多解一次粗解」。但**顺序对局**里有个几乎免费的特例：**上一街
+（如 flop）本身就 unanchored、已为它建并解过真栈子树**时，不必为「条件化下一街（turn）的 range」
+再解——直接复用那棵子树的 σ。
+
+问题（对着代码）：turn 搜索的前缀 reach 取同步前缀里 `street < turn` 的决策（`subgame.rs:2314-2325`）。
+`synced_node` 在 flop 失同步后**冻结**在断点前 → 进 turn 的 `prior` 只剩 **preflop + flop 断点之前**；
+**断点及其后的 flop 下注战（往往是最强价值信号，如 re-raise）按因子 1 丢掉**，range 退回
+「preflop 3bet range」粗粒度。
+
+修法 = belief 沿街前递（DeepStack continual re-solving 递归，§1 已引）：flop 子树
+（`ResolveRoot::RoundStart`，根在 flop 街起点 → **含整条 flop 下注所有节点的 σ**）解出的 σ，对 flop
+实际动作线做贝叶斯条件化 → 进 turn 的后验 root range。§0.3 双重批评（节点错 + 码深错）在此失效
+（子树真规则真码深），连档一「跳过 AllIn-tag」补丁都不需要。
+
+**动机 = §5.1 的直接续集**：§5.1 在 off-tree flop 决策（88@A73r）上把 uniform 先验的 stack-off
+漏洞改成正确弃牌。但若 hero call 了 re-raise 走到 turn，档一把 range 退回「preflop 3bettor」、
+**恰好丢掉 BTN 那个 flop re-raise** → §5.1 刚堵的洞下一街又开。同一漏洞的下一街，非新边角。
+
+**落地前要钉死的正确性点（概念对、管道大半现成，但非「换参数」）**：
+
+- **(a) σ 索引不通用 = 主要工程量**：`estimate_range`（`subgame.rs:1046`）在 **blueprint 树**上走决策
+  （`game.tree()` + `info_set_for_cards`）；flop 子树 σ 按**子树自己的 node id / 桶**索引，对不上
+  blueprint 节点 → **不能直接当 `PrefixReach.strategy`**，需「沿 flop 子树节点走实际 flop 动作线逐点
+  读 σ」的变体。导航子问题已解（`within_round_real` 把 real 动作映进菜单），但实际尺寸 off-菜单时
+  读 σ 要走同款 off-tree 尺寸映射（粒度税跑不掉）。
+- **(b) 纯函数 / replay-AIVAT 可复现 = 真正 gating（也是当初推迟档二′的原因）**：档一前缀 reach 是
+  **请求的纯函数**（静态查表）→ seeded 可复现、replay/AIVAT 一致（§2，gate②）。本法让 turn range
+  依赖一次 **CFR 解**（flop 子树）。**可以**保持纯（解在给定 seed/iters/range/菜单 下确定，均可从手
+  历史派生），前提是**确定性重派生 σ（重解或按 key 命中缓存），绝不 stash 依赖墙钟迭代数的浮点
+  后验**。代价：live 便宜（`solve_cache_key` session 内命中时）；但**离线 replay/AIVAT
+  （`openpoker_hh_aivat`）要真重解 flop 子树、不再查表 → eval 管道变重**。
+- **(c) 误差复合 + 零概率地板**：flop 子树 σ 是「对着它自己那个（可能 uniform 的）root range 的
+  均衡」，跨街条件化误差累积 → 带档二′ 同款规则：σ 整列塌零设 ε 地板，全塌退 uniform。
+- **(d) 自我 vs 对手 belief 不对称**：DeepStack 只用自己 σ 更新自己 range；ReBeL/Pluribus 两边更新。
+  本法两边都用子树 σ → 与档一现有「同质 blueprint / 对手按均衡打」假设（`estimate_range` 同质假设）
+  一致，只是把同一模型依赖往深推一街——明确这是「假设对手按真栈均衡打」的后验，非真人 range。
+- **(e) 街间 card removal**：flop 后验要按 turn 新牌重新去撞牌组合再用。
+
+**门槛不在概念，在 (b) replay/AIVAT 可复现 + (a) σ 索引改写**——定它是「接缓存」还是「动 eval 管道
+的中等工程」。**下一步先钉死**：`solve_cache_key`（`subgame.rs:1120`）缓存是否在 session 内留存、
+turn 时能否命中 flop 的解 → 「复用缓存」（几乎免费）vs「重解」（退回档二′ wall 成本）。取证同档一：
+自对弈造不出触发手（§5），干净标尺 = 构造 2-way 深码 HU 的 off-tree-flop→turn 线（零和有 EV 真值，
+如 §5.1），或 live 按「flop 失同步且续打到 turn」分桶。
+
 ### 档三：limp 池 = 结构性死路，只能等对手数据
 
 limper 的 range 在 blueprint 里**不存在**——nolimp 树剪掉了所有 open-limp 边，dense 表里没有任何
@@ -151,7 +198,9 @@ range（真人 limp 偏离均衡是常态），长期答案不变 = 对手数据
 2. **档二′（失同步动作的真栈子树 σ 条件化）作为第二步**——文献标准做法（DeepStack/ReBeL/Pluribus
    的 belief 更新全部用搜索解而非 blueprint 查表），同时覆盖 off-stack all-in、真 4+way、limp 池
    三类场景，并使档一的 AllIn-tag 补丁失效（被更正确的机制取代）。代价 = 每次失同步多一次粗解，
-   wall 预算要实测。
+   wall 预算要实测。**（2026-06-18 补充）顺序对局里有个几乎免费的跨街特例**——上一街本身
+   unanchored、子树已解时，街间 belief 更新直接复用那棵子树的 σ，不必再解（见 §1 末「档二′-跨街
+   复用」）。门槛是 replay/AIVAT 可复现成本 + σ 索引改写，非概念。
 
 档二（代理节点映射）被档二′取代，不再考虑；limp 池长期答案仍是对手数据（步 D），档二′提供过渡
 先验。两步各自走 h2h A/B（uniform vs 档一 vs 档一+档二′）拿证据，不凭直觉上生产。
