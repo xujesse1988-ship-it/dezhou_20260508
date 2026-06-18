@@ -2017,6 +2017,148 @@ fn lcfr_period(cfg: &SubgameSearchConfig) -> u64 {
 /// 实验仪表 trace 回调（[`solve_subgame`] 的 `trace` 参数，临时收敛诊断）：`(done, &trainer)`。
 type SolveTraceFn<'a> = dyn FnMut(u64, &EsMccfrTrainer<SubgameNlheGame>) + 'a;
 
+/// 实验仪表 helper（env `SIX_MAX_EXPLOIT_KDEALS`）：对已解 σ̄ 算 deal-积分 MC exploitability
+/// （Σ_i [BR_i − u_i] ≥ 0，NE→0；N-player BR 通用，多人/脱锚同口径）。从 anchored
+/// `build_and_solve` 内联块抽出供 unanchored 复用。未设 env → 不算、行为不变。
+fn report_subgame_exploit(trainer: &EsMccfrTrainer<SubgameNlheGame>, master: u64) {
+    let Some(kd) = std::env::var("SIX_MAX_EXPLOIT_KDEALS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k > 0)
+    else {
+        return;
+    };
+    let keval = std::env::var("SIX_MAX_EXPLOIT_KEVAL")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(kd);
+    let active: Vec<PlayerId> = trainer
+        .game()
+        .template()
+        .players()
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| matches!(p.status, PlayerStatus::Active))
+        .map(|(i, _)| i as PlayerId)
+        .collect();
+    let avg = |info: &SimplifiedNlheInfoSet, n: usize| {
+        let v = Trainer::average_strategy(trainer, info);
+        if v.len() == n {
+            v
+        } else {
+            vec![1.0 / n as f64; n]
+        }
+    };
+    let updates = trainer.update_count();
+    let (expl, pp) = crate::training::best_response::mc_exploitability(
+        trainer.game(),
+        &avg,
+        &active,
+        kd,
+        keval,
+        master,
+    );
+    eprintln!(
+        "EXPLOIT_TURN\tupdates={updates}\tactive={active:?}\tk_train={kd}\tk_eval={keval}\texpl_sum={expl:.4}\tdetail={pp:?}"
+    );
+    let cur = |info: &SimplifiedNlheInfoSet, n: usize| {
+        let v = Trainer::current_strategy(trainer, info);
+        if v.len() == n {
+            v
+        } else {
+            vec![1.0 / n as f64; n]
+        }
+    };
+    let (expl_cur, pp_cur) = crate::training::best_response::mc_exploitability(
+        trainer.game(),
+        &cur,
+        &active,
+        kd,
+        keval,
+        master,
+    );
+    eprintln!("EXPLOIT_CUR\texpl_sum={expl_cur:.4}\tdetail={pp_cur:?}");
+    // 按街拆 average exploitability：BR 只许在该街偏离（其余打 σ̄）→ 来源街归因。
+    // flop 子博弈三街全列（anchored 旧块只有 turn/river，这里补 flop）。
+    let flop_only = |info: &SimplifiedNlheInfoSet| {
+        info.street_tag() == crate::abstraction::info::StreetTag::Flop
+    };
+    let turn_only = |info: &SimplifiedNlheInfoSet| {
+        info.street_tag() == crate::abstraction::info::StreetTag::Turn
+    };
+    let river_only = |info: &SimplifiedNlheInfoSet| {
+        info.street_tag() == crate::abstraction::info::StreetTag::River
+    };
+    let (expl_flop, _) = crate::training::best_response::mc_exploitability_restricted(
+        trainer.game(),
+        &avg,
+        &active,
+        kd,
+        keval,
+        master,
+        &flop_only,
+    );
+    let (expl_turn, _) = crate::training::best_response::mc_exploitability_restricted(
+        trainer.game(),
+        &avg,
+        &active,
+        kd,
+        keval,
+        master,
+        &turn_only,
+    );
+    let (expl_river, _) = crate::training::best_response::mc_exploitability_restricted(
+        trainer.game(),
+        &avg,
+        &active,
+        kd,
+        keval,
+        master,
+        &river_only,
+    );
+    eprintln!(
+        "EXPLOIT_STREET\tfull={expl:.4}\tflop_only={expl_flop:.4}\tturn_only={expl_turn:.4}\triver_only={expl_river:.4}"
+    );
+    let norm_ent = |p: &[f64]| -> f64 {
+        let n = p.len();
+        if n <= 1 {
+            return 0.0;
+        }
+        let h: f64 = p.iter().filter(|&&x| x > 0.0).map(|&x| -x * x.ln()).sum();
+        h / (n as f64).ln()
+    };
+    let mut acc: [[f64; 5]; 4] = [[0.0; 5]; 4];
+    for (info, ss) in trainer.strategy_sum().inner().iter() {
+        let st = info.street_tag() as usize;
+        if st >= 4 {
+            continue;
+        }
+        let ss_total: f64 = ss.iter().sum();
+        let ae = norm_ent(&Trainer::average_strategy(trainer, info));
+        let ce = norm_ent(&Trainer::current_strategy(trainer, info));
+        acc[st][0] += 1.0;
+        acc[st][1] += ss_total;
+        acc[st][2] += ae;
+        acc[st][3] += ce;
+        if ae > 0.9 {
+            acc[st][4] += 1.0;
+        }
+    }
+    for (st, row) in acc.iter().enumerate() {
+        let cnt = row[0];
+        if cnt == 0.0 {
+            continue;
+        }
+        eprintln!(
+            "EXPLOIT_STREETSTATS\tstreet={st}\tinfosets={cnt:.0}\tmean_ss_mass={:.5}\tmean_avg_entropy={:.4}\tmean_cur_entropy={:.4}\tfrac_avg_near_uniform={:.3}",
+            row[1] / cnt,
+            row[2] / cnt,
+            row[3] / cnt,
+            row[4] / cnt
+        );
+    }
+}
+
 fn solve_subgame(
     sub: SubgameNlheGame,
     cfg: &SubgameSearchConfig,
@@ -2597,6 +2739,9 @@ fn subgame_search_unanchored_cached_inner(
             )
         };
         let trainer = solve_subgame(sub, cfg, master, None)?;
+        // 实验仪表（SIX_MAX_EXPLOIT_KDEALS）：脱锚路径同口径算 deal-积分 MC exploitability
+        // （anchored build_and_solve 里有，unanchored 这里补上；4-way 同 N-player BR）。
+        report_subgame_exploit(&trainer, master);
         Ok(SolvedSubgame { trainer, sub_abs })
     };
     let solved_fresh: SolvedSubgame;
