@@ -1,7 +1,7 @@
 # 实时搜索转牌子博弈收敛性 + 可剥削性诊断：QsJc（2026-06-17）
 
 > 中性记录。是 `river_search_convergence_2026_06_17.md`（QsJc/KdAc **河牌**）的续作：**同一手 QsJc，往上挪一条街到转牌根**，验河牌文档 §4.1 的悬念——「河牌干净收敛、问题在上游（转牌/翻牌）」。
-> 一句话定论：**QsJc 转牌子博弈，决策（hero 首动作 = 纯 check）、博弈值（hero −1.6 BB / BTN +2.6 BB）跨 6 run 全一致；LCFR 三 seed 把整树 σ̄ 干净收敛到 ≈0 可剥削；但 uniform 平均下 hero 侧残留 ~2–3.3 BB 真实可剥削（K=8000→40000 上修 + LCFR 双向夹死「是真残差、非噪声」），定性为「uniform 平均器对 hero 转牌策略的慢收敛」，不是 4hJh 转牌那种 ~10 BB 硬地板——本点位解得到 NE。**
+> 一句话定论：**QsJc 转牌子博弈，决策（hero 首动作 = 纯 check）、博弈值（hero −1.6 BB / BTN +2.6 BB）跨 6 run 全一致；LCFR 三 seed 把整树 σ̄ 干净收敛到 ≈0 可剥削；但 uniform 平均下 hero 侧残留 ~2–3.3 BB 真实可剥削（K=8000→40000 上修 + LCFR 双向夹死「是真残差、非噪声」），定性为「uniform 平均器对 hero 转牌策略的慢收敛」，不是 4hJh 转牌那种卡地板的样子（注：4hJh 经 1000 桶复核也非硬地板、是 ~2 BB 抽象受限，旧记 10 BB 系单位错，见其 §12）——本点位解得到 NE。**
 
 ---
 
@@ -87,7 +87,7 @@ SIX_MAX_TURN_TRACE_EVERY=10000000 SIX_MAX_EXPLOIT_KDEALS=8000
 
 **K=40000 从「估计器精度」独立再证**：σ̄ 逐位复现的前提下，full **2.51 → 3.25 BB**（涨）。该估计器去偏后是**下界**，deal 越多 BR 越准、下界越往上收；**噪声会随 K 缩向 0，它随 K 上修** → hero 侧真值 ≥3.3 BB，铁证非噪声。
 
-→ **三态**：QsJc 河牌 ≈0（两臂）｜QsJc 转牌 uniform hero 侧 ~2–3.3 BB / LCFR ≈0｜4hJh 转牌卡 ~10 BB（两臂）。**可剥削性是判据，频率不是**（决策频率三态全是纯 check，分不开）。
+→ **三态**：QsJc 河牌 ≈0（两臂）｜QsJc 转牌 uniform hero 侧 ~2–3.3 BB / LCFR ≈0｜4hJh 转牌 ~2 BB@500桶（两臂；旧记 10 BB 系单位错，且 1000 桶证为抽象受限可降，见其 §12）。**可剥削性是判据，频率不是**（决策频率三态全是纯 check，分不开）。
 
 ### 4.3 残差落点：hero 侧、转牌街、根以外的决策
 
@@ -97,7 +97,7 @@ SIX_MAX_TURN_TRACE_EVERY=10000000 SIX_MAX_EXPLOIT_KDEALS=8000
 
 ### 4.4 定性：uniform 平均器慢收敛，不是地板
 
-- **LCFR 能把 hero 侧也收敛到 ≈0** → 子博弈**有 NE 且解得到**（彻底区别于 4hJh 转牌 ~10 BB 硬地板）。
+- **LCFR 能把 hero 侧也收敛到 ≈0** → 子博弈**有 NE 且解得到**（4hJh 转牌经 1000 桶复核也可解、需更细桶，见其 §12；非原以为的硬地板）。
 - **uniform 慢**：给早期远离均衡的迭代等权，hero 那些跨范围的转牌混合应对洗得慢，100M 时 s1/s2 还剩 ~2–3.3 BB（s3 靠 seed 运气洗到 0.42）。LCFR 近期加权抹平。
 - **机制旁证**：LCFR ss_mass 更低（street2 ~22k vs uniform ~45k）却收敛**更好** → 是**加权方式**起作用，不是采样量；两街 ss_mass 都不为 0 → 非 starvation。
 
@@ -120,9 +120,9 @@ SIX_MAX_TURN_TRACE_EVERY=10000000 SIX_MAX_EXPLOIT_KDEALS=8000
 |--|--|--:|--|--|--|
 | QsJc 河牌 | 1 | ~160 | 无 | ≈0 | ≈0 |
 | **QsJc 转牌** | 2 | ~6,700 | 有(44) | **≈0** | **2–3.3 BB（hero 侧, 慢收敛）** |
-| 4hJh 转牌 | 2 | ~19,000(3-way) | 有 | 卡 ~10 BB | 卡 ~10 BB |
+| 4hJh 转牌 | 2 | ~19,000(**HU**) | 有 | ~2 BB@500→0.7–1.2@1000 | ~2 BB@500→0.4–1.6@1000 |
 
-机制递进：河牌（终局街、根下无发牌）干净收敛；转牌（双街、根下压发牌+一轮下注）uniform 在 hero 跨范围混合侧慢收敛、LCFR 修得动；4hJh 转牌（3-way 深码不对称）连 LCFR 都卡 ~10 BB = 真欠收敛/地板。**QsJc 转牌坐在中间：可解到 NE，但对平均器/算力敏感。**
+机制递进：河牌（终局街、根下无发牌）干净收敛；转牌（双街、根下压发牌+一轮下注）uniform 在 hero 跨范围混合侧慢收敛、LCFR 修得动；4hJh 转牌（**HU**、湿面空气）500 桶下卡 ~2 BB（旧记「3-way / 10 BB」均误，见其 §12）= **500 桶抽象受限**，1000 桶腰斩、turn 解到 ≈0。**三手都可解到 NE，差别只在所需抽象细度 / 平均器 / 算力。**
 
 ## 6. 复现
 
@@ -142,3 +142,27 @@ SIX_MAX_TURN_TRACE_EVERY=10000000 SIX_MAX_EXPLOIT_KDEALS=8000 \
   --search-solve-threads 1 --search-bucket-table artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin \
   [--search-lcfr] --seed S --search-iterations 100000000 < turn_req.json 2>err.txt
 ```
+
+## 7. 待做实验：regret 折扣 vs 只折 average（之后做）
+
+> 用户拍板「之后做」，先登记。起因 = §4.4 + LCFR 调度讨论。
+
+**事实**：本文 LCFR = 「一直做」的 Linear CFR——`maybe_lcfr_rescale`（`trainer.rs:389`）每 period 边界 n 把 **regret 与 strategy_sum 都 ×n/(n+1)**（默认 `lcfr_rescale_regret=true`，Brown 2018），100M 跑里 `period_size=iters/50` → **50 次 rescale 贯穿全程 = 线性加权**（伸缩积 `∏ n/(n+1)` 使 period m 贡献权重 ∝ m）。**不是只前期做。**
+
+**待验问题**：regret 也一路折扣，收敛后期会不会 **over-discount**（折掉有用的 regret 信号、拖慢 current 策略变锐）？DCFR（Brown & Sandholm 2019）核心结论 = **regret 与 strategy 想要不同的折扣表**（正/负 regret、average 三参数分开调），暗示「两者用同一个全程折扣」非最优。代码已留诊断入口 `with_lcfr_period_strategy_only`（`trainer.rs:410`，只折 strategy_sum、regret 不动），注释动机即此。
+
+**设计**（同 `turn_req.json`、同 6-run 框架，3 seed × 100M）：
+1. **full LCFR**（折 regret + average）= 本文 lcfr 臂（已有，hero 侧 ≈0）。
+2. **strategy-only LCFR**（只折 average、regret 不动）= 新臂。
+3. uniform（已有，hero 侧 ~2–3 BB）作锚。
+
+读数同 §3：full / turn_only / river_only 可剥削性 + hero(P1) BR 增益 + 收敛轨迹。
+
+**判读**：
+- strategy-only ≈ full LCFR（都 ≈0）→ 此节点 regret 折扣**无害**（over-discount 不成立）。
+- strategy-only **更低/更快** → regret 后期确实 over-discount，「只折 average」更优 → 指向 DCFR 式分离折扣。
+- strategy-only **更差** → regret 折扣是 LCFR 收敛优势的必要部分。
+
+**前置**：确认 `with_lcfr_period_strategy_only` 是否接到 CLI；没接则加 env 门控（仿 `SIX_MAX_TURN_TRACE_EVERY`，挂 `tmp-subgame-exploit` 分支、不进主线）。
+
+**相关未做（同一条线）**：LCFR>uniform 的 gap 目前只 QsJc 转牌 1 个节点；要变规律须在 2–3 个不同手牌/SPR 的「喂得饱」转牌混合点各跑两臂 100M（把 n=1 变规律）。另：饿死节点（A3hh）上「晚期停折 average」是否救得回 average starvation（§4.4 反例），也属同组调度实验。
