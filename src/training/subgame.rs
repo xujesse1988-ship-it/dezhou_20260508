@@ -2700,6 +2700,11 @@ fn subgame_search_unanchored_cached_inner(
     let sub_table: Arc<BucketTable> =
         bucket_override.map_or_else(|| Arc::clone(&game.bucket_table), Arc::clone);
     let master = search_seed(cfg.seed, hand_seed, street_tag as u64);
+    // 实验仪表 trace（SIX_MAX_TURN_TRACE_EVERY）：脱锚 round-start 同 anchored 口径打中途快照。
+    let trace_every = std::env::var("SIX_MAX_TURN_TRACE_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&e| e > 0);
     let key = cache.as_ref().map(|_| {
         solve_cache_key(
             KEY_KIND_UNANCHORED,
@@ -2738,7 +2743,36 @@ fn subgame_search_unanchored_cached_inner(
                 0,
             )
         };
-        let trainer = solve_subgame(sub, cfg, master, None)?;
+        // 实验仪表 trace 闭包（同 anchored）：round-start + deep_menu 下导航子树根读当前
+        // 决策点平均策略——末次快照 == 末尾 probs（自带校验）。脱锚仅 RoundStart（上面已 gate）。
+        let mut trace_closure;
+        let trace_arg: Option<&mut SolveTraceFn<'_>> =
+            if let (Some(every), true) = (trace_every, cfg.deep_menu) {
+                let mut next = every;
+                trace_closure = move |done: u64, trainer: &EsMccfrTrainer<SubgameNlheGame>| {
+                    if done < next {
+                        return;
+                    }
+                    next += every;
+                    let cur = match navigate_subtree(trainer.game().subtree(), &[]) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("TRACE_TURN\t{done}\tnav_err={e}");
+                            return;
+                        }
+                    };
+                    match read_current_strategy(trainer, cur, auth, auth_actor)
+                        .and_then(|(avg, sub_legal)| self_distribution(&sub_legal, &avg))
+                    {
+                        Ok(d) => eprintln!("TRACE_TURN\t{done}\t{d:?}"),
+                        Err(e) => eprintln!("TRACE_TURN\t{done}\tread_err={e}"),
+                    }
+                };
+                Some(&mut trace_closure)
+            } else {
+                None
+            };
+        let trainer = solve_subgame(sub, cfg, master, trace_arg)?;
         // 实验仪表（SIX_MAX_EXPLOIT_KDEALS）：脱锚路径同口径算 deal-积分 MC exploitability
         // （anchored build_and_solve 里有，unanchored 这里补上；4-way 同 N-player BR）。
         report_subgame_exploit(&trainer, master);
