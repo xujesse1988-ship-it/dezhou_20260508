@@ -2159,6 +2159,216 @@ fn report_subgame_exploit(trainer: &EsMccfrTrainer<SubgameNlheGame>, master: u64
     }
 }
 
+/// 从 `state` 起按 `strat`（σ̄）随机走到终局，返回各 seat 的整手净 payoff（内部 chip）。
+/// O(depth)、与子树总节点数无关——故对大子博弈（4-way 翻牌，几千万节点）也可任意 k 跑，
+/// 不像 `value_under_profile` 的全树加权 DFS（O(tree)，大树上单次都跑不完）。子博弈无 chance
+/// 节点（[`SimplifiedNlheGame::current`] 永不返回 `Chance`），故 `Chance` 臂 unreachable。
+fn rollout_payoffs(
+    mut state: SimplifiedNlheState,
+    n_seats: usize,
+    strat: &dyn Fn(&SimplifiedNlheInfoSet, usize) -> Vec<f64>,
+    rng: &mut dyn RngSource,
+) -> Vec<f64> {
+    loop {
+        match SubgameNlheGame::current(&state) {
+            NodeKind::Terminal => break,
+            NodeKind::Chance => unreachable!("subgame 无 chance 节点（root 一次性发牌）"),
+            NodeKind::Player(actor) => {
+                let actions = SimplifiedNlheGame::legal_actions(&state);
+                let info = SimplifiedNlheGame::info_set(&state, actor);
+                let sigma = strat(&info, actions.len());
+                // sample_discrete 要求概率全正且和≈1：剔除 0 概率 + 重归一（σ̄ 可能含 0 / 浮点和≠1）。
+                let mut pairs: Vec<(SimplifiedNlheAction, f64)> = Vec::with_capacity(actions.len());
+                let mut sum = 0.0_f64;
+                for (a, &p) in actions.iter().zip(sigma.iter()) {
+                    if p > 0.0 {
+                        pairs.push((*a, p));
+                        sum += p;
+                    }
+                }
+                let chosen = if pairs.is_empty() || !sum.is_finite() || sum <= 0.0 {
+                    // 全零 σ̄（未访问 infoset）→ uniform 兜底。
+                    let p = 1.0 / actions.len() as f64;
+                    let uni: Vec<(SimplifiedNlheAction, f64)> =
+                        actions.iter().map(|a| (*a, p)).collect();
+                    sample_discrete(&uni, rng)
+                } else {
+                    for x in pairs.iter_mut() {
+                        x.1 /= sum;
+                    }
+                    sample_discrete(&pairs, rng)
+                };
+                state = SimplifiedNlheGame::next(state, chosen, rng);
+            }
+        }
+    }
+    (0..n_seats)
+        .map(|p| SimplifiedNlheGame::payoff(&state, p as PlayerId))
+        .collect()
+}
+
+/// 实验仪表 helper（env `SIX_MAX_ROOT_VALUES=<k>`）：对已解 σ̄ 用 **σ̄ rollout** 算 root 决策点
+/// 的 per-action 反事实值 + 各座范围值。**不**做全树 best response —— 避开 N-way deal-MC BR 的
+/// 覆盖塌缩（k 副 deal 盖不住几万 infoset → BR≈uniform 默认 → expl 反成负值，见
+/// `flop_search_convergence_q8h_2026_06_18.md` §4）。root 节点每副 deal 必命中 → 任何 k 覆盖充分，
+/// 只靠大 k 压方差（报 SE）。未设 env → 不算、行为不变。
+///
+/// 输出（内部 chip ×0.01 = BB；mean±SE）：
+/// - `ROOT_U`：各 active 座 σ̄ 下范围值 `u_seat`。跨 seed 比 `u_hero` 是否收敛 = 区分
+///   「欠训练」vs「非唯一均衡平流形」的判据（river/turn 文档：值/可剥削性是判据，频率不是）。
+/// - `ROOT_CFV_RANGE`：root 各 action `a` 的范围 cfv `v_a = E_deal[u_hero | hero@root 打 a, 余 σ̄]`，
+///   `regret_lb = max_a v̄_a − u_hero`（Jensen 下界：max-of-mean ≤ mean-of-max）。
+/// - `ROOT_CFV_BUCKET`：仅 hero 采样手落进**真实手所在 flop 桶**的 deal 的同口径 v_a + 该桶 σ̄ +
+///   `regret = max_a v_a − Σσ̄·v_a` + 命中数 `cnt`（hand-specific：直接判 live jam 对不对）。
+fn report_root_values(trainer: &EsMccfrTrainer<SubgameNlheGame>, master: u64) {
+    let Some(k) = std::env::var("SIX_MAX_ROOT_VALUES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k > 0)
+    else {
+        return;
+    };
+    let game = trainer.game();
+    let avg = |info: &SimplifiedNlheInfoSet, n: usize| {
+        let v = Trainer::average_strategy(trainer, info);
+        if v.len() == n {
+            v
+        } else {
+            vec![1.0 / n as f64; n]
+        }
+    };
+    let n_seats = game.template().players().len();
+    let active: Vec<PlayerId> = game
+        .template()
+        .players()
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| matches!(p.status, PlayerStatus::Active))
+        .map(|(i, _)| i as PlayerId)
+        .collect();
+    let Some(hero) = game.template().current_player().map(|s| s.0 as PlayerId) else {
+        eprintln!("ROOT_VALUES\tskip=no_current_player");
+        return;
+    };
+    // hero 真实手所在 flop 桶 + 该桶 root σ̄：用 template（含真实底牌）造一个 root-id 状态算一次。
+    let real_state = SimplifiedNlheState {
+        game_state: game.template().clone(),
+        action_history: Vec::new(),
+        bucket_table: Arc::clone(&game.bucket_table),
+        current_node_id: game.subtree.root_id(),
+        tree: Arc::clone(&game.subtree),
+        abs: Arc::clone(&game.abs),
+        info_set_cache: std::sync::atomic::AtomicU64::new(0),
+        leaf_ctx: game.leaf_ctx.clone(),
+    };
+    let flop = crate::abstraction::info::StreetTag::Flop;
+    let hero_bucket = compute_hand_bucket(&real_state, hero, flop);
+    let root_actions = SimplifiedNlheGame::legal_actions(&real_state);
+    let n_a = root_actions.len();
+    let hero_info = SimplifiedNlheGame::info_set(&real_state, hero);
+    let sigma_bucket = avg(&hero_info, n_a);
+    let updates = trainer.update_count();
+    let n_nodes = game.subtree.num_nodes();
+
+    // (sum, sumsq) → mean ± SE。
+    let mut u_acc = vec![(0.0_f64, 0.0_f64); n_seats];
+    let mut v_acc = vec![(0.0_f64, 0.0_f64); n_a];
+    let mut vb_acc = vec![(0.0_f64, 0.0_f64); n_a];
+    let mut cnt_b = 0usize;
+
+    for i in 0..k as u64 {
+        // eval deal 种子（与 mc_exploitability eval 同型混合，与 solve 流分开）。
+        let seed = master.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ 0xE2u64.wrapping_mul(0xD1B5_4A32_D192_ED03)
+            ^ i.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let mut rng = ChaCha20Rng::from_seed(seed);
+        let root = game.root(&mut rng);
+        let in_bucket = compute_hand_bucket(&root, hero, flop) == hero_bucket;
+        if in_bucket {
+            cnt_b += 1;
+        }
+        // u：一次 σ̄ rollout 同时给所有座 payoff（同副 deal 配对）。
+        let pf = rollout_payoffs(root.clone(), n_seats, &avg, &mut rng);
+        for &p in &active {
+            let x = pf[p as usize];
+            u_acc[p as usize].0 += x;
+            u_acc[p as usize].1 += x * x;
+        }
+        // v_a：hero 在 root 强制打 a（next 对 decision 纯转移），之后全 σ̄ rollout → hero payoff。
+        for (ai, a) in root_actions.iter().enumerate() {
+            let child = SimplifiedNlheGame::next(root.clone(), *a, &mut rng);
+            let v = rollout_payoffs(child, n_seats, &avg, &mut rng)[hero as usize];
+            v_acc[ai].0 += v;
+            v_acc[ai].1 += v * v;
+            if in_bucket {
+                vb_acc[ai].0 += v;
+                vb_acc[ai].1 += v * v;
+            }
+        }
+    }
+
+    // mean ± SE（内部 chip → BB），n = 样本数。
+    let stat_bb = |sum: f64, sumsq: f64, n: f64| -> (f64, f64) {
+        let mean = sum / n;
+        let se = if n > 1.0 {
+            ((sumsq / n - mean * mean).max(0.0) / n).sqrt()
+        } else {
+            0.0
+        };
+        (mean / 100.0, se / 100.0)
+    };
+    let kf = k as f64;
+    let u_line: Vec<(PlayerId, f64, f64)> = active
+        .iter()
+        .map(|&p| {
+            let (m, se) = stat_bb(u_acc[p as usize].0, u_acc[p as usize].1, kf);
+            (p, m, se)
+        })
+        .collect();
+    eprintln!(
+        "ROOT_U\tupdates={updates}\thero={hero}\tk={k}\tn_nodes={n_nodes}\tu_bb(seat,mean,se)={u_line:?}"
+    );
+    // ROOT_CFV_RANGE
+    let v_range: Vec<(String, f64, f64)> = root_actions
+        .iter()
+        .enumerate()
+        .map(|(ai, a)| {
+            let (m, se) = stat_bb(v_acc[ai].0, v_acc[ai].1, kf);
+            (format!("{a:?}"), m, se)
+        })
+        .collect();
+    let u_hero_bb = stat_bb(u_acc[hero as usize].0, u_acc[hero as usize].1, kf).0;
+    let max_v_bb = v_range
+        .iter()
+        .map(|x| x.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    eprintln!(
+        "ROOT_CFV_RANGE\tupdates={updates}\tu_hero_bb={u_hero_bb:.4}\tregret_lb_bb={:.4}\tv(action,mean,se)={v_range:?}",
+        max_v_bb - u_hero_bb
+    );
+    // ROOT_CFV_BUCKET（hero 真实手所在桶）
+    if cnt_b > 0 {
+        let cb = cnt_b as f64;
+        let vb: Vec<(String, f64, f64, f64)> = root_actions
+            .iter()
+            .enumerate()
+            .map(|(ai, a)| {
+                let (m, se) = stat_bb(vb_acc[ai].0, vb_acc[ai].1, cb);
+                let sg = sigma_bucket.get(ai).copied().unwrap_or(0.0);
+                (format!("{a:?}"), m, se, sg)
+            })
+            .collect();
+        let u_sigma_bb: f64 = vb.iter().map(|x| x.1 * x.3).sum();
+        let max_vb_bb = vb.iter().map(|x| x.1).fold(f64::NEG_INFINITY, f64::max);
+        eprintln!(
+            "ROOT_CFV_BUCKET\tbucket={hero_bucket}\tcnt={cnt_b}\tu_sigma_bb={u_sigma_bb:.4}\tregret_bb={:.4}\tv(action,mean,se,sigma)={vb:?}",
+            max_vb_bb - u_sigma_bb
+        );
+    } else {
+        eprintln!("ROOT_CFV_BUCKET\tbucket={hero_bucket}\tcnt=0\tskip=no_deal_hit_real_bucket");
+    }
+}
+
 fn solve_subgame(
     sub: SubgameNlheGame,
     cfg: &SubgameSearchConfig,
@@ -2776,6 +2986,8 @@ fn subgame_search_unanchored_cached_inner(
         // 实验仪表（SIX_MAX_EXPLOIT_KDEALS）：脱锚路径同口径算 deal-积分 MC exploitability
         // （anchored build_and_solve 里有，unanchored 这里补上；4-way 同 N-player BR）。
         report_subgame_exploit(&trainer, master);
+        // 实验仪表（SIX_MAX_ROOT_VALUES）：root per-action cfv + 各座范围值（σ̄ rollout，不做全树 BR）。
+        report_root_values(&trainer, master);
         Ok(SolvedSubgame { trainer, sub_abs })
     };
     let solved_fresh: SolvedSubgame;
