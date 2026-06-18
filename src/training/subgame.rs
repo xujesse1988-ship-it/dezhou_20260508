@@ -2207,6 +2207,64 @@ fn rollout_payoffs(
         .collect()
 }
 
+/// 评测仪表：构造 hero（root 决策者）底牌钉到 `template` 真实手、对手按 range 采、board 现发的
+/// root 状态（[`report_root_values`] 的 ROOT_CFV_BUCKET 用——hero 真实手 range 权重可能≈0，
+/// 过滤采样法 `cnt=0` 采不到，见 `flop_search_convergence_q8h_2026_06_18.md` §0）。card removal
+/// 正确：hero 真实手先进 `used`、对手避开。`ranges==None`（uniform MVP）或 hero 无底牌 → `None`。
+fn build_hero_pinned_root(
+    game: &SubgameNlheGame,
+    hero: usize,
+    rng: &mut dyn RngSource,
+) -> Option<SimplifiedNlheState> {
+    let ranges = game.ranges.as_ref()?;
+    let hero_hand = game.template.players()[hero].hole_cards?;
+    let mut used = game
+        .template
+        .board()
+        .iter()
+        .fold(0u64, |m, c| m | (1u64 << c.to_u8()));
+    used |= 1u64 << hero_hand[0].to_u8();
+    used |= 1u64 << hero_hand[1].to_u8();
+    let players = game.template.players();
+    let mut holes: Vec<Option<[Card; 2]>> = vec![None; players.len()];
+    holes[hero] = Some(hero_hand);
+    for (seat, player) in players.iter().enumerate() {
+        if seat == hero || player.hole_cards.is_none() {
+            continue;
+        }
+        let chosen_idx = if let Some(cdf) = game.range_cdfs[seat].as_ref() {
+            let mut found = None;
+            for _ in 0..RANGE_REJECTION_RETRY_CAP {
+                let u = (rng.next_u64() >> 11) as f64 / ((1u64 << 53) as f64);
+                let mut j = cdf.cum.partition_point(|&c| c <= u);
+                if j >= cdf.cum.len() {
+                    j = cdf.last_positive;
+                }
+                if game.hole_masks[j] & used == 0 {
+                    found = Some(j);
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| game.sample_hole_exact(&ranges[seat], used, rng))
+        } else {
+            game.sample_hole_exact(&ranges[seat], used, rng)
+        };
+        used |= game.hole_masks[chosen_idx];
+        holes[seat] = Some(game.hole_combos[chosen_idx]);
+    }
+    let game_state = game.template.resample_hidden_with_holes(&holes, rng);
+    Some(SimplifiedNlheState {
+        game_state,
+        action_history: Vec::new(),
+        bucket_table: Arc::clone(&game.bucket_table),
+        current_node_id: game.subtree.root_id(),
+        tree: Arc::clone(&game.subtree),
+        abs: Arc::clone(&game.abs),
+        info_set_cache: std::sync::atomic::AtomicU64::new(0),
+        leaf_ctx: game.leaf_ctx.clone(),
+    })
+}
+
 /// 实验仪表 helper（env `SIX_MAX_ROOT_VALUES=<k>`）：对已解 σ̄ 用 **σ̄ rollout** 算 root 决策点
 /// 的 per-action 反事实值 + 各座范围值。**不**做全树 best response —— 避开 N-way deal-MC BR 的
 /// 覆盖塌缩（k 副 deal 盖不住几万 infoset → BR≈uniform 默认 → expl 反成负值，见
@@ -2282,12 +2340,8 @@ fn report_root_values(trainer: &EsMccfrTrainer<SubgameNlheGame>, master: u64) {
             ^ 0xE2u64.wrapping_mul(0xD1B5_4A32_D192_ED03)
             ^ i.wrapping_mul(0x2545_F491_4F6C_DD1D);
         let mut rng = ChaCha20Rng::from_seed(seed);
+        // (1) range：root() 按 σ̄ range 采各家底牌。u：一次 σ̄ rollout 同时给所有座 payoff。
         let root = game.root(&mut rng);
-        let in_bucket = compute_hand_bucket(&root, hero, flop) == hero_bucket;
-        if in_bucket {
-            cnt_b += 1;
-        }
-        // u：一次 σ̄ rollout 同时给所有座 payoff（同副 deal 配对）。
         let pf = rollout_payoffs(root.clone(), n_seats, &avg, &mut rng);
         for &p in &active {
             let x = pf[p as usize];
@@ -2300,7 +2354,14 @@ fn report_root_values(trainer: &EsMccfrTrainer<SubgameNlheGame>, master: u64) {
             let v = rollout_payoffs(child, n_seats, &avg, &mut rng)[hero as usize];
             v_acc[ai].0 += v;
             v_acc[ai].1 += v * v;
-            if in_bucket {
+        }
+        // (2) bucket：hero 钉到真实手（range 权重可能≈0、过滤采样 cnt=0，§0）→ 全 k 覆盖。
+        if let Some(rootp) = build_hero_pinned_root(game, hero as usize, &mut rng) {
+            debug_assert_eq!(compute_hand_bucket(&rootp, hero, flop), hero_bucket);
+            cnt_b += 1;
+            for (ai, a) in root_actions.iter().enumerate() {
+                let child = SimplifiedNlheGame::next(rootp.clone(), *a, &mut rng);
+                let v = rollout_payoffs(child, n_seats, &avg, &mut rng)[hero as usize];
                 vb_acc[ai].0 += v;
                 vb_acc[ai].1 += v * v;
             }
