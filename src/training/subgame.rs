@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 use crate::abstraction::action::{ActionAbstraction, StreetActionAbstraction};
 use crate::abstraction::bucket_table::BucketTable;
 use crate::abstraction::info::{InfoSetId, StreetTag};
+use crate::abstraction::postflop::canonical_observation_id;
+use crate::abstraction::preflop::PreflopLossless169;
 use crate::core::rng::{ChaCha20Rng, RngSource};
 use crate::core::{Card, PlayerStatus, Street};
 use crate::rules::action::Action;
@@ -42,8 +44,8 @@ use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::nlhe::{
-    compute_hand_bucket, SimplifiedNlheAction, SimplifiedNlheGame, SimplifiedNlheInfoSet,
-    SimplifiedNlheState,
+    compute_hand_bucket, pack_info_set_v2, SimplifiedNlheAction, SimplifiedNlheGame,
+    SimplifiedNlheInfoSet, SimplifiedNlheState,
 };
 use crate::training::nlhe_betting_tree::{
     deep_menu_for, AbstractActionTag, BettingAbstractionRules, Child, NodeId, PublicBettingTree,
@@ -456,6 +458,43 @@ impl SubgameNlheGame {
     /// 在 root + template 上的特化；CurrentDecision 模式下 template = `auth`，几何一致）。
     pub fn root_query(&self) -> (SimplifiedNlheInfoSet, Vec<SimplifiedNlheAction>) {
         self.query_at(self.subtree.root_id(), &self.template)
+    }
+
+    /// per-seat hole marginal range（`ranges == Some` 时；下标 = seat、对齐
+    /// [`all_hole_combos`]，folded 座向量留空）。档二′-跨街复用读上一街子树解所**条件化的**
+    /// root range 当贝叶斯先验（[`cross_street_posterior_range`]）。`None` = 该解走 uniform
+    /// resample（无显式先验）。
+    pub fn ranges(&self) -> Option<&[Vec<f64>]> {
+        self.ranges.as_deref()
+    }
+
+    /// 用注入的 `hole`+`board` 为**子树节点** `node_id` 构造 `InfoSetId`——与
+    /// [`SimplifiedNlheGame::info_set_for_cards`](crate::training::nlhe::SimplifiedNlheGame::info_set_for_cards)
+    /// **同路径**（`street_tag = self.subtree.node(node_id).street`；postflop 走
+    /// `canonical_observation_id` + `self.bucket_table.lookup`；同一 [`pack_info_set_v2`] 打包），
+    /// 只是树换成本子树。故对子树 solve 期 `Game::info_set(state, actor)`（state 携 subtree 节点 +
+    /// 同一 hole/board）**逐位相等** → [`Trainer::average_strategy`] 命中同一 infoset 的解。档二′
+    /// 跨街复用用它沿上一街实际动作线为任意候选 `hole` 读 σ（[`cross_street_posterior_range`]）。
+    ///
+    /// `board` 须是该街实际公共牌（flop=3 / turn=4 / river=5；preflop 忽略），否则
+    /// `canonical_observation_id` 内部 `board.len()` 断言 panic。
+    pub fn info_set_for_cards(
+        &self,
+        node_id: NodeId,
+        hole: [Card; 2],
+        board: &[Card],
+    ) -> SimplifiedNlheInfoSet {
+        let street_tag = self.subtree.node(node_id).street;
+        let hand_bucket: u32 = match street_tag {
+            StreetTag::Preflop => u32::from(PreflopLossless169::new().hand_class(hole)),
+            StreetTag::Flop | StreetTag::Turn | StreetTag::River => {
+                let observation = canonical_observation_id(street_tag, board, hole);
+                self.bucket_table
+                    .lookup(street_tag, observation)
+                    .expect("BucketTable::lookup returned None on in-range observation_id")
+            }
+        };
+        pack_info_set_v2(hand_bucket, node_id, street_tag)
     }
 }
 
@@ -1136,6 +1175,217 @@ fn mix_range_with_uniform(range: &mut [f64], holes: &[[Card; 2]], board: &[Card]
     }
 }
 
+/// 「整列塌零」判据（[`cross_street_posterior_range`] 的 ε 地板）：某决策列 σ(实际动作|·) 对所有
+/// 候选 hole 的**最大值** < 此阈 → 视该列无信息（动作映射后整列≈0，贝叶斯更新会把全座 reach 抹零）→
+/// 跳过该列（因子 1）保住其余列信号。设极小（只拦真·全零列，正常小概率仍参与条件化）。
+const CROSS_STREET_DEAD_COLUMN_EPS: f64 = 1e-12;
+
+/// 沿子树**实际动作线**收集逐步决策三元组 `(子树节点 id, 抽象 tag, 决策者)`——
+/// [`navigate_subtree_by_real_actions`] 的「收集每步」版（后者只返回终点节点；档二′-跨街复用要
+/// 每个决策点单独读 σ）。走法逐字同源：tag 以**真栈几何**现算（aggressive 经
+/// [`ActionAbstraction::map_off_tree`]，状态从 `root_real` 沿真实动作 apply 推进），每步校验子树节点
+/// 决策者 == 真实状态当前行动者（失同步 → `Err`）。收集的 tag 恒 ∈ 该节点 `legal_actions`
+/// （由导航定位保证）。
+fn subtree_decisions_on_real_line(
+    subtree: &PublicBettingTree,
+    abs: &StreetActionAbstraction,
+    root_real: &GameState,
+    actions: &[(Action, bool)],
+) -> Result<Vec<(NodeId, AbstractActionTag, PlayerId)>, String> {
+    let mut state = root_real.clone();
+    let mut id = subtree.root_id();
+    let mut out: Vec<(NodeId, AbstractActionTag, PlayerId)> = Vec::with_capacity(actions.len());
+    for (applied, applied_is_all_in) in actions {
+        let node = subtree.node(id);
+        let cur = state
+            .current_player()
+            .ok_or("跨街收集：中途状态无行动者（与动作序不符）")?;
+        if node.player_acting != cur.0 as PlayerId {
+            return Err(format!(
+                "跨街收集：子树节点决策者 {} ≠ 真实行动者 {}（失同步）",
+                node.player_acting, cur.0
+            ));
+        }
+        let has = |t: AbstractActionTag| node.legal_actions.contains(&t);
+        let tag = match applied {
+            Action::Fold => AbstractActionTag::Fold,
+            Action::Check => AbstractActionTag::Check,
+            Action::Call => {
+                if has(AbstractActionTag::Call) {
+                    AbstractActionTag::Call
+                } else if *applied_is_all_in && has(AbstractActionTag::AllIn) {
+                    AbstractActionTag::AllIn
+                } else {
+                    return Err("跨街收集：被动 Call 在子树无对应（结构性 gap）".to_string());
+                }
+            }
+            Action::AllIn => AbstractActionTag::AllIn,
+            Action::Bet { to } | Action::Raise { to } => {
+                let raw = AbstractActionTag::of(&abs.map_off_tree(&state, *to));
+                if *applied_is_all_in || !has(raw) {
+                    AbstractActionTag::AllIn
+                } else {
+                    raw
+                }
+            }
+        };
+        let idx = node
+            .legal_actions
+            .iter()
+            .position(|t| *t == tag)
+            .ok_or_else(|| format!("跨街收集：tag {tag:?} 不在子树节点 {id} 合法集（失同步）"))?;
+        out.push((id, tag, node.player_acting));
+        match node.children[idx] {
+            Child::Decision(next) => id = next,
+            Child::Terminal => {
+                // 末动作收街（收街动作导向子树终局）= 正常：它仍是上一街最后一个决策，已收集。
+                // 后续不应再有同街动作（actions 是上一街**完整**线，收街动作即末元素）。
+                state
+                    .apply(*applied)
+                    .map_err(|e| format!("跨街收集：apply({applied:?}) 非法: {e:?}"))?;
+                return Ok(out);
+            }
+        }
+        state
+            .apply(*applied)
+            .map_err(|e| format!("跨街收集：apply({applied:?}) 非法: {e:?}"))?;
+    }
+    Ok(out)
+}
+
+/// **档二′-跨街复用**（`unanchored_range_design_2026_06_10` §1末「档二′-跨街复用」+ §4）：复用
+/// **上一街已解的真栈子树** `prev` 的 σ，对上一街实际动作线 `prev_within` 做贝叶斯条件化 →
+/// 当前（下一）街 root range **后验**，替代档一退回的「上一街断点前」粗粒度先验。
+///
+/// 后验：`range[seat][h] ∝ prev_root_range[seat][h] × Π_{seat 的上一街决策} σ_prev(action|h)`。
+/// `prev_root_range` = 上一街子树解所**条件化的** root range（[`SubgameNlheGame::ranges`]，已含
+/// preflop 先验 + λ 混合；`None` = uniform）；σ_prev 从 `prev.trainer` 沿上一街子树实际动作线逐点读
+/// （[`SubgameNlheGame::info_set_for_cards`] 子树索引 + [`Trainer::average_strategy`]）。§0.3 双重
+/// 批评（节点错 + 码深错）在此失效——子树真规则真码深 → AllIn 边在真栈下就是真 all-in，σ 答的是
+/// 正确问题，**不需档一「跳过 AllIn-tag」补丁**。DeepStack continual re-solving 的街间 belief 递归
+/// （两边 belief 都用子树 σ 更新 = 与档一同质「对手按真栈均衡打」假设一致，只推深一街，§(d)）。
+///
+/// 守护：
+/// - **身份验证**（拒绝复用错条目，`None` = 不可复用 → 调用方退档一/uniform）：`prev.kind ==
+///   UNANCHORED`（不复用 anchored 解——anchored 时档一已由同步影子覆盖上一街，无需跨街）&&
+///   `prev.hand_seed == hand_seed`（同手）&& `prev` 子树 board 是 `next_root_state.board()` 的**严格
+///   前缀**、长度恰少 1（紧前一街：flop3→turn4 / turn4→river5）。
+/// - **导航失配**（`prev_within` 在子树上走不通）→ `None`（退档一）。
+/// - **card removal（§(e)）**：撞 `next_root_state.board()`（含本街新发牌）的 hole → reach 0。
+/// - **零概率（§(c)）**：某列 σ(action|·) 全 hole < ε（[`CROSS_STREET_DEAD_COLUMN_EPS`]）→ 跳过该
+///   列（ε 地板）；某座后验**全塌** → 该座返回全零（下游 [`SubgameNlheGame::sample_holes_from_ranges`]
+///   退均匀，与 uniform 不差）。
+///
+/// `hero` = range 平滑「不混」座（[`mix_lambda_for_seat`]，对手座按 `lambda` 混 uniform）。`holes` =
+/// [`all_hole_combos`]（与 `prev_root_range` 下标对齐）。
+fn cross_street_posterior_range(
+    prev: &SolvedSubgame,
+    prev_within: &[(Action, bool)],
+    next_root_state: &GameState,
+    holes: &[[Card; 2]],
+    lambda: f64,
+    hero: PlayerId,
+    hand_seed: u64,
+) -> Option<Vec<Vec<f64>>> {
+    // —— 身份验证 ——
+    if prev.kind != KEY_KIND_UNANCHORED || prev.hand_seed != hand_seed {
+        return None;
+    }
+    let prev_game = prev.trainer.game();
+    let prev_root = prev_game.template();
+    let prev_board: Vec<Card> = prev_root.board().to_vec();
+    let next_board = next_root_state.board();
+    // 紧前一街 + 同手 board：prev_board 是 next_board 严格前缀、恰少 1 张。
+    if prev_board.len() + 1 != next_board.len() || next_board[..prev_board.len()] != prev_board[..]
+    {
+        return None;
+    }
+    // —— 沿上一街子树实际动作线收集决策三元组（导航失配 → 退档一）——
+    let decisions =
+        subtree_decisions_on_real_line(prev_game.subtree(), &prev.sub_abs, prev_root, prev_within)
+            .ok()?;
+    let prior = prev_game.ranges(); // 子树解所条件化的 root range（None = uniform）。
+                                    // card-removal 掩码：撞本街 board（含新发牌；prev_board ⊂ next_board，已覆盖上一街撞牌）→ 0。
+    let next_board_set: BTreeSet<u8> = next_board.iter().map(|c| c.to_u8()).collect();
+    let collides = |h: &[Card; 2]| {
+        next_board_set.contains(&h[0].to_u8()) || next_board_set.contains(&h[1].to_u8())
+    };
+    let players = next_root_state.players();
+    let subtree = prev_game.subtree();
+    let mut col = vec![0.0_f64; holes.len()]; // 每决策列 σ(tag|hole) 临时缓冲（复用）。
+    let ranges: Vec<Vec<f64>> = (0..players.len())
+        .map(|seat| {
+            if players[seat].hole_cards.is_none() {
+                return Vec::new(); // 本街已弃牌座：range 不被读。
+            }
+            // prior（reach 起点）：子树解 ranges 有则取该座，否则 uniform（1.0）；撞 board → 0。
+            let mut reach: Vec<f64> = (0..holes.len())
+                .map(|hi| {
+                    if collides(&holes[hi]) {
+                        0.0
+                    } else {
+                        prior
+                            .and_then(|p| p.get(seat))
+                            .and_then(|r| r.get(hi))
+                            .copied()
+                            .unwrap_or(1.0)
+                    }
+                })
+                .collect();
+            // 沿该座上一街决策逐列条件化。
+            for (node, tag, _) in decisions.iter().filter(|(_, _, s)| *s == seat as PlayerId) {
+                let n = subtree.node(*node).legal_actions.len();
+                let idx = subtree
+                    .node(*node)
+                    .legal_actions
+                    .iter()
+                    .position(|t| t == tag)
+                    .expect("收集的 tag 恒 ∈ 节点合法集");
+                let mut max_p = 0.0_f64;
+                for (hi, hole) in holes.iter().enumerate() {
+                    if reach[hi] <= 0.0 {
+                        col[hi] = 0.0; // 已剪枝（撞 board / 前列归零）→ 不查 σ。
+                        continue;
+                    }
+                    let info = prev_game.info_set_for_cards(*node, *hole, &prev_board);
+                    let sigma = prev.trainer.average_strategy(&info);
+                    // 空/坏 σ（该桶未被粗解访问）→ 均匀兜底 1/n（同 estimate_range 容错）。
+                    let p = if sigma.len() == n && sigma[idx].is_finite() && sigma[idx] >= 0.0 {
+                        sigma[idx]
+                    } else {
+                        1.0 / n as f64
+                    };
+                    col[hi] = p;
+                    if p > max_p {
+                        max_p = p;
+                    }
+                }
+                if max_p < CROSS_STREET_DEAD_COLUMN_EPS {
+                    continue; // 整列塌零（ε 地板）→ 跳过该列（因子 1），保其余列信号。
+                }
+                for hi in 0..holes.len() {
+                    reach[hi] *= col[hi];
+                }
+            }
+            // 归一 + 对手座 λ 混 uniform（hero 不混）。全塌（sum==0）→ 全零（下游退均匀）。
+            let sum: f64 = reach.iter().sum();
+            if sum > 0.0 {
+                for r in reach.iter_mut() {
+                    *r /= sum;
+                }
+                mix_range_with_uniform(
+                    &mut reach,
+                    holes,
+                    next_board,
+                    mix_lambda_for_seat(seat as PlayerId, hero, lambda),
+                );
+            }
+            reach
+        })
+        .collect();
+    Some(ranges)
+}
+
 // ===========================================================================
 // within-round solve 缓存（exec 文档 §6 #2：「每轮恰好一个 solve」落到常驻 advisor）
 // ===========================================================================
@@ -1143,9 +1393,16 @@ fn mix_range_with_uniform(range: &mut [f64], holes: &[[Card; 2]], board: &[Card]
 /// 已求解的子博弈（[`SubgameSolveCache`] 的条目）：solve 段产物 + 子树自身抽象——deep_menu /
 /// unanchored 的 mid-round 真实动作导航须用与 solve **同一份**菜单现算 tag（命中时不重算
 /// `deep_menu_for`，直接读存下的）。
+///
+/// `kind` / `hand_seed`：solve 的路径判别（[`KEY_KIND_ANCHORED`]/[`KEY_KIND_UNANCHORED`]）+ 手
+/// 标识（[`search_seed`] 的 hand_seed，不含 actions/board → 同手跨街恒等）。档二′-跨街复用经
+/// [`SubgameSolveCache::current`] 取**上一街**条目时，用它们 + 子树 board 严格前缀验「同手、紧前
+/// 一街、unanchored 解」，拒绝复用错条目（[`cross_street_posterior_range`]）。
 struct SolvedSubgame {
     trainer: EsMccfrTrainer<SubgameNlheGame>,
     sub_abs: StreetActionAbstraction,
+    kind: u8,
+    hand_seed: u64,
 }
 
 /// within-round solve 缓存（容量 1，advisor 常驻进程持有、跨请求传入）。
@@ -1213,6 +1470,14 @@ impl SubgameSolveCache {
 
     fn store(&mut self, key: [u8; 32], solved: SolvedSubgame) {
         self.entry = Some((key, solved));
+    }
+
+    /// 当前条目（**不论 key**），档二′-跨街复用 peek 用：turn 解的 miss 路径上、turn solve 尚未
+    /// store 替换前，缓存仍持上一街（flop）的解（容量 1 + 顺序决策流 + 街间无其他 solve）。调用方
+    /// 须自验身份（同手/紧前一街/unanchored，[`cross_street_posterior_range`]）——`current` 不做
+    /// key 比对，错条目（跨手 / 非紧前街）由 caller 拒绝。不计 hits/misses（非求解查询）。
+    fn current(&self) -> Option<&SolvedSubgame> {
+        self.entry.as_ref().map(|(_, s)| s)
     }
 
     fn entry(&self, key: [u8; 32]) -> Option<&SolvedSubgame> {
@@ -1729,7 +1994,12 @@ fn subgame_search_cached_inner(
             )
         };
         let trainer = solve_subgame(sub, cfg, master)?;
-        Ok(SolvedSubgame { trainer, sub_abs })
+        Ok(SolvedSubgame {
+            trainer,
+            sub_abs,
+            kind: KEY_KIND_ANCHORED,
+            hand_seed,
+        })
     };
     let solved_fresh: SolvedSubgame;
     let solved: &SolvedSubgame = match (cache, key) {
@@ -2202,6 +2472,9 @@ pub fn subgame_search_unanchored(
 /// （[`solve_cache_key`] 的 ranges 项）→ 开/关前缀 reach 自动 cache miss，不会读错均衡。
 /// `None`（默认）= uniform（既有行为，**逐 infoset byte-equal、不改既有调用点**）。**前缀里没有
 /// 当前街之前的决策**（如 limp 池在首动作即失同步 → 前缀为空）→ 退 uniform 路径（byte-equal）。
+///
+/// 档二′-跨街复用见 [`subgame_search_unanchored_cached_cross`]（本函数 = 其 `cross_street = None`
+/// 的薄包装，既有调用点零改动）。
 #[allow(clippy::too_many_arguments)]
 pub fn subgame_search_unanchored_cached(
     cache: Option<&mut SubgameSolveCache>,
@@ -2214,6 +2487,42 @@ pub fn subgame_search_unanchored_cached(
     prefix_reach: Option<PrefixReach<'_>>,
     hand_seed: u64,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    subgame_search_unanchored_cached_cross(
+        cache,
+        auth,
+        root_state,
+        game,
+        within_round,
+        cfg,
+        bucket_override,
+        prefix_reach,
+        None,
+        hand_seed,
+    )
+}
+
+/// [`subgame_search_unanchored_cached`] + **档二′-跨街复用**（`unanchored_range_design` §1末/§4）。
+///
+/// `cross_street`：`Some(prev_within)` 且 `cache` 当前条目是**同手紧前一街的 unanchored 解**
+/// （[`SubgameSolveCache::current`] + [`cross_street_posterior_range`] 自验）→ 复用上一街子树 σ 对
+/// `prev_within`（上一街**完整**真实动作线）条件化得本街后验 range，**覆盖** `prefix_reach`
+/// （跨街后验比档一断点前粗前缀更准——档一在 turn 丢掉 flop 断点后的加注战，§动机）。不可复用
+/// （无缓存 / 跨手 / 非紧前街 / 导航失配 / 上一街解非 unanchored）→ 静默退 `prefix_reach`/uniform
+/// （不破现状）。算出的 ranges 同进 solve 缓存 key → 开/关跨街自动 miss。`None` = 关（= 薄包装的
+/// [`subgame_search_unanchored_cached`]，byte-equal）。
+#[allow(clippy::too_many_arguments)]
+pub fn subgame_search_unanchored_cached_cross(
+    cache: Option<&mut SubgameSolveCache>,
+    auth: &GameState,
+    root_state: &GameState,
+    game: &SimplifiedNlheGame,
+    within_round: &[(Action, bool)],
+    cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
+    prefix_reach: Option<PrefixReach<'_>>,
+    cross_street: Option<&[(Action, bool)]>,
+    hand_seed: u64,
+) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
     subgame_search_unanchored_cached_inner(
         cache,
         auth,
@@ -2223,6 +2532,7 @@ pub fn subgame_search_unanchored_cached(
         cfg,
         bucket_override,
         prefix_reach,
+        cross_street,
         None,
         hand_seed,
         false,
@@ -2246,6 +2556,7 @@ fn subgame_search_unanchored_cached_inner(
     cfg: &SubgameSearchConfig,
     bucket_override: Option<&Arc<BucketTable>>,
     prefix_reach: Option<PrefixReach<'_>>,
+    cross_street: Option<&[(Action, bool)]>,
     actor_override: Option<PlayerId>,
     hand_seed: u64,
     solve_only: bool,
@@ -2304,14 +2615,36 @@ fn subgame_search_unanchored_cached_inner(
     // 真栈锚上下文：entrants = 轮起点 live bitmask；raises_on_street = 0（轮起点）。
     let entrants = live_entrants(root_state);
 
+    // 档二′-跨街复用（unanchored_range_design §1末/§4）：缓存当前条目是**同手紧前一街的
+    // unanchored 解**时（`cross_street = Some(prev_within)` 且 [`SubgameSolveCache::current`] 自验
+    // 通过），复用上一街子树 σ 对 `prev_within`（上一街**完整**真实动作线）条件化 → 本街后验
+    // range，**覆盖**档一前缀 reach（跨街后验比断点前粗前缀准；档一在 turn 会丢掉 flop 断点后的
+    // 加注战，§动机）。不可复用（无缓存 / 跨手 / 非紧前街 / 导航失配 / 上一街解非 unanchored）→
+    // `None`、静默退档一（不破现状）。**在 cache 后续 lookup/store 借用前**算出 owned ranges
+    // （`cache.as_deref()` 只读 peek，借用随 owned 结果落地即释放）。
+    let cross_ranges: Option<Vec<Vec<f64>>> = match (cross_street, cache.as_deref()) {
+        (Some(prev_within), Some(c)) => c.current().and_then(|prev| {
+            cross_street_posterior_range(
+                prev,
+                prev_within,
+                root_state,
+                &all_hole_combos(),
+                cfg.range_uniform_mix,
+                auth_actor,
+                hand_seed,
+            )
+        }),
+        _ => None,
+    };
+
     // 档一前缀 reach（PrefixReach=Some 且有当前街之前的前缀决策）→ 为每个未弃牌座位估 marginal
     // range（new_with_ranges 加权采样底牌），替代 uniform（SubgameNlheGame::new 的 root uniform
     // resample）。只用**当前街之前**的决策（当前街 betting 在子博弈内由 CFR 解，§2）；AllIn-tag
     // 跳过（estimate_range skip_all_in=true，档一 v1）；对手座位做 uniform 平滑（range_uniform_mix），
     // hero（auth_actor）不混（mix_lambda_for_seat）。**前缀里无当前街之前的决策（如 limp 池首动作
     // 即失同步）→ ranges=None 退 uniform 路径**（与既有 byte-equal，不走 new_with_ranges 的均匀
-    // 向量——那是不同采样路径、不 byte-equal）。
-    let ranges_opt: Option<Vec<Vec<f64>>> = prefix_reach.and_then(|pr| {
+    // 向量——那是不同采样路径、不 byte-equal）。跨街复用命中（cross_ranges=Some）→ 直接用它、不算档一。
+    let prefix_ranges: Option<Vec<Vec<f64>>> = prefix_reach.and_then(|pr| {
         let tree = game.tree();
         let cur = root_state.street() as u8;
         let prior: Vec<(NodeId, AbstractActionTag, PlayerId)> = pr
@@ -2357,6 +2690,8 @@ fn subgame_search_unanchored_cached_inner(
                 .collect(),
         )
     });
+    // 跨街复用优先（命中即 owned，覆盖档一）；否则用档一前缀 reach（仍 None → uniform）。
+    let ranges_opt: Option<Vec<Vec<f64>>> = cross_ranges.or(prefix_ranges);
 
     // 子树 solve 实际用表（同 anchored：override 优先，否则 blueprint 表 byte-equal）。
     let sub_table: Arc<BucketTable> =
@@ -2401,7 +2736,12 @@ fn subgame_search_unanchored_cached_inner(
             )
         };
         let trainer = solve_subgame(sub, cfg, master)?;
-        Ok(SolvedSubgame { trainer, sub_abs })
+        Ok(SolvedSubgame {
+            trainer,
+            sub_abs,
+            kind: KEY_KIND_UNANCHORED,
+            hand_seed,
+        })
     };
     let solved_fresh: SolvedSubgame;
     let solved: &SolvedSubgame = match (cache, key) {
@@ -2497,7 +2837,8 @@ pub fn subgame_search_prewarm(
 /// （街起点是 decision 节点）。`prefix_reach`（档一）= `Some` 时用已同步前缀估 range——预热须与
 /// 决策时**算出同一份 ranges** 才能命中 key，故须传 `hero`（range 平滑「不混」座按它算而非街首
 /// 行动者，否则 ranges 不同 → key miss → 预热静默失效；同 anchored [`subgame_search_prewarm`]）。
-/// `prefix_reach = None` = uniform（`hero` 不被读、传任意值即可）。失败无害（同上）。
+/// `prefix_reach = None` = uniform（`hero` 不被读、传任意值即可）。失败无害（同上）。档二′-跨街
+/// 复用见 [`subgame_search_unanchored_prewarm_cross`]（本函数 = 其 `cross_street = None` 薄包装）。
 #[allow(clippy::too_many_arguments)]
 pub fn subgame_search_unanchored_prewarm(
     cache: &mut SubgameSolveCache,
@@ -2505,6 +2846,37 @@ pub fn subgame_search_unanchored_prewarm(
     round_start: &GameState,
     game: &SimplifiedNlheGame,
     prefix_reach: Option<PrefixReach<'_>>,
+    cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
+    hand_seed: u64,
+) -> Result<(), String> {
+    subgame_search_unanchored_prewarm_cross(
+        cache,
+        hero,
+        round_start,
+        game,
+        prefix_reach,
+        None,
+        cfg,
+        bucket_override,
+        hand_seed,
+    )
+}
+
+/// [`subgame_search_unanchored_prewarm`] + **档二′-跨街复用**。`cross_street`：与决策路径同义——
+/// `Some(prev_within)` 且缓存当前条目是同手紧前一街 unanchored 解 → 复用其 σ 算本街后验 range
+/// （覆盖 `prefix_reach`）。**预热须与决策时算出同一份 ranges 才命中 key**：跨街复用读
+/// `cache.current()`（街起点预热时仍持上一街解，turn solve 未 store），与决策路径同一 peek → 同
+/// ranges → 同 key。不可复用 → 退 `prefix_reach`/uniform。`None` = 关（= 薄包装的
+/// [`subgame_search_unanchored_prewarm`]）。
+#[allow(clippy::too_many_arguments)]
+pub fn subgame_search_unanchored_prewarm_cross(
+    cache: &mut SubgameSolveCache,
+    hero: PlayerId,
+    round_start: &GameState,
+    game: &SimplifiedNlheGame,
+    prefix_reach: Option<PrefixReach<'_>>,
+    cross_street: Option<&[(Action, bool)]>,
     cfg: &SubgameSearchConfig,
     bucket_override: Option<&Arc<BucketTable>>,
     hand_seed: u64,
@@ -2518,6 +2890,7 @@ pub fn subgame_search_unanchored_prewarm(
         cfg,
         bucket_override,
         prefix_reach,
+        cross_street,
         Some(hero),
         hand_seed,
         true,
@@ -5615,6 +5988,349 @@ mod tests {
             assert!(
                 utg_skip.iter().any(|w| *w > 0.0 && (*w - w0).abs() > 1e-12),
                 "真桶：Raise 条件化 → UTG range 非 uniform"
+            );
+        }
+    }
+
+    // —— 脱锚搜索档二′：跨街复用（unanchored_range_design §1末/§4）——
+
+    /// off-stack 线推进到 turn：flop（SB/BB check-check）→ turn 起点 + flop **完整**动作线。
+    /// flop 子树解（前缀 reach）缓存后，turn 复用它的 σ 条件化（[`cross_street_posterior_range`]）。
+    fn offstack_turn_after_flop_checks() -> (GameState, GameState, Vec<(Action, bool)>) {
+        let flop = offstack_allin_flop_state();
+        let mut turn = flop.clone();
+        turn.apply(Action::Check).expect("SB check flop");
+        turn.apply(Action::Check).expect("BB check flop");
+        assert_eq!(turn.street(), Street::Turn, "check-check → turn");
+        assert_eq!(turn.current_player(), Some(SeatId(1)), "turn 首行动 = SB");
+        let flop_within = vec![(Action::Check, false), (Action::Check, false)];
+        (flop, turn, flop_within)
+    }
+
+    /// 把 flop unanchored 解（前缀 reach）存进 cache，返回 cache（其 `current()` = flop SolvedSubgame）。
+    fn cache_with_flop_solve(
+        game: &SimplifiedNlheGame,
+        flop: &GameState,
+        cfg: &SubgameSearchConfig,
+        strat: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+        decisions: &[(NodeId, AbstractActionTag, PlayerId)],
+        hand_seed: u64,
+    ) -> SubgameSolveCache {
+        let mut cache = SubgameSolveCache::new();
+        subgame_search_unanchored_cached(
+            Some(&mut cache),
+            flop,
+            flop,
+            game,
+            &[],
+            cfg,
+            None,
+            Some(PrefixReach {
+                strategy: strat,
+                decisions,
+            }),
+            hand_seed,
+        )
+        .expect("flop unanchored solve");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 0),
+            "flop solve = 首 miss"
+        );
+        cache
+    }
+
+    /// 档二′核心：复用上一街（flop）已解子树 σ → turn 后验 range 结构 + card-removal + 可复现。
+    /// flop 子树解缓存后，[`cross_street_posterior_range`] 沿 flop 真实动作线读 σ：未弃牌座
+    /// （SB/BB live + UTG all-in）range 归一、有限、撞 turn board 的 hole 归零；弃牌座空向量。
+    /// 同输入两次 byte-equal（纯函数 / 确定性重派生，gate②）。stub 桶下结构仍成立（值≈ uniform）。
+    #[test]
+    fn cross_street_posterior_structure_and_reproducible() {
+        let game = nolimp_6max_game();
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let decisions = offstack_synced_prefix(&game);
+        let hand_seed = 0xC505_C505;
+        let (flop, turn_root, flop_within) = offstack_turn_after_flop_checks();
+        let cache = cache_with_flop_solve(&game, &flop, &cfg, &strat, &decisions, hand_seed);
+
+        let holes = all_hole_combos();
+        let prev = cache.current().expect("cache 持 flop 解");
+        let r =
+            cross_street_posterior_range(prev, &flop_within, &turn_root, &holes, 0.0, 1, hand_seed)
+                .expect("跨街复用应产 range");
+        assert_eq!(r.len(), turn_root.players().len(), "per-seat range");
+
+        let turn_board: BTreeSet<u8> = turn_root.board().iter().map(|c| c.to_u8()).collect();
+        // 弃牌座（BTN=0 / HJ=4 / CO=5）空；未弃牌座（SB=1 / BB=2 / UTG-allin=3）归一 + card-removed。
+        for folded in [0usize, 4, 5] {
+            assert!(
+                turn_root.players()[folded].hole_cards.is_none() && r[folded].is_empty(),
+                "弃牌座 {folded} → 空 range"
+            );
+        }
+        for live in [1usize, 2, 3] {
+            assert_eq!(r[live].len(), holes.len(), "座 {live} range 对齐 holes");
+            let sum: f64 = r[live].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-9, "座 {live} 须归一，sum={sum}");
+            assert!(
+                r[live].iter().all(|w| w.is_finite() && *w >= 0.0),
+                "座 {live} 权重须有限非负"
+            );
+            for (hi, h) in holes.iter().enumerate() {
+                if turn_board.contains(&h[0].to_u8()) || turn_board.contains(&h[1].to_u8()) {
+                    assert_eq!(
+                        r[live][hi], 0.0,
+                        "座 {live} 撞 turn board 的 hole 须 reach 0"
+                    );
+                }
+            }
+        }
+        // 可复现（同 prev / 同输入）。
+        let r2 =
+            cross_street_posterior_range(prev, &flop_within, &turn_root, &holes, 0.0, 1, hand_seed)
+                .expect("再算一次");
+        assert_eq!(format!("{r:?}"), format!("{r2:?}"), "跨街后验须可复现");
+
+        // 真桶下额外验：未弃牌座 range **非 uniform**（σ + 前缀 reach 逐 hole 变 → 真条件化）。
+        let bucket_path = std::env::var("SUBGAME_CAL_BUCKET_TABLE").unwrap_or_else(|_| {
+            "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin".to_string()
+        });
+        if let Ok(t) = BucketTable::open(std::path::Path::new(&bucket_path)) {
+            let (a, mut rules) = first_small_6max(2);
+            rules.no_open_limp = true;
+            let real_game = SimplifiedNlheGame::new_with_abstraction(
+                Arc::new(t),
+                TableConfig::default_6max_100bb(),
+                a,
+                rules,
+            )
+            .expect("real-table 6max game");
+            let cache_real =
+                cache_with_flop_solve(&real_game, &flop, &cfg, &strat, &decisions, hand_seed);
+            let prev_real = cache_real.current().expect("cache 持 flop 解");
+            let rr = cross_street_posterior_range(
+                prev_real,
+                &flop_within,
+                &turn_root,
+                &holes,
+                0.0,
+                1,
+                hand_seed,
+            )
+            .expect("真桶跨街复用");
+            // SB（座 1）的 range 在非撞牌 hole 上不应全相等（真条件化产物）。
+            let sb = &rr[1];
+            let first = sb
+                .iter()
+                .copied()
+                .find(|w| *w > 0.0)
+                .expect("SB range 有正权");
+            assert!(
+                sb.iter().any(|w| *w > 0.0 && (*w - first).abs() > 1e-12),
+                "真桶：跨街后验 range 非 uniform（σ 逐 hole 变）"
+            );
+        } else {
+            eprintln!("[cross-street] WARN 打不开真桶表 → 跳过非 uniform 验（stub 全归桶 0）");
+        }
+    }
+
+    /// 档二′身份验证：拒绝复用错条目 → `None`（调用方退档一/uniform，不破现状）。
+    /// ①跨手（`hand_seed` 不符）；②`next_root` board 非紧后一街（长度不恰 +1 / 非前缀）。
+    #[test]
+    fn cross_street_posterior_identity_rejects() {
+        let game = nolimp_6max_game();
+        let cfg = SubgameSearchConfig {
+            iterations: 200,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let decisions = offstack_synced_prefix(&game);
+        let hand_seed = 0xC5DD_C5DD;
+        let (flop, turn_root, flop_within) = offstack_turn_after_flop_checks();
+        let cache = cache_with_flop_solve(&game, &flop, &cfg, &strat, &decisions, hand_seed);
+        let holes = all_hole_combos();
+        let prev = cache.current().expect("cache 持 flop 解");
+        // ①跨手 hand_seed → 拒绝（同 prev 但声称是别手）。
+        assert!(
+            cross_street_posterior_range(
+                prev,
+                &flop_within,
+                &turn_root,
+                &holes,
+                0.0,
+                1,
+                hand_seed ^ 0x1
+            )
+            .is_none(),
+            "跨手 hand_seed → None"
+        );
+        // ②next_root = flop 本身（board len 3 == prev board len 3，非 +1）→ 拒绝（非紧后一街）。
+        assert!(
+            cross_street_posterior_range(prev, &flop_within, &flop, &holes, 0.0, 1, hand_seed)
+                .is_none(),
+            "next board 长度非 prev+1 → None"
+        );
+    }
+
+    /// 档二′回退 byte-equal：`cross_street = Some` 但**无缓存可 peek**（cache=None）→ 跨街自验
+    /// 不可达 → 静默退档一前缀 reach，与不传 cross_street（[`subgame_search_unanchored_cached`]）
+    /// 逐字节相同（验收：开 cross-street 但条件不满足时绝不改现状）。
+    #[test]
+    fn cross_street_no_cache_falls_back_byte_equal() {
+        let game = nolimp_6max_game();
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let decisions = offstack_synced_prefix(&game);
+        let hand_seed = 0xC5EE_C5EE;
+        let (_flop, turn_root, flop_within) = offstack_turn_after_flop_checks();
+        // cache=None → cross_street 无处 peek → 退档一前缀 reach。
+        let cross = subgame_search_unanchored_cached_cross(
+            None,
+            &turn_root,
+            &turn_root,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(PrefixReach {
+                strategy: &strat,
+                decisions: &decisions,
+            }),
+            Some(&flop_within),
+            hand_seed,
+        )
+        .expect("cross 无缓存应 Ok");
+        let prefix = subgame_search_unanchored_cached(
+            None,
+            &turn_root,
+            &turn_root,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(PrefixReach {
+                strategy: &strat,
+                decisions: &decisions,
+            }),
+            hand_seed,
+        )
+        .expect("档一应 Ok");
+        assert_eq!(
+            format!("{cross:?}"),
+            format!("{prefix:?}"),
+            "cross_street 无缓存 → 退档一 byte-equal"
+        );
+    }
+
+    /// 档二′「ranges 进 key」（验收 ③）+ **跨街复用真改 range** 的确定性证据：缓存里有 flop 解时，
+    /// turn 跨街复用解出的 range（flop σ 条件化）vs turn 档一前缀 reach 解出的 range，是否进同一
+    /// solve key。序列（共享一个容量-1 缓存）：① flop solve（miss）→ ② turn **跨街复用**（cache 有
+    /// flop → cross 触发；miss、存 turn_cross）→ ③ turn **档一**（cross=None）。真桶下 cross range ≠
+    /// prefix range → 两 turn 解 key 不同 → ③ miss（3 miss / 0 hit）= **跨街复用确实用了 flop σ、改了
+    /// range**；stub 全归桶 0 → cross range == prefix range（退化）→ ③ 命中 ② 的解（2 miss / 1 hit）。
+    #[test]
+    fn cross_street_changes_solve_key() {
+        let bucket_path = std::env::var("SUBGAME_CAL_BUCKET_TABLE").unwrap_or_else(|_| {
+            "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin".to_string()
+        });
+        let (table, is_real): (Arc<BucketTable>, bool) =
+            match BucketTable::open(std::path::Path::new(&bucket_path)) {
+                Ok(t) => (Arc::new(t), true),
+                Err(e) => {
+                    eprintln!(
+                        "[cross-street-key] WARN 打不开真桶表 {bucket_path}: {e:?} → 退 stub"
+                    );
+                    (stub_table(), false)
+                }
+            };
+        eprintln!(
+            "[cross-street-key] bucket_mode={}",
+            if is_real { "real" } else { "stub" }
+        );
+        let (a, mut rules) = first_small_6max(2);
+        rules.no_open_limp = true;
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            table,
+            TableConfig::default_6max_100bb(),
+            a,
+            rules,
+        )
+        .expect("6max game");
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let decisions = offstack_synced_prefix(&game);
+        let hand_seed = 0xC5_4B_45_59; // "..KEY"
+        let (flop, turn, flop_within) = offstack_turn_after_flop_checks();
+        let mk_prefix = || PrefixReach {
+            strategy: &strat,
+            decisions: &decisions,
+        };
+        let mut cache = SubgameSolveCache::new();
+        // ① flop solve（前缀 reach）→ miss 1，cache = flop_unanchored。
+        subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &flop,
+            &flop,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(mk_prefix()),
+            hand_seed,
+        )
+        .expect("flop solve");
+        // ② turn 跨街复用（cache 有 flop → cross 触发覆盖 prefix）→ miss 2，cache = turn_cross。
+        subgame_search_unanchored_cached_cross(
+            Some(&mut cache),
+            &turn,
+            &turn,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(mk_prefix()),
+            Some(&flop_within),
+            hand_seed,
+        )
+        .expect("turn 跨街复用");
+        // ③ turn 档一（cross=None）→ key 取决于 cross range 是否 ≠ prefix range。
+        subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &turn,
+            &turn,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(mk_prefix()),
+            hand_seed,
+        )
+        .expect("turn 档一");
+        if is_real {
+            assert_eq!(
+                (cache.misses(), cache.hits()),
+                (3, 0),
+                "真桶：cross range（flop σ 条件化）≠ prefix range → turn 两解不同 key（跨街复用真改 range）"
+            );
+        } else {
+            assert_eq!(
+                (cache.misses(), cache.hits()),
+                (2, 1),
+                "stub：cross range == prefix range（全归桶 0 退化）→ turn 档一命中跨街解"
             );
         }
     }

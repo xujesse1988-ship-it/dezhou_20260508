@@ -81,9 +81,10 @@ use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::openpoker_hh::hist_to_concrete;
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
-    should_search, subgame_search_cached, subgame_search_prewarm, subgame_search_unanchored_cached,
-    subgame_search_unanchored_prewarm, synced_prefix_decisions, PrefixReach, ResolveRoot,
-    SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
+    should_search, subgame_search_cached, subgame_search_prewarm,
+    subgame_search_unanchored_cached_cross, subgame_search_unanchored_prewarm_cross,
+    synced_prefix_decisions, PrefixReach, ResolveRoot, SearchTrigger, SubgameSearchConfig,
+    SubgameSolveCache,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, HandEvaluator,
@@ -110,6 +111,12 @@ const DEFAULT_SEARCH_RANGE_UNIFORM_MIX: f64 = 0.25;
 /// 臂 / 回退）。注意 §5.1 仍是 n=1 决策级证据 → live 多手 EV 确认仍在进行（开默认是据机制 + 该证据
 /// 拍板，正确性早单测硬证、是守护默认关不会变坏的旗）。
 const DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH: bool = true;
+/// 脱锚搜索**档二′-跨街复用**的生产默认（`unanchored_range_design_2026_06_10` §1末/§4）：上一街本身
+/// unanchored、子树已解时，复用那棵子树的 σ 对上一街实际动作线做贝叶斯条件化 → 本街后验 range，
+/// 替代档一退回的「上一街断点前」粗前缀（档一在 turn 丢掉 flop 断点后的加注战 = §5.1 刚堵的洞下一街
+/// 又开）。**默认关**（`on` 显式开 = live A/B 实验臂）：与档一上线节奏一致（先 A/B 拿证据再拍板默认），
+/// 正确性由 search=None / cross_street=None byte-equal 单测 + 缓存 key 隔离硬证。
+const DEFAULT_SEARCH_UNANCHORED_CROSS_STREET: bool = false;
 /// 搜索墙钟告警阈的建树余量（ms）：最坏单线程建树 ≈ 4-way@20× 宽档 ~2.7s，留 3s。
 const SEARCH_WALL_BUILD_MARGIN_MS: u128 = 3000;
 /// 无 `time_budget`（固定迭代）时的告警阈回落（ms）。
@@ -397,6 +404,12 @@ struct SearchRuntime {
     /// §5.1 实测：真 live off-tree 深码 / 3bet 池上 uniform 先验致 stack-off 漏洞、档一改正确弃牌。
     /// range 估计用 blueprint σ / blueprint 表（同 `bucket_table` 注解：换表不影响 range 估计）。
     unanchored_prefix_reach: bool,
+    /// `--search-unanchored-cross-street`（脱锚搜索**档二′-跨街复用**，`unanchored_range_design`
+    /// §1末/§4）：`on` = 上一街本身 unanchored、子树已解（within-round 缓存当前条目）时，复用其 σ
+    /// 对上一街实际动作线条件化得本街后验 range，覆盖档一前缀 reach（§动机：档一在 turn 丢掉 flop
+    /// 断点后的加注战）。**默认关**（[`DEFAULT_SEARCH_UNANCHORED_CROSS_STREET`]，先 A/B 再拍板）。
+    /// 仅在脱影子搜索（`decide_search_unanchored` / 脱影子预热）+ postflop turn/river 触发。
+    unanchored_cross_street: bool,
 }
 
 /// RoundStart 预热（`Request.prewarm = true`，driver `--search-prewarm` 在街起点、hero 行动
@@ -473,8 +486,9 @@ fn prewarm(
         Ok(t) => SeatId(t),
         Err(reason) => return mk(format!("prewarm:skip:{reason}")),
     };
-    // 真栈轮起点快照（require_my_turn=false：预热正是在 hero 行动前）。
-    let (_auth, round_start, _within) = match build_real_auth(
+    // 真栈轮起点快照（require_my_turn=false：预热正是在 hero 行动前）。`prev_within` = 紧前一街
+    // 完整动作线（档二′-跨街复用，仅脱影子预热分支读）。
+    let (_auth, round_start, _within, prev_within) = match build_real_auth(
         req,
         &solver_cfg,
         scale,
@@ -526,12 +540,17 @@ fn prewarm(
                 strategy: strategy_fn,
                 decisions: d,
             });
-            subgame_search_unanchored_prewarm(
+            // 档二′-跨街复用（默认关）：复用缓存里上一街 unanchored 解的 σ 算本街后验 range。预热须
+            // 与决策时算出同一份 ranges 才命中 key——两路同读 `cache.current()`（街起点预热时仍持上一
+            // 街解）+ 同 `prev_within` → 同 ranges。off / 缓存非紧前街 → 自验退档一（不破现状）。
+            let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
+            subgame_search_unanchored_prewarm_cross(
                 solve_cache,
                 hero_pid,
                 &round_start,
                 game,
                 prefix_reach,
+                cross_street,
                 scfg,
                 rt.bucket_table.as_ref(),
                 hand_seed,
@@ -837,7 +856,8 @@ fn decide(
         let rt = search.expect("want_search ⇒ search.is_some()");
         let scfg = &rt.cfg;
         // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ 安全降级。
-        let (auth, round_start, within) = match build_real_auth(
+        // 锚定搜索路径（lockstep Ok）：上一街也同步、无 unanchored 子树可复用 → 不取 prev_within。
+        let (auth, round_start, within, _prev_within) = match build_real_auth(
             req,
             &solver_cfg,
             scale,
@@ -1172,7 +1192,7 @@ fn preflop_pot_odds(
         true,
     )
     .ok()
-    .and_then(|(auth, _, _)| pot_odds_from_auth(&auth, solver_cfg))
+    .and_then(|(auth, _, _, _)| pot_odds_from_auth(&auth, solver_cfg))
 }
 
 /// 决策阶段兜底动作 + 「别扔好牌」地板（用户 2026-06-14；2026-06-15 加底池赔率 floor）。
@@ -1311,14 +1331,19 @@ fn limp_heuristic(req: &Request, hole: [Card; 2]) -> Option<Response> {
     })
 }
 
-/// 缺口②：在**真码深** config 上重放本手 → 注入真实牌，产 `(auth, round_start, within)` 喂
-/// [`subgame_search`] / [`subgame_search_unanchored`]。`auth` = 当前决策点真栈态（query_at 索引
+/// 缺口②：在**真码深** config 上重放本手 → 注入真实牌，产 `(auth, round_start, within, prev_within)`
+/// 喂 [`subgame_search`] / [`subgame_search_unanchored`]。`auth` = 当前决策点真栈态（query_at 索引
 /// hero 真桶用）；`round_start` = 当前街起点快照（[`ResolveRoot::RoundStart`] 子树根）；`within` =
 /// **当前街**真实动作序 `(动作, 是否令行动者 all-in)`（街变清空；脱影子路径的 within-round 导航
-/// 输入，锚定路径不读）。重放对不上 / 注入失败 → `Err`（caller 安全降级）。
+/// 输入，锚定路径不读）；`prev_within` = **紧前一街完整**真实动作线（**含收街动作**——档二′-跨街复用
+/// 沿它在上一街子树读 σ，[`cross_street_posterior_range`]）。重放对不上 / 注入失败 → `Err`
+/// （caller 安全降级）。
 ///
 /// `require_my_turn`：决策路径 `true`（重放末尾须轮到 hero，旧行为）；[`prewarm`] 传 `false`
 /// （预热在 hero 行动**前**，轮到的是该街首行动者——只取 `round_start` 快照）。
+///
+/// **`within` / `round_start` / `auth` 输出与加 `prev_within` 前逐字节相同**（街变分支只多「收街动作
+/// 补进 within 再 `take` 进 prev_within」，`within` 仍以空收尾、`round_start` 仍重快照）。
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn build_real_auth(
     req: &Request,
@@ -1329,7 +1354,15 @@ fn build_real_auth(
     hole: [Card; 2],
     board: &[Card],
     require_my_turn: bool,
-) -> Result<(GameState, GameState, Vec<(Action, bool)>), String> {
+) -> Result<
+    (
+        GameState,
+        GameState,
+        Vec<(Action, bool)>,
+        Vec<(Action, bool)>,
+    ),
+    String,
+> {
     let real_cfg = real_stacks_config(req, solver_cfg, scale, smap)?;
 
     let mut auth = GameState::new(&real_cfg, REAL_REPLAY_SEED);
@@ -1337,6 +1370,8 @@ fn build_real_auth(
     let mut round_start = auth.clone();
     let mut rs_street = auth.street();
     let mut within: Vec<(Action, bool)> = Vec::new();
+    // 紧前一街**完整**动作线（含收街动作）：街变时由当前 within + 收街动作组成（档二′-跨街复用）。
+    let mut prev_within: Vec<(Action, bool)> = Vec::new();
     // 短桌幻影 fold + 真实动作走同一条重放（[`seat_map`]；幻影 fold 在 preflop 开局，
     // 不可能收街——盲注两座还没行动，within 推进与真实动作同口径即可）。
     let phantom = smap.phantoms.iter().map(|&t| (t, "fold".to_string(), None));
@@ -1369,10 +1404,12 @@ fn build_real_auth(
         }
         let became_all_in = auth.players()[actor as usize].status == poker::PlayerStatus::AllIn;
         if auth.street() != rs_street {
-            // 收街动作属上一街：清空 within（新街从空动作序开始）、重 snapshot。
+            // 收街动作属上一街：补进 within 凑齐上一街**完整**线 → take 进 prev_within（within 随之
+            // 空，与旧 `within.clear()` 同收尾）、重 snapshot。
+            within.push((concrete, became_all_in));
+            prev_within = std::mem::take(&mut within);
             round_start = auth.clone();
             rs_street = auth.street();
-            within.clear();
         } else {
             within.push((concrete, became_all_in));
         }
@@ -1386,7 +1423,7 @@ fn build_real_auth(
     // 注入真实牌（hero hole + board）到当前点 + 街起点（subgame solve / query_at 读真牌）。
     let auth = auth.inject_external_cards(my_seat_solver, hole, board)?;
     let round_start = round_start.inject_external_cards(my_seat_solver, hole, board)?;
-    Ok((auth, round_start, within))
+    Ok((auth, round_start, within, prev_within))
 }
 
 /// 缺口②续（v1 边界①收口）：**影子失同步区**的脱影子搜索。off-stack all-in 线上 100BB 影子 /
@@ -1422,8 +1459,9 @@ fn decide_search_unanchored(
     solve_cache: &mut SubgameSolveCache,
 ) -> Response {
     let scfg = &rt.cfg;
-    // 真栈重放（auth / 轮起点快照 / 当前街真实动作序）。建不了 = §2.3「建不了树」→ 安全降级。
-    let (auth, round_start, within) = match build_real_auth(
+    // 真栈重放（auth / 轮起点快照 / 当前街真实动作序 / 紧前一街完整动作线）。建不了 = §2.3「建不了
+    // 树」→ 安全降级。`prev_within` = 档二′-跨街复用沿它在上一街子树读 σ（默认关）。
+    let (auth, round_start, within, prev_within) = match build_real_auth(
         req,
         solver_cfg,
         scale,
@@ -1465,9 +1503,13 @@ fn decide_search_unanchored(
         strategy: strategy_fn,
         decisions: d,
     });
+    // 档二′-跨街复用（默认关）：上一街本身 unanchored、子树已解（within-round 缓存当前条目）时，复用其
+    // σ 对 `prev_within`（上一街完整真实动作线）条件化得本街后验 range，覆盖档一前缀 reach。off / 缓存
+    // 非紧前街 unanchored 解 → 自验退档一（不破现状）。算出 ranges 进 solve key → 开/关自动 miss。
+    let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
     let t0 = Instant::now();
     let misses_before = solve_cache.misses();
-    let dist = match subgame_search_unanchored_cached(
+    let dist = match subgame_search_unanchored_cached_cross(
         Some(solve_cache), // within-round solve 缓存（同锚定路径；kind 进 key、两路不串条目）。
         &auth,
         &round_start,
@@ -1476,6 +1518,7 @@ fn decide_search_unanchored(
         scfg,
         rt.bucket_table.as_ref(), // --search-bucket-table：子树独立桶表（None = blueprint 表）。
         prefix_reach,
+        cross_street,
         hand_seed,
     ) {
         Ok(d) => d,
@@ -1663,6 +1706,10 @@ struct Args {
     /// 先验从 uniform 升级为已同步前缀 reach。**默认 `true`**（[`DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH`]，
     /// §5.1 实测拍板）；`off` 显式关（A/B 对照臂 / 回退）。
     search_unanchored_prefix_reach: bool,
+    /// `--search-unanchored-cross-street on|off`（档二′-跨街复用，[`SearchRuntime`] doc）：复用上一街
+    /// 已解 unanchored 子树 σ 算本街后验 range。**默认 `false`**（[`DEFAULT_SEARCH_UNANCHORED_CROSS_STREET`]，
+    /// 先 A/B 再拍板）；`on` 显式开（live 实验臂）。
+    search_unanchored_cross_street: bool,
 }
 
 #[derive(Serialize)]
@@ -1754,6 +1801,7 @@ fn run() -> Result<(), String> {
                 cfg,
                 bucket_table,
                 unanchored_prefix_reach: args.search_unanchored_prefix_reach,
+                unanchored_cross_street: args.search_unanchored_cross_street,
             })
         }
         None => None,
@@ -1769,8 +1817,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} bucket_table={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} bucket_table={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
     }
@@ -1863,6 +1911,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_bucket_table: Option<PathBuf> = None;
     let mut search_solve_threads: Option<usize> = None;
     let mut search_unanchored_prefix_reach: Option<bool> = None;
+    let mut search_unanchored_cross_street: Option<bool> = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -1946,6 +1995,19 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     }
                 });
             }
+            "--search-unanchored-cross-street" => {
+                // 默认关（DEFAULT_SEARCH_UNANCHORED_CROSS_STREET）；取值 on|off 显式覆盖（A/B 用）。
+                let v = next_val(&mut it, &arg)?;
+                search_unanchored_cross_street = Some(match v.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(format!(
+                            "--search-unanchored-cross-street 须 on|off，得 {other}"
+                        ))
+                    }
+                });
+            }
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -1995,6 +2057,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_bucket_table.is_some()
             || search_solve_threads.is_some()
             || search_unanchored_prefix_reach.is_some()
+            || search_unanchored_cross_street.is_some()
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
         }
@@ -2011,6 +2074,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         // 默认开（§5.1 实测拍板）；--search-unanchored-prefix-reach off 显式关。
         search_unanchored_prefix_reach: search_unanchored_prefix_reach
             .unwrap_or(DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH),
+        // 默认关（先 A/B）；--search-unanchored-cross-street on 显式开。
+        search_unanchored_cross_street: search_unanchored_cross_street
+            .unwrap_or(DEFAULT_SEARCH_UNANCHORED_CROSS_STREET),
     })
 }
 
@@ -2035,6 +2101,7 @@ mod tests {
             cfg,
             bucket_table: None,
             unanchored_prefix_reach: false,
+            unanchored_cross_street: false,
         }
     }
 
@@ -2044,6 +2111,17 @@ mod tests {
             cfg,
             bucket_table: None,
             unanchored_prefix_reach: true,
+            unanchored_cross_street: false,
+        }
+    }
+
+    /// 同 [`rt_prefix_reach`] 但**加开**档二′-跨街复用（脱影子 range 先验 = 上一街已解子树 σ，A/B 用）。
+    fn rt_cross_street(cfg: SubgameSearchConfig) -> SearchRuntime {
+        SearchRuntime {
+            cfg,
+            bucket_table: None,
+            unanchored_prefix_reach: true,
+            unanchored_cross_street: true,
         }
     }
 
@@ -3371,6 +3449,34 @@ mod tests {
         }
     }
 
+    /// [`offstack_allin_req`] **续打到 turn**：flop（SB=1 / BB=2 check-check）走完 → turn（board
+    /// 4 张、SB 首行动）。flop 本身在 100BB 影子上失同步（off-stack）→ flop 解是 unanchored；
+    /// turn 决策时档二′-跨街复用沿 `prev_within`（flop check-check）读上一街子树 σ。
+    fn offstack_allin_turn_req() -> Request {
+        let mut req = offstack_allin_req();
+        // flop 三张 + turn 一张（与 hero hole Ah/Kd / 各家牌不撞）。
+        req.board = vec!["7h".into(), "2c".into(), "Ks".into(), "9d".into()];
+        req.actions.push(HistAction {
+            seat: 1,
+            action: "check".into(),
+            to: None,
+        }); // SB check flop
+        req.actions.push(HistAction {
+            seat: 2,
+            action: "check".into(),
+            to: None,
+        }); // BB check flop
+            // turn 起点：SB 首行动、未起注（can_check）。max_raise = SB turn 剩余栈（4000−1200=2800op）。
+        req.valid = ValidActions {
+            can_check: true,
+            can_call: false,
+            can_raise: true,
+            min_raise: Some(20),
+            max_raise: Some(2800),
+        };
+        req
+    }
+
     /// 端到端钉缺口②续：off-stack all-in 线上 ①search=None（旧路径）确证 lockstep 失同步 →
     /// 兜底（这条线在 100BB 影子上**拿不到 node_id**，测试前提）；②`--search` 开 → 脱影子真栈
     /// 搜索接管（source=search:unanchored、动作合法、同 seed 可复现）。
@@ -4281,5 +4387,101 @@ mod tests {
         assert!(parse(&["--search", "--search-unanchored-prefix-reach", "maybe"]).is_err());
         // 拒绝静默 guard：设了 flag 未开 --search → Err。
         assert!(parse(&["--search-unanchored-prefix-reach", "off"]).is_err());
+    }
+
+    /// `--search-unanchored-cross-street on|off`（档二′-跨街复用，默认关 / 先 A/B）：默认关、on 显式
+    /// 开、off 显式关、坏值拒收、未开 --search 拒收。
+    #[test]
+    fn parse_args_unanchored_cross_street() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        // 默认关（与档一上线节奏一致：先 A/B 再拍板）。
+        let a = parse(&["--search"]).expect("parse Ok");
+        assert!(!a.search_unanchored_cross_street, "默认关");
+        // on 显式开（live 实验臂）。
+        let a = parse(&["--search", "--search-unanchored-cross-street", "on"]).expect("parse Ok");
+        assert!(a.search_unanchored_cross_street, "on 应开");
+        // off 显式关。
+        let a = parse(&["--search", "--search-unanchored-cross-street", "off"]).expect("parse Ok");
+        assert!(!a.search_unanchored_cross_street, "off 应关");
+        // 坏值拒收。
+        assert!(parse(&["--search", "--search-unanchored-cross-street", "maybe"]).is_err());
+        // 拒绝静默 guard：设了 flag 未开 --search → Err。
+        assert!(parse(&["--search-unanchored-cross-street", "on"]).is_err());
+    }
+
+    /// 档二′-跨街复用端到端（脱影子 `decide` 路径，trigger=AllPostflop 才搜 turn）：先 flop 决策解
+    /// flop 子树入缓存 → turn 决策复用其 σ（`build_real_auth` 重建 `prev_within` = flop 完整动作线 →
+    /// `decide_search_unanchored` → `subgame_search_unanchored_cached_cross`）。stub 桶下钉 plumbing：
+    /// 两决策均 `search:unanchored`、无 panic、同序列可复现（gate②）。真桶级「复用真改 range」由
+    /// [`cross_street_changes_solve_key`](poker::training::subgame) 在 subgame 层确定性钉死。
+    #[test]
+    fn cross_street_decide_flop_then_turn() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::AllPostflop, // 档二′ 在 turn/river → 须 AllPostflop（FlopFirstUnraised 不搜 turn）。
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let flop_req = offstack_allin_req();
+        let turn_req = offstack_allin_turn_req();
+        let seed = 0xC505_0FF5;
+        // 序列：flop 决策（解 flop 入缓存）→ turn 决策（跨街复用 flop 解）。
+        let mut cache = SubgameSolveCache::new();
+        let r_flop = decide(
+            &game,
+            &abs,
+            &uniform,
+            &flop_req,
+            seed,
+            Some(&rt_cross_street(scfg)),
+            &mut cache,
+        );
+        assert_eq!(
+            r_flop.source, "search:unanchored",
+            "flop 脱影子搜索：{r_flop:?}"
+        );
+        let r_turn = decide(
+            &game,
+            &abs,
+            &uniform,
+            &turn_req,
+            seed,
+            Some(&rt_cross_street(scfg)),
+            &mut cache,
+        );
+        assert_eq!(
+            r_turn.source, "search:unanchored",
+            "turn 脱影子搜索（跨街复用）：{r_turn:?}"
+        );
+        // 可复现：另起缓存跑同序列 → 同 turn 决策（gate②，跨街复用是请求的确定性函数）。
+        let mut cache2 = SubgameSolveCache::new();
+        let _ = decide(
+            &game,
+            &abs,
+            &uniform,
+            &flop_req,
+            seed,
+            Some(&rt_cross_street(scfg)),
+            &mut cache2,
+        );
+        let r_turn2 = decide(
+            &game,
+            &abs,
+            &uniform,
+            &turn_req,
+            seed,
+            Some(&rt_cross_street(scfg)),
+            &mut cache2,
+        );
+        assert_eq!(r_turn, r_turn2, "跨街复用 turn 决策须可复现");
     }
 }
