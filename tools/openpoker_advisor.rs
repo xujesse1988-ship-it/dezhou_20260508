@@ -114,9 +114,15 @@ const DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH: bool = true;
 /// 脱锚搜索**档二′-跨街复用**的生产默认（`unanchored_range_design_2026_06_10` §1末/§4）：上一街本身
 /// unanchored、子树已解时，复用那棵子树的 σ 对上一街实际动作线做贝叶斯条件化 → 本街后验 range，
 /// 替代档一退回的「上一街断点前」粗前缀（档一在 turn 丢掉 flop 断点后的加注战 = §5.1 刚堵的洞下一街
-/// 又开）。**默认关**（`on` 显式开 = live A/B 实验臂）：与档一上线节奏一致（先 A/B 拿证据再拍板默认），
-/// 正确性由 search=None / cross_street=None byte-equal 单测 + 缓存 key 隔离硬证。
-const DEFAULT_SEARCH_UNANCHORED_CROSS_STREET: bool = false;
+/// 又开）。**默认开**（与档一 [`DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH`] 同等证据等级拍板）：决策级
+/// A/B（`six_max_cross_street_ab`，构造 deep off-tree flop→turn 加注战线、真 blueprint + 真桶、受控
+/// 配对差仅 root range 不同）实测 ON 显著且按 §动机方向改 turn 决策——mean TV 0.27–0.41 / argmax 翻转
+/// 29–61% / ~100% 触发，对菜单粒度 / seed / 迭代数（4000 iter 不洗掉）皆稳；方向 = ON 把档一的近乎
+/// auto-jam 收成随牌力分化的极化策略（中等/摊牌牌从梭哈拉回、纯空气构造极化诈唬）。EV「更好」结构性
+/// 不可得（自对弈触发率~0、live 功效太弱，§4 已钉），故据「强机制 + 决策级方向一致」开默认（同档一）。
+/// `--search-unanchored-cross-street off` 显式关（live A/B 对照臂 / 回退）；正确性由 search=None /
+/// cross_street=None byte-equal 单测 + 缓存 key 隔离 + prev-slot 一致性硬证（默认开不会变坏的旗）。
+const DEFAULT_SEARCH_UNANCHORED_CROSS_STREET: bool = true;
 /// 搜索墙钟告警阈的建树余量（ms）：最坏单线程建树 ≈ 4-way@20× 宽档 ~2.7s，留 3s。
 const SEARCH_WALL_BUILD_MARGIN_MS: u128 = 3000;
 /// 无 `time_budget`（固定迭代）时的告警阈回落（ms）。
@@ -407,7 +413,8 @@ struct SearchRuntime {
     /// `--search-unanchored-cross-street`（脱锚搜索**档二′-跨街复用**，`unanchored_range_design`
     /// §1末/§4）：`on` = 上一街本身 unanchored、子树已解（within-round 缓存当前条目）时，复用其 σ
     /// 对上一街实际动作线条件化得本街后验 range，覆盖档一前缀 reach（§动机：档一在 turn 丢掉 flop
-    /// 断点后的加注战）。**默认关**（[`DEFAULT_SEARCH_UNANCHORED_CROSS_STREET`]，先 A/B 再拍板）。
+    /// 断点后的加注战）。**默认开**（[`DEFAULT_SEARCH_UNANCHORED_CROSS_STREET`]，决策级 A/B + 机制
+    /// 拍板，同档一）；`off` 显式关 = 退档一（live A/B 对照臂 / 回退）。
     /// 仅在脱影子搜索（`decide_search_unanchored` / 脱影子预热）+ postflop turn/river 触发。
     unanchored_cross_street: bool,
 }
@@ -1707,8 +1714,8 @@ struct Args {
     /// §5.1 实测拍板）；`off` 显式关（A/B 对照臂 / 回退）。
     search_unanchored_prefix_reach: bool,
     /// `--search-unanchored-cross-street on|off`（档二′-跨街复用，[`SearchRuntime`] doc）：复用上一街
-    /// 已解 unanchored 子树 σ 算本街后验 range。**默认 `false`**（[`DEFAULT_SEARCH_UNANCHORED_CROSS_STREET`]，
-    /// 先 A/B 再拍板）；`on` 显式开（live 实验臂）。
+    /// 已解 unanchored 子树 σ 算本街后验 range。**默认 `true`**（[`DEFAULT_SEARCH_UNANCHORED_CROSS_STREET`]，
+    /// 决策级 A/B + 机制拍板，同档一）；`off` 显式关（A/B 对照臂 / 回退）。
     search_unanchored_cross_street: bool,
 }
 
@@ -1996,7 +2003,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 });
             }
             "--search-unanchored-cross-street" => {
-                // 默认关（DEFAULT_SEARCH_UNANCHORED_CROSS_STREET）；取值 on|off 显式覆盖（A/B 用）。
+                // 默认开（DEFAULT_SEARCH_UNANCHORED_CROSS_STREET）；取值 on|off 显式覆盖（A/B 用）。
                 let v = next_val(&mut it, &arg)?;
                 search_unanchored_cross_street = Some(match v.as_str() {
                     "on" | "true" | "1" => true,
@@ -2074,7 +2081,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         // 默认开（§5.1 实测拍板）；--search-unanchored-prefix-reach off 显式关。
         search_unanchored_prefix_reach: search_unanchored_prefix_reach
             .unwrap_or(DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH),
-        // 默认关（先 A/B）；--search-unanchored-cross-street on 显式开。
+        // 默认开（决策级 A/B + 机制拍板，同档一）；--search-unanchored-cross-street off 显式关。
         search_unanchored_cross_street: search_unanchored_cross_street
             .unwrap_or(DEFAULT_SEARCH_UNANCHORED_CROSS_STREET),
     })
@@ -4389,8 +4396,8 @@ mod tests {
         assert!(parse(&["--search-unanchored-prefix-reach", "off"]).is_err());
     }
 
-    /// `--search-unanchored-cross-street on|off`（档二′-跨街复用，默认关 / 先 A/B）：默认关、on 显式
-    /// 开、off 显式关、坏值拒收、未开 --search 拒收。
+    /// `--search-unanchored-cross-street on|off`（档二′-跨街复用，决策级 A/B + 机制拍板默认开）：
+    /// 默认开、on 显式开、off 显式关、坏值拒收、未开 --search 拒收。
     #[test]
     fn parse_args_unanchored_cross_street() {
         let parse = |extra: &[&str]| {
@@ -4400,13 +4407,13 @@ mod tests {
                 .map(|s| s.to_string());
             parse_args_from(argv)
         };
-        // 默认关（与档一上线节奏一致：先 A/B 再拍板）。
+        // 默认开（决策级 A/B + 机制拍板，同档一）。
         let a = parse(&["--search"]).expect("parse Ok");
-        assert!(!a.search_unanchored_cross_street, "默认关");
-        // on 显式开（live 实验臂）。
+        assert!(a.search_unanchored_cross_street, "默认开");
+        // on 显式开。
         let a = parse(&["--search", "--search-unanchored-cross-street", "on"]).expect("parse Ok");
         assert!(a.search_unanchored_cross_street, "on 应开");
-        // off 显式关。
+        // off 显式关（A/B 对照臂 / 回退）。
         let a = parse(&["--search", "--search-unanchored-cross-street", "off"]).expect("parse Ok");
         assert!(!a.search_unanchored_cross_street, "off 应关");
         // 坏值拒收。
