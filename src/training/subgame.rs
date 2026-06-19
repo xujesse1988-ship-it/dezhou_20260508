@@ -50,6 +50,7 @@ use crate::training::nlhe::{
 use crate::training::nlhe_betting_tree::{
     deep_menu_for, AbstractActionTag, BettingAbstractionRules, Child, NodeId, PublicBettingTree,
 };
+use crate::training::opponent_profile::OpponentProfile;
 use crate::training::sampling::sample_discrete;
 use crate::training::subgame_leaf_value::LeafValueTables;
 use crate::training::trainer::{EsMccfrTrainer, Trainer};
@@ -1173,6 +1174,174 @@ fn mix_range_with_uniform(range: &mut [f64], holes: &[[Card; 2]], board: &[Card]
     for (w, ok) in range.iter_mut().zip(valid.iter()) {
         *w = if *ok { (1.0 - lambda) * *w + u } else { 0.0 };
     }
+}
+
+// ===========================================================================
+// 叠加剥削 Tier 2：翻前 range 宽度先验（`exploit_strategy_design_2026_06_14` 实现）
+// ===========================================================================
+
+/// 翻前宽度先验 α 上限（剥削强度旋钮）。设计草案 §2 强调剥削须建在**对手真实宽度**正确轴上、
+/// 不是单纯调大 λ（λ 往激进推会「空气 73% jam」，`project_6max_search_range_prior_overexploit`）；
+/// 这里混合朝**观测宽度分布**而非 uniform，但仍 clamp 防过剥削。
+const EXPLOIT_ALPHA_CAP: f64 = 0.8;
+/// 宽度目标分布里「非 top-VPIP」combo 的相对地板（松手偶尔也玩 trash → 不硬清零，留尾部保险）。
+const EXPLOIT_WIDTH_FLOOR: f64 = 0.05;
+
+/// 剥削先验输入（决策路径传 [`subgame_search_unanchored_cached_cross_exploit`]）：per-solver-seat
+/// 画像（下标 = solver seat；`None` = 该座不剥削 / 未收敛 / 是 hero）+ 混合强度 α。
+#[derive(Clone, Copy)]
+pub struct ExploitPrior<'a> {
+    pub profiles: &'a [Option<OpponentProfile>],
+    pub alpha: f64,
+}
+
+/// Chen 起手分（翻前宽度 tilt 用的强度序；设计草案 §1 摊牌 Chen 同口径）。返回值仅用于**排序**
+/// （取观测 VPIP 宽度内的 top-k combo），不需与教科书逐分吻合。`rank`：Two=0 .. Ace=12。
+fn chen_score(hole: [Card; 2]) -> f64 {
+    let card_point = |r: u8| -> f64 {
+        match r {
+            12 => 10.0,                      // A
+            11 => 8.0,                       // K
+            10 => 7.0,                       // Q
+            9 => 6.0,                        // J
+            8 => 5.0,                        // T
+            r => (f64::from(r) + 2.0) / 2.0, // 2..9 → 1.0..4.5（face/2）
+        }
+    };
+    let r0 = hole[0].rank() as u8;
+    let r1 = hole[1].rank() as u8;
+    let (hi, lo) = if r0 >= r1 { (r0, r1) } else { (r1, r0) };
+    let suited = hole[0].suit() == hole[1].suit();
+    let mut s = card_point(hi);
+    if hi == lo {
+        s = (s * 2.0).max(5.0); // 对子：高牌分 ×2，最低 5
+    } else {
+        if suited {
+            s += 2.0;
+        }
+        let gap = i32::from(hi) - i32::from(lo) - 1; // connectors → gap 0
+        s -= match gap {
+            0 => 0.0,
+            1 => 1.0,
+            2 => 2.0,
+            3 => 4.0,
+            _ => 5.0,
+        };
+        if gap <= 1 && hi < 10 {
+            s += 1.0; // 顺子潜力：gap≤1 且两张都 < Q
+        }
+    }
+    s
+}
+
+/// 把对手子博弈 root range 朝其**观测翻前宽度**凸混合（叠加剥削 Tier 2，设计草案 §2/§4）。
+///
+/// - `ranges_opt = None`（无 GTO range 信号，如 limp 池首动作即 desync）→ **不剥削**（v1 限制，
+///   返回 None 维持 uniform 采样路径）。
+/// - `Some(r)` → 对每个**已收敛对手座**（`profiles[seat]=Some`、非 hero、非弃牌）把 `r[seat]` 与
+///   「VPIP 宽度分布」`w` 凸混合：`r'=(1−α)·r_norm+α·w`，`w` = 按 Chen 序取 top `ceil(vpip·n_valid)`
+///   个 combo 权 1、其余 [`EXPLOIT_WIDTH_FLOOR`]，归一。
+///
+/// 方向：高 VPIP→`w` 含更多弱 combo→对手 range 更宽更弱→solver 自动薄价值 / 少诈唬；低 VPIP→
+/// `w` 收窄到强牌→solver 多弃多偷（设计草案 §2/§4 意图）。
+///
+/// 安全：α clamp [0, [`EXPLOIT_ALPHA_CAP`]]；`w` 自带地板 → 永不过窄 / NaN；card-removal（撞 board
+/// 两侧皆 0）保持；**hero 座永不动**（复用 [`mix_lambda_for_seat`] 语义）。结果进 `solve_cache_key`
+/// （同 ranges）→ 开/关/画像更新自动 cache-miss、不串均衡。
+pub fn apply_exploit_width_prior(
+    ranges_opt: Option<Vec<Vec<f64>>>,
+    profiles: &[Option<OpponentProfile>],
+    hero: PlayerId,
+    holes: &[[Card; 2]],
+    board: &[Card],
+    alpha: f64,
+) -> Option<Vec<Vec<f64>>> {
+    let alpha = alpha.clamp(0.0, EXPLOIT_ALPHA_CAP);
+    let mut ranges = ranges_opt?; // None → 不剥削（v1）
+    if alpha <= 0.0 || profiles.iter().all(Option::is_none) {
+        return Some(ranges); // 无强度 / 无收敛对手 → 恒等
+    }
+    let board_set: BTreeSet<u8> = board.iter().map(|c| c.to_u8()).collect();
+    let valid: Vec<bool> = holes
+        .iter()
+        .map(|h| !board_set.contains(&h[0].to_u8()) && !board_set.contains(&h[1].to_u8()))
+        .collect();
+    let n_valid = valid.iter().filter(|v| **v).count();
+    if n_valid == 0 {
+        return Some(ranges);
+    }
+    // valid combo 按 Chen 降序（tie → combo idx 升序，确定性 → 同画像同 board 必同 w）。
+    let scores: Vec<f64> = holes.iter().map(|&h| chen_score(h)).collect();
+    let mut order: Vec<usize> = (0..holes.len()).filter(|&i| valid[i]).collect();
+    order.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    for (seat, slot) in ranges.iter_mut().enumerate() {
+        if seat as PlayerId == hero {
+            continue; // hero range 不动
+        }
+        let Some(prof) = profiles.get(seat).copied().flatten() else {
+            continue; // 未收敛 / 无画像 → 不剥削该座
+        };
+        if slot.len() != holes.len() {
+            continue; // 弃牌座（空 vec）/ 维度不符 → 跳过
+        }
+        tilt_seat_to_width(slot, prof.vpip, &valid, n_valid, &order, alpha);
+    }
+    Some(ranges)
+}
+
+/// 单座内核（[`apply_exploit_width_prior`]）：把 `r` 与 top-VPIP 宽度分布 `w` 凸混合。`order` =
+/// valid combo 按 Chen 降序的下标。`r` 全零（无信号）→ 起点取 uniform-over-valid（与下游 resample
+/// 等价，改读 tilt 后向量）。撞 board combo 两侧皆 0 → 保持 0（card-removal）。
+fn tilt_seat_to_width(
+    r: &mut [f64],
+    vpip: f64,
+    valid: &[bool],
+    n_valid: usize,
+    order: &[usize],
+    alpha: f64,
+) {
+    let k = ((vpip.clamp(0.0, 1.0) * n_valid as f64).ceil() as usize).clamp(1, n_valid);
+    let mut w = vec![0.0_f64; r.len()];
+    for (rank_idx, &combo) in order.iter().enumerate() {
+        w[combo] = if rank_idx < k {
+            1.0
+        } else {
+            EXPLOIT_WIDTH_FLOOR
+        };
+    }
+    let w_sum: f64 = w.iter().sum();
+    if w_sum <= 0.0 {
+        return;
+    }
+    for x in w.iter_mut() {
+        *x /= w_sum;
+    }
+    // r_norm：仅按 **valid** 质量归一（输入即便带撞 board 残留也不影响）。全零（无信号）→ uniform。
+    let r_valid_sum: f64 = r
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| valid[*i])
+        .map(|(_, x)| *x)
+        .sum();
+    let uniform = 1.0 / n_valid as f64;
+    for (i, ri) in r.iter_mut().enumerate() {
+        if !valid[i] {
+            *ri = 0.0; // card-removal：撞 board combo 恒 0（不依赖输入是否已清零）
+            continue;
+        }
+        let rn = if r_valid_sum > 0.0 {
+            *ri / r_valid_sum
+        } else {
+            uniform
+        };
+        *ri = (1.0 - alpha) * rn + alpha * w[i];
+    }
+    // rn 与 w 各自在 valid 上归一 → 凸组合在 valid 上和为 1；invalid 恒 0。
 }
 
 /// 「整列塌零」判据（[`cross_street_posterior_range`] 的 ε 地板）：某决策列 σ(实际动作|·) 对所有
@@ -2571,6 +2740,43 @@ pub fn subgame_search_unanchored_cached_cross(
         bucket_override,
         prefix_reach,
         cross_street,
+        None, // exploit：既有调用点不剥削（byte-equal 守护）
+        None,
+        hand_seed,
+        false,
+    )
+}
+
+/// [`subgame_search_unanchored_cached_cross`] + **叠加剥削先验**（`exploit_strategy_design_2026_06_14`
+/// Tier 2）。`exploit = Some` → 在档二′/档一/uniform 算出的对手 root range 上，对每个已收敛对手座按
+/// 其观测翻前 VPIP 宽度凸混合（[`apply_exploit_width_prior`]）。`None`（默认 / `--exploit` 关）= 薄包装的
+/// [`subgame_search_unanchored_cached_cross`]，**逐位 byte-equal**。剥削 ranges 进 solve 缓存 key →
+/// 开/关/画像更新自动 cache-miss、不串均衡。
+#[allow(clippy::too_many_arguments)]
+pub fn subgame_search_unanchored_cached_cross_exploit(
+    cache: Option<&mut SubgameSolveCache>,
+    auth: &GameState,
+    root_state: &GameState,
+    game: &SimplifiedNlheGame,
+    within_round: &[(Action, bool)],
+    cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
+    prefix_reach: Option<PrefixReach<'_>>,
+    cross_street: Option<&[(Action, bool)]>,
+    exploit: Option<ExploitPrior<'_>>,
+    hand_seed: u64,
+) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    subgame_search_unanchored_cached_inner(
+        cache,
+        auth,
+        root_state,
+        game,
+        within_round,
+        cfg,
+        bucket_override,
+        prefix_reach,
+        cross_street,
+        exploit,
         None,
         hand_seed,
         false,
@@ -2595,6 +2801,7 @@ fn subgame_search_unanchored_cached_inner(
     bucket_override: Option<&Arc<BucketTable>>,
     prefix_reach: Option<PrefixReach<'_>>,
     cross_street: Option<&[(Action, bool)]>,
+    exploit: Option<ExploitPrior<'_>>,
     actor_override: Option<PlayerId>,
     hand_seed: u64,
     solve_only: bool,
@@ -2736,7 +2943,24 @@ fn subgame_search_unanchored_cached_inner(
         )
     });
     // 跨街复用优先（命中即 owned，覆盖档一）；否则用档一前缀 reach（仍 None → uniform）。
-    let ranges_opt: Option<Vec<Vec<f64>>> = cross_ranges.or(prefix_ranges);
+    let mut ranges_opt: Option<Vec<Vec<f64>>> = cross_ranges.or(prefix_ranges);
+
+    // 叠加剥削 Tier 2（exploit_strategy_design §2/§4）：在 GTO range 上对已收敛对手座按观测翻前
+    // VPIP 宽度凸混合。`exploit = None`（默认 / --exploit 关）→ 此块不执行 → ranges_opt 不变、与
+    // 既有 _cross 路径逐位 byte-equal。剥削后的 ranges 同进下面的 solve_cache_key → 开/关/画像更新
+    // 自动 cache-miss、不串均衡。hero（auth_actor）座永不动（apply_exploit_width_prior 内守）。
+    if let Some(ep) = exploit {
+        let holes = all_hole_combos();
+        let board: Vec<Card> = root_state.board().to_vec();
+        ranges_opt = apply_exploit_width_prior(
+            ranges_opt,
+            ep.profiles,
+            auth_actor,
+            &holes,
+            &board,
+            ep.alpha,
+        );
+    }
 
     // 子树 solve 实际用表（同 anchored：override 优先，否则 blueprint 表 byte-equal）。
     let sub_table: Arc<BucketTable> =
@@ -2936,6 +3160,7 @@ pub fn subgame_search_unanchored_prewarm_cross(
         bucket_override,
         prefix_reach,
         cross_street,
+        None, // exploit：v1 预热不剥削（决策时 key 不同 → miss 现解，无害）
         Some(hero),
         hand_seed,
         true,
@@ -2962,6 +3187,147 @@ mod tests {
         Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::default_500_500_500(),
         ))
+    }
+
+    // ---- 叠加剥削 Tier 2：翻前宽度 tilt（apply_exploit_width_prior / chen_score）----
+
+    fn card(rank: u8, suit: u8) -> Card {
+        Card::new(
+            crate::core::Rank::from_u8(rank).unwrap(),
+            crate::core::Suit::from_u8(suit).unwrap(),
+        )
+    }
+
+    fn prof(vpip: f64) -> OpponentProfile {
+        OpponentProfile {
+            vpip,
+            pfr: 0.0,
+            postflop_af: 0.0,
+            n_preflop: 200,
+            n_postflop: 0,
+        }
+    }
+
+    #[test]
+    fn chen_score_strength_order() {
+        let aa = [card(12, 0), card(12, 1)]; // AA
+        let kk = [card(11, 0), card(11, 1)]; // KK
+        let aks = [card(12, 0), card(11, 0)]; // AKs
+        let ako = [card(12, 0), card(11, 1)]; // AKo
+        let o72 = [card(5, 0), card(0, 1)]; // 72o
+        assert!(chen_score(aa) > chen_score(kk));
+        assert!(chen_score(kk) > chen_score(ako));
+        assert!(chen_score(aks) > chen_score(ako), "同花加分");
+        assert!(chen_score(ako) > chen_score(o72), "AKo 远强于 72o");
+    }
+
+    #[test]
+    fn exploit_none_ranges_returns_none() {
+        let holes = all_hole_combos();
+        assert!(
+            apply_exploit_width_prior(None, &[Some(prof(0.4))], 0, &holes, &[], 0.5).is_none(),
+            "无 GTO range 信号 → v1 不剥削"
+        );
+    }
+
+    #[test]
+    fn exploit_no_converged_or_alpha0_is_identity() {
+        let holes = all_hole_combos();
+        let r = vec![vec![1.0 / 1326.0; 1326], vec![1.0 / 1326.0; 1326]];
+        // 全 None 画像 → 恒等。
+        let out = apply_exploit_width_prior(Some(r.clone()), &[None, None], 0, &holes, &[], 0.5);
+        assert_eq!(out.unwrap(), r, "无收敛对手 → 恒等");
+        // α=0 → 恒等。
+        let out0 = apply_exploit_width_prior(
+            Some(r.clone()),
+            &[None, Some(prof(0.4))],
+            0,
+            &holes,
+            &[],
+            0.0,
+        );
+        assert_eq!(out0.unwrap(), r, "α=0 → 恒等");
+    }
+
+    #[test]
+    fn exploit_hero_seat_untouched_opponent_tilted() {
+        let holes = all_hole_combos();
+        let r = vec![vec![1.0 / 1326.0; 1326], vec![1.0 / 1326.0; 1326]];
+        // hero=0；两座都给画像，但 hero 座必不动。
+        let out = apply_exploit_width_prior(
+            Some(r.clone()),
+            &[Some(prof(0.2)), Some(prof(0.2))],
+            0, // hero
+            &holes,
+            &[],
+            0.6,
+        )
+        .unwrap();
+        assert_eq!(out[0], r[0], "hero 座 range 不动");
+        assert_ne!(out[1], r[1], "对手座被 tilt");
+    }
+
+    #[test]
+    fn exploit_tight_concentrates_more_than_loose_and_normalized() {
+        let holes = all_hole_combos();
+        let uni = vec![1.0 / 1326.0; 1326];
+        let tight = apply_exploit_width_prior(
+            Some(vec![uni.clone()]),
+            &[Some(prof(0.10))],
+            1,
+            &holes,
+            &[],
+            0.6,
+        )
+        .unwrap();
+        let loose = apply_exploit_width_prior(
+            Some(vec![uni.clone()]),
+            &[Some(prof(0.90))],
+            1,
+            &holes,
+            &[],
+            0.6,
+        )
+        .unwrap();
+        let peak = |v: &[f64]| v.iter().cloned().fold(0.0_f64, f64::max);
+        assert!(
+            peak(&tight[0]) > peak(&loose[0]),
+            "紧手 range 更集中（峰值更高）：tight={} loose={}",
+            peak(&tight[0]),
+            peak(&loose[0])
+        );
+        for out in [&tight[0], &loose[0]] {
+            let s: f64 = out.iter().sum();
+            assert!((s - 1.0).abs() < 1e-9, "tilt 后仍归一，得 {s}");
+        }
+    }
+
+    #[test]
+    fn exploit_enforces_card_removal() {
+        let holes = all_hole_combos();
+        let board = [card(12, 0), card(11, 0), card(10, 0)]; // A♣K♣Q♣
+                                                             // 故意喂 uniform-over-ALL（含撞 board），验 tilt 强制撞 board combo → 0。
+        let uni_all = vec![1.0 / 1326.0; 1326];
+        let out = apply_exploit_width_prior(
+            Some(vec![uni_all]),
+            &[Some(prof(0.5))],
+            1,
+            &holes,
+            &board,
+            0.5,
+        )
+        .unwrap();
+        let bset: std::collections::BTreeSet<u8> = board.iter().map(|c| c.to_u8()).collect();
+        for (i, h) in holes.iter().enumerate() {
+            if bset.contains(&h[0].to_u8()) || bset.contains(&h[1].to_u8()) {
+                assert_eq!(out[0][i], 0.0, "撞 board combo 必为 0");
+            }
+        }
+        let s: f64 = out[0].iter().sum();
+        assert!(
+            (s - 1.0).abs() < 1e-9,
+            "card-removal 后 valid 质量仍归一，得 {s}"
+        );
     }
 
     // ---- project_strategy_onto_auth_legal（deep-wide 菜单维度漂移修复）----

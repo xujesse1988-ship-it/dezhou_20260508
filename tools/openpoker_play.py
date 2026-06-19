@@ -99,6 +99,17 @@ class Advisor:
         self.proc.stdin.flush()
         self._pending_prewarms += 1
 
+    def observe(self, rec):
+        """叠加剥削（--exploit）：每手结束把完整手历史发给 advisor 喂进进程内 Profiler
+        （`{"observe":1,names,actions:[{seat,street,action}]}`）。**不等响应**（advisor 返回遥测
+        ack，下次 decide 前 drain 丢弃，同 prewarm 锁步机制）。--exploit 关时 driver 不调本方法
+        → IPC 流 byte-equal 旧行为。"""
+        payload = dict(rec)
+        payload["observe"] = True
+        self.proc.stdin.write(json.dumps(payload) + "\n")
+        self.proc.stdin.flush()
+        self._pending_prewarms += 1  # observe 与 prewarm 共用「待 drain 的非决策响应」计数。
+
     def _drain_pending(self):
         while self._pending_prewarms > 0:
             line = self.proc.stdout.readline()
@@ -164,6 +175,10 @@ class HandState:
         # HH 日志（§4.2）：与 actions 平行的 player_action 原始字段子集 + 本手观测的
         # seat→name。advisor 的 build_request 不读这两个（byte-equal 隔离，selftest 5 钉死）。
         self.actions_ext = []
+        # 叠加剥削（--exploit）：与 actions 平行的**驱动侧街**（on_player_action 时的 self.street）。
+        # 用驱动侧跟踪的街而非 actions_ext.street（后者关闭轮错位一街，memory
+        # reference_openpoker_hh_jsonl_parsing）。observe_record 据它给 advisor Profiler 逐动作标街。
+        self._action_streets = []
         self.names = {}
         # 本街每座累计投入（preflop 含盲注）；新街清零。盲注 seeding 按满桌 btn+1/+2 ——
         # **短桌手必错**（盲注跳空座），短桌路径不读它、用 _committed_total_for 按 dealt 重算。
@@ -195,6 +210,7 @@ class HandState:
         self.committed_total[seat] = self.committed_total.get(seat, 0) + delta
         self.actions.append({"seat": seat, "action": a, **({"to": to} if to is not None else {})})
         self.actions_ext.append(dict(ext) if ext else {})
+        self._action_streets.append(self.street)  # 剥削 observe：逐动作驱动侧街（与 actions 平行）。
         if seat is not None:
             self.acted.add(seat)
         self._raw_events.append(("act", seat, a, amount))
@@ -275,10 +291,12 @@ class HandState:
         self.committed = {s: 0 for s in range(NUM_SEATS)}
         self._raw_events.append(("street",))
 
-    def build_request(self, valid):
+    def build_request(self, valid, include_names=False):
         """组 advisor 请求（openpoker_advisor::Request）。`stacks` 仅在真栈已知时附带
         （缺口②实时搜索读；缺省 → advisor 退对称 100BB blueprint，byte-equal）。
-        `dealt_seats` 仅短桌且占座可判时附带（幻影座映射；满桌不带 = 请求 byte-equal 旧行为）。"""
+        `dealt_seats` 仅短桌且占座可判时附带（幻影座映射；满桌不带 = 请求 byte-equal 旧行为）。
+        `include_names`（--exploit 开）：附 `names`（seat→name）供 advisor 脱锚搜索按名查画像；
+        缺省关 = 不附 = 旧请求 byte-equal。"""
         req = {
             "hole": self.hole,
             "board": self.board,
@@ -296,7 +314,20 @@ class HandState:
         dealt = self.dealt_now()
         if dealt is not None and len(dealt) < NUM_SEATS:
             req["dealt_seats"] = sorted(dealt)
+        if include_names and self.names:
+            req["names"] = self.names  # json.dumps：int 座位键 → 字符串键，Rust BTreeMap<u8,_> 解析。
         return req
+
+    def observe_record(self):
+        """叠加剥削（--exploit）：一手完整观测给 advisor Profiler（`{observe,names,actions}`）。
+        `actions` = 逐动作 `{seat, street, action}`（街用驱动侧 `_action_streets`，避开
+        actions_ext.street 错位坑）。driver 在我方弃牌后仍续记牌桌动作到 hand_result → 覆盖整手所有
+        座位（含我退出后的街），对手统计无「只看我参与的线」偏差。"""
+        acts = [
+            {"seat": a["seat"], "street": st, "action": a["action"]}
+            for a, st in zip(self.actions, self._action_streets)
+        ]
+        return {"observe": 1, "names": self.names, "actions": acts}
 
     def hh_record(self, hand_result_msg):
         """一手 HH JSONL 记录（§4.2 数据管道）。hand_result 的 winners/final_stacks/
@@ -368,13 +399,15 @@ class Session:
                     "community_cards", "your_turn", "hand_result",
                     "lobby_joined", "table_joined", "table_state")
 
-    def __init__(self, advisor, send, num_hands, log_f=None, hh_f=None, prewarm=False):
+    def __init__(self, advisor, send, num_hands, log_f=None, hh_f=None, prewarm=False,
+                 exploit=False):
         self.advisor = advisor
         self.send = send
         self.num_hands = num_hands
         self.log_f = log_f
         self.hh_f = hh_f
         self.prewarm = prewarm  # --search-prewarm：街起点预热（缺省关 = 请求流 byte-equal）
+        self.exploit = exploit  # --exploit：决策请求带 names + 每手结束发 observe（缺省关 = byte-equal）
         self.counters = {"hands": 0, "decisions": 0, "blueprint": 0, "search": 0,
                          "limp_heuristic": 0, "fallback": 0, "net_chips": 0,
                          "prewarms": 0,
@@ -531,7 +564,7 @@ class Session:
             hand.update_stacks(p.get("seat"), p.get("stack"))
             hand.update_name(p.get("seat"), p.get("name"))
         valid = parse_valid_actions(msg)
-        req = hand.build_request(valid)
+        req = hand.build_request(valid, include_names=self.exploit)
         try:
             resp = self.advisor.decide(req)
         except Exception as e:
@@ -578,6 +611,13 @@ class Session:
     def _handle_hand_result(self, ws, msg):
         self.last_hand_ts = time.time()
         hand = self.state["hand"]
+        # 叠加剥削（--exploit）：每手结束把完整观测发给 advisor Profiler（在清空 hand、且任何 HU/
+        # 码深漂移早退之前——保证每手都喂，对手统计无遗漏）。--exploit 关 → 不发 → IPC byte-equal。
+        if self.exploit and hand is not None:
+            try:
+                self.advisor.observe(hand.observe_record())
+            except Exception as e:
+                print(f"  [observe 异常] {e}（跳过本手画像，不影响决策）", file=sys.stderr)
         # HH 日志（§4.2）：整手落一行（在清空 hand 之前）。只读已累计状态 + hand_result 原样，
         # 不动 advisor 消费的任何字段（byte-equal 由 selftest 5 钉死）。
         if self.hh_f is not None:
@@ -626,7 +666,8 @@ def _ws_send(ws, obj):
     ws.send(json.dumps(obj))
 
 
-def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=False):
+def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=False,
+             exploit=False):
     import threading
 
     import websocket  # 延迟 import：离线 selftest 不需要 websocket-client
@@ -635,7 +676,7 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
     log_f = open(action_log, "a") if action_log else None
     hh_f = open(hh_log, "a") if hh_log else None
     session = Session(advisor, send=_ws_send, num_hands=num_hands, log_f=log_f, hh_f=hh_f,
-                      prewarm=prewarm)
+                      prewarm=prewarm, exploit=exploit)
 
     # 看门狗线程：被移出桌 / 桌散后服务端不再推任何消息，回调模型里没有别的唤醒点。
     stop_watchdog = threading.Event()
@@ -836,9 +877,41 @@ def run_selftest(advisor):
     # → hu_detected 置位 + 发 leave_table + 关 ws；≥3 座（含全员 fold 的 6-max）不触发。
     _selftest_hu_detection()
 
-    print("OK: 8 个 canned 场景跑通：advisor 全程出合法动作、driver 组请求/动作包（含真栈 stacks"
+    # 场景 9（叠加剥削 observe IPC）：每手结束发 observe → advisor ack（--exploit 关也 ack、不崩）；
+    # observe_record 逐动作带街；names 进 request；observe 与 decide 锁步对齐（drain）。剥削画像/收敛/
+    # tilt 数学由 Rust 单测覆盖（opponent_profile / subgame），本场景只钉 driver↔advisor IPC 管道。
+    hand9 = HandState("h9", button_seat=0, my_seat=1)
+    hand9.hole = ["As", "Ks"]
+    hand9.on_player_action(2, "raise", 60)        # preflop 对手开池
+    hand9.on_player_action(3, "fold", None)
+    hand9.on_community(["7h", "2c", "Kd"], "flop")
+    hand9.on_player_action(2, "bet", 80)          # flop 对手续注
+    hand9.update_name(1, "me")
+    hand9.update_name(2, "villain")
+    rec9 = hand9.observe_record()
+    if rec9["observe"] != 1 or rec9["names"].get(2) != "villain":
+        raise RuntimeError(f"[exploit] observe_record 结构异常: {rec9}")
+    if not all({"seat", "street", "action"} <= set(a) for a in rec9["actions"]):
+        raise RuntimeError(f"[exploit] observe actions 缺字段: {rec9['actions']}")
+    if rec9["actions"][0]["street"] != "preflop" or rec9["actions"][-1]["street"] != "flop":
+        raise RuntimeError(f"[exploit] 逐动作街标注错: {rec9['actions']}")
+    req9 = hand9.build_request(valid_flop, include_names=True)
+    if str(req9.get("names", {}).get(2, req9.get("names", {}).get("2"))) != "villain":
+        raise RuntimeError(f"[exploit] include_names 应把 names 带进 request: {req9.get('names')}")
+    for _ in range(3):
+        advisor.observe(rec9)
+    if advisor._pending_prewarms != 3:
+        raise RuntimeError(f"[exploit] observe×3 后应有 3 条待 drain，得 {advisor._pending_prewarms}")
+    resp9 = advisor.decide(req7)  # 复用场景 7 的合法 flop 请求；先 drain 3 条 observe ack
+    if advisor._pending_prewarms != 0:
+        raise RuntimeError(f"[exploit] decide 后 observe ack 应 drain 净，得 {advisor._pending_prewarms}")
+    _assert_legal(resp9, valid_flop, "exploit observe+decide")
+    print(f"[selftest 9 exploit] observe×3 acked+drained, names 进 request, resp={resp9} "
+          f"(--exploit 开则 advisor 进程内累积画像；剥削数学由 Rust 单测覆盖)", file=sys.stderr)
+
+    print("OK: 9 个 canned 场景跑通：advisor 全程出合法动作、driver 组请求/动作包（含真栈 stacks"
           " + 短桌 dealt_seats）正常、HH 日志 byte-equal 隔离成立、prewarm IPC 锁步对齐、"
-          "两人桌检测触发离场。", file=sys.stderr)
+          "两人桌检测触发离场、叠加剥削 observe IPC 锁步对齐。", file=sys.stderr)
 
 
 def _assert_legal(resp, valid, tag):
@@ -1173,6 +1246,14 @@ def main():
     # RoundStart 预热：街起点（hero 行动前）让 advisor 提前 build+solve 暖缓存，
     # wall 藏进对手行动时间。driver 侧行为（advisor 按请求响应，无需自己的 flag）。
     p.add_argument("--search-prewarm", action="store_true")
+    # 叠加剥削（Tier 2，exploit_strategy_design_2026_06_14）：进程内对手画像 → 翻前 range 宽度先验。
+    # 需配 --search（仅挂脱锚搜索路径）。缺省关 = 全程与现网 byte-equal（不带 names、不发 observe）。
+    p.add_argument("--exploit", action="store_true",
+                   help="开叠加剥削（进程内画像，收敛后对对手翻前 range 宽度偏置；需 --search）")
+    p.add_argument("--exploit-min-hands", type=int, default=None)
+    p.add_argument("--exploit-strength", type=float, default=None)
+    p.add_argument("--exploit-converge-se", type=float, default=None)
+    p.add_argument("--exploit-converge-drift", type=float, default=None)
     args = p.parse_args()
 
     extra = []
@@ -1202,6 +1283,23 @@ def main():
             extra += ["--search-bucket-table", args.search_bucket_table]
         if args.search_solve_threads is not None:
             extra += ["--search-solve-threads", str(args.search_solve_threads)]
+    # 叠加剥削透传（仅 --exploit 开时；advisor 侧 guard 再校验需 --search）。
+    if args.exploit:
+        extra.append("--exploit")
+        if args.exploit_min_hands is not None:
+            extra += ["--exploit-min-hands", str(args.exploit_min_hands)]
+        if args.exploit_strength is not None:
+            extra += ["--exploit-strength", str(args.exploit_strength)]
+        if args.exploit_converge_se is not None:
+            extra += ["--exploit-converge-se", str(args.exploit_converge_se)]
+        if args.exploit_converge_drift is not None:
+            extra += ["--exploit-converge-drift", str(args.exploit_converge_drift)]
+    if args.exploit and not args.search:
+        raise SystemExit("--exploit 需配 --search（剥削只挂脱锚搜索路径；没有搜索无处叠加）")
+    if (args.exploit_min_hands is not None or args.exploit_strength is not None
+            or args.exploit_converge_se is not None or args.exploit_converge_drift is not None) \
+            and not args.exploit:
+        raise SystemExit("--exploit-* 子旗需配 --exploit")
     if args.search_prewarm and not args.search:
         raise SystemExit("--search-prewarm 需配 --search（拒绝静默：没有搜索就没有可预热的 solve）")
     if args.search_unanchored_prefix_reach is not None and not args.search:
@@ -1225,7 +1323,7 @@ def main():
             log = args.action_log if args.action_log else None
             run_real(advisor, args.api_key, args.num_hands, action_log=log,
                      hh_log=args.hh_log if args.hh_log else None,
-                     prewarm=args.search_prewarm)
+                     prewarm=args.search_prewarm, exploit=args.exploit)
     finally:
         advisor.close()
 

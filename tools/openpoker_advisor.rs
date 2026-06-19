@@ -61,6 +61,8 @@
 //!   盲注对齐；k=2 按 OpenPoker 实测 HU 约定 button=BB 映 SB/BB→树座 1/2）；占座不可判
 //!   （无 table_state）→ 仍兜底。
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -79,12 +81,13 @@ use poker::training::nlhe_betting_tree::{
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::openpoker_hh::hist_to_concrete;
+use poker::training::opponent_profile::{ExploitConfig, ObserveHand, OpponentProfile, Profiler};
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
     should_search, subgame_search_cached, subgame_search_prewarm,
-    subgame_search_unanchored_cached_cross, subgame_search_unanchored_prewarm_cross,
-    synced_prefix_decisions, PrefixReach, ResolveRoot, SearchTrigger, SubgameSearchConfig,
-    SubgameSolveCache,
+    subgame_search_unanchored_cached_cross_exploit, subgame_search_unanchored_prewarm_cross,
+    synced_prefix_decisions, ExploitPrior, PrefixReach, ResolveRoot, SearchTrigger,
+    SubgameSearchConfig, SubgameSolveCache,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, HandEvaluator,
@@ -204,6 +207,11 @@ struct Request {
     /// 才发（决策时占座唯一可判才启用）。
     #[serde(default)]
     dealt_seats: Vec<u8>,
+    /// 叠加剥削（`exploit_strategy_design_2026_06_14` Tier 2）：本手 OpenPoker 座 → 玩家名。仅
+    /// driver `--exploit` 开时附带（缺省 = 空 = 旧行为，blueprint/search 路径不读 → byte-equal）。
+    /// 脱锚搜索据它把对手座解析成 [`Profiler`] 画像 → 翻前 range 宽度先验。
+    #[serde(default)]
+    names: BTreeMap<u8, String>,
 }
 
 /// 请求信封判别（与 [`Request`] 分开解析；serde 忽略未知字段 → 同一行 JSON 两个结构都能读，
@@ -214,6 +222,11 @@ struct Request {
 struct RequestEnvelope {
     #[serde(default)]
     prewarm: bool,
+    /// `observe = true` → driver 每手结束发来的完整手历史（[`ObserveHand`]）；advisor 喂进
+    /// [`Profiler`]、返回遥测（driver 丢弃）。仅 `--exploit` 开时 driver 才发。缺省 `false`
+    /// = 决策 / prewarm 请求（旧 driver byte-equal）。
+    #[serde(default)]
+    observe: bool,
 }
 
 /// advisor → driver 一行响应。`amount` 仅 raise 携带（= OpenPoker 单位的 raise-to 额）。
@@ -242,6 +255,11 @@ struct Response {
     /// （serde skip → 旧输出 byte-equal）。
     #[serde(skip_serializing_if = "Option::is_none")]
     solve_updates: Option<u64>,
+    /// 叠加剥削遥测（`exploit_strategy_design_2026_06_14`）：本决策实际剥削的 `[(solver_seat, vpip)]`
+    /// （已收敛对手座）。仅 search:unanchored 且 `--exploit` 开、有收敛对手时填；否则 `None`
+    /// （serde skip → 旧输出 byte-equal）。离线分析「哪些手剥削了谁」用，不影响决策。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exploit: Option<Vec<(u8, f64)>>,
 }
 
 /// 策略分布 → 日志格式：label 同 `chosen`，概率四舍五入 4 位小数（采样仍用全精度 `dist`，
@@ -430,6 +448,12 @@ struct SearchRuntime {
     /// flop（lockstep 失同步）照常实时搜索（[`decide_search_unanchored`] 不经此旗）。**默认关**
     /// （`false`，旧行为 byte-equal）。turn/river 锚定面不受影响。
     flop_prefer_blueprint: bool,
+    /// 叠加剥削（`--exploit`，`exploit_strategy_design_2026_06_14` Tier 2）：`Some` = 进程内对手画像
+    /// 累积器（[`Profiler`]，**只用本进程数据、不依赖过往、启动后空表开始统计**）。`RefCell` 内部
+    /// 可变：observe 路径经共享 `&SearchRuntime` 用 `borrow_mut` 累积、决策路径用 `borrow` 读已收敛
+    /// 画像（单线程 advisor 循环；solve 并行不碰它，只吃决策时算好的 owned 画像快照）。`None`（默认 /
+    /// `--exploit` 关）= 不剥削，[`decide_search_unanchored`] 退既有 search:unanchored（byte-equal）。
+    exploit: Option<RefCell<Profiler>>,
 }
 
 /// RoundStart 预热（`Request.prewarm = true`，driver `--search-prewarm` 在街起点、hero 行动
@@ -1531,9 +1555,39 @@ fn decide_search_unanchored(
     // σ 对 `prev_within`（上一街完整真实动作线）条件化得本街后验 range，覆盖档一前缀 reach。off / 缓存
     // 非紧前街 unanchored 解 → 自验退档一（不破现状）。算出 ranges 进 solve key → 开/关自动 miss。
     let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
+    // 叠加剥削 Tier 2（exploit_strategy_design §2/§4）：组 per-solver-seat 画像 + 强度 α（仅 --exploit
+    // 开、对手已收敛）。owned 快照，`borrow` 随即释放（solve 并行不碰 Profiler，只吃此快照）。hero 座
+    // 按 OpenPoker my_seat 跳过（subgame apply_exploit_width_prior 再守一层）。`None` = 不剥削 →
+    // _cross_exploit 走 exploit=None 分支，与既有 search:unanchored 逐位 byte-equal。
+    let exploit_owned: Option<(Vec<Option<OpponentProfile>>, f64)> =
+        rt.exploit.as_ref().map(|cell| {
+            let prof = cell.borrow();
+            let alpha = prof.cfg().strength_alpha;
+            let mut profiles: Vec<Option<OpponentProfile>> = vec![None; N_SEATS];
+            for op_seat in 0..N_SEATS {
+                if op_seat == req.my_seat as usize {
+                    continue; // hero
+                }
+                let Some(tree) = smap.to_tree[op_seat] else {
+                    continue; // 未发牌座（短桌幻影 / 空座）
+                };
+                if let Some(name) = req.names.get(&(op_seat as u8)) {
+                    if let Some(p) = prof.profile_for(name) {
+                        profiles[tree as usize] = Some(p);
+                    }
+                }
+            }
+            (profiles, alpha)
+        });
+    let exploit_prior = exploit_owned
+        .as_ref()
+        .map(|(profiles, alpha)| ExploitPrior {
+            profiles: profiles.as_slice(),
+            alpha: *alpha,
+        });
     let t0 = Instant::now();
     let misses_before = solve_cache.misses();
-    let dist = match subgame_search_unanchored_cached_cross(
+    let dist = match subgame_search_unanchored_cached_cross_exploit(
         Some(solve_cache), // within-round solve 缓存（同锚定路径；kind 进 key、两路不串条目）。
         &auth,
         &round_start,
@@ -1543,6 +1597,7 @@ fn decide_search_unanchored(
         rt.bucket_table.as_ref(), // --search-bucket-table：子树独立桶表（None = blueprint 表）。
         prefix_reach,
         cross_street,
+        exploit_prior, // 叠加剥削先验（None = 不剥削，byte-equal）。
         hand_seed,
     ) {
         Ok(d) => d,
@@ -1597,6 +1652,16 @@ fn decide_search_unanchored(
         resp.chosen = Some(action_label(&chosen));
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates;
+        // 叠加剥削遥测：本决策实际剥削了哪些对手座（已收敛）+ 其 VPIP。无收敛对手 → None
+        // （serde skip → byte-equal）。
+        resp.exploit = exploit_owned.as_ref().and_then(|(profiles, _)| {
+            let tel: Vec<(u8, f64)> = profiles
+                .iter()
+                .enumerate()
+                .filter_map(|(s, p)| p.map(|p| (s as u8, p.vpip)))
+                .collect();
+            (!tel.is_empty()).then_some(tel)
+        });
     }
     resp
 }
@@ -1738,6 +1803,10 @@ struct Args {
     /// （脱影子 flop 仍搜索）。**默认 `false`**（[`DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT`]，旧行为
     /// byte-equal）；`on` 显式开。
     search_flop_prefer_blueprint: bool,
+    /// `--exploit`（叠加剥削 Tier 2）：`Some` = 开（进程内画像 → 翻前 range 宽度先验）。**仅 `--search`
+    /// 开时可设**（拒静默 guard）。`None`（默认）= 关，全程与现网 byte-equal。子旗 `--exploit-min-hands`
+    /// / `--exploit-strength` / `--exploit-converge-se` / `--exploit-converge-drift` 填 [`ExploitConfig`]。
+    exploit: Option<ExploitConfig>,
 }
 
 #[derive(Serialize)]
@@ -1831,6 +1900,8 @@ fn run() -> Result<(), String> {
                 unanchored_prefix_reach: args.search_unanchored_prefix_reach,
                 unanchored_cross_street: args.search_unanchored_cross_street,
                 flop_prefer_blueprint: args.search_flop_prefer_blueprint,
+                // 叠加剥削：--exploit 开 → 进程内空表 Profiler（只用本进程数据，不依赖过往）。
+                exploit: args.exploit.map(|cfg| RefCell::new(Profiler::new(cfg))),
             })
         }
         None => None,
@@ -1850,6 +1921,13 @@ fn run() -> Result<(), String> {
             scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
+        if let Some(cell) = &rt.exploit {
+            let ec = *cell.borrow().cfg();
+            eprintln!(
+                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): min_hands={} strength_alpha={} converge_se={} converge_drift={} window={}（进程内画像、不依赖过往）",
+                ec.min_hands, ec.strength_alpha, ec.converge_se, ec.converge_drift, ec.window
+            );
+        }
     }
     eprintln!(
         "[openpoker_advisor] ready reshape={} update_count={} search={}",
@@ -1876,35 +1954,51 @@ fn run() -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
-        // 信封判别（RequestEnvelope doc）：prewarm 请求不出动作、只暖 solve 缓存；
+        // 信封判别（RequestEnvelope doc）：observe = 每手结束的画像观测（喂 Profiler、返回遥测、
+        // driver 丢弃）；prewarm = 街起点预热（不出动作、只暖 solve 缓存）；否则决策请求。
         // 必有一行响应（IPC 锁步）。
-        let is_prewarm = serde_json::from_str::<RequestEnvelope>(&line)
-            .map(|e| e.prewarm)
-            .unwrap_or(false);
-        let resp = match serde_json::from_str::<Request>(&line) {
-            Ok(req) if is_prewarm => prewarm(
-                game,
-                &strategy_fn,
-                &req,
-                args.seed,
-                search_rt.as_ref(),
-                &mut solve_cache,
-            ),
-            Ok(req) => decide(
-                game,
-                &abstraction,
-                &strategy_fn,
-                &req,
-                args.seed,
-                search_rt.as_ref(),
-                &mut solve_cache,
-            ),
-            // 解析失败也不崩：出 fold（最保守；没有 valid 信息可用）。
-            Err(e) => Response {
-                action: "fold".into(),
-                source: format!("fallback:bad_request_json:{e}"),
+        let envelope = serde_json::from_str::<RequestEnvelope>(&line).ok();
+        let is_observe = envelope.as_ref().map(|e| e.observe).unwrap_or(false);
+        let is_prewarm = envelope.as_ref().map(|e| e.prewarm).unwrap_or(false);
+        let resp = if is_observe {
+            // 叠加剥削：吃一手 observe 进进程内 Profiler（仅 --exploit 开时有；脏数据静默跳过、
+            // 不崩）。observe 永不出动作——返回遥测 ack（driver `_drain_pending` 丢弃）。
+            if let Some(cell) = search_rt.as_ref().and_then(|rt| rt.exploit.as_ref()) {
+                if let Ok(obs) = serde_json::from_str::<ObserveHand>(&line) {
+                    cell.borrow_mut().observe_hand(&obs);
+                }
+            }
+            Response {
+                action: "none".into(),
+                source: "observe:ack".into(),
                 ..Default::default()
-            },
+            }
+        } else {
+            match serde_json::from_str::<Request>(&line) {
+                Ok(req) if is_prewarm => prewarm(
+                    game,
+                    &strategy_fn,
+                    &req,
+                    args.seed,
+                    search_rt.as_ref(),
+                    &mut solve_cache,
+                ),
+                Ok(req) => decide(
+                    game,
+                    &abstraction,
+                    &strategy_fn,
+                    &req,
+                    args.seed,
+                    search_rt.as_ref(),
+                    &mut solve_cache,
+                ),
+                // 解析失败也不崩：出 fold（最保守；没有 valid 信息可用）。
+                Err(e) => Response {
+                    action: "fold".into(),
+                    source: format!("fallback:bad_request_json:{e}"),
+                    ..Default::default()
+                },
+            }
         };
         writeln!(
             stdout,
@@ -1942,6 +2036,12 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_unanchored_prefix_reach: Option<bool> = None;
     let mut search_unanchored_cross_street: Option<bool> = None;
     let mut search_flop_prefer_blueprint: Option<bool> = None;
+    // 叠加剥削（--exploit*，仅 --search 开时生效）。
+    let mut exploit_on = false;
+    let mut exploit_min_hands: Option<u32> = None;
+    let mut exploit_strength: Option<f64> = None;
+    let mut exploit_converge_se: Option<f64> = None;
+    let mut exploit_converge_drift: Option<f64> = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -2051,6 +2151,42 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     }
                 });
             }
+            // —— 叠加剥削（Tier 2）：--exploit 开总开关，子旗调 ExploitConfig ——
+            "--exploit" => exploit_on = true,
+            "--exploit-min-hands" => {
+                exploit_min_hands = Some(
+                    next_val(&mut it, &arg)?
+                        .parse()
+                        .map_err(|e| format!("bad exploit-min-hands: {e}"))?,
+                )
+            }
+            "--exploit-strength" => {
+                let v: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad exploit-strength: {e}"))?;
+                if !(0.0..=1.0).contains(&v) {
+                    return Err(format!("--exploit-strength 须在 [0,1]，得 {v}"));
+                }
+                exploit_strength = Some(v);
+            }
+            "--exploit-converge-se" => {
+                let v: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad exploit-converge-se: {e}"))?;
+                if !(0.0..=1.0).contains(&v) {
+                    return Err(format!("--exploit-converge-se 须在 [0,1]，得 {v}"));
+                }
+                exploit_converge_se = Some(v);
+            }
+            "--exploit-converge-drift" => {
+                let v: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad exploit-converge-drift: {e}"))?;
+                if !(0.0..=1.0).contains(&v) {
+                    return Err(format!("--exploit-converge-drift 须在 [0,1]，得 {v}"));
+                }
+                exploit_converge_drift = Some(v);
+            }
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -2107,6 +2243,28 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         }
         None
     };
+    // --exploit* guard：子旗需 --exploit；--exploit 需 --search（剥削仅作用脱锚搜索路径）。
+    if !exploit_on
+        && (exploit_min_hands.is_some()
+            || exploit_strength.is_some()
+            || exploit_converge_se.is_some()
+            || exploit_converge_drift.is_some())
+    {
+        return Err("设了 --exploit-* 参数但未开 --exploit".to_string());
+    }
+    if exploit_on && search.is_none() {
+        return Err("--exploit 需配合 --search（剥削只挂脱锚搜索路径）".to_string());
+    }
+    let exploit = exploit_on.then(|| {
+        let d = ExploitConfig::default();
+        ExploitConfig {
+            min_hands: exploit_min_hands.unwrap_or(d.min_hands),
+            converge_se: exploit_converge_se.unwrap_or(d.converge_se),
+            converge_drift: exploit_converge_drift.unwrap_or(d.converge_drift),
+            strength_alpha: exploit_strength.unwrap_or(d.strength_alpha),
+            window: d.window,
+        }
+    });
     Ok(Args {
         checkpoint: checkpoint.ok_or("缺 --checkpoint")?,
         bucket_table: bucket_table.ok_or("缺 --bucket-table")?,
@@ -2115,6 +2273,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         seed,
         search,
         search_bucket_table,
+        exploit,
         // 默认开（§5.1 实测拍板）；--search-unanchored-prefix-reach off 显式关。
         search_unanchored_prefix_reach: search_unanchored_prefix_reach
             .unwrap_or(DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH),
@@ -2150,6 +2309,7 @@ mod tests {
             unanchored_prefix_reach: false,
             unanchored_cross_street: false,
             flop_prefer_blueprint: false,
+            exploit: None,
         }
     }
 
@@ -2161,6 +2321,7 @@ mod tests {
             unanchored_prefix_reach: true,
             unanchored_cross_street: false,
             flop_prefer_blueprint: false,
+            exploit: None,
         }
     }
 
@@ -2172,6 +2333,7 @@ mod tests {
             unanchored_prefix_reach: true,
             unanchored_cross_street: true,
             flop_prefer_blueprint: false,
+            exploit: None,
         }
     }
 
@@ -2184,6 +2346,7 @@ mod tests {
             unanchored_prefix_reach: false,
             unanchored_cross_street: false,
             flop_prefer_blueprint: true,
+            exploit: None,
         }
     }
 
@@ -2324,6 +2487,7 @@ mod tests {
             },
             stacks: vec![1588, 2402, 1241, 2000, 108265, 1340],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         let solver_cfg = TableConfig::default_6max_100bb();
         let scale = solver_cfg.big_blind.as_u64() / 20; // 5
@@ -2414,6 +2578,7 @@ mod tests {
             valid: full_valid(),
             stacks: vec![],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         let resp = decide(
             &game,
@@ -2467,6 +2632,7 @@ mod tests {
             valid,
             stacks: vec![],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         let decide_one = |req: &Request| {
             decide(
@@ -2543,6 +2709,7 @@ mod tests {
             valid: full_valid(),
             stacks: vec![],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         let decide_one = |req: &Request| {
             decide(
@@ -2846,6 +3013,7 @@ mod tests {
             },
             stacks: vec![2302, 1420, 1917, 628, 99614, 722],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         let resp = decide(
             &game,
@@ -2888,6 +3056,7 @@ mod tests {
             },
             stacks: vec![],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         let resp = decide(
             &game,
@@ -2958,6 +3127,7 @@ mod tests {
             },
             stacks,
             dealt_seats: vec![],
+            names: Default::default(),
         }
     }
 
@@ -3564,6 +3734,7 @@ mod tests {
             // op 单位 hand-start 真栈：UTG 600=30BB、SB/BB 4000=200BB、其余 2000=100BB。
             stacks: vec![2000, 4000, 4000, 600, 2000, 2000],
             dealt_seats: vec![],
+            names: Default::default(),
         }
     }
 
@@ -3777,6 +3948,7 @@ mod tests {
             valid: full_valid(),
             stacks: vec![],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         let scfg = SubgameSearchConfig {
             iterations: 200,
@@ -3860,6 +4032,7 @@ mod tests {
             },
             stacks: vec![2000; 6],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         // 命中：BTN min-raise to 40 → pot=130、SB to_call=30（已投 10），130/30≈4.33>4、30=1.5BB≤30BB。
         let hit = decide(
@@ -3953,6 +4126,7 @@ mod tests {
             },
             stacks: vec![2000; 6],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         // 前提确证：旧路径在 limp 池上必兜底（结构 gap）。
         let off = decide(
@@ -4025,6 +4199,7 @@ mod tests {
             valid: full_valid(),
             stacks: vec![],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         let full_resp = decide(&game, &abs, &uniform, &full, 7, None, &mut cache);
         assert_eq!(
@@ -4039,6 +4214,7 @@ mod tests {
             button_seat: 4,
             actions: vec![],
             dealt_seats: vec![0, 2, 4, 5],
+            names: Default::default(),
             hole: full.hole.clone(),
             board: vec![],
             num_seats: 6,
@@ -4065,6 +4241,7 @@ mod tests {
             button_seat: 5,
             actions: vec![],
             dealt_seats: vec![0, 3, 4, 5],
+            names: Default::default(),
             hole: full.hole.clone(),
             board: vec![],
             num_seats: 6,
@@ -4108,6 +4285,7 @@ mod tests {
                 hist(2, "check", None),
             ],
             dealt_seats: vec![0, 1, 2, 5],
+            names: Default::default(),
             hole: full.hole.clone(),
             board: full.board.clone(),
             button_seat: 0,
@@ -4203,6 +4381,7 @@ mod tests {
             valid: full_valid(),
             stacks: vec![],
             dealt_seats: vec![],
+            names: Default::default(),
         };
         let full_resp = decide(&game, &abs, &uniform, &full, 9, None, &mut cache);
         assert_eq!(
@@ -4215,6 +4394,7 @@ mod tests {
             button_seat: 4,
             my_seat: 1,
             dealt_seats: vec![1, 4],
+            names: Default::default(),
             actions: vec![],
             hole: full.hole.clone(),
             board: vec![],
@@ -4244,6 +4424,7 @@ mod tests {
             button_seat: 4,
             my_seat: 1,
             dealt_seats: vec![1, 4],
+            names: Default::default(),
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
@@ -4260,6 +4441,7 @@ mod tests {
         // button 不在 dealt：
         let bad_btn = Request {
             dealt_seats: vec![0, 4, 5],
+            names: Default::default(),
             button_seat: 1,
             my_seat: 4,
             hole: full.hole.clone(),
@@ -4279,6 +4461,7 @@ mod tests {
         // 服务端 your_turn、重放失同步也可信）；source 前缀仍含 actor_not_dealt（失同步检测不变）。
         let bad_actor = Request {
             dealt_seats: vec![0, 1, 2, 5],
+            names: Default::default(),
             button_seat: 0,
             my_seat: 1,
             actions: vec![hist(3, "fold", None)],
@@ -4298,6 +4481,7 @@ mod tests {
         // 乱序 / 重复：
         let unsorted = Request {
             dealt_seats: vec![2, 0, 5],
+            names: Default::default(),
             button_seat: 0,
             my_seat: 2,
             hole: full.hole.clone(),
@@ -4335,6 +4519,7 @@ mod tests {
             valid: full_valid(),
             stacks: vec![],
             dealt_seats: dealt,
+            names: Default::default(),
         };
         let implicit = decide(
             &game,
@@ -4401,6 +4586,67 @@ mod tests {
         assert_eq!(a.search.expect("search on").iterations, 1000);
         // 拒绝静默 guard 对显式 iterations（含恰好 1000）仍生效。
         assert!(parse(&["--search-iterations", "1000"]).is_err());
+    }
+
+    /// 叠加剥削 CLI：`--exploit` 默认关；开需配 `--search`；子旗需 `--exploit`；坏值 / 出界拒收；
+    /// 子旗覆盖默认。
+    #[test]
+    fn parse_args_exploit() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        // 默认关。
+        assert!(parse(&[]).expect("parse Ok").exploit.is_none());
+        // --exploit 需 --search。
+        assert!(
+            parse(&["--exploit"]).is_err(),
+            "--exploit 无 --search 应拒收"
+        );
+        // 子旗需 --exploit。
+        assert!(
+            parse(&["--search", "--exploit-strength", "0.3"]).is_err(),
+            "--exploit-* 无 --exploit 应拒收"
+        );
+        // --search --exploit → Some(默认)。
+        let d = ExploitConfig::default();
+        let a = parse(&["--search", "--exploit"]).expect("parse Ok");
+        let e = a.exploit.expect("exploit on");
+        assert_eq!(e.min_hands, d.min_hands);
+        assert!((e.strength_alpha - d.strength_alpha).abs() < 1e-12);
+        // 子旗覆盖。
+        let a = parse(&[
+            "--search",
+            "--exploit",
+            "--exploit-min-hands",
+            "300",
+            "--exploit-strength",
+            "0.3",
+        ])
+        .expect("parse Ok");
+        let e = a.exploit.expect("exploit on");
+        assert_eq!(e.min_hands, 300);
+        assert!((e.strength_alpha - 0.3).abs() < 1e-12);
+        // 出界拒收。
+        assert!(parse(&["--search", "--exploit", "--exploit-strength", "1.5"]).is_err());
+    }
+
+    /// `Request` 解析 `names`（serde 默认；缺省 = 空 → 旧请求 byte-equal）。
+    #[test]
+    fn request_parses_names() {
+        let j = r#"{"hole":["Ah","Kh"],"board":[],"button_seat":0,"my_seat":1,"num_seats":6,
+                    "small_blind":10,"big_blind":20,"actions":[],"valid":{"can_check":false},
+                    "names":{"2":"villain"}}"#;
+        let req: Request = serde_json::from_str(j).unwrap();
+        assert_eq!(req.names.get(&2).map(String::as_str), Some("villain"));
+        // 缺省 names = 空。
+        let j2 = r#"{"hole":["Ah","Kh"],"board":[],"button_seat":0,"my_seat":1,"num_seats":6,
+                     "small_blind":10,"big_blind":20,"actions":[],"valid":{"can_check":false}}"#;
+        let req2: Request = serde_json::from_str(j2).unwrap();
+        assert!(req2.names.is_empty());
     }
 
     /// `--search-range-uniform-mix`（range 先验平滑 λ）：生产默认 = 开

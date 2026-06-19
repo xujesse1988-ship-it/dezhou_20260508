@@ -64,6 +64,16 @@ mid-round 撞 §6 #1/#2 landmine(非 round-start 重解+无 within-round 冻结)
 (不是退化源、反是修正,价值被放宽触发面揭示)② 残余 −192 = §6 landmine 非 range(迭代扫排噪声+本 A/B 排 range)。
 默认 trigger 设回 FlopFirstUnraised(安全),AllPostflop 留研究 opt-in。详见 `temp/realtime_search_design_2026_06_03.md`
 §10.2–10.4 + target S6。
+
+**叠加剥削 Tier 2 已落地(2026-06-19,`--exploit`,默认关)**:进程内对手画像(`src/training/opponent_profile.rs`
+`Profiler`,**只用本进程数据、不依赖过往**,driver 每手发 observe 累积 VPIP/PFR/AF)→ 收敛门(样本≥150 +
+VPIP SE≤0.05 + 近窗漂移≤0.08 三条全过才剥削)→ `subgame::apply_exploit_width_prior` 在**脱锚搜索** ranges
+组装处把已收敛对手 root range 朝观测翻前 VPIP 宽度凸混合(Chen 序 top-k,α≤0.8 默认 0.5,hero 不混,带 uniform
+地板 + card-removal)。**默认关时全程 byte-equal**(driver 不带 names/不发 observe,advisor `exploit=None` 走既有
+`_cross`);剥削 ranges 进 solve_cache_key → 开/关/画像更新自动 cache-miss。仅翻前宽度 + 仅脱锚路径(翻后 AF
+轴/锚定路径/Tier 3 = 后续);prewarm v1 不剥削。正确性靠 Rust 单测(opponent_profile 收敛门 / subgame tilt 方向·
+恒等·card-removal·`exploit=None` byte-equal / advisor parse+names) + driver selftest 场景 9(observe IPC);
+**live EV 测不出剥削(§0 前提 B),离线 EV-方向 demo 后续**。详见 `temp/exploit_strategy_design_2026_06_14.md` §9。
 **§10.5 round-start re-solve 已落地——实测推翻 §10.4 的 §6-landmine 归因**(commit `8fde9bc`,vultr lib **76/0/8**):
 实现 `ResolveRoot{CurrentDecision,RoundStart}`(默认 RoundStart;从 betting-round 起点建子树+within-round 导航+
 round-stable seed 给一致性)。**两 control 复现 harness**:current-decision×all-postflop=−192(=§10.4 byte-equal)、
