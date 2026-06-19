@@ -158,6 +158,18 @@ prewarm 时 turn 仍在主 slot）+ 同 `prev_within` → 同 ranges → 同 key
 4. **决策级 A/B（保留 turn blueprint 跑）**：扩 `six_max_cross_street_ab`（或新工具）到锚定路径，
    量 river 决策 TV / argmax 翻转：新「turn 子树后验」vs 旧「estimate_range(turn blueprint)」。
    方向应与 §动机一致（后验比断点前粗前缀准）。这是**只测 range 来源差异**的受控配对差。
+   - **✅ 已做（2026-06-19，commit `56c1a12`）**：`six_max_cross_street_ab --anchored`（on-tree
+     100BB flop→turn→river 线，turn 子树解入缓存，两臂只差 river 的 cross；真 1B nolimp blueprint +
+     **真 200 桶**——该 checkpoint 用 200/200/200 cafebabe 表训，非 usage 例里写的 500；桶固定两臂
+     一致 = 干净「只测 range 来源」）。实测 96 手×{2000,5000}iter×2 seed：**cross 触发 ~98% / river
+     决策 mean TV 0.38–0.42 / median 0.38–0.41 / argmax 翻转 60–67%**，**对迭代数稳**（2000→5000
+     mean 0.38→0.40 不洗掉 = 结构性信号非欠收敛噪声）、**对 seed 稳**。方向 = 逐手再优化（OFF
+     blueprint estimate 过 check 的成手 ON 转价值下注 / OFF 过 jam 的空气 ON 收手），与 §动机
+     「turn 子树后验更贴本子博弈」一致。诚实边界同脱锚 A/B：构造谱非真实频率（翻转率 = 给定这些
+     on-tree 线）、无 EV 锚（「不同」≠「更好」）、200 桶（生产搜索另用 1000 → 量级或更大）、~35%
+     deal skip（桶未访问，两臂同 skip 不偏差）。**这是与脱锚 A/B / 翻档一 ON 同一证据等级**（强机制
+     + 决策级方向）；它证「裁掉 turn blueprint、river 改走 turn 后验」**确实改 river 决策且方向合理**，
+     但「裁是否无损」由命中率（§4.5）+ 兜底（§3）定，非本项。
 5. **复用命中率实测**：插桩数 river 决策里 `cross_ranges=Some` 占比（锚定 + 脱锚分别）。
    12s / 24 线程 / 1000 桶下 turn 一般能解出（非 giveup），命中率应高；但 off-menu 导航失配 +
    giveup 会拉低。**只有命中率足够高，裁 turn 才接近无损**——这是裁剪的 go/no-go 闸。
