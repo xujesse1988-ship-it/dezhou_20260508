@@ -146,6 +146,12 @@ path = "tools/six_max_search_probe.rs"
 name = "six_max_unanchored_prefix_ab"
 path = "tools/six_max_unanchored_prefix_ab.rs"
 
+# 档二′-跨街复用 ON vs OFF 决策级 A/B：构造 deep off-tree flop→turn 加注战线，flop 解入缓存后
+# turn cross=Some(ON) vs None(OFF)，比 hero turn 决策分布 TV/argmax flip + dump top-K 谱（机制验证）。
+[[bin]]
+name = "six_max_cross_street_ab"
+path = "tools/six_max_cross_street_ab.rs"
+
 # S5② OpenPoker 常驻 advisor：Python WS driver 喂每决策请求，本进程加载 6-max blueprint
 # 无状态重放→出 {action,amount}（off-tree 复用 blueprint_advisor；失败安全兜底，live 不崩）。
 [[bin]]
