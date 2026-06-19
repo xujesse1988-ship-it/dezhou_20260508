@@ -73,7 +73,7 @@ VPIP SE≤0.05 + 近窗漂移≤0.08 三条全过才剥削)→ `subgame::apply_e
 `_cross`);剥削 ranges 进 solve_cache_key → 开/关/画像更新自动 cache-miss。仅翻前宽度 + 仅脱锚路径(翻后 AF
 轴/锚定路径/Tier 3 = 后续);prewarm v1 不剥削。正确性靠 Rust 单测(opponent_profile 收敛门 / subgame tilt 方向·
 恒等·card-removal·`exploit=None` byte-equal / advisor parse+names) + driver selftest 场景 9(observe IPC);
-**live EV 测不出剥削(§0 前提 B),离线 EV-方向 demo 后续**。详见 `temp/exploit_strategy_design_2026_06_14.md` §9。
+**live EV 测不出剥削(§0 前提 B)**。**§6 决策级 demo 已做**(`six_max_exploit_ab`,真 10B preopen blueprint,96 deal:剥削触发 94-98%、LOOSE≠TIGHT 95.7%/TV 0.32=决策响应观测宽度、betting 质量 GTO0.606→LOOSE0.652→TIGHT0.589 单调——证机制响应+方向,非 EV)。详见 `temp/exploit_strategy_design_2026_06_14.md` §9。
 **§10.5 round-start re-solve 已落地——实测推翻 §10.4 的 §6-landmine 归因**(commit `8fde9bc`,vultr lib **76/0/8**):
 实现 `ResolveRoot{CurrentDecision,RoundStart}`(默认 RoundStart;从 betting-round 起点建子树+within-round 导航+
 round-stable seed 给一致性)。**两 control 复现 harness**:current-decision×all-postflop=−192(=§10.4 byte-equal)、
