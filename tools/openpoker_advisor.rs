@@ -446,7 +446,8 @@ struct SearchRuntime {
     /// `--search-flop-prefer-blueprint`（[`DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT`]）：`on` = 仅 flop
     /// 街，锚定面（lockstep Ok / 100BB 影子同步）即使命中 trigger 也走 blueprint、不实时搜索；脱影子
     /// flop（lockstep 失同步）照常实时搜索（[`decide_search_unanchored`] 不经此旗）。**默认关**
-    /// （`false`，旧行为 byte-equal）。turn/river 锚定面不受影响。
+    /// （`false`，旧行为 byte-equal）。turn/river 锚定面不受影响。预热（[`prewarm`]）同源 skip 锚定
+    /// flop 子树（不 build+solve），否则 advisor 单线程下 hero 决策白等一个 time_budget 才拿 blueprint。
     flop_prefer_blueprint: bool,
     /// 叠加剥削（`--exploit`，`exploit_strategy_design_2026_06_14` Tier 2）：`Some` = 进程内对手画像
     /// 累积器（[`Profiler`]，**只用本进程数据、不依赖过往、启动后空表开始统计**）。`RefCell` 内部
@@ -562,7 +563,18 @@ fn prewarm(
     // 监控：预热 build+solve 墙钟（= 藏进对手思考时间的成本；> 对手用时则 hero 决策仍会 MISS 现解）。
     let t0 = Instant::now();
     // —— 路径分类与 decide 同源：lockstep Ok → 锚定；Err（off-stack / limp 线）→ 脱影子 ——
-    let result = match lockstep_replay(game, &solver_cfg, &smap, req, scale, board.len(), None) {
+    // 路径分类（锚定/脱影子）一次算清；下面 flop_prefer_blueprint skip 与 build+solve 共用同一份
+    // 重放结果（重算两次会无谓重放历史）。
+    let lockstep = lockstep_replay(game, &solver_cfg, &smap, req, scale, board.len(), None);
+    // `--search-flop-prefer-blueprint` on：flop **锚定**面（此处 lockstep Ok）的决策走 blueprint、不搜
+    // （decide `want_search` gating 同款，[`SearchRuntime::flop_prefer_blueprint`] doc）。预热该锚定 flop
+    // 子树纯属浪费，且因 advisor 单线程串行处理（build+solve 排在 hero decide 请求前），会让 hero 决策
+    // 白等一个 time_budget 才拿到 blueprint。故锚定 flop 直接 skip，hero 决策即时返回。脱影子 flop
+    // （lockstep Err：off-stack all-in / limp 线）decide 照常搜索、不受此旗影响 → 不在此 skip，照常预热。
+    if rt.flop_prefer_blueprint && round_start.street() == poker::Street::Flop && lockstep.is_ok() {
+        return mk("prewarm:skip:flop_prefer_blueprint".into());
+    }
+    let result = match lockstep {
         Ok((_real, abs)) => subgame_search_prewarm(
             solve_cache,
             hero_pid,
@@ -3630,6 +3642,81 @@ mod tests {
         pre_pf.actions.truncate(4); // 只剩 folds-to-SB，preflop 中途。
         let pf = prewarm(&game, &skew, &pre_pf, 0xCAC4E, Some(&rt(scfg)), &mut cache);
         assert_eq!(pf.source, "prewarm:skip:preflop");
+    }
+
+    /// `--search-flop-prefer-blueprint on` + 预热：flop **锚定**面（lockstep Ok）的决策本会走
+    /// blueprint、不搜（[`flop_prefer_blueprint_anchored_flop_goes_blueprint`]）。advisor 单线程串行
+    /// 处理 → 若仍预热该子树（build+solve），hero 决策会白等一个 time_budget 才拿到 blueprint。故须
+    /// `prewarm:skip:flop_prefer_blueprint`、缓存零增长。对照①：旗关（[`rt`]）同输入照常 `prewarm:stored`
+    /// （证 skip 确由旗驱动，非别的前置不满足）。对照②：脱影子 flop（off-stack all-in 线、lockstep
+    /// Err）decide 走 `decide_search_unanchored`、不经此旗 → 即使开旗预热仍 `prewarm:stored`（证只 skip
+    /// 锚定 flop、不误伤脱影子，否则决策会 MISS 现解、白丢预热）。
+    #[test]
+    fn prewarm_flop_prefer_blueprint_anchored_flop_skips() {
+        let game = nolimp_game();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            ..SubgameSearchConfig::default()
+        };
+        // hero=BB（seat 2）：SB(1) flop 首行动者 → 预热 = 街起点、hero 未轮到；对称 100BB → 锚定。
+        let mut pre = flop_first_unraised_req(vec![2000; 6]);
+        pre.my_seat = 2;
+        pre.hole = vec!["Qs".into(), "Qd".into()];
+
+        // 开旗：锚定 flop 预热 → skip，缓存零增长（无 build+solve）。
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(
+            &game,
+            &uniform,
+            &pre,
+            0xF10B,
+            Some(&rt_flop_prefer_blueprint(scfg)),
+            &mut cache,
+        );
+        assert_eq!(p.source, "prewarm:skip:flop_prefer_blueprint", "得 {p:?}");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (0, 0),
+            "skip 不该建/解任何子树"
+        );
+
+        // 对照①：旗关同输入照常预热（证 skip 由旗驱动）。
+        let mut cache_off = SubgameSolveCache::new();
+        let off = prewarm(
+            &game,
+            &uniform,
+            &pre,
+            0xF10B,
+            Some(&rt(scfg)),
+            &mut cache_off,
+        );
+        assert_eq!(off.source, "prewarm:stored", "旗关须照常预热，得 {off:?}");
+        assert_eq!((cache_off.misses(), cache_off.hits()), (1, 0));
+
+        // 对照②：脱影子 flop（off-stack all-in 线、lockstep Err）即使开旗也照常预热。
+        let un_scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let un_req = offstack_allin_req();
+        let mut cache_un = SubgameSolveCache::new();
+        let un = prewarm(
+            &game,
+            &uniform,
+            &un_req,
+            0xF10B,
+            Some(&rt_flop_prefer_blueprint(un_scfg)),
+            &mut cache_un,
+        );
+        assert_eq!(
+            un.source, "prewarm:stored",
+            "脱影子 flop 开旗仍须照常预热，得 {un:?}"
+        );
+        assert_eq!((cache_un.misses(), cache_un.hits()), (1, 0));
     }
 
     /// 脱影子预热端到端：off-stack all-in 线（lockstep 必失同步）→ 预热走 unanchored 路径
