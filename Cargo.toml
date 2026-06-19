@@ -152,6 +152,12 @@ path = "tools/six_max_unanchored_prefix_ab.rs"
 name = "six_max_cross_street_ab"
 path = "tools/six_max_cross_street_ab.rs"
 
+# 叠加剥削 Tier 2 决策级 demo：同一 off-tree flop→turn 线，对 hero turn 决策只换对手 BB 座剥削先验
+# （GTO / loose-vpip / tight-vpip），比决策分布 TV + betting 质量方向（响应观测宽度 = 机制验证，非 EV）。
+[[bin]]
+name = "six_max_exploit_ab"
+path = "tools/six_max_exploit_ab.rs"
+
 # S5② OpenPoker 常驻 advisor：Python WS driver 喂每决策请求，本进程加载 6-max blueprint
 # 无状态重放→出 {action,amount}（off-tree 复用 blueprint_advisor；失败安全兜底，live 不崩）。
 [[bin]]
