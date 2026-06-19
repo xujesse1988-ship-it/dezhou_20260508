@@ -2,6 +2,16 @@
 //! deep off-tree flop→turn 加注战线**上（`unanchored_range_design` §动机 / §4 「仍 pending = 强弱」
 //! 指定的「干净标尺 = 构造 off-tree-flop→turn 线」）。
 //!
+//! # 两种模式
+//!
+//! - **默认（脱锚 turn）**：off-tree flop→turn 线，比 turn 决策 ON（flop σ 后验）vs OFF（档一前缀）。
+//! - **`--anchored`（锚定 river，`turn_blueprint_trim_cross_street_anchored_2026_06_19` §4.4）**：
+//!   **on-tree**（lockstep 100BB）flop→turn→river 线，turn 子树解入缓存，比 **river 决策** ON
+//!   （turn 子树后验，跨街复用 turn 解 σ）vs OFF（`estimate_range` 读 **turn blueprint**）。受控配对
+//!   差只差 river root range 来源 → **直接量「裁掉 turn blueprint」对 river 决策的影响**（裁剪 §4.4
+//!   决策级证据；保留 turn blueprint 跑）。方向应与 §动机一致：turn 子树后验比泛 blueprint estimate
+//!   更贴本子博弈。两臂用**同一** turn 解（同 hand_seed/cfg）→ 欠收敛对两臂等量不污染差值。
+//!
 //! # 为什么不是 EV / 自对弈
 //!
 //! - 跨街复用要同一手 flop **和** turn **都**走脱锚搜索（先解 flop 缓存、turn 复用）。连只需单街
@@ -45,16 +55,16 @@ use std::process::ExitCode;
 use rayon::prelude::*;
 
 use poker::training::game::Game;
-use poker::training::nlhe::SimplifiedNlheGame;
+use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::{
     first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max, AbstractActionTag,
     BettingAbstractionRules, NodeId,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::subgame::{
-    subgame_search_unanchored_cached, subgame_search_unanchored_cached_cross,
-    synced_prefix_decisions, PrefixReach, ResolveRoot, SearchTrigger, SubgameSearchConfig,
-    SubgameSolveCache,
+    subgame_search_cached, subgame_search_unanchored_cached,
+    subgame_search_unanchored_cached_cross, synced_prefix_decisions, PrefixReach, ResolveRoot,
+    SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, InfoSetId,
@@ -89,7 +99,10 @@ struct Args {
     seed: u64,
     top_k: usize,
     search: SubgameSearchConfig,
-    /// 构造线参数（BB）：UTG 短码 all-in / SB raise-over to / flop SB bet to / flop BB raise to。
+    /// `--anchored`：跑**锚定 river** A/B（on-tree flop→turn→river，turn-posterior vs
+    /// estimate(turn blueprint)），而非默认的脱锚 turn A/B。下面 4 个构造线参数仅默认模式用。
+    anchored: bool,
+    /// 构造线参数（BB，仅默认脱锚模式）：UTG 短码 all-in / SB raise-over to / flop SB bet to / flop BB raise to。
     utg_bb: u64,
     sb_raise_bb: u64,
     flop_bet_bb: u64,
@@ -127,29 +140,41 @@ fn run() -> Result<(), String> {
     let strat = |info: &InfoSetId, _n: usize| trainer.average_strategy(*info);
     let game_ref = trainer.game();
 
-    // 同步前缀（deal-independent：影子走 abstract all-in + 3 fold → SB 节点 = 断点前）。
-    let synced = build_synced_prefix(game_ref)?;
+    let results: Vec<DealResult> = if args.anchored {
+        // 锚定 river A/B（turn_blueprint_trim §4.4）：on-tree flop→turn→river，无需同步前缀。
+        eprintln!(
+            "[cross_street_ab] mode=ANCHORED-river reshape={} cap={} update_count={} | search: iters={} deep_menu={} range_mix={} max_nodes={} seed=0x{:016x} deals={}",
+            args.reshape, args.postflop_cap, trainer.update_count(),
+            args.search.iterations, args.search.deep_menu, args.search.range_uniform_mix,
+            args.search.max_subtree_nodes, args.seed, args.deals,
+        );
+        (0..args.deals)
+            .into_par_iter()
+            .filter_map(|i| eval_anchored_deal(game_ref, &strat, &args, i))
+            .collect()
+    } else {
+        // 同步前缀（deal-independent：影子走 abstract all-in + 3 fold → SB 节点 = 断点前）。
+        let synced = build_synced_prefix(game_ref)?;
+        eprintln!(
+            "[cross_street_ab] mode=UNANCHORED-turn reshape={} cap={} update_count={} synced_prefix_len={}",
+            args.reshape,
+            args.postflop_cap,
+            trainer.update_count(),
+            synced.len()
+        );
+        eprintln!(
+            "[cross_street_ab] line: utg={}bb sb_raise_to={}bb flop_bet_to={}bb flop_raise_to={}bb | search: iters={} deep_menu={} range_mix={} max_nodes={} seed=0x{:016x} deals={}",
+            args.utg_bb, args.sb_raise_bb, args.flop_bet_bb, args.flop_raise_bb,
+            args.search.iterations, args.search.deep_menu, args.search.range_uniform_mix,
+            args.search.max_subtree_nodes, args.seed, args.deals,
+        );
+        (0..args.deals)
+            .into_par_iter()
+            .filter_map(|i| eval_deal(game_ref, &strat, &game_cfg, &synced, &args, i))
+            .collect()
+    };
 
-    eprintln!(
-        "[cross_street_ab] reshape={} cap={} update_count={} synced_prefix_len={}",
-        args.reshape,
-        args.postflop_cap,
-        trainer.update_count(),
-        synced.len()
-    );
-    eprintln!(
-        "[cross_street_ab] line: utg={}bb sb_raise_to={}bb flop_bet_to={}bb flop_raise_to={}bb | search: iters={} deep_menu={} range_mix={} max_nodes={} seed=0x{:016x} deals={}",
-        args.utg_bb, args.sb_raise_bb, args.flop_bet_bb, args.flop_raise_bb,
-        args.search.iterations, args.search.deep_menu, args.search.range_uniform_mix,
-        args.search.max_subtree_nodes, args.seed, args.deals,
-    );
-
-    let results: Vec<DealResult> = (0..args.deals)
-        .into_par_iter()
-        .filter_map(|i| eval_deal(game_ref, &strat, &game_cfg, &synced, &args, i))
-        .collect();
-
-    print_report(&results, args.deals, args.top_k);
+    print_report(&results, args.deals, args.top_k, args.anchored);
     Ok(())
 }
 
@@ -340,6 +365,215 @@ fn solve_flop(
     .map(|_| ())
 }
 
+// ===========================================================================
+// 锚定 river A/B（turn_blueprint_trim §4.4）：on-tree flop→turn→river，turn 解入缓存，river 决策
+// ON（cross=Some(turn_within)=turn 子树后验）vs OFF（cross=None=estimate_range 读 turn blueprint）。
+// ===========================================================================
+
+/// 想要的抽象动作类别（在 legal 集里按 tag 取首个匹配 → 确定性走 on-tree 线）。
+#[derive(Clone, Copy, Debug)]
+enum Want {
+    Raise,
+    Fold,
+    Call,
+    Check,
+    Bet,
+}
+
+fn pick_want(st: &SimplifiedNlheState, want: Want) -> Option<AbstractAction> {
+    SimplifiedNlheGame::legal_actions(st).into_iter().find(|a| {
+        matches!(
+            (want, AbstractActionTag::of(a)),
+            (Want::Fold, AbstractActionTag::Fold)
+                | (Want::Check, AbstractActionTag::Check)
+                | (Want::Call, AbstractActionTag::Call)
+                | (Want::Raise, AbstractActionTag::Raise(_))
+                | (Want::Bet, AbstractActionTag::Bet(_))
+        )
+    })
+}
+
+/// 在 blueprint 树上走一步抽象动作（`SimplifiedNlheState` 同步推进 game_state + node_id）；`rec=Some`
+/// 时把该步 **concrete** 动作记入（turn_within 跨街导航用）——Bet/Raise 的 `to` = 行动者 apply 后的
+/// committed_this_round（= 下注/加注到的总额），与 advisor `build_real_auth` 记 prev_within 同口径。
+fn nav(
+    st: SimplifiedNlheState,
+    want: Want,
+    rng: &mut dyn RngSource,
+    rec: Option<&mut Vec<(Action, bool)>>,
+) -> Result<SimplifiedNlheState, String> {
+    let actor = st.game_state.current_player().ok_or("nav: 非决策点")?.0 as usize;
+    let chosen = pick_want(&st, want).ok_or_else(|| format!("nav: legal 集无 {want:?}"))?;
+    let tag = AbstractActionTag::of(&chosen);
+    let next = SimplifiedNlheGame::next(st, chosen, rng);
+    if let Some(rec) = rec {
+        let p = &next.game_state.players()[actor];
+        let became_all_in = p.status == PlayerStatus::AllIn;
+        let concrete = match tag {
+            AbstractActionTag::Fold => Action::Fold,
+            AbstractActionTag::Check => Action::Check,
+            AbstractActionTag::Call => Action::Call,
+            AbstractActionTag::AllIn => Action::AllIn,
+            AbstractActionTag::Bet(_) => Action::Bet {
+                to: p.committed_this_round,
+            },
+            AbstractActionTag::Raise(_) => Action::Raise {
+                to: p.committed_this_round,
+            },
+        };
+        rec.push((concrete, became_all_in));
+    }
+    Ok(next)
+}
+
+/// 构造 on-tree（lockstep 100BB）flop→turn→river 加注线（betting 线固定、随 `deal_seed` 换牌）：
+/// UTG raise → HJ/CO/BTN/SB fold → BB call → flop BB/UTG check-check → turn BB check / UTG bet /
+/// BB call → river（BB 首行动 = hero）。返回 (turn round-start, turn_within 完整真实动作线, river
+/// round-start, hero seat)；turn/river 各带 blueprint 树 node_id（锚定路径建子树 + 导航）。
+type AnchoredLine = (
+    SimplifiedNlheState,
+    Vec<(Action, bool)>,
+    SimplifiedNlheState,
+    usize,
+);
+
+fn build_anchored_line(game: &SimplifiedNlheGame, deal_seed: u64) -> Result<AnchoredLine, String> {
+    let mut rng = ChaCha20Rng::from_seed(deal_seed);
+    let rng: &mut dyn RngSource = &mut rng;
+    let mut st = game.root(rng);
+    if st.game_state.current_player() != Some(SeatId(3)) {
+        return Err("preflop 首行动非 UTG(seat 3)".to_string());
+    }
+    st = nav(st, Want::Raise, rng, None)?; // UTG open
+    for _ in 0..4 {
+        st = nav(st, Want::Fold, rng, None)?; // HJ/CO/BTN/SB fold
+    }
+    st = nav(st, Want::Call, rng, None)?; // BB call → flop
+    if st.game_state.street() != Street::Flop {
+        return Err(format!("preflop 后非 flop（{:?}）", st.game_state.street()));
+    }
+    st = nav(st, Want::Check, rng, None)?; // flop BB check
+    st = nav(st, Want::Check, rng, None)?; // flop UTG check → turn
+    if st.game_state.street() != Street::Turn {
+        return Err(format!("flop 后非 turn（{:?}）", st.game_state.street()));
+    }
+    let turn_rs = st.clone();
+    let mut within = Vec::with_capacity(3);
+    st = nav(st, Want::Check, rng, Some(&mut within))?; // turn BB check
+    st = nav(st, Want::Bet, rng, Some(&mut within))?; // turn UTG bet
+    st = nav(st, Want::Call, rng, Some(&mut within))?; // turn BB call → river
+    if st.game_state.street() != Street::River {
+        return Err(format!("turn 后非 river（{:?}）", st.game_state.street()));
+    }
+    let hero = st.game_state.current_player().ok_or("river 非决策点")?.0 as usize;
+    Ok((turn_rs, within, st, hero))
+}
+
+/// turn round-start 子树解入缓存（cross=None：turn 自身用 estimate，两臂一致）→ river 跨街 peek 它。
+fn solve_turn(
+    cache: &mut SubgameSolveCache,
+    turn_rs: &SimplifiedNlheState,
+    turn_legal: &[AbstractAction],
+    game: &SimplifiedNlheGame,
+    strat: &(dyn Fn(&InfoSetId, usize) -> Vec<f64> + Sync),
+    cfg: &SubgameSearchConfig,
+    hand_seed: u64,
+) -> Option<()> {
+    subgame_search_cached(
+        Some(cache),
+        &turn_rs.game_state,
+        &turn_rs.game_state,
+        game,
+        turn_legal,
+        turn_rs.current_node_id,
+        strat,
+        cfg,
+        None,
+        None,
+        None,
+        None, // cross=None
+        hand_seed,
+        0,
+    )
+    .ok()
+    .map(|_| ())
+}
+
+/// 单 deal 的锚定 river ON-vs-OFF 读数。两臂用**同一** turn 解（同 hand_seed/cfg/子树），只 river
+/// 的 cross 不同（ON=Some(turn_within) 复用 turn σ 后验 / OFF=None 走 estimate_range 读 turn
+/// blueprint）→ TV 纯由 river root range 来源驱动。
+fn eval_anchored_deal(
+    game: &SimplifiedNlheGame,
+    strat: &(dyn Fn(&InfoSetId, usize) -> Vec<f64> + Sync),
+    args: &Args,
+    deal_idx: u64,
+) -> Option<DealResult> {
+    let deal_seed = mix2(args.seed, deal_idx);
+    let (turn_rs, turn_within, river_rs, hero) = build_anchored_line(game, deal_seed).ok()?;
+    let hand_seed = mix2(args.seed ^ 0xC505, deal_idx);
+    let turn_legal = SimplifiedNlheGame::legal_actions(&turn_rs);
+    let river_legal = SimplifiedNlheGame::legal_actions(&river_rs);
+    let river_decision = |cache: &mut SubgameSolveCache,
+                          cross: Option<&[(Action, bool)]>|
+     -> Option<Vec<(AbstractAction, f64)>> {
+        subgame_search_cached(
+            Some(cache),
+            &river_rs.game_state,
+            &river_rs.game_state,
+            game,
+            &river_legal,
+            river_rs.current_node_id,
+            strat,
+            &args.search,
+            None,
+            None,
+            None, // within_round_real：river 首决策（within 空）不需。
+            cross,
+            hand_seed,
+            0,
+        )
+        .ok()
+    };
+
+    // OFF 臂：turn 解入缓存 → river cross=None（estimate_range 读 turn blueprint σ）。
+    let mut cache_off = SubgameSolveCache::new();
+    solve_turn(
+        &mut cache_off,
+        &turn_rs,
+        &turn_legal,
+        game,
+        strat,
+        &args.search,
+        hand_seed,
+    )?;
+    let off = river_decision(&mut cache_off, None)?;
+
+    // ON 臂：同一 turn 解 → river cross=Some(turn_within)（turn 子树 σ 后验覆盖 estimate）。
+    let mut cache_on = SubgameSolveCache::new();
+    solve_turn(
+        &mut cache_on,
+        &turn_rs,
+        &turn_legal,
+        game,
+        strat,
+        &args.search,
+        hand_seed,
+    )?;
+    let on = river_decision(&mut cache_on, Some(&turn_within))?;
+
+    let (tv, flip) = dist_tv_and_flip(&on, &off);
+    let hero_hole = river_rs.game_state.players()[hero].hole_cards?;
+    Some(DealResult {
+        deal_seed,
+        hero_hole,
+        board: river_rs.game_state.board().to_vec(),
+        tv,
+        flip,
+        off,
+        on,
+    })
+}
+
 fn apply(st: &mut GameState, a: Action) -> Result<(), String> {
     st.apply(a).map_err(|e| format!("apply({a:?}): {e:?}"))
 }
@@ -378,7 +612,22 @@ fn dist_tv_and_flip(a: &[(AbstractAction, f64)], b: &[(AbstractAction, f64)]) ->
     (0.5 * tv, flip)
 }
 
-fn print_report(results: &[DealResult], deals_total: u64, top_k: usize) {
+fn print_report(results: &[DealResult], deals_total: u64, top_k: usize, anchored: bool) {
+    let (decision, line_desc, off_label, on_label) = if anchored {
+        (
+            "river",
+            "on-tree flop→turn→river 线",
+            "estimate(turn blueprint)",
+            "turn σ 后验",
+        )
+    } else {
+        (
+            "turn",
+            "构造 off-tree flop→turn 加注战线",
+            "档一前缀",
+            "flop σ 后验",
+        )
+    };
     let solved = results.len();
     let skipped = deals_total as usize - solved;
     if solved == 0 {
@@ -399,7 +648,7 @@ fn print_report(results: &[DealResult], deals_total: u64, top_k: usize) {
         fired.iter().map(|r| r.tv).sum::<f64>() / fired.len() as f64
     };
 
-    println!("\n=== 跨街复用 ON vs OFF 决策级 A/B（构造 off-tree flop→turn 加注战线）===");
+    println!("\n=== 跨街复用 ON vs OFF 决策级 A/B（{line_desc}）===");
     println!("  deal: {solved} 解出 / {skipped} skip（共 {deals_total}）");
     println!(
         "  跨街触发（ON≠OFF, TV>0）: {}/{solved} ({:.1}%)",
@@ -407,7 +656,7 @@ fn print_report(results: &[DealResult], deals_total: u64, top_k: usize) {
         100.0 * fired.len() as f64 / solved as f64
     );
     println!(
-        "  hero turn 决策 TV（ON vs OFF）: mean={mean:.4} median={median:.4} max={max:.4}；触发子集 mean={fired_mean:.4}"
+        "  hero {decision} 决策 TV（ON vs OFF）: mean={mean:.4} median={median:.4} max={max:.4}；触发子集 mean={fired_mean:.4}"
     );
     println!(
         "  argmax 翻转: {flips}/{solved} ({:.1}%)",
@@ -436,7 +685,7 @@ fn print_report(results: &[DealResult], deals_total: u64, top_k: usize) {
     let mut by_tv: Vec<&DealResult> = results.iter().collect();
     by_tv.sort_by(|a, b| b.tv.partial_cmp(&a.tv).unwrap_or(std::cmp::Ordering::Equal));
     println!(
-        "\n  top-{} 最大决策改变谱（hero=SB；OFF=档一前缀 / ON=flop σ 后验）:",
+        "\n  top-{} 最大决策改变谱（OFF={off_label} / ON={on_label}）:",
         top_k.min(by_tv.len())
     );
     for r in by_tv.iter().take(top_k) {
@@ -448,12 +697,15 @@ fn print_report(results: &[DealResult], deals_total: u64, top_k: usize) {
             r.tv,
             if r.flip { " [argmax FLIP]" } else { "" }
         );
-        println!("       OFF(档一): {}", fmt_dist(&r.off));
-        println!("       ON (档二′): {}", fmt_dist(&r.on));
+        println!("       OFF({off_label}): {}", fmt_dist(&r.off));
+        println!("       ON ({on_label}): {}", fmt_dist(&r.on));
     }
-    println!(
+    let reading = if anchored {
+        "\n  读法：TV/翻转 = 「裁掉 turn blueprint、river range 改走 turn 子树后验」对 river 决策的**幅度**；\n  方向看 top-K（§动机 = turn 子树后验比泛 blueprint estimate 更贴本子博弈）。TV 小 → 裁 turn 近无损；\n  TV 大且方向合理 → 后验确有信息。构造谱非真实频率，单数字勿当判决；命中率（§4.5）才是裁剪 go/no-go。"
+    } else {
         "\n  读法：TV/翻转 = 跨街 range 精化对 turn 决策的**幅度**；方向看 top-K（§动机 = ON 应把档一\n  丢掉的 flop 加注战信号捡回 → 价值线收紧/诈唬下修）。构造谱非真实频率，单数字勿当强弱判决。"
-    );
+    };
+    println!("{reading}");
 }
 
 fn fmt_cards(cs: &[Card]) -> String {
@@ -525,6 +777,7 @@ fn parse_args() -> Result<Args, String> {
     let mut deep_menu = true;
     let mut max_nodes = 1_000_000usize;
     let mut range_mix = 0.25f64;
+    let mut anchored = false;
     let mut utg_bb = 10u64;
     let mut sb_raise_bb = 20u64;
     let mut flop_bet_bb = 12u64;
@@ -577,6 +830,7 @@ fn parse_args() -> Result<Args, String> {
                     return Err(format!("--range-uniform-mix 须在 [0,1]，得 {range_mix}"));
                 }
             }
+            "--anchored" => anchored = true,
             "--utg-bb" => utg_bb = parse_u64(next(&mut it, &arg)?)?,
             "--sb-raise-bb" => sb_raise_bb = parse_u64(next(&mut it, &arg)?)?,
             "--flop-bet-bb" => flop_bet_bb = parse_u64(next(&mut it, &arg)?)?,
@@ -602,6 +856,7 @@ fn parse_args() -> Result<Args, String> {
         seed,
         top_k,
         search,
+        anchored,
         utg_bb,
         sb_raise_bb,
         flop_bet_bb,
