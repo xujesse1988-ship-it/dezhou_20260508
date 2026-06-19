@@ -114,17 +114,20 @@ const DEFAULT_SEARCH_RANGE_UNIFORM_MIX: f64 = 0.25;
 /// 臂 / 回退）。注意 §5.1 仍是 n=1 决策级证据 → live 多手 EV 确认仍在进行（开默认是据机制 + 该证据
 /// 拍板，正确性早单测硬证、是守护默认关不会变坏的旗）。
 const DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH: bool = true;
-/// 脱锚搜索**档二′-跨街复用**的生产默认（`unanchored_range_design_2026_06_10` §1末/§4）：上一街本身
-/// unanchored、子树已解时，复用那棵子树的 σ 对上一街实际动作线做贝叶斯条件化 → 本街后验 range，
-/// 替代档一退回的「上一街断点前」粗前缀（档一在 turn 丢掉 flop 断点后的加注战 = §5.1 刚堵的洞下一街
-/// 又开）。**默认开**（与档一 [`DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH`] 同等证据等级拍板）：决策级
-/// A/B（`six_max_cross_street_ab`，构造 deep off-tree flop→turn 加注战线、真 blueprint + 真桶、受控
-/// 配对差仅 root range 不同）实测 ON 显著且按 §动机方向改 turn 决策——mean TV 0.27–0.41 / argmax 翻转
-/// 29–61% / ~100% 触发，对菜单粒度 / seed / 迭代数（4000 iter 不洗掉）皆稳；方向 = ON 把档一的近乎
-/// auto-jam 收成随牌力分化的极化策略（中等/摊牌牌从梭哈拉回、纯空气构造极化诈唬）。EV「更好」结构性
-/// 不可得（自对弈触发率~0、live 功效太弱，§4 已钉），故据「强机制 + 决策级方向一致」开默认（同档一）。
-/// `--search-unanchored-cross-street off` 显式关（live A/B 对照臂 / 回退）；正确性由 search=None /
-/// cross_street=None byte-equal 单测 + 缓存 key 隔离 + prev-slot 一致性硬证（默认开不会变坏的旗）。
+/// **档二′-跨街复用**的生产默认（`unanchored_range_design_2026_06_10` §1末/§4 +
+/// `turn_blueprint_trim_cross_street_anchored_2026_06_19`）：上一街子树已解时，复用那棵子树的 σ 对上一街
+/// 实际动作线做贝叶斯条件化 → 本街后验 range，替代断点前粗前缀（档一在 turn 丢掉 flop 断点后的加注战 =
+/// §5.1 刚堵的洞下一街又开）。**flag 现同管锚定 + 脱锚两路**（turn_blueprint_trim §2.4）：锚定 river 复用
+/// turn 子树后验覆盖 blueprint `estimate_range`，脱锚 river 覆盖档一前缀 reach，跨 kind 亦复用——目的是
+/// 让 turn blueprint 在**所有** river 决策上都不被读（裁剪前提）。**默认开**（与档一
+/// [`DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH`] 同等证据等级拍板）：决策级 A/B（`six_max_cross_street_ab`，
+/// 构造 deep off-tree flop→turn 加注战线、真 blueprint + 真桶、受控配对差仅 root range 不同）实测 ON 显著
+/// 且按 §动机方向改 turn 决策——mean TV 0.27–0.41 / argmax 翻转 29–61% / ~100% 触发，对菜单粒度 / seed /
+/// 迭代数（4000 iter 不洗掉）皆稳；方向 = ON 把档一的近乎 auto-jam 收成随牌力分化的极化策略（中等/摊牌牌
+/// 从梭哈拉回、纯空气构造极化诈唬）。EV「更好」结构性不可得（自对弈触发率~0、live 功效太弱，§4 已钉），
+/// 故据「强机制 + 决策级方向一致」开默认（同档一）。`--search-unanchored-cross-street off` 显式关（两路都退，
+/// live A/B 对照臂 / 回退）；正确性由 search=None / cross_street=None byte-equal 单测 + 缓存 key 隔离 +
+/// prev-slot 一致性硬证（默认开不会变坏的旗）。
 const DEFAULT_SEARCH_UNANCHORED_CROSS_STREET: bool = true;
 /// flop 街「优先 blueprint」的生产默认（`--search-flop-prefer-blueprint`）：**默认关**
 /// （`false` = 保持旧行为 byte-equal——flop 锚定面命中触发就实时搜索）。`on` = 仅 flop 街改成：
@@ -436,12 +439,16 @@ struct SearchRuntime {
     /// §5.1 实测：真 live off-tree 深码 / 3bet 池上 uniform 先验致 stack-off 漏洞、档一改正确弃牌。
     /// range 估计用 blueprint σ / blueprint 表（同 `bucket_table` 注解：换表不影响 range 估计）。
     unanchored_prefix_reach: bool,
-    /// `--search-unanchored-cross-street`（脱锚搜索**档二′-跨街复用**，`unanchored_range_design`
-    /// §1末/§4）：`on` = 上一街本身 unanchored、子树已解（within-round 缓存当前条目）时，复用其 σ
-    /// 对上一街实际动作线条件化得本街后验 range，覆盖档一前缀 reach（§动机：档一在 turn 丢掉 flop
-    /// 断点后的加注战）。**默认开**（[`DEFAULT_SEARCH_UNANCHORED_CROSS_STREET`]，决策级 A/B + 机制
-    /// 拍板，同档一）；`off` 显式关 = 退档一（live A/B 对照臂 / 回退）。
-    /// 仅在脱影子搜索（`decide_search_unanchored` / 脱影子预热）+ postflop turn/river 触发。
+    /// `--search-unanchored-cross-street`（**档二′-跨街复用**，`unanchored_range_design` §1末/§4 +
+    /// `turn_blueprint_trim_cross_street_anchored_2026_06_19`）：`on` = 上一街子树已解（within-round
+    /// 缓存当前条目）时，复用其 σ 对上一街实际动作线条件化得本街后验 range，覆盖断点前粗前缀（§动机：
+    /// 档一在 turn 丢掉 flop 断点后的加注战）。**flag 名保留但语义已扩**（turn_blueprint_trim §2.4 改动
+    /// D）：现**同时管锚定 + 脱锚两路**——锚定 river 复用 turn 子树后验（覆盖 [`subgame_search_cached`]
+    /// 的 blueprint `estimate_range`）、脱锚 river 复用（覆盖档一前缀 reach）；改动 A 后跨 kind 也复用
+    /// （turn anchored → river unanchored 等）。目的 = 让 turn blueprint 在**所有** river 决策上都不被
+    /// 读 → blueprint 可裁到 preflop+flop。**默认开**（[`DEFAULT_SEARCH_UNANCHORED_CROSS_STREET`]，决策
+    /// 级 A/B + 机制拍板，同档一）；`off` 显式关 = 两路都退（A/B 对照臂 / 回退）。
+    /// postflop turn/river 触发（锚定 [`decide`]/[`prewarm`] + 脱锚 [`decide_search_unanchored`]/脱锚预热）。
     unanchored_cross_street: bool,
     /// `--search-flop-prefer-blueprint`（[`DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT`]）：`on` = 仅 flop
     /// 街，锚定面（lockstep Ok / 100BB 影子同步）即使命中 trigger 也走 blueprint、不实时搜索；脱影子
@@ -575,17 +582,24 @@ fn prewarm(
         return mk("prewarm:skip:flop_prefer_blueprint".into());
     }
     let result = match lockstep {
-        Ok((_real, abs)) => subgame_search_prewarm(
-            solve_cache,
-            hero_pid,
-            &round_start,
-            game,
-            abs.current_node_id,
-            strategy_fn,
-            scfg,
-            rt.bucket_table.as_ref(),
-            hand_seed,
-        ),
+        Ok((_real, abs)) => {
+            // 档二′-跨街复用（锚定预热，turn_blueprint_trim §2.4 改动 D）：与决策路径同义，复用缓存里
+            // 上一街已解子树 σ 算本街后验 range。预热须与决策时算出同一份 ranges 才命中 key——两路同读
+            // `cache.current()`（街起点预热时仍持上一街解）+ 同 `prev_within`。off / 非紧前街 → 自验退 estimate。
+            let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
+            subgame_search_prewarm(
+                solve_cache,
+                hero_pid,
+                &round_start,
+                game,
+                abs.current_node_id,
+                strategy_fn,
+                scfg,
+                rt.bucket_table.as_ref(),
+                cross_street,
+                hand_seed,
+            )
+        }
         Err(LockstepErr { synced_node, .. }) => {
             // 档一前缀 reach（生产默认开）：用已同步前缀估 range——须与决策时算出同一份 ranges 才能
             // 命中 key（hero 显式传入：range 平滑「不混」座按 hero 算，见 subgame_search_unanchored_prewarm）。
@@ -916,8 +930,9 @@ fn decide(
         let rt = search.expect("want_search ⇒ search.is_some()");
         let scfg = &rt.cfg;
         // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ 安全降级。
-        // 锚定搜索路径（lockstep Ok）：上一街也同步、无 unanchored 子树可复用 → 不取 prev_within。
-        let (auth, round_start, within, _prev_within) = match build_real_auth(
+        // 锚定搜索路径（lockstep Ok）：`prev_within` = 紧前一街完整动作线，档二′-跨街复用沿它在上一街
+        // 已解子树（anchored/unanchored 皆可，turn_blueprint_trim §2.1）读 σ 算本街后验 range。
+        let (auth, round_start, within, prev_within) = match build_real_auth(
             req,
             &solver_cfg,
             scale,
@@ -944,6 +959,11 @@ fn decide(
             ResolveRoot::CurrentDecision => &auth,
         };
         let hand_seed = hand_seed_for(req, base_seed);
+        // 档二′-跨街复用（turn_blueprint_trim §2.4 改动 D，flag 现同管锚定 + 脱锚两路）：复用缓存里上一
+        // 街已解子树的 σ 对 `prev_within`（上一街完整真实动作线）条件化得本街后验 range，覆盖 blueprint
+        // estimate（裁掉 turn blueprint 的唯一 river 消费者）。off / 缓存非紧前街 → 子树内自验退 estimate
+        // （不破现状）。预热路径（prewarm 锚定分支）同读 `cache.current()` + 同 `prev_within` → 同 key 命中。
+        let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
         // 监控：本决策搜索墙钟（build+solve；预热命中 ≈0）+ 是否现 build（misses 涨 = MISS）。
         let t0 = Instant::now();
         let misses_before = solve_cache.misses();
@@ -961,6 +981,7 @@ fn decide(
             None, // depth_limit=false 解到终局 → 无 leaf_values（§2.1）。
             // deep_menu mid-round（AllPostflop）导航：当前街真实动作序在子树上重放（缺口③细化）。
             Some(&within),
+            cross_street, // 档二′-跨街复用（上一街子树 σ 后验 range，覆盖 blueprint estimate）。
             hand_seed,
             req.actions.len() as u64,
         ) {
