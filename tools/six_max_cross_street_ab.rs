@@ -457,10 +457,19 @@ fn print_report(results: &[DealResult], deals_total: u64, top_k: usize) {
 }
 
 fn fmt_cards(cs: &[Card]) -> String {
+    const RANKS: &[u8; 13] = b"23456789TJQKA";
+    const SUITS: &[u8; 4] = b"cdhs";
     cs.iter()
-        .map(|c| format!("{c:?}"))
+        .map(|c| {
+            let v = c.to_u8();
+            format!(
+                "{}{}",
+                RANKS[(v / 4) as usize] as char,
+                SUITS[(v % 4) as usize] as char
+            )
+        })
         .collect::<Vec<_>>()
-        .join("")
+        .join(" ")
 }
 
 fn fmt_dist(d: &[(AbstractAction, f64)]) -> String {
