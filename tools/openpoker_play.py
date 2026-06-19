@@ -8,7 +8,7 @@ driver 职责（§3）：
   - WS 连 wss://openpoker.ai/ws + Bearer 鉴权；join_lobby{buy_in:2000}（锁 100BB）。
   - 累计每手 betting 历史（hand_start/hole_cards/player_action/community_cards）→ 组 advisor 请求。
   - your_turn → 调 advisor 拿 {action, amount} → 回 action{turn_token, client_action_id}。
-  - §4 码深漂移：每手后我方栈漂出 [80,125]BB → leave_table + rejoin 取 2000（控我方栈）。
+  - §4 码深漂移：每手后我方栈漂出 [80,180]BB → leave_table + rejoin 取 2000（控我方栈）。
   - §4 两人桌：一手仅 2 座发牌（HU）→ 本实现 postflop 不支持 → leave_table + 离线等 10 分钟
     重连，**连续** 5 次仍是两人桌才放弃（中途换到人多的桌即清零；HU 是 live 最大出血点，exec §3.2）。
   - 断线重连 + resync（best-effort）；限速 20 msg/s。
@@ -33,7 +33,7 @@ winners/final_stacks/shown_cards 原样，喂 Rust 侧 `openpoker_hh_aivat`
     turn_token,seat}；community_cards{cards,street}。消息分 stream:event（离散事件，driver 用）+
     stream:state（table_state 全量快照，driver 忽略，未来可改用它取 valid_actions 更鲁棒）。
 ⚠ 固有限制：真实桌**码深漂移严重**（实测同桌 14BB–800BB），blueprint 假设 100BB → off-distribution
-  手大量走 advisor 兜底（§4 已知短板，非 bug）；买入锁 2000 + 漂出 [80,125]BB leave/rejoin 只控我方栈。
+  手大量走 advisor 兜底（§4 已知短板，非 bug）；买入锁 2000 + 漂出 [80,180]BB leave/rejoin 只控我方栈。
 """
 
 import argparse
@@ -49,7 +49,7 @@ BUY_IN = 2000           # 锁 100BB（§4 码深漂移缓解①）。
 BIG_BLIND_OP = 20       # OpenPoker 默认 10/20。
 SMALL_BLIND_OP = 10
 STACK_LEAVE_LO = 80 * BIG_BLIND_OP   # 1600：我方栈 < 80BB → leave/rejoin。
-STACK_LEAVE_HI = 125 * BIG_BLIND_OP  # 2500：我方栈 > 125BB → leave/rejoin。
+STACK_LEAVE_HI = 180 * BIG_BLIND_OP  # 3600：我方栈 > 180BB → leave/rejoin。
 NUM_SEATS = 6
 _BOARD_LEN = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 
@@ -647,7 +647,7 @@ class Session:
         # 重试计数清零：重连成功换到人多的桌就不再累积，只有连续 5 次仍是两人桌才放弃）。
         if isinstance(final, dict) and len(final) >= 3:
             self.non_hu_hand_seen = True
-        # §4 码深漂移：我方栈漂出 [80,125]BB → leave_table + rejoin 取 2000。
+        # §4 码深漂移：我方栈漂出 [80,180]BB → leave_table + rejoin 取 2000。
         my_stack = None
         if hand is not None:
             my_stack = final.get(str(hand.my_seat), final.get(hand.my_seat))
