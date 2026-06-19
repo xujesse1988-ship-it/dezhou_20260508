@@ -1161,6 +1161,9 @@ def main():
     # 脱锚搜索档二′-跨街复用（advisor 默认 on；off = A/B 对照臂 / 回退到档一前缀）。
     # 不传 = 不透传，吃 advisor 默认（ON）。
     p.add_argument("--search-unanchored-cross-street", choices=["on", "off"], default=None)
+    # 仅 flop 街优先 blueprint（advisor 默认 off）：on = flop 锚定面（影子同步）走 blueprint、不搜索；
+    # flop 脱影子（off-stack all-in 等）仍实时搜索；turn/river 不受影响。不传 = 吃 advisor 默认（OFF）。
+    p.add_argument("--search-flop-prefer-blueprint", choices=["on", "off"], default=None)
     # 深码 SPR 自适应菜单（deep_menu_for：深 {1pot} / 浅 ≤3-way {0.5,1} 全层级）。
     p.add_argument("--search-deep-menu", action="store_true")
     # 子树独立桶表（如 500/500/500；blueprint 仍用 --bucket-table 的表）。
@@ -1191,6 +1194,8 @@ def main():
             extra += ["--search-unanchored-prefix-reach", args.search_unanchored_prefix_reach]
         if args.search_unanchored_cross_street is not None:
             extra += ["--search-unanchored-cross-street", args.search_unanchored_cross_street]
+        if args.search_flop_prefer_blueprint is not None:
+            extra += ["--search-flop-prefer-blueprint", args.search_flop_prefer_blueprint]
         if args.search_deep_menu:
             extra.append("--search-deep-menu")
         if args.search_bucket_table:
@@ -1205,6 +1210,9 @@ def main():
     if args.search_unanchored_cross_street is not None and not args.search:
         raise SystemExit("--search-unanchored-cross-street 需配 --search"
                          "（拒绝静默：没有搜索就没有跨街复用，否则误以为在跑 off 臂实则纯 blueprint）")
+    if args.search_flop_prefer_blueprint is not None and not args.search:
+        raise SystemExit("--search-flop-prefer-blueprint 需配 --search"
+                         "（拒绝静默：没有搜索 flop 本就走 blueprint，设此旗无意义）")
     advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
                       args.reshape, args.postflop_cap, args.seed, extra_args=extra)
     try:

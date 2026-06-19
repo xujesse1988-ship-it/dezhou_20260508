@@ -123,6 +123,14 @@ const DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH: bool = true;
 /// `--search-unanchored-cross-street off` 显式关（live A/B 对照臂 / 回退）；正确性由 search=None /
 /// cross_street=None byte-equal 单测 + 缓存 key 隔离 + prev-slot 一致性硬证（默认开不会变坏的旗）。
 const DEFAULT_SEARCH_UNANCHORED_CROSS_STREET: bool = true;
+/// flop 街「优先 blueprint」的生产默认（`--search-flop-prefer-blueprint`）：**默认关**
+/// （`false` = 保持旧行为 byte-equal——flop 锚定面命中触发就实时搜索）。`on` = 仅 flop 街改成：
+/// **脱影子（unanchored）才实时搜索、锚定（lockstep Ok / 100BB 影子同步）仍走 blueprint**。
+/// 动机：flop 锚定面 100BB 影子可信、blueprint 训练充分，实时搜索净收益不确定 + 吃建树/求解墙钟；
+/// 脱影子 flop（off-stack all-in / 结构性缺节点）blueprint 树本就缺该节点 → 仍须搜索。turn/river
+/// 不受影响（锚定面照常按 trigger 搜索）。注意脱影子路径（[`decide_search_unanchored`]）不经
+/// `should_search`/此旗 → flop unanchored 恒搜索（旧行为），此旗只抑制 **flop 锚定** 搜索。
+const DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT: bool = false;
 /// 搜索墙钟告警阈的建树余量（ms）：最坏单线程建树 ≈ 4-way@20× 宽档 ~2.7s，留 3s。
 const SEARCH_WALL_BUILD_MARGIN_MS: u128 = 3000;
 /// 无 `time_budget`（固定迭代）时的告警阈回落（ms）。
@@ -417,6 +425,11 @@ struct SearchRuntime {
     /// 拍板，同档一）；`off` 显式关 = 退档一（live A/B 对照臂 / 回退）。
     /// 仅在脱影子搜索（`decide_search_unanchored` / 脱影子预热）+ postflop turn/river 触发。
     unanchored_cross_street: bool,
+    /// `--search-flop-prefer-blueprint`（[`DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT`]）：`on` = 仅 flop
+    /// 街，锚定面（lockstep Ok / 100BB 影子同步）即使命中 trigger 也走 blueprint、不实时搜索；脱影子
+    /// flop（lockstep 失同步）照常实时搜索（[`decide_search_unanchored`] 不经此旗）。**默认关**
+    /// （`false`，旧行为 byte-equal）。turn/river 锚定面不受影响。
+    flop_prefer_blueprint: bool,
 }
 
 /// RoundStart 预热（`Request.prewarm = true`，driver `--search-prewarm` 在街起点、hero 行动
@@ -851,7 +864,11 @@ fn decide(
 
     // —— gating（设计 §1）：仅 `--search` 开 + 命中触发面才搜索；否则 blueprint。
     // should_search 只读街 + 本街是否已起注（与码深无关）→ 在 100BB `real` 上判等价真栈 auth。
-    let want_search = matches!(search, Some(rt) if should_search(&real, rt.cfg.trigger));
+    // `--search-flop-prefer-blueprint` on（[`SearchRuntime`] doc）：仅 flop 锚定面（此处 lockstep Ok）
+    // 抑制搜索回 blueprint；脱影子 flop 走上面 `decide_search_unanchored`，不经此 gating，照常搜索。
+    let want_search = matches!(search, Some(rt)
+        if should_search(&real, rt.cfg.trigger)
+            && !(rt.flop_prefer_blueprint && real.street() == poker::Street::Flop));
     // dist + outgoing 基准态：默认 = blueprint 分布 + 100BB real 算尺寸（search=None / 未触发，
     // byte-equal 旧行为）；搜索触发 = 真码深 auth 子博弈解 + auth 算尺寸（失败 → check-when-free，不回落）。
     // deep_abs_holder：缺口③ deep 搜索成功时记下与子树**同一**菜单（deep_menu_for(root_state)，
@@ -1717,6 +1734,10 @@ struct Args {
     /// 已解 unanchored 子树 σ 算本街后验 range。**默认 `true`**（[`DEFAULT_SEARCH_UNANCHORED_CROSS_STREET`]，
     /// 决策级 A/B + 机制拍板，同档一）；`off` 显式关（A/B 对照臂 / 回退）。
     search_unanchored_cross_street: bool,
+    /// `--search-flop-prefer-blueprint on|off`（[`SearchRuntime`] doc）：仅 flop 锚定面优先 blueprint
+    /// （脱影子 flop 仍搜索）。**默认 `false`**（[`DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT`]，旧行为
+    /// byte-equal）；`on` 显式开。
+    search_flop_prefer_blueprint: bool,
 }
 
 #[derive(Serialize)]
@@ -1809,6 +1830,7 @@ fn run() -> Result<(), String> {
                 bucket_table,
                 unanchored_prefix_reach: args.search_unanchored_prefix_reach,
                 unanchored_cross_street: args.search_unanchored_cross_street,
+                flop_prefer_blueprint: args.search_flop_prefer_blueprint,
             })
         }
         None => None,
@@ -1824,8 +1846,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} bucket_table={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} bucket_table={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
     }
@@ -1919,6 +1941,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_solve_threads: Option<usize> = None;
     let mut search_unanchored_prefix_reach: Option<bool> = None;
     let mut search_unanchored_cross_street: Option<bool> = None;
+    let mut search_flop_prefer_blueprint: Option<bool> = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -2015,6 +2038,19 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     }
                 });
             }
+            "--search-flop-prefer-blueprint" => {
+                // 默认关（DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT）；取值 on|off 显式覆盖。
+                let v = next_val(&mut it, &arg)?;
+                search_flop_prefer_blueprint = Some(match v.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(format!(
+                            "--search-flop-prefer-blueprint 须 on|off，得 {other}"
+                        ))
+                    }
+                });
+            }
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -2065,6 +2101,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_solve_threads.is_some()
             || search_unanchored_prefix_reach.is_some()
             || search_unanchored_cross_street.is_some()
+            || search_flop_prefer_blueprint.is_some()
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
         }
@@ -2084,6 +2121,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         // 默认开（决策级 A/B + 机制拍板，同档一）；--search-unanchored-cross-street off 显式关。
         search_unanchored_cross_street: search_unanchored_cross_street
             .unwrap_or(DEFAULT_SEARCH_UNANCHORED_CROSS_STREET),
+        // 默认关（旧行为 byte-equal）；--search-flop-prefer-blueprint on 显式开。
+        search_flop_prefer_blueprint: search_flop_prefer_blueprint
+            .unwrap_or(DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT),
     })
 }
 
@@ -2109,6 +2149,7 @@ mod tests {
             bucket_table: None,
             unanchored_prefix_reach: false,
             unanchored_cross_street: false,
+            flop_prefer_blueprint: false,
         }
     }
 
@@ -2119,6 +2160,7 @@ mod tests {
             bucket_table: None,
             unanchored_prefix_reach: true,
             unanchored_cross_street: false,
+            flop_prefer_blueprint: false,
         }
     }
 
@@ -2129,6 +2171,19 @@ mod tests {
             bucket_table: None,
             unanchored_prefix_reach: true,
             unanchored_cross_street: true,
+            flop_prefer_blueprint: false,
+        }
+    }
+
+    /// 同 [`rt`] 但开「flop 锚定面优先 blueprint」（脱影子档位仍取关，与 [`rt`] 一致——此旗只抑制
+    /// flop 锚定搜索）。
+    fn rt_flop_prefer_blueprint(cfg: SubgameSearchConfig) -> SearchRuntime {
+        SearchRuntime {
+            cfg,
+            bucket_table: None,
+            unanchored_prefix_reach: false,
+            unanchored_cross_street: false,
+            flop_prefer_blueprint: true,
         }
     }
 
@@ -3020,6 +3075,62 @@ mod tests {
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(resp, again, "同 seed 搜索须确定性（byte-equal 可复现）");
+    }
+
+    /// `--search-flop-prefer-blueprint on`：同一 **flop 锚定**触发面（100BB 对称、影子同步 = lockstep
+    /// Ok），开旗后须改走 blueprint（`source=blueprint`）而非搜索，且与 `search=None` byte-equal——
+    /// 此旗只抑制 flop 锚定搜索、不改 blueprint 输出。对照：不开旗（[`rt`]）同输入是搜索区
+    /// （`search` / `search_giveup:*`），证明改的确实是 flop 锚定路径。
+    #[test]
+    fn flop_prefer_blueprint_anchored_flop_goes_blueprint() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let req = flop_first_unraised_req(vec![2000, 2000, 2000, 2000, 2000, 2000]); // 对称 100BB → 锚定。
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            ..SubgameSearchConfig::default()
+        };
+        // search=None 基准（纯 blueprint）。
+        let off = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xB1DE,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(off.source, "blueprint");
+        // flop_prefer_blueprint on：flop 锚定面抑制搜索 → 与 search=None byte-equal。
+        let prefer = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xB1DE,
+            Some(&rt_flop_prefer_blueprint(scfg)),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(
+            off, prefer,
+            "flop 锚定面 + flop_prefer_blueprint on 须与 search=None byte-equal，得 {off:?} vs {prefer:?}"
+        );
+        // 对照：不开旗，同输入是搜索区（证明 flop 锚定路径本会搜，旗确实抑制了它）。
+        let searched = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0xB1DE,
+            Some(&rt(scfg)),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(
+            searched.source == "search" || searched.source.starts_with("search_giveup:"),
+            "不开旗：flop 锚定面本应搜索（search / search_giveup:*），得 {searched:?}"
+        );
     }
 
     /// 真码深（非对称深码：我 SB 600BB vs 其余浅）下搜索仍出合法动作（喂真栈，不 panic）。
@@ -4420,6 +4531,32 @@ mod tests {
         assert!(parse(&["--search", "--search-unanchored-cross-street", "maybe"]).is_err());
         // 拒绝静默 guard：设了 flag 未开 --search → Err。
         assert!(parse(&["--search-unanchored-cross-street", "on"]).is_err());
+    }
+
+    /// `--search-flop-prefer-blueprint on|off`（仅 flop 锚定面优先 blueprint，默认关）：默认关、
+    /// on 显式开、off 显式关、坏值拒收、未开 --search 拒收（拒绝静默 guard）。
+    #[test]
+    fn parse_args_flop_prefer_blueprint() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        // 默认关（旧行为 byte-equal：flop 锚定面命中触发仍搜索）。
+        let a = parse(&["--search"]).expect("parse Ok");
+        assert!(!a.search_flop_prefer_blueprint, "默认关");
+        // on 显式开（仅 flop 锚定面回 blueprint）。
+        let a = parse(&["--search", "--search-flop-prefer-blueprint", "on"]).expect("parse Ok");
+        assert!(a.search_flop_prefer_blueprint, "on 应开");
+        // off 显式关。
+        let a = parse(&["--search", "--search-flop-prefer-blueprint", "off"]).expect("parse Ok");
+        assert!(!a.search_flop_prefer_blueprint, "off 应关");
+        // 坏值拒收。
+        assert!(parse(&["--search", "--search-flop-prefer-blueprint", "maybe"]).is_err());
+        // 拒绝静默 guard：设了 flag 未开 --search → Err。
+        assert!(parse(&["--search-flop-prefer-blueprint", "on"]).is_err());
     }
 
     /// 档二′-跨街复用端到端（脱影子 `decide` 路径，trigger=AllPostflop 才搜 turn）：先 flop 决策解
