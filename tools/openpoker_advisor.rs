@@ -66,6 +66,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -84,7 +85,7 @@ use poker::training::openpoker_hh::hist_to_concrete;
 use poker::training::opponent_profile::{ExploitConfig, ObserveHand, OpponentProfile, Profiler};
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
-    should_search, subgame_search_cached, subgame_search_prewarm,
+    set_subgame_debug, should_search, subgame_search_cached, subgame_search_prewarm,
     subgame_search_unanchored_cached_cross_exploit, subgame_search_unanchored_prewarm_cross,
     synced_prefix_decisions, ExploitPrior, PrefixReach, ResolveRoot, SearchTrigger,
     SubgameSearchConfig, SubgameSolveCache,
@@ -148,6 +149,26 @@ fn search_wall_slow_ms(cfg: &SubgameSearchConfig) -> u128 {
     cfg.time_budget
         .map(|d| d.as_millis() + SEARCH_WALL_BUILD_MARGIN_MS)
         .unwrap_or(SEARCH_WALL_SLOW_FALLBACK_MS)
+}
+
+// ===========================================================================
+// 调试日志（--debug-log）：进程级开关，**仅 eprintln 到 stderr**——决策走的是 stdout，故 debug
+// 输出绝不污染 IPC，挂/不挂 --debug-log 发往 driver 的字节逐字节一致（off=默认零开销零输出）。
+// [`run`] 启动期一次性设置 DEBUG + 透传 [`set_subgame_debug`]（range / solve 中间数据走子博弈层）。
+// ===========================================================================
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+fn debug_on() -> bool {
+    DEBUG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 决策流水线调试一行（仅 DEBUG 开时；args 惰性求值——关时只付一次原子读）。
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        if debug_on() {
+            eprintln!("[dbg-advisor] {}", format_args!($($arg)*));
+        }
+    };
 }
 
 // ===========================================================================
@@ -806,12 +827,26 @@ fn decide(
         Ok(b) => b,
         Err(_) => return safe_fallback(&req.valid, "bad_board"),
     };
+    dlog!(
+        "decide: hole={:?} board={:?} my_seat={} button={} bb={} sb={} scale={} stacks={:?} dealt={:?} valid={:?} actions={:?}",
+        req.hole, req.board, req.my_seat, req.button_seat, req.big_blind, req.small_blind,
+        scale, req.stacks, req.dealt_seats, req.valid, req.actions
+    );
 
     // —— 座位映射（满桌 = 旧 rotate 公式；短桌 = 幻影座映射，[`seat_map`]）——
     let smap = match seat_map(req) {
         Ok(m) => m,
-        Err(reason) => return safe_fallback(&req.valid, &reason),
+        Err(reason) => {
+            dlog!("seat_map FAIL → fallback:{reason}");
+            return safe_fallback(&req.valid, &reason);
+        }
     };
+    dlog!(
+        "seat_map: hu={} to_tree={:?} phantoms={:?}",
+        smap.hu,
+        smap.to_tree,
+        smap.phantoms
+    );
     if smap.hu && !board.is_empty() {
         // OpenPoker HU 行动序是角色序（postflop BB 先），树是环序（SB 先）→ postflop 映不进
         // （[`seat_map`] doc）。顺序错位本会被重放 seat 校验拦下，这里只是把原因标清楚。
@@ -850,6 +885,16 @@ fn decide(
             reason,
             synced_node,
         }) => {
+            dlog!(
+                "lockstep DESYNC: reason={reason} synced_node={synced_node:?} board_len={} search={} → {}",
+                board.len(),
+                search.is_some(),
+                if search.is_some() && board.len() >= 3 {
+                    "unanchored search"
+                } else {
+                    "blueprint fallback/limp-heuristic"
+                }
+            );
             // 100BB 影子失同步（off-stack all-in 线等：blueprint 树按 100BB 对称栈建、该线结构性
             // 缺节点）：缺口②续——`--search` 开且 postflop → **脱影子**搜索（触发 / 子树根 /
             // within-round 导航全来自真栈重放，[`subgame_search_unanchored`]；档一前缀 reach 用
@@ -919,6 +964,17 @@ fn decide(
     let want_search = matches!(search, Some(rt)
         if should_search(&real, rt.cfg.trigger)
             && !(rt.flop_prefer_blueprint && real.street() == poker::Street::Flop));
+    dlog!(
+        "lockstep OK: street={:?} node_id={node_id:?} info_set={} legal_abs={:?} path={}",
+        street,
+        info.raw(),
+        legal_abs,
+        if want_search {
+            "search (anchored)"
+        } else {
+            "blueprint"
+        }
+    );
     // dist + outgoing 基准态：默认 = blueprint 分布 + 100BB real 算尺寸（search=None / 未触发，
     // byte-equal 旧行为）；搜索触发 = 真码深 auth 子博弈解 + auth 算尺寸（失败 → check-when-free，不回落）。
     // deep_abs_holder：缺口③ deep 搜索成功时记下与子树**同一**菜单（deep_menu_for(root_state)，
@@ -959,6 +1015,17 @@ fn decide(
             ResolveRoot::CurrentDecision => &auth,
         };
         let hand_seed = hand_seed_for(req, base_seed);
+        dlog!(
+            "anchored search auth: street={:?} pot={} current={:?} stacks={:?} committed={:?} within={} prev_within={} cross_street={} hand_seed={hand_seed}",
+            auth.street(),
+            auth.pot().as_u64(),
+            auth.current_player(),
+            auth.players().iter().map(|p| p.stack.as_u64()).collect::<Vec<_>>(),
+            auth.players().iter().map(|p| p.committed_total.as_u64()).collect::<Vec<_>>(),
+            within.len(),
+            prev_within.len(),
+            rt.unanchored_cross_street
+        );
         // 档二′-跨街复用（turn_blueprint_trim §2.4 改动 D，flag 现同管锚定 + 脱锚两路）：复用缓存里上一
         // 街已解子树的 σ 对 `prev_within`（上一街完整真实动作线）条件化得本街后验 range，覆盖 blueprint
         // estimate（裁掉 turn blueprint 的唯一 river 消费者）。off / 缓存非紧前街 → 子树内自验退 estimate
@@ -1070,6 +1137,15 @@ fn decide(
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates; // blueprint 路径恒 None（serde skip，byte-equal）。
     }
+    dlog!(
+        "decide RESULT: source={} action={} amount={:?} chosen={:?} solve_updates={:?} dist={:?}",
+        resp.source,
+        resp.action,
+        resp.amount,
+        resp.chosen,
+        resp.solve_updates,
+        resp.probs
+    );
     resp
 }
 
@@ -1564,9 +1640,27 @@ fn decide_search_unanchored(
             );
         }
     };
+    dlog!(
+        "unanchored search auth: shadow_reason={shadow_reason} synced_node={synced_node:?} street={:?} pot={} current={:?} stacks={:?} committed={:?} within={} prev_within={} prefix_reach={} cross_street={} exploit={}",
+        auth.street(),
+        auth.pot().as_u64(),
+        auth.current_player(),
+        auth.players().iter().map(|p| p.stack.as_u64()).collect::<Vec<_>>(),
+        auth.players().iter().map(|p| p.committed_total.as_u64()).collect::<Vec<_>>(),
+        within.len(),
+        prev_within.len(),
+        rt.unanchored_prefix_reach,
+        rt.unanchored_cross_street,
+        rt.exploit.is_some()
+    );
     // gating 在真栈 auth 上判（影子失同步、100BB real 不可得；should_search 只读街+本街是否起注）。
     // 未命中 / board 与真栈街对不上 → 维持旧兜底（非搜索区，labels 与 search=None 同）。
     if !should_search(&auth, scfg.trigger) || board.len() != expected_board_len(auth.street()) {
+        dlog!(
+            "unanchored gating MISS (street={:?} board_len={}) → fallback:{shadow_reason}",
+            auth.street(),
+            board.len()
+        );
         return fallback_with_floor(
             &req.valid,
             hole,
@@ -1584,6 +1678,10 @@ fn decide_search_unanchored(
         strategy: strategy_fn,
         decisions: d,
     });
+    dlog!(
+        "unanchored prefix_decisions: count={}",
+        prefix_decisions.as_ref().map_or(0, |d| d.len())
+    );
     // 档二′-跨街复用（默认关）：上一街本身 unanchored、子树已解（within-round 缓存当前条目）时，复用其
     // σ 对 `prev_within`（上一街完整真实动作线）条件化得本街后验 range，覆盖档一前缀 reach。off / 缓存
     // 非紧前街 unanchored 解 → 自验退档一（不破现状）。算出 ranges 进 solve key → 开/关自动 miss。
@@ -1696,6 +1794,11 @@ fn decide_search_unanchored(
             (!tel.is_empty()).then_some(tel)
         });
     }
+    dlog!(
+        "unanchored RESULT: source={} action={} amount={:?} chosen={:?} solve_updates={:?} exploit={:?} dist={:?}",
+        resp.source, resp.action, resp.amount, resp.chosen, resp.solve_updates, resp.exploit,
+        resp.probs
+    );
     resp
 }
 
@@ -1840,6 +1943,9 @@ struct Args {
     /// 开时可设**（拒静默 guard）。`None`（默认）= 关，全程与现网 byte-equal。子旗 `--exploit-min-hands`
     /// / `--exploit-strength` / `--exploit-converge-se` / `--exploit-converge-drift` 填 [`ExploitConfig`]。
     exploit: Option<ExploitConfig>,
+    /// `--debug-log`：打印决策流水线 + range / solve 中间数据到 **stderr**（与 `--search` 正交，
+    /// blueprint 路径也打）。`false`（默认）= 静默、零开销；on 也不动 stdout（IPC byte-equal）。
+    debug_log: bool,
 }
 
 #[derive(Serialize)]
@@ -1887,6 +1993,14 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
+    // 调试日志（--debug-log）：进程级开关 + 透传子博弈层（range / solve 中间数据）。仅 stderr。
+    DEBUG.store(args.debug_log, std::sync::atomic::Ordering::Relaxed);
+    set_subgame_debug(args.debug_log);
+    if args.debug_log {
+        eprintln!(
+            "[dbg-advisor] --debug-log ON：打印决策流水线 + range/solve 中间数据到 stderr（stdout/IPC 字节不变）"
+        );
+    }
     if !matches!(args.postflop_cap, 2..=4) {
         return Err(format!(
             "--postflop-cap must be 2/3/4, got {}",
@@ -2075,6 +2189,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_strength: Option<f64> = None;
     let mut exploit_converge_se: Option<f64> = None;
     let mut exploit_converge_drift: Option<f64> = None;
+    let mut debug_log = false;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -2184,6 +2299,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     }
                 });
             }
+            "--debug-log" => debug_log = true,
             // —— 叠加剥削（Tier 2）：--exploit 开总开关，子旗调 ExploitConfig ——
             "--exploit" => exploit_on = true,
             "--exploit-min-hands" => {
@@ -2316,6 +2432,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         // 默认关（旧行为 byte-equal）；--search-flop-prefer-blueprint on 显式开。
         search_flop_prefer_blueprint: search_flop_prefer_blueprint
             .unwrap_or(DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT),
+        debug_log,
     })
 }
 
@@ -3278,6 +3395,59 @@ mod tests {
             &mut SubgameSolveCache::new(),
         );
         assert_eq!(resp, again, "同 seed 搜索须确定性（byte-equal 可复现）");
+    }
+
+    /// `--debug-log`（[`set_subgame_debug`] + [`DEBUG`]）只往 **stderr** 打中间数据、绝不改决策：
+    /// 同一锚定搜索 + 脱锚搜索场景，debug off / on 的 [`Response`] 必逐字节相等（stdout=IPC 不变，
+    /// range / solve 全 byte-equal）。守「调试开关纯展示」契约——给 advisor 加 dlog!、给 subgame 加
+    /// range dump 都不许动求解结果。
+    #[test]
+    fn debug_log_does_not_change_decision() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        // 锚定搜索（flop 首点 100BB 对称）+ 脱锚搜索（off-stack all-in 线）两条路径都验 range dump。
+        let cases = [
+            flop_first_unraised_req(vec![2000, 2000, 2000, 2000, 2000, 2000]),
+            offstack_allin_req(),
+        ];
+        let set_dbg = |on: bool| {
+            set_subgame_debug(on);
+            DEBUG.store(on, std::sync::atomic::Ordering::Relaxed);
+        };
+        for req in &cases {
+            set_dbg(false); // off（默认）。
+            let off = decide(
+                &game,
+                &abs,
+                &uniform,
+                req,
+                0xDB6,
+                Some(&rt(scfg)),
+                &mut SubgameSolveCache::new(),
+            );
+            set_dbg(true); // on：打中间数据到 stderr。
+            let on = decide(
+                &game,
+                &abs,
+                &uniform,
+                req,
+                0xDB6,
+                Some(&rt(scfg)),
+                &mut SubgameSolveCache::new(),
+            );
+            set_dbg(false); // 复位（不给其它并行测试留 stderr 噪声）。
+            assert_eq!(
+                off, on,
+                "--debug-log 须纯展示：off/on 决策须 byte-equal，得 {off:?} vs {on:?}"
+            );
+        }
     }
 
     /// `--search-flop-prefer-blueprint on`：同一 **flop 锚定**触发面（100BB 对称、影子同步 = lockstep

@@ -20,6 +20,11 @@ winners/final_stacks/shown_cards 原样，喂 Rust 侧 `openpoker_hh_aivat`
 已累计状态、绝不动 build_request 消费的字段；挂/不挂 --hh-log advisor 请求/输出 byte-equal
 由 --selftest 的 canned 序列钉死（场景 5）。
 
+调试（--debug-log）：开后把每手中间数据打到 stderr——手起（button/座）、发牌、对手动作、决策点
+（请求摘要含真栈/幻影座 + advisor 响应全诊断字段 source/probs/info_set/solve_updates/chosen +
+实发动作包）、结果（winners/final_stacks/我方栈）。**纯展示、只读已累计状态**，不动任何发往
+advisor / ws 的字节 → IPC + 出动作 byte-equal 不受影响（与 --hh-log 同隔离原则）。
+
 两种模式：
   --selftest   离线：不连网，用 canned 6-max 消息序列把 driver↔advisor IPC + 出合法动作跑通
                （验收：advisor 全程出合法 {action,amount}、driver 组请求正确，无需账号）。
@@ -400,7 +405,7 @@ class Session:
                     "lobby_joined", "table_joined", "table_state")
 
     def __init__(self, advisor, send, num_hands, log_f=None, hh_f=None, prewarm=False,
-                 exploit=False):
+                 exploit=False, debug=False):
         self.advisor = advisor
         self.send = send
         self.num_hands = num_hands
@@ -408,6 +413,9 @@ class Session:
         self.hh_f = hh_f
         self.prewarm = prewarm  # --search-prewarm：街起点预热（缺省关 = 请求流 byte-equal）
         self.exploit = exploit  # --exploit：决策请求带 names + 每手结束发 observe（缺省关 = byte-equal）
+        # --debug-log：把牌局中间数据（手起/发牌/动作/决策请求+响应/结果）打到 stderr。**纯展示**：
+        # 只读已累计状态，绝不改 advisor 请求 / 动作包 → IPC + 出动作 byte-equal 不受影响（缺省关）。
+        self.debug = debug
         self.counters = {"hands": 0, "decisions": 0, "blueprint": 0, "search": 0,
                          "limp_heuristic": 0, "fallback": 0, "net_chips": 0,
                          "prewarms": 0,
@@ -427,6 +435,12 @@ class Session:
         # 本次连接是否打到过非两人桌手（≥3 座发牌）：run_real 据此把两人桌**连续**重试计数
         # 清零——重连后只要落到人多的桌就不再累积，只有连续都是两人桌才会逼近上限（每次连接前重置）。
         self.non_hu_hand_seen = False
+
+    def _dbg(self, msg):
+        """--debug-log：一行牌局中间数据到 stderr（仅 self.debug 开时）。纯展示、不改任何
+        发往 advisor / ws 的字节（byte-equal 不变）。"""
+        if self.debug:
+            print(f"  [dbg] {msg}", file=sys.stderr)
 
     def rejoin(self, ws, why):
         """leave + 重新 join_lobby 拿干净座位（已不在桌 / 卡死自救；服务端对未坐桌的
@@ -484,20 +498,30 @@ class Session:
         elif t == "hand_start":
             self.state["hand"] = HandState(msg.get("hand_id"), msg.get("dealer_seat"),
                                            msg.get("seat"))
+            self._dbg(f"=== hand_start hand_id={msg.get('hand_id')} "
+                      f"button={msg.get('dealer_seat')} my_seat={msg.get('seat')} ===")
         elif t == "hole_cards":
             if self.state["hand"]:
                 self.state["hand"].hole = msg.get("cards")
+                self._dbg(f"hole {' '.join(msg.get('cards') or [])}")
         elif t == "player_action":
             if self.state["hand"]:
                 ext = {k: msg[k] for k in _EXT_KEYS if k in msg}
                 self.state["hand"].on_player_action(msg.get("seat"), msg.get("action"),
                                                     msg.get("amount"), ext=ext)
                 self.state["hand"].update_stacks(msg.get("seat"), msg.get("stack"))
+                self._dbg(f"act seat={msg.get('seat')} {msg.get('action')}"
+                          + (f" amount={msg.get('amount')}"
+                             if msg.get("amount") is not None else "")
+                          + (f" stack={msg.get('stack')}"
+                             if msg.get("stack") is not None else ""))
         elif t == "community_cards":
             if self.state["hand"]:
                 self.state["hand"].on_community(msg.get("cards", []),
                                                 _street_name(msg.get("street")))
                 self._maybe_prewarm()
+                self._dbg(f"{_street_name(msg.get('street'))} "
+                          f"board={' '.join(msg.get('cards') or [])}")
         elif t == "table_state":
             # 短桌占座推断（幻影座映射）：stream:state 全量快照的 seats[].in_hand 是发牌的
             # 权威信号（your_turn.players 含等局玩家，不可用）。已弃牌者会翻 false → 并集
@@ -607,6 +631,30 @@ class Session:
             self.log_f.write(json.dumps({"req": req, "resp": resp, "sent": out},
                                         ensure_ascii=False) + "\n")
             self.log_f.flush()
+        if self.debug:
+            self._dbg_decision(hand, req, resp, out)
+
+    def _dbg_decision(self, hand, req, resp, out):
+        """--debug-log：决策点中间数据——请求摘要（含真栈 / 幻影座）、advisor 响应全诊断字段
+        （source / probs / info_set / solve_updates / chosen / exploit）、实发动作包。req/resp/out
+        已成形，只读不改（byte-equal 不变）。"""
+        v = req.get("valid", {})
+        acts = ",".join(a for a, ok in (("check", v.get("can_check")),
+                                        ("call", v.get("can_call")),
+                                        ("raise", v.get("can_raise"))) if ok) or "—"
+        rng = (f" raise=[{v.get('min_raise')},{v.get('max_raise')}]"
+               if v.get("can_raise") else "")
+        self._dbg(f"your_turn street={hand.street} hole={''.join(hand.hole or [])} "
+                  f"board={' '.join(hand.board or [])} valid={{{acts}}}{rng}"
+                  + (f" stacks={req['stacks']}" if "stacks" in req else "")
+                  + (f" dealt={req['dealt_seats']}" if "dealt_seats" in req else ""))
+        extra = " ".join(f"{k}={resp[k]}" for k in
+                         ("info_set", "solve_updates", "chosen", "probs", "exploit")
+                         if resp.get(k) is not None)
+        self._dbg(f"decide action={resp.get('action')} amount={resp.get('amount')} "
+                  f"source={resp.get('source')}" + (f"  {extra}" if extra else ""))
+        self._dbg(f"sent action={out['action']} amount={out['amount']} "
+                  f"id={out['client_action_id']}")
 
     def _handle_hand_result(self, ws, msg):
         self.last_hand_ts = time.time()
@@ -632,6 +680,15 @@ class Session:
                 # 中途入桌 / 重连后第一手：本手没跟到开头，丢弃并计数（不落半截手）。
                 self.counters["hh_skipped"] += 1
         final = msg.get("final_stacks", {})
+        if self.debug:
+            my_seat = hand.my_seat if hand is not None else None
+            my_final = (final.get(str(my_seat), final.get(my_seat))
+                        if my_seat is not None else None)
+            self._dbg(f"hand_result winners={msg.get('winners')} pot={msg.get('pot')} "
+                      f"final_stacks={final}"
+                      + (f" my_stack={my_final}" if my_final is not None else "")
+                      + (f" shown={msg.get('shown_cards')}"
+                         if msg.get("shown_cards") else ""))
         # 两人桌（HU）检测：final_stacks 键集 = 本手发牌座（盲注跳空座，exec §3.2）→ 恰 2 座
         # = 两人桌。本实现 postflop 不支持 HU → 主动离场、关连接，由 run_real 等 10 分钟后重连
         # （连续最多 5 次）。在码深漂移 rejoin 之前判：HU 要的是断开等待、不是就地换座（同桌还是两人）。
@@ -667,7 +724,7 @@ def _ws_send(ws, obj):
 
 
 def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=False,
-             exploit=False):
+             exploit=False, debug=False):
     import threading
 
     import websocket  # 延迟 import：离线 selftest 不需要 websocket-client
@@ -676,7 +733,7 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
     log_f = open(action_log, "a") if action_log else None
     hh_f = open(hh_log, "a") if hh_log else None
     session = Session(advisor, send=_ws_send, num_hands=num_hands, log_f=log_f, hh_f=hh_f,
-                      prewarm=prewarm, exploit=exploit)
+                      prewarm=prewarm, exploit=exploit, debug=debug)
 
     # 看门狗线程：被移出桌 / 桌散后服务端不再推任何消息，回调模型里没有别的唤醒点。
     stop_watchdog = threading.Event()
@@ -1218,6 +1275,10 @@ def main():
     p.add_argument("--hh-log", default="openpoker_hh.jsonl",
                    help="每手落全桌 HH JSONL（append 累积；§4.2 数据管道）；空串关闭")
     p.add_argument("--selftest", action="store_true", help="离线验 IPC，不连网（无需账号）")
+    p.add_argument("--debug-log", action="store_true",
+                   help="打印牌局中间数据到 stderr（driver 侧：手起/发牌/对手动作/决策请求+响应/"
+                        "实发动作/结果）+ 透传 advisor（内部：座位映射/lockstep 同步/真栈 auth/"
+                        "range 来源+per-seat 摘要/solve）；纯展示、不改 IPC（byte-equal 不变）")
     # 缺口② 实时搜索（透传给 Rust advisor；开了才送 stacks 真栈、postflop 触发面 re-solve）。
     p.add_argument("--search", action="store_true",
                    help="开实时子博弈搜索（postflop 触发面用真码深 re-solve；缺省纯 blueprint）")
@@ -1294,6 +1355,10 @@ def main():
             extra += ["--exploit-converge-se", str(args.exploit_converge_se)]
         if args.exploit_converge_drift is not None:
             extra += ["--exploit-converge-drift", str(args.exploit_converge_drift)]
+    # --debug-log 透传给 advisor：打印决策流水线 + range/solve 中间数据（与 --search 正交，
+    # blueprint 路径也打）。driver 侧的牌局中间数据 + advisor 内部数据由同一旗一起开。
+    if args.debug_log:
+        extra.append("--debug-log")
     if args.exploit and not args.search:
         raise SystemExit("--exploit 需配 --search（剥削只挂脱锚搜索路径；没有搜索无处叠加）")
     if (args.exploit_min_hands is not None or args.exploit_strength is not None
@@ -1323,7 +1388,8 @@ def main():
             log = args.action_log if args.action_log else None
             run_real(advisor, args.api_key, args.num_hands, action_log=log,
                      hh_log=args.hh_log if args.hh_log else None,
-                     prewarm=args.search_prewarm, exploit=args.exploit)
+                     prewarm=args.search_prewarm, exploit=args.exploit,
+                     debug=args.debug_log)
     finally:
         advisor.close()
 

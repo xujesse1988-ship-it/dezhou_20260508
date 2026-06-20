@@ -28,7 +28,7 @@
 //!   终局、不查 blueprint 值，故子树自洽即可；6b 接 blueprint 续局值时再做 local↔global 映射。
 
 use std::collections::BTreeSet;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,6 +54,71 @@ use crate::training::opponent_profile::OpponentProfile;
 use crate::training::sampling::sample_discrete;
 use crate::training::subgame_leaf_value::LeafValueTables;
 use crate::training::trainer::{EsMccfrTrainer, Trainer};
+
+// ===========================================================================
+// 调试日志（advisor `--debug-log`）：进程级开关，**仅 eprintln 到 stderr**，绝不改任何计算值
+// → CFR / range / solve 全 byte-equal，所有测试不受影响（off=默认，零开销零输出）。
+// 由 advisor 启动期 [`set_subgame_debug`] 一次性设置。dump 子博弈层最关键的中间数据 = root range
+// （脱锚 / 锚定路径解 CFR 前喂进去的 per-seat 先验，[`SubgameNlheGame::ranges`]）。
+// ===========================================================================
+static SUBGAME_DEBUG: AtomicBool = AtomicBool::new(false);
+
+/// 开 / 关子博弈层调试日志（range / solve 中间数据 → stderr）。advisor `--debug-log` 调用；
+/// `false`（默认）= 完全静默、零开销。纯展示开关，不影响任何求解结果。
+pub fn set_subgame_debug(on: bool) {
+    SUBGAME_DEBUG.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn subgame_debug_on() -> bool {
+    SUBGAME_DEBUG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 单张牌 → `"Ah"` 风格（rank=idx/4，suit=idx%4；与 advisor `parse_card` 同序，调试可读）。
+fn debug_card_label(c: Card) -> String {
+    const R: [char; 13] = [
+        '2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A',
+    ];
+    const S: [char; 4] = ['c', 'd', 'h', 's'];
+    let v = c.to_u8();
+    format!("{}{}", R[(v / 4) as usize], S[(v % 4) as usize])
+}
+
+/// per-seat root range 摘要（每座：非零组合数 / 权重和 / 权重最高的前 6 个底牌组合，归一化）。
+/// `ranges[seat]` 为空 = 弃牌座（range 不被读）→ 跳过。仅 debug 开时输出；下标对齐
+/// [`all_hole_combos`]。检查「先验 range 是否合理」用（如对手范围有没有错塌成噪声窄）。
+fn debug_dump_ranges(tag: &str, ranges: &[Vec<f64>], holes: &[[Card; 2]]) {
+    if !subgame_debug_on() {
+        return;
+    }
+    for (seat, r) in ranges.iter().enumerate() {
+        if r.is_empty() {
+            continue; // 弃牌座
+        }
+        let sum: f64 = r.iter().sum();
+        let nz = r.iter().filter(|&&p| p > 0.0).count();
+        let norm = if sum > 0.0 { sum } else { 1.0 };
+        let mut idx: Vec<usize> = (0..r.len()).collect();
+        idx.sort_by(|&a, &b| r[b].partial_cmp(&r[a]).unwrap_or(std::cmp::Ordering::Equal));
+        let top: String = idx
+            .iter()
+            .take(6)
+            .filter(|&&i| r[i] > 0.0)
+            .map(|&i| {
+                format!(
+                    "{}{}={:.3}",
+                    debug_card_label(holes[i][0]),
+                    debug_card_label(holes[i][1]),
+                    r[i] / norm
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "[dbg-subgame] {tag} range seat={seat} nonzero={nz}/{len} sum={sum:.4} top: {top}",
+            len = r.len()
+        );
+    }
+}
 
 /// depth-limit 叶子查哪个续局值（[`SubgameLeafCtx::cont_policy`]）。
 ///
@@ -2218,9 +2283,30 @@ fn subgame_search_cached_inner(
     // 捕获，记录在下面 solve 的 `(Some(c), Some(key))` 臂（c 已 &mut，cache=Some ⟺ 走该臂；cross_street
     // =None 不计入分母）。
     let cross_hit = cross_ranges.is_some();
-    // 跨街复用优先（命中即 owned，覆盖 estimate_range）；否则用上面的 blueprint estimate（仍 None →
-    // uniform）。cross 关 / 不可复用 → cross_ranges=None → ranges_opt 原样（与改动前逐位 byte-equal）。
+    let est_hit = ranges_opt.is_some(); // 调试：range 来源标注用（cross > blueprint_estimate > uniform）。
+                                        // 跨街复用优先（命中即 owned，覆盖 estimate_range）；否则用上面的 blueprint estimate（仍 None →
+                                        // uniform）。cross 关 / 不可复用 → cross_ranges=None → ranges_opt 原样（与改动前逐位 byte-equal）。
     let ranges_opt = cross_ranges.or(ranges_opt);
+    // —— 调试（--debug-log）：solve 前 dump 本次锚定搜索的 root range 来源 + per-seat 摘要 ——
+    if subgame_debug_on() {
+        let src = if cross_hit {
+            "cross_street_posterior"
+        } else if est_hit {
+            "blueprint_estimate"
+        } else {
+            "uniform"
+        };
+        eprintln!(
+            "[dbg-subgame] anchored solve: street={:?} hero_seat={auth_actor} entrants={entrants:#08b} \
+             raises_on_street={raises_on_street} hand_seed={hand_seed} range_src={src} deep_menu={} range_mix={}",
+            root_state.street(),
+            cfg.deep_menu,
+            cfg.range_uniform_mix
+        );
+        if let Some(r) = ranges_opt.as_deref() {
+            debug_dump_ranges("anchored", r, &all_hole_combos());
+        }
+    }
     let key = cache.as_ref().map(|_| {
         solve_cache_key(
             KEY_KIND_ANCHORED,
@@ -3043,12 +3129,14 @@ fn subgame_search_unanchored_cached_inner(
         )
     });
     // 跨街复用优先（命中即 owned，覆盖档一）；否则用档一前缀 reach（仍 None → uniform）。
+    let prefix_hit = prefix_ranges.is_some(); // 调试：range 来源标注用（cross > prefix > uniform）。
     let mut ranges_opt: Option<Vec<Vec<f64>>> = cross_ranges.or(prefix_ranges);
 
     // 叠加剥削 Tier 2（exploit_strategy_design §2/§4）：在 GTO range 上对已收敛对手座按观测翻前
     // VPIP 宽度凸混合。`exploit = None`（默认 / --exploit 关）→ 此块不执行 → ranges_opt 不变、与
     // 既有 _cross 路径逐位 byte-equal。剥削后的 ranges 同进下面的 solve_cache_key → 开/关/画像更新
     // 自动 cache-miss、不串均衡。hero（auth_actor）座永不动（apply_exploit_width_prior 内守）。
+    let exploit_active = exploit.is_some(); // 调试：剥削是否参与（消费 exploit 前捕获）。
     if let Some(ep) = exploit {
         let holes = all_hole_combos();
         let board: Vec<Card> = root_state.board().to_vec();
@@ -3060,6 +3148,27 @@ fn subgame_search_unanchored_cached_inner(
             &board,
             ep.alpha,
         );
+    }
+
+    // —— 调试（--debug-log）：solve 前 dump 本次脱锚搜索的 root range 来源 + per-seat 摘要 ——
+    if subgame_debug_on() {
+        let src = if cross_hit {
+            "cross_street_posterior"
+        } else if prefix_hit {
+            "prefix_reach"
+        } else {
+            "uniform"
+        };
+        eprintln!(
+            "[dbg-subgame] unanchored solve: street={:?} hero_seat={auth_actor} entrants={entrants:#08b} \
+             hand_seed={hand_seed} range_src={src} exploit={exploit_active} deep_menu={} range_mix={}",
+            root_state.street(),
+            cfg.deep_menu,
+            cfg.range_uniform_mix
+        );
+        if let Some(r) = ranges_opt.as_deref() {
+            debug_dump_ranges("unanchored", r, &all_hole_combos());
+        }
     }
 
     // 子树 solve 实际用表（同 anchored：override 优先，否则 blueprint 表 byte-equal）。
