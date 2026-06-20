@@ -173,6 +173,24 @@ prewarm 时 turn 仍在主 slot）+ 同 `prev_within` → 同 ranges → 同 key
 5. **复用命中率实测**：插桩数 river 决策里 `cross_ranges=Some` 占比（锚定 + 脱锚分别）。
    12s / 24 线程 / 1000 桶下 turn 一般能解出（非 giveup），命中率应高；但 off-menu 导航失配 +
    giveup 会拉低。**只有命中率足够高，裁 turn 才接近无损**——这是裁剪的 go/no-go 闸。
+   - **✅ 已做（2026-06-20，commit `bc07c19`）= 锚定主体 GO**：①`SubgameSolveCache` 加
+     `cross_attempts`/`cross_hits` 计数（两 inner 的 cross 块算完 cross_ranges 后、在 solve 的
+     `(Some(c),Some(key))` 臂里 `record_cross`；与 solve-key 的 hits/misses 正交；单测
+     `cross_telemetry_counts_attempts_and_hits` 钉空缓存→(1,0)/flop cross=None 不计/turn 复用 flop
+     →(1,1)）。②`six_max_cross_street_ab --hitrate` 自对弈模式：blueprint 驱动全座生成真分布 on-tree
+     手，hero 轮转、每手常驻 cache 先解 turn → river 决策 cross=Some(turn_within)，delta cache 跨街
+     计数。**关键口径**：`estimate_range`（读 turn σ）在 cross 前**无条件**跑——裁 turn 后它对缺失
+     key 退 uniform（§5.1），cross **命中即用后验覆盖、恢复 turn 信息**；未命中则留 uniform = §3
+     退化。故命中率 = 裁剪**无损度**。**实测**（真 200 桶 + 真 blueprint，自对弈）：**锚定 river
+     cross 命中率 = 100%**（nolimp 1B：25/25、232/232；preopen 10B：389/389；跨 seed/blueprint
+     一致），**0 turn-giveup / 0 off-menu**。→ 裁 turn 对**锚定（on-tree）river 主体无损**（cross 永远
+     恢复 turn 后验，§3 退化从不触发）。**诚实边界**：(a) 自对弈全 on-tree → off-menu 失配 ≈0 by
+     construction（且 `map_off_tree` 总能映、结构性失配本就罕见）；(b) 固定 iter（1500），turn-giveup
+     已 0、生产 12s/24 线程只会更少 → 命中率本读数是**下界**；(c)「river hero search 本身 giveup」
+     ~46%（低 iter river 桶欠采样，正交——cross 在 solve 前已记，不影响命中率，生产高 iter 大降）；
+     (d) **脱锚（off-stack/4way）river 尾自对弈触发 ~0 → 未测**，须 live（advisor 已插桩
+     cross_attempts/cross_hits，开 off 臂跑 live 回填）。脱锚是 river 决策的小尾、机制同（turn 解→cross
+     fire），但数值未实测确认。
 
 ## 5. 裁剪步骤（gate 全过之后，独立一步）
 
