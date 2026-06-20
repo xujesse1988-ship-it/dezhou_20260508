@@ -46,8 +46,12 @@ pub struct ObserveHand {
 pub struct OpponentProfile {
     /// 翻前入池率 ∈ [0,1]（翻前宽度 tilt 唯一驱动量）。
     pub vpip: f64,
-    /// 翻前加注率 ∈ [0,1]（v1 仅遥测）。
+    /// 翻前加注率 ∈ [0,1]（PFR-aware 形状用：见 [`pfr_converged`](Self::pfr_converged)）。
     pub pfr: f64,
+    /// PFR 是否也收敛（`se(pfr) ≤ converge_se`，分母同 VPIP 门的 `n_preflop`）。`true` 才允许搜索层
+    /// 据 PFR 选 `CallBand`/`RaiseBand` 形状；`false` → 退 `TopK`（仅 VPIP）。VPIP 已收敛是前提
+    /// （`profile_for` 只在 VPIP 三门全过才产出画像）。
+    pub pfr_converged: bool,
     /// 翻后激进度 = (bet+raise+allin)/call（v1 仅遥测 + 未来激进度轴）。
     pub postflop_af: f64,
     /// 翻前样本量（收敛门分母）。
@@ -69,6 +73,10 @@ pub struct ExploitConfig {
     pub strength_alpha: f64,
     /// 漂移检测的近窗手数。
     pub window: usize,
+    /// PFR-aware 宽度形状开关（advisor `--exploit-pfr-shape`）。`false`（默认）= 全程 `TopK`（仅 VPIP，
+    /// 与现有 exploit 行为逐位 byte-equal）；`true` = 据对手 PFR 收敛性 + 本手翻前入池方式选
+    /// `CallBand`（被动入池掐顶端）/`RaiseBand`（主动入池收顶端）。
+    pub pfr_shape: bool,
 }
 
 impl Default for ExploitConfig {
@@ -79,6 +87,7 @@ impl Default for ExploitConfig {
             converge_drift: 0.08,
             strength_alpha: 0.5,
             window: 50,
+            pfr_shape: false,
         }
     }
 }
@@ -240,11 +249,16 @@ impl Profiler {
             }
         }
         let pfr = f64::from(st.pfr_count) / n;
+        // PFR 也用同口径 SE 门（分母同 n_preflop，VPIP 三门已过 → n≥min_hands）。se(pfr)=0（pfr=0/1，
+        // 如 3bet=0 的纯被动跟注站）天然收敛 = 我们对其「不加注」很确定。
+        let se_pfr = (pfr * (1.0 - pfr) / n).sqrt();
+        let pfr_converged = se_pfr <= self.cfg.converge_se;
         let denom = st.postflop_passive.max(1);
         let postflop_af = f64::from(st.postflop_aggr) / f64::from(denom);
         Some(OpponentProfile {
             vpip,
             pfr,
+            pfr_converged,
             postflop_af,
             n_preflop: st.n_preflop,
             n_postflop: st.postflop_aggr + st.postflop_passive,

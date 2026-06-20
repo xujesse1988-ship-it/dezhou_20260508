@@ -1583,6 +1583,92 @@ fn build_real_auth(
     Ok((auth, round_start, within, prev_within))
 }
 
+/// PFR-aware 形状用：一个对手座本手**翻前**的入池方式（[`preflop_entry_kinds`] 重放判定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreflopEntry {
+    /// 无翻前动作记录 / 重放失败 / 该座弃牌 → 不据 PFR 选形状（退 `TopK`）。
+    Unknown,
+    /// 仅 limp/call/check 进池（无主动加注）→ `CallBand`（掐顶端会加注的强牌）。
+    Passive,
+    /// 翻前 raise/bet/all_in 过（主动入池）→ `RaiseBand`（收到顶端加注 range）。
+    Aggressive,
+}
+
+/// 重放本手**翻前街**，返回每个 solver tree seat 的入池方式（[`PreflopEntry`]，下标 = tree seat）。
+/// 纯函数（只读 `req`+`smap`+`solver_cfg`）：真栈建不出 / 重放失同步 / 脏动作 / 溢出 → 全
+/// `Unknown`（caller 退 `TopK`，保守安全）。只看翻前——街一进 flop 即停。与 [`build_real_auth`]
+/// 同重放口径（真栈 config + 幻影 fold + [`hist_to_concrete`]），但不注入牌、不要求轮到 hero。
+fn preflop_entry_kinds(
+    req: &Request,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+) -> [PreflopEntry; N_SEATS] {
+    let unknown = [PreflopEntry::Unknown; N_SEATS];
+    let Ok(real_cfg) = real_stacks_config(req, solver_cfg, scale, smap) else {
+        return unknown;
+    };
+    let mut st = GameState::new(&real_cfg, REAL_REPLAY_SEED);
+    let mut kinds = unknown;
+    let phantom = smap.phantoms.iter().map(|&t| (t, "fold".to_string(), None));
+    let acts: Vec<(u8, String, Option<u64>)> = match req
+        .actions
+        .iter()
+        .map(|h| {
+            Ok((
+                smap.tree_seat(h.seat).map_err(|e| e.to_string())?,
+                h.action.clone(),
+                h.to,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()
+    {
+        Ok(v) => v,
+        Err(_) => return unknown,
+    };
+    for (actor, action, to_op) in phantom.chain(acts) {
+        if st.street() != poker::Street::Preflop {
+            break; // 只看翻前街
+        }
+        if st.current_player() != Some(SeatId(actor)) {
+            return unknown; // 失同步 → 保守退 TopK
+        }
+        // 在 apply 前分类（此动作属翻前）：raise/bet/all_in 锁 Aggressive；call/check 升 Passive
+        // （若未锁 Aggressive，含 BB option check）；fold 不改（弃牌座翻后不在 root range、不被剥削）。
+        let slot = &mut kinds[actor as usize];
+        match action.as_str() {
+            "raise" | "bet" | "all_in" => *slot = PreflopEntry::Aggressive,
+            "call" | "check" if *slot != PreflopEntry::Aggressive => *slot = PreflopEntry::Passive,
+            _ => {}
+        }
+        let to_solver = match to_op.map(|t| t.checked_mul(scale)) {
+            Some(Some(v)) => Some(v),
+            Some(None) => return unknown, // 溢出
+            None => None,
+        };
+        let Some(concrete) = hist_to_concrete(&st, &action, to_solver) else {
+            return unknown;
+        };
+        if st.apply(concrete).is_err() {
+            return unknown;
+        }
+    }
+    kinds
+}
+
+/// `(--exploit-pfr-shape 开关, 该座 PFR 是否收敛, 本手翻前入池方式)` → 宽度形状。off / PFR 未收敛 /
+/// 入池方式未知 → `TopK`（仅 VPIP，与现有 exploit 逐位 byte-equal）。
+fn pick_shape(on: bool, pfr_converged: bool, entry: PreflopEntry) -> ExploitShape {
+    if !on || !pfr_converged {
+        return ExploitShape::TopK;
+    }
+    match entry {
+        PreflopEntry::Passive => ExploitShape::CallBand,
+        PreflopEntry::Aggressive => ExploitShape::RaiseBand,
+        PreflopEntry::Unknown => ExploitShape::TopK,
+    }
+}
+
 /// 缺口②续（v1 边界①收口）：**影子失同步区**的脱影子搜索。off-stack all-in 线上 100BB 影子 /
 /// blueprint 全局树**结构性缺节点**（树按 100BB 对称栈建：短码 shove 在树里是全栈 all-in，
 /// 「raise-over / call 完还活着」的后续节点不存在）→ lockstep 重放必失同步、拿不到 node_id。
@@ -1690,11 +1776,21 @@ fn decide_search_unanchored(
     // 开、对手已收敛）。owned 快照，`borrow` 随即释放（solve 并行不碰 Profiler，只吃此快照）。hero 座
     // 按 OpenPoker my_seat 跳过（subgame apply_exploit_width_prior 再守一层）。`None` = 不剥削 →
     // _cross_exploit 走 exploit=None 分支，与既有 search:unanchored 逐位 byte-equal。
-    let exploit_owned: Option<(Vec<Option<OpponentProfile>>, f64)> =
+    let exploit_owned: Option<(Vec<Option<OpponentProfile>>, f64, Vec<ExploitShape>)> =
         rt.exploit.as_ref().map(|cell| {
             let prof = cell.borrow();
             let alpha = prof.cfg().strength_alpha;
+            let pfr_shape_on = prof.cfg().pfr_shape;
             let mut profiles: Vec<Option<OpponentProfile>> = vec![None; N_SEATS];
+            let mut shapes: Vec<ExploitShape> = vec![ExploitShape::TopK; N_SEATS];
+            // PFR-aware（--exploit-pfr-shape）：重放翻前判各对手座本手入池方式（被动→CallBand 掐顶端 /
+            // 主动→RaiseBand 收顶端），且仅当该座 PFR 也收敛才用。off → 全 Unknown → 全 TopK（仅 VPIP，
+            // 与现有 exploit 逐位 byte-equal）；重放失败同样退 TopK（安全）。索引 = solver tree seat。
+            let entry_kinds = if pfr_shape_on {
+                preflop_entry_kinds(req, solver_cfg, scale, smap)
+            } else {
+                [PreflopEntry::Unknown; N_SEATS]
+            };
             for op_seat in 0..N_SEATS {
                 if op_seat == req.my_seat as usize {
                     continue; // hero
@@ -1705,17 +1801,19 @@ fn decide_search_unanchored(
                 if let Some(name) = req.names.get(&(op_seat as u8)) {
                     if let Some(p) = prof.profile_for(name) {
                         profiles[tree as usize] = Some(p);
+                        shapes[tree as usize] =
+                            pick_shape(pfr_shape_on, p.pfr_converged, entry_kinds[tree as usize]);
                     }
                 }
             }
-            (profiles, alpha)
+            (profiles, alpha, shapes)
         });
     let exploit_prior = exploit_owned
         .as_ref()
-        .map(|(profiles, alpha)| ExploitPrior {
+        .map(|(profiles, alpha, shapes)| ExploitPrior {
             profiles: profiles.as_slice(),
             alpha: *alpha,
-            shape: ExploitShape::TopK, // 生产仅 VPIP（byte-equal）；PFR-aware 形状仅 demo 工具用。
+            shapes: shapes.as_slice(), // off / 未收敛 PFR / 重放失败 → 全 TopK（byte-equal）。
         });
     let t0 = Instant::now();
     let misses_before = solve_cache.misses();
@@ -1786,7 +1884,7 @@ fn decide_search_unanchored(
         resp.solve_updates = solve_updates;
         // 叠加剥削遥测：本决策实际剥削了哪些对手座（已收敛）+ 其 VPIP。无收敛对手 → None
         // （serde skip → byte-equal）。
-        resp.exploit = exploit_owned.as_ref().and_then(|(profiles, _)| {
+        resp.exploit = exploit_owned.as_ref().and_then(|(profiles, _, _)| {
             let tel: Vec<(u8, f64)> = profiles
                 .iter()
                 .enumerate()
@@ -2072,8 +2170,9 @@ fn run() -> Result<(), String> {
         if let Some(cell) = &rt.exploit {
             let ec = *cell.borrow().cfg();
             eprintln!(
-                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): min_hands={} strength_alpha={} converge_se={} converge_drift={} window={}（进程内画像、不依赖过往）",
-                ec.min_hands, ec.strength_alpha, ec.converge_se, ec.converge_drift, ec.window
+                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): min_hands={} strength_alpha={} converge_se={} converge_drift={} window={} pfr_shape={}（进程内画像、不依赖过往）",
+                ec.min_hands, ec.strength_alpha, ec.converge_se, ec.converge_drift, ec.window,
+                if ec.pfr_shape { "ON(CallBand/RaiseBand)" } else { "off(TopK/仅VPIP)" }
             );
         }
     }
@@ -2190,6 +2289,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_strength: Option<f64> = None;
     let mut exploit_converge_se: Option<f64> = None;
     let mut exploit_converge_drift: Option<f64> = None;
+    let mut exploit_pfr_shape = false;
     let mut debug_log = false;
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -2337,6 +2437,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 }
                 exploit_converge_drift = Some(v);
             }
+            "--exploit-pfr-shape" => {
+                // PFR-aware 宽度形状（被动入池→CallBand / 主动→RaiseBand，需 PFR 收敛）。默认关
+                // = 全 TopK（仅 VPIP，byte-equal 当前 exploit）；on 显式开（A/B 用）。
+                exploit_pfr_shape = match next_val(&mut it, &arg)?.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => return Err(format!("--exploit-pfr-shape 须 on|off，得 {other}")),
+                };
+            }
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -2398,7 +2507,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         && (exploit_min_hands.is_some()
             || exploit_strength.is_some()
             || exploit_converge_se.is_some()
-            || exploit_converge_drift.is_some())
+            || exploit_converge_drift.is_some()
+            || exploit_pfr_shape)
     {
         return Err("设了 --exploit-* 参数但未开 --exploit".to_string());
     }
@@ -2413,6 +2523,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             converge_drift: exploit_converge_drift.unwrap_or(d.converge_drift),
             strength_alpha: exploit_strength.unwrap_or(d.strength_alpha),
             window: d.window,
+            pfr_shape: exploit_pfr_shape,
         }
     });
     Ok(Args {
@@ -4911,6 +5022,105 @@ mod tests {
         assert!((e.strength_alpha - 0.3).abs() < 1e-12);
         // 出界拒收。
         assert!(parse(&["--search", "--exploit", "--exploit-strength", "1.5"]).is_err());
+        // --exploit-pfr-shape：默认关、on 显式开、脏值拒收、无 --exploit 拒收。
+        assert!(
+            !parse(&["--search", "--exploit"])
+                .unwrap()
+                .exploit
+                .unwrap()
+                .pfr_shape
+        );
+        assert!(
+            parse(&["--search", "--exploit", "--exploit-pfr-shape", "on"])
+                .unwrap()
+                .exploit
+                .unwrap()
+                .pfr_shape
+        );
+        assert!(parse(&["--search", "--exploit", "--exploit-pfr-shape", "x"]).is_err());
+        assert!(
+            parse(&["--search", "--exploit-pfr-shape", "on"]).is_err(),
+            "--exploit-pfr-shape 无 --exploit 应拒收"
+        );
+    }
+
+    #[test]
+    fn pick_shape_guards_byte_equal() {
+        use PreflopEntry::*;
+        // off → 恒 TopK（与现有 exploit byte-equal），无论入池方式 / PFR 收敛。
+        assert_eq!(pick_shape(false, true, Passive), ExploitShape::TopK);
+        assert_eq!(pick_shape(false, true, Aggressive), ExploitShape::TopK);
+        // on 但 PFR 未收敛 → TopK（退仅 VPIP）。
+        assert_eq!(pick_shape(true, false, Passive), ExploitShape::TopK);
+        // on + PFR 收敛 → 按入池方式选。
+        assert_eq!(pick_shape(true, true, Passive), ExploitShape::CallBand);
+        assert_eq!(pick_shape(true, true, Aggressive), ExploitShape::RaiseBand);
+        assert_eq!(pick_shape(true, true, Unknown), ExploitShape::TopK);
+    }
+
+    #[test]
+    fn preflop_entry_kinds_classifies_aggressor_vs_caller() {
+        // 满 6-max：UTG(3) 开池加注、HJ(4) 平跟、BB(2) 平跟、其余弃 → UTG=Aggressive、HJ/BB=Passive。
+        let req = Request {
+            hole: vec!["Td".into(), "Th".into()],
+            board: vec![],
+            button_seat: 0,
+            my_seat: 1,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                HistAction {
+                    seat: 3,
+                    action: "raise".into(),
+                    to: Some(60),
+                },
+                HistAction {
+                    seat: 4,
+                    action: "call".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 5,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 0,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 1,
+                    action: "fold".into(),
+                    to: None,
+                },
+                HistAction {
+                    seat: 2,
+                    action: "call".into(),
+                    to: None,
+                },
+            ],
+            valid: ValidActions {
+                can_check: true,
+                can_call: false,
+                can_raise: true,
+                min_raise: Some(200),
+                max_raise: Some(10000),
+            },
+            stacks: vec![2000; 6],
+            dealt_seats: vec![],
+            names: Default::default(),
+        };
+        let solver_cfg = TableConfig::default_6max_100bb();
+        let scale = solver_cfg.big_blind.as_u64() / req.big_blind; // 5
+        let smap = seat_map(&req).expect("seat_map");
+        let kinds = preflop_entry_kinds(&req, &solver_cfg, scale, &smap);
+        let kind_of = |op_seat: u8| kinds[smap.tree_seat(op_seat).unwrap() as usize];
+        assert_eq!(kind_of(3), PreflopEntry::Aggressive, "UTG 开池加注");
+        assert_eq!(kind_of(4), PreflopEntry::Passive, "HJ 平跟");
+        assert_eq!(kind_of(2), PreflopEntry::Passive, "BB 平跟");
+        assert_eq!(kind_of(5), PreflopEntry::Unknown, "弃牌座不分类");
     }
 
     /// `Request` 解析 `names`（serde 默认；缺省 = 空 → 旧请求 byte-equal）。

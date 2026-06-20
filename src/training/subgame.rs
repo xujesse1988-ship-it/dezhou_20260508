@@ -1268,13 +1268,14 @@ pub enum ExploitShape {
 }
 
 /// 剥削先验输入（决策路径传 [`subgame_search_unanchored_cached_cross_exploit`]）：per-solver-seat
-/// 画像（下标 = solver seat；`None` = 该座不剥削 / 未收敛 / 是 hero）+ 混合强度 α + 宽度形状。
+/// 画像（下标 = solver seat；`None` = 该座不剥削 / 未收敛 / 是 hero）+ 混合强度 α + per-seat 形状。
 #[derive(Clone, Copy)]
 pub struct ExploitPrior<'a> {
     pub profiles: &'a [Option<OpponentProfile>],
     pub alpha: f64,
-    /// `w` 形状（[`ExploitShape`]）。生产默认 `TopK`（仅 VPIP，byte-equal）。
-    pub shape: ExploitShape,
+    /// per-solver-seat `w` 形状（[`ExploitShape`]，下标 = solver seat）。缺位 / 空切片 → `TopK`
+    /// （仅 VPIP，byte-equal）。advisor 据各对手座本手翻前入池方式 + PFR 收敛性逐座填。
+    pub shapes: &'a [ExploitShape],
 }
 
 /// Chen 起手分（翻前宽度 tilt 用的强度序；设计草案 §1 摊牌 Chen 同口径）。返回值仅用于**排序**
@@ -1325,8 +1326,9 @@ fn chen_score(hole: [Card; 2]) -> f64 {
 ///   个 combo 权 1、其余 [`EXPLOIT_WIDTH_FLOOR`]，归一。
 ///
 /// 方向：高 VPIP→`w` 含更多弱 combo→对手 range 更宽更弱→solver 自动薄价值 / 少诈唬；低 VPIP→
-/// `w` 收窄到强牌→solver 多弃多偷（设计草案 §2/§4 意图）。`shape`（[`ExploitShape`]）选 `w` 取
-/// 哪一段：`TopK`（默认，仅 VPIP，byte-equal）/ `CallBand` / `RaiseBand`（PFR-aware，掐顶端 / 收顶端）。
+/// `w` 收窄到强牌→solver 多弃多偷（设计草案 §2/§4 意图）。`shapes`（per-seat [`ExploitShape`]，
+/// 下标 = seat；缺位 / 空切片 → `TopK`）选每座 `w` 取哪一段：`TopK`（仅 VPIP，byte-equal）/
+/// `CallBand` / `RaiseBand`（PFR-aware，掐顶端 / 收顶端）。
 ///
 /// 安全：α clamp [0, [`EXPLOIT_ALPHA_CAP`]]；`w` 自带地板 → 永不过窄 / NaN；card-removal（撞 board
 /// 两侧皆 0）保持；**hero 座永不动**（复用 [`mix_lambda_for_seat`] 语义）。结果进 `solve_cache_key`
@@ -1338,7 +1340,7 @@ pub fn apply_exploit_width_prior(
     holes: &[[Card; 2]],
     board: &[Card],
     alpha: f64,
-    shape: ExploitShape,
+    shapes: &[ExploitShape],
 ) -> Option<Vec<Vec<f64>>> {
     let alpha = alpha.clamp(0.0, EXPLOIT_ALPHA_CAP);
     let mut ranges = ranges_opt?; // None → 不剥削（v1）
@@ -1373,6 +1375,7 @@ pub fn apply_exploit_width_prior(
         if slot.len() != holes.len() {
             continue; // 弃牌座（空 vec）/ 维度不符 → 跳过
         }
+        let shape = shapes.get(seat).copied().unwrap_or_default(); // 缺位 = TopK
         let band = width_band(prof.vpip, prof.pfr, n_valid, shape);
         tilt_seat_to_width(slot, band, &valid, n_valid, &order, alpha);
     }
@@ -3188,7 +3191,7 @@ fn subgame_search_unanchored_cached_inner(
             &holes,
             &board,
             ep.alpha,
-            ep.shape,
+            ep.shapes,
         );
     }
 
@@ -3469,6 +3472,7 @@ mod tests {
         OpponentProfile {
             vpip,
             pfr,
+            pfr_converged: true,
             postflop_af: 0.0,
             n_preflop: 200,
             n_postflop: 0,
@@ -3492,16 +3496,8 @@ mod tests {
     fn exploit_none_ranges_returns_none() {
         let holes = all_hole_combos();
         assert!(
-            apply_exploit_width_prior(
-                None,
-                &[Some(prof(0.4))],
-                0,
-                &holes,
-                &[],
-                0.5,
-                ExploitShape::TopK
-            )
-            .is_none(),
+            apply_exploit_width_prior(None, &[Some(prof(0.4))], 0, &holes, &[], 0.5, &[],)
+                .is_none(),
             "无 GTO range 信号 → v1 不剥削"
         );
     }
@@ -3511,15 +3507,8 @@ mod tests {
         let holes = all_hole_combos();
         let r = vec![vec![1.0 / 1326.0; 1326], vec![1.0 / 1326.0; 1326]];
         // 全 None 画像 → 恒等。
-        let out = apply_exploit_width_prior(
-            Some(r.clone()),
-            &[None, None],
-            0,
-            &holes,
-            &[],
-            0.5,
-            ExploitShape::TopK,
-        );
+        let out =
+            apply_exploit_width_prior(Some(r.clone()), &[None, None], 0, &holes, &[], 0.5, &[]);
         assert_eq!(out.unwrap(), r, "无收敛对手 → 恒等");
         // α=0 → 恒等。
         let out0 = apply_exploit_width_prior(
@@ -3529,7 +3518,7 @@ mod tests {
             &holes,
             &[],
             0.0,
-            ExploitShape::TopK,
+            &[],
         );
         assert_eq!(out0.unwrap(), r, "α=0 → 恒等");
     }
@@ -3546,7 +3535,7 @@ mod tests {
             &holes,
             &[],
             0.6,
-            ExploitShape::TopK,
+            &[],
         )
         .unwrap();
         assert_eq!(out[0], r[0], "hero 座 range 不动");
@@ -3564,7 +3553,7 @@ mod tests {
             &holes,
             &[],
             0.6,
-            ExploitShape::TopK,
+            &[],
         )
         .unwrap();
         let loose = apply_exploit_width_prior(
@@ -3574,7 +3563,7 @@ mod tests {
             &holes,
             &[],
             0.6,
-            ExploitShape::TopK,
+            &[],
         )
         .unwrap();
         let peak = |v: &[f64]| v.iter().cloned().fold(0.0_f64, f64::max);
@@ -3603,7 +3592,7 @@ mod tests {
             &holes,
             &board,
             0.5,
-            ExploitShape::TopK,
+            &[],
         )
         .unwrap();
         let bset: std::collections::BTreeSet<u8> = board.iter().map(|c| c.to_u8()).collect();
@@ -3644,7 +3633,7 @@ mod tests {
         let holes = all_hole_combos();
         let uni = vec![1.0 / 1326.0; 1326];
         let prof = prof_vp(0.40, 0.18); // VPIP 40 / PFR 18（Bottelon4 型跟注站）
-        let mk = |shape| {
+        let mk = |shapes: &[ExploitShape]| {
             apply_exploit_width_prior(
                 Some(vec![uni.clone()]),
                 &[Some(prof)],
@@ -3652,12 +3641,12 @@ mod tests {
                 &holes,
                 &[],
                 0.8,
-                shape,
+                shapes,
             )
             .unwrap()
         };
-        let topk = mk(ExploitShape::TopK);
-        let callband = mk(ExploitShape::CallBand);
+        let topk = mk(&[ExploitShape::TopK]);
+        let callband = mk(&[ExploitShape::CallBand]);
         // AA 下标（all_hole_combos 里 A♣A♦ 等四张同 rank 组合任取一）。
         let aa = [card(12, 0), card(12, 1)];
         let aa_idx = holes.iter().position(|h| *h == aa).expect("AA combo 在");
