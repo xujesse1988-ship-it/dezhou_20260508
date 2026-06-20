@@ -58,9 +58,20 @@ pub fn build_opp_thresholds(
 ) -> Vec<f64> {
     let mut out = Vec::new();
     let n = view.num_seats as usize;
-    // 翻后行动越多，range 越紧（每多一次本街投入加成）。
-    let postflop_tighten = if view.street != Street::Preflop {
-        0.04
+    // 街越晚，range 越紧（人对大注/晚街更诚实）：flop 0.03 / turn 0.06 / river 0.09。
+    let street_idx = match view.street {
+        Street::Preflop => 0.0,
+        Street::Flop => 1.0,
+        Street::Turn => 2.0,
+        _ => 3.0,
+    };
+    let postflop_tighten = 0.03 * street_idx;
+    // 当前街下注尺寸 / 底池 → 对**本街下注者**额外收紧（面对大注假设更强 range）。
+    // 无需对手数据、普遍正确：弱场多数玩家下大注 = 价值，少诈。
+    let pot = view.pot_chips().max(1) as f64;
+    let bet_frac = (view.high_bet as f64 / pot).clamp(0.0, 1.5);
+    let aggressor_size_tighten = if view.street != Street::Preflop && view.high_bet > 0 {
+        0.12 * bet_frac
     } else {
         0.0
     };
@@ -69,10 +80,10 @@ pub fn build_opp_thresholds(
             continue;
         }
         // base：是否激进者。
-        let is_aggr =
-            view.preflop_aggressor == Some(s as u8) || view.street_aggressor == Some(s as u8);
+        let is_pre_aggr = view.preflop_aggressor == Some(s as u8);
+        let is_street_aggr = view.street_aggressor == Some(s as u8);
         let committed_bb = view.committed_total[s] as f64 / view.big_blind as f64;
-        let frac = if is_aggr {
+        let frac = if is_pre_aggr || is_street_aggr {
             if view.preflop_num_raises >= 2 {
                 0.08 // 3bet+ 激进者
             } else {
@@ -86,11 +97,15 @@ pub fn build_opp_thresholds(
             0.80 // 几乎随机（盲位 check option）
         };
         let mut thr = eq.threshold_for_top(frac) + postflop_tighten;
+        // 本街下注者额外按注大小收紧。
+        if is_street_aggr {
+            thr += aggressor_size_tighten;
+        }
         // 对手画像偏移。
         if let Some(name) = view.names.get(&(s as u8)) {
             thr += opp.range_threshold_shift(name, cfg.exploit.min_hands, cfg.exploit.adjust_cap);
         }
-        out.push(thr.clamp(0.0, 0.95));
+        out.push(thr.clamp(0.0, 0.96));
     }
     out
 }
