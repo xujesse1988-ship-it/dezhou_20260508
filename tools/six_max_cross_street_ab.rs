@@ -11,6 +11,12 @@
 //!   差只差 river root range 来源 → **直接量「裁掉 turn blueprint」对 river 决策的影响**（裁剪 §4.4
 //!   决策级证据；保留 turn blueprint 跑）。方向应与 §动机一致：turn 子树后验比泛 blueprint estimate
 //!   更贴本子博弈。两臂用**同一** turn 解（同 hand_seed/cfg）→ 欠收敛对两臂等量不污染差值。
+//! - **`--hitrate`（§4.5 命中率，裁剪 go/no-go 闸）**：**自对弈**（blueprint 驱动全座）生成真分布
+//!   on-tree 手，hero 座每手常驻 cache 先解 turn → river 决策 cross=Some(turn_within)，delta cache
+//!   跨街计数 → **river 跨街命中率**。命中 = turn 信息经后验恢复（裁 turn 后 range 不退化）；未命中 =
+//!   river range 退化为「preflop+flop reach × turn uniform」（§3 兜底）。命中率够高 → 裁近无损。
+//!   口径：自对弈全 on-tree（off-menu 失配近 0）+ 固定 iter（生产 12s/24 线程 giveup 更少 → 本读数
+//!   是下界）；脱锚 river 尾自对弈触发~0 → 须 live（advisor 已插桩 cross_attempts/cross_hits 待 live）。
 //!
 //! # 为什么不是 EV / 自对弈
 //!
@@ -54,6 +60,7 @@ use std::process::ExitCode;
 
 use rayon::prelude::*;
 
+use poker::training::blueprint_advisor::outgoing_action;
 use poker::training::game::Game;
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::{
@@ -102,6 +109,9 @@ struct Args {
     /// `--anchored`：跑**锚定 river** A/B（on-tree flop→turn→river，turn-posterior vs
     /// estimate(turn blueprint)），而非默认的脱锚 turn A/B。下面 4 个构造线参数仅默认模式用。
     anchored: bool,
+    /// `--hitrate`（turn_blueprint_trim §4.5）：跑**自对弈 river 跨街命中率**（裁剪 go/no-go 闸），
+    /// 而非 A/B。优先于 `--anchored`。
+    hitrate: bool,
     /// 构造线参数（BB，仅默认脱锚模式）：UTG 短码 all-in / SB raise-over to / flop SB bet to / flop BB raise to。
     utg_bb: u64,
     sb_raise_bb: u64,
@@ -139,6 +149,22 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("load checkpoint {} failed: {e:?}", args.checkpoint))?;
     let strat = |info: &InfoSetId, _n: usize| trainer.average_strategy(*info);
     let game_ref = trainer.game();
+
+    // §4.5 命中率模式（自对弈，非 A/B）：早返回，自带报表。
+    if args.hitrate {
+        eprintln!(
+            "[cross_street_ab] mode=HITRATE(self-play river) reshape={} cap={} update_count={} | search: iters={} deep_menu={} range_mix={} max_nodes={} seed=0x{:016x} deals={}",
+            args.reshape, args.postflop_cap, trainer.update_count(),
+            args.search.iterations, args.search.deep_menu, args.search.range_uniform_mix,
+            args.search.max_subtree_nodes, args.seed, args.deals,
+        );
+        let stats: Vec<HitrateStat> = (0..args.deals)
+            .into_par_iter()
+            .map(|i| eval_hitrate_deal(game_ref, &strat, &args, i))
+            .collect();
+        print_hitrate_report(&stats, args.deals);
+        return Ok(());
+    }
 
     let results: Vec<DealResult> = if args.anchored {
         // 锚定 river A/B（turn_blueprint_trim §4.4）：on-tree flop→turn→river，无需同步前缀。
@@ -574,6 +600,218 @@ fn eval_anchored_deal(
     })
 }
 
+// ===========================================================================
+// §4.5 跨街复用命中率（turn_blueprint_trim §4.5）：自对弈真分布 river 决策里 cross 命中占比 =
+// 「river range 由 turn 子树后验恢复（不退化）」的比例。miss = turn 信息退化为 uniform（§3 兜底
+// 「preflop+flop reach × turn uniform」）。**关键口径**：`estimate_range`（读 turn σ）在 cross 前
+// **无条件**跑——裁掉 turn blueprint 后它对缺失 turn key 退 uniform（§5.1），cross **命中即用后验
+// 覆盖、恢复 turn 信息**；cross miss → 留 uniform = 退化。故命中率 = turn 信息被恢复的占比 = 裁剪
+// 无损度。命中率够高 → 裁近无损（go），低 → 裁会实质劣化 river range（no-go）。
+// ===========================================================================
+
+/// blueprint 分布（空 / 全零 / 长度不符 → uniform 兜底，与 advisor blueprint_distribution 同口径）。
+fn blueprint_dist(
+    info: &InfoSetId,
+    legal_abs: &[AbstractAction],
+    strat: &(dyn Fn(&InfoSetId, usize) -> Vec<f64> + Sync),
+) -> Vec<(AbstractAction, f64)> {
+    let raw = strat(info, legal_abs.len());
+    if raw.len() == legal_abs.len() && raw.iter().any(|p| p.is_finite() && *p > 0.0) {
+        let sum: f64 = raw.iter().filter(|p| p.is_finite() && **p > 0.0).sum();
+        legal_abs
+            .iter()
+            .copied()
+            .zip(raw)
+            .filter(|(_, p)| p.is_finite() && *p > 0.0)
+            .map(|(a, p)| (a, p / sum))
+            .collect()
+    } else {
+        let p = 1.0 / legal_abs.len() as f64;
+        legal_abs.iter().copied().map(|a| (a, p)).collect()
+    }
+}
+
+/// 从归一分布按 rng 抽一个下标（累积分布；next_u64 → [0,1) double）。
+fn sample_idx(dist: &[(AbstractAction, f64)], rng: &mut dyn RngSource) -> usize {
+    let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+    let mut acc = 0.0;
+    for (i, (_, p)) in dist.iter().enumerate() {
+        acc += p;
+        if u < acc {
+            return i;
+        }
+    }
+    dist.len() - 1
+}
+
+fn sample_rng_dyn(rng: &mut ChaCha20Rng) -> &mut dyn RngSource {
+    rng
+}
+
+/// 自对弈（blueprint 驱动全座，含 hero——search 仅测量不驱动 → 保持 on-tree = 锚定路径）生成
+/// on-tree flop→turn→river 真分布线，捕 hero 的 turn→river 转移：返回 (turn round-start, turn
+/// **完整**真实动作线, hero river 决策态, hero)。hero river 前手结束 / hero 未到 river / 偏离
+/// on-tree → `None`（skip）。concrete 动作经 [`outgoing_action`] 在 **pre-state** 算（避免 post-`next`
+/// committed 复位）。
+fn selfplay_anchored_line(
+    game: &SimplifiedNlheGame,
+    strat: &(dyn Fn(&InfoSetId, usize) -> Vec<f64> + Sync),
+    deal_seed: u64,
+    hero: usize,
+) -> Option<AnchoredLine> {
+    let mut rng = ChaCha20Rng::from_seed(deal_seed);
+    let mut st = game.root(sample_rng_dyn(&mut rng));
+    let mut turn_rs: Option<SimplifiedNlheState> = None;
+    let mut turn_line: Vec<(Action, bool)> = Vec::new();
+    let mut cur_within: Vec<(Action, bool)> = Vec::new();
+    let mut cur_street = st.game_state.street();
+    for _ in 0..256usize {
+        if st.game_state.is_terminal() {
+            return None; // 手在 hero river 决策前结束。
+        }
+        let actor = st.game_state.current_player()?.0 as usize;
+        if actor == hero && st.game_state.street() == Street::River {
+            // hero river 决策点（on-tree）。turn_rs 须已捕（hero 经 turn 到 river）。
+            return Some((turn_rs?, turn_line, st, hero));
+        }
+        let legal = SimplifiedNlheGame::legal_actions(&st);
+        if legal.is_empty() {
+            return None;
+        }
+        let hole = st.game_state.players()[actor].hole_cards?;
+        let board = st.game_state.board().to_vec();
+        let info = game.info_set_for_cards(st.current_node_id, hole, &board);
+        let dist = blueprint_dist(&info, &legal, strat);
+        let chosen = dist[sample_idx(&dist, sample_rng_dyn(&mut rng))].0;
+        let concrete = outgoing_action(&st.game_state, game.abstraction(), chosen).ok()?;
+        st = SimplifiedNlheGame::next(st, chosen, sample_rng_dyn(&mut rng));
+        let became_all_in = st.game_state.players()[actor].status == PlayerStatus::AllIn;
+        if st.game_state.street() != cur_street {
+            // 收街动作属上一街（同 build_real_auth）。刚结束的街 = cur_street。
+            cur_within.push((concrete, became_all_in));
+            let completed = std::mem::take(&mut cur_within);
+            if cur_street == Street::Turn {
+                turn_line = completed; // turn 完整线（含收街动作）→ river 跨街沿它读 turn σ。
+            }
+            cur_street = st.game_state.street();
+            if cur_street == Street::Turn {
+                turn_rs = Some(st.clone()); // turn round-start 快照。
+            }
+        } else {
+            cur_within.push((concrete, became_all_in));
+        }
+    }
+    None
+}
+
+/// 单 deal 的 river 跨街命中读数（hero 座轮转覆盖各位置）。
+#[derive(Default, Clone, Copy)]
+struct HitrateStat {
+    river_reached: bool,       // hero 到 river on-tree（= 分母）。
+    turn_giveup: bool,         // turn 解 giveup（→ 缓存无 turn → river cross 必 miss）。
+    cross_attempt: bool,       // river 决策有跨街尝试（cross_street=Some + cache 传入）。
+    cross_hit: bool,           // river cross 命中（turn 信息经后验恢复，不退化）。
+    river_search_giveup: bool, // river hero search 本身 giveup（正交：advisor check-when-free）。
+}
+
+/// 自对弈 river 跨街命中率单点：生成 on-tree 线 → 同手一个常驻 cache 先解 turn（giveup → 后续
+/// cross 必 miss）→ river 决策 cross=Some(turn_within)，delta cache 跨街计数 → 命中/未命中。
+fn eval_hitrate_deal(
+    game: &SimplifiedNlheGame,
+    strat: &(dyn Fn(&InfoSetId, usize) -> Vec<f64> + Sync),
+    args: &Args,
+    deal_idx: u64,
+) -> HitrateStat {
+    let mut s = HitrateStat::default();
+    let deal_seed = mix2(args.seed, deal_idx);
+    let hero = (deal_idx % 6) as usize; // 轮转 hero 座 → 覆盖 BTN/SB/BB/UTG/HJ/CO。
+    let Some((turn_rs, turn_within, river_rs, _)) =
+        selfplay_anchored_line(game, strat, deal_seed, hero)
+    else {
+        return s; // 未到 hero river → skip（不计分母）。
+    };
+    s.river_reached = true;
+    let hand_seed = mix2(args.seed ^ 0xC505, deal_idx);
+    let turn_legal = SimplifiedNlheGame::legal_actions(&turn_rs);
+    let river_legal = SimplifiedNlheGame::legal_actions(&river_rs);
+    let mut cache = SubgameSolveCache::new();
+    // turn 解入缓存（cross=None；river 命中率只看 turn 解是否在缓存 + 可导航，与 turn 自身 range 来源
+    // 无关 → solve_turn 复用 §4.4 的 cross=None，简洁等价）。giveup → 缓存无 turn → river cross 必 miss。
+    s.turn_giveup = solve_turn(
+        &mut cache,
+        &turn_rs,
+        &turn_legal,
+        game,
+        strat,
+        &args.search,
+        hand_seed,
+    )
+    .is_none();
+    // river 决策（cross=Some(turn_within)）：record_cross 在 solve 前记 → Ok/Err 都已计数，delta 有效。
+    let att0 = cache.cross_attempts();
+    let hit0 = cache.cross_hits();
+    let river = subgame_search_cached(
+        Some(&mut cache),
+        &river_rs.game_state,
+        &river_rs.game_state,
+        game,
+        &river_legal,
+        river_rs.current_node_id,
+        strat,
+        &args.search,
+        None,
+        None,
+        None,
+        Some(&turn_within),
+        hand_seed,
+        0,
+    );
+    s.cross_attempt = cache.cross_attempts() > att0;
+    s.cross_hit = cache.cross_hits() > hit0;
+    s.river_search_giveup = river.is_err();
+    s
+}
+
+fn print_hitrate_report(stats: &[HitrateStat], deals_total: u64) {
+    let reached: Vec<&HitrateStat> = stats.iter().filter(|s| s.river_reached).collect();
+    let n = reached.len();
+    println!("\n=== §4.5 跨街复用命中率（自对弈 on-tree river 决策；锚定路径）===");
+    println!(
+        "  deal: {n} 到 hero river / {} skip（共 {deals_total}）",
+        deals_total as usize - n
+    );
+    if n == 0 {
+        println!("  无 river 决策——检查 reshape/checkpoint。");
+        return;
+    }
+    let hits = reached.iter().filter(|s| s.cross_hit).count();
+    let attempts = reached.iter().filter(|s| s.cross_attempt).count();
+    let turn_giveup = reached.iter().filter(|s| s.turn_giveup).count();
+    let miss_nav = reached
+        .iter()
+        .filter(|s| s.cross_attempt && !s.cross_hit && !s.turn_giveup)
+        .count();
+    let river_giveup = reached.iter().filter(|s| s.river_search_giveup).count();
+    println!(
+        "  跨街命中（turn 信息经后验恢复、不退化）: {hits}/{n} = {:.1}%",
+        100.0 * hits as f64 / n as f64
+    );
+    println!(
+        "  未命中（river range 退化为「preflop+flop reach × turn uniform」，§3 兜底）: {}/{n} = {:.1}%",
+        n - hits,
+        100.0 * (n - hits) as f64 / n as f64
+    );
+    println!("    ├─ turn 解 giveup（缓存无 turn 子树）: {turn_giveup}");
+    println!("    └─ turn 已解但导航/身份失配（off-menu）: {miss_nav}");
+    println!(
+        "  [参考] cross attempt 计数: {attempts}/{n}（应 ≈ n：cross_street=Some + cache 传入）；\
+         river hero search 自身 giveup（正交，advisor check-when-free）: {river_giveup}"
+    );
+    println!(
+        "\n  读法（go/no-go 闸）：命中率 = 裁掉 turn blueprint 后 river range **不退化**的占比。够高 →\n  裁近无损（极少 river 退 turn-uniform，§3 兜底接住、不崩）；低 → 裁会实质劣化 → 别裁 / 知情接受。\n  口径：自对弈全 on-tree（off-menu 失配近 0）+ 固定 iter（giveup 随 iter，生产 12s/24线程更少 →\n  命中率本读数是**下界**）。脱锚 river（off-tree 尾）自对弈触发~0，须 live 测（已插桩 advisor 待 live）。"
+    );
+}
+
 fn apply(st: &mut GameState, a: Action) -> Result<(), String> {
     st.apply(a).map_err(|e| format!("apply({a:?}): {e:?}"))
 }
@@ -778,6 +1016,7 @@ fn parse_args() -> Result<Args, String> {
     let mut max_nodes = 1_000_000usize;
     let mut range_mix = 0.25f64;
     let mut anchored = false;
+    let mut hitrate = false;
     let mut utg_bb = 10u64;
     let mut sb_raise_bb = 20u64;
     let mut flop_bet_bb = 12u64;
@@ -831,6 +1070,7 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--anchored" => anchored = true,
+            "--hitrate" => hitrate = true,
             "--utg-bb" => utg_bb = parse_u64(next(&mut it, &arg)?)?,
             "--sb-raise-bb" => sb_raise_bb = parse_u64(next(&mut it, &arg)?)?,
             "--flop-bet-bb" => flop_bet_bb = parse_u64(next(&mut it, &arg)?)?,
@@ -857,6 +1097,7 @@ fn parse_args() -> Result<Args, String> {
         top_k,
         search,
         anchored,
+        hitrate,
         utg_bb,
         sb_raise_bb,
         flop_bet_bb,

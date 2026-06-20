@@ -1621,6 +1621,12 @@ pub struct SubgameSolveCache {
     prev: Option<SolvedSubgame>,
     hits: u64,
     misses: u64,
+    /// 档二′-跨街复用遥测（turn_blueprint_trim §4.5 命中率）：每次 `cross_street = Some` 且本 cache
+    /// 被传入（cross 块真跑 peek）记一次 attempt；`cross_street_posterior_range` 返 `Some`（复用成功
+    /// → range 走上一街子树后验、**不读 blueprint estimate**）记一次 hit。与 `hits`/`misses`（solve key
+    /// 命中）正交。caller 按街 delta（river 决策前后差）归因——cache 不知街（同 misses_before 口径）。
+    cross_attempts: u64,
+    cross_hits: u64,
 }
 
 impl SubgameSolveCache {
@@ -1630,6 +1636,8 @@ impl SubgameSolveCache {
             prev: None,
             hits: 0,
             misses: 0,
+            cross_attempts: 0,
+            cross_hits: 0,
         }
     }
 
@@ -1641,6 +1649,27 @@ impl SubgameSolveCache {
     /// 未命中次数（≥ 实际跑的 solve 数；solve 失败也计 miss、不 store）。
     pub fn misses(&self) -> u64 {
         self.misses
+    }
+
+    /// 档二′-跨街复用 attempt 累计数（`cross_street = Some` 且 cache 传入的每次 cross 块运行；含命中
+    /// 与未命中）。turn_blueprint_trim §4.5：caller 在 river 决策前后 delta → 本决策是否尝试跨街。
+    pub fn cross_attempts(&self) -> u64 {
+        self.cross_attempts
+    }
+
+    /// 档二′-跨街复用 hit 累计数（cross 块返 `Some`，range 走上一街子树后验、不读 blueprint estimate）。
+    /// §4.5 命中率 = Δcross_hits / Δcross_attempts（river 决策窗口）。
+    pub fn cross_hits(&self) -> u64 {
+        self.cross_hits
+    }
+
+    /// 记一次跨街复用尝试（`hit` = 复用成功）。两个 inner 的 cross 块算完 `cross_ranges` 后调，仅
+    /// `cross_street = Some` 时（无跨街请求不计入分母）。
+    fn record_cross(&mut self, hit: bool) {
+        self.cross_attempts += 1;
+        if hit {
+            self.cross_hits += 1;
+        }
     }
 
     /// 当前缓存条目 solve 的更新数（[`Trainer::update_count`]，ES-MCCFR 每 `step` 一次
@@ -2184,6 +2213,11 @@ fn subgame_search_cached_inner(
         }
         _ => None,
     };
+    // §4.5 命中率遥测：cross_street=Some 且 cache 传入 = 一次 attempt，cross_ranges=Some = 一次 hit
+    // （range 走上一街后验、不读 turn blueprint estimate）。`cross_hit` 在 `or` 吞掉 cross_ranges 前
+    // 捕获，记录在下面 solve 的 `(Some(c), Some(key))` 臂（c 已 &mut，cache=Some ⟺ 走该臂；cross_street
+    // =None 不计入分母）。
+    let cross_hit = cross_ranges.is_some();
     // 跨街复用优先（命中即 owned，覆盖 estimate_range）；否则用上面的 blueprint estimate（仍 None →
     // uniform）。cross 关 / 不可复用 → cross_ranges=None → ranges_opt 原样（与改动前逐位 byte-equal）。
     let ranges_opt = cross_ranges.or(ranges_opt);
@@ -2269,6 +2303,11 @@ fn subgame_search_cached_inner(
     let solved_fresh: SolvedSubgame;
     let solved: &SolvedSubgame = match (cache, key) {
         (Some(c), Some(key)) => {
+            // §4.5 跨街复用遥测：cache 存在（走本臂）+ cross_street=Some 即一次 attempt（hit 见
+            // cross_hit）。在 lookup/store 前记（solve cache 命中与否都算一次跨街尝试）。
+            if cross_street.is_some() {
+                c.record_cross(cross_hit);
+            }
             if !c.lookup(key) {
                 c.store(key, build_and_solve()?);
             }
@@ -2946,6 +2985,9 @@ fn subgame_search_unanchored_cached_inner(
         }
         _ => None,
     };
+    // §4.5 命中率遥测（同 anchored inner 口径）：cross_hit 在下面 `cross_ranges.or` 吞掉前捕获，记录在
+    // solve 的 `(Some(c), Some(key))` 臂（c 已 &mut）。cross_street=None 不计入分母。
+    let cross_hit = cross_ranges.is_some();
 
     // 档一前缀 reach（PrefixReach=Some 且有当前街之前的前缀决策）→ 为每个未弃牌座位估 marginal
     // range（new_with_ranges 加权采样底牌），替代 uniform（SubgameNlheGame::new 的 root uniform
@@ -3072,6 +3114,11 @@ fn subgame_search_unanchored_cached_inner(
     let solved_fresh: SolvedSubgame;
     let solved: &SolvedSubgame = match (cache, key) {
         (Some(c), Some(key)) => {
+            // §4.5 跨街复用遥测：cache 存在（走本臂）+ cross_street=Some 即一次 attempt（hit 见
+            // cross_hit）。在 lookup/store 前记（solve cache 命中与否都算一次跨街尝试）。
+            if cross_street.is_some() {
+                c.record_cross(cross_hit);
+            }
             if !c.lookup(key) {
                 c.store(key, build_and_solve()?);
             }
@@ -7289,6 +7336,74 @@ mod tests {
             (cache.misses(), cache.hits()),
             (2, 1),
             "本街第二跨街决策须命中（prev-slot 保上一街解 → 同 cross range 同 key）；无 prev-slot 真桶会 (3,0)"
+        );
+    }
+
+    /// §4.5 命中率遥测计数（[`SubgameSolveCache::cross_attempts`]/[`cross_hits`](SubgameSolveCache::cross_hits)）：
+    /// ①`cross_street = None`（flop 首街解 / 关跨街）→ 不计 attempt（不进分母）；②`cross_street = Some`
+    /// 但**缓存里没有上一街解**（空缓存）→ cross 未命中（返 `None`）→ attempt+1 / hit+0；③`cross_street =
+    /// Some` 且缓存有同手紧前一街解 → cross 命中（返 `Some`）→ attempt+1 / hit+1。stub 桶即可（cross
+    /// 是否 fire 只看身份 + 导航，与桶内容无关——桶只决定 range 数值差，不决定 fire）。
+    #[test]
+    fn cross_telemetry_counts_attempts_and_hits() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let (flop, turn, flop_within) = hu_turn_after_flop_checks(&game, 0x4352_4F53_5445_4C45); // "CROSTELE"
+        let cfg = SubgameSearchConfig {
+            iterations: 200,
+            max_subtree_nodes: 1_000_000,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let hand_seed = 0xC505_7E1E;
+        let flop_legal = SimplifiedNlheGame::legal_actions(&flop);
+        let turn_legal = SimplifiedNlheGame::legal_actions(&turn);
+        let run = |cache: &mut SubgameSolveCache,
+                   st: &SimplifiedNlheState,
+                   legal: &[AbstractAction],
+                   cross: Option<&[(Action, bool)]>,
+                   ord: u64| {
+            subgame_search_cached(
+                Some(cache),
+                &st.game_state,
+                &st.game_state,
+                &game,
+                legal,
+                st.current_node_id,
+                &strat,
+                &cfg,
+                None,
+                None,
+                None,
+                cross,
+                hand_seed,
+                ord,
+            )
+            .expect("solve Ok");
+        };
+
+        // ② 空缓存 + turn cross=Some → cross 无上一街可复用（返 None）→ attempt+1 / hit+0。
+        let mut empty = SubgameSolveCache::new();
+        run(&mut empty, &turn, &turn_legal, Some(&flop_within), 3);
+        assert_eq!(
+            (empty.cross_attempts(), empty.cross_hits()),
+            (1, 0),
+            "空缓存 cross=Some → attempt 计但未命中（无上一街解可复用）"
+        );
+
+        // ① flop 首街解 cross=None → 不计 attempt；③ 随后 turn cross=Some 复用 flop → attempt+hit。
+        let mut cache = SubgameSolveCache::new();
+        run(&mut cache, &flop, &flop_legal, None, 2);
+        assert_eq!(
+            cache.cross_attempts(),
+            0,
+            "cross_street=None（flop 首街）→ 不进 §4.5 分母"
+        );
+        run(&mut cache, &turn, &turn_legal, Some(&flop_within), 3);
+        assert_eq!(
+            (cache.cross_attempts(), cache.cross_hits()),
+            (1, 1),
+            "turn cross=Some 复用缓存 flop 解 → attempt+1 / hit+1（range 走后验、不读 blueprint）"
         );
     }
 
