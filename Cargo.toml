@@ -164,6 +164,16 @@ path = "tools/six_max_exploit_ab.rs"
 name = "openpoker_advisor"
 path = "tools/openpoker_advisor.rs"
 
+# 启发式 9-max 独立线：OpenPoker 常驻 advisor（IPC drop-in，零网络）。
+[[bin]]
+name = "heuristic9_advisor"
+path = "tools/heuristic9_advisor.rs"
+
+# 启发式 9-max 自对弈仿真（离线迭代回归门，出 mbb/g）。
+[[bin]]
+name = "heuristic9_sim"
+path = "tools/heuristic9_sim.rs"
+
 # §4.2 live 半段数据管道：OpenPoker HH JSONL（driver --hh-log）→ 多人 AIVAT 报表（缺口⑥）。
 [[bin]]
 name = "openpoker_hh_aivat"

@@ -24,6 +24,7 @@ pub mod abstraction;
 pub mod core;
 pub mod error;
 pub mod eval;
+pub mod heuristic;
 pub mod history;
 pub mod rules;
 pub mod training;
