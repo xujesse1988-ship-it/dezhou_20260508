@@ -1252,12 +1252,29 @@ const EXPLOIT_ALPHA_CAP: f64 = 0.8;
 /// 宽度目标分布里「非 top-VPIP」combo 的相对地板（松手偶尔也玩 trash → 不硬清零，留尾部保险）。
 const EXPLOIT_WIDTH_FLOOR: f64 = 0.05;
 
+/// 翻前宽度分布 `w` 的**形状**（[`tilt_seat_to_width`] 取哪一段 Chen 序 combo 权 1）。
+///
+/// - `TopK`（默认 / 生产）：仅用 VPIP，取 Chen 序 top-`ceil(vpip·n)` 个权 1。**与历史逐字节相等**。
+/// - `CallBand`（PFR-aware 平跟线）：对手这次**平跟/limp 进池** → range 掐掉顶端 `ceil(pfr·n)` 个
+///   （那些会**加注**的强牌不会在平跟线里），留中段 `[ceil(pfr·n), ceil(vpip·n))`。修正 `TopK` 把
+///   「松」误等同「含最强 k 个」的结构错误（跟注站平跟 range 是中段，非顶端）。
+/// - `RaiseBand`（PFR-aware 加注线）：对手这次**加注/3bet 进池** → range 收到顶端 `[0, ceil(pfr·n))`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExploitShape {
+    #[default]
+    TopK,
+    CallBand,
+    RaiseBand,
+}
+
 /// 剥削先验输入（决策路径传 [`subgame_search_unanchored_cached_cross_exploit`]）：per-solver-seat
-/// 画像（下标 = solver seat；`None` = 该座不剥削 / 未收敛 / 是 hero）+ 混合强度 α。
+/// 画像（下标 = solver seat；`None` = 该座不剥削 / 未收敛 / 是 hero）+ 混合强度 α + 宽度形状。
 #[derive(Clone, Copy)]
 pub struct ExploitPrior<'a> {
     pub profiles: &'a [Option<OpponentProfile>],
     pub alpha: f64,
+    /// `w` 形状（[`ExploitShape`]）。生产默认 `TopK`（仅 VPIP，byte-equal）。
+    pub shape: ExploitShape,
 }
 
 /// Chen 起手分（翻前宽度 tilt 用的强度序；设计草案 §1 摊牌 Chen 同口径）。返回值仅用于**排序**
@@ -1308,7 +1325,8 @@ fn chen_score(hole: [Card; 2]) -> f64 {
 ///   个 combo 权 1、其余 [`EXPLOIT_WIDTH_FLOOR`]，归一。
 ///
 /// 方向：高 VPIP→`w` 含更多弱 combo→对手 range 更宽更弱→solver 自动薄价值 / 少诈唬；低 VPIP→
-/// `w` 收窄到强牌→solver 多弃多偷（设计草案 §2/§4 意图）。
+/// `w` 收窄到强牌→solver 多弃多偷（设计草案 §2/§4 意图）。`shape`（[`ExploitShape`]）选 `w` 取
+/// 哪一段：`TopK`（默认，仅 VPIP，byte-equal）/ `CallBand` / `RaiseBand`（PFR-aware，掐顶端 / 收顶端）。
 ///
 /// 安全：α clamp [0, [`EXPLOIT_ALPHA_CAP`]]；`w` 自带地板 → 永不过窄 / NaN；card-removal（撞 board
 /// 两侧皆 0）保持；**hero 座永不动**（复用 [`mix_lambda_for_seat`] 语义）。结果进 `solve_cache_key`
@@ -1320,6 +1338,7 @@ pub fn apply_exploit_width_prior(
     holes: &[[Card; 2]],
     board: &[Card],
     alpha: f64,
+    shape: ExploitShape,
 ) -> Option<Vec<Vec<f64>>> {
     let alpha = alpha.clamp(0.0, EXPLOIT_ALPHA_CAP);
     let mut ranges = ranges_opt?; // None → 不剥削（v1）
@@ -1354,26 +1373,48 @@ pub fn apply_exploit_width_prior(
         if slot.len() != holes.len() {
             continue; // 弃牌座（空 vec）/ 维度不符 → 跳过
         }
-        tilt_seat_to_width(slot, prof.vpip, &valid, n_valid, &order, alpha);
+        let band = width_band(prof.vpip, prof.pfr, n_valid, shape);
+        tilt_seat_to_width(slot, band, &valid, n_valid, &order, alpha);
     }
     Some(ranges)
 }
 
-/// 单座内核（[`apply_exploit_width_prior`]）：把 `r` 与 top-VPIP 宽度分布 `w` 凸混合。`order` =
-/// valid combo 按 Chen 降序的下标。`r` 全零（无信号）→ 起点取 uniform-over-valid（与下游 resample
-/// 等价，改读 tilt 后向量）。撞 board combo 两侧皆 0 → 保持 0（card-removal）。
+/// 由画像 + 形状定「权 1」的 Chen-序区间 `[lo, hi)`（下标进 `order`，0 = 最强）。区间**恒非空**
+/// （`lo < hi`，至少 1 个 combo 权 1），否则 `w` 退化全地板。
+/// - `TopK`：`[0, kv)`，`kv=ceil(vpip·n)`（仅 VPIP，历史行为）。
+/// - `CallBand`：`[kp, kv)`，`kp=ceil(pfr·n)` clamp 到 `kv-1`（掐顶端会加注的强牌，留中段）。
+/// - `RaiseBand`：`[0, kp)`，`kp=ceil(pfr·n)` clamp `≥1`（只留顶端加注 range）。
+fn width_band(vpip: f64, pfr: f64, n_valid: usize, shape: ExploitShape) -> (usize, usize) {
+    let ceil_k = |frac: f64| (frac.clamp(0.0, 1.0) * n_valid as f64).ceil() as usize;
+    let kv = ceil_k(vpip).clamp(1, n_valid);
+    match shape {
+        ExploitShape::TopK => (0, kv),
+        ExploitShape::CallBand => {
+            // pfr ≤ vpip（加注是入池子集）；clamp 到 kv-1 保证中段非空。
+            let kp = ceil_k(pfr).min(kv.saturating_sub(1));
+            (kp, kv)
+        }
+        ExploitShape::RaiseBand => (0, ceil_k(pfr).clamp(1, n_valid)),
+    }
+}
+
+/// 单座内核（[`apply_exploit_width_prior`]）：把 `r` 与宽度分布 `w` 凸混合。`band=[lo,hi)` 是
+/// 「权 1」的 Chen-序区间（[`width_band`] 按画像 + 形状算）；区间内权 1、其余 [`EXPLOIT_WIDTH_FLOOR`]。
+/// `order` = valid combo 按 Chen 降序的下标。`r` 全零（无信号）→ 起点取 uniform-over-valid（与下游
+/// resample 等价）。撞 board combo 两侧皆 0 → 保持 0（card-removal）。
 fn tilt_seat_to_width(
     r: &mut [f64],
-    vpip: f64,
+    band: (usize, usize),
     valid: &[bool],
     n_valid: usize,
     order: &[usize],
     alpha: f64,
 ) {
-    let k = ((vpip.clamp(0.0, 1.0) * n_valid as f64).ceil() as usize).clamp(1, n_valid);
+    let _ = n_valid; // band 已编码宽度；保留参数对齐调用点语义。
+    let (lo, hi) = band;
     let mut w = vec![0.0_f64; r.len()];
     for (rank_idx, &combo) in order.iter().enumerate() {
-        w[combo] = if rank_idx < k {
+        w[combo] = if rank_idx >= lo && rank_idx < hi {
             1.0
         } else {
             EXPLOIT_WIDTH_FLOOR
@@ -3147,6 +3188,7 @@ fn subgame_search_unanchored_cached_inner(
             &holes,
             &board,
             ep.alpha,
+            ep.shape,
         );
     }
 
@@ -3420,9 +3462,13 @@ mod tests {
     }
 
     fn prof(vpip: f64) -> OpponentProfile {
+        prof_vp(vpip, 0.0)
+    }
+
+    fn prof_vp(vpip: f64, pfr: f64) -> OpponentProfile {
         OpponentProfile {
             vpip,
-            pfr: 0.0,
+            pfr,
             postflop_af: 0.0,
             n_preflop: 200,
             n_postflop: 0,
@@ -3446,7 +3492,16 @@ mod tests {
     fn exploit_none_ranges_returns_none() {
         let holes = all_hole_combos();
         assert!(
-            apply_exploit_width_prior(None, &[Some(prof(0.4))], 0, &holes, &[], 0.5).is_none(),
+            apply_exploit_width_prior(
+                None,
+                &[Some(prof(0.4))],
+                0,
+                &holes,
+                &[],
+                0.5,
+                ExploitShape::TopK
+            )
+            .is_none(),
             "无 GTO range 信号 → v1 不剥削"
         );
     }
@@ -3456,7 +3511,15 @@ mod tests {
         let holes = all_hole_combos();
         let r = vec![vec![1.0 / 1326.0; 1326], vec![1.0 / 1326.0; 1326]];
         // 全 None 画像 → 恒等。
-        let out = apply_exploit_width_prior(Some(r.clone()), &[None, None], 0, &holes, &[], 0.5);
+        let out = apply_exploit_width_prior(
+            Some(r.clone()),
+            &[None, None],
+            0,
+            &holes,
+            &[],
+            0.5,
+            ExploitShape::TopK,
+        );
         assert_eq!(out.unwrap(), r, "无收敛对手 → 恒等");
         // α=0 → 恒等。
         let out0 = apply_exploit_width_prior(
@@ -3466,6 +3529,7 @@ mod tests {
             &holes,
             &[],
             0.0,
+            ExploitShape::TopK,
         );
         assert_eq!(out0.unwrap(), r, "α=0 → 恒等");
     }
@@ -3482,6 +3546,7 @@ mod tests {
             &holes,
             &[],
             0.6,
+            ExploitShape::TopK,
         )
         .unwrap();
         assert_eq!(out[0], r[0], "hero 座 range 不动");
@@ -3499,6 +3564,7 @@ mod tests {
             &holes,
             &[],
             0.6,
+            ExploitShape::TopK,
         )
         .unwrap();
         let loose = apply_exploit_width_prior(
@@ -3508,6 +3574,7 @@ mod tests {
             &holes,
             &[],
             0.6,
+            ExploitShape::TopK,
         )
         .unwrap();
         let peak = |v: &[f64]| v.iter().cloned().fold(0.0_f64, f64::max);
@@ -3536,6 +3603,7 @@ mod tests {
             &holes,
             &board,
             0.5,
+            ExploitShape::TopK,
         )
         .unwrap();
         let bset: std::collections::BTreeSet<u8> = board.iter().map(|c| c.to_u8()).collect();
@@ -3549,6 +3617,61 @@ mod tests {
             (s - 1.0).abs() < 1e-9,
             "card-removal 后 valid 质量仍归一，得 {s}"
         );
+    }
+
+    #[test]
+    fn width_band_topk_callband_raiseband() {
+        // n=100：TopK 仅看 vpip；CallBand 掐顶端 ceil(pfr·n)、留中段；RaiseBand 只留顶端。
+        assert_eq!(width_band(0.40, 0.18, 100, ExploitShape::TopK), (0, 40));
+        assert_eq!(
+            width_band(0.40, 0.18, 100, ExploitShape::CallBand),
+            (18, 40)
+        );
+        assert_eq!(
+            width_band(0.40, 0.18, 100, ExploitShape::RaiseBand),
+            (0, 18)
+        );
+        // pfr=0 → CallBand 退回 TopK（无强牌可掐）；TopK lo 恒 0。
+        assert_eq!(width_band(0.40, 0.0, 100, ExploitShape::CallBand), (0, 40));
+        // pfr≈vpip（纯加注型）→ CallBand clamp 到 [kv-1,kv) 保证非空、不 panic。
+        let (lo, hi) = width_band(0.40, 0.40, 100, ExploitShape::CallBand);
+        assert!(lo < hi, "CallBand 恒非空，得 [{lo},{hi})");
+    }
+
+    #[test]
+    fn callband_excludes_premium_topk_includes() {
+        // 跟注站平跟线：CallBand 应把顶端强牌（AA/KK…）压到地板，TopK（同 vpip）含它们。
+        let holes = all_hole_combos();
+        let uni = vec![1.0 / 1326.0; 1326];
+        let prof = prof_vp(0.40, 0.18); // VPIP 40 / PFR 18（Bottelon4 型跟注站）
+        let mk = |shape| {
+            apply_exploit_width_prior(
+                Some(vec![uni.clone()]),
+                &[Some(prof)],
+                1,
+                &holes,
+                &[],
+                0.8,
+                shape,
+            )
+            .unwrap()
+        };
+        let topk = mk(ExploitShape::TopK);
+        let callband = mk(ExploitShape::CallBand);
+        // AA 下标（all_hole_combos 里 A♣A♦ 等四张同 rank 组合任取一）。
+        let aa = [card(12, 0), card(12, 1)];
+        let aa_idx = holes.iter().position(|h| *h == aa).expect("AA combo 在");
+        assert!(
+            topk[0][aa_idx] > callband[0][aa_idx],
+            "AA：TopK 含（权高）> CallBand 掐顶端（地板）：topk={} callband={}",
+            topk[0][aa_idx],
+            callband[0][aa_idx]
+        );
+        // 两者都归一（valid 质量和 1）。
+        for out in [&topk[0], &callband[0]] {
+            let s: f64 = out.iter().sum();
+            assert!((s - 1.0).abs() < 1e-9, "tilt 后仍归一，得 {s}");
+        }
     }
 
     // ---- project_strategy_onto_auth_legal（deep-wide 菜单维度漂移修复）----

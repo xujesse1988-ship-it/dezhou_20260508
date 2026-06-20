@@ -87,7 +87,7 @@ use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
     set_subgame_debug, should_search, subgame_search_cached, subgame_search_prewarm,
     subgame_search_unanchored_cached_cross_exploit, subgame_search_unanchored_prewarm_cross,
-    synced_prefix_decisions, ExploitPrior, PrefixReach, ResolveRoot, SearchTrigger,
+    synced_prefix_decisions, ExploitPrior, ExploitShape, PrefixReach, ResolveRoot, SearchTrigger,
     SubgameSearchConfig, SubgameSolveCache,
 };
 use poker::{
@@ -1715,6 +1715,7 @@ fn decide_search_unanchored(
         .map(|(profiles, alpha)| ExploitPrior {
             profiles: profiles.as_slice(),
             alpha: *alpha,
+            shape: ExploitShape::TopK, // 生产仅 VPIP（byte-equal）；PFR-aware 形状仅 demo 工具用。
         });
     let t0 = Instant::now();
     let misses_before = solve_cache.misses();
