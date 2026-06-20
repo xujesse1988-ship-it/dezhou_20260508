@@ -1315,6 +1315,8 @@ def main():
     p.add_argument("--exploit-strength", type=float, default=None)
     p.add_argument("--exploit-converge-se", type=float, default=None)
     p.add_argument("--exploit-converge-drift", type=float, default=None)
+    p.add_argument("--exploit-pfr-shape", choices=["on", "off"], default=None,
+                   help="PFR-aware 宽度形状（被动入池→CallBand/主动→RaiseBand，需 PFR 收敛）；默认关=仅 VPIP")
     args = p.parse_args()
 
     extra = []
@@ -1355,6 +1357,8 @@ def main():
             extra += ["--exploit-converge-se", str(args.exploit_converge_se)]
         if args.exploit_converge_drift is not None:
             extra += ["--exploit-converge-drift", str(args.exploit_converge_drift)]
+        if args.exploit_pfr_shape is not None:
+            extra += ["--exploit-pfr-shape", args.exploit_pfr_shape]
     # --debug-log 透传给 advisor：打印决策流水线 + range/solve 中间数据（与 --search 正交，
     # blueprint 路径也打）。driver 侧的牌局中间数据 + advisor 内部数据由同一旗一起开。
     if args.debug_log:
@@ -1362,7 +1366,8 @@ def main():
     if args.exploit and not args.search:
         raise SystemExit("--exploit 需配 --search（剥削只挂脱锚搜索路径；没有搜索无处叠加）")
     if (args.exploit_min_hands is not None or args.exploit_strength is not None
-            or args.exploit_converge_se is not None or args.exploit_converge_drift is not None) \
+            or args.exploit_converge_se is not None or args.exploit_converge_drift is not None
+            or args.exploit_pfr_shape is not None) \
             and not args.exploit:
         raise SystemExit("--exploit-* 子旗需配 --exploit")
     if args.search_prewarm and not args.search:
