@@ -16,7 +16,9 @@
 //! ```text
 //! heuristic9_sim [--hands N] [--seats K] [--bb 20] [--samples S] [--seed X]
 //!                [--field mixed|nit|station|maniac|tag|random] [--mirror] [--exploit]
+//!                [--config cfg.json]
 //! ```
+//! `--config` 覆盖 HeuristicConfig（partial JSON，缺字段走默认）——无需重编即可扫旋钮。
 
 use poker::core::{Card, Rank, Suit};
 use poker::heuristic::features::{draws, made_class, MadeClass};
@@ -595,6 +597,7 @@ fn main() {
     let mut field_kind = String::from("mixed");
     let mut mirror = false;
     let mut exploit = false;
+    let mut config_path: Option<String> = None;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -641,12 +644,29 @@ fn main() {
                 exploit = true;
                 i += 1;
             }
+            "--config" => {
+                config_path = argv.get(i + 1).cloned();
+                i += 2;
+            }
             _ => i += 1,
         }
     }
     let seats = seats.clamp(2, 9);
 
-    let mut config = HeuristicConfig::default();
+    // config：JSON 覆盖（缺字段走默认，serde(default)）→ 再压实 sim 提速用 equity 样本。
+    let mut config = match &config_path {
+        Some(p) => match std::fs::read_to_string(p) {
+            Ok(s) => HeuristicConfig::from_json_str(&s).unwrap_or_else(|e| {
+                eprintln!("[sim] config 解析失败（{e}），用默认。");
+                HeuristicConfig::default()
+            }),
+            Err(e) => {
+                eprintln!("[sim] config 读取失败（{e}），用默认。");
+                HeuristicConfig::default()
+            }
+        },
+        None => HeuristicConfig::default(),
+    };
     config.equity.samples = samples;
     // sim 建表用稍小样本提速。
     config.equity.preflop_table_samples = 2000;
