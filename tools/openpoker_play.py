@@ -63,8 +63,8 @@ _BOARD_LEN = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 # 6-max 树表达不了跨街反转、smoke 实测 87.5% 兜底）。检测到一手仅 2 座发牌 → 主动离场，
 # 等 HU_RETRY_WAIT_S 后重连（期望换到人更多的桌）；**连续** HU_MAX_RETRIES 次仍是两人桌才放弃
 # （重连后只要落到人多的桌就清零，不累积）。
-HU_RETRY_WAIT_S = 600   # 10 分钟。
-HU_MAX_RETRIES = 5
+HU_RETRY_WAIT_S = 120   # 2 分钟（2026-06-21 由 10 分钟下调：lobby HU 多时更快换桌找多人桌）。
+HU_MAX_RETRIES = 30     # 配合 2 分钟重试：~60min 才放弃，避免频繁 give-up 触发昂贵的 10B blueprint 重载。
 
 # HH 日志（§4.2）：player_action 原始字段子集，平行落进 actions_ext（advisor 不读）。
 # contribution_delta / stack_before / stack_after 是 live 校准发现的字段——比 driver 自跟
@@ -758,7 +758,7 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
     # 连接循环：分两类「重连」，计数独立——
     #   · 断线（run_forever 异常返回）：3s 后重连，最多 10 次（§1：断线 120s 内 resync 简化为重连）。
     #   · 两人桌（session.hu_detected）：本实现 postflop 不支持 HU → 主动离场，等 HU_RETRY_WAIT_S
-    #     （10 分钟）后重连，期望换到人更多的桌；**连续** HU_MAX_RETRIES 次仍是两人桌才放弃。
+    #     （2 分钟）后重连，期望换到人更多的桌；**连续** HU_MAX_RETRIES 次仍是两人桌才放弃。
     #     hu_retries 计的是「连续」次数：本次连接只要打到过非两人桌手（non_hu_hand_seen）就清零
     #     ——重连成功换到人多的桌即视为恢复，不累积。
     reconnect_attempts = 0
