@@ -30,9 +30,18 @@
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
+
+# 内联硬伤检测（前期抓 bug）：复用 analyze 的 hard_issues；导入失败则降级为 no-op。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from heuristic9_analyze import hard_issues
+except Exception:
+    def hard_issues(_req, _resp):
+        return []
 
 WS_URL = "wss://openpoker.ai/ws"
 REGISTER_URL = "https://api.openpoker.ai/api/register"
@@ -288,8 +297,9 @@ class Session:
         self.observed_max_seat = default_seats - 1
         self.client_action_id = 0
         self.counters = {"hands": 0, "decisions": 0, "fallback": 0, "net_chips": 0,
-                         "watchdog_rejoins": 0}
+                         "watchdog_rejoins": 0, "hard": 0}
         self.fallback_reasons = {}
+        self.hard_cats = {}
         self.last_hand_ts = time.time()
         self._ws = None
 
@@ -374,8 +384,8 @@ class Session:
             if self.counters["hands"] % 25 == 0 and self.counters["hands"] < self.num_hands:
                 c = self.counters
                 print(f"  [♥ {c['hands']}h] dec={c['decisions']} "
-                      f"fb={c['fallback']} net={c['net_chips']} table={self.table_id}",
-                      file=sys.stderr)
+                      f"fb={c['fallback']} hard={c['hard']} net={c['net_chips']} "
+                      f"table={self.table_id}", file=sys.stderr)
             if self.counters["hands"] >= self.num_hands:
                 print(f"  打满 {self.num_hands} 手，离场。", file=sys.stderr)
                 ws.close()
@@ -404,6 +414,14 @@ class Session:
         if src.startswith("fallback"):
             self.counters["fallback"] += 1
             self.fallback_reasons[src[:80]] = self.fallback_reasons.get(src[:80], 0) + 1
+        # 内联硬伤扫描：决策当下即报（不等 100 手），前期 bug 立刻现形。
+        for cat, detail in hard_issues(req, resp):
+            self.counters["hard"] += 1
+            self.hard_cats[cat] = self.hard_cats.get(cat, 0) + 1
+            hole = "".join(req.get("hole", []) or [])
+            board = "".join(req.get("board", []) or [])
+            print(f"  ⚠[硬伤:{cat}] {hole}|{board or '-'} -> {resp.get('action')} "
+                  f"{resp.get('amount') or ''} :: {detail}", file=sys.stderr)
         self.client_action_id += 1
         amt = resp.get("amount")
         out = {
@@ -519,8 +537,10 @@ def run_real(args):
     print(f"\n=== 收尾：{c['hands']} 手 | 决策 {c['decisions']} | fallback {c['fallback']}"
           f" | net {c['net_chips']} chips "
           f"({1000.0 * c['net_chips'] / BIG_BLIND_OP / max(1, c['hands']):.1f} mbb/g)"
-          f" | watchdog_rejoins {c['watchdog_rejoins']} ===",
+          f" | watchdog_rejoins {c['watchdog_rejoins']} | hard {c['hard']} ===",
           file=sys.stderr)
+    if sess.hard_cats:
+        print(f"  硬伤分类: {dict(sorted(sess.hard_cats.items()))}", file=sys.stderr)
     if log_f:
         log_f.close()
     advisor.close()

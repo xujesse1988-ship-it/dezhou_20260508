@@ -21,6 +21,107 @@ import json
 import sys
 from collections import Counter, defaultdict
 
+_RANK_ORD = {r: i for i, r in enumerate("23456789TJQKA")}
+PREMIUM = {"AA", "KK", "QQ", "JJ", "AK"}
+
+
+def hole_label(hole):
+    """["As","Kh"] -> "AK"（按 rank 降序，忽略花色）。用于 premium 判定。"""
+    if not hole or len(hole) < 2:
+        return None
+    rs = sorted((c[0] for c in hole if c), key=lambda r: _RANK_ORD.get(r, -1), reverse=True)
+    return "".join(rs[:2]) if len(rs) >= 2 else None
+
+
+def hard_issues(req, resp):
+    """逐决策硬伤检测：只报「与样本量无关、几乎必错」的红旗（前期抓 bug 用）。"""
+    out = []
+    act = resp.get("action")
+    src = str(resp.get("source", ""))
+    eq = resp.get("equity")
+    valid = req.get("valid", {}) or {}
+    board = req.get("board", []) or []
+    street = resp.get("street") or _street_from_board(board)
+    hole = req.get("hole", []) or []
+    eqf = eq if isinstance(eq, (int, float)) else None
+
+    # 1) 引擎兜底 = 决策管线某处异常。
+    if src.startswith("fallback"):
+        out.append(("FALLBACK", src[:50]))
+    # 2) 能免费 check 却 fold —— 永远是硬伤（弃牌一无所得）。
+    if act == "fold" and valid.get("can_check"):
+        out.append(("FOLD_WHILE_CAN_CHECK", f"{street} 可 check 却 fold"))
+    # 3) 翻前弃顶级起手（AA/KK/QQ/JJ/AK）—— 几乎必错。
+    if street == "preflop" and act == "fold":
+        lbl = hole_label(hole)
+        if lbl in PREMIUM:
+            out.append(("PREMIUM_PREFLOP_FOLD", f"弃 {''.join(hole)}"))
+    # 4) 自称 value 却低 equity —— 自相矛盾（翻后 equity 为 vs-range）。
+    if "value" in src and eqf is not None and eqf < 0.45:
+        out.append(("VALUE_LOW_EQ", f"{src} eq={eqf:.2f}"))
+    # 5) 加注金额越界（advisor 本应夹取，越界=映射 bug）。
+    if act == "raise":
+        amt = resp.get("amount")
+        mn, mx = valid.get("min_raise"), valid.get("max_raise")
+        if amt is None:
+            out.append(("RAISE_NO_AMOUNT", src[:40]))
+        elif mn is not None and amt < mn - 0.5:
+            out.append(("RAISE_BELOW_MIN", f"to {amt} < min {mn}"))
+        elif mx is not None and amt > mx + 0.5:
+            out.append(("RAISE_ABOVE_MAX", f"to {amt} > max {mx}"))
+    # 6) 近乎 0 equity 还跟注 —— 漏斗送钱（极端门槛，避免误报赔率位）。
+    if act == "call" and eqf is not None and eqf < 0.12:
+        out.append(("CALL_NEAR_ZERO_EQ", f"{street} eq={eqf:.2f}"))
+    return out
+
+
+def hard_report(paths):
+    """硬伤扫描（--hard）：简洁、可频繁跑（每 ~100 手一次）。"""
+    cats = Counter()
+    examples = []
+    total = 0
+    for path in paths:
+        try:
+            f = open(path)
+        except OSError as e:
+            print(f"跳过 {path}: {e}", file=sys.stderr)
+            continue
+        for ln, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            req, resp = o.get("req"), o.get("resp")
+            if not req or not resp:
+                continue
+            total += 1
+            for cat, detail in hard_issues(req, resp):
+                cats[cat] += 1
+                if len(examples) < 25:
+                    hole = "".join(req.get("hole", []) or [])
+                    board = "".join(req.get("board", []) or [])
+                    examples.append(f"  [{cat}] {hole}|{board or '-'} "
+                                    f"-> {resp.get('action')} {resp.get('amount') or ''} :: {detail}")
+        f.close()
+
+    print("=" * 60)
+    print(f"硬伤扫描 | 决策 {total} | 硬伤 {sum(cats.values())}")
+    print("=" * 60)
+    if not cats:
+        print("✅ 无硬伤（fallback / 该 check 却弃 / 弃顶对子 / value 低eq / 加注越界 / 跟空气 全 0）")
+        return 0
+    print("[按类别]")
+    for cat, n in cats.most_common():
+        print(f"  {cat:24s} {n}")
+    print("[样例]")
+    for e in examples:
+        print(e)
+    print(f"\n⚠ 发现 {sum(cats.values())} 处硬伤 —— 逐类排查（多为决策逻辑或映射 bug）。")
+    return sum(cats.values())
+
 
 def pos_bucket(button, my_seat, n):
     """与 Rust view::my_pos_bucket 对齐的位置桶。"""
@@ -53,10 +154,14 @@ def preflop_num_raises(actions):
 
 
 def main():
-    if len(sys.argv) < 2:
+    argv = sys.argv[1:]
+    hard_only = "--hard" in argv
+    paths = [a for a in argv if a != "--hard"]
+    if not paths:
         print(__doc__)
         sys.exit(1)
-    paths = sys.argv[1:]
+    if hard_only:
+        sys.exit(1 if hard_report(paths) else 0)
 
     total = 0
     by_street = Counter()
