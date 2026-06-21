@@ -164,6 +164,22 @@ MID 23%（正确位置梯度）、AF 2.25、fallback 0%。
 - **driver 自救**：live 暴露「对手离桌独坐→server 心跳使 recv 永不超时→永久空等」（实测卡
   34min）。移植主线三件套：`already_seated`→leave+rejoin、看门狗线程（120s 无新手 rejoin）、
   断开 `_ws=None`。重启后 6 决策/40s 正常流转、画像持久载入。
+- **前期硬伤检测**：`analyze --hard`（fallback/该 check 却弃/弃顶级起手/value 低eq/加注越界/
+  HU 跟空气）+ driver 内联即时扫。1000 手 live 实测 net **+36976 chips=+1849 mbb/g**、0 fallback。
+  硬伤检测先误报 2 例（多人池 BB 防守跟注），已修为仅 HU 报。
+
+### live 1000 手 EV 深挖：limp「漏洞」是伪命题（被回归门驳回，未改代码）
+
+live 6-max 1940 决策显示翻前被动（VPIP46/PFR18、gap 28pt），`limp_behind` 76 手是
+被支配的 offsuit K-rag（K5o/K3o/J8o…）。**假设**：按可玩性（对子/同花/同连）收紧 limp、弃 K-rag。
+**为可门控，先加 sim 被动 baseline `Limper`（open-limp 宽 range，制造多人 limped 底池，0 fallback/漂移）。**
+**回归门驳回**（子 agent 严测）：对那批 K-rag 做 EV 归因，竟是**强 +EV**（9max vs station +7.35bb/手、
+limpy +5.01、mixed +4.90）——弱/被动场没人惩罚跛入，跛进去翻到 K 顶对就收钱。收紧反而退化
+（40k×3seed：9max station −923、limpy −559，2–4σ 真退化）。故**未提交**收紧改动。
+**结论**：limp K-rag 对弱/被动场（=我们实际面对的、也是赢 +1849 的原因）就是 +EV，只对**会 iso 惩罚的强场**才是漏洞。
+正确归属＝**剥削层**（仅对激进 iso 对手收紧 limp），非默认改动；当前不接强场，暂不做。
+「正确性>一切 + sim 门控」拦下了一个教科书正确但语境错误的 -EV 改动。Limper baseline 保留（`0bfea7a`，
+让 sim 混合场更像 live 弱场，提升后续所有回归保真度）。
 
 ### 迭代 backlog（下一步，按优先级）
 
