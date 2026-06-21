@@ -206,7 +206,8 @@ pub struct ExploitConfig {
     pub nit_vpip: f64,
     /// AF（aggression factor）高于此 = 激进/疯子，放宽抓诈跟注。
     pub maniac_af: f64,
-    /// 各类调整的最大幅度（equity 阈值偏移）。
+    /// 各类调整的最大幅度（equity 阈值偏移）。0.12 = sim 扫参验证的甜点：station/maniac/
+    /// mixed 显著提升、nit 持平；≥0.16 时对 nit 过偷反被惩罚（断崖），故止于 0.12。
     pub adjust_cap: f64,
 }
 
@@ -217,7 +218,7 @@ impl Default for ExploitConfig {
             station_vpip: 0.45,
             nit_vpip: 0.16,
             maniac_af: 3.5,
-            adjust_cap: 0.08,
+            adjust_cap: 0.12,
         }
     }
 }
