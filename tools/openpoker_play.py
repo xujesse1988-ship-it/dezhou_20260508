@@ -43,6 +43,7 @@ advisor / ws 的字节 → IPC + 出动作 byte-equal 不受影响（与 --hh-lo
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -1357,6 +1358,12 @@ def main():
             extra += ["--exploit-converge-se", str(args.exploit_converge_se)]
         if args.exploit_converge_drift is not None:
             extra += ["--exploit-converge-drift", str(args.exploit_converge_drift)]
+        # 暖启动剥削画像：--hh-log 指定的文件若已有历史牌局（同一文件 append 跨 run 累积），
+        # 启动期喂给 advisor Profiler（advisor 侧逐手重放，网络丢数据 / 不完整的手会被过滤掉、
+        # 不污染统计）。仅真实联机（非 selftest）+ 文件存在且非空时透传。
+        if (not args.selftest and args.hh_log
+                and os.path.exists(args.hh_log) and os.path.getsize(args.hh_log) > 0):
+            extra += ["--warm-profile-hh", args.hh_log]
     # --debug-log 透传给 advisor：打印决策流水线 + range/solve 中间数据（与 --search 正交，
     # blueprint 路径也打）。driver 侧的牌局中间数据 + advisor 内部数据由同一旗一起开。
     if args.debug_log:

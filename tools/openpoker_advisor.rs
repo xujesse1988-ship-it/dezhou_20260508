@@ -81,7 +81,7 @@ use poker::training::nlhe_betting_tree::{
     NodeId,
 };
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
-use poker::training::openpoker_hh::hist_to_concrete;
+use poker::training::openpoker_hh::{hh_record_to_observe, hist_to_concrete, HhRecord};
 use poker::training::opponent_profile::{ExploitConfig, ObserveHand, OpponentProfile, Profiler};
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
@@ -2042,6 +2042,11 @@ struct Args {
     /// 开时可设**（拒静默 guard）。`None`（默认）= 关，全程与现网 byte-equal。子旗 `--exploit-min-hands`
     /// / `--exploit-strength` / `--exploit-converge-se` / `--exploit-converge-drift` 填 [`ExploitConfig`]。
     exploit: Option<ExploitConfig>,
+    /// `--warm-profile-hh <path>`：暖启动剥削画像——启动期读这个 HH JSONL（driver `--hh-log` 同一文件），
+    /// 把过往牌局喂进进程内 `Profiler`（与 live observe 同口径）。**仅 `--exploit on|vpip` 时可设**
+    /// （拒静默 guard）。`None`（默认）= 空表起步（旧行为）。网络丢消息 / 字段缺失 / 序列不完整的牌局
+    /// 在 [`hh_record_to_observe`] 重放处 `Err` → 计数跳过（不污染统计）。
+    warm_profile_hh: Option<PathBuf>,
     /// `--debug-log`：打印决策流水线 + range / solve 中间数据到 **stderr**（与 `--search` 正交，
     /// blueprint 路径也打）。`false`（默认）= 静默、零开销；on 也不动 stdout（IPC byte-equal）。
     debug_log: bool,
@@ -2088,6 +2093,34 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// 暖启动剥削画像（`--warm-profile-hh`）：逐行读 HH JSONL，把过往牌局喂进 `prof`（与 driver live
+/// observe 同口径）。返回 `(fed, skipped)`：`fed` = 成功喂入的手数、`skipped` = 因数据有问题被
+/// 过滤的手数（serde 解析失败 / 网络丢消息致重放 actor 失配 / 字段缺失 / 序列未到终局——全在
+/// [`hh_record_to_observe`] 处 `Err`）。文件打不开 → `Err`（caller 降级空表起步，不致命）。
+fn warm_profile_from_hh(path: &std::path::Path, prof: &mut Profiler) -> Result<(u64, u64), String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("open {} 失败: {e}", path.display()))?;
+    let reader = std::io::BufReader::new(f);
+    let (mut fed, mut skipped) = (0u64, 0u64);
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("读取 {} 失败: {e}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // 解析 → 重放转换 → 喂。任一步失败 = 该手有问题（含网络丢数据）→ 计数跳过，不污染统计。
+        match serde_json::from_str::<HhRecord>(&line)
+            .map_err(|e| e.to_string())
+            .and_then(|rec| hh_record_to_observe(&rec))
+        {
+            Ok(obs) => {
+                prof.observe_hand(&obs);
+                fed += 1;
+            }
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((fed, skipped))
 }
 
 fn run() -> Result<(), String> {
@@ -2174,6 +2207,22 @@ fn run() -> Result<(), String> {
                 ec.min_hands, ec.strength_alpha, ec.converge_se, ec.converge_drift, ec.window,
                 if ec.pfr_shape { "on(VPIP+PFR/CallBand·RaiseBand)" } else { "vpip(仅VPIP/byte-equal)" }
             );
+            // 暖启动（--warm-profile-hh）：启动期读过往 HH JSONL，把历史牌局喂进 Profiler（与 live
+            // observe 同口径）。网络丢消息 / 字段缺失 / 序列不完整的牌局在 hh_record_to_observe 重放处
+            // Err → 计数跳过（不污染统计）。在写 ready 行**前**做 → 首决策即带画像。
+            if let Some(path) = &args.warm_profile_hh {
+                let mut prof = cell.borrow_mut();
+                match warm_profile_from_hh(path, &mut prof) {
+                    Ok((fed, skipped)) => eprintln!(
+                        "[openpoker_advisor] warm-profile: {fed} 手喂入画像 / {skipped} 手跳过（数据有问题，已过滤）/ {names} 名玩家 from {path}",
+                        path = path.display(),
+                        names = prof.names_seen(),
+                    ),
+                    Err(e) => eprintln!(
+                        "[openpoker_advisor] warm-profile 读取失败（跳过暖启动、空表起步）: {e}"
+                    ),
+                }
+            }
         }
     }
     eprintln!(
@@ -2290,6 +2339,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_converge_se: Option<f64> = None;
     let mut exploit_converge_drift: Option<f64> = None;
     let mut exploit_pfr_shape = false;
+    let mut warm_profile_hh: Option<PathBuf> = None;
     let mut debug_log = false;
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -2418,6 +2468,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 }
                 other => return Err(format!("--exploit 须 on|vpip|off，得 {other}")),
             },
+            "--warm-profile-hh" => warm_profile_hh = Some(PathBuf::from(next_val(&mut it, &arg)?)),
             "--exploit-min-hands" => {
                 exploit_min_hands = Some(
                     next_val(&mut it, &arg)?
@@ -2518,6 +2569,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     {
         return Err("设了 --exploit-* 子旗但 --exploit 非 on|vpip".to_string());
     }
+    if warm_profile_hh.is_some() && !exploit_on {
+        return Err("设了 --warm-profile-hh 但 --exploit 非 on|vpip（无画像可暖启动）".to_string());
+    }
     if exploit_on && search.is_none() {
         return Err("--exploit on|vpip 需配合 --search（剥削只挂脱锚搜索路径）".to_string());
     }
@@ -2550,6 +2604,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         // 默认关（旧行为 byte-equal）；--search-flop-prefer-blueprint on 显式开。
         search_flop_prefer_blueprint: search_flop_prefer_blueprint
             .unwrap_or(DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT),
+        warm_profile_hh,
         debug_log,
     })
 }
@@ -5050,6 +5105,44 @@ mod tests {
         assert!(e.pfr_shape);
         // 出界拒收。
         assert!(parse(&["--search", "--exploit", "on", "--exploit-strength", "1.5"]).is_err());
+        // --warm-profile-hh：需 --exploit on|vpip；on / vpip 都接（都用画像）。
+        assert!(
+            parse(&["--search", "--warm-profile-hh", "x.jsonl"]).is_err(),
+            "--warm-profile-hh 无 --exploit 应拒收"
+        );
+        assert!(
+            parse(&[
+                "--search",
+                "--exploit",
+                "off",
+                "--warm-profile-hh",
+                "x.jsonl"
+            ])
+            .is_err(),
+            "--exploit off 不该接 --warm-profile-hh"
+        );
+        let a = parse(&[
+            "--search",
+            "--exploit",
+            "on",
+            "--warm-profile-hh",
+            "hh.jsonl",
+        ])
+        .expect("parse Ok");
+        assert_eq!(
+            a.warm_profile_hh.as_deref(),
+            Some(std::path::Path::new("hh.jsonl"))
+        );
+        assert!(parse(&[
+            "--search",
+            "--exploit",
+            "vpip",
+            "--warm-profile-hh",
+            "hh.jsonl"
+        ])
+        .expect("parse Ok")
+        .warm_profile_hh
+        .is_some());
     }
 
     #[test]

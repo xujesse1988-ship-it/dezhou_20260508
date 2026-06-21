@@ -28,12 +28,13 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
-use crate::core::{Card, ChipAmount, SeatId};
+use crate::core::{Card, ChipAmount, SeatId, Street};
 use crate::rules::action::Action;
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::aivat_multiway::MultiwayHandInput;
 use crate::training::blueprint_advisor::parse_card;
+use crate::training::opponent_profile::{ObsAction, ObserveHand};
 
 /// solver 单位（与 `TableConfig::default_6max_100bb` 一致）。
 const SOLVER_BB: u64 = 100;
@@ -440,6 +441,53 @@ pub fn hh_to_multiway_input(rec: &HhRecord) -> Result<HhConverted, String> {
     })
 }
 
+/// HH 记录 → [`ObserveHand`]（Profiler 暖启动用，与 driver live observe 同口径）。**复用
+/// [`hh_to_multiway_input`] 的已验证重放**：短桌 dealt-ring / 角色盲注 / actor 逐步校验 / all-in
+/// 种类判定 / 重放到终局 全在内 → 网络丢消息、字段缺失、序列不完整的牌局在那里就 `Err`
+/// （`reference_openpoker_hh_jsonl_parsing`：丢消息 = 「期望行动者 X ≠ 日志 seat Y」），caller 计数跳过。
+/// 拿到合法动作序后再重放一遍读**每步应用前的真实街**（治 actions_ext.street 错位坑——
+/// 关闭轮动作被标下一街），按原始座 + 原样动作串组 [`ObserveHand`]（座与 `names` 对齐、Profiler 按名 key）。
+pub fn hh_record_to_observe(rec: &HhRecord) -> Result<ObserveHand, String> {
+    let conv = hh_to_multiway_input(rec)?; // 验证重放：合法动作序 + 到终局（有问题的牌局在此 Err）
+                                           // conv.input.actions 与 rec.actions 严格 1:1 同序（hh_to_multiway_input 逐 rec.actions 构造）。
+    if conv.input.actions.len() != rec.actions.len() {
+        return Err(format!(
+            "重放动作数 {} ≠ HH actions {}（不应发生）",
+            conv.input.actions.len(),
+            rec.actions.len()
+        ));
+    }
+    // 已验证可重放到终局 → 此处 apply 不会失败；只为读每步**应用前**的真实街。
+    let mut st = GameState::new(&conv.input.config, HH_REPLAY_SEED);
+    let mut actions: Vec<ObsAction> = Vec::with_capacity(rec.actions.len());
+    for (i, (_ring_seat, act)) in conv.input.actions.iter().enumerate() {
+        let street = match st.street() {
+            Street::Preflop => "preflop",
+            Street::Flop => "flop",
+            Street::Turn => "turn",
+            Street::River => "river",
+            Street::Showdown => {
+                return Err(format!("暖启动重放第 {i} 步处于 showdown，不应有动作"))
+            }
+        };
+        actions.push(ObsAction {
+            seat: rec.actions[i].seat, // 原始座（与 names 对齐）
+            street: street.to_string(),
+            action: rec.actions[i].action.clone(), // 原样动作串（observe_hand::classify 同口径）
+        });
+        st.apply(*act)
+            .map_err(|e| format!("暖启动重放第 {i} 步 apply({act:?}) 非法: {e:?}（不应发生）"))?;
+    }
+    // names：HH 字符串座位键 → u8（坏键静默跳过——名缺失只是该座不可按名累计）。
+    let mut names: BTreeMap<u8, String> = BTreeMap::new();
+    for (k, v) in &rec.names {
+        if let Ok(seat) = k.parse::<u8>() {
+            names.insert(seat, v.clone());
+        }
+    }
+    Ok(ObserveHand { names, actions })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +545,52 @@ mod tests {
         assert!(!r.has_runout);
         assert_eq!(r.aivat, r.raw);
         assert_eq!(r.our_rel_pos, 2, "BB 相对 button=0 是 2");
+    }
+
+    #[test]
+    fn hh_record_to_observe_reconstructs_streets_and_feeds_profiler() {
+        use crate::training::opponent_profile::{ExploitConfig, Profiler};
+        let rec: HhRecord = serde_json::from_str(&canned_showdown_line()).expect("parse");
+        let obs = hh_record_to_observe(&rec).expect("convert observe");
+        // 街重建（治 actions_ext.street 错位）：前 6 动作 preflop、[6,7] flop、[8,9] turn、[10,11] river。
+        let streets: Vec<&str> = obs.actions.iter().map(|a| a.street.as_str()).collect();
+        assert_eq!(
+            streets,
+            [
+                "preflop", "preflop", "preflop", "preflop", "preflop", "preflop", "flop", "flop",
+                "turn", "turn", "river", "river"
+            ]
+        );
+        // 座位保持原始（与 names 对齐）：UTG(3)/HJ(4)/CO(5)/BTN(0) fold，再 SB(1)/BB(2)…
+        let seats: Vec<u8> = obs.actions.iter().map(|a| a.seat).collect();
+        assert_eq!(seats, [3, 4, 5, 0, 1, 2, 1, 2, 1, 2, 1, 2]);
+        // 喂 Profiler 200×（与 live observe 同口径）：bot1（SB 仅 call）vpip=1/pfr=0、bot3（preflop fold）vpip=0。
+        let mut p = Profiler::new(ExploitConfig::default());
+        for _ in 0..200 {
+            p.observe_hand(&obs);
+        }
+        let b1 = p.profile_for("bot1").expect("bot1 收敛");
+        assert!(
+            (b1.vpip - 1.0).abs() < 1e-9 && b1.pfr.abs() < 1e-9,
+            "SB 仅 call：vpip=1 pfr=0，得 vpip={} pfr={}",
+            b1.vpip,
+            b1.pfr
+        );
+        let b3 = p.profile_for("bot3").expect("bot3 收敛");
+        assert!(b3.vpip.abs() < 1e-9, "preflop fold：vpip=0，得 {}", b3.vpip);
+    }
+
+    #[test]
+    fn hh_record_to_observe_filters_damaged_hand() {
+        // 网络丢一条 preflop 动作（删 BTN seat0 的 fold）→ 重放 actor 失配（期望 seat0 得 seat1）
+        // → Err，被暖启动计数跳过（用户要求过滤掉有问题的牌局）。
+        let mut rec: HhRecord = serde_json::from_str(&canned_showdown_line()).expect("parse");
+        rec.actions.remove(3); // 原序 [3,4,5,0,1,2,…] 删下标 3 = seat0 fold
+        rec.actions_ext.remove(3); // 同步长度（hh_to_multiway_input 校验 ext.len==actions.len）
+        assert!(
+            hh_record_to_observe(&rec).is_err(),
+            "丢消息的牌局应 Err（过滤）"
+        );
     }
 
     /// turn all-in → river 纯发牌段：c_runout 生效（44 张补全），AIVAT = U − c_runout。
