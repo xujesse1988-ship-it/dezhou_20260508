@@ -287,7 +287,8 @@ class Session:
         self.table_id = None
         self.observed_max_seat = default_seats - 1
         self.client_action_id = 0
-        self.counters = {"hands": 0, "decisions": 0, "fallback": 0, "net_chips": 0}
+        self.counters = {"hands": 0, "decisions": 0, "fallback": 0, "net_chips": 0,
+                         "watchdog_rejoins": 0}
         self.fallback_reasons = {}
         self.last_hand_ts = time.time()
         self._ws = None
@@ -298,6 +299,23 @@ class Session:
 
     def _num_seats(self):
         return max(self.default_seats, self.observed_max_seat + 1)
+
+    def rejoin(self, ws, why):
+        """leave_table + 重新 join_lobby：从死桌/旧座自救，重排队到活桌。"""
+        print(f"  [rejoin] {why} → leave_table + join_lobby", file=sys.stderr)
+        try:
+            self.send(ws, {"type": "leave_table"})
+            self.send(ws, {"type": "join_lobby", "buy_in": BUY_IN})
+        except Exception as e:
+            print(f"  [rejoin 发送失败] {e}", file=sys.stderr)
+
+    def watchdog_check(self, stale_after=120):
+        """另一线程每 30s 调：超过 stale_after 秒无新手（对手离桌后独坐、server recv 因
+        心跳帧永不超时 → 会永久空等）→ leave+rejoin 自救。"""
+        if self._ws is not None and time.time() - self.last_hand_ts > stale_after:
+            self.counters["watchdog_rejoins"] += 1
+            self.last_hand_ts = time.time()  # 防重入桌等待期连环触发
+            self.rejoin(self._ws, f"{stale_after}s 无新手（watchdog）")
 
     def _track_seat(self, seat):
         if isinstance(seat, int) and seat > self.observed_max_seat:
@@ -317,6 +335,9 @@ class Session:
             print(f"  [error] {msg}", file=sys.stderr)
             if msg.get("code") == "auth_failed":
                 ws.close()
+            elif msg.get("code") == "already_seated":
+                # 继承了旧进程/旧连接的座位（可能是死桌）→ leave + 重新 join 拿活桌。
+                self.rejoin(ws, "already_seated（继承旧座，可能死桌）")
         elif t in ("lobby_joined", "table_joined"):
             self.last_hand_ts = time.time()
             print(f"  [{t}] seat={msg.get('seat')} pos={msg.get('position')}", file=sys.stderr)
@@ -440,6 +461,20 @@ def run_real(args):
     sess = Session(advisor, send, args.num_hands, args.seats, log_f=log_f,
                    exploit=args.exploit, debug=args.debug)
     header = [f"Authorization: Bearer {args.api_key}"]
+
+    # 看门狗线程：对手离桌后独坐时 server 因心跳帧使 recv 永不超时 → 主线程会永久空等。
+    # 另起线程每 30s 查 last_hand_ts，超 120s 无新手则 leave+rejoin 排队到活桌。
+    stop_watchdog = threading.Event()
+
+    def watchdog_loop():
+        while not stop_watchdog.wait(30):
+            try:
+                sess.watchdog_check()
+            except Exception as e:
+                print(f"  [watchdog] {e}", file=sys.stderr)
+
+    threading.Thread(target=watchdog_loop, daemon=True).start()
+
     attempts = 0
     while sess.counters["hands"] < args.num_hands:
         try:
@@ -453,6 +488,8 @@ def run_real(args):
             time.sleep(3)
             continue
         attempts = 0
+        sess._ws = ws
+        sess.last_hand_ts = time.time()
         try:
             while sess.counters["hands"] < args.num_hands:
                 raw = ws.recv()
@@ -467,15 +504,18 @@ def run_real(args):
             print(f"  连接中断（{e}），3s 重连…", file=sys.stderr)
             time.sleep(3)
         finally:
+            sess._ws = None  # 断开期间看门狗读到 None 即 no-op（不往死 ws 发）。
             try:
                 ws.close()
             except Exception:
                 pass
+    stop_watchdog.set()
 
     c = sess.counters
     print(f"\n=== 收尾：{c['hands']} 手 | 决策 {c['decisions']} | fallback {c['fallback']}"
           f" | net {c['net_chips']} chips "
-          f"({1000.0 * c['net_chips'] / BIG_BLIND_OP / max(1, c['hands']):.1f} mbb/g) ===",
+          f"({1000.0 * c['net_chips'] / BIG_BLIND_OP / max(1, c['hands']):.1f} mbb/g)"
+          f" | watchdog_rejoins {c['watchdog_rejoins']} ===",
           file=sys.stderr)
     if log_f:
         log_f.close()
