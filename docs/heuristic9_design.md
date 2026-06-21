@@ -145,19 +145,40 @@ Request(JSON) ──> [1]GameView ──> [2]Features ──> [3]Range ──> [
 **真实日志画像（1500 决策回放）**：VPIP 28.7% / PFR 16.6%、按位置 open 率 LATE 43% >
 MID 23%（正确位置梯度）、AF 2.25、fallback 0%。
 
+### v0.2（2026-06-21）：live 接通 + 剥削层可测可门控 + 加力
+
+用户提供 api_key（`.env` 的 `API_KEY=`）后首次跑通 live，并完成一轮「打→优化→打」闭环。
+**OpenPoker 是 6-max（常半空/近 HU），但引擎保持 2-9 通用**（用户后续可能接 9-max 平台；
+已验引擎零硬编码座数，`--seats` 仅 driver per-run 参数；live 短桌用 `--seats 2` 向上自适应）。
+
+- **live 实测通过**：smoke 5 手连通/鉴权/出牌全绿、0 fallback；决策合理（AKo open、
+  JQ 成手大注价值、垃圾牌弃）。依赖 `pip3 install --user websocket-client`。
+- **迭代②（基建）**：`heuristic9_sim` 加 `--exploit`，与 live driver 同语义喂画像（稳定座名
+  `p{seat}`、board 长度标街、SB/BB forced_blind、手末 `observe_hand`）→ 剥削层首次可在
+  离线回归门里测/门控。默认关时 byte 级等价历史基线。**首测：剥削层对紧场欠力**（全 nit
+  场 ON≈OFF≈+250 mbb/g）。`--config PATH` 同时加上（partial JSON 扫旋钮免重编）。
+- **迭代③（加力）**：sim 扫 `exploit.adjust_cap` → 0.08 改 **0.12**（甜点）。回归门
+  （`--exploit`, 12000h, 多 seed, 0 fallback/0 重建漂移）6-max 3-seed 均值 vs 0.08：
+  station +386、maniac +256、mixed +97、nit +103、tag −65(噪声内)；9-max 同向。
+  **≥0.16 对 nit 断崖**（过偷被罚 295→−520→−1975），故止于 0.12。exploit=OFF 不受影响。
+- **driver 自救**：live 暴露「对手离桌独坐→server 心跳使 recv 永不超时→永久空等」（实测卡
+  34min）。移植主线三件套：`already_seated`→leave+rejoin、看门狗线程（120s 无新手 rejoin）、
+  断开 `_ws=None`。重启后 6 决策/40s 正常流转、画像持久载入。
+
 ### 迭代 backlog（下一步，按优先级）
 
-1. **剥削变现 vs 紧场**（最大缺口）：sim 显示 vs 全 nit 场仅 break-even。根因 = sim 不喂
-   names/observe → 剥削层不激活。补：① live 接 `--exploit` + `--opp-profile` 持久画像；
-   ② 面对大注/晚街自动收紧对手 betting range 估计（`build_opp_thresholds` 按 bet/pot 与
-   street 加紧）——这条**无需对手数据、普遍正确**，应先做。
-2. **equity 遥测统一标度**：翻前 fold 短路返回 vs-random `strength`、翻后返回 vs-range
+1. **稀疏占座 compact 重映射**（driver，对 6-max 短桌 + 9-max 稀疏都重要）：v1 满环假设，
+   非连续物理座会多模拟「幻影座」扭曲位置/人数。主线 `openpoker_play.py` 已有 `dealt_seats`/
+   `stream:state` 占座推断方案可移植。
+2. **剥削对纯 nit 场仍欠力**：adjust_cap 已到安全上限 0.12（再高 nit 断崖）。要进一步榨干
+   紧场需结构改动——把「模型对手紧（助我弃）」与「利用其高弃率（助我攻）」解耦，因为同一
+   equity 既驱动跟注又驱动下注，对手收紧会同时压住我方进攻。非全 nit 的真实混合场剥削已正收益。
+3. **equity 遥测统一标度**：翻前 fold 短路返回 vs-random `strength`、翻后返回 vs-range
    equity，`heuristic9_analyze.py` 的「弃了 +equity」标记会混标度误报。统一成 vs-range。
-3. **稀疏占座 compact 重映射**（driver）：v1 满环假设；非满桌需把 dealt 座压缩成 0..k。
 4. **混合/平衡**：`MixingConfig.temperature` 目前只用频率门，可加边界动作 softmax 混合
    降可剥削性。
-5. **live 校准**：driver live 路径未经我实测（无 api_key）；用户接 key 跑 1000 手后按
-   `heuristic9_analyze.py` 报告 + 此文档闭环迭代。
+5. **live 数据闭环**：表有活人时跑满 1000 手 → `heuristic9_analyze.py` 出漏洞报告 → 迭代。
+   当前平台活跃度低（实测仅 1 对手），数据攒得慢。
 
 ### 如何升级（操作）
 
