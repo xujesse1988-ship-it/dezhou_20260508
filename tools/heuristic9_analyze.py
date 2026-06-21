@@ -69,10 +69,21 @@ def hard_issues(req, resp):
             out.append(("RAISE_BELOW_MIN", f"to {amt} < min {mn}"))
         elif mx is not None and amt > mx + 0.5:
             out.append(("RAISE_ABOVE_MAX", f"to {amt} > max {mx}"))
-    # 6) 近乎 0 equity 还跟注 —— 漏斗送钱（极端门槛，避免误报赔率位）。
-    if act == "call" and eqf is not None and eqf < 0.12:
-        out.append(("CALL_NEAR_ZERO_EQ", f"{street} eq={eqf:.2f}"))
+    # 6) 近乎 0 equity 还跟注 —— 只在近 HU 池报。多人池 equity 天然被稀释（5 人池均分=20%），
+    #    且常是廉价收尾跟注（BB 防守 9:1 价位），raw equity 低不等于 -EV → 多人不报，避免误报。
+    if act == "call" and eqf is not None and eqf < 0.12 and _opps_in_pot(req.get("actions", [])) <= 1:
+        out.append(("CALL_NEAR_ZERO_EQ", f"{street} HU eq={eqf:.2f}"))
     return out
+
+
+def _opps_in_pot(actions):
+    """据动作流估「仍在池中的对手数」= 各座最后动作非 fold 的座位数（不含 hero 自己未必在表中）。"""
+    last = {}
+    for a in actions:
+        s = a.get("seat")
+        if s is not None:
+            last[s] = a.get("action")
+    return sum(1 for v in last.values() if v != "fold")
 
 
 def hard_report(paths):
