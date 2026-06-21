@@ -65,7 +65,7 @@ mid-round 撞 §6 #1/#2 landmine(非 round-start 重解+无 within-round 冻结)
 默认 trigger 设回 FlopFirstUnraised(安全),AllPostflop 留研究 opt-in。详见 `temp/realtime_search_design_2026_06_03.md`
 §10.2–10.4 + target S6。
 
-**叠加剥削 Tier 2 已落地(2026-06-19,`--exploit`,默认关)**:进程内对手画像(`src/training/opponent_profile.rs`
+**叠加剥削 Tier 2 已落地(2026-06-19;CLI 2026-06-21 合并为三态 `--exploit on|vpip|off`,默认 `off`:`on`=VPIP+PFR 形状/`vpip`=仅 VPIP 与现网 byte-equal/`off`=关,原 `--exploit-pfr-shape` 子旗删除)**:进程内对手画像(`src/training/opponent_profile.rs`
 `Profiler`,**只用本进程数据、不依赖过往**,driver 每手发 observe 累积 VPIP/PFR/AF)→ 收敛门(样本≥150 +
 VPIP SE≤0.05 + 近窗漂移≤0.08 三条全过才剥削)→ `subgame::apply_exploit_width_prior` 在**脱锚搜索** ranges
 组装处把已收敛对手 root range 朝观测翻前 VPIP 宽度凸混合(Chen 序 top-k,α≤0.8 默认 0.5,hero 不混,带 uniform

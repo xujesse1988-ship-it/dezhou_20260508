@@ -1309,14 +1309,13 @@ def main():
     p.add_argument("--search-prewarm", action="store_true")
     # 叠加剥削（Tier 2，exploit_strategy_design_2026_06_14）：进程内对手画像 → 翻前 range 宽度先验。
     # 需配 --search（仅挂脱锚搜索路径）。缺省关 = 全程与现网 byte-equal（不带 names、不发 observe）。
-    p.add_argument("--exploit", action="store_true",
-                   help="开叠加剥削（进程内画像，收敛后对对手翻前 range 宽度偏置；需 --search）")
+    p.add_argument("--exploit", choices=["on", "vpip", "off"], default="off",
+                   help="叠加剥削三态：on=VPIP+PFR 形状（被动入池→CallBand/主动→RaiseBand，需 PFR 收敛）/ "
+                        "vpip=仅 VPIP 宽度（与现网逐位 byte-equal）/ off=关（默认）；on|vpip 需 --search")
     p.add_argument("--exploit-min-hands", type=int, default=None)
     p.add_argument("--exploit-strength", type=float, default=None)
     p.add_argument("--exploit-converge-se", type=float, default=None)
     p.add_argument("--exploit-converge-drift", type=float, default=None)
-    p.add_argument("--exploit-pfr-shape", choices=["on", "off"], default=None,
-                   help="PFR-aware 宽度形状（被动入池→CallBand/主动→RaiseBand，需 PFR 收敛）；默认关=仅 VPIP")
     args = p.parse_args()
 
     extra = []
@@ -1346,9 +1345,10 @@ def main():
             extra += ["--search-bucket-table", args.search_bucket_table]
         if args.search_solve_threads is not None:
             extra += ["--search-solve-threads", str(args.search_solve_threads)]
-    # 叠加剥削透传（仅 --exploit 开时；advisor 侧 guard 再校验需 --search）。
-    if args.exploit:
-        extra.append("--exploit")
+    # 叠加剥削透传（仅 on|vpip 时；advisor 侧 guard 再校验需 --search）。三态原样透传给 advisor。
+    exploit_on = args.exploit in ("on", "vpip")
+    if exploit_on:
+        extra += ["--exploit", args.exploit]
         if args.exploit_min_hands is not None:
             extra += ["--exploit-min-hands", str(args.exploit_min_hands)]
         if args.exploit_strength is not None:
@@ -1357,19 +1357,16 @@ def main():
             extra += ["--exploit-converge-se", str(args.exploit_converge_se)]
         if args.exploit_converge_drift is not None:
             extra += ["--exploit-converge-drift", str(args.exploit_converge_drift)]
-        if args.exploit_pfr_shape is not None:
-            extra += ["--exploit-pfr-shape", args.exploit_pfr_shape]
     # --debug-log 透传给 advisor：打印决策流水线 + range/solve 中间数据（与 --search 正交，
     # blueprint 路径也打）。driver 侧的牌局中间数据 + advisor 内部数据由同一旗一起开。
     if args.debug_log:
         extra.append("--debug-log")
-    if args.exploit and not args.search:
-        raise SystemExit("--exploit 需配 --search（剥削只挂脱锚搜索路径；没有搜索无处叠加）")
+    if exploit_on and not args.search:
+        raise SystemExit("--exploit on|vpip 需配 --search（剥削只挂脱锚搜索路径；没有搜索无处叠加）")
     if (args.exploit_min_hands is not None or args.exploit_strength is not None
-            or args.exploit_converge_se is not None or args.exploit_converge_drift is not None
-            or args.exploit_pfr_shape is not None) \
-            and not args.exploit:
-        raise SystemExit("--exploit-* 子旗需配 --exploit")
+            or args.exploit_converge_se is not None or args.exploit_converge_drift is not None) \
+            and not exploit_on:
+        raise SystemExit("--exploit-* 子旗需配 --exploit on|vpip")
     if args.search_prewarm and not args.search:
         raise SystemExit("--search-prewarm 需配 --search（拒绝静默：没有搜索就没有可预热的 solve）")
     if args.search_unanchored_prefix_reach is not None and not args.search:
@@ -1393,7 +1390,7 @@ def main():
             log = args.action_log if args.action_log else None
             run_real(advisor, args.api_key, args.num_hands, action_log=log,
                      hh_log=args.hh_log if args.hh_log else None,
-                     prewarm=args.search_prewarm, exploit=args.exploit,
+                     prewarm=args.search_prewarm, exploit=exploit_on,
                      debug=args.debug_log)
     finally:
         advisor.close()

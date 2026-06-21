@@ -2170,9 +2170,9 @@ fn run() -> Result<(), String> {
         if let Some(cell) = &rt.exploit {
             let ec = *cell.borrow().cfg();
             eprintln!(
-                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): min_hands={} strength_alpha={} converge_se={} converge_drift={} window={} pfr_shape={}（进程内画像、不依赖过往）",
+                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): min_hands={} strength_alpha={} converge_se={} converge_drift={} window={} mode={}（进程内画像、不依赖过往）",
                 ec.min_hands, ec.strength_alpha, ec.converge_se, ec.converge_drift, ec.window,
-                if ec.pfr_shape { "ON(CallBand/RaiseBand)" } else { "off(TopK/仅VPIP)" }
+                if ec.pfr_shape { "on(VPIP+PFR/CallBand·RaiseBand)" } else { "vpip(仅VPIP/byte-equal)" }
             );
         }
     }
@@ -2401,8 +2401,23 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 });
             }
             "--debug-log" => debug_log = true,
-            // —— 叠加剥削（Tier 2）：--exploit 开总开关，子旗调 ExploitConfig ——
-            "--exploit" => exploit_on = true,
+            // —— 叠加剥削（Tier 2）：--exploit 三态总开关（on=VPIP+PFR 形状 / vpip=仅 VPIP，与
+            // 现网逐位 byte-equal / off=关），子旗调 ExploitConfig ——
+            "--exploit" => match next_val(&mut it, &arg)?.as_str() {
+                "on" => {
+                    exploit_on = true;
+                    exploit_pfr_shape = true; // VPIP + PFR-aware 形状（CallBand/RaiseBand）
+                }
+                "vpip" => {
+                    exploit_on = true;
+                    exploit_pfr_shape = false; // 仅 VPIP 宽度（TopK，与现网逐位 byte-equal）
+                }
+                "off" => {
+                    exploit_on = false;
+                    exploit_pfr_shape = false;
+                }
+                other => return Err(format!("--exploit 须 on|vpip|off，得 {other}")),
+            },
             "--exploit-min-hands" => {
                 exploit_min_hands = Some(
                     next_val(&mut it, &arg)?
@@ -2436,15 +2451,6 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     return Err(format!("--exploit-converge-drift 须在 [0,1]，得 {v}"));
                 }
                 exploit_converge_drift = Some(v);
-            }
-            "--exploit-pfr-shape" => {
-                // PFR-aware 宽度形状（被动入池→CallBand / 主动→RaiseBand，需 PFR 收敛）。默认关
-                // = 全 TopK（仅 VPIP，byte-equal 当前 exploit）；on 显式开（A/B 用）。
-                exploit_pfr_shape = match next_val(&mut it, &arg)?.as_str() {
-                    "on" | "true" | "1" => true,
-                    "off" | "false" | "0" => false,
-                    other => return Err(format!("--exploit-pfr-shape 须 on|off，得 {other}")),
-                };
             }
             other => return Err(format!("unknown arg {other}")),
         }
@@ -2502,18 +2508,18 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         }
         None
     };
-    // --exploit* guard：子旗需 --exploit；--exploit 需 --search（剥削仅作用脱锚搜索路径）。
+    // --exploit* guard：子旗需 --exploit on|vpip；--exploit on|vpip 需 --search（剥削仅作用脱锚
+    // 搜索路径）。pfr_shape 现由 --exploit 取值派生（off 时恒 false），不再单列入此 guard。
     if !exploit_on
         && (exploit_min_hands.is_some()
             || exploit_strength.is_some()
             || exploit_converge_se.is_some()
-            || exploit_converge_drift.is_some()
-            || exploit_pfr_shape)
+            || exploit_converge_drift.is_some())
     {
-        return Err("设了 --exploit-* 参数但未开 --exploit".to_string());
+        return Err("设了 --exploit-* 子旗但 --exploit 非 on|vpip".to_string());
     }
     if exploit_on && search.is_none() {
-        return Err("--exploit 需配合 --search（剥削只挂脱锚搜索路径）".to_string());
+        return Err("--exploit on|vpip 需配合 --search（剥削只挂脱锚搜索路径）".to_string());
     }
     let exploit = exploit_on.then(|| {
         let d = ExploitConfig::default();
@@ -4978,8 +4984,8 @@ mod tests {
         assert!(parse(&["--search-iterations", "1000"]).is_err());
     }
 
-    /// 叠加剥削 CLI：`--exploit` 默认关；开需配 `--search`；子旗需 `--exploit`；坏值 / 出界拒收；
-    /// 子旗覆盖默认。
+    /// 叠加剥削 CLI：`--exploit on|vpip|off` 三态（on=VPIP+PFR / vpip=仅 VPIP / off=关，默认关）；
+    /// on|vpip 需配 `--search`；子旗需 `--exploit on|vpip`；缺参数 / 脏值 / 出界拒收；子旗覆盖默认。
     #[test]
     fn parse_args_exploit() {
         let parse = |extra: &[&str]| {
@@ -4989,28 +4995,49 @@ mod tests {
                 .map(|s| s.to_string());
             parse_args_from(argv)
         };
-        // 默认关。
+        // 省略 / off → 关。
         assert!(parse(&[]).expect("parse Ok").exploit.is_none());
-        // --exploit 需 --search。
+        assert!(parse(&["--search", "--exploit", "off"])
+            .expect("parse Ok")
+            .exploit
+            .is_none());
+        // --exploit 缺参数 / 脏值拒收。
         assert!(
-            parse(&["--exploit"]).is_err(),
-            "--exploit 无 --search 应拒收"
+            parse(&["--search", "--exploit"]).is_err(),
+            "--exploit 缺参数应拒收"
         );
-        // 子旗需 --exploit。
+        assert!(
+            parse(&["--search", "--exploit", "x"]).is_err(),
+            "--exploit 脏值应拒收"
+        );
+        // --exploit on|vpip 需 --search。
+        assert!(
+            parse(&["--exploit", "on"]).is_err(),
+            "--exploit on 无 --search 应拒收"
+        );
+        // 子旗需 --exploit on|vpip。
         assert!(
             parse(&["--search", "--exploit-strength", "0.3"]).is_err(),
             "--exploit-* 无 --exploit 应拒收"
         );
-        // --search --exploit → Some(默认)。
+        // --search --exploit on → Some(默认 + PFR 形状开)。
         let d = ExploitConfig::default();
-        let a = parse(&["--search", "--exploit"]).expect("parse Ok");
+        let a = parse(&["--search", "--exploit", "on"]).expect("parse Ok");
         let e = a.exploit.expect("exploit on");
         assert_eq!(e.min_hands, d.min_hands);
         assert!((e.strength_alpha - d.strength_alpha).abs() < 1e-12);
-        // 子旗覆盖。
+        assert!(e.pfr_shape, "--exploit on → VPIP+PFR 形状");
+        // --exploit vpip → 仅 VPIP（pfr_shape 关，与现网逐位 byte-equal）。
+        let e = parse(&["--search", "--exploit", "vpip"])
+            .expect("parse Ok")
+            .exploit
+            .expect("exploit on");
+        assert!(!e.pfr_shape, "--exploit vpip → 仅 VPIP（TopK）");
+        // 子旗覆盖（on 接子旗）。
         let a = parse(&[
             "--search",
             "--exploit",
+            "on",
             "--exploit-min-hands",
             "300",
             "--exploit-strength",
@@ -5020,28 +5047,9 @@ mod tests {
         let e = a.exploit.expect("exploit on");
         assert_eq!(e.min_hands, 300);
         assert!((e.strength_alpha - 0.3).abs() < 1e-12);
+        assert!(e.pfr_shape);
         // 出界拒收。
-        assert!(parse(&["--search", "--exploit", "--exploit-strength", "1.5"]).is_err());
-        // --exploit-pfr-shape：默认关、on 显式开、脏值拒收、无 --exploit 拒收。
-        assert!(
-            !parse(&["--search", "--exploit"])
-                .unwrap()
-                .exploit
-                .unwrap()
-                .pfr_shape
-        );
-        assert!(
-            parse(&["--search", "--exploit", "--exploit-pfr-shape", "on"])
-                .unwrap()
-                .exploit
-                .unwrap()
-                .pfr_shape
-        );
-        assert!(parse(&["--search", "--exploit", "--exploit-pfr-shape", "x"]).is_err());
-        assert!(
-            parse(&["--search", "--exploit-pfr-shape", "on"]).is_err(),
-            "--exploit-pfr-shape 无 --exploit 应拒收"
-        );
+        assert!(parse(&["--search", "--exploit", "on", "--exploit-strength", "1.5"]).is_err());
     }
 
     #[test]

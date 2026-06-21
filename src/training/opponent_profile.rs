@@ -73,9 +73,9 @@ pub struct ExploitConfig {
     pub strength_alpha: f64,
     /// 漂移检测的近窗手数。
     pub window: usize,
-    /// PFR-aware 宽度形状开关（advisor `--exploit-pfr-shape`）。`false`（默认）= 全程 `TopK`（仅 VPIP，
-    /// 与现有 exploit 行为逐位 byte-equal）；`true` = 据对手 PFR 收敛性 + 本手翻前入池方式选
-    /// `CallBand`（被动入池掐顶端）/`RaiseBand`（主动入池收顶端）。
+    /// PFR-aware 宽度形状开关（advisor `--exploit on` 置 `true`、`--exploit vpip` 置 `false`）。
+    /// `false`（默认）= 全程 `TopK`（仅 VPIP，与现有 exploit 行为逐位 byte-equal）；`true` = 据对手
+    /// PFR 收敛性 + 本手翻前入池方式选 `CallBand`（被动入池掐顶端）/`RaiseBand`（主动入池收顶端）。
     pub pfr_shape: bool,
 }
 
