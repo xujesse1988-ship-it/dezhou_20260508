@@ -8,16 +8,20 @@
 //! → Action），因此 sim 同时**验证下注重建**——把 [`GameView`] 重建的 pot/to_call 与权威
 //! GameState 对照，统计漂移率（重建 bug 在这里现形）。
 //!
+//! `--exploit` 开对手画像（与 live driver 同语义：每手给每座稳定名 `p{seat}`、按 board 长度
+//! 标街、按 SB/BB 座标 forced_blind，手末 `observe_hand` 喂画像）——让剥削层在 sim 里可测/可门控。
+//! 默认关：`exploit=false` 时 `names` 空、不 observe，行为与历史基线 byte 级一致。
+//!
 //! 用法：
 //! ```text
 //! heuristic9_sim [--hands N] [--seats K] [--bb 20] [--samples S] [--seed X]
-//!                [--field mixed|nit|station|maniac|tag|random] [--mirror]
+//!                [--field mixed|nit|station|maniac|tag|random] [--mirror] [--exploit]
 //! ```
 
 use poker::core::{Card, Rank, Suit};
 use poker::heuristic::features::{draws, made_class, MadeClass};
 use poker::heuristic::view::{GameView, HistAction, Request, ValidActions};
-use poker::heuristic::{EquityEngine, HeuristicBot, HeuristicConfig};
+use poker::heuristic::{EquityEngine, HeuristicBot, HeuristicConfig, ObservedAction};
 use poker::rules::action::{Action, LegalActionSet};
 use poker::rules::config::TableConfig;
 use poker::rules::state::GameState;
@@ -384,11 +388,17 @@ fn random_action(
 // Request 构建（GameState → advisor 协议）
 // ===========================================================================
 
+/// 稳定座位名（observe/names 用）。座位身份跨手固定 = 真实对手保号。
+fn seat_name(seat: usize) -> String {
+    format!("p{seat}")
+}
+
 fn build_request(
     state: &GameState,
     seat: usize,
     hist: &[HistAction],
     cfg: &TableConfig,
+    exploit: bool,
 ) -> Request {
     let players = state.players();
     let hole = players[seat]
@@ -408,12 +418,23 @@ fn build_request(
         actions: hist.to_vec(),
         valid: valid_from_legal(&state.legal_actions()),
         stacks,
-        names: std::collections::BTreeMap::new(),
+        names: if exploit {
+            (0..cfg.n_seats)
+                .map(|s| (s, seat_name(s as usize)))
+                .collect()
+        } else {
+            std::collections::BTreeMap::new()
+        },
     }
 }
 
-/// 记录一个已应用动作到 OpenPoker 风格历史。
-fn record_action(state_after: &GameState, seat: usize, action: Action, hist: &mut Vec<HistAction>) {
+/// 记录一个已应用动作到 OpenPoker 风格历史。返回动作标签（observe 复用）。
+fn record_action(
+    state_after: &GameState,
+    seat: usize,
+    action: Action,
+    hist: &mut Vec<HistAction>,
+) -> &'static str {
     let (label, to) = match action {
         Action::Fold => ("fold", None),
         Action::Check => ("check", None),
@@ -443,6 +464,7 @@ fn record_action(state_after: &GameState, seat: usize, action: Action, hist: &mu
         action: label.to_string(),
         to,
     });
+    label
 }
 
 // ===========================================================================
@@ -462,15 +484,18 @@ struct SimStats {
 
 #[allow(clippy::too_many_arguments)]
 fn play_hand(
-    bot: &HeuristicBot,
+    bot: &mut HeuristicBot,
     eq: &EquityEngine,
     field: &[Archetype],
     cfg: &TableConfig,
     hand_seed: u64,
     stats: &mut SimStats,
+    exploit: bool,
 ) {
     let mut state = GameState::new(cfg, hand_seed);
     let mut hist: Vec<HistAction> = Vec::new();
+    // observe 累积：(seat, street, action_label)；街由翻牌前/后 board 长度判定。
+    let mut obs: Vec<(u8, u8, &'static str)> = Vec::new();
     let mut guard = 0;
     while !state.is_terminal() && guard < 400 {
         guard += 1;
@@ -479,8 +504,15 @@ fn play_hand(
             None => break,
         };
         let legal = state.legal_actions();
+        // 街 = 动作发生时的 board 长度（apply 前捕获，apply 可能翻新街）。
+        let street_idx: u8 = match state.board().len() {
+            0 => 0,
+            3 => 1,
+            4 => 2,
+            _ => 3,
+        };
         let action = if field[seat] == Archetype::Hero {
-            let req = build_request(&state, seat, &hist, cfg);
+            let req = build_request(&state, seat, &hist, cfg, exploit);
             // 重建对照（验证 GameView）。
             let view = GameView::from_request(&req);
             let real_pot = state.pot().0;
@@ -511,7 +543,10 @@ fn play_hand(
             // 不应发生（映射保证合法）；保险退出。
             break;
         }
-        record_action(&state, seat, action, &mut hist);
+        let label = record_action(&state, seat, action, &mut hist);
+        if exploit {
+            obs.push((seat as u8, street_idx, label));
+        }
     }
     if let Some(payouts) = state.payouts() {
         // hero 座位 = field 中 Hero 的下标。
@@ -528,6 +563,27 @@ fn play_hand(
         stats.hands += 1;
         stats.per_hand.push(net as f64 / cfg.big_blind.0 as f64);
     }
+    // 喂对手画像（与 live advisor feed_observe 同语义：盲位翻前动作标 forced）。
+    if exploit {
+        let n = cfg.n_seats;
+        let btn = cfg.button_seat.0 % n;
+        let (sb_seat, bb_seat) = if n == 2 {
+            (btn, (btn + 1) % n)
+        } else {
+            ((btn + 1) % n, (btn + 2) % n)
+        };
+        let names: Vec<String> = (0..n as usize).map(seat_name).collect();
+        let observed: Vec<ObservedAction> = obs
+            .iter()
+            .map(|(seat, st, act)| ObservedAction {
+                name: &names[*seat as usize],
+                street: *st,
+                action: act,
+                forced_blind: *st == 0 && (*seat == sb_seat || *seat == bb_seat),
+            })
+            .collect();
+        bot.observe_hand(&observed, &names);
+    }
 }
 
 fn main() {
@@ -538,6 +594,7 @@ fn main() {
     let mut seed = 12345u64;
     let mut field_kind = String::from("mixed");
     let mut mirror = false;
+    let mut exploit = false;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -580,6 +637,10 @@ fn main() {
                 mirror = true;
                 i += 1;
             }
+            "--exploit" => {
+                exploit = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -589,7 +650,7 @@ fn main() {
     config.equity.samples = samples;
     // sim 建表用稍小样本提速。
     config.equity.preflop_table_samples = 2000;
-    let bot = HeuristicBot::new(config);
+    let mut bot = HeuristicBot::new(config);
     let eq = EquityEngine::new(2000, 999);
 
     // 组场：座 0 = Hero，其余按 field_kind。
@@ -647,7 +708,9 @@ fn main() {
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .wrapping_add(h)
             .wrapping_add(0x1234_5678);
-        play_hand(&bot, &eq, &field, &config, hand_seed, &mut stats);
+        play_hand(
+            &mut bot, &eq, &field, &config, hand_seed, &mut stats, exploit,
+        );
     }
 
     // 统计。
@@ -665,7 +728,7 @@ fn main() {
 
     println!("=== heuristic9 自对弈仿真 ===");
     println!(
-        "场: seats={seats} field={} hands={} samples={samples}",
+        "场: seats={seats} field={} hands={} samples={samples} exploit={exploit}",
         if mirror {
             "mirror(hero×N)".into()
         } else {
