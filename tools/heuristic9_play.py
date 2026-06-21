@@ -325,6 +325,8 @@ class Session:
         t = msg.get("type")
         self._ws = ws
         if "table_id" in msg and msg["table_id"]:
+            if msg["table_id"] != self.table_id:
+                print(f"  [table_id] {msg['table_id']}", file=sys.stderr)
             self.table_id = msg["table_id"]
         if t == "connected":
             print(f"  connected agent_id={msg.get('agent_id')} name={msg.get('name')}",
@@ -340,7 +342,8 @@ class Session:
                 self.rejoin(ws, "already_seated（继承旧座，可能死桌）")
         elif t in ("lobby_joined", "table_joined"):
             self.last_hand_ts = time.time()
-            print(f"  [{t}] seat={msg.get('seat')} pos={msg.get('position')}", file=sys.stderr)
+            print(f"  [{t}] seat={msg.get('seat')} pos={msg.get('position')} "
+                  f"table={self.table_id}", file=sys.stderr)
         elif t == "hand_start":
             self._track_seat(msg.get("dealer_seat"))
             self._track_seat(msg.get("seat"))
@@ -371,7 +374,8 @@ class Session:
             if self.counters["hands"] % 25 == 0 and self.counters["hands"] < self.num_hands:
                 c = self.counters
                 print(f"  [♥ {c['hands']}h] dec={c['decisions']} "
-                      f"fb={c['fallback']} net={c['net_chips']}", file=sys.stderr)
+                      f"fb={c['fallback']} net={c['net_chips']} table={self.table_id}",
+                      file=sys.stderr)
             if self.counters["hands"] >= self.num_hands:
                 print(f"  打满 {self.num_hands} 手，离场。", file=sys.stderr)
                 ws.close()
