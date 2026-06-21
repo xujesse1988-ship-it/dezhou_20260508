@@ -40,6 +40,9 @@ enum Archetype {
     Maniac,
     Tag,
     Random,
+    /// 被动开池跛入者 / 跟注站混合：first-in 用宽 range **跛入（仅跟 BB，不加注）**，
+    /// 制造多人 limped 底池——这是 hero `limp_behind` 路径的测试载荷。
+    Limper,
     Hero, // 仅 mirror 模式
 }
 
@@ -212,12 +215,52 @@ fn baseline_action(
     };
 
     if preflop {
+        // Limper：被动开池跛入者。first-in（仅面对 BB）= 用宽 range 跛入（call BB，不加注），
+        // 偶尔只用顶级强牌加注；面对跛入者继续跛入；面对加注用宽 range 跟注（站式），几乎不 3bet。
+        if arch == Archetype::Limper {
+            let facing = to_call > 0;
+            // 是否仅面对 BB（即 first-in / 跛入底池，尚无人加注）。high bet == BB 的整数倍判定不可靠，
+            // 改用「最高本街投入 <= BB」近似 first-in（盲注/limper 的投入都 == BB）。
+            let high = state_high(state);
+            let only_blinds = high <= state.config().big_blind.0;
+            if !facing {
+                // 无人下注（盲位 check option 或 BB）：用宽 range 偶尔加注顶级牌，否则过牌。
+                if strength >= 0.72 {
+                    if let Some(a) = make_bet(0.12, &legal) {
+                        return a;
+                    }
+                }
+                return safe_action(&legal);
+            }
+            if only_blinds {
+                // first-in / 面对跛入者：宽 range（约 top 50%）跛入 = 只跟 BB，不加注。
+                // 仅极顶级牌（~AA/KK/AKs 量级）才偶尔 iso-raise，频率低。
+                if strength >= 0.74 && legal_can_raise(&legal) && rng.unit() < 0.30 {
+                    if let Some(a) = make_bet(0.15, &legal) {
+                        return a;
+                    }
+                }
+                if strength >= 0.50 && legal.call.is_some() {
+                    return Action::Call; // open-limp / limp-along
+                }
+                return safe_action(&legal);
+            }
+            // 面对真正的加注：站式宽跟，几乎不 3bet。
+            if strength >= 0.46 && legal.call.is_some() {
+                return Action::Call;
+            }
+            if pot_odds < 0.22 && legal.call.is_some() {
+                return Action::Call; // 好赔率也跟
+            }
+            return safe_action(&legal);
+        }
         let (open_thr, call_thr, threebet, aggro) = match arch {
             Archetype::Nit => (0.62, 0.60, 0.70, 0.0),
             Archetype::Station => (0.50, 0.42, 0.72, 0.05),
             Archetype::Maniac => (0.42, 0.40, 0.52, 0.55),
             Archetype::Tag => (0.55, 0.50, 0.64, 0.15),
             Archetype::Random => return random_action(&legal, state, seat, rng),
+            Archetype::Limper => unreachable!("Limper handled above"),
             Archetype::Hero => (0.55, 0.50, 0.64, 0.15),
         };
         let facing = to_call > 0;
@@ -276,6 +319,21 @@ fn baseline_action(
             } else if r >= MadeClass::WeakPair.rank() || dr.has_meaningful_draw() || pot_odds < 0.2
             {
                 Action::Call // 跟注站：任何对子/听牌/好赔率都跟
+            } else {
+                safe_action(&legal)
+            }
+        }
+        Archetype::Limper => {
+            // 极被动：check/call 为主，仅强 made-hand 低频下注，几乎不加注。
+            if !facing {
+                if r >= MadeClass::Strong.rank() && rng.unit() < 0.5 {
+                    make_bet(0.4, &legal).unwrap_or_else(|| safe_action(&legal))
+                } else {
+                    safe_action(&legal)
+                }
+            } else if r >= MadeClass::WeakPair.rank() || dr.has_meaningful_draw() || pot_odds < 0.22
+            {
+                Action::Call // 跟注站式：任何对子/听牌/好赔率都跟，不加注
             } else {
                 safe_action(&legal)
             }
@@ -682,6 +740,7 @@ fn main() {
         Archetype::Maniac,
         Archetype::Nit,
         Archetype::Random,
+        Archetype::Limper,
     ];
     for k in 1..seats as usize {
         let a = if mirror {
@@ -693,6 +752,7 @@ fn main() {
                 "maniac" => Archetype::Maniac,
                 "tag" => Archetype::Tag,
                 "random" => Archetype::Random,
+                "limpy" => Archetype::Limper,
                 _ => pool[(k - 1) % pool.len()],
             }
         };
