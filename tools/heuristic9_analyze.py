@@ -10,8 +10,12 @@
   - source 分布（top）+ fallback 率/原因
   - 翻前 VPIP / PFR（hero 自愿入池）+ 按位置桶 open/3bet 率
   - 激进度 AF =（bet+raise）/ call（总 + 翻后）
-  - equity 分桶（下注/跟注/弃牌时的均值 → 抓「弃了 +equity / 跟了 -equity」）
-  - 自动漏洞标记（fallback 偏高、过松/过紧、激进度异常…）
+  - equity 分桶（**按街拆**：翻前=vs-random 标度，翻后=vs-range 标度，不可跨街比）
+  - 面对下注的弃/跟 EV 余量 surplus=equity-required_eq（required_eq 来自重建底池实际价位）
+  - 自动漏洞标记（fallback 偏高、过松/过紧按实际价位判、激进度异常…）
+
+pot/to_call 来源：优先读 resp 里引擎记的 pot/to_call/required_eq/opps_in_pot（精确）；旧日志
+（无这些字段）则用 reconstruct_pot_state 从 req 的 actions[] 重放（与 Rust from_request 等价）。
 
 用法：
   python3 tools/heuristic9_analyze.py heuristic9_actions.jsonl
@@ -23,6 +27,166 @@ from collections import Counter, defaultdict
 
 _RANK_ORD = {r: i for i, r in enumerate("23456789TJQKA")}
 PREMIUM = {"AA", "KK", "QQ", "JJ", "AK"}
+
+# 软 flag 判定容差：surplus 必须越过 ±margin 才报，吸收 equity 蒙特卡洛抖动 + 重建近似。
+EV_MARGIN = 0.08
+# 翻后接近 0 equity 还跟注的硬伤阈值（与 hard_issues 的 multiplicity 处理对齐）。
+NEAR_ZERO_EQ = 0.12
+
+# 默认栈 = 100bb（与 Rust view::default_stack_chips 对齐：栈未知/为 0 时用）。
+DEFAULT_STACK_BB = 100
+
+
+def reconstruct_pot_state(req):
+    """从 req 重放下注状态 → (pot, to_call, required_eq, opps_in_pot)。
+
+    与 Rust `view::GameView::from_request` 的 pot/to_call/pot_odds 等价（同一份 actions[] 历史）：
+    逐街分段重放、每座 committed、检测下注轮关闭后推进街、以 board 长度校准目标街。
+    供缺 pot/to_call 字段的旧日志（run5–9）重建用；新日志直接读 resp 字段更精确。
+    返回 None 表示信息不足（无 big_blind 等）。
+    """
+    try:
+        n = max(int(req.get("num_seats", 0)), 2)
+        bb = max(int(req.get("big_blind", 0)), 1)
+        sb = max(int(req.get("small_blind", 0)), 1)
+    except (TypeError, ValueError):
+        return None
+    if not req.get("big_blind"):
+        return None
+    my = int(req.get("my_seat", 0)) % n
+    btn = int(req.get("button_seat", 0)) % n
+
+    default_stack = max(bb * DEFAULT_STACK_BB, 1)
+    start_stack = [default_stack] * n
+    stacks = req.get("stacks", []) or []
+    for i, s in enumerate(stacks):
+        if i < n and isinstance(s, (int, float)) and s > 0:
+            start_stack[i] = int(s)
+
+    if n == 2:
+        sb_seat, bb_seat = btn, (btn + 1) % n
+    else:
+        sb_seat, bb_seat = (btn + 1) % n, (btn + 2) % n
+
+    folded = [False] * n
+    allin = [False] * n
+    committed_total = [0] * n
+    committed_round = [0] * n
+    has_acted = [False] * n
+
+    def post(seat, amt):
+        avail = start_stack[seat]
+        pay = min(amt, avail)
+        committed_total[seat] += pay
+        committed_round[seat] += pay
+        if pay >= avail:
+            allin[seat] = True
+
+    post(sb_seat, sb)
+    post(bb_seat, bb)
+    high_bet = max(committed_round) if committed_round else bb
+    cur_aggressor = None
+    street_idx = 0
+    pending_advance = False
+
+    def round_closed():
+        live = 0
+        for s in range(n):
+            if folded[s] or allin[s] or start_stack[s] == 0:
+                continue
+            live += 1
+            if not has_acted[s] or committed_round[s] != high_bet:
+                return False
+        return live >= 1
+
+    def advance_street():
+        nonlocal high_bet, cur_aggressor, street_idx
+        for s in range(n):
+            committed_round[s] = 0
+            has_acted[s] = False
+        high_bet = 0
+        cur_aggressor = None
+        street_idx += 1
+
+    for a in req.get("actions", []) or []:
+        if pending_advance:
+            advance_street()
+            pending_advance = False
+        s = int(a.get("seat", 0)) % n
+        act = str(a.get("action", "")).lower()
+        if act == "fold":
+            folded[s] = True
+            has_acted[s] = True
+        elif act == "check":
+            has_acted[s] = True
+        elif act == "call":
+            need = max(high_bet - committed_round[s], 0)
+            avail = max(start_stack[s] - committed_total[s], 0)
+            pay = min(need, avail)
+            committed_round[s] += pay
+            committed_total[s] += pay
+            if pay >= avail:
+                allin[s] = True
+            has_acted[s] = True
+        elif act in ("bet", "raise", "allin", "all_in", "all-in"):
+            to = a.get("to")
+            if to is None:
+                if act.startswith("all"):
+                    to = committed_total[s] + max(start_stack[s] - committed_total[s], 0)
+                else:
+                    to = max(high_bet, bb)
+            to = min(int(to), start_stack[s])
+            delta = max(to - committed_round[s], 0)
+            room = max(start_stack[s] - committed_total[s], 0)
+            pay = min(delta, room)
+            committed_round[s] += pay
+            committed_total[s] += pay
+            if committed_total[s] >= start_stack[s]:
+                allin[s] = True
+            if committed_round[s] > high_bet:
+                high_bet = committed_round[s]
+                cur_aggressor = s
+                for t in range(n):
+                    if t != s and not folded[t] and not allin[t]:
+                        has_acted[t] = False
+            has_acted[s] = True
+        else:
+            has_acted[s] = True
+        if round_closed():
+            pending_advance = True
+    if pending_advance:
+        advance_street()
+
+    # 以 board 长度校准目标街（与 Rust 一致，重放漂移时信 board）。
+    board = req.get("board", []) or []
+    target = {0: 0, 3: 1, 4: 2, 5: 3}.get(len(board), street_idx)
+    while street_idx < target:
+        advance_street()
+
+    pot = sum(committed_total)
+    to_call = max(high_bet - committed_round[my], 0)
+    required_eq = to_call / (pot + to_call) if to_call > 0 else 0.0
+    opps_in_pot = sum(1 for s in range(n) if s != my and not folded[s])
+    return {"pot": pot, "to_call": to_call,
+            "required_eq": required_eq, "opps_in_pot": opps_in_pot}
+
+
+def pot_metrics(req, resp):
+    """取决策点的 pot/to_call/required_eq/opps_in_pot：优先读引擎已记的字段（精确），
+    否则从 req 重建（向后兼容旧日志）。返回 dict 或 None（信息不足）。"""
+    if isinstance(resp.get("required_eq"), (int, float)) and resp.get("to_call") is not None:
+        return {
+            "pot": resp.get("pot"),
+            "to_call": resp.get("to_call"),
+            "required_eq": float(resp["required_eq"]),
+            "opps_in_pot": resp.get("opps_in_pot"),
+            "src": "logged",
+        }
+    rec = reconstruct_pot_state(req)
+    if rec is None:
+        return None
+    rec["src"] = "rebuilt"
+    return rec
 
 
 def hole_label(hole):
@@ -71,19 +235,13 @@ def hard_issues(req, resp):
             out.append(("RAISE_ABOVE_MAX", f"to {amt} > max {mx}"))
     # 6) 近乎 0 equity 还跟注 —— 只在近 HU 池报。多人池 equity 天然被稀释（5 人池均分=20%），
     #    且常是廉价收尾跟注（BB 防守 9:1 价位），raw equity 低不等于 -EV → 多人不报，避免误报。
-    if act == "call" and eqf is not None and eqf < 0.12 and _opps_in_pot(req.get("actions", [])) <= 1:
-        out.append(("CALL_NEAR_ZERO_EQ", f"{street} HU eq={eqf:.2f}"))
+    #    multiplicity 与软 flag 共用 pot_metrics 的 opps_in_pot（同一份重建口径，两套逻辑一致）。
+    if act == "call" and eqf is not None and eqf < NEAR_ZERO_EQ:
+        m = pot_metrics(req, resp)
+        opps = m.get("opps_in_pot") if m else None
+        if opps is not None and opps <= 1:
+            out.append(("CALL_NEAR_ZERO_EQ", f"{street} HU eq={eqf:.2f}"))
     return out
-
-
-def _opps_in_pot(actions):
-    """据动作流估「仍在池中的对手数」= 各座最后动作非 fold 的座位数（不含 hero 自己未必在表中）。"""
-    last = {}
-    for a in actions:
-        s = a.get("seat")
-        if s is not None:
-            last[s] = a.get("action")
-    return sum(1 for v in last.values() if v != "fold")
 
 
 def hard_report(paths):
@@ -189,7 +347,11 @@ def main():
     pre_vpip = 0
     pre_pfr = 0
     open_by_pos = defaultdict(lambda: [0, 0])   # pos -> [open_raise, opportunities]
-    eq_when = defaultdict(list)  # action -> [equity...]
+    # equity 按 (街, 动作) 分桶（翻前=vs-random 标度，翻后=vs-range 标度，不可混看）。
+    eq_when = defaultdict(list)  # (street, action) -> [equity...]
+    # 面对下注的弃/跟，按街收 EV 余量样本：surplus = equity - required_eq（实际价位 break-even）。
+    # 翻前弃牌用 vs-random equity（虚高），不参与「弃太紧」判定，单列以免误导（详见 flag 段）。
+    facing = defaultdict(list)  # (street, action) -> [(surplus, equity, required_eq, req, resp)...]
 
     seen_hands = set()
 
@@ -230,10 +392,24 @@ def main():
                 af_calls += 1
                 if street != "preflop":
                     af_calls_post += 1
-            # equity 分桶。
+            # equity 分桶（按街拆，避免翻前 vs-random 与翻后 vs-range 混看误导）。
             eqv = resp.get("equity")
             if isinstance(eqv, (int, float)):
-                eq_when[act].append(eqv)
+                eq_when[(street, act)].append(eqv)
+
+            # 面对下注的弃/跟：算实际价位 break-even（required_eq），收 EV 余量样本（按街判过松/过紧）。
+            valid = req.get("valid", {}) or {}
+            cant_check = not valid.get("can_check")
+            if act in ("fold", "call") and cant_check and isinstance(eqv, (int, float)):
+                m = pot_metrics(req, resp)
+                # 重建漂移护栏：不能 check（确实面对下注）却重建出 to_call=0 → required_eq 不可信
+                #（OpenPoker 扁平历史分街偏移导致，引擎自身也对此回退 0.33）。这类样本排除出
+                # EV 余量判定，否则 required_eq=0 会把任何正 equity 误判成「弃了/跟了 +EV 价位」。
+                if (m is not None and isinstance(m.get("required_eq"), (int, float))
+                        and m.get("to_call", 0) and m["to_call"] > 0):
+                    req_eq = float(m["required_eq"])
+                    surplus = eqv - req_eq
+                    facing[(street, act)].append((surplus, eqv, req_eq, req, resp))
 
             # 翻前位置 / VPIP / PFR。
             if street == "preflop":
@@ -298,12 +474,31 @@ def main():
             if opp:
                 print(f"    {pb:6s} {100.0*o/opp:5.1f}%  ({o}/{opp})")
 
-    print("\n[equity 均值 按动作]")
-    for a in ("fold", "check", "call", "raise"):
-        v = eq_when.get(a, [])
-        if v:
-            print(f"  {a:6s} n={len(v):6d} eq均值={sum(v)/len(v):.3f}"
-                  f" min={min(v):.2f} max={max(v):.2f}")
+    # equity 按街拆开：翻前=vs-random 强度（虚高，不可与翻后比），翻后=vs-range 蒙特卡洛。
+    print("\n[equity 均值 按街×动作]  (翻前=vs-random 标度, 翻后=vs-range 标度，不可跨街比)")
+    for st in ("preflop", "flop", "turn", "river"):
+        rows = []
+        for a in ("fold", "check", "call", "raise"):
+            v = eq_when.get((st, a), [])
+            if v:
+                rows.append(f"{a}: n={len(v)} eq均值={sum(v)/len(v):.3f}"
+                            f" [{min(v):.2f},{max(v):.2f}]")
+        if rows:
+            print(f"  {st:8s} " + " | ".join(rows))
+
+    # required_eq 余量分布（面对下注的弃/跟，按街）：surplus = equity - 实际价位 break-even。
+    print("\n[面对下注 EV 余量 surplus=equity-required_eq 按街×动作]  (margin=±%.2f)" % EV_MARGIN)
+    for st in ("preflop", "flop", "turn", "river"):
+        for a in ("fold", "call"):
+            samp = facing.get((st, a), [])
+            if not samp:
+                continue
+            surs = [x[0] for x in samp]
+            reqs = [x[2] for x in samp]
+            print(f"  {st:8s} {a:5s} n={len(samp):5d}"
+                  f" required_eq均值={sum(reqs)/len(reqs):.3f}"
+                  f" surplus均值={sum(surs)/len(surs):+.3f}"
+                  f" [{min(surs):+.2f},{max(surs):+.2f}]")
 
     # 自动漏洞标记。
     print("\n[漏洞标记]")
@@ -317,24 +512,41 @@ def main():
             flags.append(f"翻前 VPIP {vpip:.0f}% 偏松（>42%）→ 收紧 open/call 阈值")
         if vpip < 16:
             flags.append(f"翻前 VPIP {vpip:.0f}% 偏紧（<16%）→ 放宽 open/偷盲")
-    folds = eq_when.get("fold", [])
-    if folds:
-        hi_eq_folds = sum(1 for e in folds if e > 0.5)
-        if hi_eq_folds > 0.15 * len(folds):
-            flags.append(f"{100.0*hi_eq_folds/len(folds):.0f}% 的弃牌 equity>0.5 "
-                         f"→ 可能在好赔率/强牌点弃太多")
-    calls = eq_when.get("call", [])
-    if calls:
-        lo_eq_calls = sum(1 for e in calls if e < 0.25)
-        if lo_eq_calls > 0.20 * len(calls):
-            flags.append(f"{100.0*lo_eq_calls/len(calls):.0f}% 的跟注 equity<0.25 "
-                         f"→ 可能在差点跟太多（漏斗给跟注站）")
+
+    # --- 跟注过松：只在确实跟在 -EV 价位（equity < required_eq - margin）才报，按街分桶。---
+    # required_eq 来自实际重建底池 → 多人稀释/盈亏赔率自动吸收，不再拿 raw equity 比固定常数。
+    # 翻前 equity 是 vs-random（虚高），在此偏宽松（少报漏报），不会误伤；翻后是 vs-range 口径，可靠。
+    for st in ("preflop", "flop", "turn", "river"):
+        calls = facing.get((st, "call"), [])
+        if len(calls) < 20:
+            continue
+        loose = sum(1 for s, _e, _r, _q, _p in calls if s < -EV_MARGIN)
+        if loose > 0.15 * len(calls):
+            flags.append(f"{_zh_street(st)} {100.0*loose/len(calls):.0f}% 的跟注在 -EV 价位"
+                         f"（equity<required_eq-{EV_MARGIN:.2f}, {loose}/{len(calls)}）→ 跟太松")
+
+    # --- 弃牌过紧：只在确实弃了 +EV 价位（equity > required_eq + margin）才报。---
+    # **仅翻后**：翻前 equity 是 vs-random 虚高（K5o vs-random≈0.5 但面对加注是标准弃牌），
+    # 拿它判「弃了好价位」必伪报；翻后 equity 已是 vs-range，与 required_eq 同口径，可比。
+    for st in ("flop", "turn", "river"):
+        folds = facing.get((st, "fold"), [])
+        if len(folds) < 20:
+            continue
+        tight = sum(1 for s, _e, _r, _q, _p in folds if s > EV_MARGIN)
+        if tight > 0.12 * len(folds):
+            flags.append(f"{_zh_street(st)} {100.0*tight/len(folds):.0f}% 的弃牌弃了 +EV 价位"
+                         f"（equity>required_eq+{EV_MARGIN:.2f}, {tight}/{len(folds)}）→ 弃太紧")
+
     if afp != float("inf") and afp < 0.8:
         flags.append(f"翻后 AF {afp:.2f} 偏被动（<0.8）→ 加价值下注/c-bet 频率")
     if not flags:
         print("  （无显著漏洞标记）")
     for fl in flags:
         print(f"  ⚠ {fl}")
+
+
+def _zh_street(st):
+    return {"preflop": "翻前", "flop": "翻牌", "turn": "转牌", "river": "河牌"}.get(st, st)
 
 
 def _street_from_board(board):

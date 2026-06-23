@@ -70,38 +70,39 @@ impl HeuristicBot {
         } else {
             Some(d.probs.clone())
         };
+        // 纯日志度量：读已重建好的 view 状态，绝不回馈决策（analyzer 用真实价位判过松/过紧）。
+        let pot = view.pot_chips();
+        let to_call = view.to_call_chips();
+        let required_eq = view.pot_odds();
+        let opps_in_pot = view.num_opponents();
+        let base = Response {
+            source: d.source,
+            street,
+            equity: Some(round4(d.equity)),
+            probs,
+            pot: Some(pot),
+            to_call: Some(to_call),
+            required_eq: Some(round4(required_eq)),
+            opps_in_pot: Some(opps_in_pot),
+            ..Default::default()
+        };
         match d.action {
             DecisionAction::Fold => Response {
                 action: "fold".into(),
-                amount: None,
-                source: d.source,
-                street,
-                equity: Some(round4(d.equity)),
-                probs,
+                ..base
             },
             DecisionAction::Check => Response {
                 action: "check".into(),
-                amount: None,
-                source: d.source,
-                street,
-                equity: Some(round4(d.equity)),
-                probs,
+                ..base
             },
             DecisionAction::Call => Response {
                 action: "call".into(),
-                amount: None,
-                source: d.source,
-                street,
-                equity: Some(round4(d.equity)),
-                probs,
+                ..base
             },
             DecisionAction::Raise(to) => Response {
                 action: "raise".into(),
                 amount: Some(to),
-                source: d.source,
-                street,
-                equity: Some(round4(d.equity)),
-                probs,
+                ..base
             },
         }
     }

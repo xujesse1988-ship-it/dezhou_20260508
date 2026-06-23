@@ -71,6 +71,19 @@ pub struct Response {
     pub equity: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probs: Option<Vec<(String, f64)>>,
+    // --- 纯日志度量（绝不参与决策；analyzer 用来按真实价位判过松/过紧）---
+    /// 决策点底池（chips，含全部已投入）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pot: Option<u64>,
+    /// 我方需跟注额（chips；不面对下注时 0）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_call: Option<u64>,
+    /// 底池赔率 break-even equity = to_call/(pot+to_call)（不面对下注时 0）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_eq: Option<f64>,
+    /// 仍在池中的对手数（不含我）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opps_in_pot: Option<u32>,
 }
 
 // ===========================================================================
