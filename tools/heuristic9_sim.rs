@@ -2,7 +2,7 @@
 //!
 //! 用权威规则引擎 [`GameState`]（N-generic，side pot/showdown 已验证）发牌、结算。hero（座 0）
 //! = 启发式引擎，其余座 = baseline 原型（nit/station/maniac/tag/random）混合场。每手轮转按钮、
-//! 重置 100bb，累计 hero 净盈亏 → mbb/g + CI95。
+//! 重置起始码深（`--start-bb`，默认 100bb；200/400 = 深码回归区），累计 hero 净盈亏 → mbb/g + CI95。
 //!
 //! **关键**：hero 的决策走**真实** advisor 路径（GameState → Request → [`HeuristicBot::respond`]
 //! → Action），因此 sim 同时**验证下注重建**——把 [`GameView`] 重建的 pot/to_call 与权威
@@ -14,7 +14,7 @@
 //!
 //! 用法：
 //! ```text
-//! heuristic9_sim [--hands N] [--seats K] [--bb 20] [--samples S] [--seed X]
+//! heuristic9_sim [--hands N] [--seats K] [--bb 20] [--start-bb 100] [--samples S] [--seed X]
 //!                [--field mixed|nit|station|maniac|tag|random] [--mirror] [--exploit]
 //!                [--config cfg.json]
 //! ```
@@ -650,6 +650,7 @@ fn main() {
     let mut hands = 5000u64;
     let mut seats = 9u8;
     let mut bb = 20u64;
+    let mut start_bb = 100u64;
     let mut samples = 300u32;
     let mut seed = 12345u64;
     let mut field_kind = String::from("mixed");
@@ -677,6 +678,13 @@ fn main() {
             }
             "--bb" => {
                 bb = argv.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(bb);
+                i += 2;
+            }
+            "--start-bb" => {
+                start_bb = argv
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(start_bb);
                 i += 2;
             }
             "--samples" => {
@@ -761,7 +769,9 @@ fn main() {
 
     let bb_chips = ChipAmount(bb);
     let sb_chips = ChipAmount(bb / 2);
-    let stack = ChipAmount(bb * 100);
+    // 起始码深（BB 数）：默认 100；200/400 = 深码回归区。下限 2BB（须够发盲）。
+    let start_bb = start_bb.max(2);
+    let stack = ChipAmount(bb * start_bb);
 
     let mut stats = SimStats {
         hero_chips: 0,
@@ -808,7 +818,7 @@ fn main() {
 
     println!("=== heuristic9 自对弈仿真 ===");
     println!(
-        "场: seats={seats} field={} hands={} samples={samples} exploit={exploit}",
+        "场: seats={seats} start_bb={start_bb} field={} hands={} samples={samples} exploit={exploit}",
         if mirror {
             "mirror(hero×N)".into()
         } else {

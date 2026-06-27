@@ -128,6 +128,9 @@ Request(JSON) ──> [1]GameView ──> [2]Features ──> [3]Range ──> [
   **10 万+ 真实下注序列、漂移 0.000%**（9/6/2-max 全座）。
 - **0% fallback / 0 illegal**：sim 全程出合法动作、永不兜底；真实日志 1500 决策回放 0 fallback。
 - **mirror 自检 ~0**：hero×9 自对弈 3 seed {+135,−103,−54} mbb/g、均straddle 0 = 无座位偏差。
+- **深码区覆盖（`--start-bb 200/400`）**：100/200/400BB 全 **0 fallback、0 重建漂移**；mirror 自检
+  各深 3 seed 均落在 CI95 内（200BB {+186,−475,−604}、400BB {+141,−554,−1204} mbb/g）→ 重建/SPR
+  逻辑深码不崩。注意 CI95 随深度约线性放大（100→400BB 翻倍），深码门须**加手数或放宽容差带**。
 
 **强度（sim mbb/g，CI95）**：
 | 场 | 9-max | 6-max | HU |
@@ -201,7 +204,11 @@ limpy +5.01、mixed +4.90）——弱/被动场没人惩罚跛入，跛进去翻
 ```bash
 # 1) 离线回归门（改 config/规则后必跑，确认不退化）
 cargo build --release --bin heuristic9_sim
-./target/release/heuristic9_sim --hands 8000 --seats 9 --seed 7   # mbb/g 不退 + 0 fallback/漂移
+./target/release/heuristic9_sim --hands 8000 --seats 9 --seed 7   # 100BB：mbb/g 不退 + 0 fallback/漂移
+# 1b) 深码区回归门（码深漂移到 200/400BB 仍须 0 fallback/0 重建漂移；mirror 自检落 CI95 内）
+./target/release/heuristic9_sim --hands 8000 --seats 9 --seed 7 --start-bb 200
+./target/release/heuristic9_sim --hands 8000 --seats 9 --seed 7 --start-bb 400
+./target/release/heuristic9_sim --hands 8000 --seats 9 --seed 7 --start-bb 400 --mirror  # 深码无座位偏差
 
 # 2) live 打 1000 手（需 api_key）
 python3 tools/heuristic9_play.py --api-key KEY --num-hands 1000 \

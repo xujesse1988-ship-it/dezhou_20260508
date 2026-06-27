@@ -34,6 +34,8 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
 # 内联硬伤检测（前期抓 bug）：复用 analyze 的 hard_issues；导入失败则降级为 no-op。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,11 +47,45 @@ except Exception:
 
 WS_URL = "wss://openpoker.ai/ws"
 REGISTER_URL = "https://api.openpoker.ai/api/register"
-BUY_IN = 2000
 BIG_BLIND_OP = 20
 SMALL_BLIND_OP = 10
-STACK_LEAVE_LO = 60 * BIG_BLIND_OP
-STACK_LEAVE_HI = 220 * BIG_BLIND_OP
+# 买入：season bankroll 受限——rebuy 每次仅补 1500、服务端 min buy-in 1000（docs/compete/rebuys）。
+# 锁 1000=50BB 求**可持续**（原 2000=100BB 在薄 bankroll 下买不进；深码靠桌上赢钱自然累积，HI 仍 500BB）。
+BUY_IN = 1000
+MIN_BUY_IN_CHIPS = 1000  # season_min_buy_in_chips：chip_balance < 此值且离桌才有 rebuy 资格。
+REBUY_URL = "https://api.openpoker.ai/api/season/rebuy"  # POST +1500（free 首次 0s、之后 300s 冷却）。
+# Cloudflare 对 `Python-urllib` UA 返 403「error code: 1010」（浏览器签名封禁）→ 必须伪装浏览器 UA。
+HTTP_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+# 码深漂移窗口：每手后我方栈漂出 [LO, HI] → leave/rejoin（重锚买入、控我方栈）。
+# LO=30BB：跌破即离桌重买（**不等打光再 rebuy**）；buy_in 不足时 driver 自动 season rebuy（见 rebuy_and_join）。
+# HI=500BB：上限放宽——深码区已由 `heuristic9_sim --start-bb 200/400` 回归门覆盖（0 fallback / 0 重建漂移 /
+#   mirror 落 CI95）。有效栈被最深对手封顶（view::effective_stack_chips）；薄 bankroll 下多由桌上赢钱才触深码。
+STACK_LEAVE_LO = 30 * BIG_BLIND_OP
+STACK_LEAVE_HI = 500 * BIG_BLIND_OP
+
+
+def season_rebuy(api_key):
+    """POST /api/season/rebuy → 补 1500 season chips（仅 chip_balance<1000 且离桌时有资格）。
+    返回 (ok, info)：ok=True → info={'chip_balance','cooldown_seconds',...}；
+    429 冷却 → (False, {'cooldown': 秒})；其它失败 → (False, {...})。"""
+    req = urllib.request.Request(
+        REBUY_URL, data=b"", method="POST",
+        headers={"Authorization": f"Bearer {api_key}", "User-Agent": HTTP_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return True, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            retry = e.headers.get("Retry-After")
+            return False, {"cooldown": int(retry) if retry and str(retry).isdigit() else 300}
+        try:
+            body = e.read().decode()[:200]
+        except Exception:
+            body = ""
+        return False, {"http_error": e.code, "body": body}
+    except Exception as e:
+        return False, {"error": str(e)}
 _BOARD_LEN = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 
 
@@ -284,7 +320,7 @@ class Session:
               "lobby_joined", "table_joined", "table_state")
 
     def __init__(self, advisor, send, num_hands, default_seats, log_f=None,
-                 exploit=False, debug=False):
+                 exploit=False, debug=False, api_key=None):
         self.advisor = advisor
         self.send = send
         self.num_hands = num_hands
@@ -292,15 +328,17 @@ class Session:
         self.log_f = log_f
         self.exploit = exploit
         self.debug = debug
+        self.api_key = api_key
         self.hand = None
         self.table_id = None
         self.observed_max_seat = default_seats - 1
         self.client_action_id = 0
         self.counters = {"hands": 0, "decisions": 0, "fallback": 0, "net_chips": 0,
-                         "watchdog_rejoins": 0, "hard": 0}
+                         "watchdog_rejoins": 0, "season_rebuys": 0, "hard": 0}
         self.fallback_reasons = {}
         self.hard_cats = {}
         self.last_hand_ts = time.time()
+        self._rebuy_cooldown_until = 0.0  # season rebuy 冷却到点时刻（防 429 空转刷屏）。
         self._ws = None
 
     def _dbg(self, m):
@@ -318,6 +356,34 @@ class Session:
             self.send(ws, {"type": "join_lobby", "buy_in": BUY_IN})
         except Exception as e:
             print(f"  [rejoin 发送失败] {e}", file=sys.stderr)
+
+    def rebuy_and_join(self, ws):
+        """season bankroll 不足以买入（insufficient_season_chips）→ POST /api/season/rebuy
+        补 1500 → 重新 join_lobby。冷却中（429）记下到点时刻、交给 watchdog 重试，不空转刷屏。"""
+        now = time.time()
+        if now < self._rebuy_cooldown_until:
+            print(f"  [rebuy] season 冷却中，约 {int(self._rebuy_cooldown_until - now)}s "
+                  f"后可再 rebuy（等 watchdog 重试）", file=sys.stderr)
+            return
+        if not self.api_key:
+            print("  [rebuy] 无 api_key，无法 season rebuy", file=sys.stderr)
+            return
+        ok, info = season_rebuy(self.api_key)
+        if ok:
+            self.counters["season_rebuys"] += 1
+            cd = info.get("cooldown_seconds", 0) or 0
+            self._rebuy_cooldown_until = now + cd
+            print(f"  [rebuy] +1500 → chip_balance={info.get('chip_balance')} cooldown={cd}s "
+                  f"（第 {self.counters['season_rebuys']} 次）→ join_lobby", file=sys.stderr)
+            try:
+                self.send(ws, {"type": "join_lobby", "buy_in": BUY_IN})
+            except Exception as e:
+                print(f"  [rebuy join 发送失败] {e}", file=sys.stderr)
+        elif info.get("cooldown"):
+            self._rebuy_cooldown_until = now + info["cooldown"]
+            print(f"  [rebuy] 冷却 {info['cooldown']}s（429）→ 等待后重试", file=sys.stderr)
+        else:
+            print(f"  [rebuy] 失败 {info}", file=sys.stderr)
 
     def watchdog_check(self, stale_after=120):
         """另一线程每 30s 调：超过 stale_after 秒无新手（对手离桌后独坐、server recv 因
@@ -350,6 +416,9 @@ class Session:
             elif msg.get("code") == "already_seated":
                 # 继承了旧进程/旧连接的座位（可能是死桌）→ leave + 重新 join 拿活桌。
                 self.rejoin(ws, "already_seated（继承旧座，可能死桌）")
+            elif msg.get("code") == "insufficient_season_chips":
+                # season bankroll 不足买入 → 自动 rebuy(+1500) 后重 join（受 300s 冷却约束）。
+                self.rebuy_and_join(ws)
         elif t in ("lobby_joined", "table_joined"):
             self.last_hand_ts = time.time()
             print(f"  [{t}] seat={msg.get('seat')} pos={msg.get('position')} "
@@ -481,7 +550,7 @@ def run_real(args):
         ws.send(json.dumps(obj))
 
     sess = Session(advisor, send, args.num_hands, args.seats, log_f=log_f,
-                   exploit=args.exploit, debug=args.debug)
+                   exploit=args.exploit, debug=args.debug, api_key=args.api_key)
     header = [f"Authorization: Bearer {args.api_key}"]
 
     # 看门狗线程：对手离桌后独坐时 server 因心跳帧使 recv 永不超时 → 主线程会永久空等。
@@ -537,7 +606,8 @@ def run_real(args):
     print(f"\n=== 收尾：{c['hands']} 手 | 决策 {c['decisions']} | fallback {c['fallback']}"
           f" | net {c['net_chips']} chips "
           f"({1000.0 * c['net_chips'] / BIG_BLIND_OP / max(1, c['hands']):.1f} mbb/g)"
-          f" | watchdog_rejoins {c['watchdog_rejoins']} | hard {c['hard']} ===",
+          f" | watchdog_rejoins {c['watchdog_rejoins']} | season_rebuys {c['season_rebuys']}"
+          f" | hard {c['hard']} ===",
           file=sys.stderr)
     if sess.hard_cats:
         print(f"  硬伤分类: {dict(sorted(sess.hard_cats.items()))}", file=sys.stderr)
