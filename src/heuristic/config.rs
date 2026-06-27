@@ -138,11 +138,14 @@ pub struct PostflopConfig {
     pub commit_spr: f64,
     /// 下注尺寸（底池分数）候选——干面小、湿面大；引擎按质地/SPR 选。
     pub size_small: f64,
+    /// ⚠ 暂未接线：`pick_bet_size` 当前只在 `size_small`↔`size_big` 间按 wetness lerp，
+    /// 中尺寸档未取用。保留为后续「三档尺寸」预留，改它现在无 EV 影响。
     pub size_mid: f64,
     pub size_big: f64,
     /// overbet 尺寸（坚果 polar）。
     pub size_overbet: f64,
-    /// check-raise 频率（有强牌/强听牌的 OOP）。
+    /// ⚠ 暂未接线：翻后尚无独立 check-raise 逻辑（OOP 强牌走通用 value_raise）。
+    /// 保留为后续 check-raise 专家预留，改它现在无 EV 影响。
     pub checkraise_freq: f64,
 }
 
@@ -175,8 +178,9 @@ impl Default for PostflopConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MixingConfig {
-    /// 边界决策的混合带宽：分数差在此带内的动作按 softmax 概率混合（防被简单针对）。
-    /// 0 = 纯贪心（确定性）。
+    /// ⚠ 暂未接线：预期语义=边界决策的混合带宽（分数差在此带内的动作按 softmax 概率混合，
+    /// 防被简单针对，0=纯贪心）。当前 `policy` 仅用频率门（cbet/semibluff 等），未做边界 softmax
+    /// 混合（见设计 backlog #4）。改它现在无 EV 影响。
     pub temperature: f64,
     /// 决策 RNG 的基础 seed（与手牌状态混合）。
     pub seed: u64,

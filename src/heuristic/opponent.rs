@@ -4,6 +4,7 @@
 //! nit/tag/station/maniac，再把它翻译成「对手 range 松紧偏移」+「我方价值/诈唬调整」。
 //! 弱场里这是最大 EV 来源——纯 GTO 留在桌上的钱，剥削能拿走。
 
+use crate::heuristic::config::ExploitConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -106,20 +107,23 @@ impl OpponentTable {
         }
     }
 
-    pub fn classify(&self, name: &str, min_hands: u32) -> OppType {
+    /// 据累计画像分类对手。主阈值取自 [`ExploitConfig`]（`min_hands`/`nit_vpip`/`station_vpip`/
+    /// `maniac_af`）——默认值与历史硬编码字面量一致（0.16/0.45/3.5）→ 默认行为 byte-equal。
+    /// 次级判据（station 的 AF 上限 1.5、maniac/lag 的 vpip-pfr 组合）暂无独立旋钮，保留经验字面量。
+    pub fn classify(&self, name: &str, cfg: &ExploitConfig) -> OppType {
         let st = match self.by_name.get(name) {
-            Some(s) if s.hands >= min_hands => s,
+            Some(s) if s.hands >= cfg.min_hands => s,
             _ => return OppType::Unknown,
         };
         let vpip = st.vpip().unwrap_or(0.25);
         let pfr = st.pfr().unwrap_or(0.15);
         let af = st.af().unwrap_or(1.5);
         let gap = (vpip - pfr).max(0.0);
-        if vpip < 0.16 {
+        if vpip < cfg.nit_vpip {
             OppType::Nit
-        } else if vpip > 0.45 && af < 1.5 {
+        } else if vpip > cfg.station_vpip && af < 1.5 {
             OppType::Station
-        } else if af > 3.5 || (vpip > 0.40 && pfr > 0.30) {
+        } else if af > cfg.maniac_af || (vpip > 0.40 && pfr > 0.30) {
             OppType::Maniac
         } else if gap > 0.18 && vpip > 0.30 {
             OppType::Lag
@@ -129,8 +133,9 @@ impl OpponentTable {
     }
 
     /// 对手 range 强度阈值偏移（station/松 → 负=放宽；nit/紧 → 正=收紧）。
-    pub fn range_threshold_shift(&self, name: &str, min_hands: u32, cap: f64) -> f64 {
-        match self.classify(name, min_hands) {
+    pub fn range_threshold_shift(&self, name: &str, cfg: &ExploitConfig) -> f64 {
+        let cap = cfg.adjust_cap;
+        match self.classify(name, cfg) {
             OppType::Nit => cap,
             OppType::Tag => 0.0,
             OppType::Station => -cap,
@@ -164,12 +169,8 @@ impl Default for ExploitAdjust {
 
 impl OpponentTable {
     /// 据一组活跃对手名聚合剥削调整。
-    pub fn aggregate_exploit(
-        &self,
-        active_names: &[String],
-        min_hands: u32,
-        cap: f64,
-    ) -> ExploitAdjust {
+    pub fn aggregate_exploit(&self, active_names: &[String], cfg: &ExploitConfig) -> ExploitAdjust {
+        let cap = cfg.adjust_cap;
         let mut adj = ExploitAdjust::default();
         if active_names.is_empty() {
             return adj;
@@ -179,7 +180,7 @@ impl OpponentTable {
         let mut all_nit = true;
         let mut known = 0;
         for nm in active_names {
-            let t = self.classify(nm, min_hands);
+            let t = self.classify(nm, cfg);
             if t != OppType::Unknown {
                 known += 1;
             }

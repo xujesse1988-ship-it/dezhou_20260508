@@ -103,7 +103,7 @@ pub fn build_opp_thresholds(
         }
         // 对手画像偏移。
         if let Some(name) = view.names.get(&(s as u8)) {
-            thr += opp.range_threshold_shift(name, cfg.exploit.min_hands, cfg.exploit.adjust_cap);
+            thr += opp.range_threshold_shift(name, &cfg.exploit);
         }
         out.push(thr.clamp(0.0, 0.96));
     }
@@ -121,7 +121,7 @@ fn exploit_adjust(view: &GameView, cfg: &HeuristicConfig, opp: &OpponentTable) -
             names.push(nm.clone());
         }
     }
-    opp.aggregate_exploit(&names, cfg.exploit.min_hands, cfg.exploit.adjust_cap)
+    opp.aggregate_exploit(&names, &cfg.exploit)
 }
 
 // ===========================================================================
