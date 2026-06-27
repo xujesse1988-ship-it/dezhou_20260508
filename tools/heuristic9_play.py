@@ -320,15 +320,17 @@ class Session:
               "lobby_joined", "table_joined", "table_state")
 
     def __init__(self, advisor, send, num_hands, default_seats, log_f=None,
-                 exploit=False, debug=False, api_key=None):
+                 exploit=False, debug=False, api_key=None, raw_log=None):
         self.advisor = advisor
         self.send = send
         self.num_hands = num_hands
         self.default_seats = default_seats
         self.log_f = log_f
+        self.raw_log = raw_log         # 每条服务器原始消息逐行落盘（发现 showdown 等未解析 schema）。
         self.exploit = exploit
         self.debug = debug
         self.api_key = api_key
+        self._seen_unknown = set()     # 未知消息类型只提示一次（首见即报，便于发现新 schema）。
         self.hand = None
         self.table_id = None
         self.observed_max_seat = default_seats - 1
@@ -400,6 +402,12 @@ class Session:
     def handle(self, ws, msg):
         t = msg.get("type")
         self._ws = ws
+        if self.raw_log:
+            try:
+                self.raw_log.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                self.raw_log.flush()
+            except Exception:
+                pass
         if "table_id" in msg and msg["table_id"]:
             if msg["table_id"] != self.table_id:
                 print(f"  [table_id] {msg['table_id']}", file=sys.stderr)
@@ -458,6 +466,12 @@ class Session:
             if self.counters["hands"] >= self.num_hands:
                 print(f"  打满 {self.num_hands} 手，离场。", file=sys.stderr)
                 ws.close()
+        elif t not in self._KNOWN:
+            # 未知/未解析消息类型（可能含 showdown 亮牌）：首见即报，提示去 --raw-log 看 schema。
+            if t not in self._seen_unknown:
+                self._seen_unknown.add(t)
+                print(f"  [未知消息类型] type={t!r} keys={sorted(msg.keys())}"
+                      f"（如需解析见 --raw-log）", file=sys.stderr)
 
     def _your_turn(self, ws, msg):
         hand = self.hand
@@ -518,6 +532,7 @@ class Session:
             except Exception as e:
                 print(f"  [observe 异常] {e}", file=sys.stderr)
         final = msg.get("final_stacks", {})
+        net = None
         if hand is not None:
             my_final = final.get(str(hand.my_seat), final.get(hand.my_seat))
             start = hand.hand_start_stacks_list()
@@ -532,6 +547,25 @@ class Session:
                 print(f"  [码深漂移] 我方栈 {my_final} 漂出 → leave/rejoin", file=sys.stderr)
                 self.send(ws, {"type": "leave_table"})
                 self.send(ws, {"type": "join_lobby", "buy_in": BUY_IN})
+        # 落完整手历史：tag 行（无 req/resp → analyzer 安全跳过）。内嵌服务器 hand_result 整条，
+        # 任何摊牌/亮牌字段都一并留底——schema 不靠猜，发现后再在 analyzer 侧结构化解析。
+        if self.log_f:
+            rec = {
+                "kind": "hand_result",
+                "hand_id": hand.hand_id if hand is not None else msg.get("hand_id"),
+                "my_seat": hand.my_seat if hand is not None else None,
+                "net": net,
+                "board": hand.board if hand is not None else None,
+                "winners": msg.get("winners"),
+                "pot": msg.get("pot"),
+                "final_stacks": msg.get("final_stacks"),
+                "result": msg,
+            }
+            try:
+                self.log_f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                self.log_f.flush()
+            except Exception as e:
+                print(f"  [hand_result 落盘失败] {e}", file=sys.stderr)
         self.hand = None
 
 
@@ -545,12 +579,14 @@ def run_real(args):
     advisor = Advisor(args.advisor_bin, args.samples, args.seed,
                       config=args.config, opp_profile=args.opp_profile, debug=args.debug)
     log_f = open(args.action_log, "w") if args.action_log else None
+    raw_log_f = open(args.raw_log, "w") if args.raw_log else None
 
     def send(ws, obj):
         ws.send(json.dumps(obj))
 
     sess = Session(advisor, send, args.num_hands, args.seats, log_f=log_f,
-                   exploit=args.exploit, debug=args.debug, api_key=args.api_key)
+                   exploit=args.exploit, debug=args.debug, api_key=args.api_key,
+                   raw_log=raw_log_f)
     header = [f"Authorization: Bearer {args.api_key}"]
 
     # 看门狗线程：对手离桌后独坐时 server 因心跳帧使 recv 永不超时 → 主线程会永久空等。
@@ -613,6 +649,8 @@ def run_real(args):
         print(f"  硬伤分类: {dict(sorted(sess.hard_cats.items()))}", file=sys.stderr)
     if log_f:
         log_f.close()
+    if raw_log_f:
+        raw_log_f.close()
     advisor.close()
 
 
@@ -622,13 +660,17 @@ def run_real(args):
 def run_selftest(args):
     """不连网：用 canned 9-max 消息序列把 driver↔advisor IPC + 出合法动作跑通。
     验收：advisor 全程出合法 {action, amount}、driver 组请求正确。"""
+    import io
     advisor = Advisor(args.advisor_bin, args.samples, args.seed, debug=args.debug)
     sent = []
+    logbuf = io.StringIO()   # 验完整手历史落盘
+    rawbuf = io.StringIO()   # 验原始消息 dump
 
     def send(_ws, obj):
         sent.append(obj)
 
-    sess = Session(advisor, send, num_hands=2, default_seats=9, exploit=True, debug=True)
+    sess = Session(advisor, send, num_hands=2, default_seats=9, exploit=True, debug=True,
+                   log_f=logbuf, raw_log=rawbuf)
 
     # 一手 9-max：button=0, 我=seat3(UTG)。preflop 我 open，翻牌我 cbet，转牌结束。
     seq = [
@@ -666,6 +708,9 @@ def run_selftest(args):
          "valid_actions": ["check", "raise"], "min_raise": 20, "max_raise": 1894,
          "players": [{"seat": 3, "name": "p3", "stack": 1894},
                      {"seat": 5, "name": "p5", "stack": 1894}]},
+        # 仿一条「未解析」消息（schema 待定）：验 raw dump + 未知类型首见提示。
+        {"type": "showdown", "hand_id": "H1",
+         "shown": [{"seat": 3, "cards": ["As", "Kd"]}, {"seat": 5, "cards": ["Qh", "Qc"]}]},
         {"type": "hand_result", "hand_id": "H1", "winners": [3], "pot": 232,
          "final_stacks": {str(i): 2000 for i in range(9)}},
     ]
@@ -687,9 +732,28 @@ def run_selftest(args):
         print(f"  action={a['action']} amount={a['amount']} token={a['turn_token']}",
               file=sys.stderr)
     assert len(actions) == 3, f"应有 3 个决策点，实得 {len(actions)}"
+
+    # 完整手历史落盘校验：action-log 应含 3 条决策行 + 1 条 hand_result（内嵌服务器整条）。
+    log_lines = [json.loads(x) for x in logbuf.getvalue().splitlines() if x.strip()]
+    dec_lines = [o for o in log_lines if "req" in o and "resp" in o]
+    hr_lines = [o for o in log_lines if o.get("kind") == "hand_result"]
+    assert len(dec_lines) == 3, f"决策行应 3，实得 {len(dec_lines)}"
+    assert len(hr_lines) == 1, f"hand_result 行应 1，实得 {len(hr_lines)}"
+    hr = hr_lines[0]
+    assert hr["winners"] == [3] and hr["pot"] == 232, hr
+    assert hr.get("result", {}).get("type") == "hand_result", "应内嵌服务器 hand_result 整条"
+    assert "req" not in hr and "resp" not in hr, "hand_result 行须无 req/resp（analyzer 才会跳过）"
+
+    # raw dump：每条收到的消息都逐行落盘；showdown（未解析类型）应被原样捕获 + 首见提示。
+    raw_lines = [json.loads(x) for x in rawbuf.getvalue().splitlines() if x.strip()]
+    assert len(raw_lines) == len(seq), f"raw dump 应 {len(seq)} 行，实得 {len(raw_lines)}"
+    assert any(o.get("type") == "showdown" for o in raw_lines), "raw dump 应含 showdown 原始消息"
+    assert "showdown" in sess._seen_unknown, "未知类型 showdown 应被首见提示捕获"
+
     advisor.close()
     if ok:
-        print("=== selftest PASS：IPC 通、3 决策全合法、observe 喂入无异常 ===", file=sys.stderr)
+        print("=== selftest PASS：IPC 通、3 决策全合法、observe 无异常、"
+              "完整手历史(hand_result)+raw dump+未知类型提示 全绿 ===", file=sys.stderr)
 
 
 # ===========================================================================
@@ -704,6 +768,8 @@ def main():
     p.add_argument("--config", default=None, help="启发式 config JSON 路径")
     p.add_argument("--opp-profile", default=None, help="对手画像持久化 JSON 路径（累积经验）")
     p.add_argument("--action-log", default="heuristic9_actions.jsonl")
+    p.add_argument("--raw-log", default=None,
+                   help="把每条服务器原始消息逐行落盘（发现 showdown 等未解析消息的 schema 用）")
     p.add_argument("--exploit", action="store_true", help="开对手画像剥削（发 names + observe）")
     p.add_argument("--selftest", action="store_true", help="离线验 IPC，不连网（无需账号）")
     p.add_argument("--debug", action="store_true")
