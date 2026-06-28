@@ -213,6 +213,12 @@ pub struct ExploitConfig {
     /// 各类调整的最大幅度（equity 阈值偏移）。0.12 = sim 扫参验证的甜点：station/maniac/
     /// mixed 显著提升、nit 持平；≥0.16 时对 nit 过偷反被惩罚（断崖），故止于 0.12。
     pub adjust_cap: f64,
+    /// 对**已分类跟注站**的价值下注/加注尺寸乘子（仅价值动作放大，诈唬不动）。站跟更大注 →
+    /// 价值注做大多榨筹码。仅在场上有分类 station 时生效（剥削层，非默认改动）；无 station 或
+    /// 未开 exploit 时 = 1.0 不变。1.0 = 关闭。1.30 = sim 扫参甜点：`--field station` 6max 6/6
+    /// seed 正（均 +112 mbb/g）、9max 多 seed 正（均 +48~71）、`--field mixed` 5/6 seed 正
+    /// （均 +106/+73）、tag-9max +100、nit/HU byte-equal 不退；≥1.40 时 9max station 转负（过大）。
+    pub station_value_size_mult: f64,
 }
 
 impl Default for ExploitConfig {
@@ -223,6 +229,7 @@ impl Default for ExploitConfig {
             nit_vpip: 0.16,
             maniac_af: 3.5,
             adjust_cap: 0.12,
+            station_value_size_mult: 1.30,
         }
     }
 }

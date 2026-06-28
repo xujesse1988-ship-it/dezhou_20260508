@@ -155,6 +155,9 @@ pub struct ExploitAdjust {
     pub bluff_mult: f64,
     /// 偷盲加成（对身后全是紧手时多偷）。
     pub steal_bonus: f64,
+    /// 价值下注/加注尺寸乘子（>1 = 对跟注站把价值注做大，多榨筹码）。仅价值动作放大，诈唬不动
+    /// （诈唬放大会增亏，且站不会因尺寸不平衡而弃）。1.0 = 不变。
+    pub value_size_mult: f64,
 }
 
 impl Default for ExploitAdjust {
@@ -163,6 +166,7 @@ impl Default for ExploitAdjust {
             value_shift: 0.0,
             bluff_mult: 1.0,
             steal_bonus: 0.0,
+            value_size_mult: 1.0,
         }
     }
 }
@@ -195,9 +199,10 @@ impl OpponentTable {
             }
         }
         if any_station {
-            // 跟注站在场：价值放薄、诈唬大砍。
+            // 跟注站在场：价值放薄、诈唬大砍、价值注做大（站会跟更大注 → 多榨）。
             adj.value_shift -= cap;
             adj.bluff_mult *= 0.5;
+            adj.value_size_mult *= cfg.station_value_size_mult;
         }
         if any_maniac {
             // 疯子：抓诈跟注放松（价值门槛略降），自己少主动诈。

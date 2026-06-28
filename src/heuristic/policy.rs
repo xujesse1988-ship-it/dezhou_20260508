@@ -417,12 +417,12 @@ fn postflop_decide(
         // === 无人下注：下注 vs 过牌 ===
         // 价值。
         if equity >= value_thr && made.rank() >= MadeClass::MidPair.rank() {
-            let size = pick_bet_size(view, oc, &tex, made, spr, true);
+            let size = value_size(view, oc, &tex, made, spr, adj);
             return bet_size_decision(view, size, equity, "postflop:value_bet");
         }
         // 低 SPR 承诺：顶对好牌直接下注承诺。
         if spr < oc.commit_spr && made.rank() >= MadeClass::TopPair.rank() {
-            let size = pick_bet_size(view, oc, &tex, made, spr, true);
+            let size = value_size(view, oc, &tex, made, spr, adj);
             return bet_size_decision(view, size, equity, "postflop:commit_bet");
         }
         // 半诈唬：有听牌。
@@ -480,7 +480,7 @@ fn postflop_decide(
         (value_thr + 0.06 + oc.multiway_value_tighten * multiway).clamp(0.30, 0.97);
     if equity >= raise_value_thr && made.rank() >= MadeClass::TopPair.rank() && view.valid.can_raise
     {
-        let size = pick_bet_size(view, oc, &tex, made, spr, true);
+        let size = value_size(view, oc, &tex, made, spr, adj);
         return raise_pot_fraction(view, size, equity, "postflop:value_raise");
     }
     // 强听牌半诈唬加注（heads-up 偏多，多人少）。
@@ -555,6 +555,20 @@ fn pick_bet_size(
     // 低 SPR 倾向更大（承诺）。
     let spr_adj = if spr < 2.0 { 0.15 } else { 0.0 };
     (base + spr_adj).clamp(oc.size_small, oc.size_overbet)
+}
+
+/// 价值动作尺寸 = `pick_bet_size(value)` × 剥削 value 放大（对 station 做大价值注），夹到
+/// `[size_small, 1.6]`。仅价值注/价值加注调用；诈唬/半诈唬走 `pick_bet_size(false)` 不放大
+/// （放大诈唬只会对不弃牌的站增亏）。`value_size_mult==1.0` 时与 `pick_bet_size(true)` 等价。
+fn value_size(
+    view: &GameView,
+    oc: &crate::heuristic::config::PostflopConfig,
+    tex: &crate::heuristic::features::Texture,
+    made: MadeClass,
+    spr: f64,
+    adj: &ExploitAdjust,
+) -> f64 {
+    (pick_bet_size(view, oc, tex, made, spr, true) * adj.value_size_mult).clamp(oc.size_small, 1.6)
 }
 
 /// 把「底池分数」下注转成 raise-to chips 并夹到 valid（无前序 bet 的下注）。
