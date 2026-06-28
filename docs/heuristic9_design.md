@@ -184,6 +184,33 @@ limpy +5.01、mixed +4.90）——弱/被动场没人惩罚跛入，跛进去翻
 「正确性>一切 + sim 门控」拦下了一个教科书正确但语境错误的 -EV 改动。Limper baseline 保留（`0bfea7a`，
 让 sim 混合场更像 live 弱场，提升后续所有回归保真度）。
 
+### live net 标度修正：盲注走过手的起始栈回落虚高（driver bug，已修）
+
+**症状**：driver `_hand_result` 的 `net = my_final − my_start`，`my_start` 经
+`hand_start_stacks_list()`——只有当 hero 在 `player_action`/`your_turn` 上被 `note_start_stack`
+记过栈时才知道真实起始栈，否则**回落 `BUY_IN`（=1000）**。于是**hero 零动作的手**（盲注走过、
+全弃到 hero 盲）拿不到起始栈 → `net = my_final − 1000`，hero 栈越深虚高越夸张。
+**run24 实测**：56 手 pot=10 的盲注走过全部 `my_start==1000`，单手虚报上千（例：hero 坐 4847
+赢 10 的走过 → `my_final=4857`、记 `net=+3857` 而非 `+10`）。整段把 net 从真实 **+106,372** 抬到
+**+302,916**（虚高 +196,544 / 65%），mbb/g 从真实 **+2,659** 抬到 +7,577。**历史所有 live run 的
+mbb/g 都被此 bug 系统性高估**（越深越假）。
+
+**修复**（`heuristic9_play.py`）：dispatch 处理 `table_state`（此前被忽略但 raw 有留底）——每条快照
+对各非空座喂起始栈。取 **preflop（行动前）首条**最干净：此刻各座唯一已投入＝盲注，
+`start = 当前栈 + 该座盲注`，故 hero 零动作手也能拿到权威起始栈。盲注按 **紧凑指派**
+（dealt 座环序，button 后第一个=SB、第二个=BB；**服务端对 2 人池亦无 HU 特例**，不能用物理座
+`btn+1/btn+2` 否则把盲注派到空座）。首见即锁、不覆盖、`hand_id` 守门；天然兼容 leave/rejoin/rebuy
+（用本手自己的 table_state，不挪用上手 final）。
+
+**验证**（离线复算全 run24，2000 手）：把真实 raw 流喂回**打了补丁的 Session**，driver 自报
+`net=+106,372`（+2,659 mbb/g）、与独立「stack-delta」真值**逐手 2000/2000 完全一致**；
+68 手 old≠new；**0 手违反盲注走过 `|net|<=pot`**（修前 59 手 `|net|>pot`）。落在交叉校验区间内
+（pot-bounded ≈ +105,872、stack-delta ≈ +108,267）。`--selftest` 加了一手盲注走过回归手
+（hero 零动作、起始栈只能来自 table_state，断言 `net=+10` 且 `|net|<=pot`）守住此修复。
+
+> 残留：稀疏/非连续占座下盲注紧凑指派仍是近似（见 backlog ①），但本修复直接用 table_state 的
+> `in_hand` 座集做紧凑环序，已对 run24 全部短桌/HU 手校准为 0 越界。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. **稀疏占座 compact 重映射**（driver，对 6-max 短桌 + 9-max 稀疏都重要）：v1 满环假设，

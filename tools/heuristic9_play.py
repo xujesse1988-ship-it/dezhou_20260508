@@ -205,6 +205,15 @@ class HandState:
         committed = self.committed_total().get(s, 0)
         self.start_stacks[s] = int(round(float(remaining_now))) + committed
 
+    def set_start_stack(self, seat, start):
+        """直接锁定某座 hand-start 栈（来自 table_state 权威快照推算）。首见即锁、不覆盖。"""
+        if seat is None or start is None:
+            return
+        s = int(seat)
+        if s in self.start_stacks:
+            return
+        self.start_stacks[s] = int(round(float(start)))
+
     def committed_total(self):
         """从 actions 重建各座本手累计投入（含盲注）。"""
         n = self.num_seats
@@ -453,6 +462,8 @@ class Session:
             if self.hand:
                 self.hand.on_community(msg.get("cards", []), _street_name(msg.get("street")))
                 self._dbg(f"{self.hand.street} board={' '.join(self.hand.board)}")
+        elif t == "table_state":
+            self._on_table_state(msg)
         elif t == "your_turn":
             self._your_turn(ws, msg)
         elif t == "hand_result":
@@ -472,6 +483,62 @@ class Session:
                 self._seen_unknown.add(t)
                 print(f"  [未知消息类型] type={t!r} keys={sorted(msg.keys())}"
                       f"（如需解析见 --raw-log）", file=sys.stderr)
+
+    @staticmethod
+    def _compact_blinds(dealer_seat, seats):
+        """紧凑盲注指派：dealt（in_hand）座按座号环序，button 后第一个=SB、第二个=BB。
+        服务端（run24 校准）对 2 人池亦**无 HU 特例**——button 不投盲、盲注纯按座序顺延，
+        故空座/稀疏占座时不能用「物理座 btn+1/btn+2」（会把盲注派到空座）。返回 {seat: blind}。"""
+        dealt = sorted(int(s["seat"]) for s in seats
+                       if s.get("seat") is not None and s.get("in_hand") is True
+                       and s.get("status") != "empty")
+        out = {}
+        k = len(dealt)
+        if k < 2 or dealer_seat is None:
+            return out
+        btn = int(dealer_seat)
+        if btn in dealt:
+            bi = dealt.index(btn)
+        else:
+            # button 座坐出/不在 dealt：取座号 <= btn 的最后一个 dealt 为环锚（保序）。
+            le = [i for i, s in enumerate(dealt) if s <= btn]
+            bi = le[-1] if le else k - 1
+        order = dealt[bi + 1:] + dealt[:bi + 1]  # order[0] = button 后第一个 dealt 座
+        out[order[0]] = SMALL_BLIND_OP
+        out[order[1 % k]] = BIG_BLIND_OP
+        return out
+
+    def _on_table_state(self, msg):
+        """权威 per-seat 栈快照（每条服务器 table_state）：锁定 hand-start 栈，使「零动作手」
+        （盲注走过/全弃到 hero 盲、hero 无 your_turn）也能拿到 hero 真实起始栈。否则
+        hand_start_stacks_list 回落 BUY_IN（=1000），net = my_final − 1000 严重虚高（run24 实测
+        虚高 +197k/65%）。取 **preflop（行动前）首条快照**最干净：此刻各座唯一已投入＝盲注，
+        start = 当前栈 + 该座盲注（紧凑指派）。非 preflop 首见（半路入桌）退回通用推算。
+        set/note_start_stack 首见即锁、不覆盖，故首条 preflop 快照胜出；跨手错栈由 hand_id 守门。"""
+        hand = self.hand
+        if hand is None:
+            return
+        hid = msg.get("hand_id")
+        if hid is not None and hand.hand_id is not None and hid != hand.hand_id:
+            return
+        seats = msg.get("seats") or []
+        preflop = _street_name(msg.get("street")) == "preflop"
+        blinds = self._compact_blinds(msg.get("dealer_seat"), seats) if preflop else {}
+        for s in seats:
+            if s.get("status") == "empty":
+                continue
+            seat = s.get("seat")
+            stack = s.get("stack")
+            if seat is None or stack is None:
+                continue
+            hand.update_name(seat, s.get("name"))
+            if preflop:
+                # 行动前：start = 当前栈 + 本座盲注（唯一已投入），权威且有界。
+                hand.set_start_stack(seat, int(round(float(stack))) + blinds.get(int(seat), 0))
+            else:
+                # 半路入桌：退回 stack + 从 actions 重建的已投入（含盲注，full-ring 近似）。
+                hand.note_start_stack(seat, stack)
+            hand.update_stack(seat, stack)
 
     def _your_turn(self, ws, msg):
         hand = self.hand
@@ -669,7 +736,7 @@ def run_selftest(args):
     def send(_ws, obj):
         sent.append(obj)
 
-    sess = Session(advisor, send, num_hands=2, default_seats=9, exploit=True, debug=True,
+    sess = Session(advisor, send, num_hands=3, default_seats=9, exploit=True, debug=True,
                    log_f=logbuf, raw_log=rawbuf)
 
     # 一手 9-max：button=0, 我=seat3(UTG)。preflop 我 open，翻牌我 cbet，转牌结束。
@@ -713,6 +780,22 @@ def run_selftest(args):
          "shown": [{"seat": 3, "cards": ["As", "Kd"]}, {"seat": 5, "cards": ["Qh", "Qc"]}]},
         {"type": "hand_result", "hand_id": "H1", "winners": [3], "pot": 232,
          "final_stacks": {str(i): 2000 for i in range(9)}},
+        # 二手：**盲注走过**（blind walk）——我=seat2=BB、**全程零动作**（无 your_turn）。
+        # 关键回归：此手 hero 起始栈只能由 table_state 提供；缺它则 hand_start_stacks_list 回落
+        # BUY_IN=1000 → net=my_final−1000 严重虚高（深码越深越夸张）。table_state 修复后 net 须有界。
+        {"type": "hand_start", "hand_id": "H2", "dealer_seat": 0, "seat": 2},
+        {"type": "hole_cards", "cards": ["7d", "2c"]},
+        # 行动前 preflop 权威快照：我（seat2=BB，dealer=0→SB=1,BB=2）真实起始栈 1500，已扣 BB=20→1480。
+        {"type": "table_state", "hand_id": "H2", "street": "preflop", "dealer_seat": 0,
+         "seats": [{"seat": i, "name": f"p{i}",
+                    "stack": 1500 - (SMALL_BLIND_OP if i == 1 else BIG_BLIND_OP if i == 2 else 0),
+                    "status": "active", "in_hand": True} for i in range(9)]},
+        # 众人弃到 BB（我无 your_turn、零动作），我捡盲。
+        *[{"type": "player_action", "seat": s, "action": "fold"}
+          for s in [3, 4, 5, 6, 7, 8, 0, 1]],
+        # 我（BB）净 +10（捡 SB 的 10）：start=1500、final=1510。
+        {"type": "hand_result", "hand_id": "H2", "winners": [2], "pot": 10,
+         "final_stacks": {**{str(i): 1500 for i in range(9)}, "1": 1490, "2": 1510}},
     ]
 
     print("=== selftest: 跑 canned 9-max 序列 ===", file=sys.stderr)
@@ -738,11 +821,21 @@ def run_selftest(args):
     dec_lines = [o for o in log_lines if "req" in o and "resp" in o]
     hr_lines = [o for o in log_lines if o.get("kind") == "hand_result"]
     assert len(dec_lines) == 3, f"决策行应 3，实得 {len(dec_lines)}"
-    assert len(hr_lines) == 1, f"hand_result 行应 1，实得 {len(hr_lines)}"
-    hr = hr_lines[0]
+    assert len(hr_lines) == 2, f"hand_result 行应 2，实得 {len(hr_lines)}"
+    by_id = {o["hand_id"]: o for o in hr_lines}
+    hr = by_id["H1"]
     assert hr["winners"] == [3] and hr["pot"] == 232, hr
     assert hr.get("result", {}).get("type") == "hand_result", "应内嵌服务器 hand_result 整条"
     assert "req" not in hr and "resp" not in hr, "hand_result 行须无 req/resp（analyzer 才会跳过）"
+    # H1：我 seat3 起始/最终均 2000 → net=0（起始栈由 your_turn 捕获）。
+    assert hr["net"] == 0, f"H1 net 应 0，实得 {hr['net']}"
+    # H2（核心回归）：盲注走过、hero 零动作，起始栈只能来自 table_state。修复后 net=+10、|net|<=pot；
+    # 若 table_state 未被处理则回落 BUY_IN=1000 → net=510（>pot），此断言即抓 bug。
+    hr2 = by_id["H2"]
+    assert hr2["net"] == 10, (
+        f"H2 blind-walk net 应 +10（table_state 提供起始栈），实得 {hr2['net']}"
+        "（若为 510 则 table_state 起始栈修复失效，回落了 BUY_IN）")
+    assert abs(hr2["net"]) <= hr2["pot"], f"H2 blind-walk 须 |net|<=pot，实得 net={hr2['net']} pot={hr2['pot']}"
 
     # raw dump：每条收到的消息都逐行落盘；showdown（未解析类型）应被原样捕获 + 首见提示。
     raw_lines = [json.loads(x) for x in rawbuf.getvalue().splitlines() if x.strip()]
