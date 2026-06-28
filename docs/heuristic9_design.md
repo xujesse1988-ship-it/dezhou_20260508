@@ -211,6 +211,42 @@ mbb/g 都被此 bug 系统性高估**（越深越假）。
 > 残留：稀疏/非连续占座下盲注紧凑指派仍是近似（见 backlog ①），但本修复直接用 table_state 的
 > `in_hand` 座集做紧凑环序，已对 run24 全部短桌/HU 手校准为 0 越界。
 
+### v0.3（2026-06-28）：剥削层价值放大（接线，shipped）+ 对子面再加注限深（驳回）
+
+两项**场依赖**优化在严 sim 门控下分流——一过一驳，再次印证「教科书正确 ≠ 本场 +EV」。
+
+**① 剥削层 value-size 放大（SHIPPED）**：弱场全是 any-two 跟注站（live 见 93o/62s/J6o 摊牌、
+WTSD 43–51%）。剥削层已对分类 station 下调价值门槛（`value_shift`，薄价值）；新增**价值注/价值
+加注尺寸乘子** `ExploitConfig.station_value_size_mult`（默认 **1.30**）：仅价值动作放大、诈唬不动
+（放大诈唬只对不弃牌的站增亏）。仅在场上有**已分类 station** 时生效（剥削层，**非默认改动**；
+无 station / 未开 exploit 时 byte-equal）。落点 `policy::value_size`（包 `pick_bet_size(true)` ×
+mult，夹 `[size_small,1.6]`），由 `aggregate_exploit` 的 `any_station` 触发。
+回归门（8000h，多 seed，0 fallback/0 重建漂移）：
+- `--field station`：6max 6/6 seed 正（均 **+112 mbb/g**）、9max 多 seed 正（8kh 均 +48、16kh 均 +71）；
+- `--field mixed`（**真实弱场**，含 1 个 station）：6max 5/6 seed 正（均 **+106**）、9max 5/6 正（均 +73）；
+- `--field tag`：6max 持平（噪声内）、9max +100（部分 tag 实测 VPIP>0.45&AF<1.5 被分类 station，剥削正确触发）；
+- `--field nit` / HU(seats2) station：**byte-equal**（无/未触发 station 分类，乘子=1.0，零退化）；
+- 非 exploit 全座/全 field：**byte-equal** 历史基线。
+`≥1.40` 时 9max station 转负（过大尺寸把站的边缘成手吓弃 + 薄价值放大方差），故止于 1.30。
+**机理**：站跟更大注 → 价值注做大多榨；且 sim 的 station 对大注会按底池赔率弃 air（`pot_odds<0.2` 门），
+**低估** live any-two 站（不弃）的放大收益 → sim 是保守下界。
+
+**② 对子面非坚果价值再加注限深（REJECTED，未提交引擎改动）**：run24 最大输池（−7031）＝hero 持
+非坚果两对（K7o→aces-up）在**成对面**（A A x x K）把 `value_raise` 连开进 5 层再加注战（52→306→994→
+2995→6981）撞对手 trip-A。**假设**：成对面 + 本街进攻数 ≥3（深战）+ made<Monster 时把价值再加注降级跟注。
+为可门控，加 sim baseline **`PairedTrap`**（松被动入池、**仅成对面持 trips+ 才升级加注战**，否则绝不诈唬加注；
+非对子面同 Tag）——follow Limper 先例。**回归门驳回**：
+- 漏洞在 sim **极稀疏**：trap 场 8000h 仅 ~8 次 hero 在 snr≥3 的成对面 value_raise（hero 的 equity 模型
+  对大注已收紧对手 range、本就多半不再加注）；
+- 对 trap 仅噪声级帮助（6max +5.5 单 seed、余 0）；
+- 对**真实 `tag` 场一致小亏**（depth3 全 seed 负 −12~−46；窄到「仅两对、排除 trips」仍 5/6 seed 负 −4~−12）——
+  因 tag 也用两对打成对面加注战，hero 两对再加注本是 **+EV**，限深反而漏价值（正是任务预警的「别杀掉
+  非对子面/可盈利加注战」的同构陷阱，只是发生在**成对面 + 非 trap 激进对手**）；
+- depth=5 时全场 byte-equal（纯 no-op）。
+**结论**：机理对（深成对面战别拿非坚果 stack-off），但**对实际激进场是 wash-to-小亏**，无法证明 +EV → 驳回默认改动。
+正确归属同 limp＝**剥削层**（仅对画像为被动/仅坚果建战的对手限深），非默认。`PairedTrap` baseline **保留**为
+该剥削项的将来验证夹具（follow `0bfea7a` Limper 先例；不入 mixed pool，不动默认 sim 数）。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. **稀疏占座 compact 重映射**（driver，对 6-max 短桌 + 9-max 稀疏都重要）：v1 满环假设，
