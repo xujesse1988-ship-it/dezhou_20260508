@@ -43,7 +43,32 @@ enum Archetype {
     /// 被动开池跛入者 / 跟注站混合：first-in 用宽 range **跛入（仅跟 BB，不加注）**，
     /// 制造多人 limped 底池——这是 hero `limp_behind` 路径的测试载荷。
     Limper,
+    /// 对子面陷阱：松被动入池见多翻牌；**仅在成对面持 trips+ 时才升级加注战**（大注/再加注），
+    /// 否则被动 check/call、绝不诈唬加注；非对子面打法同 Tag。这是 hero 「对子面非坚果价值再加注」
+    /// 漏洞的测试载荷（run24 −7031 复盘）——专门惩罚把两对/顶对加进 trips/boat 深战。
+    PairedTrap,
     Hero, // 仅 mirror 模式
+}
+
+/// board 是否成对（任一 rank 出现 ≥2）。
+fn board_paired(board: &[Card]) -> bool {
+    let mut cnt = [0u8; 13];
+    for c in board {
+        cnt[(c.to_u8() / 4) as usize] += 1;
+    }
+    cnt.iter().any(|&c| c >= 2)
+}
+
+/// 成对面上我方是否持「三条」（某 hole 张匹配 board 成对 rank → trips/quads）。葫芦/四条已归
+/// Monster，此处只补 trips；与 `made==Monster` 合用即覆盖 trips+。用于 `PairedTrap` 仅坚果建战。
+fn holds_trips_on_paired(hole: [Card; 2], board: &[Card]) -> bool {
+    let mut cnt = [0u8; 13];
+    for c in board {
+        cnt[(c.to_u8() / 4) as usize] += 1;
+    }
+    let h0 = (hole[0].to_u8() / 4) as usize;
+    let h1 = (hole[1].to_u8() / 4) as usize;
+    cnt[h0] >= 2 || cnt[h1] >= 2
 }
 
 struct SimRng(u64);
@@ -259,6 +284,8 @@ fn baseline_action(
             Archetype::Station => (0.50, 0.42, 0.72, 0.05),
             Archetype::Maniac => (0.42, 0.40, 0.52, 0.55),
             Archetype::Tag => (0.55, 0.50, 0.64, 0.15),
+            // 松被动入池见多翻牌；几乎只用顶级牌 3bet（建池靠跟注而非翻前加注）。
+            Archetype::PairedTrap => (0.52, 0.42, 0.85, 0.0),
             Archetype::Random => return random_action(&legal, state, seat, rng),
             Archetype::Limper => unreachable!("Limper handled above"),
             Archetype::Hero => (0.55, 0.50, 0.64, 0.15),
@@ -336,6 +363,59 @@ fn baseline_action(
                 Action::Call // 跟注站式：任何对子/听牌/好赔率都跟，不加注
             } else {
                 safe_action(&legal)
+            }
+        }
+        Archetype::PairedTrap => {
+            let paired = board_paired(board);
+            // 坚果建战判据：成对面持 trips+（trips via 匹配 rank，或 boat/quads via Monster）。
+            let danger =
+                made == MadeClass::Monster || (paired && holds_trips_on_paired(hole, board));
+            if paired {
+                if danger {
+                    // 仅此处升级加注战：大注/池量再加注，把 hero 的非坚果价值再加注钓进深战。
+                    if facing {
+                        if legal_can_raise(&legal) {
+                            make_bet(1.0, &legal).unwrap_or(Action::Call)
+                        } else {
+                            Action::Call
+                        }
+                    } else {
+                        make_bet(0.8, &legal).unwrap_or_else(|| safe_action(&legal))
+                    }
+                } else {
+                    // 成对面无坚果：被动，绝不诈唬加注（不喂 hero 的抓诈）。
+                    if !facing {
+                        if r >= MadeClass::TopPair.rank() && rng.unit() < 0.4 {
+                            make_bet(0.4, &legal).unwrap_or_else(|| safe_action(&legal))
+                        } else {
+                            safe_action(&legal)
+                        }
+                    } else if (r >= MadeClass::MidPair.rank() && pot_odds < 0.30) || pot_odds < 0.18
+                    {
+                        Action::Call // 便宜跟成手，深注弃
+                    } else {
+                        safe_action(&legal)
+                    }
+                }
+            } else {
+                // 非对子面：直球价值，打法同 Tag（不限深）——确保「非对子面加注战」对照不被污染。
+                if !facing {
+                    if r >= MadeClass::TopPair.rank() {
+                        make_bet(0.6, &legal).unwrap_or_else(|| safe_action(&legal))
+                    } else if dr.has_meaningful_draw() && rng.unit() < 0.6 {
+                        make_bet(0.55, &legal).unwrap_or_else(|| safe_action(&legal))
+                    } else {
+                        safe_action(&legal)
+                    }
+                } else if r >= MadeClass::Strong.rank() && legal_can_raise(&legal) {
+                    make_bet(0.7, &legal).unwrap_or(Action::Call)
+                } else if (r >= MadeClass::MidPair.rank() && pot_odds < 0.4)
+                    || (dr.has_meaningful_draw() && pot_odds < 0.33)
+                {
+                    Action::Call
+                } else {
+                    safe_action(&legal)
+                }
             }
         }
         Archetype::Maniac => {
@@ -761,6 +841,7 @@ fn main() {
                 "tag" => Archetype::Tag,
                 "random" => Archetype::Random,
                 "limpy" => Archetype::Limper,
+                "pairedtrap" | "trap" => Archetype::PairedTrap,
                 _ => pool[(k - 1) % pool.len()],
             }
         };
