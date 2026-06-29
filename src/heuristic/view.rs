@@ -19,6 +19,10 @@ pub struct HistAction {
     pub action: String,
     #[serde(default)]
     pub to: Option<u64>,
+    /// 该动作所属街（0=preflop..3=river）。driver 权威；**全部动作都带**时按标签分段
+    /// （跳过启发式下注轮关闭检测）；任一缺省则整手退化到启发式分段。
+    #[serde(default)]
+    pub street: Option<u8>,
 }
 
 /// 我方决策点的合法区间（OpenPoker 单位，权威）。
@@ -56,6 +60,12 @@ pub struct Request {
     /// 各座玩家名（剥削画像用，可空）。
     #[serde(default)]
     pub names: std::collections::BTreeMap<u8, String>,
+    /// 权威小盲座位（driver 紧凑指派；缺省退化到物理 btn+1 / HU btn）。
+    #[serde(default)]
+    pub sb_seat: Option<u8>,
+    /// 权威大盲座位（driver 紧凑指派；缺省退化到物理 btn+2 / HU btn+1）。
+    #[serde(default)]
+    pub bb_seat: Option<u8>,
 }
 
 /// advisor → driver 响应。`amount` 仅 raise 携带（OpenPoker 单位 raise-to）。
@@ -153,6 +163,10 @@ pub struct GameView {
     pub num_seats: u8,
     pub my_seat: u8,
     pub button_seat: u8,
+    /// 解析后的小盲座（driver 权威优先；否则物理 btn+1 / HU btn）。位置桶按它分类。
+    pub sb_seat: u8,
+    /// 解析后的大盲座（driver 权威优先；否则物理 btn+2 / HU btn+1）。
+    pub bb_seat: u8,
     pub small_blind: u64,
     pub big_blind: u64,
     pub street: Street,
@@ -215,12 +229,13 @@ impl GameView {
             }
         }
 
-        // 盲注座位（座位无关；HU 特例 button=SB）。
+        // 盲注座位：driver 权威优先（紧凑指派，正确处理稀疏占座 / 服务端 HU 无特例）；
+        // 缺省退化到物理座（HU 特例 button=SB，多人 btn+1/btn+2）。
         let btn = (req.button_seat as usize) % n;
-        let (sb_seat, bb_seat) = if n == 2 {
-            (btn, (btn + 1) % n)
-        } else {
-            ((btn + 1) % n, (btn + 2) % n)
+        let (sb_seat, bb_seat) = match (req.sb_seat, req.bb_seat) {
+            (Some(sbs), Some(bbs)) => ((sbs as usize) % n, (bbs as usize) % n),
+            _ if n == 2 => (btn, (btn + 1) % n),
+            _ => ((btn + 1) % n, (btn + 2) % n),
         };
 
         let mut folded = vec![false; n];
@@ -263,6 +278,12 @@ impl GameView {
         let mut limpers_preflop: u32 = 0;
         let mut preflop_raises: u32 = 0;
         let mut pending_advance = false;
+
+        // 街分段模式：当 driver 给**每个**动作都打了街标签时，按标签权威推进，跳过启发式
+        // 下注轮关闭检测——这样幻影空座/不规则序列不再扰乱分段。任一动作缺标签则整手退化到
+        // 启发式分段（与历史完全一致）。空 actions 走启发式路径（对空序两者等价）。
+        let use_street_labels =
+            !req.actions.is_empty() && req.actions.iter().all(|a| a.street.is_some());
 
         // 下注轮关闭检测：所有 live & 非 all-in & 有栈 的座都已行动且追平 high_bet。
         let round_closed = |folded: &[bool],
@@ -309,8 +330,21 @@ impl GameView {
             };
 
         for a in &req.actions {
-            // 上一个动作触发了关闭 → 本动作属于下一街，先推进。
-            if pending_advance {
+            if use_street_labels {
+                // 权威街标签：推进到该动作所属街（跳过启发式关闭检测，幻影空座不再扰动分段）。
+                let want = a.street.unwrap_or(0).min(3);
+                while street_idx < want {
+                    advance_street(
+                        &mut street_idx,
+                        &mut committed_round,
+                        &mut has_acted,
+                        &mut high_bet,
+                        &mut cur_aggressor,
+                        &mut aggressor_by_street,
+                    );
+                }
+            } else if pending_advance {
+                // 启发式：上一个动作触发了关闭 → 本动作属于下一街，先推进。
                 advance_street(
                     &mut street_idx,
                     &mut committed_round,
@@ -365,8 +399,18 @@ impl GameView {
                             }
                         }
                     };
+                    // raise-to 自纠：a.to 是 server 权威 raise-to。若它超过本座**记录**起始栈，
+                    // 就是 start 被低估的铁证（没人能 raise-to 超过自己起始栈）→ 把有效起始栈抬到
+                    // 至少 target，而非把加注夹小到错误小栈。只信权威 a.to（None-fallback 的 target
+                    // 是猜测，不抬栈，仍按总栈夹）。安全、never panic；sim 送正确栈 → 此分支不触发
+                    // → 重建零漂移。
+                    if let Some(t) = a.to {
+                        if t > start_stack[s] {
+                            start_stack[s] = t;
+                        }
+                    }
                     let avail_total = start_stack[s];
-                    let target = target.min(avail_total); // 不超过总栈
+                    let target = target.min(avail_total); // 已自纠则 no-op；否则仍夹总栈
                     let delta = target.saturating_sub(committed_round[s]);
                     let already_in = committed_total[s];
                     let room = avail_total.saturating_sub(already_in);
@@ -397,14 +441,16 @@ impl GameView {
                 }
             }
 
-            if round_closed(
-                &folded,
-                &allin,
-                &has_acted,
-                &committed_round,
-                &start_stack,
-                high_bet,
-            ) {
+            if !use_street_labels
+                && round_closed(
+                    &folded,
+                    &allin,
+                    &has_acted,
+                    &committed_round,
+                    &start_stack,
+                    high_bet,
+                )
+            {
                 pending_advance = true;
             }
         }
@@ -458,6 +504,8 @@ impl GameView {
             num_seats: n as u8,
             my_seat: (req.my_seat as usize % n) as u8,
             button_seat: btn as u8,
+            sb_seat: sb_seat as u8,
+            bb_seat: bb_seat as u8,
             small_blind: sb,
             big_blind: bb,
             street,
@@ -585,25 +633,20 @@ impl GameView {
         ((self.my_seat as i32 - self.button_seat as i32).rem_euclid(n as i32)) as u8
     }
 
-    /// 翻前位置桶（座位无关）。
+    /// 翻前位置桶（座位无关）。盲位按**解析后的** sb_seat/bb_seat 分类（driver 权威优先，
+    /// 正确处理稀疏占座 / 服务端 HU 无特例）；非盲位按相对按钮行动序分 Late/Mid/Early。
+    /// 物理回退时 sb_seat=btn+1、bb_seat=btn+2（HU=btn/btn+1）→ 与历史 button-index 判定等价。
     pub fn my_pos_bucket(&self) -> PosBucket {
         let n = self.num_seats;
-        let idx = self.my_button_index();
-        if n == 2 {
-            // HU：button=SB, 另一个=BB。
-            return if idx == 0 {
-                PosBucket::SmallBlind
-            } else {
-                PosBucket::BigBlind
-            };
-        }
-        if idx == 1 {
+        let me = self.my_seat;
+        if me == self.sb_seat {
             return PosBucket::SmallBlind;
         }
-        if idx == 2 {
+        if me == self.bb_seat {
             return PosBucket::BigBlind;
         }
-        // 非盲位：idx==0(BTN) 或 idx∈[3, n-1]。
+        // 非盲位：按相对按钮行动序。idx==0(BTN) 或 idx∈[3, n-1]。
+        let idx = self.my_button_index();
         if idx == 0 || idx == n - 1 {
             PosBucket::Late
         } else if idx >= n.saturating_sub(3) {

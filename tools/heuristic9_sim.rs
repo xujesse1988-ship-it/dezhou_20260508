@@ -565,6 +565,10 @@ fn build_request(
         } else {
             std::collections::BTreeMap::new()
         },
+        // sim 走启发式重建路径（不送权威盲注座/街标签）→ from_request 走与历史一致的物理+启发式
+        // 分段 → 重建 byte-for-byte 不变（漂移恒 0.000% by construction）。
+        sb_seat: None,
+        bb_seat: None,
     }
 }
 
@@ -603,6 +607,8 @@ fn record_action(
         seat: seat as u8,
         action: label.to_string(),
         to,
+        // street: None → 任一动作缺街标签 → from_request 整手走启发式分段（零漂移 by construction）。
+        street: None,
     });
     label
 }

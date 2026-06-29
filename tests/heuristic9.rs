@@ -8,7 +8,7 @@ use poker::core::{Card, Rank, Suit};
 use poker::heuristic::config::HeuristicConfig;
 use poker::heuristic::equity::{canonical_index, EquityEngine};
 use poker::heuristic::features::{made_class, MadeClass};
-use poker::heuristic::view::{parse_card, GameView, HistAction, Request, ValidActions};
+use poker::heuristic::view::{parse_card, GameView, HistAction, PosBucket, Request, ValidActions};
 use poker::heuristic::{HeuristicBot, Request as R2};
 
 fn c(s: &str) -> Card {
@@ -76,36 +76,44 @@ fn betting_reconstruction_matches_canned() {
                 seat: 1,
                 action: "fold".into(),
                 to: None,
+                street: None,
             },
             HistAction {
                 seat: 2,
                 action: "fold".into(),
                 to: None,
+                street: None,
             },
             HistAction {
                 seat: 3,
                 action: "fold".into(),
                 to: None,
+                street: None,
             },
             HistAction {
                 seat: 4,
                 action: "raise".into(),
                 to: Some(40),
+                street: None,
             },
             HistAction {
                 seat: 5,
                 action: "fold".into(),
                 to: None,
+                street: None,
             },
             HistAction {
                 seat: 0,
                 action: "call".into(),
                 to: None,
+                street: None,
             },
         ],
         valid: valid(true, false, true, 20, 1960),
         stacks: vec![2000, 1416, 1322, 6020, 11891, 1460],
         names: Default::default(),
+        sb_seat: None,
+        bb_seat: None,
     };
     let v = GameView::from_request(&req);
     // 翻牌街，pot = 40(s4) + 40(me) + 10(s5 SB dead) = 90。
@@ -137,36 +145,44 @@ fn betting_reconstruction_preflop_3bet() {
                 seat: 3,
                 action: "raise".into(),
                 to: Some(6),
+                street: None,
             }, // UTG open 3bb=6
             HistAction {
                 seat: 4,
                 action: "fold".into(),
                 to: None,
+                street: None,
             },
             HistAction {
                 seat: 5,
                 action: "fold".into(),
                 to: None,
+                street: None,
             },
             HistAction {
                 seat: 6,
                 action: "fold".into(),
                 to: None,
+                street: None,
             },
             HistAction {
                 seat: 7,
                 action: "raise".into(),
                 to: Some(18),
+                street: None,
             }, // BTN 3bet
             HistAction {
                 seat: 8,
                 action: "fold".into(),
                 to: None,
+                street: None,
             }, // SB fold
         ],
         valid: valid(false, true, true, 34, 200),
         stacks: vec![200; 9],
         names: Default::default(),
+        sb_seat: None,
+        bb_seat: None,
     };
     let v = GameView::from_request(&req);
     assert_eq!(v.street, Street::Preflop);
@@ -251,6 +267,8 @@ fn respond_always_legal_never_panics() {
         valid: va,
         stacks: vec![200; n as usize],
         names: Default::default(),
+        sb_seat: None,
+        bb_seat: None,
     };
     let reqs = vec![
         mk(
@@ -340,10 +358,106 @@ fn raise_amount_clamped() {
         valid: valid(false, false, true, 4, 50),
         stacks: vec![200; 6],
         names: Default::default(),
+        sb_seat: None,
+        bb_seat: None,
     };
     let resp = bot.respond(&req);
     if resp.action == "raise" {
         let a = resp.amount.unwrap();
         assert!((4..=50).contains(&a), "raise amount {a} 越界");
     }
+}
+
+/// Fix C：权威盲注座（driver `_compact_blinds`）覆盖物理 btn+1/btn+2。
+/// HU 服务端真实规则：**button 投 BIG blind**（无 HU 特例）。button=seat0 → 权威
+/// sb_seat=1、bb_seat=0；旧物理逻辑反过来给 sb=0/bb=1（button=SB）。我=seat0=BB、翻前盲注
+/// 已发、轮到 BB 行动权（无 raise）：
+///   权威：我是 BB、committed==high_bet=20 → to_call=0、位置=BigBlind；
+///   旧物理：我是 SB、committed=10 → to_call=10、位置=SmallBlind（错）。
+/// 断言权威值 → 在旧 button-index 盲注逻辑下必然失败。
+#[test]
+fn authoritative_blinds_hu_button_is_bb() {
+    let req = Request {
+        hole: vec!["Ah".into(), "Kh".into()],
+        board: vec![],
+        button_seat: 0,
+        my_seat: 0,
+        num_seats: 2,
+        small_blind: 10,
+        big_blind: 20,
+        actions: vec![],
+        valid: valid(true, false, true, 40, 1000),
+        stacks: vec![1000, 1000],
+        names: Default::default(),
+        sb_seat: Some(1),
+        bb_seat: Some(0),
+    };
+    let v = GameView::from_request(&req);
+    assert_eq!(v.sb_seat, 1, "权威 SB 座");
+    assert_eq!(v.bb_seat, 0, "权威 BB 座（button 投大盲）");
+    // pot = SB(10)+BB(20) = 30。
+    assert_eq!(v.pot_chips(), 30);
+    // 我(seat0)=BB：committed_round 20 == high_bet 20 → 无需跟注（旧物理逻辑会算 10）。
+    assert_eq!(v.to_call_chips(), 0, "button=BB → 已补平，to_call 应为 0");
+    // 位置桶按权威盲注座分类（旧逻辑会判 SmallBlind）。
+    assert_eq!(
+        v.my_pos_bucket(),
+        PosBucket::BigBlind,
+        "权威：button(seat0)=BB"
+    );
+}
+
+/// Fix B：权威逐动作街标签修复「分段坍缩」。构造幻影空座（seat4 从不行动、从不弃牌、
+/// 有默认栈）→ 启发式 `round_closed` 永不触发 → 所有动作压进翻前街、转牌下注被并进同一轮、
+/// board 校准把 committed_round/high_bet 清零 → to_call 坍缩为 0、pot 少计。带街标签后按标签
+/// 权威分段：转牌 hero(seat2) 正面对 100 的下注 → to_call=100、pot=230。
+/// 断言权威值 → 在无标签启发式下（pot=170/to_call=0）必然失败。
+#[test]
+fn authoritative_street_labels_fix_segmentation_collapse() {
+    // n=5, button=0（物理 sb=1, bb=2）；seat4 = 幻影（从不出现在 actions）。
+    // preflop: seat3 fold, seat0 raise→60, seat1 fold, seat2(BB) call。
+    // flop: seat2 check, seat0 check（过牌）。
+    // turn: seat2 check, seat0 bet→100。hero=seat2 面对 100。
+    let ha = |seat: u8, action: &str, to: Option<u64>, street: u8| HistAction {
+        seat,
+        action: action.into(),
+        to,
+        street: Some(street),
+    };
+    let req = Request {
+        hole: vec!["Ah".into(), "Kd".into()],
+        board: vec!["7c".into(), "2d".into(), "9h".into(), "Qs".into()], // turn (4 张)
+        button_seat: 0,
+        my_seat: 2,
+        num_seats: 5,
+        small_blind: 10,
+        big_blind: 20,
+        actions: vec![
+            ha(3, "fold", None, 0),
+            ha(0, "raise", Some(60), 0),
+            ha(1, "fold", None, 0),
+            ha(2, "call", None, 0),
+            ha(2, "check", None, 1),
+            ha(0, "check", None, 1),
+            ha(2, "check", None, 2),
+            ha(0, "raise", Some(100), 2),
+        ],
+        valid: valid(false, true, true, 200, 940),
+        stacks: vec![1000; 5],
+        names: Default::default(),
+        sb_seat: None,
+        bb_seat: None,
+    };
+    let v = GameView::from_request(&req);
+    assert_eq!(v.street, Street::Turn);
+    // committed_total = [160(60+100), 10(sb dead), 60(20+40 call), 0(fold), 0(phantom)] = 230。
+    assert_eq!(v.pot_chips(), 230, "pot 应含两条街投入（标签分段，不坍缩）");
+    // 转牌 hero(seat2) 面对 seat0 的 100 下注（committed_round[2]=0）。
+    assert_eq!(
+        v.to_call_chips(),
+        100,
+        "面对转牌 100 下注，应需跟注 100（非坍缩的 0）"
+    );
+    assert_eq!(v.high_bet, 100);
+    assert_eq!(v.preflop_aggressor, Some(0), "翻前加注者 = seat0");
 }

@@ -169,6 +169,8 @@ class HandState:
         self.names = {}            # seat -> name
         self.stacks = {}           # seat -> remaining stack（your_turn/player_action 滚动）
         self.start_stacks = {}     # seat -> hand-start stack（首见时锁）
+        self.sb_seat = None        # 权威小盲座（table_state 紧凑指派；None→advisor 退化物理）
+        self.bb_seat = None        # 权威大盲座（同上）
 
     def on_player_action(self, seat, action, amount):
         if seat is None or action is None:
@@ -213,6 +215,17 @@ class HandState:
         if s in self.start_stacks:
             return
         self.start_stacks[s] = int(round(float(start)))
+
+    def set_blind_seats(self, blinds):
+        """从 _compact_blinds 输出（{seat: blind_amount}）锁定权威 SB/BB 座，供 advisor 用
+        正确盲注座位（紧凑指派，正确处理稀疏占座 / 服务端 HU 无特例）。首见即锁、不覆盖。"""
+        if self.sb_seat is not None and self.bb_seat is not None:
+            return
+        for seat, amt in blinds.items():
+            if amt == SMALL_BLIND_OP and self.sb_seat is None:
+                self.sb_seat = int(seat)
+            elif amt == BIG_BLIND_OP and self.bb_seat is None:
+                self.bb_seat = int(seat)
 
     def committed_total(self):
         """从 actions 重建各座本手累计投入（含盲注）。"""
@@ -266,6 +279,10 @@ class HandState:
         return out
 
     def build_request(self, valid, include_names=False):
+        # 每个动作都带街标签（0=preflop..3=river）→ advisor 按标签权威分段，跳过启发式下注轮
+        # 关闭检测（幻影空座不再扰乱分段）。镜像 observe_record 的 action_streets 映射。
+        acts = [{**a, "street": _street_idx(st)}
+                for a, st in zip(self.actions, self.action_streets)]
         req = {
             "hole": self.hole,
             "board": self.board,
@@ -274,10 +291,14 @@ class HandState:
             "num_seats": self.num_seats,
             "small_blind": SMALL_BLIND_OP,
             "big_blind": BIG_BLIND_OP,
-            "actions": self.actions,
+            "actions": acts,
             "valid": valid,
             "stacks": self.hand_start_stacks_list(),
         }
+        # 权威盲注座（紧凑指派；两者皆知时才发，advisor 仅在 both present 时用、否则退化物理）。
+        if self.sb_seat is not None and self.bb_seat is not None:
+            req["sb_seat"] = self.sb_seat
+            req["bb_seat"] = self.bb_seat
         if include_names and self.names:
             req["names"] = {str(k): v for k, v in self.names.items()}
         return req
@@ -454,9 +475,12 @@ class Session:
         elif t == "player_action":
             if self.hand:
                 self._track_seat(msg.get("seat"))
-                self.hand.note_start_stack(msg.get("seat"), msg.get("stack"))
+                # 先记动作再推起始栈：note_start_stack 用 committed_total 推 start = remaining +
+                # committed；若本次 raise 尚未计入 committed（首动作即 raise 的座尤甚），start 会锁
+                # 太低（例：raise to 303、剩 10 → 应锁 ~313，旧序锁 ~20）。故先 on_player_action。
                 self.hand.on_player_action(msg.get("seat"), msg.get("action"),
                                            msg.get("amount"))
+                self.hand.note_start_stack(msg.get("seat"), msg.get("stack"))
                 self.hand.update_stack(msg.get("seat"), msg.get("stack"))
         elif t == "community_cards":
             if self.hand:
@@ -524,6 +548,8 @@ class Session:
         seats = msg.get("seats") or []
         preflop = _street_name(msg.get("street")) == "preflop"
         blinds = self._compact_blinds(msg.get("dealer_seat"), seats) if preflop else {}
+        if blinds:
+            hand.set_blind_seats(blinds)  # 权威盲注座 → advisor 用正确盲注分配
         for s in seats:
             if s.get("status") == "empty":
                 continue
