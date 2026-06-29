@@ -247,11 +247,44 @@ mult，夹 `[size_small,1.6]`），由 `aggregate_exploit` 的 `any_station` 触
 正确归属同 limp＝**剥削层**（仅对画像为被动/仅坚果建战的对手限深），非默认。`PairedTrap` baseline **保留**为
 该剥削项的将来验证夹具（follow `0bfea7a` Limper 先例；不入 mixed pool，不动默认 sim 数）。
 
+### v0.4（2026-06-29）：协议增强—driver 发权威信息，view.rs 重建对齐服务端（shipped）
+
+三个重建正确性 bug 同根：`view.rs` 从**残缺信息**（扁平 actions 无街标、物理猜盲、偶尔低估的栈）
+重建下注态，而 **driver 手里有全部权威信息却没发**。本次让 driver 把已知权威发给 advisor，
+`from_request` **有则用、无则退化历史启发式**——sim 全发 `None` → 重建逐字节不变（漂移恒 0.000% by
+construction），只有 live 走权威路径。commit `ad7bff2`。
+
+**A 栈硬化（根修；此前 `c500643` 的 table_state 锚定只是抢先规避、未真修）**：
+- driver `player_action`：先 `on_player_action` 再 `note_start_stack`（旧序对**首动作即 raise** 的座把
+  start 锁太低——raise-to 尚未计入 committed）；
+- `view.rs` raise-to 自纠：`a.to`（server 权威 raise-to）超过记录起始栈即栈被低估的铁证 → 把有效起始栈
+  抬到 ≥target，而非把加注夹到错误小栈（仅信权威 `a.to`，None-fallback 的 target 是猜测、不抬栈）。
+
+**B 逐动作街标签（治翻后「分段坍缩」）**：`HistAction.street: Option<u8>`（serde default）。全动作带
+标签时按标签权威推进、**跳过启发式 `round_closed`**——幻影空座/不规则序列不再把多街塌成一跳、抹掉
+`to_call`；任一缺标签整手退化历史启发式分段。driver `build_request` 给每动作打街标（镜像 observe 的
+`action_streets` 映射）。
+
+**C 权威盲座（治盲规则反 + 翻前位置桶错）**：`Request.sb_seat/bb_seat: Option<u8>`；`GameView` 存盲座，
+`my_pos_bucket` 改走存储盲座而非 button-index 硬编码 HU 特例。**服务端 HU 无特例：button 投 BIG blind**
+（run24 raw 坐实）。driver 用 `_compact_blinds`（紧凑指派，正确处理稀疏/空座）发权威盲座，两者皆知才发。
+物理回退（sim/缺省）= HU `btn/btn+1`、多人 `btn+1/btn+2`，与历史 button-index 判定**等价**。
+
+**验证**：`cargo test --test heuristic9` 10/10（含 2 个权威路径新测：HU button=BB、街标签修复幻影座分段
+坍缩，均断言旧逻辑下**必失败**的值）；sim 漂移门 9/6/2-max × exploit × 多 seed = pot/to_call **0.000%、
+fallback 0**；clippy/fmt/selftest/`build --all-targets` 全绿。**实盘 A/B**（replay run24/run25 raw 经新
+driver+advisor，比对重建 `to_call` vs 服务端权威 `can_check`）：run24 旧路径 **52** 处「`facing_bet` 却
+`to_call=0`」全部修正、run25 修 1、**0 回归**；新 driver 实盘上 sb/bb 座 4000/4000、postflop 街标
+1902/1902 全填充。
+
+**机理价值**：实际 EV 影响小（栈已被 table_state 锚定预修、其余被 `policy.rs` 两道防线接住），但根治了
+**分析器 `pot`/`required_eq` 脏数据**（run24 ~1.3% 决策）、解锁真 HU 盘（盲规则）、并在短手/稀疏占座放大
+前预修。
+
 ### 迭代 backlog（下一步，按优先级）
 
-1. **稀疏占座 compact 重映射**（driver，对 6-max 短桌 + 9-max 稀疏都重要）：v1 满环假设，
-   非连续物理座会多模拟「幻影座」扭曲位置/人数。主线 `openpoker_play.py` 已有 `dealt_seats`/
-   `stream:state` 占座推断方案可移植。
+1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街
+   标签，`view.rs` 按标签分段、按权威盲座定位 → 幻影空座不再扰乱分段/位置（实盘 A/B 坐实，0 回归）。
 2. **剥削对纯 nit 场仍欠力**：adjust_cap 已到安全上限 0.12（再高 nit 断崖）。要进一步榨干
    紧场需结构改动——把「模型对手紧（助我弃）」与「利用其高弃率（助我攻）」解耦，因为同一
    equity 既驱动跟注又驱动下注，对手收紧会同时压住我方进攻。非全 nit 的真实混合场剥削已正收益。
