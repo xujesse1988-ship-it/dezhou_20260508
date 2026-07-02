@@ -11,6 +11,7 @@ pub mod mlrange;
 pub mod opponent;
 pub mod policy;
 pub mod range;
+pub mod tokenizer;
 pub mod view;
 
 pub use config::HeuristicConfig;

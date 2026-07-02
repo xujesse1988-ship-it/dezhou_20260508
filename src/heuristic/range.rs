@@ -96,11 +96,17 @@ pub struct LifeStats {
     pub call_actions: f64,
 }
 
-/// 对手画像（只需 `life`）。
+/// 对手画像（`life` 供因果 prior；`w50`/`n_shows` 仅 tokenizer 特征用）。
 #[derive(serde::Deserialize, Default, Clone)]
 pub struct Prof {
     #[serde(default)]
     pub life: LifeStats,
+    /// 最近 50 手窗口统计（tokenizer prof 通道 2）。
+    #[serde(default)]
+    pub w50: LifeStats,
+    /// 亮牌次数（tokenizer prof 第 15 维）。
+    #[serde(default)]
+    pub n_shows: f64,
 }
 
 /// 单手样本（golden `hands[i]["s"]`）。
@@ -130,6 +136,18 @@ pub struct Sample {
     /// 画像。
     #[serde(default)]
     pub prof: Prof,
+    /// 座位数（num seats）；tokenizer ctx 用，缺省 2（HU）。
+    #[serde(default)]
+    pub ns: Option<i64>,
+    /// 在手座位列表；tokenizer `pos_bucket_idx` 用。
+    #[serde(default)]
+    pub inh: Vec<i64>,
+    /// 按钮座位；tokenizer `pos_bucket_idx` 用。
+    #[serde(default)]
+    pub btn: Option<i64>,
+    /// 各座位筹码（键=座位十进制字符串，同 golden `s["stacks"]`）；tokenizer ctx/act 用。
+    #[serde(default)]
+    pub stacks: std::collections::HashMap<String, i64>,
 }
 
 // ===========================================================================
