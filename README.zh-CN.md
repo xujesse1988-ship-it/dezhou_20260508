@@ -7,7 +7,7 @@
 核心 API（规则引擎、座位模型、抽象层、训练 trait、收益向量）全部对 `n_seats` 保持通用，
 在 2 人与 6 人之间切换时不需要重写内核。
 
-- **语言 / 技术栈**：Rust 2021，工具链锁定 `1.95.0`（`rust-toolchain.toml`），禁用 `unsafe`。
+- **语言 / 技术栈**：Rust 2021，工具链锁定 `1.95.0`（`rust-toolchain.toml`）。
 - **算法**：External-Sampling MCCFR / LCFR（Brown & Sandholm 2018 Discounted MCCFR）、dense 表后端、
   流式 checkpoint、信息抽象（翻前 169 lossless + 翻后 equity/OCHS 桶）。
 - **评测**：LBR / best-response（heads-up）、AIVAT 降方差对照、以及对 Slumbot（HUNL）与
@@ -52,20 +52,6 @@
 
 ---
 
-## 算法正确性（已验证的基础）
-
-这是整个求解器所建立在的可复用基础。每一行都有外部对照（不变量 #7：改算法必须有外部对照才能落地）。
-
-| 项目 | 状态 | 依据 |
-|---|---|---|
-| Kuhn / Leduc Vanilla CFR | ✅ 收敛 closed-form `-1/18`，exploitability `<0.1` | `tests/cfr_kuhn.rs`、`tests/cfr_leduc.rs` |
-| Leduc ES-MCCFR / LCFR-MCCFR | ✅ `ev_p0` 收敛 -0.087；ES 路径 BLAKE3 byte-equal anchor | `tools/leduc_es_mccfr_report` |
-| 简化 NLHE ES-MCCFR / LCFR | ✅ LCFR 100M LBR 1,233 → 500M 1,126（100M 即饱和） | `run_lcfr_*`（vultr） |
-| dense 后端 + v4 bucket | ✅ byte-equal（对 HashMap）；吞吐 ~2.2×、RAM 平 5.2 GiB、ckpt 不暴涨 | `tests/dense_nlhe_trainer.rs` |
-| AIVAT 评测器 | ✅ 无偏（全证）；真日志降方差 1.21× | `tests/aivat_nlhe_*.rs`、`docs/aivat_eval.md` |
-| CFR trainer / 规则引擎 6-max N-generic | ✅ 多人 side pot 返回 per-seat 收益向量；traverser 按 `% n_players` 轮换 | `src/training/trainer.rs`、`src/rules/state.rs` |
-
----
 
 ## 仓库结构
 
@@ -117,17 +103,6 @@ cargo clippy --all-targets -- -D warnings
 cargo test                          # 默认套件
 cargo test --release -- --ignored   # 长跑性能/正确性 SLO + BLAKE3 anchor
 ```
-
-可选 PokerKit 跨验证：
-
-```bash
-uv venv --python 3.11 .venv-pokerkit
-uv pip install --python .venv-pokerkit/bin/python "pokerkit==0.4.14"
-PATH=".venv-pokerkit/bin:$PATH" cargo test
-```
-
-> **测试在哪跑**：本机只信任 `build` / `fmt` / `clippy`。完整训练和长测试套件在远端主机跑
-> （性能不足的本机跑出来的结果不可信）。
 
 ---
 
