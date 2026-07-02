@@ -103,23 +103,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test                          # 默认套件
 cargo test --release -- --ignored   # 长跑性能/正确性 SLO + BLAKE3 anchor
 ```
-
 ---
 
-## 代码层硬约束（由编译器 / clippy / `Cargo.toml` 强制）
-
-详见 [`docs/invariants.md`](./docs/invariants.md)。违反这些规则的 PR 不通过。
-
-1. **规则 / 评估器 / 抽象层不用浮点**——筹码 `u64`、盈亏 `i64`、评估器返回整数 rank、bucket id 离散整数。
-   唯一允许浮点的位置是 CFR 内部的 σ / regret 累加。
-2. **不用全局 RNG**——所有随机性走显式 `RngSource`；byte-equal 复现是发现算法 bug 的最低门槛。
-3. **不用 `unsafe`**——`Cargo.toml` 里 `unsafe_code = "forbid"`。
-4. **`ChipAmount::Sub` 下溢 panic**（debug + release）——筹码负数永远是 bug；要 saturating 行为用 `checked_sub`。
-5. **`Action::Raise { to }` 是绝对值**——`to` 是 raise 的目标金额（含已下注部分），与 NLHE / PokerKit 惯例一致。
-6. **座位方向唯一约定**——`SeatId((k+1) mod n_seats)` 是 `SeatId(k)` 的左邻；所有"向左"语义
-   （按钮轮转 / 大小盲 / odd-chip / 摊牌顺序 / 发牌起点）共用这一条。
-
----
 
 ## 基础设施
 
