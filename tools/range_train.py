@@ -116,20 +116,24 @@ def loss_fn(res, batch, eps=0.05):
 
 
 @torch.no_grad()
-def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False):
-    """街末快照指标。返回 per_street dict + 逐样本命中/NLL 矩阵（配对检验用）。"""
+def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscale=1.0):
+    """街末快照指标。返回 per_street dict + 逐样本命中/NLL 矩阵（配对检验用）。
+    rscale：残差温度（logits = log_prior + rscale·f_θ），<1 向 B2b 插值——q 失准的
+    校准旋钮。"""
     model.eval()
     hit5 = np.full((len(idxs), 4), -1, dtype=np.int8)
     nll = np.full((len(idxs), 4), np.nan, dtype=np.float64)
+    qpct = np.full((len(idxs), 4), np.nan, dtype=np.float64)
     ref_hit5 = np.full((len(idxs), 4), -1, dtype=np.int8)
     ref_nll = np.full((len(idxs), 4), np.nan, dtype=np.float64)
+    ref_qpct = np.full((len(idxs), 4), np.nan, dtype=np.float64)
     ranks = np.full((len(idxs), 4), -1, dtype=np.int32)
     arange = np.arange(169)
     for lo in range(0, len(idxs), batch_size):
         sub = idxs[lo:lo + batch_size]
         batch = data.batch(sub)
         res = model(batch["feat"], batch["lens"])
-        logits = masked_logits(res, batch).numpy()
+        logits = masked_logits(res, batch, rscale).numpy()
         logits0 = masked_logits(torch.zeros_like(res), batch).numpy()
         for j, i in enumerate(sub):
             for S in range(4):
@@ -137,7 +141,9 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False):
                 if sp < 0:
                     continue
                 row = lo + j
-                for mat_h, mat_n, lg in ((hit5, nll, logits), (ref_hit5, ref_nll, logits0)):
+                av = data.alive[i, S].astype(np.float64)
+                for mat_h, mat_n, mat_q, lg in ((hit5, nll, qpct, logits),
+                                                (ref_hit5, ref_nll, ref_qpct, logits0)):
                     if mat_h is ref_hit5 and not with_prior_ref:
                         continue
                     z = lg[j, sp]
@@ -148,6 +154,11 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False):
                     rk = int(np.nonzero(order == data.y[i])[0][0])
                     mat_h[row, S] = rk < 5
                     mat_n[row, S] = -math.log(max(p[data.y[i]], 1e-12))
+                    # range 质量分位：per-combo 密度降序累计预测质量到标签类，
+                    # 类内/平局取中点（越小 = 亮牌越靠 range 头部；均匀预测期望 50%）
+                    dens = np.divide(p, av, out=np.full(169, -1.0), where=av > 0)
+                    dy = dens[data.y[i]]
+                    mat_q[row, S] = p[dens > dy].sum() + 0.5 * p[dens == dy].sum()
                     if mat_h is hit5:
                         ranks[row, S] = rk
     out = {}
@@ -160,11 +171,14 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False):
                   "top10": float((ranks[m, S] < 10).mean()),
                   "nll": float(nll[m, S].mean()),
                   "rank_mean": float(ranks[m, S].mean() + 1),
-                  "rank_med": int(np.median(ranks[m, S]) + 1)}
+                  "rank_med": int(np.median(ranks[m, S]) + 1),
+                  "q_mean": float(qpct[m, S].mean()), "q_med": float(np.median(qpct[m, S]))}
         if with_prior_ref:
             out[S]["ref_top5"] = float((ref_hit5[m, S] == 1).mean())
             out[S]["ref_nll"] = float(ref_nll[m, S].mean())
-    return out, (hit5, nll, ref_hit5, ref_nll)
+            out[S]["ref_q_mean"] = float(ref_qpct[m, S].mean())
+            out[S]["ref_q_med"] = float(np.median(ref_qpct[m, S]))
+    return out, (hit5, nll, ref_hit5, ref_nll, qpct, ref_qpct)
 
 
 def paired_bootstrap(hit_a, hit_b, n_boot=10000, seed=7):
@@ -198,6 +212,8 @@ def main():
     ap.add_argument("--seed", type=int, default=20260702)
     ap.add_argument("--src-filter", default="", help="消融：只用这些源训练，如 live_opp")
     ap.add_argument("--eval-only", action="store_true")
+    ap.add_argument("--residual-scale", type=float, default=1.0,
+                    help="评估期残差温度（<1 向 B2b 插值，校准 q 用）")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -275,24 +291,29 @@ def main():
               f"batch={ta['batch']} seed={ta['seed']}",
               "- 口径：与 M0 harness 同（4 街末快照、top-k 平局按 (-p,k) 破、alive=观察者死牌）",
               ""]
+    if args.residual_scale != 1.0:
+        report.insert(3, f"- **残差温度 rscale={args.residual_scale}**（评估期向 B2b 插值）")
     final = {}
     for name, idxs in (("val", val_idx), ("test", test_idx)):
-        met, mats = snapshot_eval(model, data, idxs, with_prior_ref=True)
+        met, mats = snapshot_eval(model, data, idxs, with_prior_ref=True,
+                                  rscale=args.residual_scale)
         final[name] = (met, mats)
         report += [f"### {name} 切分（live_opp，n={len(idxs)}）", "",
-                   "| 街 | top-1 | **top-5** | top-10 | NLL | rank 均值 | rank 中位 | B2b top-5 | B2b NLL | Δtop-5 |",
-                   "|---|---|---|---|---|---|---|---|---|---|"]
+                   "| 街 | top-1 | **top-5** | top-10 | NLL | rank 均值 | rank 中位 | "
+                   "**q 中位** | q 均值 | B2b top-5 | B2b NLL | B2b q 中位 | Δtop-5 |",
+                   "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for S in range(4):
             m = met.get(S)
             if not m:
                 continue
             report.append(f"| {STREET_NAME[S]} | {m['top1']:.3f} | **{m['top5']:.3f}** | "
                           f"{m['top10']:.3f} | {m['nll']:.3f} | {m['rank_mean']:.1f} | {m['rank_med']} | "
-                          f"{m['ref_top5']:.3f} | {m['ref_nll']:.3f} | "
+                          f"**{m['q_med']*100:.1f}%** | {m['q_mean']*100:.1f}% | "
+                          f"{m['ref_top5']:.3f} | {m['ref_nll']:.3f} | {m['ref_q_med']*100:.1f}% | "
                           f"{m['top5']-m['ref_top5']:+.3f} |")
         report.append("")
 
-    met, (hit5, nllm, ref_hit5, ref_nllm) = final["test"]
+    met, (hit5, nllm, ref_hit5, ref_nllm, qpctm, ref_qpctm) = final["test"]
     report += ["### 出闸检验（test）", ""]
     vals = [met[S]["top5"] for S in sorted(met)]
     mono = all(vals[i] <= vals[i + 1] + 1e-9 for i in range(len(vals) - 1))
@@ -302,8 +323,10 @@ def main():
         m = hit5[:, S] >= 0
         d, (lo, hi), p = paired_bootstrap(hit5[m, S], ref_hit5[m, S])
         dn, (nlo, nhi), pn = paired_bootstrap(-nllm[m, S], -ref_nllm[m, S])
+        dq, (qlo, qhi), pq = paired_bootstrap(-qpctm[m, S], -ref_qpctm[m, S])
         report.append(f"- {STREET_NAME[S]}：Δtop-5 = {d:+.3f} [{lo:+.3f}, {hi:+.3f}] p={p:.4f}；"
-                      f"ΔNLL = {-dn:+.3f} [{-nhi:+.3f}, {-nlo:+.3f}] p={pn:.4f}")
+                      f"ΔNLL = {-dn:+.3f} [{-nhi:+.3f}, {-nlo:+.3f}] p={pn:.4f}；"
+                      f"Δq = {-dq*100:+.1f}pp [{-qhi*100:+.1f}, {-qlo*100:+.1f}] p={pq:.4f}")
     # 后街斜率：river−preflop 的 top-5 差距（仅打满 4 街的样本，配对）
     full = (hit5[:, 0] >= 0) & (hit5[:, 3] >= 0)
     slope_m = hit5[full, 3].astype(float) - hit5[full, 0].astype(float)
