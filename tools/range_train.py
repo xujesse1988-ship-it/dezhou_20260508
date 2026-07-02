@@ -128,6 +128,7 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
     ref_nll = np.full((len(idxs), 4), np.nan, dtype=np.float64)
     ref_qpct = np.full((len(idxs), 4), np.nan, dtype=np.float64)
     ranks = np.full((len(idxs), 4), -1, dtype=np.int32)
+    ref_ranks = np.full((len(idxs), 4), -1, dtype=np.int32)
     arange = np.arange(169)
     for lo in range(0, len(idxs), batch_size):
         sub = idxs[lo:lo + batch_size]
@@ -161,6 +162,8 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
                     mat_q[row, S] = p[dens > dy].sum() + 0.5 * p[dens == dy].sum()
                     if mat_h is hit5:
                         ranks[row, S] = rk
+                    else:
+                        ref_ranks[row, S] = rk
     out = {}
     for S in range(4):
         m = hit5[:, S] >= 0
@@ -178,7 +181,9 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
             out[S]["ref_nll"] = float(ref_nll[m, S].mean())
             out[S]["ref_q_mean"] = float(ref_qpct[m, S].mean())
             out[S]["ref_q_med"] = float(np.median(ref_qpct[m, S]))
-    return out, (hit5, nll, ref_hit5, ref_nll, qpct, ref_qpct)
+            out[S]["ref_rank_mean"] = float(ref_ranks[m, S].mean() + 1)
+            out[S]["ref_rank_med"] = int(np.median(ref_ranks[m, S]) + 1)
+    return out, (hit5, nll, ref_hit5, ref_nll, qpct, ref_qpct, ranks, ref_ranks)
 
 
 def paired_bootstrap(hit_a, hit_b, n_boot=10000, seed=7):
@@ -313,7 +318,7 @@ def main():
                           f"{m['top5']-m['ref_top5']:+.3f} |")
         report.append("")
 
-    met, (hit5, nllm, ref_hit5, ref_nllm, qpctm, ref_qpctm) = final["test"]
+    met, (hit5, nllm, ref_hit5, ref_nllm, qpctm, ref_qpctm, ranksm, ref_ranksm) = final["test"]
     report += ["### 出闸检验（test）", ""]
     vals = [met[S]["top5"] for S in sorted(met)]
     mono = all(vals[i] <= vals[i + 1] + 1e-9 for i in range(len(vals) - 1))
@@ -324,9 +329,12 @@ def main():
         d, (lo, hi), p = paired_bootstrap(hit5[m, S], ref_hit5[m, S])
         dn, (nlo, nhi), pn = paired_bootstrap(-nllm[m, S], -ref_nllm[m, S])
         dq, (qlo, qhi), pq = paired_bootstrap(-qpctm[m, S], -ref_qpctm[m, S])
+        dr, (rlo, rhi), pr = paired_bootstrap(-ranksm[m, S].astype(float),
+                                              -ref_ranksm[m, S].astype(float))
         report.append(f"- {STREET_NAME[S]}：Δtop-5 = {d:+.3f} [{lo:+.3f}, {hi:+.3f}] p={p:.4f}；"
                       f"ΔNLL = {-dn:+.3f} [{-nhi:+.3f}, {-nlo:+.3f}] p={pn:.4f}；"
-                      f"Δq = {-dq*100:+.1f}pp [{-qhi*100:+.1f}, {-qlo*100:+.1f}] p={pq:.4f}")
+                      f"Δq = {-dq*100:+.1f}pp [{-qhi*100:+.1f}, {-qlo*100:+.1f}] p={pq:.4f}；"
+                      f"Δrank = {-dr:+.1f} [{-rhi:+.1f}, {-rlo:+.1f}] p={pr:.4f}")
     # 后街斜率：river−preflop 的 top-5 差距（仅打满 4 街的样本，配对）
     full = (hit5[:, 0] >= 0) & (hit5[:, 3] >= 0)
     slope_m = hit5[full, 3].astype(float) - hit5[full, 0].astype(float)
