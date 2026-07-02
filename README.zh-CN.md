@@ -3,7 +3,7 @@
 > English version: [README.md](./README.md)
 
 一个可复现、可训练、可评测的 **无限注德州扑克（No-Limit Texas Hold'em）** 求解器，Rust 实现。
-**heads-up（2 人）200BB** 求解器是已收尾的基线，**6-max（6 人）100BB blueprint** 是当前主线。
+共用一套内核，覆盖两条线：**heads-up（2 人）200BB** 与 **6-max（6 人）100BB blueprint**。
 核心 API（规则引擎、座位模型、抽象层、训练 trait、收益向量）全部对 `n_seats` 保持通用，
 在 2 人与 6 人之间切换时不需要重写内核。
 
@@ -15,48 +15,9 @@
 
 ---
 
-## 当前状态
-
-### Heads-up NLHE（阶段 H1–H5）—— 已收尾 ✅
-
-1B update 的 dense blueprint（200BB）对 Slumbot **近 break-even**：10,000 手 AIVAT 下
-raw −85.25 / AIVAT −108.31 mbb/g，置信区间跨 0（符合预期、未显著）。LCFR / batched-parallel /
-dense 后端 + v4 bucket + AIVAT 评测链全部端到端验证。剩余收尾动作 = Slumbot 对战数据持续采集。
-详见 [`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md)。
-
-### 6-max NLHE blueprint-only（路线 A，100BB）—— 主线 🚧
-
-2026-05-30 立项。路线 A = 先把离线自对弈 blueprint 端到端跑通（参数化 game → 多人抽象 →
-复用 N-generic trainer → 实测对战评测），**不把实时 depth-limited search 作为硬门槛**。
-
-| 阶段 | 重点 | 状态 |
-|---|---|---|
-| S1 | 规则 / 6-max profile | 已闭（余 100k PokerKit 重跑） |
-| S2 | 树规模 + A3×A4 抽象接进生产 | 已闭 |
-| S3 | 多人桶（单对手桶 ≤3-way 可复用） | 已闭 |
-| S4 | 1B dense 训练 + preflop reshape（`--reshape none\|nolimp\|preopen\|preopen-small`） | 已跑完一轮并独立复核 |
-| S5 | 脱锚跨抽象 advisor 引擎、跨抽象 h2h、OpenPoker live 客户端 | 端到端 smoke 已过 |
-| S6 | 实时子博弈搜索 MVP | 核心已落地并验证（分支上，未并入） |
-
-6-max 主线的关键结论：
-
-- **6-max 是多人一般和博弈**，CFR 自对弈不再保证收敛 Nash，LBR/exploitability 失去理论意义
-  （只作诊断）。质量以**实测对战**为准，没有"训到 floor 就停"。
-- **Preflop reshape**（删非 SB 开池 limp + 加 2.25BB 开池档）把翻前支配对翻转从 ~13% 降到 <1%，
-  树最多缩 ~4.2×。GTO Wizard 真值修正确认 SB limp / AA-limp 是 GTO 而非缺陷。
-- **实时搜索 MVP**：瓶颈是 **blueprint / 抽象质量**，不是搜索 root——干净、训透的节点（flop-first）
-  中性不亏，而朴素放宽触发面到所有翻后节点会在弱基底上退化。
-- **叠加剥削 Tier 2**（进程内对手画像 → 收敛门 → 脱锚搜索路径上翻前宽度 range 凸混合）在
-  `--exploit on|vpip|off` 后面，默认 `off`（关时与现网策略 byte-equal）。
-
-详见 [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md)（主线验收目标）与
-[`docs/status_v3.md`](./docs/status_v3.md)（代码真实状态）。
-
----
-
 ## 算法正确性（已验证的基础）
 
-这是 6-max 主线所建立在的可复用基础。每一行都有外部对照（不变量 #7：改算法必须有外部对照才能落地）。
+这是整个求解器所建立在的可复用基础。每一行都有外部对照（不变量 #7：改算法必须有外部对照才能落地）。
 
 | 项目 | 状态 | 依据 |
 |---|---|---|
@@ -120,7 +81,7 @@ cargo test                          # 默认套件
 cargo test --release -- --ignored   # 长跑性能/正确性 SLO + BLAKE3 anchor
 ```
 
-可选 PokerKit 跨验证（6-max 阶段 S1 会用）：
+可选 PokerKit 跨验证：
 
 ```bash
 uv venv --python 3.11 .venv-pokerkit
@@ -165,8 +126,8 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test
 
 1. [`docs/status_v3.md`](./docs/status_v3.md) —— 代码真实状态。**先看正确性表，再决定要不要动代码。**
 2. [`docs/invariants.md`](./docs/invariants.md) —— 代码层硬约束。
-3. [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md) —— 当前主线目标（6-max blueprint-only，S1–S6 门槛）。
-4. [`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md) —— heads-up 阶段（H1–H5），已收尾。
+3. [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md) —— 6-max blueprint-only 目标（S1–S6 门槛）。
+4. [`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md) —— heads-up 阶段（H1–H5）。
 5. [`docs/aivat_eval.md`](./docs/aivat_eval.md) —— AIVAT 评测器细节。
 6. [`CLAUDE.md`](./CLAUDE.md) / [`AGENTS.md`](./AGENTS.md) —— 仓库导航 + 给编码 agent 的工作规则。
 
@@ -175,6 +136,47 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test
 ## 工作语言
 
 文档与 commit message 用中文；Rust 标识符与内联注释用英文（Rust 习惯）。
+
+---
+
+## 项目进度
+
+### Heads-up NLHE（200BB，阶段 H1–H5）
+
+1B update 的 dense blueprint 对 Slumbot **近 break-even**：10,000 手 AIVAT 下
+raw −85.25 / AIVAT −108.31 mbb/g，置信区间跨 0（符合预期、未显著）。LCFR / batched-parallel /
+dense 后端 + v4 bucket + AIVAT 评测链全部端到端验证。当前动作 = Slumbot 对战数据持续采集。
+详见 [`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md)。
+
+### 6-max NLHE blueprint-only（路线 A，100BB）
+
+2026-05-30 立项。路线 A = 先把离线自对弈 blueprint 端到端跑通（参数化 game → 多人抽象 →
+复用 N-generic trainer → 实测对战评测），**不把实时 depth-limited search 作为硬门槛**。
+
+| 阶段 | 重点 | 状态 |
+|---|---|---|
+| S1 | 规则 / 6-max profile | 已闭（余 100k PokerKit 重跑） |
+| S2 | 树规模 + A3×A4 抽象接进生产 | 已闭 |
+| S3 | 多人桶（单对手桶 ≤3-way 可复用） | 已闭 |
+| S4 | 1B dense 训练 + preflop reshape（`--reshape none\|nolimp\|preopen\|preopen-small`） | 已跑完一轮并独立复核 |
+| S5 | 脱锚跨抽象 advisor 引擎、跨抽象 h2h、OpenPoker live 客户端 | 端到端 smoke 已过 |
+| S6 | 实时子博弈搜索 MVP | 核心已落地并验证（分支上，未并入） |
+
+6-max 线的关键结论：
+
+- **6-max 是多人一般和博弈**，CFR 自对弈不再保证收敛 Nash，LBR/exploitability 失去理论意义
+  （只作诊断）。质量以**实测对战**为准，没有"训到 floor 就停"。
+- **Preflop reshape**（删非 SB 开池 limp + 加 2.25BB 开池档）把翻前支配对翻转从 ~13% 降到 <1%，
+  树最多缩 ~4.2×。GTO Wizard 真值修正确认 SB limp / AA-limp 是 GTO 而非缺陷。
+- **实时搜索 MVP**：瓶颈是 **blueprint / 抽象质量**，不是搜索 root——干净、训透的节点（flop-first）
+  中性不亏，而朴素放宽触发面到所有翻后节点会在弱基底上退化。
+- **叠加剥削 Tier 2**（进程内对手画像 → 收敛门 → 脱锚搜索路径上翻前宽度 range 凸混合）在
+  `--exploit on|vpip|off` 后面，默认 `off`（关时与现网策略 byte-equal）。
+
+详见 [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md)（验收目标）与
+[`docs/status_v3.md`](./docs/status_v3.md)（代码真实状态）。
+
+---
 
 ## License
 

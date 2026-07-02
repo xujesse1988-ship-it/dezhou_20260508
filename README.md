@@ -3,10 +3,10 @@
 > 中文版见 [README.zh-CN.md](./README.zh-CN.md)
 
 A reproducible, trainable, and evaluatable **No-Limit Texas Hold'em** solver written in Rust.
-The **heads-up (2-player) 200BB** solver is the completed baseline; the **6-max (6-player) 100BB
-blueprint** track is the current main line. Core APIs (rules engine, seat model, abstraction,
-training traits, payoff vectors) are kept `n_seats`-generic so nothing has to be rewritten when
-moving between 2 and 6 players.
+It covers two tracks that share one core — **heads-up (2-player) 200BB** and **6-max (6-player)
+100BB blueprint**. Core APIs (rules engine, seat model, abstraction, training traits, payoff
+vectors) are kept `n_seats`-generic so nothing has to be rewritten when moving between 2 and 6
+players.
 
 - **Language / stack**: Rust 2021, pinned toolchain `1.95.0` (`rust-toolchain.toml`), `unsafe` forbidden.
 - **Algorithm**: External-Sampling MCCFR / LCFR (Brown & Sandholm 2018 Discounted MCCFR), dense
@@ -17,54 +17,9 @@ moving between 2 and 6 players.
 
 ---
 
-## Current Status
-
-### Heads-up NLHE (stages H1–H5) — wrapped up ✅
-
-A 1B-update dense blueprint (200BB) plays **near break-even against Slumbot**: over 10,000 AIVAT hands,
-raw −85.25 / AIVAT −108.31 mbb/g with confidence intervals crossing 0 (as expected, not statistically
-significant). The full LCFR / batched-parallel / dense backend + v4 bucket + AIVAT evaluation chain is
-verified end-to-end. Only trailing action left is ongoing Slumbot battle-data collection.
-See [`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md).
-
-### 6-max NLHE blueprint-only (route A, 100BB) — main line 🚧
-
-Kicked off 2026-05-30. Route A = get the offline self-play blueprint working end-to-end first
-(parameterized game → multi-way abstraction → reuse the N-generic trainer → real head-to-head
-evaluation), **without** real-time depth-limited search as a hard requirement.
-
-| Stage | Focus | Status |
-|---|---|---|
-| S1 | Rules / 6-max profile | closed (100k PokerKit re-run pending) |
-| S2 | Tree sizing + A3×A4 abstraction into production | closed |
-| S3 | Multi-way bucketing (single-opponent buckets reusable ≤3-way) | closed |
-| S4 | 1B dense training + preflop reshape (`--reshape none\|nolimp\|preopen\|preopen-small`) | one round done + independently reviewed |
-| S5 | Off-tree cross-abstraction advisor engine, cross-abstraction h2h, live OpenPoker client | end-to-end smoke passed |
-| S6 | Real-time subgame search MVP | core landed + verified on a branch (not merged) |
-
-Key findings on the 6-max line:
-
-- **6-max is a multi-player general-sum game**, so CFR self-play no longer provably converges to Nash,
-  and LBR/exploitability lose their theoretical meaning (kept only as diagnostics). Quality is judged by
-  **real head-to-head play**, not by an exploitability floor.
-- **Preflop reshape** (dropping non-SB limps + adding a 2.25BB open size) cleaned up preflop dominated-pair
-  flips from ~13% → <1% and shrank the tree up to ~4.2×. A GTO Wizard truth-check confirmed SB limp / AA-limp
-  are correct GTO, not defects.
-- **Real-time search MVP**: the bottleneck is **blueprint / abstraction quality**, not the search root —
-  clean, well-trained nodes (flop-first) stay neutral, while naively widening the trigger to all post-flop
-  nodes regresses on a weak base.
-- **Exploitation Tier 2** (in-process opponent profiling → convergence gate → preflop-width range tilt on the
-  unanchored search path) is behind `--exploit on|vpip|off`, defaulting to `off` (byte-equal with the shipped
-  strategy when off).
-
-See [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md) (main-line acceptance target) and
-[`docs/status_v3.md`](./docs/status_v3.md) (ground-truth code status).
-
----
-
 ## Verified Algorithm Correctness
 
-This is the reusable foundation the 6-max line builds on. Each row has an external cross-check
+This is the reusable foundation the solver is built on. Each row has an external cross-check
 (invariant #7: no algorithm change ships without one).
 
 | Item | Status | Evidence |
@@ -129,7 +84,7 @@ cargo test                       # default suite
 cargo test --release -- --ignored  # long-running perf/correctness SLOs + BLAKE3 anchors
 ```
 
-Optional PokerKit cross-validation (used by 6-max stage S1):
+Optional PokerKit cross-validation:
 
 ```bash
 uv venv --python 3.11 .venv-pokerkit
@@ -177,8 +132,8 @@ Read in order of authority (highest first):
 
 1. [`docs/status_v3.md`](./docs/status_v3.md) — ground-truth code status. **Read the correctness table before touching code.**
 2. [`docs/invariants.md`](./docs/invariants.md) — hard code-level constraints.
-3. [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md) — current main-line target (6-max blueprint-only, S1–S6 gates).
-4. [`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md) — heads-up phase (H1–H5), wrapped up.
+3. [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md) — 6-max blueprint-only target (S1–S6 gates).
+4. [`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md) — heads-up phase (H1–H5).
 5. [`docs/aivat_eval.md`](./docs/aivat_eval.md) — AIVAT evaluator details.
 6. [`CLAUDE.md`](./CLAUDE.md) / [`AGENTS.md`](./AGENTS.md) — repo navigation and working rules for coding agents.
 
@@ -187,6 +142,53 @@ Read in order of authority (highest first):
 ## Working Language
 
 Docs and commit messages are in Chinese; Rust identifiers and inline comments are in English (Rust convention).
+
+---
+
+## Project Progress
+
+### Heads-up NLHE (200BB, stages H1–H5)
+
+A 1B-update dense blueprint plays **near break-even against Slumbot**: over 10,000 AIVAT hands,
+raw −85.25 / AIVAT −108.31 mbb/g with confidence intervals crossing 0 (as expected, not statistically
+significant). The full LCFR / batched-parallel / dense backend + v4 bucket + AIVAT evaluation chain is
+verified end-to-end. Current activity is ongoing Slumbot battle-data collection.
+See [`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md).
+
+### 6-max NLHE blueprint-only (route A, 100BB)
+
+Kicked off 2026-05-30. Route A = get the offline self-play blueprint working end-to-end first
+(parameterized game → multi-way abstraction → reuse the N-generic trainer → real head-to-head
+evaluation), **without** real-time depth-limited search as a hard requirement.
+
+| Stage | Focus | Status |
+|---|---|---|
+| S1 | Rules / 6-max profile | closed (100k PokerKit re-run pending) |
+| S2 | Tree sizing + A3×A4 abstraction into production | closed |
+| S3 | Multi-way bucketing (single-opponent buckets reusable ≤3-way) | closed |
+| S4 | 1B dense training + preflop reshape (`--reshape none\|nolimp\|preopen\|preopen-small`) | one round done + independently reviewed |
+| S5 | Off-tree cross-abstraction advisor engine, cross-abstraction h2h, live OpenPoker client | end-to-end smoke passed |
+| S6 | Real-time subgame search MVP | core landed + verified on a branch (not merged) |
+
+Key findings on the 6-max line:
+
+- **6-max is a multi-player general-sum game**, so CFR self-play no longer provably converges to Nash,
+  and LBR/exploitability lose their theoretical meaning (kept only as diagnostics). Quality is judged by
+  **real head-to-head play**, not by an exploitability floor.
+- **Preflop reshape** (dropping non-SB limps + adding a 2.25BB open size) cleaned up preflop dominated-pair
+  flips from ~13% → <1% and shrank the tree up to ~4.2×. A GTO Wizard truth-check confirmed SB limp / AA-limp
+  are correct GTO, not defects.
+- **Real-time search MVP**: the bottleneck is **blueprint / abstraction quality**, not the search root —
+  clean, well-trained nodes (flop-first) stay neutral, while naively widening the trigger to all post-flop
+  nodes regresses on a weak base.
+- **Exploitation Tier 2** (in-process opponent profiling → convergence gate → preflop-width range tilt on the
+  unanchored search path) is behind `--exploit on|vpip|off`, defaulting to `off` (byte-equal with the shipped
+  strategy when off).
+
+See [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md) (acceptance target) and
+[`docs/status_v3.md`](./docs/status_v3.md) (ground-truth code status).
+
+---
 
 ## License
 
