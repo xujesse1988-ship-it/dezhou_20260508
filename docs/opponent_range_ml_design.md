@@ -507,13 +507,25 @@ heuristic_mlrange_parity`（**勿裸 `cargo test`**，1.6GB 机 OOM）。字节�
 证移植零误设。改动仅 `equity.rs`（重构出 `from_strength`，`new` 行为不变，`heuristic9`
 测试 10/10 无回归）+ `mod.rs` 加两模块，默认路径零触碰、byte-equal 守。
 
-M3 判断：**影子半 + Rust 离线前向半 + golden 对拍 均交付**。出闸项「影子命中复现离线
-指标」通过（--verify 逐位 Δ0.000）；「Rust 手写前向 + golden 对拍」通过（两测 800/800
-字节级）。**离线预测已全 Rust 化字节复现 Python**。剩 **Level-2 在线消费**：tokenizer
-（`GameView`→feat）、`equity_weighted`（§2.5）、`RangeConfig`+policy 分流（§2.7）、P0-1
-动作线、`use_ml_range` 翻默认过 sim 回归门——依赖 multi_field §2.5/§2.7 + Phase 1。
-`RangePredictor` trait（observe/predict from `GameView`）是 tokenizer 落地后的薄壳，一并
-归 Level-2。影子模式继续零风险积累 run31+ 标签。
+**⑤ tokenizer 港 + P0-1 地基（2026-07-02 续，均字节级/byte-equal）**：
+- **`src/heuristic/tokenizer.rs`**：`tokenize(&Sample) → Vec<[f64;72]>`，逐义移植
+  `range_featurize.py` 的 72 维 token 特征（CTX/PROF/action/board + prof 双通道 +
+  board_texture + pos_bucket + canon-suit 首现重标号 + MAXTOK=96）。
+  `tests/heuristic_tokenizer_parity.rs`：200 手 4365 token 对 golden feat
+  **max|Δ|=3e-8**（纯 f32↔f64 舍入）。**至此从 `Sample` 起，`tokenizer→range→mlrange`
+  三段全 Rust 化、逐位复现 Python**（Δ 3e-8 / 1e-16 / 3e-16）。
+- **P0-1 地基**（multi_field §4 P0-1 / Phase 1）：`GameView` 增 `seat_actions`（逐座逐
+  街行动线）+ `street_aggressors[0..3]` + 只读访问器，**纯增 / decide 零引用 → byte-equal**
+  （`heuristic9` 10/10 守）。为在线 `GameView→Sample` 适配器备料。
+
+M3 判断：**影子半 + Rust 离线预测管线（tokenizer+range+mlrange）+ golden 对拍 均交付**。
+出闸项「影子命中复现离线指标」通过（--verify 逐位 Δ0.000）；「Rust 手写前向 + golden
+对拍」通过（三测 800/800 字节级）。**离线预测已从 `Sample` 起全 Rust 化字节复现 Python**。
+剩 **Level-2 在线接线**：`GameView→Sample` 适配器（组 `ev[]` 带 c/p/tc/hb 筹码上下文，
+P0-1 行动线已备料）、`equity_weighted`（§2.5）、`RangeConfig`+policy `use_range_vec/
+use_ml_range` 分流（§2.7）、`i_have_initiative` 修复、`use_ml_range` 翻默认过 sim 回归门。
+`RangePredictor` trait（observe/predict from `GameView`）= 适配器落地后的薄壳。影子模式
+继续零风险积累 run31+ 标签。
 
 ## 10. 风险与拍板点
 
