@@ -85,9 +85,15 @@
 > class_axes,causal_logpriors}`），并对 Python 参考（`range_baselines.B2RangeVec`）**golden
 > 对拍字节级通过**（`tests/heuristic_range_parity.rs`，800 快照 max|Δ|=1.1e-16）。配套
 > `EquityEngine::from_strength` 载入 `strength169.json`（Rust 现算 MC 与 Python MT 必不同，
-> 故载表对齐）。**尚未落地**：§2.5 `equity_weighted` 消费端、§2.6 `use_range_vec` 分流、
-> §2.7 `RangeConfig`、§2.9 逐动作序列喂料（依赖 Phase 1 / P0-1）。当前 `range.rs` 由 M3
-> 的离线 golden 对拍消费，未接进 `decide`——接进 = 本节剩余 Level-2 工作。
+> 故载表对齐）。**续（同日）**：§2.1 `RangeVec` + §2.5 `equity_weighted`（加权枚举→CDF
+> →`rng.unit()` 二分，degenerate 对 `equity` max|Δ|=0.011，`tests/heuristic_equity_weighted.rs`）、
+> §2.7 `RangeConfig` + `decide` 分流（`equity_dispatch`）、**在线 ML range**（`GameView::
+> to_range_sample`→tokenizer→`MlRange::predict`→`RangeVec`→`equity_weighted` 接进决策，
+> `use_ml_range` 默认 false，smoke 通）均已落地；P0-1 行动线（`view.rs`）备 §2.9 喂料。
+> **剩**：远端 sim A/B 验 EV 才翻默认；画像 fidelity（`OpponentTable`→prof）；启发式版
+> `build_opp_ranges`（`use_range_vec`，用 `RangeModel` 先验/算子而非 ML）尚未接 `decide`
+> （ML 路径先行）。**注：owner 已解除本引擎「默认 byte-equal」纪律（§2.6），改以 sim/live
+> EV 为准。**
 
 ### 2.1 数据结构
 

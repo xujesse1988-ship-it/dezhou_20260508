@@ -518,14 +518,33 @@ heuristic_mlrange_parity`（**勿裸 `cargo test`**，1.6GB 机 OOM）。字节�
   街行动线）+ `street_aggressors[0..3]` + 只读访问器，**纯增 / decide 零引用 → byte-equal**
   （`heuristic9` 10/10 守）。为在线 `GameView→Sample` 适配器备料。
 
-M3 判断：**影子半 + Rust 离线预测管线（tokenizer+range+mlrange）+ golden 对拍 均交付**。
-出闸项「影子命中复现离线指标」通过（--verify 逐位 Δ0.000）；「Rust 手写前向 + golden
-对拍」通过（三测 800/800 字节级）。**离线预测已从 `Sample` 起全 Rust 化字节复现 Python**。
-剩 **Level-2 在线接线**：`GameView→Sample` 适配器（组 `ev[]` 带 c/p/tc/hb 筹码上下文，
-P0-1 行动线已备料）、`equity_weighted`（§2.5）、`RangeConfig`+policy `use_range_vec/
-use_ml_range` 分流（§2.7）、`i_have_initiative` 修复、`use_ml_range` 翻默认过 sim 回归门。
-`RangePredictor` trait（observe/predict from `GameView`）= 适配器落地后的薄壳。影子模式
-继续零风险积累 run31+ 标签。
+**⑥ Level-2 在线接线（2026-07-02 续，plumbing 全通，EV 待 sim 门）**：把离线管线接进
+活引擎决策路径。四件落地（`use_ml_range` 默认 false）：
+- **`RangeVec` + `equity_weighted`**（§2.1/§2.5，`range.rs`/`equity.rs`）：169 类权重向量
+  + 加权枚举→CDF→`rng.unit()` 二分采样（保留空 range/40 重抽兜底）。degenerate 正确性
+  测：`equity_weighted(from_threshold(thr))` 对 `equity(&[thr])` max|Δ|=0.011<0.02
+  （`tests/heuristic_equity_weighted.rs`）；记录 §2.5「mass/n_alive 保边际 vs 存活均匀」
+  在阻断强类时有界背离（≤0.037）。
+- **`GameView→Sample` 适配器**（`view.rs`）：重放里逐动作记 `events`（c/p/tc/hb 逐字段
+  对齐 `range_dataset_build.py` 防训练/服务偏斜）+ `to_range_sample(opp_seat,prof)`；
+  手算 10 事件精确对拍（`tests/heuristic_gameview_sample.rs`）。
+- **`MlRange` 在线预测器**（`range_online.rs`）：`load`（strength169→`from_strength`→
+  `RangeModel` + 权重 json→`GruForward`，缺文件优雅 None）+ `predict`（当前街快照
+  logprior + `res[street_snap]` + card-removal alive → `mlrange::predict` → 归一 RangeVec）。
+- **decide 分流**（`policy.rs`）：`build_opp_ranges_ml`（座位序同 `build_opp_thresholds`）
+  + `equity_dispatch` 分发翻前/翻后两处 equity；**off 路径逐字节同历史 `equity()`**。
+  `HeuristicBot.ml_range: Option<MlRange>` 构造时按 `use_ml_range` 载入。
+  smoke 测（`tests/heuristic_ml_range_online.rs`）：bot 载入、RangeVec ∑=1、死类≈0、
+  合法决策、off 路径不变。
+
+M3 判断：**影子半 + Rust 离线管线 + golden 对拍 + 在线接线 plumbing 均交付**。
+出闸项「影子命中复现离线指标」「Rust 手写前向 + golden 对拍」全通过（三测 800/800
+字节级）；在线路径 `GameView→…→equity_weighted→决策` smoke 通。**剩：① 远端 sim A/B
+（`use_ml_range` on vs off，mbb/g 不劣才翻默认）——EV 唯一未验证项；② 画像 fidelity
+（`OpponentTable`→`Sample.prof`，现传 None）；③ `i_have_initiative` 过期主动权修复
+（行为变更、随 sim 门）；④ `RangePredictor` trait 薄壳（可选）。影子模式继续零风险积累
+run31+ 标签。**注**：按 owner 决定，启发式引擎不再要求 byte-equal（以 sim/live EV 校验），
+§2.6「默认 byte-equal」纪律对本引擎解除。
 
 ## 10. 风险与拍板点
 
