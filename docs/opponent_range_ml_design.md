@@ -209,6 +209,63 @@ python3 tools/range_baselines.py --slumbot-eval 800             # ~90s（含强�
 
 M0 判断：**ML 立项通过**，进入 M1。
 
+### M1 结果（2026-07-02，已交付）
+
+工具：`tools/range_featurize.py`（jsonl → 序列张量 + B3 特征；核心是**逐前缀因果
+m_prior**——复用 `range_baselines.py` 的 B2b 先验/算子逐事件维护，翻前角色随前缀重算、
+目标翻后动作逐个施算子、fold 冻结；`--parity` 验证残差置零时街末快照与 M0 报告逐位
+一致，test 0.140/0.142/0.142/0.158，差 1 样本 = f16 平局破序——这就是 §6 golden 对拍
+纪律的离线半边）、`tools/range_b3_lgbm.py`、`tools/range_train.py`。环境
+`.venv-rangeml`（torch 2.12 cpu + lightgbm 4.6，进 `.gitignore`）。复现：
+
+```bash
+.venv-rangeml/bin/python tools/range_featurize.py --parity        # ~4.5min
+.venv-rangeml/bin/python tools/range_b3_lgbm.py --live-opp-only --lr 0.02 \
+  --leaves 7 --min-data 80 --ff 0.7 --rounds 800                  # ~10s
+OMP_NUM_THREADS=2 .venv-rangeml/bin/python tools/range_train.py \
+  --lr 5e-4 --epochs 120 --patience 20 --seed 7                   # ~5min（早停 ep32）
+```
+
+**B3（LightGBM 每街聚合特征）**：最优配置（仅 live_opp、强正则）test top-5
+0.147/0.150/0.139/0.154，**非单调且打不过 B2b**（river 0.154 < 0.158）；混辅助源更差
+（0.146@river）；每街 best_iter 仅 3–10——聚合特征喂树模型，翻后基本学不出东西。
+与 §3 预期一致：**反证序列结构必要性**，B3 归档不上线。
+
+**v1 序列模型（GRU d=192 先验残差，0.27M 参数）**：混源训练 18,370 条序列
+（live_opp 1.0 / hero 0.3 / slumbot 0.1，hero/slumbot 仅入 train 切分防同手泄漏），
+run28 早停，CPU 训练 ~7s/epoch。test（run29,30，n=1243）：
+
+| | preflop | flop | turn | river | 单调 |
+|---|---|---|---|---|---|
+| B2b（M0 门槛）| 0.140 | 0.142 | 0.142 | 0.158 | ✅ |
+| **v1 top-5** | **0.161** | **0.171** | **0.175** | **0.183** | ✅ |
+| Δ（配对 bootstrap p）| +0.021 (.059) | +0.030 (.002) | +0.033 (.0008) | +0.024 (.012) | |
+| ΔNLL | −0.29 | −0.25 | −0.23 | −0.23 | 全部 p=0.0001 |
+
+出闸判定（对照 §9 M1 行 + M0 改写的两条）：
+
+1. **分街显著 > B2b：✅**（翻后三街 p≤0.012；preflop +0.021 边缘 p=0.059）。
+2. **单调断言：✅**（0.161→0.171→0.175→0.183；口径同 M0——top-5 逐街，NLL 逐街本就
+   随街上行，B2b/M0 亦然）。
+3. **后街斜率显著拉大：✗**——模型 river−preflop = +0.022 vs B2b +0.019（p=0.81）。
+   增益在四条街上近乎均匀：preflop 的 +0.021 来自画像通道与先验再校准（B1 人群频率
+   0.145 → 模型 0.161），把斜率分母一起抬高了。「翻后序列信息变现」的直接证据是
+   翻后三街对 B2b 的显著 Δ；「斜率拉大」作为遗留课题带入 M2（亮牌记忆 + 预训练
+   都是翻后侧的杠杆）。
+
+消融与稳定性：同配置 3 种子 val snapNLL 4.525/4.528/4.533（选 seed=7）；
+**live_opp-only 消融** val 4.518（最优）/ test river 0.181——混源在摊牌条件评估上
+代价 ≈ 0，但该口径本来就看不见 L1 要修的 fold 手偏差（§2.1），且 test 上混源版
+preflop/flop 反而更好（0.161/0.171 vs 0.150/0.169）→ **保留混源默认**。超参对 val
+不敏感（lr 5e-4–2e-3 / dropout 0.15–0.3 的 4 配置 val NLL 带宽 0.015），过拟合快
+（best epoch 3–22），样本量仍是主约束——预训练（M2）是下一个杠杆。
+
+产物：`artifacts/range_ml/{seq_v1.npz, b3_v1.npz, range_v1_gru.pt, m1_report.md,
+m1_b3_report.md}`（`artifacts/*` 不进 git，npz/ckpt 由上述命令分钟级重建）。
+
+M1 判断：**主出闸通过（显著打赢 B2b + 单调），进入 M2**；斜率课题与 censoring
+对照实验（Slumbot 全知集）一起在 M2 处理。
+
 ## 10. 风险与拍板点
 
 | 风险 | 缓解 |
