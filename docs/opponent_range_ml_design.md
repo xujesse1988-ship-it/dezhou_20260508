@@ -181,7 +181,10 @@ tools/range_censoring_ab.py    # M2：Slumbot 全知集 censoring AB（full/matc
 tools/range_loo_eval.py        # M2：leave-opponents-out 折叠重训评估
 tools/range_shows_sidecar.py   # M2：亮牌记忆侧车（prof.shows → npz，对齐 seq_v1）
 tools/range_rscale_scan.py     # M2：per-street 残差温度扫描（val 选点 test 复评）
-tools/range_export.py          # 权重 → artifacts/range_ml_v1.bin（版本头 + f32）
+tools/range_shadow.py          # M3：手写 numpy 前向（↔torch 对拍）+ 影子模式
+                               #   （--verify 复现离线；--from-runs 跑 live raw 发 range_pred）
+tools/range_golden_dump.py     # M3 §6：golden 对拍 oracle（s+feat+logprior+alive+p+pred → json）
+tools/range_export.py          # M3 §6：GRU 权重 → range_v1_gru_weights.json（f64-repr，Rust 前向载入）
 tools/heuristic9_sim.rs        # 加 --dump-hands：双侧底牌 + 事件流 jsonl（全知 sim 源）
 ```
 
@@ -196,7 +199,7 @@ tools/heuristic9_sim.rs        # 加 --dump-hands：双侧底牌 + 事件流 jso
 | **M0 摸底**（先做，~2 天）| dataset build + 基线阶梯 B0–B2 + 评估 harness | 拿到 **B2 手写 tracker 的分街 top-5 命中率**——这个数决定 ML 的价值空间；若 B2 已经很高，ML 立项缩水也是合理结论 |
 | **M1 v1 模型** | B3 + 序列网络（统计向量通道，先不做亮牌记忆）| 时间切分测试集上分街显著 > B2；单调断言通过 |
 | **M2 画像强化** | 亮牌记忆 attention + Slumbot/sim 预训练→live 微调 + LOO 评估 + censoring 对照实验（Slumbot 全知集）| LOO 不崩（未见对手 ≥ B2）；量化 censoring 伤害，拍板要不要 L2 |
-| **M3 接线** | Rust 手写前向 + golden 对拍 + `RangePredictor` trait + 影子模式 live 跑 | 影子命中复现离线指标；随后 `use_ml_range=true` 过 sim 回归门（多 seed 不退）才翻默认 |
+| **M3 接线** | Rust 手写前向 + golden 对拍 + `RangePredictor` trait + 影子模式 live 跑 | 影子命中复现离线指标（**✅**，`range_shadow.py`）+ **Rust 手写前向 + golden 对拍（✅ 2026-07-02，`range.rs`/`mlrange.rs`，两测 800/800 字节级）**；剩 Level-2 在线消费（tokenizer + `equity_weighted` + P0-1 + `use_ml_range` 翻默认过 sim 门）依赖 multi_field §2.5/§2.7 + Phase 1 |
 | **M4 v2（可选）** | 生成式 policy 网 + 隐变量边际似然（L2 censoring 修复）| 仅当 M2 对照实验显示 censoring 伤害显著 |
 
 与 multi_field 路线图的关系：M0–M2 纯离线零依赖可立即开工；M3 依赖其 Phase 1（P0-1 动作线）+ Phase 3（`RangeVec`/`equity_weighted`）。
@@ -415,6 +418,102 @@ M2 判断：**两个出闸项通过（LOO 不崩 + censoring 量化完成、L2 �
 遗留：后街斜率未拉大（三杠杆均未触动）——与 shows v2（线摘要）、sim 族群预训练
 同判：当前 5k 样本 + 类信号已见顶，等数据侧扩容。**进入 M3（Rust 前向 + golden
 对拍 + 影子模式）**。
+
+### M3 结果（2026-07-02，影子模式 + Rust 手写前向 + golden 对拍 均已交付）
+
+工具：`tools/range_shadow.py`（`.venv-rangeml` 内跑，零 EV 风险——**不碰 live 决策
+路径**，决策仍出自 Rust advisor）。复现：
+
+```bash
+.venv-rangeml/bin/python tools/range_shadow.py --parity-torch   # 手写前向对拍
+.venv-rangeml/bin/python tools/range_shadow.py --verify         # 复现离线指标（出闸）
+.venv-rangeml/bin/python tools/range_shadow.py --from-runs run30 \
+  --emit h9_live_run30.range_pred.jsonl                         # 影子跑 live run + 发记录
+```
+
+**依赖复核（历史起点，已部分消解）**：M3 起初拆两半——① 影子模式零依赖零 EV 风险；
+② Rust 接线半（手写前向 + golden 对拍 + `RangePredictor` trait + `use_ml_range` 翻默认）
+当时的关键卡点是 `m_prior`（手写 B2b tracker，§4.2）**只在 Python**
+（`range_baselines.B2RangeVec`），Rust 侧无先验可对拍/可消费。**本轮已把该卡点消解**：
+移植 §2 RangeVec 的 prior/op + GRU 前向进 Rust 并 golden 对拍逐位通过（见下 ④）。
+**离线预测路径（forward + m_prior + card-removal）已全 Rust 化并字节级复现 Python**；
+仅剩「在线消费」半（tokenizer 从 `GameView` 出特征 + `equity_weighted` 喂 equity +
+P0-1 动作线 + `use_ml_range` 门控翻默认过 sim 门）留作 Level-2，仍依赖 multi_field
+§2.5/§2.7 + Phase 1（P0-1）。
+
+**① 手写前向（numpy）——Rust 端的参考实现**：`NpResidualGRU` 逐义移植
+`range_train.ResidualGRU`（输入线性+tanh → 单层 GRU → 零残差头 → `logits = log_prior
++ s·f_θ + log alive`，死类 −∞）。`--parity-torch`：test 切分 64 样本对 torch 原版逐
+元素对拍残差 logits，**max|Δ|=2.0e-6**（✅ <1e-3）。这就是 §6 golden 对拍的**Python
+侧半边**——待 Rust 前向落地，对拍的就是它（Rust↔numpy，两端皆手写、无框架依赖）。
+
+**② 出闸项——影子命中复现离线指标：✅ 通过。** `--verify` 从 `seq_v1.npz` 取
+val/test 切分（== run28 / run29,30，与训练 eval 完全同输入 f16 特征），用手写 numpy
+前向复算街末快照：val+test 共 **8 个街×切分格逐位复现 m1_report（Δ=+0.000，rscale=0.8）**
+——唯一差异源（numpy vs torch 前向）已被 ① 界定到 2e-6。另在**现场特征化路径**
+（raw run 因果重建 + `SampleFeaturizer`，f32）上对 run29,30 的 1,243 个已见手复算，
+逐街 top-5 与离线差 ≤0.0004（≤0.5 手，f16↔f32 漂移），证现场管线与 npz 管线同源。
+
+**③ 影子跑 live（真实部署分布 + 新标签积累）**：`--from-runs` 用
+`range_dataset_build.parse_live_run` 按 run 升序因果重放 profiles（与 `live_opp.jsonl`
+同代码路径，新 run 落 raw 即被捡起），现场特征化后发 `range_pred` 侧车记录（每样本每
+街末：top-5 类 + 命中 + rank + q）。跑时**恰逢 run30 live 会话在跑**（`heuristic9_play.py`
+--seats 6 --exploit 正写 `h9_live_run30.raw.jsonl`），故 raw 已从建库时的 167 手长到
+790+ 手——工具自动按 `(hid,tseat)` 把样本拆 **seen（已进 M1 数据集，复现口径）** vs
+**new（建库后新亮牌手，真实部署分布）**：
+
+| run30 `new`（n≈491，genuine unseen）| preflop | flop | turn | river |
+|---|---|---|---|---|
+| top-5 | 0.127 | 0.139 | 0.149 | 0.160 |
+| q 中位 | 53.6% | 66.8% | 72.3% | 74.0% |
+
+new 桶单调、远超 B0 地板（~0.03），但逐街较 M1 test（0.163/0.172/0.178/0.183）低
+2–4pp——n≈491 上 SE≈1.6–1.7pp，preflop 差约 2σ、翻后 <1.5σ，**大体在噪声内、含轻微
+场型漂移嫌疑**（run30 当前 exploit 场的对手混合与 run24–28 不同）。**作为影子监控点
+留观**，随 run31+ 标签积累复评（这正是影子模式的用途：零 EV 拿真实分布命中率）。
+
+**接线取舍（本轮已定）**：`range_pred` 走**独立侧车文件**（`h9_live_run30.range_pred.jsonl`
+/ `artifacts/range_ml/shadow_run2930.jsonl`），**不**内联进 live 正在写的
+`h9_live_runN.jsonl`（并发追写有竞态；侧车零风险且与决策路径完全解耦）。持续监控 =
+建库后周期性重跑 `--from-runs auto`（或 `/loop`/cron 包一层），无需常驻 torch 进正式
+决策进程（本机 3.3GB + §4.4 推理应下沉 Rust 的纪律）。
+
+**④ Rust 手写前向 + golden 对拍（§6，本轮交付，字节级通过）**：把离线预测管线全
+移植进 Rust 并对 Python 逐位对拍。三件落地：
+
+- **`src/heuristic/range.rs`**：`RangeModel`（§2 RangeVec 的先验/算子）——移植
+  `B2RangeVec.prior`（角色模板 + `range_threshold_shift` 画像平移）+ `op`（bet/raise/
+  call/check 似然）+ `class_axes`（复用 Rust `features::made_class`/`draws`）+ **因果
+  m_prior 重放**（逐义复刻 `range_featurize.SampleFeaturizer.run` 的 token 流 + 街末
+  snaps）。**关键卡点解法**：strength169 表 Rust 用 wyrand 现算与 Python MT 必不同 →
+  新增 `EquityEngine::from_strength([f64;169])`，**载入 Python 缓存的 `strength169.json`**
+  （其余基元 `canonical_index`/`combo_weight`/`made_class`/`draws`/`threshold_for_top`
+  经查已与 Python 逐义一致，一旦同表即同值）。
+- **`src/heuristic/mlrange.rs`**：`GruForward`（纯 f64 手写：输入线性+tanh → 单层
+  GRU 门序 [r,z,n] → 线性头，逐义复刻 `range_shadow.NpResidualGRU`）+ `predict`
+  （`softmax(log_prior + rscale·residual + log alive`，死类 −∞）。权重由
+  `tools/range_export.py` 从 ckpt 导出为 `range_v1_gru_weights.json`（f64-repr）。
+- **golden 对拍**（`tools/range_golden_dump.py` 产 `artifacts/range_ml/golden_mprior.json`
+  = 200 手跨 run 均匀采样 / 800 街末快照，含 `s`/feat/logprior/alive/`p`/`pred`）+ 两个
+  CI 单测：
+  - `tests/heuristic_range_parity.rs`（m_prior）：Rust 因果 m_prior 复现 B2b 预测
+    `p`，**800/800，max|Δp|=1.1e-16，top-5 全一致**；
+  - `tests/heuristic_mlrange_parity.rs`（全 ML 预测）：Rust m_prior + Rust GRU 前向 +
+    card-removal 复现 rscale=0.8 的 `pred`，**800/800，max|Δpred|=3.3e-16，top-5 全一致**。
+
+复现：`.venv-rangeml/bin/python tools/range_export.py && .venv-rangeml/bin/python
+tools/range_golden_dump.py`，再 `cargo test --test heuristic_range_parity --test
+heuristic_mlrange_parity`（**勿裸 `cargo test`**，1.6GB 机 OOM）。字节级（≈f64 舍入）
+证移植零误设。改动仅 `equity.rs`（重构出 `from_strength`，`new` 行为不变，`heuristic9`
+测试 10/10 无回归）+ `mod.rs` 加两模块，默认路径零触碰、byte-equal 守。
+
+M3 判断：**影子半 + Rust 离线前向半 + golden 对拍 均交付**。出闸项「影子命中复现离线
+指标」通过（--verify 逐位 Δ0.000）；「Rust 手写前向 + golden 对拍」通过（两测 800/800
+字节级）。**离线预测已全 Rust 化字节复现 Python**。剩 **Level-2 在线消费**：tokenizer
+（`GameView`→feat）、`equity_weighted`（§2.5）、`RangeConfig`+policy 分流（§2.7）、P0-1
+动作线、`use_ml_range` 翻默认过 sim 回归门——依赖 multi_field §2.5/§2.7 + Phase 1。
+`RangePredictor` trait（observe/predict from `GameView`）是 tokenizer 落地后的薄壳，一并
+归 Level-2。影子模式继续零风险积累 run31+ 标签。
 
 ## 10. 风险与拍板点
 

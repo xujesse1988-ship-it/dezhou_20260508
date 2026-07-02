@@ -7,8 +7,10 @@
 pub mod config;
 pub mod equity;
 pub mod features;
+pub mod mlrange;
 pub mod opponent;
 pub mod policy;
+pub mod range;
 pub mod view;
 
 pub use config::HeuristicConfig;

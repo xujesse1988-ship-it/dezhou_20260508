@@ -93,6 +93,13 @@ impl EquityEngine {
             let (c1, c2) = representative_hand(idx);
             *slot = preflop_equity_vs_random(c1, c2, table_samples, &mut rng);
         }
+        EquityEngine::from_strength(strength)
+    }
+
+    /// 直接由给定的 169 强度向量构建（例如从 Python 缓存的 `strength169.json` 载入），
+    /// 重建 `sorted_strength`/`total_combos`，使 [`threshold_for_top`](Self::threshold_for_top)
+    /// 与强度来源一致（跨语言字节级对拍前提）。
+    pub fn from_strength(strength: [f64; 169]) -> EquityEngine {
         // combo 权重：pair=6, suited=4, offsuit=12。
         let mut sorted: Vec<(f64, u32)> = Vec::with_capacity(169);
         let mut total = 0u32;
