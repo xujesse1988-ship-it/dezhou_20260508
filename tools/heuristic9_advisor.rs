@@ -58,6 +58,7 @@ struct Args {
     samples: Option<u32>,
     seed: Option<u64>,
     debug: bool,
+    no_ml_range: bool,
 }
 
 fn parse_args() -> Args {
@@ -67,6 +68,7 @@ fn parse_args() -> Args {
         samples: None,
         seed: None,
         debug: false,
+        no_ml_range: false,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -90,6 +92,11 @@ fn parse_args() -> Args {
             }
             "--debug" => {
                 a.debug = true;
+                i += 1;
+            }
+            // live 默认开 ML range；此 flag 退回标量路径（A/B 或应急兜底用）。
+            "--no-ml-range" => {
+                a.no_ml_range = true;
                 i += 1;
             }
             // drop-in 兼容：未知 flag 跳过（带值的也跳过其值）。
@@ -127,6 +134,9 @@ fn build_config(args: &Args) -> HeuristicConfig {
         cfg.equity.seed = s;
         cfg.mixing.seed ^= s;
     }
+    // live advisor 默认开 ML range（对手 169 类 range 预测喂加权 equity）；
+    // `--no-ml-range` 退回标量阈值路径。缺 artifacts 时 HeuristicBot::new 优雅回落。
+    cfg.range.use_ml_range = !args.no_ml_range;
     cfg
 }
 
@@ -167,8 +177,17 @@ fn feed_observe(bot: &mut HeuristicBot, rec: &ObserveRecord) {
 
 fn run() -> Result<(), String> {
     let args = parse_args();
+    let want_ml = !args.no_ml_range;
     let cfg = build_config(&args);
     let mut bot = HeuristicBot::new(cfg);
+    // 明确 ML range 状态：想开但没载入（缺 artifacts）→ 静默退化成标量，须让 live 操作者看见。
+    match (want_ml, bot.ml_range.is_some()) {
+        (true, true) => eprintln!("[heuristic9] ML range: ON（对手 range 预测已载入）"),
+        (true, false) => eprintln!(
+            "[heuristic9] ⚠ ML range 想开但未载入（artifacts 缺失？）→ 退回标量 equity"
+        ),
+        (false, _) => eprintln!("[heuristic9] ML range: OFF（--no-ml-range）"),
+    }
 
     // 加载持久对手画像（累积经验）。
     if let Some(path) = &args.opp_profile {
