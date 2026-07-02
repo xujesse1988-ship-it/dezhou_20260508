@@ -1,5 +1,5 @@
-//! `equity_weighted`（加权 range 消费面，`docs/multi_field_strategy_design.md` §2.5）
-//! 的**正确性**检验——注意是数值逼近，非 byte-equal（设计 §2.6 point 3：新旧路径 CDF
+//! `equity_weighted`（加权 range 消费面，走读见 `docs/heuristic9_strategy.md`「主货币」节）
+//! 的**正确性**检验——注意是数值逼近，非 byte-equal（新旧路径 CDF
 //! 二分 vs `rng.below` 消费 RNG 不同）。
 //!
 //! 主锚点（degenerate 自检）：`equity_weighted(&[RangeVec::from_threshold(thr)])` 应与

@@ -1,4 +1,4 @@
-//! P0-1：`GameView` 逐座行动线记忆 + 逐街 aggressor 暴露（docs/multi_field_strategy_design.md §4 P0-1）。
+//! P0-1：`GameView` 逐座行动线记忆 + 逐街 aggressor 暴露（docs/scenario_heuristic_design.md §7 P0-1）。
 //!
 //! 纯增字段/访问器，默认决策不读它们（byte-equal 由构造保证）。这里验证：
 //! - `seat_actions(seat)` 返回精确时序 + 权威街标；

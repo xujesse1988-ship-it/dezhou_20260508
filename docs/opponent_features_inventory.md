@@ -8,7 +8,8 @@
 >   本文是它的超集与升级方向。
 > - `docs/opponent_range_ml_design.md`：ML range 层。本文 §D（摊牌真值）正是它的标签来源；
 >   本文的 per-node 频率是它「手写 Bayesian tracker 似然」的数据化对象。
-> - `docs/multi_field_strategy_design.md` §2：加权 range `RangeVec` 的消费端。
+> - `docs/scenario_heuristic_design.md`：策略层的场景森林设计——本文 §0.5 的 per-opponent 节点计数表
+>   与其场景 key **共享坐标系**（其 §5.2）；加权 range `RangeVec` 消费端走读见 `docs/heuristic9_strategy.md`。
 >
 > 落地纪律照旧（`docs/heuristic9_design.md` §4、`CLAUDE.md`）：正确性优先；任何特征进**剥削决策**前，
 > 必须过 sim A/B 门（mbb/g 不劣），不能拍脑袋接。**本文只管「采什么」，不预设「怎么用」。**

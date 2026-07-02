@@ -2,7 +2,7 @@
 
 > 一句话：用一个**小型因果序列模型**（<1M 参数），以「手写 Bayesian tracker 的 log 先验 + 网络残差」的形式，在牌局的**每个事件位置**输出对手 169 类手牌的权重分布；showdown 亮牌做标签，对手画像（近 50 手 + 亮牌记忆）做条件；离线打赢手写 tracker 才接进引擎。
 >
-> 定位：本文是**前瞻设计草案**。它与 `docs/multi_field_strategy_design.md` §2（加权 range `RangeVec`）**同轴互补**——§2 的手写似然是本文 ML 模型的**先验锚、冷启动回退、以及必须打赢的 baseline**；ML 学的本质就是 §2 里那组手工猜的似然参数（`a_v / a_d / κ…`，`multi_field_strategy_design.md` §2.3）的数据版。
+> 定位：本文是**前瞻设计草案**。它与**加权 range `RangeVec`**（原 `multi_field_strategy_design.md` §2——**该文档已于 2026-07-02 废止**，由 `docs/scenario_heuristic_design.md` 代替、原文见 git 历史；§2 设计已落地进 `src/heuristic/range.rs`/`equity.rs`，走读见 `docs/heuristic9_strategy.md`「对手 range 建模详解」。**本文后续所有「multi_field §2 / §2.x」引用均指该旧文档章节**）**同轴互补**——§2 的手写似然是本文 ML 模型的**先验锚、冷启动回退、以及必须打赢的 baseline**；ML 学的本质就是 §2 里那组手工猜的似然参数（`a_v / a_d / κ…`，现 `RangeModel::op`，`range.rs`）的数据版。
 >
 > 落地纪律照旧：离线先行，接线时门控 opt-in、默认 byte-equal、sim 回归门裁决（`docs/heuristic9_design.md` §4）。
 

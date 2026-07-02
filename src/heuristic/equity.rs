@@ -274,7 +274,7 @@ impl EquityEngine {
         win_sum / samples as f64
     }
 
-    /// **加权版多人蒙特卡洛 equity**（`docs/multi_field_strategy_design.md` §2.5）：
+    /// **加权版多人蒙特卡洛 equity**（走读见 `docs/heuristic9_strategy.md`「主货币」节）：
     /// 与 [`equity`](Self::equity) 完全同构，唯一区别是每个对手的隐藏牌不再来自「硬阈值
     /// 过滤 + 均匀抽」，而来自 [`RangeVec`] 的**加权 CDF**——类质量 `mass[idx]` 平摊到
     /// 「去死牌后存活的具体 combo」，再按累积权重二分采样。听牌 / polar 形态由 `mass` 表达。

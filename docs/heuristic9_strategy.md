@@ -102,7 +102,7 @@ equity 仍是主货币，这三个信号的作用是**区分 equity 相同、但
 
 **③ 组合先验 + 残差 + 牌面移除。** `predict` 把三样东西拧成 logits（`mlrange::predict`，`src/heuristic/mlrange.rs:216`）：
 
-- **因果 m_prior**（`RangeModel::causal_logpriors(&Sample)`，`src/heuristic/range.rs:486`）= 一个**手写贝叶斯追踪器**（`docs/multi_field_strategy_design.md` §2）：翻前按角色（`role_now`，`range.rs:668`）取模板先验（`RangeModel::prior`，`range.rs:380`），翻后按对手每个动作乘一个**似然算子**（`RangeModel::op`，`range.rs:399`——bet/raise/call/check 各有极性：大注抬价值、跟注偏中段、check 偏两极）。角色模板阈值就是上面那套 `TPL_FRAC`（`range.rs:34`），经 `EquityEngine::threshold_for_top` 折成强度线。强度表由 `strength169.json` 经 `EquityEngine::from_strength` 载入。这是「B2b」基线，可解释、零数据可用，充当**先验锚**。
+- **因果 m_prior**（`RangeModel::causal_logpriors(&Sample)`，`src/heuristic/range.rs:486`）= 一个**手写贝叶斯追踪器**（原 multi_field 草案 §2，该文档已由 `docs/scenario_heuristic_design.md` 代替）：翻前按角色（`role_now`，`range.rs:668`）取模板先验（`RangeModel::prior`，`range.rs:380`），翻后按对手每个动作乘一个**似然算子**（`RangeModel::op`，`range.rs:399`——bet/raise/call/check 各有极性：大注抬价值、跟注偏中段、check 偏两极）。角色模板阈值就是上面那套 `TPL_FRAC`（`range.rs:34`），经 `EquityEngine::threshold_for_top` 折成强度线。强度表由 `strength169.json` 经 `EquityEngine::from_strength` 载入。这是「B2b」基线，可解释、零数据可用，充当**先验锚**。
 - **GRU 学习残差**（`GruForward::residual(feat)`，`src/heuristic/mlrange.rs:137`）= 一个小的单层 GRU，吃 token 序列、在 m_prior 之上输出一个**学到的残差**。它是纯 f64 手写前向，逐义移植自离线 torch 模型（golden 字节级对拍）。
 - **合成** `mlrange::predict(logprior, residual, alive, rscale)`：`logits = logprior + rscale·residual + log(alive)`，`softmax` 归一。`rscale` 默认 **0.8**（`RangeConfig.ml_rscale`，`config.rs:60`）；**死类做牌面移除**——去死牌（hero 底牌 + 当前 board，`alive_counts`，`range_online.rs:109`）后存活 combo 数为 0 的类掩 `−1e30`（`mlrange.rs:229`），不可能的手严格零质量，部分阻断的手按存活 combo 折减。
 

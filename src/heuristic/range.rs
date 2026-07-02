@@ -286,10 +286,10 @@ pub(crate) fn combo_weight(idx: usize) -> u32 {
 }
 
 /// 单个对手在某决策点的 range：169 类的归一化质量分布
-/// （`docs/multi_field_strategy_design.md` §2.1）。下标轴 = [`canonical_index`]：
+/// （走读见 `docs/heuristic9_strategy.md`「对手 range 建模详解」）。下标轴 = [`canonical_index`]：
 /// pair 0..12 / suited 13..90 / offsuit 91..168。
 /// [`EquityEngine::equity_weighted`](super::equity::EquityEngine::equity_weighted)
-/// 按类质量平摊到「去死牌后存活的具体 combo」采样对手手牌（§2.5）。
+/// 按类质量平摊到「去死牌后存活的具体 combo」采样对手手牌。
 #[derive(Clone, Debug)]
 pub struct RangeVec {
     /// mass[idx] = 该 169 类整体占对手 range 的概率质量；`normalize` 后 ∑mass == 1。
