@@ -15,19 +15,6 @@ and reproducible byte-for-byte. Built with Rust 2021, toolchain pinned to `1.95.
 
 ---
 
-## Results at a glance
-
-| Track | Setup | Result |
-|---|---|---|
-| Heads-up 200BB | 1B-update blueprint vs Slumbot, 10,000 AIVAT hands | raw −85.25 / AIVAT −108.31 mbb/g — CI crosses 0, near break-even |
-| 6-max 100BB | blueprint vs the live OpenPoker pool | evaluation ongoing; no strong public reference bot to measure against |
-
-Heads-up is the finished baseline; 6-max is the current line of work. Full numbers and method are in
-[`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md) and
-[`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md).
-
----
-
 ## The hard problems
 
 Building a No-Limit Hold'em solver mostly comes down to getting past a handful of problems that don't
@@ -213,12 +200,15 @@ or a byte-equal anchor from a known-good run. The full evidence grid (which test
 ## Project status
 
 Heads-up (200BB, stages H1–H5) is the finished baseline: the full training and evaluation chain is
-verified end to end, and the blueprint plays near break-even against Slumbot (see results above). Current
-activity there is ongoing Slumbot battle-data collection.
+verified end to end, and the blueprint plays near break-even against Slumbot — over 10,000 AIVAT hands,
+raw −85.25 / AIVAT −108.31 mbb/g, with confidence intervals crossing 0. Current activity there is ongoing
+Slumbot battle-data collection. See
+[`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md).
 
 6-max blueprint-only (route A, 100BB) is the current line, kicked off 2026-05-30 — get the offline
 self-play blueprint working end to end first (parameterized game → multi-way abstraction → seat-generic
 trainer → real head-to-head evaluation), with real-time search as a follow-on rather than a hard gate.
+It's evaluated by live play against the OpenPoker pool, since there's no strong public 6-max reference bot.
 
 | Stage | Focus | Status |
 |---|---|---|
@@ -229,7 +219,8 @@ trainer → real head-to-head evaluation), with real-time search as a follow-on 
 | S5 | Cross-abstraction advisor engine, cross-abstraction h2h, live OpenPoker client | end-to-end smoke passed |
 | S6 | Real-time subgame search MVP | core landed + verified on a branch (not merged) |
 
-Ground-truth code status: [`docs/status_v3.md`](./docs/status_v3.md).
+Acceptance target: [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md). Ground-truth code
+status: [`docs/status_v3.md`](./docs/status_v3.md).
 
 ---
 
