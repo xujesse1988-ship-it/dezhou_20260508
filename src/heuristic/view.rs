@@ -157,6 +157,17 @@ pub enum PosBucket {
 // GameView
 // ===========================================================================
 
+/// P0-1：单座逐动作记录（时序，带权威街标）。行动线记忆的原子单位。
+#[derive(Clone, Debug)]
+pub struct SeatAction {
+    /// 动作所属街（0=preflop..3=river）。
+    pub street: u8,
+    /// 原始动作字符串（未小写化，保留 driver 原样）。
+    pub action: String,
+    /// raise/bet 的本轮投入绝对总额（其余动作 None）。
+    pub to: Option<u64>,
+}
+
 /// 单座视角的重建下注状态。所有筹码量 = OpenPoker 单位（chips）；用 `*_bb()` 取 bb 标度。
 #[derive(Clone, Debug)]
 pub struct GameView {
@@ -199,6 +210,13 @@ pub struct GameView {
     pub valid: ValidActions,
     /// 座位 → 玩家名（剥削画像用）。
     pub names: std::collections::BTreeMap<u8, String>,
+
+    /// P0-1：每座本手全部动作（下标 = 座位号，len = num_seats）。内层按时序，带权威街标。
+    /// 纯增记忆，默认决策不读它 → byte-equal。
+    pub seat_actions: Vec<Vec<SeatAction>>,
+    /// P0-1：逐街最后加注者（0=preflop..3=river）。重放本就算了 `aggressor_by_street`，
+    /// 但历史只导出 preflop + 当前街；这里补全被丢弃的 flop/turn/river aggressor。
+    pub street_aggressors: [Option<u8>; 4],
 }
 
 impl GameView {
@@ -243,6 +261,8 @@ impl GameView {
         let mut committed_total = vec![0u64; n];
         let mut committed_round = vec![0u64; n];
         let mut has_acted = vec![false; n];
+        // P0-1：逐座动作线累加器（纯增，不参与任何既有计算/分段/决策）。
+        let mut seat_actions: Vec<Vec<SeatAction>> = vec![Vec::new(); n];
 
         // 发盲注。
         let post =
@@ -441,6 +461,15 @@ impl GameView {
                 }
             }
 
+            // P0-1：记录本动作到该座动作线。街标沿用既有推导（权威 a.street 优先，缺省用重放
+            // 当前街 street_idx）——只读，不改任何既有变量/分段/决策。
+            let act_street = a.street.map(|st| st.min(3)).unwrap_or(street_idx.min(3));
+            seat_actions[s].push(SeatAction {
+                street: act_street,
+                action: a.action.clone(),
+                to: a.to,
+            });
+
             if !use_street_labels
                 && round_closed(
                     &folded,
@@ -500,6 +529,16 @@ impl GameView {
         };
         let preflop_raised = preflop_aggressor.is_some();
 
+        // P0-1：暴露被丢弃的逐街 aggressor。已完成街在 aggressor_by_street 里；当前街的 aggressor
+        // 仍留在 cur_aggressor（尚未 flush，与上面 preflop_aggressor 的当前街特例同理），补进当前槽。
+        let mut street_aggressors = aggressor_by_street;
+        {
+            let cur = (street_idx as usize).min(3);
+            if street_aggressors[cur].is_none() {
+                street_aggressors[cur] = cur_aggressor;
+            }
+        }
+
         GameView {
             num_seats: n as u8,
             my_seat: (req.my_seat as usize % n) as u8,
@@ -524,6 +563,8 @@ impl GameView {
             preflop_num_raises: preflop_raises,
             valid: req.valid.clone(),
             names: req.names.clone(),
+            seat_actions,
+            street_aggressors,
         }
     }
 
@@ -683,5 +724,34 @@ impl GameView {
         } else {
             0
         }
+    }
+
+    // --- P0-1：行动线记忆只读访问器（不参与决策）---
+
+    /// 某座本手全部动作（时序，带权威街标）。越界返回空切片。
+    pub fn seat_actions(&self, seat: usize) -> &[SeatAction] {
+        self.seat_actions
+            .get(seat)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// 指定街（0=preflop..3=river）的最后加注者。越界或无人加注返回 None。
+    pub fn aggressor_on_street(&self, street: u8) -> Option<u8> {
+        self.street_aggressors
+            .get(street as usize)
+            .copied()
+            .flatten()
+    }
+
+    /// 某座在指定街的动作（时序过滤）。
+    pub fn seat_street_actions(
+        &self,
+        seat: usize,
+        street: u8,
+    ) -> impl Iterator<Item = &SeatAction> {
+        self.seat_actions(seat)
+            .iter()
+            .filter(move |sa| sa.street == street)
     }
 }
