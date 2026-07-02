@@ -8,6 +8,8 @@ use crate::heuristic::config::HeuristicConfig;
 use crate::heuristic::equity::{EquityEngine, Rng};
 use crate::heuristic::features::{draws, made_class, texture, MadeClass};
 use crate::heuristic::opponent::{ExploitAdjust, OpponentTable};
+use crate::heuristic::range::RangeVec;
+use crate::heuristic::range_online::MlRange;
 use crate::heuristic::view::{GameView, PosBucket};
 
 /// 决策结果。`Raise(to_chips)` 的 to 是 OpenPoker 单位的 raise-to 绝对额。
@@ -110,6 +112,43 @@ pub fn build_opp_thresholds(
     out
 }
 
+/// 为每个仍在场对手用在线 ML 流水线建 169 类 [`RangeVec`]，喂
+/// [`EquityEngine::equity_weighted`]。**座位序与 [`build_opp_thresholds`] 完全一致**
+/// （同样跳过 `my_seat` 与已弃座、同样 `0..num_seats` 升序），保证加权 equity 的对手
+/// 顺序与标量路径逐一对应。
+pub fn build_opp_ranges_ml(view: &GameView, ml: &MlRange) -> Vec<RangeVec> {
+    let mut out = Vec::new();
+    let n = view.num_seats as usize;
+    for s in 0..n {
+        if s == view.my_seat as usize || view.folded[s] {
+            continue;
+        }
+        out.push(ml.predict(view, s));
+    }
+    out
+}
+
+/// 主 equity 货币的分发：`Some(ml)`（`use_ml_range` 开且已载入）→ ML range 加权 equity；
+/// `None` → 原标量阈值 equity（与历史路径逐字节一致）。两侧 `samples`/`seed` 相同；对手
+/// 顺序在 [`build_opp_ranges_ml`] 与 [`build_opp_thresholds`] 间保持一致。
+fn equity_dispatch(
+    view: &GameView,
+    eq: &EquityEngine,
+    ml: Option<&MlRange>,
+    opp_thr: &[f64],
+    hole: [crate::core::Card; 2],
+    samples: u32,
+    seed: u64,
+) -> f64 {
+    match ml {
+        Some(m) => {
+            let ranges = build_opp_ranges_ml(view, m);
+            eq.equity_weighted(hole, &view.board, &ranges, samples, seed)
+        }
+        None => eq.equity(hole, &view.board, opp_thr, samples, seed),
+    }
+}
+
 /// 聚合活跃对手的剥削调整。
 fn exploit_adjust(view: &GameView, cfg: &HeuristicConfig, opp: &OpponentTable) -> ExploitAdjust {
     let mut names = Vec::new();
@@ -133,6 +172,7 @@ pub fn decide(
     eq: &EquityEngine,
     cfg: &HeuristicConfig,
     opp: &OpponentTable,
+    ml: Option<&MlRange>,
 ) -> Decision {
     let hole = match view.hole {
         Some(h) => h,
@@ -146,9 +186,9 @@ pub fn decide(
     let opp_thr = build_opp_thresholds(view, eq, cfg, opp);
 
     let d = if view.street == Street::Preflop {
-        preflop_decide(view, eq, cfg, &adj, &opp_thr, hole, &mut rng)
+        preflop_decide(view, eq, cfg, &adj, &opp_thr, ml, hole, &mut rng)
     } else {
-        postflop_decide(view, eq, cfg, &adj, &opp_thr, hole, &mut rng)
+        postflop_decide(view, eq, cfg, &adj, &opp_thr, ml, hole, &mut rng)
     };
     legalize(d, view)
 }
@@ -216,12 +256,14 @@ fn safe_fallback(view: &GameView, why: &str) -> Decision {
 // 翻前
 // ===========================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn preflop_decide(
     view: &GameView,
     eq: &EquityEngine,
     cfg: &HeuristicConfig,
     adj: &ExploitAdjust,
     opp_thr: &[f64],
+    ml: Option<&MlRange>,
     hole: [crate::core::Card; 2],
     rng: &mut Rng,
 ) -> Decision {
@@ -330,10 +372,12 @@ fn preflop_decide(
     // flat call：底池赔率驱动（修 BB 防守漏洞）。call_thr 只作为「想 flat 强牌」的补充入口，
     // 不作必要条件——否则 BB 拿好赔率也弃掉便宜防守。
     if view.valid.can_call {
-        let real_eq = eq.equity(
-            hole,
-            &view.board,
+        let real_eq = equity_dispatch(
+            view,
+            eq,
+            ml,
             opp_thr,
+            hole,
             cfg.equity.samples / 2 + 1,
             situation_seed(view, cfg) ^ 0xCA11_0DD5,
         );
@@ -376,20 +420,24 @@ fn preflop_decide(
 // 翻后
 // ===========================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn postflop_decide(
     view: &GameView,
     eq: &EquityEngine,
     cfg: &HeuristicConfig,
     adj: &ExploitAdjust,
     opp_thr: &[f64],
+    ml: Option<&MlRange>,
     hole: [crate::core::Card; 2],
     rng: &mut Rng,
 ) -> Decision {
     let oc = &cfg.postflop;
-    let equity = eq.equity(
-        hole,
-        &view.board,
+    let equity = equity_dispatch(
+        view,
+        eq,
+        ml,
         opp_thr,
+        hole,
         cfg.equity.samples,
         situation_seed(view, cfg),
     );

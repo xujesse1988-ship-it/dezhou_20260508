@@ -338,8 +338,13 @@ impl RangeVec {
 
 /// 因果快照结果：每街 0..3 的街末因果 log m_prior（f32 舍入回 f64，与 featurizer
 /// 存储口径一致）；`None` = 该街无快照。
+///
+/// `street_snap[s]` = 该街末快照对应的 **token 下标**（与 [`super::tokenizer::tokenize`]
+/// 产出的 token 序、以及 [`super::mlrange::GruForward::residual`] 的输出行逐 token 对齐）。
+/// 供在线预测按街取残差行 `res[street_snap[s]]`（纯增字段，不影响既有 range 对拍）。
 pub struct CausalResult {
     pub street_logprior: [Option<[f64; 169]>; 4],
+    pub street_snap: [Option<usize>; 4],
 }
 
 /// B2b range 模型。
@@ -612,6 +617,7 @@ impl RangeModel {
 
         // 街末快照：snaps[S] = 最后一个 clamped-street <= S 的 token。
         let mut out: [Option<[f64; 169]>; 4] = [None, None, None, None];
+        let mut snap_out: [Option<usize>; 4] = [None; 4];
         for (s_idx, slot) in out.iter_mut().enumerate() {
             if board_ids.len() < STREET_NEED[s_idx] {
                 continue;
@@ -625,10 +631,12 @@ impl RangeModel {
             if let Some(spi) = snap {
                 let pidx = tokens[spi].1;
                 *slot = Some(priors[pidx]);
+                snap_out[s_idx] = Some(spi);
             }
         }
         CausalResult {
             street_logprior: out,
+            street_snap: snap_out,
         }
     }
 }

@@ -17,12 +17,48 @@ pub struct HeuristicConfig {
     pub postflop: PostflopConfig,
     pub mixing: MixingConfig,
     pub exploit: ExploitConfig,
+    pub range: RangeConfig,
 }
 
 impl HeuristicConfig {
     /// 从 JSON 字符串覆盖默认值（缺字段走默认，`serde(default)`）。解析失败返回 `Err`。
     pub fn from_json_str(s: &str) -> Result<Self, String> {
         serde_json::from_str(s).map_err(|e| e.to_string())
+    }
+}
+
+// ===========================================================================
+// 在线 ML 对手 range（EV 未验证，默认 false）
+// ===========================================================================
+
+/// 在线 ML range 预测器旋钮。`use_ml_range=true` 时引擎为每个对手用离线已落地
+/// （golden 对拍通过）的 range 流水线建 169 类 [`RangeVec`](super::range::RangeVec)，
+/// 喂 [`equity_weighted`](super::equity::EquityEngine::equity_weighted) 取代标量
+/// [`equity`](super::equity::EquityEngine::equity)。
+///
+/// ⚠ **EV 未验证**：默认 `false`。远端 sim A/B（mbb/g 不劣于标量路径）通过前**不翻默认**。
+/// 产物缺失 → 引擎优雅回落标量路径（构造期日志）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RangeConfig {
+    /// 是否用 ML range 加权 equity（默认 false = 标量阈值 equity，与历史路径逐字节一致）。
+    pub use_ml_range: bool,
+    /// GRU 残差权重 JSON 路径。
+    pub ml_weights_path: String,
+    /// 169 强度表 JSON 路径（→ `EquityEngine::from_strength` → `RangeModel`）。
+    pub ml_strength_path: String,
+    /// 残差温度（生产值 0.8，与离线 golden 一致）。
+    pub ml_rscale: f64,
+}
+
+impl Default for RangeConfig {
+    fn default() -> Self {
+        RangeConfig {
+            use_ml_range: false,
+            ml_weights_path: "artifacts/range_ml/range_v1_gru_weights.json".to_string(),
+            ml_strength_path: "artifacts/range_ml/strength169.json".to_string(),
+            ml_rscale: 0.8,
+        }
     }
 }
 

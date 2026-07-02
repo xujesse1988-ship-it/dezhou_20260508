@@ -11,6 +11,7 @@ pub mod mlrange;
 pub mod opponent;
 pub mod policy;
 pub mod range;
+pub mod range_online;
 pub mod tokenizer;
 pub mod view;
 
@@ -18,23 +19,48 @@ pub use config::HeuristicConfig;
 pub use equity::EquityEngine;
 pub use opponent::{ObservedAction, OppType, OpponentTable};
 pub use policy::{decide, Decision, DecisionAction};
+pub use range_online::MlRange;
 pub use view::{GameView, HistAction, Request, Response, ValidActions};
 
-/// 常驻决策机：一份 config + 一张 equity 强度表 + 累积对手画像。
+/// 常驻决策机：一份 config + 一张 equity 强度表 + 累积对手画像
+/// （+ 可选在线 ML range 预测器，`use_ml_range` 开且产物存在时载入）。
 pub struct HeuristicBot {
     pub config: HeuristicConfig,
     pub equity: EquityEngine,
     pub opponents: OpponentTable,
+    /// 在线 ML range 预测器；`None` = 关闭或产物缺失（回落标量 equity 路径）。
+    pub ml_range: Option<MlRange>,
 }
 
 impl HeuristicBot {
-    /// 构造（建 equity 强度表，几毫秒一次性）。
+    /// 构造（建 equity 强度表，几毫秒一次性）。`use_ml_range` 开时另载 ML range 模型
+    /// （产物缺失 → 日志 + 回落标量路径）。
     pub fn new(config: HeuristicConfig) -> HeuristicBot {
         let equity = EquityEngine::new(config.equity.preflop_table_samples, config.equity.seed);
+        let ml_range = if config.range.use_ml_range {
+            match MlRange::load(
+                &config.range.ml_strength_path,
+                &config.range.ml_weights_path,
+                config.range.ml_rscale,
+            ) {
+                Some(m) => Some(m),
+                None => {
+                    eprintln!(
+                        "[heuristic] use_ml_range=true 但 ML 产物载入失败（strength={} weights={}）\
+                         → 回落标量 equity",
+                        config.range.ml_strength_path, config.range.ml_weights_path
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         HeuristicBot {
             config,
             equity,
             opponents: OpponentTable::new(),
+            ml_range,
         }
     }
 
@@ -45,7 +71,13 @@ impl HeuristicBot {
 
     /// 决策（返回引擎内部 [`Decision`]）。
     pub fn decide_view(&self, view: &GameView) -> Decision {
-        decide(view, &self.equity, &self.config, &self.opponents)
+        decide(
+            view,
+            &self.equity,
+            &self.config,
+            &self.opponents,
+            self.ml_range.as_ref(),
+        )
     }
 
     /// 从原始请求决策。
