@@ -393,8 +393,6 @@ pub struct StrategySelectionConfig {
 
 **灰度**：先 ship「trait 抽象 + Exploitative 包装 + Fixed 选路」（纯重构 byte-equal）；再 ship BalancedHeuristic + SizeExploiter baseline（默认不选中）；最后接 `classify_field` 自动选路（prior=Weak 保守）。
 
-> ⚠ 机器约束：只跑改动相关 targeted 测试，别裸 `cargo test`（1.6GB 机器 OOM）。
-
 ### 3.8 风险与大决策
 
 1. **检测盲点（最大风险）**：强 reg 用现统计看起来就是 Tag，误判强场为弱 → 被 size-tighten 反剥削是最贵的错。缓解：保守 prior + 逐座门控 + 不确定默认弱。根治需给 `OppStats` 加平衡性信号（§4 P0-3）。

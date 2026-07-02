@@ -58,13 +58,13 @@
 | (b) GBDT（LightGBM）on 手工线特征 | 每街聚合特征（角色/尺寸桶/质地/画像统计）→ 169 类 | 小数据稳、快、本机友好 | 169 类多分类碎（每轮 169 棵树）；序列信息靠手工压缩，丢线的结构；每街要单独一套模型，anytime 粒度粗 | 离线 sanity 基线 B3，不上线 |
 | (c) **小型因果序列网络（推荐）** | GRU（1 层 d≈192）或 2–4 层 d=128 causal Transformer，逐事件 token，逐前缀 CE，先验残差输出 | 一个模型吃全部前缀粒度；画像/亮牌记忆可微地进条件；数据效率靠残差学习兜底；0.3–0.8M 参数本机 2 核可训可推 | 需要写 tokenizer + 训练管线；可解释性弱于 (a)(b) | **v1 主干** |
 | (d) 生成式 policy 网 + Bayes 后验 | 学 `P(a|y,state,π)`，预测=后验；隐变量边际似然用全部无标签手 | 数据利用率最高、censoring 原理性修复、policy 网本身可复用（判 villain 会不会下注 → check-raise 规划）| 实现复杂度 ×169 边际化、调试难、收益要等 L1 对照实验量化 | **v2 升级路径**，不是 v1 |
-| (e) in-context 大模型 | 近 50 手原始序列直接进大 Transformer 上下文 | 理论上限最高 | 数据（要海量**对手**多样性）与算力（本机 3.3GB/2 核）双双不配 | 否 |
+| (e) in-context 大模型 | 近 50 手原始序列直接进大 Transformer 上下文 | 理论上限最高 | 数据（要海量**对手**多样性）与算力（本机 4GB/2 核）双双不配 | 否 |
 
 推荐 (c) 的三个决定性理由：
 
 1. **它是唯一同时原生满足两条目标函数性质、又能吃进画像条件的方案**。(a) 满足性质但画像表达力弱；(b) 每街一套模型，「anytime」退化成「每街一次」。
 2. **残差参数化让它在 5k 样本下不至于胡说**（§4.2）：网络只学「对手写先验的乘性修正」，数据稀薄处自动退回 (a)，冷启动 = (a)。ML 上线的最坏情况就是等于现状。
-3. **机器约束**：本机 3.3GB RAM / 2 核（实测），`docs/multi_field_strategy_design.md` §3.7 已警告过 OOM。<1M 参数 CPU 训练分钟级/epoch，推理微秒级，手写 Rust 前向即可，零重依赖。
+3. **机器约束**：本机 4GB RAM / 2 核。<1M 参数 CPU 训练分钟级/epoch，推理微秒级，手写 Rust 前向即可，零重依赖。
 
 ## 4. v1 模型设计
 
@@ -189,7 +189,7 @@ tools/heuristic9_sim.rs        # 加 --dump-hands：双侧底牌 + 事件流 jso
 ```
 
 - 环境照 `.venv-pokerkit` 先例：`uv venv --python 3.12 .venv-rangeml && uv pip install torch --index-url https://download.pytorch.org/whl/cpu lightgbm numpy`，进 `.gitignore`。
-- 本机 3.3GB/2 核：数据构建与 LightGBM 无压力；torch 训练控制 batch 与 `OMP_NUM_THREADS=2`，或整个训练目录拷去更大机器（数据集几十 MB，无 GPU 需求）。
+- 本机 4GB/2 核：数据构建与 LightGBM 无压力；torch 训练控制 batch 与 `OMP_NUM_THREADS=2`，或整个训练目录拷去更大机器（数据集几十 MB，无 GPU 需求）。
 - sim 人造对手族群：对现有 baseline（Station/Nit/Maniac/PairedTrap/Limper…，`tools/heuristic9_sim.rs:37-51`）做参数扰动生成几十个「人格」，每个跑几千手全知牌局——给画像通道提供「风格 → range」的密集对照，这是 meta 学习真正的口粮。
 
 ## 9. 路线图（每步带出闸条件）
@@ -476,7 +476,7 @@ new 桶单调、远超 B0 地板（~0.03），但逐街较 M1 test（0.163/0.172
 / `artifacts/range_ml/shadow_run2930.jsonl`），**不**内联进 live 正在写的
 `h9_live_runN.jsonl`（并发追写有竞态；侧车零风险且与决策路径完全解耦）。持续监控 =
 建库后周期性重跑 `--from-runs auto`（或 `/loop`/cron 包一层），无需常驻 torch 进正式
-决策进程（本机 3.3GB + §4.4 推理应下沉 Rust 的纪律）。
+决策进程（本机 4GB + §4.4 推理应下沉 Rust 的纪律）。
 
 **④ Rust 手写前向 + golden 对拍（§6，本轮交付，字节级通过）**：把离线预测管线全
 移植进 Rust 并对 Python 逐位对拍。三件落地：
@@ -503,9 +503,9 @@ new 桶单调、远超 B0 地板（~0.03），但逐街较 M1 test（0.163/0.172
 
 复现：`.venv-rangeml/bin/python tools/range_export.py && .venv-rangeml/bin/python
 tools/range_golden_dump.py`，再 `cargo test --test heuristic_range_parity --test
-heuristic_mlrange_parity`（**勿裸 `cargo test`**，1.6GB 机 OOM）。字节级（≈f64 舍入）
-证移植零误设。改动仅 `equity.rs`（重构出 `from_strength`，`new` 行为不变，`heuristic9`
-测试 10/10 无回归）+ `mod.rs` 加两模块，默认路径零触碰、byte-equal 守。
+heuristic_mlrange_parity`。字节级（≈f64 舍入）证移植零误设。改动仅 `equity.rs`
+（重构出 `from_strength`，`new` 行为不变，`heuristic9` 测试 10/10 无回归）+ `mod.rs`
+加两模块，默认路径零触碰。
 
 **⑤ tokenizer 港 + P0-1 地基（2026-07-02 续，均字节级/byte-equal）**：
 - **`src/heuristic/tokenizer.rs`**：`tokenize(&Sample) → Vec<[f64;72]>`，逐义移植
