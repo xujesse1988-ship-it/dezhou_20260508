@@ -58,7 +58,7 @@ pub enum Role {
 // ===========================================================================
 
 /// 单条事件（causal order）。字段与 golden `s["ev"][i]` 同名。
-#[derive(serde::Deserialize, Clone)]
+#[derive(serde::Deserialize, Clone, Debug, PartialEq)]
 pub struct Event {
     /// 街 0..3。
     pub st: i64,

@@ -6,6 +6,7 @@
 
 use crate::core::Street;
 use crate::core::{Card, Rank, Suit};
+use crate::heuristic::range;
 use serde::{Deserialize, Serialize};
 
 // ===========================================================================
@@ -139,6 +140,17 @@ fn parse_cards(v: &[String]) -> Vec<Card> {
     v.iter().filter_map(|s| parse_card(s)).collect()
 }
 
+/// `Card` → range 侧卡串（rank ∈ "23456789TJQKA"，suit ∈ "cdhs"）——[`range::card_id`]
+/// 的逆。用 `to_u8() = rank*4 + suit` 拆分，保证 `card_id(card_to_string(c)) == c.to_u8()`。
+fn card_to_string(c: Card) -> String {
+    const RANKS: &[u8; 13] = b"23456789TJQKA";
+    const SUITS: &[u8; 4] = b"cdhs";
+    let v = c.to_u8();
+    let r = RANKS[(v / 4) as usize] as char;
+    let s = SUITS[(v % 4) as usize] as char;
+    format!("{r}{s}")
+}
+
 // ===========================================================================
 // 位置桶（座位无关）
 // ===========================================================================
@@ -217,6 +229,12 @@ pub struct GameView {
     /// P0-1：逐街最后加注者（0=preflop..3=river）。重放本就算了 `aggressor_by_street`，
     /// 但历史只导出 preflop + 当前街；这里补全被丢弃的 flop/turn/river aggressor。
     pub street_aggressors: [Option<u8>; 4],
+
+    /// 在线 range 适配器的因果事件流（全手行动线，按重放序）。每个动作一条，字段口径
+    /// 与离线 `tools/range_dataset_build.py` `finalize_live_hand` 逐字段一致（防训练/服务
+    /// 特征漂移；见 [`GameView::to_range_sample`] 与 `tests/heuristic_gameview_sample.rs`）。
+    /// 盲注是种子承诺（不发事件），与离线一致。
+    pub events: Vec<range::Event>,
 }
 
 impl GameView {
@@ -263,6 +281,8 @@ impl GameView {
         let mut has_acted = vec![false; n];
         // P0-1：逐座动作线累加器（纯增，不参与任何既有计算/分段/决策）。
         let mut seat_actions: Vec<Vec<SeatAction>> = vec![Vec::new(); n];
+        // 在线 range 适配器的因果事件流累加器（纯增；口径见 range_dataset_build.finalize_live_hand）。
+        let mut events: Vec<range::Event> = Vec::new();
 
         // 发盲注。
         let post =
@@ -378,6 +398,13 @@ impl GameView {
 
             let s = (a.seat as usize) % n;
             let act = a.action.to_ascii_lowercase();
+            // --- range 事件：捕获动作**前**的本街上下文（口径 = finalize_live_hand）---
+            // st = 本动作所属街（重放当前街）；hb = 动作前本街最高投入；
+            // tc = 动作前需跟额 = max(0, hb - 本座本街已投)。
+            let ev_st = (street_idx as i64).min(3);
+            let ev_hb = high_bet;
+            let ev_commit_before = committed_round[s];
+            let ev_tc = ev_hb.saturating_sub(ev_commit_before);
             match act.as_str() {
                 "fold" => {
                     folded[s] = true;
@@ -468,6 +495,25 @@ impl GameView {
                 street: act_street,
                 action: a.action.clone(),
                 to: a.to,
+            });
+
+            // --- range 事件：动作**后**的承诺/底池（口径 = finalize_live_hand）---
+            // c = 本座本街累计投入（动作后）；p = 全局底池（动作后，含盲注种子，随 delta 单调增）；
+            // delta = c - commit_before 由 tokenizer/model 侧从 c 反推，无需显存。
+            // a 归一化到 AGGR 集合识别的口径（"all-in" → "all_in"）。
+            let ev_a = if act == "all-in" {
+                "all_in".to_string()
+            } else {
+                act.clone()
+            };
+            events.push(range::Event {
+                st: ev_st,
+                s: s as i64,
+                a: ev_a,
+                c: committed_round[s] as i64,
+                p: committed_total.iter().sum::<u64>() as i64,
+                tc: ev_tc as i64,
+                hb: ev_hb as i64,
             });
 
             if !use_street_labels
@@ -565,6 +611,7 @@ impl GameView {
             names: req.names.clone(),
             seat_actions,
             street_aggressors,
+            events,
         }
     }
 
@@ -753,5 +800,75 @@ impl GameView {
         self.seat_actions(seat)
             .iter()
             .filter(move |sa| sa.street == street)
+    }
+
+    /// 为在此决策点预测 `opp_seat` 的 range 构造 [`range::Sample`]。
+    ///
+    /// 桥接离线已落地（golden 对拍通过）的 range 流水线（tokenizer → range → mlrange）到
+    /// **在线** live 决策点：`ev` 用重放期记录的全手因果事件流（口径逐字段对齐
+    /// `tools/range_dataset_build.py` `finalize_live_hand`，防训练/服务特征漂移），其余
+    /// 上下文（盲注/座位/board/栈/画像）从 `GameView` 直取。`tseat` 只切换「目标座位」，
+    /// `ev` 在所有目标间共享。
+    ///
+    /// - `prof`：该对手的画像快照（life/w50/n_shows）；`None` → 默认空画像
+    ///   （range_threshold_shift=0，prof_features 取缺省）。从引擎 OpponentTable 接线是后续项。
+    /// - `stacks`：**盲注已扣**的座位栈（= hand-start 栈 − 该座盲注种子），与离线 `stacks`
+    ///   同口径——tokenizer 用 `stack_of + seed_commit` 加回盲注还原 hand-start 栈，故此处必须
+    ///   预扣，否则盲位栈特征会多算一个盲注。
+    /// - `hseat`/`hhole`：hero 座位/底牌（离线 card-removal 仅在 `hseat != tseat` 时把 hero
+    ///   底牌当死牌——门控在离线 `causal_logpriors` 内，这里如实填 hero 自身）。
+    /// - `ns`/`inh`：在手座位数/列表（= 有过动作 ∪ 盲位 ∪ hero），与 featurizer `len(in_hand)` 同口径。
+    pub fn to_range_sample(&self, opp_seat: usize, prof: Option<range::Prof>) -> range::Sample {
+        let n = self.num_seats as usize;
+        // 该座的盲注种子承诺（用于把 hand-start 栈折成「盲注已扣」栈）。
+        let seed_commit_of = |seat: usize| -> u64 {
+            if seat == self.sb_seat as usize {
+                self.small_blind
+            } else if seat == self.bb_seat as usize {
+                self.big_blind
+            } else {
+                0
+            }
+        };
+        // stacks：盲注已扣（离线口径）；键 = 座位十进制字符串。
+        let mut stacks = std::collections::HashMap::with_capacity(n);
+        for seat in 0..n {
+            let post_blind = self.start_stack[seat].saturating_sub(seed_commit_of(seat));
+            stacks.insert(seat.to_string(), post_blind as i64);
+        }
+        // 在手座位：有过动作 ∪ 盲位 ∪ hero（离线 in_hand = 发牌座 ∪ 出现在动作里的座）。
+        let mut inh: Vec<i64> = (0..n)
+            .filter(|&seat| {
+                !self.seat_actions[seat].is_empty()
+                    || seat == self.sb_seat as usize
+                    || seat == self.bb_seat as usize
+                    || seat == self.my_seat as usize
+            })
+            .map(|seat| seat as i64)
+            .collect();
+        inh.sort_unstable();
+        let ns = inh.len() as i64;
+
+        let board: Vec<String> = self.board.iter().map(|&c| card_to_string(c)).collect();
+        let hhole = self
+            .hole
+            .map(|h| vec![card_to_string(h[0]), card_to_string(h[1])]);
+
+        range::Sample {
+            sb: self.sb_seat as i64,
+            bb: self.bb_seat as i64,
+            sbamt: self.small_blind as i64,
+            bbamt: self.big_blind as i64,
+            tseat: opp_seat as i64,
+            hseat: Some(self.my_seat as i64),
+            hhole,
+            board,
+            ev: self.events.clone(),
+            prof: prof.unwrap_or_default(),
+            ns: Some(ns),
+            inh,
+            btn: Some(self.button_seat as i64),
+            stacks,
+        }
     }
 }
