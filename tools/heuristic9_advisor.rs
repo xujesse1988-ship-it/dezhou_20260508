@@ -183,9 +183,9 @@ fn run() -> Result<(), String> {
     // 明确 ML range 状态：想开但没载入（缺 artifacts）→ 静默退化成标量，须让 live 操作者看见。
     match (want_ml, bot.ml_range.is_some()) {
         (true, true) => eprintln!("[heuristic9] ML range: ON（对手 range 预测已载入）"),
-        (true, false) => eprintln!(
-            "[heuristic9] ⚠ ML range 想开但未载入（artifacts 缺失？）→ 退回标量 equity"
-        ),
+        (true, false) => {
+            eprintln!("[heuristic9] ⚠ ML range 想开但未载入（artifacts 缺失？）→ 退回标量 equity")
+        }
         (false, _) => eprintln!("[heuristic9] ML range: OFF（--no-ml-range）"),
     }
 
