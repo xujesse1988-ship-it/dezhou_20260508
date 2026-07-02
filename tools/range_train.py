@@ -116,10 +116,12 @@ def loss_fn(res, batch, eps=0.05):
 
 
 @torch.no_grad()
-def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscale=1.0):
+def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscale=1.0,
+                  eqtab=None):
     """街末快照指标。返回 per_street dict + 逐样本命中/NLL 矩阵（配对检验用）。
     rscale：残差温度（logits = log_prior + rscale·f_θ），<1 向 B2b 插值——q 失准的
-    校准旋钮。"""
+    校准旋钮。eqtab：(idx_map, eqc, eqy, valid) equity 残差表（range_eqtab_build），
+    残差 = Σ_k p_k·eqc_k − eqy（对手视角 equity；>0 = range 高估对手强度）。"""
     model.eval()
     hit5 = np.full((len(idxs), 4), -1, dtype=np.int8)
     nll = np.full((len(idxs), 4), np.nan, dtype=np.float64)
@@ -129,6 +131,8 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
     ref_qpct = np.full((len(idxs), 4), np.nan, dtype=np.float64)
     ranks = np.full((len(idxs), 4), -1, dtype=np.int32)
     ref_ranks = np.full((len(idxs), 4), -1, dtype=np.int32)
+    eqres = np.full((len(idxs), 4), np.nan, dtype=np.float64)
+    ref_eqres = np.full((len(idxs), 4), np.nan, dtype=np.float64)
     arange = np.arange(169)
     for lo in range(0, len(idxs), batch_size):
         sub = idxs[lo:lo + batch_size]
@@ -137,14 +141,16 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
         logits = masked_logits(res, batch, rscale).numpy()
         logits0 = masked_logits(torch.zeros_like(res), batch).numpy()
         for j, i in enumerate(sub):
+            eqrow = eqtab[0].get(int(i)) if eqtab is not None else None
             for S in range(4):
                 sp = data.snaps[i, S]
                 if sp < 0:
                     continue
                 row = lo + j
                 av = data.alive[i, S].astype(np.float64)
-                for mat_h, mat_n, mat_q, lg in ((hit5, nll, qpct, logits),
-                                                (ref_hit5, ref_nll, ref_qpct, logits0)):
+                for mat_h, mat_n, mat_q, mat_e, lg in ((hit5, nll, qpct, eqres, logits),
+                                                       (ref_hit5, ref_nll, ref_qpct,
+                                                        ref_eqres, logits0)):
                     if mat_h is ref_hit5 and not with_prior_ref:
                         continue
                     z = lg[j, sp]
@@ -160,6 +166,10 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
                     dens = np.divide(p, av, out=np.full(169, -1.0), where=av > 0)
                     dy = dens[data.y[i]]
                     mat_q[row, S] = p[dens > dy].sum() + 0.5 * p[dens == dy].sum()
+                    if eqrow is not None and eqtab[3][eqrow, S]:
+                        eqc = eqtab[1][eqrow, S]
+                        mat_e[row, S] = float(np.where(eqc >= 0, eqc, 0.0) @ p) \
+                            - float(eqtab[2][eqrow, S])
                     if mat_h is hit5:
                         ranks[row, S] = rk
                     else:
@@ -176,6 +186,11 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
                   "rank_mean": float(ranks[m, S].mean() + 1),
                   "rank_med": int(np.median(ranks[m, S]) + 1),
                   "q_mean": float(qpct[m, S].mean()), "q_med": float(np.median(qpct[m, S]))}
+        me = m & ~np.isnan(eqres[:, S])
+        if me.any():
+            out[S]["eq_n"] = int(me.sum())
+            out[S]["eq_bias"] = float(eqres[me, S].mean())
+            out[S]["eq_mae"] = float(np.abs(eqres[me, S]).mean())
         if with_prior_ref:
             out[S]["ref_top5"] = float((ref_hit5[m, S] == 1).mean())
             out[S]["ref_nll"] = float(ref_nll[m, S].mean())
@@ -183,7 +198,11 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
             out[S]["ref_q_med"] = float(np.median(ref_qpct[m, S]))
             out[S]["ref_rank_mean"] = float(ref_ranks[m, S].mean() + 1)
             out[S]["ref_rank_med"] = int(np.median(ref_ranks[m, S]) + 1)
-    return out, (hit5, nll, ref_hit5, ref_nll, qpct, ref_qpct, ranks, ref_ranks)
+            if me.any():
+                out[S]["ref_eq_bias"] = float(ref_eqres[me, S].mean())
+                out[S]["ref_eq_mae"] = float(np.abs(ref_eqres[me, S]).mean())
+    return out, (hit5, nll, ref_hit5, ref_nll, qpct, ref_qpct, ranks, ref_ranks,
+                 eqres, ref_eqres)
 
 
 def paired_bootstrap(hit_a, hit_b, n_boot=10000, seed=7):
@@ -219,6 +238,8 @@ def main():
     ap.add_argument("--eval-only", action="store_true")
     ap.add_argument("--residual-scale", type=float, default=1.0,
                     help="评估期残差温度（<1 向 B2b 插值，校准 q 用）")
+    ap.add_argument("--eqtab", default="artifacts/range_ml/eqtab_v1.npz",
+                    help="equity 残差表（range_eqtab_build 产出；缺失则跳过该指标）")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -287,6 +308,17 @@ def main():
     model.load_state_dict(ck["model"])
     print(f"[eval] loaded {args.ckpt} (ep{ck['epoch']}, val_snapNLL={ck['val_nll']:.4f})", flush=True)
 
+    eqtab = None
+    if args.eqtab and os.path.exists(args.eqtab):
+        et = np.load(args.eqtab)
+        idx_map = {int(si): j for j, si in enumerate(et["sample"])}
+        assert all(int(data.y[si]) == int(et["y"][j]) for si, j in idx_map.items()), \
+            "eqtab 与 seq npz 样本错位"
+        eqtab = (idx_map, et["eqc"].astype(np.float32), et["eqy"], et["valid"])
+        print(f"[eval] eqtab: {len(idx_map)} 行 ← {args.eqtab}", flush=True)
+    elif args.eqtab:
+        print(f"[eval] eqtab {args.eqtab} 不存在，跳过 equity 残差指标", flush=True)
+
     ta = ck.get("args", vars(args))  # 训练时超参（eval-only 也如实报告）
     report = ["# M1 v1 序列模型报告（GRU 先验残差）", "",
               f"- 模型：GRU d={ck['d']}，参数 {n_params/1e6:.2f}M；ckpt `{args.ckpt}`（best ep{ck['epoch']}）",
@@ -301,7 +333,7 @@ def main():
     final = {}
     for name, idxs in (("val", val_idx), ("test", test_idx)):
         met, mats = snapshot_eval(model, data, idxs, with_prior_ref=True,
-                                  rscale=args.residual_scale)
+                                  rscale=args.residual_scale, eqtab=eqtab)
         final[name] = (met, mats)
         report += [f"### {name} 切分（live_opp，n={len(idxs)}）", "",
                    "| 街 | top-1 | **top-5** | top-10 | NLL | rank 均值 | rank 中位 | "
@@ -317,8 +349,22 @@ def main():
                           f"{m['ref_top5']:.3f} | {m['ref_nll']:.3f} | {m['ref_q_med']*100:.1f}% | "
                           f"{m['top5']-m['ref_top5']:+.3f} |")
         report.append("")
+        if any("eq_bias" in met.get(S, {}) for S in range(4)):
+            report += ["equity 残差（预测 range 折算对手 equity − 亮牌 equity，百分点；"
+                       "bias>0 = range 高估对手强度；n_eq = 有 hero 视角的样本）：", "",
+                       "| 街 | n_eq | v1 bias | v1 MAE | B2b bias | B2b MAE |",
+                       "|---|---|---|---|---|---|"]
+            for S in range(4):
+                m = met.get(S)
+                if not m or "eq_bias" not in m:
+                    continue
+                report.append(f"| {STREET_NAME[S]} | {m['eq_n']} | {m['eq_bias']*100:+.1f} | "
+                              f"{m['eq_mae']*100:.1f} | {m['ref_eq_bias']*100:+.1f} | "
+                              f"{m['ref_eq_mae']*100:.1f} |")
+            report.append("")
 
-    met, (hit5, nllm, ref_hit5, ref_nllm, qpctm, ref_qpctm, ranksm, ref_ranksm) = final["test"]
+    met, (hit5, nllm, ref_hit5, ref_nllm, qpctm, ref_qpctm, ranksm, ref_ranksm,
+          eqresm, ref_eqresm) = final["test"]
     report += ["### 出闸检验（test）", ""]
     vals = [met[S]["top5"] for S in sorted(met)]
     mono = all(vals[i] <= vals[i + 1] + 1e-9 for i in range(len(vals) - 1))
@@ -335,6 +381,24 @@ def main():
                       f"ΔNLL = {-dn:+.3f} [{-nhi:+.3f}, {-nlo:+.3f}] p={pn:.4f}；"
                       f"Δq = {-dq*100:+.1f}pp [{-qhi*100:+.1f}, {-qlo*100:+.1f}] p={pq:.4f}；"
                       f"Δrank = {-dr:+.1f} [{-rhi:+.1f}, {-rlo:+.1f}] p={pr:.4f}")
+    if not np.all(np.isnan(eqresm)):
+        report.append("")
+        report.append("**equity 残差检验**（对手视角；bias 带自身 bootstrap CI，"
+                      "ΔMAE = v1 − B2b，负 = 更准）：")
+        for S in sorted(met):
+            m = (hit5[:, S] >= 0) & ~np.isnan(eqresm[:, S])
+            if not m.any():
+                continue
+            r_m, r_r = eqresm[m, S], ref_eqresm[m, S]
+            bm, (bmlo, bmhi), _ = paired_bootstrap(r_m, np.zeros_like(r_m))
+            db, (dblo, dbhi), pb = paired_bootstrap(r_m, r_r)
+            dmae, (mlo, mhi), pm = paired_bootstrap(-np.abs(r_m), -np.abs(r_r))
+            report.append(
+                f"- {STREET_NAME[S]}（n={int(m.sum())}）：v1 bias = {bm*100:+.1f}pp "
+                f"[{bmlo*100:+.1f}, {bmhi*100:+.1f}] vs B2b {r_r.mean()*100:+.1f}pp"
+                f"（Δbias = {db*100:+.1f}pp p={pb:.4f}）；"
+                f"MAE {np.abs(r_m).mean()*100:.1f} vs {np.abs(r_r).mean()*100:.1f}，"
+                f"ΔMAE = {-dmae*100:+.1f}pp [{-mhi*100:+.1f}, {-mlo*100:+.1f}] p={pm:.4f}")
     # 后街斜率：river−preflop 的 top-5 差距（仅打满 4 街的样本，配对）
     full = (hit5[:, 0] >= 0) & (hit5[:, 3] >= 0)
     slope_m = hit5[full, 3].astype(float) - hit5[full, 0].astype(float)

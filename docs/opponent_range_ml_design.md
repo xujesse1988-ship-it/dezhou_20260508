@@ -146,6 +146,15 @@ pub trait RangePredictor {
     是纯排序失准度——q>50% = range 画得过强过窄（真牌被压进尾部），<50% = 过宽。
     它把整条分布形状用上（top-5 只看头部），且是 `equity_weighted` 消费端最关心的
     「形状质量」的直接读数。
+  - **equity 残差 bias / MAE**（M1 起常设）：`e = Σ_k p̂_k·eqc_k − eq(亮牌 vs hero)`，
+    其中 `eqc_k` = 类 k 存活 combo 对 hero 底牌的 equity 均值（街末 board 上 MC 补完
+    runout；对手视角）。这是对下游 `equity_weighted` 消费的那个**线性泛函**的直接检验
+    ——类空间指标（top-5/NLL/q/rank）全部置换不变，「错到相邻强度」和「错到强度谱
+    另一端」同罪，而 equity 残差只按决策代价计罪。bias>0 = range 系统性高估对手强度
+    （hero 会偏保守）——censoring 偏差在决策空间的读数；MAE = 逐手精度。模型与
+    B2b 共用同一张预计算 eq 表（`range_eqtab_build`），MC 噪声共模、配对 Δ 精确对消。
+    hero 不在手的样本无 hero 视角，跳过（val+test 仅 10/2,040，与消费分布一致——
+    hero 不在手时引擎也不消费 range）。
   - 工程：NLL、真实类权重、真实类排名分位（MRR）、ECE 校准。
   - **单调性断言**：同一批摊牌手在「翻前末/翻牌末/转牌末/河牌末」四个快照的平均 top-5 与 NLL 必须单调改善，违反即报警（§1 性质 2）。
 - **基线阶梯**（全部先于模型实现，M0 交付）：
@@ -167,6 +176,7 @@ tools/range_dataset_build.py   # runN.jsonl + slumbot.jsonl + sim dump + prof �
                                #   顺带产出数据审计报告（muck 率、街分布、对手分布）
 tools/range_baselines.py       # B0–B3 + 评估 harness（分街/单调/LOO 全套报告）
 tools/range_train.py           # PyTorch CPU，早停看 run29 验证 NLL
+tools/range_eqtab_build.py     # equity 残差表：val/test 每街末 per-class eq + 亮牌 eq
 tools/range_export.py          # 权重 → artifacts/range_ml_v1.bin（版本头 + f32）
 tools/heuristic9_sim.rs        # 加 --dump-hands：双侧底牌 + 事件流 jsonl（全知 sim 源）
 ```
@@ -266,8 +276,9 @@ preflop/flop 反而更好（0.161/0.171 vs 0.150/0.169）→ **保留混源默�
 不敏感（lr 5e-4–2e-3 / dropout 0.15–0.3 的 4 配置 val NLL 带宽 0.015），过拟合快
 （best epoch 3–22），样本量仍是主约束——预训练（M2）是下一个杠杆。
 
-产物：`artifacts/range_ml/{seq_v1.npz, b3_v1.npz, range_v1_gru.pt, m1_report.md,
-m1_b3_report.md}`（`artifacts/*` 不进 git，npz/ckpt 由上述命令分钟级重建）。
+产物：`artifacts/range_ml/{seq_v1.npz, b3_v1.npz, eqtab_v1.npz, range_v1_gru.pt,
+m1_report.md, m1_b3_report.md}`（`artifacts/*` 不进 git，npz/ckpt 由上述命令分钟级
+重建）。
 
 **range 质量分位 q 的发现（§7 新指标，2026-07-02 补）**：
 
@@ -294,8 +305,45 @@ m1_b3_report.md}`（`artifacts/*` 不进 git，npz/ckpt 由上述命令分钟级
    B2b 的 ~41–44 提到 ~32–34（中位 ~30 → ~22）。rank↓ 而纯 v1 的 q↑ 正是「排序
    变准、质量堆头」的拆解证据。
 
+**equity 残差 bias/MAE 的发现（§7 新指标，2026-07-02 补）**：
+
+工具：`tools/range_eqtab_build.py`（val/test 每样本每街末预计算 per-class eq 表 +
+亮牌 eq：river 精确、turn 全枚举、preflop/flop 24 个共享 runout、每类采 2 combo；
+模型与 B2b 共表 → MC 噪声配对对消；构建 ~4.5min，2,030/2,040 行，缺 hero 底牌的
+10 个跳过）+ `range_train.py --eqtab`（默认接入）。复现：
+
+```bash
+.venv-rangeml/bin/python tools/range_eqtab_build.py                      # ~4.5min
+OMP_NUM_THREADS=2 .venv-rangeml/bin/python tools/range_train.py \
+  --eval-only --residual-scale 0.8 --report artifacts/range_ml/m1_report.md
+```
+
+| test（rscale=0.8）| preflop | flop | turn | river |
+|---|---|---|---|---|
+| v1 bias | **−1.5pp** | +2.2pp | +4.3pp | +4.7pp |
+| B2b bias | −4.2pp | +0.8pp | +3.2pp | +3.6pp |
+| MAE：v1 / B2b | 11.6 / 12.3 | 16.7 / 16.9 | 19.8 / 19.9 | 23.9 / 24.0 |
+| ΔMAE（配对 p）| **−0.7pp (.0001)** | −0.2pp (.012) | −0.1pp (.23) | −0.1pp (.31) |
+
+1. **口径先行**：本指标条件在「摊牌且亮牌」上（L0 同轴；亮牌 eq 均值 0.60→0.64
+   逐街）。亮牌手比前缀条件均值强，故对**在场后验**无偏的 range 在此口径下应读出
+   **负 bias**；读数 ≈0 = 贴合摊牌条件分布。无条件读数要等 M2 Slumbot 全知对照。
+2. **两个模型的翻后 bias 全为正且逐街攀升**（B2b +0.8→+3.6，v1 +2.2→+4.7）——
+   即使相对摊牌条件真值，range 仍画得过强。这是翻后 q>50% 倾斜的 equity 空间版，
+   并给出决策代价的量纲：river 时 hero 平均把对手看强 4–5 个 equity 点（偏保守向，
+   与 §2.1 L0 声明的偏差方向一致）。
+3. **v1 的 equity 精度增益集中在前两街**：MAE preflop −0.7pp（p=.0001）、flop
+   −0.2pp（p=.012）显著更准，turn/river 打平——类空间的大胜（Δtop-5/Δrank 四街全
+   显著）没有等比例转化成 equity 精度，说明「排序变准」主要发生在同强度带内部的
+   类间排布。
+4. **v1 相对 B2b 的 Δbias 四街全为 +1.1～+2.7pp（p=.0001）**：preflop 是修正
+   （B2b −4.2pp 过弱 → v1 −1.5pp 近无偏），翻后是加重（CE 质量堆头 = 往强牌侧堆）。
+   残差温度对此几乎无感（rscale 1.0 vs 0.8 各街 bias 差 ±0.3pp）——全局温度修不动
+   方向性 bias，翻后 equity bias 与 q 倾斜同源，一起进 M2 校准课题。
+
 M1 判断：**主出闸通过（显著打赢 B2b + 单调；rscale=0.8 下四街全显著），进入 M2**；
-斜率课题、翻后 q 倾斜、censoring 对照实验（Slumbot 全知集）一起在 M2 处理。
+斜率课题、翻后 q/equity bias 倾斜（同源）、censoring 对照实验（Slumbot 全知集）
+一起在 M2 处理。
 
 ## 10. 风险与拍板点
 
