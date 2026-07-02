@@ -177,6 +177,10 @@ tools/range_dataset_build.py   # runN.jsonl + slumbot.jsonl + sim dump + prof �
 tools/range_baselines.py       # B0–B3 + 评估 harness（分街/单调/LOO 全套报告）
 tools/range_train.py           # PyTorch CPU，早停看 run29 验证 NLL
 tools/range_eqtab_build.py     # equity 残差表：val/test 每街末 per-class eq + 亮牌 eq
+tools/range_censoring_ab.py    # M2：Slumbot 全知集 censoring AB（full/matched/sd-only）
+tools/range_loo_eval.py        # M2：leave-opponents-out 折叠重训评估
+tools/range_shows_sidecar.py   # M2：亮牌记忆侧车（prof.shows → npz，对齐 seq_v1）
+tools/range_rscale_scan.py     # M2：per-street 残差温度扫描（val 选点 test 复评）
 tools/range_export.py          # 权重 → artifacts/range_ml_v1.bin（版本头 + f32）
 tools/heuristic9_sim.rs        # 加 --dump-hands：双侧底牌 + 事件流 jsonl（全知 sim 源）
 ```
@@ -344,6 +348,73 @@ OMP_NUM_THREADS=2 .venv-rangeml/bin/python tools/range_train.py \
 M1 判断：**主出闸通过（显著打赢 B2b + 单调；rscale=0.8 下四街全显著），进入 M2**；
 斜率课题、翻后 q/equity bias 倾斜（同源）、censoring 对照实验（Slumbot 全知集）
 一起在 M2 处理。
+
+### M2 结果（2026-07-02，已交付）
+
+工具：`tools/range_loo_eval.py`、`tools/range_censoring_ab.py`、
+`tools/range_shows_sidecar.py`、`tools/range_rscale_scan.py`；`range_train.py` 增
+`--use-shows` / `--pretrain-epochs` / `--residual-scale` 逐街 4 值。复现：
+
+```bash
+OMP_NUM_THREADS=2 .venv-rangeml/bin/python tools/range_loo_eval.py          # ~25min
+OMP_NUM_THREADS=2 .venv-rangeml/bin/python tools/range_censoring_ab.py     # ~12min
+.venv-rangeml/bin/python tools/range_shows_sidecar.py                       # ~30s
+OMP_NUM_THREADS=2 .venv-rangeml/bin/python tools/range_rscale_scan.py       # ~4min
+```
+
+**出闸项 1——LOO meta 泛化：✅ 通过**（34 个 ≥50 样本对手分 6 折重训，剔除同 hid
+事件流防泄漏，4,542 个未见对手样本）：
+
+| pooled | preflop | flop | turn | river |
+|---|---|---|---|---|
+| Δtop-5 vs B2b（p）| −0.001 (.91) | **+0.015 (.004)** | **+0.020 (.0001)** | **+0.020 (.0001)** |
+| ΔNLL | −0.27 | −0.22 | −0.21 | −0.20（全 p=.0001）|
+
+分对手 25/34 top-5 ≥ B2b、30/34 NLL 更好，无显著崩盘。结构清晰：**preflop 优势
+消失（打平）、翻后优势保留**——test 上的 preflop +2.1pp 来自已见对手的画像个性化，
+翻后「读线」跨对手泛化；画像通道对未见对手退化为不伤害（先验残差兜底如设计）。
+
+**出闸项 2——censoring 伤害量化：显著，M4/L2 立项条件满足**（Slumbot 全知集
+8k/2k 时间切，同架构同种子，test 含 fold 手）：
+
+| test 全集 | full（7.2k 全知）| **full-matched（1.55k 全知）** | sd-only（1.55k 摊牌）|
+|---|---|---|---|
+| preflop top-5 | 0.105 | 0.092 | 0.071 |
+| ΔNLL vs sd-only | −0.30～−0.44（四街 p=.0001）| preflop −0.11 (.0001)；翻后 ≈0 (ns) | — |
+| fold_bot 子集 preflop | **+9.0pp** top-5 / −0.77 NLL | +6.7pp / −0.35 | 0.058 ≈ B2b 地板 |
+
+full-matched 组（全知分布下采样到 sd-only 同量级）把两个效应拆开了：**「fold 手
+信息」的纯分布效应集中在 preflop**（弃牌倾向 = 弱牌 range 的形状，仅摊牌训练学不到，
++6.7pp）；**翻后的大头是样本量效应**（fold 手很少打到翻后）。对 live 的推论：L0 的
+伤害主要是「高估爱弃牌对手的 preflop range」；L1 混源（hero 零截断）已部分覆盖。
+**判定：按 §9 预设条件（伤害显著）M4/L2 立项成立，排 M3 接线之后**——影子模式
+还能先积累无偏观测。
+
+**负结果一：亮牌记忆（类信号版）无收益。** prof.shows 的 169 类 attention 池化 →
+GRU 初始隐态（注入层零初始化）：val snapNLL 4.5200 vs v1 4.5246（差 0.005，在 3 种子
+噪声带 0.015 内），test preflop −1.4pp 且单调断言破坏。诊断：只有类索引的亮牌记忆
+≈ WTSD/松紧代理，画像统计里已有；§5 设计的真正载荷是**线摘要**（「check-raise river
+亮诈唬」的线-牌对），dataset schema 尚未存线摘要——**shows v2 = dataset 扩线摘要 +
+attention 重做**，进 backlog。
+
+**负结果二：Slumbot 预训练→live 微调有害。** 15ep 预训后微调 val snapNLL 4.5500
+（v1 4.5246），连 val 都退。诊断：HU→6-max 分布错配（M0 已把 slumbot 排除主指标），
+预训把模型拽向 HU 翻前动态且微调更早停（ep9 vs ep12）洗不回来；混源 w=0.1 已是
+slumbot 信号的正确剂量。**预训练的正路是 sim 人造对手族群**（6-max 同分布 +
+`--dump-hands`，§8），进 backlog。
+
+**负结果三（带诊断价值）：per-street 残差温度修不动翻后 q。** val 逐街选点
+[0.8, 0.5, 0.5, 0.5]，但 s 压到 0.5 时 turn/river q_mean 仍 61.8/63.3%——**B2b 先验
+自己就是 62.7/63.9%**：失准根子在手写算子（M0 发现 2 的又一实锤），往先验插值只是
+换失准源，还赔 top-5（river 0.183→0.176）与 NLL。**维持标量 s=0.8**；翻后校准的
+正解是把 ML 残差学到的修正回填 §2 算子参数（`a_v/a_d/κ`），或学加性先验修正——
+归入 §2 调参课题。
+
+M2 判断：**两个出闸项通过（LOO 不崩 + censoring 量化完成、L2 立项条件满足）**；
+三个模型杠杆负结果如实记录，**生产配置维持 v1 权重 + 标量 rscale=0.8 不变**。
+遗留：后街斜率未拉大（三杠杆均未触动）——与 shows v2（线摘要）、sim 族群预训练
+同判：当前 5k 样本 + 类信号已见顶，等数据侧扩容。**进入 M3（Rust 前向 + golden
+对拍 + 影子模式）**。
 
 ## 10. 风险与拍板点
 

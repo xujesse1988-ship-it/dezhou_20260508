@@ -35,8 +35,13 @@ STREET_NAME = {0: "preflop", 1: "flop", 2: "turn", 3: "river"}
 
 
 class SeqData:
-    def __init__(self, path):
+    def __init__(self, path, shows_path=None):
         d = np.load(path)
+        self.shows = None
+        if shows_path:
+            sd = np.load(shows_path)
+            assert (sd["y"] == d["y"]).all(), "shows 侧车与 seq npz 对拍失败"
+            self.shows = sd["shows"].astype(np.int64)
         self.feat = d["feat"]
         self.street = d["street"]
         self.pidx = d["pidx"]
@@ -67,7 +72,7 @@ class SeqData:
             logprior[j, :l] = self.prior[self.pidx[a:b]].astype(np.float32)
             alive[j, :l] = self.alive[i][self.street[a:b]]
             posmask[j, 1:l] = True  # 位置 0 = CTX，不进损失
-        return {
+        out = {
             "feat": torch.from_numpy(feat),
             "logprior": torch.from_numpy(logprior),
             "alive": torch.from_numpy(alive),
@@ -76,10 +81,13 @@ class SeqData:
             "w": torch.from_numpy(self.w[idxs].astype(np.float32)),
             "lens": torch.from_numpy(self.lens[idxs]),
         }
+        if self.shows is not None:
+            out["shows"] = torch.from_numpy(self.shows[idxs])
+        return out
 
 
 class ResidualGRU(nn.Module):
-    def __init__(self, fdim, d=192, dropout=0.15):
+    def __init__(self, fdim, d=192, dropout=0.15, use_shows=False, show_dim=24):
         super().__init__()
         self.inp = nn.Linear(fdim, d)
         self.gru = nn.GRU(d, d, batch_first=True)
@@ -87,12 +95,32 @@ class ResidualGRU(nn.Module):
         self.head = nn.Linear(d, 169)
         nn.init.zeros_(self.head.weight)  # 第 0 步 = 手写 tracker（§4.2）
         nn.init.zeros_(self.head.bias)
+        self.use_shows = use_shows
+        if use_shows:
+            # 亮牌记忆（§5）：类嵌入 + 加性 attention 池化 → GRU 初始隐态。
+            # 注入层零初始化 → 开局 == 无记忆模型，梯度只学「亮牌历史改了什么」。
+            self.show_emb = nn.Embedding(169, show_dim)
+            self.show_att_w = nn.Linear(show_dim, show_dim)
+            self.show_att_v = nn.Linear(show_dim, 1, bias=False)
+            self.show_h0 = nn.Linear(show_dim, d)
+            nn.init.zeros_(self.show_h0.weight)
+            nn.init.zeros_(self.show_h0.bias)
 
-    def forward(self, feat, lens):
+    def forward(self, feat, lens, shows=None):
         x = torch.tanh(self.inp(feat))
+        h0 = None
+        if self.use_shows and shows is not None:
+            mask = shows >= 0
+            e = self.show_emb(shows.clamp(min=0))                      # B,K,E
+            sc = self.show_att_v(torch.tanh(self.show_att_w(e))).squeeze(-1)
+            att = torch.softmax(sc.masked_fill(~mask, -1e30), dim=-1)
+            att = torch.where(mask.any(-1, keepdim=True), att,
+                              torch.zeros_like(att))                   # 无记忆 → 全零
+            pooled = (att.unsqueeze(-1) * e).sum(1)
+            h0 = self.show_h0(pooled).unsqueeze(0).contiguous()        # 1,B,d
         packed = nn.utils.rnn.pack_padded_sequence(x, lens, batch_first=True,
                                                    enforce_sorted=False)
-        h, _ = self.gru(packed)
+        h, _ = self.gru(packed) if h0 is None else self.gru(packed, h0)
         h, _ = nn.utils.rnn.pad_packed_sequence(h, batch_first=True,
                                                 total_length=feat.shape[1])
         return self.head(self.drop(h))
@@ -120,8 +148,10 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
                   eqtab=None):
     """街末快照指标。返回 per_street dict + 逐样本命中/NLL 矩阵（配对检验用）。
     rscale：残差温度（logits = log_prior + rscale·f_θ），<1 向 B2b 插值——q 失准的
-    校准旋钮。eqtab：(idx_map, eqc, eqy, valid) equity 残差表（range_eqtab_build），
-    残差 = Σ_k p_k·eqc_k − eqy（对手视角 equity；>0 = range 高估对手强度）。"""
+    校准旋钮；标量或逐街 4 值（街 S 的快照用 rs[S]）。eqtab：(idx_map, eqc, eqy, valid)
+    equity 残差表（range_eqtab_build），残差 = Σ_k p_k·eqc_k − eqy（对手视角 equity；
+    >0 = range 高估对手强度）。"""
+    rs = list(rscale) if isinstance(rscale, (list, tuple)) else [float(rscale)] * 4
     model.eval()
     hit5 = np.full((len(idxs), 4), -1, dtype=np.int8)
     nll = np.full((len(idxs), 4), np.nan, dtype=np.float64)
@@ -137,8 +167,8 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
     for lo in range(0, len(idxs), batch_size):
         sub = idxs[lo:lo + batch_size]
         batch = data.batch(sub)
-        res = model(batch["feat"], batch["lens"])
-        logits = masked_logits(res, batch, rscale).numpy()
+        res = model(batch["feat"], batch["lens"], batch.get("shows"))
+        lgm = {s: masked_logits(res, batch, s).numpy() for s in sorted(set(rs))}
         logits0 = masked_logits(torch.zeros_like(res), batch).numpy()
         for j, i in enumerate(sub):
             eqrow = eqtab[0].get(int(i)) if eqtab is not None else None
@@ -148,7 +178,7 @@ def snapshot_eval(model, data, idxs, batch_size=256, with_prior_ref=False, rscal
                     continue
                 row = lo + j
                 av = data.alive[i, S].astype(np.float64)
-                for mat_h, mat_n, mat_q, mat_e, lg in ((hit5, nll, qpct, eqres, logits),
+                for mat_h, mat_n, mat_q, mat_e, lg in ((hit5, nll, qpct, eqres, lgm[rs[S]]),
                                                        (ref_hit5, ref_nll, ref_qpct,
                                                         ref_eqres, logits0)):
                     if mat_h is ref_hit5 and not with_prior_ref:
@@ -217,7 +247,7 @@ def paired_bootstrap(hit_a, hit_b, n_boot=10000, seed=7):
         boots[b] = diff[rng.integers(0, n, n)].mean()
     lo, hi = np.percentile(boots, [2.5, 97.5])
     p = 2 * min((boots <= 0).mean(), (boots >= 0).mean())
-    return float(diff.mean()), (float(lo), float(hi)), float(max(p, 1.0 / n_boot))
+    return float(diff.mean()), (float(lo), float(hi)), float(min(1.0, max(p, 1.0 / n_boot)))
 
 
 def main():
@@ -236,17 +266,28 @@ def main():
     ap.add_argument("--seed", type=int, default=20260702)
     ap.add_argument("--src-filter", default="", help="消融：只用这些源训练，如 live_opp")
     ap.add_argument("--eval-only", action="store_true")
-    ap.add_argument("--residual-scale", type=float, default=1.0,
-                    help="评估期残差温度（<1 向 B2b 插值，校准 q 用）")
+    ap.add_argument("--residual-scale", default="1.0",
+                    help="评估期残差温度（<1 向 B2b 插值，校准 q 用）；标量或逐街 4 值"
+                         "如 '1.0,0.9,0.8,0.7'")
     ap.add_argument("--eqtab", default="artifacts/range_ml/eqtab_v1.npz",
                     help="equity 残差表（range_eqtab_build 产出；缺失则跳过该指标）")
+    ap.add_argument("--use-shows", action="store_true",
+                    help="亮牌记忆通道（需 range_shows_sidecar 产出的侧车）")
+    ap.add_argument("--shows-npz", default="artifacts/range_ml/shows_v1.npz")
+    ap.add_argument("--pretrain-epochs", type=int, default=0,
+                    help=">0：先在 slumbot 全知源（w=1.0）上预训 N epoch 再混源微调")
     args = ap.parse_args()
+
+    rs_list = [float(x) for x in str(args.residual_scale).split(",")]
+    assert len(rs_list) in (1, 4), "--residual-scale 需 1 或 4 个值"
+    rscale = rs_list[0] if len(rs_list) == 1 else rs_list
 
     torch.manual_seed(args.seed)
     torch.set_num_threads(2)
     rng = np.random.default_rng(args.seed)
 
-    data = SeqData(os.path.join(args.ds, "seq_v1.npz"))
+    data = SeqData(os.path.join(args.ds, "seq_v1.npz"),
+                   shows_path=args.shows_npz if args.use_shows else None)
     src_names = {0: "live_opp", 1: "live_hero", 2: "slumbot"}
     train_mask = data.split == 0
     if args.src_filter:
@@ -258,11 +299,35 @@ def main():
     print(f"[train] sequences: train={len(train_idx)} val={len(val_idx)} test={len(test_idx)} "
           f"fdim={data.fdim}", flush=True)
 
-    model = ResidualGRU(data.fdim, d=args.d, dropout=args.dropout)
+    model = ResidualGRU(data.fdim, d=args.d, dropout=args.dropout,
+                        use_shows=args.use_shows)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[train] params={n_params/1e6:.2f}M", flush=True)
+    print(f"[train] params={n_params/1e6:.2f}M use_shows={args.use_shows}", flush=True)
 
     if not args.eval_only:
+        if args.pretrain_epochs:
+            # 阶段 1：slumbot 全知源预训（w=1.0，常数 lr，无早停）
+            pre_idx = np.nonzero((data.split == 0) & (data.src == 2))[0]
+            popt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+            porder = pre_idx[np.argsort(data.lens[pre_idx], kind="stable")]
+            pbatches = [porder[i:i + args.batch] for i in range(0, len(porder), args.batch)]
+            for ep in range(args.pretrain_epochs):
+                model.train()
+                t0 = time.time()
+                rng.shuffle(pbatches)
+                for bidx in pbatches:
+                    batch = data.batch(bidx)
+                    batch["w"][:] = 1.0
+                    loss = loss_fn(model(batch["feat"], batch["lens"], batch.get("shows")),
+                                   batch, eps=args.eps)
+                    popt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    popt.step()
+                met, _ = snapshot_eval(model, data, val_idx)
+                print(f"[pretrain] ep{ep:03d} ({len(pre_idx)} slumbot) "
+                      f"val_snapNLL={np.mean([met[S]['nll'] for S in met]):.4f} "
+                      f"({time.time()-t0:.0f}s)", flush=True)
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
         # 按长度分桶再洗牌，减 padding
@@ -276,7 +341,8 @@ def main():
             tot = cnt = 0.0
             for bidx in batches:
                 batch = data.batch(bidx)
-                loss = loss_fn(model(batch["feat"], batch["lens"]), batch, eps=args.eps)
+                loss = loss_fn(model(batch["feat"], batch["lens"], batch.get("shows")),
+                               batch, eps=args.eps)
                 opt.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -292,7 +358,7 @@ def main():
                 best_nll, best_ep, bad = val_nll, ep, 0
                 torch.save({"model": model.state_dict(), "fdim": data.fdim,
                             "d": args.d, "args": vars(args), "epoch": ep,
-                            "val_nll": val_nll}, args.ckpt)
+                            "val_nll": val_nll, "use_shows": args.use_shows}, args.ckpt)
                 marker = " *best"
             else:
                 bad += 1
@@ -304,7 +370,10 @@ def main():
                 break
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
-    model = ResidualGRU(ck["fdim"], d=ck["d"], dropout=0.0)
+    model = ResidualGRU(ck["fdim"], d=ck["d"], dropout=0.0,
+                        use_shows=ck.get("use_shows", False))
+    if ck.get("use_shows", False) and data.shows is None:
+        data = SeqData(os.path.join(args.ds, "seq_v1.npz"), shows_path=args.shows_npz)
     model.load_state_dict(ck["model"])
     print(f"[eval] loaded {args.ckpt} (ep{ck['epoch']}, val_snapNLL={ck['val_nll']:.4f})", flush=True)
 
@@ -325,15 +394,17 @@ def main():
               f"- 训练：{len(train_idx)} 序列（源权重 live_opp 1.0/hero 0.3/slumbot 0.1"
               f"{'; src_filter=' + ta['src_filter'] if ta.get('src_filter') else ''}），"
               f"lr={ta['lr']} wd={ta['wd']} smooth={ta['eps']} dropout={ta['dropout']} "
-              f"batch={ta['batch']} seed={ta['seed']}",
+              f"batch={ta['batch']} seed={ta['seed']}"
+              f"{' **+亮牌记忆**' if ta.get('use_shows') else ''}"
+              f"{' **+slumbot 预训 ' + str(ta['pretrain_epochs']) + 'ep**' if ta.get('pretrain_epochs') else ''}",
               "- 口径：与 M0 harness 同（4 街末快照、top-k 平局按 (-p,k) 破、alive=观察者死牌）",
               ""]
-    if args.residual_scale != 1.0:
+    if rscale != 1.0:
         report.insert(3, f"- **残差温度 rscale={args.residual_scale}**（评估期向 B2b 插值）")
     final = {}
     for name, idxs in (("val", val_idx), ("test", test_idx)):
         met, mats = snapshot_eval(model, data, idxs, with_prior_ref=True,
-                                  rscale=args.residual_scale, eqtab=eqtab)
+                                  rscale=rscale, eqtab=eqtab)
         final[name] = (met, mats)
         report += [f"### {name} 切分（live_opp，n={len(idxs)}）", "",
                    "| 街 | top-1 | **top-5** | top-10 | NLL | rank 均值 | rank 中位 | "
