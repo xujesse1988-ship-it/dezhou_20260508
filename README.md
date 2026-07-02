@@ -8,7 +8,7 @@ It covers two tracks that share one core — **heads-up (2-player) 200BB** and *
 vectors) are kept `n_seats`-generic so nothing has to be rewritten when moving between 2 and 6
 players.
 
-- **Language / stack**: Rust 2021, pinned toolchain `1.95.0` (`rust-toolchain.toml`), `unsafe` forbidden.
+- **Language / stack**: Rust 2021, pinned toolchain `1.95.0` (`rust-toolchain.toml`).
 - **Algorithm**: External-Sampling MCCFR / LCFR (Brown & Sandholm 2018 Discounted MCCFR), dense
   tabular backend, streaming checkpoints, information abstraction (169 lossless preflop + equity/OCHS
   postflop buckets).
@@ -63,22 +63,6 @@ blueprint is trained, and how real-time search refines it at the table.
 
 ---
 
-## Verified Algorithm Correctness
-
-This is the reusable foundation the solver is built on. Each row has an external cross-check
-(invariant #7: no algorithm change ships without one).
-
-| Item | Status | Evidence |
-|---|---|---|
-| Kuhn / Leduc Vanilla CFR | ✅ converges to closed-form `-1/18`, exploitability `<0.1` | `tests/cfr_kuhn.rs`, `tests/cfr_leduc.rs` |
-| Leduc ES-MCCFR / LCFR-MCCFR | ✅ `ev_p0` → -0.087; ES path BLAKE3 byte-equal anchor | `tools/leduc_es_mccfr_report` |
-| Simplified NLHE ES-MCCFR / LCFR | ✅ LCFR 100M LBR 1,233 → 500M 1,126 (saturates by 100M) | `run_lcfr_*` (vultr) |
-| Dense backend + v4 bucket | ✅ byte-equal vs HashMap; ~2.2× throughput, flat 5.2 GiB RAM, no checkpoint blowup | `tests/dense_nlhe_trainer.rs` |
-| AIVAT evaluator | ✅ unbiased (full proof); 1.21× variance reduction on real logs | `tests/aivat_nlhe_*.rs`, `docs/aivat_eval.md` |
-| CFR trainer / rules engine, 6-max N-generic | ✅ multi-way side pot returns per-seat payoff vector; traverser rotates `% n_players` | `src/training/trainer.rs`, `src/rules/state.rs` |
-
----
-
 ## Repository Layout
 
 ```
@@ -129,48 +113,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test                       # default suite
 cargo test --release -- --ignored  # long-running perf/correctness SLOs + BLAKE3 anchors
 ```
-
-Optional PokerKit cross-validation:
-
-```bash
-uv venv --python 3.11 .venv-pokerkit
-uv pip install --python .venv-pokerkit/bin/python "pokerkit==0.4.14"
-PATH=".venv-pokerkit/bin:$PATH" cargo test
-```
-
-> **Where tests run**: the local machine is only trusted for `build` / `fmt` / `clippy`. Full training and
-> the long test suite run on a remote host (results from an underpowered local box are not trustworthy).
-
 ---
 
-## Hard Invariants (enforced by the compiler / clippy / `Cargo.toml`)
-
-See [`docs/invariants.md`](./docs/invariants.md). A PR violating these does not pass.
-
-1. **No floats** in the rules / evaluator / abstraction layers — chips are `u64`, payoffs `i64`, hand rank is
-   an integer, bucket ids are discrete. Floats are only allowed inside CFR σ/regret accumulation.
-2. **No global RNG** — all randomness flows through an explicit `RngSource`; byte-equal reproducibility is the
-   minimum bar for catching algorithm bugs.
-3. **No `unsafe`** — `unsafe_code = "forbid"` in `Cargo.toml`.
-4. **`ChipAmount::Sub` underflow panics** (debug + release) — a negative chip count is always a bug; use
-   `checked_sub` for saturating behavior.
-5. **`Action::Raise { to }` is absolute** — `to` is the target amount (including chips already in), matching
-   the NLHE / PokerKit convention.
-6. **One seat-direction convention** — `SeatId((k+1) mod n_seats)` is the left neighbor of `SeatId(k)`;
-   every "to the left" rule (button rotation, blinds, odd-chip, showdown order, deal start) uses it.
-
----
-
-## Infrastructure
-
-| Host | Role | Notes |
-|---|---|---|
-| vultr (4 vCPU / 11.67 GiB) | persistent storage + short tests | holds 1B dense checkpoints + bucket tables; **cannot run NLHE training** (3M updates hit swap) |
-| AWS (on-demand, IP varies) | training | HU used `c6a.8xlarge` (32 vCPU); 6-max likely needs a bigger box, sized in S2 |
-
-Persistent artifacts (1B dense checkpoint, bucket tables) live under `~/dezhou_20260508/artifacts/` on vultr.
-
----
 
 ## Working Language
 
