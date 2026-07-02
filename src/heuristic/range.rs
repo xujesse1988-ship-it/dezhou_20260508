@@ -270,6 +270,69 @@ fn build_class_combos() -> Vec<Vec<(u8, u8)>> {
 }
 
 // ===========================================================================
+// RangeVec —— §2.1 加权 range：169 类归一化质量分布（equity_weighted 的消费面）
+// ===========================================================================
+
+/// combo 权重（pair=6 / suited=4 / offsuit=12），沿用 `equity.rs:103` 的约定。
+/// 下标轴 = [`canonical_index`]：pair 0..12 / suited 13..90 / offsuit 91..168。
+pub(crate) fn combo_weight(idx: usize) -> u32 {
+    if idx < 13 {
+        6
+    } else if idx < 13 + 78 {
+        4
+    } else {
+        12
+    }
+}
+
+/// 单个对手在某决策点的 range：169 类的归一化质量分布
+/// （`docs/multi_field_strategy_design.md` §2.1）。下标轴 = [`canonical_index`]：
+/// pair 0..12 / suited 13..90 / offsuit 91..168。
+/// [`EquityEngine::equity_weighted`](super::equity::EquityEngine::equity_weighted)
+/// 按类质量平摊到「去死牌后存活的具体 combo」采样对手手牌（§2.5）。
+#[derive(Clone, Debug)]
+pub struct RangeVec {
+    /// mass[idx] = 该 169 类整体占对手 range 的概率质量；`normalize` 后 ∑mass == 1。
+    pub mass: [f64; 169],
+}
+
+impl RangeVec {
+    /// 除以总和归一。总和 ≤ 0（全零/退化）→ 退化成 169 类**均匀分布**（鲁棒兜底，
+    /// 绝不留下非法的全零分布；与 `equity()` 空 range「退化成任意两张」同精神）。
+    pub fn normalize(&mut self) {
+        let sum: f64 = self.mass.iter().sum();
+        if sum > 0.0 {
+            let inv = 1.0 / sum;
+            for m in &mut self.mass {
+                *m *= inv;
+            }
+        } else {
+            let u = 1.0 / 169.0;
+            for m in &mut self.mass {
+                *m = u;
+            }
+        }
+    }
+
+    /// 迁移锚点：把旧标量阈值模型精确复刻成硬 membership 向量（设计 §2.1）。
+    /// `mass[idx] = combo_weight(idx)`（若 `strength[idx] >= thr`，否则 0），随后归一。
+    ///
+    /// 退化行为：`thr` 过紧（无任何类满足，如 `thr=1.0` 而最大强度 < 1.0）→ 全零 →
+    /// `normalize` 兜底成 169 类均匀（对应 `equity()` 空 range 时「退化成任意两张」的语义）。
+    pub fn from_threshold(thr: f64, eq: &EquityEngine) -> RangeVec {
+        let mut mass = [0.0f64; 169];
+        for (idx, m) in mass.iter_mut().enumerate() {
+            if eq.strength[idx] >= thr {
+                *m = combo_weight(idx) as f64;
+            }
+        }
+        let mut rv = RangeVec { mass };
+        rv.normalize();
+        rv
+    }
+}
+
+// ===========================================================================
 // RangeModel
 // ===========================================================================
 

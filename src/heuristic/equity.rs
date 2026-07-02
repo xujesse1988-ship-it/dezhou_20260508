@@ -10,6 +10,10 @@
 use crate::core::Card;
 use crate::eval::eval7 as eval7_pub;
 use crate::eval::HandRank;
+use crate::heuristic::range::RangeVec;
+
+/// 加权采样 CDF 的每 combo 最小权重地板（守 CDF 严格递增，二分良定义）。
+const W_EPS: f64 = 1e-12;
 
 // ===========================================================================
 // 快速确定性 PRNG（wyrand）——无全局状态，满足可复现约束。
@@ -269,6 +273,175 @@ impl EquityEngine {
         }
         win_sum / samples as f64
     }
+
+    /// **加权版多人蒙特卡洛 equity**（`docs/multi_field_strategy_design.md` §2.5）：
+    /// 与 [`equity`](Self::equity) 完全同构，唯一区别是每个对手的隐藏牌不再来自「硬阈值
+    /// 过滤 + 均匀抽」，而来自 [`RangeVec`] 的**加权 CDF**——类质量 `mass[idx]` 平摊到
+    /// 「去死牌后存活的具体 combo」，再按累积权重二分采样。听牌 / polar 形态由 `mass` 表达。
+    ///
+    /// `opp_ranges` 为空 → 返回 1.0（同 `equity`）。空 range（某对手全零质量）→ 退化成
+    /// 该对手在全部 `avail` pair 上均匀（复刻 `equity` 的空池兜底 `:188-195`）。
+    pub fn equity_weighted(
+        &self,
+        hole: [Card; 2],
+        board: &[Card],
+        opp_ranges: &[RangeVec],
+        samples: u32,
+        seed: u64,
+    ) -> f64 {
+        let n_opp = opp_ranges.len();
+        if n_opp == 0 {
+            return 1.0;
+        }
+        // dead = hole + board。
+        let mut dead: u64 = 0;
+        let mut hero_cards: Vec<u8> = Vec::with_capacity(7);
+        for c in hole.iter().chain(board.iter()) {
+            let b = c.to_u8();
+            dead |= 1u64 << b;
+            hero_cards.push(b);
+        }
+        let avail: Vec<u8> = (0..52u8).filter(|c| dead & (1u64 << c) == 0).collect();
+
+        // 第一遍：每类在 `avail` 上的存活 combo 数（类质量平摊的分母）。
+        let mut n_alive = [0u32; 169];
+        for i in 0..avail.len() {
+            for j in (i + 1)..avail.len() {
+                let ca = Card::from_u8(avail[i]).unwrap();
+                let cb = Card::from_u8(avail[j]).unwrap();
+                n_alive[canonical_index(ca, cb)] += 1;
+            }
+        }
+
+        // 第二遍：每个对手一条加权 CDF（`(a, b, acc)`，`acc` 单调递增）。
+        let mut allowed: Vec<Vec<(u8, u8, f64)>> = Vec::with_capacity(n_opp);
+        for r in opp_ranges {
+            let mut cdf: Vec<(u8, u8, f64)> = Vec::new();
+            let mut acc = 0.0f64;
+            for i in 0..avail.len() {
+                for j in (i + 1)..avail.len() {
+                    let a = avail[i];
+                    let b = avail[j];
+                    let ca = Card::from_u8(a).unwrap();
+                    let cb = Card::from_u8(b).unwrap();
+                    let idx = canonical_index(ca, cb);
+                    if r.mass[idx] <= 0.0 {
+                        continue;
+                    }
+                    // 类质量平摊到存活 combo。na>=1（本 pair 就在类 idx 内）。
+                    let w = r.mass[idx] / n_alive[idx] as f64;
+                    // TODO combo_refine: per-combo 花色精确 draw 似然（§2.5），v1 省略。
+                    acc += w.max(W_EPS);
+                    cdf.push((a, b, acc));
+                }
+            }
+            if acc <= 0.0 {
+                // 空 range 兜底：全部 avail pair 均匀（复刻 equity() 的 :188-195）。
+                cdf.clear();
+                let mut acc2 = 0.0f64;
+                for i in 0..avail.len() {
+                    for j in (i + 1)..avail.len() {
+                        acc2 += 1.0;
+                        cdf.push((avail[i], avail[j], acc2));
+                    }
+                }
+            }
+            allowed.push(cdf);
+        }
+
+        let board_need = 5usize.saturating_sub(board.len());
+        let mut rng = Rng::new(seed);
+        let mut win_sum = 0.0f64;
+        let evaluator_board_base: Vec<u8> = board.iter().map(|c| c.to_u8()).collect();
+
+        for _ in 0..samples {
+            let mut used = dead;
+            // 抽对手手牌（加权 CDF 二分 + 冲突重抽 40 次 + draw_unused 兜底）。
+            let mut opp_hole: Vec<(u8, u8)> = Vec::with_capacity(n_opp);
+            let mut ok = true;
+            for cdf in &allowed {
+                let total = cdf.last().map(|e| e.2).unwrap_or(0.0);
+                let mut got = None;
+                for _try in 0..40 {
+                    let (a, b) = sample_cdf(cdf, total, &mut rng);
+                    if used & (1u64 << a) == 0 && used & (1u64 << b) == 0 {
+                        got = Some((a, b));
+                        break;
+                    }
+                }
+                let (a, b) = match got {
+                    Some(p) => p,
+                    None => {
+                        // 兜底：随机两张未用牌（同 equity()）。
+                        let a = draw_unused(&mut rng, used);
+                        used |= 1u64 << a;
+                        let b = draw_unused(&mut rng, used);
+                        (a, b)
+                    }
+                };
+                used |= 1u64 << a;
+                used |= 1u64 << b;
+                opp_hole.push((a, b));
+                if a == b {
+                    ok = false;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // 补全公共牌。
+            let mut full_board = evaluator_board_base.clone();
+            for _ in 0..board_need {
+                let c = draw_unused(&mut rng, used);
+                used |= 1u64 << c;
+                full_board.push(c);
+            }
+            // 评估（与 equity() 逐字同构）。
+            let hero_rank = eval7_cards(hero_cards[0], hero_cards[1], &full_board);
+            let mut best_opp = HandRank(0);
+            let mut tie_top = 1u32; // 含我方
+            let mut hero_best = true;
+            for &(a, b) in &opp_hole {
+                let r = eval7_cards(a, b, &full_board);
+                if r > hero_rank {
+                    hero_best = false;
+                    break;
+                } else if r == hero_rank {
+                    tie_top += 1;
+                }
+                if r > best_opp {
+                    best_opp = r;
+                }
+            }
+            if hero_best {
+                if tie_top == 1 {
+                    win_sum += 1.0;
+                } else {
+                    win_sum += 1.0 / tie_top as f64;
+                }
+            }
+        }
+        win_sum / samples as f64
+    }
+}
+
+/// 在加权 CDF 上二分采样一个 combo。`total` = `cdf.last().2`；`x = rng.unit()·total`
+/// ∈ [0, total)，返回第一个累积权重 > x 的 combo。`cdf` 非空由调用方保证。
+#[inline]
+fn sample_cdf(cdf: &[(u8, u8, f64)], total: f64, rng: &mut Rng) -> (u8, u8) {
+    let x = rng.unit() * total;
+    let mut lo = 0usize;
+    let mut hi = cdf.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if cdf[mid].2 <= x {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let idx = lo.min(cdf.len() - 1);
+    (cdf[idx].0, cdf[idx].1)
 }
 
 #[inline]
