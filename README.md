@@ -17,6 +17,52 @@ players.
 
 ---
 
+## Core Work
+
+Three pieces carry the solver from rules to real play: how hands are bucketed, how the offline
+blueprint is trained, and how real-time search refines it at the table.
+
+### Information abstraction (bucketing)
+
+- **Preflop is 169-class lossless**: the 1,326 starting hands collapse to 13 pocket pairs + 78 suited
+  + 78 offsuit. Preflop equity is suit-invariant within a class, so this loses no information.
+- **Postflop** uses per-street 16-dim feature vectors — flop/turn = 8-bin equity histogram + 8-bin
+  OCHS, river = OCHS-16 — clustered by k-means (HU production 1000/1000/1000, 6-max 200/200/200 per
+  flop/turn/river). OCHS (Opponent Cluster Hand Strength) is expanded to the combo level so monotone /
+  paired / two-tone boards are scored correctly.
+- Clusters are reordered so **cluster 0 = weakest** (ascending EHS median); the bucket table is schema
+  v4 (v3 tables are rejected, not silently mis-read). Beyond the hand bucket, `InfoSetId` carries
+  position, stack depth, and betting state as separate dimensions.
+- 6-max **reuses the heads-up single-opponent buckets up to 3-way** — verified, not assumed (river OCHS
+  Spearman 0.9995; flop/turn cluster agreement within the k-means seed noise floor).
+
+### Blueprint (offline training)
+
+- Trained by **External-Sampling MCCFR**, optionally with **Linear CFR** discounting (Brown & Sandholm
+  2018 Discounted MCCFR), on a **dense tabular backend** (byte-equal to the HashMap backend, ~2.2×
+  throughput, flat RAM) to ~1B sampled updates with streaming checkpoints.
+- Action abstraction is **pot-relative bet sizes**. The 6-max abstraction (A3×A4) caps postflop at
+  ≤3-way and uses a curated size set, because small bets explode the tree. `--reshape` optionally drops
+  non-SB open-limps and adds a 2.25BB open to clean up preflop dominated-pair flips.
+- Stakes: **HU 200BB** (Slumbot-aligned), **6-max 100BB** (Pluribus-aligned). At play time an advisor
+  consults the blueprint through an "abstraction shadow" per net, mapping off-tree bet sizes; a
+  structural action-set gap raises an explicit desync instead of silently collapsing.
+
+### Real-time search
+
+- A Pluribus / Modicum-style **tabular depth-limited subgame search** that replaces only the "ask the
+  blueprint for a distribution" step — it reuses the same MCCFR trainer through a `SubgameNlheGame` that
+  overrides only the tree root.
+- The trigger is **flop-first by default** (neutral); widening it to all post-flop nodes regresses on the
+  current base, so that is research opt-in. The MVP solves subtrees to true terminals; depth-limited
+  blueprint-continuation leaf values (with biased continuations) are also available.
+- **Exploitation (Tier 2, `--exploit on|vpip|off`, default off)** profiles opponents in-process
+  (VPIP / PFR / postflop AF), gates on statistical convergence, then convex-mixes the opponent's preflop
+  range toward observed width on the unanchored search path. Default-off is byte-equal with the shipped
+  strategy.
+
+---
+
 ## Verified Algorithm Correctness
 
 This is the reusable foundation the solver is built on. Each row has an external cross-check
@@ -123,19 +169,6 @@ See [`docs/invariants.md`](./docs/invariants.md). A PR violating these does not 
 | AWS (on-demand, IP varies) | training | HU used `c6a.8xlarge` (32 vCPU); 6-max likely needs a bigger box, sized in S2 |
 
 Persistent artifacts (1B dense checkpoint, bucket tables) live under `~/dezhou_20260508/artifacts/` on vultr.
-
----
-
-## Documentation Map
-
-Read in order of authority (highest first):
-
-1. [`docs/status_v3.md`](./docs/status_v3.md) — ground-truth code status. **Read the correctness table before touching code.**
-2. [`docs/invariants.md`](./docs/invariants.md) — hard code-level constraints.
-3. [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md) — 6-max blueprint-only target (S1–S6 gates).
-4. [`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md) — heads-up phase (H1–H5).
-5. [`docs/aivat_eval.md`](./docs/aivat_eval.md) — AIVAT evaluator details.
-6. [`CLAUDE.md`](./CLAUDE.md) / [`AGENTS.md`](./AGENTS.md) — repo navigation and working rules for coding agents.
 
 ---
 

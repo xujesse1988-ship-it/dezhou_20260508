@@ -15,6 +15,43 @@
 
 ---
 
+## 核心工作
+
+从规则到实测对战，靠三块工作串起来：牌怎么分桶、离线 blueprint 怎么训、实时搜索怎么在牌桌上细化它。
+
+### 信息抽象（分桶）
+
+- **翻前 169 类 lossless**：1,326 个起手牌收敛为 13 对子 + 78 同花 + 78 非同花。翻前 equity 在类内
+  suit-invariant，所以这一步不丢信息。
+- **翻后**用每条街 16 维特征向量——flop/turn = 8 桶 equity 直方图 + 8 桶 OCHS，river = OCHS-16——
+  用 k-means 聚类（HU 生产 1000/1000/1000，6-max 200/200/200，按 flop/turn/river）。OCHS（Opponent
+  Cluster Hand Strength）在 combo 级展开，所以单色 / 对面 / 双色牌面能被正确打分。
+- 簇按 EHS 中位数升序重排，**簇 0 = 最弱**；桶表 schema 为 v4（v3 表直接拒读，不会静默错读）。除手牌桶外，
+  `InfoSetId` 还把位置、筹码深度、下注状态作为独立维度携带。
+- 6-max **复用 heads-up 的单对手桶，最多到 3-way**——已验证而非假设（river OCHS Spearman 0.9995；
+  flop/turn 簇一致性落在 k-means 种子噪声地板内）。
+
+### Blueprint（离线训练）
+
+- 用 **External-Sampling MCCFR** 训练，可选叠加 **Linear CFR** 折扣（Brown & Sandholm 2018 Discounted
+  MCCFR），跑在 **dense 表后端**（对 HashMap 后端 byte-equal、吞吐 ~2.2×、RAM 平稳），训到约 1B 采样
+  update，配流式 checkpoint。
+- 动作抽象是 **pot 相对的下注档**。6-max 抽象（A3×A4）把翻后封顶 ≤3-way 并用精选档位，因为小注会让树爆炸。
+  `--reshape` 可选删掉非 SB 的 open-limp 并加一档 2.25BB 开池，清理翻前支配对翻转。
+- 码深：**HU 200BB**（对齐 Slumbot）、**6-max 100BB**（对齐 Pluribus）。实战时 advisor 通过每张网一个
+  "抽象影子" 查 blueprint，把脱树下注档做 off-tree 映射；遇到结构性动作集缺口会显式报 desync，而不是静默塌缩。
+
+### 实时搜索
+
+- Pluribus / Modicum 风格的**表式深度受限子博弈搜索**，只替换 "向 blueprint 要一个分布" 这一步——通过一个
+  只重写树 root 的 `SubgameNlheGame` 复用同一套 MCCFR trainer。
+- 触发默认 **flop-first**（中性）；放宽到所有翻后节点会在当前基底上退化，所以那是研究性开关。MVP 把子树解到真
+  终局；也提供深度受限的 blueprint 续局叶子值（含 biased 续局）。
+- **叠加剥削（Tier 2，`--exploit on|vpip|off`，默认 off）** 在进程内画像对手（VPIP / PFR / 翻后 AF），
+  过统计收敛门后，在脱锚搜索路径上把对手翻前 range 向观测宽度做凸混合。默认 off 与现网策略 byte-equal。
+
+---
+
 ## 算法正确性（已验证的基础）
 
 这是整个求解器所建立在的可复用基础。每一行都有外部对照（不变量 #7：改算法必须有外部对照才能落地）。
@@ -117,19 +154,6 @@ PATH=".venv-pokerkit/bin:$PATH" cargo test
 | AWS（按需起停，IP 每次变） | 训练 | HU 用 `c6a.8xlarge`（32 vCPU）；6-max 大概率不够，待 S2 sizing 定更大机 |
 
 持久 artifact（1B dense ckpt、桶表）在 vultr 的 `~/dezhou_20260508/artifacts/`。
-
----
-
-## 文档导航
-
-按权威级别从高到低读：
-
-1. [`docs/status_v3.md`](./docs/status_v3.md) —— 代码真实状态。**先看正确性表，再决定要不要动代码。**
-2. [`docs/invariants.md`](./docs/invariants.md) —— 代码层硬约束。
-3. [`docs/six_max_nlhe_target.md`](./docs/six_max_nlhe_target.md) —— 6-max blueprint-only 目标（S1–S6 门槛）。
-4. [`docs/heads_up_nlhe_solver_target.md`](./docs/heads_up_nlhe_solver_target.md) —— heads-up 阶段（H1–H5）。
-5. [`docs/aivat_eval.md`](./docs/aivat_eval.md) —— AIVAT 评测器细节。
-6. [`CLAUDE.md`](./CLAUDE.md) / [`AGENTS.md`](./AGENTS.md) —— 仓库导航 + 给编码 agent 的工作规则。
 
 ---
 
