@@ -299,6 +299,11 @@ legalize 降级占比，§8④）；旧日志无 trace 优雅降级（run30 实�
 trace 多算 equity）；`cargo test` 全绿（`heuristic9` 10/10 + 新增 `heuristic9_trace` 6 测、
 P0-1 派生量 3 测）；fmt / clippy 全绿。
 
+**2026-07-03 纪律更新（用户拍板）：byte-equal 兼容门退役。** 它只是 Phase A 一次性的发布
+条件——Phase B 起重构**不再兼容旧行为**、以「重新做一个、做得更好」为目标，仅过质量门
+（多 seed sim mbb/g 不退 + 0 fallback / 0 重建漂移 + 样本纪律），见
+`docs/scenario_heuristic_design.md` §6 纪律更新。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街

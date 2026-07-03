@@ -261,8 +261,8 @@ key 第一层维度的投影。
 ### 4.4 版本节奏
 
 每轮迭代：按 `热度 × EV 缺口 × 可造靶性` 排序，取 **top-K（K ≈ 单位数到十位数）** 节点
-处理。场景库的生长是**多轮累积**的结果，不是一轮铺几千个——初版只需把现有隐式树 1:1
-显式化（Phase B），之后每轮长几个节点。
+处理。场景库的生长是**多轮累积**的结果，不是一轮铺几千个——初版以现有隐式树的节点清单
+（§3.2.1）为**起点**显式化（Phase B，不受等价迁移约束），之后每轮长几个节点。
 
 ---
 
@@ -314,12 +314,20 @@ equity 信号越干净，节点参数才调得动——**先有好输入，再�
 
 ## 6. 落地路线（三阶段，每步可验）
 
-**Phase A — 纯遥测（零行为变化，byte-equal）。**
+> **纪律更新（2026-07-03，用户拍板）：兼容性等价门解除。**
+> 「与旧代码 byte-equal / 1:1 等价迁移」只是 Phase A（纯增遥测）的发布条件，使命已随
+> Phase A 落地而完成。这是一次大重构，目标是**重新做一个、做得更好**——从 Phase B 起
+> **不再为兼容旧行为设任何门**：分派条件、节点边界、参数默认值、已知 bug 都允许且应当
+> 在重构中直接改好。**质量门保留且不放松**（它们约束的是「不能变差」，不是「不能变」）：
+> 多 seed sim 回归门（mbb/g 不退 + CI）、0 fallback / 0 重建漂移、§4 样本纪律、
+> `invariants.md`（同 seed 确定性复现是调试基线，与兼容旧行为无关）。
+
+**Phase A — 纯遥测（已完成；发布条件为零行为变化）。**
 给 `decide` 加节点 trace：每个决策打上「场景路径 + 驱动信号（equity、made、关键阈值比较
 结果）+ 所选动作」，经 advisor 落进 action log；`heuristic9_analyze.py` 加按节点聚合
-`(n, EV, CI, 动作分布)`。trace 只写不读，**决策路径逐字节不变**（sim 回归门一票否决）。
-产出：现有隐式树的**热度 / 盈亏 / 兜底率图**——它直接回答「先拆哪里」，让 Phase C 的
-优先级不靠拍脑袋。顺带落 P0-1 派生量（纯增字段，同样 byte-equal）。
+`(n, EV, CI, 动作分布)`。trace 只写不读，发布时以「决策路径逐字节不变」验证纯增性
+（该门随 Phase A 完成而退役，见上方纪律更新）。产出：现有隐式树的**热度 / 盈亏 /
+兜底率图**——它直接回答「先拆哪里」，让 Phase C 的优先级不靠拍脑袋。顺带落 P0-1 派生量。
 
 > **落地状态（2026-07-02）：已落地。**
 > - **引擎**：`Decision.trace`（`src/heuristic/trace.rs`：`DecisionTrace` = 完整节点路径 +
@@ -342,11 +350,16 @@ equity 信号越干净，节点参数才调得动——**先有好输入，再�
 > - **范围外**：`i_have_initiative()` 过期主动权 bug 是行为变更，本阶段不碰（Phase B+）。
 > - 节点 id 清单见 §3.2.1。
 
-**Phase B — 显式分派重构（1:1 等价迁移）。**
-把 `preflop_decide` / `postflop_decide` 的 if 结构拆成显式节点表（节点 enum/id + 分派 +
-每节点参数收进 config 新子树）。**先不改任何行为**：默认参数下与旧代码 byte-equal
-（一票否决门），trace 从「事后标注」变「分派即路径」。此阶段结束，场景森林作为代码结构
-存在，节点数 ≈ 现有隐式分支数（约 30–60 个）。
+**Phase B — 场景森林重构（重新做，以更好为目标）。**
+把 `preflop_decide` / `postflop_decide` 的隐式 if 结构**重写**为显式节点森林（节点 enum +
+`match` 分派，§8⑤；每节点参数收进 config 新子树），trace 从「事后标注」变「分派即路径」。
+**不受旧行为约束**：不做 1:1 等价迁移、不设 byte-equal 门——§3.2.1 的 22 个节点只是
+结构起点，分派条件与节点边界按 §1/§3 的正确形态直接重画（如 3bet 池与 SRP 分节点、
+池型/角色进 key），已知 bug 顺手修掉（`i_have_initiative` 过期主动权首当其冲）。
+**门 = 质量门**：多 seed sim（如 seed 7/11/23 × mixed/limpy/station，8000 手）mbb/g
+不退 + 0 fallback + 0 重建漂移；行为差异用 Phase A 遥测逐节点对比（同一坐标系，前后可
+对齐）——每处变化要能说出为什么更好，说不出的按 §4.2 反例警惕。此阶段结束，场景森林
+作为代码结构存在，节点数 ≈ 几十个。
 
 **Phase C — 逐节点迭代（常态循环）。**
 按 Phase A 的图跑 §4.1 闭环：每轮 top-K 节点 → 造靶 baseline → 拆分/调参 → 回归门。
@@ -360,7 +373,7 @@ check-raise 计划节点（P1-1）、翻前 3bet-bluff 频率（P1-4）。「几
 
 | 原项 | 内容 | 新角色 / 去向 |
 |---|---|---|
-| **P0-1** | 行动线记忆。数据基座**已落**（`seat_actions`，`view.rs:228`；`street_aggressors`，`view.rs:231`；`tests/heuristic_p0_1_action_line.rs`）| **剩余部分升格为场景 key 前置**：派生量（`villain_capped` / `is_delayed_cbet` / `facing_barrel_n`）+ `i_have_initiative()` 过期主动权修复（行为变更、须 sim 门）→ Phase A/B |
+| **P0-1** | 行动线记忆。数据基座**已落**（`seat_actions`，`view.rs:228`；`street_aggressors`，`view.rs:231`；`tests/heuristic_p0_1_action_line.rs`）| 派生量（`villain_capped` / `is_delayed_cbet` / `facing_barrel_n`）**已随 Phase A 落地**；`i_have_initiative()` 过期主动权修复 → Phase B 直接修（过 sim 质量门即可，等价门已解除） |
 | **P0-2** | 下注尺寸引擎（多档尺寸 / 跨街 geometry / 接线 `size_mid`）| 融入节点参数化：尺寸 = 节点参数的一部分，Phase C 按节点落，不再是独立引擎 |
 | **P0-3** | per-street 对手统计（fold-to-cbet 等）+ 连续剥削 | 与 `opponent_features_inventory.md` 合流 → §5.2 节点计数表；剥削从「离散 ±cap」改「节点级连续查询」 |
 | **P1-1** | check-raise 专家 | 新场景节点（OOP 无主动权 × 强牌/强听 → check 计划 raise），Phase C；须配「会 cbet 的 aggressor」靶 baseline（P1-5）|
