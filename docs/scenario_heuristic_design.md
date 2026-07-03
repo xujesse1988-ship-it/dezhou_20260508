@@ -147,6 +147,43 @@
    `….unopened.paired`），父节点退化成「其余情况」兜底但 id 不变；
 3. 每个 Decision 记录**完整节点路径**，不只叶 id——路径前缀聚合让「拆分前后」的数据可对齐。
 
+### 3.2.1 Phase A 节点 id 清单（2026-07-02 落地）
+
+Phase A 的「节点」= **现有 if 分支的显式命名**（以实际代码分支为准，不发明代码里不存在的
+分支）；街 / 池型等由 §1.1 场景 key 维度单独记录，故 id 比 §3.2 的完整格式短一层——Phase B
+分派重构时再按需长出 `<pot_type>` 等层级（前缀不变，规则 2 兼容）。trace 记完整前缀路径
+（如 `pre → pre.facing_raise → pre.facing_raise.odds_call`）。叶节点与代码分支的对应
+（`source` 标签是既有稳定锚，两者可互相校验）：
+
+| 叶节点 id | `Decision.source` | 代码分支（`src/heuristic/policy.rs`） |
+|---|---|---|
+| `pre.short.shove` | `preflop:shove` | 短栈（<25bb）推全下 |
+| `pre.unopened.open` | `preflop:open` | 无人加注：开池 / iso |
+| `pre.unopened.limp_behind` | `preflop:limp_behind` | 无人加注：投机跟注（set-mine）|
+| `pre.unopened.check_option` | `preflop:check_option` | 无人加注：BB check option |
+| `pre.unopened.fold` | `preflop:fold` | 无人加注：弃牌 |
+| `pre.facing_raise.value_reraise` | `preflop:3bet` / `preflop:4bet` | 面对加注：价值再加注 |
+| `pre.facing_raise.odds_call` | `preflop:call` | 面对加注：赔率/强度平跟 |
+| `pre.facing_raise.check` | `preflop:check` | 面对加注：check（不一致输入边角）|
+| `pre.facing_raise.fold` | `preflop:fold_vs_raise` | 面对加注：弃牌 |
+| `post.unopened.value_bet` | `postflop:value_bet` | 无人下注：价值下注 |
+| `post.unopened.commit` | `postflop:commit_bet` | 无人下注：低 SPR 承诺注 |
+| `post.unopened.semibluff` | `postflop:semibluff` | 无人下注：听牌半诈唬 |
+| `post.unopened.cbet_bluff` | `postflop:cbet_bluff` | 无人下注：主动权方 c-bet 诈唬 |
+| `post.unopened.float` | `postflop:float_bluff` | 无人下注：无主动权低频诈唬 |
+| `post.unopened.check` | `postflop:check` | 无人下注：过牌（控池/放弃）|
+| `post.facing.value_raise` | `postflop:value_raise` | 面对下注：价值加注 |
+| `post.facing.semibluff_raise` | `postflop:semibluff_raise` | 面对下注：强听牌半诈唬加注 |
+| `post.facing.odds_call` | `postflop:call` | 面对下注：赔率跟注（含隐含折让）|
+| `post.facing.bluff_raise` | `postflop:bluff_raise` | 面对下注：纯诈唬加注（低频）|
+| `post.facing.check_back` | `postflop:check_back` | 面对下注：check（不一致输入边角）|
+| `post.facing.fold` | `postflop:fold` | 面对下注：弃牌 |
+| `fallback.no_hole` | `fallback:no_hole` | 异常兜底（`safe_fallback`，无手牌信息）|
+
+另有两类**非节点**的降级标记（都进兜底率分子，§8④）：policy 内降级（想 raise 但不可加注，
+`source` 带 `:downgrade[_call]` 后缀，节点仍归因原分支）；`legalize` 地板改动作/尺寸
+（`trace.legalized` 记 before/after，当前引擎正常路径不触发，属 belt-and-suspenders）。
+
 ### 3.3 三棵示例树（从直觉例子长出的正确形态）
 
 **树 A：翻前面对 3bet（`pre.3bp.facing_3bet.*`）。** 一层拆 IP/OOP，一层拆 HU/被 squeeze，
@@ -283,6 +320,27 @@ equity 信号越干净，节点参数才调得动——**先有好输入，再�
 `(n, EV, CI, 动作分布)`。trace 只写不读，**决策路径逐字节不变**（sim 回归门一票否决）。
 产出：现有隐式树的**热度 / 盈亏 / 兜底率图**——它直接回答「先拆哪里」，让 Phase C 的
 优先级不靠拍脑袋。顺带落 P0-1 派生量（纯增字段，同样 byte-equal）。
+
+> **落地状态（2026-07-02）：已落地。**
+> - **引擎**：`Decision.trace`（`src/heuristic/trace.rs`：`DecisionTrace` = 完整节点路径 +
+>   §1.1 场景 key（含 P0-1 派生维度 barrel_n / delayed_cbet / villains_capped）+ 实际
+>   evaluate 过的阈值比较（含频率门掷点）+ policy 输出快照 + `legalized` before/after，
+>   拍板点①：Decision 为单一事实源）。频率门掷点先绑定局部变量再比较——RNG 消费序列不变；
+>   trace 只记既有中间值（翻前 fold 短路路径的 equity 保持 `None`，不为 trace 多算）。
+> - **advisor / driver**：`Response.trace` 原样透传（一行 JSON），driver 对未知字段天然
+>   容忍、整条 resp 落 action log（`heuristic9_play.py` 零改动，`--selftest` 通过）。
+> - **analyze**：`heuristic9_analyze.py` 新增「节点聚合 Phase A trace」段——每节点
+>   `(n, hands, EV 均值 bb/hand, CI95, 动作分布)`，EV 口径=整手 net 摊给该手命中的所有节点
+>   （拍板点②，`hand_result.net` 按 `sent.hand_id` 关联）；h<30 标「待观察」（§4.3）；
+>   另报兜底率 =（source 落 `fallback` ∪ `trace.legalized` 非空）/ 全部决策（拍板点④）。
+>   旧日志（无 trace）优雅降级不崩（run30 实测）。
+> - **sim**：`heuristic9_sim --trace-summary`（opt-in）结束时打印叶节点热度表 + legalize
+>   降级数；默认关时输出与基线逐字节一致。
+> - **回归门**：9-max / 6-max / 2-max / `--exploit` / `--start-bb 400` 五条 8000 手基线
+>   （seed 7）**逐字节一致**；`cargo test` 全绿（新增 `tests/heuristic9_trace.rs` 6 测 +
+>   P0-1 派生量 3 测）；fmt / clippy 全绿。
+> - **范围外**：`i_have_initiative()` 过期主动权 bug 是行为变更，本阶段不碰（Phase B+）。
+> - 节点 id 清单见 §3.2.1。
 
 **Phase B — 显式分派重构（1:1 等价迁移）。**
 把 `preflop_decide` / `postflop_decide` 的 if 结构拆成显式节点表（节点 enum/id + 分派 +

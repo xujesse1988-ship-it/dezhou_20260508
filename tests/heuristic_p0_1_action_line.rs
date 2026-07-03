@@ -4,7 +4,9 @@
 //! - `seat_actions(seat)` 返回精确时序 + 权威街标；
 //! - `aggressor_on_street(1/2/3)` 暴露以前被丢弃的 flop/turn/river aggressor；
 //! - `seat_street_actions` 逐街过滤正确；
-//! - 无街标（启发式分段）路径下街标由重放 `street_idx` 派生。
+//! - 无街标（启发式分段）路径下街标由重放 `street_idx` 派生；
+//! - P0-1 派生量（Phase A 顺带落地，可进 trace 场景维度）：`villain_capped` /
+//!   `villains_capped` / `facing_barrel_n` / `is_delayed_cbet`。
 
 use poker::core::Street;
 use poker::heuristic::view::{GameView, HistAction, Request, ValidActions};
@@ -228,4 +230,137 @@ fn action_line_street_derived_from_replay_when_labels_absent() {
         Some(1),
         "flop aggressor = seat1（曾被丢弃，现暴露）"
     );
+}
+
+// ===========================================================================
+// P0-1 派生量（villain_capped / facing_barrel_n / is_delayed_cbet）
+// ===========================================================================
+
+fn ha(seat: u8, action: &str, to: Option<u64>, street: u8) -> HistAction {
+    HistAction {
+        seat,
+        action: action.into(),
+        to,
+        street: Some(street),
+    }
+}
+
+fn req_3max(my_seat: u8, board: Vec<&str>, actions: Vec<HistAction>) -> Request {
+    Request {
+        hole: vec!["Ah".into(), "Kd".into()],
+        board: board.into_iter().map(|s| s.to_string()).collect(),
+        button_seat: 0,
+        my_seat,
+        num_seats: 3,
+        small_blind: 10,
+        big_blind: 20,
+        actions,
+        valid: valid(false, true, true, 400, 940),
+        stacks: vec![1000; 3],
+        names: Default::default(),
+        sb_seat: None,
+        bb_seat: None,
+    }
+}
+
+/// 双管（double barrel）：villain 连开 flop + turn → 转牌 hero 面对 barrel_n=2；
+/// villain 线激进 → 不 capped；只在翻前弃牌的座（无翻后动作）也不 capped。
+#[test]
+fn derived_facing_barrel_n_double_barrel() {
+    // n=3, button=0（sb=1, bb=2, hero=2）。
+    // preflop: s0 raise→60, s1 fold, s2 call。flop: s2 check, s0 bet→80, s2 call。
+    // turn: s2 check, s0 bet→200 —— hero 面对第二管。
+    let v = GameView::from_request(&req_3max(
+        2,
+        vec!["7c", "2d", "9h", "Qs"],
+        vec![
+            ha(0, "raise", Some(60), 0),
+            ha(1, "fold", None, 0),
+            ha(2, "call", None, 0),
+            ha(2, "check", None, 1),
+            ha(0, "bet", Some(80), 1),
+            ha(2, "call", None, 1),
+            ha(2, "check", None, 2),
+            ha(0, "bet", Some(200), 2),
+        ],
+    ));
+    assert_eq!(v.street, Street::Turn);
+    assert_eq!(v.facing_barrel_n(), 2, "flop+turn 同一 villain 连开 → 2 管");
+    assert!(!v.is_delayed_cbet(), "flop 有 aggressor → 非 delayed c-bet");
+    assert!(!v.villain_capped(0), "villain 翻后有 bet → 未 capped");
+    assert!(
+        v.villain_capped(2),
+        "hero 自身线 check/call/check → capped（访问器座位通用）"
+    );
+    assert!(
+        !v.villains_capped(),
+        "在场对手 s0 未 capped → 全体 capped 为 false"
+    );
+    assert!(
+        !v.villain_capped(1),
+        "s1 仅翻前动作（fold）→ 无翻后线，不算 capped"
+    );
+}
+
+/// delayed c-bet：翻前加注者 check back flop、bet turn → hero 面对 delayed c-bet，
+/// barrel_n=1（flop 无 aggressor，连续段只有 turn）。
+#[test]
+fn derived_is_delayed_cbet() {
+    let v = GameView::from_request(&req_3max(
+        2,
+        vec!["7c", "2d", "9h", "Qs"],
+        vec![
+            ha(0, "raise", Some(60), 0),
+            ha(1, "fold", None, 0),
+            ha(2, "call", None, 0),
+            ha(2, "check", None, 1),
+            ha(0, "check", None, 1),
+            ha(2, "check", None, 2),
+            ha(0, "bet", Some(100), 2),
+        ],
+    ));
+    assert_eq!(v.street, Street::Turn);
+    assert!(
+        v.is_delayed_cbet(),
+        "PFA check flop 后 bet turn → delayed c-bet"
+    );
+    assert_eq!(v.facing_barrel_n(), 1, "flop 无 aggressor → 连续管数=1");
+}
+
+/// hero 为进攻方、villain 全线 check/call：villain capped、全体 capped 为 true；
+/// 当前街无人下注 → barrel_n=0；翻前视角（无翻后动作）→ 一律不 capped。
+#[test]
+fn derived_villain_capped_passive_line() {
+    // hero=0(BTN PFA)：preflop s0 raise / s2 call；flop s2 check-call；turn s2 check。
+    let v = GameView::from_request(&req_3max(
+        0,
+        vec!["7c", "2d", "9h", "Qs"],
+        vec![
+            ha(0, "raise", Some(60), 0),
+            ha(1, "fold", None, 0),
+            ha(2, "call", None, 0),
+            ha(2, "check", None, 1),
+            ha(0, "bet", Some(80), 1),
+            ha(2, "call", None, 1),
+            ha(2, "check", None, 2),
+        ],
+    ));
+    assert_eq!(v.street, Street::Turn);
+    assert!(v.villain_capped(2), "s2 翻后只 check/call → capped");
+    assert!(v.villains_capped(), "唯一在场对手 capped → 全体 capped");
+    assert_eq!(v.facing_barrel_n(), 0, "本街无 aggressor → 0");
+    assert!(
+        !v.is_delayed_cbet(),
+        "hero 自己是 PFA → 不算面对 delayed c-bet"
+    );
+
+    // 翻前视角：无翻后动作 → 谁都不 capped（未知 ≠ 被动）。
+    let pre = GameView::from_request(&req_3max(
+        2,
+        vec![],
+        vec![ha(0, "raise", Some(60), 0), ha(1, "fold", None, 0)],
+    ));
+    assert!(!pre.villain_capped(0));
+    assert!(!pre.villains_capped());
+    assert_eq!(pre.facing_barrel_n(), 0, "翻前恒 0");
 }

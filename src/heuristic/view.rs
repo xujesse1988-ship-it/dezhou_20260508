@@ -95,6 +95,10 @@ pub struct Response {
     /// 仍在池中的对手数（不含我）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opps_in_pot: Option<u32>,
+    /// Phase A 决策遥测（节点路径 + 场景 key + 驱动信号，只写不读；
+    /// `docs/scenario_heuristic_design.md` §6）。旧日志无此字段 → serde default None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<crate::heuristic::trace::DecisionTrace>,
 }
 
 // ===========================================================================
@@ -800,6 +804,90 @@ impl GameView {
         self.seat_actions(seat)
             .iter()
             .filter(move |sa| sa.street == street)
+    }
+
+    // --- P0-1：行动线派生量（纯只读；decide 不读，可进 trace 场景维度）---
+
+    /// Current street index 0..3 (preflop..river; Showdown folds into river).
+    fn street_index(&self) -> u8 {
+        match self.street {
+            Street::Preflop => 0,
+            Street::Flop => 1,
+            Street::Turn => 2,
+            _ => 3,
+        }
+    }
+
+    /// True when `seat`'s postflop betting line marks their range as "capped": the seat
+    /// has taken at least one passive flop-or-later action (check/call) and **no**
+    /// postflop aggressive action (bet/raise/all-in) this hand. Passive-only lines
+    /// rarely contain the strongest holdings (those tend to bet or raise), so the top
+    /// of the range is capped. A seat with no postflop check/call yet is NOT capped
+    /// (unknown ≠ passive); fold and unrecognized actions neither cap nor uncap.
+    pub fn villain_capped(&self, seat: usize) -> bool {
+        let mut acted_passive_postflop = false;
+        for sa in self.seat_actions(seat) {
+            if sa.street == 0 {
+                continue;
+            }
+            match sa.action.to_ascii_lowercase().as_str() {
+                "check" | "call" => acted_passive_postflop = true,
+                "bet" | "raise" | "allin" | "all_in" | "all-in" => return false,
+                _ => {}
+            }
+        }
+        acted_passive_postflop
+    }
+
+    /// True when **every** remaining opponent (not folded, hero excluded) is capped per
+    /// [`GameView::villain_capped`]. False preflop (no postflop line yet) and false when
+    /// there is no remaining opponent (no vacuous truth).
+    pub fn villains_capped(&self) -> bool {
+        let mut any = false;
+        for s in 0..self.num_seats as usize {
+            if s == self.my_seat as usize || self.folded[s] {
+                continue;
+            }
+            any = true;
+            if !self.villain_capped(s) {
+                return false;
+            }
+        }
+        any
+    }
+
+    /// Consecutive-street barrel count hero is currently facing: the number of
+    /// consecutive postflop streets, ending at the current street, on which the **same
+    /// opponent** has been the last aggressor. 0 when preflop, when the current street
+    /// has no aggressor, or when the current-street aggressor is hero. Example: villain
+    /// bets flop and turn → while hero faces the turn bet this returns 2 (double barrel).
+    pub fn facing_barrel_n(&self) -> u8 {
+        let cur = self.street_index() as usize;
+        if cur == 0 {
+            return 0;
+        }
+        let aggr = match self.street_aggressors[cur] {
+            Some(s) if s != self.my_seat => s,
+            _ => return 0,
+        };
+        let mut n = 0u8;
+        let mut k = cur;
+        while k >= 1 && self.street_aggressors[k] == Some(aggr) {
+            n += 1;
+            k -= 1;
+        }
+        n
+    }
+
+    /// True when hero currently faces a delayed c-bet: the street is the turn, the flop
+    /// checked through (no flop aggressor), and the preflop aggressor — an opponent —
+    /// is the turn aggressor (they skipped the flop c-bet and bet the turn instead).
+    pub fn is_delayed_cbet(&self) -> bool {
+        self.street == Street::Turn
+            && self.street_aggressors[1].is_none()
+            && self.street_aggressors[2].is_some()
+            && self.street_aggressors[2] == self.preflop_aggressor
+            && self.preflop_aggressor != Some(self.my_seat)
     }
 
     /// 为在此决策点预测 `opp_seat` 的 range 构造 [`range::Sample`]。

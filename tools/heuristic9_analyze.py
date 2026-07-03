@@ -13,6 +13,10 @@
   - equity 分桶（**按街拆**：翻前=vs-random 标度，翻后=vs-range 标度，不可跨街比）
   - 面对下注的弃/跟 EV 余量 surplus=equity-required_eq（required_eq 来自重建底池实际价位）
   - 自动漏洞标记（fallback 偏高、过松/过紧按实际价位判、激进度异常…）
+  - Phase A 节点聚合（docs/scenario_heuristic_design.md §6）：resp.trace 的节点路径 →
+    每节点 (机会数 n, EV 均值, CI95, 动作分布)。EV 归因口径=整手 net 摊给该手命中的所有
+    节点（§8②，用 hand_result 行的 net 按 sent.hand_id 关联）；另报兜底率（落 fallback
+    或 legalize 降级的决策占比，§8④）。旧日志（无 trace 字段）优雅降级：跳过本节不崩。
 
 pot/to_call 来源：优先读 resp 里引擎记的 pot/to_call/required_eq/opps_in_pot（精确）；旧日志
 （无这些字段）则用 reconstruct_pot_state 从 req 的 actions[] 重放（与 Rust from_request 等价）。
@@ -22,8 +26,12 @@ pot/to_call 来源：优先读 resp 里引擎记的 pot/to_call/required_eq/opps
   python3 tools/heuristic9_analyze.py openpoker9_actions_*.jsonl   # 也吃旧 6-max 格式
 """
 import json
+import math
 import sys
 from collections import Counter, defaultdict
+
+# 节点 EV 读数的样本纪律（设计 §4.3）：EV 归因手数低于此门槛的节点标「待观察」，禁止下结论。
+NODE_MIN_HANDS = 30
 
 _RANK_ORD = {r: i for i, r in enumerate("23456789TJQKA")}
 PREMIUM = {"AA", "KK", "QQ", "JJ", "AK"}
@@ -353,6 +361,16 @@ def main():
     # 翻前弃牌用 vs-random equity（虚高），不参与「弃太紧」判定，单列以免误导（详见 flag 段）。
     facing = defaultdict(list)  # (street, action) -> [(surplus, equity, required_eq, req, resp)...]
 
+    # --- Phase A 节点 trace 聚合（旧日志无 trace → 全部保持空，优雅降级）---
+    trace_n = 0                          # 带 trace 的决策数
+    node_n = Counter()                   # 节点 id（含路径前缀）→ 命中决策数
+    node_actions = defaultdict(Counter)  # 节点 id → 动作分布
+    hand_nodes = {}                      # hand_id → 该手命中的节点集（EV 归因，§8②）
+    hand_bb = {}                         # hand_id → big_blind（chips → bb 换算）
+    hand_net = {}                        # hand_id → 整手 net（chips，来自 hand_result 行）
+    guard_hits = 0                       # 落 fallback 或 legalize 降级的决策数（兜底率分子，§8④）
+    legalized_n = 0                      # 其中 legalize 降级数
+
     seen_hands = set()
 
     for path in paths:
@@ -369,6 +387,13 @@ def main():
                 o = json.loads(line)
             except Exception:
                 continue
+            # hand_result 行（无 req/resp）：记整手 net，供 Phase A 节点 EV 归因。
+            if o.get("kind") == "hand_result":
+                hid = o.get("hand_id")
+                net = o.get("net")
+                if hid is not None and isinstance(net, (int, float)):
+                    hand_net[hid] = net
+                continue
             req = o.get("req")
             resp = o.get("resp")
             if not req or not resp:
@@ -383,6 +408,24 @@ def main():
             if src.startswith("fallback"):
                 fallback += 1
                 fallback_reasons[src[:60]] += 1
+            # --- Phase A 节点 trace（旧日志 resp 无 trace → 本块整体跳过）---
+            tr = resp.get("trace")
+            tr = tr if isinstance(tr, dict) else None
+            was_legalized = bool(tr and tr.get("legalized"))
+            if was_legalized:
+                legalized_n += 1
+            if src.startswith("fallback") or was_legalized:
+                guard_hits += 1
+            path = [p for p in (tr.get("path") or []) if isinstance(p, str)] if tr else []
+            if path:
+                trace_n += 1
+                for node in path:  # 含前缀节点（§3.2 规则 3：路径前缀聚合可对齐拆分前后）
+                    node_n[node] += 1
+                    node_actions[node][act] += 1
+                hand_id = (o.get("sent") or {}).get("hand_id")
+                if hand_id is not None:
+                    hand_nodes.setdefault(hand_id, set()).update(path)
+                    hand_bb.setdefault(hand_id, max(int(req.get("big_blind") or 20), 1))
             # 激进度。
             if act == "raise":
                 af_bets += 1
@@ -499,6 +542,40 @@ def main():
                   f" required_eq均值={sum(reqs)/len(reqs):.3f}"
                   f" surplus均值={sum(surs)/len(surs):+.3f}"
                   f" [{min(surs):+.2f},{max(surs):+.2f}]")
+
+    # --- Phase A 节点聚合（docs/scenario_heuristic_design.md §6 / §8②④）---
+    if trace_n:
+        # 每节点 EV 样本（bb/hand）：整手 net 摊给该手命中的所有节点（§8②，每手每节点 1 样本）。
+        node_ev = defaultdict(list)
+        for hid, nodes in hand_nodes.items():
+            if hid not in hand_net:
+                continue  # 无 hand_result（截断/丢失）→ 不参与 EV，仍计热度
+            ev_bb = hand_net[hid] / hand_bb.get(hid, 20)
+            for nd in nodes:
+                node_ev[nd].append(ev_bb)
+        print(f"\n[节点聚合 Phase A trace] 带trace决策 {trace_n}/{total}"
+              f" | EV 口径=整手 net 摊给该手命中的所有节点（§8②）"
+              f" | h<{NODE_MIN_HANDS} 标待观察（§4.3）")
+        print(f"  {'节点':38s} {'n':>6s} {'hands':>6s} {'EV(bb/hand)':>14s} {'CI95':>8s}  动作分布")
+        for node, n in sorted(node_n.items(), key=lambda kv: (-kv[1], kv[0])):
+            evs = node_ev.get(node, [])
+            if evs:
+                m = sum(evs) / len(evs)
+                sd = math.sqrt(sum((x - m) ** 2 for x in evs) / len(evs))
+                ci = 1.96 * sd / math.sqrt(len(evs))
+                ev_s, ci_s = f"{m:+.2f}", f"±{ci:.2f}"
+                mark = "" if len(evs) >= NODE_MIN_HANDS else "  ⚠待观察"
+            else:
+                ev_s, ci_s, mark = "n/a", "", "  ⚠待观察"
+            acts = node_actions[node]
+            tot_a = sum(acts.values()) or 1
+            dist = " ".join(f"{a}={100.0 * c / tot_a:.0f}%" for a, c in acts.most_common())
+            print(f"  {node:38s} {n:6d} {len(evs):6d} {ev_s:>14s} {ci_s:>8s}  {dist}{mark}")
+        print(f"\n[兜底率 §8④] fallback/legalize降级决策 {guard_hits}/{total}"
+              f" ({100.0 * guard_hits / total:.2f}%)"
+              f"  (fallback={fallback}, legalize降级={legalized_n})")
+    else:
+        print("\n[节点聚合 Phase A trace] 日志无 trace 字段（旧日志）→ 跳过节点聚合/兜底率")
 
     # 自动漏洞标记。
     print("\n[漏洞标记]")

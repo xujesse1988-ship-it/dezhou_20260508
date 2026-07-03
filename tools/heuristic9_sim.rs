@@ -16,9 +16,11 @@
 //! ```text
 //! heuristic9_sim [--hands N] [--seats K] [--bb 20] [--start-bb 100] [--samples S] [--seed X]
 //!                [--field mixed|nit|station|maniac|tag|random] [--mirror] [--exploit]
-//!                [--config cfg.json]
+//!                [--config cfg.json] [--trace-summary]
 //! ```
 //! `--config` 覆盖 HeuristicConfig（partial JSON，缺字段走默认）——无需重编即可扫旋钮。
+//! `--trace-summary` 结束时追加打印 Phase A 节点热度表（叶节点 × 命中次数 + legalize 降级数，
+//! `docs/scenario_heuristic_design.md` §6）；默认关，关时输出与历史基线逐字节一致。
 
 use poker::core::{Card, Rank, Suit};
 use poker::heuristic::features::{draws, made_class, MadeClass};
@@ -626,6 +628,10 @@ struct SimStats {
     pot_mismatch: u64,
     tocall_mismatch: u64,
     reconstruct_checks: u64,
+    /// `--trace-summary`：收集 Phase A 节点热度（叶节点 → 命中次数）。默认关（零收集）。
+    collect_trace: bool,
+    node_counts: std::collections::BTreeMap<String, u64>,
+    legalize_downgrades: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -679,6 +685,17 @@ fn play_hand(
             stats.decisions += 1;
             if resp.source.starts_with("fallback") {
                 stats.fallback += 1;
+            }
+            // Phase A 节点热度（仅 --trace-summary 时收集；trace 只写不读，不回馈决策）。
+            if stats.collect_trace {
+                if let Some(t) = &resp.trace {
+                    if let Some(leaf) = t.path.last() {
+                        *stats.node_counts.entry(leaf.clone()).or_insert(0) += 1;
+                    }
+                    if t.legalized.is_some() {
+                        stats.legalize_downgrades += 1;
+                    }
+                }
             }
             response_to_action(&legal, &resp.action, resp.amount)
         } else {
@@ -742,6 +759,7 @@ fn main() {
     let mut field_kind = String::from("mixed");
     let mut mirror = false;
     let mut exploit = false;
+    let mut trace_summary = false;
     let mut config_path: Option<String> = None;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -794,6 +812,10 @@ fn main() {
             }
             "--exploit" => {
                 exploit = true;
+                i += 1;
+            }
+            "--trace-summary" => {
+                trace_summary = true;
                 i += 1;
             }
             "--config" => {
@@ -869,6 +891,9 @@ fn main() {
         pot_mismatch: 0,
         tocall_mismatch: 0,
         reconstruct_checks: 0,
+        collect_trace: trace_summary,
+        node_counts: std::collections::BTreeMap::new(),
+        legalize_downgrades: 0,
     };
 
     for h in 0..hands {
@@ -934,4 +959,21 @@ fn main() {
         stats.reconstruct_checks,
         100.0 * stats.tocall_mismatch as f64 / stats.reconstruct_checks.max(1) as f64,
     );
+    // Phase A 节点热度表（opt-in；默认关时上面输出与历史基线逐字节一致）。
+    if trace_summary {
+        println!("=== Phase A 节点热度 (--trace-summary) ===");
+        let mut rows: Vec<(&String, &u64)> = stats.node_counts.iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        for (node, cnt) in rows {
+            println!(
+                "{cnt:8}  {:5.1}%  {node}",
+                100.0 * *cnt as f64 / stats.decisions.max(1) as f64
+            );
+        }
+        println!(
+            "legalize 降级: {} ({:.2}%)",
+            stats.legalize_downgrades,
+            100.0 * stats.legalize_downgrades as f64 / stats.decisions.max(1) as f64
+        );
+    }
 }

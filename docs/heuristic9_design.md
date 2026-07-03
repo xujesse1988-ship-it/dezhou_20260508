@@ -281,6 +281,24 @@ driver+advisor，比对重建 `to_call` vs 服务端权威 `can_check`）：run2
 **分析器 `pot`/`required_eq` 脏数据**（run24 ~1.3% 决策）、解锁真 HU 盘（盲规则）、并在短手/稀疏占座放大
 前预修。
 
+### Phase A 遥测（2026-07-02）：决策节点 trace（零行为变化，byte-equal，shipped）
+
+场景化设计（`docs/scenario_heuristic_design.md` §6 Phase A）首阶段落地：每个决策挂**只写**
+trace（`src/heuristic/trace.rs`）——现有 if 分支的显式命名节点路径（22 个叶节点，清单见该文档
+§3.2.1）+ 场景 key 维度（街/池型/角色/面对/人数/SPR/位置 + P0-1 派生量）+ 驱动信号（equity /
+made / 实际 evaluate 过的阈值比较与频率门掷点）+ legalize 降级 before/after。`Response.trace`
+经 advisor 一行 JSON 原样透传，driver 整条 resp 落 action log（`heuristic9_play.py` 零改动，
+selftest 全绿）。`heuristic9_analyze.py` 新增按节点聚合 `(n, hands, EV bb/hand, CI95, 动作
+分布)`（EV 口径=整手 net 摊给该手命中的所有节点，§8②；h<30 标待观察）+ 兜底率（fallback ∪
+legalize 降级占比，§8④）；旧日志无 trace 优雅降级（run30 实测）。`heuristic9_sim
+--trace-summary`（opt-in）打印节点热度表。P0-1 派生量同步落地（`villain_capped` /
+`villains_capped` / `facing_barrel_n` / `is_delayed_cbet`，`view.rs` 只读访问器；
+`i_have_initiative` 过期主动权修复仍未做——行为变更，出 Phase A 范围）。**回归门**：
+9/6/2-max、`--exploit`、`--start-bb 400` 五条 8000 手基线（seed 7）**逐字节一致**
+（trace 只写不读：频率门掷点绑定局部变量后比较，RNG 消费序列不变；翻前 fold 短路路径不为
+trace 多算 equity）；`cargo test` 全绿（`heuristic9` 10/10 + 新增 `heuristic9_trace` 6 测、
+P0-1 派生量 3 测）；fmt / clippy 全绿。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街

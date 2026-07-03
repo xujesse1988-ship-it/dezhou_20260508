@@ -10,6 +10,7 @@ use crate::heuristic::features::{draws, made_class, texture, MadeClass};
 use crate::heuristic::opponent::{ExploitAdjust, OpponentTable};
 use crate::heuristic::range::RangeVec;
 use crate::heuristic::range_online::MlRange;
+use crate::heuristic::trace::{DecisionTrace, LegalizeChange};
 use crate::heuristic::view::{GameView, PosBucket};
 
 /// 决策结果。`Raise(to_chips)` 的 to 是 OpenPoker 单位的 raise-to 绝对额。
@@ -27,6 +28,38 @@ pub struct Decision {
     pub equity: f64,
     pub source: String,
     pub probs: Vec<(String, f64)>,
+    /// Phase A 遥测（`docs/scenario_heuristic_design.md` §6）：节点路径 + 场景 key +
+    /// 驱动信号。**只写不读**——决策路径 / equity 采样 / RNG 消费与无 trace 时逐字节一致。
+    pub trace: Option<DecisionTrace>,
+}
+
+/// Stable action label (trace bookkeeping).
+fn action_label(a: &DecisionAction) -> &'static str {
+    match a {
+        DecisionAction::Fold => "fold",
+        DecisionAction::Check => "check",
+        DecisionAction::Call => "call",
+        DecisionAction::Raise(_) => "raise",
+    }
+}
+
+/// raise-to amount if the action is a raise (trace bookkeeping).
+fn raise_amount(a: &DecisionAction) -> Option<u64> {
+    match a {
+        DecisionAction::Raise(to) => Some(*to),
+        _ => None,
+    }
+}
+
+/// Attach the Phase A trace to a finished policy decision: set the leaf node id (full
+/// prefix path per design §3.2) and snapshot the policy-chosen action/size before the
+/// legalize floor. Pure bookkeeping — never alters the decision.
+fn traced(mut d: Decision, mut tr: DecisionTrace, leaf: &str) -> Decision {
+    tr.set_leaf(leaf);
+    tr.policy_action = action_label(&d.action).to_string();
+    tr.policy_amount = raise_amount(&d.action);
+    d.trace = Some(tr);
+    d
 }
 
 /// 决策 RNG seed：手牌状态混合（确定性、可复现）。
@@ -184,13 +217,30 @@ pub fn decide(
     let mut rng = Rng::new(situation_seed(view, cfg));
     let adj = exploit_adjust(view, cfg, opp);
     let opp_thr = build_opp_thresholds(view, eq, cfg, opp);
+    // Phase A telemetry: write-only trace (node path + scenario key + signals). Building
+    // it only reads the view — decision path / equity samples / RNG stream unchanged.
+    let tr = DecisionTrace::new(view);
 
     let d = if view.street == Street::Preflop {
-        preflop_decide(view, eq, cfg, &adj, &opp_thr, ml, hole, &mut rng)
+        preflop_decide(view, eq, cfg, &adj, &opp_thr, ml, hole, &mut rng, tr)
     } else {
-        postflop_decide(view, eq, cfg, &adj, &opp_thr, ml, hole, &mut rng)
+        postflop_decide(view, eq, cfg, &adj, &opp_thr, ml, hole, &mut rng, tr)
     };
-    legalize(d, view)
+    // legalize floor; if it changed the policy action/size, record before→after in the
+    // trace (fallback-rate input, design §8④).
+    let before = d.action.clone();
+    let mut d = legalize(d, view);
+    if d.action != before {
+        if let Some(t) = d.trace.as_mut() {
+            t.legalized = Some(LegalizeChange {
+                before_action: action_label(&before).into(),
+                before_amount: raise_amount(&before),
+                after_action: action_label(&d.action).into(),
+                after_amount: raise_amount(&d.action),
+            });
+        }
+    }
+    d
 }
 
 /// 最终合法性网：保证输出动作严格落在 `valid` 内（兜底，正常路径已合法）。
@@ -237,18 +287,22 @@ fn legalize(mut d: Decision, view: &GameView) -> Decision {
     d
 }
 
-/// 异常兜底：能 check 就 check，否则 fold。
+/// 异常兜底：能 check 就 check，否则 fold。trace 落 `fallback.<why>` 节点（设计 §8④）。
 fn safe_fallback(view: &GameView, why: &str) -> Decision {
     let action = if view.valid.can_check {
         DecisionAction::Check
     } else {
         DecisionAction::Fold
     };
+    let mut tr = DecisionTrace::new(view);
+    tr.set_leaf(&format!("fallback.{why}"));
+    tr.policy_action = action_label(&action).to_string();
     Decision {
         action,
         equity: 0.0,
         source: format!("fallback:{why}"),
         probs: vec![],
+        trace: Some(tr),
     }
 }
 
@@ -266,9 +320,11 @@ fn preflop_decide(
     ml: Option<&MlRange>,
     hole: [crate::core::Card; 2],
     rng: &mut Rng,
+    mut tr: DecisionTrace,
 ) -> Decision {
     let pc = &cfg.preflop;
     let strength = eq.hand_strength(hole[0], hole[1]);
+    tr.note_strength(strength);
     let pos = view.my_pos_bucket();
     let eff_bb = view.effective_stack_chips() as f64 / view.big_blind as f64;
     let to_call_bb = view.to_call_bb();
@@ -285,8 +341,18 @@ fn preflop_decide(
     // --- 短栈推/弃 ---
     if eff_bb < pc.shortstack_bb && view.valid.can_raise {
         let shove_thr = pc.shove_strength + 0.02 * entrants as f64 - adj.steal_bonus;
+        tr.cmp(
+            "preflop.shove_thr",
+            strength,
+            shove_thr,
+            strength >= shove_thr,
+        );
         if strength >= shove_thr {
-            return raise_decision(view, view.valid.max_raise, strength, "preflop:shove", probs);
+            return traced(
+                raise_decision(view, view.valid.max_raise, strength, "preflop:shove", probs),
+                tr,
+                "pre.short.shove",
+            );
         }
         // 否则按下面常规逻辑（可能 call/fold）。
     }
@@ -305,40 +371,66 @@ fn preflop_decide(
             PosBucket::BigBlind => pc.open_mid, // BB 可加注的 limp 底池
         };
         let open_thr = (open_thr_base + mult_tighten - adj.steal_bonus).clamp(0.0, 0.99);
+        tr.cmp("preflop.open_thr", strength, open_thr, strength >= open_thr);
         if strength >= open_thr && view.valid.can_raise {
             // 开池/iso 尺寸。
             let size_bb =
                 pc.open_size_bb + pc.iso_extra_per_limper_bb * view.preflop_limpers as f64;
             let to_chips = (size_bb * view.big_blind as f64).round() as u64;
-            return raise_to_clamped(view, to_chips, strength, "preflop:open", probs);
+            return traced(
+                raise_to_clamped(view, to_chips, strength, "preflop:open", probs),
+                tr,
+                "pre.unopened.open",
+            );
         }
         // 投机跟注（小对/同连，多人且便宜，set-mine / 隐含赔率）。
         let speculative = strength >= pc.flat_call - 0.06
             && to_call_bb <= 1.5
             && (entrants >= 1 || view.preflop_limpers >= 1);
+        tr.cmp(
+            "preflop.limp_thr",
+            strength,
+            pc.flat_call - 0.06,
+            strength >= pc.flat_call - 0.06,
+        );
         if speculative && view.valid.can_call {
             probs.push(("call".into(), 1.0));
-            return Decision {
-                action: DecisionAction::Call,
-                equity: strength,
-                source: "preflop:limp_behind".into(),
-                probs,
-            };
+            return traced(
+                Decision {
+                    action: DecisionAction::Call,
+                    equity: strength,
+                    source: "preflop:limp_behind".into(),
+                    probs,
+                    trace: None,
+                },
+                tr,
+                "pre.unopened.limp_behind",
+            );
         }
         if view.valid.can_check {
-            return Decision {
-                action: DecisionAction::Check,
-                equity: strength,
-                source: "preflop:check_option".into(),
-                probs,
-            };
+            return traced(
+                Decision {
+                    action: DecisionAction::Check,
+                    equity: strength,
+                    source: "preflop:check_option".into(),
+                    probs,
+                    trace: None,
+                },
+                tr,
+                "pre.unopened.check_option",
+            );
         }
-        return Decision {
-            action: DecisionAction::Fold,
-            equity: strength,
-            source: "preflop:fold".into(),
-            probs,
-        };
+        return traced(
+            Decision {
+                action: DecisionAction::Fold,
+                equity: strength,
+                source: "preflop:fold".into(),
+                probs,
+                trace: None,
+            },
+            tr,
+            "pre.unopened.fold",
+        );
     }
 
     // --- 面对加注 ---
@@ -352,6 +444,7 @@ fn preflop_decide(
     let call_thr = (call_thr + mult_tighten).clamp(0.0, 0.99);
 
     // value (re)raise
+    tr.cmp("preflop.reraise_thr", strength, rr_thr, strength >= rr_thr);
     if strength >= rr_thr && view.valid.can_raise {
         let face = view.facing_raise_chips();
         let ip = view.in_position();
@@ -366,7 +459,11 @@ fn preflop_decide(
         } else {
             "preflop:3bet"
         };
-        return raise_to_clamped(view, to_chips, strength, tag, probs);
+        return traced(
+            raise_to_clamped(view, to_chips, strength, tag, probs),
+            tr,
+            "pre.facing_raise.value_reraise",
+        );
     }
 
     // flat call：底池赔率驱动（修 BB 防守漏洞）。call_thr 只作为「想 flat 强牌」的补充入口，
@@ -388,32 +485,50 @@ fn preflop_decide(
             0.0
         };
         let needed = (view.pot_odds() + cfg.postflop.call_equity_margin - implied).max(0.0);
+        tr.note_equity(real_eq);
+        tr.cmp("preflop.call_needed_eq", real_eq, needed, real_eq >= needed);
+        tr.cmp("preflop.call_thr", strength, call_thr, strength >= call_thr);
         if real_eq >= needed || strength >= call_thr {
             probs.push(("call".into(), 1.0));
-            return Decision {
-                action: DecisionAction::Call,
-                equity: real_eq,
-                source: "preflop:call".into(),
-                probs,
-            };
+            return traced(
+                Decision {
+                    action: DecisionAction::Call,
+                    equity: real_eq,
+                    source: "preflop:call".into(),
+                    probs,
+                    trace: None,
+                },
+                tr,
+                "pre.facing_raise.odds_call",
+            );
         }
         let _ = rng; // 预留混合
     }
 
     if view.valid.can_check {
-        return Decision {
-            action: DecisionAction::Check,
+        return traced(
+            Decision {
+                action: DecisionAction::Check,
+                equity: strength,
+                source: "preflop:check".into(),
+                probs,
+                trace: None,
+            },
+            tr,
+            "pre.facing_raise.check",
+        );
+    }
+    traced(
+        Decision {
+            action: DecisionAction::Fold,
             equity: strength,
-            source: "preflop:check".into(),
+            source: "preflop:fold_vs_raise".into(),
             probs,
-        };
-    }
-    Decision {
-        action: DecisionAction::Fold,
-        equity: strength,
-        source: "preflop:fold_vs_raise".into(),
-        probs,
-    }
+            trace: None,
+        },
+        tr,
+        "pre.facing_raise.fold",
+    )
 }
 
 // ===========================================================================
@@ -430,6 +545,7 @@ fn postflop_decide(
     ml: Option<&MlRange>,
     hole: [crate::core::Card; 2],
     rng: &mut Rng,
+    mut tr: DecisionTrace,
 ) -> Decision {
     let oc = &cfg.postflop;
     let equity = equity_dispatch(
@@ -444,6 +560,9 @@ fn postflop_decide(
     let made = made_class(hole, &view.board);
     let dr = draws(hole, &view.board);
     let tex = texture(&view.board);
+    tr.note_equity(equity);
+    tr.made = Some(format!("{made:?}"));
+    tr.draw = Some(dr.has_meaningful_draw());
     let n_opp = view.num_active().saturating_sub(1).max(1);
     let ip = view.in_position();
     let spr = view.spr();
@@ -464,21 +583,48 @@ fn postflop_decide(
     if !facing_bet {
         // === 无人下注：下注 vs 过牌 ===
         // 价值。
+        tr.cmp("postflop.value_thr", equity, value_thr, equity >= value_thr);
         if equity >= value_thr && made.rank() >= MadeClass::MidPair.rank() {
             let size = value_size(view, oc, &tex, made, spr, adj);
-            return bet_size_decision(view, size, equity, "postflop:value_bet");
+            return traced(
+                bet_size_decision(view, size, equity, "postflop:value_bet"),
+                tr,
+                "post.unopened.value_bet",
+            );
         }
         // 低 SPR 承诺：顶对好牌直接下注承诺。
+        tr.cmp(
+            "postflop.commit_spr",
+            spr,
+            oc.commit_spr,
+            spr < oc.commit_spr,
+        );
         if spr < oc.commit_spr && made.rank() >= MadeClass::TopPair.rank() {
             let size = value_size(view, oc, &tex, made, spr, adj);
-            return bet_size_decision(view, size, equity, "postflop:commit_bet");
+            return traced(
+                bet_size_decision(view, size, equity, "postflop:commit_bet"),
+                tr,
+                "post.unopened.commit",
+            );
         }
         // 半诈唬：有听牌。
         if dr.has_meaningful_draw() && equity >= oc.semibluff_min_equity {
             let semibluff_freq = (0.75 * adj.bluff_mult).clamp(0.0, 1.0);
-            if rng.unit() < semibluff_freq {
+            // Bind the roll so the trace records it — RNG consumption unchanged.
+            let roll = rng.unit();
+            tr.cmp(
+                "postflop.semibluff_freq",
+                roll,
+                semibluff_freq,
+                roll < semibluff_freq,
+            );
+            if roll < semibluff_freq {
                 let size = pick_bet_size(view, oc, &tex, made, spr, true);
-                return bet_size_decision(view, size, equity, "postflop:semibluff");
+                return traced(
+                    bet_size_decision(view, size, equity, "postflop:semibluff"),
+                    tr,
+                    "post.unopened.semibluff",
+                );
             }
         }
         // c-bet / 纯诈唬（主动权方在干面）。
@@ -486,24 +632,43 @@ fn postflop_decide(
             let cbet_freq = lerp(oc.cbet_freq_dry, oc.cbet_freq_wet, tex.wetness)
                 * adj.bluff_mult
                 * (1.0 - oc.multiway_bluff_cut * multiway).max(0.10);
-            if rng.unit() < cbet_freq.clamp(0.0, 0.95) {
+            let gate = cbet_freq.clamp(0.0, 0.95);
+            let roll = rng.unit();
+            tr.cmp("postflop.cbet_freq", roll, gate, roll < gate);
+            if roll < gate {
                 let size = pick_bet_size(view, oc, &tex, made, spr, false);
-                return bet_size_decision(view, size, equity, "postflop:cbet_bluff");
+                return traced(
+                    bet_size_decision(view, size, equity, "postflop:cbet_bluff"),
+                    tr,
+                    "post.unopened.cbet_bluff",
+                );
             }
         } else if made == MadeClass::Air && !dr.has_meaningful_draw() {
             // 无主动权的空气：偶尔无主动诈唬（低频）。
-            if rng.unit() < bluff_freq_base * 0.5 {
+            let gate = bluff_freq_base * 0.5;
+            let roll = rng.unit();
+            tr.cmp("postflop.float_freq", roll, gate, roll < gate);
+            if roll < gate {
                 let size = pick_bet_size(view, oc, &tex, made, spr, false);
-                return bet_size_decision(view, size, equity, "postflop:float_bluff");
+                return traced(
+                    bet_size_decision(view, size, equity, "postflop:float_bluff"),
+                    tr,
+                    "post.unopened.float",
+                );
             }
         }
         // 其余过牌（控池 / 放弃）。
-        return Decision {
-            action: DecisionAction::Check,
-            equity,
-            source: "postflop:check".into(),
-            probs: vec![("check".into(), 1.0)],
-        };
+        return traced(
+            Decision {
+                action: DecisionAction::Check,
+                equity,
+                source: "postflop:check".into(),
+                probs: vec![("check".into(), 1.0)],
+                trace: None,
+            },
+            tr,
+            "post.unopened.check",
+        );
     }
 
     // === 面对下注：弃/跟/加 ===
@@ -526,27 +691,57 @@ fn postflop_decide(
     // 价值加注。
     let raise_value_thr =
         (value_thr + 0.06 + oc.multiway_value_tighten * multiway).clamp(0.30, 0.97);
+    tr.cmp(
+        "postflop.raise_value_thr",
+        equity,
+        raise_value_thr,
+        equity >= raise_value_thr,
+    );
     if equity >= raise_value_thr && made.rank() >= MadeClass::TopPair.rank() && view.valid.can_raise
     {
         let size = value_size(view, oc, &tex, made, spr, adj);
-        return raise_pot_fraction(view, size, equity, "postflop:value_raise");
+        return traced(
+            raise_pot_fraction(view, size, equity, "postflop:value_raise"),
+            tr,
+            "post.facing.value_raise",
+        );
     }
     // 强听牌半诈唬加注（heads-up 偏多，多人少）。
     if dr.combo_draw || (dr.flush_draw && dr.oesd) {
         let sb_raise_freq = (0.5 * adj.bluff_mult * (1.0 - 0.5 * multiway)).clamp(0.0, 0.7);
-        if view.valid.can_raise && rng.unit() < sb_raise_freq {
-            let size = pick_bet_size(view, oc, &tex, made, spr, false);
-            return raise_pot_fraction(view, size, equity, "postflop:semibluff_raise");
+        // Preserve the original short-circuit: the roll is only drawn when can_raise.
+        if view.valid.can_raise {
+            let roll = rng.unit();
+            tr.cmp(
+                "postflop.semibluff_raise_freq",
+                roll,
+                sb_raise_freq,
+                roll < sb_raise_freq,
+            );
+            if roll < sb_raise_freq {
+                let size = pick_bet_size(view, oc, &tex, made, spr, false);
+                return traced(
+                    raise_pot_fraction(view, size, equity, "postflop:semibluff_raise"),
+                    tr,
+                    "post.facing.semibluff_raise",
+                );
+            }
         }
     }
     // 跟注（含听牌靠隐含赔率）。
+    tr.cmp("postflop.call_needed_eq", equity, needed, equity >= needed);
     if view.valid.can_call && equity >= needed {
-        return Decision {
-            action: DecisionAction::Call,
-            equity,
-            source: "postflop:call".into(),
-            probs: vec![("call".into(), 1.0)],
-        };
+        return traced(
+            Decision {
+                action: DecisionAction::Call,
+                equity,
+                source: "postflop:call".into(),
+                probs: vec![("call".into(), 1.0)],
+                trace: None,
+            },
+            tr,
+            "post.facing.odds_call",
+        );
     }
     // 纯诈唬加注（低频，主要对紧手）。
     if made == MadeClass::Air
@@ -555,26 +750,47 @@ fn postflop_decide(
         && view.street != Street::River
     {
         let bluff_raise_freq = (bluff_freq_base * 0.35).clamp(0.0, 0.4);
-        if rng.unit() < bluff_raise_freq {
+        let roll = rng.unit();
+        tr.cmp(
+            "postflop.bluff_raise_freq",
+            roll,
+            bluff_raise_freq,
+            roll < bluff_raise_freq,
+        );
+        if roll < bluff_raise_freq {
             let size = pick_bet_size(view, oc, &tex, made, spr, false);
-            return raise_pot_fraction(view, size, equity, "postflop:bluff_raise");
+            return traced(
+                raise_pot_fraction(view, size, equity, "postflop:bluff_raise"),
+                tr,
+                "post.facing.bluff_raise",
+            );
         }
     }
     // 能 check 就 check（无需跟注的情形已在上面分支处理；这里 to_call>0 故 check 不可用）。
     if view.valid.can_check {
-        return Decision {
-            action: DecisionAction::Check,
+        return traced(
+            Decision {
+                action: DecisionAction::Check,
+                equity,
+                source: "postflop:check_back".into(),
+                probs: vec![("check".into(), 1.0)],
+                trace: None,
+            },
+            tr,
+            "post.facing.check_back",
+        );
+    }
+    traced(
+        Decision {
+            action: DecisionAction::Fold,
             equity,
-            source: "postflop:check_back".into(),
-            probs: vec![("check".into(), 1.0)],
-        };
-    }
-    Decision {
-        action: DecisionAction::Fold,
-        equity,
-        source: "postflop:fold".into(),
-        probs: vec![("fold".into(), 1.0)],
-    }
+            source: "postflop:fold".into(),
+            probs: vec![("fold".into(), 1.0)],
+            trace: None,
+        },
+        tr,
+        "post.facing.fold",
+    )
 }
 
 // ===========================================================================
@@ -666,6 +882,7 @@ fn raise_to_clamped(
                 equity,
                 source: format!("{src}:downgrade_call"),
                 probs,
+                trace: None,
             };
         }
         return Decision {
@@ -677,6 +894,7 @@ fn raise_to_clamped(
             equity,
             source: format!("{src}:downgrade"),
             probs,
+            trace: None,
         };
     }
     let min_r = view.valid.min_raise.unwrap_or(to_chips);
@@ -690,5 +908,6 @@ fn raise_to_clamped(
         equity,
         source: src.into(),
         probs,
+        trace: None,
     }
 }

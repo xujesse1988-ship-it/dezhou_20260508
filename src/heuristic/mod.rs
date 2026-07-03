@@ -13,6 +13,7 @@ pub mod policy;
 pub mod range;
 pub mod range_online;
 pub mod tokenizer;
+pub mod trace;
 pub mod view;
 
 pub use config::HeuristicConfig;
@@ -20,6 +21,7 @@ pub use equity::EquityEngine;
 pub use opponent::{ObservedAction, OppType, OpponentTable};
 pub use policy::{decide, Decision, DecisionAction};
 pub use range_online::MlRange;
+pub use trace::DecisionTrace;
 pub use view::{GameView, HistAction, Request, Response, ValidActions};
 
 /// 常驻决策机：一份 config + 一张 equity 强度表 + 累积对手画像
@@ -119,6 +121,8 @@ impl HeuristicBot {
             to_call: Some(to_call),
             required_eq: Some(round4(required_eq)),
             opps_in_pot: Some(opps_in_pot),
+            // Phase A 遥测原样透传（拍板点①：Decision 是单一事实源，advisor 只落盘）。
+            trace: d.trace,
             ..Default::default()
         };
         match d.action {
