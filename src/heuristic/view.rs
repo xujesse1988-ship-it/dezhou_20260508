@@ -708,11 +708,21 @@ impl GameView {
         call as f64 / (pot + call) as f64
     }
 
-    /// 我是否本街/本手主动权方（翻前加注者或本街最后加注者）。
+    /// 我是否当前主动权方 = **最近一条有 aggressor 的街**（含本街）由我主导。
+    ///
+    /// P0-1 过期主动权修复（Phase B，`docs/scenario_heuristic_design.md` §6/§7）：旧实现在
+    /// 本街尚无人下注时直接回落到翻前加注者——翻前加注者在中途街被对手接管火力（对手 bet /
+    /// check-raise、hero 只 call）后，下一条街仍凭翻前身份领 c-bet 权（stale initiative）；
+    /// 反之翻后真正接管者（如 check-raise 方）拿不到主动权。现按街从近到远回溯
+    /// `street_aggressors`，谁最后开火谁持有主动权；全程无人开火（limp 池过牌到底）= 无人持有。
     pub fn i_have_initiative(&self) -> bool {
-        let me = Some(self.my_seat);
-        self.street_aggressor == me
-            || (self.street_aggressor.is_none() && self.preflop_aggressor == me)
+        let cur = self.street_index() as usize;
+        for k in (0..=cur).rev() {
+            if let Some(a) = self.street_aggressors[k] {
+                return a == self.my_seat;
+            }
+        }
+        false
     }
 
     pub fn i_am_preflop_aggressor(&self) -> bool {

@@ -327,6 +327,101 @@ fn derived_is_delayed_cbet() {
     assert_eq!(v.facing_barrel_n(), 1, "flop 无 aggressor → 连续管数=1");
 }
 
+// ===========================================================================
+// i_have_initiative：过期主动权修复（P0-1 剩余项，Phase B）
+// ===========================================================================
+
+/// stale initiative 修复：hero（BTN PFA）翻牌被 villain donk bet 接管火力、hero 只 call，
+/// 转牌 villain check 让牌 → hero **不再**凭翻前身份领主动权（旧实现返回 true）。
+#[test]
+fn initiative_lost_when_villain_takes_over_postflop() {
+    // n=3, button=0, hero=0（PFA）。flop: s2 bet（接管），s0 call。turn: s2 check → hero 行动。
+    let v = GameView::from_request(&req_3max(
+        0,
+        vec!["7c", "2d", "9h", "Qs"],
+        vec![
+            ha(0, "raise", Some(60), 0),
+            ha(1, "fold", None, 0),
+            ha(2, "call", None, 0),
+            ha(2, "bet", Some(80), 1),
+            ha(0, "call", None, 1),
+            ha(2, "check", None, 2),
+        ],
+    ));
+    assert_eq!(v.street, Street::Turn);
+    assert_eq!(v.preflop_aggressor, Some(0), "hero 仍是翻前加注者");
+    assert_eq!(v.aggressor_on_street(1), Some(2), "翻牌火力已被 s2 接管");
+    assert!(
+        !v.i_have_initiative(),
+        "翻牌被接管后，转牌不再有主动权（stale initiative 修复）"
+    );
+}
+
+/// 接管方获得主动权：hero（BB，非 PFA）翻牌 check-raise，转牌轮到 hero → hero 持有主动权
+/// （旧实现返回 false——本街无人下注时只认翻前加注者）。
+#[test]
+fn initiative_gained_by_postflop_takeover() {
+    // n=3, button=0, hero=2（BB）。flop: s2 check, s0 bet, s2 raise（check-raise）, s0 call。
+    let v = GameView::from_request(&req_3max(
+        2,
+        vec!["7c", "2d", "9h", "Qs"],
+        vec![
+            ha(0, "raise", Some(60), 0),
+            ha(1, "fold", None, 0),
+            ha(2, "call", None, 0),
+            ha(2, "check", None, 1),
+            ha(0, "bet", Some(80), 1),
+            ha(2, "raise", Some(240), 1),
+            ha(0, "call", None, 1),
+        ],
+    ));
+    assert_eq!(v.street, Street::Turn);
+    assert_ne!(v.preflop_aggressor, Some(2), "hero 不是翻前加注者");
+    assert_eq!(v.aggressor_on_street(1), Some(2), "翻牌最后加注者 = hero");
+    assert!(
+        v.i_have_initiative(),
+        "check-raise 接管后，转牌主动权归 hero"
+    );
+}
+
+/// 回归：翻牌过牌过街（无翻后 aggressor）时翻前加注者保留主动权（delayed c-bet 权，
+/// 新旧实现一致）；limp 池全程无人开火 → 无人持有主动权。
+#[test]
+fn initiative_retained_through_checked_streets_and_absent_in_limped_pot() {
+    // hero=0（BTN PFA），flop 双方 check → turn hero 仍有主动权。
+    let v = GameView::from_request(&req_3max(
+        0,
+        vec!["7c", "2d", "9h", "Qs"],
+        vec![
+            ha(0, "raise", Some(60), 0),
+            ha(1, "fold", None, 0),
+            ha(2, "call", None, 0),
+            ha(2, "check", None, 1),
+            ha(0, "check", None, 1),
+            ha(2, "check", None, 2),
+        ],
+    ));
+    assert_eq!(v.street, Street::Turn);
+    assert!(
+        v.i_have_initiative(),
+        "过牌过街不转移主动权：PFA 保留 delayed c-bet 权"
+    );
+
+    // limp 池：无人加注、翻牌过牌 → 谁都没有主动权。
+    let limped = GameView::from_request(&req_3max(
+        2,
+        vec!["7c", "2d", "9h"],
+        vec![
+            ha(0, "call", None, 0),
+            ha(1, "fold", None, 0),
+            ha(2, "check", None, 0),
+            ha(2, "check", None, 1),
+        ],
+    ));
+    assert_eq!(limped.street, Street::Flop);
+    assert!(!limped.i_have_initiative(), "limp 池无人开火 → 无主动权方");
+}
+
 /// hero 为进攻方、villain 全线 check/call：villain capped、全体 capped 为 true；
 /// 当前街无人下注 → barrel_n=0；翻前视角（无翻后动作）→ 一律不 capped。
 #[test]
