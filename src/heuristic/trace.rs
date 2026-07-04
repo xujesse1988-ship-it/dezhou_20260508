@@ -1,11 +1,12 @@
-//! Phase A 决策遥测（`docs/scenario_heuristic_design.md` §6 Phase A，拍板点①）。
+//! 决策遥测（`docs/scenario_heuristic_design.md` §6，拍板点①；Phase A 落地，Phase B 起
+//! 节点路径由场景森林**分派结构直接产出**——「分派即路径」，见 `policy.rs` `SpotNode`）。
 //!
-//! 每个 [`Decision`](crate::heuristic::policy::Decision) 挂一份**只写** trace：本次实际走过的
-//! 命名分支路径（稳定节点 id，§3.2）、从 [`GameView`] 现有字段读出的场景 key 维度（§1.1）、
+//! 每个 [`Decision`](crate::heuristic::policy::Decision) 挂一份**只写** trace：本次分派命中的
+//! 节点路径（稳定节点 id，§3.2）、从 [`GameView`] 现有字段读出的场景 key 维度（§1.1）、
 //! 以及决策路径上**本来就算出**的驱动信号（equity / made / 阈值比较 / RNG 频率门掷点）。
 //!
-//! 硬约束（byte-equal 一票否决）：trace 只写不读——决策路径、equity 采样次数、RNG 消费序列
-//! 必须逐字节不变。禁止为 trace 多算一次 equity、多抽一个随机数；这里记录的全部是既有中间值
+//! 硬约束：trace 只写不读——决策路径、equity 采样次数、RNG 消费序列不因 trace 改变。
+//! 禁止为 trace 多算一次 equity、多抽一个随机数；这里记录的全部是既有中间值
 //! 或对 `GameView` 的纯读取。
 
 use crate::core::Street;
@@ -60,6 +61,9 @@ pub struct ScenarioKey {
     pub pos: String,
     /// Postflop in-position flag (relative to remaining opponents).
     pub ip: bool,
+    /// Hero holds the betting initiative (last aggressor across streets,
+    /// [`GameView::i_have_initiative`] — Phase B stale-initiative fix semantics).
+    pub initiative: bool,
     /// P0-1 derived line feature: consecutive-street barrel count hero is facing
     /// ([`GameView::facing_barrel_n`]).
     pub barrel_n: u8,
@@ -134,6 +138,7 @@ impl ScenarioKey {
             spr: round2(spr),
             pos: pos.into(),
             ip: view.in_position(),
+            initiative: view.i_have_initiative(),
             barrel_n: view.facing_barrel_n(),
             delayed_cbet: view.is_delayed_cbet(),
             villains_capped: view.villains_capped(),

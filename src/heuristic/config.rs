@@ -9,12 +9,18 @@
 use serde::{Deserialize, Serialize};
 
 /// 顶层启发式配置。所有子配置都实现 [`Default`]，默认值 = v0.1 经验调参起点。
+///
+/// Phase B（场景森林，`docs/scenario_heuristic_design.md` §6）起参数分两层：
+/// - [`NodesConfig`]（`nodes.*`）：**按场景节点分参**——已拆分节点各持一份阈值/频率；
+/// - [`PreflopConfig`] / [`PostflopConfig`]：跨节点**共享层**（尺寸、多人收紧系数、
+///   赔率余量等对所有节点生效的地板参数）。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HeuristicConfig {
     pub equity: EquityConfig,
     pub preflop: PreflopConfig,
     pub postflop: PostflopConfig,
+    pub nodes: NodesConfig,
     pub mixing: MixingConfig,
     pub exploit: ExploitConfig,
     pub range: RangeConfig,
@@ -91,25 +97,13 @@ impl Default for EquityConfig {
 // 翻前
 // ===========================================================================
 
-/// 翻前阈值都以「手牌强度」表达——强度 = equity-vs-1-random ∈ [0,1]（见 `equity::preflop`）。
-/// 位置用「相对按钮的未行动人数桶」泛化，座位无关：
-/// `early`（离按钮远，身后人多）/ `mid` / `late`（CO/BTN）/ `blinds`（SB/BB）。
+/// 翻前**共享层**（Phase B）：只留跨节点生效的尺寸/系数；各节点阈值移入
+/// [`NodesConfig`]（`nodes.short` / `nodes.open` / `nodes.limp_behind` /
+/// `nodes.vs_open|vs_3bet|vs_4bet`）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PreflopConfig {
-    /// 各位置桶的开池（first-in raise）最低强度阈值。
-    pub open_early: f64,
-    pub open_mid: f64,
-    pub open_late: f64,
-    pub open_sb: f64,
-    /// 面对一个加注的 3bet 最低强度（value 3bet）。
-    pub threebet: f64,
-    /// 面对一个加注的冷跟（flat call）最低强度。
-    pub flat_call: f64,
-    /// 面对 3bet/4bet 的继续（call/4bet）最低强度。
-    pub vs_threebet_continue: f64,
-    pub fourbet: f64,
-    /// 每多一个**已入池**对手，价值门槛上抬多少（多人收紧）。
+    /// 每多一个**已入池**对手，价值门槛上抬多少（多人收紧，所有翻前节点共享）。
     pub multiway_tighten: f64,
     /// 开池尺寸（bb）。9-max 标准 2.2–2.5bb。
     pub open_size_bb: f64,
@@ -118,31 +112,16 @@ pub struct PreflopConfig {
     /// 3bet 尺寸 = 面对的 raise-to 的倍数（IP）/（OOP）。
     pub threebet_mult_ip: f64,
     pub threebet_mult_oop: f64,
-    /// 短栈（有效栈 < 此 bb）切「推/弃」模式。
-    pub shortstack_bb: f64,
-    /// 短栈推全下的最低强度。
-    pub shove_strength: f64,
 }
 
 impl Default for PreflopConfig {
     fn default() -> Self {
         PreflopConfig {
-            // equity-vs-random 标度：随机两张约 0.5；这些阈值经 9-max 常识设定。
-            open_early: 0.585,
-            open_mid: 0.555,
-            open_late: 0.505,
-            open_sb: 0.535,
-            threebet: 0.64,
-            flat_call: 0.57,
-            vs_threebet_continue: 0.60,
-            fourbet: 0.70,
             multiway_tighten: 0.012,
             open_size_bb: 2.3,
             iso_extra_per_limper_bb: 1.0,
             threebet_mult_ip: 3.0,
             threebet_mult_oop: 4.0,
-            shortstack_bb: 25.0,
-            shove_strength: 0.60,
         }
     }
 }
@@ -167,9 +146,6 @@ pub struct PostflopConfig {
     /// 每多一个 active 对手，价值门槛上抬、诈唬频率下调的系数。
     pub multiway_value_tighten: f64,
     pub multiway_bluff_cut: f64,
-    /// c-bet 作为翻前加注者的基础频率（heads-up、干面）。
-    pub cbet_freq_dry: f64,
-    pub cbet_freq_wet: f64,
     /// 低 SPR 承诺阈值：SPR < 此值且 made-hand ≥ 顶对好踢 → 倾向 stack-off。
     pub commit_spr: f64,
     /// 下注尺寸（底池分数）候选——干面小、湿面大；引擎按质地/SPR 选。
@@ -195,14 +171,207 @@ impl Default for PostflopConfig {
             call_equity_margin: 0.02,
             multiway_value_tighten: 0.03,
             multiway_bluff_cut: 0.45,
-            cbet_freq_dry: 0.80,
-            cbet_freq_wet: 0.55,
             commit_spr: 2.5,
             size_small: 0.33,
             size_mid: 0.55,
             size_big: 0.80,
             size_overbet: 1.30,
             checkraise_freq: 0.18,
+        }
+    }
+}
+
+// ===========================================================================
+// 场景节点参数（Phase B 场景森林，`docs/scenario_heuristic_design.md` §3/§6）
+// ===========================================================================
+
+/// `pre.short` 推/弃覆盖层参数（短栈时先于常规翻前节点评估）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreShortNodeConfig {
+    /// 有效栈低于此 bb 数进入推/弃覆盖层。
+    pub max_eff_bb: f64,
+    /// 推全下最低强度（equity-vs-random 标度）。
+    pub shove_strength: f64,
+}
+
+impl Default for PreShortNodeConfig {
+    fn default() -> Self {
+        PreShortNodeConfig {
+            max_eff_bb: 25.0,
+            shove_strength: 0.60,
+        }
+    }
+}
+
+/// `pre.unopened.open` 各位置桶的开池（first-in raise）最低强度阈值
+/// （equity-vs-random 标度；BB 面对 limper 复用 `mid`）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreOpenNodeConfig {
+    pub early: f64,
+    pub mid: f64,
+    pub late: f64,
+    pub sb: f64,
+}
+
+impl Default for PreOpenNodeConfig {
+    fn default() -> Self {
+        PreOpenNodeConfig {
+            early: 0.585,
+            mid: 0.555,
+            late: 0.505,
+            sb: 0.535,
+        }
+    }
+}
+
+/// `pre.unopened.limp_behind` 投机跟注参数（小对/同连 set-mine，多人且便宜）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PreLimpBehindNodeConfig {
+    /// 投机跟注最低强度。
+    pub min_strength: f64,
+    /// 跟注上限（bb），超过不算「便宜」。
+    pub max_call_bb: f64,
+}
+
+impl Default for PreLimpBehindNodeConfig {
+    fn default() -> Self {
+        PreLimpBehindNodeConfig {
+            min_strength: 0.51,
+            max_call_bb: 1.5,
+        }
+    }
+}
+
+/// `pre.facing_raise.*` 单节点参数形态（每个加注级别一份独立类型——保证 JSON
+/// partial 覆盖时缺字段回落**该级别**的默认值，而非跨级别串参）。
+/// 字段语义：`reraise` = 价值再加注（3bet/4bet/5bet）最低强度；`call_strength` =
+/// 赔率线之外的「想 flat 强牌」强度补充入口；`implied_discount` = 深栈（>40bb）
+/// 投机牌隐含赔率折让（所需 equity 下调量），加注级别越高折让越窄（更可能被支配）。
+macro_rules! pre_facing_node_config {
+    ($name:ident, $reraise:expr, $call:expr, $implied:expr) => {
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        #[serde(default)]
+        pub struct $name {
+            /// 价值再加注最低强度。
+            pub reraise: f64,
+            /// 强度补充平跟入口。
+            pub call_strength: f64,
+            /// 深栈投机牌隐含赔率折让。
+            pub implied_discount: f64,
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                $name {
+                    reraise: $reraise,
+                    call_strength: $call,
+                    implied_discount: $implied,
+                }
+            }
+        }
+    };
+}
+
+pre_facing_node_config!(VsOpenNodeConfig, 0.64, 0.57, 0.05);
+pre_facing_node_config!(Vs3betNodeConfig, 0.70, 0.60, 0.025);
+pre_facing_node_config!(Vs4betNodeConfig, 0.70, 0.60, 0.0125);
+
+/// `post.unopened.value_bet.*` 单节点参数（池型分参）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ValueBetNodeConfig {
+    /// 价值下注最低 equity（vs 跟注 range）。
+    pub value_equity: f64,
+}
+
+impl Default for ValueBetNodeConfig {
+    fn default() -> Self {
+        ValueBetNodeConfig { value_equity: 0.58 }
+    }
+}
+
+/// `post.unopened.cbet_bluff.*` 单节点参数（池型分参，设计 §3.3 树 B 点名的拆分）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CbetNodeConfig {
+    /// 空气 c-bet 基础频率（干面 / 湿面，按湿度 lerp）。
+    pub freq_dry: f64,
+    pub freq_wet: f64,
+}
+
+impl Default for CbetNodeConfig {
+    fn default() -> Self {
+        CbetNodeConfig {
+            freq_dry: 0.80,
+            freq_wet: 0.55,
+        }
+    }
+}
+
+/// 池型三槽：`srp` / `threebet`（3bet 池）/ `other`（limped 与 4bet+ ——样本稀，
+/// 落 Phase A 父节点 id 兜底，§3.2 规则 2）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ValueBetSplit {
+    pub srp: ValueBetNodeConfig,
+    pub threebet: ValueBetNodeConfig,
+    pub other: ValueBetNodeConfig,
+}
+
+/// 池型三槽（c-bet 诈唬），语义同 [`ValueBetSplit`]。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CbetSplit {
+    pub srp: CbetNodeConfig,
+    pub threebet: CbetNodeConfig,
+    pub other: CbetNodeConfig,
+}
+
+/// 场景森林节点参数子树（Phase B）。已拆分节点在此分参；未拆分节点沿用
+/// `preflop` / `postflop` 共享层。JSON partial 覆盖照常工作（`serde(default)`）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NodesConfig {
+    /// `pre.short`：短栈推/弃覆盖层。
+    pub short: PreShortNodeConfig,
+    /// `pre.unopened.open`：各位置开池阈值。
+    pub open: PreOpenNodeConfig,
+    /// `pre.unopened.limp_behind`：投机跟注。
+    pub limp_behind: PreLimpBehindNodeConfig,
+    /// `pre.facing_raise.*.vs_open`：面对单个 open。
+    pub vs_open: VsOpenNodeConfig,
+    /// `pre.facing_raise.*.vs_3bet`：面对 3bet。
+    pub vs_3bet: Vs3betNodeConfig,
+    /// `pre.facing_raise.*.vs_4bet`：面对 4bet+（Phase B 新拆节点；`reraise`/
+    /// `call_strength` 默认与 vs_3bet 同参起步，遥测攒够样本后按 §4.3 纪律分调）。
+    pub vs_4bet: Vs4betNodeConfig,
+    /// `post.unopened.value_bet.{srp|3bp}`：价值下注池型分参。
+    pub value_bet: ValueBetSplit,
+    /// `post.unopened.cbet_bluff.{srp|3bp}`：c-bet 诈唬池型分参。
+    pub cbet: CbetSplit,
+    /// `post.unopened.float` 频率 = 空气诈唬基础频率 × 此乘子（run31 EV 缺口候选，
+    /// 先参数化待 Phase C 配靶调优）。
+    pub float_freq_mult: f64,
+    /// `post.facing.bluff_raise` 频率 = 空气诈唬基础频率 × 此乘子（同上）。
+    pub bluff_raise_freq_mult: f64,
+}
+
+impl Default for NodesConfig {
+    fn default() -> Self {
+        NodesConfig {
+            short: PreShortNodeConfig::default(),
+            open: PreOpenNodeConfig::default(),
+            limp_behind: PreLimpBehindNodeConfig::default(),
+            vs_open: VsOpenNodeConfig::default(),
+            vs_3bet: Vs3betNodeConfig::default(),
+            vs_4bet: Vs4betNodeConfig::default(),
+            value_bet: ValueBetSplit::default(),
+            cbet: CbetSplit::default(),
+            float_freq_mult: 0.5,
+            bluff_raise_freq_mult: 0.35,
         }
     }
 }

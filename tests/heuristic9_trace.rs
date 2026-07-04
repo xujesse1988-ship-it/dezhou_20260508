@@ -341,3 +341,212 @@ fn action_name(a: &DecisionAction) -> &'static str {
         DecisionAction::Raise(_) => "raise",
     }
 }
+
+// ===========================================================================
+// Phase B 场景森林：分派即路径（子节点 qualifier）+ 节点分参
+// ===========================================================================
+
+/// AA 面对 3bet 价值再加注：叶落 Phase B 子节点 `pre.facing_raise.value_reraise.vs_3bet`，
+/// 且 Phase A 叶 id `pre.facing_raise.value_reraise` 仍是路径前缀（§3.2 规则 2：拆分 =
+/// 父 id + qualifier，路径前缀聚合可对齐拆分前后）。
+#[test]
+fn trace_phase_b_facing_level_child_node() {
+    let bot = small_bot();
+    let req = Request {
+        hole: vec!["Ah".into(), "As".into()],
+        board: vec![],
+        button_seat: 7,
+        my_seat: 0,
+        num_seats: 9,
+        small_blind: 1,
+        big_blind: 2,
+        actions: vec![
+            ha(3, "raise", Some(6)),
+            ha(4, "fold", None),
+            ha(5, "fold", None),
+            ha(6, "fold", None),
+            ha(7, "raise", Some(18)),
+            ha(8, "fold", None),
+        ],
+        valid: valid(false, true, true, 34, 200),
+        stacks: vec![200; 9],
+        names: Default::default(),
+        sb_seat: None,
+        bb_seat: None,
+    };
+    let d = bot.decide_request(&req);
+    assert!(
+        matches!(d.action, DecisionAction::Raise(_)),
+        "AA 面对 3bet 应 4bet"
+    );
+    let tr = d.trace.as_ref().expect("trace 必须非空");
+    assert_eq!(
+        tr.path,
+        vec![
+            "pre",
+            "pre.facing_raise",
+            "pre.facing_raise.value_reraise",
+            "pre.facing_raise.value_reraise.vs_3bet",
+        ],
+        "分派即路径：Phase A 叶 id 为前缀 + vs_3bet qualifier 子节点"
+    );
+}
+
+/// 3bet 池坚果价值下注：叶落 `post.unopened.value_bet.3bp`（池型分参节点）；
+/// limped 池同款局面落 Phase A 父 id `post.unopened.value_bet`（父节点兜底，id 不变）。
+#[test]
+fn trace_phase_b_value_bet_pot_type_split() {
+    let bot = small_bot();
+    let mk = |actions: Vec<HistAction>| Request {
+        hole: vec!["Ah".into(), "5h".into()],
+        board: vec!["Kh".into(), "9h".into(), "2h".into()], // 坚果同花
+        button_seat: 0,
+        my_seat: 0,
+        num_seats: 3,
+        small_blind: 10,
+        big_blind: 20,
+        actions,
+        valid: valid(true, false, true, 20, 1900),
+        stacks: vec![2000; 3],
+        names: Default::default(),
+        sb_seat: None,
+        bb_seat: None,
+    };
+    // 3bet 池：hero(BTN) open→s2 3bet→hero call。
+    let d3 = bot.decide_request(&mk(vec![
+        ha(0, "raise", Some(50)),
+        ha(1, "fold", None),
+        ha(2, "raise", Some(160)),
+        ha(0, "call", None),
+    ]));
+    let tr3 = d3.trace.as_ref().unwrap();
+    assert_eq!(
+        tr3.path.last().unwrap(),
+        "post.unopened.value_bet.3bp",
+        "3bet 池价值下注落池型子节点"
+    );
+    assert!(
+        tr3.path.contains(&"post.unopened.value_bet".to_string()),
+        "Phase A 父 id 仍在路径前缀中"
+    );
+    // limped 池：无人加注过牌看翻牌 → 落父 id 兜底。
+    let dl = bot.decide_request(&mk(vec![
+        ha(0, "call", None),
+        ha(1, "fold", None),
+        ha(2, "check", None),
+    ]));
+    let trl = dl.trace.as_ref().unwrap();
+    assert_eq!(
+        trl.path.last().unwrap(),
+        "post.unopened.value_bet",
+        "limped 池落 Phase A 父 id（兜底，id 永不改义）"
+    );
+}
+
+/// 节点分参可独立生效（partial-JSON 覆盖机制照常工作）：
+/// - `nodes.vs_3bet.reraise` 拉满 → AA 面对 3bet 不再 4bet（改走赔率平跟），vs_open 不受影响；
+/// - 缺字段回落**该级别**默认值（不跨级别串参）。
+#[test]
+fn phase_b_node_params_split_and_partial_override() {
+    let cfg = HeuristicConfig::from_json_str(r#"{"nodes":{"vs_3bet":{"reraise":0.99}}}"#)
+        .expect("partial JSON 必须可解析");
+    assert_eq!(cfg.nodes.vs_3bet.reraise, 0.99);
+    assert_eq!(
+        cfg.nodes.vs_3bet.call_strength, 0.60,
+        "缺字段回落 vs_3bet 级别默认值"
+    );
+    assert_eq!(
+        cfg.nodes.vs_open.reraise, 0.64,
+        "vs_open 不受 vs_3bet 覆盖影响"
+    );
+    assert_eq!(cfg.nodes.cbet.srp.freq_dry, 0.80, "未触及子树全默认");
+
+    let bot = HeuristicBot::new(HeuristicConfig {
+        equity: poker::heuristic::config::EquityConfig {
+            samples: 120,
+            preflop_table_samples: 400,
+            seed: 1,
+        },
+        ..cfg
+    });
+    let req = Request {
+        hole: vec!["Ah".into(), "As".into()],
+        board: vec![],
+        button_seat: 7,
+        my_seat: 0,
+        num_seats: 9,
+        small_blind: 1,
+        big_blind: 2,
+        actions: vec![
+            ha(3, "raise", Some(6)),
+            ha(7, "raise", Some(18)),
+            ha(8, "fold", None),
+        ],
+        valid: valid(false, true, true, 34, 200),
+        stacks: vec![200; 9],
+        names: Default::default(),
+        sb_seat: None,
+        bb_seat: None,
+    };
+    let d = bot.decide_request(&req);
+    let tr = d.trace.as_ref().unwrap();
+    assert_eq!(
+        tr.path.last().unwrap(),
+        "pre.facing_raise.odds_call.vs_3bet",
+        "vs_3bet.reraise=0.99 → AA 改走赔率平跟（节点参数实际被消费）"
+    );
+}
+
+/// c-bet 池型分参独立生效：`nodes.cbet.threebet` 频率清零 → 3bet 池空气不再 c-bet
+/// （确定性：gate=0 掷点必不过），落 `post.unopened.check`；srp 参数不受影响。
+#[test]
+fn phase_b_cbet_3bp_params_independent() {
+    let cfg = HeuristicConfig::from_json_str(
+        r#"{"nodes":{"cbet":{"threebet":{"freq_dry":0.0,"freq_wet":0.0}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.nodes.cbet.srp.freq_dry, 0.80,
+        "srp 槽不受 threebet 槽覆盖影响"
+    );
+    let bot = HeuristicBot::new(HeuristicConfig {
+        equity: poker::heuristic::config::EquityConfig {
+            samples: 120,
+            preflop_table_samples: 400,
+            seed: 1,
+        },
+        ..cfg
+    });
+    // hero = 3bet 池翻前加注者（有主动权），空气干面，无人下注。
+    let req = Request {
+        hole: vec!["7c".into(), "2d".into()],
+        board: vec!["Kh".into(), "8s".into(), "3c".into()],
+        button_seat: 0,
+        my_seat: 0,
+        num_seats: 3,
+        small_blind: 10,
+        big_blind: 20,
+        actions: vec![
+            ha(2, "raise", Some(60)),
+            ha(0, "raise", Some(180)),
+            ha(1, "fold", None),
+            ha(2, "call", None),
+            ha(2, "check", None),
+        ],
+        valid: valid(true, false, true, 20, 1800),
+        stacks: vec![2000; 3],
+        names: Default::default(),
+        sb_seat: None,
+        bb_seat: None,
+    };
+    let d = bot.decide_request(&req);
+    let tr = d.trace.as_ref().unwrap();
+    assert_eq!(tr.scenario.pot_type, "3bp");
+    assert!(tr.scenario.initiative, "hero 是 3bet 方，持主动权");
+    assert_eq!(
+        tr.path.last().unwrap(),
+        "post.unopened.check",
+        "3bp c-bet 频率清零 → 空气必 check"
+    );
+    assert_eq!(d.action, DecisionAction::Check);
+}
