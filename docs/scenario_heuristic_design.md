@@ -113,8 +113,8 @@
 | 每个对手的预估 range | **ML 默认**：`build_opp_ranges_ml`（`policy.rs:119`）→ 169 类 `RangeVec`；兜底标量 `build_opp_thresholds`（`policy.rs:55`） | ✅ |
 | 按 range 计算的 equity | `equity_dispatch`（`policy.rs:134`）→ `equity_weighted`（`equity.rs:284`） | ✅ |
 | 对手画像 | `OpponentTable`（VPIP/PFR/AF，`opponent.rs`） | ⚠ 仅 3 个标量，扩充方向 = `opponent_features_inventory.md` |
-| 行动线派生量（capped / delayed-cbet / facing-barrel-N） | 数据基座已落：`seat_actions`（`view.rs:228`）+ `street_aggressors`（`view.rs:231`） | ⚠ 派生量未做（P0-1 剩余，§7） |
-| 主动权 | `i_have_initiative()` | ⚠ 过期主动权 bug 未修（P0-1 剩余） |
+| 行动线派生量（capped / delayed-cbet / facing-barrel-N） | 数据基座已落：`seat_actions`（`view.rs:228`）+ `street_aggressors`（`view.rs:231`）；派生量随 Phase A 落地 | ✅ |
+| 主动权 | `i_have_initiative()` | ✅ 过期主动权已修（Phase B）：按街回溯 `street_aggressors`，谁最后开火谁持有 |
 
 结论：**信息层已经够 Phase A/B 起步**——场景 key 的每个维度今天就能从 `GameView` 读出；
 只有「面对 double barrel」这类线敏感场景要等 P0-1 派生量。这也是本设计与 range 优化的关系：
@@ -183,6 +183,12 @@ Phase A 的「节点」= **现有 if 分支的显式命名**（以实际代码�
 另有两类**非节点**的降级标记（都进兜底率分子，§8④）：policy 内降级（想 raise 但不可加注，
 `source` 带 `:downgrade[_call]` 后缀，节点仍归因原分支）；`legalize` 地板改动作/尺寸
 （`trace.legalized` 记 before/after，当前引擎正常路径不触发，属 belt-and-suspenders）。
+
+> **Phase B（2026-07-04）在此清单上长出的子层级**（规则 2：父 id + qualifier，父 id 均仍在
+> 路径前缀中，聚合可对齐）：`pre.facing_raise.{value_reraise|odds_call|fold}` 按加注级别拆
+> `.vs_open / .vs_3bet / .vs_4bet`；`post.unopened.{value_bet|cbet_bluff}` 按池型拆
+> `.srp / .3bp`（limped / 4bet+ 落父 id 兜底）。现行叶节点共 32 个（30 policy 叶 +
+> `pre.facing_raise.check` 边角 + `fallback.no_hole`）。详见 §6 Phase B 落地状态。
 
 ### 3.3 三棵示例树（从直觉例子长出的正确形态）
 
@@ -361,6 +367,43 @@ equity 信号越干净，节点参数才调得动——**先有好输入，再�
 对齐）——每处变化要能说出为什么更好，说不出的按 §4.2 反例警惕。此阶段结束，场景森林
 作为代码结构存在，节点数 ≈ 几十个。
 
+> **落地状态（2026-07-04）：已落地。**
+> - **分派结构**：`policy.rs` 重写为显式场景森林——上下文节点 enum
+>   `SpotNode { PreUnopened, PreFacingRaise(RaiseLevel), PostUnopened(PotType),
+>   PostFacingBet(PotType) }`，`SpotNode::classify` 对 `GameView` 纯读取、互斥完备
+>   （每个决策点恰好一个节点），`match` 分派完备性由编译器保证（§8⑤）；`pre.short`
+>   （短栈推/弃）为覆盖层 gate。**trace 从「事后标注」变「分派即路径」**：叶 id 由
+>   家族前缀 + 分派 qualifier 组装（`leaf_id`），`Response.trace` 透传链路与 driver
+>   零改动。`ScenarioKey` 新增 `initiative` 维度（修复后语义）。
+> - **节点分层（拆分全部按规则 2 长子层级，Phase A 22 叶 id 全部保留为路径前缀）**：
+>   翻前 `pre.facing_raise.{value_reraise|odds_call|fold}` × `.vs_open/.vs_3bet/.vs_4bet`
+>   （run31 reraise 仅 5% —— P1-4 分调的遥测前置）；翻后 `post.unopened.{value_bet|
+>   cbet_bluff}` × `.srp/.3bp`（§3.3 树 B 点名的 3bet/SRP 拆分；limped/4bet+ 落父 id
+>   兜底）。现行叶节点 32 个。
+> - **节点参数**：`HeuristicConfig.nodes` 新子树（`#[serde(default)]`，partial-JSON 覆盖
+>   照常）：`short / open / limp_behind / vs_open / vs_3bet / vs_4bet / value_bet(池型三槽)
+>   / cbet(池型三槽) / float_freq_mult / bluff_raise_freq_mult`；每个加注级别独立类型，
+>   缺字段回落**该级别**默认值。`preflop`/`postflop` 退为共享层（尺寸/多人系数/赔率余量）。
+> - **顺手修的 bug**：`i_have_initiative()` 过期主动权（P0-1 收尾）——按街从近到远回溯
+>   `street_aggressors`，谁最后开火谁持有主动权（旧实现本街无人下注即回落翻前加注者）。
+>   下游行为变化：失去火力的 PFA 不再高频 c-bet（改走低频 float 门）、check-raise 接管方
+>   获得 barrel 权、limp 池翻后开火者获得主动权——sim 里 c-bet/float 热度迁移与此一致。
+> - **扫参（shipped / 驳回）**：`bluff_raise_freq_mult` 0.35→**0.10** shipped
+>   （0.20/0.10/0.0 三档 paired 同 seed 均 10/11 配置正、越低越好、0.10≈0.0 不可分；
+>   与 run31 live n=13 EV −15.5±6.4 显著亏互证；保留 0.10 让节点存活继续攒样本）。
+>   **驳回**：`float_freq_mult` 0.5→0.25（3/11 负、无一致方向，§4.3）；
+>   `cbet.threebet` 分参默认值（sim 场该节点 n≈2/8000 手不可测，须先造靶——§4.3 规则 2，
+>   Phase C；结构与参数槽已就位、默认与 srp 同参）。
+> - **质量门**：8000 手 × 11 配置（6-max {mixed,limpy,station} × seed {7,11,23} +
+>   9-max/2-max seed 7，`--exploit`）vs 重构前基线：**10/11 上行、1 平（−1.6）**，均值
+>   +41.6 mbb/g，全部在 CI95 内无退化；**fallback 0、pot/to_call 重建漂移 0（11/11）**；
+>   `--trace-summary` 节点热度拆分子节点之和与父节点对齐（如 facing fold
+>   2982→1991+805+185）；fmt / clippy 全绿；`heuristic9` 10 + `heuristic9_trace` 10
+>   （新增 4）+ `heuristic_p0_1_action_line` 8（新增 3）全绿；`heuristic9_play.py
+>   --selftest` PASS。
+> - **范围外**：`post.facing` 池型/听牌细分（树 C）、check-raise 计划节点（P1-1）、
+>   翻前 3bet-bluff 频率（P1-4）、尺寸按节点分参（P0-2）→ Phase C。
+
 **Phase C — 逐节点迭代（常态循环）。**
 按 Phase A 的图跑 §4.1 闭环：每轮 top-K 节点 → 造靶 baseline → 拆分/调参 → 回归门。
 预期先动的节点（按已知证据）：3bet 池 c-bet 与 SRP 分参、树 C 听牌防守细化、
@@ -373,7 +416,7 @@ check-raise 计划节点（P1-1）、翻前 3bet-bluff 频率（P1-4）。「几
 
 | 原项 | 内容 | 新角色 / 去向 |
 |---|---|---|
-| **P0-1** | 行动线记忆。数据基座**已落**（`seat_actions`，`view.rs:228`；`street_aggressors`，`view.rs:231`；`tests/heuristic_p0_1_action_line.rs`）| 派生量（`villain_capped` / `is_delayed_cbet` / `facing_barrel_n`）**已随 Phase A 落地**；`i_have_initiative()` 过期主动权修复 → Phase B 直接修（过 sim 质量门即可，等价门已解除） |
+| **P0-1** | 行动线记忆。数据基座**已落**（`seat_actions`，`view.rs:228`；`street_aggressors`，`view.rs:231`；`tests/heuristic_p0_1_action_line.rs`）| 派生量（`villain_capped` / `is_delayed_cbet` / `facing_barrel_n`）**已随 Phase A 落地**；`i_have_initiative()` 过期主动权**已随 Phase B 修复**（按街回溯 `street_aggressors`，3 个 view 级单测）→ **P0-1 关闭** |
 | **P0-2** | 下注尺寸引擎（多档尺寸 / 跨街 geometry / 接线 `size_mid`）| 融入节点参数化：尺寸 = 节点参数的一部分，Phase C 按节点落，不再是独立引擎 |
 | **P0-3** | per-street 对手统计（fold-to-cbet 等）+ 连续剥削 | 与 `opponent_features_inventory.md` 合流 → §5.2 节点计数表；剥削从「离散 ±cap」改「节点级连续查询」 |
 | **P1-1** | check-raise 专家 | 新场景节点（OOP 无主动权 × 强牌/强听 → check 计划 raise），Phase C；须配「会 cbet 的 aggressor」靶 baseline（P1-5）|
@@ -403,16 +446,17 @@ check-raise 计划节点（P1-1）、翻前 3bet-bluff 频率（P1-4）。「几
 
 | 主题 | 位置 |
 |---|---|
-| 决策入口 | `src/heuristic/policy.rs:170`（`decide`）|
-| 现隐式场景树 | `policy.rs:260`（`preflop_decide`）/ `:424`（`postflop_decide`）|
-| 共享地板 | `policy.rs:198`（`legalize`）/ `:241`（`safe_fallback`）/ `:33`（`situation_seed`）|
-| 尺寸 | `policy.rs:589`（`pick_bet_size`）|
-| ML range（信息层，不动）| `policy.rs:119`（`build_opp_ranges_ml`）/ `:134`（`equity_dispatch`）/ `src/heuristic/range_online.rs:49`（`MlRange::predict`）|
-| 标量 range 兜底 | `policy.rs:55`（`build_opp_thresholds`）/ `:71-79`（`aggressor_size_tighten`，§5.3 门控对象）|
+| 决策入口 | `src/heuristic/policy.rs:324`（`decide`）|
+| 场景森林分派（Phase B）| `policy.rs:117`（`SpotNode::classify`）；节点响应 `pre_unopened`:478 / `pre_facing_raise`:567 / `post_unopened`:750 / `post_facing_bet`:867 / `pre_short_shove_gate`:455 |
+| 节点参数子树 | `src/heuristic/config.rs`（`NodesConfig`，`nodes.*`）|
+| 共享地板 | `policy.rs:378`（`legalize`）/ `:421`（`safe_fallback`）/ `:176`（`situation_seed`）|
+| 尺寸 | `policy.rs:1017`（`pick_bet_size`）|
+| ML range（信息层，不动）| `policy.rs:262`（`build_opp_ranges_ml`）/ `:277`（`equity_dispatch`）/ `src/heuristic/range_online.rs:49`（`MlRange::predict`）|
+| 标量 range 兜底 | `policy.rs:198`（`build_opp_thresholds`）/ `:218`（`aggressor_size_tighten`，§5.3 门控对象）|
 | equity | `src/heuristic/equity.rs:284`（`equity_weighted`）/ `:156`（`equity`）|
 | 特征 | `src/heuristic/features.rs:98`（`made_class`）/ `:193`（`draws`）/ `:239`（`texture`）|
-| 行动线数据基座（P0-1）| `src/heuristic/view.rs:228`（`seat_actions`）/ `:231`（`street_aggressors`）|
-| 位置桶 | `view.rs:727`（`my_pos_bucket`）|
+| 行动线数据基座（P0-1）| `src/heuristic/view.rs:232`（`seat_actions`）/ `:235`（`street_aggressors`）/ `:718`（`i_have_initiative`，Phase B 修复后）|
+| 位置桶 | `view.rs:741`（`my_pos_bucket`）|
 | 对手画像 | `src/heuristic/opponent.rs:113`（`classify`）/ `:176`（`aggregate_exploit`）|
 | 迭代闭环先例 | `docs/heuristic9_design.md` §6（limp K-rag 驳回、PairedTrap 驳回、v0.3 station 尺寸放大 shipped）|
 | sim baseline 先例 | `tools/heuristic9_sim.rs`（`Limper` / `PairedTrap`）|

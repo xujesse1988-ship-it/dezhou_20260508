@@ -3,6 +3,13 @@
 > 本文逐层讲清 `src/heuristic/` 里的实际决策逻辑，把「文档怎么说」对齐到「代码怎么做」。
 > 想看架构和迭代闭环，去 [`heuristic9_design.md`](heuristic9_design.md)；本文只聚焦**策略本身**。
 > 每处引用都带 `file:line`，点开即可对照源码。
+>
+> ⚠ **Phase B（2026-07-04）重构提示**：policy 层已重写为**显式场景森林**（节点 enum +
+> `match` 分派，`preflop_decide`/`postflop_decide` 不复存在；各节点阈值移入
+> `HeuristicConfig.nodes` 子树；`i_have_initiative` 过期主动权已修）。本文的策略**语义**
+> 走读仍基本成立（节点响应逐规则移植），但涉及 `policy.rs`/`config.rs` 的行号与字段名以
+> [`scenario_heuristic_design.md`](scenario_heuristic_design.md) §3.2.1 + §6 Phase B
+> 落地状态与源码为准；本文全面更新排在 Phase C 首轮迭代后。
 
 ## 一句话概括
 

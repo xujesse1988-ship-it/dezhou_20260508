@@ -304,6 +304,29 @@ P0-1 派生量 3 测）；fmt / clippy 全绿。
 （多 seed sim mbb/g 不退 + 0 fallback / 0 重建漂移 + 样本纪律），见
 `docs/scenario_heuristic_design.md` §6 纪律更新。
 
+### Phase B 场景森林重构（2026-07-04）：显式节点分派 + i_have_initiative 修复（shipped）
+
+场景化设计（`docs/scenario_heuristic_design.md` §6 Phase B）落地——首个「重新做、做得更好」
+的行为性重构（等价门已随 Phase A 退役）：
+
+- **结构**：`preflop_decide`/`postflop_decide` 隐式 if 树重写为显式场景森林——上下文节点
+  enum `SpotNode`（`PreUnopened` / `PreFacingRaise(RaiseLevel)` / `PostUnopened(PotType)` /
+  `PostFacingBet(PotType)`）+ `match` 分派（编译器保证完备，每个决策点恰好一个节点）；
+  trace 路径由分派结构直接组装（「分派即路径」），`Response.trace` 透传链路与 driver 零改动。
+- **节点分层**：`pre.facing_raise.*` 按加注级别拆 `.vs_open/.vs_3bet/.vs_4bet`；
+  `post.unopened.{value_bet,cbet_bluff}` 按池型拆 `.srp/.3bp`（3bet 池与 SRP 分参——
+  设计点名项；limped/4bet+ 落父 id 兜底）。Phase A 22 叶 id 全部保留为路径前缀，现行
+  叶节点 32 个。参数收进 `HeuristicConfig.nodes` 新子树（`serde(default)`，partial-JSON
+  覆盖照常）；`preflop`/`postflop` 退为共享层。
+- **bug 修复**：`i_have_initiative()` 过期主动权（P0-1 收尾，backlog 旧项关闭）——按街
+  回溯 `street_aggressors`；失去火力的 PFA 不再高频 c-bet、check-raise 接管方获得 barrel 权。
+- **扫参**：`bluff_raise_freq_mult` 0.35→0.10 shipped（三档扫描 10/11 配置一致向好、与
+  run31 live 遥测互证）；float 0.25、3bp c-bet 分参默认值按 §4.3 驳回/推迟（详见场景设计
+  文档 §6 落地状态）。
+- **回归门**：8000 手 × 11 配置（6-max mixed/limpy/station × seed 7/11/23 + 9-max/2-max）
+  vs 重构前基线 10/11 上行、1 平、全在 CI95 内；0 fallback、0 重建漂移；fmt/clippy/
+  heuristic 测试套件（+7 新测）/`--selftest` 全绿。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街
