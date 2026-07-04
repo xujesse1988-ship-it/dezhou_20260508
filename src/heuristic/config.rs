@@ -353,9 +353,12 @@ pub struct NodesConfig {
     /// `post.unopened.cbet_bluff.{srp|3bp}`：c-bet 诈唬池型分参。
     pub cbet: CbetSplit,
     /// `post.unopened.float` 频率 = 空气诈唬基础频率 × 此乘子（run31 EV 缺口候选，
-    /// 先参数化待 Phase C 配靶调优）。
+    /// 参数化待 Phase C 配靶调优；0.25 试点 sim 正负参半 → 驳回，维持 0.5）。
     pub float_freq_mult: f64,
-    /// `post.facing.bluff_raise` 频率 = 空气诈唬基础频率 × 此乘子（同上）。
+    /// `post.facing.bluff_raise` 频率 = 空气诈唬基础频率 × 此乘子。0.10 = Phase B
+    /// 扫参甜点：0.35→0.20/0.10/0.0 均 10/11 配置正（paired 同 seed），越低越好且
+    /// 0.10 与 0.0 不可分；与 run31 live 遥测一致（n=13，−15.5±6.4 bb/hand 显著亏）。
+    /// 保留 0.10 而非 0：节点存活才能继续攒 live 样本供 Phase C 复评（死节点无数据）。
     pub bluff_raise_freq_mult: f64,
 }
 
@@ -371,7 +374,7 @@ impl Default for NodesConfig {
             value_bet: ValueBetSplit::default(),
             cbet: CbetSplit::default(),
             float_freq_mult: 0.5,
-            bluff_raise_freq_mult: 0.35,
+            bluff_raise_freq_mult: 0.10,
         }
     }
 }
