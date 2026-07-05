@@ -321,13 +321,32 @@ pub struct ValueBetSplit {
     pub other: ValueBetNodeConfig,
 }
 
-/// 池型三槽（c-bet 诈唬），语义同 [`ValueBetSplit`]。
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// 池型三槽（c-bet 诈唬），语义同 [`ValueBetSplit`]。`srp` / `other` 用通用默认
+/// （0.80/0.55）；`threebet` **默认更低（0.30/0.20）**——Phase C 第一轮扫参结论：3bet 池
+/// 空气 c-bet 的 fold-equity 结构性低于 srp（低 SPR、大池、villain 跟 3bet 后 range 更强更
+/// 粘），srp 频率放到 3bet 池是过度诈唬。造靶 wideopen-2max（hero 作 3bettor 进翻后）上
+/// 0.30/0.20 vs srp 默认 0.80/0.55：9/9 seed 一致 +23 mbb/g（无 exploit 时同向 → 结构性、
+/// 非画像分类假象），标准回归矩阵近不变（3bet 池在标准场稀疏）；详见
+/// `docs/heuristic9_design.md` §6「Phase C 第一轮」。
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CbetSplit {
     pub srp: CbetNodeConfig,
     pub threebet: CbetNodeConfig,
     pub other: CbetNodeConfig,
+}
+
+impl Default for CbetSplit {
+    fn default() -> Self {
+        CbetSplit {
+            srp: CbetNodeConfig::default(),
+            threebet: CbetNodeConfig {
+                freq_dry: 0.30,
+                freq_wet: 0.20,
+            },
+            other: CbetNodeConfig::default(),
+        }
+    }
 }
 
 /// 场景森林节点参数子树（Phase B）。已拆分节点在此分参；未拆分节点沿用
