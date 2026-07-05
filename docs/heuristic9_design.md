@@ -327,6 +327,38 @@ P0-1 派生量 3 测）；fmt / clippy 全绿。
   vs 重构前基线 10/11 上行、1 平、全在 CI95 内；0 fallback、0 重建漂移；fmt/clippy/
   heuristic 测试套件（+7 新测）/`--selftest` 全绿。
 
+### Phase C 第一轮（2026-07-05）：3bp c-bet 分参 shipped + float 二次驳回（scenario §6 Phase C）
+
+首轮 §4.1 逐节点闭环。造靶基建 `7a64c45`（`tools/heuristic9_sim.rs` 新增 `WideOpener` /
+`ThreeBettor` 两 3bet 池对手原型 + `--field 3bp|wideopen|3bettor`，不入 mixed pool、默认
+关，follow Limper/PairedTrap 先例）。三候选按 run31/32 live 定序处理，方法论 follow
+PairedTrap 驳回格式（多 seed paired 同 seed 对比 mbb/g，靶场显著向好 + 标准矩阵不退化）：
+
+- **候选① 3bp c-bet 频率（SHIPPED，`d84cc35`）**：`CbetSplit::threebet` 默认 0.80/0.55 →
+  **0.30/0.20**（srp/other 不动）。靶 = `--field wideopen --seats 2`（hero 作 3bettor 进
+  翻后，`cbet_bluff.3bp` n~60/8000 手）。9 seed paired：0.30/0.20 vs srp-同参 **9/9 一致
+  +23.3 mbb/g**（单调至 0 的 +32.1，保留非零留节点存活 + 平衡头寸，follow Phase B
+  bluff_raise 0.10 先例）；**无 --exploit 时同向 +20** → 结构性（3bet 池 fold-equity 低：
+  低 SPR、大池、villain 跟 3bet 后 range 更强更粘），非画像分类假象。标准回归矩阵 11 配置
+  均值 Δ −0.68 mbb/g（limpy/station/9max/2max 恰 0，仅稀疏 mixed 3bet 池漂 ±10）、
+  0 fallback / 0 漂移——参数只在 3bet 池生效未串 srp，与 run32 live `value_bet.3bp` n=24
+  +45.6 的「3bet 池是好 spot」互证。**同轮驳回 value_bet.3bp 价值阈值**：ve 0.58→0.50 在
+  3bp-6max 仅 +31（4/7、深在 ±950 噪声内）、wideopen-2max 反 −4，跨靶不一致；ve 收紧
+  （0.61/0.64）两靶一致变差 → 默认 0.58 已近最优，不动。
+- **候选② float 频率（二次驳回）**：Phase B 已驳回 0.5→0.25 一刀切（3/11 负）。本轮在高密度
+  靶复核揭示**机理**：float 最优值随对手翻后粘度**反号**——wideopen-2max（粘跟站）float=0.0
+  最优（+49 mbb/g 9/9），3bettor-2max（过度 barrel 后弃牌的进攻方）float=1.0 最优（+33
+  8/9），且**与 exploit 无关**（含/不含 --exploit 反号方向一致）。故任何一刀切乘子必错；正确
+  修法 = 按对手翻后弃牌画像门控（scenario §5.2 节点级剥削查询 / P0-3），当前 float 节点仅
+  经 `bluff_mult` 消费剥削读数、而该效应 exploit 无关 → `bluff_mult` 不含此信号 → 门控须等
+  P0-3 per-opponent 翻后 fold-to-stab 统计。街/人数一刀切门控不解反号（分裂由对手驱动、非
+  街/人数），拒绝按代理量过拟合两个合成靶（§4.2）。
+- **候选③ bluff_raise 频率（复核，无改动）**：全局频率、非池型分参。3bettor-2max 靶（n~22）
+  + 标准矩阵复核：降 0.10→0.0 仅 +8~11 mbb/g（7/9、9/11）但**杀节点**（Phase B 已权衡：保
+  0.10 留 live 样本通道，每 2000 手 ~5 次）；升 0.20/0.35 两处一致明确变差（0/11、1/11）。
+  **0.10 复核仍甜点，维持**。画像门控（仅对高弃牌对手开）与 float 同需 P0-3 翻后 fold 统计
+  → 一并推迟。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街

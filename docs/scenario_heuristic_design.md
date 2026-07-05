@@ -410,6 +410,19 @@ equity 信号越干净，节点参数才调得动——**先有好输入，再�
 check-raise 计划节点（P1-1）、翻前 3bet-bluff 频率（P1-4）。「几千个格子」从这一阶段起
 自然生长，但每一步都有分母、有靶、有门。
 
+> **落地状态（Phase C 第一轮，2026-07-05）：3bp c-bet 分参 shipped。** 造靶基建
+> `7a64c45`（`WideOpener` / `ThreeBettor` 两 3bet 池对手 + `--field 3bp|wideopen|3bettor`，
+> 令 `value_bet.3bp` / `cbet_bluff.3bp` / `vs_3bet` 家族可测）。三候选（run31/32 live 定序）：
+> - **① 3bp c-bet 频率 SHIPPED（`d84cc35`）**：`nodes.cbet.threebet` 默认 0.80/0.55 →
+>   **0.30/0.20**（srp 不动）——3bet 池空气 c-bet 的 fold-equity 结构性低于 srp。靶
+>   wideopen-2max 9 seed **9/9 +23.3 mbb/g**（无 exploit 同向），标准矩阵 11 配置均值
+>   Δ −0.68（近不变）、0 fallback / 0 漂移。value_bet.3bp 价值阈值同轮驳回（信号弱、跨靶
+>   不一致，默认 0.58 近最优）。详见 `docs/heuristic9_design.md` §6。
+> - **② float 频率 二次驳回**：最优乘子随对手翻后粘度**反号**（wideopen-2max 要 0.0、
+>   3bettor-2max 要 1.0，且 exploit 无关）→ 一刀切必错，须待 P0-3 per-opponent 翻后
+>   fold 画像门控（`bluff_mult` 不含此信号）。
+> - **③ bluff_raise 频率 复核维持 0.10**：降 0 仅 +10 但杀节点、升明确变差；画像门控同需 P0-3。
+
 ---
 
 ## 7. 继承 backlog（自旧文档 §4，保留原编号）
@@ -417,13 +430,13 @@ check-raise 计划节点（P1-1）、翻前 3bet-bluff 频率（P1-4）。「几
 | 原项 | 内容 | 新角色 / 去向 |
 |---|---|---|
 | **P0-1** | 行动线记忆。数据基座**已落**（`seat_actions`，`view.rs:228`；`street_aggressors`，`view.rs:231`；`tests/heuristic_p0_1_action_line.rs`）| 派生量（`villain_capped` / `is_delayed_cbet` / `facing_barrel_n`）**已随 Phase A 落地**；`i_have_initiative()` 过期主动权**已随 Phase B 修复**（按街回溯 `street_aggressors`，3 个 view 级单测）→ **P0-1 关闭** |
-| **P0-2** | 下注尺寸引擎（多档尺寸 / 跨街 geometry / 接线 `size_mid`）| 融入节点参数化：尺寸 = 节点参数的一部分，Phase C 按节点落，不再是独立引擎 |
-| **P0-3** | per-street 对手统计（fold-to-cbet 等）+ 连续剥削 | 与 `opponent_features_inventory.md` 合流 → §5.2 节点计数表；剥削从「离散 ±cap」改「节点级连续查询」 |
+| **P0-2** | 下注尺寸引擎（多档尺寸 / 跨街 geometry / 接线 `size_mid`）| 融入节点参数化：尺寸 = 节点参数的一部分，Phase C 按节点落，不再是独立引擎。**Phase C 第一轮记录**：尺寸仍是 `postflop` 共享层（`pick_bet_size`/`value_size` 读 `size_small/big`），**尚未按节点分槽**——故 3bp 尺寸无法脱离 srp 单调；要扫 3bp 尺寸须先给节点加尺寸槽（本轮范围外，未做）|
+| **P0-3** | per-street 对手统计（fold-to-cbet 等）+ 连续剥削 | 与 `opponent_features_inventory.md` 合流 → §5.2 节点计数表；剥削从「离散 ±cap」改「节点级连续查询」。**Phase C 第一轮坐实为 float / bluff_raise 门控的前置**：两节点的最优诈唬频率随对手翻后弃牌/粘度反号（造靶实测），现仅 `bluff_mult` 一个剥削读数进节点、且该效应 exploit 无关（`bluff_mult` 不含翻后 fold-to-stab 信号）→ 正确门控须等 P0-3 落 per-opponent 翻后 fold 统计 |
 | **P1-1** | check-raise 专家 | 新场景节点（OOP 无主动权 × 强牌/强听 → check 计划 raise），Phase C；须配「会 cbet 的 aggressor」靶 baseline（P1-5）|
 | **P1-2** | equity MC 方差 / 缓存 | 信息层课题，与场景化正交，原样保留（live 提 `samples` 仍是快赢）|
 | **P1-3** | 特征粒度（坚果度 / kicker / runout）| 节点内响应信号增强，按消费节点拉动（如 river 价值节点需要坚果度）|
 | **P1-4** | 翻前树浅（无诈唬 3bet/4bet、无 squeeze 建模）| 翻前森林的节点扩充，Phase C；3bet-bluff 频率 = 节点参数 + 画像（fold-to-3bet）门控 |
-| **P1-5** | 测试 / sim baseline 覆盖 | **升格为 §4.3 纪律的基础设施**：造靶 baseline 是每次节点优化的前置，随 Phase C 每轮增补 |
+| **P1-5** | 测试 / sim baseline 覆盖 | **升格为 §4.3 纪律的基础设施**：造靶 baseline 是每次节点优化的前置，随 Phase C 每轮增补。**Phase C 第一轮增补**：`WideOpener` / `ThreeBettor`（`7a64c45`）——3bet 池两侧靶（hero 作 3bettor / 被 3bet），令 `value_bet.3bp` / `cbet_bluff.3bp` / `pre.facing_raise.*.vs_3bet` / `float` 可测 |
 | **P2-1** | 边界 softmax 混合（`mixing.temperature` 死档）| 节点参数（低优先，弱场对手不针对）|
 | **P2-2** | multiway / 有效栈 nuance | SPR/人数桶的细化课题（低优先）|
 | **P2-3** | `aggressor_size_tighten` 可剥削性 | → §5.3：节点参数按画像门控 |
