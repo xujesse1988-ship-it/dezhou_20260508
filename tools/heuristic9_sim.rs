@@ -15,8 +15,8 @@
 //! 用法：
 //! ```text
 //! heuristic9_sim [--hands N] [--seats K] [--bb 20] [--start-bb 100] [--samples S] [--seed X]
-//!                [--field mixed|nit|station|maniac|tag|random] [--mirror] [--exploit]
-//!                [--config cfg.json] [--trace-summary]
+//!                [--field mixed|nit|station|maniac|tag|random|limpy|pairedtrap|3bp] [--mirror]
+//!                [--exploit] [--config cfg.json] [--trace-summary]
 //! ```
 //! `--config` 覆盖 HeuristicConfig（partial JSON，缺字段走默认）——无需重编即可扫旋钮。
 //! `--trace-summary` 结束时追加打印 Phase A 节点热度表（叶节点 × 命中次数 + legalize 降级数，
@@ -49,6 +49,14 @@ enum Archetype {
     /// 否则被动 check/call、绝不诈唬加注；非对子面打法同 Tag。这是 hero 「对子面非坚果价值再加注」
     /// 漏洞的测试载荷（run24 −7031 复盘）——专门惩罚把两对/顶对加进 trips/boat 深战。
     PairedTrap,
+    /// 3bet 池造靶（P1-5，Phase C 第一轮）之一：**宽开池 + 被再加注后爱跟**的开池跟注机。
+    /// first-in 极宽 raise-or-fold 开池（制造大量单加注池底料）；被 3bet 后宽跟、几乎不 4bet；
+    /// 翻后站式粘跟。让 hero 高频作为 3bet 者进翻后（喂 `post.unopened.{value_bet,cbet_bluff}.3bp`）。
+    WideOpener,
+    /// 3bet 池造靶（P1-5）之二：**高频 3bet 单次加注**的 3bet 机。面对 open 用宽价值域 +
+    /// 低频空气混合再加注；被 4bet 后仅顶级牌继续；翻后作为进攻方高频 c-bet（含空气）。
+    /// 喂 hero 的 `pre.facing_raise.*.vs_3bet` 与 hero 作为 caller 的 3bet 池。
+    ThreeBettor,
     Hero, // 仅 mirror 模式
 }
 
@@ -281,6 +289,84 @@ fn baseline_action(
             }
             return safe_action(&legal);
         }
+        // WideOpener：3bet 池造靶的「宽开池 + 被再加注后爱跟」一侧。
+        if arch == Archetype::WideOpener {
+            let high = state_high(state);
+            let only_blinds = high <= state.config().big_blind.0;
+            if to_call == 0 {
+                // 无人下注（BB check option）：仅顶级牌加注，否则过牌。
+                if strength >= 0.62 {
+                    if let Some(a) = make_bet(0.15, &legal) {
+                        return a;
+                    }
+                }
+                return safe_action(&legal);
+            }
+            if only_blinds {
+                // first-in / 面对 limper：极宽 raise-or-fold 开池（单加注池底料）。
+                if strength >= 0.40 {
+                    if let Some(a) = make_bet(0.12, &legal) {
+                        return a;
+                    }
+                }
+                return safe_action(&legal);
+            }
+            // 面对再加注（含自己开池被 3bet）：爱跟——宽强度域 + 好赔率都跟，低频顶级 4bet。
+            if strength >= 0.87 && legal_can_raise(&legal) && rng.unit() < 0.5 {
+                if let Some(a) = make_bet(0.8, &legal) {
+                    return a;
+                }
+            }
+            if (strength >= 0.42 || pot_odds < 0.28) && legal.call.is_some() {
+                return Action::Call;
+            }
+            return safe_action(&legal);
+        }
+        // ThreeBettor：3bet 池造靶的「高频 3bet 单次加注」一侧。
+        if arch == Archetype::ThreeBettor {
+            let bb_amt = state.config().big_blind.0;
+            let high = state_high(state);
+            let only_blinds = high <= bb_amt;
+            if to_call == 0 {
+                if strength >= 0.60 {
+                    if let Some(a) = make_bet(0.15, &legal) {
+                        return a;
+                    }
+                }
+                return safe_action(&legal);
+            }
+            if only_blinds {
+                // first-in：正常 TAG 开池（本型的重点在面对 open 的再加注）。
+                if strength >= 0.55 {
+                    if let Some(a) = make_bet(0.12, &legal) {
+                        return a;
+                    }
+                }
+                return safe_action(&legal);
+            }
+            if high <= bb_amt * 9 / 2 {
+                // 面对单次加注（open ≤ 4.5bb）：高频 3bet——宽价值域 + 低频空气混合。
+                if legal_can_raise(&legal) && (strength >= 0.55 || rng.unit() < 0.10) {
+                    if let Some(a) = make_bet(1.0, &legal) {
+                        return a;
+                    }
+                }
+                if strength >= 0.48 && legal.call.is_some() {
+                    return Action::Call;
+                }
+                return safe_action(&legal);
+            }
+            // 面对更深加注（被 4bet / 冷面对 3bet+）：仅顶级牌继续。
+            if strength >= 0.85 && legal_can_raise(&legal) {
+                if let Some(a) = make_bet(1.2, &legal) {
+                    return a;
+                }
+            }
+            if strength >= 0.72 && legal.call.is_some() {
+                return Action::Call;
+            }
+            return safe_action(&legal);
+        }
         let (open_thr, call_thr, threebet, aggro) = match arch {
             Archetype::Nit => (0.62, 0.60, 0.70, 0.0),
             Archetype::Station => (0.50, 0.42, 0.72, 0.05),
@@ -290,6 +376,9 @@ fn baseline_action(
             Archetype::PairedTrap => (0.52, 0.42, 0.85, 0.0),
             Archetype::Random => return random_action(&legal, state, seat, rng),
             Archetype::Limper => unreachable!("Limper handled above"),
+            Archetype::WideOpener | Archetype::ThreeBettor => {
+                unreachable!("3bp archetypes handled above")
+            }
             Archetype::Hero => (0.55, 0.50, 0.64, 0.15),
         };
         let facing = to_call > 0;
@@ -348,6 +437,41 @@ fn baseline_action(
             } else if r >= MadeClass::WeakPair.rank() || dr.has_meaningful_draw() || pot_odds < 0.2
             {
                 Action::Call // 跟注站：任何对子/听牌/好赔率都跟
+            } else {
+                safe_action(&legal)
+            }
+        }
+        Archetype::WideOpener => {
+            // 被 3bet 后爱跟的翻后延续：站式粘跟——只用强成手下注，任何对子/听牌/好赔率都跟。
+            if !facing {
+                if r >= MadeClass::Strong.rank() {
+                    make_bet(0.5, &legal).unwrap_or_else(|| safe_action(&legal))
+                } else {
+                    safe_action(&legal)
+                }
+            } else if r >= MadeClass::WeakPair.rank() || dr.has_meaningful_draw() || pot_odds < 0.22
+            {
+                Action::Call
+            } else {
+                safe_action(&legal)
+            }
+        }
+        Archetype::ThreeBettor => {
+            // 3bet 池进攻方样板：高频 c-bet（含空气），面对反抗按成手/赔率继续。
+            if !facing {
+                if r >= MadeClass::TopPair.rank() {
+                    make_bet(0.66, &legal).unwrap_or_else(|| safe_action(&legal))
+                } else if dr.has_meaningful_draw() || rng.unit() < 0.50 {
+                    make_bet(0.45, &legal).unwrap_or_else(|| safe_action(&legal))
+                } else {
+                    safe_action(&legal)
+                }
+            } else if r >= MadeClass::Strong.rank() && legal_can_raise(&legal) {
+                make_bet(0.8, &legal).unwrap_or(Action::Call)
+            } else if (r >= MadeClass::MidPair.rank() && pot_odds < 0.38)
+                || (dr.has_meaningful_draw() && pot_odds < 0.33)
+            {
+                Action::Call
             } else {
                 safe_action(&legal)
             }
@@ -870,6 +994,21 @@ fn main() {
                 "random" => Archetype::Random,
                 "limpy" => Archetype::Limper,
                 "pairedtrap" | "trap" => Archetype::PairedTrap,
+                // 3bet 池造靶（P1-5）：奇数座宽开跟注机 / 偶数座 3bet 机交替——hero 作为
+                // 3bet 者与被 3bet 者的两条通道都要有。不入 mixed pool（默认关，
+                // follow PairedTrap 先例：不动既有配置输出）。
+                "3bp" | "threebet" => {
+                    if k % 2 == 1 {
+                        Archetype::WideOpener
+                    } else {
+                        Archetype::ThreeBettor
+                    }
+                }
+                // 纯场变体：2-max vs WideOpener = hero 作为 3bet 者的最高密度通道
+                // （对手几乎每手宽开、被 3bet 后爱跟）；vs ThreeBettor = hero 被 3bet
+                // 的最高密度通道。
+                "wideopen" | "wideopener" => Archetype::WideOpener,
+                "3bettor" | "threebettor" => Archetype::ThreeBettor,
                 _ => pool[(k - 1) % pool.len()],
             }
         };
