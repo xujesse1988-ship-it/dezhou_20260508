@@ -403,6 +403,62 @@ impl Default for FloatGateConfig {
     }
 }
 
+/// `post.unopened.cbet_bluff.srp` 节点级门控参数（P0-3 阶段2 第三消费轮，`docs/heuristic9_design.md` §6）。
+///
+/// cbet_bluff = hero 作 PFR 进攻方、翻后本街无人下注、持 Air 无听牌时的 c-bet 空气诈唬。
+/// **same-role**：杠杆 = villain **fold-to-cbet**（villain 作防守方），门读的正是 fold-to-cbet
+/// （§C 桶 = [`crate::heuristic::opponent::facing_node_key`]`(街, "srp")`）→ 与 float 同轴（区别于
+/// 跨角色被 REJECT 的 bluff_raise）。造靶实测（8000 手 2-max）srp 最优频率**随 fold-to-cbet 反号**：
+/// 粘站 wideopen（fold 47.9%）低频最优、爱弃 3bpfold（fold 79.6%）高频最优 → 固定频率必错一边。
+///
+/// **仅门控 srp 池**：候选②（`docs/heuristic9_design.md` §6）已证 **3bp c-bet 频率跨对手粘度
+/// robust（无反号）** → 3bp 保固定 0.30/0.20 不门控；`other`/limped 亦不动。
+///
+/// **⚠ 锚独立重标定**（不照抄 float 0.50/0.65/3.0）：cbet 是持续下注、默认频率高（0.80/0.55）→
+/// 乘子上限 = 1.0（= 回退），门**只降不升**——粘站降频（+EV）、爱弃/未知保默认（默认恰坐爱弃
+/// 最优端，可剥削 EV 全在粘站侧）。见默认值注释。
+///
+/// **冷启动/未知/小样本安全**：`node_gated=false`、任一对手无名（exploit 关）、binding villain
+/// 样本 `n < min_samples`、或非 srp 池 → 乘子 **1.0** → 保留 [`CbetSplit`] 现固定频率（= 现默认
+/// 行为）→ 保标准矩阵不退、exploit 关逐字节一致。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CbetBluffGateConfig {
+    /// 是否启用节点级门控（默认 true = 校准后新行为）。false → 恒乘子 1.0（= 现固定频率路径，
+    /// 用于 paired 对照与关闭剥削）。
+    pub node_gated: bool,
+    /// 信任 villain fold-to-cbet 读数所需的最小 facing 机会数 `n`（binding villain）。低于此 →
+    /// 回退乘子 1.0。cbet_bluff.srp 节点密度高、flop.srp facing 样本充裕（造靶 n≥1200/8000）→ 30 充足。
+    pub min_samples: u32,
+    /// fold 率收缩伪计数强度 `k`（Beta-Binomial；与阶段1 dump / float 门默认一致）。
+    pub shrink_k: f64,
+    /// 单调映射低锚：shrunk_fold ≤ `fold_lo` → 乘子 = `mult_lo`（粘站 → 降频）。
+    pub fold_lo: f64,
+    pub mult_lo: f64,
+    /// 单调映射高锚：shrunk_fold ≥ `fold_hi` → 乘子 = `mult_hi`；两锚间线性插值。
+    pub fold_hi: f64,
+    pub mult_hi: f64,
+}
+
+impl Default for CbetBluffGateConfig {
+    fn default() -> Self {
+        // 造靶校准（8000 手 2-max，villain=p1 在 flop.srp 的 shrunk_fold；只扫 nodes.cbet.srp）：
+        //   wideopen（粘站）47.9% → 乘子 0.15 → freq≈0.12/0.08（落粘站最优 m00-m025 带，vs 默认 +40）；
+        //   3bpfold（爱弃）79.6% → 乘子 1.0 → freq=0.80/0.55（落爱弃最优 m10，= 现默认）。
+        // 锚 [0.50→0.15, 0.75→1.0]：0.479<0.50 → 0.15（wideopen 降频）；0.796>0.75 → 夹取 1.0
+        //   （3bpfold 保默认高频）。乘子上限 1.0（=回退）→ 只降不升：可剥削 EV 全在粘站降频侧。
+        CbetBluffGateConfig {
+            node_gated: true,
+            min_samples: 30,
+            shrink_k: 20.0,
+            fold_lo: 0.50,
+            mult_lo: 0.15,
+            fold_hi: 0.75,
+            mult_hi: 1.0,
+        }
+    }
+}
+
 /// 场景森林节点参数子树（Phase B）。已拆分节点在此分参；未拆分节点沿用
 /// `preflop` / `postflop` 共享层。JSON partial 覆盖照常工作（`serde(default)`）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -425,6 +481,11 @@ pub struct NodesConfig {
     pub value_bet: ValueBetSplit,
     /// `post.unopened.cbet_bluff.{srp|3bp}`：c-bet 诈唬池型分参。
     pub cbet: CbetSplit,
+    /// `post.unopened.cbet_bluff.srp` 节点级门控（P0-3 阶段2 第三消费轮）：按 binding villain
+    /// 翻后 fold-to-cbet 单调映射 srp c-bet 诈唬频率乘子（粘站降频 / 爱弃保默认）。仅门控 srp
+    /// （3bp robust 不动，候选②）；冷启动/未知/小样本/`node_gated=false` 回退乘子 1.0（= [`CbetSplit`]
+    /// 现固定频率）。
+    pub cbet_gate: CbetBluffGateConfig,
     /// `post.unopened.float` **回退**频率乘子（冷启动/未知/小样本/`float.node_gated=false`
     /// 时用）：float 频率 = 空气诈唬基础频率 × 此乘子。0.5 = Phase B/C 两次驳回一刀切调整后
     /// 维持的默认（0.25 试点 sim 正负参半）。P0-3 阶段2 起，样本足的已知 villain 走
@@ -451,6 +512,7 @@ impl Default for NodesConfig {
             vs_4bet: Vs4betNodeConfig::default(),
             value_bet: ValueBetSplit::default(),
             cbet: CbetSplit::default(),
+            cbet_gate: CbetBluffGateConfig::default(),
             float_freq_mult: 0.5,
             float: FloatGateConfig::default(),
             bluff_raise_freq_mult: 0.10,

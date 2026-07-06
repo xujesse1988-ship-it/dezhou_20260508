@@ -815,6 +815,81 @@ fn float_freq_mult(ctx: &NodeCtx) -> f64 {
     float_mult_from_readout(binding, nc)
 }
 
+// ---------------------------------------------------------------------------
+// P0-3 阶段2 第三消费轮：srp cbet_bluff 节点级门控（same-role，复用 float 门机制）。
+// 造靶实测 srp c-bet 诈唬最优频率随 villain fold-to-cbet **反号**（粘站低频 / 爱弃高频，
+// 与 float 同型；3bp 池候选② 已证 robust → 仅门控 srp）。四函数照 float 四函数写。
+// ---------------------------------------------------------------------------
+
+/// fold 率 → srp cbet_bluff 频率乘子的单调映射（两锚线性插值，锚**独立重标定**——cbet 默认
+/// 频率高、乘子上限 1.0 只降不升，见 [`CbetBluffGateConfig`] 默认注释）。
+fn map_fold_to_cbet_mult(fold: f64, cg: &crate::heuristic::config::CbetBluffGateConfig) -> f64 {
+    if cg.fold_hi <= cg.fold_lo {
+        return cg.mult_lo;
+    }
+    let t = ((fold - cg.fold_lo) / (cg.fold_hi - cg.fold_lo)).clamp(0.0, 1.0);
+    cg.mult_lo + t * (cg.mult_hi - cg.mult_lo)
+}
+
+/// binding villain 的节点级 fold-to-cbet 读数（对偶 `(街.池型)` 节点上、面对 hero c-bet 的
+/// **最粘者** min shrunk_fold —— bluff 需全弃，最粘者 binding）。`None` = 无法门控 → 回退乘子
+/// 1.0：翻前（不应到达）、或任一对手无名（exploit 关：sim `names` 空 / live 缺名 → 逐字节回退）。
+/// 节点 key 用与采集侧同口径的 [`facing_node_key`]/[`pot_type_name`] 构造（§5.2 单一坐标系）。
+fn cbet_bluff_binding_readout(
+    view: &GameView,
+    opp: &OpponentTable,
+    cg: &crate::heuristic::config::CbetBluffGateConfig,
+) -> Option<(f64, u32)> {
+    let street = match view.street {
+        Street::Flop => 1u8,
+        Street::Turn => 2,
+        Street::River | Street::Showdown => 3,
+        Street::Preflop => return None, // cbet_bluff 语境本就翻后；翻前 → 回退。
+    };
+    let node = facing_node_key(street, pot_type_name(view.preflop_num_raises));
+    let mut binding: Option<(f64, u32)> = None; // (shrunk_fold, n)
+    for s in 0..view.num_seats as usize {
+        if s == view.my_seat as usize || view.folded[s] {
+            continue;
+        }
+        // 有对手无名 → None（exploit 关回退，保 byte-equal）。
+        let name = view.names.get(&(s as u8))?;
+        let r = opp.node_readout(name, &node, cg.shrink_k);
+        binding = Some(match binding {
+            Some(prev) if prev.0 <= r.shrunk_fold => prev, // 保留更小 fold（更粘 = binding）
+            _ => (r.shrunk_fold, r.n),
+        });
+    }
+    binding
+}
+
+/// binding 读数 → srp cbet_bluff 频率乘子（纯核，可单测）：node_gated 关 / 冷启动（`None`）/
+/// binding 样本 `n < min_samples` → **乘子 1.0**（= 保留 [`CbetSplit`] 现固定频率，标准矩阵不退、
+/// exploit 关逐字节一致）；样本足 → 按 fold 单调映射（fold 越高 → 乘子越高，剥削反号）。
+fn cbet_bluff_mult_from_readout(
+    binding: Option<(f64, u32)>,
+    cg: &crate::heuristic::config::CbetBluffGateConfig,
+) -> f64 {
+    if !cg.node_gated {
+        return 1.0;
+    }
+    match binding {
+        Some((fold, n)) if n >= cg.min_samples => map_fold_to_cbet_mult(fold, cg),
+        _ => 1.0,
+    }
+}
+
+/// `post.unopened.cbet_bluff.srp` 频率乘子（P0-3 阶段2 第三消费轮）：查 binding villain 读数 →
+/// 纯核映射。**仅 srp 池门控**（3bp/other/limped → 乘子 1.0，保候选② robust 结论 + 现固定频率）。
+fn cbet_bluff_freq_mult(ctx: &NodeCtx, pot: PotType) -> f64 {
+    if pot != PotType::SingleRaised {
+        return 1.0; // 3bp robust（候选②）/ other 稀疏 → 不门控，保现固定频率。
+    }
+    let cg = &ctx.cfg.nodes.cbet_gate;
+    let binding = cbet_bluff_binding_readout(ctx.view, ctx.opp, cg);
+    cbet_bluff_mult_from_readout(binding, cg)
+}
+
 /// `post.unopened`：翻后本街无人下注（下注 vs 过牌）。价值与 c-bet 按池型分参。
 /// 叶：`post.unopened.value_bet[.srp|.3bp]` / `post.unopened.{commit|semibluff}` /
 /// `post.unopened.cbet_bluff[.srp|.3bp]` / `post.unopened.{float|check}`。
@@ -893,9 +968,10 @@ fn post_unopened(ctx: &NodeCtx, pot: PotType, rng: &mut Rng, mut tr: DecisionTra
         };
         let cbet_freq = lerp(cb.freq_dry, cb.freq_wet, s.tex.wetness)
             * ctx.adj.bluff_mult
-            * (1.0 - oc.multiway_bluff_cut * s.multiway).max(0.10);
+            * (1.0 - oc.multiway_bluff_cut * s.multiway).max(0.10)
+            * cbet_bluff_freq_mult(ctx, pot); // P0-3 阶段2: srp 节点级门控（仅 srp；3bp robust 不动）
         let gate = cbet_freq.clamp(0.0, 0.95);
-        let roll = rng.unit();
+        let roll = rng.unit(); // gate 后掷点、位置绝对不动 → RNG 消费序列不变（trace 测试会抓）。
         tr.cmp("postflop.cbet_freq", roll, gate, roll < gate);
         if roll < gate {
             let size = pick_bet_size(view, oc, &s.tex, s.made, s.spr, false);
@@ -1387,5 +1463,212 @@ mod float_gate_tests {
         v.folded[3] = true;
         let b2 = float_binding_readout(&v, &opp, &nc.float).unwrap();
         assert!((float_mult_from_readout(Some(b2), &nc) - 3.0).abs() < 1e-9);
+    }
+}
+
+// ===========================================================================
+// P0-3 阶段2 第三消费轮：srp cbet_bluff 节点级门控单测
+// （映射单调 / 冷启动=乘子 1.0 / node_gated 关 / n 门槛回退 / 节点查询正确即查对偶 flop.srp）
+// ===========================================================================
+#[cfg(test)]
+mod cbet_gate_tests {
+    use super::{cbet_bluff_binding_readout, cbet_bluff_mult_from_readout, map_fold_to_cbet_mult};
+    use crate::heuristic::config::NodesConfig;
+    use crate::heuristic::opponent::{FacingCounts, OpponentTable};
+    use crate::heuristic::view::{GameView, HistAction, Request, ValidActions};
+
+    /// 造一个 flop-SRP 局面（hero 座0 开池被跟 → srp 池、flop）：座4 = 面对 hero c-bet 的 villain。
+    /// 对 binding 读数只需 `preflop_num_raises==1`（srp）+ `street==Flop`，故沿用 float_view 同构。
+    fn srp_flop_view() -> GameView {
+        let req = Request {
+            hole: vec!["2c".into(), "Kc".into()],
+            board: vec!["8s".into(), "6d".into(), "Td".into()],
+            button_seat: 4,
+            my_seat: 0,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                HistAction {
+                    seat: 1,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 2,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 3,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 4,
+                    action: "raise".into(),
+                    to: Some(40),
+                    street: None,
+                },
+                HistAction {
+                    seat: 5,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 0,
+                    action: "call".into(),
+                    to: None,
+                    street: None,
+                },
+            ],
+            valid: ValidActions {
+                can_check: true,
+                can_call: false,
+                can_raise: true,
+                min_raise: Some(20),
+                max_raise: Some(1960),
+            },
+            stacks: vec![2000, 1416, 1322, 6020, 11891, 1460],
+            names: Default::default(),
+            sb_seat: None,
+            bb_seat: None,
+        };
+        GameView::from_request(&req)
+    }
+
+    fn with_facing(opp: &mut OpponentTable, name: &str, node: &str, n: u32, folds: u32) {
+        opp.by_name
+            .entry(name.to_string())
+            .or_default()
+            .facing
+            .insert(
+                node.to_string(),
+                FacingCounts {
+                    n,
+                    folds,
+                    calls: n - folds,
+                    raises: 0,
+                },
+            );
+    }
+
+    // --- 映射单调 + 端点/夹取（锚 [0.50→0.15, 0.75→1.0]，独立重标定） ---
+    #[test]
+    fn cbet_mapping_is_monotone_and_clamped() {
+        let cg = NodesConfig::default().cbet_gate;
+        assert_eq!(
+            map_fold_to_cbet_mult(0.30, &cg),
+            0.15,
+            "低锚以下 → mult_lo（粘站降频）"
+        );
+        assert_eq!(map_fold_to_cbet_mult(0.50, &cg), 0.15, "低锚点 = mult_lo");
+        assert!(
+            (map_fold_to_cbet_mult(0.75, &cg) - 1.0).abs() < 1e-9,
+            "高锚点 = mult_hi（爱弃保默认）"
+        );
+        assert!(
+            (map_fold_to_cbet_mult(0.95, &cg) - 1.0).abs() < 1e-9,
+            "高锚以上 → 夹取 mult_hi（乘子只降不升）"
+        );
+        // 中点 0.625 → t=0.5 → 0.575。
+        assert!((map_fold_to_cbet_mult(0.625, &cg) - 0.575).abs() < 1e-6);
+        // 严格单调递增（fold 越高 → 乘子越高 → 频率越高，剥削反号）。
+        assert!(map_fold_to_cbet_mult(0.55, &cg) < map_fold_to_cbet_mult(0.65, &cg));
+        assert!(map_fold_to_cbet_mult(0.65, &cg) < map_fold_to_cbet_mult(0.72, &cg));
+        // 乘子恒 ≤ 1.0（默认频率高，门只降不升）。
+        assert!(map_fold_to_cbet_mult(0.99, &cg) <= 1.0);
+    }
+
+    // --- 冷启动 / node_gated 关 / n 门槛回退 = 乘子 1.0（保现固定频率、byte-equal） ---
+    #[test]
+    fn cbet_gating_falls_back_to_unit_mult() {
+        let cg = NodesConfig::default().cbet_gate; // node_gated=true, min_samples=30
+                                                   // 冷启动（无 binding 读数）→ 乘子 1.0。
+        assert_eq!(cbet_bluff_mult_from_readout(None, &cg), 1.0);
+        // 小样本（n < 30）→ 乘子 1.0（即便 fold 很粘）。
+        assert_eq!(cbet_bluff_mult_from_readout(Some((0.30, 29)), &cg), 1.0);
+        // node_gated 关 → 恒乘子 1.0（即便样本足、fold 很粘）。
+        let mut cg_off = cg.clone();
+        cg_off.node_gated = false;
+        assert_eq!(
+            cbet_bluff_mult_from_readout(Some((0.30, 500)), &cg_off),
+            1.0
+        );
+    }
+
+    // --- 样本足 → 走映射（粘站降频 / 爱弃保默认） ---
+    #[test]
+    fn cbet_gating_uses_mapping_when_sample_ready() {
+        let cg = NodesConfig::default().cbet_gate;
+        // 粘站（fold 0.30，n 足）→ 0.15 乘子（降频，vs 默认 +40 mbb/g）。
+        assert_eq!(cbet_bluff_mult_from_readout(Some((0.30, 100)), &cg), 0.15);
+        // 爱弃（fold 0.90，n 足）→ 夹取 1.0（保默认高频 = 爱弃最优）。
+        assert!((cbet_bluff_mult_from_readout(Some((0.90, 100)), &cg) - 1.0).abs() < 1e-9);
+    }
+
+    // --- 节点查询正确：查对偶 (街.池型)="flop.srp"，冷启动 = 乘子 1.0 ---
+    #[test]
+    fn cbet_binding_queries_correct_node_and_cold_start_defaults() {
+        let cg = NodesConfig::default().cbet_gate;
+        let mut v = srp_flop_view();
+        assert_eq!(v.preflop_num_raises, 1, "srp 池");
+        // 无名对手（exploit 关：names 空）→ None → 乘子 1.0（byte-equal 语义）。
+        assert!(cbet_bluff_binding_readout(&v, &OpponentTable::new(), &cg).is_none());
+        assert_eq!(
+            cbet_bluff_mult_from_readout(
+                cbet_bluff_binding_readout(&v, &OpponentTable::new(), &cg),
+                &cg
+            ),
+            1.0,
+            "冷启动 = 乘子 1.0"
+        );
+        // 给座4 命名 + 在 flop.srp 塞粘站计数（低 fold）。
+        v.names.insert(4, "sticky".into());
+        let mut opp = OpponentTable::new();
+        with_facing(&mut opp, "sticky", "flop.srp", 200, 60); // raw fold 30%
+        let b = cbet_bluff_binding_readout(&v, &opp, &cg).expect("有名 villain → Some");
+        assert_eq!(b.1, 200, "读到 flop.srp 的 n（查错节点会得 n=0）");
+        assert!(b.0 < 0.40, "shrunk_fold 应贴近 30%（n 大）");
+        assert_eq!(
+            cbet_bluff_mult_from_readout(Some(b), &cg),
+            0.15,
+            "粘站 → 降频 0.15"
+        );
+        // 若把计数塞到 turn.srp（错节点）→ 查 flop.srp 得 n=0（回退乘子 1.0）。
+        let mut opp_wrong = OpponentTable::new();
+        with_facing(&mut opp_wrong, "sticky", "turn.srp", 200, 60);
+        let bw = cbet_bluff_binding_readout(&v, &opp_wrong, &cg).unwrap();
+        assert_eq!(bw.1, 0, "flop.srp 无样本 → n=0");
+        assert_eq!(
+            cbet_bluff_mult_from_readout(Some(bw), &cg),
+            1.0,
+            "n=0 < 门槛 → 乘子 1.0"
+        );
+    }
+
+    // --- 多人池保守：取最粘者（min shrunk_fold）binding ---
+    #[test]
+    fn cbet_binding_picks_stickiest_villain_multiway() {
+        let cg = NodesConfig::default().cbet_gate;
+        let mut v = srp_flop_view();
+        v.folded[3] = false; // 座3 也在场（多人池）
+        v.names.insert(3, "sticky".into());
+        v.names.insert(4, "foldy".into());
+        let mut opp = OpponentTable::new();
+        with_facing(&mut opp, "sticky", "flop.srp", 200, 60); // raw fold 30%（粘）
+        with_facing(&mut opp, "foldy", "flop.srp", 200, 180); // raw fold 90%（弃）
+        let b = cbet_bluff_binding_readout(&v, &opp, &cg).unwrap();
+        assert!(b.0 < 0.40, "binding = 最粘者（sticky ~0.31），非爱弃者");
+        // binding 粘 → 降频 0.15（多人池保守：任一粘站在场即降 c-bet 空气频率）。
+        assert_eq!(cbet_bluff_mult_from_readout(Some(b), &cg), 0.15);
+        // 反证：仅 foldy 在场 → binding = foldy → 保默认乘子 1.0。
+        v.folded[3] = true;
+        let b2 = cbet_bluff_binding_readout(&v, &opp, &cg).unwrap();
+        assert!((cbet_bluff_mult_from_readout(Some(b2), &cg) - 1.0).abs() < 1e-9);
     }
 }

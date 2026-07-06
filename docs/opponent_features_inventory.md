@@ -388,7 +388,7 @@ float 门（首个消费轮）SHIPPED 后，尝试对 `post.facing.bluff_raise` 
 |---|---|---|---|---|
 | float 频率 | fold-to-cbet | **防守方** | §C fold 桶 | ✅ 已采（same-role，SHIPPED）|
 | **bluff_raise 频率** | **fold-to-raise** | **进攻方被加注** | **§B**（非 §C）| ✅ **已采**（`*.facing_raise`，same-role，2026-07-06）→ 门控解锁，待接线 |
-| cbet 过度诈唬 | fold-to-cbet | 防守方 | §C fold 桶 | ✅ 已采（same-role，留后续轮）|
+| **cbet 过度诈唬（srp）** | fold-to-cbet | 防守方 | §C fold 桶 | ✅ 已采（same-role，**SHIPPED**）|
 
 ---
 
@@ -433,3 +433,25 @@ fold-to-cbet 循环在防守方 re-raise 处 `break` 且开火者不入 facing �
 **解锁**：bluff_raise 门（真杠杆 fold-to-raise）+ 候选① river 极化门现有 same-role 真信号可读
 （`facing_raise_node_key` 查询、照 float same-role 门控），门控接线留后续消费轮；`DonkFold`/`DonkStick`
 造靶留作门控验证载荷。诊断/数据 `scratchpad/p03_fold_to_raise/DIAGNOSIS.md` + `heuristic9_design.md` §6。
+
+---
+
+## 落地记录：P0-3 阶段2 第三消费轮（srp cbet 过度诈唬门）**SHIPPED**（2026-07-06）
+
+订正表末行「cbet 过度诈唬」兑现为**首个跨角色代理有效 + 反号成立的 same-role 消费门**（继 float 后
+第二个 shipped 引擎门）。`post.unopened.cbet_bluff.srp`（hero 作 PFR 进攻方 c-bet 空气、villain 防守）
+的 srp 频率由 `policy::cbet_bluff_freq_mult` 按 binding villain 在对偶 `(街.srp)` 节点的 `shrunk_fold`
+单调门控（乘子锚 `[0.50→0.15, 0.75→1.0]`，独立重标定；上限 1.0 = 只降不升）。
+
+- **纪律 B（代理有效，此轮成立）**：门读 flop.srp fold-to-cbet 与真杠杆 fold-to-cbet **同轴**
+  （same-role）。造靶两靶（WideOpener 粘 47.9% / ThreebetFolder 弃 79.6%，§C fold 桶）**强分化 31.7pp**，
+  且最优频率方向**随该轴对齐**（高 fold → 高最优频率）→ 门**能**剥削（区别于 bluff_raise 的解耦）。
+- **纪律 A（反号成立）**：sweep（8000 手 2-max，只扫 `nodes.cbet.srp`）粘站单调↓（低频最优）、爱弃
+  单调↑（高频最优），3 seed paired 一致。**srp 反号（像 float）**；候选②已证 **3bp robust（不反号）**
+  → **仅门控 srp、3bp 保 0.30/0.20 不动**（池型正是分野）。
+- **sim 回归门全过**：靶字段 wideopen ON−OFF **3/3 +42.3**、3bpfold **2/3 +12.9**；标准 11-config
+  **0/11 超 CI95、均值 +28.6**（粘站 Station/Limper 场受益于 srp 空气降频）；exploit 关 6/6 逐字节 =
+  HEAD、gate_off fallback 3/3 逐字节 = HEAD；深码 200/400BB 0 fallback/0 漂移。
+- 复用阶段1 §C fold 桶 + `facing_node_key`/`pot_type_name` 同口径（零采集侧改动，未碰 opponent.rs）。
+  造靶复用 float 门的 `wideopen`/`3bpfold`（无新靶）。数据/判定见 `scratchpad/p03_cbet_bluff/DIAGNOSIS.md`
+  + `docs/heuristic9_design.md` §6。

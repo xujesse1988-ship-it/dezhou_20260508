@@ -593,6 +593,70 @@ re-raise）。byte-equal：基线 vs 改动默认输出 **0/15 diff**（5 field 
 （`facing_raise_node_key` 查询、same-role 门控），门控接线留后续消费轮。`DonkFold`/`DonkStick` 造靶留作
 门控验证载荷。诊断/数据 `scratchpad/p03_fold_to_raise/DIAGNOSIS.md`。
 
+### P0-3 阶段2 第三消费轮（srp cbet 过度诈唬门）：节点级门控 **SHIPPED**（2026-07-06）
+
+float 门（same-role SHIPPED）后、bluff_raise 门（跨角色 REJECT）后的第三个消费轮，命中**干净
+same-role**：`post.unopened.cbet_bluff.srp` = hero 作 PFR 进攻方 c-bet 空气、villain 作防守方面对
+→ 杠杆 = villain **fold-to-cbet**，门读的正是 §C fold 桶（同 float 轴，区别于 bluff_raise 的跨角色
+fold-to-raise）。两矛盾先验（float 反号 vs 候选② 3bp robust）经造靶实测判定 = **srp 反号（像 float）**。
+
+**现状（门前）**：srp c-bet 诈唬频率 = `lerp(cbet.srp.freq_dry, cbet.srp.freq_wet, wetness) × bluff_mult
+× multiway_cut`，clamp[0,0.95]，默认 **0.80/0.55** 全局固定。
+
+**纪律 B（代理有效，此轮成立）**：复用 float 门造靶（无新靶）——WideOpener（粘站）vs ThreebetFolder
+（`--field 3bpfold`，爱弃），翻前逐字节共享、唯一分叉 = 翻后 fold-to-cbet。`--opp-stats` 实测 villain(p1)
+在 **flop.srp shrunk_fold：wideopen 47.9%（n=1222）/ 3bpfold 79.6%（n=2821）= 分化 31.7pp**（比 float
+校准 47/64.5 更宽）。节点密度 cbet_bluff.srp **636 / 655 每 8000 手**（远密于 float 168 / 3bp cbet 33）。
+分化 + 密度双达标，且最优频率方向与门读轴对齐 → 代理 VALID。
+
+**纪律 A（sweep 反号，决定性）**：只扫 `nodes.cbet.srp`（3bp 保 0.30/0.20 不动），5 档
+{0/0, 0.20/0.14, 0.40/0.28, 0.80/0.55, 0.95/0.65} × paired 同 seed{7,11,23} × 8000 手 --exploit：
+
+| freq 档 | WideOpener（粘 47.9%）均值 | ThreebetFolder（弃 79.6%）均值 |
+|---|---|---|
+| 0/0 | **676.3** | 868.2 |
+| 0.20/0.14 | 675.5 | 896.8 |
+| 0.40/0.28 | 663.7 | 906.7 |
+| 0.80/0.55（默认） | 635.4 | 926.2 |
+| 0.95/0.65 | 615.7 | **929.8** |
+
+**粘站单调 ↓（低频最优）、爱弃单调 ↑（高频最优），3/3 seed 一致 → 反号真实。** 与候选②
+**3bp c-bet 跨靶 robust（无反号）**成鲜明对比——**池型（srp vs 3bp）正是分野**：srp cbet_bluff 结构上
+像 float（villain 防守 range 未封顶、fold-to-cbet 变异大 → 反号），3bp 池 caller range 被翻前跟 3bet
+封顶偏强（fold-equity 顶住 → robust）。任何全局固定 srp 频率必错一边。
+
+**门设计（锚独立重标定，`CbetBluffGateConfig`）**：cbet 是持续下注、默认频率高（0.80）恰坐**爱弃
+最优端** → 可剥削 EV 全在**粘站降频**侧 → 乘子上限 = 1.0（= 回退），门**只降不升**。锚
+`[fold_lo 0.50→mult_lo 0.15, fold_hi 0.75→mult_hi 1.0]`：wideopen 0.479 → 乘子 0.15 → freq≈0.12/0.08
+（落粘站最优带，vs 默认 +40）；3bpfold 0.796 → 夹取 1.0 → 保默认高频（爱弃最优）。**仅门控 srp**
+（`pot != SingleRaised` → 乘子 1.0，3bp robust 保 0.30/0.20 + limped/other 不动）。冷启动/未知/n<30/
+`node_gated=false` → 乘子 1.0 = `CbetSplit` 现固定频率（byte-equal 安全，同 float 结构）。`policy.rs`
+四函数照 float 四函数写（`map_fold_to_cbet_mult`/`cbet_bluff_binding_readout`/
+`cbet_bluff_mult_from_readout`/`cbet_bluff_freq_mult`）；gate 插在该叶 `roll = rng.unit()` **之前**、
+掷点位置绝对不动 → RNG 消费序列不变。
+
+**回归门（paired 同 seed，8000 手 --exploit；node-gated=默认 ON vs OFF=baseline）**：
+
+| 门 | 结果 |
+|---|---|
+| 靶字段 wideopen（粘，应降频）| ON−OFF **3/3 seed，均值 +42.3** |
+| 靶字段 3bpfold（弃，应保默认）| **2/3 seed 正，均值 +12.9**（门减 turn/river barrel，3bpfold 那两街更粘）|
+| 标准 11-config（6-max {mixed,limpy,station}×{7,11,23} + 9-max s7 + 2-max s7）| **0/11 超 CI95、均值 +28.6**（粘站 Station/Limper 场受益）|
+| exploit 关（9/6/2-max × s7 × ±start-bb 400）vs HEAD `4893739` 二进制 | **6/6 逐字节一致** |
+| `node_gated=false`+exploit vs HEAD | **3/3 逐字节一致**（回退 = 旧行为）|
+| 0 fallback / 0 pot\|to_call 漂移（含深码 200/400BB）| **全配置 0** |
+
+**反号解决证明**：一个固定 srp 频率只能赢一边；node-gated 在两个反号靶都 ≥ OFF——粘站靠**降**频赢、
+爱弃保默认（已最优）。cbet 默认高频恰坐爱弃端 → 门捕获全部粘站侧 EV，爱弃/未知逐字节保守不动。
+
+**测试**：`policy.rs` 内 5 新单测（`cbet_gate_tests`：映射单调+夹取 / 冷启动=乘子 1.0 / node_gated 关 /
+n 门槛回退 / 节点查询正确即查对偶 flop.srp / 多人池 binding=最粘者）；`heuristic9_trace`(10) +
+`heuristic_p0_3_facing`(7) 全绿；fmt / clippy(`-D warnings`) 全绿。**未跑全量 cargo test**。
+诊断/数据 `scratchpad/p03_cbet_bluff/DIAGNOSIS.md`。
+
+**范围外（留后续轮）**：srp c-bet **尺寸**按对手粘度分槽（现共享 `pick_bet_size`）；turn/river barrel
+频率独立门（现随 srp 锚同映射）；3bp cbet 门（候选② robust，须新反号证据才动）。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街
