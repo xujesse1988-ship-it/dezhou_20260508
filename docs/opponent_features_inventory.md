@@ -301,3 +301,48 @@ VPIP 基线：中位 513 手/人。摊牌真值（§D）：合计亮牌 6112 手
 per-action 决策耗时（§F 时序 tell）是现有日志的唯一缺口——`player_action` 无时间戳。
 补采需在 driver 侧给每条 villain 动作打到达时间戳（协议小改）。**不补则该信号永久丢失**，
 其余所有特征都可从现有 `h9_live_run*.raw.jsonl` 离线重建，不急。
+
+---
+
+## 落地记录：P0-3 阶段1（采集基建）SHIPPED（2026-07-06）
+
+> 分两阶段，照 Phase A→B 先例。**阶段1 = 纯增采集、决策路径不读 → sim byte-equal**（本轮落）；
+> **阶段2 = 剥削接线（改行为、过 sim 质量门）待接**。设计全文见
+> `scratchpad/p03/DESIGN.md`（分阶段计划 + 阶段2 四门接线方案 + 未决点）。
+
+**阶段1 采什么（`src/heuristic/opponent.rs`）**：`OppStats` 新增 `facing:
+BTreeMap<String, FacingCounts>`（`#[serde(default, skip_serializing_if=is_empty)]` → 旧
+`h9_live_prof*.json` 逐字节兼容）。
+
+- **节点 key = `(街.池型)`**：`flop.srp` / `turn.3bp` / `river.srp` / … + `pre.facing_3bet`。
+  池型由翻前 raise 数派生，与 hero 侧 `ScenarioKey.pot_type` 逐字同口径（§0.5/§5.2 共享坐标系）。
+  止步 (街,池型)、**不铺 §G 牌面/位置/SPR**——实测 fold-to-cbet 中位仅 18/人，再叠维即噪声。
+- **`FacingCounts{n,folds,calls,raises}`**（`n=folds+calls+raises`，存原始计数不存比率，§0.5 铁律）：
+  - `folds/n` = §C fold-to-cbet / fold-to-turn-barrel / fold-to-river-barrel（villain **作防守方**）
+    → 阶段2 喂 float / bluff_raise / cbet 过度诈唬门。
+  - `raises/n` = §B raise-cbet/check-raise/river-raise 频率（villain **作进攻方**极性代理）
+    → 阶段2 喂候选① 成花板非坚果 stack-off 门（真极性需 §D 摊牌，代理先造靶验）。
+  - **信号归属澄清**：float/cbet 吃 §C fold 桶、候选① 吃 §B raise 桶，是**两个不同信号共用一张表**。
+- **facing 重建**：`observe_hand` 内新写轻量 villain replay（`observe_facing`），从有序
+  `(name, street, action)` 派生，**无需 enrich `ObservedAction`、无协议改动**（二值 fold-to-bet
+  不需 amount/seat；name 一手内唯一）。口径与 `tools/opponent_feature_weigh.py` `replay`
+  一致（7-run 实测校准）。sim/live 喂入路径均已满足唯一前提「actions 时序排列」。
+- **先验 + 收缩**：`node_field_prior`（fold-to-cbet 0.456 / fold-to-3bet 0.151，实测快照；
+  turn/river fold 无实测→占位）；`node_readout(name,node,k)` 返回 `(n, raw, shrunk)`，
+  `shrunk=(folds+prior·k)/(n+k)`，`k=20` 默认。**决策路径不调用**（阶段1 零行为变化）。
+- **可观测**：`heuristic9_sim --opp-stats` dump 每对手每节点 `(n, raw/shrunk fold%, raise%)`。
+
+**验证门（全过）**：
+- **byte-equal**：9/6/2-max × `--exploit` × seed 7 × 8000 手，改动前后 **pot/to_call 0.000% 漂移、
+  fallback 0、hero 净盈亏/CI 逐字节一致**。现有 `h9_live_prof.json`（44 名）加载通过、旧字段不丢。
+- **采集正确性（fixture 方向自证，`--opp-stats` dump，flop.srp fold-to-cbet）**：
+  `ThreebetFolder` **81.6%** / `Nit` **80.8%**（爱弃，高）≫ `Station` **54.1%** / `WideOpener`
+  **47.0%**（粘跟，低）——方向完全符合预期。收缩数学实测正确（nit n=3 raw 100% → shrunk 52.7%
+  向 0.456 先验收缩）。
+- 单测 `tests/heuristic_p0_3_facing.rs`（7 测：计数/池型/逐街/fold-to-3bet/方向/收缩数学/后向兼容）
+  + `heuristic9`(10) + `heuristic9_trace`(10) + `heuristic_p0_1_action_line`(8) 全绿；fmt / clippy 全绿。
+
+**阶段2 前置未决点（DESIGN.md §6）**：① live driver `observe_record` 现用 `player_action` 流，
+按 §1 铁律会漏结束手最后动作（fold-to-3bet/cbet 分母低估近半）→ 阶段2 上线前须改用
+`hand_result.actions`（sim 完整、不受影响）；② turn/river fold 先验须扩测 weigh.py 校准；
+③ 候选① raise 极性代理样本饥饿（river raise 稀有），短期近群体级偏坚果假设。

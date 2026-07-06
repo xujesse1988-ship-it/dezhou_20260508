@@ -6,7 +6,131 @@
 
 use crate::heuristic::config::ExploitConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// P0-3 阶段1：per-node 面对下注的响应直方图（原始计数 + 分母 `n`；§0.5「采原始计数不采比率」）。
+///
+/// 语义 = 某街某池型下，该对手**作为防守方首次面对一个未平下注**时的动作分布：
+/// - flop 节点 → fold-to-cbet 的原料（§C）；turn → fold-to-turn-barrel；river → fold-to-river-barrel。
+/// - `raises` 桶 = raise-cbet / check-raise / river-raise 频率（§B「villain 作进攻方」极性代理，候选①）。
+/// - `pre.facing_3bet` 节点 → fold-to-3bet（§A，群体级）。
+///
+/// 不变式：`n == folds + calls + raises`（check/其他不计入分母）。**决策路径不读**（阶段1
+/// byte-equal）；比率查询时现算并按 `n` 向 field 先验收缩（§H）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FacingCounts {
+    /// 机会数（分母）= folds + calls + raises。
+    pub n: u32,
+    pub folds: u32,
+    pub calls: u32,
+    pub raises: u32,
+}
+
+impl FacingCounts {
+    /// 原始 fold-to-bet 率 = folds/n。`n==0` → None（无样本）。
+    pub fn raw_fold_rate(&self) -> Option<f64> {
+        (self.n >= 1).then(|| self.folds as f64 / self.n as f64)
+    }
+    /// 原始 raise 率 = raises/n（候选① 极性代理）。`n==0` → None。
+    pub fn raw_raise_rate(&self) -> Option<f64> {
+        (self.n >= 1).then(|| self.raises as f64 / self.n as f64)
+    }
+    /// Beta-Binomial 收缩后 fold 率：`(folds + prior·k)/(n + k)`，`k` = 先验伪计数强度
+    /// （先验等效样本数；`n==k` 时个体/先验各半）。`n==0` → 返回 prior。
+    pub fn shrunk_fold_rate(&self, prior: f64, k: f64) -> f64 {
+        (self.folds as f64 + prior * k) / (self.n as f64 + k)
+    }
+    /// 收缩后 raise 率（同上口径）。
+    pub fn shrunk_raise_rate(&self, prior: f64, k: f64) -> f64 {
+        (self.raises as f64 + prior * k) / (self.n as f64 + k)
+    }
+}
+
+/// 归一化「加注类」动作判定（bet/raise/all-in 变体）。
+fn is_raise_action(a: &str) -> bool {
+    matches!(
+        a.to_ascii_lowercase().as_str(),
+        "bet" | "raise" | "allin" | "all_in" | "all-in"
+    )
+}
+
+/// 池型名（与 hero 侧 `ScenarioKey.pot_type` 逐字同口径，`preflop_num_raises` 派生）。
+fn pot_type_name(pre_raises: u32) -> &'static str {
+    match pre_raises {
+        0 => "limped",
+        1 => "srp",
+        2 => "3bp",
+        _ => "4bp+",
+    }
+}
+
+/// 翻后街名（1=flop..3=river）。
+fn street_name(street: u8) -> &'static str {
+    match street {
+        1 => "flop",
+        2 => "turn",
+        _ => "river",
+    }
+}
+
+/// P0-3 阶段1：per-node 面对下注 fold/raise 率的 **field 先验**（冷启动默认读数）。
+/// 数值取自 `docs/opponent_features_inventory.md`「实测样本称重」7-run 快照：
+/// fold-to-cbet 45.6% / fold-to-3bet 15.1%。turn/river fold 无独立实测 → 占位（消费前须扩测校准）；
+/// raise 先验（候选① 极性代理）无实测 → 保守 0.05 占位（阶段2 造靶校准）。
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct NodePrior {
+    pub fold: f64,
+    pub raise: f64,
+}
+
+/// 查询某 `node_id` 的 field 先验。未知节点 → 中性占位。
+pub fn node_field_prior(node_id: &str) -> NodePrior {
+    if node_id == "pre.facing_3bet" {
+        NodePrior {
+            fold: 0.151,
+            raise: 0.05,
+        }
+    } else if node_id.starts_with("flop.") {
+        NodePrior {
+            fold: 0.456,
+            raise: 0.05,
+        }
+    } else if node_id.starts_with("turn.") {
+        // 占位（无独立实测；暂用 flop 值）。
+        NodePrior {
+            fold: 0.456,
+            raise: 0.05,
+        }
+    } else if node_id.starts_with("river.") {
+        // 占位（无独立实测；河牌弃牌略紧）。
+        NodePrior {
+            fold: 0.50,
+            raise: 0.05,
+        }
+    } else {
+        NodePrior {
+            fold: 0.45,
+            raise: 0.05,
+        }
+    }
+}
+
+/// P0-3 阶段1：per-node 面对下注读数（原始计数 + 收缩率）。**阶段1 决策路径不消费**——
+/// 仅供 dump/inspect 与阶段2 剥削门控。
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodeReadout {
+    pub node_id: String,
+    /// 机会数（分母）。
+    pub n: u32,
+    /// 原始 fold 率（n==0 → None）。
+    pub raw_fold: Option<f64>,
+    /// 按 n 向 field 先验收缩后的 fold 率。
+    pub shrunk_fold: f64,
+    /// 原始 raise 率（候选① 极性代理；n==0 → None）。
+    pub raw_raise: Option<f64>,
+    /// 收缩后 raise 率。
+    pub shrunk_raise: f64,
+}
 
 /// 单个对手的累计统计。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -20,6 +144,11 @@ pub struct OppStats {
     /// 翻后激进度：下注+加注 vs 跟注。
     pub aggr_actions: u32,
     pub call_actions: u32,
+    /// P0-3 阶段1：per-node（`街.池型`）面对下注响应计数。key 例：`"flop.srp"` / `"turn.3bp"`
+    /// / `"pre.facing_3bet"`。`BTreeMap` → 确定性序列化（byte-stable profile JSON）。
+    /// 旧 profile 无此字段 → `#[serde(default)]` 补空表（后向兼容硬约束）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub facing: BTreeMap<String, FacingCounts>,
 }
 
 impl OppStats {
@@ -105,6 +234,94 @@ impl OpponentTable {
                 }
             }
         }
+        // P0-3 阶段1：per-node 面对下注响应重建（纯增采集，决策路径不读 → byte-equal）。
+        self.observe_facing(actions);
+    }
+
+    /// P0-3 阶段1：从有序 `(name, street, action)` 序列重建 facing 上下文，填 `OppStats.facing`。
+    ///
+    /// 二值 fold-to-bet 无需 amount/seat：name 在一手内唯一（与上面 `counted_pre` 同键口径），
+    /// actions 已按时序排列（sim `obs` 按 play 序、live driver `observe_record` 按动作序）。
+    /// 口径与 `tools/opponent_feature_weigh.py` `replay` 一致（7-run 实测校准的权威口径）。
+    /// **决策路径不调用此函数，也不读它写入的 `facing`** —— 阶段1 零行为变化。
+    fn observe_facing(&mut self, actions: &[ObservedAction]) {
+        // 池型：翻前 raise 次数（= `preflop_num_raises` 语义；首个 raiser = opener）。
+        let mut pre_raises = 0u32;
+        let mut opener: Option<&str> = None;
+        for a in actions {
+            if a.street == 0 && is_raise_action(a.action) {
+                if pre_raises == 0 {
+                    opener = Some(a.name);
+                }
+                pre_raises += 1;
+            }
+        }
+        let pot_type = pot_type_name(pre_raises);
+
+        // 翻前 fold-to-3bet：opener 面对站住的 3bet（链上恰好 2 个加注）的首次响应（§A）。
+        {
+            let mut raises = 0u32;
+            let mut recorded = false;
+            for a in actions.iter().filter(|a| a.street == 0) {
+                if raises == 2 && Some(a.name) == opener && !recorded {
+                    self.record_facing(a.name, "pre.facing_3bet", a.action);
+                    recorded = true;
+                }
+                if is_raise_action(a.action) {
+                    raises += 1;
+                }
+            }
+        }
+
+        // 翻后每街：街首注「开火」→ 其后每个防守方**首次面对该未平注**的响应（§C）。
+        for street in 1u8..=3 {
+            let node = format!("{}.{}", street_name(street), pot_type);
+            let mut opened = false;
+            let mut recorded: Vec<&str> = Vec::new();
+            for a in actions.iter().filter(|a| a.street == street) {
+                if opened && !recorded.contains(&a.name) {
+                    // 防守方面对未平注：记首个响应（每名每街一次）。
+                    self.record_facing(a.name, &node, a.action);
+                    recorded.push(a.name);
+                    if is_raise_action(a.action) {
+                        // 被 raise → 本街线重开；阶段1 只记「首次面对首注」，不追加注链
+                        // （与 weigh.py fold-to-cbet 口径一致）。
+                        break;
+                    }
+                }
+                if is_raise_action(a.action) {
+                    opened = true; // 开火者本身在此轮不入 facing（他是进攻方）。
+                }
+            }
+        }
+    }
+
+    /// 把一次「防守方面对未平注」的响应记进 `facing[node]`。check/其他不计入分母
+    /// （保 `n = folds+calls+raises` 恒等）。
+    fn record_facing(&mut self, name: &str, node: &str, action: &str) {
+        let fc = self
+            .by_name
+            .entry(name.to_string())
+            .or_default()
+            .facing
+            .entry(node.to_string())
+            .or_default();
+        let al = action.to_ascii_lowercase();
+        match al.as_str() {
+            "fold" => {
+                fc.n += 1;
+                fc.folds += 1;
+            }
+            "call" => {
+                fc.n += 1;
+                fc.calls += 1;
+            }
+            "bet" | "raise" | "allin" | "all_in" | "all-in" => {
+                fc.n += 1;
+                fc.raises += 1;
+            }
+            _ => {}
+        }
     }
 
     /// 据累计画像分类对手。主阈值取自 [`ExploitConfig`]（`min_hands`/`nit_vpip`/`station_vpip`/
@@ -129,6 +346,27 @@ impl OpponentTable {
             OppType::Lag
         } else {
             OppType::Tag
+        }
+    }
+
+    /// P0-3 阶段1：per-node 面对下注读数（原始计数 + 按 `n` 向 field 先验收缩）。
+    /// `k` = 收缩伪计数强度（先验等效样本数；默认建议 20 ≈ 实测 fold-to-cbet 中位样本）。
+    /// **阶段1 决策路径不调用此访问器** —— 仅供 dump/inspect 与阶段2 门控。
+    pub fn node_readout(&self, name: &str, node_id: &str, k: f64) -> NodeReadout {
+        let prior = node_field_prior(node_id);
+        let fc = self
+            .by_name
+            .get(name)
+            .and_then(|s| s.facing.get(node_id))
+            .cloned()
+            .unwrap_or_default();
+        NodeReadout {
+            node_id: node_id.to_string(),
+            n: fc.n,
+            raw_fold: fc.raw_fold_rate(),
+            shrunk_fold: fc.shrunk_fold_rate(prior.fold, k),
+            raw_raise: fc.raw_raise_rate(),
+            shrunk_raise: fc.shrunk_raise_rate(prior.raise, k),
         }
     }
 

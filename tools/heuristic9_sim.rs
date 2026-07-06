@@ -1027,6 +1027,7 @@ fn main() {
     let mut mirror = false;
     let mut exploit = false;
     let mut trace_summary = false;
+    let mut opp_stats = false;
     let mut config_path: Option<String> = None;
 
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -1083,6 +1084,10 @@ fn main() {
             }
             "--trace-summary" => {
                 trace_summary = true;
+                i += 1;
+            }
+            "--opp-stats" => {
+                opp_stats = true;
                 i += 1;
             }
             "--config" => {
@@ -1271,5 +1276,31 @@ fn main() {
             "非坚果 Monster 面对下注机会 n={} (其中 value_raise 点火 {})",
             stats.nonnut_facing, stats.nonnut_value_raise
         );
+    }
+    // P0-3 阶段1：per-opponent per-node facing 读数 dump（opt-in；只读采集表，不回馈决策）。
+    if opp_stats {
+        const K: f64 = 20.0; // 收缩伪计数强度（默认）。
+        println!("=== P0-3 阶段1 facing 读数 (--opp-stats, k={K}) ===");
+        println!("每格: node  n  raw_fold%  shrunk_fold%  raw_raise%  shrunk_raise%");
+        for (name, st) in bot.opponents.by_name.iter() {
+            if st.facing.is_empty() {
+                continue;
+            }
+            println!("--- {name} (hands={}) ---", st.hands);
+            for node in st.facing.keys() {
+                let r = bot.opponents.node_readout(name, node, K);
+                let rf = r.raw_fold.map(|x| x * 100.0).unwrap_or(f64::NAN);
+                let rr = r.raw_raise.map(|x| x * 100.0).unwrap_or(f64::NAN);
+                println!(
+                    "  {:<16} n={:<5} raw_fold={:5.1}  shrunk_fold={:5.1}  raw_raise={:5.1}  shrunk_raise={:5.1}",
+                    r.node_id,
+                    r.n,
+                    rf,
+                    r.shrunk_fold * 100.0,
+                    rr,
+                    r.shrunk_raise * 100.0,
+                );
+            }
+        }
     }
 }
