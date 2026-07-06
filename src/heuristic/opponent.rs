@@ -73,6 +73,21 @@ fn street_name(street: u8) -> &'static str {
     }
 }
 
+/// P0-3 阶段1：翻后 facing 节点 key 构造器 —— **§G 维度扩展的唯一接口**。
+///
+/// 当前粒度止步 `<街>.<池型>`（如 `"flop.srp"`）——实测 fold-to-cbet 中位仅 18/人，
+/// 再叠维即噪声（`opponent_features_inventory.md` §G/§H）。**留的口子**：key 是点分
+/// 限定符串，后续加 §G 维度（牌面质地 / 位置 IP-OOP / SPR 桶）= 在此函数**追加限定符**
+/// （如 `format!("{}.{}.{}", street, pot, texture_bucket)` → `"flop.srp.wet"`），无需动
+/// 数据结构（`BTreeMap<String,_>` 任意 key）。三处协同已为扩展就位：
+/// - `node_field_prior` 按**前缀**匹配（`starts_with("flop.")`）→ 更细 key 自动继承粗先验，
+///   加维不破先验查询；
+/// - 消费侧（阶段2）按样本自适应**并桶**：细 key 分母不足时回退粗 key（§G「采最细、消费并桶」）；
+/// - 采 §G 维度需 enrich `ObservedAction`（携 board/位置）——那是加维时的真正工作量，非本函数。
+fn facing_node_key(street: u8, pot_type: &str) -> String {
+    format!("{}.{}", street_name(street), pot_type)
+}
+
 /// P0-3 阶段1：per-node 面对下注 fold/raise 率的 **field 先验**（冷启动默认读数）。
 /// 数值取自 `docs/opponent_features_inventory.md`「实测样本称重」7-run 快照：
 /// fold-to-cbet 45.6% / fold-to-3bet 15.1%。turn/river fold 无独立实测 → 占位（消费前须扩测校准）；
@@ -84,6 +99,10 @@ pub struct NodePrior {
 }
 
 /// 查询某 `node_id` 的 field 先验。未知节点 → 中性占位。
+///
+/// **前缀匹配 = §G 扩展的前向兼容机制**：按 `starts_with("flop.")` 等匹配，故更细的
+/// key（如 `"flop.srp.wet"`，见 [`facing_node_key`]）自动继承 `flop.` 的粗先验——加 §G
+/// 维度不破此查询。加维时如有更细的实测先验，在此按更长前缀**前置**一条分支即可（长前缀先判）。
 pub fn node_field_prior(node_id: &str) -> NodePrior {
     if node_id == "pre.facing_3bet" {
         NodePrior {
@@ -275,7 +294,8 @@ impl OpponentTable {
 
         // 翻后每街：街首注「开火」→ 其后每个防守方**首次面对该未平注**的响应（§C）。
         for street in 1u8..=3 {
-            let node = format!("{}.{}", street_name(street), pot_type);
+            // key 经 `facing_node_key`（§G 扩展的唯一接口，见其文档）。
+            let node = facing_node_key(street, pot_type);
             let mut opened = false;
             let mut recorded: Vec<&str> = Vec::new();
             for a in actions.iter().filter(|a| a.street == street) {
