@@ -303,9 +303,34 @@ class HandState:
             req["names"] = {str(k): v for k, v in self.names.items()}
         return req
 
-    def observe_record(self):
-        acts = [{"seat": a["seat"], "street": _street_idx(st), "action": a["action"]}
-                for a, st in zip(self.actions, self.action_streets)]
+    def observe_record(self, result_actions=None):
+        """构对手画像 observe 载荷。
+
+        动作源优先用 `hand_result.actions`（`result_actions`）——它是服务端**权威完整**动作数组，
+        含结束手的最后一个动作（尤其 opener 对 3bet 的 fold、防守方对 river 注的 fold）。累积的
+        `player_action` 流（`self.actions`/`self.action_streets`）会漏这些末动作，用它构 observe 会让
+        fold-to-3bet / fold-to-cbet 的分母系统性偏低（见 docs/opponent_features_inventory.md §1）。
+        `result_actions` 缺失/空时回退旧流（个别缺 actions 的 hand_result 不至于丢掉整手 observe）。
+
+        `names`/`button_seat`/`num_seats` 仍用本手累积（seat→name 已由 player_action/your_turn/
+        table_state 覆盖：被漏的末动作的座，其早前动作在流里、name 必已知）。advisor 侧二值
+        fold-to-bet 不用 amount，故此处不带。街字符串→int 走 _street_idx，与 player_action 路径同。
+        """
+        if result_actions:
+            acts = []
+            for a in result_actions:
+                seat = a.get("seat")
+                action = a.get("action")
+                if seat is None or action is None:
+                    continue
+                acts.append({
+                    "seat": int(seat),
+                    "street": _street_idx(str(a.get("street", "")).strip().lower()),
+                    "action": str(action).lower(),
+                })
+        else:
+            acts = [{"seat": a["seat"], "street": _street_idx(st), "action": a["action"]}
+                    for a, st in zip(self.actions, self.action_streets)]
         return {
             "observe": 1,
             "button_seat": self.button_seat,
@@ -621,7 +646,9 @@ class Session:
         hand = self.hand
         if self.exploit and hand is not None:
             try:
-                self.advisor.observe(hand.observe_record())
+                # 权威完整动作源 = hand_result.actions（含结束手末动作）；缺失时 observe_record
+                # 内部回退累积 player_action 流。见 HandState.observe_record 文档。
+                self.advisor.observe(hand.observe_record(msg.get("actions")))
             except Exception as e:
                 print(f"  [observe 异常] {e}", file=sys.stderr)
         final = msg.get("final_stacks", {})
@@ -750,9 +777,64 @@ def run_real(args):
 # ===========================================================================
 # 离线 selftest（canned 9-max 序列，无网络）
 # ===========================================================================
+def _selftest_observe_source():
+    """回归（P0-3 阶段2 前置 #3）：observe 动作源改用 hand_result.actions 后，须捕获「结束手的
+    最后一个动作」——尤其 opener 对 3bet 的 fold、fold-to-cbet 结束手——而累积 player_action 流会漏它。
+    并验缺失时回退旧流、names/button/num_seats 仍取自本手。"""
+    # 场景1：opener(seat0) open → seat1 3bet → opener 对 3bet fold（终结手）。
+    #   模拟 player_action 流只喂到 3bet（漏 opener 终结 fold）；hand_result.actions 权威完整含它。
+    h = HandState("T1", 0, 5, 6)
+    h.update_name(0, "opener")
+    h.update_name(1, "threebettor")
+    h.on_player_action(0, "raise", 60)
+    h.on_player_action(1, "raise", 200)
+    old = h.observe_record()  # 旧路径（player_action 流）：漏 opener 终结 fold。
+    assert len(old["actions"]) == 2, old
+    assert not any(a["action"] == "fold" for a in old["actions"]), \
+        "旧 player_action 路径本应漏掉 opener 对 3bet 的终结 fold（回归前提）"
+    hr_actions = [
+        {"seat": 0, "action": "raise", "amount": 60, "street": "preflop"},
+        {"seat": 1, "action": "raise", "amount": 200, "street": "preflop"},
+        {"seat": 0, "action": "fold", "amount": None, "street": "preflop"},
+    ]
+    new = h.observe_record(hr_actions)  # 新路径：hand_result.actions 含终结 fold。
+    assert len(new["actions"]) == 3, new
+    assert new["actions"][-1] == {"seat": 0, "street": 0, "action": "fold"}, new["actions"]
+    assert new["button_seat"] == 0 and new["num_seats"] == 6, new
+    assert new["names"] == {"0": "opener", "1": "threebettor"}, new["names"]
+
+    # 场景2：fold-to-cbet 结束手。opener(seat0) open、防守方(seat1) call；flop opener cbet、
+    #   防守方 fold（终结）。player_action 流漏 flop 终结 fold；hand_result.actions 完整。
+    h2 = HandState("T2", 0, 5, 6)
+    h2.update_name(0, "cbettor")
+    h2.update_name(1, "defender")
+    h2.on_player_action(0, "raise", 60)
+    h2.on_player_action(1, "call", 60)
+    h2.on_community(["Ah", "7c", "2d"], "flop")
+    h2.on_player_action(0, "bet", 80)
+    old2 = h2.observe_record()
+    assert not any(a["action"] == "fold" for a in old2["actions"]), old2
+    hr2 = [
+        {"seat": 0, "action": "raise", "amount": 60, "street": "preflop"},
+        {"seat": 1, "action": "call", "amount": 60, "street": "preflop"},
+        {"seat": 0, "action": "bet", "amount": 80, "street": "flop"},
+        {"seat": 1, "action": "fold", "amount": None, "street": "flop"},
+    ]
+    new2 = h2.observe_record(hr2)
+    assert len(new2["actions"]) == 4, new2
+    assert new2["actions"][-1] == {"seat": 1, "street": 1, "action": "fold"}, new2["actions"]
+
+    # 回退：hand_result.actions 缺失/空 → 回退累积 player_action 流（个别缺 actions 的手不丢整手 observe）。
+    assert h2.observe_record(None)["actions"] == old2["actions"], "None 应回退旧流"
+    assert h2.observe_record([])["actions"] == old2["actions"], "空 list 应回退旧流"
+    print("=== selftest[observe-source] PASS：hand_result.actions 捕获终结 fold-to-3bet/cbet；"
+          "缺失回退 player_action 流；names/button/num_seats 稳定 ===", file=sys.stderr)
+
+
 def run_selftest(args):
     """不连网：用 canned 9-max 消息序列把 driver↔advisor IPC + 出合法动作跑通。
     验收：advisor 全程出合法 {action, amount}、driver 组请求正确。"""
+    _selftest_observe_source()
     import io
     advisor = Advisor(args.advisor_bin, args.samples, args.seed, debug=args.debug)
     sent = []

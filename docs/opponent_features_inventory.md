@@ -342,7 +342,15 @@ BTreeMap<String, FacingCounts>`（`#[serde(default, skip_serializing_if=is_empty
 - 单测 `tests/heuristic_p0_3_facing.rs`（7 测：计数/池型/逐街/fold-to-3bet/方向/收缩数学/后向兼容）
   + `heuristic9`(10) + `heuristic9_trace`(10) + `heuristic_p0_1_action_line`(8) 全绿；fmt / clippy 全绿。
 
-**阶段2 前置未决点（DESIGN.md §6）**：① live driver `observe_record` 现用 `player_action` 流，
-按 §1 铁律会漏结束手最后动作（fold-to-3bet/cbet 分母低估近半）→ 阶段2 上线前须改用
-`hand_result.actions`（sim 完整、不受影响）；② turn/river fold 先验须扩测 weigh.py 校准；
+**阶段2 前置未决点（DESIGN.md §6）**：① ~~live driver `observe_record` 现用 `player_action` 流，
+按 §1 铁律会漏结束手最后动作~~ **✅ 已完成（2026-07-06，前置 #3）**：`observe_record` 改用
+`hand_result.actions`（权威完整、含结束手末动作），缺失时回退旧 `player_action` 流；driver-only 改动，
+advisor observe schema（`actions:[{seat,street,action}]`+`names`）不变、Rust 决策路径未碰。
+**实测校订（诚实记录，与本节旧「低估近半」表述冲突）**：对本机 raw 日志（run24-30，去重 10484 手）跑
+A/B（真实 advisor observe 路径 + weigh.replay 双独立复算），换源后 fold-to-3bet 机会数 1020→1020、
+fold-to-cbet 4761→4761、VPIP/PFR 机会数漂移 <0.01%，**分母几乎零恢复**——因这批日志的 `player_action`
+消息在 `hand_result` 前基本全达（每 2000 手仅缺 ≤22 条动作）。故「低估近半」在**当前 raw 日志 + 当前
+weigh.replay 逻辑上不复现**；该数值疑似源自更早一版 weigh 脚本的重建 bug。换源仍保留：它是**权威源、
+更稳健**（免受未来 server/driver 时序变化导致终结动作漏采），且零害（分母等于或略升、name 覆盖实测
+100%）。前置 #3 的价值＝正确性/健壮性，而非分母恢复；② turn/river fold 先验须扩测 weigh.py 校准；
 ③ 候选① raise 极性代理样本饥饿（river raise 稀有），短期近群体级偏坚果假设。
