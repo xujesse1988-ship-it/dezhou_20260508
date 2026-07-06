@@ -945,6 +945,49 @@ min=15 靶场 3/3 正但标准 **2/11 误伤**（−1245/−320，落 CI95 内�
 （一轮一改）。造靶 FlushTrap/Tag + 坚果度特征 + 单测（造靶夹具）保留。诊断全文
 `scratchpad/cand1_v4/DIAGNOSIS.md`。
 
+### P0-3 阶段2 第六消费轮（srp c-bet **价值下注尺寸** 门）：**CONFIRMED-ROBUST（无反号，零引擎改动）**（2026-07-06）
+
+srp c-bet **频率**门（第三消费轮，戏剧反号 SHIPPED）的**尺寸**姊妹课题：把 hero c-bet 价值注**尺寸**按
+binding villain 节点级 fold-to-cbet 连续调整（拟：粘站放大榨价值 / 爱弃缩小诱跟）。杠杆同轴（value_bet.srp
+= hero 进攻方价值下注、villain 防守方面对 → 读 flop.srp fold-to-cbet）。**本轮非白纸**：现画像
+`ExploitAdjust.value_size_mult` 已对分类 `Station` 放大 1.30x（`ExploitConfig::station_value_size_mult`），
+但粗（离散）、单向（只放大）、非节点级。判定 bar = 节点级连续 **beats 画像级 station 1.30x**，非只 beats 平尺寸。
+
+**造靶（复用频率门 wideopen/3bpfold，无新靶）**：flop.srp shrunk_fold = WideOpener 47.5% / ThreebetFolder
+79.6%（分化 32.1pp）；`value_bet.srp` 点火 1648/1080 每 8000 手（密度足）。**⚠ 关键前提发现**：两靶
+`station_value_size_mult` 1.00↔1.30 toggle **EV 逐字节不变** → 两靶均**不分类 Station**（宽开→高 PFR/AF
+≥1.5），现画像乘子对其 = **1.0**（非 1.30）——画像分类看翻前 VPIP/AF，漏「翻后粘 + 翻前激进」对手。
+
+**纪律 A（sweep 反号，决定性）= 无反号**。constant-mode（gate 恒定乘子、仅作用 value_bet.srp 叶）8000 手
+2-max --exploit，5 seed 均值（mbb/g）：
+
+| value_size mult | WideOpener（粘 47.5%）| ThreebetFolder（爱弃 79.6%）|
+|---|---|---|
+| 0.60 | 720.5 | 933.8 |
+| 1.00 | 651.0 | 938.2 |
+| 1.40 | 868.9 | 956.6 |
+| 1.60 | **961.4** | 955.9 |
+
+粘站**清晰要大**（1.60 最优，+310 vs 1.0，单调↑）；爱弃**wash**（933–957，跨度 23 ≪ CI95 ±270，最优 1.2/1.4
+仍**大**，**不要小**）。**最优尺寸不随粘度反号**——粘要大、爱弃不反向。本轮核心假设「爱弃→缩小」**证伪**。
+与频率门（爱弃清晰高频 / 粘站清晰低频，戏剧反号）根本不同；与候选②（3bp 频率 robust，爱弃 wash）**同型**。
+
+**纪律 B（beats 画像）= shrink 方向 ≈0**。默认反号门锚 `[0.45→1.45, 0.80→0.70]` ON vs OFF（=画像）paired：
+WideOpener Δ **+202**（3/3 正）、ThreebetFolder Δ **+8.9**（1/3 负）。**拆解**：WideOpener 的 +202 **全来自门
+把粘站映到大尺寸（放大方向）= 与画像 station boost 同向**（画像做的正是「粘→放大」，只是这靶漏被分类）；门
+**独有的 shrink（爱弃→小 ~0.71）** sweep 已证劣于放大 → 均值 +8.9、1/3 负 ≈ 0。**本轮唯一新 EV 路径（爱弃
+缩小）实测证伪。** 放大那半增益固定大乘子/画像 boost 即可拿，节点级反号门无独有 EV。
+
+**机理**：价值注（非诈唬）尺寸对所有对手「越大越不亏」——对爱弃对手，任何尺寸它都弃弱牌（省的边际弃牌本
+就付不多），它不弃的是像样牌、会付更大注 → 大注不劣。故不像频率（诈唬 EV 直接随弃率反号）。一个固定大尺寸
+赢两边（正是画像 1.30x 的方向）。
+
+**判定 = CONFIRMED-ROBUST，零引擎改动。** policy/config `git checkout` 还原 HEAD（`9e7aff1`，`grep` 无 gate
+残留、引擎逐字节 = HEAD）→ 标准 11-config / byte-equal / 深码门按构造成立（同一二进制）。造靶保留。**引申
+（非本轮行动）**：两靶未分类 Station 却强受益于放大（WideOpener +310）= **画像分类覆盖盲区**（漏翻后粘/翻前
+激进），补法 = **单向** value-size boost 或放宽 station 分类，是另一 feature（须独立证 beats 画像 + 过标准场含
+station 避双重放大 + 节点差异化落 CI），留后续轮。诊断全文 `scratchpad/p03_cbet_value_size/DIAGNOSIS.md`。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街
