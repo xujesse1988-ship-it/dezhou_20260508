@@ -389,7 +389,7 @@ float 门（首个消费轮）SHIPPED 后，尝试对 `post.facing.bluff_raise` 
 | float 频率 | fold-to-cbet | **防守方** | §C fold 桶 | ✅ 已采（same-role，SHIPPED）|
 | **bluff_raise 频率** | **fold-to-raise** | **进攻方被加注** | **§B**（非 §C）| ✅ 已采（`*.facing_raise`）→ same-role 门控 **SHIPPED**（2026-07-06，双向门，读 `facing_raise_node_key`）|
 | **cbet 过度诈唬（srp）** | fold-to-cbet | 防守方 | §C fold 桶 | ✅ 已采（same-role，**SHIPPED**）|
-| **候选① river 极化门（value_raise 降级）** | **摊牌 range 极性（flush-only）** | **进攻方（下注/加注）** | **§D 摊牌**（§B raise 桶仅代理） | ✅ **§D 已采**（`*.attack_showdown` 的 `nonnut_flush` 桶，2026-07-06 SHIPPED）→ **门控解锁待接线**（读 `attack_showdown_node_key` 的 `raw_nonnut_flush_rate`）；§B raise 代理第三次 REJECT 见下 |
+| **候选① river 极化门（value_raise 降级 / 领打压尺寸）** | **摊牌 range 极性（flush-only）** | **进攻方（下注/加注）** | **§D 摊牌**（§B raise 桶仅代理） | ✅ **§D 已采+live 接线**（`*.attack_showdown.nonnut_flush`，SHIPPED）→ **§D 门重做（第四次）REJECTED**（2026-07-06，纹理盲 §D 决策时冷启动/稀释、靶正与标准 0/11 互斥，处方 §G 成花纹理维，见下） |
 
 > **bluff_raise 门 SHIPPED（重做 = 上轮 REJECT 的正解）**：上轮门读 fold-to-cbet（跨角色）两靶逐字节
 > 相同 33.8%、无法区分反号 → REJECT；本轮门读 `facing_raise`（same-role）实测 DonkFold 86.7% vs DonkStick
@@ -408,6 +408,19 @@ float 门（首个消费轮）SHIPPED 后，尝试对 `post.facing.bluff_raise` 
 > 窗从不点火（标准 11-config 0/11 = **空洞通过**）；flush-only GATED 20000 手仅 +1802（1/4 seed@200bb）。
 > 引擎逐字节还原 HEAD。**处方 = §D 摊牌采集**（villain 河牌攻击时摊牌 range 是否含非坚果，唯一分开
 > FlushTrap 纯坚果攻击 vs Tag 混合价值攻击）± §G 成花纹理维。详见 `docs/heuristic9_design.md` §6。
+
+> **候选① river 极化门 REJECTED（第四次尝试，§D 摊牌信号；2026-07-06）**：③ 的处方（§D 摊牌）落地做门——
+> 读 binding villain `river.<池型>.attack_showdown` 的 `raw_nonnut_flush`（< thresh 且 showdowns≥min → 极化）
+> → 降级 hero 非坚果同花攻击（领打超池压尺寸 + value_raise 降级 call）。**§D 稳态聚合确实对**（FlushTrap
+> river.srp flush-only **0.0% 全 seed 结构性** ≪ Tag 3.5% / Station 6.1% / Maniac 2.8%），但**决策时失效**：
+> **① 冷启动**——`raw_nonnut_flush` 累积率，非极化 villain 头 ~15–29 摊牌读 0%（还没亮非坚果同花）→ 误判极化
+> （实测 2max-mixed-s7 误伤者是 **Tag**，稳态 3.5%/9.7% 皆超阈值、纯冷启动）；**② 纹理盲稀释**——率分母含
+> 非成花板摊牌 → 松 air-heavy 场（Random）成花摊牌稀、limped 0.0% 撞 FlushTrap。**min_samples sweep 无干净窗口**：
+> min=15 靶 3/3 正(+663/+862/+1254 chips)但标准 **2/11 误伤**(−1245/−320，破 0/11 硬门)；min≥30 标准干净但**靶激活
+> 坍塌+seed23 转负**（互斥）。byte-equal PASS（node_gated=off == HEAD 二进制 4/4）。增益全来自领打超池压尺寸
+> （value_raise 侧 spot n=1/8000 死码），+4~+8 mbb/g 与标准误伤同量级、edge 边际。引擎逐字节还原 HEAD。
+> **处方 = §G 成花纹理维细化 §D**（`river.<池型>.flush_board.attack_showdown`：只在成花板计摊牌 → 治稀释+冷启动）。
+> 详见 `docs/heuristic9_design.md` §6 + `scratchpad/cand1_v4/DIAGNOSIS.md`。
 
 ---
 

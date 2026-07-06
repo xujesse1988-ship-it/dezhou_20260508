@@ -882,6 +882,69 @@ driver observe 路径解析 `shown_cards` + final board → 用 `features` 现�
 → 喂 `observe_showdown`（同 sim enrich 口径，opponent.rs 采集侧零改动即复用）。schema 详见
 `opponent_features_inventory.md` §D 落地记录。
 
+### P0-3 阶段2 第五消费轮 = 候选① river 极化门（**§D 摊牌信号，第四次重做**）：引擎改动**驳回**（2026-07-06）
+
+候选①（成花板非坚果 stack-off）的**第四次**尝试。前三次：①②全局降级死于标准矩阵 11/11（−113.9）；
+③（画像门控，`river.srp.facing_raise` §B 频率代理）死于**撞车**（FlushTrap raise 率 44.9% ≈ Tag 45.2%）。
+③ REJECT 处方 = **§D 摊牌采集**（`bad0396` 采、`0613410` live 接线，SHIPPED）：§D flush-only 非坚果率**能分开**
+纯坚果攻击（FlushTrap river.srp **0.0%** 全 seed 结构性）与混合价值攻击（Tag 3.5%）。本轮用这个**对了的信号**做门。
+判定 **REJECTED**——§D 稳态聚合对、但**决策时**跨不过 make-or-break，非失败（照候选①③ / bluff_raise v1 先例）。
+
+**已实现（sim 复核后逐字节还原 HEAD）**：`RiverPolarityGateConfig`（挂 NodesConfig：`node_gated / min_samples /
+nonnut_flush_thresh`）+ policy 首次消费 `showdown_readout.raw_nonnut_flush`（**唯一区别** vs float/cbet/bluff_raise
+门读 facing/facing_raise 的 `node_readout`）。两漏点：① 领打超池 `post.unopened.value_bet` → 压尺寸
+（`suppress_overbet` 绕过 Monster 超池升级、回落常规 value size）；② `post.facing.value_raise` → 降级 call
+（直接路由 call 叶、不穿下游 RNG）。多人池保守（全活对手须一致极化）。10 内联单测全绿。
+
+**关 A 标准场 §D rate（2-max p1 villain, 8000 手 seed7, `river.*.attack_showdown` flush-only nnflush%）**：
+
+| 场 | river.srp nnflush%(n) | river.limped nnflush%(n) |
+|----|-----------------------|--------------------------|
+| **FlushTrap** | **0.0% (66)** | **0.0% (33)** |
+| Random | 1.4% (71) | **0.0% (37)** ← limped 撞车 |
+| Maniac | 2.8% (178) | 8.6% (35) |
+| Tag | 3.5% (85) | 9.7% (31) |
+| Station | 6.1% (114) | 14.3% (28) |
+| Limpy | 6.5% (46) | 33.3% (21) |
+
+FlushTrap srp 0.0% 全 seed 结构性（0/36..0/69，从不攻击非坚果同花）。**srp 池可分**（0% vs ≥1.4%）、
+**limped 池不可分**（松 air-heavy 场成花摊牌稀 → 0% 撞 FlushTrap，纹理盲）。
+
+**决定性证据 = min_samples sweep（thresh=0.01，标准 vs 靶 paired ON/OFF chips Δ）——无干净窗口**：
+
+| min_samples | flushtrap Δ[s7,s11,s23] | mixed6-s7 Δ | mixed2-s7 Δ |
+|-------------|-------------------------|-------------|-------------|
+| **15** | **+663/+862/+1254** | **−1245** | **−320** |
+| 30 | +273/+160/**−291** | 0 | 0 |
+| 50 | 0/0/**−291** | 0 | 0 |
+| 80 | 0/0/0 | 0 | 0 |
+
+min=15 靶场 3/3 正但标准 **2/11 误伤**（−1245/−320，落 CI95 内但破 0/11 硬门）；min≥30 标准干净但**靶场激活
+坍塌 + seed23 转负**（门连靶都伤）。**没有任何 min 同时靶正 3/3 + 标准 0/11。**
+
+**根因两条（纹理盲 §D 的语境失效，正是 §8④/REJECT 预警的失效模式）**：
+1. **冷启动累积偏差**：`raw_nonnut_flush` 是累积率，非极化 villain 头 ~15–29 摊牌读 0%（还没亮过非坚果同花）
+   → 冷启动窗误判极化。2max-mixed-s7 误伤 villain 是 **Tag**（稳态 3.5%/9.7% 皆超阈值），纯冷启动致误伤 →
+   srp-only / 调阈值都治不了。
+2. **纹理盲稀释**：率分母含非成花板摊牌 → 松场成花摊牌稀 → 率压到 0%、limped 撞 FlushTrap。
+- **min_samples 分不开**：FlushTrap 可信样本窗（~15–30）恰覆盖标准场冷启动误伤窗；抬 min 杀靶场激活。
+
+**靶场增益来源 + 稀疏（诚实）**：3/3 正**全来自领打超池压尺寸**（leak 1）——`--trace-summary` 证 `value_raise
+点火` ON==OFF（未降级）→ facing-bet 非坚果同花 river spot **n=1/8000**（value_raise 侧实为死码）。增益
++4~+8 mbb/g 与标准误伤 −2~−8 同量级、edge 边际；live 9-max 每 villain river 攻击摊牌更稀（run33b ~5/villain）
+→ 门更慢热。
+
+**byte-equal（PASS，证门正确、REJECT 是 EV 权衡非 bug）**：node_gated=off full-stdout md5 == HEAD 二进制
+**4/4 逐字节相同**（mixed-6/flushtrap-2/mixed-9/station-6）；标准 8/11 config ON==OFF Δ=0；0 fallback/0 漂移。
+
+**判定 = REJECTED**：SHIP 四条——(a) 靶场向好 min=15 met 但**破 0/11 硬门**；(b) 标准 0/11 仅在 min≥30 达成、
+但此时靶场激活坍塌+转负（互斥）；(c) byte-equal PASS；(d) 激活可行但 value_raise 侧死码、增益边际。
+→ **(a)(b) 互斥不可兼得**。引擎逐字节还原 HEAD（`git diff HEAD -- src/` 空）。**处方 = §G 成花纹理维细化 §D**
+（`river.<池型>.flush_board.attack_showdown`：只在成花板计摊牌 → 分母不被稀释、率反映「成花板上攻不攻非坚果
+同花」→ 分开 FlushTrap 结构性 0% 与松场成花板会亮非坚果、且治冷启动）。这是 §D 采集侧改动，留后续轮
+（一轮一改）。造靶 FlushTrap/Tag + 坚果度特征 + 单测（造靶夹具）保留。诊断全文
+`scratchpad/cand1_v4/DIAGNOSIS.md`。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街
