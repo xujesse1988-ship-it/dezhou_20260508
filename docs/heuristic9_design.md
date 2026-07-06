@@ -359,6 +359,28 @@ PairedTrap 驳回格式（多 seed paired 同 seed 对比 mbb/g，靶场显著�
   **0.10 复核仍甜点，维持**。画像门控（仅对高弃牌对手开）与 float 同需 P0-3 翻后 fold 统计
   → 一并推迟。
 
+### Phase C 第二轮候选序（run33 live 复盘重排，2026-07-06）
+
+run33（2000 手，收频验证轮：`value_bet.3bp` n=32 +41.0 仍强正、`cbet_bluff.3bp` n=2 仍饥饿、
+aggregate 0 −EV 跟注 / 0 兜底）单笔最大亏 −7821 chips（−391 BB）复盘定位到一个**系统性 EV bug**，
+按正确性优先升为下一轮头号候选：
+
+- **候选①（新增，头号）成花/成顺湿板非坚果 made 的 commit 过松**。实证 hand `1b3328bc`：hero
+  `Qc3c` 在 `6h2s5c8c4c`（三梅花）成 **Q 高非坚果同花**，river `post.facing.value_raise` 读
+  equity **0.966 / made=Monster** → 全下 7278 输给更高（A/K 高）同花；账分 −285 BB 直接归因坏
+  stack-off（另 ~105 BB 为成型同花下注的 cooler 底）。根因两条（均可泛化）：① `MadeClass::Monster`
+  （`features.rs:104-109`，亲验）把所有同花/顺子+ 归一档、无坚果度区分 → 非坚果同花过
+  `value_thr`/`raise_value_thr` 并触发 `pick_bet_size` 超池尺寸；② `build_opp_thresholds`
+  （`policy.rs:206-253`）用**翻前起手强度**分位建对手 range + 对大注反向收紧 → 成花河牌上剔掉
+  A7s/K9s 这类翻前弱却成更高同花的手、留下输给 hero 的 AA/KK 超对 → MC 高估至 0.966（数值日志确认；
+  此因果机制为复盘主张、未逐行复核）。旋钮：给 `MadeClass` 加 nut-ness 折让、成花/成顺板关 value_raise
+  门与超池尺寸；`build_opp_thresholds` 加板质地感知（成花河牌不按翻前强度收紧、反纳低翻前强度的同色/
+  连接手）。靶：扩 `heuristic9_sim` 一个「成花板 vs float-then-raise」场做 sim 回归。
+- 候选②/③/④ 顺延：② 3bp c-bet 造靶（`cbet_bluff.3bp` n=2 饥饿）；③ float 造靶（run31/32/33
+  三轮一致轻负、机理为对手翻后粘度反号、须 P0-3 门控）；④ bluff_raise 造靶（0.10 复核仍甜点）。
+
+改动仍须 paired 复核（靶场显著向好 + 标准矩阵不退化）+ sim 回归门通过后方 shipped。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街
