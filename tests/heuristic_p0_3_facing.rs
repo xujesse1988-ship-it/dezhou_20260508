@@ -5,7 +5,8 @@
 //! 「Beta-Binomial 收缩数学正确」「旧 profile（无 facing 字段）仍加载、旧字段不丢」。
 
 use poker::heuristic::opponent::{
-    facing_raise_node_key, node_field_prior, FacingCounts, ObservedAction, OpponentTable,
+    attack_showdown_node_key, facing_raise_node_key, node_field_prior, FacingCounts,
+    ObservedAction, OpponentTable, ShowdownObs,
 };
 
 /// 构造一条观测动作（非盲位）。
@@ -15,6 +16,17 @@ fn act<'a>(name: &'a str, street: u8, action: &'a str) -> ObservedAction<'a> {
         street,
         action,
         forced_blind: false,
+    }
+}
+
+/// P0-3 §D：构造一条摊牌观测（`made_rank`=MadeClass::rank，`nonnut`=monster_non_nut 同花+顺，
+/// `nonnut_flush`=flush-only 非坚果同花 = 候选① 真杠杆）。
+fn sd(name: &str, made_rank: u8, nonnut: bool, nonnut_flush: bool) -> ShowdownObs<'_> {
+    ShowdownObs {
+        name,
+        made_rank,
+        nonnut,
+        nonnut_flush,
     }
 }
 
@@ -225,14 +237,17 @@ fn backward_compat_real_profile_file() {
         "现有 profile 应加载 ≥40 名，实得 {}",
         t.by_name.len()
     );
-    // 旧字段完整（抽查 GenesisBlock）+ facing 默认空。
+    // 旧字段完整（抽查 GenesisBlock）+ facing / attack_showdown 默认空。
     if let Some(st) = t.by_name.get("GenesisBlock") {
         assert_eq!(st.hands, 592);
         assert!(st.facing.is_empty());
+        assert!(st.attack_showdown.is_empty());
     }
-    // round-trip 不含 facing（现有画像无翻后 facing 数据）。
+    // round-trip 不含 facing / attack_showdown（现有画像无翻后 facing/§D 数据 → §D 新字段
+    // skip_serializing_if 空表不写 → 逐字节兼容旧 profile）。
     let round = t.to_json_string();
     assert!(!round.contains("\"facing\""));
+    assert!(!round.contains("attack_showdown"));
 }
 
 // ===========================================================================
@@ -418,4 +433,235 @@ fn backward_compat_facing_raise_key_roundtrip() {
             .folds,
         5
     );
+}
+
+// ===========================================================================
+// P0-3 §D 摊牌采集（villain 作进攻方且摊牌，final-board 成手牌力构成；候选① range 极性真信号）
+// MadeClass::rank：Air=0 WeakPair=1 MidPair=2 TopPair=3 Strong=4 Monster=5
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 13. §D 计数 + actor/时点正确性：river 攻击方摊牌 → river.srp.attack_showdown；非攻击者 / 独立 map
+// ---------------------------------------------------------------------------
+#[test]
+fn river_attack_showdown_counts_and_actor() {
+    let mut t = OpponentTable::new();
+    // SRP（hero open, villain call → pot_type=srp）。river：villain bet（进攻方）→ hero call → 摊牌。
+    // villain 亮非坚果 Monster（rank=5, nonnut=true）；hero 只跟（非攻击方）亮 Strong。
+    let actions = [
+        act("hero", 0, "raise"),
+        act("villain", 0, "call"),
+        act("villain", 3, "bet"), // villain river 攻击（进攻方）
+        act("hero", 3, "call"),   // hero 只跟（防守方，非攻击）
+    ];
+    t.observe_showdown(
+        &actions,
+        &[sd("villain", 5, true, true), sd("hero", 4, false, false)],
+    );
+
+    // villain river attack_showdown 命中（进攻方摊牌）。
+    let r = t.by_name["villain"]
+        .attack_showdown
+        .get("river.srp.attack_showdown")
+        .expect("villain 应有 river.srp.attack_showdown");
+    assert_eq!((r.showdowns, r.nonnut, r.nonnut_flush), (1, 1, 1));
+    assert_eq!(r.by_made_class[5], 1); // Monster 直方 +1
+    assert_eq!(r.raw_nonnut_rate(), Some(1.0));
+    assert_eq!(r.raw_nonnut_flush_rate(), Some(1.0));
+
+    // actor：villain 只在 river 攻击 → 无 flop/turn 节点。
+    assert!(!t.by_name["villain"]
+        .attack_showdown
+        .contains_key("flop.srp.attack_showdown"));
+    assert!(!t.by_name["villain"]
+        .attack_showdown
+        .contains_key("turn.srp.attack_showdown"));
+
+    // hero 未攻击任何街（只跟）→ observe_showdown 从不为其建条目（进攻方专属，非攻击者不入表）。
+    assert!(!t.by_name.contains_key("hero"));
+
+    // 结构分野：§D 独立 map（attack_showdown），不进 facing map。
+    assert!(t.by_name["villain"].facing.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// 14. §D 非坚果率方向分化（纯坚果攻击 FlushTrap 型 0% ≪ 混合价值 Tag 型 60%）——§B 频率代理做不到
+// ---------------------------------------------------------------------------
+#[test]
+fn showdown_nonnut_direction_nutonly_vs_mixed() {
+    let mut t = OpponentTable::new();
+    // "nutonly"（FlushTrap 型）：10 手 river 攻击摊牌全坚果 Monster（nonnut=false）。
+    // "mixed"（Tag 型）：10 手 river 攻击摊牌里 6 手非坚果 Monster（nonnut=true）+ 4 手坚果。
+    for i in 0..10u8 {
+        t.observe_showdown(
+            &[
+                act("hero", 0, "raise"),
+                act("nutonly", 0, "call"),
+                act("nutonly", 3, "bet"),
+                act("hero", 3, "call"),
+            ],
+            &[sd("nutonly", 5, false, false), sd("hero", 4, false, false)],
+        );
+        t.observe_showdown(
+            &[
+                act("hero", 0, "raise"),
+                act("mixed", 0, "call"),
+                act("mixed", 3, "bet"),
+                act("hero", 3, "call"),
+            ],
+            &[sd("mixed", 5, i < 6, i < 6), sd("hero", 4, false, false)],
+        );
+    }
+    let nut = t.showdown_readout("nutonly", "river.srp.attack_showdown");
+    let mix = t.showdown_readout("mixed", "river.srp.attack_showdown");
+    assert_eq!(nut.showdowns, 10);
+    assert_eq!(mix.showdowns, 10);
+    assert_eq!(nut.raw_nonnut, Some(0.0)); // 纯坚果 → 0%
+    assert_eq!(mix.raw_nonnut, Some(0.6)); // 混合 → 60%
+    assert_eq!(nut.raw_nonnut_flush, Some(0.0)); // flush-only 同向（候选① 真信号）
+    assert_eq!(mix.raw_nonnut_flush, Some(0.6));
+    // 这正是 §B raise 频率代理做不到的分化（FlushTrap 44.9% ≈ Tag 45.2% 撞车）。
+    assert!(mix.raw_nonnut.unwrap() > nut.raw_nonnut.unwrap());
+    assert!(mix.raw_nonnut_flush.unwrap() > nut.raw_nonnut_flush.unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// 14b. flush-only 与 monster 分开跟踪：非坚果**顺子**攻击命中 nonnut 但不命中 nonnut_flush
+//      （monster_non_nut 被 FlushTrap 成顺板非坚果顺子污染、唯 flush-only 给净信号的机理自证）
+// ---------------------------------------------------------------------------
+#[test]
+fn showdown_flush_only_isolates_straight() {
+    let mut t = OpponentTable::new();
+    let actions = [
+        act("hero", 0, "raise"),
+        act("v", 0, "call"),
+        act("v", 3, "bet"),
+        act("hero", 3, "call"),
+    ];
+    // 非坚果**顺子**攻击：Monster(rank=5) + nonnut=true + nonnut_flush=false。
+    t.observe_showdown(
+        &actions,
+        &[sd("v", 5, true, false), sd("hero", 4, false, false)],
+    );
+    let r = t.showdown_readout("v", "river.srp.attack_showdown");
+    assert_eq!((r.showdowns, r.nonnut, r.nonnut_flush), (1, 1, 0));
+    assert_eq!(r.raw_nonnut, Some(1.0)); // monster_non_nut 命中（含顺子）
+    assert_eq!(r.raw_nonnut_flush, Some(0.0)); // flush-only 不命中 → 候选① 不误判为极化攻击
+}
+
+// ---------------------------------------------------------------------------
+// 15. §D node key 构造器 + 独立 readout 不经 node_field_prior（无前缀碰撞污染）
+// ---------------------------------------------------------------------------
+#[test]
+fn attack_showdown_key_and_no_field_prior_path() {
+    // key 构造器（复用 facing_node_key 基座 + `.attack_showdown` 后缀）。
+    assert_eq!(
+        attack_showdown_node_key(3, "srp"),
+        "river.srp.attack_showdown"
+    );
+    assert_eq!(
+        attack_showdown_node_key(1, "3bp"),
+        "flop.3bp.attack_showdown"
+    );
+    assert_eq!(
+        attack_showdown_node_key(2, "limped"),
+        "turn.limped.attack_showdown"
+    );
+    // §D 走独立 map + 独立 readout（showdown_readout），**不经 node_field_prior** → 空样本返回
+    // showdowns=0 / raw_nonnut=None（非某 fold 先验数值污染，比 fold-to-raise 共用 facing map 更干净）。
+    let t = OpponentTable::new();
+    let r = t.showdown_readout("ghost", "river.srp.attack_showdown");
+    assert_eq!((r.showdowns, r.nonnut), (0, 0));
+    assert_eq!(r.raw_nonnut, None);
+    assert_eq!(r.by_made_class, [0u32; 6]);
+    // 对照：基座 fold-to-cbet 节点的 node_field_prior 未被 §D 扰动。
+    assert!((node_field_prior("river.srp").fold - 0.50).abs() < 1e-12);
+}
+
+// ---------------------------------------------------------------------------
+// 16. §D 多街归属：triple-barrel 摊牌 → flop/turn/river 三节点各记一次（同 final-board 牌力）
+// ---------------------------------------------------------------------------
+#[test]
+fn showdown_multistreet_attribution() {
+    let mut t = OpponentTable::new();
+    let actions = [
+        act("hero", 0, "raise"),
+        act("villain", 0, "call"),
+        act("villain", 1, "bet"),
+        act("hero", 1, "call"),
+        act("villain", 2, "bet"),
+        act("hero", 2, "call"),
+        act("villain", 3, "bet"),
+        act("hero", 3, "call"),
+    ];
+    t.observe_showdown(
+        &actions,
+        &[sd("villain", 5, true, true), sd("hero", 4, false, false)],
+    );
+    for node in [
+        "flop.srp.attack_showdown",
+        "turn.srp.attack_showdown",
+        "river.srp.attack_showdown",
+    ] {
+        let r = t.by_name["villain"]
+            .attack_showdown
+            .get(node)
+            .unwrap_or_else(|| panic!("villain 应有 {node}"));
+        assert_eq!((r.showdowns, r.nonnut), (1, 1));
+        assert_eq!(r.by_made_class[5], 1); // 同一 final-board 牌力（Monster）
+    }
+    // hero 只跟 → observe_showdown 从不为其建条目。
+    assert!(!t.by_name.contains_key("hero"));
+}
+
+// ---------------------------------------------------------------------------
+// 17. 后向兼容：旧 profile（无 attack_showdown）仍加载 + 含 §D key 的 profile round-trip + 缺 by_made_class 默认
+// ---------------------------------------------------------------------------
+#[test]
+fn backward_compat_attack_showdown_key_roundtrip() {
+    // 旧 profile（无 facing / attack_showdown）仍加载，且 round-trip 不写空 §D 字段（逐字节兼容）。
+    let old = r#"{"by_name":{"A":{"hands":10,"vpip_opp":5,"vpip_cnt":3,"pfr_opp":5,"pfr_cnt":2,"aggr_actions":4,"call_actions":3}}}"#;
+    let t_old = OpponentTable::from_json_str(old);
+    assert!(t_old.by_name["A"].attack_showdown.is_empty());
+    assert!(t_old.by_name["A"].facing.is_empty());
+    let round_old = t_old.to_json_string();
+    assert!(!round_old.contains("attack_showdown"));
+
+    // 含 facing + attack_showdown 双结构的 profile 反序列化。
+    let json = r#"{"by_name":{"villain":{"hands":50,"vpip_opp":30,"vpip_cnt":15,"pfr_opp":30,"pfr_cnt":10,"aggr_actions":20,"call_actions":15,"facing":{"flop.srp":{"n":10,"folds":4,"calls":5,"raises":1}},"attack_showdown":{"river.srp.attack_showdown":{"showdowns":8,"nonnut":3,"by_made_class":[0,0,1,2,2,3]}}}}}"#;
+    let t = OpponentTable::from_json_str(json);
+    let sc = t.by_name["villain"]
+        .attack_showdown
+        .get("river.srp.attack_showdown")
+        .expect("attack_showdown 节点应反序列化");
+    assert_eq!((sc.showdowns, sc.nonnut), (8, 3));
+    // 早期 §D profile 只写 nonnut（无 nonnut_flush）→ #[serde(default)] 补 0（后向兼容）。
+    assert_eq!(sc.nonnut_flush, 0);
+    assert_eq!(sc.by_made_class, [0, 0, 1, 2, 2, 3]);
+    assert!((sc.raw_nonnut_rate().unwrap() - 3.0 / 8.0).abs() < 1e-9);
+    // facing 并存不受影响。
+    assert_eq!(t.by_name["villain"].facing.get("flop.srp").unwrap().n, 10);
+    // round-trip 保留 attack_showdown key。
+    let round = t.to_json_string();
+    assert!(round.contains("river.srp.attack_showdown"));
+    let t2 = OpponentTable::from_json_str(&round);
+    assert_eq!(
+        t2.by_name["villain"]
+            .attack_showdown
+            .get("river.srp.attack_showdown")
+            .unwrap()
+            .nonnut,
+        3
+    );
+
+    // 缺 nonnut_flush/by_made_class 的 ShowdownCounts 也反序列化（#[serde(default)] 兜底；OppStats
+    // 基础字段仍须齐全）。
+    let partial = r#"{"by_name":{"v":{"hands":1,"vpip_opp":0,"vpip_cnt":0,"pfr_opp":0,"pfr_cnt":0,"aggr_actions":0,"call_actions":0,"attack_showdown":{"river.srp.attack_showdown":{"showdowns":2,"nonnut":1}}}}}"#;
+    let tp = OpponentTable::from_json_str(partial);
+    let scp = tp.by_name["v"]
+        .attack_showdown
+        .get("river.srp.attack_showdown")
+        .unwrap();
+    assert_eq!((scp.showdowns, scp.nonnut, scp.nonnut_flush), (2, 1, 0));
+    assert_eq!(scp.by_made_class, [0u32; 6]);
 }

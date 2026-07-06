@@ -779,6 +779,72 @@ river.srp.facing_raise n=29、river.limped n=12/20000）→ 门在 8000 手标�
 坚果 Monster），非 `post.facing.value_raise`；且必须 **flush-only**（顺子降级 -EV）。造靶夹具
 （FlushTrap + `monster_non_nut`/`nonnut_flush`）保留。
 
+### P0-3 §D 摊牌采集（villain 攻击方摊牌牌力构成）**SHIPPED**（2026-07-06）
+
+候选① 第三次 REJECT 处方 #1 落地：**§D 摊牌采集**——记 villain **河牌攻击时摊牌牌力构成**（攻击
+range 含非坚果吗），唯一能分开 FlushTrap（纯坚果攻击）与 Tag（混合价值攻击）；REJECT 坐实的 §B 频率
+代理（raise/fold 率）**撞车**（`river.srp.facing_raise` FlushTrap 44.9% ≈ Tag 45.2%）§D 解得开。**本轮
+只采集、不接门**（候选① 门重做用 §D 是后续轮）。纯增采集、决策不读 → **sim byte-equal**；**`policy.rs`
+零改动**（只动 `opponent.rs` 采集 + `heuristic9_sim.rs` enrich/dump + tests + docs）。照 fold-to-raise
+（`fac17a8`）范式。
+
+**采什么**：per-villain，keyed by `<街>.<池型>.attack_showdown`（河牌为主，flop/turn 一并采）。villain
+在该街作**进攻方**（bet/raise）**且到摊牌亮牌**时，其牌在 **final board** 上的成手牌力构成——存原始计数
+（§0.5 铁律）：`{showdowns, nonnut, nonnut_flush, by_made_class[6]}`，非坚果率查询时现算。
+
+**5 设计决策**：
+1. **新字段**（非复用 facing map）：值类型 `ShowdownCounts` ≠ `FacingCounts` → 新
+   `OppStats.attack_showdown: BTreeMap<String,ShowdownCounts>`，`#[serde(default, skip_serializing_if)]`
+   → 旧 `h9_live_prof*.json` 逐字节兼容。
+2. **key** = `<街>.<池型>.attack_showdown`，新 `pub attack_showdown_node_key` = `facing_node_key` 的
+   `.attack_showdown` 兄弟（§G 扩展口子，采集/未来 gate 共用同一构造器）。
+3. **前缀碰撞：天然无**（比 fold-to-raise 更干净）——§D key 存**独立 map** + **独立 readout**
+   （`showdown_readout`）→ **不经 `node_field_prior`**（§D 无摊牌率先验，全原始计数 + 现算率）→ 结构上无从
+   碰撞，故**不动 `node_field_prior`**（fold-to-raise 共用 facing map 才需 `ends_with(".facing_raise")`
+   前置分支）。
+4. **两档非坚果度**：`nonnut`（`monster_non_nut`，含同花+顺子）**被 FlushTrap 成顺非成花板的非坚果顺子
+   value_raise 污染**（FlushTrap 仅**成花板**纯坚果建战、成顺板打法同 Tag）；`nonnut_flush`（**flush-only**）
+   才是候选① 真杠杆（照 REJECT 处方 #3「必须 flush-only，顺子降级 -EV」）——FlushTrap 从不攻击非坚果同花
+   → flush-only ≈0。
+5. **enrich（真正工作量）**：`opponent.rs` **不依赖 `features`/`eval`**——sim 用 `features` 现算
+   `made_rank`/`nonnut`/`nonnut_flush` 喂 `ShowdownObs`；`observe_showdown(actions, showdowns)` 从 actions
+   重建 pot_type + per-villain per-street 攻击标记（同 observe_facing 口径），归牌力到节点。摊牌判定：终局
+   board 满 5 张 且 ≥2 座保有 `hole_cards`（弃牌者 apply 时 `hole_cards`→None）。**多街归属**：triple-barrel
+   摊牌 → flop/turn/river 三节点各记一次（同 final-board 牌力；river 主用、flop/turn 副）。
+
+**选择偏差（显式）**：`showdowns` 分母只含「攻击被跟到摊牌」的手——被弃的攻击无亮牌 → §D range 是
+**摊牌子集**、非全攻击 range（inventory §D 截断偏差）。对候选① 无害：FlushTrap 坚果同花攻击会被 hero
+非坚果同花跟到摊牌（正是要度量的 spot）。
+
+**自校验（造靶铁证；FlushTrap vs Tag 隔离攻击极性，2-max villain=p1，20000 手 seed 7）**：
+
+| 靶 p1 | `river.srp.attack_showdown` nnflush (n) | `river.limped` nnflush | `nonnut`（含顺子，被污染） |
+|---|---|---|---|
+| **FlushTrap**（纯坚果攻击） | **0.0%** (0/142) | **0.0%** (0/72) | 11.3% / 20.8% |
+| **Tag**（混合价值攻击） | **6.3%** (12/189) | **20.3%** (15/74) | 14.8% / 37.8% |
+
+**flush-only 决定性分化**：FlushTrap river 攻击摊牌 flush-only 非坚果率 **恰 0%**（`nnflush` 桶两 river
+节点全 0——从不攻击非坚果同花）≪ Tag **6.3% / 20.3%**。**这正是 §B 频率代理做不到的**（raise-to-raise
+两者 44.9%≈45.2% 撞车）→ §D 处方兑现的铁证。注：`nonnut`（monster，含顺子）被 FlushTrap 成顺板非坚果
+顺子攻击污染（11.3% vs 14.8%，弱分化）→ 印证决策 #4，唯 flush-only 给净信号。
+
+**验证门（全过）**：byte-equal 基线（HEAD=7646c2d）vs 改动默认输出（无 `--opp-stats`）**0/30 diff**
+（field {mixed,flushtrap,tag,3bpfold,donk_fold} × seats {2,6,9} × exploit {ON,OFF}，--hands 4000 --seed 7）；
+`policy.rs` 零改动。单测 `heuristic_p0_3_facing` 新增 6（§D counts/actor、direction、flush-only 隔离顺子、
+key/no-field-prior、multistreet、backward-compat）→ 18 全绿；`heuristic9_trace`(10) 绿；fmt/clippy 绿。
+**未跑全量 `cargo test`**（遵约束）。
+
+**解锁**：候选① river 极化门重做——现可读 `river.<池型>.attack_showdown` 的 **flush-only 摊牌极性**
+（`raw_nonnut_flush_rate`）门控 `post.facing.value_raise` / `post.unopened.value_bet`（REJECT 处方 #3
+scope 订正：真杠杆是领打超池尺寸 + flush-only），门控接线留后续消费轮。造靶 FlushTrap/Tag 留作门控验证载荷。
+诊断/数据 `scratchpad/p03_showdown_d/DIAGNOSIS.md`。
+
+**live 接线入口（后续轮，本轮不做）**：live `hand_result.shown_cards` = 逐座底牌 map（如
+`{"0":["Td","5d"],"2":["8c","9d"]}`），850 手中 262 手（所有摊牌手）都有；driver 当前**未解析**。后续轮：
+driver observe 路径解析 `shown_cards` + final board → 用 `features` 现算 `made_rank`/`nonnut`/`nonnut_flush`
+→ 喂 `observe_showdown`（同 sim enrich 口径，opponent.rs 采集侧零改动即复用）。schema 详见
+`opponent_features_inventory.md` §D 落地记录。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街

@@ -24,6 +24,7 @@
 
 use poker::core::{Card, Rank, Suit};
 use poker::heuristic::features::{draws, made_class, monster_non_nut, nonnut_flush, MadeClass};
+use poker::heuristic::opponent::ShowdownObs;
 use poker::heuristic::view::{GameView, HistAction, Request, ValidActions};
 use poker::heuristic::{EquityEngine, HeuristicBot, HeuristicConfig, ObservedAction};
 use poker::rules::action::{Action, LegalActionSet};
@@ -1073,6 +1074,27 @@ fn play_hand(
             })
             .collect();
         bot.observe_hand(&observed, &names);
+
+        // P0-3 §D：摊牌采集（villain 作进攻方且亮牌时的 **final-board** 成手牌力构成）。纯增采集、
+        // 决策路径不读 → byte-equal。摊牌判定：终局 board 满 5 张 且 ≥2 座保有 hole_cards（弃牌者在
+        // apply 时 hole_cards 被清 None，见 `GameState::apply_action_for_player` Fold 分支）→ 未弃且到河
+        // 摊牌者才亮牌。`made_rank`/`nonnut` 用 features 现算（opponent.rs 不依赖 features），喂 ShowdownObs。
+        let board = state.board();
+        if board.len() == 5 {
+            let shown: Vec<ShowdownObs> = (0..n as usize)
+                .filter_map(|s| {
+                    state.players()[s].hole_cards.map(|h| ShowdownObs {
+                        name: &names[s],
+                        made_rank: made_class(h, board).rank(),
+                        nonnut: monster_non_nut(h, board),
+                        nonnut_flush: nonnut_flush(h, board),
+                    })
+                })
+                .collect();
+            if shown.len() >= 2 {
+                bot.opponents.observe_showdown(&observed, &shown);
+            }
+        }
     }
 }
 
@@ -1389,6 +1411,55 @@ fn main() {
         };
         println!(
             "fold-to-raise 聚合 (*.facing_raise): n={fr_n} folds={fr_folds} calls={fr_calls} raises={fr_raises} raw_fold={fr_fold_pct:.1}%"
+        );
+
+        // P0-3 §D 摊牌攻击读数（`*.attack_showdown`）：villain 作**进攻方且亮牌**时的 final-board 成手
+        // 牌力构成——候选① range 极性真信号（§B 频率代理撞车的解药）。决策路径不读，仅 dump/inspect。
+        println!("=== P0-3 §D 摊牌攻击读数 (--opp-stats) ===");
+        println!(
+            "每格: node  showdowns  nonnut(同花+顺)  nnflush(flush-only,候选①真杠杆)  by_made_class[Air,WkP,MidP,TopP,Strong,Monster]"
+        );
+        for (name, st) in bot.opponents.by_name.iter() {
+            if st.attack_showdown.is_empty() {
+                continue;
+            }
+            println!("--- {name} (hands={}) ---", st.hands);
+            for node in st.attack_showdown.keys() {
+                let r = bot.opponents.showdown_readout(name, node);
+                let nn = r.raw_nonnut.map(|x| x * 100.0).unwrap_or(f64::NAN);
+                let nnf = r.raw_nonnut_flush.map(|x| x * 100.0).unwrap_or(f64::NAN);
+                println!(
+                    "  {:<26} showdowns={:<5} nonnut={:<4}({nn:5.1}%)  nnflush={:<4}({nnf:5.1}%)  by_made={:?}",
+                    r.node_id, r.showdowns, r.nonnut, r.nonnut_flush, r.by_made_class,
+                );
+            }
+        }
+        // river `*.attack_showdown` 跨对手聚合 —— FlushTrap vs Tag 非坚果率分化的方向自校验载荷。
+        // **flush-only（nnflush）= 决定性信号**：期望 `--field flushtrap` river flush-only ≈ 0%（从不
+        // 攻击非坚果同花）≪ `--field tag`（混合价值攻击）。`nonnut`（含顺子）被 FlushTrap 成顺板非坚果
+        // 顺子污染（非 ≈0）。这正是 §B raise 频率代理做不到的（`river.srp.facing_raise` FlushTrap 44.9%
+        // ≈ Tag 45.2% 撞车）。注：2-max 聚合含 hero(p0)+villain(p1)，纯 villain 信号见上 per-opponent p1 行。
+        let (mut sd_n, mut sd_nn, mut sd_nnf) = (0u32, 0u32, 0u32);
+        for st in bot.opponents.by_name.values() {
+            for (node, sc) in st.attack_showdown.iter() {
+                if node.starts_with("river.") {
+                    sd_n += sc.showdowns;
+                    sd_nn += sc.nonnut;
+                    sd_nnf += sc.nonnut_flush;
+                }
+            }
+        }
+        let pct = |num: u32, den: u32| {
+            if den > 0 {
+                100.0 * num as f64 / den as f64
+            } else {
+                f64::NAN
+            }
+        };
+        println!(
+            "§D river attack_showdown 聚合: showdowns={sd_n} nonnut={sd_nn}({:.1}%) nnflush={sd_nnf}({:.1}%)",
+            pct(sd_nn, sd_n),
+            pct(sd_nnf, sd_n),
         );
     }
 }

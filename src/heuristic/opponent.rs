@@ -46,6 +46,48 @@ impl FacingCounts {
     }
 }
 
+/// P0-3 §D：per-node villain **作进攻方且摊牌**时的成手牌力构成（原始计数，§0.5 铁律：存计数
+/// 不存比率，非坚果率查询时现算）。
+///
+/// 分母 `showdowns` = 该节点作进攻方（该街 bet/raise）且到摊牌亮牌的手数（**截断偏差**：只含
+/// 「攻击被跟到摊牌」的手，被弃的攻击无亮牌 → range 是**摊牌子集**、非全攻击 range，见
+/// `opponent_features_inventory.md` §D 截断偏差）。候选① river 极化门的真信号源——§B 频率代理
+/// （raise/fold 率）撞车（`river.srp.facing_raise` FlushTrap 44.9% ≈ Tag 45.2%），唯 §D 摊牌 range
+/// 极性能分开纯坚果攻击（FlushTrap）与混合价值攻击（Tag）。**决策路径不读**（纯增采集）。
+///
+/// **两档非坚果度**（务必区分）：`nonnut`（`monster_non_nut`，含**同花或顺子**）会被 FlushTrap 在
+/// **成顺非成花板**的非坚果**顺子** value_raise 污染（FlushTrap 仅**成花板**纯坚果建战、成顺板打法
+/// 同 Tag）→ FlushTrap river.srp `nonnut` 实测 11.3% 非 ≈0；`nonnut_flush`（**flush-only**）才是候选①
+/// 真杠杆（REJECT 处方 #3「必须 flush-only，顺子降级 -EV」，`heuristic9_design.md` §6）——FlushTrap
+/// 从不攻击非坚果同花 → flush-only ≈0 ≪ Tag。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ShowdownCounts {
+    /// 摊牌样本数（分母）= 该节点作进攻方且亮牌的手数。
+    pub showdowns: u32,
+    /// 其中 `monster_non_nut` 命中数（非坚果 Monster = 可被压制的**同花或顺子**攻击）。
+    pub nonnut: u32,
+    /// 其中 `nonnut_flush` 命中数（**flush-only** 非坚果同花攻击）——候选① 的**真杠杆**（`nonnut`
+    /// 含顺子被 FlushTrap 成顺板非坚果顺子污染，唯 flush-only 给出 FlushTrap≈0% ≪ Tag 的决定性分化）。
+    /// `#[serde(default)]` 兼容早期只写 `nonnut` 的 profile。
+    #[serde(default)]
+    pub nonnut_flush: u32,
+    /// 成手类别直方（索引 = `MadeClass::rank()`，0=Air..5=Monster）；`#[serde(default)]` 防未来
+    /// 部分 JSON 缺该字段。
+    #[serde(default)]
+    pub by_made_class: [u32; 6],
+}
+
+impl ShowdownCounts {
+    /// 原始非坚果 Monster 攻击率 = nonnut/showdowns（含同花+顺子）。`showdowns==0` → None。
+    pub fn raw_nonnut_rate(&self) -> Option<f64> {
+        (self.showdowns >= 1).then(|| self.nonnut as f64 / self.showdowns as f64)
+    }
+    /// 原始 **flush-only** 非坚果攻击率 = nonnut_flush/showdowns（候选① 真杠杆信号）。`showdowns==0` → None。
+    pub fn raw_nonnut_flush_rate(&self) -> Option<f64> {
+        (self.showdowns >= 1).then(|| self.nonnut_flush as f64 / self.showdowns as f64)
+    }
+}
+
 /// 归一化「加注类」动作判定（bet/raise/all-in 变体）。
 fn is_raise_action(a: &str) -> bool {
     matches!(
@@ -110,6 +152,26 @@ pub fn facing_node_key(street: u8, pot_type: &str) -> String {
 /// 专用前置分支（长/专用先判，见其 doc）。
 pub fn facing_raise_node_key(street: u8, pot_type: &str) -> String {
     format!("{}.facing_raise", facing_node_key(street, pot_type))
+}
+
+/// P0-3 §D：翻后 **摊牌攻击** 节点 key —— [`facing_node_key`] 的 `.attack_showdown` 兄弟。
+///
+/// 语义：villain **作进攻方**（该街 bet/raise）且**到摊牌亮牌**时，其牌在 **final board** 上的成手
+/// 牌力构成（`MadeClass` 直方 + `monster_non_nut` 命中）。候选① river 极化门的真信号源——§B 频率代理
+/// 撞车（`river.srp.facing_raise` FlushTrap 44.9% ≈ Tag 45.2%），唯 §D 摊牌 range 极性能分开纯坚果
+/// 攻击（FlushTrap）与混合价值攻击（Tag），见 `heuristic9_design.md` §6 候选① 第三次 REJECT。
+///
+/// **与 fold-to-raise（`.facing_raise`）的结构分野（关键）**：§D 计数值 = [`ShowdownCounts`]
+/// （非 [`FacingCounts`]）→ 存入 **独立** `OppStats.attack_showdown` map（非 `facing`），有独立 readout
+/// （[`OpponentTable::showdown_readout`]）→ **不经 [`node_field_prior`]**（§D 无摊牌率 field 先验，全是
+/// 原始计数 + 现算率）→ **天然无前缀碰撞**（比 fold-to-raise 更干净：后者共用 `facing` map 经
+/// `node_field_prior`，须加 `ends_with(".facing_raise")` 专用前置分支；本 key 无此需）。
+///
+/// 走 [`facing_node_key`] 的 §G 扩展口子：复用点分基座 + 缀 `.attack_showdown` 语义后缀，与采集侧
+/// （[`OpponentTable::observe_showdown`]）共用**同一构造器** → 未来 gate（候选① river 极化门重做）
+/// 查询/采集口径逐字节一致（照 float 门用 `facing_node_key` 的先例）。
+pub fn attack_showdown_node_key(street: u8, pot_type: &str) -> String {
+    format!("{}.attack_showdown", facing_node_key(street, pot_type))
 }
 
 /// P0-3 阶段1：per-node 面对下注 fold/raise 率的 **field 先验**（冷启动默认读数）。
@@ -186,6 +248,25 @@ pub struct NodeReadout {
     pub shrunk_raise: f64,
 }
 
+/// P0-3 §D：per-node 摊牌攻击读数（原始计数 + 现算非坚果率）。**决策路径不消费**——仅供 dump/inspect
+/// 与后续 gate（候选① river 极化门重做）门控。无收缩（§D 无摊牌率 field 先验；接门时按样本再定）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShowdownReadout {
+    pub node_id: String,
+    /// 摊牌样本数（分母）。
+    pub showdowns: u32,
+    /// 非坚果 Monster 攻击命中数（同花+顺子）。
+    pub nonnut: u32,
+    /// flush-only 非坚果攻击命中数（候选① 真杠杆）。
+    pub nonnut_flush: u32,
+    /// 原始非坚果率 = nonnut/showdowns（showdowns==0 → None）。
+    pub raw_nonnut: Option<f64>,
+    /// 原始 flush-only 非坚果率 = nonnut_flush/showdowns（候选① 真信号；showdowns==0 → None）。
+    pub raw_nonnut_flush: Option<f64>,
+    /// 成手类别直方（0=Air..5=Monster）。
+    pub by_made_class: [u32; 6],
+}
+
 /// 单个对手的累计统计。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OppStats {
@@ -203,6 +284,13 @@ pub struct OppStats {
     /// 旧 profile 无此字段 → `#[serde(default)]` 补空表（后向兼容硬约束）。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub facing: BTreeMap<String, FacingCounts>,
+    /// P0-3 §D：per-node（`街.池型.attack_showdown`）villain **作进攻方且摊牌**时的成手牌力构成。
+    /// **独立于** `facing`（值类型 [`ShowdownCounts`] ≠ [`FacingCounts`]，且不经 `node_field_prior`
+    /// → 天然无前缀碰撞）。key 例：`"river.srp.attack_showdown"` / `"flop.3bp.attack_showdown"`。
+    /// 旧 profile 无此字段 → `#[serde(default)]` 补空表（后向兼容硬约束）。**决策路径不读**
+    /// （纯增采集，sim byte-equal）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub attack_showdown: BTreeMap<String, ShowdownCounts>,
 }
 
 impl OppStats {
@@ -235,6 +323,20 @@ pub struct ObservedAction<'a> {
     pub action: &'a str,
     /// 翻前是否盲位强制（盲位不计 vpip 机会）。
     pub forced_blind: bool,
+}
+
+/// P0-3 §D：一条摊牌观测 —— 某亮牌 villain 的 **final-board** 成手牌力。
+///
+/// `made_rank`（`MadeClass::rank()`）+ `nonnut`（`monster_non_nut`）由 sim/driver 用 `features` 现算后
+/// 喂入 → `opponent.rs` **不依赖 `features`/`eval`**（采集层与决策/牌型评估层解耦，口径单点定义在调用侧）。
+pub struct ShowdownObs<'a> {
+    pub name: &'a str,
+    /// `MadeClass::rank()`（0=Air..5=Monster），在 **final board** 上评。
+    pub made_rank: u8,
+    /// `monster_non_nut` 命中（非坚果 Monster：可被压制的同花**或**顺子）。
+    pub nonnut: bool,
+    /// `nonnut_flush` 命中（**flush-only** 非坚果同花）——候选① 真杠杆（见 [`ShowdownCounts`] doc）。
+    pub nonnut_flush: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -410,6 +512,66 @@ impl OpponentTable {
         }
     }
 
+    /// P0-3 §D：喂一手摊牌观测 —— 为每个亮牌 villain（`showdowns`），把其 **final-board** 成手牌力归到
+    /// 「该 villain 在各街**作进攻方**（该街 bet/raise）」的 `<街>.<池型>.attack_showdown` 节点。
+    ///
+    /// 与 [`Self::observe_facing`] **独立并存**：facing 采「面对下注的响应」（fold-to-cbet / fold-to-raise
+    /// 桶）；本函数采「攻击方摊牌的牌力构成」（候选① range 极性真信号，§B 频率代理撞车的解药）。池型
+    /// 口径同 observe_facing（翻前 raise 数派生）。
+    ///
+    /// **多街归属**：villain triple-barrel 摊牌 → flop/turn/river 三节点各记一次（**同一 final-board
+    /// 牌力**）。river 节点是候选① 主用（final board = river 攻击时的板，语义精确）；flop/turn 为副
+    /// （final board ≠ 攻击时该街的板，用于将来别的 street 极性度量）。
+    ///
+    /// **选择偏差（务必显式）**：`showdowns` 分母只含「攻击被跟到摊牌」的手——被弃的攻击无亮牌 → §D
+    /// range 是**摊牌子集**、非全攻击 range（`opponent_features_inventory.md` §D 截断偏差）。对候选① 无害：
+    /// FlushTrap 的坚果同花攻击会被 hero 非坚果同花跟到摊牌（正是要度量的 spot）。
+    ///
+    /// **决策路径不调用此函数，也不读它写入的 `attack_showdown`** —— 纯增采集，sim byte-equal。
+    pub fn observe_showdown(&mut self, actions: &[ObservedAction], showdowns: &[ShowdownObs]) {
+        // 池型：翻前 raise 次数（= observe_facing 同口径 `preflop_num_raises`）。
+        let mut pre_raises = 0u32;
+        for a in actions {
+            if a.street == 0 && is_raise_action(a.action) {
+                pre_raises += 1;
+            }
+        }
+        let pot_type = pot_type_name(pre_raises);
+
+        for sd in showdowns {
+            for street in 1u8..=3 {
+                // 该 villain 在本街是否作进攻方（该街有任一 bet/raise）。
+                let attacked = actions
+                    .iter()
+                    .any(|a| a.name == sd.name && a.street == street && is_raise_action(a.action));
+                if attacked {
+                    let node = attack_showdown_node_key(street, pot_type);
+                    self.record_showdown(sd.name, &node, sd);
+                }
+            }
+        }
+    }
+
+    /// 记一次「攻击方摊牌」到 `attack_showdown[node]`（§0.5 原始计数：分母 + 非坚果命中 + 成手直方）。
+    fn record_showdown(&mut self, name: &str, node: &str, sd: &ShowdownObs) {
+        let sc = self
+            .by_name
+            .entry(name.to_string())
+            .or_default()
+            .attack_showdown
+            .entry(node.to_string())
+            .or_default();
+        sc.showdowns += 1;
+        if sd.nonnut {
+            sc.nonnut += 1;
+        }
+        if sd.nonnut_flush {
+            sc.nonnut_flush += 1;
+        }
+        let idx = (sd.made_rank as usize).min(5);
+        sc.by_made_class[idx] += 1;
+    }
+
     /// 据累计画像分类对手。主阈值取自 [`ExploitConfig`]（`min_hands`/`nit_vpip`/`station_vpip`/
     /// `maniac_af`）——默认值与历史硬编码字面量一致（0.16/0.45/3.5）→ 默认行为 byte-equal。
     /// 次级判据（station 的 AF 上限 1.5、maniac/lag 的 vpip-pfr 组合）暂无独立旋钮，保留经验字面量。
@@ -453,6 +615,27 @@ impl OpponentTable {
             shrunk_fold: fc.shrunk_fold_rate(prior.fold, k),
             raw_raise: fc.raw_raise_rate(),
             shrunk_raise: fc.shrunk_raise_rate(prior.raise, k),
+        }
+    }
+
+    /// P0-3 §D：per-node 摊牌攻击读数（原始计数 + 现算非坚果率）。**决策路径不调用此访问器** ——
+    /// 仅供 dump/inspect 与后续 gate（候选① river 极化门重做）。无 field 先验/收缩（§D 无摊牌率先验；
+    /// 接门时按样本再定收缩口径）。
+    pub fn showdown_readout(&self, name: &str, node_id: &str) -> ShowdownReadout {
+        let sc = self
+            .by_name
+            .get(name)
+            .and_then(|s| s.attack_showdown.get(node_id))
+            .cloned()
+            .unwrap_or_default();
+        ShowdownReadout {
+            node_id: node_id.to_string(),
+            showdowns: sc.showdowns,
+            nonnut: sc.nonnut,
+            nonnut_flush: sc.nonnut_flush,
+            raw_nonnut: sc.raw_nonnut_rate(),
+            raw_nonnut_flush: sc.raw_nonnut_flush_rate(),
+            by_made_class: sc.by_made_class,
         }
     }
 

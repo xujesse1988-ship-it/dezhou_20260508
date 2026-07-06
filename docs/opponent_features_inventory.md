@@ -389,7 +389,7 @@ float 门（首个消费轮）SHIPPED 后，尝试对 `post.facing.bluff_raise` 
 | float 频率 | fold-to-cbet | **防守方** | §C fold 桶 | ✅ 已采（same-role，SHIPPED）|
 | **bluff_raise 频率** | **fold-to-raise** | **进攻方被加注** | **§B**（非 §C）| ✅ 已采（`*.facing_raise`）→ same-role 门控 **SHIPPED**（2026-07-06，双向门，读 `facing_raise_node_key`）|
 | **cbet 过度诈唬（srp）** | fold-to-cbet | 防守方 | §C fold 桶 | ✅ 已采（same-role，**SHIPPED**）|
-| **候选① river 极化门（value_raise 降级）** | **摊牌 range 极性** | **进攻方（下注/加注）** | **§D 摊牌**（§B raise 桶仅代理）| ⛔ **REJECTED（第三次，2026-07-06）**——§B raise 代理不跟真极性，见下 |
+| **候选① river 极化门（value_raise 降级）** | **摊牌 range 极性（flush-only）** | **进攻方（下注/加注）** | **§D 摊牌**（§B raise 桶仅代理） | ✅ **§D 已采**（`*.attack_showdown` 的 `nonnut_flush` 桶，2026-07-06 SHIPPED）→ **门控解锁待接线**（读 `attack_showdown_node_key` 的 `raw_nonnut_flush_rate`）；§B raise 代理第三次 REJECT 见下 |
 
 > **bluff_raise 门 SHIPPED（重做 = 上轮 REJECT 的正解）**：上轮门读 fold-to-cbet（跨角色）两靶逐字节
 > 相同 33.8%、无法区分反号 → REJECT；本轮门读 `facing_raise`（same-role）实测 DonkFold 86.7% vs DonkStick
@@ -452,6 +452,76 @@ fold-to-cbet 循环在防守方 re-raise 处 `break` 且开火者不入 facing �
 **解锁**：bluff_raise 门（真杠杆 fold-to-raise）+ 候选① river 极化门现有 same-role 真信号可读
 （`facing_raise_node_key` 查询、照 float same-role 门控），门控接线留后续消费轮；`DonkFold`/`DonkStick`
 造靶留作门控验证载荷。诊断/数据 `scratchpad/p03_fold_to_raise/DIAGNOSIS.md` + `heuristic9_design.md` §6。
+
+---
+
+## 落地记录：P0-3 §D 摊牌采集（villain 攻击方摊牌牌力构成）**SHIPPED**（2026-07-06）
+
+候选① 第三次 REJECT 处方 #1 落地：**§D 摊牌采集**——记 villain 河牌**攻击时摊牌牌力构成**（攻击
+range 含非坚果同花吗），唯一能分开 FlushTrap（纯坚果攻击）与 Tag（混合价值攻击）。REJECT 坐实的 §B
+频率代理**撞车**（`river.srp.facing_raise` FlushTrap 44.9% ≈ Tag 45.2%）§D 解得开。**本轮只采集、不接门**
+（候选① 门重做用 §D 是后续轮）。纯增采集、**决策路径不读 → sim byte-equal**（Phase-1 纪律，`policy.rs`
+零改动）。照 fold-to-raise（`fac17a8`）范式。
+
+**采什么（`src/heuristic/opponent.rs`）**：新 `observe_showdown(actions, showdowns)` —— 为每个亮牌 villain，
+把其 **final board** 成手牌力归到「该 villain 在各街作**进攻方**（bet/raise）」的 `<街>.<池型>.attack_showdown`
+节点。存原始计数（§0.5 铁律）`ShowdownCounts{showdowns, nonnut, nonnut_flush, by_made_class[6]}`，非坚果率
+查询时现算。
+
+- **新字段（非复用 facing）**：值类型 `ShowdownCounts` ≠ `FacingCounts` → 新 `OppStats.attack_showdown:
+  BTreeMap<String,ShowdownCounts>`，`#[serde(default, skip_serializing_if)]` → 旧 `h9_live_prof*.json` 逐字节
+  兼容。新 `pub attack_showdown_node_key(street,pot_type)` = `facing_node_key` 的 `.attack_showdown` 兄弟
+  （§G 扩展口子，采集/未来 gate 共用同一构造器）。
+- **前缀碰撞：天然无**（比 fold-to-raise 更干净）——§D key 存**独立 map** + **独立 readout**
+  （`showdown_readout`）→ **不经 `node_field_prior`**（§D 无摊牌率先验，全原始计数 + 现算率）→ 结构上无从
+  碰撞，故 **`node_field_prior` 零改动**（fold-to-raise 共用 `facing` map 才需 `ends_with(".facing_raise")`
+  前置分支）。
+- **两档非坚果度（关键，§D/§G 交叉）**：`nonnut`（`monster_non_nut`，含同花+顺子）**被 FlushTrap 成顺非成花
+  板的非坚果顺子 value_raise 污染**（FlushTrap 仅**成花板**纯坚果建战、成顺板打法同 Tag）；`nonnut_flush`
+  （**flush-only**）才是候选① 真杠杆（照 REJECT 处方 #3「必须 flush-only，顺子降级 -EV」）——FlushTrap 从不
+  攻击非坚果同花 → flush-only ≈0。
+- **enrich = 真正工作量**：`opponent.rs` **不依赖 `features`/`eval`**——sim 用 `features` 现算
+  `made_rank`/`nonnut`/`nonnut_flush` 喂 `ShowdownObs`。摊牌判定：终局 board 满 5 张 且 ≥2 座保有
+  `hole_cards`（弃牌者 apply 时 `hole_cards`→None）。**多街归属**：triple-barrel 摊牌 → flop/turn/river 三
+  节点各记一次（同 final-board 牌力；river 主用、flop/turn 副）。
+- **可观测**：`heuristic9_sim --opp-stats` 新增 §D per-node dump（`showdowns/nonnut(nn%)/nnflush(nnf%)/by_made`）
+  + **river `*.attack_showdown` 跨对手聚合行**（`nonnut`+`nnflush`）作方向自校验载荷（2-max 聚合含
+  hero(p0)+villain(p1)，纯 villain 信号看 per-opponent p1 行）。
+
+**选择偏差（显式）**：`showdowns` 分母只含「攻击被跟到摊牌」的手——被弃的攻击无亮牌 → §D range 是
+**摊牌子集**、非全攻击 range（§D 截断偏差）。对候选① 无害：FlushTrap 坚果同花攻击会被 hero 非坚果同花
+跟到摊牌（正是要度量的 spot）。
+
+**验证门（全过）**：
+- **自校验（造靶铁证；FlushTrap vs Tag 隔离攻击极性，2-max villain=p1，20000 手 seed 7）**：FlushTrap
+  `river.srp.attack_showdown` **flush-only 非坚果率 0.0%**（0/142；river.limped 0/72）≪ Tag **6.3%**（12/189；
+  river.limped 20.3% = 15/74）。**这正是 §B raise 频率代理做不到的**（44.9%≈45.2% 撞车）→ §D 处方兑现铁证。
+  `nonnut`（含顺子）被污染（FlushTrap 11.3% vs Tag 14.8%，弱分化）→ 印证 flush-only 才是净信号。
+- **byte-equal**：基线（HEAD=7646c2d）vs 改动默认输出（无 `--opp-stats`）**0/30 diff**（field
+  {mixed,flushtrap,tag,3bpfold,donk_fold} × seats {2,6,9} × exploit {ON,OFF}，--hands 4000 --seed 7）；
+  `policy.rs` 零改动。
+- 单测 `tests/heuristic_p0_3_facing.rs` 新增 6（§D counts/actor、direction、flush-only 隔离顺子、
+  key/no-field-prior、multistreet、backward-compat）→ 18 全绿；`heuristic9_trace`(10) 绿；fmt/clippy 绿。
+  **未跑全量 `cargo test`**（遵约束）。
+
+**解锁**：候选① river 极化门重做——现可读 `river.<池型>.attack_showdown` 的 **flush-only 摊牌极性**
+（`raw_nonnut_flush_rate`）门控（REJECT 处方 #3 scope 订正：真杠杆 = 领打超池尺寸 + flush-only），门控接线
+留后续消费轮。诊断/数据 `scratchpad/p03_showdown_d/DIAGNOSIS.md` + `heuristic9_design.md` §6。
+
+### live 接线入口（后续轮，本轮不做）：`hand_result.shown_cards` schema
+
+live 侧 §D 采集的**唯一新数据源** = `hand_result.shown_cards`，driver 当前**未解析**（本轮不改 driver）：
+
+- **schema**：逐座底牌 map，key = 座位号字符串、value = 两张牌串数组，如
+  `{"0":["Td","5d"],"2":["8c","9d"]}`。
+- **覆盖**：仅摊牌且未 muck 才有——850 手样本中 **262 手**（≈31%，所有摊牌手）都带 `shown_cards`（§0.5 底账
+  「摊牌手牌 ✅ ~34% 手」的实测切片）。**截断偏差同 sim**：只有到摊牌亮牌的攻击有标签。
+- **final board**：`community_cards.cards`（§0.5 底账已采）→ 河牌 5 张。
+- **接线口径（复用 sim enrich，零采集侧改动）**：driver observe 路径解析 `shown_cards` 得逐座 hole → 与
+  `community_cards.cards` 一起用 `features` 现算 `made_rank`/`nonnut`/`nonnut_flush` → 构 `ShowdownObs` →
+  喂 `OpponentTable::observe_showdown`（与 sim `play_hand` enrich 同一函数、同一口径）。名字从
+  `hand_result.actions`+`table_state` 补（§1 权威源），attack 街集合从动作序列重建（`observe_showdown` 内部
+  已做）。
 
 ---
 
