@@ -421,6 +421,45 @@ per-opponent 河牌加注极性统计门控），非默认改动。引擎代码�
 矩阵 byte-equal 复核通过）；`FlushTrap` 靶 + 坚果度特征 + 单测**保留**为该剥削项的将来验证夹具
 （follow `0bfea7a` Limper / PairedTrap 先例）。
 
+### Phase C 第二轮候选②（3bp c-bet 频率）：跨靶稳健性复核 → **CONFIRMED-ROBUST（无引擎改动）**（2026-07-06）
+
+round-1 的 `cbet_bluff.3bp` 默认 **0.30/0.20**（`d84cc35`）只在**单一** `WideOpener`（翻后粘站）靶上
+验过。本轮不重扫频率（round-1 已做透、已探单调至 0），而是做**诊断驱动的跨靶稳健性复核**：float
+先例（round-1 二次驳回）证明 3bp 空气决策的最优频率会**随对手翻后弃率反号**（wideopen→float 0.0；
+3bettor→float 1.0，且 exploit 无关）。0.30/0.20 现在是 shipped 默认，其立论「3bet 池 fold-equity
+结构性低」只有在 3bet-pot caller 粘站时才成立——须验它对**翻后爱弃**的 caller 是否也成立。
+
+**造靶（保留，`--field 3bpfold`）**：新增 `ThreebetFolder` 对手原型——翻前**逐字节共享 `WideOpener`
+分支**（宽开 + 被 3bet 后跟，喂 hero 作 3bettor 进翻后、保节点密度），翻后**高弃**（面对 c-bet 仅
+TopPair+ / 好赔率强听牌继续，其余全弃）。翻前共享 → 唯一差异 = 翻后弃率（隔离变量，follow PairedTrap
+「非对子面同 Tag」范式）。不入 mixed pool、默认关、既有 `--field` 逐字节输出不变（byte-equal 复核 8
+配置通过）；0 fallback / 0 重建漂移。`cbet_bluff.3bp` 点火 n=28（LO）/ ~46（HI）/8000，与 WideOpener（33）同量级。
+
+**跨靶 paired 数据（8000 手, 2-max, --exploit, paired 同 seed；LO=0.30/0.20 vs HI=0.80/0.55，mbb/g）**：
+
+| seed | WideOpener（粘站）LO / HI / Δ | ThreebetFolder（爱弃）LO / HI / Δ | 极端 over-folder（仅两对+跟）Δ |
+|---|---|---|---|
+| 7  | 527.2 / 508.9 / **+18.3** | 650.6 / 659.4 / −8.8 | −18.9 |
+| 11 | 623.3 / 591.2 / **+32.1** | 897.6 / 912.7 / −15.1 | −13.2 |
+| 23 | 636.6 / 627.8 / **+8.8**  | 654.7 / 644.8 / +9.9 | +2.4 |
+| 31 | 463.0 / 439.5 / **+23.5** | 824.8 / 812.6 / +12.2 | +5.6 |
+| 47 | 573.7 / 547.6 / **+26.1** | 686.8 / 678.3 / +8.5 | −8.8 |
+| 均值 | **LO +21.8（5/5 LO 优）** | **−0.66（3 正 2 负 = wash）** | −6.6（2 正 3 负，非显著） |
+
+**结论：CONFIRMED-ROBUST，0.30/0.20 稳健，无引擎默认改动。** 与 float 的**戏剧性显著反号**（+49/+33）
+不同：3bp c-bet 频率**跨对手粘度不反号**——爱弃靶 wash、连人为的极端 over-folder（连顶对都弃、每街）
+也只弱 lean HI 且不过 CI（均值 −6.6，2/5 正）。而 HI（round-1 前的旧默认）在粘站靶被**清晰击败**（5/5，
+LO +21.8）、在爱弃靶仅弱势不显著领先 → HI 被 dominated。机理：3bet-pot caller 的 range 已被翻前跟 3bet
+**封顶为偏强**，翻后 TopPair+/两对+ 命中足够频繁 → 惩罚 hero 的多街空气 barrel，把 fold-equity 顶住；
+一个**真·高弃**的 3bet caller 是自相矛盾的（它会直接在翻前弃掉 3bet）。故 round-1「3bet 池 fold-equity
+结构性低」的立论**跨对手粘度成立**，非单靶过拟合。
+
+引擎默认不动（policy/config 逐字节 = HEAD `0f2f3bd`；`--field 3bpfold` 加入后既有 field byte-equal
+复核通过）。`ThreebetFolder` 靶**保留**为将来 P0-3 per-opponent 翻后 fold 统计落地后、3bp c-bet 频率
+**画像门控**（若届时要对爱弃对手抬频）与 3bp c-bet **尺寸**（P0-2 结构面：现尺寸仍共享 `pick_bet_size`
+层未按节点分槽；本轮判定尺寸最优方向继承与频率相同的对手依赖、须同 P0-3 信号驱动，故推迟）的验证夹具
+（follow `0bfea7a` Limper / PairedTrap / `FlushTrap` 先例）。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街

@@ -15,7 +15,7 @@
 //! 用法：
 //! ```text
 //! heuristic9_sim [--hands N] [--seats K] [--bb 20] [--start-bb 100] [--samples S] [--seed X]
-//!                [--field mixed|nit|station|maniac|tag|random|limpy|pairedtrap|3bp|flushtrap] [--mirror]
+//!                [--field mixed|nit|station|maniac|tag|random|limpy|pairedtrap|3bp|flushtrap|3bpfold] [--mirror]
 //!                [--exploit] [--config cfg.json] [--trace-summary]
 //! ```
 //! `--config` 覆盖 HeuristicConfig（partial JSON，缺字段走默认）——无需重编即可扫旋钮。
@@ -64,6 +64,12 @@ enum Archetype {
     /// 的价值注被更差的牌支付、把漏洞隔离在 re-raise 上）；非成花/成顺板打法同 Tag（不污染
     /// 「正常价值加注」对照）。这是 hero 「成花板非坚果 stack-off」漏洞的测试载荷。
     FlushTrap,
+    /// 3bp c-bet 频率跨靶复核造靶（Phase C 第二轮候选②）：**翻后爱弃**的 3bet 池跟注机。
+    /// 翻前**逐字节同 `WideOpener`**（宽开 + 被 3bet 后跟——喂 hero 作 3bettor 进翻后、保节点密度），
+    /// 翻后**高弃**：面对 c-bet 仅 TopPair+ / 好赔率强听牌继续，其余全弃 → 拉高 hero c-bet 的
+    /// fold-equity。与 `WideOpener`（站式粘跟 = 低 fold-equity）构成 `cbet_bluff.3bp` 频率最优值的
+    /// 对靶：若最优频率随对手翻后弃率反号（如 float 先例），此靶应偏好**高** c-bet 频率。
+    ThreebetFolder,
     Hero, // 仅 mirror 模式
 }
 
@@ -306,7 +312,8 @@ fn baseline_action(
             return safe_action(&legal);
         }
         // WideOpener：3bet 池造靶的「宽开池 + 被再加注后爱跟」一侧。
-        if arch == Archetype::WideOpener {
+        // ThreebetFolder 翻前逐字节共享此分支（唯一差异在翻后弃率，见 postflop 分支）。
+        if arch == Archetype::WideOpener || arch == Archetype::ThreebetFolder {
             let high = state_high(state);
             let only_blinds = high <= state.config().big_blind.0;
             if to_call == 0 {
@@ -424,7 +431,7 @@ fn baseline_action(
             Archetype::Random => return random_action(&legal, state, seat, rng),
             Archetype::Limper => unreachable!("Limper handled above"),
             Archetype::FlushTrap => unreachable!("FlushTrap handled above"),
-            Archetype::WideOpener | Archetype::ThreeBettor => {
+            Archetype::WideOpener | Archetype::ThreeBettor | Archetype::ThreebetFolder => {
                 unreachable!("3bp archetypes handled above")
             }
             Archetype::Hero => (0.55, 0.50, 0.64, 0.15),
@@ -502,6 +509,29 @@ fn baseline_action(
                 Action::Call
             } else {
                 safe_action(&legal)
+            }
+        }
+        Archetype::ThreebetFolder => {
+            // 3bp c-bet 频率跨靶复核：翻后**爱弃**的 3bet 池跟注机（翻前同 WideOpener）。
+            // 面对 hero 的 c-bet 只用顶对+ / 好赔率强听牌继续，其余全弃 → 拉高 fold-equity，
+            // 与 WideOpener 的站式粘跟构成频率最优值对靶（诊断 (a)）。
+            if !facing {
+                // 不主动进攻：仅强成手价值注，其余过牌（被动，不 stab/领打）。
+                if r >= MadeClass::Strong.rank() {
+                    make_bet(0.5, &legal).unwrap_or_else(|| safe_action(&legal))
+                } else {
+                    safe_action(&legal)
+                }
+            } else if r >= MadeClass::Strong.rank() && legal_can_raise(&legal) {
+                // 坚果+：加注（不做纯站，避免 hero 价值注被无脑支付污染 c-bet 频率信号）。
+                make_bet(0.8, &legal).unwrap_or(Action::Call)
+            } else if r >= MadeClass::TopPair.rank()
+                || (dr.has_meaningful_draw() && pot_odds < 0.25)
+            {
+                // 顶对/超对跟；强听牌仅好赔率跟。
+                Action::Call
+            } else {
+                safe_action(&legal) // 空气 / 弱对中对 / 边缘听牌 → 弃（爱弃的核心）
             }
         }
         Archetype::ThreeBettor => {
@@ -1126,6 +1156,10 @@ fn main() {
                 // 的最高密度通道。
                 "wideopen" | "wideopener" => Archetype::WideOpener,
                 "3bettor" | "threebettor" => Archetype::ThreeBettor,
+                // 3bp c-bet 频率跨靶复核造靶（Phase C 第二轮候选②）：全座 ThreebetFolder
+                // ——翻前同 WideOpener（hero 作 3bettor 进翻后）、翻后爱弃。2-max = 最高密度。
+                // 不入 mixed pool（默认关，follow 先例：不动既有 --field 逐字节输出）。
+                "3bpfold" | "threebetfolder" => Archetype::ThreebetFolder,
                 _ => pool[(k - 1) % pool.len()],
             }
         };
