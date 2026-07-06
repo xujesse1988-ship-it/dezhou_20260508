@@ -4,7 +4,9 @@
 //! 自证「采到的计数符合构造序列」「fold-to-cbet 方向 = ThreebetFolder 高 / WideOpener 低」
 //! 「Beta-Binomial 收缩数学正确」「旧 profile（无 facing 字段）仍加载、旧字段不丢」。
 
-use poker::heuristic::opponent::{node_field_prior, FacingCounts, ObservedAction, OpponentTable};
+use poker::heuristic::opponent::{
+    facing_raise_node_key, node_field_prior, FacingCounts, ObservedAction, OpponentTable,
+};
 
 /// 构造一条观测动作（非盲位）。
 fn act<'a>(name: &'a str, street: u8, action: &'a str) -> ObservedAction<'a> {
@@ -231,4 +233,189 @@ fn backward_compat_real_profile_file() {
     // round-trip 不含 facing（现有画像无翻后 facing 数据）。
     let round = t.to_json_string();
     assert!(!round.contains("\"facing\""));
+}
+
+// ===========================================================================
+// P0-3 fold-to-raise 采集扩展（villain 作进攻方被 re-raise，§B；pre.facing_3bet 翻后镜像）
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// 8. fold-to-raise 计数 + actor/时点正确性：开火者（donk-lead 方）被 hero 加注后弃牌
+//    → `flop.srp.facing_raise`；并证 fold-to-cbet 采集互不干扰。
+// ---------------------------------------------------------------------------
+#[test]
+fn flop_fold_to_raise_counts_and_actor() {
+    let mut t = OpponentTable::new();
+    // SRP（hero open, villain call → pot_type=srp, PFA=hero）。
+    // flop：villain donk-lead（开火者）→ hero raise → villain fold（fold-to-raise）。
+    let actions = [
+        act("hero", 0, "raise"),
+        act("villain", 0, "call"),
+        act("villain", 1, "bet"), // villain 领打 = 街内首个 raiser = 开火者/进攻方
+        act("hero", 1, "raise"),  // hero re-raise villain 的 lead
+        act("villain", 1, "fold"), // 开火者面对 re-raise → fold（fold-to-raise 命中）
+    ];
+    observe(&mut t, &actions, &["hero", "villain"]);
+
+    // villain 的 fold-to-raise 命中（进攻方被加注弃牌）。
+    let fr = t.by_name["villain"]
+        .facing
+        .get("flop.srp.facing_raise")
+        .expect("villain 应有 flop.srp.facing_raise");
+    assert_eq!((fr.n, fr.folds, fr.calls, fr.raises), (1, 1, 0, 0));
+    assert_eq!(fr.raw_fold_rate(), Some(1.0));
+
+    // actor 正确性：villain 是**开火者**（进攻方）→ 不入 fold-to-cbet（防守方）节点。
+    assert!(
+        !t.by_name["villain"].facing.contains_key("flop.srp"),
+        "开火者不应进 fold-to-cbet 表"
+    );
+    // hero 是防守方（面对 villain 的 lead）且加注了 → 进既有 fold-to-cbet 节点 raises 桶（未变）。
+    let hero_ftc = t.by_name["hero"]
+        .facing
+        .get("flop.srp")
+        .expect("hero 面对 villain lead 应入 fold-to-cbet 表");
+    assert_eq!((hero_ftc.n, hero_ftc.raises), (1, 1));
+    // hero 不是开火者 → 无 fold-to-raise。
+    assert!(!t.by_name["hero"]
+        .facing
+        .contains_key("flop.srp.facing_raise"));
+}
+
+// ---------------------------------------------------------------------------
+// 9. fold-to-raise 方向自证（DonkFold 型高 / DonkStick 型低）+ 收缩保持方向
+// ---------------------------------------------------------------------------
+#[test]
+fn fold_to_raise_direction_high_vs_low() {
+    let mut t = OpponentTable::new();
+    // "folder"：10 手全部 lead→被加注→弃（高 fold-to-raise，DonkFold 型）。
+    // "sticker"：10 手全部 lead→被加注→跟（低 fold-to-raise，DonkStick 型）。
+    for _ in 0..10 {
+        observe(
+            &mut t,
+            &[
+                act("hero", 0, "raise"),
+                act("folder", 0, "call"),
+                act("folder", 1, "bet"),
+                act("hero", 1, "raise"),
+                act("folder", 1, "fold"),
+            ],
+            &["hero", "folder"],
+        );
+        observe(
+            &mut t,
+            &[
+                act("hero", 0, "raise"),
+                act("sticker", 0, "call"),
+                act("sticker", 1, "bet"),
+                act("hero", 1, "raise"),
+                act("sticker", 1, "call"),
+            ],
+            &["hero", "sticker"],
+        );
+    }
+    let folder = t.by_name["folder"]
+        .facing
+        .get("flop.srp.facing_raise")
+        .unwrap();
+    let sticker = t.by_name["sticker"]
+        .facing
+        .get("flop.srp.facing_raise")
+        .unwrap();
+    assert_eq!(folder.raw_fold_rate(), Some(1.0));
+    assert_eq!(sticker.raw_fold_rate(), Some(0.0));
+    assert!(folder.raw_fold_rate().unwrap() > sticker.raw_fold_rate().unwrap());
+    // 收缩后仍保持方向（n=10, k=20, prior=0.30）。
+    let r_folder = t.node_readout("folder", "flop.srp.facing_raise", 20.0);
+    let r_sticker = t.node_readout("sticker", "flop.srp.facing_raise", 20.0);
+    assert!(r_folder.shrunk_fold > r_sticker.shrunk_fold);
+    assert_eq!(r_folder.n, 10);
+    // 收缩数学：folder (10 folds/10) 向 0.30 收缩 = (10 + 0.30*20)/(10+20) = 16/30 = 0.5333…
+    assert!((r_folder.shrunk_fold - 16.0 / 30.0).abs() < 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// 10. 前缀碰撞铁证：`*.facing_raise` 先验 = 0.30 占位（**不是** fold-to-cbet 的 0.456）
+// ---------------------------------------------------------------------------
+#[test]
+fn facing_raise_prior_no_prefix_collision() {
+    // 专用分支前置 → 不被 starts_with("flop.") 抢先匹配到 0.456。
+    assert!((node_field_prior("flop.srp.facing_raise").fold - 0.30).abs() < 1e-12);
+    assert!((node_field_prior("turn.3bp.facing_raise").fold - 0.30).abs() < 1e-12);
+    assert!((node_field_prior("river.srp.facing_raise").fold - 0.30).abs() < 1e-12);
+    // 对照：基座 fold-to-cbet 节点仍取各自先验（未被扰动）。
+    assert!((node_field_prior("flop.srp").fold - 0.456).abs() < 1e-12);
+    assert!((node_field_prior("turn.srp").fold - 0.456).abs() < 1e-12);
+    assert!((node_field_prior("river.srp").fold - 0.50).abs() < 1e-12);
+    // key 构造器与前缀检测自洽。
+    assert_eq!(facing_raise_node_key(1, "srp"), "flop.srp.facing_raise");
+    assert_eq!(facing_raise_node_key(2, "3bp"), "turn.3bp.facing_raise");
+    assert_eq!(
+        facing_raise_node_key(3, "limped"),
+        "river.limped.facing_raise"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. 止步首次响应：开火者被加注后 re-raise（记 raise 桶）→ 后续 4bet 链不再记
+// ---------------------------------------------------------------------------
+#[test]
+fn fold_to_raise_stops_at_first_response() {
+    let mut t = OpponentTable::new();
+    let actions = [
+        act("hero", 0, "raise"),
+        act("villain", 0, "call"),
+        act("villain", 1, "bet"),   // villain 开火（raises=1）
+        act("hero", 1, "raise"),    // hero re-raise（raises=2）
+        act("villain", 1, "raise"), // 开火者面对 re-raise 的**首次响应** = 3bet-back（记 raise）
+        act("hero", 1, "raise"),    // hero 4bet（raises=4）
+        act("villain", 1, "fold"),  // 开火者后续弃 → **不再记**（止步首次响应）
+    ];
+    observe(&mut t, &actions, &["hero", "villain"]);
+    let fr = t.by_name["villain"]
+        .facing
+        .get("flop.srp.facing_raise")
+        .unwrap();
+    // 只记首次响应（re-raise），后续 fold 不入 → n=1, raises=1, folds=0。
+    assert_eq!((fr.n, fr.folds, fr.calls, fr.raises), (1, 0, 0, 1));
+}
+
+// ---------------------------------------------------------------------------
+// 12. 后向兼容：含 facing_raise key 的 profile 反序列化 + round-trip（无新结构字段，
+//     复用既有 facing BTreeMap → serde 逐字节兼容）
+// ---------------------------------------------------------------------------
+#[test]
+fn backward_compat_facing_raise_key_roundtrip() {
+    // 旧 profile（无 facing）仍加载（新增采集不加结构字段）。
+    let old = r#"{"by_name":{"A":{"hands":10,"vpip_opp":5,"vpip_cnt":3,"pfr_opp":5,"pfr_cnt":2,"aggr_actions":4,"call_actions":3}}}"#;
+    let t_old = OpponentTable::from_json_str(old);
+    assert!(t_old.by_name["A"].facing.is_empty());
+
+    // 含 fold-to-cbet + fold-to-raise 双节点的 profile 反序列化。
+    let json = r#"{"by_name":{"villain":{"hands":50,"vpip_opp":30,"vpip_cnt":15,"pfr_opp":30,"pfr_cnt":10,"aggr_actions":20,"call_actions":15,"facing":{"flop.srp":{"n":10,"folds":4,"calls":5,"raises":1},"flop.srp.facing_raise":{"n":6,"folds":5,"calls":0,"raises":1}}}}}"#;
+    let t = OpponentTable::from_json_str(json);
+    let fr = t.by_name["villain"]
+        .facing
+        .get("flop.srp.facing_raise")
+        .expect("facing_raise 节点应反序列化");
+    assert_eq!((fr.n, fr.folds, fr.calls, fr.raises), (6, 5, 0, 1));
+    // fold-to-cbet 节点并存不受影响。
+    let ftc = t.by_name["villain"].facing.get("flop.srp").unwrap();
+    assert_eq!((ftc.n, ftc.folds, ftc.calls, ftc.raises), (10, 4, 5, 1));
+    // node_readout 用 facing_raise 先验（0.30），不误用 0.456。
+    let r = t.node_readout("villain", "flop.srp.facing_raise", 20.0);
+    assert_eq!(r.n, 6);
+    assert!((r.raw_fold.unwrap() - 5.0 / 6.0).abs() < 1e-9);
+    // round-trip 保留 facing_raise key。
+    let round = t.to_json_string();
+    assert!(round.contains("flop.srp.facing_raise"));
+    let t2 = OpponentTable::from_json_str(&round);
+    assert_eq!(
+        t2.by_name["villain"]
+            .facing
+            .get("flop.srp.facing_raise")
+            .unwrap()
+            .folds,
+        5
+    );
 }

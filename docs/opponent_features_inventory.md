@@ -382,10 +382,54 @@ float 门（首个消费轮）SHIPPED 后，尝试对 `post.facing.bluff_raise` 
 - 造靶夹具 `DonkFold`/`DonkStick` 保留待 fold-to-raise 采集落地。诊断/数据见
   `scratchpad/p03_bluff_raise/DIAGNOSIS.md` + `docs/heuristic9_design.md` §6。
 
-**信号归属订正表**（覆盖 DESIGN.md §2 旧表 bluff_raise 行）：
+**信号归属订正表**（覆盖 DESIGN.md §2 旧表 bluff_raise 行；采集侧现状随 fold-to-raise 落地更新）：
 
 | 消费门 | 真杠杆 | villain 角色 | 清单归属 | 采集侧现状 |
 |---|---|---|---|---|
 | float 频率 | fold-to-cbet | **防守方** | §C fold 桶 | ✅ 已采（same-role，SHIPPED）|
-| **bluff_raise 频率** | **fold-to-raise** | **进攻方被加注** | **§B**（非 §C）| ❌ 未采（break 掉）→ 门无从读，REJECT |
+| **bluff_raise 频率** | **fold-to-raise** | **进攻方被加注** | **§B**（非 §C）| ✅ **已采**（`*.facing_raise`，same-role，2026-07-06）→ 门控解锁，待接线 |
 | cbet 过度诈唬 | fold-to-cbet | 防守方 | §C fold 桶 | ✅ 已采（same-role，留后续轮）|
+
+---
+
+## 落地记录：P0-3 采集侧扩展 fold-to-raise（villain 进攻方被加注）SHIPPED（2026-07-06）
+
+bluff_raise REJECT 记录里的「正确修法」落地：**先扩采集 fold-to-raise，再门控**。本轮 = 采集，
+门控留后续消费轮。纯增采集、**决策路径不读 → sim byte-equal**（Phase-1 纪律，引擎决策零改动）。
+
+**采什么（`src/heuristic/opponent.rs`）**：`observe_facing` 新增翻后 fold-to-raise 循环——把翻前
+`pre.facing_3bet`（opener 面对站住 3bet 的首次响应）**镜像到翻后每街**：街内**开火者**（首个 raiser =
+领打/c-bet 方，§B「villain 作进攻方」）面对站住 re-raise（街内恰好 2 个加注）的**首次响应**。既有
+fold-to-cbet 循环在防守方 re-raise 处 `break` 且开火者不入 facing → fold-to-raise 从未进表；本轮独立
+循环补之（不改既有循环 → fold-to-cbet 采集逐字节不变）。
+
+- **节点 key = `<街>.<池型>.facing_raise`**（`flop.srp.facing_raise` / `turn.3bp.facing_raise` / …）。
+  新 `pub facing_raise_node_key(street, pot_type)` = `facing_node_key` 的 `.facing_raise` 兄弟（§G 扩展
+  口子：复用点分基座 + 缀语义后缀），与采集共用**同一构造器**（照 float 门用 `facing_node_key` 先例，
+  未来 hero 侧 bluff_raise 门直接复用）。存入**同一** `facing: BTreeMap`（新 key，**不加结构字段**）→
+  旧 `h9_live_prof*.json` serde 逐字节兼容（`facing` 本就 `#[serde(default, skip_serializing_if)]`）。
+- **`node_field_prior` 前缀碰撞（必踩陷阱，已处理）**：`flop.srp.facing_raise` 以 `flop.` 起始 → 会被
+  `starts_with("flop.")` 抢先匹配到 fold-to-cbet 先验 0.456（**错**，那是防守方 fold）。加
+  `ends_with(".facing_raise")` **专用前置分支**（照 §H/`node_field_prior` doc「长/专用先判」）。fold-to-raise
+  **无实测**（`opponent_feature_weigh.py` 无对应 replay）→ 保守占位 **fold=0.30**（进攻方被加注弃牌率
+  通常低于面对首注，因下注方有范围；**占位待实测校准**，别照抄 0.456）；raise 先验沿用 0.05。
+- **收缩 + 极性**：复用 `shrunk_fold_rate`（Beta-Binomial）；`raises` 桶 = 开火者被加注后 re-raise
+  （4bet/3bet-back）= 更高极性信号，一并采/dump。**止步首次响应**（`recorded` 守卫，照 pre.facing_3bet）。
+- **可观测**：`heuristic9_sim --opp-stats` per-node dump 已自动含 `*.facing_raise`（读 `facing.keys()`），
+  另加 **fold-to-raise 跨对手聚合行**（`n/folds/calls/raises/raw_fold%`）作方向自校验载荷。
+
+**验证门（全过）**：
+- **byte-equal**：基线（commit 4893739）vs 改动默认输出（无 `--opp-stats`）**0/15 diff**
+  （field {mixed,3bpfold,flushtrap,3bp,donk_fold} × seats {2,6,9}，--exploit --hands 4000 --seed 7）；
+  pot/to_call 漂移 0.000%、fallback 0。`policy.rs` 零改动（grep 证只查 `facing_node_key`=基座节点）。
+- **采集方向（造靶铁证；无 weigh.py 参照 → DonkFold/DonkStick 隔离 fold-to-raise）**：两靶防守方
+  fold-to-cbet + donk-lead 规则逐字节相同，唯一分叉 = 自己 lead 被加注后响应。8000 手 seed7：
+  DonkFold `flop.srp.facing_raise` fold **93.5%**（聚合 86.7%）≫ DonkStick **0.0%**（聚合 0.0%）；
+  **n 两靶相同（flop.srp 154）**——同规则 → 机会数相同，只响应不同（folds 320 vs calls 449）= 隔离变量。
+- 单测 `tests/heuristic_p0_3_facing.rs` 新增 5（counts/actor、direction、prior-no-collision、
+  stops-at-first、backward-compat-roundtrip）→ 12 全绿；`heuristic9_trace`(10) 绿；fmt/clippy 绿。
+  **未跑全量 `cargo test`**（遵约束）。
+
+**解锁**：bluff_raise 门（真杠杆 fold-to-raise）+ 候选① river 极化门现有 same-role 真信号可读
+（`facing_raise_node_key` 查询、照 float same-role 门控），门控接线留后续消费轮；`DonkFold`/`DonkStick`
+造靶留作门控验证载荷。诊断/数据 `scratchpad/p03_fold_to_raise/DIAGNOSIS.md` + `heuristic9_design.md` §6。

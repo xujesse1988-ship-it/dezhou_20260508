@@ -551,6 +551,48 @@ hero 持 Air、无有效听牌、**面对 villain 下注**、`can_raise`、非�
 最优），**维持不动、零引擎改动**。造靶 `DonkFold`/`DonkStick` 保留为 fold-to-raise 采集落地后的门控
 验证载荷。诊断全文 `scratchpad/p03_bluff_raise/DIAGNOSIS.md`。
 
+### P0-3 采集侧扩展：fold-to-raise（villain 进攻方被加注）**SHIPPED**（2026-07-06）
+
+bluff_raise 门 REJECT 的「正确修法」落地：**先扩采集 fold-to-raise**（bluff_raise/候选① 的真杠杆），
+门控留后续轮。纯增采集、决策路径不读 → **sim byte-equal**（Phase-1 纪律）。**引擎决策零改动**
+（`policy.rs` 未碰），只动采集（`opponent.rs`）+ dump（`heuristic9_sim.rs`）+ tests + docs。
+
+**采什么**：`observe_facing` 新增翻后 fold-to-raise 循环——把翻前 `pre.facing_3bet`（opener 面对站住
+3bet 的首次响应）**镜像到翻后每街**：街内**开火者**（首个 raiser = 领打/c-bet 方）面对站住的 re-raise
+（街内恰好 2 个加注）的**首次响应**。既有 fold-to-cbet 循环在防守方 re-raise 处 `break` 且开火者本身
+不入 facing → fold-to-raise 从未进表；本轮补的正是这个（**独立循环、独立 key，与 fold-to-cbet 采集
+互不干扰** → fold-to-cbet 逐字节不变）。
+
+**5 设计决策**：
+1. **key** = `<街>.<池型>.facing_raise`（`flop.srp.facing_raise` 等），新 `pub facing_raise_node_key`
+   = `facing_node_key` 的 `.facing_raise` 兄弟（§G 扩展口子，与采集共用同一构造器，未来 hero 侧门复用）。
+   存入**同一** `facing: BTreeMap`（新 key，**不加结构字段**）→ 旧 `h9_live_prof*.json` serde 逐字节兼容。
+2. **前缀碰撞（必踩陷阱）**：`flop.srp.facing_raise` 会被 `starts_with("flop.")` 抢先匹配到 fold-to-cbet
+   先验 0.456（错）→ `node_field_prior` 加 `ends_with(".facing_raise")` **专用前置分支**（照 doc「长/专用
+   先判」）。无实测（weigh.py 无 fold-to-raise replay）→ 保守占位 **0.30**（进攻方被加注弃牌率通常低于
+   面对首注，**占位待实测校准**）。
+3. **收缩**复用 `shrunk_fold_rate`（Beta-Binomial）；`raises` 桶 = 开火者被加注后 re-raise（4bet/3bet-back）
+   = 更高极性信号，一并采/dump。
+4. **止步首次响应**（`recorded` 守卫，照 pre.facing_3bet，不追 4bet/5bet 链）。
+5. **多街** flop/turn/river 各自节点，独立 per-street 循环。
+
+**自校验（造靶方向铁证；无 weigh.py 参照，用 DonkFold/DonkStick 隔离 fold-to-raise）**：
+`--field donk_{fold,stick} --seats 2 --exploit --opp-stats --hands 8000 --seed 7`。两靶防守方
+fold-to-cbet + donk-lead 规则逐字节相同，唯一分叉 = 自己 lead 被加注后响应。读数：
+
+| 靶 | `flop.srp.facing_raise` raw_fold (n) | 聚合 `*.facing_raise` raw_fold (n) |
+|---|---|---|
+| **DonkFold** | **93.5%** (n=154) | **86.7%** (n=369, folds 320) |
+| **DonkStick** | **0.0%** (n=154) | **0.0%** (n=510, calls 449) |
+
+**n 两靶相同（flop.srp 154）**——同 lead+防守规则 → 开火者面对加注机会数相同，只**响应**不同
+（folds 320 vs calls 449）= 正是隔离变量。方向成立 → 采集接对了 actor（进攻方开火者）与时点（面对
+re-raise）。byte-equal：基线 vs 改动默认输出 **0/15 diff**（5 field × 3 seats）。
+
+**解锁**：bluff_raise 门（本清单 §6 REJECT，真杠杆 = fold-to-raise）+ 候选① river 极化门现有真信号可读
+（`facing_raise_node_key` 查询、same-role 门控），门控接线留后续消费轮。`DonkFold`/`DonkStick` 造靶留作
+门控验证载荷。诊断/数据 `scratchpad/p03_fold_to_raise/DIAGNOSIS.md`。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街

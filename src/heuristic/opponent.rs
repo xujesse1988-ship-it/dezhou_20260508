@@ -92,6 +92,26 @@ pub fn facing_node_key(street: u8, pot_type: &str) -> String {
     format!("{}.{}", street_name(street), pot_type)
 }
 
+/// P0-3：翻后 **fold-to-raise** 节点 key —— [`facing_node_key`] 的 `.facing_raise` 兄弟。
+///
+/// 语义分野（务必与 fold-to-cbet 区分）：`<街>.<池型>`（如 `"flop.srp"`）= villain **作防守方**
+/// 首次面对未平注的响应（fold-to-cbet，§C）；本 key `<街>.<池型>.facing_raise`（如
+/// `"flop.srp.facing_raise"`）= villain **作进攻方**（街内首注方/领打方）被防守方 re-raise 后的
+/// 首次响应（fold-to-raise，§B「villain 进攻方极性」）——**独立两轴**（造靶 `DonkFold`/`DonkStick`
+/// 证明可任意解耦，见 `heuristic9_design.md` §6「bluff_raise REJECT」）。它是翻前 `pre.facing_3bet`
+/// 在翻后每街的镜像。
+///
+/// 走 [`facing_node_key`] 的 §G 扩展口子：复用其点分限定符串基座、再缀 `.facing_raise` 语义
+/// 后缀，与采集侧（[`OpponentTable::observe_facing`]）共用**同一构造器** → 未来 hero 侧 bluff_raise
+/// 门查询/采集口径逐字节一致（照 float 门用 `facing_node_key` 的先例）。
+///
+/// **前缀碰撞警示**：本 key 以 `flop.`/`turn.`/`river.` 起始，会被 [`node_field_prior`] 的
+/// `starts_with("flop.")` 抢先匹配到 fold-to-cbet 先验（错）——故该函数为 `.facing_raise` 加了
+/// 专用前置分支（长/专用先判，见其 doc）。
+pub fn facing_raise_node_key(street: u8, pot_type: &str) -> String {
+    format!("{}.facing_raise", facing_node_key(street, pot_type))
+}
+
 /// P0-3 阶段1：per-node 面对下注 fold/raise 率的 **field 先验**（冷启动默认读数）。
 /// 数值取自 `docs/opponent_features_inventory.md`「实测样本称重」7-run 快照：
 /// fold-to-cbet 45.6% / fold-to-3bet 15.1%。turn/river fold 无独立实测 → 占位（消费前须扩测校准）；
@@ -111,6 +131,17 @@ pub fn node_field_prior(node_id: &str) -> NodePrior {
     if node_id == "pre.facing_3bet" {
         NodePrior {
             fold: 0.151,
+            raise: 0.05,
+        }
+    } else if node_id.ends_with(".facing_raise") {
+        // P0-3 fold-to-raise（villain 作**进攻方**被 re-raise 后弃牌，§B）。**专用分支须前置**：
+        // key `flop.srp.facing_raise` 以 `flop.` 起始，若落到下方 `starts_with("flop.")` 会被抢先
+        // 匹配到 fold-to-cbet 先验 0.456（那是**防守方** fold，非 fold-to-raise，错）。照本函数
+        // doc「长/专用前缀先判」机制前置。**无实测**（`opponent_feature_weigh.py` 无 fold-to-raise
+        // replay）→ 保守占位 0.30（进攻方被加注弃牌率通常低于面对首注，因下注方有范围）；
+        // **占位待实测校准**（扩 weigh.py fold-to-raise replay 后订正，别照抄 0.456）。
+        NodePrior {
+            fold: 0.30,
             raise: 0.05,
         }
     } else if node_id.starts_with("flop.") {
@@ -263,10 +294,15 @@ impl OpponentTable {
 
     /// P0-3 阶段1：从有序 `(name, street, action)` 序列重建 facing 上下文，填 `OppStats.facing`。
     ///
-    /// 二值 fold-to-bet 无需 amount/seat：name 在一手内唯一（与上面 `counted_pre` 同键口径），
+    /// 采三类节点：(a) 翻前 fold-to-3bet（`pre.facing_3bet`，§A）；(b) 翻后 fold-to-cbet
+    /// （`<街>.<池型>`，villain 作**防守方**，§C）；(c) 翻后 **fold-to-raise**
+    /// （`<街>.<池型>.facing_raise`，villain 作**进攻方**被 re-raise，§B——(a) 的翻后镜像）。
+    ///
+    /// 二值响应无需 amount/seat：name 在一手内唯一（与上面 `counted_pre` 同键口径），
     /// actions 已按时序排列（sim `obs` 按 play 序、live driver `observe_record` 按动作序）。
-    /// 口径与 `tools/opponent_feature_weigh.py` `replay` 一致（7-run 实测校准的权威口径）。
-    /// **决策路径不调用此函数，也不读它写入的 `facing`** —— 阶段1 零行为变化。
+    /// fold-to-cbet 口径与 `tools/opponent_feature_weigh.py` `replay` 一致（7-run 实测校准的权威
+    /// 口径）；fold-to-raise weigh.py 无对应 replay（改用造靶 `DonkFold`/`DonkStick` 方向自校验）。
+    /// **决策路径不调用此函数，也不读它写入的 `facing`** —— 纯增采集，sim byte-equal。
     fn observe_facing(&mut self, actions: &[ObservedAction]) {
         // 池型：翻前 raise 次数（= `preflop_num_raises` 语义；首个 raiser = opener）。
         let mut pre_raises = 0u32;
@@ -315,6 +351,32 @@ impl OpponentTable {
                 }
                 if is_raise_action(a.action) {
                     opened = true; // 开火者本身在此轮不入 facing（他是进攻方）。
+                }
+            }
+        }
+
+        // 翻后 fold-to-raise（§B「villain 作进攻方被加注」极性）：把翻前 `pre.facing_3bet` 镜像到
+        // 翻后每街——街内**开火者**（首个 raiser = 领打/c-bet 方）面对站住的 re-raise（街内恰好 2 个
+        // 加注）的**首次响应**。上面的 fold-to-cbet 循环在防守方 re-raise 处 `break` 且开火者本身不入
+        // facing → fold-to-raise 从未进表，本循环补之（独立节点 key，与 fold-to-cbet 采集互不干扰）。
+        // 节点 key 经 [`facing_raise_node_key`]（§G 扩展唯一接口，见其 doc）。`raises` 桶 = 开火者被
+        // 加注后 re-raise（4bet/3bet-back）= 更高极性信号。**止步首次响应**（`recorded` 守卫，不追
+        // 4bet/5bet 链，照 `pre.facing_3bet` 同纪律）。
+        for street in 1u8..=3 {
+            let node = facing_raise_node_key(street, pot_type);
+            let mut raises = 0u32;
+            let mut fire_starter: Option<&str> = None;
+            let mut recorded = false;
+            for a in actions.iter().filter(|a| a.street == street) {
+                if raises == 2 && Some(a.name) == fire_starter && !recorded {
+                    self.record_facing(a.name, &node, a.action);
+                    recorded = true;
+                }
+                if is_raise_action(a.action) {
+                    if raises == 0 {
+                        fire_starter = Some(a.name);
+                    }
+                    raises += 1;
                 }
             }
         }

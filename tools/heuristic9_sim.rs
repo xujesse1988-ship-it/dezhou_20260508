@@ -1358,7 +1358,7 @@ fn main() {
                 let rf = r.raw_fold.map(|x| x * 100.0).unwrap_or(f64::NAN);
                 let rr = r.raw_raise.map(|x| x * 100.0).unwrap_or(f64::NAN);
                 println!(
-                    "  {:<16} n={:<5} raw_fold={:5.1}  shrunk_fold={:5.1}  raw_raise={:5.1}  shrunk_raise={:5.1}",
+                    "  {:<20} n={:<5} raw_fold={:5.1}  shrunk_fold={:5.1}  raw_raise={:5.1}  shrunk_raise={:5.1}",
                     r.node_id,
                     r.n,
                     rf,
@@ -1368,5 +1368,27 @@ fn main() {
                 );
             }
         }
+        // P0-3 fold-to-raise（`*.facing_raise`）跨对手聚合 —— DonkFold/DonkStick 方向自校验载荷。
+        // villain 作**进攻方**（donk-lead）被 hero 加注后弃牌倾向，与 fold-to-cbet 独立轴：
+        // 期望 `--field donk_fold` raw_fold 显著高于 `--field donk_stick`（隔离变量 = fold-to-raise）。
+        let (mut fr_n, mut fr_folds, mut fr_calls, mut fr_raises) = (0u32, 0u32, 0u32, 0u32);
+        for st in bot.opponents.by_name.values() {
+            for (node, fc) in st.facing.iter() {
+                if node.ends_with(".facing_raise") {
+                    fr_n += fc.n;
+                    fr_folds += fc.folds;
+                    fr_calls += fc.calls;
+                    fr_raises += fc.raises;
+                }
+            }
+        }
+        let fr_fold_pct = if fr_n > 0 {
+            100.0 * fr_folds as f64 / fr_n as f64
+        } else {
+            f64::NAN
+        };
+        println!(
+            "fold-to-raise 聚合 (*.facing_raise): n={fr_n} folds={fr_folds} calls={fr_calls} raises={fr_raises} raw_fold={fr_fold_pct:.1}%"
+        );
     }
 }
