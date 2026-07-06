@@ -19,11 +19,18 @@ use std::process::ExitCode;
 
 use serde::Deserialize;
 
+use poker::core::Card;
 use poker::heuristic::config::HeuristicConfig;
-use poker::heuristic::opponent::{ObservedAction, OpponentTable};
+use poker::heuristic::features::{made_class, monster_non_nut, nonnut_flush};
+use poker::heuristic::opponent::{ObservedAction, OpponentTable, ShowdownObs};
+use poker::heuristic::view::parse_card;
 use poker::heuristic::{HeuristicBot, Request, Response};
 
 /// observe 信封（driver 每手结束发）。`actions[].street`：0=preflop。
+///
+/// P0-3 §D live 接线：`board`（终局 5 张公共牌）+ `shown_cards`（逐座亮牌底牌 map，key = 座位号
+/// 字符串 → serde 自动解析为 u8）供 [`feed_observe`] 复刻 sim 侧摊牌采集。二者皆 `#[serde(default)]`
+/// → 非摊牌手 / 旧 driver 路径不带该字段时天然为空、无 §D、byte-equal backward-compat。
 #[derive(Deserialize, Default)]
 struct ObserveRecord {
     #[serde(default)]
@@ -34,6 +41,12 @@ struct ObserveRecord {
     names: std::collections::BTreeMap<u8, String>,
     #[serde(default)]
     actions: Vec<ObserveAction>,
+    /// 终局 5 张公共牌串（如 `["8h","2c","Kh","2d","Qd"]`）；不满 5 张 → 不采 §D。
+    #[serde(default)]
+    board: Vec<String>,
+    /// 亮牌底牌 map：座位号 → 两张底牌串（如 `{"0":["Td","5d"],"2":["8c","9d"]}`）。
+    #[serde(default)]
+    shown_cards: std::collections::BTreeMap<u8, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +186,38 @@ fn feed_observe(bot: &mut HeuristicBot, rec: &ObserveRecord) {
         })
         .collect();
     bot.observe_hand(&observed, &names_in_hand);
+
+    // P0-3 §D live 摊牌采集：逐座亮牌底牌 → **final board** 成手牌力构成 → observe_showdown。
+    // 与 sim 侧（heuristic9_sim.rs `play_hand` enrich）**逐字段同口径**：同 `features`
+    // （made_class/monster_non_nut/nonnut_flush）、同 final board、同 nut-ness 定义 → live/sim 画像一致。
+    // 门槛：shown_cards 非空 且 board 解析满 5 张（不满 → 非摊牌手 / 中途结束，跳过，无 §D）。
+    // observe_showdown 内部按每街 attack（bet/raise）归属 + 只记攻击方 → 非攻击者/hero 不误采。
+    if !rec.shown_cards.is_empty() && rec.board.len() == 5 {
+        let board: Vec<Card> = rec.board.iter().filter_map(|s| parse_card(s)).collect();
+        if board.len() == 5 {
+            let showdowns: Vec<ShowdownObs> = rec
+                .shown_cards
+                .iter()
+                .filter_map(|(seat, cards)| {
+                    // 座位名从本手 names 取（与 observed 动作同源 → observe_showdown 内 name 匹配一致）。
+                    let name = rec.names.get(seat)?;
+                    if cards.len() != 2 {
+                        return None;
+                    }
+                    let hole = [parse_card(&cards[0])?, parse_card(&cards[1])?];
+                    Some(ShowdownObs {
+                        name,
+                        made_rank: made_class(hole, &board).rank(),
+                        nonnut: monster_non_nut(hole, &board),
+                        nonnut_flush: nonnut_flush(hole, &board),
+                    })
+                })
+                .collect();
+            if !showdowns.is_empty() {
+                bot.opponents.observe_showdown(&observed, &showdowns);
+            }
+        }
+    }
 }
 
 fn run() -> Result<(), String> {

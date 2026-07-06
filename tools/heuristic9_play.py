@@ -303,7 +303,7 @@ class HandState:
             req["names"] = {str(k): v for k, v in self.names.items()}
         return req
 
-    def observe_record(self, result_actions=None):
+    def observe_record(self, result_actions=None, shown_cards=None):
         """构对手画像 observe 载荷。
 
         动作源优先用 `hand_result.actions`（`result_actions`）——它是服务端**权威完整**动作数组，
@@ -315,6 +315,13 @@ class HandState:
         `names`/`button_seat`/`num_seats` 仍用本手累积（seat→name 已由 player_action/your_turn/
         table_state 覆盖：被漏的末动作的座，其早前动作在流里、name 必已知）。advisor 侧二值
         fold-to-bet 不用 amount，故此处不带。街字符串→int 走 _street_idx，与 player_action 路径同。
+
+        P0-3 §D 摊牌采集（`docs/opponent_features_inventory.md` §D）：
+        - `board` = 本手终局公共牌（`self.board`，由 community_cards 事件累积，含 all-in 后 runout 补齐）；
+          advisor 侧只在满 5 张时采 §D。
+        - `shown_cards`（可选）= `hand_result.shown_cards`（逐座亮牌底牌 map，仅摊牌未 muck 手才有）。
+          非空才带该字段——非摊牌手 / 旧路径不带 → advisor 天然无 §D、byte-equal backward-compat。
+        advisor（`heuristic9_advisor.rs` feed_observe）复用 sim 侧 `features` 逐字段同口径分类。
         """
         if result_actions:
             acts = []
@@ -331,13 +338,18 @@ class HandState:
         else:
             acts = [{"seat": a["seat"], "street": _street_idx(st), "action": a["action"]}
                     for a, st in zip(self.actions, self.action_streets)]
-        return {
+        rec = {
             "observe": 1,
             "button_seat": self.button_seat,
             "num_seats": self.num_seats,
             "names": {str(k): v for k, v in self.names.items()},
             "actions": acts,
+            "board": self.board,
         }
+        # P0-3 §D：摊牌手才带 shown_cards（逐座亮牌底牌）；缺失/空（非摊牌手/muck）→ 不带该字段。
+        if shown_cards:
+            rec["shown_cards"] = {str(k): v for k, v in shown_cards.items()}
+        return rec
 
 
 def _street_idx(s):
@@ -648,7 +660,9 @@ class Session:
             try:
                 # 权威完整动作源 = hand_result.actions（含结束手末动作）；缺失时 observe_record
                 # 内部回退累积 player_action 流。见 HandState.observe_record 文档。
-                self.advisor.observe(hand.observe_record(msg.get("actions")))
+                # P0-3 §D：一并传 hand_result.shown_cards（摊牌亮牌底牌），非摊牌手为 None → 不带该字段。
+                self.advisor.observe(hand.observe_record(msg.get("actions"),
+                                                         msg.get("shown_cards")))
             except Exception as e:
                 print(f"  [observe 异常] {e}", file=sys.stderr)
         final = msg.get("final_stacks", {})

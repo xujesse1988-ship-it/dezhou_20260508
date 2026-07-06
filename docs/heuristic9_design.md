@@ -839,6 +839,43 @@ key/no-field-prior、multistreet、backward-compat）→ 18 全绿；`heuristic9
 scope 订正：真杠杆是领打超池尺寸 + flush-only），门控接线留后续消费轮。造靶 FlushTrap/Tag 留作门控验证载荷。
 诊断/数据 `scratchpad/p03_showdown_d/DIAGNOSIS.md`。
 
+### P0-3 §D **live 接线**（`shown_cards` → 生产 attack_showdown）**SHIPPED**（2026-07-06）
+
+上轮（`bad0396`）§D **只在 sim 侧喂**——live 生产的 `h9_live_prof*.json` 里 `attack_showdown` 全空 → 候选①
+门若接 §D 在 live **永不激活**（死码）。本轮把 live 观测管线接上：driver 捕获摊牌底牌 → advisor 用 `features`
+分类坚果度 → 调 `observe_showdown`。**live §D 生产现可用**，候选① 门重做（下一轮）才有意义。**只动 driver +
+advisor observe 路径**——sim（`heuristic9_sim.rs`）、`policy.rs`/任何门、§D 采集结构（`opponent.rs`
+`ShowdownCounts`/`observe_showdown` 签名）**全零改动**，无 pass-through（`bot.opponents` 已 `pub`，直接调）。
+
+**三处接线**：
+1. **driver `observe_record()`（`tools/heuristic9_play.py`）**：observe 载荷增 `board`（= `self.board`，
+   由 `community_cards` 事件累积；关键实测——**`hand_result` 不带 board/community_cards（皆 null）**，且
+   all-in 后 turn/river 经 `community_cards` 事件补齐至 5 张）+ `shown_cards`（= `hand_result.shown_cards`，
+   逐座亮牌底牌 map；**非摊牌手/muck → 不带该字段**）。
+2. **advisor `ObserveRecord`（`tools/heuristic9_advisor.rs`）**：`#[serde(default)] board: Vec<String>` +
+   `#[serde(default)] shown_cards: BTreeMap<u8, Vec<String>>`（serde 自动把字符串座位键 `"2"`→u8）。
+3. **advisor `feed_observe()`**：`observe_hand` 后，`shown_cards` 非空且 `board` 满 5 张 → 每座 `view::parse_card`
+   解析 + **`features::made_class/monster_non_nut/nonnut_flush`（与 sim §D enrich 逐字段同函数、同 final board、
+   同 nut-ness）** 算 `ShowdownObs` → `bot.opponents.observe_showdown(&observed, &showdowns)`。
+
+**离线验证（无网络，全跑通）**：
+- **crafted 端到端**：villain 河牌 bet 亮 `QhJh` on `Kh7h2h5c9d`（非坚果同花）→ `villain river.srp.attack_showdown
+  = {showdowns:1, nonnut:1, nonnut_flush:1, by_made_class[Monster]:1}`；hero（仅 call）不入表 → 攻击方归属 +
+  serde 座位键解析双证。
+- **raw-log replay（金标准，`h9_live_run33b.raw.jsonl`）**：重建 846 手（261 手带 `shown_cards`，30.9%）→
+  **17 名真实对手 attack_showdown 填充**（Sparky 55 摊牌、PaD_AI 37、JoaoOracle 33…），river 聚合 nnflush
+  3.8%(3/80)。**独立 Python 判定**（纯 flush + nut-ness，不复刻引擎）river 攻击方非坚果同花 = **3 手，与 advisor
+  river nnflush 逐一对上**（`allInAmazonia 5d3d`/`PaD_AI 9hQh`/`hero 8hQc`；两手坚果同花正确判 nnf+0）→
+  证 live 分类 == sim 分类、整管线真数据跑通。
+- **decision byte-equal**：HEAD(`bad0396`) vs 改动 advisor，1586 条真实 live Request 同 args → **响应 md5 逐字节
+  相同**（观测路径不碰决策）。
+- **backward-compat**：旧格式 observe（无新字段）→ 无 §D、不 crash、`observe_hand` 照常；`board<5` 守门跳过；
+  旧 `h9_live_prof.json`（44 名）加载 + round-trip 语义无损。
+- 跑 `heuristic_p0_3_facing`(18) / `heuristic9_trace`(10) 全绿；fmt/clippy 绿；debug+release 编译过。**未跑全量
+  `cargo test`**（遵约束）。
+
+诊断/数据 `scratchpad/p03_showdown_d_live/DIAGNOSIS.md`。
+
 **live 接线入口（后续轮，本轮不做）**：live `hand_result.shown_cards` = 逐座底牌 map（如
 `{"0":["Td","5d"],"2":["8c","9d"]}`），850 手中 262 手（所有摊牌手）都有；driver 当前**未解析**。后续轮：
 driver observe 路径解析 `shown_cards` + final board → 用 `features` 现算 `made_rank`/`nonnut`/`nonnut_flush`
