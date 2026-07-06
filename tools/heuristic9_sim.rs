@@ -15,7 +15,7 @@
 //! 用法：
 //! ```text
 //! heuristic9_sim [--hands N] [--seats K] [--bb 20] [--start-bb 100] [--samples S] [--seed X]
-//!                [--field mixed|nit|station|maniac|tag|random|limpy|pairedtrap|3bp] [--mirror]
+//!                [--field mixed|nit|station|maniac|tag|random|limpy|pairedtrap|3bp|flushtrap] [--mirror]
 //!                [--exploit] [--config cfg.json] [--trace-summary]
 //! ```
 //! `--config` 覆盖 HeuristicConfig（partial JSON，缺字段走默认）——无需重编即可扫旋钮。
@@ -23,7 +23,7 @@
 //! `docs/scenario_heuristic_design.md` §6）；默认关，关时输出与历史基线逐字节一致。
 
 use poker::core::{Card, Rank, Suit};
-use poker::heuristic::features::{draws, made_class, MadeClass};
+use poker::heuristic::features::{draws, made_class, monster_non_nut, nonnut_flush, MadeClass};
 use poker::heuristic::view::{GameView, HistAction, Request, ValidActions};
 use poker::heuristic::{EquityEngine, HeuristicBot, HeuristicConfig, ObservedAction};
 use poker::rules::action::{Action, LegalActionSet};
@@ -57,7 +57,23 @@ enum Archetype {
     /// 低频空气混合再加注；被 4bet 后仅顶级牌继续；翻后作为进攻方高频 c-bet（含空气）。
     /// 喂 hero 的 `pre.facing_raise.*.vs_3bet` 与 hero 作为 caller 的 3bet 池。
     ThreeBettor,
+    /// 成花/成顺湿板非坚果 made commit 造靶（Phase C 第二轮，run33 −285BB 复盘）：**松被动
+    /// 入池见多翻牌**（宽跟制造大量到河的成花机会）；成花/成顺板上**仅持坚果同类**（nut flush /
+    /// boat via `monster_non_nut==false`）时才升级下注/加注战（大注 / 池量再加注），把 hero 的
+    /// **非坚果同花/顺子** value_raise 全下钓进 drawing-dead；非坚果同类被动 check/call（让 hero
+    /// 的价值注被更差的牌支付、把漏洞隔离在 re-raise 上）；非成花/成顺板打法同 Tag（不污染
+    /// 「正常价值加注」对照）。这是 hero 「成花板非坚果 stack-off」漏洞的测试载荷。
+    FlushTrap,
     Hero, // 仅 mirror 模式
+}
+
+/// board 是否成花可能（任一花色 ≥3 张）——顺子被压 / 同花在场的判据。
+fn board_flushy(board: &[Card]) -> bool {
+    let mut cnt = [0u8; 4];
+    for c in board {
+        cnt[(c.to_u8() % 4) as usize] += 1;
+    }
+    cnt.iter().any(|&c| c >= 3)
 }
 
 /// board 是否成对（任一 rank 出现 ≥2）。
@@ -322,6 +338,37 @@ fn baseline_action(
             }
             return safe_action(&legal);
         }
+        // FlushTrap：成花板非坚果 stack-off 造靶。松被动入池见多翻牌（宽跟制造到河成花机会）。
+        if arch == Archetype::FlushTrap {
+            let high = state_high(state);
+            let only_blinds = high <= state.config().big_blind.0;
+            if to_call == 0 {
+                // BB check option / 无人下注：过牌见翻牌（便宜），仅顶级牌偶尔小注。
+                if strength >= 0.80 {
+                    if let Some(a) = make_bet(0.10, &legal) {
+                        return a;
+                    }
+                }
+                return safe_action(&legal);
+            }
+            if only_blinds {
+                // first-in / 面对跛入者：极宽跟注跛入见翻牌；仅坚果牌低频 iso。
+                if strength >= 0.85 && legal_can_raise(&legal) && rng.unit() < 0.20 {
+                    if let Some(a) = make_bet(0.12, &legal) {
+                        return a;
+                    }
+                }
+                if strength >= 0.30 && legal.call.is_some() {
+                    return Action::Call;
+                }
+                return safe_action(&legal);
+            }
+            // 面对加注：站式宽跟（见翻牌），几乎不 3bet。
+            if (strength >= 0.42 || pot_odds < 0.30) && legal.call.is_some() {
+                return Action::Call;
+            }
+            return safe_action(&legal);
+        }
         // ThreeBettor：3bet 池造靶的「高频 3bet 单次加注」一侧。
         if arch == Archetype::ThreeBettor {
             let bb_amt = state.config().big_blind.0;
@@ -376,6 +423,7 @@ fn baseline_action(
             Archetype::PairedTrap => (0.52, 0.42, 0.85, 0.0),
             Archetype::Random => return random_action(&legal, state, seat, rng),
             Archetype::Limper => unreachable!("Limper handled above"),
+            Archetype::FlushTrap => unreachable!("FlushTrap handled above"),
             Archetype::WideOpener | Archetype::ThreeBettor => {
                 unreachable!("3bp archetypes handled above")
             }
@@ -525,6 +573,53 @@ fn baseline_action(
                 }
             } else {
                 // 非对子面：直球价值，打法同 Tag（不限深）——确保「非对子面加注战」对照不被污染。
+                if !facing {
+                    if r >= MadeClass::TopPair.rank() {
+                        make_bet(0.6, &legal).unwrap_or_else(|| safe_action(&legal))
+                    } else if dr.has_meaningful_draw() && rng.unit() < 0.6 {
+                        make_bet(0.55, &legal).unwrap_or_else(|| safe_action(&legal))
+                    } else {
+                        safe_action(&legal)
+                    }
+                } else if r >= MadeClass::Strong.rank() && legal_can_raise(&legal) {
+                    make_bet(0.7, &legal).unwrap_or(Action::Call)
+                } else if (r >= MadeClass::MidPair.rank() && pot_odds < 0.4)
+                    || (dr.has_meaningful_draw() && pot_odds < 0.33)
+                {
+                    Action::Call
+                } else {
+                    safe_action(&legal)
+                }
+            }
+        }
+        Archetype::FlushTrap => {
+            let flushy = board_flushy(board);
+            // danger = 成花/成顺板持坚果同类（nut flush / boat，`monster_non_nut==false`）→ 升级
+            // 加注战，把 hero 非坚果同花/顺子 stack-off 钓进 drawing-dead。
+            let danger = flushy && made == MadeClass::Monster && !monster_non_nut(hole, board);
+            if flushy {
+                if danger {
+                    // 升级：能加就池量下注/加注（不管 facing）。
+                    if legal_can_raise(&legal) {
+                        make_bet(1.0, &legal).unwrap_or(Action::Call)
+                    } else if facing {
+                        Action::Call
+                    } else {
+                        safe_action(&legal)
+                    }
+                } else {
+                    // 非坚果同类 / 无同花：被动——让 hero 下注、便宜跟成手（付 hero 价值注）、大注弃。
+                    if !facing {
+                        safe_action(&legal)
+                    } else if (r >= MadeClass::MidPair.rank() && pot_odds < 0.35) || pot_odds < 0.18
+                    {
+                        Action::Call
+                    } else {
+                        safe_action(&legal)
+                    }
+                }
+            } else {
+                // 非成花/成顺板：打法同 Tag（不污染「正常价值加注」对照）。
                 if !facing {
                     if r >= MadeClass::TopPair.rank() {
                         make_bet(0.6, &legal).unwrap_or_else(|| safe_action(&legal))
@@ -756,6 +851,10 @@ struct SimStats {
     collect_trace: bool,
     node_counts: std::collections::BTreeMap<String, u64>,
     legalize_downgrades: u64,
+    /// 造靶度量（仅 collect_trace）：hero 在 `post.facing.*` 节点持**非坚果 Monster**
+    /// （成花/成顺可被压制）的机会数 = FlushTrap 靶的分母 n；其中落 `value_raise`（漏洞点火）的次数。
+    nonnut_facing: u64,
+    nonnut_value_raise: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -818,6 +917,20 @@ fn play_hand(
                     }
                     if t.legalized.is_some() {
                         stats.legalize_downgrades += 1;
+                    }
+                    // 造靶度量：hero 在面对下注节点持非坚果 Monster 的机会 / 其中 value_raise 点火。
+                    let leaf = t.path.last().map(|s| s.as_str()).unwrap_or("");
+                    if leaf.starts_with("post.facing") {
+                        if let Some(h) = state.players()[seat].hole_cards {
+                            let b = state.board();
+                            // 造靶焦点 = 非坚果**同花**面对下注（成花板 stack-off 漏洞的 n 分母）。
+                            if nonnut_flush(h, b) {
+                                stats.nonnut_facing += 1;
+                                if leaf == "post.facing.value_raise" {
+                                    stats.nonnut_value_raise += 1;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -994,6 +1107,10 @@ fn main() {
                 "random" => Archetype::Random,
                 "limpy" => Archetype::Limper,
                 "pairedtrap" | "trap" => Archetype::PairedTrap,
+                // 成花板非坚果 stack-off 造靶（Phase C 第二轮，run33 复盘）：全座 FlushTrap，
+                // hero 高频在成花/成顺板对上「仅坚果建战」的对手。不入 mixed pool（默认关，
+                // follow PairedTrap 先例：不动既有配置逐字节输出）。2-max = 最高密度通道。
+                "flushtrap" | "flush" => Archetype::FlushTrap,
                 // 3bet 池造靶（P1-5）：奇数座宽开跟注机 / 偶数座 3bet 机交替——hero 作为
                 // 3bet 者与被 3bet 者的两条通道都要有。不入 mixed pool（默认关，
                 // follow PairedTrap 先例：不动既有配置输出）。
@@ -1033,6 +1150,8 @@ fn main() {
         collect_trace: trace_summary,
         node_counts: std::collections::BTreeMap::new(),
         legalize_downgrades: 0,
+        nonnut_facing: 0,
+        nonnut_value_raise: 0,
     };
 
     for h in 0..hands {
@@ -1113,6 +1232,10 @@ fn main() {
             "legalize 降级: {} ({:.2}%)",
             stats.legalize_downgrades,
             100.0 * stats.legalize_downgrades as f64 / stats.decisions.max(1) as f64
+        );
+        println!(
+            "非坚果 Monster 面对下注机会 n={} (其中 value_raise 点火 {})",
+            stats.nonnut_facing, stats.nonnut_value_raise
         );
     }
 }

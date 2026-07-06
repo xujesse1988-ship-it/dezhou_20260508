@@ -147,6 +147,137 @@ fn classify_pair(hole: [Card; 2], board: &[Card]) -> MadeClass {
     }
 }
 
+/// 成手坚果度（只读特征，`docs/scenario_heuristic_design.md` P1-3）：hero 的 **Monster**
+/// （同花/顺子）在本板上是否**非坚果**——可被更高同花/顺子压制，或成对/成花板上被葫芦压制。
+///
+/// **消费方**：`heuristic9_sim --field flushtrap` 造靶（villain 仅持坚果同类升级加注战）
+/// 与将来的**剥削层门控**（仅对画像为「河牌极化加注」的对手压制非坚果 stack-off）。
+/// 引擎 policy **不消费**它：Phase C 第二轮实测，把非坚果同花/顺子 value_raise 降级为
+/// 默认改动会退化标准矩阵（对弱/被动/跟注场，非坚果价值加注被更差的牌支付 = +EV，
+/// 见 `docs/heuristic9_design.md` §6 驳回记录 + 实证 hand `1b3328bc`）。
+///
+/// 语义：仅对「同花」「顺子」两类 Monster 判非坚果；葫芦/四条/同花顺/皇家归**坚果**
+/// （返回 false，不降级——避免重蹈 PairedTrap 对成对面非坚果两对限深被驳回的语境陷阱）；
+/// 非 Monster 一律返回 false。board 不足 3 张返回 false。
+pub fn monster_non_nut(hole: [Card; 2], board: &[Card]) -> bool {
+    if board.len() < 3 {
+        return false;
+    }
+    match best_category(hole, board) {
+        HandCategory::Flush => flush_non_nut(hole, board),
+        HandCategory::Straight => straight_non_nut(hole, board),
+        _ => false,
+    }
+}
+
+/// hero 是否成**非坚果同花**（best category = Flush 且可被更高同花压制）——`monster_non_nut`
+/// 窄化到「仅同花」的判据（不含顺子）：sim 实测非坚果顺子在干板对 Tag 风格对手 value_raise
+/// 是强 +EV（更差两对/暗三/更小顺子会跟），压制反漏价值。**消费方同 `monster_non_nut`**
+/// （造靶度量 + 将来剥削层门控；引擎 policy 不消费，见其文档与 §6 驳回记录）。
+pub fn nonnut_flush(hole: [Card; 2], board: &[Card]) -> bool {
+    board.len() >= 3
+        && best_category(hole, board) == HandCategory::Flush
+        && flush_non_nut(hole, board)
+}
+
+/// hero 同花是否非坚果：存在比 hero 最高同花 hole 张更高、且不在 board / 不在 hero 手里的
+/// 同花色牌 → 对手可持更高同花。hero 无该花色 hole 张（board 五张同花）→ 保守判非坚果。
+fn flush_non_nut(hole: [Card; 2], board: &[Card]) -> bool {
+    for suit in 0..4u8 {
+        let board_cnt = board.iter().filter(|c| c.to_u8() % 4 == suit).count();
+        let hole_cnt = hole.iter().filter(|c| c.to_u8() % 4 == suit).count();
+        if board_cnt + hole_cnt < 5 {
+            continue; // 非本花色的成花
+        }
+        let hole_hi = hole
+            .iter()
+            .filter(|c| c.to_u8() % 4 == suit)
+            .map(|c| c.to_u8() / 4)
+            .max();
+        let hero_hi = match hole_hi {
+            Some(h) => h,
+            None => return true, // board 五张同花、hero 无参与 → 非坚果（保守）
+        };
+        let on_board = |r: u8| {
+            board
+                .iter()
+                .any(|c| c.to_u8() % 4 == suit && c.to_u8() / 4 == r)
+        };
+        let in_hole = |r: u8| {
+            hole.iter()
+                .any(|c| c.to_u8() % 4 == suit && c.to_u8() / 4 == r)
+        };
+        for r in (hero_hi + 1)..13u8 {
+            if !on_board(r) && !in_hole(r) {
+                return true; // 更高同花可能存在 → 非坚果
+            }
+        }
+        return false; // hero 持有效坚果同花（含 board 已含更高张的情形）
+    }
+    false
+}
+
+/// hero 顺子是否非坚果：monotone（可成花）/ 成对（可成葫芦）板一律非坚果；否则比较
+/// board-only 可支撑的最高顺子 top（对手补 ≤2 张）与 hero 实际顺子 top，对手更高 → 非坚果。
+fn straight_non_nut(hole: [Card; 2], board: &[Card]) -> bool {
+    let mut suit_cnt = [0u8; 4];
+    let mut rank_cnt = [0u8; 13];
+    for c in board {
+        suit_cnt[(c.to_u8() % 4) as usize] += 1;
+        rank_cnt[(c.to_u8() / 4) as usize] += 1;
+    }
+    if suit_cnt.iter().any(|&c| c >= 3) || rank_cnt.iter().any(|&c| c >= 2) {
+        return true; // 成花板 / 成对板：顺子被 flush / boat 压
+    }
+    let mut board_present = [false; 13];
+    for c in board {
+        board_present[(c.to_u8() / 4) as usize] = true;
+    }
+    let mut all_present = board_present;
+    for c in hole.iter() {
+        all_present[(c.to_u8() / 4) as usize] = true;
+    }
+    match (
+        highest_straight_top(&all_present),
+        highest_straight_top_with_help(&board_present, 2),
+    ) {
+        (Some(hero_top), Some(opp_top)) => opp_top > hero_top,
+        _ => false,
+    }
+}
+
+/// 给定 rank-present 集合里的最高顺子 top（rank index；wheel A2345 → top=3=Five）。
+fn highest_straight_top(present: &[bool; 13]) -> Option<u8> {
+    for t in (4..13u8).rev() {
+        if (0..5).all(|k| present[(t - k) as usize]) {
+            return Some(t);
+        }
+    }
+    if present[12] && present[0] && present[1] && present[2] && present[3] {
+        return Some(3); // wheel
+    }
+    None
+}
+
+/// 对手能补 `help` 张（≤2）时可成的最高顺子 top（board 须提供 `5-help` 张连号）。
+fn highest_straight_top_with_help(board_present: &[bool; 13], help: usize) -> Option<u8> {
+    let need = 5 - help;
+    for t in (4..13u8).rev() {
+        let have = (0..5).filter(|k| board_present[(t - k) as usize]).count();
+        if have >= need {
+            return Some(t);
+        }
+    }
+    let wheel = [12usize, 0, 1, 2, 3]
+        .iter()
+        .filter(|&&r| board_present[r])
+        .count();
+    if wheel >= need {
+        return Some(3);
+    }
+    None
+}
+
 fn has_straight(present: &[bool; 13]) -> bool {
     // wheel：A2345 = ranks 12,0,1,2,3。
     if present[12] && present[0] && present[1] && present[2] && present[3] {

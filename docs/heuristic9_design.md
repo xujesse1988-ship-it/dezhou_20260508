@@ -381,6 +381,46 @@ aggregate 0 −EV 跟注 / 0 兜底）单笔最大亏 −7821 chips（−391 BB�
 
 改动仍须 paired 复核（靶场显著向好 + 标准矩阵不退化）+ sim 回归门通过后方 shipped。
 
+### Phase C 第二轮候选①（成花板非坚果 commit）：造靶落地 + 引擎改动**驳回**（2026-07-06）
+
+run33 复盘的头号候选，走完「造靶 → 修 → sim 回归门」闭环后**驳回引擎默认改动**——第三次
+印证 limp K-rag / PairedTrap 的同一教训：**教科书正确（非坚果别 stack-off）≠ 本场 +EV**。
+
+**造靶（保留，`--field flushtrap`）**：新增 `FlushTrap` 对手原型——松被动入池见多翻牌（宽跟
+制造到河成花机会），成花/成顺板上**仅持坚果同类**（nut flush / boat，`monster_non_nut==false`）
+才升级下注/加注战，把 hero 非坚果同花 value_raise 全下钓进 drawing-dead；非坚果同类被动
+check/call（让 hero 价值注被更差的牌支付、把漏洞隔离在 re-raise 上）；非成花/成顺板打法同
+Tag。follow Limper/PairedTrap 先例：不入 mixed pool、默认关、既有 `--field` 逐字节输出不变
+（byte-equal 复核 5 配置通过）。同增只读坚果度特征 `features::monster_non_nut` / `nonnut_flush`
+（+10 单测）与 `--trace-summary` 下的「非坚果同花面对下注」n 计数。
+
+**修复设计（已实现、已 sim 回归、已还原）**：给成手加坚果度判定（同花：hero 是否持该花色
+高于自身最高 hole 张、且不在 board 的牌 → 有则非坚果；顺子：monotone/成对板或有更高顺子
+top → 非坚果）；policy 对**非坚果 Monster** 关 `post.facing.value_raise` 门（降级为
+`odds_call`）+ 关超池尺寸。回归单测确认 `Qc3c` on `6h2s5c8c4c` 由 value_raise→call、
+`Ac3c`（坚果）仍 value_raise。
+
+**回归门数据（驳回依据）**：
+- **靶场（`--field flushtrap` 2-max 200bb，窄化到「仅同花」gate）**：3/3 seed 一致向好
+  **+29.4 / +34.5 / +37.7 mbb/g**——对**河牌极化加注**的对手，压制非坚果同花 stack-off 确实 +EV。
+- **标准矩阵（11 配置，8000 手，`--exploit`）**：**11/11 一致退化、均值 −113.9 mbb/g**
+  （mixed −25~−86、limpy −115~−174、**station −155~−245**，0 fallback / 0 漂移）。对**弱/被动/
+  跟注场**（=我们实际面对的场、也是 live +1600 mbb/g 的来源），hero 非坚果同花的 value_raise
+  与超池是被更差的牌（更小同花/对子/两对）**支付的 +EV 动作**，降级为默认反而漏价值。
+- **归因定位**：value_raise 门单独降级已退化（seed7 mixed/limpy/station −55/−76/−199），超池关闭再叠加。
+- **顺子先被排除**：初版 gate 含顺子时靶场反而 −100~−260——instrument 实测「非坚果顺子 value_raise」
+  在干板对 Tag 风格对手是**强 +EV**（seed23 靶：23 次 value_raise 点火合计净 **+49210 chips**，多为
+  T/J/K 高顺子收更差两对/暗三/小顺子）。故 gate 窄化到「仅成花板同花」，但仍未过标准矩阵门。
+- **漏洞在 sim 极稀疏**（同 PairedTrap）：非坚果同花面对下注每 8000 手仅 n≈2–5、48000 手才 ~15，
+  且 hero 的 equity 模型（成花板过度收紧对手 range → 读 ~1.0）令 hero 无论如何跟到底、
+  value_raise 门只省下 re-raise 增量 → 净收益小、被标准矩阵的漏价值淹没。
+
+**结论**：机理对**河牌极化加注**的对手（真 reg、或本靶）是真 -EV，但对**弱/被动跟注场是 +EV**。
+正确归属 = **剥削层**（仅对画像为「河牌高频极化加注」的对手压制非坚果 stack-off，P0-3
+per-opponent 河牌加注极性统计门控），非默认改动。引擎代码已还原（policy 逐字节回 HEAD、标准
+矩阵 byte-equal 复核通过）；`FlushTrap` 靶 + 坚果度特征 + 单测**保留**为该剥削项的将来验证夹具
+（follow `0bfea7a` Limper / PairedTrap 先例）。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街
