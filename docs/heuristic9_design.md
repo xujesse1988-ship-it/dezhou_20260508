@@ -657,6 +657,66 @@ n 门槛回退 / 节点查询正确即查对偶 flop.srp / 多人池 binding=最
 **范围外（留后续轮）**：srp c-bet **尺寸**按对手粘度分槽（现共享 `pick_bet_size`）；turn/river barrel
 频率独立门（现随 srp 锚同映射）；3bp cbet 门（候选② robust，须新反号证据才动）。
 
+### P0-3 阶段2 第四消费轮（bluff_raise 门，重做）：节点级门控 **SHIPPED**（2026-07-06）
+
+上轮（commit 4893739）对 `post.facing.bluff_raise` 复用 float 机制被 **REJECT**——真杠杆 = villain
+**fold-to-RAISE**（villain 作**进攻方/开火者被加注**，§B），但当时门只能读 fold-to-cbet（villain 作
+**防守方**，`facing_node_key`）= **跨角色代理**，两靶 fold-to-cbet 逐字节相同 33.8%、最优频率却相反 →
+无法区分 → REJECT。commit fac17a8 扩采 fold-to-raise（节点 key `<街>.<池型>.facing_raise`，via
+`facing_raise_node_key`）后，本轮门读**真信号** = **same-role**（杠杆 fold-to-raise，门读 fold-to-raise）
+→ 上轮 REJECT 记录写明的「正确修法」落地。
+
+**现状（门前）**：bluff_raise 频率 = `air_bluff_freq_base(ctx,multiway) × bluff_raise_freq_mult`
+（clamp[0,0.4]），`bluff_raise_freq_mult=0.10` 全局固定。触发 = hero 持 Air、无有效听牌、**面对 villain
+下注**、`can_raise`、非河。
+
+**唯一实质区别 vs float/cbet 门** = binding readout 的节点 key 用 `facing_raise_node_key`（fold-to-raise，
+villain 进攻方被加注）而非 `facing_node_key`（fold-to-cbet，villain 防守方）。这正是上轮跨角色 →
+本轮 same-role 的信号源分野。四函数（`map_fold_to_bluff_raise_mult` / `bluff_raise_binding_readout` /
+`bluff_raise_mult_from_readout` / `bluff_raise_freq_mult_gated`）照 float 四函数写（回退 = 固定
+`bluff_raise_freq_mult`，非 cbet 的 1.0）；gate 插在该叶 `roll = rng.unit()` **之前**、掷点位置绝对不动。
+
+**纪律 A（反号，当前树 058c1f5 亲自复现）**：`bluff_raise_freq_mult`∈{0,2}×paired seed{7,11}×8000 手
+2-max --exploit——DonkFold（高 fold-to-raise）单调↑（+260/+231）、DonkStick（低 fold-to-raise）单调↓
+（−372/−356），4/4 一致。**反号真实**，一个固定乘子只能赢一边。
+
+**纪律 B（代理有效 = 本轮 vs 上轮决定性差异）**：门读 `facing_raise` 与真杠杆 fold-to-raise **同轴**。
+`--opp-stats` 实测 villain(p1) `flop.srp.facing_raise` shrunk_fold：**DonkFold 86.7%（raw 93.8, n=161）
+/ DonkStick 3.3%（raw 0.0, n=161）= 分化 83.4pp**（turn.srp 74.5% / 3.4%），且分化方向与最优频率对齐
+（高 fold-to-raise → 高最优频率）→ **代理有效、能剥削反号**。对照上轮门读 fold-to-cbet **两靶逐字节相同
+33.8%（0 分化，死信号）**——这就是「解耦→同轴」的决定性区别。
+
+**门设计（双向，锚独立标定，`BluffRaiseGateConfig`）**：bluff_raise 默认低频（0.10）、最优频率随
+fold-to-raise 反号 → 门须**双向**（爱弃升频剥削 / 粘站降频止损），乘子范围 `[0.0, 2.0]`（**不套 cbet 上限
+1.0**）。锚 `[fold_lo 0.30→mult_lo 0.0, fold_hi 0.80→mult_hi 2.0]`：DonkStick 3.3%<0.30 → 0.0（下调）；
+DonkFold flop 86.7%>0.80 → 2.0、turn 74.5%→1.78（上调）。低锚 0.30 = fold-to-raise 占位先验 →「典型/
+未分化」villain 落地板 0.0（保守，仅对**明确爱弃** fold>0.30 才升频，照 float 哲学）。**门控全池型**
+（区别于 cbet 仅 srp：fold-to-raise 全池型都采、bluff_raise 无 3bp robust 例外）。冷启动/未知/n<30/
+`node_gated=false` → 回退固定 `bluff_raise_freq_mult`(0.10) = 现默认行为（byte-equal 安全 + 保节点存活）。
+
+**回归门（paired 同 seed，8000 手 --exploit；node-gated=默认 ON vs OFF=node_gated:false=HEAD）**：
+
+| 门 | 结果 |
+|---|---|
+| 靶字段 donk_fold（高 fold-to-raise，应升频）| ON−OFF **3/3 seed，均值 +145.3**（+182/+151/+102）|
+| 靶字段 donk_stick（低 fold-to-raise，应降频）| **2/3 seed 正，均值 +7.6**（+10.8/+16.7/−4.7 噪声内；0.10→0.0 对粘站仅微增）|
+| 标准 11-config（6-max {mixed,limpy,station}×{7,11,23} + 9-max s7 + 2-max s7）| **0/11 超 CI95**（多数 Δ=0.0，facing_raise 标准场稀疏→回退 0.10 门不激活；wash = 预期窄剥削）|
+| exploit 关（field×seats{2,6,9}）vs HEAD `058c1f5` 二进制 | **15/15 逐字节一致** |
+| `node_gated=false`+exploit vs HEAD 二进制 | **12/12 逐字节一致**（回退 = 旧行为）|
+| 深码 400BB exploit-OFF vs HEAD | **4/4 逐字节一致** |
+| 0 fallback / 0 pot\|to_call 漂移（ON gate 活跃路径）| **全配置 0.00% / 0.000%** |
+
+**反号解决证明**：一个固定乘子只能赢一边；node-gated 在两个反号靶都 ≥ OFF——爱弃靶靠**升**频赢
+（+145.3 强）、粘站靶靠**降**频赢（+7.6 微，默认 0.10 已近粘站最优）。上轮 REJECT 的正解落地。
+
+**测试**：`policy.rs` 内 5 新单测（`bluff_raise_gate_tests`：映射单调**双向**+夹取 / 冷启动=固定 0.10（非
+1.0）/ node_gated 关 / n 门槛回退 / **节点查询用 facing_raise key 而非 facing key**（决定性）/ 多人池
+binding=最粘者）；`heuristic9_trace`(10) + `heuristic_p0_3_facing`(12) 全绿；fmt / clippy(`-D warnings`)
+全绿。**未跑全量 cargo test**。诊断/数据 `scratchpad/p03_bluff_raise2/DIAGNOSIS.md`。
+
+**范围外（留后续轮）**：bluff_raise **尺寸**按对手粘度分槽（现共享 `pick_bet_size`）；候选① river 极化门
+（现有 `facing_raise` 真信号可读，同 same-role 机制）；fold-to-raise 先验 0.30 待 weigh.py 实测校准。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街

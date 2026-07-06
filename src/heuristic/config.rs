@@ -459,6 +459,76 @@ impl Default for CbetBluffGateConfig {
     }
 }
 
+/// `post.facing.bluff_raise` 节点级门控参数（P0-3 阶段2 第四消费轮，`docs/heuristic9_design.md` §6）。
+///
+/// bluff_raise = hero 持 Air、无有效听牌、**面对 villain 下注**、`can_raise`、非河时的纯诈唬加注。
+/// **same-role（本轮 vs 上轮 REJECT 的唯一实质差别）**：真杠杆 = villain **fold-to-RAISE**（villain 作
+/// **进攻方/开火者被加注**后弃牌，§B），门读的正是 fold-to-raise
+/// （[`crate::heuristic::opponent::facing_raise_node_key`]`(街, 池型)` = `<街>.<池型>.facing_raise`）→
+/// 与杠杆**同轴**。上轮（commit 4893739）门只能读 fold-to-cbet（villain 作**防守方**，
+/// [`crate::heuristic::opponent::facing_node_key`]）= **跨角色代理**，两靶 fold-to-cbet 逐字节相同
+/// 33.8%、最优频率却相反 → 无法区分 → REJECTED。commit fac17a8 扩采 fold-to-raise 后，门可读真信号。
+///
+/// **双向门（区别于 cbet「只降」）**：默认回退乘子 [`NodesConfig::bluff_raise_freq_mult`]=0.10（低）。
+/// 造靶 sweep（8000 手 2-max）证最优频率随 fold-to-raise **反号**：DonkFold（`flop.srp.facing_raise`
+/// shrunk_fold 86.7%）最优 m≈2.0（高频剥削爱弃对手）、DonkStick（3.3%）最优 m≈0.0（零频止损粘站对手）
+/// → 门须能从 0.10 既**上调**（爱弃）又**下调**（粘站）。故乘子范围 `[mult_lo 0.0, mult_hi 2.0]`
+/// （**不套 cbet 的上限 1.0**）。
+///
+/// **冷启动/未知/小样本安全**：`node_gated=false`、任一对手无名（exploit 关：sim `names` 空 / live
+/// 缺名）、或 binding villain 样本 `n < min_samples` → 回退固定 [`NodesConfig::bluff_raise_freq_mult`]
+/// (0.10) → 保标准矩阵不退、exploit 关逐字节一致（同 float 门结构：回退固定乘子，非 cbet 的 1.0）。
+///
+/// **binding villain**：hero 加注需下注方（及其他活对手）全弃才成 → 取**最粘者**（min shrunk_fold）
+/// 作 binding（同 float/cbet；bluff_raise 尤其需全弃 → min 正确）。**语义注**：`facing_raise` = 该
+/// villain 作**开火者**被加注后的弃牌，最直接相关的是**本手下注方**（开火者）的 stat；遍历活对手取
+/// min 是多人池保守做法（HU 只有下注方一人 → min = 下注方）。
+///
+/// **门控全池型**（区别于 cbet 仅 srp）：fold-to-raise 对所有池型都采、且 bluff_raise 无「3bp robust」
+/// 发现（那是 cbet 的事）→ 全池型同锚，按各自 `<街>.<池型>.facing_raise` 读。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BluffRaiseGateConfig {
+    /// 是否启用节点级门控（默认 true = 校准后新行为）。false → 恒用固定
+    /// [`NodesConfig::bluff_raise_freq_mult`]（= Phase B/C 旧路径，用于 paired 对照与关闭剥削）。
+    pub node_gated: bool,
+    /// 信任 villain fold-to-raise 读数所需的最小 facing 机会数 `n`（binding villain）。低于此 →
+    /// 回退固定乘子。fold-to-raise 节点稀疏（villain 须**开火 + 被加注 + 响应**）→ 标准场多数 villain
+    /// n<30 落回退（= 现固定 0.10）→ 门仅在「爱 donk/lead 进 hero」的窄场激活（预期窄剥削）。
+    pub min_samples: u32,
+    /// fold 率收缩伪计数强度 `k`（Beta-Binomial；与阶段1 dump / float / cbet 门默认一致）。
+    pub shrink_k: f64,
+    /// 单调映射低锚：shrunk_fold ≤ `fold_lo` → 乘子 = `mult_lo`（粘站 → 降频止损）。
+    pub fold_lo: f64,
+    pub mult_lo: f64,
+    /// 单调映射高锚：shrunk_fold ≥ `fold_hi` → 乘子 = `mult_hi`（爱弃 → 升频剥削）；两锚间线性插值。
+    pub fold_hi: f64,
+    pub mult_hi: f64,
+}
+
+impl Default for BluffRaiseGateConfig {
+    fn default() -> Self {
+        // 造靶校准（8000 手 2-max，villain=p1 在 `<街>.<池型>.facing_raise` 的 shrunk_fold；sweep
+        // `bluff_raise_freq_mult` ∈{0,2}×seed{7,11} 复现于当前树）：
+        //   DonkStick（低 fold-to-raise）flop.srp 3.3% / turn.srp 3.4% → 最优 m≈0.0（零频，止损）；
+        //   DonkFold（高 fold-to-raise）flop.srp 86.7% / turn.srp 74.5% → 最优 m≈2.0（高频，剥削）。
+        // 锚 [0.30→0.0, 0.80→2.0]（**双向**，不套 cbet 上限 1.0）：
+        //   DonkStick 3.3%<0.30 → 0.0（下调，vs OFF 0.10 略优）；DonkFold flop 86.7%>0.80 → 2.0、
+        //   turn 74.5%→t≈0.89→1.78（上调，剥削）。低锚 0.30 = fold-to-raise 占位先验（`node_field_prior`）
+        //   → 「典型/未分化」villain 落地板 mult 0.0（保守，仅对**明确爱弃**对手 fold>0.30 才升频，照
+        //   float 门「仅对明确爱弃对手 float」哲学）；n<min_samples 仍走回退固定 0.10 保节点存活+样本通道。
+        BluffRaiseGateConfig {
+            node_gated: true,
+            min_samples: 30,
+            shrink_k: 20.0,
+            fold_lo: 0.30,
+            mult_lo: 0.0,
+            fold_hi: 0.80,
+            mult_hi: 2.0,
+        }
+    }
+}
+
 /// 场景森林节点参数子树（Phase B）。已拆分节点在此分参；未拆分节点沿用
 /// `preflop` / `postflop` 共享层。JSON partial 覆盖照常工作（`serde(default)`）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -494,11 +564,16 @@ pub struct NodesConfig {
     /// `post.unopened.float` 节点级门控（P0-3 阶段2）：按 villain 翻后 fold-to-stab 单调映射
     /// float 频率乘子，取代固定 `float_freq_mult`（冷启动/未知/小样本回退固定乘子）。
     pub float: FloatGateConfig,
-    /// `post.facing.bluff_raise` 频率 = 空气诈唬基础频率 × 此乘子。0.10 = Phase B
-    /// 扫参甜点：0.35→0.20/0.10/0.0 均 10/11 配置正（paired 同 seed），越低越好且
-    /// 0.10 与 0.0 不可分；与 run31 live 遥测一致（n=13，−15.5±6.4 bb/hand 显著亏）。
-    /// 保留 0.10 而非 0：节点存活才能继续攒 live 样本供 Phase C 复评（死节点无数据）。
+    /// `post.facing.bluff_raise` **回退**频率乘子（冷启动/未知/小样本/`bluff_raise_gate.node_gated=false`
+    /// 时用）：bluff_raise 频率 = 空气诈唬基础频率 × 此乘子。0.10 = Phase B 扫参甜点（对 sticky/常见场
+    /// 近最优，sweep 低频侧）。P0-3 阶段2 第四消费轮起，样本足的已知 villain 走 [`BluffRaiseGateConfig`]
+    /// 节点级门控（读 fold-to-raise 真信号）取代此固定乘子；未分化对手仍走此回退保节点存活 + 样本通道。
     pub bluff_raise_freq_mult: f64,
+    /// `post.facing.bluff_raise` 节点级门控（P0-3 阶段2 第四消费轮）：按 binding villain 翻后
+    /// **fold-to-raise**（真杠杆，same-role）单调映射 bluff_raise 频率乘子——**双向**（爱弃升频剥削 /
+    /// 粘站降频止损，区别于 cbet 只降）。冷启动/未知/小样本/`node_gated=false` 回退固定
+    /// `bluff_raise_freq_mult`。上轮跨角色代理（读 fold-to-cbet）被 REJECT，本轮读 fold-to-raise 同轴。
+    pub bluff_raise_gate: BluffRaiseGateConfig,
 }
 
 impl Default for NodesConfig {
@@ -516,6 +591,7 @@ impl Default for NodesConfig {
             float_freq_mult: 0.5,
             float: FloatGateConfig::default(),
             bluff_raise_freq_mult: 0.10,
+            bluff_raise_gate: BluffRaiseGateConfig::default(),
         }
     }
 }

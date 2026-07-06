@@ -13,7 +13,9 @@ use crate::core::Street;
 use crate::heuristic::config::HeuristicConfig;
 use crate::heuristic::equity::{EquityEngine, Rng};
 use crate::heuristic::features::{draws, made_class, texture, MadeClass};
-use crate::heuristic::opponent::{facing_node_key, pot_type_name, ExploitAdjust, OpponentTable};
+use crate::heuristic::opponent::{
+    facing_node_key, facing_raise_node_key, pot_type_name, ExploitAdjust, OpponentTable,
+};
 use crate::heuristic::range::RangeVec;
 use crate::heuristic::range_online::MlRange;
 use crate::heuristic::trace::{DecisionTrace, LegalizeChange};
@@ -890,6 +892,90 @@ fn cbet_bluff_freq_mult(ctx: &NodeCtx, pot: PotType) -> f64 {
     cbet_bluff_mult_from_readout(binding, cg)
 }
 
+// ---------------------------------------------------------------------------
+// P0-3 阶段2 第四消费轮：bluff_raise 节点级门控（**same-role**，真杠杆 = fold-to-raise）。
+// 上轮（4893739）读 fold-to-cbet = 跨角色代理被 REJECT；commit fac17a8 扩采 fold-to-raise 后，
+// 本轮门读 `facing_raise_node_key`（**唯一实质区别** vs float/cbet 的 `facing_node_key`）= 同轴真信号。
+// 造靶实测最优频率随 fold-to-raise **反号**（DonkFold 高弃→高频 / DonkStick 低弃→零频）→ **双向门**
+// （乘子 [0.0, 2.0]，不套 cbet 上限 1.0）。四函数照 float 四函数写（回退 = 固定 `bluff_raise_freq_mult`）。
+// ---------------------------------------------------------------------------
+
+/// fold-to-raise 率 → bluff_raise 频率乘子的单调映射（两锚线性插值，锚**双向独立标定**——爱弃升频
+/// 剥削 / 粘站降频止损，见 [`BluffRaiseGateConfig`] 默认注释）。
+fn map_fold_to_bluff_raise_mult(
+    fold: f64,
+    bg: &crate::heuristic::config::BluffRaiseGateConfig,
+) -> f64 {
+    if bg.fold_hi <= bg.fold_lo {
+        return bg.mult_lo;
+    }
+    let t = ((fold - bg.fold_lo) / (bg.fold_hi - bg.fold_lo)).clamp(0.0, 1.0);
+    bg.mult_lo + t * (bg.mult_hi - bg.mult_lo)
+}
+
+/// binding villain 的节点级 **fold-to-raise** 读数（对偶 `<街>.<池型>.facing_raise` 节点上、面对
+/// hero 加注的**最粘者** min shrunk_fold —— bluff-raise 需下注方全弃，最粘者 binding）。`None` =
+/// 无法门控 → 回退固定 `bluff_raise_freq_mult`：翻前（不应到达）、或任一对手无名（exploit 关：sim
+/// `names` 空 / live 缺名 → 逐字节回退）。
+///
+/// **唯一区别 vs float/cbet 门**：节点 key 用 [`facing_raise_node_key`]（fold-to-raise，villain 作
+/// **进攻方被加注**）而非 [`facing_node_key`]（fold-to-cbet，villain 作**防守方**）——这正是上轮跨角色
+/// REJECT → 本轮 same-role 的信号源分野。与采集侧共用同一构造器（§5.2 单一坐标系）。
+fn bluff_raise_binding_readout(
+    view: &GameView,
+    opp: &OpponentTable,
+    bg: &crate::heuristic::config::BluffRaiseGateConfig,
+) -> Option<(f64, u32)> {
+    let street = match view.street {
+        Street::Flop => 1u8,
+        Street::Turn => 2,
+        Street::River | Street::Showdown => 3, // bluff_raise 决策非河短路，此分支实为 dead（保对称）。
+        Street::Preflop => return None,        // bluff_raise 语境本就翻后；翻前 → 回退。
+    };
+    // ⚠ facing_raise_node_key（fold-to-raise）≠ facing_node_key（fold-to-cbet）：本轮 same-role 关键。
+    let node = facing_raise_node_key(street, pot_type_name(view.preflop_num_raises));
+    let mut binding: Option<(f64, u32)> = None; // (shrunk_fold, n)
+    for s in 0..view.num_seats as usize {
+        if s == view.my_seat as usize || view.folded[s] {
+            continue;
+        }
+        // 有对手无名 → None（exploit 关回退，保 byte-equal）。
+        let name = view.names.get(&(s as u8))?;
+        let r = opp.node_readout(name, &node, bg.shrink_k);
+        binding = Some(match binding {
+            Some(prev) if prev.0 <= r.shrunk_fold => prev, // 保留更小 fold（更粘 = binding）
+            _ => (r.shrunk_fold, r.n),
+        });
+    }
+    binding
+}
+
+/// binding 读数 → bluff_raise 频率乘子（纯核，可单测）：node_gated 关 / 冷启动（`None`）/ binding
+/// 样本 `n < min_samples` → 固定 `bluff_raise_freq_mult`（= 现默认 0.10，保标准矩阵不退、exploit 关
+/// 逐字节一致、节点存活续攒样本）；样本足 → 按 fold-to-raise 单调映射（**双向**：爱弃升频 / 粘站降频）。
+fn bluff_raise_mult_from_readout(
+    binding: Option<(f64, u32)>,
+    nc: &crate::heuristic::config::NodesConfig,
+) -> f64 {
+    let bg = &nc.bluff_raise_gate;
+    if !bg.node_gated {
+        return nc.bluff_raise_freq_mult;
+    }
+    match binding {
+        Some((fold, n)) if n >= bg.min_samples => map_fold_to_bluff_raise_mult(fold, bg),
+        _ => nc.bluff_raise_freq_mult,
+    }
+}
+
+/// `post.facing.bluff_raise` 频率乘子（P0-3 阶段2 第四消费轮，same-role fold-to-raise 门控）：查
+/// binding villain 读数 → 纯核映射。**门控全池型**（各按 `<街>.<池型>.facing_raise` 读，无 3bp robust
+/// 例外——那是 cbet 的事）。冷启动/未知/小样本/`node_gated=false` → 固定 `bluff_raise_freq_mult`。
+fn bluff_raise_freq_mult_gated(ctx: &NodeCtx) -> f64 {
+    let nc = &ctx.cfg.nodes;
+    let binding = bluff_raise_binding_readout(ctx.view, ctx.opp, &nc.bluff_raise_gate);
+    bluff_raise_mult_from_readout(binding, nc)
+}
+
 /// `post.unopened`：翻后本街无人下注（下注 vs 过牌）。价值与 c-bet 按池型分参。
 /// 叶：`post.unopened.value_bet[.srp|.3bp]` / `post.unopened.{commit|semibluff}` /
 /// `post.unopened.cbet_bluff[.srp|.3bp]` / `post.unopened.{float|check}`。
@@ -1016,7 +1102,8 @@ fn post_unopened(ctx: &NodeCtx, pot: PotType, rng: &mut Rng, mut tr: DecisionTra
 fn post_facing_bet(ctx: &NodeCtx, _pot: PotType, rng: &mut Rng, mut tr: DecisionTrace) -> Decision {
     let view = ctx.view;
     let oc = &ctx.cfg.postflop;
-    let nc = &ctx.cfg.nodes;
+    // bluff_raise 频率乘子经 `bluff_raise_freq_mult_gated(ctx)`（内部读 `ctx.cfg.nodes`）→ 本函数
+    // 无需 `nc` 直接绑定。
     let s = post_signals(ctx, &mut tr);
 
     let pot_odds = {
@@ -1109,8 +1196,12 @@ fn post_facing_bet(ctx: &NodeCtx, _pot: PotType, rng: &mut Rng, mut tr: Decision
         && view.valid.can_raise
         && view.street != Street::River
     {
-        let bluff_raise_freq =
-            (air_bluff_freq_base(ctx, s.multiway) * nc.bluff_raise_freq_mult).clamp(0.0, 0.4);
+        // P0-3 阶段2 第四消费轮：bluff_raise 频率乘子按 binding villain 节点级 **fold-to-raise**
+        // （same-role 真杠杆）双向门控（冷启动/未知/小样本回退固定 `bluff_raise_freq_mult`）。掷点仍
+        // 在 gate 之后、位置不变 → RNG 消费序列不变（trace 测试会抓）。
+        let bluff_raise_freq = (air_bluff_freq_base(ctx, s.multiway)
+            * bluff_raise_freq_mult_gated(ctx))
+        .clamp(0.0, 0.4);
         let roll = rng.unit();
         tr.cmp(
             "postflop.bluff_raise_freq",
@@ -1670,5 +1761,238 @@ mod cbet_gate_tests {
         v.folded[3] = true;
         let b2 = cbet_bluff_binding_readout(&v, &opp, &cg).unwrap();
         assert!((cbet_bluff_mult_from_readout(Some(b2), &cg) - 1.0).abs() < 1e-9);
+    }
+}
+
+// ===========================================================================
+// P0-3 阶段2 第四消费轮：bluff_raise 门单测（same-role fold-to-raise）
+// （映射单调双向 / 冷启动=固定 0.10 / node_gated 关 / n 门槛回退 /
+//  **节点查询用 facing_raise key 而非 facing key** = 本轮 vs 上轮 REJECT 的决定性区别）
+// ===========================================================================
+#[cfg(test)]
+mod bluff_raise_gate_tests {
+    use super::{
+        bluff_raise_binding_readout, bluff_raise_mult_from_readout, map_fold_to_bluff_raise_mult,
+    };
+    use crate::heuristic::config::NodesConfig;
+    use crate::heuristic::opponent::{FacingCounts, OpponentTable};
+    use crate::heuristic::view::{GameView, HistAction, Request, ValidActions};
+
+    /// 造一个 flop-SRP 局面（hero 座0 开池被跟 → srp 池、flop）：座4 = 面对 hero 的 villain。
+    /// bluff_raise 读数只需 `preflop_num_raises==1`（srp）+ `street==Flop`（readout 不校验「面对注」）。
+    fn srp_flop_view() -> GameView {
+        let req = Request {
+            hole: vec!["2c".into(), "Kc".into()],
+            board: vec!["8s".into(), "6d".into(), "Td".into()],
+            button_seat: 4,
+            my_seat: 0,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                HistAction {
+                    seat: 1,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 2,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 3,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 4,
+                    action: "raise".into(),
+                    to: Some(40),
+                    street: None,
+                },
+                HistAction {
+                    seat: 5,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 0,
+                    action: "call".into(),
+                    to: None,
+                    street: None,
+                },
+            ],
+            valid: ValidActions {
+                can_check: true,
+                can_call: false,
+                can_raise: true,
+                min_raise: Some(20),
+                max_raise: Some(1960),
+            },
+            stacks: vec![2000, 1416, 1322, 6020, 11891, 1460],
+            names: Default::default(),
+            sb_seat: None,
+            bb_seat: None,
+        };
+        GameView::from_request(&req)
+    }
+
+    fn with_facing(opp: &mut OpponentTable, name: &str, node: &str, n: u32, folds: u32) {
+        opp.by_name
+            .entry(name.to_string())
+            .or_default()
+            .facing
+            .insert(
+                node.to_string(),
+                FacingCounts {
+                    n,
+                    folds,
+                    calls: n - folds,
+                    raises: 0,
+                },
+            );
+    }
+
+    // --- 映射单调**双向** + 端点/夹取（锚 [0.30→0.0, 0.80→2.0]，不套 cbet 上限 1.0） ---
+    #[test]
+    fn bluff_raise_mapping_is_monotone_bidirectional_and_clamped() {
+        let bg = NodesConfig::default().bluff_raise_gate;
+        // 低锚以下（粘站 DonkStick 3.3%）→ mult_lo=0.0（降频止损，vs 回退 0.10 更低）。
+        assert_eq!(map_fold_to_bluff_raise_mult(0.033, &bg), 0.0);
+        assert_eq!(
+            map_fold_to_bluff_raise_mult(0.30, &bg),
+            0.0,
+            "低锚点 = mult_lo"
+        );
+        // 高锚以上（爱弃 DonkFold 86.7%）→ 夹取 mult_hi=2.0（升频剥削，远超回退 0.10）。
+        assert!((map_fold_to_bluff_raise_mult(0.867, &bg) - 2.0).abs() < 1e-9);
+        assert!(
+            (map_fold_to_bluff_raise_mult(0.80, &bg) - 2.0).abs() < 1e-9,
+            "高锚点 = mult_hi"
+        );
+        // DonkFold turn 74.5% → t=(0.745-0.30)/0.50=0.89 → 1.78（升频，未夹顶）。
+        assert!((map_fold_to_bluff_raise_mult(0.745, &bg) - 1.78).abs() < 1e-6);
+        // 中点 0.55 → t=0.5 → 1.0（跨越回退 0.10，证双向可上调）。
+        assert!((map_fold_to_bluff_raise_mult(0.55, &bg) - 1.0).abs() < 1e-6);
+        // 严格单调递增（fold-to-raise 越高 → 乘子越高 → 频率越高，剥削反号）。
+        assert!(map_fold_to_bluff_raise_mult(0.40, &bg) < map_fold_to_bluff_raise_mult(0.60, &bg));
+        assert!(map_fold_to_bluff_raise_mult(0.60, &bg) < map_fold_to_bluff_raise_mult(0.78, &bg));
+        // 双向证据：低端 < 回退 0.10 < 高端（门既能下调又能上调）。
+        assert!(map_fold_to_bluff_raise_mult(0.20, &bg) < 0.10);
+        assert!(map_fold_to_bluff_raise_mult(0.85, &bg) > 0.10);
+    }
+
+    // --- 冷启动 / node_gated 关 / n 门槛回退 = 固定 bluff_raise_freq_mult（0.10），非 1.0 ---
+    #[test]
+    fn bluff_raise_gating_falls_back_to_fixed_mult() {
+        let nc = NodesConfig::default(); // bluff_raise_freq_mult=0.10, node_gated=true, min=30
+        let fb = nc.bluff_raise_freq_mult;
+        assert!((fb - 0.10).abs() < 1e-12, "回退基准 = 0.10");
+        // 冷启动（无 binding 读数）→ 固定 0.10（非 cbet 的 1.0）。
+        assert_eq!(bluff_raise_mult_from_readout(None, &nc), fb);
+        // 小样本（n < 30）→ 固定 0.10（即便 fold-to-raise 很高/很低）。
+        assert_eq!(bluff_raise_mult_from_readout(Some((0.90, 29)), &nc), fb);
+        assert_eq!(bluff_raise_mult_from_readout(Some((0.02, 29)), &nc), fb);
+        // node_gated 关 → 恒固定 0.10（即便样本足）。
+        let mut nc_off = nc.clone();
+        nc_off.bluff_raise_gate.node_gated = false;
+        assert_eq!(
+            bluff_raise_mult_from_readout(Some((0.90, 500)), &nc_off),
+            fb
+        );
+        assert_eq!(
+            bluff_raise_mult_from_readout(Some((0.02, 500)), &nc_off),
+            fb
+        );
+    }
+
+    // --- 样本足 → 走映射（爱弃升频 / 粘站降频，双向剥削反号） ---
+    #[test]
+    fn bluff_raise_gating_uses_mapping_when_sample_ready() {
+        let nc = NodesConfig::default();
+        // DonkFold（fold-to-raise 0.867，n 足）→ 夹取 2.0（升频剥削爱弃，>> 回退 0.10）。
+        assert!((bluff_raise_mult_from_readout(Some((0.867, 154)), &nc) - 2.0).abs() < 1e-9);
+        // DonkStick（fold-to-raise 0.033，n 足）→ 0.0（降频止损粘站，< 回退 0.10）。
+        assert_eq!(bluff_raise_mult_from_readout(Some((0.033, 154)), &nc), 0.0);
+    }
+
+    // --- 决定性测试：节点查询用 **facing_raise** key（fold-to-raise）而非 facing key（fold-to-cbet） ---
+    // 上轮 REJECT 正因门读 facing_node_key（fold-to-cbet）跨角色；本轮读 facing_raise_node_key 同轴。
+    #[test]
+    fn bluff_raise_binding_queries_facing_raise_node_not_facing_node() {
+        let nc = NodesConfig::default();
+        let bg = &nc.bluff_raise_gate;
+        let mut v = srp_flop_view();
+        assert_eq!(v.preflop_num_raises, 1, "srp 池");
+        // 无名对手（exploit 关：names 空）→ None → 回退固定 0.10（byte-equal 语义）。
+        assert!(bluff_raise_binding_readout(&v, &OpponentTable::new(), bg).is_none());
+        assert_eq!(
+            bluff_raise_mult_from_readout(
+                bluff_raise_binding_readout(&v, &OpponentTable::new(), bg),
+                &nc
+            ),
+            nc.bluff_raise_freq_mult,
+            "冷启动 = 回退 0.10"
+        );
+        // 给座4 命名，**同时**在 fold-to-cbet 节点（flop.srp）塞粘站计数、在 fold-to-raise 节点
+        // （flop.srp.facing_raise）塞爱弃计数 —— 两轴相反，证门读的是 facing_raise（而非 facing）。
+        v.names.insert(4, "villain".into());
+        let mut opp = OpponentTable::new();
+        with_facing(&mut opp, "villain", "flop.srp", 200, 20); // fold-to-cbet 10%（粘，上轮读这个）
+        with_facing(&mut opp, "villain", "flop.srp.facing_raise", 154, 145); // fold-to-raise ~94%（爱弃）
+        let b = bluff_raise_binding_readout(&v, &opp, bg).expect("有名 villain → Some");
+        assert_eq!(
+            b.1, 154,
+            "读到 flop.srp.facing_raise 的 n=154（若误读 facing key 会得 n=200）"
+        );
+        assert!(
+            b.0 > 0.80,
+            "shrunk_fold 贴近 fold-to-raise 94%（若误读 fold-to-cbet 会 ~0.10）"
+        );
+        assert!(
+            (bluff_raise_mult_from_readout(Some(b), &nc) - 2.0).abs() < 1e-9,
+            "爱弃(被加注) → 升频 2.0（若误读 fold-to-cbet 粘站会得 0.0，方向反）"
+        );
+        // 反证：只在 fold-to-cbet 节点有样本、facing_raise 无 → 查 facing_raise 得 n=0 → 回退 0.10。
+        let mut opp_cbet_only = OpponentTable::new();
+        with_facing(&mut opp_cbet_only, "villain", "flop.srp", 200, 180); // 仅 fold-to-cbet
+        let bc = bluff_raise_binding_readout(&v, &opp_cbet_only, bg).unwrap();
+        assert_eq!(
+            bc.1, 0,
+            "facing_raise 节点无样本 → n=0（证没去读 fold-to-cbet 节点）"
+        );
+        assert_eq!(
+            bluff_raise_mult_from_readout(Some(bc), &nc),
+            nc.bluff_raise_freq_mult,
+            "n=0 < 门槛 → 回退 0.10"
+        );
+    }
+
+    // --- 多人池保守：取最粘者（min shrunk_fold）binding（bluff-raise 需全弃 → min 正确） ---
+    #[test]
+    fn bluff_raise_binding_picks_stickiest_villain_multiway() {
+        let nc = NodesConfig::default();
+        let bg = &nc.bluff_raise_gate;
+        let node = "flop.srp.facing_raise";
+        let mut v = srp_flop_view();
+        v.folded[3] = false; // 座3 也在场（多人池）
+        v.names.insert(3, "sticky".into());
+        v.names.insert(4, "foldy".into());
+        let mut opp = OpponentTable::new();
+        with_facing(&mut opp, "sticky", node, 154, 8); // fold-to-raise ~5%（粘，DonkStick 型）
+        with_facing(&mut opp, "foldy", node, 154, 145); // fold-to-raise ~94%（弃，DonkFold 型）
+        let b = bluff_raise_binding_readout(&v, &opp, bg).unwrap();
+        assert!(b.0 < 0.20, "binding = 最粘者（sticky ~0.05），非爱弃者");
+        // binding 粘 → 降频 0.0（多人池保守：任一粘站在场即压 bluff_raise，因需全弃才成）。
+        assert_eq!(bluff_raise_mult_from_readout(Some(b), &nc), 0.0);
+        // 反证：仅 foldy 在场 → binding = foldy → 升频 2.0（可剥削）。
+        v.folded[3] = true;
+        let b2 = bluff_raise_binding_readout(&v, &opp, bg).unwrap();
+        assert!((bluff_raise_mult_from_readout(Some(b2), &nc) - 2.0).abs() < 1e-9);
     }
 }
