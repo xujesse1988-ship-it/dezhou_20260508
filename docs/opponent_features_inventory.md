@@ -389,12 +389,25 @@ float 门（首个消费轮）SHIPPED 后，尝试对 `post.facing.bluff_raise` 
 | float 频率 | fold-to-cbet | **防守方** | §C fold 桶 | ✅ 已采（same-role，SHIPPED）|
 | **bluff_raise 频率** | **fold-to-raise** | **进攻方被加注** | **§B**（非 §C）| ✅ 已采（`*.facing_raise`）→ same-role 门控 **SHIPPED**（2026-07-06，双向门，读 `facing_raise_node_key`）|
 | **cbet 过度诈唬（srp）** | fold-to-cbet | 防守方 | §C fold 桶 | ✅ 已采（same-role，**SHIPPED**）|
+| **候选① river 极化门（value_raise 降级）** | **摊牌 range 极性** | **进攻方（下注/加注）** | **§D 摊牌**（§B raise 桶仅代理）| ⛔ **REJECTED（第三次，2026-07-06）**——§B raise 代理不跟真极性，见下 |
 
 > **bluff_raise 门 SHIPPED（重做 = 上轮 REJECT 的正解）**：上轮门读 fold-to-cbet（跨角色）两靶逐字节
 > 相同 33.8%、无法区分反号 → REJECT；本轮门读 `facing_raise`（same-role）实测 DonkFold 86.7% vs DonkStick
 > 3.3%（分化 83.4pp、方向与最优频率对齐）→ 代理有效。双向门（乘子 [0.0,2.0]，爱弃升频 / 粘站降频）、
 > 门控全池型。靶改善 donk_fold 3/3 +145.3 / donk_stick 2/3 +7.6（两反号靶皆 ≥ OFF）、标准 0/11 超 CI、
 > exploit 关 byte-equal 全过。详见 `docs/heuristic9_design.md` §6 + `scratchpad/p03_bluff_raise2/DIAGNOSIS.md`。
+
+> **候选① river 极化门 REJECTED（第三次尝试，画像门控版；2026-07-06）**：非坚果 Monster 面对河牌下注、
+> 用 villain 河牌极性代理门控 `post.facing.value_raise` 降级为 call。实测（20000 手 2-max，villain=p1，
+> `river.srp.facing_raise` k=20）：**① fold-to-raise 死信号**——FlushTrap villain raw fold-to-raise **0%**
+> = station = tag = nit（bluff_raise 门那条轴在此无分化）。**② raise-to-raise 判被动弱场、但与 Tag 撞车**
+> ——FlushTrap **44.9%** vs Tag **45.2%**（station 0.6/limpy 1.1/nit 3.4/maniac 9.6）；FlushTrap<Tag →
+> **无阈值只打靶不打 reg**，而非坚果 value_raise 对 Tag 是 +EV（降级 -EV）。raise-aggression ≠ nut-polarity
+> = **代理风险 #1 致命**。**③ 纹理无关**（代理风险 #2）：44.9% 主由非成花板 Tag 式攻击贡献 → 分开的是
+> 通用攻击性、非成花板极性。**④ 样本饥饿**：river `facing_raise` 稀（n=12–29/20000），门在 8000 手标准
+> 窗从不点火（标准 11-config 0/11 = **空洞通过**）；flush-only GATED 20000 手仅 +1802（1/4 seed@200bb）。
+> 引擎逐字节还原 HEAD。**处方 = §D 摊牌采集**（villain 河牌攻击时摊牌 range 是否含非坚果，唯一分开
+> FlushTrap 纯坚果攻击 vs Tag 混合价值攻击）± §G 成花纹理维。详见 `docs/heuristic9_design.md` §6。
 
 ---
 

@@ -717,6 +717,68 @@ binding=最粘者）；`heuristic9_trace`(10) + `heuristic_p0_3_facing`(12) 全�
 **范围外（留后续轮）**：bluff_raise **尺寸**按对手粘度分槽（现共享 `pick_bet_size`）；候选① river 极化门
 （现有 `facing_raise` 真信号可读，同 same-role 机制）；fold-to-raise 先验 0.30 待 weigh.py 实测校准。
 
+### P0-3 阶段2 第五消费轮 = 候选① river 极化门（画像门控版，第三次尝试）：引擎改动**驳回**（2026-07-06）
+
+候选①（成花板非坚果 stack-off）的**第三次尝试**。前两次（全局降级）死在标准矩阵 11/11（−113.9）；
+REJECT 记录归因 = 剥削层画像门控。本轮试图用 villain 河牌极性代理**只对极化对手**降级
+`post.facing.value_raise`（非坚果 Monster → odds_call），对弱场保 value_raise。走完整闭环，判定
+**REJECTED**——§B 频率代理不跟真极性 + 样本饥饿，非失败（照 bluff_raise v1 / 候选① 成花板先例）。
+
+**机制**：river + `monster_non_nut(hole,board)` + binding villain 河牌极性信号达阈 → 降级 value_raise
+为 call（直接路由到 call 叶、无 RNG 消费）。信号候选 = `river.<池型>.facing_raise` 的 fold-to-raise 或
+raise-to-raise。已实现（`RiverPolarityGateConfig` + policy 消费 `monster_non_nut`/`nonnut_flush` + 四函数
+照 bluff_raise 门写、唯一区别读 shrunk_raise），sim 复核后**逐字节还原 HEAD**。
+
+**信号判别（20000 手 2-max，villain=p1，`river.srp.facing_raise`，k=20）**：
+
+| 场 | shrunk_raise | raw_raise | shrunk_fold | raw_fold | n |
+|---|---|---|---|---|---|
+| **FlushTrap（-EV 靶）** | **44.9%** | 72.4% | 12.2% | **0.0%** | 29 |
+| **Tag（+EV 标准 reg）** | **45.2%** | 64.3% | 9.7% | **0.0%** | 42 |
+| Maniac | 9.6% | 10.5% | 23.2% | 21.9% | 105 |
+| Station | 0.6% | 0.0% | 3.4% | 0.0% | 158 |
+| Limpy | 1.1% | 0.0% | 6.3% | 0.0% | 75 |
+| Nit | 3.4% | 0.0% | 20.7% | 0.0% | 9 |
+
+**代理风险 #1（频率 ≠ 真极性，致命）**：① **fold-to-raise 死信号**——FlushTrap villain raw fold-to-raise
+**0%** = station/tag/nit（成花板持 nut 被加注**从不弃、再加注**；非坚果被动**不下注**→ 不进 facing_raise
+分母），bluff_raise 门那条轴在此无分化。② **raise-to-raise 判被动弱场、但与 Tag 撞车**——FlushTrap 44.9%
+vs Tag 45.2%，**FlushTrap < Tag → 无阈值只点火 FlushTrap 而不点火 Tag**；非坚果 value_raise 对 Tag 是
++EV（干板非坚果顺 REJECT 记录 +49210/23 次）→ 降级 -EV。raise-aggression ≠ nut-polarity。
+
+**代理风险 #2（纹理无关）**：节点 key 无 §G 纹理维。FlushTrap raise-to-raise 44.9% **主由非成花板 Tag
+式攻击贡献**（成花板在聚合中罕见）→ 分开 FlushTrap 与 station 的是**通用攻击性、非成花板极性**——正是
+#1 里 Tag 撞车的机理来源。
+
+**靶场 + 标准矩阵（成败关键，paired ON vs OFF，chips，seed 7/11/23/12345）**：
+
+| 门 | 结果 |
+|---|---|
+| FlushTrap `monster_non_nut` GATED @200bb | 0 / −15601 / −10443 / +8（**HURTS**，含顺子）|
+| FlushTrap `monster_non_nut` ALWAYS @200bb | +486 / −34159 / −31156 / −27542（顺子降级大亏）|
+| FlushTrap **flush-only** ALWAYS @200bb | 0 / 0 / +3378 / +8645（**HELPS**，复现旧 REJECT 记录、验证 harness）|
+| FlushTrap **flush-only** GATED(min15,thr0.30) @200bb | 0 / 0 / 0 / **+1802**（样本饥饿仅 ~1 次点火）|
+| FlushTrap **flush-only** GATED @100bb | 0 / 0 / 0（从不点火）|
+| **标准 11-config @8000 手 --exploit** | **0/11 非 byte-equal（空洞通过：门 8000 手内从不点火）** |
+| exploit 关（field×seats）ON vs node_gated=false | **5/5 逐字节一致** |
+
+**样本饥饿（第三独立阻碍）**：river `facing_raise` 稀（villain 须开火+被加注+响应、限河；FlushTrap
+river.srp.facing_raise n=29、river.limped n=12/20000）→ 门在 8000 手标准回归窗**从不点火**（标准 0/11 =
+**空洞通过**，非「正确门控守住」）。漏洞本身极罕见：非坚果 flush value_raise **3 次/20000 手**。附带发现：
+原漏洞手 `1b3328bc`（−285BB）主漏 = **领打超池**（`post.unopened.value_bet`，本门不碰），scope 太窄。
+
+**判定 = REJECTED**：SHIP 四条——(a) 强分化+方向对齐 **半met**（分开被动弱场、但与 Tag 不分开）；
+(b) 靶场向好 **FAIL**（样本饥饿至 ~1 次点火，flush-only GATED 仅 +1802/4 seed）；(c) 标准 0/11 **空洞
+通过**；(d) exploit 关 byte-equal PASS。**(a) 受损 + (b) 失败 → 不满足四条全过**。引擎逐字节还原 HEAD
+（`git diff HEAD -- src/` 空）。诊断全文 `scratchpad/cand1/DIAGNOSIS.md`。
+
+**处方（正确修法，留后续轮）**：① **§D 摊牌采集（首选）**——记录 villain 河牌**攻击时的摊牌牌力构成**
+（攻击 range 含非坚果吗），唯一能分开 FlushTrap（纯坚果攻击）与 Tag（混合价值攻击）；频率/fold/raise 率
+都做不到。② **§G 成花纹理维**（`river.<池型>.flush3.facing_raise`）缓解代理风险 #2，但仍需 §D 解 #1
+（Tag 在成花板也用坚果攻击）。③ **scope 订正**：真杠杆是**领打超池尺寸**（`post.unopened.value_bet` 非
+坚果 Monster），非 `post.facing.value_raise`；且必须 **flush-only**（顺子降级 -EV）。造靶夹具
+（FlushTrap + `monster_non_nut`/`nonnut_flush`）保留。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街
