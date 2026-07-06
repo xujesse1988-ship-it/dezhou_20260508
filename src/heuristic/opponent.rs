@@ -55,7 +55,8 @@ fn is_raise_action(a: &str) -> bool {
 }
 
 /// 池型名（与 hero 侧 `ScenarioKey.pot_type` 逐字同口径，`preflop_num_raises` 派生）。
-fn pot_type_name(pre_raises: u32) -> &'static str {
+/// `pub`：P0-3 阶段2 hero 侧节点查询用同一口径构造对偶 facing 节点 key（单一坐标系，§5.2）。
+pub fn pot_type_name(pre_raises: u32) -> &'static str {
     match pre_raises {
         0 => "limped",
         1 => "srp",
@@ -84,7 +85,10 @@ fn street_name(street: u8) -> &'static str {
 ///   加维不破先验查询；
 /// - 消费侧（阶段2）按样本自适应**并桶**：细 key 分母不足时回退粗 key（§G「采最细、消费并桶」）；
 /// - 采 §G 维度需 enrich `ObservedAction`（携 board/位置）——那是加维时的真正工作量，非本函数。
-fn facing_node_key(street: u8, pot_type: &str) -> String {
+///
+/// `pub`：P0-3 阶段2 hero 侧 float 门用它构造「villain 面对 hero stab 的对偶节点」key，
+/// 与采集侧共用同一构造器 → 查询/采集口径逐字节一致（§5.2 节点级剥削）。
+pub fn facing_node_key(street: u8, pot_type: &str) -> String {
     format!("{}.{}", street_name(street), pot_type)
 }
 

@@ -13,7 +13,7 @@ use crate::core::Street;
 use crate::heuristic::config::HeuristicConfig;
 use crate::heuristic::equity::{EquityEngine, Rng};
 use crate::heuristic::features::{draws, made_class, texture, MadeClass};
-use crate::heuristic::opponent::{ExploitAdjust, OpponentTable};
+use crate::heuristic::opponent::{facing_node_key, pot_type_name, ExploitAdjust, OpponentTable};
 use crate::heuristic::range::RangeVec;
 use crate::heuristic::range_online::MlRange;
 use crate::heuristic::trace::{DecisionTrace, LegalizeChange};
@@ -312,6 +312,8 @@ struct NodeCtx<'a> {
     eq: &'a EquityEngine,
     cfg: &'a HeuristicConfig,
     adj: &'a ExploitAdjust,
+    /// P0-3 阶段2：per-node villain fold 读数源（float 门节点级查询用；`adj` 只有聚合读数）。
+    opp: &'a OpponentTable,
     opp_thr: &'a [f64],
     ml: Option<&'a MlRange>,
     hole: [crate::core::Card; 2],
@@ -344,6 +346,7 @@ pub fn decide(
         eq,
         cfg,
         adj: &adj,
+        opp,
         opp_thr: &opp_thr,
         ml,
         hole,
@@ -744,6 +747,74 @@ fn air_bluff_freq_base(ctx: &NodeCtx, multiway: f64) -> f64 {
         .clamp(0.0, 0.95)
 }
 
+/// fold 率 → float 频率乘子的单调映射（两锚线性插值，斜率/阈值造靶校准，避开朴素 breakeven）。
+fn map_fold_to_mult(fold: f64, fg: &crate::heuristic::config::FloatGateConfig) -> f64 {
+    if fg.fold_hi <= fg.fold_lo {
+        return fg.mult_lo;
+    }
+    let t = ((fold - fg.fold_lo) / (fg.fold_hi - fg.fold_lo)).clamp(0.0, 1.0);
+    fg.mult_lo + t * (fg.mult_hi - fg.mult_lo)
+}
+
+/// binding villain 的节点级 fold 读数（P0-3 阶段2）：对偶 `(街.池型)` 节点上、面对 hero
+/// 本街 stab 的**最粘者**（min shrunk_fold —— bluff 需全弃，最粘者 binding）的 `(shrunk_fold, n)`。
+///
+/// `None` 语义 = **无法门控 → 调用方回退固定乘子**：翻前（不应到达）、或**任一对手无名**
+/// （exploit 关：sim `names` 空 / live 缺名 → 逐字节回退）。节点 key 用与采集侧同口径的
+/// [`facing_node_key`]/[`pot_type_name`] 构造（§5.2 单一坐标系）。
+fn float_binding_readout(
+    view: &GameView,
+    opp: &OpponentTable,
+    fg: &crate::heuristic::config::FloatGateConfig,
+) -> Option<(f64, u32)> {
+    let street = match view.street {
+        Street::Flop => 1u8,
+        Street::Turn => 2,
+        Street::River | Street::Showdown => 3,
+        Street::Preflop => return None, // float 语境本就翻后；翻前 → 回退。
+    };
+    let node = facing_node_key(street, pot_type_name(view.preflop_num_raises));
+    let mut binding: Option<(f64, u32)> = None; // (shrunk_fold, n)
+    for s in 0..view.num_seats as usize {
+        if s == view.my_seat as usize || view.folded[s] {
+            continue;
+        }
+        // 有对手无名 → None（exploit 关回退，保 byte-equal）。
+        let name = view.names.get(&(s as u8))?;
+        let r = opp.node_readout(name, &node, fg.shrink_k);
+        binding = Some(match binding {
+            Some(prev) if prev.0 <= r.shrunk_fold => prev, // 保留更小 fold（更粘 = binding）
+            _ => (r.shrunk_fold, r.n),
+        });
+    }
+    binding
+}
+
+/// binding 读数 → float 频率乘子（纯核，可单测）：node_gated 关 / 冷启动（`None`）/ binding
+/// 样本 `n < min_samples` → 固定 `float_freq_mult`（= 现默认，保标准矩阵不退、exploit 关一致）；
+/// 样本足 → 按 fold 单调映射（fold 越高 → 乘子越高，避开朴素 breakeven，锚造靶校准）。
+fn float_mult_from_readout(
+    binding: Option<(f64, u32)>,
+    nc: &crate::heuristic::config::NodesConfig,
+) -> f64 {
+    let fg = &nc.float;
+    if !fg.node_gated {
+        return nc.float_freq_mult;
+    }
+    match binding {
+        Some((fold, n)) if n >= fg.min_samples => map_fold_to_mult(fold, fg),
+        _ => nc.float_freq_mult,
+    }
+}
+
+/// `post.unopened.float` 频率乘子（P0-3 阶段2 节点级门控，`scenario §5.2`）：查 binding villain
+/// 读数 → 纯核映射。**多人池保守**取最粘者（min shrunk_fold）读数并以其样本量做门。
+fn float_freq_mult(ctx: &NodeCtx) -> f64 {
+    let nc = &ctx.cfg.nodes;
+    let binding = float_binding_readout(ctx.view, ctx.opp, &nc.float);
+    float_mult_from_readout(binding, nc)
+}
+
 /// `post.unopened`：翻后本街无人下注（下注 vs 过牌）。价值与 c-bet 按池型分参。
 /// 叶：`post.unopened.value_bet[.srp|.3bp]` / `post.unopened.{commit|semibluff}` /
 /// `post.unopened.cbet_bluff[.srp|.3bp]` / `post.unopened.{float|check}`。
@@ -835,7 +906,9 @@ fn post_unopened(ctx: &NodeCtx, pot: PotType, rng: &mut Rng, mut tr: DecisionTra
             );
         }
     } else if s.made == MadeClass::Air && !s.dr.has_meaningful_draw() {
-        let gate = air_bluff_freq_base(ctx, s.multiway) * nc.float_freq_mult;
+        // P0-3 阶段2：float 频率乘子按 villain 节点级 fold-to-stab 门控（冷启动/未知/小样本
+        // 回退固定 `float_freq_mult`）。掷点仍在 gate 之后、位置不变 → RNG 消费序列不变。
+        let gate = air_bluff_freq_base(ctx, s.multiway) * float_freq_mult(ctx);
         let roll = rng.unit();
         tr.cmp("postflop.float_freq", roll, gate, roll < gate);
         if roll < gate {
@@ -1121,5 +1194,198 @@ fn raise_to_clamped(
         source: src.into(),
         probs,
         trace: None,
+    }
+}
+
+// ===========================================================================
+// P0-3 阶段2：float 节点级门控单测（映射单调 / 冷启动=默认 / n 门槛回退 / 节点查询正确）
+// ===========================================================================
+#[cfg(test)]
+mod float_gate_tests {
+    use super::{float_binding_readout, float_mult_from_readout, map_fold_to_mult};
+    use crate::heuristic::config::NodesConfig;
+    use crate::heuristic::opponent::{FacingCounts, OpponentTable};
+    use crate::heuristic::view::{GameView, HistAction, Request, ValidActions};
+
+    /// 造一个 flop-SRP float 局面：6-max，btn=4，hero(座0,BB) 平跟座4 的开池 → 翻牌
+    /// 无人下注、hero 无主动权（座4 是翻前加注者）。座4 = 面对 hero stab 的 villain。
+    fn float_view() -> GameView {
+        let req = Request {
+            hole: vec!["2c".into(), "Kc".into()],
+            board: vec!["8s".into(), "6d".into(), "Td".into()],
+            button_seat: 4,
+            my_seat: 0,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                HistAction {
+                    seat: 1,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 2,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 3,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 4,
+                    action: "raise".into(),
+                    to: Some(40),
+                    street: None,
+                },
+                HistAction {
+                    seat: 5,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 0,
+                    action: "call".into(),
+                    to: None,
+                    street: None,
+                },
+            ],
+            valid: ValidActions {
+                can_check: true,
+                can_call: false,
+                can_raise: true,
+                min_raise: Some(20),
+                max_raise: Some(1960),
+            },
+            stacks: vec![2000, 1416, 1322, 6020, 11891, 1460],
+            names: Default::default(),
+            sb_seat: None,
+            bb_seat: None,
+        };
+        GameView::from_request(&req)
+    }
+
+    /// 便捷：给对手名在某节点塞 facing 计数（fold_rate ≈ folds/n）。
+    fn with_facing(opp: &mut OpponentTable, name: &str, node: &str, n: u32, folds: u32) {
+        opp.by_name
+            .entry(name.to_string())
+            .or_default()
+            .facing
+            .insert(
+                node.to_string(),
+                FacingCounts {
+                    n,
+                    folds,
+                    calls: n - folds,
+                    raises: 0,
+                },
+            );
+    }
+
+    // --- 映射单调 + 端点/夹取 ---
+    #[test]
+    fn mapping_is_monotone_and_clamped() {
+        let fg = NodesConfig::default().float; // 锚 [0.50→0.0, 0.65→3.0]
+        assert_eq!(map_fold_to_mult(0.30, &fg), 0.0, "低锚以下 → mult_lo");
+        assert_eq!(map_fold_to_mult(0.50, &fg), 0.0, "低锚点 = mult_lo");
+        assert!(
+            (map_fold_to_mult(0.65, &fg) - 3.0).abs() < 1e-9,
+            "高锚点 = mult_hi"
+        );
+        assert!(
+            (map_fold_to_mult(0.90, &fg) - 3.0).abs() < 1e-9,
+            "高锚以上 → 夹取 mult_hi"
+        );
+        // 中点 0.575 → t=0.5 → 1.5。
+        assert!((map_fold_to_mult(0.575, &fg) - 1.5).abs() < 1e-6);
+        // 严格单调递增（fold 越高 → 乘子越高）。
+        assert!(map_fold_to_mult(0.52, &fg) < map_fold_to_mult(0.58, &fg));
+        assert!(map_fold_to_mult(0.58, &fg) < map_fold_to_mult(0.63, &fg));
+    }
+
+    // --- 冷启动 / node_gated 关 / n 门槛回退 = 固定 float_freq_mult ---
+    #[test]
+    fn gating_falls_back_to_fixed_mult() {
+        let nc = NodesConfig::default(); // float_freq_mult=0.5, min_samples=30, node_gated=true
+                                         // 冷启动（无 binding 读数）→ 固定乘子。
+        assert_eq!(float_mult_from_readout(None, &nc), 0.5);
+        // 小样本（n < 30）→ 固定乘子（即便 fold 很高）。
+        assert_eq!(float_mult_from_readout(Some((0.95, 29)), &nc), 0.5);
+        // node_gated 关 → 恒固定乘子（即便样本足、fold 高）。
+        let mut nc_off = nc.clone();
+        nc_off.float.node_gated = false;
+        assert_eq!(float_mult_from_readout(Some((0.95, 500)), &nc_off), 0.5);
+    }
+
+    // --- 样本足 → 走映射（爱弃升 float / 粘站降 float） ---
+    #[test]
+    fn gating_uses_mapping_when_sample_ready() {
+        let nc = NodesConfig::default();
+        // 爱弃（fold 0.90，n 足）→ 高乘子（夹取 3.0 → float 高）。
+        assert!((float_mult_from_readout(Some((0.90, 100)), &nc) - 3.0).abs() < 1e-9);
+        // 粘站（fold 0.30，n 足）→ 0 乘子（float≈0，避开朴素 breakeven）。
+        assert_eq!(float_mult_from_readout(Some((0.30, 100)), &nc), 0.0);
+    }
+
+    // --- 节点查询正确：查对偶 (街.池型)="flop.srp"，冷启动 = 默认（回退固定乘子） ---
+    #[test]
+    fn binding_queries_correct_node_and_cold_start_defaults() {
+        let nc = NodesConfig::default();
+        let mut v = float_view();
+        assert_eq!(v.preflop_num_raises, 1, "srp 池");
+        // 无名对手（exploit 关：names 空）→ None → 回退固定乘子（byte-equal 语义）。
+        assert!(float_binding_readout(&v, &OpponentTable::new(), &nc.float).is_none());
+        assert_eq!(
+            float_mult_from_readout(
+                float_binding_readout(&v, &OpponentTable::new(), &nc.float),
+                &nc
+            ),
+            0.5,
+            "冷启动 = 默认"
+        );
+        // 给座4 命名 + 在 flop.srp 塞高 fold 计数（爱弃 villain）。
+        v.names.insert(4, "foldy".into());
+        let mut opp = OpponentTable::new();
+        with_facing(&mut opp, "foldy", "flop.srp", 200, 180); // raw fold 90%
+        let b = float_binding_readout(&v, &opp, &nc.float).expect("有名 villain → Some");
+        assert_eq!(b.1, 200, "读到 flop.srp 的 n（查错节点会得 n=0）");
+        assert!(b.0 > 0.80, "shrunk_fold 应贴近 90%（n 大）");
+        // 若把计数塞到 turn.srp（错节点）→ 查 flop.srp 得 n=0（回退）。
+        let mut opp_wrong = OpponentTable::new();
+        with_facing(&mut opp_wrong, "foldy", "turn.srp", 200, 180);
+        let bw = float_binding_readout(&v, &opp_wrong, &nc.float).unwrap();
+        assert_eq!(bw.1, 0, "flop.srp 无样本 → n=0");
+        assert_eq!(
+            float_mult_from_readout(Some(bw), &nc),
+            0.5,
+            "n=0 < 门槛 → 固定乘子"
+        );
+    }
+
+    // --- 多人池保守：取最粘者（min shrunk_fold）binding ---
+    #[test]
+    fn binding_picks_stickiest_villain_multiway() {
+        let nc = NodesConfig::default();
+        let mut v = float_view();
+        v.folded[3] = false; // 座3 也在场（多人池）
+        v.names.insert(3, "sticky".into());
+        v.names.insert(4, "foldy".into());
+        let mut opp = OpponentTable::new();
+        with_facing(&mut opp, "sticky", "flop.srp", 200, 60); // raw fold 30%（粘）
+        with_facing(&mut opp, "foldy", "flop.srp", 200, 180); // raw fold 90%（弃）
+        let b = float_binding_readout(&v, &opp, &nc.float).unwrap();
+        assert!(b.0 < 0.40, "binding = 最粘者（sticky ~0.31），非爱弃者");
+        // binding 粘 → 乘子 0（bluff 需全弃，最粘者 binding → 不 float）。
+        assert_eq!(float_mult_from_readout(Some(b), &nc), 0.0);
+        // 反证：仅 foldy 在场 → binding = foldy → 高乘子。
+        v.folded[3] = true;
+        let b2 = float_binding_readout(&v, &opp, &nc.float).unwrap();
+        assert!((float_mult_from_readout(Some(b2), &nc) - 3.0).abs() < 1e-9);
     }
 }

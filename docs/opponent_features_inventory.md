@@ -306,9 +306,14 @@ per-action 决策耗时（§F 时序 tell）是现有日志的唯一缺口——
 
 ## 落地记录：P0-3 阶段1（采集基建）SHIPPED（2026-07-06）
 
-> 分两阶段，照 Phase A→B 先例。**阶段1 = 纯增采集、决策路径不读 → sim byte-equal**（本轮落）；
-> **阶段2 = 剥削接线（改行为、过 sim 质量门）待接**。设计全文见
-> `scratchpad/p03/DESIGN.md`（分阶段计划 + 阶段2 四门接线方案 + 未决点）。
+> 分两阶段，照 Phase A→B 先例。**阶段1 = 纯增采集、决策路径不读 → sim byte-equal**（已落）；
+> **阶段2 = 剥削接线（改行为、过 sim 质量门）—— 首个消费轮 float 门 SHIPPED（2026-07-06）**：
+> `policy::float_freq_mult` 查 binding villain 在对偶 `(街.池型)` 节点的 `shrunk_fold` 单调门控
+> float 频率（fold 越高 → float 越高，避开朴素 breakeven 靠造靶校准锚），解决 float 最优频率随
+> 对手翻后粘度**反号**（两反号靶 9/9 ≥ 默认、+46/+51 mbb/g；标准矩阵 0/11 超 CI；exploit 关
+> byte-equal）。bluff_raise / c-bet 过度诈唬门（同吃 §C fold 桶）复用同机制、留后续轮。设计全文见
+> `scratchpad/p03/DESIGN.md`（分阶段计划 + 阶段2 四门接线方案 + 未决点）；shipped 数据见
+> `docs/heuristic9_design.md` §6「P0-3 阶段2」。
 
 **阶段1 采什么（`src/heuristic/opponent.rs`）**：`OppStats` 新增 `facing:
 BTreeMap<String, FacingCounts>`（`#[serde(default, skip_serializing_if=is_empty)]` → 旧

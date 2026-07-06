@@ -460,6 +460,60 @@ LO +21.8）、在爱弃靶仅弱势不显著领先 → HI 被 dominated。机理
 层未按节点分槽；本轮判定尺寸最优方向继承与频率相同的对手依赖、须同 P0-3 信号驱动，故推迟）的验证夹具
 （follow `0bfea7a` Limper / PairedTrap / `FlushTrap` 先例）。
 
+### P0-3 阶段2（首个消费轮）：float 门节点级门控 **SHIPPED**（2026-07-06，scenario §5.2/§7）
+
+P0-3 阶段1（`70eecb5`/`402a4e9` 采集基建 + `e74b9c1` live 采集口径前置）落 per-node 面对下注
+fold 读数后的**第一个会改行为、兑现 EV** 的消费轮。两次被驳回的 float（Phase B 0.5→0.25 一刀切
+3/11 负；Phase C round-1 复核揭示**反号**：粘站 wideopen float≈0 最优、爱弃进攻方 3bettor float≈高
+最优，且 exploit 无关）终于被**正确修法**解决——不是全局乘子，而是**按面对 hero stab 的 villain 在
+对偶 `(街.池型)` 节点的 fold-to-stab 读数单调门控**。
+
+**机制（`src/heuristic/policy.rs`）**：float 门（`post_unopened` 内，made=Air、无听牌、无主动权、
+本街无人下注）的频率乘子由 `float_freq_mult(ctx)` 决定：查 binding villain（仍在场对手里
+**最粘者** = min `shrunk_fold`，bluff 需全弃故最粘者 binding）在对偶节点 `facing_node_key(街, 池型)`
+（与阶段1 采集侧同口径构造 → §5.2 单一坐标系）的 `node_readout(name, node, k).shrunk_fold`。
+`NodeCtx` 新接 `&OpponentTable`（原只带聚合 `adj`）。掷点仍在 gate 之后、位置不变 → RNG 消费序列
+不变（守 invariants 无全局 RNG）。
+
+**避开朴素 breakeven 陷阱**：不用 `f > s/(s+P)` 直接开关（wideopen fold 47% > 0.5-pot breakeven
+33% 会误判「该 float」，但实测最优是 0——延迟/OOP stab 未弃对手续街、hero 空气续街≈0 equity →
+朴素 breakeven 高估 float 盈利）。fold 只作**驱动信号 + 单调映射**，阈值/斜率**造靶校准**：
+`--opp-stats` 实测 villain(p1) 在 flop.srp 的 shrunk_fold —— wideopen 47.0% / 3bettor 64.5%（清晰
+discriminator），锚 `[fold_lo 0.50→mult 0.0, fold_hi 0.65→mult 3.0]` 线性插值 →
+wideopen(0.47<0.50)→mult 0（float≈0，复现 +49 最优侧）、3bettor(0.645→t≈0.97)→mult≈2.9 →
+float=air_bluff_base(0.30)×2.9≈0.87（float 高，复现 +33 最优侧）。turn/river fold 低（且 3bettor
+那里 raise 率 22–30% 惩罚 float）→ 两靶均映射低 float（正确：延迟街 float 风险高）。
+
+**冷启动/未知/小样本 = 现默认**（保标准矩阵不退、exploit 关逐字节一致）：`node_gated=false` /
+任一对手无名（exploit 关：sim `names` 空 / live 缺名）/ binding villain `n < min_samples`(30) →
+回退固定 `nodes.float_freq_mult`(0.5) = Phase B/C 旧路径。config 旋钮 `NodesConfig.float`
+（`FloatGateConfig`，`#[serde(default)]`）：`node_gated`/`min_samples`/`shrink_k`/两锚（fold/mult）。
+
+**回归门（paired 同 seed，8000 手 --exploit；node-gated=默认 ON vs 固定默认 OFF）**：
+
+| 靶（2-max） | 语义 | node-gated ≥ 默认 | 均值 Δ mbb/g |
+|---|---|---|---|
+| `wideopen` | 粘跟站（float 应低）| **9/9 seed** | **+46.0** |
+| `3bettor` | flop 爱弃进攻方（float 应高）| **9/9 seed** | **+51.0** |
+| `3bpfold`（旁证）| fold-happy | 3/3 seed | +176~+219 |
+
+**反号解决证明**：一个固定乘子只能赢一边；node-gated 在**两个反号靶都 9/9 ≥ 默认且均显著正**——
+粘站靶靠**降** float 赢、爱弃靶靠**升** float 赢，同一门控两边都对。
+
+**标准矩阵不退化（11 配置，node-gated vs 固定默认=baseline）**：**0/11 超 CI95、均值 Δ +14.1
+mbb/g**（9 正 2 微负 −13.4/−2.9 均在 CI 内）——node-gating 对每个对手按其 fold 率自适应，方向普适
+（粘→少 float、弃→多 float）故标准场也不劣反微升。**exploit 关**：9/6/2-max × seed7（±start-bb 400）
+vs baseline binary(HEAD `e74b9c1`) **逐字节一致**；`node_gated=false`+exploit == baseline+exploit
+逐字节一致（回退路径 = 未改旧行为）。**0 fallback / 0 pot|to_call 漂移**（全配置）。
+
+**测试**：`policy.rs` 内 5 新单测（映射单调+夹取 / 冷启动=默认 / n 门槛回退 / 节点查询正确即查对偶
+`flop.srp` / 多人池 binding=最粘者）；`heuristic9`(10) + `heuristic9_trace`(10) + `heuristic_p0_3_facing`(7)
+全绿；fmt / clippy(`-D warnings`) 全绿。
+
+**范围外（留后续轮，复用同机制）**：bluff_raise 门（全局频率、非池型分参，同需翻后 fold 门控）、
+3bp/srp c-bet 过度诈唬门；多人池现取最粘者 min-fold 近似（HU 为主场做干净，多人池任一对手未知即回退
+默认——保守但不误开）。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街

@@ -420,8 +420,21 @@ check-raise 计划节点（P1-1）、翻前 3bet-bluff 频率（P1-4）。「几
 >   不一致，默认 0.58 近最优）。详见 `docs/heuristic9_design.md` §6。
 > - **② float 频率 二次驳回**：最优乘子随对手翻后粘度**反号**（wideopen-2max 要 0.0、
 >   3bettor-2max 要 1.0，且 exploit 无关）→ 一刀切必错，须待 P0-3 per-opponent 翻后
->   fold 画像门控（`bluff_mult` 不含此信号）。
+>   fold 画像门控（`bluff_mult` 不含此信号）。**→ 已由阶段2 float 门解决（见下）。**
 > - **③ bluff_raise 频率 复核维持 0.10**：降 0 仅 +10 但杀节点、升明确变差；画像门控同需 P0-3。
+
+> **落地状态（P0-3 阶段2 首个消费轮，2026-07-06）：float 门节点级门控 SHIPPED。** 上面候选②
+> 的反号（一刀切必错）终于被**正确修法**解决——`float_freq_mult(ctx)` 查**面对 hero stab 的
+> binding villain**（仍在场对手里最粘者，min `shrunk_fold`）在**对偶 `(街.池型)` 节点**的
+> `node_readout().shrunk_fold`（§5.2 节点级剥削查询：与阶段1 采集侧同口径构造 key），按 fold
+> **单调映射** float 乘子（fold 越高 → float 越高）。**避开朴素 breakeven 陷阱**：fold 只作驱动
+> 信号，阈值/斜率造靶校准（锚 `[0.50→0, 0.65→3.0]`，实测 wideopen flop.srp 47% / 3bettor 64.5%）
+> 复现 wideopen→float≈0、3bettor→float≈0.87。冷启动/未知/小样本（`n<30`）/exploit 关 → 回退固定
+> `nodes.float_freq_mult`。**回归门**：两反号靶 node-gated vs 固定默认各 **9/9 seed ≥ 默认**
+> （wideopen +46.0 / 3bettor +51.0 mbb/g，均显著正 → 一门控两边都赢）；标准矩阵 11 配置
+> **0/11 超 CI95、均值 +14.1**；exploit 关逐字节一致；0 fallback / 0 漂移。config 旋钮
+> `NodesConfig.float`（`FloatGateConfig`）。详见 `docs/heuristic9_design.md` §6「P0-3 阶段2」。
+> bluff_raise / c-bet 过度诈唬门复用同机制、留后续轮。
 
 ---
 
@@ -431,7 +444,7 @@ check-raise 计划节点（P1-1）、翻前 3bet-bluff 频率（P1-4）。「几
 |---|---|---|
 | **P0-1** | 行动线记忆。数据基座**已落**（`seat_actions`，`view.rs:228`；`street_aggressors`，`view.rs:231`；`tests/heuristic_p0_1_action_line.rs`）| 派生量（`villain_capped` / `is_delayed_cbet` / `facing_barrel_n`）**已随 Phase A 落地**；`i_have_initiative()` 过期主动权**已随 Phase B 修复**（按街回溯 `street_aggressors`，3 个 view 级单测）→ **P0-1 关闭** |
 | **P0-2** | 下注尺寸引擎（多档尺寸 / 跨街 geometry / 接线 `size_mid`）| 融入节点参数化：尺寸 = 节点参数的一部分，Phase C 按节点落，不再是独立引擎。**Phase C 第一轮记录**：尺寸仍是 `postflop` 共享层（`pick_bet_size`/`value_size` 读 `size_small/big`），**尚未按节点分槽**——故 3bp 尺寸无法脱离 srp 单调；要扫 3bp 尺寸须先给节点加尺寸槽（本轮范围外，未做）|
-| **P0-3** | per-street 对手统计（fold-to-cbet 等）+ 连续剥削 | 与 `opponent_features_inventory.md` 合流 → §5.2 节点计数表；剥削从「离散 ±cap」改「节点级连续查询」。**Phase C 第一轮坐实为 float / bluff_raise 门控的前置**：两节点的最优诈唬频率随对手翻后弃牌/粘度反号（造靶实测），现仅 `bluff_mult` 一个剥削读数进节点、且该效应 exploit 无关（`bluff_mult` 不含翻后 fold-to-stab 信号）→ 正确门控须等 P0-3 落 per-opponent 翻后 fold 统计 |
+| **P0-3** | per-street 对手统计（fold-to-cbet 等）+ 连续剥削 | 与 `opponent_features_inventory.md` 合流 → §5.2 节点计数表；剥削从「离散 ±cap」改「节点级连续查询」。**阶段1 采集基建 SHIPPED**（`70eecb5`/`402a4e9`/`e74b9c1`：per-node facing fold 计数 + 收缩，决策不读=byte-equal）。**阶段2 首个消费轮 = float 门 SHIPPED（2026-07-06）**：`float_freq_mult(ctx)` 查 binding villain 在对偶 `(街.池型)` 节点的 `shrunk_fold` 单调门控 float 频率，解决候选② 的反号（两反号靶各 9/9 ≥ 默认、+46/+51 mbb/g；标准矩阵 0/11 超 CI；exploit 关 byte-equal）；避开朴素 breakeven 靠造靶校准锚。**后续轮复用同机制**：bluff_raise 门、c-bet 过度诈唬门（同吃翻后 fold 桶）；成花板非坚果 stack-off 门吃 §B raise 桶 |
 | **P1-1** | check-raise 专家 | 新场景节点（OOP 无主动权 × 强牌/强听 → check 计划 raise），Phase C；须配「会 cbet 的 aggressor」靶 baseline（P1-5）|
 | **P1-2** | equity MC 方差 / 缓存 | 信息层课题，与场景化正交，原样保留（live 提 `samples` 仍是快赢）|
 | **P1-3** | 特征粒度（坚果度 / kicker / runout）| 节点内响应信号增强，按消费节点拉动（如 river 价值节点需要坚果度）|

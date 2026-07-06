@@ -349,6 +349,60 @@ impl Default for CbetSplit {
     }
 }
 
+/// `post.unopened.float` 节点级门控参数（P0-3 阶段2，`docs/scenario_heuristic_design.md` §5.2/§7）。
+///
+/// float = hero 无主动权、空气、本街无人下注时的延迟 stab 诈唬。其最优频率随**对手翻后
+/// fold-to-stab 反号**（造靶实测：粘站 wideopen float≈0 最优、爱弃进攻方 3bettor float≈高
+/// 最优，且 exploit 无关）→ 任何全局固定乘子必错（Phase B/C 两次驳回）。正确修法 = 按
+/// **面对 hero stab 的 villain 在对偶 `(街.池型)` 节点的 fold 读数**单调门控。
+///
+/// **⚠ 避开朴素 breakeven 陷阱**：不用 `f > s/(s+P)` 直接开关（wideopen fold 47% > 0.5-pot
+/// breakeven 33% 会误判「该 float」，但实测最优是 0——延迟/OOP stab 未弃的对手续街、hero
+/// 空气续街≈0 equity → 朴素 breakeven 高估）。故 fold 只作**驱动信号 + 单调映射**，映射的
+/// 阈值/斜率在造靶上校准使其复现已知最优（见默认值注释）。
+///
+/// **冷启动/未知/小样本安全**：`node_gated=false`、任一对手无名（exploit 关）、或 binding
+/// villain 样本 `n < min_samples` → 回退固定 [`NodesConfig::float_freq_mult`]（= 现默认
+/// 行为）→ 保标准矩阵不退、exploit 关逐字节一致。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FloatGateConfig {
+    /// 是否启用节点级门控（默认 true = 校准后新行为）。false → 恒用 `float_freq_mult` 固定乘子
+    /// （= Phase B/C 的旧路径，用于 paired 对照与关闭剥削）。
+    pub node_gated: bool,
+    /// 信任 villain fold 读数所需的最小 facing 机会数 `n`（binding villain）。低于此 → 回退
+    /// 固定乘子（§H 分特征收敛门；float 对偶 = fold-to-cbet/barrel，中位样本饥饿 → 门设小）。
+    pub min_samples: u32,
+    /// fold 率收缩伪计数强度 `k`（Beta-Binomial；与阶段1 dump 默认一致）。
+    pub shrink_k: f64,
+    /// 单调映射低锚：shrunk_fold ≤ `fold_lo` → 乘子 = `mult_lo`。
+    pub fold_lo: f64,
+    pub mult_lo: f64,
+    /// 单调映射高锚：shrunk_fold ≥ `fold_hi` → 乘子 = `mult_hi`；两锚间线性插值。
+    pub fold_hi: f64,
+    pub mult_hi: f64,
+}
+
+impl Default for FloatGateConfig {
+    fn default() -> Self {
+        // 造靶校准（8000 手 2-max，villain=p1 在 flop.srp 的 shrunk_fold）：
+        //   wideopen（粘站）47% → 乘子≈0（float≈0，复现 +49 最优）；
+        //   3bettor（flop 爱弃）64.5% → 乘子≈高（float≈0.85，复现 +33 最优）。
+        // 锚 [0.50→0.0, 0.65→3.0]：0.47<0.50 → 0（wideopen off）；0.645→t≈0.97→2.9 →
+        //   float=air_bluff_freq_base(0.30)×2.9≈0.87（3bettor 高）。turn/river fold 低（且
+        //   3bettor 那里高 raise 惩罚 float）→ 两靶均映射低 float（正确：延迟街 float 风险高）。
+        FloatGateConfig {
+            node_gated: true,
+            min_samples: 30,
+            shrink_k: 20.0,
+            fold_lo: 0.50,
+            mult_lo: 0.0,
+            fold_hi: 0.65,
+            mult_hi: 3.0,
+        }
+    }
+}
+
 /// 场景森林节点参数子树（Phase B）。已拆分节点在此分参；未拆分节点沿用
 /// `preflop` / `postflop` 共享层。JSON partial 覆盖照常工作（`serde(default)`）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -371,9 +425,14 @@ pub struct NodesConfig {
     pub value_bet: ValueBetSplit,
     /// `post.unopened.cbet_bluff.{srp|3bp}`：c-bet 诈唬池型分参。
     pub cbet: CbetSplit,
-    /// `post.unopened.float` 频率 = 空气诈唬基础频率 × 此乘子（run31 EV 缺口候选，
-    /// 参数化待 Phase C 配靶调优；0.25 试点 sim 正负参半 → 驳回，维持 0.5）。
+    /// `post.unopened.float` **回退**频率乘子（冷启动/未知/小样本/`float.node_gated=false`
+    /// 时用）：float 频率 = 空气诈唬基础频率 × 此乘子。0.5 = Phase B/C 两次驳回一刀切调整后
+    /// 维持的默认（0.25 试点 sim 正负参半）。P0-3 阶段2 起，样本足的已知 villain 走
+    /// [`FloatGateConfig`] 节点级门控取代此固定乘子。
     pub float_freq_mult: f64,
+    /// `post.unopened.float` 节点级门控（P0-3 阶段2）：按 villain 翻后 fold-to-stab 单调映射
+    /// float 频率乘子，取代固定 `float_freq_mult`（冷启动/未知/小样本回退固定乘子）。
+    pub float: FloatGateConfig,
     /// `post.facing.bluff_raise` 频率 = 空气诈唬基础频率 × 此乘子。0.10 = Phase B
     /// 扫参甜点：0.35→0.20/0.10/0.0 均 10/11 配置正（paired 同 seed），越低越好且
     /// 0.10 与 0.0 不可分；与 run31 live 遥测一致（n=13，−15.5±6.4 bb/hand 显著亏）。
@@ -393,6 +452,7 @@ impl Default for NodesConfig {
             value_bet: ValueBetSplit::default(),
             cbet: CbetSplit::default(),
             float_freq_mult: 0.5,
+            float: FloatGateConfig::default(),
             bluff_raise_freq_mult: 0.10,
         }
     }
