@@ -15,7 +15,7 @@
 //! 用法：
 //! ```text
 //! heuristic9_sim [--hands N] [--seats K] [--bb 20] [--start-bb 100] [--samples S] [--seed X]
-//!                [--field mixed|nit|station|maniac|tag|random|limpy|pairedtrap|3bp|flushtrap|3bpfold] [--mirror]
+//!                [--field mixed|nit|station|maniac|tag|random|limpy|pairedtrap|3bp|flushtrap|3bpfold|donk_fold|donk_stick] [--mirror]
 //!                [--exploit] [--config cfg.json] [--trace-summary]
 //! ```
 //! `--config` 覆盖 HeuristicConfig（partial JSON，缺字段走默认）——无需重编即可扫旋钮。
@@ -70,8 +70,22 @@ enum Archetype {
     /// fold-equity。与 `WideOpener`（站式粘跟 = 低 fold-equity）构成 `cbet_bluff.3bp` 频率最优值的
     /// 对靶：若最优频率随对手翻后弃率反号（如 float 先例），此靶应偏好**高** c-bet 频率。
     ThreebetFolder,
+    /// bluff_raise 门造靶（P0-3 阶段2 第二消费轮）之一：**爱 donk-lead 进 hero + 被加注即弃**。
+    /// 翻前松被动（宽跟、几乎不加注 → hero 作 PFA、单加注池）；翻后高频 donk-lead（宽范围下注
+    /// 进 hero → 喂 hero 持 Air 面对下注的 `post.facing.bluff_raise` 节点密度）；作**防守方**
+    /// （面对 hero 首注、自己未 lead）用共享 fold-to-cbet 规则；**唯一分叉**：自己 lead 被 hero
+    /// 加注后**仅 Strong+ 继续、其余全弃 → 高 fold-to-raise**。与 [`Archetype::DonkStick`] 构成
+    /// bluff_raise 频率最优值的对靶（隔离变量 = fold-to-raise，follow PairedTrap「非对子面同 Tag」）。
+    DonkFold,
+    /// bluff_raise 门造靶之二：**爱 donk-lead 进 hero + 被加注即粘**。翻前/donk-lead/防守方规则
+    /// 与 [`Archetype::DonkFold`] **逐字节相同**（→ fold-to-cbet 相同）；**唯一分叉**：自己 lead 被
+    /// hero 加注后**仅 Strong+ 加注、其余全 call → 低 fold-to-raise（几乎不弃）**。
+    DonkStick,
     Hero, // 仅 mirror 模式
 }
+
+/// bluff_raise 造靶共享翻后 donk-lead 参数（DonkFold/DonkStick 唯一差异在 fold-to-raise，见其分支）。
+const DONK_LEAD_FREQ: f64 = 0.60;
 
 /// board 是否成花可能（任一花色 ≥3 张）——顺子被压 / 同花在场的判据。
 fn board_flushy(board: &[Card]) -> bool {
@@ -421,6 +435,19 @@ fn baseline_action(
             }
             return safe_action(&legal);
         }
+        // DonkFold / DonkStick 翻前**逐字节共享**：松被动跟注机——从不加注（→ hero 作 PFA、单加注
+        // 池，翻后 villain 得以 donk-lead 进 hero）；面对 hero open 宽跟建池；first-in 补盲/过牌。
+        if arch == Archetype::DonkFold || arch == Archetype::DonkStick {
+            let facing = to_call > 0;
+            if !facing {
+                return safe_action(&legal); // BB check option / 补盲：不加注、不 stab
+            }
+            // 面对下注：宽跟建池（强度域 + 好赔率），绝不 3bet（保 hero 主动权）。
+            if (strength >= 0.32 || pot_odds < 0.35) && legal.call.is_some() {
+                return Action::Call;
+            }
+            return safe_action(&legal);
+        }
         let (open_thr, call_thr, threebet, aggro) = match arch {
             Archetype::Nit => (0.62, 0.60, 0.70, 0.0),
             Archetype::Station => (0.50, 0.42, 0.72, 0.05),
@@ -433,6 +460,9 @@ fn baseline_action(
             Archetype::FlushTrap => unreachable!("FlushTrap handled above"),
             Archetype::WideOpener | Archetype::ThreeBettor | Archetype::ThreebetFolder => {
                 unreachable!("3bp archetypes handled above")
+            }
+            Archetype::DonkFold | Archetype::DonkStick => {
+                unreachable!("donk archetypes handled above")
             }
             Archetype::Hero => (0.55, 0.50, 0.64, 0.15),
         };
@@ -683,6 +713,36 @@ fn baseline_action(
                 Action::Call
             } else {
                 safe_action(&legal)
+            }
+        }
+        Archetype::DonkFold | Archetype::DonkStick => {
+            // bluff_raise 造靶：翻后 donk-lead 宽 + fold-to-cbet 共享规则；**唯一分叉** = fold-to-raise。
+            // `led` = 本街已 donk-lead（committed_this_round>0）→ 面对下注 = 面对**我方 lead 被加注**
+            //        （fold-to-raise，villain 进攻方）；否则 = 面对**首注**（fold-to-cbet，防守方）。
+            let led = players[seat].committed_this_round.0 > 0;
+            if !facing {
+                // donk-lead：宽范围高频领打进 hero（喂 hero Air 面对下注 → bluff_raise 节点密度）。
+                if rng.unit() < DONK_LEAD_FREQ {
+                    make_bet(0.6, &legal).unwrap_or_else(|| safe_action(&legal))
+                } else {
+                    safe_action(&legal)
+                }
+            } else if led {
+                // 唯一分叉：自己 lead 被 hero 加注 → fold-to-raise。
+                if r >= MadeClass::Strong.rank() && legal_can_raise(&legal) {
+                    make_bet(0.8, &legal).unwrap_or(Action::Call)
+                } else if arch == Archetype::DonkStick {
+                    Action::Call // 低 fold-to-raise：几乎不弃（站式粘 lead）
+                } else {
+                    safe_action(&legal) // 高 fold-to-raise：Strong 以下全弃
+                }
+            } else {
+                // 防守方面对 hero 首注（fold-to-cbet）——两靶**逐字节相同**规则（→ fold-to-cbet 相同）。
+                if r >= MadeClass::TopPair.rank() || dr.has_meaningful_draw() || pot_odds < 0.25 {
+                    Action::Call
+                } else {
+                    safe_action(&legal)
+                }
             }
         }
         Archetype::Tag | Archetype::Hero => {
@@ -1165,6 +1225,12 @@ fn main() {
                 // ——翻前同 WideOpener（hero 作 3bettor 进翻后）、翻后爱弃。2-max = 最高密度。
                 // 不入 mixed pool（默认关，follow 先例：不动既有 --field 逐字节输出）。
                 "3bpfold" | "threebetfolder" => Archetype::ThreebetFolder,
+                // bluff_raise 门造靶（P0-3 阶段2 第二消费轮）：全座 donk-leader（爱领打进 hero →
+                // 喂 hero Air 面对下注的 `post.facing.bluff_raise` 密度）。donk_fold=被加注即弃、
+                // donk_stick=被加注即粘（隔离变量 = fold-to-raise）。不入 mixed pool（默认关，
+                // follow 先例：不动既有 --field 逐字节输出）。2-max = 最高密度。
+                "donk_fold" | "donkfold" => Archetype::DonkFold,
+                "donk_stick" | "donkstick" => Archetype::DonkStick,
                 _ => pool[(k - 1) % pool.len()],
             }
         };

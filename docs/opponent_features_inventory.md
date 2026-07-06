@@ -359,3 +359,33 @@ weigh.replay 逻辑上不复现**；该数值疑似源自更早一版 weigh 脚�
 更稳健**（免受未来 server/driver 时序变化导致终结动作漏采），且零害（分母等于或略升、name 覆盖实测
 100%）。前置 #3 的价值＝正确性/健壮性，而非分母恢复；② turn/river fold 先验须扩测 weigh.py 校准；
 ③ 候选① raise 极性代理样本饥饿（river raise 稀有），短期近群体级偏坚果假设。
+
+---
+
+## 落地记录：P0-3 阶段2 第二消费轮（bluff_raise 门）**REJECTED**（2026-07-06）
+
+float 门（首个消费轮）SHIPPED 后，尝试对 `post.facing.bluff_raise` 复用同机制（本清单 line 314/326-327
+预留「同吃 §C fold 桶」）。走完整闭环后判定 **REJECTED**——**信号归属预判有误、代理不成立**（诚实修订）：
+
+- **float vs bluff_raise 的角色分野**：float 杠杆 = villain **作防守方**的 fold-to-cbet（§C），门读 §C
+  fold 桶 = **same-role**（成立）。bluff_raise 杠杆 = villain **作进攻方被加注**的 **fold-to-RAISE**
+  （属 §B「villain 进攻方极性」一类，**非** §C 防守方 fold），门却只能读 §C fold-to-cbet = **跨角色代理**。
+- **采集侧硬约束**：`observe_facing`（`opponent.rs:270`）被 re-raise 即 break + 开火者不入 facing
+  → **fold-to-raise 从未进 `facing` 表**。门物理上读不到 bluff_raise 的真信号。
+- **造靶实证**（`DonkFold`/`DonkStick`，隔离变量 = fold-to-raise）：两靶 villain fold-to-cbet
+  **flop.srp 逐字节相同 33.8%**，但 bluff_raise 最优频率**相反**（DonkFold 高频最优 +135~+266 mbb/g、
+  DonkStick 低频最优 −289~−300，3 seed paired 一致）。门读 fold-to-cbet 返回相同乘子 → 无法剥削反号。
+  「作防守方弃牌倾向」与「作进攻方被加注弃牌倾向」是**独立两轴**。
+- **正确修法（列 §B/§H 扩展）**：先扩 `observe_facing` 采 **fold-to-raise**（进攻方被 re-raise 的首次
+  响应，当前 break 掉），再照 float same-role 门控 bluff_raise。**在此之前，bluff_raise 不做画像门控**，
+  维持固定 `bluff_raise_freq_mult=0.10`（sweep 证对 sticky/常见场近最优）。
+- 造靶夹具 `DonkFold`/`DonkStick` 保留待 fold-to-raise 采集落地。诊断/数据见
+  `scratchpad/p03_bluff_raise/DIAGNOSIS.md` + `docs/heuristic9_design.md` §6。
+
+**信号归属订正表**（覆盖 DESIGN.md §2 旧表 bluff_raise 行）：
+
+| 消费门 | 真杠杆 | villain 角色 | 清单归属 | 采集侧现状 |
+|---|---|---|---|---|
+| float 频率 | fold-to-cbet | **防守方** | §C fold 桶 | ✅ 已采（same-role，SHIPPED）|
+| **bluff_raise 频率** | **fold-to-raise** | **进攻方被加注** | **§B**（非 §C）| ❌ 未采（break 掉）→ 门无从读，REJECT |
+| cbet 过度诈唬 | fold-to-cbet | 防守方 | §C fold 桶 | ✅ 已采（same-role，留后续轮）|

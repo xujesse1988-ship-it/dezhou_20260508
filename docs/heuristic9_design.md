@@ -514,6 +514,43 @@ vs baseline binary(HEAD `e74b9c1`) **逐字节一致**；`node_gated=false`+expl
 3bp/srp c-bet 过度诈唬门；多人池现取最粘者 min-fold 近似（HU 为主场做干净，多人池任一对手未知即回退
 默认——保守但不误开）。
 
+### P0-3 阶段2 第二消费轮（bluff_raise 门）：造靶落地 + 引擎改动**驳回**（2026-07-06）
+
+float 门（same-role）成功后，尝试对 `post.facing.bluff_raise`（纯诈唬加注频率乘子
+`nodes.bluff_raise_freq_mult=0.10`）复用同机制。走完整闭环（先证据后接线），判定 **REJECTED**——
+不是失败，是「代理不成立」的合法结论（照候选①成花板 REJECT 先例：造靶保留、零引擎行为变更）。
+
+**现状**：`bluff_raise` 频率 = `air_bluff_freq_base × 0.10`（clamp[0,0.4]），全局固定乘子。触发条件 =
+hero 持 Air、无有效听牌、**面对 villain 下注**、`can_raise`、非河。
+
+**杠杆（关键，与 float 的分野）**：bluff_raise 的 EV 杠杆 = villain 的 **fold-to-RAISE**（villain 作
+**进攻方被加注**）。float 门 same-role 成立是因 float 杠杆 = fold-to-cbet（villain 作**防守方**），门读的
+正是 fold-to-cbet；bluff_raise 若照抄，门读 `shrunk_fold`（= fold-to-cbet，villain 作**防守方**），
+与真杠杆 fold-to-raise **跨角色**。且采集侧 `observe_facing` **被 re-raise 即 break、开火者不入 facing**
+→ **fold-to-raise 从未进表**，门物理上读不到正确信号。
+
+**造靶（隔离变量，follow PairedTrap「非对子面同 Tag」）**：`tools/heuristic9_sim.rs` 新增
+`DonkFold`/`DonkStick` 两 archetype + `--field donk_fold|donk_stick`（不入 mixed pool、默认关，既有
+`--field` 5 靶逐字节等价已验）。两靶**共享**翻前松被动 + 翻后 donk-lead 宽（喂 hero Air 面对下注密度：
+标准靶 bluff_raise 仅 15-18 takes/8000，donk 靶 m=0.10 → 35、m=2.0 → 441-473，机会 ≈1100/8000）+
+防守方 fold-to-cbet 规则；**唯一分叉 = fold-to-raise**（自己 lead 被 hero 加注后：DonkFold 仅 Strong+
+继续、其余全弃 = 高 fold-to-raise；DonkStick 仅 Strong+ 加注、其余全 call = 低 fold-to-raise）。
+
+**sim 数据**：
+- **纪律 A（sweep 反号，成立）**：`bluff_raise_freq_mult` ∈ {0,0.1,0.5,1,2} paired 同 seed{7,11,23}
+  8000 手。DonkFold 单调↑（seed7 290→556，3 seed 均 +135~+266 mbb/g，高频最优）；DonkStick 单调↓
+  （seed7 1575→1286，3 seed 均 −289~−300，低频最优）。**反号真实**——一个固定乘子只能赢一边。
+- **纪律 B（代理失效，决定性）**：两靶 villain(p1) 的 fold-to-cbet（门实际读的 `shrunk_fold`）
+  **flop.srp 逐字节相同 33.8%（n=1266）**、turn.srp 21.9/22.0、river.srp 24.1/27.2；而最优 bluff_raise
+  频率**相反**。门读 fold-to-cbet 对两靶返回**相同乘子** → 无法剥削反号。villain 的「作防守方弃牌倾向」
+  与「作进攻方被加注弃牌倾向」是**独立两轴**，本靶隔离证明可任意解耦。
+
+**判定 = REJECTED**：反号真实但门读的 fold-to-cbet **不能代理** fold-to-raise（跨角色）。**正确修法**
+（非本轮）= 先扩采集 fold-to-raise（Phase-1 §B/§H：`observe_facing` 记进攻方被 re-raise 的首次响应），
+再照 float same-role 门控。现状固定 `bluff_raise_freq_mult=0.10` 对 sticky/常见场近最优（sweep 低频侧
+最优），**维持不动、零引擎改动**。造靶 `DonkFold`/`DonkStick` 保留为 fold-to-raise 采集落地后的门控
+验证载荷。诊断全文 `scratchpad/p03_bluff_raise/DIAGNOSIS.md`。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街
