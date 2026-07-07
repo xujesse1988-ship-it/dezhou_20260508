@@ -1029,17 +1029,45 @@ node_gated 关回退 / n=0 flat 放大 vs 节点门 n<min 回退 / subsume 1.30 
 
 ### 迭代 backlog（下一步，按优先级）
 
-1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街
-   标签，`view.rs` 按标签分段、按权威盲座定位 → 幻影空座不再扰乱分段/位置（实盘 A/B 坐实，0 回归）。
-2. **剥削对纯 nit 场仍欠力**：adjust_cap 已到安全上限 0.12（再高 nit 断崖）。要进一步榨干
+> **本节 = 跨 session 循环恢复的单一入口**（各轮细节仍在 §6 对应记录，此处只收拢前沿 + 指针）。
+> **P0-3 阶段2 消费门弧线现状（截至 2026-07-07，HEAD `3cb611f`）**：7 ship / 3 reject / 1 robust。
+> ship = float(`30f0b09`) / cbet-srp 频率(`058c1f5`) / bluff_raise v2(`63b5822`) / §D 采集(`bad0396`) /
+> §D live 接线(`0613410`) / value_bet.srp 尺寸放大(`3cb611f`) + fold-to-raise 采集(`fac17a8`)。
+> **经验规律**：same-role 密集信号（信号轴=杠杆轴）→ ship；跨角色/稀疏/无反号 → reject/robust。
+
+#### A. P0-3 消费门前沿（本主线，按 ROI 排序）
+
+1. **turn/river barrel 频率独立门**（**最顺、推荐先做**）：same-role 密集频率信号
+   `fold-to-turn-barrel`/`fold-to-river-barrel`（`turn.<池型>`/`river.<池型>` 节点**已采**在 facing 表），
+   照 float/cbet-srp 频率门四函数范式。现状 turn/river barrel 频率随 srp flop 锚同映射（未独立门）。
+   预期同 cbet 频率门（反号 + 密集）→ 大概率干净 ship。指针：§6 cbet 门记录「范围外」。
+2. **value 放大扩街/扩叶**：flat A（`3cb611f`）只做了 `value_bet.srp`（flop c-bet 价值）。
+   `bigger-never-worse` 或可扩到 turn/river 价值注 + `value_raise` 叶。**须重验**：flop 上 limpy 已现
+   3/3 微负苗头（深在 CI 内），扩街对 limper 过放大风险更高，逐街逐叶独立过标准矩阵。指针：§6 第七轮记录。
+3. **Station 分类覆盖 gap**（结构性、惠及多门）：现画像分类看翻前 VPIP/AF，**漏「翻后粘 + 翻前激进」
+   对手**（WideOpener/3bpfold 未被判 Station → 现拿 mult 1.0；主会话实测 `station_value_size_mult`
+   在 sim 完全惰性）。补法 = 放宽 station 分类或节点级化——影响 `value_shift`/`bluff_mult`/`value_size_mult`
+   **所有画像调整**，非只尺寸。须独立证 beats 画像 + 过标准场含 station 不双重放大。指针：§6 第六轮记录(:987)。
+4. **§G flush_board 细化 §D → 复活候选①**（**低优先，稀疏边际**）：候选① 四次 REJECT，v4 处方 =
+   `river.<池型>.flush_board.attack_showdown`（只成花板计摊牌 → 治 §D 纹理盲稀释 + 冷启动累积偏差）。
+   属 §D 采集侧改动。**风险**：成花板摊牌比全河牌攻击更稀 → 门更慢热；且 v4 已证 value_raise 侧死码、
+   增益边际（领打超池为主漏）。指针：inventory §D 落地记录(:423) + §6 候选① v3/v4 记录。
+
+#### B. 结构性 backlog（跨主线、长期）
+
+5. **剥削对纯 nit 场仍欠力**：adjust_cap 已到安全上限 0.12（再高 nit 断崖）。要进一步榨干
    紧场需结构改动——把「模型对手紧（助我弃）」与「利用其高弃率（助我攻）」解耦，因为同一
    equity 既驱动跟注又驱动下注，对手收紧会同时压住我方进攻。非全 nit 的真实混合场剥削已正收益。
-3. **equity 遥测统一标度**：翻前 fold 短路返回 vs-random `strength`、翻后返回 vs-range
+6. **equity 遥测统一标度**：翻前 fold 短路返回 vs-random `strength`、翻后返回 vs-range
    equity，`heuristic9_analyze.py` 的「弃了 +equity」标记会混标度误报。统一成 vs-range。
-4. **混合/平衡**：`MixingConfig.temperature` 目前只用频率门，可加边界动作 softmax 混合
+7. **混合/平衡**：`MixingConfig.temperature` 目前只用频率门，可加边界动作 softmax 混合
    降可剥削性。
-5. **live 数据闭环**：表有活人时跑满 1000 手 → `heuristic9_analyze.py` 出漏洞报告 → 迭代。
-   当前平台活跃度低（实测仅 1 对手），数据攒得慢。
+8. **live 数据闭环**：表有活人时跑满 1000 手 → `heuristic9_analyze.py` 出漏洞报告 → 迭代。
+   当前平台活跃度低（实测仅 1 对手），数据攒得慢。§D 摊牌信号已 live 接线（`0613410`）→ 攻击方
+   摊牌牌力构成随实盘累积。
+
+> ✅ **已 v0.4 解决**（保留备查）：稀疏占座 compact 重映射（driver `_compact_blinds` 权威盲座 + 逐动作
+> 街标签，`view.rs` 分段/定位；实盘 A/B 0 回归）。
 
 ### 如何升级（操作）
 
