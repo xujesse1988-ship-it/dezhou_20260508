@@ -988,6 +988,45 @@ WideOpener Δ **+202**（3/3 正）、ThreebetFolder Δ **+8.9**（1/3 负）。
 激进），补法 = **单向** value-size boost 或放宽 station 分类，是另一 feature（须独立证 beats 画像 + 过标准场含
 station 避双重放大 + 节点差异化落 CI），留后续轮。诊断全文 `scratchpad/p03_cbet_value_size/DIAGNOSIS.md`。
 
+### P0-3 阶段2 第七消费轮（srp value_bet 尺寸**单向放大**）：**SHIP 平放大 A（flat ×1.5）**（2026-07-07）
+
+第六消费轮引申的落地：捕获画像分类漏掉的「翻后粘 + 翻前激进」对手的**放大**增益（WideOpener +310，
+现 `value_size_mult` 恒 1.0 漏掉）。核心工程问题 = **平放大 A 够不够，还是要节点门 B 的精度？** 用 A/B
+正面对比按证据选（rail #3：能简单就别上门）。
+
+**接线**：`CbetValueSizeGateConfig`（挂 `NodesConfig.cbet_value_size_gate`）。value_bet.srp 叶尺寸乘子由
+`adj.value_size_mult` 换为 `value_bet_size_mult(ctx,pot)`（四函数门，照 cbet/float 范式）；commit/value_raise
+叶**不碰**（仍 `adj.value_size_mult`，byte-equal）。激活时 `mult = max(map(fold), adj.value_size_mult)`——
+`.max(1.0)` 结构**单向不缩小**，`max(_, adj)` **subsume 画像 station 1.30x（不双重放大、不回退分类站）**。
+**默认 flat**（两 fold 锚同乘子 1.5、`min_samples=0`）= 平放大 A：对任一有名对手恒 ×1.5。回退（byte-equal）：
+`node_gated=false` / 无名（exploit 关）/ 非 srp → `adj.value_size_mult`。
+
+**A/B 对比（决定性）= A ≥ B 逐点估**。三配置同二进制、config 选。两靶 8000 手 2-max --exploit paired（mbb/g）：
+
+| 靶 | OFF 均值 | A(flat) Δ均值 | B(node) Δ均值 |
+|---|---|---|---|
+| wideopen（粘 fold47.5%）| 679.7 | **+259.8**（3/3 正）| +249.8（3/3 正）|
+| 3bpfold（爱弃 fold79.6%）| 939.1 | **+54.3**（2/3 正，s7 −20.6 噪声）| +44.4（3/3 正）|
+
+wideopen 两者大赢近平（A 微高：`min_samples=0` 首手即放大 vs B 需攒样本）；**3bpfold A 均值反更高**——sweep
+早证爱弃靶大尺寸 wash 偏**大**（1.0 让出 ~+18），B「回落保护」丢这 +18。**nit 靶（B 保护高 fold 尾最应占优处）
+仍 A ≥ B**：2max A +4.9 / B +0.4、6max A +22.8 / B +13.5 mbb/g。**机理**：价值注尺寸对**所有**对手（含 nit）
+「越大越不亏」——nit 弃 trash 于任何尺寸、跟时持强牌付更大注，「大注逼出中张」的理论风险不成立（nit range
+极化缺中张）→ **B 的节点精度无独有 EV、只让出放大增益 → ship A（更简单不劣）**。
+
+**标准 11-config（ON=默认 flat A vs baseline=OFF=HEAD，8000 手 --exploit）= 0/11 退**：全 11 落 CI95 内、
+0 退化、fb=0 / drift=0。净正偏（6max mixed +62/+123/+101、station +183/+93/+46、9max +46 全正；limpy
+−95/−32/−16、2max −7 三 seed 微负但深在噪声 ±889~1254 内）。**station 场（含分类 station fallback=1.30）ON
+仍正且 in-band → subsume（max 非乘积）确证不双重放大。**
+
+**byte-equal**：`node_gated=false`（exploit ON）/ exploit-OFF 默认 `{}`（无名回退）vs HEAD 均**逐字节相同**；
+默认 `{}` == 独立 `flatA.json` 逐字节相同（ship 默认 = 已验平放大 A）。`policy.rs` 内 **7 新单测**
+（`value_size_gate_tests`：flat 默认恒 1.5 / 递减节点门能力 + 单向 `.max(1.0)`（含敌意锚）/ 冷启动/无名/
+node_gated 关回退 / n=0 flat 放大 vs 节点门 n<min 回退 / subsume 1.30 非 1.95 / binding 最粘者）。
+
+**判定 = SHIP 平放大 A。** 节点门 B 能力（递减锚）保留于 config（`mult_hi<mult_lo`+`min_samples=30` 即开），
+供 live 数据后续证需时 config-only 校准，本轮证暂无此需。诊断全文 `scratchpad/p03_value_size_flat/DIAGNOSIS.md`。
+
 ### 迭代 backlog（下一步，按优先级）
 
 1. ✅ **已 v0.4 解决**：稀疏占座 compact 重映射。driver 用 `_compact_blinds` 发权威盲座 + 逐动作街

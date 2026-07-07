@@ -389,6 +389,7 @@ float 门（首个消费轮）SHIPPED 后，尝试对 `post.facing.bluff_raise` 
 | float 频率 | fold-to-cbet | **防守方** | §C fold 桶 | ✅ 已采（same-role，SHIPPED）|
 | **bluff_raise 频率** | **fold-to-raise** | **进攻方被加注** | **§B**（非 §C）| ✅ 已采（`*.facing_raise`）→ same-role 门控 **SHIPPED**（2026-07-06，双向门，读 `facing_raise_node_key`）|
 | **cbet 过度诈唬（srp）** | fold-to-cbet | 防守方 | §C fold 桶 | ✅ 已采（same-role，**SHIPPED**）|
+| **value_bet 尺寸（srp，单向放大）** | fold-to-cbet（仅门/回退用；ship = **平放大**与读数无关） | 防守方 | §C fold 桶 | ✅ 已采（same-role）→ **平放大 A SHIPPED**（2026-07-07，`CbetValueSizeGateConfig` 默认 flat ×1.5、subsume 画像 station 1.30x；A/B 对比证节点微分不占优含 nit，见下）|
 | **候选① river 极化门（value_raise 降级 / 领打压尺寸）** | **摊牌 range 极性（flush-only）** | **进攻方（下注/加注）** | **§D 摊牌**（§B raise 桶仅代理） | ✅ **§D 已采+live 接线**（`*.attack_showdown.nonnut_flush`，SHIPPED）→ **§D 门重做（第四次）REJECTED**（2026-07-06，纹理盲 §D 决策时冷启动/稀释、靶正与标准 0/11 互斥，处方 §G 成花纹理维，见下） |
 
 > **bluff_raise 门 SHIPPED（重做 = 上轮 REJECT 的正解）**：上轮门读 fold-to-cbet（跨角色）两靶逐字节

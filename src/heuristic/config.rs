@@ -529,6 +529,82 @@ impl Default for BluffRaiseGateConfig {
     }
 }
 
+/// `post.unopened.value_bet.srp` **价值下注尺寸**节点级门控（P0-3 阶段2 第七消费轮，
+/// `docs/heuristic9_design.md` §6）。
+///
+/// value_bet = hero 作 PFR 进攻方、翻后本街无人下注、持 MidPair+ 真牌的价值下注。杠杆同轴
+/// （hero 进攻方价值下注、villain 防守方面对 → 读 [`crate::heuristic::opponent::facing_node_key`]`(街,"srp")`
+/// 的 **fold-to-cbet**，与 cbet 频率门 / float 门同轴）。
+///
+/// **单向放大门（本轮 vs 上轮 CONFIRMED-ROBUST 的关键差别）**：上轮（commit 5634b62）造靶 sweep 证
+/// 价值注尺寸最优值**不随** villain 粘度**反号**——粘站 WideOpener（fold 47.5%）清晰要**大**（1.60
+/// 最优、+310 vs 1.0、单调↑）、爱弃 ThreebetFolder（fold 79.6%）**wash 偏大不要小**（933–957 跨度
+/// 23 ≪ CI95 ±270）。双向门（含「爱弃→缩小」）实测证伪。但同轮挖出真机会：**两靶均不分类 Station**
+/// （画像看翻前 VPIP/AF，漏「翻后粘 + 翻前激进」对手）→ 现 `value_size_mult` 恒 1.0、漏掉 WideOpener
+/// +310 的放大增益。本门**单向捕获**这半：只做「放大」半（sweep 证有收益），不做「缩小」半（证伪）。
+///
+/// **本轮判定 = ship 平放大 A（flat 1.5），非节点门 B**：A/B 正面对比（`docs/heuristic9_design.md` §6）：
+/// 平放大（value_bet.srp 恒 ×1.5）vs 节点门（低 fold→1.5 / 高 fold→1.0）在两靶 + 标准 11-config + **nit
+/// 靶**（B「保护高 fold 尾」应最占优处）实测 **A ≥ B 逐点估**（nit 2max A +4.9 / B +0.4、6max A +22.8 /
+/// B +13.5 mbb/g）。机理：价值注尺寸对**所有**对手「越大越不亏」（含 nit：nit 弃 trash 于任何尺寸、跟
+/// 时持强牌付更大注），故 B「回落高 fold 保爱弃尾」是**无的放矢**（那半没损失可保），反让出放大 EV。
+/// → 平放大更简单且不劣（rail #3）→ **默认 flat**（`fold_lo/fold_hi` 两锚同乘子 1.5 = 无 fold 微分）。
+/// 递减单向映射能力保留（锚可配），供 live 数据后续证需时（config-only）再校准，本轮证暂无此需。
+///
+/// **subsume 画像乘子（避双重放大）**：激活时用 `max(mult, adj.value_size_mult)`——既保证不低于画像
+/// station 1.30x（不回退已分类站），又用 `max` 而非乘积**吸收**画像乘子（不与其双重放大）。且 `map`
+/// 结果下夹 1.0（`mult.max(1.0)`）→ **结构上单向**，任何锚配置都不缩小。
+///
+/// **仅门控 srp 池**（区别于 value_raise/commit 叶不碰；3bp/other value_bet 保画像乘子）：sweep 只在
+/// value_bet.srp 叶做、密度 1648/1080 每 8000 手足。非 srp 池 → 回退 `adj.value_size_mult`（byte-equal）。
+///
+/// **冷启动/未知安全**：`node_gated=false`、任一对手无名（exploit 关：sim `names` 空 / live 缺名）、
+/// binding villain 样本 `n < min_samples`、或非 srp 池 → 回退 `adj.value_size_mult` → 保标准矩阵不退、
+/// exploit 关逐字节一致。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CbetValueSizeGateConfig {
+    /// 是否启用节点级门控（默认 true = 校准后新行为）。false → 恒回退 `adj.value_size_mult`（=
+    /// 现固定尺寸路径，用于 paired 对照与关闭剥削）。
+    pub node_gated: bool,
+    /// 信任 binding villain（有名）所需的最小 facing 机会数 `n`。低于此 → 回退 `adj.value_size_mult`。
+    /// **默认 0 = 对任一有名对手即放大**（平放大 A 与 villain 读数无关：价值注越大越不亏，见结构注释；
+    /// sweep/矩阵以 `min_samples=0` 验）。>0 时可要求「至少见过 N 次」再放大（保守；`fold_lo/fold_hi`
+    /// 微分时才需读足样本）。
+    pub min_samples: u32,
+    /// fold 率收缩伪计数强度 `k`（Beta-Binomial；与阶段1 dump / float / cbet 门默认一致）。仅
+    /// `fold_lo != fold_hi`（node-differentiation）时影响乘子；默认 flat（两锚同乘子）下 fold 读被忽略。
+    pub shrink_k: f64,
+    /// 单调（递减）映射低 fold 锚：shrunk_fold ≤ `fold_lo` → 乘子 = `mult_lo`（粘站侧）。
+    /// **默认 `mult_lo == mult_hi == 1.5` → flat（无 fold 微分，= 本轮 ship 的平放大 A）**。
+    pub fold_lo: f64,
+    pub mult_lo: f64,
+    /// 单调映射高 fold 锚：shrunk_fold ≥ `fold_hi` → 乘子 = `mult_hi`（爱弃侧）；两锚间线性插值。
+    /// 映射结果结构上下夹 1.0（单向不缩小）。默认与 `mult_lo` 同 → flat。设 `mult_hi < mult_lo` 可开
+    /// 「低 fold 放大 / 高 fold 回落」节点门 B（本轮证不占优，留后续 config-only 校准）。
+    pub fold_hi: f64,
+    pub mult_hi: f64,
+}
+
+impl Default for CbetValueSizeGateConfig {
+    fn default() -> Self {
+        // 本轮 ship = **平放大 A**（value_bet.srp 恒 ×1.5，对任一有名对手）。A/B 对比（§6）证 A ≥ B
+        // 逐点估（含 nit 靶），平放大更简单且不劣（rail #3）→ 默认 flat：两 fold 锚同乘子 1.5 → 线性插值
+        // 恒 1.5（无 fold 微分）；`min_samples=0` → 对任一有名对手即放大（价值注越大越不亏，与读数无关）。
+        // 激活时 `max(1.5, adj.value_size_mult)` → subsume 画像 station 1.30x（不双重放大、不回退分类站）。
+        // 递减节点门能力保留（设 `mult_hi<mult_lo` + `min_samples=30`）供后续 live 校准，本轮证暂无此需。
+        CbetValueSizeGateConfig {
+            node_gated: true,
+            min_samples: 0,
+            shrink_k: 20.0,
+            fold_lo: 0.50,
+            mult_lo: 1.5,
+            fold_hi: 0.80,
+            mult_hi: 1.5,
+        }
+    }
+}
+
 /// 场景森林节点参数子树（Phase B）。已拆分节点在此分参；未拆分节点沿用
 /// `preflop` / `postflop` 共享层。JSON partial 覆盖照常工作（`serde(default)`）。
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -574,6 +650,12 @@ pub struct NodesConfig {
     /// 粘站降频止损，区别于 cbet 只降）。冷启动/未知/小样本/`node_gated=false` 回退固定
     /// `bluff_raise_freq_mult`。上轮跨角色代理（读 fold-to-cbet）被 REJECT，本轮读 fold-to-raise 同轴。
     pub bluff_raise_gate: BluffRaiseGateConfig,
+    /// `post.unopened.value_bet.srp` **价值下注尺寸**放大门（P0-3 阶段2 第七消费轮）：对任一有名对手把
+    /// srp 价值注尺寸乘子放大 **~1.5**（捕获画像漏分类的「翻后粘 + 翻前激进」对手 +310 增益；A/B 对比证
+    /// 平放大 ≥ 节点门、含 nit，见 §6）。激活时 `max(1.5, adj.value_size_mult)` subsume 画像 station
+    /// 1.30x（**不双重放大**）。仅门控 srp；冷启动/无名/非 srp/`node_gated=false` 回退 `adj.value_size_mult`
+    /// （byte-equal）。递减节点门（低 fold 放大 / 高 fold 回落）能力保留（锚可配），本轮证不占优。
+    pub cbet_value_size_gate: CbetValueSizeGateConfig,
 }
 
 impl Default for NodesConfig {
@@ -592,6 +674,7 @@ impl Default for NodesConfig {
             float: FloatGateConfig::default(),
             bluff_raise_freq_mult: 0.10,
             bluff_raise_gate: BluffRaiseGateConfig::default(),
+            cbet_value_size_gate: CbetValueSizeGateConfig::default(),
         }
     }
 }

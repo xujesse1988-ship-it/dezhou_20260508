@@ -976,6 +976,96 @@ fn bluff_raise_freq_mult_gated(ctx: &NodeCtx) -> f64 {
     bluff_raise_mult_from_readout(binding, nc)
 }
 
+// ---------------------------------------------------------------------------
+// P0-3 阶段2 第七消费轮：srp value_bet **尺寸** 放大门（**单向放大**，same-role fold-to-cbet）。
+// 上轮（5634b62）造靶 sweep 证价值注尺寸最优值**不随** villain 粘度反号（粘站清晰要大 +310 /
+// 爱弃 wash 不要小）→ 双向门证伪。但同轮挖出真机会：两靶均不分类 Station、画像 `value_size_mult`
+// 恒 1.0 漏掉粘站放大增益。**本轮 ship = 平放大 A（flat 1.5），非节点门 B**：A/B 对比（含 nit 靶，
+// §6）证 **A ≥ B 逐点估**——价值注尺寸对所有对手（含 nit）「越大越不亏」，故节点门「回落高 fold 保
+// 爱弃尾」无的放矢、反让出放大 EV → 平放大更简单不劣（rail #3）。默认 flat（两 fold 锚同乘子 1.5）；
+// 递减单向门能力保留（`.max(1.0)` 结构单向 + 锚可配）供 live 后续校准。激活 `max(mult, adj.value_size_mult)`
+// subsume 画像 station 1.30x（不双重放大）。四函数照 cbet/float 四函数写；作用叶仅 value_bet.srp。
+// ---------------------------------------------------------------------------
+
+/// fold-to-cbet 率 → srp value_bet 尺寸乘子的单调（递减）映射（两锚线性插值，`.max(1.0)` 下夹 →
+/// **结构上单向不缩小**）：默认两锚同乘子 1.5 → **恒 1.5（平放大，无 fold 微分）**；设 `mult_hi < mult_lo`
+/// 则低 fold（粘）→ 高乘子放大、高 fold（爱弃）→ 低乘子回落（节点门 B，本轮证不占优，锚可配）。
+/// `fold_hi <= fold_lo` → 退化为常乘子 `mult_lo`（constant-mode，供 sweep / 对照）。
+fn map_fold_to_value_size_mult(
+    fold: f64,
+    vg: &crate::heuristic::config::CbetValueSizeGateConfig,
+) -> f64 {
+    if vg.fold_hi <= vg.fold_lo {
+        return vg.mult_lo.max(1.0);
+    }
+    let t = ((fold - vg.fold_lo) / (vg.fold_hi - vg.fold_lo)).clamp(0.0, 1.0);
+    (vg.mult_lo + t * (vg.mult_hi - vg.mult_lo)).max(1.0)
+}
+
+/// binding villain 的节点级 fold-to-cbet 读数（对偶 `(街.池型)` 节点上、面对 hero c-bet 的**最粘者**
+/// min shrunk_fold —— 价值注对最粘者放大最赚，取 min 保守）。`None` = 无法门控 → 回退 `adj.value_size_mult`：
+/// 翻前（不应到达）、或任一对手无名（exploit 关：sim `names` 空 / live 缺名 → 逐字节回退）。
+/// 节点 key 用与采集侧同口径的 [`facing_node_key`]/[`pot_type_name`] 构造（§5.2 单一坐标系）。
+fn value_size_binding_readout(
+    view: &GameView,
+    opp: &OpponentTable,
+    vg: &crate::heuristic::config::CbetValueSizeGateConfig,
+) -> Option<(f64, u32)> {
+    let street = match view.street {
+        Street::Flop => 1u8,
+        Street::Turn => 2,
+        Street::River | Street::Showdown => 3,
+        Street::Preflop => return None, // value_bet 语境本就翻后；翻前 → 回退。
+    };
+    let node = facing_node_key(street, pot_type_name(view.preflop_num_raises));
+    let mut binding: Option<(f64, u32)> = None; // (shrunk_fold, n)
+    for s in 0..view.num_seats as usize {
+        if s == view.my_seat as usize || view.folded[s] {
+            continue;
+        }
+        // 有对手无名 → None（exploit 关回退，保 byte-equal）。
+        let name = view.names.get(&(s as u8))?;
+        let r = opp.node_readout(name, &node, vg.shrink_k);
+        binding = Some(match binding {
+            Some(prev) if prev.0 <= r.shrunk_fold => prev, // 保留更小 fold（更粘 = binding）
+            _ => (r.shrunk_fold, r.n),
+        });
+    }
+    binding
+}
+
+/// binding 读数 → srp value_bet 尺寸乘子（纯核，可单测）：node_gated 关 / 冷启动（`None`）/ binding
+/// 样本 `n < min_samples` → **回退 `fallback`**（= `adj.value_size_mult`，保留现固定尺寸行为、byte-equal）；
+/// 样本足 → `max(map(fold), fallback)`（**subsume 画像**：不低于 station 1.30x、不双重放大、不缩小）。
+fn value_size_mult_from_readout(
+    binding: Option<(f64, u32)>,
+    vg: &crate::heuristic::config::CbetValueSizeGateConfig,
+    fallback: f64,
+) -> f64 {
+    if !vg.node_gated {
+        return fallback;
+    }
+    match binding {
+        Some((fold, n)) if n >= vg.min_samples => {
+            map_fold_to_value_size_mult(fold, vg).max(fallback)
+        }
+        _ => fallback,
+    }
+}
+
+/// `post.unopened.value_bet.srp` 尺寸乘子（P0-3 阶段2 第七消费轮）：查 binding villain fold-to-cbet 读数
+/// → 纯核映射。**仅 srp 池门控**（3bp/other/limped → 回退 `adj.value_size_mult`，保现固定尺寸）。回退
+/// 值 = `adj.value_size_mult`（激活时 subsume 之，不双重放大）。
+fn value_bet_size_mult(ctx: &NodeCtx, pot: PotType) -> f64 {
+    let fallback = ctx.adj.value_size_mult;
+    if pot != PotType::SingleRaised {
+        return fallback; // 仅 srp 门控；3bp/other 保画像乘子（byte-equal 现行）。
+    }
+    let vg = &ctx.cfg.nodes.cbet_value_size_gate;
+    let binding = value_size_binding_readout(ctx.view, ctx.opp, vg);
+    value_size_mult_from_readout(binding, vg, fallback)
+}
+
 /// `post.unopened`：翻后本街无人下注（下注 vs 过牌）。价值与 c-bet 按池型分参。
 /// 叶：`post.unopened.value_bet[.srp|.3bp]` / `post.unopened.{commit|semibluff}` /
 /// `post.unopened.cbet_bluff[.srp|.3bp]` / `post.unopened.{float|check}`。
@@ -1004,7 +1094,16 @@ fn post_unopened(ctx: &NodeCtx, pot: PotType, rng: &mut Rng, mut tr: DecisionTra
         s.equity >= value_thr,
     );
     if s.equity >= value_thr && s.made.rank() >= MadeClass::MidPair.rank() {
-        let size = value_size(view, oc, &s.tex, s.made, s.spr, ctx.adj);
+        // P0-3 阶段2 第七消费轮：srp value_bet 尺寸乘子按 binding villain 节点级 fold-to-cbet 单向门控
+        // （低 fold 放大 / 高 fold 回落 1.0，subsume 画像）。非 srp/冷启动/无名/小样本 → `adj.value_size_mult`。
+        let size = value_size(
+            view,
+            oc,
+            &s.tex,
+            s.made,
+            s.spr,
+            value_bet_size_mult(ctx, pot),
+        );
         return traced(
             bet_size_decision(view, size, s.equity, "postflop:value_bet"),
             tr,
@@ -1019,7 +1118,8 @@ fn post_unopened(ctx: &NodeCtx, pot: PotType, rng: &mut Rng, mut tr: DecisionTra
         s.spr < oc.commit_spr,
     );
     if s.spr < oc.commit_spr && s.made.rank() >= MadeClass::TopPair.rank() {
-        let size = value_size(view, oc, &s.tex, s.made, s.spr, ctx.adj);
+        // commit 叶不在本轮尺寸门作用域（仅 value_bet）→ 用画像乘子（byte-equal）。
+        let size = value_size(view, oc, &s.tex, s.made, s.spr, ctx.adj.value_size_mult);
         return traced(
             bet_size_decision(view, size, s.equity, "postflop:commit_bet"),
             tr,
@@ -1141,7 +1241,8 @@ fn post_facing_bet(ctx: &NodeCtx, _pot: PotType, rng: &mut Rng, mut tr: Decision
         && s.made.rank() >= MadeClass::TopPair.rank()
         && view.valid.can_raise
     {
-        let size = value_size(view, oc, &s.tex, s.made, s.spr, ctx.adj);
+        // value_raise 叶不在本轮尺寸门作用域（仅 value_bet）→ 用画像乘子（byte-equal）。
+        let size = value_size(view, oc, &s.tex, s.made, s.spr, ctx.adj.value_size_mult);
         return traced(
             raise_pot_fraction(view, size, s.equity, "postflop:value_raise"),
             tr,
@@ -1273,18 +1374,20 @@ fn pick_bet_size(
     (base + spr_adj).clamp(oc.size_small, oc.size_overbet)
 }
 
-/// 价值动作尺寸 = `pick_bet_size(value)` × 剥削 value 放大（对 station 做大价值注），夹到
-/// `[size_small, 1.6]`。仅价值注/价值加注调用；诈唬/半诈唬走 `pick_bet_size(false)` 不放大
-/// （放大诈唬只会对不弃牌的站增亏）。`value_size_mult==1.0` 时与 `pick_bet_size(true)` 等价。
+/// 价值动作尺寸 = `pick_bet_size(value)` × value 尺寸乘子 `mult`，夹到 `[size_small, 1.6]`。仅价值注/
+/// 价值加注/commit 调用；诈唬/半诈唬走 `pick_bet_size(false)` 不放大（放大诈唬只会对不弃牌的站增亏）。
+/// `mult==1.0` 时与 `pick_bet_size(true)` 等价。**调用方传乘子**：commit/value_raise 传
+/// `adj.value_size_mult`（画像层）；value_bet.srp 传 `value_bet_size_mult(ctx, pot)`（节点级单向门，
+/// 内部已 subsume 画像乘子）。
 fn value_size(
     view: &GameView,
     oc: &crate::heuristic::config::PostflopConfig,
     tex: &crate::heuristic::features::Texture,
     made: MadeClass,
     spr: f64,
-    adj: &ExploitAdjust,
+    mult: f64,
 ) -> f64 {
-    (pick_bet_size(view, oc, tex, made, spr, true) * adj.value_size_mult).clamp(oc.size_small, 1.6)
+    (pick_bet_size(view, oc, tex, made, spr, true) * mult).clamp(oc.size_small, 1.6)
 }
 
 /// 把「底池分数」下注转成 raise-to chips 并夹到 valid（无前序 bet 的下注）。
@@ -1761,6 +1864,280 @@ mod cbet_gate_tests {
         v.folded[3] = true;
         let b2 = cbet_bluff_binding_readout(&v, &opp, &cg).unwrap();
         assert!((cbet_bluff_mult_from_readout(Some(b2), &cg) - 1.0).abs() < 1e-9);
+    }
+}
+
+// ===========================================================================
+// P0-3 阶段2 第七消费轮：srp value_bet 尺寸门单测（单向 fold-to-cbet，subsume 画像）
+// ===========================================================================
+#[cfg(test)]
+mod value_size_gate_tests {
+    use super::{
+        map_fold_to_value_size_mult, value_size_binding_readout, value_size_mult_from_readout,
+    };
+    use crate::heuristic::config::NodesConfig;
+    use crate::heuristic::opponent::{FacingCounts, OpponentTable};
+    use crate::heuristic::view::{GameView, HistAction, Request, ValidActions};
+
+    /// 造一个 flop-SRP 局面（hero 座0 开池被跟 → srp 池、flop）：座4 = 面对 hero c-bet 的 villain。
+    fn srp_flop_view() -> GameView {
+        let req = Request {
+            hole: vec!["2c".into(), "Kc".into()],
+            board: vec!["8s".into(), "6d".into(), "Td".into()],
+            button_seat: 4,
+            my_seat: 0,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                HistAction {
+                    seat: 1,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 2,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 3,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 4,
+                    action: "raise".into(),
+                    to: Some(40),
+                    street: None,
+                },
+                HistAction {
+                    seat: 5,
+                    action: "fold".into(),
+                    to: None,
+                    street: None,
+                },
+                HistAction {
+                    seat: 0,
+                    action: "call".into(),
+                    to: None,
+                    street: None,
+                },
+            ],
+            valid: ValidActions {
+                can_check: true,
+                can_call: false,
+                can_raise: true,
+                min_raise: Some(20),
+                max_raise: Some(1960),
+            },
+            stacks: vec![2000, 1416, 1322, 6020, 11891, 1460],
+            names: Default::default(),
+            sb_seat: None,
+            bb_seat: None,
+        };
+        GameView::from_request(&req)
+    }
+
+    fn with_facing(opp: &mut OpponentTable, name: &str, node: &str, n: u32, folds: u32) {
+        opp.by_name
+            .entry(name.to_string())
+            .or_default()
+            .facing
+            .insert(
+                node.to_string(),
+                FacingCounts {
+                    n,
+                    folds,
+                    calls: n - folds,
+                    raises: 0,
+                },
+            );
+    }
+
+    /// node-differentiation（递减节点门 B）显式锚：`[0.50→1.5, 0.80→1.0]`、`min_samples=30`。
+    /// 本轮 ship = flat（A），此 helper 仅用于验「递减 + 单向不缩小」能力留存（供后续 config-only 校准）。
+    fn node_b() -> crate::heuristic::config::CbetValueSizeGateConfig {
+        let mut vg = NodesConfig::default().cbet_value_size_gate;
+        vg.min_samples = 30;
+        vg.fold_lo = 0.50;
+        vg.mult_lo = 1.5;
+        vg.fold_hi = 0.80;
+        vg.mult_hi = 1.0;
+        vg
+    }
+
+    // --- 默认 = **平放大**（本轮 ship A）：任一 fold 都映到 1.5（两锚同乘子，无 fold 微分） ---
+    #[test]
+    fn value_size_default_is_flat_amplify() {
+        let vg = NodesConfig::default().cbet_value_size_gate;
+        assert_eq!(
+            vg.min_samples, 0,
+            "flat: 对任一有名对手即放大（与读数无关）"
+        );
+        for f in [0.0, 0.30, 0.475, 0.50, 0.65, 0.80, 0.90, 0.99] {
+            assert!(
+                (map_fold_to_value_size_mult(f, &vg) - 1.5).abs() < 1e-9,
+                "flat 默认：fold={f} → 恒 1.5（无 fold 微分）"
+            );
+        }
+    }
+
+    // --- 递减节点门**能力**留存（显式锚）+ 端点/夹取 + **单向不缩小**（`.max(1.0)` 结构保证） ---
+    #[test]
+    fn value_size_map_can_node_differentiate_and_never_below_unit() {
+        let vg = node_b(); // 显式递减锚 [0.50→1.5, 0.80→1.0]
+        assert!(
+            (map_fold_to_value_size_mult(0.475, &vg) - 1.5).abs() < 1e-9,
+            "低锚以下 → 1.5（粘站放大）"
+        );
+        assert!(
+            (map_fold_to_value_size_mult(0.80, &vg) - 1.0).abs() < 1e-9,
+            "高锚点 → 1.0（爱弃回落）"
+        );
+        assert!(
+            (map_fold_to_value_size_mult(0.95, &vg) - 1.0).abs() < 1e-9,
+            "高锚以上 → 夹取 1.0"
+        );
+        // 中点 0.65 → t=0.5 → 1.25。
+        assert!((map_fold_to_value_size_mult(0.65, &vg) - 1.25).abs() < 1e-6);
+        // 严格单调**递减**（fold 越高 → 乘子越低，趋近 1.0）。
+        assert!(map_fold_to_value_size_mult(0.55, &vg) > map_fold_to_value_size_mult(0.65, &vg));
+        assert!(map_fold_to_value_size_mult(0.65, &vg) > map_fold_to_value_size_mult(0.75, &vg));
+        // **结构单向**：整段（含默认 flat 与显式节点门与敌意锚）恒 ≥ 1.0（不缩小）。
+        let mut vg_hostile = vg.clone();
+        vg_hostile.mult_hi = 0.5; // 敌意：想让高 fold 缩小 < 1.0
+        for f in [0.0, 0.30, 0.50, 0.65, 0.80, 0.99] {
+            assert!(
+                map_fold_to_value_size_mult(f, &vg) >= 1.0
+                    && map_fold_to_value_size_mult(f, &vg_hostile) >= 1.0,
+                ".max(1.0) 结构上保证不缩小（含敌意锚）"
+            );
+        }
+    }
+
+    // --- 冷启动（None）/ node_gated 关 → 回退 fallback（= adj.value_size_mult，byte-equal）；
+    //     显式 min_samples>0 时 n 不足亦回退（节点门校准场景） ---
+    #[test]
+    fn value_size_gating_falls_back_when_off_or_unnamed() {
+        let vg = NodesConfig::default().cbet_value_size_gate; // flat, min_samples=0
+                                                              // 冷启动（None）→ 回退 fallback（画像乘子原样）。
+        assert_eq!(value_size_mult_from_readout(None, &vg, 1.0), 1.0);
+        assert_eq!(
+            value_size_mult_from_readout(None, &vg, 1.30),
+            1.30,
+            "回退 = 画像 station 1.30（byte-equal）"
+        );
+        // node_gated 关 → 恒回退 fallback（即便有 binding、fold 很粘）。
+        let mut vg_off = vg.clone();
+        vg_off.node_gated = false;
+        assert_eq!(
+            value_size_mult_from_readout(Some((0.30, 500)), &vg_off, 1.30),
+            1.30
+        );
+        // 显式 min_samples=30（节点门校准场景）：n<30 → 回退 fallback（即便 fold 很粘）。
+        assert_eq!(
+            value_size_mult_from_readout(Some((0.30, 29)), &node_b(), 1.0),
+            1.0
+        );
+    }
+
+    // --- 平放大（默认 flat）：任一有名对手（含 n=0）→ 放大 1.5；显式节点门 → 低 fold 放大 / 高 fold 回落 ---
+    #[test]
+    fn value_size_flat_amplifies_any_named_and_node_differentiates_when_configured() {
+        let vg = NodesConfig::default().cbet_value_size_gate; // flat, min_samples=0
+                                                              // flat：粘站/爱弃/n=0 都放大 1.5（价值注越大越不亏，与读数无关）。
+        assert!((value_size_mult_from_readout(Some((0.30, 100)), &vg, 1.0) - 1.5).abs() < 1e-9);
+        assert!((value_size_mult_from_readout(Some((0.90, 100)), &vg, 1.0) - 1.5).abs() < 1e-9);
+        assert!(
+            (value_size_mult_from_readout(Some((0.90, 0)), &vg, 1.0) - 1.5).abs() < 1e-9,
+            "flat min_samples=0：n=0 也放大"
+        );
+        // 显式节点门 B（能力留存）：低 fold 放大 1.5 / 高 fold 回落 1.0（不缩小、不亏爱弃尾）。
+        let vb = node_b();
+        assert!((value_size_mult_from_readout(Some((0.30, 100)), &vb, 1.0) - 1.5).abs() < 1e-9);
+        assert!((value_size_mult_from_readout(Some((0.90, 100)), &vb, 1.0) - 1.0).abs() < 1e-9);
+    }
+
+    // --- subsume 画像 station 1.30x：max(mult, fallback) → 不双重放大、不回退分类站 ---
+    #[test]
+    fn value_size_subsumes_station_boost_no_double_amplify() {
+        let vg = NodesConfig::default().cbet_value_size_gate; // flat 1.5
+                                                              // 已分类 station（fallback=1.30）→ max(1.5, 1.30)=1.5（**非** 1.5×1.30=1.95，不双重放大）。
+        let m = value_size_mult_from_readout(Some((0.30, 100)), &vg, 1.30);
+        assert!(
+            (m - 1.5).abs() < 1e-9,
+            "subsume：用 max 非乘积 → 1.5 而非 1.95"
+        );
+        // 节点门 B 高 fold → map 给 1.0，但 max(1.0, 1.30)=1.30（不回退已分类站 boost）。
+        let m2 = value_size_mult_from_readout(Some((0.90, 100)), &node_b(), 1.30);
+        assert!(
+            (m2 - 1.30).abs() < 1e-9,
+            "高 fold 也不低于画像 1.30（不回退分类站）"
+        );
+    }
+
+    // --- 节点查询正确：查对偶 (街.池型)="flop.srp"，无名 → None → 回退 fallback ---
+    #[test]
+    fn value_size_binding_queries_correct_node_and_cold_start_defaults() {
+        let vg = NodesConfig::default().cbet_value_size_gate;
+        let mut v = srp_flop_view();
+        assert_eq!(v.preflop_num_raises, 1, "srp 池");
+        // 无名对手（exploit 关：names 空）→ None → 回退 fallback（byte-equal 语义）。
+        assert!(value_size_binding_readout(&v, &OpponentTable::new(), &vg).is_none());
+        assert_eq!(
+            value_size_mult_from_readout(
+                value_size_binding_readout(&v, &OpponentTable::new(), &vg),
+                &vg,
+                1.0,
+            ),
+            1.0,
+            "冷启动（无名）= 回退 fallback 1.0"
+        );
+        // 给座4 命名 + 在 flop.srp 塞计数 → binding 读对 flop.srp 的 n（查错节点会得 n=0）。
+        v.names.insert(4, "sticky".into());
+        let mut opp = OpponentTable::new();
+        with_facing(&mut opp, "sticky", "flop.srp", 200, 60); // raw fold 30%
+        let b = value_size_binding_readout(&v, &opp, &vg).expect("有名 villain → Some");
+        assert_eq!(b.1, 200, "读到 flop.srp 的 n（查错节点会得 n=0）");
+        assert!(b.0 < 0.40, "shrunk_fold 应贴近 30%（n 大）");
+        // flat：有名即放大 1.5。
+        assert!((value_size_mult_from_readout(Some(b), &vg, 1.0) - 1.5).abs() < 1e-9);
+        // 错节点（塞 turn.srp）→ 查 flop.srp 得 n=0：节点门 B（min_samples=30）→ 回退 fallback；
+        // flat（min_samples=0）→ 仍放大（价值注与读数无关，正是 flat 意图）。
+        let mut opp_wrong = OpponentTable::new();
+        with_facing(&mut opp_wrong, "sticky", "turn.srp", 200, 60);
+        let bw = value_size_binding_readout(&v, &opp_wrong, &vg).unwrap();
+        assert_eq!(bw.1, 0, "flop.srp 无样本 → n=0");
+        assert_eq!(
+            value_size_mult_from_readout(Some(bw), &node_b(), 1.0),
+            1.0,
+            "节点门 B：n=0 < min_samples=30 → 回退 fallback"
+        );
+    }
+
+    // --- 多人池保守：取最粘者（min shrunk_fold）binding（节点门 B 下差异化显著） ---
+    #[test]
+    fn value_size_binding_picks_stickiest_villain_multiway() {
+        let vb = node_b(); // 用节点门验 binding 选择影响乘子（flat 下两者都 1.5，无从验选择）
+        let mut v = srp_flop_view();
+        v.folded[3] = false; // 座3 也在场（多人池）
+        v.names.insert(3, "sticky".into());
+        v.names.insert(4, "foldy".into());
+        let mut opp = OpponentTable::new();
+        with_facing(&mut opp, "sticky", "flop.srp", 200, 60); // raw fold 30%（粘）
+        with_facing(&mut opp, "foldy", "flop.srp", 200, 180); // raw fold 90%（弃）
+        let b = value_size_binding_readout(&v, &opp, &vb).unwrap();
+        assert!(b.0 < 0.40, "binding = 最粘者（sticky ~0.31），非爱弃者");
+        // binding 粘 → 放大 1.5（多人池：任一粘站在场即放大价值注榨其筹码）。
+        assert!((value_size_mult_from_readout(Some(b), &vb, 1.0) - 1.5).abs() < 1e-9);
+        // 反证：仅 foldy 在场 → binding = foldy（高 fold）→ 节点门回落 1.0。
+        v.folded[3] = true;
+        let b2 = value_size_binding_readout(&v, &opp, &vb).unwrap();
+        assert!((value_size_mult_from_readout(Some(b2), &vb, 1.0) - 1.0).abs() < 1e-9);
     }
 }
 
