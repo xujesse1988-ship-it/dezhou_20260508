@@ -892,6 +892,31 @@ fn cbet_bluff_freq_mult(ctx: &NodeCtx, pot: PotType) -> f64 {
     cbet_bluff_mult_from_readout(binding, cg)
 }
 
+/// P0-3 阶段2 第八消费轮（A1，SHIPPED）：turn/river 空气 barrel **base 频率修正**乘子核（纯函数，
+/// 可单测）。仅 srp 池（3bp robust / other 稀疏 → 1.0）、仅 turn/river（flop c-bet / preflop 保 flop 锚
+/// → 1.0）。river 空气 fold-equity 结构性最弱 → 默认砍最狠（等价梯度）。乘子设 1.0 = 逐字节回退 HEAD。
+fn barrel_mult_core(street: Street, pot: PotType, turn_mult: f64, river_mult: f64) -> f64 {
+    if pot != PotType::SingleRaised {
+        return 1.0; // 与 cbet 门同 scope：仅 srp。
+    }
+    match street {
+        Street::Turn => turn_mult,
+        Street::River | Street::Showdown => river_mult,
+        _ => 1.0, // flop c-bet / preflop → 不动。
+    }
+}
+
+/// A1 base 修正的 [`NodeCtx`] 入口：查 config 两乘子 → 纯核映射（见 [`barrel_mult_core`]）。
+fn barrel_street_freq_mult(ctx: &NodeCtx, pot: PotType) -> f64 {
+    let nc = &ctx.cfg.nodes;
+    barrel_mult_core(
+        ctx.view.street,
+        pot,
+        nc.barrel_turn_freq_mult,
+        nc.barrel_river_freq_mult,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // P0-3 阶段2 第四消费轮：bluff_raise 节点级门控（**same-role**，真杠杆 = fold-to-raise）。
 // 上轮（4893739）读 fold-to-cbet = 跨角色代理被 REJECT；commit fac17a8 扩采 fold-to-raise 后，
@@ -1155,7 +1180,8 @@ fn post_unopened(ctx: &NodeCtx, pot: PotType, rng: &mut Rng, mut tr: DecisionTra
         let cbet_freq = lerp(cb.freq_dry, cb.freq_wet, s.tex.wetness)
             * ctx.adj.bluff_mult
             * (1.0 - oc.multiway_bluff_cut * s.multiway).max(0.10)
-            * cbet_bluff_freq_mult(ctx, pot); // P0-3 阶段2: srp 节点级门控（仅 srp；3bp robust 不动）
+            * cbet_bluff_freq_mult(ctx, pot) // P0-3 阶段2: srp 节点级门控（仅 srp；3bp robust 不动）
+            * barrel_street_freq_mult(ctx, pot); // P0-3 阶段2 第八消费轮 A1: turn/river barrel 独立频率旋钮（默认 1.0）
         let gate = cbet_freq.clamp(0.0, 0.95);
         let roll = rng.unit(); // gate 后掷点、位置绝对不动 → RNG 消费序列不变（trace 测试会抓）。
         tr.cmp("postflop.cbet_freq", roll, gate, roll < gate);
@@ -2371,5 +2397,86 @@ mod bluff_raise_gate_tests {
         v.folded[3] = true;
         let b2 = bluff_raise_binding_readout(&v, &opp, bg).unwrap();
         assert!((bluff_raise_mult_from_readout(Some(b2), &nc) - 2.0).abs() < 1e-9);
+    }
+}
+
+// ===========================================================================
+// P0-3 阶段2 第八消费轮（A1，SHIPPED）：turn/river 空气 barrel base 频率修正单测
+// （仅 srp / 仅 turn+river 作用；flop/preflop/非 srp = 1.0 无操作；乘子 1.0 = 逐字节回退）
+// ===========================================================================
+#[cfg(test)]
+mod barrel_mult_tests {
+    use super::{barrel_mult_core, PotType};
+    use crate::core::Street;
+    use crate::heuristic::config::NodesConfig;
+
+    #[test]
+    fn only_srp_pool_gated() {
+        // 非 srp 池（3bp robust / other 稀疏）→ 1.0，即便在 turn/river、即便乘子非 1。
+        for pot in [PotType::ThreeBet, PotType::FourBetPlus, PotType::Limped] {
+            assert_eq!(barrel_mult_core(Street::Turn, pot, 0.6, 0.3), 1.0);
+            assert_eq!(barrel_mult_core(Street::River, pot, 0.6, 0.3), 1.0);
+        }
+    }
+
+    #[test]
+    fn only_turn_river_gated() {
+        let (t, r) = (0.6, 0.3);
+        // flop c-bet / preflop 保 flop 锚 → 1.0（不受 barrel 修正影响）。
+        assert_eq!(
+            barrel_mult_core(Street::Preflop, PotType::SingleRaised, t, r),
+            1.0
+        );
+        assert_eq!(
+            barrel_mult_core(Street::Flop, PotType::SingleRaised, t, r),
+            1.0
+        );
+        // turn → turn_mult；river/showdown → river_mult。
+        assert_eq!(
+            barrel_mult_core(Street::Turn, PotType::SingleRaised, t, r),
+            t
+        );
+        assert_eq!(
+            barrel_mult_core(Street::River, PotType::SingleRaised, t, r),
+            r
+        );
+        assert_eq!(
+            barrel_mult_core(Street::Showdown, PotType::SingleRaised, t, r),
+            r
+        );
+    }
+
+    #[test]
+    fn unit_mults_are_noop_byte_equal_fallback() {
+        // 乘子 1.0（config 覆盖回退）→ 所有街/池型均 1.0 = HEAD 逐字节等价。
+        for st in [Street::Flop, Street::Turn, Street::River, Street::Showdown] {
+            assert_eq!(barrel_mult_core(st, PotType::SingleRaised, 1.0, 1.0), 1.0);
+        }
+    }
+
+    #[test]
+    fn shipped_defaults_grade_river_harder() {
+        // SHIPPED 默认：river 空气更纯 → 砍更狠（river_mult < turn_mult < 1.0）。
+        let nc = NodesConfig::default();
+        assert!(nc.barrel_river_freq_mult < nc.barrel_turn_freq_mult);
+        assert!(nc.barrel_turn_freq_mult < 1.0);
+        assert_eq!(
+            barrel_mult_core(
+                Street::Turn,
+                PotType::SingleRaised,
+                nc.barrel_turn_freq_mult,
+                nc.barrel_river_freq_mult
+            ),
+            0.6
+        );
+        assert_eq!(
+            barrel_mult_core(
+                Street::River,
+                PotType::SingleRaised,
+                nc.barrel_turn_freq_mult,
+                nc.barrel_river_freq_mult
+            ),
+            0.3
+        );
     }
 }

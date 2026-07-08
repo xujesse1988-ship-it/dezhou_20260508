@@ -656,6 +656,20 @@ pub struct NodesConfig {
     /// 1.30x（**不双重放大**）。仅门控 srp；冷启动/无名/非 srp/`node_gated=false` 回退 `adj.value_size_mult`
     /// （byte-equal）。递减节点门（低 fold 放大 / 高 fold 回落）能力保留（锚可配），本轮证不占优。
     pub cbet_value_size_gate: CbetValueSizeGateConfig,
+    /// `post.unopened.cbet_bluff.srp` 在 **turn / river** 街的空气 barrel **基础频率修正**乘子
+    /// （P0-3 阶段2 第八消费轮 = A1，SHIPPED）。**门前现状**：turn/river barrel 频率随 srp flop 锚
+    /// 同映射——base = `nc.cbet.srp`(0.80/0.55) 对三街通用，`cbet_gate` 读数虽已按街但锚 flop 标定、
+    /// 且 mult 上限 1.0（只降不升）+ turn/river 每对手样本稀（n<30 频回退 1.0）→ live 对未知/稀疏对手
+    /// barrel 空气 @0.80（run34 `cbet_bluff.srp` −4.05 主因）。**A1 结论（非门，base 修正）**：空气 barrel
+    /// 在后街 fold-equity 结构性衰减（river 空气 eq≈0.08）→ 降 turn/river base 频率对**全对手**（含未知/
+    /// 稀疏，门够不到的人群）broadly +EV。纪律 A sweep（gate-OFF）：粘/跟场单调↑（limpy +115~+149、
+    /// wideopen +65~+96、station +38、mixed +21、nit +26），唯纯弃场(3bpfold) −4~−10 小 wash；exploit-ON
+    /// 标准矩阵 0/N（门已处理有名密样对手）。**这是 base 策略修正**（作用于 exploit on+off；exploit-OFF
+    /// byte-equal 有意打破 = base 应变）；乘子设 1.0 可逐字节回退 HEAD（rollback/隔离证明）。等效度按街分：
+    /// river 空气更纯 → 砍更狠（等价梯度）。作用点在 [`policy::barrel_street_freq_mult`]、
+    /// `roll = rng.unit()` **之前**（掷点位置不动 → RNG 消费序列不变）；仅 srp 池（3bp robust / other 稀疏）。
+    pub barrel_turn_freq_mult: f64,
+    pub barrel_river_freq_mult: f64,
 }
 
 impl Default for NodesConfig {
@@ -675,6 +689,9 @@ impl Default for NodesConfig {
             bluff_raise_freq_mult: 0.10,
             bluff_raise_gate: BluffRaiseGateConfig::default(),
             cbet_value_size_gate: CbetValueSizeGateConfig::default(),
+            // A1 SHIPPED：turn/river 空气 barrel base 频率修正（等价梯度：river 空气更纯砍更狠）。
+            barrel_turn_freq_mult: 0.6,
+            barrel_river_freq_mult: 0.3,
         }
     }
 }

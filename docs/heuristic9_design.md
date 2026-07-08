@@ -1027,20 +1027,65 @@ node_gated 关回退 / n=0 flat 放大 vs 节点门 n<min 回退 / subsume 1.30 
 **判定 = SHIP 平放大 A。** 节点门 B 能力（递减锚）保留于 config（`mult_hi<mult_lo`+`min_samples=30` 即开），
 供 live 数据后续证需时 config-only 校准，本轮证暂无此需。诊断全文 `scratchpad/p03_value_size_flat/DIAGNOSIS.md`。
 
+### P0-3 阶段2 第八消费轮（A1）：turn/river 空气 barrel **base 频率修正**：**SHIP 等价梯度砍（turn ×0.6 / river ×0.3）**（2026-07-08）
+
+backlog A1 落地（run34 `cbet_bluff.srp` −4.05 的处方）。**门前现状**（code map 亲验）：hero 空气 barrel
+（`post.unopened.cbet_bluff.srp`，有主动权、Air、无听牌）三街共用 `nc.cbet.srp` base(0.80/0.55)——**flop c-bet
+频率照搬到 turn/river barrel**。`cbet_gate` 读数虽已按街（`turn.srp`/`river.srp` fold），但① mult 上限 1.0
+（只降不升）② turn/river 每对手样本稀（n<30 频回退 1.0）③ exploit-OFF / 无名对手门恒回退 1.0 → **live 对
+未知/稀疏对手 barrel 空气 @0.80**（run34 turn/river = cbet_bluff.srp 决策的 45%、mean eq flop0.357→turn0.209
+→river0.081 递减纯空气）。
+
+**造靶诊断（先证据后接线，rail #2/#3）**。复用 WideOpener（后街粘：villain p1 fold flop54%→turn26%→
+river27%）vs ThreebetFolder（后街爱弃些：80%→58%→46%），2-max 8000 手：
+- **纪律 A sweep（gate-OFF，独立 barrel 乘子 0→1.0，paired seed 7/11/23）——非反号，是「越低越不差」**：
+  WideOpener 单调↑（mult 1.0→0.0 = +102，barrel 空气进 caller 纯亏）；ThreebetFolder **wash**（全档噪声内）。
+  = value_size flat 同型（一侧强要低、另一侧 wash → **flat base 修正胜过门**，非 same-role 反号）。
+
+**这是 base 策略修正（非 exploit 门）**：空气 barrel 后街 fold-equity 结构性衰减（river 空气 eq≈0.08）→ 降
+turn/river base 对**全对手**（含门够不到的未知/稀疏，= live 主人群）正确。作用于 exploit on+off；**exploit-OFF
+byte-equal 有意打破**（base 应变），回退保证 = 乘子设 1.0 逐字节回 HEAD（已验）。
+
+**接线**：`NodesConfig.barrel_turn_freq_mult`(0.6) / `barrel_river_freq_mult`(0.3)，policy `barrel_street_freq_mult`
+在 cbet 分支乘入 `cbet_freq`、**`roll = rng.unit()` 之前**（掷点位置不动 → RNG 序列不变，trace 测试抓）；仅 srp
+池（3bp robust / other 稀疏 → 1.0）、仅 turn/river（flop/preflop 保 flop 锚 → 1.0）。等价梯度：river 空气更纯 →
+砍更狠（0.3 < 0.6）。纯核 `barrel_mult_core` + 4 内联单测（`barrel_mult_tests`）。
+
+**回归门（主会话亲验，8000 手 paired；baseline = 同二进制 config{mult=1.0} = HEAD 已证 byte-equal）**：
+
+| 门 | 结果 |
+|---|---|
+| **A：exploit-ON 标准矩阵**（6max mixed/station/limpy×7/11/23 + 9max s7 + 2max s7）| **0/11 超 CI95**（Δ≤±8，门已处理有名密样 villain → base 修正中性）|
+| **B：exploit-OFF broad +EV**（= 门回退 1.0 / 稀疏 / 无名，live 主人群）| **6/7 场正**：limpy **+113**、wideopen +81、station +45、mixed +25、nit +24、maniac +6；唯纯弃 3bpfold −3.4 wash |
+| **靶 poles（exploit-ON）** | wideopen +9（3/3↑，门 0.15 floor 残余）、3bpfold −7（噪声内）|
+| C：0 fallback / 0 pot\|to_call 漂移 / 0 legalize | 全 0（mixed 6max + wideopen 2max）|
+| **隔离/回滚**：NEW binary + config{mult=1.0} vs 干净 HEAD binary | exploit-ON(wideopen/3bpfold) + exploit-OFF(mixed/station) **逐字节相同**|
+| serde(default)：缺 barrel 字段的 config JSON | 载 0.6/0.3（非 1.0）→ **live 无 --config / 旧 config 皆得新默认** |
+
+**测试**：`barrel_mult_tests`(4) + `heuristic9_trace`(10，RNG 序列不变) + `heuristic_p0_3_facing`(18) + heuristic lib
+单测(26) 全绿；fmt / clippy(`-D warnings`) 绿。**未跑全量 cargo test**（本轮同时把非 heuristic 集成/bin 测试从
+`cargo test` 默认集隔离，见 Cargo.toml `autotests=false`；非 heuristic lib 单测保留、按需 `--lib heuristic::` 过滤）。
+
+**判定 = SHIP。** 数据/诊断 `scratchpad/p03_barrel/`。**范围外（后续轮）**：turn vs river 独立锚精调（本轮等价
+梯度启发式）；barrel **尺寸**分街（现共享）；3bp barrel（robust，须新证据）。
+
 ### 迭代 backlog（下一步，按优先级）
 
 > **本节 = 跨 session 循环恢复的单一入口**（各轮细节仍在 §6 对应记录，此处只收拢前沿 + 指针）。
 > **P0-3 阶段2 消费门弧线现状（截至 2026-07-07，HEAD `3cb611f`）**：7 ship / 3 reject / 1 robust。
 > ship = float(`30f0b09`) / cbet-srp 频率(`058c1f5`) / bluff_raise v2(`63b5822`) / §D 采集(`bad0396`) /
-> §D live 接线(`0613410`) / value_bet.srp 尺寸放大(`3cb611f`) + fold-to-raise 采集(`fac17a8`)。
-> **经验规律**：same-role 密集信号（信号轴=杠杆轴）→ ship；跨角色/稀疏/无反号 → reject/robust。
+> §D live 接线(`0613410`) / value_bet.srp 尺寸放大(`3cb611f`) + fold-to-raise 采集(`fac17a8`) /
+> **turn/river barrel base 频率修正(A1，本轮)**。
+> **经验规律**：same-role 密集信号（信号轴=杠杆轴）→ ship 门；**一侧强要 + 另一侧 wash（非反号）→ ship flat
+> base 修正**（value_size 第七轮 / barrel A1）；跨角色/稀疏/无反号无 wash → reject/robust。
 
 #### A. P0-3 消费门前沿（本主线，按 ROI 排序）
 
-1. **turn/river barrel 频率独立门**（**最顺、推荐先做**）：same-role 密集频率信号
-   `fold-to-turn-barrel`/`fold-to-river-barrel`（`turn.<池型>`/`river.<池型>` 节点**已采**在 facing 表），
-   照 float/cbet-srp 频率门四函数范式。现状 turn/river barrel 频率随 srp flop 锚同映射（未独立门）。
-   预期同 cbet 频率门（反号 + 密集）→ 大概率干净 ship。指针：§6 cbet 门记录「范围外」。
+1. ✅ **已 SHIP（本轮，第八消费轮）**：turn/river 空气 barrel **base 频率修正**（turn ×0.6 / river ×0.3）。
+   **原假设（独立门/反号）证伪**：造靶 sweep = 非反号（WideOpener 单调要低、ThreebetFolder wash）→ 不是门、
+   是 **flat base 修正**（越低越不差）。且真杠杆非「门读数」（读数已按街）而是 **base 频率照搬 flop + 门在
+   turn/river 稀疏样本/无名对手频回退 1.0** → live @0.80 空气 barrel（run34 −4.05 主因）。exploit-OFF broad
+   +EV（limpy +113…）、exploit-ON 标准矩阵 0/11。详见 §6 第八消费轮。
 2. **value 放大扩街/扩叶**：flat A（`3cb611f`）只做了 `value_bet.srp`（flop c-bet 价值）。
    `bigger-never-worse` 或可扩到 turn/river 价值注 + `value_raise` 叶。**须重验**：flop 上 limpy 已现
    3/3 微负苗头（深在 CI 内），扩街对 limper 过放大风险更高，逐街逐叶独立过标准矩阵。指针：§6 第七轮记录。
