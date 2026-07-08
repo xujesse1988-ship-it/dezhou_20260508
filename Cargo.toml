@@ -6,6 +6,11 @@ rust-version = "1.75"
 description = "6-max NLHE poker AI — Pluribus-style stage 1 (rules + evaluator)."
 license = "MIT OR Apache-2.0"
 publish = false
+# heuristic9 迭代循环隔离：关闭 tests/ 自动发现，只显式注册 heuristic 相关集成测试（见文件末
+# `[[test]]` 块）。非 heuristic 的 CFR/trainer/clustering/AIVAT 重测试（100M update、dense trainer
+# 等）不再进入 `cargo test` 默认全量集，避免 heuristic 循环验证时被其拖挂/退出。要跑非 heuristic
+# 测试，用 `cargo test --test <name>`（仍可单独指名运行）或临时改 autotests=true。
+autotests = false
 
 [dependencies]
 # rand 在 RngCoreAdapter 中作为公开依赖暴露，pin minor 版本（L-4 评审）。
@@ -139,6 +144,7 @@ path = "tools/six_max_blueprint_h2h.rs"
 [[bin]]
 name = "six_max_search_probe"
 path = "tools/six_max_search_probe.rs"
+test = false # heuristic 循环隔离：非 heuristic bin 单测不进 `cargo test` 全量集
 
 # 脱锚搜索档一 A/B：uniform vs 前缀 reach。自对弈到 off-tree（off-stack/4+way）postflop 后所有座
 # 走脱锚搜索，hero 前缀 reach vs field uniform，配对差 CI + 触发率 + 决策改变率（TV/argmax flip）。
@@ -163,6 +169,7 @@ path = "tools/six_max_exploit_ab.rs"
 [[bin]]
 name = "openpoker_advisor"
 path = "tools/openpoker_advisor.rs"
+test = false # heuristic 循环隔离：非 heuristic bin 单测不进 `cargo test` 全量集
 
 # 启发式 9-max 独立线：OpenPoker 常驻 advisor（IPC drop-in，零网络）。
 [[bin]]
@@ -202,6 +209,7 @@ path = "tools/nlhe_h3_report.rs"
 [[bin]]
 name = "slumbot_advisor"
 path = "tools/slumbot_advisor.rs"
+test = false # heuristic 循环隔离：非 heuristic bin 单测不进 `cargo test` 全量集
 
 # 构建 AIVAT 值函数表（NLHE 自对弈 MC）→ artifact，供 aivat_eval 估计器加载。
 [[bin]]
@@ -267,3 +275,51 @@ path = "tools/ochs_warmup_dump.rs"
 [[bin]]
 name = "bucket_features_dump"
 path = "tools/bucket_features_dump.rs"
+
+# ===========================================================================
+# heuristic 集成测试显式注册（`autotests = false` 后，只有这些进入 `cargo test` 全量集）。
+# 非 heuristic 的 tests/*.rs 不再自动发现（不编译/不运行）；需要时 `cargo test --test <name>`。
+# ===========================================================================
+[[test]]
+name = "heuristic9"
+path = "tests/heuristic9.rs"
+
+[[test]]
+name = "heuristic9_nutness"
+path = "tests/heuristic9_nutness.rs"
+
+[[test]]
+name = "heuristic9_trace"
+path = "tests/heuristic9_trace.rs"
+
+[[test]]
+name = "heuristic_equity_weighted"
+path = "tests/heuristic_equity_weighted.rs"
+
+[[test]]
+name = "heuristic_gameview_sample"
+path = "tests/heuristic_gameview_sample.rs"
+
+[[test]]
+name = "heuristic_ml_range_online"
+path = "tests/heuristic_ml_range_online.rs"
+
+[[test]]
+name = "heuristic_mlrange_parity"
+path = "tests/heuristic_mlrange_parity.rs"
+
+[[test]]
+name = "heuristic_p0_1_action_line"
+path = "tests/heuristic_p0_1_action_line.rs"
+
+[[test]]
+name = "heuristic_p0_3_facing"
+path = "tests/heuristic_p0_3_facing.rs"
+
+[[test]]
+name = "heuristic_range_parity"
+path = "tests/heuristic_range_parity.rs"
+
+[[test]]
+name = "heuristic_tokenizer_parity"
+path = "tests/heuristic_tokenizer_parity.rs"
