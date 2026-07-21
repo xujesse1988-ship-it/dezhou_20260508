@@ -1069,47 +1069,83 @@ byte-equal 有意打破**（base 应变），回退保证 = 乘子设 1.0 逐字
 **判定 = SHIP。** 数据/诊断 `scratchpad/p03_barrel/`。**范围外（后续轮）**：turn vs river 独立锚精调（本轮等价
 梯度启发式）；barrel **尺寸**分街（现共享）；3bp barrel（robust，须新证据）。
 
+### run39 live 复盘（20000 手，A1 barrel 修正后首个长跑，2026-07-12 → 07-20）
+
+**规模/健康度**：20000 手 / 38679 决策 / **0 fallback / 0 legalize 降级** / net **+1503.3 mbb/g**（与
+run36–38 的 1360–1550 同区间、样本 ×10）。「硬伤」1 例 `CALL_NEAR_ZERO_EQ`（As5s @ KdJd4d7h turn call
+eq=0.063）实为**误报**：pot 646 / to_call 10 → required_eq 0.0152、门限 0.0352 < 0.063 → `odds_call`
+正确；driver 硬伤分类器只看 eq 绝对值不看赔率（分类器待修，非引擎漏洞）。
+
+**A1 barrel 修正 live 实效确证**（vs run34 同节点，`heuristic9_analyze.py` + jsonl 亲验）：
+
+| 指标 | run34（修正前）| run39（修正后）|
+|---|---|---|
+| `cbet_bluff.srp` EV(bb/hand) | −4.05 ±2.94（n=85/2000 手）| **−0.81 ±1.66**（n=231/20000 手，CI 含 0）|
+| 节点密度 | 42.5 决策/千手 | **11.6 决策/千手** |
+| river 空气占比 / mean eq | 22.4% / 0.081 | **13.4% / 0.182**（最纯空气被砍）|
+
+**新前沿信号（run36–39 跨 run 同向）**，口径注意 = 整手 net 摊给命中节点（§8②），非纯反事实：
+1. **`post.facing.bluff_raise` −17.09 ±8.88（n=44，CI 全负）**，run36/37/38 同向（−39.7/−16.1/−14.5，
+   n=8/5/6）→ v2（`63b5822`，0.10 频率甜点维持）后仍稳定负，摊派口径拖累 ≈ −38 mbb/g，当前最大单节点负项。
+2. **`post.unopened.float` −1.28 ±1.23（n=415，CI 勉强全负）**，run36–38 同向（−4.9/−3.0/−1.8）。float
+   节点门（`30f0b09`）后的残余负；疑与 barrel A1 同型（门对无名/稀疏对手回退 1.0 → live 主人群吃 base 频率）。
+3. VPIP 47.3% 触分析器松阈值（>42%）但**非漏洞**：翻前 call 类节点全正（`odds_call` +3.20、
+   `limp_behind` +2.95）= 对当前 limpy 场的剥削性放松。
+4. 第七轮价值尺寸放大维持强正：`value_bet.srp` +15.74 ±2.97（n=1928）。
+
 ### 迭代 backlog（下一步，按优先级）
 
 > **本节 = 跨 session 循环恢复的单一入口**（各轮细节仍在 §6 对应记录，此处只收拢前沿 + 指针）。
-> **P0-3 阶段2 消费门弧线现状（截至 2026-07-07，HEAD `3cb611f`）**：7 ship / 3 reject / 1 robust。
+> **P0-3 阶段2 消费门弧线现状（截至 2026-07-21，HEAD `097affc` + run39 复盘）**：8 ship / 3 reject / 1 robust。
 > ship = float(`30f0b09`) / cbet-srp 频率(`058c1f5`) / bluff_raise v2(`63b5822`) / §D 采集(`bad0396`) /
 > §D live 接线(`0613410`) / value_bet.srp 尺寸放大(`3cb611f`) + fold-to-raise 采集(`fac17a8`) /
-> **turn/river barrel base 频率修正(A1，本轮)**。
+> **turn/river barrel base 频率修正(A1，`097affc`，run39 live 确证)**。
 > **经验规律**：same-role 密集信号（信号轴=杠杆轴）→ ship 门；**一侧强要 + 另一侧 wash（非反号）→ ship flat
 > base 修正**（value_size 第七轮 / barrel A1）；跨角色/稀疏/无反号无 wash → reject/robust。
 
 #### A. P0-3 消费门前沿（本主线，按 ROI 排序）
 
-1. ✅ **已 SHIP（本轮，第八消费轮）**：turn/river 空气 barrel **base 频率修正**（turn ×0.6 / river ×0.3）。
-   **原假设（独立门/反号）证伪**：造靶 sweep = 非反号（WideOpener 单调要低、ThreebetFolder wash）→ 不是门、
-   是 **flat base 修正**（越低越不差）。且真杠杆非「门读数」（读数已按街）而是 **base 频率照搬 flop + 门在
-   turn/river 稀疏样本/无名对手频回退 1.0** → live @0.80 空气 barrel（run34 −4.05 主因）。exploit-OFF broad
-   +EV（limpy +113…）、exploit-ON 标准矩阵 0/11。详见 §6 第八消费轮。
-2. **value 放大扩街/扩叶**：flat A（`3cb611f`）只做了 `value_bet.srp`（flop c-bet 价值）。
+1. ✅ **已 SHIP + run39 live 确证（第八消费轮）**：turn/river 空气 barrel **base 频率修正**（turn ×0.6 /
+   river ×0.3）。**原假设（独立门/反号）证伪**：造靶 sweep = 非反号（WideOpener 单调要低、ThreebetFolder
+   wash）→ 不是门、是 **flat base 修正**（越低越不差）。且真杠杆非「门读数」（读数已按街）而是 **base 频率
+   照搬 flop + 门在 turn/river 稀疏样本/无名对手频回退 1.0** → live @0.80 空气 barrel（run34 −4.05 主因）。
+   exploit-OFF broad +EV（limpy +113…）、exploit-ON 标准矩阵 0/11。**run39 实效**：−4.05 → −0.81（CI 含 0）、
+   river 空气占比 22.4%→13.4%。详见 §6 第八消费轮 + run39 复盘。
+2. **bluff_raise 复诊（run39 新证据，升头号候选）**：`post.facing.bluff_raise` run36–39 四 run 全负、run39
+   n=44 CI 全负（−17.09 ±8.88），v2（0.10 频率甜点）后仍是最大单节点负项（摊派≈−38 mbb/g）。候选④造靶
+   当年结论「0.10 仍甜点」基于 sim 靶；live 场（limpy/粘站为主，VPIP 47%）对 bluff_raise 的 fold-equity
+   或结构性低于靶场 → 疑与 barrel A1 同型（base 频率对 live 主人群偏高）。先造「粘站 vs bluff_raise」
+   纪律 sweep 判型（flat 砍 vs 门），再走标准矩阵。指针：§6 bluff_raise v2 记录 + run39 复盘。
+3. **float 残余复诊**：`post.unopened.float` run39 n=415 CI 勉强全负（−1.28 ±1.23）、run36–38 同向。float
+   节点门（`30f0b09`）对无名/稀疏对手回退 1.0 → live 主人群吃 base 频率，与 barrel A1 同型处方候选
+   （降 base、门保留）。幅度小（≈−26 mbb/g），排 bluff_raise 后。指针：§6 首个消费轮记录 + run39 复盘。
+4. **value 放大扩街/扩叶**：flat A（`3cb611f`）只做了 `value_bet.srp`（flop c-bet 价值）。
    `bigger-never-worse` 或可扩到 turn/river 价值注 + `value_raise` 叶。**须重验**：flop 上 limpy 已现
-   3/3 微负苗头（深在 CI 内），扩街对 limper 过放大风险更高，逐街逐叶独立过标准矩阵。指针：§6 第七轮记录。
-3. **Station 分类覆盖 gap**（结构性、惠及多门）：现画像分类看翻前 VPIP/AF，**漏「翻后粘 + 翻前激进」
+   3/3 微负苗头（深在 CI 内），扩街对 limper 过放大风险更高，逐街逐叶独立过标准矩阵。run39 佐证 flop 叶
+   维持强正（`value_bet.srp` +15.74）。指针：§6 第七轮记录。
+5. **Station 分类覆盖 gap**（结构性、惠及多门）：现画像分类看翻前 VPIP/AF，**漏「翻后粘 + 翻前激进」
    对手**（WideOpener/3bpfold 未被判 Station → 现拿 mult 1.0；主会话实测 `station_value_size_mult`
    在 sim 完全惰性）。补法 = 放宽 station 分类或节点级化——影响 `value_shift`/`bluff_mult`/`value_size_mult`
    **所有画像调整**，非只尺寸。须独立证 beats 画像 + 过标准场含 station 不双重放大。指针：§6 第六轮记录(:987)。
-4. **§G flush_board 细化 §D → 复活候选①**（**低优先，稀疏边际**）：候选① 四次 REJECT，v4 处方 =
+6. **§G flush_board 细化 §D → 复活候选①**（**低优先，稀疏边际**）：候选① 四次 REJECT，v4 处方 =
    `river.<池型>.flush_board.attack_showdown`（只成花板计摊牌 → 治 §D 纹理盲稀释 + 冷启动累积偏差）。
    属 §D 采集侧改动。**风险**：成花板摊牌比全河牌攻击更稀 → 门更慢热；且 v4 已证 value_raise 侧死码、
    增益边际（领打超池为主漏）。指针：inventory §D 落地记录(:423) + §6 候选① v3/v4 记录。
 
 #### B. 结构性 backlog（跨主线、长期）
 
-5. **剥削对纯 nit 场仍欠力**：adjust_cap 已到安全上限 0.12（再高 nit 断崖）。要进一步榨干
+7. **剥削对纯 nit 场仍欠力**：adjust_cap 已到安全上限 0.12（再高 nit 断崖）。要进一步榨干
    紧场需结构改动——把「模型对手紧（助我弃）」与「利用其高弃率（助我攻）」解耦，因为同一
    equity 既驱动跟注又驱动下注，对手收紧会同时压住我方进攻。非全 nit 的真实混合场剥削已正收益。
-6. **equity 遥测统一标度**：翻前 fold 短路返回 vs-random `strength`、翻后返回 vs-range
+8. **equity 遥测统一标度**：翻前 fold 短路返回 vs-random `strength`、翻后返回 vs-range
    equity，`heuristic9_analyze.py` 的「弃了 +equity」标记会混标度误报。统一成 vs-range。
-7. **混合/平衡**：`MixingConfig.temperature` 目前只用频率门，可加边界动作 softmax 混合
+   run39 新增同类项：driver 硬伤分类器 `CALL_NEAR_ZERO_EQ` 只看 eq 绝对值不看赔率（run39 唯一
+   「硬伤」实为正确 odds_call）→ 分类器加 required_eq 对比。
+9. **混合/平衡**：`MixingConfig.temperature` 目前只用频率门，可加边界动作 softmax 混合
    降可剥削性。
-8. **live 数据闭环**：表有活人时跑满 1000 手 → `heuristic9_analyze.py` 出漏洞报告 → 迭代。
-   当前平台活跃度低（实测仅 1 对手），数据攒得慢。§D 摊牌信号已 live 接线（`0613410`）→ 攻击方
-   摊牌牌力构成随实盘累积。
+10. **live 数据闭环**：✅ 已跑通大样本（run39 20000 手 / 8 天，prof 累积 190KB）。后续保持
+    「长跑 → `heuristic9_analyze.py` 复盘 → 消费轮」节奏。§D 摊牌信号已 live 接线（`0613410`）→
+    攻击方摊牌牌力构成随实盘累积。
 
 > ✅ **已 v0.4 解决**（保留备查）：稀疏占座 compact 重映射（driver `_compact_blinds` 权威盲座 + 逐动作
 > 街标签，`view.rs` 分段/定位；实盘 A/B 0 回归）。
