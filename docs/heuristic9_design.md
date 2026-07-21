@@ -1112,10 +1112,16 @@ eq=0.063）实为**误报**：pot 646 / to_call 10 → required_eq 0.0152、门�
    exploit-OFF broad +EV（limpy +113…）、exploit-ON 标准矩阵 0/11。**run39 实效**：−4.05 → −0.81（CI 含 0）、
    river 空气占比 22.4%→13.4%。详见 §6 第八消费轮 + run39 复盘。
 2. **bluff_raise 复诊（run39 新证据，升头号候选）**：`post.facing.bluff_raise` run36–39 四 run 全负、run39
-   n=44 CI 全负（−17.09 ±8.88），v2（0.10 频率甜点）后仍是最大单节点负项（摊派≈−38 mbb/g）。候选④造靶
-   当年结论「0.10 仍甜点」基于 sim 靶；live 场（limpy/粘站为主，VPIP 47%）对 bluff_raise 的 fold-equity
-   或结构性低于靶场 → 疑与 barrel A1 同型（base 频率对 live 主人群偏高）。先造「粘站 vs bluff_raise」
-   纪律 sweep 判型（flat 砍 vs 门），再走标准矩阵。指针：§6 bluff_raise v2 记录 + run39 复盘。
+   n=44 CI 全负（−17.09 ±8.88），v2（0.10 频率甜点）后仍是最大单节点负项（摊派≈−38 mbb/g）。**run39 门内
+   拆解（主会话亲验，trace `bluff_raise_freq` cmp 分组）**：1761 评估 = 门清零 153（读到粘站，正确止损）+
+   门上调 ~22 + **回退 0.10 约 90%**；44 fire 中**回退组 38 手 −20.4 bb/hand、直接弃牌率仅 18%**（7/38，
+   诈唬加注约需 40%+ 直接弃保本）vs **门上调组 6 手 +3.9、直接弃 83%**（5/6）→ 亏损全在回退人群、门工作
+   正常。池真相：prof24 全池 fold-to-raise **11.6%**（486/4172）« 低锚 0.30 → 按门自身映射本池正确频率
+   ≈0；但仅 **6/102 对手**有任一 `facing_raise` 节点 n≥30 → 门够不到主人群。摊派口径有 cooler 掺入
+   （最差 −111.8bb 手实为诈唬变真被河杀），但 18% 直接弃牌率为无摊派水分的独立确证。**处方收敛 = barrel
+   A1 同型：回退默认 `bluff_raise_freq_mult` 0.10 → ~0（门保留，上调/清零能力不动）**；样本不饥饿
+   （fold-to-raise 采自所有 hero 加注、价值加注为主）。剩余工作 = sweep {0, 0.02, 0.05, 0.10} 定砍幅 +
+   标准矩阵 + 回退 0.10 byte-equal 回 HEAD。指针：§6 bluff_raise v2 记录 + run39 复盘。
 3. **float 残余复诊**：`post.unopened.float` run39 n=415 CI 勉强全负（−1.28 ±1.23）、run36–38 同向。float
    节点门（`30f0b09`）对无名/稀疏对手回退 1.0 → live 主人群吃 base 频率，与 barrel A1 同型处方候选
    （降 base、门保留）。幅度小（≈−26 mbb/g），排 bluff_raise 后。指针：§6 首个消费轮记录 + run39 复盘。
