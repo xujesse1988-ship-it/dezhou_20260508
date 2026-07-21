@@ -1093,13 +1093,47 @@ eq=0.063）实为**误报**：pot 646 / to_call 10 → required_eq 0.0152、门�
    `limp_behind` +2.95）= 对当前 limpy 场的剥削性放松。
 4. 第七轮价值尺寸放大维持强正：`value_bet.srp` +15.74 ±2.97（n=1928）。
 
+### P0-3 阶段2 第九消费轮（bluff_raise 回退砍频）：默认 0.10 → 0.02 **SHIP**（2026-07-21）
+
+run39 复诊处方（backlog #2）落地。**门（v2）不动**，只砍门读不到时的回退默认
+`NodesConfig.bluff_raise_freq_mult` 0.10 → **0.02**。这是继 value_size 第七轮 / barrel A1 后第三例
+「**base 值照 sim 靶甜点校准、live 主人群（门回退人群）实测粘 → 砍 base、门保留**」同型修正。
+
+**证据（先证据后接线）**：① run39 门内拆解——44 fire 中回退组 38 手 −20.4 bb/hand、直接弃牌率 18%
+（保本需 ~40%+），门上调组 6 手 +3.9、直接弃 83%；全池 fold-to-raise 11.6% « 低锚 0.30、仅 6/102
+对手门可读。② sweep {0,0.02,0.05,0.10}（HEAD `0fbd25b` 同二进制 config-only，253 run，
+`scratchpad/p03_bluff_raise_fallback/`）：
+
+| 臂 | Δ0.02 vs 0.10 | 读法 |
+|---|---|---|
+| 粘极 donk_stick exploit-OFF 32k×6seed | **+15.8（6/6 正）**（Δ0.00 +16.3）| live 主人群替身，单调要低 |
+| 弃极 donk_fold exploit-OFF | −20.1（Δ0.00 −25.5，0/6）| **真反号**，但该形态（永远无名的极端爱弃者）live 不存在 |
+| 弃极 donk_fold exploit-ON | −3.1@32k（8k −14 → 32k −3.9 **≈÷4**）| 纯冷启动固定成本，门接管后无持续损失（takes ~1600 全门驱动 ×2.0）|
+| broad 6 标准场 exploit-OFF ×3seed | 全正/平（station +29、nit +15、limpy +20…）| 无反向信号 |
+| **标准 11-config exploit-ON** | **0/11 超 CI95**（0.00 亦 0/11）| 最后一道门 |
+
+**档位判定 0.02（非 0）**：live 形态臂两档统计不可分；0.02 保留弃极尾部对冲 ~20%（OFF −20.1 vs
+−25.5 / ON −3.1 vs −3.9），残余放血按直接弃牌率去 cooler 水分估 ≈−1.5 mbb/g（保险价 ≈ 保费）；
+house 非零地板先例（barrel river ×0.3 非 0、cbet 门 0.15 floor）。
+
+**工程**：改动仅 `config.rs`（默认值 + 字段注释）+ `policy.rs` 注释/单测同步（`bluff_raise_gate_tests`
+断言回退基准 0.02）。掷点位置不动（乘子本就在 `roll` 前乘入）→ RNG 序列不变。**三重 byte-equal**：
+NEW 二进制 + config{0.10} == HEAD 二进制（ON+OFF，回滚保证）；NEW 无 config == config{0.02}
+（serde(default)：旧 config/无 config 皆得 0.02）；NEW 默认输出 == sweep 已验 m0.02 输出逐字节
+（**发的 = 验过的**）。测试：heuristic lib 26 / trace 10 / p0_3_facing 18 全绿；fmt / clippy 绿。
+（⚠ 全量 `cargo test` 勿跑：非 heuristic 重型测试 OOM，按第八轮先例只跑 heuristic 过滤集。）
+
+**范围外（留后续）**：run40 live 复盘验实效（预期 `post.facing.bluff_raise` 摊派负项收敛、fire 数
+~38→~8/20k）；门低锚 0.30（fold-to-raise 占位先验）按 live 池 11.6% 实测校准；float 残余（backlog #3）
+同型处方待独立走完闭环。诊断全文 `scratchpad/p03_bluff_raise_fallback/DIAGNOSIS.md`。
+
 ### 迭代 backlog（下一步，按优先级）
 
 > **本节 = 跨 session 循环恢复的单一入口**（各轮细节仍在 §6 对应记录，此处只收拢前沿 + 指针）。
-> **P0-3 阶段2 消费门弧线现状（截至 2026-07-21，HEAD `097affc` + run39 复盘）**：8 ship / 3 reject / 1 robust。
+> **P0-3 阶段2 消费门弧线现状（截至 2026-07-21，run39 复盘 + 第九消费轮）**：9 ship / 3 reject / 1 robust。
 > ship = float(`30f0b09`) / cbet-srp 频率(`058c1f5`) / bluff_raise v2(`63b5822`) / §D 采集(`bad0396`) /
 > §D live 接线(`0613410`) / value_bet.srp 尺寸放大(`3cb611f`) + fold-to-raise 采集(`fac17a8`) /
-> **turn/river barrel base 频率修正(A1，`097affc`，run39 live 确证)**。
+> turn/river barrel base 频率修正(A1，`097affc`，run39 live 确证) / **bluff_raise 回退砍频(第九轮，本轮)**。
 > **经验规律**：same-role 密集信号（信号轴=杠杆轴）→ ship 门；**一侧强要 + 另一侧 wash（非反号）→ ship flat
 > base 修正**（value_size 第七轮 / barrel A1）；跨角色/稀疏/无反号无 wash → reject/robust。
 
@@ -1111,17 +1145,12 @@ eq=0.063）实为**误报**：pot 646 / to_call 10 → required_eq 0.0152、门�
    照搬 flop + 门在 turn/river 稀疏样本/无名对手频回退 1.0** → live @0.80 空气 barrel（run34 −4.05 主因）。
    exploit-OFF broad +EV（limpy +113…）、exploit-ON 标准矩阵 0/11。**run39 实效**：−4.05 → −0.81（CI 含 0）、
    river 空气占比 22.4%→13.4%。详见 §6 第八消费轮 + run39 复盘。
-2. **bluff_raise 复诊（run39 新证据，升头号候选）**：`post.facing.bluff_raise` run36–39 四 run 全负、run39
-   n=44 CI 全负（−17.09 ±8.88），v2（0.10 频率甜点）后仍是最大单节点负项（摊派≈−38 mbb/g）。**run39 门内
-   拆解（主会话亲验，trace `bluff_raise_freq` cmp 分组）**：1761 评估 = 门清零 153（读到粘站，正确止损）+
-   门上调 ~22 + **回退 0.10 约 90%**；44 fire 中**回退组 38 手 −20.4 bb/hand、直接弃牌率仅 18%**（7/38，
-   诈唬加注约需 40%+ 直接弃保本）vs **门上调组 6 手 +3.9、直接弃 83%**（5/6）→ 亏损全在回退人群、门工作
-   正常。池真相：prof24 全池 fold-to-raise **11.6%**（486/4172）« 低锚 0.30 → 按门自身映射本池正确频率
-   ≈0；但仅 **6/102 对手**有任一 `facing_raise` 节点 n≥30 → 门够不到主人群。摊派口径有 cooler 掺入
-   （最差 −111.8bb 手实为诈唬变真被河杀），但 18% 直接弃牌率为无摊派水分的独立确证。**处方收敛 = barrel
-   A1 同型：回退默认 `bluff_raise_freq_mult` 0.10 → ~0（门保留，上调/清零能力不动）**；样本不饥饿
-   （fold-to-raise 采自所有 hero 加注、价值加注为主）。剩余工作 = sweep {0, 0.02, 0.05, 0.10} 定砍幅 +
-   标准矩阵 + 回退 0.10 byte-equal 回 HEAD。指针：§6 bluff_raise v2 记录 + run39 复盘。
+2. ✅ **已 SHIP（本轮，第九消费轮）**：bluff_raise 回退默认 `bluff_raise_freq_mult` 0.10 → **0.02**
+   （门 v2 不动）。run39 门内拆解证亏损全在回退人群（38 fire −20.4 bb/hand、直接弃牌率 18% vs 门上调组
+   +3.9/83%；全池 fold-to-raise 11.6% « 低锚 0.30、门仅够到 6/102 对手）；sweep {0,0.02,0.05,0.10} 粘极
+   +15.8（6/6）、弃极 exploit-ON 仅冷启动成本（÷4 摊薄）、标准矩阵 0/11；0.02 非 0 = 弃极尾部对冲
+   （保险价 ≈ 保费）。**验实效挂 run40 live 复盘**（预期节点摊派负项收敛、fire ~38→~8/20k）。
+   详见 §6 第九消费轮。
 3. **float 残余复诊**：`post.unopened.float` run39 n=415 CI 勉强全负（−1.28 ±1.23）、run36–38 同向。float
    节点门（`30f0b09`）对无名/稀疏对手回退 1.0 → live 主人群吃 base 频率，与 barrel A1 同型处方候选
    （降 base、门保留）。幅度小（≈−26 mbb/g），排 bluff_raise 后。指针：§6 首个消费轮记录 + run39 复盘。

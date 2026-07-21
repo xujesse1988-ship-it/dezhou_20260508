@@ -641,9 +641,13 @@ pub struct NodesConfig {
     /// float 频率乘子，取代固定 `float_freq_mult`（冷启动/未知/小样本回退固定乘子）。
     pub float: FloatGateConfig,
     /// `post.facing.bluff_raise` **回退**频率乘子（冷启动/未知/小样本/`bluff_raise_gate.node_gated=false`
-    /// 时用）：bluff_raise 频率 = 空气诈唬基础频率 × 此乘子。0.10 = Phase B 扫参甜点（对 sticky/常见场
-    /// 近最优，sweep 低频侧）。P0-3 阶段2 第四消费轮起，样本足的已知 villain 走 [`BluffRaiseGateConfig`]
-    /// 节点级门控（读 fold-to-raise 真信号）取代此固定乘子；未分化对手仍走此回退保节点存活 + 样本通道。
+    /// 时用）：bluff_raise 频率 = 空气诈唬基础频率 × 此乘子。P0-3 阶段2 第四消费轮起，样本足的已知
+    /// villain 走 [`BluffRaiseGateConfig`] 节点级门控（读 fold-to-raise 真信号）取代此固定乘子。
+    /// **0.02 = 第九消费轮 live 复诊砍幅**（原 Phase B 甜点 0.10 系 sim 靶标定）：run39 20000 手实测
+    /// 亏损全在回退人群（38 fire −20.4 bb/hand、直接弃牌率 18%，全池 fold-to-raise 11.6% « 低锚 0.30），
+    /// 门上调组 +EV；sweep {0,0.02,0.05,0.10} 粘极单调要低（exploit-OFF +16 6/6）、弃极 exploit-ON 仅
+    /// 冷启动成本（门接管，8k −14 → 32k −3.9 ≈÷4）、标准矩阵 0/11。留 0.02 非 0 = 弃极尾部对冲
+    /// （池漂移保险，house 非零地板先例）。回滚 = 设 0.10 逐字节回旧行为。
     pub bluff_raise_freq_mult: f64,
     /// `post.facing.bluff_raise` 节点级门控（P0-3 阶段2 第四消费轮）：按 binding villain 翻后
     /// **fold-to-raise**（真杠杆，same-role）单调映射 bluff_raise 频率乘子——**双向**（爱弃升频剥削 /
@@ -686,7 +690,8 @@ impl Default for NodesConfig {
             cbet_gate: CbetBluffGateConfig::default(),
             float_freq_mult: 0.5,
             float: FloatGateConfig::default(),
-            bluff_raise_freq_mult: 0.10,
+            // 第九消费轮：回退默认 0.10 → 0.02（run39 复诊 + sweep 定砍幅，见字段注释）。
+            bluff_raise_freq_mult: 0.02,
             bluff_raise_gate: BluffRaiseGateConfig::default(),
             cbet_value_size_gate: CbetValueSizeGateConfig::default(),
             // A1 SHIPPED：turn/river 空气 barrel base 频率修正（等价梯度：river 空气更纯砍更狠）。

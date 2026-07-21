@@ -976,7 +976,7 @@ fn bluff_raise_binding_readout(
 }
 
 /// binding 读数 → bluff_raise 频率乘子（纯核，可单测）：node_gated 关 / 冷启动（`None`）/ binding
-/// 样本 `n < min_samples` → 固定 `bluff_raise_freq_mult`（= 现默认 0.10，保标准矩阵不退、exploit 关
+/// 样本 `n < min_samples` → 固定 `bluff_raise_freq_mult`（= 现默认 0.02，第九消费轮 0.10→0.02，保标准矩阵不退、exploit 关
 /// 逐字节一致、节点存活续攒样本）；样本足 → 按 fold-to-raise 单调映射（**双向**：爱弃升频 / 粘站降频）。
 fn bluff_raise_mult_from_readout(
     binding: Option<(f64, u32)>,
@@ -2265,14 +2265,14 @@ mod bluff_raise_gate_tests {
     #[test]
     fn bluff_raise_mapping_is_monotone_bidirectional_and_clamped() {
         let bg = NodesConfig::default().bluff_raise_gate;
-        // 低锚以下（粘站 DonkStick 3.3%）→ mult_lo=0.0（降频止损，vs 回退 0.10 更低）。
+        // 低锚以下（粘站 DonkStick 3.3%）→ mult_lo=0.0（降频止损，vs 回退 0.02 更低）。
         assert_eq!(map_fold_to_bluff_raise_mult(0.033, &bg), 0.0);
         assert_eq!(
             map_fold_to_bluff_raise_mult(0.30, &bg),
             0.0,
             "低锚点 = mult_lo"
         );
-        // 高锚以上（爱弃 DonkFold 86.7%）→ 夹取 mult_hi=2.0（升频剥削，远超回退 0.10）。
+        // 高锚以上（爱弃 DonkFold 86.7%）→ 夹取 mult_hi=2.0（升频剥削，远超回退 0.02）。
         assert!((map_fold_to_bluff_raise_mult(0.867, &bg) - 2.0).abs() < 1e-9);
         assert!(
             (map_fold_to_bluff_raise_mult(0.80, &bg) - 2.0).abs() < 1e-9,
@@ -2280,28 +2280,29 @@ mod bluff_raise_gate_tests {
         );
         // DonkFold turn 74.5% → t=(0.745-0.30)/0.50=0.89 → 1.78（升频，未夹顶）。
         assert!((map_fold_to_bluff_raise_mult(0.745, &bg) - 1.78).abs() < 1e-6);
-        // 中点 0.55 → t=0.5 → 1.0（跨越回退 0.10，证双向可上调）。
+        // 中点 0.55 → t=0.5 → 1.0（远超回退 0.02，证双向可上调）。
         assert!((map_fold_to_bluff_raise_mult(0.55, &bg) - 1.0).abs() < 1e-6);
         // 严格单调递增（fold-to-raise 越高 → 乘子越高 → 频率越高，剥削反号）。
         assert!(map_fold_to_bluff_raise_mult(0.40, &bg) < map_fold_to_bluff_raise_mult(0.60, &bg));
         assert!(map_fold_to_bluff_raise_mult(0.60, &bg) < map_fold_to_bluff_raise_mult(0.78, &bg));
-        // 双向证据：低端 < 回退 0.10 < 高端（门既能下调又能上调）。
-        assert!(map_fold_to_bluff_raise_mult(0.20, &bg) < 0.10);
-        assert!(map_fold_to_bluff_raise_mult(0.85, &bg) > 0.10);
+        // 双向证据：低端 < 回退 0.02 < 高端（门既能下调又能上调）。
+        assert!(map_fold_to_bluff_raise_mult(0.20, &bg) < 0.02);
+        assert!(map_fold_to_bluff_raise_mult(0.85, &bg) > 0.02);
     }
 
-    // --- 冷启动 / node_gated 关 / n 门槛回退 = 固定 bluff_raise_freq_mult（0.10），非 1.0 ---
+    // --- 冷启动 / node_gated 关 / n 门槛回退 = 固定 bluff_raise_freq_mult（0.02），非 1.0 ---
     #[test]
     fn bluff_raise_gating_falls_back_to_fixed_mult() {
-        let nc = NodesConfig::default(); // bluff_raise_freq_mult=0.10, node_gated=true, min=30
+        let nc = NodesConfig::default(); // bluff_raise_freq_mult=0.02, node_gated=true, min=30
         let fb = nc.bluff_raise_freq_mult;
-        assert!((fb - 0.10).abs() < 1e-12, "回退基准 = 0.10");
-        // 冷启动（无 binding 读数）→ 固定 0.10（非 cbet 的 1.0）。
+        // 第九消费轮：回退默认 0.10 → 0.02（run39 复诊 + sweep 定砍幅，config.rs 字段注释）。
+        assert!((fb - 0.02).abs() < 1e-12, "回退基准 = 0.02");
+        // 冷启动（无 binding 读数）→ 固定 0.02（非 cbet 的 1.0）。
         assert_eq!(bluff_raise_mult_from_readout(None, &nc), fb);
-        // 小样本（n < 30）→ 固定 0.10（即便 fold-to-raise 很高/很低）。
+        // 小样本（n < 30）→ 固定 0.02（即便 fold-to-raise 很高/很低）。
         assert_eq!(bluff_raise_mult_from_readout(Some((0.90, 29)), &nc), fb);
         assert_eq!(bluff_raise_mult_from_readout(Some((0.02, 29)), &nc), fb);
-        // node_gated 关 → 恒固定 0.10（即便样本足）。
+        // node_gated 关 → 恒固定 0.02（即便样本足）。
         let mut nc_off = nc.clone();
         nc_off.bluff_raise_gate.node_gated = false;
         assert_eq!(
@@ -2318,9 +2319,9 @@ mod bluff_raise_gate_tests {
     #[test]
     fn bluff_raise_gating_uses_mapping_when_sample_ready() {
         let nc = NodesConfig::default();
-        // DonkFold（fold-to-raise 0.867，n 足）→ 夹取 2.0（升频剥削爱弃，>> 回退 0.10）。
+        // DonkFold（fold-to-raise 0.867，n 足）→ 夹取 2.0（升频剥削爱弃，>> 回退 0.02）。
         assert!((bluff_raise_mult_from_readout(Some((0.867, 154)), &nc) - 2.0).abs() < 1e-9);
-        // DonkStick（fold-to-raise 0.033，n 足）→ 0.0（降频止损粘站，< 回退 0.10）。
+        // DonkStick（fold-to-raise 0.033，n 足）→ 0.0（降频止损粘站，< 回退 0.02）。
         assert_eq!(bluff_raise_mult_from_readout(Some((0.033, 154)), &nc), 0.0);
     }
 
@@ -2340,7 +2341,7 @@ mod bluff_raise_gate_tests {
                 &nc
             ),
             nc.bluff_raise_freq_mult,
-            "冷启动 = 回退 0.10"
+            "冷启动 = 回退 0.02"
         );
         // 给座4 命名，**同时**在 fold-to-cbet 节点（flop.srp）塞粘站计数、在 fold-to-raise 节点
         // （flop.srp.facing_raise）塞爱弃计数 —— 两轴相反，证门读的是 facing_raise（而非 facing）。
@@ -2361,7 +2362,7 @@ mod bluff_raise_gate_tests {
             (bluff_raise_mult_from_readout(Some(b), &nc) - 2.0).abs() < 1e-9,
             "爱弃(被加注) → 升频 2.0（若误读 fold-to-cbet 粘站会得 0.0，方向反）"
         );
-        // 反证：只在 fold-to-cbet 节点有样本、facing_raise 无 → 查 facing_raise 得 n=0 → 回退 0.10。
+        // 反证：只在 fold-to-cbet 节点有样本、facing_raise 无 → 查 facing_raise 得 n=0 → 回退 0.02。
         let mut opp_cbet_only = OpponentTable::new();
         with_facing(&mut opp_cbet_only, "villain", "flop.srp", 200, 180); // 仅 fold-to-cbet
         let bc = bluff_raise_binding_readout(&v, &opp_cbet_only, bg).unwrap();
@@ -2372,7 +2373,7 @@ mod bluff_raise_gate_tests {
         assert_eq!(
             bluff_raise_mult_from_readout(Some(bc), &nc),
             nc.bluff_raise_freq_mult,
-            "n=0 < 门槛 → 回退 0.10"
+            "n=0 < 门槛 → 回退 0.02"
         );
     }
 
