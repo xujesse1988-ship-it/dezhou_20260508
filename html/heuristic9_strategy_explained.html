@@ -1,0 +1,928 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Heuristic9 德州扑克策略图解</title>
+<style>
+/* ============ 主题与调色板（light / dark 双套） ============ */
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --s1: #2a78d6;           /* 系列1 蓝 */
+  --s2: #eb6834;           /* 系列2 橙 */
+  --neutral-cell: #f0efec; /* 中性格 */
+  --o1: #86b6ef;           /* 有序梯 1（最浅） */
+  --o2: #5598e7;
+  --o3: #256abf;
+  --o4: #104281;           /* 有序梯 4（最深） */
+  --band: rgba(42,120,214,0.10);
+  --good-text: #006300;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --s1: #3987e5;
+    --s2: #d95926;
+    --neutral-cell: #383835;
+    --o1: #9ec5f4;
+    --o2: #6da7ec;
+    --o3: #2a78d6;
+    --o4: #184f95;
+    --band: rgba(57,135,229,0.14);
+    --good-text: #0ca30c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --ink: #ffffff;
+  --ink2: #c3c2b7;
+  --muted: #898781;
+  --grid: #2c2c2a;
+  --baseline: #383835;
+  --border: rgba(255,255,255,0.10);
+  --s1: #3987e5;
+  --s2: #d95926;
+  --neutral-cell: #383835;
+  --o1: #9ec5f4;
+  --o2: #6da7ec;
+  --o3: #2a78d6;
+  --o4: #184f95;
+  --band: rgba(57,135,229,0.14);
+  --good-text: #0ca30c;
+}
+
+/* ============ 基础 ============ */
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.75;
+  font-size: 16px;
+}
+main { max-width: 920px; margin: 0 auto; padding: 0 20px 80px; }
+h1 { font-size: 1.9rem; line-height: 1.3; margin: 0.2em 0 0.3em; }
+h2 { font-size: 1.4rem; margin: 2.6em 0 0.6em; padding-top: 0.4em; border-top: 1px solid var(--grid); }
+h3 { font-size: 1.08rem; margin: 1.6em 0 0.5em; }
+p { margin: 0.7em 0; }
+a { color: var(--s1); text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { font-weight: 650; }
+.sub { color: var(--ink2); }
+.small { font-size: 0.86rem; color: var(--ink2); }
+.tiny { font-size: 0.8rem; color: var(--muted); }
+code { background: var(--neutral-cell); border-radius: 4px; padding: 0.1em 0.35em; font-size: 0.88em; }
+
+/* 顶部 */
+header.top {
+  max-width: 920px; margin: 0 auto; padding: 28px 20px 0;
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
+}
+#themeBtn {
+  flex: none; margin-top: 6px; cursor: pointer;
+  background: var(--surface); color: var(--ink2);
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 6px 14px; font-size: 0.85rem;
+}
+#themeBtn:hover { color: var(--ink); }
+
+/* 目录 */
+nav.toc {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px 20px; margin: 20px 0 8px; font-size: 0.9rem;
+}
+nav.toc ol { margin: 6px 0 2px; padding-left: 1.4em; columns: 2; column-gap: 2.5em; }
+nav.toc li { margin: 2px 0; break-inside: avoid; }
+@media (max-width: 640px) { nav.toc ol { columns: 1; } }
+
+/* 图卡 */
+.fig {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 18px 20px 14px; margin: 18px 0;
+}
+.fig h4 { margin: 0 0 2px; font-size: 0.98rem; }
+.fig .cap { font-size: 0.84rem; color: var(--ink2); margin: 8px 0 0; }
+.scrollx { overflow-x: auto; }
+
+/* 指标块 */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin: 18px 0; }
+.stat {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px;
+}
+.stat .lbl { font-size: 0.84rem; color: var(--ink2); }
+.stat .val { font-size: 1.9rem; font-weight: 650; line-height: 1.25; margin-top: 2px; }
+.stat .note { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+
+/* 流水线 */
+.flow { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding: 6px 0 10px; }
+.flow .step {
+  flex: 1 0 128px; min-width: 128px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 12px; font-size: 0.82rem; color: var(--ink2);
+}
+.flow .step b { display: block; color: var(--ink); font-size: 0.9rem; margin-bottom: 3px; }
+.flow .step .n {
+  display: inline-block; width: 20px; height: 20px; border-radius: 50%;
+  background: var(--s1); color: #fff; text-align: center; line-height: 20px;
+  font-size: 0.75rem; margin-bottom: 6px;
+}
+.flow .arrow { flex: none; align-self: center; padding: 0 6px; color: var(--muted); font-size: 1.1rem; }
+
+/* 横向条形图（div 版） */
+.hbars { display: grid; grid-template-columns: max-content 1fr; gap: 8px 12px; align-items: center; margin-top: 10px; }
+.hbars .lbl { font-size: 0.86rem; color: var(--ink2); text-align: right; white-space: nowrap; }
+.hbars .track { position: relative; height: 20px; }
+.hbars .bar {
+  height: 18px; border-radius: 0 4px 4px 0; background: var(--s1);
+  display: inline-block; vertical-align: middle;
+}
+.hbars .bar.alt { background: var(--s2); }
+.hbars .val { font-size: 0.82rem; color: var(--ink); margin-left: 8px; vertical-align: middle; }
+.legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: 0.82rem; color: var(--ink2); margin: 4px 0 2px; }
+.legend .key { display: inline-flex; align-items: center; gap: 6px; }
+.legend .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+
+/* 手牌矩阵 */
+.gridwrap { overflow-x: auto; padding-bottom: 4px; }
+#handGrid {
+  display: grid; grid-template-columns: repeat(13, minmax(40px, 1fr));
+  gap: 2px; min-width: 560px; margin-top: 10px;
+}
+.hc {
+  aspect-ratio: 1.35 / 1; display: flex; align-items: center; justify-content: center;
+  font-size: 0.72rem; font-weight: 600; border-radius: 3px; cursor: default;
+  color: var(--muted); background: var(--neutral-cell);
+}
+.hc.t1 { background: var(--o1); color: #0b0b0b; }
+.hc.t2 { background: var(--o2); color: #0b0b0b; }
+.hc.t3 { background: var(--o3); color: #ffffff; }
+.hc.t4 { background: var(--o4); color: #ffffff; }
+:root[data-theme="dark"] .hc.t3, :root[data-theme="dark"] .hc.t4 { color: #ffffff; }
+.hc:focus { outline: 2px solid var(--s2); outline-offset: 1px; }
+#gridTip {
+  position: fixed; z-index: 10; pointer-events: none; display: none;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+  padding: 8px 12px; font-size: 0.82rem; max-width: 260px;
+}
+#gridTip b { font-size: 0.95rem; }
+
+/* 优先级阶梯 */
+.ladders { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 760px) { .ladders { grid-template-columns: 1fr; } }
+.ladder { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+.ladder h4 { margin: 0 0 10px; font-size: 0.98rem; }
+.ladder ol { margin: 0; padding: 0; list-style: none; counter-reset: step; }
+.ladder li {
+  counter-increment: step; position: relative; padding: 8px 0 8px 38px;
+  border-top: 1px solid var(--grid); font-size: 0.88rem; color: var(--ink2);
+}
+.ladder li:first-child { border-top: none; }
+.ladder li::before {
+  content: counter(step); position: absolute; left: 0; top: 10px;
+  width: 24px; height: 24px; border-radius: 50%; background: var(--s1); color: #fff;
+  font-size: 0.78rem; text-align: center; line-height: 24px;
+}
+.ladder li.else::before { background: var(--baseline); color: var(--ink); }
+.ladder li b { color: var(--ink); }
+.ladder li .act { color: var(--s1); font-weight: 650; }
+
+/* 成手阶梯 */
+.made { display: flex; flex-direction: column-reverse; gap: 4px; margin-top: 10px; }
+.made .rung { display: flex; align-items: center; gap: 12px; font-size: 0.86rem; }
+.made .chip { flex: none; width: 110px; text-align: center; border-radius: 5px; padding: 4px 0; font-weight: 650; }
+.made .ex { color: var(--ink2); }
+
+/* 扑克牌示意 */
+.boards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 10px; }
+@media (max-width: 700px) { .boards { grid-template-columns: 1fr; } }
+.board { border: 1px solid var(--grid); border-radius: 10px; padding: 12px 14px; }
+.cards { display: flex; gap: 6px; margin: 6px 0 8px; }
+.pcard {
+  width: 40px; height: 56px; border-radius: 6px; background: #ffffff; border: 1px solid #d5d4cd;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 1rem; color: #16161a; line-height: 1.1;
+}
+.pcard .suit { font-size: 1.05rem; }
+.pcard.red { color: #c22f2f; }
+.meter { height: 8px; border-radius: 4px; background: var(--neutral-cell); overflow: hidden; margin-top: 6px; }
+.meter i { display: block; height: 100%; background: var(--s1); border-radius: 4px 0 0 4px; }
+
+/* 对手类型卡 */
+.opps { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-top: 12px; }
+.opp { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; font-size: 0.86rem; }
+.opp h4 { margin: 0 0 4px; font-size: 1rem; }
+.opp .crit { color: var(--muted); font-size: 0.78rem; margin-bottom: 6px; }
+.opp ul { margin: 4px 0 0; padding-left: 1.2em; color: var(--ink2); }
+.opp li { margin: 2px 0; }
+
+/* SVG 图 */
+svg.chart { width: 100%; height: auto; display: block; }
+svg .axis { stroke: var(--baseline); stroke-width: 1; }
+svg .gridline { stroke: var(--grid); stroke-width: 1; }
+svg .tick { fill: var(--muted); font-size: 11px; }
+svg .lab { fill: var(--ink2); font-size: 12px; }
+svg .lab-strong { fill: var(--ink); font-size: 12px; font-weight: 650; }
+svg .dot { fill: var(--s1); stroke: var(--surface); stroke-width: 2; }
+svg .dot2 { fill: var(--s2); stroke: var(--surface); stroke-width: 2; }
+svg .line1 { stroke: var(--s1); stroke-width: 2; fill: none; stroke-linejoin: round; stroke-linecap: round; }
+svg .band { fill: var(--band); }
+
+/* 小面板组 */
+.panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
+.panel { border: 1px solid var(--grid); border-radius: 10px; padding: 10px 12px; }
+.panel h5 { margin: 0 0 2px; font-size: 0.88rem; }
+.panel .sub5 { font-size: 0.76rem; color: var(--muted); margin-bottom: 4px; }
+
+/* 表格 */
+table.data { border-collapse: collapse; width: 100%; font-size: 0.86rem; margin-top: 8px; }
+table.data th, table.data td { border: 1px solid var(--grid); padding: 5px 10px; text-align: left; vertical-align: top; }
+table.data th { background: var(--neutral-cell); font-weight: 650; }
+table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
+details { margin-top: 10px; font-size: 0.86rem; }
+details summary { cursor: pointer; color: var(--s1); }
+
+/* 提示框 */
+.callout {
+  border-left: 3px solid var(--s1); background: var(--band);
+  border-radius: 0 10px 10px 0; padding: 10px 16px; margin: 16px 0; font-size: 0.9rem;
+}
+.callout.warn { border-left-color: var(--s2); background: color-mix(in srgb, var(--s2) 9%, transparent); }
+
+/* 变更标签 */
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.chip-item {
+  font-size: 0.78rem; color: var(--ink2); background: var(--neutral-cell);
+  border-radius: 999px; padding: 3px 12px;
+}
+
+footer { margin-top: 60px; padding-top: 16px; border-top: 1px solid var(--grid); font-size: 0.8rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div>
+    <h1>一套"讲道理"的德州扑克 AI 策略</h1>
+    <p class="sub">Heuristic9 策略图解 —— 不靠海量算力求解,靠一套可解释的规则打牌。写给普通德州爱好者。</p>
+  </div>
+  <button id="themeBtn" type="button">主题:自动</button>
+</header>
+
+<main>
+
+<nav class="toc">
+  <strong>目录</strong>
+  <ol>
+    <li><a href="#sec1">它是什么</a></li>
+    <li><a href="#sec2">每个决策怎么做出来:六步流水线</a></li>
+    <li><a href="#sec3">通用货币:胜率(equity)</a></li>
+    <li><a href="#sec4">读人:猜对手拿什么牌</a></li>
+    <li><a href="#sec5">翻牌前怎么打</a></li>
+    <li><a href="#sec6">翻牌后怎么打</a></li>
+    <li><a href="#sec7">下多大注</a></li>
+    <li><a href="#sec8">剥削:给对手建档案</a></li>
+    <li><a href="#sec9">安全网与"受控随机"</a></li>
+    <li><a href="#sec10">它怎么变强:迭代闭环</a></li>
+    <li><a href="#sec11">它不做什么(诚实的局限)</a></li>
+    <li><a href="#sec12">术语小词典</a></li>
+  </ol>
+</nav>
+
+<h2 id="sec1">1. 它是什么</h2>
+<p>市面上最强的扑克 AI(比如 Pluribus)靠海量算力"求解"博弈,算出一张巨大的策略表——强,但像黑盒:没人能说清它为什么在某一手选择加注。<strong>Heuristic9 走的是另一条路:把职业玩家的打牌逻辑写成一套明确的规则</strong>。每一个决策都能回答"为什么"——因为胜率够、因为对手太紧、因为赔率划算。</p>
+<p>三个关键词:</p>
+<ul>
+  <li><strong>分层</strong> —— 先算胜率,再看局面性质,再按场景规则出牌,最后针对具体对手微调;</li>
+  <li><strong>可解释</strong> —— 每个决策都留有"痕迹":当时胜率多少、过了哪条门槛、掷了什么骰子;</li>
+  <li><strong>人数无关</strong> —— 同一套规则从单挑打到 9 人桌,不用重新训练。</li>
+</ul>
+
+<div class="stats">
+  <div class="stat">
+    <div class="lbl">线上 6 人桌实测赢率(run39)</div>
+    <div class="val" style="color:var(--good-text)">+1.5 bb/手</div>
+    <div class="note">20,000 手,匿名线上对手池(以弱场玩家为主),+1503 mbb/手</div>
+  </div>
+  <div class="stat">
+    <div class="lbl">决策可追溯率</div>
+    <div class="val">100%</div>
+    <div class="note">每个决策都记录完整依据,异常兜底触发 0 次</div>
+  </div>
+  <div class="stat">
+    <div class="lbl">同一套规则支持</div>
+    <div class="val">2–9 人</div>
+    <div class="note">规则以"胜率+赔率"为核心,天然与人数无关</div>
+  </div>
+</div>
+
+<h2 id="sec2">2. 每个决策怎么做出来:六步流水线</h2>
+<p>轮到它行动时(无论翻牌前后),它都走同一条流水线:</p>
+
+<div class="fig">
+  <div class="flow">
+    <div class="step"><span class="n">1</span><b>看清牌桌</b>重建当前局面:底池、各家筹码、行动历史、公共牌</div>
+    <div class="arrow">→</div>
+    <div class="step"><span class="n">2</span><b>猜对手的牌</b>根据每个对手这手牌的一路动作,推测他的手牌范围</div>
+    <div class="arrow">→</div>
+    <div class="step"><span class="n">3</span><b>算胜率</b>蒙特卡洛模拟上千次发牌,算出对上这些范围的真实胜率</div>
+    <div class="arrow">→</div>
+    <div class="step"><span class="n">4</span><b>场景规则</b>命中一个具体场景节点(如"翻牌·单加注池·无人下注"),按该节点的规则选动作</div>
+    <div class="arrow">→</div>
+    <div class="step"><span class="n">5</span><b>针对性微调</b>按对手档案(紧/松/疯)调整价值门槛、诈唬频率、下注尺寸</div>
+    <div class="arrow">→</div>
+    <div class="step"><span class="n">6</span><b>合法性检查</b>保证输出动作合法;万一出错,保守兜底(能过牌就过牌)</div>
+  </div>
+  <p class="cap">整条流水线的核心思想:<strong>把所有信息折算成一个数——胜率</strong>,再用场景规则决定"这个胜率值不值得投钱"。</p>
+</div>
+
+<h2 id="sec3">3. 通用货币:胜率(equity)</h2>
+<p>胜率(equity)是整个引擎的地基:<strong>"如果现在把牌发完摊牌,我平均能赢下底池的百分之几"</strong>。它不查表打分,而是真的模拟:给每个对手从他的"可能手牌范围"里发一手牌,补完剩下的公共牌,摊牌比大小——重复上千次,统计赢的比例。</p>
+<p>翻牌前还有一把随时可用的尺子:<strong>169 种起手牌强度表</strong>。德州所有起手牌按"对子 / 同花 / 不同花"归成 169 类,启动时给每一类跑一遍"对一个随机对手"的模拟,得到 0 到 1 的强度值。随机两张牌约等于 0.5,越强越接近 1:</p>
+
+<div class="fig">
+  <h4>起手牌强度尺(对一名随机对手的胜率)</h4>
+  <div class="scrollx">
+  <svg class="chart" viewBox="0 0 760 130" role="img" aria-label="起手牌强度尺:32o约0.32,72o约0.35,随机两张0.50,JTs约0.57,AKs约0.67,QQ约0.80,AA约0.85">
+    <line class="axis" x1="40" y1="72" x2="720" y2="72"></line>
+    <g>
+      <line class="gridline" x1="159" y1="66" x2="159" y2="78"></line>
+      <line class="gridline" x1="279" y1="66" x2="279" y2="78"></line>
+      <line class="gridline" x1="398" y1="66" x2="398" y2="78"></line>
+      <line class="gridline" x1="517" y1="66" x2="517" y2="78"></line>
+      <line class="gridline" x1="637" y1="66" x2="637" y2="78"></line>
+      <text class="tick" x="40" y="92" text-anchor="middle">0.30</text>
+      <text class="tick" x="159" y="92" text-anchor="middle">0.40</text>
+      <text class="tick" x="279" y="92" text-anchor="middle">0.50</text>
+      <text class="tick" x="398" y="92" text-anchor="middle">0.60</text>
+      <text class="tick" x="517" y="92" text-anchor="middle">0.70</text>
+      <text class="tick" x="637" y="92" text-anchor="middle">0.80</text>
+    </g>
+    <circle class="dot" cx="66" cy="72" r="5"></circle>
+    <text class="lab" x="66" y="114" text-anchor="middle">32o 0.32</text>
+    <circle class="dot" cx="103" cy="72" r="5"></circle>
+    <text class="lab" x="103" y="48" text-anchor="middle">72o 0.35</text>
+    <circle class="dot2" cx="279" cy="72" r="5"></circle>
+    <text class="lab-strong" x="279" y="114" text-anchor="middle">随机两张 ≈0.50</text>
+    <circle class="dot" cx="356" cy="72" r="5"></circle>
+    <text class="lab" x="356" y="48" text-anchor="middle">JTs 0.57</text>
+    <circle class="dot" cx="485" cy="72" r="5"></circle>
+    <text class="lab" x="485" y="114" text-anchor="middle">AKs 0.67</text>
+    <circle class="dot" cx="633" cy="72" r="5"></circle>
+    <text class="lab" x="633" y="48" text-anchor="middle">QQ 0.80</text>
+    <circle class="dot" cx="696" cy="72" r="5"></circle>
+    <text class="lab" x="696" y="114" text-anchor="middle">AA 0.85</text>
+  </svg>
+  </div>
+  <p class="cap">翻牌前所有门槛(开池、3bet、全下)都用这把尺子;后文出现的 0.505、0.585 之类的数,单位都是它。s = 同花(suited),o = 不同花(offsuit)。</p>
+</div>
+
+<div class="callout">
+  <strong>为什么这招能"人数无关"?</strong> 因为模拟时每个还在场的对手各自有一条手牌范围,各发各的牌。三个对手就同时对三条范围摊牌——胜率自动变低,多人局"该收紧"不用另写规则,它从数学里自己长出来。
+</div>
+
+<h2 id="sec4">4. 读人:猜对手拿什么牌</h2>
+<p>算胜率之前必须回答:<strong>对手可能拿着什么牌?</strong>这是全引擎最关键的一环——范围猜得准,后面所有门槛才有意义。基本思路是"听其言,观其行":一个人这手牌做过什么动作,就暴露了他的牌力下限。</p>
+
+<div class="fig">
+  <h4>动作角色 → 手牌范围宽度(占全部起手牌的百分比)</h4>
+  <div class="hbars" role="img" aria-label="翻前3bet者约前8%,开池加注者前17%,冷跟者前34%,limp入池者前55%,大盲免费看翻牌约前80%">
+    <div class="lbl">翻牌前再加注(3bet)的人</div>
+    <div class="track"><span class="bar" style="width:10%"></span><span class="val">前 8% 的强牌</span></div>
+    <div class="lbl">开池加注的人</div>
+    <div class="track"><span class="bar" style="width:21%"></span><span class="val">前 17%</span></div>
+    <div class="lbl">冷跟一个加注的人</div>
+    <div class="track"><span class="bar" style="width:42%"></span><span class="val">前 34%</span></div>
+    <div class="lbl">limp 平跟入池的人</div>
+    <div class="track"><span class="bar" style="width:69%"></span><span class="val">前 55%</span></div>
+    <div class="lbl">大盲免费看翻牌的人</div>
+    <div class="track"><span class="bar" style="width:100%"></span><span class="val">前 80% ≈ 随便两张</span></div>
+  </div>
+  <p class="cap">动作越激进,范围越窄越强。注意"宽 ≠ 弱":范围放宽只是把下限拉低,顶端永远还有 AA。</p>
+  <details><summary>数据表</summary>
+    <table class="data">
+      <tr><th>动作角色</th><th>范围宽度</th><th>大致对应</th></tr>
+      <tr><td>3bet 及以上的加注者</td><td class="num">前 8%</td><td>99+、AQs+、AKo 一档</td></tr>
+      <tr><td>开池 / 单加注者</td><td class="num">前 17%</td><td>66+、A9s+、ATo+、KJs+ 一档</td></tr>
+      <tr><td>冷跟加注</td><td class="num">前 34%</td><td>再加小对、宽同花连张、宽 Ax</td></tr>
+      <tr><td>limp / 补盲</td><td class="num">前 55%</td><td>约半数起手牌</td></tr>
+      <tr><td>大盲免费过牌</td><td class="num">前 80%</td><td>几乎任意两张</td></tr>
+    </table>
+  </details>
+</div>
+
+<p>这只是起点。范围还会随三件事继续收紧或放宽:</p>
+<ul>
+  <li><strong>街越晚越紧</strong>:翻牌 +0.03、转牌 +0.06、河牌 +0.09——到了后面的街还愿意投钱,牌就越诚实;</li>
+  <li><strong>注越大越紧</strong>:本条街的下注者,下注占底池比例越高,越假设他有真牌(最多 +0.18)。这是刻意针对弱场的假设——普通玩家"下大注 = 有货",职业场未必如此;</li>
+  <li><strong>看人下菜</strong>:观察满 18 手后,紧手(nit)的下注范围再收紧 0.12,跟注站放宽 0.12(见第 8 节)。</li>
+</ul>
+
+<div class="callout">
+  <strong>举个例子。</strong>对手在按钮位开池加注(范围≈前 17%),你在大盲跟注。翻牌 A♠7♦2♣,他又下注一半底池。此时他的范围 ≈ 0.17 档起点 + 翻牌收紧 + 下注收紧——比他翻前开池时<em>还紧</em>。所以你拿个中对,引擎会算出胜率不够,直接弃掉。这正是老玩家说的"干燥 A 高面上别跟持续下注"——但这里不是背口诀,是从范围推出来的。
+</div>
+
+<p class="small"><strong>进阶:实战默认用的是机器学习版范围。</strong>上面的"百分比截断"是保底模型——它把范围压成"从最强往下取到某条线"。实战里默认跑一个小型神经网络(GRU),吃进对手的整串动作序列,输出 169 类手牌的<em>完整概率分布</em>——能表达"他这条线更像听牌/诈唬"这类截断模型说不出的形状。两条路输出口径相同,神经网络产物缺失时自动退回保底模型。</p>
+
+<h2 id="sec5">5. 翻牌前怎么打</h2>
+
+<h3>位置:不数座位,数"还有几个人没行动"</h3>
+<p>翻前策略核心是<strong>位置 × 牌力门槛</strong>。它不用固定的"枪口位/中位/CO/按钮"叫法,而是把座位换算成"相对按钮还剩几人"的桶:前位 / 中位 / 后位 / 小盲 / 大盲——这样 6 人桌和 9 人桌能共用同一套规则。位置越靠后,越晚行动信息越多,开池门槛越低:</p>
+
+<div class="fig">
+  <h4>首入开池(前面无人加注时)的手牌矩阵</h4>
+  <p class="small" style="margin-top:2px">颜色越深 = 越强、越早的位置就能开池加注(尺寸 2.3bb)。鼠标悬停/键盘聚焦查看每手牌的强度值。</p>
+  <div class="legend">
+    <span class="key"><span class="sw" style="background:var(--o4)"></span>任何位置都开(强度≥0.585)</span>
+    <span class="key"><span class="sw" style="background:var(--o3)"></span>中位起开(≥0.555)</span>
+    <span class="key"><span class="sw" style="background:var(--o2)"></span>小盲/后位开(≥0.535)</span>
+    <span class="key"><span class="sw" style="background:var(--o1)"></span>只在后位开(≥0.505)</span>
+    <span class="key"><span class="sw" style="background:var(--neutral-cell);border:1px solid var(--grid)"></span>不主动开池</span>
+  </div>
+  <div class="gridwrap"><div id="handGrid"></div></div>
+  <p class="cap">左上-右下对角线是对子;对角线右上方是同花(s),左下方是不同花(o)。数据取自引擎实际使用的 169 手强度表,所以能看到蒙特卡洛的真实"毛刺"(比如 K4s 比 K5s 略高)。实战中门槛还会微调:每多一个已入池对手 +0.012;全桌都是紧手时降低门槛多偷盲。</p>
+  <details><summary>文字版(表格)</summary>
+    <table class="data">
+      <tr><th>档位</th><th>占全部起手牌</th><th>手牌</th></tr>
+      <tr><td>任何位置都开</td><td class="num">19.0%</td><td>AA–55、AKs–A3s、KQs–K8s、QJs–QTs、JJ 之外还有 AKo–A7o、KQo–KTo、A9s、A8s 等(38 类)</td></tr>
+      <tr><td>中位起开</td><td class="num">再加 10.1%</td><td>A2s、K7s、K6s、K4s、Q9s、Q8s、QJo、JTs、J9s、QTo、K9o、K8o、A6o–A3o、44</td></tr>
+      <tr><td>小盲/后位开</td><td class="num">再加 7.7%</td><td>K5s、K3s、Q7s、Q6s、J8s、JTo、T9s、Q9o、Q8o、K7o、K6o、33、A2o</td></tr>
+      <tr><td>只在后位开</td><td class="num">再加 10.9%</td><td>K2s、Q5s–Q3s、J7s、J6s、T8s、T7s、98s、J9o、T9o、J8o、Q7o、Q6o、K5o–K2o</td></tr>
+      <tr><td>不主动开池</td><td class="num">其余 52.3%</td><td>过牌 / 弃牌,或满足条件时投机跟注</td></tr>
+    </table>
+  </details>
+</div>
+
+<h3>翻前的完整决策顺序</h3>
+<div class="ladders">
+  <div class="ladder">
+    <h4>前面没人加注时</h4>
+    <ol>
+      <li><b>短筹码覆盖层:</b>有效筹码 &lt; 25bb 且强度 ≥ 0.60 → <span class="act">直接全下</span><br><span class="tiny">短筹码没有翻后周旋空间,推/弃是数学最优的简化</span></li>
+      <li><b>强度过位置门槛</b>(见上图)→ <span class="act">开池加注 2.3bb</span>,每有一个 limper 再加 1bb(把跟风者隔离出去)</li>
+      <li><b>投机跟注:</b>强度 ≥ 0.51、跟注 ≤ 1.5bb、前面已有人入池 → <span class="act">便宜跟注</span><br><span class="tiny">小对子、同花连张:博翻牌中暗三/强听牌,靠"隐含赔率"回本</span></li>
+      <li class="else"><b>其余:</b>大盲能免费看就<span class="act">过牌</span>,否则<span class="act">弃牌</span></li>
+    </ol>
+  </div>
+  <div class="ladder">
+    <h4>面对加注时</h4>
+    <ol>
+      <li><b>短筹码覆盖层:</b>同左,强度够就<span class="act">全下</span></li>
+      <li><b>价值再加注:</b>面对开池,强度 ≥ 0.64 → <span class="act">3bet</span>;面对 3bet,强度 ≥ 0.70 → <span class="act">4bet</span><br><span class="tiny">尺寸:有位置 ×3 倍,没位置 ×4 倍(没位置要把底池打大补偿劣势)</span></li>
+      <li><b>赔率跟注:</b>用真实胜率对比底池赔率,划算就<span class="act">跟注</span><br><span class="tiny">深筹码(&gt;40bb)时投机牌额外给一点"隐含赔率"折让;面对的加注级别越高,折让越小(容易被更大的牌"支配")</span></li>
+      <li class="else"><b>都不满足:</b><span class="act">弃牌</span></li>
+    </ol>
+  </div>
+</div>
+
+<div class="callout">
+  <strong>一个专门修过的坑:大盲防守。</strong>早期版本大盲拿边缘牌面对小加注也弃,长期被偷盲打穿。现在只要底池赔率划算就防守,不再硬卡牌力门槛——这条改动就是靠"分场景记账发现大盲位置持续漏钱"定位出来的(见第 10 节)。
+</div>
+
+<h2 id="sec6">6. 翻牌后怎么打</h2>
+<p>翻牌一发,除了算胜率,引擎还提取三个互相独立的信号——它们的作用是<strong>区分"胜率相同但性质完全不同"的牌</strong>:同样 50% 胜率,可能是中对(该控池),也可能是同花听牌(该半诈唬),打法天差地别。</p>
+
+<h3>信号一:成手档位</h3>
+<div class="fig">
+  <div class="made">
+    <div class="rung"><span class="chip" style="background:var(--neutral-cell);color:var(--ink2)">空气 Air</span><span class="ex">没成对、没像样听牌 —— 只能诈唬或放弃</span></div>
+    <div class="rung"><span class="chip" style="background:var(--o1);color:#0b0b0b">弱对</span><span class="ex">底对、低于牌面的口袋对</span></div>
+    <div class="rung"><span class="chip" style="background:var(--o2);color:#0b0b0b">中对</span><span class="ex">第二大的对子 —— 价值下注的最低门槛</span></div>
+    <div class="rung"><span class="chip" style="background:var(--o3);color:#fff">顶对/超对</span><span class="ex">顶对或口袋超对 —— 可以打大底池</span></div>
+    <div class="rung"><span class="chip" style="background:var(--o4);color:#fff">强牌</span><span class="ex">两对、三条</span></div>
+    <div class="rung"><span class="chip" style="background:var(--o4);color:#fff">怪物 Monster</span><span class="ex">顺子及以上 —— 考虑超额下注榨取</span></div>
+  </div>
+</div>
+
+<h3>信号二:听牌</h3>
+<p>"值得半诈唬"的听牌 = <strong>同花听牌、两头顺听牌、或复合听牌</strong>(两者兼具)。只有卡顺(4 张补 1 张)不算——出牌概率太低,撑不起半诈唬的数学。</p>
+
+<h3>信号三:牌面湿度</h3>
+<div class="fig">
+  <div class="boards">
+    <div class="board">
+      <strong>干燥牌面</strong>
+      <div class="cards">
+        <div class="pcard">A<span class="suit">♠</span></div>
+        <div class="pcard red">7<span class="suit">♦</span></div>
+        <div class="pcard">2<span class="suit">♣</span></div>
+      </div>
+      <div class="meter"><i style="width:15%"></i></div>
+      <p class="small">三色、不连张——谁都很难有听牌。诈唬频率高(空气 c-bet 约 80%),下注小(约 1/3 底池)就够赶人走。</p>
+    </div>
+    <div class="board">
+      <strong>潮湿牌面</strong>
+      <div class="cards">
+        <div class="pcard red">9<span class="suit">♥</span></div>
+        <div class="pcard red">8<span class="suit">♥</span></div>
+        <div class="pcard">7<span class="suit">♠</span></div>
+      </div>
+      <div class="meter"><i style="width:85%"></i></div>
+      <p class="small">两同花、三连张——满地听牌。诈唬频率降(约 55%),但真下注就下大(约 0.8 底池),不给听牌便宜看牌。</p>
+    </div>
+  </div>
+  <p class="cap">引擎把"是否成对 / 两同花 / 单色 / 连张程度"综合成一个 0–1 的湿度值,诈唬频率和下注尺寸都随它连续滑动。</p>
+</div>
+
+<h3>翻后的两张决策阶梯</h3>
+<p>翻后所有决策归成两种局面,各自一条"从上往下,第一个满足就执行"的优先级阶梯:</p>
+
+<div class="ladders">
+  <div class="ladder">
+    <h4>没人下注(我可以下注或过牌)</h4>
+    <ol>
+      <li><b>价值下注:</b>胜率 ≥ 0.58 且成手 ≥ 中对 → <span class="act">下注要钱</span><br><span class="tiny">有位置单挑放宽到 0.53(敢打更薄);每多一个对手 +0.03(多人收紧)</span></li>
+      <li><b>低 SPR 承诺:</b>底池已大(SPR &lt; 2.5)且拿顶对以上 → <span class="act">下注,准备全下</span></li>
+      <li><b>半诈唬:</b>有像样听牌且胜率 ≥ 0.28 → 75% 的频率<span class="act">下注</span><br><span class="tiny">两条路赢:对手直接弃,或跟注后自己听中</span></li>
+      <li><b>空气 c-bet(我是进攻方):</b>按频率<span class="act">继续开火诈唬</span>(频率见下图)</li>
+      <li><b>空气偷池(我不是进攻方):</b>极低频率<span class="act">试探性下注</span>(float,基础仅 15%,且被对手档案严格门控)</li>
+      <li class="else"><b>其余:</b><span class="act">过牌</span>(控池或放弃)</li>
+    </ol>
+  </div>
+  <div class="ladder">
+    <h4>面对下注(弃牌 / 跟注 / 加注三选一)</h4>
+    <ol>
+      <li><b>价值加注:</b>胜率 ≥ 0.64 且顶对以上 → <span class="act">加注</span></li>
+      <li><b>强听半诈唬加注:</b>复合听牌(如同花听+顺听)→ 约 50% 频率<span class="act">加注</span>,多人时减半</li>
+      <li><b>赔率跟注:</b>胜率 ≥ 底池赔率 + 0.02 的安全边际 → <span class="act">跟注</span><br><span class="tiny">非河牌的听牌享受隐含赔率折让(筹码越深折让越多,最多 0.12)</span></li>
+      <li><b>纯诈唬加注:</b>空气、非河牌 → <span class="act">加注</span>,但基础频率仅 0.6%,几乎不做<br><span class="tiny">只有当统计确认这个对手"被加注就弃"(弃牌率&gt;30%)才逐步升频,上限 40%(第 8 节)</span></li>
+      <li class="else"><b>都不满足:</b><span class="act">弃牌</span>——绝不做胜率不够的跟注</li>
+    </ol>
+  </div>
+</div>
+
+<div class="fig">
+  <h4>空气 c-bet 诈唬频率(基础值)</h4>
+  <div class="panels">
+    <div class="panel">
+      <h5>按底池类型 × 牌面(翻牌圈)</h5>
+      <div class="sub5">3bet 底池对手范围更强更粘,诈唬大砍</div>
+      <div class="legend">
+        <span class="key"><span class="sw" style="background:var(--s1)"></span>干燥牌面</span>
+        <span class="key"><span class="sw" style="background:var(--s2)"></span>潮湿牌面</span>
+      </div>
+      <div class="hbars">
+        <div class="lbl">单加注池</div>
+        <div class="track"><span class="bar" style="width:80%"></span><span class="val">80%</span></div>
+        <div class="lbl"></div>
+        <div class="track"><span class="bar alt" style="width:55%"></span><span class="val">55%</span></div>
+        <div class="lbl">3bet 池</div>
+        <div class="track"><span class="bar" style="width:30%"></span><span class="val">30%</span></div>
+        <div class="lbl"></div>
+        <div class="track"><span class="bar alt" style="width:20%"></span><span class="val">20%</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h5>按街衰减(单加注池·干燥面)</h5>
+      <div class="sub5">越到后街,空气诈唬的弃牌率越低 → 频率砍越狠</div>
+      <div class="hbars">
+        <div class="lbl">翻牌</div>
+        <div class="track"><span class="bar" style="width:80%"></span><span class="val">80%</span></div>
+        <div class="lbl">转牌</div>
+        <div class="track"><span class="bar" style="width:48%"></span><span class="val">48%(×0.6)</span></div>
+        <div class="lbl">河牌</div>
+        <div class="track"><span class="bar" style="width:24%"></span><span class="val">24%(×0.3)</span></div>
+      </div>
+    </div>
+  </div>
+  <p class="cap">这些只是基础值,实际频率还要乘:多人砍频(每多一个对手 −45%)、对手档案(跟注站 ×0.5)、场景门控(第 8 节)。频率之间按牌面湿度连续插值。</p>
+  <details><summary>数据表</summary>
+    <table class="data">
+      <tr><th>场景</th><th>干燥面</th><th>潮湿面</th></tr>
+      <tr><td>单加注池 · 翻牌</td><td class="num">80%</td><td class="num">55%</td></tr>
+      <tr><td>单加注池 · 转牌(×0.6)</td><td class="num">48%</td><td class="num">33%</td></tr>
+      <tr><td>单加注池 · 河牌(×0.3)</td><td class="num">24%</td><td class="num">16.5%</td></tr>
+      <tr><td>3bet 池 · 翻牌</td><td class="num">30%</td><td class="num">20%</td></tr>
+    </table>
+  </details>
+</div>
+
+<h2 id="sec7">7. 下多大注</h2>
+<div class="fig">
+  <h4>下注尺寸(以底池的倍数计)</h4>
+  <div class="scrollx">
+  <svg class="chart" viewBox="0 0 760 170" role="img" aria-label="下注尺寸轴:干燥面约0.33倍底池,湿面约0.8倍,超额下注1.3倍">
+    <rect class="band" x="180" y="58" width="200" height="28" rx="4"></rect>
+    <line class="axis" x1="40" y1="100" x2="720" y2="100"></line>
+    <g>
+      <text class="tick" x="40" y="120" text-anchor="middle">0</text>
+      <line class="gridline" x1="252" y1="94" x2="252" y2="106"></line>
+      <text class="tick" x="252" y="120" text-anchor="middle">0.5 池</text>
+      <line class="gridline" x1="465" y1="94" x2="465" y2="106"></line>
+      <text class="tick" x="465" y="120" text-anchor="middle">1 池</text>
+      <line class="gridline" x1="677" y1="94" x2="677" y2="106"></line>
+      <text class="tick" x="677" y="120" text-anchor="middle">1.5 池</text>
+    </g>
+    <circle class="dot" cx="180" cy="100" r="5"></circle>
+    <text class="lab" x="180" y="42" text-anchor="middle">干燥面 1/3 池</text>
+    <circle class="dot" cx="380" cy="100" r="5"></circle>
+    <text class="lab" x="380" y="42" text-anchor="middle">潮湿面 0.8 池</text>
+    <text class="lab" x="280" y="76" text-anchor="middle" style="font-size:11px">← 按湿度滑动 →</text>
+    <circle class="dot2" cx="592" cy="100" r="5"></circle>
+    <text class="lab" x="592" y="42" text-anchor="middle">超额下注 1.3 池</text>
+    <text class="tick" x="592" y="148" text-anchor="middle">仅"怪物牌 + 湿面 + 深筹码"</text>
+  </svg>
+  </div>
+  <p class="cap">在此基础上:SPR &lt; 2(底池相对筹码很大)再 +0.15 池,为全下做铺垫;<strong>价值注还有专属放大器</strong>——确认对面是跟注站 ×1.3,单加注池对任何有档案的对手 ×1.5(上限 1.6 池)。<strong>诈唬永远不放大</strong>:把诈唬下大,只会对不弃牌的人多送钱。</p>
+</div>
+
+<h2 id="sec8">8. 剥削:给对手建档案</h2>
+<p>前面的规则对"平均对手"就能赢,但弱场里最大的利润来自<strong>针对具体的人</strong>。引擎跨牌局、跨场次给每个对手记三个经典指标:</p>
+<ul>
+  <li><strong>VPIP</strong> —— 主动投钱入池的手数占比(松紧度);</li>
+  <li><strong>PFR</strong> —— 翻前加注占比(主动性);</li>
+  <li><strong>AF</strong> —— 翻后(下注+加注)÷ 跟注(激进度)。</li>
+</ul>
+<p>观察满 18 手后分类,并翻译成具体调整:</p>
+
+<div class="opps">
+  <div class="opp">
+    <h4>📞 跟注站</h4>
+    <div class="crit">VPIP &gt; 45% 且翻后不激进(AF &lt; 1.5)</div>
+    <ul>
+      <li>价值下注门槛降 0.12——敢用更薄的牌要钱</li>
+      <li>诈唬频率 ×0.5——他不弃牌,诈唬就是烧钱</li>
+      <li>价值注尺寸 ×1.3——他跟得起大注,就下大点多榨</li>
+    </ul>
+  </div>
+  <div class="opp">
+    <h4>🪨 紧手(Nit)</h4>
+    <div class="crit">VPIP &lt; 16%</div>
+    <ul>
+      <li>他下注 = 有真货:把他的范围再收紧 0.12,该弃就弃</li>
+      <li>全桌都是紧手时:开池门槛降 0.12 多偷盲,诈唬 ×1.3</li>
+    </ul>
+  </div>
+  <div class="opp">
+    <h4>🔥 疯子(Maniac)</h4>
+    <div class="crit">AF &gt; 3.5,或 VPIP &gt; 40% 且 PFR &gt; 30%</div>
+    <ul>
+      <li>他的下注掺水多:范围放宽读,用更弱的牌抓诈</li>
+      <li>价值门槛降一点(0.048),自己少主动诈唬(×0.8)——让他替你把钱打进底池</li>
+    </ul>
+  </div>
+  <div class="opp">
+    <h4>🎭 松凶(LAG)</h4>
+    <div class="crit">VPIP &gt; 30% 且 VPIP−PFR &gt; 18%</div>
+    <ul>
+      <li>范围读法略放宽(0.048),其余按常规打</li>
+    </ul>
+  </div>
+  <div class="opp">
+    <h4>⚖️ 紧凶(TAG)/ 未知</h4>
+    <div class="crit">其余,或观察不足 18 手</div>
+    <ul>
+      <li>不做任何调整——按"平均对手"的默认策略打</li>
+    </ul>
+  </div>
+</div>
+
+<h3>更细一层:分场景记账的"门控"</h3>
+<p>光知道一个人"总体紧不紧"还不够。引擎给每个对手<strong>按场景分格记账</strong>:比如"翻牌·单加注池·面对持续下注"这个格子里,他弃牌率究竟多少。攒够 30 次观察后,这个数字<strong>直接驱动</strong>对应场景的诈唬频率——弃牌率高就多打他,粘就彻底停手:</p>
+
+<div class="fig">
+  <h4>对手在该场景的弃牌率 → 我的诈唬频率乘数</h4>
+  <div class="panels">
+    <div class="panel">
+      <h5>空气 c-bet 门</h5>
+      <div class="sub5">看:他面对持续下注弃不弃(仅单加注池)</div>
+      <svg class="chart" viewBox="0 0 240 170" role="img" aria-label="弃牌率50%以下乘0.15,75%以上乘1.0,线性过渡">
+        <line class="gridline" x1="36" y1="30" x2="228" y2="30"></line>
+        <line class="gridline" x1="36" y1="83" x2="228" y2="83"></line>
+        <line class="axis" x1="36" y1="136" x2="228" y2="136"></line>
+        <text class="tick" x="30" y="34" text-anchor="end">×2</text>
+        <text class="tick" x="30" y="87" text-anchor="end">×1</text>
+        <text class="tick" x="30" y="140" text-anchor="end">×0</text>
+        <polyline class="line1" points="36,128 132,128 180,83 228,83"></polyline>
+        <text class="tick" x="36" y="156" text-anchor="middle">0%</text>
+        <text class="tick" x="132" y="156" text-anchor="middle">50%</text>
+        <text class="tick" x="180" y="156" text-anchor="middle">75%</text>
+        <text class="tick" x="228" y="156" text-anchor="middle">100%</text>
+      </svg>
+      <p class="tiny">只降不升:粘人降到 ×0.15,爱弃的保持默认(默认已经够高)。没数据时 ×1。</p>
+    </div>
+    <div class="panel">
+      <h5>float 偷池门</h5>
+      <div class="sub5">看:他被试探性下注打弃不弃</div>
+      <svg class="chart" viewBox="0 0 240 170" role="img" aria-label="弃牌率50%以下乘0,65%以上乘3,线性过渡">
+        <line class="gridline" x1="36" y1="30" x2="228" y2="30"></line>
+        <line class="gridline" x1="36" y1="83" x2="228" y2="83"></line>
+        <line class="axis" x1="36" y1="136" x2="228" y2="136"></line>
+        <text class="tick" x="30" y="34" text-anchor="end">×3</text>
+        <text class="tick" x="30" y="87" text-anchor="end">×1.5</text>
+        <text class="tick" x="30" y="140" text-anchor="end">×0</text>
+        <polyline class="line1" points="36,136 132,136 161,30 228,30"></polyline>
+        <text class="tick" x="36" y="156" text-anchor="middle">0%</text>
+        <text class="tick" x="132" y="156" text-anchor="middle">50%</text>
+        <text class="tick" x="161" y="156" text-anchor="middle">65%</text>
+        <text class="tick" x="228" y="156" text-anchor="middle">100%</text>
+      </svg>
+      <p class="tiny">双向:弃牌率&lt;50% 的人完全不偷(乘 0),明确爱弃的可以放大到 ×3。没数据时 ×0.5。</p>
+    </div>
+    <div class="panel">
+      <h5>诈唬加注门</h5>
+      <div class="sub5">看:他下注后被加注时弃不弃</div>
+      <svg class="chart" viewBox="0 0 240 170" role="img" aria-label="弃牌率30%以下乘0,80%以上乘2,线性过渡">
+        <line class="gridline" x1="36" y1="30" x2="228" y2="30"></line>
+        <line class="gridline" x1="36" y1="83" x2="228" y2="83"></line>
+        <line class="axis" x1="36" y1="136" x2="228" y2="136"></line>
+        <text class="tick" x="30" y="34" text-anchor="end">×2</text>
+        <text class="tick" x="30" y="87" text-anchor="end">×1</text>
+        <text class="tick" x="30" y="140" text-anchor="end">×0</text>
+        <polyline class="line1" points="36,136 94,136 190,30 228,30"></polyline>
+        <text class="tick" x="36" y="156" text-anchor="middle">0%</text>
+        <text class="tick" x="94" y="156" text-anchor="middle">30%</text>
+        <text class="tick" x="190" y="156" text-anchor="middle">80%</text>
+        <text class="tick" x="228" y="156" text-anchor="middle">100%</text>
+      </svg>
+      <p class="tiny">对"被加注就跑"的人最高 ×2;对粘人乘 0 彻底止损。没数据时基础频率仅 0.6%,几乎不做。</p>
+    </div>
+  </div>
+  <p class="cap">三个门共用同一套机制:统计弃牌率(小样本先向全场平均值收缩,避免三五手就妄下结论)→ 在两个锚点间线性映射成频率乘数。锚点数值全部由数千手的靶场模拟校准,不是拍脑袋。</p>
+  <details><summary>数据表</summary>
+    <table class="data">
+      <tr><th>门</th><th>读什么信号</th><th>低锚</th><th>高锚</th><th>没数据时</th></tr>
+      <tr><td>空气 c-bet 门</td><td>面对持续下注的弃牌率</td><td>≤50% → ×0.15</td><td>≥75% → ×1.0</td><td>×1.0(保持默认)</td></tr>
+      <tr><td>float 偷池门</td><td>面对试探下注的弃牌率</td><td>≤50% → ×0</td><td>≥65% → ×3.0</td><td>×0.5</td></tr>
+      <tr><td>诈唬加注门</td><td>下注后被加注的弃牌率</td><td>≤30% → ×0</td><td>≥80% → ×2.0</td><td>×0.02</td></tr>
+    </table>
+  </details>
+</div>
+
+<h2 id="sec9">9. 安全网与"受控随机"</h2>
+<ul>
+  <li><strong>合法性地板:</strong>任何决策最后都过一道检查——动作必须在规则允许的集合里,加注额夹进最小/最大范围。实测 20,000 手 0 次非法输出。</li>
+  <li><strong>异常兜底:</strong>万一内部出错(比如收不到手牌信息),能过牌就过牌,不能就弃牌——绝不崩溃、绝不乱打。</li>
+  <li><strong>受控随机:</strong>"80% 频率 c-bet"这类掷骰子,用的是<strong>由当前局面(手牌+公共牌+底池)派生种子的伪随机数</strong>。好处有两个:同一局面回放必然得到同一决策(可复现、可调试);而种子随局面变化,对手看不出"它每次都在同类局面做同样的事"的规律。</li>
+</ul>
+
+<h2 id="sec10">10. 它怎么变强:迭代闭环</h2>
+<p>这套策略不是一次写完的,而是靠一条纪律严格的循环持续进化:</p>
+
+<div class="fig">
+  <div class="flow">
+    <div class="step"><span class="n">1</span><b>打牌</b>线上实战或模拟对局,每次数千到数万手</div>
+    <div class="arrow">→</div>
+    <div class="step"><span class="n">2</span><b>留痕</b>每个决策记录:场景节点、胜率、过了哪条门槛</div>
+    <div class="arrow">→</div>
+    <div class="step"><span class="n">3</span><b>找漏洞</b>按场景聚合盈亏:哪个场景在持续漏钱?</div>
+    <div class="arrow">→</div>
+    <div class="step"><span class="n">4</span><b>造靶验证</b>构造针对性靶场对手,扫描参数找最优值</div>
+    <div class="arrow">→</div>
+    <div class="step"><span class="n">5</span><b>回归门</b>改动必须在标准模拟矩阵上不退化,才允许上线</div>
+    <div class="arrow">↺</div>
+  </div>
+  <p class="cap">近期通过这条循环上线的改动(每一条都先在模拟里证明了自己):</p>
+  <div class="chips">
+    <span class="chip-item">3bet 池空气 c-bet:80%→30%(此前照搬单加注池频率,属于过度诈唬)</span>
+    <span class="chip-item">转牌/河牌连续开火砍频(×0.6 / ×0.3)</span>
+    <span class="chip-item">诈唬加注默认频率 10%→2%(实战数据:亏损全来自对粘人乱加注)</span>
+    <span class="chip-item">单加注池价值注放大 ×1.5</span>
+  </div>
+</div>
+
+<div class="callout">
+  <strong>为什么不"看到哪亏就调哪"?</strong>扑克方差极大:一个场景几十手的盈亏几乎全是噪声。所以纪律是:live 数据只负责"提出嫌疑",定罪必须靠可控的模拟靶场(同样的牌、镜像座位、多随机种子);上线前还要过"标准对手矩阵不退化"这道门。上面每条改动都走完了全流程。
+</div>
+
+<h2 id="sec11">11. 它不做什么(诚实的局限)</h2>
+<ul>
+  <li><strong>它不是 GTO。</strong>它压根不追求"不可被剥削"。比如"下大注 = 有真牌"这条范围假设,在 GTO 里是错的(均衡策略的大注掺满诈唬),但对普通玩家是对的。碰上会平衡诈唬的高手,这些假设会反过来被利用。</li>
+  <li><strong>成绩来自弱场。</strong>+1.5bb/手 是对线上匿名休闲对手池的战绩,不代表能赢职业桌。</li>
+  <li><strong>还有已知短板。</strong>翻后没有专门的 check-raise 线路(强牌只会平铺直叙地加注);河牌不做纯诈唬加注;试探性下注(float)残余小额亏损仍在优化队列里——这些都在遥测里明确记账,排队走第 10 节的流程。</li>
+  <li><strong>对手建模有滞后。</strong>档案要 18 手起判、场景门要 30 次观察起效,前几十手对新对手就是默认打法。</li>
+</ul>
+
+<h2 id="sec12">12. 术语小词典</h2>
+<div class="fig">
+  <table class="data">
+    <tr><th style="width:9em">术语</th><th>意思</th></tr>
+    <tr><td>胜率 equity</td><td>现在把牌发完摊牌,平均能赢下底池的比例。本文所有 0.xx 门槛都是它</td></tr>
+    <tr><td>范围 range</td><td>某人此刻"可能拿着的所有手牌"的集合(或概率分布)</td></tr>
+    <tr><td>bb</td><td>大盲注,筹码的通用计量单位。100bb = 100 个大盲</td></tr>
+    <tr><td>开池 / 3bet / 4bet</td><td>本手第一个加注 / 对开池的再加注 / 对 3bet 的再加注</td></tr>
+    <tr><td>单加注池 / 3bet 池</td><td>翻前只有一次加注 / 有过 3bet 的底池。3bet 池双方范围都强得多</td></tr>
+    <tr><td>c-bet</td><td>持续下注:翻前的进攻方到翻后继续开火</td></tr>
+    <tr><td>半诈唬</td><td>拿听牌下注:当下落后,但对手弃牌能赢、跟注也可能反超</td></tr>
+    <tr><td>float</td><td>不是进攻方、也没牌,趁没人下注试探性偷池</td></tr>
+    <tr><td>SPR</td><td>剩余筹码 ÷ 底池。SPR 低意味着"再打一两枪就全下了"</td></tr>
+    <tr><td>底池赔率</td><td>跟注额 ÷(底池+跟注额)= 跟注保本所需的最低胜率</td></tr>
+    <tr><td>隐含赔率</td><td>听中之后还能从对手那赢到的"未来钱",可以让当下略亏的跟注变划算</td></tr>
+    <tr><td>VPIP / PFR / AF</td><td>松紧度 / 翻前主动性 / 翻后激进度,读人三件套(见第 8 节)</td></tr>
+    <tr><td>mbb/手</td><td>千分之一大盲每手。+1503 mbb/手 ≈ 每手平均赢 1.5 个大盲</td></tr>
+    <tr><td>GTO</td><td>博弈论最优:追求不可被剥削的均衡策略。本引擎明确不是,它选择最大化对弱场的赢率</td></tr>
+  </table>
+</div>
+
+<footer>
+  <p>本页依据 2026-07 时点的引擎默认参数与源码整理(<code>src/heuristic/</code>,详见 <code>docs/heuristic9_strategy.md</code>);手牌矩阵直接取自引擎实际加载的 169 手强度表。参数会随第 10 节的迭代闭环持续演进,以代码为准。</p>
+</footer>
+
+</main>
+
+<div id="gridTip" role="tooltip"></div>
+
+<script>
+/* ============ 主题切换 ============ */
+(function () {
+  const btn = document.getElementById('themeBtn');
+  const states = ['auto', 'light', 'dark'];
+  const names = { auto: '自动', light: '浅色', dark: '深色' };
+  let idx = 0;
+  btn.addEventListener('click', function () {
+    idx = (idx + 1) % 3;
+    const s = states[idx];
+    if (s === 'auto') delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = s;
+    btn.textContent = '主题:' + names[s];
+  });
+})();
+
+/* ============ 手牌矩阵 ============ */
+const GRID=[
+[["AA",4,0.85],["AKs",4,0.673],["AQs",4,0.663],["AJs",4,0.649],["ATs",4,0.645],["A9s",4,0.632],["A8s",4,0.615],["A7s",4,0.605],["A6s",4,0.601],["A5s",4,0.593],["A4s",4,0.592],["A3s",4,0.587],["A2s",3,0.571]],
+[["AKo",4,0.661],["KK",4,0.823],["KQs",4,0.631],["KJs",4,0.618],["KTs",4,0.614],["K9s",4,0.596],["K8s",4,0.586],["K7s",3,0.58],["K6s",3,0.573],["K5s",2,0.551],["K4s",3,0.557],["K3s",2,0.541],["K2s",1,0.526]],
+[["AQo",4,0.641],["KQo",4,0.614],["QQ",4,0.797],["QJs",4,0.608],["QTs",4,0.588],["Q9s",3,0.575],["Q8s",3,0.564],["Q7s",2,0.542],["Q6s",2,0.543],["Q5s",1,0.527],["Q4s",1,0.52],["Q3s",1,0.513],["Q2s",0,0.503]],
+[["AJo",4,0.631],["KJo",4,0.606],["QJo",3,0.575],["JJ",4,0.776],["JTs",3,0.565],["J9s",3,0.563],["J8s",2,0.542],["J7s",1,0.522],["J6s",1,0.512],["J5s",0,0.496],["J4s",0,0.49],["J3s",0,0.486],["J2s",0,0.471]],
+[["ATo",4,0.634],["KTo",4,0.599],["QTo",3,0.569],["JTo",2,0.549],["TT",4,0.751],["T9s",2,0.54],["T8s",1,0.52],["T7s",1,0.505],["T6s",0,0.487],["T5s",0,0.472],["T4s",0,0.461],["T3s",0,0.468],["T2s",0,0.447]],
+[["A9o",4,0.595],["K9o",3,0.573],["Q9o",2,0.553],["J9o",1,0.523],["T9o",1,0.506],["99",4,0.724],["98s",1,0.506],["97s",0,0.478],["96s",0,0.475],["95s",0,0.454],["94s",0,0.443],["93s",0,0.429],["92s",0,0.419]],
+[["A8o",4,0.605],["K8o",3,0.559],["Q8o",2,0.54],["J8o",1,0.512],["T8o",0,0.5],["98o",0,0.479],["88",4,0.705],["87s",0,0.48],["86s",0,0.466],["85s",0,0.448],["84s",0,0.417],["83s",0,0.407],["82s",0,0.404]],
+[["A7o",4,0.594],["K7o",2,0.545],["Q7o",1,0.519],["J7o",0,0.499],["T7o",0,0.474],["97o",0,0.456],["87o",0,0.452],["77",4,0.658],["76s",0,0.451],["75s",0,0.44],["74s",0,0.425],["73s",0,0.395],["72s",0,0.388]],
+[["A6o",3,0.583],["K6o",2,0.545],["Q6o",1,0.512],["J6o",0,0.473],["T6o",0,0.457],["96o",0,0.441],["86o",0,0.438],["76o",0,0.428],["66",4,0.63],["65s",0,0.43],["64s",0,0.411],["63s",0,0.391],["62s",0,0.381]],
+[["A5o",3,0.572],["K5o",1,0.529],["Q5o",0,0.498],["J5o",0,0.477],["T5o",0,0.443],["95o",0,0.431],["85o",0,0.418],["75o",0,0.409],["65o",0,0.398],["55",4,0.593],["54s",0,0.413],["53s",0,0.395],["52s",0,0.375]],
+[["A4o",3,0.579],["K4o",1,0.519],["Q4o",0,0.492],["J4o",0,0.456],["T4o",0,0.433],["94o",0,0.41],["84o",0,0.394],["74o",0,0.397],["64o",0,0.38],["54o",0,0.384],["44",3,0.567],["43s",0,0.381],["42s",0,0.372]],
+[["A3o",3,0.555],["K3o",1,0.519],["Q3o",0,0.484],["J3o",0,0.452],["T3o",0,0.428],["93o",0,0.396],["83o",0,0.373],["73o",0,0.366],["63o",0,0.359],["53o",0,0.363],["43o",0,0.349],["33",2,0.546],["32s",0,0.362]],
+[["A2o",2,0.543],["K2o",1,0.51],["Q2o",0,0.478],["J2o",0,0.444],["T2o",0,0.416],["92o",0,0.386],["82o",0,0.379],["72o",0,0.353],["62o",0,0.332],["52o",0,0.347],["42o",0,0.331],["32o",0,0.322],["22",0,0.505]]
+];
+const TIER_DESC = {
+  4: '任何位置都开池(强度 ≥ 0.585)',
+  3: '中位及更晚的位置开池(≥ 0.555)',
+  2: '小盲和后位开池(≥ 0.535)',
+  1: '只在后位开池(≥ 0.505)',
+  0: '不主动开池(过牌/弃牌,或便宜时投机跟注)'
+};
+(function () {
+  const grid = document.getElementById('handGrid');
+  const tip = document.getElementById('gridTip');
+  const frag = document.createDocumentFragment();
+  GRID.forEach(function (row) {
+    row.forEach(function (c) {
+      const d = document.createElement('div');
+      d.className = 'hc' + (c[1] ? ' t' + c[1] : '');
+      d.textContent = c[0];
+      d.tabIndex = 0;
+      d.setAttribute('aria-label', c[0] + ',强度' + c[2].toFixed(3) + ',' + TIER_DESC[c[1]]);
+      d.dataset.h = c[0]; d.dataset.s = c[2]; d.dataset.t = c[1];
+      frag.appendChild(d);
+    });
+  });
+  grid.appendChild(frag);
+
+  function show(el) {
+    tip.innerHTML = '<b>' + el.dataset.h + '</b> — 强度 ' + Number(el.dataset.s).toFixed(3) +
+      '<br><span style="color:var(--ink2)">' + TIER_DESC[el.dataset.t] + '</span>';
+    tip.style.display = 'block';
+    const r = el.getBoundingClientRect();
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    let x = r.left + r.width / 2 - tw / 2;
+    x = Math.max(8, Math.min(x, window.innerWidth - tw - 8));
+    let y = r.top - th - 8;
+    if (y < 8) y = r.bottom + 8;
+    tip.style.left = x + 'px';
+    tip.style.top = y + 'px';
+  }
+  function hide() { tip.style.display = 'none'; }
+  grid.addEventListener('mouseover', function (e) {
+    const el = e.target.closest('.hc');
+    if (el) show(el);
+  });
+  grid.addEventListener('mouseout', hide);
+  grid.addEventListener('focusin', function (e) {
+    const el = e.target.closest('.hc');
+    if (el) show(el);
+  });
+  grid.addEventListener('focusout', hide);
+})();
+</script>
+</body>
+</html>
