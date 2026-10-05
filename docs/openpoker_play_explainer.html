@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="从 OpenPoker 消息、翻前 blueprint 到翻后实时搜索：实现详解、交互示例与源码索引。">
+<title>一手牌如何被决定 · OpenPoker 实现详解</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 32 32%27%3E%3Crect width=%2732%27 height=%2732%27 rx=%277%27 fill=%27%23176749%27/%3E%3Ctext x=%277%27 y=%2725%27 font-size=%2726%27 fill=%27white%27%3E%E2%99%A0%3C/text%3E%3C/svg%3E">
+<style>
+:root{--paper:#f3f2ed;--white:#fffefb;--ink:#182f2a;--muted:#64716c;--line:#d9dfd7;--green:#176749;--mint:#e1efe5;--blue:#365ba2;--blue-bg:#eaf0fc;--amber:#875b1b;--amber-bg:#fbefdb;--red:#a34339;--radius:16px;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color-scheme:light}
+*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:28px}body{margin:0;background:var(--paper);color:var(--ink);line-height:1.8}a{color:var(--green);text-underline-offset:4px}button,input,select{font:inherit}button,select,input[type=number]{border:1px solid #b8c7bc;background:white;border-radius:8px;padding:8px 12px;color:var(--ink)}button{cursor:pointer}button:hover{background:var(--mint)}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #bb851c;outline-offset:4px}button.primary{background:var(--green);color:white;border-color:var(--green)}input[type=range]{width:100%;accent-color:var(--green)}input[type=checkbox]{accent-color:var(--green);width:17px;height:17px}code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}code{font-size:.88em;background:#edf0e9;padding:2px 5px;border-radius:4px;overflow-wrap:anywhere}pre{font-size:13px;line-height:1.8;background:#18352d;color:#e4f0e8;padding:22px;border-radius:12px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}pre code{background:none;padding:0;color:inherit}h1,h2,h3,p{margin:0}p+p{margin-top:13px}h1{font-size:clamp(36px,4.9vw,66px);line-height:1.17;letter-spacing:-2px;margin:22px 0}h2{font-size:29px;line-height:1.35;letter-spacing:-.6px}h3{font-size:18px;margin-bottom:10px}strong{font-weight:650}ul,ol{padding-left:23px;margin:12px 0}li+li{margin-top:6px}.shell{max-width:1440px;margin:auto;display:grid;grid-template-columns:226px minmax(0,1fr);gap:48px;padding:30px 48px 70px}.side{position:sticky;top:24px;align-self:start;max-height:calc(100vh - 48px);overflow:auto;padding:12px 0}.brand{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:700;letter-spacing:1px}.logo{display:grid;place-items:center;background:var(--green);color:white;width:34px;height:38px;border-radius:7px;font-size:22px}.side small{display:block;color:var(--muted);margin:18px 0 10px}.side nav a{display:block;color:#52615a;text-decoration:none;font-size:13px;padding:7px 10px;border-left:2px solid transparent}.side nav a:hover,.side nav a.active{background:var(--mint);border-color:var(--green);color:var(--green)}.side .tools{display:flex;gap:8px;margin-top:20px}.tools button{font-size:12px;padding:5px 10px}.hero{padding:28px 0 34px;border-bottom:1px solid #becbbf}.eyebrow{font-size:11px;letter-spacing:2px;font-weight:750;color:var(--green);text-transform:uppercase}.lead{font-size:18px;color:#52615a;max-width:790px}.meta{display:flex;gap:8px;flex-wrap:wrap;margin:24px 0 0}.chip{font-size:11px;border:1px solid #b9cbbc;padding:4px 10px;border-radius:20px;color:#4d6556}.facts{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:28px}.fact{border-top:2px solid var(--green);padding:12px 0;font-size:13px;color:var(--muted)}.fact b{display:block;font-size:18px;color:var(--ink);margin-bottom:3px}section{padding-top:54px}.section-head{display:flex;gap:15px;align-items:baseline;margin-bottom:18px}.number{font:600 14px ui-monospace,monospace;color:#6c8b73}.intro{color:var(--muted);margin-bottom:22px}.panel{background:var(--white);border:1px solid var(--line);border-radius:var(--radius);padding:26px;margin-top:18px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.grid .panel{margin-top:0}.note{border-left:3px solid var(--green);background:var(--mint);padding:15px 18px;border-radius:0 9px 9px 0;font-size:14px;margin:20px 0}.note.amber{border-color:#bc8b37;background:var(--amber-bg);color:#745322}.small,.source{font-size:12px;color:var(--muted)}.source{margin-top:14px}.source a{overflow-wrap:anywhere}.table-wrap{overflow-x:auto;margin:16px 0;border:1px solid var(--line);border-radius:10px}table{border-collapse:collapse;width:100%;font-size:14px;text-align:left}th{background:#e8ede4;font-weight:650;color:#405846}th,td{padding:13px 16px;vertical-align:top;border-bottom:1px solid var(--line)}tr:last-child td{border-bottom:none}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:23px 0}.flow-item{background:var(--white);border:1px solid var(--line);border-radius:12px;padding:18px 15px;font-size:13px}.flow-item b{display:block;margin:6px 0}.flow-item em{font:600 11px ui-monospace,monospace;color:var(--green);font-style:normal}.flow-item span{color:var(--muted)}.branch{display:grid;grid-template-columns:1fr 1fr;gap:14px}.branch>div{border-radius:12px;padding:20px;background:var(--blue-bg);border:1px solid #d5dff0}.branch>div+div{background:var(--mint);border-color:#c7ddcc}.tag{display:inline-block;font:600 11px ui-monospace,monospace;letter-spacing:.5px;color:var(--green);margin-bottom:10px}.example{border-top:1px dashed #b8c7b9;margin-top:21px;padding-top:18px}.example-label{font-size:11px;font-weight:700;letter-spacing:1px;color:var(--amber);margin-bottom:8px}.card-row{display:flex;gap:7px;margin:14px 0;align-items:center;flex-wrap:wrap}.card{background:white;border:1px solid #c9d2c8;border-radius:7px;width:46px;height:59px;display:grid;place-items:center;font-size:20px;font-weight:650;box-shadow:0 2px 0 #dde3d9}.card.red{color:var(--red)}.controls{display:grid;grid-template-columns:1fr 1fr;gap:15px;margin:18px 0}.field{display:flex;flex-direction:column;gap:6px;font-size:13px}.field select,.field input[type=number]{width:100%;min-width:0}.check{display:flex;gap:8px;align-items:flex-start;font-size:13px}.result{padding:18px 20px;background:var(--mint);border-radius:12px;border:1px solid #b8d8c1;margin-top:18px}.result b{display:block;font-size:20px;margin-bottom:5px}.result p{font-size:14px}.result[data-kind=fallback]{background:var(--amber-bg);border-color:#e6cfaa}.result[data-kind=blueprint]{background:var(--blue-bg);border-color:#c4d1ee}.bar-row{display:grid;grid-template-columns:80px 1fr 58px;gap:12px;align-items:center;font-size:13px;margin:12px 0}.bar-track{height:13px;background:#e4e9e0;border-radius:20px;overflow:hidden}.bar{height:100%;background:var(--green);transition:width .25s}.formula{font-family:ui-monospace,monospace;background:#e9eee5;border-radius:8px;padding:15px 18px;margin:16px 0;font-size:14px;overflow-wrap:anywhere}.timeline{border-left:2px solid #bdd3c2;margin:20px 0 0 10px;padding:0 0 0 24px}.event{position:relative;padding:0 0 23px}.event:before{content:"";position:absolute;left:-31px;top:9px;background:var(--green);width:11px;height:11px;border:2px solid var(--paper);border-radius:50%}.event b{display:block}.event p{font-size:14px;color:var(--muted)}details{background:var(--white);border:1px solid var(--line);border-radius:10px;padding:15px 18px;margin:12px 0}summary{cursor:pointer;font-weight:650}details p,details pre{margin-top:12px}.two-col{columns:2;column-gap:26px}.two-col p{break-inside:avoid;margin-bottom:14px}.foot{margin-top:50px;padding-top:20px;border-top:1px solid var(--line);font-size:12px;color:var(--muted)}.skip{position:absolute;left:10px;top:-100px}.skip:focus{top:10px;background:white;z-index:5;padding:12px}.no-js{padding:16px;background:var(--amber-bg)}.rule{height:1px;background:var(--line);margin:24px 0}.badge{font-size:11px;padding:3px 8px;border-radius:6px;background:var(--amber-bg);color:var(--amber)}
+@media(max-width:1050px){.shell{grid-template-columns:185px minmax(0,1fr);gap:25px;padding:25px}.flow{grid-template-columns:1fr 1fr}.facts{gap:10px}.controls{grid-template-columns:1fr}}
+@media(max-width:760px){.shell{display:block;padding:20px}.side{position:static;max-height:none;padding:0 0 15px}.side nav{display:flex;overflow-x:auto;gap:6px;padding:12px 0}.side nav a{white-space:nowrap;border:1px solid var(--line);border-radius:6px}.side small{display:none}.side .tools{position:static;margin:0}.hero{padding-top:10px}h1{letter-spacing:-1px}.lead{font-size:16px}.facts{grid-template-columns:1fr}.fact{padding:8px 0}.grid,.branch{grid-template-columns:1fr}.panel{padding:19px}.flow{gap:9px}.flow-item{padding:13px}section{padding-top:39px}h2{font-size:25px}.two-col{columns:1}th,td{padding:10px;font-size:13px}.section-head{gap:10px}.bar-row{grid-template-columns:64px 1fr 48px}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.bar{transition:none}}
+@media print{body{background:white;font-size:11pt}.shell{display:block;padding:0;max-width:none}.side,.skip,.controls,button{display:none!important}.hero{padding-top:0}section{padding-top:24px;break-before:auto}h1{font-size:32pt}h2{font-size:21pt}.panel,details,.flow-item{box-shadow:none;break-inside:avoid}.grid{display:block}.grid .panel{margin-top:12px}a{color:inherit;text-decoration:none}pre{background:#f1f3ee;color:#172f27}.source{font-size:9pt}.table-wrap{overflow:visible}tr{break-inside:avoid}.result,.note,.bar{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+</style>
+</head>
+<body>
+<a class="skip" href="#overview">跳到正文</a>
+<noscript><div class="no-js">正文可离线阅读；交互示例需要启用 JavaScript。默认示例结果已保留。</div></noscript>
+<div class="shell">
+<aside class="side" aria-label="阅读导航">
+<div class="brand"><span class="logo" aria-hidden="true">♠</span> POKER / ENGINE</div>
+<small>实现详解 · 阅读约 20 分钟</small>
+<nav>
+<a href="#overview">01　全局路线</a><a href="#driver">02　消息与状态</a><a href="#replay">03　双状态重放</a><a href="#preflop">04　翻前查表</a><a href="#limp">05　翻前异常分支</a><a href="#postflop">06　翻后真实局面</a><a href="#range">07　手牌范围</a><a href="#solve">08　建树与求解</a><a href="#cache">09　缓存与跨街</a><a href="#outgoing">10　采样与出牌</a><a href="#fallback">11　失败与剥削</a><a href="#walkthrough">12　一手牌串讲</a><a href="#reference">13　参数与源码</a>
+</nav>
+<div class="tools"><button id="print-button" type="button">打印 / PDF</button><button id="expand-button" type="button" aria-expanded="false">展开补充</button></div>
+</aside>
+<main>
+<header class="hero">
+<div class="eyebrow">OpenPoker · Code Walkthrough</div>
+<h1>一手牌，<br>如何被决定。</h1>
+<p class="lead">从 <code>your_turn</code> 到最终下注：读懂翻前 blueprint、翻后实时搜索，以及两者之间的历史映射、范围更新和失败分支。</p>
+<div class="meta"><span class="chip">源码基线 bb3f175</span><span class="chip">核对日期 2026-10-05</span><span class="chip">单文件 · 无外部依赖 · 可离线阅读</span></div>
+<div class="facts"><div class="fact"><b>Python 接牌桌</b>累计历史，组请求，发送动作。</div><div class="fact"><b>Rust 作决策</b>查平均策略，或现场求解子博弈。</div><div class="fact"><b>概率决定行动</b>按策略采样，不直接取最大概率。</div></div>
+</header>
+
+<section id="overview">
+<div class="section-head"><span class="number">01</span><h2>先看整条路线</h2></div>
+<p class="intro">“翻前 blueprint，翻后搜索”对应开启搜索并选择 all-postflop 的正常路径。入口默认关闭搜索，异常路线另有处理。</p>
+<div class="flow" aria-label="四阶段决策流程"><div class="flow-item"><em>01 / INPUT</em><b>收到行动通知</b><span>Python 汇总牌、座位、筹码、完整历史与合法动作。</span></div><div class="flow-item"><em>02 / REPLAY</em><b>重放与映射</b><span>检查历史；在 blueprint 中定位节点，或识别失同步。</span></div><div class="flow-item"><em>03 / POLICY</em><b>得到策略分布</b><span>翻前查表；翻后按开关和局面搜索；失败进入专用分支。</span></div><div class="flow-item"><em>04 / ACTION</em><b>采样并发送</b><span>抽取动作，计算真实金额，校验范围，记录来源。</span></div></div>
+<div class="branch"><div><span class="tag">PREFLOP</span><h3>节点 × 169 类手牌 → 平均策略</h3><p>读取离线 checkpoint。树中没有的 limp 路线可能交给启发式，其他失配走兜底。翻前不触发实时搜索。</p></div><div><span class="tag">POSTFLOP</span><h3>本街起点 × 各家范围 → 子博弈</h3><p>根据真实筹码重建局面，求解、缓存，然后读取当前节点和真实手牌桶对应的策略。</p></div></div>
+<div class="panel">
+<span class="tag">INTERACTIVE / 决策分支检查器</span><h3>同一个入口，参数不同，路线不同</h3>
+<p class="small">下面仅演示路由，不执行求解。假定输入合法、至少 3 人发牌、重放后的街与公共牌一致；“失同步”专指 blueprint 双状态重放失败。</p>
+<div class="controls"><label class="field">搜索模式<select id="route-mode"><option value="all">--search + all-postflop</option><option value="flop">仅 --search（默认窄触发）</option><option value="off">未开启 --search</option></select></label><label class="field">当前街<select id="route-street"><option value="preflop">翻前 Preflop</option><option value="flop" selected>翻牌 Flop</option><option value="turn">转牌 Turn</option><option value="river">河牌 River</option></select></label><label class="check"><input id="route-sync" type="checkbox" checked> 历史能映射到 blueprint（lockstep 成功）</label><label class="check"><input id="route-bet" type="checkbox"> 本街已经有人下注</label><label class="check"><input id="route-prefer" type="checkbox"> --search-flop-prefer-blueprint on</label></div>
+<div class="result" id="route-result" aria-live="polite"><b>锚定实时搜索 · search</b><p>搜索已开启、命中触发器，且 blueprint 历史映射成功。重建真实筹码状态后求解。</p></div>
+</div>
+<p class="source">源码：<a href="../tools/openpoker_play.py">tools/openpoker_play.py</a> · main() L1264；<a href="../tools/openpoker_advisor.rs">openpoker_advisor.rs</a> · decide() L791、默认参数 L2321；<a href="../src/training/subgame.rs">subgame.rs</a> · should_search() L978。</p>
+</section>
+
+<section id="driver">
+<div class="section-head"><span class="number">02</span><h2>Python 如何拼出“这一手”</h2></div>
+<p>advisor 是常驻子进程。启动时加载 bucket table、构建与 checkpoint 匹配的六人桌 100BB 抽象游戏，再加载训练结果并输出 <code>ready</code>。随后 Python 通过 JSON-lines 请求与它通信。<strong>每次请求重放历史；模型、搜索缓存和可选画像留在进程内。</strong></p>
+<div class="table-wrap"><table><thead><tr><th>事件 / 信息</th><th>driver 做什么</th><th>为什么需要</th></tr></thead><tbody><tr><td>手牌开始、底牌、公共牌</td><td>记录 hand、button、hero、hole、board</td><td>标识当前公共状态和我方私有信息</td></tr><tr><td>player_action</td><td>追加已确认动作；更新本街投入与本手累计投入</td><td>Rust 从头重放，不能只知道上一位做了什么</td></tr><tr><td>筹码与桌面状态</td><td>记录 remaining；推断本手发牌座位</td><td>恢复真实起始栈，处理短桌空座</td></tr><tr><td>your_turn</td><td>刷新 board / stacks，读取 valid_actions，组装请求</td><td>以服务端允许的动作和金额区间作为输出边界</td></tr><tr><td>hand_result</td><td>记录 HH；开启 exploit 时发送 observe</td><td>留存整手历史、更新对手画像</td></tr></tbody></table></div>
+<div class="panel"><h3>两个“投入”不能混用</h3><div class="formula">starting_stack = remaining_stack + committed_total</div><p><code>committed_this_street</code> 换街清零，<code>committed_total</code> 跨街保留。raise 的 <code>to</code> 是本街累计到额。</p><div class="example"><div class="example-label">例子 / 单位均为 BB</div><p>我方起始 100，翻前已投入 3，flop 又投入 5，当前剩余 92。起始栈反推为 <strong>92 + 3 + 5 = 100</strong>。如果随后本街加注到 14，本次追加是 <strong>14 − 5 = 9</strong>，不是再加 14。</p></div></div>
+<details><summary>短桌如何处理？为什么两人发牌是特殊边界？</summary><p>3～5 人发牌时，真实 BTN/SB/BB 对齐树中的对应位置，空缺玩家放到较早行动位并预先弃牌。真实牌桌并不因此多出筹码，虚拟玩家只帮助定位六人树分支。两人发牌时，本实现对 OpenPoker 记录的行动序只完成翻前映射；翻后明确返回 <code>fallback:short_hu_postflop</code>，不能当成已支持的 HU 实时搜索。</p><p>满桌需要六座筹码均已观测；短桌只要求已发牌座筹码已观测。缺筹码时请求不带 stacks，后续搜索会采用 100BB 假设，而不是必然关闭。</p></details>
+<p class="source">源码：<a href="../tools/openpoker_play.py">openpoker_play.py</a> · HandState L171、hand_start_stacks() L272、build_request() L300、_handle_your_turn() L578；<a href="../tools/openpoker_advisor.rs">advisor</a> · seat_map()、run()。</p>
+</section>
+
+<section id="replay">
+<div class="section-head"><span class="number">03</span><h2>先走一遍真实历史，再找抽象节点</h2></div>
+<p>blueprint 只存离散动作树，而对手可以下注任意合法金额。<code>lockstep_replay</code> 为此同时维护具体金额状态和抽象影子：</p>
+<div class="table-wrap"><table><thead><tr><th>状态</th><th>历史金额</th><th>起始栈</th><th>职责</th></tr></thead><tbody><tr><td><code>real</code></td><td>历史的具体金额（换算为 solver 单位）</td><td>对称 100BB</td><td>执行规则，校验行动顺序和本街状态</td></tr><tr><td><code>abs</code></td><td>映射后的抽象动作</td><td>blueprint 的 100BB 配置</td><td>沿预建树定位 node_id</td></tr><tr><td><code>auth</code>（搜索阶段）</td><td>历史的具体金额</td><td>牌桌真实起始栈；缺省为 100BB</td><td>搜索和输出金额的权威局面</td></tr></tbody></table></div>
+<div class="note"><strong>名称陷阱：</strong><code>real</code> 并不表示已经使用各家的真实码深。实际真栈重放发生在之后的 <code>build_real_auth</code>。</div>
+<p>每个动作先检查“是不是轮到这个座位”，再在 real 上执行；随后映射到 abs，检查两边下一行动者是否一致。最后还要检查街、公共牌张数以及是否轮到我方。</p>
+<div class="panel"><h3>尺寸不在树里，与动作根本不在树里，是两回事</h3><div class="example-label">例子 / 抽象尺寸示意，不是线上采样结果</div><p>树里只有 0.5pot 和 1pot，对手下了中间的尺寸：可以映射到已有档位。底层使用 <code>pseudo-harmonic randomized rounding</code>，在相邻档位之间按局面确定的随机数选择；相同状态与金额可复现，并非总取最近档。</p><p>但如果非 SB 玩家 open-limp，而当前训练树删除了这条 Call 边，<strong>不能把 Call 翻译成 Raise 来“凑一个节点”</strong>。代码报告 <code>structural_gap</code>，后续转启发式或脱锚搜索。</p></div>
+<p class="source">源码：<a href="../tools/openpoker_advisor.rs">advisor</a> · lockstep_step() L674、lockstep_replay() L716；<a href="../src/training/blueprint_advisor.rs">blueprint_advisor.rs</a> · advance_shadow_by_applied() L292；<a href="../src/abstraction/action.rs">action.rs</a> · map_off_tree() L476。</p>
+</section>
+
+<section id="preflop">
+<div class="section-head"><span class="number">04</span><h2>翻前：读取离线学好的平均策略</h2></div>
+<p>历史映射成功后，node_id 已编码位置和行动路线。翻前手牌则归入 169 类：13 个对子、78 个同花非对子、78 个不同花非对子。花色不同的 AKs 属于同一类。</p>
+<div class="formula">InfoSetId = pack(手牌类别, 下注树 node_id, 当前街)<br>策略分布 = checkpoint.average_strategy(InfoSetId)</div>
+<div class="panel"><div class="card-row"><span class="card red">A♥</span><span class="card red">K♥</span><span class="small">→ AKs · 同花 AK</span></div><p>AKs 在 UTG 首次行动与在 BTN 面对 3bet，手牌类相同，node_id 不同，因此不是查询同一行策略。读取的是累计的<strong>平均策略</strong>，最终会按概率抽样。</p><div class="example"><div class="example-label">例子 / 纯教学概率</div><p>某节点返回 fold 10%、call 25%、raise 65%。这表示每次按该分布选择，不是“65% 最大，所以永远 raise”。具体采样过程见第 10 节。</p></div></div>
+<p>默认 <code>reshape=preopen</code> 的训练菜单增加约 2.25BB 的开池档，同时保留常规 3.5BB 档；禁非 SB open-limp，保留 SB complete；后续再加注主要用 1pot；删除翻前首次进攻直接全下的分支。<strong>菜单是候选动作，不是固定出牌规则。</strong>最后选哪一档由策略决定。</p>
+<div class="note amber"><strong>查不到有效策略并不等于弃牌。</strong>blueprint_distribution 遇到空、全零、维度不匹配的策略，会在当前合法抽象动作间均匀分配。这个结果仍标记 <code>source=blueprint</code>。正常向量则过滤非有限或非正概率，再归一化。</div>
+<details><summary>“100BB blueprint”如何处理非 100BB 实战？</summary><p>翻前主要依然使用 100BB 树与具体金额重放；没有为每个真实码深即时重训翻前策略。实际筹码差可能引发全下结构、行动序或合法动作失配。代码通过失同步分流、合法金额限制和兜底处理这些边界，这不等于已得到任意码深的精确翻前策略。</p></details>
+<p class="source">源码：<a href="../src/training/nlhe.rs">nlhe.rs</a> · info_set_for_cards() L277；<a href="../tools/openpoker_advisor.rs">advisor</a> · blueprint_distribution() L1154；<a href="../src/training/nlhe_betting_tree.rs">nlhe_betting_tree.rs</a> · first_small_preopen_6max() L166。</p>
+</section>
+
+<section id="limp">
+<div class="section-head"><span class="number">05</span><h2>翻前异常：limp 启发式与跟注保护</h2></div>
+<p>在翻前，<code>structural_gap</code> 且历史中确有首次加注前的跟注时，进入 limp_heuristic。它是手写规则，不是 blueprint，也不是实时搜索。</p>
+<div class="table-wrap"><table><thead><tr><th>牌档</th><th>范围</th><th>无人加注时</th><th>已经有人加注时</th></tr></thead><tbody><tr><td>P 强牌</td><td>JJ+、AK、AQ（AK/AQ 含同花和不同花）</td><td>可加注时隔离加注</td><td>可跟注则 call；该分支无独立金额上限</td></tr><tr><td>S 扩展牌</td><td>P 加上 TT、99、ATs、AJs、KQs</td><td>可加注时隔离加注</td><td>非 P 部分：能 check 则 check，否则 fold</td></tr><tr><td>其余</td><td>以上之外</td><td>能 check 则 check，否则 fold</td><td>能 check 则 check，否则 fold</td></tr></tbody></table></div>
+<div class="formula">隔离加注目标 to = (4 + limper 数量) × BB<br>实际目标 = clamp(to, min_raise, max_raise)</div>
+<div class="panel"><div class="example-label">例子 / 两人 limp，我方在 BB 拿 J♣J♦</div><p>树不支持该路线，进入启发式；JJ 属于 P，也属于 S。若仍无人加注且允许 raise，目标是 <strong>(4 + 2)BB = 6BB</strong>。BB 已投入 1BB，因此追加 5BB。之后若被再加注，P 档在可跟注时跟注。</p><p>若拿的是 7♣2♦，且轮到 BB 可以免费过牌，则 check。若启发式本想 fold，但后述底池赔率保护命中，则改为 call。</p></div>
+<p>其他翻前失同步会走通用兜底：强牌可受 premium_call 保护；能够重建底池和跟注额时，还会检查 <code>pot &gt; 4 × to_call</code> 且 <code>to_call ≤ 30BB</code>。这不是对所有正常策略的事后改写，只作用于相应失败分支。</p>
+<p class="source">源码：<a href="../tools/openpoker_advisor.rs">advisor</a> · 翻前分流 L923、limp_hand_tier() L1405、limp_heuristic() L1442、pot_odds_floor_hit() L1324。</p>
+</section>
+
+<section id="postflop">
+<div class="section-head"><span class="number">06</span><h2>翻后：以本街起点为根，重建子博弈</h2></div>
+<div class="branch"><div><span class="tag">ANCHORED / 锚定</span><h3>blueprint 节点还能对齐</h3><p>用完整抽象历史辅助估范围和导航；实际搜索的底池、筹码来自 auth。返回来源 <code>search</code>。</p></div><div><span class="tag">UNANCHORED / 脱锚</span><h3>blueprint 影子已经失同步</h3><p>用真实历史重建局面；尽量利用断点前范围信息，在独立子树中导航。返回来源 <code>search:unanchored</code>。</p></div></div>
+<p style="margin-top:20px">两条路径都先检查搜索触发条件。真栈重放失败仍会 giveup；“脱锚”只解除对 blueprint 当前节点的依赖，不表示可以忽略损坏的历史。</p>
+<div class="table-wrap"><table><thead><tr><th>重放产物</th><th>内容</th><th>用途</th></tr></thead><tbody><tr><td><code>auth</code></td><td>当前真实决策点</td><td>读取我方真实手牌、合法动作、输出金额</td></tr><tr><td><code>round_start</code></td><td>本街刚开始的状态</td><td>RoundStart 搜索根</td></tr><tr><td><code>within</code></td><td>本街已发生的动作</td><td>从子树根导航到当前节点</td></tr><tr><td><code>prev_within</code></td><td>上一街完整动作，含收街动作</td><td>用上一街搜索结果更新范围</td></tr></tbody></table></div>
+<div class="panel"><div class="example-label">例子 / flop 上对手先下注，我方再行动</div><p>公共牌发出时底池 10BB。对手下注 5BB 后轮到我：<code>round_start</code> 的底池是 10BB；<code>auth</code> 的底池是 15BB，面对 5BB 跟注额；<code>within</code> 记着对手这次下注。</p><p>求解从 10BB 的街起点开始，再沿下注动作走到我的节点。到同一街第二次轮到我，仍可在这棵解过的树上继续导航。</p></div>
+<div class="note amber">源码默认是 RoundStart。不要把“每次收到请求”理解为“每次都从当前点另算一套策略”。缺少真实 stacks 时会退为 100BB 配置继续尝试搜索，因此日志显示 search 不足以证明输入码深完整。</div>
+<p class="source">源码：<a href="../tools/openpoker_advisor.rs">advisor</a> · build_real_auth() L1505、decide_search_unanchored() L1687、real_stacks_config()；<a href="../src/training/subgame.rs">subgame.rs</a> · SubgameSearchConfig::default() L954。</p>
+</section>
+
+<section id="range">
+<div class="section-head"><span class="number">07</span><h2>不知道对手的牌，如何估计范围？</h2></div>
+<p>每个座位都有一组候选两张牌组合的权重。正常锚定路径沿该座位的历史动作，查询 blueprint 中对应动作的概率并相乘。只使用当时已公开的牌，不借用未来信息。</p>
+<div class="formula">reach(h) = ∏ σ_blueprint(已观察动作 | 候选手牌 h, 当时节点)<br>range(h) = reach(h) / Σ reach<br>对手平滑：r′ = (1 − λ)r + λu　（默认 λ = 0.25）</div>
+<p>从本街起点搜索时，根范围只由<strong>本街之前</strong>的动作估计；本街下注留在子树里处理，避免重复条件化。我方范围不混 uniform。全零范围保持“无信号”语义，后续采样时退均匀。</p>
+<div class="panel"><span class="tag">INTERACTIVE / 范围更新</span><h3>观察到“加注，再跟注”后，哪些牌更可信？</h3><p class="small">教学模型：只有 3 个等先验、等组合数的假想类别。真实代码遍历具体两张牌组合，下面不是某副牌的真实策略。</p>
+<div class="table-wrap"><table><thead><tr><th>类别</th><th>P(加注)</th><th>P(随后跟注)</th><th>乘积</th></tr></thead><tbody><tr><td>强牌</td><td>0.80</td><td>0.75</td><td>0.60</td></tr><tr><td>中等牌</td><td>0.40</td><td>0.50</td><td>0.20</td></tr><tr><td>弱牌</td><td>0.10</td><td>0.20</td><td>0.02</td></tr></tbody></table></div>
+<div class="controls"><label class="field">观察的动作<select id="range-stage"><option value="prior">尚未观察动作</option><option value="raise">只观察到加注</option><option value="call" selected>加注后又跟注</option></select></label><label class="field">对手均匀混合 λ：<output id="lambda-label" for="range-lambda">0.25</output><input id="range-lambda" type="range" min="0" max="1" step="0.05" value="0.25"></label></div>
+<div id="range-bars" aria-live="polite"></div><p class="small" id="range-description">未平滑：73.17% / 24.39% / 2.44%；混入 25% 均匀先验后：63.21% / 26.63% / 10.16%。</p>
+<div class="example"><p>这层平滑保留弱牌等尾部组合的可能性，缓和 blueprint 估计过窄的问题；它不是“所有人都随机玩”。新公共牌出现时，与它冲突的组合权重归零。</p></div></div>
+<div class="panel"><h3>脱锚时还能保留多少信息？</h3><p>默认使用失同步之前最后对齐的历史前缀，只取当前街之前的动作。AllIn 标签在这条前缀估计中跳过，因为非 100BB 的全下不宜直接套 100BB shove 概率。没有有效前缀时，退均匀范围。</p><p>turn/river 若有同手上一街的求解结果，则优先用“上一街根范围 × 上一街实际动作的搜索概率”生成后验范围。两条路径都可跨街复用，详见第 9 节。</p></div>
+<details><summary>搜索时是否固定我方真实两张牌？</summary><p><strong>不固定。</strong>训练时我方也从自己的范围中采样；求解的是范围对范围的策略，再查询我方真实手牌桶。每座位先有边际范围，发牌时按座位顺序排除已用牌；它不是精确存储所有玩家联合手牌分布。剩余公共牌也会重采样，已知公共牌与下注状态保持不变。</p></details>
+<p class="source">源码：<a href="../src/training/subgame.rs">subgame.rs</a> · estimate_range() L1151、mix_range_with_uniform() L1224、sample_holes_from_ranges() L413、root() L616、脱锚范围组装 L3119。</p>
+</section>
+
+<section id="solve">
+<div class="section-head"><span class="number">08</span><h2>实时搜索究竟算了什么</h2></div>
+<p>搜索创建新的子博弈训练器，范围与动作抽象是输入。它没有把整个 blueprint 的 regret 表直接复制过来继续训练。当前入口默认 <code>depth_limit=false</code>：在抽象动作子树里求解到终局，而不是在下一街截断后读取叶子价值表。</p>
+<div class="flow"><div class="flow-item"><em>A / BUILD</em><b>从本街起点建树</b><span>固定公共状态和真实筹码；选择下注菜单。</span></div><div class="flow-item"><em>B / SAMPLE</em><b>采样隐藏信息</b><span>按各家范围发底牌，排除冲突，采样后续公共牌。</span></div><div class="flow-item"><em>C / UPDATE</em><b>跑 ES-MCCFR</b><span>轮换更新玩家；本人分支枚举，其他玩家动作采样。</span></div><div class="flow-item"><em>D / READ</em><b>读平均策略</b><span>导航到当前点，按 hero 真手牌桶查询。</span></div></div>
+<div class="panel"><h3>一轮遗憾更新：用一个小例子理解</h3><p class="small">教学示例：这里的收益是一次采样遍历返回的假设值，不是当前程序对具体牌局的输出。</p><div class="table-wrap"><table><thead><tr><th>动作</th><th>当前策略 σ</th><th>本次动作收益 v</th><th>遗憾增量 v − Σσv</th></tr></thead><tbody><tr><td>check</td><td>50%</td><td>+2BB</td><td>−1BB</td></tr><tr><td>bet</td><td>50%</td><td>+4BB</td><td>+1BB</td></tr></tbody></table></div><p>当前混合收益是 3BB；本次样本认为 bet 比当前混合策略好 1BB。更新累计遗憾后，后续 regret matching 倾向增加有正遗憾的动作概率。它会重复采样和更新，并累计平均策略；<strong>不会凭这一次样本就把 bet 定为最终答案。</strong></p><p>在更新玩家自己的节点，枚举所有合法动作；在其他玩家节点，按其策略采样一个动作。对手和机会节点的到达权重已体现在访问概率里，不在本次遗憾增量中再乘一次。</p><p class="source">更细的更新过程：<a href="es_mccfr_update_explainer.html">仓库已有《一次 ES-MCCFR Update》</a>。</p></div>
+<div class="grid" style="margin-top:18px"><div class="panel"><h3>计算预算</h3><ul><li>无时间预算：默认 1000 次 update。</li><li>有时间预算、未显式设次数：次数上限提至 u64::MAX，主要按时间停止。</li><li>同时指定次数和时间：达到其中一个限制即停止。</li><li>可选 LCFR 和多线程更新；默认各自关闭、1 线程。</li><li>默认 max_subtree_nodes 为 8000，可调整。</li></ul></div><div class="panel"><h3>实际耗时</h3><p>时间预算从求解循环附近开始计时。范围估计、建树等前置工作不包括在内，多线程在批次边界检查时间。</p><div class="formula">总决策耗时 ≈ 重放 + 范围估计 + 建树 + 求解 + 导航 / 输出</div><p>缓存命中可以跳过建树与求解；限时模式的更新数随机器负载变化，不保证逐位复现。</p></div></div>
+<div class="panel"><h3>deep-menu：把树的宽度限制在当前街</h3><p>不开此开关时沿用 blueprint 抽象。开启后依据根局面里<strong>第二大 Active 剩余栈</strong>和底池选择菜单；HU 下该栈就是两人较小的剩余栈。</p><div class="table-wrap"><table><thead><tr><th>条件</th><th>当前街下注比例</th><th>子树的后续街</th></tr></thead><tbody><tr><td>Active ≤ 3，第二大栈 ≤ 40 × pot</td><td>0.5pot、1pot</td><td>1pot</td></tr><tr><td>Active = 4，第二大栈 ≤ 20 × pot</td><td>0.5pot、1pot</td><td>1pot</td></tr><tr><td>其余</td><td>1pot</td><td>1pot</td></tr></tbody></table></div><p>合法的 fold / check / call / all-in 仍存在。“只 1pot”指有限下注比例，不是每次都必须下注一个底池。脱锚路径关闭训练树的 width_redirect 限宽，允许真实多人局面建子树；节点规模另有上限检查。</p></div>
+<p class="source">源码：<a href="../src/training/subgame.rs">subgame.rs</a> · solve_subgame() L2540、read_current_strategy() L2645；<a href="../src/training/trainer.rs">trainer.rs</a> · step() L579、recurse_es()；<a href="../src/training/nlhe_betting_tree.rs">nlhe_betting_tree.rs</a> · deep_menu_for() L323。</p>
+</section>
+
+<section id="cache">
+<div class="section-head"><span class="number">09</span><h2>一街复用一次解，下一街传递范围</h2></div>
+<p>缓存不只是保存上一个动作，而是保存<strong>已求解子博弈及其平均策略</strong>。同街同根、相同范围和配置等输入会命中；真实局面、范围、菜单或配置变化则可能重新求解。另保留上一街解，避免当前街第二次决策时丢掉范围来源。</p>
+<div class="timeline"><div class="event"><b>Flop 刚发出</b><p>可选 prewarm 提前向同一个 advisor 发请求。先建树和求解，不立即出动作。</p></div><div class="event"><b>Flop 首次轮到我</b><p>有匹配预热结果则命中；否则现算。沿当前街动作定位节点，查询真手牌策略。</p></div><div class="event"><b>Flop 再次轮到我</b><p>相同根与范围等输入可复用当前解，沿更长动作历史导航，不重新随机求解一整棵树。</p></div><div class="event"><b>Turn 发出</b><p>用 flop 完整实际动作线，对 flop 搜索根范围做条件化，并排除新 turn 牌；作为 turn 新子博弈的范围。</p></div><div class="event"><b>Turn 再次决策 / River 发出</b><p>当前解用于同街导航，保留的上一街解用于稳定生成范围；换手时清理不适用的上一街条目。</p></div></div>
+<div class="panel"><div class="example-label">例子 / 跨街更新，教学权重</div><p>flop 根范围中，候选组合 A、B 各占 50%。实际观察到对手下注；flop 搜索策略中，A 的下注率为 80%，B 为 20%。到 turn 时，更新权重为：</p><div class="formula">A：0.5 × 0.8 = 0.40 → 归一后 80%<br>B：0.5 × 0.2 = 0.10 → 归一后 20%</div><p>随后排除与 turn 新牌冲突的组合，并按配置对对手平滑。实际代码沿上一街全部相关动作相乘，且核对同手身份、公共牌严格前缀与紧邻街关系。</p></div>
+<div class="note">默认跨街复用开启，锚定和脱锚结果可以互相提供上一街解。复用失败则回到各自范围估计；这不是必须有上一街搜索才能打下一街。</div>
+<details><summary>为什么 prewarm 也不一定带来零等待？</summary><p>Python 先发送预热请求，不立即读取响应；后续 decide 会先排空预热响应，再读取决策响应。它没有另外启动一个独立求解进程。如果预热尚未结束，或新的决策输入导致缓存不匹配，仍可能等待或重新计算。预热能隐藏多少耗时取决于对手思考时间和缓存匹配情况。</p></details>
+<p class="source">源码：<a href="../src/training/subgame.rs">subgame.rs</a> · cross_street_posterior_range() L1561、SubgameSolveCache L1727、solve_cache_key() L1879；<a href="../tools/openpoker_play.py">driver</a> · Advisor.prewarm() L98、_drain_pending()。</p>
+</section>
+
+<section id="outgoing">
+<div class="section-head"><span class="number">10</span><h2>从概率分布到服务端动作</h2></div>
+<p>搜索会先核对当前节点的行动者，再查询我方真实底牌和 board 对应的 bucket。如果该信息集没被采样访问到，则搜索失败；它不像 blueprint 那样自动均匀分配。</p>
+<p>真实码深下，部分加注档可能合并为 all-in。代码按动作标签对齐，把塌缩档位的概率并入全下；若不存在合理对应关系，则返回错误。正常分布再交给采样器。</p>
+<div class="panel"><span class="tag">INTERACTIVE / 混合策略采样</span><h3>概率最高不代表每次都选它</h3><p class="small">固定教学分布：fold 10%、call 25%、raise 65%。生产随机数由局面和基础 seed 派生；此滑杆只演示累计概率区间。</p><label class="field" style="margin-top:18px">采样数 u ∈ [0,1)：<output id="sample-value" for="sample-u">0.420</output><input id="sample-u" type="range" min="0" max="999" step="1" value="420"></label><div class="table-wrap"><table><thead><tr><th>随机数区间</th><th>动作</th></tr></thead><tbody><tr><td>[0.00, 0.10)</td><td>fold</td></tr><tr><td>[0.10, 0.35)</td><td>call</td></tr><tr><td>[0.35, 1.00)</td><td>raise</td></tr></tbody></table></div><div class="result" id="sample-result" aria-live="polite"><b>本次选择 raise</b><p>u = 0.420 落在 [0.35, 1.00) 内。</p></div></div>
+<div class="panel"><h3>抽象比例要重新变成金额</h3><p>blueprint 在 100BB 具体金额重放状态上计算；搜索在 auth 真栈状态上计算。使用与求解一致的动作菜单，再换回 OpenPoker 单位并夹到服务端的 min/max。</p><div class="example-label">例子 / 面对下注时的 1pot 加注</div><p>假设我本街尚未投入，对手已下注 5BB，当前底池 15BB。跟注后底池为 20BB。1pot 加注目标是：</p><div class="formula">raise_to = 本街最高投入 + 1 × 跟注后底池<br>　　　　 = 5 + 20 = 25BB</div><p>若合法上限只有 18BB，则按合法范围和全下折叠逻辑处理。输出 <code>amount</code> 是累计到额，不是增量。Call 在可免费过牌时可转换成 check；不合法动作走对应兜底。</p></div>
+<p class="source">源码：<a href="../tools/openpoker_advisor.rs">advisor</a> · sample_seed() L1990、action_to_response() L1179；<a href="../src/training/blueprint_advisor.rs">blueprint_advisor.rs</a> · outgoing_action() L225；<a href="../src/training/subgame.rs">subgame.rs</a> · project_strategy_onto_auth_legal() L2705。</p>
+</section>
+
+<section id="fallback">
+<div class="section-head"><span class="number">11</span><h2>搜索失败怎样打？剥削又在哪里？</h2></div>
+<p>搜索建树失败、规模超限、导航失配、当前信息集未访问等情况进入 <code>search_giveup:*</code>。<strong>搜索失败不会自动回查 blueprint。</strong></p>
+<div class="panel"><h3>通用决策兜底 fallback_with_floor</h3><ol><li>能免费过牌：check。</li><li>否则可以 call，且翻前为 JJ+/AK/AQ，或翻后当前牌面坚果度 &gt; 93%：call。</li><li>否则有可用底池赔率，满足 pot &gt; 4 × to_call 且 to_call ≤ 30BB：call。</li><li>其余：fold。</li></ol><p>“坚果度”是当前 board 上，hero 击败或打平剩余对手两张牌组合的比例；不按对手估计范围加权，也不预测后续公共牌。赔率计算中的 pot 包含当前对手下注；封顶全下时也未做精细侧池修正。</p></div>
+<div class="panel"><span class="tag">INTERACTIVE / 赔率保护边界</span><h3>这些局面会因赔率条件被保护吗？</h3><p class="small">假定已经进入通用决策兜底、不能免费过牌、允许跟注、没有强牌保护，且可以重建底池。</p><div class="controls"><label class="field">当前底池（BB）<input id="odds-pot" type="number" min="0" max="10000" step="1" value="50"></label><label class="field">需要补的跟注额（BB）<input id="odds-call" type="number" min="0" max="1000" step="1" value="10"></label></div><div class="result" id="odds-result" aria-live="polite"><b>call · pot_odds_call</b><p>50 / 10 = 5 &gt; 4，且 10 ≤ 30BB。</p></div><p class="small">试试 pot=40、call=10：比值恰好 4，不命中；pot=200、call=31：赔率虽好，超过 30BB 也不命中。</p></div>
+<div class="note amber">这些保护不是全局覆盖层。输入校验、座位映射或部分动作转换失败可能只调用简单 safe_fallback；Python 与 advisor 通信异常时直接 fold。正常策略决定的 fold 不会被这套规则统一改成 call。</div>
+<div class="panel"><h3>可选 exploit：修改范围，然后重新求解</h3><p>默认 <code>--exploit off</code>。<code>vpip</code> 根据观察到的翻前入池率调整对手范围宽度；<code>on</code> 再结合 PFR 和本手主动／被动入池方式调整范围形状。它当前挂在<strong>脱锚搜索的范围组装阶段</strong>，不直接改翻前查表输出。</p><p>默认至少 150 手、标准误不超过 0.05、近窗漂移不超过 0.08 才让画像参与；PFR 形状还要求 PFR 收敛。默认混合强度 0.5。我方范围不被剥削先验修改。</p><p>driver 在整手结束后发送 observe，即使我方早已弃牌也继续记录后续事件。启用 exploit 且已有非空 HH 文件时，会尝试用历史日志暖启动画像。预热 v1 不叠加剥削，范围不同可能导致后续决策缓存不命中。</p></div>
+<p class="source">源码：<a href="../tools/openpoker_advisor.rs">advisor</a> · fallback_with_floor() L1368、NUT_CALL_THRESHOLD L1250、脱锚 exploit 组装 L1779；<a href="../src/training/opponent_profile.rs">opponent_profile.rs</a> · ExploitConfig / profile_for；<a href="../tools/openpoker_play.py">driver</a> · main() 暖启动参数。</p>
+</section>
+
+<section id="walkthrough">
+<div class="section-head"><span class="number">12</span><h2>把一手牌从头串起来</h2></div>
+<p class="intro">以下是教学牌局，不是实盘日志。假定六人发牌、hero 在 BTN、100BB 起始栈，开启 all-postflop 搜索；忽略抽水，示例概率不代表程序真实输出。</p>
+<div class="card-row"><span class="card red">A♥</span><span class="card red">Q♥</span><span class="small">hero / BTN</span></div>
+<div class="timeline"><div class="event"><b>翻前：前位弃牌，轮到 BTN</b><p>三位前位 fold 进入历史；lockstep 找到 BTN 未开池节点。AQs 落在 169 类中的一个类别，读取该节点平均策略。假设本次采样选择加到 2.25BB。</p></div><div class="event"><b>SB 弃牌，BB 跟注</b><p>hero 2.25 + BB 2.25 + SB 死盲 0.5 = 5BB。driver 保留整手投入；flop 起点 hero/BB 剩余各 97.75BB。</p></div><div class="event"><b>Flop：Q♣ 7♦ 2♠，BB check</b><p>搜索从 flop 起点的 5BB 底池开始。用翻前动作估计双方根范围。hero 在搜索中也有完整范围，输出时才查询 A♥Q♥ 对应桶；沿 BB check 导航到 BTN 节点。</p></div><div class="event"><b>假设策略采样选择半池下注</b><p>目标为 2.5BB；BB call 后底池变成 10BB，双方剩余各 95.25BB。动作日志记录 req、resp、sent，而不只记录“下注了多少”。</p></div><div class="event"><b>Turn：发出 9♥，BB 再次 check</b><p>从 flop 搜索结果沿“BB check → BTN bet → BB call”更新双方范围，再排除 9♥ 冲突组合。以 turn 起点的 10BB 底池建立新子博弈，沿 BB check 找到 hero 当前点。</p></div><div class="event"><b>如果某个环节失败</b><p>例如 turn 当前桶未访问，返回 search_giveup 并进入保护规则。此时的动作不能再解读成“搜索认为 AQ 应该弃牌”；它可能只是搜索没有产出可用策略。</p></div></div>
+<div class="panel"><h3>看日志，先看 source，再看概率</h3><div class="table-wrap"><table><thead><tr><th>source</th><th>实际含义</th><th>读数注意</th></tr></thead><tbody><tr><td>blueprint</td><td>查表路径</td><td>也包含坏／空策略的均匀分布</td></tr><tr><td>limp_heuristic:*</td><td>翻前 limp 手写规则</td><td>不是训练器输出</td></tr><tr><td>search</td><td>锚定搜索成功</td><td>可能复用了同街缓存</td></tr><tr><td>search:unanchored</td><td>脱锚搜索成功</td><td>不依赖当前 blueprint 节点可达</td></tr><tr><td>search_giveup:*</td><td>搜索失败后的动作</td><td>必须读具体失败原因和保护后缀</td></tr><tr><td>fallback:*</td><td>其他失败兜底</td><td>不代表策略正常选择了该动作</td></tr></tbody></table></div><p><code>probs</code> 是概率分布，<code>chosen</code> 是抽象动作，<code>sent.amount</code> 是最后发送的金额。<code>solve_updates</code> 在缓存命中时仍是被复用解的更新数，不表示本次又跑了这么多次。</p><pre><code>// 日志结构示意，省略具体牌与数值；不是可直接发送的请求
+{
+  "req":  { "hole": [...], "board": [...], "actions": [...], "valid": {...} },
+  "resp": { "source": "search", "action": "raise", "amount": ..., "probs": [...] },
+  "sent": { "type": "action", "action": "raise", "amount": ..., "turn_token": ... }
+}</code></pre></div>
+</section>
+
+<section id="reference">
+<div class="section-head"><span class="number">13</span><h2>参数速查与源码地图</h2></div>
+<p>这里区分“源码默认值”与“解释中使用的模式”。没有读取任何正在运行的进程参数，也没有据实盘文件名推断线上配置。源码注释有部分历史描述，本文以执行分支和常量为准。</p>
+<div class="table-wrap"><table><thead><tr><th>参数</th><th>源码默认</th><th>影响</th></tr></thead><tbody><tr><td>--search</td><td>关闭</td><td>搜索总开关</td></tr><tr><td>--search-trigger</td><td>flop-first-unraised</td><td>all-postflop 才覆盖 turn/river 和 flop 已起注局面</td></tr><tr><td>--reshape</td><td>preopen</td><td>应与 checkpoint 的抽象配置匹配</td></tr><tr><td>--postflop-cap</td><td>3</td><td>传给训练树 width_redirect 的人数收缩配置，不是“最多加注三次”</td></tr><tr><td>--search-iterations</td><td>1000；设时间预算且未显式设次数时改为 u64::MAX</td><td>求解更新数上限</td></tr><tr><td>--search-time-budget-ms</td><td>无</td><td>限制求解循环，不是整次决策硬超时</td></tr><tr><td>--search-max-nodes</td><td>8000</td><td>子树节点上限检查</td></tr><tr><td>--search-range-uniform-mix</td><td>0.25</td><td>对手范围平滑，hero 不混</td></tr><tr><td>--search-unanchored-prefix-reach</td><td>on</td><td>脱锚后利用已同步前缀</td></tr><tr><td>--search-unanchored-cross-street</td><td>on</td><td>名字含 unanchored，但当前同时控制锚定与脱锚跨街复用</td></tr><tr><td>--search-flop-prefer-blueprint</td><td>off</td><td>on 时仅抑制能映射的 flop 搜索；脱锚仍受触发器控制</td></tr><tr><td>--search-deep-menu / --search-prewarm / --search-lcfr</td><td>均关闭</td><td>自适应菜单 / 预热 / 线性加权</td></tr><tr><td>--search-solve-threads</td><td>1</td><td>并行求解更新线程数</td></tr><tr><td>--search-bucket-table</td><td>不单独指定</td><td>默认沿用 blueprint 表；显式指定只替换搜索桶表</td></tr><tr><td>--exploit</td><td>off</td><td>on / vpip 都要求同时开启 search</td></tr></tbody></table></div>
+<div class="panel"><h3>从哪里开始读代码</h3><div class="table-wrap"><table><thead><tr><th>文件</th><th>关键函数 / 行号（基线）</th></tr></thead><tbody><tr><td><a href="../tools/openpoker_play.py">tools/openpoker_play.py</a></td><td>main L1264；_handle_your_turn L578；build_request L300</td></tr><tr><td><a href="../tools/openpoker_advisor.rs">tools/openpoker_advisor.rs</a></td><td>decide L791；build_real_auth L1505；decide_search_unanchored L1687；parse_args_from L2314</td></tr><tr><td><a href="../src/training/blueprint_advisor.rs">src/training/blueprint_advisor.rs</a></td><td>outgoing_action L225；advance_shadow_by_applied L292</td></tr><tr><td><a href="../src/training/nlhe.rs">src/training/nlhe.rs</a></td><td>info_set_for_cards L277</td></tr><tr><td><a href="../src/training/subgame.rs">src/training/subgame.rs</a></td><td>should_search L978；estimate_range L1151；cross_street_posterior_range L1561；solve_subgame L2540；read_current_strategy L2645</td></tr><tr><td><a href="../src/training/nlhe_betting_tree.rs">src/training/nlhe_betting_tree.rs</a></td><td>first_small_preopen_6max L166；deep_menu_for L323</td></tr><tr><td><a href="../src/training/trainer.rs">src/training/trainer.rs</a></td><td>EsMccfrTrainer::step L579；recurse_es</td></tr><tr><td><a href="../src/training/opponent_profile.rs">src/training/opponent_profile.rs</a></td><td>ExploitConfig；Profiler；profile_for</td></tr></tbody></table></div><p class="small">链接使用仓库内相对路径，保留目录结构时可以直接打开。单独分享本 HTML 仍可阅读全文和使用示例，但源码链接需配套仓库。</p></div>
+<div class="note"><strong>阅读时保留三个区别：</strong>查表成功与策略训练充分不是一回事；搜索开启与每次搜索成功不是一回事；范围先验来自 blueprint 与最终动作来自 blueprint 也不是一回事。</div>
+</section>
+<footer class="foot">实现说明新增于 2026-10-05，依据提交 bb3f175 的代码。本文不修改历史决策或算法契约。交互例子均为教学演示，不调用 solver、外部 API 或真实牌桌。所有样式与脚本内嵌，无第三方资源。</footer>
+</main>
+</div>
+<script>
+'use strict';
+const byId = id => document.getElementById(id);
+function routeDecision(mode, street, synced, hasBet, prefer) {
+  if (street === 'preflop') return synced
+    ? {kind:'blueprint',title:'翻前查表 · blueprint',body:'无论是否开启搜索，翻前都不实时求解。按 node_id 与 169 类手牌查询平均策略。'}
+    : {kind:'fallback',title:'翻前异常分支',body:'若是 structural_gap 且历史有 open-limp，尝试 limp_heuristic；否则进入相应兜底。翻前不会转实时搜索。'};
+  const triggered = mode === 'all' || (mode === 'flop' && street === 'flop' && !hasBet);
+  if (!triggered) return synced
+    ? {kind:'blueprint',title:'翻后查表 · blueprint',body:'搜索关闭或未命中触发器。历史映射成功，读取该街 bucket 对应的 blueprint 平均策略。'}
+    : {kind:'fallback',title:'未触发搜索 · fallback',body:'历史失同步且没有命中搜索触发器，不能继续查当前 blueprint 节点，进入相应兜底。'};
+  if (synced && street === 'flop' && prefer) return {kind:'blueprint',title:'Flop 优先查表 · blueprint',body:'prefer-blueprint 只抑制已同步的 flop 搜索。这个开关不改变 turn/river，也不取消脱锚路径本身。'};
+  return synced
+    ? {kind:'search',title:'锚定实时搜索 · search',body:'搜索已开启、命中触发器，且 blueprint 历史映射成功。重建真实筹码状态后求解；失败再走 search_giveup。'}
+    : {kind:'search',title:'脱锚实时搜索 · search:unanchored',body:'已失去当前 blueprint 节点，但命中触发器。尝试真栈重放、前缀或跨街范围估计和独立子树求解；失败进入兜底。'};
+}
+function showResult(id, result) {const el=byId(id);el.dataset.kind=result.kind;el.querySelector('b').textContent=result.title;el.querySelector('p').textContent=result.body;}
+function updateRoute() {showResult('route-result',routeDecision(byId('route-mode').value,byId('route-street').value,byId('route-sync').checked,byId('route-bet').checked,byId('route-prefer').checked));}
+['route-mode','route-street','route-sync','route-bet','route-prefer'].forEach(id=>byId(id).addEventListener('change',updateRoute));
+function rangeDistribution(stage, lambda) {const weights=stage==='prior'?[1,1,1]:stage==='raise'?[.8,.4,.1]:[.6,.2,.02];const sum=weights.reduce((a,b)=>a+b,0);return weights.map(w=>(1-lambda)*w/sum+lambda/3);}
+function updateRange() {const stage=byId('range-stage').value,lambda=Number(byId('range-lambda').value),raw=rangeDistribution(stage,0),mixed=rangeDistribution(stage,lambda);byId('lambda-label').textContent=lambda.toFixed(2);const holder=byId('range-bars');holder.replaceChildren();['强牌','中等牌','弱牌'].forEach((name,i)=>{const row=document.createElement('div');row.className='bar-row';const label=document.createElement('span');label.textContent=name;const track=document.createElement('div');track.className='bar-track';track.setAttribute('aria-hidden','true');const bar=document.createElement('div');bar.className='bar';bar.style.width=(mixed[i]*100)+'%';track.append(bar);const value=document.createElement('span');value.textContent=(mixed[i]*100).toFixed(2)+'%';row.append(label,track,value);holder.append(row);});byId('range-description').textContent='未平滑：'+raw.map(p=>(p*100).toFixed(2)+'%').join(' / ')+'；混入 '+(lambda*100).toFixed(0)+'% 均匀先验后，得到上图分布。';}
+byId('range-stage').addEventListener('change',updateRange);byId('range-lambda').addEventListener('input',updateRange);
+function sampleAction(u) {return u<.1?'fold':u<.35?'call':'raise';}
+function updateSample() {const u=Number(byId('sample-u').value)/1000,action=sampleAction(u),interval=action==='fold'?'[0.00, 0.10)':action==='call'?'[0.10, 0.35)':'[0.35, 1.00)';byId('sample-value').textContent=u.toFixed(3);showResult('sample-result',{kind:'search',title:'本次选择 '+action,body:'u = '+u.toFixed(3)+' 落在 '+interval+' 内。'});}
+byId('sample-u').addEventListener('input',updateSample);
+function oddsProtected(pot,call) {return call>0&&pot>4*call&&call<=30;}
+function updateOdds() {const pot=byId('odds-pot').valueAsNumber,call=byId('odds-call').valueAsNumber;if(!Number.isFinite(pot)||!Number.isFinite(call)||pot<0||call<=0){showResult('odds-result',{kind:'fallback',title:'请输入有效底池与正跟注额',body:'跟注额为 0 时应检查能否免费过牌，不适用此赔率保护示例。'});return;}const hit=oddsProtected(pot,call);showResult('odds-result',{kind:hit?'search':'fallback',title:hit?'call · pot_odds_call':'不触发赔率保护 → 此示例中 fold',body:'pot / to_call = '+(pot/call).toFixed(2)+'；需要严格 > 4，且跟注额 ≤ 30BB。'+(hit?' 两项均满足。':' 至少一项不满足。')});}
+['odds-pot','odds-call'].forEach(id=>byId(id).addEventListener('input',updateOdds));
+byId('print-button').addEventListener('click',()=>window.print());
+byId('expand-button').addEventListener('click',()=>{const button=byId('expand-button'),open=button.getAttribute('aria-expanded')!=='true';document.querySelectorAll('details').forEach(el=>el.open=open);button.setAttribute('aria-expanded',String(open));button.textContent=open?'收起补充':'展开补充';});
+let printDetails=[];window.addEventListener('beforeprint',()=>{printDetails=Array.from(document.querySelectorAll('details'),el=>el.open);document.querySelectorAll('details').forEach(el=>el.open=true);});window.addEventListener('afterprint',()=>document.querySelectorAll('details').forEach((el,i)=>el.open=printDetails[i]));
+if('IntersectionObserver' in window){const observer=new IntersectionObserver(entries=>{for(const entry of entries){if(entry.isIntersecting){document.querySelectorAll('.side nav a').forEach(a=>{const active=a.hash==='#'+entry.target.id;a.classList.toggle('active',active);if(active)a.setAttribute('aria-current','location');else a.removeAttribute('aria-current');});}}},{rootMargin:'-5% 0px -75% 0px',threshold:0});document.querySelectorAll('section').forEach(section=>observer.observe(section));}
+updateRoute();updateRange();updateSample();updateOdds();
+</script>
+</body>
+</html>
