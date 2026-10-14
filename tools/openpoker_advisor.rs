@@ -50,6 +50,16 @@
 //! {0.5,1} 两档）**（深码 /
 //! 多人解到终局控树，§2.1），此时 outgoing 也用 {1pot} 抽象算尺寸（脱影子路径同样适用）。
 //!
+//! # 按街裁切的 blueprint（`--cropped-checkpoint`）
+//!
+//! 加载 [`nlhe_dense_crop`](poker::training::nlhe_dense_crop) 产出的 crop 文件（如只含翻前 + 翻牌）
+//! 替代完整 dense ckpt，全部 σ 查询经 [`Blueprint`] 一处。保留街上与完整 blueprint 逐位一致；被裁掉的
+//! 街**只能实时搜索**：启动期强制 `--search` + `--search-trigger all-postflop` + 跨街复用开（
+//! [`validate_crop_runtime`]，不满足直接报错退出）。搜索 range 先验不查被裁街 σ
+//! （[`SubgameSearchConfig::blueprint_max_street`] 守卫）：river 先验 = turn 子树跨街后验；缓存里没有
+//! 可复用的 turn 解时按需补解 turn（[`search_with_crop_backfill`]），仍不成 →
+//! `source=search_giveup:crop_no_posterior:*`（check-when-free + 地板），绝不退均匀 / 不读被裁街。
+//!
 //! # 已知限制（blueprint 路径，`...client_design...` §4）
 //!
 //! - 码深 ≠ 100BB 且**未开搜索 / 未触发**：solver 树/SPR 都按 100BB 解；real `GameState` 用
@@ -66,7 +76,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -77,22 +87,22 @@ use poker::training::blueprint_advisor::{advance_shadow_by_applied, outgoing_act
 use poker::training::game::{Game, PlayerId};
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::{
-    deep_menu_for, first_small_6max, first_small_preopen_6max, first_small_preopen_small_6max,
-    NodeId,
+    deep_menu_for, six_max_reshape, NodeId, SIX_MAX_RESHAPE_NAMES,
 };
+use poker::training::nlhe_dense_crop::CroppedBlueprint;
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::openpoker_hh::{hh_record_to_observe, hist_to_concrete, HhRecord};
 use poker::training::opponent_profile::{ExploitConfig, ObserveHand, OpponentProfile, Profiler};
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
-    set_subgame_debug, should_search, subgame_search_cached, subgame_search_prewarm,
-    subgame_search_unanchored_cached_cross_exploit, subgame_search_unanchored_prewarm_cross,
-    synced_prefix_decisions, ExploitPrior, ExploitShape, PrefixReach, ResolveRoot, SearchTrigger,
-    SubgameSearchConfig, SubgameSolveCache,
+    is_blueprint_cropped_err, set_subgame_debug, should_search, subgame_search_cached,
+    subgame_search_prewarm, subgame_search_unanchored_cached_cross_exploit,
+    subgame_search_unanchored_prewarm_cross, synced_prefix_decisions, ExploitPrior, ExploitShape,
+    PrefixReach, ResolveRoot, SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, HandEvaluator,
-    InfoSetId, SeatId, StreetActionAbstraction, TableConfig,
+    InfoSetId, SeatId, StreetActionAbstraction, StreetTag, TableConfig,
 };
 
 const N_SEATS: usize = 6;
@@ -309,6 +319,27 @@ fn safe_fallback(valid: &ValidActions, reason: &str) -> Response {
     }
 }
 
+/// 搜索区降级的 `source`：crop 缺后验（[`CROP_NO_POSTERIOR`] 前缀）→ `search_giveup:crop_no_posterior:*`
+/// （独立分桶）；其余 → 旧标签 `search_giveup:{kind}:{reason}`（完整 blueprint 下恒走此支，byte-equal）。
+fn giveup_source(kind: &str, reason: &str) -> String {
+    if reason.starts_with(CROP_NO_POSTERIOR) {
+        format!("search_giveup:{reason}")
+    } else {
+        format!("search_giveup:{kind}:{reason}")
+    }
+}
+
+/// `poker::Street` → blueprint 街标签（Showdown 无决策 → `None`）。
+fn street_tag_of(s: poker::Street) -> Option<StreetTag> {
+    match s {
+        poker::Street::Preflop => Some(StreetTag::Preflop),
+        poker::Street::Flop => Some(StreetTag::Flop),
+        poker::Street::Turn => Some(StreetTag::Turn),
+        poker::Street::River => Some(StreetTag::River),
+        poker::Street::Showdown => None,
+    }
+}
+
 fn street_label(s: poker::Street) -> &'static str {
     match s {
         poker::Street::Preflop => "preflop",
@@ -506,6 +537,19 @@ fn prewarm(
     search: Option<&SearchRuntime>,
     solve_cache: &mut SubgameSolveCache,
 ) -> Response {
+    prewarm_inner(game, strategy_fn, req, base_seed, search, solve_cache, 0)
+}
+
+/// [`prewarm`] 本体。`backfill_depth` = crop 补解递归深度（[`search_with_crop_backfill`]；顶层 0）。
+fn prewarm_inner(
+    game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    req: &Request,
+    base_seed: u64,
+    search: Option<&SearchRuntime>,
+    solve_cache: &mut SubgameSolveCache,
+    backfill_depth: u8,
+) -> Response {
     let mk = |source: String| Response {
         action: "none".into(),
         source,
@@ -602,7 +646,9 @@ fn prewarm(
     if rt.flop_prefer_blueprint && round_start.street() == poker::Street::Flop && lockstep.is_ok() {
         return mk("prewarm:skip:flop_prefer_blueprint".into());
     }
-    let result = match lockstep {
+    // crop blueprint：range 先验缺被裁街 σ（跨街后验不可得）→ 先补解上一街再重试一次
+    // （[`search_with_crop_backfill`]；完整 blueprint 下等价于直接调一次）。
+    let attempt = |solve_cache: &mut SubgameSolveCache| match &lockstep {
         Ok((_real, abs)) => {
             // 档二′-跨街复用（锚定预热，turn_blueprint_trim §2.4 改动 D）：与决策路径同义，复用缓存里
             // 上一街已解子树 σ 算本街后验 range。预热须与决策时算出同一份 ranges 才命中 key——两路同读
@@ -626,7 +672,7 @@ fn prewarm(
             // 命中 key（hero 显式传入：range 平滑「不混」座按 hero 算，见 subgame_search_unanchored_prewarm）。
             let prefix_decisions = rt
                 .unanchored_prefix_reach
-                .then(|| synced_prefix_decisions(game, synced_node));
+                .then(|| synced_prefix_decisions(game, *synced_node));
             let prefix_reach = prefix_decisions.as_ref().map(|d| PrefixReach {
                 strategy: strategy_fn,
                 decisions: d,
@@ -648,6 +694,16 @@ fn prewarm(
             )
         }
     };
+    let result = search_with_crop_backfill(
+        game,
+        strategy_fn,
+        req,
+        base_seed,
+        rt,
+        solve_cache,
+        backfill_depth,
+        attempt,
+    );
     match result {
         Ok(()) => {
             let wall_ms = t0.elapsed().as_millis();
@@ -668,6 +724,164 @@ fn prewarm(
         }
         Err(reason) => mk(format!("prewarm:err:{reason}")),
     }
+}
+
+// ===========================================================================
+// crop blueprint：range 先验缺被裁街 σ 时按需补解上一街（再走档二′跨街后验）
+// ===========================================================================
+
+/// crop 补解失败 / 补解后仍拿不到跨街后验时的 `Err` 前缀；[`decide`] 据此标
+/// `source = search_giveup:crop_no_posterior:*`（与「树太大 / 未收敛」的 `search_giveup:unsolved:*` 分桶）。
+const CROP_NO_POSTERIOR: &str = "crop_no_posterior";
+
+/// 补解递归深度上限。补解只会向更早的街走（river → turn → flop），flop 子树的先验只需翻前 σ
+/// （crop 至少保留翻前）→ 最多 2 层；3 是防御上限。
+const CROP_BACKFILL_MAX_DEPTH: u8 = 3;
+
+/// 跑一次搜索 `attempt`；若因 crop blueprint 缺数据失败（[`is_blueprint_cropped_err`]：本街 range
+/// 先验要查被裁街的 σ、而缓存里没有可复用的上一街子树解 → 档二′跨街后验不可得），则**补解紧前一街**
+/// （[`backfill_prev_street`]：截断到上一街起点的同手请求走 [`prewarm_inner`]，把上一街子树解进缓存），
+/// 再重试一次——重试时跨街后验从刚补的上一街解条件化得来，不读任何被裁街 σ。
+///
+/// 这是「从仍有数据的街界起点重新解」：上一街子树的先验只依赖更早的街（保留 / 或递归补解），与正常
+/// 流程里 hero 上一街决策时那次搜索同一机制、同一近似等级（不是均匀替代、也不丢弃上一街动作信息）。
+/// 补解不成 / 重试仍缺 → `Err("crop_no_posterior:…")`，调用方显式降级（check-when-free + 地板）。
+/// 其它失败原样返回。完整 blueprint（`blueprint_max_street = River`）下守卫恒不触发 → 恰调一次
+/// `attempt`，行为与引入本函数前相同。
+#[allow(clippy::too_many_arguments)]
+fn search_with_crop_backfill<T>(
+    game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    req: &Request,
+    base_seed: u64,
+    rt: &SearchRuntime,
+    solve_cache: &mut SubgameSolveCache,
+    depth: u8,
+    mut attempt: impl FnMut(&mut SubgameSolveCache) -> Result<T, String>,
+) -> Result<T, String> {
+    let reason = match attempt(solve_cache) {
+        Err(reason) if is_blueprint_cropped_err(&reason) => reason,
+        other => return other,
+    };
+    if depth >= CROP_BACKFILL_MAX_DEPTH {
+        return Err(format!("{CROP_NO_POSTERIOR}:max_depth:{reason}"));
+    }
+    let t0 = Instant::now();
+    let filled = backfill_prev_street(
+        game,
+        strategy_fn,
+        req,
+        base_seed,
+        rt,
+        solve_cache,
+        depth + 1,
+    );
+    eprintln!(
+        "[openpoker_advisor] crop backfill: board_len={} depth={} result={} wall_ms={}",
+        req.board.len(),
+        depth + 1,
+        match &filled {
+            Ok(()) => "stored".to_string(),
+            Err(e) => format!("failed:{e}"),
+        },
+        t0.elapsed().as_millis()
+    );
+    if let Err(e) = filled {
+        return Err(format!("{CROP_NO_POSTERIOR}:backfill:{e}"));
+    }
+    attempt(solve_cache).map_err(|e| {
+        if is_blueprint_cropped_err(&e) {
+            format!("{CROP_NO_POSTERIOR}:after_backfill:{e}")
+        } else {
+            e
+        }
+    })
+}
+
+/// 补解 `req` 所在街的**紧前一街**：把同手请求截断到上一街起点（[`truncate_request_to_street`]），
+/// 走 [`prewarm_inner`]（与正常预热同一条路径：锚定 / 脱锚分类、range 先验、key 计算全同源）把上一街
+/// 子树解存进缓存。成功 = `prewarm:stored`；其余（skip / err）→ `Err(source)`。
+#[allow(clippy::too_many_arguments)]
+fn backfill_prev_street(
+    game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    req: &Request,
+    base_seed: u64,
+    rt: &SearchRuntime,
+    solve_cache: &mut SubgameSolveCache,
+    depth: u8,
+) -> Result<(), String> {
+    let prev = match req.board.len() {
+        4 => poker::Street::Flop,
+        5 => poker::Street::Turn,
+        n => return Err(format!("no_prev_postflop_street(board_len={n})")),
+    };
+    let trunc = truncate_request_to_street(req, prev)?;
+    let resp = prewarm_inner(
+        game,
+        strategy_fn,
+        &trunc,
+        base_seed,
+        Some(rt),
+        solve_cache,
+        depth,
+    );
+    if resp.source == "prewarm:stored" {
+        Ok(())
+    } else {
+        Err(resp.source)
+    }
+}
+
+/// 把同手请求截断到 `target` 街**起点**：真栈重放（同 [`build_real_auth`] 口径：真栈 config +
+/// 幻影 fold + [`hist_to_concrete`]）到街首次变为 `target` 的那一刻，保留此前的动作、board 截到该街
+/// 长度。其余字段（hole / 座位 / 盲注 / stacks / dealt_seats / names）不变 → `hand_seed` 不变（同手）。
+/// 重放失败 / 没到达 `target` → `Err`。
+fn truncate_request_to_street(req: &Request, target: poker::Street) -> Result<Request, String> {
+    let solver_cfg = TableConfig::default_6max_100bb();
+    let solver_bb = solver_cfg.big_blind.as_u64();
+    if req.big_blind == 0 || solver_bb % req.big_blind != 0 {
+        return Err("truncate_bad_scale".into());
+    }
+    let scale = solver_bb / req.big_blind;
+    let smap = seat_map(req)?;
+    let real_cfg = real_stacks_config(req, &solver_cfg, scale, &smap)?;
+    let mut st = GameState::new(&real_cfg, REAL_REPLAY_SEED);
+    let apply = |st: &mut GameState, actor: u8, action: &str, to_op: Option<u64>| {
+        if st.current_player() != Some(SeatId(actor)) {
+            return Err("truncate_seat_mismatch".to_string());
+        }
+        let to_solver = match to_op.map(|t| t.checked_mul(scale)) {
+            Some(Some(v)) => Some(v),
+            Some(None) => return Err("truncate_to_overflow".to_string()),
+            None => None,
+        };
+        let concrete = hist_to_concrete(st, action, to_solver).ok_or("truncate_bad_hist")?;
+        st.apply(concrete)
+            .map_err(|_| "truncate_replay_illegal".to_string())
+    };
+    for &t in &smap.phantoms {
+        apply(&mut st, t, "fold", None)?;
+    }
+    let board_len = expected_board_len(target);
+    if req.board.len() < board_len {
+        return Err("truncate_board_too_short".into());
+    }
+    let cut = |n: usize| Request {
+        actions: req.actions[..n].to_vec(),
+        board: req.board[..board_len].to_vec(),
+        ..req.clone()
+    };
+    for (i, h) in req.actions.iter().enumerate() {
+        if st.street() == target {
+            return Ok(cut(i));
+        }
+        apply(&mut st, smap.tree_seat(h.seat)?, &h.action, h.to)?;
+    }
+    if st.street() == target {
+        return Ok(cut(req.actions.len()));
+    }
+    Err("truncate_target_street_not_reached".into())
 }
 
 /// 两态 lockstep 单步（真实动作与幻影 fold 共用，保两路不漂）。
@@ -1034,24 +1248,38 @@ fn decide(
         // 监控：本决策搜索墙钟（build+solve；预热命中 ≈0）+ 是否现 build（misses 涨 = MISS）。
         let t0 = Instant::now();
         let misses_before = solve_cache.misses();
-        match subgame_search_cached(
-            Some(solve_cache), // within-round solve 缓存：同手同街命中 → 复用 solve 只重导航。
-            &auth,
-            root_state,
+        // crop blueprint：本街 range 先验缺被裁街 σ（跨街后验不可得）→ 补解上一街后重试一次
+        // （search_with_crop_backfill doc）；完整 blueprint 下恰调一次（行为不变）。
+        let search_result = search_with_crop_backfill(
             game,
-            &legal_abs,
-            node_id,
             strategy_fn,
-            scfg,
-            // --search-bucket-table：子树 solve + hero 读数换独立桶表（None = blueprint 表）。
-            rt.bucket_table.as_ref(),
-            None, // depth_limit=false 解到终局 → 无 leaf_values（§2.1）。
-            // deep_menu mid-round（AllPostflop）导航：当前街真实动作序在子树上重放（缺口③细化）。
-            Some(&within),
-            cross_street, // 档二′-跨街复用（上一街子树 σ 后验 range，覆盖 blueprint estimate）。
-            hand_seed,
-            req.actions.len() as u64,
-        ) {
+            req,
+            base_seed,
+            rt,
+            solve_cache,
+            0,
+            |cache| {
+                subgame_search_cached(
+                    Some(cache), // within-round solve 缓存：同手同街命中 → 复用 solve 只重导航。
+                    &auth,
+                    root_state,
+                    game,
+                    &legal_abs,
+                    node_id,
+                    strategy_fn,
+                    scfg,
+                    // --search-bucket-table：子树 solve + hero 读数换独立桶表（None = blueprint 表）。
+                    rt.bucket_table.as_ref(),
+                    None, // depth_limit=false 解到终局 → 无 leaf_values（§2.1）。
+                    // deep_menu mid-round（AllPostflop）导航：当前街真实动作序在子树上重放（缺口③细化）。
+                    Some(&within),
+                    cross_street, // 档二′-跨街复用（上一街子树 σ 后验 range，覆盖 blueprint estimate）。
+                    hand_seed,
+                    req.actions.len() as u64,
+                )
+            },
+        );
+        match search_result {
             Ok(d) => {
                 // 遥测：本次决策用到的 solve 实际跑了多少 update（time_budget anytime 下
                 // 即「5s 内迭代数」；命中 = 复用 solve 的原始计数）+ 墙钟 + 缓存命中。
@@ -1075,6 +1303,7 @@ fn decide(
                 d
             }
             // 解不出来（建不了/未访问/失同步/限时连一轮迭代都未完成）→ check-when-free，不回落 blueprint。
+            // crop 缺后验（补解不成）单独分桶 `search_giveup:crop_no_posterior:*`。
             Err(reason) => {
                 // auth 已建（此 Err 分支未 move 走）→ 喂底池赔率 floor。
                 return fallback_with_floor(
@@ -1082,11 +1311,24 @@ fn decide(
                     hole,
                     &board,
                     pot_odds_from_auth(&auth, &solver_cfg),
-                    format!("search_giveup:unsolved:{reason}"),
+                    giveup_source("unsolved", &reason),
                 );
             }
         }
     } else {
+        // crop blueprint 守卫：不搜索的决策只能查保留街的 σ。启动期约束（validate_crop_runtime）
+        // 保证被裁街恒触发搜索，此处不可达；万一到达 → 显式兜底，绝不把缺失 σ 当均匀用。
+        // 完整 blueprint（River）恒不触发（byte-equal）。
+        let bp_max = search.map_or(StreetTag::River, |rt| rt.cfg.blueprint_max_street);
+        if !matches!(street_tag_of(street), Some(t) if t as u8 <= bp_max as u8) {
+            return fallback_with_floor(
+                &req.valid,
+                hole,
+                &board,
+                None,
+                format!("fallback:blueprint_cropped:{}", street_label(street)),
+            );
+        }
         blueprint_distribution(&info, &legal_abs, strategy_fn)
     };
 
@@ -1760,10 +2002,6 @@ fn decide_search_unanchored(
     let prefix_decisions = rt
         .unanchored_prefix_reach
         .then(|| synced_prefix_decisions(game, synced_node));
-    let prefix_reach = prefix_decisions.as_ref().map(|d| PrefixReach {
-        strategy: strategy_fn,
-        decisions: d,
-    });
     dlog!(
         "unanchored prefix_decisions: count={}",
         prefix_decisions.as_ref().map_or(0, |d| d.len())
@@ -1817,19 +2055,37 @@ fn decide_search_unanchored(
         });
     let t0 = Instant::now();
     let misses_before = solve_cache.misses();
-    let dist = match subgame_search_unanchored_cached_cross_exploit(
-        Some(solve_cache), // within-round solve 缓存（同锚定路径；kind 进 key、两路不串条目）。
-        &auth,
-        &round_start,
+    // crop blueprint：档一前缀含被裁街决策且跨街后验不可得 → 补解上一街后重试一次
+    // （search_with_crop_backfill doc）；完整 blueprint 下恰调一次（行为不变）。
+    let search_result = search_with_crop_backfill(
         game,
-        &within,
-        scfg,
-        rt.bucket_table.as_ref(), // --search-bucket-table：子树独立桶表（None = blueprint 表）。
-        prefix_reach,
-        cross_street,
-        exploit_prior, // 叠加剥削先验（None = 不剥削，byte-equal）。
-        hand_seed,
-    ) {
+        strategy_fn,
+        req,
+        base_seed,
+        rt,
+        solve_cache,
+        0,
+        |cache| {
+            let prefix_reach = prefix_decisions.as_ref().map(|d| PrefixReach {
+                strategy: strategy_fn,
+                decisions: d,
+            });
+            subgame_search_unanchored_cached_cross_exploit(
+                Some(cache), // within-round solve 缓存（同锚定路径；kind 进 key、两路不串条目）。
+                &auth,
+                &round_start,
+                game,
+                &within,
+                scfg,
+                rt.bucket_table.as_ref(), // --search-bucket-table：子树独立桶表（None = blueprint 表）。
+                prefix_reach,
+                cross_street,
+                exploit_prior, // 叠加剥削先验（None = 不剥削，byte-equal）。
+                hand_seed,
+            )
+        },
+    );
+    let dist = match search_result {
         Ok(d) => d,
         Err(reason) => {
             // auth 已建（真栈河牌决策态）→ 喂底池赔率 floor（用户场景：河牌 giveup 被它接住）。
@@ -1838,7 +2094,7 @@ fn decide_search_unanchored(
                 hole,
                 board,
                 pot_odds_from_auth(&auth, solver_cfg),
-                format!("search_giveup:unanchored:{reason}"),
+                giveup_source("unanchored", &reason),
             );
         }
     };
@@ -2011,11 +2267,192 @@ fn sample_seed(req: &Request, base_seed: u64) -> u64 {
 }
 
 // ===========================================================================
+// blueprint 访问面（完整 dense checkpoint / 按街裁切的 crop 文件）
+// ===========================================================================
+
+/// advisor 唯一的 blueprint 访问面：`decide` / `prewarm` / 搜索 range 先验拿到的 `strategy_fn`
+/// 全部经 [`Blueprint::strategy`]，game（树 / 抽象 / 桶表）经 [`Blueprint::game`]。
+///
+/// - [`Full`](Self::Full)（`--checkpoint`，dense ckpt `PLDNCKPT`）：`strategy` ≡ 原
+///   `trainer.average_strategy(*info)`，与引入本枚举前**逐位相同**。
+/// - [`Cropped`](Self::Cropped)（`--cropped-checkpoint`，`PLDNCROP`，[`CroppedBlueprint`]）：只含
+///   `street <= keep_through` 的行。保留街上 `strategy` 与完整 blueprint **逐位一致**（未访问 =
+///   空 Vec，同原 trainer 约定）。被裁掉的街**不应被查询**：转牌 / 河牌由实时搜索接管（启动期
+///   [`validate_crop_runtime`] 强制），搜索 range 先验在 `blueprint_max_street` 守卫下不查被裁街
+///   （[`poker::training::subgame::BLUEPRINT_CROPPED_ERR`]），blueprint 路径在 [`decide`] 里显式拦。
+///   万一仍被查到（= 守卫有洞），`strategy` 计入 `cropped_queries` 并返回空 Vec；主循环见计数变化
+///   即**作废该请求的输出**（换显式兜底 + 清 solve 缓存，[`run`]）——绝不把缺失 σ 当均匀悄悄用掉。
+// 进程内只有一个实例、常驻整个生命周期 → 变体尺寸差无所谓。
+#[allow(clippy::large_enum_variant)]
+enum Blueprint {
+    Full(Box<DenseNlheEsMccfrTrainer>),
+    Cropped {
+        bp: CroppedBlueprint,
+        game: SimplifiedNlheGame,
+        /// 查询落在被裁街的累计次数（安全网；正常恒 0）。
+        cropped_queries: AtomicU64,
+    },
+}
+
+impl Blueprint {
+    fn game(&self) -> &SimplifiedNlheGame {
+        match self {
+            Blueprint::Full(t) => t.game(),
+            Blueprint::Cropped { game, .. } => game,
+        }
+    }
+
+    fn update_count(&self) -> u64 {
+        match self {
+            Blueprint::Full(t) => t.update_count(),
+            Blueprint::Cropped { bp, .. } => bp.update_count(),
+        }
+    }
+
+    /// σ 可查询到哪条街（含）：完整 = `River`；crop = 文件的 `keep_through`。搜索运行时据此填
+    /// [`SubgameSearchConfig::blueprint_max_street`]。
+    fn keep_through(&self) -> StreetTag {
+        match self {
+            Blueprint::Full(_) => StreetTag::River,
+            Blueprint::Cropped { bp, .. } => bp.keep_through(),
+        }
+    }
+
+    /// 安全网计数（完整 blueprint 恒 0）。
+    fn cropped_queries(&self) -> u64 {
+        match self {
+            Blueprint::Full(_) => 0,
+            Blueprint::Cropped {
+                cropped_queries, ..
+            } => cropped_queries.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// `strategy_fn` 的实现（见类型 doc）。
+    fn strategy(&self, info: &InfoSetId) -> Vec<f64> {
+        match self {
+            Blueprint::Full(t) => t.average_strategy(*info),
+            Blueprint::Cropped {
+                bp,
+                cropped_queries,
+                ..
+            } => bp.average_strategy(*info).unwrap_or_else(|| {
+                // 只在首次打全量信息（range 估计一次会扫 1326 组合，逐条打会刷屏）；每个受影响请求
+                // 另由主循环打一行汇总。
+                let prev = cropped_queries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if prev == 0 {
+                    eprintln!(
+                    "[openpoker_advisor] CROP VIOLATION: 查询了被裁掉街的 infoset {}（keep_through={:?}），\
+                     本请求输出将作废",
+                    info.raw(),
+                    bp.keep_through()
+                    );
+                }
+                Vec::new()
+            }),
+        }
+    }
+}
+
+/// 文件 magic 前 8 字节（错用 `--checkpoint` / `--cropped-checkpoint` 时给可读提示用）。
+fn sniff_magic(path: &std::path::Path) -> Option<[u8; 8]> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut m = [0u8; 8];
+    f.read_exact(&mut m).ok()?;
+    Some(m)
+}
+
+/// 加载 blueprint：`cropped = false` → 完整 dense ckpt；`true` → crop 文件。两者都用同一
+/// `game`（[`six_max_reshape`] 重建的树）做 layout 指纹校验，不符即拒绝。
+fn load_blueprint(
+    path: &std::path::Path,
+    game: SimplifiedNlheGame,
+    cropped: bool,
+) -> Result<Blueprint, String> {
+    let hint = match (cropped, sniff_magic(path)) {
+        (false, Some(m)) if &m == b"PLDNCROP" => "（这是 crop 文件，请改用 --cropped-checkpoint）",
+        (true, Some(m)) if &m == b"PLDNCKPT" => {
+            "（这是完整 dense checkpoint，请改用 --checkpoint）"
+        }
+        _ => "",
+    };
+    if cropped {
+        let bp = CroppedBlueprint::load(path, &game).map_err(|e| {
+            format!(
+                "load cropped blueprint {} failed{hint}: {e:?}",
+                path.display()
+            )
+        })?;
+        Ok(Blueprint::Cropped {
+            bp,
+            game,
+            cropped_queries: AtomicU64::new(0),
+        })
+    } else {
+        let t = DenseNlheEsMccfrTrainer::load_checkpoint(path, game)
+            .map_err(|e| format!("load checkpoint {} failed{hint}: {e:?}", path.display()))?;
+        Ok(Blueprint::Full(Box::new(t)))
+    }
+}
+
+/// crop blueprint 的启动期约束（违反 = 直接报错退出，不静默降级）。`keep_through` = crop 保留到哪条
+/// 街；`search` = 搜索运行时（crop 必须开 `--search`，parse 期已拦，这里再守一层）。
+///
+/// 决策点在街 S 的数据需求：S ≤ keep_through 才能走 blueprint σ；S > keep_through 必须实时搜索；
+/// 搜索的 range 先验要查 S 之前各街 σ，S−1 > keep_through 时只能靠档二′跨街后验（上一街子树 σ）。
+/// 由此：
+/// - keep_through < River → `--search-trigger all-postflop`（FlopFirstUnraised 让 turn/river 走 blueprint）；
+/// - keep_through < Turn → 档二′跨街复用必须开（river 先验不能读 turn σ）；
+/// - keep_through < Flop → `--search-flop-prefer-blueprint` 不可开（它让 flop 锚定面走 blueprint）；
+/// - `depth_limit`（叶子续局值表要全树 blueprint）/ `CurrentDecision`（range 含当前街 σ）不支持。
+fn validate_crop_runtime(
+    keep_through: StreetTag,
+    search: Option<&SearchRuntime>,
+) -> Result<(), String> {
+    let Some(rt) = search else {
+        return Err("crop blueprint 需要 --search（被裁掉的街只能实时搜索）".to_string());
+    };
+    let k = keep_through as u8;
+    if k < StreetTag::River as u8 && rt.cfg.trigger != SearchTrigger::AllPostflop {
+        return Err(format!(
+            "crop blueprint 只保留到 {keep_through:?}：需要 --search-trigger all-postflop（被裁街的每个决策都必须实时搜索）"
+        ));
+    }
+    if k < StreetTag::Turn as u8 && !rt.unanchored_cross_street {
+        return Err(format!(
+            "crop blueprint 只保留到 {keep_through:?}：不能 --search-unanchored-cross-street off（河牌 range 先验只能来自上一街子树后验）"
+        ));
+    }
+    if k < StreetTag::Flop as u8 && rt.flop_prefer_blueprint {
+        return Err(format!(
+            "crop blueprint 只保留到 {keep_through:?}：不能 --search-flop-prefer-blueprint on（翻牌无 blueprint 数据）"
+        ));
+    }
+    if rt.cfg.depth_limit || rt.cfg.resolve_root != ResolveRoot::RoundStart {
+        return Err("crop blueprint 只支持 RoundStart + 解到终局的搜索".to_string());
+    }
+    if rt.cfg.blueprint_max_street != keep_through {
+        return Err(format!(
+            "内部错误：搜索 blueprint_max_street={:?} ≠ crop keep_through={keep_through:?}",
+            rt.cfg.blueprint_max_street
+        ));
+    }
+    Ok(())
+}
+
+// ===========================================================================
 // blueprint 加载 + ready + stdio 主循环
 // ===========================================================================
 
 struct Args {
+    /// blueprint 文件路径：`--checkpoint`（完整 dense ckpt）与 `--cropped-checkpoint`（按街裁切的
+    /// crop 文件，[`Blueprint::Cropped`]）**二选一**。
     checkpoint: PathBuf,
+    /// `true` = 路径来自 `--cropped-checkpoint`。显式分开两个 flag（而非按 magic 自动识别）：crop
+    /// 模式要求「被裁街必须实时搜索」等一组启动约束（[`validate_crop_runtime`]），由操作者显式
+    /// 选择更不易误用；错用时按 magic 给出改用另一 flag 的提示（[`load_blueprint`]）。
+    cropped: bool,
     bucket_table: PathBuf,
     reshape: String,
     postflop_cap: u8,
@@ -2060,8 +2497,14 @@ struct ReadyLine {
     n_seats: usize,
     /// 缺口②：是否开了实时搜索（driver 据此知道 source 可能是 `search` / `search_fold:*`）。
     search: bool,
+    /// crop blueprint 时 = 保留到哪条街（如 `"Flop"`）；完整 blueprint = `None`（serde skip →
+    /// ready 行与旧版逐字节相同）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blueprint_keep_through: Option<String>,
 }
 
+/// `--reshape` → 树定义：与 `train_cfr` / `nlhe_dense_crop` 共用 [`six_max_reshape`]，保证加载时
+/// 重建的树与训练时同一定义（checkpoint / crop 的 layout 指纹再兜底校验）。
 fn reshape_profile(
     reshape: &str,
     cap: u8,
@@ -2072,17 +2515,8 @@ fn reshape_profile(
     ),
     String,
 > {
-    Ok(match reshape {
-        "none" => first_small_6max(cap),
-        "nolimp" => {
-            let (a, mut r) = first_small_6max(cap);
-            r.no_open_limp = true;
-            (a, r)
-        }
-        "preopen" => first_small_preopen_6max(cap),
-        "preopen-small" => first_small_preopen_small_6max(cap),
-        other => return Err(format!("unknown reshape {other}")),
-    })
+    six_max_reshape(reshape, cap)
+        .ok_or_else(|| format!("unknown reshape {reshape} (expected {SIX_MAX_RESHAPE_NAMES})"))
 }
 
 fn main() -> ExitCode {
@@ -2153,14 +2587,9 @@ fn run() -> Result<(), String> {
         rules,
     )
     .map_err(|e| format!("build six-max game failed: {e:?}"))?;
-    let trainer =
-        DenseNlheEsMccfrTrainer::load_checkpoint(&args.checkpoint, game).map_err(|e| {
-            format!(
-                "load checkpoint {} failed: {e:?}",
-                args.checkpoint.display()
-            )
-        })?;
-    let game = trainer.game();
+    // blueprint 访问面（Blueprint doc）：完整 ckpt 或 crop 文件，二者都用同一 game 校验 layout 指纹。
+    let blueprint = load_blueprint(&args.checkpoint, game, args.cropped)?;
+    let game = blueprint.game();
     let abstraction = game.abstraction().clone();
 
     // --search-bucket-table：子树 solve 的独立桶表（SearchRuntime doc）。启动期 open（坏路径
@@ -2174,7 +2603,12 @@ fn run() -> Result<(), String> {
                 None => None,
             };
             Some(SearchRuntime {
-                cfg,
+                // blueprint σ 覆盖街：完整 = River（默认值，行为不变）；crop = keep_through
+                // （range 先验不得查被裁街，SubgameSearchConfig::blueprint_max_street doc）。
+                cfg: SubgameSearchConfig {
+                    blueprint_max_street: blueprint.keep_through(),
+                    ..cfg
+                },
                 bucket_table,
                 unanchored_prefix_reach: args.search_unanchored_prefix_reach,
                 unanchored_cross_street: args.search_unanchored_cross_street,
@@ -2186,12 +2620,24 @@ fn run() -> Result<(), String> {
         None => None,
     };
 
+    // crop 启动期约束（validate_crop_runtime doc）：不满足直接报错退出，不静默降级。
+    if let Blueprint::Cropped { bp, .. } = &blueprint {
+        validate_crop_runtime(bp.keep_through(), search_rt.as_ref())?;
+        eprintln!(
+            "[openpoker_advisor] cropped blueprint: keep_through={:?} has_regret={}（被裁街全部实时搜索；\
+             river 先验 = 上一街子树后验，缺失时按需补解上一街）",
+            bp.keep_through(),
+            bp.has_regret()
+        );
+    }
     let ready = ReadyLine {
         ready: true,
-        update_count: trainer.update_count(),
+        update_count: blueprint.update_count(),
         reshape: args.reshape.clone(),
         n_seats: N_SEATS,
         search: search_rt.is_some(),
+        blueprint_keep_through: matches!(blueprint, Blueprint::Cropped { .. })
+            .then(|| format!("{:?}", blueprint.keep_through())),
     };
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
@@ -2238,7 +2684,7 @@ fn run() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     stdout.flush().map_err(|e| e.to_string())?;
 
-    let strategy_fn = |info: &InfoSetId, _n: usize| -> Vec<f64> { trainer.average_strategy(*info) };
+    let strategy_fn = |info: &InfoSetId, _n: usize| -> Vec<f64> { blueprint.strategy(info) };
 
     // within-round solve 缓存（进程常驻，跨请求）：同手同街第二次决策命中 → 复用 solve 只重
     // 导航——恢复「每轮恰好一个 solve」一致性（time_budget anytime 下重解会读不同均衡）+
@@ -2253,6 +2699,7 @@ fn run() -> Result<(), String> {
         // 信封判别（RequestEnvelope doc）：observe = 每手结束的画像观测（喂 Profiler、返回遥测、
         // driver 丢弃）；prewarm = 街起点预热（不出动作、只暖 solve 缓存）；否则决策请求。
         // 必有一行响应（IPC 锁步）。
+        let violations_before = blueprint.cropped_queries();
         let envelope = serde_json::from_str::<RequestEnvelope>(&line).ok();
         let is_observe = envelope.as_ref().map(|e| e.observe).unwrap_or(false);
         let is_prewarm = envelope.as_ref().map(|e| e.prewarm).unwrap_or(false);
@@ -2296,6 +2743,28 @@ fn run() -> Result<(), String> {
                 },
             }
         };
+        // crop 安全网（Blueprint doc）：本请求查到了被裁掉的街 = 守卫有洞，输出建立在缺失的 σ 上 →
+        // 作废：决策换显式兜底、预热标 err；清 solve 缓存（被污染的 range 可能已入缓存，跨街复用会
+        // 继续传染）。完整 blueprint 计数恒 0、此分支不可达（byte-equal）。
+        let resp = if blueprint.cropped_queries() != violations_before {
+            eprintln!(
+                "[openpoker_advisor] CROP VIOLATION: 本请求查询被裁街 {} 次 → 输出作废（原 source={}），清 solve 缓存",
+                blueprint.cropped_queries() - violations_before,
+                resp.source
+            );
+            solve_cache = SubgameSolveCache::new();
+            match serde_json::from_str::<Request>(&line) {
+                Ok(_) if is_prewarm => Response {
+                    action: "none".into(),
+                    source: "prewarm:err:crop_violation".into(),
+                    ..Default::default()
+                },
+                Ok(req) => safe_fallback(&req.valid, "crop_violation"),
+                Err(_) => resp,
+            }
+        } else {
+            resp
+        };
         writeln!(
             stdout,
             "{}",
@@ -2313,6 +2782,7 @@ fn parse_args() -> Result<Args, String> {
 
 fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut checkpoint: Option<PathBuf> = None;
+    let mut cropped_checkpoint: Option<PathBuf> = None;
     let mut bucket_table: Option<PathBuf> = None;
     let mut reshape = "preopen".to_string();
     let mut postflop_cap = 3u8;
@@ -2344,6 +2814,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
+            "--cropped-checkpoint" => {
+                cropped_checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?))
+            }
             "--bucket-table" => bucket_table = Some(PathBuf::from(next_val(&mut it, &arg)?)),
             "--reshape" => reshape = next_val(&mut it, &arg)?,
             "--postflop-cap" => {
@@ -2575,6 +3048,24 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     if exploit_on && search.is_none() {
         return Err("--exploit on|vpip 需配合 --search（剥削只挂脱锚搜索路径）".to_string());
     }
+    // blueprint 来源二选一；crop 必须配 --search（被裁掉的街只能实时搜索；街级约束要读 crop 的
+    // keep_through，加载后由 validate_crop_runtime 再查）。
+    let (checkpoint, cropped) = match (checkpoint, cropped_checkpoint) {
+        (Some(p), None) => (p, false),
+        (None, Some(p)) => {
+            if search.is_none() {
+                return Err(
+                    "--cropped-checkpoint 需要配合 --search（转牌 / 河牌没有 blueprint 数据，必须实时搜索；拒绝静默降级）"
+                        .to_string(),
+                );
+            }
+            (p, true)
+        }
+        (Some(_), Some(_)) => {
+            return Err("--checkpoint 与 --cropped-checkpoint 只能二选一".to_string())
+        }
+        (None, None) => return Err("缺 --checkpoint（或 --cropped-checkpoint）".to_string()),
+    };
     let exploit = exploit_on.then(|| {
         let d = ExploitConfig::default();
         ExploitConfig {
@@ -2587,7 +3078,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         }
     });
     Ok(Args {
-        checkpoint: checkpoint.ok_or("缺 --checkpoint")?,
+        checkpoint,
+        cropped,
         bucket_table: bucket_table.ok_or("缺 --bucket-table")?,
         reshape,
         postflop_cap,
@@ -2620,6 +3112,7 @@ fn next_val(it: &mut impl Iterator<Item = String>, name: &str) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use poker::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_6max};
     use poker::BucketConfig;
 
     /// 把纯 config 包成 [`SearchRuntime`]（子树桶表 = None，沿用 blueprint 表——既有搜索测试
@@ -5463,5 +5956,662 @@ mod tests {
             &mut cache2,
         );
         assert_eq!(r_turn, r_turn2, "跨街复用 turn 决策须可复现");
+    }
+
+    // =======================================================================
+    // crop blueprint（--cropped-checkpoint）：翻前 / 翻牌逐位等价 + 转牌 / 河牌只走搜索
+    // =======================================================================
+
+    use poker::training::nlhe_betting_tree::all_1pot_6max;
+    use poker::training::nlhe_dense_crop::{crop_dense_checkpoint, CropOptions};
+
+    /// crop 测试小 game：advisor 写死 6 座 100BB（N_SEATS / default_6max_100bb）→ 6-max 100BB +
+    /// all-1pot N=2（dense 两表 ≈ 49 MiB）+ stub 200 桶（postflop 全落桶 0 → 小训练量即覆盖 flop/turn/river
+    /// 节点，等价性不空验）。`--reshape all-1pot --postflop-cap 2` 的同一棵树（[`reshape_profile`]）。
+    fn crop_test_game() -> SimplifiedNlheGame {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let (abs, rules) = reshape_profile("all-1pot", 2).expect("all-1pot");
+        let g = SimplifiedNlheGame::new_with_abstraction(
+            Arc::clone(&table),
+            TableConfig::default_6max_100bb(),
+            abs,
+            rules,
+        )
+        .expect("all-1pot 6max game");
+        let (a2, r2) = all_1pot_6max(2);
+        let direct = SimplifiedNlheGame::new_with_abstraction(
+            table,
+            TableConfig::default_6max_100bb(),
+            a2,
+            r2,
+        )
+        .expect("direct");
+        assert_eq!(
+            g.tree().num_nodes(),
+            direct.tree().num_nodes(),
+            "advisor reshape 须与 all_1pot_6max 同一树定义"
+        );
+        g
+    }
+
+    /// 测试临时目录：drop（含 panic 展开）时删除，失败的测试不留 ~50 MiB 残留。
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    /// 一次性造 full ckpt + crop(keep_through=Flop, 不留 regret)，返回 (dir 守卫, full, crop)。
+    /// LCFR period 小 → 表处于 lazy scale != 1 状态（覆盖「写逻辑值」与查询一致性）。
+    fn crop_fixture(tag: &str) -> (TempDir, PathBuf, PathBuf) {
+        let mut t = DenseNlheEsMccfrTrainer::new(crop_test_game(), 7).with_lcfr_period(500);
+        let mut rng = ChaCha20Rng::from_seed(0xC0_0001);
+        for _ in 0..2_000 {
+            t.step(&mut rng).expect("step");
+        }
+        let dir = std::env::temp_dir().join(format!("advisor_crop_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let full = dir.join("full.ckpt");
+        let crop = dir.join("pf.crop");
+        t.save_checkpoint(&full).expect("save");
+        crop_dense_checkpoint(
+            &full,
+            &crop,
+            t.game(),
+            CropOptions {
+                keep_through: StreetTag::Flop,
+                keep_regret: false,
+            },
+        )
+        .expect("crop");
+        (TempDir(dir), full, crop)
+    }
+
+    fn bits_eq(a: &[f64], b: &[f64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    fn ha(seat: u8, action: &str, to: Option<u64>) -> HistAction {
+        HistAction {
+            seat,
+            action: action.into(),
+            to,
+        }
+    }
+
+    /// SB-vs-BB 线（button=0；UTG/HJ/CO/BTN fold，SB complete、BB check）。我 = SB(seat1)，postflop
+    /// 每街首个行动者。`extra` = flop 起的后续动作，`board` 决定街。对称 100BB（无 stacks → 锚定路径）。
+    fn sb_line_req(
+        hole: [&str; 2],
+        board: &[&str],
+        extra: &[HistAction],
+        valid: ValidActions,
+    ) -> Request {
+        let mut actions = vec![
+            ha(3, "fold", None),
+            ha(4, "fold", None),
+            ha(5, "fold", None),
+            ha(0, "fold", None),
+            ha(1, "call", Some(20)),
+            ha(2, "check", None),
+        ];
+        actions.extend_from_slice(extra);
+        Request {
+            hole: hole.iter().map(|c| c.to_string()).collect(),
+            board: board.iter().map(|c| c.to_string()).collect(),
+            button_seat: 0,
+            my_seat: 1,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions,
+            valid,
+            stacks: vec![],
+            dealt_seats: vec![],
+            names: Default::default(),
+        }
+    }
+
+    fn check_valid() -> ValidActions {
+        ValidActions {
+            can_check: true,
+            can_call: false,
+            can_raise: true,
+            min_raise: Some(20),
+            max_raise: Some(1980),
+        }
+    }
+
+    /// 同手四个决策：flop 首点 / turn 首点 / river 首点 / river 面对 1pot 下注（mid-round）。
+    fn sb_line_hand(hole: [&str; 2]) -> Vec<Request> {
+        let flop = ["7h", "2c", "Ks"];
+        let turn = ["7h", "2c", "Ks", "4d"];
+        let river = ["7h", "2c", "Ks", "4d", "9s"];
+        let flop_x = [ha(1, "check", None), ha(2, "check", None)];
+        let turn_x = [flop_x.as_slice(), &flop_x].concat();
+        let river_bet = [
+            turn_x.as_slice(),
+            &[ha(1, "check", None), ha(2, "raise", Some(40))],
+        ]
+        .concat();
+        vec![
+            sb_line_req(hole, &flop, &[], check_valid()),
+            sb_line_req(hole, &turn, &flop_x, check_valid()),
+            sb_line_req(hole, &river, &turn_x, check_valid()),
+            sb_line_req(
+                hole,
+                &river,
+                &river_bet,
+                ValidActions {
+                    can_check: false,
+                    can_call: true,
+                    can_raise: true,
+                    min_raise: Some(80),
+                    max_raise: Some(1980),
+                },
+            ),
+        ]
+    }
+
+    fn crop_rt(bp: &Blueprint, cfg: SubgameSearchConfig) -> SearchRuntime {
+        SearchRuntime {
+            cfg: SubgameSearchConfig {
+                blueprint_max_street: bp.keep_through(),
+                ..cfg
+            },
+            bucket_table: None,
+            unanchored_prefix_reach: DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH,
+            unanchored_cross_street: DEFAULT_SEARCH_UNANCHORED_CROSS_STREET,
+            flop_prefer_blueprint: false,
+            exploit: None,
+        }
+    }
+
+    fn crop_scfg() -> SubgameSearchConfig {
+        SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::AllPostflop,
+            max_subtree_nodes: 1_000_000,
+            range_uniform_mix: DEFAULT_SEARCH_RANGE_UNIFORM_MIX,
+            ..SubgameSearchConfig::default()
+        }
+    }
+
+    /// ① 翻前 / 翻牌：crop 与完整 blueprint **逐位一致**——(a) 底层 σ（`Blueprint::strategy`）在翻前 /
+    /// 翻牌各决策 infoset 上 to_bits 相等且非空（非空验）；(b) advisor 输出（`Response` 全字段：
+    /// 动作 / 金额 / probs / chosen / info_set / solve_updates）在 blueprint 路径（翻前、翻牌不搜、翻牌
+    /// `flop_prefer_blueprint`）与翻牌锚定搜索路径（range 先验读翻前 σ）+ 翻牌预热上全等；(c) 全程
+    /// crop 安全网计数 0。另：被裁街 `strategy` 计数（安全网自检）、错用 flag 的 magic 提示。
+    #[test]
+    fn cropped_blueprint_preflop_flop_bitwise_equal() {
+        let (_dir, full_p, crop_p) = crop_fixture("eq");
+        let full = load_blueprint(&full_p, crop_test_game(), false).expect("load full");
+        let crop = load_blueprint(&crop_p, crop_test_game(), true).expect("load crop");
+        assert_eq!(crop.keep_through(), StreetTag::Flop);
+        assert_eq!(full.update_count(), crop.update_count());
+        let game = full.game();
+        let abs = game.abstraction().clone();
+        let sf = |i: &InfoSetId, _n: usize| full.strategy(i);
+        let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);
+
+        // 翻前决策：UTG 首动 / BTN 面对 3 家 fold / SB 面对 BTN open。
+        let pre_reqs = [
+            (3u8, vec![]),
+            (
+                0,
+                vec![
+                    ha(3, "fold", None),
+                    ha(4, "fold", None),
+                    ha(5, "fold", None),
+                ],
+            ),
+            (
+                1,
+                vec![
+                    ha(3, "fold", None),
+                    ha(4, "fold", None),
+                    ha(5, "fold", None),
+                    ha(0, "raise", Some(70)),
+                ],
+            ),
+        ];
+        let mut nonvacuous = 0;
+        for hole in [["Ah", "Kd"], ["7c", "2d"], ["Qs", "Qh"], ["9h", "8h"]] {
+            for (my_seat, actions) in &pre_reqs {
+                let mut req = sb_line_req(hole, &[], &[], full_valid());
+                req.my_seat = *my_seat;
+                req.actions = actions.clone();
+                // σ 逐位（经 lockstep 取该决策的真 infoset）。
+                let smap = seat_map(&req).expect("seat map");
+                let (_real, ab) = lockstep_replay(
+                    game,
+                    &TableConfig::default_6max_100bb(),
+                    &smap,
+                    &req,
+                    5,
+                    0,
+                    Some(SeatId(smap.tree_seat(*my_seat).unwrap())),
+                )
+                .unwrap_or_else(|e| panic!("preflop 重放应 Ok: {}", e.reason));
+                let hole_c = [parse_card(hole[0]).unwrap(), parse_card(hole[1]).unwrap()];
+                let info = game.info_set_for_cards(ab.current_node_id, hole_c, &[]);
+                assert_eq!(info.street_tag(), StreetTag::Preflop);
+                let (a, b) = (full.strategy(&info), crop.strategy(&info));
+                assert!(
+                    bits_eq(&a, &b),
+                    "翻前 σ 须逐位一致 @ {hole:?} seat{my_seat}"
+                );
+                nonvacuous += usize::from(!a.is_empty());
+                for search in [None, Some(crop_rt(&full, crop_scfg()))] {
+                    let rt_c = search.as_ref().map(|_| crop_rt(&crop, crop_scfg()));
+                    let rf = decide(
+                        game,
+                        &abs,
+                        &sf,
+                        &req,
+                        0x5EED,
+                        search.as_ref(),
+                        &mut SubgameSolveCache::new(),
+                    );
+                    let rc = decide(
+                        game,
+                        &abs,
+                        &sc,
+                        &req,
+                        0x5EED,
+                        rt_c.as_ref(),
+                        &mut SubgameSolveCache::new(),
+                    );
+                    assert_eq!(rf, rc, "翻前 advisor 输出须全等 @ {hole:?} seat{my_seat}");
+                    assert_eq!(rf.source, "blueprint");
+                }
+            }
+        }
+        assert!(
+            nonvacuous >= 6,
+            "翻前 σ 大多应已被训练访问（否则等价性是空验）: {nonvacuous}"
+        );
+
+        // 翻牌：σ 逐位 + blueprint 路径（不搜 / flop_prefer_blueprint）+ 锚定搜索 + 预热 全等。
+        for hole in [["Ah", "Kd"], ["7c", "2d"], ["Qs", "Qh"]] {
+            let flop_req = &sb_line_hand(hole)[0];
+            let smap = seat_map(flop_req).unwrap();
+            let (_real, ab) = lockstep_replay(
+                game,
+                &TableConfig::default_6max_100bb(),
+                &smap,
+                flop_req,
+                5,
+                3,
+                Some(SeatId(1)),
+            )
+            .unwrap_or_else(|e| panic!("flop 重放应 Ok: {}", e.reason));
+            let hole_c = [parse_card(hole[0]).unwrap(), parse_card(hole[1]).unwrap()];
+            let board: Vec<Card> = flop_req
+                .board
+                .iter()
+                .map(|c| parse_card(c).unwrap())
+                .collect();
+            let info = game.info_set_for_cards(ab.current_node_id, hole_c, &board);
+            assert_eq!(info.street_tag(), StreetTag::Flop);
+            let (a, b) = (full.strategy(&info), crop.strategy(&info));
+            assert!(!a.is_empty(), "翻牌 infoset 应已被训练访问（stub 桶）");
+            assert!(bits_eq(&a, &b), "翻牌 σ 须逐位一致 @ {hole:?}");
+
+            let prefer = |bp: &Blueprint| SearchRuntime {
+                flop_prefer_blueprint: true,
+                ..crop_rt(bp, crop_scfg())
+            };
+            let rf = decide(
+                game,
+                &abs,
+                &sf,
+                flop_req,
+                0x5EED,
+                None,
+                &mut SubgameSolveCache::new(),
+            );
+            let rc = decide(
+                game,
+                &abs,
+                &sc,
+                flop_req,
+                0x5EED,
+                Some(&prefer(&crop)),
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(rf.source, "blueprint");
+            assert_eq!(rf, rc, "翻牌 blueprint 路径须全等 @ {hole:?}");
+
+            let (rt_f, rt_c) = (crop_rt(&full, crop_scfg()), crop_rt(&crop, crop_scfg()));
+            let rf = decide(
+                game,
+                &abs,
+                &sf,
+                flop_req,
+                0x5EED,
+                Some(&rt_f),
+                &mut SubgameSolveCache::new(),
+            );
+            let rc = decide(
+                game,
+                &abs,
+                &sc,
+                flop_req,
+                0x5EED,
+                Some(&rt_c),
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(rf.source, "search", "翻牌锚定搜索应解成功：{rf:?}");
+            assert_eq!(rf, rc, "翻牌搜索输出须全等 @ {hole:?}");
+
+            let (mut cf, mut cc) = (SubgameSolveCache::new(), SubgameSolveCache::new());
+            let pf = prewarm(game, &sf, flop_req, 0x5EED, Some(&rt_f), &mut cf);
+            let pc = prewarm(game, &sc, flop_req, 0x5EED, Some(&rt_c), &mut cc);
+            assert_eq!(pf.source, "prewarm:stored");
+            assert_eq!(pf, pc, "翻牌预热须全等");
+            let rf = decide(game, &abs, &sf, flop_req, 0x5EED, Some(&rt_f), &mut cf);
+            let rc = decide(game, &abs, &sc, flop_req, 0x5EED, Some(&rt_c), &mut cc);
+            assert_eq!((cf.hits(), cc.hits()), (1, 1), "预热后决策须命中");
+            assert_eq!(rf, rc);
+        }
+        assert_eq!(crop.cropped_queries(), 0, "翻前 / 翻牌全程不应查询被裁街");
+
+        // 安全网自检：直接查被裁街 → 空 Vec + 计数（主循环据此作废输出）。
+        let tree = game.tree();
+        let turn_node = (0..tree.num_nodes() as NodeId)
+            .find(|&id| tree.node(id).street == StreetTag::Turn)
+            .expect("树有 turn 节点");
+        let turn_board: Vec<Card> = ["7h", "2c", "Ks", "4d"]
+            .iter()
+            .map(|c| parse_card(c).unwrap())
+            .collect();
+        let hole_c = [parse_card("Ah").unwrap(), parse_card("Kd").unwrap()];
+        let turn_info = game.info_set_for_cards(turn_node, hole_c, &turn_board);
+        assert_eq!(turn_info.street_tag(), StreetTag::Turn);
+        assert!(crop.strategy(&turn_info).is_empty());
+        assert_eq!(crop.cropped_queries(), 1);
+        assert!(!full.strategy(&turn_info).is_empty() || full.cropped_queries() == 0);
+
+        // 错用 flag：crop 文件走 --checkpoint / 完整 ckpt 走 --cropped-checkpoint → 拒绝 + 提示。
+        let e = load_blueprint(&crop_p, crop_test_game(), false)
+            .err()
+            .expect("crop 当完整加载须失败");
+        assert!(e.contains("--cropped-checkpoint"), "{e}");
+        let e = load_blueprint(&full_p, crop_test_game(), true)
+            .err()
+            .expect("完整当 crop 加载须失败");
+        assert!(e.contains("--checkpoint"), "{e}");
+    }
+
+    /// ② 转牌 / 河牌：crop 下全部走实时搜索、全程**零**被裁街查询。
+    /// (a) 完整一手（flop → turn → river 首点 → river 面对下注，共享 solve 缓存 = 生产顺序）：每决策
+    ///     `source=search`，且与完整 blueprint 同序列**逐字节相同**（river 先验 = turn 子树跨街后验，
+    ///     两边都不读 turn σ；turn 先验只读翻前 + 翻牌 σ，逐位一致）。
+    /// (b) 依赖确实存在（非空验）：完整 blueprint + **空缓存**直接问 river → range 先验读了 turn σ
+    ///     （计数 > 0）——这正是 crop 必须绕开的读取。
+    /// (c) crop + 空缓存直接问 river（跨街后验不可得）→ 按需补解 turn（预热路径）后重试：
+    ///     `source=search`，缓存 2 次 miss（turn 补解 + river），零被裁街查询；关掉跨街复用则无法补救 →
+    ///     `search_giveup:crop_no_posterior:*`（显式降级，不读 turn σ、不退均匀）。
+    /// (d) blueprint 路径守卫：crop + 只搜 flop 的触发面（启动期本会拒绝）问 turn → 显式
+    ///     `fallback:blueprint_cropped:turn`，不查 σ。
+    #[test]
+    fn cropped_blueprint_turn_river_search_only() {
+        let (_dir, full_p, crop_p) = crop_fixture("tr");
+        let full = load_blueprint(&full_p, crop_test_game(), false).expect("load full");
+        let crop = load_blueprint(&crop_p, crop_test_game(), true).expect("load crop");
+        let game = crop.game();
+        let abs = game.abstraction().clone();
+        let sf = |i: &InfoSetId, _n: usize| full.strategy(i);
+        let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);
+        let (rt_f, rt_c) = (crop_rt(&full, crop_scfg()), crop_rt(&crop, crop_scfg()));
+        validate_crop_runtime(crop.keep_through(), Some(&rt_c)).expect("生产约束满足");
+
+        // (a) 完整一手。
+        for hole in [["Ah", "Kd"], ["Qs", "Qh"]] {
+            let hand = sb_line_hand(hole);
+            let (mut cf, mut cc) = (SubgameSolveCache::new(), SubgameSolveCache::new());
+            for (k, req) in hand.iter().enumerate() {
+                let rf = decide(game, &abs, &sf, req, 0xBEEF, Some(&rt_f), &mut cf);
+                let rc = decide(game, &abs, &sc, req, 0xBEEF, Some(&rt_c), &mut cc);
+                assert_eq!(
+                    rc.source, "search",
+                    "决策 {k}（{hole:?}）crop 须走搜索：{rc:?}"
+                );
+                assert!(is_legal(&rc, &req.valid));
+                assert_eq!(rf, rc, "决策 {k}（{hole:?}）crop 与完整须逐字节相同");
+            }
+            assert!(
+                cc.cross_hits() >= 2,
+                "turn/river 首点应命中跨街后验: {}",
+                cc.cross_hits()
+            );
+        }
+        assert_eq!(crop.cropped_queries(), 0, "整手不应查询被裁街");
+
+        // (b) 依赖存在：完整 blueprint 空缓存问 river → 读了 turn σ。
+        let river_req = &sb_line_hand(["Ah", "Kd"])[2];
+        let turn_reads = std::cell::Cell::new(0u64);
+        let counting = |i: &InfoSetId, _n: usize| {
+            if i.street_tag() as u8 > StreetTag::Flop as u8 {
+                turn_reads.set(turn_reads.get() + 1);
+            }
+            full.strategy(i)
+        };
+        let r = decide(
+            game,
+            &abs,
+            &counting,
+            river_req,
+            0xBEEF,
+            Some(&rt_f),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "search");
+        assert!(
+            turn_reads.get() > 0,
+            "完整 blueprint 的 river 先验本会读 turn σ（否则本测试空验）"
+        );
+
+        // (c) crop 空缓存问 river → 补解 turn → 重试成功。决策与预热两条入口都验。
+        let mut c = SubgameSolveCache::new();
+        let r = decide(game, &abs, &sc, river_req, 0xBEEF, Some(&rt_c), &mut c);
+        assert_eq!(r.source, "search", "补解 turn 后 river 应解成功：{r:?}");
+        assert_eq!(c.misses(), 2, "turn 补解 + river 各一次 solve");
+        assert_eq!(c.cross_hits(), 1);
+        let mut c = SubgameSolveCache::new();
+        let p = prewarm(game, &sc, river_req, 0xBEEF, Some(&rt_c), &mut c);
+        assert_eq!(p.source, "prewarm:stored", "river 预热同样补解 turn：{p:?}");
+        let r2 = decide(game, &abs, &sc, river_req, 0xBEEF, Some(&rt_c), &mut c);
+        assert_eq!(r2.source, "search");
+        assert_eq!(r2, r, "预热补解与决策补解是同一份 turn 解 → 同 river 决策");
+        // 脱锚入口（off-stack 真栈 → lockstep 失同步）：river 同样补解成功、零查询。
+        let mut off = river_req.clone();
+        off.stacks = vec![2000, 300, 2000, 2000, 2000, 2000];
+        let r = decide(
+            game,
+            &abs,
+            &sc,
+            &off,
+            0xBEEF,
+            Some(&rt_c),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(
+            r.source == "search:unanchored" || r.source == "search",
+            "短码 river 应搜索成功：{r:?}"
+        );
+        // 关跨街复用（启动期本会拒绝）：无从补救 → 显式 crop giveup。
+        let no_cross = SearchRuntime {
+            unanchored_cross_street: false,
+            ..crop_rt(&crop, crop_scfg())
+        };
+        assert!(validate_crop_runtime(StreetTag::Flop, Some(&no_cross)).is_err());
+        let r = decide(
+            game,
+            &abs,
+            &sc,
+            river_req,
+            0xBEEF,
+            Some(&no_cross),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(
+            r.source.starts_with("search_giveup:crop_no_posterior:"),
+            "无跨街后验须显式降级：{r:?}"
+        );
+        assert!(is_legal(&r, &river_req.valid));
+
+        // (d) blueprint 路径守卫。
+        let flop_only = SearchRuntime {
+            cfg: SubgameSearchConfig {
+                trigger: SearchTrigger::FlopFirstUnraised,
+                ..rt_c.cfg
+            },
+            ..crop_rt(&crop, crop_scfg())
+        };
+        assert!(validate_crop_runtime(StreetTag::Flop, Some(&flop_only)).is_err());
+        let turn_req = &sb_line_hand(["Ah", "Kd"])[1];
+        let r = decide(
+            game,
+            &abs,
+            &sc,
+            turn_req,
+            0xBEEF,
+            Some(&flop_only),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "fallback:blueprint_cropped:turn", "{r:?}");
+
+        assert_eq!(crop.cropped_queries(), 0, "全程不应查询被裁街");
+    }
+
+    /// ③ crop 启动约束：`--cropped-checkpoint` 未开 `--search` → parse 报错；与 `--checkpoint` 互斥；
+    /// 开了 `--search` 但触发面 / 跨街复用 / flop-prefer 不满足 → [`validate_crop_runtime`] 报错。
+    #[test]
+    fn cropped_checkpoint_requires_search() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--cropped-checkpoint", "x.crop", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        let e = parse(&[]).err().expect("crop 不开 --search 须报错");
+        assert!(e.contains("--search"), "{e}");
+        let a = parse(&["--search", "--search-trigger", "all-postflop"]).expect("parse Ok");
+        assert!(a.cropped && a.checkpoint.as_path() == std::path::Path::new("x.crop"));
+        assert!(
+            parse(&["--search", "--checkpoint", "c.ckpt"]).is_err(),
+            "两 flag 互斥"
+        );
+        let a = parse_args_from(
+            ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .map(|s| s.to_string()),
+        )
+        .expect("完整 ckpt 不需 --search");
+        assert!(!a.cropped);
+
+        let rt_with = |trigger, cross: bool, prefer: bool| SearchRuntime {
+            cfg: SubgameSearchConfig {
+                trigger,
+                blueprint_max_street: StreetTag::Flop,
+                ..SubgameSearchConfig::default()
+            },
+            bucket_table: None,
+            unanchored_prefix_reach: true,
+            unanchored_cross_street: cross,
+            flop_prefer_blueprint: prefer,
+            exploit: None,
+        };
+        let k = StreetTag::Flop;
+        assert!(validate_crop_runtime(k, None).is_err());
+        assert!(validate_crop_runtime(
+            k,
+            Some(&rt_with(SearchTrigger::FlopFirstUnraised, true, false))
+        )
+        .is_err());
+        assert!(
+            validate_crop_runtime(k, Some(&rt_with(SearchTrigger::AllPostflop, false, false)))
+                .is_err()
+        );
+        assert!(
+            validate_crop_runtime(k, Some(&rt_with(SearchTrigger::AllPostflop, true, false)))
+                .is_ok()
+        );
+        // keep_through=Flop：flop 有数据 → flop-prefer 可开。
+        assert!(
+            validate_crop_runtime(k, Some(&rt_with(SearchTrigger::AllPostflop, true, true)))
+                .is_ok()
+        );
+        // keep_through=Preflop：flop 无数据 → flop-prefer 不可开。
+        let mut pre = rt_with(SearchTrigger::AllPostflop, true, true);
+        pre.cfg.blueprint_max_street = StreetTag::Preflop;
+        assert!(validate_crop_runtime(StreetTag::Preflop, Some(&pre)).is_err());
+        // blueprint_max_street 与 crop 不一致 = 内部接线错误 → 拒绝。
+        assert!(validate_crop_runtime(
+            StreetTag::Turn,
+            Some(&rt_with(SearchTrigger::AllPostflop, true, false))
+        )
+        .is_err());
+    }
+
+    /// [`offstack_allin_req`]（UTG 30BB preflop 全下 → 100BB 影子首动作即失同步）续打到河牌：
+    /// flop / turn 均 SB-BB check-check，返回同手 [flop, turn, river] 三个 hero(SB) 首点决策。
+    /// 每街都走**脱锚**路径；已同步前缀 = 根（断点在首动作）→ 档一前缀为空、range 先验退 uniform /
+    /// 跨街后验——脱锚路径在 crop 下与完整 blueprint 同样不查任何 blueprint σ。
+    fn offstack_hand() -> Vec<Request> {
+        let flop = offstack_allin_req();
+        let turn = offstack_allin_turn_req();
+        let mut river = offstack_allin_turn_req();
+        river.board.push("2s".into());
+        river.actions.push(ha(1, "check", None));
+        river.actions.push(ha(2, "check", None));
+        vec![flop, turn, river]
+    }
+
+    /// ② 续（脱锚入口）：off-stack 线每街 `search:unanchored`；crop 与完整 blueprint 同手顺序决策逐字节
+    /// 相同、空缓存直接问 river 也相同（前缀为空 → 不需要 turn σ、不触发补解），全程零被裁街查询。
+    /// 「档一前缀含被裁街决策」的守卫在 subgame 层单测钉死（cap-2 测试树里多人池在翻前即失同步，
+    /// advisor 层造不出 turn 才失同步的脱锚线）。
+    #[test]
+    fn cropped_blueprint_unanchored_river() {
+        let (_dir, full_p, crop_p) = crop_fixture("un");
+        let full = load_blueprint(&full_p, crop_test_game(), false).expect("load full");
+        let crop = load_blueprint(&crop_p, crop_test_game(), true).expect("load crop");
+        let game = crop.game();
+        let abs = game.abstraction().clone();
+        let sf = |i: &InfoSetId, _n: usize| full.strategy(i);
+        let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);
+        let (rt_f, rt_c) = (crop_rt(&full, crop_scfg()), crop_rt(&crop, crop_scfg()));
+        let hand = offstack_hand();
+        let (mut cf, mut cc) = (SubgameSolveCache::new(), SubgameSolveCache::new());
+        for (k, req) in hand.iter().enumerate() {
+            let rf = decide(game, &abs, &sf, req, 0xD00D, Some(&rt_f), &mut cf);
+            let rc = decide(game, &abs, &sc, req, 0xD00D, Some(&rt_c), &mut cc);
+            assert_eq!(rc.source, "search:unanchored", "决策 {k}：{rc:?}");
+            assert!(is_legal(&rc, &req.valid), "决策 {k}：{rc:?}");
+            assert_eq!(rf, rc, "决策 {k} crop 与完整须逐字节相同");
+        }
+        let river = &hand[2];
+        let rf = decide(
+            game,
+            &abs,
+            &sf,
+            river,
+            0xD00D,
+            Some(&rt_f),
+            &mut SubgameSolveCache::new(),
+        );
+        let mut c = SubgameSolveCache::new();
+        let rc = decide(game, &abs, &sc, river, 0xD00D, Some(&rt_c), &mut c);
+        assert_eq!(rc.source, "search:unanchored");
+        assert_eq!(c.misses(), 1, "前缀为空 → 无需补解");
+        assert_eq!(rf, rc);
+        assert_eq!(crop.cropped_queries(), 0, "全程不应查询被裁街");
     }
 }

@@ -949,6 +949,14 @@ pub struct SubgameSearchConfig {
     /// 但固定迭代 + 固定 seed 下自身仍确定性可复现（批调度是 `(iterations, threads, batch)`
     /// 纯函数、delta 合并按 tid 序确定）→ m1==m2 契约不破。进 solve 缓存 key。
     pub solve_threads: usize,
+    /// blueprint σ 可查询到哪条街（含）。`River`（默认）= 完整 blueprint，行为与加本字段前逐位
+    /// 相同。按街裁切的 blueprint（[`crate::training::nlhe_dense_crop`]，如只留翻前 + 翻牌 =
+    /// `Flop`）由调用方填 crop 的 `keep_through`：range 先验（[`estimate_range`]，锚定路径与脱锚
+    /// 档一前缀 reach 共用）若需要查**被裁掉的街**上的 σ，且跨街后验（档二′）不可得 → 搜索直接
+    /// `Err`（前缀 [`BLUEPRINT_CROPPED_ERR`]），**绝不**把缺失的 σ 当「未访问 → 均匀」吞掉。
+    /// 调用方据此补解紧前一街（让跨街后验可得）或显式降级。跨街后验命中时不查 blueprint，
+    /// 与本字段无关。
+    pub blueprint_max_street: StreetTag,
 }
 
 impl Default for SubgameSearchConfig {
@@ -968,8 +976,48 @@ impl Default for SubgameSearchConfig {
             live_traversers: false,
             range_uniform_mix: 0.0,
             solve_threads: 1,
+            blueprint_max_street: StreetTag::River,
         }
     }
+}
+
+/// 搜索因「range 先验需要被裁掉的 blueprint 街、且跨街后验不可得」而失败时，`Err` 字符串的前缀
+/// （[`SubgameSearchConfig::blueprint_max_street`]）。调用方用 [`is_blueprint_cropped_err`] 识别。
+pub const BLUEPRINT_CROPPED_ERR: &str = "blueprint_cropped";
+
+/// `Err` 是否为 [`BLUEPRINT_CROPPED_ERR`]（crop blueprint 缺数据，而非树太大 / 未收敛等）。
+pub fn is_blueprint_cropped_err(reason: &str) -> bool {
+    reason.starts_with(BLUEPRINT_CROPPED_ERR)
+}
+
+/// crop 守卫：[`estimate_range`] 对 `decisions` 会查询的 blueprint σ 里，若有落在
+/// `max_street` 之后（被裁掉）的街 → `Err`（[`BLUEPRINT_CROPPED_ERR`] 前缀）。口径与
+/// [`estimate_range`] 的查询集合一致（保守超集）：只算 `live(seat)` 座位（未弃牌、range 会被估）
+/// 的决策；`skip_all_in` 时 `AllIn`-tag 不查。`reach == 0` 的提前 break 不计（数据相关，取超集
+/// 只会多报错、不会漏报）。`max_street == River` 时恒 `Ok`（完整 blueprint，零开销分支）。
+fn check_blueprint_coverage(
+    tree: &PublicBettingTree,
+    decisions: &[(NodeId, AbstractActionTag, PlayerId)],
+    live: impl Fn(PlayerId) -> bool,
+    skip_all_in: bool,
+    max_street: StreetTag,
+) -> Result<(), String> {
+    if max_street == StreetTag::River {
+        return Ok(());
+    }
+    for (node_id, tag, seat) in decisions {
+        if !live(*seat) || (skip_all_in && *tag == AbstractActionTag::AllIn) {
+            continue;
+        }
+        let street = tree.node(*node_id).street;
+        if street as u8 > max_street as u8 {
+            return Err(format!(
+                "{BLUEPRINT_CROPPED_ERR}: range 先验需要 {street:?} 街 blueprint σ（node {node_id}、\
+                 seat {seat}），blueprint 只保留到 {max_street:?}，且跨街后验不可得"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 触发判据。`AllPostflop`（默认）= 任意 postflop 决策点（flop 含已起注 / turn / river）；
@@ -1863,7 +1911,7 @@ const KEY_KIND_UNANCHORED: u8 = 1;
 ///   条目存活期内指针不可能被释放复用）；
 /// - `cfg` 全字段（iterations / max_subtree_nodes / seed / use_blueprint_range / trigger /
 ///   resolve_root / depth_limit / biased_leaf / lcfr / time_budget / deep_menu /
-///   live_traversers / range_uniform_mix / solve_threads——含不影响 solve 的 trigger：
+///   live_traversers / range_uniform_mix / solve_threads / blueprint_max_street——含不影响 solve 的 trigger：
 ///   过覆盖只丢命中、欠覆盖读错均衡）；
 /// - `(hand_seed, seed_ordinal)`：与 `cfg.seed` 共同决定 master seed（RoundStart 下
 ///   seed_ordinal = 街索引 = round-stable）；
@@ -1922,6 +1970,9 @@ fn solve_cache_key(
     h.update(&cfg.range_uniform_mix.to_le_bytes());
     // 生效线程数（0 与 1 都走单线程 step、solve 输出相同 → 同 key 不丢命中）。
     h.update(&(cfg.solve_threads.max(1) as u64).to_le_bytes());
+    // blueprint 覆盖街（不直接影响 solve——它只决定 range 先验能否算出，而 ranges 已逐位入 key；
+    // 照「cfg 全字段」口径过覆盖，只可能丢命中）。
+    h.update(&[cfg.blueprint_max_street as u8]);
     h.update(&hand_seed.to_le_bytes());
     h.update(&seed_ordinal.to_le_bytes());
     h.update(&entrants.to_le_bytes());
@@ -2234,14 +2285,44 @@ fn subgame_search_cached_inner(
             }
         };
 
+    // 缺口③（§2.1 / §3.2）：deep_menu → 子树下注菜单按根 SPR 自适应（deep_menu_for：深 SPR =
+    // {1pot} 单档控树 / 浅 SPR 且 ≤3 Active = {0.5,1} 两档，v2 细化），把深码 / 多人解到终局的树压到可解；
+    // 与 blueprint 菜单解耦不引偏差（桶表按 cards/board 归桶、与菜单无关，建树与运行期
+    // legal_actions 同一 abs，§2.1）。false（默认）= 用 blueprint 自身 abstraction/rules
+    // （既有行为，byte-equal）。deep_menu 与 depth_limit 互斥已在函数顶 guard：故 depth_limit 分支
+    // 必 deep_menu=false，sub_abs/sub_rules == blueprint 自身（与 game.tree() 抽象一致，叶子映射不破）。
+    let (sub_abs, sub_rules) = if cfg.deep_menu {
+        deep_menu_for(root_state)
+    } else {
+        (game.abstraction().clone(), game.rules())
+    };
+
+    // 跑 CFR 的 master seed：(cfg.seed, hand_seed, seed_ordinal) 确定派生。RoundStart 下
+    // seed_ordinal = 街索引 → 同一轮多决策的 solve 字节相同（§6 #2 一致性）。
+    let master = search_seed(cfg.seed, hand_seed, seed_ordinal);
+    // within-round solve 缓存：key 在 solve 边界按实际构造输入现算（solve_cache_key doc）。
+    // depth_limit 路径不缓存（key 须带 blueprint 树叶子映射身份 + root_global，非生产路径）。
+    let cache = if cfg.depth_limit { None } else { cache };
     // §5b range：use_blueprint_range → 为每个未弃牌座位估 marginal range（root 加权采样底牌）；
     // 否则 None = uniform。depth-limit / 解到终局都复用这一份 ranges。对手座位做 uniform 平滑
     // （range_uniform_mix 字段 doc），hero（auth_actor）保持原 reach（mix_lambda_for_seat doc）。
-    let ranges_opt: Option<Vec<Vec<f64>>> = if cfg.use_blueprint_range {
+    // 惰性：仅跨街后验未命中时才调（见下方 ranges_opt）。crop blueprint（`blueprint_max_street`
+    // < River）下先过覆盖守卫——要查被裁掉街的 σ → `Err(BLUEPRINT_CROPPED_ERR…)`，不静默退均匀。
+    let estimate_anchored_ranges = || -> Result<Option<Vec<Vec<f64>>>, String> {
+        if !cfg.use_blueprint_range {
+            return Ok(None);
+        }
         let holes = all_hole_combos();
         let board: Vec<Card> = root_state.board().to_vec();
         let players = root_state.players();
-        Some(
+        check_blueprint_coverage(
+            tree,
+            &range_decisions,
+            |seat| players[seat as usize].hole_cards.is_some(),
+            false, // anchored：estimate_range(skip_all_in=false) 同口径。
+            cfg.blueprint_max_street,
+        )?;
+        Ok(Some(
             (0..players.len())
                 .map(|seat| {
                     if players[seat].hole_cards.is_some() {
@@ -2270,29 +2351,9 @@ fn subgame_search_cached_inner(
                     }
                 })
                 .collect(),
-        )
-    } else {
-        None
+        ))
     };
 
-    // 缺口③（§2.1 / §3.2）：deep_menu → 子树下注菜单按根 SPR 自适应（deep_menu_for：深 SPR =
-    // {1pot} 单档控树 / 浅 SPR 且 ≤3 Active = {0.5,1} 两档，v2 细化），把深码 / 多人解到终局的树压到可解；
-    // 与 blueprint 菜单解耦不引偏差（桶表按 cards/board 归桶、与菜单无关，建树与运行期
-    // legal_actions 同一 abs，§2.1）。false（默认）= 用 blueprint 自身 abstraction/rules
-    // （既有行为，byte-equal）。deep_menu 与 depth_limit 互斥已在函数顶 guard：故 depth_limit 分支
-    // 必 deep_menu=false，sub_abs/sub_rules == blueprint 自身（与 game.tree() 抽象一致，叶子映射不破）。
-    let (sub_abs, sub_rules) = if cfg.deep_menu {
-        deep_menu_for(root_state)
-    } else {
-        (game.abstraction().clone(), game.rules())
-    };
-
-    // 跑 CFR 的 master seed：(cfg.seed, hand_seed, seed_ordinal) 确定派生。RoundStart 下
-    // seed_ordinal = 街索引 → 同一轮多决策的 solve 字节相同（§6 #2 一致性）。
-    let master = search_seed(cfg.seed, hand_seed, seed_ordinal);
-    // within-round solve 缓存：key 在 solve 边界按实际构造输入现算（solve_cache_key doc）。
-    // depth_limit 路径不缓存（key 须带 blueprint 树叶子映射身份 + root_global，非生产路径）。
-    let cache = if cfg.depth_limit { None } else { cache };
     // 档二′-跨街复用（**锚定路径**，turn_blueprint_trim §2.2 改动 B）：缓存里有**同手紧前一街解**
     // 时（`cross_street = Some(prev_within)`，改动 A 后 anchored/unanchored 解都可复用），复用上一街
     // 子树 σ 对 `prev_within`（上一街**完整**真实动作线）条件化 → 本街后验 range，**覆盖**上面
@@ -2327,10 +2388,14 @@ fn subgame_search_cached_inner(
     // 捕获，记录在下面 solve 的 `(Some(c), Some(key))` 臂（c 已 &mut，cache=Some ⟺ 走该臂；cross_street
     // =None 不计入分母）。
     let cross_hit = cross_ranges.is_some();
-    let est_hit = ranges_opt.is_some(); // 调试：range 来源标注用（cross > blueprint_estimate > uniform）。
-                                        // 跨街复用优先（命中即 owned，覆盖 estimate_range）；否则用上面的 blueprint estimate（仍 None →
-                                        // uniform）。cross 关 / 不可复用 → cross_ranges=None → ranges_opt 原样（与改动前逐位 byte-equal）。
-    let ranges_opt = cross_ranges.or(ranges_opt);
+    let est_hit = cfg.use_blueprint_range; // 调试：range 来源标注用（cross > blueprint_estimate > uniform）。
+                                           // 跨街复用优先（命中即 owned，覆盖 estimate_range）；否则才算 blueprint estimate（仍 None →
+                                           // uniform）。estimate 是纯函数，命中时不算 ≡ 旧版「先算后被覆盖」（逐位 byte-equal），且命中时
+                                           // 不查任何 blueprint σ（crop blueprint 的前提：river 决策不读被裁掉的 turn σ）。
+    let ranges_opt: Option<Vec<Vec<f64>>> = match cross_ranges {
+        Some(r) => Some(r),
+        None => estimate_anchored_ranges()?,
+    };
     // —— 调试（--debug-log）：solve 前 dump 本次锚定搜索的 root range 来源 + per-seat 摘要 ——
     if subgame_debug_on() {
         let src = if cross_hit {
@@ -3126,52 +3191,68 @@ fn subgame_search_unanchored_cached_inner(
     // hero（auth_actor）不混（mix_lambda_for_seat）。**前缀里无当前街之前的决策（如 limp 池首动作
     // 即失同步）→ ranges=None 退 uniform 路径**（与既有 byte-equal，不走 new_with_ranges 的均匀
     // 向量——那是不同采样路径、不 byte-equal）。跨街复用命中（cross_ranges=Some）→ 直接用它、不算档一。
-    let prefix_ranges: Option<Vec<Vec<f64>>> = prefix_reach.and_then(|pr| {
-        let tree = game.tree();
-        let cur = root_state.street() as u8;
-        let prior: Vec<(NodeId, AbstractActionTag, PlayerId)> = pr
-            .decisions
-            .iter()
-            .filter(|(nid, _, _)| (tree.node(*nid).street as u8) < cur)
-            .copied()
-            .collect();
-        if prior.is_empty() {
-            return None; // 前缀无当前街之前的决策 → 退 uniform（byte-equal）。
+    //
+    // 惰性：跨街后验命中时**不算**档一（纯函数，旧版「先算后被覆盖」逐位等价），因此命中时不查任何
+    // blueprint σ。crop blueprint（`blueprint_max_street` < River）下档一前缀若含被裁掉街的决策
+    // （口径同 estimate_range：未弃牌座、跳过 AllIn-tag）→ `Err(BLUEPRINT_CROPPED_ERR…)`——不把那段
+    // 前缀当「无信息」悄悄丢掉（那等于改了先验语义），由调用方补解上一街或显式降级。
+    let prefix_ranges: Option<Vec<Vec<f64>>> = match (cross_hit, prefix_reach) {
+        (true, _) | (false, None) => None,
+        (false, Some(pr)) => {
+            let tree = game.tree();
+            let cur = root_state.street() as u8;
+            let prior: Vec<(NodeId, AbstractActionTag, PlayerId)> = pr
+                .decisions
+                .iter()
+                .filter(|(nid, _, _)| (tree.node(*nid).street as u8) < cur)
+                .copied()
+                .collect();
+            if prior.is_empty() {
+                None // 前缀无当前街之前的决策 → 退 uniform（byte-equal）。
+            } else {
+                let holes = all_hole_combos();
+                let board: Vec<Card> = root_state.board().to_vec();
+                let players = root_state.players();
+                check_blueprint_coverage(
+                    tree,
+                    &prior,
+                    |seat| players[seat as usize].hole_cards.is_some(),
+                    true, // 档一：estimate_range(skip_all_in=true) 同口径。
+                    cfg.blueprint_max_street,
+                )?;
+                Some(
+                    (0..players.len())
+                        .map(|seat| {
+                            if players[seat].hole_cards.is_some() {
+                                let mut r = estimate_range(
+                                    game,
+                                    pr.strategy,
+                                    &prior,
+                                    &board,
+                                    seat as PlayerId,
+                                    &holes,
+                                    true, // 档一：跳过 AllIn-tag（100BB shove 语义，off-100BB 撒谎）。
+                                );
+                                mix_range_with_uniform(
+                                    &mut r,
+                                    &holes,
+                                    &board,
+                                    mix_lambda_for_seat(
+                                        seat as PlayerId,
+                                        auth_actor,
+                                        cfg.range_uniform_mix,
+                                    ),
+                                );
+                                r
+                            } else {
+                                Vec::new() // 弃牌座：range 不被读。
+                            }
+                        })
+                        .collect(),
+                )
+            }
         }
-        let holes = all_hole_combos();
-        let board: Vec<Card> = root_state.board().to_vec();
-        let players = root_state.players();
-        Some(
-            (0..players.len())
-                .map(|seat| {
-                    if players[seat].hole_cards.is_some() {
-                        let mut r = estimate_range(
-                            game,
-                            pr.strategy,
-                            &prior,
-                            &board,
-                            seat as PlayerId,
-                            &holes,
-                            true, // 档一：跳过 AllIn-tag（100BB shove 语义，off-100BB 撒谎）。
-                        );
-                        mix_range_with_uniform(
-                            &mut r,
-                            &holes,
-                            &board,
-                            mix_lambda_for_seat(
-                                seat as PlayerId,
-                                auth_actor,
-                                cfg.range_uniform_mix,
-                            ),
-                        );
-                        r
-                    } else {
-                        Vec::new() // 弃牌座：range 不被读。
-                    }
-                })
-                .collect(),
-        )
-    });
+    };
     // 跨街复用优先（命中即 owned，覆盖档一）；否则用档一前缀 reach（仍 None → uniform）。
     let prefix_hit = prefix_ranges.is_some(); // 调试：range 来源标注用（cross > prefix > uniform）。
     let mut ranges_opt: Option<Vec<Vec<f64>>> = cross_ranges.or(prefix_ranges);
@@ -4010,6 +4091,7 @@ mod tests {
             live_traversers: false,
             range_uniform_mix: 0.0,
             solve_threads: 1,
+            blueprint_max_street: StreetTag::River,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -4070,6 +4152,7 @@ mod tests {
             live_traversers: false,
             range_uniform_mix: 0.0,
             solve_threads: 1,
+            blueprint_max_street: StreetTag::River,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, None, 0, 0,
@@ -4543,6 +4626,7 @@ mod tests {
             live_traversers: false,
             range_uniform_mix: 0.0,
             solve_threads: 1,
+            blueprint_max_street: StreetTag::River,
         };
         let d9 = subgame_search(
             &auth,
@@ -5303,6 +5387,7 @@ mod tests {
             live_traversers: false,
             range_uniform_mix: 0.0,
             solve_threads: 1,
+            blueprint_max_street: StreetTag::River,
         };
         let run = |cfg: &SubgameSearchConfig| {
             subgame_search(
@@ -5377,6 +5462,7 @@ mod tests {
             live_traversers: false,
             range_uniform_mix: 0.0,
             solve_threads: 1,
+            blueprint_max_street: StreetTag::River,
         };
         let base = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &none_cfg, None, None, 0x55, 4,
@@ -8573,5 +8659,189 @@ mod tests {
             (2, 0),
             "live_traversers 翻转须 miss（key 覆盖该旗）"
         );
+    }
+
+    // —— crop blueprint 覆盖守卫（`blueprint_max_street`，`nlhe_dense_crop`）——
+
+    /// HU flop check-check → turn check-check → river 首决策点。返回 (turn, river, turn_within)。
+    fn hu_river_after_checks(
+        game: &SimplifiedNlheGame,
+        seed: u64,
+    ) -> (
+        SimplifiedNlheState,
+        SimplifiedNlheState,
+        Vec<(Action, bool)>,
+    ) {
+        let (_flop, turn, _) = hu_turn_after_flop_checks(game, seed);
+        let mut rng = ChaCha20Rng::from_seed(seed ^ 0x5249_5645_5249_5645);
+        let rng: &mut dyn RngSource = &mut rng;
+        let mut river = turn.clone();
+        for _ in 0..2 {
+            let check = SimplifiedNlheGame::legal_actions(&river)
+                .into_iter()
+                .find(|a| matches!(a, AbstractAction::Check))
+                .expect("turn 决策点应有 Check");
+            river = SimplifiedNlheGame::next(river, check, rng);
+        }
+        assert_eq!(
+            river.game_state.board().len(),
+            5,
+            "turn check-check → river"
+        );
+        (
+            turn,
+            river,
+            vec![(Action::Check, false), (Action::Check, false)],
+        )
+    }
+
+    /// 锚定路径：river 先验需要 turn σ。`blueprint_max_street = Flop` 且无跨街后验 → `Err`
+    /// （[`BLUEPRINT_CROPPED_ERR`]），且**一次都没查**被裁街 σ（不是查了再报错）；`River`（完整）→ Ok 且
+    /// 确实读了 turn σ（依赖存在，非空验）；缓存有同手 turn 解 + `cross_street` → Ok、零被裁街查询，
+    /// 且与完整 blueprint 同条件下逐位相同（命中跨街后验时 estimate 不算）。
+    #[test]
+    fn crop_guard_anchored_river_requires_cross_street() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let (turn, river, turn_within) = hu_river_after_checks(&game, 0x4352_4F50_4731);
+        let late = std::cell::Cell::new(0u64);
+        let strat = |i: &InfoSetId, n: usize| {
+            if i.street_tag() as u8 > StreetTag::Flop as u8 {
+                late.set(late.get() + 1);
+            }
+            vec![1.0 / n as f64; n]
+        };
+        let cfg_with = |max| SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            trigger: SearchTrigger::AllPostflop,
+            blueprint_max_street: max,
+            ..SubgameSearchConfig::default()
+        };
+        let hand_seed = 0xC209;
+        let search = |cache: Option<&mut SubgameSolveCache>, max, cross| {
+            subgame_search_cached(
+                cache,
+                &river.game_state,
+                &river.game_state,
+                &game,
+                &SimplifiedNlheGame::legal_actions(&river),
+                river.current_node_id,
+                &strat,
+                &cfg_with(max),
+                None,
+                None,
+                None,
+                cross,
+                hand_seed,
+                3,
+            )
+        };
+        let e = search(None, StreetTag::Flop, None).expect_err("crop 无跨街后验须 Err");
+        assert!(is_blueprint_cropped_err(&e), "{e}");
+        assert_eq!(late.get(), 0, "守卫须在查询前拦下");
+        search(None, StreetTag::River, None).expect("完整 blueprint Ok");
+        assert!(
+            late.get() > 0,
+            "完整 blueprint 的 river 先验读 turn σ（依赖存在）"
+        );
+
+        // 缓存先放同手 turn 锚定解 → river 走跨街后验。
+        let with_turn_solve = |max| {
+            let mut c = SubgameSolveCache::new();
+            subgame_search_cached(
+                Some(&mut c),
+                &turn.game_state,
+                &turn.game_state,
+                &game,
+                &SimplifiedNlheGame::legal_actions(&turn),
+                turn.current_node_id,
+                &strat,
+                &cfg_with(max),
+                None,
+                None,
+                None,
+                None,
+                hand_seed,
+                2,
+            )
+            .expect("turn solve");
+            c
+        };
+        let mut c_crop = with_turn_solve(StreetTag::Flop);
+        let mut c_full = with_turn_solve(StreetTag::River);
+        late.set(0);
+        let r_crop = search(Some(&mut c_crop), StreetTag::Flop, Some(&turn_within[..]))
+            .expect("跨街后验命中 → Ok");
+        assert_eq!(late.get(), 0, "命中跨街后验时不查被裁街");
+        assert_eq!(c_crop.cross_hits(), 1);
+        let r_full = search(Some(&mut c_full), StreetTag::River, Some(&turn_within[..]))
+            .expect("完整 + 跨街");
+        assert_eq!(
+            late.get(),
+            0,
+            "命中跨街后验时完整 blueprint 也不读 turn σ（estimate 惰性）"
+        );
+        assert_eq!(
+            format!("{r_crop:?}"),
+            format!("{r_full:?}"),
+            "crop 与完整逐位相同"
+        );
+    }
+
+    /// 脱锚路径：档一前缀含 turn 决策。`blueprint_max_street = Flop` → `Err`（[`BLUEPRINT_CROPPED_ERR`]）
+    /// 且零被裁街查询；`River` → Ok 且读了 turn σ；前缀只含翻前 + 翻牌（截到 turn 起点）→ crop 下 Ok。
+    #[test]
+    fn crop_guard_unanchored_prefix_reach() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let (turn, river, _) = hu_river_after_checks(&game, 0x4352_4F50_4732);
+        let late = std::cell::Cell::new(0u64);
+        let strat = |i: &InfoSetId, n: usize| {
+            if i.street_tag() as u8 > StreetTag::Flop as u8 {
+                late.set(late.get() + 1);
+            }
+            vec![1.0 / n as f64; n]
+        };
+        let cfg_with = |max| SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            trigger: SearchTrigger::AllPostflop,
+            blueprint_max_street: max,
+            ..SubgameSearchConfig::default()
+        };
+        let river_prefix = synced_prefix_decisions(&game, river.current_node_id);
+        assert!(
+            river_prefix
+                .iter()
+                .any(|(n, _, _)| game.tree().node(*n).street == StreetTag::Turn),
+            "前缀须含 turn 决策（否则空验）"
+        );
+        let run = |decisions: &[(NodeId, AbstractActionTag, PlayerId)], max| {
+            subgame_search_unanchored_cached(
+                None,
+                &river.game_state,
+                &river.game_state,
+                &game,
+                &[],
+                &cfg_with(max),
+                None,
+                Some(PrefixReach {
+                    strategy: &strat,
+                    decisions,
+                }),
+                0xC20A,
+            )
+        };
+        let e = run(&river_prefix, StreetTag::Flop).expect_err("crop 前缀含 turn 须 Err");
+        assert!(is_blueprint_cropped_err(&e), "{e}");
+        assert_eq!(late.get(), 0, "守卫须在查询前拦下");
+        run(&river_prefix, StreetTag::River).expect("完整 Ok");
+        assert!(
+            late.get() > 0,
+            "完整 blueprint 的档一前缀读 turn σ（依赖存在）"
+        );
+        late.set(0);
+        let turn_prefix = synced_prefix_decisions(&game, turn.current_node_id);
+        run(&turn_prefix, StreetTag::Flop).expect("前缀只含翻前 + 翻牌 → crop Ok");
+        assert_eq!(late.get(), 0);
     }
 }
