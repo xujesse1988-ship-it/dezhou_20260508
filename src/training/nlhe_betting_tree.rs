@@ -218,6 +218,28 @@ pub fn first_small_preopen_1pot_6max(
     (abs, rules)
 }
 
+/// [`first_small_preopen_1pot_6max`] 的再收窄变体：**preflop 也收成单一 `{1.0}`**，即全四街
+/// 下注菜单都只有 1pot。rules 仍与 [`first_small_preopen_6max`] 一致（`no_open_limp`、
+/// `drop_preflop_open_allin`、`drop_small_reraise`、`width_redirect`），故 preflop 行为 =
+/// **开池只剩 1pot（UTG..BTN 3.5BB / SB 3BB）、禁非 SB limp、无开池 all-in、3bet+ 1pot +
+/// all-in**；`drop_small_reraise` 因菜单无 0.5pot 而空转。
+///
+/// 与 [`deep_single_pot`] 的区别：后者 rules = `Default`（给中途 postflop 子树用，不带 preflop
+/// 收宽 / no-limp），本档是带 preflop 规则的完整 blueprint 树。
+///
+/// **`preflop_open_small_only` 必须保持 `false`**（继承自 `preopen`）：该旗在开池时删
+/// `Raise{1.0pot}`，菜单只剩 1pot 时会把开池位压成只剩 Fold。
+///
+/// 同 [`first_small_preopen_1pot_6max`] 的理由另立一档、不改既有 reshape：advisor 按
+/// `--reshape` 重建同一棵树索引 checkpoint，改既有档会让已训 `.bin` 的 node_id 错位。
+pub fn all_1pot_6max(width_redirect: u8) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let (_, rules) = first_small_preopen_6max(width_redirect);
+    debug_assert!(!rules.preflop_open_small_only);
+    let one = || ActionAbstractionConfig::new(vec![1.0]).expect("{1.0} 单档合法");
+    let abs = StreetActionAbstraction::per_street([one(), one(), one(), one()]);
+    (abs, rules)
+}
+
 /// S6 实时搜索深码档（`realtime_search_openpoker_exec` §2.1 / 缺口③）：**全街单一 {1pot}**
 /// 下注菜单——每决策点只剩 `{fold, check/call, bet/raise 1pot, all-in}`。fold/check/call/all-in
 /// 由规则引擎合法集自带（非 ratio），ratio 只配 1.0pot 单档；这就是文档「深码把下注菜单收到
@@ -969,6 +991,157 @@ mod tests {
             vec![BetRatio::FULL_POT],
             "preopen-small：re-raise 只剩 1.0pot 单档（drop_small_reraise；小开池旗不渗入 re-raise）"
         );
+    }
+
+    /// 结构守门：`all-1pot`（[`all_1pot_6max`]）全街只有 1pot。preflop：UTG / SB 开池恰一档
+    /// 1.0pot（无 0.5pot、无开池 AllIn），UTG 无 limp、SB complete 保留；面对开池 re-raise
+    /// 恰 1.0pot + AllIn 保留；postflop 全树不出现 0.5pot。与 `preopen-1pot` 唯一差异 = preflop
+    /// 开池少 0.5pot 档，故 preflop 节点数应严格更少。
+    #[test]
+    fn reshape_all_1pot_single_size_everywhere() {
+        let cfg = TableConfig::default_6max_100bb();
+        let (abs, rules) = all_1pot_6max(2);
+        let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+        let raises = |node: &TreeNode| -> Vec<BetRatio> {
+            node.legal_actions
+                .iter()
+                .filter_map(|a| match a {
+                    AbstractActionTag::Raise(r) | AbstractActionTag::Bet(r) => Some(*r),
+                    _ => None,
+                })
+                .collect()
+        };
+        let root = t.node(t.root_id());
+        assert_eq!(root.street, StreetTag::Preflop);
+        assert!(root.legal_actions.contains(&AbstractActionTag::Fold));
+        assert!(
+            !root.legal_actions.contains(&AbstractActionTag::Call),
+            "all-1pot：UTG 根删 open-limp Call"
+        );
+        assert!(
+            !root.legal_actions.contains(&AbstractActionTag::AllIn),
+            "all-1pot：UTG 根删开池 AllIn"
+        );
+        assert_eq!(
+            raises(root),
+            vec![BetRatio::FULL_POT],
+            "all-1pot：开池恰 1pot 一档"
+        );
+
+        // fold-chain 到 SB RFI：complete 保留、开池恰 1pot、无开池 AllIn。
+        let mut sb_id = t.root_id();
+        for pos in ["UTG", "HJ", "CO", "BTN"] {
+            let node = t.node(sb_id);
+            let fold_idx = node
+                .legal_actions
+                .iter()
+                .position(|a| matches!(a, AbstractActionTag::Fold))
+                .unwrap_or_else(|| panic!("{pos} RFI 应有 Fold"));
+            sb_id = match node.children[fold_idx] {
+                Child::Decision(id) => id,
+                Child::Terminal => panic!("{pos} Fold 后不应终局"),
+            };
+        }
+        let sb = t.node(sb_id);
+        assert_eq!(sb.player_acting, 1, "fold 到 SB 后应由 SB 行动");
+        assert!(
+            sb.legal_actions.contains(&AbstractActionTag::Call),
+            "all-1pot：SB complete 保留"
+        );
+        assert!(!sb.legal_actions.contains(&AbstractActionTag::AllIn));
+        assert_eq!(raises(sb), vec![BetRatio::FULL_POT]);
+
+        // UTG 1pot 开池 → 下家面对加注：re-raise 恰 1pot，AllIn 保留。
+        let open_idx = root
+            .legal_actions
+            .iter()
+            .position(|a| matches!(a, AbstractActionTag::Raise(BetRatio::FULL_POT)))
+            .expect("UTG 根有 1pot 开池");
+        let child_id = match root.children[open_idx] {
+            Child::Decision(id) => id,
+            Child::Terminal => panic!("开池后不应终局"),
+        };
+        let facing = t.node(child_id);
+        assert!(facing.legal_actions.contains(&AbstractActionTag::AllIn));
+        assert_eq!(raises(facing), vec![BetRatio::FULL_POT]);
+
+        // 全树任何节点都不出现 0.5pot。
+        let mut pre_nodes = 0usize;
+        for id in 0..t.num_nodes() as NodeId {
+            let node = t.node(id);
+            if node.street == StreetTag::Preflop {
+                pre_nodes += 1;
+            }
+            assert!(
+                raises(node).iter().all(|r| *r == BetRatio::FULL_POT),
+                "all-1pot：node {id} 出现非 1pot 档 {:?}",
+                node.legal_actions
+            );
+        }
+        // 对照 preopen-1pot（同 rules、postflop 同 {1}）：只差 preflop 少一个开池档。
+        let (p_abs, p_rules) = first_small_preopen_1pot_6max(2);
+        let pt = PublicBettingTree::build_with_rules(&cfg, &p_abs, p_rules);
+        let p_pre = (0..pt.num_nodes() as NodeId)
+            .filter(|&id| pt.node(id).street == StreetTag::Preflop)
+            .count();
+        assert!(
+            pre_nodes < p_pre && t.num_nodes() < pt.num_nodes(),
+            "all-1pot preflop 节点 {pre_nodes} 应 < preopen-1pot {p_pre}"
+        );
+    }
+
+    /// 9-max 位置结构守门（`train_cfr --seats 9`）：`no_open_limp` / SB complete 按
+    /// `(seat - button) % n_seats` 现算，9 座下须仍正确。沿 fold-chain 走 preflop：首行动 =
+    /// seat 3（UTG），seat 3..8 + seat 0（BTN）开池都无 limp Call 且无开池 AllIn；fold 到
+    /// seat 1（SB）complete 保留；SB 也 fold → BB 赢盲注终局（walk）。N=2 + debug 建树顺带
+    /// 触发 redirect 不变量 assert（9 座下 postflop 在场 ≤ N）。
+    #[test]
+    fn nine_max_positions_no_open_limp() {
+        let cfg = TableConfig::n_max_at_bb(9, 100);
+        for (label, (abs, rules)) in [
+            ("preopen-1pot", first_small_preopen_1pot_6max(2)),
+            ("all-1pot", all_1pot_6max(2)),
+        ] {
+            let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+            let mut id = t.root_id();
+            for seat in [3u8, 4, 5, 6, 7, 8, 0] {
+                let node = t.node(id);
+                assert_eq!(node.street, StreetTag::Preflop);
+                assert_eq!(node.player_acting, seat, "{label}：fold-chain 行动顺序错");
+                assert!(
+                    !node.legal_actions.contains(&AbstractActionTag::Call),
+                    "{label}：seat {seat} 开池应删 limp Call"
+                );
+                assert!(
+                    !node.legal_actions.contains(&AbstractActionTag::AllIn),
+                    "{label}：seat {seat} 应删开池 AllIn"
+                );
+                let fold_idx = node
+                    .legal_actions
+                    .iter()
+                    .position(|a| matches!(a, AbstractActionTag::Fold))
+                    .unwrap_or_else(|| panic!("{label}：seat {seat} 应有 Fold"));
+                id = match node.children[fold_idx] {
+                    Child::Decision(next) => next,
+                    Child::Terminal => panic!("{label}：seat {seat} fold 后不应终局"),
+                };
+            }
+            let sb = t.node(id);
+            assert_eq!(sb.player_acting, 1, "{label}：fold 到 SB");
+            assert!(
+                sb.legal_actions.contains(&AbstractActionTag::Call),
+                "{label}：SB complete 保留"
+            );
+            let fold_idx = sb
+                .legal_actions
+                .iter()
+                .position(|a| matches!(a, AbstractActionTag::Fold))
+                .expect("SB 应有 Fold");
+            assert!(
+                matches!(sb.children[fold_idx], Child::Terminal),
+                "{label}：SB 也 fold → BB walk 终局"
+            );
+        }
     }
 
     /// 默认全街 `{0.5,1,2}` 树节点数 = 240,096（与 `nlhe_betting_tree_sizing` 工具

@@ -685,7 +685,7 @@ mod tests {
     use super::*;
     use crate::abstraction::bucket_table::BucketConfig;
     use crate::core::rng::{ChaCha20Rng, RngSource};
-    use crate::training::nlhe_betting_tree::first_small_6max;
+    use crate::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_1pot_6max};
 
     fn stub_table() -> Arc<BucketTable> {
         Arc::new(BucketTable::stub_for_postflop(
@@ -745,6 +745,59 @@ mod tests {
                 .sum();
             assert!(sum.abs() < 1e-6, "6 座 payoff 应守恒 Σ==0，实得 {sum}");
         }
+    }
+
+    /// 9-max smoke（`train_cfr --seats 9`）：`Game` 机制在 9 座下端到端跑通。① `n_players()==9`；
+    /// ② 随机策略多条轨迹走到 terminal，每决策节点 legal_actions 非空 + info_set（n_seats>2
+    /// uncached 分支）不 panic + actor 与树节点 `player_acting` 一致；③ 9 座 payoff 守恒
+    /// （Σ==0）；④ 覆盖到 showdown（多人进 flop 后摊牌，验 9 座 side pot / 结算路径）。
+    #[test]
+    fn nine_max_game_smoke() {
+        let (abs, rules) = first_small_preopen_1pot_6max(2);
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::n_max_at_bb(9, 100),
+            abs,
+            rules,
+        )
+        .expect("9-max game 应当构造成功（stub 500 桶表）");
+        assert_eq!(game.n_players(), 9, "9-max n_players 应为 9");
+
+        let mut rng = ChaCha20Rng::from_seed(0x394D_4158_0000_0001); // "9MAX"
+        let rng: &mut dyn RngSource = &mut rng;
+        let mut reached_postflop = 0usize;
+        for _ in 0..300 {
+            let mut state = game.root(rng);
+            let mut guard = 0;
+            let mut saw_postflop = false;
+            loop {
+                match SimplifiedNlheGame::current(&state) {
+                    NodeKind::Terminal => break,
+                    NodeKind::Player(actor) => {
+                        let node = game.tree().node(state.current_node_id);
+                        assert_eq!(node.player_acting, actor, "actor 应与树节点一致");
+                        saw_postflop |= node.street != StreetTag::Preflop;
+                        let actions = SimplifiedNlheGame::legal_actions(&state);
+                        assert!(!actions.is_empty(), "决策节点 legal_actions 不应为空");
+                        let _ = SimplifiedNlheGame::info_set(&state, actor);
+                        let idx = (rng.next_u64() % actions.len() as u64) as usize;
+                        state = SimplifiedNlheGame::next(state, actions[idx], rng);
+                    }
+                    NodeKind::Chance => unreachable!("简化 NLHE 无 chance 节点"),
+                }
+                guard += 1;
+                assert!(guard < 200, "轨迹深度爆炸");
+            }
+            reached_postflop += usize::from(saw_postflop);
+            let sum: f64 = (0..9)
+                .map(|p| SimplifiedNlheGame::payoff(&state, p as PlayerId))
+                .sum();
+            assert!(sum.abs() < 1e-6, "9 座 payoff 应守恒 Σ==0，实得 {sum}");
+        }
+        assert!(
+            reached_postflop > 0,
+            "300 条随机轨迹应至少有一条进 postflop（否则没测到翻后路径）"
+        );
     }
 
     /// P4 参数化没破 HU 默认路径：`new` 仍构造 240,096 节点默认树、2 座。

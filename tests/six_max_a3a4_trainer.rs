@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use poker::training::nlhe::SimplifiedNlheGame;
-use poker::training::nlhe_betting_tree::first_small_6max;
+use poker::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_1pot_6max};
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{
     evaluate_blueprint_vs_baseline_multiway, evaluate_blueprint_vs_blueprint_multiway,
@@ -189,6 +189,85 @@ fn six_max_a3a4_hashmap_train_monitor_checkpoint() {
     let r_resume = monitor.observe(loaded.update_count(), &loaded);
     assert_report_sane(&r_resume, false);
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 9-max（`train_cfr --seats 9`）训练 plumbing：同一 N-generic HashMap trainer 在 9 座
+/// `preopen-1pot` N=2 树上单线程 + 并行训练、监控可观测、checkpoint 往返后 update_count
+/// 连续且策略查询逐位一致。stub 200 桶，只验机制不验质量。
+#[test]
+fn nine_max_hashmap_train_monitor_checkpoint() {
+    let build = || {
+        let cfg = BucketConfig::new(200, 200, 200).expect("200/200/200 合法");
+        let table = Arc::new(BucketTable::stub_for_postflop(cfg));
+        let (abs, rules) = first_small_preopen_1pot_6max(TEST_CAP);
+        SimplifiedNlheGame::new_with_abstraction(
+            table,
+            TableConfig::n_max_at_bb(9, 100),
+            abs,
+            rules,
+        )
+        .expect("9-max game 构造（stub 200 桶表）")
+    };
+    let game = build();
+    assert_eq!(game.n_players(), 9, "9-max n_players");
+    let mut monitor = ConvergenceMonitor::for_game(&game);
+
+    let mut trainer: EsMccfrTrainer<SimplifiedNlheGame> = EsMccfrTrainer::new(game, MASTER_SEED);
+    let mut rng = ChaCha20Rng::from_seed(RNG_SEED ^ 0x09);
+    for _ in 0..2_000 {
+        trainer.step(&mut rng).expect("9-max HashMap step");
+    }
+    let r_mid = monitor.observe(trainer.update_count(), &trainer);
+    assert_report_sane(&r_mid, true);
+    assert!(
+        r_mid.active_in_sample > 0,
+        "2000 update 后 UTG 根应已有活跃信息集"
+    );
+
+    let mut pool: Vec<Box<dyn RngSource>> = (0..4u64)
+        .map(|t| Box::new(ChaCha20Rng::from_seed(RNG_SEED ^ (t + 0x90))) as Box<dyn RngSource>)
+        .collect();
+    trainer
+        .step_parallel(&mut pool, 4, 16)
+        .expect("9-max HashMap step_parallel");
+    assert_eq!(trainer.update_count(), 2_000 + 4 * 16);
+    let r_end = monitor.observe(trainer.update_count(), &trainer);
+    assert_report_sane(&r_end, false);
+
+    let dir = std::env::temp_dir().join(format!("nine_max_ckpt_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir temp");
+    let ckpt = dir.join("nine_max_hm.ckpt");
+    <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::save_checkpoint(
+        &trainer, &ckpt,
+    )
+    .expect("save 9-max checkpoint");
+    let before: Vec<(InfoSetId, Vec<f64>)> = monitor
+        .sample()
+        .iter()
+        .map(|&i| (i, trainer.average_strategy_for(i)))
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
+    assert!(!before.is_empty(), "应有活跃样本可对照");
+    let loaded =
+        <EsMccfrTrainer<SimplifiedNlheGame> as Trainer<SimplifiedNlheGame>>::load_checkpoint(
+            &ckpt,
+            build(),
+        )
+        .expect("load 9-max checkpoint");
+    assert_eq!(loaded.update_count(), trainer.update_count());
+    for (info, expect) in &before {
+        let got = loaded.average_strategy_for(*info);
+        assert!(
+            got.len() == expect.len()
+                && got
+                    .iter()
+                    .zip(expect)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "9-max checkpoint 往返后策略查询应逐位一致 @ info {:#x}",
+            info.raw()
+        );
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

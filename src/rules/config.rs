@@ -33,10 +33,18 @@ impl TableConfig {
     /// node_id 上界 2^26（见 `nlhe_betting_tree` v2 packing），实际节点数看 train_cfr 的
     /// `tree_nodes` 日志。
     pub fn six_max_at_bb(stack_bb: u32) -> TableConfig {
+        Self::n_max_at_bb(6, stack_bb)
+    }
+
+    /// `n_seats` 座、起始码深 = `stack_bb` 个大盲（BB=100 chips、SB=50、ante=0、按钮在座位 0）。
+    /// `six_max_at_bb(bb)` == `n_max_at_bb(6, bb)`，逐字段一致。`train_cfr --seats <N>` 用它
+    /// 建 N 人桌（如 9-max）。`n_seats` 合法范围 2..=9 由 [`crate::GameState`] 构造时校验，本函数
+    /// 不重复检查；注意 `n_seats == 2` 走 HU 语义（button = SB）。
+    pub fn n_max_at_bb(n_seats: u8, stack_bb: u32) -> TableConfig {
         TableConfig {
-            n_seats: 6,
+            n_seats,
             // 100 chips = 1BB（与 default 一致：100BB = 10_000 chips）。
-            starting_stacks: vec![ChipAmount::new(u64::from(stack_bb) * 100); 6],
+            starting_stacks: vec![ChipAmount::new(u64::from(stack_bb) * 100); usize::from(n_seats)],
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
