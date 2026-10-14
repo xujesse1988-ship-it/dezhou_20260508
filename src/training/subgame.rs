@@ -48,7 +48,8 @@ use crate::training::nlhe::{
     SimplifiedNlheInfoSet, SimplifiedNlheState,
 };
 use crate::training::nlhe_betting_tree::{
-    deep_menu_for, AbstractActionTag, BettingAbstractionRules, Child, NodeId, PublicBettingTree,
+    count_subtree_nodes_capped, deep_menu_for, AbstractActionTag, BettingAbstractionRules, Child,
+    NodeId, PublicBettingTree,
 };
 use crate::training::opponent_profile::OpponentProfile;
 use crate::training::sampling::sample_discrete;
@@ -1059,6 +1060,44 @@ fn live_entrants(auth: &GameState) -> u16 {
     e
 }
 
+fn active_count(state: &GameState) -> usize {
+    state
+        .players()
+        .iter()
+        .filter(|p| p.status == PlayerStatus::Active)
+        .count()
+}
+
+/// 脱锚子树「建树前先计数」的人数门槛：子树根 Active ≥ 此值才先用
+/// [`count_subtree_nodes_capped`] 数一遍（不物化树），超 `max_subtree_nodes` 直接拒绝。
+///
+/// 依据（`openpoker_advisor` 的 `nine_max_search_subtree_sizing`，9-max 100BB flop 根、{1pot} 菜单
+/// 解到终局）：limp 池 k=2..9 = 460 / 5.4k / 45k / 140k / 557k / **3.07M / 15.5M / 72.6M**，单加注池
+/// （3.5BB）k=5..9 = 32k / 65k / 106k / 399k / 1.47M。≤6 人最坏 557k；≥7 人 limp 池陡增到千万级——
+/// [`solve_subgame`] 的 cap 是**建完树后**才查的，72.6M 节点的树要先吃掉 ~13 GB 内存（`TreeNode`
+/// 184 字节）/ 几分钟建树才被拒。6 座桌最多 6 个 Active → 此闸在 6-max 下恒不触发（逐位不变）。
+pub const SUBTREE_PRECOUNT_MIN_ACTIVE: usize = 7;
+
+/// 脱锚子树建树前规模闸：根 Active < [`SUBTREE_PRECOUNT_MIN_ACTIVE`] → `Ok`（不计数）；否则用与
+/// 建树**同一** `(abs, rules, entrants, raises=0)` 计数，超 `cap` → `Err("subtree_precount:{k}way>{cap}")`。
+/// 只在 solve 缓存未命中、真要建树时调用（命中时子树早已建好，无需再数）。
+fn unanchored_precount_gate(
+    root_state: &GameState,
+    sub_abs: &StreetActionAbstraction,
+    sub_rules: BettingAbstractionRules,
+    entrants: u16,
+    cap: usize,
+) -> Result<(), String> {
+    let n_active = active_count(root_state);
+    if n_active < SUBTREE_PRECOUNT_MIN_ACTIVE {
+        return Ok(());
+    }
+    match count_subtree_nodes_capped(root_state, sub_abs, sub_rules, entrants, 0, cap) {
+        Some(_) => Ok(()),
+        None => Err(format!("subtree_precount:{n_active}way>{cap}")),
+    }
+}
+
 /// tag 是否进攻动作（推进 `raises_on_street`）：`Bet` / `Raise` / `AllIn`（同
 /// `nlhe_betting_tree::is_aggression` 的 tag 版）。
 fn tag_is_aggression(tag: &AbstractActionTag) -> bool {
@@ -1784,6 +1823,10 @@ pub struct SubgameSolveCache {
     /// 命中）正交。caller 按街 delta（river 决策前后差）归因——cache 不知街（同 misses_before 口径）。
     cross_attempts: u64,
     cross_hits: u64,
+    /// 最近一次被 [`unanchored_precount_gate`] 拒绝（子树超 `max_subtree_nodes`）的 solve key +
+    /// 拒绝原因。同手同街后续决策 / 预热 key 相同 → 直接返回同一 `Err`、不再重数（计数本身要数到
+    /// cap 才停，cap 百万级时每次数秒）。只记最近一个：key 覆盖 solve 全部输入，旧值不可能误配。
+    oversize: Option<([u8; 32], String)>,
 }
 
 impl SubgameSolveCache {
@@ -1795,6 +1838,7 @@ impl SubgameSolveCache {
             misses: 0,
             cross_attempts: 0,
             cross_hits: 0,
+            oversize: None,
         }
     }
 
@@ -1887,6 +1931,14 @@ impl SubgameSolveCache {
             .as_ref()
             .filter(|(k, _)| *k == key)
             .map(|(_, s)| s)
+    }
+
+    /// `key` 此前被计数闸拒过 → 当时的拒绝原因（不计 hits/misses）。
+    fn oversize_reason(&self, key: [u8; 32]) -> Option<&str> {
+        self.oversize
+            .as_ref()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, r)| r.as_str())
     }
 }
 
@@ -3316,6 +3368,17 @@ fn subgame_search_unanchored_cached_inner(
             street_tag as u64,
         )
     });
+    // 建树前规模闸（≥7 Active 才计数）：只在真要建树时跑——缓存命中不数；被拒过的 key 直接复用
+    // 拒绝原因、不重数（`SubgameSolveCache::oversize`）。`build_and_solve` 会 move 走 `sub_abs`，
+    // 故闸用的菜单先复制一份——<7 Active（含全部 6-max）不复制、不计数。
+    let precount_abs =
+        (active_count(root_state) >= SUBTREE_PRECOUNT_MIN_ACTIVE).then(|| sub_abs.clone());
+    let precount = || match &precount_abs {
+        None => Ok(()),
+        Some(abs) => {
+            unanchored_precount_gate(root_state, abs, sub_rules, entrants, cfg.max_subtree_nodes)
+        }
+    };
     let build_and_solve = move || -> Result<SolvedSubgame, String> {
         let sub = if let Some(ranges) = ranges_opt {
             SubgameNlheGame::new_with_ranges(
@@ -3354,12 +3417,20 @@ fn subgame_search_unanchored_cached_inner(
             if cross_street.is_some() {
                 c.record_cross(cross_hit);
             }
+            if let Some(reason) = c.oversize_reason(key) {
+                return Err(reason.to_string());
+            }
             if !c.lookup(key) {
+                if let Err(reason) = precount() {
+                    c.oversize = Some((key, reason.clone()));
+                    return Err(reason);
+                }
                 c.store(key, build_and_solve()?);
             }
             c.entry(key).expect("lookup 命中或刚 store")
         }
         _ => {
+            precount()?;
             solved_fresh = build_and_solve()?;
             &solved_fresh
         }

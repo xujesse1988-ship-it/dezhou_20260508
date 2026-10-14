@@ -9,12 +9,15 @@
 //!
 //! 复用 [`blueprint_advisor`](poker::training::blueprint_advisor) 的 off-tree 核
 //! （`advance_shadow_by_applied` incoming / `outgoing_action` outgoing / `parse_card`），
-//! 但泛化到 **6 座**：座位按相对 button rotate 到 solver 的 `default_6max_100bb`（button=座0），
-//! OpenPoker 筹码（SB10/BB20/买入2000）按 `scale = solver_BB / op_BB = 5` 换算到 solver 单位。
+//! 但泛化到 **N 座**（`--seats`，默认 6；9 座 blueprint 传 `--seats 9`）：座位按相对 button
+//! rotate 到 solver 的 `TableConfig::n_max_at_bb(N, 100)`（button=座0），OpenPoker 筹码
+//! （SB10/BB20/买入2000）按 `scale = solver_BB / op_BB = 5` 换算到 solver 单位。solver 座位数 /
+//! 盲注 / 码深的**唯一来源** = blueprint game 的 [`SimplifiedNlheGame::table_config`]（重放与
+//! blueprint 树同一 config，不另写一份 N 座常量）。
 //!
 //! # 鲁棒兜底（live 不能崩 / 不能挂死）
 //!
-//! 任何重放失败（码深漂移 desync、结构性 gap = 对手 open-limp 进 no-limp 影子、非 6 人桌、
+//! 任何重放失败（码深漂移 desync、结构性 gap = 对手 open-limp 进 no-limp 影子、桌面座位数 ≠ N、
 //! 非法历史）→ **不 panic、不静默乱出**，而是从 driver 给的 `valid_actions` 出**安全合法动作**
 //! （能 check 就 check、否则 fold —— 紧、不漏筹码），并在 `source` 标 `fallback:<reason>`，
 //! driver 落日志统计兜底频率。faithful 路径成功时才由 blueprint 驱动。
@@ -63,13 +66,14 @@
 //! # 已知限制（blueprint 路径，`...client_design...` §4）
 //!
 //! - 码深 ≠ 100BB 且**未开搜索 / 未触发**：solver 树/SPR 都按 100BB 解；real `GameState` 用
-//!   `default_6max_100bb`（10000 筹码）近似，driver 靠买入锁 2000 + 栈漂出 [80,125]BB leave/rejoin 兜。
+//!   blueprint 的 100BB config（10000 筹码）近似，driver 靠买入锁 2000 + 栈漂出 [80,125]BB leave/rejoin 兜。
 //! - 对手 open-limp：no-limp blueprint 无对应节点 → preflop 走 [`limp_heuristic`] 矩阵
 //!   （好牌 iso-raise / 顶级面对加注 call / 其余免费 check 或 fold）；postflop 由脱锚搜索接管。
-//! - 短桌手（6 座只发 k<6 家）：driver 送 `dealt_seats`（`table_state.seats[].in_hand` 推断）时
-//!   走**幻影座映射**（[`seat_map`]：k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的真实节点、
+//! - 短桌手（N 座只发 k<N 家）：driver 送 `dealt_seats`（`table_state.seats[].in_hand` 推断）时
+//!   走**幻影座映射**（[`seat_map`]：k 人局映成 N-max 树「UTG 侧前 N−k 位先 fold」的真实节点、
 //!   盲注对齐；k=2 按 OpenPoker 实测 HU 约定 button=BB 映 SB/BB→树座 1/2）；占座不可判
-//!   （无 table_state）→ 仍兜底。
+//!   （无 table_state）→ 仍兜底。桌面座位数（`num_seats`）必须 == N，否则 `fallback:not_{N}max`
+//!   （如 6 座 blueprint 上 9 座桌 = `not_6max`；不做跨座位数映射，避免静默错映射）。
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -105,7 +109,10 @@ use poker::{
     InfoSetId, SeatId, StreetActionAbstraction, StreetTag, TableConfig,
 };
 
-const N_SEATS: usize = 6;
+/// `--seats` 缺省值（6-max；不传新参数时行为与引入 `--seats` 前逐位相同）。
+const DEFAULT_SEATS: u8 = 6;
+/// solver / blueprint 起始码深（BB）。advisor 只支持 100BB blueprint（driver 买入锁 2000 = 100BB）。
+const SOLVER_STACK_BB: u32 = 100;
 const REAL_REPLAY_SEED: u64 = 0x5245_414c_3645_4d58; // "REAL6EMX"
 const ABS_REPLAY_SEED: u64 = 0x4142_5336_454d_5800; // "ABS6EMX\0"
 /// 搜索 range 先验平滑 λ 的生产默认（`SubgameSearchConfig::range_uniform_mix` 字段 doc）：
@@ -233,10 +240,11 @@ struct Request {
     #[serde(default)]
     stacks: Vec<u64>,
     /// 短桌幻影座映射（exec 文档「短桌 seat_mismatch ~2.4% 兜底」修复）：本手**实际发牌**的
-    /// OpenPoker 座位（升序）。缺省 / 全 6 座 = 满桌（旧行为 byte-equal）。k∈[2,5] →
-    /// [`seat_map`] 把 k 人局映成 6-max 树「UTG 侧前 6−k 位先 fold」的真实节点（盲注对齐：
+    /// OpenPoker 座位（升序）。缺省 / 全 N 座 = 满桌（旧行为 byte-equal）。k∈[2,N−1] →
+    /// [`seat_map`] 把 k 人局映成 N-max 树「UTG 侧前 N−k 位先 fold」的真实节点（盲注对齐：
     /// 真实 BTN/SB/BB → 树座 0/1/2；k=2 按 OpenPoker 实测 HU 约定 button=BB → SB/BB 映树座
-    /// 1/2、幻影 [3,4,5,0]，**仅 preflop**——postflop 行动序角色反转映不进、显式兜底）。
+    /// 1/2、幻影 [3..N, 0]（6 座 = [3,4,5,0]），**仅 preflop**——postflop 行动序角色反转映不进、
+    /// 显式兜底）。
     /// driver 从 `table_state.seats[].in_hand` ∪ 已行动座推断，仅本手收到过 table_state 时
     /// 才发（决策时占座唯一可判才启用）。
     #[serde(default)]
@@ -388,10 +396,11 @@ fn expected_board_len(s: poker::Street) -> usize {
 
 /// OpenPoker 座 → solver 树座的映射（满桌 = 旧 rotate 公式；短桌 = 幻影座映射）。
 struct SeatMap {
-    /// 下标 = OpenPoker 座位号；`None` = 本手未发牌（空座 / 等下一手的玩家）。
-    to_tree: [Option<u8>; N_SEATS],
-    /// 重放序列开头按序先 fold 的幻影树座（preflop 行动序）。k∈[3,5] = `3..3+(6−k)`
-    /// （UTG 起最早行动位，恰好最先轮到）；k=2 = `[3,4,5,0]`（BTN 位也是幻影）。
+    /// 下标 = OpenPoker 座位号（长度 = 桌面座位数 = solver 座位数 N）；`None` = 本手未发牌
+    /// （空座 / 等下一手的玩家）。
+    to_tree: Vec<Option<u8>>,
+    /// 重放序列开头按序先 fold 的幻影树座（preflop 行动序）。k∈[3,N−1] = `3..3+(N−k)`
+    /// （UTG 起最早行动位，恰好最先轮到）；k=2 = `[3..N, 0]`（BTN 位也是幻影；6 座 = [3,4,5,0]）。
     phantoms: Vec<u8>,
     /// k==2：HU 映射只对 preflop 成立（caller 在 postflop 显式兜底，见 [`seat_map`] doc）。
     hu: bool,
@@ -407,73 +416,92 @@ impl SeatMap {
     }
 }
 
-/// 建座位映射。`dealt_seats` 缺省 / 全 6 座 → 满桌恒等（旧 `(op + 6 − button) % 6` 公式，
-/// byte-equal）。k∈[3,5] → **短桌幻影座映射**：真实 BTN/SB/BB → 树座 0/1/2（6-max 树的
+/// 建座位映射（`n` = solver 座位数 N = blueprint 的 `table_config().n_seats`；caller 已校验桌面
+/// `num_seats == n`）。solver 树的位置语义 = `(seat − button) % n`、button = 树座 0：树座 0/1/2 =
+/// BTN/SB/BB，3.. = UTG 起按 preflop 行动序（9 座：3=UTG … 8=CO）。
+///
+/// `dealt_seats` 缺省 / 全 n 座 → 满桌恒等（旧 `(op + n − button) % n` 公式，6 座 byte-equal）。
+/// k∈[3,n−1] → **短桌幻影座映射**：真实 BTN/SB/BB → 树座 0/1/2（N-max 树的
 /// SB/BB 固定在 button+1/+2 且必须发盲，树上不存在「盲注位发盲前 fold」节点，所以不能在
 /// 空座原位插 fold、必须重映环序对齐盲注），其余真实玩家按环序占 CO 侧靠后位置
-/// （ring 序 j≥3 → 树座 j+6−k），幻影座占 UTG 起最早行动位、开局先 fold——k 人桌首个
-/// 行动者 ≡ 6-max 前 6−k 位弃牌后的同位置（标准短桌位置等价，blueprint 真实训练过的节点；
-/// preflop 3,4,5,0,1,2 与 postflop 从 SB 顺时针两序在 k=3/4/5 下都与真实短桌严格吻合）。
+/// （ring 序 j≥3 → 树座 j+n−k），幻影座占 UTG 起最早行动位、开局先 fold——k 人桌首个
+/// 行动者 ≡ N-max 前 n−k 位弃牌后的同位置（标准短桌位置等价，blueprint 真实训练过的节点；
+/// preflop 3..n−1,0,1,2 与 postflop 从 SB 顺时针两序在 3≤k<n 下都与真实短桌严格吻合）。
 ///
 /// k=2：OpenPoker 的 HU 盲注按环规则贴（**live 校准 2026-06-11 两轮 smoke**：button 发
 /// BB、非 button 发 SB——非标准 HU），但**行动序是角色序**（preflop SB 先、postflop BB
 /// 先 = 标准 HU 的角色顺序）。树是环序（fold 到 SB-vs-BB 后两条街都 SB 先），跨街反转
 /// 表达不了 → **只映 preflop**（真实 SB → 树座 1、真实 BB(button) → 树座 2、幻影
-/// `[3,4,5,0]` 先 fold，preflop 行动序严格吻合）；postflop 由 caller 显式兜底
+/// `[3..n, 0]` 先 fold，preflop 行动序严格吻合）；postflop 由 caller 显式兜底
 /// `short_hu_postflop`（实测顺序错位必被重放 seat 校验拦下、0 漏网，门只是把原因标清楚）。
-fn seat_map(req: &Request) -> Result<SeatMap, String> {
-    let full = || {
-        let mut m = [None; N_SEATS];
-        for (op, slot) in m.iter_mut().enumerate() {
-            *slot = Some(((op + N_SEATS - req.button_seat as usize) % N_SEATS) as u8);
-        }
-        SeatMap {
-            to_tree: m,
-            phantoms: Vec::new(),
-            hu: false,
-        }
+///
+/// 脏输入（button 越界 / dealt 非升序、越界、个数不在 [2,n]、缺 button 或我）→ `Err`（caller
+/// 安全兜底），绝不静默错映射。
+fn seat_map(req: &Request, n: usize) -> Result<SeatMap, String> {
+    debug_assert!(
+        (3..=9).contains(&n),
+        "solver 座位数须在 [3,9]（--seats 校验）"
+    );
+    if req.button_seat as usize >= n {
+        // 旧实现在此 `op + n − button` 会下溢（debug panic / release 回绕成错映射）。
+        return Err("bad_button_seat".into());
+    }
+    let full = || SeatMap {
+        to_tree: (0..n)
+            .map(|op| Some(((op + n - req.button_seat as usize) % n) as u8))
+            .collect(),
+        phantoms: Vec::new(),
+        hu: false,
     };
     if req.dealt_seats.is_empty() {
         return Ok(full());
     }
     let dealt = &req.dealt_seats;
     let k = dealt.len();
-    if !(2..=N_SEATS).contains(&k)
+    if !(2..=n).contains(&k)
         || dealt.windows(2).any(|w| w[0] >= w[1])
-        || dealt.iter().any(|&s| s as usize >= N_SEATS)
+        || dealt.iter().any(|&s| s as usize >= n)
     {
         return Err("bad_dealt_seats".into());
     }
     if !dealt.contains(&req.button_seat) || !dealt.contains(&req.my_seat) {
         return Err("dealt_missing_btn_or_me".into());
     }
-    if k == N_SEATS {
+    if k == n {
         return Ok(full());
     }
     let btn_idx = dealt
         .iter()
         .position(|&s| s == req.button_seat)
         .expect("上面 contains 已校验");
-    let mut m = [None; N_SEATS];
+    let mut m = vec![None; n];
     if k == 2 {
         m[req.button_seat as usize] = Some(2); // OpenPoker HU：button 发 BB → 树座 2。
         m[dealt[1 - btn_idx] as usize] = Some(1); // 非 button 发 SB 先动 → 树座 1。
         return Ok(SeatMap {
             to_tree: m,
-            phantoms: vec![3, 4, 5, 0],
+            // preflop 行动序 UTG(3)..CO(n−1)、BTN(0) 全是幻影，依次先 fold 到 SB。
+            phantoms: (3..n as u8).chain(std::iter::once(0)).collect(),
             hu: true,
         });
     }
     for j in 0..k {
         let op = dealt[(btn_idx + j) % k] as usize;
-        let tree = if j < 3 { j } else { j + (N_SEATS - k) };
+        let tree = if j < 3 { j } else { j + (n - k) };
         m[op] = Some(tree as u8);
     }
     Ok(SeatMap {
         to_tree: m,
-        phantoms: (3..3 + (N_SEATS - k) as u8).collect(),
+        phantoms: (3..3 + (n - k) as u8).collect(),
         hu: false,
     })
+}
+
+/// 桌面座位数 ≠ solver 座位数时的兜底原因（`not_6max` / `not_9max`；6 座与旧标签逐字相同）。
+/// 不做跨座位数映射：桌面 > N 时多出来的座位在树上无处可放，桌面 < N 时占座可判与否 driver 侧
+/// 未建模（`dealt_seats` 下标按桌面座位），宁可显式兜底也不静默错映射。
+fn not_n_max(n: usize) -> String {
+    format!("not_{n}max")
 }
 
 /// 实时搜索运行时 = 触发/求解配置 + 可选**子树独立桶表**。`SubgameSearchConfig` 是 `Copy` 纯
@@ -566,13 +594,16 @@ fn prewarm_inner(
     if req.hole.len() != 2 {
         return mk("prewarm:skip:hole_not_2".into());
     }
-    if req.num_seats as usize != N_SEATS {
-        return mk("prewarm:skip:not_6max".into());
+    // solver config = blueprint 树的 config（座位数 / 盲注 / 码深唯一来源；6 座 = 旧
+    // `default_6max_100bb`，逐字段相同）。
+    let solver_cfg = game.table_config().clone();
+    let n_seats = solver_cfg.n_seats as usize;
+    if req.num_seats as usize != n_seats {
+        return mk(format!("prewarm:skip:{}", not_n_max(n_seats)));
     }
     if req.big_blind == 0 {
         return mk("prewarm:skip:bad_bb".into());
     }
-    let solver_cfg = TableConfig::default_6max_100bb();
     let solver_bb = solver_cfg.big_blind.as_u64();
     if solver_bb % req.big_blind != 0 {
         return mk("prewarm:skip:scale_not_integer".into());
@@ -592,7 +623,7 @@ fn prewarm_inner(
     if board.len() < 3 {
         return mk("prewarm:skip:preflop".into()); // preflop 不搜（§1 gating），无预热对象。
     }
-    let smap = match seat_map(req) {
+    let smap = match seat_map(req, n_seats) {
         Ok(m) => m,
         Err(reason) => return mk(format!("prewarm:skip:{reason}")),
     };
@@ -631,7 +662,7 @@ fn prewarm_inner(
     if round_start.players()[hero_pid as usize].status != poker::PlayerStatus::Active {
         return mk("prewarm:skip:hero_not_active".into());
     }
-    let hand_seed = hand_seed_for(req, base_seed);
+    let hand_seed = hand_seed_for(req, base_seed, n_seats);
     // 监控：预热 build+solve 墙钟（= 藏进对手思考时间的成本；> 对手用时则 hero 决策仍会 MISS 现解）。
     let t0 = Instant::now();
     // —— 路径分类与 decide 同源：lockstep Ok → 锚定；Err（off-stack / limp 线）→ 脱影子 ——
@@ -816,7 +847,7 @@ fn backfill_prev_street(
         5 => poker::Street::Turn,
         n => return Err(format!("no_prev_postflop_street(board_len={n})")),
     };
-    let trunc = truncate_request_to_street(req, prev)?;
+    let trunc = truncate_request_to_street(req, game.table_config(), prev)?;
     let resp = prewarm_inner(
         game,
         strategy_fn,
@@ -836,16 +867,20 @@ fn backfill_prev_street(
 /// 把同手请求截断到 `target` 街**起点**：真栈重放（同 [`build_real_auth`] 口径：真栈 config +
 /// 幻影 fold + [`hist_to_concrete`]）到街首次变为 `target` 的那一刻，保留此前的动作、board 截到该街
 /// 长度。其余字段（hole / 座位 / 盲注 / stacks / dealt_seats / names）不变 → `hand_seed` 不变（同手）。
+/// `solver_cfg` = blueprint 树的 config（[`SimplifiedNlheGame::table_config`]）。
 /// 重放失败 / 没到达 `target` → `Err`。
-fn truncate_request_to_street(req: &Request, target: poker::Street) -> Result<Request, String> {
-    let solver_cfg = TableConfig::default_6max_100bb();
+fn truncate_request_to_street(
+    req: &Request,
+    solver_cfg: &TableConfig,
+    target: poker::Street,
+) -> Result<Request, String> {
     let solver_bb = solver_cfg.big_blind.as_u64();
     if req.big_blind == 0 || solver_bb % req.big_blind != 0 {
         return Err("truncate_bad_scale".into());
     }
     let scale = solver_bb / req.big_blind;
-    let smap = seat_map(req)?;
-    let real_cfg = real_stacks_config(req, &solver_cfg, scale, &smap)?;
+    let smap = seat_map(req, solver_cfg.n_seats as usize)?;
+    let real_cfg = real_stacks_config(req, solver_cfg, scale, &smap)?;
     let mut st = GameState::new(&real_cfg, REAL_REPLAY_SEED);
     let apply = |st: &mut GameState, actor: u8, action: &str, to_op: Option<u64>| {
         if st.current_player() != Some(SeatId(actor)) {
@@ -1015,13 +1050,16 @@ fn decide(
     if req.hole.len() != 2 {
         return safe_fallback(&req.valid, "hole_not_2");
     }
-    if req.num_seats as usize != N_SEATS {
-        return safe_fallback(&req.valid, "not_6max");
+    // solver config = blueprint 树的 config（座位数 / 盲注 / 码深唯一来源；6 座 = 旧
+    // `default_6max_100bb`，逐字段相同 → 6 座 byte-equal）。
+    let solver_cfg = game.table_config().clone();
+    let n_seats = solver_cfg.n_seats as usize;
+    if req.num_seats as usize != n_seats {
+        return safe_fallback(&req.valid, &not_n_max(n_seats));
     }
     if req.big_blind == 0 {
         return safe_fallback(&req.valid, "bad_bb");
     }
-    let solver_cfg = TableConfig::default_6max_100bb();
     let solver_bb = solver_cfg.big_blind.as_u64();
     if solver_bb % req.big_blind != 0 {
         // OpenPoker BB 必须整除 solver BB（10/20 → ×5）；否则码深口径不一致 → 兜底。
@@ -1048,7 +1086,7 @@ fn decide(
     );
 
     // —— 座位映射（满桌 = 旧 rotate 公式；短桌 = 幻影座映射，[`seat_map`]）——
-    let smap = match seat_map(req) {
+    let smap = match seat_map(req, n_seats) {
         Ok(m) => m,
         Err(reason) => {
             dlog!("seat_map FAIL → fallback:{reason}");
@@ -1228,7 +1266,7 @@ fn decide(
             ResolveRoot::RoundStart => &round_start,
             ResolveRoot::CurrentDecision => &auth,
         };
-        let hand_seed = hand_seed_for(req, base_seed);
+        let hand_seed = hand_seed_for(req, base_seed, n_seats);
         dlog!(
             "anchored search auth: street={:?} pot={} current={:?} stacks={:?} committed={:?} within={} prev_within={} cross_street={} hand_seed={hand_seed}",
             auth.street(),
@@ -1339,7 +1377,7 @@ fn decide(
     let outgoing_abs: &StreetActionAbstraction = deep_abs_holder.as_ref().unwrap_or(abstraction);
 
     // per-decision 确定性采样（保混合策略 + 可复现；seed 与搜索与否无关 → search=None byte-equal）。
-    let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed));
+    let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed, n_seats));
     let chosen = sample_discrete(&dist, &mut sample_rng);
 
     // —— outgoing：solver Action → OpenPoker {action, amount}（blueprint / search 共享映射）——
@@ -1836,7 +1874,8 @@ enum PreflopEntry {
     Aggressive,
 }
 
-/// 重放本手**翻前街**，返回每个 solver tree seat 的入池方式（[`PreflopEntry`]，下标 = tree seat）。
+/// 重放本手**翻前街**，返回每个 solver tree seat 的入池方式（[`PreflopEntry`]，下标 = tree seat，
+/// 长度 = solver 座位数）。
 /// 纯函数（只读 `req`+`smap`+`solver_cfg`）：真栈建不出 / 重放失同步 / 脏动作 / 溢出 → 全
 /// `Unknown`（caller 退 `TopK`，保守安全）。只看翻前——街一进 flop 即停。与 [`build_real_auth`]
 /// 同重放口径（真栈 config + 幻影 fold + [`hist_to_concrete`]），但不注入牌、不要求轮到 hero。
@@ -1845,13 +1884,13 @@ fn preflop_entry_kinds(
     solver_cfg: &TableConfig,
     scale: u64,
     smap: &SeatMap,
-) -> [PreflopEntry; N_SEATS] {
-    let unknown = [PreflopEntry::Unknown; N_SEATS];
+) -> Vec<PreflopEntry> {
+    let unknown = vec![PreflopEntry::Unknown; solver_cfg.n_seats as usize];
     let Ok(real_cfg) = real_stacks_config(req, solver_cfg, scale, smap) else {
         return unknown;
     };
     let mut st = GameState::new(&real_cfg, REAL_REPLAY_SEED);
-    let mut kinds = unknown;
+    let mut kinds = unknown.clone();
     let phantom = smap.phantoms.iter().map(|&t| (t, "fold".to_string(), None));
     let acts: Vec<(u8, String, Option<u64>)> = match req
         .actions
@@ -1997,7 +2036,8 @@ fn decide_search_unanchored(
             format!("fallback:{shadow_reason}"),
         );
     }
-    let hand_seed = hand_seed_for(req, base_seed);
+    let n_seats = solver_cfg.n_seats as usize;
+    let hand_seed = hand_seed_for(req, base_seed, n_seats);
     // 档一前缀 reach（生产默认开）：用已同步前缀估 range；off → None = uniform（byte-equal 旧行为）。
     let prefix_decisions = rt
         .unanchored_prefix_reach
@@ -2019,17 +2059,17 @@ fn decide_search_unanchored(
             let prof = cell.borrow();
             let alpha = prof.cfg().strength_alpha;
             let pfr_shape_on = prof.cfg().pfr_shape;
-            let mut profiles: Vec<Option<OpponentProfile>> = vec![None; N_SEATS];
-            let mut shapes: Vec<ExploitShape> = vec![ExploitShape::TopK; N_SEATS];
+            let mut profiles: Vec<Option<OpponentProfile>> = vec![None; n_seats];
+            let mut shapes: Vec<ExploitShape> = vec![ExploitShape::TopK; n_seats];
             // PFR-aware（--exploit-pfr-shape）：重放翻前判各对手座本手入池方式（被动→CallBand 掐顶端 /
             // 主动→RaiseBand 收顶端），且仅当该座 PFR 也收敛才用。off → 全 Unknown → 全 TopK（仅 VPIP，
             // 与现有 exploit 逐位 byte-equal）；重放失败同样退 TopK（安全）。索引 = solver tree seat。
             let entry_kinds = if pfr_shape_on {
                 preflop_entry_kinds(req, solver_cfg, scale, smap)
             } else {
-                [PreflopEntry::Unknown; N_SEATS]
+                vec![PreflopEntry::Unknown; n_seats]
             };
-            for op_seat in 0..N_SEATS {
+            for op_seat in 0..smap.to_tree.len() {
                 if op_seat == req.my_seat as usize {
                     continue; // hero
                 }
@@ -2117,7 +2157,7 @@ fn decide_search_unanchored(
     let deep_abs: Option<StreetActionAbstraction> =
         scfg.deep_menu.then(|| deep_menu_for(&round_start).0);
     let outgoing_abs: &StreetActionAbstraction = deep_abs.as_ref().unwrap_or(abstraction);
-    let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed));
+    let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed, n_seats));
     let chosen = sample_discrete(&dist, &mut sample_rng);
     let solver_action = match outgoing_action(&auth, outgoing_abs, chosen) {
         Ok(a) => a,
@@ -2172,8 +2212,8 @@ fn real_stacks_config(
     if req.stacks.is_empty() {
         return Ok(cfg); // 无真栈 → 对称 100BB（仍是合法的真栈解，只是不利用码深）。
     }
-    if req.stacks.len() != N_SEATS {
-        return Err("stacks_len".into());
+    if req.stacks.len() != smap.to_tree.len() {
+        return Err("stacks_len".into()); // 下标 = OpenPoker 座位号，长度须 = 桌面座位数 N。
     }
     let mut stacks = cfg.starting_stacks.clone();
     for (op_seat, &op_stack) in req.stacks.iter().enumerate() {
@@ -2192,8 +2232,9 @@ fn real_stacks_config(
 
 /// 手内稳定的 subgame solve 基 seed：hash(hole, button, my_seat, num_seats, blinds, base_seed)
 /// —— **不含 actions / board**，故同一手多次决策同 seed → [`ResolveRoot::RoundStart`] 的街索引
-/// ordinal 下同街多决策共享字节相同的 solve（§6 #2 一致性）。
-fn hand_seed_for(req: &Request, base_seed: u64) -> u64 {
+/// ordinal 下同街多决策共享字节相同的 solve（§6 #2 一致性）。`n_seats` = solver 座位数（只用来判
+/// 「短桌」：dealt 非空且 ≠ 全座才掺 dealt）。
+fn hand_seed_for(req: &Request, base_seed: u64, n_seats: usize) -> u64 {
     let mut hasher = blake3::Hasher::new();
     for c in &req.hole {
         hasher.update(c.as_bytes());
@@ -2201,7 +2242,7 @@ fn hand_seed_for(req: &Request, base_seed: u64) -> u64 {
     hasher.update(&[req.button_seat, req.my_seat, req.num_seats]);
     hasher.update(&req.small_blind.to_le_bytes());
     hasher.update(&req.big_blind.to_le_bytes());
-    if !req.dealt_seats.is_empty() && req.dealt_seats.len() != N_SEATS {
+    if !req.dealt_seats.is_empty() && req.dealt_seats.len() != n_seats {
         // 短桌：占座不同 = 不同局面（满桌不掺、保旧 seed byte-equal）。
         hasher.update(&req.dealt_seats);
     }
@@ -2243,7 +2284,8 @@ fn action_label(a: &AbstractAction) -> String {
 }
 
 /// per-decision 确定性 seed：hash(hole, board, actions, base_seed)。保混合策略 + 可复现。
-fn sample_seed(req: &Request, base_seed: u64) -> u64 {
+/// `n_seats` 同 [`hand_seed_for`]（只判短桌）。
+fn sample_seed(req: &Request, base_seed: u64, n_seats: usize) -> u64 {
     let mut hasher = blake3::Hasher::new();
     for c in &req.hole {
         hasher.update(c.as_bytes());
@@ -2257,7 +2299,7 @@ fn sample_seed(req: &Request, base_seed: u64) -> u64 {
         hasher.update(h.action.as_bytes());
         hasher.update(&h.to.unwrap_or(0).to_le_bytes());
     }
-    if !req.dealt_seats.is_empty() && req.dealt_seats.len() != N_SEATS {
+    if !req.dealt_seats.is_empty() && req.dealt_seats.len() != n_seats {
         // 短桌：占座不同 = 不同局面（满桌不掺、保旧 seed byte-equal）。
         hasher.update(&req.dealt_seats);
     }
@@ -2456,6 +2498,10 @@ struct Args {
     bucket_table: PathBuf,
     reshape: String,
     postflop_cap: u8,
+    /// `--seats <3..=9>`：solver / blueprint 座位数（默认 [`DEFAULT_SEATS`] = 6）。须与 blueprint
+    /// 训练时的 `train_cfr --seats` 一致（不符 → 树 layout 指纹不符 → 加载报错）；OpenPoker 桌面
+    /// `num_seats` 须等于它（否则 `fallback:not_{N}max`）。
+    seats: u8,
     seed: u64,
     /// 缺口②实时搜索：`Some` = `--search` 开（postflop 触发面 re-solve 真码深子博弈）；`None`
     /// （默认）= 纯 blueprint（旧行为 byte-equal）。其余 search 字段由 `--search-*` flag 填。
@@ -2519,6 +2565,25 @@ fn reshape_profile(
         .ok_or_else(|| format!("unknown reshape {reshape} (expected {SIX_MAX_RESHAPE_NAMES})"))
 }
 
+/// 按 `(--reshape, --postflop-cap, --seats)` 重建 blueprint game（树 + 抽象 + 桶表）：桌面 =
+/// `TableConfig::n_max_at_bb(seats, 100)`，与 `train_cfr --profile six-max --seats <N>
+/// --stack-bb 100` 同一定义（6 座 == 旧 `default_6max_100bb()`）。
+fn build_game(
+    table: Arc<BucketTable>,
+    reshape: &str,
+    cap: u8,
+    seats: u8,
+) -> Result<SimplifiedNlheGame, String> {
+    let (abs, rules) = reshape_profile(reshape, cap)?;
+    SimplifiedNlheGame::new_with_abstraction(
+        table,
+        TableConfig::n_max_at_bb(seats, SOLVER_STACK_BB),
+        abs,
+        rules,
+    )
+    .map_err(|e| format!("build {seats}-max game failed: {e:?}"))
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -2579,16 +2644,23 @@ fn run() -> Result<(), String> {
             args.bucket_table.display()
         )
     })?);
-    let (abs, rules) = reshape_profile(&args.reshape, args.postflop_cap)?;
-    let game = SimplifiedNlheGame::new_with_abstraction(
+    // solver 桌面 = `--seats` 座 100BB（`n_max_at_bb(6, 100)` == 旧 `default_6max_100bb()`，逐字段
+    // 相同）。blueprint 是用某个座位数训练的：座位数不同 → 树不同 → 下面 load 的 layout 指纹校验
+    // 拒绝（`--seats` 与 blueprint 不符即报错退出，不会静默按错的座位数重放）。
+    let game = build_game(
         Arc::clone(&table),
-        TableConfig::default_6max_100bb(),
-        abs,
-        rules,
-    )
-    .map_err(|e| format!("build six-max game failed: {e:?}"))?;
+        &args.reshape,
+        args.postflop_cap,
+        args.seats,
+    )?;
     // blueprint 访问面（Blueprint doc）：完整 ckpt 或 crop 文件，二者都用同一 game 校验 layout 指纹。
-    let blueprint = load_blueprint(&args.checkpoint, game, args.cropped)?;
+    let blueprint = load_blueprint(&args.checkpoint, game, args.cropped).map_err(|e| {
+        format!(
+            "{e}\n（若 blueprint 训练时的座位数与 --seats {} 不同、或 --reshape / --postflop-cap / \
+             --bucket-table 不同，树的 layout 指纹不符，必然加载失败）",
+            args.seats
+        )
+    })?;
     let game = blueprint.game();
     let abstraction = game.abstraction().clone();
 
@@ -2634,7 +2706,7 @@ fn run() -> Result<(), String> {
         ready: true,
         update_count: blueprint.update_count(),
         reshape: args.reshape.clone(),
-        n_seats: N_SEATS,
+        n_seats: game.table_config().n_seats as usize,
         search: search_rt.is_some(),
         blueprint_keep_through: matches!(blueprint, Blueprint::Cropped { .. })
             .then(|| format!("{:?}", blueprint.keep_through())),
@@ -2672,8 +2744,8 @@ fn run() -> Result<(), String> {
         }
     }
     eprintln!(
-        "[openpoker_advisor] ready reshape={} update_count={} search={}",
-        ready.reshape, ready.update_count, ready.search
+        "[openpoker_advisor] ready reshape={} seats={} update_count={} search={}",
+        ready.reshape, ready.n_seats, ready.update_count, ready.search
     );
     let mut stdout = std::io::stdout();
     writeln!(
@@ -2786,6 +2858,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut bucket_table: Option<PathBuf> = None;
     let mut reshape = "preopen".to_string();
     let mut postflop_cap = 3u8;
+    let mut seats = DEFAULT_SEATS;
     let mut seed: u64 = 0;
     // 缺口② 实时搜索 flag（仅 --search 开时打包成 SubgameSearchConfig）。
     let mut search_on = false;
@@ -2823,6 +2896,17 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 postflop_cap = next_val(&mut it, &arg)?
                     .parse()
                     .map_err(|e| format!("bad cap: {e}"))?
+            }
+            "--seats" => {
+                let v: u8 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad seats: {e}"))?;
+                // 与 train_cfr --profile six-max --seats 同范围（2 座是 HU 语义 button=SB，
+                // 幻影座映射 / 位置语义不适用）。
+                if !(3..=9).contains(&v) {
+                    return Err(format!("--seats 须在 [3,9]，得 {v}"));
+                }
+                seats = v;
             }
             "--seed" => {
                 let raw = next_val(&mut it, &arg)?;
@@ -3083,6 +3167,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         bucket_table: bucket_table.ok_or("缺 --bucket-table")?,
         reshape,
         postflop_cap,
+        seats,
         seed,
         search,
         search_bucket_table,
@@ -3323,7 +3408,7 @@ mod tests {
             .expect("preopen game");
             let abstraction = game.abstraction().clone();
             let req = mk_req();
-            let smap = seat_map(&req).expect("seat_map");
+            let smap = seat_map(&req, 6).expect("seat_map");
             let my = SeatId(smap.tree_seat(req.my_seat).unwrap());
 
             // lockstep 不再 drift。
@@ -5708,7 +5793,7 @@ mod tests {
         };
         let solver_cfg = TableConfig::default_6max_100bb();
         let scale = solver_cfg.big_blind.as_u64() / req.big_blind; // 5
-        let smap = seat_map(&req).expect("seat_map");
+        let smap = seat_map(&req, 6).expect("seat_map");
         let kinds = preflop_entry_kinds(&req, &solver_cfg, scale, &smap);
         let kind_of = |op_seat: u8| kinds[smap.tree_seat(op_seat).unwrap() as usize];
         assert_eq!(kind_of(3), PreflopEntry::Aggressive, "UTG 开池加注");
@@ -5965,7 +6050,7 @@ mod tests {
     use poker::training::nlhe_betting_tree::all_1pot_6max;
     use poker::training::nlhe_dense_crop::{crop_dense_checkpoint, CropOptions};
 
-    /// crop 测试小 game：advisor 写死 6 座 100BB（N_SEATS / default_6max_100bb）→ 6-max 100BB +
+    /// crop 测试小 game：advisor `--seats` 默认 6 座 100BB（`default_6max_100bb`）→ 6-max 100BB +
     /// all-1pot N=2（dense 两表 ≈ 49 MiB）+ stub 200 桶（postflop 全落桶 0 → 小训练量即覆盖 flop/turn/river
     /// 节点，等价性不空验）。`--reshape all-1pot --postflop-cap 2` 的同一棵树（[`reshape_profile`]）。
     fn crop_test_game() -> SimplifiedNlheGame {
@@ -6185,7 +6270,7 @@ mod tests {
                 req.my_seat = *my_seat;
                 req.actions = actions.clone();
                 // σ 逐位（经 lockstep 取该决策的真 infoset）。
-                let smap = seat_map(&req).expect("seat map");
+                let smap = seat_map(&req, 6).expect("seat map");
                 let (_real, ab) = lockstep_replay(
                     game,
                     &TableConfig::default_6max_100bb(),
@@ -6238,7 +6323,7 @@ mod tests {
         // 翻牌：σ 逐位 + blueprint 路径（不搜 / flop_prefer_blueprint）+ 锚定搜索 + 预热 全等。
         for hole in [["Ah", "Kd"], ["7c", "2d"], ["Qs", "Qh"]] {
             let flop_req = &sb_line_hand(hole)[0];
-            let smap = seat_map(flop_req).unwrap();
+            let smap = seat_map(flop_req, 6).unwrap();
             let (_real, ab) = lockstep_replay(
                 game,
                 &TableConfig::default_6max_100bb(),
@@ -6613,5 +6698,735 @@ mod tests {
         assert_eq!(c.misses(), 1, "前缀为空 → 无需补解");
         assert_eq!(rf, rc);
         assert_eq!(crop.cropped_queries(), 0, "全程不应查询被裁街");
+    }
+
+    // =======================================================================
+    // N 座（--seats，9-max）：座位映射 / 座位数一致性 / 端到端 / 搜索规模诊断
+    // =======================================================================
+
+    /// 通用请求骨架（N 座桌，preflop、无历史）。
+    fn n_req(n: u8, button: u8, my: u8, dealt: Vec<u8>) -> Request {
+        Request {
+            hole: vec!["Ah".into(), "Kd".into()],
+            board: vec![],
+            button_seat: button,
+            my_seat: my,
+            num_seats: n,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![],
+            valid: full_valid(),
+            stacks: vec![],
+            dealt_seats: dealt,
+            names: Default::default(),
+        }
+    }
+
+    /// 选择 `items` 的所有 k 元子集（升序）。
+    fn subsets(n: u8, k: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for mask in 0u32..(1 << n) {
+            if mask.count_ones() as usize == k {
+                out.push((0..n).filter(|&i| mask >> i & 1 == 1).collect());
+            }
+        }
+        out
+    }
+
+    /// 用规则引擎**独立**验证座位映射的位置语义（不复用被测公式）：
+    /// - 满桌：OpenPoker 真实牌局 = button 在 `b` 的 N 座 `GameState`；
+    /// - 短桌 k∈[3,N−1]：真实牌局 = k 座紧凑 ring（ring 下标 0 = 真实 button，j ↔ 发牌座
+    ///   `dealt[(btn_idx+j)%k]`，盲注跳空座 = 引擎在 k 座上的标准盲注）。
+    ///
+    /// solver 侧 = N 座 button=0 的 `GameState` 先按 `phantoms` 依次 fold。两局走同一动作脚本
+    /// （能 check 就 check、否则 call；每个 preflop 首次进攻者先加注一次以打乱行动序）直到摊牌，
+    /// **每一步**断言 `solver.current_player == tree_seat(真实行动者的 OpenPoker 座)`——preflop +
+    /// 三条 postflop 街的行动序全部对上，即位置语义与 solver 的 `(seat − button) % n` 一致。
+    fn verify_seat_map_by_replay(n: u8, button: u8, dealt: &[u8]) {
+        let req = n_req(n, button, button, dealt.to_vec());
+        let smap = seat_map(&req, n as usize).expect("合法占座应可映射");
+        let k = if dealt.is_empty() {
+            n as usize
+        } else {
+            dealt.len()
+        };
+        // OpenPoker 座 ↔ 真实牌局座。
+        let (mut real, real_to_op): (GameState, Vec<u8>) = if k == n as usize {
+            let mut cfg = TableConfig::n_max_at_bb(n, 100);
+            cfg.button_seat = SeatId(button);
+            (GameState::new(&cfg, 1), (0..n).collect())
+        } else {
+            let bi = dealt.iter().position(|&s| s == button).unwrap();
+            let ring: Vec<u8> = (0..k).map(|j| dealt[(bi + j) % k]).collect();
+            (
+                GameState::new(&TableConfig::n_max_at_bb(k as u8, 100), 1),
+                ring,
+            )
+        };
+        let mut solver = GameState::new(&TableConfig::n_max_at_bb(n, 100), 1);
+        for &t in &smap.phantoms {
+            assert_eq!(solver.current_player(), Some(SeatId(t)), "幻影 fold 顺序");
+            solver.apply(Action::Fold).unwrap();
+        }
+        let mut raised = false;
+        let mut steps = 0;
+        while !real.is_terminal() {
+            let actor = real.current_player().expect("非终局有行动者");
+            let op = real_to_op[actor.0 as usize];
+            assert_eq!(
+                solver.current_player(),
+                Some(SeatId(smap.tree_seat(op).unwrap())),
+                "n={n} button={button} dealt={dealt:?} 第 {steps} 步（街 {:?}）行动者 op{op} 映射错",
+                real.street()
+            );
+            let la = real.legal_actions();
+            let open = la
+                .raise_range
+                .filter(|_| !raised && real.street() == poker::Street::Preflop);
+            let a = if let Some((min_to, _)) = open {
+                raised = true;
+                Action::Raise { to: min_to }
+            } else if la.check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            real.apply(a).unwrap();
+            solver.apply(a).unwrap();
+            steps += 1;
+        }
+        assert!(solver.is_terminal(), "两局应同时终局");
+        assert_eq!(
+            real.street(),
+            poker::Street::Showdown,
+            "脚本应打到摊牌（覆盖三条 postflop 街）"
+        );
+    }
+
+    /// 9 座：满桌（缺省 dealt / 显式全 9 座）每个 button 恒等公式 + 引擎重放；短桌 k∈[3,8] 的
+    /// **全部**占座子集 × 每个发牌 button 引擎重放（k=3..8 共 Σ C(9,k)·k 个局面）；同一套检查在
+    /// 6 座上也跑（与 9 座同一份代码，防两套逻辑漂移）。
+    #[test]
+    fn seat_map_n_max_positions_match_engine() {
+        for n in [6u8, 9] {
+            for b in 0..n {
+                let m = seat_map(&n_req(n, b, b, vec![]), n as usize).unwrap();
+                let expect: Vec<Option<u8>> = (0..n).map(|op| Some((op + n - b) % n)).collect();
+                assert_eq!(m.to_tree, expect);
+                assert!(m.phantoms.is_empty() && !m.hu);
+                let all: Vec<u8> = (0..n).collect();
+                let m2 = seat_map(&n_req(n, b, b, all.clone()), n as usize).unwrap();
+                assert_eq!(m2.to_tree, expect, "显式全座 = 满桌");
+                verify_seat_map_by_replay(n, b, &[]);
+            }
+            let mut cases = 0;
+            for k in 3..n as usize {
+                for dealt in subsets(n, k) {
+                    for &b in &dealt {
+                        let m = seat_map(&n_req(n, b, b, dealt.clone()), n as usize).unwrap();
+                        let expect_ph: Vec<u8> = (3..3 + n - k as u8).collect();
+                        assert_eq!(m.phantoms, expect_ph);
+                        // 发牌座单射到非幻影树座；未发牌座 None。
+                        let mut seen: Vec<u8> = m.to_tree.iter().flatten().copied().collect();
+                        seen.sort_unstable();
+                        let mut want: Vec<u8> = (0..n).filter(|t| !expect_ph.contains(t)).collect();
+                        want.sort_unstable();
+                        assert_eq!(seen, want);
+                        for op in 0..n {
+                            assert_eq!(m.to_tree[op as usize].is_some(), dealt.contains(&op));
+                        }
+                        verify_seat_map_by_replay(n, b, &dealt);
+                        cases += 1;
+                    }
+                }
+            }
+            assert!(cases > 0);
+        }
+    }
+
+    /// 9 座 HU（k=2，OpenPoker 约定 button 发 BB）：button → 树座 2、对手 → 树座 1，幻影 =
+    /// UTG..CO + BTN = [3,4,5,6,7,8,0]（6 座同规则得 [3,4,5,0]）；幻影 fold 完轮到 SB（树座 1）。
+    /// postflop 显式兜底 `short_hu_postflop`。
+    #[test]
+    fn seat_map_nine_max_hu_and_bad_input() {
+        let m = seat_map(&n_req(9, 7, 2, vec![2, 7]), 9).unwrap();
+        assert!(m.hu);
+        assert_eq!(m.phantoms, vec![3, 4, 5, 6, 7, 8, 0]);
+        assert_eq!(m.tree_seat(7), Ok(2));
+        assert_eq!(m.tree_seat(2), Ok(1));
+        assert!(m.tree_seat(0).is_err());
+        let m6 = seat_map(&n_req(6, 4, 1, vec![1, 4]), 6).unwrap();
+        assert_eq!(
+            m6.phantoms,
+            vec![3, 4, 5, 0],
+            "6 座 HU 幻影与旧实现逐字相同"
+        );
+        let mut st = GameState::new(&TableConfig::n_max_at_bb(9, 100), 1);
+        for &t in &m.phantoms {
+            assert_eq!(st.current_player(), Some(SeatId(t)));
+            st.apply(Action::Fold).unwrap();
+        }
+        assert_eq!(st.current_player(), Some(SeatId(1)), "幻影 fold 完轮到 SB");
+
+        // 脏输入：显式 Err，绝不静默错映射。
+        let bad = |r: Request| seat_map(&r, 9).err().expect("应 Err");
+        assert_eq!(bad(n_req(9, 9, 0, vec![])), "bad_button_seat");
+        assert_eq!(bad(n_req(9, 12, 0, vec![])), "bad_button_seat");
+        assert_eq!(bad(n_req(9, 0, 0, vec![0, 9])), "bad_dealt_seats");
+        assert_eq!(bad(n_req(9, 0, 0, vec![0])), "bad_dealt_seats");
+        assert_eq!(bad(n_req(9, 0, 0, vec![3, 0])), "bad_dealt_seats");
+        assert_eq!(
+            bad(n_req(9, 0, 4, vec![0, 1, 2])),
+            "dealt_missing_btn_or_me"
+        );
+        assert_eq!(
+            bad(n_req(9, 5, 1, vec![0, 1, 2])),
+            "dealt_missing_btn_or_me"
+        );
+        // 6 座 solver 上的 9 座号（≥6）同样 Err（driver 侧本就不该发）。
+        assert_eq!(
+            seat_map(&n_req(6, 0, 0, vec![0, 1, 7]), 6).err().as_deref(),
+            Some("bad_dealt_seats")
+        );
+    }
+
+    /// `--seats`：默认 6；[3,9] 外拒绝；与其余参数正交。
+    #[test]
+    fn parse_args_seats() {
+        let parse = |extra: &[&str]| {
+            parse_args_from(
+                ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                    .iter()
+                    .chain(extra)
+                    .map(|s| s.to_string()),
+            )
+        };
+        assert_eq!(parse(&[]).unwrap().seats, DEFAULT_SEATS);
+        assert_eq!(DEFAULT_SEATS, 6);
+        assert_eq!(parse(&["--seats", "9"]).unwrap().seats, 9);
+        assert_eq!(parse(&["--seats", "3"]).unwrap().seats, 3);
+        for bad in ["2", "10", "0", "x"] {
+            assert!(parse(&["--seats", bad]).is_err(), "--seats {bad} 应拒绝");
+        }
+        // `build_game(…, 6)` 与旧 `default_6max_100bb()` 逐字段相同（6 座 byte-equal 的根）。
+        let a = TableConfig::n_max_at_bb(DEFAULT_SEATS, SOLVER_STACK_BB);
+        let b = TableConfig::default_6max_100bb();
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
+    /// 桌面座位数 ≠ solver 座位数 → 显式兜底，标签带 solver 座位数（6 座仍是旧 `not_6max`）；
+    /// 预热同口径 skip。
+    #[test]
+    fn table_seat_count_mismatch_falls_back() {
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let g6 = preopen_game();
+        let abs6 = g6.abstraction().clone();
+        let r = decide(
+            &g6,
+            &abs6,
+            &uniform,
+            &n_req(9, 0, 3, vec![]),
+            0,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "fallback:not_6max", "6 座 blueprint 上 9 座桌");
+        let g9 = nine_max_test_game();
+        let abs9 = g9.abstraction().clone();
+        for n in [6u8, 8] {
+            let r = decide(
+                &g9,
+                &abs9,
+                &uniform,
+                &n_req(n, 0, 3, vec![]),
+                0,
+                None,
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(r.source, "fallback:not_9max", "9 座 blueprint 上 {n} 座桌");
+            assert!(is_legal(&r, &full_valid()));
+        }
+        let rt9 = rt(SubgameSearchConfig {
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        });
+        let mut flop = n_req(6, 0, 1, vec![]);
+        flop.board = vec!["7h".into(), "2c".into(), "Ks".into()];
+        let p = prewarm(
+            &g9,
+            &uniform,
+            &flop,
+            0,
+            Some(&rt9),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(p.source, "prewarm:skip:not_9max");
+        // 9 座 game 上 9 座桌 UTG（树座 3 = op (0+3)%9）首动作：blueprint 路径正常。
+        let r = decide(
+            &g9,
+            &abs9,
+            &uniform,
+            &n_req(9, 0, 3, vec![]),
+            0,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "blueprint", "{r:?}");
+    }
+
+    /// 计数版子树 DFS（与 `PublicBettingTree::walk` 同一展开：`abs.abstract_actions` → `apply` →
+    /// 非终局递归；postflop + 规则全关 / all-1pot 规则下 `filter_actions` 是恒等），内存 O(深度)。
+    /// 节点数到 `cap` 即停（返回 `None` = 超过 cap）——避免为量规模而真建一棵几 GB 的树。
+    fn count_subtree_nodes(
+        root: &GameState,
+        abs: &StreetActionAbstraction,
+        cap: u64,
+    ) -> Option<u64> {
+        use poker::ActionAbstraction;
+        fn go(st: &GameState, abs: &StreetActionAbstraction, n: &mut u64, cap: u64) -> bool {
+            *n += 1;
+            if *n > cap {
+                return false;
+            }
+            for a in abs.abstract_actions(st).iter() {
+                let mut nx = st.clone();
+                nx.apply(a.to_concrete()).expect("抽象动作合法");
+                if !nx.is_terminal() && !go(&nx, abs, n, cap) {
+                    return false;
+                }
+            }
+            true
+        }
+        let mut n = 0;
+        go(root, abs, &mut n, cap).then_some(n)
+    }
+
+    /// k 人见 flop 的 flop 首点（N=9 座 100BB）：按 preflop 行动序前 9−k 个非盲位先 fold（UTG 起），
+    /// 余下全 call（`open_to = Some(x)` = 首个留下的人先加注到 x、其余 call；`None` = limp 池），
+    /// BB check / call → flop。k 人池与座位数无关（弃牌座对子树零节点），故 6-max 已实测的
+    /// k≤6 规模在 9-max 上原样成立，9-max 新增的只有 k=7..9。
+    fn k_way_flop_root(k: usize, open_to: Option<u64>) -> GameState {
+        let mut st = GameState::new(&TableConfig::n_max_at_bb(9, 100), 1);
+        let mut folds = 9 - k;
+        let mut opened = false;
+        while st.street() == poker::Street::Preflop {
+            let seat = st.current_player().unwrap().0;
+            let a = if folds > 0 && seat != 1 && seat != 2 {
+                folds -= 1;
+                Action::Fold
+            } else if let (Some(to), false) = (open_to, opened) {
+                opened = true;
+                Action::Raise {
+                    to: ChipAmount::new(to),
+                }
+            } else if st.legal_actions().check {
+                Action::Check
+            } else {
+                Action::Call
+            };
+            st.apply(a).unwrap();
+        }
+        assert_eq!(
+            st.players()
+                .iter()
+                .filter(|p| p.status == poker::PlayerStatus::Active)
+                .count(),
+            k
+        );
+        st
+    }
+
+    /// 计数 DFS 与真建树（`build_subtree`）逐数一致（小 k），证诊断口径 = 生产建树口径。
+    #[test]
+    fn subtree_count_matches_build_subtree() {
+        use poker::training::nlhe_betting_tree::{deep_single_pot, PublicBettingTree};
+        let (abs, rules) = deep_single_pot();
+        for (k, open) in [(2, None), (3, None), (2, Some(350)), (3, Some(350))] {
+            let root = k_way_flop_root(k, open);
+            let built = PublicBettingTree::build_subtree(&root, &abs, rules, 0, 0).num_nodes();
+            assert_eq!(
+                count_subtree_nodes(&root, &abs, u64::MAX),
+                Some(built as u64),
+                "k={k} open={open:?}"
+            );
+        }
+    }
+
+    /// **9-max 实时搜索子树规模诊断**（`#[ignore]`，release 跑：`cargo test --release --bin
+    /// openpoker_advisor nine_max_search_subtree_sizing -- --ignored --nocapture`）。
+    ///
+    /// 口径：flop 首点为根（RoundStart 子树 = 解到河牌终局），菜单 = 9-max 目标 blueprint
+    /// `all-1pot` 的 postflop {1pot}（= 不开 `--search-deep-menu` 时子树菜单；开 deep_menu 时 ≥5
+    /// Active 也是 {1pot}——[`DEEP_MENU_WIDE_MAX_ACTIVE`]=4 按**人数**闸，与桌面座位数无关）。
+    /// 100BB 对称栈，limp 池（pot = k BB）与单加注池（3.5BB open，k 人 call）。计数 cap 2 亿节点。
+    ///
+    /// [`DEEP_MENU_WIDE_MAX_ACTIVE`]: poker::training::nlhe_betting_tree::DEEP_MENU_WIDE_MAX_ACTIVE
+    #[test]
+    #[ignore = "诊断：release 跑，打印 k-way flop 子树节点数"]
+    fn nine_max_search_subtree_sizing() {
+        use poker::training::nlhe_betting_tree::deep_menu_for;
+        let (abs, _) = reshape_profile("all-1pot", 4).unwrap();
+        const CAP: u64 = 200_000_000;
+        eprintln!("k | pot | menu(deep_menu_for) | {{1pot}} nodes | wall_ms");
+        for open in [None, Some(350u64)] {
+            for k in 2..=9 {
+                let root = k_way_flop_root(k, open);
+                let wide = !matches!(
+                    deep_menu_for(&root)
+                        .0
+                        .config_for(poker::Street::Flop)
+                        .raise_pot_ratios
+                        .len(),
+                    1
+                );
+                let t0 = Instant::now();
+                let n = count_subtree_nodes(&root, &abs, CAP);
+                eprintln!(
+                    "{k} | {} | {} | {} | {}",
+                    if open.is_some() { "SRP 3.5BB" } else { "limp" },
+                    if wide { "wide{0.5,1}" } else { "{1pot}" },
+                    n.map_or(format!(">{CAP}"), |n| n.to_string()),
+                    t0.elapsed().as_millis()
+                );
+            }
+        }
+    }
+
+    /// 9-max 端到端测试 game：advisor 生产构造 [`build_game`]（`n_max_at_bb(9, 100)` +
+    /// `--reshape all-1pot --postflop-cap 2`）+ stub 200 桶。cap 2 → 见 flop ≤2 人，dense 两表
+    /// ≈ 209 MiB（实测 34,895 节点 / 6.4M 行 / 13.7M slot；cap 3 要 2.3 GiB，本机跑不动）。
+    fn nine_max_test_game() -> SimplifiedNlheGame {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        build_game(table, "all-1pot", 2, 9).expect("9-max game")
+    }
+
+    /// 与 [`nine_max_test_game`] 同 reshape / cap / 桶表、只换座位数的 game（错配测试用）。
+    fn n_seat_test_game(seats: u8) -> SimplifiedNlheGame {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        build_game(table, "all-1pot", 2, seats).expect("game")
+    }
+
+    /// 9-max fixture：训练 → 完整 ckpt + crop(keep_through=Flop, 不留 regret)。文件写到
+    /// `target/tmp`（磁盘；`/tmp` 是 tmpfs，200+ MiB 的 ckpt 会直接吃内存）。trainer 存盘后即释放。
+    fn nine_max_fixture() -> (TempDir, PathBuf, PathBuf) {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tmp")
+            .join(format!("advisor_nine_max_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let guard = TempDir(dir.clone());
+        let full = dir.join("full.ckpt");
+        let crop = dir.join("pf.crop");
+        {
+            let mut t = DenseNlheEsMccfrTrainer::new(nine_max_test_game(), 7).with_lcfr_period(500);
+            let mut rng = ChaCha20Rng::from_seed(0x9_0001);
+            for _ in 0..3_000 {
+                t.step(&mut rng).expect("step");
+            }
+            t.save_checkpoint(&full).expect("save");
+            crop_dense_checkpoint(
+                &full,
+                &crop,
+                t.game(),
+                CropOptions {
+                    keep_through: StreetTag::Flop,
+                    keep_regret: false,
+                },
+            )
+            .expect("crop");
+        }
+        (guard, full, crop)
+    }
+
+    /// 9 座桌 button=4 的 SB-vs-BB 线：UTG(op7)…BTN(op4) 7 家 fold，SB(op5) complete、BB(op6)
+    /// check。我 = SB(op5)，postflop 每街首个行动者。`extra` = flop 起后续动作。
+    fn nine_sb_line_req(
+        hole: [&str; 2],
+        board: &[&str],
+        extra: &[HistAction],
+        valid: ValidActions,
+    ) -> Request {
+        let mut actions: Vec<HistAction> = [7u8, 8, 0, 1, 2, 3, 4]
+            .iter()
+            .map(|&s| ha(s, "fold", None))
+            .collect();
+        actions.push(ha(5, "call", Some(20)));
+        actions.push(ha(6, "check", None));
+        actions.extend_from_slice(extra);
+        Request {
+            hole: hole.iter().map(|c| c.to_string()).collect(),
+            board: board.iter().map(|c| c.to_string()).collect(),
+            button_seat: 4,
+            my_seat: 5,
+            num_seats: 9,
+            small_blind: 10,
+            big_blind: 20,
+            actions,
+            valid,
+            stacks: vec![],
+            dealt_seats: vec![],
+            names: Default::default(),
+        }
+    }
+
+    /// 同手 flop 首点 / turn 首点 / river 首点 / river 面对 1pot 下注。
+    fn nine_sb_line_hand(hole: [&str; 2]) -> Vec<Request> {
+        let flop = ["7h", "2c", "Ks"];
+        let turn = ["7h", "2c", "Ks", "4d"];
+        let river = ["7h", "2c", "Ks", "4d", "9s"];
+        let x = [ha(5, "check", None), ha(6, "check", None)];
+        let turn_x = [x.as_slice(), &x].concat();
+        let river_bet = [
+            turn_x.as_slice(),
+            &[ha(5, "check", None), ha(6, "raise", Some(40))],
+        ]
+        .concat();
+        vec![
+            nine_sb_line_req(hole, &flop, &[], check_valid()),
+            nine_sb_line_req(hole, &turn, &x, check_valid()),
+            nine_sb_line_req(hole, &river, &turn_x, check_valid()),
+            nine_sb_line_req(
+                hole,
+                &river,
+                &river_bet,
+                ValidActions {
+                    can_check: false,
+                    can_call: true,
+                    can_raise: true,
+                    min_raise: Some(80),
+                    max_raise: Some(1980),
+                },
+            ),
+        ]
+    }
+
+    /// **9-max 端到端**（9 座训练的小 blueprint + 9 座桌请求）：
+    /// ① `--seats` 与 blueprint 座位数不符 → 完整 ckpt / crop 加载都报错（layout 指纹拒绝；6 / 8 座
+    ///    两档，8 座树只多一个座位也拒）；同座位数加载成功、`ready.n_seats` 来源 = 9。
+    /// ② 翻前 blueprint：满桌（button=4 旋转）UTG 首动作 + 6 人短桌（幻影 fold）均走 blueprint、合法；
+    ///    短桌 k 人局与「满桌前 9−k 位 fold」的等价节点 info_set / 分布逐位相同；crop == 完整。
+    /// ③ 翻后搜索：flop → turn → river → river 面对下注全走实时搜索（crop 与完整逐字节相同，
+    ///    转牌 / 河牌零被裁街查询）；flop 预热命中；off-stack 真栈（`stacks` 长 9）走脱锚搜索。
+    #[test]
+    fn nine_max_end_to_end_blueprint_and_search() {
+        let (_dir, full_p, crop_p) = nine_max_fixture();
+
+        // ① 座位数错配必拒（完整 + crop）。
+        for wrong in [6u8, 8] {
+            let e = load_blueprint(&full_p, n_seat_test_game(wrong), false)
+                .err()
+                .unwrap_or_else(|| panic!("{wrong} 座 game 加载 9 座 ckpt 须失败"));
+            assert!(
+                e.contains("fingerprint") || e.contains("Fingerprint"),
+                "{e}"
+            );
+            assert!(
+                load_blueprint(&crop_p, n_seat_test_game(wrong), true).is_err(),
+                "{wrong} 座 game 加载 9 座 crop 须失败"
+            );
+        }
+        let full = load_blueprint(&full_p, nine_max_test_game(), false).expect("load full");
+        let crop = load_blueprint(&crop_p, nine_max_test_game(), true).expect("load crop");
+        let game = full.game();
+        assert_eq!(game.table_config().n_seats, 9);
+        let abs = game.abstraction().clone();
+        let sf = |i: &InfoSetId, _n: usize| full.strategy(i);
+        let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);
+        let (rt_f, rt_c) = (crop_rt(&full, crop_scfg()), crop_rt(&crop, crop_scfg()));
+        validate_crop_runtime(crop.keep_through(), Some(&rt_c)).expect("生产约束满足");
+
+        // ② 翻前。满桌 button=4：UTG = op (4+3)%9 = 7。
+        for hole in [["Ah", "Kd"], ["7c", "2d"], ["Qs", "Qh"]] {
+            let mut req = n_req(9, 4, 7, vec![]);
+            req.hole = hole.iter().map(|c| c.to_string()).collect();
+            for search in [false, true] {
+                let rf = decide(
+                    game,
+                    &abs,
+                    &sf,
+                    &req,
+                    0x9EED,
+                    search.then_some(&rt_f),
+                    &mut SubgameSolveCache::new(),
+                );
+                let rc = decide(
+                    game,
+                    &abs,
+                    &sc,
+                    &req,
+                    0x9EED,
+                    search.then_some(&rt_c),
+                    &mut SubgameSolveCache::new(),
+                );
+                assert_eq!(rf.source, "blueprint", "{rf:?}");
+                assert!(is_legal(&rf, &req.valid));
+                assert_eq!(rf, rc, "翻前 crop 与完整须全等");
+            }
+            // 6 人短桌 dealt={0,2,4,5,6,8}、button=4：ring 4,5,6,8,0,2 → UTG = op8（树座 3+3=6）。
+            // 等价满桌节点：树座 3/4/5 fold 后轮到树座 6 = op (4+6)%9 = 1。
+            let mut short = n_req(9, 4, 8, vec![0, 2, 4, 5, 6, 8]);
+            short.hole = req.hole.clone();
+            let mut equiv = n_req(9, 4, 1, vec![]);
+            equiv.hole = req.hole.clone();
+            equiv.actions = vec![
+                ha(7, "fold", None),
+                ha(8, "fold", None),
+                ha(0, "fold", None),
+            ];
+            let rs = decide(
+                game,
+                &abs,
+                &sf,
+                &short,
+                0x9EED,
+                None,
+                &mut SubgameSolveCache::new(),
+            );
+            let re = decide(
+                game,
+                &abs,
+                &sf,
+                &equiv,
+                0x9EED,
+                None,
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(rs.source, "blueprint", "{rs:?}");
+            assert!(is_legal(&rs, &short.valid));
+            assert_eq!(
+                rs.info_set, re.info_set,
+                "短桌 = 满桌前 3 位 fold 的同一节点"
+            );
+            assert_eq!(rs.probs, re.probs);
+        }
+
+        // ③ 翻后：整手（共享缓存 = 生产顺序），crop 与完整逐字节相同、全走搜索。
+        for hole in [["Ah", "Kd"], ["Qs", "Qh"]] {
+            let hand = nine_sb_line_hand(hole);
+            let (mut cf, mut cc) = (SubgameSolveCache::new(), SubgameSolveCache::new());
+            for (k, req) in hand.iter().enumerate() {
+                let rf = decide(game, &abs, &sf, req, 0x9EEF, Some(&rt_f), &mut cf);
+                let rc = decide(game, &abs, &sc, req, 0x9EEF, Some(&rt_c), &mut cc);
+                assert_eq!(rc.source, "search", "决策 {k}（{hole:?}）：{rc:?}");
+                assert!(is_legal(&rc, &req.valid), "决策 {k}：{rc:?}");
+                assert_eq!(rf, rc, "决策 {k}（{hole:?}）crop 与完整须逐字节相同");
+            }
+        }
+        // 预热 → 决策命中。
+        let flop_req = &nine_sb_line_hand(["Ah", "Kd"])[0];
+        let mut c = SubgameSolveCache::new();
+        let p = prewarm(game, &sc, flop_req, 0x9EEF, Some(&rt_c), &mut c);
+        assert_eq!(p.source, "prewarm:stored", "{p:?}");
+        let r = decide(game, &abs, &sc, flop_req, 0x9EEF, Some(&rt_c), &mut c);
+        assert_eq!(r.source, "search");
+        assert_eq!(c.hits(), 1, "预热后决策须命中");
+        // off-stack：hero(SB, op5) 只有 15BB（≠ blueprint 100BB 树）→ 脱锚 / 锚定搜索之一，合法。
+        let mut off = flop_req.clone();
+        off.stacks = vec![2000; 9];
+        off.stacks[5] = 300;
+        let r = decide(
+            game,
+            &abs,
+            &sc,
+            &off,
+            0x9EEF,
+            Some(&rt_c),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(r.source.starts_with("search"), "{r:?}");
+        assert!(!r.source.starts_with("search_giveup"), "{r:?}");
+        assert!(is_legal(&r, &off.valid));
+        // stacks 长度 ≠ 9 → 真栈建不了 → 显式 giveup（不静默按错座位读栈）。
+        let mut bad = flop_req.clone();
+        bad.stacks = vec![2000; 6];
+        let r = decide(
+            game,
+            &abs,
+            &sc,
+            &bad,
+            0x9EEF,
+            Some(&rt_c),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(r.source.contains("stacks_len"), "{r:?}");
+        assert_eq!(crop.cropped_queries(), 0, "全程不应查询被裁街");
+    }
+
+    /// 9 座 7 人 limp 池（no-limp blueprint 上必失同步 → 脱锚搜索）：
+    /// - 100BB 真栈：7-way limp flop {1pot} 子树实测 3.07M 节点 > cap 200k → **建树前**计数即拒，
+    ///   `search_giveup:unanchored:subtree_precount:7way>200000`（check-when-free），预热同口径 err；
+    /// - 10BB 短码：同一线子树很小 → 闸放行、正常脱锚搜索。
+    #[test]
+    fn nine_max_multiway_precount_gate() {
+        let game = nine_max_test_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let mut req = n_req(9, 0, 1, vec![]);
+        req.board = vec!["7h".into(), "2c".into(), "Ks".into()];
+        req.actions = vec![ha(3, "fold", None), ha(4, "fold", None)];
+        for s in [5u8, 6, 7, 8, 0, 1] {
+            req.actions.push(ha(s, "call", Some(20)));
+        }
+        req.actions.push(ha(2, "check", None));
+        req.valid = check_valid();
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            max_subtree_nodes: 200_000,
+            ..SubgameSearchConfig::default()
+        };
+        let rt9 = rt(scfg);
+        let r = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            1,
+            Some(&rt9),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(
+            r.source, "search_giveup:unanchored:subtree_precount:7way>200000",
+            "{r:?}"
+        );
+        assert_eq!(r.action, "check");
+        // 同一缓存：同街再次决策 → 直接复用拒绝结果（不再走 lookup / 计数，misses 不变）。
+        let mut shared = SubgameSolveCache::new();
+        let r1 = decide(&game, &abs, &uniform, &req, 1, Some(&rt9), &mut shared);
+        assert_eq!(r1.source, r.source);
+        let misses = shared.misses();
+        assert_eq!(misses, 1, "首次被拒：一次 miss（计数后拒绝）");
+        let r2 = decide(&game, &abs, &uniform, &req, 1, Some(&rt9), &mut shared);
+        assert_eq!(r2.source, r.source, "{r2:?}");
+        assert_eq!(shared.misses(), misses, "第二次直接复用拒绝原因，不再计数");
+        let p = prewarm(
+            &game,
+            &uniform,
+            &req,
+            1,
+            Some(&rt9),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(
+            p.source, "prewarm:err:subtree_precount:7way>200000",
+            "{p:?}"
+        );
+
+        let mut short = req.clone();
+        short.stacks = vec![200; 9];
+        let r = decide(
+            &game,
+            &abs,
+            &uniform,
+            &short,
+            1,
+            Some(&rt9),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "search:unanchored", "{r:?}");
+        assert!(is_legal(&r, &short.valid));
     }
 }

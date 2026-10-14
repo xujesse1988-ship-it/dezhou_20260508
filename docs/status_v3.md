@@ -37,6 +37,19 @@ GameState + 每 blueprint 一份抽象影子,off-tree 翻译推进;slumbot_advis
 (不能干净排内在强度);**实测码深漂移严重**(真实桌 14BB–800BB)。剩绝对强度量化(挂场数百手 + 排行榜,需用户授权时长)。
 详见 `six_max_nlhe_target.md` S4 续⑥⑦ + S5 续、`temp/openpoker_client_design_2026_06_02.md` §9。
 
+**OpenPoker advisor 支持 N 座 / 9-max(2026-10-14)**:`openpoker_advisor --seats <3..9>`(默认 6,不传时与旧版
+逐位相同)。solver 座位数 / 盲注 / 码深唯一来源 = blueprint game 的 `table_config()`(`n_max_at_bb(seats,100)`,与
+`train_cfr --profile six-max --seats N --stack-bb 100` 同一定义),`--seats` 与 blueprint 不符 → layout 指纹拒绝加载
+(完整 ckpt 与 crop 都测了)。座位映射 `seat_map(req, N)` 统一 N 座:满桌 `(op−button)%N`;k 人短桌(3≤k<N)真实
+BTN/SB/BB→树座 0/1/2、其余按环序占 CO 侧、前 N−k 个 UTG 起位置幻影先 fold;HU 仅 preflop。规则引擎逐步重放独立
+验证(6/9 座全部占座子集 × 每个 button,preflop + 三街行动序)。桌面座位数 ≠ N → `fallback:not_{N}max`。
+`openpoker_hh` 接受 2..=9 座。driver `tools/openpoker_play.py` 加 `--seats`(透传 + 核对 advisor ready 的 n_seats)
+与 `--cropped-checkpoint` 透传。**9-max 搜索规模**(`nine_max_search_subtree_sizing`,100BB flop 根 {1pot}):limp 池
+k=6/7/8/9 = 557k / 3.07M / 15.5M / 72.6M 节点,单加注池 9-way 1.47M;≥7 人 limp 池 `max_subtree_nodes` 原本是建完树
+才查 → `subgame.rs` 脱锚 solve 新增「≥7 Active 先计数、超 cap 不建」闸(只在缓存未命中真要建树时数;被拒的 key 记在
+`SubgameSolveCache` 里,同街再决策直接复用拒绝结果不重数;6 座不可达,逐位不变)。上线建议 `--search-max-nodes` 按此表定
+(40M 下 8-way limp 15.5M 会放行、建树约 40s + 约 2.9 GB:TreeNode 184 字节/节点)。
+
 **S6 进度(2026-06-03):实时搜索推进,MVP subgame-solver 核心已落地 + vultr 验证**(分支 `6max-rts-mvp`
 commit `cf9efdb`,**未并入 6max**)。设计成文 `temp/realtime_search_design_2026_06_03.md`(文献调研+代码复用映射+
 对抗验证):方法定型 = Pluribus/Modicum tabular depth-limited search(非 DeepStack/ReBeL)。三件落地:①

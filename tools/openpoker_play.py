@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""OpenPoker 6-max WS driver（docs/temp/openpoker_client_design_2026_06_02.md §2/§3/§7）。
+"""OpenPoker N-max WS driver（默认 6 座；9 座桌传 --seats 9 + 9 座 blueprint）
+（docs/temp/openpoker_client_design_2026_06_02.md §2/§3/§7）。
 
 网络 / token / 重连 / 限速全在本文件（Python，websocket-client），策略全在常驻 Rust
 advisor（tools/openpoker_advisor.rs）—— Rust crate 零网络依赖（invariant）。
@@ -24,6 +25,13 @@ winners/final_stacks/shown_cards 原样，喂 Rust 侧 `openpoker_hh_aivat`
 （请求摘要含真栈/幻影座 + advisor 响应全诊断字段 source/probs/info_set/solve_updates/chosen +
 实发动作包）、结果（winners/final_stacks/我方栈）。**纯展示、只读已累计状态**，不动任何发往
 advisor / ws 的字节 → IPC + 出动作 byte-equal 不受影响（与 --hh-log 同隔离原则）。
+
+座位数（--seats，默认 6）：= OpenPoker 桌面座位数 = advisor solver 座位数（透传 advisor
+`--seats`，blueprint 须用同座位数训练；advisor 启动时 layout 指纹不符直接报错退出）。driver 启动后
+核对 advisor ready 行的 n_seats，不一致即拒绝开打。缺省 6 时 advisor 命令行 / 请求流与旧版逐字节相同。
+
+blueprint 二选一：--checkpoint（完整 dense ckpt）或 --cropped-checkpoint（按街裁切的 crop 文件，
+advisor 要求同时开 --search --search-trigger all-postflop，转牌 / 河牌必走实时搜索）。
 
 两种模式：
   --selftest   离线：不连网，用 canned 6-max 消息序列把 driver↔advisor IPC + 出合法动作跑通
@@ -56,6 +64,8 @@ BIG_BLIND_OP = 20       # OpenPoker 默认 10/20。
 SMALL_BLIND_OP = 10
 STACK_LEAVE_LO = 80 * BIG_BLIND_OP   # 1600：我方栈 < 80BB → leave/rejoin。
 STACK_LEAVE_HI = 180 * BIG_BLIND_OP  # 3600：我方栈 > 180BB → leave/rejoin。
+# 桌面座位数（= advisor solver 座位数）。main() 按 --seats 改写（缺省 6 = 旧行为）；本模块所有
+# 函数在运行期读它（无定义期捕获），selftest canned 场景按 6 座写，只在 6 座下跑。
 NUM_SEATS = 6
 _BOARD_LEN = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 
@@ -78,8 +88,11 @@ _EXT_KEYS = ("amount", "amount_mode", "street", "stack", "stack_before", "stack_
 # ===========================================================================
 class Advisor:
     def __init__(self, binary, checkpoint, bucket_table, reshape, postflop_cap, seed,
-                 extra_args=None):
-        cmd = [binary, "--checkpoint", checkpoint, "--bucket-table", bucket_table,
+                 extra_args=None, cropped=False):
+        # cropped=True：checkpoint 是按街裁切的 crop 文件 → advisor --cropped-checkpoint（缺省
+        # False = --checkpoint，命令行与旧版逐字节相同）。
+        ckpt_flag = "--cropped-checkpoint" if cropped else "--checkpoint"
+        cmd = [binary, ckpt_flag, checkpoint, "--bucket-table", bucket_table,
                "--reshape", reshape, "--postflop-cap", str(postflop_cap), "--seed", str(seed)]
         cmd += list(extra_args or [])  # 缺口②：--search / --search-* 透传给 Rust advisor。
         self.proc = subprocess.Popen(
@@ -91,6 +104,12 @@ class Advisor:
         self.ready = json.loads(line)
         if not self.ready.get("ready"):
             raise RuntimeError(f"advisor ready 异常: {line!r}")
+        # 座位数一致性：advisor 的 solver 座位数（= blueprint 座位数）必须等于 driver 的桌面
+        # 座位数，否则每个请求都会 fallback:not_<N>max（或更糟：座位号越界被静默丢弃）。
+        if self.ready.get("n_seats") != NUM_SEATS:
+            self.close()
+            raise RuntimeError(f"advisor n_seats={self.ready.get('n_seats')} ≠ driver --seats "
+                               f"{NUM_SEATS}（blueprint / --seats 配错）")
         # 未读取的 prewarm 响应行数（prewarm 先发后弃响应；管道有序 → decide 前按计数 drain
         # 即可对齐，不会把预热响应误当决策响应）。
         self._pending_prewarms = 0
@@ -1262,9 +1281,16 @@ def _selftest_hu_detection():
 # main
 # ===========================================================================
 def main():
-    p = argparse.ArgumentParser(description="OpenPoker 6-max WS driver + Rust advisor")
+    p = argparse.ArgumentParser(description="OpenPoker N-max WS driver + Rust advisor")
     p.add_argument("--advisor-bin", default="target/release/openpoker_advisor")
-    p.add_argument("--checkpoint", required=True)
+    # blueprint 二选一：完整 dense ckpt / 按街裁切的 crop 文件（后者需 --search --search-trigger
+    # all-postflop，advisor 启动期校验）。
+    p.add_argument("--checkpoint", default=None)
+    p.add_argument("--cropped-checkpoint", default=None,
+                   help="按街裁切的 blueprint（nlhe_dense_crop 产出）；与 --checkpoint 二选一，"
+                        "需配 --search --search-trigger all-postflop")
+    p.add_argument("--seats", type=int, default=6, choices=range(3, 10), metavar="{3..9}",
+                   help="桌面座位数 = advisor solver 座位数（blueprint 须同座位数训练；默认 6）")
     p.add_argument("--bucket-table", required=True)
     p.add_argument("--reshape", default="preopen")
     p.add_argument("--postflop-cap", type=int, default=3)
@@ -1319,7 +1345,19 @@ def main():
     p.add_argument("--exploit-converge-drift", type=float, default=None)
     args = p.parse_args()
 
+    if (args.checkpoint is None) == (args.cropped_checkpoint is None):
+        raise SystemExit("--checkpoint 与 --cropped-checkpoint 必须二选一")
+    if args.cropped_checkpoint is not None and not args.search:
+        raise SystemExit("--cropped-checkpoint 需配 --search（转牌 / 河牌没有 blueprint 数据）")
+    if args.selftest and args.seats != 6:
+        raise SystemExit("--selftest 的 canned 场景按 6 座写，只支持 --seats 6")
+    global NUM_SEATS
+    NUM_SEATS = args.seats
+
     extra = []
+    if args.seats != 6:
+        # 缺省 6 不透传（advisor 默认 6，命令行与旧版逐字节相同）。
+        extra += ["--seats", str(args.seats)]
     if args.search:
         extra.append("--search")
         if args.search_iterations is not None:
@@ -1385,8 +1423,10 @@ def main():
     if args.search_flop_prefer_blueprint is not None and not args.search:
         raise SystemExit("--search-flop-prefer-blueprint 需配 --search"
                          "（拒绝静默：没有搜索 flop 本就走 blueprint，设此旗无意义）")
-    advisor = Advisor(args.advisor_bin, args.checkpoint, args.bucket_table,
-                      args.reshape, args.postflop_cap, args.seed, extra_args=extra)
+    cropped = args.cropped_checkpoint is not None
+    advisor = Advisor(args.advisor_bin, args.cropped_checkpoint if cropped else args.checkpoint,
+                      args.bucket_table, args.reshape, args.postflop_cap, args.seed,
+                      extra_args=extra, cropped=cropped)
     try:
         if args.selftest:
             run_selftest(advisor)

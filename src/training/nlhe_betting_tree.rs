@@ -557,58 +557,7 @@ impl PublicBettingTree {
             .expect("walk only invoked on Player nodes")
             .0 as PlayerId;
         let my_id = self.nodes.len() as NodeId;
-
-        // no_open_limp：preflop 未被加注（max committed == BB）且 actor 非 SB（rp != 1）→
-        // 该节点的 `Call` 是 open-limp，删之（强制 raise-or-fold）。BB（rp==2）此局面是
-        // free-check 无 Call，moot；SB（rp==1）的 complete 保留（GTO 合理）。rules 关时恒 false。
-        let drop_open_limp = rules.no_open_limp && state.street() == Street::Preflop && {
-            let cfg = state.config();
-            let max_committed = state
-                .players()
-                .iter()
-                .map(|p| p.committed_this_round)
-                .max()
-                .unwrap_or(ChipAmount::ZERO);
-            let n = cfg.n_seats;
-            let rp = (actor + n - cfg.button_seat.0) % n; // BTN=0 SB=1 BB=2 UTG=3..
-            max_committed == cfg.big_blind && rp != 1
-        };
-
-        // A4 redirect 不变量（closing-action 精确收口）：postflop 在场恒 ≤ N。>N 只可能
-        // 是多人 all-in 跑马（无 postflop 下注，不进 walk）。debug 建树即验（= probe
-        // redirect_postflop_over_n == 0 的生产侧断言）。
-        debug_assert!(
-            rules.width_redirect == BettingAbstractionRules::WIDTH_REDIRECT_OFF
-                || state.street() == Street::Preflop
-                || live_count(&state) <= rules.width_redirect,
-            "redirect invariant 破：postflop live {} > N {}",
-            live_count(&state),
-            rules.width_redirect
-        );
-
-        // preflop_open_small_only：preflop 开池（raises==0 = 越过 BB 的首个 Raise）只留
-        // 0.5pot 开池档，删 1.0pot（见 filter_actions）。仅 preflop 开池生效（re-raise 由
-        // drop_small_reraise 收档；postflop 不碰）。rules 关时恒 false。
-        let drop_large_open = rules.preflop_open_small_only
-            && state.street() == Street::Preflop
-            && raises_on_street == 0;
-        let drop_open_allin = rules.drop_preflop_open_allin
-            && state.street() == Street::Preflop
-            && raises_on_street == 0;
-
-        let legal_set = abs.abstract_actions(&state);
-        // A3×A4 过滤（drop_small_reraise + redirect 禁被动进场）。filter 后的集合同时
-        // 决定 node.legal_actions 与 children → child 下标恒对齐 legal_actions（D-209）。
-        let allowed = filter_actions(
-            &legal_set,
-            actor,
-            entrants,
-            rules,
-            raises_on_street,
-            drop_open_limp,
-            drop_large_open,
-            drop_open_allin,
-        );
+        let allowed = node_allowed_actions(&state, actor, abs, rules, entrants, raises_on_street);
         let legal_actions: SmallVec<[AbstractActionTag; 8]> =
             allowed.iter().map(AbstractActionTag::of).collect();
 
@@ -728,6 +677,140 @@ fn street_to_tag(s: Street) -> StreetTag {
             unreachable!("Showdown is terminal — should not enter walk as a decision node")
         }
     }
+}
+
+/// 决策节点 `state`（行动者 `actor`）的抽象动作集：`abs.abstract_actions` 后套 A3×A4 规则过滤
+/// （[`filter_actions`]）。[`PublicBettingTree::walk`] 建树与 [`count_subtree_nodes_capped`] 计数
+/// 共用这一份，保证计数口径 = 建树口径。
+fn node_allowed_actions(
+    state: &GameState,
+    actor: PlayerId,
+    abs: &StreetActionAbstraction,
+    rules: &BettingAbstractionRules,
+    entrants: u16,
+    raises_on_street: u32,
+) -> SmallVec<[AbstractAction; 8]> {
+    // no_open_limp：preflop 未被加注（max committed == BB）且 actor 非 SB（rp != 1）→
+    // 该节点的 `Call` 是 open-limp，删之（强制 raise-or-fold）。BB（rp==2）此局面是
+    // free-check 无 Call，moot；SB（rp==1）的 complete 保留（GTO 合理）。rules 关时恒 false。
+    let drop_open_limp = rules.no_open_limp && state.street() == Street::Preflop && {
+        let cfg = state.config();
+        let max_committed = state
+            .players()
+            .iter()
+            .map(|p| p.committed_this_round)
+            .max()
+            .unwrap_or(ChipAmount::ZERO);
+        let n = cfg.n_seats;
+        let rp = (actor + n - cfg.button_seat.0) % n; // BTN=0 SB=1 BB=2 UTG=3..
+        max_committed == cfg.big_blind && rp != 1
+    };
+
+    // A4 redirect 不变量（closing-action 精确收口）：postflop 在场恒 ≤ N。>N 只可能
+    // 是多人 all-in 跑马（无 postflop 下注，不进 walk）。debug 建树即验（= probe
+    // redirect_postflop_over_n == 0 的生产侧断言）。
+    debug_assert!(
+        rules.width_redirect == BettingAbstractionRules::WIDTH_REDIRECT_OFF
+            || state.street() == Street::Preflop
+            || live_count(state) <= rules.width_redirect,
+        "redirect invariant 破：postflop live {} > N {}",
+        live_count(state),
+        rules.width_redirect
+    );
+
+    // preflop_open_small_only：preflop 开池（raises==0 = 越过 BB 的首个 Raise）只留
+    // 0.5pot 开池档，删 1.0pot（见 filter_actions）。仅 preflop 开池生效（re-raise 由
+    // drop_small_reraise 收档；postflop 不碰）。rules 关时恒 false。
+    let drop_large_open =
+        rules.preflop_open_small_only && state.street() == Street::Preflop && raises_on_street == 0;
+    let drop_open_allin =
+        rules.drop_preflop_open_allin && state.street() == Street::Preflop && raises_on_street == 0;
+
+    let legal_set = abs.abstract_actions(state);
+    // A3×A4 过滤（drop_small_reraise + redirect 禁被动进场）。filter 后的集合同时
+    // 决定 node.legal_actions 与 children → child 下标恒对齐 legal_actions（D-209）。
+    filter_actions(
+        &legal_set,
+        actor,
+        entrants,
+        rules,
+        raises_on_street,
+        drop_open_limp,
+        drop_large_open,
+        drop_open_allin,
+    )
+}
+
+/// [`PublicBettingTree::build_subtree`] 会建出的决策节点数（同一 DFS、同一过滤、同一
+/// `entrants` / `raises_on_street` 推进），但**不物化树**（内存 O(深度)），数到超过 `cap` 即停
+/// 返回 `None`。实时搜索在「可能远超节点上限」的局面（如 9-max 7+ 人 limp 池：实测 9-way
+/// 7,255 万节点 ≈ 十几 GB）先用它判，避免先整棵建完再被 `max_subtree_nodes` 拒绝。
+pub fn count_subtree_nodes_capped(
+    root_state: &GameState,
+    abs: &StreetActionAbstraction,
+    rules: BettingAbstractionRules,
+    entrants: u16,
+    raises_on_street: u32,
+    cap: usize,
+) -> Option<usize> {
+    fn go(
+        state: &GameState,
+        abs: &StreetActionAbstraction,
+        rules: &BettingAbstractionRules,
+        entrants: u16,
+        raises_on_street: u32,
+        n: &mut usize,
+        cap: usize,
+    ) -> bool {
+        let actor = state
+            .current_player()
+            .expect("count 只在 Player 节点调用")
+            .0 as PlayerId;
+        *n += 1;
+        if *n > cap {
+            return false;
+        }
+        for action in node_allowed_actions(state, actor, abs, rules, entrants, raises_on_street) {
+            let mut next = state.clone();
+            next.apply(action.to_concrete())
+                .expect("action abstraction must emit legal Actions for current state");
+            if next.is_terminal() {
+                continue;
+            }
+            // entrants / raises_on_street 推进与 walk 逐字一致。
+            let next_entrants = if matches!(action, AbstractAction::Fold) {
+                entrants & !(1u16 << actor)
+            } else {
+                entrants | (1u16 << actor)
+            };
+            let next_raises = if next.street() as u8 != state.street() as u8 {
+                0
+            } else if is_aggression(&action) {
+                raises_on_street + 1
+            } else {
+                raises_on_street
+            };
+            if !go(&next, abs, rules, next_entrants, next_raises, n, cap) {
+                return false;
+            }
+        }
+        true
+    }
+    debug_assert!(
+        !root_state.is_terminal() && root_state.current_player().is_some(),
+        "count_subtree_nodes_capped root must be a Player decision node"
+    );
+    let mut n = 0usize;
+    go(
+        root_state,
+        abs,
+        &rules,
+        entrants,
+        raises_on_street,
+        &mut n,
+        cap,
+    )
+    .then_some(n)
 }
 
 /// 在场人数（`Active∪AllIn`）= A4 width 口径（all-in 玩家已见后续街、仍在底池）。
@@ -1710,5 +1793,52 @@ mod tests {
                 "limit=River 节点 {i} 应 ≡ 全子树且无叶标记"
             );
         }
+    }
+
+    /// [`count_subtree_nodes_capped`] 与真建树逐数一致（共用 [`node_allowed_actions`]）：①带
+    /// A3×A4 规则（no_open_limp / width_redirect / drop_* 全开）的 6 / 9 座 preflop 全树；②9 座
+    /// 多人 postflop 中途根（规则关）。cap 恰等于节点数 → `Some`，少 1 → `None`。
+    #[test]
+    fn count_subtree_nodes_capped_matches_build() {
+        for (n, cap) in [(6u8, 2u8), (9, 2)] {
+            let cfg = TableConfig::n_max_at_bb(n, 20);
+            let (abs, rules) = all_1pot_6max(cap);
+            let full = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+            let mut rng = ChaCha20Rng::from_seed(TREE_BUILD_RNG_SEED);
+            let root = GameState::with_rng(&cfg, 0, &mut rng);
+            let nodes = full.num_nodes();
+            assert_eq!(
+                count_subtree_nodes_capped(&root, &abs, rules, 0, 0, nodes),
+                Some(nodes),
+                "{n} 座全树"
+            );
+            assert_eq!(
+                count_subtree_nodes_capped(&root, &abs, rules, 0, 0, nodes - 1),
+                None
+            );
+        }
+        // 9 座 5 人 limp 池 flop 根（UTG..LJ 4 家 fold，其余 call / BB check）。
+        let cfg = TableConfig::n_max_at_bb(9, 30);
+        let mut st = GameState::new(&cfg, 1);
+        let mut folds = 4;
+        while st.street() == Street::Preflop {
+            let seat = st.current_player().unwrap().0;
+            let a = if folds > 0 && seat >= 3 {
+                folds -= 1;
+                crate::rules::action::Action::Fold
+            } else if st.legal_actions().check {
+                crate::rules::action::Action::Check
+            } else {
+                crate::rules::action::Action::Call
+            };
+            st.apply(a).unwrap();
+        }
+        let (abs, rules) = deep_single_pot();
+        let sub = PublicBettingTree::build_subtree(&st, &abs, rules, 0, 0);
+        assert!(sub.num_nodes() > 1000, "5-way 子树应非平凡");
+        assert_eq!(
+            count_subtree_nodes_capped(&st, &abs, rules, 0, 0, usize::MAX),
+            Some(sub.num_nodes())
+        );
     }
 }

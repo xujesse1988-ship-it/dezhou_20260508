@@ -184,7 +184,9 @@ fn won_amount(rec: &HhRecord, seat: usize) -> Result<f64, String> {
 /// HH 记录 → [`MultiwayHandInput`]（solver 单位）。任何不一致 loud `Err`（调用方计数）。
 pub fn hh_to_multiway_input(rec: &HhRecord) -> Result<HhConverted, String> {
     let n = rec.num_seats as usize;
-    if !(2..=6).contains(&n) {
+    // 2..=9 = 规则引擎支持的座位数（`GameState` D-030）；6 座 / 9 座桌同一条路径（发牌座位
+    // 一律重映射到 0..n_dealt 紧凑 ring，与桌面座位数无关）。
+    if !(2..=9).contains(&n) {
         return Err(format!("num_seats {n} 越界"));
     }
     let our = rec.my_seat as usize;
@@ -953,5 +955,124 @@ mod tests {
             Ok(_) => panic!("行动者错位应 Err"),
         };
         assert!(e.contains("期望行动者"), "应报行动者错位，得 {e}");
+    }
+
+    /// 9 座桌（`num_seats = 9`）满桌手：button=7 → SB=8 / BB=0（我）/ UTG=1。UTG、UTG+1 fold，
+    /// seat3 open 60，其余到 SB fold，我 BB call → flop 我先动 check、seat3 bet 60、我 fold。
+    /// 满桌 + driver 已回推 → 取 stacks_start；位置 = (seat − button) % 9（我 rel_pos=2 = BB）。
+    fn nine_max_full_line() -> String {
+        r#"{
+          "hand_id": "nine-full", "button_seat": 7, "my_seat": 0, "num_seats": 9,
+          "small_blind": 10, "big_blind": 20,
+          "hole": ["Ah", "Kd"],
+          "board": ["7h", "2c", "Ks"],
+          "actions": [
+            {"seat": 1, "action": "fold"}, {"seat": 2, "action": "fold"},
+            {"seat": 3, "action": "raise", "to": 60}, {"seat": 4, "action": "fold"},
+            {"seat": 5, "action": "fold"}, {"seat": 6, "action": "fold"},
+            {"seat": 7, "action": "fold"}, {"seat": 8, "action": "fold"},
+            {"seat": 0, "action": "call"},
+            {"seat": 0, "action": "check"}, {"seat": 3, "action": "bet", "to": 60},
+            {"seat": 0, "action": "fold"}
+          ],
+          "names": {"0": "me", "3": "villain", "8": "sb"},
+          "stacks_start": [2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000],
+          "hand_result": {
+            "winners": [{"seat": 3, "amount": 70}],
+            "pot": 130,
+            "final_stacks": {"0": 1940, "1": 2000, "2": 2000, "3": 2070, "4": 2000,
+                             "5": 2000, "6": 2000, "7": 2000, "8": 1990},
+            "shown_cards": null
+          }
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn nine_max_full_table_converts_and_observes() {
+        let rec: HhRecord = serde_json::from_str(&nine_max_full_line()).expect("parse");
+        let conv = hh_to_multiway_input(&rec).expect("9 座满桌应可转换");
+        assert_eq!(conv.n_dealt, 9);
+        assert_eq!(conv.input.config.n_seats, 9);
+        assert_eq!(conv.input.config.button_seat, SeatId(7));
+        assert_eq!(conv.input.our_seat, SeatId(0));
+        assert_eq!(conv.input.winnings, -300, "净 −60 op × 5");
+        assert!(matches!(conv.input.actions[10].1, Action::Bet { .. }));
+        let est = MultiwayAivatEstimator::new(None);
+        let r = est.estimate_hand(&conv.input).expect("estimate");
+        assert_eq!(r.raw, -300.0);
+        assert_eq!(r.our_rel_pos, 2, "button=7 时座 0 = BB（(0−7) mod 9 = 2）");
+
+        let obs = hh_record_to_observe(&rec).expect("observe");
+        let streets: Vec<&str> = obs.actions.iter().map(|a| a.street.as_str()).collect();
+        assert_eq!(&streets[..9], ["preflop"; 9]);
+        assert_eq!(&streets[9..], ["flop"; 3]);
+        assert_eq!(obs.names.get(&3).map(String::as_str), Some("villain"));
+    }
+
+    /// 9 座桌短桌手：只发 {1,4,6,7}，button=6 → 紧凑 ring [1,4,6,7]：SB=7、BB=1（我）、UTG=4。
+    /// 4/6 fold、SB complete、我 check，三街全 check → 摊牌我赢 SB 的 20（净）。短桌不读
+    /// stacks_start（按 net 结算 + contribution_delta 重建）。
+    #[test]
+    fn nine_max_short_handed_converts() {
+        let line = r#"{
+          "button_seat": 6, "my_seat": 1, "num_seats": 9,
+          "small_blind": 10, "big_blind": 20,
+          "hole": ["Ah", "Kd"],
+          "board": ["7h", "2c", "Ks", "5d", "9c"],
+          "actions": [
+            {"seat": 4, "action": "fold"}, {"seat": 6, "action": "fold"},
+            {"seat": 7, "action": "call"}, {"seat": 1, "action": "check"},
+            {"seat": 7, "action": "check"}, {"seat": 1, "action": "check"},
+            {"seat": 7, "action": "check"}, {"seat": 1, "action": "check"},
+            {"seat": 7, "action": "check"}, {"seat": 1, "action": "check"}
+          ],
+          "actions_ext": [
+            {"contribution_delta": 0}, {"contribution_delta": 0},
+            {"contribution_delta": 10}, {"contribution_delta": 0},
+            {"contribution_delta": 0}, {"contribution_delta": 0},
+            {"contribution_delta": 0}, {"contribution_delta": 0},
+            {"contribution_delta": 0}, {"contribution_delta": 0}
+          ],
+          "stacks_start": [2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000],
+          "hand_result": {
+            "winners": [{"seat": 1, "amount": 20}],
+            "pot": 40,
+            "final_stacks": {"1": 2020, "4": 2000, "6": 2000, "7": 1980},
+            "shown_cards": {"1": ["Ah", "Kd"], "7": ["Qs", "Qd"]}
+          }
+        }"#;
+        let rec: HhRecord = serde_json::from_str(line).expect("parse");
+        let conv = hh_to_multiway_input(&rec).expect("9 座桌短桌手应可转换");
+        assert_eq!(conv.n_dealt, 4);
+        assert_eq!(
+            conv.input.config.n_seats, 4,
+            "整手重映射到 0..n_dealt 紧凑 ring"
+        );
+        assert_eq!(
+            conv.input.config.button_seat,
+            SeatId(2),
+            "seat6 = ring 下标 2"
+        );
+        assert_eq!(conv.input.our_seat, SeatId(0), "seat1 = ring 下标 0");
+        assert!(conv
+            .input
+            .config
+            .starting_stacks
+            .iter()
+            .all(|s| s.as_u64() == 10_000));
+        assert_eq!(conv.input.winnings, 100, "净 +20 op × 5");
+        let est = MultiwayAivatEstimator::new(None);
+        assert_eq!(est.estimate_hand(&conv.input).expect("estimate").raw, 100.0);
+        assert!(hh_record_to_observe(&rec).is_ok());
+    }
+
+    /// 座位数越界（> 9，规则引擎不支持）→ loud `Err`（不 panic）。
+    #[test]
+    fn num_seats_over_nine_rejected() {
+        let mut rec: HhRecord = serde_json::from_str(&nine_max_full_line()).expect("parse");
+        rec.num_seats = 10;
+        let e = hh_to_multiway_input(&rec).err().expect("10 座应 Err");
+        assert!(e.contains("num_seats 10"), "{e}");
     }
 }

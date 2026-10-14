@@ -241,6 +241,13 @@ impl SimplifiedNlheGame {
         self.rules
     }
 
+    /// 本 game 建树用的桌面配置（座位数 / 起始码深 / 盲注 / button）。树已 baked-in 这份
+    /// config；外部重放（如 `openpoker_advisor` 的 lockstep / 真栈重放）须用**同一**座位数与
+    /// 盲注，否则 seat id / 行动序与 blueprint 树对不上。
+    pub fn table_config(&self) -> &TableConfig {
+        &self.config
+    }
+
     /// 直接为指定的 preflop `node_id` × `hole` 构造 `InfoSetId`（绕过 `Game::info_set`
     /// 对 `SimplifiedNlheState` 的依赖）。仅 preflop 路径——postflop hand bucket 依赖
     /// `state.game_state.board()`，那条路径走完整 `info_set`。
