@@ -139,7 +139,7 @@ InfoSetId position 已留 4 bit(支持 0..15 座,`abstraction/map/mod.rs`)、den
 ## 持久 artifact + 主机
 
 - **vultr `~/dezhou_20260508/artifacts/`**:1B dense ckpt(`run_dense_lockfree/`,9.3 GB,Slumbot 续跑 +
-  6-max baseline 候选)、HU bucket 表(1000 / 500,**HU equity,6-max 需重做多人桶**;b3sum/EVR 见 git 历史)。
+  6-max baseline 候选)、HU bucket 表(1000 / 500,HU equity;b3sum/EVR 见 git 历史)。
 - 主机表:
 
 | host | 角色 | 状态 |
