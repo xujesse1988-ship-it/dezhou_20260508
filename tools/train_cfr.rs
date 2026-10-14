@@ -11,10 +11,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use poker::training::nlhe::SimplifiedNlheGame;
-use poker::training::nlhe_betting_tree::{
-    all_1pot_6max, first_small_6max, first_small_preopen_1pot_6max, first_small_preopen_6max,
-    first_small_preopen_small_6max,
-};
+use poker::training::nlhe_betting_tree::{six_max_reshape, SIX_MAX_RESHAPE_NAMES};
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{ConvergenceMonitor, EsMccfrTrainer, Game, StrategySnapshot, Trainer};
 use poker::{
@@ -41,15 +38,16 @@ struct Args {
     /// 注意 `docs/six_max_nlhe_target.md` S4 续③ 实测 N=4 同 1B 预算仅 ~9% 覆盖率）。
     postflop_cap: u8,
     /// 仅 `--profile six-max`：betting 抽象 reshape（S4，治过度 limp + 开池档太大）。
-    /// `none`（默认）= [`first_small_6max`]（baseline，230.5M infoset）；`nolimp` = 加禁
+    /// `none`（默认）= `first_small_6max`（baseline，230.5M infoset）；`nolimp` = 加禁
     /// 非 SB 开池 limp（55.2M infoset，缩树 4.2×）；`preopen` = 再加 2.25BB 开池档
-    /// （157.9M infoset，full fix；见 [`first_small_preopen_6max`]）；`preopen-small` = preflop
+    /// （157.9M infoset，full fix；见 `first_small_preopen_6max`）；`preopen-small` = preflop
     /// 开池收成单档（仅 2.25BB，删 3.5BB 开池）+ 禁非 SB limp，比 `preopen` 小（preflop 单开池档）、
-    /// 比 `nolimp` 开池更便宜（2.25 vs 3.5BB）；见 [`first_small_preopen_small_6max`]。
+    /// 比 `nolimp` 开池更便宜（2.25 vs 3.5BB）；见 `first_small_preopen_small_6max`。
     /// `preopen-1pot` = `preopen` 的 preflop / 规则不变、**postflop 收成单一 {1pot}**（深码可训 /
-    /// 可解，配 `--stack-bb` 做「懂深浅」深浅 grid；见 [`first_small_preopen_1pot_6max`]）。
+    /// 可解，配 `--stack-bb` 做「懂深浅」深浅 grid；见 `first_small_preopen_1pot_6max`）。
     /// `all-1pot` = 在 `preopen-1pot` 基础上 **preflop 也收成单一 {1pot}**（开池只剩 3.5BB，
-    /// 3bet+ 1pot；no-limp / 无开池 all-in 规则不变；见 [`all_1pot_6max`]）。
+    /// 3bet+ 1pot；no-limp / 无开池 all-in 规则不变；见 `all_1pot_6max`）。
+    /// 名字 → 树定义的分派见 [`six_max_reshape`]。
     reshape: String,
     /// 仅 `--profile six-max`：起始码深（每座大盲数，对称）。默认 100（== 历史
     /// `default_6max_100bb`，byte-equal）。配 `--reshape preopen-1pot` 在 50/100/200/300/400
@@ -300,24 +298,13 @@ fn run() -> Result<(), String> {
                     args.stack_bb
                 ));
             }
-            let (abs, rules) = match args.reshape.as_str() {
-                "none" => first_small_6max(args.postflop_cap),
-                "nolimp" => {
-                    let (a, mut r) = first_small_6max(args.postflop_cap);
-                    r.no_open_limp = true;
-                    (a, r)
-                }
-                "preopen" => first_small_preopen_6max(args.postflop_cap),
-                "preopen-small" => first_small_preopen_small_6max(args.postflop_cap),
-                "preopen-1pot" => first_small_preopen_1pot_6max(args.postflop_cap),
-                "all-1pot" => all_1pot_6max(args.postflop_cap),
-                other => {
-                    return Err(format!(
-                        "unknown --reshape {other} \
-                         (expected none | nolimp | preopen | preopen-small | preopen-1pot | all-1pot)"
-                    ))
-                }
-            };
+            let (abs, rules) =
+                six_max_reshape(&args.reshape, args.postflop_cap).ok_or_else(|| {
+                    format!(
+                        "unknown --reshape {} (expected {SIX_MAX_RESHAPE_NAMES})",
+                        args.reshape
+                    )
+                })?;
             SimplifiedNlheGame::new_with_abstraction(
                 Arc::clone(&table),
                 TableConfig::n_max_at_bb(seats, args.stack_bb),

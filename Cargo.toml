@@ -122,6 +122,10 @@ path = "tools/multiway_hist_ari.rs"
 name = "train_cfr"
 path = "tools/train_cfr.rs"
 
+[[bin]]
+name = "nlhe_dense_crop"
+path = "tools/nlhe_dense_crop.rs"
+
 # S4 gate runner：加载 6-max dense blueprint ckpt，跑 N 座 baseline 评测
 # （evaluate_blueprint_vs_baseline_multiway），判 1M 手是否击败 random/call-station/tight。
 [[bin]]

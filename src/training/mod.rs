@@ -41,6 +41,7 @@ pub mod nlhe;
 pub mod nlhe_betting_tree;
 pub mod nlhe_dense;
 pub mod nlhe_dense_checkpoint;
+pub mod nlhe_dense_crop;
 pub mod nlhe_dense_trainer;
 pub mod nlhe_eval;
 pub mod nlhe_replay;

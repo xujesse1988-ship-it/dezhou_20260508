@@ -240,6 +240,32 @@ pub fn all_1pot_6max(width_redirect: u8) -> (StreetActionAbstraction, BettingAbs
     (abs, rules)
 }
 
+/// `--profile six-max` 的 `--reshape <name>` → `(abstraction, rules)`。`train_cfr` 与
+/// `nlhe_dense_crop` 共用，保证裁切 / 加载时重建的树与训练时**同一**定义（dense ckpt 的
+/// layout 指纹仍会兜底校验）。未知名返回 `None`。
+pub fn six_max_reshape(
+    name: &str,
+    width_redirect: u8,
+) -> Option<(StreetActionAbstraction, BettingAbstractionRules)> {
+    Some(match name {
+        "none" => first_small_6max(width_redirect),
+        "nolimp" => {
+            let (a, mut r) = first_small_6max(width_redirect);
+            r.no_open_limp = true;
+            (a, r)
+        }
+        "preopen" => first_small_preopen_6max(width_redirect),
+        "preopen-small" => first_small_preopen_small_6max(width_redirect),
+        "preopen-1pot" => first_small_preopen_1pot_6max(width_redirect),
+        "all-1pot" => all_1pot_6max(width_redirect),
+        _ => return None,
+    })
+}
+
+/// `six_max_reshape` 接受的名字（错误提示用）。
+pub const SIX_MAX_RESHAPE_NAMES: &str =
+    "none | nolimp | preopen | preopen-small | preopen-1pot | all-1pot";
+
 /// S6 实时搜索深码档（`realtime_search_openpoker_exec` §2.1 / 缺口③）：**全街单一 {1pot}**
 /// 下注菜单——每决策点只剩 `{fold, check/call, bet/raise 1pot, all-in}`。fold/check/call/all-in
 /// 由规则引擎合法集自带（非 ratio），ratio 只配 1.0pot 单档；这就是文档「深码把下注菜单收到

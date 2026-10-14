@@ -140,7 +140,7 @@ pub struct DenseCheckpointMeta {
     pub lcfr_rescale_regret: bool,
 }
 
-fn corrupted(offset: u64, reason: impl Into<String>) -> CheckpointError {
+pub(crate) fn corrupted(offset: u64, reason: impl Into<String>) -> CheckpointError {
     CheckpointError::Corrupted {
         offset,
         reason: reason.into(),
@@ -259,6 +259,47 @@ pub fn load_dense_checkpoint(
     read_hashed(&mut reader, &mut hasher, &mut header)
         .map_err(|e| corrupted(0, format!("read header failed: {e}")))?;
 
+    let meta = parse_header(&header, expected)?;
+
+    // fp == expected ⇒ indexer 的 total_rows/slots 与 header 一致，payload 尺寸自洽。
+    debug_assert_eq!(indexer.total_slots(), expected.total_slots);
+    debug_assert_eq!(indexer.total_rows(), expected.total_rows);
+
+    let regret = DenseNlheTable::new(Arc::clone(&indexer));
+    let strategy_sum = DenseNlheTable::new(indexer);
+
+    read_words(&mut reader, &mut hasher, regret.touched_words())
+        .map_err(|e| corrupted(HEADER_LEN as u64, format!("read regret touched: {e}")))?;
+    read_words(&mut reader, &mut hasher, strategy_sum.touched_words())
+        .map_err(|e| corrupted(0, format!("read strategy touched: {e}")))?;
+    read_f64s(&mut reader, &mut hasher, regret.raw_values())
+        .map_err(|e| corrupted(0, format!("read regret values: {e}")))?;
+    read_f64s(&mut reader, &mut hasher, strategy_sum.raw_values())
+        .map_err(|e| corrupted(0, format!("read strategy values: {e}")))?;
+
+    // trailer：直接读 32 byte（不喂 hasher），与已累加的 body hash 比。
+    let mut trailer = [0u8; TRAILER_LEN];
+    reader
+        .read_exact(&mut trailer)
+        .map_err(|e| corrupted(0, format!("read trailer failed: {e}")))?;
+    let actual: [u8; 32] = hasher.finalize().into();
+    if actual != trailer {
+        return Err(corrupted(
+            0,
+            "trailer BLAKE3 mismatch (body/header tampered)",
+        ));
+    }
+
+    Ok((meta, regret, strategy_sum))
+}
+
+/// 解析并校验 dense checkpoint header（magic / schema / storage_kind / trainer+game
+/// variant / layout fingerprint），返回训练元数据。[`load_dense_checkpoint`] 与
+/// [`crate::training::nlhe_dense_crop`]（流式裁切）共用，保证两条读路径的拒绝条件一致。
+pub(crate) fn parse_header(
+    header: &[u8; HEADER_LEN],
+    expected: &DenseLayoutFingerprint,
+) -> Result<DenseCheckpointMeta, CheckpointError> {
     if header[OFF_MAGIC..OFF_SCHEMA] != DENSE_MAGIC {
         return Err(corrupted(0, "not a dense NLHE checkpoint (magic mismatch)"));
     }
@@ -358,36 +399,7 @@ pub fn load_dense_checkpoint(
             ),
         ));
     }
-    // fp == expected ⇒ indexer 的 total_rows/slots 与 header 一致，payload 尺寸自洽。
-    debug_assert_eq!(indexer.total_slots(), total_slots);
-    debug_assert_eq!(indexer.total_rows(), total_rows);
-
-    let regret = DenseNlheTable::new(Arc::clone(&indexer));
-    let strategy_sum = DenseNlheTable::new(indexer);
-
-    read_words(&mut reader, &mut hasher, regret.touched_words())
-        .map_err(|e| corrupted(HEADER_LEN as u64, format!("read regret touched: {e}")))?;
-    read_words(&mut reader, &mut hasher, strategy_sum.touched_words())
-        .map_err(|e| corrupted(0, format!("read strategy touched: {e}")))?;
-    read_f64s(&mut reader, &mut hasher, regret.raw_values())
-        .map_err(|e| corrupted(0, format!("read regret values: {e}")))?;
-    read_f64s(&mut reader, &mut hasher, strategy_sum.raw_values())
-        .map_err(|e| corrupted(0, format!("read strategy values: {e}")))?;
-
-    // trailer：直接读 32 byte（不喂 hasher），与已累加的 body hash 比。
-    let mut trailer = [0u8; TRAILER_LEN];
-    reader
-        .read_exact(&mut trailer)
-        .map_err(|e| corrupted(0, format!("read trailer failed: {e}")))?;
-    let actual: [u8; 32] = hasher.finalize().into();
-    if actual != trailer {
-        return Err(corrupted(
-            0,
-            "trailer BLAKE3 mismatch (body/header tampered)",
-        ));
-    }
-
-    let meta = DenseCheckpointMeta {
+    Ok(DenseCheckpointMeta {
         update_count,
         rng_state,
         lcfr_period_size: if lcfr_period_raw == 0 {
@@ -397,8 +409,7 @@ pub fn load_dense_checkpoint(
         },
         lcfr_periods_completed,
         lcfr_rescale_regret,
-    };
-    Ok((meta, regret, strategy_sum))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +459,11 @@ fn write_f64s_scaled<W: Write>(
     Ok(())
 }
 
-fn read_hashed<R: Read>(r: &mut R, h: &mut Hasher, buf: &mut [u8]) -> std::io::Result<()> {
+pub(crate) fn read_hashed<R: Read>(
+    r: &mut R,
+    h: &mut Hasher,
+    buf: &mut [u8],
+) -> std::io::Result<()> {
     r.read_exact(buf)?;
     h.update(buf);
     Ok(())

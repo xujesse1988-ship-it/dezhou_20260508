@@ -470,7 +470,7 @@ impl DenseNlheEsMccfrTrainer {
 
 /// 每街 bucket 数 `[preflop, flop, turn, river]`（indexer `from_tree` 入参）。
 /// preflop 固定 169 lossless；postflop 从 bucket table config 读（v3 = 500/500/500）。
-fn bucket_count_by_street(game: &SimplifiedNlheGame) -> [u32; 4] {
+pub(crate) fn bucket_count_by_street(game: &SimplifiedNlheGame) -> [u32; 4] {
     let bt = &game.bucket_table;
     [
         bt.bucket_count(StreetTag::Preflop),
