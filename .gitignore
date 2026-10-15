@@ -16,3 +16,5 @@
 tools/__pycache__/
 # Claude Code 本地 harness 会话状态（scheduled_tasks lockfile 等）
 /.claude
+# OpenPoker 九人局联机产出的动作 / HH 日志（openpoker_play.py --action-log / --hh-log），本地分析用
+/openpoker9_*.jsonl
