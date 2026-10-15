@@ -1406,11 +1406,15 @@ fn decide(
             );
         }
     };
-    let mut resp = action_to_response(solver_action, scale, &req.valid);
+    let (mut resp, degrade) = action_to_response(solver_action, scale, &req.valid);
     if resp.source.is_empty() {
         // 合法动作：填 source（search / blueprint）+ 诊断。不合法时 action_to_response 已产
-        // safe_fallback（source = fallback:...），不覆盖。
-        resp.source = if want_search { "search" } else { "blueprint" }.into();
+        // safe_fallback（source = fallback:...），不覆盖。bet/raise 退成 call/check 时追加降级标记。
+        resp.source = format!(
+            "{}{}",
+            if want_search { "search" } else { "blueprint" },
+            degrade.unwrap_or("")
+        );
         resp.street = Some(street_label(street).into());
         resp.info_set = Some(info.raw());
         resp.chosen = Some(action_label(&chosen));
@@ -1453,11 +1457,20 @@ fn blueprint_distribution(
 }
 
 /// solver [`Action`] → OpenPoker [`Response`]（blueprint / search 共享）。合法动作 → `source` 留空
-/// （caller 填 blueprint/search + 诊断）；不合法（check/call/raise 区间缺）→ 直接 [`safe_fallback`]
-/// （`source` 已填 fallback:...，caller 不覆盖）。尺寸按传入的 `scale` ÷ 真实下注（caller 已用真栈
-/// 或 100BB 算出 solver `to`）。
-fn action_to_response(action: Action, scale: u64, valid: &ValidActions) -> Response {
-    match action {
+/// （caller 填 blueprint/search + 诊断）；不合法（check/call 不可用、或 bet/raise 连 call/check 都
+/// 退不了）→ 直接 [`safe_fallback`]（`source` 已填 fallback:...，caller 不覆盖）。尺寸按传入的
+/// `scale` ÷ 真实下注（caller 已用真栈或 100BB 算出 solver `to`）。
+///
+/// 第二个返回值 = 降级标记：策略选了 Bet/Raise 但桌面不给加注区间（对手已 all-in / 100BB 影子与
+/// 真栈不一致 / 脏区间）时，按「最接近的合法动作」退成 call（能跟）或 check（能过），`source` 仍留空
+/// 走正常诊断，caller 在填好的 source 后追加此标记（`:raise_as_call` / `:raise_as_check`）供统计。
+/// 旧行为是直接 check/fold——想加注的强牌面对下注会被扔掉。
+fn action_to_response(
+    action: Action,
+    scale: u64,
+    valid: &ValidActions,
+) -> (Response, Option<&'static str>) {
+    let resp = match action {
         Action::Fold => Response {
             action: "fold".into(),
             ..Default::default()
@@ -1495,6 +1508,20 @@ fn action_to_response(action: Action, scale: u64, valid: &ValidActions) -> Respo
                     amount: Some(op_to),
                     ..Default::default()
                 },
+                None if valid.can_call => {
+                    let resp = Response {
+                        action: "call".into(),
+                        ..Default::default()
+                    };
+                    return (resp, Some(":raise_as_call"));
+                }
+                None if valid.can_check => {
+                    let resp = Response {
+                        action: "check".into(),
+                        ..Default::default()
+                    };
+                    return (resp, Some(":raise_as_check"));
+                }
                 None => safe_fallback(valid, "raise_no_range"),
             }
         }
@@ -1513,7 +1540,8 @@ fn action_to_response(action: Action, scale: u64, valid: &ValidActions) -> Respo
                 }
             }
         }
-    }
+    };
+    (resp, None)
 }
 
 // ===========================================================================
@@ -2171,9 +2199,9 @@ fn decide_search_unanchored(
             )
         }
     };
-    let mut resp = action_to_response(solver_action, scale, &req.valid);
+    let (mut resp, degrade) = action_to_response(solver_action, scale, &req.valid);
     if resp.source.is_empty() {
-        resp.source = "search:unanchored".into();
+        resp.source = format!("search:unanchored{}", degrade.unwrap_or(""));
         resp.street = Some(street_label(auth.street()).into());
         resp.chosen = Some(action_label(&chosen));
         resp.probs = Some(probs_log(&dist));
@@ -3321,6 +3349,51 @@ mod tests {
             max_raise: Some(1840),
         };
         assert_eq!(raise_to_op(1650, 5, &ok), Some(330));
+    }
+
+    /// 策略选 Bet/Raise 但桌面不给加注区间（对手已 all-in 等）：能跟 → call、能过 → check（带降级
+    /// 标记、source 留给 caller 填正常来源）；都不能才 safe_fallback。修前一律 check/fold，
+    /// 想加注的强牌面对下注被扔掉。脏区间（min > max）同样按此退。有区间时行为不变。
+    #[test]
+    fn raise_without_range_degrades_to_call_or_check() {
+        let va = |can_check, can_call, can_raise, min, max| ValidActions {
+            can_check,
+            can_call,
+            can_raise,
+            min_raise: min,
+            max_raise: max,
+        };
+        let raise = Action::Raise {
+            to: ChipAmount::new(1650),
+        };
+        let bet = Action::Bet {
+            to: ChipAmount::new(1650),
+        };
+
+        // 面对下注、不能加注 → call。
+        let (r, d) = action_to_response(raise, 5, &va(false, true, false, None, None));
+        assert_eq!(
+            (r.action.as_str(), r.amount, r.source.as_str()),
+            ("call", None, "")
+        );
+        assert_eq!(d, Some(":raise_as_call"));
+        // 脏区间（min > max）也退 call，不再 fold。
+        let (r, d) = action_to_response(raise, 5, &va(false, true, true, Some(400), Some(300)));
+        assert_eq!((r.action.as_str(), d), ("call", Some(":raise_as_call")));
+        // 没人下注、不能下注 → check。
+        let (r, d) = action_to_response(bet, 5, &va(true, false, false, None, None));
+        assert_eq!((r.action.as_str(), r.source.as_str()), ("check", ""));
+        assert_eq!(d, Some(":raise_as_check"));
+        // call / check 都不可用 → 旧兜底（fold），source 已填、无降级标记。
+        let (r, d) = action_to_response(raise, 5, &va(false, false, false, None, None));
+        assert_eq!(
+            (r.action.as_str(), r.source.as_str()),
+            ("fold", "fallback:raise_no_range")
+        );
+        assert_eq!(d, None);
+        // 有区间 → 正常 raise，无降级标记（行为不变）。
+        let (r, d) = action_to_response(raise, 5, &va(false, true, true, Some(20), Some(1840)));
+        assert_eq!((r.action.as_str(), r.amount, d), ("raise", Some(330), None));
     }
 
     /// 回归（生产实采，2026-06-14）：TT@SB 在 UTG-open → SB-3bet → UTG-4bet 这条标准 preflop
