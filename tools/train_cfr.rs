@@ -47,6 +47,8 @@ struct Args {
     /// 可解，配 `--stack-bb` 做「懂深浅」深浅 grid；见 `first_small_preopen_1pot_6max`）。
     /// `all-1pot` = 在 `preopen-1pot` 基础上 **preflop 也收成单一 {1pot}**（开池只剩 3.5BB，
     /// 3bet+ 1pot；no-limp / 无开池 all-in 规则不变；见 `all_1pot_6max`）。
+    /// `flop2-1pot` = `all-1pot` 但 **flop 菜单 {0.5,1}pot**（0.5pot 只作首注，加注仍 1pot；
+    /// preflop / turn / river 不变；9-max cap4 两表 ~78.5 GiB；见 `flop2_1pot_6max`）。
     /// 名字 → 树定义的分派见 [`six_max_reshape`]。
     reshape: String,
     /// 仅 `--profile six-max`：起始码深（每座大盲数，对称）。默认 100（== 历史
@@ -290,12 +292,12 @@ fn run() -> Result<(), String> {
                     args.stack_bb
                 ));
             }
-            // all-1pot 开池只有 1pot（3.5BB）一档：栈 ≤3BB 时它退化成开池 all-in 又被
+            // all-1pot / flop2-1pot 开池只有 1pot（3.5BB）一档：栈 ≤3BB 时它退化成开池 all-in 又被
             // drop_preflop_open_allin 删掉 → 开池位只剩 Fold，树塌成几十个节点。拒绝而非静默训。
-            if args.reshape == "all-1pot" && args.stack_bb < 4 {
+            if matches!(args.reshape.as_str(), "all-1pot" | "flop2-1pot") && args.stack_bb < 4 {
                 return Err(format!(
-                    "--reshape all-1pot requires --stack-bb >= 4 (1pot open = 3.5BB), got {}",
-                    args.stack_bb
+                    "--reshape {} requires --stack-bb >= 4 (1pot open = 3.5BB), got {}",
+                    args.reshape, args.stack_bb
                 ));
             }
             let (abs, rules) =
@@ -711,7 +713,7 @@ fn print_usage() {
          options:\n\
          \t--profile <hu|six-max>  (default hu; six-max = 6-max 100BB A3×A4 first-small)\n\
          \t--postflop-cap <2|3|4>  (six-max only; A3×A4 width-redirect N, default 3; N=4 = 48 GiB tables)\n\
-         \t--reshape <none|nolimp|preopen|preopen-small|preopen-1pot|all-1pot>  (six-max only; preopen-1pot = preopen preflop + {{1pot}} postflop, for depth grid; all-1pot = {{1pot}} on all streets incl. preflop)\n\
+         \t--reshape <none|nolimp|preopen|preopen-small|preopen-1pot|all-1pot|flop2-1pot>  (six-max only; preopen-1pot = preopen preflop + {{1pot}} postflop, for depth grid; all-1pot = {{1pot}} on all streets incl. preflop; flop2-1pot = all-1pot but flop {{0.5,1}}pot)\n\
          \t--stack-bb <N>          (six-max only; per-seat starting stack in BB, default 100; pair with --reshape preopen-1pot)\n\
          \t--seats <3..=9>         (six-max only; number of seats, default 6; e.g. 9 = 9-handed table)\n\
          \t--seed <N|0xHEX>\n\
