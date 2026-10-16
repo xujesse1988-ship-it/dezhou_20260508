@@ -165,15 +165,27 @@ const DEFAULT_SEARCH_UNANCHORED_CROSS_STREET: bool = true;
 ///
 /// 锚定之外还须过真码深闸（[`flop_blueprint_stack_gate`]）：100BB 影子按对称 100BB 重放，短码
 /// all-in 在影子里就是 100BB all-in、照样同步，光看锚定会让 blueprint 用错底池赔率 / SPR 出牌。
+/// 还须过尺寸闸（[`flop_blueprint_size_gate`]）：本街每次下注的映射误差都在 0.75–1.33 内。
 const DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT: bool = false;
 /// 方案 B「平跟当弃牌」的默认（`--search-limp-as-fold`，[`lockstep_replay`]）：**默认关**（旧行为
 /// byte-equal）。调研（`docs/temp/openpoker_limp_handling_research_2026_10_16.md` §4）建议先做成
 /// 离线开关，回放已有平跟决策点确认翻后前缀非空比例 / 兜底占比 / 均匀出牌下降后再开实盘。
 const DEFAULT_SEARCH_LIMP_AS_FOLD: bool = false;
+/// 子树节点上限的 advisor 默认（`--search-max-nodes`，覆盖 [`SubgameSearchConfig`] 的通用默认
+/// 8000）。2026-10-16 代码审查 §4：4 人单加注池 200BB 宽菜单约 16 万节点，10 万上限下直接放弃 →
+/// check / fold；提到 20 万。557k 节点约 100MB（`docs/status_v3.md`），20 万约 36MB，单次建树内存
+/// 可控；更大的上限等换更高配置的机器再定。
+const DEFAULT_SEARCH_MAX_NODES: usize = 200_000;
 /// flop 优先 blueprint 的有效码深区间（BB，含端点；[`flop_blueprint_stack_gate`]）。hero 与每个
 /// 未弃牌对手的 hand-start 有效码深都须落在区间内，否则 flop 照常实时搜索。
 const FLOP_BLUEPRINT_EFF_STACK_BB_MIN: u64 = 60;
 const FLOP_BLUEPRINT_EFF_STACK_BB_MAX: u64 = 140;
+/// flop 优先 blueprint 的下注尺寸映射误差区间（[`flop_blueprint_size_gate`]）：本街每次下注 / 加注的
+/// 真实池比例 ÷ blueprint 树里映射到的池比例，须落在 [MIN, MAX]/1000 内（含端点），否则 flop 照常
+/// 实时搜索。all-1pot 的翻牌菜单只有 {1pot}，0.2–1.5 pot 的注都映射成 1pot——不加这条，面对 1/3 池
+/// c-bet 就会用「面对满池注」的弃牌频率（`openpoker_code_review_findings_2026_10_16.md` §3）。
+const FLOP_BLUEPRINT_SIZE_RATIO_MILLI_MIN: u64 = 750;
+const FLOP_BLUEPRINT_SIZE_RATIO_MILLI_MAX: u64 = 1333;
 /// 搜索墙钟告警阈的建树余量（ms）：最坏单线程建树 ≈ 4-way@20× 宽档 ~2.7s，留 3s。
 const SEARCH_WALL_BUILD_MARGIN_MS: u128 = 3000;
 /// 无 `time_budget`（固定迭代）时的告警阈回落（ms）。
@@ -551,7 +563,8 @@ struct SearchRuntime {
     unanchored_cross_street: bool,
     /// `--search-flop-prefer-blueprint`（[`DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT`]）：`on` = 仅 flop
     /// 街，锚定面（lockstep Ok / 100BB 影子同步）且过真码深闸（[`flop_blueprint_stack_gate`]：无人
-    /// all-in、有效码深 60–140BB）时即使命中 trigger 也走 blueprint、不实时搜索；不过闸 / 脱影子
+    /// all-in、有效码深 60–140BB）和尺寸闸（[`flop_blueprint_size_gate`]：本街下注映射误差
+    /// 0.75–1.33）时即使命中 trigger 也走 blueprint、不实时搜索；不过闸 / 脱影子
     /// flop（lockstep 失同步）照常实时搜索（[`decide_search_unanchored`] 不经此旗）。**默认关**
     /// （`false`，旧行为 byte-equal）。turn/river 锚定面不受影响。预热（[`prewarm`]）同源 skip 锚定
     /// flop 子树（不 build+solve），否则 advisor 单线程下 hero 决策白等一个 time_budget 才拿 blueprint。
@@ -709,19 +722,22 @@ fn prewarm_inner(
     // 白等一个 time_budget 才拿到 blueprint。故锚定 flop 直接 skip，hero 决策即时返回。脱影子 flop
     // （lockstep Err：off-stack all-in / limp 线）decide 照常搜索、不受此旗影响 → 不在此 skip，照常预热。
     // 真码深闸同 decide（[`flop_blueprint_stack_gate`]，街起点视角）：不过闸 = decide 会搜索 → 照常预热。
-    // 街内此后才出现的 all-in 预热看不到 → 那次 decide 现解（MISS），只慢不错。
+    // 尺寸闸同 decide（[`flop_blueprint_size_gate`]，看到目前为止的本街下注）。街内此后才出现的
+    // all-in / 偏离菜单的下注预热看不到 → 那次 decide 现解（MISS），只慢不错。
     if rt.flop_prefer_blueprint
         && round_start.street() == poker::Street::Flop
-        && lockstep.is_ok()
-        && flop_blueprint_stack_gate(req, &solver_cfg, scale, &smap, &round_start, my_seat_solver)
-            .is_ok()
+        && lockstep.as_ref().is_ok_and(|(.., sizes)| {
+            flop_blueprint_stack_gate(req, &solver_cfg, scale, &smap, &round_start, my_seat_solver)
+                .and_then(|()| flop_blueprint_size_gate(sizes, poker::Street::Flop))
+                .is_ok()
+        })
     {
         return mk("prewarm:skip:flop_prefer_blueprint".into());
     }
     // crop blueprint：range 先验缺被裁街 σ（跨街后验不可得）→ 先补解上一街再重试一次
     // （[`search_with_crop_backfill`]；完整 blueprint 下等价于直接调一次）。
     let attempt = |solve_cache: &mut SubgameSolveCache| match &lockstep {
-        Ok((_real, abs, _)) => {
+        Ok((_real, abs, ..)) => {
             // 档二′-跨街复用（锚定预热，turn_blueprint_trim §2.4 改动 D）：与决策路径同义，复用缓存里
             // 上一街已解子树 σ 算本街后验 range。预热须与决策时算出同一份 ranges 才命中 key——两路同读
             // `cache.current()`（街起点预热时仍持上一街解）+ 同 `prev_within`。off / 非紧前街 → 自验退 estimate。
@@ -963,9 +979,55 @@ fn truncate_request_to_street(
     Err("truncate_target_street_not_reached".into())
 }
 
+/// 一次下注 / 加注在 lockstep 里的尺寸映射：真实尺寸与影子（blueprint 树）里映射到的尺寸，
+/// 都按 [`raise_pot_milli`] 折成池比例。[`flop_blueprint_size_gate`] 用它判断 blueprint 的
+/// 应对是否还可信（映射误差大 = blueprint 在应对另一个尺寸）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BetSizeMap {
+    /// 该动作所在的街（apply 前的街）。
+    street: poker::Street,
+    /// 真实尺寸（100BB 重放态上算）。
+    real_milli: u64,
+    /// 影子映射尺寸（影子自身几何上算，含塌成 AllIn 的情况）。
+    mapped_milli: u64,
+}
+
+/// 当前行动者的下注几何 `(本轮最高投入, 跟注后底池)`，与抽象菜单
+/// `candidate_to = max_committed + ratio × pot_after_call` 同一坐标系
+/// （`DefaultActionAbstraction::abstract_actions`）。无行动者 → `None`。
+fn raise_geometry(state: &poker::GameState) -> Option<(u64, u64)> {
+    let actor = state.current_player()?;
+    let players = state.players();
+    let max_committed = players
+        .iter()
+        .map(|p| p.committed_this_round.as_u64())
+        .max()
+        .unwrap_or(0);
+    let own = players[actor.0 as usize].committed_this_round.as_u64();
+    Some((
+        max_committed,
+        state.pot().as_u64() + max_committed.saturating_sub(own),
+    ))
+}
+
+/// 下注 / 加注到 `to` 的池比例（milli，1 pot = 1000）：`(to − max_committed) × 1000 / pot_after_call`
+/// （几何见 [`raise_geometry`]，取该动作 apply **前**的态）。`to` 不超过本轮最高投入（跟注全下）/
+/// 底池为 0 → `None`。
+fn raise_pot_milli((max_committed, pot_after_call): (u64, u64), to: u64) -> Option<u64> {
+    if to <= max_committed {
+        return None;
+    }
+    (to - max_committed)
+        .saturating_mul(1000)
+        .checked_div(pot_after_call)
+}
+
 /// 两态 lockstep 单步（真实动作与幻影 fold 共用，保两路不漂）。行动者对齐检查（影子当前
 /// 行动者 == 真实当前行动者）不在这里做：平跟当弃牌映射（[`lockstep_replay`]）下真实局可能轮到
 /// 影子里已弃牌的平跟者，检查由调用方按 [`shadow_drifted`] 统一判。
+///
+/// 返回值：真实动作是下注 / 加注 / 主动全下时记一条 [`BetSizeMap`]（跟注全下不记——那不是尺寸
+/// 选择）；其余动作 `None`。
 fn lockstep_step(
     real: &mut poker::GameState,
     abs: &mut SimplifiedNlheState,
@@ -973,7 +1035,7 @@ fn lockstep_step(
     actor: u8,
     action: &str,
     to_solver: Option<u64>,
-) -> Result<(), String> {
+) -> Result<Option<BetSizeMap>, String> {
     if real.current_player() != Some(SeatId(actor)) {
         // 码深漂移 / 历史错位 → 重放对不上回合。
         return Err("replay_seat_mismatch".into());
@@ -981,15 +1043,48 @@ fn lockstep_step(
     let Some(concrete) = hist_to_concrete(real, action, to_solver) else {
         return Err("bad_hist_action".into());
     };
+    // 尺寸记录要 apply 前的几何（两态各自的底池 / 本轮投入）。
+    let street = real.street();
+    let real_to = match concrete {
+        Action::Bet { to } | Action::Raise { to } => Some(to.as_u64()),
+        Action::AllIn => real.legal_actions().all_in_amount.map(|t| t.as_u64()),
+        _ => None,
+    };
+    let real_milli = real_to
+        .zip(raise_geometry(real))
+        .and_then(|(to, g)| raise_pot_milli(g, to));
+    let shadow_geometry = raise_geometry(&abs.game_state);
     if real.apply(concrete).is_err() {
         return Err("replay_illegal".into());
     }
     let is_all_in = real.players()[actor as usize].status == poker::PlayerStatus::AllIn;
-    if advance_shadow_by_applied(abs, concrete, is_all_in, abs_rng).is_err() {
+    let Ok(mapped) = advance_shadow_by_applied(abs, concrete, is_all_in, abs_rng) else {
         // 结构性 gap（如 open-limp 进 no-limp 影子）→ 失同步（不静默改 kind）。
         return Err("structural_gap".into());
-    }
-    Ok(())
+    };
+    let mapped_milli = match mapped {
+        AbstractAction::Bet { to, .. }
+        | AbstractAction::Raise { to, .. }
+        | AbstractAction::AllIn { to } => {
+            shadow_geometry.and_then(|g| raise_pot_milli(g, to.as_u64()))
+        }
+        _ => None,
+    };
+    Ok(match (real_milli, mapped_milli) {
+        // 真实动作是跟注全下（real_milli = None）→ 不是尺寸选择，不记。
+        (Some(real_milli), Some(mapped_milli)) => Some(BetSizeMap {
+            street,
+            real_milli,
+            mapped_milli,
+        }),
+        // 真实是下注 / 加注，影子却不是进攻动作：映射误差无从比较 → 按最大误差记（闸必拒）。
+        (Some(real_milli), None) => Some(BetSizeMap {
+            street,
+            real_milli,
+            mapped_milli: 0,
+        }),
+        (None, _) => None,
+    })
 }
 
 /// 影子与真实局的当前行动者是否对不上。`ghosts` = 影子里已记为弃牌、真实局仍在手的平跟者
@@ -1059,6 +1154,14 @@ struct LockstepErr {
     limp: LimpFoldMap,
 }
 
+/// [`lockstep_replay`] 成功结果：(100BB 真实重放态, 影子, 平跟当弃牌映射, 下注尺寸映射)。
+type LockstepOk = (
+    poker::GameState,
+    SimplifiedNlheState,
+    LimpFoldMap,
+    Vec<BetSizeMap>,
+);
+
 /// 两态 lockstep 重放（[`decide`] 决策路径与 [`prewarm`] 预热共用——**锚定/脱影子分类与
 /// node_id 必须同源**，否则预热可能走错路径 / 推错 key 静默失效）。`my_turn = Some(seat)` →
 /// 末尾校验轮到该座（决策路径，旧行为逐字保留）；`None` → 重放到历史末尾即可（预热：该街
@@ -1075,7 +1178,8 @@ struct LockstepErr {
 /// - 其余漂移（如平跟后其余人全弃、影子已结束但真实局轮到 BB）→ 原因加 `limp_as_fold:` 前缀。
 ///
 /// 返回的 [`LimpFoldMap`] 让调用方知道翻前发生过映射（翻前决策仍交给启发式）。翻后 Ok 时
-/// 保证没有「影子已弃、真实在手」的座位（进翻牌前已拦下）。
+/// 保证没有「影子已弃、真实在手」的座位（进翻牌前已拦下）。返回的 `Vec<BetSizeMap>` = 历史里
+/// 每次下注 / 加注的真实与映射尺寸（按时间序，[`flop_blueprint_size_gate`] 用）。
 #[allow(clippy::too_many_arguments)]
 fn lockstep_replay(
     game: &SimplifiedNlheGame,
@@ -1086,7 +1190,7 @@ fn lockstep_replay(
     board_len: usize,
     my_turn: Option<SeatId>,
     limp_as_fold: bool,
-) -> Result<(poker::GameState, SimplifiedNlheState, LimpFoldMap), LockstepErr> {
+) -> Result<LockstepOk, LockstepErr> {
     let mut real = poker::GameState::new(solver_cfg, REAL_REPLAY_SEED);
     let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
     let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
@@ -1108,6 +1212,7 @@ fn lockstep_replay(
     }
     // 影子已弃、真实在手的平跟者（tree seat）。
     let mut ghosts: Vec<u8> = Vec::new();
+    let mut sizes: Vec<BetSizeMap> = Vec::new();
     for h in &req.actions {
         let synced_node = abs.current_node_id;
         let err =
@@ -1152,7 +1257,7 @@ fn lockstep_replay(
             limp.folds.push((synced_node, actor as PlayerId));
             ghosts.push(actor);
         } else {
-            lockstep_step(
+            let size = lockstep_step(
                 &mut real,
                 &mut abs,
                 &mut abs_rng,
@@ -1161,6 +1266,7 @@ fn lockstep_replay(
                 to_solver,
             )
             .map_err(|e| err(e, synced_node, &ghosts, &limp))?;
+            sizes.extend(size);
         }
         if !ghosts.is_empty() && real.street() != poker::Street::Preflop {
             // 平跟者还在手就进了翻后：影子少一个在手座位，翻后不能当锚定用。这一步本身两边
@@ -1194,7 +1300,7 @@ fn lockstep_replay(
             limp,
         });
     }
-    Ok((real, abs, limp))
+    Ok((real, abs, limp, sizes))
 }
 
 /// 脱锚搜索档一前缀 reach 的决策三元组（[`decide_search_unanchored`] 与 [`prewarm`] 共用，两路
@@ -1300,6 +1406,28 @@ fn decide(
         Err(reason) => return safe_fallback(&req.valid, &reason),
     };
 
+    // —— 翻前面对全下（审查 §5）：有效码深 < 60BB 不走 blueprint（100BB 影子把短码全下当 100BB
+    // 全下，底池赔率 / 对手范围都错）→ [`preflop_allin_response`]。码深够的全下照常往下走；走到
+    // 下面翻前兜底分支（平跟映射 / 失同步 / blueprint 占位）时同样改用它，不再只跟 P 档。——
+    let allin_spot = if board.is_empty() {
+        preflop_allin_spot(req, &solver_cfg, scale, &smap, my_seat_solver, hole)
+    } else {
+        None
+    };
+    let allin_response = |spot: &PreflopAllinSpot| {
+        preflop_allin_response(
+            req,
+            hole,
+            spot,
+            solver_cfg.n_seats,
+            sample_seed(req, base_seed, n_seats),
+        )
+    };
+    if let Some(spot) = allin_spot.as_ref().filter(|s| preflop_allin_too_short(s)) {
+        dlog!("preflop allin spot (eff too short) → heuristic: {spot:?}");
+        return allin_response(spot);
+    }
+
     // —— 两态 lockstep 重放（blueprint 路径 + 锚定搜索的 node_id / legal_abs 来源；与
     // prewarm 共用 [`lockstep_replay`]，分类 / node_id 同源）——
     // `--search-limp-as-fold`（方案 B）只在开搜索时生效：它只为翻后搜索提供范围前缀。
@@ -1314,7 +1442,7 @@ fn decide(
         Some(my_seat_solver),
         limp_as_fold,
     )
-    .and_then(|(real, abs, limp)| {
+    .and_then(|(real, abs, limp, sizes)| {
         let legal_abs = SimplifiedNlheGame::legal_actions(&abs);
         if legal_abs.is_empty() {
             // empty_legal = 终局态（非失同步）；synced_node 取当前节点（前缀走旧分流即可）。
@@ -1324,12 +1452,15 @@ fn decide(
                 limp,
             });
         }
-        Ok((real, abs, legal_abs, limp))
+        Ok((real, abs, legal_abs, limp, sizes))
     });
-    let (real, abs, legal_abs) = match lockstep {
+    let (real, abs, legal_abs, sizes) = match lockstep {
         // 平跟当弃牌映射后影子在翻前对上了 blueprint 节点，但翻前要不要加注、拿什么牌加仍由
         // 启发式决定（调研 §4：blueprint 开池范围默认后面的人会弃牌，前面多了一个平跟者照搬会偏宽）。
-        Ok((_, _, _, limp)) if limp.mapped() && board.is_empty() => {
+        Ok((_, _, _, limp, _)) if limp.mapped() && board.is_empty() => {
+            if let Some(spot) = &allin_spot {
+                return allin_response(spot);
+            }
             if let Some(resp) =
                 limp_preflop_response(req, hole, &solver_cfg, scale, &smap, my_seat_solver)
             {
@@ -1345,7 +1476,7 @@ fn decide(
                 "fallback:limp_as_fold_no_limp".into(),
             );
         }
-        Ok((real, abs, legal_abs, _)) => (real, abs, legal_abs),
+        Ok((real, abs, legal_abs, _, sizes)) => (real, abs, legal_abs, sizes),
         Err(LockstepErr {
             reason,
             synced_node,
@@ -1388,6 +1519,10 @@ fn decide(
                     );
                 }
             }
+            // 翻前面对全下（如 blueprint 树里没有的开池全下）→ 全下启发式。
+            if let Some(spot) = &allin_spot {
+                return allin_response(spot);
+            }
             // preflop open-limp 结构 gap（或平跟当弃牌映射之后的失同步）→ 启发式（[`limp_heuristic`]，
             // 面对加注的弃牌出口内含底池赔率 floor）。
             if (reason == "structural_gap" || limp.mapped()) && board.is_empty() {
@@ -1422,8 +1557,9 @@ fn decide(
     // —— gating（设计 §1）：仅 `--search` 开 + 命中触发面才搜索；否则 blueprint。
     // should_search 只读街 + 本街是否已起注（与码深无关）→ 在 100BB `real` 上判等价真栈 auth。
     // `--search-flop-prefer-blueprint` on（[`SearchRuntime`] doc）：仅 flop 锚定面（此处 lockstep Ok）
-    // 且过真码深闸（[`flop_blueprint_stack_gate`]：无人 all-in + 有效码深在区间内）才抑制搜索回
-    // blueprint；真栈建不出视同不过闸。脱影子 flop 走上面 `decide_search_unanchored`，不经此 gating。
+    // 且过真码深闸（[`flop_blueprint_stack_gate`]：无人 all-in + 有效码深在区间内）和尺寸闸
+    // （[`flop_blueprint_size_gate`]：本街下注映射误差在区间内）才抑制搜索回 blueprint；真栈建不出
+    // 视同不过闸。脱影子 flop 走上面 `decide_search_unanchored`，不经此 gating。
     let flop_bp_gate = match search {
         Some(rt) if rt.flop_prefer_blueprint && street == poker::Street::Flop => Some(
             build_real_auth(
@@ -1438,7 +1574,8 @@ fn decide(
             )
             .and_then(|(auth, ..)| {
                 flop_blueprint_stack_gate(req, &solver_cfg, scale, &smap, &auth, my_seat_solver)
-            }),
+            })
+            .and_then(|()| flop_blueprint_size_gate(&sizes, street)),
         ),
         _ => None,
     };
@@ -1470,6 +1607,9 @@ fn decide(
     let bp_placeholder = matches!(bp_dist, Some(None));
     let placeholder_search = bp_placeholder && search.is_some() && !board.is_empty();
     if bp_placeholder && !placeholder_search {
+        if let Some(spot) = &allin_spot {
+            return allin_response(spot);
+        }
         let pot_odds = board
             .is_empty()
             .then(|| preflop_pot_odds(req, &solver_cfg, scale, &smap, my_seat_solver, hole))
@@ -2180,6 +2320,297 @@ fn limp_preflop_response(
     limp_heuristic(req, hole, pos, pot_odds)
 }
 
+// ===========================================================================
+// 翻前面对全下的兜底启发式（`openpoker_code_review_findings_2026_10_16.md` §5，兜底改造第一步）
+// ===========================================================================
+
+/// 翻前面对全下时，hero 与全下者的有效码深（两人 hand-start 真栈取小）低于此值（BB）就不走
+/// blueprint、改走 [`preflop_allin_response`]：blueprint 按对称 100BB 训练，短码全下在 100BB
+/// 影子里就是 100BB 全下——底池赔率和对手范围都按 100BB 算，跟注范围严重偏紧。与翻牌码深闸
+/// 下限（[`FLOP_BLUEPRINT_EFF_STACK_BB_MIN`]）同值。码深 ≥ 此值的全下仍走 blueprint；blueprint
+/// 树里没有的全下（开池全下，`drop_preflop_open_allin`）重放失同步后同样走这里。
+const PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_BB: u64 = 60;
+/// 全下范围宽度表（起手牌强度序 [`chen_order_key`] 的 top 比例）：`(全下者 hand-start 码深上限 BB,
+/// 开池全下, 3bet/4bet 全下)`，按行从上往下取第一个「码深 ≤ 上限」的行；超过最后一行按最后一行。
+/// **数值是估计**（2026-10-16 与用户确认的常识值），不是解出来的，也没有实盘数据校准。
+const ALLIN_RANGE_TABLE: [(u64, f64, f64); 5] = [
+    (10, 0.40, 0.25),
+    (15, 0.30, 0.18),
+    (25, 0.20, 0.12),
+    (40, 0.12, 0.08),
+    (60, 0.08, 0.05),
+];
+/// 已经跟了全下的其他对手：范围按全下者宽度的这个比例收紧（跟注范围比全下范围紧，估计值）。
+const ALLIN_CALLER_RANGE_FACTOR: f64 = 0.5;
+/// 跟注要求的胜率余量：胜率 ≥ 所需底池赔率 + 余量才跟（范围是猜的，留一点保守）；每多一个已跟注
+/// 的对手再加一份（多人底池范围误差叠加）。
+const ALLIN_CALL_MARGIN: f64 = 0.02;
+const ALLIN_CALL_MARGIN_PER_CALLER: f64 = 0.02;
+/// 胜率 Monte Carlo 样本数（标准误约 0.5%；release 下单次几毫秒）。
+const ALLIN_EQUITY_SAMPLES: u32 = 10_000;
+
+/// 全下者位置对范围宽度的乘数：位置越靠前越紧，按钮 / SB 偷盲位最宽（估计值）。
+fn allin_position_factor(pos: LimpPos) -> f64 {
+    match pos {
+        LimpPos::Btn | LimpPos::Sb => 1.2,
+        LimpPos::Bb | LimpPos::BeforeBtn(1) => 1.0,
+        LimpPos::BeforeBtn(2) => 0.85,
+        LimpPos::BeforeBtn(_) => 0.7,
+    }
+}
+
+/// 全下者范围宽度（top 比例，`(0, 1]`）：[`ALLIN_RANGE_TABLE`] × [`allin_position_factor`]。
+fn allin_range_width(shover_start: u64, big_blind: u64, open_shove: bool, pos: LimpPos) -> f64 {
+    let last = ALLIN_RANGE_TABLE[ALLIN_RANGE_TABLE.len() - 1];
+    let (_, open, reshove) = ALLIN_RANGE_TABLE
+        .iter()
+        .copied()
+        .find(|&(max_bb, _, _)| shover_start <= max_bb * big_blind)
+        .unwrap_or(last);
+    let base = if open_shove { open } else { reshove };
+    (base * allin_position_factor(pos)).min(1.0)
+}
+
+/// 全部 1326 个起手组合按 [`chen_order_key`] 从强到弱排好（进程内算一次）。
+fn combos_by_strength() -> &'static [[Card; 2]] {
+    static SORTED: std::sync::OnceLock<Vec<[Card; 2]>> = std::sync::OnceLock::new();
+    SORTED.get_or_init(|| {
+        let mut v: Vec<[Card; 2]> = Vec::with_capacity(1326);
+        for a in 0u8..52 {
+            for b in (a + 1)..52 {
+                v.push([
+                    Card::from_u8(a).expect("0..52 是合法 Card"),
+                    Card::from_u8(b).expect("0..52 是合法 Card"),
+                ]);
+            }
+        }
+        // 强在前；键全相等的组合保持生成序（稳定排序 → 确定性）。
+        v.sort_by(|x, y| {
+            chen_order_key(*y)
+                .partial_cmp(&chen_order_key(*x))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        v
+    })
+}
+
+/// top `width` 的组合（至少 1 个）。不做 card removal——抽样时再排除死牌。
+fn allin_range(width: f64) -> &'static [[Card; 2]] {
+    let all = combos_by_strength();
+    // 减 1e-9 再向上取整：`k / 1326 × 1326` 的浮点误差不该多取一个组合。
+    let n = ((width * all.len() as f64 - 1e-9).ceil() as usize).clamp(1, all.len());
+    &all[..n]
+}
+
+/// hero 对若干对手范围（各自在范围内均匀，排除死牌）全下到底的底池份额期望（平分算份额）。
+/// 固定 `seed` → 确定性。某样本里某对手范围的组合全被死牌挡掉（抽 64 次不中）→ 丢弃该样本；
+/// 全部丢弃 → `None`。
+fn allin_equity(
+    hole: [Card; 2],
+    opp_ranges: &[&[[Card; 2]]],
+    samples: u32,
+    seed: u64,
+) -> Option<f64> {
+    use poker::RngSource;
+    let ev = NaiveHandEvaluator;
+    let mut rng = ChaCha20Rng::from_seed(seed);
+    let (mut share, mut used) = (0.0f64, 0u32);
+    'sample: for _ in 0..samples {
+        let mut dead = [false; 52];
+        dead[hole[0].to_u8() as usize] = true;
+        dead[hole[1].to_u8() as usize] = true;
+        let mut opps: Vec<[Card; 2]> = Vec::with_capacity(opp_ranges.len());
+        for range in opp_ranges {
+            let mut pick = None;
+            for _ in 0..64 {
+                let h = range[(rng.next_u64() % range.len() as u64) as usize];
+                if !dead[h[0].to_u8() as usize] && !dead[h[1].to_u8() as usize] {
+                    pick = Some(h);
+                    break;
+                }
+            }
+            let Some(h) = pick else { continue 'sample };
+            dead[h[0].to_u8() as usize] = true;
+            dead[h[1].to_u8() as usize] = true;
+            opps.push(h);
+        }
+        let mut deck: Vec<Card> = (0u8..52)
+            .filter(|&i| !dead[i as usize])
+            .map(|i| Card::from_u8(i).expect("0..52 是合法 Card"))
+            .collect();
+        for i in 0..5 {
+            let j = i + (rng.next_u64() % (deck.len() - i) as u64) as usize;
+            deck.swap(i, j);
+        }
+        let board = [deck[0], deck[1], deck[2], deck[3], deck[4]];
+        let rank = |h: [Card; 2]| {
+            ev.eval7(&[h[0], h[1], board[0], board[1], board[2], board[3], board[4]])
+        };
+        let hero = rank(hole);
+        let best_opp = opps.iter().map(|&h| rank(h)).max().expect("至少一个对手");
+        if hero > best_opp {
+            share += 1.0;
+        } else if hero == best_opp {
+            let ties = opps.iter().filter(|&&h| rank(h) == hero).count();
+            share += 1.0 / (ties + 1) as f64;
+        }
+        used += 1;
+    }
+    (used > 0).then(|| share / f64::from(used))
+}
+
+/// 翻前「hero 面对全下」局面（[`preflop_allin_spot`] 从真栈重放取）。筹码单位 = solver chip。
+#[derive(Clone, Debug, PartialEq)]
+struct PreflopAllinSpot {
+    /// 定价的全下者（本轮投入最高、已全下）的 tree seat。
+    shover: u8,
+    /// 全下者 hand-start 码深。
+    shover_start: u64,
+    /// hero 与全下者的有效码深（hand-start 取小）。
+    eff: u64,
+    /// 全下前没人加注过（开池全下）；否则按 3bet/4bet 全下。
+    open_shove: bool,
+    /// 已经跟了全下（或更早已全下）还在池里的其他对手 tree seat。
+    callers: Vec<u8>,
+    /// hero 跟注要补的额（封顶 hero 剩余栈）。
+    to_call: u64,
+    /// hero 跟注后能赢的底池（各家投入按 hero 跟注后的总投入封顶 + hero 自己）。
+    win_pot: u64,
+    big_blind: u64,
+}
+
+/// 翻前轮到 hero、价格由一个已全下的对手定（本轮投入最高者已 all-in）→ `Some`。其余（翻后、
+/// 没人全下、全下的人只是跟注全下而价格由别人的加注定、真栈建不出）→ `None`。全下前是否有人
+/// 加注只看 `req.actions`（全下者最后一个进攻动作之前有没有 raise / bet / all_in）。
+/// 后面还没行动的玩家可能再跟或再推，这里不考虑（只用已发生的动作）。
+fn preflop_allin_spot(
+    req: &Request,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    hero: SeatId,
+    hole: [Card; 2],
+) -> Option<PreflopAllinSpot> {
+    let (auth, ..) = build_real_auth(req, solver_cfg, scale, smap, hero, hole, &[], true).ok()?;
+    if auth.street() != poker::Street::Preflop {
+        return None;
+    }
+    let real_cfg = real_stacks_config(req, solver_cfg, scale, smap).ok()?;
+    let players = auth.players();
+    let h = hero.0 as usize;
+    let max_c = players
+        .iter()
+        .map(|p| p.committed_this_round)
+        .max()
+        .unwrap_or(ChipAmount::ZERO);
+    let shover = players
+        .iter()
+        .enumerate()
+        .filter(|&(i, p)| {
+            i != h && p.status == poker::PlayerStatus::AllIn && p.committed_this_round == max_c
+        })
+        .max_by_key(|&(_, p)| p.committed_total)
+        .map(|(i, _)| i)?;
+    let call_to = auth.legal_actions().call?;
+    let to_call = call_to
+        .as_u64()
+        .checked_sub(players[h].committed_this_round.as_u64())?;
+    if to_call == 0 {
+        return None;
+    }
+    let hero_total = players[h].committed_total.as_u64() + to_call;
+    let win_pot = hero_total
+        + players
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != h)
+            .map(|(_, p)| p.committed_total.as_u64().min(hero_total))
+            .sum::<u64>();
+    let callers = players
+        .iter()
+        .enumerate()
+        .filter(|&(i, p)| {
+            i != h
+                && i != shover
+                && (p.status == poker::PlayerStatus::AllIn
+                    || (p.status == poker::PlayerStatus::Active && p.committed_this_round == max_c))
+        })
+        .map(|(i, _)| i as u8)
+        .collect();
+    let is_aggr = |a: &str| matches!(a, "raise" | "bet" | "all_in" | "allin");
+    let shove_idx = req
+        .actions
+        .iter()
+        .rposition(|a| smap.tree_seat(a.seat) == Ok(shover as u8) && is_aggr(&a.action))?;
+    let open_shove = !req.actions[..shove_idx].iter().any(|a| is_aggr(&a.action));
+    let shover_start = real_cfg.starting_stacks[shover].as_u64();
+    let eff = shover_start.min(real_cfg.starting_stacks[h].as_u64());
+    Some(PreflopAllinSpot {
+        shover: shover as u8,
+        shover_start,
+        eff,
+        open_shove,
+        callers,
+        to_call,
+        win_pot,
+        big_blind: solver_cfg.big_blind.as_u64(),
+    })
+}
+
+/// 有效码深是否低到不该用 blueprint（[`PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_BB`]）。
+fn preflop_allin_too_short(spot: &PreflopAllinSpot) -> bool {
+    spot.eff < PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_BB * spot.big_blind
+}
+
+/// 翻前面对全下的兜底：按全下者码深 / 位置 / 是否开池估范围（[`allin_range_width`]），已跟注的
+/// 对手范围再收紧（[`ALLIN_CALLER_RANGE_FACTOR`]），Monte Carlo 算 hero 底池份额
+/// （[`allin_equity`]），`份额 ≥ 跟注额 / 跟注后底池 + 余量` → call，否则 fold。只跟或弃，不再加注。
+/// `source = fallback:preflop_allin:{call,fold}`（driver 按 `fallback` 前缀计兜底）；判断用的数字
+/// 打一行 stderr（`[openpoker_advisor] preflop_allin ...`）供复盘。
+fn preflop_allin_response(
+    req: &Request,
+    hole: [Card; 2],
+    spot: &PreflopAllinSpot,
+    n_seats: u8,
+    seed: u64,
+) -> Response {
+    let width = allin_range_width(
+        spot.shover_start,
+        spot.big_blind,
+        spot.open_shove,
+        limp_pos(spot.shover, n_seats),
+    );
+    let caller_width = width * ALLIN_CALLER_RANGE_FACTOR;
+    let mut ranges: Vec<&[[Card; 2]]> = vec![allin_range(width)];
+    ranges.extend(spot.callers.iter().map(|_| allin_range(caller_width)));
+    let equity = allin_equity(hole, &ranges, ALLIN_EQUITY_SAMPLES, seed).unwrap_or(0.0);
+    let need = spot.to_call as f64 / spot.win_pot as f64;
+    let margin = ALLIN_CALL_MARGIN + ALLIN_CALL_MARGIN_PER_CALLER * spot.callers.len() as f64;
+    let valid = &req.valid;
+    let (action, case) = if equity >= need + margin && valid.can_call {
+        ("call", "call")
+    } else if valid.can_check {
+        ("check", "check") // 防御：面对全下不该能过牌。
+    } else {
+        ("fold", "fold")
+    };
+    let bb = spot.big_blind;
+    eprintln!(
+        "[openpoker_advisor] preflop_allin {} shover=seat{} {}bb eff={}bb width={width:.3} callers={} equity={equity:.3} need={need:.3} margin={margin:.2} → {action}",
+        if spot.open_shove { "open" } else { "reshove" },
+        spot.shover,
+        spot.shover_start / bb,
+        spot.eff / bb,
+        spot.callers.len(),
+    );
+    Response {
+        action: action.into(),
+        source: format!("fallback:preflop_allin:{case}"),
+        street: Some("preflop".into()),
+        ..Default::default()
+    }
+}
+
 /// 缺口②：在**真码深** config 上重放本手 → 注入真实牌，产 `(auth, round_start, within, prev_within)`
 /// 喂 [`subgame_search`] / [`subgame_search_unanchored`]。`auth` = 当前决策点真栈态（query_at 索引
 /// hero 真桶用）；`round_start` = 当前街起点快照（[`ResolveRoot::RoundStart`] 子树根）；`within` =
@@ -2313,6 +2744,27 @@ fn flop_blueprint_stack_gate(
         if eff < FLOP_BLUEPRINT_EFF_STACK_BB_MIN * bb || eff > FLOP_BLUEPRINT_EFF_STACK_BB_MAX * bb
         {
             return Err(format!("eff_stack:seat{i}:{}bb", eff / bb));
+        }
+    }
+    Ok(())
+}
+
+/// `--search-flop-prefer-blueprint` 的尺寸闸：`street` 街上每次下注 / 加注（[`BetSizeMap`]，含 hero
+/// 自己的）的「真实池比例 ÷ 映射池比例」都须落在
+/// [[`FLOP_BLUEPRINT_SIZE_RATIO_MILLI_MIN`], [`FLOP_BLUEPRINT_SIZE_RATIO_MILLI_MAX`]]/1000 内，blueprint
+/// 才算在应对真实发生的尺寸；本街没人下注恒过。`Err(size_map:<真实>/<映射>)` = 须实时搜索。
+/// 决策路径与预热共用（[`decide`] / [`prewarm`]）。
+fn flop_blueprint_size_gate(sizes: &[BetSizeMap], street: poker::Street) -> Result<(), String> {
+    for m in sizes.iter().filter(|m| m.street == street) {
+        let real = m.real_milli.saturating_mul(1000);
+        let lo = m
+            .mapped_milli
+            .saturating_mul(FLOP_BLUEPRINT_SIZE_RATIO_MILLI_MIN);
+        let hi = m
+            .mapped_milli
+            .saturating_mul(FLOP_BLUEPRINT_SIZE_RATIO_MILLI_MAX);
+        if real < lo || real > hi {
+            return Err(format!("size_map:{}/{}", m.real_milli, m.mapped_milli));
         }
     }
     Ok(())
@@ -3358,7 +3810,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_lcfr = false;
     let mut search_deep_menu = false;
     let mut search_live_traversers: Option<bool> = None;
-    let mut search_max_nodes: usize = SubgameSearchConfig::default().max_subtree_nodes;
+    let mut search_max_nodes: Option<usize> = None;
     let mut search_range_uniform_mix: Option<f64> = None;
     let mut search_bucket_table: Option<PathBuf> = None;
     let mut search_solve_threads: Option<usize> = None;
@@ -3442,9 +3894,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 });
             }
             "--search-max-nodes" => {
-                search_max_nodes = next_val(&mut it, &arg)?
-                    .parse()
-                    .map_err(|e| format!("bad search-max-nodes: {e}"))?
+                search_max_nodes = Some(
+                    next_val(&mut it, &arg)?
+                        .parse()
+                        .map_err(|e| format!("bad search-max-nodes: {e}"))?,
+                )
             }
             "--search-range-uniform-mix" => {
                 let v: f64 = next_val(&mut it, &arg)?
@@ -3584,7 +4038,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         });
         Some(SubgameSearchConfig {
             iterations,
-            max_subtree_nodes: search_max_nodes,
+            max_subtree_nodes: search_max_nodes.unwrap_or(DEFAULT_SEARCH_MAX_NODES),
             trigger: search_trigger,
             lcfr: search_lcfr,
             time_budget: search_time_budget_ms.map(Duration::from_millis),
@@ -3612,7 +4066,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_lcfr
             || search_deep_menu
             || search_live_traversers.is_some()
-            || search_max_nodes != SubgameSearchConfig::default().max_subtree_nodes
+            || search_max_nodes.is_some()
             || search_range_uniform_mix.is_some()
             || search_bucket_table.is_some()
             || search_solve_threads.is_some()
@@ -4304,7 +4758,7 @@ mod tests {
         req: &Request,
         my_turn: Option<SeatId>,
         limp_as_fold: bool,
-    ) -> Result<(poker::GameState, SimplifiedNlheState, LimpFoldMap), LockstepErr> {
+    ) -> Result<LockstepOk, LockstepErr> {
         let smap = seat_map(req, 6).expect("seat_map");
         lockstep_replay(
             game,
@@ -4341,7 +4795,8 @@ mod tests {
             .unwrap();
         assert_eq!(off.reason, "structural_gap");
         assert!(!off.limp.mapped());
-        let (_, ab, limp) = replay_limp(&game, &req, Some(SeatId(0)), true).expect("映射后应 Ok");
+        let (_, ab, limp, _) =
+            replay_limp(&game, &req, Some(SeatId(0)), true).expect("映射后应 Ok");
         assert_eq!(limp.folds, vec![(game.tree().root_id(), 3)]);
         assert_eq!(ab.game_state.current_player(), Some(SeatId(0)));
         for (hole, want) in [
@@ -4454,7 +4909,7 @@ mod tests {
             hist(3, "fold", None),
         ];
         let req = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks"], acts);
-        let (_, _, limp) = replay_limp(&game, &req, Some(SeatId(2)), true).expect("应回到锚定");
+        let (_, _, limp, _) = replay_limp(&game, &req, Some(SeatId(2)), true).expect("应回到锚定");
         assert!(limp.mapped());
         let scfg = SubgameSearchConfig {
             iterations: 300,
@@ -4901,6 +5356,8 @@ mod tests {
     /// 99614×scale(5) ≫ 10000）→ `real.apply` 失败 → lockstep `replay_illegal`（site 796 失同步）。
     /// **修前**兜底 check-when-free 面对全下 = fold → 把 KK 白弃（live 实测 `fallback:replay_illegal`
     /// + fold）；**地板**（preflop tier-2 facing bet）须把它改成 call。
+    ///
+    /// 2026-10-16 起这条线改由翻前全下启发式接（[`preflop_allin_response`]），KK 仍须 call。
     #[test]
     fn live_deep_stack_kk_replay_illegal_calls_not_folds() {
         let game = preopen_game();
@@ -4945,9 +5402,10 @@ mod tests {
             None,
             &mut SubgameSolveCache::new(),
         );
+        // 2026-10-16 起翻前失同步面对全下改走全下启发式（审查 §5），不再是 P 档地板。
         assert_eq!(
-            resp.source, "fallback:replay_illegal:premium_call",
-            "KK 超深码 shove 前 replay_illegal 失同步须命中地板，得 {resp:?}"
+            resp.source, "fallback:preflop_allin:call",
+            "KK 超深码 shove 前 replay_illegal 失同步须走全下启发式，得 {resp:?}"
         );
         assert_eq!(
             resp.action, "call",
@@ -5667,6 +6125,336 @@ mod tests {
         pre_pf.actions.truncate(4); // 只剩 folds-to-SB，preflop 中途。
         let pf = prewarm(&game, &skew, &pre_pf, 0xCAC4E, Some(&rt(scfg)), &mut cache);
         assert_eq!(pf.source, "prewarm:skip:preflop");
+    }
+
+    /// 全下范围宽度：表 × 位置乘数；超过 60BB 按最后一行；上限 1.0。
+    #[test]
+    fn allin_range_width_table_and_position() {
+        let bb = 100;
+        let w = |stack_bb: u64, open: bool, pos| allin_range_width(stack_bb * bb, bb, open, pos);
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(close(w(25, false, LimpPos::Sb), 0.12 * 1.2));
+        assert!(close(w(10, true, LimpPos::BeforeBtn(6)), 0.40 * 0.7));
+        assert!(close(w(11, true, LimpPos::BeforeBtn(1)), 0.30));
+        assert!(close(w(60, true, LimpPos::BeforeBtn(2)), 0.08 * 0.85));
+        assert!(close(w(100, false, LimpPos::BeforeBtn(1)), 0.05));
+        assert!(close(w(5, true, LimpPos::Btn), 0.48));
+    }
+
+    /// 范围按强度序取 top：最强 6 个组合 = AA；全宽 = 1326。胜率 Monte Carlo 对已知值：AA 对随机
+    /// 牌约 85%、AhKd 对 AA 约 7.4%（穷举）、72o 对随机牌约 35%、AA 对两个随机对手约 73%。
+    #[test]
+    fn allin_range_and_equity_sanity() {
+        let top6 = allin_range(6.0 / 1326.0);
+        assert_eq!(top6.len(), 6);
+        assert!(top6
+            .iter()
+            .all(|h| h[0].rank() == poker::Rank::Ace && h[1].rank() == poker::Rank::Ace));
+        assert_eq!(allin_range(1.0).len(), 1326);
+        let c = |a: &str, b: &str| [parse_card(a).unwrap(), parse_card(b).unwrap()];
+        let eq = |hole, ranges: &[&[[Card; 2]]]| allin_equity(hole, ranges, 10_000, 7).unwrap();
+        let all = allin_range(1.0);
+        let near = |x: f64, want: f64| (x - want).abs() < 0.02;
+        assert!(near(eq(c("Ah", "Ad"), &[all]), 0.852));
+        // AhKd 对 AA（排除 Ah 后剩 3 个组合）：穷举公共牌得底池份额 0.0743。
+        assert!(near(eq(c("Ah", "Kd"), &[top6]), 0.0743));
+        assert!(near(eq(c("7h", "2d"), &[all]), 0.35));
+        assert!(near(eq(c("Ah", "Ad"), &[all, all]), 0.73));
+    }
+
+    /// 面对全下的请求（6-max，button=0：SB=1 BB=2 UTG=3 HJ=4 CO=5）。`stacks` = hand-start 真栈。
+    fn allin_req(
+        hole: [&str; 2],
+        my_seat: u8,
+        actions: Vec<HistAction>,
+        stacks: Vec<u64>,
+    ) -> Request {
+        Request {
+            hole: hole.iter().map(|c| c.to_string()).collect(),
+            board: vec![],
+            button_seat: 0,
+            my_seat,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions,
+            valid: ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: false,
+                min_raise: None,
+                max_raise: None,
+            },
+            stacks,
+            dealt_seats: vec![],
+            names: Default::default(),
+        }
+    }
+
+    /// 翻前面对短码全下（审查 §5）：有效码深 < 60BB 不走 blueprint，改走全下启发式；用牌都离
+    /// 判断线 ≥ 0.03（胜率见 [`allin_equity`] 抽样）。
+    /// - BTN 开池 2.25BB、SB 25BB 3bet 全下：99 跟（旧兜底只跟 P 档）、A8o 弃；
+    /// - 同一线 SB 100BB 全下：码深够 → 仍走 blueprint；
+    /// - UTG 10BB 开池全下、hero BB：KJo 跟、Q7o 弃；
+    /// - hero 只有 15BB、SB 100BB 3bet 全下：按 hero 码深判短 → 启发式，AKo 跟、AJo 弃；
+    /// - UTG 10BB 全下 + HJ 跟注、hero BB：多人底池，99 跟、A8o 弃。
+    #[test]
+    fn preflop_short_allin_uses_heuristic_not_blueprint() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let run = |req: &Request, rt: Option<&SearchRuntime>| {
+            decide(
+                &game,
+                &abs,
+                &uniform,
+                req,
+                0xA111,
+                rt,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        let reshove = |sb_stack: u64| {
+            vec![
+                hist(3, "fold", None),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+                hist(0, "raise", Some(45)),
+                hist(
+                    1,
+                    "all_in",
+                    if sb_stack == 0 { None } else { Some(sb_stack) },
+                ),
+                hist(2, "fold", None),
+            ]
+        };
+        let mut stacks = vec![2000; 6];
+        stacks[1] = 500;
+        for (hole, want) in [(["9h", "9d"], "call"), (["Ah", "8d"], "fold")] {
+            let req = allin_req(hole, 0, reshove(500), stacks.clone());
+            for rt in [None, Some(rt(SubgameSearchConfig::default()))] {
+                let r = run(&req, rt.as_ref());
+                assert_eq!(r.action, want, "{hole:?}: {r:?}");
+                assert_eq!(r.source, format!("fallback:preflop_allin:{want}"), "{r:?}");
+            }
+        }
+        // driver 不带 amount 的 all_in 同样识别。
+        let r = run(
+            &allin_req(["9h", "9d"], 0, reshove(0), stacks.clone()),
+            None,
+        );
+        assert_eq!(r.source, "fallback:preflop_allin:call", "{r:?}");
+        // SB 100BB 全下：码深够，照常 blueprint。
+        let r = run(
+            &allin_req(["9h", "9d"], 0, reshove(2000), vec![2000; 6]),
+            None,
+        );
+        assert_eq!(r.source, "blueprint", "{r:?}");
+
+        // UTG 10BB 开池全下，hero = BB。
+        let open = vec![
+            hist(3, "all_in", Some(200)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+        ];
+        let mut stacks = vec![2000; 6];
+        stacks[3] = 200;
+        for (hole, want) in [(["Kh", "Jd"], "call"), (["Qh", "7d"], "fold")] {
+            let r = run(&allin_req(hole, 2, open.clone(), stacks.clone()), None);
+            assert_eq!(
+                r.source,
+                format!("fallback:preflop_allin:{want}"),
+                "{hole:?}: {r:?}"
+            );
+        }
+
+        // hero（BTN）只有 15BB，SB 100BB 3bet 全下。
+        let mut stacks = vec![2000; 6];
+        stacks[0] = 300;
+        for (hole, want) in [(["Ah", "Kd"], "call"), (["Ah", "Jd"], "fold")] {
+            let r = run(&allin_req(hole, 0, reshove(2000), stacks.clone()), None);
+            assert_eq!(
+                r.source,
+                format!("fallback:preflop_allin:{want}"),
+                "{hole:?}: {r:?}"
+            );
+        }
+
+        // UTG 10BB 全下 + HJ 跟注，hero = BB。
+        let multi = vec![
+            hist(3, "all_in", Some(200)),
+            hist(4, "call", None),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+        ];
+        let mut stacks = vec![2000; 6];
+        stacks[3] = 200;
+        for (hole, want) in [(["9h", "9d"], "call"), (["Ah", "8d"], "fold")] {
+            let req = allin_req(hole, 2, multi.clone(), stacks.clone());
+            let smap = seat_map(&req, 6).unwrap();
+            let hc = [parse_card(hole[0]).unwrap(), parse_card(hole[1]).unwrap()];
+            let spot =
+                preflop_allin_spot(&req, game.table_config(), 5, &smap, SeatId(2), hc).unwrap();
+            assert_eq!(spot.callers, vec![4], "{spot:?}");
+            assert!(spot.open_shove);
+            // 跟注 900（solver 单位），底池 = 1000 + 1000 + 50 + hero 1000。
+            assert_eq!((spot.to_call, spot.win_pot), (900, 3050), "{spot:?}");
+            let r = run(&req, None);
+            assert_eq!(
+                r.source,
+                format!("fallback:preflop_allin:{want}"),
+                "{hole:?}: {r:?}"
+            );
+        }
+    }
+
+    /// 尺寸闸边界：真实 / 映射 ∈ [0.75, 1.333]（含端点）才过；只看指定街；映射不是进攻动作
+    /// （`mapped_milli = 0`）必拒；本街没有下注恒过。
+    #[test]
+    fn flop_blueprint_size_gate_ratio_band() {
+        let m = |street, real_milli, mapped_milli| BetSizeMap {
+            street,
+            real_milli,
+            mapped_milli,
+        };
+        let flop = poker::Street::Flop;
+        let gate = |sizes: &[BetSizeMap]| flop_blueprint_size_gate(sizes, flop);
+        assert_eq!(gate(&[]), Ok(()));
+        assert_eq!(gate(&[m(flop, 750, 1000)]), Ok(()));
+        assert_eq!(gate(&[m(flop, 1333, 1000)]), Ok(()));
+        assert_eq!(gate(&[m(flop, 500, 500)]), Ok(()));
+        assert_eq!(gate(&[m(flop, 749, 1000)]), Err("size_map:749/1000".into()));
+        assert_eq!(
+            gate(&[m(flop, 1334, 1000)]),
+            Err("size_map:1334/1000".into())
+        );
+        // 1/3 池 c-bet 映射成 1pot（all-1pot 翻牌菜单）。
+        assert!(gate(&[m(flop, 333, 1000)]).is_err());
+        // 先过后不过：任一次下注不过即拒。
+        assert!(gate(&[m(flop, 1000, 1000), m(flop, 2000, 1000)]).is_err());
+        assert!(gate(&[m(flop, 1000, 0)]).is_err());
+        // 翻前的尺寸误差不影响翻牌闸。
+        assert_eq!(
+            gate(&[m(poker::Street::Preflop, 3000, 1000), m(flop, 1000, 1000)]),
+            Ok(())
+        );
+    }
+
+    /// 尺寸闸端到端（审查 §3）：flop 锚定面、我(SB) check 后 BB 下注，`--search-flop-prefer-blueprint`
+    /// on + AllPostflop。测试树翻牌菜单 {0.5, 1}：BB 下 1pot（正好在菜单上）/ 1.2pot（映射成 1pot，
+    /// 误差 1.2 在区间内）→ 仍走 blueprint，与 search=None byte-equal；1.5pot（映射成 1pot，误差 1.5）
+    /// → 改走锚定搜索。lockstep 记下的尺寸按池比例核对。
+    #[test]
+    fn flop_prefer_blueprint_size_gate_routes_off_menu_bet_to_search() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        };
+        // 翻牌底池 40op（SB 补齐 + BB 过牌）；BB 下注到 `bet_to`op。
+        let facing_bet = |bet_to: u64| {
+            let mut req = flop_first_unraised_req(vec![2000; 6]);
+            req.actions.push(hist(1, "check", None));
+            req.actions.push(hist(2, "bet", Some(bet_to)));
+            req.valid = ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: true,
+                min_raise: Some(bet_to * 2),
+                max_raise: Some(1980),
+            };
+            req
+        };
+        let run = |req: &Request, rt: Option<&SearchRuntime>| {
+            decide(
+                &game,
+                &abs,
+                &uniform,
+                req,
+                0xB1DE,
+                rt,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        for (bet_to, real_milli, mapped_milli, blueprint) in [
+            (40, 1000, 1000, true),
+            (48, 1200, 1000, true),
+            (60, 1500, 1000, false),
+        ] {
+            let req = facing_bet(bet_to);
+            let smap = seat_map(&req, 6).unwrap();
+            let (.., sizes) = lockstep_replay(
+                &game,
+                game.table_config(),
+                &smap,
+                &req,
+                5,
+                3,
+                Some(SeatId(smap.tree_seat(1).unwrap())),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("bet_to={bet_to}: 应锚定，得 {}", e.reason));
+            assert_eq!(
+                sizes,
+                vec![BetSizeMap {
+                    street: poker::Street::Flop,
+                    real_milli,
+                    mapped_milli,
+                }],
+                "bet_to={bet_to}"
+            );
+            let prefer = run(&req, Some(&rt_flop_prefer_blueprint(scfg)));
+            assert!(is_legal(&prefer, &req.valid), "bet_to={bet_to}: {prefer:?}");
+            if blueprint {
+                assert_eq!(
+                    prefer,
+                    run(&req, None),
+                    "bet_to={bet_to}: 映射误差在区间内须走 blueprint"
+                );
+            } else {
+                assert!(
+                    prefer.source == "search" || prefer.source.starts_with("search_giveup:"),
+                    "bet_to={bet_to}: 映射误差超区间须改走搜索，得 {prefer:?}"
+                );
+            }
+        }
+    }
+
+    /// 尺寸闸的预热同源：hero=SB 面对 BB 下注时预热，误差在区间内（1pot）→ skip；超区间（1.5pot）
+    /// → 照常预热（decide 会搜索，不预热就白等一次现解）。
+    #[test]
+    fn prewarm_flop_prefer_blueprint_size_gate() {
+        let game = nolimp_game();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        };
+        for (bet_to, expect) in [
+            (40, "prewarm:skip:flop_prefer_blueprint"),
+            (60, "prewarm:stored"),
+        ] {
+            let mut req = flop_first_unraised_req(vec![2000; 6]);
+            req.actions.push(hist(1, "check", None));
+            req.actions.push(hist(2, "bet", Some(bet_to)));
+            let mut cache = SubgameSolveCache::new();
+            let p = prewarm(
+                &game,
+                &uniform,
+                &req,
+                0xF10B,
+                Some(&rt_flop_prefer_blueprint(scfg)),
+                &mut cache,
+            );
+            assert_eq!(p.source, expect, "bet_to={bet_to}: {p:?}");
+        }
     }
 
     /// `--search-flop-prefer-blueprint on` + 预热：flop **锚定**面（lockstep Ok）的决策本会走
@@ -7083,6 +7871,27 @@ mod tests {
         assert!(parse(&["--search-flop-prefer-blueprint", "on"]).is_err());
     }
 
+    /// `--search-max-nodes`：默认 [`DEFAULT_SEARCH_MAX_NODES`]（20 万，不是通用默认 8000）；显式值覆盖；
+    /// 未开 --search 拒收（显式写默认值也拒，拒绝静默 guard）。
+    #[test]
+    fn parse_args_search_max_nodes() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        let nodes = |a: Args| a.search.expect("search on").max_subtree_nodes;
+        assert_eq!(nodes(parse(&["--search"]).unwrap()), 200_000);
+        assert_eq!(
+            nodes(parse(&["--search", "--search-max-nodes", "50000"]).unwrap()),
+            50_000
+        );
+        assert!(parse(&["--search-max-nodes", "200000"]).is_err());
+        assert!(parse(&["--search-max-nodes", "8000"]).is_err());
+    }
+
     /// `--search-limp-as-fold on|off`（方案 B，默认关）：默认关、on/off、坏值拒收、未开 --search 拒收。
     #[test]
     fn parse_args_limp_as_fold() {
@@ -7407,7 +8216,7 @@ mod tests {
                 req.actions = actions.clone();
                 // σ 逐位（经 lockstep 取该决策的真 infoset）。
                 let smap = seat_map(&req, 6).expect("seat map");
-                let (_real, ab, _) = lockstep_replay(
+                let (_real, ab, ..) = lockstep_replay(
                     game,
                     &TableConfig::default_6max_100bb(),
                     &smap,
@@ -7461,7 +8270,7 @@ mod tests {
         for hole in [["Ah", "Kd"], ["7c", "2d"], ["Qs", "Qh"]] {
             let flop_req = &sb_line_hand(hole)[0];
             let smap = seat_map(flop_req, 6).unwrap();
-            let (_real, ab, _) = lockstep_replay(
+            let (_real, ab, ..) = lockstep_replay(
                 game,
                 &TableConfig::default_6max_100bb(),
                 &smap,

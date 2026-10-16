@@ -8,7 +8,7 @@
 
 ```
 --seats 9 --reshape all-1pot --postflop-cap 4 --search --search-trigger all-postflop
---search-flop-prefer-blueprint on --search-deep-menu --search-prewarm --search-max-nodes 100000
+--search-flop-prefer-blueprint on --search-deep-menu --search-prewarm --search-max-nodes 100000（已改 200000，见 §4）
 --search-live-traversers on --search-solve-threads 4 --search-iterations 100000
 --search-time-budget-ms 3000 --search-limp-as-fold on
 ```
@@ -19,9 +19,9 @@
 |---|---|---|---|
 | 1 | 正确性 | blueprint 路径按均匀分布出牌 | **已修**（`859ba8f`） |
 | 2 | 正确性 | driver 漏算不带 amount 的全下投入 | **已修**（`859ba8f`） |
-| 3 | 策略 | 翻牌 blueprint 只有 1pot 一档，任何尺寸都按满池注应对 | 未做 |
-| 4 | 策略 + 工程 | 子树超节点上限直接放弃，不退窄菜单；5–6 人池建完树才拒绝 | 未做 |
-| 5 | 策略 | 翻前面对短码全下按 100BB 全下应对 | 未做 |
+| 3 | 策略 | 翻牌 blueprint 只有 1pot 一档，任何尺寸都按满池注应对 | **已做**：尺寸闸（见 §3） |
+| 4 | 策略 + 工程 | 子树超节点上限直接放弃，不退窄菜单；5–6 人池建完树才拒绝 | **部分**：上限改 20 万（见 §4），按预算选菜单未做 |
+| 5 | 策略 | 翻前面对短码全下按 100BB 全下应对 | **已做**：改走兜底的全下启发式（见 §5） |
 | 6 | 策略 | 兜底太保守（HU 翻后不走 floor；免费时从不下注） | 未做 |
 | 7 | 策略 | 跟进平跟后遇到加注几乎全弃 | 未做 |
 | 8 | 参数 | driver 离场码深上限 180BB 偏宽 | 未做 |
@@ -63,6 +63,11 @@
 - **建议**：prefer-blueprint 只用在本街没人下注、或映射误差小（真实 / 映射尺寸在 0.75–1.33 之间）的节点，其余走搜索。
   判断条件放进 `flop_blueprint_stack_gate` 一类的闸里，预热的 skip 判断同源。
 - **风险**：翻牌搜索是否优于训练充分的 blueprint 没有定论，需要离线对比 + A/B。
+- **已做（2026-10-16）**：`flop_blueprint_size_gate`（`tools/openpoker_advisor.rs`）。lockstep 重放时给每次下注 /
+  加注记一条「真实池比例 / 影子映射池比例」（`BetSizeMap`，池比例与菜单同一坐标系：`(to − 本轮最高投入) / 跟注后底池`）；
+  本街任一次下注（含 hero 自己的）比值落在 [0.75, 1.333] 外 → 不走 blueprint，改走锚定搜索。本街没人下注恒过。
+  决策与预热同一个函数：预热看到目前为止的本街下注，此后才出现的偏离下注只会让那次决策现解（慢，不错）。
+  闸只在 `--search-flop-prefer-blueprint on` 时生效。实盘日志里 `--debug-log` 可见 `gate FAIL: size_map:<真实>/<映射>`。
 
 ## 4. 子树超节点上限直接放弃 [核实]
 
@@ -74,6 +79,8 @@
   预热和每次决策都重建一遍。设计文档里 6 人平跟池 557k 节点约 100MB、1.4 s 一次（来自文档，本次未核实）；机器没有 swap。
 - **建议**：按节点预算选菜单（先数宽菜单，超了退 {1pot}，再超才放弃）；计数门槛降到 ≥4 人；缓存「建后超限」。选菜单的函数
   必须在 subgame 建树处和 advisor outgoing 处共用一份（否则出牌尺寸与子树菜单不一致）。
+- **已做（2026-10-16）**：节点上限改 20 万——advisor 默认 `DEFAULT_SEARCH_MAX_NODES = 200_000`（不传 `--search-max-nodes`
+  即生效）。4 人单加注池宽菜单（约 16 万）不再放弃；5–6 人池仍会超。更大的上限 / 按预算选菜单等换更高配置的机器后再定。
 
 ## 5. 翻前面对短码全下 [路径核实，影响推断]
 
@@ -82,6 +89,21 @@
   只跟 JJ+ / AK / AQ，底池赔率 floor 在这种局面几乎不触发。
 - **建议**：全下者真栈 < 约 60BB 时用规则：hero 对「按码深定宽的全下范围」的胜率 ≥ 所需底池赔率就跟。第 2 条修好后真栈可信，
   可以做了。全下范围宽度是猜的，需要标注并留参数。
+- **已做（2026-10-16，兜底改造第一步）**：两种情况都不走 blueprint，改走兜底里新加的全下启发式
+  （`preflop_allin_response`，`tools/openpoker_advisor.rs`）。
+  - **路由**：翻前轮到 hero、价格由一个已全下的对手定时，hero 与全下者的有效码深（hand-start 真栈取小）< 60BB
+    → 直接走启发式；码深够的全下仍走 blueprint，但走到翻前兜底分支（blueprint 树里没有的开池全下导致重放跟丢、
+    平跟映射、blueprint 占位）时同样改用启发式，不再只跟 P 档。
+  - **判断**：全下者范围 = 起手牌强度序的 top x%，x 按全下者码深查表 × 位置乘数（下表，**估计值**，与用户确认）；
+    已跟注的其他对手范围取全下者宽度的一半。Monte Carlo（1 万样本、种子固定）算 hero 的底池份额，
+    `份额 ≥ 跟注额 / 跟注后底池 + 2%（每多一个跟注者再 +2%）` → 跟，否则弃。只跟或弃，不加注；
+    后面还没行动的玩家不考虑。
+  - **范围表**（全下者码深 → 开池全下 / 3bet 及以上全下）：≤10BB 40% / 25%；10–15BB 30% / 18%；
+    15–25BB 20% / 12%；25–40BB 12% / 8%；40BB 以上 8% / 5%。位置乘数：BTN / SB ×1.2，BB / CO ×1.0，
+    HJ ×0.85，更靠前 ×0.7。
+  - **输出**：`source = fallback:preflop_allin:{call,fold}`（driver 计入兜底）；stderr 每次打一行
+    `[openpoker_advisor] preflop_allin ... equity=… need=… → call|fold` 供复盘。
+  - **第二步（未做）**：翻后兜底（第 6 条）与平跟池被加注（第 7 条）接到同一套「胜率 vs 所需赔率」判断。
 
 ## 6. 兜底太保守 [核实]
 
