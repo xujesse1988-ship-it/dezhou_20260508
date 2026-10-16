@@ -1367,7 +1367,8 @@ pub struct ExploitPrior<'a> {
 
 /// Chen 起手分（翻前宽度 tilt 用的强度序；设计草案 §1 摊牌 Chen 同口径）。返回值仅用于**排序**
 /// （取观测 VPIP 宽度内的 top-k combo），不需与教科书逐分吻合。`rank`：Two=0 .. Ace=12。
-fn chen_score(hole: [Card; 2]) -> f64 {
+/// advisor 的平跟池启发式（`tools/openpoker_advisor.rs` `limp_heuristic`）也用它排范围。
+pub fn chen_score(hole: [Card; 2]) -> f64 {
     let card_point = |r: u8| -> f64 {
         match r {
             12 => 10.0,                      // A

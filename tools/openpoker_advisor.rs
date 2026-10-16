@@ -87,11 +87,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use poker::eval::NaiveHandEvaluator;
-use poker::training::blueprint_advisor::{advance_shadow_by_applied, outgoing_action, parse_card};
+use poker::training::blueprint_advisor::{
+    advance_shadow_by_applied, find_tag, outgoing_action, parse_card,
+};
 use poker::training::game::{Game, PlayerId};
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::{
-    deep_menu_for, six_max_reshape, NodeId, SIX_MAX_RESHAPE_NAMES,
+    deep_menu_for, six_max_reshape, AbstractActionTag, NodeId, SIX_MAX_RESHAPE_NAMES,
 };
 use poker::training::nlhe_dense_crop::CroppedBlueprint;
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
@@ -99,7 +101,7 @@ use poker::training::openpoker_hh::{hh_record_to_observe, hist_to_concrete, HhRe
 use poker::training::opponent_profile::{ExploitConfig, ObserveHand, OpponentProfile, Profiler};
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
-    is_blueprint_cropped_err, set_subgame_debug, should_search, subgame_search_cached,
+    chen_score, is_blueprint_cropped_err, set_subgame_debug, should_search, subgame_search_cached,
     subgame_search_prewarm, subgame_search_unanchored_cached_cross_exploit,
     subgame_search_unanchored_prewarm_cross, synced_prefix_decisions, ExploitPrior, ExploitShape,
     PrefixReach, ResolveRoot, SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
@@ -164,6 +166,10 @@ const DEFAULT_SEARCH_UNANCHORED_CROSS_STREET: bool = true;
 /// 锚定之外还须过真码深闸（[`flop_blueprint_stack_gate`]）：100BB 影子按对称 100BB 重放，短码
 /// all-in 在影子里就是 100BB all-in、照样同步，光看锚定会让 blueprint 用错底池赔率 / SPR 出牌。
 const DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT: bool = false;
+/// 方案 B「平跟当弃牌」的默认（`--search-limp-as-fold`，[`lockstep_replay`]）：**默认关**（旧行为
+/// byte-equal）。调研（`docs/temp/openpoker_limp_handling_research_2026_10_16.md` §4）建议先做成
+/// 离线开关，回放已有平跟决策点确认翻后前缀非空比例 / 兜底占比 / 均匀出牌下降后再开实盘。
+const DEFAULT_SEARCH_LIMP_AS_FOLD: bool = false;
 /// flop 优先 blueprint 的有效码深区间（BB，含端点；[`flop_blueprint_stack_gate`]）。hero 与每个
 /// 未弃牌对手的 hand-start 有效码深都须落在区间内，否则 flop 照常实时搜索。
 const FLOP_BLUEPRINT_EFF_STACK_BB_MIN: u64 = 60;
@@ -550,6 +556,11 @@ struct SearchRuntime {
     /// （`false`，旧行为 byte-equal）。turn/river 锚定面不受影响。预热（[`prewarm`]）同源 skip 锚定
     /// flop 子树（不 build+solve），否则 advisor 单线程下 hero 决策白等一个 time_budget 才拿 blueprint。
     flop_prefer_blueprint: bool,
+    /// `--search-limp-as-fold`（方案 B，[`DEFAULT_SEARCH_LIMP_AS_FOLD`]）：`true` = 非 SB 开池平跟在
+    /// 100BB 影子里记为弃牌、真实局照常跟注（[`lockstep_replay`]），让平跟池翻后脱锚搜索拿到非空
+    /// 范围前缀（平跟者 = 该位置开池范围之外的牌、hero 和盲注 = blueprint 决策），平跟者后来弃牌时
+    /// 整手回到锚定路径。**翻前决策不受影响**：有映射的翻前点一律走 [`limp_heuristic`]。
+    limp_as_fold: bool,
     /// 叠加剥削（`--exploit`，`exploit_strategy_design_2026_06_14` Tier 2）：`Some` = 进程内对手画像
     /// 累积器（[`Profiler`]，**只用本进程数据、不依赖过往、启动后空表开始统计**）。`RefCell` 内部
     /// 可变：observe 路径经共享 `&SearchRuntime` 用 `borrow_mut` 累积、决策路径用 `borrow` 读已收敛
@@ -682,7 +693,16 @@ fn prewarm_inner(
     // —— 路径分类与 decide 同源：lockstep Ok → 锚定；Err（off-stack / limp 线）→ 脱影子 ——
     // 路径分类（锚定/脱影子）一次算清；下面 flop_prefer_blueprint skip 与 build+solve 共用同一份
     // 重放结果（重算两次会无谓重放历史）。
-    let lockstep = lockstep_replay(game, &solver_cfg, &smap, req, scale, board.len(), None);
+    let lockstep = lockstep_replay(
+        game,
+        &solver_cfg,
+        &smap,
+        req,
+        scale,
+        board.len(),
+        None,
+        rt.limp_as_fold,
+    );
     // `--search-flop-prefer-blueprint` on：flop **锚定**面（此处 lockstep Ok）的决策走 blueprint、不搜
     // （decide `want_search` gating 同款，[`SearchRuntime::flop_prefer_blueprint`] doc）。预热该锚定 flop
     // 子树纯属浪费，且因 advisor 单线程串行处理（build+solve 排在 hero decide 请求前），会让 hero 决策
@@ -701,7 +721,7 @@ fn prewarm_inner(
     // crop blueprint：range 先验缺被裁街 σ（跨街后验不可得）→ 先补解上一街再重试一次
     // （[`search_with_crop_backfill`]；完整 blueprint 下等价于直接调一次）。
     let attempt = |solve_cache: &mut SubgameSolveCache| match &lockstep {
-        Ok((_real, abs)) => {
+        Ok((_real, abs, _)) => {
             // 档二′-跨街复用（锚定预热，turn_blueprint_trim §2.4 改动 D）：与决策路径同义，复用缓存里
             // 上一街已解子树 σ 算本街后验 range。预热须与决策时算出同一份 ranges 才命中 key——两路同读
             // `cache.current()`（街起点预热时仍持上一街解）+ 同 `prev_within`。off / 非紧前街 → 自验退 estimate。
@@ -719,12 +739,15 @@ fn prewarm_inner(
                 hand_seed,
             )
         }
-        Err(LockstepErr { synced_node, .. }) => {
+        Err(LockstepErr {
+            synced_node, limp, ..
+        }) => {
             // 档一前缀 reach（生产默认开）：用已同步前缀估 range——须与决策时算出同一份 ranges 才能
             // 命中 key（hero 显式传入：range 平滑「不混」座按 hero 算，见 subgame_search_unanchored_prewarm）。
+            // 平跟当弃牌映射下 hero 自己那一步的过滤与决策路径同一函数（unanchored_prefix_decisions）。
             let prefix_decisions = rt
                 .unanchored_prefix_reach
-                .then(|| synced_prefix_decisions(game, *synced_node));
+                .then(|| unanchored_prefix_decisions(game, *synced_node, limp, hero_pid));
             let prefix_reach = prefix_decisions.as_ref().map(|d| PrefixReach {
                 strategy: strategy_fn,
                 decisions: d,
@@ -940,7 +963,9 @@ fn truncate_request_to_street(
     Err("truncate_target_street_not_reached".into())
 }
 
-/// 两态 lockstep 单步（真实动作与幻影 fold 共用，保两路不漂）。
+/// 两态 lockstep 单步（真实动作与幻影 fold 共用，保两路不漂）。行动者对齐检查（影子当前
+/// 行动者 == 真实当前行动者）不在这里做：平跟当弃牌映射（[`lockstep_replay`]）下真实局可能轮到
+/// 影子里已弃牌的平跟者，检查由调用方按 [`shadow_drifted`] 统一判。
 fn lockstep_step(
     real: &mut poker::GameState,
     abs: &mut SimplifiedNlheState,
@@ -964,25 +989,94 @@ fn lockstep_step(
         // 结构性 gap（如 open-limp 进 no-limp 影子）→ 失同步（不静默改 kind）。
         return Err("structural_gap".into());
     }
-    if abs.game_state.current_player() != real.current_player() {
-        return Err("lockstep_drift".into());
-    }
     Ok(())
+}
+
+/// 影子与真实局的当前行动者是否对不上。`ghosts` = 影子里已记为弃牌、真实局仍在手的平跟者
+/// （[`LimpFoldMap`]）：真实局轮到他们时影子本就没有对应行动者，不算漂移（他们下一个动作由
+/// [`lockstep_replay`] 单独处理）。`ghosts` 为空时 = 旧的逐步检查。
+fn shadow_drifted(real: &poker::GameState, abs: &SimplifiedNlheState, ghosts: &[u8]) -> bool {
+    match real.current_player() {
+        Some(SeatId(s)) if ghosts.contains(&s) => false,
+        cur => abs.game_state.current_player() != cur,
+    }
+}
+
+/// 该动作是否是「平跟当弃牌」要接的平跟：翻前、真实动作是不全下的 call、影子当前节点没有
+/// Call（no-limp 树删掉的开池 / 跟入平跟）但有 Fold。只看影子合法集，不看真实局别的状态——
+/// 影子缺 Call 只会出现在「前面没人加注、只面对大盲」的节点（面对加注时 Call 恒在树内）。
+fn is_limp_gap(
+    real: &poker::GameState,
+    abs: &SimplifiedNlheState,
+    actor: u8,
+    action: &str,
+) -> bool {
+    if action != "call" || real.street() != poker::Street::Preflop {
+        return false;
+    }
+    if real.current_player() != Some(SeatId(actor)) {
+        return false; // 交给 lockstep_step 报 replay_seat_mismatch
+    }
+    // 跟注会令行动者全下（码深 ≤ 1BB）→ 不是普通平跟，保持结构性 gap。
+    let stack = real.players()[actor as usize].stack.as_u64();
+    let committed = real.players()[actor as usize].committed_this_round.as_u64();
+    let call_to = real.legal_actions().call.map_or(0, |c| c.as_u64());
+    if call_to.saturating_sub(committed) >= stack {
+        return false;
+    }
+    let legal_abs = SimplifiedNlheGame::legal_actions(abs);
+    find_tag(&legal_abs, AbstractActionTag::Call).is_none()
+        && find_tag(&legal_abs, AbstractActionTag::Fold).is_some()
+}
+
+/// 方案 B（平跟当弃牌映射，`docs/temp/openpoker_limp_handling_research_2026_10_16.md` §3/§4）的
+/// 记录：每次映射的 `(平跟者的决策节点, 平跟者 tree seat)`。节点 = 影子里平跟者面对的那个节点，
+/// 影子在该节点走的是 Fold、真实局走的是 Call。空 = 本手没有发生映射。
+///
+/// 用途只有两个：① 翻前有映射 → 决策交给 [`limp_heuristic`]（翻前要不要加注、拿什么牌加不由
+/// blueprint 决定）；② 翻后脱锚搜索估 range 时，hero 自己被映射的那一步从前缀里拿掉
+/// （[`unanchored_prefix_decisions`]）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LimpFoldMap {
+    folds: Vec<(NodeId, PlayerId)>,
+}
+
+impl LimpFoldMap {
+    fn mapped(&self) -> bool {
+        !self.folds.is_empty()
+    }
 }
 
 /// lockstep 失同步结果：原因 + **已同步前缀**的影子节点（断点**之前**最后一个对齐的
 /// `current_node_id`）。脱影子搜索的档一前缀 reach 用它取已同步前缀的决策三元组
 /// （[`synced_prefix_decisions`]）估 range（`unanchored_range_design` §1）。`synced_node` 在每步
 /// 失败**前**捕获 = 所有成功步之后的影子节点（断点动作及其后按无信息处理，因子 1）。
+/// `limp` = 失同步前已做的平跟当弃牌映射（`--search-limp-as-fold` 关时恒空）。
+#[derive(Debug)]
 struct LockstepErr {
     reason: String,
     synced_node: NodeId,
+    limp: LimpFoldMap,
 }
 
 /// 两态 lockstep 重放（[`decide`] 决策路径与 [`prewarm`] 预热共用——**锚定/脱影子分类与
 /// node_id 必须同源**，否则预热可能走错路径 / 推错 key 静默失效）。`my_turn = Some(seat)` →
 /// 末尾校验轮到该座（决策路径，旧行为逐字保留）；`None` → 重放到历史末尾即可（预热：该街
 /// hero 行动前，轮到的是首行动者）。失同步返回 [`LockstepErr`]（原因 + 已同步前缀节点）。
+///
+/// `limp_as_fold`（方案 B，`--search-limp-as-fold`）：`false` = 旧行为逐位不变（平跟进 no-limp
+/// 影子即 `structural_gap`）。`true` = 平跟（[`is_limp_gap`]）在影子里记为弃牌、真实局照常跟注，
+/// 平跟者成为「影子已弃、真实在手」的座位，之后：
+/// - 平跟者面对加注弃牌 → 只推真实局，两边重新一致（6 月数据 90% 是这种），整手回到锚定路径；
+/// - 平跟者再跟注 / 加注 → 失同步 `limp_as_fold:limper_continued`，`synced_node` = 此前全部
+///   已同步动作（含平跟者那一步 Fold）；
+/// - 平跟者还在手就进了翻牌（如 SB 补齐 + BB 过牌）→ 失同步 `limp_as_fold:limper_in_pot`，
+///   `synced_node` 取这一步**之后**（该步两边动作相同，翻前决策全部进前缀）；
+/// - 其余漂移（如平跟后其余人全弃、影子已结束但真实局轮到 BB）→ 原因加 `limp_as_fold:` 前缀。
+///
+/// 返回的 [`LimpFoldMap`] 让调用方知道翻前发生过映射（翻前决策仍交给启发式）。翻后 Ok 时
+/// 保证没有「影子已弃、真实在手」的座位（进翻牌前已拦下）。
+#[allow(clippy::too_many_arguments)]
 fn lockstep_replay(
     game: &SimplifiedNlheGame,
     solver_cfg: &TableConfig,
@@ -991,41 +1085,96 @@ fn lockstep_replay(
     scale: u64,
     board_len: usize,
     my_turn: Option<SeatId>,
-) -> Result<(poker::GameState, SimplifiedNlheState), LockstepErr> {
+    limp_as_fold: bool,
+) -> Result<(poker::GameState, SimplifiedNlheState, LimpFoldMap), LockstepErr> {
     let mut real = poker::GameState::new(solver_cfg, REAL_REPLAY_SEED);
     let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
     let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
     // synced_node 在每步**前**捕获（abs 只在 lockstep_step 内推进）→ 失败时 = 断点前最后对齐节点
     // （所有成功步之后的影子节点；断点动作及其后按无信息处理，因子 1）。
     // 短桌：幻影座（UTG 起的最早行动位）开局先 fold → 走到 blueprint 树的真实节点。
+    let mut limp = LimpFoldMap::default();
     for &t in &smap.phantoms {
         let synced_node = abs.current_node_id;
-        lockstep_step(&mut real, &mut abs, &mut abs_rng, t, "fold", None).map_err(|e| {
-            LockstepErr {
-                reason: format!("phantom_{e}"),
-                synced_node,
-            }
-        })?;
+        let phantom_err = |e: String| LockstepErr {
+            reason: format!("phantom_{e}"),
+            synced_node,
+            limp: LimpFoldMap::default(),
+        };
+        lockstep_step(&mut real, &mut abs, &mut abs_rng, t, "fold", None).map_err(phantom_err)?;
+        if shadow_drifted(&real, &abs, &[]) {
+            return Err(phantom_err("lockstep_drift".into()));
+        }
     }
+    // 影子已弃、真实在手的平跟者（tree seat）。
+    let mut ghosts: Vec<u8> = Vec::new();
     for h in &req.actions {
         let synced_node = abs.current_node_id;
-        let actor = smap.tree_seat(h.seat).map_err(|e| LockstepErr {
-            reason: e,
-            synced_node,
-        })?;
+        let err =
+            |reason: String, synced_node: NodeId, ghosts: &[u8], limp: &LimpFoldMap| LockstepErr {
+                reason: if ghosts.is_empty() {
+                    reason
+                } else {
+                    format!("limp_as_fold:{reason}")
+                },
+                synced_node,
+                limp: limp.clone(),
+            };
+        let actor = smap
+            .tree_seat(h.seat)
+            .map_err(|e| err(e, synced_node, &ghosts, &limp))?;
         let to_solver = h.to.map(|t| t * scale);
-        lockstep_step(
-            &mut real,
-            &mut abs,
-            &mut abs_rng,
-            actor,
-            &h.action,
-            to_solver,
-        )
-        .map_err(|e| LockstepErr {
-            reason: e,
-            synced_node,
-        })?;
+        if let Some(pos) = ghosts.iter().position(|&g| g == actor) {
+            // 影子里已弃牌的平跟者再行动：只有弃牌能让两边重新一致。
+            if h.action != "fold" {
+                return Err(err("limper_continued".into(), synced_node, &ghosts, &limp));
+            }
+            if real.current_player() != Some(SeatId(actor)) {
+                return Err(err(
+                    "replay_seat_mismatch".into(),
+                    synced_node,
+                    &ghosts,
+                    &limp,
+                ));
+            }
+            if real.apply(Action::Fold).is_err() {
+                return Err(err("replay_illegal".into(), synced_node, &ghosts, &limp));
+            }
+            ghosts.remove(pos);
+        } else if limp_as_fold && is_limp_gap(&real, &abs, actor, &h.action) {
+            // 平跟当弃牌：真实局 call、影子 fold（kind 变了，必须显式记录，见 LimpFoldMap）。
+            if real.apply(Action::Call).is_err() {
+                return Err(err("replay_illegal".into(), synced_node, &ghosts, &limp));
+            }
+            if advance_shadow_by_applied(&mut abs, Action::Fold, false, &mut abs_rng).is_err() {
+                return Err(err("structural_gap".into(), synced_node, &ghosts, &limp));
+            }
+            limp.folds.push((synced_node, actor as PlayerId));
+            ghosts.push(actor);
+        } else {
+            lockstep_step(
+                &mut real,
+                &mut abs,
+                &mut abs_rng,
+                actor,
+                &h.action,
+                to_solver,
+            )
+            .map_err(|e| err(e, synced_node, &ghosts, &limp))?;
+        }
+        if !ghosts.is_empty() && real.street() != poker::Street::Preflop {
+            // 平跟者还在手就进了翻后：影子少一个在手座位，翻后不能当锚定用。这一步本身两边
+            // 动作相同 → 取这一步之后的节点（翻前决策全部进前缀）。
+            return Err(err(
+                "limper_in_pot".into(),
+                abs.current_node_id,
+                &ghosts,
+                &limp,
+            ));
+        }
+        if shadow_drifted(&real, &abs, &ghosts) {
+            return Err(err("lockstep_drift".into(), synced_node, &ghosts, &limp));
+        }
     }
     // —— 到我方决策点（决策路径）/ 历史末尾（预热）——
     if let Some(seat) = my_turn {
@@ -1033,6 +1182,7 @@ fn lockstep_replay(
             return Err(LockstepErr {
                 reason: "not_my_turn".into(),
                 synced_node: abs.current_node_id,
+                limp,
             });
         }
     }
@@ -1041,9 +1191,29 @@ fn lockstep_replay(
         return Err(LockstepErr {
             reason: "street_board_mismatch".into(),
             synced_node: abs.current_node_id,
+            limp,
         });
     }
-    Ok((real, abs))
+    Ok((real, abs, limp))
+}
+
+/// 脱锚搜索档一前缀 reach 的决策三元组（[`decide_search_unanchored`] 与 [`prewarm`] 共用，两路
+/// 必须算出同一份才能命中 solve 缓存 key）。在 [`synced_prefix_decisions`] 基础上去掉 **hero 自己**
+/// 被平跟当弃牌映射的那一步：hero 平跟的牌由 [`limp_heuristic`] 决定（跟入平跟档），按 blueprint
+/// 在该节点的弃牌概率算会把 hero 真实底牌所在的牌型压到接近 0；拿掉 = 这一步按无信息处理（因子 1）。
+/// 对手平跟者那一步 Fold 保留：P(弃牌 | 牌) = 「该位置开池范围之外的牌」，正是调研 §4 建议的
+/// 平跟者范围先验（再经 `range_uniform_mix` 混入均匀兜底）。
+fn unanchored_prefix_decisions(
+    game: &SimplifiedNlheGame,
+    synced_node: NodeId,
+    limp: &LimpFoldMap,
+    hero: PlayerId,
+) -> Vec<(NodeId, AbstractActionTag, PlayerId)> {
+    let mut d = synced_prefix_decisions(game, synced_node);
+    d.retain(|&(node, tag, seat)| {
+        !(seat == hero && tag == AbstractActionTag::Fold && limp.folds.contains(&(node, seat)))
+    });
+    d
 }
 
 /// 一次决策：重放本手历史（100BB real + abs 两态 lockstep）→ 我方决策点。`search == None` 时
@@ -1132,6 +1302,8 @@ fn decide(
 
     // —— 两态 lockstep 重放（blueprint 路径 + 锚定搜索的 node_id / legal_abs 来源；与
     // prewarm 共用 [`lockstep_replay`]，分类 / node_id 同源）——
+    // `--search-limp-as-fold`（方案 B）只在开搜索时生效：它只为翻后搜索提供范围前缀。
+    let limp_as_fold = search.is_some_and(|rt| rt.limp_as_fold);
     let lockstep = lockstep_replay(
         game,
         &solver_cfg,
@@ -1140,23 +1312,44 @@ fn decide(
         scale,
         board.len(),
         Some(my_seat_solver),
+        limp_as_fold,
     )
-    .and_then(|(real, abs)| {
+    .and_then(|(real, abs, limp)| {
         let legal_abs = SimplifiedNlheGame::legal_actions(&abs);
         if legal_abs.is_empty() {
             // empty_legal = 终局态（非失同步）；synced_node 取当前节点（前缀走旧分流即可）。
             return Err(LockstepErr {
                 reason: "empty_legal".into(),
                 synced_node: abs.current_node_id,
+                limp,
             });
         }
-        Ok((real, abs, legal_abs))
+        Ok((real, abs, legal_abs, limp))
     });
     let (real, abs, legal_abs) = match lockstep {
-        Ok(t) => t,
+        // 平跟当弃牌映射后影子在翻前对上了 blueprint 节点，但翻前要不要加注、拿什么牌加仍由
+        // 启发式决定（调研 §4：blueprint 开池范围默认后面的人会弃牌，前面多了一个平跟者照搬会偏宽）。
+        Ok((_, _, _, limp)) if limp.mapped() && board.is_empty() => {
+            if let Some(resp) =
+                limp_preflop_response(req, hole, &solver_cfg, scale, &smap, my_seat_solver)
+            {
+                return resp;
+            }
+            // limp_heuristic 只在历史里没有首个加注前的 call 时返回 None；有映射就必有平跟，
+            // 不可达。万一到达 → 与失同步同口径的兜底，绝不让 blueprint 接管翻前。
+            return fallback_with_floor(
+                &req.valid,
+                hole,
+                &board,
+                preflop_pot_odds(req, &solver_cfg, scale, &smap, my_seat_solver, hole),
+                "fallback:limp_as_fold_no_limp".into(),
+            );
+        }
+        Ok((real, abs, legal_abs, _)) => (real, abs, legal_abs),
         Err(LockstepErr {
             reason,
             synced_node,
+            limp,
         }) => {
             dlog!(
                 "lockstep DESYNC: reason={reason} synced_node={synced_node:?} board_len={} search={} → {}",
@@ -1190,8 +1383,18 @@ fn decide(
                         &board,
                         &reason,
                         synced_node,
+                        &limp,
                         solve_cache,
                     );
+                }
+            }
+            // preflop open-limp 结构 gap（或平跟当弃牌映射之后的失同步）→ 启发式（[`limp_heuristic`]，
+            // 面对加注的弃牌出口内含底池赔率 floor）。
+            if (reason == "structural_gap" || limp.mapped()) && board.is_empty() {
+                if let Some(resp) =
+                    limp_preflop_response(req, hole, &solver_cfg, scale, &smap, my_seat_solver)
+                {
+                    return resp;
                 }
             }
             // preflop 失同步底池赔率 floor（2026-06-16 用户加）：真栈重放算 pot/to_call（限
@@ -1201,20 +1404,6 @@ fn decide(
             } else {
                 None
             };
-            // preflop open-limp 结构 gap → 启发式矩阵（[`limp_heuristic`]）；其 fold 出口（facing
-            // bet）若底池赔率 floor 命中 → 改 call（保 `limp_heuristic:` 前缀，driver 分桶不变）。
-            if reason == "structural_gap" && board.is_empty() {
-                if let Some(mut resp) = limp_heuristic(req, hole) {
-                    if resp.action == "fold"
-                        && pre_pot_odds.as_ref().is_some_and(pot_odds_floor_hit)
-                    {
-                        resp.action = "call".into();
-                        resp.amount = None;
-                        resp.source = "limp_heuristic:pot_odds_call".into();
-                    }
-                    return resp;
-                }
-            }
             // 历史无 limp 的其他结构 gap / 其余 desync：喂 pre_pot_odds（preflop 命中 floor →
             // call；postflop = None，行为同改前）。
             return fallback_with_floor(
@@ -1775,26 +1964,120 @@ fn limp_hand_tier(hole: [Card; 2]) -> u8 {
     }
 }
 
-/// preflop open-limp 池启发式：blueprint 树不含 open-limp 节点（no-limp 抽象），preflop 撞
-/// `structural_gap` 后原兜底（check-when-free/fold）会把 JJ@BB 这类好牌白扔。preflop 子树
-/// 搜索（建树规模）与 limp 线重训（树预算）均不可行 → 显式启发式收口，职责一句话：
-/// **别把好牌扔掉、别用烂牌烧钱，把局面送进 flop 交给脱锚搜索**（limp 池 postflop 已由
-/// [`subgame_search_unanchored`] 接管）。
+/// 平跟池启发式里 hero 的位置（tree seat 口径：0=BTN 1=SB 2=BB 3..=UTG..CO；短桌幻影座占最早
+/// 的位置，真实座位的 tree seat 仍按这个口径，[`seat_map`]）。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LimpPos {
+    Btn,
+    Sb,
+    Bb,
+    /// 非盲位、按钮之前还有 `k` 个座位（CO=1、HJ=2、LJ=3……）。
+    BeforeBtn(u8),
+}
+
+fn limp_pos(tree_seat: u8, n_seats: u8) -> LimpPos {
+    match tree_seat {
+        0 => LimpPos::Btn,
+        1 => LimpPos::Sb,
+        2 => LimpPos::Bb,
+        t => LimpPos::BeforeBtn(n_seats.saturating_sub(t).max(1)),
+    }
+}
+
+/// 一家平跟、前面没人加注时各位置的范围（Chen 序 top 比例，[`chen_top_fraction`]）：
+/// `(隔离加注, 被动入池上限)`。被动入池 = 非盲位跟着平跟 / SB 补齐；`0.0` = 不被动入池
+/// （BB 免费过牌另算）。只有 CO / BTN 允许跟着平跟（翻后有位置）。
 ///
-/// 矩阵（档位见 [`limp_hand_tier`]）：
-/// - **没人加注**：S（tier≥1）→ iso-raise to `(4+limper 数)×BB`（clamp 进 [min,max]）；
-///   其余 can_check（BB）→ check 免费，否则 fold（SB 损 0.5BB 死盲认了）。
-/// - **有人加注**（含 hero 启发式 raise 后被 re-raise 又轮回——同分支处理，递归自然终止）：
-///   P（tier==2）→ call（不设金额 cap，对 bot 池先收数据再调）；其余 → fold。
+/// 数值是手写的常识范围（调研 §2 估算用的 BTN ≈ 30%、CO ≈ 22%），不是解出来的；偏价值方向——
+/// 平跟者常常不弃（调研 §2 jbot 面对加注 18/18 跟注），偷盲那部分牌不该照 blueprint 开池范围加。
+fn limp_ranges(pos: LimpPos) -> (f64, f64) {
+    match pos {
+        LimpPos::Btn => (0.30, 0.45),
+        LimpPos::BeforeBtn(1) => (0.22, 0.32),
+        LimpPos::BeforeBtn(2) => (0.16, 0.0),
+        LimpPos::BeforeBtn(3) => (0.13, 0.0),
+        LimpPos::BeforeBtn(_) => (0.11, 0.0),
+        LimpPos::Sb => (0.12, 0.40),
+        LimpPos::Bb => (0.12, 0.0),
+    }
+}
+
+/// 每多一家平跟，隔离加注范围收紧 20%（最多收到一半）；SB 补齐上限放宽 5 个百分点（赔率更好，
+/// 最多 55%）。非盲位跟着平跟的上限不变（隔离范围收紧后，多出来的牌自然落进跟注档）。
+fn limp_ranges_for(pos: LimpPos, limps: u64) -> (f64, f64) {
+    let (iso, passive) = limp_ranges(pos);
+    let extra = limps.saturating_sub(1) as f64;
+    let iso = iso * (1.0 - 0.2 * extra).max(0.5);
+    let passive = if pos == LimpPos::Sb {
+        (passive + 0.05 * extra).min(0.55)
+    } else {
+        passive
+    };
+    (iso, passive)
+}
+
+/// 起手牌强度序的排序键：Chen 分（[`chen_score`]）为主；Chen 分并列很多（一个并列块可达 90+
+/// 组合，只按 Chen 取「top 30%」实际会落到 40%），用 对子 > 同花 > 高牌大 > 踢脚大 确定性拆开，
+/// 让 [`chen_top_fraction`] 的宽度贴近名义值（误差不超过一个牌型，≤ 12 组合）。
+fn chen_order_key(hole: [Card; 2]) -> (f64, bool, bool, u8, u8) {
+    let (r0, r1) = (hole[0].rank() as u8, hole[1].rank() as u8);
+    let (hi, lo) = if r0 >= r1 { (r0, r1) } else { (r1, r0) };
+    (
+        chen_score(hole),
+        hi == lo,
+        hole[0].suit() == hole[1].suit(),
+        hi,
+        lo,
+    )
+}
+
+/// hero 底牌在 1326 个组合里按 [`chen_order_key`] 的位置：排在它前面的组合占比（`0.0` = 最强）。
+/// 手牌在「top p」范围内 ⇔ 返回值 `< p`。不做 card removal（范围是按位置定的常识值，精度够用）。
+fn chen_top_fraction(hole: [Card; 2]) -> f64 {
+    let hero = chen_order_key(hole);
+    let mut stronger = 0u32;
+    let mut total = 0u32;
+    for a in 0u8..52 {
+        for b in (a + 1)..52 {
+            let h = [
+                Card::from_u8(a).expect("0..52 是合法 Card"),
+                Card::from_u8(b).expect("0..52 是合法 Card"),
+            ];
+            total += 1;
+            if chen_order_key(h).partial_cmp(&hero) == Some(std::cmp::Ordering::Greater) {
+                stronger += 1;
+            }
+        }
+    }
+    f64::from(stronger) / f64::from(total)
+}
+
+/// preflop open-limp 池启发式（方案 A，`docs/temp/openpoker_limp_handling_research_2026_10_16.md`
+/// §3/§4）：blueprint 树不含非 SB 开池平跟节点，翻前遇到平跟就由这里决定；翻后交给脱锚搜索。
+/// `--search-limp-as-fold`（方案 B）开着时翻前也一样走这里——B 只给翻后搜索提供范围前缀。
 ///
-/// 返回 `None` = 历史里没有 open-limp（其他结构 gap 误入的防御）→ caller 维持原兜底。
-/// `source = limp_heuristic:{raise,check,call,fold}`（driver 单独分桶，不混 blueprint/search）。
-fn limp_heuristic(req: &Request, hole: [Card; 2]) -> Option<Response> {
+/// - **没人加注**（只有平跟）：按位置 × 平跟人数取范围（[`limp_ranges_for`]）。
+///   隔离加注档 → raise to `(3 + 平跟人数 + OOP 1)×BB`（OOP = hero 在盲位；clamp 进 [min,max]）；
+///   被动档 → CO/BTN 跟着平跟（`overlimp`）、SB 补齐（`complete`）；其余 → BB 免费过牌，否则弃牌。
+///   **这一支不套底池赔率 floor**：一家平跟时 SB 赔率 5:1、三家平跟时任何位置赔率都 > 4，套了就是
+///   任意两张都跟（2026-10-16 抽查 §3 的 SB 任意两张补齐就是这样来的）。
+/// - **有人加注**（含 hero 隔离加注或跟着平跟之后被加注）：P 档（[`limp_hand_tier`]==2）→ call；
+///   其余弃牌，但底池赔率 floor（[`pot_odds_floor_hit`]，`pot_odds` 由调用方真栈重放算）命中 → call。
+///
+/// 返回 `None` = 历史里首个加注前没有 call（其他结构 gap 误入的防御）→ caller 维持原兜底。
+/// `source = limp_heuristic:{raise,overlimp,complete,check,fold,call,pot_odds_call}`
+/// （driver 按 `limp_heuristic` 前缀单独分桶）。
+fn limp_heuristic(
+    req: &Request,
+    hole: [Card; 2],
+    pos: LimpPos,
+    pot_odds: Option<PotOdds>,
+) -> Option<Response> {
     let mut limps = 0u64;
     let mut raised = false;
     for h in &req.actions {
         match h.action.as_str() {
-            "call" if !raised => limps += 1, // 首个 raise 前的 call = open-limp / over-limp
+            "call" if !raised => limps += 1, // 首个 raise 前的 call = open-limp / over-limp / SB 补齐
             "raise" | "all_in" | "bet" => raised = true,
             _ => {}
         }
@@ -1802,7 +2085,6 @@ fn limp_heuristic(req: &Request, hole: [Card; 2]) -> Option<Response> {
     if limps == 0 {
         return None;
     }
-    let tier = limp_hand_tier(hole);
     let valid = &req.valid;
     let mk = |action: &str, amount: Option<u64>, case: &str| Response {
         action: action.into(),
@@ -1812,30 +2094,56 @@ fn limp_heuristic(req: &Request, hole: [Card; 2]) -> Option<Response> {
         ..Default::default()
     };
     if !raised {
-        if tier >= 1 && valid.can_raise {
+        let (iso, passive) = limp_ranges_for(pos, limps);
+        let frac = chen_top_fraction(hole);
+        if frac < iso && valid.can_raise {
             if let (Some(min), Some(max)) = (valid.min_raise, valid.max_raise) {
                 if min <= max {
                     // OpenPoker raise amount = 总 to 额；脏区间（min>max）走下面被动分支。
-                    let to = (4 + limps) * req.big_blind;
+                    let oop = u64::from(matches!(pos, LimpPos::Sb | LimpPos::Bb));
+                    let to = (3 + limps + oop) * req.big_blind;
                     return Some(mk("raise", Some(to.clamp(min, max)), "raise"));
                 }
             }
         }
-        // 非 S 档（或 raise 不可用的防御）：BB 免费 check，否则 fold。
-        return Some(if valid.can_check {
-            mk("check", None, "check")
-        } else {
-            mk("fold", None, "fold")
-        });
+        if valid.can_check {
+            return Some(mk("check", None, "check")); // BB 免费过牌
+        }
+        if frac < passive.max(iso) && valid.can_call {
+            let case = if pos == LimpPos::Sb {
+                "complete"
+            } else {
+                "overlimp"
+            };
+            return Some(mk("call", None, case));
+        }
+        return Some(mk("fold", None, "fold"));
     }
-    if tier == 2 && valid.can_call {
+    if limp_hand_tier(hole) == 2 && valid.can_call {
         return Some(mk("call", None, "call"));
     }
-    Some(if valid.can_check {
-        mk("check", None, "check") // 防御（preflop 面对加注不该 can_check）
-    } else {
-        mk("fold", None, "fold")
-    })
+    if valid.can_check {
+        return Some(mk("check", None, "check")); // 防御（preflop 面对加注不该 can_check）
+    }
+    if valid.can_call && pot_odds.as_ref().is_some_and(pot_odds_floor_hit) {
+        return Some(mk("call", None, "pot_odds_call"));
+    }
+    Some(mk("fold", None, "fold"))
+}
+
+/// [`limp_heuristic`] 的调用入口：算 hero 位置 + 真栈底池赔率（[`preflop_pot_odds`]）。`None` 同
+/// [`limp_heuristic`]（历史里没有平跟）。
+fn limp_preflop_response(
+    req: &Request,
+    hole: [Card; 2],
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    my_seat_solver: SeatId,
+) -> Option<Response> {
+    let pos = limp_pos(my_seat_solver.0, solver_cfg.n_seats);
+    let pot_odds = preflop_pot_odds(req, solver_cfg, scale, smap, my_seat_solver, hole);
+    limp_heuristic(req, hole, pos, pot_odds)
 }
 
 /// 缺口②：在**真码深** config 上重放本手 → 注入真实牌，产 `(auth, round_start, within, prev_within)`
@@ -2093,6 +2401,7 @@ fn decide_search_unanchored(
     board: &[Card],
     shadow_reason: &str,
     synced_node: NodeId,
+    limp: &LimpFoldMap,
     solve_cache: &mut SubgameSolveCache,
 ) -> Response {
     let scfg = &rt.cfg;
@@ -2152,12 +2461,24 @@ fn decide_search_unanchored(
     let n_seats = solver_cfg.n_seats as usize;
     let hand_seed = hand_seed_for(req, base_seed, n_seats);
     // 档一前缀 reach（生产默认开）：用已同步前缀估 range；off → None = uniform（byte-equal 旧行为）。
-    let prefix_decisions = rt
-        .unanchored_prefix_reach
-        .then(|| synced_prefix_decisions(game, synced_node));
+    let prefix_decisions = rt.unanchored_prefix_reach.then(|| {
+        unanchored_prefix_decisions(game, synced_node, limp, my_seat_solver.0 as PlayerId)
+    });
     dlog!(
-        "unanchored prefix_decisions: count={}",
-        prefix_decisions.as_ref().map_or(0, |d| d.len())
+        "unanchored prefix_decisions: count={} live_informed={:?} limp_folds={:?}",
+        prefix_decisions.as_ref().map_or(0, |d| d.len()),
+        // 前缀里有决策、且此刻仍未弃牌的座位（只有这些座位的范围不是均匀起点）。
+        prefix_decisions.as_ref().map(|d| {
+            let mut seats: Vec<PlayerId> = d
+                .iter()
+                .map(|&(_, _, s)| s)
+                .filter(|&s| auth.players()[s as usize].status != poker::PlayerStatus::Folded)
+                .collect();
+            seats.sort_unstable();
+            seats.dedup();
+            seats
+        }),
+        limp.folds
     );
     // 档二′-跨街复用（默认关）：上一街本身 unanchored、子树已解（within-round 缓存当前条目）时，复用其
     // σ 对 `prev_within`（上一街完整真实动作线）条件化得本街后验 range，覆盖档一前缀 reach。off / 缓存
@@ -2634,6 +2955,9 @@ struct Args {
     /// （脱影子 flop 仍搜索）。**默认 `false`**（[`DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT`]，旧行为
     /// byte-equal）；`on` 显式开。
     search_flop_prefer_blueprint: bool,
+    /// `--search-limp-as-fold on|off`（方案 B，[`SearchRuntime`] doc）。**默认 `false`**
+    /// （[`DEFAULT_SEARCH_LIMP_AS_FOLD`]）。仅 `--search` 开时可设。
+    search_limp_as_fold: bool,
     /// `--exploit`（叠加剥削 Tier 2）：`Some` = 开（进程内画像 → 翻前 range 宽度先验）。**仅 `--search`
     /// 开时可设**（拒静默 guard）。`None`（默认）= 关，全程与现网 byte-equal。子旗 `--exploit-min-hands`
     /// / `--exploit-strength` / `--exploit-converge-se` / `--exploit-converge-drift` 填 [`ExploitConfig`]。
@@ -2798,6 +3122,7 @@ fn run() -> Result<(), String> {
                 unanchored_prefix_reach: args.search_unanchored_prefix_reach,
                 unanchored_cross_street: args.search_unanchored_cross_street,
                 flop_prefer_blueprint: args.search_flop_prefer_blueprint,
+                limp_as_fold: args.search_limp_as_fold,
                 // 叠加剥削：--exploit 开 → 进程内空表 Profiler（只用本进程数据，不依赖过往）。
                 exploit: args.exploit.map(|cfg| RefCell::new(Profiler::new(cfg))),
             })
@@ -2827,8 +3152,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} bucket_table={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} limp_as_fold={} bucket_table={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.limp_as_fold,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
         if let Some(cell) = &rt.exploit {
@@ -2988,6 +3313,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_unanchored_prefix_reach: Option<bool> = None;
     let mut search_unanchored_cross_street: Option<bool> = None;
     let mut search_flop_prefer_blueprint: Option<bool> = None;
+    let mut search_limp_as_fold: Option<bool> = None;
     // 叠加剥削（--exploit*，仅 --search 开时生效）。
     let mut exploit_on = false;
     let mut exploit_min_hands: Option<u32> = None;
@@ -3128,6 +3454,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     }
                 });
             }
+            "--search-limp-as-fold" => {
+                // 默认关（DEFAULT_SEARCH_LIMP_AS_FOLD）；取值 on|off 显式覆盖。
+                let v = next_val(&mut it, &arg)?;
+                search_limp_as_fold = Some(match v.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => return Err(format!("--search-limp-as-fold 须 on|off，得 {other}")),
+                });
+            }
             "--debug-log" => debug_log = true,
             // —— 叠加剥削（Tier 2）：--exploit 三态总开关（on=VPIP+PFR 形状 / vpip=仅 VPIP，与
             // 现网逐位 byte-equal / off=关），子旗调 ExploitConfig ——
@@ -3232,6 +3567,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_unanchored_prefix_reach.is_some()
             || search_unanchored_cross_street.is_some()
             || search_flop_prefer_blueprint.is_some()
+            || search_limp_as_fold.is_some()
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
         }
@@ -3302,6 +3638,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         // 默认关（旧行为 byte-equal）；--search-flop-prefer-blueprint on 显式开。
         search_flop_prefer_blueprint: search_flop_prefer_blueprint
             .unwrap_or(DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT),
+        // 默认关（旧行为 byte-equal）；--search-limp-as-fold on 显式开。
+        search_limp_as_fold: search_limp_as_fold.unwrap_or(DEFAULT_SEARCH_LIMP_AS_FOLD),
         warm_profile_hh,
         debug_log,
     })
@@ -3331,6 +3669,7 @@ mod tests {
             unanchored_prefix_reach: false,
             unanchored_cross_street: false,
             flop_prefer_blueprint: false,
+            limp_as_fold: false,
             exploit: None,
         }
     }
@@ -3343,6 +3682,7 @@ mod tests {
             unanchored_prefix_reach: true,
             unanchored_cross_street: false,
             flop_prefer_blueprint: false,
+            limp_as_fold: false,
             exploit: None,
         }
     }
@@ -3355,6 +3695,7 @@ mod tests {
             unanchored_prefix_reach: true,
             unanchored_cross_street: true,
             flop_prefer_blueprint: false,
+            limp_as_fold: false,
             exploit: None,
         }
     }
@@ -3368,6 +3709,7 @@ mod tests {
             unanchored_prefix_reach: false,
             unanchored_cross_street: false,
             flop_prefer_blueprint: true,
+            limp_as_fold: false,
             exploit: None,
         }
     }
@@ -3586,7 +3928,8 @@ mod tests {
                     &req,
                     scale,
                     req.board.len(),
-                    Some(my)
+                    Some(my),
+                    false,
                 )
                 .is_ok(),
                 "cap{cap}: 标准 3bet/4bet 线 lockstep 不该 drift"
@@ -3675,8 +4018,8 @@ mod tests {
     }
 
     /// 结构性 gap：对手 UTG open-limp（call to=20）→ nolimp blueprint 影子无对应节点 →
-    /// preflop 走 [`limp_heuristic`] 矩阵（2026-06-12）。**没人加注**分支三格：S 档 iso-raise
-    /// to (4+limper 数)×BB、非 S 档 BB 免费 check、非 S 档非盲位 fold。
+    /// preflop 走 [`limp_heuristic`]。**没人加注**分支三格（HJ / BB）：隔离档 iso-raise
+    /// to (3+limper 数)×BB、范围外 BB 免费 check、范围外非盲位 fold。
     #[test]
     fn opponent_open_limp_heuristic_no_raise_cells() {
         let game = nolimp_game();
@@ -3712,11 +4055,11 @@ mod tests {
                 &mut SubgameSolveCache::new(),
             )
         };
-        // S 档（AKo）→ iso-raise to (4+1)×20=100。
+        // 隔离档（AKo）→ iso-raise to (3+1)×20=80（HJ 非盲位，不加 OOP 1BB）。
         let req = make(["Ah", "Kd"], full_valid());
         let resp = decide_one(&req);
         assert_eq!(resp.source, "limp_heuristic:raise", "得 {resp:?}");
-        assert_eq!(resp.amount, Some(100), "iso 尺寸 (4+1)×BB，得 {resp:?}");
+        assert_eq!(resp.amount, Some(80), "iso 尺寸 (3+1)×BB，得 {resp:?}");
         assert!(is_legal(&resp, &req.valid), "须合法，得 {resp:?}");
         // 非 S 档（72o）非盲位（can_check=false）→ fold。
         let resp = decide_one(&make(["7h", "2d"], full_valid()));
@@ -3735,9 +4078,468 @@ mod tests {
         let mut nl = make(["Ah", "Kd"], full_valid());
         nl.actions.clear();
         assert!(
-            limp_heuristic(&nl, [parse_card("Ah").unwrap(), parse_card("Kd").unwrap()]).is_none(),
+            limp_heuristic(
+                &nl,
+                [parse_card("Ah").unwrap(), parse_card("Kd").unwrap()],
+                LimpPos::BeforeBtn(2),
+                None
+            )
+            .is_none(),
             "无 limp 历史须返回 None → 维持原兜底"
         );
+    }
+
+    /// 平跟池启发式（方案 A）各位置的范围 / 尺寸 / 被动入池，直接钉 [`limp_heuristic`]（纯函数）。
+    /// 9-max 抽查 §3 的三手（BTN K9o / Q8o / 96s 面对一家平跟）在这里有明确去向；SB 不再任意两张都补齐。
+    #[test]
+    fn limp_heuristic_position_ranges() {
+        let card = |s: &str| parse_card(s).unwrap();
+        let h = |a: &str, b: &str| [card(a), card(b)];
+        // n 家平跟（UTG 起）、没人加注。
+        let req = |limps: u8, can_check: bool| Request {
+            hole: vec![],
+            board: vec![],
+            button_seat: 0,
+            my_seat: 0,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: (0..limps).map(|k| hist(3 + k, "call", Some(20))).collect(),
+            valid: ValidActions {
+                can_check,
+                ..full_valid()
+            },
+            stacks: vec![],
+            dealt_seats: vec![],
+            names: Default::default(),
+        };
+        // 底池赔率 floor 必中的输入：没人加注时也不许把弃牌改成跟注。
+        let odds = Some(PotOdds {
+            pot: 50,
+            to_call: 10,
+            big_blind: 20,
+        });
+        let run = |limps: u8, can_check: bool, pos: LimpPos, hole: [Card; 2]| {
+            let r = limp_heuristic(&req(limps, can_check), hole, pos, odds).expect("有平跟");
+            (r.source, r.amount)
+        };
+        let src = |s: &str| format!("limp_heuristic:{s}");
+        // BTN：AKo 隔离加注 (3+1)×BB；96s 跟着平跟；K9o / Q8o 弃。
+        assert_eq!(
+            run(1, false, LimpPos::Btn, h("Ah", "Kd")),
+            (src("raise"), Some(80))
+        );
+        assert_eq!(
+            run(1, false, LimpPos::Btn, h("9s", "6s")).0,
+            src("overlimp")
+        );
+        assert_eq!(run(1, false, LimpPos::Btn, h("Kh", "9d")).0, src("fold"));
+        assert_eq!(run(1, false, LimpPos::Btn, h("Qh", "8d")).0, src("fold"));
+        // HJ 不跟着平跟：96s 弃。
+        assert_eq!(
+            run(1, false, LimpPos::BeforeBtn(2), h("9s", "6s")).0,
+            src("fold")
+        );
+        // CO：KTo 一家平跟时隔离；三家平跟时隔离范围收紧 → 改跟着平跟。
+        assert_eq!(
+            run(1, false, LimpPos::BeforeBtn(1), h("Kh", "Td")),
+            (src("raise"), Some(80))
+        );
+        assert_eq!(
+            run(3, false, LimpPos::BeforeBtn(1), h("Kh", "Td")).0,
+            src("overlimp")
+        );
+        // SB：72o 弃（修前底池赔率 floor 让它必补齐）；87s 补齐；AKo 隔离 (3+1+1)×BB（OOP）。
+        assert_eq!(run(1, false, LimpPos::Sb, h("7h", "2d")).0, src("fold"));
+        assert_eq!(run(1, false, LimpPos::Sb, h("8s", "7s")).0, src("complete"));
+        assert_eq!(
+            run(1, false, LimpPos::Sb, h("Ah", "Kd")),
+            (src("raise"), Some(100))
+        );
+        // BB：72o 免费过牌；AKo 隔离 (3+2+1)×BB（UTG 平跟 + SB 补齐 = 2 家）。
+        assert_eq!(run(2, true, LimpPos::Bb, h("7h", "2d")).0, src("check"));
+        assert_eq!(
+            run(2, true, LimpPos::Bb, h("Ah", "Kd")),
+            (src("raise"), Some(120))
+        );
+        // 有人加注：非 P 档弃牌，底池赔率 floor 命中才跟；P 档跟。
+        let mut raised = req(1, false);
+        raised.actions.push(hist(4, "raise", Some(40)));
+        let r = limp_heuristic(&raised, h("7h", "2d"), LimpPos::Btn, odds).unwrap();
+        assert_eq!(r.source, src("pot_odds_call"));
+        let r = limp_heuristic(&raised, h("7h", "2d"), LimpPos::Btn, None).unwrap();
+        assert_eq!(r.source, src("fold"));
+        let r = limp_heuristic(&raised, h("Ah", "Ad"), LimpPos::Btn, None).unwrap();
+        assert_eq!(r.source, src("call"));
+        // 位置映射：6 座 tree seat 0..6 = BTN SB BB UTG HJ CO；9 座 tree 8 = CO、3 = UTG。
+        assert_eq!(limp_pos(0, 6), LimpPos::Btn);
+        assert_eq!(limp_pos(1, 6), LimpPos::Sb);
+        assert_eq!(limp_pos(2, 6), LimpPos::Bb);
+        assert_eq!(limp_pos(5, 6), LimpPos::BeforeBtn(1));
+        assert_eq!(limp_pos(3, 6), LimpPos::BeforeBtn(3));
+        assert_eq!(limp_pos(8, 9), LimpPos::BeforeBtn(1));
+        assert_eq!(limp_pos(3, 9), LimpPos::BeforeBtn(6));
+    }
+
+    /// Chen 序拆并列后，名义宽度与实际组合数相差不超过一个牌型（≤ 12 组合）；顺序单调。
+    #[test]
+    fn chen_top_fraction_width_matches_nominal() {
+        let combos = all_combos_for_test();
+        for p in [0.11, 0.16, 0.22, 0.30, 0.45] {
+            let n = combos.iter().filter(|&&c| chen_top_fraction(c) < p).count();
+            let nominal = p * 1326.0;
+            assert!(
+                (n as f64) >= nominal - 0.5 && (n as f64) <= nominal + 12.0,
+                "top {p}: 实际 {n} 组合，名义 {nominal}"
+            );
+        }
+        let f =
+            |a: &str, b: &str| chen_top_fraction([parse_card(a).unwrap(), parse_card(b).unwrap()]);
+        assert_eq!(f("As", "Ad"), 0.0);
+        assert!(f("As", "Ad") < f("Ks", "Kd"));
+        assert!(f("Ah", "Kh") < f("Ah", "Kd"), "同花排在非同花前");
+        assert!(f("Ah", "Kd") < f("7h", "2d"));
+    }
+
+    fn all_combos_for_test() -> Vec<[Card; 2]> {
+        let mut v = Vec::new();
+        for a in 0u8..52 {
+            for b in (a + 1)..52 {
+                v.push([Card::from_u8(a).unwrap(), Card::from_u8(b).unwrap()]);
+            }
+        }
+        v
+    }
+
+    /// 同 [`rt_prefix_reach`] 但加开方案 B（`--search-limp-as-fold`）。
+    fn rt_limp_as_fold(cfg: SubgameSearchConfig) -> SearchRuntime {
+        SearchRuntime {
+            limp_as_fold: true,
+            ..rt_prefix_reach(cfg)
+        }
+    }
+
+    /// 6 座平跟池请求：button=0（tree seat = OpenPoker 座位号），对称 100BB。
+    fn limp_req(my_seat: u8, hole: [&str; 2], board: &[&str], actions: Vec<HistAction>) -> Request {
+        Request {
+            hole: vec![hole[0].into(), hole[1].into()],
+            board: board.iter().map(|s| s.to_string()).collect(),
+            button_seat: 0,
+            my_seat,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions,
+            valid: if board.is_empty() {
+                full_valid()
+            } else {
+                ValidActions {
+                    can_check: true,
+                    can_call: false,
+                    can_raise: true,
+                    min_raise: Some(20),
+                    max_raise: Some(1900),
+                }
+            },
+            stacks: vec![2000; 6],
+            dealt_seats: vec![],
+            names: Default::default(),
+        }
+    }
+
+    fn replay_limp(
+        game: &SimplifiedNlheGame,
+        req: &Request,
+        my_turn: Option<SeatId>,
+        limp_as_fold: bool,
+    ) -> Result<(poker::GameState, SimplifiedNlheState, LimpFoldMap), LockstepErr> {
+        let smap = seat_map(req, 6).expect("seat_map");
+        lockstep_replay(
+            game,
+            game.table_config(),
+            &smap,
+            req,
+            5,
+            req.board.len(),
+            my_turn,
+            limp_as_fold,
+        )
+    }
+
+    /// 方案 B 翻前：UTG 平跟后影子在 BTN 开池节点对上 blueprint，但翻前决策仍交给启发式——
+    /// 开关 B 的翻前输出逐字节相同（B 只给翻后搜索提供范围前缀）。
+    #[test]
+    fn limp_as_fold_preflop_still_uses_heuristic() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 100,
+            ..SubgameSearchConfig::default()
+        };
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+        ];
+        // 关：平跟即 structural_gap。开：映射成功、影子轮到 BTN。
+        let req = limp_req(0, ["9s", "6s"], &[], acts.clone());
+        let off = replay_limp(&game, &req, Some(SeatId(0)), false)
+            .err()
+            .unwrap();
+        assert_eq!(off.reason, "structural_gap");
+        assert!(!off.limp.mapped());
+        let (_, ab, limp) = replay_limp(&game, &req, Some(SeatId(0)), true).expect("映射后应 Ok");
+        assert_eq!(limp.folds, vec![(game.tree().root_id(), 3)]);
+        assert_eq!(ab.game_state.current_player(), Some(SeatId(0)));
+        for (hole, want) in [
+            (["9s", "6s"], "limp_heuristic:overlimp"),
+            (["Ah", "Kd"], "limp_heuristic:raise"),
+            (["Qh", "8d"], "limp_heuristic:fold"),
+        ] {
+            let req = limp_req(0, hole, &[], acts.clone());
+            let run = |rt: &SearchRuntime| {
+                decide(
+                    &game,
+                    &abs,
+                    &uniform,
+                    &req,
+                    1,
+                    Some(rt),
+                    &mut SubgameSolveCache::new(),
+                )
+            };
+            let on = run(&rt_limp_as_fold(scfg));
+            assert_eq!(
+                on,
+                run(&rt_prefix_reach(scfg)),
+                "{hole:?}：翻前开关 B 须相同"
+            );
+            assert_eq!(on.source, want, "{hole:?}：{on:?}");
+        }
+        // BB 面对平跟、其余全弃：影子已结束（BB 白赢）但真实局轮到 BB → 失同步，仍走启发式。
+        let bb_acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+        ];
+        let mut bb = limp_req(2, ["7h", "2d"], &[], bb_acts);
+        bb.valid.can_check = true;
+        bb.valid.can_call = false;
+        let e = replay_limp(&game, &bb, Some(SeatId(2)), true)
+            .err()
+            .unwrap();
+        assert_eq!(e.reason, "limp_as_fold:lockstep_drift");
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &bb,
+            1,
+            Some(&rt_limp_as_fold(scfg)),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(resp.source, "limp_heuristic:check", "{resp:?}");
+    }
+
+    /// 方案 B 翻后：平跟者面对隔离加注又跟注 → 失同步 `limp_as_fold:limper_continued`，但前缀里有
+    /// 平跟者那一步 Fold（= 开池范围之外的牌）和 BTN 的开池加注；关 B 时前缀为空（全员均匀）。
+    #[test]
+    fn limp_as_fold_limper_continued_keeps_prefix() {
+        let game = nolimp_game();
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "raise", Some(80)),
+            hist(1, "fold", None),
+            hist(2, "fold", None),
+            hist(3, "call", Some(80)),
+            hist(3, "check", None),
+        ];
+        let req = limp_req(0, ["Ah", "Kd"], &["7h", "2c", "Ks"], acts);
+        let off = replay_limp(&game, &req, Some(SeatId(0)), false)
+            .err()
+            .unwrap();
+        assert_eq!(off.reason, "structural_gap");
+        assert!(synced_prefix_decisions(&game, off.synced_node).is_empty());
+        let on = replay_limp(&game, &req, Some(SeatId(0)), true)
+            .err()
+            .unwrap();
+        assert_eq!(on.reason, "limp_as_fold:limper_continued");
+        let d = unanchored_prefix_decisions(&game, on.synced_node, &on.limp, 0);
+        let seat_tags: Vec<(PlayerId, AbstractActionTag)> =
+            d.iter().map(|&(_, t, s)| (s, t)).collect();
+        assert!(
+            seat_tags.contains(&(3, AbstractActionTag::Fold)),
+            "{seat_tags:?}"
+        );
+        assert!(
+            seat_tags.iter().any(|&(s, t)| s == 0
+                && t != AbstractActionTag::Fold
+                && t != AbstractActionTag::Call),
+            "BTN 开池加注须在前缀里：{seat_tags:?}"
+        );
+        // BB 弃牌后影子已结束（BTN 白赢），影子节点停在 BB 决策前 → 前缀 5 步（BB 已弃，不影响翻后）。
+        assert_eq!(d.len(), 5, "UTG/HJ/CO/BTN/SB 五步：{seat_tags:?}");
+    }
+
+    /// 方案 B：平跟者面对加注弃牌 → 两边重新一致，翻后走锚定路径（关 B 时是脱锚）。
+    #[test]
+    fn limp_as_fold_limper_folds_back_to_anchored() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "raise", Some(80)),
+            hist(1, "fold", None),
+            hist(2, "call", Some(80)),
+            hist(3, "fold", None),
+        ];
+        let req = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks"], acts);
+        let (_, _, limp) = replay_limp(&game, &req, Some(SeatId(2)), true).expect("应回到锚定");
+        assert!(limp.mapped());
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let run = |rt: &SearchRuntime| {
+            decide(
+                &game,
+                &abs,
+                &uniform,
+                &req,
+                0xB0,
+                Some(rt),
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        let on = run(&rt_limp_as_fold(scfg));
+        assert!(
+            on.source == "search" || on.source.starts_with("search_giveup:unsolved"),
+            "{on:?}"
+        );
+        assert!(is_legal(&on, &req.valid), "{on:?}");
+        let off = run(&rt_prefix_reach(scfg));
+        assert!(off.source.contains("unanchored"), "{off:?}");
+    }
+
+    /// 方案 B：平跟者还在手就进了翻牌（SB 补齐 + BB 过牌）→ `limp_as_fold:limper_in_pot`，前缀含
+    /// 全部翻前决策（UTG 弃牌映射、SB 补齐、BB 过牌）；flop 脱锚搜索照常出合法动作。
+    #[test]
+    fn limp_as_fold_limper_in_pot_prefix_includes_blinds() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "call", Some(20)),
+            hist(2, "check", None),
+        ];
+        let req = limp_req(1, ["Ah", "Kd"], &["7h", "2c", "Ks"], acts);
+        let e = replay_limp(&game, &req, Some(SeatId(1)), true)
+            .err()
+            .unwrap();
+        assert_eq!(e.reason, "limp_as_fold:limper_in_pot");
+        let d = unanchored_prefix_decisions(&game, e.synced_node, &e.limp, 1);
+        let seat_tags: Vec<(PlayerId, AbstractActionTag)> =
+            d.iter().map(|&(_, t, s)| (s, t)).collect();
+        for want in [
+            (3, AbstractActionTag::Fold),
+            (1, AbstractActionTag::Call),
+            (2, AbstractActionTag::Check),
+        ] {
+            assert!(seat_tags.contains(&want), "缺 {want:?}：{seat_tags:?}");
+        }
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let resp = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0x11B9,
+            Some(&rt_limp_as_fold(scfg)),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(is_legal(&resp, &req.valid), "{resp:?}");
+        assert!(resp.source.contains("unanchored"), "{resp:?}");
+    }
+
+    /// 方案 B：hero 自己跟着平跟（启发式 overlimp）时，hero 那一步弃牌映射从前缀里拿掉（按 blueprint
+    /// 弃牌概率算会把 hero 真实底牌压到接近 0）；对手平跟者那一步保留。预热与决策同一份前缀 → 命中缓存。
+    #[test]
+    fn limp_as_fold_hero_overlimp_dropped_and_prewarm_hits() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let skew = |i: &InfoSetId, n: usize| {
+            let mut v: Vec<f64> = (0..n)
+                .map(|k| 1.0 + k as f64 + (i.raw() % 7) as f64 * 0.1)
+                .collect();
+            let s: f64 = v.iter().sum();
+            v.iter_mut().for_each(|x| *x /= s);
+            v
+        };
+        let pre_acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "call", Some(20)),
+            hist(1, "fold", None),
+            hist(2, "check", None),
+        ];
+        let pre = limp_req(0, ["9s", "6s"], &["7h", "2c", "Ks"], pre_acts.clone());
+        let e = replay_limp(&game, &pre, None, true).err().unwrap();
+        assert_eq!(
+            e.reason, "limp_as_fold:lockstep_drift",
+            "SB 弃牌后影子已结束"
+        );
+        let raw = synced_prefix_decisions(&game, e.synced_node);
+        let kept = unanchored_prefix_decisions(&game, e.synced_node, &e.limp, 0);
+        assert!(raw
+            .iter()
+            .any(|&(_, t, s)| s == 0 && t == AbstractActionTag::Fold));
+        assert!(
+            !kept.iter().any(|&(_, _, s)| s == 0),
+            "hero 映射步须拿掉：{kept:?}"
+        );
+        assert!(kept
+            .iter()
+            .any(|&(_, t, s)| s == 3 && t == AbstractActionTag::Fold));
+        assert_eq!(kept.len(), raw.len() - 1);
+
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1_000_000,
+            range_uniform_mix: 0.25,
+            ..SubgameSearchConfig::default()
+        };
+        let rt = rt_limp_as_fold(scfg);
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(&game, &skew, &pre, 0x0E1, Some(&rt), &mut cache);
+        assert_eq!(p.source, "prewarm:stored", "{p:?}");
+        let mut acts = pre_acts;
+        acts.push(hist(2, "check", None));
+        acts.push(hist(3, "check", None));
+        let req = limp_req(0, ["9s", "6s"], &["7h", "2c", "Ks"], acts);
+        let r = decide(&game, &abs, &skew, &req, 0x0E1, Some(&rt), &mut cache);
+        assert!(r.source.contains("unanchored"), "{r:?}");
+        assert_eq!((cache.misses(), cache.hits()), (1, 1), "决策须命中预热");
     }
 
     /// [`limp_heuristic`] **有人加注**分支（含 hero raise 后被 re-raise 的递归终止格）：
@@ -6166,6 +6968,31 @@ mod tests {
         assert!(parse(&["--search-flop-prefer-blueprint", "on"]).is_err());
     }
 
+    /// `--search-limp-as-fold on|off`（方案 B，默认关）：默认关、on/off、坏值拒收、未开 --search 拒收。
+    #[test]
+    fn parse_args_limp_as_fold() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        assert!(!parse(&["--search"]).unwrap().search_limp_as_fold, "默认关");
+        assert!(
+            parse(&["--search", "--search-limp-as-fold", "on"])
+                .unwrap()
+                .search_limp_as_fold
+        );
+        assert!(
+            !parse(&["--search", "--search-limp-as-fold", "off"])
+                .unwrap()
+                .search_limp_as_fold
+        );
+        assert!(parse(&["--search", "--search-limp-as-fold", "maybe"]).is_err());
+        assert!(parse(&["--search-limp-as-fold", "on"]).is_err());
+    }
+
     /// 档二′-跨街复用端到端（脱影子 `decide` 路径，trigger=AllPostflop 才搜 turn）：先 flop 决策解
     /// flop 子树入缓存 → turn 决策复用其 σ（`build_real_auth` 重建 `prev_within` = flop 完整动作线 →
     /// `decide_search_unanchored` → `subgame_search_unanchored_cached_cross`）。stub 桶下钉 plumbing：
@@ -6404,6 +7231,7 @@ mod tests {
             unanchored_prefix_reach: DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH,
             unanchored_cross_street: DEFAULT_SEARCH_UNANCHORED_CROSS_STREET,
             flop_prefer_blueprint: false,
+            limp_as_fold: false,
             exploit: None,
         }
     }
@@ -6464,7 +7292,7 @@ mod tests {
                 req.actions = actions.clone();
                 // σ 逐位（经 lockstep 取该决策的真 infoset）。
                 let smap = seat_map(&req, 6).expect("seat map");
-                let (_real, ab) = lockstep_replay(
+                let (_real, ab, _) = lockstep_replay(
                     game,
                     &TableConfig::default_6max_100bb(),
                     &smap,
@@ -6472,6 +7300,7 @@ mod tests {
                     5,
                     0,
                     Some(SeatId(smap.tree_seat(*my_seat).unwrap())),
+                    false,
                 )
                 .unwrap_or_else(|e| panic!("preflop 重放应 Ok: {}", e.reason));
                 let hole_c = [parse_card(hole[0]).unwrap(), parse_card(hole[1]).unwrap()];
@@ -6517,7 +7346,7 @@ mod tests {
         for hole in [["Ah", "Kd"], ["7c", "2d"], ["Qs", "Qh"]] {
             let flop_req = &sb_line_hand(hole)[0];
             let smap = seat_map(flop_req, 6).unwrap();
-            let (_real, ab) = lockstep_replay(
+            let (_real, ab, _) = lockstep_replay(
                 game,
                 &TableConfig::default_6max_100bb(),
                 &smap,
@@ -6525,6 +7354,7 @@ mod tests {
                 5,
                 3,
                 Some(SeatId(1)),
+                false,
             )
             .unwrap_or_else(|e| panic!("flop 重放应 Ok: {}", e.reason));
             let hole_c = [parse_card(hole[0]).unwrap(), parse_card(hole[1]).unwrap()];
@@ -6811,6 +7641,7 @@ mod tests {
             unanchored_prefix_reach: true,
             unanchored_cross_street: cross,
             flop_prefer_blueprint: prefer,
+            limp_as_fold: false,
             exploit: None,
         };
         let k = StreetTag::Flop;

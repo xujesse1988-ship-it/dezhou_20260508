@@ -219,6 +219,21 @@ HJ 的 raise、BTN 的 call 和 UTG 后续的 call 都不进入翻牌根范围�
 
 这里的“空前缀”针对满桌首动作断开。短桌可能先重放幻影座 fold，或其他位置 limp 前已有真实动作，前缀未必为空；各座仍只使用其中属于自己的决策，没有自身有效动作的座位不会从这段前缀获得有信息的范围。
 
+以上是默认（`--search-limp-as-fold off`）的行为。
+
+### 平跟当弃牌（`--search-limp-as-fold on`，默认关）
+
+开启后，非 SB 的开池 / 跟入平跟在 100BB 影子里记为弃牌，真实局照常跟注；这名平跟者成为「影子已弃、真实在手」的座位。之后：
+
+- 平跟者面对加注弃牌：只推真实局，两边重新一致，整手回到锚定路径（翻后走 blueprint / 锚定搜索）。
+- 平跟者再跟注或加注：失同步，原因 `limp_as_fold:limper_continued`，前缀包含此前全部已同步动作。
+- 平跟者还在手就进了翻牌（如 SB 补齐 + BB 过牌）：失同步，原因 `limp_as_fold:limper_in_pot`，前缀包含全部翻前动作（含 SB 补齐和 BB 过牌）。
+- 其余漂移（如平跟后其余人全弃、影子已结束但真实局轮到 BB）：原因加 `limp_as_fold:` 前缀。
+
+上面的例子开启后：UTG 的平跟按 UTG 开池节点的弃牌概率估范围（≈ 该位置开池范围之外的牌，再按 `--search-range-uniform-mix` 混入均匀），HJ 的加注按 UTG 已弃后的 HJ 开池节点估，BTN 的跟注按面对 HJ 开池的节点估；UTG 后续的 call 是断点，不进入前缀。hero 自己被映射成弃牌的那一步（hero 跟着平跟）从前缀里拿掉，按无信息处理——按 blueprint 弃牌概率算会把 hero 真实底牌所在牌型压到接近 0。
+
+翻前不受这个开关影响：只要发生过映射，翻前决策一律交给 `limp_heuristic`（按位置 × 平跟人数配的范围），不使用影子对上的 blueprint 开池节点。原因见 `docs/temp/openpoker_limp_handling_research_2026_10_16.md` §4。
+
 ### 裁剪 blueprint 的区别
 
 若范围估计需要读取已经被裁掉的 blueprint 街，代码会触发覆盖守卫，尝试补解紧前一街，再通过跨街后验重试；必要时向更早街递归补解。补解仍不能提供后验时，advisor 显式返回 `search_giveup:crop_no_posterior:*`。
@@ -254,6 +269,7 @@ HJ 的 raise、BTN 的 call 和 UTG 后续的 call 都不进入翻牌根范围�
 | `--search-unanchored-prefix-reach` | `on` | 脱锚时使用同步成功的历史前缀 |
 | `--search-unanchored-cross-street` | `on` | 同时控制锚定和脱锚两路的跨街复用 |
 | `--search-flop-prefer-blueprint` | `off` | 开启时，锚定翻牌优先使用 blueprint（须无人全下、有效码深 60–140BB） |
+| `--search-limp-as-fold` | `off` | 开启时平跟在影子里记为弃牌，平跟池翻后搜索获得范围前缀 |
 | `--exploit` | `off` | 可选对手画像修正 |
 
 底层锚定搜索另保留 `ResolveRoot::CurrentDecision` 模式，会把当前街已发生的动作也纳入 blueprint 根范围估计，并从当前决策点建树。脱锚搜索只支持 `RoundStart`；本文逐街示例使用的也是 advisor 的 `RoundStart` 路径。

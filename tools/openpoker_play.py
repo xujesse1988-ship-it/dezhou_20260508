@@ -1326,6 +1326,9 @@ def main():
     # hero 与每个未弃牌对手的有效码深在 60–140BB 内才走 blueprint、不搜索；不满足 / flop 脱影子
     # 仍实时搜索；turn/river 不受影响。不传 = 吃 advisor 默认（OFF）。
     p.add_argument("--search-flop-prefer-blueprint", choices=["on", "off"], default=None)
+    # 平跟当弃牌（方案 B，advisor 默认 off）：on = 非 SB 开池平跟在 blueprint 影子里记为弃牌，
+    # 平跟池翻后搜索拿到范围前缀；翻前仍由 limp_heuristic 决定。不传 = 吃 advisor 默认（OFF）。
+    p.add_argument("--search-limp-as-fold", choices=["on", "off"], default=None)
     # 深码 SPR 自适应菜单（deep_menu_for：深 {1pot} / 浅 ≤3-way {0.5,1} 全层级）。
     p.add_argument("--search-deep-menu", action="store_true")
     # 子树 solve 的 traverser 只轮子树根仍 Active 的座（弃牌座轮到 = 零学习迭代）。
@@ -1382,6 +1385,8 @@ def main():
             extra += ["--search-unanchored-cross-street", args.search_unanchored_cross_street]
         if args.search_flop_prefer_blueprint is not None:
             extra += ["--search-flop-prefer-blueprint", args.search_flop_prefer_blueprint]
+        if args.search_limp_as_fold is not None:
+            extra += ["--search-limp-as-fold", args.search_limp_as_fold]
         if args.search_deep_menu:
             extra.append("--search-deep-menu")
         if args.search_live_traversers is not None:
@@ -1429,6 +1434,9 @@ def main():
     if args.search_flop_prefer_blueprint is not None and not args.search:
         raise SystemExit("--search-flop-prefer-blueprint 需配 --search"
                          "（拒绝静默：没有搜索 flop 本就走 blueprint，设此旗无意义）")
+    if args.search_limp_as_fold is not None and not args.search:
+        raise SystemExit("--search-limp-as-fold 需配 --search"
+                         "（拒绝静默：它只给翻后搜索提供范围前缀，没有搜索设了无意义）")
     cropped = args.cropped_checkpoint is not None
     advisor = Advisor(args.advisor_bin, args.cropped_checkpoint if cropped else args.checkpoint,
                       args.bucket_table, args.reshape, args.postflop_cap, args.seed,
