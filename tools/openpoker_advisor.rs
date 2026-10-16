@@ -1447,12 +1447,50 @@ fn decide(
     }
     let want_search = matches!(search, Some(rt) if should_search(&real, rt.cfg.trigger))
         && !matches!(flop_bp_gate, Some(Ok(())));
+    // 不搜索的决策先查 blueprint。crop blueprint 守卫：不搜索的决策只能查保留街的 σ。启动期约束
+    // （validate_crop_runtime）保证被裁街恒触发搜索，此处不可达；万一到达 → 显式兜底，绝不把缺失
+    // σ 当均匀用。完整 blueprint（River）恒不触发（byte-equal）。
+    let bp_dist: Option<Option<Vec<(AbstractAction, f64)>>> = if want_search {
+        None
+    } else {
+        let bp_max = search.map_or(StreetTag::River, |rt| rt.cfg.blueprint_max_street);
+        if !matches!(street_tag_of(street), Some(t) if t as u8 <= bp_max as u8) {
+            return fallback_with_floor(
+                &req.valid,
+                hole,
+                &board,
+                None,
+                format!("fallback:blueprint_cropped:{}", street_label(street)),
+            );
+        }
+        Some(blueprint_distribution(&info, &legal_abs, strategy_fn))
+    };
+    // blueprint 该信息集只是均匀占位（[`Blueprint::strategy`] 返回空）：不按均匀出牌。翻后且开了
+    // 搜索 → 改走锚定搜索（与触发面命中时同一路径；没有预热，现解）；翻前 / 未开搜索 → 兜底。
+    let bp_placeholder = matches!(bp_dist, Some(None));
+    let placeholder_search = bp_placeholder && search.is_some() && !board.is_empty();
+    if bp_placeholder && !placeholder_search {
+        let pot_odds = board
+            .is_empty()
+            .then(|| preflop_pot_odds(req, &solver_cfg, scale, &smap, my_seat_solver, hole))
+            .flatten();
+        return fallback_with_floor(
+            &req.valid,
+            hole,
+            &board,
+            pot_odds,
+            "fallback:blueprint_placeholder".into(),
+        );
+    }
+    let want_search = want_search || placeholder_search;
     dlog!(
         "lockstep OK: street={:?} node_id={node_id:?} info_set={} legal_abs={:?} path={}",
         street,
         info.raw(),
         legal_abs,
-        if want_search {
+        if placeholder_search {
+            "search (anchored, blueprint placeholder)"
+        } else if want_search {
             "search (anchored)"
         } else {
             "blueprint"
@@ -1585,20 +1623,9 @@ fn decide(
             }
         }
     } else {
-        // crop blueprint 守卫：不搜索的决策只能查保留街的 σ。启动期约束（validate_crop_runtime）
-        // 保证被裁街恒触发搜索，此处不可达；万一到达 → 显式兜底，绝不把缺失 σ 当均匀用。
-        // 完整 blueprint（River）恒不触发（byte-equal）。
-        let bp_max = search.map_or(StreetTag::River, |rt| rt.cfg.blueprint_max_street);
-        if !matches!(street_tag_of(street), Some(t) if t as u8 <= bp_max as u8) {
-            return fallback_with_floor(
-                &req.valid,
-                hole,
-                &board,
-                None,
-                format!("fallback:blueprint_cropped:{}", street_label(street)),
-            );
-        }
-        blueprint_distribution(&info, &legal_abs, strategy_fn)
+        bp_dist
+            .flatten()
+            .expect("非搜索路径 bp_dist 已算出且非占位（占位已在上面 return / 改走搜索）")
     };
 
     // outgoing 基准态：搜索 → 真栈 auth（真码深尺寸）；blueprint → 100BB real（旧行为）。
@@ -1643,7 +1670,13 @@ fn decide(
         // safe_fallback（source = fallback:...），不覆盖。bet/raise 退成 call/check 时追加降级标记。
         resp.source = format!(
             "{}{}",
-            if want_search { "search" } else { "blueprint" },
+            if placeholder_search {
+                "search:bp_placeholder"
+            } else if want_search {
+                "search"
+            } else {
+                "blueprint"
+            },
             degrade.unwrap_or("")
         );
         resp.street = Some(street_label(street).into());
@@ -1664,27 +1697,28 @@ fn decide(
     resp
 }
 
-/// blueprint 平均策略 → 归一 `(action, prob)`（空 / 全零 / 长度不符 → uniform 兜底）。逐字保留
-/// 原 `decide` 内联逻辑（search=None 路径 byte-equal）。
+/// blueprint 平均策略 → 归一 `(action, prob)`。`None` = 该信息集没有可用策略（空 / 长度不符 /
+/// 无正概率；生产 [`Blueprint::strategy`] 对均匀占位行也返回空）——调用方不得按均匀出牌
+/// （2026-10-16 run3：JJ 在 3 人池拿到 check / bet / allin 各 1/3）。
 fn blueprint_distribution(
     info: &InfoSetId,
     legal_abs: &[AbstractAction],
     strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
-) -> Vec<(AbstractAction, f64)> {
+) -> Option<Vec<(AbstractAction, f64)>> {
     let raw = strategy_fn(info, legal_abs.len());
-    if raw.len() == legal_abs.len() && raw.iter().any(|p| p.is_finite() && *p > 0.0) {
-        let sum: f64 = raw.iter().filter(|p| p.is_finite() && **p > 0.0).sum();
+    if raw.len() != legal_abs.len() || !raw.iter().any(|p| p.is_finite() && *p > 0.0) {
+        return None;
+    }
+    let sum: f64 = raw.iter().filter(|p| p.is_finite() && **p > 0.0).sum();
+    Some(
         legal_abs
             .iter()
             .copied()
             .zip(raw)
             .filter(|(_, p)| p.is_finite() && *p > 0.0)
             .map(|(a, p)| (a, p / sum))
-            .collect()
-    } else {
-        let p = 1.0 / legal_abs.len() as f64;
-        legal_abs.iter().copied().map(|a| (a, p)).collect()
-    }
+            .collect(),
+    )
 }
 
 /// solver [`Action`] → OpenPoker [`Response`]（blueprint / search 共享）。合法动作 → `source` 留空
@@ -2804,8 +2838,12 @@ impl Blueprint {
         }
     }
 
-    /// `strategy_fn` 的实现（见类型 doc）。
+    /// `strategy_fn` 的实现（见类型 doc）。均匀占位行返回空（[`strip_uniform_placeholder`]）。
     fn strategy(&self, info: &InfoSetId) -> Vec<f64> {
+        strip_uniform_placeholder(self.strategy_raw(info))
+    }
+
+    fn strategy_raw(&self, info: &InfoSetId) -> Vec<f64> {
         match self {
             Blueprint::Full(t) => t.average_strategy(*info),
             Blueprint::Cropped {
@@ -2827,6 +2865,20 @@ impl Blueprint {
                 Vec::new()
             }),
         }
+    }
+}
+
+/// blueprint 平均策略恰好均匀（≥ 2 个动作、每项与 1/n 相差 < 1e-12）→ 空。dense trainer / crop 的
+/// `average_strategy` 对「碰过但 strategy_sum 为 0」的行退成 1/n，「只被第一次遍历累计过」的行也恰好
+/// 均匀——都不是解出来的混合策略（同 `subgame::read_current_strategy` 的占位判据）。训练过的行恰好
+/// 均匀到 1e-12 的概率可以忽略。返回空后：决策路径（[`blueprint_distribution`]）不出牌、改走搜索或
+/// 兜底；range 估计（`estimate_range`）对空 σ 本来就按 1/n 处理，与改前逐位相同。
+fn strip_uniform_placeholder(v: Vec<f64>) -> Vec<f64> {
+    let n = v.len();
+    if n >= 2 && v.iter().all(|p| (p - 1.0 / n as f64).abs() < 1e-12) {
+        Vec::new()
+    } else {
+        v
     }
 }
 
@@ -5169,6 +5221,69 @@ mod tests {
         }
     }
 
+    /// 测试里现训的小 blueprint 翻前有不少恰好均匀的占位行：这些决策走占位兜底（不按均匀出牌），
+    /// 其余走 blueprint。完整 vs crop 的全等断言不受影响。
+    fn bp_or_placeholder(source: &str) -> bool {
+        source == "blueprint" || source.starts_with("fallback:blueprint_placeholder")
+    }
+
+    /// blueprint 均匀占位（[`Blueprint::strategy`] 对恰好均匀的行返回空）不按均匀出牌：翻后开搜索
+    /// → 改走锚定搜索（`search:bp_placeholder`）；翻前 / 未开搜索 → 兜底 `fallback:blueprint_placeholder`。
+    #[test]
+    fn blueprint_placeholder_never_plays_uniform() {
+        assert!(strip_uniform_placeholder(vec![0.5, 0.5]).is_empty());
+        assert!(strip_uniform_placeholder(vec![0.25; 4]).is_empty());
+        assert_eq!(
+            strip_uniform_placeholder(vec![1.0]),
+            vec![1.0],
+            "单动作不是占位"
+        );
+        assert_eq!(strip_uniform_placeholder(vec![0.3, 0.7]), vec![0.3, 0.7]);
+
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let empty = |_i: &InfoSetId, _n: usize| Vec::<f64>::new();
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            ..SubgameSearchConfig::default()
+        };
+        let run = |req: &Request, rt: Option<&SearchRuntime>| {
+            decide(
+                &game,
+                &abs,
+                &empty,
+                req,
+                0xB1DE,
+                rt,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        // 翻牌锚定面 + flop_prefer_blueprint：本该走 blueprint，占位 → 锚定搜索。
+        let flop = flop_first_unraised_req(vec![2000; 6]);
+        let r = run(&flop, Some(&rt_flop_prefer_blueprint(scfg)));
+        assert!(
+            r.source == "search:bp_placeholder" || r.source.starts_with("search_giveup:"),
+            "{r:?}"
+        );
+        assert!(is_legal(&r, &flop.valid), "{r:?}");
+        // 未开搜索：兜底。
+        let r = run(&flop, None);
+        assert_eq!(r.source, "fallback:blueprint_placeholder", "{r:?}");
+        // 翻前：兜底（AKo 面对开池加注 → premium floor 跟注，不随机）。
+        let mut pre = flop.clone();
+        pre.board.clear();
+        pre.my_seat = 5;
+        pre.actions = vec![hist(3, "raise", Some(60)), hist(4, "fold", None)];
+        pre.valid = full_valid();
+        let r = run(&pre, Some(&rt_flop_prefer_blueprint(scfg)));
+        assert!(
+            r.source.starts_with("fallback:blueprint_placeholder"),
+            "{r:?}"
+        );
+        assert_eq!(r.action, "call", "AKo premium floor：{r:?}");
+    }
+
     /// `--search-flop-prefer-blueprint on`：同一 **flop 锚定**触发面（100BB 对称、影子同步 = lockstep
     /// Ok），开旗后须改走 blueprint（`source=blueprint`）而非搜索，且与 `search=None` byte-equal——
     /// 此旗只抑制 flop 锚定搜索、不改 blueprint 输出。对照：不开旗（[`rt`]）同输入是搜索区
@@ -7306,7 +7421,7 @@ mod tests {
                 let hole_c = [parse_card(hole[0]).unwrap(), parse_card(hole[1]).unwrap()];
                 let info = game.info_set_for_cards(ab.current_node_id, hole_c, &[]);
                 assert_eq!(info.street_tag(), StreetTag::Preflop);
-                let (a, b) = (full.strategy(&info), crop.strategy(&info));
+                let (a, b) = (full.strategy_raw(&info), crop.strategy_raw(&info));
                 assert!(
                     bits_eq(&a, &b),
                     "翻前 σ 须逐位一致 @ {hole:?} seat{my_seat}"
@@ -7333,7 +7448,7 @@ mod tests {
                         &mut SubgameSolveCache::new(),
                     );
                     assert_eq!(rf, rc, "翻前 advisor 输出须全等 @ {hole:?} seat{my_seat}");
-                    assert_eq!(rf.source, "blueprint");
+                    assert!(bp_or_placeholder(&rf.source), "{rf:?}");
                 }
             }
         }
@@ -7365,7 +7480,7 @@ mod tests {
                 .collect();
             let info = game.info_set_for_cards(ab.current_node_id, hole_c, &board);
             assert_eq!(info.street_tag(), StreetTag::Flop);
-            let (a, b) = (full.strategy(&info), crop.strategy(&info));
+            let (a, b) = (full.strategy_raw(&info), crop.strategy_raw(&info));
             assert!(!a.is_empty(), "翻牌 infoset 应已被训练访问（stub 桶）");
             assert!(bits_eq(&a, &b), "翻牌 σ 须逐位一致 @ {hole:?}");
 
@@ -7391,7 +7506,7 @@ mod tests {
                 Some(&prefer(&crop)),
                 &mut SubgameSolveCache::new(),
             );
-            assert_eq!(rf.source, "blueprint");
+            assert!(bp_or_placeholder(&rf.source), "{rf:?}");
             assert_eq!(rf, rc, "翻牌 blueprint 路径须全等 @ {hole:?}");
 
             let (rt_f, rt_c) = (crop_rt(&full, crop_scfg()), crop_rt(&crop, crop_scfg()));
@@ -8267,6 +8382,16 @@ mod tests {
         let abs = game.abstraction().clone();
         let sf = |i: &InfoSetId, _n: usize| full.strategy(i);
         let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);
+        // 短桌映射检查要比较 info_set（占位兜底不带 info_set）：这里只验座位映射，空 / 占位行补成
+        // 均匀，让决策照常走 blueprint 并带出 info_set。
+        let sf_raw = |i: &InfoSetId, n: usize| {
+            let v = full.strategy_raw(i);
+            if v.is_empty() {
+                vec![1.0 / n as f64; n]
+            } else {
+                v
+            }
+        };
         let (rt_f, rt_c) = (crop_rt(&full, crop_scfg()), crop_rt(&crop, crop_scfg()));
         validate_crop_runtime(crop.keep_through(), Some(&rt_c)).expect("生产约束满足");
 
@@ -8293,7 +8418,7 @@ mod tests {
                     search.then_some(&rt_c),
                     &mut SubgameSolveCache::new(),
                 );
-                assert_eq!(rf.source, "blueprint", "{rf:?}");
+                assert!(bp_or_placeholder(&rf.source), "{rf:?}");
                 assert!(is_legal(&rf, &req.valid));
                 assert_eq!(rf, rc, "翻前 crop 与完整须全等");
             }
@@ -8311,7 +8436,7 @@ mod tests {
             let rs = decide(
                 game,
                 &abs,
-                &sf,
+                &sf_raw,
                 &short,
                 0x9EED,
                 None,
@@ -8320,7 +8445,7 @@ mod tests {
             let re = decide(
                 game,
                 &abs,
-                &sf,
+                &sf_raw,
                 &equiv,
                 0x9EED,
                 None,
@@ -8423,7 +8548,7 @@ mod tests {
             Some(&rt),
             &mut SubgameSolveCache::new(),
         );
-        assert_eq!(r.source, "blueprint", "{r:?}");
+        assert!(bp_or_placeholder(&r.source), "{r:?}");
 
         for hole in [["Ah", "Kd"], ["Qs", "Qh"]] {
             let hand = nine_sb_line_hand(hole);

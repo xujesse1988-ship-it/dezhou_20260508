@@ -58,7 +58,10 @@ k=6/7/8/9 = 557k / 3.07M / 15.5M / 72.6M 节点,单加注池 9-way 1.47M;≥7 �
 面对平跟弃得过紧。详见 `temp/openpoker_9max_live_spotcheck_2026_10_16.md`。平跟处理(同日,`temp/openpoker_limp_handling_research_2026_10_16.md` §6):
 `limp_heuristic` 改为按位置 × 平跟人数配范围(Chen 序)、CO/BTN 可跟着平跟、没人加注时不再套底池赔率规则(修 SB 任意两张补齐);
 新增 `--search-limp-as-fold on|off`(默认 off):平跟在影子里记为弃牌,平跟池翻后脱锚搜索拿到范围前缀,翻前仍走启发式。
-离线回放 35 个平跟池翻后决策:在池座位有前缀信息 0 → 31,兜底未降(节点上限 / 欠训练)。
+离线回放 35 个平跟池翻后决策:在池座位有前缀信息 0 → 31,兜底未降(节点上限 / 欠训练)。同日另修两处:① blueprint 路径
+也拦均匀占位(`Blueprint::strategy` 对恰好均匀 / 未访问的行返回空,决策时翻后改走锚定搜索 `search:bp_placeholder`、
+翻前 / 未开搜索走兜底 `fallback:blueprint_placeholder`;range 估计对空 σ 本就按 1/n,不变);② driver 对不带 amount
+的 all_in 按 `stack_before` 补投入、剩余栈记 0(修前起始栈被算成只剩已投入部分,run3 一手 BB 算成 44 → 搜索放弃)。
 
 **S6 进度(2026-06-03):实时搜索推进,MVP subgame-solver 核心已落地 + vultr 验证**(分支 `6max-rts-mvp`
 commit `cf9efdb`,**未并入 6max**)。设计成文 `temp/realtime_search_design_2026_06_03.md`(文献调研+代码复用映射+

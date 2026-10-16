@@ -167,9 +167,11 @@ class Advisor:
 # ===========================================================================
 # 单手状态累计（§3：OpenPoker 有状态推送 → driver 自己累计成 advisor 要的历史）
 # ===========================================================================
-def _commit_step(committed, seat, a, amount):
+def _commit_step(committed, seat, a, amount, all_in_delta=None):
     """单步本街 committed 转移（on_player_action 增量路径与短桌投入重算共用，保两边不漂）。
-    返回 (to, delta)：to = raise/bet 的本街累计到额；delta = 本动作投入增量。"""
+    返回 (to, delta)：to = raise/bet 的本街累计到额；delta = 本动作投入增量。
+    all_in_delta = 不带 amount 的 all_in 的投入增量（= 该座全下前的剩余栈，见
+    HandState.on_player_action）；None = 没有这个信息（旧行为：增量 0）。"""
     prev = committed.get(seat, 0)
     to = None
     if a in ("raise", "bet"):
@@ -181,6 +183,8 @@ def _commit_step(committed, seat, a, amount):
     elif a == "all_in":
         if amount is not None:
             committed[seat] = amount
+        elif all_in_delta is not None:
+            committed[seat] = prev + all_in_delta
     # check/fold：committed 不变。
     return to, committed.get(seat, 0) - prev
 
@@ -227,18 +231,28 @@ class HandState:
 
     def on_player_action(self, seat, action, amount, ext=None):
         """记一条对手 / 我方已确认动作。to = 该座本街累计到额（raise/bet 才需）。
-        ext = player_action 原始字段子集（HH 日志用，advisor 不读）。"""
+        ext = player_action 原始字段子集（HH 日志用，advisor 不读）。
+        返回值：不带 amount 的 all_in 用 ext.stack_before 补出投入时 = True（调用方须把该座
+        剩余栈记为 0，服务端这条消息的 stack 字段还是全下前的值）；其余 False。"""
         a = (action or "").lower()
-        to, delta = _commit_step(self.committed, seat, a, amount)
-        # 缺口②：本手累计投入 += 本动作增量（本街新 committed − 旧）。all_in 无 amount → 增量 0
-        # （信息缺，advisor 真栈重放会因 apply 非法回落 fold，不污染 blueprint 路径）。
+        # 不带 amount 的 all_in：服务端这条消息的 stack / stack_before / stack_after 都是全下**前**
+        # 的剩余栈、contribution_delta=0（2026-10-16 run1–3 全部 5 次 all_in 实测）。全下 = 把剩余栈
+        # 全部投入 → 增量 = stack_before。修前增量记 0、之后 your_turn 又把该座栈更新成 0 →
+        # hand-start 栈只剩已投入部分（run3：翻牌全下的 BB 被算成 44 → auth_seat_mismatch 放弃）。
+        all_in_delta = None
+        if a == "all_in" and amount is None and ext and ext.get("stack_before") is not None:
+            all_in_delta = int(round(ext["stack_before"]))
+        to, delta = _commit_step(self.committed, seat, a, amount, all_in_delta)
+        # 缺口②：本手累计投入 += 本动作增量（本街新 committed − 旧）。all_in 无 amount 且无
+        # stack_before → 增量 0（信息缺，advisor 真栈重放会因 apply 非法回落 fold，不污染 blueprint 路径）。
         self.committed_total[seat] = self.committed_total.get(seat, 0) + delta
         self.actions.append({"seat": seat, "action": a, **({"to": to} if to is not None else {})})
         self.actions_ext.append(dict(ext) if ext else {})
         self._action_streets.append(self.street)  # 剥削 observe：逐动作驱动侧街（与 actions 平行）。
         if seat is not None:
             self.acted.add(seat)
-        self._raw_events.append(("act", seat, a, amount))
+        self._raw_events.append(("act", seat, a, amount, all_in_delta))
+        return all_in_delta is not None
 
     def update_stacks(self, seat, stack):
         """从 player_action.stack / your_turn.players[].stack 滚动记各座当前 remaining 栈。
@@ -283,8 +297,8 @@ class HandState:
             if ev[0] == "street":
                 committed = {s: 0 for s in range(NUM_SEATS)}
                 continue
-            _, seat, a, amount = ev
-            _, delta = _commit_step(committed, seat, a, amount)
+            _, seat, a, amount, all_in_delta = ev
+            _, delta = _commit_step(committed, seat, a, amount, all_in_delta)
             total[seat] = total.get(seat, 0) + delta
         return total
 
@@ -527,9 +541,11 @@ class Session:
         elif t == "player_action":
             if self.state["hand"]:
                 ext = {k: msg[k] for k in _EXT_KEYS if k in msg}
-                self.state["hand"].on_player_action(msg.get("seat"), msg.get("action"),
-                                                    msg.get("amount"), ext=ext)
-                self.state["hand"].update_stacks(msg.get("seat"), msg.get("stack"))
+                all_in_resolved = self.state["hand"].on_player_action(
+                    msg.get("seat"), msg.get("action"), msg.get("amount"), ext=ext)
+                # 不带 amount 的 all_in：消息里的 stack 还是全下前的值 → 剩余栈记 0。
+                self.state["hand"].update_stacks(
+                    msg.get("seat"), 0 if all_in_resolved else msg.get("stack"))
                 self._dbg(f"act seat={msg.get('seat')} {msg.get('action')}"
                           + (f" amount={msg.get('amount')}"
                              if msg.get("amount") is not None else "")
@@ -924,6 +940,9 @@ def run_selftest(advisor):
     # 盲注座重算 / HH dealt_est。
     _selftest_short_handed()
 
+    # 场景 6b（不带 amount 的 all_in）：投入按 stack_before 补、剩余栈记 0 → hand-start 真栈正确。
+    _selftest_allin_no_amount()
+
     # 场景 7（RoundStart 预热）：街起点（hero=BB 行动前）发 prewarm（不等响应）→ hero 决策
     # decide 先 drain 预热响应再读决策响应——验 IPC 锁步对齐不串行 + 动作仍合法。
     # search off 时 advisor 回 prewarm:skip:search_off，机制同样走通（drain 只数行数）。
@@ -1224,6 +1243,50 @@ def _selftest_short_handed():
         raise RuntimeError(f"[short] 短桌 committed_total 应按真实盲注座（5/0）重算: {ct}")
     print("[selftest 6 短桌幻影座] table_state.in_hand 占座推断（排除等局玩家）→ dealt_seats + "
           "placeholder 栈 + 盲注座重算 + HH dealt_est 全对。", file=sys.stderr)
+
+
+def _selftest_allin_no_amount():
+    """场景 6b：服务端 all_in 消息不带 amount，stack / stack_before / stack_after 都是全下前的剩余栈、
+    contribution_delta=0（2026-10-16 实测）。修前投入记 0、your_turn 又把该座栈更新成 0 →
+    hand-start 栈只剩盲注（run3：BB 被算成 44 → advisor auth_seat_mismatch 放弃）。满桌 6 座，
+    button=0：UTG(3) raise 60 → 4/5/0 fold → SB(1) 全下（剩余 1990）→ 轮到我（BB=2）。"""
+    msgs = [
+        {"type": "hand_start", "hand_id": "ai-1", "seat": 2, "dealer_seat": 0,
+         "table_id": "tbl-ai", "blinds": {"small_blind": 10, "big_blind": 20}},
+        {"type": "hole_cards", "cards": ["Ah", "Kd"]},
+        {"type": "player_action", "seat": 3, "action": "raise", "amount": 60,
+         "street": "preflop", "stack": 1940, "stack_before": 2000, "stack_after": 1940,
+         "contribution_delta": 60},
+        {"type": "player_action", "seat": 4, "action": "fold", "amount": None,
+         "street": "preflop", "stack": 2000, "contribution_delta": 0},
+        {"type": "player_action", "seat": 5, "action": "fold", "amount": None,
+         "street": "preflop", "stack": 2000, "contribution_delta": 0},
+        {"type": "player_action", "seat": 0, "action": "fold", "amount": None,
+         "street": "preflop", "stack": 2000, "contribution_delta": 0},
+        {"type": "player_action", "seat": 1, "action": "all_in", "amount": None,
+         "amount_mode": "to_total", "street": "preflop", "stack": 1990, "stack_before": 1990,
+         "stack_after": 1990, "contribution_delta": 0, "to_call_before": 50},
+        {"type": "your_turn", "hand_id": "ai-1", "turn_token": "tt-ai", "seat": 2,
+         "players": [{"seat": 0, "name": "p0", "stack": 2000},
+                     {"seat": 1, "name": "p1", "stack": 0},
+                     {"seat": 2, "name": "me", "stack": 1980},
+                     {"seat": 3, "name": "p3", "stack": 1940},
+                     {"seat": 4, "name": "p4", "stack": 2000},
+                     {"seat": 5, "name": "p5", "stack": 2000}],
+         "valid_actions": [{"action": "fold"}, {"action": "call"}],
+         "min_raise": None, "max_raise": None},
+    ]
+    stub = _StubAdvisor()
+    session = Session(stub, send=lambda ws, obj: None, num_hands=10 ** 9, log_f=None, hh_f=None)
+    ws = _FakeWs()
+    for m in msgs:
+        session.handle_message(ws, m)
+    req = json.loads(stub.transcript[0][0])
+    if req.get("stacks") != [2000] * 6:
+        raise RuntimeError(f"[all_in] 不带 amount 的全下后真栈回推错: {req.get('stacks')}")
+    if req["actions"][-1] != {"seat": 1, "action": "all_in"}:
+        raise RuntimeError(f"[all_in] 历史末尾应是 SB all_in: {req['actions']}")
+    print("[selftest 6b all_in 无 amount] 投入按 stack_before 补 → 真栈 6×2000", file=sys.stderr)
 
 
 def _selftest_hu_detection():
