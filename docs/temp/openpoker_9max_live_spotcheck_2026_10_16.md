@@ -140,6 +140,7 @@ hero 遍历时对手几乎不抽到加注，hero 就到不了这个节点。这�
 blueprint 是 no-limp 训练的，对手平跟后走 `limp_heuristic`（`tools/openpoker_advisor.rs:1786`）。
 本次大量 `limp_heuristic:fold`（130 次决策里 24 次），例如按钮位 K9o / Q8o / 96s 面对一家平跟弃牌、
 JTs 面对平跟 + 加注弃牌。按钮位 K9o 面对一个平跟正常应该隔离加注或跟着平跟。已知短板，单次损失小，暂不修。
+后续调研（现状 / 数据 / 方案对比 / 建议）见 `openpoker_limp_handling_research_2026_10_16.md`。
 
 ## 4. 子树节点上限
 
