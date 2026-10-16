@@ -109,7 +109,8 @@ hero 遍历时对手几乎不抽到加注，hero 就到不了这个节点。这�
    迭代下靠均匀占位「通过」，迭代已上调：`cropped_blueprint_turn_river_search_only` → 1000、
    `anchored_cross_street_changes_solve_key` → 1000、`cross_street_changes_solve_key` → 3000（它们测缓存 key /
    crop 一致性，与策略质量无关）。修后生产配置（1000 次）重放 30 个实盘搜索请求：均匀输出 0。
-2. **加有效迭代**（配置，主修复）：开 `--search-live-traversers`，迭代 10 万量级 + `--search-time-budget-ms`
+2. **加有效迭代**（配置，主修复）：`--search-live-traversers` 已改为 advisor 默认开（`DEFAULT_SEARCH_LIVE_TRAVERSERS`，
+   `--search-live-traversers off` 显式关；库层 `SubgameSearchConfig::default()` 仍为 false，离线 A/B 工具与旧测试基线不变），迭代 10 万量级 + `--search-time-budget-ms`
    当上限 + `--search-solve-threads` 并行。兜底检查只能把乱出牌换成保守动作，迭代够才有好策略。
 3. **对手走冷门线**（Js4s 类）：靠 1 兜底；根治需要在对手实际动作后从当前节点重解，另议。
 4. 未查：`cropped_blueprint_turn_river_search_only` 开 `live_traversers`（1000 / 3000 次）反而解不出 QQ 那个点，

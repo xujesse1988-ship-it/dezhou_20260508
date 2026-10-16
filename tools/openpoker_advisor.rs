@@ -132,6 +132,12 @@ const DEFAULT_SEARCH_RANGE_UNIFORM_MIX: f64 = 0.25;
 /// 臂 / 回退）。注意 §5.1 仍是 n=1 决策级证据 → live 多手 EV 确认仍在进行（开默认是据机制 + 该证据
 /// 拍板，正确性早单测硬证、是守护默认关不会变坏的旗）。
 const DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH: bool = true;
+/// 子树 solve 只轮子树根仍 Active 的座当 traverser 的生产默认（`SubgameSearchConfig::live_traversers`）。
+/// 默认全座轮转下弃牌座轮到 = 零学习迭代：9-max 单挑底池 1000 次迭代只约 111 次 hero 遍历，hero 真实桶
+/// 常抽不中 → 平均策略只是均匀占位（2026-10-16 实盘 22 次搜索决策 6 次均匀，
+/// `docs/temp/openpoker_9max_live_spotcheck_2026_10_16.md`）。只跳过零学习迭代、不改算法，同 wall 有效迭代
+/// ×n_seats/n_active。`--search-live-traversers off` 显式关（回到全座轮转，A/B 对照）。
+const DEFAULT_SEARCH_LIVE_TRAVERSERS: bool = true;
 /// **档二′-跨街复用**的生产默认（`unanchored_range_design_2026_06_10` §1末/§4 +
 /// `turn_blueprint_trim_cross_street_anchored_2026_06_19`）：上一街子树已解时，复用那棵子树的 σ 对上一街
 /// 实际动作线做贝叶斯条件化 → 本街后验 range，替代断点前粗前缀（档一在 turn 丢掉 flop 断点后的加注战 =
@@ -2974,7 +2980,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_time_budget_ms: Option<u64> = None;
     let mut search_lcfr = false;
     let mut search_deep_menu = false;
-    let mut search_live_traversers = false;
+    let mut search_live_traversers: Option<bool> = None;
     let mut search_max_nodes: usize = SubgameSearchConfig::default().max_subtree_nodes;
     let mut search_range_uniform_mix: Option<f64> = None;
     let mut search_bucket_table: Option<PathBuf> = None;
@@ -3048,7 +3054,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             }
             "--search-lcfr" => search_lcfr = true,
             "--search-deep-menu" => search_deep_menu = true,
-            "--search-live-traversers" => search_live_traversers = true,
+            "--search-live-traversers" => {
+                // 默认开（DEFAULT_SEARCH_LIVE_TRAVERSERS）；取值 on|off 显式覆盖（A/B 用）。
+                let v = next_val(&mut it, &arg)?;
+                search_live_traversers = Some(match v.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => return Err(format!("--search-live-traversers 须 on|off，得 {other}")),
+                });
+            }
             "--search-max-nodes" => {
                 search_max_nodes = next_val(&mut it, &arg)?
                     .parse()
@@ -3191,7 +3205,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             deep_menu: search_deep_menu,
             // 缺口①续（限时杠杆②）：traverser 只轮子树根仍 Active 的座（弃牌/all-in 座零学习
             // 迭代跳过，同 wall 有效迭代 ×n_seats/n_active）。
-            live_traversers: search_live_traversers,
+            live_traversers: search_live_traversers.unwrap_or(DEFAULT_SEARCH_LIVE_TRAVERSERS),
             // range 先验平滑（2026-06-12 searchon50 修复，SubgameSearchConfig 字段 doc）：薄线
             // blueprint reach 噪声 range 会被无约束重解放大成 max-exploit（空气 99.98% 下注 /
             // 73% jam 实撞），λ 混合 uniform 给合法组合保底权重。生产默认开
@@ -3210,7 +3224,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_time_budget_ms.is_some()
             || search_lcfr
             || search_deep_menu
-            || search_live_traversers
+            || search_live_traversers.is_some()
             || search_max_nodes != SubgameSearchConfig::default().max_subtree_nodes
             || search_range_uniform_mix.is_some()
             || search_bucket_table.is_some()
@@ -6045,6 +6059,33 @@ mod tests {
         assert!(parse(&["--search", "--search-solve-threads", "0"]).is_err());
         // 拒绝静默 guard：设了 flag 未开 --search → Err。
         assert!(parse(&["--search-solve-threads", "4"]).is_err());
+    }
+
+    /// `--search-live-traversers on|off`：advisor 默认开（DEFAULT_SEARCH_LIVE_TRAVERSERS，库层
+    /// `SubgameSearchConfig::default()` 仍为 false）、off 显式关、on 显式开、坏值拒收、未开 --search 拒收。
+    #[test]
+    fn parse_args_search_live_traversers() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        let a = parse(&["--search"]).expect("parse Ok");
+        assert!(a.search.expect("search on").live_traversers, "默认开");
+        assert!(
+            !SubgameSearchConfig::default().live_traversers,
+            "库层默认不变"
+        );
+        let a = parse(&["--search", "--search-live-traversers", "off"]).expect("parse Ok");
+        assert!(!a.search.expect("search on").live_traversers, "off 应关");
+        let a = parse(&["--search", "--search-live-traversers", "on"]).expect("parse Ok");
+        assert!(a.search.expect("search on").live_traversers, "on 应开");
+        assert!(parse(&["--search", "--search-live-traversers", "maybe"]).is_err());
+        // 旧的裸 flag 写法（无取值）不再接受：会把下一个参数当取值 → 报错，不静默。
+        assert!(parse(&["--search", "--search-live-traversers"]).is_err());
+        assert!(parse(&["--search-live-traversers", "on"]).is_err());
     }
 
     /// `--search-unanchored-prefix-reach on|off`（档一，§5.1 拍板默认开）：默认开、off 显式关、
