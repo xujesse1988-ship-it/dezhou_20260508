@@ -7644,17 +7644,15 @@ mod tests {
         );
         shove.stacks = vec![2000; 9];
         shove.stacks[6] = 300;
-        // 规则引擎在唯一对手已 all-in 时仍给 hero 列加注档 → 可能出 `search:raise_as_call`（实发 call）。
-        let searched = |r: &Response| r.source == "search" || r.source == "search:raise_as_call";
         let r = run(&shove, Some(&rt));
-        assert!(searched(&r), "{r:?}");
+        assert_eq!(r.source, "search", "{r:?}");
         assert!(is_legal(&r, &shove.valid), "{r:?}");
         // 同一手对手 100BB all-in：有效码深在区间内，但有人 all-in → 仍须搜索。
         let mut shove100 = shove.clone();
         shove100.stacks[6] = 2000;
         shove100.actions.last_mut().expect("all_in").to = Some(2000);
         let r = run(&shove100, Some(&rt));
-        assert!(searched(&r), "{r:?}");
+        assert_eq!(r.source, "search", "{r:?}");
 
         assert_eq!(crop.cropped_queries(), 0, "全程不应查询被裁街");
     }

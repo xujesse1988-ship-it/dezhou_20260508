@@ -261,8 +261,8 @@ fn two_way_side_pot_btn_sb_allin_bb_wins_table() {
 // B. 3-way side pot — BTN/SB/BB 全 all-in（≥ 30 cases）
 // ============================================================================
 //
-// 设置：UTG/MP/CO 全弃。BTN AllIn (a)，SB AllIn (b)，BB AllIn (c)（c 必须 ≥ a 才
-// 能反应到 BTN 的 all-in；并且 c <= ...）。
+// 设置：UTG/MP/CO 全弃。BTN AllIn (a)，SB AllIn (b)，BB Call（BB stack = 10000 大于 a、b，
+// 其余已全 all-in、没人能回应加注 → 按 LA-009 只能 Call 到 max(a, b)）。
 //
 // 数学（三 all-in，stacks (a, b, c)）：
 //   sorted = (lo, mid, hi)：
@@ -289,8 +289,8 @@ fn two_way_side_pot_btn_sb_allin_bb_wins_table() {
 // 或单独处理。
 //
 // 简化：仅取 BB stack >= max(BTN_s, SB_s)，让 BB 始终是 hi-payer 或 mid-payer。
-// 实际我们让 BB 是大 stack（10000）→ BB 是 hi-payer → BB 投入 = max(BTN_s, SB_s) = mid。
-// 此时 side pot 2（hi only）不存在（被 uncalled 退还）。
+// 实际我们让 BB 是大 stack（10000）→ BB 是 hi-payer → BB Call 到 max(BTN_s, SB_s) = mid。
+// 此时 side pot 2（hi only）不存在（BB 只跟到 mid）。
 // pot 划分：main (3-way @ lo) + side1 (BB + max-payer @ mid - lo)。
 // BB 必胜手 → BB 拿 main + side1 = 3*lo + 2*(mid-lo) = 2*mid + lo。
 // BB committed = mid → BB net = 2*mid + lo - mid = mid + lo.
@@ -346,7 +346,8 @@ fn three_way_side_pot_bb_winner_table() {
             (5, Action::Fold),
             (0, Action::AllIn),
             (1, Action::AllIn),
-            (2, Action::AllIn),
+            // BB 最后行动、其余全 all-in 且都比 BB 短：没人能回应加注（LA-009），只能 Call 到最高注。
+            (2, Action::Call), // BB
         ]);
         let state = drive_with_deck(&cfg, &mut deck, btn_s ^ sb_s ^ 0xBB, &plan_vec);
         assert!(state.is_terminal());
@@ -395,7 +396,7 @@ fn three_way_side_pot_bb_winner_table() {
 //     main (3-way @ a) = 3a，contender = SB ∪ BB（BTN 输）→ tie，每人得 floor(3a/2)，
 //       余 = 3a mod 2 → 给按钮左侧最近赢家 = SB（D-039-rev1）。
 //     side1 (SB+BB @ b-a) = 2*(b-a)，contender = SB ∪ BB → tie，再分。
-//     side2 (BB only @ c-b) → uncalled returned。
+//     side2 (BB only @ c-b)：不存在——BB 面对全员 all-in 只能 Call 到 b（LA-009）。
 //
 // 取 a 奇数，b 任意 → main pot = 3a 奇数，余 1 → SB 拿 +1。
 // 我们能控制 odd-chip 落到 SB 即可验证 D-039-rev1。
@@ -459,7 +460,8 @@ fn odd_chip_to_sb_table() {
             (5, Action::Fold),
             (0, Action::AllIn),
             (1, Action::AllIn),
-            (2, Action::AllIn),
+            // BB 最后行动、其余全 all-in 且都比 BB 短：没人能回应加注（LA-009），只能 Call 到最高注。
+            (2, Action::Call), // BB
         ]);
         let state = drive_with_deck(&cfg, &mut rng, a ^ b ^ c, &plan_vec);
         assert!(state.is_terminal());
@@ -474,7 +476,7 @@ fn odd_chip_to_sb_table() {
         // BTN 必输 a；SB 与 BB 平分 main pot（3a，奇数）+ side pot 1（2*(b-a)，偶数）
         //   - main = 3a；SB 拿 ceil(3a/2)，BB 拿 floor(3a/2)（odd chip 给按钮左 = SB）
         //   - side1 = 2*(b-a)：每人 (b-a)
-        //   - BB committed_total 经 uncalled refund = b（c 多余的 c-b 返还）
+        //   - BB committed_total = b（BB 只能 Call 到 b，LA-009）
         // BB net = floor(3a/2) + (b-a) - b = floor(3a/2) - a
         // SB net = ceil(3a/2) + (b-a) - b = ceil(3a/2) - a
         // BTN net = -a
@@ -497,14 +499,14 @@ fn odd_chip_to_sb_table() {
 }
 
 // ============================================================================
-// D. 4-way side pot — UTG/MP fold，CO/BTN/SB/BB 全 all-in（≥ 16 cases）
+// D. 4-way side pot — UTG/MP fold，CO/BTN/SB 全 all-in、BB Call（≥ 16 cases）
 // ============================================================================
 
 #[test]
 fn four_way_side_pot_bb_winner_table() {
     let mut produced = 0usize;
     // 4 all-in 在 (CO=co, BTN=btn, SB=sb, BB=10000)；BB 必胜（用 build_bb_wins_deck）。
-    // 让 BB 是 hi-payer → BB committed = max(co,btn,sb) → 自动 uncalled。
+    // 让 BB 是 hi-payer → BB Call 到 max(co,btn,sb)（其余全 all-in，LA-009 不能再加注）。
     // 我们要求 co/btn/sb 都 < 10000，且 co/btn 至少 100，sb 至少 50。
     let triples: &[(u64, u64, u64)] = &[
         (200, 300, 100),
@@ -540,14 +542,15 @@ fn four_way_side_pot_bb_winner_table() {
         }
         let cfg = cfg_6max_with_stacks([btn_s, sb_s, 10000, 10000, 10000, co_s]);
         let mut deck = build_bb_wins_deck(&cfg);
-        // plan: UTG/MP fold; CO/BTN/SB/BB 全 all-in.
+        // plan: UTG/MP fold; CO/BTN/SB 全 all-in，BB Call。
         let plan_vec = plan(&[
             (3, Action::Fold),
             (4, Action::Fold),
             (5, Action::AllIn),
             (0, Action::AllIn),
             (1, Action::AllIn),
-            (2, Action::AllIn),
+            // BB 最后行动、其余全 all-in 且都比 BB 短：没人能回应加注（LA-009），只能 Call 到最高注。
+            (2, Action::Call), // BB
         ]);
         let state = drive_with_deck(&cfg, &mut deck, co_s ^ btn_s ^ sb_s, &plan_vec);
         assert!(state.is_terminal());
@@ -822,7 +825,8 @@ fn side_pot_and_uncalled_floor_check() {
             (5, Action::AllIn), // CO
             (0, Action::AllIn), // BTN
             (1, Action::AllIn), // SB
-            (2, Action::AllIn), // BB
+            // BB 最后行动、其余全 all-in 且都比 BB 短：没人能回应加注（LA-009），只能 Call 到最高注。
+            (2, Action::Call), // BB
         ]);
         let state = drive_with_deck(&cfg, &mut deck, co ^ btn ^ sb ^ mp ^ 0x55, &plan_vec);
         assert!(state.is_terminal());

@@ -407,11 +407,11 @@ fn two_way_side_pot_basic() {
 // 还是没奇数。改 SB starting = 199（tied @ 199 三人）→ main = 597 → tie 两人 = 298 余 1。
 // odd chip → 按钮左 1 = SB seat 1（SB 是赢家集合之一）→ 给 SB。
 //
-// 重新设置：BTN=301 (uncalled excess to BB later), SB=199, BB=401.
-//   实际 all-in 数额：SB=199, BTN=301, BB=401（升序）
+// 重新设置：BTN=301, SB=199, BB=401。BTN / SB all-in 后 BB 只能 Call 到 301（没人能回应加注，LA-009）。
+//   实际投入：SB=199, BTN=301, BB=301（升序）
 //   main pot（3-way @ 199）= 597
 //   side1 pot（BTN+BB @ 102）= 204
-//   side2 pot（BB only @ 100）= 100 → uncalled bet 返还 BB
+//   BB 剩余 100 不进底池
 // SB+BB tie：main 597 → SB / BB 平分 → 各 298 余 1 chip → odd chip → 按钮左 1 = SB
 // → SB 拿 299，BB 拿 298。
 // side1 204 → BB 独胜（SB 不在），BB 拿 204。
@@ -465,7 +465,8 @@ fn three_way_side_pot_with_odd_chip() {
             (seat(5), Action::Fold),
             (seat(0), Action::AllIn), // BTN 301
             (seat(1), Action::AllIn), // SB 199
-            (seat(2), Action::AllIn), // BB 401（自动 call BTN 301，余 100 uncalled）
+            // BB 401 面对 BTN 301 / SB 199 全 all-in：没人能回应加注（LA-009）→ 只能 Call 到 301。
+            (seat(2), Action::Call),
         ],
     );
 

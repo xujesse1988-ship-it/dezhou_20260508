@@ -54,6 +54,12 @@ pub enum Action {
 ///   时 `cap <= max_committed`，附加条件恒 false → 退化回「`Some` iff `stack > 0`」。
 /// - **LA-008** `current_player() == None`（terminal / all-in 跳轮）时所有
 ///   字段为 `false / None`（"空集合"）。
+/// - **LA-009** 除 actor 外没有人能对加注做出超过跟注的回应（不存在未弃牌、未 all-in 且
+///   `committed_this_round + stack > max_committed` 的其他玩家，例如其余全部弃牌 / all-in，或
+///   剩下的人筹码都不够跟满当前最高注）时 `bet_range = None`、`raise_range = None`，且超过
+///   call 额的 all-in 不列入（`all_in_amount = None`，all-in-for-less 跟注照列）；`apply` 同口径
+///   拒 Bet / Raise。与 PokerKit `_verify_completion_betting_or_raising` 一致。symmetric 等栈
+///   下面对 all-in 恒 `cap <= max_committed`，不受影响。
 #[derive(Clone, Debug)]
 pub struct LegalActionSet {
     pub fold: bool,

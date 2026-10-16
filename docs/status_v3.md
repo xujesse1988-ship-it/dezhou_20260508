@@ -112,6 +112,7 @@ flop-first(干净点、训透)中性不亏、all-postflop 弱基底反退化。*
 | dense 后端 + v4 bucket | ✅ byte-equal HashMap(5 对照)+ 100M LBR 1,143 ≈ baseline(同质量);吞吐 ~2.2× 且长 run 不塌、RAM 平 5.2 GiB、ckpt 不暴涨 | `tests/dense_nlhe_trainer.rs` |
 | AIVAT 评测器 | ✅ 无偏全证;真日志降方差 1.21×(精确项 deals+runout) | `tests/aivat_nlhe_*.rs` `docs/aivat_eval.md` |
 | **CFR trainer / 规则引擎 6-max N-generic** | ✅ 亲验:`recurse_es` 取 `payoff(traverser)` 不取负、traverser `% n_players`;规则多人 side pot 返回 per-seat payoff 向量 | `trainer.rs:493,653` `state.rs:846–938` |
+| 规则:无人能回应时禁 bet/raise(LA-009,2026-10-16) | ✅ 其余玩家全弃牌 / all-in 或都不够跟满当前最高注 → 只能 Check/Call/Fold。PokerKit 0.4.14 随机不等码深逐决策对照 16.6 万点:我方多放行 0(修前 1834+588);剩余「PokerKit 放行、我方不放行」全部是不足额 all-in 不重开(TDA 规则,PokerKit 未实现)。等码深行为不变 | `rules/action.rs` LA-009、`state.rs` `legal_action_tests` |
 
 ## 6-max 复用 / 需重做(亲验 file:line,2026-05-30)
 

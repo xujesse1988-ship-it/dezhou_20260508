@@ -639,6 +639,9 @@ impl GameState {
 
         let max_committed = self.max_committed_this_round();
         let cap = player.committed_this_round + player.stack;
+        // LA-009：其余玩家都已弃牌 / all-in，或筹码都不够跟满当前最高注 → 没人能回应加注，
+        // 不能 bet/raise，只能 Check/Call/Fold（PokerKit 同口径）。
+        let opponent_can_act = self.opponent_can_respond(idx);
         let check = player.committed_this_round == max_committed;
         let call = if player.committed_this_round < max_committed {
             Some(std::cmp::min(max_committed, cap))
@@ -646,7 +649,10 @@ impl GameState {
             None
         };
 
-        let bet_range = if max_committed == ChipAmount::ZERO && player.stack > ChipAmount::ZERO {
+        let bet_range = if max_committed == ChipAmount::ZERO
+            && player.stack > ChipAmount::ZERO
+            && opponent_can_act
+        {
             if cap >= self.config.big_blind {
                 Some((self.config.big_blind, cap))
             } else {
@@ -659,6 +665,7 @@ impl GameState {
         let raise_range = if max_committed > ChipAmount::ZERO
             && self.raise_option_open[idx]
             && cap > max_committed
+            && opponent_can_act
         {
             let min_to = max_committed + self.last_full_raise_size;
             if cap >= min_to {
@@ -678,8 +685,10 @@ impl GameState {
         // raise-for-less，`raise_option_open` 仍 true 而 `cap<min_to`）/ all-in call-for-less
         // （`cap<=max_committed`）。symmetric 等栈下面对 all-in 时 `cap<=max_committed`，本判恒
         // false → 既有行为 byte-equal、S1/PokerKit 不受影响；仅修不对称 / 短码线（步 A①）。
-        let all_in_is_illegal_raise =
-            max_committed > ChipAmount::ZERO && !self.raise_option_open[idx] && cap > max_committed;
+        // LA-009：无人能回应时，超过 call 额的 all-in（开池 bet 或 raise）同样非法。
+        let all_in_is_illegal_raise = cap > max_committed
+            && (!opponent_can_act
+                || (max_committed > ChipAmount::ZERO && !self.raise_option_open[idx]));
         let all_in_amount =
             (player.stack > ChipAmount::ZERO && !all_in_is_illegal_raise).then_some(cap);
 
@@ -836,6 +845,12 @@ impl GameState {
     }
 
     fn apply_bet(&mut self, idx: usize, to: ChipAmount) -> Result<(Action, ChipAmount), RuleError> {
+        if !self.opponent_can_respond(idx) {
+            return Err(RuleError::WrongActionForState {
+                action: Action::Bet { to },
+                reason: "no opponent can respond",
+            });
+        }
         if self.max_committed_this_round() != ChipAmount::ZERO {
             return Err(RuleError::WrongActionForState {
                 action: Action::Bet { to },
@@ -878,6 +893,12 @@ impl GameState {
         }
         if to <= old_max {
             return Err(RuleError::InvalidAmount(to));
+        }
+        if !self.opponent_can_respond(idx) {
+            return Err(RuleError::WrongActionForState {
+                action: Action::Raise { to },
+                reason: "no opponent can respond",
+            });
         }
         if !self.raise_option_open[idx] {
             return Err(RuleError::RaiseOptionNotReopened);
@@ -1133,6 +1154,18 @@ impl GameState {
             }
         }
         None
+    }
+
+    /// 除 `idx` 外是否还有人能对 bet/raise 做出**超过跟注**的回应：未弃牌、未 all-in，且本轮投入 +
+    /// 剩余筹码 > 当前最高注（LA-009；与 PokerKit `_verify_completion_betting_or_raising` 同口径）。
+    /// 不满足时其余玩家最多只能（all-in）跟注，再加注没有意义。
+    fn opponent_can_respond(&self, idx: usize) -> bool {
+        let max_committed = self.max_committed_this_round();
+        self.players.iter().enumerate().any(|(j, p)| {
+            j != idx
+                && p.status == PlayerStatus::Active
+                && p.committed_this_round + p.stack > max_committed
+        })
     }
 
     fn max_committed_this_round(&self) -> ChipAmount {
@@ -1859,6 +1892,93 @@ mod legal_action_tests {
             s.apply(Action::AllIn).is_err(),
             "深码 all-in 应被拒（RaiseOptionNotReopened）——legal set 已正确不列入"
         );
+    }
+
+    /// LA-009：唯一对手已 all-in（其余弃牌）→ 没人能回应，不能 raise / 超额 all-in，只能
+    /// Call/Fold；`apply` 同口径拒。PokerKit 0.4.14 同局面 `can_complete_bet_or_raise_to() ==
+    /// False`。
+    #[test]
+    fn no_raise_when_only_opponent_is_all_in() {
+        // seat0=BTN、seat1=SB 各 100BB，seat2=BB 短码 15BB。
+        let cfg = cfg_3way([10_000, 10_000, 1_500]);
+        let mut s = GameState::new(&cfg, 0x1A_0009_u64);
+        s.apply(Action::Fold).expect("btn fold");
+        s.apply(Action::Call).expect("sb complete");
+        s.apply(Action::AllIn).expect("bb all-in 1500");
+        assert_eq!(s.current_player(), Some(SeatId(1)));
+        let la = s.legal_actions();
+        assert_eq!(la.call, Some(ChipAmount::new(1_500)));
+        assert!(la.raise_range.is_none(), "唯一对手已 all-in → 无 raise");
+        assert_eq!(la.all_in_amount, None, "超额 all-in = raise → 不列入");
+        assert!(s
+            .apply(Action::Raise {
+                to: ChipAmount::new(3_000)
+            })
+            .is_err());
+        assert!(s.apply(Action::AllIn).is_err());
+        s.apply(Action::Call).expect("sb call");
+    }
+
+    /// LA-009（一般情形）：还有未弃牌、未 all-in 的短码玩家，但他本轮投入 + 剩余筹码不超过当前
+    /// 最高注（最多只能跟注）→ 仍然没人能回应加注，深码只能 Call/Fold。PokerKit 0.4.14 同局面
+    /// `can_complete_bet_or_raise_to() == False`。
+    #[test]
+    fn no_raise_when_remaining_players_cannot_cover_bet() {
+        // seat0=BTN 100BB，seat1=SB 30BB，seat2=BB 50BB。
+        let cfg = cfg_3way([10_000, 3_000, 5_000]);
+        let mut s = GameState::new(&cfg, 0x1A_0009_u64);
+        s.apply(Action::Call).expect("btn limp");
+        s.apply(Action::Call).expect("sb complete");
+        s.apply(Action::Check).expect("bb check");
+        assert_eq!(s.street(), Street::Flop);
+        s.apply(Action::Check).expect("sb check");
+        s.apply(Action::AllIn).expect("bb all-in bet 4900");
+        // BTN 面对 4900：BB 已 all-in，SB 还没行动但总共只剩 2900 < 4900。
+        assert_eq!(s.current_player(), Some(SeatId(0)));
+        let la = s.legal_actions();
+        assert_eq!(la.call, Some(ChipAmount::new(4_900)));
+        assert!(la.raise_range.is_none(), "SB 不够跟满 → 没人能回应加注");
+        assert_eq!(la.all_in_amount, None);
+        assert!(s.apply(Action::AllIn).is_err());
+        s.apply(Action::Call).expect("btn call");
+        // SB 面对 4900 只剩 2900：all-in-for-less 跟注照列。
+        let la = s.legal_actions();
+        assert_eq!(la.all_in_amount, Some(ChipAmount::new(2_900)));
+        assert!(la.raise_range.is_none());
+    }
+
+    /// LA-009 反例：还有别的 Active 玩家（未行动 / 已跟注都算）→ 面对 all-in 照常可 raise。
+    /// PokerKit 0.4.14 同局面 `can_complete_bet_or_raise_to() == True`。
+    #[test]
+    fn raise_allowed_when_another_player_can_respond() {
+        let cfg = cfg_3way([10_000, 10_000, 1_500]);
+        let mut s = GameState::new(&cfg, 0x1A_0009_u64);
+        s.apply(Action::Call).expect("btn limp");
+        s.apply(Action::Call).expect("sb complete");
+        s.apply(Action::AllIn).expect("bb all-in 1500");
+        // BTN 面对 all-in，SB 还没行动。
+        assert_eq!(s.current_player(), Some(SeatId(0)));
+        assert!(s.legal_actions().raise_range.is_some());
+        s.apply(Action::Call).expect("btn call");
+        // SB 面对 all-in，BTN 已跟注但仍有筹码。
+        assert_eq!(s.current_player(), Some(SeatId(1)));
+        let la = s.legal_actions();
+        assert!(la.raise_range.is_some());
+        assert_eq!(la.all_in_amount, Some(ChipAmount::new(10_000)));
+    }
+
+    /// LA-009：短码面对唯一对手更大的 all-in → all-in-for-less 跟注照列（不是 raise）。
+    #[test]
+    fn all_in_call_for_less_still_offered_when_no_one_can_respond() {
+        let cfg = cfg_3way([10_000, 2_000, 500]);
+        let mut s = GameState::new(&cfg, 0x1A_0009_u64);
+        s.apply(Action::Fold).expect("btn fold");
+        s.apply(Action::AllIn).expect("sb all-in 2000");
+        assert_eq!(s.current_player(), Some(SeatId(2)));
+        let la = s.legal_actions();
+        assert_eq!(la.call, Some(ChipAmount::new(500)));
+        assert_eq!(la.all_in_amount, Some(ChipAmount::new(500)));
+        assert!(la.raise_range.is_none());
     }
 
     /// 回归：symmetric 等栈面对 all-in 时 cap == max_committed（all-in = call、非 raise）→
