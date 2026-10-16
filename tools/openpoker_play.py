@@ -1328,6 +1328,8 @@ def main():
     p.add_argument("--search-flop-prefer-blueprint", choices=["on", "off"], default=None)
     # 深码 SPR 自适应菜单（deep_menu_for：深 {1pot} / 浅 ≤3-way {0.5,1} 全层级）。
     p.add_argument("--search-deep-menu", action="store_true")
+    # 子树 solve 的 traverser 只轮子树根仍 Active 的座（弃牌座轮到 = 零学习迭代）。
+    p.add_argument("--search-live-traversers", action="store_true")
     # 子树独立桶表（如 500/500/500；blueprint 仍用 --bucket-table 的表）。
     p.add_argument("--search-bucket-table", default=None)
     # solve update 并行线程数（同预算 update ≈ ×核数；只助 solve 侧，建树仍单线程）。
@@ -1381,6 +1383,8 @@ def main():
             extra += ["--search-flop-prefer-blueprint", args.search_flop_prefer_blueprint]
         if args.search_deep_menu:
             extra.append("--search-deep-menu")
+        if args.search_live_traversers:
+            extra.append("--search-live-traversers")
         if args.search_bucket_table:
             extra += ["--search-bucket-table", args.search_bucket_table]
         if args.search_solve_threads is not None:
