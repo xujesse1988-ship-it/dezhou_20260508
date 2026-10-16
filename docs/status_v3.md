@@ -163,8 +163,7 @@ InfoSetId position 已留 4 bit(支持 0..15 座,`abstraction/map/mod.rs`)、den
 
 ## 构建 / 测试
 
-命令见 `CLAUDE.md`。**测试一律在 vultr 远端跑**(本机仅 build / fmt / clippy,本机跑结果不可信);
-性能/正确性 SLO + BLAKE3 anchor 在 `cargo test --release -- --ignored`;可选 PokerKit 跨验证(6-max S1 要用)。
+命令见 `CLAUDE.md`。性能/正确性 SLO + BLAKE3 anchor 在 `cargo test --release -- --ignored`;可选 PokerKit 跨验证(6-max S1 要用)。
 
 ## 文档维护规则
 
