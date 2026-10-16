@@ -21,6 +21,10 @@ winners/final_stacks/shown_cards 原样，喂 Rust 侧 `openpoker_hh_aivat`
 已累计状态、绝不动 build_request 消费的字段；挂/不挂 --hh-log advisor 请求/输出 byte-equal
 由 --selftest 的 canned 序列钉死（场景 5）。
 
+WS 日志（--ws-log，缺省关）：与服务端往来的原始 WS 消息逐条落 JSONL（收 / 发原文 + 连接
+open/close/error 事件，带连接序号），复盘服务端实际推送用。同样纯旁路：挂/不挂 advisor 请求/输出 +
+线上发出的字节 byte-equal（场景 5b）。
+
 调试（--debug-log）：开后把每手中间数据打到 stderr——手起（button/座）、发牌、对手动作、决策点
 （请求摘要含真栈/幻影座 + advisor 响应全诊断字段 source/probs/info_set/solve_updates/chosen +
 实发动作包）、结果（winners/final_stacks/我方栈）。**纯展示、只读已累计状态**，不动任何发往
@@ -755,21 +759,68 @@ class Session:
 # ===========================================================================
 # 真实联机（WS）
 # ===========================================================================
-def _ws_send(ws, obj):
-    ws.send(json.dumps(obj))
+class WsLog:
+    """--ws-log：与服务端往来的原始 WS 消息逐条落 JSONL（append + 每行 flush）。
+
+    行格式 `{"ts", "conn", "dir", "raw"}`：dir = in（收）/ out（发），raw = 线上原始字符串（收到的
+    不重新编码，发出的就是 ws.send 的那串）；dir = event 时无 raw、带 event（open/close/error）
+    + 附加字段。conn = 第几次连接（1 起）。看门狗线程也会发消息 → 写入加锁。
+    纯旁路：不改任何发往 advisor / ws 的字节（selftest 场景 5b 钉死）。"""
+
+    def __init__(self, path):
+        import threading
+
+        self._f = open(path, "a")
+        self._lock = threading.Lock()
+        self.conn = 0
+
+    def _write(self, rec):
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        with self._lock:
+            self._f.write(line)
+            self._f.flush()
+
+    def msg(self, direction, raw):
+        self._write({"ts": round(time.time(), 3), "conn": self.conn, "dir": direction, "raw": raw})
+
+    def event(self, kind, **info):
+        self._write({"ts": round(time.time(), 3), "conn": self.conn, "dir": "event",
+                     "event": kind, **info})
+
+    def close(self):
+        with self._lock:
+            self._f.close()
+
+
+def _make_ws_send(ws_log=None):
+    """真实发送函数：序列化一次，落 ws_log（若开）后原样发出——日志里的 out 与线上逐字节相同。"""
+    def send(ws, obj):
+        raw = json.dumps(obj)
+        if ws_log:
+            ws_log.msg("out", raw)
+        ws.send(raw)
+    return send
+
+
+def _on_raw_message(session, ws, raw, ws_log=None):
+    # 先落盘再解析：服务端发来坏 JSON 时日志里也留得住原文。
+    if ws_log:
+        ws_log.msg("in", raw)
+    session.handle_message(ws, json.loads(raw))
 
 
 def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=False,
-             exploit=False, debug=False):
+             exploit=False, debug=False, ws_log_path=None):
     import threading
 
     import websocket  # 延迟 import：离线 selftest 不需要 websocket-client
 
-    # action / HH 均用 append：贯穿全程的后台采集（§4.2），跨重连 / 多次运行累积同一个文件。
+    # action / HH / WS 日志均用 append：贯穿全程的后台采集（§4.2），跨重连 / 多次运行累积同一个文件。
     log_f = open(action_log, "a") if action_log else None
     hh_f = open(hh_log, "a") if hh_log else None
-    session = Session(advisor, send=_ws_send, num_hands=num_hands, log_f=log_f, hh_f=hh_f,
-                      prewarm=prewarm, exploit=exploit, debug=debug)
+    ws_log = WsLog(ws_log_path) if ws_log_path else None
+    session = Session(advisor, send=_make_ws_send(ws_log), num_hands=num_hands, log_f=log_f,
+                      hh_f=hh_f, prewarm=prewarm, exploit=exploit, debug=debug)
 
     # 看门狗线程：被移出桌 / 桌散后服务端不再推任何消息，回调模型里没有别的唤醒点。
     stop_watchdog = threading.Event()
@@ -780,14 +831,22 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
 
     threading.Thread(target=watchdog_loop, daemon=True).start()
 
+    def on_open(ws):
+        if ws_log:
+            ws_log.event("open")
+
     def on_message(ws, raw):
-        session.handle_message(ws, json.loads(raw))
+        _on_raw_message(session, ws, raw, ws_log)
 
     def on_error(ws, err):
         print(f"  [ws error] {err}", file=sys.stderr)
+        if ws_log:
+            ws_log.event("error", error=repr(err))
 
     def on_close(ws, code, reason):
         print(f"  [ws closed] code={code} reason={reason}", file=sys.stderr)
+        if ws_log:
+            ws_log.event("close", code=code, reason=reason if isinstance(reason, str) else repr(reason))
 
     header = [f"Authorization: Bearer {api_key}"]
     # 连接循环：分两类「重连」，计数独立——
@@ -801,8 +860,10 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
     while session.counters["hands"] < num_hands:
         session.hu_detected = False
         session.non_hu_hand_seen = False
+        if ws_log:
+            ws_log.conn += 1
         ws = websocket.WebSocketApp(
-            WS_URL, header=header,
+            WS_URL, header=header, on_open=on_open,
             on_message=on_message, on_error=on_error, on_close=on_close,
         )
         ws.run_forever(ping_interval=30, ping_timeout=10)
@@ -836,6 +897,8 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
         log_f.close()
     if hh_f:
         hh_f.close()
+    if ws_log:
+        ws_log.close()
     _report(session.counters, session.fallback_reasons)
 
 
@@ -935,6 +998,9 @@ def run_selftest(advisor):
     # 场景 5（§4.2 HH 隔离）：canned 整手序列走 Session 真实消息路径，挂/不挂 --hh-log
     # 各跑一遍，advisor 请求/响应流 + 发出的 action 包必须逐字节一致；HH 行字段齐。
     _selftest_hh_byte_equal()
+
+    # 场景 5b（--ws-log 隔离）：原始字符串走真实收发路径，挂/不挂 WS 日志逐字节一致；日志原文吻合。
+    _selftest_ws_log_byte_equal()
 
     # 场景 6（短桌幻影座映射）：table_state.in_hand 占座推断 → dealt_seats / placeholder 栈 /
     # 盲注座重算 / HH dealt_est。
@@ -1172,6 +1238,65 @@ def _selftest_hh_byte_equal():
           "HH 1 行字段齐（12 动作 + names + stacks_start + 摊牌原样）。", file=sys.stderr)
 
 
+def _selftest_ws_log_byte_equal():
+    """场景 5b（--ws-log 隔离）：canned 整手序列以原始字符串走真实收发路径（_on_raw_message +
+    _make_ws_send），挂 / 不挂 --ws-log 各跑一遍——advisor 请求/响应流 + 线上发出的字节逐字节一致；
+    日志 in 行 = 收到的原文（逐条、同序），out 行 = 线上发出的原文，event 行原样落。"""
+    import os
+    import tempfile
+
+    class _RecWs(_FakeWs):
+        def __init__(self):
+            self.sent = []
+
+        def send(self, raw):
+            self.sent.append(raw)
+
+    # 收到的原文故意用非默认格式（无空格 + 中文不转义），验证落盘的是原文而不是重新编码。
+    raws = [json.dumps(m, ensure_ascii=False, separators=(",", ":")) for m in _canned_hh_messages()]
+
+    def run_once(ws_log):
+        stub = _StubAdvisor()
+        session = Session(stub, send=_make_ws_send(ws_log), num_hands=10 ** 9,
+                          log_f=None, hh_f=None)
+        ws = _RecWs()
+        for raw in raws:
+            _on_raw_message(session, ws, raw, ws_log)
+        return stub.transcript, ws.sent
+
+    t_off, sent_off = run_once(None)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "ws.jsonl")
+        ws_log = WsLog(path)
+        ws_log.conn = 1
+        ws_log.event("open")
+        t_on, sent_on = run_once(ws_log)
+        ws_log.event("close", code=1000, reason="bye")
+        ws_log.close()
+        with open(path) as f:
+            lines = [json.loads(line) for line in f]
+
+    if t_off != t_on:
+        raise RuntimeError("[ws-log] 挂/不挂 WS 日志 advisor 请求/响应流不 byte-equal")
+    if sent_off != sent_on:
+        raise RuntimeError("[ws-log] 挂/不挂 WS 日志 线上发出的字节不一致")
+    if not sent_on:
+        raise RuntimeError("[ws-log] canned 序列应至少发出 1 个 action 包")
+    ins = [r["raw"] for r in lines if r["dir"] == "in"]
+    outs = [r["raw"] for r in lines if r["dir"] == "out"]
+    events = [r["event"] for r in lines if r["dir"] == "event"]
+    if ins != raws:
+        raise RuntimeError(f"[ws-log] in 行应逐条等于收到的原文（{len(ins)} vs {len(raws)}）")
+    if outs != sent_on:
+        raise RuntimeError(f"[ws-log] out 行应逐条等于线上发出的原文（{len(outs)} vs {len(sent_on)}）")
+    if events != ["open", "close"] or lines[-1].get("code") != 1000:
+        raise RuntimeError(f"[ws-log] event 行错: {events} / {lines[-1]}")
+    if any(r.get("conn") != 1 or not isinstance(r.get("ts"), float) for r in lines):
+        raise RuntimeError("[ws-log] 每行须带 conn=1 + 浮点 ts")
+    print(f"[selftest 5b WS-log byte-equal] 挂/不挂 --ws-log：advisor 请求/响应 + 线上字节逐字节一致；"
+          f"日志 {len(ins)} in / {len(outs)} out / {len(events)} event，原文逐条吻合。", file=sys.stderr)
+
+
 def _selftest_short_handed():
     """场景 6（短桌幻影座映射，exec §3.2）：canned 4 人短桌手走 Session 真实消息路径——
     table_state.seats[].in_hand 推断占座（in_hand=false 的等局玩家必须排除）、请求带
@@ -1364,6 +1489,9 @@ def main():
                    help="每决策落 {req,resp,sent} JSONL；空串关闭")
     p.add_argument("--hh-log", default="openpoker_hh.jsonl",
                    help="每手落全桌 HH JSONL（append 累积；§4.2 数据管道）；空串关闭")
+    p.add_argument("--ws-log", default=None,
+                   help="与服务端往来的原始 WS 消息逐条落 JSONL（收/发 + 连接开关事件，append 累积）；"
+                        "缺省关；纯旁路、不改 IPC / 出动作字节")
     p.add_argument("--selftest", action="store_true", help="离线验 IPC，不连网（无需账号）")
     p.add_argument("--debug-log", action="store_true",
                    help="打印牌局中间数据到 stderr（driver 侧：手起/发牌/对手动作/决策请求+响应/"
@@ -1515,7 +1643,7 @@ def main():
             run_real(advisor, args.api_key, args.num_hands, action_log=log,
                      hh_log=args.hh_log if args.hh_log else None,
                      prewarm=args.search_prewarm, exploit=exploit_on,
-                     debug=args.debug_log)
+                     debug=args.debug_log, ws_log_path=args.ws_log or None)
     finally:
         advisor.close()
 
