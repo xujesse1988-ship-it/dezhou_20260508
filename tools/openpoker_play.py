@@ -1322,8 +1322,9 @@ def main():
     # 脱锚搜索档二′-跨街复用（advisor 默认 on；off = A/B 对照臂 / 回退到档一前缀）。
     # 不传 = 不透传，吃 advisor 默认（ON）。
     p.add_argument("--search-unanchored-cross-street", choices=["on", "off"], default=None)
-    # 仅 flop 街优先 blueprint（advisor 默认 off）：on = flop 锚定面（影子同步）走 blueprint、不搜索；
-    # flop 脱影子（off-stack all-in 等）仍实时搜索；turn/river 不受影响。不传 = 吃 advisor 默认（OFF）。
+    # 仅 flop 街优先 blueprint（advisor 默认 off）：on = flop 锚定面（影子同步）且本手无人 all-in、
+    # hero 与每个未弃牌对手的有效码深在 60–140BB 内才走 blueprint、不搜索；不满足 / flop 脱影子
+    # 仍实时搜索；turn/river 不受影响。不传 = 吃 advisor 默认（OFF）。
     p.add_argument("--search-flop-prefer-blueprint", choices=["on", "off"], default=None)
     # 深码 SPR 自适应菜单（deep_menu_for：深 {1pot} / 浅 ≤3-way {0.5,1} 全层级）。
     p.add_argument("--search-deep-menu", action="store_true")

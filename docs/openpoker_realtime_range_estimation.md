@@ -174,7 +174,7 @@ BTN 转牌起始范围(h)
 
 同理，河牌搜索没有可复用的转牌结果、但完整 blueprint 路径可用时，会重新按翻前、翻牌和转牌的 blueprint 概率计算范围。这条回退路径不会自动保留更早某次搜索的后验。
 
-范围来源由缓存和路径可用性决定，不单由上一街动作输出标签决定。例如预热也可能产生可复用的搜索结果。`--search-flop-prefer-blueprint on` 会让锚定翻牌优先查 blueprint，并跳过相应的翻牌搜索预热。
+范围来源由缓存和路径可用性决定，不单由上一街动作输出标签决定。例如预热也可能产生可复用的搜索结果。`--search-flop-prefer-blueprint on` 会让锚定翻牌优先查 blueprint，并跳过相应的翻牌搜索预热；前提是本手无人全下，且 hero 与每个未弃牌对手的有效码深在 60–140BB 内，否则翻牌照常搜索。
 
 ## 平滑和无信号处理
 
@@ -253,7 +253,7 @@ HJ 的 raise、BTN 的 call 和 UTG 后续的 call 都不进入翻牌根范围�
 | `--search-range-uniform-mix` | `0.25` | 对手范围的均匀混合权重 |
 | `--search-unanchored-prefix-reach` | `on` | 脱锚时使用同步成功的历史前缀 |
 | `--search-unanchored-cross-street` | `on` | 同时控制锚定和脱锚两路的跨街复用 |
-| `--search-flop-prefer-blueprint` | `off` | 开启时，锚定翻牌优先使用 blueprint |
+| `--search-flop-prefer-blueprint` | `off` | 开启时，锚定翻牌优先使用 blueprint（须无人全下、有效码深 60–140BB） |
 | `--exploit` | `off` | 可选对手画像修正 |
 
 底层锚定搜索另保留 `ResolveRoot::CurrentDecision` 模式，会把当前街已发生的动作也纳入 blueprint 根范围估计，并从当前决策点建树。脱锚搜索只支持 `RoundStart`；本文逐街示例使用的也是 advisor 的 `RoundStart` 路径。

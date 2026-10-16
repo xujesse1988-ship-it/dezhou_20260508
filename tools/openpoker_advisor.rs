@@ -154,7 +154,14 @@ const DEFAULT_SEARCH_UNANCHORED_CROSS_STREET: bool = true;
 /// 脱影子 flop（off-stack all-in / 结构性缺节点）blueprint 树本就缺该节点 → 仍须搜索。turn/river
 /// 不受影响（锚定面照常按 trigger 搜索）。注意脱影子路径（[`decide_search_unanchored`]）不经
 /// `should_search`/此旗 → flop unanchored 恒搜索（旧行为），此旗只抑制 **flop 锚定** 搜索。
+///
+/// 锚定之外还须过真码深闸（[`flop_blueprint_stack_gate`]）：100BB 影子按对称 100BB 重放，短码
+/// all-in 在影子里就是 100BB all-in、照样同步，光看锚定会让 blueprint 用错底池赔率 / SPR 出牌。
 const DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT: bool = false;
+/// flop 优先 blueprint 的有效码深区间（BB，含端点；[`flop_blueprint_stack_gate`]）。hero 与每个
+/// 未弃牌对手的 hand-start 有效码深都须落在区间内，否则 flop 照常实时搜索。
+const FLOP_BLUEPRINT_EFF_STACK_BB_MIN: u64 = 60;
+const FLOP_BLUEPRINT_EFF_STACK_BB_MAX: u64 = 140;
 /// 搜索墙钟告警阈的建树余量（ms）：最坏单线程建树 ≈ 4-way@20× 宽档 ~2.7s，留 3s。
 const SEARCH_WALL_BUILD_MARGIN_MS: u128 = 3000;
 /// 无 `time_budget`（固定迭代）时的告警阈回落（ms）。
@@ -531,7 +538,8 @@ struct SearchRuntime {
     /// postflop turn/river 触发（锚定 [`decide`]/[`prewarm`] + 脱锚 [`decide_search_unanchored`]/脱锚预热）。
     unanchored_cross_street: bool,
     /// `--search-flop-prefer-blueprint`（[`DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT`]）：`on` = 仅 flop
-    /// 街，锚定面（lockstep Ok / 100BB 影子同步）即使命中 trigger 也走 blueprint、不实时搜索；脱影子
+    /// 街，锚定面（lockstep Ok / 100BB 影子同步）且过真码深闸（[`flop_blueprint_stack_gate`]：无人
+    /// all-in、有效码深 60–140BB）时即使命中 trigger 也走 blueprint、不实时搜索；不过闸 / 脱影子
     /// flop（lockstep 失同步）照常实时搜索（[`decide_search_unanchored`] 不经此旗）。**默认关**
     /// （`false`，旧行为 byte-equal）。turn/river 锚定面不受影响。预热（[`prewarm`]）同源 skip 锚定
     /// flop 子树（不 build+solve），否则 advisor 单线程下 hero 决策白等一个 time_budget 才拿 blueprint。
@@ -674,7 +682,14 @@ fn prewarm_inner(
     // 子树纯属浪费，且因 advisor 单线程串行处理（build+solve 排在 hero decide 请求前），会让 hero 决策
     // 白等一个 time_budget 才拿到 blueprint。故锚定 flop 直接 skip，hero 决策即时返回。脱影子 flop
     // （lockstep Err：off-stack all-in / limp 线）decide 照常搜索、不受此旗影响 → 不在此 skip，照常预热。
-    if rt.flop_prefer_blueprint && round_start.street() == poker::Street::Flop && lockstep.is_ok() {
+    // 真码深闸同 decide（[`flop_blueprint_stack_gate`]，街起点视角）：不过闸 = decide 会搜索 → 照常预热。
+    // 街内此后才出现的 all-in 预热看不到 → 那次 decide 现解（MISS），只慢不错。
+    if rt.flop_prefer_blueprint
+        && round_start.street() == poker::Street::Flop
+        && lockstep.is_ok()
+        && flop_blueprint_stack_gate(req, &solver_cfg, scale, &smap, &round_start, my_seat_solver)
+            .is_ok()
+    {
         return mk("prewarm:skip:flop_prefer_blueprint".into());
     }
     // crop blueprint：range 先验缺被裁街 σ（跨街后验不可得）→ 先补解上一街再重试一次
@@ -1212,10 +1227,31 @@ fn decide(
     // —— gating（设计 §1）：仅 `--search` 开 + 命中触发面才搜索；否则 blueprint。
     // should_search 只读街 + 本街是否已起注（与码深无关）→ 在 100BB `real` 上判等价真栈 auth。
     // `--search-flop-prefer-blueprint` on（[`SearchRuntime`] doc）：仅 flop 锚定面（此处 lockstep Ok）
-    // 抑制搜索回 blueprint；脱影子 flop 走上面 `decide_search_unanchored`，不经此 gating，照常搜索。
-    let want_search = matches!(search, Some(rt)
-        if should_search(&real, rt.cfg.trigger)
-            && !(rt.flop_prefer_blueprint && real.street() == poker::Street::Flop));
+    // 且过真码深闸（[`flop_blueprint_stack_gate`]：无人 all-in + 有效码深在区间内）才抑制搜索回
+    // blueprint；真栈建不出视同不过闸。脱影子 flop 走上面 `decide_search_unanchored`，不经此 gating。
+    let flop_bp_gate = match search {
+        Some(rt) if rt.flop_prefer_blueprint && street == poker::Street::Flop => Some(
+            build_real_auth(
+                req,
+                &solver_cfg,
+                scale,
+                &smap,
+                my_seat_solver,
+                hole,
+                &board,
+                true,
+            )
+            .and_then(|(auth, ..)| {
+                flop_blueprint_stack_gate(req, &solver_cfg, scale, &smap, &auth, my_seat_solver)
+            }),
+        ),
+        _ => None,
+    };
+    if let Some(Err(reason)) = &flop_bp_gate {
+        dlog!("flop_prefer_blueprint gate FAIL: {reason} → search");
+    }
+    let want_search = matches!(search, Some(rt) if should_search(&real, rt.cfg.trigger))
+        && !matches!(flop_bp_gate, Some(Ok(())));
     dlog!(
         "lockstep OK: street={:?} node_id={node_id:?} info_set={} legal_abs={:?} path={}",
         street,
@@ -1889,6 +1925,49 @@ fn build_real_auth(
     let auth = auth.inject_external_cards(my_seat_solver, hole, board)?;
     let round_start = round_start.inject_external_cards(my_seat_solver, hole, board)?;
     Ok((auth, round_start, within, prev_within))
+}
+
+/// `--search-flop-prefer-blueprint` 的真码深闸：flop 锚定面只有在真实码深与 blueprint 的
+/// 100BB 假设相近时才可走 blueprint。`state` = 真栈重放态（决策路径传 `auth`、预热传
+/// `round_start`），只读各座 status。
+///
+/// `Ok(())` = 可用 blueprint；`Err(reason)` = 须实时搜索：
+/// - 本手到 `state` 为止有人 all-in（`all_in`）；
+/// - hero 与某个未弃牌对手的 hand-start 有效码深 `min(hero, opp)` 落在
+///   [[`FLOP_BLUEPRINT_EFF_STACK_BB_MIN`], [`FLOP_BLUEPRINT_EFF_STACK_BB_MAX`]] BB 外（`eff_stack`）；
+/// - 真栈 config 建不出（`stacks_len` 等脏数据）。
+///
+/// `stacks` 缺省按 [`real_stacks_config`] 惯例 = 对称 100BB（与搜索路径同口径）→ 码深一项恒过，
+/// all-in 一项照查。
+fn flop_blueprint_stack_gate(
+    req: &Request,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    state: &GameState,
+    hero: SeatId,
+) -> Result<(), String> {
+    let players = state.players();
+    if let Some(i) = players
+        .iter()
+        .position(|p| p.status == poker::PlayerStatus::AllIn)
+    {
+        return Err(format!("all_in:seat{i}"));
+    }
+    let real_cfg = real_stacks_config(req, solver_cfg, scale, smap)?;
+    let bb = solver_cfg.big_blind.as_u64();
+    let hero_start = real_cfg.starting_stacks[hero.0 as usize].as_u64();
+    for (i, p) in players.iter().enumerate() {
+        if i == hero.0 as usize || p.status == poker::PlayerStatus::Folded {
+            continue;
+        }
+        let eff = hero_start.min(real_cfg.starting_stacks[i].as_u64());
+        if eff < FLOP_BLUEPRINT_EFF_STACK_BB_MIN * bb || eff > FLOP_BLUEPRINT_EFF_STACK_BB_MAX * bb
+        {
+            return Err(format!("eff_stack:seat{i}:{}bb", eff / bb));
+        }
+    }
+    Ok(())
 }
 
 /// PFR-aware 形状用：一个对手座本手**翻前**的入池方式（[`preflop_entry_kinds`] 重放判定）。
@@ -7185,10 +7264,11 @@ mod tests {
 
     /// 9-max fixture：训练 → 完整 ckpt + crop(keep_through=Flop, 不留 regret)。文件写到
     /// `target/tmp`（磁盘；`/tmp` 是 tmpfs，200+ MiB 的 ckpt 会直接吃内存）。trainer 存盘后即释放。
-    fn nine_max_fixture() -> (TempDir, PathBuf, PathBuf) {
+    /// `tag` 区分并行跑的测试（目录只按进程号区分时，先结束的测试会删掉别的测试正在读的文件）。
+    fn nine_max_fixture(tag: &str) -> (TempDir, PathBuf, PathBuf) {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/tmp")
-            .join(format!("advisor_nine_max_{}", std::process::id()));
+            .join(format!("advisor_nine_max_{tag}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mkdir");
         let guard = TempDir(dir.clone());
         let full = dir.join("full.ckpt");
@@ -7285,7 +7365,7 @@ mod tests {
     ///    转牌 / 河牌零被裁街查询）；flop 预热命中；off-stack 真栈（`stacks` 长 9）走脱锚搜索。
     #[test]
     fn nine_max_end_to_end_blueprint_and_search() {
-        let (_dir, full_p, crop_p) = nine_max_fixture();
+        let (_dir, full_p, crop_p) = nine_max_fixture("e2e");
 
         // ① 座位数错配必拒（完整 + crop）。
         for wrong in [6u8, 8] {
@@ -7425,6 +7505,157 @@ mod tests {
             &mut SubgameSolveCache::new(),
         );
         assert!(r.source.contains("stacks_len"), "{r:?}");
+        assert_eq!(crop.cropped_queries(), 0, "全程不应查询被裁街");
+    }
+
+    /// **9-max 生产组合**：crop(preflop+flop) + `--search-trigger all-postflop` +
+    /// `--search-flop-prefer-blueprint on` + `--search-deep-menu` 同开：
+    /// 翻前 blueprint；flop 锚定面 blueprint（与 search=None 逐字节相同）；turn / river 全走搜索
+    /// 不降级（river 先验来自 turn 子树后验）；全程零被裁街查询。另验真码深闸
+    /// （[`flop_blueprint_stack_gate`]）：有效码深 60–140BB 内（含端点）走 blueprint、预热 skip；区间外
+    /// 或有人 all-in（含 100BB 影子仍同步的短码 all-in）→ 实时搜索、预热照做。
+    #[test]
+    fn nine_max_crop_flop_prefer_blueprint_deep_menu() {
+        let (_dir, _full_p, crop_p) = nine_max_fixture("prefer");
+        let crop = load_blueprint(&crop_p, nine_max_test_game(), true).expect("load crop");
+        let game = crop.game();
+        let abs = game.abstraction().clone();
+        let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);
+        let rt = SearchRuntime {
+            flop_prefer_blueprint: true,
+            ..crop_rt(
+                &crop,
+                SubgameSearchConfig {
+                    deep_menu: true,
+                    ..crop_scfg()
+                },
+            )
+        };
+        validate_crop_runtime(crop.keep_through(), Some(&rt)).expect("生产约束满足");
+
+        let mut pre = n_req(9, 4, 7, vec![]);
+        pre.hole = vec!["Ah".into(), "Kd".into()];
+        let r = decide(
+            game,
+            &abs,
+            &sc,
+            &pre,
+            0x9EED,
+            Some(&rt),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "blueprint", "{r:?}");
+
+        for hole in [["Ah", "Kd"], ["Qs", "Qh"]] {
+            let hand = nine_sb_line_hand(hole);
+            let mut cache = SubgameSolveCache::new();
+            for (k, req) in hand.iter().enumerate() {
+                let r = decide(game, &abs, &sc, req, 0x9EEF, Some(&rt), &mut cache);
+                assert!(is_legal(&r, &req.valid), "决策 {k}：{r:?}");
+                if req.board.len() == 3 {
+                    let off = decide(
+                        game,
+                        &abs,
+                        &sc,
+                        req,
+                        0x9EEF,
+                        None,
+                        &mut SubgameSolveCache::new(),
+                    );
+                    assert_eq!(r.source, "blueprint", "flop 锚定面须走 blueprint：{r:?}");
+                    assert_eq!(r, off, "flop 锚定面须与 search=None 逐字节相同");
+                } else {
+                    assert!(
+                        r.source.starts_with("search") && !r.source.starts_with("search_giveup"),
+                        "决策 {k}（{hole:?}）turn/river 须实时搜索：{r:?}"
+                    );
+                }
+            }
+        }
+
+        // 真码深闸（flop_blueprint_stack_gate）：hero = SB(op5)，对手 = BB(op6)，其余翻前已弃。
+        let flop_req = |hero_bb: u64, opp_bb: u64| {
+            let mut r = nine_sb_line_hand(["Ah", "Kd"])[0].clone();
+            r.stacks = vec![2000; 9];
+            r.stacks[5] = hero_bb * 20;
+            r.stacks[6] = opp_bb * 20;
+            r.stacks[7] = 200; // 已弃牌座的短码不参与判断。
+            r
+        };
+        let run = |req: &Request, rt: Option<&SearchRuntime>| {
+            decide(
+                game,
+                &abs,
+                &sc,
+                req,
+                0x9EEF,
+                rt,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        // 区间内（含端点 60 / 140）→ blueprint，且与 search=None 逐字节相同。
+        for (hero_bb, opp_bb) in [(100, 65), (100, 60), (150, 140), (100, 300)] {
+            let req = flop_req(hero_bb, opp_bb);
+            let r = run(&req, Some(&rt));
+            assert_eq!(
+                r.source, "blueprint",
+                "hero {hero_bb}BB vs {opp_bb}BB：{r:?}"
+            );
+            assert_eq!(r, run(&req, None));
+            let p = prewarm(
+                game,
+                &sc,
+                &req,
+                0x9EEF,
+                Some(&rt),
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(p.source, "prewarm:skip:flop_prefer_blueprint", "{p:?}");
+        }
+        // 区间外 → 实时搜索；预热也照常做。
+        for (hero_bb, opp_bb) in [(100, 59), (100, 15), (150, 150), (145, 300)] {
+            let req = flop_req(hero_bb, opp_bb);
+            let r = run(&req, Some(&rt));
+            assert_eq!(r.source, "search", "hero {hero_bb}BB vs {opp_bb}BB：{r:?}");
+            assert!(is_legal(&r, &req.valid), "{r:?}");
+            let p = prewarm(
+                game,
+                &sc,
+                &req,
+                0x9EEF,
+                Some(&rt),
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(p.source, "prewarm:stored", "{p:?}");
+        }
+        // 有人 all-in：BB 只有 15BB，hero check 后它 flop all-in。100BB 影子把它当 100BB all-in、
+        // 照样同步（锚定），闸须拦下 → 实时搜索（按真实底池赔率），不再用 blueprint。
+        let mut shove = nine_sb_line_req(
+            ["Ah", "Kd"],
+            &["7h", "2c", "Ks"],
+            &[ha(5, "check", None), ha(6, "all_in", Some(300))],
+            ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: false,
+                min_raise: None,
+                max_raise: None,
+            },
+        );
+        shove.stacks = vec![2000; 9];
+        shove.stacks[6] = 300;
+        // 规则引擎在唯一对手已 all-in 时仍给 hero 列加注档 → 可能出 `search:raise_as_call`（实发 call）。
+        let searched = |r: &Response| r.source == "search" || r.source == "search:raise_as_call";
+        let r = run(&shove, Some(&rt));
+        assert!(searched(&r), "{r:?}");
+        assert!(is_legal(&r, &shove.valid), "{r:?}");
+        // 同一手对手 100BB all-in：有效码深在区间内，但有人 all-in → 仍须搜索。
+        let mut shove100 = shove.clone();
+        shove100.stacks[6] = 2000;
+        shove100.actions.last_mut().expect("all_in").to = Some(2000);
+        let r = run(&shove100, Some(&rt));
+        assert!(searched(&r), "{r:?}");
+
         assert_eq!(crop.cropped_queries(), 0, "全程不应查询被裁街");
     }
 
