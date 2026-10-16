@@ -50,6 +50,13 @@ k=6/7/8/9 = 557k / 3.07M / 15.5M / 72.6M 节点,单加注池 9-way 1.47M;≥7 �
 `SubgameSolveCache` 里,同街再决策直接复用拒绝结果不重数;6 座不可达,逐位不变)。上线建议 `--search-max-nodes` 按此表定
 (40M 下 8-way limp 15.5M 会放行、建树约 40s + 约 2.9 GB:TreeNode 184 字节/节点)。
 
+**9-max crop blueprint 实盘抽查(2026-10-16)发现搜索正确性 bug(兜底检查已修)**:`read_current_strategy` 原先只拦「infoset
+完全未访问」,拦不住平均策略只是均匀占位(strategy_sum 无记录 / 总和 0 / 恰好均匀)→ advisor 按均匀
+抽样出牌(含顶对推全下 / 顶对弃牌)。本次实盘 22 次搜索决策 6 次均匀(27%),6 月旧记录 0.5%。根因 = 有效迭代太少:
+子博弈每次迭代重抽 hero 底牌,生产 `live_traversers=false` 在 9 座里轮遍历者,单挑底池 1000 次只约 111 次 hero 遍历,
+抽不中真实桶;离线重放 `--search-live-traversers` + 100k 迭代可解(单线程 2–6.5 s/solve)。另有 `limp_heuristic`
+面对平跟弃得过紧。详见 `temp/openpoker_9max_live_spotcheck_2026_10_16.md`。
+
 **S6 进度(2026-06-03):实时搜索推进,MVP subgame-solver 核心已落地 + vultr 验证**(分支 `6max-rts-mvp`
 commit `cf9efdb`,**未并入 6max**)。设计成文 `temp/realtime_search_design_2026_06_03.md`(文献调研+代码复用映射+
 对抗验证):方法定型 = Pluribus/Modicum tabular depth-limited search(非 DeepStack/ReBeL)。三件落地:①

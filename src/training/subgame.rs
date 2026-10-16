@@ -2780,6 +2780,31 @@ fn read_current_strategy(
                 .to_string(),
         );
     }
+    // Non-empty `avg` is not enough — it can be a uniform 1/n placeholder that used to be
+    // sampled as the solution (2026-10-16 live: top pair jams). `recurse_es` creates the regret
+    // slot whenever *any* traverser passes the node (`get_or_init`), but strategy_sum only
+    // accumulates when `actor == traverser`, as `pi_trav × σ_current`. Three placeholder states:
+    // - no strategy_sum entry: never reached as traverser (opponent traversals only) → regrets
+    //   are all zero, nothing learned;
+    // - strategy_sum all zero: reached as traverser but always with own reach 0;
+    // - average exactly uniform: every accumulated σ was the default RM-on-zero-regret uniform,
+    //   i.e. only the first traversal(s) — regrets learned from them never reached the average.
+    // In all three, the average is not a solved mix → giveup. The regret-matching current
+    // strategy is no substitute: after one or a few traversals it is one sampled opponent
+    // hand's best response (2026-10-16 replay: single-visit RM said raise 1.00 where the
+    // 100k-iteration solve says call 0.99).
+    let Some(sum) = trainer.strategy_sum().inner().get(&info) else {
+        return Err(
+            "subgame 当前决策 infoset 无 strategy_sum（只被对手遍历路过，hero 遍历未到达）"
+                .to_string(),
+        );
+    };
+    let uniform = 1.0 / avg.len() as f64;
+    if sum.iter().sum::<f64>() <= 0.0 || avg.iter().all(|p| (p - uniform).abs() < 1e-12) {
+        return Err(
+            "subgame 当前决策 infoset 平均策略只是均匀占位（hero 遍历未学到策略）".to_string(),
+        );
+    }
     // `avg` 按子树节点**建树几何** tag 序索引（CFR 解的维度恒 == node.legal_actions 长度——CFR
     // 首访该 infoset 时按 `legal_actions(state)` 注册动作槽，子树 solve 几何 == build 几何 →
     // 槽数 == 建树 tag 数）。不等 = CFR 索引契约破，硬 Err。
@@ -7168,7 +7193,9 @@ mod tests {
         )
         .expect("6max game");
         let cfg = SubgameSearchConfig {
-            iterations: 300,
+            // 3000: at 300 (and 1000) the hero infoset kept only its uniform placeholder average,
+            // which read_current_strategy now rejects (this test pins cache keys, not the strategy).
+            iterations: 3000,
             max_subtree_nodes: 1_000_000,
             ..SubgameSearchConfig::default()
         };
@@ -7541,7 +7568,9 @@ mod tests {
         let game = SimplifiedNlheGame::new(table).expect("HU game");
         let (flop, turn, flop_within) = hu_turn_after_flop_checks(&game, 0x4143_524F_534B_4559); // "ACROSKEY"
         let cfg = SubgameSearchConfig {
-            iterations: 300,
+            // 1000: at 300 the hero infoset kept only its uniform placeholder average, which
+            // read_current_strategy now rejects (this test pins cache keys, not the strategy).
+            iterations: 1000,
             max_subtree_nodes: 1_000_000,
             trigger: SearchTrigger::AllPostflop,
             ..SubgameSearchConfig::default()
@@ -8914,5 +8943,82 @@ mod tests {
         let turn_prefix = synced_prefix_decisions(&game, turn.current_node_id);
         run(&turn_prefix, StreetTag::Flop).expect("前缀只含翻前 + 翻牌 → crop Ok");
         assert_eq!(late.get(), 0);
+    }
+
+    /// `read_current_strategy` must never hand out the uniform placeholder that
+    /// `average_strategy` returns where the average carries no solved mix (2026-10-16 live
+    /// 9-max: 6/22 search decisions uniform, incl. top-pair jams). Pins the infoset states:
+    /// never visited / regret slot only (opponent traversals) / strategy_sum all-zero (own
+    /// reach 0) / average exactly uniform (first traversal only) → Err, even when regrets are
+    /// learned; non-uniform positive strategy_sum → normalised average.
+    #[test]
+    fn read_current_strategy_rejects_undefined_average() {
+        let auth = nway_limped_flop_state(3, 12_100, 0x5245_4752_4F4E_4C59); // "REGRONLY"
+        let (abs, rules) = deep_menu_for(&auth);
+        let sub = SubgameNlheGame::new(
+            stub_table(),
+            auth.config().clone(),
+            abs,
+            rules,
+            auth.clone(),
+            live_entrants(&auth),
+            0,
+        );
+        let mut trainer = EsMccfrTrainer::new(sub, 0x5245_4752);
+        let root = trainer.game().subtree().root_id();
+        let actor = auth.current_player().expect("decision node").0 as PlayerId;
+        let (info, legal) = trainer.game().query_at(root, &auth);
+        let n = trainer.game().subtree().node(root).legal_actions.len();
+        assert!(n >= 2, "root needs a real choice, got {n} actions");
+        // Fixture has no all-in collapse at the root → projection is the identity, so the
+        // returned vector can be compared position by position.
+        assert_eq!(legal.len(), n);
+        let read =
+            |t: &EsMccfrTrainer<SubgameNlheGame>| read_current_strategy(t, root, &auth, actor);
+        let uniform = vec![1.0 / n as f64; n];
+
+        // Never visited at all: pre-existing guard.
+        let err = read(&trainer).unwrap_err();
+        assert!(err.contains("未被 CFR 访问"), "unexpected err: {err}");
+
+        // Opponent-traversal-only visit: regret slot created (all zero), no strategy_sum entry.
+        // The trainer reports uniform here — the trap this guard closes.
+        trainer.regret.get_or_init(info, n);
+        assert_eq!(trainer.average_strategy(&info), uniform);
+        let err = read(&trainer).unwrap_err();
+        assert!(err.contains("无 strategy_sum"), "unexpected err: {err}");
+
+        // Traversed with own reach 0: strategy_sum entry all zero.
+        trainer.strategy_sum.accumulate(info, &vec![0.0; n]);
+        assert_eq!(trainer.average_strategy(&info), uniform);
+        let err = read(&trainer).unwrap_err();
+        assert!(err.contains("均匀占位"), "unexpected err: {err}");
+
+        // Single traversal with own reach 0.6 that learned regrets: strategy_sum = 0.6 × uniform
+        // (RM on zero regrets), average exactly uniform. Learned regrets do not rescue it — the
+        // current strategy after one visit is one sampled hand's best response.
+        trainer
+            .strategy_sum
+            .accumulate(info, &vec![0.6 / n as f64; n]);
+        let mut delta = vec![-5.0; n];
+        delta[0] = 1.0;
+        delta[1] = 3.0;
+        trainer.regret.accumulate(info, &delta);
+        assert_eq!(trainer.average_strategy(&info), uniform);
+        let err = read(&trainer).unwrap_err();
+        assert!(err.contains("均匀占位"), "unexpected err: {err}");
+
+        // A later traversal accumulates a non-uniform σ → the average carries a solved mix.
+        let w: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+        trainer.strategy_sum.accumulate(info, &w);
+        let (probs, _) = read(&trainer).expect("learned infoset must be readable");
+        let sum: Vec<f64> = w.iter().map(|wi| wi + 0.6 / n as f64).collect();
+        let total: f64 = sum.iter().sum();
+        for (p, si) in probs.iter().zip(&sum) {
+            assert!(
+                (p - si / total).abs() < 1e-12,
+                "probs {probs:?} vs sum {sum:?}"
+            );
+        }
     }
 }

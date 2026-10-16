@@ -6604,7 +6604,14 @@ mod tests {
         let abs = game.abstraction().clone();
         let sf = |i: &InfoSetId, _n: usize| full.strategy(i);
         let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);
-        let (rt_f, rt_c) = (crop_rt(&full, crop_scfg()), crop_rt(&crop, crop_scfg()));
+        // 1000 iterations: at crop_scfg's 300 the QQ river-facing-bet infoset only ever had its
+        // uniform placeholder average (own reach 0 in every hero traversal); the decision used
+        // to pass on it, read_current_strategy now rejects it as unsolved.
+        let scfg = SubgameSearchConfig {
+            iterations: 1000,
+            ..crop_scfg()
+        };
+        let (rt_f, rt_c) = (crop_rt(&full, scfg), crop_rt(&crop, scfg));
         validate_crop_runtime(crop.keep_through(), Some(&rt_c)).expect("生产约束满足");
 
         // (a) 完整一手。
