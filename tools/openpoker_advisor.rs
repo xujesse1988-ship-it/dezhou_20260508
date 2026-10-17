@@ -1776,7 +1776,7 @@ fn decide(
 
     // per-decision 确定性采样（保混合策略 + 可复现；seed 与搜索与否无关 → search=None byte-equal）。
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed, n_seats));
-    let chosen = sample_discrete(&dist, &mut sample_rng);
+    let chosen = sample_discrete(&prune_for_sampling(&dist), &mut sample_rng);
 
     // —— outgoing：solver Action → OpenPoker {action, amount}（blueprint / search 共享映射）——
     let solver_action = match outgoing_action(outgoing_state, outgoing_abs, chosen) {
@@ -3078,7 +3078,7 @@ fn decide_search_unanchored(
         scfg.deep_menu.then(|| deep_menu_for(&round_start).0);
     let outgoing_abs: &StreetActionAbstraction = deep_abs.as_ref().unwrap_or(abstraction);
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed, n_seats));
-    let chosen = sample_discrete(&dist, &mut sample_rng);
+    let chosen = sample_discrete(&prune_for_sampling(&dist), &mut sample_rng);
     let solver_action = match outgoing_action(&auth, outgoing_abs, chosen) {
         Ok(a) => a,
         Err(_) => {
@@ -3201,6 +3201,26 @@ fn action_label(a: &AbstractAction) -> String {
         }
         AbstractAction::AllIn { .. } => "allin".into(),
     }
+}
+
+/// 出牌抽样前去掉概率低于此值的动作（剩下的按比例归一）。run5 实盘（2026-10-17，805 手）抽中
+/// < 5% 的动作 6 次、< 10% 的 15 次：走进自己几乎不走的线后，后续街的搜索解不可靠，其中两手
+/// 因此输光（翻牌 fold 0.98 抽中 1.4% 的加注 → 转牌推全下）。代价：混合程度下降，理论上更容易
+/// 被针对；对手池是普通 bot / 玩家，这个风险远小于冷门线的损失。`resp.probs` 仍记原分布。
+const SAMPLE_MIN_PROB: f64 = 0.05;
+
+/// [`SAMPLE_MIN_PROB`] 过滤 + 归一。全部低于门槛（≥ 21 个动作才可能）→ 只留概率最大的一个。
+fn prune_for_sampling<A: Copy>(dist: &[(A, f64)]) -> Vec<(A, f64)> {
+    let mut kept: Vec<(A, f64)> = dist
+        .iter()
+        .copied()
+        .filter(|&(_, p)| p >= SAMPLE_MIN_PROB)
+        .collect();
+    if kept.is_empty() {
+        kept.extend(dist.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)));
+    }
+    let sum: f64 = kept.iter().map(|&(_, p)| p).sum();
+    kept.into_iter().map(|(a, p)| (a, p / sum)).collect()
 }
 
 /// per-decision 确定性 seed：hash(hole, board, actions, base_seed)。保混合策略 + 可复现。
@@ -6308,6 +6328,31 @@ mod tests {
                 format!("fallback:preflop_allin:{want}"),
                 "{hole:?}: {r:?}"
             );
+        }
+    }
+
+    /// 抽样前过滤：< 5% 的动作去掉、剩下的归一（和为 1，`sample_discrete` 要求 1e-12 内）；
+    /// 恰好 5% 保留；全部低于门槛只留最大的；过滤后再抽样永远抽不到被去掉的动作。
+    #[test]
+    fn prune_for_sampling_drops_low_prob_actions() {
+        let d = prune_for_sampling(&[('f', 0.915), ('c', 0.059), ('r', 0.021), ('a', 0.005)]);
+        assert_eq!(d.iter().map(|&(a, _)| a).collect::<String>(), "fc");
+        assert!((d[0].1 - 0.915 / 0.974).abs() < 1e-12);
+        assert!((d.iter().map(|&(_, p)| p).sum::<f64>() - 1.0).abs() < 1e-12);
+        let d = prune_for_sampling(&[('x', 0.05), ('y', 0.95)]);
+        assert_eq!(d.len(), 2, "恰好 5% 保留");
+        let d = prune_for_sampling(&[('o', 1.0)]);
+        assert_eq!(d, vec![('o', 1.0)]);
+        let small = (0.96 - 1e-3) / 24.0;
+        let many: Vec<(u8, f64)> = (0..25u8)
+            .map(|i| (i, if i == 7 { 0.041 } else { small }))
+            .collect();
+        assert_eq!(prune_for_sampling(&many), vec![(7, 1.0)]);
+        // a1a5352f（run5）翻牌 fold 0.977 / call 0.004 / raise0.5 0.014 / allin 0.005：只剩弃牌。
+        let d = prune_for_sampling(&[('f', 0.977), ('c', 0.004), ('h', 0.014), ('a', 0.005)]);
+        for seed in 0..200u64 {
+            let mut rng = ChaCha20Rng::from_seed(seed);
+            assert_eq!(sample_discrete(&d, &mut rng), 'f');
         }
     }
 
