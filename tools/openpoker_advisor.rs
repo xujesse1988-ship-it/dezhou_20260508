@@ -3203,21 +3203,22 @@ fn action_label(a: &AbstractAction) -> String {
     }
 }
 
-/// 出牌抽样前去掉概率低于此值的动作（剩下的按比例归一）。run5 实盘（2026-10-17，805 手）抽中
-/// < 5% 的动作 6 次、< 10% 的 15 次：走进自己几乎不走的线后，后续街的搜索解不可靠，其中两手
-/// 因此输光（翻牌 fold 0.98 抽中 1.4% 的加注 → 转牌推全下）。代价：混合程度下降，理论上更容易
-/// 被针对；对手池是普通 bot / 玩家，这个风险远小于冷门线的损失。`resp.probs` 仍记原分布。
-const SAMPLE_MIN_PROB: f64 = 0.05;
+/// 出牌抽样前，`AllIn` 概率低于此值就去掉（剩下的按比例归一）；其他动作不论概率多小都保留。
+/// 只管全下：低频全下一旦抽中就把整个码深押上（run5 10a9eac8 抽中 3% 的全下 100 BB），而低频的
+/// 跟注 / 下注尺寸代价有限，逐个尺寸按门槛砍会把拆成几档的进攻整类去掉（run5 有 9 次）。
+/// `resp.probs` 仍记原分布。
+const SAMPLE_MIN_ALLIN_PROB: f64 = 0.05;
 
-/// [`SAMPLE_MIN_PROB`] 过滤 + 归一。全部低于门槛（≥ 21 个动作才可能）→ 只留概率最大的一个。
-fn prune_for_sampling<A: Copy>(dist: &[(A, f64)]) -> Vec<(A, f64)> {
-    let mut kept: Vec<(A, f64)> = dist
+/// [`SAMPLE_MIN_ALLIN_PROB`] 过滤 + 归一。只有 `AllIn` 会被去掉；去掉后为空（理论上不会：
+/// 分布和为 1）则原样返回。
+fn prune_for_sampling(dist: &[(AbstractAction, f64)]) -> Vec<(AbstractAction, f64)> {
+    let kept: Vec<(AbstractAction, f64)> = dist
         .iter()
         .copied()
-        .filter(|&(_, p)| p >= SAMPLE_MIN_PROB)
+        .filter(|&(a, p)| !matches!(a, AbstractAction::AllIn { .. }) || p >= SAMPLE_MIN_ALLIN_PROB)
         .collect();
-    if kept.is_empty() {
-        kept.extend(dist.iter().copied().max_by(|a, b| a.1.total_cmp(&b.1)));
+    if kept.len() == dist.len() || kept.is_empty() {
+        return dist.to_vec();
     }
     let sum: f64 = kept.iter().map(|&(_, p)| p).sum();
     kept.into_iter().map(|(a, p)| (a, p / sum)).collect()
@@ -4183,7 +4184,7 @@ fn next_val(it: &mut impl Iterator<Item = String>, name: &str) -> Result<String,
 mod tests {
     use super::*;
     use poker::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_6max};
-    use poker::BucketConfig;
+    use poker::{BetRatio, BucketConfig};
 
     /// 把纯 config 包成 [`SearchRuntime`]（子树桶表 = None，沿用 blueprint 表——既有搜索测试
     /// 全不换表，行为与改前 byte-equal）。前缀 reach 取关（uniform）= 既有脱影子行为（生产默认已
@@ -6331,28 +6332,57 @@ mod tests {
         }
     }
 
-    /// 抽样前过滤：< 5% 的动作去掉、剩下的归一（和为 1，`sample_discrete` 要求 1e-12 内）；
-    /// 恰好 5% 保留；全部低于门槛只留最大的；过滤后再抽样永远抽不到被去掉的动作。
+    /// 抽样前过滤：只有 `AllIn` < 5% 才去掉、剩下的归一（和为 1，`sample_discrete` 要求 1e-12 内）；
+    /// 其他动作再小也保留；全下恰好 5% 保留；没有全下 / 全下够大时原样返回；过滤后永远抽不到全下。
     #[test]
-    fn prune_for_sampling_drops_low_prob_actions() {
-        let d = prune_for_sampling(&[('f', 0.915), ('c', 0.059), ('r', 0.021), ('a', 0.005)]);
-        assert_eq!(d.iter().map(|&(a, _)| a).collect::<String>(), "fc");
-        assert!((d[0].1 - 0.915 / 0.974).abs() < 1e-12);
+    fn prune_for_sampling_drops_only_low_prob_allin() {
+        let fold = AbstractAction::Fold;
+        let call = AbstractAction::Call {
+            to: ChipAmount::new(300),
+        };
+        let half = AbstractAction::Raise {
+            to: ChipAmount::new(800),
+            ratio_label: BetRatio::HALF_POT,
+        };
+        let pot = AbstractAction::Raise {
+            to: ChipAmount::new(1200),
+            ratio_label: BetRatio::FULL_POT,
+        };
+        let allin = AbstractAction::AllIn {
+            to: ChipAmount::new(2000),
+        };
+
+        // run5 14973b83 河牌：两个加注尺寸各 < 5% 也保留，只去掉 4.4% 的全下。
+        let d = prune_for_sampling(&[
+            (fold, 0.289),
+            (call, 0.632),
+            (half, 0.029),
+            (pot, 0.006),
+            (allin, 0.044),
+        ]);
+        assert_eq!(
+            d.iter().map(|&(a, _)| a).collect::<Vec<_>>(),
+            vec![fold, call, half, pot]
+        );
+        assert!((d[3].1 - 0.006 / 0.956).abs() < 1e-12);
         assert!((d.iter().map(|&(_, p)| p).sum::<f64>() - 1.0).abs() < 1e-12);
-        let d = prune_for_sampling(&[('x', 0.05), ('y', 0.95)]);
-        assert_eq!(d.len(), 2, "恰好 5% 保留");
-        let d = prune_for_sampling(&[('o', 1.0)]);
-        assert_eq!(d, vec![('o', 1.0)]);
-        let small = (0.96 - 1e-3) / 24.0;
-        let many: Vec<(u8, f64)> = (0..25u8)
-            .map(|i| (i, if i == 7 { 0.041 } else { small }))
-            .collect();
-        assert_eq!(prune_for_sampling(&many), vec![(7, 1.0)]);
-        // a1a5352f（run5）翻牌 fold 0.977 / call 0.004 / raise0.5 0.014 / allin 0.005：只剩弃牌。
-        let d = prune_for_sampling(&[('f', 0.977), ('c', 0.004), ('h', 0.014), ('a', 0.005)]);
+
+        let orig = [(fold, 0.95), (allin, 0.05)];
+        assert_eq!(prune_for_sampling(&orig), orig.to_vec(), "全下恰好 5% 保留");
+        let orig = [(fold, 0.977), (call, 0.004), (half, 0.014), (pot, 0.005)];
+        assert_eq!(
+            prune_for_sampling(&orig),
+            orig.to_vec(),
+            "没有全下：原样返回"
+        );
+        assert_eq!(prune_for_sampling(&[(allin, 1.0)]), vec![(allin, 1.0)]);
+
+        // run5 10a9eac8 翻前 QQ raise1pot 0.97 / allin 0.03：只剩加注。
+        let d = prune_for_sampling(&[(pot, 0.97), (allin, 0.03)]);
+        assert_eq!(d, vec![(pot, 1.0)]);
         for seed in 0..200u64 {
             let mut rng = ChaCha20Rng::from_seed(seed);
-            assert_eq!(sample_discrete(&d, &mut rng), 'f');
+            assert_eq!(sample_discrete(&d, &mut rng), pot);
         }
     }
 
