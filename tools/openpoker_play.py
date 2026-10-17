@@ -12,7 +12,8 @@ driver 职责（§3）：
   - §4 码深漂移：每手后我方栈漂出 [80,180]BB → leave_table + rejoin 取 2000（控我方栈）。
   - §4 两人桌：一手仅 2 座发牌（HU）→ 本实现 postflop 不支持 → leave_table + 离线等 10 分钟
     重连，**连续** 5 次仍是两人桌才放弃（中途换到人多的桌即清零；HU 是 live 最大出血点，exec §3.2）。
-  - 断线重连 + resync（best-effort）；限速 20 msg/s。
+  - 断线重连：仍在座（already_seated）→ resync_request 补事件 + 快照 token 续打，不离桌；
+    离桌换座等自己的 player_left 再 join；关桌等服务器重排（Session 入座状态机）。限速 20 msg/s。
 
 HH 日志（--hh-log，realtime_search_openpoker_exec §4.2 数据管道）：每手 hand_result 落一行
 **全桌手牌历史** JSONL——整手动作序 + board + 对手 name + 回推 hand-start 真栈 +
@@ -58,6 +59,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 # OpenPoker 协议常量（§0/§1）。
@@ -77,6 +79,8 @@ _BOARD_LEN = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 # 6-max 树表达不了跨街反转、smoke 实测 87.5% 兜底）。检测到一手仅 2 座发牌 → 主动离场，
 # 等 HU_RETRY_WAIT_S 后重连（期望换到人更多的桌）；**连续** HU_MAX_RETRIES 次仍是两人桌才放弃
 # （重连后只要落到人多的桌就清零，不累积）。
+LEAVE_TIMEOUT_S = 180   # 发 leave_table 后这么久没等到自己的 player_left → 当作已离桌（一手可能打 2 分钟）
+RESYNC_WAIT_S = 3       # 等 resync_response 的上限；超时按现有历史对暂存的 your_turn 决策
 HU_RETRY_WAIT_S = 120   # 2 分钟（2026-06-21 由 10 分钟下调：lobby HU 多时更快换桌找多人桌）。
 HU_MAX_RETRIES = 30     # 配合 2 分钟重试：~60min 才放弃，避免频繁 give-up 触发昂贵的 10B blueprint 重载。
 
@@ -440,7 +444,8 @@ class Session:
     # 移桌这类**沉默事件**的真实报文——live 实测 2026-06-11 曾被移出桌后空等）。
     _KNOWN_TYPES = ("connected", "error", "hand_start", "hole_cards", "player_action",
                     "community_cards", "your_turn", "hand_result",
-                    "lobby_joined", "table_joined", "table_state")
+                    "lobby_joined", "table_joined", "table_state",
+                    "player_left", "table_closed", "resync_response")
 
     def __init__(self, advisor, send, num_hands, log_f=None, hh_f=None, prewarm=False,
                  exploit=False, debug=False):
@@ -457,12 +462,33 @@ class Session:
         self.counters = {"hands": 0, "decisions": 0, "blueprint": 0, "search": 0,
                          "limp_heuristic": 0, "fallback": 0, "net_chips": 0,
                          "prewarms": 0,
-                         "hh_hands": 0, "hh_skipped": 0, "watchdog_rejoins": 0}
+                         "hh_hands": 0, "hh_skipped": 0, "watchdog_rejoins": 0,
+                         "resyncs": 0, "dup_events": 0}
         # 兜底/giveup 原因直方图（监控长跑异常点）：key = source 前 80 字符（同类归并、类别区分），
         # 首次见某 key 时打 [new-fallback] 提醒——新失败模式（如 Call 塌缩）立刻冒泡、不必事后 grep。
         self.fallback_reasons = {}
+        # last_seq = 当前桌已处理的最大**事件** table_seq（换桌清零）：同桌 table_seq 严格递增（run5
+        # 实测 3.8 万条无重复 / 回退）→ ≤ last_seq 的事件是重连 / resync 补发的重复，丢弃。
         self.state = {"hand": None, "table_id": None, "last_seq": 0}
         self.client_action_id = [0]
+        # 入座状态机（docs.openpoker.ai bot-lifecycle；run5 2026-10-17 实测重连 / 换桌问题后重写）：
+        #   none → join_lobby → joining →（lobby_joined / table_joined）→ seated
+        #   seated → leave_table → leaving →（自己的 player_left / not_at_table）→ none → join_lobby
+        # 每个转移只发一条消息，绝不在收到错误时回发 leave+join（旧实现在 already_seated /
+        # leave_pending 上来回 3163 轮、撞限速丢动作）。table_closed 后服务器自动重排 → joining。
+        self.seat_state = "none"
+        self.leave_ts = 0.0
+        self.my_name = None   # connected.name：认自己的 player_left
+        self.my_seat = None   # 当前桌我方座位（table_joined / hand_start / already_seated）
+        self.stopping = False  # Ctrl-C：run_real 不再重连
+        # 重连后仍在座（already_seated）→ resync_request 补漏掉的事件 + 快照（每次连接最多一次）。
+        # 等 resync_response 期间到的 your_turn 先暂存，补完历史再决策（超时 RESYNC_WAIT_S 直接决策）。
+        self.resync_sent = False
+        self.resync_pending_ts = None
+        self.stashed_turn = None
+        self.acted_tokens = set()  # 已出过牌的 turn_token：快照与实时 your_turn 同 token 只出一次
+        # 真实联机由 run_real 的 ws 线程与看门狗线程共用 → 消息处理 / 看门狗串行化。
+        self.lock = threading.RLock()
         # 看门狗（run_real 的后台线程读写）：最近一次 hand_result / 任意消息的时刻 + 当前 ws。
         self.last_hand_ts = time.time()
         self._ws = None
@@ -480,36 +506,113 @@ class Session:
         if self.debug:
             print(f"  [dbg] {msg}", file=sys.stderr)
 
-    def rejoin(self, ws, why):
-        """leave + 重新 join_lobby 拿干净座位（已不在桌 / 卡死自救；服务端对未坐桌的
-        leave_table 容忍）。"""
-        print(f"  [rejoin] {why} → leave_table + join_lobby", file=sys.stderr)
-        self.send(ws, {"type": "leave_table"})
+    def join(self, ws, why):
+        """none → joining：发一次 join_lobby。已在排队 / 在座 / 离桌中都不发（避免重复入队）。"""
+        if self.stopping or self.seat_state != "none":
+            return
+        print(f"  [join] {why} → join_lobby", file=sys.stderr)
+        self.seat_state = "joining"
+        self.last_hand_ts = time.time()  # 排队期间没有 hand_result 是正常的，喂狗
         self.send(ws, {"type": "join_lobby", "buy_in": BUY_IN})
 
-    def watchdog_check(self, stale_after=300):
-        """run_real 后台线程每 30s 调一次：超过 stale_after 秒没有 hand_result（正常节奏
-        ~1 手/分钟）≈ 被移出桌 / 桌散后空等（live 实测 2026-06-11：driver 只在 connected
-        时 join 一次，被移出后会永远空等）→ leave+rejoin 自救。"""
-        if self._ws is not None and time.time() - self.last_hand_ts > stale_after:
-            self.counters["watchdog_rejoins"] += 1
-            self.last_hand_ts = time.time()  # 防重入桌等待期间连环触发
+    def leave(self, ws, why):
+        """seated → leaving：只发一次 leave_table。服务器可能回 leave_pending（本手打完才走），
+        真正离桌以自己的 player_left / not_at_table 为准（_on_left），之后才 join_lobby——
+        旧实现 leave + join 连发，join 抢在 leave 生效前入座、随后又被那条 leave 踢出（run5 3 次）。"""
+        if self.seat_state == "leaving":
+            return
+        print(f"  [leave] {why} → leave_table（等 player_left 再进大厅）", file=sys.stderr)
+        self.seat_state = "leaving"
+        self.leave_ts = time.time()
+        self.send(ws, {"type": "leave_table"})
+
+    def rejoin(self, ws, why):
+        """换一个干净座位：先离桌，确认离开后自动 join（看门狗 / 码深漂移用）。"""
+        self.leave(ws, why)
+
+    def _on_left(self, ws, why):
+        self.state["hand"] = None
+        self.seat_state = "none"
+        self.join(ws, why)
+
+    def watchdog_check(self, stale_after=300, leave_timeout=LEAVE_TIMEOUT_S):
+        """run_real 后台线程每 30s 调一次（持 lock）。
+        - 离桌超过 leave_timeout 还没等到自己的 player_left → 当作已离开，进大厅；
+        - 超过 stale_after 秒没有 hand_result（正常 ~1 手/分钟，live 2026-06-11 曾被移出桌后
+          永远空等）→ 在座则换座、排队中则重发一次 join、不在桌则 join。"""
+        with self.lock:
+            ws = self._ws
+            if ws is None:
+                return
+            now = time.time()
             try:
-                self.rejoin(self._ws, f"{stale_after}s 无 hand_result（watchdog）")
+                if self.seat_state == "leaving":
+                    if now - self.leave_ts > leave_timeout:
+                        self.counters["watchdog_rejoins"] += 1
+                        self._on_left(ws, f"离桌 {leave_timeout}s 未见 player_left（watchdog）")
+                elif now - self.last_hand_ts > stale_after:
+                    self.counters["watchdog_rejoins"] += 1
+                    self.last_hand_ts = now  # 防连环触发
+                    why = f"{stale_after}s 无 hand_result（watchdog）"
+                    if self.seat_state == "seated":
+                        self.leave(ws, why)
+                    else:
+                        self.seat_state = "none"
+                        self.join(ws, why)
             except Exception as e:
-                print(f"  [watchdog] rejoin 发送失败: {e}", file=sys.stderr)
+                print(f"  [watchdog] 发送失败: {e}", file=sys.stderr)
+
+    def tick(self):
+        """run_real 后台线程每秒调一次：resync 迟迟不回时，别让暂存的 your_turn 一直等
+        （轮到我方时桌上没有别的消息，单靠消息驱动的超时检查醒不过来）。"""
+        with self.lock:
+            if self._ws is not None:
+                self._flush_stale_resync(self._ws)
+
+    def _flush_stale_resync(self, ws, wait=None):
+        wait = RESYNC_WAIT_S if wait is None else wait
+        if self.resync_pending_ts is not None and time.time() - self.resync_pending_ts > wait:
+            print(f"  [resync] {wait}s 未收到 resync_response → 按现有历史继续", file=sys.stderr)
+            self.resync_pending_ts = None
+            self._play_stashed(ws)
+
+    def _play_stashed(self, ws):
+        turn, self.stashed_turn = self.stashed_turn, None
+        if turn is not None:
+            self._handle_your_turn(ws, turn)
+
+    def _is_me(self, msg):
+        if self.my_name is not None and msg.get("name") is not None:
+            return msg.get("name") == self.my_name
+        return msg.get("seat") is not None and msg.get("seat") == self.my_seat
 
     def handle_message(self, ws, msg):
+        with self.lock:
+            self._handle(ws, msg)
+
+    def _handle(self, ws, msg):
         t = msg.get("type")
         self._ws = ws
-        if "table_id" in msg:
+        self._flush_stale_resync(ws)
+        tid = msg.get("table_id")
+        if tid:
             # 换桌（或首次入桌）时打观战链接（arena 页面按 table_id 路由）。
-            if msg["table_id"] and msg["table_id"] != self.state["table_id"]:
-                print(f"  [table] table_id={msg['table_id']} "
-                      f"观战: https://openpoker.ai/zh/arena/{msg['table_id']}", file=sys.stderr)
-            self.state["table_id"] = msg["table_id"]
-        if "table_seq" in msg:
-            self.state["last_seq"] = msg["table_seq"]
+            if tid != self.state["table_id"]:
+                print(f"  [table] table_id={tid} "
+                      f"观战: https://openpoker.ai/zh/arena/{tid}", file=sys.stderr)
+                self.state["table_id"] = tid
+                self.state["last_seq"] = 0
+            seq = msg.get("table_seq")
+            # 只按离散事件（stream:event）记进度：table_state 快照与事件共用 table_seq 计数，重连时
+            # 服务器先推的快照 seq 大于断线期间漏掉的事件——按它记会把 resync 补发的事件当重复丢掉、
+            # 也会让 resync_request 声称「都收到了」。
+            is_event = msg.get("stream") == "event" or (msg.get("stream") is None
+                                                        and t != "table_state")
+            if isinstance(seq, int) and is_event:
+                if seq <= self.state["last_seq"]:
+                    self.counters["dup_events"] += 1
+                    return
+                self.state["last_seq"] = seq
         if t not in self._seen_types:
             self._seen_types.add(t)
             if t not in self._KNOWN_TYPES:
@@ -518,24 +621,88 @@ class Session:
         if t == "connected":
             print(f"  connected agent_id={msg.get('agent_id')} name={msg.get('name')}",
                   file=sys.stderr)
-            self.last_hand_ts = time.time()
-            self.send(ws, {"type": "join_lobby", "buy_in": BUY_IN})
+            self.my_name = msg.get("name") or self.my_name
+            self.resync_sent = False
+            self.resync_pending_ts = None
+            self.stashed_turn = None
+            # 新连接一律先 join_lobby：仍在座时服务器回 already_seated（带 table_id）→ resync；
+            # 冷启动（上个进程留下的座位）走同一条路。
+            self.seat_state = "none"
+            self.join(ws, "connected")
         elif t == "error":
+            code = msg.get("code")
             print(f"  [error] {msg}", file=sys.stderr)
-            if msg.get("code") == "auth_failed":
+            if code == "auth_failed":
                 ws.close()
-            elif msg.get("code") == "already_seated":
-                # 上个进程的座位被服务端保留（live 实测）：可能在死桌上——主动换干净座位。
-                self.rejoin(ws, "already_seated（继承了旧进程的座位，可能是死桌）")
+            elif code == "already_seated":
+                # 断线 120s 内服务器保留座位（docs）：不是死桌，留在原座，用 error 的 table_id
+                # resync 补漏掉的事件；死桌由看门狗兜。离桌中收到（join 与 leave 赛跑）→ 等 player_left。
+                if isinstance(msg.get("seat"), int):
+                    self.my_seat = msg["seat"]
+                if self.seat_state == "leaving":
+                    return
+                self.seat_state = "seated"
+                if not self.resync_sent and self.state["table_id"]:
+                    self.resync_sent = True
+                    self.resync_pending_ts = time.time()
+                    self.counters["resyncs"] += 1
+                    print(f"  [resync] 仍在座 seat={self.my_seat} → resync_request "
+                          f"last_table_seq={self.state['last_seq']}", file=sys.stderr)
+                    self.send(ws, {"type": "resync_request", "table_id": self.state["table_id"],
+                                   "last_table_seq": self.state["last_seq"]})
+            elif code == "not_at_table":
+                if self.resync_pending_ts is not None:
+                    # resync 被拒 = 座位已经没了：暂存的 your_turn 作废，重新进大厅。
+                    self.resync_pending_ts = None
+                    self.stashed_turn = None
+                    self._on_left(ws, "resync: not_at_table")
+                elif self.seat_state == "leaving":
+                    self._on_left(ws, "not_at_table")
+            elif code not in ("leave_pending", "rate_limited") \
+                    and self.resync_pending_ts is not None:
+                # resync 期间的其他错误：不再等，按现有历史决策。
+                self.resync_pending_ts = None
+                self._play_stashed(ws)
         elif t in ("lobby_joined", "table_joined"):
             # 排队 / 入座流程中没有 hand_result 是正常状态——喂狗，免得看门狗在大厅队列里
-            # 误触发 rejoin（会被重排队尾、可能循环）。
+            # 误触发换座（会被重排队尾、可能循环）。
             self.last_hand_ts = time.time()
+            if t == "lobby_joined":
+                if self.seat_state != "leaving":
+                    self.seat_state = "joining"
+            else:
+                # 新座位：上一桌没打完的手（断线 / 关桌）作废，避免它的 hand_result 挂错手。
+                self.seat_state = "seated"
+                self.state["hand"] = None
+                if isinstance(msg.get("seat"), int):
+                    self.my_seat = msg["seat"]
             print(f"  [{t}] position={msg.get('position')} wait={msg.get('estimated_wait')} "
                   f"seat={msg.get('seat')}", file=sys.stderr)
+        elif t == "table_closed":
+            # 桌散：服务器把剩下的人自动重新排队（docs bot-lifecycle；run5 5 次关桌都紧跟
+            # lobby_joined）→ 不发 join，等它；没排上由看门狗兜。
+            print(f"  [table_closed] reason={msg.get('reason')} → 等服务器重新排队",
+                  file=sys.stderr)
+            self.state["hand"] = None
+            self.seat_state = "joining"
+            self.last_hand_ts = time.time()
+        elif t == "player_left":
+            if self._is_me(msg):
+                print(f"  [player_left] 我方离桌 seat={msg.get('seat')} "
+                      f"reason={msg.get('reason')}", file=sys.stderr)
+                if self.seat_state == "joining":
+                    self.state["hand"] = None  # 关桌后的 player_left：服务器已在重排
+                else:
+                    self._on_left(ws, f"player_left reason={msg.get('reason')}")
+        elif t == "resync_response":
+            self._handle_resync(ws, msg)
         elif t == "hand_start":
             self.state["hand"] = HandState(msg.get("hand_id"), msg.get("dealer_seat"),
                                            msg.get("seat"))
+            if self.seat_state != "leaving":
+                self.seat_state = "seated"
+            if isinstance(msg.get("seat"), int):
+                self.my_seat = msg["seat"]
             self._dbg(f"=== hand_start hand_id={msg.get('hand_id')} "
                       f"button={msg.get('dealer_seat')} my_seat={msg.get('seat')} ===")
         elif t == "hole_cards":
@@ -563,19 +730,14 @@ class Session:
                 self._dbg(f"{_street_name(msg.get('street'))} "
                           f"board={' '.join(msg.get('cards') or [])}")
         elif t == "table_state":
-            # 短桌占座推断（幻影座映射）：stream:state 全量快照的 seats[].in_hand 是发牌的
-            # 权威信号（your_turn.players 含等局玩家，不可用）。已弃牌者会翻 false → 并集
-            # 累计整手；hand_id 必须对上当前手（手间快照不算）。
-            hand = self.state["hand"]
-            seats = msg.get("seats")
-            if hand is not None and isinstance(seats, list) and msg.get("hand_id") == hand.hand_id:
-                for s in seats:
-                    if s.get("in_hand") and isinstance(s.get("seat"), int) \
-                            and 0 <= s["seat"] < NUM_SEATS:
-                        hand.in_hand_seen.add(s["seat"])
-                hand.dealt_confirmed = True
+            self._apply_table_state(msg)
         elif t == "your_turn":
-            self._handle_your_turn(ws, msg)
+            if self.resync_pending_ts is not None:
+                # 等 resync 补完断线期间的事件再决策（同 token 快照若先出过牌，这条会被去重）。
+                print("  [resync] your_turn 先到 → 暂存，等 resync_response", file=sys.stderr)
+                self.stashed_turn = msg
+            else:
+                self._handle_your_turn(ws, msg)
         elif t == "hand_result":
             self._handle_hand_result(ws, msg)
             self.counters["hands"] += 1
@@ -591,6 +753,66 @@ class Session:
             if self.counters["hands"] >= self.num_hands:
                 print(f"  打满 {self.num_hands} 手，离场。", file=sys.stderr)
                 ws.close()
+
+    def _apply_table_state(self, msg):
+        # 短桌占座推断（幻影座映射）：stream:state 全量快照的 seats[].in_hand 是发牌的
+        # 权威信号（your_turn.players 含等局玩家，不可用）。已弃牌者会翻 false → 并集
+        # 累计整手；hand_id 必须对上当前手（手间快照不算）。
+        hand = self.state["hand"]
+        seats = msg.get("seats")
+        if hand is not None and isinstance(seats, list) and msg.get("hand_id") == hand.hand_id:
+            for s in seats:
+                if s.get("in_hand") and isinstance(s.get("seat"), int) \
+                        and 0 <= s["seat"] < NUM_SEATS:
+                    hand.in_hand_seen.add(s["seat"])
+            hand.dealt_confirmed = True
+
+    def _handle_resync(self, ws, msg):
+        """resync_response（docs message-types）：replayed_events 按 table_seq 升序当普通消息
+        重放（已见过的被 table_seq 去重），snapshot 最后装上。快照的 hero 带 turn_token +
+        valid_actions = 仍轮到我方（断线不重置行动时限）→ 按原 token 出牌。"""
+        self.resync_pending_ts = None
+        role = msg.get("role")
+        events = [e for e in (msg.get("replayed_events") or []) if isinstance(e, dict)]
+        events.sort(key=lambda e: e.get("table_seq") if isinstance(e.get("table_seq"), int) else 0)
+        print(f"  [resync] role={role} 补发 {len(events)} 条 "
+              f"seq {msg.get('from_table_seq')}→{msg.get('to_table_seq')}", file=sys.stderr)
+        if role != "player":
+            self.stashed_turn = None
+            self._on_left(ws, f"resync role={role}（不在座）")
+            return
+        tid = self.state["table_id"]
+        for ev in events:
+            if ev.get("type") == "your_turn":
+                continue  # 行动权以快照为准，避免按过期 token 出牌
+            ev = dict(ev)
+            ev.setdefault("table_id", tid)
+            self._handle(ws, ev)
+        snap = msg.get("snapshot") or {}
+        if not isinstance(snap, dict):
+            snap = {}
+        self._apply_table_state(snap)
+        hand = self.state["hand"]
+        hid = snap.get("hand_id")
+        if hand is not None and hid and hand.hand_id != hid:
+            # 补发也没把我们带到快照这一手（中途换手）→ 旧手作废；这一手历史不全，只能安全出牌。
+            self.state["hand"] = hand = None
+        hero = snap.get("hero") if isinstance(snap.get("hero"), dict) else {}
+        if hand is not None and not hand.hole and hero.get("hole_cards"):
+            hand.hole = hero["hole_cards"]
+        if hero.get("turn_token") and hero.get("valid_actions"):
+            turn = {"type": "your_turn", "hand_id": hid, "turn_token": hero["turn_token"],
+                    "valid_actions": hero["valid_actions"],
+                    "min_raise": snap.get("min_raise_to"), "max_raise": snap.get("max_raise_to")}
+            if isinstance(snap.get("board"), list):
+                turn["community_cards"] = snap["board"]
+            if isinstance(snap.get("seats"), list):
+                turn["players"] = [{"seat": s.get("seat"), "name": s.get("name"),
+                                    "stack": s.get("stack")}
+                                   for s in snap["seats"] if isinstance(s, dict)]
+            print("  [resync] 快照显示轮到我方 → 按原 turn_token 出牌", file=sys.stderr)
+            self._handle_your_turn(ws, turn)
+        self._play_stashed(ws)
 
     def _maybe_prewarm(self):
         """街起点预热（--search-prewarm）：板发出、hero 行动**前**让 advisor 后台把该街
@@ -615,8 +837,14 @@ class Session:
             print(f"  [prewarm 异常] {e}（忽略：决策时现解）", file=sys.stderr)
 
     def _handle_your_turn(self, ws, msg):
+        token = msg.get("turn_token")
+        if token and token in self.acted_tokens:
+            return  # resync 快照与实时 your_turn 同一 token：只出一次（重用会被 action_rejected）
         hand = self.state["hand"]
-        if hand is None:
+        if hand is None or (msg.get("hand_id") and msg.get("hand_id") != hand.hand_id):
+            # 没跟到这手的开头（中途入座 / 重连换了手）：历史不全不能问 advisor，但也不能
+            # 不回——不回就等服务器 120s 超时。能过牌就过牌，否则弃牌。
+            self._act_safe(ws, msg, "fallback:no_hand_state")
             return
         # board / street 以 your_turn 为准（更新累计）。
         if "community_cards" in msg:
@@ -667,12 +895,39 @@ class Session:
             "turn_token": msg.get("turn_token"),
         }
         self.send(ws, out)
+        self._mark_acted(token)
         if self.log_f:
             self.log_f.write(json.dumps({"req": req, "resp": resp, "sent": out},
                                         ensure_ascii=False) + "\n")
             self.log_f.flush()
         if self.debug:
             self._dbg_decision(hand, req, resp, out)
+
+    def _mark_acted(self, token):
+        if token:
+            if len(self.acted_tokens) > 1000:
+                self.acted_tokens.clear()
+            self.acted_tokens.add(token)
+
+    def _act_safe(self, ws, msg, source):
+        acts = {va.get("action") for va in msg.get("valid_actions", []) or []}
+        action = "check" if "check" in acts else "fold"
+        self.counters["decisions"] += 1
+        self.counters["fallback"] += 1
+        if source not in self.fallback_reasons:
+            print(f"  [new-fallback decisions={self.counters['decisions']}] {source}",
+                  file=sys.stderr)
+        self.fallback_reasons[source] = self.fallback_reasons.get(source, 0) + 1
+        self.client_action_id[0] += 1
+        out = {"type": "action", "hand_id": msg.get("hand_id"), "action": action,
+               "amount": None, "client_action_id": f"jx-{self.client_action_id[0]}",
+               "turn_token": msg.get("turn_token")}
+        self.send(ws, out)
+        self._mark_acted(msg.get("turn_token"))
+        if self.log_f:
+            self.log_f.write(json.dumps({"req": None, "resp": {"action": action, "source": source},
+                                         "sent": out}, ensure_ascii=False) + "\n")
+            self.log_f.flush()
 
     def _dbg_decision(self, hand, req, resp, out):
         """--debug-log：决策点中间数据——请求摘要（含真栈 / 幻影座）、advisor 响应全诊断字段
@@ -699,6 +954,9 @@ class Session:
     def _handle_hand_result(self, ws, msg):
         self.last_hand_ts = time.time()
         hand = self.state["hand"]
+        if hand is not None and msg.get("hand_id") and msg.get("hand_id") != hand.hand_id:
+            # 结算的不是我们跟着的那手（断线 / 关桌后旧手没清掉，run5 3 条 HH 张冠李戴）。
+            self.state["hand"] = hand = None
         # 叠加剥削（--exploit）：每手结束把完整观测发给 advisor Profiler（在清空 hand、且任何 HU/
         # 码深漂移早退之前——保证每手都喂，对手统计无遗漏）。--exploit 关 → 不发 → IPC byte-equal。
         if self.exploit and hand is not None:
@@ -736,6 +994,7 @@ class Session:
             print(f"  [两人桌] 本手仅 2 座发牌（final_stacks 键={sorted(final)}）"
                   f"→ 离场，等待后重试", file=sys.stderr)
             self.hu_detected = True
+            self.seat_state = "leaving"
             self.send(ws, {"type": "leave_table"})
             self.state["hand"] = None
             ws.close()
@@ -749,10 +1008,9 @@ class Session:
         if hand is not None:
             my_stack = final.get(str(hand.my_seat), final.get(hand.my_seat))
         if my_stack is not None and (my_stack < STACK_LEAVE_LO or my_stack > STACK_LEAVE_HI):
-            print(f"  [码深漂移] 我方栈 {my_stack} 漂出 [{STACK_LEAVE_LO},{STACK_LEAVE_HI}]"
-                  f" → leave/rejoin", file=sys.stderr)
-            self.send(ws, {"type": "leave_table"})
-            self.send(ws, {"type": "join_lobby", "buy_in": BUY_IN})
+            self.state["hand"] = None
+            self.rejoin(ws, f"[码深漂移] 我方栈 {my_stack} 漂出 [{STACK_LEAVE_LO},{STACK_LEAVE_HI}]")
+            return
         self.state["hand"] = None
 
 
@@ -768,8 +1026,6 @@ class WsLog:
     纯旁路：不改任何发往 advisor / ws 的字节（selftest 场景 5b 钉死）。"""
 
     def __init__(self, path):
-        import threading
-
         self._f = open(path, "a")
         self._lock = threading.Lock()
         self.conn = 0
@@ -792,6 +1048,14 @@ class WsLog:
             self._f.close()
 
 
+RECONNECT_MAX = 10
+
+
+def _next_reconnect_attempts(prev, played_hand):
+    """断线后的连续重连计数：本次连接打完过一手（hand_result）= 已恢复 → 从 1 重新计；否则累加。"""
+    return 1 if played_hand else prev + 1
+
+
 def _make_ws_send(ws_log=None):
     """真实发送函数：序列化一次，落 ws_log（若开）后原样发出——日志里的 out 与线上逐字节相同。"""
     def send(ws, obj):
@@ -811,8 +1075,6 @@ def _on_raw_message(session, ws, raw, ws_log=None):
 
 def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=False,
              exploit=False, debug=False, ws_log_path=None):
-    import threading
-
     import websocket  # 延迟 import：离线 selftest 不需要 websocket-client
 
     # action / HH / WS 日志均用 append：贯穿全程的后台采集（§4.2），跨重连 / 多次运行累积同一个文件。
@@ -826,8 +1088,12 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
     stop_watchdog = threading.Event()
 
     def watchdog_loop():
-        while not stop_watchdog.wait(30):
-            session.watchdog_check()
+        n = 0
+        while not stop_watchdog.wait(1):
+            session.tick()
+            n += 1
+            if n % 30 == 0:
+                session.watchdog_check()
 
     threading.Thread(target=watchdog_loop, daemon=True).start()
 
@@ -839,7 +1105,10 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
         _on_raw_message(session, ws, raw, ws_log)
 
     def on_error(ws, err):
-        print(f"  [ws error] {err}", file=sys.stderr)
+        print(f"  [ws error] {err!r}", file=sys.stderr)
+        if isinstance(err, KeyboardInterrupt):
+            # run_forever 吞掉 Ctrl-C 后正常返回 → 不标记就会被当成断线自动重连（run5 实测）。
+            session.stopping = True
         if ws_log:
             ws_log.event("error", error=repr(err))
 
@@ -850,7 +1119,9 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
 
     header = [f"Authorization: Bearer {api_key}"]
     # 连接循环：分两类「重连」，计数独立——
-    #   · 断线（run_forever 异常返回）：3s 后重连，最多 10 次（§1：断线 120s 内 resync 简化为重连）。
+    #   · 断线（run_forever 异常返回）：3s 后重连，**连续** RECONNECT_MAX 次才放弃（服务器保留座位
+    #     120s，重连后由 Session 走 already_seated → resync 续打）。本次连接打完过一手即清零（_next_reconnect_attempts）——live 实测
+    #     2026-10-16 服务端 50 分钟内 RST 10 次、每次重连都正常打牌，累计计数会把整局白白停掉。
     #   · 两人桌（session.hu_detected）：本实现 postflop 不支持 HU → 主动离场，等 HU_RETRY_WAIT_S
     #     （2 分钟）后重连，期望换到人更多的桌；**连续** HU_MAX_RETRIES 次仍是两人桌才放弃。
     #     hu_retries 计的是「连续」次数：本次连接只要打到过非两人桌手（non_hu_hand_seen）就清零
@@ -858,6 +1129,7 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
     reconnect_attempts = 0
     hu_retries = 0
     while session.counters["hands"] < num_hands:
+        hands_before = session.counters["hands"]
         session.hu_detected = False
         session.non_hu_hand_seen = False
         if ws_log:
@@ -870,6 +1142,9 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
         # 断开后清掉 ws 引用：等待 / 重连期间看门狗读到 None 即 no-op（不往死 ws 发 rejoin）。
         session._ws = None
         if session.counters["hands"] >= num_hands:
+            break
+        if session.stopping:
+            print("  收到中断，不再重连（座位由服务器保留 120s 后释放）。", file=sys.stderr)
             break
         # 恢复：本次连接打到过非两人桌手（≥3 座）→ 之前累积的两人桌**连续**重试计数清零。
         # 放在 HU/断线分支之前——无论本次连接以 HU 还是断线收尾，只要中途恢复过都算连续中断。
@@ -885,8 +1160,9 @@ def run_real(advisor, api_key, num_hands, action_log=None, hh_log=None, prewarm=
             time.sleep(HU_RETRY_WAIT_S)
             reconnect_attempts = 0  # 主动等待重连不计入断线重连上限
             continue
-        reconnect_attempts += 1
-        if reconnect_attempts >= 10:
+        reconnect_attempts = _next_reconnect_attempts(
+            reconnect_attempts, session.counters["hands"] > hands_before)
+        if reconnect_attempts >= RECONNECT_MAX:
             print(f"  断线重连达上限（{reconnect_attempts}），放弃。", file=sys.stderr)
             break
         print(f"  断线，3s 后重连（attempt {reconnect_attempts}）…", file=sys.stderr)
@@ -1001,6 +1277,12 @@ def run_selftest(advisor):
 
     # 场景 5b（--ws-log 隔离）：原始字符串走真实收发路径，挂/不挂 WS 日志逐字节一致；日志原文吻合。
     _selftest_ws_log_byte_equal()
+
+    # 场景 5c（断线计数）：连接内打完过一手即清零，只有连续断线才逼近上限。
+    _selftest_reconnect_counter()
+
+    # 场景 5d（重连 / 换座状态机）：resync 补事件 + 快照 token 出牌、漂移等 player_left、关桌等重排。
+    _selftest_reconnect_and_reseat()
 
     # 场景 6（短桌幻影座映射）：table_state.in_hand 占座推断 → dealt_seats / placeholder 栈 /
     # 盲注座重算 / HH dealt_est。
@@ -1295,6 +1577,200 @@ def _selftest_ws_log_byte_equal():
         raise RuntimeError("[ws-log] 每行须带 conn=1 + 浮点 ts")
     print(f"[selftest 5b WS-log byte-equal] 挂/不挂 --ws-log：advisor 请求/响应 + 线上字节逐字节一致；"
           f"日志 {len(ins)} in / {len(outs)} out / {len(events)} event，原文逐条吻合。", file=sys.stderr)
+
+
+def _selftest_reconnect_counter():
+    n = 0
+    for played in (True, True, False, True, False, False):
+        n = _next_reconnect_attempts(n, played)
+    if n != 3:
+        raise RuntimeError(f"[reconnect] 打过手后应从 1 重新计，连续 2 次空断后应为 3，得 {n}")
+    n = 0
+    for _ in range(RECONNECT_MAX):
+        n = _next_reconnect_attempts(n, False)
+    if n != RECONNECT_MAX:
+        raise RuntimeError(f"[reconnect] 连续 {RECONNECT_MAX} 次空断应达上限，得 {n}")
+    # live 2026-10-16 序列：10 次断线、其中 9 次连接打过手 → 计数始终 ≤ 2，不放弃。
+    n, peak = 0, 0
+    for played in (True, True, True, True, True, True, True, False, True, True):
+        n = _next_reconnect_attempts(n, played)
+        peak = max(peak, n)
+    if peak >= RECONNECT_MAX:
+        raise RuntimeError(f"[reconnect] live 序列不应触发放弃，峰值 {peak}")
+    print(f"[selftest 5c 断线计数] 打过手即清零；连续 {RECONNECT_MAX} 次空断才放弃；"
+          f"live 10 次断线序列峰值 {peak}。", file=sys.stderr)
+
+
+def _selftest_reconnect_and_reseat():
+    """场景 5d（重连 / 换座状态机，run5 2026-10-17 实测问题）：每条路径只发必要的消息，
+    不在 already_seated / leave_pending 上回发 leave+join；断线仍在座 → resync 补事件 +
+    按快照 token 出牌一次；漂移换座等自己的 player_left 再进大厅；关桌等服务器重排。"""
+    import io
+
+    T = "tbl-rc"
+
+    def mk(hh_f=None):
+        stub = _StubAdvisor()
+        sent = []
+        s = Session(stub, send=lambda ws, obj: sent.append(obj), num_hands=10 ** 9,
+                    log_f=None, hh_f=hh_f)
+        return s, stub, sent, _FakeWs()
+
+    def pa(seat, action, amount, seq, stack=2000, name=None):
+        m = {"type": "player_action", "seat": seat, "action": action, "amount": amount,
+             "street": "preflop", "stack": stack, "table_id": T, "table_seq": seq}
+        if name:
+            m["name"] = name
+        return m
+
+    def types(sent):
+        return [o.get("type") for o in sent]
+
+    # ① 断线后仍在座：connected → join → already_seated → 一次 resync；先到的 your_turn 暂存；
+    #   resync 补发断线期间的动作（含重复）后按快照 token 出牌一次，暂存的同 token 不再出。
+    s, stub, sent, ws = mk()
+    s.handle_message(ws, {"type": "connected", "name": "me"})
+    s.handle_message(ws, {"type": "table_joined", "table_id": T, "seat": 2, "table_seq": 1})
+    s.handle_message(ws, {"type": "hand_start", "hand_id": "h1", "seat": 2, "dealer_seat": 0,
+                          "table_id": T, "table_seq": 10})
+    s.handle_message(ws, {"type": "hole_cards", "cards": ["Ah", "Kd"], "table_id": T,
+                          "table_seq": 11})
+    s.handle_message(ws, pa(3, "fold", None, 12))
+    # —— 断线 ——（13–16 没收到）；重连后服务器先推快照，再 connected
+    s.handle_message(ws, {"type": "table_state", "table_id": T, "table_seq": 20, "hand_id": "h1",
+                          "street": "preflop", "hero": {"seat": 2}})
+    s.handle_message(ws, {"type": "connected", "name": "me"})
+    seated_err = {"type": "error", "code": "already_seated", "message": "You are already at a table",
+                  "table_id": T, "seat": 2}
+    s.handle_message(ws, seated_err)
+    s.handle_message(ws, dict(seated_err))  # 重复的 already_seated 不得再发任何东西
+    valid = [{"action": "fold"}, {"action": "call", "amount": 20},
+             {"action": "raise", "min": 40, "max": 2000}]
+    s.handle_message(ws, {"type": "your_turn", "hand_id": "h1", "turn_token": "tt-9", "seat": 2,
+                          "valid_actions": valid, "min_raise": 40, "max_raise": 2000})
+    if types(sent) != ["join_lobby", "join_lobby", "resync_request"]:
+        raise RuntimeError(f"[reconnect] 仍在座应只发 join + join + resync，得 {types(sent)}")
+    # last_table_seq = 断线前最后一条**事件**（12），不是重连时快照的 20。
+    if sent[2] != {"type": "resync_request", "table_id": T, "last_table_seq": 12}:
+        raise RuntimeError(f"[reconnect] resync_request 字段错: {sent[2]}")
+    s.handle_message(ws, {
+        "type": "resync_response", "role": "player", "from_table_seq": 12, "to_table_seq": 30,
+        "replayed_events": [pa(5, "fold", None, 14), pa(4, "fold", None, 13), pa(3, "fold", None, 12),
+                            pa(0, "fold", None, 15), pa(1, "call", 20, 16, stack=1980),
+                            {"type": "your_turn", "turn_token": "old", "table_seq": 17}],
+        "snapshot": {"type": "table_state", "table_id": T, "table_seq": 30, "hand_id": "h1",
+                     "street": "preflop", "board": [],
+                     "seats": [{"seat": i, "name": f"p{i}", "stack": 1980 if i in (1, 2) else 2000,
+                                "in_hand": i in (1, 2)} for i in range(6)],
+                     "hero": {"seat": 2, "hole_cards": ["Ah", "Kd"], "turn_token": "tt-9",
+                              "valid_actions": valid}}})
+    acts = [o for o in sent if o.get("type") == "action"]
+    if len(acts) != 1 or acts[0]["turn_token"] != "tt-9" or acts[0]["hand_id"] != "h1":
+        raise RuntimeError(f"[reconnect] 应按快照 token tt-9 出牌恰好一次，得 {acts}")
+    seats = [a["seat"] for a in s.state["hand"].actions]
+    if seats[:5] != [3, 4, 5, 0, 1]:
+        raise RuntimeError(f"[reconnect] 补发后动作序应为 3,4,5,0,1（去重 + 排序），得 {seats}")
+    if len(stub.transcript) != 1 or '"seat": 1, "action": "call"' not in stub.transcript[0][0]:
+        raise RuntimeError("[reconnect] advisor 应在补全历史后被问一次")
+    s.handle_message(ws, pa(0, "fold", None, 15))  # 实时流里迟到的重复事件
+    if s.counters["dup_events"] < 2 or len(s.state["hand"].actions) != len(seats):
+        raise RuntimeError(f"[reconnect] table_seq 去重失效 dup={s.counters['dup_events']}")
+    if any(o.get("type") == "leave_table" for o in sent):
+        raise RuntimeError("[reconnect] 仍在座时不得发 leave_table")
+
+    # ② resync 超时：暂存的 your_turn 由 tick 按现有历史出牌；③ resync 被拒（not_at_table）→ 进大厅、不出牌。
+    s, stub, sent, ws = mk()
+    s.handle_message(ws, {"type": "connected", "name": "me"})
+    s.handle_message(ws, {"type": "hand_start", "hand_id": "h2", "seat": 2, "dealer_seat": 0,
+                          "table_id": T, "table_seq": 5})
+    s.handle_message(ws, {"type": "hole_cards", "cards": ["7h", "2c"], "table_id": T, "table_seq": 6})
+    s.handle_message(ws, seated_err)
+    s.handle_message(ws, {"type": "your_turn", "hand_id": "h2", "turn_token": "tt-2", "seat": 2,
+                          "valid_actions": valid, "min_raise": 40, "max_raise": 2000})
+    s.resync_pending_ts -= RESYNC_WAIT_S + 1
+    s.tick()
+    if [o.get("turn_token") for o in sent if o.get("type") == "action"] != ["tt-2"]:
+        raise RuntimeError(f"[reconnect] resync 超时后应对暂存的 your_turn 出牌，得 {sent}")
+    s, stub, sent, ws = mk()
+    s.handle_message(ws, {"type": "connected", "name": "me"})
+    s.handle_message(ws, seated_err)
+    s.handle_message(ws, {"type": "your_turn", "hand_id": "h3", "turn_token": "tt-3",
+                          "valid_actions": valid})
+    s.handle_message(ws, {"type": "error", "code": "not_at_table", "message": "You are not at a table"})
+    if types(sent) != ["join_lobby", "resync_request", "join_lobby"]:
+        raise RuntimeError(f"[reconnect] resync 被拒应只重新 join、不出牌，得 {types(sent)}")
+
+    # ④ 码深漂移：只发 leave；leave 生效前的 already_seated / 新手开局不触发任何发送；
+    #   自己的 player_left 后 join 一次；随后对 leave 的 not_at_table 回执不再 join。
+    s, stub, sent, ws = mk()
+    s.handle_message(ws, {"type": "connected", "name": "me"})
+    s.handle_message(ws, {"type": "table_joined", "table_id": T, "seat": 2, "table_seq": 1})
+    s.handle_message(ws, {"type": "hand_start", "hand_id": "h4", "seat": 2, "dealer_seat": 0,
+                          "table_id": T, "table_seq": 2})
+    s.handle_message(ws, {"type": "hand_result", "hand_id": "h4", "table_id": T, "table_seq": 3,
+                          "final_stacks": {"0": 2000, "1": 1000, "2": 4000}})
+    if types(sent) != ["join_lobby", "leave_table"]:
+        raise RuntimeError(f"[reseat] 漂移应只发 leave_table，得 {types(sent)}")
+    s.handle_message(ws, seated_err)
+    s.handle_message(ws, {"type": "error", "code": "leave_pending",
+                          "message": "You will leave after the current hand"})
+    s.handle_message(ws, {"type": "hand_start", "hand_id": "h5", "seat": 2, "dealer_seat": 1,
+                          "table_id": T, "table_seq": 4})
+    if types(sent) != ["join_lobby", "leave_table"] or s.seat_state != "leaving":
+        raise RuntimeError(f"[reseat] leave 生效前不得再发消息，得 {types(sent)} {s.seat_state}")
+    s.handle_message(ws, {"type": "player_left", "seat": 4, "name": "other", "reason": "left",
+                          "table_id": T, "table_seq": 5})
+    s.handle_message(ws, {"type": "player_left", "seat": 2, "name": "me", "reason": "left",
+                          "table_id": T, "table_seq": 6})
+    s.handle_message(ws, {"type": "error", "code": "not_at_table", "message": "You are not at a table"})
+    s.handle_message(ws, {"type": "lobby_joined", "position": 1})
+    s.handle_message(ws, {"type": "table_joined", "table_id": "tbl-2", "seat": 0, "table_seq": 1})
+    if types(sent) != ["join_lobby", "leave_table", "join_lobby"] or s.seat_state != "seated":
+        raise RuntimeError(f"[reseat] 离桌确认后应 join 一次，得 {types(sent)} {s.seat_state}")
+
+    # ⑤ 关桌：不发 join（服务器自动重排），之后自己的 player_left 也不触发 join；
+    #   旧手的 hand_result（hand_id 对不上）不得挂到新手上。
+    hh_buf = io.StringIO()
+    s, stub, sent, ws = mk(hh_buf)
+    s.handle_message(ws, {"type": "connected", "name": "me"})
+    s.handle_message(ws, {"type": "hand_start", "hand_id": "h6", "seat": 1, "dealer_seat": 0,
+                          "table_id": T, "table_seq": 2})
+    s.handle_message(ws, {"type": "table_closed", "reason": "Not enough players",
+                          "table_id": T, "table_seq": 3})
+    s.handle_message(ws, {"type": "player_left", "seat": 1, "name": "me", "reason": "left",
+                          "table_id": T, "table_seq": 4})
+    s.handle_message(ws, {"type": "lobby_joined", "position": 1})
+    s.handle_message(ws, {"type": "table_joined", "table_id": "tbl-3", "seat": 3, "table_seq": 1})
+    if types(sent) != ["join_lobby"] or s.state["hand"] is not None or s.seat_state != "seated":
+        raise RuntimeError(f"[reseat] 关桌应等服务器重排、不发 join，得 {types(sent)}")
+    s.handle_message(ws, {"type": "hand_start", "hand_id": "h7", "seat": 3, "dealer_seat": 0,
+                          "table_id": "tbl-3", "table_seq": 2})
+    s.handle_message(ws, {"type": "hand_result", "hand_id": "h6", "table_id": "tbl-3",
+                          "table_seq": 3, "final_stacks": {"3": 9999, "1": 1, "2": 1}})
+    if s.counters["hh_skipped"] != 1 or hh_buf.getvalue() \
+            or any(o.get("type") == "leave_table" for o in sent):
+        raise RuntimeError("[reseat] hand_id 对不上的 hand_result 应按跳过处理、不触发漂移换座")
+
+    # ⑥ 看门狗：离桌迟迟没有 player_left → 当作已离开、join 一次；没有手的 your_turn → 安全出牌。
+    s, stub, sent, ws = mk()
+    s.handle_message(ws, {"type": "connected", "name": "me"})
+    s.handle_message(ws, {"type": "table_joined", "table_id": T, "seat": 2, "table_seq": 1})
+    s.leave(ws, "selftest")
+    s.leave_ts -= LEAVE_TIMEOUT_S + 1
+    s.watchdog_check()
+    s.watchdog_check()
+    if types(sent) != ["join_lobby", "leave_table", "join_lobby"]:
+        raise RuntimeError(f"[reseat] 离桌超时应 join 一次，得 {types(sent)}")
+    s.handle_message(ws, {"type": "your_turn", "hand_id": "hx", "turn_token": "tt-x",
+                          "valid_actions": [{"action": "fold"}, {"action": "call", "amount": 20}]})
+    s.handle_message(ws, {"type": "your_turn", "hand_id": "hy", "turn_token": "tt-y",
+                          "valid_actions": [{"action": "check"}, {"action": "bet", "min": 20}]})
+    safe = [(o["turn_token"], o["action"]) for o in sent if o.get("type") == "action"]
+    if safe != [("tt-x", "fold"), ("tt-y", "check")] or stub.transcript:
+        raise RuntimeError(f"[reseat] 没有手牌状态时应过牌 / 弃牌且不问 advisor，得 {safe}")
+    print("[selftest 5d 重连 / 换座] 仍在座 → 一次 resync、补发去重排序、按快照 token 出牌一次；"
+          "resync 超时 / 被拒；漂移等 player_left 再 join；关桌等重排；离桌超时；无手安全出牌。",
+          file=sys.stderr)
 
 
 def _selftest_short_handed():
