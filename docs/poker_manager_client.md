@@ -1,0 +1,121 @@
+# 接入本地 poker_manager 牌桌服务
+
+新增入口：`tools/poker_manager_play.py`，对应相邻项目
+`../poker_manager_20261016/` 的玩家 WebSocket `/ws`。默认六座、10/20 盲注、
+2000 买入，决策复用 `openpoker_advisor` 及现有 blueprint / 实时搜索参数。
+不需要改动服务端，也不连接 OpenPoker 平台。
+
+## 启动
+
+服务端按其 README 配置 `POKER_PLAYERS` 后启动：
+
+```bash
+cd /Users/shaopengxu/projects_202605_after/poker_manager_20261016
+npm start
+```
+
+本项目安装网络依赖、构建 advisor，然后启动玩家入口。以下 `YOUR_BLUEPRINT.ckpt`
+及 `YOUR_BUCKET_TABLE.bin` 需替换为实际文件；blueprint 座位数、reshape、postflop-cap
+和桶表必须与训练配置一致：
+
+```bash
+cd /Users/shaopengxu/projects_202605_after/dezhou_20260508
+python3 -m venv /tmp/poker-manager-client-venv
+/tmp/poker-manager-client-venv/bin/pip install websocket-client
+cargo build --release --bin openpoker_advisor
+
+# 使用服务端 POKER_PLAYERS 中分配给该玩家的 token；演示配置中 Alice 为 local-alice。
+export POKER_MANAGER_TOKEN=local-alice
+/tmp/poker-manager-client-venv/bin/python tools/poker_manager_play.py \
+  --url ws://127.0.0.1:3000/ws \
+  --checkpoint YOUR_BLUEPRINT.ckpt \
+  --bucket-table YOUR_BUCKET_TABLE.bin \
+  --seats 6 --reshape preopen --postflop-cap 3 \
+  --buy-in 2000 --num-hands 100 \
+  --action-log /tmp/poker_manager_actions.jsonl \
+  --hh-log /tmp/poker_manager_hh.jsonl \
+  --ws-log /tmp/poker_manager_ws.jsonl
+```
+
+让另外两个演示账号提供对手（不要同时用 Alice，重复连接会替换玩家会话）：
+
+```bash
+cd /Users/shaopengxu/projects_202605_after/poker_manager_20261016
+BOT_TOKENS=local-bob,local-carol npm run demo
+```
+
+浏览器打开 `http://127.0.0.1:3000/viewer` 可观察牌局。入口只连接玩家 `/ws`，
+决策数据中没有查看器提供的对手底牌。
+
+九座桌使用 `--seats 9` 和对应的九座 blueprint，服务端设置 `MAX_SEATS=9`。
+`--seats` 指桌面容量，即使只坐了三人，也须与服务端容量保持一致；不一致会停止。
+盲注按每手服务端 `hand_start.blinds` 读取，买入仅接受服务端规定的 1000–5000。
+
+裁切 blueprint 将 `--checkpoint` 换成 `--cropped-checkpoint`，并加：
+
+```bash
+--search --search-trigger all-postflop --search-time-budget-ms 5000
+```
+
+支持已有 `--search-*`、`--search-prewarm`、`--exploit on|vpip|off`、`--seed`
+及 `--debug-log` 参数，完整列表见 `python3 tools/poker_manager_play.py --help`。
+URL 也可通过 `POKER_MANAGER_URL` 配置；token 可通过 `--token`（别名 `--api-key`）传入。
+不会自动读取本项目或服务端 `.env`。
+
+## 接入约定及限制（2026-10-18）
+
+- 服务端广播的 `player_action.amount_mode=incremental`，`contribution_delta` 为本次投入。
+  入口维护每街累计投入，把 raise 转成 advisor 要求的绝对 `to`；call / all-in 使用明确增量，
+  短跟注不会按桌面最高注错误扣款。起始筹码从首个快照的 `stack + bet` 取得。
+- `community_cards.cards` 为新增公共牌，逐街追加；新街重置本街投入。
+- 只有 `your_turn` 或重同步恢复快照的 `hero.turn_token` 授权出牌。
+  普通快照及 `action_delay` 等待期间不出牌；序号跳跃不触发重同步。
+- 后台线程运行 advisor，主线程持续收消息。距离行动截止不足 0.5 秒时仍未算完，
+  优先 check，否则 fold；后到的搜索结果作废。发送前检查动作是否在服务端合法列表内，
+  raise 必须为区间内整数总额。
+- 重连用 `connected.table_id` 找回原桌，先按顺序补公共事件、再核对快照，
+  不重复扣筹码。恢复期间的实时消息暂存。相同 token 已发送的动作不重复计算；
+  重连后该 token 仍有效时，用同一 `client_action_id` 和 payload 重发。
+- 冷启动重连或公共回放被截断时，快照不足以还原整手下注历史：当前手安全 check/fold，
+  下个 `hand_start` 恢复 solver。不会用全手牌查看器补历史。
+- **现有多人 advisor 不支持本服务的标准两人局**（服务端两人局 BTN=SB，OpenPoker
+  adapter 的两人局假设 BTN=BB）。两人局标记 `fallback:standard_heads_up_unsupported`，
+  全街 check/fold；三人及以上调用 solver。入口容量参数支持 3–9，不接受两座桌。
+  这是多人入口的兼容边界，不改变本项目 heads-up 求解器的产品目标。
+- 默认完成 100 手后发 `leave_table` 退出，可用 `--num-hands` 调整。筹码用尽时结束，
+  不自动补币；余额不足、非法动作、配置不符会报错停止。鉴权失败或会话被替换不循环抢回连接。
+  意外断线默认最多连续重连 10 次，可用 `--reconnect-attempts` 调整；Ctrl-C 后由服务端释放保留座位。
+- 日志默认关闭，指定路径则追加。动作日志记录 `{req, resp, sent, decide_ms}`；WS 日志沿用
+  `{ts, conn, dir, raw}` 格式。HH 为本地 `poker_manager_hh: 1` 格式，保留服务端完整
+  `result`（含 `total_pot`、`payouts`、`final_stacks`），不能直接当作 OpenPoker AIVAT 输入。
+
+## 验证
+
+离线回归无需账号、checkpoint 或 WebSocket 依赖：
+
+```bash
+python3 -m unittest discover -s tests -p test_poker_manager_play.py -v
+cargo test --no-run
+```
+
+覆盖增量下注、短跟注 / 全下、公共牌累计、行动间隔、令牌去重、重连回放、冷启动 / 截断回放、
+超时与过期结果、人数 / 盲注参数、非法 advisor 动作、手数上限和结算日志。
+
+可选真实服务协议回归（需要 Node.js、服务端已安装 `ws`、Python 已安装 `websocket-client`，
+以及本机监听端口权限）：
+
+```bash
+POKER_MANAGER_PROJECT=/Users/shaopengxu/projects_202605_after/poker_manager_20261016 \
+  /tmp/poker-manager-client-venv/bin/python -m unittest discover \
+  -s tests -p test_poker_manager_play.py -v
+```
+
+此测试通过 `tests/common/poker_manager_server.mjs` 启动随机端口、独立测试账号的服务实例，
+运行真实入口 CLI 和测试 advisor 完成三手。它验证网络及协议，不代表 solver 棋力评测。
+
+2026-10-18 联调记录：完整 Python 回归 32 项通过；`cargo test --no-run`、
+`cargo build --release --bin openpoker_advisor`、`cargo fmt --all --check` 通过。
+另用本地六人桌 `preopen` 10B checkpoint / 200 桶表、关闭搜索完成 10 手及 26 次决策，
+无服务端 `error` / `action_rejected`、10 手筹码历史完整。其中 blueprint 18 次，
+已有 advisor 的 `blueprint_placeholder` 兜底 2 次、`structural_gap` 兜底 6 次；
+这些抽象 / 策略边界仍需按原 advisor 的搜索及训练流程处理，本次接入不改变算法。

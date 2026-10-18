@@ -13,6 +13,9 @@
 - **评测**：LBR / best-response（heads-up）、AIVAT 降方差对照、以及对 Slumbot（HUNL）与
   OpenPoker（6-max）的实测对战。
 
+本地牌桌服务 `poker_manager_20261016` 接入入口：`tools/poker_manager_play.py`，
+启动方式及协议差异见 [接入说明](docs/poker_manager_client.md)。
+
 ---
 
 ## 核心工作
