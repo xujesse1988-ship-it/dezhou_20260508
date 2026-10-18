@@ -171,6 +171,46 @@ class TableStateTests(unittest.TestCase):
         self.assertEqual(model.data["board"], [])
         self.assertEqual(model.data["hole"], [])
 
+    def test_settlement_keeps_each_winner_amount_pot_and_final_stacks(self):
+        model = TableState()
+        model.apply(snapshot(big_blind=20))
+        result = dict(type="hand_result", hand_id="h1", table_seq=3, pot=70, total_pot=200,
+                      winners=[{"seat": 2, "name": "Winner A", "amount": 50, "stack": 9999,
+                                "hand_description": "Two pair"},
+                               {"seat": 3, "amount": 20, "stack": 2020, "hand_description": None}],
+                      final_stacks={"0": 0, "2": 2050, "3": 2020})
+        model.apply(result)
+        entry = next(h for h in model.data["history"] if h["kind"] == "result")
+        saved = deepcopy(entry)
+        self.assertEqual(entry["settlement"]["pot"], 200)
+        self.assertEqual([(w["name"], w["amount"], w["hero"], w["description"])
+                          for w in entry["settlement"]["winners"]],
+                         [("Winner A", 50, False, "Two pair"), ("p3", 20, True, None)])
+        self.assertEqual([(p["seat"], p["name"], p["stack"], p["hero"])
+                          for p in entry["settlement"]["final_stacks"]],
+                         [(0, "p0", 0, False), (2, "Winner A", 2050, False), (3, "p3", 2020, True)])
+        self.assertEqual(model.data["players"][2]["stack"], 2050)
+        model.apply(result)
+        self.assertEqual(sum(h["kind"] == "result" for h in model.data["history"]), 1)
+        model.data["result"]["winners"][0]["amount"] = 999
+        model.apply(snapshot(hand="h2", table_id="table-b", hero=0, big_blind=100))
+        self.assertEqual(next(h for h in model.data["history"] if h["kind"] == "result"), saved)
+
+    def test_settlement_missing_fields_do_not_invent_chips_or_hand_types(self):
+        model = TableState()
+        model.apply(snapshot())
+        model.apply(dict(type="hand_result", hand_id="h1", table_seq=3, total_pot=None, pot=30,
+                         winners=[{"seat": 3, "stack": 1900}]))
+        result = model.data["history"][-1]["settlement"]
+        self.assertEqual(result["pot"], 30)
+        self.assertIsNone(result["winners"][0]["amount"])
+        self.assertIsNone(result["winners"][0]["description"])
+        self.assertEqual(result["final_stacks"], [{"seat": 3, "name": "p3", "stack": 1900, "hero": True}])
+        model.apply(dict(type="hand_start", hand_id="h2", table_seq=4))
+        model.apply(dict(type="hand_result", hand_id="h2", table_seq=5, total_pot=0, winners=[]))
+        result = model.data["history"][-1]["settlement"]
+        self.assertEqual(result, {"pot": 0, "winners": [], "final_stacks": []})
+
     def test_outbound_and_secrets_are_not_rendered(self):
         self.assertIsNone(normalize({"dir": "out", "raw": '{"type":"action","turn_token":"secret"}'}))
         snap = snapshot()
@@ -238,10 +278,12 @@ class LogStoreTests(unittest.TestCase):
         self.assertEqual(past["players"][2]["cards"], [])
         self.assertIsNone(past["result"])
         self.assertFalse(any(h["kind"] == "shown" for h in past["history"]))
+        self.assertFalse(any("settlement" in h for h in past["history"]))
         self.assertEqual(next(h["cards"] for h in past["history"] if h["kind"] == "hole"), ["As", "Kh"])
         self.assertEqual(store.view(142)["state"]["players"][2]["cards"], ["Ad", "Qh"])
         self.assertEqual(store.view()["state"]["hole"], [])
         self.assertEqual([h["cards"] for h in store.view()["state"]["history"] if h["kind"] == "shown"], [["Ad", "Qh"]])
+        self.assertEqual(sum("settlement" in h for h in store.view()["state"]["history"]), 1)
         self.assertEqual(store.view(0)["state"]["hole"], [])
         self.assertEqual(store.view(0)["state"]["history"], [])
 

@@ -94,11 +94,50 @@ function renderSeats(s) {
   $("seats").replaceChildren(seats); $("wagers").replaceChildren(wagers);
 }
 
+function renderSettlement(item, expanded) {
+  const result = item.settlement;
+  const panel = element("div", "settlement");
+  panel.setAttribute("aria-label", "牌局结算");
+  const amount = value => money(value, true, item.big_blind) + (useBB || value == null ? "" : " 筹码");
+  const name = p => `${p.name || `座位 ${p.seat + 1}`}${p.hero && p.name !== "Hero" ? " · Hero" : ""}`;
+  panel.append(element("strong", "settlement-title", "牌局结算"));
+  const pot = element("div", "settlement-line settlement-pot");
+  pot.append(element("span", "", "总底池"), element("strong", "", amount(result.pot)));
+  panel.append(pot);
+  for (const winner of result.winners) {
+    const row = element("div", `settlement-winner${winner.hero ? " is-hero" : ""}`);
+    row.append(element("span", "settlement-name", `赢家 · ${name(winner)}`),
+      element("strong", "settlement-award", `结算 ${amount(winner.amount)}`));
+    if (winner.description) row.append(element("span", "settlement-description", winner.description));
+    panel.append(row);
+  }
+  if (!result.winners.length) panel.append(element("span", "settlement-description", "未提供赢家信息"));
+  const hero = result.final_stacks.find(p => p.hero);
+  if (hero) {
+    const row = element("div", "settlement-line settlement-hero-stack");
+    row.append(element("span", "", "Hero 最终筹码"), element("strong", "", amount(hero.stack)));
+    panel.append(row);
+  }
+  if (result.final_stacks.length) {
+    const details = element("details", "settlement-stacks");
+    details.open = expanded;
+    details.append(element("summary", "", `最终筹码 · ${result.final_stacks.length} 人`));
+    for (const p of result.final_stacks) {
+      const row = element("div", `settlement-line${p.hero ? " is-hero" : ""}`);
+      row.append(element("span", "settlement-name", name(p)), element("strong", "", amount(p.stack)));
+      details.append(row);
+    }
+    panel.append(details);
+  }
+  return panel;
+}
+
 function renderHistory(s) {
   const signature = JSON.stringify([s.history, s.hand_id, s.table_id, s.hand_number, useBB]);
   if (signature === historySignature) return;
   historySignature = signature;
   const root = $("history"), top = root.getBoundingClientRect().top;
+  const expanded = new Set([...root.querySelectorAll("details[open]")].map(el => el.closest("[data-entry]").dataset.entry));
   // Keep the reader's place when new events arrive above an older hand.
   const anchor = root.scrollTop > 2 ? [...root.querySelectorAll("[data-entry]")].find(row => row.getBoundingClientRect().bottom > top) : null;
   const anchorKey = anchor?.dataset.entry, anchorOffset = anchor ? anchor.getBoundingClientRect().top - top : 0;
@@ -122,6 +161,12 @@ function renderHistory(s) {
       const li = element("li", item.hero ? "hero-row" : "");
       li.dataset.entry = `${key}:${items.length - i}`;
       li.dataset.kind = item.kind;
+      if (item.settlement) {
+        li.classList.add("settlement-entry");
+        li.append(renderSettlement(item, expanded.has(li.dataset.entry)));
+        entries.append(li);
+        return;
+      }
       const text = element("span", "history-detail");
       const named = ["action", "hole", "shown"].includes(item.kind);
       const name = named ? item.name || (item.hero ? "Hero" : `座位 ${item.seat + 1}`) : streetNames[item.street] || "牌局";

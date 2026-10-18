@@ -87,7 +87,7 @@ class TableState:
                          small_blind=10, big_blind=20, connection="waiting", notice="等待牌局日志",
                          history=[], result=None, ts=None)
 
-    def log(self, kind, text, seat=None, amount=None, visible_cards=None, street=None, name=None):
+    def log(self, kind, text, seat=None, amount=None, visible_cards=None, street=None, name=None, settlement=None):
         d = self.data
         if not d["hand_id"]:
             return
@@ -99,6 +99,8 @@ class TableState:
                                   street=street or d["street"], cards=list(visible_cards or []),
                                   name=name, hero=is_hero, big_blind=d["big_blind"],
                                   hand_id=d["hand_id"], hand_number=d["hand_number"], table_id=d["table_id"]))
+        if settlement is not None:
+            d["history"][-1]["settlement"] = deepcopy(settlement)
 
     def log_cards(self, kind, text, values, seat=None, street=None):
         values = cards(values)
@@ -348,20 +350,35 @@ class TableState:
                             p[key] = old[key]
             d["actor_seat"] = None
             d["street"] = "showdown"
-            d["result"] = {"winners": [], "pot": m.get("total_pot", m.get("pot", d["pot"]))}
+            pot = next((value for key in ("total_pot", "pot")
+                        if (value := number(m.get(key))) is not None), d["pot"])
+            d["result"] = {"winners": [], "pot": pot, "final_stacks": []}
             d["pot"] = d["result"]["pot"]
+            final = {}
             for s, stack in (m.get("final_stacks") or {}).items():
                 p = self.get_player(int(s)) if str(s).isdigit() else None
                 if p and number(stack) is not None:
                     p["stack"] = stack
+                    final[p["seat"]] = {"seat": p["seat"], "name": p["name"], "stack": stack,
+                                        "hero": p["seat"] == d["hero_seat"]}
             for p in d["players"]:
                 p["bet"] = 0
             for winner in m.get("winners") or []:
                 p = self.get_player(winner.get("seat"))
                 if p:
                     p["winner"] = True
-                    d["result"]["winners"].append({"seat": p["seat"], "name": winner.get("name") or p["name"],
-                                                    "amount": winner.get("amount"), "description": winner.get("hand_description")})
+                    name = winner.get("name") or p["name"]
+                    is_hero = p["seat"] == d["hero_seat"]
+                    if p["seat"] not in final and number(winner.get("stack")) is not None:
+                        p["stack"] = winner["stack"]
+                        final[p["seat"]] = {"seat": p["seat"], "name": name, "stack": p["stack"], "hero": is_hero}
+                    if p["seat"] in final:
+                        final[p["seat"]]["name"] = name
+                    description = winner.get("hand_description")
+                    d["result"]["winners"].append({"seat": p["seat"], "name": name, "hero": is_hero,
+                                                    "amount": number(winner.get("amount")),
+                                                    "description": description if isinstance(description, str) else None})
+            d["result"]["final_stacks"] = [final[s] for s in sorted(final)]
             shown = m.get("shown_cards") or {}
             if isinstance(shown, dict):
                 for s, hole in shown.items():
@@ -369,7 +386,7 @@ class TableState:
                     if p:
                         p["cards"] = cards(hole)[:2]
                         self.log_cards("shown", "亮牌", p["cards"], seat=p["seat"], street="showdown")
-            self.log("result", "本手结束")
+            self.log("result", "本手结束", settlement=d["result"])
         elif t == "error":
             d["notice"] = "服务端：" + str(m.get("code", "error"))[:80]
 

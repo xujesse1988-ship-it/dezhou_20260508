@@ -846,6 +846,73 @@ input[type=range] {
 .history-cards .card .suit {
   font-size:12px;
 }
+.history li.settlement-entry {
+  display:block;
+}
+.settlement {
+  padding:10px;
+  border:1px solid #39524b;
+  border-radius:7px;
+  background:#1b2c29;
+  font-size:10px;
+  line-height:1.6;
+}
+.settlement-title {
+  color:var(--gold);
+  font-size:11px;
+}
+.settlement-line {
+  display:flex;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:3px 8px;
+  margin-top:5px;
+}
+.settlement-line strong {
+  font-weight:500;
+  white-space:nowrap;
+}
+.settlement-pot {
+  color:var(--muted);
+  margin-bottom:9px;
+}
+.settlement-winner {
+  padding:7px 0;
+  border-top:1px solid #39524b;
+}
+.settlement-name {
+  overflow-wrap:anywhere;
+}
+.settlement-winner .settlement-name,
+.settlement-award,
+.settlement-description {
+  display:block;
+}
+.settlement-award {
+  color:var(--green);
+  font-weight:500;
+}
+.settlement-description {
+  color:var(--muted);
+  overflow-wrap:anywhere;
+}
+.settlement .is-hero .settlement-name,
+.settlement-hero-stack {
+  color:var(--gold);
+}
+.settlement-stacks {
+  border-top:1px solid #39524b;
+  padding-top:7px;
+  margin-top:9px;
+}
+.settlement-stacks summary {
+  cursor:pointer;
+  color:var(--muted);
+}
+.settlement-stacks summary:focus-visible {
+  outline:1px solid var(--gold);
+  outline-offset:3px;
+}
 .source-note {
   display:flex;
   gap:4px;
