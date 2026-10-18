@@ -116,6 +116,61 @@ class TableStateTests(unittest.TestCase):
         model.apply(snapshot(seq=1, hero=0))
         self.assertEqual(model.data, before)
 
+    def test_activity_keeps_all_events_in_latest_five_hands(self):
+        model = TableState()
+        for hand in range(1, 8):
+            model.apply(snapshot(hand=f"h{hand}", seq=hand * 100))
+            for action in range(45):
+                model.apply(dict(type="player_action", hand_id=f"h{hand}", seat=3,
+                                 table_seq=hand * 100 + action + 1, action="check"))
+        history = model.data["history"]
+        self.assertEqual({h["hand_id"] for h in history}, {"h3", "h4", "h5", "h6", "h7"})
+        for hand in range(3, 8):
+            entries = [h for h in history if h["hand_id"] == f"h{hand}"]
+            self.assertEqual(sum(h["kind"] == "action" for h in entries), 45)
+            self.assertEqual(next(h["cards"] for h in entries if h["kind"] == "hole"), ["As", "Kh"])
+            self.assertEqual(entries[0]["hand_number"], hand)
+
+    def test_activity_preserves_identity_and_units_across_tables(self):
+        model = TableState()
+        model.apply(snapshot(big_blind=20))
+        model.apply(dict(type="player_action", seat=3, action="bet", amount=100, table_seq=3))
+        old_history = deepcopy(model.data["history"])
+        model.apply(snapshot(hand="h2", table_id="table-b", hero=1, big_blind=100))
+        self.assertEqual(model.data["history"][:len(old_history)], old_history)
+        action = next(h for h in model.data["history"] if h["kind"] == "action")
+        self.assertEqual((action["name"], action["hero"], action["big_blind"]), ("p3", True, 20))
+        self.assertEqual((action["table_id"], action["hand_id"]), ("table-a", "h1"))
+        self.assertEqual(model.data["hand_number"], 2)
+        self.assertEqual(model.data["hero_seat"], 1)
+
+    def test_activity_records_cards_once_per_street_and_only_observed_reveals(self):
+        model = TableState()
+        model.apply(snapshot())
+        model.apply(dict(type="hole_cards", hand_id="h1", cards=["As", "Kh"]))
+        model.apply(snapshot(seq=3))
+        model.apply(dict(type="community_cards", table_seq=4, street="flop", cards=["Ah", "7s", "2c"]))
+        model.apply(dict(type="community_cards", table_seq=5, street="turn", cards=["4d"]))
+        model.apply(snapshot(seq=6, street="turn", board=["Ah", "7s", "2c", "4d"]))
+        model.apply(dict(type="your_turn", table_seq=7, seat=3,
+                         community_cards=["Ah", "7s", "2c", "4d", "9h"]))
+        model.apply(dict(type="community_cards", table_seq=8, street="river", cards=["9h"]))
+        history = model.data["history"]
+        self.assertEqual(sum(h["kind"] == "hole" for h in history), 1)
+        boards = [h for h in history if h["kind"] == "board"]
+        self.assertEqual([(h["street"], len(h["cards"])) for h in boards], [("flop", 3), ("turn", 4), ("river", 5)])
+        self.assertEqual(boards[-1]["cards"], ["Ah", "7s", "2c", "4d", "9h"])
+        self.assertFalse(any(h["kind"] == "shown" for h in history))
+        model.apply(dict(type="hand_result", hand_id="h1", table_seq=9,
+                         shown_cards={"2": ["Ad", "Qh"], "3": ["As", "Kh"]}))
+        model.apply(dict(type="hand_start", hand_id="h2", table_seq=10, seat=3))
+        shown = [h for h in model.data["history"] if h["kind"] == "shown"]
+        self.assertEqual([(h["name"], h["cards"], h["hero"]) for h in shown],
+                         [("p2", ["Ad", "Qh"], False), ("p3", ["As", "Kh"], True)])
+        self.assertTrue(all(h["hand_id"] == "h1" and h["street"] == "showdown" for h in shown))
+        self.assertEqual(model.data["board"], [])
+        self.assertEqual(model.data["hole"], [])
+
     def test_outbound_and_secrets_are_not_rendered(self):
         self.assertIsNone(normalize({"dir": "out", "raw": '{"type":"action","turn_token":"secret"}'}))
         snap = snapshot()
@@ -182,9 +237,13 @@ class LogStoreTests(unittest.TestCase):
         self.assertEqual(past["hole"], ["As", "Kh"])
         self.assertEqual(past["players"][2]["cards"], [])
         self.assertIsNone(past["result"])
+        self.assertFalse(any(h["kind"] == "shown" for h in past["history"]))
+        self.assertEqual(next(h["cards"] for h in past["history"] if h["kind"] == "hole"), ["As", "Kh"])
         self.assertEqual(store.view(142)["state"]["players"][2]["cards"], ["Ad", "Qh"])
         self.assertEqual(store.view()["state"]["hole"], [])
+        self.assertEqual([h["cards"] for h in store.view()["state"]["history"] if h["kind"] == "shown"], [["Ad", "Qh"]])
         self.assertEqual(store.view(0)["state"]["hole"], [])
+        self.assertEqual(store.view(0)["state"]["history"], [])
 
     def test_demo_replays_to_consistent_chip_totals(self):
         store = LogStore(Path(__file__).resolve().parents[1] / "table_player/demo.jsonl")

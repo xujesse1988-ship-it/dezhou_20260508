@@ -87,10 +87,35 @@ class TableState:
                          small_blind=10, big_blind=20, connection="waiting", notice="等待牌局日志",
                          history=[], result=None, ts=None)
 
-    def log(self, kind, text, seat=None, amount=None):
-        self.data["history"].append(dict(kind=kind, text=text, seat=seat, amount=amount,
-                                         street=self.data["street"]))
-        self.data["history"] = self.data["history"][-40:]
+    def log(self, kind, text, seat=None, amount=None, visible_cards=None, street=None, name=None):
+        d = self.data
+        if not d["hand_id"]:
+            return
+        p = next((p for p in d["players"] if p["seat"] == seat), None)
+        is_hero = seat is not None and seat == d["hero_seat"]
+        # Freeze identity and units at observation time; seats can change next hand.
+        name = name or (p["name"] if p else None) or (d["hero_name"] if is_hero else None)
+        d["history"].append(dict(kind=kind, text=text, seat=seat, amount=amount,
+                                  street=street or d["street"], cards=list(visible_cards or []),
+                                  name=name, hero=is_hero, big_blind=d["big_blind"],
+                                  hand_id=d["hand_id"], hand_number=d["hand_number"], table_id=d["table_id"]))
+
+    def log_cards(self, kind, text, values, seat=None, street=None):
+        values = cards(values)
+        if not values:
+            return
+        street = street or self.data["street"]
+        if any(h["hand_number"] == self.data["hand_number"] and h["kind"] == kind
+               and h["seat"] == seat and h["cards"] == values
+               and (kind != "board" or h["street"] == street) for h in self.data["history"]):
+            return
+        self.log(kind, text, seat=seat, visible_cards=values, street=street)
+
+    def log_board(self):
+        board = self.data["board"]
+        street = {3: "flop", 4: "turn", 5: "river"}.get(len(board))
+        if street:
+            self.log_cards("board", "公共牌", board, street=street)
 
     def get_player(self, seat):
         seat = seat_id(seat)
@@ -107,7 +132,9 @@ class TableState:
             return
         self.last_active = None
         d.update(hand_id=hand_id, hand_number=d["hand_number"] + 1, hole=[], board=[],
-                 pot=0, street="preflop", actor_seat=None, result=None, history=[])
+                 pot=0, street="preflop", actor_seat=None, result=None)
+        # Include the current hand plus the previous four, preserving all their events.
+        d["history"] = [h for h in d["history"] if h["hand_number"] > d["hand_number"] - 5]
         for p in d["players"]:
             p.update(bet=0, in_hand=False, folded=False, cards=[], last_action=None, winner=False)
         self.log("hand", "新的一手")
@@ -172,10 +199,10 @@ class TableState:
         if tid and tid != d["table_id"]:
             if d["table_id"] and t not in ("table_joined", "table_state", "hand_start"):
                 return
-            name, count = d["hero_name"], d["hand_number"]
+            name, count, history = d["hero_name"], d["hand_number"], d["history"]
             self.__init__(self.default_seats, self.default_hero)
             d = self.data
-            d.update(table_id=tid, hero_name=name, hand_number=count)
+            d.update(table_id=tid, hero_name=name, hand_number=count, history=history)
         seq = m.get("table_seq")
         if isinstance(seq, int):
             if t == "table_state":
@@ -214,7 +241,7 @@ class TableState:
             # OpenPoker can send its idle/empty-board snapshot BEFORE hand_result.
             # Keep the last active board to show that result without future leakage.
             if m.get("street") == "idle" and d["street"] not in ("idle", "showdown"):
-                self.last_active = deepcopy(d)
+                self.last_active = {k: deepcopy(d[k]) for k in ("hand_id", "board", "players")}
             self.street(m.get("street"))
             d["board"] = cards(m.get("board"))
             if number(m.get("pot")) is not None:
@@ -236,12 +263,15 @@ class TableState:
             self.set_hero(hero.get("seat"))
             if "hole_cards" in hero:
                 d["hole"] = cards(hero["hole_cards"])[:2]
+                self.log_cards("hole", "Hero 手牌", d["hole"], seat=d["hero_seat"])
+            self.log_board()
         elif t == "hole_cards":
             if not m.get("hand_id") or m["hand_id"] == d["hand_id"]:
                 d["hole"] = cards(m.get("cards"))[:2]
                 p = self.get_player(d["hero_seat"])
                 if p:
                     p["in_hand"] = True
+                self.log_cards("hole", "Hero 手牌", d["hole"], seat=d["hero_seat"])
         elif t == "player_joined":
             self.merge_player(m)
         elif t == "player_left":
@@ -259,7 +289,7 @@ class TableState:
                 expected = {"flop": 3, "turn": 4, "river": 5}.get(d["street"], 0)
                 if len(d["board"]) < expected:
                     d["board"] = (d["board"] + incoming)[:expected]
-            self.log("board", " ".join(d["board"]))
+            self.log_board()
         elif t == "your_turn" and not stale:
             self.new_hand(m.get("hand_id"))
             self.set_hero(m.get("seat"))
@@ -271,13 +301,14 @@ class TableState:
                 d["pot"] = m["pot"]
             for p in m.get("players") or []:
                 self.merge_player(p)
+            self.log_board()
         elif t == "player_action":
             p = self.get_player(m.get("seat"))
             if p is None or (m.get("hand_id") and m["hand_id"] != d["hand_id"]):
                 return
             action = m.get("action", "")
             amount = m.get("contribution_delta") if action in ("call", "all_in") else m.get("amount")
-            self.log("action", action, p["seat"], number(amount))
+            self.log("action", action, p["seat"], number(amount), name=m.get("name"))
             if stale:
                 return
             # Closing actions may be labelled with the NEXT street. Board events and
@@ -337,6 +368,7 @@ class TableState:
                     p = self.get_player(int(s)) if str(s).isdigit() else None
                     if p:
                         p["cards"] = cards(hole)[:2]
+                        self.log_cards("shown", "亮牌", p["cards"], seat=p["seat"], street="showdown")
             self.log("result", "本手结束")
         elif t == "error":
             d["notice"] = "服务端：" + str(m.get("code", "error"))[:80]

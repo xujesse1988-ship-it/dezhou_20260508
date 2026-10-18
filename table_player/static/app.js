@@ -6,6 +6,7 @@ const actionNames = {fold: "弃牌", check: "过牌", call: "跟注", raise: "�
 const suits = {s: "♠", h: "♥", d: "♦", c: "♣"};
 let source = null, liveSource = null, following = true, playing = false, useBB = false;
 let current = null, timer = null, requestId = 0, controller = null, generation = null;
+let historySignature = "";
 
 function element(tag, cls, text) {
   const el = document.createElement(tag);
@@ -25,9 +26,9 @@ function card(code, hidden = false) {
   return el;
 }
 
-function money(value, suffix = false) {
+function money(value, suffix = false, bigBlind = null) {
   if (value === null || value === undefined) return "—";
-  const bb = current?.state.big_blind || 20;
+  const bb = bigBlind || current?.state.big_blind || 20;
   return (useBB ? Number((value / bb).toFixed(1)).toLocaleString() : Number(value).toLocaleString()) + (suffix && useBB ? " BB" : "");
 }
 
@@ -93,6 +94,59 @@ function renderSeats(s) {
   $("seats").replaceChildren(seats); $("wagers").replaceChildren(wagers);
 }
 
+function renderHistory(s) {
+  const signature = JSON.stringify([s.history, s.hand_id, s.table_id, s.hand_number, useBB]);
+  if (signature === historySignature) return;
+  historySignature = signature;
+  const root = $("history"), top = root.getBoundingClientRect().top;
+  // Keep the reader's place when new events arrive above an older hand.
+  const anchor = root.scrollTop > 2 ? [...root.querySelectorAll("[data-entry]")].find(row => row.getBoundingClientRect().bottom > top) : null;
+  const anchorKey = anchor?.dataset.entry, anchorOffset = anchor ? anchor.getBoundingClientRect().top - top : 0;
+  const groups = new Map();
+  for (const item of s.history) {
+    const key = `${item.table_id}:${item.hand_number}:${item.hand_id}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  const history = document.createDocumentFragment();
+  for (const [key, items] of [...groups].reverse()) {
+    const hand = items[0], finished = items.some(item => item.kind === "result");
+    const isCurrent = hand.hand_number === s.hand_number && hand.hand_id === s.hand_id && hand.table_id === s.table_id;
+    const section = element("section", "history-hand");
+    section.dataset.hand = key;
+    const heading = element("h3", "history-hand-heading");
+    heading.title = `${hand.table_id || ""} / ${hand.hand_id}`;
+    heading.append(element("span", "", `第 ${String(hand.hand_number).padStart(3, "0")} 局`), element("span", "history-hand-status", finished ? "已结束" : isCurrent ? "当前局" : "记录中断"));
+    const entries = element("ol", "history-events");
+    [...items].reverse().forEach((item, i) => {
+      const li = element("li", item.hero ? "hero-row" : "");
+      li.dataset.entry = `${key}:${items.length - i}`;
+      li.dataset.kind = item.kind;
+      const text = element("span", "history-detail");
+      const named = ["action", "hole", "shown"].includes(item.kind);
+      const name = named ? item.name || (item.hero ? "Hero" : `座位 ${item.seat + 1}`) : streetNames[item.street] || "牌局";
+      text.append(element("span", "history-name", name), element("span", "history-action", actionNames[item.text] || item.text));
+      if (item.cards?.length) {
+        const handCards = element("span", "history-cards");
+        handCards.setAttribute("aria-label", `${name} ${item.text}`);
+        handCards.append(...item.cards.map(code => card(code)));
+        text.append(handCards);
+      }
+      li.append(element("span", "history-number", String(items.length - i).padStart(2, "0")), text, element("span", "history-amount", item.amount === null ? "" : money(item.amount, true, item.big_blind)));
+      entries.append(li);
+    });
+    section.append(heading, entries);
+    history.append(section);
+  }
+  if (!s.history.length) history.append(element("p", "history-empty", "牌局开始后，行动、手牌、公共牌和亮牌会显示在这里。"));
+  root.replaceChildren(history);
+  if (anchorKey) {
+    const restored = [...root.querySelectorAll("[data-entry]")].find(row => row.dataset.entry === anchorKey);
+    if (restored) root.scrollTop += restored.getBoundingClientRect().top - top - anchorOffset;
+  }
+  $("action-count").textContent = `最近 ${groups.size} 局`;
+}
+
 function render(data) {
   current = data;
   const {state: s, meta: m} = data;
@@ -119,17 +173,7 @@ function render(data) {
   $("hero-bet").textContent = money(hero?.bet, true);
   $("hero-status").textContent = hero?.winner ? "本手获胜" : hero?.folded ? "本手已弃牌 · 保留自己的手牌" : s.hero_seat !== null && s.actor_seat === s.hero_seat ? "轮到 Hero 行动" : s.hole.length ? "你的手牌始终可见" : "收到发牌事件后显示手牌";
   $("hero-status").classList.toggle("active", s.hero_seat !== null && s.actor_seat === s.hero_seat);
-  const history = document.createDocumentFragment();
-  [...s.history].reverse().forEach((item, i) => {
-    const li = element("li", item.seat === s.hero_seat ? "hero-row" : "");
-    const text = element("span");
-    text.append(element("span", "history-name", item.kind === "action" ? s.players[item.seat]?.name || `座位 ${item.seat + 1}` : streetNames[item.street] || "牌局"), element("span", "history-action", actionNames[item.text] || item.text));
-    li.append(element("span", "history-number", String(s.history.length - i).padStart(2, "0")), text, element("span", "history-amount", item.amount === null ? "" : money(item.amount, true)));
-    history.append(li);
-  });
-  if (!s.history.length) history.append(element("li", "history-empty", "牌局开始后，行动记录会显示在这里。"));
-  $("history").replaceChildren(history);
-  $("action-count").textContent = `${s.history.length} 条`;
+  renderHistory(s);
   $("timeline").max = m.total; $("timeline").value = m.cursor;
   $("cursor-label").textContent = `${m.cursor} / ${m.total}`;
   $("event-time").textContent = timeValue(s.ts)?.toLocaleTimeString("zh-CN", {hour12: false}) || "--:--:--";

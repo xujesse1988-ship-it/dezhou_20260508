@@ -799,6 +799,53 @@ input[type=range] {
 .history li.hero-row .history-name {
   color:var(--gold);
 }
+.history-hand + .history-hand {
+  margin-top:18px;
+}
+.history-hand-heading {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:8px;
+  margin:0;
+  padding:8px 0;
+  border-bottom:1px solid var(--line);
+  color:var(--gold);
+  font-size:11px;
+  font-weight:500;
+}
+.history-hand-status {
+  color:var(--muted);
+  font-size:9px;
+  font-weight:400;
+}
+.history-events {
+  list-style:none;
+  margin:0;
+  padding:0;
+}
+.history-detail {
+  min-width:0;
+}
+.history-cards {
+  display:flex;
+  flex-wrap:wrap;
+  gap:4px;
+  margin-top:7px;
+}
+.history-cards .card {
+  width:23px;
+  height:34px;
+  padding:3px;
+  border-radius:3px;
+  box-shadow:none;
+}
+.history-cards .card .rank {
+  font-size:14px;
+}
+.history-cards .card .suit {
+  font-size:12px;
+}
 .source-note {
   display:flex;
   gap:4px;
@@ -1273,6 +1320,14 @@ input[type=range] {
   }
   .history-amount {
     display:none;
+  }
+  .history-cards {
+    gap:3px;
+  }
+  .history-cards .card {
+    width:20px;
+    height:31px;
+    padding:2px;
   }
   .page-footer {
     font-size:7px;
