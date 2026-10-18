@@ -100,7 +100,7 @@ def add_advisor_args(p, default_seats, debug_help):
                         "需配 --search --search-trigger all-postflop")
     p.add_argument("--seats", type=int, default=default_seats, choices=range(3, 10),
                    metavar="{3..9}",
-                   help=f"桌面座位数 = advisor solver 座位数（blueprint 须同座位数训练；默认 {default_seats}）")
+                   help=f"advisor / blueprint 座位数（实际牌桌人数支持范围由入口确定；默认 {default_seats}）")
     p.add_argument("--bucket-table", required=True)
     p.add_argument("--reshape", default="preopen")
     p.add_argument("--postflop-cap", type=int, default=3)

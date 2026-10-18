@@ -19,7 +19,7 @@ POKER_MANAGER_TOKEN=你的本地牌桌玩家token
 POKER_MANAGER_URL=ws://127.0.0.1:3000/ws
 ```
 
-环境变量优先；不读取 OpenPoker 的 `API_KEY`。服务端须配置 `MAX_SEATS=9`。
+环境变量优先；不读取 OpenPoker 的 `API_KEY`。九座模型可接入服务端容量不超过九座的牌桌。
 使用已安装 `websocket-client` 的 Python 从任意目录启动：
 
 ```bash
@@ -86,8 +86,9 @@ BOT_TOKENS=local-bob,local-carol npm run demo
 浏览器打开 `http://127.0.0.1:3000/viewer` 可观察牌局。入口只连接玩家 `/ws`，
 决策数据中没有查看器提供的对手底牌。
 
-九座桌使用 `--seats 9` 和对应的九座 blueprint，服务端设置 `MAX_SEATS=9`。
-`--seats` 指桌面容量，即使只坐了三人，也须与服务端容量保持一致；不一致会停止。
+`--seats` 指模型座位数，必须与 blueprint 一致。`--seats 9` 可接入服务端 2–9 座牌桌，
+例如六座桌无需改成九座：请求仍使用九座模型空间，`dealt_seats` 只包含实际发牌座位，
+由 advisor 复用短桌幻影座映射。服务端容量超过模型座位数或座位编号越界时停止。
 盲注按每手服务端 `hand_start.blinds` 读取，买入仅接受服务端规定的 1000–5000。
 
 裁切 blueprint 将 `--checkpoint` 换成 `--cropped-checkpoint`，并加：
@@ -120,7 +121,7 @@ URL 也可通过 `POKER_MANAGER_URL` 配置；token 可通过 `--token`（别名
   下个 `hand_start` 恢复 solver。不会用全手牌查看器补历史。
 - **现有多人 advisor 不支持本服务的标准两人局**（服务端两人局 BTN=SB，OpenPoker
   adapter 的两人局假设 BTN=BB）。两人局标记 `fallback:standard_heads_up_unsupported`，
-  全街 check/fold；三人及以上调用 solver。入口容量参数支持 3–9，不接受两座桌。
+  全街 check/fold；三人及以上调用 solver。模型参数支持 3–9，服务端两座桌可接入但走此兜底。
   这是多人入口的兼容边界，不改变本项目 heads-up 求解器的产品目标。
 - 默认完成 100 手后发 `leave_table` 退出，可用 `--num-hands` 调整。筹码用尽时结束，
   不自动补币；余额不足、非法动作、配置不符会报错停止。鉴权失败或会话被替换不循环抢回连接。
@@ -151,7 +152,7 @@ POKER_MANAGER_PROJECT=/Users/shaopengxu/projects_202605_after/poker_manager_2026
 ```
 
 此测试通过 `tests/common/poker_manager_server.mjs` 启动随机端口、独立测试账号的服务实例，
-运行真实入口 CLI 和测试 advisor 完成三手。它验证网络及协议，不代表 solver 棋力评测。
+运行真实入口 CLI 和九座测试 advisor，在六座服务端完成三手。它验证网络及协议，不代表 solver 棋力评测。
 
 2026-10-18 联调记录：完整 Python 回归 32 项通过；`cargo test --no-run`、
 `cargo build --release --bin openpoker_advisor`、`cargo fmt --all --check` 通过。
@@ -159,3 +160,10 @@ POKER_MANAGER_PROJECT=/Users/shaopengxu/projects_202605_after/poker_manager_2026
 无服务端 `error` / `action_rejected`、10 手筹码历史完整。其中 blueprint 18 次，
 已有 advisor 的 `blueprint_placeholder` 兜底 2 次、`structural_gap` 兜底 6 次；
 这些抽象 / 策略边界仍需按原 advisor 的搜索及训练流程处理，本次接入不改变算法。
+
+### 2026-10-18 座位容量修订
+
+初版误将 `--seats` 与服务端快照容量要求为严格相等，导致九座模型不能进入六座桌。
+修订为服务端容量不超过模型座位数即可；与 OpenPoker driver 一样，在模型空间中保留
+真实座位编号及 `dealt_seats`，额外空位只补起始栈占位，不伪造发牌玩家或动作。
+回归验证六座快照与额外三个空位的九座快照生成完全相同的 advisor 请求，并保留标准两人局的明确兜底。

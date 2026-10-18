@@ -31,6 +31,12 @@ def valid_actions(message):
             "max_raise": raise_action.get("max")}
 
 
+def table_fits_model(seats, n_seats):
+    """服务端连续座位可嵌入更大的模型；未发牌位置由 dealt_seats 排除。"""
+    return (2 <= len(seats) <= n_seats
+            and {p.get("seat") for p in seats} == set(range(len(seats))))
+
+
 class ManagerHand:
     """仅从亲收的 hand_start + 首个快照建局，使用服务端明确的增量更新历史。"""
 
@@ -57,7 +63,7 @@ class ManagerHand:
         if self.invalid:
             return
         seats = message["seats"]
-        if len(seats) != self.n_seats:
+        if not table_fits_model(seats, self.n_seats):
             raise ValueError(f"--seats={self.n_seats}, server seats={len(seats)}")
         if not self.starts:
             if self.actions or message["street"] != "preflop":
@@ -296,7 +302,7 @@ class ManagerSession:
 
     def _snapshot(self, m):
         self.my_seat = m.get("hero", {}).get("seat", self.my_seat)
-        if len(m["seats"]) != self.n_seats:
+        if not table_fits_model(m["seats"], self.n_seats):
             self.fail(f"--seats={self.n_seats}, server seats={len(m['seats'])}")
             return
         if self.hand and self.hand.id == m.get("hand_id") and m["street"] != "idle":

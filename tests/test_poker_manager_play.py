@@ -199,6 +199,51 @@ class ManagerTests(unittest.TestCase):
         callbacks[-1]({"action": "call"}, 1000)
         self.assertEqual(len(sent), count)
 
+    def test_six_seat_table_matches_nine_seat_table_with_empty_extra_seats(self):
+        requests = []
+        for capacity in (6, 9):
+            advisor = Advisor()
+            session = ManagerSession(DecisionWorker(advisor, sync=True), n_seats=9)
+            sent = []
+            session.attach(sent.append)
+            session.handle(event("hand_start", 2, seat=1, dealer_seat=0,
+                                 blinds={"small_blind": 10, "big_blind": 20}))
+            session.handle(snapshot(n=capacity, dealt=tuple(range(6))))
+            for message in (action(5, 3, "raise", 40), action(6, 4, "call", 40),
+                            action(7, 5, "fold", 0), action(8, 0, "call", 40)):
+                session.handle(message)
+            session.handle(turn())
+            self.assertFalse(session.done, session.error)
+            self.assertEqual(sent[-1]["action"], "call")
+            requests.append(advisor.requests[-1])
+        self.assertEqual(requests[0], requests[1])
+        self.assertEqual(requests[0]["num_seats"], 9)
+        self.assertEqual(requests[0]["stacks"], [2000] * 9)
+        self.assertEqual(requests[0]["dealt_seats"], list(range(6)))
+
+    def test_two_seat_table_is_accepted_with_explicit_hu_fallback(self):
+        advisor = Advisor()
+        session = ManagerSession(DecisionWorker(advisor, sync=True), n_seats=9)
+        sent = []
+        session.attach(sent.append)
+        session.handle(event("hand_start", 2, seat=1, dealer_seat=0,
+                             blinds={"small_blind": 10, "big_blind": 20}))
+        snap = snapshot(n=2, dealt=(0, 1))
+        snap["seats"][0].update(stack=1990, bet=10)
+        snap["seats"][1].update(stack=1980, bet=20)
+        session.handle(snap)
+        session.handle(turn())
+        self.assertFalse(session.done)
+        self.assertFalse(advisor.requests)
+        self.assertEqual(sent[-1]["action"], "fold")
+
+    def test_out_of_range_server_seat_is_rejected(self):
+        session, _, _ = self.session()
+        snap = snapshot()
+        snap["seats"][-1]["seat"] = 8
+        session.handle(snap)
+        self.assertTrue(session.done)
+
     def test_illegal_raise_is_not_sent_and_integral_raise_is_integer(self):
         for amount, expected in [(60.5, "fold"), (60.0, "raise"), (9999, "fold")]:
             session, _, sent = self.session({"action": "raise", "amount": amount})
@@ -245,7 +290,7 @@ class ManagerLiveTests(unittest.TestCase):
                 stub = directory / "advisor"
                 stub.write_text(f"#!{sys.executable}\n" + textwrap.dedent('''\
                     import json, sys
-                    print(json.dumps({"ready": True, "n_seats": 6}), flush=True)
+                    print(json.dumps({"ready": True, "n_seats": 9}), flush=True)
                     for line in sys.stdin:
                         req = json.loads(line)
                         v = req["valid"]
@@ -257,6 +302,7 @@ class ManagerLiveTests(unittest.TestCase):
                 completed = subprocess.run([sys.executable, str(root / "tools/poker_manager_play.py"),
                     "--url", f"ws://127.0.0.1:{port}/ws", "--token", "test-hero",
                     "--advisor-bin", str(stub), "--checkpoint", "stub", "--bucket-table", "stub",
+                    "--seats", "9",
                     "--num-hands", "3", "--action-log", str(actions), "--hh-log", str(hands)],
                     capture_output=True, text=True, timeout=30)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -266,6 +312,8 @@ class ManagerLiveTests(unittest.TestCase):
                 self.assertTrue(all(h["complete"] and len(h["board"]) == 5 for h in history))
                 self.assertGreater(len(decisions), 6)
                 self.assertTrue(all(d["resp"]["source"] == "test" for d in decisions), completed.stderr)
+                self.assertTrue(all(d["req"]["num_seats"] == 9 and len(d["req"]["stacks"]) == 9
+                                    and d["req"]["dealt_seats"] == [0, 1, 2] for d in decisions))
                 self.assertTrue(any(a["action"] == "raise" for d in decisions for a in d["req"]["actions"]))
         finally:
             server.terminate()
