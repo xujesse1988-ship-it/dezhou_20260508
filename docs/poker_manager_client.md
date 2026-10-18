@@ -5,6 +5,45 @@
 2000 买入，决策复用 `openpoker_advisor` 及现有 blueprint / 实时搜索参数。
 不需要改动服务端，也不连接 OpenPoker 平台。
 
+## 九座启动脚本（2026-10-18）
+
+`scripts/poker_manager_live/launch.py` 与同目录 `args.json` 参考
+`artifacts/openpoker_live_20261018_115450/`：默认使用该目录实际保存的 **12 线程、
+100 万次迭代、8000 ms 搜索预算、1000 手**，其余为同一份九座 crop / 500 桶 / `flop2-1pot`
+配置。需要 4 线程 / 10 万次 / 3000 ms 时，修改 `args.json` 对应项即可。
+
+设置环境变量，或在本项目 `.env` 中加入：
+
+```bash
+POKER_MANAGER_TOKEN=你的本地牌桌玩家token
+POKER_MANAGER_URL=ws://127.0.0.1:3000/ws
+```
+
+环境变量优先；不读取 OpenPoker 的 `API_KEY`。服务端须配置 `MAX_SEATS=9`。
+使用已安装 `websocket-client` 的 Python 从任意目录启动：
+
+```bash
+/tmp/poker-manager-client-venv/bin/python -u \
+  /Users/shaopengxu/projects_202605_after/dezhou_20260508/scripts/poker_manager_live/launch.py
+```
+
+每次从 `scripts/` 启动会新建 `artifacts/poker_manager_live_<上海时间>/`，保存
+`launch.py`、展开后的 `args.json`、`driver.pid`、`play.log` 和三份 JSONL 日志。
+终端先显示运行目录和 PID，之后 Python / Rust 输出均写入 `play.log`。token 通过环境
+传给入口，不写入参数文件或启动脚本。运行目录被 Git 忽略，模板脚本及配置正常版本管理。
+
+只准备运行目录、检查或修改参数后再启动：
+
+```bash
+/tmp/poker-manager-client-venv/bin/python scripts/poker_manager_live/launch.py --prepare-only
+# 根据输出的路径，修改该目录的 args.json，然后运行其中的 launch.py。
+```
+
+`--prepare-only` 不需要 token，也不加载模型或连接服务。生成目录中的 `launch.py`
+直接在该目录运行并追加日志；URL 已固定在该目录的 `args.json`，切换服务时修改其中的 `--url`。
+若其 `driver.pid` 对应进程仍存在，会拒绝重复启动。
+后台运行可在上述启动命令前加 `nohup`、末尾加 `&`；详细输出仍在 `play.log`。
+
 ## 启动
 
 服务端按其 README 配置 `POKER_PLAYERS` 后启动：
@@ -60,7 +99,8 @@ BOT_TOKENS=local-bob,local-carol npm run demo
 支持已有 `--search-*`、`--search-prewarm`、`--exploit on|vpip|off`、`--seed`
 及 `--debug-log` 参数，完整列表见 `python3 tools/poker_manager_play.py --help`。
 URL 也可通过 `POKER_MANAGER_URL` 配置；token 可通过 `--token`（别名 `--api-key`）传入。
-不会自动读取本项目或服务端 `.env`。
+直接运行 `tools/poker_manager_play.py` 不会自动读取本项目或服务端 `.env`；
+上面的 `launch.py` 启动脚本会读取本项目 `.env` 中的本地牌桌配置。
 
 ## 接入约定及限制（2026-10-18）
 
