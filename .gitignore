@@ -14,6 +14,7 @@
 !/artifacts/features_*.bin.b3sum
 # Python 工具脚本（tools/*.py）运行后生成的字节码缓存
 tools/__pycache__/
+tools/poker_live/__pycache__/
 # Claude Code 本地 harness 会话状态（scheduled_tasks lockfile 等）
 /.claude
 # OpenPoker 九人局联机产出的动作 / HH 日志（openpoker_play.py --action-log / --hh-log），本地分析用
