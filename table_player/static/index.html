@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenPoker · 牌桌播放器</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="header">
+    <a href="/" class="brand"><span class="brand-mark">♠</span><span>OPENPOKER<small>TABLE PLAYER / 牌桌播放器</small></span></a>
+    <div class="header-right"><span class="local-label"><span class="tiny-dot"></span> 本地只读</span><button id="demo" class="button subtle">演示牌局 <span>↗</span></button></div>
+  </header>
+  <main>
+    <section class="source-bar" aria-label="日志来源">
+      <div class="source-field"><label for="source">数据来源</label><select id="source"><option value="">正在查找日志…</option></select></div>
+      <button id="refresh" class="button icon-button" title="刷新日志列表" aria-label="刷新日志列表">↻</button>
+      <div class="connection"><span id="status-dot" class="status-dot"></span><span id="status">等待数据</span><span id="updated">—</span></div>
+    </section>
+    <div id="error" class="error" role="alert" hidden></div>
+    <div id="demo-banner" class="demo-banner" hidden>演示模式 · 以下为内置的虚构牌局，可使用底部控制条逐步回放。<button id="return-live">返回实际日志 →</button></div>
+    <div class="workspace">
+      <section class="table-panel" aria-label="牌桌">
+        <div class="table-heading"><div><span class="eyebrow">NO-LIMIT HOLD’EM</span><h1><span id="seat-count">9</span> 人牌桌 <span class="slash">/</span> <span id="street-title">等待开局</span></h1></div><div class="blind-info"><span>盲注</span><strong id="blinds">10 / 20</strong></div></div>
+        <div class="table-meta"><span id="table-id">TABLE —</span><span id="hand-id">HAND —</span></div>
+        <div class="table-stage" id="table-stage">
+          <div class="felt"><div class="felt-inner"></div><span class="felt-brand">OPENPOKER</span></div>
+          <div class="board-area"><div class="pot-label">TOTAL POT <span id="street-badge">等待</span></div><div id="pot" class="pot-value">0 <small>筹码</small></div><div id="board" class="board" aria-label="公共牌"></div><div id="table-notice" class="table-notice">等待日志中的下一手牌</div></div>
+          <div id="seats"></div><div id="wagers" aria-label="本街下注"></div>
+          <div id="empty-overlay" class="empty-overlay" hidden><span>♠</span><strong>等待牌局数据</strong><p>启动打牌脚本并开启 --ws-log，<br>这里会自动跟随牌局更新。</p></div>
+        </div>
+        <div class="table-footer"><span><span class="hero-dot"></span> Hero 固定在底部 · 手牌仅本人及摊牌可见</span><button id="unit" class="text-button" aria-label="切换筹码与 BB 单位">显示 BB</button></div>
+        <section class="playback" aria-label="回放控制">
+          <div class="timeline-row"><span id="cursor-label">0 / 0</span><input id="timeline" type="range" min="0" max="0" value="0" aria-label="牌局进度"><span id="event-time">--:--:--</span></div>
+          <div class="controls"><div class="transport"><button id="prev-hand" class="button transport-button" title="上一手" aria-label="上一手">Ⅰ‹</button><button id="prev" class="button transport-button" title="上一步（←）" aria-label="上一步">‹</button><button id="play" class="button play-button" title="播放 / 暂停（空格）" aria-label="播放回放">▶</button><button id="next" class="button transport-button" title="下一步（→）" aria-label="下一步">›</button><button id="next-hand" class="button transport-button" title="下一手" aria-label="下一手">›Ⅰ</button><label class="speed-label"><span class="sr-only">回放速度</span><select id="speed" aria-label="回放速度"><option value="1800">0.5×</option><option value="900" selected>1×</option><option value="450">2×</option><option value="180">5×</option></select></label></div><button id="follow" class="button follow-button active"><span class="tiny-dot"></span> 跟随最新</button></div>
+        </section>
+      </section>
+      <aside class="sidebar">
+        <section class="hero-panel"><div class="section-heading"><h2>我的手牌</h2><span class="hero-tag">HERO</span></div><div id="hero-cards" class="hero-cards" aria-label="Hero 手牌"></div><div class="hero-identity"><strong id="hero-name">等待入座</strong><span id="hero-seat">—</span></div><div class="hero-stats"><div><span>当前筹码</span><strong id="hero-stack">—</strong></div><div><span>本街投入</span><strong id="hero-bet">—</strong></div></div><div id="hero-status" class="hero-status">收到发牌事件后显示手牌</div></section>
+        <section class="history-panel"><div class="section-heading"><h2>本手动态</h2><span id="action-count">0 条</span></div><ol id="history" class="history"><li class="history-empty">牌局开始后，行动记录会显示在这里。</li></ol></section>
+        <div class="source-note"><span class="tiny-dot"></span><p>只读日志，不参与出牌。<br><span id="source-note">每秒刷新，支持暂停与回放。</span></p></div>
+      </aside>
+    </div>
+    <footer class="page-footer"><span>OPENPOKER / LOCAL TABLE VIEWER</span><span>← → 单步回放 <span class="footer-sep">·</span> 空格 播放 / 暂停</span></footer>
+  </main>
+</body>
+</html>
