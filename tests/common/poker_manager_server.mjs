@@ -3,6 +3,7 @@ import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 
 const project = process.argv[2];
+const rebuyTest = process.argv[3] === 'rebuy';
 const { createPokerServer } = await import(pathToFileURL(resolve(project, 'src/server.ts')));
 const { defaults } = await import(pathToFileURL(resolve(project, 'src/config.ts')));
 const { WebSocket } = await import(pathToFileURL(resolve(project, 'node_modules/ws/wrapper.mjs')));
@@ -10,12 +11,23 @@ const server = createPokerServer({ ...defaults, port: 0, host: '127.0.0.1',
   betweenHandsMs: 100, handStartDelayMs: 20, actionDelayMs: 5,
   actionTimeoutMs: 10_000,
   players: ['hero', 'bob', 'carol'].map(name => ({ id: name, name,
-    token: `test-${name}`, balance: 10000 })) });
+    token: `test-${name}`, balance: rebuyTest && name === 'hero' ? 2000 : 10000 })) });
 const port = await server.listen();
 console.log(port);
 const bots = [];
+let busted = false;
 const poll = setInterval(() => {
-  if (!server.service.accounts.get('hero').tableId) return;
+  const hero = server.service.accounts.get('hero');
+  if (!hero.tableId) return;
+  if (rebuyTest && !busted) {
+    if (!hero.autoRebuy) return;
+    // Exercise the service's real removal, zero-balance scheduler and grant path
+    // deterministically, before any opponents or hand are started.
+    busted = true;
+    hero.stack = 0;
+    server.service.settled(server.service.tables.get(hero.tableId));
+    return;
+  }
   clearInterval(poll);
   for (const name of ['bob', 'carol']) {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, {

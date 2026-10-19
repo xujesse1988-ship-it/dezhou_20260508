@@ -14,7 +14,8 @@ import os
 import sys
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 import uuid
 
 from poker_live.advisor_client import (add_advisor_args, advisor_extra_args, exploit_enabled,
@@ -35,6 +36,25 @@ def table_fits_model(seats, n_seats):
     """服务端连续座位可嵌入更大的模型；未发牌位置由 dealt_seats 排除。"""
     return (2 <= len(seats) <= n_seats
             and {p.get("seat") for p in seats} == set(range(len(seats))))
+
+
+def account_reader(url, token):
+    """补码前读取自己的账户余额；不允许把凭据转发到重定向目标。"""
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    parts = urlsplit(url)
+    endpoint = urlunsplit(("https" if parts.scheme == "wss" else "http",
+                          parts.netloc, "/api/me", "", ""))
+    opener = build_opener(NoRedirect)
+
+    def read():
+        request = Request(endpoint, headers={"Authorization": f"Bearer {token}"})
+        with opener.open(request, timeout=5) as response:
+            return json.load(response)
+
+    return read
 
 
 class ManagerHand:
@@ -136,7 +156,8 @@ class ManagerSession:
     """快照不授权；只处理 your_turn / resync hero token，后台计算可被超时或断线作废。"""
 
     def __init__(self, worker, n_seats=6, buy_in=2000, num_hands=100, action_log=None,
-                 hh_log=None, exploit=False, prewarm=False, debug=False):
+                 hh_log=None, exploit=False, prewarm=False, debug=False,
+                 auto_rebuy=False, read_account=None):
         self.worker = worker
         self.n_seats = n_seats
         self.buy_in = buy_in
@@ -146,6 +167,10 @@ class ManagerSession:
         self.exploit = exploit
         self.prewarm = prewarm
         self.debug = debug
+        self.auto_rebuy = auto_rebuy
+        self.read_account = read_account
+        self.joining = False
+        self.rebuy_request_id = None
         self.lock = threading.RLock()
         self.send = None
         self.table_id = None
@@ -183,6 +208,34 @@ class ManagerSession:
             self.send({"type": "resync_request", "table_id": self.table_id,
                        "last_table_seq": self.last_seq})
 
+    def join_or_rebuy(self, account=None):
+        if self.done or self.table_id or self.joining:
+            return
+        if not self.auto_rebuy:
+            self.joining = True
+            self.send({"type": "join_lobby", "buy_in": self.buy_in})
+            return
+        # Retry the same grant request after a lost acknowledgement, never a new ID.
+        if self.rebuy_request_id:
+            self.send({"type": "rebuy", "amount": 0, "request_id": self.rebuy_request_id})
+            return
+        account = self.read_account() if account is None else account
+        balance = account["chip_balance"]
+        if type(balance) is not int or balance < 0:
+            raise ValueError("invalid account balance")
+        if balance >= 1000:
+            buy_in = min(self.buy_in, balance)
+            self.joining = True
+            self.send({"type": "join_lobby", "buy_in": buy_in})
+            print(f"[auto-rebuy] 账户余额={balance}，买入={buy_in}。", file=sys.stderr)
+        elif balance == 0 and account.get("auto_rebuy"):
+            # Re-enabling also restores a missed scheduled/confirmed event on reconnect.
+            self.send({"type": "set_auto_rebuy", "enabled": True})
+            print("[auto-rebuy] 等待服务端自动补码确认。", file=sys.stderr)
+        else:
+            self.rebuy_request_id = str(uuid.uuid4())
+            self.send({"type": "rebuy", "amount": 0, "request_id": self.rebuy_request_id})
+
     def handle(self, message):
         with self.lock:
             self._handle(message)
@@ -200,13 +253,17 @@ class ManagerSession:
         if t == "connected":
             self.resyncing = False
             self.buffered.clear()
+            self.joining = False
             if tid:
+                if self.auto_rebuy:
+                    self.send({"type": "set_auto_rebuy", "enabled": True})
                 self.resync()
             else:
                 self.table_id, self.last_seq = None, 0
                 self.hand = None
+                self.my_seat = None
                 self.sent.clear()
-                self.send({"type": "join_lobby", "buy_in": self.buy_in})
+                self.join_or_rebuy()
             return
         if self.resyncing and not replay and t not in ("resync_response", "error"):
             self.buffered.append(m)
@@ -229,7 +286,7 @@ class ManagerSession:
                 self._turn({**hero, "hand_id": snapshot["hand_id"]})
             buffered, self.buffered = self.buffered, []
             for event in buffered:
-                if event.get("table_seq", 0) > self.last_seq:
+                if "table_seq" not in event or event["table_seq"] > self.last_seq:
                     self._handle(event)
             return
         seq = m.get("table_seq")
@@ -237,7 +294,23 @@ class ManagerSession:
             if seq <= self.last_seq:
                 return
             self.last_seq = seq
-        if t == "table_joined":
+        if t == "lobby_joined" and self.auto_rebuy:
+            self.send({"type": "set_auto_rebuy", "enabled": True})
+        elif t == "auto_rebuy_set" and self.auto_rebuy:
+            if m.get("enabled") is not True:
+                self.fail("server did not enable auto rebuy")
+            else:
+                print("[auto-rebuy] 服务端已确认开启。", file=sys.stderr)
+        elif t == "auto_rebuy_scheduled" and self.auto_rebuy:
+            print(f"[auto-rebuy] 补码时间：{m.get('rebuy_at')}。", file=sys.stderr)
+        elif t == "rebuy_confirmed" and self.auto_rebuy:
+            if self.rebuy_request_id and m.get("request_id") != self.rebuy_request_id:
+                return
+            self.rebuy_request_id = None
+            print(f"[auto-rebuy] 补码确认，账户余额={m.get('chip_balance')}。", file=sys.stderr)
+            self.join_or_rebuy(m)
+        elif t == "table_joined":
+            self.joining = False
             self.my_seat = m["seat"]
         elif t == "hand_start":
             self.hand = ManagerHand(m, self.n_seats)
@@ -289,11 +362,23 @@ class ManagerSession:
             else:
                 self.fail(f"action_rejected: {code}")
         elif t == "busted":
-            self.done = True
             self.pending = None
-            print("[busted] 筹码用尽，结束运行。", file=sys.stderr)
+            if self.auto_rebuy:
+                print("[busted] 筹码用尽，等待离桌后自动重新买入。", file=sys.stderr)
+            else:
+                self.done = True
+                print("[busted] 筹码用尽，结束运行。", file=sys.stderr)
         elif t == "player_left" and m.get("seat") == self.my_seat:
-            self.fail(f"player_left: {m.get('reason')}")
+            if self.auto_rebuy and m.get("reason") == "busted" and not replay:
+                self.table_id, self.my_seat = None, None
+                self.hand, self.pending = None, None
+                self.sent.clear()
+                self.warmed.clear()
+                self.last_seq = 0
+                self.joining = False
+                self.join_or_rebuy()
+            else:
+                self.fail(f"player_left: {m.get('reason')}")
         elif t == "table_closed":
             self.fail(f"table_closed: {m.get('reason')}")
         elif t == "error":
@@ -455,6 +540,8 @@ def main(argv=None):
                         help="POKER_PLAYERS 中的 token；默认读 POKER_MANAGER_TOKEN")
     parser.add_argument("--buy-in", type=int, default=2000)
     parser.add_argument("--num-hands", type=int, default=100)
+    parser.add_argument("--auto-rebuy", action="store_true",
+                        help="开启服务端自动补码，出局后按可用余额重新入座，累计到手数上限")
     parser.add_argument("--reconnect-attempts", type=int, default=10)
     parser.add_argument("--action-log", default=None)
     parser.add_argument("--hh-log", default=None)
@@ -487,7 +574,8 @@ def main(argv=None):
         stack.callback(worker.close, timeout=1)
         session = ManagerSession(worker, args.seats, args.buy_in, args.num_hands,
                                  action_log, hh_log, exploit_enabled(args),
-                                 args.search_prewarm, args.debug_log)
+                                 args.search_prewarm, args.debug_log,
+                                 args.auto_rebuy, account_reader(args.url, args.token))
         stack.callback(session.disconnect)
         try:
             run(session, args.url, args.token, ws_log, args.reconnect_attempts)

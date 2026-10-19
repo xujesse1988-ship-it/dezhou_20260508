@@ -273,13 +273,120 @@ class ManagerTests(unittest.TestCase):
         session.handle({"type": "error", "code": "auth_failed"})
         self.assertTrue(session.done)
 
+    def test_default_busted_stops_without_rebuy(self):
+        session, _, sent = self.session()
+        count = len(sent)
+        session.handle(event("busted", 10))
+        self.assertTrue(session.done)
+        self.assertEqual(len(sent), count)
+
+    def test_auto_rebuy_rejoins_after_removal_and_keeps_hand_limit(self):
+        session, _, sent = self.session(auto_rebuy=True, num_hands=2,
+            read_account=lambda: {"chip_balance": 8000, "auto_rebuy": True})
+        session.handle({"type": "lobby_joined"})
+        self.assertEqual(sent[-1], {"type": "set_auto_rebuy", "enabled": True})
+        session.handle(event("hand_result", 10, final_stacks={"1": 0}))
+        count = len(sent)
+        session.handle(event("busted", 11))
+        self.assertFalse(session.done)
+        self.assertEqual(len(sent), count)
+        session.handle(event("player_left", 12, seat=1, reason="busted"))
+        self.assertEqual(sent[-1], {"type": "join_lobby", "buy_in": 2000})
+        self.assertEqual(session.hands, 1)
+        self.assertIsNone(session.hand)
+        self.assertIsNone(session.table_id)
+        session.handle(dict(event("hand_start", 2, seat=1, dealer_seat=0,
+            blinds={"small_blind": 10, "big_blind": 20}), table_id="new", hand_id="next"))
+        session.handle(dict(event("hand_result", 3, final_stacks={"1": 0}),
+                            table_id="new", hand_id="next"))
+        self.assertTrue(session.done)
+        self.assertEqual(session.hands, 2)
+        self.assertEqual(sent[-1], {"type": "leave_table"})
+        count = len(sent)
+        session.handle(event("busted", 4))
+        session.handle({"type": "rebuy_confirmed", "chip_balance": 1500})
+        self.assertEqual(len(sent), count)
+
+    def test_zero_balance_waits_for_confirmation_and_respects_available_buy_in(self):
+        session = ManagerSession(None, auto_rebuy=True,
+            read_account=lambda: {"chip_balance": 0, "auto_rebuy": True})
+        sent = []
+        session.attach(sent.append)
+        session.handle({"type": "connected"})
+        self.assertEqual(sent, [{"type": "set_auto_rebuy", "enabled": True}])
+        session.handle({"type": "auto_rebuy_set", "enabled": True})
+        session.handle({"type": "auto_rebuy_scheduled", "rebuy_at": "later"})
+        self.assertEqual(len(sent), 1)
+        confirmation = {"type": "rebuy_confirmed", "chip_balance": 1500}
+        session.handle(confirmation)
+        self.assertEqual(sent[-1], {"type": "join_lobby", "buy_in": 1500})
+        session.handle(confirmation)
+        self.assertEqual(len(sent), 2)
+        self.assertFalse(session.done)
+
+    def test_small_balance_rebuy_retries_same_id_after_disconnect(self):
+        session = ManagerSession(None, auto_rebuy=True,
+            read_account=lambda: {"chip_balance": 500, "auto_rebuy": True})
+        sent = []
+        session.attach(sent.append)
+        session.handle({"type": "connected"})
+        request = dict(sent[-1])
+        self.assertEqual(request["type"], "rebuy")
+        self.assertEqual(request["amount"], 0)
+        session.disconnect()
+        session.attach(sent.append)
+        session.handle({"type": "connected"})
+        self.assertEqual(sent[-1], request)
+        session.handle({"type": "rebuy_confirmed", "chip_balance": 2000,
+                        "request_id": request["request_id"], "replayed": True})
+        self.assertEqual(sent[-1], {"type": "join_lobby", "buy_in": 2000})
+        self.assertIsNone(session.rebuy_request_id)
+
+    def test_auto_rebuy_cold_reconnect_uses_current_account_balance(self):
+        session = ManagerSession(None, auto_rebuy=True,
+            read_account=lambda: {"chip_balance": 1500, "auto_rebuy": True})
+        sent = []
+        session.attach(sent.append)
+        session.handle({"type": "connected"})
+        self.assertEqual(sent, [{"type": "join_lobby", "buy_in": 1500}])
+
+    def test_auto_rebuy_does_not_rejoin_unrelated_removal(self):
+        session, _, sent = self.session(auto_rebuy=True,
+            read_account=lambda: {"chip_balance": 8000})
+        count = len(sent)
+        session.handle(event("player_left", 10, seat=1, reason="away"))
+        self.assertTrue(session.done)
+        self.assertEqual(len(sent), count)
+
+    def test_auto_rebuy_seated_reconnect_handles_unsequenced_confirmation(self):
+        session, _, sent = self.session(auto_rebuy=True,
+            read_account=lambda: {"chip_balance": 8000})
+        count = len(sent)
+        session.disconnect()
+        session.attach(sent.append)
+        session.handle({"type": "connected", "table_id": "t"})
+        self.assertEqual([m["type"] for m in sent[count:]],
+                         ["set_auto_rebuy", "resync_request"])
+        session.handle({"type": "auto_rebuy_set", "enabled": False})
+        session.handle(dict(type="resync_response", table_id="t", to_table_seq=20,
+                            replayed_events=[], snapshot=snapshot()))
+        self.assertTrue(session.done)
+        self.assertEqual(session.error, "server did not enable auto rebuy")
+
 
 @unittest.skipUnless(os.environ.get("POKER_MANAGER_PROJECT"), "set POKER_MANAGER_PROJECT for local WS integration")
 class ManagerLiveTests(unittest.TestCase):
     def test_cli_against_real_service(self):
+        self.run_cli(False)
+
+    def test_auto_rebuy_against_real_service(self):
+        self.run_cli(True)
+
+    def run_cli(self, auto_rebuy):
         root = Path(__file__).resolve().parents[1]
         server = subprocess.Popen(["node", str(root / "tests/common/poker_manager_server.mjs"),
-                                   os.environ["POKER_MANAGER_PROJECT"]],
+                                   os.environ["POKER_MANAGER_PROJECT"],
+                                   "rebuy" if auto_rebuy else "normal"],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:
             self.assertTrue(select.select([server.stdout], [], [], 10)[0], "server startup timeout")
@@ -299,10 +406,12 @@ class ManagerLiveTests(unittest.TestCase):
                     '''))
                 stub.chmod(0o700)
                 actions, hands = directory / "actions.jsonl", directory / "hands.jsonl"
+                ws_log = directory / "ws.jsonl"
                 completed = subprocess.run([sys.executable, str(root / "tools/poker_manager_play.py"),
                     "--url", f"ws://127.0.0.1:{port}/ws", "--token", "test-hero",
                     "--advisor-bin", str(stub), "--checkpoint", "stub", "--bucket-table", "stub",
-                    "--seats", "9",
+                    "--seats", "9", *(["--auto-rebuy"] if auto_rebuy else []),
+                    "--ws-log", str(ws_log),
                     "--num-hands", "3", "--action-log", str(actions), "--hh-log", str(hands)],
                     capture_output=True, text=True, timeout=30)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -315,6 +424,15 @@ class ManagerLiveTests(unittest.TestCase):
                 self.assertTrue(all(d["req"]["num_seats"] == 9 and len(d["req"]["stacks"]) == 9
                                     and d["req"]["dealt_seats"] == [0, 1, 2] for d in decisions))
                 self.assertTrue(any(a["action"] == "raise" for d in decisions for a in d["req"]["actions"]))
+                if auto_rebuy:
+                    events = [json.loads(row["raw"]) for line in ws_log.read_text().splitlines()
+                              if (row := json.loads(line)).get("dir") in ("in", "out")]
+                    self.assertEqual([e["buy_in"] for e in events if e["type"] == "join_lobby"],
+                                     [2000, 1500])
+                    for kind in ("busted", "player_left", "auto_rebuy_scheduled", "rebuy_confirmed"):
+                        self.assertTrue(any(e["type"] == kind for e in events), kind)
+                    self.assertTrue(any(e["type"] == "auto_rebuy_set" and e["enabled"] for e in events))
+                    self.assertEqual(sum(e["type"] == "leave_table" for e in events), 1)
         finally:
             server.terminate()
             try:
