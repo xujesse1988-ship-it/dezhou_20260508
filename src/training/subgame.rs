@@ -44,8 +44,8 @@ use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::nlhe::{
-    compute_hand_bucket, pack_info_set_v2, SimplifiedNlheAction, SimplifiedNlheGame,
-    SimplifiedNlheInfoSet, SimplifiedNlheState,
+    cached_hand_bucket, pack_info_set_v2, SeatBucketCache, SimplifiedNlheAction,
+    SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
 };
 use crate::training::nlhe_betting_tree::{
     count_subtree_nodes_capped, deep_menu_for, AbstractActionTag, BettingAbstractionRules, Child,
@@ -514,6 +514,7 @@ impl SubgameNlheGame {
             tree: Arc::clone(&self.subtree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(0),
+            seat_bucket_cache: SeatBucketCache::default(),
             leaf_ctx: None, // query 读非叶决策点策略，不查叶子值。
         };
         let info = SimplifiedNlheGame::info_set(&query, actor);
@@ -632,6 +633,7 @@ impl Game for SubgameNlheGame {
             tree: Arc::clone(&self.subtree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(0),
+            seat_bucket_cache: SeatBucketCache::default(),
             // 6b depth-limit：把叶子值上下文带进 state（叶子 payoff 读）；6a/uniform = None。
             leaf_ctx: self.leaf_ctx.clone(),
         }
@@ -708,11 +710,11 @@ fn leaf_payoff(state: &SimplifiedNlheState, player: PlayerId, leaf_street: Stree
         LeafContPolicy::Fixed(c) => c,
         LeafContPolicy::BiasedNextActor => {
             let a = state.tree.node(state.current_node_id).player_acting as usize;
-            let bucket_a = compute_hand_bucket(state, a as PlayerId, leaf_street);
+            let bucket_a = cached_hand_bucket(state, a as PlayerId, leaf_street);
             argmax_cont(&ctx.values, a, global, bucket_a)
         }
     };
-    let bucket = compute_hand_bucket(state, player, leaf_street);
+    let bucket = cached_hand_bucket(state, player, leaf_street);
     let v = ctx
         .values
         .value(player as usize, global, bucket, cont)
@@ -4153,6 +4155,7 @@ mod tests {
             tree: Arc::clone(&sub.subtree),
             abs: Arc::clone(&sub.abs),
             info_set_cache: AtomicU64::new(0),
+            seat_bucket_cache: SeatBucketCache::default(),
             leaf_ctx: None,
         };
         let info = SimplifiedNlheGame::info_set(&query, actor);

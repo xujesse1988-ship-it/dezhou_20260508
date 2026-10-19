@@ -243,6 +243,19 @@ impl GameState {
         state
     }
 
+    /// 切到 no-history 模式，并丢掉 clone 来源（可能是 `track_history = true` 的权威局）已累积的
+    /// 历史，使本 state 的历史字段与 [`with_rng_no_history`](Self::with_rng_no_history) 构造的
+    /// 一致（`config / seed` 保留）。只置 `track_history = false` 不清空的话，旧的
+    /// `history.actions` 等会随 CFR 每个节点的 clone 一路复制下去。
+    fn drop_history(&mut self) {
+        self.track_history = false;
+        self.history.actions = Vec::new();
+        self.history.board = Vec::new();
+        self.history.hole_cards = Vec::new();
+        self.history.final_payouts = Vec::new();
+        self.history.showdown_order = Vec::new();
+    }
+
     /// 重采样隐藏信息（S6 实时搜索 subgame 发牌）。克隆本**中途**状态，**保留**公共牌前缀
     /// （`board` = 已亮出的 flop/turn/river）+ 全部下注 / 筹码 / 街 / 行动权状态，**重发**所有
     /// 未弃牌座位的底牌 + 未见的 runout 公共牌后缀（从去掉可见牌的牌堆里 Fisher-Yates 抽），
@@ -258,11 +271,12 @@ impl GameState {
     /// 卡牌字段（`hole_cards` / `runout_board` / `showdown_ranks`），其余下注 / 公共 / 行动权字段
     /// （`board` / 街 / 筹码 / `current_player` / `raise_option_open` / `last_*` …）逐字保留。
     ///
-    /// 唯一例外：返回状态强制 `track_history = false`（对齐 base `SimplifiedNlheGame::root` 的
-    /// [`with_rng_no_history`](Self::with_rng_no_history) CFR fast path）。否则从 `track_history =
-    /// true` 的权威局 clone 来时，每步 re-solve 都会在 `apply` 的 action 记录 / `finalize_terminal`
-    /// 历史写入 / 逐 apply 增长的 `history.actions`（使 per-node clone 退化成 O(depth²)）上白付开销
-    /// （CFR / `payouts` 都不读 history；`hand_history()` 在 subgame 状态上无意义）。
+    /// 唯一例外：返回状态强制 `track_history = false` 并清空 clone 来的已累积历史（对齐 base
+    /// `SimplifiedNlheGame::root` 的 [`with_rng_no_history`](Self::with_rng_no_history) CFR fast
+    /// path）。否则从 `track_history = true` 的权威局 clone 来时，每步 re-solve 都会在 `apply` 的
+    /// action 记录 / `finalize_terminal` 历史写入 / 逐 apply 增长的 `history.actions`（使 per-node
+    /// clone 退化成 O(depth²)）/ 每个节点 clone 时复制旧历史上白付开销（CFR / `payouts` 都不读
+    /// history；`hand_history()` 在 subgame 状态上无意义）。
     ///
     /// 前置：`self` 须为非终局（实时搜索从 decision 节点为根）。同 `(self, rng 状态)` 必出同补全
     /// （byte-equal 可复现）。
@@ -274,7 +288,7 @@ impl GameState {
         let mut state = self.clone();
         // Subgame 状态仅供 CFR 求解：强制走 no-history fast path（见上方 doc）——避免从
         // track_history=true 的权威局 clone 来时每步 re-solve 白付 history 开销。
-        state.track_history = false;
+        state.drop_history();
         let visible_len = state.board.len();
 
         // 去掉可见公共牌（board 前缀）的剩余牌堆。
@@ -338,8 +352,8 @@ impl GameState {
     ///
     /// `holes[seat]` 须与 `self` 的 live 模式一致：未弃牌座位 `Some([c0,c1])`、已弃 `None`。
     /// runout 后缀从「52 − 公共牌 − 全部给定底牌」的剩余牌堆补；`showdown_ranks` 重算；与
-    /// [`resample_hidden`](Self::resample_hidden) 一样强制 `track_history = false`。终局收益仍走
-    /// 权威 [`payouts`](Self::payouts)（side pot / showdown 一行不动 → S1 跨验证不受影响）。
+    /// [`resample_hidden`](Self::resample_hidden) 一样强制 `track_history = false` 并清空已累积历史。
+    /// 终局收益仍走权威 [`payouts`](Self::payouts)（side pot / showdown 一行不动 → S1 跨验证不受影响）。
     ///
     /// 调用方须保证 `holes` 两两不冲突且不撞 board（range 采样的 card-removal 负责）；debug 下
     /// 断言无冲突，release 下 `used` 仍正确排除（runout 不会重复发牌）。
@@ -354,7 +368,7 @@ impl GameState {
         );
         debug_assert_eq!(holes.len(), self.players.len(), "holes 长度须 == 座位数");
         let mut state = self.clone();
-        state.track_history = false;
+        state.drop_history();
         let visible_len = state.board.len();
 
         // 装入给定底牌（live 模式须与 template 一致）；`used` 累积 board + 全部底牌。
@@ -427,7 +441,7 @@ impl GameState {
     /// 其余**未弃牌**座位（对手）发占位底牌（剩余牌堆按 id 升序取）——subgame solve 每 step 会按
     /// blueprint range 重采样覆盖，故占位值不影响求解；只需合法（不撞 board / hero / 彼此）以保
     /// [`I-003`](GameState) 无重复牌 + `showdown_ranks` 可算。已弃座 `hole_cards` 保持 `None`。
-    /// 强制 `track_history = false`（同 `resample_hidden*`：subgame 状态只供求解）。
+    /// 强制 `track_history = false` 并清空已累积历史（同 `resample_hidden*`：subgame 状态只供求解）。
     ///
     /// 错误（外部数据可能脏 → 返回 `Err`、调用方 fold，**绝不 panic**）：
     /// - `board.len()` ≠ `self.board.len()`（外部 board 与重放街公共牌数不一致）；
@@ -462,7 +476,7 @@ impl GameState {
         }
 
         let mut state = self.clone();
-        state.track_history = false;
+        state.drop_history();
         // 覆写可见 board（外部真实板）+ hero 真实底牌。
         state.board = board.iter().copied().collect();
         state.players[hero_idx].hole_cards = Some(hero_hole);
@@ -519,7 +533,8 @@ impl GameState {
     ///
     /// 错误（外部数据可能脏 → `Err`，**绝不 panic**）：`holes` 长度 ≠ 座位数 /
     /// `board.len()` ≠ 重放街公共牌数 / `board+suffix` ≠ 5 张 / 已弃座给了底牌 / 牌重复。
-    /// 强制 `track_history = false`（同 `resample_hidden*`：仅供评测 `apply` + `payouts`）。
+    /// 强制 `track_history = false` 并清空已累积历史（同 `resample_hidden*`：仅供评测 `apply` +
+    /// `payouts`）。
     pub fn with_external_cards_and_runout(
         &self,
         holes: &[Option<[Card; 2]>],
@@ -573,7 +588,7 @@ impl GameState {
         }
 
         let mut state = self.clone();
-        state.track_history = false;
+        state.drop_history();
         state.board = board.iter().copied().collect();
 
         // 装入给定底牌；未给的未弃牌座发占位（剩余牌堆按 id 升序，used 已含后缀 → 不冲突）。
@@ -747,6 +762,11 @@ impl GameState {
     /// 终局每个玩家的净收益（正 = 赢、负 = 输）。仅 `is_terminal` 后有效。
     pub fn payouts(&self) -> Option<Vec<(SeatId, i64)>> {
         self.final_payouts.clone()
+    }
+
+    /// 同 [`payouts`](Self::payouts)，但借用返回、不 clone（CFR `payoff` 热路径用）。
+    pub fn payouts_ref(&self) -> Option<&[(SeatId, i64)]> {
+        self.final_payouts.as_deref()
     }
 
     /// 当前 hand history 的引用，可随时序列化或回放。
@@ -1647,6 +1667,50 @@ mod resample_tests {
             "同 seed resample runout 须一致"
         );
         assert_eq!(a.showdown_ranks, b.showdown_ranks);
+    }
+
+    /// 从 `track_history = true` 的权威局派生的求解 / 评测状态（`resample_hidden*` /
+    /// `inject_external_cards` / `with_external_cards_and_runout`）须清空 clone 来的历史（与
+    /// `with_rng_no_history` 一致），否则旧历史会随 CFR 每个节点的 clone 一路复制；推进到终局
+    /// 也不再写历史，`payouts` / `payouts_ref` 照常且一致。
+    #[test]
+    fn solve_states_drop_authoritative_history() {
+        let base = flop_mid_state(0xD20B);
+        assert!(
+            base.track_history() && !base.hand_history().actions.is_empty(),
+            "前提：权威局带历史"
+        );
+        let mut rng = ChaCha20Rng::from_seed(0x4849_5354_4F52_5900); // "HISTORY"
+        let holes: Vec<Option<[Card; 2]>> = base.players().iter().map(|p| p.hole_cards).collect();
+        let hero = base.current_player().expect("flop 有行动者");
+        let hero_hole = holes[hero.0 as usize].expect("hero live");
+        let derived = [
+            base.resample_hidden(&mut rng),
+            base.resample_hidden_with_holes(&holes, &mut rng),
+            base.inject_external_cards(hero, hero_hole, base.board())
+                .expect("权威局自身的牌应注入成功"),
+            base.with_external_cards_and_runout(&holes, base.board(), &base.runout_board[3..])
+                .expect("权威局自身的牌 + runout 应装入成功"),
+        ];
+        for mut s in derived {
+            assert!(!s.track_history());
+            let h = s.hand_history();
+            assert!(
+                h.actions.is_empty()
+                    && h.board.is_empty()
+                    && h.hole_cards.is_empty()
+                    && h.final_payouts.is_empty()
+                    && h.showdown_order.is_empty(),
+                "派生状态的历史须清空"
+            );
+            assert_eq!(h.seed, base.hand_history().seed, "seed 标签保留");
+            play_passive_to_terminal(&mut s);
+            assert!(
+                s.hand_history().actions.is_empty() && s.hand_history().final_payouts.is_empty()
+            );
+            assert!(s.payouts().is_some());
+            assert_eq!(s.payouts_ref(), s.payouts().as_deref());
+        }
     }
 
     /// `resample_hidden_with_holes`（S6 §5b 装牌路径）：给定底牌被精确装入、保留态不变、

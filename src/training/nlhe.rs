@@ -28,7 +28,7 @@
 //! shape-major canonical id 编号（旧 v3 artifact 需重排）。`SimplifiedNlheGame::new`
 //! 校验 `schema_version() == 4` + supported postflop bucket config。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::abstraction::action::{AbstractAction, ActionAbstraction, StreetActionAbstraction};
@@ -330,6 +330,10 @@ pub struct SimplifiedNlheState {
     /// `Game::State: Sync` bound（State 实际由单 worker 拥有，Relaxed 等价普通
     /// load/store）。
     pub(crate) info_set_cache: AtomicU64,
+    /// hand_bucket per-seat cache（[`cached_hand_bucket`] 读写）：`n_seats > 2` 的 `info_set`
+    /// （HU `info_set` 走上面的 `info_set_cache`）+ depth-limit 叶子 payoff（任意座位数）。语义同
+    /// `info_set_cache`：同一 trajectory 内 (street, seat) 不变时命中，layout 见 [`SeatBucketCache`]。
+    pub(crate) seat_bucket_cache: SeatBucketCache,
     /// S6 6b depth-limit：subgame 叶子续局值上下文（[`crate::training::subgame::SubgameLeafCtx`]）。
     /// `Some` 仅当本 state 属于 depth-limit subgame（`SubgameNlheGame::new_depth_limited`）；
     /// **base game / 6a subgame 恒 `None`**——`SimplifiedNlheGame` 自身的 `current`/`payoff`
@@ -348,6 +352,7 @@ impl Clone for SimplifiedNlheState {
             tree: Arc::clone(&self.tree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(self.info_set_cache.load(Ordering::Relaxed)),
+            seat_bucket_cache: self.seat_bucket_cache.clone(),
             leaf_ctx: self.leaf_ctx.clone(),
         }
     }
@@ -377,10 +382,59 @@ fn unpack_info_set_cache(packed: u64) -> (u8, u8, u16, u16) {
     )
 }
 
+/// hand_bucket per-seat cache（见 [`SimplifiedNlheState::seat_bucket_cache`]）。每座一个 u16 slot：
+/// - bits 0..12:  hand_bucket（preflop ≤ 169 / postflop ≤ 1000，< 4096）
+/// - bits 12..16: `street_plus_one`（0 = 未缓存，1..=4 = Preflop..River + 1）
+///
+/// 每个 slot 自带街标记，街切换后旧 slot 的标记对不上即视为未命中，无需整体失效。
+/// Atomic 理由同 `info_set_cache`（满足 `Game::State: Sync`，Relaxed 等价普通读写）。
+pub(crate) struct SeatBucketCache([AtomicU16; SEAT_BUCKET_CACHE_SEATS]);
+
+/// D-030 n_seats 上界。
+const SEAT_BUCKET_CACHE_SEATS: usize = 9;
+const SEAT_BUCKET_BITS: u32 = 12;
+const SEAT_BUCKET_MASK: u16 = (1u16 << SEAT_BUCKET_BITS) - 1;
+
+impl Default for SeatBucketCache {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| AtomicU16::new(0)))
+    }
+}
+
+impl Clone for SeatBucketCache {
+    fn clone(&self) -> Self {
+        Self(std::array::from_fn(|i| {
+            AtomicU16::new(self.0[i].load(Ordering::Relaxed))
+        }))
+    }
+}
+
+/// [`compute_hand_bucket`] 的缓存版（[`SeatBucketCache`]）：命中返回缓存值，未命中现算并写回，
+/// 返回值与 `compute_hand_bucket` 逐位相同。同一 trajectory 内 hole / runout 不变，某街的桶只由
+/// (seat, street) 决定，故缓存可沿 `next` / clone 继承。
+pub(crate) fn cached_hand_bucket(
+    state: &SimplifiedNlheState,
+    actor: PlayerId,
+    street_tag: StreetTag,
+) -> u32 {
+    let tag = u16::from(street_tag as u8 + 1) << SEAT_BUCKET_BITS;
+    let slot = &state.seat_bucket_cache.0[actor as usize];
+    let cached = slot.load(Ordering::Relaxed);
+    if cached & !SEAT_BUCKET_MASK == tag {
+        return u32::from(cached & SEAT_BUCKET_MASK);
+    }
+    let bucket = compute_hand_bucket(state, actor, street_tag);
+    // 超出 12 bit 的桶不缓存（目前支持的桶表都 ≤ 1000，不会走到）。
+    if bucket <= u32::from(SEAT_BUCKET_MASK) {
+        slot.store(tag | bucket as u16, Ordering::Relaxed);
+    }
+    bucket
+}
+
 /// 计算 `(actor, street)` 的 hand_bucket（preflop 169 lossless / postflop `BucketTable`
 /// lookup）。= [`SimplifiedNlheGame::info_set`] HU cache-miss 分支的**同源逻辑**，供 P4
-/// 6-max uncached 分支复用。HU 分支保持逐字不动、刻意不抽取——避免动到生产热路径
-/// （byte-equal by 不-touch，nlhe_infoset_semantics T1 钉死）；代价 = 这段 ~8 行重复。
+/// 6-max 分支 + depth-limit 叶子（经 [`cached_hand_bucket`]）复用。HU 分支保持逐字不动、刻意不抽取——避免动到
+/// 生产热路径（byte-equal by 不-touch，nlhe_infoset_semantics T1 钉死）；代价 = 这段 ~8 行重复。
 pub(crate) fn compute_hand_bucket(
     state: &SimplifiedNlheState,
     actor: PlayerId,
@@ -454,6 +508,7 @@ impl Game for SimplifiedNlheGame {
             tree: Arc::clone(&self.tree),
             abs: Arc::clone(&self.abs),
             info_set_cache: AtomicU64::new(0),
+            seat_bucket_cache: SeatBucketCache::default(),
             leaf_ctx: None, // base game 永不走 depth-limit 叶子。
         }
     }
@@ -484,13 +539,13 @@ impl Game for SimplifiedNlheGame {
         );
         let street_tag = node.street;
 
-        // P4 6-max（n_seats > 2）：uncached path。下方 HU 2-slot u64 cache（bits 16..48
-        // 只放得下 2 座的 hand_bucket）容不下 6 座；multiway cache 落 post-S3 perf-tune。
+        // P4 6-max（n_seats > 2）：下方 HU 2-slot u64 cache（bits 16..48 只放得下 2 座的
+        // hand_bucket）容不下 6 座，改走 per-seat [`cached_hand_bucket`]。
         // 位置仍由 node_id 内化（每节点唯一 player_acting → 不同位置不同 node_id），故
         // pack_info_set_v2 无需位置位、6-max 无碰撞。bucket 计算与下方 HU cache-miss 同源
         // （[`compute_hand_bucket`]）。
         if state.game_state.config().n_seats > 2 {
-            let hand_bucket = compute_hand_bucket(state, actor, street_tag);
+            let hand_bucket = cached_hand_bucket(state, actor, street_tag);
             return pack_info_set_v2(hand_bucket, state.current_node_id, street_tag);
         }
 
@@ -669,19 +724,20 @@ impl Game for SimplifiedNlheGame {
     }
 
     fn payoff(state: &SimplifiedNlheState, player: PlayerId) -> f64 {
-        // D-316 chip 净收益直接当 utility。stage 1 `GameState::payouts()` 在
-        // terminal 时返回 `Some(Vec<(SeatId, i64)>)`（每条 entry = `awards[seat]
-        // - committed[seat]`，即净 PnL）。`i64 → f64` lossless within chip 范围
-        // ≤ 2^31（D-339 stage 3 chip 上限远低于 f64 mantissa 52 bit 上界）。
+        // D-316 chip 净收益直接当 utility。stage 1 `GameState::payouts_ref()` 在
+        // terminal 时返回 `Some(&[(SeatId, i64)])`（每条 entry = `awards[seat]
+        // - committed[seat]`，即净 PnL）；借用读、不像 `payouts()` 每次 clone 一个 Vec。
+        // `i64 → f64` lossless within chip 范围 ≤ 2^31（D-339 stage 3 chip 上限远低于
+        // f64 mantissa 52 bit 上界）。
         let payouts = state
             .game_state
-            .payouts()
+            .payouts_ref()
             .expect("SimplifiedNlhe payoff: state must be terminal (Game::current == Terminal)");
         let target_seat = SeatId(player);
         let pnl = payouts
-            .into_iter()
+            .iter()
             .find(|(seat, _)| *seat == target_seat)
-            .map(|(_, pnl)| pnl)
+            .map(|&(_, pnl)| pnl)
             .expect("SimplifiedNlhe payoff: payouts must include actor seat (stage 1 invariant)");
         pnl as f64
     }
@@ -703,7 +759,7 @@ mod tests {
     /// P4 smoke：6-max A3×A4 game 构造 + 整套 `Game` 机制（root/current/legal_actions/
     /// info_set/next/payoff）端到端跑通不 panic。验去 HU 硬编码后 6 座 plumbing 正确：
     /// ① `n_players()==6`；② game 建的树 == probe 真值（78,852，N=2）；③ 多条确定性轨迹
-    /// 走到 terminal，每决策节点 legal_actions 非空 + info_set（6-max uncached 分支）不 panic；
+    /// 走到 terminal，每决策节点 legal_actions 非空 + info_set（6-max 分支）不 panic；
     /// ④ 6 座 payoff 守恒（Σ==0 筹码守恒）。桶是 HU 占位（S3 前不训练、只验机制）。
     /// N=2（树小、debug 快，且 debug 顺带触发建树 redirect 不变量 assert）。
     #[test]
@@ -736,7 +792,7 @@ mod tests {
                     NodeKind::Player(actor) => {
                         let actions = SimplifiedNlheGame::legal_actions(&state);
                         assert!(!actions.is_empty(), "决策节点 legal_actions 不应为空");
-                        // info_set 不 panic（6-max uncached 分支）+ actor 与节点一致。
+                        // info_set 不 panic（6-max 分支）+ actor 与节点一致。
                         let _ = SimplifiedNlheGame::info_set(&state, actor);
                         let idx = (policy as usize) % actions.len();
                         state = SimplifiedNlheGame::next(state, actions[idx], rng);
@@ -756,7 +812,7 @@ mod tests {
 
     /// 9-max smoke（`train_cfr --seats 9`）：`Game` 机制在 9 座下端到端跑通。① `n_players()==9`；
     /// ② 随机策略多条轨迹走到 terminal，每决策节点 legal_actions 非空 + info_set（n_seats>2
-    /// uncached 分支）不 panic + actor 与树节点 `player_acting` 一致；③ 9 座 payoff 守恒
+    /// 分支）不 panic + actor 与树节点 `player_acting` 一致；③ 9 座 payoff 守恒
     /// （Σ==0）；④ 覆盖到 showdown（多人进 flop 后摊牌，验 9 座 side pot / 结算路径）。
     #[test]
     fn nine_max_game_smoke() {
@@ -805,6 +861,62 @@ mod tests {
             reached_postflop > 0,
             "300 条随机轨迹应至少有一条进 postflop（否则没测到翻后路径）"
         );
+    }
+
+    /// [`cached_hand_bucket`]：9 座随机轨迹上每个决策点 `info_set`（首次 miss、再次 hit、clone
+    /// 后读继承的缓存）+ 各未弃牌座位的直接读数都须与现算 [`compute_hand_bucket`] 逐位相等，且要走到
+    /// postflop（stub 表 postflop 恒 0、preflop 169 类非 0 居多，可抓街切换后误读上一街缓存）。
+    #[test]
+    fn seat_bucket_cache_matches_uncached() {
+        let (abs, rules) = first_small_preopen_1pot_6max(2);
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::n_max_at_bb(9, 100),
+            abs,
+            rules,
+        )
+        .expect("9-max game 应当构造成功（stub 500 桶表）");
+
+        let mut rng = ChaCha20Rng::from_seed(0x4D57_4341_4348_4500); // "MWCACHE"
+        let rng: &mut dyn RngSource = &mut rng;
+        let mut postflop_checks = 0usize;
+        for _ in 0..300 {
+            let mut state = game.root(rng);
+            while let NodeKind::Player(actor) = SimplifiedNlheGame::current(&state) {
+                let street = game.tree().node(state.current_node_id).street;
+                let expect = pack_info_set_v2(
+                    compute_hand_bucket(&state, actor, street),
+                    state.current_node_id,
+                    street,
+                );
+                assert_eq!(SimplifiedNlheGame::info_set(&state, actor), expect, "miss");
+                assert_eq!(SimplifiedNlheGame::info_set(&state, actor), expect, "hit");
+                let cloned = state.clone();
+                assert_eq!(
+                    SimplifiedNlheGame::info_set(&cloned, actor),
+                    expect,
+                    "clone"
+                );
+                // 非 actor 座位（depth-limit 叶子 payoff 会查）：直接读 cached_hand_bucket。
+                for seat in 0..9 {
+                    if state.game_state.players()[seat as usize]
+                        .hole_cards
+                        .is_some()
+                    {
+                        assert_eq!(
+                            cached_hand_bucket(&state, seat, street),
+                            compute_hand_bucket(&state, seat, street),
+                            "seat {seat}"
+                        );
+                    }
+                }
+                postflop_checks += usize::from(street != StreetTag::Preflop);
+                let actions = SimplifiedNlheGame::legal_actions(&state);
+                let idx = (rng.next_u64() % actions.len() as u64) as usize;
+                state = SimplifiedNlheGame::next(state, actions[idx], rng);
+            }
+        }
+        assert!(postflop_checks > 0, "应覆盖到 postflop 决策点");
     }
 
     /// P4 参数化没破 HU 默认路径：`new` 仍构造 240,096 节点默认树、2 座。

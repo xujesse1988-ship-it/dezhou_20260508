@@ -56,13 +56,25 @@
 - 1 / 2 / 4 / 8 / 12 线程各跑一次，画加速曲线；
 - 给 `step_parallel` 的合并段加计时。
 
-### 第 3 条：三处不改变结果的小修（推测合计提速 15%–35%）
+### 第 3 条：三处不改变结果的小修（已做）
 
-| 位置 | 现状 | 改法 | 标注 |
-|---|---|---|---|
-| `src/training/nlhe.rs` `info_set`（9 座分支） | `n_seats > 2` 时每个决策节点都 `compute_hand_bucket` 现算 | 每次发牌后为各座位预算好各街的桶 | [事实] 现状；提速 [推测] |
-| `src/rules/state.rs` `resample_hidden*` / `inject_external_cards` | 只设 `track_history = false`，不清已有的整手历史，每次 clone 都复制它 | 发牌时清空历史 | [事实] 现状；提速 [推测] |
-| `src/training/nlhe.rs` `payoff` | 每次调用都 `payouts()` 生成一个 Vec 再找本座位 | 直接算本座位或复用 | [事实] 现状；提速 [推测] |
+| 位置 | 原状 | 实际改法 |
+|---|---|---|
+| `src/training/nlhe.rs` `info_set`（9 座分支） | `n_seats > 2` 时每个决策节点都 `compute_hand_bucket` 现算 | 每座一个 16 位缓存格（街号 + 桶号），按需算、同街再用直接读（`cached_hand_bucket` / `SeatBucketCache`）。没按原设想在发牌时一次算全：6-max 蓝图训练大部分局翻前就结束，预算翻后桶是白算。depth-limit 叶子取值（`subgame.rs` `leaf_payoff`）也改走这份缓存 |
+| `src/rules/state.rs` `resample_hidden*` / `inject_external_cards` / `with_external_cards_and_runout` | 只设 `track_history = false`，不清已有的整手历史，每次 clone 都复制它 | 新增 `drop_history()`：同时清空 actions / board / hole_cards / final_payouts / showdown_order，与 `with_rng_no_history` 一致 |
+| `src/training/nlhe.rs` `payoff` | 每次调用都 `payouts()` 生成一个 Vec 再找本座位 | 新增 `GameState::payouts_ref()` 借用读 |
+
+验证 [事实]：
+
+- 结果不变：真实 500 桶表上，改前 / 改后各跑同一组训练，遗憾表 + 策略累加表的哈希逐位相同。覆盖 6-max 蓝图、9 座蓝图、
+  从带历史的权威局注入真牌后的 3 人翻牌 subgame（各 3k / 15k 次迭代），以及 HU / 6-max depth-limit subgame 的
+  `Fixed(0)` 和 `BiasedNextActor` 两种叶子续局（各 20k 次迭代，合成叶子值表，查值全部命中）。
+- 常驻单测：`seat_bucket_cache_matches_uncached`（9 座随机轨迹上缓存读数 = 现算读数）、
+  `solve_states_drop_authoritative_history`（派生状态历史已清空、`payouts_ref` = `payouts`）。
+- 本机 2 核单线程提速（各 3 次取平均）：3 人翻牌 subgame 约 717ms → 620ms（约 13%）；9 座蓝图约 476ms → 455ms（约 4%）；
+  HU depth-limit `BiasedNextActor` 约 547ms → 510ms（约 7%，接近噪声）；`Fixed(0)` 和 6-max depth-limit 在噪声内。
+  明显低于原先推测的 15%–35%。测试局的历史只有 6 个动作，生产上到转牌 / 河牌历史更长，第 2 处的收益可能更大 [推断]，
+  要到生产 Mac 上按第 2 条重测。
 
 ### 第 4 条：把访问计数挪出单线程合并段
 
@@ -212,7 +224,7 @@
 ## 8. 下一步
 
 1. 实现第 1 条（单独信息集 + q 可调），按 §4.5 验证。
-2. 加上第 3、4 条不改变结果的小修。
+2. 加上第 4 条不改变结果的小修（第 3 条已做）。
 3. 实现 §5.2 办法一。
 4. 生产 Mac 上按第 2 条测量。
 5. 视结果决定第 5、6、7 条和 100 桶对比实验。
