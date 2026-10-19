@@ -51,6 +51,7 @@ pub mod regret;
 pub mod sampling;
 pub mod subgame;
 pub mod subgame_leaf_value;
+pub mod subgame_trainer;
 pub mod trainer;
 
 // API-300 / API-380 顶层公开 surface（与 `docs/pluribus_stage3_api.md` §8 对齐）。

@@ -1,7 +1,7 @@
 //! `SubgameNlheGame`（S6 实时搜索 6a：单层 subgame depth-limited re-solve 的 `Game` 壳）。
 //!
 //! 设计依据 `docs/temp/realtime_search_design_2026_06_03.md`。把"以中途 public state 为根、对各家
-//! range 做期望"的 subgame 包成一个 [`Game`]，从而**原样复用** [`EsMccfrTrainer`] /
+//! range 做期望"的 subgame 包成一个 [`Game`]，从而**原样复用** [`EsMccfrTrainer`](crate::training::trainer::EsMccfrTrainer) /
 //! [`VanillaCfrTrainer`]（`trainer.rs` 一行不改）。
 //!
 //! # 三个复用 + 一个新 root
@@ -14,8 +14,9 @@
 //!   保留中途 public state（街 / 公共牌前缀 / 下注 / 行动权）+ 重发隐藏牌（各家底牌 + 未见
 //!   runout）。§5b 后底牌按 per-seat blueprint **range 加权**采样（[`resample_hidden_with_holes`]
 //!   (crate::rules::state::GameState::resample_hidden_with_holes)），`use_blueprint_range=false`
-//!   时退 uniform（[`GameState::resample_hidden`]）。[`EsMccfrTrainer::step`] 每 step 调一次
-//!   `root` → 每 step 一个隐藏信息补全 = external chance sampling。
+//!   时退 uniform（[`GameState::resample_hidden`]）。[`EsMccfrTrainer::step`](crate::training::trainer::EsMccfrTrainer::step) 每 step 调一次
+//!   `root` → 每 step 一个隐藏信息补全 = external chance sampling。实时搜索生产求解用同算法的
+//!   数组存储版 [`SubgameTrainer`]（逐位同结果，见 `subgame_trainer.rs`）。
 //! - **终局收益仍走权威 [`GameState::payouts`]**（side pot / showdown 逻辑不改）→ S1 PokerKit
 //!   跨验证不受影响。
 //!
@@ -54,7 +55,7 @@ use crate::training::nlhe_betting_tree::{
 use crate::training::opponent_profile::OpponentProfile;
 use crate::training::sampling::sample_discrete;
 use crate::training::subgame_leaf_value::LeafValueTables;
-use crate::training::trainer::{EsMccfrTrainer, Trainer};
+use crate::training::subgame_trainer::SubgameTrainer;
 
 // ===========================================================================
 // 调试日志（advisor `--debug-log`）：进程级开关，**仅 eprintln 到 stderr**，绝不改任何计算值
@@ -399,6 +400,11 @@ impl SubgameNlheGame {
         &self.subtree
     }
 
+    /// 本 subgame 用的桶表（[`SubgameTrainer`] 按它的每街桶数给数组分块）。
+    pub(crate) fn bucket_table(&self) -> &BucketTable {
+        &self.bucket_table
+    }
+
     /// 按 `self.ranges` 为每个**未弃牌**座位采样一手底牌（顺序 card-removal：逐座位限制到
     /// 「未被 board / 已采样底牌占用」的 hole 上按权采样）。返回 per-seat `Option<[Card;2]>`
     /// （弃牌座 None）。
@@ -541,7 +547,7 @@ impl SubgameNlheGame {
     /// **同路径**（`street_tag = self.subtree.node(node_id).street`；postflop 走
     /// `canonical_observation_id` + `self.bucket_table.lookup`；同一 [`pack_info_set_v2`] 打包），
     /// 只是树换成本子树。故对子树 solve 期 `Game::info_set(state, actor)`（state 携 subtree 节点 +
-    /// 同一 hole/board）**逐位相等** → [`Trainer::average_strategy`] 命中同一 infoset 的解。档二′
+    /// 同一 hole/board）**逐位相等** → [`Trainer::average_strategy`](crate::training::trainer::Trainer::average_strategy) 命中同一 infoset 的解。档二′
     /// 跨街复用用它沿上一街实际动作线为任意候选 `hole` 读 σ（[`cross_street_posterior_range`]）。
     ///
     /// `board` 须是该街实际公共牌（flop=3 / turn=4 / river=5；preflop 忽略），否则
@@ -881,7 +887,7 @@ pub struct SubgameSearchConfig {
     /// 缺口①（`realtime_search_openpoker_exec` §2.3 / §4.1 A②）：`true` = 子树解用 **LCFR**
     /// 加权（Brown & Sandholm 2018 linear discounting）——同迭代 / 同 wall 离收敛更近，是限时
     /// 的第一杠杆。period 按 [`iterations`](Self::iterations) 现算小值（≈ `iterations/50`，使
-    /// `总更新/period` 落进 [`EsMccfrTrainer::with_lcfr_period`] 要求的 20–100，见 `trainer.rs:332`；
+    /// `总更新/period` 落进 [`EsMccfrTrainer::with_lcfr_period`](crate::training::trainer::EsMccfrTrainer::with_lcfr_period) 要求的 20–100，见 `trainer.rs:332`；
     /// `iterations<50` 时 clamp 到 1）。`false`（默认）= vanilla ES-MCCFR——**保持既有 probe /
     /// advisor / §11.5 A/B 基线 byte-equal、不改生产行为**。机制已在共享 `EsMccfrTrainer`、零新核；
     /// 两条路都确定性（固定迭代 + seed）→ 接 LCFR 后静态选粒度路径仍 byte-equal（设计 §5）。
@@ -915,7 +921,7 @@ pub struct SubgameSearchConfig {
     /// [`depth_limit`]: Self::depth_limit
     pub deep_menu: bool,
     /// 缺口①续（限时杠杆②，与 LCFR 正交）：`true` = subgame solve 的 traverser 只轮**子树根
-    /// 仍 `Active`** 的座位（[`EsMccfrTrainer::with_traverser_rotation`]）。弃牌 / all-in 座在
+    /// 仍 `Active`** 的座位（[`EsMccfrTrainer::with_traverser_rotation`](crate::training::trainer::EsMccfrTrainer::with_traverser_rotation)）。弃牌 / all-in 座在
     /// 子树里**零决策节点**（规则引擎只让 `Active` 座当 `current_player`）→ 默认 `0..n_seats`
     /// 轮转下轮到它们的迭代纯零学习（σ / regret 都只在 `actor == traverser` 节点累积，
     /// `trainer.rs` `recurse_es`）；只轮 Active 座 = 同 wall 有效迭代 ×`n_seats/n_active`
@@ -941,7 +947,7 @@ pub struct SubgameSearchConfig {
     /// 时有意义。进 solve 缓存 key（cfg 字段 + 混合后 reach 向量双重覆盖）。clamp 到 [0,1]。
     pub range_uniform_mix: f64,
     /// solve update 并行线程数（2026-06-12 限时杠杆③）：`>1` = 子树 CFR 走
-    /// [`EsMccfrTrainer::step_parallel`]（rayon pool + thread-local delta 确定性合并，
+    /// [`EsMccfrTrainer::step_parallel`](crate::training::trainer::EsMccfrTrainer::step_parallel)（rayon pool + thread-local delta 确定性合并，
     /// blueprint 训练已验证的同一路径）——同 wall 预算 update 数 ≈ ×核数，给 deep_menu
     /// 加宽下注档（infoset 乘性变多 → per-bucket 样本变稀）换回采样密度。**注意杠杆边界**：
     /// 并行只助 solve 侧；深码×多人的真瓶颈是单线程建树（exec 文档 §4.1 A②），build wall
@@ -1159,7 +1165,7 @@ fn search_seed(base: u64, hand_seed: u64, ordinal: u64) -> u64 {
 /// `search_seed(master, SALT, tid)`）。与单线程档的 `master ^ 0xC0FF…` 流天然不同。
 const SOLVE_THREADS_RNG_SALT: u64 = 0x5448_5244;
 
-/// [`EsMccfrTrainer::step_parallel`] 每 worker 每批 trajectory 数（调度摊薄 knob，
+/// [`EsMccfrTrainer::step_parallel`](crate::training::trainer::EsMccfrTrainer::step_parallel) 每 worker 每批 trajectory 数（调度摊薄 knob，
 /// `train_cfr` 默认同值；详 trainer.rs「为什么需要 batching」）。deadline 检查粒度 =
 /// `solve_threads × 本值` 个 update（~11–33 µs/update → 数百 µs 一批）。
 const SOLVE_PARALLEL_BATCH: u64 = 16;
@@ -1645,7 +1651,7 @@ fn subtree_decisions_on_real_line(
 /// 后验：`range[seat][h] ∝ prev_root_range[seat][h] × Π_{seat 的上一街决策} σ_prev(action|h)`。
 /// `prev_root_range` = 上一街子树解所**条件化的** root range（[`SubgameNlheGame::ranges`]，已含
 /// preflop 先验 + λ 混合；`None` = uniform）；σ_prev 从 `prev.trainer` 沿上一街子树实际动作线逐点读
-/// （[`SubgameNlheGame::info_set_for_cards`] 子树索引 + [`Trainer::average_strategy`]）。§0.3 双重
+/// （[`SubgameNlheGame::info_set_for_cards`] 子树索引 + [`Trainer::average_strategy`](crate::training::trainer::Trainer::average_strategy)）。§0.3 双重
 /// 批评（节点错 + 码深错）在此失效——子树真规则真码深 → AllIn 边在真栈下就是真 all-in，σ 答的是
 /// 正确问题，**不需档一「跳过 AllIn-tag」补丁**。DeepStack continual re-solving 的街间 belief 递归
 /// （两边 belief 都用子树 σ 更新 = 与档一同质「对手按真栈均衡打」假设一致，只推深一街，§(d)）。
@@ -1795,7 +1801,7 @@ fn cross_street_posterior_range(
 /// （[`KEY_KIND_ANCHORED`]/[`KEY_KIND_UNANCHORED`]）→ 不同路径解的 key 不碰撞、缓存内不串条目；跨街
 /// 复用本身 kind-agnostic（身份靠 hand_seed 加 board 前缀加导航三道守，§2.1）。
 struct SolvedSubgame {
-    trainer: EsMccfrTrainer<SubgameNlheGame>,
+    trainer: SubgameTrainer,
     sub_abs: StreetActionAbstraction,
     hand_seed: u64,
 }
@@ -1904,7 +1910,7 @@ impl SubgameSolveCache {
         }
     }
 
-    /// 当前缓存条目 solve 的更新数（[`Trainer::update_count`]，ES-MCCFR 每 `step` 一次
+    /// 当前缓存条目 solve 的更新数（[`Trainer::update_count`](crate::training::trainer::Trainer::update_count)，ES-MCCFR 每 `step` 一次
     /// traverser 递归 +1）。`time_budget` anytime 下这就是「预算内实际完成多少 update」的
     /// 读数口（advisor 遥测）；命中时返回被复用 solve 的原始计数（同街共享同一 solve 的
     /// 语义一致）。无条目 → `None`。
@@ -2698,7 +2704,7 @@ fn solve_subgame(
     sub: SubgameNlheGame,
     cfg: &SubgameSearchConfig,
     master: u64,
-) -> Result<EsMccfrTrainer<SubgameNlheGame>, String> {
+) -> Result<SubgameTrainer, String> {
     let n_nodes = sub.subtree().num_nodes();
     if n_nodes == 0 || n_nodes > cfg.max_subtree_nodes {
         return Err(format!(
@@ -2723,7 +2729,9 @@ fn solve_subgame(
     // （update_count==0）→ with_lcfr_period 前置满足。LCFR rescale 确定性（固定迭代 + seed）→
     // 仍 byte-equal 可复现；vanilla（默认）保持既有行为不变。
     // 访问计数只记账、不改 regret / σ / rng 流（与不计数逐位相同），供读数门槛用。
-    let base = EsMccfrTrainer::new(sub, master).with_visit_counts();
+    // 数组存储（[`SubgameTrainer`]）：与 `EsMccfrTrainer` 同算法、逐位同结果，只把 HashMap 换成按
+    // 子树节点 × 桶下标的数组。`master` 只派生下面的 rng 种子。
+    let base = SubgameTrainer::new(sub).with_visit_counts();
     let mut trainer = if cfg.lcfr {
         base.with_lcfr_period(lcfr_period(cfg))
     } else {
@@ -2798,11 +2806,7 @@ fn solve_subgame(
 
 /// hero 真实手在 `cur_node` 落点信息集的遍历者访问次数（trainer 未开计数 → `None`）。与
 /// [`read_current_strategy`] 的门槛判同一个信息集（同一 `query_at`）。
-fn hero_visit_count(
-    trainer: &EsMccfrTrainer<SubgameNlheGame>,
-    cur_node: NodeId,
-    auth: &GameState,
-) -> Option<u32> {
+fn hero_visit_count(trainer: &SubgameTrainer, cur_node: NodeId, auth: &GameState) -> Option<u32> {
     let (info, _) = trainer.game().query_at(cur_node, auth);
     trainer.visit_count(&info)
 }
@@ -2812,7 +2816,7 @@ fn hero_visit_count(
 /// 是当前街 betting 后的深层节点，其合法集须用当前几何算（RoundStart 的 round-start template
 /// 几何不符，见 [`SubgameNlheGame::query_at`] doc）。
 fn read_current_strategy(
-    trainer: &EsMccfrTrainer<SubgameNlheGame>,
+    trainer: &SubgameTrainer,
     cur_node: NodeId,
     auth: &GameState,
     auth_actor: PlayerId,
@@ -2846,7 +2850,7 @@ fn read_current_strategy(
     // strategy is no substitute: after one or a few traversals it is one sampled opponent
     // hand's best response (2026-10-16 replay: single-visit RM said raise 1.00 where the
     // 100k-iteration solve says call 0.99).
-    let Some(sum) = trainer.strategy_sum().inner().get(&info) else {
+    let Some(sum) = trainer.tables().strategy_sum_row(info) else {
         return Err(
             "subgame 当前决策 infoset 无 strategy_sum（只被对手遍历路过，hero 遍历未到达）"
                 .to_string(),
@@ -3693,8 +3697,7 @@ pub fn subgame_search_unanchored_prewarm_cross(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `ChaCha20Rng` / `AbstractActionTag` / `EsMccfrTrainer` / `Trainer` 已由 `use super::*`
-    // 从父模块带入；这里只补父模块未引入的项。
+    // `ChaCha20Rng` / `AbstractActionTag` 已由 `use super::*` 从父模块带入；这里只补父模块未引入的项。
     use crate::abstraction::action::AbstractAction;
     use crate::abstraction::bucket_table::BucketConfig;
     use crate::core::{ChipAmount, SeatId};
@@ -3704,6 +3707,7 @@ mod tests {
     };
     use crate::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
     use crate::training::subgame_leaf_value::{build_leaf_value_tables, default_continuations};
+    use crate::training::trainer::{EsMccfrTrainer, Trainer};
 
     fn stub_table() -> Arc<BucketTable> {
         Arc::new(BucketTable::stub_for_postflop(
@@ -9049,7 +9053,7 @@ mod tests {
             live_entrants(&auth),
             0,
         );
-        let mut trainer = EsMccfrTrainer::new(sub, 0x5245_4752);
+        let mut trainer = SubgameTrainer::new(sub);
         let root = trainer.game().subtree().root_id();
         let actor = auth.current_player().expect("decision node").0 as PlayerId;
         let (info, legal) = trainer.game().query_at(root, &auth);
@@ -9058,8 +9062,7 @@ mod tests {
         // Fixture has no all-in collapse at the root → projection is the identity, so the
         // returned vector can be compared position by position.
         assert_eq!(legal.len(), n);
-        let read =
-            |t: &EsMccfrTrainer<SubgameNlheGame>| read_current_strategy(t, root, &auth, actor, 0);
+        let read = |t: &SubgameTrainer| read_current_strategy(t, root, &auth, actor, 0);
         let uniform = vec![1.0 / n as f64; n];
 
         // Never visited at all: pre-existing guard.
@@ -9068,13 +9071,15 @@ mod tests {
 
         // Opponent-traversal-only visit: regret slot created (all zero), no strategy_sum entry.
         // The trainer reports uniform here — the trap this guard closes.
-        trainer.regret.get_or_init(info, n);
+        trainer.tables_mut().init_regret(info, n);
         assert_eq!(trainer.average_strategy(&info), uniform);
         let err = read(&trainer).unwrap_err();
         assert!(err.contains("无 strategy_sum"), "unexpected err: {err}");
 
         // Traversed with own reach 0: strategy_sum entry all zero.
-        trainer.strategy_sum.accumulate(info, &vec![0.0; n]);
+        trainer
+            .tables_mut()
+            .accumulate_strategy(info, &vec![0.0; n]);
         assert_eq!(trainer.average_strategy(&info), uniform);
         let err = read(&trainer).unwrap_err();
         assert!(err.contains("均匀占位"), "unexpected err: {err}");
@@ -9083,19 +9088,19 @@ mod tests {
         // (RM on zero regrets), average exactly uniform. Learned regrets do not rescue it — the
         // current strategy after one visit is one sampled hand's best response.
         trainer
-            .strategy_sum
-            .accumulate(info, &vec![0.6 / n as f64; n]);
+            .tables_mut()
+            .accumulate_strategy(info, &vec![0.6 / n as f64; n]);
         let mut delta = vec![-5.0; n];
         delta[0] = 1.0;
         delta[1] = 3.0;
-        trainer.regret.accumulate(info, &delta);
+        trainer.tables_mut().accumulate_regret(info, &delta);
         assert_eq!(trainer.average_strategy(&info), uniform);
         let err = read(&trainer).unwrap_err();
         assert!(err.contains("均匀占位"), "unexpected err: {err}");
 
         // A later traversal accumulates a non-uniform σ → the average carries a solved mix.
         let w: Vec<f64> = (1..=n).map(|i| i as f64).collect();
-        trainer.strategy_sum.accumulate(info, &w);
+        trainer.tables_mut().accumulate_strategy(info, &w);
         let (probs, _) = read(&trainer).expect("learned infoset must be readable");
         let sum: Vec<f64> = w.iter().map(|wi| wi + 0.6 / n as f64).collect();
         let total: f64 = sum.iter().sum();
@@ -9124,22 +9129,18 @@ mod tests {
                 0,
             )
         };
-        let mut tracked = EsMccfrTrainer::new(sub(), 0x4D49_4E56).with_visit_counts();
-        let mut untracked = EsMccfrTrainer::new(sub(), 0x4D49_4E56);
+        let mut tracked = SubgameTrainer::new(sub()).with_visit_counts();
+        let mut untracked = SubgameTrainer::new(sub());
         let root = tracked.game().subtree().root_id();
         let actor = auth.current_player().expect("decision node").0 as PlayerId;
         let (info, _) = tracked.game().query_at(root, &auth);
         let n = tracked.game().subtree().node(root).legal_actions.len();
         let w: Vec<f64> = (1..=n).map(|i| i as f64).collect();
         for t in [&mut tracked, &mut untracked] {
-            t.regret.get_or_init(info, n);
-            t.strategy_sum.accumulate(info, &w);
+            t.tables_mut().init_regret(info, n);
+            t.tables_mut().accumulate_strategy(info, &w);
         }
-        tracked
-            .visit_counts
-            .as_mut()
-            .expect("tracking on")
-            .insert(info, 7);
+        tracked.set_visit_count(info, n, 7);
         assert_eq!(hero_visit_count(&tracked, root, &auth), Some(7));
         assert_eq!(hero_visit_count(&untracked, root, &auth), None);
 
