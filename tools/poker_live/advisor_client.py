@@ -129,6 +129,12 @@ def add_advisor_args(p, default_seats, debug_help):
     # 平跟当弃牌（方案 B，advisor 默认 off）：on = 非 SB 开池平跟在 blueprint 影子里记为弃牌，
     # 平跟池翻后搜索拿到范围前缀；翻前仍由 limp_heuristic 决定。不传 = 吃 advisor 默认（OFF）。
     p.add_argument("--search-limp-as-fold", choices=["on", "off"], default=None)
+    # 搜索读数门槛（advisor 默认 200）：hero 信息集在 solve 里被遍历不足这么多次就不用这份解，
+    # flop 退回 blueprint、转牌 / 河牌兜底；0 = 关。不传 = 吃 advisor 默认。
+    p.add_argument("--search-min-hero-visits", type=int, default=None)
+    # 弱牌押上全部筹码护栏（advisor 默认 on）：翻后弱牌不全下、不做投入过半剩余筹码的加注。
+    # 不传 = 吃 advisor 默认（ON）。
+    p.add_argument("--search-weak-commit-guard", choices=["on", "off"], default=None)
     # 深码 SPR 自适应菜单（deep_menu_for：深 {1pot} / 浅 ≤3-way {0.5,1} 全层级）。
     p.add_argument("--search-deep-menu", action="store_true")
     # 子树 solve 的 traverser 只轮子树根仍 Active 的座（弃牌座轮到 = 零学习迭代）。
@@ -183,6 +189,12 @@ def validate_advisor_args(args):
     if args.search_limp_as_fold is not None and not args.search:
         raise SystemExit("--search-limp-as-fold 需配 --search"
                          "（拒绝静默：它只给翻后搜索提供范围前缀，没有搜索设了无意义）")
+    if args.search_min_hero_visits is not None and not args.search:
+        raise SystemExit("--search-min-hero-visits 需配 --search（它只管搜索读数）")
+    if args.search_min_hero_visits is not None and args.search_min_hero_visits < 0:
+        raise SystemExit("--search-min-hero-visits 须 ≥ 0")
+    if args.search_weak_commit_guard is not None and not args.search:
+        raise SystemExit("--search-weak-commit-guard 需配 --search（护栏挂在 advisor 搜索运行时上）")
 
 
 def advisor_extra_args(args, warm_profile_hh=None):
@@ -214,6 +226,10 @@ def advisor_extra_args(args, warm_profile_hh=None):
             extra += ["--search-flop-prefer-blueprint", args.search_flop_prefer_blueprint]
         if args.search_limp_as_fold is not None:
             extra += ["--search-limp-as-fold", args.search_limp_as_fold]
+        if args.search_min_hero_visits is not None:
+            extra += ["--search-min-hero-visits", str(args.search_min_hero_visits)]
+        if args.search_weak_commit_guard is not None:
+            extra += ["--search-weak-commit-guard", args.search_weak_commit_guard]
         if args.search_deep_menu:
             extra.append("--search-deep-menu")
         if args.search_live_traversers is not None:

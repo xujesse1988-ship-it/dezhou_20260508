@@ -63,6 +63,18 @@ k=6/7/8/9 = 557k / 3.07M / 15.5M / 72.6M 节点,单加注池 9-way 1.47M;≥7 �
 翻前 / 未开搜索走兜底 `fallback:blueprint_placeholder`;range 估计对空 σ 本就按 1/n,不变);② driver 对不带 amount
 的 all_in 按 `stack_before` 补投入、剩余栈记 0(修前起始栈被算成只剩已投入部分,run3 一手 BB 算成 44 → 搜索放弃)。
 
+**搜索读数门槛 + 弱牌押上全部筹码护栏(2026-10-19)**。起因:实盘 65c 在 3h9d8s 面对 2 倍池下注,搜索给 allin 0.55
+推掉 100BB(对手暗三条);同一请求换 3 个种子 allin = 0.55 / 0.09 / 0.002,该信息集没解稳。① `EsMccfrTrainer::with_visit_counts`
+记每个信息集作为遍历者的访问数(只记账,regret / σ / rng 逐位不变),子博弈求解一律开;`read_current_strategy` 加门槛
+`SubgameSearchConfig::min_hero_visits`(advisor `--search-min-hero-visits`,默认 200,0 = 关),不足 → `low_hero_visits`
+拒读:锚定 flop 退回 blueprint 同一节点(`source=blueprint:low_hero_visits`,真码深闸不过则兜底),转牌 / 河牌 /
+脱锚走 `search_giveup:*:low_hero_visits`。每次搜索读数的访问数写进响应 `hero_visits`。200 来自本机近似实验
+(9 座测试 blueprint + 500 桶 + 生产搜索参数):访问 ≤ 150 的读数几乎都一边倒,**生产值待按实盘 `hero_visits` 标定**。
+② `--search-weak-commit-guard on|off`(默认 on):翻后弱牌(坚果度 < 0.75 且顺子 / 同花出牌 < 8)时,把全下和
+「新投入 ≥ 一半剩余筹码」的下注 / 加注的概率按比例挪给过牌 / 跟注 / 弃牌,`source` 追加 `:weak_commit_guard`,
+`probs` 仍记原分布。这是针对跟注偏多的对手池的剥削,不是修均衡。另:超出菜单最大档(1pot)的下注在搜索里仍压成 1pot
+(本街从起点建树,菜单与 blueprint 翻牌同为 {0.5,1}),翻牌尺寸闸转去搜索对超池注不解决尺寸问题,尚未修。
+
 **S6 进度(2026-06-03):实时搜索推进,MVP subgame-solver 核心已落地 + vultr 验证**(分支 `6max-rts-mvp`
 commit `cf9efdb`,**未并入 6max**)。设计成文 `temp/realtime_search_design_2026_06_03.md`(文献调研+代码复用映射+
 对抗验证):方法定型 = Pluribus/Modicum tabular depth-limited search(非 DeepStack/ReBeL)。三件落地:①

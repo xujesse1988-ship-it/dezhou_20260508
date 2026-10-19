@@ -101,8 +101,8 @@ use poker::training::openpoker_hh::{hh_record_to_observe, hist_to_concrete, HhRe
 use poker::training::opponent_profile::{ExploitConfig, ObserveHand, OpponentProfile, Profiler};
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
-    chen_score, is_blueprint_cropped_err, set_subgame_debug, should_search, subgame_search_cached,
-    subgame_search_prewarm, subgame_search_unanchored_cached_cross_exploit,
+    chen_score, is_blueprint_cropped_err, is_low_hero_visits_err, set_subgame_debug, should_search,
+    subgame_search_cached, subgame_search_prewarm, subgame_search_unanchored_cached_cross_exploit,
     subgame_search_unanchored_prewarm_cross, synced_prefix_decisions, ExploitPrior, ExploitShape,
     PrefixReach, ResolveRoot, SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
 };
@@ -176,6 +176,19 @@ const DEFAULT_SEARCH_LIMP_AS_FOLD: bool = false;
 /// check / fold；提到 20 万。557k 节点约 100MB（`docs/status_v3.md`），20 万约 36MB，单次建树内存
 /// 可控；更大的上限等换更高配置的机器再定。
 const DEFAULT_SEARCH_MAX_NODES: usize = 200_000;
+/// 搜索读数门槛的 advisor 默认（`--search-min-hero-visits`，[`SubgameSearchConfig::min_hero_visits`]）：
+/// hero 落点信息集在 solve 里被遍历不足这么多次 → 不用这份解。flop 退回 blueprint 同一节点
+/// （[`decide`]），转牌 / 河牌走 `search_giveup` 兜底。`0` = 关。
+///
+/// 取值依据（2026-10-19，本机近似实验，**不是生产标定**）：9 座测试 blueprint + 500 桶 + 生产搜索参数
+/// （561,216 次、deep_menu、live traversers、λ=0.25），重放实盘 65c 面对翻牌 2 倍池下注那一请求，
+/// 7 种底牌 × 5 个种子。访问 ≤ 150 次的读数几乎都是一边倒（65c 访问 27 次 allin 0.94、T7c 访问
+/// 26 / 109 次 allin 0.70 / 0.91），上千次后各种子才都是混合策略。同一节点的访问数随种子从个位数
+/// 到上千不等（取决于解里对手走这条线的频率），所以门槛管的是「这一次解」而不是节点本身。生产
+/// 范围更窄，实际分布要看决策日志的 `hero_visits` 再定。
+const DEFAULT_SEARCH_MIN_HERO_VISITS: u32 = 200;
+/// 弱牌押上全部筹码护栏的默认（`--search-weak-commit-guard`，[`weak_commit_guard`]）：**默认开**。
+const DEFAULT_SEARCH_WEAK_COMMIT_GUARD: bool = true;
 /// flop 优先 blueprint 的有效码深区间（BB，含端点；[`flop_blueprint_stack_gate`]）。hero 与每个
 /// 未弃牌对手的 hand-start 有效码深都须落在区间内，否则 flop 照常实时搜索。
 const FLOP_BLUEPRINT_EFF_STACK_BB_MIN: u64 = 60;
@@ -333,6 +346,11 @@ struct Response {
     /// （serde skip → 旧输出 byte-equal）。离线分析「哪些手剥削了谁」用，不影响决策。
     #[serde(skip_serializing_if = "Option::is_none")]
     exploit: Option<Vec<(u8, f64)>>,
+    /// 搜索读数遥测：hero 落点信息集在 solve 里的遍历者访问次数
+    /// （[`SubgameSolveCache::last_read_visits`]，[`SubgameSearchConfig::min_hero_visits`] 判的就是它）。
+    /// 搜索走到读数的决策才填（含因访问不足被拒的那次）；blueprint / 其余兜底恒 `None`（serde skip）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hero_visits: Option<u32>,
 }
 
 /// 策略分布 → 日志格式：label 同 `chosen`，概率四舍五入 4 位小数（采样仍用全精度 `dist`，
@@ -580,6 +598,10 @@ struct SearchRuntime {
     /// 画像（单线程 advisor 循环；solve 并行不碰它，只吃决策时算好的 owned 画像快照）。`None`（默认 /
     /// `--exploit` 关）= 不剥削，[`decide_search_unanchored`] 退既有 search:unanchored（byte-equal）。
     exploit: Option<RefCell<Profiler>>,
+    /// `--search-weak-commit-guard on|off`（[`DEFAULT_SEARCH_WEAK_COMMIT_GUARD`]，默认开）：出牌抽样前
+    /// 对翻后弱牌去掉「押上全部筹码」的动作（[`weak_commit_guard`]），锚定 / 脱锚搜索与 flop
+    /// blueprint 路径都管。`false` = 原分布抽样（旧行为）。
+    weak_commit_guard: bool,
 }
 
 /// RoundStart 预热（`Request.prewarm = true`，driver `--search-prewarm` 在街起点、hero 行动
@@ -1643,6 +1665,10 @@ fn decide(
     let mut auth_holder: Option<GameState> = None;
     let mut deep_abs_holder: Option<StreetActionAbstraction> = None;
     let mut solve_updates: Option<u64> = None;
+    let mut hero_visits: Option<u32> = None;
+    // 搜索读数因 hero 信息集访问不足被拒、flop 退回 blueprint 同一节点出牌（source 标
+    // `blueprint:low_hero_visits`；outgoing 同 blueprint 路径：100BB `real` + blueprint 抽象）。
+    let mut low_visits_bp = false;
     let dist: Vec<(AbstractAction, f64)> = if want_search {
         let rt = search.expect("want_search ⇒ search.is_some()");
         let scfg = &rt.cfg;
@@ -1733,6 +1759,7 @@ fn decide(
                 let wall_ms = t0.elapsed().as_millis();
                 let hit = solve_cache.misses() == misses_before;
                 solve_updates = solve_cache.entry_update_count();
+                hero_visits = solve_cache.last_read_visits();
                 log_search_wall(
                     "",
                     street,
@@ -1752,14 +1779,45 @@ fn decide(
             // 解不出来（建不了/未访问/失同步/限时连一轮迭代都未完成）→ check-when-free，不回落 blueprint。
             // crop 缺后验（补解不成）单独分桶 `search_giveup:crop_no_posterior:*`。
             Err(reason) => {
-                // auth 已建（此 Err 分支未 move 走）→ 喂底池赔率 floor。
-                return fallback_with_floor(
-                    &req.valid,
-                    hole,
-                    &board,
-                    pot_odds_from_auth(&auth, &solver_cfg),
-                    giveup_source("unsolved", &reason),
-                );
+                hero_visits = solve_cache.last_read_visits();
+                // 访问量门槛拒读（SubgameSearchConfig::min_hero_visits）：flop 上 blueprint 保留了
+                // 这个节点、训练量远大于一次搜索 → 退回它（真码深闸不过 = 100BB 影子的底池赔率 /
+                // SPR 不可信 → 不退，走下面兜底）。转牌 / 河牌 blueprint 已裁掉，只能兜底。
+                let bp_max = scfg.blueprint_max_street;
+                let bp_ok = is_low_hero_visits_err(&reason)
+                    && street == poker::Street::Flop
+                    && matches!(street_tag_of(street), Some(t) if t as u8 <= bp_max as u8)
+                    && flop_blueprint_stack_gate(
+                        req,
+                        &solver_cfg,
+                        scale,
+                        &smap,
+                        &auth,
+                        my_seat_solver,
+                    )
+                    .is_ok();
+                match bp_ok
+                    .then(|| blueprint_distribution(&info, &legal_abs, strategy_fn))
+                    .flatten()
+                {
+                    Some(d) => {
+                        dlog!("search low_hero_visits ({reason}) → flop blueprint");
+                        low_visits_bp = true;
+                        d
+                    }
+                    None => {
+                        // auth 已建（此 Err 分支未 move 走）→ 喂底池赔率 floor。
+                        let mut resp = fallback_with_floor(
+                            &req.valid,
+                            hole,
+                            &board,
+                            pot_odds_from_auth(&auth, &solver_cfg),
+                            giveup_source("unsolved", &reason),
+                        );
+                        resp.hero_visits = hero_visits;
+                        return resp;
+                    }
+                }
             }
         }
     } else {
@@ -1774,9 +1832,20 @@ fn decide(
     // blueprint 抽象（旧行为；search=None / 非 deep 路径 byte-equal 不受影响）。
     let outgoing_abs: &StreetActionAbstraction = deep_abs_holder.as_ref().unwrap_or(abstraction);
 
+    // 弱牌押上全部筹码护栏（只在开搜索且 --search-weak-commit-guard on 时；blueprint 路径一并管）。
+    let guarded = search
+        .filter(|rt| rt.weak_commit_guard)
+        .and_then(|_| weak_commit_guard(&dist, hole, &board, outgoing_state, outgoing_abs));
+    if let Some(g) = &guarded {
+        dlog!("weak_commit_guard: {dist:?} → {g:?}");
+    }
+
     // per-decision 确定性采样（保混合策略 + 可复现；seed 与搜索与否无关 → search=None byte-equal）。
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed, n_seats));
-    let chosen = sample_discrete(&prune_for_sampling(&dist), &mut sample_rng);
+    let chosen = sample_discrete(
+        &prune_for_sampling(guarded.as_deref().unwrap_or(&dist)),
+        &mut sample_rng,
+    );
 
     // —— outgoing：solver Action → OpenPoker {action, amount}（blueprint / search 共享映射）——
     let solver_action = match outgoing_action(outgoing_state, outgoing_abs, chosen) {
@@ -1809,13 +1878,20 @@ fn decide(
         // 合法动作：填 source（search / blueprint）+ 诊断。不合法时 action_to_response 已产
         // safe_fallback（source = fallback:...），不覆盖。bet/raise 退成 call/check 时追加降级标记。
         resp.source = format!(
-            "{}{}",
-            if placeholder_search {
+            "{}{}{}",
+            if low_visits_bp {
+                "blueprint:low_hero_visits"
+            } else if placeholder_search {
                 "search:bp_placeholder"
             } else if want_search {
                 "search"
             } else {
                 "blueprint"
+            },
+            if guarded.is_some() {
+                ":weak_commit_guard"
+            } else {
+                ""
             },
             degrade.unwrap_or("")
         );
@@ -1824,6 +1900,7 @@ fn decide(
         resp.chosen = Some(action_label(&chosen));
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates; // blueprint 路径恒 None（serde skip，byte-equal）。
+        resp.hero_visits = hero_visits;
     }
     dlog!(
         "decide RESULT: source={} action={} amount={:?} chosen={:?} solve_updates={:?} dist={:?}",
@@ -3045,17 +3122,21 @@ fn decide_search_unanchored(
             )
         },
     );
+    let hero_visits = solve_cache.last_read_visits();
     let dist = match search_result {
         Ok(d) => d,
         Err(reason) => {
             // auth 已建（真栈河牌决策态）→ 喂底池赔率 floor（用户场景：河牌 giveup 被它接住）。
-            return fallback_with_floor(
+            // 访问量门槛拒读也走这里：脱锚路径没有 blueprint 节点可退。
+            let mut resp = fallback_with_floor(
                 &req.valid,
                 hole,
                 board,
                 pot_odds_from_auth(&auth, solver_cfg),
                 giveup_source("unanchored", &reason),
             );
+            resp.hero_visits = hero_visits;
+            return resp;
         }
     };
     let wall_ms = t0.elapsed().as_millis();
@@ -3077,8 +3158,19 @@ fn decide_search_unanchored(
     let deep_abs: Option<StreetActionAbstraction> =
         scfg.deep_menu.then(|| deep_menu_for(&round_start).0);
     let outgoing_abs: &StreetActionAbstraction = deep_abs.as_ref().unwrap_or(abstraction);
+    // 弱牌押上全部筹码护栏（同锚定路径 [`decide`]）。
+    let guarded = rt
+        .weak_commit_guard
+        .then(|| weak_commit_guard(&dist, hole, board, &auth, outgoing_abs))
+        .flatten();
+    if let Some(g) = &guarded {
+        dlog!("weak_commit_guard: {dist:?} → {g:?}");
+    }
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed, n_seats));
-    let chosen = sample_discrete(&prune_for_sampling(&dist), &mut sample_rng);
+    let chosen = sample_discrete(
+        &prune_for_sampling(guarded.as_deref().unwrap_or(&dist)),
+        &mut sample_rng,
+    );
     let solver_action = match outgoing_action(&auth, outgoing_abs, chosen) {
         Ok(a) => a,
         Err(_) => {
@@ -3093,11 +3185,20 @@ fn decide_search_unanchored(
     };
     let (mut resp, degrade) = action_to_response(solver_action, scale, &req.valid);
     if resp.source.is_empty() {
-        resp.source = format!("search:unanchored{}", degrade.unwrap_or(""));
+        resp.source = format!(
+            "search:unanchored{}{}",
+            if guarded.is_some() {
+                ":weak_commit_guard"
+            } else {
+                ""
+            },
+            degrade.unwrap_or("")
+        );
         resp.street = Some(street_label(auth.street()).into());
         resp.chosen = Some(action_label(&chosen));
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates;
+        resp.hero_visits = hero_visits;
         // 叠加剥削遥测：本决策实际剥削了哪些对手座（已收敛）+ 其 VPIP。无收敛对手 → None
         // （serde skip → byte-equal）。
         resp.exploit = exploit_owned.as_ref().and_then(|(profiles, _, _)| {
@@ -3222,6 +3323,168 @@ fn prune_for_sampling(dist: &[(AbstractAction, f64)]) -> Vec<(AbstractAction, f6
     }
     let sum: f64 = kept.iter().map(|&(_, p)| p).sum();
     kept.into_iter().map(|(a, p)| (a, p / sum)).collect()
+}
+
+// ===========================================================================
+// 弱牌押上全部筹码护栏（2026-10-19，run5 调研 §5 第 3 条 + 实盘 65c 翻牌超池注后全下）
+// ===========================================================================
+
+/// 护栏判「押上全部筹码」的门槛：一次下注 / 加注新投入 ≥ 行动前剩余筹码的这个比例，或直接全下。
+/// 只看标签会漏掉实际已套池的大加注（65c 那手 raise1pot 加到 1190、身后只剩 760，底池已近 2900）。
+const WEAK_COMMIT_STACK_SHARE: f64 = 0.5;
+
+/// 护栏判「弱牌」的成牌上限：当前公共牌上的坚果度（[`current_board_nuttiness`]，击败或打平的
+/// 对手组合占比）低于此值算成牌弱，大致对应「低于中对」：中对约 0.80、顶对 / 超对 0.85 以上；
+/// 比中张小的口袋对约 0.72、底对约 0.66、高牌更低（样例见 `weak_hand_classification_reference`）。
+const WEAK_HAND_MAX_NUTTINESS: f64 = 0.75;
+
+/// 护栏放行的强听牌：下一张牌能让 hero 成顺子或更好（且用到底牌）的张数 ≥ 此值
+/// （同花听 9 张、两头顺 8 张；卡顺 4 张不放行）。河牌没有下一张，不看听牌。
+const STRONG_DRAW_MIN_OUTS: u32 = 8;
+
+/// 下一张牌让 hero 从「不到顺子」变成「顺子或更好」、且不是公共牌自己成的张数（flop / turn）。
+/// 只数顺子 / 同花一类的听牌；对子变两对、三条这类改进不算。board 非 3/4 张 → 0。
+fn straight_or_better_outs(hole: [Card; 2], board: &[Card]) -> u32 {
+    use poker::eval::HandCategory;
+    if !(3..=4).contains(&board.len()) {
+        return 0;
+    }
+    let ev = NaiveHandEvaluator;
+    let mut dead = [false; 52];
+    for c in hole.iter().chain(board.iter()) {
+        dead[c.to_u8() as usize] = true;
+    }
+    let made = |cards: &[Card]| match cards.len() {
+        5 => ev.eval5(cards.try_into().expect("5 张")),
+        6 => ev.eval6(cards.try_into().expect("6 张")),
+        _ => ev.eval7(cards.try_into().expect("7 张")),
+    };
+    let mut now: Vec<Card> = hole.to_vec();
+    now.extend_from_slice(board);
+    if made(&now).category() as u8 >= HandCategory::Straight as u8 {
+        return 0; // 已经成顺子或更好：不是听牌，交给坚果度判。
+    }
+    let mut outs = 0;
+    for i in 0u8..52 {
+        if dead[i as usize] {
+            continue;
+        }
+        let c = Card::from_u8(i).expect("0..52 是合法 Card");
+        let mut next = now.clone();
+        next.push(c);
+        let hero = made(&next);
+        if (hero.category() as u8) < HandCategory::Straight as u8 {
+            continue;
+        }
+        // turn 上补成 5 张公共牌：公共牌自己成的顺子 / 同花不算 hero 的出牌（大家都有）。
+        if board.len() == 4 {
+            let mut b5: Vec<Card> = board.to_vec();
+            b5.push(c);
+            if made(&b5) >= hero {
+                continue;
+            }
+        }
+        outs += 1;
+    }
+    outs
+}
+
+/// 护栏意义上的弱牌：翻后、成牌坚果度 < [`WEAK_HAND_MAX_NUTTINESS`]、且没有强听牌
+/// （[`STRONG_DRAW_MIN_OUTS`]）。翻前 → `false`（护栏只管翻后）。
+fn is_weak_postflop_hand(hole: [Card; 2], board: &[Card]) -> bool {
+    if !(3..=5).contains(&board.len()) {
+        return false;
+    }
+    if current_board_nuttiness(hole, board) >= WEAK_HAND_MAX_NUTTINESS {
+        return false;
+    }
+    board.len() == 5 || straight_or_better_outs(hole, board) < STRONG_DRAW_MIN_OUTS
+}
+
+/// `a` 在出牌基准态 `state`（outgoing 同一份）上是否「押上全部筹码」：全下，或下注 / 加注的新投入
+/// ≥ [`WEAK_COMMIT_STACK_SHARE`] × 行动前剩余筹码。金额与实际下单同源（[`outgoing_action`]）；
+/// 算不出来时只把 `AllIn` 当押上（保守）。
+fn commits_stack(state: &GameState, abs: &StreetActionAbstraction, a: AbstractAction) -> bool {
+    let Some(seat) = state.current_player() else {
+        return false;
+    };
+    let p = &state.players()[seat.0 as usize];
+    match outgoing_action(state, abs, a) {
+        Ok(Action::AllIn) => true,
+        Ok(Action::Bet { to }) | Ok(Action::Raise { to }) => {
+            let add = to.as_u64().saturating_sub(p.committed_this_round.as_u64());
+            add as f64 >= WEAK_COMMIT_STACK_SHARE * p.stack.as_u64() as f64
+        }
+        Ok(_) => false,
+        Err(_) => matches!(a, AbstractAction::AllIn { .. }),
+    }
+}
+
+/// 弱牌押上全部筹码护栏（`--search-weak-commit-guard`，[`SearchRuntime::weak_commit_guard`]）。
+/// 翻后弱牌（[`is_weak_postflop_hand`]）时，把「押上全部筹码」的动作（[`commits_stack`]）的概率按
+/// 比例挪给过牌 / 跟注 / 弃牌；没押上的下注档原样保留。分布里没有被动动作（概率全为 0）→ 整份给
+/// 过牌（能过时）或弃牌。不触发（翻前 / 非弱牌 / 没有押上的动作）→ `None`，调用方照原分布抽样。
+///
+/// 这是针对对手池的剥削，不是修正均衡：run5 里对手面对我方超池全下只有 17% 全弃，弱牌诈唬全下
+/// 系统性亏钱（`openpoker_postflop_weak_allin_research_2026_10_17` §3.3）。代价是放弃一部分
+/// 平衡用的诈唬。强牌、强听牌不受影响。
+fn weak_commit_guard(
+    dist: &[(AbstractAction, f64)],
+    hole: [Card; 2],
+    board: &[Card],
+    state: &GameState,
+    abs: &StreetActionAbstraction,
+) -> Option<Vec<(AbstractAction, f64)>> {
+    if board.len() < 3 {
+        return None; // 只管翻后。
+    }
+    let is_passive = |a: &AbstractAction| {
+        matches!(
+            a,
+            AbstractAction::Fold | AbstractAction::Check | AbstractAction::Call { .. }
+        )
+    };
+    let committing: Vec<bool> = dist
+        .iter()
+        .map(|&(a, p)| p > 0.0 && !is_passive(&a) && commits_stack(state, abs, a))
+        .collect();
+    let moved: f64 = dist
+        .iter()
+        .zip(&committing)
+        .filter(|(_, &c)| c)
+        .map(|(&(_, p), _)| p)
+        .sum();
+    if moved <= 0.0 || !is_weak_postflop_hand(hole, board) {
+        return None;
+    }
+    let passive_mass: f64 = dist
+        .iter()
+        .filter(|(a, _)| is_passive(a))
+        .map(|&(_, p)| p.max(0.0))
+        .sum();
+    let mut out: Vec<(AbstractAction, f64)> = Vec::with_capacity(dist.len() + 1);
+    for (&(a, p), &c) in dist.iter().zip(&committing) {
+        if c {
+            continue;
+        }
+        if is_passive(&a) && passive_mass > 0.0 {
+            out.push((a, p + moved * p.max(0.0) / passive_mass));
+        } else {
+            out.push((a, p));
+        }
+    }
+    if passive_mass <= 0.0 {
+        let fallback = if state.legal_actions().check {
+            AbstractAction::Check
+        } else {
+            AbstractAction::Fold
+        };
+        match out.iter_mut().find(|(a, _)| *a == fallback) {
+            Some(slot) => slot.1 += moved,
+            None => out.push((fallback, moved)),
+        }
+    }
+    Some(out)
 }
 
 /// per-decision 确定性 seed：hash(hole, board, actions, base_seed)。保混合策略 + 可复现。
@@ -3483,6 +3746,9 @@ struct Args {
     /// `--search-limp-as-fold on|off`（方案 B，[`SearchRuntime`] doc）。**默认 `false`**
     /// （[`DEFAULT_SEARCH_LIMP_AS_FOLD`]）。仅 `--search` 开时可设。
     search_limp_as_fold: bool,
+    /// `--search-weak-commit-guard on|off`（[`SearchRuntime::weak_commit_guard`]）。**默认 `true`**
+    /// （[`DEFAULT_SEARCH_WEAK_COMMIT_GUARD`]）。仅 `--search` 开时可设。
+    search_weak_commit_guard: bool,
     /// `--exploit`（叠加剥削 Tier 2）：`Some` = 开（进程内画像 → 翻前 range 宽度先验）。**仅 `--search`
     /// 开时可设**（拒静默 guard）。`None`（默认）= 关，全程与现网 byte-equal。子旗 `--exploit-min-hands`
     /// / `--exploit-strength` / `--exploit-converge-se` / `--exploit-converge-drift` 填 [`ExploitConfig`]。
@@ -3650,6 +3916,7 @@ fn run() -> Result<(), String> {
                 limp_as_fold: args.search_limp_as_fold,
                 // 叠加剥削：--exploit 开 → 进程内空表 Profiler（只用本进程数据，不依赖过往）。
                 exploit: args.exploit.map(|cfg| RefCell::new(Profiler::new(cfg))),
+                weak_commit_guard: args.search_weak_commit_guard,
             })
         }
         None => None,
@@ -3677,8 +3944,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} limp_as_fold={} bucket_table={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.limp_as_fold,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} limp_as_fold={} min_hero_visits={} weak_commit_guard={} bucket_table={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.limp_as_fold, scfg.min_hero_visits, rt.weak_commit_guard,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
         if let Some(cell) = &rt.exploit {
@@ -3839,6 +4106,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_unanchored_cross_street: Option<bool> = None;
     let mut search_flop_prefer_blueprint: Option<bool> = None;
     let mut search_limp_as_fold: Option<bool> = None;
+    let mut search_min_hero_visits: Option<u32> = None;
+    let mut search_weak_commit_guard: Option<bool> = None;
     // 叠加剥削（--exploit*，仅 --search 开时生效）。
     let mut exploit_on = false;
     let mut exploit_min_hands: Option<u32> = None;
@@ -3990,6 +4259,23 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     other => return Err(format!("--search-limp-as-fold 须 on|off，得 {other}")),
                 });
             }
+            "--search-min-hero-visits" => {
+                search_min_hero_visits = Some(
+                    next_val(&mut it, &arg)?
+                        .parse()
+                        .map_err(|e| format!("bad search-min-hero-visits: {e}"))?,
+                )
+            }
+            "--search-weak-commit-guard" => {
+                let v = next_val(&mut it, &arg)?;
+                search_weak_commit_guard = Some(match v.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(format!("--search-weak-commit-guard 须 on|off，得 {other}"))
+                    }
+                });
+            }
             "--debug-log" => debug_log = true,
             // —— 叠加剥削（Tier 2）：--exploit 三态总开关（on=VPIP+PFR 形状 / vpip=仅 VPIP，与
             // 现网逐位 byte-equal / off=关），子旗调 ExploitConfig ——
@@ -4076,6 +4362,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             // 限时杠杆③：solve update 并行（SubgameSearchConfig::solve_threads doc）。同预算
             // update 数 ≈ ×核数；只助 solve 侧，建树仍单线程。默认 1 = 既有单线程 byte-equal。
             solve_threads: search_solve_threads.unwrap_or(1),
+            // 读数门槛（SubgameSearchConfig::min_hero_visits doc）：hero 信息集访问不足就不用这份解。
+            min_hero_visits: search_min_hero_visits.unwrap_or(DEFAULT_SEARCH_MIN_HERO_VISITS),
             // 解到终局（深码 / 多人 §2.1）：depth_limit / biased_leaf 均 false（默认）；
             // resolve_root / use_blueprint_range / seed 用默认（RoundStart / true / 固定基）。
             ..SubgameSearchConfig::default()
@@ -4095,6 +4383,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_unanchored_cross_street.is_some()
             || search_flop_prefer_blueprint.is_some()
             || search_limp_as_fold.is_some()
+            || search_min_hero_visits.is_some()
+            || search_weak_commit_guard.is_some()
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
         }
@@ -4167,6 +4457,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             .unwrap_or(DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT),
         // 默认关（旧行为 byte-equal）；--search-limp-as-fold on 显式开。
         search_limp_as_fold: search_limp_as_fold.unwrap_or(DEFAULT_SEARCH_LIMP_AS_FOLD),
+        // 默认开；--search-weak-commit-guard off 显式关。
+        search_weak_commit_guard: search_weak_commit_guard
+            .unwrap_or(DEFAULT_SEARCH_WEAK_COMMIT_GUARD),
         warm_profile_hh,
         debug_log,
     })
@@ -4198,6 +4491,7 @@ mod tests {
             flop_prefer_blueprint: false,
             limp_as_fold: false,
             exploit: None,
+            weak_commit_guard: false,
         }
     }
 
@@ -4211,6 +4505,7 @@ mod tests {
             flop_prefer_blueprint: false,
             limp_as_fold: false,
             exploit: None,
+            weak_commit_guard: false,
         }
     }
 
@@ -4224,6 +4519,7 @@ mod tests {
             flop_prefer_blueprint: false,
             limp_as_fold: false,
             exploit: None,
+            weak_commit_guard: false,
         }
     }
 
@@ -4238,6 +4534,7 @@ mod tests {
             flop_prefer_blueprint: true,
             limp_as_fold: false,
             exploit: None,
+            weak_commit_guard: false,
         }
     }
 
@@ -8232,6 +8529,7 @@ mod tests {
             flop_prefer_blueprint: false,
             limp_as_fold: false,
             exploit: None,
+            weak_commit_guard: false,
         }
     }
 
@@ -8642,6 +8940,7 @@ mod tests {
             flop_prefer_blueprint: prefer,
             limp_as_fold: false,
             exploit: None,
+            weak_commit_guard: false,
         };
         let k = StreetTag::Flop;
         assert!(validate_crop_runtime(k, None).is_err());
@@ -9618,5 +9917,393 @@ mod tests {
         );
         assert_eq!(r.source, "search:unanchored", "{r:?}");
         assert!(is_legal(&r, &short.valid));
+    }
+
+    fn cards(s: &str) -> Vec<Card> {
+        s.split_whitespace()
+            .map(|c| parse_card(c).unwrap())
+            .collect()
+    }
+
+    fn hole_of(s: &str) -> [Card; 2] {
+        let v = cards(s);
+        [v[0], v[1]]
+    }
+
+    /// 护栏的弱牌判定样例（[`is_weak_postflop_hand`]）：低于中对、且没有 8 张以上顺子 / 同花出牌的算弱。
+    /// 坚果度样例（[`current_board_nuttiness`]）：顶对 0.94 / 中对 0.80–0.81 / 比中张小的口袋对 0.72–0.73 /
+    /// 底对 0.65–0.66 / 高牌 ≤ 0.60。
+    #[test]
+    fn weak_hand_classification_reference() {
+        let cases: [(&str, &str, bool); 20] = [
+            // 实盘 65c：卡顺 4 张出牌 → 弱。
+            ("6c 5c", "3h 9d 8s", true),
+            ("Ac 9c", "3h 9d 8s", false), // 顶对
+            ("8c 7c", "3h 9d 8s", false), // 中对 + 卡顺
+            ("7c 7d", "3h 9d 8s", true),  // 两张高牌之下的口袋对
+            ("5c 3c", "3h 9d 8s", true),  // 底对
+            ("Ac Kd", "3h 9d 8s", true),  // 高牌
+            ("Tc Jd", "3h 9d 8s", false), // 两头顺 8 张
+            ("Qh 3d", "Jh Ah 6h", false), // 同花听 9 张
+            ("Qd Jd", "Kd Td 2c", false), // 同花 + 两头顺
+            ("Ts 9s", "Kc Qd Kd", true),  // 卡顺
+            ("9h 8h", "Kc 9s 4d", false), // 中对
+            ("6h 6d", "Kc 9s 4d", true),  // 比中张小的口袋对
+            ("Th Td", "Kc 9s 4d", false), // 中张之上的口袋对
+            ("Ah Ad", "Kc 9s 4d", false), // 超对
+            ("Kc Qd", "5s 9h 2d 8s", true),
+            ("Ad Qd", "Ac 7s 2h 5d", false),
+            ("7d 4h", "Kc Td 6d Tc", true),     // 只有公共对
+            ("Ah Jd", "4c 9s 8s 3d 3c", true),  // 河牌 A 高
+            ("9c 9d", "9s 6s 6h 7d 2c", false), // 河牌葫芦
+            ("Ah 5h", "Kh 9h 4d 2c 3s", false), // 河牌顺子
+        ];
+        for (h, b, weak) in cases {
+            assert_eq!(
+                is_weak_postflop_hand(hole_of(h), &cards(b)),
+                weak,
+                "{h} on {b}: nut={:.3} outs={}",
+                current_board_nuttiness(hole_of(h), &cards(b)),
+                straight_or_better_outs(hole_of(h), &cards(b))
+            );
+        }
+        // 翻前不判弱（护栏只管翻后）。
+        assert!(!is_weak_postflop_hand(hole_of("7c 2d"), &[]));
+        // 河牌公共牌自己成顺：不算 hero 的出牌；转牌上补成公共牌顺子的那张不计。
+        assert_eq!(
+            straight_or_better_outs(hole_of("2c 2d"), &cards("9s Ts Jh Qd")),
+            0
+        );
+        assert_eq!(
+            straight_or_better_outs(hole_of("Kc 2d"), &cards("9s Ts Jh Qd")),
+            0,
+            "已成顺"
+        );
+    }
+
+    /// 2 人 100 筹码 = 1BB 的翻牌局：SB complete、BB check，翻牌 BB 下注 `bet` → 轮到 SB（hero）面对下注。
+    fn facing_flop_bet_state(stack: u64, bet: u64) -> GameState {
+        let cfg = TableConfig {
+            n_seats: 2,
+            starting_stacks: vec![ChipAmount::new(stack); 2],
+            small_blind: ChipAmount::new(50),
+            big_blind: ChipAmount::new(100),
+            ante: ChipAmount::ZERO,
+            button_seat: SeatId(0),
+        };
+        let mut rng = ChaCha20Rng::from_seed(0x47_5541_5244);
+        let mut gs = GameState::with_rng(&cfg, 0x47_5541_5244, &mut rng);
+        while gs.street() == poker::Street::Preflop {
+            let la = gs.legal_actions();
+            gs.apply(if la.check {
+                Action::Check
+            } else {
+                Action::Call
+            })
+            .expect("limp / check");
+        }
+        gs.apply(Action::Bet {
+            to: ChipAmount::new(bet),
+        })
+        .expect("flop bet");
+        assert!(gs.legal_actions().call.is_some(), "hero 面对下注");
+        gs
+    }
+
+    /// 护栏（[`weak_commit_guard`]）：弱牌时押上全部筹码的动作（全下 + 新投入 ≥ 一半剩余筹码的加注）
+    /// 概率按比例挪给弃牌 / 跟注，没押上的加注原样保留；强牌 / 翻前 / 没押上的动作 → 不触发。
+    #[test]
+    fn weak_commit_guard_moves_commit_mass_to_passive() {
+        let weak = hole_of("6c 5c");
+        let flop = cards("3h 9d 8s");
+        let uniform = |state: &GameState, abs: &StreetActionAbstraction| {
+            let acts = poker::ActionAbstraction::abstract_actions(abs, state);
+            let n = acts.iter().count();
+            acts.iter()
+                .map(|&a| (a, 1.0 / n as f64))
+                .collect::<Vec<_>>()
+        };
+        // 深码（剩 9800）：1pot 加注（加到 800）不算押上，只有全下被挪。
+        let deep = facing_flop_bet_state(10_000, 200);
+        let deep_abs = deep_menu_for(&deep).0;
+        let dist = uniform(&deep, &deep_abs);
+        let g =
+            weak_commit_guard(&dist, weak, &flop, &deep, &deep_abs).expect("弱牌 + 有全下 → 触发");
+        let allin_p = dist
+            .iter()
+            .find(|(a, _)| matches!(a, AbstractAction::AllIn { .. }))
+            .expect("菜单有全下")
+            .1;
+        assert!(g
+            .iter()
+            .all(|(a, _)| !matches!(a, AbstractAction::AllIn { .. })));
+        assert!(
+            (g.iter().map(|(_, p)| p).sum::<f64>() - 1.0).abs() < 1e-12,
+            "{g:?}"
+        );
+        let passive_before: f64 = dist
+            .iter()
+            .filter(|(a, _)| matches!(a, AbstractAction::Fold | AbstractAction::Call { .. }))
+            .map(|(_, p)| p)
+            .sum();
+        for &(a, p) in &g {
+            let before = dist.iter().find(|(b, _)| *b == a).expect("同一动作").1;
+            match a {
+                AbstractAction::Fold | AbstractAction::Call { .. } => assert!(
+                    (p - (before + allin_p * before / passive_before)).abs() < 1e-12,
+                    "{a:?}: 按比例分到全下的概率"
+                ),
+                _ => assert_eq!(p, before, "{a:?}: 没押上的加注原样保留"),
+            }
+        }
+        // 强牌 / 翻前 → 不动。
+        assert_eq!(
+            weak_commit_guard(&dist, hole_of("Ac 9c"), &flop, &deep, &deep_abs),
+            None
+        );
+        assert_eq!(weak_commit_guard(&dist, weak, &[], &deep, &deep_abs), None);
+
+        // 浅码（剩 900）：每一档加注都 ≥ 450 → 全部算押上；只剩弃牌 / 跟注。
+        let shallow = facing_flop_bet_state(1_000, 200);
+        let shallow_abs = deep_menu_for(&shallow).0;
+        let dist = uniform(&shallow, &shallow_abs);
+        assert!(dist.len() >= 4, "弃 / 跟 / 至少一档加注 / 全下：{dist:?}");
+        let g = weak_commit_guard(&dist, weak, &flop, &shallow, &shallow_abs).expect("触发");
+        assert!(
+            g.iter()
+                .all(|(a, _)| matches!(a, AbstractAction::Fold | AbstractAction::Call { .. })),
+            "{g:?}"
+        );
+        assert!((g.iter().map(|(_, p)| p).sum::<f64>() - 1.0).abs() < 1e-12);
+
+        // 被动动作概率全为 0 → 整份给弃牌（面对下注不能过牌）。
+        let aggressive_only: Vec<(AbstractAction, f64)> = dist
+            .iter()
+            .map(|&(a, p)| match a {
+                AbstractAction::Fold | AbstractAction::Call { .. } => (a, 0.0),
+                _ => (a, p),
+            })
+            .collect();
+        let total: f64 = aggressive_only.iter().map(|(_, p)| p).sum();
+        let aggressive_only: Vec<(AbstractAction, f64)> = aggressive_only
+            .into_iter()
+            .map(|(a, p)| (a, p / total))
+            .collect();
+        let g =
+            weak_commit_guard(&aggressive_only, weak, &flop, &shallow, &shallow_abs).expect("触发");
+        let fold = g
+            .iter()
+            .find(|(a, _)| *a == AbstractAction::Fold)
+            .expect("弃牌")
+            .1;
+        assert!((fold - 1.0).abs() < 1e-12, "{g:?}");
+    }
+
+    /// `--search-min-hero-visits` / `--search-weak-commit-guard`：默认 200 / 开，显式值覆盖，坏值拒收，
+    /// 未开 --search 拒收。
+    #[test]
+    fn parse_args_min_hero_visits_and_weak_commit_guard() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        let a = parse(&["--search"]).unwrap();
+        assert_eq!(
+            a.search.unwrap().min_hero_visits,
+            DEFAULT_SEARCH_MIN_HERO_VISITS
+        );
+        assert_eq!(DEFAULT_SEARCH_MIN_HERO_VISITS, 200);
+        assert!(a.search_weak_commit_guard, "默认开");
+        let a = parse(&[
+            "--search",
+            "--search-min-hero-visits",
+            "0",
+            "--search-weak-commit-guard",
+            "off",
+        ])
+        .unwrap();
+        assert_eq!(a.search.unwrap().min_hero_visits, 0);
+        assert!(!a.search_weak_commit_guard);
+        assert!(parse(&["--search", "--search-min-hero-visits", "-1"]).is_err());
+        assert!(parse(&["--search", "--search-weak-commit-guard", "maybe"]).is_err());
+        assert!(parse(&["--search-min-hero-visits", "200"]).is_err());
+        assert!(parse(&["--search-weak-commit-guard", "on"]).is_err());
+    }
+
+    /// 9 座实盘 65c 那一请求（flop 3h9d8s，check / check 后 BTN 下 2 倍池，轮到我方）：
+    /// 护栏开 → 不会选全下或加到 1190 的 1pot 加注（都 ≥ 一半剩余筹码），`probs` 仍记原分布；
+    /// 护栏关 → 分布、动作与改前同一条路径。访问量门槛：访问数进 `hero_visits`；门槛拉满 → 脱锚
+    /// 路径（这个测试 blueprint 上该线失同步）走 `search_giveup:unanchored:low_hero_visits`。
+    /// 锚定 flop 门槛拉满 → 退回 blueprint 同一节点（`blueprint:low_hero_visits`）；转牌 → giveup。
+    #[test]
+    fn nine_max_weak_commit_guard_and_visit_gate() {
+        let (_dir, _full_p, crop_p) = nine_max_fixture("guard");
+        let crop = load_blueprint(&crop_p, nine_max_test_game(), true).expect("load crop");
+        let game = crop.game();
+        let abs = game.abstraction().clone();
+        let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);
+        let cfg = SubgameSearchConfig {
+            iterations: 8_000,
+            deep_menu: true,
+            live_traversers: true,
+            ..crop_scfg()
+        };
+        let rt_with = |guard: bool, min_visits: u32| SearchRuntime {
+            weak_commit_guard: guard,
+            ..crop_rt(
+                &crop,
+                SubgameSearchConfig {
+                    min_hero_visits: min_visits,
+                    ..cfg
+                },
+            )
+        };
+        let req = Request {
+            hole: vec!["6c".into(), "5c".into()],
+            board: ["3h", "9d", "8s"].iter().map(|c| c.to_string()).collect(),
+            button_seat: 2,
+            my_seat: 3,
+            num_seats: 9,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                ha(0, "fold", None),
+                ha(1, "raise", Some(50)),
+                ha(2, "call", None),
+                ha(3, "call", None),
+                ha(4, "fold", None),
+                ha(3, "check", None),
+                ha(1, "check", None),
+                ha(2, "raise", Some(340)),
+            ],
+            valid: ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: true,
+                min_raise: Some(680),
+                max_raise: Some(1950),
+            },
+            stacks: vec![1359, 2381, 2260, 2000, 2000, 2000, 2000, 2000, 2000],
+            dealt_seats: vec![0, 1, 2, 3, 4],
+            names: Default::default(),
+        };
+        let mut guarded_hits = 0;
+        for seed in 1..=3u64 {
+            let off = decide(
+                game,
+                &abs,
+                &sc,
+                &req,
+                seed,
+                Some(&rt_with(false, 0)),
+                &mut SubgameSolveCache::new(),
+            );
+            let on = decide(
+                game,
+                &abs,
+                &sc,
+                &req,
+                seed,
+                Some(&rt_with(true, 0)),
+                &mut SubgameSolveCache::new(),
+            );
+            assert!(off.source.starts_with("search"), "{off:?}");
+            assert!(!off.source.contains("weak_commit_guard"), "{off:?}");
+            assert_eq!(on.probs, off.probs, "护栏不改记录的分布");
+            assert!(
+                on.hero_visits.is_some() && on.hero_visits == off.hero_visits,
+                "{on:?}"
+            );
+            assert!(is_legal(&on, &req.valid), "{on:?}");
+            if off.probs.is_none() {
+                // 小迭代下偶有种子没学到这个信息集 → 两边同一兜底，护栏无从介入。
+                assert_eq!(on, off);
+                continue;
+            }
+            let chosen = on.chosen.as_deref().expect("chosen");
+            assert!(
+                chosen != "allin" && chosen != "raise1pot",
+                "seed {seed}: {on:?}"
+            );
+            assert_ne!(on.amount, Some(1950), "{on:?}");
+            let commit_mass: f64 = off
+                .probs
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|(l, _)| l == "allin" || l == "raise1pot")
+                .map(|(_, p)| p)
+                .sum();
+            if commit_mass > 0.0 {
+                guarded_hits += 1;
+                assert!(on.source.contains(":weak_commit_guard"), "{on:?}");
+            }
+        }
+        assert!(guarded_hits > 0, "至少一个种子的分布里有押上全部筹码的动作");
+
+        // 门槛拉满：脱锚路径没有 blueprint 节点可退 → giveup，访问数照记。
+        let r = decide(
+            game,
+            &abs,
+            &sc,
+            &req,
+            1,
+            Some(&rt_with(true, u32::MAX)),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(
+            r.source
+                .starts_with("search_giveup:unanchored:low_hero_visits"),
+            "{r:?}"
+        );
+        assert!(r.hero_visits.is_some(), "{r:?}");
+        assert!(is_legal(&r, &req.valid));
+
+        // 锚定线（SB complete / BB check，100BB 对称）：flop 门槛拉满 → 退回 blueprint；
+        // 同一请求不开搜索时的 blueprint 出牌逐字段相同（除 source / hero_visits）。
+        let hand = nine_sb_line_hand(["Ah", "Kd"]);
+        let mut cache = SubgameSolveCache::new();
+        let gated = rt_with(false, u32::MAX);
+        let r = decide(game, &abs, &sc, &hand[0], 0x9EEF, Some(&gated), &mut cache);
+        assert_eq!(r.source, "blueprint:low_hero_visits", "{r:?}");
+        assert!(r.hero_visits.is_some());
+        let bp = decide(
+            game,
+            &abs,
+            &sc,
+            &hand[0],
+            0x9EEF,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(bp.source, "blueprint", "{bp:?}");
+        assert_eq!(
+            (
+                r.action.as_str(),
+                r.amount,
+                r.probs.as_ref(),
+                r.chosen.as_ref(),
+                r.info_set
+            ),
+            (
+                bp.action.as_str(),
+                bp.amount,
+                bp.probs.as_ref(),
+                bp.chosen.as_ref(),
+                bp.info_set
+            ),
+        );
+        // 转牌没有 blueprint → giveup。
+        let r = decide(game, &abs, &sc, &hand[1], 0x9EEF, Some(&gated), &mut cache);
+        assert!(
+            r.source
+                .starts_with("search_giveup:unsolved:low_hero_visits"),
+            "{r:?}"
+        );
+        assert!(r.hero_visits.is_some());
+        assert_eq!(crop.cropped_queries(), 0, "全程不应查询被裁街");
     }
 }

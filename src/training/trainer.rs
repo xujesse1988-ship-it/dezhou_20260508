@@ -13,6 +13,7 @@
 //! B2 \[实现\] 落地 [`VanillaCfrTrainer`] 全部 Trainer 方法（除 save/load checkpoint
 //! 走 D2 \[实现\]）；[`EsMccfrTrainer`] 保持 `unimplemented!()`（C2 \[实现\] 落地）。
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -311,6 +312,11 @@ pub struct EsMccfrTrainer<G: Game> {
     /// ×`n_seats/n_active`。**不存 checkpoint**（subgame 实时一次性求解不落盘；主线训练不用，
     /// resume 后恒 `None`）。
     pub(crate) traverser_rotation: Option<Vec<PlayerId>>,
+    /// Per-infoset traverser visit counter (S6 subgame readout gate only). `None` (default) =
+    /// not tracked. `Some` = +1 each time an infoset is reached as the traverser (one regret
+    /// update), so the caller can refuse an average strategy built from too few updates. Pure
+    /// bookkeeping: no effect on regrets, strategy sums or rng consumption. Not checkpointed.
+    pub(crate) visit_counts: Option<HashMap<G::InfoSet, u32>>,
 }
 
 impl<G: Game> EsMccfrTrainer<G> {
@@ -330,6 +336,7 @@ impl<G: Game> EsMccfrTrainer<G> {
             lcfr_periods_completed: 0,
             lcfr_rescale_regret: true,
             traverser_rotation: None,
+            visit_counts: None,
         }
     }
 
@@ -359,6 +366,28 @@ impl<G: Game> EsMccfrTrainer<G> {
         );
         self.traverser_rotation = Some(seats);
         self
+    }
+
+    /// Track how many times each infoset is reached as the traverser ([`Self::visit_count`]).
+    /// Bookkeeping only: regrets, strategy sums and the rng stream are unchanged, so results stay
+    /// byte-equal with tracking off. Panics if called after the first step (counts would miss
+    /// earlier updates).
+    pub fn with_visit_counts(mut self) -> Self {
+        assert_eq!(
+            self.update_count, 0,
+            "visit counts must be enabled before any step (update_count = {} != 0)",
+            self.update_count
+        );
+        self.visit_counts = Some(HashMap::new());
+        self
+    }
+
+    /// Traverser visits of `info` so far. `None` = tracking off ([`Self::with_visit_counts`]
+    /// not called); `Some(0)` = tracked but never reached as the traverser.
+    pub fn visit_count(&self, info: &G::InfoSet) -> Option<u32> {
+        self.visit_counts
+            .as_ref()
+            .map(|m| m.get(info).copied().unwrap_or(0))
     }
 
     /// 启用 LCFR-MCCFR period rescale（Brown & Sandholm 2018 §Discounted Monte
@@ -558,6 +587,12 @@ impl<G: Game> EsMccfrTrainer<G> {
         // playback merge：tid 升序遍历 deltas，每 thread 内按 push 顺序 playback。
         for (local_regret, local_strategy) in deltas {
             for (info, delta) in local_regret.into_entries() {
+                // One regret push = one traverser visit (recurse_es_parallel pushes once per
+                // traverser node).
+                if let Some(visits) = self.visit_counts.as_mut() {
+                    let v = visits.entry(info.clone()).or_insert(0);
+                    *v = v.saturating_add(1);
+                }
                 self.regret.accumulate(info, &delta);
             }
             for (info, weighted) in local_strategy.into_entries() {
@@ -591,6 +626,7 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             1.0,
             &mut self.regret,
             &mut self.strategy_sum,
+            self.visit_counts.as_mut(),
             rng,
         );
         self.update_count += 1;
@@ -677,6 +713,7 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             lcfr_rescale_regret: true,
             // traverser 轮转同样不存 checkpoint（subgame 实时求解不落盘；resume 恒默认轮转）。
             traverser_rotation: None,
+            visit_counts: None,
         })
     }
 }
@@ -702,6 +739,7 @@ fn recurse_es<G: Game>(
     pi_trav: f64,
     regret: &mut RegretTable<G::InfoSet>,
     strategy_sum: &mut StrategyAccumulator<G::InfoSet>,
+    mut visits: Option<&mut HashMap<G::InfoSet, u32>>,
     rng: &mut dyn RngSource,
 ) -> f64 {
     match G::current(&state) {
@@ -712,7 +750,15 @@ fn recurse_es<G: Game>(
             let dist = G::chance_distribution(&state);
             let action = sample_discrete(&dist, rng);
             let next_state = G::next(state, action, rng);
-            recurse_es::<G>(next_state, traverser, pi_trav, regret, strategy_sum, rng)
+            recurse_es::<G>(
+                next_state,
+                traverser,
+                pi_trav,
+                regret,
+                strategy_sum,
+                visits,
+                rng,
+            )
         }
         NodeKind::Player(actor) => {
             let info = G::info_set(&state, actor);
@@ -731,6 +777,10 @@ fn recurse_es<G: Game>(
                 // sampled path 上再次乘 pi_opp 会把 reach 权重平方化。
                 let weighted: ShortVec<f64> = sigma.iter().map(|s| pi_trav * s).collect();
                 strategy_sum.accumulate(info.clone(), &weighted);
+                if let Some(v) = visits.as_deref_mut() {
+                    let c = v.entry(info.clone()).or_insert(0);
+                    *c = c.saturating_add(1);
+                }
 
                 let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
                 for (i, action) in actions.iter().enumerate() {
@@ -741,6 +791,7 @@ fn recurse_es<G: Game>(
                         pi_trav * sigma[i],
                         regret,
                         strategy_sum,
+                        visits.as_deref_mut(),
                         rng,
                     );
                     cfvs.push(cfv);
@@ -774,7 +825,15 @@ fn recurse_es<G: Game>(
                 let sampled = sample_discrete(&nonzero_dist, rng);
 
                 let next_state = G::next(state, sampled, rng);
-                recurse_es::<G>(next_state, traverser, pi_trav, regret, strategy_sum, rng)
+                recurse_es::<G>(
+                    next_state,
+                    traverser,
+                    pi_trav,
+                    regret,
+                    strategy_sum,
+                    visits,
+                    rng,
+                )
             }
         }
     }
@@ -1043,5 +1102,74 @@ mod tests {
             p0_slots > 0,
             "座 0 节点在采样路径上被访问（get_or_init 建槽）"
         );
+    }
+
+    /// `with_visit_counts` is bookkeeping only: single-thread `step` and batched `step_parallel`
+    /// produce bit-identical regrets / strategy sums with counting on or off, and an infoset is
+    /// counted iff it has a strategy_sum entry (both happen exactly at traverser visits).
+    #[test]
+    fn visit_counts_bookkeeping_only() {
+        let train = |count: bool, parallel: bool| {
+            let mut t = EsMccfrTrainer::new(KuhnGame, 0x7669_7374); // "vist"
+            if count {
+                t = t.with_visit_counts();
+            }
+            if parallel {
+                let mut pool: Vec<Box<dyn RngSource>> = (0..3u64)
+                    .map(|i| {
+                        Box::new(ChaCha20Rng::from_seed(0x7669_0000 + i)) as Box<dyn RngSource>
+                    })
+                    .collect();
+                for _ in 0..50 {
+                    t.step_parallel(&mut pool, 3, 4)
+                        .expect("kuhn step_parallel");
+                }
+            } else {
+                let mut rng = ChaCha20Rng::from_seed(0x7669_7375);
+                for _ in 0..600 {
+                    t.step(&mut rng).expect("kuhn step");
+                }
+            }
+            t
+        };
+        for parallel in [false, true] {
+            let off = train(false, parallel);
+            let on = train(true, parallel);
+            assert_eq!(off.update_count(), on.update_count());
+            for (info, r) in off.regret.inner() {
+                let r2 = &on.regret.inner()[info];
+                assert!(
+                    r.iter().zip(r2).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "regret 须逐位相同 {info:?}（parallel={parallel}）"
+                );
+            }
+            for (info, s1) in off.strategy_sum.inner() {
+                let s2 = &on.strategy_sum.inner()[info];
+                assert!(
+                    s1.iter().zip(s2).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "strategy_sum 须逐位相同 {info:?}（parallel={parallel}）"
+                );
+            }
+            assert_eq!(off.regret.len(), on.regret.len());
+            assert_eq!(off.strategy_sum.len(), on.strategy_sum.len());
+
+            let counts = on.visit_counts.as_ref().expect("tracking on");
+            assert!(!counts.is_empty());
+            for info in on.regret.inner().keys() {
+                let v = on.visit_count(info).expect("tracking on");
+                assert_eq!(
+                    v > 0,
+                    on.strategy_sum.inner().contains_key(info),
+                    "计数 > 0 ⟺ 作为 traverser 到过（有 strategy_sum）{info:?}"
+                );
+                assert_eq!(off.visit_count(info), None, "未开计数 → None");
+            }
+            // Kuhn has 12 infosets, 6 per seat; after hundreds of traversals each gets many visits.
+            let total: u64 = counts.values().map(|&v| v as u64).sum();
+            assert!(
+                total >= on.update_count(),
+                "每次 traversal 至少过一个 traverser 节点"
+            );
+        }
     }
 }

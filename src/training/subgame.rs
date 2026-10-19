@@ -958,6 +958,22 @@ pub struct SubgameSearchConfig {
     /// 调用方据此补解紧前一街（让跨街后验可得）或显式降级。跨街后验命中时不查 blueprint，
     /// 与本字段无关。
     pub blueprint_max_street: StreetTag,
+    /// 读数门槛：hero 实际底牌在当前决策点的信息集，solve 里作为遍历者被访问（= 做过 regret
+    /// 更新）不足这么多次 → 不用它的平均策略，返回 `Err`（前缀 [`LOW_HERO_VISITS_ERR`]），由调用方
+    /// 兜底。动机：访问很少的信息集平均策略接近噪声——2026-10-19 实盘 65c 面对翻牌超池注，同一请求
+    /// 换 3 个种子全下概率 0.55 / 0.09 / 0.002。`0`（默认）= 不设门槛（旧行为）。
+    ///
+    /// 只管读数、不进 solve：**不进** [`solve_cache_key`]（同一份解可按不同门槛读）。
+    pub min_hero_visits: u32,
+}
+
+/// [`SubgameSearchConfig::min_hero_visits`] 拒读时 `Err` 字符串的前缀。调用方用
+/// [`is_low_hero_visits_err`] 识别（区别于树太大 / 完全未访问等）。
+pub const LOW_HERO_VISITS_ERR: &str = "low_hero_visits";
+
+/// `Err` 是否为 [`LOW_HERO_VISITS_ERR`]（hero 信息集访问次数低于门槛）。
+pub fn is_low_hero_visits_err(reason: &str) -> bool {
+    reason.starts_with(LOW_HERO_VISITS_ERR)
 }
 
 impl Default for SubgameSearchConfig {
@@ -978,6 +994,7 @@ impl Default for SubgameSearchConfig {
             range_uniform_mix: 0.0,
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
+            min_hero_visits: 0,
         }
     }
 }
@@ -1828,6 +1845,9 @@ pub struct SubgameSolveCache {
     /// 拒绝原因。同手同街后续决策 / 预热 key 相同 → 直接返回同一 `Err`、不再重数（计数本身要数到
     /// cap 才停，cap 百万级时每次数秒）。只记最近一个：key 覆盖 solve 全部输入，旧值不可能误配。
     oversize: Option<([u8; 32], String)>,
+    /// 最近一次决策读数时，hero 实际底牌在落点信息集的遍历者访问次数（遥测，
+    /// [`Self::last_read_visits`]）。每次经缓存的搜索调用开始时清成 `None`，导航到落点后写入。
+    last_read_visits: Option<u32>,
 }
 
 impl SubgameSolveCache {
@@ -1840,7 +1860,15 @@ impl SubgameSolveCache {
             cross_attempts: 0,
             cross_hits: 0,
             oversize: None,
+            last_read_visits: None,
         }
+    }
+
+    /// 最近一次经本缓存的搜索调用里，hero 落点信息集的遍历者访问次数（读数门槛
+    /// [`SubgameSearchConfig::min_hero_visits`] 判的就是它）。`None` = 本次调用没走到读数
+    /// （预热 / 建树或导航失败）。advisor 写进决策日志，用于标定门槛。
+    pub fn last_read_visits(&self) -> Option<u32> {
+        self.last_read_visits
     }
 
     /// 命中次数（诊断 / 测试：钉「同街第二决策不重解」）。
@@ -1925,13 +1953,6 @@ impl SubgameSolveCache {
     /// （此时主 slot 已是本街解）。同样须 caller 自验身份。不计 hits/misses。
     fn prev(&self) -> Option<&SolvedSubgame> {
         self.prev.as_ref()
-    }
-
-    fn entry(&self, key: [u8; 32]) -> Option<&SolvedSubgame> {
-        self.entry
-            .as_ref()
-            .filter(|(k, _)| *k == key)
-            .map(|(_, s)| s)
     }
 
     /// `key` 此前被计数闸拒过 → 当时的拒绝原因（不计 hits/misses）。
@@ -2265,6 +2286,10 @@ fn subgame_search_cached_inner(
     actor_override: Option<PlayerId>,
     solve_only: bool,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    let mut cache = cache;
+    if let Some(c) = cache.as_deref_mut() {
+        c.last_read_visits = None; // 本次调用的读数遥测从空开始（早退路径不残留上一决策的值）。
+    }
     if auth.is_terminal() || auth.current_player().is_none() {
         return Err("subgame_search: auth 非 decision 节点".to_string());
     }
@@ -2549,6 +2574,8 @@ fn subgame_search_cached_inner(
         })
     };
     let solved_fresh: SolvedSubgame;
+    // 读数遥测槽（[`SubgameSolveCache::last_read_visits`]）：只有走缓存臂时有处可写。
+    let mut visits_slot: Option<&mut Option<u32>> = None;
     let solved: &SolvedSubgame = match (cache, key) {
         (Some(c), Some(key)) => {
             // §4.5 跨街复用遥测：cache 存在（走本臂）+ cross_street=Some 即一次 attempt（hit 见
@@ -2559,7 +2586,13 @@ fn subgame_search_cached_inner(
             if !c.lookup(key) {
                 c.store(key, build_and_solve()?);
             }
-            c.entry(key).expect("lookup 命中或刚 store")
+            // 字段级借用：遥测槽与条目是 `*c` 的不相交字段，可同时持有。
+            visits_slot = Some(&mut c.last_read_visits);
+            &c.entry
+                .as_ref()
+                .filter(|(k, _)| *k == key)
+                .expect("lookup 命中或刚 store")
+                .1
         }
         _ => {
             solved_fresh = build_and_solve()?;
@@ -2589,7 +2622,11 @@ fn subgame_search_cached_inner(
     } else {
         navigate_subtree(trainer.game().subtree(), &within_round_tags)?
     };
-    let (avg, sub_legal) = read_current_strategy(trainer, cur_node, auth, auth_actor)?;
+    if let Some(slot) = visits_slot {
+        *slot = hero_visit_count(trainer, cur_node, auth);
+    }
+    let (avg, sub_legal) =
+        read_current_strategy(trainer, cur_node, auth, auth_actor, cfg.min_hero_visits)?;
 
     // 缺口③ deep_menu（§2.1）：子树菜单（{1pot}）与调用方 blueprint `legal_abs` 不同
     // （{1pot} ⊊ blueprint），**不能对齐 legal_abs**（强行对齐时 blueprint 多出的档如 0.5pot
@@ -2683,7 +2720,8 @@ fn solve_subgame(
     // 缺口①：LCFR 加权（限时第一杠杆，A②）。period 见 [`lcfr_period`]。fresh trainer
     // （update_count==0）→ with_lcfr_period 前置满足。LCFR rescale 确定性（固定迭代 + seed）→
     // 仍 byte-equal 可复现；vanilla（默认）保持既有行为不变。
-    let base = EsMccfrTrainer::new(sub, master);
+    // 访问计数只记账、不改 regret / σ / rng 流（与不计数逐位相同），供读数门槛用。
+    let base = EsMccfrTrainer::new(sub, master).with_visit_counts();
     let mut trainer = if cfg.lcfr {
         base.with_lcfr_period(lcfr_period(cfg))
     } else {
@@ -2756,6 +2794,17 @@ fn solve_subgame(
     Ok(trainer)
 }
 
+/// hero 真实手在 `cur_node` 落点信息集的遍历者访问次数（trainer 未开计数 → `None`）。与
+/// [`read_current_strategy`] 的门槛判同一个信息集（同一 `query_at`）。
+fn hero_visit_count(
+    trainer: &EsMccfrTrainer<SubgameNlheGame>,
+    cur_node: NodeId,
+    auth: &GameState,
+) -> Option<u32> {
+    let (info, _) = trainer.game().query_at(cur_node, auth);
+    trainer.visit_count(&info)
+}
+
 /// 读当前决策点策略（共享）：导航落点的决策者须 == 权威当前 actor（否则读到错座的真实手 →
 /// 失同步）；取 actor 真实手在 cur_node 的 average strategy。**用 auth 几何 query**——cur_node
 /// 是当前街 betting 后的深层节点，其合法集须用当前几何算（RoundStart 的 round-start template
@@ -2765,6 +2814,7 @@ fn read_current_strategy(
     cur_node: NodeId,
     auth: &GameState,
     auth_actor: PlayerId,
+    min_visits: u32,
 ) -> Result<(Vec<f64>, Vec<SimplifiedNlheAction>), String> {
     let node = trainer.game().subtree().node(cur_node);
     let cur_actor = node.player_acting;
@@ -2805,6 +2855,16 @@ fn read_current_strategy(
         return Err(
             "subgame 当前决策 infoset 平均策略只是均匀占位（hero 遍历未学到策略）".to_string(),
         );
+    }
+    // Visited but too rarely: the average is a handful of regret-matching snapshots, i.e. noise
+    // (2026-10-19 live 65c: same request, 3 seeds → all-in 0.55 / 0.09 / 0.002). Untracked
+    // trainers (`visit_count = None`) skip the gate.
+    if let Some(visits) = trainer.visit_count(&info) {
+        if visits < min_visits {
+            return Err(format!(
+                "{LOW_HERO_VISITS_ERR}:{visits}<{min_visits}（hero 信息集访问不足，平均策略不可信）"
+            ));
+        }
     }
     // `avg` 按子树节点**建树几何** tag 序索引（CFR 解的维度恒 == node.legal_actions 长度——CFR
     // 首访该 infoset 时按 `legal_actions(state)` 注册动作槽，子树 solve 几何 == build 几何 →
@@ -3176,6 +3236,10 @@ fn subgame_search_unanchored_cached_inner(
     hand_seed: u64,
     solve_only: bool,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    let mut cache = cache;
+    if let Some(c) = cache.as_deref_mut() {
+        c.last_read_visits = None; // 同锚定路径：早退不残留上一决策的值。
+    }
     if auth.is_terminal() || auth.current_player().is_none() {
         return Err("subgame_search_unanchored: auth 非 decision 节点".to_string());
     }
@@ -3436,6 +3500,8 @@ fn subgame_search_unanchored_cached_inner(
         })
     };
     let solved_fresh: SolvedSubgame;
+    // 读数遥测槽（[`SubgameSolveCache::last_read_visits`]）：只有走缓存臂时有处可写。
+    let mut visits_slot: Option<&mut Option<u32>> = None;
     let solved: &SolvedSubgame = match (cache, key) {
         (Some(c), Some(key)) => {
             // §4.5 跨街复用遥测：cache 存在（走本臂）+ cross_street=Some 即一次 attempt（hit 见
@@ -3453,7 +3519,13 @@ fn subgame_search_unanchored_cached_inner(
                 }
                 c.store(key, build_and_solve()?);
             }
-            c.entry(key).expect("lookup 命中或刚 store")
+            // 字段级借用：遥测槽与条目是 `*c` 的不相交字段，可同时持有。
+            visits_slot = Some(&mut c.last_read_visits);
+            &c.entry
+                .as_ref()
+                .filter(|(k, _)| *k == key)
+                .expect("lookup 命中或刚 store")
+                .1
         }
         _ => {
             precount()?;
@@ -3472,7 +3544,11 @@ fn subgame_search_unanchored_cached_inner(
         root_state,
         within_round,
     )?;
-    let (avg, sub_legal) = read_current_strategy(trainer, cur_node, auth, auth_actor)?;
+    if let Some(slot) = visits_slot {
+        *slot = hero_visit_count(trainer, cur_node, auth);
+    }
+    let (avg, sub_legal) =
+        read_current_strategy(trainer, cur_node, auth, auth_actor, cfg.min_hero_visits)?;
     self_distribution(&sub_legal, &avg)
 }
 
@@ -4189,6 +4265,7 @@ mod tests {
             range_uniform_mix: 0.0,
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
+            min_hero_visits: 0,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -4250,6 +4327,7 @@ mod tests {
             range_uniform_mix: 0.0,
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
+            min_hero_visits: 0,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, None, 0, 0,
@@ -4724,6 +4802,7 @@ mod tests {
             range_uniform_mix: 0.0,
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
+            min_hero_visits: 0,
         };
         let d9 = subgame_search(
             &auth,
@@ -5485,6 +5564,7 @@ mod tests {
             range_uniform_mix: 0.0,
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
+            min_hero_visits: 0,
         };
         let run = |cfg: &SubgameSearchConfig| {
             subgame_search(
@@ -5560,6 +5640,7 @@ mod tests {
             range_uniform_mix: 0.0,
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
+            min_hero_visits: 0,
         };
         let base = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &none_cfg, None, None, 0x55, 4,
@@ -8975,7 +9056,7 @@ mod tests {
         // returned vector can be compared position by position.
         assert_eq!(legal.len(), n);
         let read =
-            |t: &EsMccfrTrainer<SubgameNlheGame>| read_current_strategy(t, root, &auth, actor);
+            |t: &EsMccfrTrainer<SubgameNlheGame>| read_current_strategy(t, root, &auth, actor, 0);
         let uniform = vec![1.0 / n as f64; n];
 
         // Never visited at all: pre-existing guard.
@@ -9021,5 +9102,121 @@ mod tests {
                 "probs {probs:?} vs sum {sum:?}"
             );
         }
+    }
+
+    /// 读数门槛（[`SubgameSearchConfig::min_hero_visits`]）：访问数 < 门槛 → `Err`（前缀
+    /// [`LOW_HERO_VISITS_ERR`]，调用方据此兜底）；= 门槛放行；未开计数的 trainer 不设门槛。
+    #[test]
+    fn read_current_strategy_min_visits_gate() {
+        let auth = nway_limped_flop_state(3, 12_100, 0x4D49_4E56_4953_4954); // "MINVISIT"
+        let (abs, rules) = deep_menu_for(&auth);
+        let sub = || {
+            SubgameNlheGame::new(
+                stub_table(),
+                auth.config().clone(),
+                abs.clone(),
+                rules,
+                auth.clone(),
+                live_entrants(&auth),
+                0,
+            )
+        };
+        let mut tracked = EsMccfrTrainer::new(sub(), 0x4D49_4E56).with_visit_counts();
+        let mut untracked = EsMccfrTrainer::new(sub(), 0x4D49_4E56);
+        let root = tracked.game().subtree().root_id();
+        let actor = auth.current_player().expect("decision node").0 as PlayerId;
+        let (info, _) = tracked.game().query_at(root, &auth);
+        let n = tracked.game().subtree().node(root).legal_actions.len();
+        let w: Vec<f64> = (1..=n).map(|i| i as f64).collect();
+        for t in [&mut tracked, &mut untracked] {
+            t.regret.get_or_init(info, n);
+            t.strategy_sum.accumulate(info, &w);
+        }
+        tracked
+            .visit_counts
+            .as_mut()
+            .expect("tracking on")
+            .insert(info, 7);
+        assert_eq!(hero_visit_count(&tracked, root, &auth), Some(7));
+        assert_eq!(hero_visit_count(&untracked, root, &auth), None);
+
+        let err = read_current_strategy(&tracked, root, &auth, actor, 8).unwrap_err();
+        assert!(is_low_hero_visits_err(&err), "unexpected err: {err}");
+        assert!(err.contains("7<8"), "访问数写进原因：{err}");
+        let (at_gate, _) =
+            read_current_strategy(&tracked, root, &auth, actor, 7).expect("= 门槛放行");
+        let (no_gate, _) = read_current_strategy(&tracked, root, &auth, actor, 0).expect("门槛 0");
+        assert_eq!(at_gate, no_gate, "门槛只决定读不读，不改读数");
+        assert!(
+            read_current_strategy(&untracked, root, &auth, actor, u32::MAX).is_ok(),
+            "未开计数 → 不设门槛"
+        );
+    }
+
+    /// 生产求解（[`solve_subgame`]）开访问计数，经缓存读数后 [`SubgameSolveCache::last_read_visits`]
+    /// = hero 落点访问数；门槛设到它之上 → `Err` 且遥测仍在；预热（solve_only）清空遥测。
+    #[test]
+    fn solve_records_hero_visits_and_gates() {
+        let auth = nway_limped_flop_state(3, 12_100, 0x5649_5349_5453_4F4C); // "VISITSOL"
+        let solve_cfg = SubgameSearchConfig {
+            iterations: 2_000,
+            max_subtree_nodes: 1_000_000,
+            use_blueprint_range: false,
+            trigger: SearchTrigger::AllPostflop,
+            deep_menu: true,
+            live_traversers: true,
+            ..SubgameSearchConfig::default()
+        };
+        let (abs, rules) = deep_menu_for(&auth);
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            auth.config().clone(),
+            abs,
+            rules,
+        )
+        .expect("game");
+        let run = |cache: &mut SubgameSolveCache, cfg: &SubgameSearchConfig| {
+            subgame_search_unanchored_cached(
+                Some(cache),
+                &auth,
+                &auth,
+                &game,
+                &[],
+                cfg,
+                None,
+                None,
+                0x5EED,
+            )
+        };
+        let mut cache = SubgameSolveCache::new();
+        run(&mut cache, &solve_cfg).expect("solve + read");
+        let v = cache.last_read_visits().expect("读数遥测");
+        assert!(v > 0, "根节点 hero 必被遍历");
+        // 同一份解（命中缓存）按更高门槛读 → 拒读，遥测照写。
+        let gated = SubgameSearchConfig {
+            min_hero_visits: v + 1,
+            ..solve_cfg
+        };
+        let err = run(&mut cache, &gated).unwrap_err();
+        assert!(is_low_hero_visits_err(&err), "unexpected err: {err}");
+        assert_eq!(cache.hits(), 1, "门槛不进 key：同一份解");
+        assert_eq!(cache.last_read_visits(), Some(v));
+        let ok = SubgameSearchConfig {
+            min_hero_visits: v,
+            ..solve_cfg
+        };
+        run(&mut cache, &ok).expect("= 门槛放行");
+        subgame_search_unanchored_prewarm(
+            &mut cache,
+            auth.current_player().unwrap().0 as PlayerId,
+            &auth,
+            &game,
+            None,
+            &solve_cfg,
+            None,
+            0x5EED,
+        )
+        .expect("prewarm");
+        assert_eq!(cache.last_read_visits(), None, "预热不读数 → 遥测清空");
     }
 }
