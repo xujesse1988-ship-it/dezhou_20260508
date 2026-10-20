@@ -75,6 +75,12 @@ k=6/7/8/9 = 557k / 3.07M / 15.5M / 72.6M 节点,单加注池 9-way 1.47M;≥7 �
 `probs` 仍记原分布。这是针对跟注偏多的对手池的剥削,不是修均衡。另:超出菜单最大档(1pot)的下注在搜索里仍压成 1pot
 (本街从起点建树,菜单与 blueprint 翻牌同为 {0.5,1}),翻牌尺寸闸转去搜索对超池注不解决尺寸问题,尚未修。
 
+**深码全下抽样门槛(2026-10-20)**。起因:poker_manager 实盘 922fe989 翻牌顶对 SPR≈21,搜索给 allin 0.055,刚过 5% 剪枝线
+被抽中,157BB 推进 7.5BB 的底池;该批 SPR ≥ 6 的 187 次翻后决策里 allin ≥ 5% 只有 3 次(0.174 / 0.080 / 0.055),全是一对顶对。
+抽样前的全下门槛改成按翻后 SPR 分档:`postflop_spr` = min(hero 剩余栈, 未弃牌对手最大剩余栈) / 跟注后底池(出牌基准态:
+搜索 = 真栈 auth,blueprint = 100BB 影子),SPR ≥ 6 时 allin < 20% 去掉,否则仍是 5%;翻前不变。只改抽样不改求解,
+`probs` 仍记原分布。动了策略,poker_manager 实盘累计从这一版起重开一段。
+
 **S6 进度(2026-06-03):实时搜索推进,MVP subgame-solver 核心已落地 + vultr 验证**(分支 `6max-rts-mvp`
 commit `cf9efdb`,**未并入 6max**)。设计成文 `temp/realtime_search_design_2026_06_03.md`(文献调研+代码复用映射+
 对抗验证):方法定型 = Pluribus/Modicum tabular depth-limited search(非 DeepStack/ReBeL)。三件落地:①

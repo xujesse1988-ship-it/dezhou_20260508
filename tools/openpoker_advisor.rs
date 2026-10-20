@@ -1843,7 +1843,10 @@ fn decide(
     // per-decision 确定性采样（保混合策略 + 可复现；seed 与搜索与否无关 → search=None byte-equal）。
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed, n_seats));
     let chosen = sample_discrete(
-        &prune_for_sampling(guarded.as_deref().unwrap_or(&dist)),
+        &prune_for_sampling(
+            guarded.as_deref().unwrap_or(&dist),
+            postflop_spr(outgoing_state),
+        ),
         &mut sample_rng,
     );
 
@@ -3168,7 +3171,7 @@ fn decide_search_unanchored(
     }
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed, n_seats));
     let chosen = sample_discrete(
-        &prune_for_sampling(guarded.as_deref().unwrap_or(&dist)),
+        &prune_for_sampling(guarded.as_deref().unwrap_or(&dist), postflop_spr(&auth)),
         &mut sample_rng,
     );
     let solver_action = match outgoing_action(&auth, outgoing_abs, chosen) {
@@ -3310,13 +3313,54 @@ fn action_label(a: &AbstractAction) -> String {
 /// `resp.probs` 仍记原分布。
 const SAMPLE_MIN_ALLIN_PROB: f64 = 0.05;
 
-/// [`SAMPLE_MIN_ALLIN_PROB`] 过滤 + 归一。只有 `AllIn` 会被去掉；去掉后为空（理论上不会：
-/// 分布和为 1）则原样返回。
-fn prune_for_sampling(dist: &[(AbstractAction, f64)]) -> Vec<(AbstractAction, f64)> {
+/// 翻后 SPR（[`postflop_spr`]）≥ 此值时，全下改用 [`SAMPLE_MIN_ALLIN_PROB_DEEP`] 作门槛。
+const DEEP_SPR_MIN: f64 = 6.0;
+
+/// 深码（SPR ≥ [`DEEP_SPR_MIN`]）翻后全下的抽样门槛。2026-10-20 poker_manager 实盘：SPR ≥ 6 的
+/// 187 次翻后决策里全下 ≥ 5% 只有 3 次（17.4% / 8.0% / 5.5%），全是一对顶对，其中 922fe989 抽中
+/// 5.5% 把 157BB 推进 7.5BB 的底池；65c 那手同一请求换种子全下 55% / 9% / 0.2%——深码全下的
+/// 小概率主要是搜索噪声，一旦抽中押上的是整个有效码深。只改抽样，不改求解；SPR < 6 不受影响。
+const SAMPLE_MIN_ALLIN_PROB_DEEP: f64 = 0.20;
+
+/// hero 在出牌基准态 `state` 上的翻后 SPR = 有效剩余栈 / 跟注后的底池；有效剩余栈 = hero 剩余栈与
+/// 未弃牌、还能行动的对手里最大剩余栈取小。翻前 / 没有当前行动者 → `None`（只按 5% 门槛剪）。
+fn postflop_spr(state: &GameState) -> Option<f64> {
+    if state.board().is_empty() {
+        return None;
+    }
+    let seat = state.current_player()?;
+    let players = state.players();
+    let hero = &players[seat.0 as usize];
+    let opp_max = players
+        .iter()
+        .enumerate()
+        .filter(|&(i, p)| i != seat.0 as usize && p.status == poker::PlayerStatus::Active)
+        .map(|(_, p)| p.stack.as_u64())
+        .max()
+        .unwrap_or(0);
+    let to_call = state.legal_actions().call.map_or(0, |c| {
+        c.as_u64()
+            .saturating_sub(hero.committed_this_round.as_u64())
+    });
+    let pot = state.pot().as_u64() + to_call;
+    (pot > 0).then(|| hero.stack.as_u64().min(opp_max) as f64 / pot as f64)
+}
+
+/// 全下门槛过滤 + 归一：翻后 SPR ≥ [`DEEP_SPR_MIN`] 用 [`SAMPLE_MIN_ALLIN_PROB_DEEP`]，否则
+/// [`SAMPLE_MIN_ALLIN_PROB`]。只有 `AllIn` 会被去掉；去掉后为空（理论上不会：分布和为 1）则原样返回。
+fn prune_for_sampling(
+    dist: &[(AbstractAction, f64)],
+    spr: Option<f64>,
+) -> Vec<(AbstractAction, f64)> {
+    let min_allin = if spr.is_some_and(|s| s >= DEEP_SPR_MIN) {
+        SAMPLE_MIN_ALLIN_PROB_DEEP
+    } else {
+        SAMPLE_MIN_ALLIN_PROB
+    };
     let kept: Vec<(AbstractAction, f64)> = dist
         .iter()
         .copied()
-        .filter(|&(a, p)| !matches!(a, AbstractAction::AllIn { .. }) || p >= SAMPLE_MIN_ALLIN_PROB)
+        .filter(|&(a, p)| !matches!(a, AbstractAction::AllIn { .. }) || p >= min_allin)
         .collect();
     if kept.len() == dist.len() || kept.is_empty() {
         return dist.to_vec();
@@ -6650,13 +6694,16 @@ mod tests {
         };
 
         // run5 14973b83 河牌：两个加注尺寸各 < 5% 也保留，只去掉 4.4% 的全下。
-        let d = prune_for_sampling(&[
-            (fold, 0.289),
-            (call, 0.632),
-            (half, 0.029),
-            (pot, 0.006),
-            (allin, 0.044),
-        ]);
+        let d = prune_for_sampling(
+            &[
+                (fold, 0.289),
+                (call, 0.632),
+                (half, 0.029),
+                (pot, 0.006),
+                (allin, 0.044),
+            ],
+            None,
+        );
         assert_eq!(
             d.iter().map(|&(a, _)| a).collect::<Vec<_>>(),
             vec![fold, call, half, pot]
@@ -6665,22 +6712,98 @@ mod tests {
         assert!((d.iter().map(|&(_, p)| p).sum::<f64>() - 1.0).abs() < 1e-12);
 
         let orig = [(fold, 0.95), (allin, 0.05)];
-        assert_eq!(prune_for_sampling(&orig), orig.to_vec(), "全下恰好 5% 保留");
+        assert_eq!(
+            prune_for_sampling(&orig, None),
+            orig.to_vec(),
+            "全下恰好 5% 保留"
+        );
         let orig = [(fold, 0.977), (call, 0.004), (half, 0.014), (pot, 0.005)];
         assert_eq!(
-            prune_for_sampling(&orig),
+            prune_for_sampling(&orig, None),
             orig.to_vec(),
             "没有全下：原样返回"
         );
-        assert_eq!(prune_for_sampling(&[(allin, 1.0)]), vec![(allin, 1.0)]);
+        assert_eq!(
+            prune_for_sampling(&[(allin, 1.0)], None),
+            vec![(allin, 1.0)]
+        );
 
         // run5 10a9eac8 翻前 QQ raise1pot 0.97 / allin 0.03：只剩加注。
-        let d = prune_for_sampling(&[(pot, 0.97), (allin, 0.03)]);
+        let d = prune_for_sampling(&[(pot, 0.97), (allin, 0.03)], None);
         assert_eq!(d, vec![(pot, 1.0)]);
         for seed in 0..200u64 {
             let mut rng = ChaCha20Rng::from_seed(seed);
             assert_eq!(sample_discrete(&d, &mut rng), pot);
         }
+    }
+
+    /// 深码门槛：SPR ≥ 6 时全下 < 20% 去掉（922fe989 翻牌顶对 SPR 21 的 5.5%），恰好 20% 保留；
+    /// SPR < 6 和翻前（`None`）仍按 5%；深码下 100% 全下（唯一动作）原样返回。
+    #[test]
+    fn prune_for_sampling_deep_spr_raises_allin_threshold() {
+        let check = AbstractAction::Check;
+        let half = AbstractAction::Bet {
+            to: ChipAmount::new(75),
+            ratio_label: BetRatio::HALF_POT,
+        };
+        let pot = AbstractAction::Bet {
+            to: ChipAmount::new(150),
+            ratio_label: BetRatio::FULL_POT,
+        };
+        let allin = AbstractAction::AllIn {
+            to: ChipAmount::new(3151),
+        };
+        let live = [
+            (check, 0.3237),
+            (half, 0.3232),
+            (pot, 0.2981),
+            (allin, 0.0551),
+        ];
+        let d = prune_for_sampling(&live, Some(21.0));
+        assert_eq!(
+            d.iter().map(|&(a, _)| a).collect::<Vec<_>>(),
+            vec![check, half, pot]
+        );
+        assert!((d.iter().map(|&(_, p)| p).sum::<f64>() - 1.0).abs() < 1e-12);
+        assert_eq!(prune_for_sampling(&live, Some(5.99)), live.to_vec());
+        assert_eq!(prune_for_sampling(&live, None), live.to_vec());
+
+        let edge = [(check, 0.8), (allin, 0.2)];
+        assert_eq!(prune_for_sampling(&edge, Some(6.0)), edge.to_vec());
+        let low = [(check, 0.81), (allin, 0.19)];
+        assert_eq!(prune_for_sampling(&low, Some(6.0)), vec![(check, 1.0)]);
+        assert_eq!(
+            prune_for_sampling(&[(allin, 1.0)], Some(30.0)),
+            vec![(allin, 1.0)]
+        );
+    }
+
+    /// SPR = min(hero 剩余栈, 未弃牌对手最大剩余栈) / 跟注后底池；翻前 → None。
+    #[test]
+    fn postflop_spr_uses_effective_stack_and_pot_after_call() {
+        let cfg = TableConfig::default_6max_100bb(); // SB 50 / BB 100 / 10000 栈。
+        let mut gs = GameState::new(&cfg, 7);
+        assert_eq!(postflop_spr(&gs), None, "翻前不算");
+        gs.apply(Action::Raise {
+            to: ChipAmount::new(300),
+        })
+        .expect("UTG open 300");
+        for _ in 0..4 {
+            gs.apply(Action::Fold).expect("HJ / CO / BTN / SB 弃");
+        }
+        gs.apply(Action::Call).expect("BB 跟");
+        assert_eq!(gs.board().len(), 3, "进翻牌");
+        // BB 先行动：底池 50 + 300 + 300 = 650，双方剩 9700，不用跟注。
+        let spr = postflop_spr(&gs).expect("翻后有行动者");
+        assert!((spr - 9700.0 / 650.0).abs() < 1e-12, "{spr}");
+        gs.apply(Action::Check).expect("BB 过");
+        gs.apply(Action::Bet {
+            to: ChipAmount::new(650),
+        })
+        .expect("UTG 下满池");
+        // BB 面对 650：跟注后底池 1950，对手剩 9050 < BB 的 9700。
+        let spr = postflop_spr(&gs).expect("面对下注");
+        assert!((spr - 9050.0 / 1950.0).abs() < 1e-12, "{spr}");
     }
 
     /// 尺寸闸边界：真实 / 映射 ∈ [0.75, 1.333]（含端点）才过；只看指定街；映射不是进攻动作
