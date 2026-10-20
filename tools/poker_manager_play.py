@@ -472,11 +472,19 @@ class ManagerSession:
                 return
             actions = {a["action"]: a for a in m["valid_actions"]}
             action, amount = response.get("action"), response.get("amount")
+            if action == "all_in" and action not in actions and "call" in actions:
+                # advisor only answers a bare all_in when no raise range is offered; without an
+                # all_in option (opponent already all-in, hero covers) calling commits the most.
+                response = {**response, "action": "call",
+                            "source": f"{response.get('source', '')}:allin_as_call"}
+                action = "call"
             if (action not in actions or (action == "raise" and
                     (isinstance(amount, bool) or not isinstance(amount, (int, float))
                      or not actions[action]["min"] <= amount <= actions[action]["max"]
                      or int(amount) != amount))):
+                rejected = {k: response.get(k) for k in ("action", "amount", "source")}
                 response = safe_response(valid_actions(m), "fallback:illegal_advisor_action")
+                response["rejected"] = rejected
                 action, amount = response["action"], None
             out = {"type": "action", "hand_id": m["hand_id"], "turn_token": m["turn_token"],
                    "client_action_id": str(uuid.uuid4()), "action": action}

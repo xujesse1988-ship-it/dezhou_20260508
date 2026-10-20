@@ -199,3 +199,15 @@ blueprint 打，翻牌 62 次锚定搜索里 58 次因为码深门不过改走�
 - 只有**入座时栈在区间内**才会因漂移离桌。服务端自动补码一次 1500（75 BB），低于 80 BB 的下限；
   如果不加这条，按 1500 入座后每手都会离桌。
 - 栈归零仍走原来的 `busted` → `player_left` 流程，不经过这里。达到 `--num-hands` 时只发收尾的那一次 `leave_table`。
+
+### 2026-10-20 对手全下时 advisor 的 `all_in` 改成跟注
+
+实盘 20261020_164346（bp3）8db1dbc5：对手全下、我方筹码更深、其余人都已弃牌，服务端只给 `fold` / `call`。
+advisor 在没有加注区间时会回一个不带金额的 `all_in`（`tools/openpoker_advisor.rs` `action_to_response` 的 `Action::AllIn` 分支），
+driver 判它不在合法动作里、按兜底弃牌，**AA 被弃**（`docs/temp/poker_manager_live_20261020_164346_analysis_2026_10_20.md` PM-8）。
+
+- advisor 只有在服务端没给 `raise` 时才回 `all_in`；这时服务端也没给 `all_in`、但给了 `call`，说明我方能投入的最多就是跟注，
+  driver 改发 `call`，`source` 末尾加 `:allin_as_call`。服务端给了 `all_in` 时照常发 `all_in`。
+- 两样都没有（例如只能过牌）仍走原兜底；`fallback:illegal_advisor_action` 的日志里新增 `rejected`，记下 advisor 原始回复
+  （`action` / `amount` / `source`），以后不用再靠读代码推断。
+- 搜索路径不受影响：同一局面下搜索会按真实局面把全下换成跟注（bp2 e400a9ce 已验证），出问题的只有翻前 blueprint 路径。

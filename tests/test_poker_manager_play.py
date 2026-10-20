@@ -252,6 +252,29 @@ class ManagerTests(unittest.TestCase):
             if expected == "raise":
                 self.assertIs(type(sent[-1]["amount"]), int)
 
+    def test_bare_allin_without_allin_option_calls(self):
+        # 8db1dbc5: opponent shoved, hero covers -> only fold/call offered; the advisor's bare
+        # all_in used to be rejected as illegal and AA was folded.
+        fold_call = [{"action": "fold"}, {"action": "call", "amount": 1618}]
+        log = io.StringIO()
+        session, _, sent = self.session({"action": "all_in", "source": "blueprint"}, action_log=log)
+        session.handle(turn(valid_actions=fold_call))
+        self.assertEqual(sent[-1]["action"], "call")
+        self.assertNotIn("amount", sent[-1])
+        self.assertEqual(json.loads(log.getvalue())["resp"]["source"], "blueprint:allin_as_call")
+        # all_in offered -> sent as is.
+        session, _, sent = self.session({"action": "all_in", "source": "blueprint"})
+        session.handle(turn(valid_actions=fold_call + [{"action": "all_in"}]))
+        self.assertEqual(sent[-1]["action"], "all_in")
+        # neither all_in nor call (check spot) -> still the safe fallback, original reply logged.
+        log = io.StringIO()
+        session, _, sent = self.session({"action": "all_in", "source": "blueprint"}, action_log=log)
+        session.handle(turn(valid_actions=[{"action": "check"}]))
+        self.assertEqual(sent[-1]["action"], "check")
+        resp = json.loads(log.getvalue())["resp"]
+        self.assertEqual(resp["source"], "fallback:illegal_advisor_action")
+        self.assertEqual(resp["rejected"], {"action": "all_in", "amount": None, "source": "blueprint"})
+
     def test_completion_logs_real_result_and_leaves_once(self):
         log = io.StringIO()
         session, _, sent = self.session(num_hands=1, hh_log=log)
