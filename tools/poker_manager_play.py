@@ -157,7 +157,7 @@ class ManagerSession:
 
     def __init__(self, worker, n_seats=6, buy_in=2000, num_hands=100, action_log=None,
                  hh_log=None, exploit=False, prewarm=False, debug=False,
-                 auto_rebuy=False, read_account=None):
+                 auto_rebuy=False, read_account=None, stack_band_bb=(80, 180)):
         self.worker = worker
         self.n_seats = n_seats
         self.buy_in = buy_in
@@ -169,6 +169,11 @@ class ManagerSession:
         self.debug = debug
         self.auto_rebuy = auto_rebuy
         self.read_account = read_account
+        # Leave and rejoin at buy-in when our stack drifts outside this band (in BB); the
+        # blueprint assumes 100BB. None disables it.
+        self.stack_band_bb = stack_band_bb
+        self.seat_start = None
+        self.leaving = False
         self.joining = False
         self.rebuy_request_id = None
         self.lock = threading.RLock()
@@ -257,8 +262,12 @@ class ManagerSession:
             if tid:
                 if self.auto_rebuy:
                     self.send({"type": "set_auto_rebuy", "enabled": True})
+                if self.leaving:
+                    # Still seated: the leave may not have reached the server.
+                    self.send({"type": "leave_table"})
                 self.resync()
             else:
+                self.leaving = False
                 self.table_id, self.last_seq = None, 0
                 self.hand = None
                 self.my_seat = None
@@ -312,6 +321,8 @@ class ManagerSession:
         elif t == "table_joined":
             self.joining = False
             self.my_seat = m["seat"]
+            self.seat_start = next((p.get("stack") for p in m.get("players", [])
+                                    if p.get("seat") == m["seat"]), None)
         elif t == "hand_start":
             self.hand = ManagerHand(m, self.n_seats)
             self.my_seat = m["seat"]
@@ -353,6 +364,8 @@ class ManagerSession:
                     self.done = True
                     if not replay:
                         self.send({"type": "leave_table"})
+                elif not replay:
+                    self._check_stack_band(m.get("final_stacks", {}).get(str(hand.hero)), hand.bb)
         elif t == "action_rejected":
             # Never spin on invalid actions. Stale authority can be recovered once.
             code = m.get("code")
@@ -369,21 +382,43 @@ class ManagerSession:
                 self.done = True
                 print("[busted] 筹码用尽，结束运行。", file=sys.stderr)
         elif t == "player_left" and m.get("seat") == self.my_seat:
-            if self.auto_rebuy and m.get("reason") == "busted" and not replay:
-                self.table_id, self.my_seat = None, None
-                self.hand, self.pending = None, None
-                self.sent.clear()
-                self.warmed.clear()
-                self.last_seq = 0
-                self.joining = False
-                self.join_or_rebuy()
+            if not replay and (self.leaving or
+                               (self.auto_rebuy and m.get("reason") == "busted")):
+                self._rejoin()
             else:
                 self.fail(f"player_left: {m.get('reason')}")
         elif t == "table_closed":
             self.fail(f"table_closed: {m.get('reason')}")
         elif t == "error":
-            if m.get("code") != "leave_pending":
+            if self.leaving and m.get("code") == "not_at_table":
+                self._rejoin()
+            elif m.get("code") != "leave_pending":
                 self.fail(f"server error: {m.get('code')}")
+
+    def _check_stack_band(self, stack, bb):
+        if self.stack_band_bb is None or self.leaving or not stack:
+            return  # A busted stack (0) is handled by busted / player_left.
+        lo, hi = self.stack_band_bb
+        if lo * bb <= stack <= hi * bb:
+            return
+        # Only a drift away from an in-band seat: a rejoin that can only buy in out of band
+        # (e.g. a 1500 auto-rebuy grant = 75BB) would otherwise leave every hand.
+        start = self.buy_in if self.seat_start is None else self.seat_start
+        if not lo * bb <= start <= hi * bb:
+            return
+        self.leaving = True
+        self.send({"type": "leave_table"})
+        print(f"[码深漂移] 我方栈 {stack} 漂出 [{lo},{hi}]BB，离桌后重新买入。", file=sys.stderr)
+
+    def _rejoin(self):
+        self.leaving = False
+        self.table_id, self.my_seat = None, None
+        self.hand, self.pending = None, None
+        self.sent.clear()
+        self.warmed.clear()
+        self.last_seq = 0
+        self.joining = False
+        self.join_or_rebuy()
 
     def _snapshot(self, m):
         self.my_seat = m.get("hero", {}).get("seat", self.my_seat)
@@ -542,6 +577,8 @@ def main(argv=None):
     parser.add_argument("--num-hands", type=int, default=100)
     parser.add_argument("--auto-rebuy", action="store_true",
                         help="开启服务端自动补码，出局后按可用余额重新入座，累计到手数上限")
+    parser.add_argument("--stack-band-bb", default="80,180",
+                        help="我方栈漂出该区间（BB，含端点）就在本手结束后离桌、按买入重新入座；off 关闭")
     parser.add_argument("--reconnect-attempts", type=int, default=10)
     parser.add_argument("--action-log", default=None)
     parser.add_argument("--hh-log", default=None)
@@ -556,6 +593,14 @@ def main(argv=None):
         parser.error("--url 必须是 ws(s)://HOST:PORT/ws；通过 --token 鉴权")
     if not 1000 <= args.buy_in <= 5000 or args.num_hands <= 0 or args.reconnect_attempts < 0:
         parser.error("buy-in 需为 1000..5000，num-hands > 0，reconnect-attempts >= 0")
+    stack_band = None
+    if args.stack_band_bb != "off":
+        try:
+            stack_band = tuple(int(v) for v in args.stack_band_bb.split(","))
+        except ValueError:
+            stack_band = ()
+        if len(stack_band) != 2 or not 0 < stack_band[0] < stack_band[1]:
+            parser.error("--stack-band-bb 需为 LO,HI（0 < LO < HI，单位 BB）或 off")
     try:
         import websocket  # noqa: F401
     except ImportError:
@@ -575,7 +620,8 @@ def main(argv=None):
         session = ManagerSession(worker, args.seats, args.buy_in, args.num_hands,
                                  action_log, hh_log, exploit_enabled(args),
                                  args.search_prewarm, args.debug_log,
-                                 args.auto_rebuy, account_reader(args.url, args.token))
+                                 args.auto_rebuy, account_reader(args.url, args.token),
+                                 stack_band)
         stack.callback(session.disconnect)
         try:
             run(session, args.url, args.token, ws_log, args.reconnect_attempts)

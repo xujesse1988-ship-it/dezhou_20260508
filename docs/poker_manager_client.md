@@ -183,3 +183,19 @@ POKER_MANAGER_PROJECT=/Users/shaopengxu/projects_202605_after/poker_manager_2026
 
 在独立运行目录的 `args.json` 数组中增加 `"--auto-rebuy"` 即可启用。该选项不改变
 checkpoint、九座模型、实时搜索或买入上限；其他离桌原因和鉴权失败仍停止，不抢回被替换的会话。
+
+### 2026-10-20 码深漂移离场
+
+实盘 20261020_105159 一批 1000 手，我方栈从 100 BB 涨到最高 848 BB 一直坐着不动：翻前按 100 BB 的
+blueprint 打，翻牌 62 次锚定搜索里 58 次因为码深门不过改走搜索
+（`docs/temp/poker_manager_6max_live_20261020_105159_analysis_2026_10_20.md` PM-1）。
+因此移植 OpenPoker driver 的码深漂移离场：
+
+- 新增 `--stack-band-bb LO,HI`，默认 `80,180`（与 `tools/openpoker_play.py` 相同），`off` 关闭。
+  每手 `hand_result` 后，我方栈不在 `[LO×BB, HI×BB]`（含端点，BB 取本手盲注）就发一次 `leave_table`。
+- 服务端在本手结束前会回 `leave_pending`、继续发牌，照常打；以本人的 `player_left`（或 `not_at_table`）
+  为离桌完成，然后按买入（开 `--auto-rebuy` 时按账户余额）重新 `join_lobby`。离桌期间不重复发 `leave_table`。
+- 断线重连时如果还在原桌、离桌没完成，重发一次 `leave_table` 再 resync。
+- 只有**入座时栈在区间内**才会因漂移离桌。服务端自动补码一次 1500（75 BB），低于 80 BB 的下限；
+  如果不加这条，按 1500 入座后每手都会离桌。
+- 栈归零仍走原来的 `busted` → `player_left` 流程，不经过这里。达到 `--num-hands` 时只发收尾的那一次 `leave_table`。

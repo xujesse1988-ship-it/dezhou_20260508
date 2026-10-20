@@ -358,6 +358,59 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(session.done)
         self.assertEqual(len(sent), count)
 
+    def test_stack_drift_leaves_once_then_rejoins_at_buy_in(self):
+        for stack in (3620, 1580):
+            session, _, sent = self.session()
+            session.handle(event("hand_result", 10, final_stacks={"0": 2000, "1": stack}))
+            self.assertEqual(sent[-1], {"type": "leave_table"})
+            self.assertTrue(session.leaving)
+            # Leave is pending until the next hand ends; it must not be sent again.
+            session.handle(dict(event("hand_start", 11, seat=1, dealer_seat=1,
+                blinds={"small_blind": 10, "big_blind": 20}), hand_id="h2"))
+            session.handle(dict(event("hand_result", 12, final_stacks={"1": stack}), hand_id="h2"))
+            self.assertEqual(sum(m["type"] == "leave_table" for m in sent), 1)
+            session.handle(event("player_left", 13, seat=1, reason="left"))
+            self.assertEqual(sent[-1], {"type": "join_lobby", "buy_in": 2000})
+            self.assertFalse(session.done)
+            self.assertFalse(session.leaving)
+            self.assertIsNone(session.table_id)
+            self.assertEqual(session.hands, 2)
+
+    def test_stack_inside_band_or_band_off_stays_seated(self):
+        for band, stack in (((80, 180), 1600), ((80, 180), 3600), (None, 9000)):
+            session, _, sent = self.session(stack_band_bb=band)
+            count = len(sent)
+            session.handle(event("hand_result", 10, final_stacks={"1": stack}))
+            self.assertEqual(len(sent), count)
+            self.assertFalse(session.leaving)
+
+    def test_not_at_table_after_leave_rejoins(self):
+        session, _, sent = self.session()
+        session.handle(event("hand_result", 10, final_stacks={"1": 4000}))
+        session.handle({"type": "error", "code": "not_at_table"})
+        self.assertEqual(sent[-1], {"type": "join_lobby", "buy_in": 2000})
+        self.assertFalse(session.done)
+
+    def test_out_of_band_seat_does_not_leave_every_hand(self):
+        # An auto-rebuy grant of 1500 (75BB) can only buy in below the band.
+        session, _, sent = self.session(auto_rebuy=True,
+            read_account=lambda: {"chip_balance": 1500, "auto_rebuy": True})
+        session.handle(dict(type="table_joined", seat=1, table_id="t",
+                            players=[{"seat": 0, "stack": 2000}, {"seat": 1, "stack": 1500}]))
+        count = len(sent)
+        session.handle(event("hand_result", 10, final_stacks={"1": 1400}))
+        self.assertEqual(len(sent), count)
+
+    def test_reconnect_while_leaving_resends_leave(self):
+        session, _, sent = self.session()
+        session.handle(event("hand_result", 10, final_stacks={"1": 4000}))
+        count = len(sent)
+        session.disconnect()
+        session.attach(sent.append)
+        session.handle({"type": "connected", "table_id": "t"})
+        self.assertEqual([m["type"] for m in sent[count:]], ["leave_table", "resync_request"])
+        self.assertTrue(session.leaving)
+
     def test_auto_rebuy_seated_reconnect_handles_unsequenced_confirmation(self):
         session, _, sent = self.session(auto_rebuy=True,
             read_account=lambda: {"chip_balance": 8000})
