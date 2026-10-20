@@ -535,10 +535,34 @@ def run(session, url, token, ws_log=None, reconnect_attempts=10):
                     ws_log.msg("out", raw)
 
             session.attach(send)
+            last_received = time.monotonic()
+            ping_sent_at = None
+            ping_payload = b"poker-manager-heartbeat"
             while not session.done:
+                now = time.monotonic()
+                if ping_sent_at is not None and now - ping_sent_at >= 10:
+                    if ws_log:
+                        ws_log.event("heartbeat_timeout", wait_seconds=round(now - ping_sent_at, 1))
+                    print("[ws] 心跳 10 秒未收到 pong，关闭旧连接并重连。", file=sys.stderr)
+                    raise websocket.WebSocketTimeoutException("heartbeat timeout")
+                if ping_sent_at is None and now - last_received >= 15:
+                    ws.ping(ping_payload)
+                    ping_sent_at = now
+                    if ws_log:
+                        ws_log.event("heartbeat_ping")
                 try:
-                    opcode, raw = ws.recv_data()
+                    # Surface control frames so idle lobbies and server pings count as live.
+                    # websocket-client still replies to server pings automatically.
+                    opcode, raw = ws.recv_data(control_frame=True)
                 except websocket.WebSocketTimeoutException:
+                    session.tick()
+                    continue
+                last_received = time.monotonic()
+                if opcode in (websocket.ABNF.OPCODE_PING, websocket.ABNF.OPCODE_PONG):
+                    if opcode == websocket.ABNF.OPCODE_PONG and raw == ping_payload:
+                        ping_sent_at = None
+                        if ws_log:
+                            ws_log.event("heartbeat_pong")
                     session.tick()
                     continue
                 if opcode == websocket.ABNF.OPCODE_CLOSE:

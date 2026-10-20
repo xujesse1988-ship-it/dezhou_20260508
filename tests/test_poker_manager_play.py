@@ -12,10 +12,12 @@ import sys
 import tempfile
 import textwrap
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from poker_manager_play import ManagerSession
+from poker_manager_play import ManagerSession, run
 from poker_live.decision import DecisionWorker
 
 
@@ -448,6 +450,116 @@ class ManagerTests(unittest.TestCase):
                             replayed_events=[], snapshot=snapshot()))
         self.assertTrue(session.done)
         self.assertEqual(session.error, "server did not enable auto rebuy")
+
+
+class ManagerTransportTests(unittest.TestCase):
+    class Timeout(Exception):
+        pass
+
+    def setUp(self):
+        self.now = 0
+        self.sleeps = []
+        self.sockets = []
+        self.ws_log = SimpleNamespace(conn=0, event=lambda kind, **kw: self.events.append(kind),
+                                      msg=lambda *args: None)
+        self.events = []
+        self.websocket = SimpleNamespace(
+            ABNF=SimpleNamespace(OPCODE_TEXT=1, OPCODE_CLOSE=8, OPCODE_PING=9, OPCODE_PONG=10),
+            WebSocketTimeoutException=self.Timeout, WebSocketException=self.Timeout)
+
+    def socket(self, frames):
+        owner = self
+
+        class Socket:
+            def __init__(self):
+                self.frames = iter(frames)
+                self.sent = []
+                self.pings = []
+                self.closed = False
+
+            def settimeout(self, timeout):
+                pass
+
+            def send(self, raw):
+                self.sent.append(json.loads(raw))
+
+            def ping(self, payload):
+                self.pings.append(payload)
+
+            def recv_data(self, control_frame=False):
+                owner.assertTrue(control_frame)
+                delay, frame = next(self.frames)
+                owner.now += delay
+                if frame is None:
+                    raise owner.Timeout()
+                if isinstance(frame, dict):
+                    return 1, json.dumps(frame)
+                return frame
+
+            def close(self):
+                self.closed = True
+
+        socket = Socket()
+        self.sockets.append(socket)
+        return socket
+
+    def finish_hand(self):
+        return [(0, event("hand_start", 2, seat=1, dealer_seat=0,
+                           blinds={"small_blind": 10, "big_blind": 20})),
+                (0, event("hand_result", 3, final_stacks={"1": 2000}))]
+
+    def play(self, session):
+        def sleep(seconds):
+            self.now += seconds
+            self.sleeps.append(seconds)
+
+        with patch.dict(sys.modules, {"websocket": self.websocket}), \
+                patch.object(self.websocket, "create_connection", create=True,
+                             side_effect=self.sockets) as connect, \
+                patch("poker_manager_play.time.monotonic", side_effect=lambda: self.now), \
+                patch("poker_manager_play.time.sleep", side_effect=sleep):
+            run(session, "ws://example.invalid/ws", "test-token", self.ws_log)
+        return connect.call_count
+
+    def test_missing_matching_pong_reconnects_and_keeps_hand_count(self):
+        first = self.socket([(0, {"type": "connected"}), (15, None),
+                             (5, (10, b"unrelated-pong")), (5, None)])
+        second = self.socket([(0, {"type": "connected"}), *self.finish_hand()])
+        session = ManagerSession(None, num_hands=44)
+        session.hands = 43
+        self.assertEqual(self.play(session), 2)
+        self.assertEqual(session.hands, 44)
+        self.assertEqual(first.sent, [{"type": "join_lobby", "buy_in": 2000}])
+        self.assertEqual(second.sent, [{"type": "join_lobby", "buy_in": 2000},
+                                       {"type": "leave_table"}])
+        self.assertTrue(first.closed and second.closed)
+        self.assertIn("heartbeat_timeout", self.events)
+        self.assertEqual(self.sleeps, [3])
+
+    def test_matching_pongs_keep_quiet_connection_alive(self):
+        socket = self.socket([(0, {"type": "connected"}), (15, None),
+                              (1, (10, b"poker-manager-heartbeat")), (15, None),
+                              (1, (10, b"poker-manager-heartbeat")), *self.finish_hand()])
+        self.assertEqual(self.play(ManagerSession(None, num_hands=1)), 1)
+        self.assertEqual(len(socket.pings), 2)
+        self.assertEqual(self.events.count("heartbeat_pong"), 2)
+        self.assertNotIn("heartbeat_timeout", self.events)
+        self.assertFalse(self.sleeps)
+
+    def test_server_pings_are_liveness_and_do_not_enter_json_handler(self):
+        socket = self.socket([(0, {"type": "connected"}),
+                              *[(10, (9, b"server-ping"))] * 4, *self.finish_hand()])
+        self.assertEqual(self.play(ManagerSession(None, num_hands=1)), 1)
+        self.assertFalse(socket.pings)
+        self.assertFalse(self.sleeps)
+
+    def test_replaced_session_still_stops_without_reconnecting(self):
+        socket = self.socket([(0, (8, (4002).to_bytes(2, "big")))])
+        with self.assertRaisesRegex(RuntimeError, "websocket closed: 4002"):
+            self.play(ManagerSession(None))
+        self.assertTrue(socket.closed)
+        self.assertEqual(self.ws_log.conn, 1)
+        self.assertFalse(self.sleeps)
 
 
 @unittest.skipUnless(os.environ.get("POKER_MANAGER_PROJECT"), "set POKER_MANAGER_PROJECT for local WS integration")
