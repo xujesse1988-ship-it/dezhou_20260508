@@ -3131,6 +3131,8 @@ fn decide_search_unanchored(
         });
     let t0 = Instant::now();
     let misses_before = solve_cache.misses();
+    // 跨街后验命中时 subgame 不再叠加剥削（后验已带上一街的剥削），遥测据此判本决策是否实际剥削。
+    let cross_hits_before = solve_cache.cross_hits();
     // crop blueprint：档一前缀含被裁街决策且跨街后验不可得 → 补解上一街后重试一次
     // （search_with_crop_backfill doc）；完整 blueprint 下恰调一次（行为不变）。
     let search_result = search_with_crop_backfill(
@@ -3238,9 +3240,12 @@ fn decide_search_unanchored(
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates;
         resp.hero_visits = hero_visits;
-        // 叠加剥削遥测：本决策实际剥削了哪些对手座（已收敛）+ 其 VPIP。无收敛对手 → None
-        // （serde skip → byte-equal）。
-        resp.exploit = exploit_owned.as_ref().and_then(|(profiles, _, _)| {
+        // 叠加剥削遥测：本决策实际剥削了哪些对手座（已收敛）+ 其 VPIP。无收敛对手 / 跨街后验命中
+        // （subgame 不再叠加）→ None（serde skip → byte-equal）。
+        let applied = exploit_owned
+            .as_ref()
+            .filter(|_| solve_cache.cross_hits() == cross_hits_before);
+        resp.exploit = applied.and_then(|(profiles, _, _)| {
             let tel: Vec<(u8, f64)> = profiles
                 .iter()
                 .enumerate()

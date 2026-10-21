@@ -3409,6 +3409,11 @@ fn subgame_search_unanchored_cached_inner(
     // VPIP 宽度凸混合。`exploit = None`（默认 / --exploit 关）→ 此块不执行 → ranges_opt 不变、与
     // 既有 _cross 路径逐位 byte-equal。剥削后的 ranges 同进下面的 solve_cache_key → 开/关/画像更新
     // 自动 cache-miss、不串均衡。hero（auth_actor）座永不动（apply_exploit_width_prior 内守）。
+    // 跨街后验命中时**不再混**：后验由上一街子树的 root range（已混过，`cross_street_posterior_range`
+    // 读 `prev_game.ranges()`）沿真实动作线条件化而来，剥削已随它带到本街；再混一次会把 α 的质量拉回
+    // 只看翻前宽度的 `w`，每街冲掉一半翻后动作信息（对手翻牌加注、转牌再下注后仍被当成宽而弱）。
+    // 代价：上一街没剥削（锚定解 / 当时画像未收敛）时本街也不剥削，保守。
+    let exploit = exploit.filter(|_| !cross_hit);
     let exploit_active = exploit.is_some(); // 调试：剥削是否参与（消费 exploit 前捕获）。
     if let Some(ep) = exploit {
         let holes = all_hole_combos();
@@ -7350,6 +7355,121 @@ mod tests {
                 "stub：cross range == prefix range（全归桶 0 退化）→ turn 档一命中跨街解"
             );
         }
+    }
+
+    /// 叠加剥削只在档一前缀 reach 上混一次：跨街后验命中时 `exploit` 不再改 range（否则每街把 α 的
+    /// 质量拉回翻前宽度、冲掉翻后动作信息）。序列（共享缓存）：① flop 前缀 solve（miss 1）→ ② turn
+    /// 跨街、不剥削（miss 2）→ ③ turn 跨街、剥削（与 ② 同 range → 同 key → **HIT**；修前 range 被
+    /// 再混 → miss）→ ④ turn 档一（cross=None）、剥削（前缀 range 被混 → 与缓存里的 ② 不同 key →
+    /// miss，证档一路径仍剥削）。stub / 真桶都是 (3,1)：剥削改的是 range 本身，与桶无关。
+    #[test]
+    fn exploit_not_reapplied_on_cross_street_posterior() {
+        let bucket_path = std::env::var("SUBGAME_CAL_BUCKET_TABLE").unwrap_or_else(|_| {
+            "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin".to_string()
+        });
+        let table: Arc<BucketTable> = match BucketTable::open(std::path::Path::new(&bucket_path)) {
+            Ok(t) => Arc::new(t),
+            Err(_) => stub_table(),
+        };
+        let (a, mut rules) = first_small_6max(2);
+        rules.no_open_limp = true;
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            table,
+            TableConfig::default_6max_100bb(),
+            a,
+            rules,
+        )
+        .expect("6max game");
+        let cfg = SubgameSearchConfig {
+            iterations: 3000,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let decisions = offstack_synced_prefix(&game);
+        let hand_seed = 0xE8_C5_0B_51;
+        let (flop, turn, flop_within) = offstack_turn_after_flop_checks();
+        let mk_prefix = || PrefixReach {
+            strategy: &strat,
+            decisions: &decisions,
+        };
+        // 所有座都给已收敛的松画像（hero / 弃牌座由 apply_exploit_width_prior 自己跳过）。
+        let profiles = vec![Some(prof(0.6)); 6];
+        let mk_exploit = || ExploitPrior {
+            profiles: &profiles,
+            alpha: 0.5,
+            shapes: &[],
+        };
+        let mut cache = SubgameSolveCache::new();
+        // ① flop 前缀 solve。
+        subgame_search_unanchored_cached(
+            Some(&mut cache),
+            &flop,
+            &flop,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(mk_prefix()),
+            hand_seed,
+        )
+        .expect("flop solve");
+        // ② turn 跨街、不剥削。
+        subgame_search_unanchored_cached_cross_exploit(
+            Some(&mut cache),
+            &turn,
+            &turn,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(mk_prefix()),
+            Some(&flop_within),
+            None,
+            hand_seed,
+        )
+        .expect("turn 跨街");
+        // ③ turn 跨街、剥削 → 跨街后验不再被混 → 命中 ②。
+        subgame_search_unanchored_cached_cross_exploit(
+            Some(&mut cache),
+            &turn,
+            &turn,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(mk_prefix()),
+            Some(&flop_within),
+            Some(mk_exploit()),
+            hand_seed,
+        )
+        .expect("turn 跨街 + 剥削");
+        assert_eq!(cache.cross_hits(), 2, "②③ 都应命中跨街后验");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (2, 1),
+            "跨街后验命中时剥削不应再改 range（③ 与 ② 同 key）"
+        );
+        // ④ turn 档一（不跨街）、剥削 → 前缀 range 被混 → 新 key。
+        subgame_search_unanchored_cached_cross_exploit(
+            Some(&mut cache),
+            &turn,
+            &turn,
+            &game,
+            &[],
+            &cfg,
+            None,
+            Some(mk_prefix()),
+            None,
+            Some(mk_exploit()),
+            hand_seed,
+        )
+        .expect("turn 档一 + 剥削");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (3, 1),
+            "档一前缀路径仍应剥削（range 变 → miss）"
+        );
     }
 
     /// 档二′-跨街复用的**本街多决策一致性**（prev-slot 回归，容量-1 缓存的关键修复）：本街首跨街
