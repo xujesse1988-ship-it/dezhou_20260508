@@ -2118,6 +2118,34 @@ fn pot_odds_floor_hit(po: &PotOdds) -> bool {
     po.to_call > 0 && po.pot as f64 > 4.0 * po.to_call as f64 && po.to_call <= 30 * po.big_blind
 }
 
+/// 强听牌 floor 的胜率折扣（2026-10-21，实盘 B5 / B7：两头顺 + 同花听牌被 giveup 弃掉）。
+/// 出牌换算的命中率按「中了就赢、没中就输」算，偏乐观：出牌可能不干净（对手已成更大的牌或有反听），
+/// 翻牌按两张牌算命中率而跟注后转牌还可能再面对下注。乘这个系数后再和底池赔率比。
+const DRAW_CALL_EQUITY_DISCOUNT: f64 = 0.85;
+
+/// 强听牌 floor 判据（2026-10-21）：翻牌 / 转牌面对下注，hero 有强听牌（[`straight_or_better_outs`]
+/// ≥ [`STRONG_DRAW_MIN_OUTS`]，和弱牌护栏同一口径），且折扣后的命中率 ≥ 需要的胜率
+/// `to_call / (pot + to_call)` → 命中。命中率：翻牌按到河牌两张牌至少中一张，转牌按河牌一张。
+/// 不设注额上限：钱数越大需要的胜率越高，赔率本身会挡住。河牌 / 翻前没有听牌 → 不命中。
+fn draw_odds_floor_hit(hole: [Card; 2], board: &[Card], po: &PotOdds) -> bool {
+    if po.to_call == 0 || !(3..=4).contains(&board.len()) {
+        return false;
+    }
+    let outs = straight_or_better_outs(hole, board);
+    if outs < STRONG_DRAW_MIN_OUTS {
+        return false;
+    }
+    let unseen = (52 - 2 - board.len()) as f64;
+    let o = outs as f64;
+    let hit = if board.len() == 3 {
+        1.0 - (unseen - o) * (unseen - o - 1.0) / (unseen * (unseen - 1.0))
+    } else {
+        o / unseen
+    };
+    let need = po.to_call as f64 / (po.pot + po.to_call) as f64;
+    hit * DRAW_CALL_EQUITY_DISCOUNT >= need
+}
+
 /// preflop 失同步/兜底点的底池赔率 floor 输入：真栈重放（limp 池真栈合法可建；off-stack 等
 /// 建不了 → `None` 不触发，安全降级，同现有 postflop floor「无 auth 不触发」）→
 /// [`pot_odds_from_auth`]。**仅 preflop 调**（board 必空；postflop 失同步走脱影子搜索或维持
@@ -2151,9 +2179,11 @@ fn preflop_pot_odds(
 ///     **>** [`NUT_CALL_THRESHOLD`] → call。
 ///  ② ①不命中时看底池赔率（[`PotOdds`]，2026-06-15 用户加）：`pot/to_call > 4` 且
 ///     `to_call ≤ 30BB` → call（`pot_odds=None` 的兜底点不触发，行为同改前）。
+///  ③ ①②都不命中时看强听牌（[`draw_odds_floor_hit`]，2026-10-21 加）：翻牌 / 转牌强听牌且
+///     折扣后命中率够赔率 → call（同样要 `pot_odds`）。
 /// 其余一律原 check-when-free（能 check 就 check、否则 fold——紧、不漏筹码）；能免费 check 的
-/// 局面不为这两条地板主动下注（用户只要「别扔/跟注」）。命中时 `source` 在 caller 给的完整
-/// source 后追加 `:premium_call` / `:nut_call`（①）或 `:pot_odds_call`（②），**前缀不变**
+/// 局面不为这几条地板主动下注（用户只要「别扔/跟注」）。命中时 `source` 在 caller 给的完整
+/// source 后追加 `:premium_call` / `:nut_call`（①）、`:pot_odds_call`（②）或 `:draw_call`（③），**前缀不变**
 /// （driver 仍按 `fallback:` / `search_giveup:` 分桶，`starts_with` 不变量保持）。仅用于已完成
 /// 座位映射的决策阶段兜底（座位映射 / 入参校验失败仍走原 [`safe_fallback`]，那里状态不可信）。
 fn fallback_with_floor(
@@ -2170,8 +2200,14 @@ fn fallback_with_floor(
         } else {
             (current_board_nuttiness(hole, board) > NUT_CALL_THRESHOLD).then_some("nut_call")
         };
-        // ② 底池赔率（①不命中才看）。
-        let suffix = nut.or_else(|| pot_odds.filter(pot_odds_floor_hit).map(|_| "pot_odds_call"));
+        // ② 底池赔率（①不命中才看）；③ 强听牌（①②都不命中才看）。
+        let suffix = nut
+            .or_else(|| pot_odds.filter(pot_odds_floor_hit).map(|_| "pot_odds_call"))
+            .or_else(|| {
+                pot_odds
+                    .filter(|po| draw_odds_floor_hit(hole, board, po))
+                    .map(|_| "draw_call")
+            });
         if let Some(sfx) = suffix {
             return Response {
                 action: "call".into(),
@@ -5674,6 +5710,124 @@ mod tests {
         assert_eq!(
             r.source, "fallback:h:premium_call",
             "preflop premium 走 ①，得 {r:?}"
+        );
+    }
+
+    /// 强听牌 floor（2026-10-21）：实盘三手两头顺 + 同花听牌被 giveup 弃掉（4c9ff02d T9s、
+    /// 05358313 T7h、6458e659 A7s），赔率够 → call（:draw_call）；卡顺、赔率不够、河牌、
+    /// 没有 pot_odds、能免费 check 都不触发。
+    #[test]
+    fn fallback_floor_strong_draw_call() {
+        let card = |s: &str| parse_card(s).unwrap();
+        let hole = |a: &str, b: &str| [card(a), card(b)];
+        let cards = |s: &str| s.split(' ').map(card).collect::<Vec<_>>();
+        let po = |pot: u64, to_call: u64| {
+            Some(PotOdds {
+                pot,
+                to_call,
+                big_blind: 20,
+            })
+        };
+        let facing_bet = ValidActions {
+            can_check: false,
+            can_call: true,
+            can_raise: true,
+            min_raise: Some(40),
+            max_raise: Some(2000),
+        };
+        let free = ValidActions {
+            can_check: true,
+            ..facing_bet.clone()
+        };
+
+        // —— 实盘三手（pot 含对手这次的下注；pot/to_call 都 < 4，② 不命中，靠 ③）。
+        for (h, b, pot, to_call) in [
+            (hole("Ts", "9s"), "Qs 8h 7s", 842, 362), // 4c9ff02d，需要 30%
+            (hole("Th", "7h"), "5h 9h 8d", 114, 44),  // 05358313，需要 28%
+            (hole("7s", "As"), "6s 5s 8h", 437, 217), // 6458e659，需要 33%
+        ] {
+            let board = cards(b);
+            assert_eq!(
+                straight_or_better_outs(h, &board),
+                15,
+                "{b} 两头顺 + 同花听 = 15 张"
+            );
+            let r = fallback_with_floor(
+                &facing_bet,
+                h,
+                &board,
+                po(pot, to_call),
+                "search_giveup:unanchored:low_hero_visits".into(),
+            );
+            assert_eq!(r.action, "call", "{b} 强听牌赔率够须 call，得 {r:?}");
+            assert_eq!(
+                r.source, "search_giveup:unanchored:low_hero_visits:draw_call",
+                "得 {r:?}"
+            );
+        }
+
+        // —— 卡顺（4 张）不算强听牌：887115ac QJo@3d5c8sTc 面对 954 → fold。
+        let gut = cards("3d 5c 8s Tc");
+        assert_eq!(straight_or_better_outs(hole("Qh", "Jc"), &gut), 4);
+        let r = fallback_with_floor(
+            &facing_bet,
+            hole("Qh", "Jc"),
+            &gut,
+            po(1862, 954),
+            "g".into(),
+        );
+        assert_eq!(
+            (r.action.as_str(), r.source.as_str()),
+            ("fold", "g"),
+            "得 {r:?}"
+        );
+
+        // —— 单同花听（9 张）翻牌：两张牌命中 ≈35%，×0.85 ≈ 0.297。
+        // 满池下注需要 1/3 → fold；半池需要 1/4 → call。
+        let fd = cards("Qh 7h 3c");
+        assert_eq!(straight_or_better_outs(hole("Kh", "2h"), &fd), 9);
+        let r = fallback_with_floor(&facing_bet, hole("Kh", "2h"), &fd, po(300, 150), "g".into());
+        assert_eq!(r.action, "fold", "单同花听面对满池须 fold，得 {r:?}");
+        let r = fallback_with_floor(&facing_bet, hole("Kh", "2h"), &fd, po(225, 75), "g".into());
+        assert_eq!(r.source, "g:draw_call", "单同花听面对半池须 call，得 {r:?}");
+
+        // —— 转牌只剩一张：15 张 15/46 ≈ 32.6%，×0.85 ≈ 0.277。满池 → fold；半池 → call。
+        let turn = cards("5h 9h 8d 2c");
+        let r = fallback_with_floor(
+            &facing_bet,
+            hole("Th", "7h"),
+            &turn,
+            po(300, 150),
+            "g".into(),
+        );
+        assert_eq!(r.action, "fold", "转牌听牌面对满池须 fold，得 {r:?}");
+        let r = fallback_with_floor(
+            &facing_bet,
+            hole("Th", "7h"),
+            &turn,
+            po(225, 75),
+            "g".into(),
+        );
+        assert_eq!(r.source, "g:draw_call", "转牌听牌面对半池须 call，得 {r:?}");
+
+        // —— 河牌没有听牌、没有 pot_odds、能免费 check → 都不触发。
+        let river = cards("5h 9h 8d 2c Ks");
+        let r = fallback_with_floor(
+            &facing_bet,
+            hole("Th", "7h"),
+            &river,
+            po(114, 44),
+            "g".into(),
+        );
+        assert_eq!(r.action, "fold", "河牌须 fold，得 {r:?}");
+        let flop = cards("5h 9h 8d");
+        let r = fallback_with_floor(&facing_bet, hole("Th", "7h"), &flop, None, "g".into());
+        assert_eq!(r.action, "fold", "无 pot_odds 须 fold，得 {r:?}");
+        let r = fallback_with_floor(&free, hole("Th", "7h"), &flop, po(114, 44), "g".into());
+        assert_eq!(
+            (r.action.as_str(), r.source.as_str()),
+            ("check", "g"),
+            "得 {r:?}"
         );
     }
 
