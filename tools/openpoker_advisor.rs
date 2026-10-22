@@ -3510,6 +3510,11 @@ fn commits_stack(state: &GameState, abs: &StreetActionAbstraction, a: AbstractAc
 /// 比例挪给过牌 / 跟注 / 弃牌；没押上的下注档原样保留。分布里没有被动动作（概率全为 0）→ 整份给
 /// 过牌（能过时）或弃牌。不触发（翻前 / 非弱牌 / 没有押上的动作）→ `None`，调用方照原分布抽样。
 ///
+/// **面对下注、分布里根本没有 `Call` 这一档**（不是概率为 0，是不在菜单里）→ 挪走的概率整份给真实
+/// 跟注：对手的注在树里被映射成全下（blueprint 影子树 / 子树菜单），我方跟注按 AA-004-rev1 折进了
+/// AllIn 槽，这份 AllIn 在树里的含义就是跟注；真实局面下我方跟完还有筹码，AllIn 才变成真全下。
+/// 按比例给弃牌会把解想跟注的部分变成弃牌（2026-10-21 实盘 1c3c2ba0、f2ff9b11）。
+///
 /// 这是针对对手池的剥削，不是修正均衡：run5 里对手面对我方超池全下只有 17% 全弃，弱牌诈唬全下
 /// 系统性亏钱（`openpoker_postflop_weak_allin_research_2026_10_17` §3.3）。代价是放弃一部分
 /// 平衡用的诈唬。强牌、强听牌不受影响。
@@ -3541,6 +3546,21 @@ fn weak_commit_guard(
         .sum();
     if moved <= 0.0 || !is_weak_postflop_hand(hole, board) {
         return None;
+    }
+    // Facing a bet with no Call slot at all: the call was folded into AllIn (opponent's bet mapped
+    // to all-in in the tree), so the moved mass goes to a real call instead of fold.
+    let has_call = dist
+        .iter()
+        .any(|(a, _)| matches!(a, AbstractAction::Call { .. }));
+    if let Some(to) = state.legal_actions().call.filter(|_| !has_call) {
+        let mut out: Vec<(AbstractAction, f64)> = dist
+            .iter()
+            .zip(&committing)
+            .filter(|(_, &c)| !c)
+            .map(|(&ap, _)| ap)
+            .collect();
+        out.push((AbstractAction::Call { to }, moved));
+        return Some(out);
     }
     let passive_mass: f64 = dist
         .iter()
@@ -10379,6 +10399,59 @@ mod tests {
             .expect("弃牌")
             .1;
         assert!((fold - 1.0).abs() < 1e-12, "{g:?}");
+    }
+
+    /// 护栏：面对下注、分布里没有 `Call` 这一档（树里对手注被映成全下，跟注折进了 AllIn 槽）→ 挪走的
+    /// 全下概率给真实跟注，不给弃牌（2026-10-21 实盘 1c3c2ba0 KcQc fold .29 / allin .71 被挪成全弃）。
+    /// `Call` 在菜单里、只是概率为 0 时仍按原规则给弃牌（上一个测试的最后一段）。
+    #[test]
+    fn weak_commit_guard_gives_absorbed_call_mass_to_call() {
+        let weak = hole_of("6c 5c");
+        let flop = cards("3h 9d 8s");
+        let state = facing_flop_bet_state(1_000, 200);
+        let abs = deep_menu_for(&state).0;
+        let all_in = poker::ActionAbstraction::abstract_actions(&abs, &state)
+            .iter()
+            .copied()
+            .find(|a| matches!(a, AbstractAction::AllIn { .. }))
+            .expect("菜单有全下");
+        let call_to = state.legal_actions().call.expect("面对下注能跟");
+        assert!(
+            commits_stack(&state, &abs, all_in),
+            "跟完还有筹码，AllIn 在真实局面是真全下"
+        );
+        let dist = vec![(AbstractAction::Fold, 0.29), (all_in, 0.71)];
+        let g = weak_commit_guard(&dist, weak, &flop, &state, &abs).expect("弱牌 + 全下 → 触发");
+        assert_eq!(
+            g,
+            vec![
+                (AbstractAction::Fold, 0.29),
+                (AbstractAction::Call { to: call_to }, 0.71)
+            ]
+        );
+        // 不面对下注（能过牌）时没有跟注可给，仍挪给过牌。
+        let mut unopened = facing_flop_bet_state(1_000, 200);
+        unopened.apply(Action::Call).expect("hero 跟注");
+        assert!(unopened.legal_actions().check, "转牌首个行动者可以过牌");
+        let unopened_abs = deep_menu_for(&unopened).0;
+        let shove = poker::ActionAbstraction::abstract_actions(&unopened_abs, &unopened)
+            .iter()
+            .copied()
+            .find(|a| matches!(a, AbstractAction::AllIn { .. }))
+            .expect("菜单有全下");
+        let turn = cards("3h 9d 8s Kc");
+        let g = weak_commit_guard(
+            &[(AbstractAction::Check, 0.4), (shove, 0.6)],
+            weak,
+            &turn,
+            &unopened,
+            &unopened_abs,
+        )
+        .expect("触发");
+        assert!(
+            matches!(g.as_slice(), [(AbstractAction::Check, p)] if (p - 1.0).abs() < 1e-12),
+            "{g:?}"
+        );
     }
 
     /// `--search-min-hero-visits` / `--search-weak-commit-guard`：默认 200 / 开，显式值覆盖，坏值拒收，
