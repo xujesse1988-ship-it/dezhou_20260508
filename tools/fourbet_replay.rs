@@ -3,13 +3,19 @@
 //! 读 poker_manager 的 hh JSONL（driver `--hh-log`，每行一手、`result.actions` 带名字和金额），
 //! 每个文件新建一个 [`FourBetTracker`]（= 每个进程从零统计），逐手：先对「我方开局、恰好一人非全下
 //! 3bet、其余都弃、轮到我方」的点判门，再把整手喂进识别器。每个点输出一行 JSON：
-//! `{"hand_id","opp","open","p3_tail","f_tail","fstar"}`，与 `artifacts/pm17_replay_2026_10_22/replay_v1.py
-//! --dump` 逐条比对。4bet 额按回放口径取 3bet 额的 2.8 倍（advisor 实盘用 raise1pot 的真实出牌额）。
+//! `{"hand_id","opp","open","p3_tail","f_tail","fstar","p3_mean","f_mean","opp3","faced4"}`，与
+//! `artifacts/pm17_replay_2026_10_22/replay_v1.py --dump` 逐条比对（后四项不依赖 fstar，可直接对实盘
+//! `resp.fourbet` 遥测）。4bet 额按回放口径取 3bet 额的 2.8 倍（advisor 实盘用 raise1pot 的真实出牌额）。
 //!
-//! 用法：`fourbet_replay <hh.jsonl>...`（多个文件按给出顺序处理，各自从零统计）。
+//! 用法：`fourbet_replay [--load-state <in.json>] [--save-state <out.json>] <hh.jsonl>...`
+//! - 不带 `--*-state`：多个文件按给出顺序处理，各自从零统计。
+//! - 带任一 `--*-state`：所有文件串成一个识别器（= 跨进程续用）；`--load-state` 从已有状态接着喂
+//!   （文件必须存在），`--save-state` 在喂完后写出状态文件（advisor `--exploit-4bet-state` 同一格式，
+//!   可用历史牌局给实盘生成初始状态）。
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 use poker::training::fourbet_exploit::{FourBetConfig, FourBetTracker};
 use poker::training::opponent_profile::{ObsAction, ObserveHand};
@@ -103,15 +109,49 @@ fn observe(x: &HhLine) -> ObserveHand {
     }
 }
 
+const USAGE: &str =
+    "用法：fourbet_replay [--load-state <in.json>] [--save-state <out.json>] <hh.jsonl>...";
+
 fn main() -> Result<(), String> {
-    let files: Vec<String> = std::env::args().skip(1).collect();
+    let mut files: Vec<String> = Vec::new();
+    let mut load: Option<PathBuf> = None;
+    let mut save: Option<PathBuf> = None;
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--load-state" | "--save-state" => {
+                let v = PathBuf::from(it.next().ok_or_else(|| format!("{arg} 缺值；{USAGE}"))?);
+                if arg == "--load-state" {
+                    load = Some(v);
+                } else {
+                    save = Some(v);
+                }
+            }
+            a if a.starts_with("--") => return Err(format!("unknown arg {a}；{USAGE}")),
+            _ => files.push(arg),
+        }
+    }
     if files.is_empty() {
-        return Err("用法：fourbet_replay <hh.jsonl>...".into());
+        return Err(USAGE.into());
     }
     let cfg = FourBetConfig::default();
+    let chained = load.is_some() || save.is_some();
+    let mut tracker = match &load {
+        Some(p) => {
+            let (t, warnings) = FourBetTracker::load_state(cfg.clone(), p)?
+                .ok_or_else(|| format!("{}: 不存在", p.display()))?;
+            for w in warnings {
+                eprintln!("[fourbet_replay] 告警：{w}");
+            }
+            t
+        }
+        None => FourBetTracker::new(cfg.clone()),
+    };
     let mut out = std::io::stdout().lock();
     for f in &files {
-        let mut tracker = FourBetTracker::new(cfg.clone());
+        if !chained {
+            tracker = FourBetTracker::new(cfg.clone());
+        }
         let file = std::fs::File::open(f).map_err(|e| format!("{f}: {e}"))?;
         for line in std::io::BufReader::new(file).lines() {
             let line = line.map_err(|e| e.to_string())?;
@@ -135,6 +175,8 @@ fn main() -> Result<(), String> {
                         serde_json::json!({
                             "hand_id": x.hand_id, "opp": name, "open": g.open,
                             "p3_tail": g.p3_tail, "f_tail": g.f_tail, "fstar": fstar,
+                            "p3_mean": g.p3_mean, "f_mean": g.f_mean, "opp3": g.opp3,
+                            "faced4": g.faced4,
                         })
                     )
                     .map_err(|e| e.to_string())?;
@@ -142,6 +184,15 @@ fn main() -> Result<(), String> {
             }
             tracker.observe_hand(&observe(&x));
         }
+    }
+    if let Some(p) = &save {
+        tracker.save_state(p)?;
+        eprintln!(
+            "[fourbet_replay] 状态写到 {}：累计 {} 手、{} 名玩家",
+            p.display(),
+            tracker.hands(),
+            tracker.players()
+        );
     }
     Ok(())
 }

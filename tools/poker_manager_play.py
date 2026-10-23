@@ -617,6 +617,9 @@ def fourbet_extra_args(args):
                         ("--exploit-4bet-3bet-decay", args.exploit_4bet_3bet_decay)):
         if value is not None:
             extra += [flag, str(value)]
+    if args.exploit_4bet_state is not None:
+        # Absolute, so the advisor reads the same file whatever its working directory.
+        extra += ["--exploit-4bet-state", os.path.abspath(args.exploit_4bet_state)]
     return extra
 
 
@@ -644,10 +647,12 @@ def main(argv=None):
                         help="被 4bet 弃牌统计的衰减系数，默认 0.9")
     parser.add_argument("--exploit-4bet-3bet-decay", type=float, default=None,
                         help="3bet 统计的衰减系数，默认 0.98")
+    parser.add_argument("--exploit-4bet-state", default=None,
+                        help="PM-17 统计的状态文件：启动时读入接着统计（不存在则从零），每手写回；不设 = 每次从零")
     args = parser.parse_args(argv)
     validate_advisor_args(args)
     fourbet_subflags = (args.exploit_4bet_convert, args.exploit_4bet_fold_decay,
-                        args.exploit_4bet_3bet_decay)
+                        args.exploit_4bet_3bet_decay, args.exploit_4bet_state)
     if args.exploit_4bet != "on" and any(v is not None for v in fourbet_subflags):
         parser.error("--exploit-4bet-* 子旗需配 --exploit-4bet on")
     if not args.token or any(c.isspace() for c in args.token):

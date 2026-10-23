@@ -88,8 +88,12 @@ clamp(1 − 0.05/p̂3, 0.45, 0.95)、权重 4)都过时,advisor 在翻前 bluepr
 / `-fold-decay` / `-3bet-decay`;driver `poker_manager_play.py` 同名参数,开启时请求带 names、observe 带
 `contribution_delta` / `to_call_before`。`decide` 改为 `decide_with(..., None)` 的转调,关闭时逐字节不变。
 离线回放(`temp/pm17_online_detector_replay_2026_10_22.md`):每进程从零统计,cc 出现后 56–193 手放开,普通玩家 0 次误判;
-Rust `tools/fourbet_replay` 与 Python 回放在 11 批 hh 上逐点一致(390 个点,尾概率差 < 1e-14)。**还没上实盘**;
-设计 `temp/pm17_preflop_4bet_exploit_design_2026_10_22.md`。
+Rust `tools/fourbet_replay` 与 Python 回放在 11 批 hh 上逐点一致(390 个点,尾概率差 < 1e-14)。
+设计 `temp/pm17_preflop_4bet_exploit_design_2026_10_22.md`。首轮实盘 bp2 2000 手(2026-10-22):第 66 手开门、只对 cc 开,
+我方 4bet 43 次净 +406.5 BB,cc 弃 45 / 全下 2(`temp/poker_manager_live_20261022_bp2_204941_pm17_analysis_2026_10_23.md`)。
+**跨进程续用(2026-10-23)**:advisor / driver `--exploit-4bet-state <path>`,启动读状态文件接着统计(不存在 → 从零),
+每手 observe 后原子写回;浮点存成最短十进制串,按位还原;`fourbet_replay --load-state / --save-state` 用同一格式,
+可从历史 hh 生成初始状态。204941 那批拆成两段续跑与一次跑完的状态文件逐字节相同,回放与实盘遥测 99 个点的统计一致。
 
 **深码全下抽样门槛(2026-10-20)**。起因:poker_manager 实盘 922fe989 翻牌顶对 SPR≈21,搜索给 allin 0.055,刚过 5% 剪枝线
 被抽中,157BB 推进 7.5BB 的底池;该批 SPR ≥ 6 的 187 次翻后决策里 allin ≥ 5% 只有 3 次(0.174 / 0.080 / 0.055),全是一对顶对。

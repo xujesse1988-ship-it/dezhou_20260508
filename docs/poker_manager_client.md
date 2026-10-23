@@ -236,4 +236,8 @@ driver 判它不在合法动作里、按兜底弃牌，**AA 被弃**（`docs/tem
   `--exploit-4bet-3bet-decay`（默认 0.98）。主开关没开时传子参数直接报错。
 - 动作日志：PM-17 改过分布的决策 `source` 末尾是 `:exploit_4bet`；命中点位的决策都有 `resp.fourbet`
   （对手名、门开没开、原因、保本弃牌率、挪了多少概率、两项统计）。
+- `--exploit-4bet-state <path>`（2026-10-23）：统计跨进程续用。启动时读这个状态文件接着统计，文件不存在就从零开始；
+  每手结束写回（先写 `<path>.tmp` 再改名）。文件内容不合法时 advisor 拒绝启动，不会悄悄从零开始。driver 把路径转成绝对路径再传。
+  不设 = 每次从零（旧行为）。用历史牌局生成初始状态：
+  `cargo run --release --bin fourbet_replay -- --save-state <state.json> <hh.jsonl>...`（多个文件按给出顺序串起来统计）。
 

@@ -4100,6 +4100,10 @@ struct Args {
     /// 关，全程与现网 byte-equal。子旗 `--exploit-4bet-convert` / `--exploit-4bet-fold-decay` /
     /// `--exploit-4bet-3bet-decay` 填 [`FourBetConfig`] 对应字段，其余用默认值。
     exploit_4bet: Option<FourBetConfig>,
+    /// `--exploit-4bet-state <path>`：PM-17 识别器跨进程续用。启动时读这个状态文件接着统计（不存在 →
+    /// 空表起步），每手 observe 后原子写回。**仅 `--exploit-4bet on` 时可设**。`None`（默认）= 每个进程
+    /// 从零统计、不写盘。
+    exploit_4bet_state: Option<PathBuf>,
     /// `--debug-log`：打印决策流水线 + range / solve 中间数据到 **stderr**（与 `--search` 正交，
     /// blueprint 路径也打）。`false`（默认）= 静默、零开销；on 也不动 stdout（IPC byte-equal）。
     debug_log: bool,
@@ -4315,17 +4319,46 @@ fn run() -> Result<(), String> {
             }
         }
     }
-    // PM-17：进程内空表识别器（不依赖 --search；observe 由 driver --exploit-4bet 开时发来）。
-    let fourbet_rt: Option<RefCell<FourBetTracker>> = args
-        .exploit_4bet
-        .clone()
-        .map(|cfg| RefCell::new(FourBetTracker::new(cfg)));
+    // PM-17：进程内识别器（不依赖 --search；observe 由 driver --exploit-4bet 开时发来）。
+    // --exploit-4bet-state 给了就读盘续用（文件坏了拒绝启动，不静默空表起步）。
+    let fourbet_rt: Option<RefCell<FourBetTracker>> =
+        match (&args.exploit_4bet, &args.exploit_4bet_state) {
+            (None, _) => None,
+            (Some(cfg), None) => Some(RefCell::new(FourBetTracker::new(cfg.clone()))),
+            (Some(cfg), Some(path)) => {
+                let tracker = match FourBetTracker::load_state(cfg.clone(), path)
+                    .map_err(|e| format!("--exploit-4bet-state 读取失败：{e}"))?
+                {
+                    Some((t, warnings)) => {
+                        for w in warnings {
+                            eprintln!("[openpoker_advisor] exploit-4bet-state 告警：{w}");
+                        }
+                        eprintln!(
+                            "[openpoker_advisor] exploit-4bet-state 续用 {}：累计 {} 手、{} 名玩家",
+                            path.display(),
+                            t.hands(),
+                            t.players()
+                        );
+                        t
+                    }
+                    None => {
+                        eprintln!(
+                            "[openpoker_advisor] exploit-4bet-state {} 不存在：空表起步，每手写回",
+                            path.display()
+                        );
+                        FourBetTracker::new(cfg.clone())
+                    }
+                };
+                Some(RefCell::new(tracker))
+            }
+        };
     if let Some(cell) = &fourbet_rt {
         let c = cell.borrow().cfg().clone();
         eprintln!(
-            "[openpoker_advisor] exploit-4bet ON (PM-17 翻前 4bet): prior3={:?} thr3={} conf3={} lam3={} cont_share={} prior_f=[{},{}]x{} conf_f={} lam_f={} convert={} min_depth_mult={}（进程内实时统计）",
+            "[openpoker_advisor] exploit-4bet ON (PM-17 翻前 4bet): prior3={:?} thr3={} conf3={} lam3={} cont_share={} prior_f=[{},{}]x{} conf_f={} lam_f={} convert={} min_depth_mult={}（{}）",
             c.prior3, c.thr3, c.conf3, c.lam3, c.cont_share, c.prior_f_floor, c.prior_f_cap,
-            c.prior_f_weight, c.conf_f, c.lam_f, c.convert, c.min_depth_mult
+            c.prior_f_weight, c.conf_f, c.lam_f, c.convert, c.min_depth_mult,
+            if args.exploit_4bet_state.is_some() { "跨进程续用" } else { "进程内实时统计" }
         );
     }
     eprintln!(
@@ -4372,6 +4405,12 @@ fn run() -> Result<(), String> {
                     }
                     if let Some(cell) = &fourbet_rt {
                         cell.borrow_mut().observe_hand(&obs);
+                        // 写盘失败只告警：决策不受影响，下一手再试。
+                        if let Some(path) = &args.exploit_4bet_state {
+                            if let Err(e) = cell.borrow().save_state(path) {
+                                eprintln!("[openpoker_advisor] exploit-4bet-state 写盘失败：{e}");
+                            }
+                        }
                     }
                 }
             }
@@ -4484,6 +4523,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_4bet_convert: Option<f64> = None;
     let mut exploit_4bet_fold_decay: Option<f64> = None;
     let mut exploit_4bet_3bet_decay: Option<f64> = None;
+    let mut exploit_4bet_state: Option<PathBuf> = None;
     let mut debug_log = false;
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -4705,6 +4745,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     other => return Err(format!("--exploit-4bet 须 on|off，得 {other}")),
                 };
             }
+            "--exploit-4bet-state" => {
+                exploit_4bet_state = Some(PathBuf::from(next_val(&mut it, &arg)?));
+            }
             "--exploit-4bet-convert"
             | "--exploit-4bet-fold-decay"
             | "--exploit-4bet-3bet-decay" => {
@@ -4798,7 +4841,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     if !exploit_4bet_on
         && (exploit_4bet_convert.is_some()
             || exploit_4bet_fold_decay.is_some()
-            || exploit_4bet_3bet_decay.is_some())
+            || exploit_4bet_3bet_decay.is_some()
+            || exploit_4bet_state.is_some())
     {
         return Err("设了 --exploit-4bet-* 子旗但 --exploit-4bet 非 on".to_string());
     }
@@ -4857,6 +4901,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         search_bucket_table,
         exploit,
         exploit_4bet,
+        exploit_4bet_state,
         // 默认开（§5.1 实测拍板）；--search-unanchored-prefix-reach off 显式关。
         search_unanchored_prefix_reach: search_unanchored_prefix_reach
             .unwrap_or(DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH),
@@ -11231,6 +11276,10 @@ mod tests {
         assert!(on.search.is_none());
         // 子旗没开总开关 → 拒绝。
         assert!(parse(&["--exploit-4bet-fold-decay", "0.9"]).is_err());
+        assert!(parse(&["--exploit-4bet-state", "s.json"]).is_err());
+        assert!(on.exploit_4bet_state.is_none());
+        let st = parse(&["--exploit-4bet", "on", "--exploit-4bet-state", "s.json"]).unwrap();
+        assert_eq!(st.exploit_4bet_state, Some(PathBuf::from("s.json")));
         // 越界 → 拒绝。
         assert!(parse(&["--exploit-4bet", "on", "--exploit-4bet-convert", "1.5"]).is_err());
         assert!(parse(&["--exploit-4bet", "maybe"]).is_err());

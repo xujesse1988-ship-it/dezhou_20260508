@@ -1,5 +1,6 @@
 """poker_manager client contracts; no checkpoint, token or server required."""
 
+import contextlib
 import copy
 from datetime import datetime, timezone
 import io
@@ -321,12 +322,28 @@ class ManagerTests(unittest.TestCase):
     def test_exploit_4bet_flags_pass_through(self):
         from poker_manager_play import fourbet_extra_args
         off = SimpleNamespace(exploit_4bet="off", exploit_4bet_convert=None,
-                              exploit_4bet_fold_decay=None, exploit_4bet_3bet_decay=None)
+                              exploit_4bet_fold_decay=None, exploit_4bet_3bet_decay=None,
+                              exploit_4bet_state=None)
         self.assertEqual(fourbet_extra_args(off), [])
         on = SimpleNamespace(exploit_4bet="on", exploit_4bet_convert=0.5,
-                             exploit_4bet_fold_decay=None, exploit_4bet_3bet_decay=0.95)
+                             exploit_4bet_fold_decay=None, exploit_4bet_3bet_decay=0.95,
+                             exploit_4bet_state=None)
         self.assertEqual(fourbet_extra_args(on), ["--exploit-4bet", "on", "--exploit-4bet-convert",
                                                   "0.5", "--exploit-4bet-3bet-decay", "0.95"])
+        state = SimpleNamespace(exploit_4bet="on", exploit_4bet_convert=None,
+                                exploit_4bet_fold_decay=None, exploit_4bet_3bet_decay=None,
+                                exploit_4bet_state="state/fourbet.json")
+        self.assertEqual(fourbet_extra_args(state),
+                         ["--exploit-4bet", "on", "--exploit-4bet-state",
+                          os.path.abspath("state/fourbet.json")])
+
+    def test_exploit_4bet_state_requires_main_switch(self):
+        from poker_manager_play import main
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            main(["--token", "t", "--checkpoint", "x.ckpt", "--bucket-table", "t.bin",
+                  "--exploit-4bet-state", "s.json"])
+        self.assertIn("--exploit-4bet-* 子旗需配 --exploit-4bet on", err.getvalue())
 
     def test_mismatched_seats_and_auth_failure_stop(self):
         session, _, _ = self.session()
