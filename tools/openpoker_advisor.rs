@@ -2317,8 +2317,9 @@ fn current_board_nuttiness(hole: [Card; 2], board: &[Card]) -> f64 {
 /// fallback「底池赔率」floor 的输入（2026-06-15 用户加）：facing bet 时若 `pot/to_call > 4`
 /// 且 `to_call ≤ 30BB` → call（好赔率 + 注额不大就别白弃）。`pot` / `to_call` / `big_blind` 同
 /// 单位（solver chip）—— 比值 `pot/to_call` 与单位无关、`to_call` vs `30×BB` 同单位 → 自洽。
-/// `pot` 取真栈 pot（含对手当前注），call-for-less（封顶全下跟）时含未被跟到的余注 → 略偏乐观，
-/// 对「别白弃」这条 floor 方向一致、可接受（不做侧池/退注精算）。
+/// `pot` 取 hero 跟注前**能赢到的**底池：每家累计投入按 hero 跟注后的累计投入封顶再相加（含对手
+/// 当前注）。call-for-less（封顶全下跟）时对手跟不到的余注不算——2026-10-23 前直接用真栈 pot，
+/// 实盘 358d86c5 cc 推 33 倍底池全下，需要的胜率 35% 被算成 3.6%，听牌 floor 误跟。
 #[derive(Copy, Clone, Debug)]
 struct PotOdds {
     pot: u64,
@@ -2333,10 +2334,19 @@ fn pot_odds_from_auth(auth: &GameState, solver_cfg: &TableConfig) -> Option<PotO
     let seat = auth.current_player()?;
     // `legal_actions().call` = 绝对跟注额（call-to 总额，封顶全下时 = cap）；补差 = 减本街已投入。
     let call_to = auth.legal_actions().call?;
-    let committed = auth.players()[seat.0 as usize].committed_this_round;
-    let to_call = call_to.as_u64().checked_sub(committed.as_u64())?;
+    let hero = &auth.players()[seat.0 as usize];
+    let to_call = call_to
+        .as_u64()
+        .checked_sub(hero.committed_this_round.as_u64())?;
+    // hero 跟注后的累计投入；每家超出它的部分 hero 赢不到（侧池 / 退还）。
+    let cap = hero.committed_total.as_u64() + to_call;
+    let pot = auth
+        .players()
+        .iter()
+        .map(|p| p.committed_total.as_u64().min(cap))
+        .sum();
     (to_call > 0).then_some(PotOdds {
-        pot: auth.pot().as_u64(),
+        pot,
         to_call,
         big_blind: solver_cfg.big_blind.as_u64(),
     })
@@ -6241,6 +6251,23 @@ mod tests {
             "fallback:e".into(),
         );
         assert_eq!(r.action, "fold", "1.5:1（<4）须 fold，得 {r:?}");
+    }
+
+    /// 短码面对超额全下（实盘 358d86c5：cc 推 33 倍底池，hero 只剩 1297）：`pot` 只算 hero 能赢到
+    /// 的部分，对手跟不到的余注不进赔率；否则 ②③ floor 会按虚高的底池误跟。
+    #[test]
+    fn pot_odds_from_auth_caps_uncallable_excess() {
+        let mut cfg = TableConfig::default_6max_100bb(); // SB 50 / BB 100。
+        cfg.starting_stacks[3] = ChipAmount::new(50_000); // UTG 超深。
+        cfg.starting_stacks[4] = ChipAmount::new(2_000); // 下一家短码。
+        let mut gs = GameState::new(&cfg, 7);
+        gs.apply(Action::AllIn).expect("UTG 全下 50000 合法");
+        let po = pot_odds_from_auth(&gs, &cfg).expect("面对全下 → Some");
+        assert_eq!(po.to_call, 2_000, "跟注封顶到 hero 全部筹码");
+        // SB 50 + BB 100 + UTG 投入封顶 2000；改前 = 50 + 100 + 50000 = 50150。
+        assert_eq!(po.pot, 2_150, "对手跟不到的 48000 不算");
+        // 需要的胜率 = 2000 / (2150 + 2000) ≈ 48%；pot/to_call ≈ 1.08 < 4 → ② 不触发。
+        assert!(!pot_odds_floor_hit(&po), "{po:?}");
     }
 
     /// 真实 live 手回归（2026-06-14 用户报）：KK（BB）对超深码对手（seat4=99614 ≈ 5000BB）
