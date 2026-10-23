@@ -32,6 +32,7 @@ pub mod aivat_value;
 pub mod best_response;
 pub mod blueprint_advisor;
 pub mod checkpoint;
+pub mod fourbet_exploit;
 pub mod game;
 pub mod kuhn;
 pub mod lbr;

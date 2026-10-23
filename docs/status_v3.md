@@ -78,6 +78,19 @@ f2ff9b11 66 allin .21 都被挪成弃牌,对手都是 cc)。`call` 在菜单里�
 这是针对跟注偏多的对手池的剥削,不是修均衡。另:超出菜单最大档(1pot)的下注在搜索里仍压成 1pot
 (本街从起点建树,菜单与 blueprint 翻牌同为 {0.5,1}),翻牌尺寸闸转去搜索对超池注不解决尺寸问题,尚未修。
 
+**PM-17 翻前 4bet 剥削(2026-10-22,默认关)**。起因:实盘全部批次合计我方开局被 cc 3bet 390 次、弃 53%(−747 BB),
+cc 被 4bet 弃 96.5%(139/144)(`temp/poker_manager_live_overall_bp2_bp3_analysis_2026_10_22.md`)。新增
+`src/training/fourbet_exploit.rs`:进程内按玩家名统计 3bet 率和「3bet 后被 4bet 的弃牌率」,两项都按新观测衰减
+(λ3 0.98 / λf 0.9),两道门(P(3bet 率 > 20%) ≥ 0.95;P(弃牌率 > 保本线) ≥ 0.8,弃牌率先验均值
+clamp(1 − 0.05/p̂3, 0.45, 0.95)、权重 4)都过时,advisor 在翻前 blueprint 路径「我方开局、恰好一人非全下 3bet、其余都弃」
+的点把 fold 概率 × convert(默认 1)挪给 raise1pot,`source` 追加 `:exploit_4bet`,`probs` 仍记原分布,响应新增
+`fourbet` 遥测(点位命中就填,门没开也填)。advisor `--exploit-4bet on|off`(不要求 `--search`)+ `--exploit-4bet-convert`
+/ `-fold-decay` / `-3bet-decay`;driver `poker_manager_play.py` 同名参数,开启时请求带 names、observe 带
+`contribution_delta` / `to_call_before`。`decide` 改为 `decide_with(..., None)` 的转调,关闭时逐字节不变。
+离线回放(`temp/pm17_online_detector_replay_2026_10_22.md`):每进程从零统计,cc 出现后 56–193 手放开,普通玩家 0 次误判;
+Rust `tools/fourbet_replay` 与 Python 回放在 11 批 hh 上逐点一致(390 个点,尾概率差 < 1e-14)。**还没上实盘**;
+设计 `temp/pm17_preflop_4bet_exploit_design_2026_10_22.md`。
+
 **深码全下抽样门槛(2026-10-20)**。起因:poker_manager 实盘 922fe989 翻牌顶对 SPR≈21,搜索给 allin 0.055,刚过 5% 剪枝线
 被抽中,157BB 推进 7.5BB 的底池;该批 SPR ≥ 6 的 187 次翻后决策里 allin ≥ 5% 只有 3 次(0.174 / 0.080 / 0.055),全是一对顶对。
 抽样前的全下门槛改成按翻后 SPR 分档:`postflop_spr` = min(hero 剩余栈, 未弃牌对手最大剩余栈) / 跟注后底池(出牌基准态:

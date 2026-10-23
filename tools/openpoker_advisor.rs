@@ -90,6 +90,7 @@ use poker::eval::NaiveHandEvaluator;
 use poker::training::blueprint_advisor::{
     advance_shadow_by_applied, find_tag, outgoing_action, parse_card,
 };
+use poker::training::fourbet_exploit::{FourBetConfig, FourBetTracker};
 use poker::training::game::{Game, PlayerId};
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::{
@@ -351,6 +352,31 @@ struct Response {
     /// 搜索走到读数的决策才填（含因访问不足被拒的那次）；blueprint / 其余兜底恒 `None`（serde skip）。
     #[serde(skip_serializing_if = "Option::is_none")]
     hero_visits: Option<u32>,
+    /// PM-17 遥测（`pm17_preflop_4bet_exploit_design_2026_10_22` §4.5）：`--exploit-4bet on` 且决策点是
+    /// 「我方开局、一人 3bet、其余都弃」时填（门没开也填，事后看为什么没放开）；否则 `None`（serde skip）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fourbet: Option<FourBetTelemetry>,
+}
+
+/// PM-17 单个决策点的遥测。浮点四舍五入到 4 位小数（只影响落盘显示）。
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct FourBetTelemetry {
+    /// 3bet 者的名字。
+    opp: String,
+    open: bool,
+    /// `open` / `3bet` / `fold4`（[`FourBetTracker::gate`]）/ `no_4bet_size`（菜单里没有非全下的
+    /// raise1pot）/ `no_stacks` / `shallow`（码深不够）/ `no_fold`（分布里没有弃牌可挪）。
+    reason: String,
+    /// 保本弃牌率 f* = risk / (risk + pot)。
+    fstar: f64,
+    /// 实际从 fold 挪给 raise1pot 的概率。
+    moved: f64,
+    p3_mean: f64,
+    p3_tail: f64,
+    opp3: f64,
+    f_mean: f64,
+    f_tail: f64,
+    faced4: f64,
 }
 
 /// 策略分布 → 日志格式：label 同 `chosen`，概率四舍五入 4 位小数（采样仍用全精度 `dist`，
@@ -1356,6 +1382,7 @@ fn unanchored_prefix_decisions(
 /// 跨请求传入——同手同街第二次决策命中即复用 solve、只重做导航（恢复「每轮恰好一个 solve」，
 /// time_budget anytime 下逐决策重解会读不同均衡；mid-round wall ≈ 0）。key 覆盖 solve 全部输入
 /// （solve 边界现算），跨手 / 跨街自然替换；blueprint 路径不读不写它（byte-equal 不受影响）。
+#[cfg(test)]
 fn decide(
     game: &SimplifiedNlheGame,
     abstraction: &StreetActionAbstraction,
@@ -1364,6 +1391,31 @@ fn decide(
     base_seed: u64,
     search: Option<&SearchRuntime>,
     solve_cache: &mut SubgameSolveCache,
+) -> Response {
+    decide_with(
+        game,
+        abstraction,
+        strategy_fn,
+        req,
+        base_seed,
+        search,
+        solve_cache,
+        None,
+    )
+}
+
+/// [`decide`] + PM-17 识别器（`fourbet`，`--exploit-4bet on` 时为 `Some`）。`None` 时与 [`decide`]
+/// 逐字节相同。识别器只读：翻前 blueprint 路径命中 [`fourbet_spot`] 时据它判门（[`fourbet_adjust`]）。
+#[allow(clippy::too_many_arguments)]
+fn decide_with(
+    game: &SimplifiedNlheGame,
+    abstraction: &StreetActionAbstraction,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    req: &Request,
+    base_seed: u64,
+    search: Option<&SearchRuntime>,
+    solve_cache: &mut SubgameSolveCache,
+    fourbet: Option<&RefCell<FourBetTracker>>,
 ) -> Response {
     // —— 前置校验（不满足 = 兜底）——
     if req.hole.len() != 2 {
@@ -1832,6 +1884,26 @@ fn decide(
     // blueprint 抽象（旧行为；search=None / 非 deep 路径 byte-equal 不受影响）。
     let outgoing_abs: &StreetActionAbstraction = deep_abs_holder.as_ref().unwrap_or(abstraction);
 
+    // PM-17（翻前 4bet 剥削）：只在翻前 blueprint 路径；门开时把 fold 概率挪给 raise1pot。
+    // `resp.probs` 仍记改之前的分布（同 weak_commit_guard 口径）。
+    let (fourbet_dist, fourbet_tel) = match fourbet {
+        Some(cell) if board.is_empty() && !want_search => fourbet_adjust(
+            &dist,
+            &legal_abs,
+            req,
+            outgoing_state,
+            outgoing_abs,
+            my_seat_solver,
+            scale,
+            &cell.borrow(),
+        )
+        .map_or((None, None), |(d, t)| (d, Some(t))),
+        _ => (None, None),
+    };
+    if let Some(t) = &fourbet_tel {
+        dlog!("fourbet: {t:?}");
+    }
+
     // 弱牌押上全部筹码护栏（只在开搜索且 --search-weak-commit-guard on 时；blueprint 路径一并管）。
     let guarded = search
         .filter(|rt| rt.weak_commit_guard)
@@ -1842,9 +1914,13 @@ fn decide(
 
     // per-decision 确定性采样（保混合策略 + 可复现；seed 与搜索与否无关 → search=None byte-equal）。
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed, n_seats));
+    // 护栏只管翻后、PM-17 只管翻前，两者不会同时改分布。
     let chosen = sample_discrete(
         &prune_for_sampling(
-            guarded.as_deref().unwrap_or(&dist),
+            guarded
+                .as_deref()
+                .or(fourbet_dist.as_deref())
+                .unwrap_or(&dist),
             postflop_spr(outgoing_state),
         ),
         &mut sample_rng,
@@ -1881,7 +1957,7 @@ fn decide(
         // 合法动作：填 source（search / blueprint）+ 诊断。不合法时 action_to_response 已产
         // safe_fallback（source = fallback:...），不覆盖。bet/raise 退成 call/check 时追加降级标记。
         resp.source = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             if low_visits_bp {
                 "blueprint:low_hero_visits"
             } else if placeholder_search {
@@ -1896,6 +1972,11 @@ fn decide(
             } else {
                 ""
             },
+            if fourbet_dist.is_some() {
+                ":exploit_4bet"
+            } else {
+                ""
+            },
             degrade.unwrap_or("")
         );
         resp.street = Some(street_label(street).into());
@@ -1904,6 +1985,7 @@ fn decide(
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates; // blueprint 路径恒 None（serde skip，byte-equal）。
         resp.hero_visits = hero_visits;
+        resp.fourbet = fourbet_tel;
     }
     dlog!(
         "decide RESULT: source={} action={} amount={:?} chosen={:?} solve_updates={:?} dist={:?}",
@@ -1915,6 +1997,156 @@ fn decide(
         resp.probs
     );
     resp
+}
+
+// ===========================================================================
+// PM-17：翻前对「3bet 多、被 4bet 就弃」的对手放开 4bet
+// （`docs/temp/pm17_preflop_4bet_exploit_design_2026_10_22.md`）
+// ===========================================================================
+
+/// PM-17 点位：翻前，我方第一个动作之前所有人都弃（没有加注也没有平跟），我方开局加注；之后到
+/// 现在恰好一个座位 X 加注（`raise`，全下不算）、其余全弃，轮到我方。返回 X 的 OpenPoker 座位。
+/// 只读真实动作序列（与 `artifacts/pm17_replay_2026_10_22/replay_v1.py::spot_v1` 同口径）。
+fn fourbet_spot(req: &Request) -> Option<u8> {
+    if !req.board.is_empty() {
+        return None;
+    }
+    let me = req.my_seat;
+    let mut opened = false;
+    let mut three: Option<u8> = None;
+    for a in &req.actions {
+        let act = a.action.trim().to_ascii_lowercase();
+        if !opened {
+            if a.seat == me {
+                if act != "raise" && act != "bet" {
+                    return None;
+                }
+                opened = true;
+            } else if act != "fold" {
+                return None;
+            }
+            continue;
+        }
+        if a.seat == me {
+            return None; // 开局后我方已经行动过（例如已经 4bet）→ 不是第一次面对 3bet。
+        }
+        match act.as_str() {
+            "fold" => {}
+            "raise" | "bet" if three.is_none() => three = Some(a.seat),
+            _ => return None,
+        }
+    }
+    three.filter(|_| opened)
+}
+
+/// 动作分布 `[(动作, 概率)]`。
+type ActionDist = Vec<(AbstractAction, f64)>;
+
+fn round4(x: f64) -> f64 {
+    (x * 1e4).round() / 1e4
+}
+
+/// PM-17 改分布。不是 PM-17 点位 / 没有 3bet 者的名字 → `None`（不留遥测）。是点位 → 必有遥测；
+/// 门开且分布里有弃牌 → 第一项为改后的分布（fold 概率 × `convert` 挪给 raise1pot，总和不变），
+/// 否则第一项 `None`（照原分布出牌）。
+///
+/// 保本弃牌率 f* = risk / (risk + pot)：risk = raise1pot 在 `state` 上的出牌额 − 我方已投入，pot =
+/// 当前底池（solver 单位，比例与 OpenPoker 单位相同）。码深：双方开局栈（`req.stacks`）都要 ≥
+/// `min_depth_mult` × 4bet 额。
+#[allow(clippy::too_many_arguments)]
+fn fourbet_adjust(
+    dist: &[(AbstractAction, f64)],
+    legal_abs: &[AbstractAction],
+    req: &Request,
+    state: &GameState,
+    abs: &StreetActionAbstraction,
+    my_seat_solver: SeatId,
+    scale: u64,
+    tracker: &FourBetTracker,
+) -> Option<(Option<ActionDist>, FourBetTelemetry)> {
+    let x = fourbet_spot(req)?;
+    let name = req.names.get(&x)?;
+    let cfg = tracker.cfg();
+    let mut tel = FourBetTelemetry {
+        opp: name.clone(),
+        open: false,
+        reason: String::new(),
+        fstar: 0.0,
+        moved: 0.0,
+        p3_mean: 0.0,
+        p3_tail: 0.0,
+        opp3: 0.0,
+        f_mean: 0.0,
+        f_tail: 0.0,
+        faced4: 0.0,
+    };
+    let closed = |mut tel: FourBetTelemetry, reason: &str| {
+        tel.reason = reason.to_string();
+        Some((None, tel))
+    };
+    let raise1pot = legal_abs.iter().copied().find(|a| {
+        matches!(a, AbstractAction::Raise { ratio_label, .. } if ratio_label.as_milli() == 1000)
+    });
+    let Some(raise1pot) = raise1pot else {
+        return closed(tel, "no_4bet_size");
+    };
+    let to = match outgoing_action(state, abs, raise1pot) {
+        Ok(Action::Raise { to }) => to.as_u64(),
+        _ => return closed(tel, "no_4bet_size"), // 全下尺寸 / 算不出 → 不碰。
+    };
+    let hero_in = state.players()[my_seat_solver.0 as usize]
+        .committed_total
+        .as_u64();
+    let pot = state.pot().as_u64();
+    let Some(risk) = to.checked_sub(hero_in).filter(|r| *r > 0) else {
+        return closed(tel, "no_4bet_size");
+    };
+    tel.fstar = round4(risk as f64 / (risk + pot) as f64);
+    let (Some(&me_stack), Some(&x_stack)) = (
+        req.stacks.get(req.my_seat as usize),
+        req.stacks.get(x as usize),
+    ) else {
+        return closed(tel, "no_stacks");
+    };
+    let need = cfg.min_depth_mult * to as f64 / scale as f64;
+    if (me_stack as f64) < need || (x_stack as f64) < need {
+        return closed(tel, "shallow");
+    }
+    let g = tracker.gate(name, risk as f64 / (risk + pot) as f64);
+    tel.open = g.open;
+    tel.reason = g.reason.to_string();
+    tel.p3_mean = round4(g.p3_mean);
+    tel.p3_tail = round4(g.p3_tail);
+    tel.opp3 = round4(g.opp3);
+    tel.f_mean = round4(g.f_mean);
+    tel.f_tail = round4(g.f_tail);
+    tel.faced4 = round4(g.faced4);
+    if !g.open {
+        return Some((None, tel));
+    }
+    let fold_p = dist
+        .iter()
+        .find(|(a, _)| matches!(a, AbstractAction::Fold))
+        .map_or(0.0, |(_, p)| *p);
+    let moved = fold_p * cfg.convert;
+    if moved <= 0.0 {
+        tel.reason = "no_fold".into();
+        return Some((None, tel));
+    }
+    tel.moved = round4(moved);
+    let mut out: ActionDist = dist
+        .iter()
+        .map(|&(a, p)| match a {
+            AbstractAction::Fold => (a, p - moved),
+            _ if a == raise1pot => (a, p + moved),
+            _ => (a, p),
+        })
+        .collect();
+    if !dist.iter().any(|(a, _)| *a == raise1pot) {
+        out.push((raise1pot, moved));
+    }
+    out.retain(|(_, p)| *p > 0.0);
+    Some((Some(out), tel))
 }
 
 /// blueprint 平均策略 → 归一 `(action, prob)`。`None` = 该信息集没有可用策略（空 / 长度不符 /
@@ -3863,6 +4095,11 @@ struct Args {
     /// （拒静默 guard）。`None`（默认）= 空表起步（旧行为）。网络丢消息 / 字段缺失 / 序列不完整的牌局
     /// 在 [`hh_record_to_observe`] 重放处 `Err` → 计数跳过（不污染统计）。
     warm_profile_hh: Option<PathBuf>,
+    /// `--exploit-4bet on|off`（PM-17，`pm17_preflop_4bet_exploit_design_2026_10_22`）：`Some` = 开
+    /// （进程内 [`FourBetTracker`] + 翻前 blueprint 路径改分布）。**不要求 `--search`**。`None`（默认）=
+    /// 关，全程与现网 byte-equal。子旗 `--exploit-4bet-convert` / `--exploit-4bet-fold-decay` /
+    /// `--exploit-4bet-3bet-decay` 填 [`FourBetConfig`] 对应字段，其余用默认值。
+    exploit_4bet: Option<FourBetConfig>,
     /// `--debug-log`：打印决策流水线 + range / solve 中间数据到 **stderr**（与 `--search` 正交，
     /// blueprint 路径也打）。`false`（默认）= 静默、零开销；on 也不动 stdout（IPC byte-equal）。
     debug_log: bool,
@@ -4078,6 +4315,19 @@ fn run() -> Result<(), String> {
             }
         }
     }
+    // PM-17：进程内空表识别器（不依赖 --search；observe 由 driver --exploit-4bet 开时发来）。
+    let fourbet_rt: Option<RefCell<FourBetTracker>> = args
+        .exploit_4bet
+        .clone()
+        .map(|cfg| RefCell::new(FourBetTracker::new(cfg)));
+    if let Some(cell) = &fourbet_rt {
+        let c = cell.borrow().cfg().clone();
+        eprintln!(
+            "[openpoker_advisor] exploit-4bet ON (PM-17 翻前 4bet): prior3={:?} thr3={} conf3={} lam3={} cont_share={} prior_f=[{},{}]x{} conf_f={} lam_f={} convert={} min_depth_mult={}（进程内实时统计）",
+            c.prior3, c.thr3, c.conf3, c.lam3, c.cont_share, c.prior_f_floor, c.prior_f_cap,
+            c.prior_f_weight, c.conf_f, c.lam_f, c.convert, c.min_depth_mult
+        );
+    }
     eprintln!(
         "[openpoker_advisor] ready reshape={} seats={} update_count={} search={}",
         ready.reshape, ready.n_seats, ready.update_count, ready.search
@@ -4113,9 +4363,16 @@ fn run() -> Result<(), String> {
         let resp = if is_observe {
             // 叠加剥削：吃一手 observe 进进程内 Profiler（仅 --exploit 开时有；脏数据静默跳过、
             // 不崩）。observe 永不出动作——返回遥测 ack（driver `_drain_pending` 丢弃）。
-            if let Some(cell) = search_rt.as_ref().and_then(|rt| rt.exploit.as_ref()) {
+            // PM-17 识别器（--exploit-4bet）与 Tier 2 Profiler 各喂一份，互不读写。
+            let profiler = search_rt.as_ref().and_then(|rt| rt.exploit.as_ref());
+            if profiler.is_some() || fourbet_rt.is_some() {
                 if let Ok(obs) = serde_json::from_str::<ObserveHand>(&line) {
-                    cell.borrow_mut().observe_hand(&obs);
+                    if let Some(cell) = profiler {
+                        cell.borrow_mut().observe_hand(&obs);
+                    }
+                    if let Some(cell) = &fourbet_rt {
+                        cell.borrow_mut().observe_hand(&obs);
+                    }
                 }
             }
             Response {
@@ -4133,7 +4390,7 @@ fn run() -> Result<(), String> {
                     search_rt.as_ref(),
                     &mut solve_cache,
                 ),
-                Ok(req) => decide(
+                Ok(req) => decide_with(
                     game,
                     &abstraction,
                     &strategy_fn,
@@ -4141,6 +4398,7 @@ fn run() -> Result<(), String> {
                     args.seed,
                     search_rt.as_ref(),
                     &mut solve_cache,
+                    fourbet_rt.as_ref(),
                 ),
                 // 解析失败也不崩：出 fold（最保守；没有 valid 信息可用）。
                 Err(e) => Response {
@@ -4221,6 +4479,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_converge_drift: Option<f64> = None;
     let mut exploit_pfr_shape = false;
     let mut warm_profile_hh: Option<PathBuf> = None;
+    // PM-17（--exploit-4bet*，不要求 --search）。
+    let mut exploit_4bet_on = false;
+    let mut exploit_4bet_convert: Option<f64> = None;
+    let mut exploit_4bet_fold_decay: Option<f64> = None;
+    let mut exploit_4bet_3bet_decay: Option<f64> = None;
     let mut debug_log = false;
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -4434,6 +4697,26 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 }
                 exploit_converge_drift = Some(v);
             }
+            "--exploit-4bet" => {
+                let v = next_val(&mut it, &arg)?;
+                exploit_4bet_on = match v.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => return Err(format!("--exploit-4bet 须 on|off，得 {other}")),
+                };
+            }
+            "--exploit-4bet-convert"
+            | "--exploit-4bet-fold-decay"
+            | "--exploit-4bet-3bet-decay" => {
+                let v: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad {arg}: {e}"))?;
+                match arg.as_str() {
+                    "--exploit-4bet-convert" => exploit_4bet_convert = Some(v),
+                    "--exploit-4bet-fold-decay" => exploit_4bet_fold_decay = Some(v),
+                    _ => exploit_4bet_3bet_decay = Some(v),
+                }
+            }
             other => return Err(format!("unknown arg {other}")),
         }
     }
@@ -4511,6 +4794,28 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     if exploit_on && search.is_none() {
         return Err("--exploit on|vpip 需配合 --search（剥削只挂脱锚搜索路径）".to_string());
     }
+    // --exploit-4bet* guard：子旗需 --exploit-4bet on；参数越界拒绝启动。
+    if !exploit_4bet_on
+        && (exploit_4bet_convert.is_some()
+            || exploit_4bet_fold_decay.is_some()
+            || exploit_4bet_3bet_decay.is_some())
+    {
+        return Err("设了 --exploit-4bet-* 子旗但 --exploit-4bet 非 on".to_string());
+    }
+    let exploit_4bet = if exploit_4bet_on {
+        let d = FourBetConfig::default();
+        let cfg = FourBetConfig {
+            convert: exploit_4bet_convert.unwrap_or(d.convert),
+            lam_f: exploit_4bet_fold_decay.unwrap_or(d.lam_f),
+            lam3: exploit_4bet_3bet_decay.unwrap_or(d.lam3),
+            ..d
+        };
+        cfg.validate()
+            .map_err(|e| format!("--exploit-4bet 参数非法：{e}"))?;
+        Some(cfg)
+    } else {
+        None
+    };
     // blueprint 来源二选一；crop 必须配 --search（被裁掉的街只能实时搜索；街级约束要读 crop 的
     // keep_through，加载后由 validate_crop_runtime 再查）。
     let (checkpoint, cropped) = match (checkpoint, cropped_checkpoint) {
@@ -4551,6 +4856,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         search,
         search_bucket_table,
         exploit,
+        exploit_4bet,
         // 默认开（§5.1 实测拍板）；--search-unanchored-prefix-reach off 显式关。
         search_unanchored_prefix_reach: search_unanchored_prefix_reach
             .unwrap_or(DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH),
@@ -10660,5 +10966,273 @@ mod tests {
         );
         assert!(r.hero_visits.is_some());
         assert_eq!(crop.cropped_queries(), 0, "全程不应查询被裁街");
+    }
+
+    // —— PM-17（翻前 4bet 剥削，`pm17_preflop_4bet_exploit_design_2026_10_22`）——
+
+    /// 6 座 button=0：UTG(3)/HJ(4) 弃，CO(5，我方) 开到 70，BTN(0) 3bet 到 240，SB(1)/BB(2) 弃 → 轮到我方。
+    fn fourbet_req(names: &[(u8, &str)], stacks: Vec<u64>) -> Request {
+        Request {
+            hole: vec!["7c".into(), "2d".into()],
+            board: vec![],
+            button_seat: 0,
+            my_seat: 5,
+            num_seats: 6,
+            small_blind: 10,
+            big_blind: 20,
+            actions: vec![
+                hist(3, "fold", None),
+                hist(4, "fold", None),
+                hist(5, "raise", Some(70)),
+                hist(0, "raise", Some(240)),
+                hist(1, "fold", None),
+                hist(2, "fold", None),
+            ],
+            valid: ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: true,
+                min_raise: Some(410),
+                max_raise: Some(2000),
+            },
+            stacks,
+            dealt_seats: vec![],
+            names: names.iter().map(|(s, n)| (*s, n.to_string())).collect(),
+        }
+    }
+
+    /// 识别器：喂 `n` 手「x 开局、cc 3bet」（cc 3bet 率 100%，从没被 4bet 过）。
+    fn tracker_with_cc(n: usize) -> RefCell<FourBetTracker> {
+        use poker::training::opponent_profile::ObsAction;
+        let act = |seat: u8, action: &str, cd: u64, tc: u64| ObsAction {
+            seat,
+            street: "preflop".into(),
+            action: action.into(),
+            contribution_delta: Some(cd),
+            to_call_before: Some(tc),
+        };
+        let hand = ObserveHand {
+            names: [(3u8, "x".to_string()), (0u8, "cc".to_string())]
+                .into_iter()
+                .collect(),
+            actions: vec![act(3, "raise", 70, 20), act(0, "raise", 240, 70)],
+        };
+        let mut t = FourBetTracker::new(FourBetConfig::default());
+        for _ in 0..n {
+            t.observe_hand(&hand);
+        }
+        RefCell::new(t)
+    }
+
+    fn run_fourbet(
+        game: &SimplifiedNlheGame,
+        req: &Request,
+        tracker: Option<&RefCell<FourBetTracker>>,
+        seed: u64,
+    ) -> Response {
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        decide_with(
+            game,
+            &abs,
+            &uniform,
+            req,
+            seed,
+            None,
+            &mut SubgameSolveCache::new(),
+            tracker,
+        )
+    }
+
+    #[test]
+    fn fourbet_spot_cases() {
+        let ok = fourbet_req(&[], vec![]);
+        assert_eq!(fourbet_spot(&ok), Some(0));
+        let with = |f: &dyn Fn(&mut Vec<HistAction>)| {
+            let mut r = fourbet_req(&[], vec![]);
+            f(&mut r.actions);
+            fourbet_spot(&r)
+        };
+        // 冷跟 3bet。
+        assert_eq!(with(&|a| a[4] = hist(1, "call", None)), None);
+        // 我方之前有人平跟。
+        assert_eq!(with(&|a| a[0] = hist(3, "call", None)), None);
+        // 3bet 是全下。
+        assert_eq!(with(&|a| a[3] = hist(0, "all_in", None)), None);
+        // 两次 3bet（SB 再加注）。
+        assert_eq!(with(&|a| a[4] = hist(1, "raise", Some(800))), None);
+        // 我方不是开局者（UTG 先加注）。
+        assert_eq!(with(&|a| a[0] = hist(3, "raise", Some(70))), None);
+        // 我方已经 4bet 过、现在面对 5bet。
+        assert_eq!(
+            with(&|a| {
+                a.push(hist(5, "raise", Some(750)));
+                a.push(hist(0, "raise", Some(2000)));
+            }),
+            None
+        );
+        // 没人 3bet（只是轮到我方——不可能是决策点，但函数须返回 None）。
+        assert_eq!(with(&|a| a[3] = hist(0, "fold", None)), None);
+        // 翻后不管。
+        let mut post = fourbet_req(&[], vec![]);
+        post.board = vec!["2c".into(), "3d".into(), "4h".into()];
+        assert_eq!(fourbet_spot(&post), None);
+    }
+
+    #[test]
+    fn fourbet_gate_open_moves_fold_mass_to_raise1pot() {
+        let req = fourbet_req(&[(0, "cc"), (5, "bp")], vec![2000; 6]);
+        let tracker = tracker_with_cc(30);
+        let game = preopen_game();
+        let resp = run_fourbet(&game, &req, Some(&tracker), 0xC0FFEE);
+        let tel = resp.fourbet.clone().expect("PM-17 点位必有遥测");
+        assert!(tel.open && tel.reason == "open", "{tel:?}");
+        assert_eq!(tel.opp, "cc");
+        // 保本弃牌率：pot = 10+20+70+240 = 340，raise1pot 到 240 + (340 + 170) = 750，risk = 680。
+        assert!((tel.fstar - 0.6667).abs() < 1e-3, "{tel:?}");
+        let probs = resp.probs.clone().expect("blueprint 路径有 probs");
+        let fold_p = probs
+            .iter()
+            .find(|(l, _)| l == "fold")
+            .map(|(_, p)| *p)
+            .unwrap();
+        assert!(
+            (tel.moved - fold_p).abs() < 1e-3,
+            "moved 应 = 原 fold 概率（convert=1），{tel:?} {probs:?}"
+        );
+        assert_eq!(resp.source, "blueprint:exploit_4bet", "{resp:?}");
+        // probs 记的是改之前的分布（uniform）。
+        assert!(
+            probs.iter().all(|(_, p)| (p - probs[0].1).abs() < 1e-3),
+            "{probs:?}"
+        );
+        // convert = 1 → fold 概率归零，任何种子都不会弃。
+        for seed in 0..12u64 {
+            let r = run_fourbet(&game, &req, Some(&tracker), seed);
+            assert_ne!(r.chosen.as_deref(), Some("fold"), "seed {seed}: {r:?}");
+            assert!(is_legal(&r, &req.valid), "seed {seed}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn fourbet_gate_closed_keeps_blueprint_output() {
+        let req = fourbet_req(&[(0, "cc"), (5, "bp")], vec![2000; 6]);
+        let unseen = RefCell::new(FourBetTracker::new(FourBetConfig::default()));
+        let game = preopen_game();
+        let baseline = decide(
+            &game,
+            &game.abstraction().clone(),
+            &|_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n],
+            &req,
+            0xC0FFEE,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(baseline.fourbet.is_none());
+        let mut resp = run_fourbet(&game, &req, Some(&unseen), 0xC0FFEE);
+        let tel = resp.fourbet.take().expect("点位命中就有遥测");
+        assert!(!tel.open && tel.reason == "3bet", "{tel:?}");
+        assert_eq!(resp, baseline, "门关时除遥测外与 decide 逐字段相同");
+        // decide_with(None) ≡ decide。
+        assert_eq!(run_fourbet(&game, &req, None, 0xC0FFEE), baseline);
+    }
+
+    #[test]
+    fn fourbet_shallow_or_unnamed_does_not_touch() {
+        let tracker = tracker_with_cc(30);
+        let game = preopen_game();
+        // 3bet 者只剩 1000（< 1.6 × 750）→ shallow。
+        let mut stacks = vec![2000; 6];
+        stacks[0] = 1000;
+        let req = fourbet_req(&[(0, "cc")], stacks);
+        let resp = run_fourbet(&game, &req, Some(&tracker), 0xC0FFEE);
+        let tel = resp.fourbet.clone().unwrap();
+        assert!(!tel.open && tel.reason == "shallow", "{tel:?}");
+        assert_eq!(resp.source, "blueprint");
+        // 没有 stacks（旧 driver）→ no_stacks。
+        let req = fourbet_req(&[(0, "cc")], vec![]);
+        let tel = run_fourbet(&game, &req, Some(&tracker), 0xC0FFEE)
+            .fourbet
+            .unwrap();
+        assert_eq!(tel.reason, "no_stacks");
+        // 3bet 者没有名字（driver 没开 --exploit-4bet）→ 不是 PM-17 点位，无遥测。
+        let req = fourbet_req(&[], vec![2000; 6]);
+        assert!(run_fourbet(&game, &req, Some(&tracker), 0xC0FFEE)
+            .fourbet
+            .is_none());
+    }
+
+    /// 生产树结构（9 座、flop2-1pot、cap 4；策略用均匀分布、桶表用占位）：面对 3bet 的节点有
+    /// raise1pot，4bet 出牌额 = 底池大小加注，门开时照常改分布、出合法加注。建 9 座 cap 4 树在 debug
+    /// 下约 150 秒 → 放长跑套件（`cargo test --release -- --ignored`，release 约 13 秒）。
+    #[test]
+    #[ignore = "9 座 cap 4 建树慢；cargo test --release -- --ignored"]
+    fn fourbet_on_production_tree_shape() {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::default_500_500_500(),
+        ));
+        let game = build_game(table, "flop2-1pot", 4, 9).expect("9-max flop2-1pot cap4");
+        // 9 座 button=0：SB=1, BB=2, UTG=3 … CO=8。UTG..HJ 弃，CO(8，我方) 开到 70，BTN(0) 3bet 到 240，盲注弃。
+        let mut actions: Vec<HistAction> = (3..8).map(|s| hist(s, "fold", None)).collect();
+        actions.push(hist(8, "raise", Some(70)));
+        actions.push(hist(0, "raise", Some(240)));
+        actions.push(hist(1, "fold", None));
+        actions.push(hist(2, "fold", None));
+        let req = Request {
+            hole: vec!["7c".into(), "2d".into()],
+            board: vec![],
+            button_seat: 0,
+            my_seat: 8,
+            num_seats: 9,
+            small_blind: 10,
+            big_blind: 20,
+            actions,
+            valid: ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: true,
+                min_raise: Some(410),
+                max_raise: Some(2000),
+            },
+            stacks: vec![2000; 9],
+            dealt_seats: vec![],
+            names: [(0u8, "cc".to_string()), (8u8, "bp".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let tracker = tracker_with_cc(30);
+        let resp = run_fourbet(&game, &req, Some(&tracker), 0xC0FFEE);
+        let tel = resp.fourbet.clone().expect("生产树上同样命中 PM-17 点位");
+        assert!(tel.open && tel.moved > 0.0, "{tel:?} {resp:?}");
+        assert!((tel.fstar - 0.6667).abs() < 1e-3, "{tel:?}");
+        assert!(resp.source.starts_with("blueprint") && resp.source.contains(":exploit_4bet"));
+        let probs = resp.probs.clone().unwrap();
+        assert!(probs.iter().any(|(l, _)| l == "raise1pot"), "{probs:?}");
+        for seed in 0..12u64 {
+            let r = run_fourbet(&game, &req, Some(&tracker), seed);
+            assert_ne!(r.chosen.as_deref(), Some("fold"), "seed {seed}: {r:?}");
+            if r.chosen.as_deref() == Some("raise1pot") {
+                assert_eq!((r.action.as_str(), r.amount), ("raise", Some(750)), "{r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn fourbet_flags_parse_and_guard() {
+        let base = ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin"];
+        let parse =
+            |extra: &[&str]| parse_args_from(base.iter().chain(extra).map(|s| s.to_string()));
+        assert!(parse(&[]).unwrap().exploit_4bet.is_none());
+        let on = parse(&["--exploit-4bet", "on", "--exploit-4bet-convert", "0.5"]).unwrap();
+        let cfg = on.exploit_4bet.expect("on → Some");
+        assert_eq!(cfg.convert, 0.5);
+        assert_eq!(cfg.lam_f, FourBetConfig::default().lam_f);
+        // 不要求 --search。
+        assert!(on.search.is_none());
+        // 子旗没开总开关 → 拒绝。
+        assert!(parse(&["--exploit-4bet-fold-decay", "0.9"]).is_err());
+        // 越界 → 拒绝。
+        assert!(parse(&["--exploit-4bet", "on", "--exploit-4bet-convert", "1.5"]).is_err());
+        assert!(parse(&["--exploit-4bet", "maybe"]).is_err());
     }
 }

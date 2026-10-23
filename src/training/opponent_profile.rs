@@ -27,6 +27,13 @@ pub struct ObsAction {
     pub street: String,
     /// 动作："fold" / "check" / "call" / "bet" / "raise" / "all_in"|"allin"|"all-in"。
     pub action: String,
+    /// 本动作投入的筹码（OpenPoker `contribution_delta`）。仅 driver `--exploit-4bet` 开时带；
+    /// [`Profiler`] 不读，[`crate::training::fourbet_exploit`] 用它区分「全下但只是跟注」。
+    #[serde(default)]
+    pub contribution_delta: Option<u64>,
+    /// 本动作前需补的跟注额（OpenPoker `to_call_before`，`null` = 0）。同上，仅 `--exploit-4bet` 开时带。
+    #[serde(default)]
+    pub to_call_before: Option<u64>,
 }
 
 /// driver 每手结束发来的 observe 载荷（`{"observe":1,"names":{seat:name},"actions":[...]}`）。
@@ -280,6 +287,8 @@ mod tests {
                     seat: *s,
                     street: st.to_string(),
                     action: a.to_string(),
+                    contribution_delta: None,
+                    to_call_before: None,
                 })
                 .collect(),
         }

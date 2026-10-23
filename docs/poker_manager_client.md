@@ -224,3 +224,16 @@ driver 判它不在合法动作里、按兜底弃牌，**AA 被弃**（`docs/tem
   正常空桌等待只要心跳有回应就不会触发重连。
 - WS 日志新增 `heartbeat_ping`、`heartbeat_pong`、`heartbeat_timeout` 事件。
   重连沿用当前手数、原桌恢复和自动补码逻辑；鉴权失败或会话被替换仍会停止。
+
+### 2026-10-22 翻前 4bet 剥削（PM-17，`--exploit-4bet`）
+
+设计：`docs/temp/pm17_preflop_4bet_exploit_design_2026_10_22.md`。默认关；关闭时请求和 observe 与之前逐字节相同。
+
+- `--exploit-4bet on`：透传给 advisor 同名参数。不要求 `--search`。
+- 开启后决策请求带 `names`（以前只有 `--exploit on|vpip` 才带），每手结束发 observe；observe 的每个动作多带
+  `contribution_delta`、`to_call_before`，advisor 用它区分真加注和「全下但只够跟注」。只开 `--exploit` 时 observe 格式不变。
+- 子参数 `--exploit-4bet-convert`（fold 概率挪给 4bet 的比例，默认 1.0）、`--exploit-4bet-fold-decay`（默认 0.9）、
+  `--exploit-4bet-3bet-decay`（默认 0.98）。主开关没开时传子参数直接报错。
+- 动作日志：PM-17 改过分布的决策 `source` 末尾是 `:exploit_4bet`；命中点位的决策都有 `resp.fourbet`
+  （对手名、门开没开、原因、保本弃牌率、挪了多少概率、两项统计）。
+

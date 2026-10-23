@@ -289,6 +289,45 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(sent[-1], {"type": "leave_table"})
         self.assertEqual(json.loads(log.getvalue())["result"], result)
 
+    def test_exploit_4bet_sends_names_and_observe_with_amounts(self):
+        session, advisor, _ = self.session(exploit_4bet=True)
+        session.handle(action(5, 0, "raise", 40))
+        session.handle(turn())
+        self.assertEqual(advisor.requests[-1]["names"], {0: "p0", 1: "p1", 2: "p2"})
+        session.handle(event("hand_result", 10, final_stacks={"0": 2050, "1": 1990, "2": 1980},
+                             total_pot=70, payouts=[{"seat": 0, "amount": 70}]))
+        self.assertEqual(len(advisor.observations), 1)
+        obs = advisor.observations[0]
+        self.assertEqual(obs["names"], {0: "p0", 1: "p1", 2: "p2"})
+        self.assertEqual(obs["actions"], [{"seat": 0, "street": "preflop", "action": "raise",
+                                           "contribution_delta": 40, "to_call_before": None}])
+
+    def test_exploit_off_keeps_ipc_unchanged(self):
+        session, advisor, _ = self.session()
+        session.handle(action(5, 0, "raise", 40))
+        session.handle(turn())
+        self.assertNotIn("names", advisor.requests[-1])
+        session.handle(event("hand_result", 10, final_stacks={"0": 2050, "1": 1990, "2": 1980},
+                             total_pot=70, payouts=[{"seat": 0, "amount": 70}]))
+        self.assertEqual(advisor.observations, [])
+        # --exploit alone keeps the old observe format (no amounts).
+        session, advisor, _ = self.session(exploit=True)
+        session.handle(action(5, 0, "raise", 40))
+        session.handle(event("hand_result", 10, final_stacks={"0": 2050, "1": 1990, "2": 1980},
+                             total_pot=70, payouts=[{"seat": 0, "amount": 70}]))
+        self.assertEqual(advisor.observations[0]["actions"],
+                         [{"seat": 0, "street": "preflop", "action": "raise"}])
+
+    def test_exploit_4bet_flags_pass_through(self):
+        from poker_manager_play import fourbet_extra_args
+        off = SimpleNamespace(exploit_4bet="off", exploit_4bet_convert=None,
+                              exploit_4bet_fold_decay=None, exploit_4bet_3bet_decay=None)
+        self.assertEqual(fourbet_extra_args(off), [])
+        on = SimpleNamespace(exploit_4bet="on", exploit_4bet_convert=0.5,
+                             exploit_4bet_fold_decay=None, exploit_4bet_3bet_decay=0.95)
+        self.assertEqual(fourbet_extra_args(on), ["--exploit-4bet", "on", "--exploit-4bet-convert",
+                                                  "0.5", "--exploit-4bet-3bet-decay", "0.95"])
+
     def test_mismatched_seats_and_auth_failure_stop(self):
         session, _, _ = self.session()
         session.handle(snapshot(n=9))

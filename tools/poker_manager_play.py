@@ -157,7 +157,8 @@ class ManagerSession:
 
     def __init__(self, worker, n_seats=6, buy_in=2000, num_hands=100, action_log=None,
                  hh_log=None, exploit=False, prewarm=False, debug=False,
-                 auto_rebuy=False, read_account=None, stack_band_bb=(80, 180)):
+                 auto_rebuy=False, read_account=None, stack_band_bb=(80, 180),
+                 exploit_4bet=False):
         self.worker = worker
         self.n_seats = n_seats
         self.buy_in = buy_in
@@ -165,6 +166,10 @@ class ManagerSession:
         self.action_log = action_log
         self.hh_log = hh_log
         self.exploit = exploit
+        # PM-17 (--exploit-4bet): the advisor needs player names on requests and a per-hand
+        # observe with amounts, same transport as --exploit.
+        self.exploit_4bet = exploit_4bet
+        self.send_names = exploit or exploit_4bet
         self.prewarm = prewarm
         self.debug = debug
         self.auto_rebuy = auto_rebuy
@@ -347,10 +352,13 @@ class ManagerSession:
             self.hand, self.pending = None, None
             if hand and hand.id == m["hand_id"]:
                 self.hands += 1
-                if self.exploit and not hand.unavailable():
+                if self.send_names and not hand.unavailable():
+                    keys = ("seat", "street", "action")
+                    if self.exploit_4bet:
+                        # Amounts let the advisor tell a real raise from an all-in that only calls.
+                        keys += ("contribution_delta", "to_call_before")
                     self.worker.submit_observe({"names": hand.names,
-                        "actions": [{k: e[k] for k in ("seat", "street", "action")}
-                                    for e in hand.events]})
+                        "actions": [{k: e.get(k) for k in keys} for e in hand.events]})
                 self._log(self.hh_log, {"poker_manager_hh": 1, "hand_id": hand.id,
                     "table_id": self.table_id,
                     "complete": bool(hand.starts and hand.hole and not hand.invalid),
@@ -431,7 +439,7 @@ class ManagerSession:
             if (self.prewarm and not self.resyncing and not self.hand.unavailable()
                     and self.hand.street != "preflop" and key not in self.warmed):
                 self.warmed.add(key)
-                self.worker.submit_prewarm(self.hand.request(valid_actions({}), self.exploit))
+                self.worker.submit_prewarm(self.hand.request(valid_actions({}), self.send_names))
         if self.pending and m.get("actor_seat") != m.get("hero", {}).get("seat"):
             self.pending = None
 
@@ -454,7 +462,7 @@ class ManagerSession:
         reason = "incomplete_history"
         if self.hand and self.hand.id == m["hand_id"]:
             reason = self.hand.unavailable()
-        req = self.hand.request(valid, self.exploit) if reason is None else None
+        req = self.hand.request(valid, self.send_names) if reason is None else None
         pending = {"message": dict(m), "deadline": deadline, "req": req}
         self.pending = pending
         if reason or deadline - time.time() < 0.5:
@@ -599,6 +607,19 @@ def run(session, url, token, ws_log=None, reconnect_attempts=10):
         raise RuntimeError(session.error)
 
 
+def fourbet_extra_args(args):
+    """PM-17 flags passed through to the advisor (empty when off, keeping the command line unchanged)."""
+    if args.exploit_4bet != "on":
+        return []
+    extra = ["--exploit-4bet", "on"]
+    for flag, value in (("--exploit-4bet-convert", args.exploit_4bet_convert),
+                        ("--exploit-4bet-fold-decay", args.exploit_4bet_fold_decay),
+                        ("--exploit-4bet-3bet-decay", args.exploit_4bet_3bet_decay)):
+        if value is not None:
+            extra += [flag, str(value)]
+    return extra
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_advisor_args(parser, default_seats=6, debug_help="打印决策及 Rust advisor 调试信息")
@@ -615,8 +636,20 @@ def main(argv=None):
     parser.add_argument("--action-log", default=None)
     parser.add_argument("--hh-log", default=None)
     parser.add_argument("--ws-log", default=None)
+    parser.add_argument("--exploit-4bet", choices=["on", "off"], default="off",
+                        help="PM-17：对 3bet 多、被 4bet 就弃的对手把翻前弃牌概率挪给 4bet（进程内实时统计）")
+    parser.add_argument("--exploit-4bet-convert", type=float, default=None,
+                        help="门开时 fold 概率挪给 4bet 的比例，默认 1.0")
+    parser.add_argument("--exploit-4bet-fold-decay", type=float, default=None,
+                        help="被 4bet 弃牌统计的衰减系数，默认 0.9")
+    parser.add_argument("--exploit-4bet-3bet-decay", type=float, default=None,
+                        help="3bet 统计的衰减系数，默认 0.98")
     args = parser.parse_args(argv)
     validate_advisor_args(args)
+    fourbet_subflags = (args.exploit_4bet_convert, args.exploit_4bet_fold_decay,
+                        args.exploit_4bet_3bet_decay)
+    if args.exploit_4bet != "on" and any(v is not None for v in fourbet_subflags):
+        parser.error("--exploit-4bet-* 子旗需配 --exploit-4bet on")
     if not args.token or any(c.isspace() for c in args.token):
         parser.error("需要 --token 或 POKER_MANAGER_TOKEN（非空且不含空白）")
     url = urlsplit(args.url)
@@ -645,7 +678,7 @@ def main(argv=None):
         ws_log = WsLog(args.ws_log) if args.ws_log else None
         if ws_log:
             stack.callback(ws_log.close)
-        advisor = start_advisor(args, advisor_extra_args(args))
+        advisor = start_advisor(args, advisor_extra_args(args) + fourbet_extra_args(args))
         stack.callback(advisor.close)
         worker = DecisionWorker(advisor)
         stack.callback(worker.close, timeout=1)
@@ -653,7 +686,7 @@ def main(argv=None):
                                  action_log, hh_log, exploit_enabled(args),
                                  args.search_prewarm, args.debug_log,
                                  args.auto_rebuy, account_reader(args.url, args.token),
-                                 stack_band)
+                                 stack_band, exploit_4bet=args.exploit_4bet == "on")
         stack.callback(session.disconnect)
         try:
             run(session, args.url, args.token, ws_log, args.reconnect_attempts)

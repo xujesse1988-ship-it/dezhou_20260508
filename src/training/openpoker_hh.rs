@@ -476,6 +476,8 @@ pub fn hh_record_to_observe(rec: &HhRecord) -> Result<ObserveHand, String> {
             seat: rec.actions[i].seat, // 原始座（与 names 对齐）
             street: street.to_string(),
             action: rec.actions[i].action.clone(), // 原样动作串（observe_hand::classify 同口径）
+            contribution_delta: None,
+            to_call_before: None,
         });
         st.apply(*act)
             .map_err(|e| format!("暖启动重放第 {i} 步 apply({act:?}) 非法: {e:?}（不应发生）"))?;

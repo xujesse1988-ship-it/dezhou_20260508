@@ -168,6 +168,12 @@ path = "tools/six_max_exploit_ab.rs"
 name = "openpoker_advisor"
 path = "tools/openpoker_advisor.rs"
 
+# PM-17 识别器离线回放：poker_manager hh JSONL → 每个「我方开局、一人 3bet、其余都弃」点的判门结果
+# （与 artifacts/pm17_replay_2026_10_22/replay_v1.py 逐条对齐用）。
+[[bin]]
+name = "fourbet_replay"
+path = "tools/fourbet_replay.rs"
+
 # §4.2 live 半段数据管道：OpenPoker HH JSONL（driver --hh-log）→ 多人 AIVAT 报表（缺口⑥）。
 [[bin]]
 name = "openpoker_hh_aivat"
