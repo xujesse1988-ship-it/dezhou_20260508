@@ -1,6 +1,8 @@
 # OpenPoker 实时搜索的手牌范围估计
 
-代码口径：2026-10-15，仓库版本 `f566185`。
+代码口径：2026-10-23，仓库版本 `c5cad80`。
+
+> 下文的「默认」都指 `openpoker_advisor` 自身的参数默认值，不是实盘配置。实盘（poker_manager 的 args.json）用的是 `--search-trigger all-postflop`（翻后全部搜索）、`--search-flop-prefer-blueprint on`、`--search-limp-as-fold on`，且加载只含翻前和翻牌的裁剪版 blueprint。对照实盘日志时：平跟池按「平跟当弃牌」一节理解；转牌、河牌的根 range 主要来自上一街的跨街后验，拿不到时补解上一街。
 
 `openpoker_advisor` 为每个仍在手的玩家构造手牌范围（range），再按这些范围抽取底牌，运行实时子博弈搜索。范围来自历史行动在 blueprint（离线训练策略）或上一街搜索策略中的概率，表示模型对各手牌组合的相对权重。
 
@@ -174,7 +176,7 @@ BTN 转牌起始范围(h)
 
 同理，河牌搜索没有可复用的转牌结果、但完整 blueprint 路径可用时，会重新按翻前、翻牌和转牌的 blueprint 概率计算范围。这条回退路径不会自动保留更早某次搜索的后验。
 
-范围来源由缓存和路径可用性决定，不单由上一街动作输出标签决定。例如预热也可能产生可复用的搜索结果。`--search-flop-prefer-blueprint on` 会让锚定翻牌优先查 blueprint，并跳过相应的翻牌搜索预热；前提是本手无人全下，且 hero 与每个未弃牌对手的有效码深在 60–140BB 内，否则翻牌照常搜索。
+范围来源由缓存和路径可用性决定，不单由上一街动作输出标签决定。例如预热也可能产生可复用的搜索结果。`--search-flop-prefer-blueprint on` 会让锚定翻牌优先查 blueprint，并跳过相应的翻牌搜索预热；前提是本手无人全下，hero 与每个未弃牌对手的有效码深在 60–140BB 内，且本街每次下注 / 加注（含 hero 自己的）的「真实池比例 ÷ 映射到 blueprint 树上的池比例」都在 0.75–1.33 内（例如 1/3 池下注被映射成满池就不过），否则翻牌照常搜索。
 
 ## 平滑和无信号处理
 
@@ -242,7 +244,7 @@ HJ 的 raise、BTN 的 call 和 UTG 后续的 call 都不进入翻牌根范围�
 
 ## 已实现的可选画像修正
 
-`--exploit` 默认关闭。开启后，仅在脱锚搜索决策路径上（配 `--search-force-unanchored on` 时即全部实时搜索决策），对满足样本量和稳定性门槛的对手使用翻前画像调整范围；默认门槛包括至少 150 手、VPIP 标准误不超过 0.05、近窗漂移不超过 0.08。
+`--exploit` 默认关闭。开启后，仅在脱锚搜索决策路径上（配 `--search-force-unanchored on` 时，命中触发面的锚定搜索也算在内；只因 blueprint 均匀占位而搜索、又没命中触发面的决策仍走锚定，不用画像），对满足样本量和稳定性门槛的对手使用翻前画像调整范围；默认门槛包括至少 150 手、VPIP 标准误不超过 0.05、近窗漂移不超过 0.08。
 
 - `--exploit vpip` 使用 VPIP 宽度和 Chen 起手牌排序构造目标分布。
 - `--exploit on` 在 PFR 也满足门槛时，结合本手翻前被动或主动入池方式选择 `CallBand` 或 `RaiseBand`；否则退为 VPIP 形状。
@@ -269,7 +271,7 @@ HJ 的 raise、BTN 的 call 和 UTG 后续的 call 都不进入翻牌根范围�
 | `--search-range-uniform-mix` | `0.25` | 对手范围的均匀混合权重 |
 | `--search-unanchored-prefix-reach` | `on` | 脱锚时使用同步成功的历史前缀 |
 | `--search-unanchored-cross-street` | `on` | 同时控制锚定和脱锚两路的跨街复用 |
-| `--search-flop-prefer-blueprint` | `off` | 开启时，锚定翻牌优先使用 blueprint（须无人全下、有效码深 60–140BB） |
+| `--search-flop-prefer-blueprint` | `off` | 开启时，锚定翻牌优先使用 blueprint（须无人全下、有效码深 60–140BB、本街下注尺寸映射比在 0.75–1.33 内） |
 | `--search-force-unanchored` | `off` | 开启时，影子同步、命中触发面的锚定搜索也改走脱锚路径（前缀范围跳过 AllIn、按真实动作导航、可叠加 `--exploit`；翻牌访问量不足不再退回 blueprint）；不改哪些决策搜索 |
 | `--search-limp-as-fold` | `off` | 开启时平跟在影子里记为弃牌，平跟池翻后搜索获得范围前缀 |
 | `--exploit` | `off` | 可选对手画像修正 |
