@@ -104,8 +104,8 @@ use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
     chen_score, is_blueprint_cropped_err, is_low_hero_visits_err, set_subgame_debug, should_search,
     subgame_search_cached, subgame_search_prewarm, subgame_search_unanchored_cached_cross_exploit,
-    subgame_search_unanchored_prewarm_cross, synced_prefix_decisions, ExploitPrior, ExploitShape,
-    PrefixReach, ResolveRoot, SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
+    subgame_search_unanchored_prewarm_cross_exploit, synced_prefix_decisions, ExploitPrior,
+    ExploitShape, PrefixReach, ResolveRoot, SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, HandEvaluator,
@@ -168,6 +168,16 @@ const DEFAULT_SEARCH_UNANCHORED_CROSS_STREET: bool = true;
 /// all-in 在影子里就是 100BB all-in、照样同步，光看锚定会让 blueprint 用错底池赔率 / SPR 出牌。
 /// 还须过尺寸闸（[`flop_blueprint_size_gate`]）：本街每次下注的映射误差都在 0.75–1.33 内。
 const DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT: bool = false;
+/// 搜索一律走脱锚路径的默认（`--search-force-unanchored`）：**默认关**（旧行为 byte-equal）。
+/// `on` = lockstep 同步、命中触发面、本该走锚定搜索的决策也改走 [`decide_search_unanchored`]：
+/// synced_node 取当前影子节点（脱锚前缀只读当前街之前的决策，与锚定是同一段历史），之后按脱锚
+/// 口径——前缀 range 跳过 AllIn-tag、本街按真实动作导航、返回子树合法集、可叠加 `--exploit`。
+/// 动机：剥削只挂在脱锚路径，开此旗让剥削覆盖全部实时搜索决策。代价：翻牌访问量不足时不再退回
+/// blueprint 同一节点（脱锚没有节点可退，走搜索兜底）。
+///
+/// 不改「哪些决策搜索」：flop_prefer_blueprint 过闸的翻牌锚定面仍走 blueprint；只因 blueprint 占位
+/// 才搜索（未命中触发面）的点仍走锚定（脱锚入口按触发面判 gating，转过去会直接落兜底）。
+const DEFAULT_SEARCH_FORCE_UNANCHORED: bool = false;
 /// 方案 B「平跟当弃牌」的默认（`--search-limp-as-fold`，[`lockstep_replay`]）：**默认关**（旧行为
 /// byte-equal）。调研（`docs/temp/openpoker_limp_handling_research_2026_10_16.md` §4）建议先做成
 /// 离线开关，回放已有平跟决策点确认翻后前缀非空比例 / 兜底占比 / 均匀出牌下降后再开实盘。
@@ -613,6 +623,9 @@ struct SearchRuntime {
     /// （`false`，旧行为 byte-equal）。turn/river 锚定面不受影响。预热（[`prewarm`]）同源 skip 锚定
     /// flop 子树（不 build+solve），否则 advisor 单线程下 hero 决策白等一个 time_budget 才拿 blueprint。
     flop_prefer_blueprint: bool,
+    /// `--search-force-unanchored`（[`DEFAULT_SEARCH_FORCE_UNANCHORED`]）：`true` = 锚定搜索决策也走
+    /// [`decide_search_unanchored`]，预热（[`prewarm`]）同源走脱锚预热（否则决策 key 必 miss）。
+    force_unanchored: bool,
     /// `--search-limp-as-fold`（方案 B，[`DEFAULT_SEARCH_LIMP_AS_FOLD`]）：`true` = 非 SB 开池平跟在
     /// 100BB 影子里记为弃牌、真实局照常跟注（[`lockstep_replay`]），让平跟池翻后脱锚搜索拿到非空
     /// 范围前缀（平跟者 = 该位置开池范围之外的牌、hero 和盲注 = blueprint 决策），平跟者后来弃牌时
@@ -782,9 +795,54 @@ fn prewarm_inner(
     {
         return mk("prewarm:skip:flop_prefer_blueprint".into());
     }
+    // 脱影子预热（lockstep Err，或 `--search-force-unanchored` 下的 lockstep Ok）。
+    let exploit_owned = exploit_snapshot(rt, req, &solver_cfg, scale, &smap);
+    let unanchored_prewarm = |solve_cache: &mut SubgameSolveCache,
+                              synced_node: NodeId,
+                              limp: &LimpFoldMap| {
+        // 档一前缀 reach（生产默认开）：用已同步前缀估 range——须与决策时算出同一份 ranges 才能
+        // 命中 key（hero 显式传入：range 平滑「不混」座按 hero 算，见 subgame_search_unanchored_prewarm）。
+        // 平跟当弃牌映射下 hero 自己那一步的过滤与决策路径同一函数（unanchored_prefix_decisions）。
+        // force_unanchored 下 synced_node = 街起点影子节点、决策时 = 当前节点：前缀只取当前街
+        // 之前的决策，两者同一份。
+        let prefix_decisions = rt
+            .unanchored_prefix_reach
+            .then(|| unanchored_prefix_decisions(game, synced_node, limp, hero_pid));
+        let prefix_reach = prefix_decisions.as_ref().map(|d| PrefixReach {
+            strategy: strategy_fn,
+            decisions: d,
+        });
+        // 档二′-跨街复用（默认关）：复用缓存里上一街 unanchored 解的 σ 算本街后验 range。预热须
+        // 与决策时算出同一份 ranges 才命中 key——两路同读 `cache.current()`（街起点预热时仍持上一
+        // 街解）+ 同 `prev_within` → 同 ranges。off / 缓存非紧前街 → 自验退档一（不破现状）。
+        let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
+        // 叠加剥削：与决策路径同一份画像快照（[`exploit_snapshot`]）→ 同 ranges → 同 key。
+        let exploit_prior = exploit_owned
+            .as_ref()
+            .map(|(profiles, alpha, shapes)| ExploitPrior {
+                profiles: profiles.as_slice(),
+                alpha: *alpha,
+                shapes: shapes.as_slice(),
+            });
+        subgame_search_unanchored_prewarm_cross_exploit(
+            solve_cache,
+            hero_pid,
+            &round_start,
+            game,
+            prefix_reach,
+            cross_street,
+            exploit_prior,
+            scfg,
+            rt.bucket_table.as_ref(),
+            hand_seed,
+        )
+    };
     // crop blueprint：range 先验缺被裁街 σ（跨街后验不可得）→ 先补解上一街再重试一次
     // （[`search_with_crop_backfill`]；完整 blueprint 下等价于直接调一次）。
     let attempt = |solve_cache: &mut SubgameSolveCache| match &lockstep {
+        Ok((_real, abs, limp, _)) if rt.force_unanchored => {
+            unanchored_prewarm(solve_cache, abs.current_node_id, limp)
+        }
         Ok((_real, abs, ..)) => {
             // 档二′-跨街复用（锚定预热，turn_blueprint_trim §2.4 改动 D）：与决策路径同义，复用缓存里
             // 上一街已解子树 σ 算本街后验 range。预热须与决策时算出同一份 ranges 才命中 key——两路同读
@@ -805,33 +863,7 @@ fn prewarm_inner(
         }
         Err(LockstepErr {
             synced_node, limp, ..
-        }) => {
-            // 档一前缀 reach（生产默认开）：用已同步前缀估 range——须与决策时算出同一份 ranges 才能
-            // 命中 key（hero 显式传入：range 平滑「不混」座按 hero 算，见 subgame_search_unanchored_prewarm）。
-            // 平跟当弃牌映射下 hero 自己那一步的过滤与决策路径同一函数（unanchored_prefix_decisions）。
-            let prefix_decisions = rt
-                .unanchored_prefix_reach
-                .then(|| unanchored_prefix_decisions(game, *synced_node, limp, hero_pid));
-            let prefix_reach = prefix_decisions.as_ref().map(|d| PrefixReach {
-                strategy: strategy_fn,
-                decisions: d,
-            });
-            // 档二′-跨街复用（默认关）：复用缓存里上一街 unanchored 解的 σ 算本街后验 range。预热须
-            // 与决策时算出同一份 ranges 才命中 key——两路同读 `cache.current()`（街起点预热时仍持上一
-            // 街解）+ 同 `prev_within` → 同 ranges。off / 缓存非紧前街 → 自验退档一（不破现状）。
-            let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
-            subgame_search_unanchored_prewarm_cross(
-                solve_cache,
-                hero_pid,
-                &round_start,
-                game,
-                prefix_reach,
-                cross_street,
-                scfg,
-                rt.bucket_table.as_ref(),
-                hand_seed,
-            )
-        }
+        }) => unanchored_prewarm(solve_cache, *synced_node, limp),
     };
     let result = search_with_crop_backfill(
         game,
@@ -1528,7 +1560,7 @@ fn decide_with(
         }
         Ok((real, abs, legal_abs, limp, sizes))
     });
-    let (real, abs, legal_abs, sizes) = match lockstep {
+    let (real, abs, legal_abs, limp, sizes) = match lockstep {
         // 平跟当弃牌映射后影子在翻前对上了 blueprint 节点，但翻前要不要加注、拿什么牌加仍由
         // 启发式决定（调研 §4：blueprint 开池范围默认后面的人会弃牌，前面多了一个平跟者照搬会偏宽）。
         Ok((_, _, _, limp, _)) if limp.mapped() && board.is_empty() => {
@@ -1550,7 +1582,7 @@ fn decide_with(
                 "fallback:limp_as_fold_no_limp".into(),
             );
         }
-        Ok((real, abs, legal_abs, _, sizes)) => (real, abs, legal_abs, sizes),
+        Ok((real, abs, legal_abs, limp, sizes)) => (real, abs, legal_abs, limp, sizes),
         Err(LockstepErr {
             reason,
             synced_node,
@@ -1697,6 +1729,34 @@ fn decide_with(
         );
     }
     let want_search = want_search || placeholder_search;
+    // `--search-force-unanchored` on（[`DEFAULT_SEARCH_FORCE_UNANCHORED`]）：命中触发面的锚定搜索改走
+    // 脱锚路径。synced_node = 当前影子节点（脱锚前缀只取当前街之前的决策，与预热的街起点节点同一份
+    // → 同 key）。只因 blueprint 占位才搜索、未命中触发面的点不转：脱锚入口按触发面判 gating 会落兜底。
+    if let Some(rt) = search.filter(|rt| rt.force_unanchored) {
+        if want_search && should_search(&real, rt.cfg.trigger) {
+            dlog!(
+                "lockstep OK: street={street:?} node_id={node_id:?} path=search (force_unanchored)"
+            );
+            return decide_search_unanchored(
+                game,
+                abstraction,
+                strategy_fn,
+                req,
+                base_seed,
+                rt,
+                &solver_cfg,
+                scale,
+                &smap,
+                my_seat_solver,
+                hole,
+                &board,
+                "force_unanchored",
+                node_id,
+                &limp,
+                solve_cache,
+            );
+        }
+    }
     dlog!(
         "lockstep OK: street={:?} node_id={node_id:?} info_set={} legal_abs={:?} path={}",
         street,
@@ -3229,6 +3289,55 @@ fn pick_shape(on: bool, pfr_converged: bool, entry: PreflopEntry) -> ExploitShap
 /// （[`synced_prefix_decisions`]）+ `strategy_fn`（blueprint σ）估 per-seat range 替代 uniform
 /// （[`PrefixReach`]）；`off`（A/B 对照臂）= uniform（既有行为）。算出的 reach 进 solve 缓存 key，
 /// 开/关自动 cache miss（`unanchored_range_design` §1/§5.1）。
+/// [`exploit_snapshot`] 的结果：per-solver-seat 已收敛画像、强度 α、各座形状。
+type ExploitSnapshot = (Vec<Option<OpponentProfile>>, f64, Vec<ExploitShape>);
+
+/// 叠加剥削 Tier 2 的画像快照（[`decide_search_unanchored`] 与脱锚预热 [`prewarm_inner`] 共用：两路
+/// 须算出同一份 ExploitPrior，ranges 才同、solve key 才命中）。owned 快照，`borrow` 随即释放（solve
+/// 并行不碰 Profiler，只吃此快照）。hero 座按 OpenPoker my_seat 跳过（subgame
+/// apply_exploit_width_prior 再守一层）。`None` = `--exploit` 关 → 不剥削。同一手内预热与决策之间
+/// Profiler 不变（observe 在手末才发），画像一致；预热请求须带 `names`（driver 开剥削时带）。
+fn exploit_snapshot(
+    rt: &SearchRuntime,
+    req: &Request,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+) -> Option<ExploitSnapshot> {
+    let n_seats = solver_cfg.n_seats as usize;
+    rt.exploit.as_ref().map(|cell| {
+        let prof = cell.borrow();
+        let alpha = prof.cfg().strength_alpha;
+        let pfr_shape_on = prof.cfg().pfr_shape;
+        let mut profiles: Vec<Option<OpponentProfile>> = vec![None; n_seats];
+        let mut shapes: Vec<ExploitShape> = vec![ExploitShape::TopK; n_seats];
+        // PFR-aware（--exploit-pfr-shape）：重放翻前判各对手座本手入池方式（被动→CallBand 掐顶端 /
+        // 主动→RaiseBand 收顶端），且仅当该座 PFR 也收敛才用。off → 全 Unknown → 全 TopK（仅 VPIP，
+        // 与现有 exploit 逐位 byte-equal）；重放失败同样退 TopK（安全）。索引 = solver tree seat。
+        let entry_kinds = if pfr_shape_on {
+            preflop_entry_kinds(req, solver_cfg, scale, smap)
+        } else {
+            vec![PreflopEntry::Unknown; n_seats]
+        };
+        for op_seat in 0..smap.to_tree.len() {
+            if op_seat == req.my_seat as usize {
+                continue; // hero
+            }
+            let Some(tree) = smap.to_tree[op_seat] else {
+                continue; // 未发牌座（短桌幻影 / 空座）
+            };
+            if let Some(name) = req.names.get(&(op_seat as u8)) {
+                if let Some(p) = prof.profile_for(name) {
+                    profiles[tree as usize] = Some(p);
+                    shapes[tree as usize] =
+                        pick_shape(pfr_shape_on, p.pfr_converged, entry_kinds[tree as usize]);
+                }
+            }
+        }
+        (profiles, alpha, shapes)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide_search_unanchored(
     game: &SimplifiedNlheGame,
@@ -3328,42 +3437,10 @@ fn decide_search_unanchored(
     // σ 对 `prev_within`（上一街完整真实动作线）条件化得本街后验 range，覆盖档一前缀 reach。off / 缓存
     // 非紧前街 unanchored 解 → 自验退档一（不破现状）。算出 ranges 进 solve key → 开/关自动 miss。
     let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
-    // 叠加剥削 Tier 2（exploit_strategy_design §2/§4）：组 per-solver-seat 画像 + 强度 α（仅 --exploit
-    // 开、对手已收敛）。owned 快照，`borrow` 随即释放（solve 并行不碰 Profiler，只吃此快照）。hero 座
-    // 按 OpenPoker my_seat 跳过（subgame apply_exploit_width_prior 再守一层）。`None` = 不剥削 →
-    // _cross_exploit 走 exploit=None 分支，与既有 search:unanchored 逐位 byte-equal。
-    let exploit_owned: Option<(Vec<Option<OpponentProfile>>, f64, Vec<ExploitShape>)> =
-        rt.exploit.as_ref().map(|cell| {
-            let prof = cell.borrow();
-            let alpha = prof.cfg().strength_alpha;
-            let pfr_shape_on = prof.cfg().pfr_shape;
-            let mut profiles: Vec<Option<OpponentProfile>> = vec![None; n_seats];
-            let mut shapes: Vec<ExploitShape> = vec![ExploitShape::TopK; n_seats];
-            // PFR-aware（--exploit-pfr-shape）：重放翻前判各对手座本手入池方式（被动→CallBand 掐顶端 /
-            // 主动→RaiseBand 收顶端），且仅当该座 PFR 也收敛才用。off → 全 Unknown → 全 TopK（仅 VPIP，
-            // 与现有 exploit 逐位 byte-equal）；重放失败同样退 TopK（安全）。索引 = solver tree seat。
-            let entry_kinds = if pfr_shape_on {
-                preflop_entry_kinds(req, solver_cfg, scale, smap)
-            } else {
-                vec![PreflopEntry::Unknown; n_seats]
-            };
-            for op_seat in 0..smap.to_tree.len() {
-                if op_seat == req.my_seat as usize {
-                    continue; // hero
-                }
-                let Some(tree) = smap.to_tree[op_seat] else {
-                    continue; // 未发牌座（短桌幻影 / 空座）
-                };
-                if let Some(name) = req.names.get(&(op_seat as u8)) {
-                    if let Some(p) = prof.profile_for(name) {
-                        profiles[tree as usize] = Some(p);
-                        shapes[tree as usize] =
-                            pick_shape(pfr_shape_on, p.pfr_converged, entry_kinds[tree as usize]);
-                    }
-                }
-            }
-            (profiles, alpha, shapes)
-        });
+    // 叠加剥削 Tier 2（exploit_strategy_design §2/§4）：画像快照（[`exploit_snapshot`]，仅 --exploit 开、
+    // 对手已收敛）。`None` = 不剥削 → _cross_exploit 走 exploit=None 分支，与既有 search:unanchored
+    // 逐位 byte-equal。
+    let exploit_owned = exploit_snapshot(rt, req, solver_cfg, scale, smap);
     let exploit_prior = exploit_owned
         .as_ref()
         .map(|(profiles, alpha, shapes)| ExploitPrior {
@@ -4090,6 +4167,9 @@ struct Args {
     /// （脱影子 flop 仍搜索）。**默认 `false`**（[`DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT`]，旧行为
     /// byte-equal）；`on` 显式开。
     search_flop_prefer_blueprint: bool,
+    /// `--search-force-unanchored on|off`（[`SearchRuntime`] doc）：锚定搜索决策也走脱锚路径。
+    /// **默认 `false`**（[`DEFAULT_SEARCH_FORCE_UNANCHORED`]，旧行为 byte-equal）；仅 `--search` 开时可设。
+    search_force_unanchored: bool,
     /// `--search-limp-as-fold on|off`（方案 B，[`SearchRuntime`] doc）。**默认 `false`**
     /// （[`DEFAULT_SEARCH_LIMP_AS_FOLD`]）。仅 `--search` 开时可设。
     search_limp_as_fold: bool,
@@ -4269,6 +4349,7 @@ fn run() -> Result<(), String> {
                 unanchored_prefix_reach: args.search_unanchored_prefix_reach,
                 unanchored_cross_street: args.search_unanchored_cross_street,
                 flop_prefer_blueprint: args.search_flop_prefer_blueprint,
+                force_unanchored: args.search_force_unanchored,
                 limp_as_fold: args.search_limp_as_fold,
                 // 叠加剥削：--exploit 开 → 进程内空表 Profiler（只用本进程数据，不依赖过往）。
                 exploit: args.exploit.map(|cfg| RefCell::new(Profiler::new(cfg))),
@@ -4300,8 +4381,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} limp_as_fold={} min_hero_visits={} weak_commit_guard={} bucket_table={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.limp_as_fold, scfg.min_hero_visits, rt.weak_commit_guard,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} force_unanchored={} limp_as_fold={} min_hero_visits={} weak_commit_guard={} bucket_table={}",
+            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.force_unanchored, rt.limp_as_fold, scfg.min_hero_visits, rt.weak_commit_guard,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
         if let Some(cell) = &rt.exploit {
@@ -4517,6 +4598,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_unanchored_prefix_reach: Option<bool> = None;
     let mut search_unanchored_cross_street: Option<bool> = None;
     let mut search_flop_prefer_blueprint: Option<bool> = None;
+    let mut search_force_unanchored: Option<bool> = None;
     let mut search_limp_as_fold: Option<bool> = None;
     let mut search_min_hero_visits: Option<u32> = None;
     let mut search_weak_commit_guard: Option<bool> = None;
@@ -4665,6 +4747,17 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                         return Err(format!(
                             "--search-flop-prefer-blueprint 须 on|off，得 {other}"
                         ))
+                    }
+                });
+            }
+            "--search-force-unanchored" => {
+                // 默认关（DEFAULT_SEARCH_FORCE_UNANCHORED）；取值 on|off 显式覆盖。
+                let v = next_val(&mut it, &arg)?;
+                search_force_unanchored = Some(match v.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(format!("--search-force-unanchored 须 on|off，得 {other}"))
                     }
                 });
             }
@@ -4823,6 +4916,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_unanchored_prefix_reach.is_some()
             || search_unanchored_cross_street.is_some()
             || search_flop_prefer_blueprint.is_some()
+            || search_force_unanchored.is_some()
             || search_limp_as_fold.is_some()
             || search_min_hero_visits.is_some()
             || search_weak_commit_guard.is_some()
@@ -4921,6 +5015,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         // 默认关（旧行为 byte-equal）；--search-flop-prefer-blueprint on 显式开。
         search_flop_prefer_blueprint: search_flop_prefer_blueprint
             .unwrap_or(DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT),
+        // 默认关（旧行为 byte-equal）；--search-force-unanchored on 显式开。
+        search_force_unanchored: search_force_unanchored.unwrap_or(DEFAULT_SEARCH_FORCE_UNANCHORED),
         // 默认关（旧行为 byte-equal）；--search-limp-as-fold on 显式开。
         search_limp_as_fold: search_limp_as_fold.unwrap_or(DEFAULT_SEARCH_LIMP_AS_FOLD),
         // 默认开；--search-weak-commit-guard off 显式关。
@@ -4955,6 +5051,7 @@ mod tests {
             unanchored_prefix_reach: false,
             unanchored_cross_street: false,
             flop_prefer_blueprint: false,
+            force_unanchored: false,
             limp_as_fold: false,
             exploit: None,
             weak_commit_guard: false,
@@ -4969,6 +5066,7 @@ mod tests {
             unanchored_prefix_reach: true,
             unanchored_cross_street: false,
             flop_prefer_blueprint: false,
+            force_unanchored: false,
             limp_as_fold: false,
             exploit: None,
             weak_commit_guard: false,
@@ -4983,6 +5081,7 @@ mod tests {
             unanchored_prefix_reach: true,
             unanchored_cross_street: true,
             flop_prefer_blueprint: false,
+            force_unanchored: false,
             limp_as_fold: false,
             exploit: None,
             weak_commit_guard: false,
@@ -4998,6 +5097,7 @@ mod tests {
             unanchored_prefix_reach: false,
             unanchored_cross_street: false,
             flop_prefer_blueprint: true,
+            force_unanchored: false,
             limp_as_fold: false,
             exploit: None,
             weak_commit_guard: false,
@@ -7584,6 +7684,241 @@ mod tests {
         assert_eq!((cache_un.misses(), cache_un.hits()), (1, 0));
     }
 
+    /// `--search-force-unanchored on`：锚定面（对称 100BB、lockstep Ok）命中触发的搜索改走脱锚路径。
+    /// ① 预热同源走脱锚预热、hero 首决策命中（预热 synced_node = 街起点、决策 = 当前节点，前缀同一份
+    /// 才同 key）、输出 byte-equal 现解；② 对照：旗关同输入是锚定搜索（`search`）；③ 不改哪些决策搜索：
+    /// flop_prefer_blueprint 过闸仍走 blueprint、翻前与旗关 byte-equal。
+    #[test]
+    fn force_unanchored_routes_anchored_search() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        // 非均匀 σ：前缀 reach 非均匀，钉住预热 / 决策两侧前缀须一致。
+        let skew = |i: &InfoSetId, n: usize| {
+            let mut v: Vec<f64> = (0..n)
+                .map(|k| 1.0 + k as f64 + (i.raw() % 7) as f64 * 0.1)
+                .collect();
+            let s: f64 = v.iter().sum();
+            v.iter_mut().for_each(|x| *x /= s);
+            v
+        };
+        let scfg = SubgameSearchConfig {
+            iterations: 400,
+            trigger: SearchTrigger::AllPostflop,
+            range_uniform_mix: 0.25,
+            ..SubgameSearchConfig::default()
+        };
+        let force = SearchRuntime {
+            force_unanchored: true,
+            ..rt_prefix_reach(scfg)
+        };
+        // hero = BB（seat 2）：flop 首行动者是 SB（seat 1）→ 预热请求 = 街起点历史、未轮到 hero。
+        let mut pre = flop_first_unraised_req(vec![2000; 6]);
+        pre.my_seat = 2;
+        pre.hole = vec!["Qs".into(), "Qd".into()];
+        let mut req = pre.clone();
+        req.actions.push(HistAction {
+            seat: 1,
+            action: "check".into(),
+            to: None,
+        });
+
+        // ① 预热 → 决策命中。
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(&game, &skew, &pre, 0xF0CE, Some(&force), &mut cache);
+        assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+        assert_eq!((cache.misses(), cache.hits()), (1, 0), "预热 = 首 solve");
+        let r = decide(&game, &abs, &skew, &req, 0xF0CE, Some(&force), &mut cache);
+        assert_eq!(r.source, "search:unanchored", "得 {r:?}");
+        assert!(is_legal(&r, &req.valid), "{r:?}");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "hero 首决策须命中脱锚预热 solve"
+        );
+        let r_fresh = decide(
+            &game,
+            &abs,
+            &skew,
+            &req,
+            0xF0CE,
+            Some(&force),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r, r_fresh, "预热只省 wall、不改输出（byte-equal 现解）");
+
+        // ② 对照：旗关同输入走锚定搜索。
+        let anchored = decide(
+            &game,
+            &abs,
+            &skew,
+            &req,
+            0xF0CE,
+            Some(&rt_prefix_reach(scfg)),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(
+            anchored.source, "search",
+            "旗关应是锚定搜索，得 {anchored:?}"
+        );
+
+        // ③a flop_prefer_blueprint 过闸（对称 100BB、未起注）：开旗仍走 blueprint。
+        let prefer_force = SearchRuntime {
+            force_unanchored: true,
+            ..rt_flop_prefer_blueprint(scfg)
+        };
+        let r = decide(
+            &game,
+            &abs,
+            &skew,
+            &req,
+            0xF0CE,
+            Some(&prefer_force),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "blueprint", "得 {r:?}");
+        // ③b 翻前不搜索：开旗与旗关 byte-equal。
+        let mut pf = flop_first_unraised_req(vec![2000; 6]);
+        pf.board.clear();
+        pf.my_seat = 5;
+        pf.actions = vec![hist(3, "raise", Some(60)), hist(4, "fold", None)];
+        pf.valid = full_valid();
+        let on = decide(
+            &game,
+            &abs,
+            &skew,
+            &pf,
+            0xF0CE,
+            Some(&force),
+            &mut SubgameSolveCache::new(),
+        );
+        let off = decide(
+            &game,
+            &abs,
+            &skew,
+            &pf,
+            0xF0CE,
+            Some(&rt_prefix_reach(scfg)),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(on, off, "翻前开旗须与旗关 byte-equal");
+    }
+
+    /// 脱锚预热套用对手画像：`--exploit` 开且对手已收敛时，预热与决策用同一份画像快照
+    /// （[`exploit_snapshot`]）→ hero 首决策命中预热 solve、实际剥削（`exploit` 遥测非空）、输出
+    /// byte-equal 现解。对照：不带画像的预热（旧行为）→ 决策 key 不同、miss 重解，证剥削 ranges
+    /// 确实进 key、上面的命中不是空转。走 `--search-force-unanchored` 的锚定面（两条改动一起钉）。
+    #[test]
+    fn prewarm_unanchored_applies_exploit_profile() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let skew = |i: &InfoSetId, n: usize| {
+            let mut v: Vec<f64> = (0..n)
+                .map(|k| 1.0 + k as f64 + (i.raw() % 7) as f64 * 0.1)
+                .collect();
+            let s: f64 = v.iter().sum();
+            v.iter_mut().for_each(|x| *x /= s);
+            v
+        };
+        let scfg = SubgameSearchConfig {
+            iterations: 400,
+            trigger: SearchTrigger::AllPostflop,
+            range_uniform_mix: 0.25,
+            ..SubgameSearchConfig::default()
+        };
+        // 对手 villain（seat 1 = SB）隔手入池：VPIP 0.5、近窗恰 0.5 → 过样本 / SE / 漂移三道门。
+        let converged_profiler = || {
+            let mut prof = Profiler::new(ExploitConfig::default());
+            for k in 0..200 {
+                let action = if k % 2 == 0 { "call" } else { "fold" };
+                prof.observe_hand(&ObserveHand {
+                    names: BTreeMap::from([(1, "villain".to_string())]),
+                    actions: vec![poker::training::opponent_profile::ObsAction {
+                        seat: 1,
+                        street: "preflop".into(),
+                        action: action.into(),
+                        contribution_delta: None,
+                        to_call_before: None,
+                    }],
+                });
+            }
+            assert!(
+                prof.profile_for("villain").is_some(),
+                "测试前提：画像须已收敛"
+            );
+            prof
+        };
+        let exploit_rt = || SearchRuntime {
+            force_unanchored: true,
+            exploit: Some(RefCell::new(converged_profiler())),
+            ..rt_prefix_reach(scfg)
+        };
+        let names = BTreeMap::from([(1, "villain".to_string()), (2, "hero".to_string())]);
+        let mut pre = flop_first_unraised_req(vec![2000; 6]);
+        pre.my_seat = 2;
+        pre.hole = vec!["Qs".into(), "Qd".into()];
+        pre.names = names.clone();
+        let mut req = pre.clone();
+        req.actions.push(HistAction {
+            seat: 1,
+            action: "check".into(),
+            to: None,
+        });
+
+        let rt_on = exploit_rt();
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(&game, &skew, &pre, 0xE7B1, Some(&rt_on), &mut cache);
+        assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+        let r = decide(&game, &abs, &skew, &req, 0xE7B1, Some(&rt_on), &mut cache);
+        assert_eq!(r.source, "search:unanchored", "得 {r:?}");
+        assert!(r.exploit.is_some(), "决策须实际剥削，得 {r:?}");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "带画像的预热须被决策命中"
+        );
+        let r_fresh = decide(
+            &game,
+            &abs,
+            &skew,
+            &req,
+            0xE7B1,
+            Some(&exploit_rt()),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r, r_fresh, "预热只省 wall、不改输出（byte-equal 现解）");
+
+        // 对照：预热不带画像（旧行为）→ 决策 key 不同、miss。
+        let rt_plain = SearchRuntime {
+            force_unanchored: true,
+            ..rt_prefix_reach(scfg)
+        };
+        let mut cache_plain = SubgameSolveCache::new();
+        let p = prewarm(
+            &game,
+            &skew,
+            &pre,
+            0xE7B1,
+            Some(&rt_plain),
+            &mut cache_plain,
+        );
+        assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+        let r = decide(
+            &game,
+            &abs,
+            &skew,
+            &req,
+            0xE7B1,
+            Some(&exploit_rt()),
+            &mut cache_plain,
+        );
+        assert!(r.exploit.is_some(), "{r:?}");
+        assert_eq!(
+            (cache_plain.misses(), cache_plain.hits()),
+            (2, 0),
+            "不带画像的预热不该被剥削决策命中"
+        );
+    }
+
     /// 脱影子预热端到端：off-stack all-in 线（lockstep 必失同步）→ 预热走 unanchored 路径
     /// 入缓存；决策（`search:unanchored`）命中、输出 byte-equal 无预热现解。
     #[test]
@@ -8923,6 +9258,26 @@ mod tests {
         assert!(parse(&["--search-flop-prefer-blueprint", "on"]).is_err());
     }
 
+    /// `--search-force-unanchored on|off`：默认关、on / off 显式设、坏值拒收、未开 --search 拒收。
+    #[test]
+    fn parse_args_force_unanchored() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        let a = parse(&["--search"]).expect("parse Ok");
+        assert!(!a.search_force_unanchored, "默认关");
+        let a = parse(&["--search", "--search-force-unanchored", "on"]).expect("parse Ok");
+        assert!(a.search_force_unanchored, "on 应开");
+        let a = parse(&["--search", "--search-force-unanchored", "off"]).expect("parse Ok");
+        assert!(!a.search_force_unanchored, "off 应关");
+        assert!(parse(&["--search", "--search-force-unanchored", "maybe"]).is_err());
+        assert!(parse(&["--search-force-unanchored", "on"]).is_err());
+    }
+
     /// `--search-max-nodes`：默认 [`DEFAULT_SEARCH_MAX_NODES`]（20 万，不是通用默认 8000）；显式值覆盖；
     /// 未开 --search 拒收（显式写默认值也拒，拒绝静默 guard）。
     #[test]
@@ -9207,6 +9562,7 @@ mod tests {
             unanchored_prefix_reach: DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH,
             unanchored_cross_street: DEFAULT_SEARCH_UNANCHORED_CROSS_STREET,
             flop_prefer_blueprint: false,
+            force_unanchored: false,
             limp_as_fold: false,
             exploit: None,
             weak_commit_guard: false,
@@ -9618,6 +9974,7 @@ mod tests {
             unanchored_prefix_reach: true,
             unanchored_cross_street: cross,
             flop_prefer_blueprint: prefer,
+            force_unanchored: false,
             limp_as_fold: false,
             exploit: None,
             weak_commit_guard: false,

@@ -126,6 +126,9 @@ def add_advisor_args(p, default_seats, debug_help):
     # hero 与每个未弃牌对手的有效码深在 60–140BB 内才走 blueprint、不搜索；不满足 / flop 脱影子
     # 仍实时搜索；turn/river 不受影响。不传 = 吃 advisor 默认（OFF）。
     p.add_argument("--search-flop-prefer-blueprint", choices=["on", "off"], default=None)
+    # 搜索一律走脱锚路径（advisor 默认 off）：on = 影子同步、本该锚定搜索的决策也走脱锚搜索
+    # （可叠加 --exploit；翻牌访问量不足不再退回 blueprint）。不改哪些决策搜索。不传 = 吃 advisor 默认（OFF）。
+    p.add_argument("--search-force-unanchored", choices=["on", "off"], default=None)
     # 平跟当弃牌（方案 B，advisor 默认 off）：on = 非 SB 开池平跟在 blueprint 影子里记为弃牌，
     # 平跟池翻后搜索拿到范围前缀；翻前仍由 limp_heuristic 决定。不传 = 吃 advisor 默认（OFF）。
     p.add_argument("--search-limp-as-fold", choices=["on", "off"], default=None)
@@ -186,6 +189,8 @@ def validate_advisor_args(args):
     if args.search_flop_prefer_blueprint is not None and not args.search:
         raise SystemExit("--search-flop-prefer-blueprint 需配 --search"
                          "（拒绝静默：没有搜索 flop 本就走 blueprint，设此旗无意义）")
+    if args.search_force_unanchored is not None and not args.search:
+        raise SystemExit("--search-force-unanchored 需配 --search（它只改搜索走哪条路径）")
     if args.search_limp_as_fold is not None and not args.search:
         raise SystemExit("--search-limp-as-fold 需配 --search"
                          "（拒绝静默：它只给翻后搜索提供范围前缀，没有搜索设了无意义）")
@@ -224,6 +229,8 @@ def advisor_extra_args(args, warm_profile_hh=None):
             extra += ["--search-unanchored-cross-street", args.search_unanchored_cross_street]
         if args.search_flop_prefer_blueprint is not None:
             extra += ["--search-flop-prefer-blueprint", args.search_flop_prefer_blueprint]
+        if args.search_force_unanchored is not None:
+            extra += ["--search-force-unanchored", args.search_force_unanchored]
         if args.search_limp_as_fold is not None:
             extra += ["--search-limp-as-fold", args.search_limp_as_fold]
         if args.search_min_hero_visits is not None:

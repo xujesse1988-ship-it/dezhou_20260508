@@ -3681,6 +3681,37 @@ pub fn subgame_search_unanchored_prewarm_cross(
     bucket_override: Option<&Arc<BucketTable>>,
     hand_seed: u64,
 ) -> Result<(), String> {
+    subgame_search_unanchored_prewarm_cross_exploit(
+        cache,
+        hero,
+        round_start,
+        game,
+        prefix_reach,
+        cross_street,
+        None,
+        cfg,
+        bucket_override,
+        hand_seed,
+    )
+}
+
+/// [`subgame_search_unanchored_prewarm_cross`] + **叠加剥削先验**。`exploit` 与决策路径
+/// [`subgame_search_unanchored_cached_cross_exploit`] 同义；预热须传与决策时同一份画像，算出的
+/// ranges 才同 → 同 key → 命中（剥削 ranges 进 solve key）。混合座按 `hero` 排除（同决策时
+/// auth_actor = hero）；跨街后验命中时不再混（同决策路径）。`None` = 不剥削（= `_prewarm_cross`）。
+#[allow(clippy::too_many_arguments)]
+pub fn subgame_search_unanchored_prewarm_cross_exploit(
+    cache: &mut SubgameSolveCache,
+    hero: PlayerId,
+    round_start: &GameState,
+    game: &SimplifiedNlheGame,
+    prefix_reach: Option<PrefixReach<'_>>,
+    cross_street: Option<&[(Action, bool)]>,
+    exploit: Option<ExploitPrior<'_>>,
+    cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
+    hand_seed: u64,
+) -> Result<(), String> {
     subgame_search_unanchored_cached_inner(
         Some(cache),
         round_start,
@@ -3691,7 +3722,7 @@ pub fn subgame_search_unanchored_prewarm_cross(
         bucket_override,
         prefix_reach,
         cross_street,
-        None, // exploit：v1 预热不剥削（决策时 key 不同 → miss 现解，无害）
+        exploit,
         Some(hero),
         hand_seed,
         true,

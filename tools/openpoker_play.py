@@ -740,7 +740,7 @@ class Session:
                 return
         valid_stub = {"can_check": False, "can_call": False, "can_raise": False,
                       "min_raise": None, "max_raise": None}
-        req = hand.build_request(valid_stub)
+        req = hand.build_request(valid_stub, include_names=self.exploit)
         try:
             self.advisor.prewarm(req)
             self.counters["prewarms"] += 1
