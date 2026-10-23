@@ -101,6 +101,10 @@ Rust `tools/fourbet_replay` 与 Python 回放在 11 批 hh 上逐点一致(390 �
 搜索 = 真栈 auth,blueprint = 100BB 影子),SPR ≥ 6 时 allin < 20% 去掉,否则仍是 5%;翻前不变。只改抽样不改求解,
 `probs` 仍记原分布。动了策略,poker_manager 实盘累计从这一版起重开一段。
 
+**低频弃牌抽样门槛(2026-10-23)**。起因:bp2 实盘 8c63f318 河牌 AA 面对全下,脱锚搜索给跟注(AllIn 槽)0.952 / 弃牌 0.048,
+抽中弃牌,只差 482 跟约 2960 的底池。`prune_for_sampling` 抽样前把 < 5% 的 `Fold` 也去掉(不分 SPR,翻前翻后、blueprint /
+搜索一样),与全下门槛同时生效;只改抽样不改求解,`probs` 仍记原分布。此前两批 bp2 实盘翻后抽中 < 10% 弃牌 3 次(4.8% / 2.5% / 0.09%)。
+
 **S6 进度(2026-06-03):实时搜索推进,MVP subgame-solver 核心已落地 + vultr 验证**(分支 `6max-rts-mvp`
 commit `cf9efdb`,**未并入 6max**)。设计成文 `temp/realtime_search_design_2026_06_03.md`(文献调研+代码复用映射+
 对抗验证):方法定型 = Pluribus/Modicum tabular depth-limited search(非 DeepStack/ReBeL)。三件落地:①

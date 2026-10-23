@@ -3667,11 +3667,16 @@ fn action_label(a: &AbstractAction) -> String {
     }
 }
 
-/// 出牌抽样前，`AllIn` 概率低于此值就去掉（剩下的按比例归一）；其他动作不论概率多小都保留。
-/// 只管全下：低频全下一旦抽中就把整个码深押上（run5 10a9eac8 抽中 3% 的全下 100 BB），而低频的
+/// 出牌抽样前，`AllIn` 概率低于此值就去掉（剩下的按比例归一）；跟注 / 下注尺寸不论概率多小都保留。
+/// 低频全下一旦抽中就把整个码深押上（run5 10a9eac8 抽中 3% 的全下 100 BB），而低频的
 /// 跟注 / 下注尺寸代价有限，逐个尺寸按门槛砍会把拆成几档的进攻整类去掉（run5 有 9 次）。
 /// `resp.probs` 仍记原分布。
 const SAMPLE_MIN_ALLIN_PROB: f64 = 0.05;
+
+/// 出牌抽样前，`Fold` 概率低于此值就去掉（与 [`SAMPLE_MIN_ALLIN_PROB`] 同门槛，不分 SPR）。低频弃牌
+/// 多是搜索噪声，一旦抽中丢掉的是已投入的整个底池：2026-10-23 bp2 实盘 8c63f318 河牌 AA 面对全下，
+/// 搜索给跟注（AllIn 槽）0.952 / 弃牌 0.048，抽中弃牌，只差 482 跟约 2960 的底池（胜率 14% 即该跟）。
+const SAMPLE_MIN_FOLD_PROB: f64 = 0.05;
 
 /// 翻后 SPR（[`postflop_spr`]）≥ 此值时，全下改用 [`SAMPLE_MIN_ALLIN_PROB_DEEP`] 作门槛。
 const DEEP_SPR_MIN: f64 = 6.0;
@@ -3706,8 +3711,9 @@ fn postflop_spr(state: &GameState) -> Option<f64> {
     (pot > 0).then(|| hero.stack.as_u64().min(opp_max) as f64 / pot as f64)
 }
 
-/// 全下门槛过滤 + 归一：翻后 SPR ≥ [`DEEP_SPR_MIN`] 用 [`SAMPLE_MIN_ALLIN_PROB_DEEP`]，否则
-/// [`SAMPLE_MIN_ALLIN_PROB`]。只有 `AllIn` 会被去掉；去掉后为空（理论上不会：分布和为 1）则原样返回。
+/// 全下 / 弃牌门槛过滤 + 归一：全下在翻后 SPR ≥ [`DEEP_SPR_MIN`] 时用 [`SAMPLE_MIN_ALLIN_PROB_DEEP`]，
+/// 否则 [`SAMPLE_MIN_ALLIN_PROB`]；弃牌用 [`SAMPLE_MIN_FOLD_PROB`]。只有 `AllIn` / `Fold` 会被去掉；
+/// 去掉后为空（理论上不会：分布和为 1）则原样返回。
 fn prune_for_sampling(
     dist: &[(AbstractAction, f64)],
     spr: Option<f64>,
@@ -3720,7 +3726,11 @@ fn prune_for_sampling(
     let kept: Vec<(AbstractAction, f64)> = dist
         .iter()
         .copied()
-        .filter(|&(a, p)| !matches!(a, AbstractAction::AllIn { .. }) || p >= min_allin)
+        .filter(|&(a, p)| match a {
+            AbstractAction::AllIn { .. } => p >= min_allin,
+            AbstractAction::Fold => p >= SAMPLE_MIN_FOLD_PROB,
+            _ => true,
+        })
         .collect();
     if kept.len() == dist.len() || kept.is_empty() {
         return dist.to_vec();
@@ -7333,7 +7343,7 @@ mod tests {
     /// 抽样前过滤：只有 `AllIn` < 5% 才去掉、剩下的归一（和为 1，`sample_discrete` 要求 1e-12 内）；
     /// 其他动作再小也保留；全下恰好 5% 保留；没有全下 / 全下够大时原样返回；过滤后永远抽不到全下。
     #[test]
-    fn prune_for_sampling_drops_only_low_prob_allin() {
+    fn prune_for_sampling_drops_low_prob_allin_keeps_sizes() {
         let fold = AbstractAction::Fold;
         let call = AbstractAction::Call {
             to: ChipAmount::new(300),
@@ -7433,6 +7443,49 @@ mod tests {
             prune_for_sampling(&[(allin, 1.0)], Some(30.0)),
             vec![(allin, 1.0)]
         );
+    }
+
+    /// 弃牌 < 5% 去掉（不分 SPR），恰好 5% 保留；与全下门槛同时生效；只剩弃牌时原样返回。
+    #[test]
+    fn prune_for_sampling_drops_low_prob_fold() {
+        let fold = AbstractAction::Fold;
+        let call = AbstractAction::Call {
+            to: ChipAmount::new(2960),
+        };
+        let allin = AbstractAction::AllIn {
+            to: ChipAmount::new(8580),
+        };
+
+        // bp2 8c63f318 河牌 AA 面对全下：跟注折进 AllIn 槽 0.9521，弃牌 0.0479 → 只剩跟注。
+        let live = [(fold, 0.0479), (allin, 0.9521)];
+        for spr in [None, Some(0.0)] {
+            let d = prune_for_sampling(&live, spr);
+            assert_eq!(d, vec![(allin, 1.0)], "spr={spr:?}");
+            for seed in 0..200u64 {
+                let mut rng = ChaCha20Rng::from_seed(seed);
+                assert_eq!(sample_discrete(&d, &mut rng), allin);
+            }
+        }
+
+        let edge = [(fold, 0.05), (call, 0.95)];
+        assert_eq!(
+            prune_for_sampling(&edge, None),
+            edge.to_vec(),
+            "恰好 5% 保留"
+        );
+        let high = [(fold, 0.9), (call, 0.1)];
+        assert_eq!(prune_for_sampling(&high, Some(10.0)), high.to_vec());
+        assert_eq!(prune_for_sampling(&[(fold, 1.0)], None), vec![(fold, 1.0)]);
+
+        // 弃牌、全下都低于各自门槛（深码全下 20%）→ 一起去掉。
+        let d = prune_for_sampling(&[(fold, 0.04), (call, 0.81), (allin, 0.15)], Some(10.0));
+        assert_eq!(d, vec![(call, 1.0)]);
+        let d = prune_for_sampling(&[(fold, 0.04), (call, 0.81), (allin, 0.15)], Some(5.0));
+        assert_eq!(
+            d.iter().map(|&(a, _)| a).collect::<Vec<_>>(),
+            vec![call, allin]
+        );
+        assert!((d.iter().map(|&(_, p)| p).sum::<f64>() - 1.0).abs() < 1e-12);
     }
 
     /// SPR = min(hero 剩余栈, 未弃牌对手最大剩余栈) / 跟注后底池；翻前 → None。
