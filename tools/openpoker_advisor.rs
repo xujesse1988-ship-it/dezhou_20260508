@@ -367,6 +367,10 @@ struct Response {
     /// 「我方开局、一人 3bet、其余都弃」时填（门没开也填，事后看为什么没放开）；否则 `None`（serde skip）。
     #[serde(skip_serializing_if = "Option::is_none")]
     fourbet: Option<FourBetTelemetry>,
+    /// 实时搜索子树**当前街**的下注尺寸菜单（[`search_menu_label`]：`1pot` / `0.5+1pot` 等）。
+    /// 搜索路径（含放弃搜索）填；blueprint / 其余兜底恒 `None`（serde skip）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    menu: Option<String>,
 }
 
 /// PM-17 单个决策点的遥测。浮点四舍五入到 4 位小数（只影响落盘显示）。
@@ -446,7 +450,8 @@ fn street_label(s: poker::Street) -> &'static str {
 
 /// 每次搜索决策的监控行（stderr）：solve 实际 update 数 / 街 / 本决策墙钟（build+solve；预热
 /// 命中时 ≈0）/ 本决策是否命中缓存（HIT=复用预热/同街 solve；MISS=现 build+solve）/ 累计命中。
-/// `wall_ms > slow_ms`（[`search_wall_slow_ms`]）追加 ` SLOW`（长跑监控 `grep SLOW`）。纯日志。
+/// `wall_ms > slow_ms`（[`search_wall_slow_ms`]）追加 ` SLOW`（长跑监控 `grep SLOW`）。`menu` = 子树当前街的
+/// 下注菜单（[`subtree_menu_label`]）。纯日志。
 #[allow(clippy::too_many_arguments)]
 fn log_search_wall(
     tag: &str,
@@ -457,9 +462,10 @@ fn log_search_wall(
     hit: bool,
     hits: u64,
     misses: u64,
+    menu: &str,
 ) {
     eprintln!(
-        "[openpoker_advisor] search{} solve updates={} street={} wall_ms={} cache={} ({}hit/{}miss){}",
+        "[openpoker_advisor] search{} solve updates={} street={} wall_ms={} cache={} ({}hit/{}miss) menu={}{}",
         tag,
         updates,
         street_label(street),
@@ -467,8 +473,69 @@ fn log_search_wall(
         if hit { "HIT" } else { "MISS" },
         hits,
         misses,
+        menu,
         if wall_ms > slow_ms { " SLOW" } else { "" },
     );
+}
+
+/// 下注尺寸菜单在 `street` 上的标签：各档按底池比例从小到大、`+` 连接，如 `1pot` / `0.5+1pot`。
+fn search_menu_label(menu: &StreetActionAbstraction, street: poker::Street) -> String {
+    let mut milli: Vec<u32> = menu
+        .config_for(street)
+        .raise_pot_ratios
+        .iter()
+        .map(|r| r.as_milli())
+        .collect();
+    milli.sort_unstable();
+    if milli.is_empty() {
+        return "none".into();
+    }
+    let parts: Vec<String> = milli
+        .iter()
+        .map(|&m| {
+            let x = format!("{:.3}", f64::from(m) / 1000.0);
+            x.trim_end_matches('0').trim_end_matches('.').to_string()
+        })
+        .collect();
+    format!("{}pot", parts.join("+"))
+}
+
+/// 实时搜索子树当前街（`root_state` 所在街）的菜单标签：`deep_menu` → 与子树同一函数
+/// [`deep_menu_for`]（按根 SPR / 人数选 `{1pot}` 或 `{0.5,1}`）；否则 blueprint 自身抽象（同 subgame）。
+fn subtree_menu_label(
+    scfg: &SubgameSearchConfig,
+    root_state: &GameState,
+    game: &SimplifiedNlheGame,
+) -> String {
+    let street = root_state.street();
+    if scfg.deep_menu {
+        search_menu_label(&deep_menu_for(root_state).0, street)
+    } else {
+        search_menu_label(game.abstraction(), street)
+    }
+}
+
+/// 按菜单累计的**现建**子树次数（决策 MISS + 预热，含建树 / 求解失败），进程内从启动起算。
+/// 记一次并返回当前累计摘要（如 `1pot=12 0.5+1pot=5`），写进 play.log 方便直接看比例。
+fn count_menu_build(menu: &str) -> String {
+    static COUNTS: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
+    let mut c = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    *c.entry(menu.to_string()).or_insert(0) += 1;
+    c.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 现建了子树（`misses` 涨了）→ 计数并打一行累计（决策路径与预热共用）。
+fn log_menu_build(menu: &str, street: poker::Street, built: bool, ok: bool) {
+    if built {
+        let total = count_menu_build(menu);
+        eprintln!(
+            "[openpoker_advisor] search menu build street={} menu={menu} ok={ok} 累计[{total}]",
+            street_label(street)
+        );
+    }
 }
 
 fn expected_board_len(s: poker::Street) -> usize {
@@ -592,8 +659,35 @@ fn not_n_max(n: usize) -> String {
 
 /// 实时搜索运行时 = 触发/求解配置 + 可选**子树独立桶表**。`SubgameSearchConfig` 是 `Copy` 纯
 /// 配置；桶表是资源（`Arc`），分开放避免把 Arc 塞进到处按值带的 config。
+/// 按街覆盖的子树迭代次数（[`SearchRuntime::street_iters`]）。翻牌沿用全局 `--search-iterations`：
+/// 翻牌子树最大、已有不少求解撞到时间预算，加迭代只会更常被截断。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StreetIters {
+    turn: Option<u64>,
+    river: Option<u64>,
+}
+
+impl SearchRuntime {
+    /// 该街子树求解用的 config：转牌 / 河牌有覆盖值就换 `iterations`，其余字段不变。决策（锚定 /
+    /// 脱锚）与预热都经此取——`iterations` 进 solve 缓存 key，两边取值不同预热就全部失效。
+    fn cfg_for(&self, street: poker::Street) -> SubgameSearchConfig {
+        let over = match street {
+            poker::Street::Turn => self.street_iters.turn,
+            poker::Street::River | poker::Street::Showdown => self.street_iters.river,
+            _ => None,
+        };
+        SubgameSearchConfig {
+            iterations: over.unwrap_or(self.cfg.iterations),
+            ..self.cfg
+        }
+    }
+}
+
 struct SearchRuntime {
     cfg: SubgameSearchConfig,
+    /// `--search-iterations-turn` / `--search-iterations-river`：转牌 / 河牌子树的迭代次数，覆盖
+    /// `cfg.iterations`（[`SearchRuntime::cfg_for`]）。缺省 = 沿用全局值（旧行为逐位不变）。
+    street_iters: StreetIters,
     /// `--search-bucket-table`：子树 solve + hero 读数用的独立桶表（如 500/500/500，比
     /// blueprint 200 更细——子树是独立一次性求解、桶空间与 blueprint checkpoint 解耦，见
     /// [`subgame_search_cached`] `bucket_override` doc）。`None` = 沿用 blueprint 表（旧行为
@@ -749,6 +843,8 @@ fn prewarm_inner(
         Ok(t) => t,
         Err(reason) => return mk(format!("prewarm:err:build:{reason}")),
     };
+    // 按街迭代次数（[`SearchRuntime::cfg_for`]，与决策同一函数 → 同 key）。
+    let scfg = &rt.cfg_for(round_start.street());
     // gating：街起点视角（真栈快照；should_search 只读街 + 本街是否已起注——街起点恒未起注，
     // FlopFirstUnraised 即「仅 flop 预热」）。街内后续是否起注未知 → 可能白预热，无害。
     if !should_search(&round_start, scfg.trigger) {
@@ -879,6 +975,9 @@ fn prewarm_inner(
             synced_node, limp, ..
         }) => unanchored_prewarm(solve_cache, *synced_node, limp),
     };
+    // 子树当前街的下注菜单：预热的子树根就是街起点（锚定 / 脱锚同一 round_start）。
+    let menu = subtree_menu_label(scfg, &round_start, game);
+    let misses_before = solve_cache.misses();
     let result = search_with_crop_backfill(
         game,
         strategy_fn,
@@ -889,17 +988,24 @@ fn prewarm_inner(
         backfill_depth,
         attempt,
     );
+    log_menu_build(
+        &menu,
+        round_start.street(),
+        solve_cache.misses() > misses_before,
+        result.is_ok(),
+    );
     match result {
         Ok(()) => {
             let wall_ms = t0.elapsed().as_millis();
             let updates = solve_cache.entry_update_count();
             eprintln!(
-                "[openpoker_advisor] prewarm stored street={} updates={} wall_ms={} cache={}hit/{}miss{}",
+                "[openpoker_advisor] prewarm stored street={} updates={} wall_ms={} cache={}hit/{}miss menu={}{}",
                 street_label(round_start.street()),
                 updates.unwrap_or(0),
                 wall_ms,
                 solve_cache.hits(),
                 solve_cache.misses(),
+                menu,
                 if wall_ms > search_wall_slow_ms(scfg) { " SLOW" } else { "" },
             );
             let mut resp = mk("prewarm:stored".into());
@@ -2030,12 +2136,15 @@ fn decide_with(
     let mut deep_abs_holder: Option<StreetActionAbstraction> = None;
     let mut solve_updates: Option<u64> = None;
     let mut hero_visits: Option<u32> = None;
+    // 子树当前街的下注菜单（[`subtree_menu_label`]），搜索路径的 resp 都带上。
+    let mut search_menu: Option<String> = None;
     // 搜索读数因 hero 信息集访问不足被拒、flop 退回 blueprint 同一节点出牌（source 标
     // `blueprint:low_hero_visits`；outgoing 同 blueprint 路径：100BB `real` + blueprint 抽象）。
     let mut low_visits_bp = false;
     let dist: Vec<(AbstractAction, f64)> = if want_search {
         let rt = search.expect("want_search ⇒ search.is_some()");
-        let scfg = &rt.cfg;
+        // 按街迭代次数（[`SearchRuntime::cfg_for`]，与预热同一函数 → 同 key）。
+        let scfg = &rt.cfg_for(street);
         // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ 安全降级。
         // 锚定搜索路径（lockstep Ok）：`prev_within` = 紧前一街完整动作线，档二′-跨街复用沿它在上一街
         // 已解子树（anchored/unanchored 皆可，turn_blueprint_trim §2.1）读 σ 算本街后验 range。
@@ -2066,6 +2175,8 @@ fn decide_with(
             ResolveRoot::CurrentDecision => &auth,
         };
         let hand_seed = hand_seed_for(req, base_seed, n_seats);
+        let menu = subtree_menu_label(scfg, root_state, game);
+        search_menu = Some(menu.clone());
         dlog!(
             "anchored search auth: street={:?} pot={} current={:?} stacks={:?} committed={:?} within={} prev_within={} cross_street={} hand_seed={hand_seed}",
             auth.street(),
@@ -2116,6 +2227,12 @@ fn decide_with(
                 )
             },
         );
+        log_menu_build(
+            &menu,
+            street,
+            solve_cache.misses() > misses_before,
+            search_result.is_ok(),
+        );
         match search_result {
             Ok(d) => {
                 // 遥测：本次决策用到的 solve 实际跑了多少 update（time_budget anytime 下
@@ -2133,6 +2250,7 @@ fn decide_with(
                     hit,
                     solve_cache.hits(),
                     solve_cache.misses(),
+                    &menu,
                 );
                 if scfg.deep_menu {
                     deep_abs_holder = Some(deep_menu_for(root_state).0);
@@ -2179,6 +2297,7 @@ fn decide_with(
                             giveup_source("unsolved", &reason),
                         );
                         resp.hero_visits = hero_visits;
+                        resp.menu = Some(menu);
                         return resp;
                     }
                 }
@@ -2297,6 +2416,7 @@ fn decide_with(
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates; // blueprint 路径恒 None（serde skip，byte-equal）。
         resp.hero_visits = hero_visits;
+        resp.menu = search_menu;
         resp.fourbet = fourbet_tel;
     }
     dlog!(
@@ -3695,8 +3815,12 @@ fn decide_search_unanchored(
             format!("fallback:{shadow_reason}"),
         );
     }
+    // 按街迭代次数（[`SearchRuntime::cfg_for`]，与预热同一函数 → 同 key）。gating 只读 trigger，不受影响。
+    let scfg = &rt.cfg_for(auth.street());
     let n_seats = solver_cfg.n_seats as usize;
     let hand_seed = hand_seed_for(req, base_seed, n_seats);
+    // 子树当前街的下注菜单（脱锚子树根 = round_start，[`subtree_menu_label`]）。
+    let menu = subtree_menu_label(scfg, &round_start, game);
     // 档一前缀 reach（生产默认开）：用已同步前缀估 range；off → None = uniform（byte-equal 旧行为）。
     // hero 由 limp 启发式决定的翻前步改乘 0/1 系数（[`unanchored_range_inputs`]，与预热同一函数）。
     let range_inputs = rt.unanchored_prefix_reach.then(|| {
@@ -3790,6 +3914,12 @@ fn decide_search_unanchored(
             )
         },
     );
+    log_menu_build(
+        &menu,
+        auth.street(),
+        solve_cache.misses() > misses_before,
+        search_result.is_ok(),
+    );
     let hero_visits = solve_cache.last_read_visits();
     let dist = match search_result {
         Ok(d) => d,
@@ -3807,6 +3937,7 @@ fn decide_search_unanchored(
                 ),
             );
             resp.hero_visits = hero_visits;
+            resp.menu = Some(menu);
             return resp;
         }
     };
@@ -3822,6 +3953,7 @@ fn decide_search_unanchored(
         hit,
         solve_cache.hits(),
         solve_cache.misses(),
+        &menu,
     );
     // outgoing：真栈 auth + 与子树同一抽象（deep_menu → deep_menu_for(round_start)，SPR 自适应：
     // 深 {1pot} / 浅 {0.5,1}；否则 blueprint 菜单）——子树自身合法集契约（同 deep 路径）：
@@ -3870,6 +4002,7 @@ fn decide_search_unanchored(
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates;
         resp.hero_visits = hero_visits;
+        resp.menu = Some(menu.clone());
         // 叠加剥削遥测：本决策实际剥削了哪些对手座（已收敛）+ 其 VPIP。无收敛对手 / 跨街后验命中
         // （subgame 不再叠加）→ None（serde skip → byte-equal）。
         let applied = exploit_owned
@@ -4473,6 +4606,8 @@ struct Args {
     /// 缺口②实时搜索：`Some` = `--search` 开（postflop 触发面 re-solve 真码深子博弈）；`None`
     /// （默认）= 纯 blueprint（旧行为 byte-equal）。其余 search 字段由 `--search-*` flag 填。
     search: Option<SubgameSearchConfig>,
+    /// `--search-iterations-turn` / `--search-iterations-river`（[`SearchRuntime::street_iters`]）。
+    search_street_iters: StreetIters,
     /// `--search-bucket-table`：子树 solve 用的独立桶表路径（[`SearchRuntime`] doc；`None` =
     /// 沿用 `--bucket-table`）。仅 `--search` 开时可设（同其余 `--search-*` 的拒静默 guard）。
     search_bucket_table: Option<PathBuf>,
@@ -4660,6 +4795,7 @@ fn run() -> Result<(), String> {
                 None => None,
             };
             Some(SearchRuntime {
+                street_iters: args.search_street_iters,
                 // blueprint σ 覆盖街：完整 = River（默认值，行为不变）；crop = keep_through
                 // （range 先验不得查被裁街，SubgameSearchConfig::blueprint_max_street doc）。
                 cfg: SubgameSearchConfig {
@@ -4702,8 +4838,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} force_unanchored={} limp_as_fold={} min_hero_visits={} weak_commit_guard={} bucket_table={}",
-            scfg.trigger, scfg.iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.force_unanchored, rt.limp_as_fold, scfg.min_hero_visits, rt.weak_commit_guard,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} iters_turn={} iters_river={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} force_unanchored={} limp_as_fold={} min_hero_visits={} weak_commit_guard={} bucket_table={}",
+            scfg.trigger, scfg.iterations, rt.cfg_for(poker::Street::Turn).iterations, rt.cfg_for(poker::Street::River).iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.force_unanchored, rt.limp_as_fold, scfg.min_hero_visits, rt.weak_commit_guard,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
         if let Some(cell) = &rt.exploit {
@@ -4907,6 +5043,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     // 缺口② 实时搜索 flag（仅 --search 开时打包成 SubgameSearchConfig）。
     let mut search_on = false;
     let mut search_iters: Option<u64> = None;
+    let mut search_street_iters = StreetIters::default();
     let mut search_trigger = SearchTrigger::FlopFirstUnraised;
     let mut search_time_budget_ms: Option<u64> = None;
     let mut search_lcfr = false;
@@ -4977,6 +5114,19 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                         .parse()
                         .map_err(|e| format!("bad search-iterations: {e}"))?,
                 )
+            }
+            "--search-iterations-turn" | "--search-iterations-river" => {
+                let n: u64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad {arg}: {e}"))?;
+                if n == 0 {
+                    return Err(format!("{arg} 须 > 0"));
+                }
+                if arg == "--search-iterations-turn" {
+                    search_street_iters.turn = Some(n);
+                } else {
+                    search_street_iters.river = Some(n);
+                }
             }
             "--search-trigger" => {
                 let v = next_val(&mut it, &arg)?;
@@ -5225,6 +5375,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         })
     } else {
         if search_iters.is_some()
+            || search_street_iters != StreetIters::default()
             || search_trigger != SearchTrigger::FlopFirstUnraised
             || search_time_budget_ms.is_some()
             || search_lcfr
@@ -5323,6 +5474,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         seats,
         seed,
         search,
+        search_street_iters,
         search_bucket_table,
         exploit,
         exploit_4bet,
@@ -5368,6 +5520,7 @@ mod tests {
     fn rt(cfg: SubgameSearchConfig) -> SearchRuntime {
         SearchRuntime {
             cfg,
+            street_iters: StreetIters::default(),
             bucket_table: None,
             unanchored_prefix_reach: false,
             unanchored_cross_street: false,
@@ -5383,6 +5536,7 @@ mod tests {
     fn rt_prefix_reach(cfg: SubgameSearchConfig) -> SearchRuntime {
         SearchRuntime {
             cfg,
+            street_iters: StreetIters::default(),
             bucket_table: None,
             unanchored_prefix_reach: true,
             unanchored_cross_street: false,
@@ -5398,6 +5552,7 @@ mod tests {
     fn rt_cross_street(cfg: SubgameSearchConfig) -> SearchRuntime {
         SearchRuntime {
             cfg,
+            street_iters: StreetIters::default(),
             bucket_table: None,
             unanchored_prefix_reach: true,
             unanchored_cross_street: true,
@@ -5414,6 +5569,7 @@ mod tests {
     fn rt_flop_prefer_blueprint(cfg: SubgameSearchConfig) -> SearchRuntime {
         SearchRuntime {
             cfg,
+            street_iters: StreetIters::default(),
             bucket_table: None,
             unanchored_prefix_reach: false,
             unanchored_cross_street: false,
@@ -6302,6 +6458,68 @@ mod tests {
         ]
     }
 
+    /// 按街迭代次数：转牌预热与决策都用转牌的覆盖值 → 决策命中预热、读到的 solve 跑了覆盖值那么多次；
+    /// 翻牌仍用全局值。
+    #[test]
+    fn street_iterations_turn_prewarm_hits() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::AllPostflop,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let rt = SearchRuntime {
+            street_iters: StreetIters {
+                turn: Some(400),
+                river: Some(500),
+            },
+            ..rt_limp_as_fold(scfg)
+        };
+        let flop = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks"], hand580_acts());
+        let r = decide(
+            &game,
+            &abs,
+            &uniform,
+            &flop,
+            0x7A,
+            Some(&rt),
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.solve_updates, Some(300), "翻牌沿用全局：{r:?}");
+
+        let mut acts = hand580_acts();
+        acts.push(hist(2, "check", None));
+        acts.push(hist(0, "check", None));
+        let turn = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks", "4d"], acts);
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(&game, &uniform, &turn, 0x7A, Some(&rt), &mut cache);
+        assert_eq!(p.source, "prewarm:stored", "{p:?}");
+        assert_eq!(p.solve_updates, Some(400), "{p:?}");
+        let r = decide(&game, &abs, &uniform, &turn, 0x7A, Some(&rt), &mut cache);
+        assert!(r.source.contains("unanchored"), "{r:?}");
+        assert_eq!(r.solve_updates, Some(400), "{r:?}");
+        assert_eq!((cache.misses(), cache.hits()), (1, 1), "决策须命中预热");
+    }
+
+    /// 菜单标签：单档 `1pot`、宽档只放当前街（`0.5+1pot`，下一街起收回 `1pot`）、blueprint 默认三档。
+    #[test]
+    fn search_menu_label_formats() {
+        use poker::training::nlhe_betting_tree::{deep_single_pot, deep_wide_then_single_pot};
+        use poker::Street;
+        let single = deep_single_pot().0;
+        let wide = deep_wide_then_single_pot(Street::Turn).0;
+        assert_eq!(search_menu_label(&single, Street::Flop), "1pot");
+        assert_eq!(search_menu_label(&wide, Street::Turn), "0.5+1pot");
+        assert_eq!(search_menu_label(&wide, Street::River), "1pot");
+        assert_eq!(
+            search_menu_label(&StreetActionAbstraction::default_6_action(), Street::Flop),
+            "0.5+1+2pot"
+        );
+    }
+
     /// 查表版 [`chen_top_fraction`] 与逐个扫描逐位相同；[`combo_index`] 与 [`all_hole_combos`] 对齐。
     #[test]
     fn chen_top_fraction_table_matches_scan() {
@@ -6757,6 +6975,10 @@ mod tests {
         let r = decide(&game, &abs, &uniform, &req, 0x580, Some(&rt), &mut cache);
         assert!(r.source.contains("unanchored"), "{r:?}");
         assert!(!r.source.contains("hero_coef_mismatch"), "{r:?}");
+        assert!(
+            matches!(r.menu.as_deref(), Some("1pot" | "0.5+1pot")),
+            "搜索 resp 须带菜单：{r:?}"
+        );
         assert_eq!((cache.misses(), cache.hits()), (1, 1), "决策须命中预热");
 
         let bad = limp_req(2, ["8h", "3d"], &["7h", "2c", "Ks"], hand580_acts());
@@ -6770,6 +6992,7 @@ mod tests {
             &mut SubgameSolveCache::new(),
         );
         assert!(r.source.ends_with(":hero_coef_mismatch"), "{r:?}");
+        assert!(r.menu.is_some(), "放弃搜索也带菜单：{r:?}");
     }
 
     /// [`limp_heuristic`] **有人加注**分支（含 hero raise 后被 re-raise 的递归终止格）：
@@ -10182,6 +10405,68 @@ mod tests {
     }
 
     /// `--search-limp-as-fold on|off`（方案 B，默认关）：默认关、on/off、坏值拒收、未开 --search 拒收。
+    /// `--search-iterations-turn/river`：只覆盖对应街，缺省沿用全局；0 / 未开 `--search` 拒绝。
+    #[test]
+    fn parse_args_street_iterations() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        let a = parse(&["--search", "--search-iterations", "1000000"]).unwrap();
+        assert_eq!(a.search_street_iters, StreetIters::default(), "默认不覆盖");
+        let a = parse(&[
+            "--search",
+            "--search-iterations",
+            "1000000",
+            "--search-iterations-turn",
+            "2000000",
+            "--search-iterations-river",
+            "3000000",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.search_street_iters,
+            StreetIters {
+                turn: Some(2_000_000),
+                river: Some(3_000_000)
+            }
+        );
+        assert!(parse(&["--search", "--search-iterations-turn", "0"]).is_err());
+        assert!(
+            parse(&["--search-iterations-river", "5"]).is_err(),
+            "未开 --search"
+        );
+    }
+
+    /// [`SearchRuntime::cfg_for`]：转牌 / 河牌换 iterations，翻牌和其余字段不变；不覆盖时逐字段同全局。
+    #[test]
+    fn search_runtime_cfg_for_street() {
+        let base = SubgameSearchConfig {
+            iterations: 1_000_000,
+            max_subtree_nodes: 777,
+            ..SubgameSearchConfig::default()
+        };
+        let mut rt = rt_prefix_reach(base);
+        for st in [
+            poker::Street::Flop,
+            poker::Street::Turn,
+            poker::Street::River,
+        ] {
+            assert_eq!(rt.cfg_for(st).iterations, 1_000_000, "{st:?} 默认沿用全局");
+        }
+        rt.street_iters = StreetIters {
+            turn: Some(2_000_000),
+            river: Some(3_000_000),
+        };
+        assert_eq!(rt.cfg_for(poker::Street::Flop).iterations, 1_000_000);
+        assert_eq!(rt.cfg_for(poker::Street::Turn).iterations, 2_000_000);
+        assert_eq!(rt.cfg_for(poker::Street::River).iterations, 3_000_000);
+        assert_eq!(rt.cfg_for(poker::Street::River).max_subtree_nodes, 777);
+    }
+
     #[test]
     fn parse_args_limp_as_fold() {
         let parse = |extra: &[&str]| {
@@ -10436,6 +10721,7 @@ mod tests {
 
     fn crop_rt(bp: &Blueprint, cfg: SubgameSearchConfig) -> SearchRuntime {
         SearchRuntime {
+            street_iters: StreetIters::default(),
             cfg: SubgameSearchConfig {
                 blueprint_max_street: bp.keep_through(),
                 ..cfg
@@ -10847,6 +11133,7 @@ mod tests {
         assert!(!a.cropped);
 
         let rt_with = |trigger, cross: bool, prefer: bool| SearchRuntime {
+            street_iters: StreetIters::default(),
             cfg: SubgameSearchConfig {
                 trigger,
                 blueprint_max_street: StreetTag::Flop,
