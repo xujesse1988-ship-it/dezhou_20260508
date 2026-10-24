@@ -305,6 +305,7 @@ fn eval_deal(
     let mk_prefix = || PrefixReach {
         strategy: strat,
         decisions: synced,
+        hero_coef: None,
     };
 
     // OFF 臂（档一）：flop 解入缓存 → turn cross=None（同步前缀 reach）。

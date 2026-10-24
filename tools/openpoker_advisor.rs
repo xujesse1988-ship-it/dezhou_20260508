@@ -102,8 +102,9 @@ use poker::training::openpoker_hh::{hh_record_to_observe, hist_to_concrete, HhRe
 use poker::training::opponent_profile::{ExploitConfig, ObserveHand, OpponentProfile, Profiler};
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
-    chen_score, is_blueprint_cropped_err, is_low_hero_visits_err, set_subgame_debug, should_search,
-    subgame_search_cached, subgame_search_prewarm, subgame_search_unanchored_cached_cross_exploit,
+    all_hole_combos, chen_score, is_blueprint_cropped_err, is_low_hero_visits_err,
+    set_subgame_debug, should_search, subgame_search_cached, subgame_search_prewarm,
+    subgame_search_unanchored_cached_cross_exploit,
     subgame_search_unanchored_prewarm_cross_exploit, synced_prefix_decisions, ExploitPrior,
     ExploitShape, PrefixReach, ResolveRoot, SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
 };
@@ -260,7 +261,7 @@ struct HistAction {
 
 /// 我方决策点 OpenPoker 合法区间（your_turn 的 valid_actions，**OpenPoker 单位**）。
 /// outgoing 夹进 [min_raise, max_raise] + 兜底从此出安全动作。
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 struct ValidActions {
     #[serde(default)]
     can_check: bool,
@@ -802,15 +803,28 @@ fn prewarm_inner(
                               limp: &LimpFoldMap| {
         // 档一前缀 reach（生产默认开）：用已同步前缀估 range——须与决策时算出同一份 ranges 才能
         // 命中 key（hero 显式传入：range 平滑「不混」座按 hero 算，见 subgame_search_unanchored_prewarm）。
-        // 平跟当弃牌映射下 hero 自己那一步的过滤与决策路径同一函数（unanchored_prefix_decisions）。
+        // 平跟当弃牌映射下的前缀过滤与 hero 系数与决策路径同一函数（unanchored_range_inputs）。
         // force_unanchored 下 synced_node = 街起点影子节点、决策时 = 当前节点：前缀只取当前街
         // 之前的决策，两者同一份。
-        let prefix_decisions = rt
-            .unanchored_prefix_reach
-            .then(|| unanchored_prefix_decisions(game, synced_node, limp, hero_pid));
-        let prefix_reach = prefix_decisions.as_ref().map(|d| PrefixReach {
+        // hero 的 limp 启发式系数同一函数算（[`unanchored_range_inputs`]），否则 ranges 对不上 key。
+        let range_inputs = rt.unanchored_prefix_reach.then(|| {
+            unanchored_range_inputs(
+                game,
+                &solver_cfg,
+                &smap,
+                req,
+                scale,
+                my_seat_solver,
+                hole,
+                synced_node,
+                limp,
+                rt.limp_as_fold,
+            )
+        });
+        let prefix_reach = range_inputs.as_ref().map(|(d, coef)| PrefixReach {
             strategy: strategy_fn,
             decisions: d,
+            hero_coef: coef.coef.as_deref(),
         });
         // 档二′-跨街复用（默认关）：复用缓存里上一街 unanchored 解的 σ 算本街后验 range。预热须
         // 与决策时算出同一份 ranges 才命中 key——两路同读 `cache.current()`（街起点预热时仍持上一
@@ -1383,23 +1397,261 @@ fn lockstep_replay(
     Ok((real, abs, limp, sizes))
 }
 
-/// 脱锚搜索档一前缀 reach 的决策三元组（[`decide_search_unanchored`] 与 [`prewarm`] 共用，两路
-/// 必须算出同一份才能命中 solve 缓存 key）。在 [`synced_prefix_decisions`] 基础上去掉 **hero 自己**
-/// 被平跟当弃牌映射的那一步：hero 平跟的牌由 [`limp_heuristic`] 决定（跟入平跟档），按 blueprint
-/// 在该节点的弃牌概率算会把 hero 真实底牌所在的牌型压到接近 0；拿掉 = 这一步按无信息处理（因子 1）。
-/// 对手平跟者那一步 Fold 保留：P(弃牌 | 牌) = 「该位置开池范围之外的牌」，正是调研 §4 建议的
-/// 平跟者范围先验（再经 `range_uniform_mix` 混入均匀兜底）。
+/// 脱锚搜索档一前缀 reach 的决策三元组（[`unanchored_range_inputs`] 内调，预热与决策同一份）。在
+/// [`synced_prefix_decisions`] 基础上去掉三类决策：
+/// - **hero 自己**被平跟当弃牌映射的那一步：hero 平跟的牌由 [`limp_heuristic`] 决定（跟入平跟档），
+///   按 blueprint 在该节点的弃牌概率算会把 hero 真实底牌所在的牌型压到接近 0；
+/// - `hero_limp_nodes`：hero 其他由 limp 启发式决定的翻前步（[`HeroLimpCoef::nodes`]），改由 hero 系数
+///   表达，留着会和系数重复相乘（`limp_heuristic_hero_range_design_2026_10_24` §3.3）；
+/// - `limp_raisers` 的映射弃牌步：平跟后在翻前又加注的对手，「开池范围之外的牌」已被他自己的动作推翻
+///   （同设计 §3.5），按无信息处理。
+///
+/// 去掉 = 这一步按无信息处理（因子 1）。其余对手平跟者那一步 Fold 保留：P(弃牌 | 牌) = 「该位置开池
+/// 范围之外的牌」，正是调研 §4 建议的平跟者范围先验（再经 `range_uniform_mix` 混入均匀兜底）。
 fn unanchored_prefix_decisions(
     game: &SimplifiedNlheGame,
     synced_node: NodeId,
     limp: &LimpFoldMap,
     hero: PlayerId,
+    hero_limp_nodes: &[NodeId],
+    limp_raisers: &[PlayerId],
 ) -> Vec<(NodeId, AbstractActionTag, PlayerId)> {
     let mut d = synced_prefix_decisions(game, synced_node);
     d.retain(|&(node, tag, seat)| {
-        !(seat == hero && tag == AbstractActionTag::Fold && limp.folds.contains(&(node, seat)))
+        let mapped_fold = tag == AbstractActionTag::Fold && limp.folds.contains(&(node, seat));
+        let hero_drop = seat == hero && (mapped_fold || hero_limp_nodes.contains(&node));
+        let raiser_drop = mapped_fold && limp_raisers.contains(&seat);
+        !(hero_drop || raiser_drop)
     });
     d
+}
+
+/// hero 由 [`limp_heuristic`] 决定的翻前步对 hero range 的系数（`limp_heuristic_hero_range_design_2026_10_24`
+/// §3）。每一步拿**同一个** `limp_heuristic` 对 1326 个组合各算一遍，动作类型和实际一致记 1、否则 0，
+/// 各步相乘。limp 启发式是确定性的，乘出来就是 hero 在这些步上的真实范围。
+#[derive(Debug, Default, Clone, PartialEq)]
+struct HeroLimpCoef {
+    /// 下标对齐 [`all_hole_combos`]。`None` = 没有一步用上系数（无 limp 步 / 全部一致性检查失败）。
+    coef: Option<Vec<f64>>,
+    /// 用上系数的步在影子里的节点（重放到那一步仍同步才有；失同步之后的步本来就不在前缀里）。
+    nodes: Vec<NodeId>,
+    /// 有一步 hero 真实底牌算出 0（分流或 `valid` 重建与当时不一致）：该步不用系数、退回旧做法。
+    mismatch: bool,
+}
+
+/// [`all_hole_combos`] 里 `hole` 的下标（`(a, b)`，`a < b` 按 `to_u8`，逐行排列）。两张相同的牌 → `None`。
+fn combo_index(hole: [Card; 2]) -> Option<usize> {
+    let (x, y) = (hole[0].to_u8() as usize, hole[1].to_u8() as usize);
+    let (a, b) = if x < y { (x, y) } else { (y, x) };
+    (a < b).then(|| a * (103 - a) / 2 + (b - a - 1))
+}
+
+/// 按真栈重放态的合法集重建 OpenPoker 口径的 [`ValidActions`]（加注额是总额，OpenPoker 单位）。
+/// hero 过去某一步的 `valid` 不在请求里，算那一步的 limp 启发式时用它。只认加注 / 下注区间：只剩
+/// 不够最小加注的全下时服务器给 `can_raise=false`（2026-10-19~22 实盘 15964 条翻前请求核对，
+/// 15962 条逐字段一致；其余 2 条是同一手大盲只剩 1 筹码的怪局，只差最小加注额，不影响启发式）。
+fn valid_from_legal(la: &poker::LegalActionSet, scale: u64) -> ValidActions {
+    let raise = la.raise_range.or(la.bet_range);
+    ValidActions {
+        can_check: la.check,
+        can_call: la.call.is_some(),
+        can_raise: raise.is_some(),
+        min_raise: raise.map(|(lo, _)| lo.as_u64() / scale),
+        max_raise: raise.map(|(_, hi)| hi.as_u64() / scale),
+    }
+}
+
+/// 历史动作 / 启发式输出的动作类型（比对用，加注额不管）。`all_in` 按当时合法集判：全下额不超过
+/// 跟注额 = 跟注，否则 = 加注（加注额被截到 `max_raise` 时 OpenPoker 记的可能是 `all_in`）。
+fn action_kind(action: &str, la: &poker::LegalActionSet) -> Option<&'static str> {
+    match action {
+        "raise" | "bet" => Some("raise"),
+        "call" => Some("call"),
+        "check" => Some("check"),
+        "fold" => Some("fold"),
+        "all_in" | "allin" => Some(match (la.all_in_amount, la.call) {
+            (Some(a), Some(c)) if a <= c => "call",
+            _ => "raise",
+        }),
+        _ => None,
+    }
+}
+
+/// hero 在 `step`（历史截到 hero 这一步之前、`valid` 已重建）上是否由 [`limp_heuristic`] 决定——与
+/// [`decide_with`] 的翻前分流同口径（改那边的分流必须同步改这里，测试
+/// `hero_limp_route_matches_decide` 守着）：
+/// - 先命中翻前全下启发式（`preflop_allin_spot`）→ 不是；
+/// - lockstep 成功且有平跟映射 → 是，`Some(Some(影子节点))`（合法集为空时 decide 走失同步分支，
+///   同样因有映射走启发式，但没有可去掉的影子节点 → `Some(None)`）；
+/// - lockstep 失同步且原因是 `structural_gap` 或有平跟映射 → 是，`Some(None)`；
+/// - 其余 → 不是（blueprint / 兜底）。
+///
+/// 启发式在历史里没有平跟时返回 `None`（decide 落兜底），由调用方逐组合算时识别。
+#[allow(clippy::too_many_arguments)]
+fn hero_limp_route(
+    game: &SimplifiedNlheGame,
+    solver_cfg: &TableConfig,
+    smap: &SeatMap,
+    step: &Request,
+    scale: u64,
+    hero: SeatId,
+    hole: [Card; 2],
+    limp_as_fold: bool,
+) -> Option<Option<NodeId>> {
+    if preflop_allin_spot(step, solver_cfg, scale, smap, hero, hole).is_some() {
+        return None;
+    }
+    match lockstep_replay(
+        game,
+        solver_cfg,
+        smap,
+        step,
+        scale,
+        0,
+        Some(hero),
+        limp_as_fold,
+    ) {
+        Ok((_, abs, limp, _)) if limp.mapped() => {
+            let legal = SimplifiedNlheGame::legal_actions(&abs);
+            Some((!legal.is_empty()).then_some(abs.current_node_id))
+        }
+        Ok(_) => None,
+        Err(e) if e.reason == "structural_gap" || e.limp.mapped() => Some(None),
+        Err(_) => None,
+    }
+}
+
+/// 逐个看 hero 的翻前动作，对由 limp 启发式决定的步算 [`HeroLimpCoef`]。底池赔率、加注额、分流都只看
+/// 历史不看底牌，每步算一次；逐组合只重跑 `limp_heuristic` 本身。
+#[allow(clippy::too_many_arguments)]
+fn hero_limp_coef(
+    game: &SimplifiedNlheGame,
+    solver_cfg: &TableConfig,
+    smap: &SeatMap,
+    req: &Request,
+    scale: u64,
+    hero: SeatId,
+    hole: [Card; 2],
+    limp_as_fold: bool,
+) -> HeroLimpCoef {
+    let mut out = HeroLimpCoef::default();
+    let Some(hero_idx) = combo_index(hole) else {
+        return out; // 脏底牌（decide 早已兜底，防御）。
+    };
+    let holes = all_hole_combos();
+    let pos = limp_pos(hero.0, solver_cfg.n_seats);
+    for (i, h) in req.actions.iter().enumerate() {
+        if smap.tree_seat(h.seat) != Ok(hero.0) {
+            continue;
+        }
+        let mut step = req.clone();
+        step.actions.truncate(i);
+        step.board.clear();
+        let Ok((auth, ..)) = build_real_auth(&step, solver_cfg, scale, smap, hero, hole, &[], true)
+        else {
+            break; // 重放不了 = 后面的步也不行。
+        };
+        if auth.street() != poker::Street::Preflop {
+            break;
+        }
+        let la = auth.legal_actions();
+        step.valid = valid_from_legal(&la, scale);
+        let Some(actual) = action_kind(&h.action, &la) else {
+            continue;
+        };
+        let Some(node) = hero_limp_route(
+            game,
+            solver_cfg,
+            smap,
+            &step,
+            scale,
+            hero,
+            hole,
+            limp_as_fold,
+        ) else {
+            continue;
+        };
+        let pot_odds = preflop_pot_odds(&step, solver_cfg, scale, smap, hero, hole);
+        let step_coef: Option<Vec<f64>> = holes
+            .iter()
+            .map(|&c| {
+                limp_heuristic(&step, c, pos, pot_odds).map(|r| {
+                    if action_kind(&r.action, &la) == Some(actual) {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+            })
+            .collect();
+        let Some(step_coef) = step_coef else {
+            continue; // 历史里没有平跟：decide 当时落兜底，不是启发式。
+        };
+        if step_coef[hero_idx] != 1.0 {
+            dlog!(
+                "hero_limp_coef MISMATCH: step={i} action={} → 该步退回旧做法",
+                h.action
+            );
+            out.mismatch = true;
+            continue;
+        }
+        match out.coef.as_mut() {
+            Some(c) => c.iter_mut().zip(&step_coef).for_each(|(x, y)| *x *= y),
+            None => out.coef = Some(step_coef),
+        }
+        out.nodes.extend(node);
+    }
+    out
+}
+
+/// 被平跟当弃牌映射过、且之后在翻前又加注（[`preflop_entry_kinds`] = `Aggressive`）的非 hero 座位
+/// （tree seat）。扫整段翻前历史，不只看触发 `limper_continued` 的那一步：lockstep 在第一次失同步就停，
+/// 两个平跟者时第二个人的再加注不会出现在 [`LockstepErr`] 里。重放失败 → 全 `Unknown` → 空（旧行为）。
+fn limp_raisers(
+    req: &Request,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    limp: &LimpFoldMap,
+    hero: PlayerId,
+) -> Vec<PlayerId> {
+    if !limp.mapped() {
+        return Vec::new();
+    }
+    let kinds = preflop_entry_kinds(req, solver_cfg, scale, smap);
+    let mut seats: Vec<PlayerId> = limp
+        .folds
+        .iter()
+        .map(|&(_, s)| s)
+        .filter(|&s| s != hero && kinds[s as usize] == PreflopEntry::Aggressive)
+        .collect();
+    seats.sort_unstable();
+    seats.dedup();
+    seats
+}
+
+/// 脱锚搜索档一前缀 reach 的全部输入（[`decide_search_unanchored`] 与 [`prewarm`] 共用，两路必须算出
+/// 同一份才能命中 solve 缓存 key）：前缀决策三元组（[`unanchored_prefix_decisions`]）+ hero 的 limp
+/// 启发式系数（[`hero_limp_coef`]）。翻前历史在一手内的翻后各街不变，每条街算出同一份系数。
+#[allow(clippy::too_many_arguments)]
+fn unanchored_range_inputs(
+    game: &SimplifiedNlheGame,
+    solver_cfg: &TableConfig,
+    smap: &SeatMap,
+    req: &Request,
+    scale: u64,
+    hero: SeatId,
+    hole: [Card; 2],
+    synced_node: NodeId,
+    limp: &LimpFoldMap,
+    limp_as_fold: bool,
+) -> (Vec<(NodeId, AbstractActionTag, PlayerId)>, HeroLimpCoef) {
+    let hero_pid = hero.0 as PlayerId;
+    let coef = hero_limp_coef(game, solver_cfg, smap, req, scale, hero, hole, limp_as_fold);
+    let raisers = limp_raisers(req, solver_cfg, scale, smap, limp, hero_pid);
+    let decisions =
+        unanchored_prefix_decisions(game, synced_node, limp, hero_pid, &coef.nodes, &raisers);
+    (decisions, coef)
 }
 
 /// 一次决策：重放本手历史（100BB real + abs 两态 lockstep）→ 我方决策点。`search == None` 时
@@ -2625,7 +2877,39 @@ fn chen_order_key(hole: [Card; 2]) -> (f64, bool, bool, u8, u8) {
 
 /// hero 底牌在 1326 个组合里按 [`chen_order_key`] 的位置：排在它前面的组合占比（`0.0` = 最强）。
 /// 手牌在「top p」范围内 ⇔ 返回值 `< p`。不做 card removal（范围是按位置定的常识值，精度够用）。
+/// 查表（进程内算一次）：算 hero range 系数时要对 1326 个组合各调一遍，逐次扫描太慢。结果与
+/// [`chen_top_fraction_scan`] 逐位相同；两张相同的牌（脏输入）查不了表，退回扫描。
 fn chen_top_fraction(hole: [Card; 2]) -> f64 {
+    static TABLE: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
+    let Some(idx) = combo_index(hole) else {
+        return chen_top_fraction_scan(hole);
+    };
+    TABLE.get_or_init(|| {
+        let keys: Vec<_> = all_hole_combos().into_iter().map(chen_order_key).collect();
+        let n = keys.len();
+        // 从强到弱排好后，一个组合前面「严格更强」的个数 = 它所在并列块的起点。
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&x, &y| {
+            keys[y]
+                .partial_cmp(&keys[x])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut frac = vec![0.0; n];
+        let mut block_start = 0usize;
+        for (rank, &k) in order.iter().enumerate() {
+            if rank > 0
+                && keys[k].partial_cmp(&keys[order[rank - 1]]) != Some(std::cmp::Ordering::Equal)
+            {
+                block_start = rank;
+            }
+            frac[k] = block_start as f64 / n as f64;
+        }
+        frac
+    })[idx]
+}
+
+/// [`chen_top_fraction`] 的逐个扫描版（查表的对照，以及脏输入的退路）。
+fn chen_top_fraction_scan(hole: [Card; 2]) -> f64 {
     let hero = chen_order_key(hole);
     let mut stronger = 0u32;
     let mut total = 0u32;
@@ -3414,14 +3698,34 @@ fn decide_search_unanchored(
     let n_seats = solver_cfg.n_seats as usize;
     let hand_seed = hand_seed_for(req, base_seed, n_seats);
     // 档一前缀 reach（生产默认开）：用已同步前缀估 range；off → None = uniform（byte-equal 旧行为）。
-    let prefix_decisions = rt.unanchored_prefix_reach.then(|| {
-        unanchored_prefix_decisions(game, synced_node, limp, my_seat_solver.0 as PlayerId)
+    // hero 由 limp 启发式决定的翻前步改乘 0/1 系数（[`unanchored_range_inputs`]，与预热同一函数）。
+    let range_inputs = rt.unanchored_prefix_reach.then(|| {
+        unanchored_range_inputs(
+            game,
+            solver_cfg,
+            smap,
+            req,
+            scale,
+            my_seat_solver,
+            hole,
+            synced_node,
+            limp,
+            rt.limp_as_fold,
+        )
     });
+    let prefix_decisions = range_inputs.as_ref().map(|(d, _)| d);
+    let hero_coef = range_inputs.as_ref().map(|(_, c)| c);
+    // 一致性检查失败（设计 §3.4）→ source 追加标记：实盘不开 --debug-log 也能看出这条路径失效。
+    let coef_mismatch_tag = if hero_coef.is_some_and(|c| c.mismatch) {
+        ":hero_coef_mismatch"
+    } else {
+        ""
+    };
     dlog!(
-        "unanchored prefix_decisions: count={} live_informed={:?} limp_folds={:?}",
-        prefix_decisions.as_ref().map_or(0, |d| d.len()),
+        "unanchored prefix_decisions: count={} live_informed={:?} limp_folds={:?} hero_coef(combos={:?} nodes={:?} mismatch={:?})",
+        prefix_decisions.map_or(0, |d| d.len()),
         // 前缀里有决策、且此刻仍未弃牌的座位（只有这些座位的范围不是均匀起点）。
-        prefix_decisions.as_ref().map(|d| {
+        prefix_decisions.map(|d| {
             let mut seats: Vec<PlayerId> = d
                 .iter()
                 .map(|&(_, _, s)| s)
@@ -3431,7 +3735,10 @@ fn decide_search_unanchored(
             seats.dedup();
             seats
         }),
-        limp.folds
+        limp.folds,
+        hero_coef.and_then(|c| c.coef.as_ref().map(|v| v.iter().filter(|&&x| x > 0.0).count())),
+        hero_coef.map(|c| &c.nodes),
+        hero_coef.map(|c| c.mismatch)
     );
     // 档二′-跨街复用（默认关）：上一街本身 unanchored、子树已解（within-round 缓存当前条目）时，复用其
     // σ 对 `prev_within`（上一街完整真实动作线）条件化得本街后验 range，覆盖档一前缀 reach。off / 缓存
@@ -3463,9 +3770,10 @@ fn decide_search_unanchored(
         solve_cache,
         0,
         |cache| {
-            let prefix_reach = prefix_decisions.as_ref().map(|d| PrefixReach {
+            let prefix_reach = prefix_decisions.map(|d| PrefixReach {
                 strategy: strategy_fn,
                 decisions: d,
+                hero_coef: hero_coef.and_then(|c| c.coef.as_deref()),
             });
             subgame_search_unanchored_cached_cross_exploit(
                 Some(cache), // within-round solve 缓存（同锚定路径；kind 进 key、两路不串条目）。
@@ -3493,7 +3801,10 @@ fn decide_search_unanchored(
                 hole,
                 board,
                 pot_odds_from_auth(&auth, solver_cfg),
-                giveup_source("unanchored", &reason),
+                format!(
+                    "{}{coef_mismatch_tag}",
+                    giveup_source("unanchored", &reason)
+                ),
             );
             resp.hero_visits = hero_visits;
             return resp;
@@ -3546,7 +3857,7 @@ fn decide_search_unanchored(
     let (mut resp, degrade) = action_to_response(solver_action, scale, &req.valid);
     if resp.source.is_empty() {
         resp.source = format!(
-            "search:unanchored{}{}",
+            "search:unanchored{}{}{coef_mismatch_tag}",
             if guarded.is_some() {
                 ":weak_commit_guard"
             } else {
@@ -5770,7 +6081,7 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(on.reason, "limp_as_fold:limper_continued");
-        let d = unanchored_prefix_decisions(&game, on.synced_node, &on.limp, 0);
+        let d = unanchored_prefix_decisions(&game, on.synced_node, &on.limp, 0, &[], &[]);
         let seat_tags: Vec<(PlayerId, AbstractActionTag)> =
             d.iter().map(|&(_, t, s)| (s, t)).collect();
         assert!(
@@ -5852,7 +6163,7 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(e.reason, "limp_as_fold:limper_in_pot");
-        let d = unanchored_prefix_decisions(&game, e.synced_node, &e.limp, 1);
+        let d = unanchored_prefix_decisions(&game, e.synced_node, &e.limp, 1, &[], &[]);
         let seat_tags: Vec<(PlayerId, AbstractActionTag)> =
             d.iter().map(|&(_, t, s)| (s, t)).collect();
         for want in [
@@ -5910,7 +6221,7 @@ mod tests {
             "SB 弃牌后影子已结束"
         );
         let raw = synced_prefix_decisions(&game, e.synced_node);
-        let kept = unanchored_prefix_decisions(&game, e.synced_node, &e.limp, 0);
+        let kept = unanchored_prefix_decisions(&game, e.synced_node, &e.limp, 0, &[], &[]);
         assert!(raw
             .iter()
             .any(|&(_, t, s)| s == 0 && t == AbstractActionTag::Fold));
@@ -5941,6 +6252,524 @@ mod tests {
         let r = decide(&game, &abs, &skew, &req, 0x0E1, Some(&rt), &mut cache);
         assert!(r.source.contains("unanchored"), "{r:?}");
         assert_eq!((cache.misses(), cache.hits()), (1, 1), "决策须命中预热");
+    }
+
+    /// limp 池 hero 系数测试共用：6 座（button=0）真栈重放的入参。
+    fn coef_ctx(req: &Request) -> (TableConfig, SeatMap, SeatId, [Card; 2]) {
+        let smap = seat_map(req, 6).expect("seat_map");
+        let hole = [
+            parse_card(&req.hole[0]).unwrap(),
+            parse_card(&req.hole[1]).unwrap(),
+        ];
+        (
+            TableConfig::default_6max_100bb(),
+            smap,
+            SeatId(req.my_seat),
+            hole,
+        )
+    }
+
+    fn coef_for(game: &SimplifiedNlheGame, req: &Request) -> HeroLimpCoef {
+        let (cfg, smap, hero, hole) = coef_ctx(req);
+        hero_limp_coef(game, &cfg, &smap, req, 5, hero, hole, true)
+    }
+
+    fn nonzero(c: &HeroLimpCoef) -> Vec<[Card; 2]> {
+        let holes = all_hole_combos();
+        let v = c.coef.as_ref().expect("应有系数");
+        assert!(v.iter().all(|&x| x == 0.0 || x == 1.0), "系数须是 0/1");
+        holes
+            .iter()
+            .zip(v)
+            .filter(|(_, &x)| x > 0.0)
+            .map(|(&h, _)| h)
+            .collect()
+    }
+
+    /// 例子 #580 形状：BTN 平跟、SB 加注、hero（BB）按 limp 规则跟注；BTN 再 3bet
+    /// （`limp_as_fold:limper_continued`）、hero 又跟注；翻牌 hero 先行动。
+    fn hand580_acts() -> Vec<HistAction> {
+        vec![
+            hist(3, "fold", None),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "call", Some(20)),
+            hist(1, "raise", Some(60)),
+            hist(2, "call", Some(60)),
+            hist(0, "raise", Some(200)),
+            hist(1, "fold", None),
+            hist(2, "call", Some(200)),
+        ]
+    }
+
+    /// 查表版 [`chen_top_fraction`] 与逐个扫描逐位相同；[`combo_index`] 与 [`all_hole_combos`] 对齐。
+    #[test]
+    fn chen_top_fraction_table_matches_scan() {
+        for (k, h) in all_hole_combos().into_iter().enumerate() {
+            assert_eq!(combo_index(h), Some(k));
+            assert_eq!(combo_index([h[1], h[0]]), Some(k), "顺序无关");
+            assert_eq!(
+                chen_top_fraction(h).to_bits(),
+                chen_top_fraction_scan(h).to_bits(),
+                "{h:?}"
+            );
+        }
+        let c = Card::from_u8(7).unwrap();
+        assert_eq!(combo_index([c, c]), None);
+    }
+
+    /// 重建的 `valid` 与实盘请求里服务器给的一致（2026-10-22 bp2 实盘 9 座翻前记录原样）。
+    #[test]
+    fn valid_from_legal_matches_live_requests() {
+        let mk = |hole: [&str; 2],
+                  button: u8,
+                  me: u8,
+                  acts: Vec<HistAction>,
+                  valid: (u64, u64),
+                  stacks: Vec<u64>,
+                  dealt: Vec<u8>| Request {
+            hole: vec![hole[0].into(), hole[1].into()],
+            board: vec![],
+            button_seat: button,
+            my_seat: me,
+            num_seats: 9,
+            small_blind: 10,
+            big_blind: 20,
+            actions: acts,
+            valid: ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: true,
+                min_raise: Some(valid.0),
+                max_raise: Some(valid.1),
+            },
+            stacks,
+            dealt_seats: dealt,
+            names: Default::default(),
+        };
+        let reqs = [
+            mk(
+                ["8h", "Jd"],
+                3,
+                5,
+                vec![
+                    hist(6, "fold", None),
+                    hist(7, "fold", None),
+                    hist(0, "fold", None),
+                    hist(1, "raise", Some(40)),
+                    hist(2, "fold", None),
+                    hist(3, "fold", None),
+                    hist(4, "fold", None),
+                ],
+                (60, 2000),
+                vec![43042, 3275, 1970, 1481, 2688, 2000, 48829, 2000, 2000],
+                vec![0, 1, 2, 3, 4, 5, 6, 7],
+            ),
+            mk(
+                ["9s", "Jc"],
+                2,
+                4,
+                vec![
+                    hist(6, "call", None),
+                    hist(7, "fold", None),
+                    hist(0, "fold", None),
+                    hist(1, "raise", Some(90)),
+                    hist(2, "fold", None),
+                    hist(3, "fold", None),
+                ],
+                (160, 2786),
+                vec![44619, 6374, 4018, 2571, 2786, 2000, 44097, 2310, 2000],
+                vec![0, 1, 2, 3, 4, 6, 7],
+            ),
+            mk(
+                ["7h", "4h"],
+                0,
+                4,
+                vec![hist(3, "call", None)],
+                (40, 2204),
+                vec![45018, 7296, 4000, 1752, 2204, 2170, 45820, 1042, 2000],
+                vec![0, 1, 2, 3, 4, 5, 6, 7],
+            ),
+        ];
+        let cfg = TableConfig::n_max_at_bb(9, 100);
+        for req in &reqs {
+            let smap = seat_map(req, 9).expect("seat_map");
+            let hero = SeatId(smap.tree_seat(req.my_seat).unwrap());
+            let hole = [
+                parse_card(&req.hole[0]).unwrap(),
+                parse_card(&req.hole[1]).unwrap(),
+            ];
+            let (auth, ..) =
+                build_real_auth(req, &cfg, 5, &smap, hero, hole, &[], true).expect("真栈重放");
+            assert_eq!(
+                valid_from_legal(&auth.legal_actions(), 5),
+                req.valid,
+                "{req:?}"
+            );
+        }
+    }
+
+    /// #580：面对加注时 hero 的范围正好是 P 档 56 个组合；hero 跟注 SB 加注那一步（已同步前缀里的
+    /// blueprint Call）和 BTN（平跟后又 3bet）的映射弃牌步都从前缀里拿掉，SB 的加注保留。
+    #[test]
+    fn hero_limp_coef_facing_raise_is_p_tier_and_prefix_adjusted() {
+        let game = nolimp_game();
+        let req = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks"], hand580_acts());
+        let c = coef_for(&game, &req);
+        assert!(!c.mismatch, "{c:?}");
+        let combos = nonzero(&c);
+        assert_eq!(combos.len(), 56);
+        assert!(combos.iter().all(|&h| limp_hand_tier(h) == 2));
+        assert_eq!(c.nodes.len(), 1, "只有第一次跟注时影子仍同步：{c:?}");
+
+        let e = replay_limp(&game, &req, Some(SeatId(2)), true)
+            .err()
+            .unwrap();
+        assert_eq!(e.reason, "limp_as_fold:limper_continued");
+        let raw = synced_prefix_decisions(&game, e.synced_node);
+        assert!(raw.iter().any(|&(n, _, s)| s == 2 && n == c.nodes[0]));
+        assert!(raw
+            .iter()
+            .any(|&(_, t, s)| s == 0 && t == AbstractActionTag::Fold));
+        let (cfg, smap, hero, hole) = coef_ctx(&req);
+        let (kept, c2) = unanchored_range_inputs(
+            &game,
+            &cfg,
+            &smap,
+            &req,
+            5,
+            hero,
+            hole,
+            e.synced_node,
+            &e.limp,
+            true,
+        );
+        assert_eq!(c2, c);
+        assert!(!kept.iter().any(|&(_, _, s)| s == 2), "{kept:?}");
+        assert!(!kept.iter().any(|&(_, _, s)| s == 0), "{kept:?}");
+        assert!(
+            kept.iter().any(|&(_, t, s)| s == 1
+                && t != AbstractActionTag::Fold
+                && t != AbstractActionTag::Call),
+            "SB 加注须保留：{kept:?}"
+        );
+        assert_eq!(kept.len(), raw.len() - 2);
+    }
+
+    /// 一致性检查（设计 §3.4）：hero 真实底牌按规则做不出实际动作 → 该步不用系数、退回旧做法，打标记。
+    #[test]
+    fn hero_limp_coef_mismatch_falls_back() {
+        let game = nolimp_game();
+        let req = limp_req(2, ["8h", "3d"], &["7h", "2c", "Ks"], hand580_acts());
+        let c = coef_for(&game, &req);
+        assert_eq!(
+            c,
+            HeroLimpCoef {
+                coef: None,
+                nodes: vec![],
+                mismatch: true
+            }
+        );
+        let e = replay_limp(&game, &req, Some(SeatId(2)), true)
+            .err()
+            .unwrap();
+        let (cfg, smap, hero, hole) = coef_ctx(&req);
+        let (kept, _) = unanchored_range_inputs(
+            &game,
+            &cfg,
+            &smap,
+            &req,
+            5,
+            hero,
+            hole,
+            e.synced_node,
+            &e.limp,
+            true,
+        );
+        assert!(
+            kept.iter()
+                .any(|&(_, t, s)| s == 2 && t == AbstractActionTag::Call),
+            "hero 那一步退回 blueprint σ：{kept:?}"
+        );
+    }
+
+    /// 赔率下限命中（三家平跟后最小加注）→ 所有牌都跟，系数全 1。
+    #[test]
+    fn hero_limp_coef_pot_odds_floor_all_ones() {
+        let game = nolimp_game();
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "call", Some(20)),
+            hist(5, "call", Some(20)),
+            hist(0, "raise", Some(40)),
+            hist(1, "fold", None),
+            hist(2, "call", Some(40)),
+            hist(3, "call", Some(40)),
+            hist(4, "call", Some(40)),
+            hist(5, "call", Some(40)),
+        ];
+        let req = limp_req(2, ["8h", "3d"], &["7h", "2c", "Ks"], acts);
+        let c = coef_for(&game, &req);
+        assert!(!c.mismatch, "{c:?}");
+        assert_eq!(nonzero(&c).len(), 1326);
+    }
+
+    /// 未加注的平跟池：BB 过牌 = 隔离加注档以外的牌；BTN 跟着平跟 = 隔离档与被动上限之间的牌——
+    /// 牌数与 [`limp_ranges_for`] 一致。
+    #[test]
+    fn hero_limp_coef_unraised_matches_limp_ranges() {
+        let game = nolimp_game();
+        let count = |lo: f64, hi: f64| {
+            all_hole_combos()
+                .into_iter()
+                .filter(|&h| (lo..hi).contains(&chen_top_fraction(h)))
+                .count()
+        };
+        let bb_acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+            hist(2, "check", None),
+        ];
+        let c = coef_for(
+            &game,
+            &limp_req(2, ["8h", "3d"], &["7h", "2c", "Ks"], bb_acts),
+        );
+        let (iso, _) = limp_ranges_for(LimpPos::Bb, 1);
+        assert_eq!(nonzero(&c).len(), count(iso, 1.1), "{c:?}");
+
+        let btn_acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "call", Some(20)),
+            hist(1, "fold", None),
+            hist(2, "check", None),
+            hist(2, "check", None),
+            hist(3, "check", None),
+        ];
+        let c = coef_for(
+            &game,
+            &limp_req(0, ["9s", "6s"], &["7h", "2c", "Ks"], btn_acts),
+        );
+        let (iso, passive) = limp_ranges_for(LimpPos::Btn, 1);
+        assert_eq!(nonzero(&c).len(), count(iso, passive), "{c:?}");
+        assert_eq!(
+            c.nodes.len(),
+            1,
+            "hero 跟入平跟那一步（映射弃牌节点）：{c:?}"
+        );
+    }
+
+    /// 没有平跟的手牌：没有系数，前缀与改前逐位相同。
+    #[test]
+    fn hero_limp_coef_none_without_limp() {
+        let game = nolimp_game();
+        let acts = vec![
+            hist(3, "raise", Some(60)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+            hist(2, "call", Some(60)),
+        ];
+        let req = limp_req(2, ["8h", "3d"], &["7h", "2c", "Ks"], acts);
+        assert_eq!(coef_for(&game, &req), HeroLimpCoef::default());
+    }
+
+    /// 设计 §3.5：两个平跟者，第一个平跟后只跟注（触发 `limper_continued`）、第二个平跟后再加注 →
+    /// 只去掉第二个人的映射弃牌步（lockstep 已停，这一步不在 `LockstepErr` 里，须扫整段翻前历史）。
+    #[test]
+    fn limp_raisers_scans_whole_preflop() {
+        let game = nolimp_game();
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "call", Some(20)),
+            hist(5, "fold", None),
+            hist(0, "raise", Some(100)),
+            hist(1, "fold", None),
+            hist(2, "fold", None),
+            hist(3, "call", Some(100)),
+            hist(4, "raise", Some(400)),
+            hist(0, "call", Some(400)),
+            hist(3, "fold", None),
+            hist(4, "check", None),
+        ];
+        let req = limp_req(0, ["Ah", "Kd"], &["7h", "2c", "Ks"], acts);
+        let e = replay_limp(&game, &req, Some(SeatId(0)), true)
+            .err()
+            .unwrap();
+        assert_eq!(e.reason, "limp_as_fold:limper_continued");
+        assert_eq!(e.limp.folds.len(), 2, "{:?}", e.limp);
+        let (cfg, smap, hero, hole) = coef_ctx(&req);
+        assert_eq!(limp_raisers(&req, &cfg, 5, &smap, &e.limp, 0), vec![4]);
+        let (kept, c) = unanchored_range_inputs(
+            &game,
+            &cfg,
+            &smap,
+            &req,
+            5,
+            hero,
+            hole,
+            e.synced_node,
+            &e.limp,
+            true,
+        );
+        assert!(kept
+            .iter()
+            .any(|&(_, t, s)| s == 3 && t == AbstractActionTag::Fold));
+        assert!(!kept
+            .iter()
+            .any(|&(_, t, s)| s == 4 && t == AbstractActionTag::Fold));
+        // hero：隔离加注（Chen 前 24%）× 面对再加注只跟 P 档 = P 档。
+        assert!(!c.mismatch, "{c:?}");
+        assert_eq!(nonzero(&c).len(), 56);
+    }
+
+    /// 每条街算出同一份 hero 系数（翻牌放弃搜索后转牌回到前缀估算，也要带系数，设计 §4.3）。
+    #[test]
+    fn hero_limp_coef_same_on_turn() {
+        let game = nolimp_game();
+        let flop = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks"], hand580_acts());
+        let mut acts = hand580_acts();
+        acts.push(hist(2, "check", None));
+        acts.push(hist(0, "check", None));
+        let turn = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks", "4d"], acts);
+        let inputs = |req: &Request| {
+            let e = replay_limp(&game, req, Some(SeatId(2)), true)
+                .err()
+                .unwrap();
+            let (cfg, smap, hero, hole) = coef_ctx(req);
+            unanchored_range_inputs(
+                &game,
+                &cfg,
+                &smap,
+                req,
+                5,
+                hero,
+                hole,
+                e.synced_node,
+                &e.limp,
+                true,
+            )
+        };
+        let (d_flop, c_flop) = inputs(&flop);
+        let (d_turn, c_turn) = inputs(&turn);
+        assert!(c_flop.coef.is_some());
+        assert_eq!(c_turn, c_flop);
+        assert_eq!(d_turn, d_flop);
+    }
+
+    /// [`hero_limp_route`] 与 [`decide`] 的翻前分流同口径：hero 在这一步走 limp 启发式 ⇔ 判为 limp 步。
+    #[test]
+    fn hero_limp_route_matches_decide() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 100,
+            ..SubgameSearchConfig::default()
+        };
+        let a580 = hand580_acts();
+        let cases: Vec<(u8, Vec<HistAction>, bool)> = vec![
+            (2, a580[..5].to_vec(), true), // #580 第一次跟注（同步、有映射）
+            (2, a580[..8].to_vec(), true), // #580 跟 3bet（失同步）
+            (
+                2,
+                vec![
+                    hist(3, "call", Some(20)),
+                    hist(4, "fold", None),
+                    hist(5, "fold", None),
+                    hist(0, "fold", None),
+                    hist(1, "fold", None),
+                ],
+                true,
+            ),
+            (
+                2,
+                vec![
+                    hist(3, "raise", Some(60)),
+                    hist(4, "fold", None),
+                    hist(5, "fold", None),
+                    hist(0, "fold", None),
+                    hist(1, "fold", None),
+                ],
+                false,
+            ),
+        ];
+        for limp_as_fold in [true, false] {
+            let rt = SearchRuntime {
+                limp_as_fold,
+                ..rt_prefix_reach(scfg)
+            };
+            for (me, acts, _) in &cases {
+                let mut req = limp_req(*me, ["Qs", "Qd"], &[], acts.clone());
+                let (cfg, smap, hero, hole) = coef_ctx(&req);
+                let (auth, ..) =
+                    build_real_auth(&req, &cfg, 5, &smap, hero, hole, &[], true).unwrap();
+                req.valid = valid_from_legal(&auth.legal_actions(), 5);
+                let route = hero_limp_route(&game, &cfg, &smap, &req, 5, hero, hole, limp_as_fold);
+                let resp = decide(
+                    &game,
+                    &abs,
+                    &uniform,
+                    &req,
+                    1,
+                    Some(&rt),
+                    &mut SubgameSolveCache::new(),
+                );
+                assert_eq!(
+                    resp.source.starts_with("limp_heuristic"),
+                    route.is_some(),
+                    "limp_as_fold={limp_as_fold} acts={acts:?} resp={resp:?} route={route:?}"
+                );
+            }
+        }
+        // 期望值本身（有平跟 ⇔ 启发式）在 limp_as_fold 开时成立。
+        for (me, acts, want) in &cases {
+            let req = limp_req(*me, ["Qs", "Qd"], &[], acts.clone());
+            let (cfg, smap, hero, hole) = coef_ctx(&req);
+            let route = hero_limp_route(&game, &cfg, &smap, &req, 5, hero, hole, true);
+            assert_eq!(route.is_some(), *want, "{acts:?}");
+        }
+    }
+
+    /// #580 形状的预热与决策算出同一份 range（含 hero 系数）→ 决策命中预热；一致性检查失败时
+    /// source 带 `:hero_coef_mismatch`。
+    #[test]
+    fn hero_limp_coef_prewarm_hits_and_mismatch_tag() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::FlopFirstUnraised,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let rt = rt_limp_as_fold(scfg);
+        let req = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks"], hand580_acts());
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(&game, &uniform, &req, 0x580, Some(&rt), &mut cache);
+        assert_eq!(p.source, "prewarm:stored", "{p:?}");
+        let r = decide(&game, &abs, &uniform, &req, 0x580, Some(&rt), &mut cache);
+        assert!(r.source.contains("unanchored"), "{r:?}");
+        assert!(!r.source.contains("hero_coef_mismatch"), "{r:?}");
+        assert_eq!((cache.misses(), cache.hits()), (1, 1), "决策须命中预热");
+
+        let bad = limp_req(2, ["8h", "3d"], &["7h", "2c", "Ks"], hand580_acts());
+        let r = decide(
+            &game,
+            &abs,
+            &uniform,
+            &bad,
+            0x580,
+            Some(&rt),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(r.source.ends_with(":hero_coef_mismatch"), "{r:?}");
     }
 
     /// [`limp_heuristic`] **有人加注**分支（含 hero raise 后被 re-raise 的递归终止格）：

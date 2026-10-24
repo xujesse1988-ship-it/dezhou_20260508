@@ -63,6 +63,11 @@ k=6/7/8/9 = 557k / 3.07M / 15.5M / 72.6M 节点,单加注池 9-way 1.47M;≥7 �
 翻前 / 未开搜索走兜底 `fallback:blueprint_placeholder`;range 估计对空 σ 本就按 1/n,不变);② driver 对不带 amount
 的 all_in 按 `stack_before` 补投入、剩余栈记 0(修前起始栈被算成只剩已投入部分,run3 一手 BB 算成 44 → 搜索放弃)。
 
+**平跟池 hero 范围按 limp 规则算(2026-10-24)**。脱锚搜索估范围时,hero 翻前由 `limp_heuristic` 决定的步不再乘 blueprint σ,
+改拿同一个启发式对 1326 个组合各算一遍得 0/1 系数(`PrefixReach::hero_coef`);对手平跟后翻前又加注的,去掉他的映射弃牌步。
+修的是平跟池 hero 真实手牌权重接近 0 → 访问次数不够 → 放弃搜索(115653 批次 23 次里 14 次)。尚未离线重放 / 上实盘。
+详见 `temp/limp_heuristic_hero_range_design_2026_10_24.md`。
+
 **搜索读数门槛 + 弱牌押上全部筹码护栏(2026-10-19)**。起因:实盘 65c 在 3h9d8s 面对 2 倍池下注,搜索给 allin 0.55
 推掉 100BB(对手暗三条);同一请求换 3 个种子 allin = 0.55 / 0.09 / 0.002,该信息集没解稳。① `EsMccfrTrainer::with_visit_counts`
 记每个信息集作为遍历者的访问数(只记账,regret / σ / rng 逐位不变),子博弈求解一律开;`read_current_strategy` 加门槛

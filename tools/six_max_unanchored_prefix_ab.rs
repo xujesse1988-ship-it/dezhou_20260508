@@ -421,6 +421,7 @@ fn unanchored_applied(
         let prefix = prefix_dec.as_ref().map(|d| PrefixReach {
             strategy: strat,
             decisions: d,
+            hero_coef: None,
         });
         let solved = subgame_search_unanchored_cached(
             None,

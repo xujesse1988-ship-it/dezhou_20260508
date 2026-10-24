@@ -1,6 +1,6 @@
 # limp 池里 hero 自己的范围：按 limp 规则算（方案 A）设计
 
-日期：2026-10-24。状态：设计，未实现。
+日期：2026-10-24。状态：代码已实现（实现记录见 §9），待离线重放和实盘验证。
 
 相关文档：
 - `docs/temp/openpoker_limp_handling_research_2026_10_16.md`（limp 规则与平跟当弃牌映射的由来）
@@ -171,3 +171,23 @@ hero 真实手牌的系数必须是 1（实际就是用这手牌按规则做出�
 - DeepStack: Expert-Level Artificial Intelligence in No-Limit Poker（自己范围的贝叶斯更新）：https://ar5iv.labs.arxiv.org/html/1701.01724
 - Billings et al., Opponent Modeling in Poker (AAAI-98)（对手权重表与下限）：https://www.cs.ualberta.ca/~games/poker/publications/AAAI98.pdf
 - Davidson et al., Improved Opponent Modeling in Poker (ICAI 2000)：https://www.cs.ualberta.ca/~games/poker/publications/ICAI00.pdf
+
+## 9. 实现记录（2026-10-24）
+
+代码在 `tools/openpoker_advisor.rs` 和 `src/training/subgame.rs`，和设计的出入、实现时定下的细节如下。
+
+- **入口**：`unanchored_range_inputs` 一次算出前缀决策和 hero 系数，脱锚决策 `decide_search_unanchored` 和预热 `prewarm_inner` 都只调它。只在 `--search-unanchored-prefix-reach` 开时算（关时本来就是均匀）。
+- **分流**：`hero_limp_route` 照 `decide_with` 的翻前分流写（全下启发式优先 → lockstep 成功且有映射 → 失同步且 `structural_gap` 或有映射）。测试 `hero_limp_route_matches_decide` 在 `--search-limp-as-fold` 开 / 关两种设置下比对 decide 的实际 `source`，改 decide 分流时会报错。
+  `--search-limp-as-fold` 关时，平跟池 hero 的步走 `structural_gap` 分支，同样会算系数。原来这种局面前缀为空、整段退均匀，现在 hero 有系数、对手仍是均匀。
+- **前缀里去掉的步**：hero 用上系数的步（重放到那一步时影子仍同步才有节点，失同步之后的步本来就不在前缀里）；hero 自己的映射弃牌步（旧规则，一致性检查失败时也保留，退回的就是旧做法）；平跟后翻前又加注的对手的映射弃牌步（`limp_raisers`，复用剥削那边的 `preflop_entry_kinds`，`all_in` 算加注）。
+- **`valid` 重建**（`valid_from_legal`）：只认加注 / 下注区间。最初写成「只剩全下也算能加注」，用 2026-10-19~22 本地实盘日志 15964 条翻前请求核对，有 5 条不一致：只够全下、全下额又不到最小加注时，服务器给的是 `can_raise=false`。去掉这条分支后 15962 条逐字段一致；剩下 2 条是同一手大盲只剩 1 筹码的怪局，只差最小加注额，不影响启发式（它只看能不能加注）。
+- **hero 系数和 blueprint 前缀相乘全为零**时（两边互相矛盾），保留乘之前的范围，不让 hero 变成「无信号」退均匀（`apply_hero_coef`）。
+- **一致性检查失败**：`source` 末尾加 `:hero_coef_mismatch`，放弃搜索时（`search_giveup:*`）也加。
+- **调试日志**：advisor 的 `unanchored prefix_decisions` 一行加了 `hero_coef(combos= nodes= mismatch=)`；subgame 的 `unanchored solve` 一行加了 `hero_coef=`。
+- **`chen_top_fraction`** 改成查表（`OnceLock`），测试逐位比对旧的逐个扫描版（保留为 `chen_top_fraction_scan`，也是两张相同牌这种脏输入的退路）。
+- **接口**：`PrefixReach` 加了 `hero_coef: Option<&[f64]>`，`all_hole_combos` 改为 `pub`（advisor 按它的下标排系数）。其他调用方一律传 `None`，行为不变。
+
+测试（都已按测试名逐个跑过、套 1.2G 内存限制）：advisor 新增 11 个（`chen_top_fraction_table_matches_scan`、`valid_from_legal_matches_live_requests`、`hero_limp_coef_*` 7 个、`limp_raisers_scans_whole_preflop`、`hero_limp_route_matches_decide`），subgame 新增 2 个（`unanchored_prefix_reach_empty_with_hero_coef_builds_ranges`、`apply_hero_coef_multiplies_and_keeps_on_zero`）；原有平跟 / 前缀相关的 11 个照常通过。
+
+还没做：§6.2 的离线重放（115653 批次放弃搜索的 14 次、10-21 的 KK / AKo）要用服务器上的日志和 blueprint，本机没有；§6.3 实盘。
+

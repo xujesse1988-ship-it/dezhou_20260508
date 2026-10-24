@@ -1173,7 +1173,7 @@ const SOLVE_PARALLEL_BATCH: u64 = 16;
 // --- §5b：blueprint range 估计（per-seat marginal，逐街 re-bucket，沿历史累乘 reach） ---
 
 /// 全部 1326 个具体两张底牌组合（升序 card id 对）；下标即 range 向量的 hole 索引。
-pub(crate) fn all_hole_combos() -> Vec<[Card; 2]> {
+pub fn all_hole_combos() -> Vec<[Card; 2]> {
     let mut v = Vec::with_capacity(1326);
     for a in 0u8..52 {
         for b in (a + 1)..52 {
@@ -1230,9 +1230,16 @@ fn decisions_on_path(
 /// 内部按 [`ResolveRoot::RoundStart`] 只用**当前街之前**的决策（当前街 betting 由 CFR 解，§2）。
 /// `strategy` = actor 的 blueprint average strategy（同质 blueprint 假设，[`estimate_range`] doc）。
 /// `None` = uniform 先验（既有行为，byte-equal）。
+///
+/// `hero_coef`（`limp_heuristic_hero_range_design_2026_10_24` §3.3）：hero 座逐组合的额外系数
+/// （下标对齐 [`all_hole_combos`]），在 `estimate_range` 算完 hero 后乘上再归一——用于 hero 某些步
+/// 不是 blueprint 做的（advisor 翻前 limp 启发式），这些步已从 `decisions` 里去掉、改由系数表达。
+/// 只作用于 hero，hero 仍不混 uniform（[`mix_lambda_for_seat`]）。`Some` 时即使 `decisions` 里没有
+/// 当前街之前的决策也照样构造 range（否则系数会被 uniform 退路吞掉）。`None` = 旧行为逐位不变。
 pub struct PrefixReach<'a> {
     pub strategy: &'a dyn Fn(&InfoSetId, usize) -> Vec<f64>,
     pub decisions: &'a [(NodeId, AbstractActionTag, PlayerId)],
+    pub hero_coef: Option<&'a [f64]>,
 }
 
 /// 档一前缀 reach：从失同步时**已同步**的影子 `synced_node`（lockstep 闭包在断点前的
@@ -1330,6 +1337,22 @@ fn mix_lambda_for_seat(seat: PlayerId, hero: PlayerId, lambda: f64) -> f64 {
         0.0
     } else {
         lambda
+    }
+}
+
+/// hero 座 range 逐组合乘 [`PrefixReach::hero_coef`] 后重新归一。乘完全零（系数与 blueprint 前缀
+/// 互相矛盾）或长度不符 → 保留原 range：全零会被下游当「无信号」退均匀，比不乘更糟。
+fn apply_hero_coef(range: &mut [f64], coef: &[f64]) {
+    debug_assert_eq!(range.len(), coef.len(), "hero_coef 须对齐 all_hole_combos");
+    if range.len() != coef.len() {
+        return;
+    }
+    let prod: Vec<f64> = range.iter().zip(coef).map(|(r, c)| r * c).collect();
+    let sum: f64 = prod.iter().sum();
+    if sum > 0.0 {
+        for (r, p) in range.iter_mut().zip(prod) {
+            *r = p / sum;
+        }
     }
 }
 
@@ -3344,6 +3367,8 @@ fn subgame_search_unanchored_cached_inner(
     // blueprint σ。crop blueprint（`blueprint_max_street` < River）下档一前缀若含被裁掉街的决策
     // （口径同 estimate_range：未弃牌座、跳过 AllIn-tag）→ `Err(BLUEPRINT_CROPPED_ERR…)`——不把那段
     // 前缀当「无信息」悄悄丢掉（那等于改了先验语义），由调用方补解上一街或显式降级。
+    // 调试：hero 系数是否参与（跨街后验命中时档一整段不算，系数自然不参与）。
+    let hero_coef_on = !cross_hit && prefix_reach.as_ref().is_some_and(|p| p.hero_coef.is_some());
     let prefix_ranges: Option<Vec<Vec<f64>>> = match (cross_hit, prefix_reach) {
         (true, _) | (false, None) => None,
         (false, Some(pr)) => {
@@ -3355,7 +3380,7 @@ fn subgame_search_unanchored_cached_inner(
                 .filter(|(nid, _, _)| (tree.node(*nid).street as u8) < cur)
                 .copied()
                 .collect();
-            if prior.is_empty() {
+            if prior.is_empty() && pr.hero_coef.is_none() {
                 None // 前缀无当前街之前的决策 → 退 uniform（byte-equal）。
             } else {
                 let holes = all_hole_combos();
@@ -3381,6 +3406,11 @@ fn subgame_search_unanchored_cached_inner(
                                     &holes,
                                     true, // 档一：跳过 AllIn-tag（100BB shove 语义，off-100BB 撒谎）。
                                 );
+                                if seat as PlayerId == auth_actor {
+                                    if let Some(coef) = pr.hero_coef {
+                                        apply_hero_coef(&mut r, coef);
+                                    }
+                                }
                                 mix_range_with_uniform(
                                     &mut r,
                                     &holes,
@@ -3440,7 +3470,7 @@ fn subgame_search_unanchored_cached_inner(
         };
         eprintln!(
             "[dbg-subgame] unanchored solve: street={:?} hero_seat={auth_actor} entrants={entrants:#08b} \
-             hand_seed={hand_seed} range_src={src} exploit={exploit_active} deep_menu={} range_mix={}",
+             hand_seed={hand_seed} range_src={src} hero_coef={hero_coef_on} exploit={exploit_active} deep_menu={} range_mix={}",
             root_state.street(),
             cfg.deep_menu,
             cfg.range_uniform_mix
@@ -6774,6 +6804,7 @@ mod tests {
         let prefix = PrefixReach {
             strategy: &strat,
             decisions: &empty,
+            hero_coef: None,
         };
         let with_empty = subgame_search_unanchored_cached(
             None,
@@ -6794,6 +6825,62 @@ mod tests {
             format!("{uniform:?}"),
             "空前缀须与 uniform 路径 byte-equal"
         );
+    }
+
+    /// hero 系数（`limp_heuristic_hero_range_design_2026_10_24` §4.2）：前缀为空但带 `hero_coef` 时
+    /// 不能退 uniform（否则系数被悄悄吞掉）→ 照样构造 range、进 key → 与 uniform 不同 key 必 miss；
+    /// 同一份系数再解一次命中（预热 / 决策同 key 的前提）。
+    #[test]
+    fn unanchored_prefix_reach_empty_with_hero_coef_builds_ranges() {
+        let game = nolimp_6max_game();
+        let auth = offstack_allin_flop_state();
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let empty: Vec<(NodeId, AbstractActionTag, PlayerId)> = Vec::new();
+        // 只留前一半组合（任意非均匀 0/1 系数即可）。
+        let coef: Vec<f64> = (0..1326).map(|i| f64::from(u8::from(i < 663))).collect();
+        let mut cache = SubgameSolveCache::new();
+        let run = |cache: &mut SubgameSolveCache, hero_coef: Option<&[f64]>| {
+            subgame_search_unanchored_cached(
+                Some(cache),
+                &auth,
+                &auth,
+                &game,
+                &[],
+                &cfg,
+                None,
+                Some(PrefixReach {
+                    strategy: &strat,
+                    decisions: &empty,
+                    hero_coef,
+                }),
+                0xE112,
+            )
+            .expect("应 Ok")
+        };
+        run(&mut cache, None);
+        run(&mut cache, Some(&coef));
+        assert_eq!((cache.misses(), cache.hits()), (2, 0), "hero 系数须进 key");
+        run(&mut cache, Some(&coef));
+        assert_eq!((cache.misses(), cache.hits()), (2, 1), "同一份系数须命中");
+    }
+
+    /// [`apply_hero_coef`]：逐组合相乘后归一；乘完全零 → 保留原 range（不变成「无信号」）。
+    #[test]
+    fn apply_hero_coef_multiplies_and_keeps_on_zero() {
+        let mut r = vec![0.25, 0.25, 0.5, 0.0];
+        apply_hero_coef(&mut r, &[1.0, 0.0, 1.0, 1.0]);
+        let want = [0.25 / 0.75, 0.0, 0.5 / 0.75, 0.0];
+        for (a, b) in r.iter().zip(want) {
+            assert!((a - b).abs() < 1e-12, "{r:?}");
+        }
+        let mut r2 = vec![0.5, 0.5, 0.0, 0.0];
+        apply_hero_coef(&mut r2, &[0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(r2, vec![0.5, 0.5, 0.0, 0.0], "全零 → 保留原 range");
     }
 
     /// 档一：前缀**非空**（off-stack 已同步前缀 = UTG all-in + 3 fold，全 preflop）→ 算出的
@@ -6837,6 +6924,7 @@ mod tests {
             Some(PrefixReach {
                 strategy: &strat,
                 decisions: &decisions,
+                hero_coef: None,
             }),
             0xE333,
         )
@@ -6860,6 +6948,7 @@ mod tests {
             Some(PrefixReach {
                 strategy: &strat,
                 decisions: &decisions,
+                hero_coef: None,
             }),
             0xE333,
         )
@@ -6897,6 +6986,7 @@ mod tests {
             Some(PrefixReach {
                 strategy: &strat,
                 decisions: &decisions,
+                hero_coef: None,
             }),
             &cfg,
             None,
@@ -6915,6 +7005,7 @@ mod tests {
             Some(PrefixReach {
                 strategy: &strat,
                 decisions: &decisions,
+                hero_coef: None,
             }),
             0xE555,
         )
@@ -6935,6 +7026,7 @@ mod tests {
             Some(PrefixReach {
                 strategy: &strat,
                 decisions: &decisions,
+                hero_coef: None,
             }),
             0xE555,
         )
@@ -7079,6 +7171,7 @@ mod tests {
             Some(PrefixReach {
                 strategy: strat,
                 decisions,
+                hero_coef: None,
             }),
             hand_seed,
         )
@@ -7256,6 +7349,7 @@ mod tests {
             Some(PrefixReach {
                 strategy: &strat,
                 decisions: &decisions,
+                hero_coef: None,
             }),
             Some(&flop_within),
             hand_seed,
@@ -7272,6 +7366,7 @@ mod tests {
             Some(PrefixReach {
                 strategy: &strat,
                 decisions: &decisions,
+                hero_coef: None,
             }),
             hand_seed,
         )
@@ -7331,6 +7426,7 @@ mod tests {
         let mk_prefix = || PrefixReach {
             strategy: &strat,
             decisions: &decisions,
+            hero_coef: None,
         };
         let mut cache = SubgameSolveCache::new();
         // ① flop solve（前缀 reach）→ miss 1，cache = flop_unanchored。
@@ -7423,6 +7519,7 @@ mod tests {
         let mk_prefix = || PrefixReach {
             strategy: &strat,
             decisions: &decisions,
+            hero_coef: None,
         };
         // 所有座都给已收敛的松画像（hero / 弃牌座由 apply_exploit_width_prior 自己跳过）。
         let profiles = vec![Some(prof(0.6)); 6];
@@ -7547,6 +7644,7 @@ mod tests {
         let mk_prefix = || PrefixReach {
             strategy: &strat,
             decisions: &decisions,
+            hero_coef: None,
         };
         let mut cache = SubgameSolveCache::new();
         // ① flop solve → miss 1，主 slot = flop。
@@ -9167,6 +9265,7 @@ mod tests {
                 Some(PrefixReach {
                     strategy: &strat,
                     decisions,
+                    hero_coef: None,
                 }),
                 0xC20A,
             )
