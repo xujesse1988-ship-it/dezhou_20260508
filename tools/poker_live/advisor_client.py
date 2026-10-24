@@ -110,6 +110,9 @@ def add_advisor_args(p, default_seats, debug_help):
     p.add_argument("--search", action="store_true",
                    help="开实时子博弈搜索（postflop 触发面用真码深 re-solve；缺省纯 blueprint）")
     p.add_argument("--search-iterations", type=int, default=None)
+    # 转牌 / 河牌子树迭代次数（覆盖 --search-iterations；不传 = 不透传，沿用全局值）。
+    p.add_argument("--search-iterations-turn", type=int, default=None)
+    p.add_argument("--search-iterations-river", type=int, default=None)
     p.add_argument("--search-trigger", choices=["flop-first-unraised", "all-postflop"], default=None)
     p.add_argument("--search-time-budget-ms", type=int, default=None)
     p.add_argument("--search-lcfr", action="store_true")
@@ -198,6 +201,13 @@ def validate_advisor_args(args):
         raise SystemExit("--search-min-hero-visits 需配 --search（它只管搜索读数）")
     if args.search_min_hero_visits is not None and args.search_min_hero_visits < 0:
         raise SystemExit("--search-min-hero-visits 须 ≥ 0")
+    for name in ("search_iterations_turn", "search_iterations_river"):
+        value = getattr(args, name)
+        flag = "--" + name.replace("_", "-")
+        if value is not None and not args.search:
+            raise SystemExit(f"{flag} 需配 --search（它只管搜索子树的迭代次数）")
+        if value is not None and value <= 0:
+            raise SystemExit(f"{flag} 须 > 0")
     if args.search_weak_commit_guard is not None and not args.search:
         raise SystemExit("--search-weak-commit-guard 需配 --search（护栏挂在 advisor 搜索运行时上）")
 
@@ -213,6 +223,10 @@ def advisor_extra_args(args, warm_profile_hh=None):
         extra.append("--search")
         if args.search_iterations is not None:
             extra += ["--search-iterations", str(args.search_iterations)]
+        if args.search_iterations_turn is not None:
+            extra += ["--search-iterations-turn", str(args.search_iterations_turn)]
+        if args.search_iterations_river is not None:
+            extra += ["--search-iterations-river", str(args.search_iterations_river)]
         if args.search_trigger is not None:
             extra += ["--search-trigger", args.search_trigger]
         if args.search_time_budget_ms is not None:

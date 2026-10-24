@@ -337,6 +337,30 @@ class ManagerTests(unittest.TestCase):
                          ["--exploit-4bet", "on", "--exploit-4bet-state",
                           os.path.abspath("state/fourbet.json")])
 
+    def test_street_iterations_pass_through(self):
+        import argparse
+        from poker_live.advisor_client import (add_advisor_args, advisor_extra_args,
+                                               validate_advisor_args)
+        parser = argparse.ArgumentParser()
+        add_advisor_args(parser, default_seats=6, debug_help="")
+        base = ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin", "--search",
+                "--search-iterations", "1000000"]
+        args = parser.parse_args(base)
+        self.assertNotIn("--search-iterations-turn", advisor_extra_args(args))
+        args = parser.parse_args(base + ["--search-iterations-turn", "2000000",
+                                         "--search-iterations-river", "3000000"])
+        validate_advisor_args(args)
+        extra = advisor_extra_args(args)
+        i = extra.index("--search-iterations")
+        self.assertEqual(extra[i:i + 6], ["--search-iterations", "1000000",
+                                          "--search-iterations-turn", "2000000",
+                                          "--search-iterations-river", "3000000"])
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            validate_advisor_args(parser.parse_args(
+                ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin",
+                 "--search-iterations-river", "5"]))
+
     def test_exploit_4bet_state_requires_main_switch(self):
         from poker_manager_play import main
         err = io.StringIO()
