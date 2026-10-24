@@ -19,7 +19,7 @@
   "--search-deep-menu",
   "--search-prewarm",
   "--search-max-nodes",
-  "200000",
+  "1000000",
   "--search-live-traversers",
   "on",
   "--search-solve-threads",
