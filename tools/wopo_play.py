@@ -19,6 +19,8 @@
     合法区间里的动作改安全动作（fallback:illegal_advisor_action，action-log 的 resp.rejected 记原回复）。
   - --exploit-4bet（PM-17）同 poker_manager：请求带玩家名、每手 observe 带投入金额。
   - --hh-log：每手打完且没作废的牌局写一行（opponent_analysis 的 wopo 平台读）。
+  - --play-log：给人看的牌桌实况（手牌 / 公共牌 / 玩家行动 / hero 决策与实际行动 / 结算 / 作废），
+    诊断信息（advisor 启动、连接、过期、未知消息）仍走 stderr。
   - 连 WS 带 token 鉴权（Authorization: Bearer）：环境变量 WOPO_TOKEN 优先，其次项目根 .env 的
     WOPO_TOKEN；不走命令行（免得进 ps / shell 历史）。服务端拒绝（关闭码 4001 / 握手 401、403）→
     不重连，直接退出。
@@ -36,6 +38,7 @@ action（fold/check/call/raise/all_in）/ amount（raise 的本街总额，其�
 """
 
 import argparse
+import io
 import json
 import os
 import shlex
@@ -223,7 +226,7 @@ def _fixture_msgs():
 
 
 def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=False,
-              exploit_4bet=False, reply=None, hh_log=None):
+              exploit_4bet=False, reply=None, hh_log=None, play_log=None):
     """msgs（dict 或 ("disconnect",)）喂一个新会话。返回 (session, stub, 行动文件行)。
     hook(i, session) 在每条消息后调用（异步场景用来在指定位置放行 advisor）。"""
     stub = _StubAdvisor(gate, reply)
@@ -233,7 +236,7 @@ def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=Fals
         af = ActionFile(path)
         session = WopoSession(worker, af, n_seats=9, hero_seat=HERO_SEAT,
                               exploit=exploit, prewarm=prewarm, exploit_4bet=exploit_4bet,
-                              hh_log=hh_log)
+                              hh_log=hh_log, play_log=play_log)
         for i, m in enumerate(msgs):
             if m == ("disconnect",):
                 session.on_disconnect()
@@ -255,7 +258,8 @@ def _check(cond, what):
 
 def _selftest_full_replay():
     msgs = _fixture_msgs()
-    session, stub, rows = _run_msgs(msgs, exploit=True, prewarm=True)
+    play = io.StringIO()
+    session, stub, rows = _run_msgs(msgs, exploit=True, prewarm=True, play_log=play)
     c = session.counters
     # 日志：8 个 hand_start，前 7 手打完，第 14 手截断在中间（没有作废原因，只是没打完）。
     _check(c["hands"] == 8 and c["hands_complete"] == 7, f"手数 {c}")
@@ -298,6 +302,24 @@ def _selftest_full_replay():
                             "min_raise": 10, "max_raise": 200}, f"hand 8 第 2 决策区间 {row['valid']}")
     _check(q["actions"][-2:] == [{"seat": 2, "action": "raise", "to": 6},
                                  {"seat": 3, "action": "fold"}], f"hand 8 历史 {q['actions']}")
+    # play log：每手一个开局行 + 底牌 + 座位；每个决策 / hero 动作 / 对手动作 / 发牌 / 结算各一行。
+    lines = [ln.split(" ", 1)[1] for ln in play.getvalue().splitlines()]
+    count = lambda pred: sum(1 for ln in lines if pred(ln))
+    n_type = lambda t: sum(m["type"] == t for m in msgs)
+    opp_acts = sum(m["type"] == "player_action" and m["seat"] != HERO_SEAT for m in msgs)
+    _check(count(lambda ln: ln.startswith("────")) == n_type("hand_start")
+           and count(lambda ln: ln.startswith("底牌 ")) == n_type("hole_cards")
+           and count(lambda ln: ln.startswith("座位 ")) == n_type("hand_start")
+           and count(lambda ln: ln.startswith(">> 轮到 hero")) == c["decisions"]
+           and count(lambda ln: "← hero 实际行动" in ln) == len(hero_acts)
+           and count(lambda ln: ln.startswith(("翻牌 ", "转牌 ", "河牌 "))) == n_type("community_cards")
+           and count(lambda ln: ln.startswith("seat") and "←" not in ln) == opp_acts
+           and count(lambda ln: ln.startswith("结算 ")) == c["hands_complete"]
+           and len(lines) == 3 * n_type("hand_start") + c["decisions"] + len(hero_acts)
+           + n_type("community_cards") + opp_acts + c["hands_complete"],
+           "play log 行数不对:\n" + play.getvalue())
+    _check("seat1 Shaggyx bet 6" in lines and "seat2 hsjwnbxj raise 到 6" in lines,
+           "play log：没人下注时的 raise 应写成 bet，面对下注的写 raise 到")
     _check(q["stacks"][:4] == [200, 175, 175, 250], f"hand 8 开局栈 {q['stacks'][:4]}")
     # 行动文件字段齐（外部程序读的接口）。
     keys = {"ts", "hand_id", "table_id", "table_seq", "street", "hole", "board", "pot", "to_call",
@@ -497,7 +519,6 @@ def _selftest_exploit_4bet():
 
 def _selftest_hh_log():
     """--hh-log：每手打完且没作废的牌局写一行；作废的手不写。"""
-    import io
 
     msgs = _fixture_msgs()
     buf = io.StringIO()
@@ -638,6 +659,9 @@ def main():
     p.add_argument("--ws-log", default=None, help="原始 WS 消息逐条落 JSONL（append）；缺省关")
     p.add_argument("--hh-log", default=None,
                    help="每手打完且没作废的牌局落 JSONL（append；opponent_analysis --platform wopo 读）；缺省关")
+    p.add_argument("--play-log", default=None,
+                   help="牌桌实况（人看，append）：手牌 / 公共牌 / 玩家行动 / hero 决策（建议、来源、耗时）/ "
+                        "实际行动 / 结算 / 作废；诊断信息仍走 stderr。缺省关")
     p.add_argument("--num-hands", type=int, default=0, help="打完这么多手后退出；0 = 不限")
     add_fourbet_args(p)
     args = p.parse_args()
@@ -656,10 +680,12 @@ def main():
     action_log = open(args.action_log, "a") if args.action_log else None
     hh_log = open(args.hh_log, "a", encoding="utf-8") if args.hh_log else None
     ws_log = WsLog(args.ws_log) if args.ws_log else None
+    play_log = open(args.play_log, "a", encoding="utf-8") if args.play_log else None
     session = WopoSession(worker, action_file, n_seats=args.seats, hero_seat=HERO_SEAT,
                           num_hands=args.num_hands, action_log=action_log,
                           prewarm=args.search_prewarm, exploit=exploit_enabled(args),
-                          debug=args.debug_log, exploit_4bet=fourbet_enabled(args), hh_log=hh_log)
+                          debug=args.debug_log, exploit_4bet=fourbet_enabled(args), hh_log=hh_log,
+                          play_log=play_log)
     ok = True
     try:
         if args.replay:
@@ -677,6 +703,8 @@ def main():
             hh_log.close()
         if ws_log:
             ws_log.close()
+        if play_log:
+            play_log.close()
     if not ok:
         sys.exit(1)
 
