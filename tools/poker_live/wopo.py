@@ -312,8 +312,11 @@ class WopoSession:
         ctx = {"hand": hand, "key": key, "table_seq": msg.get("table_seq"),
                "street": hand.street, "pot": hand.pot, "to_call": hand.to_call(hand.hero),
                "board": list(hand.board), "valid": valid, "t_wall": time.time()}
-        self._dbg(f"your_turn street={hand.street} hole={''.join(hand.hole)} "
-                  f"board={' '.join(hand.board)} valid={valid}")
+        # 轮到 hero / 决策结果各一行进 play.log（stderr），不用开 --debug-log 也能看。
+        print(f"  [turn] hand={hand.hand_id} {hand.street} hole={''.join(hand.hole)} "
+              f"board={' '.join(hand.board) or '-'} pot={hand.pot} to_call={ctx['to_call']}",
+              file=sys.stderr)
+        self._dbg(f"valid={valid}")
         self.worker.submit_decide(req, lambda resp, ms: self._on_decided(req, ctx, resp, ms))
 
     def _on_decided(self, req, ctx, resp, ms):
@@ -343,14 +346,14 @@ class WopoSession:
                 self.counters["written"] += 1
             else:
                 self.counters["stale"] += 1
-                print(f"  [stale] hand={ctx['key'][0]} 决策 {ms}ms 返回时已过期（{stale}），"
-                      f"不写行动文件", file=sys.stderr)
+            amount = f" {rec['amount']}" if rec["amount"] is not None else ""
+            print(f"  [decide] hand={ctx['key'][0]} {ctx['street']} {rec['action']}{amount} "
+                  f"source={rec['source']} {ms}ms"
+                  + (f" 已过期（{stale}），不写行动文件" if stale else ""), file=sys.stderr)
             if self.action_log:
                 self.action_log.write(json.dumps({"req": req, "resp": resp, "decide_ms": ms,
                                                   "stale": stale}, ensure_ascii=False) + "\n")
                 self.action_log.flush()
-            self._dbg(f"decide action={resp.get('action')} amount={resp.get('amount')} "
-                      f"source={resp.get('source')} {ms}ms" + (f" stale={stale}" if stale else ""))
 
     def report(self):
         c = self.counters
