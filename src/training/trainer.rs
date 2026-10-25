@@ -451,6 +451,28 @@ impl<G: Game> EsMccfrTrainer<G> {
         self
     }
 
+    /// Where [`recurse_es`] / [`recurse_es_parallel`] accumulate the average strategy.
+    ///
+    /// `true` (two players, both seats in the traverser rotation): at the non-traverser's nodes
+    /// with weight 1 — the visit frequency there is that player's own reach × chance reach, which
+    /// is exactly the average-strategy weight (Lanctot 2009; OpenSpiel `AverageType.SIMPLE`).
+    /// Leduc 20M updates: exploitability 0.0037 ± 0.0003 vs 0.150 ± 0.140 for the old path.
+    ///
+    /// `false` (n ≥ 3, or a rotation that skips a seat): old path, at the traverser's nodes
+    /// weighted by its own reach. Biased (the implicit opponent reach varies across iterations),
+    /// but with n ≥ 3 weight-1 at opponent nodes is biased too (other non-traversers' reach is
+    /// still sampled), and a skipped seat's opponent would never be averaged. Kept unchanged
+    /// pending a multi-player fix; see
+    /// `docs/temp/es_mccfr_leduc_convergence_issue_2026_10_25.md` §7.
+    pub fn average_at_opponent_nodes(&self) -> bool {
+        let n = self.game.n_players();
+        let all_seats_traverse = match &self.traverser_rotation {
+            Some(rot) => (0..n as PlayerId).all(|seat| rot.contains(&seat)),
+            None => true,
+        };
+        n == 2 && all_seats_traverse
+    }
+
     /// 已访问 infoset 的 strategy_sum 表只读访问（诊断用：导出
     /// `Σ_a strategy_sum[I][a]` 作为该 infoset 的"学习信号权重"，用于分布分析）。
     #[doc(hidden)]
@@ -548,6 +570,7 @@ impl<G: Game> EsMccfrTrainer<G> {
         let shared_regret: &RegretTable<G::InfoSet> = &self.regret;
         // traverser 轮转表（同 `step`）：None = 既有全座轮转（主线训练路径，行为不变）。
         let rotation: Option<&[PlayerId]> = self.traverser_rotation.as_deref();
+        let avg_at_opp = self.average_at_opponent_nodes();
 
         // rayon 全局 pool dispatch：`par_iter_mut().enumerate()` 是
         // `IndexedParallelIterator`，`.collect()` 保 input index 顺序，因此
@@ -574,6 +597,7 @@ impl<G: Game> EsMccfrTrainer<G> {
                             root,
                             traverser,
                             1.0,
+                            avg_at_opp,
                             shared_regret,
                             &mut local_regret,
                             &mut local_strategy,
@@ -619,11 +643,13 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             Some(rot) => rot[(self.update_count % rot.len() as u64) as usize],
             None => (self.update_count % n_players) as PlayerId,
         };
+        let avg_at_opp = self.average_at_opponent_nodes();
         let root = self.game.root_for_traverser(traverser, rng);
         recurse_es::<G>(
             root,
             traverser,
             1.0,
+            avg_at_opp,
             &mut self.regret,
             &mut self.strategy_sum,
             self.visit_counts.as_mut(),
@@ -728,15 +754,22 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
 /// 参数：
 /// - `state`：当前 owned 状态（D-319 owned clone state representation）
 /// - `traverser`：本 step 的 traverser（D-307 alternating）
-/// - `pi_trav`：traverser 自身 reach probability，用于 average strategy 权重。
-///   external sampling 的 opponent/chance reach 由“是否采样到该节点”的概率隐式
-///   提供，不能在 sampled path 上再次显式相乘。
+/// - `pi_trav`：traverser 自身 reach probability，仅 `avg_at_opp == false` 时用作
+///   average strategy 权重。
+/// - `avg_at_opp`：average strategy 累积位置（见
+///   [`EsMccfrTrainer::average_at_opponent_nodes`]）。`true` = 非 traverser 节点、权重 1：
+///   采样到该节点的频率 ∝ 该节点玩家自身 reach × chance reach，正是 average strategy
+///   定义要的权重（Lanctot 2009 external sampling / OpenSpiel `AverageType.SIMPLE`）。
+///   `false` = traverser 节点、权重 `pi_trav`：期望里多带一份随迭代变化的 opponent
+///   reach，有偏（`docs/temp/es_mccfr_leduc_convergence_issue_2026_10_25.md` §7）。
 /// - `regret` / `strategy_sum`：可变借用累积容器
 /// - `rng`：chance + opp action sampling 共享 rng（D-315 显式注入）
+#[allow(clippy::too_many_arguments)]
 fn recurse_es<G: Game>(
     state: G::State,
     traverser: PlayerId,
     pi_trav: f64,
+    avg_at_opp: bool,
     regret: &mut RegretTable<G::InfoSet>,
     strategy_sum: &mut StrategyAccumulator<G::InfoSet>,
     mut visits: Option<&mut HashMap<G::InfoSet, u32>>,
@@ -754,6 +787,7 @@ fn recurse_es<G: Game>(
                 next_state,
                 traverser,
                 pi_trav,
+                avg_at_opp,
                 regret,
                 strategy_sum,
                 visits,
@@ -772,11 +806,12 @@ fn recurse_es<G: Game>(
 
             if actor == traverser {
                 // traverser node：枚举每个 action 的 sampled counterfactual value，
-                // 累积 regret，并按 traverser 自身 reach 累积 average strategy。
-                // chance / opponent reach 由采样到该节点的概率隐式提供；在单条
-                // sampled path 上再次乘 pi_opp 会把 reach 权重平方化。
-                let weighted: ShortVec<f64> = sigma.iter().map(|s| pi_trav * s).collect();
-                strategy_sum.accumulate(info.clone(), &weighted);
+                // 累积 regret；`avg_at_opp == false` 时在此按 traverser 自身 reach 累积
+                // average strategy（有偏旧路径，见本函数 doc）。
+                if !avg_at_opp {
+                    let weighted: ShortVec<f64> = sigma.iter().map(|s| pi_trav * s).collect();
+                    strategy_sum.accumulate(info.clone(), &weighted);
+                }
                 if let Some(v) = visits.as_deref_mut() {
                     let c = v.entry(info.clone()).or_insert(0);
                     *c = c.saturating_add(1);
@@ -789,6 +824,7 @@ fn recurse_es<G: Game>(
                         next_state,
                         traverser,
                         pi_trav * sigma[i],
+                        avg_at_opp,
                         regret,
                         strategy_sum,
                         visits.as_deref_mut(),
@@ -811,6 +847,10 @@ fn recurse_es<G: Game>(
                 // 这些 action 在采样阶段不可达，从分布中剔除即可——剩余 σ 仍
                 // sum 到 1（D-330 容差）。
                 //
+                // `avg_at_opp`：average strategy 在此按权重 1 累积（全 σ，含零概率 action）。
+                if avg_at_opp {
+                    strategy_sum.accumulate(info, &sigma);
+                }
                 let nonzero_dist: ShortVec<(G::Action, f64)> = actions
                     .iter()
                     .copied()
@@ -829,6 +869,7 @@ fn recurse_es<G: Game>(
                     next_state,
                     traverser,
                     pi_trav,
+                    avg_at_opp,
                     regret,
                     strategy_sum,
                     visits,
@@ -861,6 +902,7 @@ fn recurse_es_parallel<G: Game>(
     state: G::State,
     traverser: PlayerId,
     pi_trav: f64,
+    avg_at_opp: bool,
     shared_regret: &RegretTable<G::InfoSet>,
     local_regret: &mut LocalRegretDelta<G::InfoSet>,
     local_strategy: &mut LocalStrategyDelta<G::InfoSet>,
@@ -876,6 +918,7 @@ fn recurse_es_parallel<G: Game>(
                 next_state,
                 traverser,
                 pi_trav,
+                avg_at_opp,
                 shared_regret,
                 local_regret,
                 local_strategy,
@@ -896,8 +939,10 @@ fn recurse_es_parallel<G: Game>(
                     n > 0,
                     "traverser Player 节点必有 ≥ 1 legal action（API-300 invariant：fold 兜底）"
                 );
-                let weighted: SigmaVec = sigma.iter().map(|s| pi_trav * s).collect();
-                local_strategy.push(info.clone(), weighted);
+                if !avg_at_opp {
+                    let weighted: SigmaVec = sigma.iter().map(|s| pi_trav * s).collect();
+                    local_strategy.push(info.clone(), weighted);
+                }
 
                 let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
                 // last iteration 消耗原 state（move 进 `G::next`）；前 n-1 次 clone。
@@ -910,6 +955,7 @@ fn recurse_es_parallel<G: Game>(
                         next_state,
                         traverser,
                         pi_trav * sigma[i],
+                        avg_at_opp,
                         shared_regret,
                         local_regret,
                         local_strategy,
@@ -922,6 +968,7 @@ fn recurse_es_parallel<G: Game>(
                     last_state,
                     traverser,
                     pi_trav * sigma[last_idx],
+                    avg_at_opp,
                     shared_regret,
                     local_regret,
                     local_strategy,
@@ -944,6 +991,11 @@ fn recurse_es_parallel<G: Game>(
                     "non-traverser σ all-zero impossible: RegretTable::current_strategy 退化局面 \
                      回退均匀分布 (D-331)，sum = n_actions × (1/n_actions) = 1.0 strictly > 0"
                 );
+                // Same position as `recurse_es` (before the sampled child), so playback order
+                // matches the single-thread DFS.
+                if avg_at_opp {
+                    local_strategy.push(info, sigma);
+                }
                 let sampled = sample_discrete(&nonzero_dist, rng);
 
                 let next_state = G::next(state, sampled, rng);
@@ -951,6 +1003,7 @@ fn recurse_es_parallel<G: Game>(
                     next_state,
                     traverser,
                     pi_trav,
+                    avg_at_opp,
                     shared_regret,
                     local_regret,
                     local_strategy,
@@ -1073,7 +1126,8 @@ mod tests {
         }
     }
 
-    /// 子集轮转 `[1]`：座 0 永不当 traverser → (a) σ 只在 traverser 节点累积 ⇒ strategy_sum
+    /// 子集轮转 `[1]`：座 0 永不当 traverser → (a) 轮转不覆盖全座 ⇒ 走 traverser 节点累积
+    /// average strategy 的旧路径（[`EsMccfrTrainer::average_at_opponent_nodes`] = false）⇒ strategy_sum
     /// 全部 key 的 actor == 1；(b) 座 0 的 regret 槽（路径访问 get_or_init 建出）恒为零向量
     /// （regret 也只在 actor == traverser 节点累积）。这就是「弃牌座当 traverser = 零学习」的
     /// 机制本体——S6 subgame 用 Active 座轮转表跳过它们。
@@ -1105,8 +1159,9 @@ mod tests {
     }
 
     /// `with_visit_counts` is bookkeeping only: single-thread `step` and batched `step_parallel`
-    /// produce bit-identical regrets / strategy sums with counting on or off, and an infoset is
-    /// counted iff it has a strategy_sum entry (both happen exactly at traverser visits).
+    /// produce bit-identical regrets / strategy sums with counting on or off, and every Kuhn
+    /// infoset is counted (two players → the average strategy is accumulated at opponent nodes, so
+    /// strategy_sum entries no longer coincide with traverser visits).
     #[test]
     fn visit_counts_bookkeeping_only() {
         let train = |count: bool, parallel: bool| {
@@ -1155,13 +1210,11 @@ mod tests {
 
             let counts = on.visit_counts.as_ref().expect("tracking on");
             assert!(!counts.is_empty());
+            assert_eq!(on.regret.len(), 12, "Kuhn 12 infosets");
+            assert_eq!(on.strategy_sum.len(), 12, "Kuhn 12 infosets");
             for info in on.regret.inner().keys() {
                 let v = on.visit_count(info).expect("tracking on");
-                assert_eq!(
-                    v > 0,
-                    on.strategy_sum.inner().contains_key(info),
-                    "计数 > 0 ⟺ 作为 traverser 到过（有 strategy_sum）{info:?}"
-                );
+                assert!(v > 0, "每个 infoset 都作为 traverser 到过 {info:?}");
                 assert_eq!(off.visit_count(info), None, "未开计数 → None");
             }
             // Kuhn has 12 infosets, 6 per seat; after hundreds of traversals each gets many visits.
@@ -1171,5 +1224,24 @@ mod tests {
                 "每次 traversal 至少过一个 traverser 节点"
             );
         }
+    }
+
+    /// Two players → average strategy at opponent nodes: after one step (seat 0 traverses) only
+    /// seat-1 infosets have strategy_sum entries. A rotation that skips a seat keeps the old path.
+    #[test]
+    fn two_player_average_accumulates_at_opponent_nodes() {
+        let mut t = EsMccfrTrainer::new(KuhnGame, 0x6f70_7061); // "oppa"
+        assert!(t.average_at_opponent_nodes());
+        let mut rng = ChaCha20Rng::from_seed(0x6f70_7062);
+        t.step(&mut rng).expect("seat 0 traverses");
+        assert!(!t.strategy_sum.inner().is_empty());
+        assert!(
+            t.strategy_sum.inner().keys().all(|i| i.actor == 1),
+            "座 0 当 traverser 时只应累积座 1（对手）的 average strategy"
+        );
+        let subset = EsMccfrTrainer::new(KuhnGame, 1).with_traverser_rotation(vec![1]);
+        assert!(!subset.average_at_opponent_nodes(), "轮转跳过座位 → 旧路径");
+        let full = EsMccfrTrainer::new(KuhnGame, 1).with_traverser_rotation(vec![1, 0]);
+        assert!(full.average_at_opponent_nodes());
     }
 }

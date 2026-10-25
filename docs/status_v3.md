@@ -178,9 +178,9 @@ flop-first(干净点、训透)中性不亏、all-postflop 弱基底反退化。*
 | 项目 | 状态 | 依据 |
 |---|---|---|
 | Kuhn / Leduc Vanilla CFR | ✅ 收敛 closed-form `-1/18` / exploit `<0.1` | `tests/cfr_kuhn.rs` `cfr_leduc.rs` |
-| Leduc ES-MCCFR / LCFR-MCCFR | ✅ `ev_p0` 收敛 -0.087;ES 路径 BLAKE3 byte-equal anchor | `tools/leduc_es_mccfr_report` |
+| Leduc ES-MCCFR / LCFR-MCCFR | ✅(2026-10-25 修正)两人博弈平均策略改回对手节点累加(`240bb1a` 起误挪到遍历者节点,修前 100 万次后停在 exploit 0.15–0.18 平台):200 万次 5 种子 0.0127–0.0146,2000 万次 0.0037 ± 0.0003。**n ≥ 3、dense 后端、子树求解器仍是旧写法**,见 `docs/temp/es_mccfr_leduc_convergence_issue_2026_10_25.md` §7 | `tests/es_mccfr_leduc.rs` |
 | 简化 NLHE ES-MCCFR / LCFR | ✅ LCFR 优化路径 100M LBR 1,233 → 500M 1,126(100M 即饱和) | `run_lcfr_*` on vultr |
-| dense 后端 + v4 bucket | ✅ byte-equal HashMap(5 对照)+ 100M LBR 1,143 ≈ baseline(同质量);吞吐 ~2.2× 且长 run 不塌、RAM 平 5.2 GiB、ckpt 不暴涨 | `tests/dense_nlhe_trainer.rs` |
+| dense 后端 + v4 bucket | ✅ byte-equal HashMap(5 对照;**2026-10-25 起 HU 两人配置下 HashMap 平均策略已改位置、dense 未改,这 5 个对照在 HU 下暂不成立**)+ 100M LBR 1,143 ≈ baseline(同质量);吞吐 ~2.2× 且长 run 不塌、RAM 平 5.2 GiB、ckpt 不暴涨 | `tests/dense_nlhe_trainer.rs` |
 | AIVAT 评测器 | ✅ 无偏全证;真日志降方差 1.21×(精确项 deals+runout) | `tests/aivat_nlhe_*.rs` `docs/aivat_eval.md` |
 | **CFR trainer / 规则引擎 6-max N-generic** | ✅ 亲验:`recurse_es` 取 `payoff(traverser)` 不取负、traverser `% n_players`;规则多人 side pot 返回 per-seat payoff 向量 | `trainer.rs:493,653` `state.rs:846–938` |
 | 规则:无人能回应时禁 bet/raise(LA-009,2026-10-16) | ✅ 其余玩家全弃牌 / all-in 或都不够跟满当前最高注 → 只能 Check/Call/Fold。PokerKit 0.4.14 随机不等码深逐决策对照 16.6 万点:我方多放行 0(修前 1834+588);剩余「PokerKit 放行、我方不放行」全部是不足额 all-in 不重开(TDA 规则,PokerKit 未实现)。等码深行为不变 | `rules/action.rs` LA-009、`state.rs` `legal_action_tests` |
