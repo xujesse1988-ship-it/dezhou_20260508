@@ -63,6 +63,7 @@ def hand_observations(h: Hand, river_percentile=None) -> list[Obs]:
     forced_seats = {d.seat for d in h.decisions if d.forced}
     pos = h.positions
     n = len(h.dealt_seats)
+    stack_before = stacks_before(h)
 
     def eff_depth(seat: int) -> str:
         others = [h.start_stacks[s] for s in h.dealt_seats if s != seat]
@@ -72,7 +73,7 @@ def hand_observations(h: Hand, river_percentile=None) -> list[Obs]:
 
     def emit(seat: int, stat: str, outcome: str, dims: Optional[dict] = None, **kw) -> None:
         nm = name.get(seat)
-        if nm is None:
+        if not nm:  # same test as report.Accumulator, which only creates players for non-empty names
             return
         d = dict(base[seat])
         if dims:
@@ -94,7 +95,8 @@ def hand_observations(h: Hand, river_percentile=None) -> list[Obs]:
         emit(s, "vpip", "yes" if any(d.kind in ("call", "raise") for d in mine) else "no", {"pos": cls})
         emit(s, "pfr", "yes" if any(d.kind == "raise" for d in mine) else "no", {"pos": cls})
         f = mine[0]
-        if f.raises_before == 0 and f.prior_callers == 0 and pos[s] not in ("BB", "BTN_BB"):
+        # A first decision that is a check means the BB posted less than the SB: no pot to open.
+        if f.raises_before == 0 and f.prior_callers == 0 and pos[s] not in ("BB", "BTN_BB") and f.kind != "check":
             emit(s, "rfi", {"raise": "raise", "call": "limp", "fold": "fold"}[f.kind], {"pos": pos[s]})
         if f.raises_before == 1 and f.aggressor is not None:
             o = _outcome3(f.kind)
@@ -148,7 +150,10 @@ def hand_observations(h: Hand, river_percentile=None) -> list[Obs]:
             s_ratio = bet / pot if pot else 0.0
             dims = {"hu": hu, "size": size_bucket(s_ratio), "after_check": "yes" if prev else "no"}
             clean = d.n_live == 2 and d.prior_callers == 0
-            kw = {"pot_bb": pot / bb, "bet_bb": bet / bb} if clean else {}
+            # Only what this player can match is at stake: a bet above his stack plays as his stack.
+            # (He has put nothing in on this street yet: first bet, and he only checked before.)
+            eff = min(bet, stack_before[d.idx])
+            kw = {"pot_bb": pot / bb, "bet_bb": eff / bb} if clean else {}
             o = _outcome3(d.kind)
             emit(d.seat, f"vs_bet_{d.street}", o, dims, **kw)
             if d.street == "flop" and d.aggressor == h.preflop_aggressor:
@@ -164,7 +169,10 @@ def hand_observations(h: Hand, river_percentile=None) -> list[Obs]:
         if STREETS.index(h.streets_seen[s]) >= 1 and s not in _folded_before(h, "flop"):
             emit(s, "wtsd", "yes" if s in h.showdown_seats else "no")
     for s in h.showdown_seats:
-        payout = h.final_stacks[s] - h.start_stacks[s] + h.committed[s]
+        # Chips taken from the pot. Only the part of a seat's money that someone matched is at
+        # stake; the unmatched rest is handed back and must not count as a win.
+        matched = min(h.committed[s], max(h.committed[o] for o in h.dealt_seats if o != s))
+        payout = h.final_stacks[s] - h.start_stacks[s] + matched
         emit(s, "wsd", "won" if payout > 0 else "lost")
 
     # Clean river sample: a single river bet into no prior bet, called by one player, then showdown.
@@ -176,8 +184,23 @@ def hand_observations(h: Hand, river_percentile=None) -> list[Obs]:
             after = [d for d in river if d.idx > b.idx]
             if len(after) == 1 and after[0].kind == "call" and b.seat in h.shown and not b.forced:
                 pct = river_percentile(h.shown[b.seat], h.board)
+                # A caller short of the bet calls all-in for less; the unmatched rest goes back.
+                eff = min(b.delta, after[0].delta)
                 emit(b.seat, "river_bet_called", "shown", {"size": size_bucket(b.delta / b.pot_before)},
-                     pot_bb=b.pot_before / bb, bet_bb=b.delta / bb, pct=pct)
+                     pot_bb=b.pot_before / bb, bet_bb=eff / bb, pct=pct)
+    return out
+
+
+def stacks_before(h: Hand) -> dict[int, int]:
+    """Decision idx -> the acting seat's stack just before it (blinds posted as replay posts them)."""
+    left = dict(h.start_stacks)
+    for s, p in h.positions.items():
+        blind = h.sb if p in ("SB", "BTN_SB") else (h.bb if p in ("BB", "BTN_BB") else 0)
+        left[s] -= min(blind, left[s])
+    out = {}
+    for d in h.decisions:
+        out[d.idx] = left[d.seat]
+        left[d.seat] -= d.delta
     return out
 
 

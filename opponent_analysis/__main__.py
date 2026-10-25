@@ -1,4 +1,4 @@
-"""CLI: python3 -m opponent_analysis {ingest,report} ..."""
+"""CLI: python3 -m opponent_analysis {ingest,report,live} ..."""
 
 from __future__ import annotations
 
@@ -29,8 +29,43 @@ def main(argv=None) -> int:
     rep.add_argument("--min-hands", type=int, default=Config.min_hands)
     rep.add_argument("--min-opps", type=int, default=Config.min_opps)
     rep.add_argument("--bluff-pct", type=float, default=Config.bluff_pct)
+    rep.add_argument("--recent-hands", type=int, default=Config.recent_hands,
+                    help="「最近」= 每个玩家自己的最近 N 手")
+    rep.add_argument("--hero", nargs="*", default=[],
+                    help="另外算作我方的名字（日志没被导入的我方 bot），不计入对手和群体基准")
+
+    lv = sub.add_parser("live", help="跟随正在写入的 hh 日志，实时更新画像并开 HTTP 页面")
+    lv.add_argument("--db", required=True)
+    lv.add_argument("--platform", required=True, choices=sorted(PLATFORMS))
+    lv.add_argument("--follow", nargs="+", required=True,
+                    help="hh 日志路径或通配符（加引号），每次轮询重新展开，新的 run 目录会自动接上")
+    lv.add_argument("--hero", nargs="*", default=[],
+                    help="另外算作我方的名字（日志没被跟随的我方 bot），不计入对手和群体基准")
+    lv.add_argument("--host", default="127.0.0.1")
+    lv.add_argument("--port", type=int, default=8780)
+    lv.add_argument("--poll", type=float, default=2.0, help="读日志间隔（秒）")
+    lv.add_argument("--refresh", type=float, default=5.0, help="有新手时重算画像的最短间隔（秒）")
+    lv.add_argument("--min-hands", type=int, default=Config.min_hands)
+    lv.add_argument("--min-opps", type=int, default=Config.min_opps)
+    lv.add_argument("--bluff-pct", type=float, default=Config.bluff_pct)
+    lv.add_argument("--recent-hands", type=int, default=Config.recent_hands,
+                    help="「最近」= 每个玩家自己的最近 N 手")
 
     a = ap.parse_args(argv)
+    try:
+        return _run(a)
+    except db.DatabaseBusy as e:
+        print(f"数据库正被另一个进程写入：{e}", file=sys.stderr)
+        return 2
+
+
+def _run(a) -> int:
+    if a.cmd == "live":
+        from .live import serve
+
+        cfg = Config(min_hands=a.min_hands, min_opps=a.min_opps, bluff_pct=a.bluff_pct, recent_hands=a.recent_hands)
+        serve(a.db, a.platform, a.follow, a.host, a.port, cfg, a.poll, a.refresh, a.hero)
+        return 0
     if a.cmd == "ingest":
         jobs = []
         if a.run:
@@ -46,8 +81,8 @@ def main(argv=None) -> int:
     if not hands:
         print(f"{a.platform}: 数据库里没有手牌", file=sys.stderr)
         return 1
-    cfg = Config(min_hands=a.min_hands, min_opps=a.min_opps, bluff_pct=a.bluff_pct)
-    res = analyze(hands, a.platform, db.load_rejected(a.db, a.platform), cfg)
+    cfg = Config(min_hands=a.min_hands, min_opps=a.min_opps, bluff_pct=a.bluff_pct, recent_hands=a.recent_hands)
+    res = analyze(hands, a.platform, db.load_rejected(a.db, a.platform), cfg, a.hero)
     md, js = write_report(res, a.out)
     print(md)
     print(js)

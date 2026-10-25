@@ -1,3 +1,4 @@
+import math
 import random
 import unittest
 
@@ -44,6 +45,15 @@ class EmpiricalBayes(unittest.TestCase):
                 k = sum(rng.random() < p for _ in range(n))
                 pv.append(two_sided_p(k, n, p))
         self.assertLessEqual(sum(benjamini_hochberg(pv, 0.10)), 2)
+
+    def test_binomial_test_is_exact(self):
+        def brute(k, n, p):
+            pmf = [math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(n + 1)]
+            return min(1.0, 2 * min(sum(pmf[k:]), sum(pmf[:k + 1])))
+
+        for k, n, p in [(3, 10, 0.05), (0, 10, 0.05), (10, 10, 0.9), (5, 10, 0.5), (40, 200, 0.3), (1, 1, 0.5)]:
+            self.assertAlmostEqual(two_sided_p(k, n, p), brute(k, n, p), places=12)
+        self.assertGreater(two_sided_p(3, 10, 0.05), 0.02)  # the normal approximation said 3e-4
 
     def test_bh_keeps_real_signal(self):
         self.assertEqual(benjamini_hochberg([1e-6, 0.5, 0.8, 0.9], 0.1), [True, False, False, False])

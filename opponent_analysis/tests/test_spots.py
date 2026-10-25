@@ -61,6 +61,38 @@ class Postflop(unittest.TestCase):
         self.assertIn(("p0", "wsd", "won"), got)
         self.assertIn(("p2", "wsd", "lost"), got)
 
+    def test_uncalled_return_is_not_a_showdown_win(self):
+        # BTN shoves 2000 into a 500 BB stack and loses; the 1500 nobody matched comes back.
+        rec = pm_record("h6", 0, [0, 1, 2], {0: 2000, 1: 1000, 2: 500},
+                        [(0, "all_in", 2000), (1, "fold", None), (2, "call", 480)],
+                        {0: 1500, 1: 990, 2: 1010}, board=["2c", "3d", "4h", "8s", "9c"],
+                        shown={0: ["7h", "6d"], 2: ["Kh", "Kd"]})
+        got, _ = obs(rec)
+        self.assertIn(("p0", "wsd", "lost"), got)
+        self.assertIn(("p2", "wsd", "won"), got)
+
+    def test_bet_above_callers_stack_counts_as_his_stack(self):
+        # Flop: BTN bets 500 into 130, BB has 340 left and folds -> only 340 was at stake.
+        rec = pm_record("h7", 0, [0, 1, 2], {0: 2000, 1: 1000, 2: 400},
+                        [(0, "raise", 60), (1, "fold", None), (2, "call", 40), (2, "check", None), (0, "bet", 500),
+                         (2, "fold", None)],
+                        {0: 2070, 1: 990, 2: 340}, board=["2c", "7d", "Kh"])
+        _, full = obs(rec)
+        vs = [o for o in full if o.stat == "vs_bet_flop"][0]
+        self.assertEqual((vs.pot_bb, vs.bet_bb), (130 / 20, 340 / 20))
+
+    def test_river_short_call_uses_the_matched_amount(self):
+        # River: BTN bets 500, BB calls all-in for 240 and the other 260 goes back.
+        rec = pm_record("h8", 0, [0, 1, 2], {0: 2000, 1: 1000, 2: 300},
+                        [(0, "raise", 60), (1, "fold", None), (2, "call", 40)]
+                        + [(2, "check", None), (0, "check", None)] * 2 + [(2, "check", None), (0, "bet", 500),
+                                                                          (2, "call", 240)],
+                        {0: 1700, 1: 990, 2: 610}, board=["2c", "3d", "4h", "8s", "9c"],
+                        shown={0: ["7h", "6d"], 2: ["Kh", "Kd"]})
+        _, full = obs(rec, pct=lambda hole, board: 0.1)
+        rb = [o for o in full if o.stat == "river_bet_called"][0]
+        self.assertEqual((rb.pot_bb, rb.bet_bb), (130 / 20, 240 / 20))
+
     def test_forced_decisions_are_skipped(self):
         rec = pm_record("h5", 0, [0, 1, 2], {s: 1000 for s in range(3)},
                         [(0, "fold", None), (1, "fold", None)], {0: 1000, 1: 990, 2: 1010})

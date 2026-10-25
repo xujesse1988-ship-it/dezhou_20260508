@@ -8,6 +8,7 @@ reason code, and the caller records the hand as rejected (never dropped silently
 
 from __future__ import annotations
 
+from .cards import RANKS, SUITS
 from .model import STREETS, Decision, Hand, RawHand
 
 BOARD_LEN = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
@@ -18,6 +19,22 @@ class ReplayError(Exception):
         super().__init__(f"{code}: {detail}" if detail else code)
         self.code = code
         self.detail = detail
+
+
+def check_cards(board: list, shown: dict, dealt: list[int]) -> None:
+    """Board and shown hands must be well-formed, distinct cards (the showdown evaluator relies on it)."""
+    if len(board) > 5:
+        raise ReplayError("bad_cards", f"board has {len(board)} cards")
+    cards = list(board)
+    for s, c in shown.items():
+        if s not in dealt or len(c) != 2:
+            raise ReplayError("bad_cards", f"seat {s} shows {c}")
+        cards += c
+    for c in cards:
+        if not (isinstance(c, str) and len(c) == 2 and c[0].upper() in RANKS and c[1].lower() in SUITS):
+            raise ReplayError("bad_cards", repr(c))
+    if len({c.lower() for c in cards}) != len(cards):
+        raise ReplayError("bad_cards", f"duplicate card in {cards}")
 
 
 def ring_from(seats: list[int], start: int) -> list[int]:
@@ -248,6 +265,7 @@ def replay(raw: RawHand, heads_up_button_is_sb: bool) -> Hand:
     want_board = 5 if showdown else BOARD_LEN[last_street]
     if len(raw.board) < want_board:
         raise ReplayError("board_incomplete", f"have {len(raw.board)} want {want_board}")
+    check_cards(raw.board, raw.shown, dealt)
 
     final_stacks = dict(raw.final_stacks)
     notes = []

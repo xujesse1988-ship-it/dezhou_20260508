@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>对手画像</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #667085; --line: #e3e6eb;
+  --accent: #2f6fdf; --accent-soft: #e6eefc; --good: #1f8a52; --bad: #c4372d; --warn: #b7791f;
+  --band: #c9d8f5; --prior: #8a94a6; --hero: #fff6df; --win: rgba(47, 111, 223, .10); --hit: #fdf3e1;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1a1f27; --ink: #e5e8ee; --muted: #9aa3b2; --line: #2b323d;
+    --accent: #6f9cf0; --accent-soft: #213252; --good: #4cc38a; --bad: #f07167; --warn: #e0a84e;
+    --band: #2f4a7a; --prior: #8792a5; --hero: #3a3220; --win: rgba(111, 156, 240, .14); --hit: #3a2f1c;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+h1 { font-size: 17px; margin: 0; font-weight: 600; }
+h2 { font-size: 14px; margin: 0 0 10px; font-weight: 600; }
+h3 { font-size: 13px; margin: 16px 0 6px; font-weight: 600; color: var(--muted); }
+.meta { color: var(--muted); font-size: 13px; display: flex; gap: 16px; flex-wrap: wrap; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; font-size: 12px; background: var(--accent-soft); color: var(--accent); }
+.pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pill.stale { background: transparent; color: var(--warn); border: 1px solid var(--warn); }
+.pill.down { background: transparent; color: var(--bad); border: 1px solid var(--bad); }
+main { padding: 16px 20px 40px; display: grid; gap: 16px; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; min-width: 0; }
+.full { grid-column: 1 / -1; }
+.tables { display: flex; flex-direction: column; gap: 10px; }
+.table-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.table-id { font-size: 12px; color: var(--muted); min-width: 150px; }
+.seat { border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; font-size: 12px; cursor: pointer; background: transparent; color: inherit; font-family: inherit; }
+.seat:hover { border-color: var(--accent); }
+.seat.hero { background: var(--hero); cursor: default; }
+.seat small { color: var(--muted); margin-left: 4px; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 6px 8px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; cursor: pointer; user-select: none; position: sticky; top: 0; background: var(--panel); }
+th:first-child, td:first-child, td.l, th.l { text-align: left; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--accent-soft); }
+tr.sel { background: var(--accent-soft); }
+.ptab th:first-child, .ptab td:first-child { position: sticky; left: 0; background: var(--panel); z-index: 1; box-shadow: 1px 0 0 var(--line); }
+.ptab th { z-index: 2; }
+.ptab th:first-child { z-index: 3; }
+details.pt { margin-top: 10px; }
+details.pt > summary { cursor: pointer; font-size: 13px; font-weight: 600; padding: 4px 0; list-style: none; user-select: none; }
+details.pt > summary::-webkit-details-marker { display: none; }
+details.pt > summary::before { content: "▸"; display: inline-block; width: 14px; color: var(--muted); transition: transform .15s; }
+details.pt[open] > summary::before { transform: rotate(90deg); }
+details.pt > summary .muted { font-weight: 400; font-size: 12px; margin-left: 6px; }
+#detail { scroll-margin-top: 80px; }
+.ptab tr.sel td:first-child, .ptab tbody tr:hover td:first-child { background: var(--accent-soft); }
+.scroll.tall { max-height: 60vh; overflow-y: auto; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; font-size: 13px; }
+.seg label { display: inline-flex; align-items: center; padding: 2px 10px; cursor: pointer; color: var(--muted); }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label:has(input:checked) { background: var(--accent-soft); color: var(--accent); }
+.spark { overflow: visible; }
+.spark path { fill: none; stroke: var(--accent); stroke-width: 1.4; }
+.spark circle { fill: var(--accent); }
+.spark .win { fill: var(--win); }
+table.changes tr.hit td { background: var(--hit); }
+#tip { position: fixed; z-index: 20; max-width: min(380px, calc(100vw - 16px)); padding: 10px 12px; border-radius: 8px; pointer-events: none;
+  background: var(--panel); color: var(--ink); border: 1px solid var(--line); box-shadow: 0 6px 24px rgba(0,0,0,.18); font-size: 12px; line-height: 1.55; }
+#tip b { font-size: 13px; }
+#tip p { margin: 6px 0 0; }
+#tip .f { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); padding: 4px 6px; border-radius: 4px; }
+#tip .n { color: var(--muted); }
+th[data-tip], .tip-label { text-decoration: underline dotted var(--prior); text-underline-offset: 3px; }
+.tip-label { cursor: help; }
+tr.hero td:first-child::after { content: "我方"; font-size: 11px; color: var(--warn); margin-left: 6px; }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--good); margin-right: 6px; vertical-align: 1px; }
+.dot.off { background: transparent; border: 1px solid var(--line); }
+.num { font-variant-numeric: tabular-nums; }
+.pos { color: var(--good); } .neg { color: var(--bad); }
+.muted { color: var(--muted); }
+.ci { color: var(--muted); font-size: 11px; }
+.empty { color: var(--muted); padding: 20px 0; text-align: center; }
+.statbar { display: grid; grid-template-columns: 120px 1fr 270px 150px; gap: 10px; align-items: center; padding: 3px 0; font-size: 12px; }
+.track { position: relative; height: 14px; background: var(--bg); border-radius: 3px; }
+.track .band { position: absolute; top: 3px; height: 8px; background: var(--band); border-radius: 2px; }
+.track .mean { position: absolute; top: 1px; width: 3px; height: 12px; margin-left: -1px; background: var(--accent); border-radius: 1px; }
+.track .rmean { position: absolute; top: 2px; width: 9px; height: 9px; margin-left: -4.5px; background: var(--panel); border: 2px solid var(--warn); border-radius: 50%; box-sizing: border-box; }
+.legend i.rkey { width: 9px; height: 9px; border: 2px solid var(--warn); border-radius: 50%; box-sizing: border-box; }
+.rtxt { color: var(--warn); font-size: 11px; }
+.track .prior { position: absolute; top: -2px; width: 1px; height: 18px; background: var(--prior); }
+.legend { font-size: 11px; color: var(--muted); margin: 4px 0 8px; }
+.section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.filter { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; user-select: none; }
+.filter input { margin: 0; accent-color: var(--accent); }
+.tools { display: flex; align-items: center; gap: 14px; }
+.col-picker { position: relative; }
+.col-picker summary { list-style: none; cursor: pointer; font-size: 13px; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 2px 10px; }
+.col-picker summary::-webkit-details-marker { display: none; }
+.col-picker summary::after { content: " ▾"; }
+.col-picker[open] summary { border-color: var(--accent); color: var(--accent); }
+.menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 5; width: min(460px, calc(100vw - 32px)); max-height: 70vh; overflow-y: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; box-shadow: 0 6px 24px rgba(0,0,0,.15); }
+.menu-group { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; margin-bottom: 10px; font-size: 13px; }
+.menu-group b { grid-column: 1 / -1; font-size: 12px; font-weight: 500; color: var(--muted); }
+.menu-group label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.menu-group input { accent-color: var(--accent); }
+.menu-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.menu-actions button { font: inherit; font-size: 12px; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+.menu-actions button:hover { border-color: var(--accent); }
+.legend i { display: inline-block; vertical-align: -1px; margin: 0 4px 0 10px; }
+.leaks td { white-space: normal; }
+.flag { color: var(--warn); }
+ul.plain { margin: 4px 0; padding-left: 18px; }
+ul.plain li { margin: 2px 0; }
+.recent td { font-size: 12px; }
+.cards { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.err { color: var(--bad); font-size: 12px; }
+details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+@media (max-width: 980px) { main { grid-template-columns: minmax(0, 1fr); padding: 12px 16px 32px; } header { padding: 12px 16px; } .statbar { grid-template-columns: 96px 1fr 150px; } .statbar .spark { display: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>对手画像 <span class="muted" id="platform"></span></h1>
+  <span class="pill" id="status">连接中</span>
+  <div class="meta">
+    <span id="m-hands"></span><span id="m-last"></span><span id="m-built"></span>
+    <a href="/report.md" target="_blank">报告 md</a><a href="/profile.json" target="_blank">profile.json</a>
+  </div>
+</header>
+<main>
+  <section class="full">
+    <h2>牌桌（最近一手）</h2>
+    <div class="tables" id="tables"><div class="empty">还没有手牌</div></div>
+  </section>
+  <section class="full">
+    <div class="section-head"><h2>玩家 <span class="muted" id="n-players"></span></h2>
+      <div class="tools"><label class="filter"><input type="checkbox" id="only-seated"> 只看在桌</label>
+        <details class="col-picker" id="col-picker"><summary>列</summary><div class="menu" id="col-menu"></div></details></div></div>
+    <details class="pt" id="pt-all" open><summary>全部历史<span class="muted">每个玩家的全部手牌</span></summary>
+      <div class="scroll tall"><table class="ptab" id="players-all"><thead></thead><tbody></tbody></table></div></details>
+    <details class="pt" id="pt-recent" open><summary>最近 <span id="scope-n">N</span> 手<span class="muted">每个玩家自己的最近 N 手（他不上桌的时间不算）；不到 N 手的玩家就是他的全部手牌</span></summary>
+      <div class="scroll tall"><table class="ptab" id="players-recent"><thead></thead><tbody></tbody></table></div></details>
+    <p class="legend">点表格标题可以收起 / 展开。百分数为后验均值，悬停看 [5%, 95%] 区间和机会数。绿点 = 在桌：出现在某张桌的最近一手里（比全局最新一手早 10 分钟以上的牌桌不算）。点一行看详情。</p>
+  </section>
+  <section class="full" id="detail"><div class="empty">选一个玩家</div></section>
+  <section class="full">
+    <h2>最近手牌</h2>
+    <div class="scroll"><table class="recent" id="recent"><thead><tr><th class="l">时间</th><th class="l">牌桌</th><th>人数</th><th>底池（大盲）</th><th class="l">公共牌</th><th class="l">赢家</th><th class="l">亮牌</th><th>我方盈亏（大盲）</th></tr></thead><tbody></tbody></table></div>
+  </section>
+  <section class="full">
+    <h2>数据</h2>
+    <div id="quality"></div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pct = x => x == null ? '—' : (100 * x).toFixed(1);
+const fmtTime = ts => ts ? new Date(ts * 1000).toLocaleString('zh-CN', { hour12: false }) : '—';
+const ago = ts => { if (!ts) return '—'; const s = Date.now() / 1000 - ts; if (s < 60) return Math.max(0, Math.round(s)) + ' 秒前'; if (s < 3600) return Math.round(s / 60) + ' 分钟前'; if (s < 86400) return (s / 3600).toFixed(1) + ' 小时前'; return Math.round(s / 86400) + ' 天前'; };
+const signed = (x, d = 1) => x == null ? '—' : `<span class="${x > 0 ? 'pos' : x < 0 ? 'neg' : ''}">${x > 0 ? '+' : ''}${x.toFixed(d)}</span>`;
+let snap = null, selected = null, sortKey = 'hands', sortDir = -1, failures = 0, onlySeated = false;
+try { selected = localStorage.getItem('oa.sel'); onlySeated = localStorage.getItem('oa.seated') === '1'; } catch {}
+// Two player tables: scope 'all' = whole history, 'recent' = each player's own last N hands.
+const SCOPES = [['all', 'players-all', 'pt-all'], ['recent', 'players-recent', 'pt-recent']];
+const view = (p, sc) => sc === 'recent' ? p.recent : p;
+for (const [sc, , det] of SCOPES) {
+  try { if (localStorage.getItem('oa.open.' + sc) === '0') $(det).open = false; } catch {}
+  $(det).addEventListener('toggle', e => { try { localStorage.setItem('oa.open.' + sc, e.target.open ? '1' : '0'); } catch {} });
+}
+$('only-seated').checked = onlySeated;
+$('only-seated').addEventListener('change', e => {
+  onlySeated = e.target.checked; try { localStorage.setItem('oa.seated', onlySeated ? '1' : '0'); } catch {}
+  if (snap) renderPlayers();
+});
+
+// Columns: name is always shown; the rest can be toggled in the "列" menu (kept per browser).
+// Column names are Chinese only; the usual English abbreviation is shown in the tooltip title.
+const ABBR = { 'vpip:yes': 'VPIP', 'pfr:yes': 'PFR', 'rfi:raise': 'RFI', 'vs_open:raise': '3bet', 'vs_3bet:fold': 'fold to 3bet',
+  'steal_defense:fold': 'fold to steal', 'cbet:bet': 'cbet', 'vs_cbet:fold': 'fold to cbet', 'donk:bet': 'donk bet',
+  'postflop_aggr:aggr': 'AFq', 'wtsd:yes': 'WTSD', 'wsd:won': 'W$SD', 'bb100': 'bb/100' };
+const STREET_CN = { preflop: '翻前', flop: '翻牌', turn: '转牌', river: '河牌' };
+const NAME_COL = { key: 'name', label: '玩家', l: true, val: p => p.name, cell: p => `<span class="dot ${p.seated ? '' : 'off'}"></span>${esc(p.name)}` };
+const BASE_COLS = [
+  { key: 'hands', label: '手数', val: (p, sc) => view(p, sc).hands, cell: (p, sc) => view(p, sc).hands },
+  { key: 'tag', label: '类型', l: true, val: (p, sc) => view(p, sc).tag, cell: (p, sc) => esc(view(p, sc).tag) },
+  { key: 'net_bb', label: '累计盈亏', val: (p, sc) => view(p, sc).net_bb, cell: (p, sc) => signed(view(p, sc).net_bb) },
+  { key: 'bb100', label: '每百手盈亏', val: (p, sc) => view(p, sc).bb100 ?? 0, cell: (p, sc) => signed(view(p, sc).bb100) },
+  { key: 'leaks', label: '候选漏洞', val: (p, sc) => view(p, sc).leaks.filter(x => x.gain_cons > 0).length, cell: (p, sc) => { const L = view(p, sc).leaks, c = L.filter(x => x.gain_cons > 0).length; return c ? `<b>${c}</b>` : (L.length ? `<span class="muted" title="均值为正、保守值不为正">${L.length}?</span>` : '<span class="muted">0</span>'); } },
+  { key: 'changes', label: '近期变化', val: p => p.n_changes, cell: p => p.n_changes ? `<b class="flag">${p.n_changes}</b>` : (p.recent.has_earlier ? '<span class="muted">0</span>' : '<span class="muted">—</span>') },
+  { key: 'last_ts', label: '最后出现', val: p => p.last_ts || 0, cell: p => `<span class="muted">${ago(p.last_ts)}</span>` },
+];
+// visibleCols = null means the default: every column.
+let rateCols = [], visibleCols = null;
+try { const v = JSON.parse(localStorage.getItem('oa.cols')); if (Array.isArray(v)) visibleCols = v; } catch {}
+const allKeys = () => [...BASE_COLS, ...rateCols].map(c => c.key);
+const isShown = k => visibleCols === null || visibleCols.includes(k);
+
+function buildRateCols() {
+  if (rateCols.length || !snap) return;
+  rateCols = snap.stats.map(st => ({
+    key: st.key, label: st.label, rate: true, val: (p, sc) => view(p, sc).rates[st.key].n ? view(p, sc).rates[st.key].mean : -1,
+    cell: (p, sc) => { const r = view(p, sc).rates[st.key]; return r.n ? `<span title="[${pct(r.lo)}, ${pct(r.hi)}] n=${r.n}">${pct(r.mean)}</span>` : '<span class="muted">—</span>'; } }));
+  renderColMenu();
+}
+function shownCols() {
+  // Fixed order: base columns, then stats in report order, except the trailing base columns.
+  const all = [...BASE_COLS.slice(0, 2), ...rateCols, ...BASE_COLS.slice(2)];
+  return [NAME_COL, ...all.filter(c => isShown(c.key))];
+}
+function renderColMenu() {
+  const box = (c) => `<label><input type="checkbox" data-col="${c.key}" ${isShown(c.key) ? 'checked' : ''}> ${esc(c.title || c.label)}</label>`;
+  $('col-menu').innerHTML = `<div class="menu-group"><b>基本</b>${BASE_COLS.map(box).join('')}</div>
+    <div class="menu-group"><b>统计（后验均值 %）</b>${rateCols.map(box).join('')}</div>
+    <div class="menu-actions"><button type="button" data-act="default">恢复默认（全部）</button><button type="button" data-act="all">统计全选</button><button type="button" data-act="none">统计全不选</button></div>`;
+}
+function setCols(v) {
+  visibleCols = v; try { v === null ? localStorage.removeItem('oa.cols') : localStorage.setItem('oa.cols', JSON.stringify(v)); } catch {}
+  renderColMenu(); renderPlayers();
+}
+$('col-menu').addEventListener('change', e => {
+  const k = e.target.dataset.col; if (!k) return;
+  const cur = visibleCols ?? allKeys();
+  setCols(e.target.checked ? [...cur, k] : cur.filter(x => x !== k));
+});
+$('col-menu').addEventListener('click', e => {
+  const act = e.target.dataset.act; if (!act) return;
+  const rates = rateCols.map(c => c.key), base = (visibleCols ?? allKeys()).filter(k => !rates.includes(k));
+  setCols(act === 'default' ? null : act === 'all' ? [...base, ...rates] : base);
+});
+document.addEventListener('click', e => { const d = $('col-picker'); if (d.open && !d.contains(e.target)) d.open = false; });
+
+// Header tooltips. Definitions mirror spots.py (opportunity predicate + outcome) and report.py.
+// Common to every stat: decisions the server made on timeout are skipped (for preflop stats the
+// whole hand of that seat is skipped).
+const DESC = {
+  'hands': { what: '这个玩家被发到牌的手数（hh 日志里有名字的座位）。' },
+  'tag': { what: '按后验均值粗分的打法类型。', formula: '松紧：入池率 ≥ 30% 松，≤ 15% 紧，其余中\n凶/被动：翻前加注率 ÷ 入池率 ≥ 0.6 凶，≤ 0.35 被动，其余中\n翻后：翻后进攻率 ≥ 50% 翻后凶，≤ 25% 翻后被动', note: '入池率机会少于 50 次显示「样本不足」；翻后进攻率机会少于 30 次不判断翻后。' },
+  'net_bb': { what: '累计输赢，单位：大盲。', formula: 'Σ (本手结束筹码 − 本手开始筹码) ÷ 本手大盲' },
+  'bb100': { what: '每 100 手的平均输赢，单位：大盲。', formula: '累计盈亏 ÷ 手数 × 100', note: '方差很大，几千手内只能看大方向。' },
+  'leaks': { what: '单点剥削估计里，均值收益为正的候选漏洞个数。', formula: '保守收益（取对我方不利一侧的 10% 分位）> 0 的个数加粗显示；\n只有均值为正、保守值不为正时显示「n?」（还不能确认）',
+    note: '只对手数 ≥ 100、且该局面机会 ≥ 15 次的对手估计。种类：翻牌 / 转牌 / 河牌弃牌过多，河牌跟注过多，河牌诈唬过少 / 过多。细节点玩家看详情。' },
+  'last_ts': { what: '这个玩家最近一手的时间。' },
+  'changes': { what: '最近 N 手和更早相比，明显变了的统计项数。', formula: '每项统计：更早的 k₁/n₁ 对比 最近 N 手的 k₂/n₂，两比例 z 检验；\n所有对手所有统计的检验一起做 Benjamini–Hochberg 校正（错误发现率 10%），仍显著的计数',
+    note: 'N 按这个玩家自己的手牌数算（他没上桌的时间不算）；两边都至少 30 次机会才检验。不到 N 手的玩家没有更早的数据，显示「—」。桌上人数变化也会让统计变，详情里给了 2–4 人桌占比。' },
+  'vpip:yes': { what: '翻前主动往底池里投钱的比例。', formula: '翻前跟注或加注过的手数 ÷ 翻前有过行动的手数', note: '大盲面前没人加注时过牌不算主动投入；弃到大盲（大盲没有行动）不计入机会。' },
+  'pfr:yes': { what: '翻前加注的比例。', formula: '翻前加注过的手数 ÷ 翻前有过行动的手数', note: '分母和入池率相同。' },
+  'rfi:raise': { what: '前面所有人都弃牌时，第一个进池选择加注的比例。', formula: '首个行动时选择加注的次数 ÷ 首入机会', note: '首入机会 = 本人翻前第一个行动时前面没人加注也没人平跟，且本人不在大盲（含小盲）。' },
+  'rfi:limp': { what: '前面所有人都弃牌时，第一个进池选择平跟的比例。', formula: '首个行动时选择跟注（平跟）的次数 ÷ 首入机会', note: '首入机会同「首入加注」；小盲补齐也算平跟。' },
+  'vs_open:fold': { what: '面对一次开池加注时弃牌的比例。', formula: '弃牌次数 ÷ 面对开池加注的机会', note: '机会 = 本人翻前第一个行动时，本街恰好有过一次加注（前面可以有跟注的人）。' },
+  'vs_open:raise': { what: '面对一次开池加注时再加注的比例。', formula: '加注次数 ÷ 面对开池加注的机会', note: '机会同「面对开池弃」。' },
+  'vs_3bet:fold': { what: '自己开池加注后被再加注时弃牌的比例。', formula: '弃牌次数 ÷ 开池被再加注的机会', note: '机会 = 本人是这手翻前第一个加注的人，之后轮到他时本街恰好有过两次加注，且最后一次不是他自己。' },
+  'steal_defense:fold': { what: '在盲位面对后位偷盲时弃牌的比例。', formula: '弃牌次数 ÷ 偷盲防守机会', note: '机会 = 本人在小盲或大盲，第一个行动时面对恰好一次加注、中间没人跟注，加注者在 CO、按钮或小盲。' },
+  'cbet:bet': { what: '翻前最后加注的人在翻牌圈继续下注的比例。', formula: '下注次数 ÷ 持续下注机会', note: '机会 = 本人是翻前最后一个加注者，翻牌圈轮到他第一次行动时还没人下注。单挑和多人都算。' },
+  'vs_cbet:fold': { what: '面对翻牌持续下注时弃牌的比例。', formula: '弃牌次数 ÷ 面对持续下注的机会', note: '机会 = 翻牌圈本街恰好有一次下注、下注者是翻前最后加注者，本人此前在本街只过过牌。' },
+  'vs_cbet:raise': { what: '面对翻牌持续下注时加注的比例。', formula: '加注次数 ÷ 面对持续下注的机会', note: '机会同「面对持续下注弃」。' },
+  'donk:bet': { what: '翻牌圈抢在翻前加注者前面先下注（领先下注）的比例。', formula: '下注次数 ÷ 领先下注机会', note: '机会 = 本人不是翻前最后加注者，翻牌圈第一次行动时还没人下注，而翻前加注者仍在牌里、位置在他后面。' },
+  'barrel_turn:bet': { what: '翻牌圈最后下注/加注的人在转牌继续下注的比例（二枪）。', formula: '下注次数 ÷ 二枪机会', note: '机会 = 本人是翻牌圈最后一个下注或加注的人，转牌第一次行动时还没人下注。' },
+  'barrel_river:bet': { what: '转牌最后下注/加注的人在河牌继续下注的比例（三枪）。', formula: '下注次数 ÷ 三枪机会', note: '机会 = 本人是转牌最后一个下注或加注的人，河牌第一次行动时还没人下注。' },
+  'vs_bet_turn:fold': { what: '转牌面对一次下注时弃牌的比例。', formula: '弃牌次数 ÷ 面对转牌下注的机会', note: '机会 = 转牌本街恰好有一次下注、不是本人下的，本人此前在本街只过过牌（含过牌后面对下注）。单挑和多人都算。' },
+  'vs_bet_river:fold': { what: '河牌面对一次下注时弃牌的比例。', formula: '弃牌次数 ÷ 面对河牌下注的机会', note: '机会定义同转牌。' },
+  'postflop_aggr:aggr': { what: '翻后所有非过牌动作里，下注和加注的占比。', formula: '(下注 + 加注) ÷ (下注 + 加注 + 跟注 + 弃牌)，翻牌、转牌、河牌合计', note: '过牌不计入。' },
+  'wtsd:yes': { what: '看到翻牌后坚持到摊牌的比例。', formula: '摊牌次数 ÷ 看到翻牌的手数', note: '全下后直接发完公共牌也算摊牌。' },
+  'wsd:won': { what: '摊牌时赢钱的比例。', formula: '摊牌时从底池分到筹码的次数 ÷ 摊牌次数', note: '平分底池、只赢回边池也算赢；自己多下而没人跟、被退回的筹码不算赢。' },
+};
+const tipEl = document.createElement('div');
+tipEl.id = 'tip'; tipEl.setAttribute('role', 'tooltip'); tipEl.hidden = true;
+document.body.appendChild(tipEl);
+function tipHtml(k) {
+  const d = DESC[k]; if (!d) return '';
+  const st = snap && snap.stats.find(x => x.key === k);
+  const title = (st ? st.label : (BASE_COLS.find(c => c.key === k) || {}).label) + (ABBR[k] ? `（${ABBR[k]}）` : '');
+  let h = `<b>${esc(title)}</b><p>${esc(d.what)}</p>`;
+  if (d.formula) h += `<p class="f">${esc(d.formula).replace(/\n/g, '<br>')}</p>`;
+  if (d.note) h += `<p class="n">${esc(d.note)}</p>`;
+  if (st) h += `<p class="n">表中数值是后验均值 = (k + K·m) ÷ (n + K)，k / n 为该玩家的次数 / 机会；`
+    + `本平台对手群体均值 m = ${pct(st.prior)}%，先验强度 K = ${st.k == null ? '—' : st.k.toFixed(0)}（样本少的玩家会被拉向 m）。悬停单元格看 [5%, 95%] 区间和 n。</p>`;
+  return h;
+}
+function showTip(el, k) {
+  const h = tipHtml(k); if (!h) return;
+  tipEl.innerHTML = h; tipEl.hidden = false;
+  const r = el.getBoundingClientRect(), w = tipEl.offsetWidth, hh = tipEl.offsetHeight;
+  let left = Math.min(Math.max(8, r.left), window.innerWidth - w - 8);
+  let top = r.bottom + 6; if (top + hh > window.innerHeight - 8) top = Math.max(8, r.top - hh - 6);
+  tipEl.style.left = left + 'px'; tipEl.style.top = top + 'px';
+}
+document.addEventListener('mouseover', e => {
+  const el = e.target.closest('[data-tip]');
+  if (el) showTip(el, el.dataset.tip); else tipEl.hidden = true;
+});
+document.addEventListener('scroll', () => { tipEl.hidden = true; }, true);
+
+function renderPlayers() {
+  buildRateCols();
+  const cols = shownCols();
+  const ps = snap.players.filter(p => !onlySeated || p.seated);
+  for (const [sc, id] of SCOPES) {
+    const head = $(id).tHead, body = $(id).tBodies[0];
+    head.innerHTML = '<tr>' + cols.map(c => `<th class="${c.l ? 'l' : ''}" data-k="${c.key}" ${DESC[c.key] ? `data-tip="${c.key}"` : ''}>${esc(c.label)}${sortKey === c.key ? (sortDir < 0 ? ' ↓' : ' ↑') : ''}</th>`).join('') + '</tr>';
+    const col = cols.find(c => c.key === sortKey) || BASE_COLS[0];
+    const val = c => p => c.val(p, sc);
+    const sorted = [...ps].sort((a, b) => { const x = val(col)(a), y = val(col)(b); return (x < y ? -1 : x > y ? 1 : 0) * sortDir; });
+    body.innerHTML = sorted.map(p => `<tr data-n="${esc(p.name)}" class="${p.name === selected ? 'sel' : ''} ${p.hero ? 'hero' : ''}">` + cols.map(c => `<td class="num ${c.l ? 'l' : ''}">${c.cell(p, sc)}</td>`).join('') + '</tr>').join('')
+      || `<tr><td colspan="${cols.length}" class="empty">现在没有在桌的玩家</td></tr>`;
+  }
+  const opp = snap.players.filter(p => !p.hero);
+  $('n-players').textContent = onlySeated ? `${opp.filter(p => p.seated).length} / ${opp.length} 个对手在桌` : `${opp.length} 个对手`;
+}
+
+function spark(p, key) {
+  // Raw rate per block of the player's own consecutive hands; blocks with n < 10 are gaps.
+  const t = p.trend, ser = t && t.series[key]; if (!ser || !ser.length) return '<span></span>';
+  const W = 150, H = 24, nb = ser.length, vals = ser.map(([k, n]) => n >= 10 ? k / n : null);
+  const top = Math.max(0.1, ...vals.filter(v => v != null)) * 1.15;
+  const x = j => nb === 1 ? W / 2 : 3 + j * (W - 6) / (nb - 1), y = v => H - 2 - v / top * (H - 4);
+  let path = '', pen = false;
+  vals.forEach((v, j) => { if (v == null) { pen = false; return; } path += (pen ? 'L' : 'M') + x(j).toFixed(1) + ' ' + y(v).toFixed(1); pen = true; });
+  const dots = vals.map((v, j) => v == null ? '' : `<circle cx="${x(j).toFixed(1)}" cy="${y(v).toFixed(1)}" r="1.6"/>`).join('');
+  // Shade the recent window (the player's last N hands).
+  const N = snap.cfg.recent_hands, frac = p.hands > N ? N / p.hands : 1;
+  const shadeX = p.recent.has_earlier ? W * (1 - frac) : 0;
+  const tip = ser.map(([k, n], j) => `第 ${j + 1} 段（${fmtTime(t.ts[j])} 起）：${n ? pct(k / n) + '%（' + k + '/' + n + '）' : '无机会'}`).join('\n');
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img"><title>每段 ${t.bin} 手，原始比例（纵轴 0–${pct(top)}%）\n${esc(tip)}</title>
+    ${p.recent.has_earlier ? `<rect class="win" x="${shadeX.toFixed(1)}" y="0" width="${(W - shadeX).toFixed(1)}" height="${H}"/>` : ''}
+    <path d="${path}"/>${dots}</svg>`;
+}
+
+function statBar(r, rr, prior, label, key, p) {
+  // Whole-history posterior (band + mean); the player's last-N-hands mean as a second marker.
+  const left = r.n ? 100 * r.lo : 0, width = r.n ? 100 * (r.hi - r.lo) : 0;
+  const showRecent = p.recent.has_earlier && rr && rr.n;
+  return `<div class="statbar"><span class="tip-label" data-tip="${esc(key)}">${esc(label)}</span><div class="track" title="群体 ${pct(prior)}%">
+    ${r.n ? `<div class="band" style="left:${left}%;width:${Math.max(width, 0.5)}%"></div><div class="mean" style="left:${100 * r.mean}%"></div>` : ''}
+    ${showRecent ? `<div class="rmean" style="left:${100 * rr.mean}%" title="最近 ${snap.cfg.recent_hands} 手 ${pct(rr.mean)}% [${pct(rr.lo)}, ${pct(rr.hi)}] n=${rr.n}"></div>` : ''}
+    ${prior != null ? `<div class="prior" style="left:${100 * prior}%"></div>` : ''}</div>
+    <span class="num">${r.n ? `${pct(r.mean)}% <span class="ci">[${pct(r.lo)}, ${pct(r.hi)}] n=${r.n}</span>` : '<span class="muted">无机会</span>'}${showRecent ? ` <span class="rtxt">最近 ${pct(rr.mean)}%</span>` : ''}</span>${spark(p, key)}</div>`;
+}
+
+function leakTable(leaks) {
+  let h = '<div class="scroll"><table class="leaks"><thead><tr><th class="l">漏洞</th><th>观测</th><th>保本点</th><th>每次收益（大盲）均值 / 保守</th><th>每百手出现</th><th class="l">应对</th></tr></thead><tbody>';
+  for (const x of leaks) {
+    const o = x.observed, ok = x.gain_cons > 0;
+    const what = x.kind === 'underbluff' || x.kind === 'overbluff' ? '诈唬比例' : '弃牌';
+    h += `<tr><td class="l">${esc(x.name)}·${esc(STREET_CN[x.street] || x.street)}${ok ? '' : ' <span class="flag" title="保守值不为正，不能确认">未确认</span>'}</td>
+      <td class="num" title="[${pct(o.lo)}, ${pct(o.hi)}]">${what} ${pct(o.mean)}% <span class="ci">n=${o.n}</span></td>
+      <td class="num">${pct(x.breakeven)}%</td><td class="num">${signed(x.gain_mean, 2)} / ${signed(x.gain_cons, 2)}</td>
+      <td class="num">${x.per100.toFixed(1)}</td><td class="l">${esc(x.counter)}</td></tr>`;
+  }
+  return h + '</tbody></table></div>';
+}
+
+function changesBlock(p) {
+  const cfg = snap.cfg, N = cfg.recent_hands;
+  if (!p.recent.has_earlier) return `<p class="muted">只有 ${p.hands} 手，不到 ${N} 手，没有更早的数据可比。</p>`;
+  if (!p.changes.length) return `<p class="muted">两边机会都不到 ${cfg.recent_min_opps} 次，无法比较。</p>`;
+  const TB = ['2-4', '5-6', '7-9'], m = p.mix;
+  const side = d => TB.map(tb => pct(d[tb])).join(' / ');
+  const moved = TB.some(tb => m.earlier[tb] != null && m.recent[tb] != null && Math.abs(m.earlier[tb] - m.recent[tb]) > snap.cfg.mix_warn);
+  let h = `<p class="legend">最近 ${N} 手（${fmtTime(p.recent.since_ts)} 起）对比更早的 ${p.hands - N} 手；原始比例；`
+    + `⚠ = 所有对手所有统计一起控制错误发现率 ${Math.round(100 * cfg.fdr_q)}% 后仍显著（共 ${snap.n_change_tests} 项检验）。</p>`
+    + `<p class="legend">桌上人数 2–4 / 5–6 / 7–9 人的占比（%）：更早 ${side(m.earlier)}，最近 ${side(m.recent)}`
+    + (moved ? ' <span class="flag">⚠ 桌上人数变化大，下面的变化可能来自桌况，不一定是换了打法</span>' : '') + '</p>';
+  const rows = [...p.changes].sort((a, b) => (b.flagged - a.flagged) || (a.p - b.p));
+  h += '<div class="scroll"><table class="changes"><thead><tr><th class="l">统计</th><th>更早</th><th>最近</th><th>变化</th><th>p</th></tr></thead><tbody>';
+  for (const c of rows) {
+    const a = c.k1 / c.n1, b = c.k2 / c.n2;
+    h += `<tr class="${c.flagged ? 'hit' : ''}"><td class="l"><span class="tip-label" data-tip="${esc(c.stat + ':' + c.outcome)}">${esc(c.label)}</span>${c.flagged ? ' <span class="flag">⚠</span>' : ''}</td>
+      <td class="num">${pct(a)}% <span class="ci">${c.k1}/${c.n1}</span></td><td class="num">${pct(b)}% <span class="ci">${c.k2}/${c.n2}</span></td>
+      <td class="num">${signed(100 * (b - a))}</td><td class="num muted">${c.p < 0.001 ? c.p.toExponential(1) : c.p.toFixed(3)}</td></tr>`;
+  }
+  return h + '</tbody></table></div>';
+}
+
+function renderDetail() {
+  const p = snap.players.find(x => x.name === selected);
+  if (!p) { $('detail').innerHTML = '<div class="empty">选一个玩家</div>'; return; }
+  const cfg = snap.cfg, N = cfg.recent_hands, R = p.recent;
+  let h = `<h2>${esc(p.name)} ${p.hero ? '<span class="flag">（我方）</span>' : ''}</h2>
+    <div class="meta"><span>共 ${p.hands} 手</span><span>最后出现 ${ago(p.last_ts)}</span></div>
+    <div class="meta"><span>全部历史：${esc(p.tag)}，盈亏 ${signed(p.net_bb)} 大盲（每百手 ${signed(p.bb100)}）</span>`
+    + (R.has_earlier ? `<span>最近 ${N} 手（${fmtTime(R.since_ts)} 起）：${esc(R.tag)}，盈亏 ${signed(R.net_bb)} 大盲（每百手 ${signed(R.bb100)}）</span>` : `<span class="muted">不到 ${N} 手，最近 ${N} 手就是全部历史</span>`) + '</div>';
+  if (!p.hero) {
+    const leakSec = (title, V) => `<h3>单点剥削估计 · ${title}</h3>` + (V.hands < cfg.min_hands ? `<p class="muted">手数不足 ${cfg.min_hands}，暂不估计。</p>`
+      : !V.leaks.length ? `<p class="muted">没有均值为正的候选（或可用机会不足 ${cfg.min_opps} 次）。</p>` : leakTable(V.leaks));
+    h += leakSec('全部历史', p);
+    if (R.has_earlier) h += leakSec(`最近 ${N} 手`, R);
+    h += `<h3>近期变化 · 最近 ${N} 手 对比 更早</h3>` + changesBlock(p);
+    if (p.deviations.length) {
+      h += `<h3>与其他对手显著不同 · 全部历史（错误发现率 ${Math.round(100 * cfg.fdr_q)}%）</h3><ul class="plain">` +
+        p.deviations.map(d => `<li>${esc(d.label)}：${pct(d.k / d.n)}%（${d.k}/${d.n}），其他对手 ${pct(d.pool)}%，p=${d.p.toExponential(1)}</li>`).join('') + '</ul>';
+    }
+  }
+  const bt = Object.entries(p.by_table || {}).filter(([, [k, n]]) => n);
+  if (bt.length > 1) h += '<h3>入池率按桌上人数 · 全部历史</h3><p class="num">' + bt.map(([tb, [k, n]]) => `${tb} 人 ${pct(k / n)}%（${n}）`).join('，') + '</p>';
+  h += `<h3>全部统计</h3><p class="legend"><i style="width:10px;height:8px;background:var(--band)"></i>全部历史 90% 区间<i style="width:3px;height:12px;background:var(--accent)"></i>全部历史后验均值`
+    + (R.has_earlier ? `<i class="rkey"></i>最近 ${N} 手后验均值` : '')
+    + `<i style="width:1px;height:14px;background:var(--prior)"></i>群体均值<i style="width:14px;height:10px;background:var(--win)"></i>走势图里最近 ${N} 手的范围（走势图按他自己的手牌顺序分段，悬停看每段数值）</p>`;
+  for (const s of snap.stats) h += statBar(p.rates[s.key], R.rates[s.key], s.prior, s.label, s.key, p);
+  $('detail').innerHTML = h;
+}
+
+function renderTables() {
+  const ts = snap.tables;
+  if (!ts.length) { $('tables').innerHTML = '<div class="empty">还没有手牌</div>'; return; }
+  $('tables').innerHTML = ts.map(t => `<div class="table-row"><span class="table-id">${esc(t.table_id.slice(0, 8))} · ${ago(t.ts)}</span>` +
+    t.seats.map(s => `<button class="seat ${s.hero ? 'hero' : ''}" data-n="${esc(s.name)}">${esc(s.name ?? '座' + s.seat)}<small>${esc(s.pos)} · ${s.stack_bb} 大盲</small></button>`).join('') + '</div>').join('');
+}
+
+function renderRecent() {
+  $('recent').tBodies[0].innerHTML = snap.recent.map(h => `<tr><td class="l muted">${fmtTime(h.ts)}</td><td class="l muted">${esc(h.table_id.slice(0, 8))}</td>
+    <td class="num">${h.n}</td><td class="num">${h.pot_bb}</td><td class="l cards">${esc(h.board.join(' '))}</td><td class="l">${esc(h.winners.join(', '))}</td>
+    <td class="l cards">${Object.entries(h.shown).map(([n, c]) => esc(n) + ' ' + esc(c.join(''))).join(' · ')}</td><td class="num">${signed(h.hero_net_bb)}</td></tr>`).join('') ||
+    '<tr><td colspan="8" class="empty">还没有手牌</td></tr>';
+}
+
+function renderQuality() {
+  const s = snap, rej = Object.entries(s.rejected), f = s.forced;
+  let h = '<ul class="plain">';
+  h += `<li>通过校验 ${s.hands} 手；被拒 ${rej.reduce((a, [, v]) => a + v, 0)}${rej.length ? '（' + rej.map(([k, v]) => esc(k) + ' ' + v).join('，') + '）' : ''}</li>`;
+  h += `<li>我方名字（不计入对手和群体基准）：${esc(s.hero_names.join(', ') || '—')}</li>`;
+  h += `<li>超时代打：已剔除 ${f.forced || 0} 次；无法判断是否代打 ${f.unknown || 0} 次</li>`;
+  h += `<li>摊牌亮牌：${s.reveal.seats} 个摊牌座位亮出 ${s.reveal.shown}（${pct(s.reveal.rate)}%）；河牌诈唬比例分析${s.clean_showdown ? '启用' : '停用'}</li>`;
+  h += `<li>本进程读到的日志行：${Object.entries(s.counts).map(([k, v]) => esc(k) + ' ' + v).join('，') || '无'}</li></ul>`;
+  h += '<h3>跟随的日志</h3><ul class="plain">' + (s.files.map(x => `<li class="cards">${esc(x.path)} <span class="muted">${x.lines} 行${x.bad_lines ? '，坏行 ' + x.bad_lines : ''}，最后修改 ${ago(x.mtime)}</span></li>`).join('') || '<li class="muted">没有匹配的文件</li>') + '</ul>';
+  if (s.errors.length) h += '<h3>最近错误</h3><ul class="plain">' + s.errors.map(e => `<li class="err">${fmtTime(e.ts)} ${esc(e.msg)}</li>`).join('') + '</ul>';
+  $('quality').innerHTML = h;
+}
+
+function renderHeader() {
+  $('scope-n').textContent = snap.cfg.recent_hands;
+  $('platform').textContent = '· ' + snap.platform;
+  $('m-hands').textContent = `${snap.hands} 手`;
+  $('m-last').textContent = `最新一手 ${ago(snap.last_ts)}`;
+  $('m-built').textContent = `画像更新于 ${ago(snap.built_at)}`;
+  const st = $('status'), lastChange = Math.max(0, ...snap.files.map(f => f.mtime || 0));
+  if (failures) { st.className = 'pill down'; st.textContent = '服务连不上'; }
+  else if (!lastChange || Date.now() / 1000 - lastChange > 300) { st.className = 'pill stale'; st.textContent = '日志无新内容 ' + ago(lastChange || null); }
+  else { st.className = 'pill'; st.textContent = '实时'; }
+}
+
+function render() {
+  if (!snap) return;
+  if (!selected || !snap.players.some(p => p.name === selected)) selected = (snap.players.find(p => !p.hero) || {}).name || null;
+  renderHeader(); renderTables(); renderPlayers(); renderDetail(); renderRecent(); renderQuality();
+}
+
+function select(name) {
+  if (!name || name === 'null') return;
+  selected = name; try { localStorage.setItem('oa.sel', name); } catch {}
+  renderPlayers(); renderDetail();
+}
+// Sorting is shared: a header click in either table sorts both.
+for (const [, id] of SCOPES) $(id).addEventListener('click', e => {
+  const th = e.target.closest('th');
+  if (th) { const k = th.dataset.k; if (sortKey === k) sortDir = -sortDir; else { sortKey = k; sortDir = k === 'name' || k === 'tag' ? 1 : -1; } renderPlayers(); return; }
+  const tr = e.target.closest('tr[data-n]'); if (tr) { select(tr.dataset.n); $('detail').scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+});
+$('tables').addEventListener('click', e => { const b = e.target.closest('.seat:not(.hero)'); if (b) { select(b.dataset.n); $('detail').scrollIntoView({ block: 'nearest' }); } });
+
+async function poll() {
+  try {
+    const r = await fetch('/api/snapshot' + (snap ? '?since=' + snap.version : ''), { cache: 'no-store', signal: AbortSignal.timeout(10000) });
+    if (!r.ok) throw new Error('http ' + r.status);
+    const d = await r.json();
+    failures = 0;
+    if (d.loading) { $('status').className = 'pill stale'; $('status').textContent = '正在加载历史手牌'; }
+    else if (!d.unchanged) { snap = d; render(); } else renderHeader();
+  } catch { failures++; if (snap) renderHeader(); else $('status').textContent = '服务连不上'; $('status').className = 'pill down'; }
+  setTimeout(poll, 3000);
+}
+poll();
+</script>
+</body>
+</html>

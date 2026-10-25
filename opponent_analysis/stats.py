@@ -126,10 +126,27 @@ def norm_sf(z: float) -> float:
 
 
 def two_sided_p(k: int, n: int, p0: float) -> float:
+    """Exact two-sided binomial test of k successes in n against rate p0 (smaller tail doubled, capped at 1).
+
+    Exact rather than the normal approximation, which overstates significance badly for rare
+    outcomes at small n (3/10 against 5%: normal p ~ 3e-4, exact p ~ 0.02).
+    """
     if n == 0 or p0 <= 0 or p0 >= 1:
         return 1.0
-    z = (k / n - p0) / math.sqrt(p0 * (1 - p0) / n)
-    return 2.0 * norm_sf(abs(z))
+    upper = beta_cdf(p0, k, n - k + 1) if k > 0 else 1.0  # P(X >= k)
+    lower = beta_cdf(1.0 - p0, n - k, k + 1) if k < n else 1.0  # P(X <= k)
+    return min(1.0, 2.0 * min(upper, lower))
+
+
+def two_prop_test(k1: int, n1: int, k2: int, n2: int) -> tuple[float, float]:
+    """Pooled two-proportion z test of k2/n2 against k1/n1. Returns (z, two-sided p)."""
+    if n1 == 0 or n2 == 0:
+        return 0.0, 1.0
+    pp = (k1 + k2) / (n1 + n2)
+    if pp <= 0 or pp >= 1:
+        return 0.0, 1.0
+    z = (k2 / n2 - k1 / n1) / math.sqrt(pp * (1 - pp) * (1 / n1 + 1 / n2))
+    return z, 2.0 * norm_sf(abs(z))
 
 
 def benjamini_hochberg(pvals: list[float], q: float) -> list[bool]:
