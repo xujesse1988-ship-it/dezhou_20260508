@@ -36,6 +36,21 @@ def _fmt_act(action, to=None, delta=None, to_call=None):
     return f"{action} {delta}" if action == "call" and delta is not None else action
 
 
+def fmt_probs(probs):
+    """策略分布 [[动作, 概率]] → '(fold,call,1pot,allin)=(2,92,7,0)'：bet / raise 前缀去掉，百分比
+    四舍五入取整（各项单独取整，合计可能差 1）。没有分布（启发式 / 兜底）→ ''。"""
+    if not probs:
+        return ""
+    names, pcts = [], []
+    for name, p in probs:
+        for prefix in ("bet", "raise"):
+            if name.startswith(prefix) and name != prefix:
+                name = name[len(prefix):]
+        names.append(name)
+        pcts.append(str(int(p * 100 + 0.5)))
+    return f"({','.join(names)})=({','.join(pcts)})"
+
+
 class ActionFile:
     """行动文件（外部程序读）：每个决策点追加一行 JSON。O_APPEND + 整行一次 write，
     读方 tail 时不会读到被别的写入插进来的半行。"""
@@ -388,6 +403,8 @@ class WopoSession:
             elif hand.finished or hand.turn_key() != ctx["key"]:
                 stale = "hero_acted"
             advice = _fmt_act(resp.get("action"), resp.get("amount"), ctx["to_call"], ctx["to_call"])
+            if resp.get("action") == "raise" and resp.get("amount") == ctx["valid"].get("max_raise"):
+                advice += "（全下）"
             rec = {"ts": round(time.time(), 3), "hand_id": ctx["key"][0], "table_id": self.table_id,
                    "table_seq": ctx["table_seq"], "street": ctx["street"],
                    "hole": req["hole"], "board": ctx["board"], "pot": ctx["pot"],
@@ -407,6 +424,7 @@ class WopoSession:
             self._play(f">> 决策  来源 {rec['source']}  {ms}ms"
                        + (f"  已过期（{_STALE_CN.get(stale.split(':', 1)[0], stale)}），未写入行动文件"
                           if stale else "")
+                       + (f"  {fmt_probs(rec['probs'])}" if rec["probs"] else "")
                        + f"  建议 {advice}")
             if self.action_log:
                 self.action_log.write(json.dumps({"req": req, "resp": resp, "decide_ms": ms,

@@ -52,7 +52,7 @@ from poker_live.advisor_client import (add_advisor_args, add_fourbet_args, advis
                                        start_advisor, validate_advisor_args, validate_fourbet_args)
 from poker_live.decision import DecisionWorker
 from poker_live.table import HandEngine, HandInvalid
-from poker_live.wopo import ActionFile, WopoSession, legalize
+from poker_live.wopo import ActionFile, WopoSession, fmt_probs, legalize
 from poker_live.wslog import WsLog
 
 HERO_SEAT = 0
@@ -319,6 +319,12 @@ def _selftest_full_replay():
            and len(lines) == 3 * n_type("hand_start") + 2 * c["decisions"] + len(hero_acts)
            + n_type("community_cards") + opp_acts + c["hands_complete"],
            "play log 行数不对:\n" + play.getvalue())
+    _check(all(ln.endswith(f"=(100)  建议 {ln.rsplit('建议 ', 1)[1]}") for ln in lines
+               if ln.startswith(">> 决策")), "play log 决策行应带策略分布（stub 给 100%）")
+    _check(fmt_probs([["fold", 0.0184], ["call", 0.9151], ["raise1pot", 0.0665], ["allin", 0.0]])
+           == "(fold,call,1pot,allin)=(2,92,7,0)"
+           and fmt_probs([["check", 0.4428], ["bet0.5pot", 0.5566], ["bet1pot", 0.0002]])
+           == "(check,0.5pot,1pot)=(44,56,0)" and fmt_probs(None) == "", "策略分布格式")
     _check("seat1 Shaggyx bet 6" in lines and "seat2 hsjwnbxj raise 到 6" in lines,
            "play log：没人下注时的 raise 应写成 bet，面对下注的写 raise 到")
     _check(q["stacks"][:4] == [200, 175, 175, 250], f"hand 8 开局栈 {q['stacks'][:4]}")
