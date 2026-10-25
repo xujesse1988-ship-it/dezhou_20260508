@@ -13,7 +13,8 @@
   - hero 的动作不发服务器，写行动文件（JSONL 追加，一个决策点一行：建议动作 + 策略分布 probs）。
     hero 实际动作以服务器回来的 player_action 为准（可能和建议不同）。决策在后台线程跑：搜索没
     算完 hero 就已经出牌 → 结果过期，不写行动文件（只进 --action-log，标 stale）。
-  - 桌面座位数 = --seats（默认 9，blueprint 须同座位数），至少 3 人发牌，否则略过该手。
+  - --seats（默认 9）= solver 座位数，blueprint 须同座位数；桌子本身可以是 3..--seats 座（座位号 0..k-1，
+    多出来的 solver 座当空座），至少 3 人发牌，否则略过该手。
   - advisor 的建议先过一遍合法性：不能加注时的 all_in 改成 call（source 加 :allin_as_call），其余不在
     合法区间里的动作改安全动作（fallback:illegal_advisor_action，action-log 的 resp.rejected 记原回复）。
   - --exploit-4bet（PM-17）同 poker_manager：请求带玩家名、每手 observe 带投入金额。
@@ -532,6 +533,42 @@ def _selftest_hh_log():
     print("[selftest 8 hh 日志] 打完的手逐手写入、投入合计 = 底池；作废的手不写", file=sys.stderr)
 
 
+def _selftest_table_size():
+    """--seats 9 的 solver 接小桌：实测会话（9 座桌，座 0-3 发牌）的 table_state 裁成 6 / 8 座，
+    决策请求和 9 座时逐个相同（物理座 = solver 座，多出来的当空座）；超出 / 不连续 / 中途变 → 作废。"""
+    msgs = _fixture_msgs()
+
+    def resize(fn, only=None):
+        out = []
+        for i, m in enumerate(msgs):
+            if m["type"] == "table_state" and (only is None or i in only):
+                m = dict(m, seats=fn(m["seats"]))
+            out.append(m)
+        return out
+
+    _, base_stub, base_rows = _run_msgs(msgs)
+    strip = lambda rows: [{k: v for k, v in r.items() if k not in ("ts", "decide_ms")} for r in rows]
+    for k in (6, 8):
+        session, stub, rows = _run_msgs(resize(lambda seats: seats[:k]))
+        _check(not session.skip_reasons, f"{k} 座桌不该作废: {session.skip_reasons}")
+        _check(stub.requests == base_stub.requests and strip(rows) == strip(base_rows),
+               f"{k} 座桌的请求 / 行动文件应与 9 座时相同")
+    n_hands = sum(m["type"] == "hand_start" for m in msgs)
+    ten = resize(lambda seats: seats + [dict(seats[-1], seat=9)])
+    gap = resize(lambda seats: [x for x in seats if x["seat"] != 5])
+    for name, bad, tag in (("10 座桌", ten, "seat_count"), ("座位号不连续", gap, "seat_numbers")):
+        session, _, rows = _run_msgs(bad)
+        _check(session.skip_reasons == {tag: n_hands} and not rows,
+               f"{name}应每手作废（{tag}）: {session.skip_reasons}")
+    # 手中途座位数变了 → 只作废这一手。
+    hid = msgs[0]["hand_id"]
+    idx = [i for i, m in enumerate(msgs) if m["type"] == "table_state" and m["hand_id"] == hid]
+    session, _, _ = _run_msgs(resize(lambda seats: seats[:6], only=set(idx[1:2])))
+    _check(session.skip_reasons == {"seat_count_changed": 1}, f"中途变座位数: {session.skip_reasons}")
+    print("[selftest 10 桌子座位数] 6 / 8 座桌按 9 座 solver 照常决策（请求逐个相同）；10 座 / 座位号不连续 / "
+          "中途变 → 作废", file=sys.stderr)
+
+
 def _selftest_token():
     saved = os.environ.pop(TOKEN_ENV, None)
     try:
@@ -575,7 +612,8 @@ def run_selftest():
     _selftest_exploit_4bet()
     _selftest_hh_log()
     _selftest_token()
-    print("OK: wopo selftest 9 组场景全部通过。", file=sys.stderr)
+    _selftest_table_size()
+    print("OK: wopo selftest 10 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================

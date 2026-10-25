@@ -7,6 +7,10 @@ HandEngine 只吃规范化后的数值（服务器适配层负责把各家 JSON 
 
 座位环序 = 座位号升序（button → SB → BB → …）。至少 3 人发牌（两人局盲注 / 行动序约定不同，
 advisor 只按 OpenPoker 的 HU 约定建模，这里直接不支持）。
+
+桌子座位数 k 可以小于 solver 座位数 n_seats（同 poker_manager driver 的 table_fits_model）：服务端
+座位号须正好是 0..k-1，物理座 i = solver 座 i，solver 座 k..n_seats-1 当空座（不发牌，advisor 按
+dealt_seats 当幻影座）。空座跳过后的环序和物理桌一致，所以不用重排座位号。
 """
 
 STREETS = ("preflop", "flop", "turn", "river")
@@ -47,6 +51,7 @@ class HandEngine:
             raise HandInvalid(f"bad_button:{self.button}")
         if not (0 < self.sb <= self.bb):
             raise HandInvalid(f"bad_blinds:{self.sb}/{self.bb}")
+        self.table_seats = None  # 本手桌子座位数（首个快照定，之后不许变）
         self.started = False    # 已用首个快照建好开局状态
         self.finished = False   # 已收到 hand_result
         self.street = "preflop"
@@ -133,9 +138,16 @@ class HandEngine:
         首个快照建开局状态（发牌座 / 盲注 / 开局栈），之后每个快照全量比对。"""
         if self.finished:
             return
-        if snap.get("n_seats") != self.n_seats:
-            raise HandInvalid(f"seat_count:{snap.get('n_seats')}!={self.n_seats}")
+        k = snap.get("n_seats")
         seats = snap["seats"]
+        if self.table_seats is None:
+            if not (isinstance(k, int) and MIN_DEALT <= k <= self.n_seats):
+                raise HandInvalid(f"seat_count:{k}_not_in_{MIN_DEALT}..{self.n_seats}")
+            if set(seats) != set(range(k)):
+                raise HandInvalid(f"seat_numbers:{sorted(seats)}")
+            self.table_seats = k
+        elif k != self.table_seats or set(seats) != set(range(k)):
+            raise HandInvalid(f"seat_count_changed:{self.table_seats}->{k}")
         for s, info in seats.items():
             if info.get("name") is not None:
                 self.names[s] = info["name"]
