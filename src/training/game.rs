@@ -91,6 +91,15 @@ pub trait Game {
     /// 初始状态（含 deal chance node 已完成；后续 chance node 在 `next` 内部触发）。
     fn root(&self, rng: &mut dyn RngSource) -> Self::State;
 
+    /// 本次 update 的遍历者已定时的初始状态（ES-MCCFR 每次 update 先定遍历者、再发牌）。
+    /// 默认 = [`root`](Self::root)：不读 `traverser`、rng 消费与 `root` 逐位相同。实时搜索子树
+    /// （`SubgameNlheGame`）覆盖它，hero 当遍历者时按比例直接发 hero 真实底牌
+    /// （`real_hand_forced_deal_design_2026_10_25`）。
+    fn root_for_traverser(&self, traverser: PlayerId, rng: &mut dyn RngSource) -> Self::State {
+        let _ = traverser;
+        self.root(rng)
+    }
+
     /// 当前节点角色：[`NodeKind::Chance`] / [`NodeKind::Player`] / [`NodeKind::Terminal`]。
     fn current(state: &Self::State) -> NodeKind;
 

@@ -1,7 +1,7 @@
 # 实时搜索：hero 真实手牌单独信息集 + 按比例强制发牌 —— 实现方案（2026-10-25）
 
 来源：`docs/temp/openpoker_realtime_search_efficiency_research_2026_10_19.md` 第 1 条 / §4（调研时只读、未实现）。
-本文把它落成具体改动、验证和上线步骤。**还没动代码**。
+本文把它落成具体改动、验证和上线步骤。**已实现**（分支 `feat/real-hand-forced-deal`），实现与验证结果见 §7。
 
 标注约定同调研文档：**[事实]** = 代码逐行确认；**[推断]** = 有代码或数据支撑但没直接验证。
 
@@ -80,16 +80,17 @@
 
 ### 2.5 配置、缓存 key、预热
 
-- `SubgameSearchConfig` 加 `real_hand_q: f64`（默认 0.0 = 关）。`> 0` 时搜索两条路径（锚定 `subgame_search` / 脱锚
+- `SubgameSearchConfig` 加 `real_hand_q: Option<f64>`（默认 `None` = 关）。`Some(q)` 时搜索两条路径（锚定 `subgame_search` / 脱锚
   `subgame_search_unanchored`）建子树后调 `with_real_hand(hero_seat, hole, q)`；hero 座和底牌调用方本来就有。
-  - 「关」= `real_hand: None`，不开专用信息集。`q = 0` 但想开专用信息集（验证 V3 的慢参照）单独给一个测试用开关，不进 CLI。
+  - **实现时改了**：不另设测试开关，`Some(0.0)` 就是「只开专用信息集、不强制发牌」（V3 慢参照），CLI 传 `--search-real-hand-q 0` 即可；
+    不传 = 关。
 - `solve_cache_key`：加 `real_hand_q`、开关位、hero 座、hero 底牌（root 几何里已哈希各座 hole_cards [事实]，这里再显式加，免得依赖上游）。
 - 预热：预热请求带同样的底牌，走同一个建子树函数 → 同 key。加一个单测钉住「预热与决策算出同一个 key」。
 
 ### 2.6 advisor / driver
 
-- `tools/openpoker_advisor.rs`：CLI `--search-real-hand-q <0..1>`（默认 0），启动日志 `search ON:` 行加 `real_hand_q=`；
-  决策调试日志里记 `hero_visits` 和是否开了专用信息集。
+- `tools/openpoker_advisor.rs`：CLI `--search-real-hand-q <0..1>`（不传 = 关），启动日志 `search ON:` 行加 `real_hand_q=`；
+  决策响应里本来就有 `hero_visits`，开了以后读的就是专用信息集的访问数。
 - `tools/poker_live/advisor_client.py`：`add_advisor_args` 加定义 + `advisor_extra_args` 透传。
   （10-24 教训：advisor 加了参数而 driver 没透传，driver 启动即退出。）
 
@@ -127,3 +128,54 @@
 1. 验证表里的通过标准（尤其 V3 的 1.5 倍、V4 的 1000 次 / 0.15）。
 2. `q` 的初始值：建议 0.5，V3 / V4 时同时跑 0.25 / 0.75。
 3. 是否接着做调研 §5（同街第二次决策的路线加权）。本方案只解决「hero 抽不到真实手牌」，不解决「对手很少走到这条线」。
+
+## 7. 实现与验证结果（2026-10-25）
+
+### 7.1 实现
+
+按 §2 落地，偏差只有 §2.5 / §2.6 标出的两处（`Some(0.0)` 当慢参照、CLI 不传 = 关）。改动文件：
+`src/training/{game,trainer,subgame_trainer,nlhe,subgame,blueprint_advisor}.rs`、`tools/openpoker_advisor.rs`、
+`tools/poker_live/advisor_client.py`，新增 `tests/real_hand_forced_deal_leduc.rs`。
+
+新增测试：
+
+| 测试 | 管什么 |
+|---|---|
+| `subgame_trainer::tests::trainer_matches_hashmap_trainer`（加 2 个开启用例） | V2：开启后 HashMap / 数组两种存表逐位相同 |
+| `root_for_traverser_without_forced_deal_matches_root` | 关闭 / 对手遍历 / q=0 时发牌与 `root` 逐位相同、随机数流不变 |
+| `forced_deal_gives_hero_real_hole` | q=1 每次都发真实底牌、不撞牌、公共牌不变；q=0.5 强制比例 0.46–0.54 |
+| `real_hand_infoset_uses_dedicated_slot` | 真实底牌 → 专用桶号；其它底牌 / 其它座位不变；`query_at` 与 `info_set_for_cards` 一致 |
+| `forced_deal_raises_hero_visits` | 专用信息集访问数 ≥ 20 倍 |
+| `subgame::tests::real_hand_q_keys_solve_and_reads_dedicated_slot` | 真实搜索路径：q 进缓存 key、读专用信息集、预热与决策同 key |
+| `openpoker_advisor parse_args_real_hand_q` | CLI 解析 / 越界拒收 / 未开 --search 拒收 |
+| `forced_deal_matches_natural_draw_reference`（`--ignored`） | V3（河牌小子树版，见 7.2） |
+| `tests/real_hand_forced_deal_leduc.rs`（2 个常规 + 1 个 `--ignored`） | V1 |
+
+### 7.2 验证结果（AWS 8 核 / 15 GB，`~/rh_exp/`）
+
+| 编号 | 结果 | 结论 |
+|---|---|---|
+| V0 | 改动前（355e88e）与改动后（关闭）的 advisor，同请求同种子：65c 3 个决策 × 2 种子、2dQd 2 个决策 × 2 种子，**10 个完整响应逐字节相同**（含 blueprint 与搜索决策）。相关现有测试全部通过：子树 / 训练器 / NLHE 模块 88 个、`cfr_simplified_nlhe`（含 2 个长跑）、`cfr_kuhn`、advisor 搜索相关 34 个；fmt / clippy 通过。 | 通过 |
+| V1 | Leduc，5 种子 × 2000 万次。vanilla：基线 0.150±0.140，q=0.5 0.129±0.061；LCFR（period 40 万）：基线 0.154±0.108，q=0.5 0.195±0.077。 | 按门槛通过，但**检验力弱**：基线自己在种子间 0.03–0.40 乱跳（见 7.3） |
+| V2 | 见 7.1 | 通过 |
+| V3（原设计） | 65c：只开专用信息集 + 200 倍迭代（1.12 亿次）作慢参照，访问仍只有约 1300 次，3 个种子 fold 0.94 / 0.53 / 0.81，参照本身没收敛。 | **原设计不可行**（成本太高），改用下面的小子树版 |
+| V3（小子树版） | 桩桶表 3 人河牌子树，两种抽样同样总迭代（对手训练量相同），各 4 种子。2400 万次：自然抽样访问 ~7400、种子间 L1 1.05；q=0.5 访问 ~400 万、种子间 L1 0.37；交叉 L1 1.04（比值 1.47）。1.2 亿次：自然抽样访问 ~3.7 万、种子间 0.86；q=0.5 访问 ~2000 万、种子间 0.80；交叉 0.85（比值 1.02）。第 4 个动作均值：自然 0.35 → 0.45，强制 0.77 → 0.71。 | 通过。迭代加 5 倍后自然抽样往强制发牌靠拢、交叉距离 ≈ 组内距离，看不出系统性偏差。强制发牌组 2000 万次访问下也有一个种子落到另一个解：这个粗糙小博弈本身可能有多个均衡 |
+| V4 | 65c（关闭 → q=0.5）：`hero_visits` 102–132 → 4070–5465；fold 0.34–0.97 → 0.96–1.00；allin 0.009–0.123 → 0.000–0.033。q=0.25 / 0.75：访问 2.0–3.0 千 / 6.0–7.4 千，fold 都在 0.97–1.00（结果不随 q 变，没有偏差的旁证）。 | 65c 两个门槛都过（访问 ≥1000、allin 极差 ≤0.15） |
+| V4（偏离点） | wopo 实盘 98 条决策里只有一个「偏离且原策略几乎不选」：2dQd 翻前 blueprint fold ≈100%、hero 跟注。下一街翻牌搜索关闭时访问就有 5–6 千（同桶其它牌提供访问），**实盘数据里没出现偏离导致访问不足**。q=0.5 访问 3.8–4.2 万，但 check 概率种子间 0.75–0.99，比关闭（0.89–1.00，读的是整桶平均）更散。 | 原定「改前 low_hero_visits」的场景在实盘数据里不存在；访问多了不等于读数一定更稳 |
+| V5 | 固定迭代（561216 次）求解耗时：关闭 5.7 秒，q=0.25 / 0.5 / 0.75 都是 5.6–5.8 秒。 | AWS 上持平；生产 Mac 未测 |
+
+### 7.3 和本功能无关、但要单独查的
+
+Leduc 上这套 ES-MCCFR 跑 2000 万次，可剥削度在种子间 0.03–0.40，vanilla / LCFR 都一样。印象中外部采样在 Leduc 上同等计算量能到 0.01 量级，
+差了一个数量级左右（`invariants.md` §8：偏离 10 倍以上要停下来怀疑算法）。怀疑点 [推测]：平均策略在遍历者自己的节点上按遍历者 reach 累加，
+而访问到该节点的频率还带着对手和机会的 reach，后者随迭代变化，平均策略的时间权重可能因此有偏。没有验证，需要单独立项查。
+详细记录与验证计划见 `es_mccfr_leduc_convergence_issue_2026_10_25.md`。
+
+### 7.4 结论与下一步
+
+- 实现正确性：V0（关闭逐位不变）、V2（两种存表一致）、单测全部通过。
+- 效果：65c 那类「对手下注后才轮到 hero」的点，访问涨约 40 倍、种子间策略明显稳定（V4）；求解耗时不变（V5，AWS）。
+- 无偏：理论论证（§1）+ V3 小子树版 + V4 不同 q 结果一致，三方面都没发现偏差；V1（Leduc）检验力弱，只能说明没把收敛搞坏。
+- 实盘数据里 wopo 偏离导致访问不足的情况没出现过（同桶其它牌已提供足够访问），这个功能对 wopo 偏离的实际收益比预想小，
+  主要收益在 65c 这类深层落点。另外读专用信息集后，策略只代表这一手牌、不再是整桶平均，在近似无差别的点上种子间可能更散（2dQd）。
+- 上线建议：按 §4 做实盘 A/B（`--search-real-hand-q 0.5` 对照不开）。生产 Mac 的耗时（V5）上线前测一次。

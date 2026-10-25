@@ -45,7 +45,7 @@ use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::{Game, NodeKind, PlayerId};
 use crate::training::nlhe::{
-    cached_hand_bucket, pack_info_set_v2, SeatBucketCache, SimplifiedNlheAction,
+    cached_hand_bucket, pack_info_set_v2, RealHandTag, SeatBucketCache, SimplifiedNlheAction,
     SimplifiedNlheGame, SimplifiedNlheInfoSet, SimplifiedNlheState,
 };
 use crate::training::nlhe_betting_tree::{
@@ -197,6 +197,45 @@ pub struct SubgameNlheGame {
     /// 叶子查 blueprint 续局值（[`SubgameLeafCtx`]）；`None`（6a）= 子树解到真实终局、走真实
     /// showdown payoff。`root` 把它 clone 进 state（depth-limit 叶子 `payoff` 读）。
     leaf_ctx: Option<Arc<SubgameLeafCtx>>,
+    /// hero 真实手牌单独信息集 + 强制发牌（[`with_real_hand`](Self::with_real_hand)，
+    /// `real_hand_forced_deal_design_2026_10_25`）。`None` = 关（既有行为逐位不变）。
+    real_hand: Option<RealHand>,
+}
+
+/// [`SubgameNlheGame::with_real_hand`] 的配置。
+#[derive(Clone, Copy, Debug)]
+struct RealHand {
+    /// 写进每个 state 的信息集标记（座位 + 真实底牌掩码 + 各街专用桶号）。
+    tag: RealHandTag,
+    hole: [Card; 2],
+    /// hero 当遍历者时直接发真实底牌的概率（0 = 只开专用信息集、不强制发牌）。
+    q: f64,
+}
+
+/// 两张牌的 52-bit 牌位掩码。
+fn hole_mask(hole: [Card; 2]) -> u64 {
+    (1u64 << hole[0].to_u8()) | (1u64 << hole[1].to_u8())
+}
+
+/// 53-bit 单位均匀数（与 [`sample_discrete`] / range 采样同型）。
+fn unit_f64(rng: &mut dyn RngSource) -> f64 {
+    (rng.next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
+}
+
+/// 在 `used` 之外均匀抽两张不同的牌（= 可用组合上的均匀分布）：逐张拒绝采样。
+fn sample_uniform_hole(used: u64, rng: &mut dyn RngSource) -> [Card; 2] {
+    let mut draw = |used: u64| loop {
+        let c = (unit_f64(rng) * 52.0) as u8;
+        if c < 52 && used & (1u64 << c) == 0 {
+            return c;
+        }
+    };
+    let a = draw(used);
+    let b = draw(used | (1u64 << a));
+    [
+        Card::from_u8(a).expect("card index < 52"),
+        Card::from_u8(b).expect("card index < 52"),
+    ]
 }
 
 /// 单座位 range 的归一前缀和（[`SubgameNlheGame::sample_holes_from_ranges`] 热路径）。
@@ -276,6 +315,7 @@ impl SubgameNlheGame {
             range_cdfs: Vec::new(),
             hole_masks: Vec::new(),
             leaf_ctx: None,
+            real_hand: None,
         }
     }
 
@@ -388,6 +428,7 @@ impl SubgameNlheGame {
             range_cdfs: Vec::new(),
             hole_masks: Vec::new(),
             leaf_ctx,
+            real_hand: None,
         };
         if let Some(r) = ranges {
             g.attach_ranges(r);
@@ -433,27 +474,126 @@ impl SubgameNlheGame {
             if player.hole_cards.is_none() {
                 continue; // 弃牌座：无底牌。
             }
-            let mut chosen: Option<usize> = None;
-            if let Some(cdf) = self.range_cdfs[seat].as_ref() {
-                for _ in 0..RANGE_REJECTION_RETRY_CAP {
-                    // 与 sample_discrete 同型的 53-bit 单位均匀采样。
-                    let u = (rng.next_u64() >> 11) as f64 / ((1u64 << 53) as f64);
-                    let mut idx = cdf.cum.partition_point(|&c| c <= u);
-                    if idx >= cdf.cum.len() {
-                        idx = cdf.last_positive; // 尾部浮点缝隙（u ≥ cum.last()）保底。
-                    }
-                    if self.hole_masks[idx] & used == 0 {
-                        chosen = Some(idx);
-                        break;
-                    }
-                }
-            }
-            let chosen_idx =
-                chosen.unwrap_or_else(|| self.sample_hole_exact(&ranges[seat], used, rng));
+            let chosen_idx = self.sample_seat_from_range(seat, ranges, used, rng);
             used |= self.hole_masks[chosen_idx];
             out[seat] = Some(self.hole_combos[chosen_idx]);
         }
         out
+    }
+
+    /// [`sample_holes_from_ranges`](Self::sample_holes_from_ranges) 的单座位一步：在 `used` 之外按
+    /// `ranges[seat]` 抽一手，返回 `hole_combos` 下标。CDF 二分 + 撞牌拒绝重采，连拒
+    /// [`RANGE_REJECTION_RETRY_CAP`] 次或无 CDF → [`sample_hole_exact`](Self::sample_hole_exact)。
+    fn sample_seat_from_range(
+        &self,
+        seat: usize,
+        ranges: &[Vec<f64>],
+        used: u64,
+        rng: &mut dyn RngSource,
+    ) -> usize {
+        if let Some(cdf) = self.range_cdfs[seat].as_ref() {
+            for _ in 0..RANGE_REJECTION_RETRY_CAP {
+                // 与 sample_discrete 同型的 53-bit 单位均匀采样。
+                let u = unit_f64(rng);
+                let mut idx = cdf.cum.partition_point(|&c| c <= u);
+                if idx >= cdf.cum.len() {
+                    idx = cdf.last_positive; // 尾部浮点缝隙（u ≥ cum.last()）保底。
+                }
+                if self.hole_masks[idx] & used == 0 {
+                    return idx;
+                }
+            }
+        }
+        self.sample_hole_exact(&ranges[seat], used, rng)
+    }
+
+    /// 强制发牌（[`root_for_traverser`](Game::root_for_traverser)）：`fixed_seat` 拿 `fixed_hole`，
+    /// 其余未弃牌座位在去掉 board + 这两张之后按座位顺序抽——有 range 按 range（同
+    /// [`sample_holes_from_ranges`](Self::sample_holes_from_ranges) 的单座位步），无 range 在可用牌里
+    /// 均匀抽。
+    fn sample_holes_with_fixed(
+        &self,
+        fixed_seat: usize,
+        fixed_hole: [Card; 2],
+        rng: &mut dyn RngSource,
+    ) -> Vec<Option<[Card; 2]>> {
+        let mut used: u64 = self
+            .template
+            .board()
+            .iter()
+            .fold(hole_mask(fixed_hole), |m, c| m | (1u64 << c.to_u8()));
+        let players = self.template.players();
+        let mut out: Vec<Option<[Card; 2]>> = vec![None; players.len()];
+        out[fixed_seat] = Some(fixed_hole);
+        for (seat, player) in players.iter().enumerate() {
+            if seat == fixed_seat || player.hole_cards.is_none() {
+                continue;
+            }
+            let hole = match &self.ranges {
+                Some(ranges) => {
+                    let idx = self.sample_seat_from_range(seat, ranges, used, rng);
+                    self.hole_combos[idx]
+                }
+                None => sample_uniform_hole(used, rng),
+            };
+            used |= hole_mask(hole);
+            out[seat] = Some(hole);
+        }
+        out
+    }
+
+    /// 打开「hero 真实手牌单独信息集」（`real_hand_forced_deal_design_2026_10_25`）：`seat` 拿着
+    /// 真实底牌 `hole` 时信息集换成该街专用桶号（= 该街桶数）；hero 当遍历者时以概率 `q` 直接发
+    /// `hole`（`q = 0` = 只开专用信息集，验证用的慢参照）。
+    pub fn with_real_hand(mut self, seat: PlayerId, hole: [Card; 2], q: f64) -> Self {
+        assert!(
+            (0.0..=1.0).contains(&q),
+            "real hand q must be within [0, 1], got {q}"
+        );
+        assert!(
+            self.template.players()[seat as usize].hole_cards.is_some(),
+            "real hand seat {seat} has folded"
+        );
+        let slot_by_street = [
+            StreetTag::Preflop,
+            StreetTag::Flop,
+            StreetTag::Turn,
+            StreetTag::River,
+        ]
+        .map(|s| self.bucket_table.bucket_count(s));
+        self.real_hand = Some(RealHand {
+            tag: RealHandTag {
+                seat,
+                hole_mask: hole_mask(hole),
+                slot_by_street,
+            },
+            hole,
+            q,
+        });
+        self
+    }
+
+    /// 是否开了 [`with_real_hand`](Self::with_real_hand)（[`SubgameTrainer`] 据此每街多留一格桶位）。
+    pub(crate) fn has_real_hand(&self) -> bool {
+        self.real_hand.is_some()
+    }
+
+    /// 从重发过隐藏牌的 `game_state` 建子树根 state（[`root`](Game::root) /
+    /// [`root_for_traverser`](Game::root_for_traverser) 共用）。
+    fn root_state_from(&self, game_state: GameState) -> SimplifiedNlheState {
+        SimplifiedNlheState {
+            game_state,
+            action_history: Vec::new(),
+            bucket_table: Arc::clone(&self.bucket_table),
+            current_node_id: self.subtree.root_id(),
+            tree: Arc::clone(&self.subtree),
+            abs: Arc::clone(&self.abs),
+            info_set_cache: AtomicU64::new(0),
+            seat_bucket_cache: SeatBucketCache::default(),
+            // 6b depth-limit：把叶子值上下文带进 state（叶子 payoff 读）；6a/uniform = None。
+            leaf_ctx: self.leaf_ctx.clone(),
+            real_hand: self.real_hand.map(|r| r.tag),
+        }
     }
 
     /// 单座位精确扫描采样（旧实现路径，留作拒绝采样的兜底）：限制到「不撞 `used`」的正权
@@ -522,8 +662,9 @@ impl SubgameNlheGame {
             info_set_cache: AtomicU64::new(0),
             seat_bucket_cache: SeatBucketCache::default(),
             leaf_ctx: None, // query 读非叶决策点策略，不查叶子值。
+            real_hand: self.real_hand.map(|r| r.tag),
         };
-        let info = SimplifiedNlheGame::info_set(&query, actor);
+        let info = <Self as Game>::info_set(&query, actor);
         let legal = SimplifiedNlheGame::legal_actions(&query);
         (info, legal)
     }
@@ -558,7 +699,18 @@ impl SubgameNlheGame {
         hole: [Card; 2],
         board: &[Card],
     ) -> SimplifiedNlheInfoSet {
-        let street_tag = self.subtree.node(node_id).street;
+        let node = self.subtree.node(node_id);
+        let street_tag = node.street;
+        if let Some(rh) = self.real_hand {
+            // 与 solve 期 `Game::info_set` 同口径：hero 决策点 + 真实底牌 → 专用桶号。
+            if node.player_acting == rh.tag.seat && hole_mask(hole) == rh.tag.hole_mask {
+                return pack_info_set_v2(
+                    rh.tag.slot_by_street[street_tag as usize],
+                    node_id,
+                    street_tag,
+                );
+            }
+        }
         let hand_bucket: u32 = match street_tag {
             StreetTag::Preflop => u32::from(PreflopLossless169::new().hand_class(hole)),
             StreetTag::Flop | StreetTag::Turn | StreetTag::River => {
@@ -605,6 +757,33 @@ fn navigate_subtree(
     Ok(id)
 }
 
+/// [`RealHandTag`] 换桶号：`actor` 是标记座位且底牌正好是真实那两张 → 该街专用桶号重新打包；
+/// 否则原样返回 `info`。只在子树游戏里调用（base game 的 `info_set` 不读标记）。
+fn real_hand_info_set(
+    state: &SimplifiedNlheState,
+    actor: PlayerId,
+    info: SimplifiedNlheInfoSet,
+) -> SimplifiedNlheInfoSet {
+    let Some(tag) = state.real_hand else {
+        return info;
+    };
+    if tag.seat != actor {
+        return info;
+    }
+    let is_real = state.game_state.players()[actor as usize]
+        .hole_cards
+        .is_some_and(|h| hole_mask(h) == tag.hole_mask);
+    if !is_real {
+        return info;
+    }
+    let street = info.street_tag();
+    pack_info_set_v2(
+        tag.slot_by_street[street as usize],
+        state.current_node_id,
+        street,
+    )
+}
+
 impl Game for SubgameNlheGame {
     type State = SimplifiedNlheState;
     type Action = SimplifiedNlheAction;
@@ -631,18 +810,25 @@ impl Game for SubgameNlheGame {
             }
             None => self.template.resample_hidden(rng),
         };
-        SimplifiedNlheState {
-            game_state,
-            action_history: Vec::new(),
-            bucket_table: Arc::clone(&self.bucket_table),
-            current_node_id: self.subtree.root_id(),
-            tree: Arc::clone(&self.subtree),
-            abs: Arc::clone(&self.abs),
-            info_set_cache: AtomicU64::new(0),
-            seat_bucket_cache: SeatBucketCache::default(),
-            // 6b depth-limit：把叶子值上下文带进 state（叶子 payoff 读）；6a/uniform = None。
-            leaf_ctx: self.leaf_ctx.clone(),
+        self.root_state_from(game_state)
+    }
+
+    /// hero 当遍历者时以概率 `q` 直接发真实底牌（[`with_real_hand`](Self::with_real_hand)）。
+    /// 其余情况 = [`root`](Game::root)，且**不额外消耗随机数**：功能关闭 / 对手当遍历者时
+    /// rng 流与 `root` 逐位相同。
+    fn root_for_traverser(
+        &self,
+        traverser: PlayerId,
+        rng: &mut dyn RngSource,
+    ) -> SimplifiedNlheState {
+        if let Some(rh) = self.real_hand {
+            if rh.q > 0.0 && traverser == rh.tag.seat && unit_f64(rng) < rh.q {
+                let holes = self.sample_holes_with_fixed(traverser as usize, rh.hole, rng);
+                let game_state = self.template.resample_hidden_with_holes(&holes, rng);
+                return self.root_state_from(game_state);
+            }
         }
+        self.root(rng)
     }
 
     // 多数 delegate SimplifiedNlheGame——只读 state 携带的 tree/abs/game_state（关联函数，与
@@ -657,7 +843,8 @@ impl Game for SubgameNlheGame {
     }
 
     fn info_set(state: &SimplifiedNlheState, actor: PlayerId) -> SimplifiedNlheInfoSet {
-        SimplifiedNlheGame::info_set(state, actor)
+        let info = SimplifiedNlheGame::info_set(state, actor);
+        real_hand_info_set(state, actor, info)
     }
 
     fn legal_actions(state: &SimplifiedNlheState) -> Vec<SimplifiedNlheAction> {
@@ -973,6 +1160,11 @@ pub struct SubgameSearchConfig {
     ///
     /// 只管读数、不进 solve：**不进** [`solve_cache_key`]（同一份解可按不同门槛读）。
     pub min_hero_visits: u32,
+    /// hero 真实手牌单独信息集 + 强制发牌（`real_hand_forced_deal_design_2026_10_25`）。
+    /// `None`（默认）= 关，既有行为逐位不变。`Some(q)`：hero 拿着真实底牌时用专用信息集，hero 当
+    /// 遍历者时以概率 `q ∈ [0, 1]` 直接发真实底牌；`Some(0.0)` = 只开专用信息集不强制发牌（验证用
+    /// 的慢参照）。进 [`solve_cache_key`]，读数和访问量门槛读的就是专用信息集。
+    pub real_hand_q: Option<f64>,
 }
 
 /// [`SubgameSearchConfig::min_hero_visits`] 拒读时 `Err` 字符串的前缀。调用方用
@@ -1003,6 +1195,7 @@ impl Default for SubgameSearchConfig {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            real_hand_q: None,
         }
     }
 }
@@ -2004,6 +2197,45 @@ impl Default for SubgameSolveCache {
 /// 缓存 key 的路径判别（anchored 与 unanchored 不串条目——即便其余输入碰巧相同也分开，
 /// 读数契约 / rules 处理不同，保守隔离）。
 const KEY_KIND_ANCHORED: u8 = 0;
+
+/// 一次 solve 的「hero 真实手牌单独信息集」参数（[`SubgameSearchConfig::real_hand_q`] 开时）。
+#[derive(Clone, Copy, Debug)]
+struct RealHandSpec {
+    seat: PlayerId,
+    hole: [Card; 2],
+    q: f64,
+}
+
+/// `cfg.real_hand_q` 开且 `auth` 里 hero（`hero_seat`）有底牌 → [`RealHandSpec`]；否则 `None`。
+/// 决策与预热（`auth = round_start`、`hero_seat = actor_override`）算出同一份 → 同 key。
+fn real_hand_spec(
+    cfg: &SubgameSearchConfig,
+    auth: &GameState,
+    hero_seat: PlayerId,
+) -> Option<RealHandSpec> {
+    let q = cfg.real_hand_q?;
+    let hole = auth.players()[hero_seat as usize].hole_cards?;
+    Some(RealHandSpec {
+        seat: hero_seat,
+        hole,
+        q,
+    })
+}
+
+/// 按 [`RealHandSpec`] 打开子树游戏的真实手牌单独信息集（`None` = 原样返回）。子树根状态里 hero
+/// 没有底牌（不应发生：搜索只在 hero 未弃牌时触发）→ 不开，而不是 panic。
+fn apply_real_hand(sub: SubgameNlheGame, spec: Option<RealHandSpec>) -> SubgameNlheGame {
+    match spec {
+        Some(rh)
+            if sub.template().players()[rh.seat as usize]
+                .hole_cards
+                .is_some() =>
+        {
+            sub.with_real_hand(rh.seat, rh.hole, rh.q)
+        }
+        _ => sub,
+    }
+}
 const KEY_KIND_UNANCHORED: u8 = 1;
 
 /// solve 缓存 key = blake3(solve 的**全部**实际构造输入)。在 solve 边界现算（非请求层推导）：
@@ -2041,9 +2273,18 @@ fn solve_cache_key(
     cfg: &SubgameSearchConfig,
     hand_seed: u64,
     seed_ordinal: u64,
+    real_hand: Option<RealHandSpec>,
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(&[kind]);
+    // hero 真实手牌单独信息集（`cfg.real_hand_q`）：座位 + 底牌掩码 + q 都改变 solve。`None` 不写任何
+    // 字节 → 关闭时 key 与改动前逐位相同。
+    if let Some(rh) = real_hand {
+        h.update(b"real_hand");
+        h.update(&[rh.seat]);
+        h.update(&hole_mask(rh.hole).to_le_bytes());
+        h.update(&rh.q.to_le_bytes());
+    }
     h.update(&sub_table.content_hash());
     h.update(&(Arc::as_ptr(sub_table) as usize as u64).to_le_bytes());
     // cfg 全字段。
@@ -2525,6 +2766,7 @@ fn subgame_search_cached_inner(
             debug_dump_ranges("anchored", r, &all_hole_combos());
         }
     }
+    let real_hand = real_hand_spec(cfg, auth, auth_actor);
     let key = cache.as_ref().map(|_| {
         solve_cache_key(
             KEY_KIND_ANCHORED,
@@ -2538,6 +2780,7 @@ fn subgame_search_cached_inner(
             cfg,
             hand_seed,
             seed_ordinal,
+            real_hand,
         )
     });
     // 建 subgame + 求解（仅 miss / 无缓存时跑）：bucket 表 + 上面选定的 action 抽象
@@ -2597,6 +2840,7 @@ fn subgame_search_cached_inner(
                 raises_on_street,
             )
         };
+        let sub = apply_real_hand(sub, real_hand);
         let trainer = solve_subgame(sub, cfg, master)?;
         Ok(SolvedSubgame {
             trainer,
@@ -3484,6 +3728,7 @@ fn subgame_search_unanchored_cached_inner(
     let sub_table: Arc<BucketTable> =
         bucket_override.map_or_else(|| Arc::clone(&game.bucket_table), Arc::clone);
     let master = search_seed(cfg.seed, hand_seed, street_tag as u64);
+    let real_hand = real_hand_spec(cfg, auth, auth_actor);
     let key = cache.as_ref().map(|_| {
         solve_cache_key(
             KEY_KIND_UNANCHORED,
@@ -3497,6 +3742,7 @@ fn subgame_search_unanchored_cached_inner(
             cfg,
             hand_seed,
             street_tag as u64,
+            real_hand,
         )
     });
     // 建树前规模闸（≥7 Active 才计数）：只在真要建树时跑——缓存命中不数；被拒过的 key 直接复用
@@ -3533,6 +3779,7 @@ fn subgame_search_unanchored_cached_inner(
                 0,
             )
         };
+        let sub = apply_real_hand(sub, real_hand);
         let trainer = solve_subgame(sub, cfg, master)?;
         Ok(SolvedSubgame {
             trainer,
@@ -4227,6 +4474,7 @@ mod tests {
             info_set_cache: AtomicU64::new(0),
             seat_bucket_cache: SeatBucketCache::default(),
             leaf_ctx: None,
+            real_hand: None,
         };
         let info = SimplifiedNlheGame::info_set(&query, actor);
         let avg = a.average_strategy(&info);
@@ -4339,6 +4587,7 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            real_hand_q: None,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -4401,6 +4650,7 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            real_hand_q: None,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, None, 0, 0,
@@ -4876,6 +5126,7 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            real_hand_q: None,
         };
         let d9 = subgame_search(
             &auth,
@@ -5638,6 +5889,7 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            real_hand_q: None,
         };
         let run = |cfg: &SubgameSearchConfig| {
             subgame_search(
@@ -5714,6 +5966,7 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            real_hand_q: None,
         };
         let base = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &none_cfg, None, None, 0x55, 4,
@@ -9472,5 +9725,75 @@ mod tests {
         )
         .expect("prewarm");
         assert_eq!(cache.last_read_visits(), None, "预热不读数 → 遥测清空");
+    }
+
+    /// `real_hand_q`（hero 真实手牌单独信息集 + 强制发牌）走真实搜索路径：q 进缓存 key（开 / 关 /
+    /// 不同 q 各自一份解，同 q 命中）；读数读专用信息集（访问数 ≈ hero 遍历数 × q）；预热算出同一个
+    /// key，随后的决策直接命中。
+    #[test]
+    fn real_hand_q_keys_solve_and_reads_dedicated_slot() {
+        let auth = nway_limped_flop_state(3, 12_100, 0x5245_414C_4841_4E44); // "REALHAND"
+        let base = SubgameSearchConfig {
+            iterations: 3_000,
+            max_subtree_nodes: 1_000_000,
+            use_blueprint_range: false,
+            trigger: SearchTrigger::AllPostflop,
+            deep_menu: true,
+            live_traversers: true,
+            ..SubgameSearchConfig::default()
+        };
+        let with_q = |q: Option<f64>| SubgameSearchConfig {
+            real_hand_q: q,
+            ..base
+        };
+        let (abs, rules) = deep_menu_for(&auth);
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            auth.config().clone(),
+            abs,
+            rules,
+        )
+        .expect("game");
+        let run = |cache: &mut SubgameSolveCache, cfg: &SubgameSearchConfig| {
+            subgame_search_unanchored_cached(
+                Some(cache),
+                &auth,
+                &auth,
+                &game,
+                &[],
+                cfg,
+                None,
+                None,
+                0x5EED,
+            )
+        };
+        let mut cache = SubgameSolveCache::new();
+        run(&mut cache, &with_q(None)).expect("off");
+        run(&mut cache, &with_q(Some(0.5))).expect("q=0.5");
+        assert_eq!((cache.hits(), cache.misses()), (0, 2), "开 / 关是两份解");
+        // 3 个 live 座轮流遍历 → hero 遍历约 1000 次，一半强制发真实底牌；桩桶表下自然抽到真实组合
+        // 才进专用信息集（≈1/1000），所以访问数落在 ~500。
+        let v = cache.last_read_visits().expect("读数遥测");
+        assert!((400..=650).contains(&v), "专用信息集访问数 {v}");
+        run(&mut cache, &with_q(Some(0.5))).expect("same q");
+        assert_eq!(cache.hits(), 1, "同 q 命中");
+        run(&mut cache, &with_q(Some(0.25))).expect("q=0.25");
+        assert_eq!(cache.misses(), 3, "不同 q 另解");
+        // 预热（hero = 当前行动者）与决策同 key。
+        let hero = auth.current_player().unwrap().0 as PlayerId;
+        let mut cache = SubgameSolveCache::new();
+        subgame_search_unanchored_prewarm(
+            &mut cache,
+            hero,
+            &auth,
+            &game,
+            None,
+            &with_q(Some(0.5)),
+            None,
+            0x5EED,
+        )
+        .expect("prewarm");
+        run(&mut cache, &with_q(Some(0.5))).expect("decide after prewarm");
+        assert_eq!((cache.hits(), cache.misses()), (1, 1), "预热后决策命中");
     }
 }

@@ -4838,8 +4838,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} iters_turn={} iters_river={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} force_unanchored={} limp_as_fold={} min_hero_visits={} weak_commit_guard={} bucket_table={}",
-            scfg.trigger, scfg.iterations, rt.cfg_for(poker::Street::Turn).iterations, rt.cfg_for(poker::Street::River).iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.force_unanchored, rt.limp_as_fold, scfg.min_hero_visits, rt.weak_commit_guard,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} iters_turn={} iters_river={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} force_unanchored={} limp_as_fold={} min_hero_visits={} real_hand_q={:?} weak_commit_guard={} bucket_table={}",
+            scfg.trigger, scfg.iterations, rt.cfg_for(poker::Street::Turn).iterations, rt.cfg_for(poker::Street::River).iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.force_unanchored, rt.limp_as_fold, scfg.min_hero_visits, scfg.real_hand_q, rt.weak_commit_guard,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
         if let Some(cell) = &rt.exploit {
@@ -5059,6 +5059,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_force_unanchored: Option<bool> = None;
     let mut search_limp_as_fold: Option<bool> = None;
     let mut search_min_hero_visits: Option<u32> = None;
+    let mut search_real_hand_q: Option<f64> = None;
     let mut search_weak_commit_guard: Option<bool> = None;
     // 叠加剥削（--exploit*，仅 --search 开时生效）。
     let mut exploit_on = false;
@@ -5248,6 +5249,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                         .map_err(|e| format!("bad search-min-hero-visits: {e}"))?,
                 )
             }
+            "--search-real-hand-q" => {
+                let q: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad search-real-hand-q: {e}"))?;
+                if !(0.0..=1.0).contains(&q) {
+                    return Err(format!("--search-real-hand-q 须在 [0, 1]，得 {q}"));
+                }
+                search_real_hand_q = Some(q);
+            }
             "--search-weak-commit-guard" => {
                 let v = next_val(&mut it, &arg)?;
                 search_weak_commit_guard = Some(match v.as_str() {
@@ -5369,6 +5379,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             solve_threads: search_solve_threads.unwrap_or(1),
             // 读数门槛（SubgameSearchConfig::min_hero_visits doc）：hero 信息集访问不足就不用这份解。
             min_hero_visits: search_min_hero_visits.unwrap_or(DEFAULT_SEARCH_MIN_HERO_VISITS),
+            // hero 真实手牌单独信息集 + 强制发牌（SubgameSearchConfig::real_hand_q doc）：不传 = 关。
+            real_hand_q: search_real_hand_q,
             // 解到终局（深码 / 多人 §2.1）：depth_limit / biased_leaf 均 false（默认）；
             // resolve_root / use_blueprint_range / seed 用默认（RoundStart / true / 固定基）。
             ..SubgameSearchConfig::default()
@@ -5391,6 +5403,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_force_unanchored.is_some()
             || search_limp_as_fold.is_some()
             || search_min_hero_visits.is_some()
+            || search_real_hand_q.is_some()
             || search_weak_commit_guard.is_some()
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
@@ -12390,6 +12403,34 @@ mod tests {
         assert!(parse(&["--search", "--search-weak-commit-guard", "maybe"]).is_err());
         assert!(parse(&["--search-min-hero-visits", "200"]).is_err());
         assert!(parse(&["--search-weak-commit-guard", "on"]).is_err());
+    }
+
+    /// `--search-real-hand-q`：不传 = 关（`None`）；`[0, 1]` 内收（含 0 = 只开专用信息集）；越界 / 坏值
+    /// 拒收；未开 --search 拒收。
+    #[test]
+    fn parse_args_real_hand_q() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        assert_eq!(
+            parse(&["--search"]).unwrap().search.unwrap().real_hand_q,
+            None
+        );
+        for (v, want) in [("0.5", 0.5), ("0", 0.0), ("1", 1.0)] {
+            let a = parse(&["--search", "--search-real-hand-q", v]).unwrap();
+            assert_eq!(a.search.unwrap().real_hand_q, Some(want), "{v}");
+        }
+        for bad in ["-0.1", "1.5", "x", "NaN"] {
+            assert!(
+                parse(&["--search", "--search-real-hand-q", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse(&["--search-real-hand-q", "0.5"]).is_err());
     }
 
     /// 9 座实盘 65c 那一请求（flop 3h9d8s，check / check 后 BTN 下 2 倍池，轮到我方）：

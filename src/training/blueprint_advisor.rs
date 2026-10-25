@@ -1169,6 +1169,7 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: crate::abstraction::info::StreetTag::River,
             min_hero_visits: 0,
+            real_hand_q: None,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;

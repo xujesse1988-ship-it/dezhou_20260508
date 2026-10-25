@@ -569,7 +569,7 @@ impl<G: Game> EsMccfrTrainer<G> {
                             Some(rot) => rot[(t % rot.len() as u64) as usize],
                             None => (t % n_players) as PlayerId,
                         };
-                        let root = game.root(rng);
+                        let root = game.root_for_traverser(traverser, rng);
                         recurse_es_parallel::<G>(
                             root,
                             traverser,
@@ -619,7 +619,7 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             Some(rot) => rot[(self.update_count % rot.len() as u64) as usize],
             None => (self.update_count % n_players) as PlayerId,
         };
-        let root = self.game.root(rng);
+        let root = self.game.root_for_traverser(traverser, rng);
         recurse_es::<G>(
             root,
             traverser,

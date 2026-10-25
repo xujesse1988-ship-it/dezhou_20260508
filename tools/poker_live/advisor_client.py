@@ -139,6 +139,9 @@ def add_advisor_args(p, default_seats, debug_help):
     # 搜索读数门槛（advisor 默认 200）：hero 信息集在 solve 里被遍历不足这么多次就不用这份解，
     # flop 退回 blueprint、转牌 / 河牌兜底；0 = 关。不传 = 吃 advisor 默认。
     p.add_argument("--search-min-hero-visits", type=int, default=None)
+    # hero 真实手牌单独信息集 + 强制发牌（advisor 默认关）：hero 当遍历者时以比例 q 直接发真实底牌，
+    # 0 = 只开专用信息集。不传 = 关。
+    p.add_argument("--search-real-hand-q", type=float, default=None)
     # 弱牌押上全部筹码护栏（advisor 默认 on）：翻后弱牌不全下、不做投入过半剩余筹码的加注。
     # 不传 = 吃 advisor 默认（ON）。
     p.add_argument("--search-weak-commit-guard", choices=["on", "off"], default=None)
@@ -202,6 +205,10 @@ def validate_advisor_args(args):
         raise SystemExit("--search-min-hero-visits 需配 --search（它只管搜索读数）")
     if args.search_min_hero_visits is not None and args.search_min_hero_visits < 0:
         raise SystemExit("--search-min-hero-visits 须 ≥ 0")
+    if args.search_real_hand_q is not None and not args.search:
+        raise SystemExit("--search-real-hand-q 需配 --search（它只管搜索求解）")
+    if args.search_real_hand_q is not None and not 0.0 <= args.search_real_hand_q <= 1.0:
+        raise SystemExit("--search-real-hand-q 须在 [0, 1]")
     for name in ("search_iterations_turn", "search_iterations_river"):
         value = getattr(args, name)
         flag = "--" + name.replace("_", "-")
@@ -250,6 +257,8 @@ def advisor_extra_args(args, warm_profile_hh=None):
             extra += ["--search-limp-as-fold", args.search_limp_as_fold]
         if args.search_min_hero_visits is not None:
             extra += ["--search-min-hero-visits", str(args.search_min_hero_visits)]
+        if args.search_real_hand_q is not None:
+            extra += ["--search-real-hand-q", repr(args.search_real_hand_q)]
         if args.search_weak_commit_guard is not None:
             extra += ["--search-weak-commit-guard", args.search_weak_commit_guard]
         if args.search_deep_menu:

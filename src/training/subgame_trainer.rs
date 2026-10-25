@@ -268,11 +268,13 @@ pub struct SubgameTrainer {
 impl SubgameTrainer {
     pub fn new(game: SubgameNlheGame) -> Self {
         let table = game.bucket_table();
+        // hero 真实手牌单独信息集：专用桶号 = 该街桶数，每街多留一格（`SubgameNlheGame::with_real_hand`）。
+        let extra = u32::from(game.has_real_hand());
         let bucket_count_by_street = [
-            table.bucket_count(StreetTag::Preflop),
-            table.bucket_count(StreetTag::Flop),
-            table.bucket_count(StreetTag::Turn),
-            table.bucket_count(StreetTag::River),
+            table.bucket_count(StreetTag::Preflop) + extra,
+            table.bucket_count(StreetTag::Flop) + extra,
+            table.bucket_count(StreetTag::Turn) + extra,
+            table.bucket_count(StreetTag::River) + extra,
         ];
         let tables = SubgameTables::new(game.subtree().num_nodes(), bucket_count_by_street);
         Self {
@@ -346,7 +348,7 @@ impl SubgameTrainer {
     /// One update (`EsMccfrTrainer::step`).
     pub fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError> {
         let traverser = self.traverser_at(self.update_count);
-        let root = self.game.root(rng);
+        let root = self.game.root_for_traverser(traverser, rng);
         let track = self.track_visits;
         recurse(root, traverser, 1.0, &mut self.tables, track, rng);
         self.update_count += 1;
@@ -386,7 +388,7 @@ impl SubgameTrainer {
                         Some(rot) => rot[(t % rot.len() as u64) as usize],
                         None => (t % n_players) as PlayerId,
                     };
-                    let root = game.root(rng);
+                    let root = game.root_for_traverser(traverser, rng);
                     recurse_parallel(
                         root,
                         traverser,
@@ -634,11 +636,11 @@ mod tests {
     use super::*;
     use crate::abstraction::bucket_table::{BucketConfig, BucketTable};
     use crate::core::rng::ChaCha20Rng;
-    use crate::core::PlayerStatus;
+    use crate::core::{Card, PlayerStatus};
     use crate::rules::action::Action;
     use crate::rules::config::TableConfig;
     use crate::rules::state::GameState;
-    use crate::training::nlhe::pack_info_set_v2;
+    use crate::training::nlhe::{pack_info_set_v2, SimplifiedNlheState};
     use crate::training::nlhe_betting_tree::deep_menu_for;
     use crate::training::regret::{RegretTable, StrategyAccumulator};
     use crate::training::trainer::{EsMccfrTrainer, Trainer};
@@ -759,6 +761,33 @@ mod tests {
         SubgameNlheGame::new(table, cfg, abs, rules, st, entrants, 0)
     }
 
+    /// Same limped pot checked down to the river (three live, first to act decides).
+    fn three_way_river_sub() -> SubgameNlheGame {
+        let cfg = TableConfig::six_max_at_bb(100);
+        let mut st = GameState::new(&cfg, 0x3_3A7);
+        for _ in 0..3 {
+            st.apply(Action::Fold).expect("UTG/HJ/CO fold");
+        }
+        st.apply(Action::Call).expect("BTN limp");
+        st.apply(Action::Call).expect("SB complete");
+        st.apply(Action::Check).expect("BB check");
+        for _ in 0..6 {
+            st.apply(Action::Check).expect("check flop / turn");
+        }
+        assert_eq!(st.board().len(), 5, "river");
+        let (abs, rules) = deep_menu_for(&st);
+        let entrants = st
+            .players()
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p.status, PlayerStatus::Active | PlayerStatus::AllIn))
+            .fold(0u16, |e, (i, _)| e | (1 << i));
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::default_500_500_500(),
+        ));
+        SubgameNlheGame::new(table, cfg, abs, rules, st, entrants, 0)
+    }
+
     fn assert_same(a: &EsMccfrTrainer<SubgameNlheGame>, b: &SubgameTrainer, label: &str) {
         assert_eq!(a.update_count(), b.update_count(), "{label}");
         assert_eq!(a.regret_table().len(), b.tables().regret_len(), "{label}");
@@ -782,21 +811,46 @@ mod tests {
         }
     }
 
+    /// Hero (first to act on the flop) and its real hole cards in [`three_way_flop_sub`].
+    fn hero_and_hole(sub: &SubgameNlheGame) -> (PlayerId, [Card; 2]) {
+        let t = sub.template();
+        let hero = t.current_player().expect("flop decision").0 as PlayerId;
+        (
+            hero,
+            t.players()[hero as usize].hole_cards.expect("hero hole"),
+        )
+    }
+
+    fn with_real(sub: SubgameNlheGame, q: f64) -> SubgameNlheGame {
+        let (hero, hole) = hero_and_hole(&sub);
+        sub.with_real_hand(hero, hole, q)
+    }
+
     /// Bit-identical to `EsMccfrTrainer<SubgameNlheGame>`: single-thread `step` and
-    /// `step_parallel`, each with / without LCFR, with live-seat rotation and visit counts.
+    /// `step_parallel`, each with / without LCFR, with live-seat rotation and visit counts; also with
+    /// the real-hand infoset + forced deal on (both trainers go through `root_for_traverser`).
     #[test]
     fn trainer_matches_hashmap_trainer() {
         let live: Vec<PlayerId> = vec![0, 1, 2];
-        for (label, parallel, lcfr) in [
-            ("step", false, false),
-            ("step+lcfr", false, true),
-            ("parallel", true, false),
-            ("parallel+lcfr", true, true),
+        for (label, parallel, lcfr, real) in [
+            ("step", false, false, false),
+            ("step+lcfr", false, true, false),
+            ("parallel", true, false, false),
+            ("parallel+lcfr", true, true, false),
+            ("step+real", false, false, true),
+            ("parallel+lcfr+real", true, true, true),
         ] {
-            let mut a = EsMccfrTrainer::new(three_way_flop_sub(), 1)
+            let sub = || {
+                if real {
+                    with_real(three_way_flop_sub(), 0.5)
+                } else {
+                    three_way_flop_sub()
+                }
+            };
+            let mut a = EsMccfrTrainer::new(sub(), 1)
                 .with_visit_counts()
                 .with_traverser_rotation(live.clone());
-            let mut b = SubgameTrainer::new(three_way_flop_sub())
+            let mut b = SubgameTrainer::new(sub())
                 .with_visit_counts()
                 .with_traverser_rotation(live.clone());
             if lcfr {
@@ -829,5 +883,204 @@ mod tests {
         let info = pack_info_set_v2(0, 0, StreetTag::Flop);
         assert_eq!(b.visit_count(&info), None);
         assert!(b.average_strategy(&info).is_empty());
+    }
+
+    fn holes_and_board(s: &SimplifiedNlheState) -> (Vec<Option<[Card; 2]>>, Vec<Card>) {
+        let g = &s.game_state;
+        (
+            g.players().iter().map(|p| p.hole_cards).collect(),
+            g.board().to_vec(),
+        )
+    }
+
+    /// Off, or on but the traverser is not hero (or q = 0): `root_for_traverser` deals exactly what
+    /// `root` deals and leaves the rng at the same point.
+    #[test]
+    fn root_for_traverser_without_forced_deal_matches_root() {
+        let plain = three_way_flop_sub();
+        let (hero, _) = hero_and_hole(&plain);
+        let other = (0..3).find(|&s| s != hero).unwrap();
+        for (sub, traverser) in [
+            (three_way_flop_sub(), hero),
+            (with_real(three_way_flop_sub(), 0.5), other),
+            (with_real(three_way_flop_sub(), 0.0), hero),
+        ] {
+            let mut ra = ChaCha20Rng::from_seed(0x77);
+            let mut rb = ChaCha20Rng::from_seed(0x77);
+            for _ in 0..50 {
+                let a = holes_and_board(&plain.root(&mut ra));
+                let b = holes_and_board(&sub.root_for_traverser(traverser, &mut rb));
+                assert_eq!(a, b);
+            }
+            assert_eq!(ra.next_u64(), rb.next_u64(), "rng streams diverged");
+        }
+    }
+
+    /// q = 1: every hero traversal deals the real hole, no card collides, the visible board is kept.
+    /// q = 0.5: about half of hero traversals are forced (plus the rare natural draw).
+    #[test]
+    fn forced_deal_gives_hero_real_hole() {
+        let sub = with_real(three_way_flop_sub(), 1.0);
+        let (hero, hole) = hero_and_hole(&sub);
+        let flop = sub.template().board().to_vec();
+        let mut rng = ChaCha20Rng::from_seed(0xF0);
+        for _ in 0..300 {
+            let (holes, board) = holes_and_board(&sub.root_for_traverser(hero, &mut rng));
+            assert_eq!(holes[hero as usize], Some(hole));
+            assert_eq!(&board[..3], &flop[..]);
+            let mut seen = 0u64;
+            for c in holes.iter().flatten().flatten().chain(board.iter()) {
+                let bit = 1u64 << c.to_u8();
+                assert_eq!(seen & bit, 0, "card {c:?} dealt twice");
+                seen |= bit;
+            }
+            for (s, h) in holes.iter().enumerate() {
+                let live = sub.template().players()[s].hole_cards.is_some();
+                assert_eq!(h.is_some(), live, "seat {s}");
+            }
+        }
+        let sub = with_real(three_way_flop_sub(), 0.5);
+        let n = 4000;
+        let hits = (0..n)
+            .filter(|_| {
+                holes_and_board(&sub.root_for_traverser(hero, &mut rng)).0[hero as usize]
+                    == Some(hole)
+            })
+            .count();
+        let rate = hits as f64 / n as f64;
+        assert!((0.46..0.54).contains(&rate), "forced rate {rate}");
+    }
+
+    /// Real hole at a hero node → the street's dedicated slot (= bucket count); any other hole, or
+    /// another seat, keeps its normal bucket. `query_at` and `info_set_for_cards` agree.
+    #[test]
+    fn real_hand_infoset_uses_dedicated_slot() {
+        let sub = with_real(three_way_flop_sub(), 0.5);
+        let (hero, hole) = hero_and_hole(&sub);
+        let root = sub.subtree().root_id();
+        let flop_buckets = sub.bucket_table().bucket_count(StreetTag::Flop);
+        let (info, _) = sub.query_at(root, sub.template());
+        assert_eq!(info.bucket_id(), flop_buckets);
+        assert_eq!(info.street_tag(), StreetTag::Flop);
+        let board = sub.template().board().to_vec();
+        assert_eq!(sub.info_set_for_cards(root, hole, &board), info);
+        assert_eq!(
+            sub.info_set_for_cards(root, [hole[1], hole[0]], &board),
+            info
+        );
+        // Same node, a different hole → a normal bucket, identical to the feature-off game.
+        let plain = three_way_flop_sub();
+        let mut rng = ChaCha20Rng::from_seed(0x1F);
+        let mut checked = 0;
+        for _ in 0..200 {
+            let s = sub.root_for_traverser((hero + 1) % 3, &mut rng);
+            let h = s.game_state.players()[hero as usize].hole_cards.unwrap();
+            let got = SubgameNlheGame::info_set(&s, hero);
+            if h == hole || h == [hole[1], hole[0]] {
+                assert_eq!(got.bucket_id(), flop_buckets);
+                continue;
+            }
+            assert!(got.bucket_id() < flop_buckets);
+            assert_eq!(got, plain.info_set_for_cards(root, h, &board));
+            checked += 1;
+        }
+        assert!(checked > 150);
+        // Feature off: the real hole maps to its ordinary bucket.
+        let (plain_info, _) = plain.query_at(root, plain.template());
+        assert!(plain_info.bucket_id() < flop_buckets);
+    }
+
+    /// V3 (design doc §3): forced deal is unbiased for the real-hand infoset. Same subgame, same total
+    /// iterations (so opponents get the same training), only hero's sampling differs: slot-only
+    /// (real hole reached by natural draws, ~1/1000 of hero traversals) vs q = 0.5. The stub bucket
+    /// table pools every other hand into one bucket per node — a coarse but well-defined game, small
+    /// enough that natural draws alone reach thousands of visits. Across seeds the cross-scheme L1
+    /// distance of the real-hand average strategy must stay within 1.5× the within-scheme spread.
+    #[test]
+    #[ignore = "release/--ignored opt-in（2 × 4 seeds × RH_V3_ITERS updates, 8 threads）"]
+    fn forced_deal_matches_natural_draw_reference() {
+        let iters: u64 = std::env::var("RH_V3_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24_000_000);
+        let solve = |q: f64, seed: u64| -> (Vec<f64>, u32) {
+            let sub = with_real(three_way_river_sub(), q);
+            let root = sub.subtree().root_id();
+            let (info, _) = sub.query_at(root, sub.template());
+            let mut t = SubgameTrainer::new(sub)
+                .with_visit_counts()
+                .with_traverser_rotation(vec![0, 1, 2]);
+            let mut pool: Vec<Box<dyn RngSource>> = (0..8u64)
+                .map(|k| Box::new(ChaCha20Rng::from_seed(seed * 100 + k)) as Box<dyn RngSource>)
+                .collect();
+            let batch = 256;
+            for _ in 0..iters / (8 * batch as u64) {
+                t.step_parallel(&mut pool, 8, batch).unwrap();
+            }
+            (t.average_strategy(&info), t.visit_count(&info).unwrap())
+        };
+        let l1 = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f64>();
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let seeds = [1u64, 2, 3, 4];
+        let natural: Vec<_> = seeds.iter().map(|&s| solve(0.0, s)).collect();
+        let forced: Vec<_> = seeds.iter().map(|&s| solve(0.5, s)).collect();
+        let pairs = |v: &[(Vec<f64>, u32)]| -> Vec<f64> {
+            let mut d = Vec::new();
+            for i in 0..v.len() {
+                for j in i + 1..v.len() {
+                    d.push(l1(&v[i].0, &v[j].0));
+                }
+            }
+            d
+        };
+        let d_nat = mean(&pairs(&natural));
+        let d_forced = mean(&pairs(&forced));
+        let cross: Vec<f64> = natural
+            .iter()
+            .flat_map(|a| forced.iter().map(move |b| l1(&a.0, &b.0)))
+            .collect();
+        let d_cross = mean(&cross);
+        for (label, v) in [("natural", &natural), ("forced", &forced)] {
+            for (s, (sigma, visits)) in seeds.iter().zip(v.iter()) {
+                eprintln!("{label} seed={s} visits={visits} sigma={sigma:.4?}");
+            }
+        }
+        eprintln!("iters={iters} D_cross={d_cross:.4} D_natural={d_nat:.4} D_forced={d_forced:.4}");
+        assert!(
+            natural.iter().all(|(_, v)| *v >= 2_000),
+            "natural reference too thin to mean anything"
+        );
+        let within = (d_nat + d_forced) / 2.0;
+        assert!(
+            d_cross <= 1.5 * within.max(0.01),
+            "forced deal shifts the real-hand strategy: D_cross {d_cross:.4} vs within {within:.4}"
+        );
+    }
+
+    /// The point of the feature: the hero infoset read at the decision gets far more traverser visits.
+    /// (The stub bucket table maps every hand to bucket 0, so the feature-off read here sees every
+    /// hero traversal; the meaningful baseline is slot-only, where the real hole needs a natural draw.)
+    #[test]
+    fn forced_deal_raises_hero_visits() {
+        let visits = |sub: SubgameNlheGame| {
+            let root = sub.subtree().root_id();
+            let (info, _) = sub.query_at(root, sub.template());
+            let mut t = SubgameTrainer::new(sub)
+                .with_visit_counts()
+                .with_traverser_rotation(vec![0, 1, 2]);
+            let mut rng = ChaCha20Rng::from_seed(0x5EED);
+            for _ in 0..3000 {
+                t.step(&mut rng).unwrap();
+            }
+            t.visit_count(&info).unwrap()
+        };
+        let slot_only = visits(with_real(three_way_flop_sub(), 0.0));
+        let forced = visits(with_real(three_way_flop_sub(), 0.5));
+        // 1000 hero traversals, half forced → ~500; slot-only needs the exact combo drawn (~1/1000).
+        assert!(forced >= 400, "forced visits {forced}");
+        assert!(
+            forced > 20 * slot_only.max(1),
+            "forced {forced} vs slot-only {slot_only}"
+        );
     }
 }

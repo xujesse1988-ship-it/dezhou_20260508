@@ -340,6 +340,22 @@ pub struct SimplifiedNlheState {
     /// 永不读它，故 base 路径行为/性能 byte-equal（`Option<Arc>` clone 在 `None` 下 ≈ 零成本）。
     /// depth-limit 叶子的 `SubgameNlheGame::payoff` 才读它查 blueprint 叶子值。
     pub(crate) leaf_ctx: Option<Arc<crate::training::subgame::SubgameLeafCtx>>,
+    /// 实时搜索「hero 真实手牌单独信息集」标记（[`RealHandTag`]）。只有开了该功能的
+    /// `SubgameNlheGame` 生成的 state 带 `Some`；base game 恒 `None`，`SimplifiedNlheGame::info_set`
+    /// 永不读它（换桶号在 `SubgameNlheGame::info_set` 里做），base 路径逐位不变。
+    pub(crate) real_hand: Option<RealHandTag>,
+}
+
+/// hero 真实手牌在实时搜索子树里的专用信息集标记（`real_hand_forced_deal_design_2026_10_25` §2.3）：
+/// 决策者是 `seat` 且底牌正好是真实那两张时，信息集桶号换成 `slot_by_street[street]`（= 该街桶数，
+/// 正常桶号之外的一格）。只看牌、不看是怎么发到的。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RealHandTag {
+    pub(crate) seat: PlayerId,
+    /// 真实底牌的 52-bit 牌位掩码（两张 `1 << card.to_u8()` OR；与底牌顺序无关）。
+    pub(crate) hole_mask: u64,
+    /// 各街专用桶号（下标 `StreetTag as usize`）。
+    pub(crate) slot_by_street: [u32; 4],
 }
 
 impl Clone for SimplifiedNlheState {
@@ -354,6 +370,7 @@ impl Clone for SimplifiedNlheState {
             info_set_cache: AtomicU64::new(self.info_set_cache.load(Ordering::Relaxed)),
             seat_bucket_cache: self.seat_bucket_cache.clone(),
             leaf_ctx: self.leaf_ctx.clone(),
+            real_hand: self.real_hand,
         }
     }
 }
@@ -510,6 +527,7 @@ impl Game for SimplifiedNlheGame {
             info_set_cache: AtomicU64::new(0),
             seat_bucket_cache: SeatBucketCache::default(),
             leaf_ctx: None, // base game 永不走 depth-limit 叶子。
+            real_hand: None,
         }
     }
 
