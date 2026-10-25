@@ -311,11 +311,12 @@ def _selftest_full_replay():
            and count(lambda ln: ln.startswith("底牌 ")) == n_type("hole_cards")
            and count(lambda ln: ln.startswith("座位 ")) == n_type("hand_start")
            and count(lambda ln: ln.startswith(">> 轮到 hero")) == c["decisions"]
+           and count(lambda ln: ln.startswith(">> 决策  来源 ")) == c["decisions"]
            and count(lambda ln: "← hero 实际行动" in ln) == len(hero_acts)
            and count(lambda ln: ln.startswith(("翻牌 ", "转牌 ", "河牌 "))) == n_type("community_cards")
            and count(lambda ln: ln.startswith("seat") and "←" not in ln) == opp_acts
            and count(lambda ln: ln.startswith("结算 ")) == c["hands_complete"]
-           and len(lines) == 3 * n_type("hand_start") + c["decisions"] + len(hero_acts)
+           and len(lines) == 3 * n_type("hand_start") + 2 * c["decisions"] + len(hero_acts)
            + n_type("community_cards") + opp_acts + c["hands_complete"],
            "play log 行数不对:\n" + play.getvalue())
     _check("seat1 Shaggyx bet 6" in lines and "seat2 hsjwnbxj raise 到 6" in lines,

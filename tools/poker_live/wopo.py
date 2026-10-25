@@ -370,6 +370,7 @@ class WopoSession:
                "board": list(hand.board), "valid": valid, "t_wall": time.time()}
         self._dbg(f"your_turn street={hand.street} hole={''.join(hand.hole)} "
                   f"board={' '.join(hand.board)} valid={valid}")
+        self._play(f">> 轮到 hero（{_STREET_CN[hand.street]}，底池 {hand.pot}，跟 {ctx['to_call']}）")
         self.worker.submit_decide(req, lambda resp, ms: self._on_decided(req, ctx, resp, ms))
 
     def _on_decided(self, req, ctx, resp, ms):
@@ -403,10 +404,10 @@ class WopoSession:
                 self.counters["stale"] += 1
                 print(f"  [stale] hand={ctx['key'][0]} 决策 {ms}ms 返回时已过期（{stale}），"
                       f"不写行动文件", file=sys.stderr)
-            self._play(f">> 轮到 hero（{_STREET_CN[ctx['street']]}，底池 {ctx['pot']}，跟 {ctx['to_call']}）"
-                       f"建议 {advice}  来源 {rec['source']}  {ms}ms"
+            self._play(f">> 决策  来源 {rec['source']}  {ms}ms"
                        + (f"  已过期（{_STALE_CN.get(stale.split(':', 1)[0], stale)}），未写入行动文件"
-                          if stale else ""))
+                          if stale else "")
+                       + f"  建议 {advice}")
             if self.action_log:
                 self.action_log.write(json.dumps({"req": req, "resp": resp, "decide_ms": ms,
                                                   "stale": stale}, ensure_ascii=False) + "\n")
