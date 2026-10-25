@@ -18,6 +18,9 @@
     合法区间里的动作改安全动作（fallback:illegal_advisor_action，action-log 的 resp.rejected 记原回复）。
   - --exploit-4bet（PM-17）同 poker_manager：请求带玩家名、每手 observe 带投入金额。
   - --hh-log：每手打完且没作废的牌局写一行（opponent_analysis 的 wopo 平台读）。
+  - 连 WS 带 token 鉴权（Authorization: Bearer）：环境变量 WOPO_TOKEN 优先，其次项目根 .env 的
+    WOPO_TOKEN；不走命令行（免得进 ps / shell 历史）。服务端拒绝（关闭码 4001 / 握手 401、403）→
+    不重连，直接退出。
 
 行动文件每行字段：ts / hand_id / table_id / table_seq（触发决策的那条 table_state）/ street / hole /
 board / pot / to_call / valid（can_check/can_call/can_raise/min_raise/max_raise，金额 = 本街总额）/
@@ -25,7 +28,7 @@ action（fold/check/call/raise/all_in）/ amount（raise 的本街总额，其�
 [[动作, 概率]]，兜底动作为 null）/ chosen / source / decide_ms。
 
 用法：
-  wopo_play.py --url ws://HOST:PORT/... --action-file hero_actions.jsonl \\
+  wopo_play.py [--url ws://HOST:PORT/ws] --action-file hero_actions.jsonl \\
       --cropped-checkpoint X.crop --bucket-table B.bin --search --search-trigger all-postflop ...
   wopo_play.py --replay session.log ...   回放 WS 日志（原始消息逐行，或 --ws-log 格式）
   wopo_play.py --selftest                 离线自测（stub advisor，不需要 blueprint）
@@ -34,6 +37,7 @@ action（fold/check/call/raise/all_in）/ amount（raise 的本街总额，其�
 import argparse
 import json
 import os
+import shlex
 import sys
 import tempfile
 import threading
@@ -48,17 +52,44 @@ from poker_live.wopo import ActionFile, WopoSession, legalize
 from poker_live.wslog import WsLog
 
 HERO_SEAT = 0
+DEFAULT_URL = "ws://64.176.55.133:3000/ws"
+TOKEN_ENV = "WOPO_TOKEN"
+ENV_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+AUTH_CLOSE_CODE = 4001  # 服务端鉴权失败的关闭码（先回 {"type":"error","code":"auth_failed"}）
+
+
+def load_token(env_file=ENV_FILE):
+    """wopo 服务端 token：环境变量 WOPO_TOKEN 优先，其次 env_file 里的 WOPO_TOKEN（只认这一个键，
+    不执行 shell；重复出现以最后一行为准）。缺失 / 空 / 含空白 / 引号不配对 → None。"""
+    token = os.environ.get(TOKEN_ENV)
+    if token is None and os.path.isfile(env_file):
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("export "):
+                    line = line[7:].lstrip()
+                name, sep, value = line.partition("=")
+                if sep and name.strip() == TOKEN_ENV:
+                    try:
+                        parts = shlex.split(value, comments=True)
+                    except ValueError:
+                        parts = []
+                    token = parts[0] if len(parts) == 1 else ""
+    if not token or any(c.isspace() for c in token):
+        return None
+    return token
 
 
 # ===========================================================================
 # 通讯
 # ===========================================================================
-def run_ws(session, url, ws_log=None, reconnect_wait=3):
-    """被动连 wopo WS：收到的原始消息交给 session；断线 → session.on_disconnect + 等几秒重连。
-    打满 --num-hands 或 Ctrl-C 结束。"""
+def run_ws(session, url, token, ws_log=None, reconnect_wait=3):
+    """被动连 wopo WS（带 token）：收到的原始消息交给 session；断线 → session.on_disconnect + 等几秒
+    重连。打满 --num-hands、Ctrl-C 或鉴权被拒结束；鉴权被拒返回 False，其余 True。"""
     import websocket  # 延迟 import：回放 / selftest 不需要 websocket-client
 
     stopping = [False]
+    auth_failed = [False]
 
     def on_open(ws):
         print(f"  [ws open] {url}", file=sys.stderr)
@@ -78,11 +109,15 @@ def run_ws(session, url, ws_log=None, reconnect_wait=3):
         print(f"  [ws error] {err!r}", file=sys.stderr)
         if isinstance(err, KeyboardInterrupt):
             stopping[0] = True  # run_forever 吞掉 Ctrl-C 后正常返回 → 不标记就会被当成断线重连
+        if getattr(err, "status_code", None) in (401, 403):
+            auth_failed[0] = True  # 握手阶段就被拒（HTTP 层鉴权的服务端）
         if ws_log:
             ws_log.event("error", error=repr(err))
 
     def on_close(ws, code, reason):
         print(f"  [ws closed] code={code} reason={reason}", file=sys.stderr)
+        if code == AUTH_CLOSE_CODE:
+            auth_failed[0] = True
         if ws_log:
             ws_log.event("close", code=code,
                          reason=reason if isinstance(reason, str) else repr(reason))
@@ -90,20 +125,24 @@ def run_ws(session, url, ws_log=None, reconnect_wait=3):
     while True:
         if ws_log:
             ws_log.conn += 1
-        ws = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message,
+        ws = websocket.WebSocketApp(url, header=[f"Authorization: Bearer {token}"],
+                                    on_open=on_open, on_message=on_message,
                                     on_error=on_error, on_close=on_close)
         try:
             ws.run_forever(ping_interval=30, ping_timeout=10)
         except KeyboardInterrupt:
             stopping[0] = True
         session.on_disconnect()
+        if auth_failed[0]:
+            print(f"  服务端拒绝 token（检查 {TOKEN_ENV}），不重连。", file=sys.stderr)
+            return False
         if stopping[0] or session.done:
-            return
+            return True
         print(f"  断线，{reconnect_wait}s 后重连…", file=sys.stderr)
         try:
             time.sleep(reconnect_wait)
         except KeyboardInterrupt:
-            return
+            return True
 
 
 def iter_replay(path):
@@ -493,6 +532,39 @@ def _selftest_hh_log():
     print("[selftest 8 hh 日志] 打完的手逐手写入、投入合计 = 底池；作废的手不写", file=sys.stderr)
 
 
+def _selftest_token():
+    saved = os.environ.pop(TOKEN_ENV, None)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            env = os.path.join(d, ".env")
+            cases = [("API_KEY=x\nWOPO_TOKEN=abc123\n", "abc123"),
+                     ("export WOPO_TOKEN='abc 123'\n", None),         # 含空白
+                     ("WOPO_TOKEN=\"q1\"  # comment\n", "q1"),
+                     ("WOPO_TOKEN=a\nWOPO_TOKEN=b\n", "b"),           # 最后一行为准
+                     ("WOPO_TOKEN=\n", None), ("WOPO_TOKEN='abc\n", None),
+                     ("WOPO_TOKENX=abc\n", None), (None, None)]
+            for text, want in cases:
+                if text is not None:
+                    with open(env, "w") as f:
+                        f.write(text)
+                elif os.path.exists(env):
+                    os.remove(env)
+                got = load_token(env)
+                _check(got == want, f".env {text!r}: token={got!r} 应为 {want!r}")
+            with open(env, "w") as f:
+                f.write("WOPO_TOKEN=from_file\n")
+            os.environ[TOKEN_ENV] = "from_env"
+            _check(load_token(env) == "from_env", "环境变量应优先于 .env")
+            os.environ[TOKEN_ENV] = ""
+            _check(load_token(env) is None, "环境变量设成空串应视为缺失，不回落 .env")
+    finally:
+        os.environ.pop(TOKEN_ENV, None)
+        if saved is not None:
+            os.environ[TOKEN_ENV] = saved
+    print("[selftest 9 token] 环境变量优先、.env 解析（export / 引号 / 注释 / 重复键）、坏值拒收",
+          file=sys.stderr)
+
+
 def run_selftest():
     _selftest_full_replay()
     _selftest_mid_hand_join()
@@ -502,7 +574,8 @@ def run_selftest():
     _selftest_legalize()
     _selftest_exploit_4bet()
     _selftest_hh_log()
-    print("OK: wopo selftest 8 组场景全部通过。", file=sys.stderr)
+    _selftest_token()
+    print("OK: wopo selftest 9 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================
@@ -517,8 +590,8 @@ def main():
     add_advisor_args(p, default_seats=9,
                      debug_help="打印牌局中间数据到 stderr（手起/发牌/动作/决策/结果）+ 透传 advisor "
                                 "--debug-log；纯展示")
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--url", help="wopo WS 地址")
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--url", default=DEFAULT_URL, help=f"wopo WS 地址（默认 {DEFAULT_URL}）")
     src.add_argument("--replay", help="回放文件（原始消息逐行，或 --ws-log 格式）")
     p.add_argument("--action-file", required=True,
                    help="行动文件（外部程序读）：每个决策点追加一行 JSON")
@@ -532,6 +605,11 @@ def main():
     args = p.parse_args()
     validate_advisor_args(args)
     validate_fourbet_args(p, args)
+    token = None
+    if not args.replay:
+        token = load_token()
+        if token is None:
+            p.error(f"连 WS 需要 token：设环境变量 {TOKEN_ENV} 或写进 {ENV_FILE}（非空且不含空白）")
 
     advisor = start_advisor(args, advisor_extra_args(args) + fourbet_extra_args(args))
     # 回放用同步 worker（结果确定、不会因为读文件太快把决策判成过期）；联机用后台线程。
@@ -544,11 +622,12 @@ def main():
                           num_hands=args.num_hands, action_log=action_log,
                           prewarm=args.search_prewarm, exploit=exploit_enabled(args),
                           debug=args.debug_log, exploit_4bet=fourbet_enabled(args), hh_log=hh_log)
+    ok = True
     try:
         if args.replay:
             run_replay(session, args.replay)
         else:
-            run_ws(session, args.url, ws_log=ws_log)
+            ok = run_ws(session, args.url, token, ws_log=ws_log)
     finally:
         worker.close(timeout=30)
         advisor.close()
@@ -560,6 +639,8 @@ def main():
             hh_log.close()
         if ws_log:
             ws_log.close()
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

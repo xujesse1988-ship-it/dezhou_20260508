@@ -67,6 +67,9 @@ k=6/7/8/9 = 557k / 3.07M / 15.5M / 72.6M 节点,单加注池 9-way 1.47M;≥7 �
 `all_in` 改 `call`(`:allin_as_call`,同 8a321cb),其余越界动作改安全动作(`fallback:illegal_advisor_action`,记 `rejected`);
 ② 支持 `--exploit-4bet*`(PM-17,与 poker_manager 共用参数);③ `--hh-log` 记校验通过的整手,`opponent_analysis` 新增
 `wopo` 平台(`ingest` / `report` / `live` 都能用)。只有离线自测和实测会话回放,还没上实盘。
+④ 连 WS 带 token 鉴权(`Authorization: Bearer`,环境变量 `WOPO_TOKEN` 优先,其次项目根 `.env`),默认地址
+`ws://64.176.55.133:3000/ws`;服务端拒绝(握手 401/403 或关闭码 4001)→ 不重连、退出码 1。已对该服务端实测:
+正确 token 握手成功,错误 token 被 401 拒绝后 driver 直接退出。
 
 **平跟池 hero 范围按 limp 规则算(2026-10-24)**。脱锚搜索估范围时,hero 翻前由 `limp_heuristic` 决定的步不再乘 blueprint σ,
 改拿同一个启发式对 1326 个组合各算一遍得 0/1 系数(`PrefixReach::hero_coef`);对手平跟后翻前又加注的,去掉他的映射弃牌步。
