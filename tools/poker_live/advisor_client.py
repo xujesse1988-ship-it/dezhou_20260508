@@ -4,6 +4,7 @@
 """
 
 import json
+import os
 import subprocess
 
 
@@ -276,6 +277,50 @@ def advisor_extra_args(args, warm_profile_hh=None):
     # blueprint 路径也打）。driver 侧的牌局中间数据 + advisor 内部数据由同一旗一起开。
     if args.debug_log:
         extra.append("--debug-log")
+    return extra
+
+
+# ===========================================================================
+# PM-17 翻前 4bet 剥削参数（poker_manager / wopo 共用；openpoker driver 不发带金额的 observe，
+# 不加这组参数）
+# ===========================================================================
+def add_fourbet_args(p):
+    p.add_argument("--exploit-4bet", choices=["on", "off"], default="off",
+                   help="PM-17：对 3bet 多、被 4bet 就弃的对手把翻前弃牌概率挪给 4bet（进程内实时统计）")
+    p.add_argument("--exploit-4bet-convert", type=float, default=None,
+                   help="门开时 fold 概率挪给 4bet 的比例，默认 1.0")
+    p.add_argument("--exploit-4bet-fold-decay", type=float, default=None,
+                   help="被 4bet 弃牌统计的衰减系数，默认 0.9")
+    p.add_argument("--exploit-4bet-3bet-decay", type=float, default=None,
+                   help="3bet 统计的衰减系数，默认 0.98")
+    p.add_argument("--exploit-4bet-state", default=None,
+                   help="PM-17 统计的状态文件：启动时读入接着统计（不存在则从零），每手写回；不设 = 每次从零")
+
+
+def fourbet_enabled(args):
+    return args.exploit_4bet == "on"
+
+
+def validate_fourbet_args(parser, args):
+    subflags = (args.exploit_4bet_convert, args.exploit_4bet_fold_decay,
+                args.exploit_4bet_3bet_decay, args.exploit_4bet_state)
+    if not fourbet_enabled(args) and any(v is not None for v in subflags):
+        parser.error("--exploit-4bet-* 子旗需配 --exploit-4bet on")
+
+
+def fourbet_extra_args(args):
+    """PM-17 flags passed through to the advisor (empty when off, keeping the command line unchanged)."""
+    if not fourbet_enabled(args):
+        return []
+    extra = ["--exploit-4bet", "on"]
+    for flag, value in (("--exploit-4bet-convert", args.exploit_4bet_convert),
+                        ("--exploit-4bet-fold-decay", args.exploit_4bet_fold_decay),
+                        ("--exploit-4bet-3bet-decay", args.exploit_4bet_3bet_decay)):
+        if value is not None:
+            extra += [flag, str(value)]
+    if args.exploit_4bet_state is not None:
+        # Absolute, so the advisor reads the same file whatever its working directory.
+        extra += ["--exploit-4bet-state", os.path.abspath(args.exploit_4bet_state)]
     return extra
 
 

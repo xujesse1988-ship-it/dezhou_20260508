@@ -144,7 +144,39 @@ def poker_manager_raw(r: dict, source_file: str, ws: Optional[dict] = None) -> R
     )
 
 
-ADAPTERS = {"openpoker": openpoker_raw, "poker_manager": poker_manager_raw}
+# ---------------------------------------------------------------- wopo
+
+def wopo_raw(r: dict, source_file: str, ws: Optional[dict] = None) -> RawHand:
+    """tools/wopo_play.py --hh-log rows: the driver's own engine already cross-checked every
+    action, stack and pot against the server, so actions/initial_stacks are taken as logged."""
+    res = r.get("result")
+    if not res:
+        raise ReplayError("no_result")
+    dealt = sorted(r["dealt_seats"])
+    if len(dealt) < 3:
+        raise ReplayError("heads_up_unsupported", str(len(dealt)))
+    raw_actions = []
+    for a in r.get("actions") or []:
+        kind = a["action"]
+        raw_actions.append(RawAction(
+            seat=a["seat"], kind=kind, to_total=a.get("to") if kind == "raise" else None,
+            delta=a.get("contribution_delta") if kind != "fold" else None,
+            stack_before=a.get("stack_before"),
+        ))
+    # winners[].amount is the winner's net (final - start), checked on the captured sessions.
+    net = {w["seat"]: w["amount"] for w in res.get("winners") or [] if w.get("amount") is not None}
+    return RawHand(
+        platform="wopo", hand_id=r["hand_id"], table_id=r.get("table_id") or "", ts=_iso_ts(r.get("ts")),
+        button_seat=r["button_seat"], sb=r["small_blind"], bb=r["big_blind"], dealt_seats=dealt,
+        start_stacks=_intkeys(r.get("initial_stacks")),
+        names={s: n for s, n in _intkeys(r.get("names")).items() if s in dealt},
+        hero_seat=r["my_seat"], hero_hole=list(r.get("hole") or []), board=list(r.get("board") or []),
+        actions=raw_actions, final_stacks=_intkeys(res.get("final_stacks")), shown={},
+        source_net=net, source_file=source_file,
+    )
+
+
+ADAPTERS = {"openpoker": openpoker_raw, "poker_manager": poker_manager_raw, "wopo": wopo_raw}
 
 
 def iter_records(path: str) -> Iterator[tuple[int, dict]]:

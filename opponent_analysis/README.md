@@ -18,6 +18,7 @@ python3 -m opponent_analysis ingest --db artifacts/opponent_db --hh openpoker9_h
 # 报告：一次一个平台
 python3 -m opponent_analysis report --db artifacts/opponent_db --platform poker_manager --out artifacts/opponent_report [--hero bp3]
 python3 -m opponent_analysis report --db artifacts/opponent_db --platform openpoker --out artifacts/opponent_report
+python3 -m opponent_analysis report --db artifacts/opponent_db --platform wopo --out artifacts/opponent_report
 
 # 实时：跟随正在写入的 hh 日志，增量更新画像，浏览器打开 http://127.0.0.1:8780/
 python3 -m opponent_analysis live --db artifacts/opponent_db --platform poker_manager \
@@ -81,6 +82,13 @@ python3 -m unittest discover -s opponent_analysis/tests -t .
 |---|---|---|---|
 | poker_manager | 1022 | 0 | hh 自带每个动作的投入、剩余筹码和超时标记 |
 | openpoker | 3856 | 38 | 被拒的都是日志缺动作（例如转牌下注没记，下一个动作对不上）；无 ws 日志的 run 无法识别超时代打 |
+
+wopo（2026-10-25 接入）：hh 来自 `tools/wopo_play.py --hh-log`，只记 driver 自己逐条核对通过、打完的手
+（中途接入、消息对不上、两人局的手都不记），所以动作和投入可以直接用。还没有实盘数据，只用实测会话
+`tools/testdata/wopo_session_2026_10_16.jsonl` 的 7 手验证过（`tests/data/wopo_hh_2026_10_16.jsonl`）。
+两点限制：服务器动作消息里没有超时代打标记（每手记 `forced_unknown`）；实测会话里没有摊牌，不知道摊牌牌面
+在 `hand_result` 里怎么给，所以暂不读亮牌、`reveal_policy` 先按 `may_muck`（河牌诈唬比例分析停用），抓到
+带摊牌的会话后再补适配器。
 
 摊牌亮牌实测：两个平台目前都是摊牌时所有仍在牌里的手全部亮出（openpoker 3018/3018 个座位，
 poker_manager 127/127）。`platforms.py` 里按平台设置 `reveal_policy`；报告每次都会重新实测，

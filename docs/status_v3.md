@@ -63,6 +63,11 @@ k=6/7/8/9 = 557k / 3.07M / 15.5M / 72.6M 节点,单加注池 9-way 1.47M;≥7 �
 翻前 / 未开搜索走兜底 `fallback:blueprint_placeholder`;range 估计对空 σ 本就按 1/n,不变);② driver 对不带 amount
 的 all_in 按 `stack_before` 补投入、剩余栈记 0(修前起始栈被算成只剩已投入部分,run3 一手 BB 算成 44 → 搜索放弃)。
 
+**wopo driver 跟上 poker_manager(2026-10-25)**。`tools/wopo_play.py`:① advisor 建议先过合法性,不能加注时的
+`all_in` 改 `call`(`:allin_as_call`,同 8a321cb),其余越界动作改安全动作(`fallback:illegal_advisor_action`,记 `rejected`);
+② 支持 `--exploit-4bet*`(PM-17,与 poker_manager 共用参数);③ `--hh-log` 记校验通过的整手,`opponent_analysis` 新增
+`wopo` 平台(`ingest` / `report` / `live` 都能用)。只有离线自测和实测会话回放,还没上实盘。
+
 **平跟池 hero 范围按 limp 规则算(2026-10-24)**。脱锚搜索估范围时,hero 翻前由 `limp_heuristic` 决定的步不再乘 blueprint σ,
 改拿同一个启发式对 1326 个组合各算一遍得 0/1 系数(`PrefixReach::hero_coef`);对手平跟后翻前又加注的,去掉他的映射弃牌步。
 修的是平跟池 hero 真实手牌权重接近 0 → 访问次数不够 → 放弃搜索(115653 批次 23 次里 14 次)。尚未离线重放 / 上实盘。

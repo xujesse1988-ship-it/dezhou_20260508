@@ -42,12 +42,25 @@ PLATFORMS = {
         forced_actions_in_hh=True,
         note="result.actions carries reason=timeout",
     ),
+    "wopo": Platform(
+        name="wopo",
+        # The wopo driver only logs hands with 3+ dealt seats (two-player hands are skipped),
+        # and the adapter rejects any that slip through, so this value is never used.
+        heads_up_button_is_sb=True,
+        # Not measured yet: the captured wopo sessions (2026-10-13/16) contain no showdown, so
+        # how hand_result reveals cards is unknown. Conservative until a showdown is seen.
+        reveal_policy="may_muck",
+        forced_actions_in_hh=False,
+        note="no timeout flag seen in player_action; showdown cards not yet captured",
+    ),
 }
 
 
 def detect_platform(first_record: dict) -> str:
     if "poker_manager_hh" in first_record:
         return "poker_manager"
+    if "wopo_hh" in first_record:
+        return "wopo"
     if "hh" in first_record:
         return "openpoker"
     raise ValueError("unknown hand-history format")

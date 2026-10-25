@@ -14,6 +14,10 @@
     hero 实际动作以服务器回来的 player_action 为准（可能和建议不同）。决策在后台线程跑：搜索没
     算完 hero 就已经出牌 → 结果过期，不写行动文件（只进 --action-log，标 stale）。
   - 桌面座位数 = --seats（默认 9，blueprint 须同座位数），至少 3 人发牌，否则略过该手。
+  - advisor 的建议先过一遍合法性：不能加注时的 all_in 改成 call（source 加 :allin_as_call），其余不在
+    合法区间里的动作改安全动作（fallback:illegal_advisor_action，action-log 的 resp.rejected 记原回复）。
+  - --exploit-4bet（PM-17）同 poker_manager：请求带玩家名、每手 observe 带投入金额。
+  - --hh-log：每手打完且没作废的牌局写一行（opponent_analysis 的 wopo 平台读）。
 
 行动文件每行字段：ts / hand_id / table_id / table_seq（触发决策的那条 table_state）/ street / hole /
 board / pot / to_call / valid（can_check/can_call/can_raise/min_raise/max_raise，金额 = 本街总额）/
@@ -35,11 +39,12 @@ import tempfile
 import threading
 import time
 
-from poker_live.advisor_client import (add_advisor_args, advisor_extra_args, exploit_enabled,
-                                       start_advisor, validate_advisor_args)
+from poker_live.advisor_client import (add_advisor_args, add_fourbet_args, advisor_extra_args,
+                                       exploit_enabled, fourbet_enabled, fourbet_extra_args,
+                                       start_advisor, validate_advisor_args, validate_fourbet_args)
 from poker_live.decision import DecisionWorker
 from poker_live.table import HandEngine, HandInvalid
-from poker_live.wopo import ActionFile, WopoSession
+from poker_live.wopo import ActionFile, WopoSession, legalize
 from poker_live.wslog import WsLog
 
 HERO_SEAT = 0
@@ -138,21 +143,29 @@ def run_replay(session, path):
 # ===========================================================================
 FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata",
                        "wopo_session_2026_10_16.jsonl")
+# 上面这份实测日志对应的 --hh-log 输出；opponent_analysis 的 wopo 适配器测试读它。
+HH_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "opponent_analysis",
+                          "tests", "data", "wopo_hh_2026_10_16.jsonl")
 
 
 class _StubAdvisor:
     """确定性合法动作（check → call → fold）+ 记录请求。gate 非 None 时 decide 阻塞到 gate 被 set
     （模拟搜索慢于 hero 出牌）。"""
 
-    def __init__(self, gate=None):
+    def __init__(self, gate=None, reply=None):
         self.requests = []
         self.side = []
         self.gate = gate
+        self.reply = reply  # reply(req) → 响应 dict 或 None（None = 走默认确定性动作）
 
     def decide(self, req):
         if self.gate is not None:
             self.gate.wait(10)
         self.requests.append(req)
+        if self.reply is not None:
+            r = self.reply(req)
+            if r is not None:
+                return r
         v = req["valid"]
         act = "check" if v.get("can_check") else "call" if v.get("can_call") else "fold"
         return {"action": act, "source": "stub", "probs": [[act, 1.0]], "chosen": act}
@@ -169,16 +182,18 @@ def _fixture_msgs():
         return [json.loads(line) for line in f if line.strip()]
 
 
-def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=False):
+def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=False,
+              exploit_4bet=False, reply=None, hh_log=None):
     """msgs（dict 或 ("disconnect",)）喂一个新会话。返回 (session, stub, 行动文件行)。
     hook(i, session) 在每条消息后调用（异步场景用来在指定位置放行 advisor）。"""
-    stub = _StubAdvisor(gate)
+    stub = _StubAdvisor(gate, reply)
     worker = DecisionWorker(stub, sync=sync)
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "actions.jsonl")
         af = ActionFile(path)
         session = WopoSession(worker, af, n_seats=9, hero_seat=HERO_SEAT,
-                              exploit=exploit, prewarm=prewarm)
+                              exploit=exploit, prewarm=prewarm, exploit_4bet=exploit_4bet,
+                              hh_log=hh_log)
         for i, m in enumerate(msgs):
             if m == ("disconnect",):
                 session.on_disconnect()
@@ -373,13 +388,121 @@ def _selftest_engine_rules():
     print("[selftest 5 规则细节] 不完整全下加注 / 加注权 / 最小加注幅度", file=sys.stderr)
 
 
+def _selftest_legalize():
+    """advisor 建议的合法性：不能加注时 all_in → call；其余越界动作 → 安全动作兜底。"""
+    call_only = {"can_check": False, "can_call": True, "can_raise": False,
+                 "min_raise": None, "max_raise": None}
+    check_only = dict(call_only, can_check=True, can_call=False)
+    open_raise = {"can_check": False, "can_call": True, "can_raise": True,
+                  "min_raise": 10, "max_raise": 200}
+    r = legalize({"action": "all_in", "source": "blueprint", "probs": [["all_in", 1.0]]}, call_only)
+    _check(r == {"action": "call", "source": "blueprint:allin_as_call", "probs": [["all_in", 1.0]]},
+           f"对手已全下时 all_in 应改 call: {r}")
+    r = legalize({"action": "all_in", "source": "search"}, open_raise)
+    _check(r == {"action": "all_in", "source": "search"}, f"能加注时 all_in 照写: {r}")
+    r = legalize({"action": "all_in", "source": "blueprint"}, check_only)
+    _check(r == {"action": "check", "source": "fallback:illegal_advisor_action",
+                 "rejected": {"action": "all_in", "amount": None, "source": "blueprint"}},
+           f"既不能加注也不能跟注 → 兜底: {r}")
+    for bad in ({"action": "raise", "amount": 8}, {"action": "raise", "amount": 201},
+                {"action": "raise", "amount": 12.5}, {"action": "raise", "amount": True},
+                {"action": "check"}, {"action": "bogus"}):
+        r = legalize(dict(bad, source="x"), open_raise)
+        _check(r["action"] == "fold" and r["source"] == "fallback:illegal_advisor_action",
+               f"越界 {bad} 应兜底: {r}")
+    for good in ({"action": "raise", "amount": 10}, {"action": "raise", "amount": 200},
+                 {"action": "call"}, {"action": "fold"}):
+        _check(legalize(dict(good, source="x"), open_raise) == dict(good, source="x"),
+               f"合法 {good} 不该改")
+    # 接进会话：advisor 每次回 all_in → 行动文件里不能加注的点写 call、能加注的点照写 all_in。
+    _, _, rows = _run_msgs(_fixture_msgs(), reply=lambda req: {"action": "all_in", "source": "stub"})
+    _check(rows and all(r["action"] == ("all_in" if r["valid"]["can_raise"] else "call")
+                        for r in rows if r["valid"]["can_raise"] or r["valid"]["can_call"]),
+           f"行动文件 all_in 处理 {[(r['action'], r['valid']) for r in rows]}")
+    print("[selftest 6 建议合法性] 不能加注的 all_in → call；越界动作 → 安全动作", file=sys.stderr)
+
+
+def _selftest_exploit_4bet():
+    """PM-17：请求带玩家名、每手 observe 带投入金额；只开 --exploit 时 observe 与旧格式相同。"""
+    msgs = _fixture_msgs()
+    session, stub, _ = _run_msgs(msgs, exploit_4bet=True)
+    _check(all(q.get("names") and q["names"][HERO_SEAT] == "hero" for q in stub.requests),
+           "PM-17 开时请求要带玩家名")
+    obs = [rec for k, rec in stub.side if k == "observe"]
+    _check(len(obs) == session.counters["hands_complete"] == 7, f"observe 每手一条: {len(obs)}")
+    # 和服务器原始 player_action 逐条对：投入 = contribution_delta；加注投入 > 动作前跟注额。
+    by_hand = {}
+    for m in msgs:
+        if m["type"] == "player_action":
+            by_hand.setdefault(m["hand_id"], []).append(m)
+    hand_ids = [m["hand_id"] for m in msgs if m["type"] == "hand_result"]
+    for hid, rec in zip(hand_ids, obs):
+        raw = by_hand[hid]
+        _check(len(rec["actions"]) == len(raw), f"{hid} observe 动作数")
+        for a, m in zip(rec["actions"], raw):
+            _check(a["contribution_delta"] == m["contribution_delta"], f"{hid} 投入 {a} vs {m}")
+            if a["action"] in ("raise", "all_in"):
+                _check(a["contribution_delta"] > a["to_call_before"], f"{hid} 加注应超过跟注额 {a}")
+            elif a["action"] == "call":
+                _check(a["contribution_delta"] == a["to_call_before"], f"{hid} 跟注额 {a}")
+    # 只开 --exploit：observe 不带金额（与改动前 IPC 字节相同）；两个都不开：不带名字、不发 observe。
+    _, stub, _ = _run_msgs(msgs, exploit=True)
+    _check(all(set(a) == {"seat", "street", "action"}
+               for k, rec in stub.side if k == "observe" for a in rec["actions"]),
+           "只开 --exploit 时 observe 不该带金额")
+    _, stub, _ = _run_msgs(msgs)
+    _check(not stub.side and all("names" not in q for q in stub.requests), "剥削全关时不带名字、不发 observe")
+    print("[selftest 7 PM-17] 请求带名字、observe 带投入金额并与服务器逐条一致", file=sys.stderr)
+
+
+def _selftest_hh_log():
+    """--hh-log：每手打完且没作废的牌局写一行；作废的手不写。"""
+    import io
+
+    msgs = _fixture_msgs()
+    buf = io.StringIO()
+    session, _, _ = _run_msgs(msgs, hh_log=buf)
+    rows = [json.loads(line) for line in buf.getvalue().splitlines()]
+    _check(len(rows) == session.counters["hands_complete"] == 7, f"hh 行数 {len(rows)}")
+    results = [m for m in msgs if m["type"] == "hand_result"]
+    for row, res in zip(rows, results):
+        _check(row["wopo_hh"] == 1 and row["hand_id"] == res["hand_id"] and row["result"] == res
+               and row["result_notes"] == [] and row["my_seat"] == HERO_SEAT, f"hh 行 {row['hand_id']}")
+        start = {int(k): v for k, v in row["initial_stacks"].items()}
+        final = {int(k): v for k, v in res["final_stacks"].items()}
+        _check(sorted(start) == row["dealt_seats"] == sorted(final)
+               and sum(start.values()) == sum(final.values()), f"{row['hand_id']} 开局栈 {start}")
+        # 投入合计 = 服务器最后报的底池（没人跟的注结算时退回，不能和 total_pot 比）。
+        last_pot = [m["pot"] for m in msgs if m["type"] == "player_action"
+                    and m["hand_id"] == res["hand_id"]][-1]
+        _check(sum(a["contribution_delta"] for a in row["actions"]) + row["small_blind"]
+               + row["big_blind"] == last_pot, f"{row['hand_id']} 投入合计 ≠ 底池")
+    # 与 opponent_analysis 测试用的样例逐行相同（改了 hh 格式要同步重生成样例、改适配器）。
+    with open(HH_FIXTURE) as f:
+        _check(rows == [json.loads(line) for line in f if line.strip()],
+               f"hh 输出与 {HH_FIXTURE} 不一致")
+    # 作废的手（底池对不上）不写。
+    hid = "local-table:hand:000009"
+    i = next(i for i, m in enumerate(msgs) if m.get("hand_id") == hid
+             and m["type"] == "player_action" and m["seat"] != HERO_SEAT)
+    msgs[i] = dict(msgs[i], pot_before=msgs[i]["pot_before"] + 1)
+    buf = io.StringIO()
+    _run_msgs(msgs, hh_log=buf)
+    ids = [json.loads(line)["hand_id"] for line in buf.getvalue().splitlines()]
+    _check(len(ids) == 6 and hid not in ids, f"作废的手不该写 hh: {ids}")
+    print("[selftest 8 hh 日志] 打完的手逐手写入、投入合计 = 底池；作废的手不写", file=sys.stderr)
+
+
 def run_selftest():
     _selftest_full_replay()
     _selftest_mid_hand_join()
     _selftest_tamper()
     _selftest_stale()
     _selftest_engine_rules()
-    print("OK: wopo selftest 5 组场景全部通过。", file=sys.stderr)
+    _selftest_legalize()
+    _selftest_exploit_4bet()
+    _selftest_hh_log()
+    print("OK: wopo selftest 8 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================
@@ -402,20 +525,25 @@ def main():
     p.add_argument("--action-log", default="wopo_actions_log.jsonl",
                    help="每决策落 {req,resp,decide_ms,stale} JSONL（含过期的）；空串关闭")
     p.add_argument("--ws-log", default=None, help="原始 WS 消息逐条落 JSONL（append）；缺省关")
+    p.add_argument("--hh-log", default=None,
+                   help="每手打完且没作废的牌局落 JSONL（append；opponent_analysis --platform wopo 读）；缺省关")
     p.add_argument("--num-hands", type=int, default=0, help="打完这么多手后退出；0 = 不限")
+    add_fourbet_args(p)
     args = p.parse_args()
     validate_advisor_args(args)
+    validate_fourbet_args(p, args)
 
-    advisor = start_advisor(args, advisor_extra_args(args))
+    advisor = start_advisor(args, advisor_extra_args(args) + fourbet_extra_args(args))
     # 回放用同步 worker（结果确定、不会因为读文件太快把决策判成过期）；联机用后台线程。
     worker = DecisionWorker(advisor, sync=args.replay is not None)
     action_file = ActionFile(args.action_file)
     action_log = open(args.action_log, "a") if args.action_log else None
+    hh_log = open(args.hh_log, "a", encoding="utf-8") if args.hh_log else None
     ws_log = WsLog(args.ws_log) if args.ws_log else None
     session = WopoSession(worker, action_file, n_seats=args.seats, hero_seat=HERO_SEAT,
                           num_hands=args.num_hands, action_log=action_log,
                           prewarm=args.search_prewarm, exploit=exploit_enabled(args),
-                          debug=args.debug_log)
+                          debug=args.debug_log, exploit_4bet=fourbet_enabled(args), hh_log=hh_log)
     try:
         if args.replay:
             run_replay(session, args.replay)
@@ -428,6 +556,8 @@ def main():
         action_file.close()
         if action_log:
             action_log.close()
+        if hh_log:
+            hh_log.close()
         if ws_log:
             ws_log.close()
 

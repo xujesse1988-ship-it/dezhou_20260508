@@ -66,6 +66,8 @@ class HandEngine:
         self.to_act = None
         self.actions = []       # advisor 格式 [{seat, action, to?}]
         self.action_streets = []
+        # 与 actions 一一对应：投入 / 动作前的跟注额（不截到栈）/ 动作前的栈（observe 金额、hh 日志用）
+        self.action_amounts = []
         self.names = {}
 
     # ---- 查询 ----
@@ -280,6 +282,8 @@ class HandEngine:
         self.actions.append({"seat": seat, "action": label,
                              **({"to": new} if label in ("raise", "all_in") else {})})
         self.action_streets.append(self.street)
+        self.action_amounts.append({"contribution_delta": delta, "to_call_before": to_call,
+                                    "stack_before": stack})
         self.to_act = self._next_actor(seat)
 
     def apply_board(self, street, cards):
@@ -337,8 +341,26 @@ class HandEngine:
             notes.append(f"result_not_conserved:{sum(final.values())}!={sum(self.start_stack.values())}")
         return notes
 
-    def observe_record(self):
-        """叠加剥削 observe（同 openpoker HandState.observe_record 格式）。"""
-        return {"observe": 1, "names": self.names,
-                "actions": [{"seat": a["seat"], "street": st, "action": a["action"]}
-                            for a, st in zip(self.actions, self.action_streets)]}
+    def observe_record(self, amounts=False):
+        """叠加剥削 observe（同 openpoker HandState.observe_record 格式）。amounts=True（PM-17
+        --exploit-4bet）时每个动作另带 contribution_delta / to_call_before，advisor 据此区分真加注和
+        只够跟注的全下（同 poker_manager driver）。"""
+        acts = []
+        for a, st, amt in zip(self.actions, self.action_streets, self.action_amounts):
+            rec = {"seat": a["seat"], "street": st, "action": a["action"]}
+            if amounts:
+                rec["contribution_delta"] = amt["contribution_delta"]
+                rec["to_call_before"] = amt["to_call_before"]
+            acts.append(rec)
+        return {"observe": 1, "names": self.names, "actions": acts}
+
+    def hh_record(self):
+        """校验通过的整手牌局（hh 日志一行，opponent_analysis 的 wopo 适配器读）。只在本手打完且
+        没作废时调用：开局栈 / 动作 / 投入都是本引擎逐条核对过的。"""
+        return {"hand_id": self.hand_id, "button_seat": self.button, "small_blind": self.sb,
+                "big_blind": self.bb, "my_seat": self.hero, "dealt_seats": list(self.dealt),
+                "initial_stacks": {str(s): v for s, v in self.start_stack.items()},
+                "names": {str(s): n for s, n in self.names.items()},
+                "hole": list(self.hole or []), "board": list(self.board),
+                "actions": [{**a, "street": st, **amt} for a, st, amt
+                            in zip(self.actions, self.action_streets, self.action_amounts)]}

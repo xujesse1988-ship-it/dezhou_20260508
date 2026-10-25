@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 
-from poker_live.decision import make_request, tally_source
+from poker_live.decision import make_request, safe_response, tally_source
 from poker_live.table import HandEngine, HandInvalid
 
 # 已知消息类型；其余类型首见时打 stderr、忽略（不作废当前手）。
@@ -62,9 +62,33 @@ def _action(msg):
             "name": msg.get("name")}
 
 
+def legalize(resp, valid):
+    """advisor 响应 → 行动文件可用的合法动作（同 poker_manager driver 的处理）。
+    - 不能加注时 advisor 回不带金额的 all_in（对手已全下、hero 更深）：能跟注就改成 call，
+      source 加 :allin_as_call——跟注就是这时能投入的最多筹码。
+    - 其余不在合法区间里的动作 → 安全动作兜底（fallback:illegal_advisor_action），rejected 记原回复。"""
+    action, amount = resp.get("action"), resp.get("amount")
+    if action == "all_in" and not valid.get("can_raise") and valid.get("can_call"):
+        return {**resp, "action": "call", "source": f"{resp.get('source', '')}:allin_as_call"}
+    if action == "raise":
+        ok = (valid.get("can_raise") and not isinstance(amount, bool)
+              and isinstance(amount, (int, float)) and int(amount) == amount
+              and valid["min_raise"] <= amount <= valid["max_raise"])
+    else:
+        ok = (action == "fold" or (action == "check" and valid.get("can_check"))
+              or (action == "call" and valid.get("can_call"))
+              or (action == "all_in" and valid.get("can_raise")))
+    if ok:
+        return resp
+    out = safe_response(valid, "fallback:illegal_advisor_action")
+    out["rejected"] = {k: resp.get(k) for k in ("action", "amount", "source")}
+    return out
+
+
 class WopoSession:
     def __init__(self, worker, action_file, n_seats, hero_seat=0, num_hands=0,
-                 action_log=None, prewarm=False, exploit=False, debug=False):
+                 action_log=None, prewarm=False, exploit=False, debug=False,
+                 exploit_4bet=False, hh_log=None):
         self.worker = worker
         self.action_file = action_file
         self.n_seats = n_seats
@@ -73,6 +97,10 @@ class WopoSession:
         self.action_log = action_log
         self.prewarm = prewarm
         self.exploit = exploit
+        # PM-17 (--exploit-4bet)：advisor 要请求里的玩家名 + 每手带金额的 observe（同 poker_manager）。
+        self.exploit_4bet = exploit_4bet
+        self.send_names = exploit or exploit_4bet
+        self.hh_log = hh_log    # 校验通过的整手牌局 JSONL（opponent_analysis 读）；None = 不写
         self.debug = debug
         # 消息处理线程（transport）和决策回调线程（worker）共用 → 串行化；RLock：同步 worker
         # 在处理线程里当场回调。
@@ -237,8 +265,15 @@ class WopoSession:
         if notes:
             self.counters["result_notes"] += 1
             print(f"  [result] hand={hand.hand_id} 结算核对：{'; '.join(notes)}", file=sys.stderr)
-        if self.exploit:
-            self.worker.submit_observe(hand.observe_record())
+        if self.send_names:
+            self.worker.submit_observe(hand.observe_record(amounts=self.exploit_4bet))
+        if self.hh_log:
+            # 走到这里的手都没作废（作废的手不再处理后续消息）；结算核对不过也照写，记 result_notes，
+            # opponent_analysis 回放时会再校验一遍并拒收。
+            rec = {"wopo_hh": 1, "table_id": self.table_id, "ts": msg.get("ts"),
+                   **hand.hh_record(), "result": msg, "result_notes": notes}
+            self.hh_log.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            self.hh_log.flush()
         self._dbg(f"hand_result winners={msg.get('winners')} final_stacks={msg.get('final_stacks')}")
         if self.num_hands and self.counters["hands_complete"] >= self.num_hands:
             self.done = True
@@ -250,7 +285,7 @@ class WopoSession:
                             hand.sb, hand.bb, list(hand.actions), valid,
                             stacks=hand.hand_start_stacks(placeholder=100 * hand.bb),
                             dealt_seats=list(dealt) if dealt else None,
-                            names=dict(hand.names) if self.exploit else None)
+                            names=dict(hand.names) if self.send_names else None)
 
     def _maybe_prewarm(self):
         """街起点预热（--search-prewarm）：hero 本手还能行动才发；发错无害（advisor 侧 skip）。"""
@@ -285,6 +320,7 @@ class WopoSession:
         """决策结果（worker 线程回调）。hero 在此期间已出牌 / 这手已作废 → 结果过期，不写行动文件。"""
         with self.lock:
             self.counters["decisions"] += 1
+            resp = legalize(resp, ctx["valid"])
             tally_source(self.counters, self.fallback_reasons, resp.get("source", ""))
             hand = self.hand
             stale = None

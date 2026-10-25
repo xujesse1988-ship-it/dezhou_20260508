@@ -18,8 +18,9 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 import uuid
 
-from poker_live.advisor_client import (add_advisor_args, advisor_extra_args, exploit_enabled,
-                                       start_advisor, validate_advisor_args)
+from poker_live.advisor_client import (add_advisor_args, add_fourbet_args, advisor_extra_args,
+                                       exploit_enabled, fourbet_enabled, fourbet_extra_args,
+                                       start_advisor, validate_advisor_args, validate_fourbet_args)
 from poker_live.decision import DecisionWorker, make_request, safe_response
 from poker_live.wslog import WsLog
 
@@ -607,22 +608,6 @@ def run(session, url, token, ws_log=None, reconnect_attempts=10):
         raise RuntimeError(session.error)
 
 
-def fourbet_extra_args(args):
-    """PM-17 flags passed through to the advisor (empty when off, keeping the command line unchanged)."""
-    if args.exploit_4bet != "on":
-        return []
-    extra = ["--exploit-4bet", "on"]
-    for flag, value in (("--exploit-4bet-convert", args.exploit_4bet_convert),
-                        ("--exploit-4bet-fold-decay", args.exploit_4bet_fold_decay),
-                        ("--exploit-4bet-3bet-decay", args.exploit_4bet_3bet_decay)):
-        if value is not None:
-            extra += [flag, str(value)]
-    if args.exploit_4bet_state is not None:
-        # Absolute, so the advisor reads the same file whatever its working directory.
-        extra += ["--exploit-4bet-state", os.path.abspath(args.exploit_4bet_state)]
-    return extra
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_advisor_args(parser, default_seats=6, debug_help="打印决策及 Rust advisor 调试信息")
@@ -639,22 +624,10 @@ def main(argv=None):
     parser.add_argument("--action-log", default=None)
     parser.add_argument("--hh-log", default=None)
     parser.add_argument("--ws-log", default=None)
-    parser.add_argument("--exploit-4bet", choices=["on", "off"], default="off",
-                        help="PM-17：对 3bet 多、被 4bet 就弃的对手把翻前弃牌概率挪给 4bet（进程内实时统计）")
-    parser.add_argument("--exploit-4bet-convert", type=float, default=None,
-                        help="门开时 fold 概率挪给 4bet 的比例，默认 1.0")
-    parser.add_argument("--exploit-4bet-fold-decay", type=float, default=None,
-                        help="被 4bet 弃牌统计的衰减系数，默认 0.9")
-    parser.add_argument("--exploit-4bet-3bet-decay", type=float, default=None,
-                        help="3bet 统计的衰减系数，默认 0.98")
-    parser.add_argument("--exploit-4bet-state", default=None,
-                        help="PM-17 统计的状态文件：启动时读入接着统计（不存在则从零），每手写回；不设 = 每次从零")
+    add_fourbet_args(parser)
     args = parser.parse_args(argv)
     validate_advisor_args(args)
-    fourbet_subflags = (args.exploit_4bet_convert, args.exploit_4bet_fold_decay,
-                        args.exploit_4bet_3bet_decay, args.exploit_4bet_state)
-    if args.exploit_4bet != "on" and any(v is not None for v in fourbet_subflags):
-        parser.error("--exploit-4bet-* 子旗需配 --exploit-4bet on")
+    validate_fourbet_args(parser, args)
     if not args.token or any(c.isspace() for c in args.token):
         parser.error("需要 --token 或 POKER_MANAGER_TOKEN（非空且不含空白）")
     url = urlsplit(args.url)
@@ -691,7 +664,7 @@ def main(argv=None):
                                  action_log, hh_log, exploit_enabled(args),
                                  args.search_prewarm, args.debug_log,
                                  args.auto_rebuy, account_reader(args.url, args.token),
-                                 stack_band, exploit_4bet=args.exploit_4bet == "on")
+                                 stack_band, exploit_4bet=fourbet_enabled(args))
         stack.callback(session.disconnect)
         try:
             run(session, args.url, args.token, ws_log, args.reconnect_attempts)
