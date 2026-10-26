@@ -847,7 +847,10 @@ mod tests {
                     three_way_flop_sub()
                 }
             };
+            // SubgameTrainer still averages at the traverser's nodes; pin the HashMap trainer to
+            // that path until both move to opponent-node averaging (es_mccfr issue doc §9).
             let mut a = EsMccfrTrainer::new(sub(), 1)
+                .with_traverser_node_average()
                 .with_visit_counts()
                 .with_traverser_rotation(live.clone());
             let mut b = SubgameTrainer::new(sub())

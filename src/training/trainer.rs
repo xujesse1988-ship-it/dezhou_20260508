@@ -307,7 +307,7 @@ pub struct EsMccfrTrainer<G: Game> {
     /// traverser 轮转座位表（S6 实时搜索 subgame solve 专用）。`None`（默认）= 既有行为：
     /// traverser = `update_count % n_players` 轮**全部**座位。`Some(seats)` = 第 t 个 update 的
     /// traverser = `seats[t % seats.len()]`——子树里弃牌 / all-in 座**零决策节点**（规则引擎只让
-    /// `Active` 座当 `current_player`），轮到它们的迭代纯零学习（σ / regret 都只在
+    /// `Active` 座当 `current_player`），轮到它们的迭代 regret 零学习（regret 只在
     /// `actor == traverser` 的节点累积，见 [`recurse_es`]）→ 只轮 Active 座 = 同 wall 有效迭代
     /// ×`n_seats/n_active`。**不存 checkpoint**（subgame 实时一次性求解不落盘；主线训练不用，
     /// resume 后恒 `None`）。
@@ -317,6 +317,10 @@ pub struct EsMccfrTrainer<G: Game> {
     /// update), so the caller can refuse an average strategy built from too few updates. Pure
     /// bookkeeping: no effect on regrets, strategy sums or rng consumption. Not checkpointed.
     pub(crate) visit_counts: Option<HashMap<G::InfoSet, u32>>,
+    /// Test-only override: force the old traverser-node average (see
+    /// [`Self::average_at_opponent_nodes`]). Lets the `SubgameTrainer` parity test keep its
+    /// bit-for-bit check until `SubgameTrainer` moves to opponent-node averaging too.
+    pub(crate) force_traverser_node_average: bool,
 }
 
 impl<G: Game> EsMccfrTrainer<G> {
@@ -337,6 +341,7 @@ impl<G: Game> EsMccfrTrainer<G> {
             lcfr_rescale_regret: true,
             traverser_rotation: None,
             visit_counts: None,
+            force_traverser_node_average: false,
         }
     }
 
@@ -453,24 +458,35 @@ impl<G: Game> EsMccfrTrainer<G> {
 
     /// Where [`recurse_es`] / [`recurse_es_parallel`] accumulate the average strategy.
     ///
-    /// `true` (two players, both seats in the traverser rotation): at the non-traverser's nodes
-    /// with weight 1 — the visit frequency there is that player's own reach × chance reach, which
-    /// is exactly the average-strategy weight (Lanctot 2009; OpenSpiel `AverageType.SIMPLE`).
-    /// Leduc 20M updates: exploitability 0.0037 ± 0.0003 vs 0.150 ± 0.140 for the old path.
+    /// `true` (at least two distinct seats traverse — always, unless a rotation is configured):
+    /// at every non-traverser's node with weight 1. With two players the visit frequency there is
+    /// that player's own reach × chance reach, exactly the average-strategy weight (Lanctot 2009;
+    /// OpenSpiel `AverageType.SIMPLE`); Leduc 20M updates: exploitability 0.0037 ± 0.0003 vs
+    /// 0.150 ± 0.140 for the old path. With n ≥ 3 the other non-traversers' reach is still in the
+    /// visit frequency (slightly biased), but measured against the exact sequence-weighted average
+    /// on 3–6 player Kuhn / 3 player Leduc it stays within noise of it, while the old path is
+    /// 2–7× worse in NashConv and the importance-corrected variant's variance grows with n.
     ///
-    /// `false` (n ≥ 3, or a rotation that skips a seat): old path, at the traverser's nodes
-    /// weighted by its own reach. Biased (the implicit opponent reach varies across iterations),
-    /// but with n ≥ 3 weight-1 at opponent nodes is biased too (other non-traversers' reach is
-    /// still sampled), and a skipped seat's opponent would never be averaged. Kept unchanged
-    /// pending a multi-player fix; see
-    /// `docs/temp/es_mccfr_leduc_convergence_issue_2026_10_25.md` §7.
+    /// `false` (a rotation with a single distinct seat): old path, at the traverser's nodes
+    /// weighted by its own reach. With one traverser the other seats never learn, so their
+    /// strategies are fixed and this is unbiased — and weight-1 at opponent nodes would never
+    /// average the only learning seat. See
+    /// `docs/temp/es_mccfr_leduc_convergence_issue_2026_10_25.md` §7–9.
     pub fn average_at_opponent_nodes(&self) -> bool {
-        let n = self.game.n_players();
-        let all_seats_traverse = match &self.traverser_rotation {
-            Some(rot) => (0..n as PlayerId).all(|seat| rot.contains(&seat)),
-            None => true,
-        };
-        n == 2 && all_seats_traverse
+        if self.force_traverser_node_average {
+            return false;
+        }
+        match &self.traverser_rotation {
+            Some(rot) => rot.iter().any(|&seat| seat != rot[0]),
+            None => self.game.n_players() >= 2,
+        }
+    }
+
+    /// See [`Self::force_traverser_node_average`].
+    #[cfg(test)]
+    pub(crate) fn with_traverser_node_average(mut self) -> Self {
+        self.force_traverser_node_average = true;
+        self
     }
 
     /// 已访问 infoset 的 strategy_sum 表只读访问（诊断用：导出
@@ -740,6 +756,7 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             // traverser 轮转同样不存 checkpoint（subgame 实时求解不落盘；resume 恒默认轮转）。
             traverser_rotation: None,
             visit_counts: None,
+            force_traverser_node_average: false,
         })
     }
 }
@@ -1126,7 +1143,7 @@ mod tests {
         }
     }
 
-    /// 子集轮转 `[1]`：座 0 永不当 traverser → (a) 轮转不覆盖全座 ⇒ 走 traverser 节点累积
+    /// 子集轮转 `[1]`：座 0 永不当 traverser → (a) 轮转只有 1 个座位 ⇒ 走 traverser 节点累积
     /// average strategy 的旧路径（[`EsMccfrTrainer::average_at_opponent_nodes`] = false）⇒ strategy_sum
     /// 全部 key 的 actor == 1；(b) 座 0 的 regret 槽（路径访问 get_or_init 建出）恒为零向量
     /// （regret 也只在 actor == traverser 节点累积）。这就是「弃牌座当 traverser = 零学习」的
@@ -1226,8 +1243,9 @@ mod tests {
         }
     }
 
-    /// Two players → average strategy at opponent nodes: after one step (seat 0 traverses) only
-    /// seat-1 infosets have strategy_sum entries. A rotation that skips a seat keeps the old path.
+    /// Average strategy at opponent nodes: after one step (seat 0 traverses) only seat-1 infosets
+    /// have strategy_sum entries. Only a rotation with a single distinct seat keeps the old path
+    /// (n ≥ 3 is covered by `tests/es_mccfr_multiplayer.rs`).
     #[test]
     fn two_player_average_accumulates_at_opponent_nodes() {
         let mut t = EsMccfrTrainer::new(KuhnGame, 0x6f70_7061); // "oppa"
@@ -1240,7 +1258,17 @@ mod tests {
             "座 0 当 traverser 时只应累积座 1（对手）的 average strategy"
         );
         let subset = EsMccfrTrainer::new(KuhnGame, 1).with_traverser_rotation(vec![1]);
-        assert!(!subset.average_at_opponent_nodes(), "轮转跳过座位 → 旧路径");
+        assert!(
+            !subset.average_at_opponent_nodes(),
+            "只有 1 个座位轮转 → 旧路径"
+        );
+        let repeated = EsMccfrTrainer::new(KuhnGame, 1).with_traverser_rotation(vec![1, 1]);
+        assert!(
+            !repeated.average_at_opponent_nodes(),
+            "重复同一座位仍只有 1 个座位"
+        );
+        let forced = EsMccfrTrainer::new(KuhnGame, 1).with_traverser_node_average();
+        assert!(!forced.average_at_opponent_nodes());
         let full = EsMccfrTrainer::new(KuhnGame, 1).with_traverser_rotation(vec![1, 0]);
         assert!(full.average_at_opponent_nodes());
     }

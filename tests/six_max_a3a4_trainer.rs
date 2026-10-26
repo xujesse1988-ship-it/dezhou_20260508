@@ -16,6 +16,7 @@
 //!   ```bash
 //!   cargo test --release --test six_max_a3a4_trainer six_max_a3a4_dense_train_monitor -- --ignored --nocapture
 //!   ```
+//! - `six_max_a3a4_dense_byte_equal_hashmap`（`#[ignore]`）：6-max 下 dense 与 HashMap 后端逐位相同。
 
 use std::sync::Arc;
 
@@ -469,4 +470,83 @@ fn six_max_a3a4_dense_train_monitor() {
     assert_report_sane(&r3, false);
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// 6-max dense ↔ HashMap 逐位相同（vanilla，单线程 + deterministic 并行）：两个后端的平均策略都在
+/// 非遍历者节点累积（`docs/temp/es_mccfr_leduc_convergence_issue_2026_10_25.md` §9），每个访问过的
+/// infoset 的 regret / strategy_sum 行、current / average strategy 都逐位相同，且 dense 的 touched
+/// 集合与 HashMap 的 key 集合一致。`#[ignore]`：dense 两表 ~1.5 GiB + HashMap，跑在 AWS。
+#[test]
+#[ignore]
+fn six_max_a3a4_dense_byte_equal_hashmap() {
+    let mut dense = DenseNlheEsMccfrTrainer::new(build_six_max_game(), MASTER_SEED);
+    let mut hm: EsMccfrTrainer<SimplifiedNlheGame> =
+        EsMccfrTrainer::new(build_six_max_game(), MASTER_SEED);
+    assert!(hm.average_at_opponent_nodes());
+    let mut rng_dense = ChaCha20Rng::from_seed(RNG_SEED);
+    let mut rng_hm = ChaCha20Rng::from_seed(RNG_SEED);
+    for _ in 0..3_000 {
+        dense.step(&mut rng_dense).expect("dense step");
+        hm.step(&mut rng_hm).expect("hashmap step");
+    }
+    let pool = || -> Vec<Box<dyn RngSource>> {
+        (0..4u64)
+            .map(|t| Box::new(ChaCha20Rng::from_seed(RNG_SEED ^ (t + 1))) as Box<dyn RngSource>)
+            .collect()
+    };
+    let (mut pool_dense, mut pool_hm) = (pool(), pool());
+    for _ in 0..10 {
+        dense
+            .step_parallel(&mut pool_dense, 4, 16)
+            .expect("dense step_parallel");
+        hm.step_parallel(&mut pool_hm, 4, 16)
+            .expect("hashmap step_parallel");
+    }
+    assert_eq!(dense.update_count(), hm.update_count());
+
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        dense.strategy_sum().touched_count(),
+        hm.strategy_sum().len() as u64,
+        "strategy_sum touched 行数 = HashMap key 数"
+    );
+    let visited: Vec<InfoSetId> = hm.regret_table().inner().keys().copied().collect();
+    assert!(
+        visited.len() > 1_000,
+        "访问 infoset 太少：{}",
+        visited.len()
+    );
+    for &info in &visited {
+        let hm_regret = &hm.regret_table().inner()[&info];
+        assert_eq!(
+            bits(&dense.regret_table().row_values_by_info(info)),
+            bits(hm_regret),
+            "regret @ {:#x}",
+            info.raw()
+        );
+        let hm_sum = hm
+            .strategy_sum()
+            .inner()
+            .get(&info)
+            .cloned()
+            .unwrap_or_else(|| vec![0.0; hm_regret.len()]);
+        assert_eq!(
+            bits(&dense.strategy_sum().row_values_by_info(info)),
+            bits(&hm_sum),
+            "strategy_sum @ {:#x}",
+            info.raw()
+        );
+        assert_eq!(
+            bits(&dense.current_strategy(info)),
+            bits(&hm.current_strategy(&info)),
+            "current_strategy @ {:#x}",
+            info.raw()
+        );
+        assert_eq!(
+            bits(&dense.average_strategy(info)),
+            bits(&hm.average_strategy(&info)),
+            "average_strategy @ {:#x}",
+            info.raw()
+        );
+    }
 }

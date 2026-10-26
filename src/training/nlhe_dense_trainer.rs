@@ -135,7 +135,6 @@ impl DenseNlheEsMccfrTrainer {
         recurse_es_dense(
             root,
             traverser,
-            1.0,
             &mut self.regret,
             &mut self.strategy_sum,
             rng,
@@ -216,7 +215,6 @@ impl DenseNlheEsMccfrTrainer {
                     recurse_es_dense_parallel(
                         root,
                         traverser,
-                        1.0,
                         shared_regret,
                         &mut local_regret,
                         &mut local_strategy,
@@ -290,7 +288,7 @@ impl DenseNlheEsMccfrTrainer {
                     let traverser =
                         ((base_update_count + trajectory_index) % n_players) as PlayerId;
                     let root = game.root(rng);
-                    recurse_es_dense_lockfree(root, traverser, 1.0, regret, strategy_sum, rng);
+                    recurse_es_dense_lockfree(root, traverser, regret, strategy_sum, rng);
                 }
             });
 
@@ -304,25 +302,14 @@ impl DenseNlheEsMccfrTrainer {
     /// current strategy（regret matching）：两表都没 touch 过该 infoset → 空 `Vec`；
     /// 否则走 regret matching（退化均匀分布）。
     ///
-    /// **与 HashMap [`crate::training::Trainer::current_strategy`] 的已知偏离**：
-    /// touched bit 只在 [`DenseNlheTable::accumulate_by_slot`] 时置位，而本 trainer 的
-    /// recurse 只在 **traverser 节点** accumulate（`recurse_es_dense` 的非-traverser 分支
-    /// 只采样、不累积）。HashMap 路径不同——`recurse_es` 在分流 traverser 之前就无条件
-    /// `regret.get_or_init(info, n)`，所以**任何被访问过的 player 节点**（含纯非-traverser
-    /// 路过的）都在 regret 表里 present。后果：对「训练中只作为对手非-traverser 路过、
-    /// 从未作为 traverser 被遍历」的 infoset（这类节点 regret/strategy_sum 在两路径下都恒
-    /// 为 0），**HashMap 返回 uniform `[1/n,…]`（非空），dense 返回空 `Vec`**。
+    /// touched bit 只在 [`DenseNlheTable::accumulate_by_slot`] 时置位：traverser 节点写
+    /// regret、非-traverser 节点写 strategy_sum（average strategy 在对手节点累积），所以
+    /// 训练中**任何被访问过的 player 节点**都至少有一张表 touched——与 HashMap
+    /// `recurse_es` 无条件 `regret.get_or_init` 出的 present 集合相同，未访问 infoset 两边
+    /// 分别返回空 / 不 present。消费方仍应把空 `Vec` 按 uniform 兜底。
     ///
-    /// 实质影响有限：这些是零信息节点（uniform 默认），训练值数组两路径逐位相同，
-    /// blueprint 内容一致。**但消费方若把空 `Vec` 当「节点不存在 / 跳过」而非「按 uniform
-    /// 兜底」，会与 HashMap 行为分叉**——接 LBR / blueprint 导出时需按 uniform 兜底处理空。
-    /// 集成测试 `tests/dense_nlhe_trainer.rs` 的 byte-equal 对照只遍历 `strategy_sum` keys
-    /// （= traverser 访问过的集合），结构上排除了这个偏离集合。
-    ///
-    /// 注意 [`Self::from_hashmap_checkpoint`] 逐 entry `accumulate_by_info` 会把 HashMap 里
-    /// get_or_init 出的全零非-traverser entry 也「零累加」并因此置位 touched——所以**从
-    /// HashMap ckpt 加载的 dense 对这些节点返回 uniform（与 HashMap 一致），而从零训练的
-    /// dense 返回空**，同一 trainer 两种来源行为不同。
+    /// （2026-10-26 之前 average strategy 在 traverser 节点累积，只作为对手路过的 infoset
+    /// 两表都不 touched → dense 返回空、HashMap 返回 uniform；旧 checkpoint 里仍有这种行。）
     pub fn current_strategy(&self, info: InfoSetId) -> Vec<f64> {
         let row = self.regret.indexer().locate(info).row_index;
         if self.regret.touched_row(row) || self.strategy_sum.touched_row(row) {
@@ -335,11 +322,7 @@ impl DenseNlheEsMccfrTrainer {
     /// average strategy（strategy_sum 归一化）：两表都没 touch 过 → 空 `Vec`；否则
     /// 归一化（sum 为 0 退化均匀分布）。
     ///
-    /// **与 HashMap [`crate::training::Trainer::average_strategy`] 的偏离同
-    /// [`Self::current_strategy`]**：仅作为非-traverser 访问过的零信息 infoset，HashMap
-    /// 返回 uniform、dense 返回空 `Vec`（HashMap `average_strategy` 经 regret entry present
-    /// 走 `strategy_sum.average_strategy`，缺 key 退化 uniform）。详见
-    /// [`Self::current_strategy`] 的偏离说明 + 消费方兜底要求。
+    /// touched 语义见 [`Self::current_strategy`]。
     pub fn average_strategy(&self, info: InfoSetId) -> Vec<f64> {
         let row = self.strategy_sum.indexer().locate(info).row_index;
         if self.strategy_sum.touched_row(row) || self.regret.touched_row(row) {
@@ -492,7 +475,6 @@ pub(crate) fn bucket_count_by_street(game: &SimplifiedNlheGame) -> [u32; 4] {
 fn recurse_es_dense(
     state: SimplifiedNlheState,
     traverser: PlayerId,
-    pi_trav: f64,
     regret: &mut DenseNlheTable,
     strategy_sum: &mut DenseNlheTable,
     rng: &mut dyn RngSource,
@@ -512,22 +494,10 @@ fn recurse_es_dense(
             let sigma = regret.current_strategy_smallvec_by_info(info);
 
             if actor == traverser {
-                // traverser node：先按 traverser 自身 reach 累积 average strategy
-                // （顺序与 recurse_es 一致：strategy_sum 先于 regret）。
-                let weighted: SigmaVec = sigma.iter().map(|s| pi_trav * s).collect();
-                strategy_sum.accumulate_by_info(info, &weighted);
-
                 let mut cfvs: SigmaVec = SigmaVec::with_capacity(n);
-                for (i, action) in actions.iter().enumerate() {
+                for action in &actions {
                     let next_state = SimplifiedNlheGame::next(state.clone(), *action, rng);
-                    let cfv = recurse_es_dense(
-                        next_state,
-                        traverser,
-                        pi_trav * sigma[i],
-                        regret,
-                        strategy_sum,
-                        rng,
-                    );
+                    let cfv = recurse_es_dense(next_state, traverser, regret, strategy_sum, rng);
                     cfvs.push(cfv);
                 }
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
@@ -537,7 +507,10 @@ fn recurse_es_dense(
                 regret.accumulate_by_info(info, &delta);
                 sigma_value
             } else {
-                // opponent node：按 σ 采样 1 action（剔除零概率 outcome；D-309 / D-337）。
+                // opponent node：average strategy 在此按权重 1 累积（全 σ，含零概率 action；
+                // 同 HashMap recurse_es 的 `avg_at_opp` 路径）。
+                strategy_sum.accumulate_by_info(info, &sigma);
+                // 按 σ 采样 1 action（剔除零概率 outcome；D-309 / D-337）。
                 let nonzero_dist: SmallVec<[(SimplifiedNlheAction, f64); 8]> = actions
                     .iter()
                     .copied()
@@ -550,7 +523,7 @@ fn recurse_es_dense(
                 );
                 let sampled = sample_discrete(&nonzero_dist, rng);
                 let next_state = SimplifiedNlheGame::next(state, sampled, rng);
-                recurse_es_dense(next_state, traverser, pi_trav, regret, strategy_sum, rng)
+                recurse_es_dense(next_state, traverser, regret, strategy_sum, rng)
             }
         }
     }
@@ -568,8 +541,8 @@ fn recurse_es_dense(
 ///
 /// `locate` 每决策节点只调一次（拿 `slot_start` / `row_index` / `action_count`），
 /// σ 读与 delta push 都复用同一定位结果。push 顺序与 [`recurse_es_dense`] /
-/// HashMap `recurse_es_parallel` 一致：traverser 分支先 push strategy_sum，递归
-/// 子节点后再 push regret。
+/// HashMap `recurse_es_parallel` 一致：非-traverser 分支先 push strategy_sum 再递归，
+/// traverser 分支递归子节点后再 push regret。
 ///
 /// traverser 分支走 last-iteration-move（前 n-1 次 `state.clone()`，最后一次 move），
 /// 同 HashMap 并行版 `recurse_es_parallel`——`next` 调用顺序不变，仅省 1 次 clone+drop，
@@ -578,7 +551,6 @@ fn recurse_es_dense(
 fn recurse_es_dense_parallel(
     state: SimplifiedNlheState,
     traverser: PlayerId,
-    pi_trav: f64,
     shared_regret: &DenseNlheTable,
     local_regret: &mut DenseLocalDelta,
     local_strategy: &mut DenseLocalDelta,
@@ -600,11 +572,6 @@ fn recurse_es_dense_parallel(
                 shared_regret.current_strategy_smallvec_at(slot.slot_start, slot.action_count);
 
             if actor == traverser {
-                // traverser node：先按 traverser reach 累积 average strategy（顺序与
-                // recurse_es_dense 一致：strategy_sum 先于 regret）。
-                let weighted: SigmaVec = sigma.iter().map(|s| pi_trav * s).collect();
-                local_strategy.push(slot.slot_start, slot.row_index, weighted);
-
                 debug_assert!(
                     n > 0,
                     "traverser Player 节点必有 ≥ 1 legal action（fold 兜底）"
@@ -615,12 +582,11 @@ fn recurse_es_dense_parallel(
                 // `recurse_es_parallel`）。`next` 调用顺序不变 → rng 消费序列不变 →
                 // 与单线程 `recurse_es_dense` / HashMap 并行版 byte-equal 不受影响。
                 let last_idx = n - 1;
-                for i in 0..last_idx {
-                    let next_state = SimplifiedNlheGame::next(state.clone(), actions[i], rng);
+                for &action in &actions[..last_idx] {
+                    let next_state = SimplifiedNlheGame::next(state.clone(), action, rng);
                     let cfv = recurse_es_dense_parallel(
                         next_state,
                         traverser,
-                        pi_trav * sigma[i],
                         shared_regret,
                         local_regret,
                         local_strategy,
@@ -632,7 +598,6 @@ fn recurse_es_dense_parallel(
                 let cfv_last = recurse_es_dense_parallel(
                     last_state,
                     traverser,
-                    pi_trav * sigma[last_idx],
                     shared_regret,
                     local_regret,
                     local_strategy,
@@ -656,12 +621,13 @@ fn recurse_es_dense_parallel(
                     !nonzero_dist.is_empty(),
                     "non-traverser σ all-zero impossible: current_strategy 退化局面回退均匀分布"
                 );
+                // average strategy 按权重 1 push（位置同 HashMap recurse_es_parallel）。
+                local_strategy.push(slot.slot_start, slot.row_index, sigma);
                 let sampled = sample_discrete(&nonzero_dist, rng);
                 let next_state = SimplifiedNlheGame::next(state, sampled, rng);
                 recurse_es_dense_parallel(
                     next_state,
                     traverser,
-                    pi_trav,
                     shared_regret,
                     local_regret,
                     local_strategy,
@@ -681,14 +647,13 @@ fn recurse_es_dense_parallel(
 /// （Hogwild! Niu et al. 2011 + 后续 MCCFR 经验）。
 ///
 /// `locate` 每决策节点只调一次；σ 读 + 写入都复用同一 slot 定位。push 顺序与
-/// [`recurse_es_dense_parallel`] 一致：traverser 分支先写 strategy_sum，递归子节点
-/// 后再写 regret。`last-iteration move`（前 n-1 次 `state.clone()` / 最后一次
+/// [`recurse_es_dense_parallel`] 一致：非-traverser 分支先写 strategy_sum 再递归，
+/// traverser 分支递归子节点后再写 regret。`last-iteration move`（前 n-1 次 `state.clone()` / 最后一次
 /// move）保持，对齐并行同型；本路径 byte-equal 本就不成立（CAS race 顺序不定），
 /// 但 rng 消费序列与 deterministic 路径一致，便于做 LBR / avg_strategy 统计对照。
 fn recurse_es_dense_lockfree(
     state: SimplifiedNlheState,
     traverser: PlayerId,
-    pi_trav: f64,
     regret: &DenseNlheTable,
     strategy_sum: &DenseNlheTable,
     rng: &mut dyn RngSource,
@@ -707,42 +672,28 @@ fn recurse_es_dense_lockfree(
             let sigma = regret.current_strategy_smallvec_at(slot.slot_start, slot.action_count);
 
             if actor == traverser {
-                let weighted: SigmaVec = sigma.iter().map(|s| pi_trav * s).collect();
-                strategy_sum.accumulate_by_slot(slot.slot_start, slot.row_index, &weighted);
-
                 debug_assert!(
                     n > 0,
                     "traverser Player 节点必有 ≥ 1 legal action（fold 兜底）"
                 );
                 let mut cfvs: SigmaVec = SigmaVec::with_capacity(n);
                 let last_idx = n - 1;
-                for i in 0..last_idx {
-                    let next_state = SimplifiedNlheGame::next(state.clone(), actions[i], rng);
-                    let cfv = recurse_es_dense_lockfree(
-                        next_state,
-                        traverser,
-                        pi_trav * sigma[i],
-                        regret,
-                        strategy_sum,
-                        rng,
-                    );
+                for &action in &actions[..last_idx] {
+                    let next_state = SimplifiedNlheGame::next(state.clone(), action, rng);
+                    let cfv =
+                        recurse_es_dense_lockfree(next_state, traverser, regret, strategy_sum, rng);
                     cfvs.push(cfv);
                 }
                 let last_state = SimplifiedNlheGame::next(state, actions[last_idx], rng);
-                let cfv_last = recurse_es_dense_lockfree(
-                    last_state,
-                    traverser,
-                    pi_trav * sigma[last_idx],
-                    regret,
-                    strategy_sum,
-                    rng,
-                );
+                let cfv_last =
+                    recurse_es_dense_lockfree(last_state, traverser, regret, strategy_sum, rng);
                 cfvs.push(cfv_last);
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
                 let delta: SigmaVec = cfvs.iter().map(|c| c - sigma_value).collect();
                 regret.accumulate_by_slot(slot.slot_start, slot.row_index, &delta);
                 sigma_value
             } else {
+                strategy_sum.accumulate_by_slot(slot.slot_start, slot.row_index, &sigma);
                 let nonzero_dist: SmallVec<[(SimplifiedNlheAction, f64); 8]> = actions
                     .iter()
                     .copied()
@@ -755,7 +706,7 @@ fn recurse_es_dense_lockfree(
                 );
                 let sampled = sample_discrete(&nonzero_dist, rng);
                 let next_state = SimplifiedNlheGame::next(state, sampled, rng);
-                recurse_es_dense_lockfree(next_state, traverser, pi_trav, regret, strategy_sum, rng)
+                recurse_es_dense_lockfree(next_state, traverser, regret, strategy_sum, rng)
             }
         }
     }

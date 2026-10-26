@@ -9,6 +9,9 @@
 > Leduc 2000 万次可剥削度从 0.150 ± 0.140 降到 **0.0037 ± 0.0003**；现行写法在 100 万次后基本停在 0.15–0.18 不再下降，
 > 不只是慢，而是收敛到了错误的点。这个写法是 `240bb1a`（2026-05-17）引入的，之前是对的。
 > 结论只直接适用于两人博弈；6-max（n ≥ 3）下「对手节点权重 1」本身也有偏差，见 §7.4。
+>
+> **进展（2026-10-26）**：多人实验（§9）表明 n ≥ 3 也该用「非遍历者节点、权重 1」。`trainer.rs` 全部人数和 dense 训练器已改（§9.5）；
+> 实时搜索子树 `SubgameTrainer` 待改；blueprint 要重训。
 
 ## 1. 现象
 
@@ -188,6 +191,108 @@ target/release/examples/es_avg_probe check 300000 0x11            # 仓库训练
 - `tests/real_hand_forced_deal_leduc.rs` 200 万次对照仍通过，而且灵敏得多：基线 0.0138 ± 0.0007，q = 0.5 为 0.0141 ± 0.0013（修前基线标准差 0.093）。
 - 单元测试：`visit_counts_bookkeeping_only` 原来断言「有访问计数 ⟺ 有 strategy_sum」，两人时不再成立，改为断言 Kuhn 12 个信息集全部被计数；
   新增 `two_player_average_accumulates_at_opponent_nodes`。
-- **已知副作用**：HU（两人）配置下 HashMap 训练器与 dense 训练器不再逐位相同，`tests/dense_nlhe_trainer.rs` /
+- **已知副作用**（dense 部分已在 §9.5 消除）：HU（两人）配置下 HashMap 训练器与 dense 训练器不再逐位相同，`tests/dense_nlhe_trainer.rs` /
   `dense_nlhe_trainer_lockfree.rs` 的 HashMap 对照（`--ignored`，需 ≥ 8 GiB 机器）在 HU 下会失败。dense 是否同步改，跟 blueprint 一起定。同理，实时搜索的 `SubgameTrainer`（数组版，未改）与 `EsMccfrTrainer<SubgameNlheGame>` 的「逐位同结果」在 HU 子树下也不再成立；现有对照测试 `trainer_matches_hashmap_trainer` 用的是 6-max 子树，不受影响。
 - **外部对照还没跑**：本机 `/tmp` 配额不够装 OpenSpiel。目前的依据是 OpenSpiel 源码（§7.3）+ 同轨迹探针，按 `invariants.md` §7 还欠一次实跑对照。
+
+## 9. 多人（n ≥ 3）、dense、实时搜索子树怎么改（2026-10-25 调研）
+
+### 9.1 实验方法 [事实]
+
+探针 `examples/avg_multi_probe.rs`（未提交，只用标准库，自带 N 人 Kuhn / Leduc 和 N 人最优反应，不依赖仓库代码）。
+多人下 CFR 不保证收敛到 Nash，可剥削度不能当判据，所以换基准：同一条外部采样轨迹上，每次更新后沿各玩家的
+信息集父子链（完美回忆下 `π_p(I) = π_p(parent(I))·σ(parent(I), a)`）算出**精确平均** `Σ_t π_p^t(I)·σ^t(I)`，
+再看各种采样估计离它多远（按精确 reach 加权的 L1 距离 `d`）以及各自的 NashConv（`Σ_i` 最优反应收益 − 当前收益）。
+
+| 估计 | 位置 / 权重 |
+|---|---|
+| A | 遍历者节点，`π_i`（现行，n ≥ 3 时仓库仍是它） |
+| B | 所有非遍历者节点，1（两人修正 `8da9a2b`） |
+| C | 只在 `(i+1) mod n` 号玩家节点，1（OpenSpiel `SIMPLE`） |
+| D | 遍历者节点，`π_i / Π_{k≠i} π_k(采样)`（无偏，重要性修正 A） |
+| E | 玩家 j 的节点，`1 / Π_{k∉{i,j}} π_k(采样)`（无偏，只修正第三方；n = 2 时 = B） |
+
+健全性：信息集数与仓库 / OpenSpiel 一致（两人 Kuhn 12、两人 Leduc 288、3 人 Kuhn 48）；两人 Leduc 30 万次 B 的可剥削度 0.033（§7.1 仓库探针 0.035）。
+
+### 9.2 结果 [事实]
+
+AWS 8 核机，均值（3–5 种子）。`nc` = NashConv，`d` = 离精确平均的距离。
+
+| 游戏 | 更新次数 | 精确 nc | A nc / d | B nc / d | C nc / d | D nc / d | E nc / d |
+|---|---|---|---|---|---|---|---|
+| 两人 Leduc（1 种子） | 30 万 | 0.077 | 0.597 / 0.065 | 0.066 / 0.003 | = B | 0.426 / 0.051 | = B |
+| 3 人 Kuhn | 300 万 | 0.0035 | 0.0203 / 0.0144 | 0.0036 / 0.0005 | 0.0091 / 0.0072 | 0.0143 / 0.0125 | 0.0037 / 0.0007 |
+| 4 人 Kuhn | 300 万 | 0.0047 | 0.0291 / 0.0656 | 0.0047 / 0.0035 | 0.0257 / 0.0172 | 0.0347 / 0.0665 | 0.0049 / 0.0033 |
+| 5 人 Kuhn | 300 万 | 0.0059 | 0.1127 / 0.1459 | 0.0060 / 0.0166 | 0.0540 / 0.0595 | 0.0852 / 0.1528 | 0.0058 / 0.0183 |
+| 6 人 Kuhn | 100 万 | 0.0209 | 0.1462 / 0.1977 | 0.0162 / 0.0253 | 0.1002 / 0.1060 | 0.1462 / 0.2106 | 0.0179 / 0.0348 |
+| 3 人 Leduc（3 点数，1 次加注） | 300 万 | 0.088 | 0.173 / 0.141 | 0.078 / 0.011 | 0.112 / 0.064 | 0.146 / 0.131 | 0.080 / 0.0095 |
+| 3 人 Leduc（3 点数，2 次加注） | 100 万 | 0.327 | 1.463 / 0.212 | 0.280 / 0.034 | 0.933 / 0.093 | 1.414 / 0.200 | 0.308 / 0.028 |
+
+- **A 在多人下同样坏**：`d` 停在 0.07–0.21 不降，NashConv 是精确平均的 2–7 倍，人越多越差。
+- **B 在多人下仍接近精确平均**：NashConv 与精确平均在误差内相同（3 人 Leduc、6 人 Kuhn 甚至略低），`d` 随迭代下降；
+  理论上 n ≥ 3 时 B 有偏（第三方 reach 隐式进权重），实测偏差小。
+- **E 无偏但方差随人数增长**：3 人 Leduc 上 `d` 比 B 略小，5 人起反超 B（6 人 0.035 对 0.025）。9 人桌第三方 reach 连乘更小，权重更重尾 → 不用。
+- C 样本少且同样有偏，D 方差爆炸，都不用。
+
+**结论：所有人数统一用 B**（非遍历者节点、权重 1）。
+
+### 9.3 各处改法
+
+**(1) `trainer.rs` n ≥ 3、dense 训练器（blueprint）**：统一改成 B。`average_at_opponent_nodes()` 的条件从「两人且轮转覆盖两座」
+改成「轮转里至少有 2 个不同座位」：只剩 1 个座位轮转时（如子树里对手全 all-in、只有 hero 能决策），该座之前没有任何对手决策，
+A 恰好无偏，而 B 永远轮不到累加它。dense 三个递归（`recurse_es_dense` / `_parallel` / `_lockfree`）照同样改；
+改后 HashMap ↔ dense 在 HU 和 6-max 下都重新逐位相同（`8da9a2b` 打破的 HU 对照恢复）。B 每次遍历的累加次数与 A 同量级（遍历者全展开的每个分支上，对手节点和遍历者节点交替出现），预计不会明显变慢，改完要实测吞吐。
+
+**(2) 实时搜索子树（`SubgameTrainer`）**：分两部分，**必须一起改**。
+- 各座位的分桶信息集：改成 B，同 (1)。它们会被用到：`cross_street_posterior_range` 用上一街子树的平均策略沿真实动作线算下一街各家范围。
+- hero 真实手牌信息集（读数点）：不能只改成 B。B 下它只在 hero **不**当遍历者、且按范围恰好抽到真实手牌时才累加，样本极少，
+  强制发牌（只在 hero 当遍历者时生效）帮不上；`min_hero_visits` 门槛数的也是遍历者访问。
+  改法：**对真实手牌信息集直接累加精确平均**。`π_hero^t(I)` 只取决于 hero 自己沿公共路径的各真实手牌信息集的当前策略，
+  沿子树里 hero 的决策节点做一遍「父节点乘到子节点」即可算出，与对手、采样都无关 → 无偏、没有采样方差，也和强制发牌不冲突
+  （强制发牌继续只负责给 regret 多喂样本）。每 K 次更新扫一遍（K 取到额外开销约 10%；σ 每次更新只变一点，抽样间隔 ≪ 总迭代时与逐次累加几乎无差）。
+  LCFR rescale 时同比缩放这张表。
+- 读数点：当前实盘子树建在每条街开头（还有预热 / 缓存），hero 经常在对手行动之后、沿真实动作走到子树深处才读数
+  （`navigate_subtree_by_real_actions`），所以现行 A 对实盘读数有实际影响 [推断，量级未测]。
+
+**(3) blueprint 重训**：实盘用的 `nlhe_9max_flop2_1pot_cap4_b500_9b_preflop_flop_stratonly.crop.zst` 只存平均策略，无法修正。
+regret 不受这个问题影响：如果全树带 regret 的 checkpoint 还在，可以从它接着训（strategy_sum 清零、用 B 再训一段），不必从零开始；否则只能重训。
+新旧 blueprint 用 `tools/six_max_blueprint_h2h` 对打评估。
+
+### 9.4 建议顺序
+
+1. (1)：`trainer.rs` + dense 一起改成 B（机械改动，恢复两个后端逐位相同），3 人 Kuhn / Leduc 加门槛测试（对照精确平均或 NashConv）。**已完成，见 §9.5。**
+2. (2)：`SubgameTrainer` 分桶信息集改 B + 真实手牌精确平均，一起提交；在 AWS 上用 `~/rh_exp` 的真实请求比较新旧读数分布，量一下实盘影响。
+3. (3)：blueprint 重训（2026-10-26 定：不接着训，直接重训）+ 对打评估。
+
+### 9.5 第 1 步实施结果（2026-10-26）[事实]
+
+改动：
+- `EsMccfrTrainer::average_at_opponent_nodes()` 的条件改成「轮转里至少 2 个不同座位」（不配轮转 = 全部座位轮转，恒为真），n ≥ 3 也走 B。
+  只配 1 个座位（或同一座位重复）时保留 A。
+- dense 三个递归（`recurse_es_dense` / `_parallel` / `_lockfree`）改成 B，不再需要的 `pi_trav` 参数删掉。
+  顺带消除一条已知偏离：dense 的 touched 行现在等于访问过的全部信息集（遍历者节点写 regret、非遍历者节点写 strategy_sum），
+  与 HashMap 的 key 集合相同；原来「只作为对手路过的信息集 dense 返回空、HashMap 返回均匀」不再出现（旧 checkpoint 里仍有这种行）。
+- `SubgameTrainer` 没改（第 2 步）。它和 HashMap 训练器的逐位对照测试 `trainer_matches_hashmap_trainer`（3 人子树）暂时让 HashMap 一侧
+  走旧写法（只在测试里可用的 `with_traverser_node_average()`），第 2 步改完删掉。
+
+新测试 `tests/es_mccfr_multiplayer.rs`（自带 N 人 Kuhn / Leduc 和精确 NashConv，信息集数核对：3 人 Kuhn 48、两人 Leduc 288）。
+「旧写法」一栏是同一测试临时强制走 A 实测的：
+
+| 测试 | 新写法 | 旧写法 | 门槛 |
+|---|---|---|---|
+| 3 人 Kuhn 30 万次（默认套件，1 种子） | 0.0123（5 种子 0.0075–0.0153） | 5 种子 0.0076–0.0190 | < 0.03（粗门槛，不区分新旧） |
+| 3 人 Kuhn 300 万次（`--ignored`，5 种子） | 0.0026–0.0068 | 0.0072–0.110，3 个种子 ≥ 0.01 | 每个种子 < 0.01 |
+| 3 人 Leduc 3 点数 1 次加注 300 万次（`--ignored`，5 种子） | 均值 0.110（0.089–0.153） | 均值 0.180（0.134–0.231） | 均值 < 0.14 |
+
+3 人 Leduc 新旧两组种子有重叠，所以门槛取均值。区分新旧主要靠单元测试 `three_player_average_accumulates_at_non_traverser_nodes`
+（一次更新后遍历者自己的信息集不应出现在 strategy_sum 里）和两个 `--ignored` 测试。
+
+回归（AWS 8 核，全部通过）：
+- 默认套件里相关的：`training::trainer::tests` 4 个、`trainer_matches_hashmap_trainer`、subgame 里用 `EsMccfrTrainer` 的 3 个
+  （`subgame_cfr_runs_and_is_deterministic` 等）、`nlhe_dense_crop` 3 个、`six_max_a3a4_trainer` 4 个、`es_mccfr_leduc`。
+- `--ignored`：`tests/dense_nlhe_trainer.rs` 5 个 HU 逐位对照（`8da9a2b` 后不成立的那 5 个，现在重新通过）、
+  `dense_nlhe_trainer_lockfree.rs` 4 个、`six_max_a3a4_dense_train_monitor`，以及新加的 `six_max_a3a4_dense_byte_equal_hashmap`
+  （6-max 下 dense 与 HashMap 的 regret / strategy_sum 行、当前 / 平均策略逐位相同，touched 行数 = HashMap key 数）。
+
+吞吐（`train_cfr` dense，6-max cap2 flop2-1pot，500 桶）：8 线程 lockfree 400 万次 旧 16.6 / 15.8 s、新 15.9 / 15.7 s；
+单线程 50 万次 旧 9.11 / 8.93 s、新 8.88 / 8.94 s。没有变化。
