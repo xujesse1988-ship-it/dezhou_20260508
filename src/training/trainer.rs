@@ -317,10 +317,6 @@ pub struct EsMccfrTrainer<G: Game> {
     /// update), so the caller can refuse an average strategy built from too few updates. Pure
     /// bookkeeping: no effect on regrets, strategy sums or rng consumption. Not checkpointed.
     pub(crate) visit_counts: Option<HashMap<G::InfoSet, u32>>,
-    /// Test-only override: force the old traverser-node average (see
-    /// [`Self::average_at_opponent_nodes`]). Lets the `SubgameTrainer` parity test keep its
-    /// bit-for-bit check until `SubgameTrainer` moves to opponent-node averaging too.
-    pub(crate) force_traverser_node_average: bool,
 }
 
 impl<G: Game> EsMccfrTrainer<G> {
@@ -341,7 +337,6 @@ impl<G: Game> EsMccfrTrainer<G> {
             lcfr_rescale_regret: true,
             traverser_rotation: None,
             visit_counts: None,
-            force_traverser_node_average: false,
         }
     }
 
@@ -473,20 +468,10 @@ impl<G: Game> EsMccfrTrainer<G> {
     /// average the only learning seat. See
     /// `docs/temp/es_mccfr_leduc_convergence_issue_2026_10_25.md` §7–9.
     pub fn average_at_opponent_nodes(&self) -> bool {
-        if self.force_traverser_node_average {
-            return false;
-        }
         match &self.traverser_rotation {
             Some(rot) => rot.iter().any(|&seat| seat != rot[0]),
             None => self.game.n_players() >= 2,
         }
-    }
-
-    /// See [`Self::force_traverser_node_average`].
-    #[cfg(test)]
-    pub(crate) fn with_traverser_node_average(mut self) -> Self {
-        self.force_traverser_node_average = true;
-        self
     }
 
     /// 已访问 infoset 的 strategy_sum 表只读访问（诊断用：导出
@@ -756,7 +741,6 @@ impl<G: Game> Trainer<G> for EsMccfrTrainer<G> {
             // traverser 轮转同样不存 checkpoint（subgame 实时求解不落盘；resume 恒默认轮转）。
             traverser_rotation: None,
             visit_counts: None,
-            force_traverser_node_average: false,
         })
     }
 }
@@ -1267,8 +1251,6 @@ mod tests {
             !repeated.average_at_opponent_nodes(),
             "重复同一座位仍只有 1 个座位"
         );
-        let forced = EsMccfrTrainer::new(KuhnGame, 1).with_traverser_node_average();
-        assert!(!forced.average_at_opponent_nodes());
         let full = EsMccfrTrainer::new(KuhnGame, 1).with_traverser_rotation(vec![1, 0]);
         assert!(full.average_at_opponent_nodes());
     }

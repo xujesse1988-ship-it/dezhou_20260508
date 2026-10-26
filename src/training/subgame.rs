@@ -3068,6 +3068,8 @@ fn solve_subgame(
         // blueprint）。够不够*有用*迭代由「当前桶未被访问 → Err」（read_current_strategy）继续兜。
         return Err("time_budget 内连一轮 CFR 迭代都未完成（→ fold）".to_string());
     }
+    // 根所在街的精确平均补上最后一次扫描之后的迭代（读数和跨街后验只读这条街）。
+    trainer.flush_exact_average();
     Ok(trainer)
 }
 
@@ -3105,21 +3107,22 @@ fn read_current_strategy(
         );
     }
     // Non-empty `avg` is not enough — it can be a uniform 1/n placeholder that used to be
-    // sampled as the solution (2026-10-16 live: top pair jams). `recurse_es` creates the regret
-    // slot whenever *any* traverser passes the node (`get_or_init`), but strategy_sum only
-    // accumulates when `actor == traverser`, as `pi_trav × σ_current`. Three placeholder states:
-    // - no strategy_sum entry: never reached as traverser (opponent traversals only) → regrets
-    //   are all zero, nothing learned;
-    // - strategy_sum all zero: reached as traverser but always with own reach 0;
-    // - average exactly uniform: every accumulated σ was the default RM-on-zero-regret uniform,
-    //   i.e. only the first traversal(s) — regrets learned from them never reached the average.
+    // sampled as the solution (2026-10-16 live: top pair jams). `recurse` creates the regret slot
+    // whenever *any* traverser passes the node, but strategy_sum only comes from the exact-average
+    // sweep over the root's street (`SubgameTrainer` / `ExactAverage`), which adds
+    // `π_own × σ_current` and skips paths with own reach 0. Placeholder states:
+    // - no strategy_sum entry: hero's own reach of this row was 0 at every sweep (the solve never
+    //   plays hero's actual line with this hand) → the average is undefined;
+    // - strategy_sum all zero: cannot come out of the sweep; kept as a guard;
+    // - average exactly uniform: every swept σ was the default RM-on-zero-regret uniform, i.e.
+    //   hero's own traversals had not learned anything at this row yet.
     // In all three, the average is not a solved mix → giveup. The regret-matching current
     // strategy is no substitute: after one or a few traversals it is one sampled opponent
     // hand's best response (2026-10-16 replay: single-visit RM said raise 1.00 where the
     // 100k-iteration solve says call 0.99).
     let Some(sum) = trainer.tables().strategy_sum_row(info) else {
         return Err(
-            "subgame 当前决策 infoset 无 strategy_sum（只被对手遍历路过，hero 遍历未到达）"
+            "subgame 当前决策 infoset 无 strategy_sum（hero 自身 reach 在每次扫描时都为 0，平均策略无定义）"
                 .to_string(),
         );
     };
@@ -9540,9 +9543,10 @@ mod tests {
     /// `read_current_strategy` must never hand out the uniform placeholder that
     /// `average_strategy` returns where the average carries no solved mix (2026-10-16 live
     /// 9-max: 6/22 search decisions uniform, incl. top-pair jams). Pins the infoset states:
-    /// never visited / regret slot only (opponent traversals) / strategy_sum all-zero (own
-    /// reach 0) / average exactly uniform (first traversal only) → Err, even when regrets are
-    /// learned; non-uniform positive strategy_sum → normalised average.
+    /// never visited / regret slot only (own reach 0 at every exact-average sweep) /
+    /// strategy_sum all-zero (guard) / average exactly uniform (σ swept before anything was
+    /// learned) → Err, even when regrets are learned; non-uniform positive strategy_sum →
+    /// normalised average.
     #[test]
     fn read_current_strategy_rejects_undefined_average() {
         let auth = nway_limped_flop_state(3, 12_100, 0x5245_4752_4F4E_4C59); // "REGRONLY"
@@ -9572,14 +9576,14 @@ mod tests {
         let err = read(&trainer).unwrap_err();
         assert!(err.contains("未被 CFR 访问"), "unexpected err: {err}");
 
-        // Opponent-traversal-only visit: regret slot created (all zero), no strategy_sum entry.
-        // The trainer reports uniform here — the trap this guard closes.
+        // Regret slot created, no strategy_sum entry (own reach 0 at every sweep). The trainer
+        // reports uniform here — the trap this guard closes.
         trainer.tables_mut().init_regret(info, n);
         assert_eq!(trainer.average_strategy(&info), uniform);
         let err = read(&trainer).unwrap_err();
         assert!(err.contains("无 strategy_sum"), "unexpected err: {err}");
 
-        // Traversed with own reach 0: strategy_sum entry all zero.
+        // strategy_sum entry all zero (the sweep never writes this; guard).
         trainer
             .tables_mut()
             .accumulate_strategy(info, &vec![0.0; n]);
@@ -9587,9 +9591,9 @@ mod tests {
         let err = read(&trainer).unwrap_err();
         assert!(err.contains("均匀占位"), "unexpected err: {err}");
 
-        // Single traversal with own reach 0.6 that learned regrets: strategy_sum = 0.6 × uniform
-        // (RM on zero regrets), average exactly uniform. Learned regrets do not rescue it — the
-        // current strategy after one visit is one sampled hand's best response.
+        // σ collected while regrets were still zero: strategy_sum = 0.6 × uniform, average exactly
+        // uniform. Regrets learned afterwards do not rescue it — the current strategy after one
+        // visit is one sampled hand's best response.
         trainer
             .tables_mut()
             .accumulate_strategy(info, &vec![0.6 / n as f64; n]);
@@ -9601,7 +9605,7 @@ mod tests {
         let err = read(&trainer).unwrap_err();
         assert!(err.contains("均匀占位"), "unexpected err: {err}");
 
-        // A later traversal accumulates a non-uniform σ → the average carries a solved mix.
+        // A later accumulation of a non-uniform σ → the average carries a solved mix.
         let w: Vec<f64> = (1..=n).map(|i| i as f64).collect();
         trainer.tables_mut().accumulate_strategy(info, &w);
         let (probs, _) = read(&trainer).expect("learned infoset must be readable");

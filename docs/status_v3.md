@@ -178,7 +178,7 @@ flop-first(干净点、训透)中性不亏、all-postflop 弱基底反退化。*
 | 项目 | 状态 | 依据 |
 |---|---|---|
 | Kuhn / Leduc Vanilla CFR | ✅ 收敛 closed-form `-1/18` / exploit `<0.1` | `tests/cfr_kuhn.rs` `cfr_leduc.rs` |
-| Leduc ES-MCCFR / LCFR-MCCFR | ✅(2026-10-25/26 修正)平均策略改回非遍历者节点、权重 1 累加(`240bb1a` 起误挪到遍历者节点,修前 Leduc 100 万次后停在 exploit 0.15–0.18 平台):两人 200 万次 5 种子 0.0127–0.0146,2000 万次 0.0037 ± 0.0003;n ≥ 3 同样改(3 人 Kuhn 300 万次 NashConv 0.0026–0.0068,旧写法 0.0072–0.110)。只有轮转里仅 1 个座位时保留旧写法(此时无偏)。**子树求解器 `SubgameTrainer` 仍是旧写法**,见 `docs/temp/es_mccfr_leduc_convergence_issue_2026_10_25.md` §7–9 | `tests/es_mccfr_leduc.rs` `tests/es_mccfr_multiplayer.rs` |
+| Leduc ES-MCCFR / LCFR-MCCFR | ✅(2026-10-25/26 修正)平均策略改回非遍历者节点、权重 1 累加(`240bb1a` 起误挪到遍历者节点,修前 Leduc 100 万次后停在 exploit 0.15–0.18 平台):两人 200 万次 5 种子 0.0127–0.0146,2000 万次 0.0037 ± 0.0003;n ≥ 3 同样改(3 人 Kuhn 300 万次 NashConv 0.0026–0.0068,旧写法 0.0072–0.110)。只有轮转里仅 1 个座位时保留旧写法(此时无偏)。子树求解器 `SubgameTrainer`(2026-10-26):根所在街的行(读数和跨街后验只读这条街)每隔一段迭代扫一遍子树、直接累加精确平均(各座位按自身 reach),其余街走非遍历者节点;见 `docs/temp/es_mccfr_leduc_convergence_issue_2026_10_25.md` §7–9 | `tests/es_mccfr_leduc.rs` `tests/es_mccfr_multiplayer.rs` |
 | 简化 NLHE ES-MCCFR / LCFR | ✅ LCFR 优化路径 100M LBR 1,233 → 500M 1,126(100M 即饱和) | `run_lcfr_*` on vultr |
 | dense 后端 + v4 bucket | ✅ byte-equal HashMap(HU 5 对照 + 6-max 1 对照;2026-10-26 两个后端平均策略一起改到非遍历者节点后重新成立,见下方 ES-MCCFR 行)+ 100M LBR 1,143 ≈ baseline(同质量,旧写法时测);吞吐 ~2.2× 且长 run 不塌、RAM 平 5.2 GiB、ckpt 不暴涨 | `tests/dense_nlhe_trainer.rs` `tests/six_max_a3a4_trainer.rs` |
 | AIVAT 评测器 | ✅ 无偏全证;真日志降方差 1.21×(精确项 deals+runout) | `tests/aivat_nlhe_*.rs` `docs/aivat_eval.md` |

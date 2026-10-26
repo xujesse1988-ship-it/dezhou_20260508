@@ -10989,9 +10989,12 @@ mod tests {
         let abs = game.abstraction().clone();
         let sf = |i: &InfoSetId, _n: usize| full.strategy(i);
         let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);
-        // 1000 iterations: at crop_scfg's 300 the QQ river-facing-bet infoset only ever had its
-        // uniform placeholder average (own reach 0 in every hero traversal); the decision used
-        // to pass on it, read_current_strategy now rejects it as unsolved.
+        // 1000 iterations: at crop_scfg's 300 the river-facing-bet infoset of the second hand only
+        // had its uniform placeholder average, which read_current_strategy rejects as unsolved.
+        // The second hand is KhQd, not QQ: this solve's QQ never checks the river (σ(check) = 0
+        // after the first update), so its own reach of the facing-bet node is 0 and the exact
+        // average there is undefined → giveup (the old traverser-node average only had a value
+        // from the first, still-uniform iterations).
         let scfg = SubgameSearchConfig {
             iterations: 1000,
             ..crop_scfg()
@@ -11000,7 +11003,7 @@ mod tests {
         validate_crop_runtime(crop.keep_through(), Some(&rt_c)).expect("生产约束满足");
 
         // (a) 完整一手。
-        for hole in [["Ah", "Kd"], ["Qs", "Qh"]] {
+        for hole in [["Ah", "Kd"], ["Kh", "Qd"]] {
             let hand = sb_line_hand(hole);
             let (mut cf, mut cc) = (SubgameSolveCache::new(), SubgameSolveCache::new());
             for (k, req) in hand.iter().enumerate() {

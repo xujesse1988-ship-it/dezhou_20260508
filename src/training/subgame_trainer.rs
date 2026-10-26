@@ -1,11 +1,17 @@
 //! Array-backed ES-MCCFR trainer for real-time search subgames ([`SubgameNlheGame`]).
 //!
-//! Same algorithm as [`crate::training::trainer::EsMccfrTrainer`] (single-thread `step`,
-//! deterministic `step_parallel`, LCFR period rescale, traverser rotation, visit counts); only the
-//! regret / strategy-sum storage changes from `HashMap<InfoSetId, Vec<f64>>` to arrays indexed by
-//! the subtree node id and hand bucket ([`SubgameTables`]). Every infoset sees the same f64
-//! operation sequence as on the HashMap path, so results are bit-identical (including LCFR, which
-//! rescales eagerly here, unlike the dense blueprint table's lazy global scale).
+//! Same regret updates as [`crate::training::trainer::EsMccfrTrainer`] (single-thread `step`,
+//! deterministic `step_parallel`, LCFR period rescale, traverser rotation, visit counts); the
+//! regret storage changes from `HashMap<InfoSetId, Vec<f64>>` to arrays indexed by the subtree
+//! node id and hand bucket ([`SubgameTables`]). Every infoset sees the same f64 operation sequence
+//! as on the HashMap path, so regrets, current strategies and visit counts are bit-identical
+//! (including LCFR, which rescales eagerly here, unlike the dense blueprint table's lazy global
+//! scale).
+//!
+//! The average strategy differs on purpose: only rows on the subtree root's street (the only
+//! averages the search reads) have one, and it is the exact sequence-weighted average computed by
+//! periodic sweeps ([`ExactAverage`]) instead of a sampled accumulation inside the recursion. Rows
+//! on later streets have no average (`average_strategy` → uniform).
 //!
 //! Why not reuse [`crate::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer`]: it is tied to
 //! `SimplifiedNlheGame`, pre-allocates the full `nodes × buckets × actions` table (a 200k-node
@@ -20,8 +26,9 @@ use crate::abstraction::info::{InfoSetId, StreetTag};
 use crate::core::rng::RngSource;
 use crate::error::TrainerError;
 use crate::training::game::{Game, NodeKind, PlayerId};
-use crate::training::nlhe::NLHE_V2_NODE_ID_SHIFT;
-use crate::training::regret::{LocalRegretDelta, LocalStrategyDelta, SigmaVec};
+use crate::training::nlhe::{pack_info_set_v2, NLHE_V2_NODE_ID_SHIFT};
+use crate::training::nlhe_betting_tree::{Child, NodeId};
+use crate::training::regret::{LocalRegretDelta, SigmaVec};
 use crate::training::sampling::sample_discrete;
 use crate::training::subgame::SubgameNlheGame;
 
@@ -175,10 +182,11 @@ impl SubgameTables {
         }
     }
 
-    /// `RegretTable::get_or_init`: make sure the regret entry exists.
-    pub(crate) fn init_regret(&mut self, info: InfoSetId, n_actions: usize) {
+    /// `RegretTable::get_or_init`: make sure the regret entry exists. Returns the row.
+    pub(crate) fn init_regret(&mut self, info: InfoSetId, n_actions: usize) -> usize {
         let row = self.find_or_insert(info, n_actions);
         self.flags[row] |= REGRET_PRESENT;
+        row
     }
 
     /// `RegretTable::accumulate`. Returns the row (visit counting on the merge path).
@@ -253,6 +261,91 @@ fn street_index(street: StreetTag) -> usize {
     street as usize
 }
 
+/// Relative sweep spacing for [`ExactAverage`]: sweep once the updates since the last sweep reach
+/// `update_count / EXACT_AVG_REL_PERIOD` (capped by `max_period`), so each sweep's σ stands for at
+/// most the last 1/16 of the run.
+const EXACT_AVG_REL_PERIOD: u64 = 16;
+
+/// Default cap on updates between two [`ExactAverage`] sweeps.
+const DEFAULT_EXACT_AVG_MAX_PERIOD: u64 = 1 << 16;
+
+/// Exact average strategy for every row on the subtree's first street (the root's street).
+///
+/// Those are the only averages the search reads: the hero decision readout (same street as the
+/// root) and the next street's range posterior (`cross_street_posterior_range`, which reads the
+/// previous solve along its first-street action line). Averaging them by sampling at non-traverser
+/// nodes (weight 1, the visit frequency supplies the reach) leaves a row thin exactly when its own
+/// player rarely gets there: hero's bucket after an unlikely own line, and hero's real-hand row
+/// ([`SubgameNlheGame::with_real_hand`]), which is only reached as a non-traverser when the range
+/// draw happens to deal the real hole (the forced deal only feeds hero's own traversals).
+///
+/// On one street the board is fixed and the subtree has no chance nodes, so a seat's hand bucket
+/// (or the real-hand slot) cannot change below the root, and that seat's own reach of row
+/// `(node, bucket)` is the product of its σ at `(ancestor, bucket)` over its own ancestors on the
+/// public path. A sweep walks the first street once per call carrying those products and adds
+/// `updates_since_last_sweep × π_own × σ` to every row — the definition of the average, with no
+/// sampling noise. Later-street rows get no average at all (never read), so the recursion itself
+/// does no average-strategy work.
+///
+/// Approximation: the σ at sweep time stands for every update since the previous sweep; sweeps are
+/// spaced by [`EXACT_AVG_REL_PERIOD`] / `max_period`, run before each LCFR rescale, and on
+/// [`SubgameTrainer::flush_exact_average`]. Only rows with a regret entry are written: a trajectory
+/// that reaches `(node, bucket)` for a seat also passed every ancestor of that seat with the same
+/// bucket and created those rows, so a missing row prunes the whole bucket below it.
+struct ExactAverage {
+    street: StreetTag,
+    /// `update_count` at the last sweep.
+    swept_at: u64,
+    max_period: u64,
+}
+
+/// [`ExactAverage`] sweep below node `id`. `reach[seat]` = the (bucket, own reach) pairs of `seat`
+/// still alive on the path from the root to `id`.
+fn exact_sweep(
+    tree: &crate::training::nlhe_betting_tree::PublicBettingTree,
+    id: NodeId,
+    street: StreetTag,
+    weight: f64,
+    reach: &mut [Vec<(u32, f64)>],
+    tables: &mut SubgameTables,
+) {
+    let node = tree.node(id);
+    if node.depth_limit_leaf || node.street != street {
+        return;
+    }
+    let seat = node.player_acting as usize;
+    let n = node.legal_actions.len();
+    let mine = std::mem::take(&mut reach[seat]);
+    let mut live: Vec<(u32, f64, SigmaVec)> = Vec::with_capacity(mine.len());
+    for &(bucket, pi) in &mine {
+        let info = pack_info_set_v2(bucket, id, street);
+        let has_regret = tables
+            .find(info)
+            .is_some_and(|row| tables.flags[row] & REGRET_PRESENT != 0);
+        if !has_regret {
+            continue;
+        }
+        let sigma = tables.current_strategy_smallvec(info, n);
+        let scale = weight * pi;
+        let weighted: ShortVec<f64> = sigma.iter().map(|s| scale * s).collect();
+        tables.accumulate_strategy(info, &weighted);
+        live.push((bucket, pi, sigma));
+    }
+    for (i, child) in node.children.iter().enumerate() {
+        if let Child::Decision(next) = *child {
+            reach[seat] = live
+                .iter()
+                .filter_map(|(bucket, pi, sigma)| {
+                    let next_pi = pi * sigma[i];
+                    (next_pi > 0.0).then_some((*bucket, next_pi))
+                })
+                .collect();
+            exact_sweep(tree, next, street, weight, reach, tables);
+        }
+    }
+    reach[seat] = mine;
+}
+
 /// ES-MCCFR trainer over [`SubgameTables`]; API mirrors the parts of `EsMccfrTrainer` that the
 /// real-time search uses.
 pub struct SubgameTrainer {
@@ -263,6 +356,8 @@ pub struct SubgameTrainer {
     lcfr_periods_completed: u64,
     traverser_rotation: Option<Vec<PlayerId>>,
     track_visits: bool,
+    /// `None` only for an empty subtree.
+    exact: Option<ExactAverage>,
 }
 
 impl SubgameTrainer {
@@ -276,7 +371,13 @@ impl SubgameTrainer {
             table.bucket_count(StreetTag::Turn) + extra,
             table.bucket_count(StreetTag::River) + extra,
         ];
-        let tables = SubgameTables::new(game.subtree().num_nodes(), bucket_count_by_street);
+        let tree = game.subtree();
+        let tables = SubgameTables::new(tree.num_nodes(), bucket_count_by_street);
+        let exact = (tree.num_nodes() > 0).then(|| ExactAverage {
+            street: tree.node(tree.root_id()).street,
+            swept_at: 0,
+            max_period: DEFAULT_EXACT_AVG_MAX_PERIOD,
+        });
         Self {
             game,
             tables,
@@ -285,6 +386,62 @@ impl SubgameTrainer {
             lcfr_periods_completed: 0,
             traverser_rotation: None,
             track_visits: false,
+            exact,
+        }
+    }
+
+    /// Cap on updates between two exact-average sweeps ([`ExactAverage`]); `1` = sweep after every
+    /// update / batch (tests).
+    pub fn with_max_sweep_period(mut self, max_period: u64) -> Self {
+        assert!(max_period > 0, "exact-average sweep period must be > 0");
+        assert_eq!(
+            self.update_count, 0,
+            "exact-average sweep period must be configured before any step"
+        );
+        if let Some(exact) = self.exact.as_mut() {
+            exact.max_period = max_period;
+        }
+        self
+    }
+
+    /// Street whose rows get the exact average ([`ExactAverage`]): the subtree root's street.
+    pub fn exact_average_street(&self) -> Option<StreetTag> {
+        self.exact.as_ref().map(|e| e.street)
+    }
+
+    /// Bring the exact average up to date (sweep with the current σ for the updates since the last
+    /// sweep). No-op when nothing is pending. Call before reading averages.
+    pub fn flush_exact_average(&mut self) {
+        let Some(exact) = self.exact.as_mut() else {
+            return;
+        };
+        let pending = self.update_count - exact.swept_at;
+        if pending == 0 {
+            return;
+        }
+        exact.swept_at = self.update_count;
+        let street = exact.street;
+        let buckets = self.tables.bucket_count_by_street[street_index(street)];
+        let all: Vec<(u32, f64)> = (0..buckets).map(|b| (b, 1.0)).collect();
+        let mut reach = vec![all; self.game.n_players()];
+        let tree = self.game.subtree();
+        exact_sweep(
+            tree,
+            tree.root_id(),
+            street,
+            pending as f64,
+            &mut reach,
+            &mut self.tables,
+        );
+    }
+
+    fn maybe_sweep(&mut self) {
+        let Some(exact) = &self.exact else {
+            return;
+        };
+        let period = (self.update_count / EXACT_AVG_REL_PERIOD).clamp(1, exact.max_period);
+        if self.update_count - exact.swept_at >= period {
+            self.flush_exact_average();
         }
     }
 
@@ -337,6 +494,10 @@ impl SubgameTrainer {
             return;
         };
         let target = self.update_count / period_size;
+        if self.lcfr_periods_completed < target {
+            // Pending exact-average updates belong to the period being closed.
+            self.flush_exact_average();
+        }
         while self.lcfr_periods_completed < target {
             let n = self.lcfr_periods_completed + 1;
             let factor = (n as f64) / ((n + 1) as f64);
@@ -345,19 +506,21 @@ impl SubgameTrainer {
         }
     }
 
-    /// One update (`EsMccfrTrainer::step`).
+    /// One update (`EsMccfrTrainer::step`, without the average-strategy accumulation: see
+    /// [`ExactAverage`]).
     pub fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError> {
         let traverser = self.traverser_at(self.update_count);
         let root = self.game.root_for_traverser(traverser, rng);
         let track = self.track_visits;
-        recurse(root, traverser, 1.0, &mut self.tables, track, rng);
+        recurse(root, traverser, &mut self.tables, track, rng);
         self.update_count += 1;
+        self.maybe_sweep();
         self.maybe_lcfr_rescale();
         Ok(())
     }
 
     /// `EsMccfrTrainer::step_parallel`: workers read σ from the pre-dispatch tables and push
-    /// deltas locally; the main thread merges them in tid order × push order.
+    /// regret deltas locally; the main thread merges them in tid order × push order.
     pub fn step_parallel(
         &mut self,
         rng_pool: &mut [Box<dyn RngSource>],
@@ -373,14 +536,11 @@ impl SubgameTrainer {
         let shared = &self.tables;
         let rotation = self.traverser_rotation.as_deref();
         let n_players = game.n_players() as u64;
-        #[allow(clippy::type_complexity)]
-        let deltas: Vec<(LocalRegretDelta<InfoSetId>, LocalStrategyDelta<InfoSetId>)> = rng_pool
-            [..n_active]
+        let deltas: Vec<LocalRegretDelta<InfoSetId>> = rng_pool[..n_active]
             .par_iter_mut()
             .enumerate()
             .map(|(tid, rng_slot)| {
                 let mut local_regret = LocalRegretDelta::new();
-                let mut local_strategy = LocalStrategyDelta::new();
                 let rng = rng_slot.as_mut();
                 for batch_idx in 0..batch_per_worker {
                     let t = base + batch_idx as u64 * n_active as u64 + tid as u64;
@@ -389,20 +549,12 @@ impl SubgameTrainer {
                         None => (t % n_players) as PlayerId,
                     };
                     let root = game.root_for_traverser(traverser, rng);
-                    recurse_parallel(
-                        root,
-                        traverser,
-                        1.0,
-                        shared,
-                        &mut local_regret,
-                        &mut local_strategy,
-                        rng,
-                    );
+                    recurse_parallel(root, traverser, shared, &mut local_regret, rng);
                 }
-                (local_regret, local_strategy)
+                local_regret
             })
             .collect();
-        for (local_regret, local_strategy) in deltas {
+        for local_regret in deltas {
             for (info, delta) in local_regret.into_entries() {
                 // One regret push = one traverser visit.
                 let row = self.tables.accumulate_regret(info, &delta);
@@ -410,11 +562,9 @@ impl SubgameTrainer {
                     self.tables.add_visit(row);
                 }
             }
-            for (info, weighted) in local_strategy.into_entries() {
-                self.tables.accumulate_strategy(info, &weighted);
-            }
         }
         self.update_count += (n_active as u64) * (batch_per_worker as u64);
+        self.maybe_sweep();
         self.maybe_lcfr_rescale();
         Ok(())
     }
@@ -492,11 +642,10 @@ impl SubgameTrainer {
 }
 
 /// Single-thread ES-MCCFR recursion; line for line `trainer::recurse_es` (subgames have no
-/// in-game chance nodes).
+/// in-game chance nodes) minus the average-strategy accumulation, which [`ExactAverage`] does.
 fn recurse(
     state: <SubgameNlheGame as Game>::State,
     traverser: PlayerId,
-    pi_trav: f64,
     tables: &mut SubgameTables,
     track_visits: bool,
     rng: &mut dyn RngSource,
@@ -508,27 +657,17 @@ fn recurse(
             let info = SubgameNlheGame::info_set(&state, actor);
             let actions = SubgameNlheGame::legal_actions(&state);
             let n = actions.len();
-            tables.init_regret(info, n);
+            let row = tables.init_regret(info, n);
             let sigma = tables.current_strategy_smallvec(info, n);
 
             if actor == traverser {
-                let weighted: ShortVec<f64> = sigma.iter().map(|s| pi_trav * s).collect();
-                let row = tables.accumulate_strategy(info, &weighted);
                 if track_visits {
                     tables.add_visit(row);
                 }
                 let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
-                for (i, action) in actions.iter().enumerate() {
+                for action in &actions {
                     let next_state = SubgameNlheGame::next(state.clone(), *action, rng);
-                    let cfv = recurse(
-                        next_state,
-                        traverser,
-                        pi_trav * sigma[i],
-                        tables,
-                        track_visits,
-                        rng,
-                    );
-                    cfvs.push(cfv);
+                    cfvs.push(recurse(next_state, traverser, tables, track_visits, rng));
                 }
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
                 let delta: ShortVec<f64> = cfvs.iter().map(|c| c - sigma_value).collect();
@@ -544,21 +683,19 @@ fn recurse(
                 debug_assert!(!nonzero_dist.is_empty(), "non-traverser σ all-zero");
                 let sampled = sample_discrete(&nonzero_dist, rng);
                 let next_state = SubgameNlheGame::next(state, sampled, rng);
-                recurse(next_state, traverser, pi_trav, tables, track_visits, rng)
+                recurse(next_state, traverser, tables, track_visits, rng)
             }
         }
     }
 }
 
 /// Parallel worker recursion; line for line `trainer::recurse_es_parallel` (σ from the shared
-/// pre-dispatch tables, deltas pushed locally).
+/// pre-dispatch tables, regret deltas pushed locally) minus the average-strategy accumulation.
 fn recurse_parallel(
     state: <SubgameNlheGame as Game>::State,
     traverser: PlayerId,
-    pi_trav: f64,
     shared: &SubgameTables,
     local_regret: &mut LocalRegretDelta<InfoSetId>,
-    local_strategy: &mut LocalStrategyDelta<InfoSetId>,
     rng: &mut dyn RngSource,
 ) -> f64 {
     match SubgameNlheGame::current(&state) {
@@ -572,35 +709,26 @@ fn recurse_parallel(
 
             if actor == traverser {
                 debug_assert!(n > 0, "traverser node must have a legal action");
-                let weighted: SigmaVec = sigma.iter().map(|s| pi_trav * s).collect();
-                local_strategy.push(info, weighted);
-
                 let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
                 let last_idx = n - 1;
-                for i in 0..last_idx {
-                    let next_state = SubgameNlheGame::next(state.clone(), actions[i], rng);
-                    let cfv = recurse_parallel(
+                for &action in &actions[..last_idx] {
+                    let next_state = SubgameNlheGame::next(state.clone(), action, rng);
+                    cfvs.push(recurse_parallel(
                         next_state,
                         traverser,
-                        pi_trav * sigma[i],
                         shared,
                         local_regret,
-                        local_strategy,
                         rng,
-                    );
-                    cfvs.push(cfv);
+                    ));
                 }
                 let last_state = SubgameNlheGame::next(state, actions[last_idx], rng);
-                let cfv_last = recurse_parallel(
+                cfvs.push(recurse_parallel(
                     last_state,
                     traverser,
-                    pi_trav * sigma[last_idx],
                     shared,
                     local_regret,
-                    local_strategy,
                     rng,
-                );
-                cfvs.push(cfv_last);
+                ));
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
                 let delta: SigmaVec = cfvs.iter().map(|c| c - sigma_value).collect();
                 local_regret.push(info, delta);
@@ -615,15 +743,7 @@ fn recurse_parallel(
                 debug_assert!(!nonzero_dist.is_empty(), "non-traverser σ all-zero");
                 let sampled = sample_discrete(&nonzero_dist, rng);
                 let next_state = SubgameNlheGame::next(state, sampled, rng);
-                recurse_parallel(
-                    next_state,
-                    traverser,
-                    pi_trav,
-                    shared,
-                    local_regret,
-                    local_strategy,
-                    rng,
-                )
+                recurse_parallel(next_state, traverser, shared, local_regret, rng)
             }
         }
     }
@@ -788,27 +908,30 @@ mod tests {
         SubgameNlheGame::new(table, cfg, abs, rules, st, entrants, 0)
     }
 
+    /// Regrets, visit counts and current strategies bit-identical on every row; `b` has averages
+    /// only on the root's street ([`ExactAverage`], checked against the definition in
+    /// [`exact_average_is_sequence_weighted_average`]), `a` its sampled ones everywhere.
     fn assert_same(a: &EsMccfrTrainer<SubgameNlheGame>, b: &SubgameTrainer, label: &str) {
+        let exact_street = b.exact_average_street();
         assert_eq!(a.update_count(), b.update_count(), "{label}");
         assert_eq!(a.regret_table().len(), b.tables().regret_len(), "{label}");
-        assert_eq!(a.strategy_sum().len(), b.tables().strategy_len(), "{label}");
         assert!(
             a.regret_table().len() > 100,
             "{label}: too few infosets to mean anything"
         );
+        let mut b_avg_rows = 0;
         for (k, v) in a.regret_table().inner() {
             assert_eq!(bits(v), bits(b.tables().regret_row(*k).unwrap()), "{label}");
             assert_eq!(a.visit_count(k), b.visit_count(k), "{label}");
-            assert_eq!(a.average_strategy(k), b.average_strategy(k), "{label}");
             assert_eq!(a.current_strategy(k), b.current_strategy(k), "{label}");
+            if b.tables().strategy_sum_row(*k).is_some() {
+                assert_eq!(Some(k.street_tag()), exact_street, "{label}");
+                b_avg_rows += 1;
+            }
         }
-        for (k, v) in a.strategy_sum().inner() {
-            assert_eq!(
-                bits(v),
-                bits(b.tables().strategy_sum_row(*k).unwrap()),
-                "{label}"
-            );
-        }
+        // Every `b` average row has a regret entry, so the loop above saw all of them.
+        assert_eq!(b_avg_rows, b.tables().strategy_len(), "{label}");
+        assert!(b_avg_rows > 0, "{label}: no exact-average row");
     }
 
     /// Hero (first to act on the flop) and its real hole cards in [`three_way_flop_sub`].
@@ -828,7 +951,8 @@ mod tests {
 
     /// Bit-identical to `EsMccfrTrainer<SubgameNlheGame>`: single-thread `step` and
     /// `step_parallel`, each with / without LCFR, with live-seat rotation and visit counts; also with
-    /// the real-hand infoset + forced deal on (both trainers go through `root_for_traverser`).
+    /// the real-hand infoset + forced deal on (both trainers go through `root_for_traverser`; the
+    /// real-hand rows' average differs by design, see [`assert_same`]).
     #[test]
     fn trainer_matches_hashmap_trainer() {
         let live: Vec<PlayerId> = vec![0, 1, 2];
@@ -847,10 +971,7 @@ mod tests {
                     three_way_flop_sub()
                 }
             };
-            // SubgameTrainer still averages at the traverser's nodes; pin the HashMap trainer to
-            // that path until both move to opponent-node averaging (es_mccfr issue doc §9).
             let mut a = EsMccfrTrainer::new(sub(), 1)
-                .with_traverser_node_average()
                 .with_visit_counts()
                 .with_traverser_rotation(live.clone());
             let mut b = SubgameTrainer::new(sub())
@@ -1085,5 +1206,149 @@ mod tests {
             forced > 20 * slot_only.max(1),
             "forced {forced} vs slot-only {slot_only}"
         );
+    }
+
+    /// Sum `weight × π_own × σ` into `reference` for every row on the root's street that has a
+    /// regret entry: for each seat and each bucket in `buckets`, walk the root's street of the
+    /// public subtree with `current_strategy` (uniform where never seen) and no pruning — the
+    /// definition of the average, written against the public API only.
+    fn add_exact_reference(
+        t: &SubgameTrainer,
+        buckets: &[u32],
+        weight: f64,
+        reference: &mut std::collections::HashMap<InfoSetId, Vec<f64>>,
+    ) {
+        let tree = t.game().subtree();
+        let street = tree.node(tree.root_id()).street;
+        for seat in 0..t.game().n_players() as PlayerId {
+            for &bucket in buckets {
+                let mut stack = vec![(tree.root_id(), 1.0_f64)];
+                while let Some((id, reach)) = stack.pop() {
+                    let node = tree.node(id);
+                    if node.depth_limit_leaf || node.street != street {
+                        continue;
+                    }
+                    let n = node.children.len();
+                    let mut through = vec![1.0; n];
+                    if node.player_acting == seat {
+                        let info = pack_info_set_v2(bucket, id, street);
+                        let cur = t.current_strategy(&info);
+                        through = if cur.is_empty() {
+                            vec![1.0 / n as f64; n]
+                        } else {
+                            cur
+                        };
+                        if t.tables().regret_row(info).is_some() {
+                            let row = reference.entry(info).or_insert_with(|| vec![0.0; n]);
+                            for (r, s) in row.iter_mut().zip(&through) {
+                                *r += weight * reach * s;
+                            }
+                        }
+                    }
+                    for (child, s) in node.children.iter().zip(&through) {
+                        if let Child::Decision(next) = *child {
+                            stack.push((next, reach * s));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`ExactAverage`] is the exact sequence-weighted average: sweeping after every update / batch,
+    /// every row on the root's street has average `Σ_t π_own^t(I)·σ^t(I) / Σ_t π_own^t(I)`,
+    /// recomputed from the public tree after each step ([`add_exact_reference`], no pruning), and
+    /// no other row has an average. Single-thread and parallel, with and without the real-hand slot;
+    /// the flop subtree also has turn / river rows.
+    #[test]
+    fn exact_average_is_sequence_weighted_average() {
+        for (parallel, real) in [(false, false), (false, true), (true, true)] {
+            let label = format!("parallel={parallel} real={real}");
+            let run = |reference: Option<(&[u32], &mut std::collections::HashMap<_, _>)>| {
+                let sub = if real {
+                    with_real(three_way_flop_sub(), 0.5)
+                } else {
+                    three_way_flop_sub()
+                };
+                let mut t = SubgameTrainer::new(sub)
+                    .with_traverser_rotation(vec![0, 1, 2])
+                    .with_max_sweep_period(1);
+                let mut reference = reference;
+                if parallel {
+                    let mut pool: Vec<Box<dyn RngSource>> = (0..3u64)
+                        .map(|k| Box::new(ChaCha20Rng::from_seed(0xE7 + k)) as Box<dyn RngSource>)
+                        .collect();
+                    for _ in 0..40 {
+                        t.step_parallel(&mut pool, 3, 4).unwrap();
+                        if let Some((b, r)) = reference.as_mut() {
+                            add_exact_reference(&t, b, 12.0, r);
+                        }
+                    }
+                } else {
+                    let mut rng = ChaCha20Rng::from_seed(0xE7);
+                    for _ in 0..400 {
+                        t.step(&mut rng).unwrap();
+                        if let Some((b, r)) = reference.as_mut() {
+                            add_exact_reference(&t, b, 1.0, r);
+                        }
+                    }
+                }
+                t
+            };
+            // Pass 1 finds which buckets have rows on the root's street (the run is deterministic),
+            // so the unpruned reference walk only loops over those.
+            let t = run(None);
+            let tree = t.game().subtree();
+            let street = t.exact_average_street().unwrap();
+            let count = t.tables().bucket_count_by_street[street as usize];
+            let rows_on_street = |t: &SubgameTrainer| -> Vec<InfoSetId> {
+                (0..tree.num_nodes() as NodeId)
+                    .filter(|&id| tree.node(id).street == street)
+                    .flat_map(|id| (0..count).map(move |b| pack_info_set_v2(b, id, street)))
+                    .filter(|info| t.tables().regret_row(*info).is_some())
+                    .collect()
+            };
+            let mut buckets: Vec<u32> = rows_on_street(&t).iter().map(|i| i.bucket_id()).collect();
+            buckets.sort_unstable();
+            buckets.dedup();
+            let mut reference = std::collections::HashMap::new();
+            let t = run(Some((&buckets, &mut reference)));
+            // Rows only ever reached with own reach 0 carry no average; the sweep prunes those paths.
+            reference.retain(|_, sums: &mut Vec<f64>| sums.iter().sum::<f64>() > 0.0);
+            let averaged: Vec<InfoSetId> = rows_on_street(&t)
+                .into_iter()
+                .filter(|i| t.tables().strategy_sum_row(*i).is_some())
+                .collect();
+            assert_eq!(averaged.len(), reference.len(), "{label}");
+            assert!(reference.len() > 20, "{label}: {}", reference.len());
+            if real {
+                assert!(
+                    buckets.contains(&(count - 1)),
+                    "{label}: real-hand slot never averaged"
+                );
+            }
+            let mut non_uniform = 0;
+            for (info, sums) in &reference {
+                let total: f64 = sums.iter().sum();
+                let got = t.average_strategy(info);
+                assert_eq!(got.len(), sums.len(), "{label}");
+                for (g, s) in got.iter().zip(sums) {
+                    let w = s / total;
+                    assert!(
+                        (g - w).abs() < 1e-12,
+                        "{label}: {info:?} {got:?} vs {sums:?}"
+                    );
+                }
+                let u = 1.0 / got.len() as f64;
+                non_uniform += usize::from(got.iter().any(|g| (g - u).abs() > 1e-6));
+            }
+            assert!(non_uniform > 10, "{label}: nothing learned ({non_uniform})");
+            // Later-street rows (turn / river below the flop root) get no average.
+            assert_eq!(t.tables().strategy_len(), averaged.len(), "{label}");
+            assert!(
+                t.tables().regret_len() > rows_on_street(&t).len(),
+                "{label}: no later-street rows to check"
+            );
+        }
     }
 }
