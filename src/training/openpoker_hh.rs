@@ -367,6 +367,7 @@ pub fn hh_to_multiway_input(rec: &HhRecord) -> Result<HhConverted, String> {
         small_blind: ChipAmount::new(SOLVER_SB),
         big_blind: ChipAmount::new(SOLVER_BB),
         ante: ChipAmount::ZERO,
+        ante_exempt: 0,
         button_seat: SeatId(engine_btn as u8),
     };
 

@@ -11,9 +11,9 @@ import time
 
 
 def make_request(hole, board, button_seat, my_seat, num_seats, small_blind, big_blind,
-                 actions, valid, stacks=None, dealt_seats=None, names=None):
+                 actions, valid, stacks=None, dealt_seats=None, names=None, ante=0):
     """advisor 决策请求（openpoker_advisor::Request）。键序固定（IPC 字节可比）：
-    stacks / dealt_seats / names 为 None 时不带（advisor 退各自缺省行为）。"""
+    stacks / dealt_seats / names 为 None、ante 为 0 时不带（advisor 退各自缺省行为）。"""
     req = {
         "hole": hole,
         "board": board,
@@ -22,9 +22,11 @@ def make_request(hole, board, button_seat, my_seat, num_seats, small_blind, big_
         "num_seats": num_seats,
         "small_blind": small_blind,
         "big_blind": big_blind,
-        "actions": actions,
-        "valid": valid,
     }
+    if ante:
+        req["ante"] = ante
+    req["actions"] = actions
+    req["valid"] = valid
     if stacks is not None:
         req["stacks"] = stacks
     if dealt_seats is not None:

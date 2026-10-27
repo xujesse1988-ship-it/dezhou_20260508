@@ -438,6 +438,7 @@ mod tests {
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
+            ante_exempt: 0,
             button_seat: SeatId(0),
         }
     }

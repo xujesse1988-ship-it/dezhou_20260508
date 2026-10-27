@@ -18,6 +18,10 @@ pub struct TableConfig {
     pub big_blind: ChipAmount,
     /// 默认 0（D-024 / D-031）。
     pub ante: ChipAmount,
+    /// 不交 ante 的座位（bit i = 座 i），默认 0 = 人人都交。实盘短桌把 N 座树里多出来的空座
+    /// 映成「开局先弃牌」的幻影座，真实桌上没有这几份 ante，故按空座豁免（见
+    /// `openpoker_advisor` 的真栈重放）。`ante == 0` 时不起作用。
+    pub ante_exempt: u16,
     /// 起始按钮位（默认 `SeatId(0)`，由 D-022b 推出 SB=1 / BB=2）。
     pub button_seat: SeatId,
 }
@@ -48,8 +52,21 @@ impl TableConfig {
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
+            ante_exempt: 0,
             button_seat: SeatId(0),
         }
+    }
+
+    /// 把 `ante`（每座 chips，发盲注前人人都交、计入底池但不算本轮下注）换成给定值，其余字段
+    /// 不变。`train_cfr --ante <chips>` 用它在 `n_max_at_bb` / `default_hu_200bb` 之上叠 ante。
+    pub fn with_ante(mut self, ante: ChipAmount) -> TableConfig {
+        self.ante = ante;
+        self
+    }
+
+    /// 座 `seat` 是否交 ante（`ante == 0` 时也返回 true，此时交的是 0）。
+    pub fn posts_ante(&self, seat: SeatId) -> bool {
+        self.ante_exempt & (1u16 << seat.0) == 0
     }
 
     /// 6-max 100BB 的默认配置：6 座、起始 100BB、SB=50、BB=100、ante=0、按钮在座位 0。
@@ -70,6 +87,7 @@ impl TableConfig {
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
+            ante_exempt: 0,
             button_seat: SeatId(0),
         }
     }

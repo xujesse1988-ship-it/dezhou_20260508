@@ -97,9 +97,14 @@ impl CrossValidationReport {
 ///    - ok = true → 比对终局 payouts / showdown_order
 /// 3. 比对：双方均成功 → `Match` 或 `Diverged`。
 pub fn validate_one_hand(seed: u64) -> CrossValidationOutcome {
+    validate_one_hand_with(seed, TableConfig::default_6max_100bb())
+}
+
+/// 同 [`validate_one_hand`]，但桌面配置由调用方给（ante / 座位数 / 栈深变体）。
+pub fn validate_one_hand_with(seed: u64, cfg: TableConfig) -> CrossValidationOutcome {
     let our_result = catch_unwind(AssertUnwindSafe(|| -> (TableConfig, OursSnapshot) {
-        let (cfg, state) =
-            play_random_hand(seed, 256).unwrap_or_else(|e| panic!("our random hand failed: {e}"));
+        let (cfg, state) = play_random_hand(seed, cfg, 256)
+            .unwrap_or_else(|e| panic!("our random hand failed: {e}"));
         let snap = snapshot_from_state(&state);
         (cfg, snap)
     }));
@@ -216,8 +221,11 @@ pub fn validate_one_hand(seed: u64) -> CrossValidationOutcome {
     }
 }
 
-fn play_random_hand(seed: u64, max_actions: usize) -> Result<(TableConfig, GameState), String> {
-    let cfg = TableConfig::default_6max_100bb();
+fn play_random_hand(
+    seed: u64,
+    cfg: TableConfig,
+    max_actions: usize,
+) -> Result<(TableConfig, GameState), String> {
     let total = expected_total_chips(&cfg);
     let mut state = GameState::new(&cfg, seed);
     let mut action_rng = ChaCha20Rng::from_seed(seed.wrapping_add(0xC005_CAFE));
@@ -322,6 +330,7 @@ fn encode_request_json(cfg: &TableConfig, seed: u64, hh: &Option<HandHistory>) -
         "small_blind": cfg.small_blind.as_u64(),
         "big_blind": cfg.big_blind.as_u64(),
         "ante": cfg.ante.as_u64(),
+        "ante_exempt": cfg.ante_exempt,
         "button_seat": cfg.button_seat.0,
         "seed": seed,
         "hole_cards": h.hole_cards.iter().map(|hole| {
@@ -471,6 +480,135 @@ fn cross_validation_pokerkit_100_random_hands() {
     } else {
         assert_eq!(report.matches, 100);
     }
+}
+
+/// 跑 `total` 手（seed `0..total`），每手桌面配置由 `cfg_for(seed)` 给；断言 0 分歧 / 0 panic /
+/// 0 harness 错误。PokerKit 缺失时允许全部 skipped（同 100 手出口测试的口径）。
+fn assert_cross_validation_clean(label: &str, total: u64, cfg_for: impl Fn(u64) -> TableConfig) {
+    let mut report = CrossValidationReport::default();
+    for seed in 0..total {
+        report.record(seed, validate_one_hand_with(seed, cfg_for(seed)));
+    }
+    eprintln!("[{label}] {report:?}");
+    assert_eq!(report.our_panics, 0);
+    assert_eq!(report.harness_errors, 0);
+    assert_eq!(
+        report.diverged, 0,
+        "first divergence: {:?}",
+        report.first_diverged
+    );
+    if report.skipped > 0 {
+        eprintln!("[{label}] skipped because PokerKit is unavailable");
+    } else {
+        assert_eq!(report.matches as u64, total);
+    }
+}
+
+/// ante 变体随机桌：3..=9 座、ante ∈ {5, 10, 25, 50, 100}、**同桌等栈**、栈深 2BB..200BB 随机
+/// （任意 chip 值，含交完 ante + 盲注就 all-in 的浅码），按钮在座 0。
+///
+/// 等栈是有意的：不等栈时会撞上与 ante 无关的既有分歧（ante=0 同样出现）——① 多人 all-in 后
+/// `pokerkit_replay.py` 没把 PokerKit 走到终局；② 全员 all-in 时摊牌顺序约定不同；③ side pot
+/// 奇数筹码归属差 1–2 chip。ante 不足额 all-in 形成的 side pot 由 `tests/ante_rules.rs` 手算
+/// 期望值覆盖。HU 不在内：`pokerkit_replay.py` 的座位映射按 SB = ref 0 写，未对 HU 验证过。
+fn random_ante_config(seed: u64) -> TableConfig {
+    let mut rng = ChaCha20Rng::from_seed(seed ^ 0xA17E_A17E_0000_0000);
+    let n_seats = 3 + (rng.next_u64() % 7) as u8;
+    let ante = [5u64, 10, 25, 50, 100][(rng.next_u64() % 5) as usize];
+    let stack = 200 + rng.next_u64() % 19_801;
+    let mut cfg = TableConfig::n_max_at_bb(n_seats, 100).with_ante(ChipAmount::new(ante));
+    cfg.starting_stacks = vec![ChipAmount::new(stack); usize::from(n_seats)];
+    cfg
+}
+
+/// ante 路径与 PokerKit 一致：6-max 100BB、每座 ante 10（0.1BB）。
+#[test]
+fn cross_validation_pokerkit_ante_6max_100_hands() {
+    assert_cross_validation_clean("xvalidate-ante-6max", 100, |_| {
+        TableConfig::default_6max_100bb().with_ante(ChipAmount::new(10))
+    });
+}
+
+/// ante 路径与 PokerKit 一致：随机座位数 / ante / 栈深（见 [`random_ante_config`]）。
+#[test]
+fn cross_validation_pokerkit_ante_random_tables_200_hands() {
+    assert_cross_validation_clean("xvalidate-ante-random", 200, random_ante_config);
+}
+
+/// [`random_ante_config`] 再随机挑一部分座位不交 ante（`ante_exempt`，至少留 2 座交）：实盘短桌
+/// 幻影座豁免 ante 用的就是这条路径；这里豁免座照常打牌，覆盖面更宽。
+fn random_ante_exempt_config(seed: u64) -> TableConfig {
+    let mut cfg = random_ante_config(seed);
+    let n = u32::from(cfg.n_seats);
+    let mut rng = ChaCha20Rng::from_seed(seed ^ 0xE8E3_0000_A17E_0000);
+    let mut mask = (rng.next_u64() as u16) & ((1u16 << n) - 1);
+    while n - mask.count_ones() < 2 {
+        mask &= mask - 1;
+    }
+    cfg.ante_exempt = mask;
+    cfg
+}
+
+/// 部分座位不交 ante 时与 PokerKit 一致（PokerKit 按座位传各自的 ante，豁免座传 0）。
+///
+/// 唯一放行的分歧：交了 ante 的人弃牌后总投入仍高于所有在场者（例如豁免 ante 的 BB 被弃到），
+/// 那一层没人有资格争——PokerKit 对此未定义（`push_chips` 里 `assert len(pot.player_indices) == 1`
+/// 失败），本引擎把它并给在场者，手算期望值见 `tests/ante_rules.rs`。
+#[test]
+fn cross_validation_pokerkit_ante_exempt_200_hands() {
+    const POKERKIT_UNDEFINED: &str = "assert len(pot.player_indices) == 1";
+    let mut report = CrossValidationReport::default();
+    let mut pokerkit_undefined = 0usize;
+    for seed in 0..200u64 {
+        match validate_one_hand_with(seed, random_ante_exempt_config(seed)) {
+            CrossValidationOutcome::Diverged { reason } if reason.contains(POKERKIT_UNDEFINED) => {
+                pokerkit_undefined += 1
+            }
+            outcome => report.record(seed, outcome),
+        }
+    }
+    eprintln!("[xvalidate-ante-exempt] {report:?} pokerkit_undefined={pokerkit_undefined}");
+    assert_eq!(report.our_panics, 0);
+    assert_eq!(report.harness_errors, 0);
+    assert_eq!(
+        report.diverged, 0,
+        "first divergence: {:?}",
+        report.first_diverged
+    );
+    if report.skipped == 0 {
+        assert_eq!(report.matches + pokerkit_undefined, 200);
+        assert!(
+            report.matches >= 190,
+            "PokerKit 未定义的手不该这么多: {pokerkit_undefined}"
+        );
+    }
+}
+
+/// ante 随机桌长跑版（默认 10,000 手，`XV_TOTAL` 覆盖）。PokerKit 缺失时 fail（不许静默 skip）。
+#[test]
+#[ignore = "long — needs PokerKit; ~0.4s/hand"]
+fn cross_validation_pokerkit_ante_random_tables_10k() {
+    let total: u64 = std::env::var("XV_TOTAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    let mut report = CrossValidationReport::default();
+    for seed in 0..total {
+        report.record(seed, validate_one_hand_with(seed, random_ante_config(seed)));
+        if (seed + 1) % 1_000 == 0 {
+            eprintln!("[xvalidate-ante-10k] progress {}/{}", seed + 1, total);
+        }
+    }
+    eprintln!("[xvalidate-ante-10k] final {report:?}");
+    assert_eq!(report.our_panics, 0);
+    assert_eq!(report.harness_errors, 0);
+    assert_eq!(
+        report.diverged, 0,
+        "first divergence: {:?}",
+        report.first_diverged
+    );
+    assert_eq!(report.skipped, 0, "PokerKit unavailable");
+    assert_eq!(report.matches as u64, total);
 }
 
 /// D-085 / validation §7 / C2 carve-out 闭合：规则与 PokerKit 100,000 手 0 分歧

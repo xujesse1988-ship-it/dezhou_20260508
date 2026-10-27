@@ -5,6 +5,9 @@ HandEngine 只吃规范化后的数值（服务器适配层负责把各家 JSON 
 → 抛 HandInvalid（调用方把这手作废、等下一手）。校验通过的状态直接给出 hero 决策要的全部输入
 （合法区间、动作历史、开局真栈、发牌座），不再做推断。
 
+ante（每座，桌面筹码）：开局每个发牌座先交 ante、再发盲注；ante 计入底池、不算本轮下注
+（快照的 bet 只含盲注），开局栈 = 快照栈 + bet + ante。交 ante / 盲注就全下的手不建模（作废）。
+
 座位环序 = 座位号升序（button → SB → BB → …）。至少 3 人发牌（两人局盲注 / 行动序约定不同，
 advisor 只按 OpenPoker 的 HU 约定建模，这里直接不支持）。
 
@@ -40,17 +43,20 @@ def _int(v, what):
 
 
 class HandEngine:
-    def __init__(self, hand_id, button, small_blind, big_blind, hero_seat, n_seats):
+    def __init__(self, hand_id, button, small_blind, big_blind, hero_seat, n_seats, ante=0):
         self.hand_id = hand_id
         self.button = _int(button, "dealer_seat")
         self.sb = _int(small_blind, "small_blind")
         self.bb = _int(big_blind, "big_blind")
+        self.ante = _int(ante, "ante")
         self.hero = hero_seat
         self.n_seats = n_seats
         if not (0 <= self.button < n_seats):
             raise HandInvalid(f"bad_button:{self.button}")
         if not (0 < self.sb <= self.bb):
             raise HandInvalid(f"bad_blinds:{self.sb}/{self.bb}")
+        if self.ante < 0:
+            raise HandInvalid(f"bad_ante:{self.ante}")
         self.table_seats = None  # 本手桌子座位数（首个快照定，之后不许变）
         self.started = False    # 已用首个快照建好开局状态
         self.finished = False   # 已收到 hand_result
@@ -59,7 +65,7 @@ class HandEngine:
         self.hole = None
         self.dealt = []         # 发牌座（升序 = 环序）
         self.sb_seat = self.bb_seat = None
-        self.start_stack = {}   # 开局栈（含盲注）
+        self.start_stack = {}   # 开局栈（交 ante / 盲注之前）
         self.stack = {}         # 当前剩余栈
         self.bet = {}           # 本街已投入
         self.folded = set()
@@ -203,10 +209,13 @@ class HandEngine:
             if want and stack == 0:
                 # 盲注就全下：min-call / 加注口径各家规则不一，不建模。
                 raise HandInvalid(f"blind_all_in:{s}")
+            if self.ante and stack == 0:
+                # 交 ante 就全下：交了多少看不出来（可能不足额），开局栈还原不了。
+                raise HandInvalid(f"ante_all_in:{s}")
             self.stack[s] = stack
             self.bet[s] = bet
-            self.start_stack[s] = stack + bet
-        self.pot = self.sb + self.bb
+            self.start_stack[s] = stack + bet + self.ante
+        self.pot = self.sb + self.bb + self.ante * len(dealt)
         self.max_bet = self.bb
         self.need_act = {s for s in dealt if self.stack[s] > 0}
         self.to_act = self._next_actor(self.bb_seat)
@@ -370,7 +379,8 @@ class HandEngine:
         """校验通过的整手牌局（hh 日志一行，opponent_analysis 的 wopo 适配器读）。只在本手打完且
         没作废时调用：开局栈 / 动作 / 投入都是本引擎逐条核对过的。"""
         return {"hand_id": self.hand_id, "button_seat": self.button, "small_blind": self.sb,
-                "big_blind": self.bb, "my_seat": self.hero, "dealt_seats": list(self.dealt),
+                "big_blind": self.bb, **({"ante": self.ante} if self.ante else {}),
+                "my_seat": self.hero, "dealt_seats": list(self.dealt),
                 "initial_stacks": {str(s): v for s, v in self.start_stack.items()},
                 "names": {str(s): n for s, n in self.names.items()},
                 "hole": list(self.hole or []), "board": list(self.board),

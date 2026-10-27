@@ -169,7 +169,11 @@ fn full_indexer_and_fingerprint(
     game: &SimplifiedNlheGame,
 ) -> (NlheDenseIndexer, DenseLayoutFingerprint) {
     let indexer = NlheDenseIndexer::from_tree(game.tree(), bucket_count_by_street(game));
-    let fp = DenseLayoutFingerprint::from_indexer(&indexer, game.bucket_table_blake3());
+    let fp = DenseLayoutFingerprint::from_indexer(
+        &indexer,
+        game.bucket_table_blake3(),
+        game.table_config().ante.as_u64(),
+    );
     (indexer, fp)
 }
 
@@ -474,7 +478,7 @@ impl CroppedBlueprint {
                 OFF_SRC_NUM_NODES as u64,
                 format!(
                     "source layout fingerprint mismatch: file(nodes={}, rows={}, slots={}) vs \
-                     game(nodes={}, rows={}, slots={})——crop 文件不是用这个树 / 抽象训出来的",
+                     game(nodes={}, rows={}, slots={})——crop 文件不是用这个树 / 抽象 / ante 训出来的",
                     got.num_nodes,
                     got.total_rows,
                     got.total_slots,
@@ -607,6 +611,7 @@ mod tests {
     use super::*;
     use crate::abstraction::bucket_table::{BucketConfig, BucketTable};
     use crate::core::rng::ChaCha20Rng;
+    use crate::core::ChipAmount;
     use crate::rules::config::TableConfig;
     use crate::training::monitor::StrategySnapshot;
     use crate::training::nlhe::pack_info_set_v2;
@@ -793,6 +798,43 @@ mod tests {
         .expect("other game");
         assert!(crop_dense_checkpoint(&ckpt, &dir.join("x.crop"), &other, opts).is_err());
         assert!(CroppedBlueprint::load(&out, &other).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ante 进 layout 指纹：同座位 / 码深 / 抽象 / 桶表、只差 ante 的两个 game，ckpt 与 crop
+    /// 互相拒绝（resume / crop / 加载三条路都拦）；同 ante 的 game 照常加载。
+    #[test]
+    fn ante_mismatch_rejected() {
+        let ante_game = || {
+            let table = Arc::new(BucketTable::stub_for_postflop(
+                BucketConfig::new(200, 200, 200).expect("200/200/200"),
+            ));
+            let (abs, rules) = all_1pot_6max(2);
+            let cfg = TableConfig::n_max_at_bb(3, 20).with_ante(ChipAmount::new(10));
+            SimplifiedNlheGame::new_with_abstraction(table, cfg, abs, rules).expect("ante game")
+        };
+        let mut trainer = DenseNlheEsMccfrTrainer::new(ante_game(), 11);
+        let mut rng = ChaCha20Rng::from_seed(0xA17E);
+        for _ in 0..300 {
+            trainer.step(&mut rng).expect("step");
+        }
+        let dir = tmpdir("ante");
+        let ckpt = dir.join("ante.ckpt");
+        trainer.save_checkpoint(&ckpt).expect("save");
+        let opts = CropOptions {
+            keep_through: StreetTag::Flop,
+            keep_regret: false,
+        };
+        let out = dir.join("ante.crop");
+        crop_dense_checkpoint(&ckpt, &out, trainer.game(), opts).expect("crop (same ante)");
+        CroppedBlueprint::load(&out, &ante_game()).expect("load crop (same ante)");
+        DenseNlheEsMccfrTrainer::load_checkpoint(&ckpt, ante_game()).expect("resume (same ante)");
+
+        let no_ante = small_game();
+        assert!(DenseNlheEsMccfrTrainer::load_checkpoint(&ckpt, small_game()).is_err());
+        assert!(crop_dense_checkpoint(&ckpt, &dir.join("x.crop"), &no_ante, opts).is_err());
+        assert!(CroppedBlueprint::load(&out, &no_ante).is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }

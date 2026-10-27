@@ -250,8 +250,18 @@ def _replay_with_pokerkit(request: dict[str, Any], pokerkit: Any) -> dict[str, A
             pokerkit.Automation.CHIPS_PUSHING,
             pokerkit.Automation.CHIPS_PULLING,
         ),
-        False,
-        request["ante"],
+        # ante_trimming_status=True: uniform per-seat antes count as ordinary
+        # contributions, so a player all-in for less than the ante can only win
+        # that much from each opponent (same as our side-pot tranches). False is
+        # PokerKit's non-uniform (BB-ante) mode that drops every ante into the
+        # main pot. No effect when ante == 0.
+        True,
+        # Per-seat antes (ref order); seats in the ante_exempt bitmask post none.
+        tuple(
+            0 if (request.get("ante_exempt", 0) >> _ref_to_seat(i, button_seat, n_seats)) & 1
+            else request["ante"]
+            for i in range(n_seats)
+        ),
         (request["small_blind"], request["big_blind"]),
         request["big_blind"],
         tuple(ref_stacks),

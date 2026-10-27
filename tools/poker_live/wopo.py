@@ -116,8 +116,12 @@ def legalize(resp, valid):
 class WopoSession:
     def __init__(self, worker, action_file, n_seats, hero_seat=0, num_hands=0,
                  action_log=None, prewarm=False, exploit=False, debug=False,
-                 exploit_4bet=False, hh_log=None, play_log=None):
+                 exploit_4bet=False, hh_log=None, play_log=None, ante=0, blueprint_ante=0):
         self.worker = worker
+        # ante：桌面每座 ante（--ante，桌面筹码）；blueprint_ante：blueprint 的 ante（solver 筹码，
+        # BB = 100）。每手按 ante × 100 == blueprint_ante × 大盲 核对，对不上这手作废。
+        self.ante = ante
+        self.blueprint_ante = blueprint_ante
         self.action_file = action_file
         self.n_seats = n_seats
         self.hero_seat = hero_seat
@@ -275,7 +279,7 @@ class WopoSession:
         try:
             self.hand = HandEngine(msg.get("hand_id"), msg.get("dealer_seat"),
                                    blinds.get("small_blind"), blinds.get("big_blind"),
-                                   self.hero_seat, self.n_seats)
+                                   self.hero_seat, self.n_seats, ante=self.ante)
         except HandInvalid as e:
             self._count_skip(msg.get("hand_id"), str(e))  # hand 留 None：本手后续消息全忽略
             return
@@ -283,7 +287,12 @@ class WopoSession:
             self._kill(f"hero_seat:{msg.get('seat')}!={self.hero_seat}")
             return
         self._play(f"──── {msg.get('hand_id')} 庄位 seat{self.hand.button} "
-                   f"盲注 {self.hand.sb}/{self.hand.bb}")
+                   f"盲注 {self.hand.sb}/{self.hand.bb}"
+                   + (f" ante {self.hand.ante}" if self.hand.ante else ""))
+        if self.ante * 100 != self.blueprint_ante * self.hand.bb:
+            # blueprint 是按 blueprint_ante / 100 个大盲的 ante 训的，和这桌比例不同 → 不出建议。
+            self._kill(f"ante_mismatch:{self.ante}/{self.hand.bb}vs{self.blueprint_ante}/100")
+            return
         self._dbg(f"=== hand_start hand_id={msg.get('hand_id')} button={msg.get('dealer_seat')} "
                   f"blinds={blinds.get('small_blind')}/{blinds.get('big_blind')} ===")
 
@@ -356,7 +365,8 @@ class WopoSession:
                             hand.sb, hand.bb, list(hand.actions), valid,
                             stacks=hand.hand_start_stacks(placeholder=100 * hand.bb),
                             dealt_seats=list(dealt) if dealt else None,
-                            names=dict(hand.names) if self.send_names else None)
+                            names=dict(hand.names) if self.send_names else None,
+                            ante=hand.ante)
 
     def _maybe_prewarm(self):
         """街起点预热（--search-prewarm）：hero 本手还能行动才发；发错无害（advisor 侧 skip）。"""

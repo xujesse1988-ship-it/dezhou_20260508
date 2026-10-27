@@ -21,6 +21,10 @@
   - --hh-log：每手打完且没作废的牌局写一行（opponent_analysis 的 wopo 平台读）。
   - --play-log：给人看的牌桌实况（手牌 / 公共牌 / 玩家行动 / hero 决策与实际行动 / 结算 / 作废），
     诊断信息（advisor 启动、连接、过期、未知消息）仍走 stderr。
+  - --ante（桌面筹码，默认 0）：开局每个发牌座先交 ante 再发盲注，牌桌层按此核对底池 / 栈（快照 bet
+    只含盲注；对不上 → 作废）。--blueprint-ante（solver 筹码，BB = 100，= train_cfr --ante）透传给
+    advisor 加载对应 blueprint；每手要求 ante × 100 == blueprint-ante × 大盲，否则这手作废
+    （ante_mismatch）。短桌空座在实时搜索里不交 ante（树里是按满桌人人交训的，翻前查表照用）。
   - 连 WS 带 token 鉴权（Authorization: Bearer）：环境变量 WOPO_TOKEN 优先，其次项目根 .env 的
     WOPO_TOKEN；不走命令行（免得进 ps / shell 历史）。服务端拒绝（关闭码 4001 / 握手 401、403）→
     不重连，直接退出。
@@ -189,6 +193,8 @@ FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata",
 # 上面这份实测日志对应的 --hh-log 输出；opponent_analysis 的 wopo 适配器测试读它。
 HH_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "opponent_analysis",
                           "tests", "data", "wopo_hh_2026_10_16.jsonl")
+# 同一会话改写成每人 ante 2（盲注 1/2）后的 --hh-log 输出（_selftest_ante 生成并核对）。
+HH_ANTE_FIXTURE = os.path.join(os.path.dirname(HH_FIXTURE), "wopo_hh_ante_2026_10_27.jsonl")
 
 
 class _StubAdvisor:
@@ -226,7 +232,7 @@ def _fixture_msgs():
 
 
 def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=False,
-              exploit_4bet=False, reply=None, hh_log=None, play_log=None):
+              exploit_4bet=False, reply=None, hh_log=None, play_log=None, ante=0, blueprint_ante=0):
     """msgs（dict 或 ("disconnect",)）喂一个新会话。返回 (session, stub, 行动文件行)。
     hook(i, session) 在每条消息后调用（异步场景用来在指定位置放行 advisor）。"""
     stub = _StubAdvisor(gate, reply)
@@ -236,7 +242,8 @@ def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=Fals
         af = ActionFile(path)
         session = WopoSession(worker, af, n_seats=9, hero_seat=HERO_SEAT,
                               exploit=exploit, prewarm=prewarm, exploit_4bet=exploit_4bet,
-                              hh_log=hh_log, play_log=play_log)
+                              hh_log=hh_log, play_log=play_log, ante=ante,
+                              blueprint_ante=blueprint_ante)
         for i, m in enumerate(msgs):
             if m == ("disconnect",):
                 session.on_disconnect()
@@ -630,6 +637,71 @@ def _selftest_token():
           file=sys.stderr)
 
 
+def _with_ante(msgs, ante):
+    """实测日志改写成「每个发牌座开局先交 ante」：快照栈 / bet 不变（= 每人多带 ante 入座），每手
+    所有底池数字 + ante × 发牌人数，结算时把这份加给第一个收钱的座位（筹码守恒）；赢家净赢
+    （winners[].amount = 结算栈 − 开局栈）随之调整。"""
+    out, k = [], {}
+    for m in msgs:
+        m = dict(m)
+        h = m.get("hand_id")
+        if m["type"] == "table_state" and h not in k:
+            k[h] = sum(1 for s in m["seats"] if s.get("in_hand"))
+        extra = ante * k.get(h, 0)
+        if m["type"] == "table_state":
+            m["pot"] += extra
+        elif m["type"] == "player_action":
+            m["pot"] += extra
+            m["pot_before"] += extra
+        elif m["type"] == "hand_result":
+            final = dict(m["final_stacks"])
+            w = m["payouts"][0]["seat"]
+            final[str(w)] += extra
+            m["final_stacks"] = final
+            m["winners"] = [dict(x, amount=x["amount"] - ante + (extra if x["seat"] == w else 0))
+                            for x in m["winners"]]
+        out.append(m)
+    return out
+
+
+def _selftest_ante():
+    """--ante：底池按「人人先交 ante」核对、开局栈含 ante、请求 / hh 带 ante；比例对不上 blueprint、
+    或说有 ante 而桌上没有 → 每手作废。"""
+    msgs = _fixture_msgs()
+    _, base_stub, base_rows = _run_msgs(msgs)
+    buf = io.StringIO()
+    session, stub, rows = _run_msgs(_with_ante(msgs, 2), ante=2, blueprint_ante=100, hh_log=buf)
+    c = session.counters
+    _check(not session.skip_reasons and c["hands_complete"] == 7 and c["result_notes"] == 0,
+           f"带 ante 的会话应全部正常: {session.skip_reasons} {c}")
+    _check(len(rows) == len(base_rows) and len(stub.requests) == len(base_stub.requests),
+           "决策点应与无 ante 时一一对应")
+    for q, bq, row, brow in zip(stub.requests, base_stub.requests, rows, base_rows):
+        _check(q["ante"] == 2 and "ante" not in bq, "请求应带 ante（无 ante 时不带）")
+        dealt = q.get("dealt_seats") or list(range(9))
+        _check(all(q["stacks"][s] == bq["stacks"][s] + 2 for s in dealt), "开局栈应含 ante")
+        _check(row["valid"] == brow["valid"] and row["to_call"] == brow["to_call"],
+               "ante 不算本轮下注：合法区间 / 跟注额不变")
+        _check(row["pot"] == brow["pot"] + 2 * len(dealt), "底池应含全部 ante")
+    hh = [json.loads(line) for line in buf.getvalue().splitlines()]
+    _check(len(hh) == 7 and all(r["ante"] == 2 for r in hh), "hh 行应带 ante")
+    if os.environ.get("WOPO_REGEN_HH_ANTE"):
+        with open(HH_ANTE_FIXTURE, "w") as f:
+            f.write(buf.getvalue())
+    with open(HH_ANTE_FIXTURE) as f:
+        _check(hh == [json.loads(line) for line in f if line.strip()],
+               f"ante hh 输出与 {HH_ANTE_FIXTURE} 不一致（改了格式用 WOPO_REGEN_HH_ANTE=1 重生成）")
+
+    session, _, rows = _run_msgs(_with_ante(msgs, 2), ante=2, blueprint_ante=50)
+    _check(session.skip_reasons == {"ante_mismatch": 8} and not rows,
+           f"ante 比例与 blueprint 不符应每手作废: {session.skip_reasons}")
+    session, _, rows = _run_msgs(msgs, ante=2, blueprint_ante=100)
+    _check(session.skip_reasons == {"snapshot_pot": 8} and not rows,
+           f"说有 ante 而桌上没有应作废: {session.skip_reasons}")
+    print("[selftest 11 ante] 底池 / 开局栈按人人先交 ante 核对、请求与 hh 带 ante；比例不符或桌上没有"
+          " → 作废", file=sys.stderr)
+
+
 def run_selftest():
     _selftest_full_replay()
     _selftest_mid_hand_join()
@@ -641,7 +713,8 @@ def run_selftest():
     _selftest_hh_log()
     _selftest_token()
     _selftest_table_size()
-    print("OK: wopo selftest 10 组场景全部通过。", file=sys.stderr)
+    _selftest_ante()
+    print("OK: wopo selftest 11 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================
@@ -670,8 +743,15 @@ def main():
                    help="牌桌实况（人看，append）：手牌 / 公共牌 / 玩家行动 / hero 决策（建议、来源、耗时）/ "
                         "实际行动 / 结算 / 作废；诊断信息仍走 stderr。缺省关")
     p.add_argument("--num-hands", type=int, default=0, help="打完这么多手后退出；0 = 不限")
+    p.add_argument("--ante", type=int, default=0,
+                   help="桌面每座 ante（桌面筹码，默认 0）：开局人人先交，计入底池、不算本轮下注")
+    p.add_argument("--blueprint-ante", type=int, default=0,
+                   help="blueprint 的每座 ante（solver 筹码，BB = 100，= 训练时 train_cfr --ante；默认 0）。"
+                        "每手要求 --ante × 100 == 本值 × 大盲")
     add_fourbet_args(p)
     args = p.parse_args()
+    if args.ante < 0 or not 0 <= args.blueprint_ante <= 100:
+        p.error("--ante 须 ≥ 0，--blueprint-ante 须在 [0, 100]")
     validate_advisor_args(args)
     validate_fourbet_args(p, args)
     token = None
@@ -680,7 +760,8 @@ def main():
         if token is None:
             p.error(f"连 WS 需要 token：设环境变量 {TOKEN_ENV} 或写进 {ENV_FILE}（非空且不含空白）")
 
-    advisor = start_advisor(args, advisor_extra_args(args) + fourbet_extra_args(args))
+    ante_args = ["--ante", str(args.blueprint_ante)] if args.blueprint_ante else []
+    advisor = start_advisor(args, advisor_extra_args(args) + fourbet_extra_args(args) + ante_args)
     # 回放用同步 worker（结果确定、不会因为读文件太快把决策判成过期）；联机用后台线程。
     worker = DecisionWorker(advisor, sync=args.replay is not None)
     action_file = ActionFile(args.action_file)
@@ -692,7 +773,7 @@ def main():
                           num_hands=args.num_hands, action_log=action_log,
                           prewarm=args.search_prewarm, exploit=exploit_enabled(args),
                           debug=args.debug_log, exploit_4bet=fourbet_enabled(args), hh_log=hh_log,
-                          play_log=play_log)
+                          play_log=play_log, ante=args.ante, blueprint_ante=args.blueprint_ante)
     ok = True
     try:
         if args.replay:

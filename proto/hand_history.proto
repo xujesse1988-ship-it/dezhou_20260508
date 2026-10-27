@@ -26,6 +26,7 @@ message TableConfig {
     uint64 big_blind = 4;
     uint64 ante = 5;
     uint32 button_seat = 6;
+    uint32 ante_exempt = 7;           // 不交 ante 的座位 bitmask（bit i = 座 i；0 = 人人都交）
 }
 
 message RecordedAction {

@@ -107,6 +107,12 @@ def replay(raw: RawHand, heads_up_button_is_sb: bool) -> Hand:
         if stack[seat] == 0:
             all_in.add(seat)
 
+    for s in dealt:
+        amt = min(raw.ante, stack[s])  # dead money: committed, but not this street's bet
+        stack[s] -= amt
+        committed[s] += amt
+        if stack[s] == 0:
+            all_in.add(s)
     post(sb_seat, raw.sb)
     post(bb_seat, raw.bb)
 

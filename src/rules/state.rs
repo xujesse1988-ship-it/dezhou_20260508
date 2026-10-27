@@ -1208,7 +1208,9 @@ impl GameState {
     fn post_forced_bets(&mut self) {
         if self.config.ante > ChipAmount::ZERO {
             for idx in 0..self.players.len() {
-                self.post_forced_amount(idx, self.config.ante, false);
+                if self.config.posts_ante(SeatId(idx as u8)) {
+                    self.post_forced_amount(idx, self.config.ante, false);
+                }
             }
         }
         self.post_forced_amount(
@@ -1244,16 +1246,27 @@ impl GameState {
         }
     }
 
+    /// 没人跟的注退回：按**下注额**（总投入减去自己交的 ante）判——ante 是死钱、不算跟注。
+    /// 人人交同额 ante（或无 ante）时与按总投入判逐位相同；有座位豁免 ante 时，豁免座多下的
+    /// 那份只有自己下过，须退回（与 PokerKit 每轮收注时退「超出次高下注」的口径一致）。
     fn return_uncalled_bets(&mut self) {
-        let mut returned = vec![0u64; self.players.len()];
-        for (winner, amount) in self.single_contributor_tranches() {
-            returned[winner] += amount;
-        }
-        for (idx, amount) in returned.into_iter().enumerate() {
-            if amount == 0 {
-                continue;
-            }
-            let chips = ChipAmount::new(amount);
+        let bets: Vec<u64> = (0..self.players.len())
+            .map(|idx| self.players[idx].committed_total.as_u64() - self.posted_ante(idx))
+            .collect();
+        let top = bets.iter().copied().max().unwrap_or(0);
+        let mut top_seats = bets.iter().enumerate().filter(|&(_, &b)| b == top);
+        let (Some((idx, _)), None) = (top_seats.next(), top_seats.next()) else {
+            return;
+        };
+        let second = bets
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != idx)
+            .map(|(_, &b)| b)
+            .max()
+            .unwrap_or(0);
+        if top > second {
+            let chips = ChipAmount::new(top - second);
             self.players[idx].committed_total -= chips;
             if self.players[idx].committed_this_round >= chips {
                 self.players[idx].committed_this_round -= chips;
@@ -1264,24 +1277,16 @@ impl GameState {
         }
     }
 
-    fn single_contributor_tranches(&self) -> Vec<(usize, u64)> {
-        let levels = self.contribution_levels();
-        let mut prev = 0;
-        let mut out = Vec::new();
-        for level in levels {
-            let contributors: Vec<usize> = self
-                .players
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| p.committed_total.as_u64() >= level)
-                .map(|(idx, _)| idx)
-                .collect();
-            if contributors.len() == 1 {
-                out.push((contributors[0], level - prev));
-            }
-            prev = level;
+    /// 座 `idx` 开局交的 ante（发盲注前从起始栈扣，不足额即全部）。
+    fn posted_ante(&self, idx: usize) -> u64 {
+        if self.config.posts_ante(SeatId(idx as u8)) {
+            self.config
+                .ante
+                .min(self.config.starting_stacks[idx])
+                .as_u64()
+        } else {
+            0
         }
-        out
     }
 
     fn compute_payouts(&self) -> Vec<(SeatId, i64)> {
@@ -1311,27 +1316,30 @@ impl GameState {
                 continue;
             }
 
-            let contenders: Vec<usize> = contributors
+            let mut contenders: Vec<usize> = contributors
                 .iter()
                 .copied()
                 .filter(|&idx| self.players[idx].status != PlayerStatus::Folded)
                 .collect();
-            // Unreachable in valid B2 flow (heads-up to a side pot collapses
-            // via uncalled-bet refund in `single_contributor_tranches` first).
-            // Loud in debug to flush out any C1+ flow that breaks this; in
-            // release fall back to first contributor to preserve I-001
-            // (chip conservation) rather than silently dropping the level.
-            debug_assert!(
-                !contenders.is_empty(),
-                "compute_payouts: level {} has only folded contributors — \
-                 unreachable in valid stage-1 flow; chip non-conservation if \
-                 left unhandled. Inspect single_contributor_tranches / \
-                 player status transitions.",
-                level,
-            );
+            // 只有已弃牌的人投到这么高的层：只在有座位豁免 ante 时出现（交了 ante 的人弃牌后
+            // 总投入仍高于所有在场者，例如对手豁免 ante 时跟同额下注）。人人交同额 ante / 无
+            // ante 时，没人跟的注已按下注额退回，这种层不存在（100k PokerKit 对照验过）。
+            // 这份死钱并进在场者能争的最高那个池：归在场者中总投入最多的那几位。PokerKit 对此
+            // 未定义（会建一个无人有资格的池后抛异常），是本引擎自己的约定。
             if contenders.is_empty() {
-                awards[contributors[0]] += amount;
-                continue;
+                let live_max = self
+                    .players
+                    .iter()
+                    .filter(|p| p.status != PlayerStatus::Folded)
+                    .map(|p| p.committed_total)
+                    .max()
+                    .expect("terminal hand has at least one live player");
+                contenders = (0..self.players.len())
+                    .filter(|&idx| {
+                        self.players[idx].status != PlayerStatus::Folded
+                            && self.players[idx].committed_total == live_max
+                    })
+                    .collect();
             }
 
             // Merge with the most recently appended pot if the contender set
@@ -1520,6 +1528,10 @@ fn validate_config(config: &TableConfig) {
     assert!(
         (config.button_seat.0 as usize) < config.n_seats as usize,
         "button_seat out of range"
+    );
+    assert!(
+        config.ante_exempt >> config.n_seats == 0,
+        "ante_exempt has bits beyond n_seats"
     );
 }
 
@@ -1902,6 +1914,7 @@ mod legal_action_tests {
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
+            ante_exempt: 0,
             button_seat: SeatId(0),
         }
     }
@@ -2055,6 +2068,7 @@ mod legal_action_tests {
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
+            ante_exempt: 0,
             button_seat: SeatId(0),
         };
         let mut s = GameState::new(&cfg, 0x5117_u64);

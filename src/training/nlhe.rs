@@ -165,9 +165,19 @@ impl SimplifiedNlheGame {
         // HU 默认（200BB / 2 座 / {0.5,1,2} / 无 A3×A4 规则）——委托给参数化构造但
         // 入参全是历史默认值，故与历史 `new` 逐节点 byte-equal（守 240,096 节点 +
         // nlhe_infoset_semantics T1）。6-max A3×A4 走 [`new_with_abstraction`]。
+        Self::new_hu_with_config(bucket_table, TableConfig::default_hu_200bb())
+    }
+
+    /// HU 默认 action abstraction（{0.5,1,2}）+ 无 A3×A4 规则，但桌面配置由调用方给（如
+    /// `default_hu_200bb().with_ante(..)`）。`config == default_hu_200bb()` 时与 [`new`](Self::new)
+    /// 逐节点相同。
+    pub fn new_hu_with_config(
+        bucket_table: Arc<BucketTable>,
+        config: TableConfig,
+    ) -> Result<Self, TrainerError> {
         Self::new_with_abstraction(
             bucket_table,
-            TableConfig::default_hu_200bb(),
+            config,
             nlhe_action_abstraction(),
             BettingAbstractionRules::default(),
         )
@@ -764,9 +774,13 @@ impl Game for SimplifiedNlheGame {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abstraction::action::BetRatio;
     use crate::abstraction::bucket_table::BucketConfig;
     use crate::core::rng::{ChaCha20Rng, RngSource};
-    use crate::training::nlhe_betting_tree::{first_small_6max, first_small_preopen_1pot_6max};
+    use crate::core::ChipAmount;
+    use crate::training::nlhe_betting_tree::{
+        all_1pot_6max, ante_flop2_6max, first_small_6max, first_small_preopen_1pot_6max,
+    };
 
     fn stub_table() -> Arc<BucketTable> {
         Arc::new(BucketTable::stub_for_postflop(
@@ -879,6 +893,93 @@ mod tests {
             reached_postflop > 0,
             "300 条随机轨迹应至少有一条进 postflop（否则没测到翻后路径）"
         );
+    }
+
+    /// ante：建树 / 运行期下注尺度按含 ante 的底池现算。6-max all-1pot 下 UTG 唯一开池档
+    /// 1pot = BB + (盲注 + 6×ante + 跟注额)：ante 0 → 350、ante 10 → 410。随机轨迹 6 座 payoff
+    /// 守恒（ante 进底池、按 committed_total 结算）。
+    #[test]
+    fn ante_scales_pot_sized_open_and_conserves_payoff() {
+        let open_to = |ante: u64| {
+            let (abs, rules) = all_1pot_6max(2);
+            let game = SimplifiedNlheGame::new_with_abstraction(
+                stub_table(),
+                TableConfig::default_6max_100bb().with_ante(ChipAmount::new(ante)),
+                abs,
+                rules,
+            )
+            .expect("6-max all-1pot game");
+            let mut rng = ChaCha20Rng::from_seed(0xA17E_0001);
+            let rng: &mut dyn RngSource = &mut rng;
+            let state = game.root(rng);
+            let to = SimplifiedNlheGame::legal_actions(&state)
+                .into_iter()
+                .find_map(|a| match a {
+                    AbstractAction::Raise { to, ratio_label }
+                        if ratio_label == BetRatio::FULL_POT =>
+                    {
+                        Some(to.as_u64())
+                    }
+                    _ => None,
+                })
+                .expect("UTG 应有 1pot 开池档");
+
+            let mut reached_showdown = 0usize;
+            for _ in 0..200 {
+                let mut state = game.root(rng);
+                while let NodeKind::Player(_) = SimplifiedNlheGame::current(&state) {
+                    let actions = SimplifiedNlheGame::legal_actions(&state);
+                    let idx = (rng.next_u64() % actions.len() as u64) as usize;
+                    state = SimplifiedNlheGame::next(state, actions[idx], rng);
+                }
+                reached_showdown += usize::from(state.game_state.board().len() == 5);
+                let sum: f64 = (0..6)
+                    .map(|p| SimplifiedNlheGame::payoff(&state, p as PlayerId))
+                    .sum();
+                assert!(sum.abs() < 1e-6, "ante {ante}: payoff 应守恒，实得 {sum}");
+            }
+            assert!(reached_showdown > 0, "ante {ante}: 应有轨迹走到河牌");
+            to
+        };
+        assert_eq!(open_to(0), 350);
+        assert_eq!(open_to(10), 410);
+    }
+
+    /// `ante-flop2`（8 座 100BB、每人 1BB ante）的开池额：UTG 开池只有 1/3pot 一档，
+    /// 开到 450 chips = 4.5BB（100 + 1050 × 0.333 向上取整）；BTN 之前全弃时 SB 开池 ≈ 4.33BB。
+    #[test]
+    fn ante_flop2_opens_at_four_and_half_bb() {
+        let (abs, rules) = ante_flop2_6max(4);
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::n_max_at_bb(8, 100).with_ante(ChipAmount::new(100)),
+            abs,
+            rules,
+        )
+        .expect("8-max ante-flop2 game");
+        let mut rng = ChaCha20Rng::from_seed(0xA17E_0002);
+        let rng: &mut dyn RngSource = &mut rng;
+        let raises = |state: &SimplifiedNlheState| -> Vec<u64> {
+            SimplifiedNlheGame::legal_actions(state)
+                .into_iter()
+                .filter_map(|a| match a {
+                    AbstractAction::Raise { to, .. } => Some(to.as_u64()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut state = game.root(rng);
+        assert_eq!(state.game_state.pot().as_u64(), 950, "8 × ante + 1.5BB");
+        assert_eq!(raises(&state), vec![450], "UTG 开池只有 1/3pot = 4.5BB");
+        for _ in 0..6 {
+            state = SimplifiedNlheGame::next(state, AbstractAction::Fold, rng);
+        }
+        assert_eq!(
+            state.game_state.current_player(),
+            Some(SeatId(1)),
+            "fold 到 SB"
+        );
+        assert_eq!(raises(&state), vec![433], "SB 开池 ≈ 4.33BB");
     }
 
     /// [`cached_hand_bucket`]：9 座随机轨迹上每个决策点 `info_set`（首次 miss、再次 hit、clone

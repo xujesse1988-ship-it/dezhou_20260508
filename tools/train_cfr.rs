@@ -15,7 +15,8 @@ use poker::training::nlhe_betting_tree::{six_max_reshape, SIX_MAX_RESHAPE_NAMES}
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::{ConvergenceMonitor, EsMccfrTrainer, Game, StrategySnapshot, Trainer};
 use poker::{
-    BucketTable, ChaCha20Rng, CheckpointError, InfoSetId, RngSource, TableConfig, TrainerError,
+    BucketTable, ChaCha20Rng, CheckpointError, ChipAmount, InfoSetId, RngSource, TableConfig,
+    TrainerError,
 };
 
 macro_rules! train_log {
@@ -49,6 +50,8 @@ struct Args {
     /// 3bet+ 1pot；no-limp / 无开池 all-in 规则不变；见 `all_1pot_6max`）。
     /// `flop2-1pot` = `all-1pot` 但 **flop 菜单 {0.5,1}pot**（0.5pot 只作首注，加注仍 1pot；
     /// preflop / turn / river 不变；9-max cap4 两表 ~78.5 GiB；见 `flop2_1pot_6max`）。
+    /// `ante-flop2` = `flop2-1pot` 但 **preflop 开池只有 1/3pot**（8 座每人 1BB ante = 4.5BB），
+    /// 3bet+ 仍 1pot；配 `--ante` 用，见 `ante_flop2_6max`。
     /// 名字 → 树定义的分派见 [`six_max_reshape`]。
     reshape: String,
     /// 仅 `--profile six-max`：起始码深（每座大盲数，对称）。默认 100（== 历史
@@ -61,6 +64,11 @@ struct Args {
     /// n`），9 人桌直接复用同一套抽象。HU 走 `--profile hu`，故不接受 2；`--profile hu` 下显式
     /// 传本参数直接报错（不静默忽略）。
     seats: Option<u8>,
+    /// 每座 ante（chips，BB = 100 chips；默认 0 = 无 ante，与历史 byte-equal）。发盲注前人人
+    /// 都交、计入底池但不算本轮下注（[`TableConfig::ante`]）；下注尺度按含 ante 的底池现算，
+    /// 建树代码不用改。两个 profile 都生效；dense checkpoint 指纹含 ante，resume / crop /
+    /// 对局加载须传同一值。
+    ante: u64,
     trainer: String,
     updates: u64,
     seed: u64,
@@ -108,6 +116,7 @@ impl Default for Args {
             reshape: "none".to_string(),
             stack_bb: 100,
             seats: None,
+            ante: 0,
             trainer: "es-mccfr".to_string(),
             updates: 0,
             seed: 0,
@@ -267,11 +276,22 @@ fn run() -> Result<(), String> {
         ));
     }
     let seats = args.seats.unwrap_or(6);
+    // ante 上限 1BB：每人 ante 超过大盲的桌几乎不存在，多半是把 BB 数误当 chips 传。
+    if args.ante > 100 {
+        return Err(format!(
+            "--ante is in chips (BB = 100) and must be <= 100, got {}",
+            args.ante
+        ));
+    }
+    let ante = ChipAmount::new(args.ante);
     // profile 分派：hu = 历史默认（byte-equal）；six-max = A3×A4 first-small N-cap 游戏。
     // 两条路都产 `SimplifiedNlheGame`，下游 dense/HashMap 后端 + drive 主循环不分流。
     let game = match args.profile.as_str() {
-        "hu" => SimplifiedNlheGame::new(Arc::clone(&table))
-            .map_err(|e| format!("SimplifiedNlheGame::new failed: {e:?}"))?,
+        "hu" => SimplifiedNlheGame::new_hu_with_config(
+            Arc::clone(&table),
+            TableConfig::default_hu_200bb().with_ante(ante),
+        )
+        .map_err(|e| format!("SimplifiedNlheGame::new_hu_with_config failed: {e:?}"))?,
         "six-max" => {
             if !matches!(args.postflop_cap, 2..=4) {
                 return Err(format!(
@@ -292,13 +312,23 @@ fn run() -> Result<(), String> {
                     args.stack_bb
                 ));
             }
-            // all-1pot / flop2-1pot 开池只有 1pot（3.5BB）一档：栈 ≤3BB 时它退化成开池 all-in 又被
-            // drop_preflop_open_allin 删掉 → 开池位只剩 Fold，树塌成几十个节点。拒绝而非静默训。
-            if matches!(args.reshape.as_str(), "all-1pot" | "flop2-1pot") && args.stack_bb < 4 {
-                return Err(format!(
-                    "--reshape {} requires --stack-bb >= 4 (1pot open = 3.5BB), got {}",
-                    args.reshape, args.stack_bb
-                ));
+            // all-1pot / flop2-1pot 开池只有 1pot（3.5BB + 座位数 × ante）一档、ante-flop2 只有
+            // 1/3pot 一档：栈不超过开池额时退化成开池 all-in 又被 drop_preflop_open_allin 删掉 →
+            // 开池位只剩 Fold，树塌成几十个节点。拒绝而非静默训。ante=0 时 1pot 即历史的 stack_bb < 4。
+            let pot_after_call = 250 + u64::from(seats) * args.ante;
+            let single_open = match args.reshape.as_str() {
+                "all-1pot" | "flop2-1pot" => Some(100 + pot_after_call),
+                "ante-flop2" => Some(100 + (pot_after_call * 333).div_ceil(1000)),
+                _ => None,
+            };
+            if let Some(open) = single_open {
+                if u64::from(args.stack_bb) * 100 <= open {
+                    return Err(format!(
+                        "--reshape {} requires stack > its single open size ({open} chips with \
+                         --ante {}), got --stack-bb {}",
+                        args.reshape, args.ante, args.stack_bb
+                    ));
+                }
             }
             let (abs, rules) =
                 six_max_reshape(&args.reshape, args.postflop_cap).ok_or_else(|| {
@@ -309,7 +339,7 @@ fn run() -> Result<(), String> {
                 })?;
             SimplifiedNlheGame::new_with_abstraction(
                 Arc::clone(&table),
-                TableConfig::n_max_at_bb(seats, args.stack_bb),
+                TableConfig::n_max_at_bb(seats, args.stack_bb).with_ante(ante),
                 abs,
                 rules,
             )
@@ -335,6 +365,10 @@ fn run() -> Result<(), String> {
             );
             train_log!("[train_cfr] seats            = {seats}");
         }
+        train_log!(
+            "[train_cfr] ante             = {} chips per seat (BB = 100)",
+            args.ante
+        );
         train_log!("[train_cfr] n_players        = {}", game.n_players());
         train_log!("[train_cfr] tree_nodes       = {}", game.tree().num_nodes());
     }
@@ -576,6 +610,7 @@ fn parse_args() -> Result<Args, String> {
                 out.seats =
                     Some(u8::try_from(raw).map_err(|_| format!("--seats {raw} out of range"))?);
             }
+            "--ante" => out.ante = parse_u64(&next_value(&mut args, "--ante")?)?,
             "--trainer" => out.trainer = next_value(&mut args, "--trainer")?,
             "--updates" => out.updates = parse_u64(&next_value(&mut args, "--updates")?)?,
             "--iter" => {
@@ -713,9 +748,10 @@ fn print_usage() {
          options:\n\
          \t--profile <hu|six-max>  (default hu; six-max = 6-max 100BB A3×A4 first-small)\n\
          \t--postflop-cap <2|3|4>  (six-max only; A3×A4 width-redirect N, default 3; N=4 = 48 GiB tables)\n\
-         \t--reshape <none|nolimp|preopen|preopen-small|preopen-1pot|all-1pot|flop2-1pot>  (six-max only; preopen-1pot = preopen preflop + {{1pot}} postflop, for depth grid; all-1pot = {{1pot}} on all streets incl. preflop; flop2-1pot = all-1pot but flop {{0.5,1}}pot)\n\
+         \t--reshape <none|nolimp|preopen|preopen-small|preopen-1pot|all-1pot|flop2-1pot|ante-flop2>  (six-max only; preopen-1pot = preopen preflop + {{1pot}} postflop, for depth grid; all-1pot = {{1pot}} on all streets incl. preflop; flop2-1pot = all-1pot but flop {{0.5,1}}pot; ante-flop2 = flop2-1pot but preflop open 1/3pot only)\n\
          \t--stack-bb <N>          (six-max only; per-seat starting stack in BB, default 100; pair with --reshape preopen-1pot)\n\
          \t--seats <3..=9>         (six-max only; number of seats, default 6; e.g. 9 = 9-handed table)\n\
+         \t--ante <chips>          (per-seat ante in chips, BB = 100, default 0, max 100; both profiles)\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>\n\
          \t--batch-per-worker <N>  (default 16; trajectories per worker per step_parallel dispatch)\n\

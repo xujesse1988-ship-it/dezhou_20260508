@@ -10,7 +10,7 @@ import subprocess
 
 class Advisor:
     def __init__(self, binary, checkpoint, bucket_table, reshape, postflop_cap, seed,
-                 extra_args=None, cropped=False, n_seats=6):
+                 extra_args=None, cropped=False, n_seats=6, ante=0):
         # cropped=True：checkpoint 是按街裁切的 crop 文件 → advisor --cropped-checkpoint（缺省
         # False = --checkpoint，命令行与旧版逐字节相同）。
         ckpt_flag = "--cropped-checkpoint" if cropped else "--checkpoint"
@@ -32,6 +32,11 @@ class Advisor:
             self.close()
             raise RuntimeError(f"advisor n_seats={self.ready.get('n_seats')} ≠ driver --seats "
                                f"{n_seats}（blueprint / --seats 配错）")
+        # blueprint ante（solver 筹码，BB = 100）：ready 不带 = 0。
+        if self.ready.get("ante", 0) != ante:
+            self.close()
+            raise RuntimeError(f"advisor ante={self.ready.get('ante', 0)} ≠ driver --blueprint-ante "
+                               f"{ante}")
         # 未读取的 prewarm 响应行数（prewarm 先发后弃响应；管道有序 → decide 前按计数 drain
         # 即可对齐，不会把预热响应误当决策响应）。
         self._pending_prewarms = 0
@@ -337,4 +342,5 @@ def start_advisor(args, extra):
     cropped = args.cropped_checkpoint is not None
     return Advisor(args.advisor_bin, args.cropped_checkpoint if cropped else args.checkpoint,
                    args.bucket_table, args.reshape, args.postflop_cap, args.seed,
-                   extra_args=extra, cropped=cropped, n_seats=args.seats)
+                   extra_args=extra, cropped=cropped, n_seats=args.seats,
+                   ante=getattr(args, "blueprint_ante", 0))

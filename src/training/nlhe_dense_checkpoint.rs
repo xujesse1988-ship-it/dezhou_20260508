@@ -110,13 +110,25 @@ pub struct DenseLayoutFingerprint {
 impl DenseLayoutFingerprint {
     /// 从 indexer + game bucket table content hash 算指纹。`action_count_blake3`
     /// 逐节点 feed `street as u8` + `bucket_count` LE + `action_count`。
-    pub fn from_indexer(indexer: &NlheDenseIndexer, bucket_table_blake3: [u8; 32]) -> Self {
+    ///
+    /// `ante`（`TableConfig::ante` chips）≠ 0 时在节点序列之后再 feed `b"ante"` + ante LE：
+    /// ante 只改底池大小、常常不改树形状，不 feed 的话 ante 训出的数组能被 ante=0 的 game
+    /// 静默读进来（反之亦然）。ante == 0 时不 feed，既有 checkpoint / crop 的指纹不变。
+    pub fn from_indexer(
+        indexer: &NlheDenseIndexer,
+        bucket_table_blake3: [u8; 32],
+        ante: u64,
+    ) -> Self {
         let mut hasher = Hasher::new();
         for id in 0..indexer.num_nodes() as NodeId {
             let m = indexer.node_meta(id);
             hasher.update(&[m.street as u8]);
             hasher.update(&m.bucket_count.to_le_bytes());
             hasher.update(&[m.action_count]);
+        }
+        if ante != 0 {
+            hasher.update(b"ante");
+            hasher.update(&ante.to_le_bytes());
         }
         Self {
             bucket_table_blake3,
@@ -384,7 +396,9 @@ pub(crate) fn parse_header(
             OFF_NUM_NODES as u64,
             format!(
                 "layout fingerprint mismatch: file(nodes={}, rows={}, slots={}) \
-                 action_hash={} vs expected(nodes={}, rows={}, slots={})",
+                 action_hash={} vs expected(nodes={}, rows={}, slots={}) \
+                 (action_hash covers per-node actions and the table ante: \
+                 check reshape / seats / stack / --ante)",
                 num_nodes,
                 total_rows,
                 total_slots,
@@ -591,7 +605,7 @@ mod tests {
         ];
         let idx = Arc::new(NlheDenseIndexer::from_node_specs(specs.iter().copied()));
         let (regret, strategy) = build_filled_tables(&idx, &specs);
-        let fp = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0xAB));
+        let fp = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0xAB), 0);
         let meta = meta_sample();
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -635,8 +649,8 @@ mod tests {
         let specs = [spec(StreetTag::Preflop, 4, 3), spec(StreetTag::Flop, 5, 6)];
         let idx = Arc::new(NlheDenseIndexer::from_node_specs(specs.iter().copied()));
         let (regret, strategy) = build_filled_tables(&idx, &specs);
-        let fp_save = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0x11));
-        let fp_load = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0x22));
+        let fp_save = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0x11), 0);
+        let fp_load = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0x22), 0);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("dense.ckpt");
@@ -656,7 +670,7 @@ mod tests {
         let idx_a = Arc::new(NlheDenseIndexer::from_node_specs(specs_a.iter().copied()));
         let (regret, strategy) = build_filled_tables(&idx_a, &specs_a);
         let bucket = fake_bucket_blake3(0x33);
-        let fp_a = DenseLayoutFingerprint::from_indexer(&idx_a, bucket);
+        let fp_a = DenseLayoutFingerprint::from_indexer(&idx_a, bucket, 0);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("dense.ckpt");
@@ -669,7 +683,7 @@ mod tests {
             spec(StreetTag::Turn, 2, 2),
         ];
         let idx_b = Arc::new(NlheDenseIndexer::from_node_specs(specs_b.iter().copied()));
-        let fp_b = DenseLayoutFingerprint::from_indexer(&idx_b, bucket);
+        let fp_b = DenseLayoutFingerprint::from_indexer(&idx_b, bucket, 0);
 
         let err = load_dense_checkpoint(&path, &fp_b, idx_b).unwrap_err();
         assert!(
@@ -695,8 +709,8 @@ mod tests {
 
         let (regret, strategy) = build_filled_tables(&idx_a, &specs_a);
         let bucket = fake_bucket_blake3(0x44);
-        let fp_a = DenseLayoutFingerprint::from_indexer(&idx_a, bucket);
-        let fp_b = DenseLayoutFingerprint::from_indexer(&idx_b, bucket);
+        let fp_a = DenseLayoutFingerprint::from_indexer(&idx_a, bucket, 0);
+        let fp_b = DenseLayoutFingerprint::from_indexer(&idx_b, bucket, 0);
         assert_ne!(
             fp_a.action_count_blake3, fp_b.action_count_blake3,
             "action_count hash 必须区分两种布局"
@@ -713,13 +727,56 @@ mod tests {
         );
     }
 
+    /// ante 进指纹：同一棵树 / 同桶表，ante=0 与 ante≠0 的指纹必须不同（ante 常不改树形状，
+    /// 不区分就会静默串读），且 ante≠0 的 checkpoint 用 ante=0 的期望指纹加载必须被拒。
+    /// ante=0 的 hash 须与只 feed 节点序列的历史公式逐位相同（既有 checkpoint / crop 不失效）。
+    #[test]
+    fn dense_checkpoint_fingerprint_distinguishes_ante() {
+        let specs = [spec(StreetTag::Preflop, 4, 3), spec(StreetTag::Flop, 5, 6)];
+        let idx = Arc::new(NlheDenseIndexer::from_node_specs(specs.iter().copied()));
+        let bucket = fake_bucket_blake3(0x45);
+        let fp_0 = DenseLayoutFingerprint::from_indexer(&idx, bucket, 0);
+        let fp_10 = DenseLayoutFingerprint::from_indexer(&idx, bucket, 10);
+        let fp_20 = DenseLayoutFingerprint::from_indexer(&idx, bucket, 20);
+        assert_ne!(fp_0.action_count_blake3, fp_10.action_count_blake3);
+        assert_ne!(fp_10.action_count_blake3, fp_20.action_count_blake3);
+        assert_eq!(
+            fp_10,
+            DenseLayoutFingerprint::from_indexer(&idx, bucket, 10)
+        );
+
+        let mut legacy = Hasher::new();
+        for id in 0..idx.num_nodes() as NodeId {
+            let m = idx.node_meta(id);
+            legacy.update(&[m.street as u8]);
+            legacy.update(&m.bucket_count.to_le_bytes());
+            legacy.update(&[m.action_count]);
+        }
+        let legacy: [u8; 32] = legacy.finalize().into();
+        assert_eq!(
+            fp_0.action_count_blake3, legacy,
+            "ante=0 指纹须与历史公式相同"
+        );
+
+        let (regret, strategy) = build_filled_tables(&idx, &specs);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("dense.ckpt");
+        save_dense_checkpoint(&path, &fp_10, &meta_sample(), &regret, &strategy).expect("save");
+        let err = load_dense_checkpoint(&path, &fp_0, Arc::clone(&idx)).unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::Corrupted { .. }),
+            "ante 不符应被拒，got {err:?}"
+        );
+        load_dense_checkpoint(&path, &fp_10, idx).expect("同 ante 应能加载");
+    }
+
     /// trailer：翻一个 body byte → BLAKE3 mismatch → Corrupted。
     #[test]
     fn dense_checkpoint_rejects_corrupted_body() {
         let specs = [spec(StreetTag::Preflop, 4, 3), spec(StreetTag::Flop, 5, 6)];
         let idx = Arc::new(NlheDenseIndexer::from_node_specs(specs.iter().copied()));
         let (regret, strategy) = build_filled_tables(&idx, &specs);
-        let fp = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0x55));
+        let fp = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0x55), 0);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("dense.ckpt");
@@ -743,7 +800,7 @@ mod tests {
     fn dense_checkpoint_file_not_found() {
         let specs = [spec(StreetTag::Preflop, 4, 3)];
         let idx = Arc::new(NlheDenseIndexer::from_node_specs(specs.iter().copied()));
-        let fp = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0x66));
+        let fp = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0x66), 0);
         let err =
             load_dense_checkpoint(Path::new("/nonexistent/dense.ckpt"), &fp, idx).unwrap_err();
         assert!(
@@ -758,7 +815,7 @@ mod tests {
         let specs = [spec(StreetTag::Preflop, 4, 3), spec(StreetTag::Flop, 5, 6)];
         let idx = Arc::new(NlheDenseIndexer::from_node_specs(specs.iter().copied()));
         let (regret, strategy) = build_filled_tables(&idx, &specs);
-        let fp = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0x77));
+        let fp = DenseLayoutFingerprint::from_indexer(&idx, fake_bucket_blake3(0x77), 0);
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("dense.ckpt");

@@ -259,6 +259,7 @@ fn config_to_proto(config: &TableConfig) -> proto::TableConfig {
         big_blind: config.big_blind.as_u64(),
         ante: config.ante.as_u64(),
         button_seat: config.button_seat.0 as u32,
+        ante_exempt: u32::from(config.ante_exempt),
     }
 }
 
@@ -282,6 +283,12 @@ fn config_from_proto(config: &proto::TableConfig) -> Result<TableConfig, History
             config.button_seat, config.n_seats
         )));
     }
+    if config.ante_exempt >> config.n_seats != 0 {
+        return Err(HistoryError::Corrupted(format!(
+            "ante_exempt {:#x} has bits beyond n_seats {}",
+            config.ante_exempt, config.n_seats
+        )));
+    }
     Ok(TableConfig {
         n_seats: config.n_seats as u8,
         starting_stacks: config
@@ -292,6 +299,8 @@ fn config_from_proto(config: &proto::TableConfig) -> Result<TableConfig, History
         small_blind: ChipAmount::new(config.small_blind),
         big_blind: ChipAmount::new(config.big_blind),
         ante: ChipAmount::new(config.ante),
+        // 上面已校验高位为 0（n_seats ≤ 9）→ 截到 u16 无损。
+        ante_exempt: config.ante_exempt as u16,
         button_seat: seat_from_u32(config.button_seat, "button_seat")?,
     })
 }
@@ -442,6 +451,9 @@ mod proto {
         pub ante: u64,
         #[prost(uint32, tag = "6")]
         pub button_seat: u32,
+        /// 不交 ante 的座位 bitmask（0 = 人人都交；proto3 默认值不编码 → 旧 history 字节不变）。
+        #[prost(uint32, tag = "7")]
+        pub ante_exempt: u32,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]

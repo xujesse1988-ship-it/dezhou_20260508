@@ -285,6 +285,11 @@ struct Request {
     num_seats: u8,
     small_blind: u64,
     big_blind: u64,
+    /// 每座 ante（OpenPoker 单位；缺省 0 = 无 ante，旧 driver 不带）。须按同一 scale 对上
+    /// blueprint 的 ante（`train_cfr --ante`），否则兜底 `ante_mismatch`。短桌幻影座不交
+    /// （[`exempt_phantom_antes`]）。
+    #[serde(default)]
+    ante: u64,
     #[serde(default)]
     actions: Vec<HistAction>,
     valid: ValidActions,
@@ -805,6 +810,9 @@ fn prewarm_inner(
     let scale = solver_bb / req.big_blind;
     if req.small_blind * scale != solver_cfg.small_blind.as_u64() {
         return mk("prewarm:skip:blind_ratio_mismatch".into());
+    }
+    if req.ante.checked_mul(scale) != Some(solver_cfg.ante.as_u64()) {
+        return mk("prewarm:skip:ante_mismatch".into());
     }
     let hole = match (parse_card(&req.hole[0]), parse_card(&req.hole[1])) {
         (Ok(a), Ok(b)) => [a, b],
@@ -1391,7 +1399,10 @@ fn lockstep_replay(
     my_turn: Option<SeatId>,
     limp_as_fold: bool,
 ) -> Result<LockstepOk, LockstepErr> {
-    let mut real = poker::GameState::new(solver_cfg, REAL_REPLAY_SEED);
+    // 真实侧（按占底池比例翻译尺寸用）：短桌幻影座不交 ante，底池与真实桌一致。
+    let mut real_cfg = solver_cfg.clone();
+    exempt_phantom_antes(&mut real_cfg, smap);
+    let mut real = poker::GameState::new(&real_cfg, REAL_REPLAY_SEED);
     let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
     let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
     // synced_node 在每步**前**捕获（abs 只在 lockstep_step 内推进）→ 失败时 = 断点前最后对齐节点
@@ -1830,6 +1841,10 @@ fn decide_with(
     // sb 必须按同一 scale 对齐 solver sb（默认 50；10×5=50）—— 否则盲注比例非标准、口径不一致。
     if req.small_blind * scale != solver_cfg.small_blind.as_u64() {
         return safe_fallback(&req.valid, "blind_ratio_mismatch");
+    }
+    // ante 同理按 scale 对上 blueprint 的 ante（blueprint 无 ante 时请求也须无 ante）。
+    if req.ante.checked_mul(scale) != Some(solver_cfg.ante.as_u64()) {
+        return safe_fallback(&req.valid, "ante_mismatch");
     }
 
     let hole = match (parse_card(&req.hole[0]), parse_card(&req.hole[1])) {
@@ -4037,6 +4052,7 @@ fn real_stacks_config(
     smap: &SeatMap,
 ) -> Result<TableConfig, String> {
     let mut cfg = solver_cfg.clone();
+    exempt_phantom_antes(&mut cfg, smap);
     if req.stacks.is_empty() {
         return Ok(cfg); // 无真栈 → 对称 100BB（仍是合法的真栈解，只是不利用码深）。
     }
@@ -4058,6 +4074,14 @@ fn real_stacks_config(
     Ok(cfg)
 }
 
+/// 短桌幻影座不交 ante：真实桌上没有这几份（blueprint 树按满桌人人交 ante 训的，影子不改）。
+/// 无 ante 时不动 config（`ante_exempt` 保持 0，与旧行为逐位相同）。
+fn exempt_phantom_antes(cfg: &mut TableConfig, smap: &SeatMap) {
+    if cfg.ante > ChipAmount::ZERO {
+        cfg.ante_exempt = smap.phantoms.iter().fold(0, |m, &t| m | 1u16 << t);
+    }
+}
+
 /// 手内稳定的 subgame solve 基 seed：hash(hole, button, my_seat, num_seats, blinds, base_seed)
 /// —— **不含 actions / board**，故同一手多次决策同 seed → [`ResolveRoot::RoundStart`] 的街索引
 /// ordinal 下同街多决策共享字节相同的 solve（§6 #2 一致性）。`n_seats` = solver 座位数（只用来判
@@ -4070,6 +4094,9 @@ fn hand_seed_for(req: &Request, base_seed: u64, n_seats: usize) -> u64 {
     hasher.update(&[req.button_seat, req.my_seat, req.num_seats]);
     hasher.update(&req.small_blind.to_le_bytes());
     hasher.update(&req.big_blind.to_le_bytes());
+    if req.ante != 0 {
+        hasher.update(&req.ante.to_le_bytes()); // 无 ante 不掺、保旧 seed。
+    }
     if !req.dealt_seats.is_empty() && req.dealt_seats.len() != n_seats {
         // 短桌：占座不同 = 不同局面（满桌不掺、保旧 seed byte-equal）。
         hasher.update(&req.dealt_seats);
@@ -4602,6 +4629,10 @@ struct Args {
     /// 训练时的 `train_cfr --seats` 一致（不符 → 树 layout 指纹不符 → 加载报错）；OpenPoker 桌面
     /// `num_seats` 须等于它（否则 `fallback:not_{N}max`）。
     seats: u8,
+    /// `--ante <chips>`：blueprint 的每座 ante（solver 单位，BB = 100；默认 0）。须与训练时的
+    /// `train_cfr --ante` 相同（不符 → layout 指纹不符 → 加载报错）；决策请求的 ante 按盲注同一
+    /// scale 须对上它（否则 `fallback:ante_mismatch`）。
+    ante: u64,
     seed: u64,
     /// 缺口②实时搜索：`Some` = `--search` 开（postflop 触发面 re-solve 真码深子博弈）；`None`
     /// （默认）= 纯 blueprint（旧行为 byte-equal）。其余 search 字段由 `--search-*` flag 填。
@@ -4667,6 +4698,13 @@ struct ReadyLine {
     /// ready 行与旧版逐字节相同）。
     #[serde(skip_serializing_if = "Option::is_none")]
     blueprint_keep_through: Option<String>,
+    /// blueprint 的每座 ante（solver 单位，BB = 100）；0 不写（ready 行与旧版逐字节相同）。
+    #[serde(skip_serializing_if = "is_zero")]
+    ante: u64,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// `--reshape` → 树定义：与 `train_cfr` / `nlhe_dense_crop` 共用 [`six_max_reshape`]，保证加载时
@@ -4685,19 +4723,20 @@ fn reshape_profile(
         .ok_or_else(|| format!("unknown reshape {reshape} (expected {SIX_MAX_RESHAPE_NAMES})"))
 }
 
-/// 按 `(--reshape, --postflop-cap, --seats)` 重建 blueprint game（树 + 抽象 + 桶表）：桌面 =
-/// `TableConfig::n_max_at_bb(seats, 100)`，与 `train_cfr --profile six-max --seats <N>
-/// --stack-bb 100` 同一定义（6 座 == 旧 `default_6max_100bb()`）。
+/// 按 `(--reshape, --postflop-cap, --seats, --ante)` 重建 blueprint game（树 + 抽象 + 桶表）：桌面
+/// = `TableConfig::n_max_at_bb(seats, 100).with_ante(ante)`，与 `train_cfr --profile six-max
+/// --seats <N> --stack-bb 100 --ante <ante>` 同一定义（6 座无 ante == 旧 `default_6max_100bb()`）。
 fn build_game(
     table: Arc<BucketTable>,
     reshape: &str,
     cap: u8,
     seats: u8,
+    ante: u64,
 ) -> Result<SimplifiedNlheGame, String> {
     let (abs, rules) = reshape_profile(reshape, cap)?;
     SimplifiedNlheGame::new_with_abstraction(
         table,
-        TableConfig::n_max_at_bb(seats, SOLVER_STACK_BB),
+        TableConfig::n_max_at_bb(seats, SOLVER_STACK_BB).with_ante(ChipAmount::new(ante)),
         abs,
         rules,
     )
@@ -4772,13 +4811,14 @@ fn run() -> Result<(), String> {
         &args.reshape,
         args.postflop_cap,
         args.seats,
+        args.ante,
     )?;
     // blueprint 访问面（Blueprint doc）：完整 ckpt 或 crop 文件，二者都用同一 game 校验 layout 指纹。
     let blueprint = load_blueprint(&args.checkpoint, game, args.cropped).map_err(|e| {
         format!(
-            "{e}\n（若 blueprint 训练时的座位数与 --seats {} 不同、或 --reshape / --postflop-cap / \
-             --bucket-table 不同，树的 layout 指纹不符，必然加载失败）",
-            args.seats
+            "{e}\n（若 blueprint 训练时的座位数与 --seats {} 不同、ante 与 --ante {} 不同、或 --reshape / \
+             --postflop-cap / --bucket-table 不同，树的 layout 指纹不符，必然加载失败）",
+            args.seats, args.ante
         )
     })?;
     let game = blueprint.game();
@@ -4834,6 +4874,7 @@ fn run() -> Result<(), String> {
         search: search_rt.is_some(),
         blueprint_keep_through: matches!(blueprint, Blueprint::Cropped { .. })
             .then(|| format!("{:?}", blueprint.keep_through())),
+        ante: game.table_config().ante.as_u64(),
     };
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
@@ -5039,6 +5080,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut reshape = "preopen".to_string();
     let mut postflop_cap = 3u8;
     let mut seats = DEFAULT_SEATS;
+    let mut ante = 0u64;
     let mut seed: u64 = 0;
     // 缺口② 实时搜索 flag（仅 --search 开时打包成 SubgameSearchConfig）。
     let mut search_on = false;
@@ -5099,6 +5141,18 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     return Err(format!("--seats 须在 [3,9]，得 {v}"));
                 }
                 seats = v;
+            }
+            "--ante" => {
+                let v: u64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad ante: {e}"))?;
+                // 与 train_cfr --ante 同口径（solver chips，BB = 100）同上限。
+                if v > 100 {
+                    return Err(format!(
+                        "--ante 是 solver 筹码（BB = 100），须 ≤ 100，得 {v}"
+                    ));
+                }
+                ante = v;
             }
             "--seed" => {
                 let raw = next_val(&mut it, &arg)?;
@@ -5485,6 +5539,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         reshape,
         postflop_cap,
         seats,
+        ante,
         seed,
         search,
         search_street_iters,
@@ -5730,6 +5785,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -5848,6 +5904,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -5914,6 +5971,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![HistAction {
                 seat: 3,
                 action: "call".into(),
@@ -5984,6 +6042,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: (0..limps).map(|k| hist(3 + k, "call", Some(20))).collect(),
             valid: ValidActions {
                 can_check,
@@ -6109,6 +6168,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions,
             valid: if board.is_empty() {
                 full_valid()
@@ -6566,6 +6626,7 @@ mod tests {
             num_seats: 9,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: acts,
             valid: ValidActions {
                 can_check: false,
@@ -7024,6 +7085,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -7465,6 +7527,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 hist(3, "fold", None),
                 hist(4, "raise", Some(50)),
@@ -7522,6 +7585,7 @@ mod tests {
             num_seats: 4,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![],
             valid: ValidActions {
                 can_check: true,
@@ -7559,6 +7623,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -8271,6 +8336,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions,
             valid: ValidActions {
                 can_check: false,
@@ -9097,6 +9163,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -9345,6 +9412,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![HistAction {
                 seat: 3,
                 action: "call".into(),
@@ -9406,6 +9474,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -9490,6 +9559,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -9600,6 +9670,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![hist(3, "fold", None), hist(4, "fold", None)],
             valid: full_valid(),
             stacks: vec![],
@@ -9625,6 +9696,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             valid: full_valid(),
             stacks: vec![],
         };
@@ -9652,6 +9724,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             valid: full_valid(),
             stacks: vec![],
         };
@@ -9697,6 +9770,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             valid: full.valid.clone(),
             stacks: vec![],
         };
@@ -9777,6 +9851,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 hist(3, "fold", None),
                 hist(4, "fold", None),
@@ -9806,6 +9881,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             valid: full_valid(),
             stacks: vec![],
         };
@@ -9833,6 +9909,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             valid: ValidActions {
                 can_check: true,
                 ..full_valid()
@@ -9854,6 +9931,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![],
             valid: full_valid(),
             stacks: vec![],
@@ -9875,6 +9953,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             valid: full_valid(),
             stacks: vec![],
         };
@@ -9894,6 +9973,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![],
             valid: full_valid(),
             stacks: vec![],
@@ -9916,6 +9996,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 hist(5, "fold", None),
                 hist(0, "fold", None),
@@ -10124,6 +10205,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -10683,6 +10765,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions,
             valid,
             stacks: vec![],
@@ -11265,6 +11348,7 @@ mod tests {
             num_seats: n,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![],
             valid: full_valid(),
             stacks: vec![],
@@ -11465,6 +11549,169 @@ mod tests {
         assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
 
+    /// ante：① `--ante` 解析（solver 筹码，上限 100）；② 请求 ante 按盲注同一 scale 须对上 blueprint
+    /// 的 ante，否则兜底 `ante_mismatch`（两个方向都拦）；③ 短桌幻影座在真实侧不交 ante：8 座
+    /// ante 1BB 的 blueprint、4 人桌 → 真实开局底池 = 4 份 ante + 盲注，blueprint 影子仍是 8 份。
+    #[test]
+    fn ante_request_and_phantom_exemption() {
+        let parse = |extra: &[&str]| {
+            parse_args_from(
+                ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                    .iter()
+                    .chain(extra)
+                    .map(|s| s.to_string()),
+            )
+        };
+        assert_eq!(parse(&[]).unwrap().ante, 0);
+        assert_eq!(parse(&["--ante", "100"]).unwrap().ante, 100);
+        assert!(parse(&["--ante", "101"]).is_err());
+
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let g_ante =
+            build_game(Arc::clone(&table), "all-1pot", 2, 8, 100).expect("8-max ante game");
+        let g_plain = build_game(table, "all-1pot", 2, 8, 0).expect("8-max game");
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        // OpenPoker 盲注 10/20 → scale 5：ante 20 ↔ solver 100（1BB）。
+        let with_ante = |ante: u64| Request {
+            ante,
+            ..n_req(8, 0, 3, vec![])
+        };
+        let src = |g: &SimplifiedNlheGame, req: &Request| {
+            decide(
+                g,
+                &g.abstraction().clone(),
+                &uniform,
+                req,
+                0,
+                None,
+                &mut SubgameSolveCache::new(),
+            )
+            .source
+        };
+        assert_eq!(src(&g_ante, &with_ante(0)), "fallback:ante_mismatch");
+        assert_eq!(src(&g_ante, &with_ante(10)), "fallback:ante_mismatch");
+        assert_eq!(src(&g_plain, &with_ante(20)), "fallback:ante_mismatch");
+        assert_eq!(src(&g_ante, &with_ante(20)), "blueprint");
+        assert_eq!(src(&g_plain, &with_ante(0)), "blueprint");
+
+        // 4 人桌（button 0，发牌 0..=3）：幻影 = 树座 3..=6（UTG 起先弃），真实侧这 4 座不交 ante。
+        let mut short = with_ante(20);
+        short.dealt_seats = vec![0, 1, 2, 3];
+        short.my_seat = 3;
+        let solver_cfg = g_ante.table_config().clone();
+        let smap = seat_map(&short, 8).expect("seat_map");
+        let real_cfg = real_stacks_config(&short, &solver_cfg, 5, &smap).expect("real cfg");
+        let phantom_mask = smap.phantoms.iter().fold(0u16, |m, &t| m | 1 << t);
+        assert_eq!(phantom_mask.count_ones(), 4);
+        assert_eq!(real_cfg.ante_exempt, phantom_mask);
+        assert_eq!(
+            GameState::new(&real_cfg, 1).pot(),
+            ChipAmount::new(4 * 100 + 150)
+        );
+        assert_eq!(
+            GameState::new(&solver_cfg, 1).pot(),
+            ChipAmount::new(8 * 100 + 150),
+            "blueprint 影子按满桌 8 份 ante"
+        );
+        // 无 ante 的 blueprint：不设豁免（旧行为逐位相同）。
+        let plain_cfg = g_plain.table_config().clone();
+        let mut short0 = short.clone();
+        short0.ante = 0;
+        let cfg0 = real_stacks_config(&short0, &plain_cfg, 5, &smap).expect("real cfg");
+        assert_eq!(cfg0.ante_exempt, 0);
+        // 短桌 hero 首次决策照常走 blueprint（影子与真实侧同步推进幻影弃牌）。
+        assert_eq!(src(&g_ante, &short), "blueprint");
+
+        // 翻牌实时搜索：UTG（op 3）按真实底池开 1pot（4 份 ante 80 + 盲注 30 + 跟注 20 → 到 150），
+        // BTN / SB 弃、BB 跟 → 翻牌 BB（hero）先动。真实侧按真实底池能对上 1pot 档、照常锚定搜索。
+        let mut flop = short.clone();
+        flop.my_seat = 2;
+        flop.hole = vec!["Qs".into(), "Qd".into()];
+        flop.board = vec!["7h".into(), "2c".into(), "Ks".into()];
+        flop.actions = vec![
+            hist(3, "raise", Some(150)),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+            hist(2, "call", Some(150)),
+        ];
+        flop.valid = ValidActions {
+            can_check: true,
+            can_call: false,
+            can_raise: true,
+            min_raise: Some(20),
+            max_raise: Some(2000 - 20 - 150),
+        };
+        let rt_ante = rt(SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        });
+        let r = decide(
+            &g_ante,
+            &g_ante.abstraction().clone(),
+            &uniform,
+            &flop,
+            0xA7E,
+            Some(&rt_ante),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(
+            r.source == "search" || r.source.starts_with("search_giveup:unsolved"),
+            "{r:?}"
+        );
+        assert!(is_legal(&r, &flop.valid), "{r:?}");
+    }
+
+    /// `ante-flop2`（8 座、每人 1BB ante、开池只有 1/3pot）在 advisor 侧可用：盲注 10/20、ante 20
+    /// （scale 5）。① hero 在 UTG 首个行动、策略全压最后一档 → 开池到 90 = 4.5BB（solver 450 / 5）；
+    /// ② 真实 UTG 开 2.5BB（50）→ 影子映到 1/3pot 开池档，下一位 hero 照常走 blueprint、动作合法。
+    #[test]
+    fn ante_flop2_open_size_and_small_open_translation() {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let game = build_game(table, "ante-flop2", 2, 8, 100).expect("8-max ante-flop2 game");
+        let abs = game.abstraction().clone();
+        let last = |_i: &InfoSetId, n: usize| {
+            let mut p = vec![0.0; n];
+            p[n - 1] = 1.0;
+            p
+        };
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let mut req = Request {
+            ante: 20,
+            ..n_req(8, 0, 3, vec![])
+        };
+        let r = decide(
+            &game,
+            &abs,
+            &last,
+            &req,
+            0,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "blueprint", "{r:?}");
+        assert_eq!((r.action.as_str(), r.amount), ("raise", Some(90)), "{r:?}");
+
+        req.my_seat = 4;
+        req.actions = vec![hist(3, "raise", Some(50))];
+        let r = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "blueprint", "{r:?}");
+        assert!(is_legal(&r, &req.valid), "{r:?}");
+    }
+
     /// 桌面座位数 ≠ solver 座位数 → 显式兜底，标签带 solver 座位数（6 座仍是旧 `not_6max`）；
     /// 预热同口径 skip。
     #[test]
@@ -11650,7 +11897,7 @@ mod tests {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::new(200, 200, 200).expect("200/200/200"),
         ));
-        build_game(table, "all-1pot", 2, 9).expect("9-max game")
+        build_game(table, "all-1pot", 2, 9, 0).expect("9-max game")
     }
 
     /// 与 [`nine_max_test_game`] 同 reshape / cap / 桶表、只换座位数的 game（错配测试用）。
@@ -11658,7 +11905,7 @@ mod tests {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::new(200, 200, 200).expect("200/200/200"),
         ));
-        build_game(table, "all-1pot", 2, seats).expect("game")
+        build_game(table, "all-1pot", 2, seats, 0).expect("game")
     }
 
     /// 9-max fixture：训练 → 完整 ckpt + crop(keep_through=Flop, 不留 regret)。文件写到
@@ -11716,6 +11963,7 @@ mod tests {
             num_seats: 9,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions,
             valid,
             stacks: vec![],
@@ -12211,6 +12459,7 @@ mod tests {
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
+            ante_exempt: 0,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(0x47_5541_5244);
@@ -12472,6 +12721,7 @@ mod tests {
             num_seats: 9,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 ha(0, "fold", None),
                 ha(1, "raise", Some(50)),
@@ -12622,6 +12872,7 @@ mod tests {
             num_seats: 6,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions: vec![
                 hist(3, "fold", None),
                 hist(4, "fold", None),
@@ -12813,7 +13064,7 @@ mod tests {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::default_500_500_500(),
         ));
-        let game = build_game(table, "flop2-1pot", 4, 9).expect("9-max flop2-1pot cap4");
+        let game = build_game(table, "flop2-1pot", 4, 9, 0).expect("9-max flop2-1pot cap4");
         // 9 座 button=0：SB=1, BB=2, UTG=3 … CO=8。UTG..HJ 弃，CO(8，我方) 开到 70，BTN(0) 3bet 到 240，盲注弃。
         let mut actions: Vec<HistAction> = (3..8).map(|s| hist(s, "fold", None)).collect();
         actions.push(hist(8, "raise", Some(70)));
@@ -12828,6 +13079,7 @@ mod tests {
             num_seats: 9,
             small_blind: 10,
             big_blind: 20,
+            ante: 0,
             actions,
             valid: ValidActions {
                 can_check: false,

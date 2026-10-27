@@ -89,8 +89,9 @@ pub struct TreeNode {
 /// 影响）。`Default`（全关）与历史行为逐节点 byte-equal（守 240,096 / 719,764 节点）。
 #[derive(Copy, Clone, Debug)]
 pub struct BettingAbstractionRules {
-    /// A3 first-bet-small：0.5pot 只许作**首次进攻**（开池 `Bet`，或 preflop 越过 BB 的
-    /// 首个 `Raise`），任何 **re-raise**（本街已有进攻后）一律 1pot。`raises_on_street`
+    /// A3 first-bet-small：小于 1pot 的档（既有菜单都是 0.5pot，`ante-flop2` 的 preflop 是
+    /// 1/3pot）只许作**首次进攻**（开池 `Bet`，或 preflop 越过 BB 的首个 `Raise`），任何
+    /// **re-raise**（本街已有进攻后）一律 1pot。`raises_on_street`
     /// 感知（见 [`filter_actions`]）：postflop 行为与历史 byte-equal（postflop `Raise`
     /// 恒有前序进攻 → `raises>0` → 照旧删 0.5 reraise），但允许 preflop 菜单含 0.5 时
     /// 把它当 2.25BB 开池档（见 [`first_small_preopen_6max`]）。
@@ -109,7 +110,8 @@ pub struct BettingAbstractionRules {
     /// （[`BetRatio::FULL_POT`] = 3.5BB）。**仅 preflop 开池生效**：re-raise（`raises>0`）的档由
     /// `drop_small_reraise` 收到 1.0pot，postflop 一行不动。与 `drop_small_reraise` 叠加 →
     /// preflop 严格单档：开池 2.25BB、3bet+ 1.0pot。配 preflop`{0.5,1}` 菜单（见
-    /// [`first_small_preopen_small_6max`]）；菜单无 1.0pot 时本旗空转。`false` = 关（默认，
+    /// [`first_small_preopen_small_6max`]；`ante-flop2` 配 `{1/3,1}` 同理只留 1/3pot 开池，见
+    /// [`ante_flop2_6max`]）；菜单无 1.0pot 时本旗空转。`false` = 关（默认，
     /// 保持 [`first_small_preopen_6max`] 的双开池档行为，守 cross-check）。
     pub preflop_open_small_only: bool,
     /// 禁 preflop 首个进攻 AllIn（开池 all-in）。仅删 `raises_on_street == 0` 时的
@@ -258,6 +260,26 @@ pub fn flop2_1pot_6max(width_redirect: u8) -> (StreetActionAbstraction, BettingA
     (abs, rules)
 }
 
+/// ante 桌用的 [`flop2_1pot_6max`] 变体：**preflop 菜单 `{1/3, 1.0}`**，rules 在
+/// [`all_1pot_6max`] 之上再开 `preflop_open_small_only`，故 preflop = **开池只有 1/3pot**
+/// （删 1pot 开池）、3bet+ 1pot（`drop_small_reraise` 删 1/3pot re-raise）、禁非 SB limp
+/// （SB complete 保留）、无开池 all-in；flop `{0.5,1}`、turn / river `{1}` 与 `flop2-1pot` 相同。
+///
+/// 动机：每人 1BB ante 的 8 座桌开池前底池 9.5BB，1pot 开池要开到 11.5BB，远大于 ante 桌
+/// 常见的 3–5BB；1/3pot 开池 = 1 + (9.5 + 1) / 3 ≈ 4.5BB（SB 开池 ≈ 4.33BB）。档位按底池
+/// 比例定，换别的 ante / 座位数开池 BB 数会跟着变（无 ante 6 座 ≈ 1.83BB），专给 ante 桌用。
+///
+/// 同 [`first_small_preopen_1pot_6max`] 的理由另立一档、不改既有 reshape。
+pub fn ante_flop2_6max(width_redirect: u8) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let (_, mut rules) = all_1pot_6max(width_redirect);
+    rules.preflop_open_small_only = true;
+    let pre = ActionAbstractionConfig::new(vec![1.0 / 3.0, 1.0]).expect("preflop {1/3,1.0} 合法");
+    let one = || ActionAbstractionConfig::new(vec![1.0]).expect("{1.0} 单档合法");
+    let flop = ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("flop {0.5,1.0} 合法");
+    let abs = StreetActionAbstraction::per_street([pre, flop, one(), one()]);
+    (abs, rules)
+}
+
 /// `--profile six-max` 的 `--reshape <name>` → `(abstraction, rules)`。`train_cfr` 与
 /// `nlhe_dense_crop` 共用，保证裁切 / 加载时重建的树与训练时**同一**定义（dense ckpt 的
 /// layout 指纹仍会兜底校验）。未知名返回 `None`。
@@ -277,13 +299,14 @@ pub fn six_max_reshape(
         "preopen-1pot" => first_small_preopen_1pot_6max(width_redirect),
         "all-1pot" => all_1pot_6max(width_redirect),
         "flop2-1pot" => flop2_1pot_6max(width_redirect),
+        "ante-flop2" => ante_flop2_6max(width_redirect),
         _ => return None,
     })
 }
 
 /// `six_max_reshape` 接受的名字（错误提示用）。
 pub const SIX_MAX_RESHAPE_NAMES: &str =
-    "none | nolimp | preopen | preopen-small | preopen-1pot | all-1pot | flop2-1pot";
+    "none | nolimp | preopen | preopen-small | preopen-1pot | all-1pot | flop2-1pot | ante-flop2";
 
 /// S6 实时搜索深码档（`realtime_search_openpoker_exec` §2.1 / 缺口③）：**全街单一 {1pot}**
 /// 下注菜单——每决策点只剩 `{fold, check/call, bet/raise 1pot, all-in}`。fold/check/call/all-in
@@ -894,7 +917,9 @@ fn filter_actions(
         .filter(|a| {
             if rules.drop_small_reraise && raises_on_street > 0 {
                 if let AbstractAction::Raise { ratio_label, .. } = a {
-                    if *ratio_label == BetRatio::HALF_POT {
+                    // Any sub-pot ratio is the "small" slot: 0.5pot in every legacy menu
+                    // (byte-equal), 1/3pot in `ante-flop2`.
+                    if ratio_label.as_milli() < BetRatio::FULL_POT.as_milli() {
                         return false;
                     }
                 }
@@ -1319,6 +1344,102 @@ mod tests {
         );
     }
 
+    /// 结构守门：`ante-flop2`（[`ante_flop2_6max`]，8 座 100BB 每人 1BB ante）。① preflop 加注档
+    /// ⊆ {1/3, 1}pot，且同一节点不会两档并存（开池只有 1/3pot、3bet+ 只有 1pot），两档都出现；
+    /// ② fold-chain 上 UTG..BTN 开池 = {Fold, 1/3pot}（无 limp、无 1pot 开池、无开池 AllIn），
+    /// SB complete 保留；③ postflop 菜单同 `flop2-1pot`（flop 加注 1pot、首注 ⊆ {0.5,1}，
+    /// turn / river 只 1pot）；④ `six_max_reshape("ante-flop2")` 分派到本函数。
+    #[test]
+    fn reshape_ante_flop2_small_open_only() {
+        let third = BetRatio::from_f64(1.0 / 3.0).expect("1/3 合法");
+        let cfg = TableConfig::n_max_at_bb(8, 100).with_ante(ChipAmount::new(100));
+        let (abs, rules) = ante_flop2_6max(4);
+        let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+
+        let (mut opens, mut reraises) = (0usize, 0usize);
+        for id in 0..t.num_nodes() as NodeId {
+            let node = t.node(id);
+            let sized: Vec<(bool, BetRatio)> = node
+                .legal_actions
+                .iter()
+                .filter_map(|a| match a {
+                    AbstractActionTag::Bet(r) => Some((true, *r)),
+                    AbstractActionTag::Raise(r) => Some((false, *r)),
+                    _ => None,
+                })
+                .collect();
+            let has = |r: BetRatio| sized.iter().any(|&(_, x)| x == r);
+            match node.street {
+                StreetTag::Preflop => {
+                    assert!(
+                        sized
+                            .iter()
+                            .all(|&(b, r)| !b && (r == third || r == BetRatio::FULL_POT)),
+                        "ante-flop2：preflop node {id} 档位越出 {{1/3,1}} {:?}",
+                        node.legal_actions
+                    );
+                    assert!(
+                        !(has(third) && has(BetRatio::FULL_POT)),
+                        "ante-flop2：preflop node {id} 开池 / 再加注档并存 {:?}",
+                        node.legal_actions
+                    );
+                    opens += usize::from(has(third));
+                    reraises += usize::from(has(BetRatio::FULL_POT));
+                }
+                StreetTag::Flop => assert!(
+                    sized
+                        .iter()
+                        .all(|&(b, r)| r == BetRatio::FULL_POT || (b && r == BetRatio::HALF_POT)),
+                    "ante-flop2：flop node {id} 档位错 {:?}",
+                    node.legal_actions
+                ),
+                StreetTag::Turn | StreetTag::River => assert!(
+                    sized.iter().all(|&(_, r)| r == BetRatio::FULL_POT),
+                    "ante-flop2：{:?} node {id} 出现非 1pot 档 {:?}",
+                    node.street,
+                    node.legal_actions
+                ),
+            }
+        }
+        assert!(
+            opens > 0 && reraises > 0,
+            "ante-flop2：preflop 两档都应出现"
+        );
+
+        let mut id = t.root_id();
+        for seat in [3u8, 4, 5, 6, 7, 0] {
+            let node = t.node(id);
+            assert_eq!(
+                node.player_acting, seat,
+                "ante-flop2：fold-chain 行动顺序错"
+            );
+            assert_eq!(
+                node.legal_actions.to_vec(),
+                vec![AbstractActionTag::Fold, AbstractActionTag::Raise(third)],
+                "ante-flop2：seat {seat} 开池只应有 Fold / 1/3pot"
+            );
+            id = match node.children[0] {
+                Child::Decision(next) => next,
+                Child::Terminal => panic!("ante-flop2：seat {seat} fold 后不应终局"),
+            };
+        }
+        let sb = t.node(id);
+        assert_eq!(sb.player_acting, 1, "ante-flop2：fold 到 SB");
+        assert!(
+            sb.legal_actions.contains(&AbstractActionTag::Call)
+                && sb.legal_actions.contains(&AbstractActionTag::Raise(third)),
+            "ante-flop2：SB 应可 complete / 1/3pot 开池 {:?}",
+            sb.legal_actions
+        );
+
+        let (d_abs, d_rules) = six_max_reshape("ante-flop2", 4).expect("ante-flop2 已注册");
+        assert_eq!(
+            PublicBettingTree::build_with_rules(&cfg, &d_abs, d_rules).num_nodes(),
+            t.num_nodes(),
+            "six_max_reshape 分派须指向 ante_flop2_6max"
+        );
+    }
+
     /// 9-max 位置结构守门（`train_cfr --seats 9`）：`no_open_limp` / SB complete 按
     /// `(seat - button) % n_seats` 现算，9 座下须仍正确。沿 fold-chain 走 preflop：首行动 =
     /// seat 3（UTG），seat 3..8 + seat 0（BTN）开池都无 limp Call 且无开池 AllIn；fold 到
@@ -1398,6 +1519,7 @@ mod tests {
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
+            ante_exempt: 0,
             button_seat: crate::core::SeatId(0),
         };
         let (abs, rules) = deep_single_pot();

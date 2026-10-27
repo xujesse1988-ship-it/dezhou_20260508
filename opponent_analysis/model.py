@@ -47,6 +47,9 @@ class RawHand:
     source_file: str = ""
     # Seats the source left out of final_stacks (left mid-hand); allowed only if they folded.
     missing_final: list[int] = field(default_factory=list)
+    # Per-seat ante, posted by every dealt seat before the blinds: counts toward the pot and the
+    # seat's total commitment but not toward the street's bet. 0 = no ante.
+    ante: int = 0
 
 
 @dataclass

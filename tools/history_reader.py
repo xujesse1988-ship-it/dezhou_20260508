@@ -76,6 +76,7 @@ TABLE_CONFIG_SCHEMA = {
     4: ("big_blind", "varint", "u64"),
     5: ("ante", "varint", "u64"),
     6: ("button_seat", "varint", "u32"),
+    7: ("ante_exempt", "varint", "u32"),
 }
 
 RECORDED_ACTION_SCHEMA = {
@@ -231,6 +232,7 @@ def _normalize_history(decoded: dict[str, Any]) -> dict[str, Any]:
             "big_blind": cfg.get("big_blind", 0),
             "ante": cfg.get("ante", 0),
             "button_seat": cfg.get("button_seat", 0),
+            **({"ante_exempt": cfg["ante_exempt"]} if cfg.get("ante_exempt") else {}),
         },
         "seed": decoded.get("seed", 0),
         "actions": normalized_actions,

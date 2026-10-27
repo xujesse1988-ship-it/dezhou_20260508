@@ -14,10 +14,13 @@ from opponent_analysis.platforms import detect_platform
 from opponent_analysis.report import Config, analyze
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "data", "wopo_hh_2026_10_16.jsonl")
+# Same session rewritten with a 2-chip ante per dealt seat (blinds 1/2); the driver's --selftest
+# produces it and checks it is still byte-identical.
+ANTE_FIXTURE = os.path.join(os.path.dirname(__file__), "data", "wopo_hh_ante_2026_10_27.jsonl")
 
 
-def wopo_hh_rows():
-    with open(FIXTURE) as f:
+def wopo_hh_rows(path=FIXTURE):
+    with open(path) as f:
         return [json.loads(line) for line in f if line.strip()]
 
 
@@ -51,6 +54,28 @@ class Wopo(unittest.TestCase):
         self.assertEqual(h7.names, {0: "hero", 1: "Shaggyx", 2: "hsjwnbxj", 3: "Jjdjhej"})
         res = analyze(hands, "wopo", [], Config(min_hands=1, min_opps=1))
         self.assertEqual(res["hands"], 7)
+
+    def test_ante_hands_ingest(self):
+        rows = wopo_hh_rows(ANTE_FIXTURE)
+        self.assertTrue(all(r["ante"] == 2 for r in rows))
+        e = self.ingest(rows)
+        self.assertEqual(e["counts"], {"accepted": 7, "forced_unknown": 7})
+        hands = {h.hand_id: h for h in db.load_hands(self.db, "wopo")}
+        base_db = os.path.join(self.tmp.name, "base_db")
+        base_hh = os.path.join(self.tmp.name, "base.jsonl")
+        with open(base_hh, "w") as f:
+            for r in wopo_hh_rows():
+                f.write(json.dumps(r) + "\n")
+        db.ingest(base_db, base_hh)
+        for b in db.load_hands(base_db, "wopo"):
+            h = hands[b.hand_id]
+            # The ante is dead money: every dealt seat commits 2 more, decisions are unchanged.
+            self.assertEqual(h.committed, {s: c + 2 for s, c in b.committed.items()})
+            self.assertEqual(len(h.decisions), len(b.decisions))
+            for s in h.folded:
+                self.assertEqual(h.final_stacks[s] - h.start_stacks[s], -h.committed[s])
+            for d, bd in zip(h.decisions, b.decisions):
+                self.assertEqual(d.pot_before, bd.pot_before + 2 * len(h.dealt_seats))
 
     def test_live_follows_wopo_log(self):
         from opponent_analysis.live import Live

@@ -2332,6 +2332,9 @@ fn solve_cache_key(
     h.update(&rc.small_blind.as_u64().to_le_bytes());
     h.update(&rc.big_blind.as_u64().to_le_bytes());
     h.update(&rc.ante.as_u64().to_le_bytes());
+    if rc.ante_exempt != 0 {
+        h.update(&rc.ante_exempt.to_le_bytes());
+    }
     h.update(&[rc.button_seat.0]);
     h.update(&[root_state.street() as u8]);
     h.update(&[root_state.board().len() as u8]);
@@ -6098,6 +6101,7 @@ mod tests {
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
+            ante_exempt: 0,
             button_seat: SeatId(0),
         };
         SimplifiedNlheGame::new_with_abstraction(
@@ -6124,6 +6128,7 @@ mod tests {
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
+            ante_exempt: 0,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(seed);
@@ -6167,6 +6172,7 @@ mod tests {
             small_blind: ChipAmount::new(50),
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
+            ante_exempt: 0,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(seed);
