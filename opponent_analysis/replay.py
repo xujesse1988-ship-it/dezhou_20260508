@@ -115,6 +115,10 @@ def replay(raw: RawHand, heads_up_button_is_sb: bool) -> Hand:
             all_in.add(s)
     post(sb_seat, raw.sb)
     post(bb_seat, raw.bb)
+    for s in raw.posts:
+        if s not in dealt or s in (sb_seat, bb_seat):
+            raise ReplayError("bad_post", str(s))
+        post(s, raw.bb)
 
     street_i = 0
     current_bet = max(contrib.values())

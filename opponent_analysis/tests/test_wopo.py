@@ -17,6 +17,9 @@ FIXTURE = os.path.join(os.path.dirname(__file__), "data", "wopo_hh_2026_10_16.js
 # Same session rewritten with a 2-chip ante per dealt seat (blinds 1/2); the driver's --selftest
 # produces it and checks it is still byte-identical.
 ANTE_FIXTURE = os.path.join(os.path.dirname(__file__), "data", "wopo_hh_ante_2026_10_27.jsonl")
+# Four live ante-table hands (8 seats, 50/100, ante 100) where a new / returning player posted an
+# extra live big blind; the driver's --selftest produces it from tools/testdata/wopo_posts_*.jsonl.
+POSTS_FIXTURE = os.path.join(os.path.dirname(__file__), "data", "wopo_hh_posts_2026_10_28.jsonl")
 
 
 def wopo_hh_rows(path=FIXTURE):
@@ -76,6 +79,21 @@ class Wopo(unittest.TestCase):
                 self.assertEqual(h.final_stacks[s] - h.start_stacks[s], -h.committed[s])
             for d, bd in zip(h.decisions, b.decisions):
                 self.assertEqual(d.pot_before, bd.pot_before + 2 * len(h.dealt_seats))
+
+    def test_live_post_hands_ingest(self):
+        rows = wopo_hh_rows(POSTS_FIXTURE)
+        self.assertEqual([r["posts"] for r in rows], [[6], [2], [7], [4]])
+        e = self.ingest(rows)
+        self.assertEqual(e["counts"], {"accepted": 4, "forced_unknown": 4})
+        hands = {h.hand_id[-3:]: h for h in db.load_hands(self.db, "wopo")}
+        h = hands["132"]
+        # Seat 4 posted 100 on top of the 100 ante and folded to the open: both are dead money.
+        self.assertEqual(h.committed[4], 200)
+        self.assertEqual(h.final_stacks[4] - h.start_stacks[4], -200)
+        # The post is a live bet: the first decision after it sees the pot with it already in.
+        first = h.decisions[0]
+        self.assertEqual(first.pot_before, 8 * 100 + 50 + 100 + 100)
+        self.assertEqual(first.to_call, 100)
 
     def test_live_follows_wopo_log(self):
         from opponent_analysis.live import Live

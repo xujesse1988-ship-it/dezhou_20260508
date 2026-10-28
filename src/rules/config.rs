@@ -22,6 +22,10 @@ pub struct TableConfig {
     /// 映成「开局先弃牌」的幻影座，真实桌上没有这几份 ante，故按空座豁免（见
     /// `openpoker_advisor` 的真栈重放）。`ante == 0` 时不起作用。
     pub ante_exempt: u16,
+    /// 开局额外补一个 live 大盲的座位（bit i = 座 i），默认 0 = 没人补。实盘新进场 / 回座的玩家
+    /// 补盲：补的 `big_blind` 算本轮下注（跟注额照扣、没人加注时轮到他可以过牌，同大盲的选择权），
+    /// 行动顺序不变（不是 straddle）。只能标非盲注座（构造 [`crate::GameState`] 时校验）。
+    pub live_posts: u16,
     /// 起始按钮位（默认 `SeatId(0)`，由 D-022b 推出 SB=1 / BB=2）。
     pub button_seat: SeatId,
 }
@@ -53,6 +57,7 @@ impl TableConfig {
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
+            live_posts: 0,
             button_seat: SeatId(0),
         }
     }
@@ -67,6 +72,32 @@ impl TableConfig {
     /// 座 `seat` 是否交 ante（`ante == 0` 时也返回 true，此时交的是 0）。
     pub fn posts_ante(&self, seat: SeatId) -> bool {
         self.ante_exempt & (1u16 << seat.0) == 0
+    }
+
+    /// 座 `seat` 开局是否补 live 大盲（见 [`TableConfig::live_posts`]）。
+    pub fn posts_live_blind(&self, seat: SeatId) -> bool {
+        self.live_posts & (1u16 << seat.0) != 0
+    }
+
+    /// (SB 座, BB 座)，与 [`crate::GameState`] 同一推导：2 座 button = SB（D-022b-rev1），
+    /// 3 座以上 SB = button+1、BB = button+2（D-022b）。
+    pub fn blind_seats(&self) -> (SeatId, SeatId) {
+        let n = self.n_seats.max(1);
+        let next = |s: SeatId| SeatId((s.0 + 1) % n);
+        let sb = if n == 2 {
+            self.button_seat
+        } else {
+            next(self.button_seat)
+        };
+        (sb, next(sb))
+    }
+
+    /// `live_posts` 是否合法：不越过 `n_seats`、不标盲注座。
+    pub fn live_posts_valid(&self) -> bool {
+        let (sb, bb) = self.blind_seats();
+        self.live_posts >> self.n_seats == 0
+            && !self.posts_live_blind(sb)
+            && !self.posts_live_blind(bb)
     }
 
     /// 6-max 100BB 的默认配置：6 座、起始 100BB、SB=50、BB=100、ante=0、按钮在座位 0。
@@ -88,6 +119,7 @@ impl TableConfig {
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
+            live_posts: 0,
             button_seat: SeatId(0),
         }
     }

@@ -260,6 +260,7 @@ fn config_to_proto(config: &TableConfig) -> proto::TableConfig {
         ante: config.ante.as_u64(),
         button_seat: config.button_seat.0 as u32,
         ante_exempt: u32::from(config.ante_exempt),
+        live_posts: u32::from(config.live_posts),
     }
 }
 
@@ -289,7 +290,13 @@ fn config_from_proto(config: &proto::TableConfig) -> Result<TableConfig, History
             config.ante_exempt, config.n_seats
         )));
     }
-    Ok(TableConfig {
+    if config.live_posts >> config.n_seats != 0 {
+        return Err(HistoryError::Corrupted(format!(
+            "live_posts {:#x} has bits beyond n_seats {}",
+            config.live_posts, config.n_seats
+        )));
+    }
+    let out = TableConfig {
         n_seats: config.n_seats as u8,
         starting_stacks: config
             .starting_stacks
@@ -301,8 +308,16 @@ fn config_from_proto(config: &proto::TableConfig) -> Result<TableConfig, History
         ante: ChipAmount::new(config.ante),
         // 上面已校验高位为 0（n_seats ≤ 9）→ 截到 u16 无损。
         ante_exempt: config.ante_exempt as u16,
+        live_posts: config.live_posts as u16,
         button_seat: seat_from_u32(config.button_seat, "button_seat")?,
-    })
+    };
+    if !out.live_posts_valid() {
+        return Err(HistoryError::Corrupted(format!(
+            "live_posts {:#x} marks a blind seat",
+            config.live_posts
+        )));
+    }
+    Ok(out)
 }
 
 fn action_to_proto(action: &RecordedAction) -> proto::RecordedAction {
@@ -454,6 +469,9 @@ mod proto {
         /// 不交 ante 的座位 bitmask（0 = 人人都交；proto3 默认值不编码 → 旧 history 字节不变）。
         #[prost(uint32, tag = "7")]
         pub ante_exempt: u32,
+        /// 开局补 live 大盲的座位 bitmask（0 = 没人补；默认值不编码 → 旧 history 字节不变）。
+        #[prost(uint32, tag = "8")]
+        pub live_posts: u32,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]

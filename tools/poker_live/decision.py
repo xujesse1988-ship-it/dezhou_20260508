@@ -11,9 +11,10 @@ import time
 
 
 def make_request(hole, board, button_seat, my_seat, num_seats, small_blind, big_blind,
-                 actions, valid, stacks=None, dealt_seats=None, names=None, ante=0):
+                 actions, valid, stacks=None, dealt_seats=None, names=None, ante=0, posts=None):
     """advisor 决策请求（openpoker_advisor::Request）。键序固定（IPC 字节可比）：
-    stacks / dealt_seats / names 为 None、ante 为 0 时不带（advisor 退各自缺省行为）。"""
+    stacks / dealt_seats / names / posts 为 None（或空）、ante 为 0 时不带（advisor 退各自缺省行为）。
+    posts = 本手补 live 大盲的座位（wopo 新进场 / 回座补盲）。"""
     req = {
         "hole": hole,
         "board": board,
@@ -33,6 +34,8 @@ def make_request(hole, board, button_seat, my_seat, num_seats, small_blind, big_
         req["dealt_seats"] = dealt_seats
     if names:
         req["names"] = names  # json.dumps：int 座位键 → 字符串键，Rust BTreeMap<u8,_> 解析。
+    if posts:
+        req["posts"] = posts
     return req
 
 

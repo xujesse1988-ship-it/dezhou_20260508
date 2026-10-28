@@ -8,6 +8,10 @@ HandEngine 只吃规范化后的数值（服务器适配层负责把各家 JSON 
 ante（每座，桌面筹码）：开局每个发牌座先交 ante、再发盲注；ante 计入底池、不算本轮下注
 （快照的 bet 只含盲注），开局栈 = 快照栈 + bet + ante。交 ante / 盲注就全下的手不建模（作废）。
 
+补盲（wopo 新进场 / 回座的玩家）：非盲注座开局快照 bet = 1BB → 记为补盲座（posts）。补的是 live
+盲注：算本轮下注、行动顺序不变、没人加注时轮到他可以过牌（同大盲的选择权；wopo 实测 + 用户确认
+2026-10-28）。补盲就全下的手不建模（作废）；其余非盲注座开局有下注照旧作废。
+
 座位环序 = 座位号升序（button → SB → BB → …）。至少 3 人发牌（两人局盲注 / 行动序约定不同，
 advisor 只按 OpenPoker 的 HU 约定建模，这里直接不支持）。
 
@@ -65,6 +69,7 @@ class HandEngine:
         self.hole = None
         self.dealt = []         # 发牌座（升序 = 环序）
         self.sb_seat = self.bb_seat = None
+        self.posts = []         # 补盲座（升序）
         self.start_stack = {}   # 开局栈（交 ante / 盲注之前）
         self.stack = {}         # 当前剩余栈
         self.bet = {}           # 本街已投入
@@ -203,19 +208,22 @@ class HandEngine:
             bet = _int(info.get("bet"), f"bet[{s}]")
             want = self.sb if s == self.sb_seat else self.bb if s == self.bb_seat else 0
             if bet != want:
-                raise HandInvalid(f"blinds[{s}]:bet={bet},want={want}")
+                if want == 0 and bet == self.bb:
+                    self.posts.append(s)  # 补盲：live 1BB
+                else:
+                    raise HandInvalid(f"blinds[{s}]:bet={bet},want={want}")
             if info.get("folded"):
                 raise HandInvalid(f"folded_at_start:{s}")
-            if want and stack == 0:
-                # 盲注就全下：min-call / 加注口径各家规则不一，不建模。
-                raise HandInvalid(f"blind_all_in:{s}")
+            if bet and stack == 0:
+                # 盲注 / 补盲就全下：min-call / 加注口径各家规则不一，不建模。
+                raise HandInvalid(f"{'post' if s in self.posts else 'blind'}_all_in:{s}")
             if self.ante and stack == 0:
                 # 交 ante 就全下：交了多少看不出来（可能不足额），开局栈还原不了。
                 raise HandInvalid(f"ante_all_in:{s}")
             self.stack[s] = stack
             self.bet[s] = bet
             self.start_stack[s] = stack + bet + self.ante
-        self.pot = self.sb + self.bb + self.ante * len(dealt)
+        self.pot = self.sb + self.bb + self.bb * len(self.posts) + self.ante * len(dealt)
         self.max_bet = self.bb
         self.need_act = {s for s in dealt if self.stack[s] > 0}
         self.to_act = self._next_actor(self.bb_seat)
@@ -356,10 +364,12 @@ class HandEngine:
             final = {int(k): _int(v, f"final[{k}]") for k, v in (final_stacks or {}).items()}
         except (ValueError, HandInvalid) as e:
             return notes + [f"result_bad_final_stacks:{e}"]
-        if sorted(final) != self.dealt:
+        # wopo 把没发牌的座（sitting_out）也列进 final_stacks：多出来的座不算错，只核对发牌座。
+        if not set(self.dealt) <= set(final):
             notes.append(f"result_seats:{sorted(final)}!={self.dealt}")
-        elif sum(final.values()) != sum(self.start_stack.values()):
-            notes.append(f"result_not_conserved:{sum(final.values())}!={sum(self.start_stack.values())}")
+        elif sum(final[s] for s in self.dealt) != sum(self.start_stack.values()):
+            notes.append(f"result_not_conserved:{sum(final[s] for s in self.dealt)}"
+                         f"!={sum(self.start_stack.values())}")
         return notes
 
     def observe_record(self, amounts=False):
@@ -380,6 +390,7 @@ class HandEngine:
         没作废时调用：开局栈 / 动作 / 投入都是本引擎逐条核对过的。"""
         return {"hand_id": self.hand_id, "button_seat": self.button, "small_blind": self.sb,
                 "big_blind": self.bb, **({"ante": self.ante} if self.ante else {}),
+                **({"posts": list(self.posts)} if self.posts else {}),
                 "my_seat": self.hero, "dealt_seats": list(self.dealt),
                 "initial_stacks": {str(s): v for s, v in self.start_stack.items()},
                 "names": {str(s): n for s, n in self.names.items()},

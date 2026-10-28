@@ -27,6 +27,7 @@ message TableConfig {
     uint64 ante = 5;
     uint32 button_seat = 6;
     uint32 ante_exempt = 7;           // 不交 ante 的座位 bitmask（bit i = 座 i；0 = 人人都交）
+    uint32 live_posts = 8;            // 开局补 live 大盲的座位 bitmask（非盲注座；0 = 没人补）
 }
 
 message RecordedAction {

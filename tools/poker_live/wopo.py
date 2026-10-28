@@ -300,6 +300,8 @@ class WopoSession:
         """首个快照后：发牌座 + 开局栈（含盲注）+ 庄 / 盲位。"""
         hand = self.hand
         tag = {hand.button: "BTN", hand.sb_seat: "SB", hand.bb_seat: "BB"}
+        for s in hand.posts:
+            tag[s] = f"{tag[s]},补盲" if s in tag else "补盲"
         self._play("座位 " + " | ".join(
             f"{self._who(s)} {hand.start_stack[s]}" + (f"({tag[s]})" if s in tag else "")
             for s in hand.dealt))
@@ -366,7 +368,7 @@ class WopoSession:
                             stacks=hand.hand_start_stacks(placeholder=100 * hand.bb),
                             dealt_seats=list(dealt) if dealt else None,
                             names=dict(hand.names) if self.send_names else None,
-                            ante=hand.ante)
+                            ante=hand.ante, posts=list(hand.posts) or None)
 
     def _maybe_prewarm(self):
         """街起点预热（--search-prewarm）：hero 本手还能行动才发；发错无害（advisor 侧 skip）。"""

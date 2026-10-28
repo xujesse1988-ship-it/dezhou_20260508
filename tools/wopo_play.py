@@ -195,6 +195,11 @@ HH_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "opp
                           "tests", "data", "wopo_hh_2026_10_16.jsonl")
 # 同一会话改写成每人 ante 2（盲注 1/2）后的 --hh-log 输出（_selftest_ante 生成并核对）。
 HH_ANTE_FIXTURE = os.path.join(os.path.dirname(HH_FIXTURE), "wopo_hh_ante_2026_10_27.jsonl")
+# wopo ante-table（8 座、50/100、ante 100）2026-10-28 实盘里有人补盲的 4 手原始消息（修前全部作废），
+# 及其 --hh-log 输出（_selftest_posts 生成并核对；opponent_analysis 的补盲回放测试读它）。
+POSTS_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata",
+                             "wopo_posts_2026_10_28.jsonl")
+HH_POSTS_FIXTURE = os.path.join(os.path.dirname(HH_FIXTURE), "wopo_hh_posts_2026_10_28.jsonl")
 
 
 class _StubAdvisor:
@@ -232,7 +237,8 @@ def _fixture_msgs():
 
 
 def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=False,
-              exploit_4bet=False, reply=None, hh_log=None, play_log=None, ante=0, blueprint_ante=0):
+              exploit_4bet=False, reply=None, hh_log=None, play_log=None, ante=0, blueprint_ante=0,
+              n_seats=9):
     """msgs（dict 或 ("disconnect",)）喂一个新会话。返回 (session, stub, 行动文件行)。
     hook(i, session) 在每条消息后调用（异步场景用来在指定位置放行 advisor）。"""
     stub = _StubAdvisor(gate, reply)
@@ -240,7 +246,7 @@ def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=Fals
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "actions.jsonl")
         af = ActionFile(path)
-        session = WopoSession(worker, af, n_seats=9, hero_seat=HERO_SEAT,
+        session = WopoSession(worker, af, n_seats=n_seats, hero_seat=HERO_SEAT,
                               exploit=exploit, prewarm=prewarm, exploit_4bet=exploit_4bet,
                               hh_log=hh_log, play_log=play_log, ante=ante,
                               blueprint_ante=blueprint_ante)
@@ -702,6 +708,56 @@ def _selftest_ante():
           " → 作废", file=sys.stderr)
 
 
+def _selftest_posts():
+    """补盲：非盲注座开局 bet = 1BB 记为补盲座，底池 / 跟注额按 live 盲注核对，请求与 hh 带 posts。
+    用 2026-10-28 实盘 4 手（修前全部 blinds[N]:bet=100,want=0 作废）。补的不是 1BB、补盲就全下 → 作废。"""
+    with open(POSTS_FIXTURE) as f:
+        msgs = [json.loads(line) for line in f if line.strip()]
+    buf, play = io.StringIO(), io.StringIO()
+    session, stub, rows = _run_msgs(msgs, ante=100, blueprint_ante=100, n_seats=8, hh_log=buf,
+                                    play_log=play)
+    c = session.counters
+    _check(not session.skip_reasons and c["hands_complete"] == 4 and c["result_notes"] == 0,
+           f"补盲手应全部正常: {session.skip_reasons} {c}")
+    hh = [json.loads(line) for line in buf.getvalue().splitlines()]
+    want = {"122": [6], "123": [2], "127": [7], "132": [4]}
+    _check({r["hand_id"][-3:]: r.get("posts") for r in hh} == want, f"hh posts: {hh}")
+    _check(stub.requests and all(q.get("posts") == want[q_hand[-3:]]
+                                 for q, q_hand in zip(stub.requests, [r["hand_id"] for r in rows])),
+           "请求应带本手 posts")
+    _check("补盲" in play.getvalue(), "play.log 座位行应标出补盲座")
+    _, base_stub, _ = _run_msgs(_fixture_msgs())
+    _check(all("posts" not in q for q in base_stub.requests), "没人补盲时请求不带 posts")
+    if os.environ.get("WOPO_REGEN_HH_POSTS"):
+        with open(HH_POSTS_FIXTURE, "w") as f:
+            f.write(buf.getvalue())
+    with open(HH_POSTS_FIXTURE) as f:
+        _check(hh == [json.loads(line) for line in f if line.strip()],
+               f"补盲 hh 输出与 {HH_POSTS_FIXTURE} 不一致（改了格式用 WOPO_REGEN_HH_POSTS=1 重生成）")
+
+    def tamper(bet=None, stack=None):
+        out, done = [], False
+        for m in msgs:
+            m = json.loads(json.dumps(m))
+            if (not done and m.get("type") == "table_state"
+                    and m.get("hand_id") == "ante-table:hand:000132"):
+                seat4 = m["seats"][4]
+                if bet is not None:
+                    m["pot"] += bet - seat4["bet"]
+                    seat4["bet"] = bet
+                if stack is not None:
+                    seat4["stack"] = stack
+                done = True
+            out.append(m)
+        return out
+    session, _, _ = _run_msgs(tamper(bet=50), ante=100, blueprint_ante=100, n_seats=8)
+    _check(session.skip_reasons == {"blinds[4]": 1}, f"补的不是 1BB 应作废: {session.skip_reasons}")
+    session, _, _ = _run_msgs(tamper(stack=0), ante=100, blueprint_ante=100, n_seats=8)
+    _check(session.skip_reasons == {"post_all_in": 1}, f"补盲就全下应作废: {session.skip_reasons}")
+    print("[selftest 12 posts] 补盲按 live 1BB 核对（实盘 4 手不再作废）、请求与 hh 带 posts；"
+          "补的不是 1BB / 补盲全下 → 作废", file=sys.stderr)
+
+
 def run_selftest():
     _selftest_full_replay()
     _selftest_mid_hand_join()
@@ -714,7 +770,8 @@ def run_selftest():
     _selftest_token()
     _selftest_table_size()
     _selftest_ante()
-    print("OK: wopo selftest 11 组场景全部通过。", file=sys.stderr)
+    _selftest_posts()
+    print("OK: wopo selftest 12 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================

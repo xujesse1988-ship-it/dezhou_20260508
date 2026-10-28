@@ -173,6 +173,7 @@ def wopo_raw(r: dict, source_file: str, ws: Optional[dict] = None) -> RawHand:
         hero_seat=r["my_seat"], hero_hole=list(r.get("hole") or []), board=list(r.get("board") or []),
         actions=raw_actions, final_stacks=_intkeys(res.get("final_stacks")), shown={},
         source_net=net, source_file=source_file, ante=r.get("ante", 0),
+        posts=list(r.get("posts") or []),
     )
 
 

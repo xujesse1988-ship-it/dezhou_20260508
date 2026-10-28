@@ -2335,6 +2335,11 @@ fn solve_cache_key(
     if rc.ante_exempt != 0 {
         h.update(&rc.ante_exempt.to_le_bytes());
     }
+    if rc.live_posts != 0 {
+        // 带前缀与 ante_exempt 区分（两者都是可选追加的 u16；ante_exempt < 2^9 不会撞上 "lp"）。
+        h.update(b"lp");
+        h.update(&rc.live_posts.to_le_bytes());
+    }
     h.update(&[rc.button_seat.0]);
     h.update(&[root_state.street() as u8]);
     h.update(&[root_state.board().len() as u8]);
@@ -6106,6 +6111,7 @@ mod tests {
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
+            live_posts: 0,
             button_seat: SeatId(0),
         };
         SimplifiedNlheGame::new_with_abstraction(
@@ -6133,6 +6139,7 @@ mod tests {
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
+            live_posts: 0,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(seed);
@@ -6177,6 +6184,7 @@ mod tests {
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
+            live_posts: 0,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(seed);
@@ -8452,6 +8460,45 @@ mod tests {
     /// hits/misses 计数硬证）、命中输出与无缓存从头重解 byte-equal（固定迭代确定性 → 缓存只省
     /// wall 不改结果）；换 hand_seed / 换 iterations / 换 root 几何 → key 变 → miss
     /// （漏 key 输入 = 读错均衡，这里钉关键输入都进了 key）。
+    /// 补盲 `live_posts` 进 solve 缓存 key：同一局面有没有补盲是不同的 solve；没人补（0）时 key 与
+    /// 改动前逐位相同（不写任何字节）；与同值的 `ante_exempt` 也不撞。
+    #[test]
+    fn live_posts_enter_solve_cache_key() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let table = stub_table();
+        let cfg = SubgameSearchConfig::default();
+        let key = |tc: &TableConfig| {
+            let st = GameState::new(tc, 1);
+            solve_cache_key(
+                KEY_KIND_ANCHORED,
+                &table,
+                &st,
+                0,
+                0,
+                None,
+                game.abstraction(),
+                &game.rules(),
+                &cfg,
+                7,
+                0,
+                None,
+            )
+        };
+        let base = TableConfig::default_6max_100bb();
+        let mut zero = base.clone();
+        zero.live_posts = 0;
+        assert_eq!(key(&base), key(&zero));
+        let mut post = base.clone();
+        post.live_posts = 1 << 4;
+        assert_ne!(key(&base), key(&post));
+        let mut exempt = base.with_ante(ChipAmount::new(10));
+        exempt.ante_exempt = 1 << 4;
+        let mut exempt_post = exempt.clone();
+        exempt_post.ante_exempt = 0;
+        exempt_post.live_posts = 1 << 4;
+        assert_ne!(key(&exempt), key(&exempt_post));
+    }
+
     #[test]
     fn solve_cache_within_round_hit_and_key_sensitivity() {
         let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");

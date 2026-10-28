@@ -50,6 +50,9 @@ class RawHand:
     # Per-seat ante, posted by every dealt seat before the blinds: counts toward the pot and the
     # seat's total commitment but not toward the street's bet. 0 = no ante.
     ante: int = 0
+    # Seats that post an extra live big blind at hand start (new / returning players on wopo):
+    # counts as that seat's street bet, action order unchanged, may check when unraised.
+    posts: list[int] = field(default_factory=list)
 
 
 @dataclass

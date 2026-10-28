@@ -1223,6 +1223,12 @@ impl GameState {
             self.config.big_blind,
             true,
         );
+        // 补盲（validate_config 已保证只标非盲注座）：live 大盲，算本轮下注。
+        for idx in 0..self.players.len() {
+            if self.config.posts_live_blind(SeatId(idx as u8)) {
+                self.post_forced_amount(idx, self.config.big_blind, true);
+            }
+        }
     }
 
     fn post_forced_amount(&mut self, idx: usize, amount: ChipAmount, this_round: bool) {
@@ -1532,6 +1538,11 @@ fn validate_config(config: &TableConfig) {
     assert!(
         config.ante_exempt >> config.n_seats == 0,
         "ante_exempt has bits beyond n_seats"
+    );
+    assert!(
+        config.live_posts_valid(),
+        "live_posts {:#x} has bits beyond n_seats or marks a blind seat",
+        config.live_posts
     );
 }
 
@@ -1915,6 +1926,7 @@ mod legal_action_tests {
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
+            live_posts: 0,
             button_seat: SeatId(0),
         }
     }
@@ -2069,6 +2081,7 @@ mod legal_action_tests {
             big_blind: ChipAmount::new(100),
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
+            live_posts: 0,
             button_seat: SeatId(0),
         };
         let mut s = GameState::new(&cfg, 0x5117_u64);
