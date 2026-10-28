@@ -25,6 +25,8 @@
     只含盲注；对不上 → 作废）。--blueprint-ante（solver 筹码，BB = 100，= train_cfr --ante）透传给
     advisor 加载对应 blueprint；每手要求 ante × 100 == blueprint-ante × 大盲，否则这手作废
     （ante_mismatch）。短桌空座在实时搜索里不交 ante（树里是按满桌人人交训的，翻前查表照用）。
+  - --stack-bb（默认 100）= blueprint 训练时的起始码深（train_cfr --stack-bb），透传给 advisor；
+    advisor ready 行回报的码深须一致，否则启动报错。
   - 连 WS 带 token 鉴权（Authorization: Bearer）：环境变量 WOPO_TOKEN 优先，其次项目根 .env 的
     WOPO_TOKEN；不走命令行（免得进 ps / shell 历史）。服务端拒绝（关闭码 4001 / 握手 401、403）→
     不重连，直接退出。
@@ -805,10 +807,14 @@ def main():
     p.add_argument("--blueprint-ante", type=int, default=0,
                    help="blueprint 的每座 ante（solver 筹码，BB = 100，= 训练时 train_cfr --ante；默认 0）。"
                         "每手要求 --ante × 100 == 本值 × 大盲")
+    p.add_argument("--stack-bb", type=int, default=100,
+                   help="blueprint 的起始码深（BB，= 训练时 train_cfr --stack-bb；默认 100）。透传给 advisor")
     add_fourbet_args(p)
     args = p.parse_args()
     if args.ante < 0 or not 0 <= args.blueprint_ante <= 100:
         p.error("--ante 须 ≥ 0，--blueprint-ante 须在 [0, 100]")
+    if not 2 <= args.stack_bb <= 1000:
+        p.error("--stack-bb 须在 [2, 1000]")
     validate_advisor_args(args)
     validate_fourbet_args(p, args)
     token = None
@@ -818,7 +824,10 @@ def main():
             p.error(f"连 WS 需要 token：设环境变量 {TOKEN_ENV} 或写进 {ENV_FILE}（非空且不含空白）")
 
     ante_args = ["--ante", str(args.blueprint_ante)] if args.blueprint_ante else []
-    advisor = start_advisor(args, advisor_extra_args(args) + fourbet_extra_args(args) + ante_args)
+    # 缺省 100 不透传（advisor 默认 100，命令行与旧版逐字节相同）。
+    stack_args = ["--stack-bb", str(args.stack_bb)] if args.stack_bb != 100 else []
+    advisor = start_advisor(args, advisor_extra_args(args) + fourbet_extra_args(args) + ante_args
+                            + stack_args)
     # 回放用同步 worker（结果确定、不会因为读文件太快把决策判成过期）；联机用后台线程。
     worker = DecisionWorker(advisor, sync=args.replay is not None)
     action_file = ActionFile(args.action_file)

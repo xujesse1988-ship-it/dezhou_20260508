@@ -263,8 +263,8 @@ pub fn find_tag(legal: &[AbstractAction], tag: AbstractActionTag) -> Option<Abst
 
 /// 把 `map_off_tree` 选出的 tag 投影到 abs 当前合法集：tag 在则取之。不在时分两种：
 /// **① 被规则剪掉的加注档**（节点仍有更大合法加注）→ 在合法加注阶梯上向上取最近一档（ratio
-/// ≥ 选中档的最小合法加注）；**② 选中档塌进 AllIn**（短码：比所有合法加注都大）→ 退 AllIn。
-/// 两者都缺 → Err（决策节点必有 ≥1 动作）。与 [`crate::training::blueprint_advisor::project_tag_onto`]
+/// ≥ 选中档的最小合法加注）；**② 选中档塌进 AllIn**（短码：比所有合法加注都大）→ 退 AllIn；
+/// **③ 两者都缺**（开池节点只剩小档、开池全下被剪）→ 向下取最大的合法加注。仍无 → Err。与 [`crate::training::blueprint_advisor::project_tag_onto`]
 /// 同逻辑（off-tree 投影单一源；Slumbot `default_6_action` 无剪档 → ① 永不触发 = byte-equal）。
 pub fn project_tag_onto(
     legal: &[AbstractAction],
@@ -294,6 +294,23 @@ pub fn project_tag_onto(
     // ② 塌全下（或无更大合法加注）→ AllIn 兜底。
     if let Some(a) = find_tag(legal, AbstractActionTag::AllIn) {
         return Ok(a);
+    }
+    // ③ 没有更大的合法加注、也没有 AllIn（典型：ante-flop2 开池节点只留 1/3pot、开池全下被
+    // `drop_preflop_open_allin` 剪掉，而真实开池偏大被映射到 0.5 / 1pot）→ 向下取最大的合法加注。
+    if let AbstractActionTag::Bet(_) | AbstractActionTag::Raise(_) = tag {
+        let down = legal
+            .iter()
+            .copied()
+            .filter_map(|a| match a {
+                AbstractAction::Bet { ratio_label, .. }
+                | AbstractAction::Raise { ratio_label, .. } => Some((ratio_label.as_milli(), a)),
+                _ => None,
+            })
+            .max_by_key(|(m, _)| *m)
+            .map(|(_, a)| a);
+        if let Some(a) = down {
+            return Ok(a);
+        }
     }
     Err(format!(
         "投影失败：tag {tag:?} 与 AllIn 都不在 abs 合法集 {legal:?}"

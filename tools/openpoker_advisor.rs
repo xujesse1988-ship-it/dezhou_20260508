@@ -115,8 +115,10 @@ use poker::{
 
 /// `--seats` 缺省值（6-max；不传新参数时行为与引入 `--seats` 前逐位相同）。
 const DEFAULT_SEATS: u8 = 6;
-/// solver / blueprint 起始码深（BB）。advisor 只支持 100BB blueprint（driver 买入锁 2000 = 100BB）。
-const SOLVER_STACK_BB: u32 = 100;
+/// `--stack-bb` 缺省值：solver / blueprint 起始码深（BB）。须与 blueprint 训练时的
+/// `train_cfr --stack-bb` 一致（不符 → layout 指纹不符 → 加载报错）。OpenPoker driver 买入锁
+/// 2000 = 100BB，走缺省；wopo ante 桌可接 200BB blueprint。
+const DEFAULT_SOLVER_STACK_BB: u32 = 100;
 const REAL_REPLAY_SEED: u64 = 0x5245_414c_3645_4d58; // "REAL6EMX"
 const ABS_REPLAY_SEED: u64 = 0x4142_5336_454d_5800; // "ABS6EMX\0"
 /// 搜索 range 先验平滑 λ 的生产默认（`SubgameSearchConfig::range_uniform_mix` 字段 doc）：
@@ -201,10 +203,11 @@ const DEFAULT_SEARCH_MAX_NODES: usize = 200_000;
 const DEFAULT_SEARCH_MIN_HERO_VISITS: u32 = 200;
 /// 弱牌押上全部筹码护栏的默认（`--search-weak-commit-guard`，[`weak_commit_guard`]）：**默认开**。
 const DEFAULT_SEARCH_WEAK_COMMIT_GUARD: bool = true;
-/// flop 优先 blueprint 的有效码深区间（BB，含端点；[`flop_blueprint_stack_gate`]）。hero 与每个
-/// 未弃牌对手的 hand-start 有效码深都须落在区间内，否则 flop 照常实时搜索。
-const FLOP_BLUEPRINT_EFF_STACK_BB_MIN: u64 = 60;
-const FLOP_BLUEPRINT_EFF_STACK_BB_MAX: u64 = 140;
+/// flop 优先 blueprint 的有效码深区间（占 blueprint 起始码深的百分比，含端点；
+/// [`flop_blueprint_stack_gate`]）。hero 与每个未弃牌对手的 hand-start 有效码深都须落在区间内，
+/// 否则 flop 照常实时搜索。100BB blueprint = 60–140BB（与改成比例前逐位相同），200BB = 120–280BB。
+const FLOP_BLUEPRINT_EFF_STACK_PCT_MIN: u64 = 60;
+const FLOP_BLUEPRINT_EFF_STACK_PCT_MAX: u64 = 140;
 /// flop 优先 blueprint 的下注尺寸映射误差区间（[`flop_blueprint_size_gate`]）：本街每次下注 / 加注的
 /// 真实池比例 ÷ blueprint 树里映射到的池比例，须落在 [MIN, MAX]/1000 内（含端点），否则 flop 照常
 /// 实时搜索。all-1pot 的翻牌菜单只有 {1pot}，0.2–1.5 pot 的注都映射成 1pot——不加这条，面对 1/3 池
@@ -1231,7 +1234,7 @@ fn truncate_request_to_street(
 struct BetSizeMap {
     /// 该动作所在的街（apply 前的街）。
     street: poker::Street,
-    /// 真实尺寸（100BB 重放态上算）。
+    /// 真实尺寸（blueprint 码深的重放态上算）。
     real_milli: u64,
     /// 影子映射尺寸（影子自身几何上算，含塌成 AllIn 的情况）。
     mapped_milli: u64,
@@ -1408,7 +1411,7 @@ struct LockstepErr {
     limp: LimpFoldMap,
 }
 
-/// [`lockstep_replay`] 成功结果：(100BB 真实重放态, 影子, 平跟当弃牌映射, 下注尺寸映射)。
+/// [`lockstep_replay`] 成功结果：(blueprint 码深真实重放态, 影子, 平跟当弃牌映射, 下注尺寸映射)。
 type LockstepOk = (
     poker::GameState,
     SimplifiedNlheState,
@@ -3236,12 +3239,13 @@ fn limp_preflop_response(
 // 翻前面对全下的兜底启发式（`openpoker_code_review_findings_2026_10_16.md` §5，兜底改造第一步）
 // ===========================================================================
 
-/// 翻前面对全下时，hero 与全下者的有效码深（两人 hand-start 真栈取小）低于此值（BB）就不走
-/// blueprint、改走 [`preflop_allin_response`]：blueprint 按对称 100BB 训练，短码全下在 100BB
-/// 影子里就是 100BB 全下——底池赔率和对手范围都按 100BB 算，跟注范围严重偏紧。与翻牌码深闸
-/// 下限（[`FLOP_BLUEPRINT_EFF_STACK_BB_MIN`]）同值。码深 ≥ 此值的全下仍走 blueprint；blueprint
-/// 树里没有的全下（开池全下，`drop_preflop_open_allin`）重放失同步后同样走这里。
-const PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_BB: u64 = 60;
+/// 翻前面对全下时，hero 与全下者的有效码深（两人 hand-start 真栈取小）低于 blueprint 起始码深的
+/// 这个百分比就不走 blueprint、改走 [`preflop_allin_response`]：blueprint 按对称码深训练，短码全下
+/// 在影子里就是满码全下——底池赔率和对手范围都按满码算，跟注范围严重偏紧。与翻牌码深闸下限
+/// （[`FLOP_BLUEPRINT_EFF_STACK_PCT_MIN`]）同值：100BB blueprint = 60BB，200BB = 120BB。码深够的
+/// 全下仍走 blueprint；blueprint 树里没有的全下（开池全下，`drop_preflop_open_allin`）重放失同步后
+/// 同样走这里。
+const PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_PCT: u64 = 60;
 /// 全下范围宽度表（起手牌强度序 [`chen_order_key`] 的 top 比例）：`(全下者 hand-start 码深上限 BB,
 /// 开池全下, 3bet/4bet 全下)`，按行从上往下取第一个「码深 ≤ 上限」的行；超过最后一行按最后一行。
 /// **数值是估计**（2026-10-16 与用户确认的常识值），不是解出来的，也没有实盘数据校准。
@@ -3389,6 +3393,8 @@ struct PreflopAllinSpot {
     /// hero 跟注后能赢的底池（各家投入按 hero 跟注后的总投入封顶 + hero 自己）。
     win_pot: u64,
     big_blind: u64,
+    /// blueprint 起始码深（[`PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_PCT`] 的基数）。
+    solver_stack: u64,
 }
 
 /// 翻前轮到 hero、价格由一个已全下的对手定（本轮投入最高者已 all-in）→ `Some`。其余（翻后、
@@ -3466,12 +3472,18 @@ fn preflop_allin_spot(
         to_call,
         win_pot,
         big_blind: solver_cfg.big_blind.as_u64(),
+        solver_stack: solver_cfg.starting_stacks[0].as_u64(),
     })
 }
 
-/// 有效码深是否低到不该用 blueprint（[`PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_BB`]）。
+/// 有效码深是否低到不该用 blueprint（[`PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_PCT`]）。
 fn preflop_allin_too_short(spot: &PreflopAllinSpot) -> bool {
-    spot.eff < PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_BB * spot.big_blind
+    spot.eff * 100 < spot.solver_stack * PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_PCT
+}
+
+/// blueprint 起始码深（对称，取 0 号座）的 `pct`%（solver chips，向下取整）。
+fn solver_stack_pct(solver_cfg: &TableConfig, pct: u64) -> u64 {
+    solver_cfg.starting_stacks[0].as_u64() * pct / 100
 }
 
 /// 翻前面对全下的兜底：按全下者码深 / 位置 / 是否开池估范围（[`allin_range_width`]），已跟注的
@@ -3619,16 +3631,16 @@ fn build_real_auth(
 }
 
 /// `--search-flop-prefer-blueprint` 的真码深闸：flop 锚定面只有在真实码深与 blueprint 的
-/// 100BB 假设相近时才可走 blueprint。`state` = 真栈重放态（决策路径传 `auth`、预热传
+/// 起始码深（`--stack-bb`）相近时才可走 blueprint。`state` = 真栈重放态（决策路径传 `auth`、预热传
 /// `round_start`），只读各座 status。
 ///
 /// `Ok(())` = 可用 blueprint；`Err(reason)` = 须实时搜索：
 /// - 本手到 `state` 为止有人 all-in（`all_in`）；
-/// - hero 与某个未弃牌对手的 hand-start 有效码深 `min(hero, opp)` 落在
-///   [[`FLOP_BLUEPRINT_EFF_STACK_BB_MIN`], [`FLOP_BLUEPRINT_EFF_STACK_BB_MAX`]] BB 外（`eff_stack`）；
+/// - hero 与某个未弃牌对手的 hand-start 有效码深 `min(hero, opp)` 落在 blueprint 起始码深的
+///   [[`FLOP_BLUEPRINT_EFF_STACK_PCT_MIN`], [`FLOP_BLUEPRINT_EFF_STACK_PCT_MAX`]]% 外（`eff_stack`）；
 /// - 真栈 config 建不出（`stacks_len` 等脏数据）。
 ///
-/// `stacks` 缺省按 [`real_stacks_config`] 惯例 = 对称 100BB（与搜索路径同口径）→ 码深一项恒过，
+/// `stacks` 缺省按 [`real_stacks_config`] 惯例 = 对称 blueprint 码深（与搜索路径同口径）→ 码深一项恒过，
 /// all-in 一项照查。
 fn flop_blueprint_stack_gate(
     req: &Request,
@@ -3647,14 +3659,15 @@ fn flop_blueprint_stack_gate(
     }
     let real_cfg = real_stacks_config(req, solver_cfg, scale, smap)?;
     let bb = solver_cfg.big_blind.as_u64();
+    let lo = solver_stack_pct(solver_cfg, FLOP_BLUEPRINT_EFF_STACK_PCT_MIN);
+    let hi = solver_stack_pct(solver_cfg, FLOP_BLUEPRINT_EFF_STACK_PCT_MAX);
     let hero_start = real_cfg.starting_stacks[hero.0 as usize].as_u64();
     for (i, p) in players.iter().enumerate() {
         if i == hero.0 as usize || p.status == poker::PlayerStatus::Folded {
             continue;
         }
         let eff = hero_start.min(real_cfg.starting_stacks[i].as_u64());
-        if eff < FLOP_BLUEPRINT_EFF_STACK_BB_MIN * bb || eff > FLOP_BLUEPRINT_EFF_STACK_BB_MAX * bb
-        {
+        if eff < lo || eff > hi {
             return Err(format!("eff_stack:seat{i}:{}bb", eff / bb));
         }
     }
@@ -4721,6 +4734,9 @@ struct Args {
     /// `train_cfr --ante` 相同（不符 → layout 指纹不符 → 加载报错）；决策请求的 ante 按盲注同一
     /// scale 须对上它（否则 `fallback:ante_mismatch`）。
     ante: u64,
+    /// `--stack-bb <N>`：blueprint 的起始码深（BB，默认 [`DEFAULT_SOLVER_STACK_BB`] = 100）。须与训练时
+    /// 的 `train_cfr --stack-bb` 相同（不符 → layout 指纹不符 → 加载报错）。
+    stack_bb: u32,
     seed: u64,
     /// 缺口②实时搜索：`Some` = `--search` 开（postflop 触发面 re-solve 真码深子博弈）；`None`
     /// （默认）= 纯 blueprint（旧行为 byte-equal）。其余 search 字段由 `--search-*` flag 填。
@@ -4789,10 +4805,17 @@ struct ReadyLine {
     /// blueprint 的每座 ante（solver 单位，BB = 100）；0 不写（ready 行与旧版逐字节相同）。
     #[serde(skip_serializing_if = "is_zero")]
     ante: u64,
+    /// blueprint 起始码深（BB）；= 100 不写（ready 行与旧版逐字节相同）。
+    #[serde(skip_serializing_if = "is_default_stack_bb")]
+    stack_bb: u32,
 }
 
 fn is_zero(v: &u64) -> bool {
     *v == 0
+}
+
+fn is_default_stack_bb(v: &u32) -> bool {
+    *v == DEFAULT_SOLVER_STACK_BB
 }
 
 /// `--reshape` → 树定义：与 `train_cfr` / `nlhe_dense_crop` 共用 [`six_max_reshape`]，保证加载时
@@ -4811,20 +4834,22 @@ fn reshape_profile(
         .ok_or_else(|| format!("unknown reshape {reshape} (expected {SIX_MAX_RESHAPE_NAMES})"))
 }
 
-/// 按 `(--reshape, --postflop-cap, --seats, --ante)` 重建 blueprint game（树 + 抽象 + 桶表）：桌面
-/// = `TableConfig::n_max_at_bb(seats, 100).with_ante(ante)`，与 `train_cfr --profile six-max
-/// --seats <N> --stack-bb 100 --ante <ante>` 同一定义（6 座无 ante == 旧 `default_6max_100bb()`）。
+/// 按 `(--reshape, --postflop-cap, --seats, --ante, --stack-bb)` 重建 blueprint game（树 + 抽象 +
+/// 桶表）：桌面 = `TableConfig::n_max_at_bb(seats, stack_bb).with_ante(ante)`，与 `train_cfr --profile
+/// six-max --seats <N> --stack-bb <stack_bb> --ante <ante>` 同一定义（6 座 100BB 无 ante == 旧
+/// `default_6max_100bb()`）。
 fn build_game(
     table: Arc<BucketTable>,
     reshape: &str,
     cap: u8,
     seats: u8,
     ante: u64,
+    stack_bb: u32,
 ) -> Result<SimplifiedNlheGame, String> {
     let (abs, rules) = reshape_profile(reshape, cap)?;
     SimplifiedNlheGame::new_with_abstraction(
         table,
-        TableConfig::n_max_at_bb(seats, SOLVER_STACK_BB).with_ante(ChipAmount::new(ante)),
+        TableConfig::n_max_at_bb(seats, stack_bb).with_ante(ChipAmount::new(ante)),
         abs,
         rules,
     )
@@ -4891,22 +4916,24 @@ fn run() -> Result<(), String> {
             args.bucket_table.display()
         )
     })?);
-    // solver 桌面 = `--seats` 座 100BB（`n_max_at_bb(6, 100)` == 旧 `default_6max_100bb()`，逐字段
-    // 相同）。blueprint 是用某个座位数训练的：座位数不同 → 树不同 → 下面 load 的 layout 指纹校验
-    // 拒绝（`--seats` 与 blueprint 不符即报错退出，不会静默按错的座位数重放）。
+    // solver 桌面 = `--seats` 座 `--stack-bb` 码深（缺省 6 座 100BB：`n_max_at_bb(6, 100)` == 旧
+    // `default_6max_100bb()`，逐字段相同）。blueprint 是用某个座位数 / 码深训练的：不同 → 树不同 →
+    // 下面 load 的 layout 指纹校验拒绝（与 blueprint 不符即报错退出，不会静默按错的树重放）。
     let game = build_game(
         Arc::clone(&table),
         &args.reshape,
         args.postflop_cap,
         args.seats,
         args.ante,
+        args.stack_bb,
     )?;
     // blueprint 访问面（Blueprint doc）：完整 ckpt 或 crop 文件，二者都用同一 game 校验 layout 指纹。
     let blueprint = load_blueprint(&args.checkpoint, game, args.cropped).map_err(|e| {
         format!(
-            "{e}\n（若 blueprint 训练时的座位数与 --seats {} 不同、ante 与 --ante {} 不同、或 --reshape / \
-             --postflop-cap / --bucket-table 不同，树的 layout 指纹不符，必然加载失败）",
-            args.seats, args.ante
+            "{e}\n（若 blueprint 训练时的座位数与 --seats {} 不同、ante 与 --ante {} 不同、码深与 \
+             --stack-bb {} 不同、或 --reshape / --postflop-cap / --bucket-table 不同，树的 layout 指纹不符，\
+             必然加载失败）",
+            args.seats, args.ante, args.stack_bb
         )
     })?;
     let game = blueprint.game();
@@ -4963,6 +4990,7 @@ fn run() -> Result<(), String> {
         blueprint_keep_through: matches!(blueprint, Blueprint::Cropped { .. })
             .then(|| format!("{:?}", blueprint.keep_through())),
         ante: game.table_config().ante.as_u64(),
+        stack_bb: args.stack_bb,
     };
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
@@ -5169,6 +5197,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut postflop_cap = 3u8;
     let mut seats = DEFAULT_SEATS;
     let mut ante = 0u64;
+    let mut stack_bb = DEFAULT_SOLVER_STACK_BB;
     let mut seed: u64 = 0;
     // 缺口② 实时搜索 flag（仅 --search 开时打包成 SubgameSearchConfig）。
     let mut search_on = false;
@@ -5241,6 +5270,16 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     ));
                 }
                 ante = v;
+            }
+            "--stack-bb" => {
+                let v: u32 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad stack-bb: {e}"))?;
+                // 与 train_cfr --profile six-max --stack-bb 同范围。
+                if !(2..=1000).contains(&v) {
+                    return Err(format!("--stack-bb 须在 [2,1000]，得 {v}"));
+                }
+                stack_bb = v;
             }
             "--seed" => {
                 let raw = next_val(&mut it, &arg)?;
@@ -5628,6 +5667,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         postflop_cap,
         seats,
         ante,
+        stack_bb,
         seed,
         search,
         search_street_iters,
@@ -11661,7 +11701,7 @@ mod tests {
             assert!(parse(&["--seats", bad]).is_err(), "--seats {bad} 应拒绝");
         }
         // `build_game(…, 6)` 与旧 `default_6max_100bb()` 逐字段相同（6 座 byte-equal 的根）。
-        let a = TableConfig::n_max_at_bb(DEFAULT_SEATS, SOLVER_STACK_BB);
+        let a = TableConfig::n_max_at_bb(DEFAULT_SEATS, DEFAULT_SOLVER_STACK_BB);
         let b = TableConfig::default_6max_100bb();
         assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
@@ -11686,9 +11726,17 @@ mod tests {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::new(200, 200, 200).expect("200/200/200"),
         ));
-        let g_ante =
-            build_game(Arc::clone(&table), "all-1pot", 2, 8, 100).expect("8-max ante game");
-        let g_plain = build_game(table, "all-1pot", 2, 8, 0).expect("8-max game");
+        let g_ante = build_game(
+            Arc::clone(&table),
+            "all-1pot",
+            2,
+            8,
+            100,
+            DEFAULT_SOLVER_STACK_BB,
+        )
+        .expect("8-max ante game");
+        let g_plain =
+            build_game(table, "all-1pot", 2, 8, 0, DEFAULT_SOLVER_STACK_BB).expect("8-max game");
         let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
         // OpenPoker 盲注 10/20 → scale 5：ante 20 ↔ solver 100（1BB）。
         let with_ante = |ante: u64| Request {
@@ -11790,7 +11838,8 @@ mod tests {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::new(200, 200, 200).expect("200/200/200"),
         ));
-        let game = build_game(table, "ante-flop2", 2, 8, 100).expect("8-max ante-flop2 game");
+        let game = build_game(table, "ante-flop2", 2, 8, 100, DEFAULT_SOLVER_STACK_BB)
+            .expect("8-max ante-flop2 game");
         let abs = game.abstraction().clone();
         let last = |_i: &InfoSetId, n: usize| {
             let mut p = vec![0.0; n];
@@ -11865,7 +11914,8 @@ mod tests {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::new(200, 200, 200).expect("200/200/200"),
         ));
-        build_game(table, "ante-flop2", 2, 8, 100).expect("8-max ante-flop2 game")
+        build_game(table, "ante-flop2", 2, 8, 100, DEFAULT_SOLVER_STACK_BB)
+            .expect("8-max ante-flop2 game")
     }
 
     fn post_req(my: u8, actions: Vec<HistAction>) -> Request {
@@ -12005,7 +12055,8 @@ mod tests {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::new(200, 200, 200).expect("200/200/200"),
         ));
-        let game = build_game(table, "ante-flop2-3bet", 2, 8, 100).expect("8-max ante-flop2-3bet");
+        let game = build_game(table, "ante-flop2-3bet", 2, 8, 100, DEFAULT_SOLVER_STACK_BB)
+            .expect("8-max ante-flop2-3bet");
         let abs = game.abstraction().clone();
         // BB facing the open: [Fold, Call, Raise 0.5, Raise 1, AllIn] -> all on the 0.5pot slot.
         let half = |_i: &InfoSetId, n: usize| {
@@ -12047,6 +12098,130 @@ mod tests {
         );
         assert_eq!(r.source, "blueprint", "{r:?}");
         assert!(is_legal(&r, &req.valid), "{r:?}");
+    }
+
+    /// 开池节点只有 1/3pot 一档、没有开池全下（ante-flop2 / ante-flop2-3bet）：真实开池偏大
+    /// （5–20BB，盲注 10/20、ante 20，scale 5）被 map_off_tree 映到 0.5 / 1pot 时，影子向下落到
+    /// 1/3pot 开池、不再 `structural_gap` 失同步；BB（hero）照常走 blueprint、动作合法。
+    #[test]
+    fn big_open_projects_down_to_small_open() {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        for reshape in ["ante-flop2", "ante-flop2-3bet"] {
+            let game = build_game(
+                Arc::clone(&table),
+                reshape,
+                2,
+                8,
+                100,
+                DEFAULT_SOLVER_STACK_BB,
+            )
+            .expect("8-max ante game");
+            let abs = game.abstraction().clone();
+            let solver_cfg = game.table_config().clone();
+            for open in [100u64, 120, 200, 400] {
+                let mut req = Request {
+                    ante: 20,
+                    ..n_req(8, 0, 2, vec![])
+                };
+                req.actions = std::iter::once(hist(3, "raise", Some(open)))
+                    .chain([4, 5, 6, 7, 0, 1].map(|s| hist(s, "fold", None)))
+                    .collect();
+                let smap = seat_map(&req, 8).expect("seat_map");
+                let my = SeatId(smap.tree_seat(2).unwrap());
+                let (_, _, _, sizes) =
+                    lockstep_replay(&game, &solver_cfg, &smap, &req, 5, 0, Some(my), false)
+                        .unwrap_or_else(|e| panic!("{reshape} 开池 {open}：{e:?}"));
+                assert_eq!(sizes.len(), 1, "{reshape} 开池 {open}");
+                assert_eq!(
+                    sizes[0].mapped_milli, 333,
+                    "{reshape} 开池 {open} 应落 1/3pot"
+                );
+                let r = decide(
+                    &game,
+                    &abs,
+                    &uniform,
+                    &req,
+                    0,
+                    None,
+                    &mut SubgameSolveCache::new(),
+                );
+                assert_eq!(r.source, "blueprint", "{reshape} 开池 {open}：{r:?}");
+                assert!(is_legal(&r, &req.valid), "{reshape} 开池 {open}：{r:?}");
+            }
+        }
+    }
+
+    /// `--stack-bb`：① 解析（缺省 100，范围 [2,1000]）；② 建出的 blueprint 桌面按它定起始码深；
+    /// ③ 两道码深闸按 blueprint 码深的比例走：100BB 时与改成比例前逐位相同（翻前全下 60BB、翻牌
+    /// 60–140BB），200BB 时翻前全下 120BB、翻牌 120–280BB。
+    #[test]
+    fn stack_bb_arg_and_proportional_stack_gates() {
+        let parse = |extra: &[&str]| {
+            parse_args_from(
+                ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                    .iter()
+                    .chain(extra)
+                    .map(|s| s.to_string()),
+            )
+        };
+        assert_eq!(parse(&[]).unwrap().stack_bb, 100);
+        assert_eq!(parse(&["--stack-bb", "200"]).unwrap().stack_bb, 200);
+        for bad in ["1", "1001", "x"] {
+            assert!(
+                parse(&["--stack-bb", bad]).is_err(),
+                "--stack-bb {bad} 应拒绝"
+            );
+        }
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let g = build_game(table, "ante-flop2-3bet", 2, 3, 100, 200).expect("3-max 200BB game");
+        assert_eq!(
+            g.table_config().starting_stacks,
+            vec![ChipAmount::new(20_000); 3]
+        );
+
+        // (blueprint 码深, 翻前全下 / 翻牌下限, 翻牌上限)，单位 BB。
+        for (stack_bb, lo, hi) in [(100u32, 60u64, 140u64), (200, 120, 280)] {
+            let cfg = TableConfig::n_max_at_bb(3, stack_bb);
+            let spot = |eff_bb: u64| PreflopAllinSpot {
+                shover: 1,
+                shover_start: eff_bb * 100,
+                eff: eff_bb * 100,
+                open_shove: true,
+                callers: vec![],
+                to_call: 0,
+                win_pot: 0,
+                big_blind: 100,
+                solver_stack: cfg.starting_stacks[0].as_u64(),
+            };
+            assert!(
+                !preflop_allin_too_short(&spot(lo)),
+                "{stack_bb}BB：{lo}BB 够深"
+            );
+            assert!(
+                preflop_allin_too_short(&spot(lo - 1)),
+                "{stack_bb}BB：{}BB 太短",
+                lo - 1
+            );
+
+            // 真实桌盲注 10/20（scale 5）：hero（座 1）1000BB，另两座都是 `opp_bb`。
+            let state = GameState::new(&cfg, 1);
+            let gate = |opp_bb: u64| {
+                let mut req = n_req(3, 0, 1, vec![]);
+                req.stacks = vec![opp_bb * 20, 1000 * 20, opp_bb * 20];
+                let smap = seat_map(&req, 3).expect("seat_map");
+                let hero = SeatId(smap.tree_seat(1).unwrap());
+                flop_blueprint_stack_gate(&req, &cfg, 5, &smap, &state, hero)
+            };
+            assert!(gate(lo).is_ok(), "{stack_bb}BB：{lo}BB 在区间内");
+            assert!(gate(hi).is_ok(), "{stack_bb}BB：{hi}BB 在区间内");
+            assert!(gate(lo - 1).is_err(), "{stack_bb}BB：{}BB 太短", lo - 1);
+            assert!(gate(hi + 1).is_err(), "{stack_bb}BB：{}BB 太深", hi + 1);
+        }
     }
 
     /// 桌面座位数 ≠ solver 座位数 → 显式兜底，标签带 solver 座位数（6 座仍是旧 `not_6max`）；
@@ -12234,7 +12409,7 @@ mod tests {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::new(200, 200, 200).expect("200/200/200"),
         ));
-        build_game(table, "all-1pot", 2, 9, 0).expect("9-max game")
+        build_game(table, "all-1pot", 2, 9, 0, DEFAULT_SOLVER_STACK_BB).expect("9-max game")
     }
 
     /// 与 [`nine_max_test_game`] 同 reshape / cap / 桶表、只换座位数的 game（错配测试用）。
@@ -12242,7 +12417,7 @@ mod tests {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::new(200, 200, 200).expect("200/200/200"),
         ));
-        build_game(table, "all-1pot", 2, seats, 0).expect("game")
+        build_game(table, "all-1pot", 2, seats, 0, DEFAULT_SOLVER_STACK_BB).expect("game")
     }
 
     /// 9-max fixture：训练 → 完整 ckpt + crop(keep_through=Flop, 不留 regret)。文件写到
@@ -13405,7 +13580,8 @@ mod tests {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::default_500_500_500(),
         ));
-        let game = build_game(table, "flop2-1pot", 4, 9, 0).expect("9-max flop2-1pot cap4");
+        let game = build_game(table, "flop2-1pot", 4, 9, 0, DEFAULT_SOLVER_STACK_BB)
+            .expect("9-max flop2-1pot cap4");
         // 9 座 button=0：SB=1, BB=2, UTG=3 … CO=8。UTG..HJ 弃，CO(8，我方) 开到 70，BTN(0) 3bet 到 240，盲注弃。
         let mut actions: Vec<HistAction> = (3..8).map(|s| hist(s, "fold", None)).collect();
         actions.push(hist(8, "raise", Some(70)));

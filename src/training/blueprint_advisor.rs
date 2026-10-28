@@ -135,13 +135,15 @@ pub fn find_tag(legal: &[AbstractAction], tag: AbstractActionTag) -> Option<Abst
 /// **① 被 A3×A4 规则剪掉的加注档**（典型 `drop_small_reraise` 删 0.5pot re-raise，但节点仍有
 /// 更大的合法加注）→ 在合法加注阶梯上**向上取最近一档**（ratio ≥ 选中档的最小合法加注）；
 /// **② 选中档在抽象 pot 下塌进 AllIn**（短码：比所有合法加注都大）→ 无更大合法加注 → 退
-/// AllIn。两者都缺 → Err（决策节点必有 ≥1 动作，不该发生）。
+/// AllIn；**③ 既无更大合法加注、也无 AllIn**（ante-flop2 / ante-flop2-3bet 开池节点只有 1/3pot、
+/// 开池全下被剪，真实开池偏大被 map_off_tree 映射到 0.5 / 1pot）→ **向下取最大的合法加注**（不然
+/// 整手 `structural_gap` 失同步、走兜底）。三者都缺（tag 不是加注 / 节点没有任何加注）→ Err。
 ///
 /// ①②由「合法集里有没有 ratio ≥ 选中档的加注」区分：剪档时小档被删、大档仍在（向上投）；
 /// 塌全下时大档先塌、无更大加注（退 AllIn）。修复「小 3bet/4bet 被剪 0.5pot 档后**错塌全下**
 /// → 影子比真实多一个 all-in → `lockstep_drift` → fallback 盲弃」（2026-06-14 openpoker 实采）。
 /// 无剪档抽象（slumbot `default_6_action` / nolimp `{1.0}`）下 ① 永不触发（map_off_tree 选的档
-/// 恒在合法集，或塌全下时无更大加注）= byte-equal。
+/// 恒在合法集，或塌全下时无更大加注）= byte-equal；③ 只接管原先会 Err 的情形，其余逐位不变。
 pub fn project_tag_onto(
     legal: &[AbstractAction],
     tag: AbstractActionTag,
@@ -170,6 +172,23 @@ pub fn project_tag_onto(
     // ② 塌全下（或无更大合法加注）→ AllIn 兜底。
     if let Some(a) = find_tag(legal, AbstractActionTag::AllIn) {
         return Ok(a);
+    }
+    // ③ 没有更大的合法加注、也没有 AllIn（典型：ante-flop2 开池节点只留 1/3pot、开池全下被
+    // `drop_preflop_open_allin` 剪掉，而真实开池偏大被映射到 0.5 / 1pot）→ 向下取最大的合法加注。
+    if let AbstractActionTag::Bet(_) | AbstractActionTag::Raise(_) = tag {
+        let down = legal
+            .iter()
+            .copied()
+            .filter_map(|a| match a {
+                AbstractAction::Bet { ratio_label, .. }
+                | AbstractAction::Raise { ratio_label, .. } => Some((ratio_label.as_milli(), a)),
+                _ => None,
+            })
+            .max_by_key(|(m, _)| *m)
+            .map(|(_, a)| a);
+        if let Some(a) = down {
+            return Ok(a);
+        }
     }
     Err(format!(
         "投影失败：tag {tag:?} 与 AllIn 都不在合法集 {legal:?}"
