@@ -11712,6 +11712,58 @@ mod tests {
         assert!(is_legal(&r, &req.valid), "{r:?}");
     }
 
+    /// `ante-flop2-3bet`（盲注 10/20、ante 20，scale 5）：UTG 开 90（4.5BB）、其余弃到 BB；
+    /// ① BB 策略全压 0.5pot 档 → 3bet 到 265 = 13.25BB（solver 1325 / 5）；② 真实 BB 3bet 到
+    /// 270（13.5BB）→ 影子映进 3bet 档，UTG（hero）照常走 blueprint、动作合法。
+    #[test]
+    fn ante_flop2_3bet_half_pot_three_bet() {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let game = build_game(table, "ante-flop2-3bet", 2, 8, 100).expect("8-max ante-flop2-3bet");
+        let abs = game.abstraction().clone();
+        // BB facing the open: [Fold, Call, Raise 0.5, Raise 1, AllIn] -> all on the 0.5pot slot.
+        let half = |_i: &InfoSetId, n: usize| {
+            assert_eq!(n, 5, "BB 面对开池应有 5 个动作");
+            let mut p = vec![0.0; n];
+            p[2] = 1.0;
+            p
+        };
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let mut req = Request {
+            ante: 20,
+            ..n_req(8, 0, 2, vec![])
+        };
+        req.actions = std::iter::once(hist(3, "raise", Some(90)))
+            .chain([4, 5, 6, 7, 0, 1].map(|s| hist(s, "fold", None)))
+            .collect();
+        let r = decide(
+            &game,
+            &abs,
+            &half,
+            &req,
+            0,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "blueprint", "{r:?}");
+        assert_eq!((r.action.as_str(), r.amount), ("raise", Some(265)), "{r:?}");
+
+        req.my_seat = 3;
+        req.actions.push(hist(2, "raise", Some(270)));
+        let r = decide(
+            &game,
+            &abs,
+            &uniform,
+            &req,
+            0,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.source, "blueprint", "{r:?}");
+        assert!(is_legal(&r, &req.valid), "{r:?}");
+    }
+
     /// 桌面座位数 ≠ solver 座位数 → 显式兜底，标签带 solver 座位数（6 座仍是旧 `not_6max`）；
     /// 预热同口径 skip。
     #[test]

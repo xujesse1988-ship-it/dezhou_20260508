@@ -779,7 +779,8 @@ mod tests {
     use crate::core::rng::{ChaCha20Rng, RngSource};
     use crate::core::ChipAmount;
     use crate::training::nlhe_betting_tree::{
-        all_1pot_6max, ante_flop2_6max, first_small_6max, first_small_preopen_1pot_6max,
+        all_1pot_6max, ante_flop2_3bet_6max, ante_flop2_6max, first_small_6max,
+        first_small_preopen_1pot_6max,
     };
 
     fn stub_table() -> Arc<BucketTable> {
@@ -980,6 +981,59 @@ mod tests {
             "fold 到 SB"
         );
         assert_eq!(raises(&state), vec![433], "SB 开池 ≈ 4.33BB");
+    }
+
+    /// `ante-flop2-3bet`：开池仍只有 450；UTG 开池、其余弃到 BB，BB 的 3bet = 0.5pot 1325
+    /// （450 + (950 + 450 + 350) / 2）与 1pot 2200；BB 0.5pot 3bet 后 UTG 的 4bet 只有 1pot。
+    #[test]
+    fn ante_flop2_3bet_sizes() {
+        let (abs, rules) = ante_flop2_3bet_6max(4);
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::n_max_at_bb(8, 100).with_ante(ChipAmount::new(100)),
+            abs,
+            rules,
+        )
+        .expect("8-max ante-flop2-3bet game");
+        let mut rng = ChaCha20Rng::from_seed(0xA17E_0003);
+        let rng: &mut dyn RngSource = &mut rng;
+        let raises = |state: &SimplifiedNlheState| -> Vec<(u64, u32)> {
+            SimplifiedNlheGame::legal_actions(state)
+                .into_iter()
+                .filter_map(|a| match a {
+                    AbstractAction::Raise { to, ratio_label } => {
+                        Some((to.as_u64(), ratio_label.as_milli()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut state = game.root(rng);
+        assert_eq!(raises(&state), vec![(450, 333)]);
+        let open = SimplifiedNlheGame::legal_actions(&state)
+            .into_iter()
+            .find(|a| matches!(a, AbstractAction::Raise { .. }))
+            .unwrap();
+        state = SimplifiedNlheGame::next(state, open, rng);
+        for _ in 0..6 {
+            state = SimplifiedNlheGame::next(state, AbstractAction::Fold, rng);
+        }
+        assert_eq!(
+            state.game_state.current_player(),
+            Some(SeatId(2)),
+            "弃到 BB"
+        );
+        assert_eq!(raises(&state), vec![(1325, 500), (2200, 1000)]);
+        let three_bet = SimplifiedNlheGame::legal_actions(&state)
+            .into_iter()
+            .find(|a| matches!(a, AbstractAction::Raise { ratio_label, .. } if *ratio_label == BetRatio::HALF_POT))
+            .unwrap();
+        state = SimplifiedNlheGame::next(state, three_bet, rng);
+        assert_eq!(state.game_state.current_player(), Some(SeatId(3)));
+        assert_eq!(
+            raises(&state).iter().map(|r| r.1).collect::<Vec<_>>(),
+            vec![1000]
+        );
     }
 
     /// [`cached_hand_bucket`]：9 座随机轨迹上每个决策点 `info_set`（首次 miss、再次 hit、clone

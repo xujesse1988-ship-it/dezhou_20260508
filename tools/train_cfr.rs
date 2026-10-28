@@ -51,7 +51,8 @@ struct Args {
     /// `flop2-1pot` = `all-1pot` 但 **flop 菜单 {0.5,1}pot**（0.5pot 只作首注，加注仍 1pot；
     /// preflop / turn / river 不变；9-max cap4 两表 ~78.5 GiB；见 `flop2_1pot_6max`）。
     /// `ante-flop2` = `flop2-1pot` 但 **preflop 开池只有 1/3pot**（8 座每人 1BB ante = 4.5BB），
-    /// 3bet+ 仍 1pot；配 `--ante` 用，见 `ante_flop2_6max`。
+    /// 3bet+ 仍 1pot；配 `--ante` 用，见 `ante_flop2_6max`。`ante-flop2-3bet` = `ante-flop2` 再加
+    /// 0.5pot 的 3bet 档（4bet+ 仍 1pot；8 座 ante 1BB cap4 两表 32.7 GiB），见 `ante_flop2_3bet_6max`。
     /// 名字 → 树定义的分派见 [`six_max_reshape`]。
     reshape: String,
     /// 仅 `--profile six-max`：起始码深（每座大盲数，对称）。默认 100（== 历史
@@ -318,7 +319,9 @@ fn run() -> Result<(), String> {
             let pot_after_call = 250 + u64::from(seats) * args.ante;
             let single_open = match args.reshape.as_str() {
                 "all-1pot" | "flop2-1pot" => Some(100 + pot_after_call),
-                "ante-flop2" => Some(100 + (pot_after_call * 333).div_ceil(1000)),
+                "ante-flop2" | "ante-flop2-3bet" => {
+                    Some(100 + (pot_after_call * 333).div_ceil(1000))
+                }
                 _ => None,
             };
             if let Some(open) = single_open {
@@ -748,7 +751,7 @@ fn print_usage() {
          options:\n\
          \t--profile <hu|six-max>  (default hu; six-max = 6-max 100BB A3×A4 first-small)\n\
          \t--postflop-cap <2|3|4>  (six-max only; A3×A4 width-redirect N, default 3; N=4 = 48 GiB tables)\n\
-         \t--reshape <none|nolimp|preopen|preopen-small|preopen-1pot|all-1pot|flop2-1pot|ante-flop2>  (six-max only; preopen-1pot = preopen preflop + {{1pot}} postflop, for depth grid; all-1pot = {{1pot}} on all streets incl. preflop; flop2-1pot = all-1pot but flop {{0.5,1}}pot; ante-flop2 = flop2-1pot but preflop open 1/3pot only)\n\
+         \t--reshape <none|nolimp|preopen|preopen-small|preopen-1pot|all-1pot|flop2-1pot|ante-flop2|ante-flop2-3bet>  (six-max only; preopen-1pot = preopen preflop + {{1pot}} postflop, for depth grid; all-1pot = {{1pot}} on all streets incl. preflop; flop2-1pot = all-1pot but flop {{0.5,1}}pot; ante-flop2 = flop2-1pot but preflop open 1/3pot only; ante-flop2-3bet = ante-flop2 plus a 0.5pot 3bet)\n\
          \t--stack-bb <N>          (six-max only; per-seat starting stack in BB, default 100; pair with --reshape preopen-1pot)\n\
          \t--seats <3..=9>         (six-max only; number of seats, default 6; e.g. 9 = 9-handed table)\n\
          \t--ante <chips>          (per-seat ante in chips, BB = 100, default 0, max 100; both profiles)\n\

@@ -2389,6 +2389,10 @@ fn solve_cache_key(
         sub_rules.preflop_open_small_only as u8,
         sub_rules.drop_preflop_open_allin as u8,
     ]);
+    // Only when on, so keys of every pre-existing reshape stay byte-equal.
+    if sub_rules.preflop_half_3bet {
+        h.update(b"half3bet");
+    }
     *h.finalize().as_bytes()
 }
 
