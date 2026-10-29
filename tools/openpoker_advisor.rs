@@ -3805,12 +3805,13 @@ fn preflop_entry_kinds(
     kinds
 }
 
-/// `(--exploit-pfr-shape 开关, 该座 PFR 是否收敛, 本手翻前入池方式)` → 宽度形状；`None` = 这一座
-/// 不做画像修正（`Reraise` / `Unshaped`，与开关无关）。off / PFR 未收敛 / 入池方式未知 → `TopK`（仅 VPIP）。
-fn pick_shape(on: bool, pfr_converged: bool, entry: PreflopEntry) -> Option<ExploitShape> {
+/// `(PFR-aware 形状开关, 本手翻前入池方式)` → 宽度形状；`None` = 这一座不做画像修正（`Reraise` /
+/// `Unshaped`，与开关无关）。off / 入池方式未知 → `TopK`（仅 VPIP）。PFR 不再单独设收敛门：
+/// [`OpponentProfile::pfr`] 已和 VPIP 同样往人群收缩。
+fn pick_shape(on: bool, entry: PreflopEntry) -> Option<ExploitShape> {
     match entry {
         PreflopEntry::Reraise | PreflopEntry::Unshaped => None,
-        _ if !on || !pfr_converged => Some(ExploitShape::TopK),
+        _ if !on => Some(ExploitShape::TopK),
         PreflopEntry::Passive => Some(ExploitShape::CallBand),
         PreflopEntry::Aggressive => Some(ExploitShape::RaiseBand),
         PreflopEntry::Unknown => Some(ExploitShape::TopK),
@@ -3831,7 +3832,7 @@ fn pick_shape(on: bool, pfr_converged: bool, entry: PreflopEntry) -> Option<Expl
 /// （[`synced_prefix_decisions`]）+ `strategy_fn`（blueprint σ）估 per-seat range 替代 uniform
 /// （[`PrefixReach`]）；`off`（A/B 对照臂）= uniform（既有行为）。算出的 reach 进 solve 缓存 key，
 /// 开/关自动 cache miss（`unanchored_range_design` §1/§5.1）。
-/// [`exploit_snapshot`] 的结果：per-solver-seat 已收敛画像、强度 α、各座形状。
+/// [`exploit_snapshot`] 的结果：per-solver-seat 画像（含收缩权重）、强度 α、各座形状。
 type ExploitSnapshot = (Vec<Option<OpponentProfile>>, f64, Vec<ExploitShape>);
 
 /// 叠加剥削 Tier 2 的画像快照（[`decide_search_unanchored`] 与脱锚预热 [`prewarm_inner`] 共用：两路
@@ -3854,9 +3855,11 @@ fn exploit_snapshot(
         let mut profiles: Vec<Option<OpponentProfile>> = vec![None; n_seats];
         let mut shapes: Vec<ExploitShape> = vec![ExploitShape::TopK; n_seats];
         // 重放翻前判各对手座本手入池方式：盲位过牌 / 补齐 / 防守、3bet 及以上的线 → 该座不修正（开关
-        // 无关）；其余 PFR-aware 开且该座 PFR 收敛时，被动→CallBand 掐顶端 / 主动→RaiseBand 收顶端，
-        // 否则 TopK（仅 VPIP）。重放失败 → 全 Unknown → 全 TopK。索引 = solver tree seat。
+        // 无关）；其余 PFR-aware 开时被动→CallBand 掐顶端 / 主动→RaiseBand 收顶端，否则 TopK（仅
+        // VPIP）。重放失败 → 全 Unknown → 全 TopK。索引 = solver tree seat。
         let entry_kinds = preflop_entry_kinds(req, solver_cfg, scale, smap);
+        // 人群均值里扣掉 hero（我方 bot 不代表对手人群）。
+        let hero_name = req.names.get(&req.my_seat).map(String::as_str);
         for op_seat in 0..smap.to_tree.len() {
             if op_seat == req.my_seat as usize {
                 continue; // hero
@@ -3865,10 +3868,8 @@ fn exploit_snapshot(
                 continue; // 未发牌座（短桌幻影 / 空座）
             };
             if let Some(name) = req.names.get(&(op_seat as u8)) {
-                if let Some(p) = prof.profile_for(name) {
-                    if let Some(shape) =
-                        pick_shape(pfr_shape_on, p.pfr_converged, entry_kinds[tree as usize])
-                    {
+                if let Some(p) = prof.profile_for(name, hero_name) {
+                    if let Some(shape) = pick_shape(pfr_shape_on, entry_kinds[tree as usize]) {
                         profiles[tree as usize] = Some(p);
                         shapes[tree as usize] = shape;
                     }
@@ -4802,8 +4803,8 @@ struct Args {
     /// （[`DEFAULT_SEARCH_WEAK_COMMIT_GUARD`]）。仅 `--search` 开时可设。
     search_weak_commit_guard: bool,
     /// `--exploit`（叠加剥削 Tier 2）：`Some` = 开（进程内画像 → 翻前 range 宽度先验）。**仅 `--search`
-    /// 开时可设**（拒静默 guard）。`None`（默认）= 关，全程与现网 byte-equal。子旗 `--exploit-min-hands`
-    /// / `--exploit-strength` / `--exploit-converge-se` / `--exploit-converge-drift` 填 [`ExploitConfig`]。
+    /// 开时可设**（拒静默 guard）。`None`（默认）= 关，全程与现网 byte-equal。子旗 `--exploit-shrink-k`
+    /// / `--exploit-strength` 填 [`ExploitConfig`]。
     exploit: Option<ExploitConfig>,
     /// `--warm-profile-hh <path>`：暖启动剥削画像——启动期读这个 HH JSONL（driver `--hh-log` 同一文件），
     /// 把过往牌局喂进进程内 `Profiler`（与 live observe 同口径）。**仅 `--exploit on|vpip` 时可设**
@@ -5036,8 +5037,8 @@ fn run() -> Result<(), String> {
         if let Some(cell) = &rt.exploit {
             let ec = *cell.borrow().cfg();
             eprintln!(
-                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): min_hands={} strength_alpha={} converge_se={} converge_drift={} window={} mode={}（进程内画像、不依赖过往）",
-                ec.min_hands, ec.strength_alpha, ec.converge_se, ec.converge_drift, ec.window,
+                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): shrink_k={} strength_alpha={} mode={}（进程内画像，按 n/(n+k) 收缩）",
+                ec.shrink_k, ec.strength_alpha,
                 if ec.pfr_shape { "on(VPIP+PFR/CallBand·RaiseBand)" } else { "vpip(仅VPIP/byte-equal)" }
             );
             // 暖启动（--warm-profile-hh）：启动期读过往 HH JSONL，把历史牌局喂进 Profiler（与 live
@@ -5256,10 +5257,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_weak_commit_guard: Option<bool> = None;
     // 叠加剥削（--exploit*，仅 --search 开时生效）。
     let mut exploit_on = false;
-    let mut exploit_min_hands: Option<u32> = None;
+    let mut exploit_shrink_k: Option<f64> = None;
     let mut exploit_strength: Option<f64> = None;
-    let mut exploit_converge_se: Option<f64> = None;
-    let mut exploit_converge_drift: Option<f64> = None;
     let mut exploit_pfr_shape = false;
     let mut warm_profile_hh: Option<PathBuf> = None;
     // PM-17（--exploit-4bet*，不要求 --search）。
@@ -5502,12 +5501,20 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 other => return Err(format!("--exploit 须 on|vpip|off，得 {other}")),
             },
             "--warm-profile-hh" => warm_profile_hh = Some(PathBuf::from(next_val(&mut it, &arg)?)),
-            "--exploit-min-hands" => {
-                exploit_min_hands = Some(
-                    next_val(&mut it, &arg)?
-                        .parse()
-                        .map_err(|e| format!("bad exploit-min-hands: {e}"))?,
-                )
+            "--exploit-shrink-k" => {
+                let v: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad exploit-shrink-k: {e}"))?;
+                if !(v.is_finite() && v >= 0.0) {
+                    return Err(format!("--exploit-shrink-k 须是非负数，得 {v}"));
+                }
+                exploit_shrink_k = Some(v);
+            }
+            // 2026-10-29 收缩替代了三道收敛门：旧子旗明确拒收，不静默忽略。
+            "--exploit-min-hands" | "--exploit-converge-se" | "--exploit-converge-drift" => {
+                return Err(format!(
+                    "{arg} 已删除（画像改为收缩，没有收敛门了），改用 --exploit-shrink-k"
+                ));
             }
             "--exploit-strength" => {
                 let v: f64 = next_val(&mut it, &arg)?
@@ -5517,24 +5524,6 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     return Err(format!("--exploit-strength 须在 [0,1]，得 {v}"));
                 }
                 exploit_strength = Some(v);
-            }
-            "--exploit-converge-se" => {
-                let v: f64 = next_val(&mut it, &arg)?
-                    .parse()
-                    .map_err(|e| format!("bad exploit-converge-se: {e}"))?;
-                if !(0.0..=1.0).contains(&v) {
-                    return Err(format!("--exploit-converge-se 须在 [0,1]，得 {v}"));
-                }
-                exploit_converge_se = Some(v);
-            }
-            "--exploit-converge-drift" => {
-                let v: f64 = next_val(&mut it, &arg)?
-                    .parse()
-                    .map_err(|e| format!("bad exploit-converge-drift: {e}"))?;
-                if !(0.0..=1.0).contains(&v) {
-                    return Err(format!("--exploit-converge-drift 须在 [0,1]，得 {v}"));
-                }
-                exploit_converge_drift = Some(v);
             }
             "--exploit-4bet" => {
                 let v = next_val(&mut it, &arg)?;
@@ -5627,12 +5616,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     };
     // --exploit* guard：子旗需 --exploit on|vpip；--exploit on|vpip 需 --search（剥削仅作用脱锚
     // 搜索路径）。pfr_shape 现由 --exploit 取值派生（off 时恒 false），不再单列入此 guard。
-    if !exploit_on
-        && (exploit_min_hands.is_some()
-            || exploit_strength.is_some()
-            || exploit_converge_se.is_some()
-            || exploit_converge_drift.is_some())
-    {
+    if !exploit_on && (exploit_shrink_k.is_some() || exploit_strength.is_some()) {
         return Err("设了 --exploit-* 子旗但 --exploit 非 on|vpip".to_string());
     }
     if warm_profile_hh.is_some() && !exploit_on {
@@ -5685,11 +5669,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let exploit = exploit_on.then(|| {
         let d = ExploitConfig::default();
         ExploitConfig {
-            min_hands: exploit_min_hands.unwrap_or(d.min_hands),
-            converge_se: exploit_converge_se.unwrap_or(d.converge_se),
-            converge_drift: exploit_converge_drift.unwrap_or(d.converge_drift),
+            shrink_k: exploit_shrink_k.unwrap_or(d.shrink_k),
             strength_alpha: exploit_strength.unwrap_or(d.strength_alpha),
-            window: d.window,
             pfr_shape: exploit_pfr_shape,
         }
     });
@@ -9183,7 +9164,7 @@ mod tests {
             ..SubgameSearchConfig::default()
         };
         // 对手 villain（seat 1 = SB）隔手入池：VPIP 0.5、近窗恰 0.5 → 过样本 / SE / 漂移三道门。
-        let converged_profiler = || {
+        let villain_profiler = || {
             let mut prof = Profiler::new(ExploitConfig::default());
             for k in 0..200 {
                 let action = if k % 2 == 0 { "call" } else { "fold" };
@@ -9199,14 +9180,14 @@ mod tests {
                 });
             }
             assert!(
-                prof.profile_for("villain").is_some(),
-                "测试前提：画像须已收敛"
+                prof.profile_for("villain", None).is_some(),
+                "测试前提：画像须已产出"
             );
             prof
         };
         let exploit_rt = || SearchRuntime {
             force_unanchored: true,
-            exploit: Some(RefCell::new(converged_profiler())),
+            exploit: Some(RefCell::new(villain_profiler())),
             ..rt_prefix_reach(scfg)
         };
         let names = BTreeMap::from([(1, "villain".to_string()), (2, "hero".to_string())]);
@@ -10333,7 +10314,7 @@ mod tests {
         let d = ExploitConfig::default();
         let a = parse(&["--search", "--exploit", "on"]).expect("parse Ok");
         let e = a.exploit.expect("exploit on");
-        assert_eq!(e.min_hands, d.min_hands);
+        assert!((e.shrink_k - d.shrink_k).abs() < 1e-12);
         assert!((e.strength_alpha - d.strength_alpha).abs() < 1e-12);
         assert!(e.pfr_shape, "--exploit on → VPIP+PFR 形状");
         // --exploit vpip → 仅 VPIP（pfr_shape 关，与现网逐位 byte-equal）。
@@ -10347,18 +10328,30 @@ mod tests {
             "--search",
             "--exploit",
             "on",
-            "--exploit-min-hands",
-            "300",
+            "--exploit-shrink-k",
+            "30",
             "--exploit-strength",
             "0.3",
         ])
         .expect("parse Ok");
         let e = a.exploit.expect("exploit on");
-        assert_eq!(e.min_hands, 300);
+        assert!((e.shrink_k - 30.0).abs() < 1e-12);
         assert!((e.strength_alpha - 0.3).abs() < 1e-12);
         assert!(e.pfr_shape);
         // 出界拒收。
         assert!(parse(&["--search", "--exploit", "on", "--exploit-strength", "1.5"]).is_err());
+        assert!(parse(&["--search", "--exploit", "on", "--exploit-shrink-k", "-1"]).is_err());
+        // 已删除的收敛门子旗明确拒收。
+        for old in [
+            "--exploit-min-hands",
+            "--exploit-converge-se",
+            "--exploit-converge-drift",
+        ] {
+            assert!(
+                parse(&["--search", "--exploit", "on", old, "100"]).is_err(),
+                "{old}"
+            );
+        }
         // --warm-profile-hh：需 --exploit on|vpip；on / vpip 都接（都用画像）。
         assert!(
             parse(&["--search", "--warm-profile-hh", "x.jsonl"]).is_err(),
@@ -10403,25 +10396,17 @@ mod tests {
     fn pick_shape_guards_byte_equal() {
         use PreflopEntry::*;
         let topk = Some(ExploitShape::TopK);
-        // off → TopK（仅 VPIP），无论入池方式 / PFR 收敛。
-        assert_eq!(pick_shape(false, true, Passive), topk);
-        assert_eq!(pick_shape(false, true, Aggressive), topk);
-        // on 但 PFR 未收敛 → TopK（退仅 VPIP）。
-        assert_eq!(pick_shape(true, false, Passive), topk);
-        // on + PFR 收敛 → 按入池方式选。
-        assert_eq!(
-            pick_shape(true, true, Passive),
-            Some(ExploitShape::CallBand)
-        );
-        assert_eq!(
-            pick_shape(true, true, Aggressive),
-            Some(ExploitShape::RaiseBand)
-        );
-        assert_eq!(pick_shape(true, true, Unknown), topk);
+        // off → TopK（仅 VPIP），无论入池方式。
+        assert_eq!(pick_shape(false, Passive), topk);
+        assert_eq!(pick_shape(false, Aggressive), topk);
+        // on → 按入池方式选。
+        assert_eq!(pick_shape(true, Passive), Some(ExploitShape::CallBand));
+        assert_eq!(pick_shape(true, Aggressive), Some(ExploitShape::RaiseBand));
+        assert_eq!(pick_shape(true, Unknown), topk);
         // 3bet 及以上 / 盲位被动入池 → 不修正，与开关无关。
-        for (on, conv) in [(false, false), (true, false), (true, true)] {
-            assert_eq!(pick_shape(on, conv, Reraise), None);
-            assert_eq!(pick_shape(on, conv, Unshaped), None);
+        for on in [false, true] {
+            assert_eq!(pick_shape(on, Reraise), None);
+            assert_eq!(pick_shape(on, Unshaped), None);
         }
     }
 

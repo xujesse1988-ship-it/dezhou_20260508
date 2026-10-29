@@ -1650,7 +1650,7 @@ pub fn chen_score(hole: [Card; 2]) -> f64 {
 ///
 /// - `ranges_opt = None`（无 GTO range 信号，如 limp 池首动作即 desync）→ **不剥削**（v1 限制，
 ///   返回 None 维持 uniform 采样路径）。
-/// - `Some(r)` → 对每个**已收敛对手座**（`profiles[seat]=Some`、非 hero、非弃牌）把 `r[seat]` 与
+/// - `Some(r)` → 对每个**有画像的对手座**（`profiles[seat]=Some`、非 hero、非弃牌）把 `r[seat]` 与
 ///   「VPIP 宽度分布」`w` 凸混合：`r'=(1−α)·r_norm+α·w`，`w` = 按 Chen 序取 top `ceil(vpip·n_valid)`
 ///   个 combo 权 1、其余 [`EXPLOIT_WIDTH_FLOOR`]，归一。
 ///
@@ -1658,6 +1658,8 @@ pub fn chen_score(hole: [Card; 2]) -> f64 {
 /// `w` 收窄到强牌→solver 多弃多偷（设计草案 §2/§4 意图）。`shapes`（per-seat [`ExploitShape`]，
 /// 下标 = seat；缺位 / 空切片 → `TopK`）选每座 `w` 取哪一段：`TopK`（仅 VPIP，byte-equal）/
 /// `CallBand` / `RaiseBand`（PFR-aware，掐顶端 / 收顶端）。
+///
+/// 每座实际强度 = clamp 后的 α × 该座 [`OpponentProfile::weight`]（样本越少越弱）。
 ///
 /// 安全：α clamp [0, [`EXPLOIT_ALPHA_CAP`]]；`w` 自带地板 → 永不过窄 / NaN；card-removal（撞 board
 /// 两侧皆 0）保持；**hero 座永不动**（复用 [`mix_lambda_for_seat`] 语义）。结果进 `solve_cache_key`
@@ -1699,14 +1701,19 @@ pub fn apply_exploit_width_prior(
             continue; // hero range 不动
         }
         let Some(prof) = profiles.get(seat).copied().flatten() else {
-            continue; // 未收敛 / 无画像 → 不剥削该座
+            continue; // 无画像 / 不修正的线 → 不剥削该座
         };
         if slot.len() != holes.len() {
             continue; // 弃牌座（空 vec）/ 维度不符 → 跳过
         }
+        // 样本少 → 权重小（[`OpponentProfile::weight`] = n/(n+k)），该座按 α×weight 混。
+        let seat_alpha = alpha * prof.weight.clamp(0.0, 1.0);
+        if seat_alpha <= 0.0 {
+            continue;
+        }
         let shape = shapes.get(seat).copied().unwrap_or_default(); // 缺位 = TopK
         let band = width_band(prof.vpip, prof.pfr, n_valid, shape);
-        tilt_seat_to_width(slot, band, &valid, n_valid, &order, alpha);
+        tilt_seat_to_width(slot, band, &valid, n_valid, &order, seat_alpha);
     }
     Some(ranges)
 }
@@ -3466,7 +3473,7 @@ pub fn subgame_search_unanchored_cached_cross(
 }
 
 /// [`subgame_search_unanchored_cached_cross`] + **叠加剥削先验**（`exploit_strategy_design_2026_06_14`
-/// Tier 2）。`exploit = Some` → 在档二′/档一/uniform 算出的对手 root range 上，对每个已收敛对手座按
+/// Tier 2）。`exploit = Some` → 在档二′/档一/uniform 算出的对手 root range 上，对每个有画像的对手座按
 /// 其观测翻前 VPIP 宽度凸混合（[`apply_exploit_width_prior`]）。`None`（默认 / `--exploit` 关）= 薄包装的
 /// [`subgame_search_unanchored_cached_cross`]，**逐位 byte-equal**。剥削 ranges 进 solve 缓存 key →
 /// 开/关/画像更新自动 cache-miss、不串均衡。
@@ -3694,7 +3701,7 @@ fn subgame_search_unanchored_cached_inner(
     let prefix_hit = prefix_ranges.is_some(); // 调试：range 来源标注用（cross > prefix > uniform）。
     let mut ranges_opt: Option<Vec<Vec<f64>>> = cross_ranges.or(prefix_ranges);
 
-    // 叠加剥削 Tier 2（exploit_strategy_design §2/§4）：在 GTO range 上对已收敛对手座按观测翻前
+    // 叠加剥削 Tier 2（exploit_strategy_design §2/§4）：在 GTO range 上对有画像的对手座按观测翻前
     // VPIP 宽度凸混合。`exploit = None`（默认 / --exploit 关）→ 此块不执行 → ranges_opt 不变、与
     // 既有 _cross 路径逐位 byte-equal。剥削后的 ranges 同进下面的 solve_cache_key → 开/关/画像更新
     // 自动 cache-miss、不串均衡。hero（auth_actor）座永不动（apply_exploit_width_prior 内守）。
@@ -4060,7 +4067,7 @@ mod tests {
         OpponentProfile {
             vpip,
             pfr,
-            pfr_converged: true,
+            weight: 1.0,
             postflop_af: 0.0,
             n_preflop: 200,
             n_postflop: 0,
@@ -4109,6 +4116,35 @@ mod tests {
             &[],
         );
         assert_eq!(out0.unwrap(), r, "α=0 → 恒等");
+    }
+
+    #[test]
+    fn exploit_weight_scales_alpha() {
+        let holes = all_hole_combos();
+        // 非均匀起点（否则混合前后差别看不出权重）。
+        let r: Vec<f64> = (0..1326).map(|i| (1 + i % 7) as f64).collect();
+        let sum: f64 = r.iter().sum();
+        let r = vec![vec![], r.iter().map(|x| x / sum).collect::<Vec<_>>()];
+        let run = |weight: f64, alpha: f64| {
+            let p = OpponentProfile {
+                weight,
+                ..prof(0.3)
+            };
+            apply_exploit_width_prior(
+                Some(r.clone()),
+                &[None, Some(p)],
+                0,
+                &holes,
+                &[],
+                alpha,
+                &[],
+            )
+            .unwrap()
+        };
+        // 每座强度 = α × weight：weight 0.5 / α 0.6 与 weight 1 / α 0.3 逐位相同。
+        assert_eq!(run(0.5, 0.6), run(1.0, 0.3));
+        // weight 0 → 该座不动。
+        assert_eq!(run(0.0, 0.6), r);
     }
 
     #[test]

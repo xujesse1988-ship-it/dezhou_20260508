@@ -1,10 +1,10 @@
 //! 进程内对手画像（叠加剥削 Tier 2 的统计层，`exploit_strategy_design_2026_06_14` 实现）。
 //!
-//! **只用当前进程的数据、不依赖过往**（用户拍板偏离设计草案 §5.1 的跨 session profile DB）：
-//! [`Profiler`] 进程启动时空，靠 driver 每手结束发来的 `observe` 消息（[`ObserveHand`]）累积
-//! per-name 频率统计；**仅当某玩家行为频率有收敛趋势**（[`Profiler::profile_for`] 三条门全过）
-//! 才产出 [`OpponentProfile`]，供搜索层（`subgame::apply_exploit_width_prior`）把对手子博弈
-//! root range 朝其观测翻前宽度偏置。
+//! **只用当前进程的数据**（`--warm-profile-hh` 暖启动另算）：[`Profiler`] 进程启动时空，靠 driver
+//! 每手结束发来的 `observe` 消息（[`ObserveHand`]）累积 per-name 频率统计。[`Profiler::profile_for`]
+//! 对见过的玩家都产出 [`OpponentProfile`]，样本少时**收缩**而不是拒绝：VPIP / PFR 按 `k` 手伪样本往
+//! 人群均值拉，剥削权重 `n/(n+k)` 随样本增加（`docs/temp/preflop_range_offanchor_research_2026_10_29.md`
+//! §4.1）。搜索层（`subgame::apply_exploit_width_prior`）据此把对手子博弈 root range 朝其翻前宽度偏置。
 //!
 //! 口径（coarse 但几百手够，设计草案 §1）：
 //! - **VPIP** = 翻前曾主动 call/bet/raise（盲注不入 `actions` → 不计）的手占比。
@@ -15,7 +15,7 @@
 //! `reference_openpoker_hh_jsonl_parsing`），故 observe 覆盖整手所有座位的动作（含我退出后的街），
 //! 对手统计无「只看我参与的线」偏差。街由 driver 侧可靠跟踪（避开 `actions_ext.street` 错位坑）。
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 
@@ -47,21 +47,18 @@ pub struct ObserveHand {
     pub actions: Vec<ObsAction>,
 }
 
-/// 已收敛对手的画像摘要（[`Profiler::profile_for`] 仅收敛才产出）。`Copy` 便于决策路径收集成
-/// per-solver-seat 向量。
+/// 对手画像摘要（[`Profiler::profile_for`] 产出）。`Copy` 便于决策路径收集成 per-solver-seat 向量。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OpponentProfile {
-    /// 翻前入池率 ∈ [0,1]（翻前宽度 tilt 唯一驱动量）。
+    /// 收缩后的翻前入池率 ∈ [0,1]（翻前宽度 tilt 的驱动量）：`(n·实测 + k·人群) / (n + k)`。
     pub vpip: f64,
-    /// 翻前加注率 ∈ [0,1]（PFR-aware 形状用：见 [`pfr_converged`](Self::pfr_converged)）。
+    /// 收缩后的翻前加注率 ∈ [0,1]（PFR-aware 形状用），口径同 `vpip`；收缩前后都保持 `pfr ≤ vpip`。
     pub pfr: f64,
-    /// PFR 是否也收敛（`se(pfr) ≤ converge_se`，分母同 VPIP 门的 `n_preflop`）。`true` 才允许搜索层
-    /// 据 PFR 选 `CallBand`/`RaiseBand` 形状；`false` → 退 `TopK`（仅 VPIP）。VPIP 已收敛是前提
-    /// （`profile_for` 只在 VPIP 三门全过才产出画像）。
-    pub pfr_converged: bool,
+    /// 剥削权重 `n/(n+k)` ∈ [0,1)：搜索层的混合强度 = `strength_alpha × weight`。
+    pub weight: f64,
     /// 翻后激进度 = (bet+raise+allin)/call（v1 仅遥测 + 未来激进度轴）。
     pub postflop_af: f64,
-    /// 翻前样本量（收敛门分母）。
+    /// 翻前样本量。
     pub n_preflop: u32,
     /// 翻后计入的动作数（aggr+passive）。
     pub n_postflop: u32,
@@ -70,30 +67,22 @@ pub struct OpponentProfile {
 /// 剥削配置（CLI 可调；`Copy` 纯配置）。
 #[derive(Debug, Clone, Copy)]
 pub struct ExploitConfig {
-    /// 最小翻前样本（设计草案 §1「N≥150 可信样本」）。
-    pub min_hands: u32,
-    /// VPIP 标准误上限（设计草案 §1「VPIP 400 手 SE≈2%」；`se=sqrt(p(1-p)/n)`）。
-    pub converge_se: f64,
-    /// 近窗 VPIP 与累计 VPIP 的最大漂移（拦「行为还在漂」的玩家 = 收敛**趋势**而非仅样本量）。
-    pub converge_drift: f64,
-    /// 翻前宽度 tilt 的混合强度 α（搜索层用；clamp 见 `subgame::apply_exploit_width_prior`）。
+    /// 收缩伪样本数 `k`（手）：`n = k` 时实测与人群各占一半、剥削权重 0.5。
+    pub shrink_k: f64,
+    /// 翻前宽度 tilt 的混合强度 α（样本无穷多时的上限；搜索层再乘 `weight`，clamp 见
+    /// `subgame::apply_exploit_width_prior`）。
     pub strength_alpha: f64,
-    /// 漂移检测的近窗手数。
-    pub window: usize,
     /// PFR-aware 宽度形状开关（advisor `--exploit on` 置 `true`、`--exploit vpip` 置 `false`）。
-    /// `false`（默认）= 全程 `TopK`（仅 VPIP，与现有 exploit 行为逐位 byte-equal）；`true` = 据对手
-    /// PFR 收敛性 + 本手翻前入池方式选 `CallBand`（被动入池掐顶端）/`RaiseBand`（主动入池收顶端）。
+    /// `false`（默认）= 全程 `TopK`（仅 VPIP）；`true` = 据本手翻前入池方式选 `CallBand`（被动入池掐顶端）
+    /// / `RaiseBand`（主动入池收顶端）。
     pub pfr_shape: bool,
 }
 
 impl Default for ExploitConfig {
     fn default() -> Self {
         ExploitConfig {
-            min_hands: 150,
-            converge_se: 0.05,
-            converge_drift: 0.08,
+            shrink_k: 50.0,
             strength_alpha: 0.5,
-            window: 50,
             pfr_shape: false,
         }
     }
@@ -139,38 +128,21 @@ fn is_postflop(street: &str) -> bool {
     )
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 struct NameStats {
     n_preflop: u32,
     vpip_count: u32,
     pfr_count: u32,
     postflop_aggr: u32,
     postflop_passive: u32,
-    /// 近窗 VPIP 0/1（漂移检测；长度 ≤ `cfg.window`）。
-    window: VecDeque<u8>,
-    window_sum: u32,
-}
-
-impl NameStats {
-    fn push_window(&mut self, voluntary: bool, cap: usize) {
-        if cap == 0 {
-            return;
-        }
-        let v = u8::from(voluntary);
-        self.window.push_back(v);
-        self.window_sum += u32::from(v);
-        while self.window.len() > cap {
-            if let Some(old) = self.window.pop_front() {
-                self.window_sum -= u32::from(old);
-            }
-        }
-    }
 }
 
 /// 进程内 per-name 对手画像累积器。
 pub struct Profiler {
     cfg: ExploitConfig,
     stats: HashMap<String, NameStats>,
+    /// 所有名字的翻前计数之和（人群均值用；`profile_for` 里扣掉目标和 hero）。
+    total: NameStats,
 }
 
 impl Profiler {
@@ -178,6 +150,7 @@ impl Profiler {
         Profiler {
             cfg,
             stats: HashMap::new(),
+            total: NameStats::default(),
         }
     }
 
@@ -219,20 +192,17 @@ impl Profiler {
                 }
             }
         }
-        let window = self.cfg.window;
         for (seat, (voluntary, raised)) in pre {
             let Some(name) = hand.names.get(&seat) else {
                 continue; // 无名座：无法按名 key，跳过。
             };
             let st = self.stats.entry(name.clone()).or_default();
             st.n_preflop += 1;
-            if voluntary {
-                st.vpip_count += 1;
-            }
-            if raised {
-                st.pfr_count += 1;
-            }
-            st.push_window(voluntary, window);
+            st.vpip_count += u32::from(voluntary);
+            st.pfr_count += u32::from(raised);
+            self.total.n_preflop += 1;
+            self.total.vpip_count += u32::from(voluntary);
+            self.total.pfr_count += u32::from(raised);
         }
         for (seat, (aggr, passive)) in post {
             let Some(name) = hand.names.get(&seat) else {
@@ -244,38 +214,50 @@ impl Profiler {
         }
     }
 
-    /// 已收敛才产出画像（三条门：样本量 / VPIP 标准误 / 近窗漂移）。任一未过 → `None`（搜索层
-    /// 对该座不剥削，回退 GTO）。
-    pub fn profile_for(&self, name: &str) -> Option<OpponentProfile> {
+    /// `name` 的画像；没见过（无翻前样本）→ `None`。`hero` = 我方名字（人群均值里扣掉，我方是 bot，
+    /// 不代表对手人群）。
+    ///
+    /// 收缩：`vpip = (n·vpip_实测 + k·vpip_人群) / (n + k)`，PFR 同式，`weight = n/(n+k)`。人群 =
+    /// 除目标和 hero 之外所有名字的翻前计数之和；人群为空 → 用目标自己的实测（只靠 `weight` 收缩）。
+    pub fn profile_for(&self, name: &str, hero: Option<&str>) -> Option<OpponentProfile> {
         let st = self.stats.get(name)?;
-        if st.n_preflop < self.cfg.min_hands {
+        if st.n_preflop == 0 {
             return None;
         }
-        let n = f64::from(st.n_preflop);
-        let vpip = f64::from(st.vpip_count) / n;
-        let se = (vpip * (1.0 - vpip) / n).sqrt();
-        if se > self.cfg.converge_se {
-            return None;
-        }
-        if !st.window.is_empty() {
-            let wlen = st.window.len() as f64;
-            let wv = f64::from(st.window_sum) / wlen;
-            if (wv - vpip).abs() > self.cfg.converge_drift {
-                return None; // 行为还在漂 → 不算收敛趋势。
+        let mut pool = self.total;
+        let mut minus = |x: &NameStats| {
+            pool.n_preflop -= x.n_preflop;
+            pool.vpip_count -= x.vpip_count;
+            pool.pfr_count -= x.pfr_count;
+        };
+        minus(st);
+        if let Some(h) = hero.filter(|&h| h != name) {
+            if let Some(hs) = self.stats.get(h) {
+                minus(hs);
             }
         }
-        let pfr = f64::from(st.pfr_count) / n;
-        // PFR 也用同口径 SE 门（分母同 n_preflop，VPIP 三门已过 → n≥min_hands）。se(pfr)=0（pfr=0/1，
-        // 如 3bet=0 的纯被动跟注站）天然收敛 = 我们对其「不加注」很确定。
-        let se_pfr = (pfr * (1.0 - pfr) / n).sqrt();
-        let pfr_converged = se_pfr <= self.cfg.converge_se;
+        let n = f64::from(st.n_preflop);
+        let rate = |count: u32, of: u32| f64::from(count) / f64::from(of);
+        let (vpip_raw, pfr_raw) = (
+            rate(st.vpip_count, st.n_preflop),
+            rate(st.pfr_count, st.n_preflop),
+        );
+        let (vpip_pop, pfr_pop) = if pool.n_preflop > 0 {
+            (
+                rate(pool.vpip_count, pool.n_preflop),
+                rate(pool.pfr_count, pool.n_preflop),
+            )
+        } else {
+            (vpip_raw, pfr_raw)
+        };
+        let k = self.cfg.shrink_k.max(0.0);
+        let weight = n / (n + k);
         let denom = st.postflop_passive.max(1);
-        let postflop_af = f64::from(st.postflop_aggr) / f64::from(denom);
         Some(OpponentProfile {
-            vpip,
-            pfr,
-            pfr_converged,
-            postflop_af,
+            vpip: weight * vpip_raw + (1.0 - weight) * vpip_pop,
+            pfr: weight * pfr_raw + (1.0 - weight) * pfr_pop,
+            weight,
+            postflop_af: f64::from(st.postflop_aggr) / f64::from(denom),
             n_preflop: st.n_preflop,
             n_postflop: st.postflop_aggr + st.postflop_passive,
         })
@@ -317,13 +299,7 @@ mod tests {
 
     #[test]
     fn short_allin_call_counts_as_vpip_not_pfr() {
-        let cfg = ExploitConfig {
-            min_hands: 1,
-            converge_se: 1.0,
-            converge_drift: 1.0,
-            ..Default::default()
-        };
-        let mut p = Profiler::new(cfg);
+        let mut p = Profiler::new(ExploitConfig::default());
         let allin = |cd: Option<u64>, tc: Option<u64>| ObserveHand {
             names: [(0, "s".to_string())].into_iter().collect(),
             actions: vec![ObsAction {
@@ -339,80 +315,67 @@ mod tests {
         p.observe_hand(&allin(Some(100), Some(100)));
         p.observe_hand(&allin(Some(300), Some(100)));
         p.observe_hand(&allin(None, None));
-        let prof = p.profile_for("s").expect("收敛门已放开");
+        // 只有一个名字 → 人群为空，vpip / pfr 就是实测。
+        let prof = p.profile_for("s", None).expect("见过");
         assert_eq!(prof.n_preflop, 4);
         assert!((prof.vpip - 1.0).abs() < 1e-12, "vpip={}", prof.vpip);
         assert!((prof.pfr - 0.5).abs() < 1e-12, "pfr={}", prof.pfr);
     }
 
-    #[test]
-    fn below_min_hands_not_converged() {
-        let cfg = ExploitConfig {
-            min_hands: 150,
-            ..Default::default()
-        };
-        let mut p = Profiler::new(cfg);
-        for _ in 0..100 {
-            p.observe_hand(&hand(&[(0, "x")], &[(0, "preflop", "call")]));
+    /// 喂 `n` 手：前 `vpip_hands` 手平跟（入池不加注）、其余弃牌。
+    fn feed(p: &mut Profiler, seat: u8, name: &str, n: u32, vpip_hands: u32) {
+        for i in 0..n {
+            let act = if i < vpip_hands { "call" } else { "fold" };
+            p.observe_hand(&hand(&[(seat, name)], &[(seat, "preflop", act)]));
         }
-        assert!(p.profile_for("x").is_none(), "100 < 150 手不应收敛");
     }
 
     #[test]
-    fn stable_loose_player_converges_with_high_vpip() {
-        let cfg = ExploitConfig {
-            min_hands: 150,
-            converge_se: 0.05,
-            converge_drift: 0.1,
-            ..Default::default()
-        };
-        let mut p = Profiler::new(cfg);
-        // 稳定 40% VPIP（每 5 手 2 主动入池、3 弃）：n=400。
-        for i in 0..400 {
-            let act = if i % 5 < 2 { "call" } else { "fold" };
-            p.observe_hand(&hand(&[(2, "loose")], &[(2, "preflop", act)]));
-        }
-        let prof = p.profile_for("loose").expect("400 稳定手应收敛");
-        assert_eq!(prof.n_preflop, 400);
-        assert!(
-            (prof.vpip - 0.4).abs() < 0.02,
-            "vpip 应≈0.40，得 {}",
-            prof.vpip
-        );
+    fn unseen_name_has_no_profile() {
+        let mut p = Profiler::new(ExploitConfig::default());
+        feed(&mut p, 0, "a", 10, 5);
+        assert!(p.profile_for("b", None).is_none());
     }
 
     #[test]
-    fn drifting_player_not_converged() {
-        // 前半极松(80%)、后半极紧(0%)：累计 vpip≈0.4 但近窗≈0 → 漂移门拦下。
-        let cfg = ExploitConfig {
-            min_hands: 150,
-            converge_se: 0.1, // 放宽 SE，单独验漂移门
-            converge_drift: 0.08,
-            window: 50,
+    fn shrinks_toward_population_and_weight_grows() {
+        let mut p = Profiler::new(ExploitConfig {
+            shrink_k: 50.0,
             ..Default::default()
-        };
-        let mut p = Profiler::new(cfg);
-        for _ in 0..200 {
-            p.observe_hand(&hand(&[(1, "drift")], &[(1, "preflop", "raise")]));
-        }
-        for _ in 0..200 {
-            p.observe_hand(&hand(&[(1, "drift")], &[(1, "preflop", "fold")]));
-        }
-        assert!(
-            p.profile_for("drift").is_none(),
-            "近窗 VPIP≈0 vs 累计≈0.4，漂移应拦下"
-        );
+        });
+        // 人群：两个人共 200 手、VPIP 0.2。
+        feed(&mut p, 1, "x", 100, 10);
+        feed(&mut p, 2, "y", 100, 30);
+        // 目标 50 手、VPIP 0.6 → n = k：实测与人群各半 → 0.4，权重 0.5。
+        feed(&mut p, 3, "t", 50, 30);
+        let prof = p.profile_for("t", None).unwrap();
+        assert!((prof.weight - 0.5).abs() < 1e-12, "{prof:?}");
+        assert!((prof.vpip - 0.4).abs() < 1e-12, "{prof:?}");
+        assert!(prof.pfr <= prof.vpip);
+        // 再 100 手同频率（共 150 手、VPIP 0.6）→ 权重 0.75，vpip = 0.75·0.6 + 0.25·0.2。
+        feed(&mut p, 3, "t", 100, 60);
+        let prof = p.profile_for("t", None).unwrap();
+        assert!((prof.weight - 0.75).abs() < 1e-12, "{prof:?}");
+        assert!((prof.vpip - 0.5).abs() < 1e-12, "{prof:?}");
+    }
+
+    #[test]
+    fn hero_excluded_from_population() {
+        let mut p = Profiler::new(ExploitConfig::default());
+        feed(&mut p, 1, "x", 200, 40); // 人群 VPIP 0.2
+        feed(&mut p, 3, "t", 50, 30); // 目标 VPIP 0.6
+        let want = p.profile_for("t", None).unwrap();
+        // hero 每手都入池：扣掉后人群不变，结果与没有 hero 时逐位相同。
+        feed(&mut p, 0, "bot", 300, 300);
+        assert_eq!(p.profile_for("t", Some("bot")), Some(want));
+        assert_ne!(p.profile_for("t", None), Some(want), "不扣 hero 人群会变");
+        // hero 自己也能查（扣自己一次，不重复扣）。
+        assert!(p.profile_for("bot", Some("bot")).is_some());
     }
 
     #[test]
     fn vpip_pfr_af_counting() {
-        let cfg = ExploitConfig {
-            min_hands: 1,
-            converge_se: 1.0,
-            converge_drift: 1.0,
-            ..Default::default()
-        };
-        let mut p = Profiler::new(cfg);
+        let mut p = Profiler::new(ExploitConfig::default());
         // 一手：seat0 翻前 raise（vpip+pfr），翻后 bet（aggr）再 call（passive）。
         p.observe_hand(&hand(
             &[(0, "h")],
@@ -422,7 +385,7 @@ mod tests {
                 (0, "turn", "call"),
             ],
         ));
-        let prof = p.profile_for("h").unwrap();
+        let prof = p.profile_for("h", None).unwrap();
         assert_eq!(prof.vpip, 1.0);
         assert_eq!(prof.pfr, 1.0);
         assert_eq!(prof.n_postflop, 2);
@@ -431,16 +394,10 @@ mod tests {
 
     #[test]
     fn bb_check_is_not_vpip() {
-        let cfg = ExploitConfig {
-            min_hands: 1,
-            converge_se: 1.0,
-            converge_drift: 1.0,
-            ..Default::default()
-        };
-        let mut p = Profiler::new(cfg);
+        let mut p = Profiler::new(ExploitConfig::default());
         // BB 免费过牌 → 非主动入池（盲注不入 actions，首动作 check）。
         p.observe_hand(&hand(&[(0, "bb")], &[(0, "preflop", "check")]));
-        let prof = p.profile_for("bb").unwrap();
+        let prof = p.profile_for("bb", None).unwrap();
         assert_eq!(prof.vpip, 0.0, "BB check 不计 VPIP");
     }
 }

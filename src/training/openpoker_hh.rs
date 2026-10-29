@@ -571,18 +571,22 @@ mod tests {
         let seats: Vec<u8> = obs.actions.iter().map(|a| a.seat).collect();
         assert_eq!(seats, [3, 4, 5, 0, 1, 2, 1, 2, 1, 2, 1, 2]);
         // 喂 Profiler 200×（与 live observe 同口径）：bot1（SB 仅 call）vpip=1/pfr=0、bot3（preflop fold）vpip=0。
-        let mut p = Profiler::new(ExploitConfig::default());
+        // shrink_k = 0：不往人群收缩，直接读实测频率。
+        let mut p = Profiler::new(ExploitConfig {
+            shrink_k: 0.0,
+            ..Default::default()
+        });
         for _ in 0..200 {
             p.observe_hand(&obs);
         }
-        let b1 = p.profile_for("bot1").expect("bot1 收敛");
+        let b1 = p.profile_for("bot1", None).expect("bot1 见过");
         assert!(
             (b1.vpip - 1.0).abs() < 1e-9 && b1.pfr.abs() < 1e-9,
             "SB 仅 call：vpip=1 pfr=0，得 vpip={} pfr={}",
             b1.vpip,
             b1.pfr
         );
-        let b3 = p.profile_for("bot3").expect("bot3 收敛");
+        let b3 = p.profile_for("bot3", None).expect("bot3 见过");
         assert!(b3.vpip.abs() < 1e-9, "preflop fold：vpip=0，得 {}", b3.vpip);
     }
 

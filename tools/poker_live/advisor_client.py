@@ -170,12 +170,10 @@ def add_advisor_args(p, default_seats, debug_help):
     # 叠加剥削（Tier 2，exploit_strategy_design_2026_06_14）：进程内对手画像 → 翻前 range 宽度先验。
     # 需配 --search（仅挂脱锚搜索路径）。缺省关 = 全程与现网 byte-equal（不带 names、不发 observe）。
     p.add_argument("--exploit", choices=["on", "vpip", "off"], default="off",
-                   help="叠加剥削三态：on=VPIP+PFR 形状（被动入池→CallBand/主动→RaiseBand，需 PFR 收敛）/ "
+                   help="叠加剥削三态：on=VPIP+PFR 形状（被动入池→CallBand/主动→RaiseBand）/ "
                         "vpip=仅 VPIP 宽度（与现网逐位 byte-equal）/ off=关（默认）；on|vpip 需 --search")
-    p.add_argument("--exploit-min-hands", type=int, default=None)
+    p.add_argument("--exploit-shrink-k", type=float, default=None)
     p.add_argument("--exploit-strength", type=float, default=None)
-    p.add_argument("--exploit-converge-se", type=float, default=None)
-    p.add_argument("--exploit-converge-drift", type=float, default=None)
 
 
 def exploit_enabled(args):
@@ -191,9 +189,7 @@ def validate_advisor_args(args):
     exploit_on = exploit_enabled(args)
     if exploit_on and not args.search:
         raise SystemExit("--exploit on|vpip 需配 --search（剥削只挂脱锚搜索路径；没有搜索无处叠加）")
-    if (args.exploit_min_hands is not None or args.exploit_strength is not None
-            or args.exploit_converge_se is not None or args.exploit_converge_drift is not None) \
-            and not exploit_on:
+    if (args.exploit_shrink_k is not None or args.exploit_strength is not None) and not exploit_on:
         raise SystemExit("--exploit-* 子旗需配 --exploit on|vpip")
     if args.search_prewarm and not args.search:
         raise SystemExit("--search-prewarm 需配 --search（拒绝静默：没有搜索就没有可预热的 solve）")
@@ -282,14 +278,10 @@ def advisor_extra_args(args, warm_profile_hh=None):
     # 叠加剥削透传（仅 on|vpip 时；advisor 侧 guard 再校验需 --search）。三态原样透传给 advisor。
     if exploit_enabled(args):
         extra += ["--exploit", args.exploit]
-        if args.exploit_min_hands is not None:
-            extra += ["--exploit-min-hands", str(args.exploit_min_hands)]
+        if args.exploit_shrink_k is not None:
+            extra += ["--exploit-shrink-k", str(args.exploit_shrink_k)]
         if args.exploit_strength is not None:
             extra += ["--exploit-strength", str(args.exploit_strength)]
-        if args.exploit_converge_se is not None:
-            extra += ["--exploit-converge-se", str(args.exploit_converge_se)]
-        if args.exploit_converge_drift is not None:
-            extra += ["--exploit-converge-drift", str(args.exploit_converge_drift)]
         if warm_profile_hh:
             extra += ["--warm-profile-hh", warm_profile_hh]
     # --debug-log 透传给 advisor：打印决策流水线 + range/solve 中间数据（与 --search 正交，
