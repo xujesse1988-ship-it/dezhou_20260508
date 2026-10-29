@@ -1791,7 +1791,7 @@ fn hero_limp_coef(
     out
 }
 
-/// 被平跟当弃牌映射过、且之后在翻前又加注（[`preflop_entry_kinds`] = `Aggressive`）的非 hero 座位
+/// 被平跟当弃牌映射过、且之后在翻前又加注（[`preflop_entry_kinds`] = `Aggressive` / `Reraise`）的非 hero 座位
 /// （tree seat）。扫整段翻前历史，不只看触发 `limper_continued` 的那一步：lockstep 在第一次失同步就停，
 /// 两个平跟者时第二个人的再加注不会出现在 [`LockstepErr`] 里。重放失败 → 全 `Unknown` → 空（旧行为）。
 fn limp_raisers(
@@ -1810,7 +1810,13 @@ fn limp_raisers(
         .folds
         .iter()
         .map(|&(_, s)| s)
-        .filter(|&s| s != hero && kinds[s as usize] == PreflopEntry::Aggressive)
+        .filter(|&s| {
+            s != hero
+                && matches!(
+                    kinds[s as usize],
+                    PreflopEntry::Aggressive | PreflopEntry::Reraise
+                )
+        })
         .collect();
     seats.sort_unstable();
     seats.dedup();
@@ -3695,15 +3701,22 @@ fn flop_blueprint_size_gate(sizes: &[BetSizeMap], street: poker::Street) -> Resu
     Ok(())
 }
 
-/// PFR-aware 形状用：一个对手座本手**翻前**的入池方式（[`preflop_entry_kinds`] 重放判定）。
+/// 一个对手座本手**翻前**的入池方式（[`preflop_entry_kinds`] 重放判定）：决定画像修正用哪种宽度形状，
+/// 或这一座干脆不修正。画像只有全局 VPIP / PFR，只能描述「非盲位平跟 / 平跟一次加注」和「开池加注」
+/// 两类线；盲位的过牌 / 补齐 / 防守、3bet 及以上的线它都描述不了，套上去方向是错的
+/// （`docs/temp/preflop_range_offanchor_research_2026_10_29.md` §2.1 / §2.2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreflopEntry {
     /// 无翻前动作记录 / 重放失败 / 该座弃牌 → 不据 PFR 选形状（退 `TopK`）。
     Unknown,
-    /// 仅 limp/call/check 进池（无主动加注）→ `CallBand`（掐顶端会加注的强牌）。
+    /// 非盲位平跟、或面对一次加注跟注（没加注过）→ `CallBand`（掐顶端会加注的强牌）。
     Passive,
-    /// 翻前 raise/bet/all_in 过（主动入池）→ `RaiseBand`（收到顶端加注 range）。
+    /// 开池加注（加注时前面没人加注过），之后没进 ≥2 次加注的池 → `RaiseBand`（收到顶端加注 range）。
     Aggressive,
+    /// 面对加注再加注（3bet 及以上，含平跟后再加注）→ 不做画像修正。
+    Reraise,
+    /// 盲位 / 补盲者过牌、补齐或跟注，或面对 ≥2 次加注跟注 → 不做画像修正。
+    Unshaped,
 }
 
 /// 重放本手**翻前街**，返回每个 solver tree seat 的入池方式（[`PreflopEntry`]，下标 = tree seat，
@@ -3711,6 +3724,7 @@ enum PreflopEntry {
 /// 纯函数（只读 `req`+`smap`+`solver_cfg`）：真栈建不出 / 重放失同步 / 脏动作 / 溢出 → 全
 /// `Unknown`（caller 退 `TopK`，保守安全）。只看翻前——街一进 flop 即停。与 [`build_real_auth`]
 /// 同重放口径（真栈 config + 幻影 fold + [`hist_to_concrete`]），但不注入牌、不要求轮到 hero。
+/// 动作类型按当时合法集判（[`action_kind`]）：短码全下只够跟注 = 跟注。
 fn preflop_entry_kinds(
     req: &Request,
     solver_cfg: &TableConfig,
@@ -3722,7 +3736,14 @@ fn preflop_entry_kinds(
         return unknown;
     };
     let mut st = GameState::new(&real_cfg, REAL_REPLAY_SEED);
+    // 开局本轮已有投入 = 盲注 / 补盲者（ante 不算本轮下注）。
+    let forced: Vec<bool> = st
+        .players()
+        .iter()
+        .map(|p| p.committed_this_round > ChipAmount::ZERO)
+        .collect();
     let mut kinds = unknown.clone();
+    let mut raises = 0u32;
     let phantom = smap.phantoms.iter().map(|&t| (t, "fold".to_string(), None));
     let acts: Vec<(u8, String, Option<u64>)> = match req
         .actions
@@ -3746,13 +3767,28 @@ fn preflop_entry_kinds(
         if st.current_player() != Some(SeatId(actor)) {
             return unknown; // 失同步 → 保守退 TopK
         }
-        // 在 apply 前分类（此动作属翻前）：raise/bet/all_in 锁 Aggressive；call/check 升 Passive
-        // （若未锁 Aggressive，含 BB option check）；fold 不改（弃牌座翻后不在 root range、不被剥削）。
+        let Some(kind) = action_kind(&action, &st.legal_actions()) else {
+            return unknown;
+        };
+        // 在 apply 前分类（此动作属翻前）。Reraise 最高、其次 Unshaped，都不再降级；fold 不改
+        // （弃牌座翻后不在 root range、不被剥削）。
         let slot = &mut kinds[actor as usize];
-        match action.as_str() {
-            "raise" | "bet" | "all_in" => *slot = PreflopEntry::Aggressive,
-            "call" | "check" if *slot != PreflopEntry::Aggressive => *slot = PreflopEntry::Passive,
-            _ => {}
+        let next = match kind {
+            "raise" if raises > 0 => PreflopEntry::Reraise,
+            "raise" => PreflopEntry::Aggressive,
+            "call" if raises >= 2 || forced[actor as usize] => PreflopEntry::Unshaped,
+            "call" => PreflopEntry::Passive,
+            "check" => PreflopEntry::Unshaped, // 翻前能过牌的只有盲位 / 补盲者
+            _ => *slot,
+        };
+        *slot = match (*slot, next) {
+            (PreflopEntry::Reraise, _) | (_, PreflopEntry::Reraise) => PreflopEntry::Reraise,
+            (PreflopEntry::Unshaped, _) | (_, PreflopEntry::Unshaped) => PreflopEntry::Unshaped,
+            (PreflopEntry::Aggressive, _) => PreflopEntry::Aggressive,
+            (_, n) => n,
+        };
+        if kind == "raise" {
+            raises += 1;
         }
         let to_solver = match to_op.map(|t| t.checked_mul(scale)) {
             Some(Some(v)) => Some(v),
@@ -3769,16 +3805,15 @@ fn preflop_entry_kinds(
     kinds
 }
 
-/// `(--exploit-pfr-shape 开关, 该座 PFR 是否收敛, 本手翻前入池方式)` → 宽度形状。off / PFR 未收敛 /
-/// 入池方式未知 → `TopK`（仅 VPIP，与现有 exploit 逐位 byte-equal）。
-fn pick_shape(on: bool, pfr_converged: bool, entry: PreflopEntry) -> ExploitShape {
-    if !on || !pfr_converged {
-        return ExploitShape::TopK;
-    }
+/// `(--exploit-pfr-shape 开关, 该座 PFR 是否收敛, 本手翻前入池方式)` → 宽度形状；`None` = 这一座
+/// 不做画像修正（`Reraise` / `Unshaped`，与开关无关）。off / PFR 未收敛 / 入池方式未知 → `TopK`（仅 VPIP）。
+fn pick_shape(on: bool, pfr_converged: bool, entry: PreflopEntry) -> Option<ExploitShape> {
     match entry {
-        PreflopEntry::Passive => ExploitShape::CallBand,
-        PreflopEntry::Aggressive => ExploitShape::RaiseBand,
-        PreflopEntry::Unknown => ExploitShape::TopK,
+        PreflopEntry::Reraise | PreflopEntry::Unshaped => None,
+        _ if !on || !pfr_converged => Some(ExploitShape::TopK),
+        PreflopEntry::Passive => Some(ExploitShape::CallBand),
+        PreflopEntry::Aggressive => Some(ExploitShape::RaiseBand),
+        PreflopEntry::Unknown => Some(ExploitShape::TopK),
     }
 }
 
@@ -3818,14 +3853,10 @@ fn exploit_snapshot(
         let pfr_shape_on = prof.cfg().pfr_shape;
         let mut profiles: Vec<Option<OpponentProfile>> = vec![None; n_seats];
         let mut shapes: Vec<ExploitShape> = vec![ExploitShape::TopK; n_seats];
-        // PFR-aware（--exploit-pfr-shape）：重放翻前判各对手座本手入池方式（被动→CallBand 掐顶端 /
-        // 主动→RaiseBand 收顶端），且仅当该座 PFR 也收敛才用。off → 全 Unknown → 全 TopK（仅 VPIP，
-        // 与现有 exploit 逐位 byte-equal）；重放失败同样退 TopK（安全）。索引 = solver tree seat。
-        let entry_kinds = if pfr_shape_on {
-            preflop_entry_kinds(req, solver_cfg, scale, smap)
-        } else {
-            vec![PreflopEntry::Unknown; n_seats]
-        };
+        // 重放翻前判各对手座本手入池方式：盲位过牌 / 补齐 / 防守、3bet 及以上的线 → 该座不修正（开关
+        // 无关）；其余 PFR-aware 开且该座 PFR 收敛时，被动→CallBand 掐顶端 / 主动→RaiseBand 收顶端，
+        // 否则 TopK（仅 VPIP）。重放失败 → 全 Unknown → 全 TopK。索引 = solver tree seat。
+        let entry_kinds = preflop_entry_kinds(req, solver_cfg, scale, smap);
         for op_seat in 0..smap.to_tree.len() {
             if op_seat == req.my_seat as usize {
                 continue; // hero
@@ -3835,9 +3866,12 @@ fn exploit_snapshot(
             };
             if let Some(name) = req.names.get(&(op_seat as u8)) {
                 if let Some(p) = prof.profile_for(name) {
-                    profiles[tree as usize] = Some(p);
-                    shapes[tree as usize] =
-                        pick_shape(pfr_shape_on, p.pfr_converged, entry_kinds[tree as usize]);
+                    if let Some(shape) =
+                        pick_shape(pfr_shape_on, p.pfr_converged, entry_kinds[tree as usize])
+                    {
+                        profiles[tree as usize] = Some(p);
+                        shapes[tree as usize] = shape;
+                    }
                 }
             }
         }
@@ -9176,16 +9210,47 @@ mod tests {
             ..rt_prefix_reach(scfg)
         };
         let names = BTreeMap::from([(1, "villain".to_string()), (2, "hero".to_string())]);
-        let mut pre = flop_first_unraised_req(vec![2000; 6]);
-        pre.my_seat = 2;
-        pre.hole = vec!["Qs".into(), "Qd".into()];
-        pre.names = names.clone();
+        // SB 补齐、BB 过牌的线：盲位被动入池画像描述不了 → villain 不修正（research 2026-10-29 §2.1）。
+        let mut complete = flop_first_unraised_req(vec![2000; 6]);
+        complete.my_seat = 2;
+        complete.hole = vec!["Qs".into(), "Qd".into()];
+        complete.names = names.clone();
+        complete.actions.push(HistAction {
+            seat: 1,
+            action: "check".into(),
+            to: None,
+        });
+        let solver_cfg = TableConfig::default_6max_100bb();
+        let scale = solver_cfg.big_blind.as_u64() / complete.big_blind;
+        let smap = seat_map(&complete, 6).expect("seat_map");
+        let villain = smap.tree_seat(1).unwrap() as usize;
+        let snap = |r: &Request| {
+            let (profiles, _, _) = exploit_snapshot(&exploit_rt(), r, &solver_cfg, scale, &smap)
+                .expect("--exploit 开");
+            profiles[villain]
+        };
+        assert!(snap(&complete).is_none(), "SB 补齐不该剥削");
+        // SB 开池加注、BB 跟注的线：villain 是开池者 → 修正。
+        let mut pre = complete.clone();
+        pre.actions.pop();
+        pre.actions[4] = HistAction {
+            seat: 1,
+            action: "raise".into(),
+            to: Some(60),
+        };
+        pre.actions[5] = HistAction {
+            seat: 2,
+            action: "call".into(),
+            to: None,
+        };
+        pre.valid.max_raise = Some(1940);
         let mut req = pre.clone();
         req.actions.push(HistAction {
             seat: 1,
             action: "check".into(),
             to: None,
         });
+        assert!(snap(&req).is_some(), "SB 开池者应剥削");
 
         let rt_on = exploit_rt();
         let mut cache = SubgameSolveCache::new();
@@ -10337,15 +10402,27 @@ mod tests {
     #[test]
     fn pick_shape_guards_byte_equal() {
         use PreflopEntry::*;
-        // off → 恒 TopK（与现有 exploit byte-equal），无论入池方式 / PFR 收敛。
-        assert_eq!(pick_shape(false, true, Passive), ExploitShape::TopK);
-        assert_eq!(pick_shape(false, true, Aggressive), ExploitShape::TopK);
+        let topk = Some(ExploitShape::TopK);
+        // off → TopK（仅 VPIP），无论入池方式 / PFR 收敛。
+        assert_eq!(pick_shape(false, true, Passive), topk);
+        assert_eq!(pick_shape(false, true, Aggressive), topk);
         // on 但 PFR 未收敛 → TopK（退仅 VPIP）。
-        assert_eq!(pick_shape(true, false, Passive), ExploitShape::TopK);
+        assert_eq!(pick_shape(true, false, Passive), topk);
         // on + PFR 收敛 → 按入池方式选。
-        assert_eq!(pick_shape(true, true, Passive), ExploitShape::CallBand);
-        assert_eq!(pick_shape(true, true, Aggressive), ExploitShape::RaiseBand);
-        assert_eq!(pick_shape(true, true, Unknown), ExploitShape::TopK);
+        assert_eq!(
+            pick_shape(true, true, Passive),
+            Some(ExploitShape::CallBand)
+        );
+        assert_eq!(
+            pick_shape(true, true, Aggressive),
+            Some(ExploitShape::RaiseBand)
+        );
+        assert_eq!(pick_shape(true, true, Unknown), topk);
+        // 3bet 及以上 / 盲位被动入池 → 不修正，与开关无关。
+        for (on, conv) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(pick_shape(on, conv, Reraise), None);
+            assert_eq!(pick_shape(on, conv, Unshaped), None);
+        }
     }
 
     #[test]
@@ -10411,8 +10488,73 @@ mod tests {
         let kind_of = |op_seat: u8| kinds[smap.tree_seat(op_seat).unwrap() as usize];
         assert_eq!(kind_of(3), PreflopEntry::Aggressive, "UTG 开池加注");
         assert_eq!(kind_of(4), PreflopEntry::Passive, "HJ 平跟");
-        assert_eq!(kind_of(2), PreflopEntry::Passive, "BB 平跟");
+        assert_eq!(kind_of(2), PreflopEntry::Unshaped, "BB 防守跟注");
         assert_eq!(kind_of(5), PreflopEntry::Unknown, "弃牌座不分类");
+
+        // 其余几条线：同一张桌，只换动作（和栈）。
+        let kinds_for = |acts: &[(u8, &str, Option<u64>)], stacks: Vec<u64>| {
+            let mut r = req.clone();
+            r.actions = acts
+                .iter()
+                .map(|&(seat, action, to)| HistAction {
+                    seat,
+                    action: action.into(),
+                    to,
+                })
+                .collect();
+            r.stacks = stacks;
+            let k = preflop_entry_kinds(&r, &solver_cfg, scale, &smap);
+            (0..6u8)
+                .map(|s| k[smap.tree_seat(s).unwrap() as usize])
+                .collect::<Vec<_>>()
+        };
+        use PreflopEntry::*;
+        // 平跟池：UTG 平跟、SB 补齐、BB 过牌。
+        let k = kinds_for(
+            &[
+                (3, "call", None),
+                (4, "fold", None),
+                (5, "fold", None),
+                (0, "fold", None),
+                (1, "call", None),
+                (2, "check", None),
+            ],
+            vec![2000; 6],
+        );
+        assert_eq!((k[3], k[1], k[2]), (Passive, Unshaped, Unshaped), "{k:?}");
+        // 3bet 池：UTG 开池、HJ 3bet、CO 冷跟 3bet、UTG 跟注。
+        let k = kinds_for(
+            &[
+                (3, "raise", Some(60)),
+                (4, "raise", Some(180)),
+                (5, "call", None),
+                (0, "fold", None),
+                (1, "fold", None),
+                (2, "fold", None),
+                (3, "call", None),
+            ],
+            vec![2000; 6],
+        );
+        assert_eq!((k[3], k[4], k[5]), (Unshaped, Reraise, Unshaped), "{k:?}");
+        // 平跟再加注：UTG 平跟、HJ 隔离、UTG 再加注。
+        let k = kinds_for(
+            &[
+                (3, "call", None),
+                (4, "raise", Some(80)),
+                (5, "fold", None),
+                (0, "fold", None),
+                (1, "fold", None),
+                (2, "fold", None),
+                (3, "raise", Some(240)),
+            ],
+            vec![2000; 6],
+        );
+        assert_eq!((k[3], k[4]), (Reraise, Aggressive), "{k:?}");
+        // 短码全下只够跟注 = 跟注：HJ 只剩 50（开池到 60）。
+        let mut stacks = vec![2000; 6];
+        stacks[4] = 50;
+        let k = kinds_for(&[(3, "raise", Some(60)), (4, "all_in", Some(50))], stacks);
+        assert_eq!((k[3], k[4]), (Aggressive, Passive), "{k:?}");
     }
 
     /// `Request` 解析 `names`（serde 默认；缺省 = 空 → 旧请求 byte-equal）。

@@ -119,6 +119,15 @@ fn classify(action: &str) -> Option<ActKind> {
     }
 }
 
+/// [`classify`] 加金额校正：带了投入额（driver `--exploit-4bet` 开时）且投入不超过跟注额 → 跟注
+/// （短码全下只够跟注，不算加注；同 [`crate::training::fourbet_exploit`] 口径）。没带金额 → 只看动作名。
+fn classify_obs(a: &ObsAction) -> Option<ActKind> {
+    match (classify(&a.action)?, a.contribution_delta) {
+        (ActKind::Aggr, Some(cd)) if cd <= a.to_call_before.unwrap_or(0) => Some(ActKind::Call),
+        (k, _) => Some(k),
+    }
+}
+
 fn is_preflop(street: &str) -> bool {
     street.eq_ignore_ascii_case("preflop")
 }
@@ -188,7 +197,7 @@ impl Profiler {
         let mut pre: BTreeMap<u8, (bool, bool)> = BTreeMap::new();
         let mut post: BTreeMap<u8, (u32, u32)> = BTreeMap::new();
         for a in &hand.actions {
-            let Some(kind) = classify(&a.action) else {
+            let Some(kind) = classify_obs(a) else {
                 continue;
             };
             if is_preflop(&a.street) {
@@ -304,6 +313,36 @@ mod tests {
         assert_eq!(h.names.get(&0).map(String::as_str), Some("alice"));
         assert_eq!(h.names.get(&3).map(String::as_str), Some("bob"));
         assert_eq!(h.actions.len(), 2);
+    }
+
+    #[test]
+    fn short_allin_call_counts_as_vpip_not_pfr() {
+        let cfg = ExploitConfig {
+            min_hands: 1,
+            converge_se: 1.0,
+            converge_drift: 1.0,
+            ..Default::default()
+        };
+        let mut p = Profiler::new(cfg);
+        let allin = |cd: Option<u64>, tc: Option<u64>| ObserveHand {
+            names: [(0, "s".to_string())].into_iter().collect(),
+            actions: vec![ObsAction {
+                seat: 0,
+                street: "preflop".into(),
+                action: "all_in".into(),
+                contribution_delta: cd,
+                to_call_before: tc,
+            }],
+        };
+        // 全下只够跟注 → 入池不算加注；全下超过跟注额 → 加注；没带金额 → 照动作名算加注（旧口径）。
+        p.observe_hand(&allin(Some(80), Some(100)));
+        p.observe_hand(&allin(Some(100), Some(100)));
+        p.observe_hand(&allin(Some(300), Some(100)));
+        p.observe_hand(&allin(None, None));
+        let prof = p.profile_for("s").expect("收敛门已放开");
+        assert_eq!(prof.n_preflop, 4);
+        assert!((prof.vpip - 1.0).abs() < 1e-12, "vpip={}", prof.vpip);
+        assert!((prof.pfr - 0.5).abs() < 1e-12, "pfr={}", prof.pfr);
     }
 
     #[test]
