@@ -3067,7 +3067,9 @@ fn limp_ranges(pos: LimpPos) -> (f64, f64) {
 
 /// 每多一家平跟，隔离加注范围收紧 20%（最多收到一半）；SB 补齐上限放宽 5 个百分点（赔率更好，
 /// 最多 55%）。非盲位跟着平跟的上限不变（隔离范围收紧后，多出来的牌自然落进跟注档）。
-fn limp_ranges_for(pos: LimpPos, limps: u64) -> (f64, f64) {
+/// 有 ante 时两档再一起乘 `1 + (LIMP_ANTE_REF_WIDEN − 1) × ante_level`（[`limp_ante_level`]），
+/// 封顶 100%；被动档为 0 的位置乘完仍是 0。`ante_level = 0` 时逐位同无 ante。
+fn limp_ranges_for(pos: LimpPos, limps: u64, ante_level: f64) -> (f64, f64) {
     let (iso, passive) = limp_ranges(pos);
     let extra = limps.saturating_sub(1) as f64;
     let iso = iso * (1.0 - 0.2 * extra).max(0.5);
@@ -3076,7 +3078,32 @@ fn limp_ranges_for(pos: LimpPos, limps: u64) -> (f64, f64) {
     } else {
         passive
     };
-    (iso, passive)
+    let widen = 1.0 + (LIMP_ANTE_REF_WIDEN - 1.0) * ante_level;
+    ((iso * widen).min(1.0), (passive * widen).min(1.0))
+}
+
+/// 平跟池启发式 ante 放宽的参照点：8 座每人 1BB ante = 8BB 死钱（wopo ante 桌）。
+const LIMP_ANTE_REF_DEAD_BB: u64 = 8;
+/// 参照点上范围放宽的倍数。依据（2026-10-30）：8 座 ante 1BB 200BB ante-flop2-3bet 9B blueprint
+/// 各位置首入范围是无 ante 9 座 flop2-1pot 9B 的 2.04–2.18 倍（BTN 75.1% / 36.8%、CO 51.0% / 23.4%、
+/// HJ 37.6% / 17.6%）；无 ante 的手写隔离范围约等于后者的 0.9 倍。两边开池尺寸不同（4.5BB / 3.5BB），
+/// 倍数里也含尺寸差，是估计值。
+const LIMP_ANTE_REF_WIDEN: f64 = 2.1;
+
+/// 平跟池启发式的 ante 程度，`[0, 1]`：本手 ante 总额（发牌座位数 × 每座 ante）÷ 参照死钱
+/// [`LIMP_ANTE_REF_DEAD_BB`]，超过参照点按 1（没有更大 ante 的数据，不外推）。无 ante = 0。
+/// 发牌座位数取 `dealt_seats`（短桌幻影座不交 ante），缺省按满桌。
+fn limp_ante_level(req: &Request) -> f64 {
+    let ref_chips = LIMP_ANTE_REF_DEAD_BB * req.big_blind;
+    if req.ante == 0 || ref_chips == 0 {
+        return 0.0;
+    }
+    let dealt = if req.dealt_seats.is_empty() {
+        u64::from(req.num_seats)
+    } else {
+        req.dealt_seats.len() as u64
+    };
+    ((req.ante * dealt) as f64 / ref_chips as f64).min(1.0)
 }
 
 /// 起手牌强度序的排序键：Chen 分（[`chen_score`]）为主；Chen 分并列很多（一个并列块可达 90+
@@ -3152,10 +3179,13 @@ fn chen_top_fraction_scan(hole: [Card; 2]) -> f64 {
 /// `--search-limp-as-fold`（方案 B）开着时翻前也一样走这里——B 只给翻后搜索提供范围前缀。
 ///
 /// - **没人加注**（只有平跟）：按位置 × 平跟人数取范围（[`limp_ranges_for`]）。
-///   隔离加注档 → raise to `(3 + 平跟人数 + OOP 1)×BB`（OOP = hero 在盲位；clamp 进 [min,max]）；
-///   被动档 → CO/BTN 跟着平跟（`overlimp`）、SB 补齐（`complete`）；其余 → BB 免费过牌，否则弃牌。
-///   **这一支不套底池赔率 floor**：一家平跟时 SB 赔率 5:1、三家平跟时任何位置赔率都 > 4，套了就是
-///   任意两张都跟（2026-10-16 抽查 §3 的 SB 任意两张补齐就是这样来的）。
+///   隔离加注档 → raise to `(3 + 平跟人数 + OOP 1)×BB + ante_level×BB`（OOP = hero 在盲位；
+///   clamp 进 [min,max]）；被动档 → CO/BTN 跟着平跟（`overlimp`）、SB 补齐（`complete`）；其余 → BB
+///   免费过牌，否则弃牌。**这一支不套底池赔率 floor**：一家平跟时 SB 赔率 5:1、三家平跟时任何位置
+///   赔率都 > 4，套了就是任意两张都跟（2026-10-16 抽查 §3 的 SB 任意两张补齐就是这样来的）。
+///   **ante**（2026-10-30）：[`limp_ante_level`] 按死钱放宽两档范围（[`limp_ranges_for`]），隔离尺寸
+///   跟着开池尺寸加 `ante_level×BB`——8 座 1BB ante 的 ante-flop2 菜单开池 4.5BB，比无 ante 1pot 开池
+///   3.5BB 多 1BB。无 ante 时范围和尺寸逐位不变。
 /// - **有人加注**（含 hero 隔离加注或跟着平跟之后被加注）：P 档（[`limp_hand_tier`]==2）→ call；
 ///   其余弃牌，但底池赔率 floor（[`pot_odds_floor_hit`]，`pot_odds` 由调用方真栈重放算）命中 → call。
 ///
@@ -3189,14 +3219,17 @@ fn limp_heuristic(
         ..Default::default()
     };
     if !raised {
-        let (iso, passive) = limp_ranges_for(pos, limps);
+        let ante_level = limp_ante_level(req);
+        let (iso, passive) = limp_ranges_for(pos, limps, ante_level);
         let frac = chen_top_fraction(hole);
         if frac < iso && valid.can_raise {
             if let (Some(min), Some(max)) = (valid.min_raise, valid.max_raise) {
                 if min <= max {
                     // OpenPoker raise amount = 总 to 额；脏区间（min>max）走下面被动分支。
                     let oop = u64::from(matches!(pos, LimpPos::Sb | LimpPos::Bb));
-                    let to = (3 + limps + oop) * req.big_blind;
+                    // ante 加的部分跟开池尺寸走（ante_level = 0 → 0，逐位同无 ante）。
+                    let ante_extra = (ante_level * req.big_blind as f64).round() as u64;
+                    let to = (3 + limps + oop) * req.big_blind + ante_extra;
                     return Some(mk("raise", Some(to.clamp(min, max)), "raise"));
                 }
             }
@@ -6267,6 +6300,74 @@ mod tests {
         assert_eq!(limp_pos(3, 9), LimpPos::BeforeBtn(6));
     }
 
+    /// 平跟池启发式的 ante 放宽（2026-10-30）：8 座 1BB ante 时两档范围 ×2.1、隔离尺寸 +1BB；按发牌
+    /// 座位数线性缩小，超过 8BB 死钱不外推；被动档为 0 的位置仍不跟着平跟。
+    #[test]
+    fn limp_heuristic_ante_widens_ranges_and_size() {
+        let card = |s: &str| parse_card(s).unwrap();
+        let h = |a: &str, b: &str| [card(a), card(b)];
+        // 8 座 50/100，一家平跟（UTG），没人加注。
+        let req = |ante: u64, dealt: &[u8]| Request {
+            hole: vec![],
+            board: vec![],
+            button_seat: 0,
+            my_seat: 0,
+            num_seats: 8,
+            small_blind: 50,
+            big_blind: 100,
+            ante,
+            actions: vec![hist(3, "call", Some(100))],
+            valid: full_valid(),
+            stacks: vec![],
+            dealt_seats: dealt.to_vec(),
+            names: Default::default(),
+            posts: Vec::new(),
+        };
+        assert_eq!(limp_ante_level(&req(0, &[])), 0.0);
+        assert_eq!(limp_ante_level(&req(100, &[])), 1.0);
+        assert_eq!(limp_ante_level(&req(100, &[0, 1, 2, 3])), 0.5);
+        assert_eq!(limp_ante_level(&req(200, &[])), 1.0, "超过参照点不外推");
+        let run = |r: &Request, pos: LimpPos, hole: [Card; 2]| {
+            let r = limp_heuristic(r, hole, pos, None).expect("有平跟");
+            (r.source, r.amount)
+        };
+        let src = |s: &str| format!("limp_heuristic:{s}");
+        let full = req(100, &[]);
+        // BTN K9o：无 ante 弃（Chen 序约 46%，在 30% 隔离 / 45% 跟着平跟之外）；ante 下隔离 63% →
+        // 隔离加注到 (3+1)×BB + 1BB。
+        let k9o = h("Kh", "9d");
+        assert_eq!(run(&req(0, &[]), LimpPos::Btn, k9o).0, src("fold"));
+        assert_eq!(run(&full, LimpPos::Btn, k9o), (src("raise"), Some(500)));
+        // 半档 ante（4 座发牌）：尺寸 +0.5BB。
+        assert_eq!(
+            run(&req(100, &[0, 1, 2, 3]), LimpPos::Btn, h("Ah", "Kd")),
+            (src("raise"), Some(450))
+        );
+        // SB：40% 补齐上限 → 84%；72o 仍弃。
+        let sb_mid = h("Kh", "4d");
+        let f = chen_top_fraction(sb_mid);
+        assert!(f > 0.40 && f < 0.84, "前提：K4o 在 40%–84% 之间，得 {f}");
+        assert_eq!(run(&req(0, &[]), LimpPos::Sb, sb_mid).0, src("fold"));
+        assert_eq!(run(&full, LimpPos::Sb, sb_mid).0, src("complete"));
+        assert_eq!(run(&full, LimpPos::Sb, h("7h", "2d")).0, src("fold"));
+        // HJ：隔离 16% → 33.6%；被动档 0 → 仍不跟着平跟。
+        let hj = LimpPos::BeforeBtn(2);
+        let (iso, passive) = limp_ranges_for(hj, 1, 1.0);
+        assert!(
+            (iso - 0.336).abs() < 1e-12 && passive == 0.0,
+            "{iso} {passive}"
+        );
+        let hj_mid = h("Qh", "Td");
+        let f = chen_top_fraction(hj_mid);
+        assert!(f > 0.16 && f < 0.336, "前提：QTo 在 16%–33.6% 之间，得 {f}");
+        assert_eq!(run(&req(0, &[]), hj, hj_mid).0, src("fold"));
+        assert_eq!(run(&full, hj, hj_mid), (src("raise"), Some(500)));
+        assert_eq!(run(&full, hj, h("9h", "4d")).0, src("fold"));
+        // 封顶 100%：BTN 跟着平跟上限 45% × 2.1 → 94.5%，不超过 1。
+        let (_, p) = limp_ranges_for(LimpPos::Btn, 1, 1.0);
+        assert!((p - 0.945).abs() < 1e-12, "{p}");
+    }
+
     /// Chen 序拆并列后，名义宽度与实际组合数相差不超过一个牌型（≤ 12 组合）；顺序单调。
     #[test]
     fn chen_top_fraction_width_matches_nominal() {
@@ -6978,7 +7079,7 @@ mod tests {
             &game,
             &limp_req(2, ["8h", "3d"], &["7h", "2c", "Ks"], bb_acts),
         );
-        let (iso, _) = limp_ranges_for(LimpPos::Bb, 1);
+        let (iso, _) = limp_ranges_for(LimpPos::Bb, 1, 0.0);
         assert_eq!(nonzero(&c).len(), count(iso, 1.1), "{c:?}");
 
         let btn_acts = vec![
@@ -6995,7 +7096,7 @@ mod tests {
             &game,
             &limp_req(0, ["9s", "6s"], &["7h", "2c", "Ks"], btn_acts),
         );
-        let (iso, passive) = limp_ranges_for(LimpPos::Btn, 1);
+        let (iso, passive) = limp_ranges_for(LimpPos::Btn, 1, 0.0);
         assert_eq!(nonzero(&c).len(), count(iso, passive), "{c:?}");
         assert_eq!(
             c.nodes.len(),
