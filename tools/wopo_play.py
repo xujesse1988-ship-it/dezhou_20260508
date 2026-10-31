@@ -240,7 +240,7 @@ def _fixture_msgs():
 
 def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=False,
               exploit_4bet=False, reply=None, hh_log=None, play_log=None, ante=0, blueprint_ante=0,
-              n_seats=9):
+              n_seats=9, send_hand_id=False):
     """msgs（dict 或 ("disconnect",)）喂一个新会话。返回 (session, stub, 行动文件行)。
     hook(i, session) 在每条消息后调用（异步场景用来在指定位置放行 advisor）。"""
     stub = _StubAdvisor(gate, reply)
@@ -251,7 +251,7 @@ def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=Fals
         session = WopoSession(worker, af, n_seats=n_seats, hero_seat=HERO_SEAT,
                               exploit=exploit, prewarm=prewarm, exploit_4bet=exploit_4bet,
                               hh_log=hh_log, play_log=play_log, ante=ante,
-                              blueprint_ante=blueprint_ante)
+                              blueprint_ante=blueprint_ante, send_hand_id=send_hand_id)
         for i, m in enumerate(msgs):
             if m == ("disconnect",):
                 session.on_disconnect()
@@ -540,6 +540,11 @@ def _selftest_exploit_4bet():
            "observe 要带 button_seat / dealt_seats / posts（画像的未开池统计用）")
     _, stub, _ = _run_msgs(msgs)
     _check(not stub.side and all("names" not in q for q in stub.requests), "剥削全关时不带名字、不发 observe")
+    _check(all("hand_id" not in q for q in stub.requests), "没开 --range-log 时请求不带 hand_id")
+    _, stub, rows = _run_msgs(msgs, send_hand_id=True)
+    _check(stub.requests and all(q.get("hand_id") for q in stub.requests), "开 --range-log 时请求带 hand_id")
+    _check({q["hand_id"] for q in stub.requests} >= {r["hand_id"] for r in rows},
+           "请求的 hand_id 与行动文件一致")
     print("[selftest 7 PM-17] 请求带名字、observe 带投入金额并与服务器逐条一致", file=sys.stderr)
 
 
@@ -815,6 +820,9 @@ def main():
                    help="blueprint 的起始码深（BB，= 训练时 train_cfr --stack-bb；默认 100）。透传给 advisor")
     add_fourbet_args(p)
     args = p.parse_args()
+    # 根范围日志默认开（开了 --search 才有范围）：写在行动文件同目录的 wopo_ranges.jsonl；--range-log off 关。
+    if args.range_log is None and args.search:
+        args.range_log = os.path.join(os.path.dirname(os.path.abspath(args.action_file)), "wopo_ranges.jsonl")
     if args.ante < 0 or not 0 <= args.blueprint_ante <= 100:
         p.error("--ante 须 ≥ 0，--blueprint-ante 须在 [0, 100]")
     if not 2 <= args.stack_bb <= 1000:
@@ -843,7 +851,8 @@ def main():
                           num_hands=args.num_hands, action_log=action_log,
                           prewarm=args.search_prewarm, exploit=exploit_enabled(args),
                           debug=args.debug_log, exploit_4bet=fourbet_enabled(args), hh_log=hh_log,
-                          play_log=play_log, ante=args.ante, blueprint_ante=args.blueprint_ante)
+                          play_log=play_log, ante=args.ante, blueprint_ante=args.blueprint_ante,
+                          send_hand_id=args.range_log is not None)
     ok = True
     try:
         if args.replay:

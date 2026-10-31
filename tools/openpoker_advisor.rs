@@ -110,7 +110,8 @@ use poker::training::subgame::{
     set_subgame_debug, should_search, subgame_search_cached, subgame_search_prewarm,
     subgame_search_unanchored_cached_cross_exploit,
     subgame_search_unanchored_prewarm_cross_exploit, synced_prefix_decisions, ExploitPrior,
-    ExploitShape, PrefixReach, ResolveRoot, SearchTrigger, SubgameSearchConfig, SubgameSolveCache,
+    ExploitShape, PrefixReach, ResolveRoot, SearchTrigger, SolveView, SubgameSearchConfig,
+    SubgameSolveCache,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, HandEvaluator,
@@ -343,6 +344,9 @@ struct RequestEnvelope {
     /// = 决策 / prewarm 请求（旧 driver byte-equal）。
     #[serde(default)]
     observe: bool,
+    /// driver 的本手编号（可选，只写进 `--range-log`，方便与 hh 对上；不参与决策）。
+    #[serde(default)]
+    hand_id: Option<serde_json::Value>,
 }
 
 /// advisor → driver 一行响应。`amount` 仅 raise 携带（= OpenPoker 单位的 raise-to 额）。
@@ -5690,6 +5694,9 @@ struct Args {
     /// `--debug-log`：打印决策流水线 + range / solve 中间数据到 **stderr**（与 `--search` 正交，
     /// blueprint 路径也打）。`false`（默认）= 静默、零开销；on 也不动 stdout（IPC byte-equal）。
     debug_log: bool,
+    /// `--range-log <path>`：每次新 solve 的各座根范围追加写进这个 JSONL（[`RangeLog`]）。**需 `--search`**。
+    /// `None`（默认）= 不写。只读 solve 缓存，不影响决策。
+    range_log: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -5756,6 +5763,148 @@ fn build_game(
         rules,
     )
     .map_err(|e| format!("build {seats}-max game failed: {e:?}"))
+}
+
+// ===========================================================================
+// 根范围日志（`--range-log`）：每次新 solve 的各座根范围，供事后分析（对照亮牌、看倾斜的效果）
+// ===========================================================================
+
+/// [`RangeLog::record`] 的请求上下文（主循环给）。
+struct RangeLogCtx<'a> {
+    /// driver 的本手编号（信封 `hand_id`，可缺）。
+    hand_id: Option<&'a serde_json::Value>,
+    /// `"decide"` / `"prewarm"`：哪类请求触发了这次 solve。
+    trigger: &'a str,
+    /// 该请求的响应来源（`search:unanchored` 等）。
+    source: &'a str,
+    /// solver 座位数（建座位映射用）。
+    n_seats: usize,
+}
+
+/// 范围的定点刻度：每座范围归一后乘它取整（1e-6 精度，均匀平滑后的最小权重约 2e-4）。
+const RANGE_LOG_SCALE: f64 = 1e6;
+
+/// `--range-log` 的写入端。每个决策 / 预热请求之后看一眼 solve 缓存：主 slot 的 key 和上次写过的不同
+/// = 刚出了一次新 solve（同街预热与决策命中同一条，只写一次；solve 失败没存进缓存 → 不写），把这次 solve
+/// 实际用的根范围写一行 JSON（[`range_log_entry`]）。打开时先写一行表头：1326 个组合的牌面，范围下标按它。
+struct RangeLog<W: Write> {
+    out: W,
+    last_key: Option<[u8; 32]>,
+}
+
+impl<W: Write> RangeLog<W> {
+    fn new(mut out: W) -> std::io::Result<Self> {
+        let combos: Vec<String> = all_hole_combos()
+            .iter()
+            .map(|h| format!("{}{}", card_label(h[0]), card_label(h[1])))
+            .collect();
+        let header = serde_json::json!({
+            "range_log_header": 1,
+            "scale": RANGE_LOG_SCALE,
+            "combos": combos,
+        });
+        writeln!(out, "{header}")?;
+        out.flush()?;
+        Ok(RangeLog {
+            out,
+            last_key: None,
+        })
+    }
+
+    /// 有新 solve 就写一行（返回是否写了）。
+    fn record(
+        &mut self,
+        cache: &SubgameSolveCache,
+        req: &Request,
+        ctx: &RangeLogCtx<'_>,
+    ) -> std::io::Result<bool> {
+        let Some(solve) = cache.current_solve() else {
+            return Ok(false);
+        };
+        if self.last_key == Some(solve.key) {
+            return Ok(false);
+        }
+        self.last_key = Some(solve.key);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        let entry = range_log_entry(&solve, req, ctx, ts);
+        writeln!(self.out, "{entry}")?;
+        self.out.flush()?;
+        Ok(true)
+    }
+}
+
+/// 一张牌的文本（`"Ah"`；与 [`parse_card`] 互逆：rank = 编号 / 4，花色 = 编号 % 4 按 c d h s）。
+fn card_label(c: Card) -> String {
+    const R: &[u8; 13] = b"23456789TJQKA";
+    const S: &[u8; 4] = b"cdhs";
+    let v = c.to_u8() as usize;
+    format!("{}{}", R[v / 4] as char, S[v % 4] as char)
+}
+
+/// 一次 solve 的日志行：请求标识（hand_id、底牌、公共牌、动作数）+ 范围来源（[`SolveRangeMeta`]）+ 每个
+/// 在手座（范围非空）的名字、是否 hero、是否被翻前系数 / 画像宽度修正改过、归一后按 [`RANGE_LOG_SCALE`]
+/// 取整的 1326 个权重（下标对齐表头 `combos`）。`range_src = "uniform"` 时没有范围，`seats` 为空。
+fn range_log_entry(
+    solve: &SolveView<'_>,
+    req: &Request,
+    ctx: &RangeLogCtx<'_>,
+    ts: f64,
+) -> serde_json::Value {
+    let smap = seat_map(req, ctx.n_seats).ok();
+    let op_of = |tree: usize| {
+        smap.as_ref()
+            .and_then(|m| m.to_tree.iter().position(|&t| t == Some(tree as u8)))
+    };
+    let meta = solve.meta;
+    let seats: Vec<serde_json::Value> = solve
+        .ranges
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.is_empty())
+        .map(|(tree, r)| {
+            let sum: f64 = r.iter().sum();
+            let scale = if sum > 0.0 {
+                RANGE_LOG_SCALE / sum
+            } else {
+                0.0
+            };
+            let range: Vec<u32> = r.iter().map(|x| (x * scale).round() as u32).collect();
+            let op = op_of(tree);
+            serde_json::json!({
+                "seat": op,
+                "tree_seat": tree,
+                "name": op.and_then(|o| req.names.get(&(o as u8))),
+                "hero": op == Some(req.my_seat as usize),
+                "coef": meta.coef_seats.contains(&(tree as u8)),
+                "width": meta.width_seats.contains(&(tree as u8)),
+                "range": range,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "ts": (ts * 1000.0).round() / 1000.0,
+        "hand_id": ctx.hand_id,
+        "trigger": ctx.trigger,
+        "source": ctx.source,
+        "street": match req.board.len() {
+            3 => "flop",
+            4 => "turn",
+            5 => "river",
+            _ => "preflop",
+        },
+        "hole": req.hole,
+        "board": req.board,
+        "button_seat": req.button_seat,
+        "my_seat": req.my_seat,
+        "n_actions": req.actions.len(),
+        "path": meta.path,
+        "range_src": meta.range_src,
+        "hero_coef": meta.hero_coef,
+        "seats": seats,
+    })
 }
 
 fn main() -> ExitCode {
@@ -5988,6 +6137,23 @@ fn run() -> Result<(), String> {
     // 导航——恢复「每轮恰好一个 solve」一致性（time_budget anytime 下重解会读不同均衡）+
     // mid-round wall ≈ 0。容量 1，跨手 / 跨街 key 自然替换。
     let mut solve_cache = SubgameSolveCache::new();
+    let mut range_log = match &args.range_log {
+        None => None,
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(RangeLog::new)
+                .map_err(|e| format!("--range-log {} 打不开：{e}", path.display()))?;
+            eprintln!(
+                "[openpoker_advisor] range-log → {}（每次新 solve 一行根范围）",
+                path.display()
+            );
+            Some(file)
+        }
+    };
+    let n_seats = game.table_config().n_seats as usize;
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -6077,6 +6243,19 @@ fn run() -> Result<(), String> {
         } else {
             resp
         };
+        if let (Some(log), false) = (range_log.as_mut(), is_observe) {
+            if let Ok(req) = serde_json::from_str::<Request>(&line) {
+                let ctx = RangeLogCtx {
+                    hand_id: envelope.as_ref().and_then(|e| e.hand_id.as_ref()),
+                    trigger: if is_prewarm { "prewarm" } else { "decide" },
+                    source: &resp.source,
+                    n_seats,
+                };
+                if let Err(e) = log.record(&solve_cache, &req, &ctx) {
+                    eprintln!("[openpoker_advisor] range-log 写入失败：{e}");
+                }
+            }
+        }
         writeln!(
             stdout,
             "{}",
@@ -6138,6 +6317,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_4bet_3bet_decay: Option<f64> = None;
     let mut exploit_4bet_state: Option<PathBuf> = None;
     let mut debug_log = false;
+    let mut range_log: Option<PathBuf> = None;
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--checkpoint" => checkpoint = Some(PathBuf::from(next_val(&mut it, &arg)?)),
@@ -6353,6 +6533,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 });
             }
             "--debug-log" => debug_log = true,
+            "--range-log" => range_log = Some(PathBuf::from(next_val(&mut it, &arg)?)),
             // —— 叠加剥削（Tier 2）：--exploit 三态总开关（on=VPIP+PFR 形状 / vpip=仅 VPIP，与
             // 现网逐位 byte-equal / off=关），子旗调 ExploitConfig ——
             "--exploit" => match next_val(&mut it, &arg)?.as_str() {
@@ -6514,6 +6695,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     if exploit_on && search.is_none() {
         return Err("--exploit on|vpip 需配合 --search（剥削只挂脱锚搜索路径）".to_string());
     }
+    if range_log.is_some() && search.is_none() {
+        return Err("--range-log 需配合 --search（范围只在实时搜索里估）".to_string());
+    }
     // 平跟者倾斜作用在「平跟当弃牌」映射出来的那一步上：没有映射就永远不生效，拒绝静默空开。
     let exploit_limp_tilt = exploit_limp_tilt.unwrap_or(false);
     if exploit_limp_tilt && !search_limp_as_fold.unwrap_or(DEFAULT_SEARCH_LIMP_AS_FOLD) {
@@ -6605,6 +6789,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             .unwrap_or(DEFAULT_SEARCH_WEAK_COMMIT_GUARD),
         warm_profile_hh,
         debug_log,
+        range_log,
     })
 }
 
@@ -10903,8 +11088,23 @@ mod tests {
         assert!(snap.0[villain].is_none(), "接管的座不再做宽度修正");
 
         let mut cache = SubgameSolveCache::new();
+        let mut log = RangeLog::new(Vec::new()).unwrap();
+        let hand_id = serde_json::json!("t:hand:7");
+        let ctx = |trigger, source| RangeLogCtx {
+            hand_id: Some(&hand_id),
+            trigger,
+            source,
+            n_seats: 6,
+        };
+        assert!(
+            !log.record(&cache, &pre, &ctx("prewarm", "x")).unwrap(),
+            "空缓存不写"
+        );
         let p = prewarm(&game, &sigma, &pre, 0xE7B2, Some(&rt_on), &mut cache);
         assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+        assert!(log
+            .record(&cache, &pre, &ctx("prewarm", &p.source))
+            .unwrap());
         let r = decide(&game, &abs, &sigma, &req, 0xE7B2, Some(&rt_on), &mut cache);
         assert_eq!(r.source, "search:unanchored", "得 {r:?}");
         assert_eq!(
@@ -10912,6 +11112,52 @@ mod tests {
             (1, 1),
             "带倾斜的预热须被决策命中"
         );
+        assert!(
+            !log.record(&cache, &req, &ctx("decide", &r.source)).unwrap(),
+            "决策命中预热的 solve：不重复写"
+        );
+        // --range-log：表头 + 一行。范围来源 / 倾斜座 / hero 标记 / 归一定点权重。
+        let text = String::from_utf8(log.out).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines[0]["combos"].as_array().unwrap().len(), 1326);
+        assert_eq!(lines[0]["combos"][0], "2c2d");
+        let e = &lines[1];
+        assert_eq!(
+            (
+                &e["hand_id"],
+                &e["trigger"],
+                &e["street"],
+                &e["path"],
+                &e["range_src"]
+            ),
+            (
+                &hand_id,
+                &serde_json::json!("prewarm"),
+                &serde_json::json!("flop"),
+                &serde_json::json!("unanchored"),
+                &serde_json::json!("prefix_reach")
+            )
+        );
+        let seats = e["seats"].as_array().unwrap();
+        assert_eq!(seats.len(), 2, "{e}");
+        for st in seats {
+            let sum: u64 = st["range"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_u64().unwrap())
+                .sum();
+            assert!(sum.abs_diff(1_000_000) < 1000, "{sum}");
+            let villain_seat = st["seat"] == 1;
+            assert_eq!(st["hero"], !villain_seat);
+            assert_eq!(st["coef"], villain_seat, "只有 villain 被倾斜接管");
+            assert_eq!(st["width"], false);
+            assert_eq!(st["name"], if villain_seat { "villain" } else { "hero" });
+        }
 
         let mut cache_off = SubgameSolveCache::new();
         let p = prewarm(
@@ -12156,6 +12402,18 @@ mod tests {
         assert!(
             parse(&["--search", "--exploit-tilt", "on"]).is_err(),
             "--exploit-tilt 无 --exploit 应拒收"
+        );
+        // --range-log：需 --search。
+        assert_eq!(
+            parse(&["--search", "--range-log", "r.jsonl"])
+                .expect("parse Ok")
+                .range_log
+                .as_deref(),
+            Some(std::path::Path::new("r.jsonl"))
+        );
+        assert!(
+            parse(&["--range-log", "r.jsonl"]).is_err(),
+            "无 --search 应拒收"
         );
         // 子旗覆盖（on 接子旗）。
         let a = parse(&[

@@ -2082,6 +2082,34 @@ struct SolvedSubgame {
     trainer: SubgameTrainer,
     sub_abs: StreetActionAbstraction,
     hand_seed: u64,
+    /// 这次 solve 的根范围从哪来（只读遥测，advisor `--range-log`；不进 key）。
+    meta: SolveRangeMeta,
+}
+
+/// 一次 solve 的根范围来源（[`SubgameSolveCache::current_solve`]，advisor `--range-log` 写日志用）。
+/// 座位都是 solver 树座。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SolveRangeMeta {
+    /// `"anchored"` / `"unanchored"`。
+    pub path: &'static str,
+    /// `"cross_street_posterior"`（上一街子树后验）/ `"prefix_reach"`（脱锚档一前缀）/
+    /// `"blueprint_estimate"`（锚定 blueprint 估计）/ `"uniform"`（没给范围）。
+    pub range_src: &'static str,
+    /// hero 范围乘了翻前系数（[`PrefixReach::hero_coef`]）。
+    pub hero_coef: bool,
+    /// 乘了对手系数（[`PrefixReach::seat_coefs`]，advisor 翻前倾斜）的对手座。
+    pub coef_seats: Vec<u8>,
+    /// 做了画像宽度修正（[`apply_exploit_width_prior`]）的对手座。
+    pub width_seats: Vec<u8>,
+}
+
+/// 缓存主 slot 当前 solve 的只读视图（[`SubgameSolveCache::current_solve`]）。
+pub struct SolveView<'a> {
+    /// solve key：同一 key = 同一次 solve（同街的预热与决策命中同一条）。
+    pub key: [u8; 32],
+    pub meta: &'a SolveRangeMeta,
+    /// 子博弈根各座范围（下标 = 树座，内层对齐 [`all_hole_combos`]，弃牌座为空）；`None` = 均匀。
+    pub ranges: Option<&'a [Vec<f64>]>,
 }
 
 impl SolvedSubgame {
@@ -2233,6 +2261,16 @@ impl SubgameSolveCache {
     /// hits/misses（非求解查询）。
     fn current(&self) -> Option<&SolvedSubgame> {
         self.entry.as_ref().map(|(_, s)| s)
+    }
+
+    /// 主 slot 当前 solve（key + 根范围 + 来源），advisor `--range-log` 在每个请求后读：key 变了 =
+    /// 出了一次新 solve。不计 hits/misses。
+    pub fn current_solve(&self) -> Option<SolveView<'_>> {
+        self.entry.as_ref().map(|(key, s)| SolveView {
+            key: *key,
+            meta: &s.meta,
+            ranges: s.trainer.game().ranges(),
+        })
     }
 
     /// `prev` slot（同手换街时由主 slot 提升的上一街解），档二′-跨街复用在**本街第二决策起** peek
@@ -2840,6 +2878,15 @@ fn subgame_search_cached_inner(
             debug_dump_ranges("anchored", r, &all_hole_combos());
         }
     }
+    let meta = SolveRangeMeta {
+        path: "anchored",
+        range_src: match (ranges_opt.is_some(), cross_hit) {
+            (false, _) => "uniform",
+            (true, true) => "cross_street_posterior",
+            (true, false) => "blueprint_estimate",
+        },
+        ..SolveRangeMeta::default()
+    };
     let real_hand = real_hand_spec(cfg, auth, auth_actor);
     let key = cache.as_ref().map(|_| {
         solve_cache_key(
@@ -2920,6 +2967,7 @@ fn subgame_search_cached_inner(
             trainer,
             sub_abs,
             hand_seed,
+            meta,
         })
     };
     let solved_fresh: SolvedSubgame;
@@ -3690,6 +3738,17 @@ fn subgame_search_unanchored_cached_inner(
     // 前缀当「无信息」悄悄丢掉（那等于改了先验语义），由调用方补解上一街或显式降级。
     // 调试：hero 系数是否参与（跨街后验命中时档一整段不算，系数自然不参与）。
     let hero_coef_on = !cross_hit && prefix_reach.as_ref().is_some_and(|p| p.hero_coef.is_some());
+    // 遥测（`SolveRangeMeta::coef_seats`）：乘了对手系数的在手对手座（前缀范围真被用上时才算，见下）。
+    let coef_seats: Vec<u8> = match (cross_hit, prefix_reach.as_ref()) {
+        (false, Some(pr)) => (0..root_state.players().len())
+            .filter(|&s| {
+                root_state.players()[s].hole_cards.is_some()
+                    && pr.seat_coef(s as PlayerId, auth_actor).is_some()
+            })
+            .map(|s| s as u8)
+            .collect(),
+        _ => Vec::new(),
+    };
     let prefix_ranges: Option<Vec<Vec<f64>>> = match (cross_hit, prefix_reach) {
         (true, _) | (false, None) => None,
         (false, Some(pr)) => {
@@ -3774,6 +3833,21 @@ fn subgame_search_unanchored_cached_inner(
     // 代价：上一街没剥削（锚定解 / 当时画像未收敛）时本街也不剥削，保守。
     let exploit = exploit.filter(|_| !cross_hit);
     let exploit_active = exploit.is_some(); // 调试：剥削是否参与（消费 exploit 前捕获）。
+                                            // 遥测（`SolveRangeMeta::width_seats`）：有画像、在手、非 hero 的座（同 apply_exploit_width_prior 的
+                                            // 跳过条件；没有范围 → 整段不修正）。
+    let width_seats: Vec<u8> = match (&exploit, ranges_opt.as_deref()) {
+        (Some(ep), Some(r)) if ep.alpha > 0.0 => r
+            .iter()
+            .enumerate()
+            .filter(|&(s, x)| {
+                s as PlayerId != auth_actor
+                    && !x.is_empty()
+                    && ep.profiles.get(s).is_some_and(Option::is_some)
+            })
+            .map(|(s, _)| s as u8)
+            .collect(),
+        _ => Vec::new(),
+    };
     if let Some(ep) = exploit {
         let holes = all_hole_combos();
         let board: Vec<Card> = root_state.board().to_vec();
@@ -3809,6 +3883,18 @@ fn subgame_search_unanchored_cached_inner(
         }
     }
 
+    let meta = SolveRangeMeta {
+        path: "unanchored",
+        range_src: match (ranges_opt.is_some(), cross_hit, prefix_hit) {
+            (false, ..) => "uniform",
+            (true, true, _) => "cross_street_posterior",
+            (true, false, true) => "prefix_reach",
+            (true, false, false) => "uniform",
+        },
+        hero_coef: hero_coef_on && prefix_hit,
+        coef_seats: if prefix_hit { coef_seats } else { Vec::new() },
+        width_seats,
+    };
     // 子树 solve 实际用表（同 anchored：override 优先，否则 blueprint 表 byte-equal）。
     let sub_table: Arc<BucketTable> =
         bucket_override.map_or_else(|| Arc::clone(&game.bucket_table), Arc::clone);
@@ -3870,6 +3956,7 @@ fn subgame_search_unanchored_cached_inner(
             trainer,
             sub_abs,
             hand_seed,
+            meta,
         })
     };
     let solved_fresh: SolvedSubgame;

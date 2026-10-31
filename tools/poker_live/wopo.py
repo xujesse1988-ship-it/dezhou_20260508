@@ -116,7 +116,8 @@ def legalize(resp, valid):
 class WopoSession:
     def __init__(self, worker, action_file, n_seats, hero_seat=0, num_hands=0,
                  action_log=None, prewarm=False, exploit=False, debug=False,
-                 exploit_4bet=False, hh_log=None, play_log=None, ante=0, blueprint_ante=0):
+                 exploit_4bet=False, hh_log=None, play_log=None, ante=0, blueprint_ante=0,
+                 send_hand_id=False):
         self.worker = worker
         # ante：桌面每座 ante（--ante，桌面筹码）；blueprint_ante：blueprint 的 ante（solver 筹码，
         # BB = 100）。每手按 ante × 100 == blueprint_ante × 大盲 核对，对不上这手作废。
@@ -132,6 +133,8 @@ class WopoSession:
         # PM-17 (--exploit-4bet)：advisor 要请求里的玩家名 + 每手带金额的 observe（同 poker_manager）。
         self.exploit_4bet = exploit_4bet
         self.send_names = exploit or exploit_4bet
+        # advisor --range-log：请求带本手编号，范围日志才能和 hh 对上。关时请求与旧版逐字节相同。
+        self.send_hand_id = send_hand_id
         self.hh_log = hh_log    # 校验通过的整手牌局 JSONL（opponent_analysis 读）；None = 不写
         # 牌桌实况（人看）：手牌 / 公共牌 / 玩家行动 / hero 决策 / 结算 / 作废；None = 不写。
         # 诊断信息（连接、未知消息、过期等）照旧走 stderr。
@@ -368,7 +371,8 @@ class WopoSession:
                             stacks=hand.hand_start_stacks(placeholder=100 * hand.bb),
                             dealt_seats=list(dealt) if dealt else None,
                             names=dict(hand.names) if self.send_names else None,
-                            ante=hand.ante, posts=list(hand.posts) or None)
+                            ante=hand.ante, posts=list(hand.posts) or None,
+                            hand_id=hand.hand_id if self.send_hand_id else None)
 
     def _maybe_prewarm(self):
         """街起点预热（--search-prewarm）：hero 本手还能行动才发；发错无害（advisor 侧 skip）。"""
