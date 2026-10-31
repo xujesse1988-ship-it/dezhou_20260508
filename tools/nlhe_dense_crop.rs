@@ -11,6 +11,9 @@
 //!     --bucket-table <v4 table> --profile six-max --seats 9 --reshape all-1pot \
 //!     --postflop-cap 4 --stack-bb 100 [--keep-through flop] [--strategy-only] [--verify]
 //! ```
+//!
+//! 已有的 crop 再裁到更早的街（如本机只要翻前 σ 的离线工具）：`--from-crop <crop 文件 | ->`
+//! 代替 `--checkpoint`（`-` = 从 stdin 读，可接 `zstd -dc x.crop.zst |`），输出恒不含 regret。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,11 +22,15 @@ use std::time::Instant;
 
 use poker::training::nlhe::SimplifiedNlheGame;
 use poker::training::nlhe_betting_tree::{six_max_reshape, SIX_MAX_RESHAPE_NAMES};
-use poker::training::nlhe_dense_crop::{crop_dense_checkpoint, CropOptions, CroppedBlueprint};
+use poker::training::nlhe_dense_crop::{
+    crop_dense_checkpoint, recrop, CropOptions, CroppedBlueprint,
+};
 use poker::{BucketTable, ChipAmount, StreetTag, TableConfig};
 
 struct Args {
     checkpoint: PathBuf,
+    /// `--from-crop`：源是已有 crop（`-` = stdin），再裁到 `--keep-through`（[`recrop`]）。
+    from_crop: Option<PathBuf>,
     out: PathBuf,
     bucket_table: PathBuf,
     profile: String,
@@ -39,7 +46,7 @@ struct Args {
 }
 
 fn usage() -> &'static str {
-    "usage: nlhe_dense_crop --checkpoint <dense ckpt> --out <crop file> --bucket-table <path>\n\
+    "usage: nlhe_dense_crop (--checkpoint <dense ckpt> | --from-crop <crop|->) --out <crop file> --bucket-table <path>\n\
      \t[--profile hu|six-max (default six-max)] [--seats <N> (default 6)]\n\
      \t[--reshape <name> (default none)] [--postflop-cap <N> (default 3)] [--stack-bb <N> (default 100)]\n\
      \t[--ante <chips> (default 0)]\n\
@@ -50,6 +57,7 @@ fn usage() -> &'static str {
 fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         checkpoint: PathBuf::new(),
+        from_crop: None,
         out: PathBuf::new(),
         bucket_table: PathBuf::new(),
         profile: "six-max".to_string(),
@@ -72,6 +80,9 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--checkpoint" => {
                 a.checkpoint = it.next().ok_or("--checkpoint requires a value")?.into()
+            }
+            "--from-crop" => {
+                a.from_crop = Some(it.next().ok_or("--from-crop requires a value")?.into())
             }
             "--out" => a.out = it.next().ok_or("--out requires a value")?.into(),
             "--bucket-table" => {
@@ -115,17 +126,20 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument: {other}\n{}", usage())),
         }
     }
-    for (v, name) in [
-        (&a.checkpoint, "--checkpoint"),
-        (&a.out, "--out"),
-        (&a.bucket_table, "--bucket-table"),
-    ] {
+    let has_checkpoint = !a.checkpoint.as_os_str().is_empty();
+    if a.from_crop.is_some() == has_checkpoint {
+        return Err(format!(
+            "exactly one of --checkpoint / --from-crop is required\n{}",
+            usage()
+        ));
+    }
+    for (v, name) in [(&a.out, "--out"), (&a.bucket_table, "--bucket-table")] {
         if v.as_os_str().is_empty() {
             return Err(format!("{name} is required\n{}", usage()));
         }
     }
-    if a.checkpoint == a.out {
-        return Err("--out must differ from --checkpoint".to_string());
+    if a.checkpoint == a.out || a.from_crop.as_ref() == Some(&a.out) {
+        return Err("--out must differ from the source".to_string());
     }
     Ok(a)
 }
@@ -181,14 +195,27 @@ fn run() -> Result<(), String> {
         keep_through: a.keep_through,
         keep_regret: !a.strategy_only,
     };
-    let s = crop_dense_checkpoint(&a.checkpoint, &a.out, &game, opts)
-        .map_err(|e| format!("crop failed: {e}"))?;
+    let s = match &a.from_crop {
+        Some(src) if src.as_os_str() == "-" => {
+            recrop(std::io::stdin().lock(), &a.out, &game, a.keep_through)
+        }
+        Some(src) => {
+            let f = std::fs::File::open(src).map_err(|e| format!("open {}: {e}", src.display()))?;
+            recrop(f, &a.out, &game, a.keep_through)
+        }
+        None => crop_dense_checkpoint(&a.checkpoint, &a.out, &game, opts),
+    }
+    .map_err(|e| format!("crop failed: {e}"))?;
     eprintln!(
         "[crop] done in {:.1}s: update_count={} keep_through={:?} regret={}",
         t1.elapsed().as_secs_f64(),
         s.source_update_count,
         a.keep_through,
-        if a.strategy_only { "dropped" } else { "kept" },
+        if a.strategy_only || a.from_crop.is_some() {
+            "dropped"
+        } else {
+            "kept"
+        },
     );
     eprintln!(
         "[crop] nodes {} -> {} | infosets {} -> {} | slots {} -> {} ({:.2}%)",

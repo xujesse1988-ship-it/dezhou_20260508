@@ -401,6 +401,250 @@ pub fn crop_dense_checkpoint(
     })
 }
 
+/// crop header 里读方关心的字段（[`parse_crop_header`] 校验通过后返回）。
+struct CropHeader {
+    keep_through: StreetTag,
+    has_regret: bool,
+    update_count: u64,
+}
+
+/// 校验 crop header（magic / schema / 全树指纹）并取出 [`CropHeader`]。指纹不符（不同树 / 抽象 /
+/// 桶表 / ante）即拒绝。kept 尺寸另由 [`check_kept_layout`] 对照。
+fn parse_crop_header(
+    header: &[u8; CROP_HEADER_LEN],
+    expected: &DenseLayoutFingerprint,
+) -> Result<CropHeader, CheckpointError> {
+    if header[OFF_MAGIC..OFF_SCHEMA] != CROP_MAGIC {
+        return Err(corrupted(
+            0,
+            "not a cropped dense blueprint (magic mismatch)",
+        ));
+    }
+    let schema = u32::from_le_bytes(header[OFF_SCHEMA..OFF_KEEP_THROUGH].try_into().unwrap());
+    if schema != CROP_SCHEMA_VERSION {
+        return Err(CheckpointError::SchemaMismatch {
+            expected: CROP_SCHEMA_VERSION,
+            got: schema,
+        });
+    }
+    let keep_through = street_from_u8(header[OFF_KEEP_THROUGH]).ok_or_else(|| {
+        corrupted(
+            OFF_KEEP_THROUGH as u64,
+            format!("invalid keep_through {}", header[OFF_KEEP_THROUGH]),
+        )
+    })?;
+    let has_regret = match header[OFF_HAS_REGRET] {
+        0 => false,
+        1 => true,
+        v => {
+            return Err(corrupted(
+                OFF_HAS_REGRET as u64,
+                format!("invalid has_regret {v}"),
+            ))
+        }
+    };
+    let rd = |off: usize| u64::from_le_bytes(header[off..off + 8].try_into().unwrap());
+
+    let bucket_blake3: [u8; 32] = header[OFF_BUCKET_BLAKE3..OFF_ACTION_BLAKE3]
+        .try_into()
+        .unwrap();
+    if bucket_blake3 != expected.bucket_table_blake3 {
+        return Err(CheckpointError::BucketTableMismatch {
+            expected: expected.bucket_table_blake3,
+            got: bucket_blake3,
+        });
+    }
+    let got = DenseLayoutFingerprint {
+        bucket_table_blake3: bucket_blake3,
+        num_nodes: rd(OFF_SRC_NUM_NODES),
+        total_rows: rd(OFF_SRC_TOTAL_ROWS),
+        total_slots: rd(OFF_SRC_TOTAL_SLOTS),
+        action_count_blake3: header[OFF_ACTION_BLAKE3..CROP_HEADER_LEN]
+            .try_into()
+            .unwrap(),
+    };
+    if &got != expected {
+        return Err(corrupted(
+            OFF_SRC_NUM_NODES as u64,
+            format!(
+                "source layout fingerprint mismatch: file(nodes={}, rows={}, slots={}) vs \
+                 game(nodes={}, rows={}, slots={})——crop 文件不是用这个树 / 抽象 / ante 训出来的",
+                got.num_nodes,
+                got.total_rows,
+                got.total_slots,
+                expected.num_nodes,
+                expected.total_rows,
+                expected.total_slots,
+            ),
+        ));
+    }
+    Ok(CropHeader {
+        keep_through,
+        has_regret,
+        update_count: rd(OFF_UPDATE_COUNT),
+    })
+}
+
+/// 按 `keep_through` 现算紧凑布局，并与 header 声明的 kept 尺寸对照。
+fn check_kept_layout(
+    header: &[u8; CROP_HEADER_LEN],
+    indexer: &NlheDenseIndexer,
+    keep_through: StreetTag,
+) -> Result<KeptLayout, CheckpointError> {
+    let rd = |off: usize| u64::from_le_bytes(header[off..off + 8].try_into().unwrap());
+    let layout = KeptLayout::new(indexer, keep_through);
+    let declared = (rd(OFF_KEPT_NODES), rd(OFF_KEPT_ROWS), rd(OFF_KEPT_SLOTS));
+    if declared != (layout.kept_nodes, layout.kept_rows, layout.kept_slots) {
+        return Err(corrupted(
+            OFF_KEPT_NODES as u64,
+            format!(
+                "kept layout mismatch: file {declared:?} vs recomputed ({}, {}, {})",
+                layout.kept_nodes, layout.kept_rows, layout.kept_slots
+            ),
+        ));
+    }
+    Ok(layout)
+}
+
+/// 把已有的 crop（从 `src` 流式读，可以是 `zstd -dc` 的管道）再裁到更早的街 `keep_through`，写成
+/// 新 crop 文件 `dst`。输出只含 strategy 表（源有 regret 也丢掉）；保留行的 touched 位与 strategy
+/// 值逐位照抄，所以新 crop 上的 average strategy 查询与源 crop 逐位一致。
+///
+/// 用途：本机内存放不下完整翻前 + 翻牌 crop 时，只要翻前 σ 的离线工具（范围估计、翻前分析）读一个
+/// 小得多的翻前 crop。`keep_through` 不早于源 crop 的保留街 → 拒绝（那不是裁切）。源 trailer 校验
+/// 通过才落盘（temp file + atomic rename，同 [`crop_dense_checkpoint`]）。
+pub fn recrop<R: Read>(
+    src: R,
+    dst: &Path,
+    game: &SimplifiedNlheGame,
+    keep_through: StreetTag,
+) -> Result<CropSummary, CheckpointError> {
+    let (indexer, expected) = full_indexer_and_fingerprint(game);
+    let mut reader = BufReader::with_capacity(IO_BUF_BYTES, src);
+    let mut rh = Hasher::new();
+    let mut header = [0u8; CROP_HEADER_LEN];
+    read_hashed(&mut reader, &mut rh, &mut header)
+        .map_err(|e| corrupted(0, format!("read source crop header failed: {e}")))?;
+    let src_hdr = parse_crop_header(&header, &expected)?;
+    if keep_through as u8 >= src_hdr.keep_through as u8 {
+        return Err(corrupted(
+            OFF_KEEP_THROUGH as u64,
+            format!(
+                "recrop keep_through={keep_through:?} 须早于源 crop 的 {:?}",
+                src_hdr.keep_through
+            ),
+        ));
+    }
+    let src_layout = check_kept_layout(&header, &indexer, src_hdr.keep_through)?;
+    let layout = KeptLayout::new(&indexer, keep_through);
+
+    // 1. 两张 touched bitset：源紧凑行号 → 新紧凑行号。
+    let src_words = words_for_rows(src_layout.kept_rows);
+    let rerr = |what: &'static str| {
+        move |e: std::io::Error| corrupted(0, format!("read source crop {what}: {e}"))
+    };
+    let regret_touched =
+        read_words_hashed(&mut reader, &mut rh, src_words).map_err(rerr("regret touched"))?;
+    let strategy_touched =
+        read_words_hashed(&mut reader, &mut rh, src_words).map_err(rerr("strategy touched"))?;
+    let kept_words = words_for_rows(layout.kept_rows);
+    let mut kept_regret_touched = vec![0u64; kept_words];
+    let mut kept_strategy_touched = vec![0u64; kept_words];
+    for id in 0..indexer.num_nodes() as NodeId {
+        let (Some((src_row, _)), Some((dst_row, _))) =
+            (src_layout.base[id as usize], layout.base[id as usize])
+        else {
+            continue;
+        };
+        for b in 0..u64::from(indexer.node_meta(id).bucket_count) {
+            if bit_get(&regret_touched, src_row + b) {
+                bit_set(&mut kept_regret_touched, dst_row + b);
+            }
+            if bit_get(&strategy_touched, src_row + b) {
+                bit_set(&mut kept_strategy_touched, dst_row + b);
+            }
+        }
+    }
+    drop((regret_touched, strategy_touched));
+
+    // 2. 新 header：源指纹 / 元数据照抄，改 keep_through / has_regret / kept 尺寸。
+    let mut out_header = header;
+    out_header[OFF_KEEP_THROUGH] = keep_through as u8;
+    out_header[OFF_HAS_REGRET] = 0;
+    for (off, v) in [
+        (OFF_KEPT_NODES, layout.kept_nodes),
+        (OFF_KEPT_ROWS, layout.kept_rows),
+        (OFF_KEPT_SLOTS, layout.kept_slots),
+    ] {
+        out_header[off..off + 8].copy_from_slice(&v.to_le_bytes());
+    }
+
+    let parent_dir = match dst.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let tmp = tempfile::NamedTempFile::new_in(parent_dir)
+        .map_err(|e| corrupted(0, format!("create temp file in {parent_dir:?} failed: {e}")))?;
+    let mut writer = BufWriter::with_capacity(IO_BUF_BYTES, tmp);
+    let mut wh = Hasher::new();
+    let werr = |e: std::io::Error| corrupted(0, format!("write recrop output failed: {e}"));
+    wh.update(&out_header);
+    writer.write_all(&out_header).map_err(werr)?;
+    write_words_hashed(&mut writer, &mut wh, &kept_regret_touched).map_err(werr)?;
+    write_words_hashed(&mut writer, &mut wh, &kept_strategy_touched).map_err(werr)?;
+
+    // 3. 值表按节点顺序流式过：regret 表（若有）整张读过即弃；strategy 表只拷新布局保留的节点。
+    let mut buf = vec![0u8; COPY_BUF_BYTES];
+    for (table, present, keep_table) in [
+        ("regret", src_hdr.has_regret, false),
+        ("strategy", true, true),
+    ] {
+        if !present {
+            continue;
+        }
+        for id in 0..indexer.num_nodes() as NodeId {
+            if src_layout.base[id as usize].is_none() {
+                continue;
+            }
+            let m = indexer.node_meta(id);
+            let nbytes = u64::from(m.bucket_count) * u64::from(m.action_count) * 8;
+            let out = (keep_table && layout.base[id as usize].is_some())
+                .then_some((&mut writer, &mut wh));
+            copy_or_skip(&mut reader, &mut rh, out, nbytes, &mut buf)
+                .map_err(|e| corrupted(0, format!("copy {table} values (node {id}): {e}")))?;
+        }
+    }
+
+    // 4. 源 trailer 校验通过才落盘输出。
+    verify_trailer_and_eof(&mut reader, rh, "source crop")?;
+    let trailer: [u8; 32] = wh.finalize().into();
+    writer.write_all(&trailer).map_err(werr)?;
+    writer.flush().map_err(werr)?;
+    let tmp = writer
+        .into_inner()
+        .map_err(|e| corrupted(0, format!("BufWriter into_inner failed: {e}")))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| corrupted(0, format!("fsync temp file failed: {e}")))?;
+    let file = tmp
+        .persist(dst)
+        .map_err(|e| corrupted(0, format!("atomic rename failed: {e}")))?;
+    let output_bytes = file
+        .metadata()
+        .map_err(|e| corrupted(0, format!("stat output failed: {e}")))?
+        .len();
+    Ok(CropSummary {
+        source_update_count: src_hdr.update_count,
+        source_nodes: expected.num_nodes,
+        source_rows: expected.total_rows,
+        source_slots: expected.total_slots,
+        kept_nodes: layout.kept_nodes,
+        kept_rows: layout.kept_rows,
+        kept_slots: layout.kept_slots,
+        output_bytes,
+    })
+}
+
 /// 加载后的裁切 blueprint：保留街上的 average strategy 查询与原
 /// `DenseNlheEsMccfrTrainer::average_strategy` **逐位一致**；被裁掉的街返回 `None`。
 pub struct CroppedBlueprint {
@@ -423,82 +667,12 @@ impl CroppedBlueprint {
         let mut header = [0u8; CROP_HEADER_LEN];
         read_hashed(&mut reader, &mut h, &mut header)
             .map_err(|e| corrupted(0, format!("read crop header failed: {e}")))?;
-
-        if header[OFF_MAGIC..OFF_SCHEMA] != CROP_MAGIC {
-            return Err(corrupted(
-                0,
-                "not a cropped dense blueprint (magic mismatch)",
-            ));
-        }
-        let schema = u32::from_le_bytes(header[OFF_SCHEMA..OFF_KEEP_THROUGH].try_into().unwrap());
-        if schema != CROP_SCHEMA_VERSION {
-            return Err(CheckpointError::SchemaMismatch {
-                expected: CROP_SCHEMA_VERSION,
-                got: schema,
-            });
-        }
-        let keep_through = street_from_u8(header[OFF_KEEP_THROUGH]).ok_or_else(|| {
-            corrupted(
-                OFF_KEEP_THROUGH as u64,
-                format!("invalid keep_through {}", header[OFF_KEEP_THROUGH]),
-            )
-        })?;
-        let has_regret = match header[OFF_HAS_REGRET] {
-            0 => false,
-            1 => true,
-            v => {
-                return Err(corrupted(
-                    OFF_HAS_REGRET as u64,
-                    format!("invalid has_regret {v}"),
-                ))
-            }
-        };
-        let rd = |off: usize| u64::from_le_bytes(header[off..off + 8].try_into().unwrap());
-
-        let bucket_blake3: [u8; 32] = header[OFF_BUCKET_BLAKE3..OFF_ACTION_BLAKE3]
-            .try_into()
-            .unwrap();
-        if bucket_blake3 != expected.bucket_table_blake3 {
-            return Err(CheckpointError::BucketTableMismatch {
-                expected: expected.bucket_table_blake3,
-                got: bucket_blake3,
-            });
-        }
-        let got = DenseLayoutFingerprint {
-            bucket_table_blake3: bucket_blake3,
-            num_nodes: rd(OFF_SRC_NUM_NODES),
-            total_rows: rd(OFF_SRC_TOTAL_ROWS),
-            total_slots: rd(OFF_SRC_TOTAL_SLOTS),
-            action_count_blake3: header[OFF_ACTION_BLAKE3..CROP_HEADER_LEN]
-                .try_into()
-                .unwrap(),
-        };
-        if got != expected {
-            return Err(corrupted(
-                OFF_SRC_NUM_NODES as u64,
-                format!(
-                    "source layout fingerprint mismatch: file(nodes={}, rows={}, slots={}) vs \
-                     game(nodes={}, rows={}, slots={})——crop 文件不是用这个树 / 抽象 / ante 训出来的",
-                    got.num_nodes,
-                    got.total_rows,
-                    got.total_slots,
-                    expected.num_nodes,
-                    expected.total_rows,
-                    expected.total_slots,
-                ),
-            ));
-        }
-        let layout = KeptLayout::new(&indexer, keep_through);
-        let declared = (rd(OFF_KEPT_NODES), rd(OFF_KEPT_ROWS), rd(OFF_KEPT_SLOTS));
-        if declared != (layout.kept_nodes, layout.kept_rows, layout.kept_slots) {
-            return Err(corrupted(
-                OFF_KEPT_NODES as u64,
-                format!(
-                    "kept layout mismatch: file {declared:?} vs recomputed ({}, {}, {})",
-                    layout.kept_nodes, layout.kept_rows, layout.kept_slots
-                ),
-            ));
-        }
+        let CropHeader {
+            keep_through,
+            has_regret,
+            update_count,
+        } = parse_crop_header(&header, &expected)?;
+        let layout = check_kept_layout(&header, &indexer, keep_through)?;
 
         let n_words = words_for_rows(layout.kept_rows);
         let rerr = |what: &'static str| {
@@ -521,7 +695,7 @@ impl CroppedBlueprint {
             indexer: Arc::new(indexer),
             layout,
             keep_through,
-            update_count: rd(OFF_UPDATE_COUNT),
+            update_count,
             regret_touched,
             strategy_touched,
             regret,
@@ -747,6 +921,67 @@ mod tests {
             ));
             assert!(bp.regret_for(info).is_none(), "未保留 regret 表 → None");
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [`recrop`]：翻前 + 翻牌（含 regret）crop 再裁到翻前，翻前查询与直接从 ckpt 裁翻前逐位一致，
+    /// 文件也逐字节相同（直接裁时同样不留 regret）；裁到不更早的街、源 crop 被改都拒绝且不留输出。
+    #[test]
+    fn recrop_to_preflop_matches_direct_crop() {
+        let trainer = trained(2_000);
+        let game = trainer.game();
+        let dir = tmpdir("recrop");
+        let ckpt = dir.join("src.ckpt");
+        trainer.save_checkpoint(&ckpt).expect("save");
+        let flop = dir.join("flop.crop");
+        let opts = |keep_through, keep_regret| CropOptions {
+            keep_through,
+            keep_regret,
+        };
+        crop_dense_checkpoint(&ckpt, &flop, game, opts(StreetTag::Flop, true)).expect("crop flop");
+        let direct = dir.join("direct.crop");
+        crop_dense_checkpoint(&ckpt, &direct, game, opts(StreetTag::Preflop, false))
+            .expect("crop preflop");
+
+        let re = dir.join("re.crop");
+        let src = File::open(&flop).expect("open flop crop");
+        let s = recrop(src, &re, game, StreetTag::Preflop).expect("recrop");
+        assert_eq!(s.source_update_count, 2_000);
+        assert_eq!(
+            std::fs::read(&re).expect("read re"),
+            std::fs::read(&direct).expect("read direct"),
+            "再裁的翻前 crop 应与直接裁的逐字节相同"
+        );
+        let bp = CroppedBlueprint::load(&re, game).expect("load recrop");
+        assert_eq!(bp.keep_through(), StreetTag::Preflop);
+        let tree = game.tree();
+        let mut checked = 0;
+        for id in 0..tree.num_nodes() as NodeId {
+            let street = tree.node(id).street;
+            for b in 0..bucket_count_by_street(game)[street as usize] {
+                let info = pack_info_set_v2(b, id, street);
+                if street == StreetTag::Preflop {
+                    let avg = bp.average_strategy(info).expect("preflop kept");
+                    checked += usize::from(!avg.is_empty());
+                    assert!(bits_eq(&avg, &trainer.average_strategy(info)));
+                } else {
+                    assert!(bp.average_strategy(info).is_none(), "{street:?} 应已裁掉");
+                }
+            }
+        }
+        assert!(checked > 0, "应有被访问的翻前信息集");
+
+        let same = dir.join("same.crop");
+        let src = File::open(&flop).expect("open flop crop");
+        assert!(recrop(src, &same, game, StreetTag::Flop).is_err());
+        assert!(!same.exists());
+
+        let mut bytes = std::fs::read(&flop).expect("read flop crop");
+        let pos = bytes.len() - TRAILER_LEN - 9;
+        bytes[pos] ^= 0x01;
+        let bad = dir.join("bad_re.crop");
+        assert!(recrop(&bytes[..], &bad, game, StreetTag::Preflop).is_err());
+        assert!(!bad.exists(), "源校验失败不应留下输出文件");
         std::fs::remove_dir_all(&dir).ok();
     }
 
