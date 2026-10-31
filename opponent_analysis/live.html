@@ -653,8 +653,9 @@ function timeline(h) {
     }
     cur.rows.push(`<div class="tl ${cls}"><span class="t">${t}</span><span>${row}</span></div>`);
   }
-  return '<div class="timeline">' + groups.filter((g, i) => i === 0 || g.rows.length || g.board).map(g =>
-    `<div class="st">${STREET_CN[g.st] || esc(g.st)}${g.board ? ' ' + pcards(g.board) : ''}</div>${g.rows.join('') || '<div class="tl muted"><span class="t"></span><span>（没有动作）</span></div>'}`).join('') + '</div>';
+  // Newest first: the latest street on top, and within each street the latest action on top.
+  return '<div class="timeline">' + groups.filter((g, i) => i === 0 || g.rows.length || g.board).reverse().map(g =>
+    `<div class="st">${STREET_CN[g.st] || esc(g.st)}${g.board ? ' ' + pcards(g.board) : ''}</div>${g.rows.slice().reverse().join('') || '<div class="tl muted"><span class="t"></span><span>（没有动作）</span></div>'}`).join('') + '</div>';
 }
 
 function resultBlock(h) {
