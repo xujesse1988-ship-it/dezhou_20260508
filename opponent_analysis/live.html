@@ -237,8 +237,8 @@ const NAME_COL = { key: 'name', label: '玩家', l: true, val: p => p.name, cell
 const BASE_COLS = [
   { key: 'hands', label: '手数', val: (p, sc) => view(p, sc).hands, cell: (p, sc) => view(p, sc).hands },
   { key: 'tag', label: '类型', l: true, val: (p, sc) => view(p, sc).tag, cell: (p, sc) => esc(view(p, sc).tag) },
-  { key: 'net_bb', label: '累计盈亏', val: (p, sc) => view(p, sc).net_bb, cell: (p, sc) => signed(view(p, sc).net_bb) },
-  { key: 'bb100', label: '每百手盈亏', val: (p, sc) => view(p, sc).bb100 ?? 0, cell: (p, sc) => signed(view(p, sc).bb100) },
+  { key: 'net_bb', label: '累计盈亏（大盲）', val: (p, sc) => view(p, sc).net_bb, cell: (p, sc) => signed(view(p, sc).net_bb) },
+  { key: 'bb100', label: '每百手盈亏（大盲）', val: (p, sc) => view(p, sc).bb100 ?? 0, cell: (p, sc) => signed(view(p, sc).bb100) },
   { key: 'leaks', label: '候选漏洞', val: (p, sc) => view(p, sc).leaks.filter(x => x.gain_cons > 0).length, cell: (p, sc) => { const L = view(p, sc).leaks, c = L.filter(x => x.gain_cons > 0).length; return c ? `<b>${c}</b>` : (L.length ? `<span class="muted" title="均值为正、保守值不为正">${L.length}?</span>` : '<span class="muted">0</span>'); } },
   { key: 'changes', label: '近期变化', val: p => p.n_changes, cell: p => p.n_changes ? `<b class="flag">${p.n_changes}</b>` : (p.recent.has_earlier ? '<span class="muted">0</span>' : '<span class="muted">—</span>') },
   { key: 'pf_allin', label: '翻前全下 亮/总', val: p => p.pf_allin.n_shown * 1000 + p.pf_allin.n, cell: p => p.pf_allin.n ? `${p.pf_allin.n_shown ? `<b>${p.pf_allin.n_shown}</b>` : '<span class="muted">0</span>'}<span class="muted"> / ${p.pf_allin.n}</span>` : '<span class="muted">—</span>' },

@@ -186,3 +186,6 @@ class PreflopAllins(unittest.TestCase):
         md = render_markdown(acc.finalize([], Config()))
         self.assertIn("推全下·面对开池：3 次，亮 3 次：AA、A5s×2", md)
         self.assertIn("跟全下·面对 3bet：3 次，亮 3 次：72o×3", md)
+        # Stack depths are in big blinds (2000 chips at blinds 10/20).
+        self.assertIn("| 起手 / 有效码深（大盲） |", md)
+        self.assertIn("| BTN | 100 / 100 | 4 | s2 |", md)

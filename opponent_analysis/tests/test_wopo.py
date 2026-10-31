@@ -121,6 +121,47 @@ class Wopo(unittest.TestCase):
         lv.build()
         self.assertEqual(lv.snapshot["hands"], 7)
 
+    def test_live_amounts_use_each_hands_big_blind(self):
+        """Blinds change between wopo hands (1/2 here, then 50/100 with ante 100): every amount the
+        page shows is in big blinds of its own hand, computed here from the raw hh rows."""
+        from opponent_analysis.live import Live
+
+        rows = wopo_hh_rows() + wopo_hh_rows(POSTS_FIXTURE)
+        self.assertEqual({(r["big_blind"], r.get("ante") or 0) for r in rows}, {(2, 0), (100, 100)})
+        with open(self.hh, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        lv = Live(self.db, "wopo", [self.hh], Config(min_hands=1, min_opps=1), refresh_s=0)
+        self.addCleanup(lv.close)
+        lv.bootstrap()
+        s = lv.snapshot
+        self.assertEqual(s["hands"], 11)
+        net: dict = {}
+        for r in rows:
+            for seat in r["dealt_seats"]:
+                k = str(seat)
+                d = (r["result"]["final_stacks"][k] - r["initial_stacks"][k]) / r["big_blind"]
+                net[r["names"][k]] = net.get(r["names"][k], 0.0) + d
+        self.assertEqual({p["name"]: p["net_bb"] for p in s["players"]},
+                         {n: round(v, 1) for n, v in net.items()})
+        recent = {h["hand_id"]: h for h in s["recent"]}
+        for r in rows:
+            h = recent[r["hand_id"]]
+            # Pot = antes + blinds + live posts + every action's chips (no short blinds in these hands).
+            pot = (sum(a["contribution_delta"] for a in r["actions"]) + len(r["dealt_seats"]) * (r.get("ante") or 0)
+                   + r["small_blind"] + r["big_blind"] + len(r.get("posts") or []) * r["big_blind"])
+            self.assertEqual(h["pot_bb"], round(pot / r["big_blind"], 1))
+            me = str(r["my_seat"])
+            self.assertEqual(h["hero_net_bb"],
+                             round((r["result"]["final_stacks"][me] - r["initial_stacks"][me]) / r["big_blind"], 1))
+        self.assertEqual(recent["ante-table:hand:000132"]["pot_bb"], 1206.5)
+        # Seat chips under each table's latest hand, in that hand's big blinds.
+        last = {r["table_id"]: r for r in rows}
+        for t in s["tables"]:
+            r = last[t["table_id"]]
+            self.assertEqual({x["seat"]: x["stack_bb"] for x in t["seats"]},
+                             {sd: round(r["result"]["final_stacks"][str(sd)] / r["big_blind"], 1) for sd in r["dealt_seats"]})
+
     def test_bad_final_stacks_rejected(self):
         rows = wopo_hh_rows()
         rows[0]["result"] = dict(rows[0]["result"], final_stacks={"0": 200, "1": 175, "2": 175, "3": 251})

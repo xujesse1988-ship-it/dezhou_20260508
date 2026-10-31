@@ -96,3 +96,17 @@ class Cards(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeakTableUnits(unittest.TestCase):
+    def test_gains_are_labelled_in_big_blinds(self):
+        from opponent_analysis.report import _leak_table
+
+        # Gains come from exploit.* on pot_bb / bet_bb, so they are big blinds; the header says so.
+        x = {"kind": "overfold", "street": "flop", "n": 20, "observed": posterior(12, 20, BetaPrior(0.5, 10)),
+             "breakeven": exploit.overfold_breakeven([6.0], [3.0]),
+             "gain_mean": exploit.overfold_gain(0.6, [6.0], [3.0]), "gain_cons": 0.5, "per100": 10.0, "index": 5.0,
+             "counter": "c"}
+        head, _, row = _leak_table([x])
+        self.assertIn("每次收益（大盲）", head)
+        self.assertIn("| 33.3 | +2.40 / +0.50 |", row)
