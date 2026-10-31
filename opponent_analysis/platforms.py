@@ -47,11 +47,12 @@ PLATFORMS = {
         # The wopo driver only logs hands with 3+ dealt seats (two-player hands are skipped),
         # and the adapter rejects any that slip through, so this value is never used.
         heads_up_button_is_sb=True,
-        # Not measured yet: the captured wopo sessions (2026-10-13/16) contain no showdown, so
-        # how hand_result reveals cards is unknown. Conservative until a showdown is seen.
+        # Measured 2026-10-29 on the two 2026-10-28 ante-table runs: hand_result.shown_cards held
+        # 114 of 114 opponents live at showdown; the logging seat's own cards are never in it
+        # (13 of 13). Kept at may_muck until the reveal-rate check leaves the hero seat out.
         reveal_policy="may_muck",
         forced_actions_in_hh=False,
-        note="no timeout flag seen in player_action; showdown cards not yet captured",
+        note="no timeout flag seen in player_action; shown_cards omits the hero seat",
     ),
 }
 

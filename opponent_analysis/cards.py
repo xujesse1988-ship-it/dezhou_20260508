@@ -47,6 +47,14 @@ def rank5(cards: list[tuple[int, str]]) -> tuple:
     return (0, *rs)
 
 
+def hand_class(hole: list[str]) -> str:
+    """Two hole cards -> 169-class label, high rank first: "QQ", "AKs", "T9o"."""
+    (r1, s1), (r2, s2) = sorted((_parse(c) for c in hole), reverse=True)
+    if r1 == r2:
+        return RANKS[r1] * 2
+    return RANKS[r1] + RANKS[r2] + ("s" if s1 == s2 else "o")
+
+
 def best_rank(cards: list[str]) -> tuple:
     parsed = [_parse(c) for c in cards]
     return max(rank5(list(c)) for c in combinations(parsed, 5))

@@ -6,14 +6,14 @@ import bisect
 import json
 import math
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 from . import exploit
-from .cards import river_percentile
+from .cards import RANKS, river_percentile
 from .model import Hand
 from .platforms import PLATFORMS
-from .spots import hand_observations
+from .spots import hand_observations, preflop_allins
 from .stats import BetaPrior, Posterior, benjamini_hochberg, fit_prior, posterior, two_prop_test, two_sided_p
 
 # (stat, outcome of interest, label) used in the summary table and deviation tests.
@@ -69,6 +69,7 @@ class Player:
     hand_idx: list = field(default_factory=list)
     hand_ts: list = field(default_factory=list)
     hand_net: list = field(default_factory=list)  # big blinds won in that hand
+    allins: list = field(default_factory=list)  # spots.PreflopAllin, in hand order
 
     def add(self, i: int, o) -> None:
         self.obs.append(o)
@@ -238,6 +239,8 @@ class Accumulator:
                 self.forced["forced"] += 1
         for o in hand_observations(h, self.pct_fn):
             self.players[o.name].add(i, o)
+        for nm, a in preflop_allins(h):
+            self.players[nm].allins.append(a)
 
     def finalize(self, rejected: list[dict], cfg: Config) -> dict:
         return _finalize(self, rejected, cfg)
@@ -383,6 +386,42 @@ def _tag(r: dict) -> str:
     return f"{loose}/{pre}{post}"
 
 
+ALLIN_ACTION = {"jam": "推全下", "call": "跟全下"}
+ALLIN_FACING = {0: "未开池", 1: "面对开池", 2: "面对 3bet", 3: "面对 4bet 及以上"}
+
+
+def _combo_key(c: str) -> tuple:
+    """Sort 169-class labels: pairs high to low, then by high card, kicker, suited first."""
+    r1, r2 = RANKS.index(c[0]), RANKS.index(c[1])
+    return (r1 != r2, -r1, -r2, c[2:] != "s")
+
+
+def allin_summary(p: Player) -> dict:
+    """A player's voluntary preflop all-ins grouped by (action, facing), with the shown hands."""
+    groups = {}
+    for a in p.allins:
+        g = groups.setdefault((a.action, a.facing), {"action": a.action, "facing": a.facing, "n": 0, "combos": Counter()})
+        g["n"] += 1
+        if a.combo:
+            g["combos"][a.combo] += 1
+    order = [(act, f) for act in ALLIN_ACTION for f in ALLIN_FACING]
+    rows = []
+    for key in order:
+        if key in groups:
+            g = groups[key]
+            rows.append({"action": g["action"], "facing": g["facing"],
+                         "label": f"{ALLIN_ACTION[g['action']]}·{ALLIN_FACING[g['facing']]}", "n": g["n"],
+                         "n_shown": sum(g["combos"].values()),
+                         "combos": sorted(g["combos"].items(), key=lambda kv: _combo_key(kv[0]))})
+    shown = [a for a in reversed(p.allins) if a.combo]
+    return {"n": len(p.allins), "jam": sum(a.action == "jam" for a in p.allins),
+            "call": sum(a.action == "call" for a in p.allins), "n_shown": len(shown), "groups": rows, "shown": shown}
+
+
+def _combo_list(combos: list) -> str:
+    return "、".join(c + (f"×{k}" if k > 1 else "") for c, k in combos) or "—"
+
+
 LEAK_NAMES = {"overfold": "弃牌过多", "overcall": "跟注过多", "underbluff": "河牌诈唬过少", "overbluff": "河牌诈唬过多"}
 
 
@@ -483,7 +522,34 @@ def render_markdown(res: dict) -> str:
         L.append("")
         L.append("</details>")
     L.append("")
-    L.append("## 5. 读法")
+    L.append("## 5. 翻前全下的亮牌")
+    L.append("")
+    L.append("每个对手自愿的翻前全下（主动推，或跟注全下），按局面分组；亮了牌的列出手牌。"
+             "没人跟的推全下不会亮牌，所以手牌样本偏向被跟注的那些"
+             + ("" if plat.reveal_policy == "all_live" else "，而且本平台输家可能不亮牌") + "。")
+    shown_any = False
+    for p in sorted(res["opponents"].values(), key=lambda p: (-len([a for a in p.allins if a.combo]), -len(p.allins))):
+        if not p.allins:
+            continue
+        shown_any = True
+        sm = allin_summary(p)
+        L.append("")
+        L.append(f"### {p.name}（{p.hands} 手；翻前全下 {sm['n']} 次：推 {sm['jam']} / 跟 {sm['call']}；亮牌 {sm['n_shown']} 次）")
+        L.append("")
+        for g in sm["groups"]:
+            L.append(f"- {g['label']}：{g['n']} 次，亮 {g['n_shown']} 次：{_combo_list(g['combos'])}")
+        if sm["shown"]:
+            L.append("")
+            L.append("| 时间 | 手牌 | 局面 | 位置 | 起手 / 有效码深（大盲） | 当时在牌里人数 | 手牌编号 |")
+            L.append("|---|---|---|---|---|---|---|")
+            for a in sm["shown"]:
+                L.append(f"| {_date(a.ts)} | {a.combo}（{''.join(a.cards)}） | {ALLIN_ACTION[a.action]}·{ALLIN_FACING[a.facing]}"
+                         f"{f'（前面 {a.callers} 人跟）' if a.callers else ''} | {a.pos} | {a.stack_bb:g} / {a.eff_bb:g} | {a.n_live} | {a.hand_id} |")
+    if not shown_any:
+        L.append("")
+        L.append("还没有对手翻前全下。")
+    L.append("")
+    L.append("## 6. 读法")
     L.append("")
     L.append("- 每次收益按「我方在同样的局面、同样的下注尺寸做出这个改动」计算：弃牌过多 = 用零胜率牌下注，"
              "被加注就弃；跟注过多 = 少打一次河牌纯诈唬；河牌诈唬过少 / 过多 = 只能抓诈唬的牌面对他河牌下注时弃 / 跟。")
@@ -532,6 +598,12 @@ def _leak_table(lk: list) -> list[str]:
     return L
 
 
+def allin_json(p: Player) -> dict:
+    sm = allin_summary(p)
+    return dict(sm, groups=[dict(g, combos=[list(c) for c in g["combos"]]) for g in sm["groups"]],
+                shown=[asdict(a) for a in sm["shown"]])
+
+
 def profile_json(res: dict) -> dict:
     def post(p: Posterior) -> dict:
         return {"k": p.k, "n": p.n, "mean": p.mean, "lo5": p.lo, "hi95": p.hi}
@@ -544,6 +616,7 @@ def profile_json(res: dict) -> dict:
             "rates": {f"{s}:{o}": post(r[(s, o)]) for s, o, _ in KEY_RATES},
             "leaks": [{k: (post(v) if isinstance(v, Posterior) else v) for k, v in x.items()}
                       for x in res["leaks"].get(name, [])],
+            "preflop_allin": allin_json(p),
         }
     out["priors"] = {f"{s}:{o}": {"mean": pr.mean, "k": pr.strength} for (s, o), pr in res["priors"].items()}
     return out

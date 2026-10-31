@@ -27,7 +27,8 @@ from . import db
 from .cards import river_percentile
 from .model import Hand
 from .platforms import detect_platform
-from .report import KEY_RATES, LEAK_NAMES, MIX_WARN, Accumulator, Config, _tag, profile_json, render_markdown, trend
+from .report import (KEY_RATES, LEAK_NAMES, MIX_WARN, Accumulator, Config, _tag, allin_json, profile_json, render_markdown,
+                     trend)
 from .stats import Posterior, posterior
 
 PAGE_PATH = os.path.join(os.path.dirname(__file__), "live.html")
@@ -303,6 +304,7 @@ def snapshot_json(res: dict, live: Live) -> dict:
             "n_changes": sum(c["flagged"] for c in res["changes"].get(p.name, [])),
             "mix": _clean(res["mix"].get(p.name)),
             "trend": trend(p),
+            "pf_allin": _clean(allin_json(p)),
         })
     rv = res["reveal"]
     return {

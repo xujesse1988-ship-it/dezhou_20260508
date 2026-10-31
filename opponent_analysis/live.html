@@ -193,6 +193,7 @@ const BASE_COLS = [
   { key: 'bb100', label: '每百手盈亏', val: (p, sc) => view(p, sc).bb100 ?? 0, cell: (p, sc) => signed(view(p, sc).bb100) },
   { key: 'leaks', label: '候选漏洞', val: (p, sc) => view(p, sc).leaks.filter(x => x.gain_cons > 0).length, cell: (p, sc) => { const L = view(p, sc).leaks, c = L.filter(x => x.gain_cons > 0).length; return c ? `<b>${c}</b>` : (L.length ? `<span class="muted" title="均值为正、保守值不为正">${L.length}?</span>` : '<span class="muted">0</span>'); } },
   { key: 'changes', label: '近期变化', val: p => p.n_changes, cell: p => p.n_changes ? `<b class="flag">${p.n_changes}</b>` : (p.recent.has_earlier ? '<span class="muted">0</span>' : '<span class="muted">—</span>') },
+  { key: 'pf_allin', label: '翻前全下 亮/总', val: p => p.pf_allin.n_shown * 1000 + p.pf_allin.n, cell: p => p.pf_allin.n ? `${p.pf_allin.n_shown ? `<b>${p.pf_allin.n_shown}</b>` : '<span class="muted">0</span>'}<span class="muted"> / ${p.pf_allin.n}</span>` : '<span class="muted">—</span>' },
   { key: 'last_ts', label: '最后出现', val: p => p.last_ts || 0, cell: p => `<span class="muted">${ago(p.last_ts)}</span>` },
 ];
 // visibleCols = null means the default: every column.
@@ -377,6 +378,22 @@ function changesBlock(p) {
   return h + '</tbody></table></div>';
 }
 
+const ALLIN_ACTION = { jam: '推全下', call: '跟全下' };
+const ALLIN_FACING = ['未开池', '面对开池', '面对 3bet', '面对 4bet 及以上'];
+function allinBlock(A) {
+  if (!A.n) return '<p class="muted">还没有翻前全下。</p>';
+  let h = `<p class="legend">自愿的翻前全下 ${A.n} 次（推 ${A.jam} / 跟 ${A.call}），亮牌 ${A.n_shown} 次。没人跟的推全下不会亮牌，手牌样本偏向被跟注的那些`
+    + (snap.clean_showdown ? '' : '；本平台输家可能不亮牌') + '。</p><ul class="plain">'
+    + A.groups.map(g => `<li>${esc(g.label)}：${g.n} 次，亮 ${g.n_shown} 次${g.combos.length ? '：<span class="cards">' + g.combos.map(([c, k]) => esc(c) + (k > 1 ? '×' + k : '')).join('、') + '</span>' : ''}</li>`).join('') + '</ul>';
+  if (A.shown.length) {
+    h += '<div class="scroll"><table class="changes"><thead><tr><th class="l">时间</th><th class="l">手牌</th><th class="l">局面</th><th class="l">位置</th><th>起手 / 有效码深（大盲）</th><th>当时在牌里</th></tr></thead><tbody>'
+      + A.shown.map(a => `<tr><td class="l muted">${fmtTime(a.ts)}</td><td class="l cards"><b>${esc(a.combo)}</b> <span class="muted">${esc(a.cards.join(''))}</span></td>
+        <td class="l">${ALLIN_ACTION[a.action]}·${ALLIN_FACING[a.facing]}${a.callers ? `（前面 ${a.callers} 人跟）` : ''}</td><td class="l">${esc(a.pos)}</td>
+        <td class="num">${a.stack_bb} / ${a.eff_bb}</td><td class="num">${a.n_live} 人</td></tr>`).join('') + '</tbody></table></div>';
+  }
+  return h;
+}
+
 function renderDetail() {
   const p = snap.players.find(x => x.name === selected);
   if (!p) { $('detail').innerHTML = '<div class="empty">选一个玩家</div>'; return; }
@@ -396,6 +413,7 @@ function renderDetail() {
         p.deviations.map(d => `<li>${esc(d.label)}：${pct(d.k / d.n)}%（${d.k}/${d.n}），其他对手 ${pct(d.pool)}%，p=${d.p.toExponential(1)}</li>`).join('') + '</ul>';
     }
   }
+  h += `<h3>翻前全下的亮牌 · 全部历史</h3>` + allinBlock(p.pf_allin);
   const bt = Object.entries(p.by_table || {}).filter(([, [k, n]]) => n);
   if (bt.length > 1) h += '<h3>入池率按桌上人数 · 全部历史</h3><p class="num">' + bt.map(([tb, [k, n]]) => `${tb} 人 ${pct(k / n)}%（${n}）`).join('，') + '</p>';
   h += `<h3>全部统计</h3><p class="legend"><i style="width:10px;height:8px;background:var(--band)"></i>全部历史 90% 区间<i style="width:3px;height:12px;background:var(--accent)"></i>全部历史后验均值`

@@ -2,7 +2,7 @@ import unittest
 
 from opponent_analysis.adapters import poker_manager_raw
 from opponent_analysis.replay import replay
-from opponent_analysis.spots import hand_observations
+from opponent_analysis.spots import hand_observations, preflop_allins
 from opponent_analysis.tests.helpers import pm_record
 
 
@@ -103,3 +103,60 @@ class Postflop(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreflopAllins(unittest.TestCase):
+    def allins(self, rec):
+        h = replay(poker_manager_raw(rec, "test"), heads_up_button_is_sb=True)
+        return h, preflop_allins(h)
+
+    def test_jam_and_call_with_shown_cards(self):
+        # CO opens, BTN jams over it, blinds fold, CO calls all-in; both show.
+        rec = pm_record("a1", 0, [0, 1, 2, 3], {0: 2000, 1: 2000, 2: 2000, 3: 1000},
+                        [(3, "raise", 60), (0, "all_in", 2000), (1, "fold", None), (2, "fold", None),
+                         (3, "call", 940)],
+                        {0: 3030, 1: 1990, 2: 1980, 3: 0}, board=["2c", "3d", "4h", "8s", "9c"],
+                        shown={0: ["Ah", "5h"], 3: ["Kd", "Kc"]})
+        _, got = self.allins(rec)
+        self.assertEqual([n for n, _ in got], ["p0", "p3"])
+        jam, call = got[0][1], got[1][1]
+        self.assertEqual((jam.action, jam.facing, jam.pos, jam.combo, jam.n_live), ("jam", 1, "BTN", "A5s", 4))
+        self.assertEqual((jam.stack_bb, jam.eff_bb), (100.0, 100.0))
+        # CO faces open + jam = a 3bet; his 1000 is the effective stack.
+        self.assertEqual((call.action, call.facing, call.combo, call.cards), ("call", 2, "KK", ["Kd", "Kc"]))
+        self.assertEqual((call.stack_bb, call.eff_bb, call.n_live), (50.0, 50.0, 2))
+
+    def test_uncalled_jam_has_no_cards_and_folded_seats_do_not_count(self):
+        # Two fold, BTN (3000) jams into SB 400 / BB 600: effective = the biggest live other = 600.
+        rec = pm_record("a2", 0, [0, 1, 2, 3, 4], {0: 3000, 1: 400, 2: 600, 3: 5000, 4: 5000},
+                        [(3, "fold", None), (4, "fold", None), (0, "all_in", 3000), (1, "fold", None),
+                         (2, "fold", None)],
+                        {0: 3030, 1: 390, 2: 580, 3: 5000, 4: 5000})
+        _, got = self.allins(rec)
+        self.assertEqual(len(got), 1)
+        a = got[0][1]
+        self.assertEqual((a.action, a.facing, a.callers, a.combo, a.cards), ("jam", 0, 0, None, None))
+        self.assertEqual((a.stack_bb, a.eff_bb), (150.0, 30.0))
+
+    def test_summary_groups_and_report_section(self):
+        from opponent_analysis.report import Accumulator, Config, allin_summary, render_markdown
+
+        acc = Accumulator("poker_manager", pct_fn=lambda hole, board: 0.5)
+        for i, (hole, open_first) in enumerate([(["Ah", "5h"], True), (["As", "Ad"], True), (["Ah", "5h"], True),
+                                                (None, False)]):
+            acts = ([(3, "raise", 60)] if open_first else [(3, "fold", None)]) + [(0, "all_in", 2000), (1, "fold", None),
+                                                                                  (2, "fold", None)]
+            acts += [(3, "call", 1940)] if open_first else []
+            final = {0: 4030, 1: 1990, 2: 1980, 3: 0} if open_first else {0: 2030, 1: 1990, 2: 1980, 3: 2000}
+            rec = pm_record(f"s{i}", 0, [0, 1, 2, 3], {s: 2000 for s in range(4)}, acts, final,
+                            board=["2c", "3d", "4h", "8s", "9c"] if open_first else (),
+                            shown={0: hole, 3: ["7c", "2d"]} if hole else None, hero=1)
+            acc.add(replay(poker_manager_raw(rec, "test"), heads_up_button_is_sb=True))
+        sm = allin_summary(acc.players["p0"])
+        self.assertEqual((sm["n"], sm["jam"], sm["call"], sm["n_shown"]), (4, 4, 0, 3))
+        self.assertEqual([(g["label"], g["n"], g["n_shown"], g["combos"]) for g in sm["groups"]],
+                         [("推全下·未开池", 1, 0, []), ("推全下·面对开池", 3, 3, [("AA", 1), ("A5s", 2)])])
+        self.assertEqual(sm["shown"][0].hand_id, "s2")  # latest first
+        md = render_markdown(acc.finalize([], Config()))
+        self.assertIn("推全下·面对开池：3 次，亮 3 次：AA、A5s×2", md)
+        self.assertIn("跟全下·面对 3bet：3 次，亮 3 次：72o×3", md)

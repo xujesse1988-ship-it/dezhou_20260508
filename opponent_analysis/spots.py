@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .cards import hand_class
 from .model import STREETS, Hand
 from .replay import position_class, ring_from
 
@@ -188,6 +189,52 @@ def hand_observations(h: Hand, river_percentile=None) -> list[Obs]:
                 eff = min(b.delta, after[0].delta)
                 emit(b.seat, "river_bet_called", "shown", {"size": size_bucket(b.delta / b.pot_before)},
                      pot_bb=b.pot_before / bb, bet_bb=eff / bb, pct=pct)
+    return out
+
+
+@dataclass
+class PreflopAllin:
+    """One voluntary preflop all-in, with the hole cards when the player showed them.
+
+    Only shown hands reveal cards, and an uncalled jam is never shown, so the cards are a
+    sample biased toward jams that got called.
+    """
+
+    hand_id: str
+    ts: Optional[float]
+    action: str  # "jam" = bet / raise all-in, "call" = call all-in
+    facing: int  # raises before the action, capped at 3: 0 unopened, 1 open, 2 3bet, 3 4bet+
+    callers: int  # calls since the last raise (unopened pot: limpers)
+    pos: str
+    n_live: int  # seats not folded before the action
+    stack_bb: float  # his starting stack
+    eff_bb: float  # min(his start, the largest start among the other seats still live then)
+    cards: Optional[list[str]] = None
+    combo: Optional[str] = None
+
+
+def preflop_allins(h: Hand) -> list[tuple[str, PreflopAllin]]:
+    """(player name, all-in) for every non-forced preflop decision that put the player all-in."""
+    out = []
+    folded: set[int] = set()
+    for d in h.decisions:
+        if d.street != "preflop":
+            break
+        if d.kind == "fold":
+            folded.add(d.seat)
+            continue
+        nm = h.names.get(d.seat)
+        if not d.all_in or d.forced or not nm:
+            continue
+        others = [h.start_stacks[s] for s in h.dealt_seats if s != d.seat and s not in folded]
+        eff = min(h.start_stacks[d.seat], max(others)) if others else h.start_stacks[d.seat]
+        cards = h.shown.get(d.seat)
+        out.append((nm, PreflopAllin(
+            hand_id=h.hand_id, ts=h.ts, action="call" if d.kind == "call" else "jam",
+            facing=min(d.raises_before, 3), callers=d.prior_callers, pos=h.positions[d.seat], n_live=d.n_live,
+            stack_bb=round(h.start_stacks[d.seat] / h.bb, 1), eff_bb=round(eff / h.bb, 1),
+            cards=list(cards) if cards else None, combo=hand_class(cards) if cards else None,
+        )))
     return out
 
 

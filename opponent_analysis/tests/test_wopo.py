@@ -95,6 +95,13 @@ class Wopo(unittest.TestCase):
         self.assertEqual(first.pot_before, 8 * 100 + 50 + 100 + 100)
         self.assertEqual(first.to_call, 100)
 
+    def test_shown_cards_are_read(self):
+        # hand_result.shown_cards carries every opponent live at showdown (hero's own cards are not in it).
+        self.ingest(wopo_hh_rows(POSTS_FIXTURE))
+        hands = {h.hand_id[-3:]: h for h in db.load_hands(self.db, "wopo")}
+        self.assertEqual(hands["132"].shown, {3: ["Ac", "4c"], 5: ["8d", "6c"]})
+        self.assertEqual(hands["123"].shown, {4: ["Jc", "2c"]})
+
     def test_live_follows_wopo_log(self):
         from opponent_analysis.live import Live
 
