@@ -142,6 +142,12 @@ pub struct HhRecord {
     #[serde(default, deserialize_with = "null_default")]
     pub committed_total: BTreeMap<String, f64>,
     pub hand_result: HhHandResult,
+    /// 发了牌的座位（升序；wopo / poker_manager hh 带，旧 openpoker hh 没有 → 空）。只喂画像的未开池统计。
+    #[serde(default, deserialize_with = "null_default")]
+    pub dealt_seats: Vec<u8>,
+    /// 补 live 大盲的座位（wopo hh 带）。同上，只喂画像。
+    #[serde(default, deserialize_with = "null_default")]
+    pub posts: Vec<u8>,
 }
 
 /// 转换结果：估计器输入 + 报表层要的换算元数据。
@@ -491,7 +497,13 @@ pub fn hh_record_to_observe(rec: &HhRecord) -> Result<ObserveHand, String> {
             names.insert(seat, v.clone());
         }
     }
-    Ok(ObserveHand { names, actions })
+    Ok(ObserveHand {
+        names,
+        actions,
+        button_seat: Some(rec.button_seat),
+        dealt_seats: rec.dealt_seats.clone(),
+        posts: rec.posts.clone(),
+    })
 }
 
 #[cfg(test)]

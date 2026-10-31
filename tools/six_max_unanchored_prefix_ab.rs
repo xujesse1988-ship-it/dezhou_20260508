@@ -422,6 +422,7 @@ fn unanchored_applied(
             strategy: strat,
             decisions: d,
             hero_coef: None,
+            seat_coefs: None,
         });
         let solved = subgame_search_unanchored_cached(
             None,

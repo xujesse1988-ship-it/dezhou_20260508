@@ -373,9 +373,9 @@ class HandEngine:
         return notes
 
     def observe_record(self, amounts=False):
-        """叠加剥削 observe（同 openpoker HandState.observe_record 格式）。amounts=True（PM-17
-        --exploit-4bet）时每个动作另带 contribution_delta / to_call_before，advisor 据此区分真加注和
-        只够跟注的全下（同 poker_manager driver）。"""
+        """叠加剥削 observe（同 openpoker HandState.observe_record 格式，另带 button_seat / dealt_seats /
+        posts）。amounts=True（PM-17 --exploit-4bet）时每个动作另带 contribution_delta / to_call_before，
+        advisor 据此区分真加注和只够跟注的全下（同 poker_manager driver）。"""
         acts = []
         for a, st, amt in zip(self.actions, self.action_streets, self.action_amounts):
             rec = {"seat": a["seat"], "street": st, "action": a["action"]}
@@ -383,7 +383,9 @@ class HandEngine:
                 rec["contribution_delta"] = amt["contribution_delta"]
                 rec["to_call_before"] = amt["to_call_before"]
             acts.append(rec)
-        return {"observe": 1, "names": self.names, "actions": acts}
+        # 座位信息：advisor 画像按「位置组 × 前面有没有平跟者」统计未开池频率（平跟者范围倾斜用）。
+        return {"observe": 1, "names": self.names, "actions": acts, "button_seat": self.button,
+                "dealt_seats": list(self.dealt), "posts": list(self.posts)}
 
     def hh_record(self):
         """校验通过的整手牌局（hh 日志一行，opponent_analysis 的 wopo 适配器读）。只在本手打完且

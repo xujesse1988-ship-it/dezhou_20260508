@@ -306,6 +306,7 @@ fn eval_deal(
         strategy: strat,
         decisions: synced,
         hero_coef: None,
+        seat_coefs: None,
     };
 
     // OFF 臂（档一）：flop 解入缓存 → turn cross=None（同步前缀 reach）。

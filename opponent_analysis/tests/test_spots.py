@@ -26,6 +26,32 @@ class Preflop(unittest.TestCase):
         self.assertNotIn("rfi", {s for n, s, _ in got if n == "p2"})  # BB never faces an unopened pot here
         self.assertEqual(sorted(o for n, s, o in got if s == "vpip"), ["no", "no", "yes", "yes"])
 
+    def test_limp_spots(self):
+        # 6-handed, button 0: p3 limps, p4 iso-raises, p5 / p0 / p1 fold, p2 (BB) calls, p3 folds; checked down.
+        rec = pm_record("h5", 0, list(range(6)), {s: 2000 for s in range(6)},
+                        [(3, "call", 20), (4, "raise", 100), (5, "fold", None), (0, "fold", None),
+                         (1, "fold", None), (2, "call", 80), (3, "fold", None),
+                         (2, "check", None), (4, "check", None), (2, "check", None), (4, "check", None),
+                         (2, "check", None), (4, "check", None)],
+                        {0: 2000, 1: 1990, 2: 1900, 3: 1980, 4: 2130, 5: 2000}, board=["2c", "3d", "4h", "8s", "9c"])
+        got, _ = obs(rec)
+        self.assertIn(("p4", "vs_limp", "raise"), got)
+        self.assertIn(("p3", "limp_vs_raise", "fold"), got)
+        self.assertIn(("p2", "vs_open", "call"), got)
+        self.assertIn(("p5", "vs_open", "fold"), got)
+        self.assertNotIn("vs_limp", {s for n, s, _ in got if n == "p3"})
+        self.assertNotIn("limp_vs_raise", {s for n, s, _ in got if n != "p3"})
+        # 4-handed: SB completes, BB checks with one caller in: blind option, not multi.
+        rec = pm_record("h6", 0, list(range(4)), {s: 2000 for s in range(4)},
+                        [(3, "fold", None), (0, "fold", None), (1, "call", 10), (2, "check", None),
+                         (1, "check", None), (2, "check", None), (1, "check", None), (2, "check", None),
+                         (1, "check", None), (2, "check", None)],
+                        {0: 2000, 1: 2020, 2: 1980, 3: 2000}, board=["2c", "3d", "4h", "8s", "9c"])
+        got, full = obs(rec)
+        bo = [(o.name, o.outcome, o.dims["bb"], o.dims["multi"]) for o in full if o.stat == "blind_option"]
+        self.assertEqual(bo, [("p2", "check", "yes", "no")])
+        self.assertNotIn("vs_limp", {s for n, s, _ in got})  # SB completes into an unlimped pot: rfi
+
     def test_bb_walk_has_no_vpip_opportunity(self):
         rec = pm_record("h2", 0, [0, 1, 2], {s: 1000 for s in range(3)},
                         [(0, "fold", None), (1, "fold", None)], {0: 1000, 1: 990, 2: 1010})

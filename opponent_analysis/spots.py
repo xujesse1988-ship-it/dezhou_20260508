@@ -99,6 +99,17 @@ def hand_observations(h: Hand, river_percentile=None) -> list[Obs]:
         # A first decision that is a check means the BB posted less than the SB: no pot to open.
         if f.raises_before == 0 and f.prior_callers == 0 and pos[s] not in ("BB", "BTN_BB") and f.kind != "check":
             emit(s, "rfi", {"raise": "raise", "call": "limp", "fold": "fold"}[f.kind], {"pos": pos[s]})
+        # Same cells as the Rust Profiler (`opponent_profile.rs` `preflop_spots`); live-blind posters
+        # (to_call 0 in an unraised pot) go to blind_option, not vs_limp.
+        if f.raises_before == 0 and f.prior_callers > 0 and pos[s] not in ("BB", "BTN_BB") and f.to_call > 0:
+            emit(s, "vs_limp", {"raise": "raise", "call": "limp", "fold": "fold"}[f.kind], {"pos": pos[s]})
+        if f.raises_before == 0 and f.to_call == 0:
+            emit(s, "blind_option", "raise" if f.kind == "raise" else "check",
+                 {"bb": "yes" if pos[s] in ("BB", "BTN_BB") else "no", "multi": "yes" if f.prior_callers >= 2 else "no"})
+        if f.raises_before == 0 and f.kind in ("call", "check"):
+            nxt = next((d for d in mine[1:] if d.raises_before >= 1), None)
+            if nxt is not None and nxt.raises_before == 1:
+                emit(s, "limp_vs_raise", _outcome3(nxt.kind), {"pos": cls})
         if f.raises_before == 1 and f.aggressor is not None:
             o = _outcome3(f.kind)
             emit(s, "vs_open", o, {"pos": cls, "callers": "yes" if f.prior_callers else "no"})

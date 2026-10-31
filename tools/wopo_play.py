@@ -534,6 +534,10 @@ def _selftest_exploit_4bet():
     _check(all(set(a) == {"seat", "street", "action"}
                for k, rec in stub.side if k == "observe" for a in rec["actions"]),
            "只开 --exploit 时 observe 不该带金额")
+    _check(all(isinstance(rec.get("button_seat"), int) and rec.get("dealt_seats")
+               and isinstance(rec.get("posts"), list)
+               for k, rec in stub.side if k == "observe"),
+           "observe 要带 button_seat / dealt_seats / posts（画像的未开池统计用）")
     _, stub, _ = _run_msgs(msgs)
     _check(not stub.side and all("names" not in q for q in stub.requests), "剥削全关时不带名字、不发 observe")
     print("[selftest 7 PM-17] 请求带名字、observe 带投入金额并与服务器逐条一致", file=sys.stderr)

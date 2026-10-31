@@ -119,7 +119,46 @@ fn debug_dump_ranges(tag: &str, ranges: &[Vec<f64>], holes: &[[Card; 2]]) {
             "[dbg-subgame] {tag} range seat={seat} nonzero={nz}/{len} sum={sum:.4} top: {top}",
             len = r.len()
         );
+        for row in debug_range_grid(r, holes) {
+            eprintln!("[dbg-subgame] {tag} range seat={seat} grid {row}");
+        }
     }
+}
+
+/// range 的 13×13 起手牌格（行 / 列 = A..2；对角线对子，右上同花，左下杂色）：每格 = 该牌型非零组合的
+/// 平均权重相对全表最大值，`0`–`9` 十档（`9` ≈ 最大），`.` = 不到最大值的 5%，空格 = 全部撞公共牌。
+/// 看「这个座的范围长什么样」用（如平跟者是不是「加注牌之下、能玩的牌」）。
+fn debug_range_grid(r: &[f64], holes: &[[Card; 2]]) -> Vec<String> {
+    let mut sum = [[0.0f64; 13]; 13];
+    let mut cnt = [[0u32; 13]; 13];
+    for (w, h) in r.iter().zip(holes) {
+        if *w <= 0.0 {
+            continue;
+        }
+        let (a, b) = (12 - h[0].to_u8() / 4, 12 - h[1].to_u8() / 4);
+        let (hi, lo) = (a.min(b) as usize, a.max(b) as usize);
+        let suited = h[0].to_u8() % 4 == h[1].to_u8() % 4;
+        let (i, j) = if suited { (hi, lo) } else { (lo, hi) };
+        sum[i][j] += w;
+        cnt[i][j] += 1;
+    }
+    let avg = |i: usize, j: usize| (cnt[i][j] > 0).then(|| sum[i][j] / f64::from(cnt[i][j]));
+    let max = (0..13)
+        .flat_map(|i| (0..13).map(move |j| (i, j)))
+        .filter_map(|(i, j)| avg(i, j))
+        .fold(0.0f64, f64::max);
+    (0..13)
+        .map(|i| {
+            (0..13)
+                .map(|j| match avg(i, j) {
+                    None => ' ',
+                    Some(_) if max <= 0.0 => '.',
+                    Some(v) if v < 0.05 * max => '.',
+                    Some(v) => char::from(b'0' + ((v / max) * 9.0).round().min(9.0) as u8),
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// depth-limit 叶子查哪个续局值（[`SubgameLeafCtx::cont_policy`]）。
@@ -1429,10 +1468,26 @@ fn decisions_on_path(
 /// 不是 blueprint 做的（advisor 翻前 limp 启发式），这些步已从 `decisions` 里去掉、改由系数表达。
 /// 只作用于 hero，hero 仍不混 uniform（[`mix_lambda_for_seat`]）。`Some` 时即使 `decisions` 里没有
 /// 当前街之前的决策也照样构造 range（否则系数会被 uniform 退路吞掉）。`None` = 旧行为逐位不变。
+///
+/// `seat_coefs`（`preflop_range_offanchor_research_2026_10_29` §4.1/§4.2，advisor `--exploit-limp-tilt`）：
+/// 对手座逐组合的额外系数（下标 = seat，内层对齐 [`all_hole_combos`]；`None` = 该座没有）。用法同
+/// `hero_coef`：被系数替代的那一步已从 `decisions` 里去掉。乘在 uniform 平滑**之前**（平滑是最后的兜底）。
+/// hero 座的条目不读（hero 只认 `hero_coef`）。`None` / 全 `None` = 旧行为逐位不变。
 pub struct PrefixReach<'a> {
     pub strategy: &'a dyn Fn(&InfoSetId, usize) -> Vec<f64>,
     pub decisions: &'a [(NodeId, AbstractActionTag, PlayerId)],
     pub hero_coef: Option<&'a [f64]>,
+    pub seat_coefs: Option<&'a [Option<Vec<f64>>]>,
+}
+
+impl PrefixReach<'_> {
+    /// 对手座 `seat` 的额外系数（hero 座恒 `None`）。
+    fn seat_coef(&self, seat: PlayerId, hero: PlayerId) -> Option<&[f64]> {
+        if seat == hero {
+            return None;
+        }
+        self.seat_coefs?.get(seat as usize)?.as_deref()
+    }
 }
 
 /// 档一前缀 reach：从失同步时**已同步**的影子 `synced_node`（lockstep 闭包在断点前的
@@ -1533,7 +1588,7 @@ fn mix_lambda_for_seat(seat: PlayerId, hero: PlayerId, lambda: f64) -> f64 {
     }
 }
 
-/// hero 座 range 逐组合乘 [`PrefixReach::hero_coef`] 后重新归一。乘完全零（系数与 blueprint 前缀
+/// 某座 range 逐组合乘系数（hero 座 [`PrefixReach::hero_coef`] / 对手座 `seat_coefs`）后重新归一。乘完全零（系数与 blueprint 前缀
 /// 互相矛盾）或长度不符 → 保留原 range：全零会被下游当「无信号」退均匀，比不乘更糟。
 fn apply_hero_coef(range: &mut [f64], coef: &[f64]) {
     debug_assert_eq!(range.len(), coef.len(), "hero_coef 须对齐 all_hole_combos");
@@ -3646,7 +3701,12 @@ fn subgame_search_unanchored_cached_inner(
                 .filter(|(nid, _, _)| (tree.node(*nid).street as u8) < cur)
                 .copied()
                 .collect();
-            if prior.is_empty() && pr.hero_coef.is_none() {
+            let any_seat_coef = pr.seat_coefs.is_some_and(|c| {
+                c.iter()
+                    .enumerate()
+                    .any(|(s, x)| x.is_some() && s as PlayerId != auth_actor)
+            });
+            if prior.is_empty() && pr.hero_coef.is_none() && !any_seat_coef {
                 None // 前缀无当前街之前的决策 → 退 uniform（byte-equal）。
             } else {
                 let holes = all_hole_combos();
@@ -3676,6 +3736,9 @@ fn subgame_search_unanchored_cached_inner(
                                     if let Some(coef) = pr.hero_coef {
                                         apply_hero_coef(&mut r, coef);
                                     }
+                                }
+                                if let Some(coef) = pr.seat_coef(seat as PlayerId, auth_actor) {
+                                    apply_hero_coef(&mut r, coef);
                                 }
                                 mix_range_with_uniform(
                                     &mut r,
@@ -7115,6 +7178,7 @@ mod tests {
             strategy: &strat,
             decisions: &empty,
             hero_coef: None,
+            seat_coefs: None,
         };
         let with_empty = subgame_search_unanchored_cached(
             None,
@@ -7167,6 +7231,7 @@ mod tests {
                     strategy: &strat,
                     decisions: &empty,
                     hero_coef,
+                    seat_coefs: None,
                 }),
                 0xE112,
             )
@@ -7177,6 +7242,60 @@ mod tests {
         assert_eq!((cache.misses(), cache.hits()), (2, 0), "hero 系数须进 key");
         run(&mut cache, Some(&coef));
         assert_eq!((cache.misses(), cache.hits()), (2, 1), "同一份系数须命中");
+    }
+
+    /// `seat_coefs`（advisor 平跟者倾斜）：对手座的系数进 ranges → 进 key；全 `None` 与不传逐位相同（命中）；
+    /// hero 座的条目不读（与不传相同 → 命中）。
+    #[test]
+    fn unanchored_prefix_reach_seat_coefs_enter_key_hero_ignored() {
+        let game = nolimp_6max_game();
+        let auth = offstack_allin_flop_state();
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let decisions = offstack_synced_prefix(&game);
+        let hero = auth.current_player().expect("决策点").0 as usize;
+        let villain = (0..auth.players().len())
+            .find(|&s| s != hero && auth.players()[s].hole_cards.is_some())
+            .expect("有在手的对手");
+        let coef: Vec<f64> = (0..1326).map(|i| f64::from(u8::from(i < 663))).collect();
+        let with = |seat: Option<usize>| {
+            let mut v: Vec<Option<Vec<f64>>> = vec![None; auth.players().len()];
+            if let Some(s) = seat {
+                v[s] = Some(coef.clone());
+            }
+            v
+        };
+        let mut cache = SubgameSolveCache::new();
+        let run = |cache: &mut SubgameSolveCache, seat_coefs: Option<&[Option<Vec<f64>>]>| {
+            subgame_search_unanchored_cached(
+                Some(cache),
+                &auth,
+                &auth,
+                &game,
+                &[],
+                &cfg,
+                None,
+                Some(PrefixReach {
+                    strategy: &strat,
+                    decisions: &decisions,
+                    hero_coef: None,
+                    seat_coefs,
+                }),
+                0xE113,
+            )
+            .expect("应 Ok")
+        };
+        run(&mut cache, None);
+        run(&mut cache, Some(&with(None)));
+        assert_eq!((cache.misses(), cache.hits()), (1, 1), "全 None = 不传");
+        run(&mut cache, Some(&with(Some(hero))));
+        assert_eq!((cache.misses(), cache.hits()), (1, 2), "hero 座条目不读");
+        run(&mut cache, Some(&with(Some(villain))));
+        assert_eq!((cache.misses(), cache.hits()), (2, 2), "对手系数须进 key");
     }
 
     /// [`apply_hero_coef`]：逐组合相乘后归一；乘完全零 → 保留原 range（不变成「无信号」）。
@@ -7235,6 +7354,7 @@ mod tests {
                 strategy: &strat,
                 decisions: &decisions,
                 hero_coef: None,
+                seat_coefs: None,
             }),
             0xE333,
         )
@@ -7259,6 +7379,7 @@ mod tests {
                 strategy: &strat,
                 decisions: &decisions,
                 hero_coef: None,
+                seat_coefs: None,
             }),
             0xE333,
         )
@@ -7297,6 +7418,7 @@ mod tests {
                 strategy: &strat,
                 decisions: &decisions,
                 hero_coef: None,
+                seat_coefs: None,
             }),
             &cfg,
             None,
@@ -7316,6 +7438,7 @@ mod tests {
                 strategy: &strat,
                 decisions: &decisions,
                 hero_coef: None,
+                seat_coefs: None,
             }),
             0xE555,
         )
@@ -7337,6 +7460,7 @@ mod tests {
                 strategy: &strat,
                 decisions: &decisions,
                 hero_coef: None,
+                seat_coefs: None,
             }),
             0xE555,
         )
@@ -7482,6 +7606,7 @@ mod tests {
                 strategy: strat,
                 decisions,
                 hero_coef: None,
+                seat_coefs: None,
             }),
             hand_seed,
         )
@@ -7660,6 +7785,7 @@ mod tests {
                 strategy: &strat,
                 decisions: &decisions,
                 hero_coef: None,
+                seat_coefs: None,
             }),
             Some(&flop_within),
             hand_seed,
@@ -7677,6 +7803,7 @@ mod tests {
                 strategy: &strat,
                 decisions: &decisions,
                 hero_coef: None,
+                seat_coefs: None,
             }),
             hand_seed,
         )
@@ -7737,6 +7864,7 @@ mod tests {
             strategy: &strat,
             decisions: &decisions,
             hero_coef: None,
+            seat_coefs: None,
         };
         let mut cache = SubgameSolveCache::new();
         // ① flop solve（前缀 reach）→ miss 1，cache = flop_unanchored。
@@ -7830,6 +7958,7 @@ mod tests {
             strategy: &strat,
             decisions: &decisions,
             hero_coef: None,
+            seat_coefs: None,
         };
         // 所有座都给已收敛的松画像（hero / 弃牌座由 apply_exploit_width_prior 自己跳过）。
         let profiles = vec![Some(prof(0.6)); 6];
@@ -7955,6 +8084,7 @@ mod tests {
             strategy: &strat,
             decisions: &decisions,
             hero_coef: None,
+            seat_coefs: None,
         };
         let mut cache = SubgameSolveCache::new();
         // ① flop solve → miss 1，主 slot = flop。
@@ -9615,6 +9745,7 @@ mod tests {
                     strategy: &strat,
                     decisions,
                     hero_coef: None,
+                    seat_coefs: None,
                 }),
                 0xC20A,
             )

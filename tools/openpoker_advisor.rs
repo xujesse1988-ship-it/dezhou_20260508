@@ -94,12 +94,16 @@ use poker::training::fourbet_exploit::{FourBetConfig, FourBetTracker};
 use poker::training::game::{Game, PlayerId};
 use poker::training::nlhe::{SimplifiedNlheGame, SimplifiedNlheState};
 use poker::training::nlhe_betting_tree::{
-    deep_menu_for, six_max_reshape, AbstractActionTag, NodeId, SIX_MAX_RESHAPE_NAMES,
+    deep_menu_for, six_max_reshape, AbstractActionTag, Child, NodeId, PublicBettingTree,
+    SIX_MAX_RESHAPE_NAMES,
 };
 use poker::training::nlhe_dense_crop::CroppedBlueprint;
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::openpoker_hh::{hh_record_to_observe, hist_to_concrete, HhRecord};
-use poker::training::opponent_profile::{ExploitConfig, ObserveHand, OpponentProfile, Profiler};
+use poker::training::opponent_profile::{
+    preflop_spots, ExploitConfig, HandSeats, ObserveHand, OpponentProfile, PreflopSpot, Profiler,
+    SpotAct, SpotActInput, SpotDecision,
+};
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
     all_hole_combos, chen_score, is_blueprint_cropped_err, is_low_hero_visits_err,
@@ -941,7 +945,6 @@ fn prewarm_inner(
         return mk("prewarm:skip:flop_prefer_blueprint".into());
     }
     // 脱影子预热（lockstep Err，或 `--search-force-unanchored` 下的 lockstep Ok）。
-    let exploit_owned = exploit_snapshot(rt, req, &solver_cfg, scale, &smap);
     let unanchored_prewarm = |solve_cache: &mut SubgameSolveCache,
                               synced_node: NodeId,
                               limp: &LimpFoldMap| {
@@ -954,6 +957,7 @@ fn prewarm_inner(
         let range_inputs = rt.unanchored_prefix_reach.then(|| {
             unanchored_range_inputs(
                 game,
+                strategy_fn,
                 &solver_cfg,
                 &smap,
                 req,
@@ -962,19 +966,29 @@ fn prewarm_inner(
                 hole,
                 synced_node,
                 limp,
-                rt.limp_as_fold,
+                rt,
             )
         });
-        let prefix_reach = range_inputs.as_ref().map(|(d, coef)| PrefixReach {
+        let prefix_reach = range_inputs.as_ref().map(|ri| PrefixReach {
             strategy: strategy_fn,
-            decisions: d,
-            hero_coef: coef.coef.as_deref(),
+            decisions: &ri.decisions,
+            hero_coef: ri.hero_coef.coef.as_deref(),
+            seat_coefs: Some(&ri.tilt.coefs),
         });
         // 档二′-跨街复用（默认关）：复用缓存里上一街 unanchored 解的 σ 算本街后验 range。预热须
         // 与决策时算出同一份 ranges 才命中 key——两路同读 `cache.current()`（街起点预热时仍持上一
         // 街解）+ 同 `prev_within` → 同 ranges。off / 缓存非紧前街 → 自验退档一（不破现状）。
         let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
-        // 叠加剥削：与决策路径同一份画像快照（[`exploit_snapshot`]）→ 同 ranges → 同 key。
+        // 叠加剥削：与决策路径同一份画像快照（[`exploit_snapshot`]，平跟者倾斜过的座不再做宽度修正）
+        // → 同 ranges → 同 key。
+        let exploit_owned = exploit_snapshot(
+            rt,
+            req,
+            &solver_cfg,
+            scale,
+            &smap,
+            range_inputs.as_ref().map(|ri| &ri.tilt),
+        );
         let exploit_prior = exploit_owned
             .as_ref()
             .map(|(profiles, alpha, shapes)| ExploitPrior {
@@ -1823,12 +1837,777 @@ fn limp_raisers(
     seats
 }
 
+// ===========================================================================
+// 翻前局面分类输入 + 断点后决策的替身节点（`preflop_range_offanchor_research_2026_10_29` §4.2 / §4.3）
+// ===========================================================================
+
+/// 本手翻前的一个真实动作（[`preflop_real_steps`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreflopStep {
+    /// OpenPoker 座。
+    seat: u8,
+    /// 局面分类输入：按当时合法集判（[`action_kind`]），短码全下只够跟注 = 跟注。
+    input: SpotActInput,
+    /// 加注 / 主动全下的池比例（milli，[`raise_pot_milli`]，与抽象菜单同一坐标系）；其余 `None`。
+    raise_milli: Option<u64>,
+    /// 主动全下（加注到自己的全部筹码）时 = 该座本手起始真栈（solver chips）；其余 `None`。
+    shove_start: Option<u64>,
+}
+
+/// 真栈重放本手**翻前街**（与 [`preflop_entry_kinds`] 同口径：真栈 config + 幻影 fold +
+/// [`hist_to_concrete`]），逐个真实动作给出 [`PreflopStep`]（幻影座不出现）；进翻牌即停。纯函数。
+/// 真栈建不出 / 重放失同步 / 脏动作 / 溢出 → `None`。
+fn preflop_real_steps(
+    req: &Request,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+) -> Option<Vec<PreflopStep>> {
+    let real_cfg = real_stacks_config(req, solver_cfg, scale, smap).ok()?;
+    let mut st = GameState::new(&real_cfg, REAL_REPLAY_SEED);
+    for &t in &smap.phantoms {
+        if st.current_player() != Some(SeatId(t)) || st.apply(Action::Fold).is_err() {
+            return None;
+        }
+    }
+    let mut out = Vec::new();
+    for h in &req.actions {
+        if st.street() != poker::Street::Preflop {
+            break;
+        }
+        let actor = smap.tree_seat(h.seat).ok()?;
+        if st.current_player() != Some(SeatId(actor)) {
+            return None;
+        }
+        let la = st.legal_actions();
+        let input = match action_kind(&h.action, &la)? {
+            "raise" => SpotActInput::Aggr,
+            "call" => SpotActInput::Call,
+            "check" => SpotActInput::Check,
+            _ => SpotActInput::Fold,
+        };
+        let to_solver = match h.to.map(|t| t.checked_mul(scale)) {
+            Some(Some(v)) => Some(v),
+            Some(None) => return None, // 溢出
+            None => None,
+        };
+        let concrete = hist_to_concrete(&st, &h.action, to_solver)?;
+        let to = match concrete {
+            _ if input != SpotActInput::Aggr => None,
+            Action::Bet { to } | Action::Raise { to } => Some(to.as_u64()),
+            Action::AllIn => la.all_in_amount.map(|t| t.as_u64()),
+            _ => None,
+        };
+        let raise_milli = to
+            .zip(raise_geometry(&st))
+            .and_then(|(to, g)| raise_pot_milli(g, to));
+        let shove_start = (to.is_some() && to == la.all_in_amount.map(|t| t.as_u64()))
+            .then(|| real_cfg.starting_stacks[actor as usize].as_u64());
+        st.apply(concrete).ok()?;
+        out.push(PreflopStep {
+            seat: h.seat,
+            input,
+            raise_milli,
+            shove_start,
+        });
+    }
+    Some(out)
+}
+
+/// 本手翻前各决策的局面分类（[`preflop_spots`]，与 [`Profiler`] 统计同一份分类）。`action_idx` 对齐
+/// `steps`（= `req.actions` 的翻前部分）。
+fn req_preflop_spots(req: &Request, steps: &[PreflopStep]) -> Vec<SpotDecision> {
+    let full: Vec<u8> = (0..req.num_seats).collect();
+    let seats = HandSeats {
+        button: req.button_seat,
+        dealt: if req.dealt_seats.is_empty() {
+            &full
+        } else {
+            &req.dealt_seats
+        },
+        posts: &req.posts,
+    };
+    let acts: Vec<(u8, SpotActInput)> = steps.iter().map(|s| (s.seat, s.input)).collect();
+    preflop_spots(seats, &acts)
+}
+
+/// 替身路径上某座要走的动作（其余座一律弃牌）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptAct {
+    /// 加注到池比例（milli）最接近的抽象加注档。
+    Raise(u64),
+    Call,
+}
+
+/// 翻前决策 `d`（[`req_preflop_spots`]，`steps` 同源）在 blueprint 树里的**替身节点**
+/// （调研 §4.2）：从树根按「脚本」走一条规范路径——脚本里的座位按脚本动作，其余座一律弃牌——走到
+/// 替身行动者时停下。它表达的是「同位置、同局面类」的节点，用来给断点之后的决策查参考策略 σ_ref。
+///
+/// 各局面类的脚本（`d` 之前的真实动作里取；加注按池比例映射到最接近的抽象档；平跟者一律当弃牌，
+/// 他们之后的动作也不进脚本）：
+/// - `Unopened`：空脚本，替身 = 本座（前面平跟的人当弃牌，同平跟当弃牌映射）；
+/// - `BlindOption`：SB 补齐，替身 = 大盲（树里只有 SB 补齐这一种「没人加注到大盲」的线；补盲者也用它）；
+/// - `VsOpen`：开池者加注、加注后的跟注者跟注，替身 = 本座；
+/// - `LimpVsRaise`：树里没有平跟，用「已投入 1BB、面对这次加注」的盲位代替——加注者不是大盲：
+///   加注者加注，替身 = 大盲（面对开池）；加注者是大盲：SB 补齐、大盲加注，替身 = SB；
+/// - `Vs3bet`：本座开池、3bet 者加注，两次加注之后的跟注者跟注，替身 = 本座（第二次行动）。
+///
+/// 路径上脚本动作不在合法集里（树规则删了跟注、没有加注档）/ 提前进翻牌或终局 / 局面类与脚本对不上
+/// → `None`（这一步按无信息处理）。替身节点的行动者可能不是 `d` 的座位（上面两类盲位替身），参考策略
+/// 只按牌查 σ，与行动者无关。纯函数（只读树、座位映射和本手动作）。
+fn spot_substitute(
+    tree: &PublicBettingTree,
+    smap: &SeatMap,
+    steps: &[PreflopStep],
+    d: &SpotDecision,
+) -> Option<NodeId> {
+    let before = steps.get(..d.action_idx)?;
+    let tree_of = |op: u8| smap.tree_seat(op).ok();
+    let me = tree_of(d.seat)?;
+    let raises: Vec<usize> = (0..before.len())
+        .filter(|&i| before[i].input == SpotActInput::Aggr)
+        .collect();
+    let raise_at = |i: usize| -> Option<(u8, ScriptAct)> {
+        Some((
+            tree_of(before[i].seat)?,
+            ScriptAct::Raise(before[i].raise_milli?),
+        ))
+    };
+    // 没人加注时跟注过的座位（平跟者，含 SB 补齐）：树里没有平跟，替身路径上一律当弃牌（同平跟当弃牌
+    // 映射），他们之后的跟注也不进脚本——否则他们在树里排在开池者前面，脚本顺序复现不了。
+    let first_raise = raises.first().copied().unwrap_or(before.len());
+    let limpers: Vec<u8> = before[..first_raise]
+        .iter()
+        .filter(|s| s.input == SpotActInput::Call)
+        .map(|s| s.seat)
+        .collect();
+    // 第 `from` 步之后、第 `to` 步之前跟注的人（不含本座和平跟者）。
+    let callers = |from: usize, to: usize| -> Option<Vec<(u8, ScriptAct)>> {
+        before[from + 1..to]
+            .iter()
+            .filter(|s| {
+                s.input == SpotActInput::Call && s.seat != d.seat && !limpers.contains(&s.seat)
+            })
+            .map(|s| Some((tree_of(s.seat)?, ScriptAct::Call)))
+            .collect()
+    };
+    let callers_after = |from: usize| callers(from, before.len());
+    let (mut script, target): (Vec<(u8, ScriptAct)>, u8) = match (d.spot, raises.as_slice()) {
+        (PreflopSpot::Unopened(_), []) => (Vec::new(), me),
+        (PreflopSpot::BlindOption { .. }, []) => (vec![(1, ScriptAct::Call)], 2),
+        (PreflopSpot::VsOpen { .. }, &[r]) => {
+            let mut v = vec![raise_at(r)?];
+            v.extend(callers_after(r)?);
+            (v, me)
+        }
+        (PreflopSpot::LimpVsRaise { .. }, &[r]) => {
+            let (raiser, act) = raise_at(r)?;
+            if raiser == 2 {
+                (vec![(1, ScriptAct::Call), (2, act)], 1)
+            } else {
+                // 大盲自己跟这次加注的那一步就是替身节点上的决策，不进脚本。
+                let mut v = vec![(raiser, act)];
+                v.extend(callers_after(r)?.into_iter().filter(|&(s, _)| s != 2));
+                (v, 2)
+            }
+        }
+        (PreflopSpot::Vs3bet { .. }, &[r1, r2]) if tree_of(before[r1].seat) == Some(me) => {
+            let mut v = vec![raise_at(r1)?];
+            v.extend(callers(r1, r2)?); // 开池后、3bet 前的跟注者。
+            v.push(raise_at(r2)?);
+            v.extend(callers_after(r2)?);
+            (v, me)
+        }
+        _ => return None,
+    };
+    walk_script(tree, &mut script, target)
+}
+
+/// 调试（`--debug-log`）：本手每个非 hero 翻前决策的局面格与替身节点（树上路径）。替身节点还没接进
+/// 范围估计（对手侧倾斜流水线的下一步），这里先给离线回放核对「替身选得对不对」（调研 §4.3 / §5）。
+fn log_spot_substitutes(
+    game: &SimplifiedNlheGame,
+    solver_cfg: &TableConfig,
+    smap: &SeatMap,
+    req: &Request,
+    scale: u64,
+) {
+    let Some(steps) = preflop_real_steps(req, solver_cfg, scale, smap) else {
+        dlog!("spot_substitute: 翻前真栈重放失败");
+        return;
+    };
+    let tree = game.tree();
+    for d in req_preflop_spots(req, &steps) {
+        if d.seat == req.my_seat {
+            continue;
+        }
+        let sub = spot_substitute(tree, smap, &steps, &d);
+        dlog!(
+            "spot_substitute: idx={} seat={} spot={:?} act={:?} node={:?} actor={:?} path={:?}",
+            d.action_idx,
+            d.seat,
+            d.spot,
+            d.act,
+            sub,
+            sub.map(|n| tree.node(n).player_acting),
+            sub.map(|n| tree.path_to_root(n))
+        );
+    }
+}
+
+/// [`spot_substitute`] 的树上行走：从根出发，每个节点的行动者有脚本动作就走它，否则弃牌；轮到 `target`
+/// 且它的脚本已走完 → 返回该节点（排在后面、还没轮到的脚本动作丢掉）。脚本按真实时间序排，必须按这个
+/// 顺序消耗：行动者的脚本动作不是下一条（例如平跟者在开池者之后再加注，树里他会先行动）→ 这条线在
+/// 树里复现不了，`None`。离开翻前 / 终局 / 动作不合法 → `None`。
+fn walk_script(
+    tree: &PublicBettingTree,
+    script: &mut Vec<(u8, ScriptAct)>,
+    target: u8,
+) -> Option<NodeId> {
+    let mut id = tree.root_id();
+    loop {
+        let node = tree.node(id);
+        if node.street != StreetTag::Preflop || node.legal_actions.is_empty() {
+            return None;
+        }
+        let p = node.player_acting;
+        let next = match script.iter().position(|&(s, _)| s == p) {
+            Some(0) => Some(script.remove(0).1),
+            Some(_) => return None,
+            None => None,
+        };
+        if p == target && next.is_none() {
+            return Some(id);
+        }
+        let tag = match next {
+            None => AbstractActionTag::Fold,
+            Some(ScriptAct::Call) => AbstractActionTag::Call,
+            Some(ScriptAct::Raise(milli)) => node
+                .legal_actions
+                .iter()
+                .filter_map(|t| match t {
+                    AbstractActionTag::Raise(r) | AbstractActionTag::Bet(r) => {
+                        Some((*t, u64::from(r.as_milli()).abs_diff(milli)))
+                    }
+                    _ => None,
+                })
+                .min_by_key(|&(_, d)| d)
+                .map(|(t, _)| t)
+                .or_else(|| {
+                    node.legal_actions
+                        .contains(&AbstractActionTag::AllIn)
+                        .then_some(AbstractActionTag::AllIn)
+                })?,
+        };
+        let i = node.legal_actions.iter().position(|t| *t == tag)?;
+        match node.children[i] {
+            Child::Decision(next_id) => id = next_id,
+            Child::Terminal => return None,
+        }
+    }
+}
+
+// ===========================================================================
+// 对手平跟者范围倾斜（`--exploit-limp-tilt on`，`preflop_range_offanchor_research_2026_10_29` §4.1/§4.2）
+// ===========================================================================
+
+/// 参考策略尾部的显式排序底值：blueprint σ 在边界以下只剩 1e-4 量级的残余值（调研 §4.7），排序不可靠。
+/// 加注 / 弃牌两类各取 `max(σ, 底值)`，底值按 Chen 序单调（强牌的加注底值高、弃牌底值低）。
+const LIMP_TILT_TAIL_FLOOR: f64 = 1e-3;
+/// 平跟种子的陡度：blueprint 没有平跟，「不加注的牌里哪些更可能平跟」用 Chen 序给：
+/// `q = logistic(−K·(chen_top_fraction − 0.5))`。倾斜只平移 logit，K 决定这条带的软硬
+/// （K = 10：在 Chen 序上约 40% 的宽度内从 0.88 降到 0.12）。
+const LIMP_TILT_SEED_STEEPNESS: f64 = 10.0;
+/// 参考策略各类的下限（精确 0 没法倾斜）。
+const LIMP_TILT_MIN_PROB: f64 = 1e-9;
+/// 频率下限：实测频率为 0 时 θ 发散，夹到这里（再归一）。
+const LIMP_TILT_MIN_FREQ: f64 = 1e-4;
+
+/// 对手座的倾斜系数（[`limp_tilt`] / [`exploit_tilt`]）。
+#[derive(Debug, Default, Clone, PartialEq)]
+struct SeatTilt {
+    /// 下标 = 树座；`Some` = 该座被接管的翻前步的逐组合系数之积（对齐 [`all_hole_combos`]）：平跟者倾斜 =
+    /// 平跟那一步的 `σ_opp(平跟 | 牌)`；流水线 = 他全部翻前步。
+    coefs: Vec<Option<Vec<f64>>>,
+    /// 被系数替代的前缀决策 `(影子节点, 树座)`（节点只有一个行动者，二者唯一确定一个决策）。
+    nodes: Vec<(NodeId, PlayerId)>,
+}
+
+impl SeatTilt {
+    fn seat(&self, seat: usize) -> bool {
+        self.coefs.get(seat).is_some_and(Option::is_some)
+    }
+}
+
+/// 在 `ref_probs`（每个组合的 [加注, 平跟, 弃牌] 参考概率）上解指数倾斜
+/// `σ(a|h) ∝ ref(a|h)·e^{θ_a}`，使 `prior` 加权下的边际 = `f`（最小 KL 投影，调研 §4.1）。三个动作类的
+/// 指示特征之和恒为 1 → 迭代缩放 `θ_a += ln(f_a / m_a)` 单调收敛。返回 θ。
+///
+/// 节点上没有的动作类（参考概率在先验下处处为 0，例如大盲 option 没有弃牌、面对全下没有加注）不参与：
+/// 频率在其余类上重新归一，该类 θ 记 0（不然 `ln(f / 0)` 发散）。θ 以弃牌为基准（没有弃牌类时不平移）。
+fn solve_tilt(ref_probs: &[[f64; 3]], prior: &[f64], f: [f64; 3]) -> [f64; 3] {
+    let present: [bool; 3] = std::array::from_fn(|a| {
+        ref_probs
+            .iter()
+            .zip(prior)
+            .any(|(r, &p)| p > 0.0 && r[a] > 0.0)
+    });
+    let f = std::array::from_fn::<f64, 3, _>(|a| {
+        if present[a] {
+            f[a].max(LIMP_TILT_MIN_FREQ)
+        } else {
+            0.0
+        }
+    });
+    let f_sum: f64 = f.iter().sum();
+    if f_sum <= 0.0 {
+        return [0.0; 3];
+    }
+    let f = f.map(|x| x / f_sum);
+    let p_sum: f64 = prior.iter().sum();
+    let mut theta = [0.0f64; 3];
+    for _ in 0..500 {
+        let w = theta.map(f64::exp);
+        let mut m = [0.0f64; 3];
+        for (r, &p) in ref_probs.iter().zip(prior) {
+            let z: f64 = (0..3).map(|a| r[a] * w[a]).sum();
+            if z > 0.0 {
+                for a in 0..3 {
+                    m[a] += p * r[a] * w[a] / z;
+                }
+            }
+        }
+        let step = std::array::from_fn::<f64, 3, _>(|a| {
+            if present[a] {
+                (f[a] / (m[a] / p_sum)).ln()
+            } else {
+                0.0
+            }
+        });
+        for a in 0..3 {
+            theta[a] += step[a];
+        }
+        if step.iter().all(|s| s.abs() < 1e-10) {
+            break;
+        }
+    }
+    let fold = SpotAct::Fold as usize;
+    let base = if present[fold] { theta[fold] } else { 0.0 };
+    std::array::from_fn(|a| if present[a] { theta[a] - base } else { 0.0 })
+}
+
+/// 平跟者在开池节点 `node` 上的三类参考策略（逐组合，对齐 [`all_hole_combos`]）：加注 = blueprint 全部
+/// 加注 / 全下概率之和，弃牌部分再按平跟种子 `q` 拆成平跟与弃牌（调研 §4.2）。两类尾部先套
+/// [`LIMP_TILT_TAIL_FLOOR`] 底值（§4.1 第二排序键）。节点含跟注 / 过牌（不是平跟当弃牌的节点）→ `None`。
+fn limp_reference(
+    game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    node_id: NodeId,
+) -> Option<Vec<[f64; 3]>> {
+    let node = game.tree().node(node_id);
+    let tags = &node.legal_actions;
+    if tags
+        .iter()
+        .any(|t| matches!(t, AbstractActionTag::Call | AbstractActionTag::Check))
+    {
+        return None;
+    }
+    let fold_idx = tags.iter().position(|t| *t == AbstractActionTag::Fold)?;
+    let n = tags.len();
+    Some(
+        all_hole_combos()
+            .into_iter()
+            .map(|hole| {
+                let info = game.info_set_for_cards(node_id, hole, &[]);
+                let sigma = strategy_fn(&info, n);
+                // 空 / 坏 σ → 均匀（同 estimate_range 的容错）。
+                let ok = sigma.len() == n && sigma.iter().all(|p| p.is_finite() && *p >= 0.0);
+                let p = |i: usize| if ok { sigma[i] } else { 1.0 / n as f64 };
+                let fold = p(fold_idx);
+                let raise: f64 = (0..n).filter(|&i| i != fold_idx).map(p).sum();
+                let pct = chen_top_fraction(hole);
+                let raise = raise.max(LIMP_TILT_TAIL_FLOOR * (1.0 - pct));
+                let fold = fold.max(LIMP_TILT_TAIL_FLOOR * pct);
+                let (raise, fold) = (raise / (raise + fold), fold / (raise + fold));
+                let q = 1.0 / (1.0 + (LIMP_TILT_SEED_STEEPNESS * (pct - 0.5)).exp());
+                [raise, fold * q, fold * (1.0 - q)].map(|x| x.max(LIMP_TILT_MIN_PROB))
+            })
+            .collect(),
+    )
+}
+
+/// 对手平跟者范围倾斜（`--exploit-limp-tilt on`）。对 `prefix` 里每个对手的「平跟当弃牌」映射步
+/// （`limp.folds`，不含 hero、不含 `raisers`——平跟后又加注的那一步本来就按无信息处理）：
+/// 1. 用 [`preflop_spots`]（与 [`Profiler`] 同一份局面分类，输入来自 [`preflop_real_steps`]）找出他这次
+///    平跟所在的格（位置组 × 前面有没有平跟者）；
+/// 2. 在影子节点上合成参考策略（[`limp_reference`]），以 blueprint 边际 [加注, 0, 弃牌] 作人群的收缩
+///    目标，取该玩家在该格的收缩频率（[`Profiler::spot_freqs`]）；
+/// 3. 解倾斜（[`solve_tilt`]，先验 = 均匀，平跟是他本手第一个动作），系数 = `σ_opp(平跟 | 牌)`。
+///
+/// 任何一步对不上（找不到格、没有名字、节点不是平跟缺口、人群和本人都没有样本）→ 该座不倾斜，保持旧
+/// 做法（blueprint 弃牌概率）。纯函数（只读请求、画像快照和 blueprint），预热与决策算出同一份。
+#[allow(clippy::too_many_arguments)]
+fn limp_tilt(
+    game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    req: &Request,
+    prefix: &[(NodeId, AbstractActionTag, PlayerId)],
+    limp: &LimpFoldMap,
+    hero: PlayerId,
+    raisers: &[PlayerId],
+    prof: &Profiler,
+) -> SeatTilt {
+    let n_seats = smap.to_tree.len();
+    let mut out = SeatTilt {
+        coefs: vec![None; n_seats],
+        nodes: Vec::new(),
+    };
+    if !prof.cfg().limp_tilt || !limp.mapped() {
+        return out;
+    }
+    let Some(steps) = preflop_real_steps(req, solver_cfg, scale, smap) else {
+        return out;
+    };
+    let spots = req_preflop_spots(req, &steps);
+    let hero_name = req.names.get(&req.my_seat).map(String::as_str);
+    for &(node, seat) in &limp.folds {
+        if seat == hero
+            || raisers.contains(&seat)
+            || out.nodes.contains(&(node, seat))
+            || !prefix.contains(&(node, AbstractActionTag::Fold, seat))
+        {
+            continue;
+        }
+        let Some(op_seat) = smap.to_tree.iter().position(|&t| t == Some(seat)) else {
+            continue;
+        };
+        let Some(spot) = spots.iter().find(|d| {
+            d.seat as usize == op_seat
+                && d.act == SpotAct::Call
+                && matches!(d.spot, PreflopSpot::Unopened(_))
+        }) else {
+            continue; // 补盲者过牌也映成弃牌，但那是免费过牌：保持 blueprint「没加注」的概率。
+        };
+        let Some(name) = req.names.get(&(op_seat as u8)) else {
+            continue;
+        };
+        let Some(reference) = limp_reference(game, strategy_fn, node) else {
+            continue;
+        };
+        let n = reference.len() as f64;
+        let bp_raise = reference.iter().map(|r| r[0]).sum::<f64>() / n;
+        let prior = [bp_raise, 0.0, 1.0 - bp_raise];
+        let Some(freqs) = prof.spot_freqs(name, hero_name, spot.spot, prior) else {
+            continue;
+        };
+        let uniform = vec![1.0; reference.len()];
+        let theta = solve_tilt(&reference, &uniform, freqs.f);
+        let w = theta.map(f64::exp);
+        let coef: Vec<f64> = reference
+            .iter()
+            .map(|r| {
+                let z: f64 = (0..3).map(|a| r[a] * w[a]).sum();
+                r[SpotAct::Call as usize] * w[SpotAct::Call as usize] / z
+            })
+            .collect();
+        dlog!(
+            "limp_tilt: seat={op_seat}(tree {seat}) name={name} spot={:?} f(raise,limp,fold)={:.3?} n={} n_pop={} n_kind={} bp_raise={bp_raise:.3} theta={:.2?} limp_mass={:.3}",
+            spot.spot,
+            freqs.f,
+            freqs.n,
+            freqs.n_pop,
+            freqs.n_kind,
+            theta,
+            coef.iter().sum::<f64>() / n
+        );
+        out.coefs[seat as usize] = Some(coef);
+        out.nodes.push((node, seat));
+    }
+    out
+}
+
+// ===========================================================================
+// 对手翻前范围倾斜流水线（`--exploit-tilt on`，`preflop_range_offanchor_research_2026_10_29` §0 第 4 条 / §7.3）
+// ===========================================================================
+
+/// 节点动作标签 → 三类（[`SpotAct`]）：加注 / 下注 / 全下 = 加注，跟注 / 过牌 = 跟，弃牌 = 弃。
+fn tag_class(t: AbstractActionTag) -> SpotAct {
+    match t {
+        AbstractActionTag::Fold => SpotAct::Fold,
+        AbstractActionTag::Call | AbstractActionTag::Check => SpotAct::Call,
+        AbstractActionTag::Bet(_) | AbstractActionTag::Raise(_) | AbstractActionTag::AllIn => {
+            SpotAct::Raise
+        }
+    }
+}
+
+/// 翻前节点 `node_id` 上的三类参考策略（逐组合，对齐 [`all_hole_combos`]）：blueprint σ 按 [`tag_class`]
+/// 合并，类内各尺寸只看总概率（wopo 的尺寸跟抽象档对不上，按档切只会放大映射误差，调研 §7.3）。
+/// 加注 / 弃牌两类先套 [`LIMP_TILT_TAIL_FLOOR`] 底值（§4.1 第二排序键，按 Chen 序单调）。跟注类只在
+/// `call_floor` 时套（强牌底值高）：面对一次加注时不套，跟注边缘由 1e-4 量级的残余值决定，θ_call 6–10
+/// 把它放大成锯齿（调研 §7.4 问题 1）；面对 3bet 时不能套——跟注的低概率区装的是要 4bet 的强牌，Chen 序
+/// 是反的（§4.7 第 4 条）。节点上有的类夹到 [`LIMP_TILT_MIN_PROB`] 以上，没有的类恒为 0（[`solve_tilt`]
+/// 据此跳过）。
+fn class_reference(
+    game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    node_id: NodeId,
+    call_floor: bool,
+) -> Vec<[f64; 3]> {
+    let tags = &game.tree().node(node_id).legal_actions;
+    let n = tags.len();
+    let classes: Vec<usize> = tags.iter().map(|&t| tag_class(t) as usize).collect();
+    let present: [bool; 3] = std::array::from_fn(|a| classes.contains(&a));
+    let (raise, call, fold) = (
+        SpotAct::Raise as usize,
+        SpotAct::Call as usize,
+        SpotAct::Fold as usize,
+    );
+    all_hole_combos()
+        .into_iter()
+        .map(|hole| {
+            let info = game.info_set_for_cards(node_id, hole, &[]);
+            let sigma = strategy_fn(&info, n);
+            // 空 / 坏 σ → 均匀（同 estimate_range 的容错）。
+            let ok = sigma.len() == n && sigma.iter().all(|p| p.is_finite() && *p >= 0.0);
+            let mut c = [0.0f64; 3];
+            for (i, &a) in classes.iter().enumerate() {
+                c[a] += if ok { sigma[i] } else { 1.0 / n as f64 };
+            }
+            let pct = chen_top_fraction(hole);
+            if present[raise] {
+                c[raise] = c[raise].max(LIMP_TILT_TAIL_FLOOR * (1.0 - pct));
+            }
+            if call_floor && present[call] {
+                c[call] = c[call].max(LIMP_TILT_TAIL_FLOOR * (1.0 - pct));
+            }
+            if present[fold] {
+                c[fold] = c[fold].max(LIMP_TILT_TAIL_FLOOR * pct);
+            }
+            let z: f64 = c.iter().sum();
+            std::array::from_fn(|a| match (present[a], z > 0.0) {
+                (false, _) => 0.0,
+                (true, true) => (c[a] / z).max(LIMP_TILT_MIN_PROB),
+                (true, false) => 1.0,
+            })
+        })
+        .collect()
+}
+
+/// 主动全下那一步的系数（调研 §7.3 拍板 1：v1 不倾斜，画像里没有单独的全下频率）：[`allin_range_width`]
+/// 宽度表的 top 比例内 = 1，其余 = [`LIMP_TILT_TAIL_FLOOR`]（不给精确 0，与其它步相乘不至于全零）。
+/// 与 hero 面对全下（[`preflop_allin_response`]）用同一张表。
+fn shove_coef(width: f64) -> Vec<f64> {
+    all_hole_combos()
+        .into_iter()
+        .map(|h| {
+            if chen_top_fraction(h) < width {
+                1.0
+            } else {
+                LIMP_TILT_TAIL_FLOOR
+            }
+        })
+        .collect()
+}
+
+/// 前缀决策 `(node, tag)` 的原始 blueprint σ（逐组合；同 `estimate_range` 的取值与容错，翻前没有公共牌）。
+fn raw_sigma_coef(
+    game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    node_id: NodeId,
+    tag: AbstractActionTag,
+) -> Vec<f64> {
+    let tags = &game.tree().node(node_id).legal_actions;
+    let n = tags.len();
+    let idx = tags.iter().position(|t| *t == tag);
+    all_hole_combos()
+        .into_iter()
+        .map(|hole| {
+            let sigma = strategy_fn(&game.info_set_for_cards(node_id, hole, &[]), n);
+            match idx {
+                Some(i) if sigma.len() == n && sigma[i].is_finite() && sigma[i] >= 0.0 => sigma[i],
+                _ => 1.0 / n as f64,
+            }
+        })
+        .collect()
+}
+
+/// 对手翻前范围倾斜流水线（`--exploit-tilt on`）：「每个对手决策 → 参考策略 → 倾斜 → 乘」。对每个有名字、
+/// 本手没弃牌的对手座，按时间序走他的翻前决策（[`preflop_real_steps`] + [`req_preflop_spots`]，与
+/// [`Profiler`] 同一份局面分类），逐步乘出一份逐组合系数，代替他翻前那几步的 blueprint 前缀 reach 和宽度
+/// 修正。每一步：
+/// - 主动全下 → 宽度表系数（[`shove_coef`]，不倾斜；旧做法是跳过 AllIn tag，按无信息处理）；
+/// - 分了类的决策 → 参考节点 = 同步前缀里的影子节点，没有就用替身（[`spot_substitute`]，同步线上两者
+///   相同）。首入用 [`limp_reference`]（平跟合成三类；节点本身有跟注——SB 补齐——退回 [`class_reference`]），
+///   其余用 [`class_reference`]（面对一次加注的跟注类也套底值）。频率 = [`Profiler::spot_freqs`]（收缩目标 = 参考策略在本手先验下的边际；
+///   平跟合成时同 [`limp_tilt`] 取 [加注, 0, 弃牌]），`None` → θ = 0。[`solve_tilt`] 解 θ，系数 =
+///   `σ_opp(实际动作类 | 牌)`；
+/// - 没分类（面对 4bet、冷跟 3bet……）/ 找不到参考节点 / 节点上没有实际动作类 → 在同步前缀里的照旧乘原始
+///   σ（不倾斜，AllIn tag 照旧跳过），不在的按无信息处理（因子 1）。
+///
+/// 每步系数同时是下一步的先验（频率约束按本手先验解，§4.6 已知近似）。至少一步用上了参考节点或宽度表的座
+/// 才接管：他在前缀里的全部翻前决策进 `nodes`（调用方从前缀里删掉），翻后决策不动；其余座保持旧做法。
+/// 纯函数（只读请求、画像快照和 blueprint），预热与决策算出同一份。
+#[allow(clippy::too_many_arguments)]
+fn exploit_tilt(
+    game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    req: &Request,
+    synced_node: NodeId,
+    hero: PlayerId,
+    prof: &Profiler,
+) -> SeatTilt {
+    let mut out = SeatTilt {
+        coefs: vec![None; smap.to_tree.len()],
+        nodes: Vec::new(),
+    };
+    let Some(steps) = preflop_real_steps(req, solver_cfg, scale, smap) else {
+        return out;
+    };
+    let spots = req_preflop_spots(req, &steps);
+    let tree = game.tree();
+    let prefix = synced_prefix_decisions(game, synced_node);
+    let hero_name = req.names.get(&req.my_seat).map(String::as_str);
+    let n_combos = all_hole_combos().len();
+    for (op_seat, name) in &req.names {
+        let Ok(seat) = smap.tree_seat(*op_seat) else {
+            continue;
+        };
+        if seat as PlayerId == hero
+            || req
+                .actions
+                .iter()
+                .any(|h| h.seat == *op_seat && h.action == "fold")
+        {
+            continue; // hero / 已弃牌（范围不被读）。
+        }
+        // 他在同步前缀里的翻前决策，按时间序与他的真实翻前动作一一对应（lockstep 每个已同步的真实动作在
+        // 影子里恰好走一步；平跟当弃牌映射的那一步是他的第一个动作，之后他再行动就失同步了）。
+        let synced: Vec<(NodeId, AbstractActionTag)> = prefix
+            .iter()
+            .filter(|&&(n, _, s)| {
+                s == seat as PlayerId && tree.node(n).street == StreetTag::Preflop
+            })
+            .map(|&(n, t, _)| (n, t))
+            .collect();
+        let mut coef = vec![1.0f64; n_combos];
+        let mut taken = false;
+        let mul = |coef: &mut [f64], c: &[f64]| coef.iter_mut().zip(c).for_each(|(x, y)| *x *= y);
+        let my_steps = steps.iter().enumerate().filter(|(_, s)| s.seat == *op_seat);
+        for (k, (i, step)) in my_steps.enumerate() {
+            let at = synced.get(k).copied();
+            if let Some(start) = step.shove_start {
+                let open = !steps[..i].iter().any(|s| s.input == SpotActInput::Aggr);
+                let width = allin_range_width(
+                    start,
+                    solver_cfg.big_blind.as_u64(),
+                    open,
+                    limp_pos(seat, solver_cfg.n_seats),
+                );
+                dlog!("exploit_tilt: seat={op_seat}(tree {seat}) idx={i} shove start={start} open={open} width={width:.3}");
+                mul(&mut coef, &shove_coef(width));
+                taken = true;
+                continue;
+            }
+            let tilted = spots.iter().find(|d| d.action_idx == i).and_then(|d| {
+                let from_prefix = at.is_some();
+                let node =
+                    at.map(|(n, _)| n).or_else(|| spot_substitute(tree, smap, &steps, d))?;
+                let limp_ref = matches!(d.spot, PreflopSpot::Unopened(_))
+                    .then(|| limp_reference(game, strategy_fn, node))
+                    .flatten();
+                let p_sum: f64 = coef.iter().sum();
+                let marginal = |r: &[[f64; 3]]| -> [f64; 3] {
+                    std::array::from_fn(|a| {
+                        r.iter().zip(&coef).map(|(x, p)| x[a] * p).sum::<f64>() / p_sum
+                    })
+                };
+                let (reference, target) = match limp_ref {
+                    Some(r) => {
+                        let m = marginal(&r);
+                        (r, [m[0], 0.0, 1.0 - m[0]])
+                    }
+                    None => {
+                        // 跟注类的第二排序键只给面对一次加注的局面（`class_reference` doc）。
+                        let call_floor = matches!(
+                            d.spot,
+                            PreflopSpot::VsOpen { .. } | PreflopSpot::LimpVsRaise { .. }
+                        );
+                        let r = class_reference(game, strategy_fn, node, call_floor);
+                        let m = marginal(&r);
+                        (r, m)
+                    }
+                };
+                let a = d.act as usize;
+                if !reference.iter().any(|r| r[a] > 0.0) {
+                    return None;
+                }
+                let freqs = prof.spot_freqs(name, hero_name, d.spot, target);
+                let theta = freqs.map_or([0.0; 3], |f| solve_tilt(&reference, &coef, f.f));
+                let w = theta.map(f64::exp);
+                let step_coef: Vec<f64> = reference
+                    .iter()
+                    .map(|r| {
+                        let z: f64 = (0..3).map(|b| r[b] * w[b]).sum();
+                        r[a] * w[a] / z
+                    })
+                    .collect();
+                dlog!(
+                    "exploit_tilt: seat={op_seat}(tree {seat}) name={name} idx={i} spot={:?} act={:?} node={node:?}({}) target={target:.3?} f={:.3?} n={:?} theta={theta:.2?} mass={:.3}",
+                    d.spot,
+                    d.act,
+                    if from_prefix { "prefix" } else { "substitute" },
+                    freqs.map(|f| f.f),
+                    freqs.map(|f| (f.n, f.n_pop, f.n_kind)),
+                    step_coef.iter().zip(&coef).map(|(c, p)| c * p).sum::<f64>() / p_sum
+                );
+                Some(step_coef)
+            });
+            match (tilted, at) {
+                (Some(c), _) => {
+                    mul(&mut coef, &c);
+                    taken = true;
+                }
+                (None, Some((node, tag))) if tag != AbstractActionTag::AllIn => {
+                    mul(&mut coef, &raw_sigma_coef(game, strategy_fn, node, tag));
+                }
+                (None, _) => {}
+            }
+        }
+        if taken {
+            out.coefs[seat as usize] = Some(coef);
+            out.nodes
+                .extend(synced.iter().map(|&(n, _)| (n, seat as PlayerId)));
+        }
+    }
+    out
+}
+
+/// 脱锚搜索档一前缀 reach 的全部输入（[`unanchored_range_inputs`]）。
+struct RangeInputs {
+    /// 前缀决策三元组（[`unanchored_prefix_decisions`]，再去掉被平跟者倾斜替代的步）。
+    decisions: Vec<(NodeId, AbstractActionTag, PlayerId)>,
+    /// hero 的 limp 启发式系数（[`hero_limp_coef`]）。
+    hero_coef: HeroLimpCoef,
+    /// 对手座倾斜系数（`--exploit-tilt` → [`exploit_tilt`]，否则 `--exploit-limp-tilt` → [`limp_tilt`]；
+    /// 都关 → 全 `None`）。
+    tilt: SeatTilt,
+}
+
 /// 脱锚搜索档一前缀 reach 的全部输入（[`decide_search_unanchored`] 与 [`prewarm`] 共用，两路必须算出
 /// 同一份才能命中 solve 缓存 key）：前缀决策三元组（[`unanchored_prefix_decisions`]）+ hero 的 limp
-/// 启发式系数（[`hero_limp_coef`]）。翻前历史在一手内的翻后各街不变，每条街算出同一份系数。
+/// 启发式系数（[`hero_limp_coef`]）+ 对手座倾斜（[`exploit_tilt`] / [`limp_tilt`]，读画像快照：一手之内画像不变）。
+/// 翻前历史在一手内的翻后各街不变，每条街算出同一份系数。
 #[allow(clippy::too_many_arguments)]
 fn unanchored_range_inputs(
     game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
     solver_cfg: &TableConfig,
     smap: &SeatMap,
     req: &Request,
@@ -1837,14 +2616,61 @@ fn unanchored_range_inputs(
     hole: [Card; 2],
     synced_node: NodeId,
     limp: &LimpFoldMap,
-    limp_as_fold: bool,
-) -> (Vec<(NodeId, AbstractActionTag, PlayerId)>, HeroLimpCoef) {
+    rt: &SearchRuntime,
+) -> RangeInputs {
     let hero_pid = hero.0 as PlayerId;
-    let coef = hero_limp_coef(game, solver_cfg, smap, req, scale, hero, hole, limp_as_fold);
+    let coef = hero_limp_coef(
+        game,
+        solver_cfg,
+        smap,
+        req,
+        scale,
+        hero,
+        hole,
+        rt.limp_as_fold,
+    );
     let raisers = limp_raisers(req, solver_cfg, scale, smap, limp, hero_pid);
-    let decisions =
+    let mut decisions =
         unanchored_prefix_decisions(game, synced_node, limp, hero_pid, &coef.nodes, &raisers);
-    (decisions, coef)
+    let tilt = rt.exploit.as_ref().map_or_else(SeatTilt::default, |cell| {
+        let prof = cell.borrow();
+        if prof.cfg().tilt {
+            exploit_tilt(
+                game,
+                strategy_fn,
+                solver_cfg,
+                scale,
+                smap,
+                req,
+                synced_node,
+                hero_pid,
+                &prof,
+            )
+        } else {
+            limp_tilt(
+                game,
+                strategy_fn,
+                solver_cfg,
+                scale,
+                smap,
+                req,
+                &decisions,
+                limp,
+                hero_pid,
+                &raisers,
+                &prof,
+            )
+        }
+    });
+    decisions.retain(|&(node, _, seat)| !tilt.nodes.contains(&(node, seat)));
+    if debug_on() {
+        log_spot_substitutes(game, solver_cfg, smap, req, scale);
+    }
+    RangeInputs {
+        decisions,
+        hero_coef: coef,
+        tilt,
+    }
 }
 
 /// 一次决策：重放本手历史（100BB real + abs 两态 lockstep）→ 我方决策点。`search == None` 时
@@ -3873,12 +4699,14 @@ type ExploitSnapshot = (Vec<Option<OpponentProfile>>, f64, Vec<ExploitShape>);
 /// 并行不碰 Profiler，只吃此快照）。hero 座按 OpenPoker my_seat 跳过（subgame
 /// apply_exploit_width_prior 再守一层）。`None` = `--exploit` 关 → 不剥削。同一手内预热与决策之间
 /// Profiler 不变（observe 在手末才发），画像一致；预热请求须带 `names`（driver 开剥削时带）。
+/// `tilt` = 本手的对手座倾斜（[`unanchored_range_inputs`]）：倾斜过的座不再做宽度修正。
 fn exploit_snapshot(
     rt: &SearchRuntime,
     req: &Request,
     solver_cfg: &TableConfig,
     scale: u64,
     smap: &SeatMap,
+    tilt: Option<&SeatTilt>,
 ) -> Option<ExploitSnapshot> {
     let n_seats = solver_cfg.n_seats as usize;
     rt.exploit.as_ref().map(|cell| {
@@ -3900,6 +4728,9 @@ fn exploit_snapshot(
             let Some(tree) = smap.to_tree[op_seat] else {
                 continue; // 未发牌座（短桌幻影 / 空座）
             };
+            if tilt.is_some_and(|t| t.seat(tree as usize)) {
+                continue; // 翻前已按他的局面频率倾斜过，宽度修正会重复算一次画像。
+            }
             if let Some(name) = req.names.get(&(op_seat as u8)) {
                 if let Some(p) = prof.profile_for(name, hero_name) {
                     if let Some(shape) = pick_shape(pfr_shape_on, entry_kinds[tree as usize]) {
@@ -3997,6 +4828,7 @@ fn decide_search_unanchored(
     let range_inputs = rt.unanchored_prefix_reach.then(|| {
         unanchored_range_inputs(
             game,
+            strategy_fn,
             solver_cfg,
             smap,
             req,
@@ -4005,11 +4837,12 @@ fn decide_search_unanchored(
             hole,
             synced_node,
             limp,
-            rt.limp_as_fold,
+            rt,
         )
     });
-    let prefix_decisions = range_inputs.as_ref().map(|(d, _)| d);
-    let hero_coef = range_inputs.as_ref().map(|(_, c)| c);
+    let prefix_decisions = range_inputs.as_ref().map(|ri| &ri.decisions);
+    let hero_coef = range_inputs.as_ref().map(|ri| &ri.hero_coef);
+    let tilt = range_inputs.as_ref().map(|ri| &ri.tilt);
     // 一致性检查失败（设计 §3.4）→ source 追加标记：实盘不开 --debug-log 也能看出这条路径失效。
     let coef_mismatch_tag = if hero_coef.is_some_and(|c| c.mismatch) {
         ":hero_coef_mismatch"
@@ -4042,7 +4875,7 @@ fn decide_search_unanchored(
     // 叠加剥削 Tier 2（exploit_strategy_design §2/§4）：画像快照（[`exploit_snapshot`]，仅 --exploit 开、
     // 对手已收敛）。`None` = 不剥削 → _cross_exploit 走 exploit=None 分支，与既有 search:unanchored
     // 逐位 byte-equal。
-    let exploit_owned = exploit_snapshot(rt, req, solver_cfg, scale, smap);
+    let exploit_owned = exploit_snapshot(rt, req, solver_cfg, scale, smap, tilt);
     let exploit_prior = exploit_owned
         .as_ref()
         .map(|(profiles, alpha, shapes)| ExploitPrior {
@@ -4069,6 +4902,7 @@ fn decide_search_unanchored(
                 strategy: strategy_fn,
                 decisions: d,
                 hero_coef: hero_coef.and_then(|c| c.coef.as_deref()),
+                seat_coefs: tilt.map(|t| t.coefs.as_slice()),
             });
             subgame_search_unanchored_cached_cross_exploit(
                 Some(cache), // within-round solve 缓存（同锚定路径；kind 进 key、两路不串条目）。
@@ -5070,9 +5904,10 @@ fn run() -> Result<(), String> {
         if let Some(cell) = &rt.exploit {
             let ec = *cell.borrow().cfg();
             eprintln!(
-                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): shrink_k={} strength_alpha={} mode={}（进程内画像，按 n/(n+k) 收缩）",
+                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): shrink_k={} strength_alpha={} mode={} limp_tilt={} tilt={} cell_shrink_k={}（进程内画像，按 n/(n+k) 收缩）",
                 ec.shrink_k, ec.strength_alpha,
-                if ec.pfr_shape { "on(VPIP+PFR/CallBand·RaiseBand)" } else { "vpip(仅VPIP/byte-equal)" }
+                if ec.pfr_shape { "on(VPIP+PFR/CallBand·RaiseBand)" } else { "vpip(仅VPIP/byte-equal)" },
+                ec.limp_tilt, ec.tilt, ec.cell_shrink_k
             );
             // 暖启动（--warm-profile-hh）：启动期读过往 HH JSONL，把历史牌局喂进 Profiler（与 live
             // observe 同口径）。网络丢消息 / 字段缺失 / 序列不完整的牌局在 hh_record_to_observe 重放处
@@ -5293,6 +6128,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_shrink_k: Option<f64> = None;
     let mut exploit_strength: Option<f64> = None;
     let mut exploit_pfr_shape = false;
+    let mut exploit_limp_tilt: Option<bool> = None;
+    let mut exploit_tilt: Option<bool> = None;
     let mut warm_profile_hh: Option<PathBuf> = None;
     // PM-17（--exploit-4bet*，不要求 --search）。
     let mut exploit_4bet_on = false;
@@ -5533,6 +6370,20 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 }
                 other => return Err(format!("--exploit 须 on|vpip|off，得 {other}")),
             },
+            "--exploit-limp-tilt" => {
+                exploit_limp_tilt = Some(match next_val(&mut it, &arg)?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => return Err(format!("--exploit-limp-tilt 须 on|off，得 {other}")),
+                })
+            }
+            "--exploit-tilt" => {
+                exploit_tilt = Some(match next_val(&mut it, &arg)?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => return Err(format!("--exploit-tilt 须 on|off，得 {other}")),
+                })
+            }
             "--warm-profile-hh" => warm_profile_hh = Some(PathBuf::from(next_val(&mut it, &arg)?)),
             "--exploit-shrink-k" => {
                 let v: f64 = next_val(&mut it, &arg)?
@@ -5649,7 +6500,12 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     };
     // --exploit* guard：子旗需 --exploit on|vpip；--exploit on|vpip 需 --search（剥削仅作用脱锚
     // 搜索路径）。pfr_shape 现由 --exploit 取值派生（off 时恒 false），不再单列入此 guard。
-    if !exploit_on && (exploit_shrink_k.is_some() || exploit_strength.is_some()) {
+    if !exploit_on
+        && (exploit_shrink_k.is_some()
+            || exploit_strength.is_some()
+            || exploit_limp_tilt.is_some()
+            || exploit_tilt.is_some())
+    {
         return Err("设了 --exploit-* 子旗但 --exploit 非 on|vpip".to_string());
     }
     if warm_profile_hh.is_some() && !exploit_on {
@@ -5657,6 +6513,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     }
     if exploit_on && search.is_none() {
         return Err("--exploit on|vpip 需配合 --search（剥削只挂脱锚搜索路径）".to_string());
+    }
+    // 平跟者倾斜作用在「平跟当弃牌」映射出来的那一步上：没有映射就永远不生效，拒绝静默空开。
+    let exploit_limp_tilt = exploit_limp_tilt.unwrap_or(false);
+    if exploit_limp_tilt && !search_limp_as_fold.unwrap_or(DEFAULT_SEARCH_LIMP_AS_FOLD) {
+        return Err("--exploit-limp-tilt on 需配合 --search-limp-as-fold on".to_string());
     }
     // --exploit-4bet* guard：子旗需 --exploit-4bet on；参数越界拒绝启动。
     if !exploit_4bet_on
@@ -5705,6 +6566,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             shrink_k: exploit_shrink_k.unwrap_or(d.shrink_k),
             strength_alpha: exploit_strength.unwrap_or(d.strength_alpha),
             pfr_shape: exploit_pfr_shape,
+            limp_tilt: exploit_limp_tilt,
+            tilt: exploit_tilt.unwrap_or(false),
+            ..d
         }
     });
     Ok(Args {
@@ -6732,6 +7596,751 @@ mod tests {
         assert_eq!((cache.misses(), cache.hits()), (1, 1), "决策须命中预热");
     }
 
+    /// [`unanchored_range_inputs`] 的测试入口：平跟当弃牌开、不开剥削（没有平跟者倾斜）、均匀 σ，
+    /// 只看前缀决策与 hero 系数。
+    #[allow(clippy::too_many_arguments)]
+    fn range_inputs_t(
+        game: &SimplifiedNlheGame,
+        cfg: &TableConfig,
+        smap: &SeatMap,
+        req: &Request,
+        hero: SeatId,
+        hole: [Card; 2],
+        synced_node: NodeId,
+        limp: &LimpFoldMap,
+    ) -> (Vec<(NodeId, AbstractActionTag, PlayerId)>, HeroLimpCoef) {
+        let rt = rt_limp_as_fold(SubgameSearchConfig::default());
+        let ri = unanchored_range_inputs(
+            game,
+            &|_: &InfoSetId, n: usize| vec![1.0 / n as f64; n],
+            cfg,
+            smap,
+            req,
+            5,
+            hero,
+            hole,
+            synced_node,
+            limp,
+            &rt,
+        );
+        assert!(ri.tilt.nodes.is_empty(), "不开剥削不应有平跟者倾斜");
+        (ri.decisions, ri.hero_coef)
+    }
+
+    /// [`spot_substitute`] 的测试入口：本手翻前分类 + 每个决策的替身节点（下标对齐 `req.actions`）。
+    fn substitutes(
+        game: &SimplifiedNlheGame,
+        req: &Request,
+    ) -> Vec<(SpotDecision, Option<NodeId>)> {
+        let (cfg, smap, ..) = coef_ctx(req);
+        let steps = preflop_real_steps(req, &cfg, 5, &smap).expect("翻前重放");
+        assert_eq!(steps.len(), req.actions.len());
+        req_preflop_spots(req, &steps)
+            .into_iter()
+            .map(|d| (d, spot_substitute(game.tree(), &smap, &steps, &d)))
+            .collect()
+    }
+
+    /// lockstep 重放到第 `i` 个真实动作之前时影子所在的节点（= 该动作的决策节点）。
+    fn lockstep_node(game: &SimplifiedNlheGame, req: &Request, i: usize) -> NodeId {
+        let mut r = req.clone();
+        r.actions.truncate(i);
+        let (_, abs, ..) = replay_limp(game, &r, None, true).expect("lockstep 同步");
+        abs.current_node_id
+    }
+
+    /// 替身节点：影子能同步的线上，每个分了类的决策的替身 = lockstep 实际走到的节点（脚本 + 「其余弃牌」
+    /// 复现了原线，加注档映射一致）。覆盖首入、面对开池（有 / 无跟注者）、面对 3bet。
+    #[test]
+    fn spot_substitute_matches_synced_line() {
+        let game = nolimp_game();
+        let acts = vec![
+            hist(3, "raise", Some(50)),
+            hist(4, "fold", None),
+            hist(5, "call", Some(50)),
+            hist(0, "raise", Some(250)),
+            hist(1, "fold", None),
+            hist(2, "fold", None),
+            hist(3, "call", Some(250)),
+        ];
+        let req = limp_req(5, ["Qs", "Qd"], &[], acts);
+        let subs = substitutes(&game, &req);
+        let kinds: Vec<(usize, PreflopSpot)> =
+            subs.iter().map(|(d, _)| (d.action_idx, d.spot)).collect();
+        assert!(
+            matches!(
+                kinds[..],
+                [
+                    (0, PreflopSpot::Unopened(_)),
+                    (1, PreflopSpot::VsOpen { callers: false, .. }),
+                    (2, PreflopSpot::VsOpen { callers: false, .. }),
+                    (3, PreflopSpot::VsOpen { callers: true, .. }),
+                    (6, PreflopSpot::Vs3bet { .. }),
+                ]
+            ),
+            "{kinds:?}"
+        );
+        for (d, sub) in &subs {
+            assert_eq!(
+                *sub,
+                Some(lockstep_node(&game, &req, d.action_idx)),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// 平跟相关的替身：平跟后面对隔离加注 → 大盲面对同一次加注（同一跟注者）的节点，即 lockstep 在大盲
+    /// 那一步走到的节点；被大盲加注 → SB 补齐、大盲加注后的 SB；大盲 option → SB 补齐后的大盲（多人平跟
+    /// 也用它）；跟在平跟后面加注 → 前面弃牌的首入节点。
+    #[test]
+    fn spot_substitute_limp_lines() {
+        let game = nolimp_game();
+        let tree = game.tree();
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "raise", Some(100)),
+            hist(5, "call", Some(100)),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+            hist(2, "fold", None),
+            hist(3, "call", Some(100)),
+        ];
+        let req = limp_req(0, ["Qs", "Qd"], &[], acts);
+        let subs = substitutes(&game, &req);
+        let get = |idx: usize| subs.iter().find(|(d, _)| d.action_idx == idx).unwrap();
+        assert!(matches!(
+            get(6).0.spot,
+            PreflopSpot::LimpVsRaise {
+                pos: poker::training::opponent_profile::PosClass::Early
+            }
+        ));
+        assert_eq!(get(6).1, Some(lockstep_node(&game, &req, 5)));
+        assert!(matches!(get(1).0.spot, PreflopSpot::Unopened(c) if c.limped));
+        assert_eq!(get(1).1, Some(lockstep_node(&game, &req, 1)));
+        assert_eq!(get(2).1, Some(lockstep_node(&game, &req, 2)));
+
+        // 大盲跟了隔离加注之后平跟者再面对：替身仍是大盲面对这次加注的节点（大盲自己那一步不进脚本）。
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "raise", Some(100)),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+            hist(2, "call", Some(100)),
+            hist(3, "call", Some(100)),
+        ];
+        let req = limp_req(0, ["Qs", "Qd"], &[], acts);
+        let (d, sub) = substitutes(&game, &req).pop().unwrap();
+        assert!(matches!(d.spot, PreflopSpot::LimpVsRaise { .. }), "{d:?}");
+        assert_eq!(sub, Some(lockstep_node(&game, &req, 5)));
+
+        // 两个平跟者：第一个人跟了隔离加注（时间上在大盲之后，树里却排在加注者前面）——平跟者当弃牌，
+        // 他的跟注不进脚本，第二个平跟者的替身同样是大盲面对这次加注的节点。
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "call", Some(20)),
+            hist(5, "raise", Some(120)),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+            hist(2, "fold", None),
+            hist(3, "call", Some(120)),
+            hist(4, "call", Some(120)),
+        ];
+        let req = limp_req(0, ["Qs", "Qd"], &[], acts);
+        let subs = substitutes(&game, &req);
+        let get = |idx: usize| subs.iter().find(|(d, _)| d.action_idx == idx).unwrap().1;
+        assert_eq!(get(6), Some(lockstep_node(&game, &req, 5)));
+        assert_eq!(get(7), Some(lockstep_node(&game, &req, 5)));
+
+        // 平跟者再加注、隔离加注者面对：树里平跟者会先于开池者行动，这条线复现不了 → None（不给错节点）。
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "raise", Some(100)),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+            hist(2, "fold", None),
+            hist(3, "raise", Some(400)),
+            hist(4, "fold", None),
+        ];
+        let req = limp_req(0, ["Qs", "Qd"], &[], acts);
+        let (d, sub) = substitutes(&game, &req).pop().unwrap();
+        assert!(matches!(d.spot, PreflopSpot::Vs3bet { .. }), "{d:?}");
+        assert_eq!(sub, None);
+
+        // UTG 平跟、其余弃到大盲、大盲加注、UTG 面对。
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+            hist(2, "raise", Some(100)),
+            hist(3, "call", Some(100)),
+        ];
+        let req = limp_req(0, ["Qs", "Qd"], &[], acts);
+        let subs = substitutes(&game, &req);
+        let (d, sub) = subs.last().unwrap();
+        assert!(matches!(d.spot, PreflopSpot::LimpVsRaise { .. }), "{d:?}");
+        let node = sub.expect("SB 替身");
+        assert_eq!(tree.node(node).player_acting, 1);
+        let path = tree.path_to_root(node);
+        assert_eq!(
+            path[..5],
+            [
+                AbstractActionTag::Fold,
+                AbstractActionTag::Fold,
+                AbstractActionTag::Fold,
+                AbstractActionTag::Fold,
+                AbstractActionTag::Call
+            ]
+        );
+        assert!(matches!(path[5], AbstractActionTag::Raise(_)), "{path:?}");
+        assert_eq!(path.len(), 6);
+
+        // UTG、BTN 平跟，SB 补齐，大盲过牌：option（multi）→ SB 补齐后的大盲。
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "call", Some(20)),
+            hist(1, "call", Some(20)),
+            hist(2, "check", None),
+        ];
+        let req = limp_req(0, ["Qs", "Qd"], &[], acts);
+        let subs = substitutes(&game, &req);
+        let (d, sub) = subs.last().unwrap();
+        assert_eq!(
+            d.spot,
+            PreflopSpot::BlindOption {
+                bb: true,
+                multi: true
+            }
+        );
+        let node = sub.expect("大盲替身");
+        assert_eq!(tree.node(node).player_acting, 2);
+        assert!(tree
+            .node(node)
+            .legal_actions
+            .contains(&AbstractActionTag::Check));
+        assert_eq!(
+            tree.path_to_root(node),
+            [
+                AbstractActionTag::Fold,
+                AbstractActionTag::Fold,
+                AbstractActionTag::Fold,
+                AbstractActionTag::Fold,
+                AbstractActionTag::Call
+            ]
+        );
+    }
+
+    /// [`solve_tilt`]：解出的 θ 让先验加权边际等于目标频率（含 0 频率被夹到下限）；θ 以弃牌为基准。
+    #[test]
+    fn solve_tilt_matches_marginals() {
+        let refs: Vec<[f64; 3]> = (0..200)
+            .map(|i| {
+                let x = i as f64 / 199.0;
+                let r = [0.9 * (1.0 - x) + 0.01, 0.3 * x + 0.02, 0.5 * x + 0.05];
+                let s: f64 = r.iter().sum();
+                r.map(|v| v / s)
+            })
+            .collect();
+        let prior: Vec<f64> = (0..200).map(|i| 1.0 + (i % 7) as f64).collect();
+        for f in [[0.1, 0.4, 0.5], [0.3, 0.0, 0.7], [0.05, 0.05, 0.9]] {
+            let theta = solve_tilt(&refs, &prior, f);
+            assert_eq!(theta[SpotAct::Fold as usize], 0.0);
+            let w = theta.map(f64::exp);
+            let total: f64 = prior.iter().sum();
+            let mut m = [0.0; 3];
+            for (r, p) in refs.iter().zip(&prior) {
+                let z: f64 = (0..3).map(|a| r[a] * w[a]).sum();
+                (0..3).for_each(|a| m[a] += p * r[a] * w[a] / z / total);
+            }
+            let fs: f64 = f.iter().map(|x| x.max(LIMP_TILT_MIN_FREQ)).sum();
+            for a in 0..3 {
+                let want = f[a].max(LIMP_TILT_MIN_FREQ) / fs;
+                assert!((m[a] - want).abs() < 1e-8, "f={f:?} m={m:?}");
+            }
+        }
+    }
+
+    /// 平跟者倾斜端到端（6 座、button 0；UTG 平跟、SB 补齐、大盲 hero 过牌 → 翻牌 `limper_in_pot` 脱锚）。
+    /// σ = 「Chen 序前 15% 开池、其余弃牌」。开关开：UTG 那一步弃牌映射从前缀里拿掉、换成系数；系数在
+    /// 均匀先验下的均值 = 画像给的平跟频率；形状是「加注牌之下、能玩的牌」（AA 和 72o 都低于中段牌）；
+    /// 该座不再做宽度修正。开关关 / 该座没名字：旧行为逐位不变。
+    #[test]
+    fn limp_tilt_limper_range() {
+        use poker::PreflopLossless169;
+        let game = nolimp_game();
+        let classes = PreflopLossless169::new();
+        let open_top = |hole: [Card; 2]| chen_top_fraction(hole) < 0.15;
+        let mut raise_by_class = vec![0.0f64; 169];
+        for h in all_hole_combos() {
+            raise_by_class[classes.hand_class(h) as usize] = f64::from(u8::from(open_top(h)));
+        }
+        // 弃牌 = 下标 0（下面断言平跟节点的合法集），其余加注档平分。
+        let open = move |i: &InfoSetId, n: usize| {
+            let r = raise_by_class
+                .get(i.bucket_id() as usize)
+                .copied()
+                .unwrap_or(0.0);
+            let mut v = vec![r / (n - 1) as f64; n];
+            v[0] = 1.0 - r;
+            v
+        };
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "call", Some(20)),
+            hist(2, "check", None),
+        ];
+        let mut req = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks"], acts);
+        req.names = BTreeMap::from([(3, "limper".to_string()), (2, "hero".to_string())]);
+        let e = replay_limp(&game, &req, Some(SeatId(2)), true)
+            .err()
+            .unwrap();
+        assert_eq!(e.reason, "limp_as_fold:limper_in_pot");
+        let (limp_node, limper) = e.limp.folds[0];
+        assert_eq!(limper, 3);
+        assert_eq!(
+            game.tree().node(limp_node).legal_actions[0],
+            AbstractActionTag::Fold
+        );
+        // 画像：limper 在 UTG（Early、前面没人平跟）30 手里平跟 12、加注 3；人群另一个人 UTG 20 手全弃。
+        let profiler = |limp_tilt: bool| {
+            let mut p = Profiler::new(ExploitConfig {
+                limp_tilt,
+                pfr_shape: true,
+                ..ExploitConfig::default()
+            });
+            for (i, (name, act)) in std::iter::repeat_n(("limper", "call"), 12)
+                .chain(std::iter::repeat_n(("limper", "raise"), 3))
+                .chain(std::iter::repeat_n(("limper", "fold"), 15))
+                .chain(std::iter::repeat_n(("other", "fold"), 20))
+                .enumerate()
+            {
+                let mut acts = vec![(3, act)];
+                if act == "call" {
+                    acts.extend([
+                        (4, "fold"),
+                        (5, "fold"),
+                        (0, "fold"),
+                        (1, "fold"),
+                        (2, "check"),
+                    ]);
+                }
+                p.observe_hand(&ObserveHand {
+                    names: BTreeMap::from([(3, name.to_string()), (2, format!("x{}", i % 3))]),
+                    actions: acts
+                        .into_iter()
+                        .map(|(seat, a)| poker::training::opponent_profile::ObsAction {
+                            seat,
+                            street: "preflop".into(),
+                            action: a.into(),
+                            contribution_delta: None,
+                            to_call_before: None,
+                        })
+                        .collect(),
+                    button_seat: Some(0),
+                    dealt_seats: (0..6).collect(),
+                    posts: Vec::new(),
+                });
+            }
+            p
+        };
+        let rt_with = |limp_tilt: bool| SearchRuntime {
+            exploit: Some(RefCell::new(profiler(limp_tilt))),
+            ..rt_limp_as_fold(SubgameSearchConfig::default())
+        };
+        let (cfg, smap, hero, hole) = coef_ctx(&req);
+        let inputs = |rt: &SearchRuntime, req: &Request| {
+            unanchored_range_inputs(
+                &game,
+                &open,
+                &cfg,
+                &smap,
+                req,
+                5,
+                hero,
+                hole,
+                e.synced_node,
+                &e.limp,
+                rt,
+            )
+        };
+        let rt = rt_with(true);
+        let on = inputs(&rt, &req);
+        assert_eq!(on.tilt.nodes, vec![(limp_node, 3)]);
+        assert!(!on
+            .decisions
+            .contains(&(limp_node, AbstractActionTag::Fold, 3)));
+        let coef = on.tilt.coefs[3].as_ref().expect("limper 有系数");
+        assert!(on
+            .tilt
+            .coefs
+            .iter()
+            .enumerate()
+            .all(|(s, c)| s == 3 || c.is_none()));
+        let cell = PreflopSpot::Unopened(poker::training::opponent_profile::UnopenedCell {
+            pos: poker::training::opponent_profile::OpenPos::Early,
+            limped: false,
+        });
+        let holes = all_hole_combos();
+        let bp_raise = holes.iter().filter(|&&h| open_top(h)).count() as f64 / holes.len() as f64;
+        let f = rt
+            .exploit
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .spot_freqs(
+                "limper",
+                Some("hero"),
+                cell,
+                [bp_raise, 0.0, 1.0 - bp_raise],
+            )
+            .unwrap();
+        assert_eq!((f.n, f.n_pop), (30, 20));
+        let mean = coef.iter().sum::<f64>() / coef.len() as f64;
+        assert!((mean - f.f[1]).abs() < 1e-6, "mean={mean} f={f:?}");
+        let at = |a: &str, b: &str| {
+            coef[combo_index([parse_card(a).unwrap(), parse_card(b).unwrap()]).unwrap()]
+        };
+        let (aa, mid, trash) = (at("Ah", "Ad"), at("Ts", "9s"), at("7c", "2d"));
+        assert!(mid > 0.5, "T9s 应在平跟范围里: {mid}");
+        assert!(aa < 0.05 && trash < 0.05, "AA={aa} 72o={trash} T9s={mid}");
+        let snap = exploit_snapshot(&rt, &req, &cfg, 5, &smap, Some(&on.tilt)).unwrap();
+        assert!(snap.0[3].is_none(), "倾斜过的座不再做宽度修正");
+        let snap = exploit_snapshot(&rt, &req, &cfg, 5, &smap, None).unwrap();
+        assert!(snap.0[3].is_some(), "不传倾斜时照旧修正（CallBand）");
+
+        let off = inputs(&rt_with(false), &req);
+        assert_eq!(
+            off.tilt,
+            SeatTilt {
+                coefs: vec![None; 6],
+                nodes: vec![]
+            }
+        );
+        assert!(off
+            .decisions
+            .contains(&(limp_node, AbstractActionTag::Fold, 3)));
+        let mut anon = req.clone();
+        anon.names.remove(&3);
+        let no_name = inputs(&rt, &anon);
+        assert!(no_name.tilt.nodes.is_empty());
+        assert_eq!(no_name.decisions, off.decisions);
+    }
+
+    /// 倾斜流水线测试共用的 σ：169 类里 Chen 序前 15% 的牌把「非下标 0」的动作平分，其余全押下标 0
+    /// （开池 / 面对加注节点上下标 0 = 弃牌，大盲 option 上 = 过牌）。
+    fn top15_sigma() -> impl Fn(&InfoSetId, usize) -> Vec<f64> {
+        use poker::PreflopLossless169;
+        let classes = PreflopLossless169::new();
+        let mut top = vec![0.0f64; 169];
+        for h in all_hole_combos() {
+            top[classes.hand_class(h) as usize] = f64::from(u8::from(chen_top_fraction(h) < 0.15));
+        }
+        move |i: &InfoSetId, n: usize| {
+            let r = top.get(i.bucket_id() as usize).copied().unwrap_or(0.0);
+            let mut v = vec![r / (n - 1) as f64; n];
+            v[0] = 1.0 - r;
+            v
+        }
+    }
+
+    /// 一手只有翻前的观测：(各座名字, 按时间序的 (座, 动作))。
+    type PreflopHand<'a> = (Vec<(u8, &'a str)>, Vec<(u8, &'a str)>);
+
+    /// 喂一串只有翻前的 6 座手（button 0，全座发牌）。
+    fn profiler_from(cfg: ExploitConfig, hands: &[PreflopHand<'_>]) -> Profiler {
+        let mut p = Profiler::new(cfg);
+        for (names, acts) in hands {
+            p.observe_hand(&ObserveHand {
+                names: names.iter().map(|&(s, n)| (s, n.to_string())).collect(),
+                actions: acts
+                    .iter()
+                    .map(|&(seat, a)| poker::training::opponent_profile::ObsAction {
+                        seat,
+                        street: "preflop".into(),
+                        action: a.into(),
+                        contribution_delta: None,
+                        to_call_before: None,
+                    })
+                    .collect(),
+                button_seat: Some(0),
+                dealt_seats: (0..6).collect(),
+                posts: Vec::new(),
+            });
+        }
+        p
+    }
+
+    fn normalized(v: &[f64]) -> Vec<f64> {
+        let s: f64 = v.iter().sum();
+        v.iter().map(|x| x / s).collect()
+    }
+
+    /// 倾斜流水线（[`exploit_tilt`]）在画像为空（θ = 0）时退化成 blueprint 前缀：影子同步的线上（UTG 开池、
+    /// CO 跟注，测试树限两人入池），开池者（首入，平跟合成参考）与跟注者（面对开池）各当一次对手，系数
+    /// 归一后 ≈ 他前缀决策原始 σ 归一（差别只来自尾部底值，以及类内尺寸合并——同一节点尺寸数不变，归一后
+    /// 不影响）。只接管这个对手，`nodes` = 他的翻前前缀决策。预热（街起点影子节点）与决策
+    /// （街内更后的节点）算出同一份。
+    #[test]
+    fn exploit_tilt_empty_profile_matches_prefix() {
+        let game = nolimp_game();
+        let sigma = top15_sigma();
+        let pre = vec![
+            hist(3, "raise", Some(50)),
+            hist(4, "fold", None),
+            hist(5, "call", Some(50)),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+            hist(2, "fold", None),
+        ];
+        let prof = Profiler::new(ExploitConfig {
+            tilt: true,
+            ..ExploitConfig::default()
+        });
+        for (hero, opp) in [(3u8, 5u8), (5, 3)] {
+            let mut req = limp_req(hero, ["Qs", "Qd"], &["7h", "2c", "Ks"], pre.clone());
+            req.names = BTreeMap::from([
+                (hero, "hero".to_string()),
+                (opp, "opp".to_string()),
+                (4, "folder".to_string()),
+            ]);
+            let (_, abs, ..) = replay_limp(&game, &req, None, true).expect("同步到翻牌");
+            let (cfg, smap, ..) = coef_ctx(&req);
+            let tilt_at = |req: &Request, node: NodeId| {
+                exploit_tilt(
+                    &game,
+                    &sigma,
+                    &cfg,
+                    5,
+                    &smap,
+                    req,
+                    node,
+                    hero as PlayerId,
+                    &prof,
+                )
+            };
+            let t = tilt_at(&req, abs.current_node_id);
+            let prefix = synced_prefix_decisions(&game, abs.current_node_id);
+            let coef = t.coefs[opp as usize].as_ref().expect("被接管");
+            let mine: Vec<_> = prefix.iter().filter(|d| d.2 == opp as PlayerId).collect();
+            assert_eq!(mine.len(), 1, "{mine:?}");
+            let (node, tag, _) = *mine[0];
+            assert_eq!(t.nodes, vec![(node, opp as PlayerId)]);
+            let raw = raw_sigma_coef(&game, &sigma, node, tag);
+            let tv: f64 = normalized(coef)
+                .iter()
+                .zip(normalized(&raw))
+                .map(|(a, b)| (a - b).abs())
+                .sum();
+            // 跟注者的跟注类另有底值（面对一次加注，`class_reference`）：blueprint 不跟的 85% 组合上多出约 0.5e-3，
+            // 总变差略大；底值按 Chen 序单调（QJo 高于 72o，二者 blueprint 都不跟）。
+            assert!(tv < 0.03, "opp {opp} tv={tv}");
+            if opp == 5 {
+                let at = |a: &str, b: &str| {
+                    coef[combo_index([parse_card(a).unwrap(), parse_card(b).unwrap()]).unwrap()]
+                };
+                assert!(
+                    at("Qh", "Jd") > 2.0 * at("7h", "2d"),
+                    "跟注底值须按 Chen 序"
+                );
+            }
+            assert!((0..6).all(|s| s == opp as usize || t.coefs[s].is_none()));
+
+            // 街内更后的节点（预热 vs 决策）：系数逐位相同。
+            let mut later = req.clone();
+            later
+                .actions
+                .extend([hist(3, "check", None), hist(5, "bet", Some(60))]);
+            let (_, abs2, ..) = replay_limp(&game, &later, None, true).expect("同步");
+            assert_ne!(abs2.current_node_id, abs.current_node_id);
+            assert_eq!(tilt_at(&later, abs2.current_node_id), t);
+        }
+    }
+
+    /// 倾斜流水线的频率约束：单步座在均匀先验下的系数均值 = 画像给的该类频率。大盲 option 节点没有弃牌
+    /// （[`solve_tilt`] 跳过缺的类，频率在加注 / 过牌上重新归一，θ 有限）；SB 补齐节点本身有跟注，首入
+    /// 退回 [`class_reference`]。线：BTN 平跟（hero，平跟当弃牌）→ SB 补齐 → 大盲过牌 → `limper_in_pot`。
+    #[test]
+    fn exploit_tilt_frequencies_and_missing_class() {
+        let game = nolimp_game();
+        let sigma = top15_sigma();
+        let pre = vec![
+            hist(3, "fold", None),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "call", Some(20)),
+            hist(1, "call", Some(20)),
+            hist(2, "check", None),
+        ];
+        let mut req = limp_req(0, ["Qs", "Qd"], &["7h", "2c", "Ks"], pre.clone());
+        req.names = BTreeMap::from([
+            (0, "hero".to_string()),
+            (1, "sb".to_string()),
+            (2, "bb".to_string()),
+        ]);
+        let e = replay_limp(&game, &req, Some(SeatId(1)), true)
+            .err()
+            .unwrap();
+        assert_eq!(e.reason, "limp_as_fold:limper_in_pot");
+        // 画像：同一条线 bb 过牌 12 / 加注 8，sb 补齐 6 / 弃牌 9 / 加注 1；另有人群 x 在 sb 位弃牌 10 次。
+        let line = |sb: &'static str, bb: &'static str| {
+            let mut v = vec![(3, "fold"), (4, "fold"), (5, "fold"), (0, "call"), (1, sb)];
+            if sb != "raise" {
+                v.push((2, bb));
+            }
+            v
+        };
+        let names = |sb: &'static str| vec![(0, "hero"), (1, sb), (2, "bb")];
+        let mut hands = Vec::new();
+        hands.extend(std::iter::repeat_n((names("sb"), line("call", "check")), 6));
+        hands.extend(std::iter::repeat_n((names("sb"), line("fold", "check")), 9));
+        hands.extend(std::iter::repeat_n((names("sb"), line("raise", "")), 1));
+        hands.extend(std::iter::repeat_n((names("x"), line("call", "raise")), 8));
+        hands.extend(std::iter::repeat_n((names("x"), line("fold", "check")), 10));
+        let prof = profiler_from(
+            ExploitConfig {
+                tilt: true,
+                ..ExploitConfig::default()
+            },
+            &hands,
+        );
+        let (cfg, smap, ..) = coef_ctx(&req);
+        let t = exploit_tilt(&game, &sigma, &cfg, 5, &smap, &req, e.synced_node, 0, &prof);
+        let prefix = synced_prefix_decisions(&game, e.synced_node);
+        let node_of = |seat: PlayerId| prefix.iter().find(|d| d.2 == seat).unwrap().0;
+        let steps = preflop_real_steps(&req, &cfg, 5, &smap).unwrap();
+        let spots = req_preflop_spots(&req, &steps);
+        for (seat, name) in [(1u8, "sb"), (2, "bb")] {
+            let coef = t.coefs[seat as usize].as_ref().expect("被接管");
+            assert!(coef.iter().all(|c| c.is_finite() && *c > 0.0));
+            let node = node_of(seat as PlayerId);
+            let reference = class_reference(&game, &sigma, node, false);
+            let n = reference.len() as f64;
+            let target: [f64; 3] =
+                std::array::from_fn(|a| reference.iter().map(|r| r[a]).sum::<f64>() / n);
+            let d = spots.iter().find(|d| d.seat == seat).unwrap();
+            let f = prof.spot_freqs(name, Some("hero"), d.spot, target).unwrap();
+            let present: f64 = (0..3)
+                .filter(|&a| reference.iter().any(|r| r[a] > 0.0))
+                .map(|a| f.f[a].max(LIMP_TILT_MIN_FREQ))
+                .sum();
+            let want = f.f[SpotAct::Call as usize] / present;
+            let mean = coef.iter().sum::<f64>() / n;
+            assert!(
+                (mean - want).abs() < 1e-6,
+                "{name}: mean={mean} want={want} f={f:?}"
+            );
+        }
+        assert!(matches!(
+            spots.iter().find(|d| d.seat == 2).unwrap().spot,
+            PreflopSpot::BlindOption {
+                bb: true,
+                multi: true
+            }
+        ));
+        assert!(class_reference(&game, &sigma, node_of(2), false)
+            .iter()
+            .all(|r| r[SpotAct::Fold as usize] == 0.0));
+    }
+
+    /// 断点之后的决策用替身节点：UTG 平跟、BTN 隔离加注、UTG 跟注（`limper_continued` 失同步）。UTG 的
+    /// 平跟步（前缀里的映射弃牌）和面对隔离加注的跟注步（替身 = 大盲面对这次加注）都进系数，前缀里只删
+    /// 他的那一步映射弃牌；第二步确实乘上了（系数不与第一步成比例）。短码开池全下 → 宽度表系数。
+    #[test]
+    fn exploit_tilt_substitute_and_shove() {
+        let game = nolimp_game();
+        let sigma = top15_sigma();
+        let acts = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "raise", Some(100)),
+            hist(1, "fold", None),
+            hist(2, "fold", None),
+            hist(3, "call", Some(100)),
+        ];
+        let mut req = limp_req(0, ["Qs", "Qd"], &["7h", "2c", "Ks"], acts);
+        req.names = BTreeMap::from([(0, "hero".to_string()), (3, "limper".to_string())]);
+        let e = replay_limp(&game, &req, Some(SeatId(3)), true)
+            .err()
+            .unwrap();
+        assert_eq!(e.reason, "limp_as_fold:limper_continued");
+        let (cfg, smap, ..) = coef_ctx(&req);
+        let prof = Profiler::new(ExploitConfig {
+            tilt: true,
+            ..ExploitConfig::default()
+        });
+        let t = exploit_tilt(&game, &sigma, &cfg, 5, &smap, &req, e.synced_node, 0, &prof);
+        let (limp_node, limper) = e.limp.folds[0];
+        assert_eq!(limper, 3);
+        assert_eq!(t.nodes, vec![(limp_node, 3)]);
+        let coef = t.coefs[3].as_ref().expect("被接管");
+        let first: Vec<f64> = limp_reference(&game, &sigma, limp_node)
+            .unwrap()
+            .iter()
+            .map(|r| r[SpotAct::Call as usize])
+            .collect();
+        let ratios: Vec<f64> = coef.iter().zip(&first).map(|(c, f)| c / f).collect();
+        let (lo, hi) = ratios
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(l, h), &r| (l.min(r), h.max(r)));
+        assert!(
+            hi > lo * 2.0,
+            "第二步（替身节点上的跟注）没乘上：{lo}..{hi}"
+        );
+
+        // 短码（15BB）UTG 开池全下、大盲 hero 跟注。
+        let acts = vec![
+            hist(3, "all_in", Some(300)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "fold", None),
+            hist(2, "call", Some(300)),
+        ];
+        let mut req = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks"], acts);
+        req.stacks[3] = 300;
+        req.names = BTreeMap::from([(2, "hero".to_string()), (3, "shover".to_string())]);
+        let (cfg, smap, ..) = coef_ctx(&req);
+        let synced = match replay_limp(&game, &req, None, true) {
+            Ok((_, abs, ..)) => abs.current_node_id,
+            Err(e) => e.synced_node,
+        };
+        let t = exploit_tilt(&game, &sigma, &cfg, 5, &smap, &req, synced, 2, &prof);
+        let width = allin_range_width(1500, 100, true, limp_pos(3, 6));
+        assert_eq!(t.coefs[3].as_deref(), Some(shove_coef(width).as_slice()));
+    }
+
+    /// [`solve_tilt`]：节点上缺一类（参考概率处处为 0）时 θ 有限、该类 θ = 0，其余两类的边际 = 频率在它们
+    /// 上重新归一。
+    #[test]
+    fn solve_tilt_missing_class() {
+        let refs: Vec<[f64; 3]> = (0..100)
+            .map(|i| {
+                let x = i as f64 / 99.0;
+                [0.05 + 0.9 * x, 0.95 - 0.9 * x, 0.0]
+            })
+            .collect();
+        let prior = vec![1.0; 100];
+        let theta = solve_tilt(&refs, &prior, [0.2, 0.6, 0.2]);
+        assert!(theta.iter().all(|t| t.is_finite()), "{theta:?}");
+        assert_eq!(theta[SpotAct::Fold as usize], 0.0);
+        let w = theta.map(f64::exp);
+        let m: f64 = refs
+            .iter()
+            .map(|r| r[0] * w[0] / (r[0] * w[0] + r[1] * w[1]))
+            .sum::<f64>()
+            / 100.0;
+        assert!((m - 0.25).abs() < 1e-8, "m={m}");
+    }
+
     /// limp 池 hero 系数测试共用：6 座（button=0）真栈重放的入参。
     fn coef_ctx(req: &Request) -> (TableConfig, SeatMap, SeatId, [Card; 2]) {
         let smap = seat_map(req, 6).expect("seat_map");
@@ -6974,18 +8583,8 @@ mod tests {
             .iter()
             .any(|&(_, t, s)| s == 0 && t == AbstractActionTag::Fold));
         let (cfg, smap, hero, hole) = coef_ctx(&req);
-        let (kept, c2) = unanchored_range_inputs(
-            &game,
-            &cfg,
-            &smap,
-            &req,
-            5,
-            hero,
-            hole,
-            e.synced_node,
-            &e.limp,
-            true,
-        );
+        let (kept, c2) =
+            range_inputs_t(&game, &cfg, &smap, &req, hero, hole, e.synced_node, &e.limp);
         assert_eq!(c2, c);
         assert!(!kept.iter().any(|&(_, _, s)| s == 2), "{kept:?}");
         assert!(!kept.iter().any(|&(_, _, s)| s == 0), "{kept:?}");
@@ -7016,18 +8615,8 @@ mod tests {
             .err()
             .unwrap();
         let (cfg, smap, hero, hole) = coef_ctx(&req);
-        let (kept, _) = unanchored_range_inputs(
-            &game,
-            &cfg,
-            &smap,
-            &req,
-            5,
-            hero,
-            hole,
-            e.synced_node,
-            &e.limp,
-            true,
-        );
+        let (kept, _) =
+            range_inputs_t(&game, &cfg, &smap, &req, hero, hole, e.synced_node, &e.limp);
         assert!(
             kept.iter()
                 .any(|&(_, t, s)| s == 2 && t == AbstractActionTag::Call),
@@ -7147,18 +8736,8 @@ mod tests {
         assert_eq!(e.limp.folds.len(), 2, "{:?}", e.limp);
         let (cfg, smap, hero, hole) = coef_ctx(&req);
         assert_eq!(limp_raisers(&req, &cfg, 5, &smap, &e.limp, 0), vec![4]);
-        let (kept, c) = unanchored_range_inputs(
-            &game,
-            &cfg,
-            &smap,
-            &req,
-            5,
-            hero,
-            hole,
-            e.synced_node,
-            &e.limp,
-            true,
-        );
+        let (kept, c) =
+            range_inputs_t(&game, &cfg, &smap, &req, hero, hole, e.synced_node, &e.limp);
         assert!(kept
             .iter()
             .any(|&(_, t, s)| s == 3 && t == AbstractActionTag::Fold));
@@ -7184,18 +8763,7 @@ mod tests {
                 .err()
                 .unwrap();
             let (cfg, smap, hero, hole) = coef_ctx(req);
-            unanchored_range_inputs(
-                &game,
-                &cfg,
-                &smap,
-                req,
-                5,
-                hero,
-                hole,
-                e.synced_node,
-                &e.limp,
-                true,
-            )
+            range_inputs_t(&game, &cfg, &smap, req, hero, hole, e.synced_node, &e.limp)
         };
         let (d_flop, c_flop) = inputs(&flop);
         let (d_turn, c_turn) = inputs(&turn);
@@ -9246,6 +10814,127 @@ mod tests {
     /// （[`exploit_snapshot`]）→ hero 首决策命中预热 solve、实际剥削（`exploit` 遥测非空）、输出
     /// byte-equal 现解。对照：不带画像的预热（旧行为）→ 决策 key 不同、miss 重解，证剥削 ranges
     /// 确实进 key、上面的命中不是空转。走 `--search-force-unanchored` 的锚定面（两条改动一起钉）。
+    /// `--exploit-tilt on` 端到端：SB 开池、BB（hero）跟注、翻牌脱锚（force_unanchored）。预热与决策算出
+    /// 同一份倾斜系数 → 决策命中预热；SB 被流水线接管（不再做宽度修正）；与不开倾斜的预热 key 不同。
+    #[test]
+    fn prewarm_unanchored_exploit_tilt_hits() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let sigma = top15_sigma();
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            range_uniform_mix: 0.25,
+            ..SubgameSearchConfig::default()
+        };
+        // villain 在 SB 首入 20 手：加注 8、弃牌 12（带座位信息 → 进局面格）。
+        let line = |a: &'static str| {
+            let mut v = vec![(3, "fold"), (4, "fold"), (5, "fold"), (0, "fold"), (1, a)];
+            if a == "raise" {
+                v.push((2, "fold"));
+            }
+            v
+        };
+        let hands: Vec<_> = (0..20)
+            .map(|k| {
+                let a = if k % 5 < 2 { "raise" } else { "fold" };
+                (vec![(1, "villain"), (2, "hero")], line(a))
+            })
+            .collect();
+        let rt_with = |tilt: bool| SearchRuntime {
+            force_unanchored: true,
+            exploit: Some(RefCell::new(profiler_from(
+                ExploitConfig {
+                    tilt,
+                    pfr_shape: true,
+                    ..ExploitConfig::default()
+                },
+                &hands,
+            ))),
+            ..rt_prefix_reach(scfg)
+        };
+        let mut pre = flop_first_unraised_req(vec![2000; 6]);
+        pre.my_seat = 2;
+        pre.hole = vec!["Qs".into(), "Qd".into()];
+        pre.names = BTreeMap::from([(1, "villain".to_string()), (2, "hero".to_string())]);
+        pre.actions[4] = HistAction {
+            seat: 1,
+            action: "raise".into(),
+            to: Some(60),
+        };
+        pre.actions[5] = HistAction {
+            seat: 2,
+            action: "call".into(),
+            to: None,
+        };
+        pre.valid.max_raise = Some(1940);
+        let mut req = pre.clone();
+        req.actions.push(HistAction {
+            seat: 1,
+            action: "check".into(),
+            to: None,
+        });
+
+        let rt_on = rt_with(true);
+        let (cfg, smap, hero, hole) = coef_ctx(&req);
+        let villain = smap.tree_seat(1).unwrap() as usize;
+        let (_, shadow, ..) = replay_limp(&game, &req, Some(hero), true).expect("同步");
+        let ri = unanchored_range_inputs(
+            &game,
+            &sigma,
+            &cfg,
+            &smap,
+            &req,
+            5,
+            hero,
+            hole,
+            shadow.current_node_id,
+            &LimpFoldMap::default(),
+            &rt_on,
+        );
+        assert!(ri.tilt.coefs[villain].is_some(), "SB 开池者被接管");
+        assert!(
+            !ri.decisions
+                .iter()
+                .any(|d| d.2 as usize == villain
+                    && game.tree().node(d.0).street == StreetTag::Preflop)
+        );
+        let snap = exploit_snapshot(&rt_on, &req, &cfg, 5, &smap, Some(&ri.tilt)).unwrap();
+        assert!(snap.0[villain].is_none(), "接管的座不再做宽度修正");
+
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(&game, &sigma, &pre, 0xE7B2, Some(&rt_on), &mut cache);
+        assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+        let r = decide(&game, &abs, &sigma, &req, 0xE7B2, Some(&rt_on), &mut cache);
+        assert_eq!(r.source, "search:unanchored", "得 {r:?}");
+        assert_eq!(
+            (cache.misses(), cache.hits()),
+            (1, 1),
+            "带倾斜的预热须被决策命中"
+        );
+
+        let mut cache_off = SubgameSolveCache::new();
+        let p = prewarm(
+            &game,
+            &sigma,
+            &pre,
+            0xE7B2,
+            Some(&rt_with(false)),
+            &mut cache_off,
+        );
+        assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+        decide(
+            &game,
+            &abs,
+            &sigma,
+            &req,
+            0xE7B2,
+            Some(&rt_on),
+            &mut cache_off,
+        );
+        assert_eq!(cache_off.misses(), 2, "开 / 关倾斜的范围不同 → key 不同");
+    }
+
     #[test]
     fn prewarm_unanchored_applies_exploit_profile() {
         let game = nolimp_game();
@@ -9278,6 +10967,7 @@ mod tests {
                         contribution_delta: None,
                         to_call_before: None,
                     }],
+                    ..Default::default()
                 });
             }
             assert!(
@@ -9307,8 +10997,9 @@ mod tests {
         let smap = seat_map(&complete, 6).expect("seat_map");
         let villain = smap.tree_seat(1).unwrap() as usize;
         let snap = |r: &Request| {
-            let (profiles, _, _) = exploit_snapshot(&exploit_rt(), r, &solver_cfg, scale, &smap)
-                .expect("--exploit 开");
+            let (profiles, _, _) =
+                exploit_snapshot(&exploit_rt(), r, &solver_cfg, scale, &smap, None)
+                    .expect("--exploit 开");
             profiles[villain]
         };
         assert!(snap(&complete).is_none(), "SB 补齐不该剥削");
@@ -10424,6 +12115,48 @@ mod tests {
             .exploit
             .expect("exploit on");
         assert!(!e.pfr_shape, "--exploit vpip → 仅 VPIP（TopK）");
+        // --exploit-limp-tilt：默认关；开要 --exploit on|vpip + --search-limp-as-fold on，脏值拒收。
+        assert!(!e.limp_tilt, "--exploit-limp-tilt 默认关");
+        let tilt = |extra: &[&str]| {
+            let mut v = vec!["--search", "--exploit", "on"];
+            v.extend_from_slice(extra);
+            parse(&v)
+        };
+        let e = tilt(&["--search-limp-as-fold", "on", "--exploit-limp-tilt", "on"])
+            .expect("parse Ok")
+            .exploit
+            .expect("exploit on");
+        assert!(e.limp_tilt);
+        assert!(
+            tilt(&["--exploit-limp-tilt", "on"]).is_err(),
+            "没开 --search-limp-as-fold 应拒收（倾斜永远不生效）"
+        );
+        assert!(tilt(&["--search-limp-as-fold", "on", "--exploit-limp-tilt", "x"]).is_err());
+        assert!(
+            parse(&[
+                "--search",
+                "--search-limp-as-fold",
+                "on",
+                "--exploit-limp-tilt",
+                "on"
+            ])
+            .is_err(),
+            "--exploit-limp-tilt 无 --exploit 应拒收"
+        );
+        // --exploit-tilt：默认关；只要 --exploit on|vpip（不强制 --search-limp-as-fold），脏值拒收。
+        assert!(!e.tilt, "--exploit-tilt 默认关");
+        assert!(
+            tilt(&["--exploit-tilt", "on"])
+                .expect("parse Ok")
+                .exploit
+                .expect("exploit on")
+                .tilt
+        );
+        assert!(tilt(&["--exploit-tilt", "x"]).is_err());
+        assert!(
+            parse(&["--search", "--exploit-tilt", "on"]).is_err(),
+            "--exploit-tilt 无 --exploit 应拒收"
+        );
         // 子旗覆盖（on 接子旗）。
         let a = parse(&[
             "--search",
@@ -13653,6 +15386,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             actions: vec![act(3, "raise", 70, 20), act(0, "raise", 240, 70)],
+            ..Default::default()
         };
         let mut t = FourBetTracker::new(FourBetConfig::default());
         for _ in 0..n {

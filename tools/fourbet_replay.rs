@@ -106,6 +106,7 @@ fn observe(x: &HhLine) -> ObserveHand {
                 to_call_before: a.to_call_before,
             })
             .collect(),
+        ..Default::default()
     }
 }
 

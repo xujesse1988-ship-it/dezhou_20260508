@@ -3,6 +3,8 @@
 代码口径：`fa72600`（分支 `feat/real-hand-forced-deal`）。只读调研，**没改代码**。
 **2026-10-30 更新**：§2.1 / §2.2 已在 `94c3233` 修掉，画像收缩已在 `ff4302e` 上线（§1 表 ⑥ 已按现状改写）；
 补了评审意见和翻前 σ 渐变度实测（§4.7），据此改了 §4.1 的抖动位置、§4.3 的收缩目标、§4.4 的复用方式、§5 的评估口径和 §6 的顺序。
+**2026-10-31 更新**：§7.2 补齐倾斜的两样输入（局面格统计 + 替身节点）；§7.3 是接流水线的交接说明。
+**2026-10-31 再更新**：流水线已接上（`--exploit-tilt`，§7.4），§7.3 的三个拍板项按建议定；回放后改了拍板 3（面对一次加注时跟注类也套底值，§7.4 问题 1），下一步见 §7.4 末尾。
 标注约定：**[事实]** = 代码逐行确认；**[推断]** = 有代码 / 数据支撑但没直接验证；**[计算]** = 按代码公式手算的示意数；
 **[实测]** = 跑 blueprint 数据得到。
 
@@ -312,3 +314,260 @@ hero 的翻前决策函数是确定的（给定请求和底牌，输出一个分
    第一步是从 `decide_with` 抽出翻前纯函数。
 4. **对手侧倾斜**（§4.1–4.3）：先只在锚定前缀上替换画像修正（参考策略 = blueprint 节点，原始 σ 倾斜 + 第二排序键，
    收缩分层），A/B；再加替身节点、平跟合成、全下 σ_ref，逐个删掉 §4.5 的旧特例。
+
+## 7. 实施记录（2026-10-30，转向 wopo 后）
+
+主线转向 wopo、只看 wopo 牌局。wopo 三轮共 246 手，翻前全下亮牌只有 17 个，§5 的尺子短期内量不出东西，
+**评估工具暂缓**，先按「范围看起来合不合理」判断。wopo 实盘没开 PM-17 和 `--search-force-unanchored`，
+翻前约一半决策走平跟启发式、翻后过半是脱锚搜索（平跟池），所以先做 §4.2 里对 wopo 影响最大的一项：
+**平跟者的参考策略合成 + 未开池频率倾斜**，`--exploit-limp-tilt on|off`（默认关，需 `--exploit on|vpip` +
+`--search-limp-as-fold on`）。
+
+- **统计**（`opponent_profile.rs`）：`unopened_decisions` 把一手翻前里「没人加注时非大盲、非补盲座的第一个动作」
+  按「位置组（EP / MP / CO / BTN / SB，与 `opponent_analysis/replay.py` 的位置标签 + `position_class` 一致）×
+  前面有没有平跟者」分格，记加注 / 平跟 / 弃牌。advisor 判本手平跟者的格也调它，局面分类只有一份。
+  对拍：wopo 三轮 545 个首入决策与 `spots.py` 的 `rfi` 逐条一致；唯一差别是补盲者（live 1BB）开池加注，
+  `spots.py` 记进 `rfi`（但不记他们的过牌，补盲者加注率被高估），这里不记。observe 新增
+  `button_seat / dealt_seats / posts`（wopo driver 已发；旧 driver 不带 → 这部分不统计）。
+- **收缩**（§4.3 简化版两层）：人群本格（不含本人和 hero）先按 10 条伪样本往 blueprint 边际 [加注, 0, 弃牌] 收，
+  本人本格再按 `cell_shrink_k = 30` 往收过的人群收；本人和人群都没有样本 → 不倾斜（保持旧做法）。
+  §4.3 第 2 层（本人跨格整体松紧）没做。
+- **参考策略**（§4.2 平跟一行）：在平跟者面对的影子节点（no-limp 树里的开池节点）上，加注 = blueprint 全部加注 /
+  全下概率之和；弃牌部分按平跟种子 `q = logistic(−10·(Chen 序分位 − 0.5))` 拆成平跟与弃牌。
+  种子用 Chen 序而不是 blueprint 残余值：blueprint 没有平跟，平跟内部的先后只能另给；Chen 序也是 hero 平跟启发式
+  用的序，两边一致。两类尾部先套 §4.1 的第二排序键（底值 1e-3，按 Chen 序单调）。
+- **倾斜**（§4.1）：`σ_opp(a|h) ∝ σ_ref(a|h)·e^{θ_a}`，先验均匀（平跟是他本手第一个动作），迭代缩放解 θ 使三类边际
+  = 收缩频率；平跟那一步的系数 = `σ_opp(平跟|h)`，代替原来的「blueprint 弃牌概率」，乘在 25% 均匀平滑之前。
+  倾斜过的座不再做宽度修正（画像已经用过一次）。平跟后又加注的人、补盲者过牌、hero 自己：都不动，保持旧做法。
+- **没做**：锚定前缀上的倾斜、替身节点、全下 σ_ref、hero 通用重放（§6 第 3、4 步其余部分）。
+
+### 7.1 离线回放：范围长什么样（2026-10-30）[实测]
+
+做法：wopo 三轮 hh（246 手）先全部当 observe 喂进画像（离线先验），再对 hero 看到翻牌的 73 手各发一条翻牌街起点预热请求；
+advisor 用 200BB ante-flop2-3bet 9B 的**翻前 crop**（`nlhe_dense_crop --from-crop` 从翻前 + 翻牌 crop 流式再裁，0.46 GiB，
+本机 3 GB 内存放得下）+ `--debug-log`，搜索预算压到最小，只看 solve 前打印的根范围（新增 13×13 牌型格）。
+开 / 关 `--exploit-limp-tilt` 各跑一遍，44 次脱锚 solve，75 个平跟者范围被倾斜。
+
+- **隔离**：没被倾斜的 102 个座位范围、全部响应来源，两遍逐字相同。
+- **人群频率**：未开池时 wopo 人群加注 8%–20%（前位）/ 26%–30%（CO / BTN，前面有人平跟），blueprint 是 25%–38% / 51%–75%；
+  平跟 25%–47%。所以 θ_raise ≈ −5 … −11：blueprint 会开池、这些人不加注的牌被推到平跟里。
+- **形状**（UTG 首入平跟者，同一手开 / 关对比）：
+  - 关（现生产）：72o、83o、52o 这类杂色小牌权重最高，高张和 A 几乎是地板——「开池范围之外的所有牌」，
+    这份 blueprint 带 ante 开得很宽（UTG 30%、BTN 75%），所以更偏垃圾牌；BTN 跟着平跟的人只剩 54o–32o 一带。
+  - 开：中等高张（J9o、T9o、QJ、KT）、各种 A、小对子、同花连张权重高；AA / KK / QQ / AK 低（留在加注里）；杂色垃圾牌只剩均匀平滑的地板。
+- **数据不够的格**：BTN 首入只有 12 条人群样本，加注率被收到接近 blueprint（0.59），平跟范围仍挤在最下面 25%（小杂色连张）。
+  这是样本问题，攒数据后会自己变。
+- **种子的副作用**：43s、32s 这类小同花连张权重偏高（6–8 / 9），来自 Chen 序给同花、连张加分。对 wopo 不算离谱，但这是种子的选择决定的。
+
+### 7.2 倾斜的两样输入：局面格统计 + 替身节点（2026-10-31）
+
+§0 第 4 条的流水线（每个对手决策 → 参考策略 → 倾斜 → 乘）缺两样输入：除「首入」以外局面的实测频率，和断点之后决策的参考策略节点。
+这次只把这两样做出来，**还没接进范围估计**（流水线本身是下一步），生产行为不变：默认配置下逐位相同；
+`--exploit-limp-tilt on` 时平跟者的频率会多出第 2 层（见下）。参数都按结构和保守原则给，没有按现有 wopo 数据调。
+
+**局面格统计**（`opponent_profile.rs` `preflop_spots` / `Profiler::spot_freqs`）：
+
+- 局面分类从「首入」扩成五类，每个翻前决策按动作前的局面归格，归不进的（面对 4bet、冷跟 3bet 等）不分类：
+
+  | 局面类 | 条件 | 格 | 动作 |
+  |---|---|---|---|
+  | `Unopened`（= 原首入） | 没人加注、非大盲 / 补盲者 | 位置组 × 前面有没有人跟 | 加注 / 平跟 / 弃 |
+  | `BlindOption` | 没人加注、轮到大盲或补盲者 | 是不是大盲 × 前面跟注 ≥ 2 人 | 加注 / 过牌 |
+  | `VsOpen` | 本手第一个动作、面对恰好一次加注 | 位置大类 × 加注后有没有人跟 | 3bet / 跟 / 弃 |
+  | `LimpVsRaise` | 没人加注时平跟（或补盲过牌）过，之后第一次面对恰好一次加注 | 位置大类 | 再加注 / 跟 / 弃 |
+  | `Vs3bet` | 开池者第一次面对两次加注 | 位置大类 | 4bet / 跟 / 弃 |
+
+  位置大类 = `replay.py` `position_class`（EP / MP / LP / 盲位）。advisor 判本手决策所在的格也调同一个函数；
+  advisor 侧的输入改由真栈重放给出（`preflop_real_steps`，按当时合法集判，短码全下只够跟注 = 跟注），平跟者倾斜也换用它。
+- **收缩分层**（§4.3 的 1–3 层，原来只有 1、3 层）：人群本格往 blueprint 边际收 10 条伪样本 → 乘上「本人整体松紧」→
+  本人本格往它收 `cell_shrink_k`（30）条。「本人整体松紧」= 他在**同一局面类其余格**的实测，相对「人群在这些格、按他每格样本数加权」的期望，
+  逐动作类的比值，比值先按 `cell_shrink_k` 往 1 收；只用其余格，本格样本不重复计。哪一层没样本就等于上一层，所以格子切多细不用看数据量定。
+  离线库（第 2、3 层之间）没做。
+- **对拍**：`spots.py` 补了 `vs_limp`、`blind_option`、`limp_vs_raise` 三类（口径同上表）。wopo 三轮 hh 上，两边都能解析的 230 手共 1910 个决策
+  **逐条一致**；差异只有 3 条，都是补盲者在没人加注时加注——`spots.py` 同时记进 `rfi`，这里只记 `BlindOption`（已知差异，`rfi` 原口径不动）。
+  另有 8 手 `spots.py` 重放拒收（Rust 侧照常分类）。对拍脚本是临时的，没提交。
+- 已知口径差：实盘 driver 只开 `--exploit`（不开 `--exploit-4bet`）时 observe 不带投入金额，短码「全下只够跟注」会被画像记成加注
+  （`spots.py` 和 advisor 侧按金额判）。wopo 三轮 2182 个翻前动作里没有一个「`all_in` 但只够跟注」（wopo 这种情况记成 `call`），暂不处理。
+
+**替身节点**（`openpoker_advisor.rs` `spot_substitute`）：从树根按「脚本」走一条规范路径——脚本里的座位按真实动作（加注按池比例映射到最近的抽象档），
+其余座一律弃牌——走到替身行动者停下：
+
+| 局面类 | 脚本 | 替身行动者 |
+|---|---|---|
+| `Unopened` | 空（前面平跟的人当弃牌，同平跟当弃牌映射） | 本座 |
+| `BlindOption` | SB 补齐（树里唯一一条「没人加注到大盲」的线；补盲者也用它） | 大盲 |
+| `VsOpen` | 开池者加注 + 加注后的跟注者跟注 | 本座 |
+| `LimpVsRaise` | 树里没有平跟，用「已投入 1BB、面对这次加注」的盲位代替：加注者不是大盲 → 加注者加注 + 跟注者跟注（大盲自己那一步除外）；加注者是大盲 → SB 补齐、大盲加注 | 大盲 / SB |
+| `Vs3bet` | 本座开池 + 开池后跟注者 + 3bet + 3bet 后跟注者 | 本座 |
+
+平跟者（没人加注时跟注过的人，含 SB 补齐）在脚本里一律当弃牌，同平跟当弃牌映射，他们之后的跟注也不进脚本。
+脚本按真实时间序消耗，树里复现不了这个顺序（例如平跟者在隔离加注后再加注：树里他会先于开池者行动）、脚本动作不合法、
+提前进翻牌 → 不给节点（这一步仍按无信息处理），不给错节点。
+
+- 测试：影子能同步的线上，每个分了类的决策的替身 = lockstep 实际走到的节点（首入、面对开池有 / 无跟注者、面对 3bet）；平跟后面对隔离加注的替身 =
+  lockstep 在大盲那一步的节点；复现不了的线返回空。
+- 离线回放（同 §7.1 的设置，翻前 crop + `--debug-log`，wopo 150 条翻后请求）：替身节点目前只在 `--debug-log` 里按决策打印
+  （`spot_substitute:` 行，含树上路径），给下一步核对「替身选得对不对」。按手去重后 328 个对手翻前决策 [实测]：
+
+  | 局面类 | 决策数 | 有替身 |
+  |---|---:|---:|
+  | `Unopened` | 209 | 209 |
+  | `BlindOption` | 20 | 20 |
+  | `VsOpen` | 64 | 64 |
+  | `LimpVsRaise` | 31 | 31 |
+  | `Vs3bet` | 4 | 2 |
+
+  没给替身的 2 个都是「平跟者在隔离加注后再加注、隔离加注者面对」，树里复现不了，按设计返回空。
+  回放中途修了两处：大盲自己跟隔离加注的那一步被写进脚本（替身走过头）、多个平跟者时第一个平跟者的跟注排序复现不了
+  （改成平跟者一律当弃牌），修之前 `LimpVsRaise` 只有 24 / 61（未去重）有替身。
+  替身「对不对」目前只核对了路径形状（行动者、走过的动作），参考策略本身合不合理要等流水线接上后看范围。
+
+### 7.3 下一步交接：把流水线接上（2026-10-31，新会话从这里开始）
+
+**状态**：§7、§7.2 的代码都在分支 `feat/real-hand-forced-deal` 的工作区里，**没有提交**（工作区还混着别的未提交改动，提交前先按文件分清）。
+§7.2 的两样输入已就绪、有测试；默认配置下生产行为不变。下面是「每个对手决策 → 参考策略 → 倾斜 → 乘」本身怎么接。
+
+**目标**：新开关 `--exploit-tilt on|off`（默认关，需 `--exploit on|vpip`）。开时，对每个有名字的对手座，用一份逐组合系数
+代替他翻前那几步的 blueprint 前缀 reach 和宽度修正；关时逐位不变。`--exploit-limp-tilt` 是它的子集（只管首入平跟那一步），
+开了 `--exploit-tilt` 就不再单独走 `limp_tilt`。hero 侧不在这一步里（仍是 `hero_limp_coef`，§4.4 另做）。
+
+**现在的数据流**（都在 `tools/openpoker_advisor.rs` / `src/training/subgame.rs`）：
+
+- `unanchored_range_inputs`（advisor）算三样：前缀决策三元组（`unanchored_prefix_decisions`，已删掉 hero 被系数替代的步和 `limp_raisers`）、
+  hero 系数、平跟者倾斜 `LimpTilt { coefs, nodes }`；被倾斜替代的弃牌映射步从三元组里删掉。决策（`decide_search_unanchored`）和预热（`prewarm`）共用它，
+  两路必须算出同一份，否则 solve 缓存 key 对不上。
+- `PrefixReach { decisions, hero_coef, seat_coefs }` 进 `subgame_search_unanchored_*_cross_exploit`：每座 `estimate_range(skip_all_in=true)`
+  → 乘 `seat_coefs[seat]`（`apply_hero_coef`）→ `mix_range_with_uniform`（对手 25%）。
+- 之后 `apply_exploit_width_prior` 对有画像的座做宽度修正；`exploit_snapshot` 里 `LimpTilt::seat(tree)` 为真的座跳过（避免同一份画像用两次）。
+- 画像只进脱锚搜索；锚定搜索（`subgame_search_cached`）不读画像。
+
+**要写的**：一个纯函数（例如 `tilt_coefs(game, strategy_fn, solver_cfg, scale, smap, req, hero, prof) -> TiltCoefs { coefs, seats }`），
+放进 `RangeInputs` 代替 `limp_tilt`，结果走现成的 `seat_coefs` 通道。对每个对手座：
+
+1. `preflop_real_steps` + `req_preflop_spots` 取出他本手的翻前决策（按时间序）；`prior` 从均匀开始，逐步乘。
+2. 每个决策选参考策略：
+   - 分了类的决策 → `spot_substitute` 给节点。影子同步的线上它就等于 lockstep 节点（有测试），所以锚定 / 断点后不用分两套。
+     `Unopened` 的平跟走 `limp_reference`（开池节点上合成三类）；其余在节点上把动作标签并成三类：加注 = `Raise/Bet/AllIn` 之和，跟 = `Call/Check`，弃 = `Fold`。
+   - 没分类的决策（面对 4bet、冷跟 3bet、平跟后再加注等）→ 在同步前缀里的，照旧乘原始 σ（不倾斜）；不在的，因子 1。
+   - 实际动作是树外的短码全下（真栈下 `AllIn`）→ 用 `allin_range_width` 的宽度表当这一步的系数（见下「要拍板的」）。
+   - 两类尾部先套第二排序键底值（`LIMP_TILT_TAIL_FLOOR`，按 Chen 序单调），同 `limp_reference`。
+3. 频率：`prof.spot_freqs(name, hero_name, spot, prior_bp)`，`prior_bp` = 参考策略按 `prior` 加权的三类边际（平跟那步先验均匀，所以 `limp_tilt` 用的是简单平均，结果一致）。
+   返回 `None` → θ=0（等于直接乘原始参考策略）。
+4. `solve_tilt(ref, prior, f)` 解 θ，系数 = `σ_opp(实际动作类 | h)`，乘进该座系数，`prior` 也乘上它进入下一步。
+5. 这个座翻前所有被系数覆盖的步，从前缀三元组里删掉（只删翻前；翻后街的决策照旧留给 `estimate_range`）；`exploit_snapshot` 里跳过这些座的宽度修正。
+   均匀平滑 λ 不动，仍在最后。
+
+**容易踩的坑**：
+
+- **节点上缺某一类动作**：`BlindOption` 没有弃牌；面对全下的节点没有加注。`solve_tilt` 现在三类都解，参考概率全为 0 的那类会让 `ln(f/0)` 发散。
+  要先把缺的类去掉、频率在剩下的类上重新归一再解。`limp_reference` 不会遇到（三类都有），所以现在没暴露。
+- **加注尺寸**：§4.1 说「类内保持 σ_ref 比例」。v1 建议系数只用类的总概率，不再乘「映射到的那个尺寸占比」：wopo 的尺寸跟 blueprint 的抽象档对不上，
+  按档切只会放大映射误差。3bet / 4bet 里「全下 vs 非全下」是否要分开，留到看过范围再说。
+- **频率口径**：`spot_freqs` 是历史平均，`prior` 是本手的（§4.6 已知近似）。不要试图修。
+- **预热和决策同源**：新函数只能读请求、画像快照、blueprint，不能读任何会在一手内变化的状态。加一条测试：同一请求在决策和预热两路得到同一份系数。
+- **观察口径**：画像的格要靠 observe 里的 `button_seat / dealt_seats / posts`；缺了这些的旧 driver 数据整手不统计，对应座 `spot_freqs` 只剩人群层。
+
+**要拍板的（实现前先定，写进这里）**——2026-10-31 都按建议定了，实现见 §7.4：
+
+1. 树外短码全下：直接用宽度表当系数（不倾斜），还是拿该格的加注频率再倾斜一次？画像里没有单独的「全下频率」，建议 v1 不倾斜。
+   **定：不倾斜**。
+2. `--exploit-tilt on` 时是否还保留 `--search-limp-as-fold` 的要求：替身节点本身不需要它，但 wopo 上不开它很多手到不了脱锚搜索；建议不强制，只在文档里写明。
+   **定：不强制**（`--exploit-tilt` 只要 `--exploit on|vpip`）。wopo 上要让平跟池进脱锚搜索，仍需另开 `--search-limp-as-fold on`。
+3. 第二排序键要不要推广到所有动作类：`call` 一栏 Chen 序是反的（§4.7 第 4 条），建议只给加注 / 弃牌两类套底值，跟注类不套。
+   **定：跟注类不套**。回放看到这条在「面对开池」上有代价（§7.4 问题 1），**2026-10-31 改为**：面对一次加注（`VsOpen`、`LimpVsRaise`）
+   跟注类也套底值（强牌高），面对 3bet（`Vs3bet`）仍不套。
+
+**验证**（只跑相关测试，按测试名、套 1.2G 内存；参数不按 wopo 数据调）：
+
+- 单元测试：
+  - 画像为空、频率 = blueprint 边际时 θ≈0：同步线上新系数 × 均匀 = 旧 `estimate_range` 的结果（关掉底值比对，或给容差）。这是最强的一条一致性测试。
+  - 缺类节点（`BlindOption`、面对全下）θ 有限、边际对得上。
+  - 开关关时 `RangeInputs` 与现在逐位相同（沿用 `prewarm_unanchored_applies_exploit_profile` 那类测试的写法）。
+- 离线回放（§7.1 做法）：wopo 三轮 hh 每手先作为 observe 行喂进 advisor（要带 `--exploit on`），再发翻后请求，`--debug-log` 看根范围的 13×13 格，开 / 关各一遍：
+  - 关时响应和根范围逐字相同；
+  - 开时重点看 `VsOpen` 跟注 / 3bet、`LimpVsRaise`、`Vs3bet` 几类范围是否合理（这是替身「选得对不对」第一次能看到）。
+  - 翻后请求的生成（去重、只留 ante = 1BB 的桌）：
+
+    ```python
+    for f in ["artifacts/wopo_ante_live_20261028", "artifacts/wopo_ante200_live_20261028",
+              "artifacts/wopo_ante200_9b_exploit_live_20261029"]:
+        for line in open(f + "/wopo_actions_log.jsonl"):
+            r = json.loads(line)["req"]
+            # 保留 r["board"] 非空、r["ante"] == r["big_blind"]，按 (hole, button_seat, len(board)) 去重
+    ```
+
+  - advisor 命令（本机 3G，翻前 crop 峰值约 2.3G，用 2600M 上限）：
+
+    ```bash
+    systemd-run --user --scope -q -p MemoryMax=2600M -p MemorySwapMax=0 timeout 3000 \
+      ./target/release/openpoker_advisor --seats 8 --ante 100 --stack-bb 200 \
+      --cropped-checkpoint artifacts/run_8max_ante100_200bb_antefl2_3bet_cap4_b500/nlhe_8max_ante100_200bb_antefl2_3bet_cap4_b500_9b_preflop_stratonly.crop \
+      --bucket-table artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin \
+      --reshape ante-flop2-3bet --postflop-cap 4 --search --search-trigger all-postflop --search-deep-menu \
+      --search-max-nodes 50000 --search-solve-threads 1 --search-iterations 100 --search-iterations-turn 100 \
+      --search-iterations-river 100 --search-time-budget-ms 100 --search-limp-as-fold on --debug-log \
+      [--exploit on --exploit-tilt on] < reqs.jsonl > resp.jsonl 2> adv.err
+    ```
+
+- 之后才是删旧特例（§4.5 表）和 A/B，单独做。
+
+### 7.4 流水线实现与离线回放（2026-10-31）
+
+**实现**（`tools/openpoker_advisor.rs` `exploit_tilt`，开关 `--exploit-tilt on|off`，默认关，需 `--exploit on|vpip`）：
+
+- 接法按 §7.3：结果是 `SeatTilt { coefs, nodes }`（原 `LimpTilt` 改名，两条路共用），走现成的 `seat_coefs` 通道；
+  `RangeInputs.limp_tilt` 改名 `tilt`。开了 `--exploit-tilt` 就不再走 `limp_tilt`。被接管座的**全部翻前前缀决策**进 `nodes`、从前缀里删掉
+  （前缀过滤从「只删弃牌标签」改成按 `(节点, 座)` 删，节点只有一个行动者，对平跟者倾斜是等价的），翻后决策不动；`exploit_snapshot` 跳过这些座的宽度修正。
+- 每个有名字、本手没弃牌的对手座，按时间序走他的翻前决策：
+  - 主动全下（`PreflopStep` 新增 `shove_start` = 起始真栈）→ `allin_range_width` 宽度表，表内 1、表外 `1e-3`（不给 0，免得和其它步相乘全零）；
+  - 分了类的 → 参考节点优先取同步前缀里的影子节点，没有再取替身。前缀第 k 个该座翻前决策 ↔ 他第 k 个真实翻前动作
+    （lockstep 每个已同步动作恰好走一步；平跟当弃牌的那步是他的第一个动作，之后再行动就失同步）。首入用 `limp_reference`，
+    节点本身有跟注（SB 补齐）时退回通用三类合并 `class_reference`；其余一律 `class_reference`。收缩目标 = 参考策略在本手先验下的三类边际
+    （平跟合成时沿用 `limp_tilt` 的 [加注, 0, 弃牌]）；
+  - 没分类 / 找不到节点 / 节点上没有实际动作类 → 在前缀里的乘原始 σ（AllIn 标签照旧跳过），不在的因子 1。
+  - 至少一步用上了参考节点或宽度表才接管该座，否则保持旧做法。
+- `solve_tilt` 处理缺类：先验下参考概率处处为 0 的类不参与，频率在其余类上重新归一，该类 θ 记 0（大盲 option 没有弃牌）。
+- 测试（都按名字单跑，1.2G 上限）：`exploit_tilt_empty_profile_matches_prefix`（画像空时同步线上新系数归一后 ≈ 原始 σ 归一，跟注底值按 Chen 序，
+  总变差 < 0.03；预热 / 决策两个影子节点算出逐位相同的系数）、`exploit_tilt_frequencies_and_missing_class`（单步座系数均值 = 画像频率；
+  大盲 option 缺弃牌类 θ 有限）、`exploit_tilt_substitute_and_shove`（断点后的跟注用替身节点、只删映射弃牌那一步；短码开池全下 = 宽度表）、
+  `solve_tilt_missing_class`、`prewarm_unanchored_exploit_tilt_hits`（端到端预热被决策命中、接管座不做宽度修正、开关不同 key 不同）、
+  `parse_args_exploit` 补了新开关。原有 `limp_tilt_limper_range`、`prewarm_unanchored_applies_exploit_profile`、替身、hero 系数几条照过。
+  `cargo clippy --all-targets -D warnings`、`cargo fmt --check` 通过。
+
+**离线回放** [实测]：复用 §7.1 的请求（246 手 observe + 73 条翻牌街起点预热，参数也同 §7.1：每街 1 次迭代、3000 节点、1ms），
+`--exploit on` 下分三遍：不开倾斜 / `--exploit-limp-tilt on` / `--exploit-tilt on`。
+
+- **关时逐字不变**：不开倾斜那遍的 320 行响应、2478 行根范围（含 13×13 格）和 §7.1 的旧输出逐字相同。三遍的响应来源分布相同，没有 panic。
+- **覆盖**：44 次脱锚 solve 里接管了 151 个对手翻前决策：
+
+  | 局面类 / 动作 | 前缀节点 | 替身节点 |
+  |---|---:|---:|
+  | 首入平跟 / 加注 | 88 / 5 | 0 |
+  | 面对开池 跟 / 3bet | 17 / 1 | 0 |
+  | 大盲 option 过牌 / 加注 | 14 / 1 | 1 / 0 |
+  | 平跟后面对加注 跟 / 再加注 | 0 | 19 / 2 |
+  | 开池后面对 3bet 跟 | 0 | 2 |
+  | 主动全下（宽度表） | 1 | — |
+
+  每一步都拿到了频率（没有 `f=None`）。θ 量级：首入平跟 θ_raise ≈ −9（同 §7.1）；面对开池跟注 θ_call ≈ +6 … +10；平跟后面对加注 θ_raise、θ_call ≈ −7（往弃牌推）。
+- **形状**（同一手开 / 关对比，看根范围 13×13 格）：
+  - 平跟后跟隔离加注（以前第二步在断点后、因子 1）：关 = 「开池范围之外的牌」，杂色小牌最重；开 = 中段牌（中等高张、小对子、同花连张），
+    强牌和最差的杂色牌都低。这是这一步最大的改进。
+  - 开池后跟 3bet（以前开池者是 Reraise 不修正、跟 3bet 在断点后）：关 ≈ 均匀；开 = 中段同花 A、口袋对、同花连张，AK 低（在 4bet 里）。
+  - 大盲 option 过牌：开 / 关形状接近（blueprint 这个节点本来就混合得多）；以前前缀里没有这步的手，开了之后用替身给出形状。
+  - **问题 1：面对开池的跟注，边缘一圈是锯齿**。θ_call 6–10 时，跟注概率 1e-4 量级的残余值被放大几千倍，决定了谁进跟注范围，
+    结果像 QJo 不在、Q4s 在、KTo 不在、ATo 和 JTo 在这样的跳跃（关的时候 blueprint 本身就有这些跳跃，只是没被放大）。
+    这正是 §4.6「边界以下排序来自残余值」的风险，根源是拍板 3 让跟注类不套底值。
+    **已改（2026-10-31）**：`class_reference` 加 `call_floor`，`VsOpen` / `LimpVsRaise` 的跟注类套 `1e-3 × (1 − Chen 分位)` 底值，`Vs3bet` 不套。
+    同样设置重跑回放 [实测]：关时响应仍与 §7.1 逐字相同；面对开池跟注的 θ_call 从 6–10 降到 4.4–5.6；
+    17 个面对开池跟注座的根范围，在「Chen 分 < 8」的牌型上与 Chen 分的秩相关中位数 0.69 → 0.73；offsuit 高张那一圈
+    （ATo / KTo / QTo / JTo）从一高一低变成连成一片。没消掉的跳跃（例如 Q4s 高、QJo 低）来自 blueprint 跟注概率本身在 1e-3 以上的牌，
+    底值只管 1e-3 以下，那部分是 blueprint 真实的混合，不再处理。`LimpVsRaise` 的替身（大盲面对开池）本来就跟 77%，底值不起作用，结果不变。
+  - **问题 2：平跟再加注的范围以 ATo、KTo 这类为主，AA 低**：第二步替身是「大盲面对开池」，blueprint 在那里用 ATo、KTo 诈唬 3bet；
+    第一步里 AA 几乎都留在加注里（这个人开池率 14%，θ_raise ≈ −9 也挤不走纯加注的 AA）。各步独立相乘，表达不了真人「平跟陷阱 AA」的习惯。
+    只有 2 例，先记下。
+
+**下一步**：
+
+1. 问题 2 不急，等样本；需要时在 `LimpVsRaise` 的加注类上换参考（例如用首入加注的 σ 代替大盲 3bet 的 σ）。
+2. 之后按 §7.3 原计划：删旧特例（§4.5 表）、实盘 A/B。
