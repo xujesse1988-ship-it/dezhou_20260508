@@ -3920,6 +3920,22 @@ const LIMP_ANTE_REF_DEAD_BB: u64 = 8;
 /// 倍数里也含尺寸差，是估计值。
 const LIMP_ANTE_REF_WIDEN: f64 = 2.1;
 
+/// P 档（[`limp_hand_tier`]==2：JJ+、AK、AQ）的组合占比，[`limp_call_width`] 的基准。
+const LIMP_P_TIER_WIDTH: f64 = 56.0 / 1326.0;
+
+/// 平跟池里有人加注时，ante 下额外跟注的宽度（Chen 序 top 比例，[`chen_top_fraction`]）：
+/// P 档组合占比 × `1 + (LIMP_ANTE_REF_WIDEN − 1) × ante_level`，与没人加注那一支（[`limp_ranges_for`]）
+/// 同一倍数——满 ante（8 座 1BB）约 8.9%，补上 TT–88、AJs、ATs、AJo、KQs、KJs、KTs、QJs、QTs、JTs、J9s、
+/// T9s（Chen 序给同花连张加分）。P 档不是 Chen 序的
+/// 前缀（KQs、AJs、TT 排在 AQo 前面），所以和 P 档取并集而不是替换。无 ante = 0（只有 P 档跟，逐位同旧行为）。
+/// 底池赔率 floor 用的底池本来就含 ante，这里补的是「牌型档没随死钱放宽」。
+fn limp_call_width(ante_level: f64) -> f64 {
+    if ante_level <= 0.0 {
+        return 0.0;
+    }
+    LIMP_P_TIER_WIDTH * (1.0 + (LIMP_ANTE_REF_WIDEN - 1.0) * ante_level)
+}
+
 /// 平跟池启发式的 ante 程度，`[0, 1]`：本手 ante 总额（发牌座位数 × 每座 ante）÷ 参照死钱
 /// [`LIMP_ANTE_REF_DEAD_BB`]，超过参照点按 1（没有更大 ante 的数据，不外推）。无 ante = 0。
 /// 发牌座位数取 `dealt_seats`（短桌幻影座不交 ante），缺省按满桌。
@@ -4017,7 +4033,8 @@ fn chen_top_fraction_scan(hole: [Card; 2]) -> f64 {
 ///   跟着开池尺寸加 `ante_level×BB`——8 座 1BB ante 的 ante-flop2 菜单开池 4.5BB，比无 ante 1pot 开池
 ///   3.5BB 多 1BB。无 ante 时范围和尺寸逐位不变。
 /// - **有人加注**（含 hero 隔离加注或跟着平跟之后被加注）：P 档（[`limp_hand_tier`]==2）→ call；
-///   其余弃牌，但底池赔率 floor（[`pot_odds_floor_hit`]，`pot_odds` 由调用方真栈重放算）命中 → call。
+///   有 ante 时另加 Chen 序前 [`limp_call_width`] 的牌也 call（2026-10-31）；其余弃牌，但底池赔率 floor
+///   （[`pot_odds_floor_hit`]，`pot_odds` 由调用方真栈重放算，底池含 ante）命中 → call。
 ///
 /// 返回 `None` = 历史里首个加注前没有 call（其他结构 gap 误入的防御）→ caller 维持原兜底。
 /// `source = limp_heuristic:{raise,overlimp,complete,check,fold,call,pot_odds_call}`
@@ -4048,8 +4065,8 @@ fn limp_heuristic(
         street: Some("preflop".into()),
         ..Default::default()
     };
+    let ante_level = limp_ante_level(req);
     if !raised {
-        let ante_level = limp_ante_level(req);
         let (iso, passive) = limp_ranges_for(pos, limps, ante_level);
         let frac = chen_top_fraction(hole);
         if frac < iso && valid.can_raise {
@@ -4077,7 +4094,9 @@ fn limp_heuristic(
         }
         return Some(mk("fold", None, "fold"));
     }
-    if limp_hand_tier(hole) == 2 && valid.can_call {
+    let call_tier =
+        limp_hand_tier(hole) == 2 || chen_top_fraction(hole) < limp_call_width(ante_level);
+    if call_tier && valid.can_call {
         return Some(mk("call", None, "call"));
     }
     if valid.can_check {
@@ -7347,6 +7366,82 @@ mod tests {
         assert_eq!(limp_pos(3, 6), LimpPos::BeforeBtn(3));
         assert_eq!(limp_pos(8, 9), LimpPos::BeforeBtn(1));
         assert_eq!(limp_pos(3, 9), LimpPos::BeforeBtn(6));
+    }
+
+    /// 平跟池里有人加注时的 ante 放宽（2026-10-31）：无 ante 只有 P 档跟；满 ante 另加 Chen 序前 8.9%
+    /// （与没人加注那一支同一倍数）；半档 ante 介于两者之间。
+    #[test]
+    fn limp_heuristic_ante_widens_call_vs_raise() {
+        // 8 座 50/100：UTG 平跟、HJ 隔离到 450，轮到 BTN（不传底池赔率 → 只看牌型档）。
+        let req = |ante: u64| Request {
+            hole: vec![],
+            board: vec![],
+            button_seat: 0,
+            my_seat: 0,
+            num_seats: 8,
+            small_blind: 50,
+            big_blind: 100,
+            ante,
+            actions: vec![hist(3, "call", Some(100)), hist(5, "raise", Some(450))],
+            valid: full_valid(),
+            stacks: vec![],
+            dealt_seats: vec![],
+            names: Default::default(),
+            posts: Vec::new(),
+        };
+        let calls = |r: &Request| -> std::collections::BTreeSet<String> {
+            all_hole_combos()
+                .into_iter()
+                .filter(|&h| {
+                    limp_heuristic(r, h, LimpPos::Btn, None)
+                        .expect("有平跟")
+                        .source
+                        == "limp_heuristic:call"
+                })
+                .map(|h| {
+                    let (a, b) = (card_label(h[0]), card_label(h[1]));
+                    let (ra, rb) = (&a[..1], &b[..1]);
+                    let order = "23456789TJQKA";
+                    let (hi, lo) = if order.find(ra) >= order.find(rb) {
+                        (ra, rb)
+                    } else {
+                        (rb, ra)
+                    };
+                    let kind = if hi == lo {
+                        ""
+                    } else if a[1..] == b[1..] {
+                        "s"
+                    } else {
+                        "o"
+                    };
+                    format!("{hi}{lo}{kind}")
+                })
+                .collect()
+        };
+        let set = |v: &[&str]| {
+            v.iter()
+                .map(|x| x.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let p_tier = set(&["AA", "KK", "QQ", "JJ", "AKs", "AKo", "AQs", "AQo"]);
+        assert_eq!(calls(&req(0)), p_tier, "无 ante：只有 P 档跟（旧行为）");
+        let mut want = p_tier.clone();
+        want.extend(set(&[
+            "TT", "99", "88", "AJs", "ATs", "AJo", "KQs", "KJs", "KTs", "QJs", "QTs", "JTs", "J9s",
+            "T9s",
+        ]));
+        assert_eq!(calls(&req(100)), want, "满 ante：P 档 ∪ Chen 序前 8.9%");
+        // 半档 ante（4.2% × 1.55 ≈ 6.5%）介于两者之间。
+        let half = calls(&Request {
+            dealt_seats: vec![0, 1, 2, 3],
+            ..req(100)
+        });
+        assert!(
+            half.is_superset(&p_tier)
+                && half.is_subset(&want)
+                && half.len() > p_tier.len()
+                && half.len() < want.len()
+        );
     }
 
     /// 平跟池启发式的 ante 放宽（2026-10-30）：8 座 1BB ante 时两档范围 ×2.1、隔离尺寸 +1BB；按发牌
