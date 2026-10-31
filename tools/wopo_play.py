@@ -21,6 +21,10 @@
   - --hh-log：每手打完且没作废的牌局写一行（opponent_analysis 的 wopo 平台读）。
   - --play-log：给人看的牌桌实况（手牌 / 公共牌 / 玩家行动 / hero 决策与实际行动 / 结算 / 作废），
     诊断信息（advisor 启动、连接、过期、未知消息）仍走 stderr。
+  - --play-events：同一份实况的结构化事件流（JSONL，play log 每行对应一条事件，带同一行文字 text），
+    给 opponent_analysis live --play-events 在网页上实时显示「行动指南」。缺省：给了 --play-log 时写到
+    同目录的 wopo_play_events.jsonl；--play-events off 关闭。只记录，不影响决策 / 行动文件 / hh /
+    action log。事件格式见 opponent_analysis/README.md「行动指南」。
   - --ante（桌面筹码，默认 0）：开局每个发牌座先交 ante 再发盲注，牌桌层按此核对底池 / 栈（快照 bet
     只含盲注；对不上 → 作废）。--blueprint-ante（solver 筹码，BB = 100，= train_cfr --ante）透传给
     advisor 加载对应 blueprint；每手要求 ante × 100 == blueprint-ante × 大盲，否则这手作废
@@ -40,6 +44,9 @@ action（fold/check/call/raise/all_in）/ amount（raise 的本街总额，其�
   wopo_play.py [--url ws://HOST:PORT/ws] --action-file hero_actions.jsonl \\
       --cropped-checkpoint X.crop --bucket-table B.bin --search --search-trigger all-postflop ...
   wopo_play.py --replay session.log ...   回放 WS 日志（原始消息逐行，或 --ws-log 格式）
+  wopo_play.py ... --play-log $D/play.log  同时写 $D/wopo_play_events.jsonl（行动指南事件流）；网页看：
+      python3 -m opponent_analysis live --db <库> --platform wopo --follow $D/wopo_hh.jsonl \\
+          --play-events $D/wopo_play_events.jsonl --hero hero      （http://127.0.0.1:8780/）
   wopo_play.py --selftest                 离线自测（stub advisor，不需要 blueprint）
 """
 
@@ -47,6 +54,7 @@ import argparse
 import io
 import json
 import os
+import re
 import shlex
 import sys
 import tempfile
@@ -58,7 +66,7 @@ from poker_live.advisor_client import (add_advisor_args, add_fourbet_args, advis
                                        start_advisor, validate_advisor_args, validate_fourbet_args)
 from poker_live.decision import DecisionWorker
 from poker_live.table import HandEngine, HandInvalid
-from poker_live.wopo import ActionFile, WopoSession, fmt_probs, legalize
+from poker_live.wopo import _STALE_CN, _STREET_CN, ActionFile, WopoSession, _fmt_act, fmt_probs, legalize
 from poker_live.wslog import WsLog
 
 HERO_SEAT = 0
@@ -202,6 +210,9 @@ HH_ANTE_FIXTURE = os.path.join(os.path.dirname(HH_FIXTURE), "wopo_hh_ante_2026_1
 POSTS_FIXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "testdata",
                              "wopo_posts_2026_10_28.jsonl")
 HH_POSTS_FIXTURE = os.path.join(os.path.dirname(HH_FIXTURE), "wopo_hh_posts_2026_10_28.jsonl")
+# FIXTURE 回放（exploit + prewarm）的 --play-events 输出，ts / decide_ms 规范化后（_selftest_play_events
+# 生成并核对；opponent_analysis 的行动指南测试读它）。
+PLAY_EVENTS_FIXTURE = os.path.join(os.path.dirname(HH_FIXTURE), "wopo_play_events_2026_10_16.jsonl")
 
 
 class _StubAdvisor:
@@ -240,7 +251,7 @@ def _fixture_msgs():
 
 def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=False,
               exploit_4bet=False, reply=None, hh_log=None, play_log=None, ante=0, blueprint_ante=0,
-              n_seats=9, send_hand_id=False):
+              n_seats=9, send_hand_id=False, play_events=None):
     """msgs（dict 或 ("disconnect",)）喂一个新会话。返回 (session, stub, 行动文件行)。
     hook(i, session) 在每条消息后调用（异步场景用来在指定位置放行 advisor）。"""
     stub = _StubAdvisor(gate, reply)
@@ -251,7 +262,8 @@ def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=Fals
         session = WopoSession(worker, af, n_seats=n_seats, hero_seat=HERO_SEAT,
                               exploit=exploit, prewarm=prewarm, exploit_4bet=exploit_4bet,
                               hh_log=hh_log, play_log=play_log, ante=ante,
-                              blueprint_ante=blueprint_ante, send_hand_id=send_hand_id)
+                              blueprint_ante=blueprint_ante, send_hand_id=send_hand_id,
+                              play_events=play_events)
         for i, m in enumerate(msgs):
             if m == ("disconnect",):
                 session.on_disconnect()
@@ -769,6 +781,280 @@ def _selftest_posts():
           "补的不是 1BB / 补盲全下 → 作废", file=sys.stderr)
 
 
+class _EventSink:
+    """--play-events 的内存版：每条事件过一遍 JSON（保证可序列化）后留下。"""
+
+    def __init__(self):
+        self.events = []
+
+    def write(self, rec):
+        self.events.append(json.loads(json.dumps(rec, ensure_ascii=False)))
+
+
+# 每种事件除公共字段（ts / type / hand_id / table_id / text）外的字段（opponent_analysis/README.md 有说明）。
+_EVENT_COMMON = {"ts", "type", "hand_id", "table_id", "text"}
+_ACTION_KEYS = {"seat", "name", "street", "turn", "action", "to", "delta", "to_call_before",
+                "stack_before", "stack_after", "pot_after"}
+EVENT_KEYS = {
+    "hand_start": {"button", "sb", "bb", "ante", "hero_seat", "n_seats"},
+    "dead": {"reason", "tag"},
+    "hole": {"cards"},
+    "seats": {"seats", "button", "sb_seat", "bb_seat", "posts", "pot"},
+    "board": {"street", "cards", "board", "pot"},
+    "action": _ACTION_KEYS,
+    "hero_action": _ACTION_KEYS | {"advice", "match"},
+    "hero_turn": {"turn", "street", "pot", "to_call", "valid", "hole", "board", "table_seq"},
+    "decision": {"turn", "street", "pot", "to_call", "valid", "action", "amount", "all_in", "advice",
+                 "probs", "chosen", "source", "decide_ms", "stale", "stale_kind", "written",
+                 "rejected"},
+    "result": {"stacks", "pot", "board", "winners", "shown", "notes", "server_ts"},
+}
+
+
+def _render_event(e):
+    """只用事件的结构化字段（不看 text）还原 play log 那一行：核对事件足够让网页不解析文字。"""
+    t = e["type"]
+
+    def who(seat, name):
+        return f"seat{seat} {name}" if name else f"seat{seat}"
+
+    if t == "hand_start":
+        return (f"──── {e['hand_id']} 庄位 seat{e['button']} 盲注 {e['sb']}/{e['bb']}"
+                + (f" ante {e['ante']}" if e["ante"] else ""))
+    if t == "dead":
+        _check(e["tag"] == e["reason"].split(":", 1)[0], f"dead tag {e}")
+        return f"本手作废：{e['reason']}（之后不出建议）"
+    if t == "hole":
+        return "底牌 " + " ".join(e["cards"])
+    if t == "seats":
+        return "座位 " + " | ".join(
+            f"{who(x['seat'], x['name'])} {x['start']}" + (f"({','.join(x['roles'])})" if x["roles"] else "")
+            for x in e["seats"])
+    if t == "board":
+        _check(e["board"][-len(e["cards"]):] == e["cards"], f"board 新牌 {e}")
+        return f"{_STREET_CN[e['street']]} {' '.join(e['board'])}"
+    if t in ("action", "hero_action"):
+        _check(e["stack_after"] == e["stack_before"] - e["delta"], f"动作栈 {e}")
+        line = f"{who(e['seat'], e['name'])} " + _fmt_act(e["action"], e["to"], e["delta"],
+                                                          e["to_call_before"])
+        if t == "action":
+            return line
+        if e["advice"] is None:
+            _check(e["match"] is None, f"无建议时 match 应为 null: {e}")
+            return f"{line}  ← hero 实际行动（无建议）"
+        return (f"{line}  ← hero 实际行动（{'同' if e['match'] == 'same' else '不同于'}建议 "
+                f"{e['advice']['text']}）")
+    if t == "hero_turn":
+        return f">> 轮到 hero（{_STREET_CN[e['street']]}，底池 {e['pot']}，跟 {e['to_call']}）"
+    if t == "decision":
+        advice = _fmt_act(e["action"], e["amount"], e["to_call"], e["to_call"])
+        if e["action"] == "raise" and e["amount"] == e["valid"].get("max_raise"):
+            advice += "（全下）"
+        _check(advice == e["advice"], f"建议文字 {advice!r} ≠ {e['advice']!r}")
+        _check(e["written"] == (e["stale"] is None)
+               and e["stale_kind"] == (e["stale"].split(":", 1)[0] if e["stale"] else None),
+               f"决策过期字段 {e}")
+        stale = e["stale"]
+        return (f">> 决策  来源 {e['source']}  {e['decide_ms']}ms"
+                + (f"  已过期（{_STALE_CN.get(e['stale_kind'], stale)}），未写入行动文件" if stale else "")
+                + (f"  {fmt_probs(e['probs'])}" if e["probs"] else "")
+                + f"  建议 {advice}")
+    if t == "result":
+        net = [f"{who(x['seat'], x['name'])} {x['net']:+d}" for x in e["stacks"]
+               if x["final"] is not None and x["final"] != x["start"]]
+        return "结算 " + (" | ".join(net) or "无输赢")
+    raise RuntimeError(f"[selftest] 未知事件类型 {t}")
+
+
+def _check_events(play_text, events, session=None, rows=None):
+    """事件流和 play log 一一对应（同一时刻、同一行文字、类型与行首一致），字段齐全，且只用结构化
+    字段就能还原每一行；给了 session / rows 时再和计数器、行动文件对账。"""
+    lines = play_text.splitlines()
+    _check(len(lines) == len(events), f"事件 {len(events)} 条 ≠ play log {len(lines)} 行")
+    prefix = {"hand_start": "────", "hole": "底牌 ", "seats": "座位 ", "hero_turn": ">> 轮到 hero",
+              "decision": ">> 决策  来源 ", "result": "结算 ", "dead": "本手作废："}
+    turns = set()
+    for ln, e in zip(lines, events):
+        clock, text = ln.split(" ", 1)
+        t = e["type"]
+        _check(t in EVENT_KEYS and set(e) == _EVENT_COMMON | EVENT_KEYS[t],
+               f"{t} 事件字段 {sorted(e)}")
+        _check(e["text"] == text and time.strftime("%H:%M:%S", time.localtime(e["ts"])) == clock,
+               f"事件与 play log 行不对应: {e} / {ln}")
+        _check(_render_event(e) == text, f"结构化字段还原不出这一行:\n  {_render_event(e)}\n  {text}")
+        if t in prefix:
+            _check(text.startswith(prefix[t]), f"{t} ↔ {text}")
+        elif t == "board":
+            _check(text.startswith(("翻牌 ", "转牌 ", "河牌 ")), f"board ↔ {text}")
+        else:
+            _check(text.startswith("seat") and (("← hero 实际行动" in text) == (t == "hero_action")),
+                   f"{t} ↔ {text}")
+        if t == "hero_turn":
+            turns.add((e["hand_id"], e["turn"]))
+        if t == "decision":
+            _check((e["hand_id"], e["turn"]) in turns, f"决策之前没有对应的 hero_turn: {e}")
+    if session is not None:
+        c = session.counters
+        n = lambda t, pred=lambda e: True: sum(1 for e in events if e["type"] == t and pred(e))
+        _check(n("decision") == c["decisions"] and n("hero_turn") == c["turns"]
+               and n("decision", lambda e: e["written"]) == c["written"]
+               and n("decision", lambda e: not e["written"]) == c["stale"]
+               and n("hero_action", lambda e: e["match"] == "same") == c["hero_same"]
+               and n("hero_action", lambda e: e["match"] == "diff") == c["hero_diff"]
+               and n("hero_action", lambda e: e["match"] is None) == c["hero_unadvised"]
+               and n("result") == c["hands_complete"]
+               and n("dead") == sum(session.skip_reasons.values()), f"事件计数与计数器 {c}")
+    if rows is not None:
+        written = [e for e in events if e["type"] == "decision" and e["written"]]
+        _check([(e["hand_id"], e["action"], e["amount"], e["probs"], e["source"], e["decide_ms"],
+                 e["pot"], e["to_call"], e["valid"]) for e in written]
+               == [(r["hand_id"], r["action"], r["amount"], r["probs"], r["source"], r["decide_ms"],
+                    r["pot"], r["to_call"], r["valid"]) for r in rows], "已写决策事件 ≠ 行动文件")
+
+
+def _norm_events(events):
+    """固定 ts / decide_ms（stub advisor 的耗时可能是 0 或 1ms），让输出能和 fixture 逐条比。"""
+    out = []
+    for i, e in enumerate(events):
+        e = dict(e, ts=1792130000.0 + 2 * i)
+        if e["type"] == "decision":
+            e["decide_ms"] = 0
+            e["text"] = re.sub(r"  \d+ms", "  0ms", e["text"], count=1)
+        out.append(e)
+    return out
+
+
+def _selftest_play_events():
+    """--play-events：和 play log 逐行对应、字段齐、能还原文字；开不开事件流，行动文件 / hh / play log /
+    advisor 请求逐字节相同；作废 / 过期 / 无建议 / 补盲 / ante 都有对应事件；off 不写文件。"""
+    msgs = _fixture_msgs()
+    play, hh, sink = io.StringIO(), io.StringIO(), _EventSink()
+    session, stub, rows = _run_msgs(msgs, exploit=True, prewarm=True, play_log=play, hh_log=hh,
+                                    play_events=sink)
+    ev = sink.events
+    _check_events(play.getvalue(), ev, session, rows)
+    _check([e["type"] for e in ev[:4]] == ["hand_start", "hole", "seats", "action"],
+           f"一手开头的事件顺序 {[e['type'] for e in ev[:4]]}")
+    # 不开事件流：其余输出完全一样（play log 只比文字，时间戳会差）。
+    play0, hh0 = io.StringIO(), io.StringIO()
+    _, stub0, rows0 = _run_msgs(msgs, exploit=True, prewarm=True, play_log=play0, hh_log=hh0)
+    strip = lambda txt: [ln.split(" ", 1)[1] for ln in txt.splitlines()]
+    nots = lambda rs: [{k: v for k, v in r.items() if k not in ("ts", "decide_ms")} for r in rs]
+    _check(nots(rows) == nots(rows0) and hh.getvalue() == hh0.getvalue()
+           and strip(play.getvalue()) == strip(play0.getvalue())
+           and stub.requests == stub0.requests and stub.side == stub0.side,
+           "开事件流不该改变行动文件 / hh / play log / advisor 请求")
+    norm = _norm_events(ev)
+    if os.environ.get("WOPO_REGEN_PLAY_EVENTS"):
+        with open(PLAY_EVENTS_FIXTURE, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(e, ensure_ascii=False) + "\n" for e in norm)
+    with open(PLAY_EVENTS_FIXTURE, encoding="utf-8") as f:
+        _check(norm == [json.loads(line) for line in f if line.strip()],
+               f"事件流与 {PLAY_EVENTS_FIXTURE} 不一致（改了格式用 WOPO_REGEN_PLAY_EVENTS=1 重生成）")
+
+    # 作废：断线 → dead 事件（之后这手不再有决策事件）。
+    i = next(i for i, m in enumerate(msgs) if m.get("hand_id") == "local-table:hand:000009"
+             and m["type"] == "community_cards")
+    play, sink = io.StringIO(), _EventSink()
+    session, _, rows = _run_msgs(msgs[:i] + [("disconnect",)] + msgs[i:], play_log=play,
+                                 play_events=sink)
+    _check_events(play.getvalue(), sink.events, session, rows)
+    dead = [e for e in sink.events if e["type"] == "dead"]
+    _check([(e["hand_id"], e["reason"]) for e in dead] == [("local-table:hand:000009", "disconnected")],
+           f"断线作废事件 {dead}")
+    k = sink.events.index(dead[0])
+    _check(not any(e["hand_id"] == dead[0]["hand_id"] and e["type"] in ("decision", "hero_turn")
+                   for e in sink.events[k:]), "作废后不该再有这手的决策事件")
+
+    # 过期 + 无建议（同 selftest 4：advisor 卡到 hero 第一次实际行动之后）。
+    gate = threading.Event()
+    first_hero_act = next(i for i, m in enumerate(msgs)
+                          if m["type"] == "player_action" and m["seat"] == HERO_SEAT)
+
+    def hook(i, session):
+        if i == first_hero_act:
+            gate.set()
+        if i >= first_hero_act:
+            deadline = time.time() + 10
+            while session.counters["decisions"] < session.counters["turns"] and time.time() < deadline:
+                time.sleep(0.001)
+
+    play, sink = io.StringIO(), _EventSink()
+    session, _, rows = _run_msgs(msgs, gate=gate, sync=False, hook=hook, play_log=play,
+                                 play_events=sink)
+    _check_events(play.getvalue(), sink.events, session, rows)
+    stale = [e for e in sink.events if e["type"] == "decision" and not e["written"]]
+    unadv = [e for e in sink.events if e["type"] == "hero_action" and e["advice"] is None]
+    _check(len(stale) == 1 and stale[0]["stale_kind"] == "hero_acted" and len(unadv) == 1
+           and (unadv[0]["hand_id"], unadv[0]["turn"]) == (stale[0]["hand_id"], stale[0]["turn"])
+           and sink.events.index(unadv[0]) < sink.events.index(stale[0]),
+           f"过期决策 / 无建议事件 {stale} {unadv}")
+
+    # 补盲 + ante：座位事件标出补盲座，hand_start 带 ante。
+    with open(POSTS_FIXTURE) as f:
+        pmsgs = [json.loads(line) for line in f if line.strip()]
+    play, sink = io.StringIO(), _EventSink()
+    session, _, rows = _run_msgs(pmsgs, ante=100, blueprint_ante=100, n_seats=8, play_log=play,
+                                 play_events=sink)
+    _check_events(play.getvalue(), sink.events, session, rows)
+    seats = [e for e in sink.events if e["type"] == "seats"]
+    _check({e["hand_id"][-3:]: e["posts"] for e in seats} == {"122": [6], "123": [2], "127": [7], "132": [4]}
+           and all("补盲" in x["roles"] for e in seats for x in e["seats"] if x["seat"] in e["posts"])
+           and all(e["ante"] == 100 for e in sink.events if e["type"] == "hand_start"),
+           "补盲 / ante 事件")
+    _check(all(x["start"] == x["stack"] + x["bet"] + 100 for e in seats for x in e["seats"]),
+           "开局栈 = 剩余栈 + 盲注 + ante")
+
+    # ante 比例不符：hand_start 之后紧跟 dead；hand_start 本身不合法（盲注坏）：只有 dead，hand_id 照带。
+    play, sink = io.StringIO(), _EventSink()
+    session, _, _ = _run_msgs(_with_ante(msgs, 2), ante=2, blueprint_ante=50, play_log=play,
+                              play_events=sink)
+    _check_events(play.getvalue(), sink.events, session)
+    _check([e["type"] for e in sink.events] == ["hand_start", "dead"] * 8
+           and all(e["tag"] == "ante_mismatch" for e in sink.events if e["type"] == "dead"),
+           "ante 不符的事件序列")
+    bad = [dict(m, blinds={"small_blind": 0, "big_blind": 2}) if m["type"] == "hand_start" else m
+           for m in msgs]
+    play, sink = io.StringIO(), _EventSink()
+    session, _, _ = _run_msgs(bad, play_log=play, play_events=sink)
+    _check_events(play.getvalue(), sink.events, session)
+    _check([e["type"] for e in sink.events] == ["dead"] * 8
+           and all(e["hand_id"] and e["tag"] == "bad_blinds" for e in sink.events),
+           f"hand_start 不合法的事件 {sink.events[:2]}")
+
+    # 事件文件写不进去：停写事件，行动文件 / play log 照旧。
+    class _Broken:
+        def write(self, rec):
+            raise OSError(28, "No space left on device")
+    play = io.StringIO()
+    session, _, rows = _run_msgs(msgs, play_log=play, play_events=_Broken())
+    _, _, rows0 = _run_msgs(msgs)
+    _check(session.play_events is None and nots(rows) == nots(rows0)
+           and len(play.getvalue().splitlines()) == len(ev),
+           "事件文件写失败不该影响其余输出")
+
+    # 路径缺省规则；off / 没有 play log 时不建文件。
+    with tempfile.TemporaryDirectory() as d:
+        pl = os.path.join(d, "play.log")
+        _check(resolve_play_events(None, pl) == os.path.join(d, PLAY_EVENTS_NAME)
+               and resolve_play_events("x.jsonl", pl) == "x.jsonl"
+               and resolve_play_events("off", pl) is None and resolve_play_events(None, None) is None
+               and resolve_play_events("off", None) is None, "--play-events 缺省规则")
+        for arg, log in (("off", pl), (None, None)):
+            f = open_play_events(arg, log)
+            _check(f is None, "off / 无 play log 时不该打开事件文件")
+            _run_msgs(msgs[:40], play_events=f)
+        _check(os.listdir(d) == [], f"off 时不该写文件: {os.listdir(d)}")
+        f = open_play_events(None, pl)
+        _run_msgs(msgs[:40], play_events=f)
+        f.close()
+        with open(os.path.join(d, PLAY_EVENTS_NAME), encoding="utf-8") as fh:
+            got = [json.loads(line) for line in fh]
+        _check(got and got[0]["type"] == "hand_start", "缺省时应写到 play log 同目录")
+    print(f"[selftest 13 行动指南事件流] {len(ev)} 条事件与 play log 逐行对应、字段齐、可还原文字；"
+          "开关不影响其余输出；作废 / 过期 / 无建议 / 补盲 / ante / off 都覆盖", file=sys.stderr)
+
+
 def run_selftest():
     _selftest_full_replay()
     _selftest_mid_hand_join()
@@ -782,10 +1068,32 @@ def run_selftest():
     _selftest_table_size()
     _selftest_ante()
     _selftest_posts()
-    print("OK: wopo selftest 12 组场景全部通过。", file=sys.stderr)
+    _selftest_play_events()
+    print("OK: wopo selftest 13 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================
+PLAY_EVENTS_NAME = "wopo_play_events.jsonl"
+
+
+def resolve_play_events(arg, play_log):
+    """--play-events 的实际路径：off → None；给了路径 → 原样；缺省时有 --play-log 就写它同目录的
+    wopo_play_events.jsonl，没有就不写。"""
+    if arg == "off":
+        return None
+    if arg:
+        return arg
+    if play_log:
+        return os.path.join(os.path.dirname(os.path.abspath(play_log)), PLAY_EVENTS_NAME)
+    return None
+
+
+def open_play_events(arg, play_log):
+    """按 resolve_play_events 打开事件文件（ActionFile：O_APPEND + 整行一次 write）；不写时 None。"""
+    path = resolve_play_events(arg, play_log)
+    return ActionFile(path) if path else None
+
+
 def main():
     p = argparse.ArgumentParser(description="wopo 牌桌 driver（只收不发，建议写行动文件）+ Rust advisor")
     p.add_argument("--selftest", action="store_true",
@@ -810,6 +1118,10 @@ def main():
     p.add_argument("--play-log", default=None,
                    help="牌桌实况（人看，append）：手牌 / 公共牌 / 玩家行动 / hero 决策（建议、来源、耗时）/ "
                         "实际行动 / 结算 / 作废；诊断信息仍走 stderr。缺省关")
+    p.add_argument("--play-events", default=None,
+                   help="牌桌实况的结构化事件流（JSONL，append；opponent_analysis live --play-events 读，"
+                        "网页「行动指南」）。缺省：给了 --play-log 时写同目录 wopo_play_events.jsonl，"
+                        "否则不写；off 关闭")
     p.add_argument("--num-hands", type=int, default=0, help="打完这么多手后退出；0 = 不限")
     p.add_argument("--ante", type=int, default=0,
                    help="桌面每座 ante（桌面筹码，默认 0）：开局人人先交，计入底池、不算本轮下注")
@@ -847,12 +1159,13 @@ def main():
     hh_log = open(args.hh_log, "a", encoding="utf-8") if args.hh_log else None
     ws_log = WsLog(args.ws_log) if args.ws_log else None
     play_log = open(args.play_log, "a", encoding="utf-8") if args.play_log else None
+    play_events = open_play_events(args.play_events, args.play_log)
     session = WopoSession(worker, action_file, n_seats=args.seats, hero_seat=HERO_SEAT,
                           num_hands=args.num_hands, action_log=action_log,
                           prewarm=args.search_prewarm, exploit=exploit_enabled(args),
                           debug=args.debug_log, exploit_4bet=fourbet_enabled(args), hh_log=hh_log,
                           play_log=play_log, ante=args.ante, blueprint_ante=args.blueprint_ante,
-                          send_hand_id=args.range_log is not None)
+                          send_hand_id=args.range_log is not None, play_events=play_events)
     ok = True
     try:
         if args.replay:
@@ -872,6 +1185,8 @@ def main():
             ws_log.close()
         if play_log:
             play_log.close()
+        if play_events:
+            play_events.close()
     if not ok:
         sys.exit(1)
 

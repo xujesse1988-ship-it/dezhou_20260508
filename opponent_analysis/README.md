@@ -23,6 +23,9 @@ python3 -m opponent_analysis report --db artifacts/opponent_db --platform wopo -
 # 实时：跟随正在写入的 hh 日志，增量更新画像，浏览器打开 http://127.0.0.1:8780/
 python3 -m opponent_analysis live --db artifacts/opponent_db --platform poker_manager \
     --follow 'artifacts/poker_manager_live_*/poker_manager_hh.jsonl' [--hero bp3] [--port 8780]
+# wopo：再加 --play-events，页面顶部多一个实时「行动指南」（见下）
+python3 -m opponent_analysis live --db artifacts/opponent_db --platform wopo \
+    --follow "$D/wopo_hh.jsonl" --play-events "$D/wopo_play_events.jsonl" --hero hero
 
 # 测试
 python3 -m unittest discover -s opponent_analysis/tests -t .
@@ -30,7 +33,8 @@ python3 -m unittest discover -s opponent_analysis/tests -t .
 
 ## 实时画像（`live`）
 
-- **只读日志**：数据只来自 driver 写的 `*_hh.jsonl`（每打完一手追加一行）。不调用牌桌服务的任何接口
+- **只读日志**：数据只来自 driver 写的 `*_hh.jsonl`（每打完一手追加一行），以及（可选）wopo driver 的事件流
+  `wopo_play_events.jsonl`（行动指南用，只有 hero 自己的底牌和服务器公开给 hero 的信息）。不调用牌桌服务的任何接口
   （包括公开的 `/api/hands`，它会给出所有座位的底牌，不用）。
 - `--follow` 给路径或通配符（加引号），每 2 秒重新展开一次，bot 换批次新建的 run 目录会自动接上。
   只读到换行为止，写了一半的行留到下次；坏行计数后跳过；文件被截断或替换时从头重读。
@@ -42,7 +46,7 @@ python3 -m unittest discover -s opponent_analysis/tests -t .
 - 我方名字 = 每手日志的记录座位，加上 `--hero` 给的名字（日志没被跟随的我方 bot），都不计入对手和群体基准。
   `report` 也有 `--hero`，给同样的名字时两边结果一致。
 - 默认只监听 `127.0.0.1`。在实盘机器上跑时用 ssh 隧道看：`ssh -L 8780:127.0.0.1:8780 <机器>`，再开本机浏览器。
-- 页面：最近一手的牌桌座次（点名字看详情）、玩家总表（可排序、选列、只看在桌）、单人详情
+- 页面：（给了 `--play-events` 时）顶部的实时行动指南（见下节）、最近一手的牌桌座次（点名字看详情）、玩家总表（可排序、选列、只看在桌）、单人详情
   （单点剥削估计、近期变化、与群体的显著差异、翻前全下的亮牌、全部统计的区间条和走势图）、最近 40 手、数据质量。
 - **近期口径**（`--recent-hands`，默认 1000，`report` 也有）：每个玩家自己的最近 N 手单独算一套统计和单点剥削估计，
   页面上「全部历史」和「最近 N 手」是两张玩家表（点标题可收起），单人详情两份剥削估计都列出。「近期变化」= 每项统计最近 N 手对比更早的手做两比例检验
@@ -50,6 +54,70 @@ python3 -m unittest discover -s opponent_analysis/tests -t .
   2–4 / 5–6 / 7–9 的占比，某一档变化超过 15 个百分点时提示可能是桌况。替代了原来的「前后半程漂移」。
   走势图按玩家自己的手牌顺序分成约 24 段（每段至少 250 手），画原始比例，阴影是最近 N 手。
   另有 `/report.md`、`/profile.json`（与 `report` 命令的输出相同）、`/api/snapshot`。
+
+## 行动指南（wopo，`--play-events`）
+
+hh 日志每手打完才写一行，看不到正在打的这手。wopo driver（`tools/wopo_play.py`）在写 play.log 的同时，
+把每一行同时写成一条 JSON 事件（`--play-events`，缺省就是 play.log 同目录的 `wopo_play_events.jsonl`，
+`--play-events off` 关闭）。`live` 加 `--play-events <文件或通配符>` 后，页面顶部显示「行动指南」：
+
+- 当前这手：编号、庄位、盲注 / ante、状态（进行中 / 已结算 / 作废及原因）；hero 底牌、公共牌、底池；
+  最新的决策建议（建议动作和金额放大显示，下面是各动作概率、来源、耗时；过期的划掉并标出原因，
+  还在算时显示已等待秒数）；hero 实际怎么打的、和建议是否一致；各座位名字 / 位置 / 开局栈 / 剩余栈 /
+  本手最近动作，旁边是这个玩家画像里的手数、入池率 / 翻前加注率、候选漏洞数、类型（点名字打开下面的
+  单人详情）；按街分组的动作时间线；结算（各座输赢、亮牌）。
+- 下面是最近几手的折叠列表（一行摘要：底牌、公共牌、hero 输赢、决策点数与同 / 不同 / 无建议 / 过期次数）。
+- 页面每秒轮询 `/api/play?since=<version>`，没有新事件时只回 `{"version", "unchanged": true, "now"}`。
+  `now` 是服务端时间，页面用它算「已等待几秒」，所以浏览器和实盘机器时钟不同步也没关系。
+- 没给 `--play-events` 时 `/api/play` 回 `{"enabled": false}`，页面不显示这个面板，其余部分照旧。
+
+服务端只在内存里保留最近 `--play-hands`（默认 20）手，不写数据库，和画像统计无关。事件文件还不存在时等它出现；
+只读到换行为止；第一次见到一个文件时只读它最后 8 MB（约几百手），所以服务重启后马上能恢复最近 20 手，
+长时间的会话也不用整份重读；文件被替换时从头读，完全相同的事件去重；被挤出窗口的旧手再来的事件（例如过期决策）忽略。
+通配符匹配到多个文件时按每手第一条事件的时间排序。事件按 `hand_id` 归到各手，按到达顺序排列，
+服务端把它们整理成每手的状态（座位、栈、公共牌、各决策点的建议与 hero 实际动作、结算），页面只用结构化字段，
+不解析文字。
+
+### 启动（wopo 实盘）
+
+driver 只要照旧给 `--play-log $D/play.log`，就会同时写 `$D/wopo_play_events.jsonl`，不用加参数。
+画像服务（在同一台机器上跑，ssh 隧道看）：
+
+```bash
+D=artifacts/wopo_ante200_9b_exploit_live_20261029
+setsid nohup python3 -m opponent_analysis live --db artifacts/opponent_db_ante100_20261029 --platform wopo \
+    --follow "$D/wopo_hh.jsonl" --play-events "$D/wopo_play_events.jsonl" --hero hero \
+    >> $D/opponent_live.log 2>&1 < /dev/null &
+# 本机：ssh -L 8780:127.0.0.1:8780 <机器>，再开 http://127.0.0.1:8780/
+```
+
+画像服务和 driver 谁先启动都行；driver 重启后接着往同一个事件文件追加。
+
+### 事件格式
+
+每行一个 JSON 对象。所有事件都有：`ts`（driver 机器的 Unix 秒，3 位小数，与 play.log 行首时间同一时刻）、
+`type`、`hand_id`、`table_id`、`text`（play.log 这一行去掉时间后的文字，只作对照）。play.log 每一行恰好对应一条事件，
+顺序相同（driver 自测逐行核对，并且只用下面的结构化字段就能还原出每一行的文字）。
+
+| type | play.log 行 | 字段 |
+|---|---|---|
+| `hand_start` | `──── <hand_id> 庄位 …` | `button`、`sb`、`bb`、`ante`（桌面筹码，0 = 无）、`hero_seat`、`n_seats`（solver 座位数） |
+| `hole` | `底牌 …` | `cards`（hero 两张底牌） |
+| `seats` | `座位 …`（首个快照后） | `seats`：每个发牌座 `{seat, name, start（开局栈，交 ante / 盲注前）, stack（交完后的剩余栈）, bet（已下的盲注）, hero, roles（`BTN` / `SB` / `BB` / `补盲`）}`；`button`、`sb_seat`、`bb_seat`、`posts`（补盲座）、`pot` |
+| `action` | 对手动作 | `seat`、`name`、`street`、`turn`（这个动作之前已有的动作数）、`action`（fold / check / call / raise / all_in，按投入归类）、`to`（raise / all_in 的本街总额，其余 null）、`delta`（本次投入）、`to_call_before`（0 时 raise 在 play.log 写成 bet）、`stack_before`、`stack_after`、`pot_after` |
+| `hero_action` | hero 实际动作（`← hero 实际行动 …`） | 同 `action`，另有 `advice`（这个决策点写进行动文件的建议 `{action, amount, text}`，没有 = null）、`match`（`same` / `diff`；没有建议 = null）。raise 和 all_in 互相算一致 |
+| `board` | `翻牌 / 转牌 / 河牌 …` | `street`、`cards`（本街新发的牌）、`board`（到本街为止的全部公共牌）、`pot` |
+| `hero_turn` | `>> 轮到 hero …` | `turn`（决策点编号，和后面的 `decision` / `hero_action` 对应）、`street`、`pot`、`to_call`、`valid`（`can_check` / `can_call` / `can_raise` / `min_raise` / `max_raise`，本街总额）、`hole`、`board`、`table_seq` |
+| `decision` | `>> 决策 …` | `turn`、`street`、`pot`、`to_call`、`valid`、`action`、`amount`（raise 的本街总额）、`all_in`（all_in，或 raise 到最大额）、`advice`（play.log 里的建议文字）、`probs`（`[[动作, 概率]]`，兜底动作为 null）、`chosen`、`source`、`decide_ms`、`stale`（过期原因全文；null = 已写进行动文件）、`stale_kind`（`hero_acted` / `hand_over` / `hand_dead`）、`written`、`rejected`（advisor 原建议不合法被换成安全动作时的原回复） |
+| `dead` | `本手作废：…` | `reason`、`tag`（冒号前的类别）。开局消息本身不合法时只有这一条，没有 `hand_start` |
+| `result` | `结算 …` | `stacks`：每个发牌座 `{seat, name, start, final, net}`；`pot`、`board`、`winners`、`shown`（服务器 `hand_result` 的原样字段）、`notes`（结算核对不过的说明）、`server_ts` |
+
+`decision` 是 worker 线程回调写的，可能在下一手已经开始后才到（`stale_kind = hand_over`），按 `hand_id` 归回原来那手。
+
+`/api/play` 返回 `{enabled, version, max_hands, hands, files, counts, errors, patterns, now}`；`hands` 新的在前，每手是
+`{hand_id, table_id, first_ts, last_ts, partial（开头没读到）, button, sb, bb, ante, hero_seat, hole, seats, board,
+street, pot, turns, dead, result, hero_net, status（playing / done / dead）, events}`，`seats` 里的 `stack` 跟到最近一个动作
+（结算前），`turns` 每项 `{turn, street, pot, to_call, valid, ts, decision, hero_action}`。
 
 数据库：`<db>/<平台>/hands.jsonl`（通过校验的手）、`rejected.jsonl`（被拒的手和原因）、`ingest_log.jsonl`
 （每次导入的文件、sha256、计数）。同一 hand_id 只收一次；被拒过的手再导入会跳过，修了适配器后删掉
@@ -83,7 +151,7 @@ python3 -m unittest discover -s opponent_analysis/tests -t .
 | `exploit.py` | 单点公式：弃牌过多 / 河牌跟注过多 / 河牌诈唬过少或过多，以及各自的保本点。下注额按跟注方能跟上的部分算（超出他筹码的部分不算） |
 | `cards.py` | 河牌牌力百分位（对所有可能底牌） |
 | `report.py` | 群体基准、对手总表、逐人候选漏洞、与群体的显著差异、前后半程漂移、翻前全下的亮牌 |
-| `live.py` + `live.html` | 跟随 hh 日志、增量累加（`report.Accumulator`）、HTTP 页面 |
+| `live.py` + `live.html` | 跟随 hh 日志、增量累加（`report.Accumulator`）、HTTP 页面；`PlayFeed` / `hand_view` 跟随 wopo 事件流（行动指南，`/api/play`） |
 
 ## 现有数据的校验结果（2026-10-20）
 

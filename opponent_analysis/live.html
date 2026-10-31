@@ -120,6 +120,48 @@ ul.plain li { margin: 2px 0; }
 .cards { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .err { color: var(--bad); font-size: 12px; }
 details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+/* action guide (wopo --play-events) */
+.badge { display: inline-block; padding: 0 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.badge.live { color: var(--good); border-color: var(--good); }
+.badge.done { color: var(--accent); border-color: var(--accent); }
+.badge.dead, .badge.diff { color: var(--bad); border-color: var(--bad); }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.badge.same { color: var(--good); border-color: var(--good); }
+.g-head { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: baseline; font-size: 13px; }
+.g-head .hid { font-weight: 600; font-size: 15px; }
+.g-grid { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); margin-top: 10px; }
+.g-cards { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; margin: 4px 0 8px; font-size: 12px; color: var(--muted); }
+.g-cards > span { display: inline-flex; align-items: center; gap: 4px; }
+.pc { display: inline-block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; font-size: 12px; color: var(--ink); padding: 0 4px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); margin-right: 2px; }
+.pc.red { color: var(--bad); }
+.pc.big { font-size: 18px; padding: 2px 7px; }
+.advice { border: 1px solid var(--accent); border-radius: 8px; padding: 10px 14px; background: var(--accent-soft); }
+.advice.stale, .advice.idle { border-color: var(--line); background: transparent; }
+.advice .act { font-size: 24px; font-weight: 700; color: var(--accent); line-height: 1.3; }
+.advice.stale .act { color: var(--muted); text-decoration: line-through; }
+.advice .meta { margin-top: 4px; }
+.probs { display: grid; grid-template-columns: minmax(60px, auto) 1fr 40px; gap: 2px 8px; font-size: 12px; align-items: center; margin-top: 8px; }
+.probs .bar { height: 8px; background: var(--band); border-radius: 2px; min-width: 1px; }
+.probs .on { font-weight: 600; color: var(--accent); }
+.g-actual { margin-top: 8px; font-size: 13px; }
+.seats-tab td, .seats-tab th { padding: 4px 8px; }
+.seats-tab th { cursor: default; position: static; }
+.seats-tab tbody tr { cursor: default; }
+.seats-tab tr.folded td { color: var(--muted); }
+.seats-tab tr.hero td { background: var(--hero); }
+.namebtn { border: none; background: none; padding: 0; font: inherit; color: var(--accent); cursor: pointer; text-align: left; }
+.namebtn:hover { text-decoration: underline; }
+.timeline { font-size: 12px; margin-top: 6px; }
+.timeline .st { font-weight: 600; color: var(--muted); margin: 8px 0 2px; display: flex; gap: 8px; align-items: center; }
+.tl { display: flex; gap: 8px; padding: 1px 4px; border-radius: 3px; }
+.tl .t { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 60px; }
+.tl.hero { background: var(--hero); }
+.tl.dec { color: var(--accent); }
+.tl.bad { color: var(--bad); }
+details.hand { border-top: 1px solid var(--line); margin: 0; padding: 4px 0; }
+details.hand > summary { font-weight: 400; font-size: 12px; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: center; }
+details.hand > div { padding: 4px 0 8px 14px; }
+@media (max-width: 980px) { .g-grid { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 980px) { main { grid-template-columns: minmax(0, 1fr); padding: 12px 16px 32px; } header { padding: 12px 16px; } .statbar { grid-template-columns: 96px 1fr 150px; } .statbar .spark { display: none; } }
 </style>
 </head>
@@ -133,6 +175,12 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
   </div>
 </header>
 <main>
+  <section class="full" id="guide" hidden>
+    <div class="section-head"><h2>行动指南 <span class="muted" id="g-sub"></span></h2><span class="pill stale" id="g-status">连接中</span></div>
+    <div id="g-current"><div class="empty">还没有事件</div></div>
+    <details class="pt" id="g-recent-box"><summary>最近 <span id="g-n">0</span> 手<span class="muted">点开看每手的动作、建议与结算</span></summary><div id="g-recent"></div></details>
+    <p class="legend" id="g-files"></p>
+  </section>
   <section class="full">
     <h2>牌桌（最近一手）</h2>
     <div class="tables" id="tables"><div class="empty">还没有手牌</div></div>
@@ -466,6 +514,7 @@ function render() {
   if (!snap) return;
   if (!selected || !snap.players.some(p => p.name === selected)) selected = (snap.players.find(p => !p.hero) || {}).name || null;
   renderHeader(); renderTables(); renderPlayers(); renderDetail(); renderRecent(); renderQuality();
+  if (play) renderGuide();  // seat profile numbers come from the snapshot
 }
 
 function select(name) {
@@ -493,6 +542,210 @@ async function poll() {
   setTimeout(poll, 3000);
 }
 poll();
+
+// ---- Action guide: the wopo driver's --play-events stream (/api/play), polled every second.
+// The server groups events by hand and derives the state; everything here uses structured
+// fields only (an event's `text` is the play.log line and is not parsed).
+let play = null, playOff = 0, playFailures = 0;
+const openHands = new Set();
+const SUIT = { s: '♠', h: '♥', d: '♦', c: '♣' };
+const pcard = (c, big) => { const r = String(c ?? ''), su = r.slice(-1).toLowerCase(); return `<span class="pc ${big ? 'big' : ''} ${su === 'h' || su === 'd' ? 'red' : ''}">${esc(r.slice(0, -1))}${SUIT[su] || esc(su)}</span>`; };
+const pcards = (cs, big) => (cs && cs.length) ? cs.map(c => pcard(c, big)).join('') : '<span class="muted">—</span>';
+const nowS = () => Date.now() / 1000 + playOff;  // driver-side clock (server sends its time)
+const secAgo = ts => ts ? Math.max(0, nowS() - ts) : null;
+const agoP = ts => { const s = secAgo(ts); if (s == null) return '—'; if (s < 60) return Math.round(s) + ' 秒前'; if (s < 3600) return Math.round(s / 60) + ' 分钟前'; return (s / 3600).toFixed(1) + ' 小时前'; };
+const clock = ts => ts ? new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+const shortHid = h => { const s = String(h ?? '（无编号）'); const i = s.lastIndexOf(':'); return i >= 0 ? '#' + s.slice(i + 1) : s; };
+const STALE_CN = { hero_acted: 'hero 已行动', hand_over: '这手已结束', hand_dead: '这手已作废' };
+const STATUS = { playing: ['live', '进行中'], done: ['done', '已结算'], dead: ['dead', '作废'] };
+// Same wording as the driver's play.log (poker_live/wopo.py _fmt_act).
+function fmtAct(a, to, delta, toCall) {
+  if (a === 'raise' && toCall === 0) return `bet ${to}`;
+  if (to != null) return `${a} 到 ${to}`;
+  return a === 'call' && delta != null ? `call ${delta}` : String(a ?? '');
+}
+const adviceText = d => fmtAct(d.action, d.amount, d.to_call, d.to_call) + (d.action === 'raise' && d.all_in ? '（全下）' : '');
+const probName = n => { for (const p of ['bet', 'raise']) if (n.startsWith(p) && n !== p) return n.slice(p.length); return n; };
+function nameBtn(name, seat) {
+  const label = name ?? `座${seat}`;
+  const known = snap && name != null && snap.players.some(p => p.name === name);
+  return known ? `<button class="namebtn" data-n="${esc(name)}">${esc(label)}</button>` : esc(label);
+}
+function profChip(name) {
+  if (!snap) return '<span class="muted">画像加载中</span>';
+  const p = name != null && snap.players.find(x => x.name === name);
+  if (!p) return '<span class="muted">无画像</span>';
+  const r = k => p.rates[k] && p.rates[k].n ? pct(p.rates[k].mean) : '—';
+  const L = p.leaks.filter(x => x.gain_cons > 0).length, U = p.leaks.length - L;
+  return `${p.hands} 手 · 入池 / 加注 ${r('vpip:yes')} / ${r('pfr:yes')} · 候选漏洞 ${L ? `<b>${L}</b>` : '0'}${U ? `<span class="muted" title="均值为正、保守值不为正">+${U}?</span>` : ''} · <span class="muted">${esc(p.tag)}</span>`;
+}
+
+function seatsTable(h) {
+  if (!h.seats.length) return '<p class="muted">没有座位信息（从这手中途开始读）。</p>';
+  const bb = h.bb;
+  const rows = h.seats.map(x => {
+    const last = x.last ? fmtAct(x.last.action, x.last.to, x.last.delta, x.last.to_call_before) : '';
+    return `<tr class="${x.seat === h.hero_seat ? 'hero' : ''} ${x.folded ? 'folded' : ''}"><td class="num">${x.seat}</td>
+      <td class="l">${nameBtn(x.name, x.seat)}${x.seat === h.hero_seat ? ' <span class="flag">我方</span>' : ''}</td><td class="l">${esc((x.roles || []).join(' '))}</td>
+      <td class="num">${x.start ?? '—'}${bb && x.start != null ? ` <span class="ci">${(x.start / bb).toFixed(1)}BB</span>` : ''}</td>
+      <td class="num">${x.stack ?? '—'}</td><td class="l">${esc(last)}${x.folded && x.last && x.last.action !== 'fold' ? ' · 弃' : ''}</td>
+      <td class="l">${x.seat === h.hero_seat ? '' : profChip(x.name)}</td></tr>`;
+  }).join('');
+  return `<div class="scroll"><table class="seats-tab"><thead><tr><th>座</th><th class="l">玩家</th><th class="l">位置</th><th>开局</th><th>剩余</th><th class="l">本手最近动作</th><th class="l">画像（全部历史）</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function probsGrid(d) {
+  if (!d.probs || !d.probs.length) return '<p class="muted" style="margin:6px 0 0">没有策略分布（启发式 / 兜底动作）。</p>';
+  return '<div class="probs">' + d.probs.map(([n, p]) => {
+    const on = n === d.chosen ? 'on' : '';
+    return `<span class="${on}" title="${esc(n)}">${esc(probName(n))}</span><div><div class="bar" style="width:${(100 * p).toFixed(1)}%"></div></div><span class="num ${on}">${(100 * p).toFixed(0)}%</span>`;
+  }).join('') + '</div>';
+}
+
+function matchBadge(a) {
+  if (!a) return '';
+  if (a.match === 'same') return '<span class="badge same">同建议</span>';
+  if (a.match === 'diff') return `<span class="badge diff">不同于建议 ${esc(a.advice ? a.advice.text : '')}</span>`;
+  return '<span class="badge warn">无建议</span>';
+}
+
+function decisionBox(h) {
+  const t = h.turns[h.turns.length - 1];
+  if (!t) return `<div class="advice idle"><div class="muted">${h.status === 'playing' ? '这手还没轮到 hero' : '这手 hero 没有决策点'}</div></div>`;
+  const d = t.decision, a = t.hero_action;
+  const where = `${STREET_CN[t.street] || esc(t.street || '')}${t.pot != null ? `，底池 ${t.pot}` : ''}${t.to_call != null ? `，跟 ${t.to_call}` : ''}`;
+  let html;
+  if (!d) {
+    const pending = h.status === 'playing' && !a;
+    html = `<div class="advice ${pending ? '' : 'idle'}"><div class="muted">第 ${h.turns.length} 个决策点 · ${where}</div>`
+      + (pending ? `<div class="act">计算中…</div><div class="meta muted">已等待 <span id="g-pending" data-ts="${t.ts || ''}">${Math.round(secAgo(t.ts) || 0)}</span> 秒</div>`
+        : `<div class="act" style="color:var(--muted)">无建议</div><div class="meta muted">${a ? '建议没赶上，hero 已自行行动' : '这手已结束或作废'}</div>`);
+  } else {
+    const stale = !d.written;
+    html = `<div class="advice ${stale ? 'stale' : ''}"><div class="muted">第 ${h.turns.length} 个决策点 · ${where}</div>
+      <div class="act">建议 ${esc(adviceText(d))}</div>
+      <div class="meta">${stale ? `<span class="badge warn">已过期（${esc(STALE_CN[d.stale_kind] || d.stale)}），未写入行动文件</span> ` : ''}<span class="muted">来源 ${esc(d.source)} · ${d.decide_ms} ms · ${clock(d.ts)}</span>${d.rejected ? ` <span class="badge warn" title="${esc(JSON.stringify(d.rejected))}">原建议不合法，已换安全动作</span>` : ''}</div>`
+      + probsGrid(d);
+  }
+  if (a) html += `<div class="g-actual">hero 实际：<b>${esc(fmtAct(a.action, a.to, a.delta, a.to_call_before))}</b> ${matchBadge(a)}</div>`;
+  else if (h.status === 'playing' && d) html += '<div class="g-actual muted">等待 hero 行动</div>';
+  return html + '</div>';
+}
+
+function timeline(h) {
+  const groups = [];
+  let cur = null;
+  const open = (st, board) => { cur = { st, board, rows: [] }; groups.push(cur); };
+  open('preflop', null);
+  const seatName = s => { const x = h.seats.find(y => y.seat === s); return x ? x.name : null; };
+  for (const e of h.events) {
+    const t = clock(e.ts), who = () => `${nameBtn(e.name ?? seatName(e.seat), e.seat)} <span class="muted">座${e.seat}</span>`;
+    let row = null, cls = '';
+    switch (e.type) {
+      case 'board': open(e.street, e.cards); continue;
+      case 'action': row = `${who()} ${esc(fmtAct(e.action, e.to, e.delta, e.to_call_before))}`; break;
+      case 'hero_action': row = `${who()} <b>${esc(fmtAct(e.action, e.to, e.delta, e.to_call_before))}</b> ${matchBadge(e)}`; cls = 'hero'; break;
+      case 'hero_turn': row = `轮到 hero · 底池 ${e.pot} · 跟 ${e.to_call}`; cls = 'hero'; break;
+      case 'decision': row = `建议 <b>${esc(adviceText(e))}</b> · ${esc(e.source)} · ${e.decide_ms} ms` + (e.written ? '' : ` <span class="badge warn">已过期（${esc(STALE_CN[e.stale_kind] || e.stale)}）</span>`); cls = 'dec'; break;
+      case 'dead': row = `本手作废：${esc(e.reason)}（之后不出建议）`; cls = 'bad'; break;
+      case 'result': row = '结算'; break;
+      default: continue;  // hand_start / hole / seats are shown above the timeline
+    }
+    cur.rows.push(`<div class="tl ${cls}"><span class="t">${t}</span><span>${row}</span></div>`);
+  }
+  return '<div class="timeline">' + groups.filter((g, i) => i === 0 || g.rows.length || g.board).map(g =>
+    `<div class="st">${STREET_CN[g.st] || esc(g.st)}${g.board ? ' ' + pcards(g.board) : ''}</div>${g.rows.join('') || '<div class="tl muted"><span class="t"></span><span>（没有动作）</span></div>'}`).join('') + '</div>';
+}
+
+function resultBlock(h) {
+  const r = h.result;
+  if (!r) return '';
+  const name = s => { const x = (r.stacks || []).find(y => y.seat === s) || h.seats.find(y => y.seat === s); return x && x.name != null ? x.name : `座${s}`; };
+  const nets = (r.stacks || []).filter(x => x.final != null && x.final !== x.start).sort((a, b) => b.net - a.net);
+  const shown = Object.entries(r.shown || {});
+  return `<h3>结算 · 底池 ${r.pot ?? '—'}</h3><p class="num" style="margin:0">${nets.map(x => `${nameBtn(x.name, x.seat)} ${signed(x.net, 0)}`).join(' · ') || '<span class="muted">无输赢</span>'}</p>`
+    + (shown.length ? `<p style="margin:4px 0 0">亮牌：${shown.map(([s, cs]) => `${esc(name(+s))} ${pcards(cs)}`).join(' · ')}</p>` : '')
+    + (r.notes && r.notes.length ? `<p class="err">结算核对：${esc(r.notes.join('; '))}</p>` : '');
+}
+
+function handBody(h, full) {
+  if (h.error) return `<p class="err">这手的事件无法解析：${esc(h.error)}</p>`;
+  const cardsLine = `<div class="g-cards"><span>底牌 ${pcards(h.hole, full)}</span><span>公共牌 ${pcards(h.board, full)}</span><span>底池 <b class="num">${h.pot ?? '—'}</b></span></div>`;
+  if (!full) return cardsLine + timeline(h) + resultBlock(h);
+  return cardsLine + `<div class="g-grid"><div>${decisionBox(h)}${resultBlock(h)}</div><div>${seatsTable(h)}</div></div>` + timeline(h);
+}
+
+function handHead(h) {
+  const [cls, label] = STATUS[h.status] || ['', esc(h.status)];
+  const bl = h.sb != null ? `盲注 ${h.sb}/${h.bb}${h.ante ? ` · ante ${h.ante}` : ''}` : '';
+  return `<div class="g-head"><span class="hid" title="${esc(h.hand_id)}">${esc(shortHid(h.hand_id))}</span><span class="badge ${cls}">${label}${h.dead ? '：' + esc(h.dead.reason) : ''}</span>`
+    + `<span class="muted">${esc(h.table_id || '')}</span>${h.button != null ? `<span>庄位 座${h.button}</span>` : ''}${bl ? `<span>${bl}</span>` : ''}`
+    + `<span class="muted">开始 ${clock(h.first_ts)}（${agoP(h.first_ts)}）</span>${h.partial ? '<span class="badge warn">从这手中途开始读，开头没有</span>' : ''}</div>`;
+}
+
+function handSummary(h) {
+  const n = h.turns.length, c = { same: 0, diff: 0, none: 0, stale: 0 };
+  for (const t of h.turns) {
+    if (t.hero_action) c[t.hero_action.match === 'same' ? 'same' : t.hero_action.match === 'diff' ? 'diff' : 'none']++;
+    if (t.decision && !t.decision.written) c.stale++;
+  }
+  const [cls, label] = STATUS[h.status] || ['', h.status];
+  return `<span class="muted">${clock(h.first_ts)}</span><span title="${esc(h.hand_id)}">${esc(shortHid(h.hand_id))}</span><span>${pcards(h.hole)}</span><span>${pcards(h.board)}</span>`
+    + `<span>hero ${h.hero_net == null ? '<span class="muted">—</span>' : signed(h.hero_net, 0)}</span>`
+    + `<span class="muted">决策 ${n}${n ? `（同 ${c.same} / 不同 ${c.diff} / 无建议 ${c.none}${c.stale ? ` / 过期 ${c.stale}` : ''}）` : ''}</span><span class="badge ${cls}">${esc(label)}</span>`;
+}
+
+function guideStatus() {
+  const st = $('g-status');
+  const last = play && play.hands.length ? Math.max(...play.hands.map(h => h.last_ts || 0)) : 0;
+  if (playFailures) { st.className = 'pill down'; st.textContent = '服务连不上'; }
+  else if (!last) { st.className = 'pill stale'; st.textContent = '等待 driver 写事件'; }
+  else if (secAgo(last) > 120) { st.className = 'pill stale'; st.textContent = '最近事件 ' + agoP(last); }
+  else { st.className = 'pill'; st.textContent = '实时'; }
+}
+
+function renderGuide() {
+  const hs = play.hands;
+  $('g-sub').textContent = hs.length ? `· ${hs[0].table_id || ''}` : '';
+  $('g-current').innerHTML = hs.length ? handHead(hs[0]) + handBody(hs[0], true) : '<div class="empty">还没有事件（driver 开局后出现）</div>';
+  const rest = hs.slice(1);
+  $('g-n').textContent = rest.length;
+  $('g-recent').innerHTML = rest.map(h => `<details class="hand" data-h="${esc(h.hand_id)}" ${openHands.has(String(h.hand_id)) ? 'open' : ''}><summary>${handSummary(h)}</summary><div>${handHead(h)}${handBody(h, false)}</div></details>`).join('')
+    || '<div class="empty">还没有更早的手</div>';
+  $('g-files').innerHTML = '事件文件：' + (play.files.map(f => `<span class="cards">${esc(f.path)}</span> ${f.lines} 行${f.bad_lines ? '，坏行 ' + f.bad_lines : ''}，最后修改 ${agoP(f.mtime)}`).join('；') || `没有匹配 ${esc(play.patterns.join(' '))} 的文件`)
+    + (play.errors && play.errors.length ? ` <span class="err">${esc(play.errors[0].msg)}</span>` : '');
+  guideStatus();
+}
+
+function tickGuide() {
+  const el = document.getElementById('g-pending');
+  if (el && el.dataset.ts) el.textContent = Math.round(secAgo(+el.dataset.ts) || 0);
+  if (play) guideStatus(); else if (playFailures) { $('g-status').className = 'pill down'; $('g-status').textContent = '服务连不上'; }
+}
+
+$('g-recent').addEventListener('toggle', e => {
+  const d = e.target.closest('details.hand'); if (!d) return;
+  if (d.open) openHands.add(d.dataset.h); else openHands.delete(d.dataset.h);
+}, true);
+$('guide').addEventListener('click', e => {
+  const b = e.target.closest('.namebtn'); if (!b) return;
+  e.preventDefault(); select(b.dataset.n); $('detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+
+async function pollPlay() {
+  try {
+    const r = await fetch('/api/play' + (play ? '?since=' + play.version : ''), { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+    if (!r.ok) throw new Error('http ' + r.status);
+    const d = await r.json();
+    playFailures = 0;
+    if (!d.enabled) { $('guide').hidden = true; return; }  // started without --play-events: no panel
+    $('guide').hidden = false;
+    if (d.now) playOff = d.now - Date.now() / 1000;
+    if (!d.unchanged) { play = d; renderGuide(); } else tickGuide();
+  } catch { playFailures++; tickGuide(); }
+  setTimeout(pollPlay, 1000);
+}
+pollPlay();
 </script>
 </body>
 </html>

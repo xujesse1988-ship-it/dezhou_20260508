@@ -5,6 +5,11 @@ finished hand). Each new line goes through the same adapter + replay validation 
 `ingest` and is appended to the platform database, so a restart resumes from the database
 and the followed files are re-read with hand_id dedupe.
 
+Optionally (--play-events) the wopo driver's play-event stream is followed too: one JSON line
+per play.log line, written while the hand is played. It only feeds the "action guide" panel
+(/api/play): the current hand and the last N hands, held in memory, never written to the
+database.
+
     python3 -m opponent_analysis live --db artifacts/opponent_db --platform poker_manager \
         --follow 'artifacts/poker_manager_live_*/poker_manager_hh.jsonl' --port 8780
 """
@@ -18,7 +23,7 @@ import os
 import threading
 import time
 import traceback
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 from urllib.parse import parse_qs, urlsplit
@@ -42,10 +47,15 @@ class Follower:
     Patterns are re-expanded on each poll, so a new run directory is picked up. A file that
     shrinks or is replaced (new inode) is read again from the start; dedupe is by hand_id.
     A trailing line without its newline is left for the next poll (the writer is mid-line).
+
+    tail_bytes: a file seen for the first time is read from its last tail_bytes only (the
+    partial first line is skipped); None = from the start. A replaced / shrunk file is still
+    read from the start.
     """
 
-    def __init__(self, patterns: list[str]):
+    def __init__(self, patterns: list[str], tail_bytes: Optional[int] = None):
         self.patterns = patterns
+        self.tail_bytes = tail_bytes
         self.files: dict[str, dict] = {}
 
     def poll(self) -> list[tuple[str, int, dict]]:
@@ -58,13 +68,30 @@ class Follower:
                 continue
             f = self.files.get(path)
             if f is None or f["ino"] != st.st_ino or st.st_size < f["offset"]:
-                f = self.files[path] = {"ino": st.st_ino, "offset": 0, "lines": 0, "bad_lines": 0, "mtime": None}
+                start = 0
+                if f is None and self.tail_bytes is not None and st.st_size > self.tail_bytes:
+                    start = st.st_size - self.tail_bytes
+                f = self.files[path] = {"ino": st.st_ino, "offset": start, "lines": 0, "bad_lines": 0,
+                                        "mtime": None, "skip_partial": start > 0}
             f["mtime"] = st.st_mtime
             if st.st_size == f["offset"]:
                 continue
             with open(path, "rb") as fh:
                 fh.seek(f["offset"])
                 data = fh.read(st.st_size - f["offset"])
+            if f["skip_partial"]:
+                # Started mid-file: drop everything up to the first newline (a partial line),
+                # unless the byte before the start is itself a newline.
+                with open(path, "rb") as fh:
+                    fh.seek(f["offset"] - 1)
+                    at_line_start = fh.read(1) == b"\n"
+                if not at_line_start:
+                    cut = data.find(b"\n")
+                    if cut < 0:
+                        continue
+                    f["offset"] += cut + 1
+                    data = data[cut + 1:]
+                f["skip_partial"] = False
             end = data.rfind(b"\n")
             if end < 0:
                 continue
@@ -249,6 +276,229 @@ def _hand_line(h: Hand) -> dict:
     }
 
 
+# ------------------------------------------------------------------ action guide (wopo play events)
+
+class PlayFeed:
+    """Follows the wopo driver's --play-events JSONL and keeps the newest `max_hands` hands.
+
+    Events are grouped by hand_id in arrival order; hands are ordered by their first event's
+    ts (so several followed files interleave correctly). A file seen for the first time is read
+    from its last `tail_bytes` only, which is plenty for max_hands hands, so a restart recovers
+    the recent hands without reading a long session. Identical re-read events are dropped; an
+    event for a hand already pushed out of the window is ignored (it would otherwise come back
+    as the newest hand).
+    """
+
+    def __init__(self, patterns: list[str], max_hands: int = 20, tail_bytes: int = 8 << 20):
+        self.patterns = patterns
+        self.max_hands = max(1, max_hands)
+        self.follower = Follower(patterns, tail_bytes=tail_bytes)
+        self.hands: dict[str, dict] = {}
+        self.dropped: OrderedDict = OrderedDict()
+        self.seq = 0
+        self.counts: Counter = Counter()
+        self.errors: deque = deque(maxlen=20)
+        self.version = 0
+        self.lock = threading.Lock()
+        self.body: dict = {}
+        self._publish()
+
+    def step(self) -> int:
+        """Reads new events; returns how many were added (0 = no change, version unchanged)."""
+        added = 0
+        for path, line_no, rec in self.follower.poll():
+            if not isinstance(rec, dict) or not isinstance(rec.get("type"), str):
+                self.counts["bad_event"] += 1
+                continue
+            added += self._add(rec)
+        if added:
+            self._evict()
+            self._publish()
+        return added
+
+    def _add(self, rec: dict) -> int:
+        hid = rec.get("hand_id")
+        key = "" if hid is None else str(hid)
+        if key in self.dropped:
+            self.counts["late_event"] += 1
+            return 0
+        h = self.hands.get(key)
+        ts = _ts(rec.get("ts"))
+        if h is None and len(self.hands) >= self.max_hands and ts is not None and all(
+                x["first_ts"] is not None and ts < x["first_ts"] for x in self.hands.values()):
+            # Older than every hand in a full window (e.g. a re-read file's early part): it
+            # would be evicted at once, so it is not a change.
+            self.dropped[key] = True
+            self.counts["late_event"] += 1
+            return 0
+        if h is None:
+            self.seq += 1
+            h = self.hands[key] = {"hand_id": hid, "events": [], "seen": set(), "seq": self.seq,
+                                   "first_ts": _ts(rec.get("ts"))}
+        sig = json.dumps(rec, sort_keys=True, ensure_ascii=False)
+        if sig in h["seen"]:
+            self.counts["duplicate"] += 1
+            return 0
+        h["seen"].add(sig)
+        h["events"].append(rec)
+        if h["first_ts"] is None:
+            h["first_ts"] = _ts(rec.get("ts"))
+        self.counts["events"] += 1
+        return 1
+
+    def _order(self, key: str):
+        h = self.hands[key]
+        return (h["first_ts"] if h["first_ts"] is not None else 0.0, h["seq"])
+
+    def _evict(self) -> None:
+        if len(self.hands) <= self.max_hands:
+            return
+        for key in sorted(self.hands, key=self._order)[: len(self.hands) - self.max_hands]:
+            del self.hands[key]
+            self.dropped[key] = True
+        while len(self.dropped) > 10000:
+            self.dropped.popitem(last=False)
+
+    def _publish(self) -> None:
+        views = []
+        for key in sorted(self.hands, key=self._order, reverse=True):
+            h = self.hands[key]
+            try:
+                views.append(hand_view(h["hand_id"], h["events"]))
+            except Exception as e:  # a malformed event must not take the panel down
+                self.errors.appendleft({"ts": time.time(), "msg": f"{key}: {type(e).__name__}: {e}"})
+                views.append({"hand_id": h["hand_id"], "error": f"{type(e).__name__}: {e}",
+                              "events": h["events"]})
+        with self.lock:
+            self.version += 1
+            self.body = {
+                "enabled": True, "version": self.version, "max_hands": self.max_hands, "hands": views,
+                "patterns": self.patterns,
+                "files": [{"path": p, "lines": f["lines"], "bad_lines": f["bad_lines"], "mtime": f["mtime"]}
+                          for p, f in sorted(self.follower.files.items())],
+                "counts": dict(self.counts), "errors": list(self.errors),
+            }
+
+    def response(self, since: Optional[str]) -> dict:
+        with self.lock:
+            if since is not None and since == str(self.version):
+                return {"enabled": True, "version": self.version, "unchanged": True, "now": time.time()}
+            return dict(self.body, now=time.time())
+
+    def run(self, stop: threading.Event, poll_s: float) -> None:
+        while not stop.is_set():
+            try:
+                self.step()
+            except Exception as e:  # keep serving the last good state
+                self.errors.appendleft({"ts": time.time(), "msg": f"{type(e).__name__}: {e}"})
+                traceback.print_exc()
+            stop.wait(poll_s)
+
+
+def _ts(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def hand_view(hand_id, events: list[dict]) -> dict:
+    """One hand's events -> the state the page shows. Only structured fields are used (the
+    event's `text` is the play.log line, kept for reference). A hand whose first events were
+    not read (follow started mid-hand) has partial=True."""
+    v = {"hand_id": hand_id, "table_id": None, "first_ts": None, "last_ts": None, "partial": True,
+         "button": None, "sb": None, "bb": None, "ante": 0, "hero_seat": None, "hole": None,
+         "seats": [], "board": [], "street": "preflop", "pot": None, "turns": [], "dead": None,
+         "result": None, "hero_net": None, "status": "playing", "events": events}
+    seats: dict[int, dict] = {}
+    turns: dict[int, dict] = {}
+
+    def seat(s, name=None):
+        x = seats.get(s)
+        if x is None:
+            x = seats[s] = {"seat": s, "name": name, "start": None, "stack": None, "bet": 0, "roles": [],
+                            "hero": False, "folded": False, "last": None}
+        if name is not None:
+            x["name"] = name
+        return x
+
+    def turn(e):
+        k = e.get("turn")
+        t = turns.get(k)
+        if t is None:
+            t = turns[k] = {"turn": k, "street": e.get("street"), "pot": None, "to_call": None, "valid": None,
+                            "ts": None, "decision": None, "hero_action": None}
+        return t
+
+    for e in events:
+        t = e.get("type")
+        ts = _ts(e.get("ts"))
+        if ts is not None:
+            v["first_ts"] = ts if v["first_ts"] is None else min(v["first_ts"], ts)
+            v["last_ts"] = ts if v["last_ts"] is None else max(v["last_ts"], ts)
+        if e.get("table_id") is not None:
+            v["table_id"] = e["table_id"]
+        if t == "hand_start":
+            v["partial"] = False
+            for k in ("button", "sb", "bb", "ante", "hero_seat"):
+                v[k] = e.get(k)
+        elif t == "hole":
+            v["hole"] = e.get("cards")
+        elif t == "seats":
+            for k in ("button",):
+                if e.get(k) is not None:
+                    v[k] = e[k]
+            for s in e.get("seats") or []:
+                x = seat(s.get("seat"), s.get("name"))
+                x.update(start=s.get("start"), stack=s.get("stack"), bet=s.get("bet") or 0,
+                         roles=list(s.get("roles") or []), hero=bool(s.get("hero")))
+                if x["hero"] and v["hero_seat"] is None:
+                    v["hero_seat"] = x["seat"]
+            v["pot"] = e.get("pot")
+        elif t in ("action", "hero_action"):
+            x = seat(e.get("seat"), e.get("name"))
+            x["stack"] = e.get("stack_after")
+            x["bet"] = (x["bet"] or 0) + (e.get("delta") or 0)
+            if e.get("action") == "fold":
+                x["folded"] = True
+            x["last"] = {k: e.get(k) for k in ("action", "to", "delta", "to_call_before", "street")}
+            if t == "hero_action":
+                x["hero"] = True
+                tr = turn(e)
+                tr["hero_action"] = {k: e.get(k) for k in ("action", "to", "delta", "to_call_before",
+                                                             "advice", "match", "ts")}
+            v["pot"] = e.get("pot_after")
+            v["street"] = e.get("street") or v["street"]
+        elif t == "board":
+            v["board"] = list(e.get("board") or [])
+            v["street"] = e.get("street") or v["street"]
+            v["pot"] = e.get("pot")
+            for x in seats.values():
+                x["bet"] = 0
+        elif t == "hero_turn":
+            tr = turn(e)
+            tr.update({k: e.get(k) for k in ("street", "pot", "to_call", "valid")}, ts=ts)
+            if v["hole"] is None and e.get("hole"):
+                v["hole"] = e["hole"]
+        elif t == "decision":
+            tr = turn(e)
+            if tr["street"] is None:
+                tr["street"] = e.get("street")
+            tr["decision"] = {k: e.get(k) for k in ("action", "amount", "all_in", "advice", "probs", "chosen",
+                                                     "source", "decide_ms", "stale", "stale_kind", "written",
+                                                     "rejected", "pot", "to_call", "valid")}
+            tr["decision"]["ts"] = ts
+        elif t == "dead":
+            v["dead"] = {"reason": e.get("reason"), "tag": e.get("tag"), "ts": ts}
+        elif t == "result":
+            v["result"] = {k: e.get(k) for k in ("stacks", "pot", "board", "winners", "shown", "notes")}
+            v["pot"] = e.get("pot")
+            for x in e.get("stacks") or []:
+                if x.get("seat") == v["hero_seat"]:
+                    v["hero_net"] = x.get("net")
+    v["seats"] = [seats[s] for s in sorted(seats, key=lambda s: (s is None, s if isinstance(s, int) else 0))]
+    v["turns"] = [turns[k] for k in sorted(turns, key=lambda k: k if isinstance(k, int) else -1)]
+    v["status"] = "dead" if v["dead"] else "done" if v["result"] else "playing"
+    return v
+
+
 # ------------------------------------------------------------------ JSON for the page
 
 def _num(x):
@@ -336,7 +586,7 @@ def _kn(p, stat: str, outcome: str) -> tuple[int, int]:
 
 # ------------------------------------------------------------------ HTTP
 
-def make_handler(live: Live):
+def make_handler(live: Live, play: Optional[PlayFeed] = None):
     class H(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # quiet: the page polls every few seconds
             pass
@@ -365,6 +615,10 @@ def make_handler(live: Live):
                 else:
                     body = snap
                 self._send(200, json.dumps(body, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+            elif u.path == "/api/play":
+                since = parse_qs(u.query).get("since", [None])[0]
+                body = play.response(since) if play is not None else {"enabled": False}
+                self._send(200, json.dumps(body, ensure_ascii=False).encode(), "application/json; charset=utf-8")
             elif u.path == "/report.md":
                 self._send(200, md.encode(), "text/markdown; charset=utf-8")
             elif u.path == "/profile.json":
@@ -376,13 +630,19 @@ def make_handler(live: Live):
 
 
 def serve(db_dir: str, platform: str, patterns: list[str], host: str, port: int, cfg: Config,
-          poll_s: float = 2.0, refresh_s: float = 5.0, hero_names=()) -> None:
+          poll_s: float = 2.0, refresh_s: float = 5.0, hero_names=(), play_patterns=None,
+          play_hands: int = 20, play_poll_s: float = 0.5) -> None:
     live = Live(db_dir, platform, patterns, cfg, refresh_s, hero_names)
+    play = PlayFeed(play_patterns, play_hands) if play_patterns else None
     # Bind first: a busy port fails at once, and the page shows "loading" during bootstrap.
-    httpd = ThreadingHTTPServer((host, port), make_handler(live))
+    httpd = ThreadingHTTPServer((host, port), make_handler(live, play))
     print(f"serving http://{host}:{port}/", flush=True)
     stop = threading.Event()
     failed = []
+    if play is not None:
+        # Own thread: the guide stays live while the profile bootstraps or rebuilds.
+        threading.Thread(target=play.run, args=(stop, play_poll_s), daemon=True).start()
+        print(f"action guide: following {', '.join(play_patterns)} (last {play.max_hands} hands)", flush=True)
 
     def work() -> None:
         t0 = time.time()

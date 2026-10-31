@@ -117,7 +117,7 @@ class WopoSession:
     def __init__(self, worker, action_file, n_seats, hero_seat=0, num_hands=0,
                  action_log=None, prewarm=False, exploit=False, debug=False,
                  exploit_4bet=False, hh_log=None, play_log=None, ante=0, blueprint_ante=0,
-                 send_hand_id=False):
+                 send_hand_id=False, play_events=None):
         self.worker = worker
         # ante：桌面每座 ante（--ante，桌面筹码）；blueprint_ante：blueprint 的 ante（solver 筹码，
         # BB = 100）。每手按 ante × 100 == blueprint_ante × 大盲 核对，对不上这手作废。
@@ -139,6 +139,9 @@ class WopoSession:
         # 牌桌实况（人看）：手牌 / 公共牌 / 玩家行动 / hero 决策 / 结算 / 作废；None = 不写。
         # 诊断信息（连接、未知消息、过期等）照旧走 stderr。
         self.play_log = play_log
+        # 牌桌实况的结构化事件流（JSONL，opponent_analysis live --play-events 读）：play log 每写一行，
+        # 这里同时写一条同 type 的事件（带同一行文字 text）；None = 不写。只记录，不影响决策。
+        self.play_events = play_events
         self.debug = debug
         # 消息处理线程（transport）和决策回调线程（worker）共用 → 串行化；RLock：同步 worker
         # 在处理线程里当场回调。
@@ -159,10 +162,25 @@ class WopoSession:
         self.fallback_reasons = {}
         self.skip_reasons = {}  # 作废原因（冒号前标签）→ 手数
 
-    def _play(self, text):
+    def _play(self, text, etype, hand_id=None, **fields):
+        """play log 一行 + 一条结构化事件（同一时刻、同一段文字）。hand_id 缺省 = 当前手。
+        事件字段见 docs：ts / type / hand_id / table_id / 各 type 自己的字段 / text。"""
+        # Same instant for the log clock and the event ts; truncate (not round) so the log's second never
+        # moves past the wall clock's.
+        now = int(time.time() * 1000) / 1000
         if self.play_log:
-            self.play_log.write(f"{time.strftime('%H:%M:%S')} {text}\n")
+            self.play_log.write(f"{time.strftime('%H:%M:%S', time.localtime(now))} {text}\n")
             self.play_log.flush()
+        if self.play_events:
+            if hand_id is None and self.hand is not None:
+                hand_id = self.hand.hand_id
+            try:
+                self.play_events.write({"ts": now, "type": etype, "hand_id": hand_id,
+                                        "table_id": self.table_id, **fields, "text": text})
+            except (OSError, TypeError, ValueError) as e:
+                # 事件流只是给网页看的：写不进去（磁盘满等）就停写，不能影响决策 / 行动文件。
+                print(f"  [play-events] 写入失败，之后不再写：{e!r}", file=sys.stderr)
+                self.play_events = None
 
     def _who(self, seat):
         name = self.hand.names.get(seat) if self.hand else None
@@ -211,7 +229,8 @@ class WopoSession:
         tag = reason.split(":", 1)[0]
         self.skip_reasons[tag] = self.skip_reasons.get(tag, 0) + 1
         print(f"  [skip] hand={hand_id} 作废：{reason}", file=sys.stderr)
-        self._play(f"本手作废：{reason}（之后不出建议）")
+        self._play(f"本手作废：{reason}（之后不出建议）", "dead", hand_id=hand_id,
+                   reason=reason, tag=tag)
 
     def _handle(self, msg):
         t = msg.get("type")
@@ -249,7 +268,7 @@ class WopoSession:
                 first = hand.hole is None
                 hand.apply_hole(msg.get("cards"))
                 if first:
-                    self._play(f"底牌 {' '.join(hand.hole)}")
+                    self._play(f"底牌 {' '.join(hand.hole)}", "hole", cards=list(hand.hole))
                 self._dbg(f"hole {' '.join(hand.hole)}")
                 self._maybe_decide(msg)  # 手牌晚于轮次快照到达时补上决策
             elif t == "table_state":
@@ -261,8 +280,11 @@ class WopoSession:
             elif t == "player_action":
                 self._on_action(msg)
             elif t == "community_cards":
+                n_before = len(hand.board)
                 hand.apply_board(msg.get("street"), msg.get("cards"))
-                self._play(f"{_STREET_CN[hand.street]} {' '.join(hand.board)}")
+                self._play(f"{_STREET_CN[hand.street]} {' '.join(hand.board)}", "board",
+                           street=hand.street, cards=hand.board[n_before:], board=list(hand.board),
+                           pot=hand.pot)
                 self._dbg(f"{hand.street} board={' '.join(hand.board)}")
                 self._maybe_prewarm()
             elif t == "hand_result":
@@ -291,7 +313,9 @@ class WopoSession:
             return
         self._play(f"──── {msg.get('hand_id')} 庄位 seat{self.hand.button} "
                    f"盲注 {self.hand.sb}/{self.hand.bb}"
-                   + (f" ante {self.hand.ante}" if self.hand.ante else ""))
+                   + (f" ante {self.hand.ante}" if self.hand.ante else ""), "hand_start",
+                   button=self.hand.button, sb=self.hand.sb, bb=self.hand.bb, ante=self.hand.ante,
+                   hero_seat=self.hero_seat, n_seats=self.n_seats)
         if self.ante * 100 != self.blueprint_ante * self.hand.bb:
             # blueprint 是按 blueprint_ante / 100 个大盲的 ante 训的，和这桌比例不同 → 不出建议。
             self._kill(f"ante_mismatch:{self.ante}/{self.hand.bb}vs{self.blueprint_ante}/100")
@@ -307,7 +331,13 @@ class WopoSession:
             tag[s] = f"{tag[s]},补盲" if s in tag else "补盲"
         self._play("座位 " + " | ".join(
             f"{self._who(s)} {hand.start_stack[s]}" + (f"({tag[s]})" if s in tag else "")
-            for s in hand.dealt))
+            for s in hand.dealt), "seats",
+            # start = 开局栈（交 ante / 盲注之前），stack / bet = 交完之后的剩余栈 / 本街已投入。
+            seats=[{"seat": s, "name": hand.names.get(s), "start": hand.start_stack[s],
+                    "stack": hand.stack[s], "bet": hand.bet[s], "hero": s == hand.hero,
+                    "roles": tag[s].split(",") if s in tag else []} for s in hand.dealt],
+            button=hand.button, sb_seat=hand.sb_seat, bb_seat=hand.bb_seat,
+            posts=list(hand.posts), pot=hand.pot)
 
     def _on_action(self, msg):
         hand = self.hand
@@ -318,8 +348,15 @@ class WopoSession:
         amt = hand.action_amounts[-1]
         line = f"{self._who(a['seat'])} " + _fmt_act(a["action"], a.get("to"),
                                                      amt["contribution_delta"], amt["to_call_before"])
+        # 事件字段：action = 牌桌层归类后的动作（fold/check/call/raise/all_in），to = raise/all_in 的
+        # 本街总额，delta = 本次投入；street = 动作所在街；turn = 动作前已发生的动作数（= 决策点编号）。
+        ev = {"seat": a["seat"], "name": hand.names.get(a["seat"]), "street": hand.action_streets[-1],
+              "turn": key[1], "action": a["action"], "to": a.get("to"),
+              "delta": amt["contribution_delta"], "to_call_before": amt["to_call_before"],
+              "stack_before": amt["stack_before"], "stack_after": hand.stack[a["seat"]],
+              "pot_after": hand.pot}
         if a["seat"] != self.hero_seat:
-            self._play(line)
+            self._play(line, "action", **ev)
             return
         # hero 实际动作（服务器为准）和本程序的建议对照。
         self.counters["hero_actions"] += 1
@@ -327,12 +364,14 @@ class WopoSession:
         if adv is None:
             # 建议没赶上（搜索还在跑 = hero 已自行决策）或没触发决策。
             self.counters["hero_unadvised"] += 1
-            self._play(f"{line}  ← hero 实际行动（无建议）")
+            self._play(f"{line}  ← hero 实际行动（无建议）", "hero_action", **ev, advice=None,
+                       match=None)
             return
         same = adv["action"] == a["action"] or (
             adv["action"] in ("raise", "all_in") and a["action"] in ("raise", "all_in"))
         self.counters["hero_same" if same else "hero_diff"] += 1
-        self._play(f"{line}  ← hero 实际行动（{'同' if same else '不同于'}建议 {adv['text']}）")
+        self._play(f"{line}  ← hero 实际行动（{'同' if same else '不同于'}建议 {adv['text']}）",
+                   "hero_action", **ev, advice=dict(adv), match="same" if same else "diff")
         if not same:
             self._dbg(f"hero 实际 {a} ≠ 建议 {adv}")
 
@@ -340,12 +379,18 @@ class WopoSession:
         hand = self.hand
         notes = hand.apply_result(msg.get("final_stacks"))
         final = msg.get("final_stacks") or {}
-        net = []
+        net, stacks = [], []
         for s in hand.dealt:
             v = final.get(str(s), final.get(s))
             if isinstance(v, (int, float)) and v != hand.start_stack[s]:
                 net.append(f"{self._who(s)} {int(v) - hand.start_stack[s]:+d}")
-        self._play("结算 " + (" | ".join(net) or "无输赢"))
+            num = isinstance(v, (int, float)) and not isinstance(v, bool)
+            stacks.append({"seat": s, "name": hand.names.get(s), "start": hand.start_stack[s],
+                           "final": v if num else None,
+                           "net": int(v) - hand.start_stack[s] if num else None})
+        self._play("结算 " + (" | ".join(net) or "无输赢"), "result", stacks=stacks, pot=hand.pot,
+                   board=list(hand.board), winners=msg.get("winners"),
+                   shown=msg.get("shown_cards"), notes=notes, server_ts=msg.get("ts"))
         self.counters["hands_complete"] += 1
         if notes:
             self.counters["result_notes"] += 1
@@ -401,7 +446,10 @@ class WopoSession:
                "board": list(hand.board), "valid": valid, "t_wall": time.time()}
         self._dbg(f"your_turn street={hand.street} hole={''.join(hand.hole)} "
                   f"board={' '.join(hand.board)} valid={valid}")
-        self._play(f">> 轮到 hero（{_STREET_CN[hand.street]}，底池 {hand.pot}，跟 {ctx['to_call']}）")
+        self._play(f">> 轮到 hero（{_STREET_CN[hand.street]}，底池 {hand.pot}，跟 {ctx['to_call']}）",
+                   "hero_turn", turn=key[1], street=hand.street, pot=hand.pot,
+                   to_call=ctx["to_call"], valid=dict(valid), hole=list(hand.hole),
+                   board=list(hand.board), table_seq=msg.get("table_seq"))
         self.worker.submit_decide(req, lambda resp, ms: self._on_decided(req, ctx, resp, ms))
 
     def _on_decided(self, req, ctx, resp, ms):
@@ -437,11 +485,23 @@ class WopoSession:
                 self.counters["stale"] += 1
                 print(f"  [stale] hand={ctx['key'][0]} 决策 {ms}ms 返回时已过期（{stale}），"
                       f"不写行动文件", file=sys.stderr)
+            # 事件：stale = 过期原因全文（None = 已写进行动文件），stale_kind = 冒号前的类别；
+            # advice = play log 里的建议文字；all_in = raise 到 hero 能下的最大额。
             self._play(f">> 决策  来源 {rec['source']}  {ms}ms"
                        + (f"  已过期（{_STALE_CN.get(stale.split(':', 1)[0], stale)}），未写入行动文件"
                           if stale else "")
                        + (f"  {fmt_probs(rec['probs'])}" if rec["probs"] else "")
-                       + f"  建议 {advice}")
+                       + f"  建议 {advice}", "decision", hand_id=ctx["key"][0],
+                       turn=ctx["key"][1], street=ctx["street"], pot=ctx["pot"],
+                       to_call=ctx["to_call"], valid=dict(ctx["valid"]), action=rec["action"],
+                       amount=rec["amount"],
+                       all_in=(resp.get("action") == "all_in"
+                               or (resp.get("action") == "raise"
+                                   and resp.get("amount") == ctx["valid"].get("max_raise"))),
+                       advice=advice, probs=rec["probs"], chosen=rec["chosen"],
+                       source=rec["source"], decide_ms=ms, stale=stale,
+                       stale_kind=stale.split(":", 1)[0] if stale else None,
+                       written=stale is None, rejected=resp.get("rejected"))
             if self.action_log:
                 self.action_log.write(json.dumps({"req": req, "resp": resp, "decide_ms": ms,
                                                   "stale": stale}, ensure_ascii=False) + "\n")
