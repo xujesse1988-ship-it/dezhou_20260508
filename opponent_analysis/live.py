@@ -367,8 +367,7 @@ class PlayFeed:
                 views.append(hand_view(h["hand_id"], h["events"]))
             except Exception as e:  # a malformed event must not take the panel down
                 self.errors.appendleft({"ts": time.time(), "msg": f"{key}: {type(e).__name__}: {e}"})
-                views.append({"hand_id": h["hand_id"], "error": f"{type(e).__name__}: {e}",
-                              "events": h["events"]})
+                views.append(error_view(h["hand_id"], h["events"], f"{type(e).__name__}: {e}"))
         with self.lock:
             self.version += 1
             self.body = {
@@ -399,14 +398,31 @@ def _ts(v):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def _blank_view(hand_id, events: list) -> dict:
+    """The fields every hand view carries, before any event is applied."""
+    return {"hand_id": hand_id, "table_id": None, "first_ts": None, "last_ts": None, "partial": True,
+            "button": None, "sb": None, "bb": None, "ante": 0, "hero_seat": None, "hole": None,
+            "seats": [], "board": [], "street": "preflop", "pot": None, "turns": [], "dead": None,
+            "result": None, "hero_net": None, "status": "playing", "events": events}
+
+
+def error_view(hand_id, events: list, error: str) -> dict:
+    """A hand whose events hand_view could not turn into state: same shape as hand_view (so the
+    page renders every hand the same way), status "error", only the times and table filled in."""
+    v = _blank_view(hand_id, events)
+    recs = [e for e in events if isinstance(e, dict)]
+    ts = [t for t in (_ts(e.get("ts")) for e in recs) if t is not None]
+    v.update(status="error", error=error, partial=False, first_ts=min(ts, default=None),
+             last_ts=max(ts, default=None),
+             table_id=next((e["table_id"] for e in recs if e.get("table_id") is not None), None))
+    return v
+
+
 def hand_view(hand_id, events: list[dict]) -> dict:
     """One hand's events -> the state the page shows. Only structured fields are used (the
     event's `text` is the play.log line, kept for reference). A hand whose first events were
     not read (follow started mid-hand) has partial=True."""
-    v = {"hand_id": hand_id, "table_id": None, "first_ts": None, "last_ts": None, "partial": True,
-         "button": None, "sb": None, "bb": None, "ante": 0, "hero_seat": None, "hole": None,
-         "seats": [], "board": [], "street": "preflop", "pot": None, "turns": [], "dead": None,
-         "result": None, "hero_net": None, "status": "playing", "events": events}
+    v = _blank_view(hand_id, events)
     seats: dict[int, dict] = {}
     turns: dict[int, dict] = {}
 

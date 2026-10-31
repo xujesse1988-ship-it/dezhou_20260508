@@ -116,8 +116,10 @@ setsid nohup python3 -m opponent_analysis live --db artifacts/opponent_db_ante10
 
 `/api/play` 返回 `{enabled, version, max_hands, hands, files, counts, errors, patterns, now}`；`hands` 新的在前，每手是
 `{hand_id, table_id, first_ts, last_ts, partial（开头没读到）, button, sb, bb, ante, hero_seat, hole, seats, board,
-street, pot, turns, dead, result, hero_net, status（playing / done / dead）, events}`，`seats` 里的 `stack` 跟到最近一个动作
-（结算前），`turns` 每项 `{turn, street, pot, to_call, valid, ts, decision, hero_action}`。
+street, pot, turns, dead, result, hero_net, status（playing / done / dead / error）, events}`，`seats` 里的 `stack` 跟到最近一个动作
+（结算前），`turns` 每项 `{turn, street, pot, to_call, valid, ts, decision, hero_action}`。某手的事件整理不出来时
+`status = error`，另带 `error`（异常信息），其余字段同样齐全（只填了时间和 table_id），错误也记进 `errors`；页面上这手
+显示一行错误说明，其它手照常刷新。
 
 数据库：`<db>/<平台>/hands.jsonl`（通过校验的手）、`rejected.jsonl`（被拒的手和原因）、`ingest_log.jsonl`
 （每次导入的文件、sha256、计数）。同一 hand_id 只收一次；被拒过的手再导入会跳过，修了适配器后删掉

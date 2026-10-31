@@ -546,7 +546,7 @@ poll();
 // ---- Action guide: the wopo driver's --play-events stream (/api/play), polled every second.
 // The server groups events by hand and derives the state; everything here uses structured
 // fields only (an event's `text` is the play.log line and is not parsed).
-let play = null, playOff = 0, playFailures = 0;
+let play = null, playOff = 0, playFailures = 0, renderError = null;
 const openHands = new Set();
 const SUIT = { s: '♠', h: '♥', d: '♦', c: '♣' };
 const pcard = (c, big) => { const r = String(c ?? ''), su = r.slice(-1).toLowerCase(); return `<span class="pc ${big ? 'big' : ''} ${su === 'h' || su === 'd' ? 'red' : ''}">${esc(r.slice(0, -1))}${SUIT[su] || esc(su)}</span>`; };
@@ -557,7 +557,7 @@ const agoP = ts => { const s = secAgo(ts); if (s == null) return '—'; if (s < 
 const clock = ts => ts ? new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour12: false }) : '';
 const shortHid = h => { const s = String(h ?? '（无编号）'); const i = s.lastIndexOf(':'); return i >= 0 ? '#' + s.slice(i + 1) : s; };
 const STALE_CN = { hero_acted: 'hero 已行动', hand_over: '这手已结束', hand_dead: '这手已作废' };
-const STATUS = { playing: ['live', '进行中'], done: ['done', '已结算'], dead: ['dead', '作废'] };
+const STATUS = { playing: ['live', '进行中'], done: ['done', '已结算'], dead: ['dead', '作废'], error: ['dead', '无法解析'] };
 // Same wording as the driver's play.log (poker_live/wopo.py _fmt_act).
 function fmtAct(a, to, delta, toCall) {
   if (a === 'raise' && toCall === 0) return `bet ${to}`;
@@ -684,8 +684,8 @@ function handHead(h) {
 }
 
 function handSummary(h) {
-  const n = h.turns.length, c = { same: 0, diff: 0, none: 0, stale: 0 };
-  for (const t of h.turns) {
+  const turns = h.turns || [], n = turns.length, c = { same: 0, diff: 0, none: 0, stale: 0 };
+  for (const t of turns) {
     if (t.hero_action) c[t.hero_action.match === 'same' ? 'same' : t.hero_action.match === 'diff' ? 'diff' : 'none']++;
     if (t.decision && !t.decision.written) c.stale++;
   }
@@ -699,18 +699,27 @@ function guideStatus() {
   const st = $('g-status');
   const last = play && play.hands.length ? Math.max(...play.hands.map(h => h.last_ts || 0)) : 0;
   if (playFailures) { st.className = 'pill down'; st.textContent = '服务连不上'; }
+  else if (renderError) { st.className = 'pill down'; st.textContent = '页面显示出错：' + renderError; }
   else if (!last) { st.className = 'pill stale'; st.textContent = '等待 driver 写事件'; }
   else if (secAgo(last) > 120) { st.className = 'pill stale'; st.textContent = '最近事件 ' + agoP(last); }
   else { st.className = 'pill'; st.textContent = '实时'; }
 }
 
+// One hand's HTML; a hand the page cannot draw shows an error line instead of blanking the panel.
+function safeHand(h, draw) {
+  try { return draw(); } catch (e) {
+    return `<p class="err">这手显示出错（${esc(String(h && h.hand_id))}）：${esc(e && e.message || String(e))}</p>`;
+  }
+}
+
 function renderGuide() {
   const hs = play.hands;
   $('g-sub').textContent = hs.length ? `· ${hs[0].table_id || ''}` : '';
-  $('g-current').innerHTML = hs.length ? handHead(hs[0]) + handBody(hs[0], true) : '<div class="empty">还没有事件（driver 开局后出现）</div>';
+  $('g-current').innerHTML = hs.length ? safeHand(hs[0], () => handHead(hs[0]) + handBody(hs[0], true)) : '<div class="empty">还没有事件（driver 开局后出现）</div>';
   const rest = hs.slice(1);
   $('g-n').textContent = rest.length;
-  $('g-recent').innerHTML = rest.map(h => `<details class="hand" data-h="${esc(h.hand_id)}" ${openHands.has(String(h.hand_id)) ? 'open' : ''}><summary>${handSummary(h)}</summary><div>${handHead(h)}${handBody(h, false)}</div></details>`).join('')
+  $('g-recent').innerHTML = rest.map(h => `<details class="hand" data-h="${esc(h.hand_id)}" ${openHands.has(String(h.hand_id)) ? 'open' : ''}>`
+    + `<summary>${safeHand(h, () => handSummary(h))}</summary><div>${safeHand(h, () => handHead(h) + handBody(h, false))}</div></details>`).join('')
     || '<div class="empty">还没有更早的手</div>';
   $('g-files').innerHTML = '事件文件：' + (play.files.map(f => `<span class="cards">${esc(f.path)}</span> ${f.lines} 行${f.bad_lines ? '，坏行 ' + f.bad_lines : ''}，最后修改 ${agoP(f.mtime)}`).join('；') || `没有匹配 ${esc(play.patterns.join(' '))} 的文件`)
     + (play.errors && play.errors.length ? ` <span class="err">${esc(play.errors[0].msg)}</span>` : '');
@@ -741,7 +750,14 @@ async function pollPlay() {
     if (!d.enabled) { $('guide').hidden = true; return; }  // started without --play-events: no panel
     $('guide').hidden = false;
     if (d.now) playOff = d.now - Date.now() / 1000;
-    if (!d.unchanged) { play = d; renderGuide(); } else tickGuide();
+    if (!d.unchanged) {
+      play = d;
+      // A drawing bug is not a connection failure: report it as such, and drop `play` so the next
+      // poll fetches the full state again (asking with ?since= would get "unchanged" forever).
+      try { renderGuide(); renderError = null; } catch (e) {
+        renderError = e && e.message || String(e); play = null; guideStatus();
+      }
+    } else tickGuide();
   } catch { playFailures++; tickGuide(); }
   setTimeout(pollPlay, 1000);
 }

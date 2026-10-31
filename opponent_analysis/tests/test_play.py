@@ -105,6 +105,29 @@ class PlayFeedTest(unittest.TestCase):
         self.assertEqual([h["hand_id"] for h in r["hands"]], list(reversed(list(by_hand(ev)))))
         self.assertEqual(r["counts"], {"events": len(ev)})
 
+    def test_unreadable_hand_keeps_the_view_shape(self):
+        # One hand's seats event is garbage: that hand becomes status "error" with every field the
+        # page reads (turns, seats, ...) still present, and the other hands are exactly as before.
+        hands = by_hand(self.events)
+        bad_id = list(hands)[1]
+        events = [dict(e, seats="garbage") if e["hand_id"] == bad_id and e["type"] == "seats" else e
+                  for e in self.events]
+        self.append(events)
+        feed = PlayFeed([self.path], max_hands=20)
+        feed.step()
+        r = feed.response(None)
+        clean = {h["hand_id"]: h for h in (hand_view(k, v) for k, v in hands.items())}
+        got = {h["hand_id"]: h for h in r["hands"]}
+        bad = got.pop(bad_id)
+        self.assertEqual(bad["status"], "error")
+        self.assertTrue(bad["error"])
+        self.assertLessEqual(set(clean[bad_id]), set(bad))
+        self.assertEqual((bad["turns"], bad["seats"], bad["partial"]), ([], [], False))
+        self.assertEqual((bad["first_ts"], bad["last_ts"], bad["table_id"]),
+                         (clean[bad_id]["first_ts"], clean[bad_id]["last_ts"], clean[bad_id]["table_id"]))
+        self.assertEqual(got, {k: v for k, v in clean.items() if k != bad_id})
+        self.assertTrue(any(str(bad_id) in e["msg"] for e in r["errors"]))
+
     def test_restart_recovers_last_hands_from_tail(self):
         self.append(self.events)
         full = PlayFeed([self.path], max_hands=50)
