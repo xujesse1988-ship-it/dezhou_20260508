@@ -185,6 +185,9 @@ const DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT: bool = false;
 ///
 /// 不改「哪些决策搜索」：flop_prefer_blueprint 过闸的翻牌锚定面仍走 blueprint；只因 blueprint 占位
 /// 才搜索（未命中触发面）的点仍走锚定（脱锚入口按触发面判 gating，转过去会直接落兜底）。
+///
+/// 2026-11-01 亮牌补算：全部走脱锚让翻牌起点范围更准（用上画像），但转牌 / 河牌后验明显变差（脱锚路径的
+/// 翻牌求解推出的后验不如锚定），总体变差，没有改默认（调研 §7.6）。
 const DEFAULT_SEARCH_FORCE_UNANCHORED: bool = false;
 /// 方案 B「平跟当弃牌」的默认（`--search-limp-as-fold`，[`lockstep_replay`]）：**默认关**（旧行为
 /// byte-equal）。调研（`docs/temp/openpoker_limp_handling_research_2026_10_16.md` §4）建议先做成
@@ -2203,10 +2206,15 @@ fn solve_tilt(ref_probs: &[[f64; 3]], prior: &[f64], f: [f64; 3]) -> [f64; 3] {
 /// 平跟者在开池节点 `node` 上的三类参考策略（逐组合，对齐 [`all_hole_combos`]）：加注 = blueprint 全部
 /// 加注 / 全下概率之和，弃牌部分再按平跟种子 `q` 拆成平跟与弃牌（调研 §4.2）。两类尾部先套
 /// [`LIMP_TILT_TAIL_FLOOR`] 底值（§4.1 第二排序键）。节点含跟注 / 过牌（不是平跟当弃牌的节点）→ `None`。
+///
+/// 种子 `q = (1 − flat)·Chen 中段带 + flat`（[`limp_seed_flat`]）：`flat = 0` 时平跟集中在加注牌之下的
+/// 中段牌；`flat = 1` 时 q 恒定，平跟按 blueprint 弃牌概率排序（「开池范围之外的牌」，垃圾牌靠前）。
+/// 加注那一列与 `flat` 无关（收缩目标只用它）。
 fn limp_reference(
     game: &SimplifiedNlheGame,
     strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
     node_id: NodeId,
+    flat: f64,
 ) -> Option<Vec<[f64; 3]>> {
     let node = game.tree().node(node_id);
     let tags = &node.legal_actions;
@@ -2233,11 +2241,31 @@ fn limp_reference(
                 let raise = raise.max(LIMP_TILT_TAIL_FLOOR * (1.0 - pct));
                 let fold = fold.max(LIMP_TILT_TAIL_FLOOR * pct);
                 let (raise, fold) = (raise / (raise + fold), fold / (raise + fold));
-                let q = 1.0 / (1.0 + (LIMP_TILT_SEED_STEEPNESS * (pct - 0.5)).exp());
+                let band = 1.0 / (1.0 + (LIMP_TILT_SEED_STEEPNESS * (pct - 0.5)).exp());
+                let q = (1.0 - flat) * band + flat;
                 [raise, fold * q, fold * (1.0 - q)].map(|x| x.max(LIMP_TILT_MIN_PROB))
             })
             .collect(),
     )
+}
+
+/// 平跟种子的混合比例 `flat`（[`limp_reference`]，`--exploit-limp-seed`）。固定值直接用（默认 0 = 纯 Chen
+/// 中段带）；自适应 = 该玩家在该格的收缩频率里「不加注的牌有多少拿来平跟」：`f_平跟 / (f_平跟 + f_弃牌)`，
+/// 平跟得越多平跟范围越往垃圾牌延伸。2026-11-01 亮牌补算：自适应救回了常平跟垃圾牌的人，但把平跟中段牌的
+/// 人估差了，总体没有更好（调研 §7.6），所以只作实验选项。没有频率（不倾斜）→ 0。
+fn limp_seed_flat(cfg: &ExploitConfig, f: Option<[f64; 3]>) -> f64 {
+    let flat = match cfg.limp_seed {
+        Some(b) => b,
+        None => f.map_or(0.0, |f| {
+            let (limp, fold) = (f[SpotAct::Call as usize], f[SpotAct::Fold as usize]);
+            if limp + fold > 0.0 {
+                limp / (limp + fold)
+            } else {
+                0.0
+            }
+        }),
+    };
+    flat.clamp(0.0, 1.0)
 }
 
 /// 对手平跟者范围倾斜（`--exploit-limp-tilt on`）。对 `prefix` 里每个对手的「平跟当弃牌」映射步
@@ -2298,7 +2326,7 @@ fn limp_tilt(
         let Some(name) = req.names.get(&(op_seat as u8)) else {
             continue;
         };
-        let Some(reference) = limp_reference(game, strategy_fn, node) else {
+        let Some(reference) = limp_reference(game, strategy_fn, node, 0.0) else {
             continue;
         };
         let n = reference.len() as f64;
@@ -2306,6 +2334,13 @@ fn limp_tilt(
         let prior = [bp_raise, 0.0, 1.0 - bp_raise];
         let Some(freqs) = prof.spot_freqs(name, hero_name, spot.spot, prior) else {
             continue;
+        };
+        // 种子比例要用收缩频率定，加注那一列与它无关（上面的收缩目标不变）。
+        let flat = limp_seed_flat(prof.cfg(), Some(freqs.f));
+        let reference = if flat > 0.0 {
+            limp_reference(game, strategy_fn, node, flat).unwrap_or(reference)
+        } else {
+            reference
         };
         let uniform = vec![1.0; reference.len()];
         let theta = solve_tilt(&reference, &uniform, freqs.f);
@@ -2318,7 +2353,7 @@ fn limp_tilt(
             })
             .collect();
         dlog!(
-            "limp_tilt: seat={op_seat}(tree {seat}) name={name} spot={:?} f(raise,limp,fold)={:.3?} n={} n_pop={} n_kind={} bp_raise={bp_raise:.3} theta={:.2?} limp_mass={:.3}",
+            "limp_tilt: seat={op_seat}(tree {seat}) name={name} spot={:?} f(raise,limp,fold)={:.3?} n={} n_pop={} n_kind={} bp_raise={bp_raise:.3} seed_flat={flat:.2} theta={:.2?} limp_mass={:.3}",
             spot.spot,
             freqs.f,
             freqs.n,
@@ -2524,8 +2559,9 @@ fn exploit_tilt(
                 let node =
                     at.map(|(n, _)| n).or_else(|| spot_substitute(tree, smap, &steps, d))?;
                 let limp_ref = matches!(d.spot, PreflopSpot::Unopened(_))
-                    .then(|| limp_reference(game, strategy_fn, node))
+                    .then(|| limp_reference(game, strategy_fn, node, 0.0))
                     .flatten();
+                let is_limp_ref = limp_ref.is_some();
                 let p_sum: f64 = coef.iter().sum();
                 let marginal = |r: &[[f64; 3]]| -> [f64; 3] {
                     std::array::from_fn(|a| {
@@ -2553,6 +2589,17 @@ fn exploit_tilt(
                     return None;
                 }
                 let freqs = prof.spot_freqs(name, hero_name, d.spot, target);
+                // 平跟合成参考的种子比例按收缩频率定（加注那一列和收缩目标都与它无关）。
+                let flat = if is_limp_ref {
+                    limp_seed_flat(prof.cfg(), freqs.map(|f| f.f))
+                } else {
+                    0.0
+                };
+                let reference = if flat > 0.0 {
+                    limp_reference(game, strategy_fn, node, flat).unwrap_or(reference)
+                } else {
+                    reference
+                };
                 let theta = freqs.map_or([0.0; 3], |f| solve_tilt(&reference, &coef, f.f));
                 let w = theta.map(f64::exp);
                 let step_coef: Vec<f64> = reference
@@ -2563,7 +2610,7 @@ fn exploit_tilt(
                     })
                     .collect();
                 dlog!(
-                    "exploit_tilt: seat={op_seat}(tree {seat}) name={name} idx={i} spot={:?} act={:?} node={node:?}({}) target={target:.3?} f={:.3?} n={:?} theta={theta:.2?} mass={:.3}",
+                    "exploit_tilt: seat={op_seat}(tree {seat}) name={name} idx={i} spot={:?} act={:?} node={node:?}({}) target={target:.3?} f={:.3?} n={:?} seed_flat={flat:.2} theta={theta:.2?} mass={:.3}",
                     d.spot,
                     d.act,
                     if from_prefix { "prefix" } else { "substitute" },
@@ -6072,10 +6119,10 @@ fn run() -> Result<(), String> {
         if let Some(cell) = &rt.exploit {
             let ec = *cell.borrow().cfg();
             eprintln!(
-                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): shrink_k={} strength_alpha={} mode={} limp_tilt={} tilt={} cell_shrink_k={}（进程内画像，按 n/(n+k) 收缩）",
+                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): shrink_k={} strength_alpha={} mode={} limp_tilt={} tilt={} limp_seed={} cell_shrink_k={}（进程内画像，按 n/(n+k) 收缩）",
                 ec.shrink_k, ec.strength_alpha,
                 if ec.pfr_shape { "on(VPIP+PFR/CallBand·RaiseBand)" } else { "vpip(仅VPIP/byte-equal)" },
-                ec.limp_tilt, ec.tilt, ec.cell_shrink_k
+                ec.limp_tilt, ec.tilt, ec.limp_seed.map_or("adaptive".to_string(), |b| b.to_string()), ec.cell_shrink_k
             );
             // 暖启动（--warm-profile-hh）：启动期读过往 HH JSONL，把历史牌局喂进 Profiler（与 live
             // observe 同口径）。网络丢消息 / 字段缺失 / 序列不完整的牌局在 hh_record_to_observe 重放处
@@ -6328,6 +6375,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_pfr_shape = false;
     let mut exploit_limp_tilt: Option<bool> = None;
     let mut exploit_tilt: Option<bool> = None;
+    let mut exploit_limp_seed: Option<Option<f64>> = None;
     let mut warm_profile_hh: Option<PathBuf> = None;
     // PM-17（--exploit-4bet*，不要求 --search）。
     let mut exploit_4bet_on = false;
@@ -6577,6 +6625,20 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     other => return Err(format!("--exploit-limp-tilt 须 on|off，得 {other}")),
                 })
             }
+            "--exploit-limp-seed" => {
+                let v = next_val(&mut it, &arg)?;
+                exploit_limp_seed = Some(match v.as_str() {
+                    "adaptive" => None,
+                    x => match x.parse::<f64>() {
+                        Ok(b) if (0.0..=1.0).contains(&b) => Some(b),
+                        _ => {
+                            return Err(format!(
+                                "--exploit-limp-seed 须 adaptive 或 [0,1] 的数，得 {x}"
+                            ))
+                        }
+                    },
+                });
+            }
             "--exploit-tilt" => {
                 exploit_tilt = Some(match next_val(&mut it, &arg)?.as_str() {
                     "on" => true,
@@ -6704,7 +6766,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         && (exploit_shrink_k.is_some()
             || exploit_strength.is_some()
             || exploit_limp_tilt.is_some()
-            || exploit_tilt.is_some())
+            || exploit_tilt.is_some()
+            || exploit_limp_seed.is_some())
     {
         return Err("设了 --exploit-* 子旗但 --exploit 非 on|vpip".to_string());
     }
@@ -6771,6 +6834,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             pfr_shape: exploit_pfr_shape,
             limp_tilt: exploit_limp_tilt,
             tilt: exploit_tilt.unwrap_or(false),
+            limp_seed: exploit_limp_seed.unwrap_or(d.limp_seed),
             ..d
         }
     });
@@ -8190,10 +8254,12 @@ mod tests {
             AbstractActionTag::Fold
         );
         // 画像：limper 在 UTG（Early、前面没人平跟）30 手里平跟 12、加注 3；人群另一个人 UTG 20 手全弃。
-        let profiler = |limp_tilt: bool| {
+        // 原来的形状断言按纯 Chen 中段种子（limp_seed = 0）；自适应种子另在下面核对。
+        let profiler_seed = |limp_tilt: bool, limp_seed: Option<f64>| {
             let mut p = Profiler::new(ExploitConfig {
                 limp_tilt,
                 pfr_shape: true,
+                limp_seed,
                 ..ExploitConfig::default()
             });
             for (i, (name, act)) in std::iter::repeat_n(("limper", "call"), 12)
@@ -8231,6 +8297,7 @@ mod tests {
             }
             p
         };
+        let profiler = |limp_tilt: bool| profiler_seed(limp_tilt, Some(0.0));
         let rt_with = |limp_tilt: bool| SearchRuntime {
             exploit: Some(RefCell::new(profiler(limp_tilt))),
             ..rt_limp_as_fold(SubgameSearchConfig::default())
@@ -8291,6 +8358,31 @@ mod tests {
         let (aa, mid, trash) = (at("Ah", "Ad"), at("Ts", "9s"), at("7c", "2d"));
         assert!(mid > 0.5, "T9s 应在平跟范围里: {mid}");
         assert!(aa < 0.05 && trash < 0.05, "AA={aa} 72o={trash} T9s={mid}");
+        // 自适应种子：收缩后这人不加注的牌里约 1/5 拿来平跟 → 种子约 1/5 是均匀，平跟范围往垃圾牌延伸；频率约束
+        // 照旧成立，AA 仍留在加注里。
+        let rt_ad = SearchRuntime {
+            exploit: Some(RefCell::new(profiler_seed(true, None))),
+            ..rt_limp_as_fold(SubgameSearchConfig::default())
+        };
+        let ad = inputs(&rt_ad, &req).tilt.coefs[3]
+            .clone()
+            .expect("limper 有系数");
+        let ad_mean = ad.iter().sum::<f64>() / ad.len() as f64;
+        assert!((ad_mean - f.f[1]).abs() < 1e-6, "mean={ad_mean} f={f:?}");
+        let flat = limp_seed_flat(rt_ad.exploit.as_ref().unwrap().borrow().cfg(), Some(f.f));
+        assert!(
+            (flat - f.f[1] / (f.f[1] + f.f[2])).abs() < 1e-12 && flat > 0.1 && flat < 0.5,
+            "{flat}"
+        );
+        let ad_at = |a: &str, b: &str| {
+            ad[combo_index([parse_card(a).unwrap(), parse_card(b).unwrap()]).unwrap()]
+        };
+        let (aa2, trash2) = (ad_at("Ah", "Ad"), ad_at("7c", "2d"));
+        assert!(aa2 < 0.05, "AA={aa2}");
+        assert!(
+            trash2 > 10.0 * trash,
+            "72o: Chen 种子 {trash} → 自适应 {trash2}"
+        );
         let snap = exploit_snapshot(&rt, &req, &cfg, 5, &smap, Some(&on.tilt)).unwrap();
         assert!(snap.0[3].is_none(), "倾斜过的座不再做宽度修正");
         let snap = exploit_snapshot(&rt, &req, &cfg, 5, &smap, None).unwrap();
@@ -8562,7 +8654,7 @@ mod tests {
         assert_eq!(limper, 3);
         assert_eq!(t.nodes, vec![(limp_node, 3)]);
         let coef = t.coefs[3].as_ref().expect("被接管");
-        let first: Vec<f64> = limp_reference(&game, &sigma, limp_node)
+        let first: Vec<f64> = limp_reference(&game, &sigma, limp_node, 0.0)
             .unwrap()
             .iter()
             .map(|r| r[SpotAct::Call as usize])
@@ -12497,6 +12589,18 @@ mod tests {
         assert!(
             parse(&["--search", "--exploit-tilt", "on"]).is_err(),
             "--exploit-tilt 无 --exploit 应拒收"
+        );
+        // --exploit-limp-seed：默认 0（Chen 中段）；adaptive / [0,1] 的数，出界和脏值拒收，需 --exploit。
+        assert_eq!(e.limp_seed, Some(0.0), "默认 Chen 中段");
+        let seed =
+            |v: &str| tilt(&["--exploit-limp-seed", v]).map(|a| a.exploit.unwrap().limp_seed);
+        assert_eq!(seed("adaptive"), Ok(None));
+        assert_eq!(seed("0"), Ok(Some(0.0)));
+        assert_eq!(seed("0.5"), Ok(Some(0.5)));
+        assert!(seed("1.5").is_err() && seed("x").is_err());
+        assert!(
+            parse(&["--search", "--exploit-limp-seed", "0"]).is_err(),
+            "无 --exploit 应拒收"
         );
         // --range-log：需 --search。
         assert_eq!(

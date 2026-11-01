@@ -387,6 +387,12 @@ pub struct ExploitConfig {
     /// 「参考策略（同步节点 / 替身节点）× 局面格实测频率倾斜」连乘，代替 blueprint 前缀 reach + 宽度修正；
     /// 开了它 `limp_tilt` 不再单独生效（平跟那一步是它的子集）。`false`（默认）= 旧行为逐位不变。
     pub tilt: bool,
+    /// 平跟合成参考里「不加注的牌里谁平跟」的种子混合比例（advisor `--exploit-limp-seed`）：种子 =
+    /// `(1 − β)·Chen 中段带 + β·均匀`，β = 1 时平跟范围按 blueprint 弃牌概率排序（「开池范围之外的牌」，
+    /// 垃圾牌靠前）。`Some(β)` = 固定值，默认 `Some(0.0)`（纯 Chen 中段带）；`None` = 自适应：β = 该玩家
+    /// 在该格的平跟频率 ÷（平跟 + 弃牌频率）。2026-11-01 亮牌补算里自适应没有比 Chen 中段更准（调研 §7.6），
+    /// 默认保持 Chen 中段，自适应留作实验。
+    pub limp_seed: Option<f64>,
 }
 
 impl Default for ExploitConfig {
@@ -398,6 +404,7 @@ impl Default for ExploitConfig {
             cell_shrink_k: 30.0,
             limp_tilt: false,
             tilt: false,
+            limp_seed: Some(0.0),
         }
     }
 }

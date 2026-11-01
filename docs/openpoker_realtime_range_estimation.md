@@ -1,8 +1,8 @@
 # OpenPoker 实时搜索的手牌范围估计
 
-代码口径：2026-10-31，仓库版本 `bbc54fa`。
+代码口径：2026-11-01（`9201509` 之后加了 `--exploit-limp-seed`）。
 
-> 下文的「默认」都指 `openpoker_advisor` 自身的参数默认值，不是实盘配置。wopo 实盘（`tools/wopo_play.py`，2026-10-29 那轮的 `common_args.sh`）用的是 `--search-trigger all-postflop`（翻后全部搜索）、`--search-flop-prefer-blueprint on`、`--search-limp-as-fold on`、`--exploit on`，且加载只含翻前和翻牌的裁剪版 blueprint；`--exploit-tilt` 还没在实盘开过。对照实盘日志时：平跟池按「平跟当弃牌」一节理解；转牌、河牌的根 range 主要来自上一街的跨街后验，拿不到时补解上一街。wopo driver 开了 `--search` 就默认写范围日志（见「配置和诊断入口」）。
+> 下文的「默认」都指 `openpoker_advisor` 自身的参数默认值，不是实盘配置。wopo 实盘（`tools/wopo_play.py`，2026-10-31 那两轮的 `common_args.sh`）用的是 `--search-trigger all-postflop`（翻后全部搜索）、`--search-flop-prefer-blueprint on`、`--search-limp-as-fold on`、`--exploit on --exploit-tilt on`，且加载只含翻前和翻牌的裁剪版 blueprint。翻牌优先 blueprint 放行的翻牌决策不搜索、用不上画像。对照实盘日志时：平跟池按「平跟当弃牌」一节理解；转牌、河牌的根 range 主要来自上一街的跨街后验，拿不到时补解上一街。wopo driver 开了 `--search` 就默认写范围日志（见「配置和诊断入口」）。
 
 `openpoker_advisor` 为每个仍在手的玩家构造手牌范围（range），再按这些范围抽取底牌，运行实时子博弈搜索。范围来自历史行动在 blueprint（离线训练策略）或上一街搜索策略中的概率，表示模型对各手牌组合的相对权重。
 
@@ -251,7 +251,7 @@ HJ 的 raise、BTN 的 call 和 UTG 后续的 call 都不进入翻牌根范围�
 
 ### 翻前宽度修正（`--exploit on|vpip`）
 
-`--exploit` 默认关闭。开启后，仅在脱锚搜索决策路径上（配 `--search-force-unanchored on` 时，命中触发面的锚定搜索也算在内；只因 blueprint 均匀占位而搜索、又没命中触发面的决策仍走锚定，不用画像），对见过的对手使用翻前画像调整范围。没有样本量门槛，改为收缩（2026-10-29）：设该玩家已有 `n` 手、`k = --exploit-shrink-k`（默认 50），VPIP / PFR 取 `(n·实测 + k·人群) / (n + k)`（人群 = 除该玩家和 hero 之外所有名字的合计），混合强度取 `--exploit-strength × n/(n+k)`。默认下 10 手约 1/6 强度、50 手半强度、150 手 3/4 强度。
+`--exploit` 默认关闭。开启后，仅在脱锚搜索决策路径上（配 `--search-force-unanchored on` 时，命中触发面的锚定搜索也算在内；只因 blueprint 均匀占位而搜索、又没命中触发面的决策仍走锚定，不用画像），对见过的对手使用翻前画像调整范围。锚定搜索不用画像：2026-11-01 亮牌补算试过全部走脱锚，翻牌起点范围更准，但转牌 / 河牌后验明显变差，没有改默认（调研 §7.6）。没有样本量门槛，改为收缩（2026-10-29）：设该玩家已有 `n` 手、`k = --exploit-shrink-k`（默认 50），VPIP / PFR 取 `(n·实测 + k·人群) / (n + k)`（人群 = 除该玩家和 hero 之外所有名字的合计），混合强度取 `--exploit-strength × n/(n+k)`。默认下 10 手约 1/6 强度、50 手半强度、150 手 3/4 强度。
 
 - `--exploit vpip` 使用 VPIP 宽度和 Chen 起手牌排序构造目标分布。
 - `--exploit on` 结合本手翻前被动或主动入池方式选择 `CallBand` 或 `RaiseBand`，入池方式未知时退为 VPIP 形状。
@@ -289,7 +289,7 @@ HJ 的 raise、BTN 的 call 和 UTG 后续的 call 都不进入翻牌根范围�
 
 blueprint 在边界以下的概率只剩 1e-4 量级的残余值，排序不可靠，所以参考策略先套一个按 Chen 序单调的底值（`1e-3`）：加注类强牌高、弃牌类弱牌高；跟注类只在面对一次加注（`VsOpen`、`LimpVsRaise`）时套（强牌高），面对 3bet 时不套——那里跟注的低概率区装的是要 4bet 的强牌。
 
-- **`--exploit-limp-tilt on`**（需 `--search-limp-as-fold on`）：只处理对手首入平跟那一步（被平跟当弃牌映射掉的步）。参考策略在开池节点上合成：加注 = blueprint 全部加注概率，其余按 Chen 序种子拆成平跟和弃牌（blueprint 没有平跟）。系数代替原来的「blueprint 弃牌概率」。
+- **`--exploit-limp-tilt on`**（需 `--search-limp-as-fold on`）：只处理对手首入平跟那一步（被平跟当弃牌映射掉的步）。参考策略在开池节点上合成：加注 = blueprint 全部加注概率，其余按种子拆成平跟和弃牌（blueprint 没有平跟）。种子 = `(1 − β)·Chen 中段带 + β·均匀`：β = 0 时平跟集中在加注牌之下的中段牌，β = 1 时按 blueprint 弃牌概率排序（「开池范围之外的牌」，垃圾牌靠前）。`--exploit-limp-seed` 默认 `0`（Chen 中段）；可给 0–1 的固定值，或 `adaptive`（β = 该玩家该格「不加注的牌里拿来平跟的比例」，平跟多的人范围往垃圾牌延伸）。亮牌补算里自适应没有比 Chen 中段更准：救回了常平跟垃圾牌的人，但把平跟中段牌的人估差了（调研 §7.6），所以只作实验选项。系数代替原来的「blueprint 弃牌概率」。
 - **`--exploit-tilt on`**（只需 `--exploit on|vpip`）：对每个有名字、本手没弃牌的对手，按时间序处理他的**全部翻前决策**，结果代替他翻前的 blueprint 前缀 reach 和宽度修正；开了它就不再单独走 `--exploit-limp-tilt`。每一步的参考节点：
   - 影子同步的步：用影子里实际走到的节点；
   - 断点之后的步：用「替身节点」（`spot_substitute`）——从树根按脚本走一条规范路径（相关座位按真实动作，加注映射到最近的抽象档，其余座弃牌，平跟者当弃牌），走到同位置、同局面类的节点。例如平跟后面对隔离加注，用「大盲面对同一次加注」的节点。树里复现不了的线不给节点；
@@ -328,6 +328,7 @@ blueprint 在边界以下的概率只剩 1e-4 量级的残余值，排序不可�
 | `--exploit-shrink-k` | `50` | 宽度修正的收缩伪样本数 |
 | `--exploit-limp-tilt` | `off` | 只倾斜对手首入平跟那一步；需 `--exploit` 与 `--search-limp-as-fold on` |
 | `--exploit-tilt` | `off` | 对手全部翻前决策走倾斜流水线；需 `--exploit` |
+| `--exploit-limp-seed` | `0` | 平跟合成参考的种子：0–1 固定值（0 = Chen 中段，1 = 按弃牌概率）或 `adaptive`；需 `--exploit` |
 | `--range-log <path>` | 不写 | 每次新 solve 写一行各座根范围；需 `--search`。wopo driver 开了 `--search` 时默认写到行动文件同目录的 `wopo_ranges.jsonl`，`--range-log off` 关 |
 
 底层锚定搜索另保留 `ResolveRoot::CurrentDecision` 模式，会把当前街已发生的动作也纳入 blueprint 根范围估计，并从当前决策点建树。脱锚搜索只支持 `RoundStart`；本文逐街示例使用的也是 advisor 的 `RoundStart` 路径。
