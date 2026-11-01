@@ -484,6 +484,40 @@ def _selftest_engine_rules():
     print("[selftest 5 规则细节] 不完整全下加注 / 加注权 / 最小加注幅度", file=sys.stderr)
 
 
+def _selftest_post_rewrite():
+    """补盲不进 advisor：补盲者翻前没人加注时的过牌改发 call；大盲的过牌、补盲者翻后的过牌和其余动作原样。"""
+    e = HandEngine("h", 0, 1, 2, HERO_SEAT, 5)
+    seats = {s: {"seat": s, "stack": st, "bet": b, "in_hand": True, "folded": False}
+             for s, st, b in [(0, 100, 0), (1, 99, 1), (2, 98, 2), (3, 98, 2), (4, 100, 0)]}
+    e.apply_hole(["Ah", "Kd"])
+    e.apply_snapshot({"street": "preflop", "board": [], "pot": 5, "actor": 3, "seats": seats,
+                      "n_seats": 5})
+    _check(e.posts == [3], f"座 3 补盲: {e.posts}")
+
+    def act(seat, action, delta, to=None):
+        st, pot = e.stack[seat], e.pot
+        e.apply_action({"seat": seat, "action": action, "street": e.street, "delta": delta,
+                        "to": to, "stack_before": st, "stack_after": st - delta,
+                        "pot_before": pot, "pot_after": pot + delta})
+
+    act(3, "check", 0)                         # 补盲者没人加注时过牌
+    act(4, "fold", 0)
+    _check(e.advisor_actions() == [{"seat": 3, "action": "call"}, {"seat": 4, "action": "fold"}],
+           f"补盲过牌应改发 call: {e.advisor_actions()}")
+    _check(e.actions[0] == {"seat": 3, "action": "check"}, f"牌桌层历史不改: {e.actions[0]}")
+    act(0, "call", 2)
+    act(1, "call", 1)
+    act(2, "check", 0)                         # 大盲过牌：不是补盲，原样
+    e.apply_board("flop", ["2c", "7d", "9h"])
+    act(1, "check", 0)
+    act(2, "check", 0)
+    act(3, "check", 0)                         # 补盲者翻后过牌：原样
+    got = e.advisor_actions()
+    _check([a["action"] for a in got] == ["call", "fold", "call", "call", "check",
+                                          "check", "check", "check"], f"{got}")
+    print("[selftest 5b 补盲改写] 补盲者翻前没人加注时的过牌改发 call，其余原样", file=sys.stderr)
+
+
 def _selftest_legalize():
     """advisor 建议的合法性：不能加注时 all_in → call；其余越界动作 → 安全动作兜底。"""
     call_only = {"can_check": False, "can_call": True, "can_raise": False,
@@ -732,7 +766,8 @@ def _selftest_ante():
 
 
 def _selftest_posts():
-    """补盲：非盲注座开局 bet = 1BB 记为补盲座，底池 / 跟注额按 live 盲注核对，请求与 hh 带 posts。
+    """补盲：非盲注座开局 bet = 1BB 记为补盲座，底池 / 跟注额按 live 盲注核对，hh 带 posts；advisor 请求
+    不带补盲，补盲者翻前没人加注时的过牌改发 call（advisor 没有补盲逻辑）。
     用 2026-10-28 实盘 4 手（修前全部 blinds[N]:bet=100,want=0 作废）。补的不是 1BB、补盲就全下 → 作废。"""
     with open(POSTS_FIXTURE) as f:
         msgs = [json.loads(line) for line in f if line.strip()]
@@ -745,12 +780,19 @@ def _selftest_posts():
     hh = [json.loads(line) for line in buf.getvalue().splitlines()]
     want = {"122": [6], "123": [2], "127": [7], "132": [4]}
     _check({r["hand_id"][-3:]: r.get("posts") for r in hh} == want, f"hh posts: {hh}")
-    _check(stub.requests and all(q.get("posts") == want[q_hand[-3:]]
-                                 for q, q_hand in zip(stub.requests, [r["hand_id"] for r in rows])),
-           "请求应带本手 posts")
+    # 补盲不进 advisor 请求：补盲者翻前没人加注时的过牌改发 call，其余动作原样（HandEngine.advisor_actions）。
+    by_hand = {r["hand_id"]: r for r in hh}
+    for q, q_hand in zip(stub.requests, [r["hand_id"] for r in rows]):
+        h = by_hand[q_hand]
+        want_acts = []
+        for a in h["actions"][:len(q["actions"])]:
+            post_check = a["seat"] in h["posts"] and a["action"] == "check" and a["street"] == "preflop"
+            want_acts.append({"seat": a["seat"], "action": "call" if post_check else a["action"],
+                              **({"to": a["to"]} if "to" in a else {})})
+        _check("posts" not in q and q["actions"] == want_acts,
+               f"{q_hand} 请求应不带 posts、补盲过牌改发 call: {q['actions']} vs {want_acts}")
+    _check(stub.requests, "补盲手应有 hero 决策")  # 补盲过牌的改写由 _selftest_post_rewrite 覆盖。
     _check("补盲" in play.getvalue(), "play.log 座位行应标出补盲座")
-    _, base_stub, _ = _run_msgs(_fixture_msgs())
-    _check(all("posts" not in q for q in base_stub.requests), "没人补盲时请求不带 posts")
     if os.environ.get("WOPO_REGEN_HH_POSTS"):
         with open(HH_POSTS_FIXTURE, "w") as f:
             f.write(buf.getvalue())
@@ -777,7 +819,8 @@ def _selftest_posts():
     _check(session.skip_reasons == {"blinds[4]": 1}, f"补的不是 1BB 应作废: {session.skip_reasons}")
     session, _, _ = _run_msgs(tamper(stack=0), ante=100, blueprint_ante=100, n_seats=8)
     _check(session.skip_reasons == {"post_all_in": 1}, f"补盲就全下应作废: {session.skip_reasons}")
-    print("[selftest 12 posts] 补盲按 live 1BB 核对（实盘 4 手不再作废）、请求与 hh 带 posts；"
+    print("[selftest 12 posts] 补盲按 live 1BB 核对（实盘 4 手不再作废）、hh 带 posts、请求不带补盲"
+          "（补盲过牌改发 call）；"
           "补的不是 1BB / 补盲全下 → 作废", file=sys.stderr)
 
 
@@ -1061,6 +1104,7 @@ def run_selftest():
     _selftest_tamper()
     _selftest_stale()
     _selftest_engine_rules()
+    _selftest_post_rewrite()
     _selftest_legalize()
     _selftest_exploit_4bet()
     _selftest_hh_log()

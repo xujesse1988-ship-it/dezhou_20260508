@@ -326,12 +326,9 @@ struct Request {
     /// 脱锚搜索据它把对手座解析成 [`Profiler`] 画像 → 翻前 range 宽度先验。
     #[serde(default)]
     names: BTreeMap<u8, String>,
-    /// 本手开局补 live 大盲的 OpenPoker 座位（wopo 新进场 / 回座补盲：补的 1BB 算本轮下注、
-    /// 行动顺序不变、没人加注时可过牌）。缺省 = 空 = 没人补（旧 driver / 旧行为逐位不变）。
-    /// [`seat_map`] 映成树座进 [`SeatMap::live_posts`]：真实侧（lockstep 重放 / 实时搜索）按补盲
-    /// 建局，blueprint 影子不变（树里没有补盲，补的那 100 在影子里不存在）。
-    #[serde(default)]
-    posts: Vec<u8>,
+    // 补盲（wopo 新进场 / 回座补 live 1BB）不进请求：driver 把补盲者当成没下过注的普通玩家发来
+    // （开局栈含补的 1BB；没人加注时的过牌改发 `call`，弃牌则补的 1BB 不进底池），advisor 没有补盲逻辑
+    // （`tools/poker_live/table.py` `HandEngine.advisor_actions`）。
 }
 
 /// 请求信封判别（与 [`Request`] 分开解析；serde 忽略未知字段 → 同一行 JSON 两个结构都能读，
@@ -582,9 +579,6 @@ struct SeatMap {
     phantoms: Vec<u8>,
     /// k==2：HU 映射只对 preflop 成立（caller 在 postflop 显式兜底，见 [`seat_map`] doc）。
     hu: bool,
-    /// 补 live 大盲的**树座** bitmask（`req.posts` 经 `to_tree` 映射；0 = 没人补）。真实侧
-    /// config 的 [`TableConfig::live_posts`]（[`apply_real_table`]）。
-    live_posts: u16,
 }
 
 impl SeatMap {
@@ -633,10 +627,9 @@ fn seat_map(req: &Request, n: usize) -> Result<SeatMap, String> {
             .collect(),
         phantoms: Vec::new(),
         hu: false,
-        live_posts: 0,
     };
     if req.dealt_seats.is_empty() {
-        return with_posts(req, full());
+        return Ok(full());
     }
     let dealt = &req.dealt_seats;
     let k = dealt.len();
@@ -650,7 +643,7 @@ fn seat_map(req: &Request, n: usize) -> Result<SeatMap, String> {
         return Err("dealt_missing_btn_or_me".into());
     }
     if k == n {
-        return with_posts(req, full());
+        return Ok(full());
     }
     let btn_idx = dealt
         .iter()
@@ -660,50 +653,23 @@ fn seat_map(req: &Request, n: usize) -> Result<SeatMap, String> {
     if k == 2 {
         m[req.button_seat as usize] = Some(2); // OpenPoker HU：button 发 BB → 树座 2。
         m[dealt[1 - btn_idx] as usize] = Some(1); // 非 button 发 SB 先动 → 树座 1。
-        return with_posts(
-            req,
-            SeatMap {
-                to_tree: m,
-                // preflop 行动序 UTG(3)..CO(n−1)、BTN(0) 全是幻影，依次先 fold 到 SB。
-                phantoms: (3..n as u8).chain(std::iter::once(0)).collect(),
-                hu: true,
-                live_posts: 0,
-            },
-        );
+        return Ok(SeatMap {
+            to_tree: m,
+            // preflop 行动序 UTG(3)..CO(n−1)、BTN(0) 全是幻影，依次先 fold 到 SB。
+            phantoms: (3..n as u8).chain(std::iter::once(0)).collect(),
+            hu: true,
+        });
     }
     for j in 0..k {
         let op = dealt[(btn_idx + j) % k] as usize;
         let tree = if j < 3 { j } else { j + (n - k) };
         m[op] = Some(tree as u8);
     }
-    with_posts(
-        req,
-        SeatMap {
-            to_tree: m,
-            phantoms: (3..3 + (n - k) as u8).collect(),
-            hu: false,
-            live_posts: 0,
-        },
-    )
-}
-
-/// 把 `req.posts`（OpenPoker 座）映成树座填进 [`SeatMap::live_posts`]。补盲座须本手发了牌、
-/// 不是盲注位（树座 1 / 2）、不重复；脏输入 → `Err("bad_posts")`（caller 安全兜底），不静默丢。
-fn with_posts(req: &Request, mut smap: SeatMap) -> Result<SeatMap, String> {
-    for &op in &req.posts {
-        let tree = smap
-            .to_tree
-            .get(op as usize)
-            .copied()
-            .flatten()
-            .ok_or("bad_posts")?;
-        let bit = 1u16 << tree;
-        if tree == 1 || tree == 2 || smap.live_posts & bit != 0 {
-            return Err("bad_posts".into());
-        }
-        smap.live_posts |= bit;
-    }
-    Ok(smap)
+    Ok(SeatMap {
+        to_tree: m,
+        phantoms: (3..3 + (n - k) as u8).collect(),
+        hu: false,
+    })
 }
 
 /// 桌面座位数 ≠ solver 座位数时的兜底原因（`not_6max` / `not_9max`；6 座与旧标签逐字相同）。
@@ -1393,15 +1359,6 @@ fn is_limp_gap(
         && find_tag(&legal_abs, AbstractActionTag::Fold).is_some()
 }
 
-/// 该动作是否是补盲者（[`SeatMap::live_posts`]）在翻前没人加注时的过牌。影子里他没有补盲，
-/// 这一步没有同 kind 的动作，由 [`lockstep_replay`] 单独映射。
-fn is_post_check(real: &poker::GameState, smap: &SeatMap, actor: u8, action: &str) -> bool {
-    action == "check"
-        && real.street() == poker::Street::Preflop
-        && real.current_player() == Some(SeatId(actor))
-        && smap.live_posts & (1u16 << actor) != 0
-}
-
 /// 方案 B（平跟当弃牌映射，`docs/temp/openpoker_limp_handling_research_2026_10_16.md` §3/§4）的
 /// 记录：每次映射的 `(平跟者的决策节点, 平跟者 tree seat)`。节点 = 影子里平跟者面对的那个节点，
 /// 影子在该节点走的是 Fold、真实局走的是 Call。空 = 本手没有发生映射。
@@ -1527,27 +1484,6 @@ fn lockstep_replay(
                 return Err(err("replay_illegal".into(), synced_node, &ghosts, &limp));
             }
             ghosts.remove(pos);
-        } else if is_post_check(&real, smap, actor, &h.action) {
-            // 补盲者没人加注时过牌：真实局 Check（补的 1BB 已在本轮下注里）。影子里他没补盲、
-            // 面对的是大盲，投入同为 1BB 的对应动作是平跟：影子有 Call 走 Call（两边重新一致）；
-            // no-limp 影子没有 Call → 同平跟当弃牌（影子 Fold、记为 ghost）。
-            if real.apply(Action::Check).is_err() {
-                return Err(err("replay_illegal".into(), synced_node, &ghosts, &limp));
-            }
-            let legal_abs = SimplifiedNlheGame::legal_actions(&abs);
-            if find_tag(&legal_abs, AbstractActionTag::Call).is_some() {
-                if advance_shadow_by_applied(&mut abs, Action::Call, false, &mut abs_rng).is_err() {
-                    return Err(err("structural_gap".into(), synced_node, &ghosts, &limp));
-                }
-            } else if limp_as_fold && find_tag(&legal_abs, AbstractActionTag::Fold).is_some() {
-                if advance_shadow_by_applied(&mut abs, Action::Fold, false, &mut abs_rng).is_err() {
-                    return Err(err("structural_gap".into(), synced_node, &ghosts, &limp));
-                }
-                limp.folds.push((synced_node, actor as PlayerId));
-                ghosts.push(actor);
-            } else {
-                return Err(err("post_check_gap".into(), synced_node, &ghosts, &limp));
-            }
         } else if limp_as_fold && is_limp_gap(&real, &abs, actor, &h.action) {
             // 平跟当弃牌：真实局 call、影子 fold（kind 变了，必须显式记录，见 LimpFoldMap）。
             if real.apply(Action::Call).is_err() {
@@ -1932,7 +1868,7 @@ fn req_preflop_spots(req: &Request, steps: &[PreflopStep]) -> Vec<SpotDecision> 
         } else {
             &req.dealt_seats
         },
-        posts: &req.posts,
+        posts: &[], // 补盲不进请求（driver 已改写成普通动作，见 [`Request`]）。
     };
     let acts: Vec<(u8, SpotActInput)> = steps.iter().map(|s| (s.seat, s.input)).collect();
     preflop_spots(seats, &acts)
@@ -1953,7 +1889,7 @@ enum ScriptAct {
 /// 各局面类的脚本（`d` 之前的真实动作里取；加注按池比例映射到最接近的抽象档；平跟者一律当弃牌，
 /// 他们之后的动作也不进脚本）：
 /// - `Unopened`：空脚本，替身 = 本座（前面平跟的人当弃牌，同平跟当弃牌映射）；
-/// - `BlindOption`：SB 补齐，替身 = 大盲（树里只有 SB 补齐这一种「没人加注到大盲」的线；补盲者也用它）；
+/// - `BlindOption`：SB 补齐，替身 = 大盲（树里只有 SB 补齐这一种「没人加注到大盲」的线）；
 /// - `VsOpen`：开池者加注、加注后的跟注者跟注，替身 = 本座；
 /// - `LimpVsRaise`：树里没有平跟，用「已投入 1BB、面对这次加注」的盲位代替——加注者不是大盲：
 ///   加注者加注，替身 = 大盲（面对开池）；加注者是大盲：SB 补齐、大盲加注，替身 = SB；
@@ -2321,7 +2257,7 @@ fn limp_tilt(
                 && d.act == SpotAct::Call
                 && matches!(d.spot, PreflopSpot::Unopened(_))
         }) else {
-            continue; // 补盲者过牌也映成弃牌，但那是免费过牌：保持 blueprint「没加注」的概率。
+            continue; // 不是没人加注时的平跟（如入池上限删了跟注的冷跟）：保持 blueprint 的概率。
         };
         let Some(name) = req.names.get(&(op_seat as u8)) else {
             continue;
@@ -3588,7 +3524,8 @@ fn action_to_response(
     valid: &ValidActions,
 ) -> (Response, Option<&'static str>) {
     let resp = match action {
-        // 能免费过牌时弃牌是劣势动作（补盲者没人加注时影子里面对的是大盲，blueprint 可能给弃牌）。
+        // 能免费过牌时弃牌是劣势动作（hero 补盲、没人加注时：补盲不进请求，影子和真实重放里他都面对
+        // 大盲，blueprint 可能给弃牌，但桌面上他可以过牌）。
         Action::Fold if valid.can_check => {
             let resp = Response {
                 action: "check".into(),
@@ -4644,7 +4581,7 @@ enum PreflopEntry {
     Aggressive,
     /// 面对加注再加注（3bet 及以上，含平跟后再加注）→ 不做画像修正。
     Reraise,
-    /// 盲位 / 补盲者过牌、补齐或跟注，或面对 ≥2 次加注跟注 → 不做画像修正。
+    /// 盲位过牌、补齐或跟注，或面对 ≥2 次加注跟注 → 不做画像修正。
     Unshaped,
 }
 
@@ -4665,7 +4602,7 @@ fn preflop_entry_kinds(
         return unknown;
     };
     let mut st = GameState::new(&real_cfg, REAL_REPLAY_SEED);
-    // 开局本轮已有投入 = 盲注 / 补盲者（ante 不算本轮下注）。
+    // 开局本轮已有投入 = 盲注（ante 不算本轮下注）。
     let forced: Vec<bool> = st
         .players()
         .iter()
@@ -4707,7 +4644,7 @@ fn preflop_entry_kinds(
             "raise" => PreflopEntry::Aggressive,
             "call" if raises >= 2 || forced[actor as usize] => PreflopEntry::Unshaped,
             "call" => PreflopEntry::Passive,
-            "check" => PreflopEntry::Unshaped, // 翻前能过牌的只有盲位 / 补盲者
+            "check" => PreflopEntry::Unshaped, // 翻前能过牌的只有大盲
             _ => *slot,
         };
         *slot = match (*slot, next) {
@@ -5134,15 +5071,12 @@ fn real_stacks_config(
     Ok(cfg)
 }
 
-/// 真实侧 config 相对 blueprint 的两处差别（影子不改）：
-/// - 短桌幻影座不交 ante：真实桌上没有这几份（blueprint 树按满桌人人交 ante 训的）。无 ante 时
-///   不动（`ante_exempt` 保持 0，与旧行为逐位相同）；
-/// - 补盲座（[`SeatMap::live_posts`]）开局多下 1BB live 盲注。没人补 = 0，与旧行为逐位相同。
+/// 真实侧 config 相对 blueprint 的差别（影子不改）：短桌幻影座不交 ante——真实桌上没有这几份
+/// （blueprint 树按满桌人人交 ante 训的）。无 ante 时不动（`ante_exempt` 保持 0，与旧行为逐位相同）。
 fn apply_real_table(cfg: &mut TableConfig, smap: &SeatMap) {
     if cfg.ante > ChipAmount::ZERO {
         cfg.ante_exempt = smap.phantoms.iter().fold(0, |m, &t| m | 1u16 << t);
     }
-    cfg.live_posts = smap.live_posts;
 }
 
 /// 手内稳定的 subgame solve 基 seed：hash(hole, button, my_seat, num_seats, blinds, base_seed)
@@ -5163,11 +5097,6 @@ fn hand_seed_for(req: &Request, base_seed: u64, n_seats: usize) -> u64 {
     if !req.dealt_seats.is_empty() && req.dealt_seats.len() != n_seats {
         // 短桌：占座不同 = 不同局面（满桌不掺、保旧 seed byte-equal）。
         hasher.update(&req.dealt_seats);
-    }
-    if !req.posts.is_empty() {
-        // 有人补盲 = 不同局面（没人补不掺、保旧 seed）。前缀与 dealt_seats 区分。
-        hasher.update(b"posts");
-        hasher.update(&req.posts);
     }
     hasher.update(&base_seed.to_le_bytes());
     let d = hasher.finalize();
@@ -5479,11 +5408,6 @@ fn sample_seed(req: &Request, base_seed: u64, n_seats: usize) -> u64 {
     if !req.dealt_seats.is_empty() && req.dealt_seats.len() != n_seats {
         // 短桌：占座不同 = 不同局面（满桌不掺、保旧 seed byte-equal）。
         hasher.update(&req.dealt_seats);
-    }
-    if !req.posts.is_empty() {
-        // 有人补盲 = 不同局面（没人补不掺、保旧 seed）。前缀与 dealt_seats 区分。
-        hasher.update(b"posts");
-        hasher.update(&req.posts);
     }
     hasher.update(&base_seed.to_le_bytes());
     let d = hasher.finalize();
@@ -7269,7 +7193,6 @@ mod tests {
             stacks: vec![1588, 2402, 1241, 2000, 108265, 1340],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let solver_cfg = TableConfig::default_6max_100bb();
         let scale = solver_cfg.big_blind.as_u64() / 20; // 5
@@ -7363,7 +7286,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let resp = decide(
             &game,
@@ -7419,7 +7341,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let decide_one = |req: &Request| {
             decide(
@@ -7490,7 +7411,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         // 底池赔率 floor 必中的输入：没人加注时也不许把弃牌改成跟注。
         let odds = Some(PotOdds {
@@ -7579,7 +7499,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let calls = |r: &Request| -> std::collections::BTreeSet<String> {
             all_hole_combos()
@@ -7657,7 +7576,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: dealt.to_vec(),
             names: Default::default(),
-            posts: Vec::new(),
         };
         assert_eq!(limp_ante_level(&req(0, &[])), 0.0);
         assert_eq!(limp_ante_level(&req(100, &[])), 1.0);
@@ -7768,7 +7686,6 @@ mod tests {
             stacks: vec![2000; 6],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         }
     }
 
@@ -8996,7 +8913,6 @@ mod tests {
             stacks,
             dealt_seats: dealt,
             names: Default::default(),
-            posts: Vec::new(),
         };
         let reqs = [
             mk(
@@ -9425,7 +9341,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let decide_one = |req: &Request| {
             decide(
@@ -9868,7 +9783,6 @@ mod tests {
             stacks: vec![2302, 1420, 1917, 628, 99614, 722],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let resp = decide(
             &game,
@@ -9914,7 +9828,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let resp = decide(
             &game,
@@ -9987,7 +9900,6 @@ mod tests {
             stacks,
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         }
     }
 
@@ -10670,7 +10582,6 @@ mod tests {
             stacks,
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         }
     }
 
@@ -11757,7 +11668,6 @@ mod tests {
             stacks: vec![2000, 4000, 4000, 600, 2000, 2000],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         }
     }
 
@@ -11973,7 +11883,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let scfg = SubgameSearchConfig {
             iterations: 200,
@@ -12059,7 +11968,6 @@ mod tests {
             stacks: vec![2000; 6],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         // 命中：BTN min-raise to 40 → pot=130、SB to_call=30（已投 10），130/30≈4.33>4、30=1.5BB≤30BB。
         let hit = decide(
@@ -12155,7 +12063,6 @@ mod tests {
             stacks: vec![2000; 6],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         // 前提确证：旧路径在 limp 池上必兜底（结构 gap）。
         let off = decide(
@@ -12230,7 +12137,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let full_resp = decide(&game, &abs, &uniform, &full, 7, None, &mut cache);
         assert_eq!(
@@ -12254,7 +12160,6 @@ mod tests {
             ante: 0,
             valid: full_valid(),
             stacks: vec![],
-            posts: Vec::new(),
         };
         let resp_a = decide(&game, &abs, &uniform, &short_a, 7, None, &mut cache);
         assert_eq!(
@@ -12283,7 +12188,6 @@ mod tests {
             ante: 0,
             valid: full_valid(),
             stacks: vec![],
-            posts: Vec::new(),
         };
         let resp_b = decide(&game, &abs, &uniform, &short_b, 7, None, &mut cache);
         assert_eq!(
@@ -12330,7 +12234,6 @@ mod tests {
             ante: 0,
             valid: full.valid.clone(),
             stacks: vec![],
-            posts: Vec::new(),
         };
         let resp = decide(&game, &abs, &uniform, &short, 7, None, &mut cache);
         assert_eq!(
@@ -12420,7 +12323,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let full_resp = decide(&game, &abs, &uniform, &full, 9, None, &mut cache);
         assert_eq!(
@@ -12443,7 +12345,6 @@ mod tests {
             ante: 0,
             valid: full_valid(),
             stacks: vec![],
-            posts: Vec::new(),
         };
         let resp = decide(&game, &abs, &uniform, &hu, 9, None, &mut cache);
         assert_eq!(
@@ -12475,7 +12376,6 @@ mod tests {
                 ..full_valid()
             },
             stacks: vec![],
-            posts: Vec::new(),
         };
         let resp = decide(&game, &abs, &uniform, &hu_flop, 9, None, &mut cache);
         assert_eq!(resp.source, "fallback:short_hu_postflop");
@@ -12496,7 +12396,6 @@ mod tests {
             actions: vec![],
             valid: full_valid(),
             stacks: vec![],
-            posts: Vec::new(),
         };
         let resp = decide(&game, &abs, &uniform, &bad_btn, 0, None, &mut cache);
         assert_eq!(resp.source, "fallback:dealt_missing_btn_or_me");
@@ -12518,7 +12417,6 @@ mod tests {
             ante: 0,
             valid: full_valid(),
             stacks: vec![],
-            posts: Vec::new(),
         };
         let resp = decide(&game, &abs, &uniform, &bad_actor, 0, None, &mut cache);
         assert_eq!(resp.source, "fallback:actor_not_dealt:premium_call");
@@ -12540,7 +12438,6 @@ mod tests {
             actions: vec![],
             valid: full_valid(),
             stacks: vec![],
-            posts: Vec::new(),
         };
         let resp = decide(&game, &abs, &uniform, &unsorted, 0, None, &mut cache);
         assert_eq!(resp.source, "fallback:bad_dealt_seats");
@@ -12570,7 +12467,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: dealt,
             names: Default::default(),
-            posts: Vec::new(),
         };
         let implicit = decide(
             &game,
@@ -12895,7 +12791,6 @@ mod tests {
             stacks: vec![2000; 6],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let solver_cfg = TableConfig::default_6max_100bb();
         let scale = solver_cfg.big_blind.as_u64() / req.big_blind; // 5
@@ -13484,7 +13379,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         }
     }
 
@@ -14068,7 +13962,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: dealt,
             names: Default::default(),
-            posts: Vec::new(),
         }
     }
 
@@ -14436,38 +14329,8 @@ mod tests {
         assert!(is_legal(&r, &req.valid), "{r:?}");
     }
 
-    /// 补盲 `posts`：OpenPoker 座经 `to_tree` 映成树座；未发牌 / 盲注位 / 重复 → `bad_posts`。
-    #[test]
-    fn seat_map_live_posts() {
-        let mk = |posts: Vec<u8>, dealt: Vec<u8>| Request {
-            posts,
-            ..n_req(8, 6, 0, dealt)
-        };
-        // 满桌按钮 6：OpenPoker 座 4 = 树座 (4 + 8 − 6) % 8 = 6。
-        assert_eq!(
-            seat_map(&mk(vec![4], vec![]), 8).unwrap().live_posts,
-            1 << 6
-        );
-        assert_eq!(seat_map(&mk(vec![], vec![]), 8).unwrap().live_posts, 0);
-        // SB = 座 7（树座 1）、BB = 座 0（树座 2）不能补盲。
-        for bad in [vec![7], vec![0], vec![4, 4]] {
-            assert_eq!(
-                seat_map(&mk(bad.clone(), vec![]), 8).err().as_deref(),
-                Some("bad_posts"),
-                "{bad:?}"
-            );
-        }
-        // 短桌：未发牌的座补盲 → bad_posts；发了牌的照常映射。
-        let dealt = vec![0, 1, 3, 4, 5, 6, 7];
-        assert_eq!(
-            seat_map(&mk(vec![2], dealt.clone()), 8).err().as_deref(),
-            Some("bad_posts")
-        );
-        let smap = seat_map(&mk(vec![4], dealt), 8).unwrap();
-        assert_eq!(smap.live_posts, 1 << smap.tree_seat(4).unwrap());
-    }
-
-    /// 8 座 ante-flop2（盲注 50/100、ante 100，scale 1），按钮座 6，座 4 补盲。
+    /// 8 座 ante-flop2（盲注 50/100、ante 100，scale 1），按钮座 6（SB = 7、BB = 0）。补盲测试用：
+    /// 补盲不进请求，driver 把补盲者当成没下过注的普通玩家发来（[`Request`] 注释）。
     fn post_game() -> SimplifiedNlheGame {
         let table = Arc::new(BucketTable::stub_for_postflop(
             BucketConfig::new(200, 200, 200).expect("200/200/200"),
@@ -14482,16 +14345,14 @@ mod tests {
             big_blind: 100,
             ante: 100,
             actions,
-            posts: vec![4],
             ..n_req(8, 6, my, vec![])
         }
     }
 
-    /// wopo 实盘 132 手的翻前变体（座 3 开 960、补盲座 4 弃、其余弃到 SB 跟）轮到 BB：真实侧按补盲
-    /// 建局（底池多出补盲的 100），影子不受影响、仍锚定，决策走 blueprint 且合法。修前 driver 整手作废。
-    /// （实盘那手座 5 也跟了：cap4 树里开池后已有一人跟注时 SB 没有 Call，与补盲无关。）
+    /// wopo 实盘 132 手的翻前变体（座 3 开 960、补盲座 4 弃、其余弃到 SB 跟）轮到 BB：补盲者弃牌，
+    /// 他补的 100 不进底池（真实桌多 100），影子仍锚定，决策走 blueprint 且合法。
     #[test]
-    fn live_post_fold_stays_anchored() {
+    fn poster_fold_stays_anchored() {
         let game = post_game();
         let abs = game.abstraction().clone();
         let solver_cfg = game.table_config().clone();
@@ -14517,7 +14378,8 @@ mod tests {
         let (real, _, limp, _) =
             lockstep_replay(&game, &solver_cfg, &smap, &req, 1, 0, Some(my), false)
                 .expect("补盲者弃牌后两边一致");
-        assert_eq!(real.pot().as_u64(), 1_050 + 960 + 910);
+        // ante 800 + 盲注 150，加开池 960 与 SB 跟到 960；补盲的 100 不在里面。
+        assert_eq!(real.pot().as_u64(), 950 + 960 + 910);
         assert!(!limp.mapped());
         let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
         let r = decide(
@@ -14531,48 +14393,71 @@ mod tests {
         );
         assert_eq!(r.source, "blueprint", "{r:?}");
         assert!(is_legal(&r, &req.valid), "{r:?}");
-        // 同一请求不带 posts：真实侧少了补盲的 100。
-        let plain = Request {
-            posts: vec![],
-            ..req.clone()
-        };
-        let smap0 = seat_map(&plain, 8).unwrap();
-        let (real0, ..) =
-            lockstep_replay(&game, &solver_cfg, &smap0, &plain, 1, 0, Some(my), false).unwrap();
-        assert_eq!(real0.pot().as_u64() + 100, real.pot().as_u64());
     }
 
-    /// 补盲者没人加注时过牌：no-limp 影子（ante-flop2 禁非 SB 平跟）里等同平跟 → 开平跟当弃牌时
-    /// 记 ghost（翻前交给 limp 启发式）；关时显式失同步 `post_check_gap`，不静默错映射。
+    /// 补盲者没人加注时过牌，driver 改发 `call`：advisor 当成一家平跟，翻前交给平跟池启发式。
+    /// 修前（请求带 posts、原样发 check）这里落到兜底，底池赔率规则让 hero 拿任意两张跟进 1BB
+    /// （wopo 10-29 实盘 75o）。72o 在 CO 面对一家平跟应弃牌。
     #[test]
-    fn live_post_check_maps_like_limp() {
+    fn poster_check_sent_as_call_goes_limp_heuristic() {
         let game = post_game();
+        let abs = game.abstraction().clone();
         let solver_cfg = game.table_config().clone();
-        // 1、2、3 弃，补盲座 4 过牌，5、6 弃，SB(7) 补齐 → 轮到 BB(0)。
-        let actions = vec![
-            hist(1, "fold", None),
-            hist(2, "fold", None),
-            hist(3, "fold", None),
-            hist(4, "check", None),
-            hist(5, "fold", None),
-            hist(6, "fold", None),
-            hist(7, "call", None),
-        ];
-        let req = post_req(0, actions);
+        let mut req = post_req(
+            5,
+            vec![
+                hist(1, "fold", None),
+                hist(2, "fold", None),
+                hist(3, "fold", None),
+                hist(4, "call", None),
+            ],
+        );
+        req.hole = vec!["7c".into(), "2d".into()];
+        req.valid = ValidActions {
+            can_check: false,
+            can_call: true,
+            can_raise: true,
+            min_raise: Some(200),
+            max_raise: Some(19_900),
+        };
         let smap = seat_map(&req, 8).unwrap();
-        let my = SeatId(smap.tree_seat(0).unwrap());
-        let (real, _, limp, _) =
+        let my = SeatId(smap.tree_seat(5).unwrap());
+        assert_eq!(limp_pos(my.0, 8), LimpPos::BeforeBtn(1), "座 5 = CO");
+        let (_, _, limp, _) =
             lockstep_replay(&game, &solver_cfg, &smap, &req, 1, 0, Some(my), true)
-                .expect("过牌按平跟当弃牌映射");
+                .expect("平跟当弃牌映射");
         assert!(limp.mapped());
-        assert!(real.legal_actions().check, "BB 仍有选择权");
-        assert_eq!(real.pot().as_u64(), 1_050 + 50);
-        let e = lockstep_replay(&game, &solver_cfg, &smap, &req, 1, 0, Some(my), false)
-            .expect_err("不开平跟当弃牌 → 显式失同步");
-        assert_eq!(e.reason, "post_check_gap");
+        let r = decide(
+            &game,
+            &abs,
+            &|_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n],
+            &req,
+            0,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(
+            (r.action.as_str(), r.source.as_str()),
+            ("fold", "limp_heuristic:fold"),
+            "{r:?}"
+        );
+        // 旧 driver 原样发补盲者的 check：advisor 里他面对大盲不能过牌 → 重放对不上 → 兜底弃牌，
+        // 不会按底池赔率跟。
+        req.actions[3] = hist(4, "check", None);
+        let r = decide(
+            &game,
+            &abs,
+            &|_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n],
+            &req,
+            0,
+            None,
+            &mut SubgameSolveCache::new(),
+        );
+        assert_eq!(r.action, "fold", "{r:?}");
+        assert!(r.source.starts_with("fallback:"), "{r:?}");
     }
 
-    /// hero 自己补盲、没人加注轮到他：真实可以过牌。影子里他面对大盲、策略全压弃牌时出 check
+    /// hero 自己补盲、没人加注轮到他：桌面上可以过牌；advisor 里他面对大盲，策略全压弃牌时出 check
     /// （`:fold_as_check`），不会把免费看牌扔掉。
     #[test]
     fn hero_poster_never_folds_free_option() {
@@ -15039,7 +14924,6 @@ mod tests {
             stacks: vec![],
             dealt_seats: vec![],
             names: Default::default(),
-            posts: Vec::new(),
         }
     }
 
@@ -15869,7 +15753,6 @@ mod tests {
             stacks: vec![1359, 2381, 2260, 2000, 2000, 2000, 2000, 2000, 2000],
             dealt_seats: vec![0, 1, 2, 3, 4],
             names: Default::default(),
-            posts: Vec::new(),
         };
         let mut guarded_hits = 0;
         for seed in 1..=3u64 {
@@ -16019,7 +15902,6 @@ mod tests {
             stacks,
             dealt_seats: vec![],
             names: names.iter().map(|(s, n)| (*s, n.to_string())).collect(),
-            posts: Vec::new(),
         }
     }
 
@@ -16224,7 +16106,6 @@ mod tests {
             names: [(0u8, "cc".to_string()), (8u8, "bp".to_string())]
                 .into_iter()
                 .collect(),
-            posts: Vec::new(),
         };
         let tracker = tracker_with_cc(30);
         let resp = run_fourbet(&game, &req, Some(&tracker), 0xC0FFEE);

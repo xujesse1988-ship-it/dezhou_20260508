@@ -411,12 +411,13 @@ class WopoSession:
     def _request(self, valid):
         hand = self.hand
         dealt = hand.dealt if len(hand.dealt) < self.n_seats else None
+        # 补盲不进请求，由 advisor_actions 改写成普通动作（advisor 没有补盲逻辑）。
         return make_request(hand.hole, hand.board, hand.button, hand.hero, self.n_seats,
-                            hand.sb, hand.bb, list(hand.actions), valid,
+                            hand.sb, hand.bb, hand.advisor_actions(), valid,
                             stacks=hand.hand_start_stacks(placeholder=100 * hand.bb),
                             dealt_seats=list(dealt) if dealt else None,
                             names=dict(hand.names) if self.send_names else None,
-                            ante=hand.ante, posts=list(hand.posts) or None,
+                            ante=hand.ante,
                             hand_id=hand.hand_id if self.send_hand_id else None)
 
     def _maybe_prewarm(self):

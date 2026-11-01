@@ -129,6 +129,17 @@ class HandEngine:
     def to_call(self, seat):
         return self.max_bet - self.bet.get(seat, 0)
 
+    def advisor_actions(self):
+        """发给 advisor 的动作历史：补盲在这里消化掉，advisor 没有补盲逻辑。
+
+        advisor 请求不带补盲座，补盲者就是一个没下过注的普通玩家（开局栈 hand_start_stacks 本来就含
+        补的 1BB）。他在翻前没人加注时的过牌改成 call——投入同为 1BB，等于一次平跟；跟注 / 加注 / 全下
+        的金额是本街总额，原样发；弃牌原样发，补的 1BB 在 advisor 的底池里就没有了（advisor 按动作
+        重放自算底池，之后各街自然一直少这 1BB）。轮到补盲者之前 advisor 的底池同样少 1BB。"""
+        return [{**a, "action": "call"}
+                if a["seat"] in self.posts and a["action"] == "check" and st == "preflop" else dict(a)
+                for a, st in zip(self.actions, self.action_streets)]
+
     def hand_start_stacks(self, placeholder):
         """下标 = 座位号的开局真栈；非发牌座填 placeholder（advisor 按 dealt_seats 忽略）。"""
         return [self.start_stack.get(s, placeholder) for s in range(self.n_seats)]
