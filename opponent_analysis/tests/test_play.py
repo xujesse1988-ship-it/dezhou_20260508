@@ -1,5 +1,6 @@
 """Action guide: following the wopo driver's --play-events stream and serving /api/play."""
 
+import gzip
 import json
 import os
 import shutil
@@ -10,7 +11,7 @@ import unittest
 import urllib.request
 from http.server import ThreadingHTTPServer
 
-from opponent_analysis.live import Follower, PlayFeed, hand_view, make_handler
+from opponent_analysis.live import Follower, PlayFeed, accepts_gzip, hand_view, make_handler
 
 DATA = os.path.join(os.path.dirname(__file__), "data")
 # tools/wopo_play.py --selftest writes and checks this file (ts / decide_ms normalised): the
@@ -264,6 +265,39 @@ class PlayHttpTest(unittest.TestCase):
             code, ctype, page = self.get(base + "/")
             self.assertEqual(code, 200)
             self.assertIn("行动指南".encode(), page)
+
+    def test_gzip_when_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "ev.jsonl")
+            shutil.copy(EVENTS, path)
+            feed = PlayFeed([path])
+            feed.step()
+            base = self.serve(feed)
+            plain = self.get(base + "/api/play")[2]
+
+            def fetch(url, enc):
+                req = urllib.request.Request(url, headers={"Accept-Encoding": enc})
+                with urllib.request.urlopen(req) as r:
+                    return r.headers.get("Content-Encoding"), r.headers.get("Vary"), r.read()
+
+            # Large body + gzip accepted: compressed, same JSON once decompressed (the "now" field
+            # is the server clock, so compare without it).
+            enc, vary, body = fetch(base + "/api/play", "gzip, deflate")
+            self.assertEqual((enc, vary), ("gzip", "Accept-Encoding"))
+            self.assertLess(len(body), len(plain) / 3)
+            strip = lambda b: {k: v for k, v in json.loads(b).items() if k != "now"}  # noqa: E731
+            self.assertEqual(strip(gzip.decompress(body)), strip(plain))
+            # Refused, or not offered: plain.
+            self.assertIsNone(fetch(base + "/api/play", "gzip;q=0, identity")[0])
+            self.assertIsNone(fetch(base + "/api/play", "identity")[0])
+            # Small body (the "unchanged" reply): not worth compressing.
+            v = json.loads(plain)["version"]
+            self.assertIsNone(fetch(f"{base}/api/play?since={v}", "gzip")[0])
+
+    def test_accepts_gzip(self):
+        for header, want in [(None, False), ("", False), ("gzip", True), ("deflate, gzip;q=0.5", True),
+                             ("gzip;q=0", False), ("GZIP", True), ("*", True), ("br, deflate", False)]:
+            self.assertEqual(accepts_gzip(header), want, header)
 
     def test_api_play_disabled(self):
         base = self.serve(None)

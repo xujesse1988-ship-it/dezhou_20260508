@@ -17,6 +17,7 @@ database.
 from __future__ import annotations
 
 import glob
+import gzip
 import json
 import math
 import os
@@ -602,14 +603,42 @@ def _kn(p, stat: str, outcome: str) -> tuple[int, int]:
 
 # ------------------------------------------------------------------ HTTP
 
+GZIP_MIN_BYTES = 1024  # smaller bodies are not worth compressing
+
+
+def accepts_gzip(header: Optional[str]) -> bool:
+    """Whether an Accept-Encoding header allows gzip (a `gzip;q=0` entry refuses it)."""
+    for part in (header or "").split(","):
+        name, _, params = part.strip().partition(";")
+        if name.strip().lower() in ("gzip", "*"):
+            q = params.strip()
+            return not (q.startswith("q=") and _float(q[2:]) == 0.0)
+    return False
+
+
+def _float(s: str) -> Optional[float]:
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def make_handler(live: Live, play: Optional[PlayFeed] = None):
     class H(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # quiet: the page polls every few seconds
             pass
 
         def _send(self, code: int, body: bytes, ctype: str) -> None:
+            # The page polls ~80 KB of JSON every second or two, usually through an ssh tunnel:
+            # gzip cuts that several-fold.
+            gz = len(body) >= GZIP_MIN_BYTES and accepts_gzip(self.headers.get("Accept-Encoding"))
+            if gz:
+                body = gzip.compress(body, compresslevel=6)
             self.send_response(code)
             self.send_header("Content-Type", ctype)
+            if gz:
+                self.send_header("Content-Encoding", "gzip")
+            self.send_header("Vary", "Accept-Encoding")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()

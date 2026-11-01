@@ -213,6 +213,9 @@ const fmtTime = ts => ts ? new Date(ts * 1000).toLocaleString('zh-CN', { hour12:
 const ago = ts => { if (!ts) return '—'; const s = Date.now() / 1000 - ts; if (s < 60) return Math.max(0, Math.round(s)) + ' 秒前'; if (s < 3600) return Math.round(s / 60) + ' 分钟前'; if (s < 86400) return (s / 3600).toFixed(1) + ' 小时前'; return Math.round(s / 86400) + ' 天前'; };
 const signed = (x, d = 1) => x == null ? '—' : `<span class="${x > 0 ? 'pos' : x < 0 ? 'neg' : ''}">${x > 0 ? '+' : ''}${x.toFixed(d)}</span>`;
 let snap = null, selected = null, sortKey = 'hands', sortDir = -1, failures = 0, onlySeated = false;
+// Consecutive failed requests before the status says the service is unreachable: one slow
+// response through an ssh tunnel is not an outage.
+const DOWN_AFTER = 3;
 try { selected = localStorage.getItem('oa.sel'); onlySeated = localStorage.getItem('oa.seated') === '1'; } catch {}
 // Two player tables: scope 'all' = whole history, 'recent' = each player's own last N hands.
 const SCOPES = [['all', 'players-all', 'pt-all'], ['recent', 'players-recent', 'pt-recent']];
@@ -505,7 +508,7 @@ function renderHeader() {
   $('m-last').textContent = `最新一手 ${ago(snap.last_ts)}`;
   $('m-built').textContent = `画像更新于 ${ago(snap.built_at)}`;
   const st = $('status'), lastChange = Math.max(0, ...snap.files.map(f => f.mtime || 0));
-  if (failures) { st.className = 'pill down'; st.textContent = '服务连不上'; }
+  if (failures >= DOWN_AFTER) { st.className = 'pill down'; st.textContent = '服务连不上'; }
   else if (!lastChange || Date.now() / 1000 - lastChange > 300) { st.className = 'pill stale'; st.textContent = '日志无新内容 ' + ago(lastChange || null); }
   else { st.className = 'pill'; st.textContent = '实时'; }
 }
@@ -538,7 +541,11 @@ async function poll() {
     failures = 0;
     if (d.loading) { $('status').className = 'pill stale'; $('status').textContent = '正在加载历史手牌'; }
     else if (!d.unchanged) { snap = d; render(); } else renderHeader();
-  } catch { failures++; if (snap) renderHeader(); else $('status').textContent = '服务连不上'; $('status').className = 'pill down'; }
+  } catch {
+    failures++;
+    if (snap) renderHeader();
+    else if (failures >= DOWN_AFTER) { $('status').textContent = '服务连不上'; $('status').className = 'pill down'; }
+  }
   setTimeout(poll, 3000);
 }
 poll();
@@ -699,7 +706,7 @@ function handSummary(h) {
 function guideStatus() {
   const st = $('g-status');
   const last = play && play.hands.length ? Math.max(...play.hands.map(h => h.last_ts || 0)) : 0;
-  if (playFailures) { st.className = 'pill down'; st.textContent = '服务连不上'; }
+  if (playFailures >= DOWN_AFTER) { st.className = 'pill down'; st.textContent = '服务连不上'; }
   else if (renderError) { st.className = 'pill down'; st.textContent = '页面显示出错：' + renderError; }
   else if (!last) { st.className = 'pill stale'; st.textContent = '等待 driver 写事件'; }
   else if (secAgo(last) > 120) { st.className = 'pill stale'; st.textContent = '最近事件 ' + agoP(last); }
@@ -730,7 +737,7 @@ function renderGuide() {
 function tickGuide() {
   const el = document.getElementById('g-pending');
   if (el && el.dataset.ts) el.textContent = Math.round(secAgo(+el.dataset.ts) || 0);
-  if (play) guideStatus(); else if (playFailures) { $('g-status').className = 'pill down'; $('g-status').textContent = '服务连不上'; }
+  if (play) guideStatus(); else if (playFailures >= DOWN_AFTER) { $('g-status').className = 'pill down'; $('g-status').textContent = '服务连不上'; }
 }
 
 $('g-recent').addEventListener('toggle', e => {
