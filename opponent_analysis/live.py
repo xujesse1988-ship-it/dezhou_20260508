@@ -8,7 +8,8 @@ and the followed files are re-read with hand_id dedupe.
 Optionally (--play-events) the wopo driver's play-event stream is followed too: one JSON line
 per play.log line, written while the hand is played. It only feeds the "action guide" panel
 (/api/play): the current hand and the last N hands, held in memory, never written to the
-database.
+database. The advisor's --range-log next to it (wopo_ranges.jsonl) is followed as well, for the
+opponents' estimated hand-strength mix per street; the 1326-combo ranges themselves are dropped.
 
     python3 -m opponent_analysis live --db artifacts/opponent_db --platform poker_manager \
         --follow 'artifacts/poker_manager_live_*/poker_manager_hh.jsonl' --port 8780
@@ -279,6 +280,28 @@ def _hand_line(h: Hand) -> dict:
 
 # ------------------------------------------------------------------ action guide (wopo play events)
 
+RANGES_NAME = "wopo_ranges.jsonl"  # tools/wopo_play.py writes the advisor's --range-log here by default
+
+
+def default_range_patterns(play_patterns: list[str]) -> list[str]:
+    """The range log the driver writes by default: wopo_ranges.jsonl next to each play-event file."""
+    return list(dict.fromkeys(os.path.join(os.path.dirname(p), RANGES_NAME) for p in play_patterns))
+
+
+def range_event(rec) -> Optional[dict]:
+    """One --range-log line -> a small "ranges" event (opponent seats' strength mix only), or None
+    for the header line, a line without hand_id, or one without any opponent strength summary."""
+    if not isinstance(rec, dict) or "range_log_header" in rec or rec.get("hand_id") is None:
+        return None
+    seats = [{k: s.get(k) for k in ("seat", "name", "coef", "width", "strength")}
+             for s in rec.get("seats") or []
+             if isinstance(s, dict) and not s.get("hero") and isinstance(s.get("strength"), dict)]
+    if not seats:
+        return None
+    return {"ts": rec.get("ts"), "type": "ranges", "hand_id": rec["hand_id"],
+            **{k: rec.get(k) for k in ("street", "board", "path", "range_src", "source", "trigger")}, "seats": seats}
+
+
 class PlayFeed:
     """Follows the wopo driver's --play-events JSONL and keeps the newest `max_hands` hands.
 
@@ -288,12 +311,18 @@ class PlayFeed:
     the recent hands without reading a long session. Identical re-read events are dropped; an
     event for a hand already pushed out of the window is ignored (it would otherwise come back
     as the newest hand).
+
+    range_patterns: the advisor's --range-log files; each line becomes a "ranges" event of its
+    hand (range_event). Its lines are large (1326 weights per seat), hence the bigger tail.
     """
 
-    def __init__(self, patterns: list[str], max_hands: int = 20, tail_bytes: int = 8 << 20):
+    def __init__(self, patterns: list[str], max_hands: int = 20, tail_bytes: int = 8 << 20,
+                 range_patterns: Optional[list[str]] = None, range_tail_bytes: int = 64 << 20):
         self.patterns = patterns
         self.max_hands = max(1, max_hands)
         self.follower = Follower(patterns, tail_bytes=tail_bytes)
+        self.range_patterns = list(range_patterns or [])
+        self.range_follower = Follower(self.range_patterns, tail_bytes=range_tail_bytes) if self.range_patterns else None
         self.hands: dict[str, dict] = {}
         self.dropped: OrderedDict = OrderedDict()
         self.seq = 0
@@ -312,6 +341,11 @@ class PlayFeed:
                 self.counts["bad_event"] += 1
                 continue
             added += self._add(rec)
+        if self.range_follower is not None:
+            for _, _, rec in self.range_follower.poll():
+                ev = range_event(rec)
+                if ev is not None:
+                    added += self._add(ev)
         if added:
             self._evict()
             self._publish()
@@ -376,6 +410,9 @@ class PlayFeed:
                 "patterns": self.patterns,
                 "files": [{"path": p, "lines": f["lines"], "bad_lines": f["bad_lines"], "mtime": f["mtime"]}
                           for p, f in sorted(self.follower.files.items())],
+                "range_patterns": self.range_patterns,
+                "range_files": [{"path": p, "lines": f["lines"], "bad_lines": f["bad_lines"], "mtime": f["mtime"]}
+                                for p, f in sorted(self.range_follower.files.items())] if self.range_follower else [],
                 "counts": dict(self.counts), "errors": list(self.errors),
             }
 
@@ -404,7 +441,7 @@ def _blank_view(hand_id, events: list) -> dict:
     return {"hand_id": hand_id, "table_id": None, "first_ts": None, "last_ts": None, "partial": True,
             "button": None, "sb": None, "bb": None, "ante": 0, "hero_seat": None, "hole": None,
             "seats": [], "board": [], "street": "preflop", "pot": None, "turns": [], "dead": None,
-            "result": None, "hero_net": None, "status": "playing", "events": events}
+            "result": None, "hero_net": None, "status": "playing", "ranges": [], "events": events}
 
 
 def error_view(hand_id, events: list, error: str) -> dict:
@@ -426,6 +463,7 @@ def hand_view(hand_id, events: list[dict]) -> dict:
     v = _blank_view(hand_id, events)
     seats: dict[int, dict] = {}
     turns: dict[int, dict] = {}
+    ranges: dict[str, dict] = {}  # street -> the latest solve's opponent strength mix
 
     def seat(s, name=None):
         x = seats.get(s)
@@ -502,6 +540,9 @@ def hand_view(hand_id, events: list[dict]) -> dict:
                                                      "source", "decide_ms", "stale", "stale_kind", "written",
                                                      "rejected", "pot", "to_call", "valid")}
             tr["decision"]["ts"] = ts
+        elif t == "ranges":
+            ranges[e.get("street")] = {k: e.get(k) for k in ("street", "board", "path", "range_src", "source", "seats")}
+            ranges[e.get("street")]["ts"] = ts
         elif t == "dead":
             v["dead"] = {"reason": e.get("reason"), "tag": e.get("tag"), "ts": ts}
         elif t == "result":
@@ -512,6 +553,7 @@ def hand_view(hand_id, events: list[dict]) -> dict:
                     v["hero_net"] = x.get("net")
     v["seats"] = [seats[s] for s in sorted(seats, key=lambda s: (s is None, s if isinstance(s, int) else 0))]
     v["turns"] = [turns[k] for k in sorted(turns, key=lambda k: k if isinstance(k, int) else -1)]
+    v["ranges"] = [ranges[st] for st in ("flop", "turn", "river") if st in ranges]
     v["status"] = "dead" if v["dead"] else "done" if v["result"] else "playing"
     return v
 
@@ -676,9 +718,9 @@ def make_handler(live: Live, play: Optional[PlayFeed] = None):
 
 def serve(db_dir: str, platform: str, patterns: list[str], host: str, port: int, cfg: Config,
           poll_s: float = 2.0, refresh_s: float = 5.0, hero_names=(), play_patterns=None,
-          play_hands: int = 20, play_poll_s: float = 0.5) -> None:
+          play_hands: int = 20, play_poll_s: float = 0.5, range_patterns=None) -> None:
     live = Live(db_dir, platform, patterns, cfg, refresh_s, hero_names)
-    play = PlayFeed(play_patterns, play_hands) if play_patterns else None
+    play = PlayFeed(play_patterns, play_hands, range_patterns=range_patterns) if play_patterns else None
     # Bind first: a busy port fails at once, and the page shows "loading" during bootstrap.
     httpd = ThreadingHTTPServer((host, port), make_handler(live, play))
     print(f"serving http://{host}:{port}/", flush=True)
@@ -687,7 +729,8 @@ def serve(db_dir: str, platform: str, patterns: list[str], host: str, port: int,
     if play is not None:
         # Own thread: the guide stays live while the profile bootstraps or rebuilds.
         threading.Thread(target=play.run, args=(stop, play_poll_s), daemon=True).start()
-        print(f"action guide: following {', '.join(play_patterns)} (last {play.max_hands} hands)", flush=True)
+        print(f"action guide: following {', '.join(play_patterns)} (last {play.max_hands} hands)"
+              + (f"; ranges {', '.join(play.range_patterns)}" if play.range_patterns else ""), flush=True)
 
     def work() -> None:
         t0 = time.time()

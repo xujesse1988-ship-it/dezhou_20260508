@@ -340,6 +340,7 @@ blueprint 在边界以下的概率只剩 1e-4 量级的残余值，排序不可�
 - 请求标识：`hand_id`（driver 开了范围日志就在请求里带上，可与 hh 对上）、hero 底牌、公共牌、街、动作数、`trigger`（`prewarm` / `decide`）、响应来源；
 - 范围来源：`path`（`anchored` / `unanchored`）、`range_src`（同上表）、`hero_coef`；
 - `seats`：每个在手座的 OpenPoker 座位、名字、是否 hero、`coef`（被翻前倾斜接管）、`width`（做了宽度修正）、`range`（这次 solve 实际用的 1326 个权重，归一后乘 1e6 取整）。`range_src = uniform` 时为空。
+- `strength`（翻牌起、对手座才有）：这份范围按牌力档汇总的概率，剔除撞公共牌和 hero 底牌的组合后重新归一，只写非零档。档位强到弱：`straight_flush` / `quads` / `full_house` / `flush` / `straight` / `trips` / `two_pair` / `top_pair`（超对或顶对）/ `pair`（其它一对）/ `nothing`。牌型不比公共牌自身高的（打公共牌、只多了踢脚）算 `nothing`，所以对子面上拿一张配上别的公共牌是 `two_pair`，什么都没配上是 `nothing`；公共牌本身已是顺子时拿更大的顺子也算 `nothing`（少见，没细分）。行动指南网页直接读它显示「对手牌力估计」。
 
 文件开头（每次进程启动）有一行表头，`combos` 列出 1326 个组合的牌面，`range` 下标按它。只读缓存，不影响决策；写失败只告警。实测平均约 20KB / 行，1000 手约 40MB。
 

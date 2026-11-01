@@ -11,7 +11,8 @@ import unittest
 import urllib.request
 from http.server import ThreadingHTTPServer
 
-from opponent_analysis.live import Follower, PlayFeed, accepts_gzip, hand_view, make_handler
+from opponent_analysis.live import (Follower, PlayFeed, accepts_gzip, default_range_patterns, hand_view, make_handler,
+                                    range_event)
 
 DATA = os.path.join(os.path.dirname(__file__), "data")
 # tools/wopo_play.py --selftest writes and checks this file (ts / decide_ms normalised): the
@@ -159,6 +160,50 @@ class PlayFeedTest(unittest.TestCase):
         self.append([late])
         self.assertEqual(feed.step(), 0)
         self.assertEqual(feed.counts["late_event"], 1)
+
+    def test_range_log_strength_per_street(self):
+        """The advisor's --range-log next to the events adds each opponent's strength mix per street
+        (latest solve of the street wins); hero seats, the header and the 1326 weights are dropped."""
+        self.append(self.events)
+        hid = self.events[-1]["hand_id"]
+        t0 = self.events[-1]["ts"]
+        rpath = default_range_patterns([self.path])[0]
+        self.assertEqual(rpath, os.path.join(os.path.dirname(self.path), "wopo_ranges.jsonl"))
+
+        def line(street, ts, strength, board):
+            return {"ts": ts, "hand_id": hid, "trigger": "prewarm", "source": "prewarm:stored", "street": street,
+                    "board": board, "path": "unanchored", "range_src": "prefix_reach",
+                    "seats": [{"seat": 0, "name": "hero", "hero": True, "range": [1] * 1326},
+                              {"seat": 3, "name": "v", "hero": False, "coef": True, "width": False,
+                               "range": [1] * 1326, "strength": strength}]}
+        recs = [{"range_log_header": 1, "combos": []},
+                line("flop", t0 + 1, {"nothing": 0.6, "pair": 0.4}, ["As", "7d", "2c"]),
+                line("flop", t0 + 2, {"nothing": 0.5, "top_pair": 0.5}, ["As", "7d", "2c"]),
+                line("turn", t0 + 3, {"trips": 0.2, "nothing": 0.8}, ["As", "7d", "2c", "2h"]),
+                {"ts": t0, "hand_id": None, "street": "flop", "seats": []}]
+        with open(rpath, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(r) + "\n" for r in recs)
+        self.assertIsNone(range_event(recs[0]))
+        self.assertIsNone(range_event(recs[-1]))
+        ev = range_event(recs[1])
+        self.assertEqual(ev["seats"], [{"seat": 3, "name": "v", "coef": True, "width": False,
+                                        "strength": {"nothing": 0.6, "pair": 0.4}}])
+        feed = PlayFeed([self.path], max_hands=3, range_patterns=[rpath])
+        feed.step()
+        r = feed.response(None)
+        cur = r["hands"][0]
+        self.assertEqual(cur["hand_id"], hid)
+        self.assertEqual([x["street"] for x in cur["ranges"]], ["flop", "turn"])
+        self.assertEqual(cur["ranges"][0]["seats"][0]["strength"], {"nothing": 0.5, "top_pair": 0.5})
+        self.assertEqual(cur["ranges"][1]["board"], ["As", "7d", "2c", "2h"])
+        self.assertTrue(all("range" not in s for e in cur["events"] for s in e.get("seats") or []))
+        self.assertEqual([f["lines"] for f in r["range_files"]], [5])
+        # Without range files the views have no strength and are otherwise unchanged.
+        plain = PlayFeed([self.path], max_hands=3)
+        plain.step()
+        p = plain.response(None)["hands"]
+        self.assertEqual(p[0]["ranges"], [])
+        self.assertEqual(p[1:], r["hands"][1:])
 
     def test_views_match_hand_history(self):
         """The guide's per-hand state equals what the driver's hh log says about the same hands."""

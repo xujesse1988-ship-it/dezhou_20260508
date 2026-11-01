@@ -5909,9 +5909,125 @@ fn card_label(c: Card) -> String {
     format!("{}{}", R[v / 4] as char, S[v % 4] as char)
 }
 
+/// 牌力档（强到弱），[`range_strength`] 的键。
+const STRENGTH_CLASSES: [&str; 10] = [
+    "straight_flush",
+    "quads",
+    "full_house",
+    "flush",
+    "straight",
+    "trips",
+    "two_pair",
+    "top_pair",
+    "pair",
+    "nothing",
+];
+
+/// 3–4 张公共牌自身的牌型（只有对子类：凑不出顺子 / 同花）；5 张走评估器。
+fn board_category(board: &[Card]) -> poker::eval::HandCategory {
+    use poker::eval::HandCategory;
+    if let Ok(five) = <&[Card; 5]>::try_from(board) {
+        return NaiveHandEvaluator.eval5(five).category();
+    }
+    let mut counts = [0u8; 13];
+    for c in board {
+        counts[(c.to_u8() / 4) as usize] += 1;
+    }
+    let max = counts.iter().copied().max().unwrap_or(0);
+    let pairs = counts.iter().filter(|&&n| n == 2).count();
+    match (max, pairs) {
+        (4, _) => HandCategory::Quads,
+        (3, _) => HandCategory::Trips,
+        (2, 2) => HandCategory::TwoPair,
+        (2, _) => HandCategory::OnePair,
+        _ => HandCategory::HighCard,
+    }
+}
+
+/// 一座范围按牌力档汇总的概率（键见 [`STRENGTH_CLASSES`]，只写非零档，保留 4 位小数）。剔除撞公共牌和
+/// `dead`（看范围那一方自己的底牌）的组合后重新归一。牌型没比公共牌自身高（打公共牌、只换了踢脚，
+/// 或公共牌已是顺子时拿到更大的顺子）算 `nothing`；一对里对子不低于公共牌最大点（超对 / 顶对）算
+/// `top_pair`。翻前（公共牌不足 3 张）或剔完没有权重 → `None`。
+fn range_strength(
+    range: &[f64],
+    holes: &[[Card; 2]],
+    board: &[Card],
+    dead: &[Card],
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    use poker::eval::HandCategory;
+    if board.len() < 3 || range.len() != holes.len() {
+        return None;
+    }
+    let ev = NaiveHandEvaluator;
+    let board_cat = board_category(board) as u8;
+    let board_top = board.iter().map(|c| c.to_u8() / 4).max().unwrap_or(0);
+    let mut acc = [0.0_f64; STRENGTH_CLASSES.len()];
+    let mut cards: Vec<Card> = Vec::with_capacity(7);
+    for (&w, h) in range.iter().zip(holes) {
+        if w <= 0.0 || h.iter().any(|c| board.contains(c) || dead.contains(c)) {
+            continue;
+        }
+        cards.clear();
+        cards.extend_from_slice(h);
+        cards.extend_from_slice(board);
+        let rank = match cards.len() {
+            5 => ev.eval5(cards.as_slice().try_into().expect("5 张")),
+            6 => ev.eval6(cards.as_slice().try_into().expect("6 张")),
+            _ => ev.eval7(cards.as_slice().try_into().expect("7 张")),
+        };
+        let cat = rank.category();
+        let class = if (cat as u8) <= board_cat {
+            9
+        } else {
+            match cat {
+                HandCategory::StraightFlush | HandCategory::RoyalFlush => 0,
+                HandCategory::Quads => 1,
+                HandCategory::FullHouse => 2,
+                HandCategory::Flush => 3,
+                HandCategory::Straight => 4,
+                HandCategory::Trips => 5,
+                HandCategory::TwoPair => 6,
+                HandCategory::OnePair => {
+                    // Board is unpaired here, so the pair is the rank seen twice among the 7 cards.
+                    let mut counts = [0u8; 13];
+                    for c in &cards {
+                        counts[(c.to_u8() / 4) as usize] += 1;
+                    }
+                    let pair = counts.iter().rposition(|&n| n == 2).unwrap_or(0) as u8;
+                    if pair >= board_top {
+                        7
+                    } else {
+                        8
+                    }
+                }
+                HandCategory::HighCard => 9,
+            }
+        };
+        acc[class] += w;
+    }
+    let total: f64 = acc.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    Some(
+        STRENGTH_CLASSES
+            .iter()
+            .zip(acc)
+            .filter(|(_, w)| *w > 0.0)
+            .map(|(k, w)| {
+                (
+                    (*k).to_string(),
+                    serde_json::json!(((w / total) * 1e4).round() / 1e4),
+                )
+            })
+            .collect(),
+    )
+}
+
 /// 一次 solve 的日志行：请求标识（hand_id、底牌、公共牌、动作数）+ 范围来源（[`SolveRangeMeta`]）+ 每个
 /// 在手座（范围非空）的名字、是否 hero、是否被翻前系数 / 画像宽度修正改过、归一后按 [`RANGE_LOG_SCALE`]
-/// 取整的 1326 个权重（下标对齐表头 `combos`）。`range_src = "uniform"` 时没有范围，`seats` 为空。
+/// 取整的 1326 个权重（下标对齐表头 `combos`）；对手座翻牌起另有 `strength`（[`range_strength`]，剔除
+/// hero 底牌）。`range_src = "uniform"` 时没有范围，`seats` 为空。
 fn range_log_entry(
     solve: &SolveView<'_>,
     req: &Request,
@@ -5924,6 +6040,13 @@ fn range_log_entry(
             .and_then(|m| m.to_tree.iter().position(|&t| t == Some(tree as u8)))
     };
     let meta = solve.meta;
+    let holes = all_hole_combos();
+    let board: Vec<Card> = req
+        .board
+        .iter()
+        .filter_map(|s| parse_card(s).ok())
+        .collect();
+    let hero_hole: Vec<Card> = req.hole.iter().filter_map(|s| parse_card(s).ok()).collect();
     let seats: Vec<serde_json::Value> = solve
         .ranges
         .unwrap_or(&[])
@@ -5939,15 +6062,20 @@ fn range_log_entry(
             };
             let range: Vec<u32> = r.iter().map(|x| (x * scale).round() as u32).collect();
             let op = op_of(tree);
-            serde_json::json!({
+            let hero = op == Some(req.my_seat as usize);
+            let mut seat = serde_json::json!({
                 "seat": op,
                 "tree_seat": tree,
                 "name": op.and_then(|o| req.names.get(&(o as u8))),
-                "hero": op == Some(req.my_seat as usize),
+                "hero": hero,
                 "coef": meta.coef_seats.contains(&(tree as u8)),
                 "width": meta.width_seats.contains(&(tree as u8)),
                 "range": range,
-            })
+            });
+            if let (false, Some(s)) = (hero, range_strength(r, &holes, &board, &hero_hole)) {
+                seat["strength"] = serde_json::Value::Object(s);
+            }
+            seat
         })
         .collect();
     serde_json::json!({
@@ -11344,6 +11472,18 @@ mod tests {
             assert_eq!(st["coef"], villain_seat, "只有 villain 被倾斜接管");
             assert_eq!(st["width"], false);
             assert_eq!(st["name"], if villain_seat { "villain" } else { "hero" });
+            // Strength summary: villain only (flop), probabilities sum to ~1.
+            if villain_seat {
+                let total: f64 = st["strength"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|v| v.as_f64().unwrap())
+                    .sum();
+                assert!((total - 1.0).abs() < 1e-3, "{}", st["strength"]);
+            } else {
+                assert!(st.get("strength").is_none());
+            }
         }
 
         let mut cache_off = SubgameSolveCache::new();
@@ -15329,6 +15469,61 @@ mod tests {
     fn hole_of(s: &str) -> [Card; 2] {
         let v = cards(s);
         [v[0], v[1]]
+    }
+
+    /// 范围日志的牌力汇总：按牌型分档、打公共牌算没中、超对 / 顶对单列，剔除撞 hero 底牌的组合后重新归一。
+    #[test]
+    fn range_strength_buckets() {
+        let holes = all_hole_combos();
+        let range_of = |hands: &[(&str, f64)]| {
+            let mut r = vec![0.0; holes.len()];
+            for (h, w) in hands {
+                let hc = hole_of(h);
+                let i = holes
+                    .iter()
+                    .position(|x| *x == hc || *x == [hc[1], hc[0]])
+                    .unwrap();
+                r[i] = *w;
+            }
+            r
+        };
+        let get = |m: &serde_json::Map<String, serde_json::Value>, k: &str| {
+            m.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0)
+        };
+        // Paired river (Ts Tc 5h 2d 4d): the AhAd combo shares a card with hero's Ah7d → dropped.
+        let board = cards("Ts Tc 5h 2d 4d");
+        let r = range_of(&[
+            ("5c 5d", 1.0),
+            ("Th 8d", 1.0),
+            ("7h 2c", 1.0),
+            ("6c 3c", 1.0),
+            ("Kh Qh", 1.0),
+            ("Ad Ah", 5.0),
+        ]);
+        let s = range_strength(&r, &holes, &board, &cards("Ah 7d")).unwrap();
+        for k in ["full_house", "trips", "two_pair", "straight", "nothing"] {
+            assert!((get(&s, k) - 0.2).abs() < 1e-9, "{k}: {s:?}");
+        }
+        assert_eq!(s.len(), 5, "零档不写：{s:?}");
+        // Unpaired flop (Ks 7d 2c): overpair and top pair → top_pair; under-pair / middle pair → pair.
+        let board = cards("Ks 7d 2c");
+        let r = range_of(&[
+            ("Ac Ad", 1.0),
+            ("Ah Kd", 1.0),
+            ("Qc Qd", 1.0),
+            ("7h 6h", 1.0),
+            ("9h 8h", 3.0),
+            ("Kc 7c", 3.0),
+        ]);
+        let s = range_strength(&r, &holes, &board, &[]).unwrap();
+        assert!((get(&s, "top_pair") - 0.2).abs() < 1e-9, "{s:?}");
+        assert!((get(&s, "pair") - 0.2).abs() < 1e-9, "{s:?}");
+        assert!((get(&s, "nothing") - 0.3).abs() < 1e-9, "{s:?}");
+        assert!((get(&s, "two_pair") - 0.3).abs() < 1e-9, "{s:?}");
+        // Preflop, or nothing left after card removal → no summary.
+        assert!(range_strength(&r, &holes, &cards("Ks 7d"), &[]).is_none());
+        let only_dead = range_of(&[("Ac Ad", 1.0)]);
+        assert!(range_strength(&only_dead, &holes, &board, &cards("Ac 2h")).is_none());
     }
 
     /// 护栏的弱牌判定样例（[`is_weak_postflop_hand`]）：低于中对、且没有 8 张以上顺子 / 同花出牌的算弱。

@@ -54,6 +54,9 @@ def main(argv=None) -> int:
                     help="wopo driver 的 --play-events 事件文件（路径或通配符，加引号）：页面顶部显示实时行动指南；"
                          "缺省不显示")
     lv.add_argument("--play-hands", type=int, default=20, help="行动指南保留的最近手数（含当前手）")
+    lv.add_argument("--play-ranges", nargs="+", default=None,
+                    help="advisor 的 --range-log 文件（路径或通配符）：行动指南显示对手每条街的牌力分布；"
+                         "缺省 = 每个 --play-events 同目录的 wopo_ranges.jsonl（driver 的默认位置），off 关")
 
     a = ap.parse_args(argv)
     try:
@@ -65,13 +68,17 @@ def main(argv=None) -> int:
 
 def _run(a) -> int:
     if a.cmd == "live":
-        from .live import serve
+        from .live import default_range_patterns, serve
 
         cfg = Config(min_hands=a.min_hands, min_opps=a.min_opps, bluff_pct=a.bluff_pct, recent_hands=a.recent_hands)
         if a.play_hands < 1:
             ap.error("--play-hands 须 ≥ 1")
+        if a.play_ranges == ["off"] or not a.play_events:
+            ranges = None
+        else:
+            ranges = a.play_ranges or default_range_patterns(a.play_events)
         serve(a.db, a.platform, a.follow, a.host, a.port, cfg, a.poll, a.refresh, a.hero,
-              play_patterns=a.play_events, play_hands=a.play_hands)
+              play_patterns=a.play_events, play_hands=a.play_hands, range_patterns=ranges)
         return 0
     if a.cmd == "ingest":
         jobs = []

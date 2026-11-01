@@ -151,6 +151,11 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .seats-tab tr.hero td { background: var(--hero); }
 .namebtn { border: none; background: none; padding: 0; font: inherit; color: var(--accent); cursor: pointer; text-align: left; }
 .namebtn:hover { text-decoration: underline; }
+.strength { font-size: 12px; margin-top: 10px; }
+.strength .sh { color: var(--muted); margin: 6px 0 2px; }
+.strength .row { display: grid; grid-template-columns: minmax(70px, auto) minmax(80px, 140px) 1fr; gap: 2px 8px; align-items: center; padding: 1px 0; }
+.sbar { display: flex; height: 8px; border-radius: 2px; overflow: hidden; background: var(--line); }
+.sbar span { display: block; height: 100%; background: var(--accent); }
 .timeline { font-size: 12px; margin-top: 6px; }
 .timeline .st { font-weight: 600; color: var(--muted); margin: 8px 0 2px; display: flex; gap: 8px; align-items: center; }
 .tl { display: flex; gap: 8px; padding: 1px 4px; border-radius: 3px; }
@@ -639,6 +644,26 @@ function decisionBox(h) {
   return html + '</div>';
 }
 
+// Opponents' estimated hand-strength mix (advisor --range-log): the range at the start of each
+// street, before that street's actions. Strongest class first; the bar fades with strength.
+const STRENGTH = [['straight_flush', '同花顺'], ['quads', '四条'], ['full_house', '葫芦'], ['flush', '同花'], ['straight', '顺子'],
+  ['trips', '三条'], ['two_pair', '两对'], ['top_pair', '超对 / 顶对'], ['pair', '其它一对'], ['nothing', '没中']];
+function strengthRow(x) {
+  const st = x.strength || {};
+  const parts = STRENGTH.map(([k, label], i) => [label, +st[k] || 0, 1 - i * 0.09]).filter(p => p[1] > 0);
+  const bar = parts.map(([label, p, o]) => `<span title="${esc(label)} ${pct(p)}%" style="width:${(100 * p).toFixed(1)}%;opacity:${o.toFixed(2)}"></span>`).join('');
+  const text = parts.filter(p => p[1] >= 0.01).map(([label, p]) => `${esc(label)} ${(100 * p).toFixed(0)}%`).join(' · ');
+  return `<div class="row"><span>${nameBtn(x.name, x.seat)}</span><div class="sbar">${bar}</div><span>${text || '<span class="muted">—</span>'}</span></div>`;
+}
+function strengthBlock(h) {
+  const rs = (h.ranges || []).slice().reverse();
+  if (!rs.length) return '';
+  const one = r => `<div class="sh">${STREET_CN[r.street] || esc(r.street)}开始时 ${pcards(r.board)} <span title="${esc(r.source || '')}">${esc(r.path || '')} / ${esc(r.range_src || '')}</span></div>`
+    + (r.seats || []).map(strengthRow).join('');
+  return `<div class="strength"><h3>对手牌力估计 <span class="muted" style="font-weight:normal;font-size:12px">每条街开始时的范围，不含这条街的动作</span></h3>${one(rs[0])}`
+    + (rs.length > 1 ? `<details><summary>之前的街</summary>${rs.slice(1).map(one).join('')}</details>` : '') + '</div>';
+}
+
 function timeline(h) {
   const groups = [];
   let cur = null;
@@ -679,8 +704,8 @@ function resultBlock(h) {
 function handBody(h, full) {
   if (h.error) return `<p class="err">这手的事件无法解析：${esc(h.error)}</p>`;
   const cardsLine = `<div class="g-cards"><span>底牌 ${pcards(h.hole, full)}</span><span>公共牌 ${pcards(h.board, full)}</span><span>底池 <b class="num">${h.pot ?? '—'}</b></span></div>`;
-  if (!full) return cardsLine + timeline(h) + resultBlock(h);
-  return cardsLine + `<div class="g-grid"><div>${decisionBox(h)}${resultBlock(h)}</div><div>${seatsTable(h)}</div></div>` + timeline(h);
+  if (!full) return cardsLine + strengthBlock(h) + timeline(h) + resultBlock(h);
+  return cardsLine + `<div class="g-grid"><div>${decisionBox(h)}${resultBlock(h)}</div><div>${seatsTable(h)}${strengthBlock(h)}</div></div>` + timeline(h);
 }
 
 function handHead(h) {
@@ -730,6 +755,7 @@ function renderGuide() {
     + `<summary>${safeHand(h, () => handSummary(h))}</summary><div>${safeHand(h, () => handHead(h) + handBody(h, false))}</div></details>`).join('')
     || '<div class="empty">还没有更早的手</div>';
   $('g-files').innerHTML = '事件文件：' + (play.files.map(f => `<span class="cards">${esc(f.path)}</span> ${f.lines} 行${f.bad_lines ? '，坏行 ' + f.bad_lines : ''}，最后修改 ${agoP(f.mtime)}`).join('；') || `没有匹配 ${esc(play.patterns.join(' '))} 的文件`)
+    + (play.range_patterns && play.range_patterns.length ? '；范围日志：' + (play.range_files.map(f => `<span class="cards">${esc(f.path)}</span> ${f.lines} 行`).join('；') || `没有匹配 ${esc(play.range_patterns.join(' '))} 的文件`) : '')
     + (play.errors && play.errors.length ? ` <span class="err">${esc(play.errors[0].msg)}</span>` : '');
   guideStatus();
 }
