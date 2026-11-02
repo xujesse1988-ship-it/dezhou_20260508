@@ -177,6 +177,9 @@ def add_advisor_args(p, default_seats, debug_help):
     # 对手翻前范围倾斜流水线（advisor 默认 off）：on = 脱锚搜索里每个对手的翻前决策按他在该局面的实测
     # 频率倾斜 blueprint 参考策略（preflop_range_offanchor_research §7.4）。需 --exploit on|vpip。
     p.add_argument("--exploit-tilt", choices=["on", "off"], default=None)
+    # 锚定局面也用倾斜（advisor 默认 off）：锚定搜索的 blueprint estimate 根范围里对手翻前步改乘倾斜系数。
+    # 需 --exploit-tilt on（advisor 侧同样拦）。
+    p.add_argument("--exploit-anchored", choices=["on", "off"], default=None)
     # 根范围日志：advisor 每次新 solve 把各座根范围追加写进这个 JSONL（事后对照亮牌、看倾斜效果）；
     # 请求随之带 hand_id。需 --search。入口可给缺省路径（wopo：开 --search 默认写），off = 关。
     p.add_argument("--range-log", default=None,
@@ -197,8 +200,10 @@ def validate_advisor_args(args):
     if exploit_on and not args.search:
         raise SystemExit("--exploit on|vpip 需配 --search（剥削只挂脱锚搜索路径；没有搜索无处叠加）")
     if (args.exploit_shrink_k is not None or args.exploit_strength is not None
-            or args.exploit_tilt is not None) and not exploit_on:
+            or args.exploit_tilt is not None or args.exploit_anchored is not None) and not exploit_on:
         raise SystemExit("--exploit-* 子旗需配 --exploit on|vpip")
+    if args.exploit_anchored == "on" and args.exploit_tilt != "on":
+        raise SystemExit("--exploit-anchored on 需配 --exploit-tilt on（锚定倾斜用倾斜流水线的系数）")
     if args.range_log == "off":
         args.range_log = None
     if args.range_log is not None and not args.search:
@@ -298,6 +303,8 @@ def advisor_extra_args(args, warm_profile_hh=None):
             extra += ["--exploit-strength", str(args.exploit_strength)]
         if args.exploit_tilt is not None:
             extra += ["--exploit-tilt", args.exploit_tilt]
+        if args.exploit_anchored is not None:
+            extra += ["--exploit-anchored", args.exploit_anchored]
         if warm_profile_hh:
             extra += ["--warm-profile-hh", warm_profile_hh]
     # --debug-log 透传给 advisor：打印决策流水线 + range/solve 中间数据（与 --search 正交，
