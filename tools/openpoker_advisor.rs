@@ -825,8 +825,8 @@ fn prewarm_inner(
         return mk("prewarm:skip:scale_not_integer".into());
     }
     let scale = solver_bb / req.big_blind;
-    if req.small_blind * scale != solver_cfg.small_blind.as_u64() {
-        return mk("prewarm:skip:blind_ratio_mismatch".into());
+    if req.small_blind == 0 || req.small_blind > req.big_blind {
+        return mk("prewarm:skip:bad_sb".into());
     }
     if req.ante.checked_mul(scale) != Some(solver_cfg.ante.as_u64()) {
         return mk("prewarm:skip:ante_mismatch".into());
@@ -1444,7 +1444,7 @@ fn lockstep_replay(
 ) -> Result<LockstepOk, LockstepErr> {
     // 真实侧（按占底池比例翻译尺寸用）：短桌幻影座不交 ante，底池与真实桌一致。
     let mut real_cfg = solver_cfg.clone();
-    apply_real_table(&mut real_cfg, smap);
+    apply_real_table(&mut real_cfg, smap, req, scale);
     let mut real = poker::GameState::new(&real_cfg, REAL_REPLAY_SEED);
     let mut abs_rng = ChaCha20Rng::from_seed(ABS_REPLAY_SEED);
     let mut abs: SimplifiedNlheState = game.root(&mut abs_rng);
@@ -2799,9 +2799,10 @@ fn decide_with(
         return safe_fallback(&req.valid, "scale_not_integer");
     }
     let scale = solver_bb / req.big_blind;
-    // sb 必须按同一 scale 对齐 solver sb（默认 50；10×5=50）—— 否则盲注比例非标准、口径不一致。
-    if req.small_blind * scale != solver_cfg.small_blind.as_u64() {
-        return safe_fallback(&req.valid, "blind_ratio_mismatch");
+    // 小盲不要求是大盲的一半（wopo 有 20/50 这类桌）：真实侧按桌面小盲 × scale 建局（[`apply_real_table`]），
+    // blueprint 影子仍是训练时的小盲。只拦脏值。
+    if req.small_blind == 0 || req.small_blind > req.big_blind {
+        return safe_fallback(&req.valid, "bad_sb");
     }
     // ante 同理按 scale 对上 blueprint 的 ante（blueprint 无 ante 时请求也须无 ante）。
     if req.ante.checked_mul(scale) != Some(solver_cfg.ante.as_u64()) {
@@ -5127,7 +5128,7 @@ fn decide_search_unanchored(
 }
 
 /// 真码深 [`TableConfig`]：各座起始栈 = OpenPoker hand-start 栈 × `scale`（座位按 [`seat_map`]
-/// 映到 solver 座）。盲注 / 座数 / button 沿用 `solver_cfg`（对齐 blueprint）。`stacks` 缺省
+/// 映到 solver 座）。大盲 / 座数 / button 沿用 `solver_cfg`（对齐 blueprint），小盲取桌面值（[`apply_real_table`]）。`stacks` 缺省
 /// （旧 driver / 无 players 字段）→ 退 `solver_cfg` 对称 100BB。短桌：非发牌座的条目是 driver
 /// placeholder、跳过不读；幻影树座保持 solver 默认 100BB（开局即 fold，不影响底池）。
 /// 脏数据（长度 / 发牌座 0 栈 / 溢出）→ `Err`。
@@ -5138,7 +5139,7 @@ fn real_stacks_config(
     smap: &SeatMap,
 ) -> Result<TableConfig, String> {
     let mut cfg = solver_cfg.clone();
-    apply_real_table(&mut cfg, smap);
+    apply_real_table(&mut cfg, smap, req, scale);
     if req.stacks.is_empty() {
         return Ok(cfg); // 无真栈 → 对称 100BB（仍是合法的真栈解，只是不利用码深）。
     }
@@ -5160,9 +5161,13 @@ fn real_stacks_config(
     Ok(cfg)
 }
 
-/// 真实侧 config 相对 blueprint 的差别（影子不改）：短桌幻影座不交 ante——真实桌上没有这几份
-/// （blueprint 树按满桌人人交 ante 训的）。无 ante 时不动（`ante_exempt` 保持 0，与旧行为逐位相同）。
-fn apply_real_table(cfg: &mut TableConfig, smap: &SeatMap) {
+/// 真实侧 config 相对 blueprint 的差别（影子不改）：
+/// - 小盲 = 桌面小盲 × `scale`。blueprint 按小盲 = 半个大盲训练，wopo 有 20/50 这类桌（小盲 0.4BB）；
+///   真实侧（重放、实时搜索、出牌金额）按真实小盲算底池和 SB 补齐额，影子照旧。标准桌与旧行为逐位相同。
+/// - 短桌幻影座不交 ante——真实桌上没有这几份（blueprint 树按满桌人人交 ante 训的）。无 ante 时不动
+///   （`ante_exempt` 保持 0，与旧行为逐位相同）。
+fn apply_real_table(cfg: &mut TableConfig, smap: &SeatMap, req: &Request, scale: u64) {
+    cfg.small_blind = ChipAmount::new(req.small_blind * scale);
     if cfg.ante > ChipAmount::ZERO {
         cfg.ante_exempt = smap.phantoms.iter().fold(0, |m, &t| m | 1u16 << t);
     }
@@ -11717,6 +11722,81 @@ mod tests {
             &mut cache,
         );
         assert_eq!(cache.misses(), 2, "开 / 关锚定倾斜的范围不同 → key 不同");
+    }
+
+    /// 小盲不是大盲的一半（wopo 20/50 这类桌）：桌面 8/20 → scale 5 → 真实小盲 40（blueprint 50）。
+    /// 不再兜底；真实侧按 40 建局（SB 弃牌后翻牌底池少 10），影子不变 → 仍锚定、正常搜索，预热命中决策；
+    /// 翻前走 blueprint。脏值（小盲 0 / 大于大盲）兜底 `bad_sb`。
+    #[test]
+    fn small_blind_not_half_big_blind() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let sigma = top15_sigma();
+        let rt = rt_prefix_reach(SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        });
+        // UTG(3) 开到 60，其余弃（含 SB），BB(2) 跟 → 翻牌，BB 先行动。
+        let flop_req = |sb: u64| {
+            let mut r = flop_first_unraised_req(vec![2000; 6]);
+            r.small_blind = sb;
+            r.my_seat = 2;
+            r.hole = vec!["Qs".into(), "Qd".into()];
+            let a = |seat, action: &str, to| HistAction {
+                seat,
+                action: action.into(),
+                to,
+            };
+            r.actions = vec![
+                a(3, "raise", Some(60)),
+                a(4, "fold", None),
+                a(5, "fold", None),
+                a(0, "fold", None),
+                a(1, "fold", None),
+                a(2, "call", None),
+            ];
+            r.valid.max_raise = Some(1940);
+            r
+        };
+        let flop_pot = |req: &Request| {
+            let (cfg, smap, hero, hole) = coef_ctx(req);
+            let board: Vec<Card> = req.board.iter().map(|c| parse_card(c).unwrap()).collect();
+            let (_, round_start, ..) =
+                build_real_auth(req, &cfg, 5, &smap, hero, hole, &board, true).expect("真栈重放");
+            round_start.pot().as_u64()
+        };
+        assert_eq!(
+            flop_pot(&flop_req(10)),
+            650,
+            "标准桌：开池 300 × 2 + 小盲 50"
+        );
+        assert_eq!(flop_pot(&flop_req(8)), 640, "真实小盲 40 进底池");
+
+        let req = flop_req(8);
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(&game, &sigma, &req, 0x5B, Some(&rt), &mut cache);
+        assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+        let r = decide(&game, &abs, &sigma, &req, 0x5B, Some(&rt), &mut cache);
+        assert_eq!(r.source, "search", "仍锚定、正常搜索：得 {r:?}");
+        assert_eq!((cache.misses(), cache.hits()), (1, 1), "预热被决策命中");
+
+        // 翻前：UTG 首个行动 → blueprint，不兜底。
+        let mut pre = flop_req(8);
+        pre.board.clear();
+        pre.actions.clear();
+        pre.my_seat = 3;
+        pre.valid = full_valid();
+        let r = decide(&game, &abs, &sigma, &pre, 0x5B, None, &mut cache);
+        assert_eq!(r.source, "blueprint", "得 {r:?}");
+
+        for bad in [0, 30] {
+            let req = flop_req(bad);
+            let r = decide(&game, &abs, &sigma, &req, 0x5B, Some(&rt), &mut cache);
+            assert_eq!(r.source, "fallback:bad_sb", "小盲 {bad}");
+            let p = prewarm(&game, &sigma, &req, 0x5B, Some(&rt), &mut cache);
+            assert_eq!(p.source, "prewarm:skip:bad_sb", "小盲 {bad}");
+        }
     }
 
     #[test]
