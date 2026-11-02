@@ -2410,8 +2410,27 @@ fn raw_sigma_coef(
         .collect()
 }
 
+/// `req.actions` 里本街起点之前的那一段（本街按 board 长度定，起点用 [`truncate_request_to_street`]
+/// 的真栈重放找）。board 长度不对 / 重放失败 → 整段历史（旧口径）。
+fn actions_before_street_start<'a>(req: &'a Request, solver_cfg: &TableConfig) -> &'a [HistAction] {
+    let street = match req.board.len() {
+        0 => poker::Street::Preflop,
+        3 => poker::Street::Flop,
+        4 => poker::Street::Turn,
+        5 => poker::Street::River,
+        _ => return &req.actions,
+    };
+    match truncate_request_to_street(req, solver_cfg, street) {
+        Ok(t) => &req.actions[..t.actions.len()],
+        Err(e) => {
+            dlog!("actions_before_street_start: {e}，退回整段历史");
+            &req.actions
+        }
+    }
+}
+
 /// 对手翻前范围倾斜流水线（`--exploit-tilt on`）：「每个对手决策 → 参考策略 → 倾斜 → 乘」。对每个有名字、
-/// 本手没弃牌的对手座，按时间序走他的翻前决策（[`preflop_real_steps`] + [`req_preflop_spots`]，与
+/// 本街起点之前没弃牌的对手座，按时间序走他的翻前决策（[`preflop_real_steps`] + [`req_preflop_spots`]，与
 /// [`Profiler`] 同一份局面分类），逐步乘出一份逐组合系数，代替他翻前那几步的 blueprint 前缀 reach 和宽度
 /// 修正。每一步：
 /// - 主动全下 → 宽度表系数（[`shove_coef`]，不倾斜；旧做法是跳过 AllIn tag，按无信息处理）；
@@ -2450,17 +2469,19 @@ fn exploit_tilt(
     let prefix = synced_prefix_decisions(game, synced_node);
     let hero_name = req.names.get(&req.my_seat).map(String::as_str);
     let n_combos = all_hole_combos().len();
+    // 只认本街起点之前的弃牌：子树根在本街起点，街内才弃牌的座在根上还在手里、范围照读。按整段历史
+    // 判的话，街内有人弃牌后 hero 同街第二次决策会少倾斜这一座 → 范围变 → 缓存 key 变 → 重解。
+    let before_root = actions_before_street_start(req, solver_cfg);
     for (op_seat, name) in &req.names {
         let Ok(seat) = smap.tree_seat(*op_seat) else {
             continue;
         };
         if seat as PlayerId == hero
-            || req
-                .actions
+            || before_root
                 .iter()
                 .any(|h| h.seat == *op_seat && h.action == "fold")
         {
-            continue; // hero / 已弃牌（范围不被读）。
+            continue; // hero / 本街起点前已弃牌（范围不被读）。
         }
         // 他在同步前缀里的翻前决策，按时间序与他的真实翻前动作一一对应（lockstep 每个已同步的真实动作在
         // 影子里恰好走一步；平跟当弃牌映射的那一步是他的第一个动作，之后他再行动就失同步了）。
@@ -8665,6 +8686,52 @@ mod tests {
         assert!(class_reference(&game, &sigma, node_of(2), false)
             .iter()
             .all(|r| r[SpotAct::Fold as usize] == 0.0));
+    }
+
+    /// 街内弃牌不改倾斜：翻牌起点（预热）与同街 SB 下注、大盲弃牌之后（hero 决策）两份请求算出同一份
+    /// 系数——子树根在本街起点，大盲那时还在手里，范围照读；翻前就弃牌的座照旧跳过。修前大盲在第二份
+    /// 请求里被当成已弃牌、不倾斜 → 范围不同 → 同街重解。
+    #[test]
+    fn exploit_tilt_ignores_fold_within_street() {
+        let game = nolimp_game();
+        let sigma = top15_sigma();
+        let pre = vec![
+            hist(3, "fold", None),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "call", Some(20)),
+            hist(1, "call", Some(20)),
+            hist(2, "check", None),
+        ];
+        let mut req = limp_req(0, ["Qs", "Qd"], &["7h", "2c", "Ks"], pre);
+        req.names = BTreeMap::from([
+            (0, "hero".to_string()),
+            (1, "sb".to_string()),
+            (2, "bb".to_string()),
+            (3, "utg".to_string()),
+        ]);
+        let prof = Profiler::new(ExploitConfig {
+            tilt: true,
+            ..ExploitConfig::default()
+        });
+        let (cfg, smap, ..) = coef_ctx(&req);
+        let tilt_of = |r: &Request| {
+            let synced = replay_limp(&game, r, None, true).err().unwrap().synced_node;
+            exploit_tilt(&game, &sigma, &cfg, 5, &smap, r, synced, 0, &prof)
+        };
+        let t = tilt_of(&req);
+        assert!(t.coefs[1].is_some() && t.coefs[2].is_some(), "{t:?}");
+        assert!(t.coefs[3].is_none(), "翻前弃牌的座不倾斜");
+
+        let mut later = req.clone();
+        later
+            .actions
+            .extend([hist(1, "bet", Some(60)), hist(2, "fold", None)]);
+        assert_eq!(
+            actions_before_street_start(&later, &cfg).len(),
+            req.actions.len()
+        );
+        assert_eq!(tilt_of(&later), t);
     }
 
     /// 断点之后的决策用替身节点：UTG 平跟、BTN 隔离加注、UTG 跟注（`limper_continued` 失同步）。UTG 的
