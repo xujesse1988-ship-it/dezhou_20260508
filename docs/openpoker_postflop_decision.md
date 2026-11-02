@@ -334,7 +334,9 @@
 
 **宽度修正实际很少起作用**：开倾斜后，被倾斜接管的座跳过宽度修正（`exploit_snapshot` :4710）。实盘 range 日志里宽度修正只出现 2 次，都是 §8.1 的 bug 造成的（修后不会再这样出现）。
 
-**重启清零**：实盘每个进程空表起步。代码有 `--warm-profile-hh <hh 文件>` 可以启动时从 hh 日志暖启动（`warm_profile_from_hh` :6042），实盘没开。
+**暖启动**（2026-11-02 起，wopo driver 默认开）：driver 启动后、第一手之前，把历史 `wopo_hh.jsonl` 里每手按实盘同一格式当 observe
+发给 advisor（`tools/wopo_play.py` `--warm-hh`，缺省读 run 目录上一级下所有 `*/wopo_hh.jsonl`，`off` 关闭），进程内画像不再空表起步。
+此前实盘每个进程空表起步。advisor 自己的 `--warm-profile-hh` 读的是 OpenPoker hh（ante 写死 0），不能用于 wopo。
 
 ---
 
@@ -514,9 +516,9 @@ range 日志里这两次 `trigger: decide` 的条目，该座 `coef: false, widt
 - `:weak_commit_guard`：只要挪了任意概率就加，大多数只挪了 1% 以下（§4.4），不代表护栏改变了动作。
 - `resp.exploit`：列的是「有画像、没被倾斜接管」的座位，**包括已弃牌的座**，不能用来判断谁的范围被改了；要看 range 日志的 `coef` / `width`。
 
-### 8.7 画像进程内统计、重启清零 [事实]
+### 8.7 画像进程内统计、重启清零 [事实]（2026-11-02 已改：wopo driver 默认暖启动，见 §5）
 
-实盘没开 `--warm-profile-hh`，advisor 每次重启画像从空表开始；一手结束才更新。
+11-02 之前的实盘：advisor 每次重启画像从空表开始；一手结束才更新。
 
 ### 8.8 hero 偏离建议时锚定路径的 hero 范围不对 [推断]
 

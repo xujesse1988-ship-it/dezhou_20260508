@@ -19,6 +19,10 @@
     合法区间里的动作改安全动作（fallback:illegal_advisor_action，action-log 的 resp.rejected 记原回复）。
   - --exploit-4bet（PM-17）同 poker_manager：请求带玩家名、每手 observe 带投入金额。
   - --hh-log：每手打完且没作废的牌局写一行（opponent_analysis 的 wopo 平台读）。
+  - 画像暖启动（--warm-hh，开了 --exploit / --exploit-4bet 时默认开）：启动后、第一手之前，把历史 hh 里
+    每手按实盘同一格式（table.observe_from_hh）当 observe 发给 advisor，进程内画像不再从空表开始。缺省
+    来源 = --hh-log 所在 run 目录的上一级下所有 */wopo_hh.jsonl（同级各轮 + 本轮已写的，重启能接上）；
+    给 glob（可重复）覆盖，off 关闭。按 hand_id 去重、按 ts 排序。
   - --play-log：给人看的牌桌实况（手牌 / 公共牌 / 玩家行动 / hero 决策与实际行动 / 结算 / 作废），
     诊断信息（advisor 启动、连接、过期、未知消息）仍走 stderr。
   - --play-events：同一份实况的结构化事件流（JSONL，play log 每行对应一条事件，带同一行文字 text），
@@ -65,7 +69,7 @@ from poker_live.advisor_client import (add_advisor_args, add_fourbet_args, advis
                                        exploit_enabled, fourbet_enabled, fourbet_extra_args,
                                        start_advisor, validate_advisor_args, validate_fourbet_args)
 from poker_live.decision import DecisionWorker
-from poker_live.table import HandEngine, HandInvalid
+from poker_live.table import HandEngine, HandInvalid, observe_from_hh
 from poker_live.wopo import _STALE_CN, _STREET_CN, ActionFile, WopoSession, _fmt_act, fmt_probs, legalize
 from poker_live.wslog import WsLog
 
@@ -594,6 +598,57 @@ def _selftest_exploit_4bet():
     print("[selftest 7 PM-17] 请求带名字、observe 带投入金额并与服务器逐条一致", file=sys.stderr)
 
 
+def _selftest_warm_hh():
+    """画像暖启动：从 hh 重建的 observe 与这些手实盘当时发给 advisor 的 observe 逐条相同（含补盲手、带金额的
+    PM-17 格式）；多文件按 ts 排序、hand_id 去重、坏行跳过；缺省来源 / off / 显式 glob。"""
+    norm = lambda o: json.loads(json.dumps(o, ensure_ascii=False))  # 实盘 names 的 int 键序列化后是字符串
+    cases = [(_fixture_msgs(), {}), ]
+    with open(POSTS_FIXTURE) as f:
+        cases.append(([json.loads(line) for line in f if line.strip()],
+                      {"ante": 100, "blueprint_ante": 100, "n_seats": 8}))
+    with tempfile.TemporaryDirectory() as d:
+        files = []
+        for k, (msgs, kw) in enumerate(cases):
+            for amounts in (False, True):
+                buf = io.StringIO()
+                _, stub, _ = _run_msgs(msgs, hh_log=buf, exploit=not amounts, exploit_4bet=amounts, **kw)
+                live = [norm(rec) for kind, rec in stub.side if kind == "observe"]
+                path = os.path.join(d, f"r{k}", WARM_HH_NAME)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(buf.getvalue())
+                got, st = load_warm_observes([path], amounts=amounts)
+                _check(live and got == live and st == {"files": 1, "hands": len(live), "bad": 0, "dup": 0},
+                       f"第 {k} 组 amounts={amounts}：hh 重建的 observe 与实盘不同 {st}")
+                if k == 1:
+                    _check(any(o["posts"] for o in got), "补盲手的 observe 要带 posts")
+            files.append(path)
+        # 两个文件一起：按 ts 排序（补盲那组是 10-28 实盘，fixture 是 10-16），同一文件再给一次 → 全部算重复；坏行跳过。
+        with open(files[0], "a", encoding="utf-8") as f:
+            f.write("not json\n" + json.dumps({"wopo_hh": 1, "hand_id": "x"}) + "\n")
+        got, st = load_warm_observes([os.path.join(d, "*", WARM_HH_NAME), files[1]])
+        n0 = len(load_warm_observes([files[0]])[0])
+        _check(st == {"files": 2, "hands": len(got), "bad": 2, "dup": 0} and len(got) == n0 + 4,
+               f"多文件统计 {st}")
+        ts = [json.loads(line).get("ts") for f in files for line in open(f, encoding="utf-8")
+              if line.startswith("{") and "result" in line]
+        _check(got[:n0] == load_warm_observes([files[0]])[0] and min(ts[:n0]) < min(ts[n0:]),
+               "按 ts 排序：fixture（10-16）在补盲那组（10-28）之前")
+        _, st = load_warm_observes([files[0], files[0], os.path.join(d, "r0", "*.jsonl")])
+        _check(st["dup"] == 0 and st["files"] == 1, f"同一文件多次匹配只读一次 {st}")
+        dup = os.path.join(d, "copy", WARM_HH_NAME)
+        os.makedirs(os.path.dirname(dup))
+        with open(files[1], encoding="utf-8") as src, open(dup, "w", encoding="utf-8") as dst:
+            dst.write(src.read())
+        _, st = load_warm_observes([files[1], dup])
+        _check(st["hands"] == 4 and st["dup"] == 4, f"不同文件里同一手按 hand_id 去重 {st}")
+    run = os.path.join("x", "runs", "r1", "wopo_hh.jsonl")
+    _check(resolve_warm_hh(None, run) == [os.path.join(os.path.abspath(os.path.join("x", "runs")), "*", WARM_HH_NAME)]
+           and resolve_warm_hh(None, None) == [] and resolve_warm_hh(["off"], run) == []
+           and resolve_warm_hh(["a/*.jsonl", "b.jsonl"], run) == ["a/*.jsonl", "b.jsonl"], "--warm-hh 缺省规则")
+    print("[selftest 14 画像暖启动] hh 重建的 observe 与实盘逐条相同；多文件排序 / 去重 / 坏行；缺省来源", file=sys.stderr)
+
+
 def _selftest_hh_log():
     """--hh-log：每手打完且没作废的牌局写一行；作废的手不写。"""
 
@@ -1113,7 +1168,8 @@ def run_selftest():
     _selftest_ante()
     _selftest_posts()
     _selftest_play_events()
-    print("OK: wopo selftest 13 组场景全部通过。", file=sys.stderr)
+    _selftest_warm_hh()
+    print("OK: wopo selftest 14 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================
@@ -1136,6 +1192,50 @@ def open_play_events(arg, play_log):
     """按 resolve_play_events 打开事件文件（ActionFile：O_APPEND + 整行一次 write）；不写时 None。"""
     path = resolve_play_events(arg, play_log)
     return ActionFile(path) if path else None
+
+
+WARM_HH_NAME = "wopo_hh.jsonl"
+
+
+def resolve_warm_hh(arg, hh_log):
+    """--warm-hh → glob 列表。arg = None（缺省）：有 --hh-log 时取它 run 目录的上一级下所有
+    */wopo_hh.jsonl，否则不暖启动；["off"] → 不暖启动；其余 = 给定的 glob。"""
+    if arg is None:
+        if not hh_log:
+            return []
+        runs = os.path.dirname(os.path.dirname(os.path.abspath(hh_log)))
+        return [os.path.join(runs, "*", WARM_HH_NAME)]
+    if arg == ["off"]:
+        return []
+    return list(arg)
+
+
+def load_warm_observes(patterns, amounts=False):
+    """glob 匹配的 hh 文件 → observe 列表（按 ts 排序，hand_id 去重）+ 统计。坏行 / 缺字段的行跳过计数。"""
+    import glob
+    files = sorted({f for pat in patterns for f in glob.glob(pat)})
+    stats = {"files": len(files), "hands": 0, "bad": 0, "dup": 0}
+    seen, rows = set(), []
+    for f in files:
+        with open(f, encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                    key = (rec.get("table_id"), rec["hand_id"])
+                    obs = observe_from_hh(rec, amounts)
+                except (ValueError, KeyError, TypeError):
+                    stats["bad"] += 1
+                    continue
+                if key in seen:
+                    stats["dup"] += 1
+                    continue
+                seen.add(key)
+                rows.append((str(rec.get("ts") or ""), len(rows), obs))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    stats["hands"] = len(rows)
+    return [o for _, _, o in rows], stats
 
 
 def main():
@@ -1167,6 +1267,9 @@ def main():
                         "网页「行动指南」）。缺省：给了 --play-log 时写同目录 wopo_play_events.jsonl，"
                         "否则不写；off 关闭")
     p.add_argument("--num-hands", type=int, default=0, help="打完这么多手后退出；0 = 不限")
+    p.add_argument("--warm-hh", action="append", default=None,
+                   help="画像暖启动的历史 hh（glob，可重复；off 关闭）。开了 --exploit / --exploit-4bet 时"
+                        "默认开：--hh-log 所在 run 目录的上一级下所有 */wopo_hh.jsonl")
     p.add_argument("--ante", type=int, default=0,
                    help="桌面每座 ante（桌面筹码，默认 0）：开局人人先交，计入底池、不算本轮下注")
     p.add_argument("--blueprint-ante", type=int, default=0,
@@ -1191,6 +1294,13 @@ def main():
         if token is None:
             p.error(f"连 WS 需要 token：设环境变量 {TOKEN_ENV} 或写进 {ENV_FILE}（非空且不含空白）")
 
+    # 画像暖启动的来源（参数检查放在启动 advisor 之前，报错不留 advisor 进程）。
+    warm = resolve_warm_hh(args.warm_hh, args.hh_log)
+    if warm and not (exploit_enabled(args) or fourbet_enabled(args)):
+        if args.warm_hh is not None and args.warm_hh != ["off"]:
+            p.error("--warm-hh 需要 --exploit 或 --exploit-4bet（没开画像）")
+        warm = []
+
     ante_args = ["--ante", str(args.blueprint_ante)] if args.blueprint_ante else []
     # 缺省 100 不透传（advisor 默认 100，命令行与旧版逐字节相同）。
     stack_args = ["--stack-bb", str(args.stack_bb)] if args.stack_bb != 100 else []
@@ -1198,6 +1308,15 @@ def main():
                             + stack_args)
     # 回放用同步 worker（结果确定、不会因为读文件太快把决策判成过期）；联机用后台线程。
     worker = DecisionWorker(advisor, sync=args.replay is not None)
+    # 画像暖启动：第一手之前把历史 hh 当 observe 发给 advisor（与实盘每手结束发的同格式）。
+    if warm:
+        observes, st = load_warm_observes(warm, amounts=fourbet_enabled(args))
+        for o in observes:
+            worker.submit_observe(o)
+        print(f"[warm] 画像暖启动：{st['files']} 个 hh 文件，{st['hands']} 手发给 advisor"
+              f"（坏行 {st['bad']}，重复 {st['dup']}）；来源 {' '.join(warm)}", file=sys.stderr)
+    else:
+        print("[warm] 画像暖启动：关", file=sys.stderr)
     action_file = ActionFile(args.action_file)
     action_log = open(args.action_log, "a") if args.action_log else None
     hh_log = open(args.hh_log, "a", encoding="utf-8") if args.hh_log else None

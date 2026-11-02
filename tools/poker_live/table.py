@@ -27,6 +27,22 @@ _SUITS = set("cdhs")
 MIN_DEALT = 3
 
 
+
+def observe_payload(names, actions, button, dealt, posts, amounts=False):
+    """advisor observe 的唯一构造处（实盘每手结束 [`HandEngine.observe_record`] 与启动暖画像
+    [`observe_from_hh`] 共用）。actions 每项至少有 seat / street / action；amounts=True 时再带
+    contribution_delta / to_call_before。座位信息：advisor 画像按「位置组 × 前面有没有平跟者」统计未开池频率。"""
+    keys = ("seat", "street", "action") + (("contribution_delta", "to_call_before") if amounts else ())
+    return {"observe": 1, "names": names, "actions": [{k: a[k] for k in keys} for a in actions],
+            "button_seat": button, "dealt_seats": list(dealt), "posts": list(posts)}
+
+
+def observe_from_hh(rec, amounts=False):
+    """hh 日志一行（[`HandEngine.hh_record`] + result）→ 与这手实盘当时发出的 observe 相同的记录（names 键
+    是字符串，与实盘 JSON 序列化后一致）。hh 只写打完且没作废的手，与实盘发 observe 的手是同一组。"""
+    return observe_payload(rec["names"], rec["actions"], rec["button_seat"], rec["dealt_seats"],
+                           rec.get("posts") or [], amounts)
+
 class HandInvalid(Exception):
     """服务器消息与规则 / 自算状态不一致，这手无法继续推进。str(e) = 原因（短标签:细节）。"""
 
@@ -387,16 +403,9 @@ class HandEngine:
         """叠加剥削 observe（同 openpoker HandState.observe_record 格式，另带 button_seat / dealt_seats /
         posts）。amounts=True（PM-17 --exploit-4bet）时每个动作另带 contribution_delta / to_call_before，
         advisor 据此区分真加注和只够跟注的全下（同 poker_manager driver）。"""
-        acts = []
-        for a, st, amt in zip(self.actions, self.action_streets, self.action_amounts):
-            rec = {"seat": a["seat"], "street": st, "action": a["action"]}
-            if amounts:
-                rec["contribution_delta"] = amt["contribution_delta"]
-                rec["to_call_before"] = amt["to_call_before"]
-            acts.append(rec)
-        # 座位信息：advisor 画像按「位置组 × 前面有没有平跟者」统计未开池频率（平跟者范围倾斜用）。
-        return {"observe": 1, "names": self.names, "actions": acts, "button_seat": self.button,
-                "dealt_seats": list(self.dealt), "posts": list(self.posts)}
+        acts = [{"seat": a["seat"], "street": st, "action": a["action"], **amt}
+                for a, st, amt in zip(self.actions, self.action_streets, self.action_amounts)]
+        return observe_payload(self.names, acts, self.button, self.dealt, self.posts, amounts)
 
     def hh_record(self):
         """校验通过的整手牌局（hh 日志一行，opponent_analysis 的 wopo 适配器读）。只在本手打完且
