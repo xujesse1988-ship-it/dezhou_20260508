@@ -183,6 +183,7 @@ details.hand > div { padding: 4px 0 8px 14px; }
 <main>
   <section class="full" id="guide" hidden>
     <div class="section-head"><h2>行动指南 <span class="muted" id="g-sub"></span></h2><span class="pill stale" id="g-status">连接中</span></div>
+    <p class="legend" id="g-session"></p>
     <div id="g-current"><div class="empty">还没有事件</div></div>
     <details class="pt" id="g-recent-box"><summary>最近 <span id="g-n">0</span> 手<span class="muted">点开看每手的动作、建议与结算</span></summary><div id="g-recent"></div></details>
     <p class="legend" id="g-files"></p>
@@ -748,6 +749,19 @@ function safeHand(h, draw) {
   }
 }
 
+// The driver session behind the events file (/api/play `session`): start, uptime, hands so far.
+const dur = s => s < 3600 ? Math.max(0, Math.round(s / 60)) + ' 分钟' : Math.floor(s / 3600) + ' 小时 ' + Math.round(s % 3600 / 60) + ' 分';
+function renderSession() {
+  const s = play && play.session, el = $('g-session');
+  if (!s || !s.started) { el.textContent = ''; return; }
+  const state = s.alive === true ? `运行中，已运行 ${dur(secAgo(s.started) || 0)}`
+    : s.alive === false ? '<span class="err">进程已退出</span>' : '进程状态未知';
+  const pid = s.pid != null ? `pid ${s.pid} · ` : '';
+  const what = s.start_src === 'driver.pid' ? '本次进程启动' : '本次首个事件（没有 driver.pid）';
+  el.innerHTML = `${what} <b>${esc(fmtTime(s.started))}</b> · ${pid}${state} · 已打 <b>${s.hands}</b> 局`
+    + `<span class="muted">（结算 ${s.settled}，作废 ${s.dead}）</span>`;
+}
+
 function renderGuide() {
   const hs = play.hands;
   $('g-sub').textContent = hs.length ? `· ${hs[0].table_id || ''}` : '';
@@ -760,13 +774,14 @@ function renderGuide() {
   $('g-files').innerHTML = '事件文件：' + (play.files.map(f => `<span class="cards">${esc(f.path)}</span> ${f.lines} 行${f.bad_lines ? '，坏行 ' + f.bad_lines : ''}，最后修改 ${agoP(f.mtime)}`).join('；') || `没有匹配 ${esc(play.patterns.join(' '))} 的文件`)
     + (play.range_patterns && play.range_patterns.length ? '；范围日志：' + (play.range_files.map(f => `<span class="cards">${esc(f.path)}</span> ${f.lines} 行`).join('；') || `没有匹配 ${esc(play.range_patterns.join(' '))} 的文件`) : '')
     + (play.errors && play.errors.length ? ` <span class="err">${esc(play.errors[0].msg)}</span>` : '');
+  renderSession();
   guideStatus();
 }
 
 function tickGuide() {
   const el = document.getElementById('g-pending');
   if (el && el.dataset.ts) el.textContent = Math.round(secAgo(+el.dataset.ts) || 0);
-  if (play) guideStatus(); else if (playFailures >= DOWN_AFTER) { $('g-status').className = 'pill down'; $('g-status').textContent = '服务连不上'; }
+  if (play) { renderSession(); guideStatus(); } else if (playFailures >= DOWN_AFTER) { $('g-status').className = 'pill down'; $('g-status').textContent = '服务连不上'; }
 }
 
 $('g-recent').addEventListener('toggle', e => {

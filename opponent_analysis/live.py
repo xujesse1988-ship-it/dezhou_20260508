@@ -302,6 +302,102 @@ def range_event(rec) -> Optional[dict]:
             **{k: rec.get(k) for k in ("street", "board", "path", "range_src", "source", "trigger")}, "seats": seats}
 
 
+PID_NAME = "driver.pid"  # written by each run directory's start.sh right after it launches the driver
+SESSION_TYPES = ("hand_start", "result", "dead")
+
+
+def _pid_alive(pid: int, marker: str = "wopo_play") -> bool:
+    """The pid exists and (where /proc is readable) is the driver: a pid file left behind by an exited
+    driver, whose number a later unrelated process reused (e.g. after a reboot), is not alive."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return marker.encode() in f.read()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        pass  # no /proc (not Linux) or unreadable: existence only
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists, owned by someone else
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class SessionInfo:
+    """The driver session behind the newest followed play-event file: when it started and how many
+    hands it has played.
+
+    Start = mtime of driver.pid next to the events file (start.sh writes it right after launching
+    the driver, a restart rewrites it), with the pid's liveness; no pid file -> the file's first
+    event (start_src "first_event", alive unknown). Hands = hand_start events at or after the start,
+    split into settled (result) and voided (dead). The whole file is scanned once (the PlayFeed
+    follower reads only its tail), then only appended bytes; a replaced / shrunk file or a new
+    start rescans.
+    """
+
+    def __init__(self):
+        self.path: Optional[str] = None
+        self.key = None  # (path, inode, start) the counts belong to
+        self.offset = 0
+        self.first_ts: Optional[float] = None
+        self.counts: Counter = Counter()
+        self.info: Optional[dict] = None
+
+    def poll(self, paths: list[str]) -> bool:
+        """Updates from the matched event files; returns whether the published info changed."""
+        live = []
+        for p in paths:
+            try:
+                live.append((os.stat(p).st_mtime, p))
+            except FileNotFoundError:
+                pass
+        if not live:
+            changed, self.info, self.key = self.info is not None, None, None
+            return changed
+        path = max(live)[1]
+        st = os.stat(path)
+        pid = start = None
+        pid_path = os.path.join(os.path.dirname(path), PID_NAME)
+        try:
+            start = os.stat(pid_path).st_mtime
+            with open(pid_path, encoding="utf-8") as f:
+                pid = int(f.read().strip())
+        except (OSError, ValueError):
+            pid = None
+        key = (path, st.st_ino, start)
+        if key != self.key or st.st_size < self.offset:
+            self.key, self.offset, self.first_ts, self.counts = key, 0, None, Counter()
+        if st.st_size > self.offset:
+            with open(path, "rb") as f:
+                f.seek(self.offset)
+                data = f.read(st.st_size - self.offset)
+            end = data.rfind(b"\n") + 1  # a trailing half line waits for the next poll
+            for line in data[:end].splitlines():
+                if self.first_ts is None or any(t.encode() in line for t in SESSION_TYPES):
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    ts = _ts(rec.get("ts")) if isinstance(rec, dict) else None
+                    if ts is None:
+                        continue
+                    if self.first_ts is None:
+                        self.first_ts = ts
+                    if rec.get("type") in SESSION_TYPES and (start is None or ts >= start):
+                        self.counts[rec["type"]] += 1
+            self.offset += end
+        info = {"path": path, "started": start if start is not None else self.first_ts,
+                "start_src": "driver.pid" if start is not None else "first_event",
+                "pid": pid, "alive": _pid_alive(pid) if pid is not None else None,
+                "hands": self.counts["hand_start"], "settled": self.counts["result"], "dead": self.counts["dead"]}
+        changed, self.info = info != self.info, info
+        return changed
+
+
 class PlayFeed:
     """Follows the wopo driver's --play-events JSONL and keeps the newest `max_hands` hands.
 
@@ -331,6 +427,7 @@ class PlayFeed:
         self.version = 0
         self.lock = threading.Lock()
         self.body: dict = {}
+        self.session = SessionInfo()
         self._publish()
 
     def step(self) -> int:
@@ -346,8 +443,11 @@ class PlayFeed:
                 ev = range_event(rec)
                 if ev is not None:
                     added += self._add(ev)
+        paths = sorted({p for pat in self.patterns for p in glob.glob(pat)})
+        session_changed = self.session.poll(paths)
         if added:
             self._evict()
+        if added or session_changed:
             self._publish()
         return added
 
@@ -413,7 +513,7 @@ class PlayFeed:
                 "range_patterns": self.range_patterns,
                 "range_files": [{"path": p, "lines": f["lines"], "bad_lines": f["bad_lines"], "mtime": f["mtime"]}
                                 for p, f in sorted(self.range_follower.files.items())] if self.range_follower else [],
-                "counts": dict(self.counts), "errors": list(self.errors),
+                "counts": dict(self.counts), "errors": list(self.errors), "session": self.session.info,
             }
 
     def response(self, since: Optional[str]) -> dict:

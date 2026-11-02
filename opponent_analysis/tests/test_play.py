@@ -59,6 +59,118 @@ class FollowerTailTest(unittest.TestCase):
             self.assertEqual([r["n"] for _, _, r in fo.poll()], [0, 1, 2])
 
 
+class SessionInfoTest(unittest.TestCase):
+    """/api/play `session`: the driver session behind the events file (start, pid, hands so far)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run_dir = os.path.join(self.tmp.name, "run")
+        os.makedirs(self.run_dir)
+        self.path = os.path.join(self.run_dir, "wopo_play_events.jsonl")
+        self.events = load(EVENTS)
+        dead = dict(self.events[0], type="dead", text="本手作废")  # one voided hand on top of the fixture
+        self.events.append(dict(dead, ts=self.events[-1]["ts"] + 1))
+
+    def write(self, recs):
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.writelines(json.dumps(r, ensure_ascii=False) + "\n" for r in recs)
+
+    def pid_file(self, pid, mtime):
+        p = os.path.join(self.run_dir, "driver.pid")
+        with open(p, "w") as f:
+            f.write(f"{pid}\n")
+        os.utime(p, (mtime, mtime))
+
+    def counts(self, events, start=None):
+        n = lambda t: sum(e["type"] == t and (start is None or e["ts"] >= start) for e in events)
+        return n("hand_start"), n("result"), n("dead")
+
+    def session(self, feed):
+        s = feed.response(None)["session"]
+        return s, (s["hands"], s["settled"], s["dead"])
+
+    def test_no_pid_file_counts_whole_file_from_first_event(self):
+        feed = PlayFeed([self.path], max_hands=3)
+        feed.step()
+        self.assertIsNone(feed.response(None)["session"])  # no file yet
+        half = len(self.events) // 2
+        self.write(self.events[:half])
+        feed.step()
+        s, c = self.session(feed)
+        self.assertEqual((s["started"], s["start_src"], s["pid"], s["alive"]),
+                         (self.events[0]["ts"], "first_event", None, None))
+        self.assertEqual(c, self.counts(self.events[:half]))
+        # Appended events (and a half-written line) count once the line is complete.
+        tail = json.dumps(self.events[half], ensure_ascii=False)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(tail[:10])
+        feed.step()
+        self.assertEqual(self.session(feed)[1], self.counts(self.events[:half]))
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(tail[10:] + "\n")
+        self.write(self.events[half + 1:])
+        v = feed.response(None)["version"]
+        feed.step()
+        self.assertGreater(feed.response(None)["version"], v)
+        self.assertEqual(self.session(feed)[1], self.counts(self.events))
+        self.assertEqual(self.counts(self.events), (8, 7, 1))
+
+    def test_pid_file_sets_start_liveness_and_counts_only_later_hands(self):
+        self.write(self.events)
+        start = [e["ts"] for e in self.events if e["type"] == "hand_start"][3]  # a restart before hand 4
+        import subprocess
+        import sys
+        # Stands in for tools/wopo_play.py: the marker is in its command line.
+        driver = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "wopo_play"])
+        self.addCleanup(driver.wait)
+        self.addCleanup(driver.kill)
+        self.pid_file(driver.pid, start)
+        feed = PlayFeed([self.path], max_hands=3)
+        feed.step()
+        s, c = self.session(feed)
+        self.assertEqual((s["started"], s["start_src"], s["pid"], s["alive"]), (start, "driver.pid", driver.pid, True))
+        self.assertEqual(c, self.counts(self.events, start))
+        self.assertEqual(c[0], 5)
+        # A live pid that is not the driver (reused number) is not alive.
+        self.pid_file(os.getpid(), start)
+        feed.step()
+        self.assertIs(self.session(feed)[0]["alive"], False)
+        self.pid_file(driver.pid, start)
+        feed.step()
+        self.assertIs(self.session(feed)[0]["alive"], True)
+        # The driver exits: published without any new event.
+        gone = subprocess.Popen(["true"])
+        gone.wait()
+        self.pid_file(gone.pid, start)
+        v = feed.response(None)["version"]
+        self.assertEqual(feed.step(), 0)
+        s, _ = self.session(feed)
+        self.assertEqual((s["pid"], s["alive"]), (gone.pid, False))
+        self.assertGreater(feed.response(None)["version"], v)
+        # Restarted (pid file rewritten later): the count starts over from the new start.
+        later = self.events[-1]["ts"] + 10
+        self.pid_file(driver.pid, later)
+        feed.step()
+        self.assertEqual(self.session(feed)[1], (0, 0, 0))
+        self.write([dict(e, ts=later + 1 + i) for i, e in enumerate(self.events[:3])])
+        feed.step()
+        self.assertEqual(self.session(feed)[1], self.counts(self.events[:3]))
+
+    def test_newest_file_is_the_session(self):
+        old = os.path.join(self.tmp.name, "old", "wopo_play_events.jsonl")
+        os.makedirs(os.path.dirname(old))
+        with open(old, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(e, ensure_ascii=False) + "\n" for e in self.events)
+        os.utime(old, (1, 1))
+        self.write(self.events[:20])
+        feed = PlayFeed([os.path.join(self.tmp.name, "*", "wopo_play_events.jsonl")], max_hands=3)
+        feed.step()
+        s, c = self.session(feed)
+        self.assertEqual(s["path"], self.path)
+        self.assertEqual(c, self.counts(self.events[:20]))
+
+
 class PlayFeedTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
