@@ -1,4 +1,4 @@
-"""CLI: python3 -m opponent_analysis {ingest,report,live} ..."""
+"""CLI: python3 -m opponent_analysis {ingest,report,live,history} ..."""
 
 from __future__ import annotations
 
@@ -58,7 +58,16 @@ def main(argv=None) -> int:
                     help="advisor 的 --range-log 文件（路径或通配符）：行动指南显示对手每条街的牌力分布；"
                          "缺省 = 每个 --play-events 同目录的 wopo_ranges.jsonl（driver 的默认位置），off 关")
 
+    hs = sub.add_parser("history", help="wopo 牌局回放：浏览器里逐步回放打完的手（读 hh 日志，有事件流时带上建议）")
+    hs.add_argument("--run", nargs="+", required=True,
+                    help="run 目录或 wopo_hh.jsonl（可用通配符，加引号）；同目录的 wopo_play_events.jsonl / "
+                         "wopo_ranges.jsonl 有就一起读")
+    hs.add_argument("--host", default="127.0.0.1")
+    hs.add_argument("--port", type=int, default=8781)
+
     a = ap.parse_args(argv)
+    if a.cmd == "live" and a.play_hands < 1:
+        ap.error("--play-hands 须 ≥ 1")  # exits with status 2 and the usage line
     try:
         return _run(a)
     except db.DatabaseBusy as e:
@@ -67,12 +76,15 @@ def main(argv=None) -> int:
 
 
 def _run(a) -> int:
+    if a.cmd == "history":
+        from .history import serve as serve_history
+
+        serve_history(a.run, a.host, a.port)
+        return 0
     if a.cmd == "live":
         from .live import default_range_patterns, serve
 
         cfg = Config(min_hands=a.min_hands, min_opps=a.min_opps, bluff_pct=a.bluff_pct, recent_hands=a.recent_hands)
-        if a.play_hands < 1:
-            ap.error("--play-hands 须 ≥ 1")
         if a.play_ranges == ["off"] or not a.play_events:
             ranges = None
         else:
