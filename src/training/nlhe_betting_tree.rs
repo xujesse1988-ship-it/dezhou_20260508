@@ -310,6 +310,25 @@ pub fn ante_flop2_3bet_6max(
     (abs, rules)
 }
 
+/// [`ante_flop2_3bet_6max`] 再加一个 **1pot 开池档**：关掉 `preflop_open_small_only`，其余
+/// 不变。preflop 菜单仍 `{1/3, 0.5, 1}`：开池 = {1/3pot, 1pot}（0.5pot 由 `preflop_half_3bet`
+/// 删、开池全下由 `drop_preflop_open_allin` 删）；3bet = {0.5pot, 1pot}（1/3pot 由
+/// `drop_small_reraise` 删）；4bet+ 只有 1pot（均另有 all-in）；postflop 同 `ante-flop2`。
+/// 8 座每人 1BB ante：UTG–BTN 开池 4.5BB / 11.5BB，SB 开池（及 SB limp 后 BB 加注）4.33BB / 11BB。
+///
+/// 动机：wopo ante 桌（2026-10-31 至 11-02，8 人满桌 67 次无 limp 开池）对手开池中位 11.5BB、
+/// 42% 正好是满底池加注 11.5BB，几乎没人开 4.5BB 左右；`ante-flop2-3bet` 开池节点只有 1/3pot，
+/// 这些开池全被投到 4.5BB，面对大开池按小开池的范围防守。
+///
+/// 同 [`first_small_preopen_1pot_6max`] 的理由另立一档、不改既有 reshape。
+pub fn ante_flop2_3bet_open2_6max(
+    width_redirect: u8,
+) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let (abs, mut rules) = ante_flop2_3bet_6max(width_redirect);
+    rules.preflop_open_small_only = false;
+    (abs, rules)
+}
+
 /// `--profile six-max` 的 `--reshape <name>` → `(abstraction, rules)`。`train_cfr` 与
 /// `nlhe_dense_crop` 共用，保证裁切 / 加载时重建的树与训练时**同一**定义（dense ckpt 的
 /// layout 指纹仍会兜底校验）。未知名返回 `None`。
@@ -331,6 +350,7 @@ pub fn six_max_reshape(
         "flop2-1pot" => flop2_1pot_6max(width_redirect),
         "ante-flop2" => ante_flop2_6max(width_redirect),
         "ante-flop2-3bet" => ante_flop2_3bet_6max(width_redirect),
+        "ante-flop2-3bet-open2" => ante_flop2_3bet_open2_6max(width_redirect),
         _ => return None,
     })
 }
@@ -338,7 +358,7 @@ pub fn six_max_reshape(
 /// `six_max_reshape` 接受的名字（错误提示用）。
 pub const SIX_MAX_RESHAPE_NAMES: &str =
     "none | nolimp | preopen | preopen-small | preopen-1pot | all-1pot | flop2-1pot | ante-flop2 \
-     | ante-flop2-3bet";
+     | ante-flop2-3bet | ante-flop2-3bet-open2";
 
 /// S6 实时搜索深码档（`realtime_search_openpoker_exec` §2.1 / 缺口③）：**全街单一 {1pot}**
 /// 下注菜单——每决策点只剩 `{fold, check/call, bet/raise 1pot, all-in}`。fold/check/call/all-in
@@ -821,6 +841,49 @@ fn node_allowed_actions(
     )
 }
 
+/// 不物化树的决策节点 DFS：与 `walk` 同序、同过滤（[`node_allowed_actions`]）、同
+/// `entrants` / `raises_on_street` 推进，逐个决策节点调 `visit(state, allowed)`；`visit` 返回
+/// `false` 即中止整个遍历并返回 `false`。内存 O(深度)。
+fn dfs_decision_nodes(
+    state: &GameState,
+    abs: &StreetActionAbstraction,
+    rules: &BettingAbstractionRules,
+    entrants: u16,
+    raises_on_street: u32,
+    visit: &mut dyn FnMut(&GameState, &[AbstractAction]) -> bool,
+) -> bool {
+    let actor = state.current_player().expect("dfs 只在 Player 节点调用").0 as PlayerId;
+    let allowed = node_allowed_actions(state, actor, abs, rules, entrants, raises_on_street);
+    if !visit(state, &allowed) {
+        return false;
+    }
+    for action in allowed {
+        let mut next = state.clone();
+        next.apply(action.to_concrete())
+            .expect("action abstraction must emit legal Actions for current state");
+        if next.is_terminal() {
+            continue;
+        }
+        // entrants / raises_on_street 推进与 walk 逐字一致。
+        let next_entrants = if matches!(action, AbstractAction::Fold) {
+            entrants & !(1u16 << actor)
+        } else {
+            entrants | (1u16 << actor)
+        };
+        let next_raises = if next.street() as u8 != state.street() as u8 {
+            0
+        } else if is_aggression(&action) {
+            raises_on_street + 1
+        } else {
+            raises_on_street
+        };
+        if !dfs_decision_nodes(&next, abs, rules, next_entrants, next_raises, visit) {
+            return false;
+        }
+    }
+    true
+}
+
 /// [`PublicBettingTree::build_subtree`] 会建出的决策节点数（同一 DFS、同一过滤、同一
 /// `entrants` / `raises_on_street` 推进），但**不物化树**（内存 O(深度)），数到超过 `cap` 即停
 /// 返回 `None`。实时搜索在「可能远超节点上限」的局面（如 9-max 7+ 人 limp 池：实测 9-way
@@ -833,64 +896,59 @@ pub fn count_subtree_nodes_capped(
     raises_on_street: u32,
     cap: usize,
 ) -> Option<usize> {
-    fn go(
-        state: &GameState,
-        abs: &StreetActionAbstraction,
-        rules: &BettingAbstractionRules,
-        entrants: u16,
-        raises_on_street: u32,
-        n: &mut usize,
-        cap: usize,
-    ) -> bool {
-        let actor = state
-            .current_player()
-            .expect("count 只在 Player 节点调用")
-            .0 as PlayerId;
-        *n += 1;
-        if *n > cap {
-            return false;
-        }
-        for action in node_allowed_actions(state, actor, abs, rules, entrants, raises_on_street) {
-            let mut next = state.clone();
-            next.apply(action.to_concrete())
-                .expect("action abstraction must emit legal Actions for current state");
-            if next.is_terminal() {
-                continue;
-            }
-            // entrants / raises_on_street 推进与 walk 逐字一致。
-            let next_entrants = if matches!(action, AbstractAction::Fold) {
-                entrants & !(1u16 << actor)
-            } else {
-                entrants | (1u16 << actor)
-            };
-            let next_raises = if next.street() as u8 != state.street() as u8 {
-                0
-            } else if is_aggression(&action) {
-                raises_on_street + 1
-            } else {
-                raises_on_street
-            };
-            if !go(&next, abs, rules, next_entrants, next_raises, n, cap) {
-                return false;
-            }
-        }
-        true
-    }
     debug_assert!(
         !root_state.is_terminal() && root_state.current_player().is_some(),
         "count_subtree_nodes_capped root must be a Player decision node"
     );
     let mut n = 0usize;
-    go(
+    dfs_decision_nodes(
         root_state,
         abs,
         &rules,
         entrants,
         raises_on_street,
-        &mut n,
-        cap,
+        &mut |_, _| {
+            n += 1;
+            n <= cap
+        },
     )
     .then_some(n)
+}
+
+/// 全树按街的决策节点数与动作数之和（下标 = [`StreetTag`] as usize）。dense 表 slot 数 =
+/// Σ_街 `actions_by_street[s] × bucket_count[s]`，行数 = Σ_街 `nodes_by_street[s] × bucket_count[s]`
+/// （同 [`crate::training::nlhe_dense::NlheDenseIndexer::from_tree`]）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TreeLayoutCounts {
+    pub nodes_by_street: [u64; 4],
+    pub actions_by_street: [u64; 4],
+}
+
+impl TreeLayoutCounts {
+    /// 决策节点总数（== [`PublicBettingTree::num_nodes`]）。
+    pub fn total_nodes(&self) -> u64 {
+        self.nodes_by_street.iter().sum()
+    }
+}
+
+/// [`PublicBettingTree::build_with_rules`] 那棵树的按街节点 / 动作计数，但**不物化树**（内存
+/// O(深度)）。用来在小内存机器上估大树（200BB 8 座）的 dense 两表 / crop 体量；与物化树逐街
+/// 相等由 `tests::count_tree_layout_matches_built_tree` 钉死。
+pub fn count_tree_layout(
+    config: &TableConfig,
+    abs: &StreetActionAbstraction,
+    rules: BettingAbstractionRules,
+) -> TreeLayoutCounts {
+    let mut rng = ChaCha20Rng::from_seed(TREE_BUILD_RNG_SEED);
+    let state = GameState::with_rng(config, 0, &mut rng);
+    let mut c = TreeLayoutCounts::default();
+    dfs_decision_nodes(&state, abs, &rules, 0, 0, &mut |s, allowed| {
+        let street = street_to_tag(s.street()) as usize;
+        c.nodes_by_street[street] += 1;
+        c.actions_by_street[street] += allowed.len() as u64;
+        true
+    });
+    c
 }
 
 /// 在场人数（`Active∪AllIn`）= A4 width 口径（all-in 玩家已见后续街、仍在底池）。
@@ -1615,6 +1673,218 @@ mod tests {
             t.num_nodes(),
             "six_max_reshape 分派须指向 ante_flop2_3bet_6max"
         );
+    }
+
+    /// 结构守门：`ante-flop2-3bet-open2`（[`ante_flop2_3bet_open2_6max`]，8 座 100BB 每人 1BB
+    /// ante；cap 2 只为树小）。① preflop 有 1/3pot 的节点 = 开池节点，必同时有 1pot、没有 0.5pot
+    /// 和 all-in；0.5pot 只出现在面对加注的节点、且不与 1/3pot 同节点；② fold-chain 每个开池位 =
+    /// {Fold, 1/3pot, 1pot}，SB 另有 complete；③ UTG 1pot 开池、其余弃到 BB：BB = {Fold, Call,
+    /// 0.5pot, 1pot, AllIn}，BB 0.5pot 3bet 后 UTG = {Fold, Call, 1pot, AllIn}；④ UTG 1/3pot 开池
+    /// 那一支与 `ante-flop2-3bet` 的同一支逐节点相同（只多了 1pot 开池这一支）；⑤ postflop 菜单同
+    /// `ante-flop2`；⑥ 分派正确。
+    #[test]
+    fn reshape_ante_flop2_3bet_open2_two_opens() {
+        let third = AbstractActionTag::Raise(BetRatio::from_f64(1.0 / 3.0).expect("1/3 合法"));
+        let half = AbstractActionTag::Raise(BetRatio::HALF_POT);
+        let full = AbstractActionTag::Raise(BetRatio::FULL_POT);
+        let cfg = TableConfig::n_max_at_bb(8, 100).with_ante(ChipAmount::new(100));
+        let (abs, rules) = ante_flop2_3bet_open2_6max(2);
+        let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+
+        let (mut open_nodes, mut half_nodes) = (0usize, 0usize);
+        for id in 0..t.num_nodes() as NodeId {
+            let node = t.node(id);
+            let la = &node.legal_actions;
+            match node.street {
+                StreetTag::Preflop => {
+                    assert!(
+                        la.iter().all(|a| !matches!(a, AbstractActionTag::Bet(_))
+                            && (!matches!(a, AbstractActionTag::Raise(_))
+                                || *a == third
+                                || *a == half
+                                || *a == full)),
+                        "open2：preflop node {id} 档位越出 {{1/3,0.5,1}} {la:?}"
+                    );
+                    if la.contains(&third) {
+                        open_nodes += 1;
+                        assert!(
+                            la.contains(&full)
+                                && !la.contains(&half)
+                                && !la.contains(&AbstractActionTag::AllIn),
+                            "open2：开池节点 {id} 应为 1/3pot + 1pot、无 0.5pot / 全下 {la:?}"
+                        );
+                    }
+                    if la.contains(&half) {
+                        half_nodes += 1;
+                        assert!(
+                            la.contains(&AbstractActionTag::Fold),
+                            "open2：0.5pot 只应出现在面对开池的节点 {id} {la:?}"
+                        );
+                    }
+                }
+                StreetTag::Flop => assert!(
+                    la.iter().all(|a| match a {
+                        AbstractActionTag::Bet(x) => *x == BetRatio::HALF_POT || *x == BetRatio::FULL_POT,
+                        AbstractActionTag::Raise(x) => *x == BetRatio::FULL_POT,
+                        _ => true,
+                    }),
+                    "open2：flop node {id} 档位错 {la:?}"
+                ),
+                StreetTag::Turn | StreetTag::River => assert!(
+                    la.iter().all(|a| !matches!(a, AbstractActionTag::Bet(x) | AbstractActionTag::Raise(x) if *x != BetRatio::FULL_POT)),
+                    "open2：{:?} node {id} 出现非 1pot 档 {la:?}",
+                    node.street
+                ),
+            }
+        }
+        assert!(
+            open_nodes > 0 && half_nodes > 0,
+            "open2：开池两档与 0.5pot 3bet 都应出现"
+        );
+
+        let step = |t: &PublicBettingTree, id: NodeId, tag: AbstractActionTag| -> NodeId {
+            let n = t.node(id);
+            let i = n
+                .legal_actions
+                .iter()
+                .position(|a| *a == tag)
+                .unwrap_or_else(|| panic!("node {id} 无 {tag:?}：{:?}", n.legal_actions));
+            match n.children[i] {
+                Child::Decision(next) => next,
+                Child::Terminal => panic!("node {id} {tag:?} 后终局"),
+            }
+        };
+        let mut id = t.root_id();
+        for seat in [3u8, 4, 5, 6, 7, 0] {
+            assert_eq!(t.node(id).player_acting, seat);
+            assert_eq!(
+                t.node(id).legal_actions.to_vec(),
+                vec![AbstractActionTag::Fold, third, full],
+                "open2：seat {seat} 开池应为 Fold / 1/3pot / 1pot"
+            );
+            id = step(&t, id, AbstractActionTag::Fold);
+        }
+        assert_eq!(t.node(id).player_acting, 1);
+        assert_eq!(
+            t.node(id).legal_actions.to_vec(),
+            vec![
+                AbstractActionTag::Fold,
+                AbstractActionTag::Call,
+                third,
+                full
+            ],
+            "open2：SB 应可 complete / 1/3pot / 1pot"
+        );
+
+        let mut id = step(&t, t.root_id(), full);
+        for _ in 0..6 {
+            id = step(&t, id, AbstractActionTag::Fold);
+        }
+        let bb = t.node(id);
+        assert_eq!(bb.player_acting, 2, "UTG 1pot 开池后弃到 BB");
+        assert_eq!(
+            bb.legal_actions.to_vec(),
+            vec![
+                AbstractActionTag::Fold,
+                AbstractActionTag::Call,
+                half,
+                full,
+                AbstractActionTag::AllIn
+            ],
+            "open2：BB 面对 1pot 开池应有 0.5pot / 1pot 两档 3bet"
+        );
+        let utg = t.node(step(&t, id, half));
+        assert_eq!(
+            utg.legal_actions.to_vec(),
+            vec![
+                AbstractActionTag::Fold,
+                AbstractActionTag::Call,
+                full,
+                AbstractActionTag::AllIn
+            ],
+            "open2：面对 3bet 的 4bet 只应有 1pot"
+        );
+
+        // ④ UTG 1/3pot 开池那一支与 ante-flop2-3bet 的同一支逐节点相同。walk 是先序 DFS、后代块
+        // 连续：新树根 = [Fold, 1/3, 1pot] → 1/3 支 = [a, 1pot 支起点)；旧树根 = [Fold, 1/3] →
+        // 1/3 支是最后一支 = [b, 节点总数)。
+        let (o_abs, o_rules) = ante_flop2_3bet_6max(2);
+        let old = PublicBettingTree::build_with_rules(&cfg, &o_abs, o_rules);
+        let a = step(&t, t.root_id(), third);
+        let a_end = step(&t, t.root_id(), full);
+        let b = step(&old, old.root_id(), third);
+        let b_end = old.num_nodes() as NodeId;
+        assert_eq!(
+            a_end - a,
+            b_end - b,
+            "1/3pot 开池子树大小应与 ante-flop2-3bet 相同"
+        );
+        for k in 0..(a_end - a) {
+            let (x, y) = (t.node(a + k), old.node(b + k));
+            assert_eq!(
+                (x.street, x.player_acting, &x.legal_actions),
+                (y.street, y.player_acting, &y.legal_actions),
+                "1/3pot 开池子树第 {k} 个节点不同"
+            );
+        }
+        assert!(t.num_nodes() > old.num_nodes());
+
+        let (d_abs, d_rules) = six_max_reshape("ante-flop2-3bet-open2", 2).expect("已注册");
+        assert_eq!(
+            PublicBettingTree::build_with_rules(&cfg, &d_abs, d_rules).num_nodes(),
+            t.num_nodes(),
+            "six_max_reshape 分派须指向 ante_flop2_3bet_open2_6max"
+        );
+    }
+
+    /// [`count_tree_layout`]（不物化树）与物化树 [`PublicBettingTree::build_with_rules`] 逐街节点数 /
+    /// 动作数相等，且总数 == 从根 [`count_subtree_nodes_capped`]。覆盖带 ante 的 reshape（含
+    /// `preflop_open_small_only` / `preflop_half_3bet` / width redirect）与无规则默认树。
+    #[test]
+    fn count_tree_layout_matches_built_tree() {
+        let cases = [
+            (
+                "open2 4 座 30BB ante 1BB",
+                TableConfig::n_max_at_bb(4, 30).with_ante(ChipAmount::new(100)),
+                ante_flop2_3bet_open2_6max(2),
+            ),
+            (
+                "3bet 4 座 30BB ante 1BB",
+                TableConfig::n_max_at_bb(4, 30).with_ante(ChipAmount::new(100)),
+                ante_flop2_3bet_6max(2),
+            ),
+            (
+                "default 3 座 10BB",
+                TableConfig::n_max_at_bb(3, 10),
+                (
+                    StreetActionAbstraction::default_6_action(),
+                    BettingAbstractionRules::default(),
+                ),
+            ),
+        ];
+        for (label, cfg, (abs, rules)) in cases {
+            let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+            let mut want = TreeLayoutCounts::default();
+            for id in 0..t.num_nodes() as NodeId {
+                let n = t.node(id);
+                want.nodes_by_street[n.street as usize] += 1;
+                want.actions_by_street[n.street as usize] += n.legal_actions.len() as u64;
+            }
+            let got = count_tree_layout(&cfg, &abs, rules);
+            assert_eq!(got, want, "{label}");
+            assert!(
+                want.nodes_by_street.iter().all(|&n| n > 0),
+                "{label}：四条街都应有节点"
+            );
+            assert_eq!(got.total_nodes(), t.num_nodes() as u64, "{label}");
+            let mut rng = ChaCha20Rng::from_seed(TREE_BUILD_RNG_SEED);
+            let root = GameState::with_rng(&cfg, 0, &mut rng);
+            assert_eq!(
+                count_subtree_nodes_capped(&root, &abs, rules, 0, 0, usize::MAX),
+                Some(t.num_nodes()),
+                "{label}"
+            );
+        }
     }
 
     /// 9-max 位置结构守门（`train_cfr --seats 9`）：`no_open_limp` / SB complete 按

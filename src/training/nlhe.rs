@@ -779,8 +779,8 @@ mod tests {
     use crate::core::rng::{ChaCha20Rng, RngSource};
     use crate::core::ChipAmount;
     use crate::training::nlhe_betting_tree::{
-        all_1pot_6max, ante_flop2_3bet_6max, ante_flop2_6max, first_small_6max,
-        first_small_preopen_1pot_6max,
+        all_1pot_6max, ante_flop2_3bet_6max, ante_flop2_3bet_open2_6max, ante_flop2_6max,
+        first_small_6max, first_small_preopen_1pot_6max,
     };
 
     fn stub_table() -> Arc<BucketTable> {
@@ -1028,6 +1028,101 @@ mod tests {
             .into_iter()
             .find(|a| matches!(a, AbstractAction::Raise { ratio_label, .. } if *ratio_label == BetRatio::HALF_POT))
             .unwrap();
+        state = SimplifiedNlheGame::next(state, three_bet, rng);
+        assert_eq!(state.game_state.current_player(), Some(SeatId(3)));
+        assert_eq!(
+            raises(&state).iter().map(|r| r.1).collect::<Vec<_>>(),
+            vec![1000]
+        );
+    }
+
+    /// `ante-flop2-3bet-open2`（8 座 100BB、每人 1BB ante；cap 2 只为树小，翻前尺寸与 cap 无关）：
+    /// ① UTG 开池 = 1/3pot 450 / 1pot 1150（100 + 1050）；② 弃到 SB：433 / 1100（100 + 1000）；
+    /// ③ SB limp 后 BB 加注同 433 / 1100（底池 1000、无需跟注）；④ UTG 1pot 开池、弃到 BB：
+    /// 3bet = 0.5pot 2725（1150 + 3150 / 2，3150 = 950 + 1150 + 跟注 1050）/ 1pot 4300；
+    /// ⑤ BB 0.5pot 3bet 后 UTG 的 4bet 只有 1pot。
+    #[test]
+    fn ante_flop2_3bet_open2_sizes() {
+        let (abs, rules) = ante_flop2_3bet_open2_6max(2);
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::n_max_at_bb(8, 100).with_ante(ChipAmount::new(100)),
+            abs,
+            rules,
+        )
+        .expect("8-max ante-flop2-3bet-open2 game");
+        let mut rng = ChaCha20Rng::from_seed(0xA17E_0004);
+        let rng: &mut dyn RngSource = &mut rng;
+        let raises = |state: &SimplifiedNlheState| -> Vec<(u64, u32)> {
+            SimplifiedNlheGame::legal_actions(state)
+                .into_iter()
+                .filter_map(|a| match a {
+                    AbstractAction::Raise { to, ratio_label } => {
+                        Some((to.as_u64(), ratio_label.as_milli()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let pick = |state: &SimplifiedNlheState, milli: u32| -> AbstractAction {
+            SimplifiedNlheGame::legal_actions(state)
+                .into_iter()
+                .find(|a| matches!(a, AbstractAction::Raise { ratio_label, .. } if ratio_label.as_milli() == milli))
+                .unwrap_or_else(|| panic!("无 {milli} 档"))
+        };
+        let root = game.root(rng);
+        assert_eq!(
+            raises(&root),
+            vec![(450, 333), (1150, 1000)],
+            "UTG 开池两档"
+        );
+        assert!(
+            !SimplifiedNlheGame::legal_actions(&root)
+                .iter()
+                .any(|a| matches!(
+                    a,
+                    AbstractAction::AllIn { .. } | AbstractAction::Call { .. }
+                )),
+            "UTG 开池无全下、无 limp"
+        );
+
+        let mut state = root.clone();
+        for _ in 0..6 {
+            state = SimplifiedNlheGame::next(state, AbstractAction::Fold, rng);
+        }
+        assert_eq!(
+            state.game_state.current_player(),
+            Some(SeatId(1)),
+            "弃到 SB"
+        );
+        assert_eq!(
+            raises(&state),
+            vec![(433, 333), (1100, 1000)],
+            "SB 开池两档"
+        );
+        let limp = SimplifiedNlheGame::legal_actions(&state)
+            .into_iter()
+            .find(|a| matches!(a, AbstractAction::Call { .. }))
+            .expect("SB 可 complete");
+        state = SimplifiedNlheGame::next(state, limp, rng);
+        assert_eq!(state.game_state.current_player(), Some(SeatId(2)));
+        assert_eq!(
+            raises(&state),
+            vec![(433, 333), (1100, 1000)],
+            "SB limp 后 BB 加注两档"
+        );
+
+        let mut state = SimplifiedNlheGame::next(root.clone(), pick(&root, 1000), rng);
+        for _ in 0..6 {
+            state = SimplifiedNlheGame::next(state, AbstractAction::Fold, rng);
+        }
+        assert_eq!(
+            state.game_state.current_player(),
+            Some(SeatId(2)),
+            "弃到 BB"
+        );
+        assert_eq!(raises(&state), vec![(2725, 500), (4300, 1000)]);
+        let three_bet = pick(&state, 500);
         state = SimplifiedNlheGame::next(state, three_bet, rng);
         assert_eq!(state.game_state.current_player(), Some(SeatId(3)));
         assert_eq!(

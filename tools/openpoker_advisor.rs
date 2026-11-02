@@ -15490,6 +15490,65 @@ mod tests {
         }
     }
 
+    /// `ante-flop2-3bet-open2`（开池 {1/3pot, 1pot}，盲注 10/20、ante 20，scale 5）：真实开池
+    /// 90（4.5BB）落 1/3pot、230（11.5BB = solver 1150 = 1pot）落 1pot、300（15BB，比最大档还大、
+    /// 开池无全下）也落 1pot、160（8BB，两档之间）落两档之一；影子都同步，BB（hero）照常走
+    /// blueprint、动作合法。
+    #[test]
+    fn open2_maps_real_opens_onto_both_open_sizes() {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let game = build_game(
+            table,
+            "ante-flop2-3bet-open2",
+            2,
+            8,
+            100,
+            DEFAULT_SOLVER_STACK_BB,
+        )
+        .expect("8-max open2 game");
+        let abs = game.abstraction().clone();
+        let solver_cfg = game.table_config().clone();
+        for (open, want) in [
+            (90u64, &[333u64][..]),
+            (230, &[1000][..]),
+            (300, &[1000][..]),
+            (160, &[333, 1000][..]),
+        ] {
+            let mut req = Request {
+                ante: 20,
+                ..n_req(8, 0, 2, vec![])
+            };
+            req.actions = std::iter::once(hist(3, "raise", Some(open)))
+                .chain([4, 5, 6, 7, 0, 1].map(|s| hist(s, "fold", None)))
+                .collect();
+            let smap = seat_map(&req, 8).expect("seat_map");
+            let my = SeatId(smap.tree_seat(2).unwrap());
+            let (_, _, _, sizes) =
+                lockstep_replay(&game, &solver_cfg, &smap, &req, 5, 0, Some(my), false)
+                    .unwrap_or_else(|e| panic!("开池 {open}：{e:?}"));
+            assert_eq!(sizes.len(), 1, "开池 {open}");
+            assert!(
+                want.contains(&sizes[0].mapped_milli),
+                "开池 {open} 应落 {want:?}，实得 {}",
+                sizes[0].mapped_milli
+            );
+            let r = decide(
+                &game,
+                &abs,
+                &uniform,
+                &req,
+                0,
+                None,
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(r.source, "blueprint", "开池 {open}：{r:?}");
+            assert!(is_legal(&r, &req.valid), "开池 {open}：{r:?}");
+        }
+    }
+
     /// `--stack-bb`：① 解析（缺省 100，范围 [2,1000]）；② 建出的 blueprint 桌面按它定起始码深；
     /// ③ 两道码深闸按 blueprint 码深的比例走：100BB 时与改成比例前逐位相同（翻前全下 60BB、翻牌
     /// 60–140BB），200BB 时翻前全下 120BB、翻牌 120–280BB。
