@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wopo 牌局回放</title>
+<link rel="icon" href="data:,">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1c2330; --muted: #667085; --line: #e3e6eb;
+  --accent: #2f6fdf; --accent-soft: #e6eefc; --good: #1f8a52; --bad: #c4372d; --warn: #b7791f;
+  --band: #c9d8f5; --hero: #fff6df; --felt: #2f6b4f; --felt-edge: #24533d; --felt-ink: #eaf4ee;
+  --seat: #ffffff; --card: #ffffff; --card-ink: #1c2330; --card-red: #c4372d; --back: #3d5a99; --chip: #f2c94c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1a1f27; --ink: #e5e8ee; --muted: #9aa3b2; --line: #2b323d;
+    --accent: #6f9cf0; --accent-soft: #213252; --good: #4cc38a; --bad: #f07167; --warn: #e0a84e;
+    --band: #2f4a7a; --hero: #3a3220; --felt: #1f4a37; --felt-edge: #163728; --felt-ink: #d9eadf;
+    --seat: #232a35; --card: #f4f5f7; --card-ink: #1c2330; --card-red: #c4372d; --back: #3a5389; --chip: #d9b440;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+h1 { font-size: 17px; margin: 0; font-weight: 600; }
+h2 { font-size: 14px; margin: 0 0 8px; font-weight: 600; }
+h3 { font-size: 13px; margin: 14px 0 6px; font-weight: 600; color: var(--muted); }
+a { color: var(--accent); }
+.muted { color: var(--muted); }
+.meta { color: var(--muted); font-size: 13px; display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+.grow { flex: 1; }
+main { padding: 14px 20px 40px; display: grid; gap: 14px; grid-template-columns: minmax(300px, 400px) minmax(0, 1fr); align-items: start; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; min-width: 0; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; font-size: 13px; }
+.seg label { display: inline-flex; align-items: center; padding: 2px 10px; cursor: pointer; color: var(--muted); }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label:has(input:checked) { background: var(--accent-soft); color: var(--accent); }
+select, input[type=search] { font: inherit; font-size: 13px; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; }
+input[type=search] { width: 100%; }
+#run { flex: 1; min-width: 0; max-width: 100%; }
+.filters { display: grid; gap: 8px; margin-bottom: 8px; }
+.filters .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.chk { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; cursor: pointer; color: var(--muted); user-select: none; }
+.chk input { display: none; }
+.chk:has(input:checked) { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+#list { max-height: calc(100vh - 230px); overflow-y: auto; margin: 0 -14px; border-top: 1px solid var(--line); }
+.hrow { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; padding: 6px 14px; border-bottom: 1px solid var(--line); cursor: pointer; font-size: 12px; }
+.hrow:hover { background: var(--accent-soft); }
+.hrow.sel { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
+.hrow .l1 { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.hrow .hid { font-weight: 600; font-size: 13px; }
+.hrow .net { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+.hrow .l2 { grid-column: 1 / -1; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; color: var(--muted); }
+.pos { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; }
+.pos { white-space: nowrap; }
+.pos-ok { color: var(--good); } .neg { color: var(--bad); }
+.badge { display: inline-block; padding: 0 7px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.badge.diff, .badge.bad { color: var(--bad); border-color: var(--bad); }
+.badge.same { color: var(--good); border-color: var(--good); }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.badge.acc { color: var(--accent); border-color: var(--accent); }
+.pc { display: inline-block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 600; font-size: 12px; color: var(--ink); padding: 0 3px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); margin-right: 2px; }
+.pc.red { color: var(--bad); }
+/* replay */
+.rhead { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; font-size: 13px; }
+.rhead .hid { font-weight: 600; font-size: 16px; }
+.warnbox { margin-top: 8px; font-size: 12px; color: var(--warn); border: 1px solid var(--warn); border-radius: 6px; padding: 6px 10px; }
+.warnbox ul { margin: 2px 0 0; padding-left: 18px; }
+.table-wrap { position: relative; width: 100%; aspect-ratio: 16 / 9.4; margin: 12px 0 4px; }
+.felt { position: absolute; inset: 13% 11%; border-radius: 50% / 50%; background: radial-gradient(ellipse at center, color-mix(in srgb, var(--felt) 85%, white) 0%, var(--felt) 70%); border: 10px solid var(--felt-edge); box-shadow: inset 0 0 30px rgba(0,0,0,.25); }
+.center { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); text-align: center; color: var(--felt-ink); }
+.center .pot { font-size: 14px; font-weight: 600; margin-top: 6px; font-variant-numeric: tabular-nums; }
+.center .street { font-size: 11px; opacity: .8; letter-spacing: .05em; }
+.board { display: flex; gap: 5px; justify-content: center; min-height: 52px; }
+.card { width: 38px; height: 52px; border-radius: 5px; background: var(--card); color: var(--card-ink); display: inline-flex; flex-direction: column; align-items: center; justify-content: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 700; font-size: 17px; line-height: 1; box-shadow: 0 1px 3px rgba(0,0,0,.35); }
+.card .s { font-size: 15px; margin-top: 2px; }
+.card.red { color: var(--card-red); }
+.card.slot { background: transparent; box-shadow: none; border: 1px dashed rgba(255,255,255,.25); }
+.card.back { background: repeating-linear-gradient(45deg, var(--back), var(--back) 4px, color-mix(in srgb, var(--back) 80%, white) 4px, color-mix(in srgb, var(--back) 80%, white) 8px); border: 2px solid #fff; }
+.card.new { outline: 2px solid var(--chip); outline-offset: 1px; }
+.card.sm { width: 28px; height: 38px; font-size: 13px; border-radius: 4px; }
+.card.sm .s { font-size: 11px; margin-top: 1px; }
+.seat { position: absolute; transform: translate(-50%, -50%); width: 128px; text-align: center; z-index: 2; }
+.seat .cards { display: flex; gap: 3px; justify-content: center; height: 38px; margin-bottom: -6px; position: relative; z-index: 1; }
+.seat .box { background: var(--seat); border: 1px solid var(--line); border-radius: 8px; padding: 6px 6px 4px; box-shadow: 0 2px 6px rgba(0,0,0,.12); position: relative; }
+.seat .nm { font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.seat .st { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); }
+.seat .act { font-size: 11px; min-height: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.seat .tag { position: absolute; top: -9px; right: -6px; font-size: 10px; padding: 0 5px; border-radius: 999px; background: var(--panel); border: 1px solid var(--line); color: var(--muted); }
+.seat.hero .box { background: var(--hero); }
+.seat.folded { opacity: .45; }
+.seat.actor .box { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+.seat.allin .st { color: var(--warn); font-weight: 600; }
+.seat.winner .box { border-color: var(--good); box-shadow: 0 0 0 2px var(--good); }
+.seat .act.fold { color: var(--muted); }
+.seat .act.agg { color: var(--bad); font-weight: 600; }
+.seat .act.pas { color: var(--accent); }
+.seat .act.win { color: var(--good); font-weight: 600; }
+.bet { position: absolute; transform: translate(-50%, -50%); font-size: 12px; font-weight: 600; color: var(--felt-ink); display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; z-index: 1; font-variant-numeric: tabular-nums; }
+.bet::before { content: ""; width: 12px; height: 12px; border-radius: 50%; background: var(--chip); border: 2px dashed rgba(0,0,0,.35); }
+.dealer { position: absolute; transform: translate(-50%, -50%); width: 20px; height: 20px; border-radius: 50%; background: #fff; color: #1c2330; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 3px rgba(0,0,0,.4); z-index: 1; }
+.controls { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; margin-top: 6px; }
+.controls button { display: inline-flex; align-items: center; justify-content: center; font: inherit; font-size: 14px; min-width: 36px; height: 32px; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; cursor: pointer; padding: 0 8px; }
+.controls button:hover { border-color: var(--accent); }
+.controls button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.controls input[type=range] { flex: 1; min-width: 120px; accent-color: var(--accent); }
+.controls .count { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--muted); min-width: 64px; text-align: center; }
+.caption { margin-top: 8px; font-size: 14px; min-height: 22px; }
+.caption b { font-size: 15px; }
+.cols { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); margin-top: 10px; }
+.advice { border: 1px solid var(--accent); border-radius: 8px; padding: 10px 12px; background: var(--accent-soft); font-size: 13px; }
+.advice.none { border-color: var(--line); background: transparent; }
+.advice .big { font-size: 20px; font-weight: 700; color: var(--accent); }
+.advice .stale { text-decoration: line-through; color: var(--muted); }
+.probs { display: grid; grid-template-columns: minmax(60px, auto) 1fr 44px; gap: 2px 8px; font-size: 12px; align-items: center; margin-top: 8px; }
+.probs .bar { height: 8px; background: var(--band); border-radius: 2px; min-width: 1px; }
+.probs .on { font-weight: 600; color: var(--accent); }
+.log { font-size: 12px; max-height: 360px; overflow-y: auto; }
+.log .st { font-weight: 600; color: var(--muted); margin: 8px 0 2px; display: flex; gap: 6px; align-items: center; }
+.log .st:first-child { margin-top: 0; }
+.lr { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 2px 6px; border-radius: 4px; cursor: pointer; }
+.lr:hover { background: var(--accent-soft); }
+.lr.hero { background: var(--hero); }
+.lr.cur { outline: 2px solid var(--accent); outline-offset: -2px; }
+.lr .t { color: var(--muted); font-variant-numeric: tabular-nums; }
+table.res { border-collapse: collapse; width: 100%; font-size: 12px; }
+table.res th, table.res td { padding: 4px 6px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+table.res th { color: var(--muted); font-weight: 500; }
+table.res th:first-child, table.res td:first-child, table.res td.l { text-align: left; }
+table.res tr.hero td { background: var(--hero); }
+.strength .row { display: grid; grid-template-columns: minmax(70px, auto) minmax(70px, 120px) 1fr; gap: 2px 8px; align-items: center; padding: 1px 0; font-size: 12px; }
+.sbar { display: flex; height: 8px; border-radius: 2px; overflow: hidden; background: var(--line); }
+.sbar span { display: block; height: 100%; background: var(--accent); }
+.empty { padding: 40px 0; text-align: center; color: var(--muted); }
+.err { color: var(--bad); font-size: 12px; }
+kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; color: var(--muted); }
+@media (max-width: 1100px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 860px) {
+  main { grid-template-columns: minmax(0, 1fr); padding: 10px 16px 32px; } header { padding: 10px 16px; }
+  #list { max-height: 40vh; }
+  .table-wrap { aspect-ratio: 4 / 5; }
+  .felt { inset: 14% 12%; }
+  .seat { width: 84px; }
+  .seat .nm, .seat .st { font-size: 11px; }
+  .card { width: 30px; height: 42px; font-size: 14px; } .card .s { font-size: 12px; }
+  .card.sm { width: 22px; height: 30px; font-size: 11px; } .card.sm .s { font-size: 9px; }
+  .seat .cards { height: 30px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>wopo 牌局回放</h1>
+  <div class="meta" id="hmeta"></div>
+  <span class="grow"></span>
+  <div class="seg" title="金额单位">
+    <label><input type="radio" name="unit" value="chips" checked>筹码</label>
+    <label><input type="radio" name="unit" value="bb">BB</label>
+  </div>
+  <label class="chk" title="翻开摊牌时亮出的对手底牌（默认到结算那一步才翻开）"><input type="checkbox" id="peek">提前亮出对手亮牌</label>
+  <a id="back" href="/" hidden>← 对手画像</a>
+</header>
+<main>
+  <section>
+    <div class="filters">
+      <div class="row">
+        <select id="run"><option value="">全部 run</option></select>
+        <select id="sort">
+          <option value="new">最新在前</option>
+          <option value="old">最早在前</option>
+          <option value="win">我方赢最多</option>
+          <option value="lose">我方输最多</option>
+          <option value="pot">底池最大</option>
+        </select>
+      </div>
+      <input type="search" id="q" placeholder="搜索玩家名 / 手牌编号 / 底牌（如 AK、7h7c）">
+      <div class="row">
+        <label class="chk"><input type="checkbox" data-f="vpip">我方入池</label>
+        <label class="chk"><input type="checkbox" data-f="showdown">摊牌</label>
+        <label class="chk"><input type="checkbox" data-f="shown">有对手亮牌</label>
+        <label class="chk"><input type="checkbox" data-f="diff">和建议不同</label>
+        <label class="chk"><input type="checkbox" data-f="postflop">到了翻后</label>
+        <label class="chk"><input type="checkbox" data-f="warn">数据有警告</label>
+      </div>
+      <div class="meta" id="lmeta"></div>
+    </div>
+    <div id="list"></div>
+  </section>
+  <section id="replay"><div class="empty">左边选一手牌开始回放</div></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const SUIT = { s: '♠', h: '♥', d: '♦', c: '♣' };
+const STREET_CN = { preflop: '翻前', flop: '翻牌', turn: '转牌', river: '河牌' };
+const NOTE_CN = [
+  ['result_not_conserved', '服务器结算筹码不守恒（多见于全下底池的额外扣款）'],
+  ['result_seats', '结算里的座位和发牌座位不同（有座位没发牌）'],
+];
+const CHECK_CN = { not_zero_sum: '各座输赢加起来不为 0', folded_chip_mismatch: '弃牌座位的输赢和投入对不上', malformed: '记录格式不对' };
+const STALE_CN = { hero_acted: 'hero 已先行动', hand_over: '这手已结束', hand_dead: '这手已作废' };
+const STRENGTH = [['straight_flush', '同花顺'], ['quads', '四条'], ['full_house', '葫芦'], ['flush', '同花'], ['straight', '顺子'],
+  ['trips', '三条'], ['two_pair', '两对'], ['top_pair', '超对 / 顶对'], ['pair', '其它一对'], ['nothing', '没中']];
+
+let listing = null, hand = null, step = 0, timer = null, rows = [];
+// Inline SVG: media-control glyphs (⏮ ⏭ ⏸) are missing from many CJK fonts.
+const svg = d => `<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">${d}</svg>`;
+const ICON = {
+  first: svg('<rect x="2" y="3" width="2" height="10"/><path d="M14 3v10L5 8z"/>'),
+  prev: svg('<path d="M12 3v10L3 8z"/>'),
+  play: svg('<path d="M4 2.5v11L13.5 8z"/>'),
+  pause: svg('<rect x="3.5" y="3" width="3" height="10"/><rect x="9.5" y="3" width="3" height="10"/>'),
+  next: svg('<path d="M4 3v10l9-5z"/>'),
+  last: svg('<path d="M2 3v10l9-5z"/><rect x="12" y="3" width="2" height="10"/>'),
+};
+const cache = new Map();
+const store = { get(k, d) { try { const v = localStorage.getItem('wopo_hist_' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+                set(k, v) { try { localStorage.setItem('wopo_hist_' + k, JSON.stringify(v)); } catch { /* private mode */ } } };
+
+// ---- formatting
+const unit = () => document.querySelector('input[name=unit]:checked').value;
+function amt(x, bb) {
+  if (x == null) return '—';
+  if (unit() === 'bb' && bb) { const v = x / bb; return (Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1)) + 'BB'; }
+  return x.toLocaleString('en-US');
+}
+const sgn = (x, bb) => x == null ? '—' : (x > 0 ? '+' : '') + amt(x, bb);
+// Action labels come from the server in chips ("raise 到 420"); rewrite the numbers in BB mode.
+const lbl = (s, bb) => unit() === 'bb' && bb ? String(s ?? '').replace(/\d+/g, m => amt(+m, bb)) : String(s ?? '');
+const pc = c => { const r = String(c ?? ''), su = r.slice(-1).toLowerCase(); return `<span class="pc ${su === 'h' || su === 'd' ? 'red' : ''}">${esc(r.slice(0, -1))}${SUIT[su] || esc(su)}</span>`; };
+const pcs = cs => cs && cs.length ? cs.map(pc).join('') : '<span class="muted">—</span>';
+function card(c, cls = '') {
+  if (c === 'back') return `<span class="card back ${cls}"></span>`;
+  if (!c) return `<span class="card slot ${cls}"></span>`;
+  const su = c.slice(-1).toLowerCase();
+  return `<span class="card ${su === 'h' || su === 'd' ? 'red' : ''} ${cls}"><span>${esc(c.slice(0, -1))}</span><span class="s">${SUIT[su] || esc(su)}</span></span>`;
+}
+const shortHid = h => { const s = String(h ?? ''); const i = s.lastIndexOf(':'); return '#' + (i >= 0 ? s.slice(i + 1) : s); };
+function when(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d)) return String(ts);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+const actCls = l => /^fold/.test(l) ? 'fold' : /^(bet|raise)|全下/.test(l) ? 'agg' : /^(call|check)/.test(l) ? 'pas' : /^收/.test(l) ? 'win' : '';
+const noteCN = n => { for (const [k, v] of NOTE_CN) if (String(n).startsWith(k)) return `${v} <span class="muted">${esc(n)}</span>`; return esc(n); };
+// "AK", "7h7c", "77" style hole-card search
+function holeMatch(hole, q) {
+  if (!hole || hole.length !== 2) return false;
+  const h = hole.map(c => c.toLowerCase()), raw = h.join(''), rev = h[1] + h[0];
+  const ql = q.toLowerCase();
+  if (raw.includes(ql) || rev.includes(ql)) return true;
+  if (/^[2-9tjqka]{2}[so]?$/.test(ql)) {
+    const r = h.map(c => c[0]), ok = (r[0] === ql[0] && r[1] === ql[1]) || (r[1] === ql[0] && r[0] === ql[1]);
+    if (!ok) return false;
+    if (ql[2] === 's') return h[0][1] === h[1][1];
+    if (ql[2] === 'o') return h[0][1] !== h[1][1];
+    return true;
+  }
+  return false;
+}
+
+// ---- list
+async function loadList() {
+  const r = await fetch('/api/history/hands', { cache: 'no-store' });
+  listing = await r.json();
+  $('back').hidden = !listing.live;
+  const sel = $('run'), cur = sel.value || store.get('run', '');
+  sel.innerHTML = '<option value="">全部 run</option>' + listing.runs.map(r =>
+    `<option value="${esc(r.run)}">${esc(r.run)}（${r.counts.hands || 0} 手）</option>`).join('');
+  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  const dead = listing.runs.reduce((a, r) => a + r.dead, 0), withEv = listing.runs.filter(r => r.events).length;
+  $('hmeta').innerHTML = `<span>${listing.hands.length} 手 · ${listing.runs.length} 个 run</span>`
+    + `<span title="有 wopo_play_events.jsonl 的 run 才有决策建议和用时">${withEv} 个 run 有决策记录</span>`
+    + (dead ? `<span title="事件流里开了局但 hh 没收的手（作废），不能回放">作废未收 ${dead} 手</span>` : '')
+    + (listing.errors.length ? `<span class="err">${listing.errors.length} 手解析失败</span>` : '');
+  renderList();
+}
+
+function filtered() {
+  const run = $('run').value, q = $('q').value.trim(), f = {};
+  document.querySelectorAll('[data-f]').forEach(x => f[x.dataset.f] = x.checked);
+  let out = listing.hands.filter(h => {
+    if (run && h.run !== run) return false;
+    if (f.vpip && !h.hero_vpip) return false;
+    if (f.showdown && !h.showdown) return false;
+    if (f.shown && !h.shown) return false;
+    if (f.diff && !h.diff) return false;
+    if (f.postflop && h.street === 'preflop') return false;
+    if (f.warn && !h.check && !h.notes) return false;
+    if (q) {
+      const ql = q.toLowerCase();
+      if (!(String(h.hand_id).toLowerCase().includes(ql) || h.players.some(p => String(p).toLowerCase().includes(ql)) || holeMatch(h.hole, q))) return false;
+    }
+    return true;
+  });
+  const bbNet = h => h.hero_net == null ? 0 : h.hero_net / h.bb;
+  const s = $('sort').value;
+  if (s === 'old') out = out.slice().reverse();
+  else if (s === 'win') out.sort((a, b) => bbNet(b) - bbNet(a));
+  else if (s === 'lose') out.sort((a, b) => bbNet(a) - bbNet(b));
+  else if (s === 'pot') out.sort((a, b) => (b.pot || 0) / b.bb - (a.pot || 0) / a.bb);
+  return out;
+}
+
+function renderList() {
+  rows = filtered();
+  const net = rows.reduce((a, h) => a + (h.hero_net || 0) / h.bb, 0);
+  $('lmeta').innerHTML = `<span>${rows.length} 手</span><span>我方合计 <b class="${net < 0 ? 'neg' : 'pos-ok'}">${net >= 0 ? '+' : ''}${net.toFixed(1)}BB</b></span><span class="muted" title="抽水在结算之后才扣，这里没算">未扣抽水</span>`;
+  $('list').innerHTML = rows.map(h => {
+    const n = h.hero_net, cls = n > 0 ? 'pos-ok' : n < 0 ? 'neg' : 'muted';
+    const badges = [
+      h.showdown ? '<span class="badge acc">摊牌</span>' : '',
+      h.diff ? `<span class="badge diff">不同 ${h.diff}</span>` : '',
+      h.check || h.notes ? '<span class="badge warn">警告</span>' : '',
+    ].join('');
+    return `<div class="hrow ${hand && hand.key === h.key ? 'sel' : ''}" data-k="${esc(h.key)}">
+      <div class="l1"><span class="hid">${esc(shortHid(h.hand_id))}</span><span class="pos">${esc(h.hero_pos || '?')}</span>${pcs(h.hole)}
+        <span class="muted">${h.board.length ? h.board.map(pc).join('') : ''}</span></div>
+      <div class="net ${cls}">${sgn(n, h.bb)}</div>
+      <div class="l2"><span>${esc(when(h.ts))}</span><span>${h.sb}/${h.bb}${h.ante ? ' ante ' + h.ante : ''}</span><span>${h.n} 人</span><span>${STREET_CN[h.street]}</span>${badges}</div>
+    </div>`;
+  }).join('') || '<div class="empty">没有符合条件的手</div>';
+}
+
+$('list').addEventListener('click', e => { const r = e.target.closest('.hrow'); if (r) openHand(r.dataset.k, 0); });
+['run', 'sort'].forEach(id => $(id).addEventListener('change', () => { store.set(id, $(id).value); renderList(); }));
+$('q').addEventListener('input', renderList);
+document.querySelectorAll('[data-f]').forEach(x => x.addEventListener('change', renderList));
+document.querySelectorAll('input[name=unit]').forEach(x => x.addEventListener('change', () => { store.set('unit', unit()); renderList(); render(); }));
+$('peek').addEventListener('change', () => { store.set('peek', $('peek').checked); render(); });
+
+// ---- one hand
+async function openHand(key, at) {
+  stop();
+  let h = cache.get(key);
+  if (!h) {
+    const r = await fetch('/api/history/hand?key=' + encodeURIComponent(key), { cache: 'no-store' });
+    h = await r.json();
+    if (!r.ok) { $('replay').innerHTML = `<div class="err">${esc(h.error || r.status)}</div>`; return; }
+    if (cache.size > 200) cache.clear();
+    cache.set(key, h);
+  }
+  hand = h;
+  step = Math.max(0, Math.min(at ?? 0, h.steps.length - 1));
+  document.querySelectorAll('.hrow').forEach(r => r.classList.toggle('sel', r.dataset.k === key));
+  const row = document.querySelector(`.hrow[data-k="${CSS.escape(key)}"]`);
+  if (row) scrollWithin($('list'), row);
+  render();
+}
+
+// Scroll only the list / log box, never the page (scrollIntoView would move the whole window).
+function scrollWithin(box, el) {
+  if (!box || !el) return;
+  const b = box.getBoundingClientRect(), r = el.getBoundingClientRect();
+  if (r.top < b.top) box.scrollTop += r.top - b.top;
+  else if (r.bottom > b.bottom) box.scrollTop += r.bottom - b.bottom;
+}
+
+const narrow = () => window.matchMedia('(max-width: 860px)').matches;
+function seatXY(h, s, r) {
+  if (narrow()) r = [r[0] * 0.82, r[1]];  // tall table: keep side seats inside the frame
+  const n = Math.max(h.n_table, 2), hero = h.hero_seat ?? 0;
+  const a = Math.PI / 2 + (s - hero) * 2 * Math.PI / n;
+  return [50 + r[0] * Math.cos(a), 50 + r[1] * Math.sin(a)];
+}
+
+function render() {
+  const h = hand;
+  if (!h) return;
+  const st = h.steps[step], last = step === h.steps.length - 1, bb = h.bb;
+  history.replaceState(null, '', `#key=${encodeURIComponent(h.key)}&step=${step}`);
+  const peek = $('peek').checked;
+  const winners = new Set((h.payouts || []).map(p => p.seat));
+  const warn = [];
+  if (h.check) warn.push(`重放校验没通过：${esc(CHECK_CN[h.check.code] || h.check.code)} <span class="muted">${esc(h.check.code)} ${esc(h.check.detail)}</span>（这手不进画像统计，回放照常）`);
+  h.notes.forEach(n => warn.push(noteCN(n)));
+
+  // table
+  let tbl = '<div class="felt"></div>';
+  h.seats.forEach((x, i) => {
+    const [stack, bet, folded, allin, act] = st.seats[i];
+    const [sx, sy] = seatXY(h, x.seat, [44, 42]);
+    let cards = '';
+    if (x.hole && (x.hero || (x.shown && (last || peek)))) cards = x.hole.map(c => card(c, 'sm')).join('');
+    else if (!folded) cards = card('back', 'sm') + card('back', 'sm');
+    const cls = [x.hero ? 'hero' : '', folded ? 'folded' : '', allin ? 'allin' : '', st.seat === x.seat ? 'actor' : '',
+      last && winners.has(x.seat) ? 'winner' : ''].join(' ');
+    tbl += `<div class="seat ${cls}" style="left:${sx}%;top:${sy}%">
+      <div class="cards">${cards}</div>
+      <div class="box">${x.pos ? `<span class="tag">${esc(x.pos)}</span>` : ''}
+        <div class="nm" title="${esc(x.name)} · 座${x.seat}">${esc(x.name ?? '座' + x.seat)}</div>
+        <div class="st">${allin ? '全下' : amt(stack, bb)}</div>
+        <div class="act ${actCls(act || '')}">${esc(lbl(act || '', bb))}</div></div></div>`;
+    if (bet > 0) {
+      const [bx, by] = seatXY(h, x.seat, [27, 23]);
+      tbl += `<div class="bet" style="left:${bx}%;top:${by}%">${amt(bet, bb)}</div>`;
+    }
+    if (x.seat === h.button) {
+      const [dx, dy] = seatXY(h, x.seat + 0.3, [33, 31]);
+      tbl += `<div class="dealer" style="left:${dx}%;top:${dy}%">D</div>`;
+    }
+  });
+  const newCards = new Set(st.kind === 'board' ? st.new : []);
+  const slots = [0, 1, 2, 3, 4].map(i => st.board[i] ? card(st.board[i], newCards.has(st.board[i]) ? 'new' : '') : card(null)).join('');
+  tbl += `<div class="center"><div class="street">${STREET_CN[st.street] || ''}</div><div class="board">${slots}</div>
+    <div class="pot">底池 ${amt(st.pot, bb)}</div></div>`;
+
+  // caption
+  let cap;
+  const who = s => { const x = h.seats.find(y => y.seat === s); return x ? `<b>${esc(x.name ?? '座' + s)}</b> <span class="muted">${esc(x.pos || '')} 座${s}</span>` : `座${s}`; };
+  if (st.kind === 'action') {
+    cap = `${STREET_CN[st.street]} · ${who(st.seat)} <b>${esc(lbl(st.label, bb))}</b>`
+      + (st.to_call ? ` <span class="muted">（面对 ${amt(st.to_call, bb)}，底池 ${amt(st.pot - st.delta, bb)}）</span>` : '')
+      + (st.think_s != null ? ` <span class="muted" title="和上一个动作 / 发牌的时间差">· ${st.think_s.toFixed(1)} 秒</span>` : '');
+  } else if (st.kind === 'board') cap = `发${STREET_CN[st.street]} ${pcs(st.new)}`;
+  else if (st.kind === 'result') {
+    cap = '结算：' + (h.winners || []).map(w => `${who(w.seat)} 赢 ${amt(w.amount, bb)}`).join('，')
+      + (st.returned ? ` <span class="muted">· 未跟注的 ${amt(st.returned, bb)} 退回</span>` : '');
+  } else cap = esc(lbl(st.label, bb));
+
+  const pctl = h.steps.length - 1;
+  const ctl = `<div class="controls">
+    <button data-c="first" title="第一步（Home）">${ICON.first}</button><button data-c="prev" title="上一步（←）">${ICON.prev}</button>
+    <button data-c="play" class="primary" title="播放 / 暂停（空格）">${timer ? ICON.pause : ICON.play}</button>
+    <button data-c="next" title="下一步（→）">${ICON.next}</button><button data-c="last" title="最后一步（End）">${ICON.last}</button>
+    <span class="count">${step} / ${pctl}</span>
+    <input type="range" id="slider" min="0" max="${pctl}" value="${step}">
+    <select id="speed" title="自动播放速度">${[['1600', '慢'], ['900', '中'], ['450', '快']].map(([v, l]) => `<option value="${v}" ${store.get('speed', '900') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+    <button data-c="prevhand" title="上一手（↑ / k）">上一手</button><button data-c="nexthand" title="下一手（↓ / j）">下一手</button>
+  </div>`;
+
+  const hero = h.seats.find(x => x.hero);
+  $('replay').innerHTML = `
+    <div class="rhead"><span class="hid">${esc(shortHid(h.hand_id))}</span>
+      <span class="muted">${esc(h.hand_id)}</span><span>${esc(when(h.ts))}</span>
+      <span>盲注 ${h.sb}/${h.bb}${h.ante ? ' · ante ' + h.ante : ''}</span><span>${h.seats.length} 人</span>
+      <span class="muted">${esc(h.run)}</span>
+      ${hero ? `<span>我方 ${esc(hero.pos || '')} ${pcs(hero.hole)} <b class="${hero.net > 0 ? 'pos-ok' : hero.net < 0 ? 'neg' : ''}">${sgn(hero.net, bb)}</b></span>` : ''}
+    </div>
+    ${warn.length ? `<div class="warnbox"><b>数据说明</b><ul>${warn.map(w => `<li>${w}</li>`).join('')}</ul></div>` : ''}
+    <div class="table-wrap">${tbl}</div>
+    ${ctl}
+    <div class="caption">${cap}</div>
+    <div class="cols">
+      <div>${decisionBlock(h, st)}${strengthBlock(h, st)}</div>
+      <div><h3>动作记录 <span class="muted" style="font-weight:normal">点一行跳到那一步</span></h3><div class="log">${logBlock(h)}</div></div>
+    </div>
+    <h3>结算</h3>${resultBlock(h)}
+    <p class="muted" style="font-size:12px;margin-top:10px">键盘：<kbd>←</kbd><kbd>→</kbd> 上 / 下一步，<kbd>空格</kbd> 播放，<kbd>Home</kbd><kbd>End</kbd> 首 / 尾，<kbd>↑</kbd><kbd>↓</kbd> 上 / 下一手。
+      结算筹码是服务器 hand_result 的数，抽水在这之后才扣，这里没算。</p>`;
+  const cur = document.querySelector('.lr.cur');
+  if (cur) scrollWithin(cur.closest('.log'), cur);
+}
+
+function heroDecisions(h) { return h.steps.map((s, i) => [s, i]).filter(([s]) => s.hero); }
+
+function decisionBlock(h, st) {
+  const bb = h.bb;
+  if (!st.hero) {
+    const ds = heroDecisions(h);
+    if (!h.has_events) return '<h3>我方决策</h3><p class="muted" style="font-size:12px">这个 run 没有 wopo_play_events.jsonl，没有建议记录。</p>';
+    if (!ds.length) return '<h3>我方决策</h3><p class="muted" style="font-size:12px">这手我方没有行动（或事件流对不上）。</p>';
+    return '<h3>我方决策</h3><div class="log">' + ds.map(([s, i]) => {
+      const m = s.hero.match;
+      return `<div class="lr hero" data-step="${i}"><span>${STREET_CN[s.street]} 实际 <b>${esc(lbl(s.label, bb))}</b> · 建议 ${esc(lbl(s.hero.advice ? s.hero.advice.text : '无', bb))}</span>
+        <span>${m === 'same' ? '<span class="badge same">同</span>' : m === 'diff' ? '<span class="badge diff">不同</span>' : '<span class="badge">无建议</span>'}</span></div>`;
+    }).join('') + '</div>';
+  }
+  const d = st.hero, dec = d.decision;
+  let html = `<h3>我方决策 · ${STREET_CN[st.street]}</h3><div class="advice ${d.advice ? '' : 'none'}">`;
+  html += `<div>实际 <span class="big">${esc(lbl(st.label, bb))}</span> `
+    + (d.match === 'same' ? '<span class="badge same">同建议</span>' : d.match === 'diff' ? '<span class="badge diff">不同于建议</span>' : '<span class="badge">没有建议</span>')
+    + (d.think_s != null ? ` <span class="muted">用时 ${d.think_s.toFixed(1)} 秒</span>` : '') + '</div>';
+  if (d.advice) html += `<div>建议 <b>${esc(lbl(d.advice.text, bb))}</b></div>`;
+  if (dec) {
+    if (!d.advice || dec.stale) html += `<div class="muted">advisor 算出 <span class="${dec.stale ? 'stale' : ''}">${esc(lbl(dec.advice, bb))}</span>${dec.stale ? '（过期：' + esc(STALE_CN[dec.stale_kind] || dec.stale) + '）' : ''}</div>`;
+    html += `<div class="muted" style="font-size:12px;word-break:break-all">来源 ${esc(dec.source || '—')} · ${dec.decide_ms ?? '—'} ms${dec.rejected ? ' · 原建议不合法：' + esc(dec.rejected) : ''}</div>`;
+    if (dec.probs && dec.probs.length) {
+      html += '<div class="probs">' + dec.probs.map(([n, p]) => `<span class="${n === dec.chosen ? 'on' : ''}">${esc(n)}</span><div><div class="bar" style="width:${(100 * p).toFixed(1)}%"></div></div><span>${(100 * p).toFixed(1)}%</span>`).join('') + '</div>';
+    }
+  } else if (!d.advice) html += '<div class="muted" style="font-size:12px">事件流里没有这个决策点的 advisor 记录。</div>';
+  if (d.valid) html += `<div class="muted" style="font-size:12px;margin-top:6px">可选：${[d.valid.can_check ? 'check' : '', d.valid.can_call ? 'call' : '', d.valid.can_raise ? `raise ${amt(d.valid.min_raise, bb)}–${amt(d.valid.max_raise, bb)}` : ''].filter(Boolean).join(' / ')}</div>`;
+  return html + '</div>';
+}
+
+function strengthBlock(h, st) {
+  const r = h.ranges && h.ranges[st.street];
+  if (!r) return '';
+  const name = s => { const x = h.seats.find(y => y.seat === s.seat); return x ? x.name : s.name; };
+  const row = x => {
+    const sm = x.strength || {};
+    const parts = STRENGTH.map(([k, label], i) => [label, +sm[k] || 0, 1 - i * 0.09]).filter(p => p[1] > 0);
+    const bar = parts.map(([l, p, o]) => `<span title="${esc(l)} ${(100 * p).toFixed(1)}%" style="width:${(100 * p).toFixed(1)}%;opacity:${o.toFixed(2)}"></span>`).join('');
+    const text = parts.filter(p => p[1] >= 0.01).map(([l, p]) => `${esc(l)} ${(100 * p).toFixed(0)}%`).join(' · ');
+    return `<div class="row"><span>${esc(name(x))}</span><div class="sbar">${bar}</div><span>${text || '—'}</span></div>`;
+  };
+  return `<div class="strength"><h3>对手牌力估计 · ${STREET_CN[st.street]}开始时 <span class="muted" style="font-weight:normal" title="${esc(r.source || '')}">${esc(r.path || '')} / ${esc(r.range_src || '')}</span></h3>${(r.seats || []).map(row).join('')}</div>`;
+}
+
+function logBlock(h) {
+  const bb = h.bb;
+  let html = '';
+  h.steps.forEach((s, i) => {
+    const cur = i === step ? 'cur' : '';
+    if (s.kind === 'start') { html += `<div class="st">翻前</div><div class="lr ${cur}" data-step="${i}"><span>${esc(lbl(s.label, bb))}</span><span class="t">底池 ${amt(s.pot, bb)}</span></div>`; return; }
+    if (s.kind === 'board') { html += `<div class="st lr ${cur}" data-step="${i}" style="display:flex">${STREET_CN[s.street]} ${pcs(s.board)} <span class="t">底池 ${amt(s.pot, bb)}</span></div>`; return; }
+    if (s.kind === 'result') { html += `<div class="st">结算</div><div class="lr ${cur}" data-step="${i}"><span>${(h.winners || []).map(w => `${esc(w.name)} 赢 ${amt(w.amount, bb)}`).join('，') || '—'}</span><span class="t">底池 ${amt(s.pot, bb)}</span></div>`; return; }
+    const x = h.seats.find(y => y.seat === s.seat) || {};
+    const m = s.hero && s.hero.match;
+    html += `<div class="lr ${s.hero || x.hero ? 'hero' : ''} ${cur}" data-step="${i}"><span>${esc(x.name ?? '座' + s.seat)} <span class="muted">${esc(x.pos || '')}</span> <b>${esc(lbl(s.label, bb))}</b>
+      ${m === 'diff' ? `<span class="badge diff">建议 ${esc(lbl(s.hero.advice.text, bb))}</span>` : m === 'same' ? '<span class="badge same">同建议</span>' : ''}</span>
+      <span class="t">${s.think_s != null ? s.think_s.toFixed(1) + 's' : ''}</span></div>`;
+  });
+  return html;
+}
+
+function resultBlock(h) {
+  const bb = h.bb, pay = new Map((h.payouts || []).map(p => [p.seat, p.amount]));
+  const rows = h.seats.map(x => `<tr class="${x.hero ? 'hero' : ''}"><td>${esc(x.name ?? '座' + x.seat)} <span class="muted">座${x.seat}</span></td><td class="l">${esc(x.pos || '')}</td>
+    <td class="l">${x.hole && (x.hero || x.shown) ? pcs(x.hole) : x.showdown ? '<span class="muted">未亮</span>' : ''}</td>
+    <td>${amt(x.start, bb)}</td><td>${amt(x.committed, bb)}</td><td>${pay.has(x.seat) ? amt(pay.get(x.seat), bb) : ''}</td><td>${amt(x.final, bb)}</td>
+    <td class="${x.net > 0 ? 'pos-ok' : x.net < 0 ? 'neg' : 'muted'}"><b>${sgn(x.net, bb)}</b></td></tr>`).join('');
+  return `<div style="overflow-x:auto"><table class="res"><thead><tr><th>玩家</th><th>位置</th><th>底牌</th><th>开局</th><th title="含 ante 和盲注；未跟注退回的部分也算在内">投入</th><th>分得</th><th>结束</th><th>输赢</th></tr></thead><tbody>${rows}</tbody></table></div>
+    <p class="muted" style="font-size:12px">总底池 ${amt(h.total_pot, bb)}${h.outcome_kind ? ' · ' + esc(h.outcome_kind) : ''}</p>`;
+}
+
+// ---- controls
+function go(i) { if (!hand) return; step = Math.max(0, Math.min(i, hand.steps.length - 1)); render(); }
+function stop() { if (timer) { clearInterval(timer); timer = null; } }
+function play() {
+  if (timer) { stop(); render(); return; }
+  if (step >= hand.steps.length - 1) step = 0;
+  timer = setInterval(() => { if (step >= hand.steps.length - 1) { stop(); render(); } else go(step + 1); }, +store.get('speed', '900'));
+  render();
+}
+function moveHand(d) {
+  if (!rows.length) return;
+  const i = hand ? rows.findIndex(r => r.key === hand.key) : -1;
+  const j = i < 0 ? 0 : Math.max(0, Math.min(rows.length - 1, i + d));
+  if (rows[j] && (!hand || rows[j].key !== hand.key)) openHand(rows[j].key, 0);
+}
+$('replay').addEventListener('click', e => {
+  const b = e.target.closest('[data-c]');
+  if (b) {
+    const c = b.dataset.c;
+    if (c !== 'play') stop();
+    ({ first: () => go(0), prev: () => go(step - 1), next: () => go(step + 1), last: () => go(hand.steps.length - 1),
+       play, prevhand: () => moveHand(-1), nexthand: () => moveHand(1) })[c]();
+    return;
+  }
+  const r = e.target.closest('[data-step]');
+  if (r) { stop(); go(+r.dataset.step); }
+});
+$('replay').addEventListener('input', e => { if (e.target.id === 'slider') { stop(); go(+e.target.value); } });
+$('replay').addEventListener('change', e => { if (e.target.id === 'speed') { store.set('speed', e.target.value); if (timer) { stop(); play(); } } });
+document.addEventListener('keydown', e => {
+  if (e.target.matches('input[type=search], select') || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (!hand && !['ArrowDown', 'j'].includes(e.key)) return;
+  const k = e.key;
+  if (k === 'ArrowRight') { stop(); go(step + 1); }
+  else if (k === 'ArrowLeft') { stop(); go(step - 1); }
+  else if (k === 'Home') { stop(); go(0); }
+  else if (k === 'End') { stop(); go(hand.steps.length - 1); }
+  else if (k === ' ') play();
+  else if (k === 'ArrowDown' || k === 'j') moveHand(1);
+  else if (k === 'ArrowUp' || k === 'k') moveHand(-1);
+  else return;
+  e.preventDefault();
+});
+
+window.addEventListener('resize', () => { if (hand) render(); });
+
+// ---- start
+(async () => {
+  const u = store.get('unit', 'chips');
+  const ui = document.querySelector(`input[name=unit][value=${u === 'bb' ? 'bb' : 'chips'}]`);
+  if (ui) ui.checked = true;
+  $('peek').checked = !!store.get('peek', false);
+  const s = store.get('sort', 'new');
+  if ([...$('sort').options].some(o => o.value === s)) $('sort').value = s;
+  try { await loadList(); } catch (e) { $('list').innerHTML = `<div class="err">读不到手牌列表：${esc(e)}</div>`; return; }
+  const m = new URLSearchParams(location.hash.slice(1));
+  if (m.get('key')) openHand(m.get('key'), +(m.get('step') || 0));
+})();
+</script>
+</body>
+</html>

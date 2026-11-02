@@ -27,6 +27,9 @@ python3 -m opponent_analysis live --db artifacts/opponent_db --platform poker_ma
 python3 -m opponent_analysis live --db artifacts/opponent_db --platform wopo \
     --follow "$D/wopo_hh.jsonl" --play-events "$D/wopo_play_events.jsonl" --hero hero
 
+# wopo 牌局回放：浏览器打开 http://127.0.0.1:8781/（见「牌局回放」一节）
+python3 -m opponent_analysis history --run 'artifacts/wopo*/' [--port 8781]
+
 # 测试
 python3 -m unittest discover -s opponent_analysis/tests -t .
 ```
@@ -143,6 +146,31 @@ street, pot, turns, dead, result, hero_net, status（playing / done / dead / err
 单人详情的剥削估计收益、翻前全下码深、最近手牌的底池和我方盈亏）一律是大盲，每手按这一手自己的大盲换算
 （wopo 盲注会变；ante 算进底池和输赢）。数据库和日志里存的仍是原始筹码。顶部的行动指南不换算，照 play.log 显示原始筹码。
 
+## 牌局回放（wopo，`history`）
+
+在浏览器里逐步回放打完的 wopo 手牌。只读文件，不碰数据库：
+
+- 手牌来自 driver 的 `wopo_hh.jsonl`（`--run` 给 run 目录、hh 文件或通配符，每次请求重新展开，文件变了就重读）。
+  同目录有 `wopo_play_events.jsonl` 时，hero 每个决策点带上建议、和实际是否一致、advisor 的动作概率 / 来源 / 耗时
+  （过期的建议也列出来），每个动作带上和上一个动作的时间差；有 `wopo_ranges.jsonl` 时显示每条街开始时的对手牌力估计。
+  10-31 之前的 run 只有 hh，回放照常，只是没有建议和用时。
+- 每手从开局筹码重新模拟（ante、盲注、补盲，然后逐个动作的 `contribution_delta`），每一步都有各座剩余栈、本街下注、
+  是否弃牌 / 全下和底池；最后一步用服务器 `hand_result` 的 `final_stacks`，未跟注退回的部分单独标出。模拟出的剩余栈和
+  hh 里每个动作的 `stack_before` 对不上时在页面「数据说明」里列出（现有 394 手没有一处对不上）。
+- 每手同时跑一遍 `ingest` 用的适配器 + 重放校验；没通过（例如全下底池额外扣款造成的 `not_zero_sum`）只显示警告，
+  照样能回放。driver 的 `result_notes` 也列在「数据说明」里。
+- hh 没收的作废手（约 8%）不能回放，页头只给个数（事件流里开了局、hh 里没有的手）。
+- 动作和事件流按顺序一一对应（座位、动作、投入都相同）；从第一个对不上的地方起不再挂建议和用时，并在「数据说明」里写明。
+- 页面：左边手牌列表（按 run 过滤；搜索玩家名 / 编号 / 底牌，如 `AK`、`AKs`、`7h7c`；只看我方入池 / 摊牌 / 有对手亮牌 /
+  和建议不同 / 到了翻后 / 有警告；按时间、我方输赢、底池排序；列表底部合计我方输赢 BB，没扣抽水）；右边牌桌（我方固定在下方），
+  逐步播放，动作记录点一行跳到那一步，下面是结算表（开局、投入、分得、结束、输赢）。对手亮牌默认到结算才翻开，
+  页头可以选提前亮出。金额可切换筹码 / BB（每手按自己的大盲）。键盘 ←/→ 单步，空格播放，↑/↓ 换手。
+  地址带 `#key=<hand_id>&step=<n>`，可以直接发链接定位到某一手的某一步。
+- `live --platform wopo` 也挂了同一个页面：`/history`，读的就是 `--follow` 的 hh 文件，打完一手刷新列表就能看到；
+  画像页页头有「牌局回放」链接，行动指南里已结算的手有「回放」链接。
+- 接口：`/api/history/hands`（列表）、`/api/history/hand?key=<key>`（一手的全部步骤）。同一个 hand_id 出现在多个 run 里时，
+  后面的 key 是 `<hand_id>@<run 目录名>`。
+
 ## 翻前全下的亮牌
 
 每个玩家自愿的翻前全下（主动推，或跟注全下；超时代打的不算）单独记一条：局面（按他行动前的加注次数：未开池 /
@@ -164,6 +192,7 @@ street, pot, turns, dead, result, hero_net, status（playing / done / dead / err
 | `cards.py` | 河牌牌力百分位（对所有可能底牌） |
 | `report.py` | 群体基准、对手总表、逐人候选漏洞、与群体的显著差异、前后半程漂移、翻前全下的亮牌 |
 | `live.py` + `live.html` | 跟随 hh 日志、增量累加（`report.Accumulator`）、HTTP 页面；`PlayFeed` / `hand_view` 跟随 wopo 事件流（行动指南，`/api/play`） |
+| `history.py` + `history.html` | wopo 牌局回放：hh 每手重新模拟成逐步状态，挂上事件流里的建议和范围日志里的牌力估计（`history` 命令，`live` 里的 `/history`） |
 
 ## 现有数据的校验结果（2026-10-20）
 

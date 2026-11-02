@@ -177,6 +177,7 @@ details.hand > div { padding: 4px 0 8px 14px; }
   <div class="meta">
     <span id="m-hands"></span><span id="m-last"></span><span id="m-built"></span>
     <a href="/report.md" target="_blank">报告 md</a><a href="/profile.json" target="_blank">profile.json</a>
+    <a id="histlink" href="/history" target="_blank" hidden>牌局回放</a>
   </div>
 </header>
 <main>
@@ -509,6 +510,7 @@ function renderQuality() {
 function renderHeader() {
   $('scope-n').textContent = snap.cfg.recent_hands;
   $('platform').textContent = '· ' + snap.platform;
+  $('histlink').hidden = snap.platform !== 'wopo';
   $('m-hands').textContent = `${snap.hands} 手`;
   $('m-last').textContent = `最新一手 ${ago(snap.last_ts)}`;
   $('m-built').textContent = `画像更新于 ${ago(snap.built_at)}`;
@@ -713,7 +715,8 @@ function handHead(h) {
   const bl = h.sb != null ? `盲注 ${h.sb}/${h.bb}${h.ante ? ` · ante ${h.ante}` : ''}` : '';
   return `<div class="g-head"><span class="hid" title="${esc(h.hand_id)}">${esc(shortHid(h.hand_id))}</span><span class="badge ${cls}">${label}${h.dead ? '：' + esc(h.dead.reason) : ''}</span>`
     + `<span class="muted">${esc(h.table_id || '')}</span>${h.button != null ? `<span>庄位 座${h.button}</span>` : ''}${bl ? `<span>${bl}</span>` : ''}`
-    + `<span class="muted">开始 ${clock(h.first_ts)}（${agoP(h.first_ts)}）</span>${h.partial ? '<span class="badge warn">从这手中途开始读，开头没有</span>' : ''}</div>`;
+    + `<span class="muted">开始 ${clock(h.first_ts)}（${agoP(h.first_ts)}）</span>${h.partial ? '<span class="badge warn">从这手中途开始读，开头没有</span>' : ''}`
+    + (h.status === 'done' ? `<a href="/history#key=${encodeURIComponent(h.hand_id)}" target="_blank" title="hh 日志收了这手才有">回放</a>` : '') + '</div>';
 }
 
 function handSummary(h) {

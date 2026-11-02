@@ -665,7 +665,7 @@ def _float(s: str) -> Optional[float]:
         return None
 
 
-def make_handler(live: Live, play: Optional[PlayFeed] = None):
+def make_handler(live: Live, play: Optional[PlayFeed] = None, hist=None):
     class H(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # quiet: the page polls every few seconds
             pass
@@ -711,7 +711,12 @@ def make_handler(live: Live, play: Optional[PlayFeed] = None):
             elif u.path == "/profile.json":
                 self._send(200, json.dumps(prof, ensure_ascii=False, indent=1).encode(), "application/json; charset=utf-8")
             else:
-                self._send(404, b"not found", "text/plain; charset=utf-8")
+                from .history import handle as history_handle  # history imports live: import here
+                r = history_handle(hist, u.path, u.query, live=True) if hist is not None else None
+                if r is not None:
+                    self._send(*r)
+                else:
+                    self._send(404, b"not found", "text/plain; charset=utf-8")
 
     return H
 
@@ -721,8 +726,14 @@ def serve(db_dir: str, platform: str, patterns: list[str], host: str, port: int,
           play_hands: int = 20, play_poll_s: float = 0.5, range_patterns=None) -> None:
     live = Live(db_dir, platform, patterns, cfg, refresh_s, hero_names)
     play = PlayFeed(play_patterns, play_hands, range_patterns=range_patterns) if play_patterns else None
+    hist = None
+    if platform == "wopo":
+        from .history import History
+
+        # Hand replay (/history) over the same hh files; reloaded on request when they change.
+        hist = History(patterns)
     # Bind first: a busy port fails at once, and the page shows "loading" during bootstrap.
-    httpd = ThreadingHTTPServer((host, port), make_handler(live, play))
+    httpd = ThreadingHTTPServer((host, port), make_handler(live, play, hist))
     print(f"serving http://{host}:{port}/", flush=True)
     stop = threading.Event()
     failed = []
