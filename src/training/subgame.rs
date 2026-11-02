@@ -1480,6 +1480,25 @@ pub struct PrefixReach<'a> {
     pub seat_coefs: Option<&'a [Option<Vec<f64>>]>,
 }
 
+/// 锚定路径的对手座倾斜（advisor `--exploit-anchored on`）：blueprint estimate 估根范围时，`replaced` 里的
+/// 前缀决策 `(影子节点, 树座)` 不再乘 blueprint σ，改乘该座的 `seat_coefs[座]`（逐组合系数，对齐
+/// [`all_hole_combos`]）。只作用在 blueprint estimate 上：跨街后验命中时不用（画像已随上一街解带下来）。
+/// hero 座（`auth_actor`）的系数恒不读。
+#[derive(Clone, Copy)]
+pub struct AnchoredTilt<'a> {
+    pub seat_coefs: &'a [Option<Vec<f64>>],
+    pub replaced: &'a [(NodeId, PlayerId)],
+}
+
+impl AnchoredTilt<'_> {
+    fn seat_coef(&self, seat: PlayerId, hero: PlayerId) -> Option<&[f64]> {
+        if seat == hero {
+            return None;
+        }
+        self.seat_coefs.get(seat as usize)?.as_deref()
+    }
+}
+
 impl PrefixReach<'_> {
     /// 对手座 `seat` 的额外系数（hero 座恒 `None`）。
     fn seat_coef(&self, seat: PlayerId, hero: PlayerId) -> Option<&[f64]> {
@@ -2612,6 +2631,45 @@ pub fn subgame_search_cached(
     hand_seed: u64,
     decision_ordinal: u64,
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
+    subgame_search_cached_tilt(
+        cache,
+        auth,
+        root_state,
+        game,
+        legal_abs,
+        node_id,
+        strategy,
+        cfg,
+        bucket_override,
+        leaf_values,
+        within_round_real,
+        cross_street,
+        None,
+        hand_seed,
+        decision_ordinal,
+    )
+}
+
+/// [`subgame_search_cached`] + 锚定路径对手座倾斜（[`AnchoredTilt`]）。`tilt = None` 与
+/// [`subgame_search_cached`] 逐位相同；倾斜后的范围进 solve 缓存 key（同 ranges 项）。
+#[allow(clippy::too_many_arguments)]
+pub fn subgame_search_cached_tilt(
+    cache: Option<&mut SubgameSolveCache>,
+    auth: &GameState,
+    root_state: &GameState,
+    game: &SimplifiedNlheGame,
+    legal_abs: &[SimplifiedNlheAction],
+    node_id: NodeId,
+    strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    cfg: &SubgameSearchConfig,
+    bucket_override: Option<&Arc<BucketTable>>,
+    leaf_values: Option<&Arc<LeafValueTables>>,
+    within_round_real: Option<&[(Action, bool)]>,
+    cross_street: Option<&[(Action, bool)]>,
+    tilt: Option<AnchoredTilt<'_>>,
+    hand_seed: u64,
+    decision_ordinal: u64,
+) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
     subgame_search_cached_inner(
         cache,
         auth,
@@ -2625,6 +2683,7 @@ pub fn subgame_search_cached(
         leaf_values,
         within_round_real,
         cross_street,
+        tilt,
         hand_seed,
         decision_ordinal,
         None,
@@ -2665,6 +2724,7 @@ fn subgame_search_cached_inner(
     leaf_values: Option<&Arc<LeafValueTables>>,
     within_round_real: Option<&[(Action, bool)]>,
     cross_street: Option<&[(Action, bool)]>,
+    tilt: Option<AnchoredTilt<'_>>,
     hand_seed: u64,
     decision_ordinal: u64,
     actor_override: Option<PlayerId>,
@@ -2770,6 +2830,21 @@ fn subgame_search_cached_inner(
     // （range_uniform_mix 字段 doc），hero（auth_actor）保持原 reach（mix_lambda_for_seat doc）。
     // 惰性：仅跨街后验未命中时才调（见下方 ranges_opt）。crop blueprint（`blueprint_max_street`
     // < River）下先过覆盖守卫——要查被裁掉街的 σ → `Err(BLUEPRINT_CROPPED_ERR…)`，不静默退均匀。
+    // 锚定倾斜（[`AnchoredTilt`]）：被系数替代的对手前缀决策从 range_decisions 里拿掉（hero 的决策恒保留），
+    // 估完 blueprint 部分后再乘该座系数。没有任何对手座系数 → 不动（逐位相同）。
+    let tilt = tilt.filter(|t| {
+        t.seat_coefs
+            .iter()
+            .enumerate()
+            .any(|(s, c)| c.is_some() && s as PlayerId != auth_actor)
+    });
+    let range_decisions: Vec<(NodeId, AbstractActionTag, PlayerId)> = match tilt {
+        Some(t) => range_decisions
+            .into_iter()
+            .filter(|&(n, _, s)| s == auth_actor || !t.replaced.contains(&(n, s)))
+            .collect(),
+        None => range_decisions,
+    };
     let estimate_anchored_ranges = || -> Result<Option<Vec<Vec<f64>>>, String> {
         if !cfg.use_blueprint_range {
             return Ok(None);
@@ -2797,6 +2872,12 @@ fn subgame_search_cached_inner(
                             &holes,
                             false, // anchored：栈≈100BB，AllIn = 真 100BB shove，不跳过（byte-equal）。
                         );
+                        if let Some(coef) = tilt
+                            .as_ref()
+                            .and_then(|t| t.seat_coef(seat as PlayerId, auth_actor))
+                        {
+                            apply_hero_coef(&mut r, coef);
+                        }
                         mix_range_with_uniform(
                             &mut r,
                             &holes,
@@ -2878,6 +2959,17 @@ fn subgame_search_cached_inner(
             debug_dump_ranges("anchored", r, &all_hole_combos());
         }
     }
+    // 遥测（`SolveRangeMeta::coef_seats`）：blueprint estimate 真被用上时乘了倾斜系数的在手对手座。
+    let coef_seats: Vec<u8> = match (tilt, ranges_opt.is_some() && !cross_hit) {
+        (Some(t), true) => (0..root_state.players().len())
+            .filter(|&s| {
+                root_state.players()[s].hole_cards.is_some()
+                    && t.seat_coef(s as PlayerId, auth_actor).is_some()
+            })
+            .map(|s| s as u8)
+            .collect(),
+        _ => Vec::new(),
+    };
     let meta = SolveRangeMeta {
         path: "anchored",
         range_src: match (ranges_opt.is_some(), cross_hit) {
@@ -2885,6 +2977,7 @@ fn subgame_search_cached_inner(
             (true, true) => "cross_street_posterior",
             (true, false) => "blueprint_estimate",
         },
+        coef_seats,
         ..SolveRangeMeta::default()
     };
     let real_hand = real_hand_spec(cfg, auth, auth_actor);
@@ -4036,6 +4129,9 @@ fn subgame_search_unanchored_cached_inner(
 /// 后验 range。预热须与决策时算出**同一份 ranges 才命中 key**：两路同读 `cache.current()`（街起点
 /// 预热时上一街解仍在主 slot，本街 solve 未 store）+ 同 `prev_within` → 同 ranges → 同 key。`None`
 /// = 关（byte-equal）。
+///
+/// `tilt`：锚定路径对手座倾斜（[`AnchoredTilt`]，同 [`subgame_search_cached_tilt`]）。预热与决策须传同一份
+/// 才命中 key；`None` = 不倾斜（逐位相同）。
 #[allow(clippy::too_many_arguments)]
 pub fn subgame_search_prewarm(
     cache: &mut SubgameSolveCache,
@@ -4047,6 +4143,7 @@ pub fn subgame_search_prewarm(
     cfg: &SubgameSearchConfig,
     bucket_override: Option<&Arc<BucketTable>>,
     cross_street: Option<&[(Action, bool)]>,
+    tilt: Option<AnchoredTilt<'_>>,
     hand_seed: u64,
 ) -> Result<(), String> {
     if cfg.resolve_root != ResolveRoot::RoundStart {
@@ -4074,6 +4171,7 @@ pub fn subgame_search_prewarm(
         None,
         None,
         cross_street,
+        tilt,
         hand_seed,
         0, // RoundStart 的 seed_ordinal = 街索引，本参数不被读。
         Some(hero),
@@ -9272,6 +9370,7 @@ mod tests {
             &cfg,
             None,
             None,
+            None,
             0xFEED,
         )
         .expect("预热应 Ok（stub 桶 + accepting cap）");
@@ -9340,6 +9439,7 @@ mod tests {
             &cd,
             None,
             None,
+            None,
             0xFEED,
         )
         .is_err());
@@ -9355,6 +9455,7 @@ mod tests {
             flop.current_node_id,
             &strat,
             &dl,
+            None,
             None,
             None,
             0xFEED,

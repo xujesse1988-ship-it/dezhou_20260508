@@ -251,7 +251,7 @@ HJ 的 raise、BTN 的 call 和 UTG 后续的 call 都不进入翻牌根范围�
 
 ### 翻前宽度修正（`--exploit on|vpip`）
 
-`--exploit` 默认关闭。开启后，仅在脱锚搜索决策路径上（配 `--search-force-unanchored on` 时，命中触发面的锚定搜索也算在内；只因 blueprint 均匀占位而搜索、又没命中触发面的决策仍走锚定，不用画像），对见过的对手使用翻前画像调整范围。锚定搜索不用画像：2026-11-01 亮牌补算试过全部走脱锚，翻牌起点范围更准，但转牌 / 河牌后验明显变差，没有改默认（调研 §7.6）。没有样本量门槛，改为收缩（2026-10-29）：设该玩家已有 `n` 手、`k = --exploit-shrink-k`（默认 50），VPIP / PFR 取 `(n·实测 + k·人群) / (n + k)`（人群 = 除该玩家和 hero 之外所有名字的合计），混合强度取 `--exploit-strength × n/(n+k)`。默认下 10 手约 1/6 强度、50 手半强度、150 手 3/4 强度。
+`--exploit` 默认关闭。开启后，仅在脱锚搜索决策路径上（配 `--search-force-unanchored on` 时，命中触发面的锚定搜索也算在内；只因 blueprint 均匀占位而搜索、又没命中触发面的决策仍走锚定，不用画像），对见过的对手使用翻前画像调整范围。锚定搜索默认不用画像：2026-11-01 亮牌补算试过全部走脱锚，翻牌起点范围更准，但转牌 / 河牌后验明显变差，没有改默认（调研 §7.6）。根范围相同时两条路解出来逐位相同，所以变差来自画像倾斜后的翻牌范围往后带，不是脱锚路径本身；`--exploit-anchored`（锚定路径用倾斜）很可能有同样的问题，默认关、未验证。没有样本量门槛，改为收缩（2026-10-29）：设该玩家已有 `n` 手、`k = --exploit-shrink-k`（默认 50），VPIP / PFR 取 `(n·实测 + k·人群) / (n + k)`（人群 = 除该玩家和 hero 之外所有名字的合计），混合强度取 `--exploit-strength × n/(n+k)`。默认下 10 手约 1/6 强度、50 手半强度、150 手 3/4 强度。
 
 - `--exploit vpip` 使用 VPIP 宽度和 Chen 起手牌排序构造目标分布。
 - `--exploit on` 结合本手翻前被动或主动入池方式选择 `CallBand` 或 `RaiseBand`，入池方式未知时退为 VPIP 形状。
@@ -300,7 +300,9 @@ blueprint 在边界以下的概率只剩 1e-4 量级的残余值，排序不可�
 
   至少一步用上了参考节点或宽度表的座才接管：他在前缀里的全部翻前决策从前缀里删掉，翻后决策不动。
 
-两个开关都只作用于脱锚档一的前缀范围，系数乘在 `estimate_range` 之后、均匀平滑之前，所以平滑仍是最后一道兜底。有对手被接管时即使前缀为空也会构造范围（没被接管的座仍是均匀），所以开了 `--exploit-tilt` 后满桌 UTG 首动作 limp 也不再是纯均匀起点。系数只读请求、画像快照和 blueprint，预热和决策算出同一份，进 solve 缓存 key。
+两个开关都作用于脱锚档一的前缀范围，系数乘在 `estimate_range` 之后、均匀平滑之前，所以平滑仍是最后一道兜底。有对手被接管时即使前缀为空也会构造范围（没被接管的座仍是均匀），所以开了 `--exploit-tilt` 后满桌 UTG 首动作 limp 也不再是纯均匀起点。系数只读请求、画像快照和 blueprint，预热和决策算出同一份，进 solve 缓存 key。
+
+**锚定局面（`--exploit-anchored on`，需 `--exploit-tilt on`，默认关）**：锚定搜索的 blueprint estimate 根范围也用同一条流水线。`exploit_tilt` 的 `synced_node` 取锚定的影子节点（决策时 = hero 当前节点，预热时 = 街起点节点；锚定时对手的翻前动作全在影子路径上，两处算出同一份系数），被接管座的翻前影子步从 `range_decisions` 里删掉、改乘系数，翻牌及以后的影子步照旧按 blueprint σ。只改 blueprint estimate 这一档：跨街后验命中时不用（画像已经随上一街的根范围带下来），也不做宽度修正，求解仍走锚定（子树、导航、翻牌访问数不足退 blueprint 都不变）。翻前全在影子路径上、没有全下的局面，锚定开倾斜与 `--search-force-unanchored` 下的脱锚倾斜算出逐座相同的根范围（测试 `prewarm_anchored_exploit_tilt_hits`）；对手翻前全下时，倾斜那一步用全下宽度表，代替锚定原来「按 200BB 全下的 σ」估短码全下。
 
 离线回放（调研 §7.1–§7.5）：wopo 三轮里平跟后跟隔离加注的范围从「开池范围之外的杂色小牌」变成中段牌；按实盘参数回放 194 条翻后决策，120 条脱锚决策中 15 条动作改变，倾斜本身耗时可忽略。已知局限：排序仍来自 blueprint，平跟再加注这种真人习惯（平跟陷阱 AA）表达不了。
 
@@ -329,6 +331,7 @@ blueprint 在边界以下的概率只剩 1e-4 量级的残余值，排序不可�
 | `--exploit-shrink-k` | `50` | 宽度修正的收缩伪样本数 |
 | `--exploit-limp-tilt` | `off` | 只倾斜对手首入平跟那一步；需 `--exploit` 与 `--search-limp-as-fold on` |
 | `--exploit-tilt` | `off` | 对手全部翻前决策走倾斜流水线；需 `--exploit` |
+| `--exploit-anchored` | `off` | 锚定搜索的 blueprint estimate 根范围也用倾斜系数（求解仍走锚定）；需 `--exploit-tilt on` |
 | `--exploit-limp-seed` | `0` | 平跟合成参考的种子：0–1 固定值（0 = Chen 中段，1 = 按弃牌概率）或 `adaptive`；需 `--exploit` |
 | `--range-log <path>` | 不写 | 每次新 solve 写一行各座根范围；需 `--search`。wopo driver 开了 `--search` 时默认写到行动文件同目录的 `wopo_ranges.jsonl`，`--range-log off` 关 |
 

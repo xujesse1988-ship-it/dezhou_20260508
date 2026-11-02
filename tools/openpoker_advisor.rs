@@ -107,11 +107,11 @@ use poker::training::opponent_profile::{
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
     all_hole_combos, chen_score, is_blueprint_cropped_err, is_low_hero_visits_err,
-    set_subgame_debug, should_search, subgame_search_cached, subgame_search_prewarm,
+    set_subgame_debug, should_search, subgame_search_cached_tilt, subgame_search_prewarm,
     subgame_search_unanchored_cached_cross_exploit,
-    subgame_search_unanchored_prewarm_cross_exploit, synced_prefix_decisions, ExploitPrior,
-    ExploitShape, PrefixReach, ResolveRoot, SearchTrigger, SolveView, SubgameSearchConfig,
-    SubgameSolveCache,
+    subgame_search_unanchored_prewarm_cross_exploit, synced_prefix_decisions, AnchoredTilt,
+    ExploitPrior, ExploitShape, PrefixReach, ResolveRoot, SearchTrigger, SolveView,
+    SubgameSearchConfig, SubgameSolveCache,
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, HandEvaluator,
@@ -993,6 +993,18 @@ fn prewarm_inner(
             // 上一街已解子树 σ 算本街后验 range。预热须与决策时算出同一份 ranges 才命中 key——两路同读
             // `cache.current()`（街起点预热时仍持上一街解）+ 同 `prev_within`。off / 非紧前街 → 自验退 estimate。
             let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
+            // 锚定局面的对手倾斜：与决策路径同一函数（[`anchored_tilt`]）→ 同 ranges → 同 key。
+            let tilt = anchored_tilt(
+                game,
+                strategy_fn,
+                &solver_cfg,
+                scale,
+                &smap,
+                req,
+                abs.current_node_id,
+                hero_pid,
+                rt,
+            );
             subgame_search_prewarm(
                 solve_cache,
                 hero_pid,
@@ -1003,6 +1015,10 @@ fn prewarm_inner(
                 scfg,
                 rt.bucket_table.as_ref(),
                 cross_street,
+                tilt.as_ref().map(|t| AnchoredTilt {
+                    seat_coefs: &t.coefs,
+                    replaced: &t.nodes,
+                }),
                 hand_seed,
             )
         }
@@ -2681,6 +2697,41 @@ fn unanchored_range_inputs(
     }
 }
 
+/// 锚定搜索的对手座倾斜（`--exploit-anchored on`，需 `--exploit-tilt on`）：同一条 [`exploit_tilt`] 流水线，
+/// `synced_node` = 锚定的影子节点（决策 = hero 当前节点，预热 = 街起点节点）。锚定时对手的翻前动作全部在
+/// 影子路径上，两处取到的翻前决策相同、本街起点前的弃牌也相同 → 系数相同 → 预热命中决策的 key。
+/// 关 / 没有画像 / 没有任何座被接管 → `None`（锚定路径逐位不变）。
+#[allow(clippy::too_many_arguments)]
+fn anchored_tilt(
+    game: &SimplifiedNlheGame,
+    strategy_fn: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    req: &Request,
+    node_id: NodeId,
+    hero: PlayerId,
+    rt: &SearchRuntime,
+) -> Option<SeatTilt> {
+    let cell = rt.exploit.as_ref()?;
+    let prof = cell.borrow();
+    if !(prof.cfg().tilt && prof.cfg().anchored) {
+        return None;
+    }
+    let t = exploit_tilt(
+        game,
+        strategy_fn,
+        solver_cfg,
+        scale,
+        smap,
+        req,
+        node_id,
+        hero,
+        &prof,
+    );
+    t.coefs.iter().any(Option::is_some).then_some(t)
+}
+
 /// 一次决策：重放本手历史（100BB real + abs 两态 lockstep）→ 我方决策点。`search == None` 时
 /// 查 blueprint → outgoing（旧行为，byte-equal）；`search == Some` 且命中触发面（[`should_search`]）
 /// 时建**真码深** subgame re-solve（[`subgame_search_cached`]；`deep_menu` → 子树用 {1pot} 单档菜单 +
@@ -3118,6 +3169,22 @@ fn decide_with(
         // estimate（裁掉 turn blueprint 的唯一 river 消费者）。off / 缓存非紧前街 → 子树内自验退 estimate
         // （不破现状）。预热路径（prewarm 锚定分支）同读 `cache.current()` + 同 `prev_within` → 同 key 命中。
         let cross_street = rt.unanchored_cross_street.then_some(prev_within.as_slice());
+        // 锚定局面的对手倾斜（`--exploit-anchored on`）：与预热同一函数 → 同系数 → 同 key。
+        let tilt = anchored_tilt(
+            game,
+            strategy_fn,
+            &solver_cfg,
+            scale,
+            &smap,
+            req,
+            node_id,
+            my_seat_solver.0 as PlayerId,
+            rt,
+        );
+        let tilt_ref = tilt.as_ref().map(|t| AnchoredTilt {
+            seat_coefs: &t.coefs,
+            replaced: &t.nodes,
+        });
         // 监控：本决策搜索墙钟（build+solve；预热命中 ≈0）+ 是否现 build（misses 涨 = MISS）。
         let t0 = Instant::now();
         let misses_before = solve_cache.misses();
@@ -3132,7 +3199,7 @@ fn decide_with(
             solve_cache,
             0,
             |cache| {
-                subgame_search_cached(
+                subgame_search_cached_tilt(
                     Some(cache), // within-round solve 缓存：同手同街命中 → 复用 solve 只重导航。
                     &auth,
                     root_state,
@@ -3147,6 +3214,7 @@ fn decide_with(
                     // deep_menu mid-round（AllPostflop）导航：当前街真实动作序在子树上重放（缺口③细化）。
                     Some(&within),
                     cross_street, // 档二′-跨街复用（上一街子树 σ 后验 range，覆盖 blueprint estimate）。
+                    tilt_ref,
                     hand_seed,
                     req.actions.len() as u64,
                 )
@@ -6192,10 +6260,10 @@ fn run() -> Result<(), String> {
         if let Some(cell) = &rt.exploit {
             let ec = *cell.borrow().cfg();
             eprintln!(
-                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): shrink_k={} strength_alpha={} mode={} limp_tilt={} tilt={} limp_seed={} cell_shrink_k={}（进程内画像，按 n/(n+k) 收缩）",
+                "[openpoker_advisor] exploit ON (叠加剥削 Tier 2，翻前 range 宽度): shrink_k={} strength_alpha={} mode={} limp_tilt={} tilt={} anchored={} limp_seed={} cell_shrink_k={}（进程内画像，按 n/(n+k) 收缩）",
                 ec.shrink_k, ec.strength_alpha,
                 if ec.pfr_shape { "on(VPIP+PFR/CallBand·RaiseBand)" } else { "vpip(仅VPIP/byte-equal)" },
-                ec.limp_tilt, ec.tilt, ec.limp_seed.map_or("adaptive".to_string(), |b| b.to_string()), ec.cell_shrink_k
+                ec.limp_tilt, ec.tilt, ec.anchored, ec.limp_seed.map_or("adaptive".to_string(), |b| b.to_string()), ec.cell_shrink_k
             );
             // 暖启动（--warm-profile-hh）：启动期读过往 HH JSONL，把历史牌局喂进 Profiler（与 live
             // observe 同口径）。网络丢消息 / 字段缺失 / 序列不完整的牌局在 hh_record_to_observe 重放处
@@ -6448,6 +6516,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_pfr_shape = false;
     let mut exploit_limp_tilt: Option<bool> = None;
     let mut exploit_tilt: Option<bool> = None;
+    let mut exploit_anchored: Option<bool> = None;
     let mut exploit_limp_seed: Option<Option<f64>> = None;
     let mut warm_profile_hh: Option<PathBuf> = None;
     // PM-17（--exploit-4bet*，不要求 --search）。
@@ -6719,6 +6788,13 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     other => return Err(format!("--exploit-tilt 须 on|off，得 {other}")),
                 })
             }
+            "--exploit-anchored" => {
+                exploit_anchored = Some(match next_val(&mut it, &arg)?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => return Err(format!("--exploit-anchored 须 on|off，得 {other}")),
+                })
+            }
             "--warm-profile-hh" => warm_profile_hh = Some(PathBuf::from(next_val(&mut it, &arg)?)),
             "--exploit-shrink-k" => {
                 let v: f64 = next_val(&mut it, &arg)?
@@ -6840,9 +6916,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || exploit_strength.is_some()
             || exploit_limp_tilt.is_some()
             || exploit_tilt.is_some()
+            || exploit_anchored.is_some()
             || exploit_limp_seed.is_some())
     {
         return Err("设了 --exploit-* 子旗但 --exploit 非 on|vpip".to_string());
+    }
+    // 锚定局面的倾斜复用倾斜流水线的系数：没开流水线就没有系数，拒绝静默空开。
+    let exploit_anchored = exploit_anchored.unwrap_or(false);
+    if exploit_anchored && !exploit_tilt.unwrap_or(false) {
+        return Err("--exploit-anchored on 需配合 --exploit-tilt on".to_string());
     }
     if warm_profile_hh.is_some() && !exploit_on {
         return Err("设了 --warm-profile-hh 但 --exploit 非 on|vpip（无画像可暖启动）".to_string());
@@ -6907,6 +6989,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             pfr_shape: exploit_pfr_shape,
             limp_tilt: exploit_limp_tilt,
             tilt: exploit_tilt.unwrap_or(false),
+            anchored: exploit_anchored,
             limp_seed: exploit_limp_seed.unwrap_or(d.limp_seed),
             ..d
         }
@@ -11486,6 +11569,156 @@ mod tests {
         assert_eq!(cache_off.misses(), 2, "开 / 关倾斜的范围不同 → key 不同");
     }
 
+    /// `--exploit-anchored on` 端到端：同上一局面（SB 开池、BB hero 跟注、翻牌），不开 force_unanchored →
+    /// 走锚定搜索。预热（街起点节点）与决策（hero 节点）算出同一份系数 → 命中；villain 被倾斜、hero 不动。
+    /// 这个局面翻前全在影子路径上、没有全下，锚定 blueprint estimate 与脱锚前缀用的是同一段前缀 →
+    /// 开倾斜后两条路的根范围应逐座相同（锚定倾斜没有多乘 / 漏乘）。关 `--exploit-anchored` → 不倾斜，
+    /// 且范围不同 → key 不同。
+    #[test]
+    fn prewarm_anchored_exploit_tilt_hits() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let sigma = top15_sigma();
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            range_uniform_mix: 0.25,
+            ..SubgameSearchConfig::default()
+        };
+        let line = |a: &'static str| {
+            let mut v = vec![(3, "fold"), (4, "fold"), (5, "fold"), (0, "fold"), (1, a)];
+            if a == "raise" {
+                v.push((2, "fold"));
+            }
+            v
+        };
+        let hands: Vec<_> = (0..20)
+            .map(|k| {
+                let a = if k % 5 < 2 { "raise" } else { "fold" };
+                (vec![(1, "villain"), (2, "hero")], line(a))
+            })
+            .collect();
+        let rt_with = |anchored: bool, force: bool| SearchRuntime {
+            force_unanchored: force,
+            exploit: Some(RefCell::new(profiler_from(
+                ExploitConfig {
+                    tilt: true,
+                    anchored,
+                    pfr_shape: true,
+                    ..ExploitConfig::default()
+                },
+                &hands,
+            ))),
+            ..rt_prefix_reach(scfg)
+        };
+        let mut pre = flop_first_unraised_req(vec![2000; 6]);
+        pre.my_seat = 2;
+        pre.hole = vec!["Qs".into(), "Qd".into()];
+        pre.names = BTreeMap::from([(1, "villain".to_string()), (2, "hero".to_string())]);
+        pre.actions[4] = HistAction {
+            seat: 1,
+            action: "raise".into(),
+            to: Some(60),
+        };
+        pre.actions[5] = HistAction {
+            seat: 2,
+            action: "call".into(),
+            to: None,
+        };
+        pre.valid.max_raise = Some(1940);
+        let mut req = pre.clone();
+        req.actions.push(HistAction {
+            seat: 1,
+            action: "check".into(),
+            to: None,
+        });
+        let hand_id = serde_json::json!("t:hand:8");
+        // 预热 + 决策，返回（决策回复，(miss, hit)，预热那次 solve 的范围日志行）。
+        let run = |rt: &SearchRuntime| {
+            let mut cache = SubgameSolveCache::new();
+            let mut log = RangeLog::new(Vec::new()).unwrap();
+            let ctx = RangeLogCtx {
+                hand_id: Some(&hand_id),
+                trigger: "prewarm",
+                source: "x",
+                n_seats: 6,
+            };
+            let p = prewarm(&game, &sigma, &pre, 0xE7B3, Some(rt), &mut cache);
+            assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+            assert!(log.record(&cache, &pre, &ctx).unwrap());
+            let r = decide(&game, &abs, &sigma, &req, 0xE7B3, Some(rt), &mut cache);
+            let counts = (cache.misses(), cache.hits());
+            let text = String::from_utf8(log.out).unwrap();
+            let e: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+            (r, counts, e)
+        };
+        let seat_field = |e: &serde_json::Value, seat: u64, f: &str| {
+            e["seats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["seat"] == seat)
+                .unwrap()[f]
+                .clone()
+        };
+
+        let (r_on, c_on, e_on) = run(&rt_with(true, false));
+        assert_eq!(r_on.source, "search", "得 {r_on:?}");
+        assert_eq!(c_on, (1, 1), "带锚定倾斜的预热须被决策命中");
+        assert_eq!(
+            (&e_on["path"], &e_on["range_src"]),
+            (
+                &serde_json::json!("anchored"),
+                &serde_json::json!("blueprint_estimate")
+            )
+        );
+        assert_eq!(seat_field(&e_on, 1, "coef"), true, "villain 被倾斜");
+        assert_eq!(seat_field(&e_on, 2, "coef"), false, "hero 不倾斜");
+
+        let (_, c_off, e_off) = run(&rt_with(false, false));
+        assert_eq!(c_off, (1, 1));
+        assert_eq!(seat_field(&e_off, 1, "coef"), false, "关旗 = 锚定不读画像");
+        assert_ne!(
+            seat_field(&e_on, 1, "range"),
+            seat_field(&e_off, 1, "range"),
+            "倾斜须改 villain 范围"
+        );
+        assert_eq!(
+            seat_field(&e_on, 2, "range"),
+            seat_field(&e_off, 2, "range"),
+            "hero 范围不动"
+        );
+
+        let (r_force, _, e_force) = run(&rt_with(false, true));
+        assert_eq!(e_force["path"], "unanchored");
+        assert_eq!(e_on["seats"], e_force["seats"], "同一段前缀 → 同一份根范围");
+        // 根范围相同 → 两条路解的是同一个子博弈：策略逐位相同（锚定 / 脱锚的区别只在输入，不在求解）。
+        assert!(r_on.probs.is_some());
+        assert_eq!(r_on.probs, r_force.probs, "同范围 → 同解");
+
+        // 关旗预热 + 开旗决策：范围不同 → miss 重解。
+        let mut cache = SubgameSolveCache::new();
+        let p = prewarm(
+            &game,
+            &sigma,
+            &pre,
+            0xE7B3,
+            Some(&rt_with(false, false)),
+            &mut cache,
+        );
+        assert_eq!(p.source, "prewarm:stored");
+        decide(
+            &game,
+            &abs,
+            &sigma,
+            &req,
+            0xE7B3,
+            Some(&rt_with(true, false)),
+            &mut cache,
+        );
+        assert_eq!(cache.misses(), 2, "开 / 关锚定倾斜的范围不同 → key 不同");
+    }
+
     #[test]
     fn prewarm_unanchored_applies_exploit_profile() {
         let game = nolimp_game();
@@ -12693,6 +12926,20 @@ mod tests {
             parse(&["--search", "--exploit-tilt", "on"]).is_err(),
             "--exploit-tilt 无 --exploit 应拒收"
         );
+        // --exploit-anchored：默认关；需 --exploit-tilt on，脏值拒收。
+        assert!(!e.anchored, "--exploit-anchored 默认关");
+        assert!(
+            tilt(&["--exploit-tilt", "on", "--exploit-anchored", "on"])
+                .expect("parse Ok")
+                .exploit
+                .expect("exploit on")
+                .anchored
+        );
+        assert!(
+            tilt(&["--exploit-anchored", "on"]).is_err(),
+            "没开 --exploit-tilt 应拒收（没有系数可用）"
+        );
+        assert!(tilt(&["--exploit-tilt", "on", "--exploit-anchored", "x"]).is_err());
         // --exploit-limp-seed：默认 0（Chen 中段）；adaptive / [0,1] 的数，出界和脏值拒收，需 --exploit。
         assert_eq!(e.limp_seed, Some(0.0), "默认 Chen 中段");
         let seed =
