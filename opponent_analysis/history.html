@@ -38,9 +38,14 @@ section { background: var(--panel); border: 1px solid var(--line); border-radius
 .seg label:has(input:checked) { background: var(--accent-soft); color: var(--accent); }
 select, input[type=search] { font: inherit; font-size: 13px; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; }
 input[type=search] { width: 100%; }
-#run { flex: 1; min-width: 0; max-width: 100%; }
-.filters { display: grid; gap: 8px; margin-bottom: 8px; }
-.filters .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+input[type=number] { font: inherit; font-size: 13px; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+#run { flex: 1 1 100%; min-width: 0; max-width: 100%; }
+#bb, #sort { flex: 1; min-width: 0; }
+/* minmax(0, 1fr): a grid track defaults to its content's min width, and the run select's long
+   option labels would push it past the panel edge. */
+.filters { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-bottom: 8px; }
+.filters .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; min-width: 0; }
+.filters select { max-width: 100%; text-overflow: ellipsis; }
 .chk { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; cursor: pointer; color: var(--muted); user-select: none; }
 .chk input { display: none; }
 .chk:has(input:checked) { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
@@ -106,6 +111,11 @@ input[type=search] { width: 100%; }
 .controls button:hover { border-color: var(--accent); }
 .controls button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .controls input[type=range] { flex: 1; min-width: 120px; accent-color: var(--accent); }
+.controls.speed { margin-top: 4px; font-size: 13px; }
+.seg.rates button { font: inherit; font-size: 12px; min-width: 42px; height: 26px; border: none; border-right: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; padding: 0 8px; border-radius: 0; }
+.seg.rates button:last-child { border-right: none; }
+.seg.rates button:hover { color: var(--accent); }
+.seg.rates button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .controls .count { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--muted); min-width: 64px; text-align: center; }
 .caption { margin-top: 8px; font-size: 14px; min-height: 22px; }
 .caption b { font-size: 15px; }
@@ -117,6 +127,14 @@ input[type=search] { width: 100%; }
 .probs { display: grid; grid-template-columns: minmax(60px, auto) 1fr 44px; gap: 2px 8px; font-size: 12px; align-items: center; margin-top: 8px; }
 .probs .bar { height: 8px; background: var(--band); border-radius: 2px; min-width: 1px; }
 .probs .on { font-weight: 600; color: var(--accent); }
+.probs .bar.on { background: var(--accent); }
+.probs .pick { font-weight: 400; font-size: 11px; }
+.declist { font-size: 12px; max-height: 360px; overflow-y: auto; }
+.dr { padding: 4px 6px; border-radius: 4px; cursor: pointer; background: var(--hero); margin-bottom: 4px; }
+.dr:hover { outline: 1px solid var(--accent); }
+.dr .l1 { display: flex; justify-content: space-between; gap: 8px; }
+.dr .l2 { margin-top: 2px; line-height: 1.6; }
+.dr .l2 .on { font-weight: 600; color: var(--accent); }
 .log { font-size: 12px; max-height: 360px; overflow-y: auto; }
 .log .st { font-weight: 600; color: var(--muted); margin: 8px 0 2px; display: flex; gap: 6px; align-items: center; }
 .log .st:first-child { margin-top: 0; }
@@ -167,12 +185,14 @@ kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-
     <div class="filters">
       <div class="row">
         <select id="run"><option value="">全部 run</option></select>
+        <select id="bb" title="按这手的大盲（筹码）筛选"><option value="">全部大盲</option></select>
         <select id="sort">
           <option value="new">最新在前</option>
           <option value="old">最早在前</option>
           <option value="win">我方赢最多</option>
           <option value="lose">我方输最多</option>
           <option value="pot">底池最大</option>
+          <option value="bigwin">胜者赢最多</option>
         </select>
       </div>
       <input type="search" id="q" placeholder="搜索玩家名 / 手牌编号 / 底牌（如 AK、7h7c）">
@@ -183,6 +203,25 @@ kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-
         <label class="chk"><input type="checkbox" data-f="diff">和建议不同</label>
         <label class="chk"><input type="checkbox" data-f="postflop">到了翻后</label>
         <label class="chk"><input type="checkbox" data-f="warn">数据有警告</label>
+        <label class="chk" title="advisor 范围日志里有对手牌力分布的手（翻牌后我方还在牌里、做了搜索）；10-31 的日志是按权重补算的"><input type="checkbox" data-f="ranges">有牌力估计</label>
+      </div>
+      <div class="row">
+        <label class="chk" title="这一手赢得最多的玩家（不限我方）净赢超过这个数，按这手自己的大盲换算；用服务器 hand_result 的 winners，没扣抽水">
+          <input type="checkbox" data-f="bigwin">胜者赢 &gt;</label>
+        <input type="number" id="bigwin" min="0" step="10" value="50" style="width:64px">
+        <span class="muted" style="font-size:12px">BB</span>
+      </div>
+      <div class="row">
+        <label class="chk" title="我方这手的输赢（结束筹码 − 开局筹码，没扣抽水）绝对值超过这个数，按这手自己的大盲换算">
+          <input type="checkbox" data-f="heronet">我方输赢 &gt;</label>
+        <input type="number" id="heronet" min="0" step="10" value="50" style="width:64px">
+        <span class="muted" style="font-size:12px">BB</span>
+        <select id="heronet-dir"><option value="both">输赢都算</option><option value="win">只看赢</option><option value="lose">只看输</option></select>
+      </div>
+      <div class="row">
+        <span class="muted" style="font-size:12px" title="在摊牌时赢的玩家的最好五张牌（对手亮的牌或我方自己的牌 + 五张公共牌）；没摊牌就赢的手没有牌型，选了牌型后不显示">胜者牌型</span>
+        <select id="made"><option value="">不限</option></select>
+        <label class="chk"><input type="checkbox" id="made-up">及以上</label>
       </div>
       <div class="meta" id="lmeta"></div>
     </div>
@@ -200,6 +239,7 @@ const NOTE_CN = [
   ['result_seats', '结算里的座位和发牌座位不同（有座位没发牌）'],
 ];
 const CHECK_CN = { not_zero_sum: '各座输赢加起来不为 0', folded_chip_mismatch: '弃牌座位的输赢和投入对不上', malformed: '记录格式不对' };
+const MADE_CN = ['高牌', '一对', '两对', '三条', '顺子', '同花', '葫芦', '四条', '同花顺'];
 const STALE_CN = { hero_acted: 'hero 已先行动', hand_over: '这手已结束', hand_dead: '这手已作废' };
 const STRENGTH = [['straight_flush', '同花顺'], ['quads', '四条'], ['full_house', '葫芦'], ['flush', '同花'], ['straight', '顺子'],
   ['trips', '三条'], ['two_pair', '两对'], ['top_pair', '超对 / 顶对'], ['pair', '其它一对'], ['nothing', '没中']];
@@ -270,8 +310,15 @@ async function loadList() {
   $('back').hidden = !listing.live;
   const sel = $('run'), cur = sel.value || store.get('run', '');
   sel.innerHTML = '<option value="">全部 run</option>' + listing.runs.map(r =>
-    `<option value="${esc(r.run)}">${esc(r.run)}（${r.counts.hands || 0} 手）</option>`).join('');
+    `<option value="${esc(r.run)}">${esc(r.run)}（${r.mtime ? when(r.mtime * 1000) + '，' : ''}${r.counts.hands || 0} 手）</option>`).join('');
   if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  // Big-blind sizes present in the data, smallest first, with hand counts.
+  const bbN = new Map();
+  for (const h of listing.hands) bbN.set(h.bb, (bbN.get(h.bb) || 0) + 1);
+  const bbSel = $('bb'), bbCur = bbSel.value || String(store.get('bb', ''));
+  bbSel.innerHTML = '<option value="">全部大盲</option>' + [...bbN].sort((a, b) => a[0] - b[0]).map(([v, n]) =>
+    `<option value="${v}">大盲 ${v}（${n} 手）</option>`).join('');
+  if ([...bbSel.options].some(o => o.value === bbCur)) bbSel.value = bbCur;
   const dead = listing.runs.reduce((a, r) => a + r.dead, 0), withEv = listing.runs.filter(r => r.events).length;
   $('hmeta').innerHTML = `<span>${listing.hands.length} 手 · ${listing.runs.length} 个 run</span>`
     + `<span title="有 wopo_play_events.jsonl 的 run 才有决策建议和用时">${withEv} 个 run 有决策记录</span>`
@@ -281,16 +328,30 @@ async function loadList() {
 }
 
 function filtered() {
-  const run = $('run').value, q = $('q').value.trim(), f = {};
+  const run = $('run').value, bbv = $('bb').value, q = $('q').value.trim(), f = {}, bigwin = +$('bigwin').value || 0,
+    heronet = +$('heronet').value || 0, heroDir = $('heronet-dir').value,
+    made = $('made').value, madeUp = $('made-up').checked;
   document.querySelectorAll('[data-f]').forEach(x => f[x.dataset.f] = x.checked);
   let out = listing.hands.filter(h => {
     if (run && h.run !== run) return false;
+    if (bbv && h.bb !== +bbv) return false;
     if (f.vpip && !h.hero_vpip) return false;
     if (f.showdown && !h.showdown) return false;
     if (f.shown && !h.shown) return false;
     if (f.diff && !h.diff) return false;
     if (f.postflop && h.street === 'preflop') return false;
     if (f.warn && !h.check && !h.notes) return false;
+    if (f.ranges && !h.has_ranges) return false;
+    if (f.bigwin && !(h.win_max != null && h.win_max / h.bb > bigwin)) return false;
+    if (made !== '') {
+      const m = +made;
+      if (!h.win_made.some(x => madeUp ? x >= m : x === m)) return false;
+    }
+    if (f.heronet) {
+      if (h.hero_net == null) return false;
+      const v = h.hero_net / h.bb;
+      if (!(heroDir === 'win' ? v > heronet : heroDir === 'lose' ? -v > heronet : Math.abs(v) > heronet)) return false;
+    }
     if (q) {
       const ql = q.toLowerCase();
       if (!(String(h.hand_id).toLowerCase().includes(ql) || h.players.some(p => String(p).toLowerCase().includes(ql)) || holeMatch(h.hole, q))) return false;
@@ -303,6 +364,7 @@ function filtered() {
   else if (s === 'win') out.sort((a, b) => bbNet(b) - bbNet(a));
   else if (s === 'lose') out.sort((a, b) => bbNet(a) - bbNet(b));
   else if (s === 'pot') out.sort((a, b) => (b.pot || 0) / b.bb - (a.pot || 0) / a.bb);
+  else if (s === 'bigwin') out.sort((a, b) => (b.win_max || 0) / b.bb - (a.win_max || 0) / a.bb);
   return out;
 }
 
@@ -315,20 +377,32 @@ function renderList() {
     const badges = [
       h.showdown ? '<span class="badge acc">摊牌</span>' : '',
       h.diff ? `<span class="badge diff">不同 ${h.diff}</span>` : '',
+      h.has_ranges ? '<span class="badge" title="有对手牌力估计">牌力</span>' : '',
       h.check || h.notes ? '<span class="badge warn">警告</span>' : '',
     ].join('');
     return `<div class="hrow ${hand && hand.key === h.key ? 'sel' : ''}" data-k="${esc(h.key)}">
       <div class="l1"><span class="hid">${esc(shortHid(h.hand_id))}</span><span class="pos">${esc(h.hero_pos || '?')}</span>${pcs(h.hole)}
         <span class="muted">${h.board.length ? h.board.map(pc).join('') : ''}</span></div>
       <div class="net ${cls}">${sgn(n, h.bb)}</div>
-      <div class="l2"><span>${esc(when(h.ts))}</span><span>${h.sb}/${h.bb}${h.ante ? ' ante ' + h.ante : ''}</span><span>${h.n} 人</span><span>${STREET_CN[h.street]}</span>${badges}</div>
+      <div class="l2"><span>${esc(when(h.ts))}</span><span>${h.sb}/${h.bb}${h.ante ? ' ante ' + h.ante : ''}</span><span>${h.n} 人</span><span>${STREET_CN[h.street]}</span>${h.win_max != null ? `<span title="这手赢得最多的玩家净赢">胜者 +${(h.win_max / h.bb).toFixed(1)}BB${h.win_made.length ? ' · ' + h.win_made.map(x => MADE_CN[x]).join(' / ') : ''}</span>` : ''}${badges}</div>
     </div>`;
   }).join('') || '<div class="empty">没有符合条件的手</div>';
 }
 
 $('list').addEventListener('click', e => { const r = e.target.closest('.hrow'); if (r) openHand(r.dataset.k, 0); });
-['run', 'sort'].forEach(id => $(id).addEventListener('change', () => { store.set(id, $(id).value); renderList(); }));
+['run', 'bb', 'sort'].forEach(id => $(id).addEventListener('change', () => { store.set(id, $(id).value); renderList(); }));
 $('q').addEventListener('input', renderList);
+$('made').innerHTML = '<option value="">不限</option>' + MADE_CN.map((n, i) => `<option value="${i}">${n}</option>`).join('');
+$('made').addEventListener('change', () => { store.set('made', $('made').value); renderList(); });
+$('made-up').addEventListener('change', () => { store.set('made-up', $('made-up').checked); renderList(); });
+// Editing a threshold (or the win / lose choice) turns its filter on.
+for (const [id, f] of [['bigwin', 'bigwin'], ['heronet', 'heronet'], ['heronet-dir', 'heronet']]) {
+  $(id).addEventListener(id.endsWith('dir') ? 'change' : 'input', () => {
+    store.set(id, $(id).value);
+    document.querySelector(`[data-f=${f}]`).checked = true;
+    renderList();
+  });
+}
 document.querySelectorAll('[data-f]').forEach(x => x.addEventListener('change', renderList));
 document.querySelectorAll('input[name=unit]').forEach(x => x.addEventListener('change', () => { store.set('unit', unit()); renderList(); render(); }));
 $('peek').addEventListener('change', () => { store.set('peek', $('peek').checked); render(); });
@@ -340,7 +414,7 @@ async function openHand(key, at) {
   if (!h) {
     const r = await fetch('/api/history/hand?key=' + encodeURIComponent(key), { cache: 'no-store' });
     h = await r.json();
-    if (!r.ok) { $('replay').innerHTML = `<div class="err">${esc(h.error || r.status)}</div>`; return; }
+    if (!r.ok) { shellFor = null; $('replay').innerHTML = `<div class="err">${esc(h.error || r.status)}</div>`; return; }
     if (cache.size > 200) cache.clear();
     cache.set(key, h);
   }
@@ -368,16 +442,63 @@ function seatXY(h, s, r) {
   return [50 + r[0] * Math.cos(a), 50 + r[1] * Math.sin(a)];
 }
 
-function render() {
-  const h = hand;
-  if (!h) return;
-  const st = h.steps[step], last = step === h.steps.length - 1, bb = h.bb;
-  history.replaceState(null, '', `#key=${encodeURIComponent(h.key)}&step=${step}`);
-  const peek = $('peek').checked;
-  const winners = new Set((h.payouts || []).map(p => p.seat));
+// The replay pane is built once per hand (and again when the unit / peek option / layout changes):
+// controls, log and result table stay put while playing, so the speed buttons and the slider can
+// be used mid-playback. Each step only redraws the table, caption and decision panel.
+let shellFor = null;
+const shellSig = () => hand && [hand.key, unit(), $('peek').checked, narrow()].join('|');
+
+function render(opt = {}) {
+  if (!hand) return;
+  if (shellFor !== shellSig()) buildShell();
+  renderStep(opt);
+}
+
+function buildShell() {
+  const h = hand, bb = h.bb;
   const warn = [];
   if (h.check) warn.push(`重放校验没通过：${esc(CHECK_CN[h.check.code] || h.check.code)} <span class="muted">${esc(h.check.code)} ${esc(h.check.detail)}</span>（这手不进画像统计，回放照常）`);
   h.notes.forEach(n => warn.push(noteCN(n)));
+  const pctl = h.steps.length - 1, rate = curRate();
+  const hero = h.seats.find(x => x.hero);
+  $('replay').innerHTML = `
+    <div class="rhead"><span class="hid">${esc(shortHid(h.hand_id))}</span>
+      <span class="muted">${esc(h.hand_id)}</span><span>${esc(when(h.ts))}</span>
+      <span>盲注 ${h.sb}/${h.bb}${h.ante ? ' · ante ' + h.ante : ''}</span><span>${h.seats.length} 人</span>
+      <span class="muted">${esc(h.run)}</span>
+      ${hero ? `<span>我方 ${esc(hero.pos || '')} ${pcs(hero.hole)} <b class="${hero.net > 0 ? 'pos-ok' : hero.net < 0 ? 'neg' : ''}">${sgn(hero.net, bb)}</b></span>` : ''}
+    </div>
+    ${warn.length ? `<div class="warnbox"><b>数据说明</b><ul>${warn.map(w => `<li>${w}</li>`).join('')}</ul></div>` : ''}
+    <div class="table-wrap" id="r-table"></div>
+    <div class="controls">
+      <button data-c="first" title="第一步（Home）">${ICON.first}</button><button data-c="prev" title="上一步（←）">${ICON.prev}</button>
+      <button data-c="play" id="r-play" class="primary" title="播放 / 暂停（空格）"></button>
+      <button data-c="next" title="下一步（→）">${ICON.next}</button><button data-c="last" title="最后一步（End）">${ICON.last}</button>
+      <span class="count" id="r-count"></span>
+      <input type="range" id="slider" min="0" max="${pctl}" value="${step}">
+      <button data-c="prevhand" title="上一手（↑ / k）">上一手</button><button data-c="nexthand" title="下一手（↓ / j）">下一手</button>
+    </div>
+    <div class="controls speed"><span class="muted">播放速度</span>
+      <div class="seg rates">${RATES.map(r => `<button data-rate="${r}" class="${r === rate ? 'on' : ''}">${r}×</button>`).join('')}</div>
+      <span class="muted" id="r-rate-note"></span>
+    </div>
+    <div class="caption" id="r-cap"></div>
+    <div class="cols">
+      <div id="r-dec"></div>
+      <div><h3>动作记录 <span class="muted" style="font-weight:normal">点一行跳到那一步</span></h3><div class="log" id="r-log">${logBlock(h)}</div></div>
+    </div>
+    <h3>结算</h3>${resultBlock(h)}
+    <p class="muted" style="font-size:12px;margin-top:10px">键盘：<kbd>←</kbd><kbd>→</kbd> 上 / 下一步，<kbd>空格</kbd> 播放，<kbd>-</kbd><kbd>+</kbd> 减速 / 加速，<kbd>Home</kbd><kbd>End</kbd> 首 / 尾，<kbd>↑</kbd><kbd>↓</kbd> 上 / 下一手。
+      结算筹码是服务器 hand_result 的数，抽水在这之后才扣，这里没算。</p>`;
+  shellFor = shellSig();
+}
+
+// opt.keepLog: the step was picked by clicking a log row, so the log must not scroll.
+function renderStep(opt = {}) {
+  const h = hand, st = h.steps[step], last = step === h.steps.length - 1, bb = h.bb;
+  history.replaceState(null, '', `#key=${encodeURIComponent(h.key)}&step=${step}`);
+  const peek = $('peek').checked;
+  const winners = new Set((h.payouts || []).map(p => p.seat));
 
   // table
   let tbl = '<div class="felt"></div>';
@@ -408,6 +529,7 @@ function render() {
   const slots = [0, 1, 2, 3, 4].map(i => st.board[i] ? card(st.board[i], newCards.has(st.board[i]) ? 'new' : '') : card(null)).join('');
   tbl += `<div class="center"><div class="street">${STREET_CN[st.street] || ''}</div><div class="board">${slots}</div>
     <div class="pot">底池 ${amt(st.pot, bb)}</div></div>`;
+  $('r-table').innerHTML = tbl;
 
   // caption
   let cap;
@@ -418,45 +540,64 @@ function render() {
       + (st.think_s != null ? ` <span class="muted" title="和上一个动作 / 发牌的时间差">· ${st.think_s.toFixed(1)} 秒</span>` : '');
   } else if (st.kind === 'board') cap = `发${STREET_CN[st.street]} ${pcs(st.new)}`;
   else if (st.kind === 'result') {
-    cap = '结算：' + (h.winners || []).map(w => `${who(w.seat)} 赢 ${amt(w.amount, bb)}`).join('，')
+    const madeOf = s => { const x = h.seats.find(y => y.seat === s); return x && x.made != null ? `（${MADE_CN[x.made]}）` : ''; };
+    cap = '结算：' + (h.winners || []).map(w => `${who(w.seat)} 赢 ${amt(w.amount, bb)}${madeOf(w.seat)}`).join('，')
       + (st.returned ? ` <span class="muted">· 未跟注的 ${amt(st.returned, bb)} 退回</span>` : '');
   } else cap = esc(lbl(st.label, bb));
+  $('r-cap').innerHTML = cap;
+  $('r-dec').innerHTML = decisionBlock(h, st) + strengthBlock(h, st);
 
-  const pctl = h.steps.length - 1;
-  const ctl = `<div class="controls">
-    <button data-c="first" title="第一步（Home）">${ICON.first}</button><button data-c="prev" title="上一步（←）">${ICON.prev}</button>
-    <button data-c="play" class="primary" title="播放 / 暂停（空格）">${timer ? ICON.pause : ICON.play}</button>
-    <button data-c="next" title="下一步（→）">${ICON.next}</button><button data-c="last" title="最后一步（End）">${ICON.last}</button>
-    <span class="count">${step} / ${pctl}</span>
-    <input type="range" id="slider" min="0" max="${pctl}" value="${step}">
-    <select id="speed" title="自动播放速度">${[['1600', '慢'], ['900', '中'], ['450', '快']].map(([v, l]) => `<option value="${v}" ${store.get('speed', '900') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
-    <button data-c="prevhand" title="上一手（↑ / k）">上一手</button><button data-c="nexthand" title="下一手（↓ / j）">下一手</button>
-  </div>`;
-
-  const hero = h.seats.find(x => x.hero);
-  $('replay').innerHTML = `
-    <div class="rhead"><span class="hid">${esc(shortHid(h.hand_id))}</span>
-      <span class="muted">${esc(h.hand_id)}</span><span>${esc(when(h.ts))}</span>
-      <span>盲注 ${h.sb}/${h.bb}${h.ante ? ' · ante ' + h.ante : ''}</span><span>${h.seats.length} 人</span>
-      <span class="muted">${esc(h.run)}</span>
-      ${hero ? `<span>我方 ${esc(hero.pos || '')} ${pcs(hero.hole)} <b class="${hero.net > 0 ? 'pos-ok' : hero.net < 0 ? 'neg' : ''}">${sgn(hero.net, bb)}</b></span>` : ''}
-    </div>
-    ${warn.length ? `<div class="warnbox"><b>数据说明</b><ul>${warn.map(w => `<li>${w}</li>`).join('')}</ul></div>` : ''}
-    <div class="table-wrap">${tbl}</div>
-    ${ctl}
-    <div class="caption">${cap}</div>
-    <div class="cols">
-      <div>${decisionBlock(h, st)}${strengthBlock(h, st)}</div>
-      <div><h3>动作记录 <span class="muted" style="font-weight:normal">点一行跳到那一步</span></h3><div class="log">${logBlock(h)}</div></div>
-    </div>
-    <h3>结算</h3>${resultBlock(h)}
-    <p class="muted" style="font-size:12px;margin-top:10px">键盘：<kbd>←</kbd><kbd>→</kbd> 上 / 下一步，<kbd>空格</kbd> 播放，<kbd>Home</kbd><kbd>End</kbd> 首 / 尾，<kbd>↑</kbd><kbd>↓</kbd> 上 / 下一手。
-      结算筹码是服务器 hand_result 的数，抽水在这之后才扣，这里没算。</p>`;
-  const cur = document.querySelector('.lr.cur');
-  if (cur) scrollWithin(cur.closest('.log'), cur);
+  // controls and log: update in place
+  $('r-play').innerHTML = timer ? ICON.pause : ICON.play;
+  $('r-count').textContent = `${step} / ${h.steps.length - 1}`;
+  const sl = $('slider');
+  if (+sl.value !== step) sl.value = step;
+  $('r-rate-note').textContent = `每步约 ${(BASE_MS / curRate() / 1000).toFixed(2).replace(/0$/, '')} 秒`;
+  document.querySelectorAll('#r-log .lr.cur').forEach(x => x.classList.remove('cur'));
+  const cur = document.querySelector(`#r-log [data-step="${step}"]`);
+  if (cur) { cur.classList.add('cur'); if (!opt.keepLog) scrollWithin($('r-log'), cur); }
 }
 
 function heroDecisions(h) { return h.steps.map((s, i) => [s, i]).filter(([s]) => s.hero); }
+
+// Advisor action labels (tools/openpoker_advisor.rs action_label): fold / check / call /
+// bet<x>pot / raise<x>pot / allin. Sizes are pot fractions in the solver's own abstract tree;
+// only the chosen action's chip amount is logged (the advice text), so others stay as fractions.
+const FRAC = { '0.25': '¼', '0.333': '⅓', '0.5': '½', '0.667': '⅔', '0.75': '¾' };
+function probName(n) {
+  const base = { fold: '弃牌', check: '过牌', call: '跟注', allin: '全下' }[n];
+  if (base) return base;
+  const m = /^(bet|raise)([\d.]+)pot$/.exec(n);
+  if (!m) return n;
+  const f = FRAC[m[2]] ? FRAC[m[2]] + ' 池' : (+m[2]) + ' 倍池';
+  return (m[1] === 'bet' ? '下注 ' : '加注 ') + f;
+}
+const SOURCE_CN = [['limp_heuristic', '平跟规则（不出概率）'], ['search_giveup', '搜索放弃，兜底（不出概率）'],
+  ['fallback', '兜底（不出概率）'], ['blueprint', 'blueprint'], ['search', '实时搜索']];
+const sourceCN = src => { for (const [k, v] of SOURCE_CN) if (String(src || '').startsWith(k)) return v; return src || '—'; };
+// Probability the advisor gave to what we actually did: exact for fold / check / call; a raise
+// or bet adds up every sizing (which one it was is not recoverable), all-in counts "allin".
+function actualProb(step, probs) {
+  if (!probs || !probs.length) return null;
+  const P = new Map(probs);
+  const a = step.action, allin = /全下/.test(step.label);
+  if (a === 'fold' || (a === 'call' && step.delta === 0)) return [a === 'fold' ? '弃牌' : '过牌', P.get(a === 'fold' ? 'fold' : 'check') ?? 0];
+  if (a === 'check') return ['过牌', P.get('check') ?? 0];
+  if (step.delta <= step.to_call) return [allin ? '跟注（全下）' : '跟注', (P.get('call') ?? 0) + (allin ? P.get('allin') ?? 0 : 0)];
+  if (allin) return ['全下', P.get('allin') ?? 0];
+  return ['下注 / 加注（各尺寸合计）', probs.filter(([n]) => /^(bet|raise)/.test(n)).reduce((x, [, p]) => x + p, 0)];
+}
+const pctS = p => (p >= 0.995 ? (100 * p).toFixed(0) : (100 * p).toFixed(1)) + '%';
+function probsGrid(dec, bb) {
+  return '<div class="probs">' + dec.probs.map(([n, p]) => {
+    const on = n === dec.chosen;
+    return `<span class="${on ? 'on' : ''}" title="${esc(n)}">${esc(probName(n))}${on ? ` <span class="pick">← 选中${dec.advice ? '：' + esc(lbl(dec.advice, bb)) : ''}</span>` : ''}</span>
+      <div><div class="bar ${on ? 'on' : ''}" style="width:${(100 * p).toFixed(1)}%"></div></div><span>${pctS(p)}</span>`;
+  }).join('') + '</div>';
+}
+// One line: every action with its probability, chosen one bold.
+const probsLine = (dec) => dec.probs.filter(([, p]) => p >= 0.0005).map(([n, p]) =>
+  `<span class="${n === dec.chosen ? 'on' : ''}">${esc(probName(n))} ${pctS(p)}</span>`).join('<span class="muted"> · </span>');
 
 function decisionBlock(h, st) {
   const bb = h.bb;
@@ -464,10 +605,15 @@ function decisionBlock(h, st) {
     const ds = heroDecisions(h);
     if (!h.has_events) return '<h3>我方决策</h3><p class="muted" style="font-size:12px">这个 run 没有 wopo_play_events.jsonl，没有建议记录。</p>';
     if (!ds.length) return '<h3>我方决策</h3><p class="muted" style="font-size:12px">这手我方没有行动（或事件流对不上）。</p>';
-    return '<h3>我方决策</h3><div class="log">' + ds.map(([s, i]) => {
-      const m = s.hero.match;
-      return `<div class="lr hero" data-step="${i}"><span>${STREET_CN[s.street]} 实际 <b>${esc(lbl(s.label, bb))}</b> · 建议 ${esc(lbl(s.hero.advice ? s.hero.advice.text : '无', bb))}</span>
-        <span>${m === 'same' ? '<span class="badge same">同</span>' : m === 'diff' ? '<span class="badge diff">不同</span>' : '<span class="badge">无建议</span>'}</span></div>`;
+    return '<h3>我方决策 <span class="muted" style="font-weight:normal">点一条跳到那一步</span></h3><div class="declist">' + ds.map(([s, i]) => {
+      const m = s.hero.match, dec = s.hero.decision;
+      const ap = dec && actualProb(s, dec.probs);
+      const detail = !dec ? '<span class="muted">没有 advisor 记录</span>'
+        : dec.probs && dec.probs.length ? probsLine(dec) + (ap ? ` <span class="muted">· 实际动作 ${pctS(ap[1])}</span>` : '')
+        : `<span class="muted">${esc(sourceCN(dec.source))}</span>`;
+      return `<div class="dr" data-step="${i}"><div class="l1"><span>${STREET_CN[s.street]} 实际 <b>${esc(lbl(s.label, bb))}</b> · 建议 ${esc(lbl(s.hero.advice ? s.hero.advice.text : '无', bb))}</span>
+        <span>${m === 'same' ? '<span class="badge same">同</span>' : m === 'diff' ? '<span class="badge diff">不同</span>' : '<span class="badge">无建议</span>'}</span></div>
+        <div class="l2">${detail}</div></div>`;
     }).join('') + '</div>';
   }
   const d = st.hero, dec = d.decision;
@@ -478,10 +624,13 @@ function decisionBlock(h, st) {
   if (d.advice) html += `<div>建议 <b>${esc(lbl(d.advice.text, bb))}</b></div>`;
   if (dec) {
     if (!d.advice || dec.stale) html += `<div class="muted">advisor 算出 <span class="${dec.stale ? 'stale' : ''}">${esc(lbl(dec.advice, bb))}</span>${dec.stale ? '（过期：' + esc(STALE_CN[dec.stale_kind] || dec.stale) + '）' : ''}</div>`;
-    html += `<div class="muted" style="font-size:12px;word-break:break-all">来源 ${esc(dec.source || '—')} · ${dec.decide_ms ?? '—'} ms${dec.rejected ? ' · 原建议不合法：' + esc(dec.rejected) : ''}</div>`;
+    html += `<div class="muted" style="font-size:12px;word-break:break-all" title="${esc(dec.source || '')}">来源 ${esc(sourceCN(dec.source))} <span style="opacity:.75">${esc(dec.source || '')}</span> · ${dec.decide_ms ?? '—'} ms${dec.rejected ? ' · 原建议不合法：' + esc(dec.rejected) : ''}</div>`;
     if (dec.probs && dec.probs.length) {
-      html += '<div class="probs">' + dec.probs.map(([n, p]) => `<span class="${n === dec.chosen ? 'on' : ''}">${esc(n)}</span><div><div class="bar" style="width:${(100 * p).toFixed(1)}%"></div></div><span>${(100 * p).toFixed(1)}%</span>`).join('') + '</div>';
-    }
+      html += probsGrid(dec, bb);
+      const ap = actualProb(st, dec.probs);
+      if (ap) html += `<div style="font-size:12px;margin-top:6px">实际动作（${esc(ap[0])}）在 advisor 里的概率 <b>${pctS(ap[1])}</b></div>`;
+      html += '<div class="muted" style="font-size:11px;margin-top:4px">尺寸是 advisor 抽象树里的底池比例；日志只记了选中动作的金额，其余尺寸不换算成筹码。</div>';
+    } else html += '<div class="muted" style="font-size:12px;margin-top:6px">这个决策没有动作概率（规则 / 兜底类决策不出概率）。</div>';
   } else if (!d.advice) html += '<div class="muted" style="font-size:12px">事件流里没有这个决策点的 advisor 记录。</div>';
   if (d.valid) html += `<div class="muted" style="font-size:12px;margin-top:6px">可选：${[d.valid.can_check ? 'check' : '', d.valid.can_call ? 'call' : '', d.valid.can_raise ? `raise ${amt(d.valid.min_raise, bb)}–${amt(d.valid.max_raise, bb)}` : ''].filter(Boolean).join(' / ')}</div>`;
   return html + '</div>';
@@ -498,7 +647,7 @@ function strengthBlock(h, st) {
     const text = parts.filter(p => p[1] >= 0.01).map(([l, p]) => `${esc(l)} ${(100 * p).toFixed(0)}%`).join(' · ');
     return `<div class="row"><span>${esc(name(x))}</span><div class="sbar">${bar}</div><span>${text || '—'}</span></div>`;
   };
-  return `<div class="strength"><h3>对手牌力估计 · ${STREET_CN[st.street]}开始时 <span class="muted" style="font-weight:normal" title="${esc(r.source || '')}">${esc(r.path || '')} / ${esc(r.range_src || '')}</span></h3>${(r.seats || []).map(row).join('')}</div>`;
+  return `<div class="strength"><h3>对手牌力估计 · ${STREET_CN[st.street]}开始时 <span class="muted" style="font-weight:normal" title="${esc(r.source || '')}">${esc(r.path || '')} / ${esc(r.range_src || '')}${r.backfill ? ' · <span title="这份日志早于 11-01，没记牌力分布，按日志里的 1326 个权重补算，规则同 advisor">按权重补算</span>' : ''}</span></h3>${(r.seats || []).map(row).join('')}</div>`;
 }
 
 function logBlock(h) {
@@ -511,7 +660,7 @@ function logBlock(h) {
     if (s.kind === 'result') { html += `<div class="st">结算</div><div class="lr ${cur}" data-step="${i}"><span>${(h.winners || []).map(w => `${esc(w.name)} 赢 ${amt(w.amount, bb)}`).join('，') || '—'}</span><span class="t">底池 ${amt(s.pot, bb)}</span></div>`; return; }
     const x = h.seats.find(y => y.seat === s.seat) || {};
     const m = s.hero && s.hero.match;
-    html += `<div class="lr ${s.hero || x.hero ? 'hero' : ''} ${cur}" data-step="${i}"><span>${esc(x.name ?? '座' + s.seat)} <span class="muted">${esc(x.pos || '')}</span> <b>${esc(lbl(s.label, bb))}</b>
+    html += `<div class="lr ${cur}" data-step="${i}"><span>${esc(x.name ?? '座' + s.seat)} <span class="muted">${esc(x.pos || '')}</span> <b>${esc(lbl(s.label, bb))}</b>
       ${m === 'diff' ? `<span class="badge diff">建议 ${esc(lbl(s.hero.advice.text, bb))}</span>` : m === 'same' ? '<span class="badge same">同建议</span>' : ''}</span>
       <span class="t">${s.think_s != null ? s.think_s.toFixed(1) + 's' : ''}</span></div>`;
   });
@@ -522,19 +671,32 @@ function resultBlock(h) {
   const bb = h.bb, pay = new Map((h.payouts || []).map(p => [p.seat, p.amount]));
   const rows = h.seats.map(x => `<tr class="${x.hero ? 'hero' : ''}"><td>${esc(x.name ?? '座' + x.seat)} <span class="muted">座${x.seat}</span></td><td class="l">${esc(x.pos || '')}</td>
     <td class="l">${x.hole && (x.hero || x.shown) ? pcs(x.hole) : x.showdown ? '<span class="muted">未亮</span>' : ''}</td>
+    <td class="l">${x.made != null ? (pay.has(x.seat) ? `<b>${MADE_CN[x.made]}</b>` : MADE_CN[x.made]) : ''}</td>
     <td>${amt(x.start, bb)}</td><td>${amt(x.committed, bb)}</td><td>${pay.has(x.seat) ? amt(pay.get(x.seat), bb) : ''}</td><td>${amt(x.final, bb)}</td>
     <td class="${x.net > 0 ? 'pos-ok' : x.net < 0 ? 'neg' : 'muted'}"><b>${sgn(x.net, bb)}</b></td></tr>`).join('');
-  return `<div style="overflow-x:auto"><table class="res"><thead><tr><th>玩家</th><th>位置</th><th>底牌</th><th>开局</th><th title="含 ante 和盲注；未跟注退回的部分也算在内">投入</th><th>分得</th><th>结束</th><th>输赢</th></tr></thead><tbody>${rows}</tbody></table></div>
+  return `<div style="overflow-x:auto"><table class="res"><thead><tr><th>玩家</th><th>位置</th><th>底牌</th><th title="摊牌时的最好五张牌">牌型</th><th>开局</th><th title="含 ante 和盲注；未跟注退回的部分也算在内">投入</th><th>分得</th><th>结束</th><th>输赢</th></tr></thead><tbody>${rows}</tbody></table></div>
     <p class="muted" style="font-size:12px">总底池 ${amt(h.total_pot, bb)}${h.outcome_kind ? ' · ' + esc(h.outcome_kind) : ''}</p>`;
 }
 
 // ---- controls
-function go(i) { if (!hand) return; step = Math.max(0, Math.min(i, hand.steps.length - 1)); render(); }
+// Playback speed: a multiple of BASE_MS per step.
+const BASE_MS = 1000, RATES = [0.5, 1, 1.5, 2, 3, 4];
+const curRate = () => { const r = +store.get('rate', 1); return RATES.includes(r) ? r : 1; };
+function setRate(r) {
+  if (!RATES.includes(r)) return;
+  store.set('rate', r);
+  document.querySelectorAll('[data-rate]').forEach(b => b.classList.toggle('on', +b.dataset.rate === r));
+  if (timer) { clearInterval(timer); timer = setInterval(tick, BASE_MS / r); }  // keep playing from here
+  if (hand && $('r-rate-note')) renderStep();
+}
+const stepRate = d => { const i = RATES.indexOf(curRate()); setRate(RATES[Math.max(0, Math.min(RATES.length - 1, i + d))]); };
+function go(i, opt) { if (!hand) return; step = Math.max(0, Math.min(i, hand.steps.length - 1)); render(opt); }
 function stop() { if (timer) { clearInterval(timer); timer = null; } }
+function tick() { if (step >= hand.steps.length - 1) { stop(); render(); } else go(step + 1); }
 function play() {
   if (timer) { stop(); render(); return; }
   if (step >= hand.steps.length - 1) step = 0;
-  timer = setInterval(() => { if (step >= hand.steps.length - 1) { stop(); render(); } else go(step + 1); }, +store.get('speed', '900'));
+  timer = setInterval(tick, BASE_MS / curRate());
   render();
 }
 function moveHand(d) {
@@ -544,6 +706,8 @@ function moveHand(d) {
   if (rows[j] && (!hand || rows[j].key !== hand.key)) openHand(rows[j].key, 0);
 }
 $('replay').addEventListener('click', e => {
+  const rb = e.target.closest('[data-rate]');
+  if (rb) { setRate(+rb.dataset.rate); return; }
   const b = e.target.closest('[data-c]');
   if (b) {
     const c = b.dataset.c;
@@ -553,12 +717,20 @@ $('replay').addEventListener('click', e => {
     return;
   }
   const r = e.target.closest('[data-step]');
-  if (r) { stop(); go(+r.dataset.step); }
+  if (r) {
+    // Keep what was clicked where it is on screen: the decision panel / caption above it change
+    // height with the step. The log is not rebuilt, so the row itself is the anchor; a row of the
+    // decision list is rebuilt, so the log box stands in for it.
+    const anchor = r.closest('#r-log') ? r : $('r-log');
+    const before = anchor && anchor.getBoundingClientRect().top;
+    stop();
+    go(+r.dataset.step, { keepLog: true });
+    if (anchor && anchor.isConnected) window.scrollBy(0, anchor.getBoundingClientRect().top - before);
+  }
 });
 $('replay').addEventListener('input', e => { if (e.target.id === 'slider') { stop(); go(+e.target.value); } });
-$('replay').addEventListener('change', e => { if (e.target.id === 'speed') { store.set('speed', e.target.value); if (timer) { stop(); play(); } } });
 document.addEventListener('keydown', e => {
-  if (e.target.matches('input[type=search], select') || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.target.matches?.('input[type=search], input[type=number], select') || e.ctrlKey || e.metaKey || e.altKey) return;
   if (!hand && !['ArrowDown', 'j'].includes(e.key)) return;
   const k = e.key;
   if (k === 'ArrowRight') { stop(); go(step + 1); }
@@ -566,13 +738,15 @@ document.addEventListener('keydown', e => {
   else if (k === 'Home') { stop(); go(0); }
   else if (k === 'End') { stop(); go(hand.steps.length - 1); }
   else if (k === ' ') play();
+  else if (k === '+' || k === '=') stepRate(1);
+  else if (k === '-' || k === '_') stepRate(-1);
   else if (k === 'ArrowDown' || k === 'j') moveHand(1);
   else if (k === 'ArrowUp' || k === 'k') moveHand(-1);
   else return;
   e.preventDefault();
 });
 
-window.addEventListener('resize', () => { if (hand) render(); });
+window.addEventListener('resize', () => { if (hand) render(); });  // shellSig includes the narrow layout
 
 // ---- start
 (async () => {
@@ -580,6 +754,13 @@ window.addEventListener('resize', () => { if (hand) render(); });
   const ui = document.querySelector(`input[name=unit][value=${u === 'bb' ? 'bb' : 'chips'}]`);
   if (ui) ui.checked = true;
   $('peek').checked = !!store.get('peek', false);
+  $('bigwin').value = store.get('bigwin', '50');
+  const mv = String(store.get('made', ''));
+  if ([...$('made').options].some(o => o.value === mv)) $('made').value = mv;
+  $('made-up').checked = !!store.get('made-up', false);
+  $('heronet').value = store.get('heronet', '50');
+  const hd = store.get('heronet-dir', 'both');
+  if ([...$('heronet-dir').options].some(o => o.value === hd)) $('heronet-dir').value = hd;
   const s = store.get('sort', 'new');
   if ([...$('sort').options].some(o => o.value === s)) $('sort').value = s;
   try { await loadList(); } catch (e) { $('list').innerHTML = `<div class="err">读不到手牌列表：${esc(e)}</div>`; return; }

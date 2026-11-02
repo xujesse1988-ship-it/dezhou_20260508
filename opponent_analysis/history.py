@@ -31,6 +31,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 
 from .adapters import wopo_raw
+from .cards import best_rank
 from .live import range_event
 from .model import STREETS
 from .platforms import PLATFORMS
@@ -42,6 +43,145 @@ EVENTS_NAME = "wopo_play_events.jsonl"
 RANGES_NAME = "wopo_ranges.jsonl"
 BOARD_LEN = {"preflop": 0, "flop": 3, "turn": 4, "river": 5}
 EVENT_TYPES = ("hand_start", "action", "hero_action", "hero_turn", "decision", "board", "dead", "result")
+
+
+# ------------------------------------------------------------------ range strength backfill
+
+# Range logs written before 2026-11-01 (562cca4) carry each seat's 1326 weights but no `strength`
+# mix. range_strength recomputes it from the weights, following tools/openpoker_advisor.rs
+# range_strength exactly (same classes, same rules); the advisor used the unrounded weights, the
+# log holds them x1e6 rounded, so the result can differ in the 4th decimal.
+STRENGTH_CLASSES = ("straight_flush", "quads", "full_house", "flush", "straight", "trips", "two_pair",
+                    "top_pair", "pair", "nothing")
+_RANK = {r: i for i, r in enumerate("23456789TJQKA")}
+_class_cache: dict = {}
+
+
+def _straight_high(ranks: set) -> Optional[int]:
+    rs = set(ranks)
+    if 12 in rs:
+        rs.add(-1)  # wheel: A counts as 1
+    for hi in range(12, 2, -1):
+        if all(r in rs for r in range(hi - 4, hi + 1)):
+            return hi
+    return None
+
+
+def hand_category(cards: list[str]) -> tuple[int, int]:
+    """5-7 cards -> (category, pair rank). Category as src/eval.rs HandCategory: 0 high card,
+    1 one pair, ..., 8 straight flush, 9 royal flush (A-high straight flush). Pair rank: the
+    highest rank seen exactly twice (used for one pair), -1 if none."""
+    ranks = [_RANK[c[0].upper()] for c in cards]
+    suits: dict[str, list[int]] = {}
+    for c, r in zip(cards, ranks):
+        suits.setdefault(c[1].lower(), []).append(r)
+    counts: dict[int, int] = {}
+    for r in ranks:
+        counts[r] = counts.get(r, 0) + 1
+    pair = max((r for r, n in counts.items() if n == 2), default=-1)
+    flush = next((rs for rs in suits.values() if len(rs) >= 5), None)
+    if flush is not None:
+        sf = _straight_high(set(flush))
+        if sf is not None:
+            return (9 if sf == 12 else 8), pair
+    ns = sorted(counts.values(), reverse=True)
+    if ns[0] == 4:
+        return 7, pair
+    if ns[0] == 3 and len(ns) > 1 and ns[1] >= 2:
+        return 6, pair
+    if flush is not None:
+        return 5, pair
+    if _straight_high(set(ranks)) is not None:
+        return 4, pair
+    if ns[0] == 3:
+        return 3, pair
+    if ns[0] == 2 and len(ns) > 1 and ns[1] == 2:
+        return 2, pair
+    if ns[0] == 2:
+        return 1, pair
+    return 0, pair
+
+
+def _board_category(board: list[str]) -> int:
+    if len(board) == 5:
+        return hand_category(board)[0]
+    counts: dict[int, int] = {}
+    for c in board:
+        counts[_RANK[c[0].upper()]] = counts.get(_RANK[c[0].upper()], 0) + 1
+    ns = sorted(counts.values(), reverse=True)
+    if ns[0] == 4:
+        return 7
+    if ns[0] == 3:
+        return 3
+    if ns[0] == 2:
+        return 2 if len(ns) > 1 and ns[1] == 2 else 1
+    return 0
+
+
+def _combo_classes(combos: tuple, board: tuple, dead: tuple) -> list[int]:
+    """Strength class index per combo (-1 = blocked by the board or the dead cards), cached per
+    (board, dead): every seat of a solve, and every reload of the file, shares it."""
+    key = (combos, board, dead)
+    hit = _class_cache.get(key)
+    if hit is not None:
+        return hit
+    if len(_class_cache) > 4096:
+        _class_cache.clear()
+    b = list(board)
+    used = {c.lower() for c in board} | {c.lower() for c in dead}
+    board_cat = _board_category(b)
+    board_top = max(_RANK[c[0].upper()] for c in b)
+    out = []
+    for combo in combos:
+        h = [combo[:2], combo[2:]]
+        if h[0].lower() in used or h[1].lower() in used:
+            out.append(-1)
+            continue
+        cat, pair = hand_category(h + b)
+        if cat <= board_cat:
+            out.append(9)  # nothing better than the board itself
+        elif cat >= 8:
+            out.append(0)
+        elif cat == 1:
+            out.append(7 if pair >= board_top else 8)
+        else:
+            out.append({7: 1, 6: 2, 5: 3, 4: 4, 3: 5, 2: 6, 0: 9}[cat])
+    _class_cache[key] = out
+    return out
+
+
+def range_strength(weights: list, combos: tuple, board: list, dead: list) -> Optional[dict]:
+    """One seat's weights -> {class: probability} (non-zero classes, 4 decimals), or None
+    preflop / when every weighted combo is blocked."""
+    if len(board) < 3 or len(weights) != len(combos):
+        return None
+    cls = _combo_classes(tuple(combos), tuple(board), tuple(dead))
+    acc = [0.0] * len(STRENGTH_CLASSES)
+    for w, k in zip(weights, cls):
+        if k >= 0 and w > 0:
+            acc[k] += w
+    total = sum(acc)
+    if total <= 0:
+        return None
+    return {name: round(a / total * 1e4) / 1e4 for name, a in zip(STRENGTH_CLASSES, acc) if a > 0}
+
+
+def backfill_strength(rec: dict, combos: Optional[list]) -> bool:
+    """Adds `strength` to the opponent seats of a range-log line that lacks it (older logs).
+    Returns True when anything was filled. Lines that already have it are left alone."""
+    if not combos or not isinstance(rec, dict) or not isinstance(rec.get("board"), list) or len(rec["board"]) < 3:
+        return False
+    filled = False
+    for seat in rec.get("seats") or []:
+        if not isinstance(seat, dict) or seat.get("hero") or isinstance(seat.get("strength"), dict):
+            continue
+        if not isinstance(seat.get("range"), list):
+            continue
+        st = range_strength(seat["range"], combos, rec["board"], list(rec.get("hole") or []))
+        if st is not None:
+            seat["strength"] = st
+            filled = True
+    return filled
 
 
 # ------------------------------------------------------------------ one hand -> steps
@@ -219,12 +359,20 @@ def build_hand(rec: dict, events: Optional[list[dict]] = None, ranges: Optional[
                       returned=put_in - total_pot if isinstance(total_pot, int) and put_in > total_pot else 0))
 
     seats = []
+    showdown = len(live) >= 2
     for s in dealt:
         hole = list(rec.get("hole") or []) if s == hero else shown.get(s)
+        # Made hand at showdown (0 high card .. 8 straight flush), for seats whose cards are known.
+        made = None
+        if showdown and s in live and hole and len(hole) == 2 and len(board) == 5:
+            try:
+                made = best_rank(hole + board)[0]
+            except (ValueError, IndexError):
+                notes.append(f"座{s} 的牌算不出牌型：{hole} {board}")
         seats.append({"seat": s, "name": names.get(s), "pos": positions.get(s), "hero": s == hero, "start": start.get(s),
                       "final": final.get(s), "net": (final[s] - start[s]) if s in final and s in start else None,
                       "hole": hole or None, "shown": s in shown, "committed": committed[s],
-                      "showdown": s in live and len(live) >= 2})
+                      "showdown": s in live and showdown, "made": made})
 
     check = None
     try:
@@ -258,6 +406,14 @@ def summarize(h: dict) -> dict:
     pfr = any(st["street"] == "preflop" and st["total"] > 0 and st["label"].startswith(("raise", "bet"))
               for st in hero_steps)
     decided = [st["hero"] for st in hero_steps if st.get("hero")]
+    # Biggest winner's net: the server's winners[].amount (final - start); the seats' own
+    # final - start only as a fallback, it is wrong when a stack was reset mid-hand (hand 379).
+    wins = [w["amount"] for w in h["winners"] if isinstance(w.get("amount"), int)]
+    nets = [x["net"] for x in h["seats"] if x["net"] is not None]
+    win_max = max(wins) if wins else max(nets, default=None)
+    # Made hands of the seats that won at showdown (cards known: shown, or our own).
+    made = {x["seat"]: x["made"] for x in h["seats"] if x["made"] is not None}
+    win_made = sorted({made[w["seat"]] for w in h["winners"] if w.get("seat") in made}, reverse=True)
     last_action_street = max((STREETS.index(st["street"]) for st in h["steps"] if st["kind"] == "action"), default=0)
     return {
         "key": h["key"], "hand_id": h["hand_id"], "run": h["run"], "ts": h["ts"], "table_id": h["table_id"],
@@ -266,7 +422,8 @@ def summarize(h: dict) -> dict:
         "hero_net": hero and hero["net"], "hero_vpip": vpip, "hero_pfr": pfr,
         "hero_folded_pre": bool(hero_steps) and hero_steps[0]["action"] == "fold" and hero_steps[0]["street"] == "preflop",
         "showdown": any(x["showdown"] for x in h["seats"]), "shown": sum(1 for x in h["seats"] if x["shown"]),
-        "street": STREETS[last_action_street], "pot": h["total_pot"],
+        "street": STREETS[last_action_street], "pot": h["total_pot"], "win_max": win_max,
+        "win_made": win_made, "has_ranges": bool(h["ranges"]),
         "decisions": len(decided), "diff": sum(1 for d in decided if d.get("match") == "diff"),
         "no_advice": sum(1 for d in decided if d.get("match") is None),
         "players": [x["name"] for x in h["seats"] if not x["hero"]],
@@ -324,11 +481,17 @@ def load_run(hh_path: str) -> dict:
         if isinstance(e, dict) and e.get("type") in EVENT_TYPES and e.get("hand_id") is not None:
             events.setdefault(str(e["hand_id"]), []).append(e)
     ranges: dict[str, dict] = {}
+    combos = None
     for rec in _read_jsonl(os.path.join(d, RANGES_NAME), counts, "ranges"):
+        if isinstance(rec, dict) and isinstance(rec.get("combos"), list):  # header: combo order
+            combos = rec["combos"]
+            continue
+        filled = backfill_strength(rec, combos)
         ev = range_event(rec)
         if ev is not None:  # the latest solve of a street wins, as on the live page
+            counts["ranges_backfilled"] += int(filled)
             ranges.setdefault(str(ev["hand_id"]), {})[ev.get("street")] = {
-                k: ev.get(k) for k in ("street", "board", "path", "range_src", "source", "seats")}
+                **{k: ev.get(k) for k in ("street", "board", "path", "range_src", "source", "seats")}, "backfill": filled}
     hands, seen = [], set()
     for rec in _read_jsonl(hh_path, counts, "hh"):
         if not isinstance(rec, dict) or "wopo_hh" not in rec:
@@ -347,7 +510,8 @@ def load_run(hh_path: str) -> dict:
                           "error": f"{type(e).__name__}: {e}"})
     dead = [hid for hid, evs in events.items() if hid not in seen and any(e.get("type") == "hand_start" for e in evs)]
     counts["hands"] = len(hands)
-    return {"run": run, "path": hh_path, "hands": hands, "dead": dead, "counts": dict(counts),
+    st = _sig(hh_path)
+    return {"run": run, "path": hh_path, "mtime": st[1] / 1e9 if st else None, "hands": hands, "dead": dead, "counts": dict(counts),
             "events": os.path.exists(os.path.join(d, EVENTS_NAME)), "ranges": os.path.exists(os.path.join(d, RANGES_NAME))}
 
 
@@ -385,7 +549,7 @@ class History:
         rows, runs, errors = [], [], []
         for p in sorted(self.runs):
             run = self.runs[p][1]
-            runs.append({k: run[k] for k in ("run", "path", "counts", "events", "ranges")} | {"dead": len(run["dead"])})
+            runs.append({k: run[k] for k in ("run", "path", "mtime", "counts", "events", "ranges")} | {"dead": len(run["dead"])})
             for h in run["hands"]:
                 key = h["hand_id"] if h["hand_id"] not in by_key else f"{h['hand_id']}@{run['run']}"
                 h["key"] = key
@@ -395,6 +559,7 @@ class History:
                 else:
                     rows.append(summarize(h))
         rows.sort(key=lambda r: (r["ts"] or "", r["hand_id"]), reverse=True)
+        runs.sort(key=lambda r: (r["mtime"] or 0, r["path"]), reverse=True)  # newest hh file first
         self.by_key = by_key
         self.listing = {"hands": rows, "runs": runs, "errors": errors, "patterns": self.patterns}
 
