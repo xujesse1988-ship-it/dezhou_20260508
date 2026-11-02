@@ -1996,6 +1996,35 @@ fn cross_street_posterior_range(
     {
         return None;
     }
+    let live: Vec<bool> = next_root_state
+        .players()
+        .iter()
+        .map(|p| p.hole_cards.is_some())
+        .collect();
+    // 导航失配 → None（退档一）。
+    condition_on_line(prev, prev_within, next_board, &live, holes, lambda, hero)
+}
+
+/// 沿 `solved` 子树上的真实动作线 `line` 对它的 root range 做贝叶斯条件化：各座 reach = 子树解所条件化的
+/// root range（`None` = 均匀）× 该座沿线每个决策的 σ(实际动作 | 牌)（子树 average strategy）。撞 `mask_board`
+/// 的牌 reach 0；`live[seat] = false` 的座返回空向量；整列 σ 塌零（< [`CROSS_STREET_DEAD_COLUMN_EPS`]）跳过该列；
+/// 归一后对手座按 `lambda` 混均匀（hero 不混，[`mix_lambda_for_seat`]）。动作线在子树上走不通 → `None`。
+/// [`cross_street_posterior_range`]（上一街整条线 → 下一街先验）与 [`current_street_ranges`]（本街到当前点）共用。
+fn condition_on_line(
+    solved: &SolvedSubgame,
+    line: &[(Action, bool)],
+    mask_board: &[Card],
+    live: &[bool],
+    holes: &[[Card; 2]],
+    lambda: f64,
+    hero: PlayerId,
+) -> Option<Vec<Vec<f64>>> {
+    let prev = solved;
+    let prev_game = prev.trainer.game();
+    let prev_root = prev_game.template();
+    let prev_board: Vec<Card> = prev_root.board().to_vec();
+    let prev_within = line;
+    let next_board = mask_board;
     // —— 沿上一街子树实际动作线收集决策三元组（导航失配 → 退档一）——
     let decisions =
         subtree_decisions_on_real_line(prev_game.subtree(), &prev.sub_abs, prev_root, prev_within)
@@ -2006,13 +2035,12 @@ fn cross_street_posterior_range(
     let collides = |h: &[Card; 2]| {
         next_board_set.contains(&h[0].to_u8()) || next_board_set.contains(&h[1].to_u8())
     };
-    let players = next_root_state.players();
     let subtree = prev_game.subtree();
     let mut col = vec![0.0_f64; holes.len()]; // 每决策列 σ(tag|hole) 临时缓冲（复用）。
-    let ranges: Vec<Vec<f64>> = (0..players.len())
+    let ranges: Vec<Vec<f64>> = (0..live.len())
         .map(|seat| {
-            if players[seat].hole_cards.is_none() {
-                return Vec::new(); // 本街已弃牌座：range 不被读。
+            if !live[seat] {
+                return Vec::new(); // 已弃牌座：range 不被读。
             }
             // prior（reach 起点）：子树解 ranges 有则取该座，否则 uniform（1.0）；撞 board → 0。
             let mut reach: Vec<f64> = (0..holes.len())
@@ -2080,6 +2108,37 @@ fn cross_street_posterior_range(
         })
         .collect();
     Some(ranges)
+}
+
+/// 兜底估胜率用（advisor 搜索读数被拒时的 `fallback_with_floor`）：缓存主 slot 的解若是**本手本街**的
+/// （`hand_seed` 相同、子树 board 与 `root_state.board()` 相同），沿本街真实动作线 `within` 条件化，返回
+/// 当前点各座范围（下标 = 树座，内层对齐 [`all_hole_combos`]；本街起点前已弃牌的座为空）。root range 已含
+/// 均匀混合，这里不再混。解不是本街的 / 导航走不通 → `None`。读数被拒（如 hero 访问数不足）不影响对手
+/// 范围：对手沿线各节点被所有牌遍历，比 hero 单个信息集可靠得多。
+pub fn current_street_ranges(
+    cache: &SubgameSolveCache,
+    root_state: &GameState,
+    within: &[(Action, bool)],
+    hand_seed: u64,
+) -> Option<Vec<Vec<f64>>> {
+    let cur = cache.current()?;
+    if cur.hand_seed != hand_seed || cur.trainer.game().template().board() != root_state.board() {
+        return None;
+    }
+    let live: Vec<bool> = root_state
+        .players()
+        .iter()
+        .map(|p| p.hole_cards.is_some())
+        .collect();
+    condition_on_line(
+        cur,
+        within,
+        root_state.board(),
+        &live,
+        &all_hole_combos(),
+        0.0,
+        0,
+    )
 }
 
 // ===========================================================================

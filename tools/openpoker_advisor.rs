@@ -106,9 +106,9 @@ use poker::training::opponent_profile::{
 };
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
-    all_hole_combos, chen_score, is_blueprint_cropped_err, is_low_hero_visits_err,
-    set_subgame_debug, should_search, subgame_search_cached_tilt, subgame_search_prewarm,
-    subgame_search_unanchored_cached_cross_exploit,
+    all_hole_combos, chen_score, current_street_ranges, is_blueprint_cropped_err,
+    is_low_hero_visits_err, set_subgame_debug, should_search, subgame_search_cached_tilt,
+    subgame_search_prewarm, subgame_search_unanchored_cached_cross_exploit,
     subgame_search_unanchored_prewarm_cross_exploit, synced_prefix_decisions, AnchoredTilt,
     ExploitPrior, ExploitShape, PrefixReach, ResolveRoot, SearchTrigger, SolveView,
     SubgameSearchConfig, SubgameSolveCache,
@@ -393,6 +393,12 @@ struct Response {
     /// 搜索路径（含放弃搜索）填；blueprint / 其余兜底恒 `None`（serde skip）。
     #[serde(skip_serializing_if = "Option::is_none")]
     menu: Option<String>,
+    /// 搜索读数失败落兜底时，hero 对当前点对手范围的胜率（[`fallback_range_equity`]；拿不到范围不填）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range_equity: Option<f64>,
+    /// 算 `range_equity` 时的在手对手数（折扣按人数乘）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range_equity_opps: Option<usize>,
 }
 
 /// PM-17 单个决策点的遥测。浮点四舍五入到 4 位小数（只影响落盘显示）。
@@ -2914,6 +2920,7 @@ fn decide_with(
                 hole,
                 &board,
                 preflop_pot_odds(req, &solver_cfg, scale, &smap, my_seat_solver, hole),
+                None,
                 "fallback:limp_as_fold_no_limp".into(),
             );
         }
@@ -2987,6 +2994,7 @@ fn decide_with(
                 hole,
                 &board,
                 pre_pot_odds,
+                None,
                 format!("fallback:{reason}"),
             );
         }
@@ -3038,6 +3046,7 @@ fn decide_with(
                 hole,
                 &board,
                 None,
+                None,
                 format!("fallback:blueprint_cropped:{}", street_label(street)),
             );
         }
@@ -3060,6 +3069,7 @@ fn decide_with(
             hole,
             &board,
             pot_odds,
+            None,
             "fallback:blueprint_placeholder".into(),
         );
     }
@@ -3142,6 +3152,7 @@ fn decide_with(
                     &req.valid,
                     hole,
                     &board,
+                    None,
                     None,
                     format!("search_giveup:build:{reason}"),
                 );
@@ -3282,14 +3293,28 @@ fn decide_with(
                         d
                     }
                     None => {
-                        // auth 已建（此 Err 分支未 move 走）→ 喂底池赔率 floor。
+                        // auth 已建（此 Err 分支未 move 走）→ 喂底池赔率 floor + 范围胜率 floor（本街解
+                        // 在缓存里时：对手沿本街动作线条件化后的范围）。
+                        let range_eq = fallback_range_equity(
+                            solve_cache,
+                            root_state,
+                            &within,
+                            hand_seed,
+                            &auth,
+                            my_seat_solver.0 as PlayerId,
+                            hole,
+                            &board,
+                        );
                         let mut resp = fallback_with_floor(
                             &req.valid,
                             hole,
                             &board,
                             pot_odds_from_auth(&auth, &solver_cfg),
+                            range_eq,
                             giveup_source("unsolved", &reason),
                         );
+                        resp.range_equity = range_eq.map(|r| r.eq);
+                        resp.range_equity_opps = range_eq.map(|r| r.opps);
                         resp.hero_visits = hero_visits;
                         resp.menu = Some(menu);
                         return resp;
@@ -3373,6 +3398,7 @@ fn decide_with(
                 hole,
                 &board,
                 pot_odds,
+                None,
                 "fallback:outgoing_failed".into(),
             );
         }
@@ -3823,6 +3849,13 @@ fn draw_odds_floor_hit(hole: [Card; 2], board: &[Card], po: &PotOdds) -> bool {
     hit * DRAW_CALL_EQUITY_DISCOUNT >= need
 }
 
+/// 范围胜率 floor 判据：面对下注，`eq × RANGE_EQUITY_CALL_DISCOUNT^对手数 ≥ to_call / (pot + to_call)`（pot = hero
+/// 跟注后能赢到的底池，[`PotOdds`]）。
+fn range_equity_floor_hit(re: RangeEquity, po: &PotOdds) -> bool {
+    let discount = RANGE_EQUITY_CALL_DISCOUNT.powi(re.opps.max(1) as i32);
+    po.to_call > 0 && re.eq * discount >= po.to_call as f64 / (po.pot + po.to_call) as f64
+}
+
 /// preflop 失同步/兜底点的底池赔率 floor 输入：真栈重放（limp 池真栈合法可建；off-stack 等
 /// 建不了 → `None` 不触发，安全降级，同现有 postflop floor「无 auth 不触发」）→
 /// [`pot_odds_from_auth`]。**仅 preflop 调**（board 必空；postflop 失同步走脱影子搜索或维持
@@ -3850,14 +3883,175 @@ fn preflop_pot_odds(
     .and_then(|(auth, _, _, _)| pot_odds_from_auth(&auth, solver_cfg))
 }
 
+/// 范围胜率 floor 的折扣，**每个在手对手乘一次**（2026-11-02，实盘 000754：转牌顶对 + 同花听牌面对全下，搜索因
+/// hero 访问数不足放弃，旧听牌 floor 只按同花 9 张算命中率、丢掉顶对的胜率而弃牌）。范围来自模型（对手按均衡打、
+/// 翻前范围常估宽），往往比真人面对下注时的范围弱，打折后再和底池赔率比（单挑同 [`DRAW_CALL_EQUITY_DISCOUNT`]）。
+/// 多人时每个对手的范围都偏弱、误差叠加，后面的人还可能再加注：000730 底对面对一注一加，按两人范围算 42%，
+/// 只打一次折会跟，打两次折（0.72）弃。
+const RANGE_EQUITY_CALL_DISCOUNT: f64 = 0.85;
+
+/// 兜底用的范围胜率（[`fallback_range_equity`]）：胜率 + 算它时的在手对手数（折扣按人数乘，
+/// [`range_equity_floor_hit`]）。
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct RangeEquity {
+    eq: f64,
+    opps: usize,
+}
+
+/// 范围胜率的蒙特卡洛局数（种子固定，同一请求同一结果；2 万局的标准误差约 0.35 个百分点）。
+const RANGE_EQUITY_TRIALS: usize = 20_000;
+
+/// hero 对一组对手范围的胜率（打平按人数分）：按权重抽每个对手的底牌（与 hero、公共牌、先抽的对手撞牌就重抽），
+/// 发完剩余公共牌后比牌。`opps` = 各在手对手的范围（对齐 [`all_hole_combos`]，权重不必归一）。没有对手 / 某个
+/// 范围全零 / 一半以上的局抽不出不撞牌的组合 → `None`。
+fn range_equity(hole: [Card; 2], board: &[Card], opps: &[&[f64]], seed: u64) -> Option<f64> {
+    use poker::RngSource as _;
+    if opps.is_empty() || !(3..=5).contains(&board.len()) {
+        return None;
+    }
+    let holes = all_hole_combos();
+    let mut dead = [false; 52];
+    for c in hole.iter().chain(board) {
+        dead[c.to_u8() as usize] = true;
+    }
+    // 各对手的累计权重（撞 hero / 公共牌的组合权重 0）。
+    let mut cdfs: Vec<Vec<f64>> = Vec::with_capacity(opps.len());
+    for r in opps {
+        if r.len() != holes.len() {
+            return None;
+        }
+        let mut acc = 0.0;
+        let cdf: Vec<f64> = holes
+            .iter()
+            .zip(r.iter())
+            .map(|(h, &w)| {
+                if w > 0.0
+                    && w.is_finite()
+                    && !dead[h[0].to_u8() as usize]
+                    && !dead[h[1].to_u8() as usize]
+                {
+                    acc += w;
+                }
+                acc
+            })
+            .collect();
+        if acc <= 0.0 {
+            return None;
+        }
+        cdfs.push(cdf);
+    }
+    let ev = NaiveHandEvaluator;
+    let mut rng = ChaCha20Rng::from_seed(seed);
+    let unit = |x: u64| (x >> 11) as f64 / (1u64 << 53) as f64;
+    let mut cards = [hole[0]; 7];
+    for (i, c) in board.iter().enumerate() {
+        cards[2 + i] = *c;
+    }
+    let (mut share, mut valid) = (0.0_f64, 0usize);
+    let mut opp_holes: Vec<[Card; 2]> = vec![[hole[0], hole[1]]; opps.len()];
+    'trial: for _ in 0..RANGE_EQUITY_TRIALS {
+        let mut used = dead;
+        for (k, cdf) in cdfs.iter().enumerate() {
+            let total = *cdf.last().expect("非空");
+            let mut tries = 0;
+            loop {
+                let x = unit(rng.next_u64()) * total;
+                let i = cdf.partition_point(|&c| c <= x).min(cdf.len() - 1);
+                let h = holes[i];
+                if !used[h[0].to_u8() as usize] && !used[h[1].to_u8() as usize] {
+                    used[h[0].to_u8() as usize] = true;
+                    used[h[1].to_u8() as usize] = true;
+                    opp_holes[k] = h;
+                    break;
+                }
+                tries += 1;
+                if tries >= 50 {
+                    continue 'trial;
+                }
+            }
+        }
+        // 发完剩余公共牌（从没用过的牌里不放回随机取）。
+        for slot in board.len()..5 {
+            loop {
+                let c = (rng.next_u64() % 52) as u8;
+                if !used[c as usize] {
+                    used[c as usize] = true;
+                    cards[2 + slot] = Card::from_u8(c).expect("0..52");
+                    break;
+                }
+            }
+        }
+        cards[0] = hole[0];
+        cards[1] = hole[1];
+        let mine = ev.eval7(&cards);
+        let (mut best_opp, mut ties) = (None, 0usize);
+        for h in &opp_holes {
+            let mut c = cards;
+            c[0] = h[0];
+            c[1] = h[1];
+            let r = ev.eval7(&c);
+            match best_opp {
+                Some(b) if r < b => {}
+                Some(b) if r == b => ties += 1,
+                _ => {
+                    best_opp = Some(r);
+                    ties = 1;
+                }
+            }
+        }
+        let b = best_opp.expect("至少一个对手");
+        share += if mine > b {
+            1.0
+        } else if mine == b {
+            1.0 / (ties + 1) as f64
+        } else {
+            0.0
+        };
+        valid += 1;
+    }
+    (valid * 2 >= RANGE_EQUITY_TRIALS).then(|| share / valid as f64)
+}
+
+/// 搜索读数失败时，hero 对**当前点**各在手对手范围的胜率（[`range_equity`]）。范围 = 缓存里本手本街的子树解沿
+/// 本街真实动作线条件化（[`current_street_ranges`]；读数被拒——如 hero 访问数不足——时解仍在缓存里）。没有本街的
+/// 解（建树失败 / 节点超限）/ 动作线走不通 → `None`（兜底退回旧的听牌 floor）。
+#[allow(clippy::too_many_arguments)]
+fn fallback_range_equity(
+    cache: &SubgameSolveCache,
+    root_state: &GameState,
+    within: &[(Action, bool)],
+    hand_seed: u64,
+    auth: &GameState,
+    hero: PlayerId,
+    hole: [Card; 2],
+    board: &[Card],
+) -> Option<RangeEquity> {
+    let ranges = current_street_ranges(cache, root_state, within, hand_seed)?;
+    let opps: Vec<&[f64]> = auth
+        .players()
+        .iter()
+        .enumerate()
+        .filter(|&(s, p)| s != hero as usize && p.status != poker::PlayerStatus::Folded)
+        .map(|(s, _)| ranges.get(s).map(Vec::as_slice))
+        .collect::<Option<Vec<_>>>()?;
+    let eq = range_equity(hole, board, &opps, hand_seed ^ within.len() as u64);
+    dlog!("fallback range_equity: opps={} eq={eq:?}", opps.len());
+    eq.map(|eq| RangeEquity {
+        eq,
+        opps: opps.len(),
+    })
+}
+
 /// 决策阶段兜底动作 + 「别扔好牌」地板（用户 2026-06-14；2026-06-15 加底池赔率 floor）。
 /// **只在面对下注**（不能免费 check 且能 call）时把 fold 改成 call，两条 floor 依次判：
 ///  ① preflop 拿 AA/KK/QQ/JJ/AK/AQ（[`limp_hand_tier`]==2）→ call；postflop 手牌坚果度
 ///     **>** [`NUT_CALL_THRESHOLD`] → call。
 ///  ② ①不命中时看底池赔率（[`PotOdds`]，2026-06-15 用户加）：`pot/to_call > 4` 且
 ///     `to_call ≤ 30BB` → call（`pot_odds=None` 的兜底点不触发，行为同改前）。
-///  ③ ①②都不命中时看强听牌（[`draw_odds_floor_hit`]，2026-10-21 加）：翻牌 / 转牌强听牌且
-///     折扣后命中率够赔率 → call（同样要 `pot_odds`）。
+///  ③ ①②都不命中时：有范围胜率（`range_eq`，[`fallback_range_equity`]，2026-11-02 加）→ 胜率 ×
+///     [`RANGE_EQUITY_CALL_DISCOUNT`] ≥ 需要的胜率就 call（`:range_equity_call`），它已含成牌和听牌，替代下面
+///     的听牌 floor；没有范围胜率 → 强听牌 floor（[`draw_odds_floor_hit`]，2026-10-21 加）：翻牌 / 转牌
+///     强听牌且折扣后命中率够赔率 → call（同样要 `pot_odds`）。
 /// 其余一律原 check-when-free（能 check 就 check、否则 fold——紧、不漏筹码）；能免费 check 的
 /// 局面不为这几条地板主动下注（用户只要「别扔/跟注」）。命中时 `source` 在 caller 给的完整
 /// source 后追加 `:premium_call` / `:nut_call`（①）、`:pot_odds_call`（②）或 `:draw_call`（③），**前缀不变**
@@ -3868,6 +4062,7 @@ fn fallback_with_floor(
     hole: [Card; 2],
     board: &[Card],
     pot_odds: Option<PotOdds>,
+    range_eq: Option<RangeEquity>,
     source: String,
 ) -> Response {
     if !valid.can_check && valid.can_call {
@@ -3877,13 +4072,16 @@ fn fallback_with_floor(
         } else {
             (current_board_nuttiness(hole, board) > NUT_CALL_THRESHOLD).then_some("nut_call")
         };
-        // ② 底池赔率（①不命中才看）；③ 强听牌（①②都不命中才看）。
+        // ② 底池赔率（①不命中才看）；③ 范围胜率，没有时退强听牌（①②都不命中才看）。
         let suffix = nut
             .or_else(|| pot_odds.filter(pot_odds_floor_hit).map(|_| "pot_odds_call"))
-            .or_else(|| {
-                pot_odds
+            .or_else(|| match range_eq {
+                Some(re) => pot_odds
+                    .filter(|po| range_equity_floor_hit(re, po))
+                    .map(|_| "range_equity_call"),
+                None => pot_odds
                     .filter(|po| draw_odds_floor_hit(hole, board, po))
-                    .map(|_| "draw_call")
+                    .map(|_| "draw_call"),
             });
         if let Some(sfx) = suffix {
             return Response {
@@ -4881,6 +5079,7 @@ fn decide_search_unanchored(
                 hole,
                 board,
                 None,
+                None,
                 format!("search_giveup:unanchored_build:{reason}"),
             );
         }
@@ -4911,6 +5110,7 @@ fn decide_search_unanchored(
             hole,
             board,
             pot_odds_from_auth(&auth, solver_cfg),
+            None,
             format!("fallback:{shadow_reason}"),
         );
     }
@@ -5027,17 +5227,30 @@ fn decide_search_unanchored(
         Ok(d) => d,
         Err(reason) => {
             // auth 已建（真栈河牌决策态）→ 喂底池赔率 floor（用户场景：河牌 giveup 被它接住）。
-            // 访问量门槛拒读也走这里：脱锚路径没有 blueprint 节点可退。
+            // 访问量门槛拒读也走这里：脱锚路径没有 blueprint 节点可退。范围胜率 floor 同锚定路径。
+            let range_eq = fallback_range_equity(
+                solve_cache,
+                &round_start,
+                &within,
+                hand_seed,
+                &auth,
+                my_seat_solver.0 as PlayerId,
+                hole,
+                board,
+            );
             let mut resp = fallback_with_floor(
                 &req.valid,
                 hole,
                 board,
                 pot_odds_from_auth(&auth, solver_cfg),
+                range_eq,
                 format!(
                     "{}{coef_mismatch_tag}",
                     giveup_source("unanchored", &reason)
                 ),
             );
+            resp.range_equity = range_eq.map(|r| r.eq);
+            resp.range_equity_opps = range_eq.map(|r| r.opps);
             resp.hero_visits = hero_visits;
             resp.menu = Some(menu);
             return resp;
@@ -5084,6 +5297,7 @@ fn decide_search_unanchored(
                 hole,
                 board,
                 pot_odds_from_auth(&auth, solver_cfg),
+                None,
                 "fallback:outgoing_failed".into(),
             )
         }
@@ -9557,7 +9771,14 @@ mod tests {
             ("Ah", "Qd"),
             ("As", "Qs"),
         ] {
-            let r = fallback_with_floor(&facing_bet, hole(a, b), &[], None, "fallback:x".into());
+            let r = fallback_with_floor(
+                &facing_bet,
+                hole(a, b),
+                &[],
+                None,
+                None,
+                "fallback:x".into(),
+            );
             assert_eq!(r.action, "call", "{a}{b} 面对下注须 call，得 {r:?}");
             assert_eq!(
                 r.source, "fallback:x:premium_call",
@@ -9566,12 +9787,26 @@ mod tests {
         }
         // 非 premium（TT / KQo / 72o）面对下注 → fold（前缀不变、无后缀）。
         for (a, b) in [("Th", "Tc"), ("Kh", "Qd"), ("7h", "2d")] {
-            let r = fallback_with_floor(&facing_bet, hole(a, b), &[], None, "fallback:x".into());
+            let r = fallback_with_floor(
+                &facing_bet,
+                hole(a, b),
+                &[],
+                None,
+                None,
+                "fallback:x".into(),
+            );
             assert_eq!(r.action, "fold", "{a}{b} 非 premium 须 fold，得 {r:?}");
             assert_eq!(r.source, "fallback:x", "{a}{b} 不该加后缀，得 {r:?}");
         }
         // AA 但能免费 check → check（地板只改 fold，不为它主动下注）。
-        let r = fallback_with_floor(&free, hole("As", "Ad"), &[], None, "fallback:x".into());
+        let r = fallback_with_floor(
+            &free,
+            hole("As", "Ad"),
+            &[],
+            None,
+            None,
+            "fallback:x".into(),
+        );
         assert_eq!(r.action, "check", "免费局面须 check，得 {r:?}");
         assert_eq!(r.source, "fallback:x", "免费 check 不加后缀，得 {r:?}");
 
@@ -9587,6 +9822,7 @@ mod tests {
             &facing_bet,
             royal_hole,
             &royal_board,
+            None,
             None,
             "search_giveup:unsolved:foo".into(),
         );
@@ -9607,6 +9843,7 @@ mod tests {
             trash_hole,
             &royal_board,
             None,
+            None,
             "fallback:y".into(),
         );
         assert_eq!(r.action, "fold", "空气面对下注须 fold，得 {r:?}");
@@ -9619,7 +9856,14 @@ mod tests {
             "broadway 顶 set 须 ≥ 阈值，得 {}",
             current_board_nuttiness(set_hole, &set_board)
         );
-        let r = fallback_with_floor(&facing_bet, set_hole, &set_board, None, "fallback:z".into());
+        let r = fallback_with_floor(
+            &facing_bet,
+            set_hole,
+            &set_board,
+            None,
+            None,
+            "fallback:z".into(),
+        );
         assert_eq!(r.action, "call", "顶 set 接近坚果须 call，得 {r:?}");
         assert_eq!(r.source, "fallback:z:nut_call", "得 {r:?}");
     }
@@ -9654,6 +9898,7 @@ mod tests {
             hole("4h", "5h"),
             &board45,
             None,
+            None,
             "search_giveup:unanchored:foo".into(),
         );
         assert_eq!(r.action, "call", "4h5h >93% 须 call，得 {r:?}");
@@ -9672,7 +9917,7 @@ mod tests {
             to_call: 100,
             big_blind: 20,
         });
-        let r = fallback_with_floor(&facing_bet, air, &air_board, po, "fallback:g".into());
+        let r = fallback_with_floor(&facing_bet, air, &air_board, po, None, "fallback:g".into());
         assert_eq!(r.action, "call", "好赔率小注须 call，得 {r:?}");
         assert_eq!(r.source, "fallback:g:pot_odds_call", "得 {r:?}");
 
@@ -9682,7 +9927,14 @@ mod tests {
             to_call: 100,
             big_blind: 20,
         });
-        let r = fallback_with_floor(&facing_bet, air, &air_board, exactly4, "fallback:g".into());
+        let r = fallback_with_floor(
+            &facing_bet,
+            air,
+            &air_board,
+            exactly4,
+            None,
+            "fallback:g".into(),
+        );
         assert_eq!(r.action, "fold", "赔率恰 4:1（非 >4）须 fold，得 {r:?}");
         assert_eq!(r.source, "fallback:g", "未命中不加后缀，得 {r:?}");
 
@@ -9692,7 +9944,14 @@ mod tests {
             to_call: 100,
             big_blind: 3,
         });
-        let r = fallback_with_floor(&facing_bet, air, &air_board, too_big, "fallback:g".into());
+        let r = fallback_with_floor(
+            &facing_bet,
+            air,
+            &air_board,
+            too_big,
+            None,
+            "fallback:g".into(),
+        );
         assert_eq!(r.action, "fold", "注额 >30BB 须 fold，得 {r:?}");
 
         // 注额恰 = 30BB（to_call 600 ≤ 30×bb(20)=600，含）+ 好赔率 → call（用户场景边界：河牌 to_call=600）。
@@ -9701,12 +9960,19 @@ mod tests {
             to_call: 600,
             big_blind: 20,
         });
-        let r = fallback_with_floor(&facing_bet, air, &air_board, boundary, "fallback:g".into());
+        let r = fallback_with_floor(
+            &facing_bet,
+            air,
+            &air_board,
+            boundary,
+            None,
+            "fallback:g".into(),
+        );
         assert_eq!(r.action, "call", "注额恰 30BB（含）须 call，得 {r:?}");
         assert_eq!(r.source, "fallback:g:pot_odds_call", "得 {r:?}");
 
         // 能免费 check（!facing bet）→ 两条 floor 都不主动下注，check。
-        let r = fallback_with_floor(&free, air, &air_board, po, "fallback:g".into());
+        let r = fallback_with_floor(&free, air, &air_board, po, None, "fallback:g".into());
         assert_eq!(r.action, "check", "免费局面须 check，得 {r:?}");
         assert_eq!(r.source, "fallback:g", "免费 check 不加后缀，得 {r:?}");
 
@@ -9714,11 +9980,18 @@ mod tests {
         // + 好赔率小注 → pot_odds_call（① premium 不命中才看 ②）。
         let trash_pf = hole("7h", "2d");
         assert_eq!(limp_hand_tier(trash_pf), 0, "72o 须非 premium（tier 0）");
-        let r = fallback_with_floor(&facing_bet, trash_pf, &[], po, "fallback:h".into());
+        let r = fallback_with_floor(&facing_bet, trash_pf, &[], po, None, "fallback:h".into());
         assert_eq!(r.action, "call", "preflop 好赔率小注须 call，得 {r:?}");
         assert_eq!(r.source, "fallback:h:pot_odds_call", "得 {r:?}");
         // preflop premium（AA）仍走 ①（premium_call 优先于 pot_odds_call）。
-        let r = fallback_with_floor(&facing_bet, hole("As", "Ad"), &[], po, "fallback:h".into());
+        let r = fallback_with_floor(
+            &facing_bet,
+            hole("As", "Ad"),
+            &[],
+            po,
+            None,
+            "fallback:h".into(),
+        );
         assert_eq!(
             r.source, "fallback:h:premium_call",
             "preflop premium 走 ①，得 {r:?}"
@@ -9728,6 +10001,205 @@ mod tests {
     /// 强听牌 floor（2026-10-21）：实盘三手两头顺 + 同花听牌被 giveup 弃掉（4c9ff02d T9s、
     /// 05358313 T7h、6458e659 A7s），赔率够 → call（:draw_call）；卡顺、赔率不够、河牌、
     /// 没有 pot_odds、能免费 check 都不触发。
+    /// 范围胜率：已知牌对已知牌的胜率（河牌确定、打平、翻牌 AA 对 KK）、多人、范围全零。
+    #[test]
+    fn range_equity_known_matchups() {
+        let card = |s: &str| parse_card(s).unwrap();
+        let cards = |s: &str| s.split(' ').map(card).collect::<Vec<_>>();
+        let holes = all_hole_combos();
+        let only = |a: &str, b: &str| {
+            let (x, y) = (card(a), card(b));
+            holes
+                .iter()
+                .map(|h| {
+                    f64::from(u8::from(
+                        (h[0] == x && h[1] == y) || (h[0] == y && h[1] == x),
+                    ))
+                })
+                .collect::<Vec<f64>>()
+        };
+        let river = cards("2c 7d 9h Js 3s");
+        let kk = only("Kc", "Kd");
+        let eq = |hole: [Card; 2], board: &[Card], opps: &[&[f64]]| {
+            range_equity(hole, board, opps, 7).unwrap()
+        };
+        assert_eq!(eq([card("Ah"), card("As")], &river, &[&kk]), 1.0);
+        assert_eq!(
+            eq([card("Kh"), card("Ks")], &river, &[&only("Ac", "Ad")]),
+            0.0
+        );
+        assert_eq!(
+            eq([card("Ah"), card("Kh")], &river, &[&only("Ad", "Kc")]),
+            0.5,
+            "打平分一半"
+        );
+        // 两个对手：hero 对 AA 是坚果，KK 与 QQ 都输。
+        assert_eq!(
+            eq([card("Ah"), card("As")], &river, &[&kk, &only("Qc", "Qd")]),
+            1.0
+        );
+        // 翻牌 AA 对 KK（无听牌干扰的低牌面）：解析值 ≈ 0.91（KK 两张里中一张 K）。
+        let e = eq([card("Ah"), card("As")], &cards("2c 7d 9h"), &[&kk]);
+        assert!((e - 0.912).abs() < 0.01, "{e}");
+        // 撞牌的组合不会被抽到：对手范围只剩撞 hero 的牌 → None。
+        assert_eq!(
+            range_equity([card("Kc"), card("Ah")], &river, &[&kk], 7),
+            None
+        );
+        assert_eq!(range_equity([card("Ah"), card("As")], &river, &[], 7), None);
+        // 种子固定 → 同一结果。
+        assert_eq!(
+            range_equity([card("Ah"), card("As")], &cards("2c 7d 9h"), &[&kk], 9),
+            range_equity([card("Ah"), card("As")], &cards("2c 7d 9h"), &[&kk], 9)
+        );
+    }
+
+    /// 兜底的范围胜率 floor（000754：转牌顶对 + 同花听面对全下，需要 33.4%）：有范围胜率时按它判，替代听牌
+    /// floor（胜率不够即使是强听牌也弃）；没有时退回听牌 floor；能免费过牌照旧过牌。
+    #[test]
+    fn fallback_floor_range_equity() {
+        let card = |s: &str| parse_card(s).unwrap();
+        let hole = [card("8h"), card("7h")];
+        let board: Vec<Card> = "3c 8d 2h Kh".split(' ').map(card).collect();
+        let po = Some(PotOdds {
+            pot: 29494,
+            to_call: 14784,
+            big_blind: 100,
+        });
+        let facing = ValidActions {
+            can_check: false,
+            can_call: true,
+            can_raise: false,
+            min_raise: None,
+            max_raise: None,
+        };
+        let hu = |eq| Some(RangeEquity { eq, opps: 1 });
+        let r = |eq| fallback_with_floor(&facing, hole, &board, po, eq, "g".into());
+        // 旧规则：同花听 9 张 ≈ 19.6% × 0.85 < 33.4% → 弃。
+        assert_eq!(
+            (r(None).action.as_str(), r(None).source.as_str()),
+            ("fold", "g")
+        );
+        // 范围胜率 0.40 × 0.85 = 0.34 ≥ 0.334 → 跟；0.39 → 0.3315 < 0.334 → 弃。
+        assert_eq!(
+            (r(hu(0.40)).action.as_str(), r(hu(0.40)).source.as_str()),
+            ("call", "g:range_equity_call")
+        );
+        assert_eq!(r(hu(0.39)).action, "fold");
+        // 两个对手：折扣乘两次，0.40 × 0.7225 = 0.289 < 0.334 → 弃；0.47 × 0.7225 = 0.340 → 跟。
+        let two = |eq| Some(RangeEquity { eq, opps: 2 });
+        assert_eq!(r(two(0.40)).action, "fold");
+        assert_eq!(r(two(0.47)).action, "call");
+        // 有范围胜率时不再走听牌 floor：两头顺 + 同花听（旧规则会跟）但范围胜率低 → 弃。
+        let draw_board: Vec<Card> = "Qs 8h 7s".split(' ').map(card).collect();
+        let draw_po = Some(PotOdds {
+            pot: 842,
+            to_call: 362,
+            big_blind: 20,
+        });
+        let d = |eq| {
+            fallback_with_floor(
+                &facing,
+                [card("Ts"), card("9s")],
+                &draw_board,
+                draw_po,
+                eq,
+                "g".into(),
+            )
+        };
+        assert_eq!(d(None).source, "g:draw_call");
+        assert_eq!(d(hu(0.2)).action, "fold");
+        // 能免费过牌：照旧过牌，不看胜率。
+        let free = ValidActions {
+            can_check: true,
+            ..facing.clone()
+        };
+        assert_eq!(
+            fallback_with_floor(&free, hole, &board, po, hu(0.9), "g".into()).action,
+            "check"
+        );
+    }
+
+    /// 端到端：搜索读数被拒（hero 访问数门槛设成不可能达到，或 hero 信息集没访问到）落兜底时，范围胜率来自缓存里本街的解沿本街动作线条件化
+    /// 后的对手范围（锚定、脱锚两条路都接上）；换一手的种子取不到。
+    #[test]
+    fn fallback_range_equity_from_current_street_solve() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let sigma = top15_sigma();
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::AllPostflop,
+            min_hero_visits: u32::MAX,
+            ..SubgameSearchConfig::default()
+        };
+        // UTG(3, hero) 开到 60，其余弃，BB(2) 跟；翻牌 BB 下注 100 → hero 面对下注。200BB（blueprint 100BB）：
+        // 码深闸不过，锚定翻牌访问数不足不退 blueprint、落兜底。
+        let mut req = flop_first_unraised_req(vec![4000; 6]);
+        req.my_seat = 3;
+        req.hole = vec!["Qs".into(), "Jd".into()]; // 翻牌 7h 2c Ks：QJ 没成牌、没强听牌。
+        let a = |seat, action: &str, to| HistAction {
+            seat,
+            action: action.into(),
+            to,
+        };
+        req.actions = vec![
+            a(3, "raise", Some(60)),
+            a(4, "fold", None),
+            a(5, "fold", None),
+            a(0, "fold", None),
+            a(1, "fold", None),
+            a(2, "call", None),
+            a(2, "raise", Some(100)),
+        ];
+        req.valid = ValidActions {
+            can_check: false,
+            can_call: true,
+            can_raise: true,
+            min_raise: Some(200),
+            max_raise: Some(3940),
+        };
+        for (rt, path) in [
+            (rt_prefix_reach(scfg), "unsolved"),
+            (
+                SearchRuntime {
+                    force_unanchored: true,
+                    ..rt_prefix_reach(scfg)
+                },
+                "unanchored",
+            ),
+        ] {
+            let mut cache = SubgameSolveCache::new();
+            let r = decide(&game, &abs, &sigma, &req, 0x754, Some(&rt), &mut cache);
+            assert!(
+                r.source.starts_with(&format!("search_giveup:{path}:")),
+                "得 {r:?}"
+            );
+            let eq = r.range_equity.expect("本街解在缓存里 → 有范围胜率");
+            assert!((0.0..=1.0).contains(&eq), "{eq}");
+            assert_eq!(
+                r.source.ends_with(":range_equity_call"),
+                r.action == "call",
+                "跟注只能来自范围胜率 floor（QJ 高张，其余 floor 都不命中）：{r:?}"
+            );
+            // 同一缓存直接取：本手种子 → 有；换一手 → 没有。
+            let (cfg, smap, hero, hole) = coef_ctx(&req);
+            let board: Vec<Card> = req.board.iter().map(|c| parse_card(c).unwrap()).collect();
+            let (_, round_start, within, _) =
+                build_real_auth(&req, &cfg, 5, &smap, hero, hole, &board, true).unwrap();
+            let seed = hand_seed_for(&req, 0x754, 6);
+            let ranges =
+                current_street_ranges(&cache, &round_start, &within, seed).expect("本街解");
+            let bb: f64 = ranges[2].iter().sum();
+            assert!((bb - 1.0).abs() < 1e-9, "BB 范围归一 {bb}");
+            assert!(
+                ranges[0].is_empty() && ranges[1].is_empty(),
+                "翻前弃牌的座没有范围"
+            );
+            assert!(current_street_ranges(&cache, &round_start, &within, seed ^ 1).is_none());
+        }
+    }
+
     #[test]
     fn fallback_floor_strong_draw_call() {
         let card = |s: &str| parse_card(s).unwrap();
@@ -9769,6 +10241,7 @@ mod tests {
                 h,
                 &board,
                 po(pot, to_call),
+                None,
                 "search_giveup:unanchored:low_hero_visits".into(),
             );
             assert_eq!(r.action, "call", "{b} 强听牌赔率够须 call，得 {r:?}");
@@ -9786,6 +10259,7 @@ mod tests {
             hole("Qh", "Jc"),
             &gut,
             po(1862, 954),
+            None,
             "g".into(),
         );
         assert_eq!(
@@ -9798,9 +10272,23 @@ mod tests {
         // 满池下注需要 1/3 → fold；半池需要 1/4 → call。
         let fd = cards("Qh 7h 3c");
         assert_eq!(straight_or_better_outs(hole("Kh", "2h"), &fd), 9);
-        let r = fallback_with_floor(&facing_bet, hole("Kh", "2h"), &fd, po(300, 150), "g".into());
+        let r = fallback_with_floor(
+            &facing_bet,
+            hole("Kh", "2h"),
+            &fd,
+            po(300, 150),
+            None,
+            "g".into(),
+        );
         assert_eq!(r.action, "fold", "单同花听面对满池须 fold，得 {r:?}");
-        let r = fallback_with_floor(&facing_bet, hole("Kh", "2h"), &fd, po(225, 75), "g".into());
+        let r = fallback_with_floor(
+            &facing_bet,
+            hole("Kh", "2h"),
+            &fd,
+            po(225, 75),
+            None,
+            "g".into(),
+        );
         assert_eq!(r.source, "g:draw_call", "单同花听面对半池须 call，得 {r:?}");
 
         // —— 转牌只剩一张：15 张 15/46 ≈ 32.6%，×0.85 ≈ 0.277。满池 → fold；半池 → call。
@@ -9810,6 +10298,7 @@ mod tests {
             hole("Th", "7h"),
             &turn,
             po(300, 150),
+            None,
             "g".into(),
         );
         assert_eq!(r.action, "fold", "转牌听牌面对满池须 fold，得 {r:?}");
@@ -9818,6 +10307,7 @@ mod tests {
             hole("Th", "7h"),
             &turn,
             po(225, 75),
+            None,
             "g".into(),
         );
         assert_eq!(r.source, "g:draw_call", "转牌听牌面对半池须 call，得 {r:?}");
@@ -9829,13 +10319,21 @@ mod tests {
             hole("Th", "7h"),
             &river,
             po(114, 44),
+            None,
             "g".into(),
         );
         assert_eq!(r.action, "fold", "河牌须 fold，得 {r:?}");
         let flop = cards("5h 9h 8d");
-        let r = fallback_with_floor(&facing_bet, hole("Th", "7h"), &flop, None, "g".into());
+        let r = fallback_with_floor(&facing_bet, hole("Th", "7h"), &flop, None, None, "g".into());
         assert_eq!(r.action, "fold", "无 pot_odds 须 fold，得 {r:?}");
-        let r = fallback_with_floor(&free, hole("Th", "7h"), &flop, po(114, 44), "g".into());
+        let r = fallback_with_floor(
+            &free,
+            hole("Th", "7h"),
+            &flop,
+            po(114, 44),
+            None,
+            "g".into(),
+        );
         assert_eq!(
             (r.action.as_str(), r.source.as_str()),
             ("check", "g"),
@@ -9874,6 +10372,7 @@ mod tests {
             [parse_card("7h").unwrap(), parse_card("2d").unwrap()], // 72o 非 premium
             &[],
             Some(po),
+            None,
             "fallback:e".into(),
         );
         assert_eq!(r.action, "fold", "1.5:1（<4）须 fold，得 {r:?}");
