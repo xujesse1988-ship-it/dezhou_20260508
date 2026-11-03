@@ -64,6 +64,7 @@ BB 面对 4.5BB 开池的 0.5 底池 3bet ≈ **13.25BB**（测试 `ante_flop2_3
 1. 面对全下，且 hero 与全下者有效码深 < blueprint 码深 60%（200BB → 120BB）→ 全下启发式（§3.4）
 2. 重放：把真实动作逐个推进 blueprint 树（「影子」），尺寸映射到最近的档（§3.2）
    ├─ 有人平跟（影子里记成弃牌，--search-limp-as-fold on）────────→ 面对全下？全下启发式 : 平跟池启发式（§3.3）
+   │    （例外：开了 --search-limp-first-blueprint 且 hero 本手还没行动过 → 往下查 blueprint，§3.7）
    ├─ 推不进去（失同步）
    │    ├─ 面对全下 ─────────────────────────────────────────→ 全下启发式
    │    ├─ 原因是结构缺口（平跟进了无平跟的树）或有平跟映射 ──→ 平跟池启发式
@@ -183,6 +184,23 @@ wopo 桌上开局码深常在 60–130BB，低于 120BB 的很常见，所以面
 - 码深：双方开局栈都要 ≥ 1.6 × 4bet 额。
 - 放开时：blueprint 分布里弃牌的概率 × 1.0 全部挪给「加注 1 底池」，跟注和原有 4bet 概率不动。`source` 加 `:exploit_4bet`。
 
+### 3.7 平跟池首次决策查 blueprint（`--search-limp-first-blueprint`，默认关）[事实]
+
+需配 `--search-limp-as-fold on`。条件：影子同步、有平跟映射、hero 本手翻前还没行动过、不是面对全下
+（`limp_first_blueprint_applies`）。这时影子里平跟者已经记成弃牌，hero 查的就是「平跟者都弃牌后」的 blueprint 节点：
+
+- 前面只有平跟 → 开池节点（弃牌 / 加注；没有跟着平跟），SB 是首入节点（弃牌 / 补齐 / 加注），BB 是面对 SB 补齐的节点。
+  BB 面对平跟、其余全弃时影子已结束（失同步），仍走平跟池启发式。
+- 平跟后有人加注 → 面对开池的节点（弃牌 / 跟注 / 3bet / 全下）。
+- 加注额按含平跟者筹码的真实底池算（同 §3.1）。`source` = `blueprint:limp_first…`，driver 计入 blueprint。
+- hero 行动过之后的翻前决策仍走平跟池启发式。翻后估 hero 范围时这一步按 blueprint σ 算（不再算 limp 规则系数，
+  `hero_limp_route` 同口径）。
+
+离线回放（11-03，10-31 起全部 wopo 轮里 hero 首次决策、前面有跟注的 375 条请求，open2 9B crop，开关关 / 开对比）：
+280 条换成 blueprint。只有平跟的 206 条：加注 71 → 86、跟注（跟着平跟 / 补齐）33 → 23；一家平跟时平均加注额 4.96 → 5.94BB
+（blueprint 在 1/3 底池约 4.2–4.9BB 和 1 底池约 11.5–12.5BB 两档之间混合）。平跟后有人加注的 74 条：跟注 12 → 16、
+再加注 0 → 11（启发式在这里从不再加注）。
+
 ---
 
 ## 4. 开关对翻前的影响
@@ -191,6 +209,7 @@ wopo 桌上开局码深常在 60–130BB，低于 120BB 的很常见，所以面
 |---|---|---|
 | `--reshape ante-flop2-3bet --postflop-cap 4` | 开 | 是：决定树的菜单和入池上限（§1.1） |
 | `--search` 及各种 `--search-*` | 开 | 否（翻前不搜索）。`--search-limp-as-fold` 只改重放怎么记平跟，翻前动作同样交给平跟池启发式 |
+| `--search-limp-first-blueprint` | 关 | 是：平跟池里 hero 首次决策改查 blueprint（§3.7） |
 | `--exploit-4bet`（PM-17） | **关** | 是（§3.6） |
 | `--exploit` / `--exploit-tilt` / `--exploit-limp-seed` | 开 | 否，只影响翻后搜索的对手范围 |
 | `--ante` / `--blueprint-ante` / `--stack-bb` | 100 / 100 / 200 | 是：ante 对不上直接兜底（`ante_mismatch`）；ante 程度决定平跟池范围；码深决定全下启发式的 120BB 线 |

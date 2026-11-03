@@ -194,6 +194,10 @@ const DEFAULT_SEARCH_FORCE_UNANCHORED: bool = false;
 /// byte-equal）。调研（`docs/temp/openpoker_limp_handling_research_2026_10_16.md` §4）建议先做成
 /// 离线开关，回放已有平跟决策点确认翻后前缀非空比例 / 兜底占比 / 均匀出牌下降后再开实盘。
 const DEFAULT_SEARCH_LIMP_AS_FOLD: bool = false;
+/// 平跟池 hero 翻前首次决策改查 blueprint 的默认（`--search-limp-first-blueprint`，
+/// [`limp_first_blueprint_applies`]）：**默认关**（旧行为 byte-equal，翻前有平跟映射一律走
+/// [`limp_heuristic`]）。需配 `--search-limp-as-fold on`（没有映射就没有「平跟者弃牌后」的影子节点）。
+const DEFAULT_SEARCH_LIMP_FIRST_BLUEPRINT: bool = false;
 /// 子树节点上限的 advisor 默认（`--search-max-nodes`，覆盖 [`SubgameSearchConfig`] 的通用默认
 /// 8000）。2026-10-16 代码审查 §4：4 人单加注池 200BB 宽菜单约 16 万节点，10 万上限下直接放弃 →
 /// check / fold；提到 20 万。557k 节点约 100MB（`docs/status_v3.md`），20 万约 36MB，单次建树内存
@@ -753,8 +757,14 @@ struct SearchRuntime {
     /// `--search-limp-as-fold`（方案 B，[`DEFAULT_SEARCH_LIMP_AS_FOLD`]）：`true` = 非 SB 开池平跟在
     /// 100BB 影子里记为弃牌、真实局照常跟注（[`lockstep_replay`]），让平跟池翻后脱锚搜索拿到非空
     /// 范围前缀（平跟者 = 该位置开池范围之外的牌、hero 和盲注 = blueprint 决策），平跟者后来弃牌时
-    /// 整手回到锚定路径。**翻前决策不受影响**：有映射的翻前点一律走 [`limp_heuristic`]。
+    /// 整手回到锚定路径。**翻前决策不受影响**：有映射的翻前点一律走 [`limp_heuristic`]
+    /// （`limp_first_blueprint` 开时 hero 翻前首次决策除外）。
     limp_as_fold: bool,
+    /// `--search-limp-first-blueprint`（[`DEFAULT_SEARCH_LIMP_FIRST_BLUEPRINT`]）：`true` = 有平跟映射、
+    /// 影子同步、hero 本手翻前还没行动过（[`limp_first_blueprint_applies`]）时，hero 这次决策查影子节点
+    /// （= 平跟者都弃牌后的局面）的 blueprint，不走 [`limp_heuristic`]。之后的翻前决策仍走启发式。
+    /// 只在 `limp_as_fold` 开时有意义（启动期校验）。
+    limp_first_blueprint: bool,
     /// 叠加剥削（`--exploit`，`exploit_strategy_design_2026_06_14` Tier 2）：`Some` = 进程内对手画像
     /// 累积器（[`Profiler`]，**只用本进程数据、不依赖过往、启动后空表开始统计**）。`RefCell` 内部
     /// 可变：observe 路径经共享 `&SearchRuntime` 用 `borrow_mut` 累积、决策路径用 `borrow` 读已收敛
@@ -1666,12 +1676,22 @@ fn action_kind(action: &str, la: &poker::LegalActionSet) -> Option<&'static str>
     }
 }
 
+/// 平跟池首次决策改查 blueprint（`--search-limp-first-blueprint`）是否适用于这次请求：hero 本手还没有
+/// 任何动作（翻前第一次轮到 hero）。调用方另须满足：有平跟映射、影子同步、翻前、不是面对全下。
+/// 这时影子节点 = 平跟者都弃牌后 hero 面对的局面（前面没人加注 = 开池 / SB 首入 / BB 面对 SB 补齐；
+/// 平跟后有人加注 = 面对开池），直接查 blueprint。hero 行动过之后的翻前决策仍走 [`limp_heuristic`]。
+fn limp_first_blueprint_applies(req: &Request) -> bool {
+    req.board.is_empty() && !req.actions.iter().any(|h| h.seat == req.my_seat)
+}
+
 /// hero 在 `step`（历史截到 hero 这一步之前、`valid` 已重建）上是否由 [`limp_heuristic`] 决定——与
 /// [`decide_with`] 的翻前分流同口径（改那边的分流必须同步改这里，测试
 /// `hero_limp_route_matches_decide` 守着）：
 /// - 先命中翻前全下启发式（`preflop_allin_spot`）→ 不是；
 /// - lockstep 成功且有平跟映射 → 是，`Some(Some(影子节点))`（合法集为空时 decide 走失同步分支，
-///   同样因有映射走启发式，但没有可去掉的影子节点 → `Some(None)`）；
+///   同样因有映射走启发式，但没有可去掉的影子节点 → `Some(None)`）；但 `limp_first_blueprint` 开且
+///   这是 hero 翻前首次决策（[`limp_first_blueprint_applies`]）→ 不是（decide 查 blueprint，hero 这一步
+///   留在前缀里按 blueprint σ 算）；
 /// - lockstep 失同步且原因是 `structural_gap` 或有平跟映射 → 是，`Some(None)`；
 /// - 其余 → 不是（blueprint / 兜底）。
 ///
@@ -1686,6 +1706,7 @@ fn hero_limp_route(
     hero: SeatId,
     hole: [Card; 2],
     limp_as_fold: bool,
+    limp_first_blueprint: bool,
 ) -> Option<Option<NodeId>> {
     if preflop_allin_spot(step, solver_cfg, scale, smap, hero, hole).is_some() {
         return None;
@@ -1702,7 +1723,13 @@ fn hero_limp_route(
     ) {
         Ok((_, abs, limp, _)) if limp.mapped() => {
             let legal = SimplifiedNlheGame::legal_actions(&abs);
-            Some((!legal.is_empty()).then_some(abs.current_node_id))
+            if legal.is_empty() {
+                Some(None)
+            } else if limp_first_blueprint && limp_first_blueprint_applies(step) {
+                None
+            } else {
+                Some(Some(abs.current_node_id))
+            }
         }
         Ok(_) => None,
         Err(e) if e.reason == "structural_gap" || e.limp.mapped() => Some(None),
@@ -1722,6 +1749,7 @@ fn hero_limp_coef(
     hero: SeatId,
     hole: [Card; 2],
     limp_as_fold: bool,
+    limp_first_blueprint: bool,
 ) -> HeroLimpCoef {
     let mut out = HeroLimpCoef::default();
     let Some(hero_idx) = combo_index(hole) else {
@@ -1757,6 +1785,7 @@ fn hero_limp_coef(
             hero,
             hole,
             limp_as_fold,
+            limp_first_blueprint,
         ) else {
             continue;
         };
@@ -2681,6 +2710,7 @@ fn unanchored_range_inputs(
         hero,
         hole,
         rt.limp_as_fold,
+        rt.limp_first_blueprint,
     );
     let raisers = limp_raisers(req, solver_cfg, scale, smap, limp, hero_pid);
     let mut decisions =
@@ -2902,6 +2932,11 @@ fn decide_with(
     // prewarm 共用 [`lockstep_replay`]，分类 / node_id 同源）——
     // `--search-limp-as-fold`（方案 B）只在开搜索时生效：它只为翻后搜索提供范围前缀。
     let limp_as_fold = search.is_some_and(|rt| rt.limp_as_fold);
+    // `--search-limp-first-blueprint`：hero 翻前首次决策、前面有平跟 → 查平跟者弃牌后的影子节点。
+    // 面对全下仍走全下启发式（与平跟映射分支原口径一致）。
+    let limp_first_bp = search.is_some_and(|rt| rt.limp_first_blueprint)
+        && limp_first_blueprint_applies(req)
+        && allin_spot.is_none();
     let lockstep = lockstep_replay(
         game,
         &solver_cfg,
@@ -2927,7 +2962,8 @@ fn decide_with(
     let (real, abs, legal_abs, limp, sizes) = match lockstep {
         // 平跟当弃牌映射后影子在翻前对上了 blueprint 节点，但翻前要不要加注、拿什么牌加仍由
         // 启发式决定（调研 §4：blueprint 开池范围默认后面的人会弃牌，前面多了一个平跟者照搬会偏宽）。
-        Ok((_, _, _, limp, _)) if limp.mapped() && board.is_empty() => {
+        // `--search-limp-first-blueprint` 开时 hero 翻前首次决策例外：往下走 blueprint 路径。
+        Ok((_, _, _, limp, _)) if limp.mapped() && board.is_empty() && !limp_first_bp => {
             if let Some(spot) = &allin_spot {
                 return allin_response(spot);
             }
@@ -3431,7 +3467,7 @@ fn decide_with(
         // 合法动作：填 source（search / blueprint）+ 诊断。不合法时 action_to_response 已产
         // safe_fallback（source = fallback:...），不覆盖。bet/raise 退成 call/check 时追加降级标记。
         resp.source = format!(
-            "{}{}{}{}",
+            "{}{}{}{}{}",
             if low_visits_bp {
                 "blueprint:low_hero_visits"
             } else if placeholder_search {
@@ -3440,6 +3476,11 @@ fn decide_with(
                 "search"
             } else {
                 "blueprint"
+            },
+            if limp_first_bp && limp.mapped() {
+                ":limp_first"
+            } else {
+                ""
             },
             if guarded.is_some() {
                 ":weak_commit_guard"
@@ -5991,6 +6032,9 @@ struct Args {
     /// `--search-limp-as-fold on|off`（方案 B，[`SearchRuntime`] doc）。**默认 `false`**
     /// （[`DEFAULT_SEARCH_LIMP_AS_FOLD`]）。仅 `--search` 开时可设。
     search_limp_as_fold: bool,
+    /// `--search-limp-first-blueprint on|off`（[`SearchRuntime::limp_first_blueprint`]）。**默认 `false`**
+    /// （[`DEFAULT_SEARCH_LIMP_FIRST_BLUEPRINT`]）。需 `--search` 且 `--search-limp-as-fold on`。
+    search_limp_first_blueprint: bool,
     /// `--search-weak-commit-guard on|off`（[`SearchRuntime::weak_commit_guard`]）。**默认 `true`**
     /// （[`DEFAULT_SEARCH_WEAK_COMMIT_GUARD`]）。仅 `--search` 开时可设。
     search_weak_commit_guard: bool,
@@ -6463,6 +6507,7 @@ fn run() -> Result<(), String> {
                 flop_prefer_blueprint: args.search_flop_prefer_blueprint,
                 force_unanchored: args.search_force_unanchored,
                 limp_as_fold: args.search_limp_as_fold,
+                limp_first_blueprint: args.search_limp_first_blueprint,
                 // 叠加剥削：--exploit 开 → 进程内空表 Profiler（只用本进程数据，不依赖过往）。
                 exploit: args.exploit.map(|cfg| RefCell::new(Profiler::new(cfg))),
                 weak_commit_guard: args.search_weak_commit_guard,
@@ -6748,6 +6793,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_flop_prefer_blueprint: Option<bool> = None;
     let mut search_force_unanchored: Option<bool> = None;
     let mut search_limp_as_fold: Option<bool> = None;
+    let mut search_limp_first_blueprint: Option<bool> = None;
     let mut search_min_hero_visits: Option<u32> = None;
     let mut search_real_hand_q: Option<f64> = None;
     let mut search_weak_commit_guard: Option<bool> = None;
@@ -6957,6 +7003,19 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     other => return Err(format!("--search-limp-as-fold 须 on|off，得 {other}")),
                 });
             }
+            "--search-limp-first-blueprint" => {
+                // 默认关（DEFAULT_SEARCH_LIMP_FIRST_BLUEPRINT）；取值 on|off 显式覆盖。
+                let v = next_val(&mut it, &arg)?;
+                search_limp_first_blueprint = Some(match v.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(format!(
+                            "--search-limp-first-blueprint 须 on|off，得 {other}"
+                        ))
+                    }
+                });
+            }
             "--search-min-hero-visits" => {
                 search_min_hero_visits = Some(
                     next_val(&mut it, &arg)?
@@ -7143,6 +7202,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_flop_prefer_blueprint.is_some()
             || search_force_unanchored.is_some()
             || search_limp_as_fold.is_some()
+            || search_limp_first_blueprint.is_some()
             || search_min_hero_visits.is_some()
             || search_real_hand_q.is_some()
             || search_weak_commit_guard.is_some()
@@ -7181,6 +7241,12 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let exploit_limp_tilt = exploit_limp_tilt.unwrap_or(false);
     if exploit_limp_tilt && !search_limp_as_fold.unwrap_or(DEFAULT_SEARCH_LIMP_AS_FOLD) {
         return Err("--exploit-limp-tilt on 需配合 --search-limp-as-fold on".to_string());
+    }
+    // 平跟池首次决策查 blueprint 查的是「平跟当弃牌」映射出来的影子节点：没有映射就永远不生效，拒绝静默空开。
+    let search_limp_first_blueprint =
+        search_limp_first_blueprint.unwrap_or(DEFAULT_SEARCH_LIMP_FIRST_BLUEPRINT);
+    if search_limp_first_blueprint && !search_limp_as_fold.unwrap_or(DEFAULT_SEARCH_LIMP_AS_FOLD) {
+        return Err("--search-limp-first-blueprint on 需配合 --search-limp-as-fold on".to_string());
     }
     // --exploit-4bet* guard：子旗需 --exploit-4bet on；参数越界拒绝启动。
     if !exploit_4bet_on
@@ -7265,6 +7331,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         search_force_unanchored: search_force_unanchored.unwrap_or(DEFAULT_SEARCH_FORCE_UNANCHORED),
         // 默认关（旧行为 byte-equal）；--search-limp-as-fold on 显式开。
         search_limp_as_fold: search_limp_as_fold.unwrap_or(DEFAULT_SEARCH_LIMP_AS_FOLD),
+        // 默认关（旧行为 byte-equal）；--search-limp-first-blueprint on 显式开。
+        search_limp_first_blueprint,
         // 默认开；--search-weak-commit-guard off 显式关。
         search_weak_commit_guard: search_weak_commit_guard
             .unwrap_or(DEFAULT_SEARCH_WEAK_COMMIT_GUARD),
@@ -7301,6 +7369,7 @@ mod tests {
             flop_prefer_blueprint: false,
             force_unanchored: false,
             limp_as_fold: false,
+            limp_first_blueprint: false,
             exploit: None,
             weak_commit_guard: false,
         }
@@ -7317,6 +7386,7 @@ mod tests {
             flop_prefer_blueprint: false,
             force_unanchored: false,
             limp_as_fold: false,
+            limp_first_blueprint: false,
             exploit: None,
             weak_commit_guard: false,
         }
@@ -7333,6 +7403,7 @@ mod tests {
             flop_prefer_blueprint: false,
             force_unanchored: false,
             limp_as_fold: false,
+            limp_first_blueprint: false,
             exploit: None,
             weak_commit_guard: false,
         }
@@ -7350,6 +7421,7 @@ mod tests {
             flop_prefer_blueprint: true,
             force_unanchored: false,
             limp_as_fold: false,
+            limp_first_blueprint: false,
             exploit: None,
             weak_commit_guard: false,
         }
@@ -9167,7 +9239,7 @@ mod tests {
 
     fn coef_for(game: &SimplifiedNlheGame, req: &Request) -> HeroLimpCoef {
         let (cfg, smap, hero, hole) = coef_ctx(req);
-        hero_limp_coef(game, &cfg, &smap, req, 5, hero, hole, true)
+        hero_limp_coef(game, &cfg, &smap, req, 5, hero, hole, true, false)
     }
 
     fn nonzero(c: &HeroLimpCoef) -> Vec<[Card; 2]> {
@@ -9617,18 +9689,41 @@ mod tests {
                 false,
             ),
         ];
-        for limp_as_fold in [true, false] {
+        // 平跟后 hero（BTN）隔离、SB 3bet、平跟者弃牌：影子同步、有映射、hero 已行动过 → 启发式。
+        let after_iso = vec![
+            hist(3, "call", Some(20)),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "raise", Some(60)),
+            hist(1, "raise", Some(200)),
+            hist(2, "fold", None),
+            hist(3, "fold", None),
+        ];
+        let mut all_cases = cases.clone();
+        all_cases.push((0, after_iso, true));
+        for (limp_as_fold, first_bp) in [(true, false), (false, false), (true, true)] {
             let rt = SearchRuntime {
                 limp_as_fold,
+                limp_first_blueprint: first_bp,
                 ..rt_prefix_reach(scfg)
             };
-            for (me, acts, _) in &cases {
+            for (me, acts, _) in &all_cases {
                 let mut req = limp_req(*me, ["Qs", "Qd"], &[], acts.clone());
                 let (cfg, smap, hero, hole) = coef_ctx(&req);
                 let (auth, ..) =
                     build_real_auth(&req, &cfg, 5, &smap, hero, hole, &[], true).unwrap();
                 req.valid = valid_from_legal(&auth.legal_actions(), 5);
-                let route = hero_limp_route(&game, &cfg, &smap, &req, 5, hero, hole, limp_as_fold);
+                let route = hero_limp_route(
+                    &game,
+                    &cfg,
+                    &smap,
+                    &req,
+                    5,
+                    hero,
+                    hole,
+                    limp_as_fold,
+                    first_bp,
+                );
                 let resp = decide(
                     &game,
                     &abs,
@@ -9641,7 +9736,7 @@ mod tests {
                 assert_eq!(
                     resp.source.starts_with("limp_heuristic"),
                     route.is_some(),
-                    "limp_as_fold={limp_as_fold} acts={acts:?} resp={resp:?} route={route:?}"
+                    "limp_as_fold={limp_as_fold} first_bp={first_bp} acts={acts:?} resp={resp:?} route={route:?}"
                 );
             }
         }
@@ -9649,9 +9744,170 @@ mod tests {
         for (me, acts, want) in &cases {
             let req = limp_req(*me, ["Qs", "Qd"], &[], acts.clone());
             let (cfg, smap, hero, hole) = coef_ctx(&req);
-            let route = hero_limp_route(&game, &cfg, &smap, &req, 5, hero, hole, true);
+            let route = hero_limp_route(&game, &cfg, &smap, &req, 5, hero, hole, true, false);
             assert_eq!(route.is_some(), *want, "{acts:?}");
         }
+    }
+
+    /// 同 [`rt_limp_as_fold`] 但加开 `--search-limp-first-blueprint`。
+    fn rt_limp_first_bp(cfg: SubgameSearchConfig) -> SearchRuntime {
+        SearchRuntime {
+            limp_first_blueprint: true,
+            ..rt_limp_as_fold(cfg)
+        }
+    }
+
+    /// `--search-limp-first-blueprint`：hero 翻前首次决策、前面有平跟 → 查「平跟者弃牌后」影子节点的
+    /// blueprint（info_set 与前面全弃的请求相同，加注额按含平跟的真实底池算）；hero 行动过之后、BB 面对
+    /// 平跟其余全弃（影子已结束）仍走启发式；开关关时逐字节同旧行为。
+    #[test]
+    fn limp_first_blueprint_queries_limp_folded_node() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        // 恒选最后一个动作（加注 / 全下），看加注额。
+        let last = |_i: &InfoSetId, n: usize| {
+            let mut v = vec![0.0; n];
+            v[n - 1] = 1.0;
+            v
+        };
+        let scfg = SubgameSearchConfig {
+            iterations: 100,
+            ..SubgameSearchConfig::default()
+        };
+        let run = |req: &Request, rt: &SearchRuntime| {
+            decide(
+                &game,
+                &abs,
+                &last,
+                req,
+                1,
+                Some(rt),
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        let on_rt = rt_limp_first_bp(scfg);
+        let off_rt = rt_limp_as_fold(scfg);
+
+        // BTN 面对 UTG 平跟（其余全弃） vs 前面全弃。
+        let limped = limp_req(
+            0,
+            ["9s", "6s"],
+            &[],
+            vec![
+                hist(3, "call", Some(20)),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+            ],
+        );
+        let folded = limp_req(
+            0,
+            ["9s", "6s"],
+            &[],
+            vec![
+                hist(3, "fold", None),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+            ],
+        );
+        let on = run(&limped, &on_rt);
+        let base = run(&folded, &on_rt);
+        assert_eq!(on.source, "blueprint:limp_first", "{on:?}");
+        assert_eq!(base.source, "blueprint", "前面全弃不加后缀：{base:?}");
+        assert_eq!(on.info_set, base.info_set, "影子节点 = 平跟者弃牌后");
+        assert_eq!(on.action, "raise", "{on:?}");
+        assert!(is_legal(&on, &limped.valid), "{on:?}");
+        assert!(
+            on.amount >= base.amount,
+            "加注额按含平跟的真实底池算：{on:?} vs {base:?}"
+        );
+        assert!(
+            run(&limped, &off_rt).source.starts_with("limp_heuristic"),
+            "开关关 → 启发式"
+        );
+
+        // SB 首入（UTG 平跟、其余全弃）→ blueprint（SB 节点有补齐）。
+        let mut sb = limp_req(
+            1,
+            ["9s", "6s"],
+            &[],
+            vec![
+                hist(3, "call", Some(20)),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+                hist(0, "fold", None),
+            ],
+        );
+        sb.valid.min_raise = Some(40);
+        let r = run(&sb, &on_rt);
+        assert_eq!(r.source, "blueprint:limp_first", "{r:?}");
+
+        // 平跟后有人加注、hero 首次决策（#580 第一步：BB 面对 BTN 平跟 + SB 加注）→ 面对开池的 blueprint。
+        let a580 = hand580_acts();
+        let r = run(&limp_req(2, ["Qs", "Qd"], &[], a580[..5].to_vec()), &on_rt);
+        assert!(r.source.starts_with("blueprint:limp_first"), "{r:?}");
+
+        // hero 行动过（BTN 隔离后被 SB 3bet、平跟者弃牌）→ 启发式。
+        let after_iso = limp_req(
+            0,
+            ["9s", "6s"],
+            &[],
+            vec![
+                hist(3, "call", Some(20)),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+                hist(0, "raise", Some(60)),
+                hist(1, "raise", Some(200)),
+                hist(2, "fold", None),
+                hist(3, "fold", None),
+            ],
+        );
+        let r = run(&after_iso, &on_rt);
+        assert!(r.source.starts_with("limp_heuristic"), "{r:?}");
+        assert_eq!(r, run(&after_iso, &off_rt), "hero 行动过后开关不改输出");
+
+        // BB 面对平跟、其余全弃：影子已结束（BB 白赢）→ 失同步，仍启发式。
+        let mut bb = limp_req(
+            2,
+            ["7h", "2d"],
+            &[],
+            vec![
+                hist(3, "call", Some(20)),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+                hist(0, "fold", None),
+                hist(1, "fold", None),
+            ],
+        );
+        bb.valid.can_check = true;
+        bb.valid.can_call = false;
+        assert_eq!(run(&bb, &on_rt).source, "limp_heuristic:check");
+    }
+
+    /// 开 `--search-limp-first-blueprint`：#580 hero 第一次跟注改由 blueprint 决定 → 这一步不算 limp
+    /// 系数、留在翻后前缀里按 blueprint σ 算；第二次跟注（失同步之后）仍按 limp 规则算系数。
+    #[test]
+    fn limp_first_blueprint_hero_step_stays_in_prefix() {
+        let game = nolimp_game();
+        let req = limp_req(2, ["Qs", "Qd"], &["7h", "2c", "Ks"], hand580_acts());
+        let (cfg, smap, hero, hole) = coef_ctx(&req);
+        let off = hero_limp_coef(&game, &cfg, &smap, &req, 5, hero, hole, true, false);
+        let on = hero_limp_coef(&game, &cfg, &smap, &req, 5, hero, hole, true, true);
+        assert_eq!(off.nodes.len(), 1, "{off:?}");
+        assert!(on.nodes.is_empty(), "{on:?}");
+        assert!(on.coef.is_some(), "第二次跟注仍有系数");
+        assert!(!on.mismatch);
+        let e = replay_limp(&game, &req, Some(SeatId(2)), true)
+            .err()
+            .unwrap();
+        let raisers = limp_raisers(&req, &cfg, 5, &smap, &e.limp, 2);
+        let hero_steps = |nodes: &[NodeId]| {
+            unanchored_prefix_decisions(&game, e.synced_node, &e.limp, 2, nodes, &raisers)
+                .iter()
+                .filter(|d| d.2 == 2)
+                .count()
+        };
+        assert_eq!(hero_steps(&off.nodes), 0);
+        assert_eq!(hero_steps(&on.nodes), 1);
     }
 
     /// #580 形状的预热与决策算出同一份 range（含 hero 系数）→ 决策命中预热；一致性检查失败时
@@ -14110,6 +14366,47 @@ mod tests {
         assert!(parse(&["--search-limp-as-fold", "on"]).is_err());
     }
 
+    #[test]
+    fn parse_args_limp_first_blueprint() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        assert!(
+            !parse(&["--search", "--search-limp-as-fold", "on"])
+                .unwrap()
+                .search_limp_first_blueprint,
+            "默认关"
+        );
+        let on = [
+            "--search",
+            "--search-limp-as-fold",
+            "on",
+            "--search-limp-first-blueprint",
+            "on",
+        ];
+        assert!(parse(&on).unwrap().search_limp_first_blueprint);
+        assert!(
+            parse(&["--search", "--search-limp-first-blueprint", "on"]).is_err(),
+            "需配 --search-limp-as-fold on"
+        );
+        assert!(
+            parse(&["--search-limp-first-blueprint", "off"]).is_err(),
+            "需 --search"
+        );
+        assert!(parse(&[
+            "--search",
+            "--search-limp-as-fold",
+            "on",
+            "--search-limp-first-blueprint",
+            "maybe"
+        ])
+        .is_err());
+    }
+
     /// 档二′-跨街复用端到端（脱影子 `decide` 路径，trigger=AllPostflop 才搜 turn）：先 flop 决策解
     /// flop 子树入缓存 → turn 决策复用其 σ（`build_real_auth` 重建 `prev_within` = flop 完整动作线 →
     /// `decide_search_unanchored` → `subgame_search_unanchored_cached_cross`）。stub 桶下钉 plumbing：
@@ -14352,6 +14649,7 @@ mod tests {
             flop_prefer_blueprint: false,
             force_unanchored: false,
             limp_as_fold: false,
+            limp_first_blueprint: false,
             exploit: None,
             weak_commit_guard: false,
         }
@@ -14768,6 +15066,7 @@ mod tests {
             flop_prefer_blueprint: prefer,
             force_unanchored: false,
             limp_as_fold: false,
+            limp_first_blueprint: false,
             exploit: None,
             weak_commit_guard: false,
         };

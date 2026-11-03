@@ -146,6 +146,9 @@ def add_advisor_args(p, default_seats, debug_help):
     # 平跟当弃牌（方案 B，advisor 默认 off）：on = 非 SB 开池平跟在 blueprint 影子里记为弃牌，
     # 平跟池翻后搜索拿到范围前缀；翻前仍由 limp_heuristic 决定。不传 = 吃 advisor 默认（OFF）。
     p.add_argument("--search-limp-as-fold", choices=["on", "off"], default=None)
+    # 平跟池 hero 翻前首次决策查 blueprint（advisor 默认 off，需 --search-limp-as-fold on）：on = 前面有人
+    # 平跟、hero 本手第一次行动时按「平跟者都弃牌」的 blueprint 节点出牌；之后的翻前决策仍走 limp_heuristic。
+    p.add_argument("--search-limp-first-blueprint", choices=["on", "off"], default=None)
     # 搜索读数门槛（advisor 默认 200）：hero 信息集在 solve 里被遍历不足这么多次就不用这份解，
     # flop 退回 blueprint、转牌 / 河牌兜底；0 = 关。不传 = 吃 advisor 默认。
     p.add_argument("--search-min-hero-visits", type=int, default=None)
@@ -224,6 +227,11 @@ def validate_advisor_args(args):
     if args.search_limp_as_fold is not None and not args.search:
         raise SystemExit("--search-limp-as-fold 需配 --search"
                          "（拒绝静默：它只给翻后搜索提供范围前缀，没有搜索设了无意义）")
+    if args.search_limp_first_blueprint is not None and not args.search:
+        raise SystemExit("--search-limp-first-blueprint 需配 --search（它挂在 advisor 搜索运行时上）")
+    if args.search_limp_first_blueprint == "on" and args.search_limp_as_fold != "on":
+        raise SystemExit("--search-limp-first-blueprint on 需配 --search-limp-as-fold on"
+                         "（它查的是平跟当弃牌映射出来的影子节点）")
     if args.search_min_hero_visits is not None and not args.search:
         raise SystemExit("--search-min-hero-visits 需配 --search（它只管搜索读数）")
     if args.search_min_hero_visits is not None and args.search_min_hero_visits < 0:
@@ -278,6 +286,8 @@ def advisor_extra_args(args, warm_profile_hh=None):
             extra += ["--search-force-unanchored", args.search_force_unanchored]
         if args.search_limp_as_fold is not None:
             extra += ["--search-limp-as-fold", args.search_limp_as_fold]
+        if args.search_limp_first_blueprint is not None:
+            extra += ["--search-limp-first-blueprint", args.search_limp_first_blueprint]
         if args.search_min_hero_visits is not None:
             extra += ["--search-min-hero-visits", str(args.search_min_hero_visits)]
         if args.search_real_hand_q is not None:
