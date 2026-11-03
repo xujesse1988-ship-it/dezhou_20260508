@@ -820,6 +820,96 @@ def _selftest_ante():
           " → 作废", file=sys.stderr)
 
 
+_NOT_CHIPS = {"seat", "dealer_seat", "actor_seat", "hand_seq", "table_seq"}
+
+
+def _scale_chips(o, k, key=None):
+    """消息里的筹码数字全部 × k（座位号 / 序号不动）。"""
+    if isinstance(o, dict):
+        return {kk: _scale_chips(v, k, kk) for kk, v in o.items()}
+    if isinstance(o, list):
+        return [_scale_chips(v, k, key) for v in o]
+    if isinstance(o, int) and not isinstance(o, bool) and key not in _NOT_CHIPS:
+        return o * k
+    return o
+
+
+def _selftest_chip_div():
+    """大盲不整除 100 的桌（100/200）：发给 advisor 的筹码 ÷ chip_div，建议的加注额 × chip_div 还原。
+    实测会话（1/2）筹码 ×100 改成 100/200 → chip_div = 2：每个请求 = 原请求筹码 ×50（advisor 侧 scale
+    从 50 变 1，看到的 solver 筹码不变）；整除的桌 chip_div = 1、请求不变。另核对单数筹码的全下。"""
+    from poker_live.wopo import chip_div, downscale_request, upscale_response
+    _check(chip_div(1, 2, 0) == 1 and chip_div(20, 50, 50) == 1 and chip_div(50, 100, 100) == 1
+           and chip_div(100, 200, 200) == 2 and chip_div(150, 300, 300) == 3
+           and chip_div(100, 300, 300) == 1
+           and chip_div(75, 150, 0) == 3 and chip_div(25, 200, 0) == 1, "chip_div 取值")
+
+    def reply(req):
+        v = req["valid"]
+        if v.get("can_raise") and v["max_raise"] - v["min_raise"] >= 2:
+            return {"action": "raise", "amount": (v["min_raise"] + v["max_raise"]) // 2,
+                    "source": "stub", "probs": [["raise", 1.0]], "chosen": "raise"}
+        return None
+
+    msgs = _fixture_msgs()
+    _, base, base_rows = _run_msgs(msgs, reply=reply)
+    session, stub, rows = _run_msgs(_scale_chips(msgs, 100), reply=reply)
+    _check(not session.skip_reasons and session.counters["hands_complete"] == 7,
+           f"100/200 会话应全部正常: {session.skip_reasons}")
+    _check(len(stub.requests) == len(base.requests) and len(rows) == len(base_rows), "决策点应一一对应")
+
+    def x50(q):
+        q = _scale_chips(q, 50)  # 请求里 seat / button_seat 等不是筹码：逐键还原
+        for k in ("button_seat", "my_seat", "num_seats"):
+            q[k] //= 50
+        q["dealt_seats"] = [s // 50 for s in q["dealt_seats"]] if "dealt_seats" in q else None
+        if q["dealt_seats"] is None:
+            del q["dealt_seats"]
+        return q
+
+    for q, bq in zip(stub.requests, base.requests):
+        _check(q == x50(bq), f"请求应 = 原请求筹码 ×50: {q} vs {bq}")
+    raised = 0
+    _check(len(rows) == len(stub.requests), "同步回放：每个决策都写进行动文件")
+    for r, br, q in zip(rows, base_rows, stub.requests):
+        _check(r["action"] == br["action"], "动作应相同")
+        if r["action"] == "raise":
+            raised += 1
+            sv = q["valid"]
+            # stub 在缩小后的区间里取中点 a'；前面各街投入是偶数（×100 改写）→ 桌面额 = a' × 2。
+            _check(r["amount"] == (sv["min_raise"] + sv["max_raise"]) // 2 * 2
+                   and r["valid"]["min_raise"] <= r["amount"] <= r["valid"]["max_raise"],
+                   f"加注额应还原成桌面筹码: {r['amount']} vs {sv}")
+    _check(raised > 0, "应有加注建议")
+
+    # 单数筹码：翻前加注到 601（单数），翻牌 hero 全下 9199 = 10000 − ante 200 − 601。
+    req = {"small_blind": 100, "big_blind": 200, "ante": 200,
+           "actions": [{"seat": 1, "action": "raise", "to": 601}, {"seat": 0, "action": "call"},
+                       {"seat": 1, "action": "raise", "to": 333}],
+           "valid": {"can_check": False, "can_call": True, "can_raise": True,
+                     "min_raise": 666, "max_raise": 9199},
+           "stacks": [10000, 20001]}
+    sreq, prior = downscale_request(req, 2, ["preflop", "preflop", "flop"], "flop")
+    pre_to = sreq["actions"][0]["to"]
+    _check(sreq["small_blind"] == 50 and sreq["big_blind"] == 100 and sreq["ante"] == 100
+           and sreq["stacks"] == [5000, 10001] and prior == 601, f"缩小后的请求 {sreq}")
+    _check(sreq["ante"] + pre_to + sreq["valid"]["max_raise"] == sreq["stacks"][0],
+           f"全下应恰好用完缩小后的栈: {sreq}")
+    v, sv = req["valid"], sreq["valid"]
+    up = lambda a: upscale_response({"action": "raise", "amount": a}, 2, prior, v, sv)["amount"]
+    _check(up(sv["max_raise"]) == 9199 and up(sv["max_raise"] + 5) == 9199
+           and up(sv["min_raise"]) == 666 and up(1) == 666, "上下限还原")
+    mid = up(3000)
+    _check(_rdiv_check(601 + mid, 2) == pre_to + 3000, f"中间额按累计投入还原: {mid}")
+    _check(upscale_response({"action": "call"}, 2, prior, v, sv) == {"action": "call"}, "call 不动")
+    print("[selftest 15 筹码缩放] 100/200 桌请求 = 1/2 桌 ×50、加注额 ×2 还原；单数筹码全下恰好用完栈",
+          file=sys.stderr)
+
+
+def _rdiv_check(x, d):
+    return (x + d // 2) // d
+
+
 def _selftest_posts():
     """补盲：非盲注座开局 bet = 1BB 记为补盲座，底池 / 跟注额按 live 盲注核对，hh 带 posts；advisor 请求
     不带补盲，补盲者翻前没人加注时的过牌改发 call（advisor 没有补盲逻辑）。
@@ -1169,7 +1259,8 @@ def run_selftest():
     _selftest_posts()
     _selftest_play_events()
     _selftest_warm_hh()
-    print("OK: wopo selftest 14 组场景全部通过。", file=sys.stderr)
+    _selftest_chip_div()
+    print("OK: wopo selftest 15 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================

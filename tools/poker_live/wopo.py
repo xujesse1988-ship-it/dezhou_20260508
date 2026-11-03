@@ -113,6 +113,87 @@ def legalize(resp, valid):
     return out
 
 
+# blueprint 的大盲（solver 筹码）。advisor 把桌面筹码乘 scale = SOLVER_BB / 桌面大盲 对上 blueprint，
+# 要求整除，只能放大（10/20 → ×5）；大盲不整除 SOLVER_BB 的桌（100/200）由 driver 先把筹码除以 chip_div。
+SOLVER_BB = 100
+_STREETS = ("preflop", "flop", "turn", "river")
+
+
+def chip_div(sb, bb, ante):
+    """发给 advisor 前桌面筹码要除的整数 d（1 = 原样发）。取最小的 d，使 bb / d 整除 SOLVER_BB，且 d 同时
+    整除小盲、大盲、ante（缩小后盲注 / ante 精确，advisor 的 ante 比例核对照样过）。找不到 → 1（advisor
+    自己兜底 scale_not_integer）。"""
+    if bb <= 0 or SOLVER_BB % bb == 0:
+        return 1
+    for d in range(2, bb + 1):
+        if bb % d == 0 and SOLVER_BB % (bb // d) == 0 and sb % d == 0 and ante % d == 0:
+            return d
+    return 1
+
+
+def _rdiv(x, d):
+    return (x + d // 2) // d  # round half up
+
+
+def _street_priors(actions, streets, bb):
+    """每条街开始时、还能行动的玩家此前各街已投入（不含 ante）= 前面各街的最大本街总额之和
+    （还能行动的人一定跟齐了前面每条街的最大注；没跟齐的已全下，不会再有动作）。"""
+    top = dict.fromkeys(_STREETS, 0)
+    top["preflop"] = bb
+    for a, st in zip(actions, streets):
+        if a.get("to") is not None:
+            top[st] = max(top[st], a["to"])
+    out, acc = {}, 0
+    for st in _STREETS:
+        out[st] = acc
+        acc += top[st]
+    return out
+
+
+def downscale_request(req, d, streets, street):
+    """advisor 请求的筹码全部 ÷ d。本街总额 to 按「整手累计投入」取整再差分：
+    to' = round((prior + to) / d) − round(prior / d)，开局栈 stack' = round(stack / d)。这样全下的 to'
+    恰好用完 stack'，各街 to' 加起来 = 累计投入取整，单数筹码不会让 advisor 看到超出栈的下注。
+    streets[i] = actions[i] 所在街；street = 当前街（valid 的 min_raise / max_raise 是这条街的总额）。
+    返回 (缩小后的请求, 当前街的 prior)；prior 给 [`upscale_response`] 还原 hero 的加注额。"""
+    pri = _street_priors(req["actions"], streets, req["big_blind"])
+
+    def s(to, st):
+        return _rdiv(pri[st] + to, d) - _rdiv(pri[st], d)
+
+    out = dict(req)
+    out["small_blind"] = req["small_blind"] // d
+    out["big_blind"] = req["big_blind"] // d
+    if "ante" in req:
+        out["ante"] = req["ante"] // d
+    out["actions"] = [{**a, "to": s(a["to"], st)} if a.get("to") is not None else dict(a)
+                      for a, st in zip(req["actions"], streets)]
+    valid = dict(req["valid"])
+    for k in ("min_raise", "max_raise"):
+        if valid.get(k) is not None:
+            valid[k] = s(valid[k], street)
+    out["valid"] = valid
+    if "stacks" in req:
+        out["stacks"] = [_rdiv(x, d) for x in req["stacks"]]
+    return out, pri[street]
+
+
+def upscale_response(resp, d, prior, valid, svalid):
+    """advisor 响应（缩小的筹码）→ 桌面筹码。只有 raise 带金额：到 / 超过缩小后的上限 = 桌面全下额，
+    到 / 低于下限 = 桌面最小加注额，中间按累计投入还原后夹进桌面合法区间。原值记 scaled_amount。"""
+    amount = resp.get("amount")
+    if (resp.get("action") != "raise" or isinstance(amount, bool) or not isinstance(amount, int)
+            or not valid.get("can_raise")):
+        return resp  # 金额不对的交给 legalize 兜底
+    if amount >= svalid["max_raise"]:
+        real = valid["max_raise"]
+    elif amount <= svalid["min_raise"]:
+        real = valid["min_raise"]
+    else:
+        real = min(max((_rdiv(prior, d) + amount) * d - prior, valid["min_raise"]), valid["max_raise"])
+    return {**resp, "amount": real, "scaled_amount": amount}
+
+
 class WopoSession:
     def __init__(self, worker, action_file, n_seats, hero_seat=0, num_hands=0,
                  action_log=None, prewarm=False, exploit=False, debug=False,
@@ -160,6 +241,7 @@ class WopoSession:
                          "fallback": 0, "prewarms": 0, "hero_actions": 0, "hero_same": 0,
                          "hero_diff": 0, "hero_unadvised": 0, "dup_msgs": 0, "result_notes": 0}
         self.fallback_reasons = {}
+        self._chip_divs_seen = set()  # 已打过提示的 chip_div
         self.skip_reasons = {}  # 作废原因（冒号前标签）→ 手数
 
     def _play(self, text, etype, hand_id=None, **fields):
@@ -409,16 +491,27 @@ class WopoSession:
             self.done = True
 
     def _request(self, valid):
+        """advisor 请求 + (chip_div, 当前街 prior)。大盲不整除 SOLVER_BB 的桌筹码先 ÷ chip_div
+        （[`downscale_request`]）；整除时 chip_div = 1，请求与旧版逐字节相同。"""
         hand = self.hand
         dealt = hand.dealt if len(hand.dealt) < self.n_seats else None
         # 补盲不进请求，由 advisor_actions 改写成普通动作（advisor 没有补盲逻辑）。
-        return make_request(hand.hole, hand.board, hand.button, hand.hero, self.n_seats,
-                            hand.sb, hand.bb, hand.advisor_actions(), valid,
-                            stacks=hand.hand_start_stacks(placeholder=100 * hand.bb),
-                            dealt_seats=list(dealt) if dealt else None,
-                            names=dict(hand.names) if self.send_names else None,
-                            ante=hand.ante,
-                            hand_id=hand.hand_id if self.send_hand_id else None)
+        req = make_request(hand.hole, hand.board, hand.button, hand.hero, self.n_seats,
+                           hand.sb, hand.bb, hand.advisor_actions(), valid,
+                           stacks=hand.hand_start_stacks(placeholder=100 * hand.bb),
+                           dealt_seats=list(dealt) if dealt else None,
+                           names=dict(hand.names) if self.send_names else None,
+                           ante=hand.ante,
+                           hand_id=hand.hand_id if self.send_hand_id else None)
+        d = chip_div(hand.sb, hand.bb, hand.ante)
+        if d == 1:
+            return req, (1, 0)
+        if d not in self._chip_divs_seen:
+            self._chip_divs_seen.add(d)
+            print(f"  [chip] 盲注 {hand.sb}/{hand.bb} ante {hand.ante}：发给 advisor 的筹码 ÷{d}，"
+                  f"建议的加注额 ×{d} 还原", file=sys.stderr)
+        req, prior = downscale_request(req, d, hand.action_streets, hand.street)
+        return req, (d, prior)
 
     def _maybe_prewarm(self):
         """街起点预热（--search-prewarm）：hero 本手还能行动才发；发错无害（advisor 侧 skip）。"""
@@ -428,7 +521,7 @@ class WopoSession:
             return
         stub = {"can_check": False, "can_call": False, "can_raise": False,
                 "min_raise": None, "max_raise": None}
-        self.worker.submit_prewarm(self._request(stub))
+        self.worker.submit_prewarm(self._request(stub)[0])
         self.counters["prewarms"] += 1
 
     def _maybe_decide(self, msg):
@@ -441,10 +534,11 @@ class WopoSession:
             return
         self._decided.add(key)
         self.counters["turns"] += 1
-        req = self._request(valid)
+        req, (div, prior) = self._request(valid)
         ctx = {"hand": hand, "key": key, "table_seq": msg.get("table_seq"),
                "street": hand.street, "pot": hand.pot, "to_call": hand.to_call(hand.hero),
-               "board": list(hand.board), "valid": valid, "t_wall": time.time()}
+               "board": list(hand.board), "valid": valid, "t_wall": time.time(),
+               "chip_div": div, "chip_prior": prior}
         self._dbg(f"your_turn street={hand.street} hole={''.join(hand.hole)} "
                   f"board={' '.join(hand.board)} valid={valid}")
         self._play(f">> 轮到 hero（{_STREET_CN[hand.street]}，底池 {hand.pot}，跟 {ctx['to_call']}）",
@@ -457,6 +551,9 @@ class WopoSession:
         """决策结果（worker 线程回调）。hero 在此期间已出牌 / 这手已作废 → 结果过期，不写行动文件。"""
         with self.lock:
             self.counters["decisions"] += 1
+            if ctx["chip_div"] > 1:
+                resp = upscale_response(resp, ctx["chip_div"], ctx["chip_prior"], ctx["valid"],
+                                        req["valid"])
             resp = legalize(resp, ctx["valid"])
             tally_source(self.counters, self.fallback_reasons, resp.get("source", ""))
             hand = self.hand
@@ -504,8 +601,12 @@ class WopoSession:
                        stale_kind=stale.split(":", 1)[0] if stale else None,
                        written=stale is None, rejected=resp.get("rejected"))
             if self.action_log:
+                # req = advisor 实际收到的（chip_div > 1 时是缩小后的筹码）；resp 已还原成桌面筹码。
                 self.action_log.write(json.dumps({"req": req, "resp": resp, "decide_ms": ms,
-                                                  "stale": stale}, ensure_ascii=False) + "\n")
+                                                  "stale": stale,
+                                                  **({"chip_div": ctx["chip_div"]}
+                                                     if ctx["chip_div"] > 1 else {})},
+                                                 ensure_ascii=False) + "\n")
                 self.action_log.flush()
 
     def report(self):
