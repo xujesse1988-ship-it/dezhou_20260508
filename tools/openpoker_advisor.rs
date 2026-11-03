@@ -1676,12 +1676,29 @@ fn action_kind(action: &str, la: &poker::LegalActionSet) -> Option<&'static str>
     }
 }
 
+/// 平跟池首次决策查 blueprint 的平跟家数上限（含）。数法同 [`limp_heuristic`]：首个加注之前的跟注
+/// （开池平跟、跟着平跟、SB 补齐都算）。11-03 20/50 轮实盘：隔离加注 17 次没有一次让所有人弃牌，
+/// 3 家以上平跟时常被 2–3 家跟进（blueprint 以为平跟者会弃牌，家数越多偏得越远）→ 用户定 ≥3 家退回启发式。
+const LIMP_FIRST_BLUEPRINT_MAX_LIMPERS: usize = 2;
+
+/// 首个加注（`raise` / `all_in` / `bet`）之前的跟注数，与 [`limp_heuristic`] 同口径。
+fn limps_before_first_raise(req: &Request) -> usize {
+    req.actions
+        .iter()
+        .take_while(|h| !matches!(h.action.as_str(), "raise" | "all_in" | "bet"))
+        .filter(|h| h.action == "call")
+        .count()
+}
+
 /// 平跟池首次决策改查 blueprint（`--search-limp-first-blueprint`）是否适用于这次请求：hero 本手还没有
-/// 任何动作（翻前第一次轮到 hero）。调用方另须满足：有平跟映射、影子同步、翻前、不是面对全下。
-/// 这时影子节点 = 平跟者都弃牌后 hero 面对的局面（前面没人加注 = 开池 / SB 首入 / BB 面对 SB 补齐；
-/// 平跟后有人加注 = 面对开池），直接查 blueprint。hero 行动过之后的翻前决策仍走 [`limp_heuristic`]。
+/// 任何动作（翻前第一次轮到 hero），且平跟不超过 [`LIMP_FIRST_BLUEPRINT_MAX_LIMPERS`] 家。调用方另须
+/// 满足：有平跟映射、影子同步、翻前、不是面对全下。这时影子节点 = 平跟者都弃牌后 hero 面对的局面
+/// （前面没人加注 = 开池 / SB 首入 / BB 面对 SB 补齐；平跟后有人加注 = 面对开池），直接查 blueprint。
+/// hero 行动过之后的翻前决策、平跟达到 3 家时仍走 [`limp_heuristic`]。
 fn limp_first_blueprint_applies(req: &Request) -> bool {
-    req.board.is_empty() && !req.actions.iter().any(|h| h.seat == req.my_seat)
+    req.board.is_empty()
+        && !req.actions.iter().any(|h| h.seat == req.my_seat)
+        && limps_before_first_raise(req) <= LIMP_FIRST_BLUEPRINT_MAX_LIMPERS
 }
 
 /// hero 在 `step`（历史截到 hero 这一步之前、`valid` 已重建）上是否由 [`limp_heuristic`] 决定——与
@@ -9701,6 +9718,16 @@ mod tests {
         ];
         let mut all_cases = cases.clone();
         all_cases.push((0, after_iso, true));
+        // 3 家平跟（开关开时也退回启发式）。
+        all_cases.push((
+            0,
+            vec![
+                hist(3, "call", Some(20)),
+                hist(4, "call", Some(20)),
+                hist(5, "call", Some(20)),
+            ],
+            true,
+        ));
         for (limp_as_fold, first_bp) in [(true, false), (false, false), (true, true)] {
             let rt = SearchRuntime {
                 limp_as_fold,
@@ -9864,6 +9891,30 @@ mod tests {
         let r = run(&after_iso, &on_rt);
         assert!(r.source.starts_with("limp_heuristic"), "{r:?}");
         assert_eq!(r, run(&after_iso, &off_rt), "hero 行动过后开关不改输出");
+
+        // 平跟家数：2 家仍查 blueprint，3 家退回启发式（SB 补齐也算一家）。
+        let limps = |n: u8| -> Vec<HistAction> {
+            (0..3u8)
+                .map(|k| hist(3 + k, if k < n { "call" } else { "fold" }, None))
+                .collect()
+        };
+        let r = run(&limp_req(0, ["9s", "6s"], &[], limps(2)), &on_rt);
+        assert_eq!(r.source, "blueprint:limp_first", "2 家平跟：{r:?}");
+        let three = limp_req(0, ["9s", "6s"], &[], limps(3));
+        let r = run(&three, &on_rt);
+        assert!(r.source.starts_with("limp_heuristic"), "3 家平跟：{r:?}");
+        assert_eq!(r, run(&three, &off_rt), "3 家平跟时开关不改输出");
+        let mut acts = limps(2);
+        acts.push(hist(0, "fold", None));
+        acts.push(hist(1, "call", None));
+        let mut bb2 = limp_req(2, ["9s", "6s"], &[], acts);
+        bb2.valid.can_check = true;
+        bb2.valid.can_call = false;
+        let r = run(&bb2, &on_rt);
+        assert!(
+            r.source.starts_with("limp_heuristic"),
+            "2 家平跟 + SB 补齐：{r:?}"
+        );
 
         // BB 面对平跟、其余全弃：影子已结束（BB 白赢）→ 失同步，仍启发式。
         let mut bb = limp_req(
