@@ -88,7 +88,8 @@ use serde::{Deserialize, Serialize};
 
 use poker::eval::NaiveHandEvaluator;
 use poker::training::blueprint_advisor::{
-    advance_shadow_by_applied, find_tag, outgoing_action, parse_card,
+    advance_shadow_by_applied, advance_shadow_by_applied_with, find_tag, outgoing_action,
+    parse_card,
 };
 use poker::training::fourbet_exploit::{FourBetConfig, FourBetTracker};
 use poker::training::game::{Game, PlayerId};
@@ -115,7 +116,7 @@ use poker::training::subgame::{
 };
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, HandEvaluator,
-    InfoSetId, SeatId, StreetActionAbstraction, StreetTag, TableConfig,
+    InfoSetId, OffTreeRounding, SeatId, StreetActionAbstraction, StreetTag, TableConfig,
 };
 
 /// `--seats` 缺省值（6-max；不传新参数时行为与引入 `--seats` 前逐位相同）。
@@ -1285,6 +1286,9 @@ fn raise_pot_milli((max_committed, pot_after_call): (u64, u64), to: u64) -> Opti
 ///
 /// 返回值：真实动作是下注 / 加注 / 主动全下时记一条 [`BetSizeMap`]（跟注全下不记——那不是尺寸
 /// 选择）；其余动作 `None`。
+///
+/// `rounding`：真实下注落在两档之间时怎么取（hero 自己的动作 `Nearest`、对手 `Randomized`，
+/// 见 [`advance_shadow_by_applied_with`]）。
 fn lockstep_step(
     real: &mut poker::GameState,
     abs: &mut SimplifiedNlheState,
@@ -1292,6 +1296,7 @@ fn lockstep_step(
     actor: u8,
     action: &str,
     to_solver: Option<u64>,
+    rounding: OffTreeRounding,
 ) -> Result<Option<BetSizeMap>, String> {
     if real.current_player() != Some(SeatId(actor)) {
         // 码深漂移 / 历史错位 → 重放对不上回合。
@@ -1315,7 +1320,8 @@ fn lockstep_step(
         return Err("replay_illegal".into());
     }
     let is_all_in = real.players()[actor as usize].status == poker::PlayerStatus::AllIn;
-    let Ok(mapped) = advance_shadow_by_applied(abs, concrete, is_all_in, abs_rng) else {
+    let Ok(mapped) = advance_shadow_by_applied_with(abs, concrete, is_all_in, rounding, abs_rng)
+    else {
         // 结构性 gap（如 open-limp 进 no-limp 影子）→ 失同步（不静默改 kind）。
         return Err("structural_gap".into());
     };
@@ -1465,7 +1471,16 @@ fn lockstep_replay(
             synced_node,
             limp: LimpFoldMap::default(),
         };
-        lockstep_step(&mut real, &mut abs, &mut abs_rng, t, "fold", None).map_err(phantom_err)?;
+        lockstep_step(
+            &mut real,
+            &mut abs,
+            &mut abs_rng,
+            t,
+            "fold",
+            None,
+            OffTreeRounding::Randomized,
+        )
+        .map_err(phantom_err)?;
         if shadow_drifted(&real, &abs, &[]) {
             return Err(phantom_err("lockstep_drift".into()));
         }
@@ -1473,6 +1488,8 @@ fn lockstep_replay(
     // 影子已弃、真实在手的平跟者（tree seat）。
     let mut ghosts: Vec<u8> = Vec::new();
     let mut sizes: Vec<BetSizeMap> = Vec::new();
+    // hero 的 tree seat：hero 自己的下注确定性取最近档（只是把建议尺寸凑了整），对手随机取整。
+    let hero_tree = smap.tree_seat(req.my_seat).ok();
     for h in &req.actions {
         let synced_node = abs.current_node_id;
         let err =
@@ -1517,6 +1534,11 @@ fn lockstep_replay(
             limp.folds.push((synced_node, actor as PlayerId));
             ghosts.push(actor);
         } else {
+            let rounding = if hero_tree == Some(actor) {
+                OffTreeRounding::Nearest
+            } else {
+                OffTreeRounding::Randomized
+            };
             let size = lockstep_step(
                 &mut real,
                 &mut abs,
@@ -1524,6 +1546,7 @@ fn lockstep_replay(
                 actor,
                 &h.action,
                 to_solver,
+                rounding,
             )
             .map_err(|e| err(e, synced_node, &ghosts, &limp))?;
             sizes.extend(size);

@@ -37,7 +37,9 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::abstraction::action::{AbstractAction, ActionAbstraction, StreetActionAbstraction};
+use crate::abstraction::action::{
+    AbstractAction, ActionAbstraction, OffTreeRounding, StreetActionAbstraction,
+};
 use crate::abstraction::info::InfoSetId;
 use crate::core::rng::{ChaCha20Rng, RngSource};
 use crate::core::{Card, ChipAmount, PlayerStatus, Rank, Street, Suit};
@@ -314,6 +316,28 @@ pub fn advance_shadow_by_applied(
     applied_is_all_in: bool,
     rng: &mut dyn RngSource,
 ) -> Result<AbstractAction, String> {
+    advance_shadow_by_applied_with(
+        shadow,
+        applied,
+        applied_is_all_in,
+        OffTreeRounding::Randomized,
+        rng,
+    )
+}
+
+/// [`advance_shadow_by_applied`] 带取整方式的版本：`rounding` 决定真实 Bet/Raise 落在两档之间时
+/// 怎么取（hero 自己的动作传 [`OffTreeRounding::Nearest`]，对手传 `Randomized`）。Bet/Raise 只在
+/// **影子当前节点实际有的**进攻档里取（[`StreetActionAbstraction::map_aggressive_onto_node`]：
+/// 被并进 AllIn 的档按全下真实金额比较、被剪掉的档不参与），再走原投影 / 塌 AllIn 逻辑。
+///
+/// [`StreetActionAbstraction::map_aggressive_onto_node`]: crate::abstraction::action::StreetActionAbstraction::map_aggressive_onto_node
+pub fn advance_shadow_by_applied_with(
+    shadow: &mut SimplifiedNlheState,
+    applied: Action,
+    applied_is_all_in: bool,
+    rounding: OffTreeRounding,
+    rng: &mut dyn RngSource,
+) -> Result<AbstractAction, String> {
     let legal_abs = SimplifiedNlheGame::legal_actions(shadow);
     let abs_action = match applied {
         Action::Fold => find_tag(&legal_abs, AbstractActionTag::Fold)
@@ -347,8 +371,18 @@ pub fn advance_shadow_by_applied(
             .ok_or("incoming AllIn 在影子当前节点不合法")?,
         Action::Bet { to } | Action::Raise { to } => {
             // 以影子几何选最近 ratio，投影到影子合法集（塌 AllIn 兜底）。
-            let raw = shadow.abs.map_off_tree(&shadow.game_state, to);
-            let raw_tag = AbstractActionTag::of(&raw);
+            // 只在影子节点实际有的档里取整；一个候选都没有（如不能进攻）→ 退 map_off_tree。
+            let on_node =
+                |a: &AbstractAction| find_tag(&legal_abs, AbstractActionTag::of(a)).is_some();
+            let raw_tag = match shadow.abs.map_aggressive_onto_node(
+                &shadow.game_state,
+                to,
+                &on_node,
+                rounding,
+            ) {
+                Some(a) => AbstractActionTag::of(&a),
+                None => AbstractActionTag::of(&shadow.abs.map_off_tree(&shadow.game_state, to)),
+            };
             let projected = project_tag_onto(&legal_abs, raw_tag)?;
             let abs_collapsed =
                 matches!(AbstractActionTag::of(&projected), AbstractActionTag::AllIn);

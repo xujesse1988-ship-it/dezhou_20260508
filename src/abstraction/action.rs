@@ -285,21 +285,83 @@ fn pseudo_harmonic_pick(
     state: &GameState,
     real_to: ChipAmount,
 ) -> BetRatio {
-    let a = lower.as_milli() as u128;
-    let b = upper.as_milli() as u128;
+    let picks_lower = pseudo_harmonic_picks_lower(
+        lower.as_milli() as u64,
+        upper.as_milli() as u64,
+        x_milli,
+        state,
+        real_to,
+        OffTreeRounding::Randomized,
+    );
+    if picks_lower {
+        lower
+    } else {
+        upper
+    }
+}
+
+/// [`pseudo_harmonic_pick`] 的 milli 版：两档以 milli 坐标给出（`a_milli < x_milli < b_milli`），
+/// 返回是否取较小档。`Randomized` 与 [`pseudo_harmonic_pick`] 逐位相同（同种子、同判据）；
+/// `Nearest` 取 `f_lower ≥ 1/2` 的那一档（确定性，同一 pseudo-harmonic 度量下的「最近档」）。
+fn pseudo_harmonic_picks_lower(
+    a_milli: u64,
+    b_milli: u64,
+    x_milli: u64,
+    state: &GameState,
+    real_to: ChipAmount,
+    rounding: OffTreeRounding,
+) -> bool {
+    let a = a_milli as u128;
+    let b = b_milli as u128;
     let x = x_milli as u128;
     // den > 0（b > a）；num ∈ (0, den)（a < x < b）→ f_lower ∈ (0, 1)。
     // num = P(map→lower) 分子；den = 分母。
     let num = (b - x) * (1000 + a);
     let den = (b - a) * (1000 + x);
-    // r ∈ [0, 2^64)；map→lower ⟺ r/2^64 < num/den ⟺ r·den < num·2^64。
-    let r = ChaCha20Rng::from_seed(phm_round_seed(state, real_to)).next_u64() as u128;
-    let lhs = r.saturating_mul(den);
-    let rhs = num << 64; // shift amount 64 < 128 → 不 panic；realistic ratio 下无丢位。
-    if lhs < rhs {
-        lower
+    match rounding {
+        OffTreeRounding::Randomized => {
+            // r ∈ [0, 2^64)；map→lower ⟺ r/2^64 < num/den ⟺ r·den < num·2^64。
+            let r = ChaCha20Rng::from_seed(phm_round_seed(state, real_to)).next_u64() as u128;
+            let lhs = r.saturating_mul(den);
+            let rhs = num << 64; // shift amount 64 < 128 → 不 panic；realistic ratio 下无丢位。
+            lhs < rhs
+        }
+        OffTreeRounding::Nearest => num.saturating_mul(2) >= den,
+    }
+}
+
+/// 真实 Bet/Raise 落在两个抽象档之间时怎么取舍（[`StreetActionAbstraction::map_aggressive_onto_node`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OffTreeRounding {
+    /// pseudo-harmonic randomized rounding（与 [`ActionAbstraction::map_off_tree`] 同种子同判据）。
+    /// 用于**对手**动作：随机化让对手没法卡固定的取整边界。
+    Randomized,
+    /// 确定性取 pseudo-harmonic 概率 ≥ 1/2 的那一档。用于 **hero 自己**的动作：hero 只是把建议
+    /// 尺寸凑了整（实盘 001131：建议 6875、实下 7000），不需要防剥削，随机取到远端档只会把导航
+    /// 带到错误的下注线上。
+    Nearest,
+}
+
+/// 第 `ratio` 档在 `(max_committed, pot_after_call)` 几何下的目标 `to`（ceil，再抬到 `min_to`）。
+/// [`DefaultActionAbstraction::abstract_actions`] 出档与
+/// [`DefaultActionAbstraction::map_aggressive_onto_node`] 判「该档是否被并进 AllIn」共用这一份。
+fn ratio_target_to(
+    ratio: BetRatio,
+    max_committed: ChipAmount,
+    pot_after_call: ChipAmount,
+    min_to: ChipAmount,
+) -> ChipAmount {
+    // candidate_to = max_committed + ceil(ratio_milli * pot_after_call / 1000)
+    let milli = ratio.as_milli() as u64;
+    let pot_chips = pot_after_call.as_u64();
+    let scaled = (milli as u128) * (pot_chips as u128);
+    let ratio_part_ceil = scaled.div_ceil(1000) as u64;
+    let candidate_to = max_committed + ChipAmount::new(ratio_part_ceil);
+    // ① floor to min_to
+    if candidate_to < min_to {
+        min_to
     } else {
-        upper
+        candidate_to
     }
 }
 
@@ -316,6 +378,123 @@ impl DefaultActionAbstraction {
 
     pub fn default_6_action() -> DefaultActionAbstraction {
         DefaultActionAbstraction::new(ActionAbstractionConfig::default_6_action())
+    }
+
+    /// 把真实 Bet/Raise（`real_to`，非 all-in）映射到**某个树节点实际有的**进攻档上。
+    ///
+    /// 与 [`ActionAbstraction::map_off_tree`] 的区别：后者在配置菜单的 ratio 之间取整，取到的档
+    /// 可能在这个节点并不存在——典型是该档目标额 ≥ 全下额、被 AA-004 并进了 AllIn 槽，或被建树
+    /// 规则剪掉。调用方过去把「不存在」一律当 AllIn（实盘 001131：转牌下 7000、半池档 6875，
+    /// 2.4% 概率取到 1pot 档 13750 ≥ 全下 13400 → 当成全下 → 后面失同步）。这里候选只取节点里
+    /// 真实存在的档：
+    ///
+    /// - 配置 ratio `r` 的 Bet/Raise 在节点里（`allowed`）→ 候选，坐标 = `r` 的 milli（与
+    ///   `map_off_tree` 同坐标，所以节点档齐全、无档被并进全下时结果与 `map_off_tree` 逐位相同）；
+    /// - `r` 的目标额 ≥ 全下额（被并进 AllIn）且节点有 AllIn → AllIn 作候选，坐标 = 全下额本身的
+    ///   milli（按全下的真实金额参与比较）；
+    /// - 其余（被建树规则剪掉的档）不作候选。
+    ///
+    /// 在候选里按 [`map_off_tree`](ActionAbstraction::map_off_tree) 同样的规则取上下邻：命中端点取该档，
+    /// 夹在中间按 `rounding` 取舍，超出两端就近。返回 `Bet/Raise { to: real_to, .. }` 或
+    /// `AllIn { to: 全下额 }`。`real_to ≥ 全下额` → AllIn（节点没有则 `None`）；
+    /// `real_to ≤ 本轮最高投入` / 不能进攻 / 无候选 → `None`（调用方按原兜底处理）。纯函数。
+    pub fn map_aggressive_onto_node(
+        &self,
+        state: &GameState,
+        real_to: ChipAmount,
+        allowed: &dyn Fn(&AbstractAction) -> bool,
+        rounding: OffTreeRounding,
+    ) -> Option<AbstractAction> {
+        let actor_seat = state.current_player()?;
+        let la = state.legal_actions();
+        let actor = &state.players()[actor_seat.0 as usize];
+        let max_committed = state
+            .players()
+            .iter()
+            .map(|p| p.committed_this_round)
+            .max()
+            .unwrap_or(ChipAmount::ZERO);
+        let cap = la
+            .all_in_amount
+            .unwrap_or(actor.committed_this_round + actor.stack);
+        let all_in = AbstractAction::AllIn { to: cap };
+        if real_to >= cap {
+            return allowed(&all_in).then_some(all_in);
+        }
+        if real_to <= max_committed {
+            return None;
+        }
+        let min_to = la
+            .bet_range
+            .map(|(min, _)| min)
+            .or(la.raise_range.map(|(min, _)| min))?;
+        let is_bet = la.bet_range.is_some();
+        let to_call_delta = if max_committed > actor.committed_this_round {
+            max_committed - actor.committed_this_round
+        } else {
+            ChipAmount::ZERO
+        };
+        let pot_after_call = state.pot() + to_call_delta;
+        let pot_chips = pot_after_call.as_u64();
+        // 与 map_off_tree 同口径：raise-above-call 占 pot_after_call 的 milli（floor）。
+        let milli_of = |to: ChipAmount| -> u64 {
+            to.as_u64()
+                .saturating_sub(max_committed.as_u64())
+                .saturating_mul(1000)
+                .checked_div(pot_chips)
+                .unwrap_or(0)
+        };
+        let x_milli = milli_of(real_to);
+
+        let mut cands: Vec<(u64, AbstractAction)> =
+            Vec::with_capacity(self.config.raise_pot_ratios.len() + 1);
+        for &ratio in &self.config.raise_pot_ratios {
+            let on_menu = if is_bet {
+                AbstractAction::Bet {
+                    to: real_to,
+                    ratio_label: ratio,
+                }
+            } else {
+                AbstractAction::Raise {
+                    to: real_to,
+                    ratio_label: ratio,
+                }
+            };
+            if allowed(&on_menu) {
+                cands.push((ratio.as_milli() as u64, on_menu));
+            } else if ratio_target_to(ratio, max_committed, pot_after_call, min_to) >= cap
+                && allowed(&all_in)
+                && !cands
+                    .iter()
+                    .any(|(_, a)| matches!(a, AbstractAction::AllIn { .. }))
+            {
+                cands.push((milli_of(cap), all_in));
+            }
+        }
+
+        let lower = cands
+            .iter()
+            .filter(|(m, _)| *m <= x_milli)
+            .max_by_key(|(m, _)| *m)
+            .copied();
+        let upper = cands
+            .iter()
+            .filter(|(m, _)| *m >= x_milli)
+            .min_by_key(|(m, _)| *m)
+            .copied();
+        match (lower, upper) {
+            (Some((a, act)), Some((b, _))) if a == b => Some(act),
+            (Some((a, lo)), Some((b, hi))) => Some(
+                if pseudo_harmonic_picks_lower(a, b, x_milli, state, real_to, rounding) {
+                    lo
+                } else {
+                    hi
+                },
+            ),
+            (None, Some((_, hi))) => Some(hi),
+            (Some((_, lo)), None) => Some(lo),
+            (None, None) => None,
+        }
     }
 }
 
@@ -375,16 +554,8 @@ impl ActionAbstraction for DefaultActionAbstraction {
                 .map(|(min, _)| min)
                 .or(la.raise_range.map(|(min, _)| min))
                 .expect("bet_range or raise_range checked above");
-            // candidate_to = max_committed + ceil(ratio_milli * pot_after_call / 1000)
-            let milli = ratio.as_milli() as u64;
-            let pot_chips = pot_after_call.as_u64();
-            let scaled = (milli as u128) * (pot_chips as u128);
-            let ratio_part_ceil = scaled.div_ceil(1000) as u64;
-            let mut candidate_to = max_committed + ChipAmount::new(ratio_part_ceil);
-            // ① floor to min_to
-            if candidate_to < min_to {
-                candidate_to = min_to;
-            }
+            // ① candidate_to（ceil，floor 到 min_to）
+            let candidate_to = ratio_target_to(ratio, max_committed, pot_after_call, min_to);
             // ② ceil to AllIn cap
             if candidate_to >= cap {
                 // Will be handled by AllIn slot below; emit nothing here so AllIn priority
@@ -671,6 +842,18 @@ impl StreetActionAbstraction {
     pub fn config_for(&self, street: Street) -> &ActionAbstractionConfig {
         self.abs_for_street(street).config()
     }
+
+    /// 按街分派的 [`DefaultActionAbstraction::map_aggressive_onto_node`]。
+    pub fn map_aggressive_onto_node(
+        &self,
+        state: &GameState,
+        real_to: ChipAmount,
+        allowed: &dyn Fn(&AbstractAction) -> bool,
+        rounding: OffTreeRounding,
+    ) -> Option<AbstractAction> {
+        self.abs_for_street(state.street())
+            .map_aggressive_onto_node(state, real_to, allowed, rounding)
+    }
 }
 
 impl ActionAbstraction for StreetActionAbstraction {
@@ -845,5 +1028,161 @@ mod street_abstraction_tests {
         assert_eq!(abs.config_for(Street::River).raise_count(), 1);
         // Showdown 复用 river 槽位（见类型文档）。
         assert_eq!(abs.config_for(Street::Showdown).raise_count(), 1);
+    }
+
+    /// 节点里的抽象动作是否含与 `a` 同类同档的一项（只比 kind + ratio_label，不比 `to`）。
+    fn same_slot(set: &AbstractActionSet, a: &AbstractAction) -> bool {
+        set.as_slice().iter().any(|b| match (a, b) {
+            (
+                AbstractAction::Bet { ratio_label: x, .. },
+                AbstractAction::Bet { ratio_label: y, .. },
+            )
+            | (
+                AbstractAction::Raise { ratio_label: x, .. },
+                AbstractAction::Raise { ratio_label: y, .. },
+            ) => x == y,
+            (AbstractAction::AllIn { .. }, AbstractAction::AllIn { .. }) => true,
+            _ => false,
+        })
+    }
+
+    /// 节点档齐全、无档被并进全下时，`map_aggressive_onto_node(Randomized)` 与 `map_off_tree`
+    /// 逐位相同（对手下注的旧行为不变）。HU 200BB flop 起点：底池 200、各 19900，{0.5,1,2}pot
+    /// 都远小于全下。
+    #[test]
+    fn map_onto_node_randomized_equals_map_off_tree_when_menu_intact() {
+        let abs = StreetActionAbstraction::default_6_action();
+        for seed in [3u64, 11, 0xBEEF] {
+            let s = decision_state_on_street(Street::Flop, seed);
+            let set = abs.abstract_actions(&s);
+            assert_eq!(set.as_slice().len(), 5, "check + 3 档 + allin");
+            let allowed = |a: &AbstractAction| same_slot(&set, a);
+            for to in (1..=1_000u64).map(ChipAmount::new) {
+                let old = abs.map_off_tree(&s, to);
+                let new = abs
+                    .map_aggressive_onto_node(&s, to, &allowed, OffTreeRounding::Randomized)
+                    .expect("能下注的点必有候选");
+                assert_eq!(new, old, "seed={seed:#x} to={to:?}");
+            }
+        }
+    }
+
+    /// HU 短码：翻前 SB 加到 400、BB 跟 → flop 底池 800、各剩 600。{0.5,1}pot 里 1pot（800）
+    /// ≥ 全下 600、被并进 AllIn，节点只有 {Check, Bet0.5(400), AllIn(600)}。
+    fn short_flop_state() -> GameState {
+        let mut cfg = TableConfig::default_hu_200bb();
+        cfg.starting_stacks = vec![ChipAmount::new(1_000); 2];
+        let mut s = GameState::new(&cfg, 7);
+        s.apply(Action::Raise {
+            to: ChipAmount::new(400),
+        })
+        .unwrap();
+        s.apply(Action::Call).unwrap();
+        assert_eq!(s.street(), Street::Flop);
+        assert_eq!(s.pot(), ChipAmount::new(800));
+        s
+    }
+
+    /// 被并进 AllIn 的档按全下真实金额参与比较：下 420（半池 400 稍多）——hero（Nearest）恒落半池；
+    /// 对手（Randomized）只会在 {半池, AllIn} 里取，绝不出节点里不存在的 1pot；贴近全下的 590 →
+    /// Nearest 落 AllIn。旧 `map_off_tree` 在配置菜单上取整，会取到节点没有的 1pot。
+    #[test]
+    fn map_onto_node_collapsed_slot_uses_real_allin_size() {
+        let abs =
+            StreetActionAbstraction::uniform(ActionAbstractionConfig::new(vec![0.5, 1.0]).unwrap());
+        let s = short_flop_state();
+        let set = abs.abstract_actions(&s);
+        let allowed = |a: &AbstractAction| same_slot(&set, a);
+        let half = AbstractAction::Bet {
+            to: ChipAmount::new(420),
+            ratio_label: BetRatio::HALF_POT,
+        };
+        assert!(allowed(&half));
+        assert!(!allowed(&AbstractAction::Bet {
+            to: ChipAmount::new(800),
+            ratio_label: BetRatio::FULL_POT,
+        }));
+        let near = |to: u64| {
+            abs.map_aggressive_onto_node(
+                &s,
+                ChipAmount::new(to),
+                &allowed,
+                OffTreeRounding::Nearest,
+            )
+        };
+        assert_eq!(near(420), Some(half));
+        assert_eq!(
+            near(590),
+            Some(AbstractAction::AllIn {
+                to: ChipAmount::new(600)
+            })
+        );
+        assert_eq!(
+            near(600),
+            Some(AbstractAction::AllIn {
+                to: ChipAmount::new(600)
+            })
+        );
+        let mut saw_full_in_old = false;
+        for to in 401..600u64 {
+            let r = abs
+                .map_aggressive_onto_node(
+                    &s,
+                    ChipAmount::new(to),
+                    &allowed,
+                    OffTreeRounding::Randomized,
+                )
+                .expect("有候选");
+            assert!(allowed(&r), "to={to}：取到节点里不存在的档 {r:?}");
+            let old = abs.map_off_tree(&s, ChipAmount::new(to));
+            saw_full_in_old |= matches!(old, AbstractAction::Bet { ratio_label, .. } if ratio_label == BetRatio::FULL_POT);
+        }
+        assert!(
+            saw_full_in_old,
+            "旧映射在这段确实会取到节点没有的 1pot（本测试的对照）"
+        );
+    }
+
+    /// Nearest 是确定性的 pseudo-harmonic 取舍：50% 交叉点 x* = (A+B+2AB)/(A+B+2)（A=0.5、B=1 →
+    /// x* ≈ 0.714），x* 以下取较小档、以上取较大档。HU flop 底池 200、档齐全：下 0.69 / 0.72 pot。
+    #[test]
+    fn map_onto_node_nearest_splits_at_pseudo_harmonic_midpoint() {
+        let abs =
+            StreetActionAbstraction::uniform(ActionAbstractionConfig::new(vec![0.5, 1.0]).unwrap());
+        let s = decision_state_on_street(Street::Flop, 3);
+        assert_eq!(s.pot(), ChipAmount::new(200));
+        let set = abs.abstract_actions(&s);
+        let allowed = |a: &AbstractAction| same_slot(&set, a);
+        let label = |to: u64| match abs.map_aggressive_onto_node(
+            &s,
+            ChipAmount::new(to),
+            &allowed,
+            OffTreeRounding::Nearest,
+        ) {
+            Some(AbstractAction::Bet { ratio_label, .. }) => ratio_label,
+            other => panic!("应为 Bet，得 {other:?}"),
+        };
+        assert_eq!(label(138), BetRatio::HALF_POT); // 0.69 pot
+        assert_eq!(label(144), BetRatio::FULL_POT); // 0.72 pot
+    }
+
+    /// 被建树规则剪掉（不在节点、也没被并进全下）的档不作候选：节点只认 {1pot, AllIn} 时，
+    /// 半池附近的下注落 1pot（就近），不再「不在节点 → 当 AllIn」。
+    #[test]
+    fn map_onto_node_skips_pruned_slots() {
+        let abs =
+            StreetActionAbstraction::uniform(ActionAbstractionConfig::new(vec![0.5, 1.0]).unwrap());
+        let s = decision_state_on_street(Street::Flop, 3);
+        let allowed = |a: &AbstractAction| {
+            matches!(a, AbstractAction::AllIn { .. })
+                || matches!(a, AbstractAction::Bet { ratio_label, .. } if *ratio_label == BetRatio::FULL_POT)
+        };
+        for rounding in [OffTreeRounding::Nearest, OffTreeRounding::Randomized] {
+            let r = abs.map_aggressive_onto_node(&s, ChipAmount::new(100), &allowed, rounding);
+            assert!(
+                matches!(r, Some(AbstractAction::Bet { ratio_label, .. }) if ratio_label == BetRatio::FULL_POT),
+                "{rounding:?}：得 {r:?}"
+            );
+        }
     }
 }

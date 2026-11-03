@@ -33,13 +33,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::abstraction::action::{ActionAbstraction, StreetActionAbstraction};
+use crate::abstraction::action::{OffTreeRounding, StreetActionAbstraction};
 use crate::abstraction::bucket_table::BucketTable;
 use crate::abstraction::info::{InfoSetId, StreetTag};
 use crate::abstraction::postflop::canonical_observation_id;
 use crate::abstraction::preflop::PreflopLossless169;
 use crate::core::rng::{ChaCha20Rng, RngSource};
-use crate::core::{Card, PlayerStatus, Street};
+use crate::core::{Card, ChipAmount, PlayerStatus, Street};
 use crate::rules::action::Action;
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
@@ -1868,6 +1868,38 @@ fn tilt_seat_to_width(
 /// 跳过该列（因子 1）保住其余列信号。设极小（只拦真·全零列，正常小概率仍参与条件化）。
 const CROSS_STREET_DEAD_COLUMN_EPS: f64 = 1e-12;
 
+/// 真实 Bet/Raise（`to`）在子树当前节点上的 tag（[`subtree_decisions_on_real_line`] 与
+/// [`navigate_subtree_by_real_actions`] 共用）：
+///
+/// - 真 all-in → AllIn；
+/// - 否则只在**节点实际有的**进攻档里取（[`StreetActionAbstraction::map_aggressive_onto_node`]：
+///   被并进 AllIn 的档按全下真实金额参与比较，被剪掉的档不参与）。行动者是 hero（自己的动作，
+///   多半只是把建议尺寸凑了整）→ 确定性取最近档；对手 → pseudo-harmonic 随机取整（与
+///   `map_off_tree` 同种子，节点档齐全时逐位同旧行为）。
+/// - 一个候选都没有 → 退旧兜底 AllIn（节点也没有 AllIn 时由调用方报失同步）。
+///
+/// 旧做法是 `map_off_tree` 在**配置菜单**上取整、取到的档不在节点就当 AllIn——实盘 001131 转牌
+/// hero 下 7000（半池档 6875），2.4% 概率取到 1pot 档（13750 ≥ 全下 13400，被并进 AllIn）→ 导航
+/// 当成 hero 全下 → 后面 s7 再全下时子树节点只剩 Fold/Call → 失同步、兜底弃牌。
+fn real_aggressive_tag(
+    abs: &StreetActionAbstraction,
+    state: &GameState,
+    to: ChipAmount,
+    applied_is_all_in: bool,
+    hero: PlayerId,
+    has: &dyn Fn(AbstractActionTag) -> bool,
+) -> AbstractActionTag {
+    if applied_is_all_in {
+        return AbstractActionTag::AllIn;
+    }
+    let rounding = match state.current_player() {
+        Some(p) if p.0 as PlayerId == hero => OffTreeRounding::Nearest,
+        _ => OffTreeRounding::Randomized,
+    };
+    abs.map_aggressive_onto_node(state, to, &|a| has(AbstractActionTag::of(a)), rounding)
+        .map_or(AbstractActionTag::AllIn, |a| AbstractActionTag::of(&a))
+}
+
 /// 沿子树**实际动作线**收集逐步决策三元组 `(子树节点 id, 抽象 tag, 决策者)`——
 /// [`navigate_subtree_by_real_actions`] 的「收集每步」版（后者只返回终点节点；档二′-跨街复用要
 /// 每个决策点单独读 σ）。走法逐字同源：tag 以**真栈几何**现算（aggressive 经
@@ -1879,6 +1911,7 @@ fn subtree_decisions_on_real_line(
     abs: &StreetActionAbstraction,
     root_real: &GameState,
     actions: &[(Action, bool)],
+    hero: PlayerId,
 ) -> Result<Vec<(NodeId, AbstractActionTag, PlayerId)>, String> {
     let mut state = root_real.clone();
     let mut id = subtree.root_id();
@@ -1909,12 +1942,7 @@ fn subtree_decisions_on_real_line(
             }
             Action::AllIn => AbstractActionTag::AllIn,
             Action::Bet { to } | Action::Raise { to } => {
-                let raw = AbstractActionTag::of(&abs.map_off_tree(&state, *to));
-                if *applied_is_all_in || !has(raw) {
-                    AbstractActionTag::AllIn
-                } else {
-                    raw
-                }
+                real_aggressive_tag(abs, &state, *to, *applied_is_all_in, hero, &has)
             }
         };
         let idx = node
@@ -2026,9 +2054,14 @@ fn condition_on_line(
     let prev_within = line;
     let next_board = mask_board;
     // —— 沿上一街子树实际动作线收集决策三元组（导航失配 → 退档一）——
-    let decisions =
-        subtree_decisions_on_real_line(prev_game.subtree(), &prev.sub_abs, prev_root, prev_within)
-            .ok()?;
+    let decisions = subtree_decisions_on_real_line(
+        prev_game.subtree(),
+        &prev.sub_abs,
+        prev_root,
+        prev_within,
+        hero,
+    )
+    .ok()?;
     let prior = prev_game.ranges(); // 子树解所条件化的 root range（None = uniform）。
                                     // card-removal 掩码：撞本街 board（含新发牌；prev_board ⊂ next_board，已覆盖上一街撞牌）→ 0。
     let next_board_set: BTreeSet<u8> = next_board.iter().map(|c| c.to_u8()).collect();
@@ -3167,7 +3200,13 @@ fn subgame_search_cached_inner(
             "deep_menu mid-round 导航需要当前街真实动作序（调用方未提供 within_round_real）"
                 .to_string()
         })?;
-        navigate_subtree_by_real_actions(trainer.game().subtree(), &solved.sub_abs, root_state, wr)?
+        navigate_subtree_by_real_actions(
+            trainer.game().subtree(),
+            &solved.sub_abs,
+            root_state,
+            wr,
+            auth_actor,
+        )?
     } else {
         navigate_subtree(trainer.game().subtree(), &within_round_tags)?
     };
@@ -3546,6 +3585,7 @@ fn navigate_subtree_by_real_actions(
     abs: &StreetActionAbstraction,
     root_real: &GameState,
     actions: &[(Action, bool)],
+    hero: PlayerId,
 ) -> Result<NodeId, String> {
     let mut state = root_real.clone();
     let mut id = subtree.root_id();
@@ -3576,13 +3616,7 @@ fn navigate_subtree_by_real_actions(
             }
             Action::AllIn => AbstractActionTag::AllIn,
             Action::Bet { to } | Action::Raise { to } => {
-                let raw = AbstractActionTag::of(&abs.map_off_tree(&state, *to));
-                if *applied_is_all_in || !has(raw) {
-                    // 真 all-in / 最近档不在子树合法集（该档在此几何塌进 AllIn 槽）→ AllIn。
-                    AbstractActionTag::AllIn
-                } else {
-                    raw
-                }
+                real_aggressive_tag(abs, &state, *to, *applied_is_all_in, hero, &has)
             }
         };
         let idx = node
@@ -4155,6 +4189,7 @@ fn subgame_search_unanchored_cached_inner(
         &solved.sub_abs,
         root_state,
         within_round,
+        auth_actor,
     )?;
     if let Some(slot) = visits_slot {
         *slot = hero_visit_count(trainer, cur_node, auth);
@@ -4340,7 +4375,7 @@ pub fn subgame_search_unanchored_prewarm_cross_exploit(
 mod tests {
     use super::*;
     // `ChaCha20Rng` / `AbstractActionTag` 已由 `use super::*` 从父模块带入；这里只补父模块未引入的项。
-    use crate::abstraction::action::AbstractAction;
+    use crate::abstraction::action::{AbstractAction, ActionAbstraction};
     use crate::abstraction::bucket_table::BucketConfig;
     use crate::core::{ChipAmount, SeatId};
     use crate::rules::action::Action;
@@ -7358,6 +7393,148 @@ mod tests {
             .expect("within-round check 导航应成功");
         let sum: f64 = d.iter().map(|(_, p)| p).sum();
         assert!((sum - 1.0).abs() < 1e-9, "分布应归一，和={sum}");
+    }
+
+    /// 实盘 001131（wopo 100/200/ante 200，driver 筹码 ÷2 后发给 advisor）转牌起点的真栈局面：
+    /// 8 座、tree seat 0 = BTN，hero = tree 2（BB）。翻前 6 家平跟、hero 加到 1100、3 家跟；
+    /// 翻牌 hero 下 2750、两家跟 → 转牌 Qh 5s 8d 6s，底池 13750，在手 tree 1 / 2 / 6 剩
+    /// 27500 / 13400 / 11700（与实盘重放打印的子树根逐座一致）。
+    fn live_001131_turn_root() -> GameState {
+        let stacks = [
+            8_000u64, 31_450, 17_350, 35_050, 16_950, 108_000, 15_650, 45_400,
+        ];
+        let cfg = TableConfig {
+            n_seats: 8,
+            starting_stacks: stacks.iter().map(|&s| ChipAmount::new(s)).collect(),
+            small_blind: ChipAmount::new(50),
+            big_blind: ChipAmount::new(100),
+            ante: ChipAmount::new(100),
+            ante_exempt: 0,
+            live_posts: 0,
+            button_seat: SeatId(0),
+        };
+        let mut st = GameState::new(&cfg, 0x0011_3100);
+        let raise = |to: u64| Action::Raise {
+            to: ChipAmount::new(to),
+        };
+        let bet = |to: u64| Action::Bet {
+            to: ChipAmount::new(to),
+        };
+        let line: [(u8, Action); 19] = [
+            (3, Action::Fold),
+            (4, Action::Call),
+            (5, Action::Call),
+            (6, Action::Call),
+            (7, Action::Call),
+            (0, Action::Call),
+            (1, Action::Call),
+            (2, raise(1_100)),
+            (4, Action::Fold),
+            (5, Action::Call),
+            (6, Action::Call),
+            (7, Action::Fold),
+            (0, Action::Fold),
+            (1, Action::Call),
+            // flop
+            (1, Action::Check),
+            (2, bet(2_750)),
+            (5, Action::Fold),
+            (6, Action::Call),
+            (1, Action::Call),
+        ];
+        for (seat, a) in line {
+            assert_eq!(
+                st.current_player(),
+                Some(SeatId(seat)),
+                "动作序错位 @ {a:?}"
+            );
+            st.apply(a).expect("001131 实盘动作在真栈下合法");
+        }
+        assert_eq!(st.street(), Street::Turn);
+        let st = st
+            .inject_external_cards(
+                SeatId(2),
+                [card(11, 0), card(10, 1)], // Kc Qd
+                &[card(10, 2), card(3, 3), card(6, 1), card(4, 3)], // Qh 5s 8d 6s
+            )
+            .expect("注入 hero 底牌与转牌牌面");
+        assert_eq!(st.pot(), ChipAmount::new(13_750));
+        let stack = |i: usize| st.players()[i].stack.as_u64();
+        assert_eq!((stack(1), stack(2), stack(6)), (27_500, 13_400, 11_700));
+        st
+    }
+
+    /// 回归（实盘 001131）：转牌 s7 过牌 → hero 下 7000（建议半池 6875、人凑了整）→ s4 全下
+    /// 11700（不够一次完整加注）→ s7 全下 27500。旧导航用 `map_off_tree` 在配置菜单 {0.5,1}pot 上
+    /// 随机取整，这个局面恰好取到 1pot（13750 ≥ hero 全下 13400，节点里被并进 AllIn）→ 当成 hero
+    /// 全下 → s7 节点只剩 Fold/Call → 「tag AllIn 不在子树节点合法集（失同步）」。现在 hero 自己的
+    /// 下注确定性取最近档、且只在节点实有档里取 → 落半池档，整条线走得通。
+    #[test]
+    fn navigate_live_001131_hero_rounded_bet_then_two_allins() {
+        use crate::abstraction::action::{ActionAbstractionConfig, BetRatio};
+        let root = live_001131_turn_root();
+        let half = BetRatio::HALF_POT;
+        let full = BetRatio::FULL_POT;
+        let abs = StreetActionAbstraction::per_street([
+            ActionAbstractionConfig::new(vec![1.0]).unwrap(),
+            ActionAbstractionConfig::new(vec![1.0]).unwrap(),
+            ActionAbstractionConfig::new(vec![0.5, 1.0]).unwrap(),
+            ActionAbstractionConfig::new(vec![1.0]).unwrap(),
+        ]);
+        let sub = PublicBettingTree::build_subtree_depth_limited(
+            &root,
+            &abs,
+            BettingAbstractionRules::default(),
+            0,
+            0,
+            StreetTag::Turn,
+        );
+
+        // 触发条件确认：旧映射在 hero 下注点把 7000 取成 1pot 档（该档在节点里不存在）。
+        let mut at_hero = root.clone();
+        at_hero.apply(Action::Check).unwrap();
+        let old = AbstractActionTag::of(&abs.map_off_tree(&at_hero, ChipAmount::new(7_000)));
+        assert_eq!(
+            old,
+            AbstractActionTag::Bet(full),
+            "旧映射应取到 1pot（实盘失同步的起因）"
+        );
+        let hero_node = sub.node(match sub.node(sub.root_id()).children[0] {
+            Child::Decision(id) => id,
+            Child::Terminal => panic!("check 后应有 hero 决策点"),
+        });
+        assert!(
+            !hero_node
+                .legal_actions
+                .contains(&AbstractActionTag::Bet(full)),
+            "hero 节点 1pot 应被并进 AllIn"
+        );
+
+        let line = [
+            (Action::Check, false),
+            (
+                Action::Bet {
+                    to: ChipAmount::new(7_000),
+                },
+                false,
+            ),
+            (Action::AllIn, true),
+            (Action::AllIn, true),
+        ];
+        let id = navigate_subtree_by_real_actions(&sub, &abs, &root, &line, 2)
+            .expect("hero 凑整下注 + 两个全下应能导航");
+        assert_eq!(sub.node(id).player_acting, 2, "落点 = hero 面对两个全下");
+        let tags: Vec<AbstractActionTag> =
+            subtree_decisions_on_real_line(&sub, &abs, &root, &line[..2], 2)
+                .expect("收集版同口径")
+                .into_iter()
+                .map(|(_, t, _)| t)
+                .collect();
+        assert_eq!(
+            tags,
+            vec![AbstractActionTag::Check, AbstractActionTag::Bet(half)],
+            "hero 的 7000 应落半池档"
+        );
     }
 
     // —— 脱锚搜索档一：同步前缀 reach（unanchored_range_design §1）——
