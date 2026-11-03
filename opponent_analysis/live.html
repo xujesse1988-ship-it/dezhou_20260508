@@ -758,8 +758,11 @@ function renderSession() {
     : s.alive === false ? '<span class="err">进程已退出</span>' : '进程状态未知';
   const pid = s.pid != null ? `pid ${s.pid} · ` : '';
   const what = s.start_src === 'driver.pid' ? '本次进程启动' : '本次首个事件（没有 driver.pid）';
+  const n = s.hero_pre || 0, rate = k => n ? `<b>${Math.round(100 * k / n)}%</b><span class="muted">（${k}/${n}）</span>` : '<span class="muted">—</span>';
   el.innerHTML = `${what} <b>${esc(fmtTime(s.started))}</b> · ${pid}${state} · 已打 <b>${s.hands}</b> 局`
-    + `<span class="muted">（结算 ${s.settled}，作废 ${s.dead}）</span>`;
+    + `<span class="muted">（结算 ${s.settled}，作废 ${s.dead}）</span>`
+    + (s.hero_pre != null ? ` · hero 入池 ${rate(s.hero_vpip)} · 翻前加注 ${rate(s.hero_pfr)}`
+      + `<span class="muted" title="分母 = hero 翻前有行动的手（不含被弃到大盲的手）；按 hero 实际行动算，不是按建议">　ⓘ</span>` : '');
 }
 
 function renderGuide() {

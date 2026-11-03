@@ -304,6 +304,10 @@ def range_event(rec) -> Optional[dict]:
 
 PID_NAME = "driver.pid"  # written by each run directory's start.sh right after it launches the driver
 SESSION_TYPES = ("hand_start", "result", "dead")
+# Hero's own preflop actions, for the session's VPIP / PFR (same rule as the profile, spots.py):
+# denominator = hands hero acted in preflop (walks excluded); VPIP = a preflop call / raise / all_in
+# that put chips in; PFR = a preflop raise, or an all_in that put in more than the call.
+HERO_ACTION = "hero_action"
 
 
 def _pid_alive(pid: int, marker: str = "wopo_play") -> bool:
@@ -334,7 +338,8 @@ class SessionInfo:
     Start = mtime of driver.pid next to the events file (start.sh writes it right after launching
     the driver, a restart rewrites it), with the pid's liveness; no pid file -> the file's first
     event (start_src "first_event", alive unknown). Hands = hand_start events at or after the start,
-    split into settled (result) and voided (dead). The whole file is scanned once (the PlayFeed
+    split into settled (result) and voided (dead); hero's VPIP / PFR over the same hands
+    (HERO_ACTION). The whole file is scanned once (the PlayFeed
     follower reads only its tail), then only appended bytes; a replaced / shrunk file or a new
     start rescans.
     """
@@ -345,6 +350,9 @@ class SessionInfo:
         self.offset = 0
         self.first_ts: Optional[float] = None
         self.counts: Counter = Counter()
+        self.pre_hands: set = set()  # hands hero acted in preflop
+        self.vpip_hands: set = set()
+        self.pfr_hands: set = set()
         self.info: Optional[dict] = None
 
     def poll(self, paths: list[str]) -> bool:
@@ -371,13 +379,14 @@ class SessionInfo:
         key = (path, st.st_ino, start)
         if key != self.key or st.st_size < self.offset:
             self.key, self.offset, self.first_ts, self.counts = key, 0, None, Counter()
+            self.pre_hands, self.vpip_hands, self.pfr_hands = set(), set(), set()
         if st.st_size > self.offset:
             with open(path, "rb") as f:
                 f.seek(self.offset)
                 data = f.read(st.st_size - self.offset)
             end = data.rfind(b"\n") + 1  # a trailing half line waits for the next poll
             for line in data[:end].splitlines():
-                if self.first_ts is None or any(t.encode() in line for t in SESSION_TYPES):
+                if self.first_ts is None or any(t.encode() in line for t in SESSION_TYPES + (HERO_ACTION,)):
                     try:
                         rec = json.loads(line)
                     except ValueError:
@@ -387,15 +396,33 @@ class SessionInfo:
                         continue
                     if self.first_ts is None:
                         self.first_ts = ts
-                    if rec.get("type") in SESSION_TYPES and (start is None or ts >= start):
+                    if start is not None and ts < start:
+                        continue
+                    if rec.get("type") in SESSION_TYPES:
                         self.counts[rec["type"]] += 1
+                    elif rec.get("type") == HERO_ACTION and rec.get("street") == "preflop":
+                        self._hero_preflop(rec)
             self.offset += end
         info = {"path": path, "started": start if start is not None else self.first_ts,
+                "hero_pre": len(self.pre_hands), "hero_vpip": len(self.vpip_hands), "hero_pfr": len(self.pfr_hands),
                 "start_src": "driver.pid" if start is not None else "first_event",
                 "pid": pid, "alive": _pid_alive(pid) if pid is not None else None,
                 "hands": self.counts["hand_start"], "settled": self.counts["result"], "dead": self.counts["dead"]}
         changed, self.info = info != self.info, info
         return changed
+
+    def _hero_preflop(self, rec: dict) -> None:
+        hid = rec.get("hand_id")
+        if hid is None:
+            return
+        self.pre_hands.add(hid)
+        kind = rec.get("action")
+        delta = rec.get("delta") if isinstance(rec.get("delta"), (int, float)) else 0
+        to_call = rec.get("to_call_before") if isinstance(rec.get("to_call_before"), (int, float)) else 0
+        if kind in ("call", "raise", "all_in") and delta > 0:
+            self.vpip_hands.add(hid)
+        if kind == "raise" or (kind == "all_in" and delta > to_call):
+            self.pfr_hands.add(hid)
 
 
 class PlayFeed:

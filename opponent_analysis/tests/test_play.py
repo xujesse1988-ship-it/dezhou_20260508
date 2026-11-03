@@ -157,6 +157,36 @@ class SessionInfoTest(unittest.TestCase):
         feed.step()
         self.assertEqual(self.session(feed)[1], self.counts(self.events[:3]))
 
+    def test_hero_vpip_pfr_over_session_hands(self):
+        def act(hid, ts, kind, delta=0, to_call=0, street="preflop"):
+            return {"ts": ts, "type": "hero_action", "hand_id": hid, "street": street, "action": kind,
+                    "delta": delta, "to_call_before": to_call}
+        recs = [
+            act("h0", 100, "raise", 300, 100),  # before the start: not counted
+            act("h1", 200, "call", 100, 100),  # VPIP
+            act("h2", 210, "raise", 450, 100), act("h2", 211, "fold", street="flop"),  # VPIP + PFR, counted once
+            act("h3", 220, "check"), act("h3", 221, "raise", 300, 0, street="flop"),  # BB check: neither; flop raise ignored
+            act("h4", 230, "fold", 0, 100),
+            act("h5", 240, "all_in", 800, 800),  # all-in call: VPIP only
+            act("h6", 250, "all_in", 900, 450),  # all-in raise: VPIP + PFR
+            act("h7", 260, "call", 50, 50, street="flop"),  # no preflop action (walk / not dealt): not in the denominator
+        ]
+        self.write(recs)
+        self.pid_file(os.getpid(), 150)
+        feed = PlayFeed([self.path], max_hands=3)
+        feed.step()
+        s, _ = self.session(feed)
+        self.assertEqual((s["hero_pre"], s["hero_vpip"], s["hero_pfr"]), (6, 4, 2))
+        # Appended later: picked up incrementally; a restart starts the counts over.
+        self.write([act("h8", 270, "raise", 300, 100)])
+        feed.step()
+        s, _ = self.session(feed)
+        self.assertEqual((s["hero_pre"], s["hero_vpip"], s["hero_pfr"]), (7, 5, 3))
+        self.pid_file(os.getpid(), 265)
+        feed.step()
+        s, _ = self.session(feed)
+        self.assertEqual((s["hero_pre"], s["hero_vpip"], s["hero_pfr"]), (1, 1, 1))
+
     def test_newest_file_is_the_session(self):
         old = os.path.join(self.tmp.name, "old", "wopo_play_events.jsonl")
         os.makedirs(os.path.dirname(old))
