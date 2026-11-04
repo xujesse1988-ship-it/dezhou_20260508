@@ -2924,7 +2924,8 @@ fn decide_with(
     };
 
     // —— 翻前面对全下（审查 §5）：有效码深 < 60BB 不走 blueprint（100BB 影子把短码全下当 100BB
-    // 全下，底池赔率 / 对手范围都错）→ [`preflop_allin_response`]。码深够的全下照常往下走；走到
+    // 全下，底池赔率 / 对手范围都错）；> blueprint 码深 140%（[`PREFLOP_BLUEPRINT_MAX_EFF_PCT`]，
+    // 影子把几百 BB 的全下当 200BB 全下）同样不走 → [`preflop_allin_response`]。码深在区间内的全下照常往下走；走到
     // 下面翻前兜底分支（平跟映射 / 失同步 / blueprint 占位）时同样改用它，不再只跟 P 档。——
     let allin_spot = if board.is_empty() {
         preflop_allin_spot(req, &solver_cfg, scale, &smap, my_seat_solver, hole)
@@ -2940,8 +2941,11 @@ fn decide_with(
             sample_seed(req, base_seed, n_seats),
         )
     };
-    if let Some(spot) = allin_spot.as_ref().filter(|s| preflop_allin_too_short(s)) {
-        dlog!("preflop allin spot (eff too short) → heuristic: {spot:?}");
+    if let Some(spot) = allin_spot
+        .as_ref()
+        .filter(|s| preflop_allin_too_short(s) || preflop_allin_too_deep(s))
+    {
+        dlog!("preflop allin spot (eff out of blueprint range) → heuristic: {spot:?}");
         return allin_response(spot);
     }
 
@@ -3438,15 +3442,39 @@ fn decide_with(
         dlog!("weak_commit_guard: {dist:?} → {g:?}");
     }
 
+    // 护栏只管翻后、PM-17 只管翻前，两者不会同时改分布。
+    let adjusted: &[(AbstractAction, f64)] = guarded
+        .as_deref()
+        .or(fourbet_dist.as_deref())
+        .unwrap_or(&dist);
+    // 翻前深码：hero 实际押上的码深超过 blueprint 码深 140% → 不按 blueprint 全下
+    // （[`deep_preflop_no_allin`]）。分布里没有全下时不重放真栈（不多花时间，旧路径 byte-equal）。
+    let deep_no_allin = if board.is_empty()
+        && adjusted
+            .iter()
+            .any(|&(a, p)| p > 0.0 && matches!(a, AbstractAction::AllIn { .. }))
+    {
+        preflop_hero_eff_stack(req, &solver_cfg, scale, &smap, my_seat_solver, hole)
+            .filter(|&eff| {
+                eff * 100 > solver_cfg.starting_stacks[0].as_u64() * PREFLOP_BLUEPRINT_MAX_EFF_PCT
+            })
+            .and_then(|eff| {
+                let d = deep_preflop_no_allin(adjusted, outgoing_state);
+                dlog!(
+                    "deep preflop eff={}bb: {adjusted:?} → {d:?}",
+                    eff / solver_cfg.big_blind.as_u64()
+                );
+                d
+            })
+    } else {
+        None
+    };
+
     // per-decision 确定性采样（保混合策略 + 可复现；seed 与搜索与否无关 → search=None byte-equal）。
     let mut sample_rng = ChaCha20Rng::from_seed(sample_seed(req, base_seed, n_seats));
-    // 护栏只管翻后、PM-17 只管翻前，两者不会同时改分布。
     let chosen = sample_discrete(
         &prune_for_sampling(
-            guarded
-                .as_deref()
-                .or(fourbet_dist.as_deref())
-                .unwrap_or(&dist),
+            deep_no_allin.as_deref().unwrap_or(adjusted),
             postflop_spr(outgoing_state),
         ),
         &mut sample_rng,
@@ -3484,7 +3512,7 @@ fn decide_with(
         // 合法动作：填 source（search / blueprint）+ 诊断。不合法时 action_to_response 已产
         // safe_fallback（source = fallback:...），不覆盖。bet/raise 退成 call/check 时追加降级标记。
         resp.source = format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
             if low_visits_bp {
                 "blueprint:low_hero_visits"
             } else if placeholder_search {
@@ -3506,6 +3534,11 @@ fn decide_with(
             },
             if fourbet_dist.is_some() {
                 ":exploit_4bet"
+            } else {
+                ""
+            },
+            if deep_no_allin.is_some() {
+                ":deep_no_allin"
             } else {
                 ""
             },
@@ -4487,6 +4520,15 @@ fn limp_preflop_response(
 /// 全下仍走 blueprint；blueprint 树里没有的全下（开池全下，`drop_preflop_open_allin`）重放失同步后
 /// 同样走这里。
 const PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_PCT: u64 = 60;
+/// 翻前有效码深**高于** blueprint 起始码深的这个百分比，blueprint 的全下就不可信：树里的全下是
+/// 200BB 全下，真实是几百 BB。两处用它：
+/// - 面对全下：hero 与全下者有效码深超过 → 不走 blueprint，改走 [`preflop_allin_response`]；
+/// - hero 自己全下：hero 与未弃牌对手中码深最大者的有效码深超过 → 全下的概率挪走
+///   （[`deep_preflop_no_allin`]）。
+///
+/// 与翻牌码深闸上限（[`FLOP_BLUEPRINT_EFF_STACK_PCT_MAX`]）同值：200BB blueprint = 280BB。
+/// 2026-11-03 实盘 001296：hero 467BB、对手 551BB，blueprint 按 200BB 让 JJ 跟 4bet 全下，输 466BB。
+const PREFLOP_BLUEPRINT_MAX_EFF_PCT: u64 = FLOP_BLUEPRINT_EFF_STACK_PCT_MAX;
 /// 全下范围宽度表（起手牌强度序 [`chen_order_key`] 的 top 比例）：`(全下者 hand-start 码深上限 BB,
 /// 开池全下, 3bet/4bet 全下)`，按行从上往下取第一个「码深 ≤ 上限」的行；超过最后一行按最后一行。
 /// **数值是估计**（2026-10-16 与用户确认的常识值），不是解出来的，也没有实盘数据校准。
@@ -4720,6 +4762,95 @@ fn preflop_allin_spot(
 /// 有效码深是否低到不该用 blueprint（[`PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_PCT`]）。
 fn preflop_allin_too_short(spot: &PreflopAllinSpot) -> bool {
     spot.eff * 100 < spot.solver_stack * PREFLOP_ALLIN_BLUEPRINT_MIN_EFF_PCT
+}
+
+/// 有效码深是否高到不该用 blueprint（[`PREFLOP_BLUEPRINT_MAX_EFF_PCT`]，端点仍用 blueprint）。
+fn preflop_allin_too_deep(spot: &PreflopAllinSpot) -> bool {
+    spot.eff * 100 > spot.solver_stack * PREFLOP_BLUEPRINT_MAX_EFF_PCT
+}
+
+/// 翻前 hero 自己全下时实际押上的码深：hero 与**未弃牌**对手（含还没行动的）中 hand-start 码深
+/// 最大者取小（solver chip）。真栈重放建不出 / 没有未弃牌对手 → `None`。
+fn preflop_hero_eff_stack(
+    req: &Request,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    hero: SeatId,
+    hole: [Card; 2],
+) -> Option<u64> {
+    let (auth, ..) = build_real_auth(req, solver_cfg, scale, smap, hero, hole, &[], true).ok()?;
+    let real_cfg = real_stacks_config(req, solver_cfg, scale, smap).ok()?;
+    let h = hero.0 as usize;
+    let deepest_opp = auth
+        .players()
+        .iter()
+        .enumerate()
+        .filter(|&(i, p)| i != h && p.status != poker::PlayerStatus::Folded)
+        .map(|(i, _)| real_cfg.starting_stacks[i].as_u64())
+        .max()?;
+    Some(deepest_opp.min(real_cfg.starting_stacks[h].as_u64()))
+}
+
+/// 翻前深码（[`PREFLOP_BLUEPRINT_MAX_EFF_PCT`]）时把 blueprint 分布里 `AllIn` 的概率整份挪走：
+/// 树里的全下是 blueprint 码深的全下，真实码深深得多时它的意思是「这手牌值得把 200BB 打进去」，
+/// 不是「把几百 BB 打进去」。挪给谁：
+/// 1. 分布里没有 `Call` 这一档、而且在 `state` 上跟注就会让 hero 全下 → 给真实跟注：跟注折进了
+///    AllIn 槽（同 [`weak_commit_guard`] 的 AA-004-rev1 说明），真实局面下这份 AllIn 就是跟注。
+///    只看「没有 `Call` 档」不够：没人入池时规则上能平跟，但树里删了平跟（`no_open_limp`），
+///    那时的 AllIn 是真全下，不能变成平跟；
+/// 2. 否则给分布里最大的非全下加注 / 下注档（全下的本意是加大注）；
+/// 3. 没有加注档 → 给 `Call`（在分布里时）。
+///
+/// 分布里没有概率 > 0 的 `AllIn`，或三条都给不出去 → `None`（调用方照原分布抽样）。
+/// `state` = outgoing 基准态（blueprint 路径 = blueprint 码深的影子局面）。
+fn deep_preflop_no_allin(
+    dist: &[(AbstractAction, f64)],
+    state: &GameState,
+) -> Option<Vec<(AbstractAction, f64)>> {
+    let is_allin = |a: &AbstractAction| matches!(a, AbstractAction::AllIn { .. });
+    let moved: f64 = dist
+        .iter()
+        .filter(|(a, _)| is_allin(a))
+        .map(|&(_, p)| p.max(0.0))
+        .sum();
+    if moved <= 0.0 {
+        return None;
+    }
+    let mut out: Vec<(AbstractAction, f64)> =
+        dist.iter().copied().filter(|(a, _)| !is_allin(a)).collect();
+    let has_call = out
+        .iter()
+        .any(|(a, _)| matches!(a, AbstractAction::Call { .. }));
+    let call_is_allin = |to: ChipAmount| {
+        state.current_player().is_some_and(|h| {
+            let p = &state.players()[h.0 as usize];
+            to.as_u64() >= p.committed_this_round.as_u64() + p.stack.as_u64()
+        })
+    };
+    if let Some(to) = state
+        .legal_actions()
+        .call
+        .filter(|&to| !has_call && call_is_allin(to))
+    {
+        out.push((AbstractAction::Call { to }, moved));
+        return Some(out);
+    }
+    let biggest_raise = out
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (a, _))| match a {
+            AbstractAction::Raise { to, .. } | AbstractAction::Bet { to, .. } => Some((i, *to)),
+            _ => None,
+        })
+        .max_by_key(|&(_, to)| to)
+        .map(|(i, _)| i);
+    let target = biggest_raise.or_else(|| {
+        out.iter()
+            .position(|(a, _)| matches!(a, AbstractAction::Call { .. }))
+    })?;
+    out[target].1 += moved;
+    Some(out)
 }
 
 /// blueprint 起始码深（对称，取 0 号座）的 `pct`%（solver chips，向下取整）。
@@ -11687,6 +11818,181 @@ mod tests {
                 "{hole:?}: {r:?}"
             );
         }
+    }
+
+    /// 翻前面对深码全下：hero 与全下者有效码深 > blueprint 码深 140%（100BB blueprint = 140BB）不走
+    /// blueprint，改走全下启发式（2026-11-03 实盘 001296：467BB JJ 按 200BB blueprint 跟 4bet 全下）。
+    /// 恰好 140% 仍走 blueprint；hero 浅、全下者深时按有效码深算，不算深码。
+    #[test]
+    fn preflop_deep_allin_uses_heuristic_not_blueprint() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let run = |req: &Request| {
+            decide(
+                &game,
+                &abs,
+                &uniform,
+                req,
+                0xA111,
+                None,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        let reshove = |sb_stack: u64| {
+            vec![
+                hist(3, "fold", None),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+                hist(0, "raise", Some(45)),
+                hist(1, "all_in", Some(sb_stack)),
+                hist(2, "fold", None),
+            ]
+        };
+        // 150BB 对 150BB：启发式，AA 跟、72o 弃。
+        for (hole, want) in [(["Ah", "Ad"], "call"), (["7h", "2d"], "fold")] {
+            let r = run(&allin_req(hole, 0, reshove(3000), vec![3000; 6]));
+            assert_eq!(
+                r.source,
+                format!("fallback:preflop_allin:{want}"),
+                "{hole:?}: {r:?}"
+            );
+        }
+        // 恰好 140BB：仍走 blueprint。
+        let r = run(&allin_req(["Ah", "Ad"], 0, reshove(2800), vec![2800; 6]));
+        assert_eq!(r.source, "blueprint", "{r:?}");
+        // hero 100BB、全下者 300BB：有效码深 100BB，照常 blueprint。
+        let mut stacks = vec![2000; 6];
+        stacks[1] = 6000;
+        let r = run(&allin_req(["Ah", "Ad"], 0, reshove(6000), stacks));
+        assert_eq!(r.source, "blueprint", "{r:?}");
+    }
+
+    /// 翻前深码 hero 自己全下（[`deep_preflop_no_allin`]）：全下概率挪给最大的加注档；树里跟注就会全下
+    /// （跟注折进 AllIn 槽）时给真实跟注；没人入池时规则上能平跟但树里没有平跟档，不能挪成平跟；
+    /// 没有加注档时给 `Call`；分布里没有全下 → `None`。
+    #[test]
+    fn deep_preflop_no_allin_moves_allin_mass() {
+        let cfg = TableConfig::default_6max_100bb();
+        let mut rng = ChaCha20Rng::from_seed(0x0dee_9a11);
+        let unopened = GameState::with_rng(&cfg, 0x0dee_9a11, &mut rng);
+        assert!(unopened.legal_actions().call.is_some(), "规则上能平跟");
+        let small = AbstractAction::Raise {
+            to: ChipAmount::new(450),
+            ratio_label: BetRatio::HALF_POT,
+        };
+        let big = AbstractAction::Raise {
+            to: ChipAmount::new(900),
+            ratio_label: BetRatio::FULL_POT,
+        };
+        let allin = AbstractAction::AllIn {
+            to: ChipAmount::new(10_000),
+        };
+        let fold = AbstractAction::Fold;
+        let close = |got: &[(AbstractAction, f64)], want: &[(AbstractAction, f64)]| {
+            got.len() == want.len()
+                && got
+                    .iter()
+                    .zip(want)
+                    .all(|((a, p), (b, q))| a == b && (p - q).abs() < 1e-12)
+        };
+        // 没人入池：给最大的加注档，不给平跟。
+        let g = deep_preflop_no_allin(
+            &[(fold, 0.2), (small, 0.3), (big, 0.1), (allin, 0.4)],
+            &unopened,
+        )
+        .expect("有全下 → 挪");
+        assert!(close(&g, &[(fold, 0.2), (small, 0.3), (big, 0.5)]), "{g:?}");
+        // 没有加注档、有 Call 档 → 给 Call。
+        let call = AbstractAction::Call {
+            to: ChipAmount::new(100),
+        };
+        let g = deep_preflop_no_allin(&[(fold, 0.5), (call, 0.1), (allin, 0.4)], &unopened)
+            .expect("有全下 → 挪");
+        assert!(close(&g, &[(fold, 0.5), (call, 0.5)]), "{g:?}");
+        // 没有全下 / 全下概率 0 → 不动。
+        assert_eq!(
+            deep_preflop_no_allin(&[(fold, 0.5), (small, 0.5)], &unopened),
+            None
+        );
+        assert_eq!(
+            deep_preflop_no_allin(&[(fold, 1.0), (allin, 0.0)], &unopened),
+            None
+        );
+
+        // UTG 在树里全下、其余弃到 BTN：跟注就是全下 → 全下概率给真实跟注。
+        let mut jam = unopened.clone();
+        jam.apply(Action::AllIn).expect("UTG 全下");
+        while jam.current_player() != Some(SeatId(0)) {
+            jam.apply(Action::Fold).expect("弃牌");
+        }
+        let call_to = jam.legal_actions().call.expect("能跟");
+        let g = deep_preflop_no_allin(&[(fold, 0.3), (allin, 0.7)], &jam).expect("有全下 → 挪");
+        assert!(
+            close(
+                &g,
+                &[(fold, 0.3), (AbstractAction::Call { to: call_to }, 0.7)]
+            ),
+            "{g:?}"
+        );
+    }
+
+    /// 翻前深码 hero 首入：均匀占位的 blueprint 分布里有全下；hero 与未弃牌对手中最深者有效码深
+    /// 超过 140BB（100BB blueprint）→ source 带 `:deep_no_allin`、不出全下；100BB 时与旧行为相同；
+    /// 对手都浅（hero 深）时按有效码深算，不触发。
+    #[test]
+    fn preflop_deep_hero_open_drops_allin() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let req = |stacks: Vec<u64>| {
+            let mut r = allin_req(["Ah", "Ad"], 3, vec![], stacks.clone());
+            r.valid = ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: true,
+                min_raise: Some(40),
+                max_raise: Some(stacks[3]),
+            };
+            r
+        };
+        let run = |r: &Request| {
+            decide(
+                &game,
+                &abs,
+                &uniform,
+                r,
+                0xA111,
+                None,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        for seed_shift in 0..8u64 {
+            let mut r = req(vec![3000; 6]);
+            r.hole = [
+                ["Ah", "Ad"],
+                ["Kh", "Kd"],
+                ["Qh", "Qd"],
+                ["Jh", "Jd"],
+                ["Th", "Td"],
+                ["9h", "9d"],
+                ["8h", "8d"],
+                ["7h", "7d"],
+            ][seed_shift as usize]
+                .iter()
+                .map(|c| c.to_string())
+                .collect();
+            let resp = run(&r);
+            assert!(resp.source.ends_with(":deep_no_allin"), "{resp:?}");
+            assert_ne!(resp.action, "all_in", "{resp:?}");
+            assert_ne!(resp.amount, Some(3000), "不能加到全下：{resp:?}");
+        }
+        let resp = run(&req(vec![2000; 6]));
+        assert_eq!(resp.source, "blueprint", "{resp:?}");
+        let mut stacks = vec![2000; 6];
+        stacks[3] = 6000;
+        let resp = run(&req(stacks));
+        assert!(!resp.source.contains("deep_no_allin"), "{resp:?}");
     }
 
     /// 抽样前过滤：只有 `AllIn` < 5% 才去掉、剩下的归一（和为 1，`sample_discrete` 要求 1e-12 内）；
