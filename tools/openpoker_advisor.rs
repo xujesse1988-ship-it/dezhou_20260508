@@ -2525,6 +2525,7 @@ fn actions_before_street_start<'a>(req: &'a Request, solver_cfg: &TableConfig) -
 /// [`Profiler`] 同一份局面分类），逐步乘出一份逐组合系数，代替他翻前那几步的 blueprint 前缀 reach 和宽度
 /// 修正。每一步：
 /// - 主动全下 → 宽度表系数（[`shove_coef`]，不倾斜；旧做法是跳过 AllIn tag，按无信息处理）；
+/// - 平跟（含 SB 补齐）之后翻前又加注 / 全下 → 平跟那一步按无信息处理（因子 1），只由之后的加注定；
 /// - 分了类的决策 → 参考节点 = 同步前缀里的影子节点，没有就用替身（[`spot_substitute`]，同步线上两者
 ///   相同）。首入用 [`limp_reference`]（平跟合成三类；节点本身有跟注——SB 补齐——退回 [`class_reference`]），
 ///   其余用 [`class_reference`]（面对一次加注的跟注类也套底值）。频率 = [`Profiler::spot_freqs`]（收缩目标 = 参考策略在本手先验下的边际；
@@ -2600,6 +2601,22 @@ fn exploit_tilt(
                 dlog!("exploit_tilt: seat={op_seat}(tree {seat}) idx={i} shove start={start} open={open} width={width:.3}");
                 mul(&mut coef, &shove_coef(width));
                 taken = true;
+                continue;
+            }
+            // 平跟（没人加注时跟注，含 SB 补齐）之后翻前又加注 / 全下：平跟那一步「开池范围之外的牌」
+            // 已被他自己的再加注推翻，按无信息处理（因子 1），强牌由再加注那一步定。不跳的话平跟参考把
+            // AA / KK 压到 1e-9 量级，再加注那一步乘不回来，范围里强牌只剩均匀兜底（wopo 870 手：平跟
+            // 再加注亮牌 12 次，9 次 AQ+ / QQ+；000983 J9s 中对打光筹码输给平跟再加注的 KK）。与不开
+            // tilt 时 [`unanchored_prefix_decisions`] 去掉 `limp_raisers` 映射弃牌步同口径。
+            let limp_then_raise = spots.iter().any(|d| {
+                d.action_idx == i
+                    && d.act == SpotAct::Call
+                    && matches!(d.spot, PreflopSpot::Unopened(_))
+            }) && steps[i + 1..]
+                .iter()
+                .any(|s| s.seat == *op_seat && s.input == SpotActInput::Aggr);
+            if limp_then_raise {
+                dlog!("exploit_tilt: seat={op_seat}(tree {seat}) idx={i} limp then raise → limp step uninformative");
                 continue;
             }
             let tilted = spots.iter().find(|d| d.action_idx == i).and_then(|d| {
@@ -9345,6 +9362,74 @@ mod tests {
         let t = exploit_tilt(&game, &sigma, &cfg, 5, &smap, &req, synced, 2, &prof);
         let width = allin_range_width(1500, 100, true, limp_pos(3, 6));
         assert_eq!(t.coefs[3].as_deref(), Some(shove_coef(width).as_slice()));
+    }
+
+    /// 平跟后再加注：平跟那一步按无信息处理，强牌由再加注那一步定（wopo 平跟再加注亮牌 12 次里 9 次
+    /// AQ+ / QQ+）。线：UTG 平跟、BTN（hero）隔离加注、盲位弃、UTG 再加注、hero 跟注。对照：同一线 UTG
+    /// 只跟注（平跟后跟注），强牌照旧几乎没有。强牌 = Chen 序前 3%（均匀范围下占 3%）。
+    #[test]
+    fn exploit_tilt_limp_reraise_keeps_strong_hands() {
+        let game = nolimp_game();
+        let sigma = top15_sigma();
+        let prof = Profiler::new(ExploitConfig {
+            tilt: true,
+            ..ExploitConfig::default()
+        });
+        let line = |limper_second: HistAction| {
+            let mut acts = vec![
+                hist(3, "call", Some(20)),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+                hist(0, "raise", Some(100)),
+                hist(1, "fold", None),
+                hist(2, "fold", None),
+                limper_second,
+            ];
+            if acts[6].action == "raise" {
+                acts.push(hist(0, "call", Some(400)));
+            }
+            let mut req = limp_req(0, ["Qs", "Qd"], &["7h", "2c", "Ks"], acts);
+            req.names = BTreeMap::from([(0, "hero".to_string()), (3, "limper".to_string())]);
+            req
+        };
+        let strong_share = |coef: &[f64]| {
+            let total: f64 = coef.iter().sum();
+            all_hole_combos()
+                .into_iter()
+                .zip(coef)
+                .filter(|(h, _)| chen_top_fraction(*h) < 0.03)
+                .map(|(_, c)| c)
+                .sum::<f64>()
+                / total
+        };
+        let tilt_of = |req: &Request| {
+            let e = replay_limp(&game, req, Some(SeatId(0)), true)
+                .err()
+                .unwrap();
+            assert_eq!(e.reason, "limp_as_fold:limper_continued", "{e:?}");
+            let (cfg, smap, ..) = coef_ctx(req);
+            let t = exploit_tilt(&game, &sigma, &cfg, 5, &smap, req, e.synced_node, 0, &prof);
+            let (limp_node, limper) = e.limp.folds[0];
+            assert_eq!(limper, 3);
+            assert_eq!(t.nodes, vec![(limp_node, 3)], "平跟那一步从前缀里删掉");
+            t.coefs[3].clone().expect("被接管")
+        };
+        let reraise = tilt_of(&line(hist(3, "raise", Some(400))));
+        let flat = tilt_of(&line(hist(3, "call", Some(100))));
+        let (r, f) = (strong_share(&reraise), strong_share(&flat));
+        assert!(r > 0.1, "平跟再加注：强牌份额 {r}");
+        assert!(f < 0.03, "平跟后跟注：强牌份额 {f}");
+        // AA 对比 72o：再加注范围里 AA 远高于 72o。
+        let idx = |h: [&str; 2]| {
+            combo_index([parse_card(h[0]).unwrap(), parse_card(h[1]).unwrap()]).unwrap()
+        };
+        let (aa, junk) = (idx(["Ah", "Ad"]), idx(["7h", "2d"]));
+        assert!(
+            reraise[aa] > 100.0 * reraise[junk],
+            "{} vs {}",
+            reraise[aa],
+            reraise[junk]
+        );
     }
 
     /// [`solve_tilt`]：节点上缺一类（参考概率处处为 0）时 θ 有限、该类 θ = 0，其余两类的边际 = 频率在它们
