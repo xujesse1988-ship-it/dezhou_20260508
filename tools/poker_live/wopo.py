@@ -36,6 +36,25 @@ def _fmt_act(action, to=None, delta=None, to_call=None):
     return f"{action} {delta}" if action == "call" and delta is not None else action
 
 
+# hero 实际加注额和建议加注额差多少以内仍算「同建议」：|实际 - 建议| ≤ 建议 × 这个百分比。
+# 2026-11-04 复盘：之前只比动作类型，建议加到 274 实际加到 720、建议全下 46551 实际加到 3500
+# 都记成「同建议」，11-03/04 两天这样的有 24 次。
+ADVICE_SIZE_TOL_PCT = 30
+
+
+def advice_matches(adv, act):
+    """hero 实际动作 act（牌桌层 fold/check/call/raise/all_in，raise/all_in 带本街总额 to）是否和
+    建议 adv（action + amount = 加注到的本街总额）一致。加注类（raise / all_in 互通）还要比金额：
+    相差不超过建议额的 ADVICE_SIZE_TOL_PCT%；任一边没有金额时只比类型。"""
+    aggr = ("raise", "all_in")
+    if adv["action"] in aggr and act["action"] in aggr:
+        want, got = adv.get("amount"), act.get("to")
+        if not want or got is None:
+            return True
+        return abs(got - want) * 100 <= want * ADVICE_SIZE_TOL_PCT
+    return adv["action"] == act["action"]
+
+
 def fmt_probs(probs):
     """策略分布 [[动作, 概率]] → '(fold,call,1pot,allin)=(2,92,7,0)'：bet / raise 前缀去掉，百分比
     四舍五入取整（各项单独取整，合计可能差 1）。没有分布（启发式 / 兜底）→ ''。"""
@@ -449,8 +468,7 @@ class WopoSession:
             self._play(f"{line}  ← hero 实际行动（无建议）", "hero_action", **ev, advice=None,
                        match=None)
             return
-        same = adv["action"] == a["action"] or (
-            adv["action"] in ("raise", "all_in") and a["action"] in ("raise", "all_in"))
+        same = advice_matches(adv, a)
         self.counters["hero_same" if same else "hero_diff"] += 1
         self._play(f"{line}  ← hero 实际行动（{'同' if same else '不同于'}建议 {adv['text']}）",
                    "hero_action", **ev, advice=dict(adv), match="same" if same else "diff")

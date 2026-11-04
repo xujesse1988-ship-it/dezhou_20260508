@@ -70,7 +70,8 @@ from poker_live.advisor_client import (add_advisor_args, add_fourbet_args, advis
                                        start_advisor, validate_advisor_args, validate_fourbet_args)
 from poker_live.decision import DecisionWorker
 from poker_live.table import HandEngine, HandInvalid, observe_from_hh
-from poker_live.wopo import _STALE_CN, _STREET_CN, ActionFile, WopoSession, _fmt_act, fmt_probs, legalize
+from poker_live.wopo import (_STALE_CN, _STREET_CN, ActionFile, WopoSession, _fmt_act, advice_matches,
+                             fmt_probs, legalize)
 from poker_live.wslog import WsLog
 
 HERO_SEAT = 0
@@ -554,6 +555,26 @@ def _selftest_legalize():
                         for r in rows if r["valid"]["can_raise"] or r["valid"]["can_call"]),
            f"行动文件 all_in 处理 {[(r['action'], r['valid']) for r in rows]}")
     print("[selftest 6 建议合法性] 不能加注的 all_in → call；越界动作 → 安全动作", file=sys.stderr)
+
+
+def _selftest_advice_match():
+    """hero 实际动作对照建议：加注类还要比金额（差不超过建议额 30%），其余只比类型。
+    例子取自 11-03/04 实盘（001326 建议 274 实际 720；001296 建议全下 46551 实际 3500）。"""
+    cases = [
+        ({"action": "raise", "amount": 274}, {"action": "raise", "to": 720}, False),
+        ({"action": "raise", "amount": 46551}, {"action": "raise", "to": 3500}, False),
+        ({"action": "raise", "amount": 500}, {"action": "raise", "to": 650}, True),   # +30% 边界
+        ({"action": "raise", "amount": 500}, {"action": "raise", "to": 651}, False),
+        ({"action": "raise", "amount": 500}, {"action": "raise", "to": 350}, True),   # -30% 边界
+        ({"action": "raise", "amount": 12600}, {"action": "all_in", "to": 12600}, True),
+        ({"action": "all_in", "amount": None}, {"action": "all_in", "to": 9000}, True),
+        ({"action": "call", "amount": None}, {"action": "call"}, True),
+        ({"action": "call", "amount": None}, {"action": "raise", "to": 900}, False),
+        ({"action": "fold", "amount": None}, {"action": "call"}, False),
+    ]
+    for adv, act, want in cases:
+        _check(advice_matches(adv, act) == want, f"{adv} vs {act} 应为 {want}")
+    print("[selftest 6b 实际动作对照建议] 加注金额差超过 30% 记「不同于建议」", file=sys.stderr)
 
 
 def _selftest_exploit_4bet():
@@ -1251,6 +1272,7 @@ def run_selftest():
     _selftest_engine_rules()
     _selftest_post_rewrite()
     _selftest_legalize()
+    _selftest_advice_match()
     _selftest_exploit_4bet()
     _selftest_hh_log()
     _selftest_token()
@@ -1260,7 +1282,7 @@ def run_selftest():
     _selftest_play_events()
     _selftest_warm_hh()
     _selftest_chip_div()
-    print("OK: wopo selftest 15 组场景全部通过。", file=sys.stderr)
+    print("OK: wopo selftest 16 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================
