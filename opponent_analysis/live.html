@@ -200,7 +200,7 @@ details.hand > div { padding: 4px 0 8px 14px; }
       <div class="scroll tall"><table class="ptab" id="players-all"><thead></thead><tbody></tbody></table></div></details>
     <details class="pt" id="pt-recent" open><summary>最近 <span id="scope-n">N</span> 手<span class="muted">每个玩家自己的最近 N 手（他不上桌的时间不算）；不到 N 手的玩家就是他的全部手牌</span></summary>
       <div class="scroll tall"><table class="ptab" id="players-recent"><thead></thead><tbody></tbody></table></div></details>
-    <p class="legend">点表格标题可以收起 / 展开。百分数为后验均值，悬停看 [5%, 95%] 区间和机会数。绿点 = 在桌：出现在某张桌的最近一手里（比全局最新一手早 10 分钟以上的牌桌不算）。点一行看详情。</p>
+    <p class="legend">点表格标题可以收起 / 展开。百分数为后验均值，悬停看 [5%, 95%] 区间和机会数。绿点 = 在桌：行动指南里最新一手的座位（开局就有，不用等结算）；没开行动指南时用每张桌最近记完的一手。离现在 10 分钟以上的不算。点一行看详情。</p>
   </section>
   <section class="full" id="detail"><div class="empty">选一个玩家</div></section>
   <section class="full">
@@ -243,7 +243,7 @@ const ABBR = { 'vpip:yes': 'VPIP', 'pfr:yes': 'PFR', 'rfi:raise': 'RFI', 'vs_ope
   'steal_defense:fold': 'fold to steal', 'cbet:bet': 'cbet', 'vs_cbet:fold': 'fold to cbet', 'donk:bet': 'donk bet',
   'postflop_aggr:aggr': 'AFq', 'wtsd:yes': 'WTSD', 'wsd:won': 'W$SD', 'bb100': 'bb/100' };
 const STREET_CN = { preflop: '翻前', flop: '翻牌', turn: '转牌', river: '河牌' };
-const NAME_COL = { key: 'name', label: '玩家', l: true, val: p => p.name, cell: p => `<span class="dot ${p.seated ? '' : 'off'}"></span>${esc(p.name)}` };
+const NAME_COL = { key: 'name', label: '玩家', l: true, val: p => p.name, cell: p => `<span class="dot ${seated.has(p.name) ? '' : 'off'}"></span>${esc(p.name)}` };
 const BASE_COLS = [
   { key: 'hands', label: '手数', val: (p, sc) => view(p, sc).hands, cell: (p, sc) => view(p, sc).hands },
   { key: 'tag', label: '类型', l: true, val: (p, sc) => view(p, sc).tag, cell: (p, sc) => esc(view(p, sc).tag) },
@@ -355,10 +355,35 @@ document.addEventListener('mouseover', e => {
 });
 document.addEventListener('scroll', () => { tipEl.hidden = true; }, true);
 
+// Who is seated now. The driver's event stream has the seats of the hand being played from its
+// first second; the hh log (snap.tables) only gets a hand once it is settled, and a dead or
+// rejected hand never, so right after a restart it still holds the previous session's table.
+// Either source counts only if its hand started within SEATED_MAX_AGE of now.
+const SEATED_MAX_AGE = 600;
+let seated = new Set(), seatedKey = '';
+function seatedNames() {
+  const now = Date.now() / 1000 + playOff;
+  const hs = play && play.hands ? play.hands.filter(h => h.first_ts && (h.events || []).some(e => e.type === 'seats')) : [];
+  if (hs.length) {
+    const h = hs.reduce((a, b) => (b.first_ts > a.first_ts ? b : a));
+    return new Set(now - h.first_ts < SEATED_MAX_AGE ? h.seats.map(s => s.name).filter(n => n != null) : []);
+  }
+  if (!snap) return new Set();
+  return new Set(snap.tables.filter(t => t.ts && now - t.ts < SEATED_MAX_AGE).flatMap(t => t.seats.map(s => s.name)));
+}
+// Re-draws the player tables only when the seated set changed (called every play poll).
+function refreshSeated() {
+  const s = seatedNames(), key = [...s].sort().join('\n');
+  if (key === seatedKey) return;
+  seated = s; seatedKey = key;
+  if (snap) renderPlayers();
+}
+
 function renderPlayers() {
   buildRateCols();
   const cols = shownCols();
-  const ps = snap.players.filter(p => !onlySeated || p.seated);
+  seated = seatedNames(); seatedKey = [...seated].sort().join('\n');
+  const ps = snap.players.filter(p => !onlySeated || seated.has(p.name));
   for (const [sc, id] of SCOPES) {
     const head = $(id).tHead, body = $(id).tBodies[0];
     head.innerHTML = '<tr>' + cols.map(c => `<th class="${c.l ? 'l' : ''}" data-k="${c.key}" ${DESC[c.key] ? `data-tip="${c.key}"` : ''}>${esc(c.label)}${sortKey === c.key ? (sortDir < 0 ? ' ↓' : ' ↑') : ''}</th>`).join('') + '</tr>';
@@ -369,7 +394,7 @@ function renderPlayers() {
       || `<tr><td colspan="${cols.length}" class="empty">现在没有在桌的玩家</td></tr>`;
   }
   const opp = snap.players.filter(p => !p.hero);
-  $('n-players').textContent = onlySeated ? `${opp.filter(p => p.seated).length} / ${opp.length} 个对手在桌` : `${opp.length} 个对手`;
+  $('n-players').textContent = onlySeated ? `${opp.filter(p => seated.has(p.name)).length} / ${opp.length} 个对手在桌` : `${opp.length} 个对手`;
 }
 
 function spark(p, key) {
@@ -814,6 +839,7 @@ async function pollPlay() {
       }
     } else tickGuide();
   } catch { playFailures++; tickGuide(); }
+  try { refreshSeated(); } catch {}
   setTimeout(pollPlay, 1000);
 }
 pollPlay();
