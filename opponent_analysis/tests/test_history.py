@@ -298,7 +298,10 @@ class Files(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertIn(b"<title>", body)
         self.assertIsNone(handle(hist, "/", "", live=True))  # the profile page owns / in live
+        _, body, _ = handle(hist, "/api/history/hands", "", live=False, preflop=True)
+        self.assertTrue(json.loads(body)["preflop"])
         code, body, _ = handle(hist, "/api/history/hands", "", live=True)
+        self.assertFalse(json.loads(body)["preflop"])  # the live server never offers the viewer
         lst = json.loads(body)
         self.assertTrue(lst["live"])
         key = lst["hands"][0]["key"]

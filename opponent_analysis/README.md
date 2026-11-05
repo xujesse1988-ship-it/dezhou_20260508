@@ -28,7 +28,7 @@ python3 -m opponent_analysis live --db artifacts/opponent_db --platform wopo \
     --follow "$D/wopo_hh.jsonl" --play-events "$D/wopo_play_events.jsonl" --hero hero
 
 # wopo 牌局回放：浏览器打开 http://127.0.0.1:8781/（见「牌局回放」一节）
-python3 -m opponent_analysis history --run 'artifacts/wopo*/' [--port 8781]
+python3 -m opponent_analysis history --run 'artifacts/wopo*/' [--port 8781] [--preflop]
 
 # 测试
 python3 -m unittest discover -s opponent_analysis/tests -t .
@@ -183,6 +183,9 @@ street, pot, turns, dead, result, hero_net, status（playing / done / dead / err
   地址带 `#key=<hand_id>&step=<n>`，可以直接发链接定位到某一手的某一步。
 - `live --platform wopo` 也挂了同一个页面：`/history`，读的就是 `--follow` 的 hh 文件，打完一手刷新列表就能看到；
   画像页页头有「牌局回放」链接，行动指南里已结算的手有「回放」链接。
+- `--preflop`：同一个地址下多一个 `/preflop/`，看 8 座 ante 两个 blueprint 的翻前策略（页头互相有链接）。由回放服务拉起
+  `target/release/preflop_viewer`（先 `cargo build --release --bin preflop_viewer`），加载约 30 秒、峰值约 1.6 GiB，
+  加载期间和加载失败时回放页不受影响；进程随回放服务退出。`live` 没有这个功能，实盘机不会多占内存。
 - 接口：`/api/history/hands`（列表）、`/api/history/hand?key=<key>`（一手的全部步骤）。同一个 hand_id 出现在多个 run 里时，
   后面的 key 是 `<hand_id>@<run 目录名>`。
 

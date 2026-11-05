@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>翻前策略查看器</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f4f5f7; --panel: #ffffff; --line: #d9dde3; --ink: #1c2230; --muted: #667085;
+  --cell: #e9ecf0; --accent: #2457c5; --warn-bg: #fff4d6; --warn-ink: #7a5300; --err-bg: #fde8e8; --err-ink: #9b1c1c;
+  --a-fold: #8896a8; --a-call: #2f9e68; --a-r1: #e8a33a; --a-r2: #e2703a; --a-r3: #d4433f; --a-allin: #8e1f5c;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1b2029; --line: #2e3542; --ink: #e7eaf0; --muted: #98a2b3;
+    --cell: #242a35; --accent: #7ba3f5; --warn-bg: #3a2f12; --warn-ink: #f2cf7c; --err-bg: #3d1a1a; --err-ink: #f7a8a8;
+    --a-fold: #566377; --a-call: #2f9e68; --a-r1: #d9962f; --a-r2: #dd6a33; --a-r3: #d1443f; --a-allin: #a32a6f;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif; }
+button { font: inherit; color: inherit; cursor: pointer; background: none; border: 1px solid var(--line); border-radius: 6px; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.wrap { max-width: 1320px; margin: 0 auto; padding: 14px 16px 32px; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 4px; }
+header a { margin-left: auto; color: var(--accent); }
+h1 { font-size: 17px; margin: 0; font-weight: 650; }
+.tabs { display: flex; gap: 4px; }
+.tabs button { padding: 4px 12px; background: var(--panel); }
+.tabs button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
+.sub { color: var(--muted); font-size: 12.5px; margin-bottom: 10px; }
+.banner { padding: 7px 11px; border-radius: 6px; margin-bottom: 10px; background: var(--warn-bg); color: var(--warn-ink); }
+.banner.err { background: var(--err-bg); color: var(--err-ink); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
+.line-box { padding: 9px 11px; margin-bottom: 10px; }
+.steps { display: flex; flex-wrap: wrap; align-items: stretch; gap: 5px; }
+.step { padding: 3px 8px; font-size: 12.5px; text-align: left; line-height: 1.3; background: var(--bg); }
+.step b { display: block; font-weight: 650; }
+.step.fold { color: var(--muted); }
+.step.now { background: var(--accent); border-color: var(--accent); color: var(--panel); cursor: default; }
+.chain { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+.chain button { padding: 1px 8px; color: var(--ink); }
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 10px; align-items: start; }
+.grid-box { padding: 10px; }
+.modes { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 9px; }
+.modes button { padding: 2px 9px; font-size: 12.5px; display: inline-flex; align-items: center; gap: 5px; }
+.modes button[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); font-weight: 600; }
+.swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; display: inline-block; }
+.grid { display: grid; grid-template-columns: repeat(13, minmax(0, 1fr)); gap: 2px; }
+.cell { position: relative; aspect-ratio: 1.22; background: var(--cell); border-radius: 3px; overflow: hidden; cursor: pointer; }
+.cell:hover { outline: 2px solid var(--ink); outline-offset: -1px; z-index: 1; }
+.cell.pin { outline: 2px solid var(--accent); outline-offset: -1px; z-index: 2; }
+.bars { position: absolute; left: 0; right: 0; bottom: 0; display: flex; }
+.bars i { display: block; height: 100%; }
+.cell.none { background-image: repeating-linear-gradient(45deg, transparent 0 4px, var(--line) 4px 5px); }
+.lbl, .val { position: absolute; left: 3px; pointer-events: none; font-size: clamp(9px, 0.9vw, 12.5px); line-height: 1.15; white-space: nowrap;
+  color: var(--ink); text-shadow: 0 0 2px var(--panel), 0 0 2px var(--panel), 0 0 1px var(--panel); }
+.lbl { top: 2px; font-weight: 600; }
+.val { bottom: 2px; font-size: clamp(8px, 0.78vw, 11px); }
+.cell.off .lbl { color: var(--muted); opacity: .7; text-shadow: none; }
+.note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+.side { display: grid; gap: 10px; }
+.side .panel { padding: 10px 11px; }
+h2 { font-size: 13px; margin: 0 0 7px; font-weight: 650; }
+.kv { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px 8px; }
+.kv div small { display: block; color: var(--muted); font-size: 11.5px; }
+.kv div span { font-weight: 600; font-variant-numeric: tabular-nums; }
+.act { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; gap: 2px 7px; align-items: center; width: 100%;
+  padding: 5px 7px; margin-bottom: 4px; text-align: left; background: var(--bg); }
+.act:disabled { cursor: default; opacity: .85; }
+.act .pc { font-weight: 650; font-variant-numeric: tabular-nums; }
+.act .meter { grid-column: 2 / 4; height: 3px; background: var(--line); border-radius: 2px; overflow: hidden; }
+.act .meter i { display: block; height: 100%; }
+.act .to { grid-column: 2 / 4; color: var(--muted); font-size: 11.5px; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 12.5px; }
+th { color: var(--muted); font-weight: 500; text-align: right; font-size: 11.5px; }
+td { text-align: right; padding: 2px 0; }
+th:first-child, td:first-child { text-align: left; }
+tr.acting td { color: var(--accent); font-weight: 650; }
+tr.folded td { color: var(--muted); opacity: .65; }
+.hand-title { font-size: 15px; font-weight: 700; margin-right: 6px; }
+.dim { color: var(--muted); font-size: 12px; }
+.warn { color: var(--warn-ink); background: var(--warn-bg); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+#app[aria-busy="true"] { opacity: .65; }
+@media (max-width: 960px) {
+  .main { grid-template-columns: minmax(0, 1fr); }
+  .lbl { font-size: clamp(8px, 2.2vw, 12px); left: 2px; }
+  .val { display: none; }
+  .grid { gap: 1px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>翻前策略查看器</h1>
+    <div class="tabs" id="tabs" role="group" aria-label="选择 blueprint"></div>
+    <a id="home" href="../" hidden>← 牌局回放</a>
+  </header>
+  <div class="sub" id="sub">正在连接…</div>
+  <div class="banner" id="banner" hidden></div>
+  <div id="app" hidden>
+    <div class="panel line-box">
+      <div class="steps" id="steps"></div>
+      <div class="chain" id="chain"></div>
+    </div>
+    <div class="main">
+      <div class="panel grid-box">
+        <div class="modes" id="modes" role="group" aria-label="范围格显示内容"></div>
+        <div class="grid" id="grid"></div>
+        <div class="note" id="note"></div>
+      </div>
+      <div class="side">
+        <div class="panel"><h2 id="node-title"></h2><div class="kv" id="node-kv"></div></div>
+        <div class="panel"><h2>动作（点击进入下一步）</h2><div id="actions"></div></div>
+        <div class="panel"><div id="hand"></div></div>
+        <div class="panel"><h2>座位</h2><table id="seats"></table></div>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+"use strict";
+// Cells with a cumulative visit weight below this are treated as too thinly sampled to trust.
+const LOW_VISITS = 10000;
+const $ = id => document.getElementById(id);
+const S = { meta: null, bp: null, line: [], mode: "all", pin: null, hover: null, data: null, seq: 0, push: false };
+
+const pct = (x, d = 1) => (100 * x).toFixed(d) + "%";
+const fmtBB = v => +v.toFixed(2) + "BB";
+function fmtNum(v) {
+  if (v >= 1e9) return (v / 1e9).toFixed(1) + "B";
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + "k";
+  return v >= 10 ? v.toFixed(0) : v.toFixed(1);
+}
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function color(a) {
+  if (a.kind === "fold") return "var(--a-fold)";
+  if (a.kind === "call" || a.kind === "check") return "var(--a-call)";
+  if (a.kind === "allin") return "var(--a-allin)";
+  if (a.ratio <= 333) return "var(--a-r1)";
+  return a.ratio <= 500 ? "var(--a-r2)" : "var(--a-r3)";
+}
+// Display order: most aggressive first, fold last (tree order is the reverse).
+const shown = d => d.actions.map((a, i) => ({ ...a, i })).reverse();
+function shortAct(a) {
+  if (a.kind === "fold") return "弃牌";
+  if (a.kind === "check") return "过牌";
+  if (a.kind === "call") return "跟注";
+  if (a.kind === "allin") return "全下";
+  return a.label.replace(/^加注到 /, "").replace(/（.*$/, "");
+}
+const nextNote = { flop: "到翻牌，查看器到此为止", end: "这手到此结束（弃牌或全下摊牌）" };
+
+function syncHash() {
+  const p = new URLSearchParams({ bp: S.bp });
+  if (S.line.length) p.set("line", S.line.join(","));
+  if (S.pin) p.set("hand", S.pin);
+  if (S.mode !== "all") p.set("mode", S.mode);
+  const hash = "#" + p.toString().replace(/%2C/g, ",");
+  if (S.push && hash !== location.hash) history.pushState(null, "", hash);
+  else history.replaceState(null, "", hash);
+  S.push = false;
+}
+function readHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  const known = S.meta.blueprints.some(b => b.id === p.get("bp"));
+  S.bp = known ? p.get("bp") : S.meta.blueprints[0].id;
+  S.line = (p.get("line") || "").split(",").filter(Boolean);
+  S.pin = p.get("hand");
+  S.mode = p.get("mode") || "all";
+}
+function banner(text, isErr) {
+  const b = $("banner");
+  b.hidden = !text;
+  b.textContent = text || "";
+  b.className = isErr ? "banner err" : "banner";
+}
+
+async function getJSON(url) {
+  const res = await fetch(url);
+  const body = await res.json();
+  if (!res.ok) throw new Error(body.error || res.status);
+  return body;
+}
+async function load() {
+  const seq = ++S.seq;
+  $("app").setAttribute("aria-busy", "true");
+  try {
+    const d = await getJSON(`api/node?bp=${encodeURIComponent(S.bp)}&line=${S.line.join(",")}`);
+    if (seq !== S.seq) return;
+    banner(d.truncated
+      ? `当前 blueprint 走不通完整动作线（第 ${d.line.length + 1} 步没有这个动作），已退到能走到的最后一步。`
+      : "");
+    S.data = d;
+    S.line = d.line;
+    if (S.mode !== "all" && S.mode !== "visits" && !d.actions.some(a => a.token === S.mode)) S.mode = "all";
+    render();
+    syncHash();
+  } catch (e) {
+    if (seq === S.seq) banner("读取失败：" + e.message + "。确认 preflop_viewer 还在运行。", true);
+  } finally {
+    if (seq === S.seq) $("app").removeAttribute("aria-busy");
+  }
+}
+function go(line) { S.line = line; S.push = true; load(); }
+
+function render() {
+  $("app").hidden = false;
+  renderHead(); renderSteps(); renderModes(); renderGrid(); renderSide(); renderHand();
+}
+function renderHead() {
+  const m = S.meta, b = m.blueprints.find(x => x.id === S.bp);
+  $("tabs").innerHTML = m.blueprints.map(x =>
+    `<button data-bp="${esc(x.id)}" aria-pressed="${x.id === S.bp}">${esc(x.label)}</button>`).join("");
+  $("sub").textContent = `${b.note} · ${m.seats} 座 ${m.stack_bb}BB，ante ${m.ante_bb}BB · ${fmtNum(b.updates)} 次更新 · ${b.nodes.toLocaleString()} 个翻前节点 · ${b.run}`;
+}
+function renderSteps() {
+  const d = S.data;
+  const chips = d.steps.map((s, i) => {
+    const text = s.kind === "fold" ? "弃" : esc(shortAct(s));
+    return `<button class="step ${s.kind === "fold" ? "fold" : ""}" data-back="${i}" title="回到 ${esc(s.pos)} 这一步：${esc(s.label)}，范围内频率 ${pct(s.freq)}"><b>${esc(s.pos)}</b>${text} ${pct(s.freq, 0)}</button>`;
+  });
+  chips.push(`<button class="step now" aria-current="step" tabindex="-1"><b>${esc(d.pos)}</b>行动中</button>`);
+  $("steps").innerHTML = chips.join("");
+  $("chain").innerHTML = d.fold_chain.length
+    ? `中间全弃，直接到：` + d.fold_chain.map((p, i) => `<button data-folds="${i + 1}">${esc(p)}</button>`).join("")
+      + (d.line.length ? ` <button data-back="0">从头开始</button>` : "")
+    : (d.line.length ? `<button data-back="0">从头开始</button>` : "");
+}
+function renderModes() {
+  const d = S.data;
+  const btn = (mode, inner) => `<button data-mode="${esc(mode)}" aria-pressed="${S.mode === mode}">${inner}</button>`;
+  $("modes").innerHTML = btn("all", "全部动作")
+    + shown(d).map(a => btn(a.token, `<span class="swatch" style="background:${color(a)}"></span>只看${esc(shortAct(a))}`)).join("")
+    + btn("visits", "样本量");
+}
+function renderGrid() {
+  const d = S.data, order = shown(d);
+  const focus = order.find(a => a.token === S.mode);
+  $("grid").innerHTML = d.hands.map((h, idx) => {
+    const reached = h.r > 0;
+    let cls = "cell", body = "", val = "";
+    if (S.mode === "visits") {
+      const shade = h.w > 0 ? Math.min(1, Math.log10(1 + h.w) / 8) : 0;
+      const hue = h.w < LOW_VISITS ? "var(--a-r3)" : "var(--a-call)";
+      if (h.w > 0) body = `<div class="bars" style="height:100%;opacity:${h.w < LOW_VISITS ? 0.9 : (0.25 + 0.75 * shade).toFixed(2)}"><i style="width:100%;background:${hue}"></i></div>`;
+      val = h.w > 0 ? fmtNum(h.w) : "0";
+      if (!h.w) cls += " none";
+    } else if (!h.s) {
+      cls += reached ? " none" : " off";
+    } else if (!reached) {
+      cls += " off";
+    } else {
+      const segs = focus ? [{ a: focus, p: h.s[focus.i] }] : order.map(a => ({ a, p: h.s[a.i] }));
+      const bars = segs.filter(x => x.p > 0).map(x => `<i style="width:${(100 * x.p).toFixed(2)}%;background:${color(x.a)}"></i>`).join("");
+      body = `<div class="bars" style="height:${(100 * h.r).toFixed(1)}%">${bars}</div>`;
+      if (focus) val = (100 * h.s[focus.i]).toFixed(0);
+    }
+    if (h.l === S.pin) cls += " pin";
+    return `<div class="${cls}" data-h="${idx}">${body}<span class="lbl">${esc(h.l)}</span>${val ? `<span class="val">${val}</span>` : ""}</div>`;
+  }).join("");
+  $("note").textContent = S.mode === "visits"
+    ? `累计访问权重：这手牌在此节点被访问的次数（LCFR 衰减后，越早的访问权重越小）。低于 ${fmtNum(LOW_VISITS)} 标红，这类格子的策略可能只是噪声。`
+    : "格子高度 = 这手牌到达此处的概率，宽度 = 选各动作的比例。斜线格 = 训练没访问到。总频率按组合数 × 到达概率加权，未算牌阻断。";
+}
+function renderSide() {
+  const d = S.data;
+  const lowSample = d.range.median_visits < LOW_VISITS
+    ? ` <span class="warn" title="范围内一半组合的累计访问权重低于 ${fmtNum(LOW_VISITS)}">样本少</span>` : "";
+  $("node-title").innerHTML = `${esc(d.pos)} 行动${lowSample}`;
+  const kv = [
+    ["底池", fmtBB(d.pot_bb)], ["要跟", fmtBB(d.to_call_bb)], ["后手", fmtBB(d.stack_bb)],
+    ["到达组合", `${d.range.combos.toFixed(1)}`], ["占全部", pct(d.range.combos / 1326)],
+    ["访问权重中位", fmtNum(d.range.median_visits)],
+  ];
+  $("node-kv").innerHTML = kv.map(([k, v]) => `<div><small>${k}</small><span>${v}</span></div>`).join("")
+    + (d.range.unvisited ? `<div style="grid-column:1/4" class="dim">${d.range.unvisited} 手能到达这里但训练没访问到</div>` : "");
+  $("actions").innerHTML = shown(d).map(a => {
+    const can = a.next === "preflop";
+    return `<button class="act" ${can ? `data-act="${esc(a.token)}"` : "disabled"} title="${can ? "进入这条线" : nextNote[a.next]}">
+      <span class="swatch" style="background:${color(a)}"></span><span>${esc(a.label)}</span><span class="pc">${pct(a.freq)}</span>
+      <span class="meter"><i style="width:${(100 * a.freq).toFixed(1)}%;background:${color(a)}"></i></span>
+      <span class="to">${a.combos.toFixed(1)} 组合${can ? "" : " · " + nextNote[a.next]}</span></button>`;
+  }).join("");
+  $("seats").innerHTML = `<tr><th>座位</th><th>已投入（含 ante）</th><th>后手</th><th>状态</th></tr>` + d.seats.map(s => {
+    const st = { active: "在局", folded: "已弃", allin: "全下" }[s.status];
+    return `<tr class="${s.acting ? "acting" : s.status === "folded" ? "folded" : ""}"><td>${esc(s.pos)}</td><td>${fmtBB(s.in_pot_bb)}</td><td>${fmtBB(s.stack_bb)}</td><td>${s.acting ? "行动中" : st}</td></tr>`;
+  }).join("");
+}
+function renderHand() {
+  const d = S.data, label = S.hover || S.pin;
+  const h = label && d.hands.find(x => x.l === label);
+  if (!h) {
+    $("hand").innerHTML = `<h2>手牌</h2><div class="dim">把鼠标移到格子上看细节，点击可固定。</div>`;
+    return;
+  }
+  const low = h.w < LOW_VISITS ? ` <span class="warn">样本少</span>` : "";
+  const head = `<div><span class="hand-title">${esc(h.l)}</span>${S.pin === h.l ? `<span class="dim">已固定</span>` : ""}${low}</div>
+    <div class="dim" style="margin:2px 0 6px">到达 ${pct(h.r)} · ${(h.c * h.r).toFixed(2)}/${h.c} 组合 · 访问权重 ${fmtNum(h.w)}</div>`;
+  if (!h.s) { $("hand").innerHTML = head + `<div class="dim">这手牌在此节点没被训练访问到，没有策略。</div>`; return; }
+  $("hand").innerHTML = head + `<table>` + shown(d).map(a =>
+    `<tr><td><span class="swatch" style="background:${color(a)}"></span> ${esc(a.label)}</td><td>${pct(h.s[a.i])}</td></tr>`).join("") + `</table>`;
+}
+
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-bp],[data-back],[data-folds],[data-act],[data-mode],[data-h]");
+  if (!t) return;
+  const ds = t.dataset;
+  if (ds.bp) { S.bp = ds.bp; S.push = true; load(); }
+  else if (ds.back !== undefined) go(S.line.slice(0, +ds.back));
+  else if (ds.folds) go(S.line.concat(Array(+ds.folds).fill("F")));
+  else if (ds.act) go(S.line.concat(ds.act));
+  else if (ds.mode) { S.mode = ds.mode; renderModes(); renderGrid(); syncHash(); }
+  else if (ds.h !== undefined) {
+    const l = S.data.hands[+ds.h].l;
+    S.pin = S.pin === l ? null : l;
+    S.hover = null;
+    renderGrid(); renderHand(); syncHash();
+  }
+});
+$("grid").addEventListener("mouseover", e => {
+  const c = e.target.closest("[data-h]");
+  if (c) { S.hover = S.data.hands[+c.dataset.h].l; renderHand(); }
+});
+$("grid").addEventListener("mouseleave", () => { S.hover = null; renderHand(); });
+window.addEventListener("hashchange", () => { readHash(); load(); });
+
+(async () => {
+  try {
+    $("home").hidden = location.pathname === "/";
+    S.meta = await getJSON("api/meta");
+    readHash();
+    await load();
+  } catch (e) {
+    banner("连不上服务：" + e.message, true);
+  }
+})();
+</script>
+</body>
+</html>

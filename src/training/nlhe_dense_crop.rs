@@ -39,9 +39,9 @@
 //! 缺 regret bitset 会把「只有 regret 被写过」的行误判为未访问。
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use blake3::Hasher;
 
@@ -49,7 +49,7 @@ use crate::abstraction::info::{InfoSetId, StreetTag};
 use crate::error::CheckpointError;
 use crate::training::game::Game;
 use crate::training::nlhe::{SimplifiedNlheGame, NLHE_V2_NODE_ID_SHIFT};
-use crate::training::nlhe_betting_tree::NodeId;
+use crate::training::nlhe_betting_tree::{NodeId, PublicBettingTree};
 use crate::training::nlhe_dense::NlheDenseIndexer;
 use crate::training::nlhe_dense_checkpoint::{
     corrupted, parse_header, read_hashed, DenseCheckpointMeta, DenseLayoutFingerprint, HEADER_LEN,
@@ -745,13 +745,7 @@ impl CroppedBlueprint {
         if !(bit_get(&self.strategy_touched, row) || bit_get(&self.regret_touched, row)) {
             return Some(Vec::new());
         }
-        let logical = &self.strategy[start..start + n];
-        let total: f64 = logical.iter().copied().sum();
-        Some(if total > 0.0 {
-            logical.iter().map(|s| s / total).collect()
-        } else {
-            vec![1.0 / n as f64; n]
-        })
+        Some(normalize_strategy(&self.strategy[start..start + n]))
     }
 
     /// 逐动作累计 regret（与 dense trainer `regret_for` 同约定：未 touch → 空 Vec）。
@@ -763,6 +757,171 @@ impl CroppedBlueprint {
             regret[start..start + n].to_vec()
         } else {
             Vec::new()
+        })
+    }
+}
+
+/// `S(a) / Σ S`（Σ == 0 退化均匀）。与 `DenseNlheEsMccfrTrainer::average_strategy` 同一计算序列。
+fn normalize_strategy(logical: &[f64]) -> Vec<f64> {
+    let total: f64 = logical.iter().copied().sum();
+    if total > 0.0 {
+        logical.iter().map(|s| s / total).collect()
+    } else {
+        vec![1.0 / logical.len() as f64; logical.len()]
+    }
+}
+
+/// [`CropStrategyReader::read_node`] 的结果：一个节点全部桶的累计策略。
+pub struct CropNodeRows {
+    action_count: usize,
+    touched: Vec<bool>,
+    sums: Vec<f64>,
+}
+
+impl CropNodeRows {
+    /// average strategy：`None` = 该桶未访问，否则与 [`CroppedBlueprint::average_strategy`] 逐位一致。
+    pub fn average_strategy(&self, bucket: usize) -> Option<Vec<f64>> {
+        self.touched[bucket].then(|| normalize_strategy(self.row(bucket)))
+    }
+
+    /// 该桶累计策略之和。每次访问累加的 σ 和为 1，所以它等于 LCFR 衰减后的累计访问权重
+    /// （最近一次访问权重 1，越早越小）。未访问 = 0。
+    pub fn row_total(&self, bucket: usize) -> f64 {
+        self.row(bucket).iter().sum()
+    }
+
+    fn row(&self, bucket: usize) -> &[f64] {
+        &self.sums[bucket * self.action_count..(bucket + 1) * self.action_count]
+    }
+}
+
+/// 不把值表读进内存的 crop 读取器：打开时流式校验整文件 trailer，之后按节点从磁盘随机读。给只看少量
+/// 节点的离线工具用（翻前查看器）。查询语义与 [`CroppedBlueprint`] 相同。
+///
+/// **不加载桶表**：翻前行与桶表无关，所以指纹里的 `bucket_table_blake3` 取文件自身的值、不做对照；
+/// 树形状 / 抽象 / ante 的指纹照常校验。要读翻后策略的调用方应走 [`CroppedBlueprint::load`]。
+pub struct CropStrategyReader {
+    file: Mutex<File>,
+    /// 按 node id 升序：`(node, row_base, slot_base, bucket_count, action_count)`，只含 `street` 这条街。
+    nodes: Vec<(NodeId, u64, u64, u32, u8)>,
+    /// 两张 touched bitset 按位或（「已访问」判定 = 任一表 touched，见模块文档）。
+    touched: Vec<u64>,
+    strategy_offset: u64,
+    update_count: u64,
+}
+
+impl CropStrategyReader {
+    /// 打开 crop。`tree` + `bucket_count_by_street` + `ante` 须与训练时一致（指纹不符即拒绝）；只有
+    /// `street` 这条街的节点可读，该街须在 crop 保留范围内。返回后调用方可以释放 `tree`。
+    pub fn open(
+        path: &Path,
+        tree: &PublicBettingTree,
+        bucket_count_by_street: [u32; 4],
+        ante: u64,
+        street: StreetTag,
+    ) -> Result<Self, CheckpointError> {
+        let indexer = NlheDenseIndexer::from_tree(tree, bucket_count_by_street);
+        let mut reader = open_reader(path)?;
+        let mut h = Hasher::new();
+        let mut header = [0u8; CROP_HEADER_LEN];
+        read_hashed(&mut reader, &mut h, &mut header)
+            .map_err(|e| corrupted(0, format!("read crop header failed: {e}")))?;
+        let file_bucket_blake3: [u8; 32] = header[OFF_BUCKET_BLAKE3..OFF_ACTION_BLAKE3]
+            .try_into()
+            .unwrap();
+        let expected = DenseLayoutFingerprint::from_indexer(&indexer, file_bucket_blake3, ante);
+        let CropHeader {
+            keep_through,
+            has_regret,
+            update_count,
+        } = parse_crop_header(&header, &expected)?;
+        if street as u8 > keep_through as u8 {
+            return Err(corrupted(
+                OFF_KEEP_THROUGH as u64,
+                format!("crop 只保留到 {keep_through:?}，读不了 {street:?}"),
+            ));
+        }
+        let layout = check_kept_layout(&header, &indexer, keep_through)?;
+
+        let n_words = words_for_rows(layout.kept_rows);
+        let rerr = |what: &'static str| {
+            move |e: std::io::Error| corrupted(0, format!("read crop {what}: {e}"))
+        };
+        let mut touched =
+            read_words_hashed(&mut reader, &mut h, n_words).map_err(rerr("regret touched"))?;
+        let strategy_touched =
+            read_words_hashed(&mut reader, &mut h, n_words).map_err(rerr("strategy touched"))?;
+        for (a, b) in touched.iter_mut().zip(&strategy_touched) {
+            *a |= b;
+        }
+        drop(strategy_touched);
+
+        let bitset_bytes = 2 * 8 * n_words as u64;
+        let regret_bytes = if has_regret { layout.kept_slots * 8 } else { 0 };
+        let strategy_offset = CROP_HEADER_LEN as u64 + bitset_bytes + regret_bytes;
+        let mut buf = vec![0u8; COPY_BUF_BYTES];
+        copy_or_skip::<_, std::io::Sink>(
+            &mut reader,
+            &mut h,
+            None,
+            regret_bytes + layout.kept_slots * 8,
+            &mut buf,
+        )
+        .map_err(rerr("value tables"))?;
+        verify_trailer_and_eof(&mut reader, h, "crop file")?;
+
+        let mut nodes = Vec::new();
+        for id in 0..indexer.num_nodes() as NodeId {
+            let m = indexer.node_meta(id);
+            if m.street == street {
+                let (row_base, slot_base) =
+                    layout.base[id as usize].expect("street <= keep_through，节点必在保留布局内");
+                nodes.push((id, row_base, slot_base, m.bucket_count, m.action_count));
+            }
+        }
+        Ok(Self {
+            file: Mutex::new(reader.into_inner()),
+            nodes,
+            touched,
+            strategy_offset,
+            update_count,
+        })
+    }
+
+    /// 源 checkpoint 的 update 数。
+    pub fn update_count(&self) -> u64 {
+        self.update_count
+    }
+
+    /// 可读节点数。
+    pub fn num_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// 从磁盘读一个节点全部桶的累计策略。`node` 不在 [`Self::open`] 指定的那条街 → `Err`。
+    pub fn read_node(&self, node: NodeId) -> Result<CropNodeRows, CheckpointError> {
+        let i = self
+            .nodes
+            .binary_search_by_key(&node, |n| n.0)
+            .map_err(|_| corrupted(0, format!("node {node} 不在可读的街上")))?;
+        let (_, row_base, slot_base, bucket_count, action_count) = self.nodes[i];
+        let n_slots = bucket_count as usize * usize::from(action_count);
+        let mut bytes = vec![0u8; n_slots * 8];
+        {
+            let mut file = self.file.lock().expect("crop file lock");
+            file.seek(SeekFrom::Start(self.strategy_offset + slot_base * 8))
+                .and_then(|_| file.read_exact(&mut bytes))
+                .map_err(|e| corrupted(0, format!("read node {node}: {e}")))?;
+        }
+        Ok(CropNodeRows {
+            action_count: usize::from(action_count),
+            touched: (0..u64::from(bucket_count))
+                .map(|b| bit_get(&self.touched, row_base + b))
+                .collect(),
+            sums: bytes
+                .chunks_exact(8)
+                .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+                .collect(),
         })
     }
 }
@@ -821,6 +980,86 @@ mod tests {
 
     fn bits_eq(a: &[f64], b: &[f64]) -> bool {
         a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    }
+
+    /// [`CropStrategyReader`] 与 [`CroppedBlueprint`] 逐位一致：有 regret / 无 regret 两种文件、
+    /// Preflop / Flop 两种保留街都验（regret 段长度和 keep_through 都影响偏移）。再验改一个字节、
+    /// 换树都被拒绝。
+    #[test]
+    fn strategy_reader_matches_cropped_blueprint_bitwise() {
+        let trainer = trained(3_000);
+        let game = trainer.game();
+        let dir = tmpdir("reader");
+        let ckpt = dir.join("src.ckpt");
+        trainer.save_checkpoint(&ckpt).expect("save");
+        let tree = game.tree();
+        let buckets = bucket_count_by_street(game);
+        let ante = game.table_config().ante.as_u64();
+
+        for (keep, keep_regret) in [
+            (StreetTag::Preflop, false),
+            (StreetTag::Preflop, true),
+            (StreetTag::Flop, false),
+            (StreetTag::Flop, true),
+        ] {
+            let out = dir.join(format!("crop_{keep:?}_{keep_regret}.bin"));
+            let opts = CropOptions {
+                keep_through: keep,
+                keep_regret,
+            };
+            crop_dense_checkpoint(&ckpt, &out, game, opts).expect("crop");
+            let bp = CroppedBlueprint::load(&out, game).expect("load");
+            let reader = CropStrategyReader::open(&out, tree, buckets, ante, StreetTag::Preflop)
+                .expect("open");
+            assert_eq!(reader.update_count(), bp.update_count());
+
+            let (mut checked, mut touched) = (0u64, 0u64);
+            for id in 0..tree.num_nodes() as NodeId {
+                if tree.node(id).street != StreetTag::Preflop {
+                    assert!(reader.read_node(id).is_err(), "翻后节点 {id} 不可读");
+                    continue;
+                }
+                let rows = reader.read_node(id).expect("read_node");
+                for b in 0..buckets[StreetTag::Preflop as usize] {
+                    let want = bp
+                        .average_strategy(pack_info_set_v2(b, id, StreetTag::Preflop))
+                        .expect("翻前必保留");
+                    match rows.average_strategy(b as usize) {
+                        None => assert!(want.is_empty(), "node {id} bucket {b} 访问判定不一致"),
+                        Some(got) => {
+                            assert!(bits_eq(&got, &want), "node {id} bucket {b}");
+                            touched += 1;
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+            assert_eq!(reader.num_nodes() as u64 * 169, checked);
+            assert!(touched > 0, "须有被访问的行（否则等价性是空验）");
+        }
+
+        // 只保留翻前的 crop 读不了翻牌。
+        let preflop_crop = dir.join("crop_Preflop_false.bin");
+        assert!(
+            CropStrategyReader::open(&preflop_crop, tree, buckets, ante, StreetTag::Flop).is_err()
+        );
+        // ante 进指纹：换 ante 须拒绝。
+        assert!(CropStrategyReader::open(
+            &preflop_crop,
+            tree,
+            buckets,
+            ante + 1,
+            StreetTag::Preflop
+        )
+        .is_err());
+        // 文件尾部翻一个字节：trailer 校验须拒绝。
+        let mut bytes = std::fs::read(&preflop_crop).expect("read crop");
+        let n = bytes.len();
+        bytes[n - 40] ^= 1;
+        let bad = dir.join("crop_bad.bin");
+        std::fs::write(&bad, bytes).expect("write");
+        assert!(CropStrategyReader::open(&bad, tree, buckets, ante, StreetTag::Preflop).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 核心等价：对全树每个 (node, bucket)，保留街上 crop 查询 == 原 trainer 查询（逐位，

@@ -178,6 +178,7 @@ kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--line); border-
     <label><input type="radio" name="unit" value="bb">BB</label>
   </div>
   <label class="chk" title="翻开摊牌时亮出的对手底牌（默认到结算那一步才翻开）"><input type="checkbox" id="peek">提前亮出对手亮牌</label>
+  <a id="preflop" href="/preflop/" hidden>翻前策略 →</a>
   <a id="back" href="/" hidden>← 对手画像</a>
 </header>
 <main>
@@ -308,6 +309,7 @@ async function loadList() {
   const r = await fetch('/api/history/hands', { cache: 'no-store' });
   listing = await r.json();
   $('back').hidden = !listing.live;
+  $('preflop').hidden = !listing.preflop;
   const sel = $('run'), cur = sel.value || store.get('run', '');
   sel.innerHTML = '<option value="">全部 run</option>' + listing.runs.map(r =>
     `<option value="${esc(r.run)}">${esc(r.run)}（${r.mtime ? when(r.mtime * 1000) + '，' : ''}${r.counts.hands || 0} 手）</option>`).join('');

@@ -71,6 +71,9 @@ def main(argv=None) -> int:
                          "wopo_ranges.jsonl 有就一起读")
     hs.add_argument("--host", default="127.0.0.1")
     hs.add_argument("--port", type=int, default=8781)
+    hs.add_argument("--preflop", action="store_true",
+                    help="同时在 /preflop/ 提供 blueprint 翻前策略查看（拉起 target/release/preflop_viewer，"
+                         "加载约 30 秒、峰值约 1.6 GiB）")
 
     a = ap.parse_args(argv)
     if a.cmd == "live" and a.play_hands < 1:
@@ -92,7 +95,7 @@ def _run(a) -> int:
     if a.cmd == "history":
         from .history import serve as serve_history
 
-        serve_history(a.run, a.host, a.port)
+        serve_history(a.run, a.host, a.port, preflop=a.preflop)
         return 0
     if a.cmd == "live":
         from .live import default_range_patterns, serve

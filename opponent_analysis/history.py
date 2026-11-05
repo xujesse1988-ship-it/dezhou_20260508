@@ -16,7 +16,9 @@ pot. The simulation is display only; the hand also goes through the same adapter
 as `ingest`, and a failure there (e.g. not_zero_sum on all-in pots with wopo's extra deductions)
 is shown as a warning, the hand is still replayed.
 
-    python3 -m opponent_analysis history --run 'artifacts/wopo*/' --port 8781
+    python3 -m opponent_analysis history --run 'artifacts/wopo*/' --port 8781 [--preflop]
+
+--preflop also serves the blueprint preflop strategy viewer under /preflop/ (see preflop_proxy.py).
 """
 
 from __future__ import annotations
@@ -576,13 +578,13 @@ class History:
 
 # ------------------------------------------------------------------ HTTP
 
-def handle(hist: History, path: str, query: str, live: bool):
+def handle(hist: History, path: str, query: str, live: bool, preflop: bool = False):
     """Shared by the standalone server and `live`: (status, body bytes, content type) or None."""
     if path == "/history" or (path == "/" and not live):
         with open(PAGE_PATH, "rb") as f:
             return 200, f.read(), "text/html; charset=utf-8"
     if path == "/api/history/hands":
-        body = dict(hist.hands(), live=live)
+        body = dict(hist.hands(), live=live, preflop=preflop)
         return 200, json.dumps(body, ensure_ascii=False).encode(), "application/json; charset=utf-8"
     if path == "/api/history/hand":
         key = parse_qs(query).get("key", [""])[0]
@@ -594,8 +596,9 @@ def handle(hist: History, path: str, query: str, live: bool):
     return None
 
 
-def serve(patterns: list[str], host: str, port: int) -> None:
+def serve(patterns: list[str], host: str, port: int, preflop: bool = False) -> None:
     from .live import GZIP_MIN_BYTES, accepts_gzip
+    from .preflop_proxy import PREFIX as PREFLOP_PREFIX, PreflopBackend, viewer_command
     import gzip
 
     hist = History(patterns)
@@ -604,6 +607,7 @@ def serve(patterns: list[str], host: str, port: int) -> None:
     files = [r["path"] for r in hist.listing.get("runs", [])]
     if not files:
         raise SystemExit(f"没有找到 {HH_NAME}：{' '.join(patterns)}")
+    backend = PreflopBackend(viewer_command()) if preflop else None
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -611,7 +615,16 @@ def serve(patterns: list[str], host: str, port: int) -> None:
 
         def do_GET(self):
             u = urlsplit(self.path)
-            r = handle(hist, u.path, u.query, live=False)
+            if backend is not None and u.path == PREFLOP_PREFIX:
+                # The viewer page requests its API relative to its own URL, so it needs the slash.
+                self.send_response(302)
+                self.send_header("Location", PREFLOP_PREFIX + "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            r = backend.handle(u.path, u.query) if backend is not None else None
+            if r is None:
+                r = handle(hist, u.path, u.query, live=False, preflop=backend is not None)
             code, body, ctype = r if r is not None else (404, b"not found", "text/plain; charset=utf-8")
             gz = len(body) >= GZIP_MIN_BYTES and accepts_gzip(self.headers.get("Accept-Encoding"))
             if gz:
@@ -629,9 +642,13 @@ def serve(patterns: list[str], host: str, port: int) -> None:
     httpd = ThreadingHTTPServer((host, port), H)
     print(f"{n} hands from {len(files)} file(s): {', '.join(files)}", flush=True)
     print(f"serving http://{host}:{port}/", flush=True)
+    if backend is not None:
+        print(f"翻前策略 http://{host}:{port}{PREFLOP_PREFIX}/（加载约 30 秒）", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         httpd.server_close()
+        if backend is not None:
+            backend.close()
