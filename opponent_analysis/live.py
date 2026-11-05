@@ -28,6 +28,8 @@ import traceback
 from collections import Counter, OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
+
+from .aliases import Aliases
 from urllib.parse import parse_qs, urlsplit
 
 from . import db
@@ -142,8 +144,10 @@ class PctCache:
 
 class Live:
     def __init__(self, db_dir: str, platform: str, patterns: list[str], cfg: Config, refresh_s: float = 5.0,
-                 hero_names=()):
+                 hero_names=(), aliases: Optional[Aliases] = None):
         self.hero_extra = tuple(hero_names)
+        # Several names of one person share one profile; the database keeps raw names.
+        self.aliases = aliases if aliases is not None else Aliases()
         self.db_dir = db_dir
         self.platform = platform
         self.cfg = cfg
@@ -170,6 +174,7 @@ class Live:
     # -- hands -> accumulator
 
     def _feed(self, h: Hand) -> None:
+        h = self.aliases.hand(h)
         self.acc.add(h)
         t = self.tables.get(h.table_id)
         if t is None or (h.ts or 0) >= (t["ts"] or 0):
@@ -747,6 +752,8 @@ def snapshot_json(res: dict, live: Live) -> dict:
         "platform": res["platform"], "hands": res["hands"], "last_ts": res.get("last_ts"),
         "built_at": time.time(), "started_at": live.started,
         "rejected": dict(res["rejected"]), "hero_names": res["hero_names"],
+        # raw name -> profile name, for names the page shows raw (action guide events).
+        "aliases": dict(sorted(live.aliases.seen.items())),
         "reveal": {"seats": rv["showdown_seats"], "shown": rv["shown"], "rate": _num(rv["rate"])},
         "clean_showdown": res["clean_showdown"], "forced": dict(res["forced"]),
         "cfg": {"min_hands": cfg.min_hands, "min_opps": cfg.min_opps, "bluff_pct": cfg.bluff_pct, "fdr_q": cfg.fdr_q,
@@ -850,8 +857,9 @@ def make_handler(live: Live, play: Optional[PlayFeed] = None, hist=None):
 
 def serve(db_dir: str, platform: str, patterns: list[str], host: str, port: int, cfg: Config,
           poll_s: float = 2.0, refresh_s: float = 5.0, hero_names=(), play_patterns=None,
-          play_hands: int = 20, play_poll_s: float = 0.5, range_patterns=None) -> None:
-    live = Live(db_dir, platform, patterns, cfg, refresh_s, hero_names)
+          play_hands: int = 20, play_poll_s: float = 0.5, range_patterns=None,
+          aliases: Optional[Aliases] = None) -> None:
+    live = Live(db_dir, platform, patterns, cfg, refresh_s, hero_names, aliases)
     play = PlayFeed(play_patterns, play_hands, range_patterns=range_patterns) if play_patterns else None
     hist = None
     if platform == "wopo":

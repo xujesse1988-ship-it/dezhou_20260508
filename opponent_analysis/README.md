@@ -47,6 +47,10 @@ python3 -m unittest discover -s opponent_analysis/tests -t .
   新读到的手比已有的更早（例如后来才加进一个旧文件）时按时间顺序整体重建，保证漂移检验的前后半程划分正确。
 - 河牌牌力百分位缓存在 `<db>/<平台>/river_pct_cache.json`（每个约 0.1–0.2 秒），重启不用重算。
 - 我方名字 = 每手日志的记录座位，加上 `--hero` 给的名字（日志没被跟随的我方 bot），都不计入对手和群体基准。
+- **对手别名**（`--aliases <JSON>`，`report` 和 `live` 都有，缺省不合并）：同一个人的多个名字（换号、服务器把名字截成
+  「前几个字...」）合成一个画像，用的是 wopo driver 那份 `tools/poker_live/wopo_aliases.json`（`exact` 原名 → 别名，再按
+  `patterns` 正则）。数据库照旧存原名，改表不用重新导入；hero 座不换；同一手里换完会和别的座重名的，这手这些座用原名。
+  页面快照带 `aliases`（原名 → 画像名），行动指南里的原名照样能点开合并后的画像。
   `report` 也有 `--hero`，给同样的名字时两边结果一致。
 - 默认只监听 `127.0.0.1`。在实盘机器上跑时用 ssh 隧道看：`ssh -L 8780:127.0.0.1:8780 <机器>`，再开本机浏览器。
 - 页面：（给了 `--play-events` 时）顶部的实时行动指南（见下节）、最近一手的牌桌座次（点名字看详情）、玩家总表（可排序、选列、只看在桌）、单人详情
@@ -123,6 +127,7 @@ setsid nohup python3 -m opponent_analysis live --db artifacts/opponent_db_ante10
 | `hero_turn` | `>> 轮到 hero …` | `turn`（决策点编号，和后面的 `decision` / `hero_action` 对应）、`street`、`pot`、`to_call`、`valid`（`can_check` / `can_call` / `can_raise` / `min_raise` / `max_raise`，本街总额）、`hole`、`board`、`table_seq` |
 | `decision` | `>> 决策 …` | `turn`、`street`、`pot`、`to_call`、`valid`、`action`、`amount`（raise 的本街总额）、`all_in`（all_in，或 raise 到最大额）、`advice`（play.log 里的建议文字）、`probs`（`[[动作, 概率]]`，兜底动作为 null）、`chosen`、`source`、`decide_ms`、`stale`（过期原因全文；null = 已写进行动文件）、`stale_kind`（`hero_acted` / `hand_over` / `hand_dead`）、`written`、`rejected`（advisor 原建议不合法被换成安全动作时的原回复） |
 | `dead` | `本手作废：…` | `reason`、`tag`（冒号前的类别）。开局消息本身不合法时只有这一条，没有 `hand_start` |
+| `shown` | `亮牌 …`（紧挨在 `结算` 前，只有对手亮了牌才有） | `seats`：亮牌的对手 `{seat, name, cards, folded}`，按座位排序（已弃牌的座也可能有亮牌，同样是真实信息：`folded` = true，play.log 标「(已弃)」）；不含 hero（底牌见 `hole`），取自 `hand_result` 的 `shown_cards` |
 | `result` | `结算 …` | `stacks`：每个发牌座 `{seat, name, start, final, net}`；`pot`、`board`、`winners`、`shown`（服务器 `hand_result` 的原样字段）、`notes`（结算核对不过的说明）、`server_ts` |
 
 `decision` 是 worker 线程回调写的，可能在下一手已经开始后才到（`stale_kind = hand_over`），按 `hand_id` 归回原来那手。

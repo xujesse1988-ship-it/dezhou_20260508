@@ -606,13 +606,18 @@ function fmtAct(a, to, delta, toCall) {
 }
 const adviceText = d => fmtAct(d.action, d.amount, d.to_call, d.to_call) + (d.action === 'raise' && d.all_in ? '（全下）' : '');
 const probName = n => { for (const p of ['bet', 'raise']) if (n.startsWith(p) && n !== p) return n.slice(p.length); return n; };
+// Raw name (as the driver logs it) -> profile name when --aliases merged several names into one profile.
+const profName = n => (snap && snap.aliases && n != null && snap.aliases[n]) || n;
 function nameBtn(name, seat) {
   const label = name ?? `座${seat}`;
-  const known = snap && name != null && snap.players.some(p => p.name === name);
-  return known ? `<button class="namebtn" data-n="${esc(name)}">${esc(label)}</button>` : esc(label);
+  const pn = profName(name);
+  const known = snap && pn != null && snap.players.some(p => p.name === pn);
+  const merged = pn !== name ? ` title="画像合并到「${esc(pn)}」"` : '';
+  return known ? `<button class="namebtn" data-n="${esc(pn)}"${merged}>${esc(label)}</button>` : esc(label);
 }
 function profChip(name) {
   if (!snap) return '<span class="muted">画像加载中</span>';
+  name = profName(name);
   const p = name != null && snap.players.find(x => x.name === name);
   if (!p) return '<span class="muted">无画像</span>';
   const r = k => p.rates[k] && p.rates[k].n ? pct(p.rates[k].mean) : '—';

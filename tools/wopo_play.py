@@ -23,6 +23,9 @@
     每手按实盘同一格式（table.observe_from_hh）当 observe 发给 advisor，进程内画像不再从空表开始。缺省
     来源 = --hh-log 所在 run 目录的上一级下所有 */wopo_hh.jsonl（同级各轮 + 本轮已写的，重启能接上）；
     给 glob（可重复）覆盖，off 关闭。按 hand_id 去重、按 ts 排序。
+  - 对手别名（--aliases，缺省 tools/poker_live/wopo_aliases.json，off 关闭）：同一个人的多个名字（换号、
+    服务器截断名字）在画像里合成一个。只换发给 advisor 的名字（observe / 决策请求 / 暖启动），play log /
+    hh / 事件流照旧记原名；同一手里换完会重名的座退回原名。
   - --play-log：给人看的牌桌实况（手牌 / 公共牌 / 玩家行动 / hero 决策与实际行动 / 结算 / 作废），
     诊断信息（advisor 启动、连接、过期、未知消息）仍走 stderr。
   - --play-events：同一份实况的结构化事件流（JSONL，play log 每行对应一条事件，带同一行文字 text），
@@ -68,10 +71,11 @@ import time
 from poker_live.advisor_client import (add_advisor_args, add_fourbet_args, advisor_extra_args,
                                        exploit_enabled, fourbet_enabled, fourbet_extra_args,
                                        start_advisor, validate_advisor_args, validate_fourbet_args)
+from poker_live.aliases import DEFAULT_PATH as DEFAULT_ALIASES, AliasError, NameAliases, load_aliases
 from poker_live.decision import DecisionWorker
 from poker_live.table import HandEngine, HandInvalid, observe_from_hh
 from poker_live.wopo import (_STALE_CN, _STREET_CN, ActionFile, WopoSession, _fmt_act, advice_matches,
-                             fmt_probs, legalize)
+                             fmt_probs, fmt_shown, legalize, shown_opponents)
 from poker_live.wslog import WsLog
 
 HERO_SEAT = 0
@@ -256,7 +260,7 @@ def _fixture_msgs():
 
 def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=False,
               exploit_4bet=False, reply=None, hh_log=None, play_log=None, ante=0, blueprint_ante=0,
-              n_seats=9, send_hand_id=False, play_events=None):
+              n_seats=9, send_hand_id=False, play_events=None, aliases=None):
     """msgs（dict 或 ("disconnect",)）喂一个新会话。返回 (session, stub, 行动文件行)。
     hook(i, session) 在每条消息后调用（异步场景用来在指定位置放行 advisor）。"""
     stub = _StubAdvisor(gate, reply)
@@ -268,7 +272,7 @@ def _run_msgs(msgs, gate=None, sync=True, hook=None, exploit=False, prewarm=Fals
                               exploit=exploit, prewarm=prewarm, exploit_4bet=exploit_4bet,
                               hh_log=hh_log, play_log=play_log, ante=ante,
                               blueprint_ante=blueprint_ante, send_hand_id=send_hand_id,
-                              play_events=play_events)
+                              play_events=play_events, aliases=aliases)
         for i, m in enumerate(msgs):
             if m == ("disconnect",):
                 session.on_disconnect()
@@ -1016,6 +1020,7 @@ EVENT_KEYS = {
     "decision": {"turn", "street", "pot", "to_call", "valid", "action", "amount", "all_in", "advice",
                  "probs", "chosen", "source", "decide_ms", "stale", "stale_kind", "written",
                  "rejected"},
+    "shown": {"seats"},
     "result": {"stacks", "pot", "board", "winners", "shown", "notes", "server_ts"},
 }
 
@@ -1068,6 +1073,9 @@ def _render_event(e):
                 + (f"  已过期（{_STALE_CN.get(e['stale_kind'], stale)}），未写入行动文件" if stale else "")
                 + (f"  {fmt_probs(e['probs'])}" if e["probs"] else "")
                 + f"  建议 {advice}")
+    if t == "shown":
+        return "亮牌 " + " | ".join(f"{who(x['seat'], x['name'])} {' '.join(x['cards'])}"
+                                    + ("(已弃)" if x["folded"] else "") for x in e["seats"])
     if t == "result":
         net = [f"{who(x['seat'], x['name'])} {x['net']:+d}" for x in e["stacks"]
                if x["final"] is not None and x["final"] != x["start"]]
@@ -1081,7 +1089,7 @@ def _check_events(play_text, events, session=None, rows=None):
     lines = play_text.splitlines()
     _check(len(lines) == len(events), f"事件 {len(events)} 条 ≠ play log {len(lines)} 行")
     prefix = {"hand_start": "────", "hole": "底牌 ", "seats": "座位 ", "hero_turn": ">> 轮到 hero",
-              "decision": ">> 决策  来源 ", "result": "结算 ", "dead": "本手作废："}
+              "decision": ">> 决策  来源 ", "shown": "亮牌 ", "result": "结算 ", "dead": "本手作废："}
     turns = set()
     for ln, e in zip(lines, events):
         clock, text = ln.split(" ", 1)
@@ -1214,6 +1222,33 @@ def _selftest_play_events():
     _check(all(x["start"] == x["stack"] + x["bet"] + 100 for e in seats for x in e["seats"]),
            "开局栈 = 剩余栈 + 盲注 + ante")
 
+    # 亮牌：结算前多一行「亮牌 …」，只列对手（hero 底牌已有），按座位排序；格式不认识的座忽略。
+    # fixture 里没有亮牌的手，这里给最后一手的 hand_result 塞一个。
+    last = max(i for i, m in enumerate(msgs) if m["type"] == "hand_result")
+    shown_msg = dict(msgs[last], shown_cards={"2": ["Ah", "Kd"], "0": ["2c", "2d"], "1": ["9s", "9c"],
+                                              "3": [], "x": ["Qs", "Qh"], "4": "QsQh"})
+    play, sink = io.StringIO(), _EventSink()
+    session, _, rows = _run_msgs(msgs[:last] + [shown_msg] + msgs[last + 1:], play_log=play,
+                                 play_events=sink)
+    _check_events(play.getvalue(), sink.events, session, rows)
+    sh = [i for i, e in enumerate(sink.events) if e["type"] == "shown"]
+    _check(len(sh) == 1 and sink.events[sh[0] + 1]["type"] == "result"
+           and sink.events[sh[0]]["hand_id"] == msgs[last]["hand_id"], f"亮牌事件位置 {sh}")
+    e = sink.events[sh[0]]
+    folded = {m["seat"] for m in msgs if m.get("hand_id") == msgs[last]["hand_id"]
+              and m["type"] == "player_action" and m.get("action") == "fold"}
+    _check(folded & {1, 2} and not {1, 2} <= folded, f"fixture 最后一手 seat1/2 应一弃一不弃 {folded}")
+    mark = {s: "(已弃)" if s in folded else "" for s in (1, 2)}
+    _check([(x["seat"], x["cards"], x["folded"]) for x in e["seats"]]
+           == [(1, ["9s", "9c"], 1 in folded), (2, ["Ah", "Kd"], 2 in folded)]
+           and all(x["name"] for x in e["seats"])
+           and e["text"] == (f"亮牌 seat1 {e['seats'][0]['name']} 9s 9c{mark[1]} | "
+                             f"seat2 {e['seats'][1]['name']} Ah Kd{mark[2]}"),
+           f"亮牌事件 {e}")
+    _check(shown_opponents(None, 0) == [] and shown_opponents({"0": ["Ah", "Kd"]}, 0) == []
+           and fmt_shown([{"seat": 5, "name": None, "cards": ["Tc", "Td"], "folded": False}]) == "亮牌 seat5 Tc Td",
+           "没有对手亮牌时不出这一行")
+
     # ante 比例不符：hand_start 之后紧跟 dead；hand_start 本身不合法（盲注坏）：只有 dead，hand_id 照带。
     play, sink = io.StringIO(), _EventSink()
     session, _, _ = _run_msgs(_with_ante(msgs, 2), ante=2, blueprint_ante=50, play_log=play,
@@ -1261,7 +1296,73 @@ def _selftest_play_events():
             got = [json.loads(line) for line in fh]
         _check(got and got[0]["type"] == "hand_start", "缺省时应写到 play log 同目录")
     print(f"[selftest 13 行动指南事件流] {len(ev)} 条事件与 play log 逐行对应、字段齐、可还原文字；"
-          "开关不影响其余输出；作废 / 过期 / 无建议 / 补盲 / ante / off 都覆盖", file=sys.stderr)
+          "开关不影响其余输出；作废 / 过期 / 无建议 / 补盲 / ante / 亮牌 / off 都覆盖", file=sys.stderr)
+
+
+def _selftest_aliases():
+    """对手别名：原名 → 别名（exact 优先、再按正则）；hero 座不换；同一手换完会重名的座退回原名；
+    发给 advisor 的 observe / 请求 / 暖启动用别名，play log / hh 照旧记原名；仓库里的别名表能读。"""
+    a = NameAliases({"ab...": "abcd"}, [(r"[0-9]h9$", "h9组")])
+    _check(a.canon("x3h9") == "h9组" and a.canon("ab...") == "abcd" and a.canon("bob") == "bob"
+           and a.canon(None) is None and a.canon("h9x") == "h9x", "单个名字的别名")
+    _check(a.apply({0: "hero", 1: "x3h9", 2: "bob"}, hero_seat=0) == {0: "hero", 1: "h9组", 2: "bob"},
+           "普通一手")
+    _check(a.apply({0: "hero", 1: "x3h9", 2: "y2h9"}, hero_seat=0) == {0: "hero", 1: "x3h9", 2: "y2h9"},
+           "两个座换成同一个别名 → 都用原名")
+    _check(a.apply({1: "ab...", 2: "abcd"}) == {1: "ab...", 2: "abcd"}, "别名和桌上另一个人的原名相同 → 用原名")
+    _check(a.apply({1: "p1h9", 2: "h9组"}) == {1: "p1h9", 2: "h9组"}, "别名和桌上原名「h9组」重名 → 用原名")
+    _check(a.apply({"0": "z5h9", "1": "z6h9"}, hero_seat="0") == {"0": "z5h9", "1": "h9组"}, "hero 座不换（字符串键）")
+    _check(not NameAliases() and not load_aliases("off") and not load_aliases(None), "空表")
+    real = load_aliases(DEFAULT_ALIASES)
+    _check(real.canon("嵩域鎏锋3h9") == "h9组" and real.canon("TRGFDGD...") == "TRGFDGDHG"
+           and real.canon("TRGFDGDHG") == "TRGFDGDHG" and real.canon("hero") == "hero", "仓库别名表")
+    with tempfile.TemporaryDirectory() as d:
+        for bad in ('[]', '{"patterns": [{"regex": "("}]}', '{"patterns": [{"regex": "x", "alias": ""}]}',
+                    '{"exact": {"a": ""}}', '{"exact": []}'):
+            path = os.path.join(d, "bad.json")
+            with open(path, "w") as f:
+                f.write(bad)
+            try:
+                load_aliases(path)
+            except AliasError:
+                continue
+            raise RuntimeError(f"[selftest] 坏别名表应报错: {bad}")
+
+    # 实盘会话：seat1 Shaggyx 换成别名；只影响发给 advisor 的名字。
+    msgs = _fixture_msgs()
+    al = NameAliases({"Shaggyx": "S组"})
+    hh, play = io.StringIO(), io.StringIO()
+    _, stub, rows = _run_msgs(msgs, exploit=True, prewarm=True, hh_log=hh, play_log=play, aliases=al)
+    _, stub0, rows0 = _run_msgs(msgs, exploit=True, prewarm=True)
+    obs = [r for k, r in stub.side if k == "observe"]
+    named = [r["names"] for r in stub.requests] + [r["names"] for r in obs]
+    _check(named and all(n.get(1) == "S组" and "Shaggyx" not in n.values() for n in named if 1 in n)
+           and any(1 in n for n in named), "请求 / observe 的 seat1 应换成别名")
+    swap = lambda n: {k: ("Shaggyx" if v == "S组" else v) for k, v in n.items()}
+    _check([dict(r, names=swap(r["names"])) for r in stub.requests] == stub0.requests
+           and [(k, dict(r, names=swap(r["names"]))) for k, r in stub.side]
+           == [(k, r) for k, r in stub0.side], "除名字外，请求 / observe 应和不开别名时相同")
+    nots = lambda rs: [{k: v for k, v in r.items() if k not in ("ts", "decide_ms")} for r in rs]
+    _check(nots(rows) == nots(rows0), "行动文件不受别名影响")
+    _check("S组" not in hh.getvalue() + play.getvalue() and "Shaggyx" in hh.getvalue() and "Shaggyx" in play.getvalue(),
+           "hh / play log 应记原名")
+    # 暖启动：从原名 hh 换别名后，和实盘发出的 observe 逐条相同。
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, WARM_HH_NAME)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(hh.getvalue())
+        warm, _ = load_warm_observes([path], aliases=al)
+        norm = lambda o: json.loads(json.dumps(o, ensure_ascii=False))
+        _check(warm == [norm(o) for o in obs], "暖启动换别名后应与实盘 observe 相同")
+        raw, _ = load_warm_observes([path])
+        _check(all("S组" not in o["names"].values() for o in raw), "不给别名时暖启动用原名")
+    # 两个人换成同一个别名：同桌的手退回原名 → 与不开别名完全相同。
+    _, stub2, _ = _run_msgs(msgs, exploit=True, prewarm=True,
+                            aliases=NameAliases({"Shaggyx": "S组", "hsjwnbxj": "S组"}))
+    _check(all(1 in r["names"] and 2 in r["names"] for r in stub0.requests), "fixture 每手 seat1 / seat2 都在")
+    _check(stub2.requests == stub0.requests and stub2.side == stub0.side, "两个座换成同一别名时应退回原名")
+    print("[selftest 16 对手别名] exact / 正则 / hero 不换 / 重名退回原名；只换发给 advisor 的名字，"
+          "暖启动同规则；坏别名表报错", file=sys.stderr)
 
 
 def run_selftest():
@@ -1282,7 +1383,8 @@ def run_selftest():
     _selftest_play_events()
     _selftest_warm_hh()
     _selftest_chip_div()
-    print("OK: wopo selftest 16 组场景全部通过。", file=sys.stderr)
+    _selftest_aliases()
+    print("OK: wopo selftest 17 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================
@@ -1323,8 +1425,9 @@ def resolve_warm_hh(arg, hh_log):
     return list(arg)
 
 
-def load_warm_observes(patterns, amounts=False):
-    """glob 匹配的 hh 文件 → observe 列表（按 ts 排序，hand_id 去重）+ 统计。坏行 / 缺字段的行跳过计数。"""
+def load_warm_observes(patterns, amounts=False, aliases=None):
+    """glob 匹配的 hh 文件 → observe 列表（按 ts 排序，hand_id 去重）+ 统计。坏行 / 缺字段的行跳过计数。
+    aliases（[`NameAliases`]）：名字换成别名，与实盘每手发的 observe 同一规则（hh 里记的是原名）。"""
     import glob
     files = sorted({f for pat in patterns for f in glob.glob(pat)})
     stats = {"files": len(files), "hands": 0, "bad": 0, "dup": 0}
@@ -1338,6 +1441,8 @@ def load_warm_observes(patterns, amounts=False):
                     rec = json.loads(line)
                     key = (rec.get("table_id"), rec["hand_id"])
                     obs = observe_from_hh(rec, amounts)
+                    if aliases:
+                        obs["names"] = aliases.apply(obs["names"], hero_seat=str(rec["my_seat"]))
                 except (ValueError, KeyError, TypeError):
                     stats["bad"] += 1
                     continue
@@ -1390,6 +1495,9 @@ def main():
                         "每手要求 --ante × 100 == 本值 × 大盲")
     p.add_argument("--stack-bb", type=int, default=100,
                    help="blueprint 的起始码深（BB，= 训练时 train_cfr --stack-bb；默认 100）。透传给 advisor")
+    p.add_argument("--aliases", default=DEFAULT_ALIASES,
+                   help="对手别名表（JSON，同一个人的多个名字在画像里合成一个；只换发给 advisor 的名字，"
+                        f"日志照旧记原名）。默认 {os.path.relpath(DEFAULT_ALIASES)}；off 关闭")
     add_fourbet_args(p)
     args = p.parse_args()
     # 根范围日志默认开（开了 --search 才有范围）：写在行动文件同目录的 wopo_ranges.jsonl；--range-log off 关。
@@ -1407,6 +1515,11 @@ def main():
         if token is None:
             p.error(f"连 WS 需要 token：设环境变量 {TOKEN_ENV} 或写进 {ENV_FILE}（非空且不含空白）")
 
+    try:
+        aliases = load_aliases(args.aliases)
+    except (OSError, ValueError, AliasError) as e:
+        p.error(f"--aliases 读不了：{e}")
+
     # 画像暖启动的来源（参数检查放在启动 advisor 之前，报错不留 advisor 进程）。
     warm = resolve_warm_hh(args.warm_hh, args.hh_log)
     if warm and not (exploit_enabled(args) or fourbet_enabled(args)):
@@ -1423,13 +1536,17 @@ def main():
     worker = DecisionWorker(advisor, sync=args.replay is not None)
     # 画像暖启动：第一手之前把历史 hh 当 observe 发给 advisor（与实盘每手结束发的同格式）。
     if warm:
-        observes, st = load_warm_observes(warm, amounts=fourbet_enabled(args))
+        observes, st = load_warm_observes(warm, amounts=fourbet_enabled(args), aliases=aliases)
         for o in observes:
             worker.submit_observe(o)
         print(f"[warm] 画像暖启动：{st['files']} 个 hh 文件，{st['hands']} 手发给 advisor"
               f"（坏行 {st['bad']}，重复 {st['dup']}）；来源 {' '.join(warm)}", file=sys.stderr)
     else:
         print("[warm] 画像暖启动：关", file=sys.stderr)
+    if exploit_enabled(args) or fourbet_enabled(args):
+        print(f"[aliases] 对手别名：{'关' if not aliases else args.aliases}"
+              + (f"（{len(aliases.exact)} 个原名、{len(aliases.patterns)} 条规则）" if aliases else ""),
+              file=sys.stderr)
     action_file = ActionFile(args.action_file)
     action_log = open(args.action_log, "a") if args.action_log else None
     hh_log = open(args.hh_log, "a", encoding="utf-8") if args.hh_log else None
@@ -1441,7 +1558,8 @@ def main():
                           prewarm=args.search_prewarm, exploit=exploit_enabled(args),
                           debug=args.debug_log, exploit_4bet=fourbet_enabled(args), hh_log=hh_log,
                           play_log=play_log, ante=args.ante, blueprint_ante=args.blueprint_ante,
-                          send_hand_id=args.range_log is not None, play_events=play_events)
+                          send_hand_id=args.range_log is not None, play_events=play_events,
+                          aliases=aliases)
     ok = True
     try:
         if args.replay:

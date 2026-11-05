@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 
+from poker_live.aliases import NameAliases
 from poker_live.decision import make_request, safe_response, tally_source
 from poker_live.table import HandEngine, HandInvalid
 
@@ -53,6 +54,34 @@ def advice_matches(adv, act):
             return True
         return abs(got - want) * 100 <= want * ADVICE_SIZE_TOL_PCT
     return adv["action"] == act["action"]
+
+
+def shown_opponents(shown, hero_seat):
+    """hand_result 的 shown_cards（{座位: [牌, 牌]}，键可能是字符串）→ 按座位排序的
+    [(seat, [牌...])]，去掉 hero 自己（底牌已在「底牌」行）和没有牌的座。格式不认识的整条忽略。"""
+    if not isinstance(shown, dict):
+        return []
+    out = []
+    for k, cards in shown.items():
+        try:
+            seat = int(k)
+        except (TypeError, ValueError):
+            continue
+        if seat == hero_seat or not isinstance(cards, (list, tuple)) or not cards:
+            continue
+        if all(isinstance(c, str) for c in cards):
+            out.append((seat, list(cards)))
+    return sorted(out)
+
+
+def fmt_shown(seats):
+    """play log 亮牌行：seats = [{seat, name, cards, folded}]。没到摊牌、或已弃牌的座也可能有亮牌
+    （11-02~11-04 有亮牌的 243 手里 13 手含弃牌座），这些也是真实信息、照样可用于分析；
+    弃牌座标「(已弃)」，说明是拿这手牌弃的。"""
+    return "亮牌 " + " | ".join(
+        (f"seat{x['seat']} {x['name']}" if x["name"] else f"seat{x['seat']}") + " " + " ".join(x["cards"])
+        + ("(已弃)" if x["folded"] else "")
+        for x in seats)
 
 
 def fmt_probs(probs):
@@ -217,8 +246,10 @@ class WopoSession:
     def __init__(self, worker, action_file, n_seats, hero_seat=0, num_hands=0,
                  action_log=None, prewarm=False, exploit=False, debug=False,
                  exploit_4bet=False, hh_log=None, play_log=None, ante=0, blueprint_ante=0,
-                 send_hand_id=False, play_events=None):
+                 send_hand_id=False, play_events=None, aliases=None):
         self.worker = worker
+        # 对手别名（[`NameAliases`]）：只换发给 advisor 的名字（observe / 决策请求），日志照旧记原名。
+        self.aliases = aliases if aliases is not None else NameAliases()
         # ante：桌面每座 ante（--ante，桌面筹码）；blueprint_ante：blueprint 的 ante（solver 筹码，
         # BB = 100）。每手按 ante × 100 == blueprint_ante × 大盲 核对，对不上这手作废。
         self.ante = ante
@@ -488,6 +519,11 @@ class WopoSession:
             stacks.append({"seat": s, "name": hand.names.get(s), "start": hand.start_stack[s],
                            "final": v if num else None,
                            "net": int(v) - hand.start_stack[s] if num else None})
+        shown = shown_opponents(msg.get("shown_cards"), self.hero_seat)
+        if shown:
+            seats = [{"seat": s, "name": hand.names.get(s), "cards": c, "folded": s in hand.folded}
+                     for s, c in shown]
+            self._play(fmt_shown(seats), "shown", seats=seats)
         self._play("结算 " + (" | ".join(net) or "无输赢"), "result", stacks=stacks, pot=hand.pot,
                    board=list(hand.board), winners=msg.get("winners"),
                    shown=msg.get("shown_cards"), notes=notes, server_ts=msg.get("ts"))
@@ -496,7 +532,9 @@ class WopoSession:
             self.counters["result_notes"] += 1
             print(f"  [result] hand={hand.hand_id} 结算核对：{'; '.join(notes)}", file=sys.stderr)
         if self.send_names:
-            self.worker.submit_observe(hand.observe_record(amounts=self.exploit_4bet))
+            obs = hand.observe_record(amounts=self.exploit_4bet)
+            obs["names"] = self.aliases.apply(obs["names"], hero_seat=self.hero_seat)
+            self.worker.submit_observe(obs)
         if self.hh_log:
             # 走到这里的手都没作废（作废的手不再处理后续消息）；结算核对不过也照写，记 result_notes，
             # opponent_analysis 回放时会再校验一遍并拒收。
@@ -518,7 +556,8 @@ class WopoSession:
                            hand.sb, hand.bb, hand.advisor_actions(), valid,
                            stacks=hand.hand_start_stacks(placeholder=100 * hand.bb),
                            dealt_seats=list(dealt) if dealt else None,
-                           names=dict(hand.names) if self.send_names else None,
+                           names=self.aliases.apply(hand.names, hero_seat=self.hero_seat)
+                           if self.send_names else None,
                            ante=hand.ante,
                            hand_id=hand.hand_id if self.send_hand_id else None)
         d = chip_div(hand.sb, hand.bb, hand.ante)

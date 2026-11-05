@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from . import aliases as aliases_mod
 from . import db
 from .platforms import PLATFORMS
 from .report import Config, analyze, write_report
@@ -33,6 +34,9 @@ def main(argv=None) -> int:
                     help="「最近」= 每个玩家自己的最近 N 手")
     rep.add_argument("--hero", nargs="*", default=[],
                     help="另外算作我方的名字（日志没被导入的我方 bot），不计入对手和群体基准")
+    rep.add_argument("--aliases", default=None,
+                     help="对手别名表（JSON，同一个人的多个名字合成一个画像，如 tools/poker_live/wopo_aliases.json）；"
+                         "数据库照旧存原名，缺省不合并")
 
     lv = sub.add_parser("live", help="跟随正在写入的 hh 日志，实时更新画像并开 HTTP 页面")
     lv.add_argument("--db", required=True)
@@ -41,6 +45,9 @@ def main(argv=None) -> int:
                     help="hh 日志路径或通配符（加引号），每次轮询重新展开，新的 run 目录会自动接上")
     lv.add_argument("--hero", nargs="*", default=[],
                     help="另外算作我方的名字（日志没被跟随的我方 bot），不计入对手和群体基准")
+    lv.add_argument("--aliases", default=None,
+                    help="对手别名表（JSON，同一个人的多个名字合成一个画像，如 tools/poker_live/wopo_aliases.json）；"
+                         "数据库照旧存原名，缺省不合并")
     lv.add_argument("--host", default="127.0.0.1")
     lv.add_argument("--port", type=int, default=8780)
     lv.add_argument("--poll", type=float, default=2.0, help="读日志间隔（秒）")
@@ -68,6 +75,12 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "live" and a.play_hands < 1:
         ap.error("--play-hands 须 ≥ 1")  # exits with status 2 and the usage line
+    a.alias_table = None
+    if a.cmd in ("report", "live"):
+        try:
+            a.alias_table = aliases_mod.load(a.aliases)
+        except (OSError, ValueError) as e:
+            ap.error(f"--aliases 读不了：{e}")
     try:
         return _run(a)
     except db.DatabaseBusy as e:
@@ -90,7 +103,8 @@ def _run(a) -> int:
         else:
             ranges = a.play_ranges or default_range_patterns(a.play_events)
         serve(a.db, a.platform, a.follow, a.host, a.port, cfg, a.poll, a.refresh, a.hero,
-              play_patterns=a.play_events, play_hands=a.play_hands, range_patterns=ranges)
+              play_patterns=a.play_events, play_hands=a.play_hands, range_patterns=ranges,
+              aliases=a.alias_table)
         return 0
     if a.cmd == "ingest":
         jobs = []
@@ -103,7 +117,7 @@ def _run(a) -> int:
             e = db.ingest(a.db, hh, ws, a.platform)
             print(f"{e['platform']}: {hh} -> {e['counts']}")
         return 0
-    hands = db.load_hands(a.db, a.platform)
+    hands = [a.alias_table.hand(h) for h in db.load_hands(a.db, a.platform)]
     if not hands:
         print(f"{a.platform}: 数据库里没有手牌", file=sys.stderr)
         return 1
