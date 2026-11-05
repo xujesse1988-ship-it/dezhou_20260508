@@ -152,6 +152,11 @@ def add_advisor_args(p, default_seats, debug_help):
     # 搜索读数门槛（advisor 默认 200）：hero 信息集在 solve 里被遍历不足这么多次就不用这份解，
     # flop 退回 blueprint、转牌 / 河牌兜底；0 = 关。不传 = 吃 advisor 默认。
     p.add_argument("--search-min-hero-visits", type=int, default=None)
+    # 翻前样本少不押上（advisor 默认 50000）：hero 这手牌这一行的累计权重低于它，就不用 blueprint 的全下
+    # 和押上大半筹码的加注；0 = 关。不传 = 吃 advisor 默认。不依赖 --search。
+    p.add_argument("--preflop-commit-min-visits", type=int, default=None)
+    # 上面「押上大半筹码」的比例（advisor 默认 0.5）：加注新投入 ≥ 还能输的筹码 × 这个比例。
+    p.add_argument("--preflop-commit-share", type=float, default=None)
     # hero 真实手牌单独信息集 + 强制发牌（advisor 默认关）：hero 当遍历者时以比例 q 直接发真实底牌，
     # 0 = 只开专用信息集。不传 = 关。
     p.add_argument("--search-real-hand-q", type=float, default=None)
@@ -236,6 +241,10 @@ def validate_advisor_args(args):
         raise SystemExit("--search-min-hero-visits 需配 --search（它只管搜索读数）")
     if args.search_min_hero_visits is not None and args.search_min_hero_visits < 0:
         raise SystemExit("--search-min-hero-visits 须 ≥ 0")
+    if args.preflop_commit_min_visits is not None and args.preflop_commit_min_visits < 0:
+        raise SystemExit("--preflop-commit-min-visits 须 ≥ 0")
+    if args.preflop_commit_share is not None and not 0.0 < args.preflop_commit_share <= 1.0:
+        raise SystemExit("--preflop-commit-share 须在 (0, 1]")
     if args.search_real_hand_q is not None and not args.search:
         raise SystemExit("--search-real-hand-q 需配 --search（它只管搜索求解）")
     if args.search_real_hand_q is not None and not 0.0 <= args.search_real_hand_q <= 1.0:
@@ -258,6 +267,10 @@ def advisor_extra_args(args, warm_profile_hh=None):
     if args.seats != 6:
         # 缺省 6 不透传（advisor 默认 6，命令行与旧版逐字节相同）。
         extra += ["--seats", str(args.seats)]
+    if args.preflop_commit_min_visits is not None:
+        extra += ["--preflop-commit-min-visits", str(args.preflop_commit_min_visits)]
+    if args.preflop_commit_share is not None:
+        extra += ["--preflop-commit-share", str(args.preflop_commit_share)]
     if args.search:
         extra.append("--search")
         if args.search_iterations is not None:

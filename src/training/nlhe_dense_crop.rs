@@ -748,6 +748,13 @@ impl CroppedBlueprint {
         Some(normalize_strategy(&self.strategy[start..start + n]))
     }
 
+    /// Sum of the row's cumulative strategy values, same as [`CropNodeRows::row_total`]. `None` = the
+    /// infoset's street was cropped away; an unvisited row on a kept street gives `0.0`.
+    pub fn strategy_row_total(&self, info: InfoSetId) -> Option<f64> {
+        let (_, start, n) = self.locate(info)?;
+        Some(self.strategy[start..start + n].iter().sum())
+    }
+
     /// 逐动作累计 regret（与 dense trainer `regret_for` 同约定：未 touch → 空 Vec）。
     /// `None` = 该街已裁掉，或 crop 时未保留 regret 表。
     pub fn regret_for(&self, info: InfoSetId) -> Option<Vec<f64>> {
@@ -1024,6 +1031,14 @@ mod tests {
                     let want = bp
                         .average_strategy(pack_info_set_v2(b, id, StreetTag::Preflop))
                         .expect("翻前必保留");
+                    let info = pack_info_set_v2(b, id, StreetTag::Preflop);
+                    let total = bp.strategy_row_total(info).expect("翻前必保留");
+                    assert_eq!(total.to_bits(), rows.row_total(b as usize).to_bits());
+                    assert_eq!(
+                        total.to_bits(),
+                        trainer.strategy_sum().row_sum_by_info(info).to_bits(),
+                        "node {id} bucket {b}"
+                    );
                     match rows.average_strategy(b as usize) {
                         None => assert!(want.is_empty(), "node {id} bucket {b} 访问判定不一致"),
                         Some(got) => {

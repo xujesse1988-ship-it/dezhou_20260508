@@ -214,6 +214,27 @@ const DEFAULT_SEARCH_MAX_NODES: usize = 200_000;
 /// 到上千不等（取决于解里对手走这条线的频率），所以门槛管的是「这一次解」而不是节点本身。生产
 /// 范围更窄，实际分布要看决策日志的 `hero_visits` 再定。
 const DEFAULT_SEARCH_MIN_HERO_VISITS: u32 = 200;
+/// Default of `--preflop-commit-min-visits` ([`PreflopVisitGate`]): below this cumulative strategy weight
+/// of hero's own preflop row the blueprint's all-in and committing raises are not used. `0` = off.
+///
+/// Basis (2026-11-05, open2 and 3bet 9B crops, about 800k rows each): compare a row's all-in probability
+/// with the mean of its strength neighbours. For non-pairs that gap only levels off at 50k (mean / P90,
+/// open2 30-40k .037/.107, 40-50k .023/.039, 50-70k .017/.022; 3bet 30-40k .064/.227, 40-50k .036/.091,
+/// 50-70k .016/.014). Live 001450 AJo is 1435, 001509 88 is 209; a common open-vs-3bet node is 786548.
+/// Raw row weight, not per combo: the knee lines up across suited / offsuit on raw weight and does not
+/// per combo, since one row pools the samples of all its combos. Hero's row, not the node's median:
+/// with the median at 10-30k a row under 10k still deviates .188, a row over 30k only .062. The number
+/// of callers adds nothing at the same weight, so there is no condition on the action line.
+///
+/// Limits: pairs show no knee (still .07-.08 at 200k+, likely real differences between adjacent pairs),
+/// so this method cannot validate the value on pairs; they just share it. It comes from two 9B crops:
+/// look at the distribution again for a new blueprint such as o75.
+const DEFAULT_PREFLOP_COMMIT_MIN_VISITS: u64 = 50_000;
+/// Default of `--preflop-commit-share` ([`PreflopVisitGate`]): on a low-weight row, a raise adding at least
+/// this share of what hero can still lose ([`low_visits_stack_behind`]) goes the same way as an all-in.
+/// Same value as [`WEAK_COMMIT_STACK_SHARE`]. Live cases: 001450 1pot to 8790 of 10776, JJ (weight 13505)
+/// 1pot to 15500 of 26983. Two hands, so a parameter rather than a measured constant.
+const DEFAULT_PREFLOP_COMMIT_SHARE: f64 = 0.5;
 /// 弱牌押上全部筹码护栏的默认（`--search-weak-commit-guard`，[`weak_commit_guard`]）：**默认开**。
 const DEFAULT_SEARCH_WEAK_COMMIT_GUARD: bool = true;
 /// flop 优先 blueprint 的有效码深区间（占 blueprint 起始码深的百分比，含端点；
@@ -390,6 +411,11 @@ struct Response {
     /// 搜索走到读数的决策才填（含因访问不足被拒的那次）；blueprint / 其余兜底恒 `None`（serde skip）。
     #[serde(skip_serializing_if = "Option::is_none")]
     hero_visits: Option<u32>,
+    /// Cumulative strategy weight of hero's preflop blueprint row ([`PreflopVisitGate`]). Filled on every
+    /// preflop blueprint decision when the gate is wired up, whether or not it fired; a firing shows as
+    /// `:low_visits_no_commit` in `source`. `None` elsewhere (serde skip).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bp_row_weight: Option<f64>,
     /// PM-17 遥测（`pm17_preflop_4bet_exploit_design_2026_10_22` §4.5）：`--exploit-4bet on` 且决策点是
     /// 「我方开局、一人 3bet、其余都弃」时填（门没开也填，事后看为什么没放开）；否则 `None`（serde skip）。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2856,7 +2882,19 @@ fn decide(
         search,
         solve_cache,
         None,
+        None,
     )
+}
+
+/// Preflop row-weight gate of [`decide_with`]. `row_weight` reads the cumulative strategy weight of an
+/// infoset's row ([`Blueprint::row_weight`]); `min_visits` is the threshold, see
+/// [`DEFAULT_PREFLOP_COMMIT_MIN_VISITS`] (`0` never fires but still logs the weight).
+#[derive(Clone, Copy)]
+struct PreflopVisitGate<'a> {
+    min_visits: u64,
+    /// See [`DEFAULT_PREFLOP_COMMIT_SHARE`].
+    commit_share: f64,
+    row_weight: &'a dyn Fn(&InfoSetId) -> Option<f64>,
 }
 
 /// [`decide`] + PM-17 识别器（`fourbet`，`--exploit-4bet on` 时为 `Some`）。`None` 时与 [`decide`]
@@ -2871,6 +2909,7 @@ fn decide_with(
     search: Option<&SearchRuntime>,
     solve_cache: &mut SubgameSolveCache,
     fourbet: Option<&RefCell<FourBetTracker>>,
+    visit_gate: Option<PreflopVisitGate<'_>>,
 ) -> Response {
     // —— 前置校验（不满足 = 兜底）——
     if req.hole.len() != 2 {
@@ -3464,6 +3503,41 @@ fn decide_with(
         .as_deref()
         .or(fourbet_dist.as_deref())
         .unwrap_or(&dist);
+    // Preflop row with too few samples: its all-in and committing raises are not used
+    // ([`low_visits_no_commit`]). Exempt when
+    // hero can only call: facing a real all-in, or a raise that covers hero (driver turns all-in into
+    // call). The all-in slot is the call there. Runs on the pruned dist, so an all-in below the sampling
+    // floor is dropped as before.
+    let bp_row_weight = visit_gate
+        .filter(|_| board.is_empty() && !want_search)
+        .and_then(|g| (g.row_weight)(&info));
+    let low_visits_no_commit = match (visit_gate, bp_row_weight) {
+        (Some(g), Some(w))
+            if w < g.min_visits as f64 && allin_spot.is_none() && req.valid.can_raise =>
+        {
+            let behind = low_visits_stack_behind(
+                req,
+                &solver_cfg,
+                scale,
+                &smap,
+                my_seat_solver,
+                hole,
+                outgoing_state,
+            );
+            let d = low_visits_no_commit(
+                &prune_for_sampling(adjusted, postflop_spr(outgoing_state)),
+                outgoing_state,
+                &legal_abs,
+                solver_cfg.big_blind,
+                &|a| raise_commits_stack(outgoing_state, outgoing_abs, a, behind, g.commit_share),
+                low_visits_call_hand(hole),
+            );
+            dlog!("low visits preflop row weight={w}: {adjusted:?} → {d:?}");
+            d
+        }
+        _ => None,
+    };
+    let adjusted: &[(AbstractAction, f64)] = low_visits_no_commit.as_deref().unwrap_or(adjusted);
     // 翻前深码：hero 实际押上的码深超过 blueprint 码深 140% → 不按 blueprint 全下
     // （[`deep_preflop_no_allin`]）。分布里没有全下时不重放真栈（不多花时间，旧路径 byte-equal）。
     let deep_no_allin = if board.is_empty()
@@ -3529,7 +3603,7 @@ fn decide_with(
         // 合法动作：填 source（search / blueprint）+ 诊断。不合法时 action_to_response 已产
         // safe_fallback（source = fallback:...），不覆盖。bet/raise 退成 call/check 时追加降级标记。
         resp.source = format!(
-            "{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}",
             if low_visits_bp {
                 "blueprint:low_hero_visits"
             } else if placeholder_search {
@@ -3554,6 +3628,11 @@ fn decide_with(
             } else {
                 ""
             },
+            if low_visits_no_commit.is_some() {
+                ":low_visits_no_commit"
+            } else {
+                ""
+            },
             if deep_no_allin.is_some() {
                 ":deep_no_allin"
             } else {
@@ -3567,6 +3646,7 @@ fn decide_with(
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates; // blueprint 路径恒 None（serde skip，byte-equal）。
         resp.hero_visits = hero_visits;
+        resp.bp_row_weight = bp_row_weight;
         resp.menu = search_menu;
         resp.fourbet = fourbet_tel;
     }
@@ -4809,6 +4889,126 @@ fn preflop_hero_eff_stack(
     Some(deepest_opp.min(real_cfg.starting_stacks[h].as_u64()))
 }
 
+/// What hero can still lose this hand, in solver chips: hero against the deepest live opponent
+/// ([`preflop_hero_eff_stack`]), minus what hero has already put in. Effective rather than hero's own
+/// stack, since a deep hero commits just as much against a short opponent. `state` = the blueprint-depth
+/// outgoing state, where hero's contribution is the same as at the table. Replay fails → hero's stack
+/// in `state`.
+fn low_visits_stack_behind(
+    req: &Request,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    hero: SeatId,
+    hole: [Card; 2],
+    state: &GameState,
+) -> u64 {
+    let h = hero.0 as usize;
+    let stack = state.players()[h].stack.as_u64();
+    let put_in = solver_cfg.starting_stacks[h].as_u64().saturating_sub(stack);
+    preflop_hero_eff_stack(req, solver_cfg, scale, smap, hero, hole)
+        .map_or(stack, |eff| eff.saturating_sub(put_in))
+}
+
+/// A bet or raise whose new chips (same amount as sent, [`outgoing_action`]) reach `share` of `behind`.
+/// `AllIn` is not judged here: the caller always takes it out.
+fn raise_commits_stack(
+    state: &GameState,
+    abs: &StreetActionAbstraction,
+    a: AbstractAction,
+    behind: u64,
+    share: f64,
+) -> bool {
+    let Some(seat) = state.current_player() else {
+        return false;
+    };
+    let in_round = state.players()[seat.0 as usize]
+        .committed_this_round
+        .as_u64();
+    match outgoing_action(state, abs, a) {
+        Ok(Action::Bet { to }) | Ok(Action::Raise { to }) => {
+            to.as_u64().saturating_sub(in_round) as f64 >= share * behind as f64
+        }
+        _ => false,
+    }
+}
+
+/// QQ+ and AK: on a low-weight row their committing mass goes to the call ([`low_visits_no_commit`]).
+fn low_visits_call_hand(hole: [Card; 2]) -> bool {
+    use poker::Rank::{Ace, King, Queen};
+    let (mut hi, mut lo) = (hole[0].rank(), hole[1].rank());
+    if hi < lo {
+        std::mem::swap(&mut hi, &mut lo);
+    }
+    (hi == lo && hi >= Queen) || (hi == Ace && lo == King)
+}
+
+/// Takes `AllIn` and committing raises (`commits`) out of a preflop row with too few samples
+/// ([`PreflopVisitGate`]) and scales the other actions up in proportion, the same thing
+/// [`prune_for_sampling`] does to a low-probability all-in. Well-sampled sibling nodes favour this over
+/// moving the mass to `Call`: on rows under the threshold the same hand one line over folds 64% (offsuit
+/// 85%), and live 001450 AJo folds 97-100% in its siblings.
+///
+/// - `legal_abs` (the node's menu) has no `Call` while hero faces a raise: the tree folded the call into
+///   `AllIn`, so the mass goes to the real call. Unopened nodes with no limp in the tree also lack `Call`;
+///   `big_blind` tells them apart.
+/// - `call_hand` ([`low_visits_call_hand`]) facing a raise: the mass goes to `Call`, its fold share stays.
+///   In proportion, AKo would fold at least half the time on 83 of 134 sampled low-weight rows, while
+///   well-sampled siblings almost never fold these hands.
+/// - Nothing else in the dist (pure all-in, e.g. AA): goes to `Call` if the menu has it, otherwise
+///   `None`, as on an unopened node with no limp in the tree.
+/// - Nothing to take out with probability > 0: `None`, the caller samples the original dist.
+fn low_visits_no_commit(
+    dist: &[(AbstractAction, f64)],
+    state: &GameState,
+    legal_abs: &[AbstractAction],
+    big_blind: ChipAmount,
+    commits: &dyn Fn(AbstractAction) -> bool,
+    call_hand: bool,
+) -> Option<Vec<(AbstractAction, f64)>> {
+    let dropped = |a: AbstractAction| matches!(a, AbstractAction::AllIn { .. }) || commits(a);
+    let moved: f64 = dist
+        .iter()
+        .filter(|&&(a, _)| dropped(a))
+        .map(|&(_, p)| p.max(0.0))
+        .sum();
+    if moved <= 0.0 {
+        return None;
+    }
+    let mut out: Vec<(AbstractAction, f64)> =
+        dist.iter().copied().filter(|&(a, _)| !dropped(a)).collect();
+    let call_slot = legal_abs
+        .iter()
+        .copied()
+        .find(|a| matches!(a, AbstractAction::Call { .. }));
+    let facing_raise = state.legal_actions().call.filter(|&to| to > big_blind);
+    match (call_slot, facing_raise) {
+        (None, Some(to)) => {
+            out.push((AbstractAction::Call { to }, moved));
+            return Some(out);
+        }
+        (Some(slot), Some(_)) if call_hand => {
+            match out
+                .iter_mut()
+                .find(|(a, _)| matches!(a, AbstractAction::Call { .. }))
+            {
+                Some(e) => e.1 += moved,
+                None => out.push((slot, moved)),
+            }
+            return Some(out);
+        }
+        _ => {}
+    }
+    let rest: f64 = out.iter().map(|&(_, p)| p.max(0.0)).sum();
+    if rest <= 0.0 {
+        return Some(vec![(call_slot?, 1.0)]);
+    }
+    for (_, p) in &mut out {
+        *p = p.max(0.0) / rest;
+    }
+    Some(out)
+}
+
 /// 翻前深码（[`PREFLOP_BLUEPRINT_MAX_EFF_PCT`]）时把 blueprint 分布里 `AllIn` 的概率整份挪走：
 /// 树里的全下是 blueprint 码深的全下，真实码深深得多时它的意思是「这手牌值得把 200BB 打进去」，
 /// 不是「把几百 BB 打进去」。挪给谁：
@@ -6013,6 +6213,15 @@ impl Blueprint {
         }
     }
 
+    /// Cumulative strategy weight of an infoset's row: the sum of its strategy table cells, which is the
+    /// LCFR-weighted count of visits (each visit adds a full sigma). `None` = street cropped away.
+    fn row_weight(&self, info: &InfoSetId) -> Option<f64> {
+        match self {
+            Blueprint::Full(t) => Some(t.strategy_sum().row_sum_by_info(*info)),
+            Blueprint::Cropped { bp, .. } => bp.strategy_row_total(*info),
+        }
+    }
+
     /// `strategy_fn` 的实现（见类型 doc）。均匀占位行返回空（[`strip_uniform_placeholder`]）。
     fn strategy(&self, info: &InfoSetId) -> Vec<f64> {
         strip_uniform_placeholder(self.strategy_raw(info))
@@ -6221,6 +6430,12 @@ struct Args {
     /// 空表起步），每手 observe 后原子写回。**仅 `--exploit-4bet on` 时可设**。`None`（默认）= 每个进程
     /// 从零统计、不写盘。
     exploit_4bet_state: Option<PathBuf>,
+    /// `--preflop-commit-min-visits <N>` ([`PreflopVisitGate`]). Default
+    /// [`DEFAULT_PREFLOP_COMMIT_MIN_VISITS`]; `0` = off. Does not need `--search`.
+    preflop_commit_min_visits: u64,
+    /// `--preflop-commit-share <0..=1>` ([`DEFAULT_PREFLOP_COMMIT_SHARE`]): a raise on a low-weight row
+    /// adding at least this share of what hero can still lose counts as committing.
+    preflop_commit_share: f64,
     /// `--debug-log`：打印决策流水线 + range / solve 中间数据到 **stderr**（与 `--search` 正交，
     /// blueprint 路径也打）。`false`（默认）= 静默、零开销；on 也不动 stdout（IPC byte-equal）。
     debug_log: bool,
@@ -6791,6 +7006,12 @@ fn run() -> Result<(), String> {
     stdout.flush().map_err(|e| e.to_string())?;
 
     let strategy_fn = |info: &InfoSetId, _n: usize| -> Vec<f64> { blueprint.strategy(info) };
+    let row_weight_fn = |info: &InfoSetId| blueprint.row_weight(info);
+    let visit_gate = PreflopVisitGate {
+        min_visits: args.preflop_commit_min_visits,
+        commit_share: args.preflop_commit_share,
+        row_weight: &row_weight_fn,
+    };
 
     // within-round solve 缓存（进程常驻，跨请求）：同手同街第二次决策命中 → 复用 solve 只重
     // 导航——恢复「每轮恰好一个 solve」一致性（time_budget anytime 下重解会读不同均衡）+
@@ -6871,6 +7092,7 @@ fn run() -> Result<(), String> {
                     search_rt.as_ref(),
                     &mut solve_cache,
                     fourbet_rt.as_ref(),
+                    Some(visit_gate),
                 ),
                 // 解析失败也不崩：出 fold（最保守；没有 valid 信息可用）。
                 Err(e) => Response {
@@ -6978,6 +7200,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_4bet_fold_decay: Option<f64> = None;
     let mut exploit_4bet_3bet_decay: Option<f64> = None;
     let mut exploit_4bet_state: Option<PathBuf> = None;
+    let mut preflop_commit_min_visits = DEFAULT_PREFLOP_COMMIT_MIN_VISITS;
+    let mut preflop_commit_share = DEFAULT_PREFLOP_COMMIT_SHARE;
     let mut debug_log = false;
     let mut range_log: Option<PathBuf> = None;
     while let Some(arg) = it.next() {
@@ -7180,6 +7404,21 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                         ))
                     }
                 });
+            }
+            "--preflop-commit-min-visits" => {
+                preflop_commit_min_visits = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad preflop-commit-min-visits: {e}"))?;
+            }
+            "--preflop-commit-share" => {
+                preflop_commit_share = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad preflop-commit-share: {e}"))?;
+                if !(preflop_commit_share > 0.0 && preflop_commit_share <= 1.0) {
+                    return Err(format!(
+                        "preflop-commit-share must be in (0, 1], got {preflop_commit_share}"
+                    ));
+                }
             }
             "--search-min-hero-visits" => {
                 search_min_hero_visits = Some(
@@ -7483,6 +7722,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         exploit,
         exploit_4bet,
         exploit_4bet_state,
+        preflop_commit_min_visits,
+        preflop_commit_share,
         // 默认开（§5.1 实测拍板）；--search-unanchored-prefix-reach off 显式关。
         search_unanchored_prefix_reach: search_unanchored_prefix_reach
             .unwrap_or(DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH),
@@ -12078,6 +12319,410 @@ mod tests {
         stacks[3] = 6000;
         let resp = run(&req(stacks));
         assert!(!resp.source.contains("deep_no_allin"), "{resp:?}");
+    }
+
+    /// [`low_visits_no_commit`]: the other actions scale up in proportion; a pure all-in goes to `Call`;
+    /// when the all-in slot holds the call it goes to the real call; an unopened node with no limp in the
+    /// tree has nowhere to send a pure all-in; no all-in → `None`.
+    #[test]
+    fn low_visits_no_commit_cases() {
+        let cfg = TableConfig::default_6max_100bb();
+        let bb = cfg.big_blind;
+        let mut rng = ChaCha20Rng::from_seed(0x0dee_9a12);
+        let unopened = GameState::with_rng(&cfg, 0x0dee_9a12, &mut rng);
+        let fold = AbstractAction::Fold;
+        let call = AbstractAction::Call {
+            to: ChipAmount::new(100),
+        };
+        let raise = AbstractAction::Raise {
+            to: ChipAmount::new(900),
+            ratio_label: BetRatio::FULL_POT,
+        };
+        let allin = AbstractAction::AllIn {
+            to: ChipAmount::new(10_000),
+        };
+        let menu = [fold, call, raise, allin];
+        let none: &dyn Fn(AbstractAction) -> bool = &|_| false;
+        let close = |got: &[(AbstractAction, f64)], want: &[(AbstractAction, f64)]| {
+            got.len() == want.len()
+                && got
+                    .iter()
+                    .zip(want)
+                    .all(|((a, p), (b, q))| a == b && (p - q).abs() < 1e-12)
+        };
+        // 001450's row: 44.52% all-in goes to the others in proportion.
+        let g = low_visits_no_commit(
+            &[
+                (fold, 0.4979),
+                (call, 0.0077),
+                (raise, 0.0492),
+                (allin, 0.4452),
+            ],
+            &unopened,
+            &menu,
+            bb,
+            none,
+            false,
+        )
+        .expect("all-in → drop");
+        let rest = 0.4979 + 0.0077 + 0.0492;
+        assert!(
+            close(
+                &g,
+                &[
+                    (fold, 0.4979 / rest),
+                    (call, 0.0077 / rest),
+                    (raise, 0.0492 / rest)
+                ]
+            ),
+            "{g:?}"
+        );
+        // Pure all-in: Call from the menu, even with zero probability in the dist.
+        let g = low_visits_no_commit(&[(allin, 1.0)], &unopened, &menu, bb, none, false)
+            .expect("pure all-in");
+        assert!(close(&g, &[(call, 1.0)]), "{g:?}");
+        // Nothing to drop.
+        assert_eq!(
+            low_visits_no_commit(
+                &[(fold, 0.5), (raise, 0.5)],
+                &unopened,
+                &menu,
+                bb,
+                none,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            low_visits_no_commit(
+                &[(fold, 1.0), (allin, 0.0)],
+                &unopened,
+                &menu,
+                bb,
+                none,
+                false
+            ),
+            None
+        );
+        // Unopened, no limp in the tree: a pure all-in stays, it must not become a limp.
+        assert_eq!(
+            low_visits_no_commit(
+                &[(allin, 1.0)],
+                &unopened,
+                &[fold, raise, allin],
+                bb,
+                none,
+                false
+            ),
+            None
+        );
+        // Facing a raise and the menu has no Call: the slot holds the call.
+        let mut jam = unopened.clone();
+        jam.apply(Action::AllIn).expect("UTG all-in");
+        while jam.current_player() != Some(SeatId(0)) {
+            jam.apply(Action::Fold).expect("fold");
+        }
+        let call_to = jam.legal_actions().call.expect("can call");
+        let g = low_visits_no_commit(
+            &[(fold, 0.3), (allin, 0.7)],
+            &jam,
+            &[fold, allin],
+            bb,
+            none,
+            false,
+        )
+        .expect("all-in → move");
+        assert!(
+            close(
+                &g,
+                &[(fold, 0.3), (AbstractAction::Call { to: call_to }, 0.7)]
+            ),
+            "{g:?}"
+        );
+        // A committing raise goes the same way as the all-in; a raise that does not commit keeps its share.
+        let big = AbstractAction::Raise {
+            to: ChipAmount::new(5000),
+            ratio_label: BetRatio::FULL_POT,
+        };
+        let big_commits = move |a: AbstractAction| a == big;
+        let dist = [(fold, 0.4), (raise, 0.1), (big, 0.2), (allin, 0.3)];
+        let g = low_visits_no_commit(&dist, &unopened, &menu, bb, &big_commits, false)
+            .expect("commit → drop");
+        assert!(close(&g, &[(fold, 0.8), (raise, 0.2)]), "{g:?}");
+        // Only a committing raise in the dist, no all-in: still taken out.
+        let g = low_visits_no_commit(
+            &[(fold, 0.5), (big, 0.5)],
+            &unopened,
+            &menu,
+            bb,
+            &big_commits,
+            false,
+        )
+        .expect("commit → drop");
+        assert!(close(&g, &[(fold, 1.0)]), "{g:?}");
+        // QQ+/AK facing a raise: the mass goes to Call, the fold share stays.
+        let mut raised = unopened.clone();
+        raised
+            .apply(Action::Raise {
+                to: ChipAmount::new(400),
+            })
+            .expect("UTG open");
+        let dist = [(fold, 0.2), (call, 0.1), (big, 0.3), (allin, 0.4)];
+        let g =
+            low_visits_no_commit(&dist, &raised, &menu, bb, &big_commits, true).expect("to call");
+        assert!(close(&g, &[(fold, 0.2), (call, 0.8)]), "{g:?}");
+        // Call not in the dist but in the menu: added.
+        let g = low_visits_no_commit(&[(fold, 0.2), (allin, 0.8)], &raised, &menu, bb, none, true)
+            .expect("to call");
+        assert!(close(&g, &[(fold, 0.2), (call, 0.8)]), "{g:?}");
+        // Same dist without the hand condition: in proportion.
+        let g = low_visits_no_commit(&dist, &raised, &menu, bb, &big_commits, false).expect("drop");
+        assert!(close(&g, &[(fold, 2.0 / 3.0), (call, 1.0 / 3.0)]), "{g:?}");
+        // QQ+/AK with nobody raising: must not turn into a limp.
+        let g = low_visits_no_commit(
+            &[(fold, 0.5), (raise, 0.1), (allin, 0.4)],
+            &unopened,
+            &menu,
+            bb,
+            none,
+            true,
+        )
+        .expect("drop");
+        assert!(close(&g, &[(fold, 5.0 / 6.0), (raise, 1.0 / 6.0)]), "{g:?}");
+    }
+
+    /// [`low_visits_call_hand`]: exactly AA, KK, QQ, AKs, AKo, in either card order.
+    #[test]
+    fn low_visits_call_hand_cases() {
+        let hole = |a: &str, b: &str| [parse_card(a).unwrap(), parse_card(b).unwrap()];
+        for (a, b) in [
+            ("Ah", "Ad"),
+            ("Kh", "Kd"),
+            ("Qh", "Qd"),
+            ("Ah", "Kh"),
+            ("Kd", "Ah"),
+        ] {
+            assert!(low_visits_call_hand(hole(a, b)), "{a}{b}");
+        }
+        for (a, b) in [
+            ("Jh", "Jd"),
+            ("Ah", "Qh"),
+            ("Kh", "Qh"),
+            ("7h", "2d"),
+            ("Ah", "2h"),
+        ] {
+            assert!(!low_visits_call_hand(hole(a, b)), "{a}{b}");
+        }
+    }
+
+    /// [`raise_commits_stack`]: new chips against `behind`; the end point counts; chips already in this
+    /// round do not; all-in, call and fold are not judged here.
+    #[test]
+    fn raise_commits_stack_cases() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let cfg = TableConfig::default_6max_100bb();
+        let mut rng = ChaCha20Rng::from_seed(0x0dee_9a12);
+        let mut state = GameState::with_rng(&cfg, 0x0dee_9a12, &mut rng);
+        state
+            .apply(Action::Raise {
+                to: ChipAmount::new(1000),
+            })
+            .expect("open");
+        let seat = state.current_player().expect("to act").0 as usize;
+        let in_round = state.players()[seat].committed_this_round.as_u64();
+        let menu = poker::ActionAbstraction::abstract_actions(&abs, &state);
+        let raise = menu
+            .iter()
+            .copied()
+            .find(|a| matches!(a, AbstractAction::Raise { .. }))
+            .expect("a raise in the menu");
+        let Ok(Action::Raise { to }) = outgoing_action(&state, &abs, raise) else {
+            panic!("raise maps to a raise");
+        };
+        let add = to.as_u64() - in_round;
+        assert!(raise_commits_stack(&state, &abs, raise, add * 2, 0.5));
+        assert!(!raise_commits_stack(&state, &abs, raise, add * 2 + 2, 0.5));
+        assert!(raise_commits_stack(&state, &abs, raise, add, 1.0));
+        for a in menu
+            .iter()
+            .copied()
+            .filter(|a| !matches!(a, AbstractAction::Raise { .. } | AbstractAction::Bet { .. }))
+        {
+            assert!(!raise_commits_stack(&state, &abs, a, 1, 0.5), "{a:?}");
+        }
+    }
+
+    /// Through `decide_with` on the production tree shape (uniform strategy; 100BB, since the 200BB tree
+    /// takes minutes in a debug build) with the action line of live hand 001450, at the row weights around
+    /// the threshold: below it no all-in and `:low_visits_no_commit`; at it, or with the gate off or absent,
+    /// the blueprint path is untouched. Hero who can only call is exempt: a real shove, or a raise covering
+    /// him. The weight is logged either way.
+    #[test]
+    fn preflop_low_visits_drops_allin() {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::default_500_500_500(),
+        ));
+        let game = build_game(
+            table,
+            "ante-flop2-3bet-open2",
+            4,
+            8,
+            100,
+            DEFAULT_SOLVER_STACK_BB,
+        )
+        .expect("8-max open2 cap4");
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let run = |r: &Request, weight: f64, min_visits: u64| {
+            let row_weight = move |_i: &InfoSetId| Some(weight);
+            decide_with(
+                &game,
+                &abs,
+                &uniform,
+                r,
+                0xA111,
+                None,
+                &mut SubgameSolveCache::new(),
+                None,
+                Some(PreflopVisitGate {
+                    min_visits,
+                    commit_share: DEFAULT_PREFLOP_COMMIT_SHARE,
+                    row_weight: &row_weight,
+                }),
+            )
+        };
+        let req = |hole: [String; 2], squeeze: HistAction| Request {
+            hole: hole.to_vec(),
+            board: vec![],
+            button_seat: 5,
+            my_seat: 0,
+            num_seats: 8,
+            small_blind: 20,
+            big_blind: 50,
+            ante: 50,
+            actions: vec![
+                hist(0, "raise", Some(225)),
+                hist(1, "call", None),
+                hist(2, "call", None),
+                hist(3, "fold", None),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+                squeeze,
+                hist(7, "fold", None),
+            ],
+            valid: ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: true,
+                min_raise: Some(1775),
+                max_raise: Some(5350),
+            },
+            stacks: vec![5400, 6000, 6000, 6000, 6000, 6000, 6000, 6000],
+            dealt_seats: (0..8).collect(),
+            names: Default::default(),
+        };
+        let squeeze = || hist(6, "raise", Some(1000));
+        let holes: Vec<[String; 2]> = "AKQJT98765432"
+            .chars()
+            .map(|r| [format!("{r}h"), format!("{r}d")])
+            .collect();
+        let mut jammed_when_open = 0;
+        for hole in &holes {
+            let r = req(hole.clone(), squeeze());
+            for weight in [1435.0, 49_999.0] {
+                let g = run(&r, weight, 50_000);
+                assert!(
+                    g.source.contains(":low_visits_no_commit"),
+                    "{hole:?}: {g:?}"
+                );
+                assert_ne!(g.chosen.as_deref(), Some("allin"), "{hole:?}: {g:?}");
+                assert_ne!(g.amount, Some(5350), "{hole:?}: {g:?}");
+                assert_eq!(g.bp_row_weight, Some(weight));
+                let probs = g.probs.as_ref().expect("probs keep the blueprint dist");
+                assert!(probs.iter().any(|(l, _)| l == "allin"), "{g:?}");
+            }
+            // At the threshold, or with the gate off: same response as without a gate, plus the weight.
+            let plain = decide(
+                &game,
+                &abs,
+                &uniform,
+                &r,
+                0xA111,
+                None,
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(plain.bp_row_weight, None);
+            for (weight, min_visits) in [(50_000.0, 50_000), (1435.0, 0)] {
+                let mut g = run(&r, weight, min_visits);
+                assert_eq!(g.bp_row_weight.take(), Some(weight));
+                assert_eq!(g, plain, "{hole:?}");
+            }
+            jammed_when_open += usize::from(plain.chosen.as_deref() == Some("allin"));
+        }
+        assert!(jammed_when_open > 0, "the uniform dist also samples all-in");
+        // Real shove: exempt, the blueprint path stands.
+        let shove = || hist(6, "all_in", Some(5950));
+        for hole in &holes {
+            let g = run(&req(hole.clone(), shove()), 1435.0, 50_000);
+            assert!(g.source.starts_with("blueprint"), "{g:?}");
+            assert!(!g.source.contains("low_visits_no_commit"), "{g:?}");
+            assert_eq!(g.bp_row_weight, Some(1435.0));
+        }
+        // A committing raise is never sent. Weight below the gate; `behind` is the effective stack, so a
+        // deep hero against short opponents is held to the opponents' depth.
+        let raise_add = |g: &Response, in_pot: u64| g.amount.map(|to| to.saturating_sub(in_pot));
+        let behind_of = |stacks: &[u64]| {
+            let deepest = stacks[1..].iter().copied().max().unwrap();
+            stacks[0].min(deepest) - 50 - 225
+        };
+        for stacks in [
+            vec![5400, 6000, 6000, 6000, 6000, 6000, 6000, 6000],
+            vec![54_000, 6000, 6000, 6000, 6000, 6000, 6000, 6000],
+        ] {
+            let behind = behind_of(&stacks);
+            for hole in &holes {
+                let mut r = req(hole.clone(), squeeze());
+                r.stacks = stacks.clone();
+                r.valid.max_raise = Some(stacks[0] - 50);
+                let g = run(&r, 1435.0, 50_000);
+                assert!(g.source.contains(":low_visits_no_commit"), "{g:?}");
+                if let Some(add) = raise_add(&g, 225) {
+                    assert!((add as f64) < 0.5 * behind as f64, "{stacks:?}: {g:?}");
+                }
+            }
+        }
+        // A raise covering hero, not an all-in: the table only offers call.
+        let mut r = req(holes[0].clone(), hist(6, "raise", Some(5600)));
+        r.valid.can_raise = false;
+        r.valid.min_raise = None;
+        r.valid.max_raise = None;
+        let g = run(&r, 1435.0, 50_000);
+        assert!(!g.source.contains("low_visits_no_commit"), "{g:?}");
+    }
+
+    #[test]
+    fn parse_args_preflop_commit_min_visits() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        assert_eq!(parse(&[]).unwrap().preflop_commit_min_visits, 50_000);
+        let a = parse(&["--preflop-commit-min-visits", "0"]).unwrap();
+        assert_eq!(a.preflop_commit_min_visits, 0);
+        let a = parse(&["--preflop-commit-min-visits", "20000"]).unwrap();
+        assert_eq!(a.preflop_commit_min_visits, 20_000);
+        assert!(parse(&["--preflop-commit-min-visits", "-1"]).is_err());
+        assert!(parse(&["--preflop-commit-min-visits", "x"]).is_err());
+        assert_eq!(parse(&[]).unwrap().preflop_commit_share, 0.5);
+        let a = parse(&["--preflop-commit-share", "0.7"]).unwrap();
+        assert_eq!(a.preflop_commit_share, 0.7);
+        for bad in ["0", "-0.1", "1.5", "NaN", "x"] {
+            assert!(parse(&["--preflop-commit-share", bad]).is_err(), "{bad}");
+        }
     }
 
     /// 抽样前过滤：只有 `AllIn` < 5% 才去掉、剩下的归一（和为 1，`sample_discrete` 要求 1e-12 内）；
@@ -17711,6 +18356,7 @@ mod tests {
             None,
             &mut SubgameSolveCache::new(),
             tracker,
+            None,
         )
     }
 
