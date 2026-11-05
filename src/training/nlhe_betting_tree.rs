@@ -329,6 +329,30 @@ pub fn ante_flop2_3bet_open2_6max(
     (abs, rules)
 }
 
+/// [`ante_flop2_3bet_6max`] 把唯一的开池档从 1/3pot 换成 **3/4pot**：preflop 菜单 `{0.5, 0.75, 1}`。
+/// 开池只有 0.75pot（1pot 由 `preflop_open_small_only` 删、0.5pot 由 `preflop_half_3bet` 删、开池全下
+/// 由 `drop_preflop_open_allin` 删）；3bet = {0.5pot, 1pot}（0.75pot 由 `drop_small_reraise` 删）；4bet+
+/// 只有 1pot（均另有 all-in）；postflop 同 `ante-flop2`。8 座每人 1BB ante：UTG–BTN 开池 8.88BB，SB 开池
+/// （及 SB limp 后 BB 加注）8.5BB。8 座 200BB cap4 约 309 万节点（`ante-flop2-3bet` 507 万、`open2` 706 万）。
+///
+/// 动机：wopo ante 桌（2026-10-31 至 11-04，对手 390 次无 limp 开池）中位 9BB、0.62–0.85pot 和
+/// 0.85–1.15pot 各占约 40%、1/3pot 约 5%。1/3pot 单档把这些开池都投到 4.5BB；`open2` 的双档把开池范围
+/// 分到两条线上，少见的多人 3bet 节点样本太少（1pot 开池线 88 的累计访问权重只有约 200）。
+///
+/// 同 [`first_small_preopen_1pot_6max`] 的理由另立一档、不改既有 reshape。
+pub fn ante_flop2_3bet_o75_6max(
+    width_redirect: u8,
+) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let (_, rules) = ante_flop2_3bet_6max(width_redirect);
+    debug_assert!(rules.preflop_open_small_only && rules.preflop_half_3bet);
+    let pre =
+        ActionAbstractionConfig::new(vec![0.5, 0.75, 1.0]).expect("preflop {0.5,0.75,1.0} 合法");
+    let one = || ActionAbstractionConfig::new(vec![1.0]).expect("{1.0} 单档合法");
+    let flop = ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("flop {0.5,1.0} 合法");
+    let abs = StreetActionAbstraction::per_street([pre, flop, one(), one()]);
+    (abs, rules)
+}
+
 /// `--profile six-max` 的 `--reshape <name>` → `(abstraction, rules)`。`train_cfr` 与
 /// `nlhe_dense_crop` 共用，保证裁切 / 加载时重建的树与训练时**同一**定义（dense ckpt 的
 /// layout 指纹仍会兜底校验）。未知名返回 `None`。
@@ -351,6 +375,7 @@ pub fn six_max_reshape(
         "ante-flop2" => ante_flop2_6max(width_redirect),
         "ante-flop2-3bet" => ante_flop2_3bet_6max(width_redirect),
         "ante-flop2-3bet-open2" => ante_flop2_3bet_open2_6max(width_redirect),
+        "ante-flop2-3bet-o75" => ante_flop2_3bet_o75_6max(width_redirect),
         _ => return None,
     })
 }
@@ -358,7 +383,7 @@ pub fn six_max_reshape(
 /// `six_max_reshape` 接受的名字（错误提示用）。
 pub const SIX_MAX_RESHAPE_NAMES: &str =
     "none | nolimp | preopen | preopen-small | preopen-1pot | all-1pot | flop2-1pot | ante-flop2 \
-     | ante-flop2-3bet | ante-flop2-3bet-open2";
+     | ante-flop2-3bet | ante-flop2-3bet-open2 | ante-flop2-3bet-o75";
 
 /// S6 实时搜索深码档（`realtime_search_openpoker_exec` §2.1 / 缺口③）：**全街单一 {1pot}**
 /// 下注菜单——每决策点只剩 `{fold, check/call, bet/raise 1pot, all-in}`。fold/check/call/all-in
@@ -1673,6 +1698,150 @@ mod tests {
             t.num_nodes(),
             "six_max_reshape 分派须指向 ante_flop2_3bet_6max"
         );
+    }
+
+    /// 结构守门：`ante-flop2-3bet-o75`（[`ante_flop2_3bet_o75_6max`]，8 座 100BB 每人 1BB ante；cap 2
+    /// 只为树小，翻前菜单与 cap 无关）。① preflop 档位 ⊆ {0.5,0.75,1}，有 0.75pot 的节点（开池）只有它
+    /// 一个加注档、无全下，0.5pot 只出现在面对加注的节点；② fold-chain 每座开池 = Fold / 0.75pot，SB =
+    /// Fold / Call / 0.75pot，SB limp 后 BB = Check / 0.75pot；③ UTG 开池弃到 BB：BB = {Fold, Call, 0.5pot,
+    /// 1pot, AllIn}，BB 0.5pot 3bet 后 UTG = {Fold, Call, 1pot, AllIn}；④ postflop 菜单同 `ante-flop2`；
+    /// ⑤ 树严格小于 `ante-flop2-3bet`；⑥ 分派与错误提示名单都有它。
+    #[test]
+    fn reshape_ante_flop2_3bet_o75_single_three_quarter_open() {
+        let o75 = AbstractActionTag::Raise(BetRatio::from_f64(0.75).expect("0.75 合法"));
+        let half = AbstractActionTag::Raise(BetRatio::HALF_POT);
+        let full = AbstractActionTag::Raise(BetRatio::FULL_POT);
+        let cfg = TableConfig::n_max_at_bb(8, 100).with_ante(ChipAmount::new(100));
+        let (abs, rules) = ante_flop2_3bet_o75_6max(2);
+        let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+
+        let (mut open_nodes, mut half_nodes) = (0usize, 0usize);
+        for id in 0..t.num_nodes() as NodeId {
+            let node = t.node(id);
+            let la = &node.legal_actions;
+            match node.street {
+                StreetTag::Preflop => {
+                    assert!(
+                        la.iter().all(|a| !matches!(a, AbstractActionTag::Bet(_))
+                            && (!matches!(a, AbstractActionTag::Raise(_))
+                                || *a == o75
+                                || *a == half
+                                || *a == full)),
+                        "o75：preflop node {id} 档位越出 {{0.5,0.75,1}} {la:?}"
+                    );
+                    if la.contains(&o75) {
+                        open_nodes += 1;
+                        assert!(
+                            !la.contains(&half)
+                                && !la.contains(&full)
+                                && !la.contains(&AbstractActionTag::AllIn),
+                            "o75：开池节点 {id} 只应有 0.75pot 一个加注档 {la:?}"
+                        );
+                    }
+                    if la.contains(&half) {
+                        half_nodes += 1;
+                        assert!(
+                            la.contains(&AbstractActionTag::Fold),
+                            "o75：0.5pot 只应出现在面对开池的节点 {id} {la:?}"
+                        );
+                    }
+                }
+                StreetTag::Flop => assert!(
+                    la.iter().all(|a| match a {
+                        AbstractActionTag::Raise(x) => *x == BetRatio::FULL_POT,
+                        AbstractActionTag::Bet(x) =>
+                            *x == BetRatio::HALF_POT || *x == BetRatio::FULL_POT,
+                        _ => true,
+                    }),
+                    "o75：flop node {id} 档位错 {la:?}"
+                ),
+                StreetTag::Turn | StreetTag::River => assert!(
+                    la.iter().all(|a| !matches!(a, AbstractActionTag::Bet(x) | AbstractActionTag::Raise(x) if *x != BetRatio::FULL_POT)),
+                    "o75：{:?} node {id} 出现非 1pot 档 {la:?}",
+                    node.street
+                ),
+            }
+        }
+        assert!(
+            open_nodes > 0 && half_nodes > 0,
+            "o75：开池和 0.5pot 3bet 都应出现"
+        );
+
+        let step = |id: NodeId, tag: AbstractActionTag| -> NodeId {
+            let n = t.node(id);
+            let i = n
+                .legal_actions
+                .iter()
+                .position(|a| *a == tag)
+                .unwrap_or_else(|| panic!("node {id} 无 {tag:?}：{:?}", n.legal_actions));
+            match n.children[i] {
+                Child::Decision(next) => next,
+                Child::Terminal => panic!("node {id} {tag:?} 后终局"),
+            }
+        };
+        let mut id = t.root_id();
+        for seat in [3u8, 4, 5, 6, 7, 0] {
+            assert_eq!(t.node(id).player_acting, seat);
+            assert_eq!(
+                t.node(id).legal_actions.to_vec(),
+                vec![AbstractActionTag::Fold, o75],
+                "o75：seat {seat} 开池只应有 Fold / 0.75pot"
+            );
+            id = step(id, AbstractActionTag::Fold);
+        }
+        assert_eq!(t.node(id).player_acting, 1, "fold 到 SB");
+        assert_eq!(
+            t.node(id).legal_actions.to_vec(),
+            vec![AbstractActionTag::Fold, AbstractActionTag::Call, o75],
+            "o75：SB 应可 complete / 0.75pot"
+        );
+        let bb_vs_limp = t.node(step(id, AbstractActionTag::Call));
+        assert_eq!(bb_vs_limp.player_acting, 2);
+        assert_eq!(
+            bb_vs_limp.legal_actions.to_vec(),
+            vec![AbstractActionTag::Check, o75],
+            "o75：SB limp 后 BB 应可过牌 / 0.75pot"
+        );
+
+        let mut id = step(t.root_id(), o75);
+        for _ in 0..6 {
+            id = step(id, AbstractActionTag::Fold);
+        }
+        assert_eq!(t.node(id).player_acting, 2, "UTG 开池后弃到 BB");
+        assert_eq!(
+            t.node(id).legal_actions.to_vec(),
+            vec![
+                AbstractActionTag::Fold,
+                AbstractActionTag::Call,
+                half,
+                full,
+                AbstractActionTag::AllIn
+            ],
+            "o75：BB 面对开池应有 0.5pot / 1pot 两档 3bet"
+        );
+        let utg = t.node(step(id, half));
+        assert_eq!(utg.player_acting, 3);
+        assert_eq!(
+            utg.legal_actions.to_vec(),
+            vec![
+                AbstractActionTag::Fold,
+                AbstractActionTag::Call,
+                full,
+                AbstractActionTag::AllIn
+            ],
+            "o75：面对 3bet 的 4bet 只应有 1pot"
+        );
+
+        let (b_abs, b_rules) = ante_flop2_3bet_6max(2);
+        let b_nodes = PublicBettingTree::build_with_rules(&cfg, &b_abs, b_rules).num_nodes();
+        assert!(t.num_nodes() < b_nodes, "应小于 ante-flop2-3bet {b_nodes}");
+        let (d_abs, d_rules) = six_max_reshape("ante-flop2-3bet-o75", 2).expect("已注册");
+        assert_eq!(
+            PublicBettingTree::build_with_rules(&cfg, &d_abs, d_rules).num_nodes(),
+            t.num_nodes(),
+            "six_max_reshape 分派须指向 ante_flop2_3bet_o75_6max"
+        );
+        assert!(SIX_MAX_RESHAPE_NAMES.contains("ante-flop2-3bet-o75"));
     }
 
     /// 结构守门：`ante-flop2-3bet-open2`（[`ante_flop2_3bet_open2_6max`]，8 座 100BB 每人 1BB
