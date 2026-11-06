@@ -8,6 +8,12 @@ import os
 import subprocess
 
 
+# 不等响应的请求（prewarm / observe）最多积压这么多条就先读掉响应。响应只在 decide 前读，而画像暖启动
+# 连发几千条 observe、中间没有 decide：响应写满 stdout 管道后 advisor 停止读 stdin，stdin 管道也满后
+# driver 的写入永远阻塞，两边死锁（2026-11-06，暖启动 2000 手）。按每条响应 1 KB 算也远小于 64 KB 管道。
+MAX_UNREAD_RESPONSES = 64
+
+
 class Advisor:
     def __init__(self, binary, checkpoint, bucket_table, reshape, postflop_cap, seed,
                  extra_args=None, cropped=False, n_seats=6, ante=0, stack_bb=100):
@@ -55,6 +61,7 @@ class Advisor:
         self.proc.stdin.write(json.dumps(payload) + "\n")
         self.proc.stdin.flush()
         self._pending_prewarms += 1
+        self._drain_if_backlogged()
 
     def observe(self, rec):
         """叠加剥削（--exploit）：每手结束把完整手历史发给 advisor 喂进进程内 Profiler
@@ -66,6 +73,11 @@ class Advisor:
         self.proc.stdin.write(json.dumps(payload) + "\n")
         self.proc.stdin.flush()
         self._pending_prewarms += 1  # observe 与 prewarm 共用「待 drain 的非决策响应」计数。
+        self._drain_if_backlogged()
+
+    def _drain_if_backlogged(self):
+        if self._pending_prewarms >= MAX_UNREAD_RESPONSES:
+            self._drain_pending()
 
     def _drain_pending(self):
         while self._pending_prewarms > 0:
