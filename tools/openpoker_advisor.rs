@@ -3539,18 +3539,25 @@ fn decide_with(
     };
     let adjusted: &[(AbstractAction, f64)] = low_visits_no_commit.as_deref().unwrap_or(adjusted);
     // 翻前深码：hero 实际押上的码深超过 blueprint 码深 140% → 不按 blueprint 全下
-    // （[`deep_preflop_no_allin`]）。分布里没有全下时不重放真栈（不多花时间，旧路径 byte-equal）。
+    // （[`deep_preflop_no_allin`]）。分布里没有全下（含发出去是全下的加注档）时不重放真栈（不多花时间，
+    // 旧路径 byte-equal）。
+    let goes_allin = |a: AbstractAction| raise_goes_allin(outgoing_state, outgoing_abs, a);
     let deep_no_allin = if board.is_empty()
         && adjusted
             .iter()
-            .any(|&(a, p)| p > 0.0 && matches!(a, AbstractAction::AllIn { .. }))
+            .any(|&(a, p)| p > 0.0 && (matches!(a, AbstractAction::AllIn { .. }) || goes_allin(a)))
     {
         preflop_hero_eff_stack(req, &solver_cfg, scale, &smap, my_seat_solver, hole)
             .filter(|&eff| {
                 eff * 100 > solver_cfg.starting_stacks[0].as_u64() * PREFLOP_BLUEPRINT_MAX_EFF_PCT
             })
             .and_then(|eff| {
-                let d = deep_preflop_no_allin(adjusted, outgoing_state);
+                let d = deep_preflop_no_allin(
+                    adjusted,
+                    outgoing_state,
+                    solver_cfg.big_blind,
+                    &goes_allin,
+                );
                 dlog!(
                     "deep preflop eff={}bb: {adjusted:?} → {d:?}",
                     eff / solver_cfg.big_blind.as_u64()
@@ -4910,8 +4917,17 @@ fn low_visits_stack_behind(
         .map_or(stack, |eff| eff.saturating_sub(put_in))
 }
 
-/// A bet or raise whose new chips (same amount as sent, [`outgoing_action`]) reach `share` of `behind`.
-/// `AllIn` is not judged here: the caller always takes it out.
+/// A bet or raise label that [`outgoing_action`] sends as an all-in on `state`: the shadow still has the
+/// size, but under this pot it does not fit the stack. [`action_to_response`] then raises to
+/// `valid.max_raise`, hero's whole real stack, however deep that is, so the gates count it as an all-in.
+fn raise_goes_allin(state: &GameState, abs: &StreetActionAbstraction, a: AbstractAction) -> bool {
+    matches!(a, AbstractAction::Bet { .. } | AbstractAction::Raise { .. })
+        && matches!(outgoing_action(state, abs, a), Ok(Action::AllIn))
+}
+
+/// A bet or raise whose new chips (same amount as sent, [`outgoing_action`]) reach `share` of `behind`,
+/// or that goes out as an all-in ([`raise_goes_allin`]). The `AllIn` label is not judged here: the caller
+/// always takes it out.
 fn raise_commits_stack(
     state: &GameState,
     abs: &StreetActionAbstraction,
@@ -4919,6 +4935,9 @@ fn raise_commits_stack(
     behind: u64,
     share: f64,
 ) -> bool {
+    if raise_goes_allin(state, abs, a) {
+        return true;
+    }
     let Some(seat) = state.current_player() else {
         return false;
     };
@@ -5017,15 +5036,22 @@ fn low_visits_no_commit(
 ///    只看「没有 `Call` 档」不够：没人入池时规则上能平跟，但树里删了平跟（`no_open_limp`），
 ///    那时的 AllIn 是真全下，不能变成平跟；
 /// 2. 否则给分布里最大的非全下加注 / 下注档（全下的本意是加大注）；
-/// 3. 没有加注档 → 给 `Call`（在分布里时）。
+/// 3. 没有加注档 → 给 `Call`（在分布里时）；
+/// 4. 分布里没有 `Call` 档但 hero 面对加注（比大盲大）→ 给真实跟注（宽度重定向删了跟注档，或树里只剩
+///    弃牌 / 全下）。
 ///
-/// 分布里没有概率 > 0 的 `AllIn`，或三条都给不出去 → `None`（调用方照原分布抽样）。
-/// `state` = outgoing 基准态（blueprint 路径 = blueprint 码深的影子局面）。
+/// `goes_allin`（[`raise_goes_allin`]）：标着加注、发出去却是全下的档，和 `AllIn` 一样挪走，也不接收
+/// 挪来的概率，否则 hero 还是把全部真实筹码推进去。
+///
+/// 分布里没有要挪的概率，或四条都给不出去（只剩没人入池、树里又没有平跟档的情形）→ `None`（调用方照
+/// 原分布抽样）。`state` = outgoing 基准态（blueprint 路径 = blueprint 码深的影子局面）。
 fn deep_preflop_no_allin(
     dist: &[(AbstractAction, f64)],
     state: &GameState,
+    big_blind: ChipAmount,
+    goes_allin: &dyn Fn(AbstractAction) -> bool,
 ) -> Option<Vec<(AbstractAction, f64)>> {
-    let is_allin = |a: &AbstractAction| matches!(a, AbstractAction::AllIn { .. });
+    let is_allin = |a: &AbstractAction| matches!(a, AbstractAction::AllIn { .. }) || goes_allin(*a);
     let moved: f64 = dist
         .iter()
         .filter(|(a, _)| is_allin(a))
@@ -5065,8 +5091,12 @@ fn deep_preflop_no_allin(
     let target = biggest_raise.or_else(|| {
         out.iter()
             .position(|(a, _)| matches!(a, AbstractAction::Call { .. }))
-    })?;
-    out[target].1 += moved;
+    });
+    match (target, state.legal_actions().call) {
+        (Some(i), _) => out[i].1 += moved,
+        (None, Some(to)) if to > big_blind => out.push((AbstractAction::Call { to }, moved)),
+        _ => return None,
+    }
     Some(out)
 }
 
@@ -12196,10 +12226,13 @@ mod tests {
 
     /// 翻前深码 hero 自己全下（[`deep_preflop_no_allin`]）：全下概率挪给最大的加注档；树里跟注就会全下
     /// （跟注折进 AllIn 槽）时给真实跟注；没人入池时规则上能平跟但树里没有平跟档，不能挪成平跟；
-    /// 没有加注档时给 `Call`；分布里没有全下 → `None`。
+    /// 没有加注档时给 `Call`，分布里也没有 `Call` 档时面对加注给真实跟注；发出去是全下的加注档同样挪走、
+    /// 不接收概率；分布里没有要挪的概率 → `None`。
     #[test]
     fn deep_preflop_no_allin_moves_allin_mass() {
         let cfg = TableConfig::default_6max_100bb();
+        let bb = cfg.big_blind;
+        let none: &dyn Fn(AbstractAction) -> bool = &|_| false;
         let mut rng = ChaCha20Rng::from_seed(0x0dee_9a11);
         let unopened = GameState::with_rng(&cfg, 0x0dee_9a11, &mut rng);
         assert!(unopened.legal_actions().call.is_some(), "规则上能平跟");
@@ -12226,6 +12259,8 @@ mod tests {
         let g = deep_preflop_no_allin(
             &[(fold, 0.2), (small, 0.3), (big, 0.1), (allin, 0.4)],
             &unopened,
+            bb,
+            none,
         )
         .expect("有全下 → 挪");
         assert!(close(&g, &[(fold, 0.2), (small, 0.3), (big, 0.5)]), "{g:?}");
@@ -12233,16 +12268,26 @@ mod tests {
         let call = AbstractAction::Call {
             to: ChipAmount::new(100),
         };
-        let g = deep_preflop_no_allin(&[(fold, 0.5), (call, 0.1), (allin, 0.4)], &unopened)
-            .expect("有全下 → 挪");
+        let g = deep_preflop_no_allin(
+            &[(fold, 0.5), (call, 0.1), (allin, 0.4)],
+            &unopened,
+            bb,
+            none,
+        )
+        .expect("有全下 → 挪");
         assert!(close(&g, &[(fold, 0.5), (call, 0.5)]), "{g:?}");
         // 没有全下 / 全下概率 0 → 不动。
         assert_eq!(
-            deep_preflop_no_allin(&[(fold, 0.5), (small, 0.5)], &unopened),
+            deep_preflop_no_allin(&[(fold, 0.5), (small, 0.5)], &unopened, bb, none),
             None
         );
         assert_eq!(
-            deep_preflop_no_allin(&[(fold, 1.0), (allin, 0.0)], &unopened),
+            deep_preflop_no_allin(&[(fold, 1.0), (allin, 0.0)], &unopened, bb, none),
+            None
+        );
+        // 没人入池、树里没有平跟档也没有加注档 → 给不出去，不能挪成平跟。
+        assert_eq!(
+            deep_preflop_no_allin(&[(fold, 0.5), (allin, 0.5)], &unopened, bb, none),
             None
         );
 
@@ -12253,12 +12298,52 @@ mod tests {
             jam.apply(Action::Fold).expect("弃牌");
         }
         let call_to = jam.legal_actions().call.expect("能跟");
-        let g = deep_preflop_no_allin(&[(fold, 0.3), (allin, 0.7)], &jam).expect("有全下 → 挪");
+        let g = deep_preflop_no_allin(&[(fold, 0.3), (allin, 0.7)], &jam, bb, none)
+            .expect("有全下 → 挪");
         assert!(
             close(
                 &g,
                 &[(fold, 0.3), (AbstractAction::Call { to: call_to }, 0.7)]
             ),
+            "{g:?}"
+        );
+
+        // 发出去是全下的加注档：大档和全下一起挪给还放得下的小档，只有它一档时也要挪。
+        let big_goes_allin = move |a: AbstractAction| a == big;
+        let g = deep_preflop_no_allin(
+            &[(fold, 0.2), (small, 0.3), (big, 0.1), (allin, 0.4)],
+            &unopened,
+            bb,
+            &big_goes_allin,
+        )
+        .expect("有全下 → 挪");
+        assert!(close(&g, &[(fold, 0.2), (small, 0.8)]), "{g:?}");
+        let g = deep_preflop_no_allin(
+            &[(fold, 0.2), (call, 0.3), (big, 0.5)],
+            &unopened,
+            bb,
+            &big_goes_allin,
+        )
+        .expect("没有全下档，但大档发出去是全下 → 挪");
+        assert!(close(&g, &[(fold, 0.2), (call, 0.8)]), "{g:?}");
+
+        // 面对加注、跟注放得下，分布里没有 Call 档：全下和塌掉的大档都给真实跟注。
+        let mut raised = unopened.clone();
+        raised
+            .apply(Action::Raise {
+                to: ChipAmount::new(400),
+            })
+            .expect("UTG 开池");
+        let to = raised.legal_actions().call.expect("能跟");
+        let g = deep_preflop_no_allin(
+            &[(fold, 0.2), (big, 0.3), (allin, 0.5)],
+            &raised,
+            bb,
+            &big_goes_allin,
+        )
+        .expect("面对加注 → 真实跟注");
+        assert!(
+            close(&g, &[(fold, 0.2), (AbstractAction::Call { to }, 0.8)]),
             "{g:?}"
         );
     }
@@ -12319,6 +12404,158 @@ mod tests {
         stacks[3] = 6000;
         let resp = run(&req(stacks));
         assert!(!resp.source.contains("deep_no_allin"), "{resp:?}");
+    }
+
+    /// A raise label that no longer fits at blueprint depth goes out as an all-in, and an all-in raises to
+    /// hero's whole real stack. Both preflop gates must treat it as one. Uniform strategy on the 200BB
+    /// `ante-flop2-3bet-o75` shape (cap 2 keeps the tree small); the lines follow live 001509.
+    #[test]
+    fn preflop_gates_catch_raise_collapsing_into_allin() {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::default_500_500_500(),
+        ));
+        let game =
+            build_game(table, "ante-flop2-3bet-o75", 2, 8, 100, 200).expect("8-max o75 200BB");
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let plain = |r: &Request| {
+            decide(
+                &game,
+                &abs,
+                &uniform,
+                r,
+                0xA111,
+                None,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        let low_visits = |r: &Request| {
+            let row_weight = |_i: &InfoSetId| Some(1000.0);
+            decide_with(
+                &game,
+                &abs,
+                &uniform,
+                r,
+                0xA111,
+                None,
+                &mut SubgameSolveCache::new(),
+                None,
+                Some(PreflopVisitGate {
+                    min_visits: 50_000,
+                    commit_share: DEFAULT_PREFLOP_COMMIT_SHARE,
+                    row_weight: &row_weight,
+                }),
+            )
+        };
+        let req = |my_seat: u8, actions: Vec<HistAction>, stack: u64, min_raise: u64| Request {
+            hole: vec![],
+            board: vec![],
+            button_seat: 7,
+            my_seat,
+            num_seats: 8,
+            small_blind: 50,
+            big_blind: 100,
+            ante: 100,
+            actions,
+            valid: ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: true,
+                min_raise: Some(min_raise),
+                max_raise: Some(stack - 100),
+            },
+            stacks: vec![stack; 8],
+            dealt_seats: (0..8).collect(),
+            names: Default::default(),
+        };
+        let utg_open_bb_3bet = |three_bet: u64| -> Vec<HistAction> {
+            let mut a = vec![hist(2, "raise", Some(1200))];
+            a.extend([3, 4, 5, 6, 7, 0].map(|s| hist(s, "fold", None)));
+            a.push(hist(1, "raise", Some(three_bet)));
+            a
+        };
+        let holes: Vec<Vec<String>> = "AKQJT98765432"
+            .chars()
+            .map(|r| vec![format!("{r}h"), format!("{r}d")])
+            .collect();
+        let with_hole = |r: &Request, hole: &[String]| Request {
+            hole: hole.to_vec(),
+            ..r.clone()
+        };
+        let has_label = |g: &Response, label: &str| {
+            g.probs
+                .as_ref()
+                .is_some_and(|p| p.iter().any(|(l, _)| l == label))
+        };
+        let passive = |g: &Response| g.action == "fold" || g.action == "call";
+
+        // 200BB hero: the gates stay out and the raise label is the all-in, as in the tree.
+        let at_depth = req(2, utg_open_bb_3bet(7000), 20_000, 12_800);
+        let sent: Vec<Response> = holes
+            .iter()
+            .map(|h| plain(&with_hole(&at_depth, h)))
+            .collect();
+        assert!(sent.iter().all(|g| g.source == "blueprint"), "{sent:?}");
+        assert!(
+            sent.iter()
+                .any(|g| g.chosen.as_deref() == Some("raise1pot") && g.amount == Some(19_900)),
+            "the 1pot label goes out as the all-in here: {sent:?}"
+        );
+
+        // Deep hero, 3bet large enough that 1pot does not fit: never a raise, least of all 499BB.
+        let deep = req(2, utg_open_bb_3bet(7000), 50_000, 12_800);
+        for hole in &holes {
+            let g = plain(&with_hole(&deep, hole));
+            assert!(g.source.ends_with(":deep_no_allin"), "{hole:?}: {g:?}");
+            assert!(has_label(&g, "raise1pot"), "{hole:?}: {g:?}");
+            assert!(passive(&g), "{hole:?}: {g:?}");
+        }
+
+        // Deep hero, smaller 3bet: 1pot fits, so it is a real raise and takes the all-in's mass as before.
+        let fits = req(2, utg_open_bb_3bet(3000), 50_000, 4800);
+        let sent: Vec<Response> = holes.iter().map(|h| plain(&with_hole(&fits, h))).collect();
+        assert!(sent.iter().any(|g| g.action == "raise"), "{sent:?}");
+        for g in &sent {
+            assert!(g.source.ends_with(":deep_no_allin"), "{g:?}");
+            assert!(g.amount.is_none_or(|to| to < 15_000), "{g:?}");
+        }
+
+        // Tree node with no Call (width redirect), every raise too big: the real call, not the all-in.
+        let no_call = req(
+            4,
+            vec![hist(2, "raise", Some(9000)), hist(3, "call", None)],
+            50_000,
+            17_100,
+        );
+        for hole in &holes {
+            let g = plain(&with_hole(&no_call, hole));
+            assert!(g.source.ends_with(":deep_no_allin"), "{hole:?}: {g:?}");
+            assert!(!has_label(&g, "call"), "{hole:?}: {g:?}");
+            assert!(passive(&g), "{hole:?}: {g:?}");
+        }
+
+        // Fold / all-in node in the tree, a raise hero can call at blueprint depth: the real call.
+        let mut fold_or_jam = utg_open_bb_3bet(4500);
+        fold_or_jam.push(hist(2, "raise", Some(10_000)));
+        fold_or_jam.push(hist(1, "raise", Some(16_000)));
+        let fold_or_jam = req(2, fold_or_jam, 50_000, 22_000);
+        for hole in &holes {
+            let g = plain(&with_hole(&fold_or_jam, hole));
+            assert!(g.source.ends_with(":deep_no_allin"), "{hole:?}: {g:?}");
+            assert!(has_label(&g, "allin"), "{hole:?}: {g:?}");
+            assert!(passive(&g), "{hole:?}: {g:?}");
+        }
+
+        // Low row weight, within the deep gate's range (236BB, like 001509): the raise is taken out too.
+        let thin = req(2, utg_open_bb_3bet(7000), 23_600, 12_800);
+        for hole in &holes {
+            let g = low_visits(&with_hole(&thin, hole));
+            assert!(
+                g.source.contains(":low_visits_no_commit"),
+                "{hole:?}: {g:?}"
+            );
+            assert!(passive(&g), "{hole:?}: {g:?}");
+        }
     }
 
     /// [`low_visits_no_commit`]: the other actions scale up in proportion; a pure all-in goes to `Call`;
@@ -12516,7 +12753,8 @@ mod tests {
     }
 
     /// [`raise_commits_stack`]: new chips against `behind`; the end point counts; chips already in this
-    /// round do not; all-in, call and fold are not judged here.
+    /// round do not; the all-in label, call and fold are not judged here; a raise label that goes out as
+    /// an all-in ([`raise_goes_allin`]) always commits, however deep `behind` is.
     #[test]
     fn raise_commits_stack_cases() {
         let game = nolimp_game();
@@ -12550,7 +12788,22 @@ mod tests {
             .filter(|a| !matches!(a, AbstractAction::Raise { .. } | AbstractAction::Bet { .. }))
         {
             assert!(!raise_commits_stack(&state, &abs, a, 1, 0.5), "{a:?}");
+            assert!(!raise_goes_allin(&state, &abs, a), "{a:?}");
         }
+        assert!(!raise_goes_allin(&state, &abs, raise));
+        // A bigger raise in front: 1pot no longer fits, so the same label is sent as an all-in.
+        let mut raised = GameState::with_rng(&cfg, 0x0dee_9a12, &mut rng);
+        raised
+            .apply(Action::Raise {
+                to: ChipAmount::new(4000),
+            })
+            .expect("open");
+        assert!(matches!(
+            outgoing_action(&raised, &abs, raise),
+            Ok(Action::AllIn)
+        ));
+        assert!(raise_goes_allin(&raised, &abs, raise));
+        assert!(raise_commits_stack(&raised, &abs, raise, u64::MAX / 4, 1.0));
     }
 
     /// Through `decide_with` on the production tree shape (uniform strategy; 100BB, since the 200BB tree
