@@ -1,0 +1,65 @@
+{
+  "table": {
+    "seats": 8,
+    "small_blind": 50,
+    "big_blind": 100,
+    "ante": 100,
+    "start_bb": 200,
+    "rebuy_below_bb": 20,
+    "reset_above_bb": 400
+  },
+  "groups": [
+    {
+      "name": "old9b",
+      "copies": 2,
+      "args": [
+        "--cropped-checkpoint", "artifacts/run_8max_ante100_200bb_antefl2_3bet_cap4_b500/nlhe_8max_ante100_200bb_antefl2_3bet_cap4_b500_9b_preflop_flop_stratonly.crop",
+        "--bucket-table", "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin",
+        "--reshape", "ante-flop2-3bet", "--postflop-cap", "4",
+        "--search", "--search-trigger", "all-postflop", "--search-flop-prefer-blueprint", "on", "--search-deep-menu", "--search-prewarm",
+        "--search-max-nodes", "1000000", "--search-live-traversers", "on", "--search-solve-threads", "16",
+        "--search-iterations", "1000000", "--search-iterations-turn", "2000000", "--search-iterations-river", "3000000",
+        "--search-time-budget-ms", "5000", "--search-limp-as-fold", "on",
+        "--exploit", "on", "--exploit-tilt", "on", "--exploit-anchored", "on"
+      ]
+    },
+    {
+      "name": "open2",
+      "copies": 2,
+      "args": [
+        "--cropped-checkpoint", "artifacts/run_8max_ante100_200bb_antefl2_3bet_open2_cap4_b500/nlhe_8max_ante100_200bb_antefl2_3bet_open2_cap4_b500_9b_preflop_flop_stratonly.crop",
+        "--bucket-table", "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin",
+        "--reshape", "ante-flop2-3bet-open2", "--postflop-cap", "4",
+        "--search", "--search-trigger", "all-postflop", "--search-flop-prefer-blueprint", "on", "--search-deep-menu", "--search-prewarm",
+        "--search-max-nodes", "1000000", "--search-live-traversers", "on", "--search-solve-threads", "16",
+        "--search-iterations", "1000000", "--search-iterations-turn", "2000000", "--search-iterations-river", "3000000",
+        "--search-time-budget-ms", "5000", "--search-limp-as-fold", "on",
+        "--exploit", "on", "--exploit-tilt", "on", "--exploit-anchored", "on"
+      ]
+    },
+    {
+      "name": "o75",
+      "copies": 2,
+      "args": [
+        "--cropped-checkpoint", "artifacts/run_8max_ante100_200bb_antefl2_3bet_o75_cap4_b500/nlhe_8max_ante100_200bb_antefl2_3bet_o75_cap4_b500_10b_preflop_flop_stratonly.crop",
+        "--bucket-table", "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin",
+        "--reshape", "ante-flop2-3bet-o75", "--postflop-cap", "4",
+        "--search", "--search-trigger", "all-postflop", "--search-flop-prefer-blueprint", "on", "--search-deep-menu", "--search-prewarm",
+        "--search-max-nodes", "1000000", "--search-live-traversers", "on", "--search-solve-threads", "16",
+        "--search-iterations", "1000000", "--search-iterations-turn", "2000000", "--search-iterations-river", "3000000",
+        "--search-time-budget-ms", "5000", "--search-limp-as-fold", "on",
+        "--exploit", "on", "--exploit-tilt", "on", "--exploit-anchored", "on"
+      ]
+    },
+    {
+      "name": "exploit",
+      "copies": 2,
+      "args": [
+        "--advisor-bin", "tools/wopo_exploit/target/release/wopo_exploit_advisor",
+        "--cropped-checkpoint", "artifacts/wopo_exploit/model.json",
+        "--bucket-table", "artifacts/wopo_exploit/chart.json",
+        "--search", "--range-log", "off", "--exploit-4bet", "on"
+      ]
+    }
+  ]
+}
