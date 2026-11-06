@@ -157,7 +157,9 @@ street, pot, turns, dead, result, hero_net, status（playing / done / dead / err
 
 ## 牌局回放（wopo，`history`）
 
-在浏览器里逐步回放打完的 wopo 手牌。只读文件，不碰数据库：
+在浏览器里逐步回放打完的 wopo 手牌。只读文件，不碰数据库。读到 `tools/wopo_arena` 的整桌牌谱（`table/` 目录）时，
+页面右上角多一个「累计输赢」入口（`/cumulative`）：每个座位随手数累计输赢筹码的折线图和结果表。
+
 
 - 手牌来自 driver 的 `wopo_hh.jsonl`（`--run` 给 run 目录、hh 文件或通配符，每次请求重新展开，文件变了就重读）。
   同目录有 `wopo_play_events.jsonl` 时，hero 每个决策点带上建议、和实际是否一致、advisor 的动作概率 / 来源 / 耗时

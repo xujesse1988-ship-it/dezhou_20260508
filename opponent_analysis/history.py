@@ -40,6 +40,7 @@ from .platforms import PLATFORMS
 from .replay import ReplayError, assign_positions, replay
 
 PAGE_PATH = os.path.join(os.path.dirname(__file__), "history.html")
+CUMULATIVE_PAGE_PATH = os.path.join(os.path.dirname(__file__), "cumulative.html")
 HH_NAME = "wopo_hh.jsonl"
 EVENTS_NAME = "wopo_play_events.jsonl"
 RANGES_NAME = "wopo_ranges.jsonl"
@@ -477,6 +478,8 @@ def load_run(hh_path: str) -> dict:
     """One hh file + its companions -> {hands: [replay], dead: [hand_id], counts, run}."""
     d = os.path.dirname(hh_path)
     run = os.path.basename(d) or d
+    if run == "table":  # tools/wopo_arena keeps the whole-table record in <match>/table
+        run = os.path.basename(os.path.dirname(os.path.abspath(d))) or run
     counts: Counter = Counter()
     events: dict[str, list] = {}
     for e in _read_jsonl(os.path.join(d, EVENTS_NAME), counts, "events"):
@@ -495,10 +498,12 @@ def load_run(hh_path: str) -> dict:
             ranges.setdefault(str(ev["hand_id"]), {})[ev.get("street")] = {
                 **{k: ev.get(k) for k in ("street", "board", "path", "range_src", "source", "seats")}, "backfill": filled}
     hands, seen = [], set()
+    has_net = False
     for rec in _read_jsonl(hh_path, counts, "hh"):
         if not isinstance(rec, dict) or "wopo_hh" not in rec:
             counts["not_wopo"] += 1
             continue
+        has_net = has_net or "net_by_bot" in rec
         hid = str(rec.get("hand_id"))
         if hid in seen:
             counts["duplicate"] += 1
@@ -514,7 +519,33 @@ def load_run(hh_path: str) -> dict:
     counts["hands"] = len(hands)
     st = _sig(hh_path)
     return {"run": run, "path": hh_path, "mtime": st[1] / 1e9 if st else None, "hands": hands, "dead": dead, "counts": dict(counts),
-            "events": os.path.exists(os.path.join(d, EVENTS_NAME)), "ranges": os.path.exists(os.path.join(d, RANGES_NAME))}
+            "events": os.path.exists(os.path.join(d, EVENTS_NAME)), "ranges": os.path.exists(os.path.join(d, RANGES_NAME)),
+            "has_net": has_net}
+
+
+def cumulative_series(hh_path: str) -> Optional[dict]:
+    """Running net chips per player over a tools/wopo_arena table record, whose rows carry `hand_no` and
+    `net_by_bot` (one hand's net per player, stack resets already left out). None for any other hh file.
+    The series start at 0 on the hand before the first one recorded."""
+    counts: Counter = Counter()
+    rows = [r for r in _read_jsonl(hh_path, counts, "hh") if isinstance(r, dict)]
+    usable = [r for r in rows if isinstance(r.get("net_by_bot"), dict) and isinstance(r.get("hand_no"), int)]
+    if not usable or len(usable) != len(rows):
+        return None
+    bots = sorted(usable[0]["net_by_bot"])
+    if any(sorted(r["net_by_bot"]) != bots for r in usable):
+        return None
+    usable.sort(key=lambda r: r["hand_no"])
+    hands = [usable[0]["hand_no"] - 1]
+    series = {b: [0] for b in bots}
+    for r in usable:
+        hands.append(r["hand_no"])
+        for b in bots:
+            series[b].append(series[b][-1] + r["net_by_bot"][b])
+    d = os.path.dirname(os.path.abspath(hh_path))
+    parent = os.path.basename(os.path.dirname(d)) if os.path.basename(d) == "table" else os.path.basename(d)
+    return {"title": parent, "path": hh_path, "big_blind": usable[-1]["big_blind"], "hands": hands, "bots": bots, "series": series,
+            "unbalanced_hands": sum(1 for r in usable if sum(r["net_by_bot"].values()) != 0)}
 
 
 class History:
@@ -527,6 +558,7 @@ class History:
         self.runs: dict[str, tuple] = {}  # hh path -> (sigs, run)
         self.by_key: dict[str, dict] = {}
         self.listing: dict = {}
+        self.cumulative_cache: dict[str, tuple] = {}  # hh path -> (file signature, series or None)
 
     def refresh(self) -> None:
         with self.lock:
@@ -563,7 +595,8 @@ class History:
         rows.sort(key=lambda r: (r["ts"] or "", r["hand_id"]), reverse=True)
         runs.sort(key=lambda r: (r["mtime"] or 0, r["path"]), reverse=True)  # newest hh file first
         self.by_key = by_key
-        self.listing = {"hands": rows, "runs": runs, "errors": errors, "patterns": self.patterns}
+        self.listing = {"hands": rows, "runs": runs, "errors": errors, "patterns": self.patterns,
+                        "cumulative": any(self.runs[p][1].get("has_net") for p in self.runs)}
 
     def hands(self) -> dict:
         self.refresh()
@@ -575,6 +608,21 @@ class History:
         with self.lock:
             return self.by_key.get(key)
 
+    def cumulative(self) -> list[dict]:
+        """Running net per player for each run that records it (cached until its hh file changes)."""
+        self.refresh()
+        out = []
+        with self.lock:
+            for p in sorted(self.runs):
+                sig = _sig(p)
+                cached = self.cumulative_cache.get(p)
+                if cached is None or cached[0] != sig:
+                    cached = (sig, cumulative_series(p))
+                    self.cumulative_cache[p] = cached
+                if cached[1] is not None:
+                    out.append(cached[1])
+        return out
+
 
 # ------------------------------------------------------------------ HTTP
 
@@ -583,6 +631,11 @@ def handle(hist: History, path: str, query: str, live: bool, preflop: bool = Fal
     if path == "/history" or (path == "/" and not live):
         with open(PAGE_PATH, "rb") as f:
             return 200, f.read(), "text/html; charset=utf-8"
+    if path == "/cumulative":
+        with open(CUMULATIVE_PAGE_PATH, "rb") as f:
+            return 200, f.read(), "text/html; charset=utf-8"
+    if path == "/api/history/cumulative":
+        return 200, json.dumps({"runs": hist.cumulative()}, ensure_ascii=False).encode(), "application/json; charset=utf-8"
     if path == "/api/history/hands":
         body = dict(hist.hands(), live=live, preflop=preflop)
         return 200, json.dumps(body, ensure_ascii=False).encode(), "application/json; charset=utf-8"

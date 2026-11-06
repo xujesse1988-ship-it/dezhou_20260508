@@ -7,7 +7,7 @@ import tempfile
 import time
 import unittest
 
-from opponent_analysis.history import History, act_label, build_hand, expand, handle, load_run
+from opponent_analysis.history import History, act_label, build_hand, cumulative_series, expand, handle, load_run
 
 DATA = os.path.join(os.path.dirname(__file__), "data")
 HH = os.path.join(DATA, "wopo_hh_2026_10_16.jsonl")
@@ -311,6 +311,51 @@ class Files(unittest.TestCase):
         code, _, _ = handle(hist, "/api/history/hand", "key=nope", live=True)
         self.assertEqual(code, 404)
         self.assertIsNone(handle(hist, "/api/snapshot", "", live=True))
+
+
+class CumulativeSeries(unittest.TestCase):
+    def _write(self, rows):
+        d = tempfile.mkdtemp(prefix="hist_cum_")
+        self.addCleanup(shutil.rmtree, d, True)
+        run = os.path.join(d, "arena_x", "table")
+        os.makedirs(run)
+        path = os.path.join(run, "wopo_hh.jsonl")
+        with open(path, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        return path
+
+    @staticmethod
+    def _row(no, a, b, c):
+        return {"wopo_hh": 1, "hand_no": no, "big_blind": 100, "net_by_bot": {"x_a": a, "x_b": b, "y_a": c}}
+
+    def test_running_net_starts_at_zero_on_the_hand_before(self):
+        got = cumulative_series(self._write([self._row(2002, 50, -20, -30), self._row(2001, 100, -100, 0)]))
+        self.assertEqual(got["hands"], [2000, 2001, 2002])
+        self.assertEqual(got["bots"], ["x_a", "x_b", "y_a"])
+        self.assertEqual(got["series"], {"x_a": [0, 100, 150], "x_b": [0, -100, -120], "y_a": [0, 0, -30]})
+        self.assertEqual(got["title"], "arena_x")
+        self.assertEqual(got["big_blind"], 100)
+        self.assertEqual(got["unbalanced_hands"], 0)
+
+    def test_hand_that_does_not_sum_to_zero_is_counted(self):
+        got = cumulative_series(self._write([self._row(1, 100, -100, 0), self._row(2, 100, 0, 0)]))
+        self.assertEqual(got["unbalanced_hands"], 1)
+
+    def test_ordinary_hh_has_no_series(self):
+        self.assertIsNone(cumulative_series(self._write([{"wopo_hh": 1, "hand_id": "t:hand:1"}])))
+        self.assertIsNone(cumulative_series(self._write([self._row(1, 1, -1, 0), {"wopo_hh": 1, "hand_id": "t:hand:2"}])))
+
+    def test_routes(self):
+        path = self._write([self._row(1, 100, -100, 0)])
+        hist = History([path])
+        code, body, ctype = handle(hist, "/cumulative", "", live=False)
+        self.assertEqual(code, 200)
+        self.assertIn("text/html", ctype)
+        self.assertIn(b"api/history/cumulative", body)
+        code, body, _ = handle(hist, "/api/history/cumulative", "", live=False)
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body)["runs"][0]["series"]["x_a"], [0, 100])
 
 
 if __name__ == "__main__":
