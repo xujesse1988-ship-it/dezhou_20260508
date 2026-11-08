@@ -3529,7 +3529,9 @@ fn decide_with(
                 outgoing_state,
                 &legal_abs,
                 solver_cfg.big_blind,
-                &|a| raise_commits_stack(outgoing_state, outgoing_abs, a, behind, g.commit_share),
+                &|a| {
+                    commits_share_of_stack(outgoing_state, outgoing_abs, a, behind, g.commit_share)
+                },
                 low_visits_call_hand(hole),
             );
             dlog!("low visits preflop row weight={w}: {adjusted:?} → {d:?}");
@@ -4925,10 +4927,12 @@ fn raise_goes_allin(state: &GameState, abs: &StreetActionAbstraction, a: Abstrac
         && matches!(outgoing_action(state, abs, a), Ok(Action::AllIn))
 }
 
-/// A bet or raise whose new chips (same amount as sent, [`outgoing_action`]) reach `share` of `behind`,
-/// or that goes out as an all-in ([`raise_goes_allin`]). The `AllIn` label is not judged here: the caller
-/// always takes it out.
-fn raise_commits_stack(
+/// A bet, raise or call whose new chips (same amount as sent, [`outgoing_action`]; a call puts in up to
+/// `legal_actions().call`) reach `share` of `behind`, or a bet / raise that goes out as an all-in
+/// ([`raise_goes_allin`]). A call of most of the stack is a commitment like a shove (live 001995: AJo
+/// facing a 4bet to 194BB called 150BB with 160BB behind, the gate having taken out only the all-in).
+/// The `AllIn` label is not judged here: the caller always takes it out.
+fn commits_share_of_stack(
     state: &GameState,
     abs: &StreetActionAbstraction,
     a: AbstractAction,
@@ -4944,10 +4948,11 @@ fn raise_commits_stack(
     let in_round = state.players()[seat.0 as usize]
         .committed_this_round
         .as_u64();
+    let reaches =
+        |to: ChipAmount| to.as_u64().saturating_sub(in_round) as f64 >= share * behind as f64;
     match outgoing_action(state, abs, a) {
-        Ok(Action::Bet { to }) | Ok(Action::Raise { to }) => {
-            to.as_u64().saturating_sub(in_round) as f64 >= share * behind as f64
-        }
+        Ok(Action::Bet { to }) | Ok(Action::Raise { to }) => reaches(to),
+        Ok(Action::Call) => state.legal_actions().call.is_some_and(reaches),
         _ => false,
     }
 }
@@ -4962,20 +4967,21 @@ fn low_visits_call_hand(hole: [Card; 2]) -> bool {
     (hi == lo && hi >= Queen) || (hi == Ace && lo == King)
 }
 
-/// Takes `AllIn` and committing raises (`commits`) out of a preflop row with too few samples
-/// ([`PreflopVisitGate`]) and scales the other actions up in proportion, the same thing
-/// [`prune_for_sampling`] does to a low-probability all-in. Well-sampled sibling nodes favour this over
-/// moving the mass to `Call`: on rows under the threshold the same hand one line over folds 64% (offsuit
-/// 85%), and live 001450 AJo folds 97-100% in its siblings.
+/// Takes `AllIn` and committing actions (`commits`: raises, and a call of most of the stack) out of a
+/// preflop row with too few samples ([`PreflopVisitGate`]) and scales the other actions up in proportion,
+/// the same thing [`prune_for_sampling`] does to a low-probability all-in. Well-sampled sibling nodes
+/// favour this over moving the mass to `Call`: on rows under the threshold the same hand one line over
+/// folds 64% (offsuit 85%), and live 001450 AJo folds 97-100% in its siblings.
 ///
 /// - `legal_abs` (the node's menu) has no `Call` while hero faces a raise: the tree folded the call into
-///   `AllIn`, so the mass goes to the real call. Unopened nodes with no limp in the tree also lack `Call`;
-///   `big_blind` tells them apart.
-/// - `call_hand` ([`low_visits_call_hand`]) facing a raise: the mass goes to `Call`, its fold share stays.
-///   In proportion, AKo would fold at least half the time on 83 of 134 sampled low-weight rows, while
-///   well-sampled siblings almost never fold these hands.
-/// - Nothing else in the dist (pure all-in, e.g. AA): goes to `Call` if the menu has it, otherwise
-///   `None`, as on an unopened node with no limp in the tree.
+///   `AllIn`, so the mass goes to the real call, unless that call commits (then as below, in proportion).
+///   Unopened nodes with no limp in the tree also lack `Call`; `big_blind` tells them apart.
+/// - `call_hand` ([`low_visits_call_hand`]) facing a raise: the mass goes to `Call`, its fold share stays,
+///   even when the call commits. In proportion, AKo would fold at least half the time on 83 of 134
+///   sampled low-weight rows, while well-sampled siblings almost never fold these hands.
+/// - Nothing else in the dist (pure all-in, e.g. AA, or every option commits and the row never folds):
+///   goes to `Call`, the menu's or, facing a raise, the real one, even when it commits: a row that never
+///   folds is not turned into a fold. Otherwise `None`, as on an unopened node with no limp in the tree.
 /// - Nothing to take out with probability > 0: `None`, the caller samples the original dist.
 fn low_visits_no_commit(
     dist: &[(AbstractAction, f64)],
@@ -5001,8 +5007,9 @@ fn low_visits_no_commit(
         .copied()
         .find(|a| matches!(a, AbstractAction::Call { .. }));
     let facing_raise = state.legal_actions().call.filter(|&to| to > big_blind);
+    let call_commits = facing_raise.is_some_and(|to| commits(AbstractAction::Call { to }));
     match (call_slot, facing_raise) {
-        (None, Some(to)) => {
+        (None, Some(to)) if call_hand || !call_commits => {
             out.push((AbstractAction::Call { to }, moved));
             return Some(out);
         }
@@ -5020,7 +5027,10 @@ fn low_visits_no_commit(
     }
     let rest: f64 = out.iter().map(|&(_, p)| p.max(0.0)).sum();
     if rest <= 0.0 {
-        return Some(vec![(call_slot?, 1.0)]);
+        // The row never folds or plays small: call rather than fold, even when the call commits (live
+        // 001840 TT facing a short stack's 97BB raise, row weight 43k, never folds in the blueprint).
+        let real_call = facing_raise.map(|to| AbstractAction::Call { to });
+        return Some(vec![(call_slot.or(real_call)?, 1.0)]);
     }
     for (_, p) in &mut out {
         *p = p.max(0.0) / rest;
@@ -12726,6 +12736,77 @@ mod tests {
         )
         .expect("drop");
         assert!(close(&g, &[(fold, 5.0 / 6.0), (raise, 1.0 / 6.0)]), "{g:?}");
+
+        // A call of most of the stack commits like a shove (live 001995: AJo facing a 4bet, the gate took
+        // out the 50% all-in and the rest sampled a 150BB call with 160BB behind).
+        let call_commits: &dyn Fn(AbstractAction) -> bool =
+            &|a| matches!(a, AbstractAction::Call { .. });
+        let row_1995 = [(fold, 0.3633), (call, 0.1351), (allin, 0.5016)];
+        let g =
+            low_visits_no_commit(&row_1995, &raised, &menu, bb, call_commits, false).expect("drop");
+        assert!(close(&g, &[(fold, 1.0)]), "{g:?}");
+        // QQ+/AK still call, committing or not; the fold share stays.
+        let g = low_visits_no_commit(&row_1995, &raised, &menu, bb, call_commits, true)
+            .expect("to call");
+        assert!(close(&g, &[(fold, 0.3633), (call, 0.6367)]), "{g:?}");
+        // Every option commits and the row never folds (live 001840 TT facing a short stack's 97BB raise):
+        // the call stays, a row that never folds is not turned into a fold.
+        let g = low_visits_no_commit(
+            &[(fold, 0.0), (call, 0.39), (raise, 0.37), (allin, 0.24)],
+            &raised,
+            &menu,
+            bb,
+            &|a| {
+                matches!(
+                    a,
+                    AbstractAction::Call { .. } | AbstractAction::Raise { .. }
+                )
+            },
+            false,
+        )
+        .expect("all commit");
+        assert!(close(&g, &[(call, 1.0)]), "{g:?}");
+        // Same with a pure all-in and the all-in slot holding the call: the real call.
+        let g = low_visits_no_commit(
+            &[(allin, 1.0)],
+            &jam,
+            &[fold, allin],
+            bb,
+            call_commits,
+            false,
+        )
+        .expect("pure all-in");
+        assert!(
+            close(&g, &[(AbstractAction::Call { to: call_to }, 1.0)]),
+            "{g:?}"
+        );
+        // The all-in slot holds the call and that call commits: in proportion, so here the fold.
+        let g = low_visits_no_commit(
+            &[(fold, 0.3), (allin, 0.7)],
+            &jam,
+            &[fold, allin],
+            bb,
+            call_commits,
+            false,
+        )
+        .expect("all-in → drop");
+        assert!(close(&g, &[(fold, 1.0)]), "{g:?}");
+        let g = low_visits_no_commit(
+            &[(fold, 0.3), (allin, 0.7)],
+            &jam,
+            &[fold, allin],
+            bb,
+            call_commits,
+            true,
+        )
+        .expect("all-in → call");
+        assert!(
+            close(
+                &g,
+                &[(fold, 0.3), (AbstractAction::Call { to: call_to }, 0.7)]
+            ),
+            "{g:?}"
+        );
     }
 
     /// [`low_visits_call_hand`]: exactly AA, KK, QQ, AKs, AKo, in either card order.
@@ -12752,11 +12833,11 @@ mod tests {
         }
     }
 
-    /// [`raise_commits_stack`]: new chips against `behind`; the end point counts; chips already in this
-    /// round do not; the all-in label, call and fold are not judged here; a raise label that goes out as
-    /// an all-in ([`raise_goes_allin`]) always commits, however deep `behind` is.
+    /// [`commits_share_of_stack`]: new chips against `behind`, for raises and calls alike; the end point counts;
+    /// chips already in this round do not; the all-in label and fold are not judged here; a raise label
+    /// that goes out as an all-in ([`raise_goes_allin`]) always commits, however deep `behind` is.
     #[test]
-    fn raise_commits_stack_cases() {
+    fn commits_share_of_stack_cases() {
         let game = nolimp_game();
         let abs = game.abstraction().clone();
         let cfg = TableConfig::default_6max_100bb();
@@ -12779,15 +12860,48 @@ mod tests {
             panic!("raise maps to a raise");
         };
         let add = to.as_u64() - in_round;
-        assert!(raise_commits_stack(&state, &abs, raise, add * 2, 0.5));
-        assert!(!raise_commits_stack(&state, &abs, raise, add * 2 + 2, 0.5));
-        assert!(raise_commits_stack(&state, &abs, raise, add, 1.0));
+        assert!(commits_share_of_stack(&state, &abs, raise, add * 2, 0.5));
+        assert!(!commits_share_of_stack(
+            &state,
+            &abs,
+            raise,
+            add * 2 + 2,
+            0.5
+        ));
+        assert!(commits_share_of_stack(&state, &abs, raise, add, 1.0));
+        // A call: what it adds is legal_actions().call minus what hero has in this round.
+        let call = menu
+            .iter()
+            .copied()
+            .find(|a| matches!(a, AbstractAction::Call { .. }))
+            .expect("a call in the menu");
+        let call_add = state.legal_actions().call.expect("can call").as_u64() - in_round;
+        assert!(commits_share_of_stack(
+            &state,
+            &abs,
+            call,
+            call_add * 2,
+            0.5
+        ));
+        assert!(!commits_share_of_stack(
+            &state,
+            &abs,
+            call,
+            call_add * 2 + 2,
+            0.5
+        ));
+        for a in menu
+            .iter()
+            .copied()
+            .filter(|a| matches!(a, AbstractAction::Fold | AbstractAction::AllIn { .. }))
+        {
+            assert!(!commits_share_of_stack(&state, &abs, a, 1, 0.5), "{a:?}");
+        }
         for a in menu
             .iter()
             .copied()
             .filter(|a| !matches!(a, AbstractAction::Raise { .. } | AbstractAction::Bet { .. }))
         {
-            assert!(!raise_commits_stack(&state, &abs, a, 1, 0.5), "{a:?}");
             assert!(!raise_goes_allin(&state, &abs, a), "{a:?}");
         }
         assert!(!raise_goes_allin(&state, &abs, raise));
@@ -12803,7 +12917,13 @@ mod tests {
             Ok(Action::AllIn)
         ));
         assert!(raise_goes_allin(&raised, &abs, raise));
-        assert!(raise_commits_stack(&raised, &abs, raise, u64::MAX / 4, 1.0));
+        assert!(commits_share_of_stack(
+            &raised,
+            &abs,
+            raise,
+            u64::MAX / 4,
+            1.0
+        ));
     }
 
     /// Through `decide_with` on the production tree shape (uniform strategy; 100BB, since the 200BB tree
