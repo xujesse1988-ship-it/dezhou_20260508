@@ -74,6 +74,7 @@ table.changes tr.hit td { background: var(--hit); }
 #tip p { margin: 6px 0 0; }
 #tip .f { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); padding: 4px 6px; border-radius: 4px; }
 #tip .n { color: var(--muted); }
+#tip .how { border-top: 1px solid var(--line, rgba(128,128,128,.35)); padding-top: 6px; }
 th[data-tip], .tip-label { text-decoration: underline dotted var(--prior); text-underline-offset: 3px; }
 .tip-label { cursor: help; }
 tr.hero td:first-child::after { content: "我方"; font-size: 11px; color: var(--warn); margin-left: 6px; }
@@ -114,6 +115,11 @@ tr.hero td:first-child::after { content: "我方"; font-size: 11px; color: var(-
 .legend i { display: inline-block; vertical-align: -1px; margin: 0 4px 0 10px; }
 .leaks td { white-space: normal; }
 .flag { color: var(--warn); }
+.tier0 { opacity: .4; }
+.tier2 { font-weight: 600; }
+.dev { font-size: 11px; }
+.dev.up { color: var(--warn); }
+.dev.down { color: var(--accent); }
 ul.plain { margin: 4px 0; padding-left: 18px; }
 ul.plain li { margin: 2px 0; }
 .recent td { font-size: 12px; }
@@ -196,11 +202,13 @@ details.hand > div { padding: 4px 0 8px 14px; }
     <div class="section-head"><h2>玩家 <span class="muted" id="n-players"></span></h2>
       <div class="tools"><label class="filter"><input type="checkbox" id="only-seated"> 只看在桌</label>
         <details class="col-picker" id="col-picker"><summary>列</summary><div class="menu" id="col-menu"></div></details></div></div>
+    <details class="pt" id="pt-session" open hidden><summary>当前牌局<span class="muted" id="session-note"></span></summary>
+      <div class="scroll tall"><table class="ptab" id="players-session"><thead></thead><tbody></tbody></table></div></details>
     <details class="pt" id="pt-all" open><summary>全部历史<span class="muted">每个玩家的全部手牌</span></summary>
       <div class="scroll tall"><table class="ptab" id="players-all"><thead></thead><tbody></tbody></table></div></details>
     <details class="pt" id="pt-recent" open><summary>最近 <span id="scope-n">N</span> 手<span class="muted">每个玩家自己的最近 N 手（他不上桌的时间不算）；不到 N 手的玩家就是他的全部手牌</span></summary>
       <div class="scroll tall"><table class="ptab" id="players-recent"><thead></thead><tbody></tbody></table></div></details>
-    <p class="legend">点表格标题可以收起 / 展开。百分数为后验均值，悬停看 [5%, 95%] 区间和机会数。绿点 = 在桌：行动指南里最新一手的座位（开局就有，不用等结算）；没开行动指南时用每张桌最近记完的一手。离现在 10 分钟以上的不算。点一行看详情。</p>
+    <p class="legend">点表格标题可以收起 / 展开。百分数为后验均值，括号里是（真实次数/机会次数），悬停看 [5%, 95%] 区间。按机会数分三档：<span class="tier0">灰色 = 机会不足</span>，正常 = 可参考，<b>加粗 = 可靠</b>，每项的门槛见表头悬停说明。▲ / ▼ = 全部历史里明确高于 / 低于其他对手（对所有玩家所有指标一起做多重检验，错误发现率 10%），只标在「全部历史」表和玩家详情里。绿点 = 在桌：行动指南里最新一手的座位（开局就有，不用等结算）；没开行动指南时用每张桌最近记完的一手。离现在 10 分钟以上的不算。点一行看详情。</p>
   </section>
   <section class="full" id="detail"><div class="empty">选一个玩家</div></section>
   <section class="full">
@@ -224,9 +232,9 @@ let snap = null, selected = null, sortKey = 'hands', sortDir = -1, failures = 0,
 // response through an ssh tunnel is not an outage.
 const DOWN_AFTER = 3;
 try { selected = localStorage.getItem('oa.sel'); onlySeated = localStorage.getItem('oa.seated') === '1'; } catch {}
-// Two player tables: scope 'all' = whole history, 'recent' = each player's own last N hands.
-const SCOPES = [['all', 'players-all', 'pt-all'], ['recent', 'players-recent', 'pt-recent']];
-const view = (p, sc) => sc === 'recent' ? p.recent : p;
+// Player tables: 'session' = the run being played (live only), 'all' = whole history, 'recent' = each player's own last N hands.
+const SCOPES = [['session', 'players-session', 'pt-session'], ['all', 'players-all', 'pt-all'], ['recent', 'players-recent', 'pt-recent']];
+const view = (p, sc) => sc === 'recent' ? p.recent : sc === 'session' ? p.session : p;
 for (const [sc, , det] of SCOPES) {
   try { if (localStorage.getItem('oa.open.' + sc) === '0') $(det).open = false; } catch {}
   $(det).addEventListener('toggle', e => { try { localStorage.setItem('oa.open.' + sc, e.target.open ? '1' : '0'); } catch {} });
@@ -263,9 +271,27 @@ const isShown = k => visibleCols === null || visibleCols.includes(k);
 function buildRateCols() {
   if (rateCols.length || !snap) return;
   rateCols = snap.stats.map(st => ({
-    key: st.key, label: st.label, rate: true, val: (p, sc) => view(p, sc).rates[st.key].n ? view(p, sc).rates[st.key].mean : -1,
-    cell: (p, sc) => { const r = view(p, sc).rates[st.key]; return r.n ? `<span title="[${pct(r.lo)}, ${pct(r.hi)}] n=${r.n}">${pct(r.mean)}</span>` : '<span class="muted">—</span>'; } }));
+    key: st.key, label: st.label, rate: true, prior: st.prior, K: st.k, val: (p, sc) => view(p, sc).rates[st.key].n ? view(p, sc).rates[st.key].mean : -1,
+    cell: (p, sc) => {
+      const r = view(p, sc).rates[st.key];
+      if (!r.n) return '<span class="muted">—</span>';
+      const t = tierOf(st, r.n), counts = ` <span class="ci">(${r.k}/${r.n})</span>`;
+      const tip = TIER_TIP[t] + (sc === 'session' ? '' : `；[${pct(r.lo)}, ${pct(r.hi)}]`);
+      return `<span class="tier${t}" title="${tip}">${pct(r.mean)}${counts}</span>${sc === 'all' ? devMark(p, st.key) : ''}`;
+    } }));
   renderColMenu();
+}
+
+// Sample tiers by opportunities n: 0 below st.t1 (greyed, read the pool average instead), 1 usable,
+// 2 at least st.t2 (bold). Thresholds come from the server (report.tier_thresholds).
+function tierOf(st, n) { return n < st.t1 ? 0 : n < st.t2 ? 1 : 2; }
+const TIER_TIP = ['机会不足，先按群体均值看', '可参考', '可靠'];
+// Clearly above / below the other opponents: whole history, exact test, Benjamini–Hochberg across
+// every player and stat (the same list as the detail's "与其他对手显著不同").
+function devMark(p, key) {
+  const d = (p.deviations || []).find(x => x.key === key); if (!d) return '';
+  const up = d.k / d.n > d.pool;
+  return ` <span class="dev ${up ? 'up' : 'down'}" title="明确${up ? '高于' : '低于'}其他对手：${pct(d.k / d.n)}%（${d.k}/${d.n}）对 ${pct(d.pool)}%">${up ? '▲' : '▼'}</span>`;
 }
 function shownCols() {
   // Fixed order: base columns, then stats in report order, except the trailing base columns.
@@ -327,6 +353,34 @@ const DESC = {
   'wtsd:yes': { what: '看到翻牌后坚持到摊牌的比例。', formula: '摊牌次数 ÷ 看到翻牌的手数', note: '全下后直接发完公共牌也算摊牌。' },
   'wsd:won': { what: '摊牌时赢钱的比例。', formula: '摊牌时从底池分到筹码的次数 ÷ 摊牌次数', note: '平分底池、只赢回边池也算赢；自己多下而没人跟、被退回的筹码不算赢。' },
 };
+// "What to do about it": rules of thumb, not solver output. "偏高 / 偏低" = against the pool average m.
+const HOW = {
+  'hands': '手数少时其他数字都不太可靠，先当普通玩家打。',
+  'tag': '松的人：多拿价值、少诈唬。紧的人：多偷盲，他加注时尊重。凶的人：别只靠弃牌，用强牌跟注或反加。被动的人：他突然下注或加注多半是真牌，弱牌弃。',
+  'net_bb': '不要用它判断对手强弱，几手大底池就能改变结果。',
+  'bb100': '几千手内只能看大方向，不要据此调整打法。',
+  'leaks': '优先针对加粗的候选（保守估计也为正）；「n?」的还不确定，只做小幅调整。细节点玩家看详情。',
+  'changes': '有变化时优先参考「最近 N 手」那张表，他可能换了打法。',
+  'vpip:yes': '偏高：范围宽，多用强牌拿价值，少诈唬，他跟得多。\n偏低：入池就按牌强算，弱牌别跟；可以多偷他的盲注。',
+  'pfr:yes': '偏高（接近入池率）：他加注不一定强，用强牌 3bet 或跟注，别轻易弃。\n偏低：加注少，他一旦加注要重视，弱牌弃。',
+  'rfi:raise': '偏高：开得宽，后位和盲位可以多 3bet、多防守。\n偏低：开得紧，他开池时牌较强，边缘牌弃。',
+  'rfi:limp': '偏高：平跟范围偏弱，可以用好牌加注隔离，尺度大一些。\n注意：平跟后又再加注，多半是大牌，不要当作诈唬。',
+  'vs_open:fold': '偏高：开池容易成功，他在你后面时可以多开，尤其后位。\n偏低：爱跟或爱反加，开池范围收紧，以价值牌为主。',
+  'vs_open:raise': '偏高：3bet 多，开池范围收紧，准备用强牌 4bet 或跟注。\n偏低：3bet 少，他 3bet 时按强牌算，边缘牌弃。',
+  'vs_3bet:fold': '偏高：开池后被 3bet 容易弃，可以对他多 3bet，包括少量诈唬。\n偏低：不容易被打走，3bet 以价值牌为主，少诈唬。',
+  'steal_defense:fold': '偏高：他在盲位时，后位可以多偷。\n偏低：防守多，偷盲范围收紧，选翻后好打的牌。',
+  'cbet:bet': '偏高：他的持续下注里弱牌多，中等牌可以跟，强牌可以加注。\n偏低：他持续下注时牌较实，弱牌弃；他过牌时可以下注抢底池。',
+  'vs_cbet:fold': '偏高：翻前加注后，翻牌多下注，没中牌也可以诈唬。\n偏低：翻牌不轻易弃，少诈唬，有牌多下注拿价值。',
+  'vs_cbet:raise': '偏高：持续下注时少用纯空气，被加注时不一定是大牌，有牌可以继续。\n偏低：他加注时通常很强，弱牌弃。',
+  'donk:bet': '偏高：领先下注范围宽，可以用强牌或好听牌加注。\n偏低：难得领先下注，多半有牌或强听牌，弱牌谨慎。',
+  'barrel_turn:bet': '偏高：转牌常继续开火，中等牌可以多跟一条街。\n偏低：转牌再下注时牌较实，弱牌弃；他转牌过牌时可以下注。',
+  'barrel_river:bet': '偏高：河牌下注里可能有诈唬，抓诈唬的牌可以多跟。\n偏低：河牌下注多半是价值，只能抓诈唬的牌弃。',
+  'vs_bet_turn:fold': '偏高：翻牌下注后，转牌继续施压。\n偏低：转牌不容易弃，少诈唬，有牌继续拿价值。',
+  'vs_bet_river:fold': '偏高：河牌可以诈唬，薄价值下注要少。\n偏低：河牌不要诈唬，可以多做薄价值下注。',
+  'postflop_aggr:aggr': '偏高：翻后爱打，他下注不一定强，强牌可以过牌让他继续下。\n偏低：他翻后下注或加注多半是真牌，弱牌弃。',
+  'wtsd:yes': '偏高：容易跟到摊牌，少诈唬，有牌多拿价值。\n偏低：中途容易放弃，可以多施压。',
+  'wsd:won': '偏高：打到摊牌的牌通常够强，他坚持到底时要重视。\n偏低：跟得太松，有牌多下注让他付钱。',
+};
 const tipEl = document.createElement('div');
 tipEl.id = 'tip'; tipEl.setAttribute('role', 'tooltip'); tipEl.hidden = true;
 document.body.appendChild(tipEl);
@@ -338,7 +392,13 @@ function tipHtml(k) {
   if (d.formula) h += `<p class="f">${esc(d.formula).replace(/\n/g, '<br>')}</p>`;
   if (d.note) h += `<p class="n">${esc(d.note)}</p>`;
   if (st) h += `<p class="n">表中数值是后验均值 = (k + K·m) ÷ (n + K)，k / n 为该玩家的次数 / 机会；`
-    + `本平台对手群体均值 m = ${pct(st.prior)}%，先验强度 K = ${st.k == null ? '—' : st.k.toFixed(0)}（样本少的玩家会被拉向 m）。悬停单元格看 [5%, 95%] 区间和 n。</p>`;
+    + `本平台对手群体均值 m = ${pct(st.prior)}%，先验强度 K = ${st.k == null ? '—' : st.k.toFixed(0)}（样本少的玩家会被拉向 m）。括号里是（真实次数/机会次数），悬停单元格看 [5%, 95%] 区间。「当前牌局」表除外，那张是原始比例。</p>`;
+  if (st && st.t1 != null) h += `<p class="n">样本门槛：机会 ≥ ${st.t1} 次可参考，≥ ${st.t2} 次可靠`
+    + (st.fitted ? `（约等于 K 和 3K：这时他自己的数据分别占一半、四分之三）。</p>` : `（K 没估出来，先用默认值）。</p>`);
+  if (HOW[k]) {
+    h += `<p class="how"><b>可以怎么做</b><br>${esc(HOW[k]).replace(/\n/g, '<br>')}</p>`;
+    if (st) h += `<p class="n">这是打牌经验，不是求解结果。偏高偏低对比群体均值 ${pct(st.prior)}%；机会少于约 30 次先不调整，也不要只凭一个指标大改打法。</p>`;
+  }
   return h;
 }
 function showTip(el, k) {
@@ -379,19 +439,30 @@ function refreshSeated() {
   if (snap) renderPlayers();
 }
 
+// Rate column headers carry (K/m): prior strength and pool average. The session table uses raw rates,
+// so only m is shown there.
+function headStats(c, sc) {
+  if (!c.rate) return '';
+  const m = pct(c.prior) + '%';
+  if (sc === 'session') return ` <span class="ci" title="群体均值 m（这张表是原始比例，没有用 K）">(m ${m})</span>`;
+  const K = c.K == null ? '—' : c.K.toFixed(0);
+  return ` <span class="ci" title="先验强度 K / 群体均值 m">(${K}/${m})</span>`;
+}
+
 function renderPlayers() {
   buildRateCols();
   const cols = shownCols();
   seated = seatedNames(); seatedKey = [...seated].sort().join('\n');
-  const ps = snap.players.filter(p => !onlySeated || seated.has(p.name));
+  const all = snap.players.filter(p => !onlySeated || seated.has(p.name));
   for (const [sc, id] of SCOPES) {
+    const ps = sc === 'session' ? all.filter(p => p.session) : all;
     const head = $(id).tHead, body = $(id).tBodies[0];
-    head.innerHTML = '<tr>' + cols.map(c => `<th class="${c.l ? 'l' : ''}" data-k="${c.key}" ${DESC[c.key] ? `data-tip="${c.key}"` : ''}>${esc(c.label)}${sortKey === c.key ? (sortDir < 0 ? ' ↓' : ' ↑') : ''}</th>`).join('') + '</tr>';
+    head.innerHTML = '<tr>' + cols.map(c => `<th class="${c.l ? 'l' : ''}" data-k="${c.key}" ${DESC[c.key] ? `data-tip="${c.key}"` : ''}>${esc(c.label)}${headStats(c, sc)}${sortKey === c.key ? (sortDir < 0 ? ' ↓' : ' ↑') : ''}</th>`).join('') + '</tr>';
     const col = cols.find(c => c.key === sortKey) || BASE_COLS[0];
     const val = c => p => c.val(p, sc);
     const sorted = [...ps].sort((a, b) => { const x = val(col)(a), y = val(col)(b); return (x < y ? -1 : x > y ? 1 : 0) * sortDir; });
     body.innerHTML = sorted.map(p => `<tr data-n="${esc(p.name)}" class="${p.name === selected ? 'sel' : ''} ${p.hero ? 'hero' : ''}">` + cols.map(c => `<td class="num ${c.l ? 'l' : ''}">${c.cell(p, sc)}</td>`).join('') + '</tr>').join('')
-      || `<tr><td colspan="${cols.length}" class="empty">现在没有在桌的玩家</td></tr>`;
+      || `<tr><td colspan="${cols.length}" class="empty">${sc === 'session' && !onlySeated ? '这局还没有结算的手' : '现在没有在桌的玩家'}</td></tr>`;
   }
   const opp = snap.players.filter(p => !p.hero);
   $('n-players').textContent = onlySeated ? `${opp.filter(p => seated.has(p.name)).length} / ${opp.length} 个对手在桌` : `${opp.length} 个对手`;
@@ -419,11 +490,12 @@ function statBar(r, rr, prior, label, key, p) {
   // Whole-history posterior (band + mean); the player's last-N-hands mean as a second marker.
   const left = r.n ? 100 * r.lo : 0, width = r.n ? 100 * (r.hi - r.lo) : 0;
   const showRecent = p.recent.has_earlier && rr && rr.n;
+  const st = snap.stats.find(x => x.key === key);
   return `<div class="statbar"><span class="tip-label" data-tip="${esc(key)}">${esc(label)}</span><div class="track" title="群体 ${pct(prior)}%">
     ${r.n ? `<div class="band" style="left:${left}%;width:${Math.max(width, 0.5)}%"></div><div class="mean" style="left:${100 * r.mean}%"></div>` : ''}
     ${showRecent ? `<div class="rmean" style="left:${100 * rr.mean}%" title="最近 ${snap.cfg.recent_hands} 手 ${pct(rr.mean)}% [${pct(rr.lo)}, ${pct(rr.hi)}] n=${rr.n}"></div>` : ''}
     ${prior != null ? `<div class="prior" style="left:${100 * prior}%"></div>` : ''}</div>
-    <span class="num">${r.n ? `${pct(r.mean)}% <span class="ci">[${pct(r.lo)}, ${pct(r.hi)}] n=${r.n}</span>` : '<span class="muted">无机会</span>'}${showRecent ? ` <span class="rtxt">最近 ${pct(rr.mean)}%</span>` : ''}</span>${spark(p, key)}</div>`;
+    <span class="num">${r.n ? `<span class="tier${tierOf(st, r.n)}" title="${TIER_TIP[tierOf(st, r.n)]}">${pct(r.mean)}% <span class="ci">(${r.k}/${r.n}) [${pct(r.lo)}, ${pct(r.hi)}]</span></span>${p.hero ? '' : devMark(p, key)}` : '<span class="muted">无机会</span>'}${showRecent ? ` <span class="rtxt">最近 ${pct(rr.mean)}%</span>` : ''}</span>${spark(p, key)}</div>`;
 }
 
 function leakTable(leaks) {
@@ -477,12 +549,25 @@ function allinBlock(A) {
   return h;
 }
 
+function shownBlock(S) {
+  if (!S.n) return '<p class="muted">还没有亮过牌。</p>';
+  const hist = snap.platform === 'wopo';
+  return `<p class="legend">亮牌 ${S.n} 次，按他这手翻前的第一个决策分组。多数来自摊牌，偏向走得远的牌，不是完整范围；少数手服务器连弃牌的人也发了底牌，第一手是「弃牌」的就是这些`
+    + (snap.clean_showdown ? '' : '；本平台输家可能不亮牌') + '。</p><ul class="plain">'
+    + S.groups.map(g => `<li>${esc(g.label)}：${g.n} 次：<span class="cards">${g.combos.map(([c, k]) => esc(c) + (k > 1 ? '×' + k : '')).join('、')}</span></li>`).join('') + '</ul>'
+    + `<div class="scroll"><table class="changes"><thead><tr><th class="l">时间</th><th class="l">手牌</th><th class="l">第一手</th><th class="l">位置</th><th>到（大盲）</th><th>前面跟注</th>${hist ? '<th class="l"></th>' : ''}</tr></thead><tbody>`
+    + S.hands.map(a => `<tr><td class="l muted">${fmtTime(a.ts)}</td><td class="l cards"><b>${esc(a.combo)}</b> <span class="muted">${esc(a.cards.join(''))}</span></td>
+        <td class="l">${esc(a.label)}${a.all_in ? '（全下）' : ''}</td><td class="l">${esc(a.pos)}</td><td class="num">${a.to_bb == null ? '—' : a.to_bb}</td><td class="num">${a.callers || '—'}</td>
+        ${hist ? `<td class="l"><a href="/history#key=${encodeURIComponent(a.hand_id)}" target="_blank">回放</a></td>` : ''}</tr>`).join('') + '</tbody></table></div>';
+}
+
 function renderDetail() {
   const p = snap.players.find(x => x.name === selected);
   if (!p) { $('detail').innerHTML = '<div class="empty">选一个玩家</div>'; return; }
   const cfg = snap.cfg, N = cfg.recent_hands, R = p.recent;
   let h = `<h2>${esc(p.name)} ${p.hero ? '<span class="flag">（我方）</span>' : ''}</h2>
     <div class="meta"><span>共 ${p.hands} 手</span><span>最后出现 ${ago(p.last_ts)}</span></div>
+    ${p.session ? `<div class="meta"><span>当前牌局：${p.session.hands} 手，${esc(p.session.tag)}，盈亏 ${signed(p.session.net_bb)} 大盲</span></div>` : ''}
     <div class="meta"><span>全部历史：${esc(p.tag)}，盈亏 ${signed(p.net_bb)} 大盲（每百手 ${signed(p.bb100)}）</span>`
     + (R.has_earlier ? `<span>最近 ${N} 手（${fmtTime(R.since_ts)} 起）：${esc(R.tag)}，盈亏 ${signed(R.net_bb)} 大盲（每百手 ${signed(R.bb100)}）</span>` : `<span class="muted">不到 ${N} 手，最近 ${N} 手就是全部历史</span>`) + '</div>';
   if (!p.hero) {
@@ -496,6 +581,7 @@ function renderDetail() {
         p.deviations.map(d => `<li>${esc(d.label)}：${pct(d.k / d.n)}%（${d.k}/${d.n}），其他对手 ${pct(d.pool)}%，p=${d.p.toExponential(1)}</li>`).join('') + '</ul>';
     }
   }
+  h += `<h3>亮牌记录 · 全部历史</h3>` + shownBlock(p.shown_hands);
   h += `<h3>翻前全下的亮牌 · 全部历史</h3>` + allinBlock(p.pf_allin);
   const bt = Object.entries(p.by_table || {}).filter(([, [k, n]]) => n);
   if (bt.length > 1) h += '<h3>入池率按桌上人数 · 全部历史</h3><p class="num">' + bt.map(([tb, [k, n]]) => `${tb} 人 ${pct(k / n)}%（${n}）`).join('，') + '</p>';
@@ -535,6 +621,9 @@ function renderQuality() {
 
 function renderHeader() {
   $('scope-n').textContent = snap.cfg.recent_hands;
+  const S = snap.session;
+  $('pt-session').hidden = !(S && S.enabled);
+  if (S && S.enabled) $('session-note').textContent = `这一轮已结算 ${S.hands} 手（${S.runs.join('、')}）；这张表是原始比例，没有向牌池平均收缩，手数少时波动很大，悬停看次数`;
   $('platform').textContent = '· ' + snap.platform;
   $('histlink').hidden = snap.platform !== 'wopo';
   $('m-hands').textContent = `${snap.hands} 手`;

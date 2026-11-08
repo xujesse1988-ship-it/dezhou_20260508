@@ -181,6 +181,66 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(lv.md, render_markdown(res))
         self.assertEqual([h["hand_id"] for h in lv.snapshot["recent"]][:2], ["n4", "n3"])
 
+    def session_setup(self):
+        old = os.path.join(self.dir, "run0", "poker_manager_hh.jsonl")
+        os.makedirs(os.path.dirname(old))
+        self.append(old, [walk(f"o{i}", {0: "hero", 1: "v1", 2: "gone"}, iso(i)) for i in range(4)])
+        self.append(self.hh, [raise_cbet(f"n{i}", {0: "hero", 1: "v1", 2: "v2"}, iso(30 + i)) for i in range(3)])
+
+    def test_session_is_only_the_current_run(self):
+        self.session_setup()
+        lv = self.live(session_dirs=[os.path.dirname(self.hh)])
+        s = lv.snapshot
+        self.assertEqual((s["session"]["enabled"], s["session"]["hands"], s["session"]["runs"]), (True, 3, ["run"]))
+        by = {p["name"]: p for p in s["players"]}
+        self.assertNotIn("session", by["gone"])  # only in the older run
+        self.assertEqual((by["hero"]["hands"], by["hero"]["session"]["hands"]), (7, 3))
+        self.assertEqual(by["hero"]["session"]["net_bb"], 10.5)  # +70 chips a hand at BB 20
+        # Raw counts of this run only, not the posterior.
+        self.assertEqual(by["hero"]["session"]["rates"]["pfr:yes"], {"k": 3, "n": 3, "mean": 1.0})
+        self.assertEqual(by["v2"]["session"]["rates"]["vs_cbet:fold"], {"k": 3, "n": 3, "mean": 1.0})
+        self.assertEqual(by["v2"]["session"]["rates"]["vs_3bet:fold"], {"k": 0, "n": 0, "mean": None})
+
+    def test_session_survives_a_rebuild_and_restart(self):
+        self.session_setup()
+        dirs = [os.path.dirname(self.hh)]
+        lv = self.live(session_dirs=dirs)
+        older = os.path.join(self.dir, "run00", "poker_manager_hh.jsonl")
+        os.makedirs(os.path.dirname(older))
+        self.append(older, [walk("x0", {0: "hero", 1: "v1", 2: "gone"}, iso(10))])
+        self.assertEqual(lv.step(), 1)  # older than what is loaded: a time-ordered rebuild
+        lv.build()
+        self.assertEqual(lv.snapshot["session"]["hands"], 3)
+        lv.close()
+        lv2 = self.live(session_dirs=dirs)  # hands now come from the database
+        self.assertEqual(lv2.snapshot["session"]["hands"], 3)
+
+    def test_tier_thresholds(self):
+        from opponent_analysis.report import TIER_DEFAULT, tier_thresholds
+        from opponent_analysis.stats import K_MAX, K_MIN
+
+        self.assertEqual(tier_thresholds(10.97), (11, 33, True))  # K, 3K
+        self.assertEqual(tier_thresholds(65.72), (66, 197, True))
+        self.assertEqual(tier_thresholds(4.2), (10, 20, True))  # floor 10, and the second at least twice the first
+        self.assertEqual(tier_thresholds(K_MIN), (*TIER_DEFAULT, False))  # clamped: K was not estimated
+        self.assertEqual(tier_thresholds(K_MAX), (*TIER_DEFAULT, False))
+
+    def test_snapshot_carries_thresholds_and_deviation_keys(self):
+        self.session_setup()
+        s = self.live().snapshot
+        st = s["stats"][0]
+        self.assertEqual(set(st), {"key", "label", "prior", "k", "t1", "t2", "fitted"})
+        self.assertTrue(all(x["t1"] < x["t2"] for x in s["stats"]))
+        for p in s["players"]:
+            for d in p["deviations"]:
+                self.assertIn(d["key"], p["rates"])
+
+    def test_no_session_without_a_run(self):
+        self.session_setup()
+        s = self.live().snapshot
+        self.assertEqual(s["session"], {"enabled": False, "hands": 0, "runs": []})
+        self.assertFalse(any("session" in p for p in s["players"]))
+
 
 if __name__ == "__main__":
     unittest.main()

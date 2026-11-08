@@ -13,8 +13,9 @@ from . import exploit
 from .cards import RANKS, river_percentile
 from .model import Hand
 from .platforms import PLATFORMS
-from .spots import hand_observations, preflop_allins
-from .stats import BetaPrior, Posterior, benjamini_hochberg, fit_prior, posterior, two_prop_test, two_sided_p
+from .spots import FIRST_ACTIONS, hand_observations, preflop_allins, shown_hands
+from .stats import (K_MAX, K_MIN, BetaPrior, Posterior, benjamini_hochberg, fit_prior, posterior, two_prop_test,
+                    two_sided_p)
 
 # (stat, outcome of interest, label) used in the summary table and deviation tests.
 KEY_RATES = [
@@ -44,6 +45,24 @@ MIX_WARN = 0.15  # a table-size share moving by more than this is called out nex
 STREET_CN = {"preflop": "翻前", "flop": "翻牌", "turn": "转牌", "river": "河牌"}
 SUMMARY = ["vpip", "pfr", "vs_open:raise", "postflop_aggr", "wtsd", "wsd"]
 
+# How many opportunities a player's rate needs before the page treats it as usable / reliable.
+TIER_MIN = 10  # floor of the first threshold
+TIER_DEFAULT = (20, 50)  # when K could not be fitted (clamped to K_MIN or K_MAX)
+
+
+def tier_thresholds(k: float) -> tuple[int, int, bool]:
+    """(usable, reliable, fitted) opportunity thresholds for a stat whose prior strength is `k`.
+
+    At n = K the player's own data and the pool average weigh the same in the posterior, at 3K his
+    own data is three quarters of it. A K clamped to K_MIN / K_MAX was not estimated (too few players
+    with enough opportunities, or no spread beyond noise), so it says nothing about how many are
+    needed: fall back to TIER_DEFAULT.
+    """
+    if not K_MIN < k < K_MAX:
+        return TIER_DEFAULT[0], TIER_DEFAULT[1], False
+    t1 = max(round(k), TIER_MIN)
+    return t1, max(round(3 * k), 2 * t1), True
+
 
 @dataclass
 class Config:
@@ -70,6 +89,7 @@ class Player:
     hand_ts: list = field(default_factory=list)
     hand_net: list = field(default_factory=list)  # big blinds won in that hand
     allins: list = field(default_factory=list)  # spots.PreflopAllin, in hand order
+    shown_hands: list = field(default_factory=list)  # spots.ShownHand, in hand order
 
     def add(self, i: int, o) -> None:
         self.obs.append(o)
@@ -105,6 +125,18 @@ def recent_view(p: Player, w: int) -> tuple[Player, Optional[int]]:
     for i, o in p.order[bisect.bisect_left(p.order, cut, key=lambda t: t[0]):]:
         v.add(i, o)
     return v, cut
+
+
+def subset_view(p: Player, keep: set) -> Player:
+    """`p` restricted to the hands whose arrival index is in `keep`."""
+    at = [j for j, idx in enumerate(p.hand_idx) if idx in keep]
+    v = Player(p.name, hands=len(at), last_ts=p.hand_ts[at[-1]] if at else None, hand_idx=[p.hand_idx[j] for j in at],
+               hand_ts=[p.hand_ts[j] for j in at], hand_net=[p.hand_net[j] for j in at])
+    v.net_bb = sum(v.hand_net)
+    for i, o in p.order:
+        if i in keep:
+            v.add(i, o)
+    return v
 
 
 def trend(p: Player, bins: int = 24, min_bin: int = 250) -> dict:
@@ -196,8 +228,10 @@ class Accumulator:
     rule or the measured reveal rate does not support an unbiased sample.
     """
 
-    def __init__(self, platform: str, pct_fn=river_percentile, hero_names=()):
+    def __init__(self, platform: str, pct_fn=river_percentile, hero_names=(), session_fn=None):
         self.pct_fn = pct_fn  # same contract as cards.river_percentile; lets a caller cache it
+        self.session_fn = session_fn  # Hand -> bool: does it belong to the session being played
+        self.session_idx: set = set()
         self.platform = platform
         self.plat = PLATFORMS[platform]
         self.players: dict[str, Player] = {}
@@ -213,6 +247,8 @@ class Accumulator:
     def add(self, h: Hand) -> None:
         i = self.n
         self.n += 1
+        if self.session_fn is not None and self.session_fn(h):
+            self.session_idx.add(i)
         if h.ts is not None:
             self.last_ts = max(self.last_ts or h.ts, h.ts)
         hero = h.names.get(h.hero_seat)
@@ -241,6 +277,8 @@ class Accumulator:
             self.players[o.name].add(i, o)
         for nm, a in preflop_allins(h):
             self.players[nm].allins.append(a)
+        for nm, sh in shown_hands(h):
+            self.players[nm].shown_hands.append(sh)
 
     def finalize(self, rejected: list[dict], cfg: Config) -> dict:
         return _finalize(self, rejected, cfg)
@@ -316,6 +354,10 @@ def _finalize(acc: Accumulator, rejected: list[dict], cfg: Config) -> dict:
                    for name, (v, _) in recent.items()}
     recent_leaks = {name: _leaks(recent[name][0], priors, cfg, clean_showdown) for name in opponents}
 
+    # ---- the session being played: only players who were dealt into one of its hands
+    session = {name: subset_view(p, acc.session_idx) for name, p in players.items()
+               if acc.session_idx and any(i in acc.session_idx for i in p.hand_idx)}
+
     # ---- recent vs earlier, per opponent and stat; FDR across all of them
     ctests = []
     mix = {}
@@ -356,8 +398,8 @@ def _finalize(acc: Accumulator, rejected: list[dict], cfg: Config) -> dict:
         "hero_names": sorted(hero_names), "reveal": rv, "clean_showdown": clean_showdown, "forced": forced,
         "priors": priors, "players": players, "opponents": opponents, "rows": rows,
         "deviations": deviations, "n_tests": len(tests), "leaks": leaks, "by_table": by_table,
-        "recent": recent, "recent_rows": recent_rows, "recent_leaks": recent_leaks,
-        "changes": changes, "n_change_tests": len(ctests), "mix": mix, "cfg": cfg,
+        "recent": recent, "recent_rows": recent_rows, "recent_leaks": recent_leaks, "session": session,
+        "session_hands": len(acc.session_idx), "changes": changes, "n_change_tests": len(ctests), "mix": mix, "cfg": cfg,
     }
 
 
@@ -416,6 +458,17 @@ def allin_summary(p: Player) -> dict:
     shown = [a for a in reversed(p.allins) if a.combo]
     return {"n": len(p.allins), "jam": sum(a.action == "jam" for a in p.allins),
             "call": sum(a.action == "call" for a in p.allins), "n_shown": len(shown), "groups": rows, "shown": shown}
+
+
+def shown_summary(p: Player) -> dict:
+    """The hands a player showed, grouped by his first preflop decision, plus each hand (latest first)."""
+    groups = {}
+    for sh in p.shown_hands:
+        groups.setdefault(sh.first, Counter())[sh.combo] += 1
+    rows = [{"first": k, "label": label, "n": sum(groups[k].values()),
+             "combos": sorted(groups[k].items(), key=lambda kv: _combo_key(kv[0]))}
+            for k, label in FIRST_ACTIONS.items() if k in groups]
+    return {"n": len(p.shown_hands), "groups": rows, "hands": list(reversed(p.shown_hands))}
 
 
 def _combo_list(combos: list) -> str:
@@ -604,6 +657,12 @@ def allin_json(p: Player) -> dict:
                 shown=[asdict(a) for a in sm["shown"]])
 
 
+def shown_json(p: Player) -> dict:
+    sm = shown_summary(p)
+    return dict(sm, groups=[dict(g, combos=[list(c) for c in g["combos"]]) for g in sm["groups"]],
+                hands=[dict(asdict(s), label=FIRST_ACTIONS[s.first]) for s in sm["hands"]])
+
+
 def profile_json(res: dict) -> dict:
     def post(p: Posterior) -> dict:
         return {"k": p.k, "n": p.n, "mean": p.mean, "lo5": p.lo, "hi95": p.hi}
@@ -617,6 +676,7 @@ def profile_json(res: dict) -> dict:
             "leaks": [{k: (post(v) if isinstance(v, Posterior) else v) for k, v in x.items()}
                       for x in res["leaks"].get(name, [])],
             "preflop_allin": allin_json(p),
+            "shown_hands": shown_json(p),
         }
     out["priors"] = {f"{s}:{o}": {"mean": pr.mean, "k": pr.strength} for (s, o), pr in res["priors"].items()}
     return out

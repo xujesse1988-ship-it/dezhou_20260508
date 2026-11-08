@@ -64,6 +64,11 @@ def main(argv=None) -> int:
     lv.add_argument("--play-ranges", nargs="+", default=None,
                     help="advisor 的 --range-log 文件（路径或通配符）：行动指南显示对手每条街的牌力分布；"
                          "缺省 = 每个 --play-events 同目录的 wopo_ranges.jsonl（driver 的默认位置），off 关")
+    lv.add_argument("--history-run", nargs="+", default=None,
+                    help="wopo：/history 回放读的 run 目录或 hh 文件（可用通配符，加引号）；缺省 = --follow。"
+                         "只放进这里的牌不进画像")
+    lv.add_argument("--preflop", action="store_true",
+                    help="wopo：同时在 /preflop/ 提供 blueprint 翻前策略查看（加载约 30 秒、峰值约 1.6 GiB，实盘机别开）")
 
     hs = sub.add_parser("history", help="wopo 牌局回放：浏览器里逐步回放打完的手（读 hh 日志，有事件流时带上建议）")
     hs.add_argument("--run", nargs="+", required=True,
@@ -78,6 +83,8 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "live" and a.play_hands < 1:
         ap.error("--play-hands 须 ≥ 1")  # exits with status 2 and the usage line
+    if a.cmd == "live" and a.platform != "wopo" and (a.history_run or a.preflop):
+        ap.error("--history-run / --preflop 只有 --platform wopo 能用")
     a.alias_table = None
     if a.cmd in ("report", "live"):
         try:
@@ -107,6 +114,7 @@ def _run(a) -> int:
             ranges = a.play_ranges or default_range_patterns(a.play_events)
         serve(a.db, a.platform, a.follow, a.host, a.port, cfg, a.poll, a.refresh, a.hero,
               play_patterns=a.play_events, play_hands=a.play_hands, range_patterns=ranges,
+              history_patterns=a.history_run, preflop=a.preflop,
               aliases=a.alias_table)
         return 0
     if a.cmd == "ingest":

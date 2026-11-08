@@ -36,8 +36,9 @@ from . import db
 from .cards import river_percentile
 from .model import Hand
 from .platforms import detect_platform
-from .report import (KEY_RATES, LEAK_NAMES, MIX_WARN, Accumulator, Config, _tag, allin_json, profile_json, render_markdown,
-                     trend)
+from .preflop_proxy import PREFIX as PREFLOP_PREFIX
+from .report import (KEY_RATES, LEAK_NAMES, MIX_WARN, Accumulator, Config, _tag, allin_json, profile_json, render_markdown, shown_json,
+                     tier_thresholds, trend)
 from .stats import Posterior, posterior
 
 PAGE_PATH = os.path.join(os.path.dirname(__file__), "live.html")
@@ -144,8 +145,10 @@ class PctCache:
 
 class Live:
     def __init__(self, db_dir: str, platform: str, patterns: list[str], cfg: Config, refresh_s: float = 5.0,
-                 hero_names=(), aliases: Optional[Aliases] = None):
+                 hero_names=(), aliases: Optional[Aliases] = None, session_dirs: Optional[list[str]] = None):
         self.hero_extra = tuple(hero_names)
+        # Run directories of the session being played; None = no "current session" table.
+        self.session_dirs = {os.path.abspath(d) for d in session_dirs} if session_dirs else None
         # Several names of one person share one profile; the database keeps raw names.
         self.aliases = aliases if aliases is not None else Aliases()
         self.db_dir = db_dir
@@ -160,7 +163,7 @@ class Live:
         self.errors: deque = deque(maxlen=20)
         self.recent: deque = deque(maxlen=40)
         self.tables: dict[str, dict] = {}
-        self.acc = Accumulator(platform, self.pct, self.hero_extra)
+        self.acc = self._new_acc()
         self.started = time.time()
         self.version = 0
         self.snapshot: dict = {}
@@ -172,6 +175,12 @@ class Live:
         self.lock = threading.Lock()
 
     # -- hands -> accumulator
+
+    def _new_acc(self) -> Accumulator:
+        fn = None
+        if self.session_dirs:
+            fn = lambda h: os.path.dirname(os.path.abspath(h.source_file)) in self.session_dirs
+        return Accumulator(self.platform, self.pct, self.hero_extra, session_fn=fn)
 
     def _feed(self, h: Hand) -> None:
         h = self.aliases.hand(h)
@@ -187,7 +196,7 @@ class Live:
         self.recent.appendleft(_hand_line(h))
 
     def _rebuild(self) -> None:
-        self.acc = Accumulator(self.platform, self.pct, self.hero_extra)
+        self.acc = self._new_acc()
         self.tables.clear()
         self.recent.clear()
         for h in db.load_hands(self.db_dir, self.platform):
@@ -712,6 +721,19 @@ def _clean(v):
     return _num(v) if isinstance(v, float) else v
 
 
+def _session_json(v, priors: dict) -> dict:
+    """One player's numbers over the session. `mean` is the raw rate, not the posterior: over a few
+    dozen hands the posterior of most stats is just the pool average. The type tag still uses the
+    posterior, so that a handful of hands does not relabel a player."""
+    rows = {(s, o): posterior(*_kn(v, s, o), priors[(s, o)]) for s, o, _ in KEY_RATES}
+    rates = {}
+    for s, o, _ in KEY_RATES:
+        k, n = _kn(v, s, o)
+        rates[f"{s}:{o}"] = {"k": k, "n": n, "mean": round(k / n, 4) if n else None}
+    return {"hands": v.hands, "net_bb": round(v.net_bb, 1), "bb100": round(100 * v.net_bb / v.hands, 1) if v.hands else None,
+            "tag": _tag(rows), "rates": rates, "leaks": []}
+
+
 def snapshot_json(res: dict, live: Live) -> dict:
     cfg: Config = res["cfg"]
     priors = res["priors"]
@@ -732,7 +754,7 @@ def snapshot_json(res: dict, live: Live) -> dict:
             "last_ts": p.last_ts, "seated": p.name in seated, "tag": _tag(rows),
             "rates": {f"{s}:{o}": _post(rows[(s, o)]) for s, o, _ in KEY_RATES},
             "leaks": [{"name": LEAK_NAMES[x["kind"]], **_clean(x)} for x in res["leaks"].get(p.name, [])],
-            "deviations": [{"label": t[3], "k": t[4], "n": t[5], "pool": _num(t[6]), "p": t[7]}
+            "deviations": [{"key": f"{t[1]}:{t[2]}", "label": t[3], "k": t[4], "n": t[5], "pool": _num(t[6]), "p": t[7]}
                            for t in sorted(res["deviations"].get(p.name, []), key=lambda t: t[-1])],
             "by_table": {tb: list(kn) for tb, kn in res["by_table"].get(p.name, {}).items()},
             "recent": {
@@ -746,11 +768,15 @@ def snapshot_json(res: dict, live: Live) -> dict:
             "mix": _clean(res["mix"].get(p.name)),
             "trend": trend(p),
             "pf_allin": _clean(allin_json(p)),
+            "shown_hands": _clean(shown_json(p)),
+            **({"session": _session_json(res["session"][p.name], priors)} if p.name in res["session"] else {}),
         })
     rv = res["reveal"]
     return {
         "platform": res["platform"], "hands": res["hands"], "last_ts": res.get("last_ts"),
         "built_at": time.time(), "started_at": live.started,
+        "session": {"enabled": bool(live.session_dirs), "hands": res["session_hands"],
+                    "runs": sorted(os.path.basename(d) for d in live.session_dirs or ())},
         "rejected": dict(res["rejected"]), "hero_names": res["hero_names"],
         # raw name -> profile name, for names the page shows raw (action guide events).
         "aliases": dict(sorted(live.aliases.seen.items())),
@@ -759,7 +785,8 @@ def snapshot_json(res: dict, live: Live) -> dict:
         "cfg": {"min_hands": cfg.min_hands, "min_opps": cfg.min_opps, "bluff_pct": cfg.bluff_pct, "fdr_q": cfg.fdr_q,
                 "recent_hands": cfg.recent_hands, "recent_min_opps": cfg.recent_min_opps, "mix_warn": MIX_WARN},
         "n_change_tests": res["n_change_tests"],
-        "stats": [{"key": f"{s}:{o}", "label": lb, "prior": _num(priors[(s, o)].mean), "k": _num(priors[(s, o)].strength)}
+        "stats": [dict(zip(("t1", "t2", "fitted"), tier_thresholds(priors[(s, o)].strength)),
+                       key=f"{s}:{o}", label=lb, prior=_num(priors[(s, o)].mean), k=_num(priors[(s, o)].strength))
                   for s, o, lb in KEY_RATES],
         "players": players,
         "tables": [dict(t, seats=[dict(x, hero=x["name"] in res["hero_names"]) for x in t["seats"]])
@@ -799,7 +826,8 @@ def _float(s: str) -> Optional[float]:
         return None
 
 
-def make_handler(live: Live, play: Optional[PlayFeed] = None, hist=None):
+def make_handler(live: Live, play: Optional[PlayFeed] = None, hist=None, preflop=None):
+    """`preflop`: a PreflopBackend to serve under /preflop/, or None."""
     class H(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # quiet: the page polls every few seconds
             pass
@@ -844,9 +872,17 @@ def make_handler(live: Live, play: Optional[PlayFeed] = None, hist=None):
                 self._send(200, md.encode(), "text/markdown; charset=utf-8")
             elif u.path == "/profile.json":
                 self._send(200, json.dumps(prof, ensure_ascii=False, indent=1).encode(), "application/json; charset=utf-8")
+            elif preflop is not None and u.path == PREFLOP_PREFIX:
+                # The viewer page requests its API relative to its own URL, so it needs the slash.
+                self.send_response(302)
+                self.send_header("Location", PREFLOP_PREFIX + "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
             else:
                 from .history import handle as history_handle  # history imports live: import here
-                r = history_handle(hist, u.path, u.query, live=True) if hist is not None else None
+                r = preflop.handle(u.path, u.query) if preflop is not None else None
+                if r is None and hist is not None:
+                    r = history_handle(hist, u.path, u.query, live=True, preflop=preflop is not None)
                 if r is not None:
                     self._send(*r)
                 else:
@@ -858,18 +894,31 @@ def make_handler(live: Live, play: Optional[PlayFeed] = None, hist=None):
 def serve(db_dir: str, platform: str, patterns: list[str], host: str, port: int, cfg: Config,
           poll_s: float = 2.0, refresh_s: float = 5.0, hero_names=(), play_patterns=None,
           play_hands: int = 20, play_poll_s: float = 0.5, range_patterns=None,
-          aliases: Optional[Aliases] = None) -> None:
-    live = Live(db_dir, platform, patterns, cfg, refresh_s, hero_names, aliases)
+          aliases: Optional[Aliases] = None, history_patterns: Optional[list[str]] = None,
+          preflop: bool = False) -> None:
+    """`history_patterns`: what /history replays, default the followed hh files. Replay-only hands (a
+    manually reconstructed one, say) go there so they stay out of the profiles.
+    `preflop`: also serve /preflop/ (see preflop_proxy: about 1.6 GiB while loading, so off on live machines)."""
+    # "Current session" = the run directories the action guide follows; without a guide there is none.
+    session_dirs = sorted({os.path.dirname(os.path.abspath(m)) for p in play_patterns or () for m in (glob.glob(p) or [p])})
+    live = Live(db_dir, platform, patterns, cfg, refresh_s, hero_names, aliases, session_dirs=session_dirs)
     play = PlayFeed(play_patterns, play_hands, range_patterns=range_patterns) if play_patterns else None
     hist = None
     if platform == "wopo":
         from .history import History
 
-        # Hand replay (/history) over the same hh files; reloaded on request when they change.
-        hist = History(patterns)
+        # Hand replay (/history); reloaded on request when the hh files change.
+        hist = History(history_patterns or patterns)
+    backend = None
+    if preflop:
+        from .preflop_proxy import PreflopBackend, viewer_command
+
+        backend = PreflopBackend(viewer_command())
     # Bind first: a busy port fails at once, and the page shows "loading" during bootstrap.
-    httpd = ThreadingHTTPServer((host, port), make_handler(live, play, hist))
+    httpd = ThreadingHTTPServer((host, port), make_handler(live, play, hist, backend))
     print(f"serving http://{host}:{port}/", flush=True)
+    if backend is not None:
+        print(f"翻前策略 http://{host}:{port}{PREFLOP_PREFIX}/（加载约 30 秒）", flush=True)
     stop = threading.Event()
     failed = []
     if play is not None:
@@ -900,5 +949,7 @@ def serve(db_dir: str, platform: str, patterns: list[str], host: str, port: int,
         stop.set()
         httpd.server_close()
         live.close()
+        if backend is not None:
+            backend.close()
     if failed:
         raise SystemExit("bootstrap failed")

@@ -4,8 +4,8 @@ One address and one start command for both pages; the viewer stays a separate pr
 reuses the Rust tree building and crop checks. It binds a free loopback port it reports on stderr,
 and exits when its stdin closes, so it goes away with this process even after a SIGKILL.
 
-Loading takes about 30 s and briefly about 1.6 GiB, hence opt-in (`history --preflop`) and never on
-the `live` server. The replay pages keep working while it loads and if it fails.
+Loading takes about 30 s and briefly about 1.6 GiB, hence opt-in (`history --preflop`, `live --preflop`)
+and off on live machines. The other pages keep working while it loads and if it fails.
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ class PreflopBackend:
         page = (f'<!doctype html><meta charset="utf-8"><title>翻前策略</title>{refresh}'
                 f'<meta name="color-scheme" content="light dark">'
                 f'<body style="font:15px/1.6 system-ui,sans-serif;margin:40px">'
-                f'<p>{html.escape(message)}</p><p><a href="/">← 牌局回放</a></p>')
+                f'<p>{html.escape(message)}</p><p><a href="/history">← 牌局回放</a></p>')
         return status, page.encode(), HTML_TYPE
 
     def handle(self, path: str, query: str):

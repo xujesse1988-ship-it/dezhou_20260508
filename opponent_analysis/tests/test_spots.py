@@ -2,7 +2,7 @@ import unittest
 
 from opponent_analysis.adapters import poker_manager_raw
 from opponent_analysis.replay import replay
-from opponent_analysis.spots import hand_observations, preflop_allins
+from opponent_analysis.spots import first_action, hand_observations, preflop_allins, shown_hands
 from opponent_analysis.tests.helpers import pm_record
 
 
@@ -125,6 +125,44 @@ class Postflop(unittest.TestCase):
         rec["result"]["actions"][0]["reason"] = "timeout"
         got, _ = obs(rec)
         self.assertFalse([1 for n, _, _ in got if n == "p0"])
+
+
+class ShownHands(unittest.TestCase):
+    def test_first_action_labels(self):
+        for (kind, raises, callers), want in {
+            ("raise", 0, 0): "open", ("raise", 0, 2): "iso", ("call", 0, 0): "limp", ("call", 0, 3): "limp",
+            ("check", 0, 2): "check", ("call", 1, 0): "call", ("call", 1, 2): "call", ("raise", 1, 0): "3bet",
+            ("raise", 1, 2): "3bet", ("call", 2, 0): "call_3bet", ("raise", 2, 0): "4bet", ("call", 3, 0): "call_4bet",
+            ("call", 5, 0): "call_4bet", ("raise", 3, 0): "5bet", ("fold", 1, 0): "fold",
+        }.items():
+            self.assertEqual(first_action(kind, raises, callers), want, (kind, raises, callers))
+
+    def _hand(self):
+        # 4 seats, button 0, blinds 10/20: seat 3 limps, the button raises over it, the BB jams, the button calls.
+        acts = [(3, "call", 20), (0, "raise", 80), (1, "fold", None), (2, "all_in", 280), (3, "fold", None), (0, "call", 220)]
+        rec = pm_record("h1", 0, [0, 1, 2, 3], {s: 300 for s in range(4)}, acts, {0: 0, 1: 290, 2: 630, 3: 280},
+                        board=["2c", "3d", "4h", "8s", "9c"], shown={0: ["Ac", "Kc"], 2: ["Qh", "Qd"]}, hero=1)
+        return replay(poker_manager_raw(rec, "test"), heads_up_button_is_sb=False)
+
+    def test_first_decision_of_each_shown_seat(self):
+        got = dict(shown_hands(self._hand()))
+        self.assertEqual(set(got), {"p0", "p2"})  # seats that did not show are not listed
+        a, b = got["p0"], got["p2"]
+        self.assertEqual((a.combo, a.first, a.pos, a.to_bb, a.all_in, a.callers), ("AKs", "iso", "BTN", 4.0, False, 1))
+        self.assertEqual((b.combo, b.first, b.pos, b.to_bb, b.all_in, b.callers), ("QQ", "3bet", "BB", 15.0, True, 0))
+
+    def test_summary_groups_by_first_action(self):
+        from opponent_analysis.report import Accumulator, shown_json, shown_summary
+
+        acc = Accumulator("poker_manager", pct_fn=lambda hole, board: 0.5)
+        acc.add(self._hand())
+        sm = shown_summary(acc.players["p2"])
+        self.assertEqual((sm["n"], [(g["first"], g["label"], g["n"], g["combos"]) for g in sm["groups"]]),
+                         (1, [("3bet", "3bet", 1, [("QQ", 1)])]))
+        self.assertEqual(shown_summary(acc.players["p1"]), {"n": 0, "groups": [], "hands": []})
+        js = shown_json(acc.players["p0"])
+        self.assertEqual((js["groups"][0]["combos"], js["hands"][0]["label"], js["hands"][0]["cards"]),
+                         ([["AKs", 1]], "隔离加注", ["Ac", "Kc"]))
 
 
 if __name__ == "__main__":

@@ -30,6 +30,10 @@ python3 -m opponent_analysis live --db artifacts/opponent_db --platform wopo \
 # wopo 牌局回放：浏览器打开 http://127.0.0.1:8781/（见「牌局回放」一节）
 python3 -m opponent_analysis history --run 'artifacts/wopo*/' [--port 8781] [--preflop]
 
+# 本地看历史：画像、回放、翻前策略合在一个地址。/ 画像，/history 回放，/preflop/ 翻前策略
+python3 -m opponent_analysis live --db artifacts/opponent_db_20261031 --platform wopo --hero hero --port 8781 \
+    --follow 'artifacts/wopo_ante200_*_live_2026*/wopo_hh.jsonl' --history-run 'artifacts/wopo*/' --preflop
+
 # 测试
 python3 -m unittest discover -s opponent_analysis/tests -t .
 ```
@@ -183,11 +187,12 @@ street, pot, turns, dead, result, hero_net, status（playing / done / dead / err
   逐步播放，动作记录点一行跳到那一步，下面是结算表（开局、投入、分得、结束、输赢）。对手亮牌默认到结算才翻开，
   页头可以选提前亮出。金额可切换筹码 / BB（每手按自己的大盲）。键盘 ←/→ 单步，空格播放，↑/↓ 换手。
   地址带 `#key=<hand_id>&step=<n>`，可以直接发链接定位到某一手的某一步。
-- `live --platform wopo` 也挂了同一个页面：`/history`，读的就是 `--follow` 的 hh 文件，打完一手刷新列表就能看到；
-  画像页页头有「牌局回放」链接，行动指南里已结算的手有「回放」链接。
+- `live --platform wopo` 也挂了同一个页面：`/history`，默认读 `--follow` 的 hh 文件，打完一手刷新列表就能看到；
+  画像页页头有「牌局回放」链接，行动指南里已结算的手有「回放」链接。`--history-run` 可另外指定回放读哪些，
+  只放进这里、不在 `--follow` 里的牌（比如人工补录的 `artifacts/wopo_manual_*`）能回放，但不进画像。
 - `--preflop`：同一个地址下多一个 `/preflop/`，看 8 座 ante 两个 blueprint 的翻前策略（页头互相有链接）。由回放服务拉起
   `target/release/preflop_viewer`（先 `cargo build --release --bin preflop_viewer`），加载约 30 秒、峰值约 1.6 GiB，
-  加载期间和加载失败时回放页不受影响；进程随回放服务退出。`live` 没有这个功能，实盘机不会多占内存。
+  加载期间和加载失败时回放页不受影响；进程随回放服务退出。`live --preflop` 同样可用，默认关，实盘机不要开，免得多占内存。
 - 接口：`/api/history/hands`（列表）、`/api/history/hand?key=<key>`（一手的全部步骤）。同一个 hand_id 出现在多个 run 里时，
   后面的 key 是 `<hand_id>@<run 目录名>`。
 
@@ -199,6 +204,12 @@ street, pot, turns, dead, result, hero_net, status（playing / done / dead / err
 `profile.json` 的 `preflop_allin` 都有，页面玩家表另有「翻前全下 亮/总」一列。没人跟的推全下不会亮牌，
 所以手牌样本偏向被跟注的那些。wopo 的 `hand_result.shown_cards` 实测包含摊牌时所有在牌里的对手
 （2026-10-28 两轮 114/114），但不含我方自己的牌。
+
+玩家表和详情里每个比例按机会数 n 分三档：n < 门槛 1 灰色（机会不足，按群体均值看），到门槛 1 正常（可参考），到门槛 2 加粗（可靠）。门槛 1 = max(K, 10)，门槛 2 = max(3K, 2 × 门槛 1)：n = K 时他自己的数据和群体均值各占一半，3K 时占四分之三；K 被夹到上下限（没估出来）时用 20 / 50（`report.tier_thresholds`）。▲ / ▼ = 全部历史里明确高于 / 低于其他对手：机会 ≥ 10 次的格子做精确二项检验，所有玩家所有指标一起做 Benjamini–Hochberg（错误发现率 10%），与详情「与其他对手显著不同」同一份结果；灰色格子也可能带 ▲▼（样本少但偏得很明显）。
+
+开了 `--play-events` 时，玩家区最上面多一张「当前牌局」表：只算事件文件所在 run 目录的手（换盲注新开一轮就重新计，页面服务重启不清零），数值是原始比例，不向牌池平均收缩，手数少时波动很大。没开行动指南（比如本地只看历史）就没有这张表。表头悬停的说明里有「可以怎么做」，是打牌经验，不是求解结果。
+
+玩家详情另有「亮牌记录」：他亮过的每手牌（169 类和具体牌）、这手翻前的第一个决策（开池 / 隔离加注 = 前面有平跟时加注 / limp，含小盲补齐 / 过牌 / 跟注 / 3bet / 跟 3bet / 4bet / 跟 4bet 以上 / 5bet 以上）、位置、加注或跟注到多少大盲、前面跟注人数，wopo 带回放链接，并按第一手动作分组汇总。`profile.json` 的 `shown_hands` 也有。多数来自摊牌，偏向走得远的牌，不是完整范围；部分手 `hand_result.shown_cards` 连弃牌的人也列出，第一手就是「弃牌」（2026-11-07 实测 1237 手里 118 个座位）。我方自己的牌不算亮牌。
 
 ## 流水线
 

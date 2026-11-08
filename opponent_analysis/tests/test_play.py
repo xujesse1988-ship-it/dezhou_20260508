@@ -8,6 +8,7 @@ import tempfile
 import threading
 import types
 import unittest
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 
@@ -489,6 +490,29 @@ class PlayHttpTest(unittest.TestCase):
     def test_api_play_disabled(self):
         base = self.serve(None)
         self.assertEqual(json.loads(self.get(base + "/api/play")[2]), {"enabled": False})
+
+    def test_preflop_backend_mounted(self):
+        class Backend:
+            def handle(self, path, query):
+                return (200, f"viewer {path} {query}".encode(), "text/plain") if path.startswith("/preflop/") else None
+
+        live = types.SimpleNamespace(lock=threading.Lock(), snapshot={}, md="", profile={})
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(live, None, None, Backend()))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        self.assertEqual(self.get(base + "/preflop/api/meta?x=1")[2], b"viewer /preflop/api/meta x=1")
+        self.assertEqual(self.get(base + "/preflop")[2], b"viewer /preflop/ ")  # redirected to the slash
+        with self.assertRaises(urllib.error.HTTPError) as e:  # anything else still falls through to 404
+            self.get(base + "/nope")
+        self.assertEqual(e.exception.code, 404)
+
+    def test_no_preflop_backend_is_404(self):
+        base = self.serve(None)
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            self.get(base + "/preflop/")
+        self.assertEqual(e.exception.code, 404)
 
 
 if __name__ == "__main__":

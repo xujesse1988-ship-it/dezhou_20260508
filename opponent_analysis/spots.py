@@ -249,6 +249,65 @@ def preflop_allins(h: Hand) -> list[tuple[str, PreflopAllin]]:
     return out
 
 
+# First preflop decision of a player, in the order the page lists them.
+FIRST_ACTIONS = {
+    "open": "开池", "iso": "隔离加注", "limp": "limp", "check": "过牌", "call": "跟注", "3bet": "3bet",
+    "call_3bet": "跟 3bet", "4bet": "4bet", "call_4bet": "跟 4bet 以上", "5bet": "5bet 以上", "fold": "弃牌", "none": "翻前没有决策",
+}
+
+
+def first_action(kind: str, raises_before: int, prior_callers: int) -> str:
+    """FIRST_ACTIONS key of a first preflop decision. A raise over limpers is "iso", not "open"
+    (on wopo those run much larger); the small blind completing counts as a limp."""
+    if kind == "fold":
+        return "fold"
+    if kind == "check":
+        return "check"
+    if raises_before == 0:
+        if kind == "raise":
+            return "iso" if prior_callers else "open"
+        return "limp"
+    if kind == "raise":
+        return "3bet" if raises_before == 1 else ("4bet" if raises_before == 2 else "5bet")
+    return "call" if raises_before == 1 else ("call_3bet" if raises_before == 2 else "call_4bet")
+
+
+@dataclass
+class ShownHand:
+    """One hand a player showed, with what he did first preflop. Most come from showdowns, so the
+    sample leans toward hands that went far and is not his whole range; on some wopo hands
+    `hand_result.shown_cards` also lists seats that folded, which is where first == "fold" comes from."""
+
+    hand_id: str
+    ts: Optional[float]
+    cards: list[str]
+    combo: str
+    first: str  # FIRST_ACTIONS key
+    pos: str
+    to_bb: Optional[float]  # total bet after that decision, in big blinds; None for check / fold / none
+    all_in: bool
+    callers: int  # calls since the last raise (unopened pot: limpers)
+
+
+def shown_hands(h: Hand) -> list[tuple[str, ShownHand]]:
+    """(player name, shown hand) for every seat that showed cards in this hand."""
+    out = []
+    for s, cards in h.shown.items():
+        nm = h.names.get(s)
+        if not nm or not cards:
+            continue
+        d = next((d for d in h.decisions if d.street == "preflop" and d.seat == s and not d.forced), None)
+        if d is None:  # e.g. all-in from the blind, nothing left to decide
+            first, to_bb, all_in, callers = "none", None, False, 0
+        else:
+            first = first_action(d.kind, d.raises_before, d.prior_callers)
+            to_bb = round(d.to_total / h.bb, 1) if d.kind in ("raise", "call") else None
+            all_in, callers = d.all_in, d.prior_callers
+        out.append((nm, ShownHand(hand_id=h.hand_id, ts=h.ts, cards=list(cards), combo=hand_class(cards), first=first,
+                                  pos=h.positions.get(s, "?"), to_bb=to_bb, all_in=all_in, callers=callers)))
+    return out
+
+
 def stacks_before(h: Hand) -> dict[int, int]:
     """Decision idx -> the acting seat's stack just before it (blinds posted as replay posts them)."""
     left = dict(h.start_stacks)
