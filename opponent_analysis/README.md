@@ -128,7 +128,7 @@ setsid nohup python3 -m opponent_analysis live --db artifacts/opponent_db_ante10
 | `action` | 对手动作 | `seat`、`name`、`street`、`turn`（这个动作之前已有的动作数）、`action`（fold / check / call / raise / all_in，按投入归类）、`to`（raise / all_in 的本街总额，其余 null）、`delta`（本次投入）、`to_call_before`（0 时 raise 在 play.log 写成 bet）、`stack_before`、`stack_after`、`pot_after` |
 | `hero_action` | hero 实际动作（`← hero 实际行动 …`） | 同 `action`，另有 `advice`（这个决策点写进行动文件的建议 `{action, amount, text}`，没有 = null）、`match`（`same` / `diff`；没有建议 = null）。raise 和 all_in 互相算一致 |
 | `board` | `翻牌 / 转牌 / 河牌 …` | `street`、`cards`（本街新发的牌）、`board`（到本街为止的全部公共牌）、`pot` |
-| `hero_turn` | `>> 轮到 hero …` | `turn`（决策点编号，和后面的 `decision` / `hero_action` 对应）、`street`、`pot`、`to_call`、`valid`（`can_check` / `can_call` / `can_raise` / `min_raise` / `max_raise`，本街总额）、`hole`、`board`、`table_seq` |
+| `hero_turn` | `>> 轮到 hero …` | `turn`（决策点编号，和后面的 `decision` / `hero_action` 对应）、`street`、`pot`、`to_call`、`valid`（`can_check` / `can_call` / `can_raise` / `min_raise` / `max_raise`，本街总额）、`hole`、`board`、`table_seq`、`equity`（hero 对 `equity_opps` 家没弃牌对手各一手随机牌的胜率，0..1，平分按份额；对手为 0 时 `null`）、`equity_opps` |
 | `decision` | `>> 决策 …` | `turn`、`street`、`pot`、`to_call`、`valid`、`action`、`amount`（raise 的本街总额）、`all_in`（all_in，或 raise 到最大额）、`advice`（play.log 里的建议文字）、`probs`（`[[动作, 概率]]`，兜底动作为 null）、`chosen`、`source`、`decide_ms`、`stale`（过期原因全文；null = 已写进行动文件）、`stale_kind`（`hero_acted` / `hand_over` / `hand_dead`）、`written`、`rejected`（advisor 原建议不合法被换成安全动作时的原回复） |
 | `dead` | `本手作废：…` | `reason`、`tag`（冒号前的类别）。开局消息本身不合法时只有这一条，没有 `hand_start` |
 | `shown` | `亮牌 …`（紧挨在 `结算` 前，只有对手亮了牌才有） | `seats`：亮牌的对手 `{seat, name, cards, folded}`，按座位排序（已弃牌的座也可能有亮牌，同样是真实信息：`folded` = true，play.log 标「(已弃)」）；不含 hero（底牌见 `hole`），取自 `hand_result` 的 `shown_cards` |

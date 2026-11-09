@@ -17,11 +17,17 @@ import time
 
 from poker_live.aliases import NameAliases
 from poker_live.decision import make_request, safe_response, tally_source
+from poker_live.equity import equity
 from poker_live.table import HandEngine, HandInvalid
 
 # 已知消息类型；其余类型首见时打 stderr、忽略（不作废当前手）。
 _KNOWN_TYPES = ("hand_start", "hole_cards", "table_state", "player_action",
                 "community_cards", "hand_result")
+
+
+def fmt_equity(eq, opps):
+    """play log 里的胜率文字：「胜率 42%（对 3 家随机牌）」。"""
+    return f"胜率 {eq * 100:.0f}%（对 {opps} 家随机牌）"
 
 
 _STREET_CN = {"preflop": "翻前", "flop": "翻牌", "turn": "转牌", "river": "河牌"}
@@ -598,10 +604,20 @@ class WopoSession:
                "chip_div": div, "chip_prior": prior}
         self._dbg(f"your_turn street={hand.street} hole={''.join(hand.hole)} "
                   f"board={' '.join(hand.board)} valid={valid}")
-        self._play(f">> 轮到 hero（{_STREET_CN[hand.street]}，底池 {hand.pot}，跟 {ctx['to_call']}）",
+        # 胜率：对没弃牌的对手（含已全下）各一手随机牌；种子 = 手号 + 行动点，同一局面重放结果一样。
+        # 只给人看：算不出来（牌面数据异常）就不写，不能影响这手的决策。
+        opps = len([s for s in hand._in_pot() if s != hand.hero])
+        try:
+            eq = equity(hand.hole, hand.board, opps, seed=f"{key[0]}:{key[1]}")
+        except (ValueError, IndexError) as e:
+            print(f"  [equity] 胜率算不出来，跳过：{e!r}", file=sys.stderr)
+            eq = None
+        self._play(f">> 轮到 hero（{_STREET_CN[hand.street]}，底池 {hand.pot}，跟 {ctx['to_call']}"
+                   + (f"，{fmt_equity(eq, opps)}" if eq is not None else "") + "）",
                    "hero_turn", turn=key[1], street=hand.street, pot=hand.pot,
                    to_call=ctx["to_call"], valid=dict(valid), hole=list(hand.hole),
-                   board=list(hand.board), table_seq=msg.get("table_seq"))
+                   board=list(hand.board), table_seq=msg.get("table_seq"),
+                   equity=None if eq is None else round(eq, 4), equity_opps=opps)
         self.worker.submit_decide(req, lambda resp, ms: self._on_decided(req, ctx, resp, ms))
 
     def _on_decided(self, req, ctx, resp, ms):

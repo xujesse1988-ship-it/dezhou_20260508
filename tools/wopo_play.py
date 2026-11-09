@@ -75,7 +75,7 @@ from poker_live.aliases import DEFAULT_PATH as DEFAULT_ALIASES, AliasError, Name
 from poker_live.decision import DecisionWorker
 from poker_live.table import HandEngine, HandInvalid, observe_from_hh
 from poker_live.wopo import (_STALE_CN, _STREET_CN, ActionFile, WopoSession, _fmt_act, advice_matches,
-                             fmt_probs, fmt_shown, legalize, shown_opponents)
+                             fmt_equity, fmt_probs, fmt_shown, legalize, shown_opponents)
 from poker_live.wslog import WsLog
 
 HERO_SEAT = 0
@@ -357,6 +357,8 @@ def _selftest_full_replay():
            "play log 行数不对:\n" + play.getvalue())
     _check(all(ln.endswith(f"=(100)  建议 {ln.rsplit('建议 ', 1)[1]}") for ln in lines
                if ln.startswith(">> 决策")), "play log 决策行应带策略分布（stub 给 100%）")
+    _check(all(re.search(r"，胜率 \d+%（对 [1-9] 家随机牌））$", ln) for ln in lines
+               if ln.startswith(">> 轮到 hero")), "play log 轮到 hero 行应带胜率")
     _check(fmt_probs([["fold", 0.0184], ["call", 0.9151], ["raise1pot", 0.0665], ["allin", 0.0]])
            == "(fold,call,1pot,allin)=(2,92,7,0)"
            and fmt_probs([["check", 0.4428], ["bet0.5pot", 0.5566], ["bet1pot", 0.0002]])
@@ -1016,7 +1018,8 @@ EVENT_KEYS = {
     "board": {"street", "cards", "board", "pot"},
     "action": _ACTION_KEYS,
     "hero_action": _ACTION_KEYS | {"advice", "match"},
-    "hero_turn": {"turn", "street", "pot", "to_call", "valid", "hole", "board", "table_seq"},
+    "hero_turn": {"turn", "street", "pot", "to_call", "valid", "hole", "board", "table_seq",
+                  "equity", "equity_opps"},
     "decision": {"turn", "street", "pot", "to_call", "valid", "action", "amount", "all_in", "advice",
                  "probs", "chosen", "source", "decide_ms", "stale", "stale_kind", "written",
                  "rejected"},
@@ -1059,7 +1062,9 @@ def _render_event(e):
         return (f"{line}  ← hero 实际行动（{'同' if e['match'] == 'same' else '不同于'}建议 "
                 f"{e['advice']['text']}）")
     if t == "hero_turn":
-        return f">> 轮到 hero（{_STREET_CN[e['street']]}，底池 {e['pot']}，跟 {e['to_call']}）"
+        return (f">> 轮到 hero（{_STREET_CN[e['street']]}，底池 {e['pot']}，跟 {e['to_call']}"
+                + (f"，{fmt_equity(e['equity'], e['equity_opps'])}" if e["equity"] is not None else "")
+                + "）")
     if t == "decision":
         advice = _fmt_act(e["action"], e["amount"], e["to_call"], e["to_call"])
         if e["action"] == "raise" and e["amount"] == e["valid"].get("max_raise"):
@@ -1365,6 +1370,36 @@ def _selftest_aliases():
           "暖启动同规则；坏别名表报错", file=sys.stderr)
 
 
+def _selftest_equity():
+    """胜率：7 张牌评估和 opponent_analysis.cards.best_rank 排序一致；常见起手牌胜率对得上公开值；
+    坚果 = 100%；同一种子结果相同。"""
+    import random
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from opponent_analysis.cards import best_rank
+    from poker_live.equity import RANKS, SUITS, card_index, equity, score7
+    deck = [r + s for r in RANKS for s in SUITS]
+    rng = random.Random(7)
+    for _ in range(3000):
+        a = rng.sample(deck, 7)
+        b = rng.sample([c for c in deck if c not in a[2:]], 2) + a[2:]
+        sa, sb = (score7([card_index(c) for c in x]) for x in (a, b))
+        ra, rb = best_rank(a), best_rank(b)
+        _check((sa > sb) == (ra > rb) and (sa == sb) == (ra == rb), f"牌力排序不一致 {a} / {b}")
+    # 公开值（对 1 家随机牌）：AA 85.2%、72o 34.6%、AKs 67.0%；AA 对 4 家 55.9%。3000 次抽样误差 < 1%。
+    for hole, k, want in ((["Ah", "As"], 1, 0.852), (["7c", "2d"], 1, 0.346),
+                          (["Ah", "Kh"], 1, 0.670), (["Ah", "As"], 4, 0.559)):
+        got = equity(hole, [], k, seed="t")
+        _check(abs(got - want) < 0.025, f"{hole} 对 {k} 家胜率 {got:.3f}，公开值 {want}")
+    _check(equity(["Ah", "Kh"], ["Qh", "Jh", "Th", "2c", "3d"], 3, seed="t") == 1.0, "皇家同花顺应 100%")
+    _check(abs(equity(["2c", "3d"], ["Ah", "Kh", "Qh", "Jh", "Th"], 2, seed="t") - 1 / 3) < 1e-9,
+           "公共牌坚果三家平分")
+    _check(equity(["Ts", "Td"], ["7h", "3s", "2h"], 2, seed="a")
+           == equity(["Ts", "Td"], ["7h", "3s", "2h"], 2, seed="a"), "同一种子结果应相同")
+    _check(equity(["Ts", "Td"], [], 0) is None, "没有对手不算胜率")
+    print("[selftest 18 胜率] 牌力排序与 best_rank 一致、常见起手牌胜率对得上、平分与种子正确",
+          file=sys.stderr)
+
+
 def run_selftest():
     _selftest_full_replay()
     _selftest_mid_hand_join()
@@ -1384,7 +1419,8 @@ def run_selftest():
     _selftest_warm_hh()
     _selftest_chip_div()
     _selftest_aliases()
-    print("OK: wopo selftest 17 组场景全部通过。", file=sys.stderr)
+    _selftest_equity()
+    print("OK: wopo selftest 18 组场景全部通过。", file=sys.stderr)
 
 
 # ===========================================================================
