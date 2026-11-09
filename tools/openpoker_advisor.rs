@@ -440,7 +440,8 @@ struct Response {
     /// 搜索路径（含放弃搜索）填；blueprint / 其余兜底恒 `None`（serde skip）。
     #[serde(skip_serializing_if = "Option::is_none")]
     menu: Option<String>,
-    /// 搜索读数失败落兜底时，hero 对当前点对手范围的胜率（[`fallback_range_equity`]；拿不到范围不填）。
+    /// hero 对当前点各在手对手范围的胜率（[`fallback_range_equity`]）：搜索路径缓存里有本街解就填（读数成功、
+    /// 放弃搜索都填，driver 写进 play log；放弃时也是兜底 floor 的输入）；blueprint 路径 / 拿不到范围不填。
     #[serde(skip_serializing_if = "Option::is_none")]
     range_equity: Option<f64>,
     /// 算 `range_equity` 时的在手对手数（折扣按人数乘）。
@@ -3282,6 +3283,9 @@ fn decide_with(
     let mut hero_visits: Option<u32> = None;
     let mut avg_recency: Option<f64> = None;
     let mut frozen_rm = false;
+    // hero 对当前点各对手范围的胜率（[`fallback_range_equity`]）：搜索路径有本街解就算，读数成功也填（play log
+    // 显示）；放弃搜索时同时喂兜底 floor。
+    let mut range_eq: Option<RangeEquity> = None;
     // 子树当前街的下注菜单（[`subtree_menu_label`]），搜索路径的 resp 都带上。
     let mut search_menu: Option<String> = None;
     // 搜索读数因 hero 信息集访问不足被拒、flop 退回 blueprint 同一节点出牌（source 标
@@ -3397,6 +3401,16 @@ fn decide_with(
             solve_cache.misses() > misses_before,
             search_result.is_ok(),
         );
+        range_eq = fallback_range_equity(
+            solve_cache,
+            root_state,
+            &within,
+            hand_seed,
+            &auth,
+            my_seat_solver.0 as PlayerId,
+            hole,
+            &board,
+        );
         match search_result {
             Ok(d) => {
                 // 遥测：本次决策用到的 solve 实际跑了多少 update（time_budget anytime 下
@@ -3456,17 +3470,7 @@ fn decide_with(
                     }
                     None => {
                         // auth 已建（此 Err 分支未 move 走）→ 喂底池赔率 floor + 范围胜率 floor（本街解
-                        // 在缓存里时：对手沿本街动作线条件化后的范围）。
-                        let range_eq = fallback_range_equity(
-                            solve_cache,
-                            root_state,
-                            &within,
-                            hand_seed,
-                            &auth,
-                            my_seat_solver.0 as PlayerId,
-                            hole,
-                            &board,
-                        );
+                        // 在缓存里时：对手沿本街动作线条件化后的范围，上面已算）。
                         let mut resp = fallback_with_floor(
                             &req.valid,
                             hole,
@@ -3684,6 +3688,8 @@ fn decide_with(
         resp.solve_updates = solve_updates; // blueprint 路径恒 None（serde skip，byte-equal）。
         resp.hero_visits = hero_visits;
         resp.avg_recency = avg_recency;
+        resp.range_equity = range_eq.map(|r| r.eq);
+        resp.range_equity_opps = range_eq.map(|r| r.opps);
         resp.bp_row_weight = bp_row_weight;
         resp.menu = search_menu;
         resp.fourbet = fourbet_tel;
@@ -4261,7 +4267,8 @@ fn range_equity(hole: [Card; 2], board: &[Card], opps: &[&[f64]], seed: u64) -> 
     (valid * 2 >= RANGE_EQUITY_TRIALS).then(|| share / valid as f64)
 }
 
-/// 搜索读数失败时，hero 对**当前点**各在手对手范围的胜率（[`range_equity`]）。范围 = 缓存里本手本街的子树解沿
+/// hero 对**当前点**各在手对手范围的胜率（[`range_equity`]）。搜索路径每次决策都算：读数成功时只给 play log
+/// 看，失败时喂兜底 floor。范围 = 缓存里本手本街的子树解沿
 /// 本街真实动作线条件化（[`current_street_ranges`]；读数被拒——如 hero 访问数不足——时解仍在缓存里）。没有本街的
 /// 解（建树失败 / 节点超限）/ 动作线走不通 → `None`（兜底退回旧的听牌 floor）。
 #[allow(clippy::too_many_arguments)]
@@ -5757,21 +5764,22 @@ fn decide_search_unanchored(
     let hero_visits = solve_cache.last_read_visits();
     let avg_recency = solve_cache.last_read_recency();
     let frozen_rm = solve_cache.last_read_frozen();
+    // hero 对当前点各对手范围的胜率：读数成功也算（play log 显示），放弃搜索时同时喂兜底 floor。
+    let range_eq = fallback_range_equity(
+        solve_cache,
+        &round_start,
+        &within,
+        hand_seed,
+        &auth,
+        my_seat_solver.0 as PlayerId,
+        hole,
+        board,
+    );
     let dist = match search_result {
         Ok(d) => d,
         Err(reason) => {
             // auth 已建（真栈河牌决策态）→ 喂底池赔率 floor（用户场景：河牌 giveup 被它接住）。
             // 访问量门槛拒读也走这里：脱锚路径没有 blueprint 节点可退。范围胜率 floor 同锚定路径。
-            let range_eq = fallback_range_equity(
-                solve_cache,
-                &round_start,
-                &within,
-                hand_seed,
-                &auth,
-                my_seat_solver.0 as PlayerId,
-                hole,
-                board,
-            );
             let mut resp = fallback_with_floor(
                 &req.valid,
                 hole,
@@ -5855,6 +5863,8 @@ fn decide_search_unanchored(
         resp.solve_updates = solve_updates;
         resp.hero_visits = hero_visits;
         resp.avg_recency = avg_recency;
+        resp.range_equity = range_eq.map(|r| r.eq);
+        resp.range_equity_opps = range_eq.map(|r| r.opps);
         resp.menu = Some(menu.clone());
         // 叠加剥削遥测：本决策实际剥削了哪些对手座（已收敛）+ 其 VPIP。无收敛对手 / 跨街后验命中
         // （subgame 不再叠加）→ None（serde skip → byte-equal）。
@@ -11048,6 +11058,70 @@ mod tests {
         assert_eq!(
             fallback_with_floor(&free, hole, &board, po, hu(0.9), "g".into()).action,
             "check"
+        );
+    }
+
+    /// 搜索读数成功的决策也带范围胜率（play log 显示），和兜底同一口径：单挑对 BB 一家；blueprint 决策不带。
+    #[test]
+    fn search_decision_reports_range_equity() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let sigma = top15_sigma();
+        let scfg = SubgameSearchConfig {
+            iterations: 300,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        };
+        let mut req = flop_first_unraised_req(vec![4000; 6]);
+        req.my_seat = 3;
+        req.hole = vec!["Kh".into(), "Kd".into()]; // 翻牌 7h 2c Ks：顶三条。
+        let a = |seat, action: &str, to| HistAction {
+            seat,
+            action: action.into(),
+            to,
+        };
+        req.actions = vec![
+            a(3, "raise", Some(60)),
+            a(4, "fold", None),
+            a(5, "fold", None),
+            a(0, "fold", None),
+            a(1, "fold", None),
+            a(2, "call", None),
+            a(2, "raise", Some(100)),
+        ];
+        req.valid = ValidActions {
+            can_check: false,
+            can_call: true,
+            can_raise: true,
+            min_raise: Some(200),
+            max_raise: Some(3940),
+        };
+        for (rt, prefix) in [
+            (rt_prefix_reach(scfg), "search"),
+            (
+                SearchRuntime {
+                    force_unanchored: true,
+                    ..rt_prefix_reach(scfg)
+                },
+                "search:unanchored",
+            ),
+        ] {
+            let mut cache = SubgameSolveCache::new();
+            let r = decide(&game, &abs, &sigma, &req, 0x754, Some(&rt), &mut cache);
+            assert!(
+                r.source.starts_with(prefix) && !r.source.contains("giveup"),
+                "得 {r:?}"
+            );
+            assert_eq!(r.range_equity_opps, Some(1), "{r:?}");
+            let eq = r.range_equity.expect("读数成功也带范围胜率");
+            assert!(eq > 0.8, "顶三条对 BB 范围应 > 80%：{eq}");
+        }
+        // 不开搜索 → blueprint 路径，不带范围胜率。
+        let mut cache = SubgameSolveCache::new();
+        let r = decide(&game, &abs, &sigma, &req, 0x754, None, &mut cache);
+        assert!(
+            r.range_equity.is_none() && r.range_equity_opps.is_none(),
+            "{r:?}"
         );
     }
 

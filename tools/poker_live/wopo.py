@@ -17,7 +17,6 @@ import time
 
 from poker_live.aliases import NameAliases
 from poker_live.decision import make_request, safe_response, tally_source
-from poker_live.equity import equity
 from poker_live.table import HandEngine, HandInvalid
 
 # 已知消息类型；其余类型首见时打 stderr、忽略（不作废当前手）。
@@ -26,8 +25,17 @@ _KNOWN_TYPES = ("hand_start", "hole_cards", "table_state", "player_action",
 
 
 def fmt_equity(eq, opps):
-    """play log 里的胜率文字：「胜率 42%（对 3 家随机牌）」。"""
-    return f"胜率 {eq * 100:.0f}%（对 {opps} 家随机牌）"
+    """play log 决策行的胜率文字：「胜率 42%（对 3 家搜索范围）」。"""
+    return f"胜率 {eq * 100:.0f}%（对 {opps} 家搜索范围）"
+
+
+def equity_of(resp):
+    """advisor 响应里的范围胜率 → (胜率 0..1 保留 4 位, 对手数)；没有或字段不对 → (None, None)。"""
+    eq, opps = resp.get("range_equity"), resp.get("range_equity_opps")
+    if (isinstance(eq, (int, float)) and not isinstance(eq, bool) and 0.0 <= eq <= 1.0
+            and isinstance(opps, int) and not isinstance(opps, bool) and opps >= 1):
+        return round(float(eq), 4), opps
+    return None, None
 
 
 _STREET_CN = {"preflop": "翻前", "flop": "翻牌", "turn": "转牌", "river": "河牌"}
@@ -604,26 +612,18 @@ class WopoSession:
                "chip_div": div, "chip_prior": prior}
         self._dbg(f"your_turn street={hand.street} hole={''.join(hand.hole)} "
                   f"board={' '.join(hand.board)} valid={valid}")
-        # 胜率：对没弃牌的对手（含已全下）各一手随机牌；种子 = 手号 + 行动点，同一局面重放结果一样。
-        # 只给人看：算不出来（牌面数据异常）就不写，不能影响这手的决策。
-        opps = len([s for s in hand._in_pot() if s != hand.hero])
-        try:
-            eq = equity(hand.hole, hand.board, opps, seed=f"{key[0]}:{key[1]}")
-        except (ValueError, IndexError) as e:
-            print(f"  [equity] 胜率算不出来，跳过：{e!r}", file=sys.stderr)
-            eq = None
-        self._play(f">> 轮到 hero（{_STREET_CN[hand.street]}，底池 {hand.pot}，跟 {ctx['to_call']}"
-                   + (f"，{fmt_equity(eq, opps)}" if eq is not None else "") + "）",
+        self._play(f">> 轮到 hero（{_STREET_CN[hand.street]}，底池 {hand.pot}，跟 {ctx['to_call']}）",
                    "hero_turn", turn=key[1], street=hand.street, pot=hand.pot,
                    to_call=ctx["to_call"], valid=dict(valid), hole=list(hand.hole),
-                   board=list(hand.board), table_seq=msg.get("table_seq"),
-                   equity=None if eq is None else round(eq, 4), equity_opps=opps)
+                   board=list(hand.board), table_seq=msg.get("table_seq"))
         self.worker.submit_decide(req, lambda resp, ms: self._on_decided(req, ctx, resp, ms))
 
     def _on_decided(self, req, ctx, resp, ms):
         """决策结果（worker 线程回调）。hero 在此期间已出牌 / 这手已作废 → 结果过期，不写行动文件。"""
         with self.lock:
             self.counters["decisions"] += 1
+            # 范围胜率（advisor 搜索路径才有）：和动作无关，legalize 拒掉非法动作时也照样显示。
+            eq, eq_opps = equity_of(resp)
             if ctx["chip_div"] > 1:
                 resp = upscale_response(resp, ctx["chip_div"], ctx["chip_prior"], ctx["valid"],
                                         req["valid"])
@@ -662,6 +662,7 @@ class WopoSession:
                        + (f"  已过期（{_STALE_CN.get(stale.split(':', 1)[0], stale)}），未写入行动文件"
                           if stale else "")
                        + (f"  {fmt_probs(rec['probs'])}" if rec["probs"] else "")
+                       + (f"  {fmt_equity(eq, eq_opps)}" if eq is not None else "")
                        + f"  建议 {advice}", "decision", hand_id=ctx["key"][0],
                        turn=ctx["key"][1], street=ctx["street"], pot=ctx["pot"],
                        to_call=ctx["to_call"], valid=dict(ctx["valid"]), action=rec["action"],
@@ -672,7 +673,8 @@ class WopoSession:
                        advice=advice, probs=rec["probs"], chosen=rec["chosen"],
                        source=rec["source"], decide_ms=ms, stale=stale,
                        stale_kind=stale.split(":", 1)[0] if stale else None,
-                       written=stale is None, rejected=resp.get("rejected"))
+                       written=stale is None, rejected=resp.get("rejected"),
+                       equity=eq, equity_opps=eq_opps)
             if self.action_log:
                 # req = advisor 实际收到的（chip_div > 1 时是缩小后的筹码）；resp 已还原成桌面筹码。
                 self.action_log.write(json.dumps({"req": req, "resp": resp, "decide_ms": ms,
