@@ -40,6 +40,8 @@ const NONE: u32 = u32::MAX;
 const REGRET_PRESENT: u8 = 1;
 /// Row flag: strategy-sum entry exists (HashMap path: key present in the strategy accumulator).
 const STRATEGY_PRESENT: u8 = 2;
+/// Row flag: the row's strategy is frozen to one action ([`SubgameTables::freeze`]).
+const FROZEN: u8 = 4;
 
 /// Regret + strategy-sum storage for one subgame solve.
 ///
@@ -62,6 +64,12 @@ pub struct SubgameTables {
     visits: Vec<u32>,
     regret: Vec<f64>,
     strategy: Vec<f64>,
+    /// Per row: Σ (mass added to the strategy sum × update time of that mass), so
+    /// `strategy_time / Σ strategy_sum` is the mass-weighted mean update count at which the
+    /// average strategy was accumulated ([`SubgameTrainer::average_recency`]).
+    strategy_time: Vec<f64>,
+    /// `(row, action)` of every [`FROZEN`] row (a handful: hero's earlier decisions this round).
+    frozen: Vec<(u32, u8)>,
 }
 
 impl SubgameTables {
@@ -77,6 +85,8 @@ impl SubgameTables {
             visits: Vec::new(),
             regret: Vec::new(),
             strategy: Vec::new(),
+            strategy_time: Vec::new(),
+            frozen: Vec::new(),
         }
     }
 
@@ -140,6 +150,7 @@ impl SubgameTables {
             .push(u8::try_from(n_actions).expect("action count exceeds u8"));
         self.flags.push(0);
         self.visits.push(0);
+        self.strategy_time.push(0.0);
         self.regret.resize(off + n_actions, 0.0);
         self.strategy.resize(off + n_actions, 0.0);
         row
@@ -165,6 +176,11 @@ impl SubgameTables {
             self.row_len[row] as usize, n_actions,
             "SubgameTables::current_strategy action_count mismatch (D-324)"
         );
+        if let Some(a) = self.frozen_action(row) {
+            let mut one_hot = SigmaVec::from_elem(0.0, n_actions);
+            one_hot[a] = 1.0;
+            return one_hot;
+        }
         let mut positives: SigmaVec = SigmaVec::with_capacity(n_actions);
         let mut sum = 0.0_f64;
         for &r in &self.regret[self.range(row)] {
@@ -180,6 +196,44 @@ impl SubgameTables {
         } else {
             uniform()
         }
+    }
+
+    /// Freeze `info`'s strategy to action `action` (of `n_actions`): regret matching then returns that
+    /// one-hot σ, traversals take only that action and learn no regret there
+    /// ([`SubgameNlheGame::with_frozen_real_line`]). The row is created with a regret entry so the
+    /// exact-average sweep carries the seat's reach through it.
+    fn freeze(&mut self, info: InfoSetId, n_actions: usize, action: usize) {
+        assert!(action < n_actions, "frozen action {action} ≥ {n_actions}");
+        let row = self.find_or_insert(info, n_actions);
+        if self.flags[row] & FROZEN != 0 {
+            return;
+        }
+        self.flags[row] |= REGRET_PRESENT | FROZEN;
+        self.frozen.push((
+            u32::try_from(row).expect("rows exceed u32"),
+            u8::try_from(action).expect("action exceeds u8"),
+        ));
+    }
+
+    /// The frozen action of `row`, if [`Self::freeze`]d.
+    #[inline]
+    fn frozen_action(&self, row: usize) -> Option<usize> {
+        if self.flags[row] & FROZEN == 0 {
+            return None;
+        }
+        self.frozen
+            .iter()
+            .find(|&&(r, _)| r as usize == row)
+            .map(|&(_, a)| a as usize)
+    }
+
+    /// [`Self::frozen_action`] by infoset (no row → `None`).
+    #[inline]
+    fn frozen_action_of(&self, info: InfoSetId) -> Option<usize> {
+        if self.frozen.is_empty() {
+            return None; // Hot path: no lookup when nothing is frozen.
+        }
+        self.find(info).and_then(|row| self.frozen_action(row))
     }
 
     /// `RegretTable::get_or_init`: make sure the regret entry exists. Returns the row.
@@ -200,14 +254,30 @@ impl SubgameTables {
         row
     }
 
-    /// `StrategyAccumulator::accumulate`.
+    /// `StrategyAccumulator::accumulate` (mass stamped at update time 0; tests only — the sweep
+    /// stamps real times via [`Self::accumulate_strategy_at`]).
+    #[cfg(test)]
     pub(crate) fn accumulate_strategy(&mut self, info: InfoSetId, weighted: &[f64]) -> usize {
+        self.accumulate_strategy_at(info, weighted, 0.0)
+    }
+
+    /// [`Self::accumulate_strategy`], recording that the mass stands for updates centred on
+    /// update count `t` (for [`SubgameTrainer::average_recency`]).
+    pub(crate) fn accumulate_strategy_at(
+        &mut self,
+        info: InfoSetId,
+        weighted: &[f64],
+        t: f64,
+    ) -> usize {
         let row = self.find_or_insert(info, weighted.len());
         self.flags[row] |= STRATEGY_PRESENT;
         let range = self.range(row);
+        let mut mass = 0.0;
         for (slot, &w) in self.strategy[range].iter_mut().zip(weighted) {
             *slot += w;
+            mass += w;
         }
+        self.strategy_time[row] += mass * t;
         row
     }
 
@@ -224,6 +294,9 @@ impl SubgameTables {
             }
         }
         for v in &mut self.strategy {
+            *v *= factor;
+        }
+        for v in &mut self.strategy_time {
             *v *= factor;
         }
     }
@@ -306,6 +379,7 @@ fn exact_sweep(
     id: NodeId,
     street: StreetTag,
     weight: f64,
+    t_mid: f64,
     reach: &mut [Vec<(u32, f64)>],
     tables: &mut SubgameTables,
 ) {
@@ -328,7 +402,7 @@ fn exact_sweep(
         let sigma = tables.current_strategy_smallvec(info, n);
         let scale = weight * pi;
         let weighted: ShortVec<f64> = sigma.iter().map(|s| scale * s).collect();
-        tables.accumulate_strategy(info, &weighted);
+        tables.accumulate_strategy_at(info, &weighted, t_mid);
         live.push((bucket, pi, sigma));
     }
     for (i, child) in node.children.iter().enumerate() {
@@ -340,7 +414,7 @@ fn exact_sweep(
                     (next_pi > 0.0).then_some((*bucket, next_pi))
                 })
                 .collect();
-            exact_sweep(tree, next, street, weight, reach, tables);
+            exact_sweep(tree, next, street, weight, t_mid, reach, tables);
         }
     }
     reach[seat] = mine;
@@ -372,7 +446,19 @@ impl SubgameTrainer {
             table.bucket_count(StreetTag::River) + extra,
         ];
         let tree = game.subtree();
-        let tables = SubgameTables::new(tree.num_nodes(), bucket_count_by_street);
+        let mut tables = SubgameTables::new(tree.num_nodes(), bucket_count_by_street);
+        // hero 真实手牌本轮已做的动作（`SubgameNlheGame::with_frozen_real_line`）：真实手牌专用格固定。
+        for &(node, action) in game.frozen_real_line() {
+            let n = tree.node(node);
+            let slot = game
+                .real_hand_slot(n.street)
+                .expect("frozen real line requires the real-hand infoset");
+            tables.freeze(
+                pack_info_set_v2(slot, node, n.street),
+                n.legal_actions.len(),
+                action,
+            );
+        }
         let exact = (tree.num_nodes() > 0).then(|| ExactAverage {
             street: tree.node(tree.root_id()).street,
             swept_at: 0,
@@ -419,6 +505,8 @@ impl SubgameTrainer {
         if pending == 0 {
             return;
         }
+        // The swept σ stands for updates (swept_at, update_count]: stamp the mass at their middle.
+        let t_mid = (exact.swept_at + self.update_count) as f64 / 2.0;
         exact.swept_at = self.update_count;
         let street = exact.street;
         let buckets = self.tables.bucket_count_by_street[street_index(street)];
@@ -430,6 +518,7 @@ impl SubgameTrainer {
             tree.root_id(),
             street,
             pending as f64,
+            t_mid,
             &mut reach,
             &mut self.tables,
         );
@@ -603,6 +692,20 @@ impl SubgameTrainer {
         }
     }
 
+    /// When the average strategy of `info` was accumulated: the mass-weighted mean update count of
+    /// its strategy-sum mass, divided by [`Self::update_count`] (0..1). Steady own reach over the
+    /// solve gives ≈ 0.5; a value near 0 means the row stopped receiving mass early — its own
+    /// player's reach collapsed to 0 and the average froze at early-iteration σ. `None` when the
+    /// row has no strategy-sum mass or nothing ran. Call after [`Self::flush_exact_average`].
+    pub fn average_recency(&self, info: &InfoSetId) -> Option<f64> {
+        let row = self.tables.find(*info)?;
+        if self.tables.flags[row] & STRATEGY_PRESENT == 0 || self.update_count == 0 {
+            return None;
+        }
+        let mass: f64 = self.tables.strategy[self.tables.range(row)].iter().sum();
+        (mass > 0.0).then(|| self.tables.strategy_time[row] / (mass * self.update_count as f64))
+    }
+
     /// Traverser visits of `info` (`EsMccfrTrainer::visit_count`): `None` when not tracked.
     pub fn visit_count(&self, info: &InfoSetId) -> Option<u32> {
         if !self.track_visits {
@@ -623,6 +726,12 @@ impl SubgameTrainer {
     #[cfg(test)]
     pub(crate) fn tables_mut(&mut self) -> &mut SubgameTables {
         &mut self.tables
+    }
+
+    /// Test hook: set the update count (readout tests stage [`Self::average_recency`]).
+    #[cfg(test)]
+    pub(crate) fn set_update_count(&mut self, n: u64) {
+        self.update_count = n;
     }
 
     /// Test hook: overwrite the traverser visit count of `info` (creates the row if needed).
@@ -658,6 +767,12 @@ fn recurse(
             let actions = SubgameNlheGame::legal_actions(&state);
             let n = actions.len();
             let row = tables.init_regret(info, n);
+            if let Some(a) = tables.frozen_action(row) {
+                // Frozen (hero's real hand already took this action this round): follow it, learn
+                // nothing here, as traverser and as non-traverser alike.
+                let next_state = SubgameNlheGame::next(state, actions[a], rng);
+                return recurse(next_state, traverser, tables, track_visits, rng);
+            }
             let sigma = tables.current_strategy_smallvec(info, n);
 
             if actor == traverser {
@@ -705,6 +820,11 @@ fn recurse_parallel(
             let info = SubgameNlheGame::info_set(&state, actor);
             let actions = SubgameNlheGame::legal_actions(&state);
             let n = actions.len();
+            if let Some(a) = shared.frozen_action_of(info) {
+                // Frozen: same as `recurse` (no sampling draw, no regret).
+                let next_state = SubgameNlheGame::next(state, actions[a], rng);
+                return recurse_parallel(next_state, traverser, shared, local_regret, rng);
+            }
             let sigma = shared.current_strategy_smallvec(info, n);
 
             if actor == traverser {
@@ -761,7 +881,7 @@ mod tests {
     use crate::rules::config::TableConfig;
     use crate::rules::state::GameState;
     use crate::training::nlhe::{pack_info_set_v2, SimplifiedNlheState};
-    use crate::training::nlhe_betting_tree::deep_menu_for;
+    use crate::training::nlhe_betting_tree::{deep_menu_for, AbstractActionTag};
     use crate::training::regret::{RegretTable, StrategyAccumulator};
     use crate::training::trainer::{EsMccfrTrainer, Trainer};
 
@@ -1350,5 +1470,142 @@ mod tests {
                 "{label}: no later-street rows to check"
             );
         }
+    }
+
+    /// [`SubgameTrainer::average_recency`]: the root actor's own reach of a root row is always 1,
+    /// so a root row gets `pending` mass at every sweep from the first sweep after it was created
+    /// on. With the sweep's σ stamped at the middle of its updates, Σ pending·t_mid = T²/2 for a
+    /// row present from the start → recency exactly 0.5; rows created later sit above 0.5.
+    /// Default (relative) sweep spacing, single thread.
+    #[test]
+    fn average_recency_root_rows() {
+        let mut t =
+            SubgameTrainer::new(three_way_flop_sub()).with_traverser_rotation(vec![0, 1, 2]);
+        let mut rng = ChaCha20Rng::from_seed(0x2EC0);
+        for _ in 0..3000 {
+            t.step(&mut rng).unwrap();
+        }
+        t.flush_exact_average();
+        let tree = t.game().subtree();
+        let root = tree.root_id();
+        let street = t.exact_average_street().unwrap();
+        let count = t.tables().bucket_count_by_street[street as usize];
+        let rec: Vec<f64> = (0..count)
+            .filter_map(|b| t.average_recency(&pack_info_set_v2(b, root, street)))
+            .collect();
+        assert!(!rec.is_empty(), "no root row averaged");
+        for r in &rec {
+            assert!((0.5 - 1e-9..=1.0).contains(r), "recency {r} out of range");
+        }
+        let min = rec.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!((min - 0.5).abs() < 0.02, "earliest root row recency {min}");
+        // Rows without strategy-sum mass have no recency.
+        assert_eq!(
+            t.average_recency(&pack_info_set_v2(count - 1, root, street))
+                .is_some(),
+            t.tables()
+                .strategy_sum_row(pack_info_set_v2(count - 1, root, street))
+                .is_some()
+        );
+    }
+
+    /// Frozen real line ([`SubgameNlheGame::with_frozen_real_line`]): hero's real-hand row at the
+    /// root is frozen to a bet. Single-thread and parallel: the frozen row's σ and average are that
+    /// one-hot action and it learns no regret; hero's real-hand row at its next decision on that
+    /// line keeps getting average mass to the end (recency ≈ 0.5 or later, not frozen early);
+    /// hero's other root buckets are untouched (not one-hot-frozen).
+    #[test]
+    fn frozen_real_line_pins_real_hand_row() {
+        for parallel in [false, true] {
+            let sub = with_real(three_way_flop_sub(), 0.5);
+            let (hero, _) = hero_and_hole(&sub);
+            let tree = sub.subtree();
+            let root = tree.root_id();
+            let street = tree.node(root).street;
+            let slot = sub.real_hand_slot(street).unwrap();
+            let bet = tree
+                .node(root)
+                .legal_actions
+                .iter()
+                .position(|t| matches!(t, AbstractActionTag::Bet(_)))
+                .expect("root has a bet");
+            // Next hero decision below root→bet: follow the first Decision child through others.
+            let mut id = match tree.node(root).children[bet] {
+                Child::Decision(n) => n,
+                Child::Terminal => panic!("bet ends the hand"),
+            };
+            while tree.node(id).player_acting != hero {
+                id = tree
+                    .node(id)
+                    .children
+                    .iter()
+                    .rev()
+                    .find_map(|c| match c {
+                        Child::Decision(n) => Some(*n),
+                        Child::Terminal => None,
+                    })
+                    .expect("line reaches hero again");
+            }
+            assert_eq!(
+                tree.node(id).street,
+                street,
+                "next hero node on the same street"
+            );
+            let next_hero = id;
+            let sub = sub.with_frozen_real_line(vec![(root, bet)]);
+            let mut t = SubgameTrainer::new(sub).with_traverser_rotation(vec![0, 1, 2]);
+            if parallel {
+                let mut pool: Vec<Box<dyn RngSource>> = (0..3u64)
+                    .map(|k| Box::new(ChaCha20Rng::from_seed(0xF2 + k)) as Box<dyn RngSource>)
+                    .collect();
+                for _ in 0..300 {
+                    t.step_parallel(&mut pool, 3, 4).unwrap();
+                }
+            } else {
+                let mut rng = ChaCha20Rng::from_seed(0xF2);
+                for _ in 0..3600 {
+                    t.step(&mut rng).unwrap();
+                }
+            }
+            t.flush_exact_average();
+            let frozen = pack_info_set_v2(slot, root, street);
+            let n = tree_len(&t, root);
+            let mut one_hot = vec![0.0; n];
+            one_hot[bet] = 1.0;
+            assert_eq!(t.current_strategy(&frozen), one_hot, "parallel={parallel}");
+            assert_eq!(t.average_strategy(&frozen), one_hot, "parallel={parallel}");
+            assert!(
+                t.tables()
+                    .regret_row(frozen)
+                    .unwrap()
+                    .iter()
+                    .all(|&r| r == 0.0),
+                "parallel={parallel}: frozen row learned regret"
+            );
+            let downstream = pack_info_set_v2(slot, next_hero, street);
+            let rec = t
+                .average_recency(&downstream)
+                .expect("real-hand row on the frozen line gets average mass");
+            assert!(rec > 0.45, "parallel={parallel}: downstream recency {rec}");
+            // Other hero buckets at the root keep regret matching (rows with learned regret are
+            // not forced one-hot).
+            let count = t.tables().bucket_count_by_street[street as usize];
+            let learned = (0..count - 1)
+                .map(|b| pack_info_set_v2(b, root, street))
+                .filter(|i| {
+                    t.tables()
+                        .regret_row(*i)
+                        .is_some_and(|r| r.iter().any(|&x| x != 0.0))
+                })
+                .count();
+            assert!(
+                learned > 0,
+                "parallel={parallel}: other buckets learned nothing"
+            );
+        }
+    }
+
+    fn tree_len(t: &SubgameTrainer, node: NodeId) -> usize {
+        t.game().subtree().node(node).legal_actions.len()
     }
 }

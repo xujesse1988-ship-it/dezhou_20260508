@@ -239,6 +239,10 @@ pub struct SubgameNlheGame {
     /// hero 真实手牌单独信息集 + 强制发牌（[`with_real_hand`](Self::with_real_hand)，
     /// `real_hand_forced_deal_design_2026_10_25`）。`None` = 关（既有行为逐位不变）。
     real_hand: Option<RealHand>,
+    /// hero 真实手牌本轮已做的动作（[`with_frozen_real_line`](Self::with_frozen_real_line)）：
+    /// `(子树节点, 动作下标)`，按时序。真实手牌专用信息集在这些节点上的策略固定为实际动作。
+    /// 空 = 不固定（既有行为）。
+    frozen_real_line: Vec<(NodeId, usize)>,
 }
 
 /// [`SubgameNlheGame::with_real_hand`] 的配置。
@@ -355,6 +359,7 @@ impl SubgameNlheGame {
             hole_masks: Vec::new(),
             leaf_ctx: None,
             real_hand: None,
+            frozen_real_line: Vec::new(),
         }
     }
 
@@ -468,6 +473,7 @@ impl SubgameNlheGame {
             hole_masks: Vec::new(),
             leaf_ctx,
             real_hand: None,
+            frozen_real_line: Vec::new(),
         };
         if let Some(r) = ranges {
             g.attach_ranges(r);
@@ -615,6 +621,41 @@ impl SubgameNlheGame {
     /// 是否开了 [`with_real_hand`](Self::with_real_hand)（[`SubgameTrainer`] 据此每街多留一格桶位）。
     pub(crate) fn has_real_hand(&self) -> bool {
         self.real_hand.is_some()
+    }
+
+    /// 真实手牌在 `street` 的专用桶号（未开 [`with_real_hand`](Self::with_real_hand) → `None`）。
+    pub(crate) fn real_hand_slot(&self, street: StreetTag) -> Option<u32> {
+        self.real_hand
+            .map(|rh| rh.tag.slot_by_street[street as usize])
+    }
+
+    /// 把 hero 真实手牌本轮已做的动作固定进求解（[`SubgameSearchConfig::freeze_real_line`]）：
+    /// `line` = `(子树节点, 动作下标)`，节点须是真实手牌座位的决策点。[`SubgameTrainer`] 建表时把
+    /// 真实手牌专用信息集在这些节点上的策略固定为该动作（遍历时只走这一支、不学 regret），于是
+    /// 求解里 hero 拿着真实手牌恒走实际那条线，后面决策点的平均策略按稳定的自身 reach 累计。
+    /// 须先开 [`with_real_hand`](Self::with_real_hand)：固定整个桶会把同桶其它组合也钉死。
+    pub fn with_frozen_real_line(mut self, line: Vec<(NodeId, usize)>) -> Self {
+        let rh = self
+            .real_hand
+            .expect("frozen real line needs the real-hand infoset (with_real_hand)");
+        for &(node, idx) in &line {
+            let n = self.subtree.node(node);
+            assert_eq!(
+                n.player_acting, rh.tag.seat,
+                "frozen node {node} is not the real-hand seat's decision"
+            );
+            assert!(
+                idx < n.legal_actions.len(),
+                "frozen action {idx} out of range at node {node}"
+            );
+        }
+        self.frozen_real_line = line;
+        self
+    }
+
+    /// [`with_frozen_real_line`](Self::with_frozen_real_line) 的固定线（空 = 不固定）。
+    pub(crate) fn frozen_real_line(&self) -> &[(NodeId, usize)] {
+        &self.frozen_real_line
     }
 
     /// 从重发过隐藏牌的 `game_state` 建子树根 state（[`root`](Game::root) /
@@ -1199,6 +1240,26 @@ pub struct SubgameSearchConfig {
     ///
     /// 只管读数、不进 solve：**不进** [`solve_cache_key`]（同一份解可按不同门槛读）。
     pub min_hero_visits: u32,
+    /// 平均策略冻结的读数门槛（[`SubgameTrainer::average_recency`]）：hero 实际底牌在当前决策点的
+    /// 信息集，平均策略质量的加权平均累计时刻 ÷ 总更新数低于这个值 → 认为冻结，改读 regret matching
+    /// 当前策略（读数遥测 [`SubgameSolveCache::last_read_frozen`]）。`0.0`（默认）= 不检查（旧行为）。
+    ///
+    /// 冻结：平均策略只在 hero 自身 reach > 0 时累计。求解中途 hero 在本街更早的决策点改成不走
+    /// 这条线（如翻牌第一步改成 100% 过牌），这个点的平均策略就停在早期迭代的噪声上，访问数却照涨
+    /// （访问数按遍历者计，regret 按对手 reach 加权照常学）——访问数门槛挡不住
+    /// （ante-table:hand:002211：TT 面对过牌加注全下 64%，换种子 0%–84% 乱跳、加迭代读数不变，
+    /// regret 各种子一致：全下大负、跟注为正）。稳定的线 ≈ 0.5。
+    ///
+    /// 只管读数、不进 solve：**不进** [`solve_cache_key`]。
+    pub frozen_avg_recency: f64,
+    /// 固定 hero 真实手牌本轮已做的动作（[`SubgameNlheGame::with_frozen_real_line`]）。`false`（默认）=
+    /// 不固定（旧行为）。`true` 且 [`Self::real_hand_q`] 开时：本轮 hero 已做过的动作在真实手牌专用
+    /// 信息集上固定为实际动作，求解里 hero 拿着真实手牌恒走实际那条线，当前决策点的平均策略不会因
+    /// 求解中途改走别的线而冻结（[`Self::frozen_avg_recency`]）。只钉这一手牌，hero 其余组合和对手
+    /// 照常求解；对手看不到 hero 的牌，一个组合对他们的策略几乎没有影响（Pluribus 同做法）。
+    /// `real_hand_q = None` 时不生效（固定整个桶会把同桶其它组合也钉死）。进 [`solve_cache_key`]
+    /// （hero 已做的动作线）：本轮 hero 第一次决策没有已做动作，key 与预热相同。
+    pub freeze_real_line: bool,
     /// hero 真实手牌单独信息集 + 强制发牌（`real_hand_forced_deal_design_2026_10_25`）。
     /// `None`（默认）= 关，既有行为逐位不变。`Some(q)`：hero 拿着真实底牌时用专用信息集，hero 当
     /// 遍历者时以概率 `q ∈ [0, 1]` 直接发真实底牌；`Some(0.0)` = 只开专用信息集不强制发牌（验证用
@@ -1209,6 +1270,9 @@ pub struct SubgameSearchConfig {
 /// [`SubgameSearchConfig::min_hero_visits`] 拒读时 `Err` 字符串的前缀。调用方用
 /// [`is_low_hero_visits_err`] 识别（区别于树太大 / 完全未访问等）。
 pub const LOW_HERO_VISITS_ERR: &str = "low_hero_visits";
+
+/// 平均策略冻结且当前策略均匀时拒读的 `Err` 前缀（[`SubgameSearchConfig::frozen_avg_recency`]）。
+pub const FROZEN_AVG_ERR: &str = "frozen_avg";
 
 /// `Err` 是否为 [`LOW_HERO_VISITS_ERR`]（hero 信息集访问次数低于门槛）。
 pub fn is_low_hero_visits_err(reason: &str) -> bool {
@@ -1234,6 +1298,8 @@ impl Default for SubgameSearchConfig {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            frozen_avg_recency: 0.0,
+            freeze_real_line: false,
             real_hand_q: None,
         }
     }
@@ -2273,6 +2339,11 @@ pub struct SubgameSolveCache {
     /// 最近一次决策读数时，hero 实际底牌在落点信息集的遍历者访问次数（遥测，
     /// [`Self::last_read_visits`]）。每次经缓存的搜索调用开始时清成 `None`，导航到落点后写入。
     last_read_visits: Option<u32>,
+    /// 最近一次决策读数时 hero 落点信息集的平均策略累计时刻（[`SubgameTrainer::average_recency`]，
+    /// 遥测，[`Self::last_read_recency`]）。清空 / 写入时机同 `last_read_visits`。
+    last_read_recency: Option<f64>,
+    /// 最近一次决策读数是否因平均策略冻结改读了当前策略（[`SubgameSearchConfig::frozen_avg_recency`]）。
+    last_read_frozen: bool,
 }
 
 impl SubgameSolveCache {
@@ -2286,6 +2357,8 @@ impl SubgameSolveCache {
             cross_hits: 0,
             oversize: None,
             last_read_visits: None,
+            last_read_recency: None,
+            last_read_frozen: false,
         }
     }
 
@@ -2294,6 +2367,25 @@ impl SubgameSolveCache {
     /// （预热 / 建树或导航失败）。advisor 写进决策日志，用于标定门槛。
     pub fn last_read_visits(&self) -> Option<u32> {
         self.last_read_visits
+    }
+
+    /// 最近一次读数时 hero 落点信息集的平均策略累计时刻（0..1，[`SubgameTrainer::average_recency`]）。
+    /// `None` = 没走到读数或该信息集没有平均策略质量。
+    pub fn last_read_recency(&self) -> Option<f64> {
+        self.last_read_recency
+    }
+
+    /// 最近一次读数是否因平均策略冻结改读了 regret matching 当前策略
+    /// （[`SubgameSearchConfig::frozen_avg_recency`]）。
+    pub fn last_read_frozen(&self) -> bool {
+        self.last_read_frozen
+    }
+
+    /// 清空读数遥测（每次经缓存的搜索调用开始时）。
+    fn clear_read_telemetry(&mut self) {
+        self.last_read_visits = None;
+        self.last_read_recency = None;
+        self.last_read_frozen = false;
     }
 
     /// 命中次数（诊断 / 测试：钉「同街第二决策不重解」）。
@@ -2433,6 +2525,72 @@ fn real_hand_spec(
     })
 }
 
+/// [`SubgameSearchConfig::freeze_real_line`] 要固定的本轮真实动作前缀：`within` 里到 hero 最后一个
+/// 动作为止（含）的部分；功能关 / 没开真实手牌信息集 / hero 本轮还没行动 → 空。`root_state` = 本轮
+/// 起点，按 `within` 重放判每个动作的行动者（重放失败 = 动作序与起点不符 → `Err`）。
+fn frozen_real_prefix<'a>(
+    cfg: &SubgameSearchConfig,
+    real_hand: Option<RealHandSpec>,
+    root_state: &GameState,
+    within: &'a [(Action, bool)],
+    hero: PlayerId,
+) -> Result<&'a [(Action, bool)], String> {
+    if !cfg.freeze_real_line || real_hand.is_none() {
+        return Ok(&[]);
+    }
+    let mut state = root_state.clone();
+    let mut end = 0;
+    for (i, (applied, _)) in within.iter().enumerate() {
+        let actor = state
+            .current_player()
+            .ok_or("固定真实动作：中途状态无行动者（与动作序不符）")?;
+        if actor.0 as PlayerId == hero {
+            end = i + 1;
+        }
+        state
+            .apply(*applied)
+            .map_err(|e| format!("固定真实动作：apply({applied:?}) 非法: {e:?}"))?;
+    }
+    Ok(&within[..end])
+}
+
+/// 把 [`frozen_real_prefix`] 在子树上走一遍，取 hero 的决策点和实际动作下标，固定进 `sub`
+/// （[`SubgameNlheGame::with_frozen_real_line`]）。前缀空 → 原样返回。
+fn apply_frozen_real_line(
+    sub: SubgameNlheGame,
+    abs: &StreetActionAbstraction,
+    root_state: &GameState,
+    prefix: &[(Action, bool)],
+    hero: PlayerId,
+) -> Result<SubgameNlheGame, String> {
+    if prefix.is_empty() {
+        return Ok(sub);
+    }
+    let (_, steps) = walk_subtree_real_line(sub.subtree(), abs, root_state, prefix, hero)?;
+    let line: Vec<(NodeId, usize)> = steps
+        .into_iter()
+        .filter(|&(node, _)| sub.subtree().node(node).player_acting == hero)
+        .collect();
+    Ok(sub.with_frozen_real_line(line))
+}
+
+/// 真实动作序进缓存 key 的编码（动作种类 + 是否全下 + 金额）。
+fn hash_real_line(h: &mut blake3::Hasher, line: &[(Action, bool)]) {
+    h.update(&(line.len() as u64).to_le_bytes());
+    for (a, all_in) in line {
+        let (kind, to) = match a {
+            Action::Fold => (0u8, 0u64),
+            Action::Check => (1, 0),
+            Action::Call => (2, 0),
+            Action::AllIn => (3, 0),
+            Action::Bet { to } => (4, to.as_u64()),
+            Action::Raise { to } => (5, to.as_u64()),
+        };
+        h.update(&[kind, *all_in as u8]);
+        h.update(&to.to_le_bytes());
+    }
+}
+
 /// 按 [`RealHandSpec`] 打开子树游戏的真实手牌单独信息集（`None` = 原样返回）。子树根状态里 hero
 /// 没有底牌（不应发生：搜索只在 hero 未弃牌时触发）→ 不开，而不是 panic。
 fn apply_real_hand(sub: SubgameNlheGame, spec: Option<RealHandSpec>) -> SubgameNlheGame {
@@ -2485,9 +2643,16 @@ fn solve_cache_key(
     hand_seed: u64,
     seed_ordinal: u64,
     real_hand: Option<RealHandSpec>,
+    frozen_prefix: &[(Action, bool)],
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(&[kind]);
+    // 固定的 hero 本轮已做动作（[`SubgameSearchConfig::freeze_real_line`]）：空不写任何字节 → 关闭时 /
+    // hero 本轮首次决策时 key 与改动前逐位相同（首次决策与街起点预热同 key）。
+    if !frozen_prefix.is_empty() {
+        h.update(b"frozen_line");
+        hash_real_line(&mut h, frozen_prefix);
+    }
     // hero 真实手牌单独信息集（`cfg.real_hand_q`）：座位 + 底牌掩码 + q 都改变 solve。`None` 不写任何
     // 字节 → 关闭时 key 与改动前逐位相同。
     if let Some(rh) = real_hand {
@@ -2824,7 +2989,7 @@ fn subgame_search_cached_inner(
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
     let mut cache = cache;
     if let Some(c) = cache.as_deref_mut() {
-        c.last_read_visits = None; // 本次调用的读数遥测从空开始（早退路径不残留上一决策的值）。
+        c.clear_read_telemetry(); // 本次调用的读数遥测从空开始（早退路径不残留上一决策的值）。
     }
     if auth.is_terminal() || auth.current_player().is_none() {
         return Err("subgame_search: auth 非 decision 节点".to_string());
@@ -3073,6 +3238,14 @@ fn subgame_search_cached_inner(
         ..SolveRangeMeta::default()
     };
     let real_hand = real_hand_spec(cfg, auth, auth_actor);
+    // 固定 hero 本轮已做动作：要真实动作序（非 deep_menu 的旧路径没传时不固定）。
+    let frozen_prefix = frozen_real_prefix(
+        cfg,
+        real_hand,
+        root_state,
+        within_round_real.unwrap_or(&[]),
+        auth_actor,
+    )?;
     let key = cache.as_ref().map(|_| {
         solve_cache_key(
             KEY_KIND_ANCHORED,
@@ -3087,6 +3260,7 @@ fn subgame_search_cached_inner(
             hand_seed,
             seed_ordinal,
             real_hand,
+            frozen_prefix,
         )
     });
     // 建 subgame + 求解（仅 miss / 无缓存时跑）：bucket 表 + 上面选定的 action 抽象
@@ -3147,6 +3321,7 @@ fn subgame_search_cached_inner(
             )
         };
         let sub = apply_real_hand(sub, real_hand);
+        let sub = apply_frozen_real_line(sub, &sub_abs, root_state, frozen_prefix, auth_actor)?;
         let trainer = solve_subgame(sub, cfg, master)?;
         Ok(SolvedSubgame {
             trainer,
@@ -3157,7 +3332,7 @@ fn subgame_search_cached_inner(
     };
     let solved_fresh: SolvedSubgame;
     // 读数遥测槽（[`SubgameSolveCache::last_read_visits`]）：只有走缓存臂时有处可写。
-    let mut visits_slot: Option<&mut Option<u32>> = None;
+    let mut visits_slot: Option<ReadSlots<'_>> = None;
     let solved: &SolvedSubgame = match (cache, key) {
         (Some(c), Some(key)) => {
             // §4.5 跨街复用遥测：cache 存在（走本臂）+ cross_street=Some 即一次 attempt（hit 见
@@ -3169,7 +3344,11 @@ fn subgame_search_cached_inner(
                 c.store(key, build_and_solve()?);
             }
             // 字段级借用：遥测槽与条目是 `*c` 的不相交字段，可同时持有。
-            visits_slot = Some(&mut c.last_read_visits);
+            visits_slot = Some(ReadSlots {
+                visits: &mut c.last_read_visits,
+                recency: &mut c.last_read_recency,
+                frozen: &mut c.last_read_frozen,
+            });
             &c.entry
                 .as_ref()
                 .filter(|(k, _)| *k == key)
@@ -3210,11 +3389,21 @@ fn subgame_search_cached_inner(
     } else {
         navigate_subtree(trainer.game().subtree(), &within_round_tags)?
     };
-    if let Some(slot) = visits_slot {
-        *slot = hero_visit_count(trainer, cur_node, auth);
+    if let Some(slot) = visits_slot.as_mut() {
+        *slot.visits = hero_visit_count(trainer, cur_node, auth);
+        *slot.recency = hero_avg_recency(trainer, cur_node, auth);
     }
-    let (avg, sub_legal) =
-        read_current_strategy(trainer, cur_node, auth, auth_actor, cfg.min_hero_visits)?;
+    let (avg, sub_legal, frozen) = read_current_strategy(
+        trainer,
+        cur_node,
+        auth,
+        auth_actor,
+        cfg.min_hero_visits,
+        cfg.frozen_avg_recency,
+    )?;
+    if let Some(slot) = visits_slot {
+        *slot.frozen = frozen;
+    }
 
     // 缺口③ deep_menu（§2.1）：子树菜单（{1pot}）与调用方 blueprint `legal_abs` 不同
     // （{1pot} ⊊ blueprint），**不能对齐 legal_abs**（强行对齐时 blueprint 多出的档如 0.5pot
@@ -3393,6 +3582,20 @@ fn hero_visit_count(trainer: &SubgameTrainer, cur_node: NodeId, auth: &GameState
     trainer.visit_count(&info)
 }
 
+/// hero 真实手在 `cur_node` 落点信息集的平均策略累计时刻（[`SubgameTrainer::average_recency`]）。
+/// 与 [`read_current_strategy`] 的冻结判定读同一个信息集。
+fn hero_avg_recency(trainer: &SubgameTrainer, cur_node: NodeId, auth: &GameState) -> Option<f64> {
+    let (info, _) = trainer.game().query_at(cur_node, auth);
+    trainer.average_recency(&info)
+}
+
+/// 读数遥测在 [`SubgameSolveCache`] 里的写入槽（缓存臂才有）。
+struct ReadSlots<'a> {
+    visits: &'a mut Option<u32>,
+    recency: &'a mut Option<f64>,
+    frozen: &'a mut bool,
+}
+
 /// 读当前决策点策略（共享）：导航落点的决策者须 == 权威当前 actor（否则读到错座的真实手 →
 /// 失同步）；取 actor 真实手在 cur_node 的 average strategy。**用 auth 几何 query**——cur_node
 /// 是当前街 betting 后的深层节点，其合法集须用当前几何算（RoundStart 的 round-start template
@@ -3403,7 +3606,8 @@ fn read_current_strategy(
     auth: &GameState,
     auth_actor: PlayerId,
     min_visits: u32,
-) -> Result<(Vec<f64>, Vec<SimplifiedNlheAction>), String> {
+    frozen_recency: f64,
+) -> Result<(Vec<f64>, Vec<SimplifiedNlheAction>, bool), String> {
     let node = trainer.game().subtree().node(cur_node);
     let cur_actor = node.player_acting;
     if cur_actor != auth_actor {
@@ -3455,6 +3659,28 @@ fn read_current_strategy(
             ));
         }
     }
+    // Frozen average ([`SubgameSearchConfig::frozen_avg_recency`]): the strategy sum stopped
+    // growing early because hero's own reach of this row collapsed to 0 mid-solve, so `avg` is
+    // early-iteration σ. Regrets are weighted by the opponents' reach and kept learning while hero
+    // was a traverser here (the visit gate above already demands enough of those visits), so the
+    // regret-matching strategy is the solve's current answer for this row. A uniform RM (all
+    // regrets ≤ 0) carries no answer → giveup.
+    let mut avg = avg;
+    let mut frozen = false;
+    if frozen_recency > 0.0
+        && trainer
+            .average_recency(&info)
+            .is_some_and(|r| r < frozen_recency)
+    {
+        let cur = trainer.current_strategy(&info);
+        if cur.len() != avg.len() || cur.iter().all(|p| (p - uniform).abs() < 1e-12) {
+            return Err(format!(
+                "{FROZEN_AVG_ERR}（hero 平均策略冻结、当前策略也没有学到东西）"
+            ));
+        }
+        avg = cur;
+        frozen = true;
+    }
     // `avg` 按子树节点**建树几何** tag 序索引（CFR 解的维度恒 == node.legal_actions 长度——CFR
     // 首访该 infoset 时按 `legal_actions(state)` 注册动作槽，子树 solve 几何 == build 几何 →
     // 槽数 == 建树 tag 数）。不等 = CFR 索引契约破，硬 Err。
@@ -3472,7 +3698,7 @@ fn read_current_strategy(
     // 的加注档塌缩则 mass 并入 AllIn（保总概率）。返回向量与 `sub_legal` 同长、按位对齐 →
     // self_distribution / legal_abs 对齐两路调用方零改动复用。无塌缩时为恒等映射（byte-equal）。
     let projected = project_strategy_onto_auth_legal(&node.legal_actions, &avg, &sub_legal)?;
-    Ok((projected, sub_legal))
+    Ok((projected, sub_legal, frozen))
 }
 
 /// 把建树几何 tag 序的策略 `avg`（与子树节点 `node_tags` 一一对应、同长）投影到 **auth 真栈
@@ -3587,8 +3813,20 @@ fn navigate_subtree_by_real_actions(
     actions: &[(Action, bool)],
     hero: PlayerId,
 ) -> Result<NodeId, String> {
+    walk_subtree_real_line(subtree, abs, root_real, actions, hero).map(|(id, _)| id)
+}
+
+/// [`navigate_subtree_by_real_actions`] 本体，另返回走过的每一步 `(节点, 动作下标)`（时序）。
+fn walk_subtree_real_line(
+    subtree: &PublicBettingTree,
+    abs: &StreetActionAbstraction,
+    root_real: &GameState,
+    actions: &[(Action, bool)],
+    hero: PlayerId,
+) -> Result<(NodeId, Vec<(NodeId, usize)>), String> {
     let mut state = root_real.clone();
     let mut id = subtree.root_id();
+    let mut steps = Vec::with_capacity(actions.len());
     for (applied, applied_is_all_in) in actions {
         let node = subtree.node(id);
         let cur = state
@@ -3624,6 +3862,7 @@ fn navigate_subtree_by_real_actions(
             .iter()
             .position(|t| *t == tag)
             .ok_or_else(|| format!("真栈导航：tag {tag:?} 不在子树节点 {id} 合法集（失同步）"))?;
+        steps.push((id, idx));
         match node.children[idx] {
             Child::Decision(next) => id = next,
             Child::Terminal => {
@@ -3634,7 +3873,7 @@ fn navigate_subtree_by_real_actions(
             .apply(*applied)
             .map_err(|e| format!("真栈导航：apply({applied:?}) 非法: {e:?}"))?;
     }
-    Ok(id)
+    Ok((id, steps))
 }
 
 /// 缺口②续（exec 文档 v1 边界①）：**真栈锚**子博弈搜索——node_id 不再来自 100BB 影子 /
@@ -3822,7 +4061,7 @@ fn subgame_search_unanchored_cached_inner(
 ) -> Result<Vec<(SimplifiedNlheAction, f64)>, String> {
     let mut cache = cache;
     if let Some(c) = cache.as_deref_mut() {
-        c.last_read_visits = None; // 同锚定路径：早退不残留上一决策的值。
+        c.clear_read_telemetry(); // 同锚定路径：早退不残留上一决策的值。
     }
     if auth.is_terminal() || auth.current_player().is_none() {
         return Err("subgame_search_unanchored: auth 非 decision 节点".to_string());
@@ -4086,6 +4325,7 @@ fn subgame_search_unanchored_cached_inner(
         bucket_override.map_or_else(|| Arc::clone(&game.bucket_table), Arc::clone);
     let master = search_seed(cfg.seed, hand_seed, street_tag as u64);
     let real_hand = real_hand_spec(cfg, auth, auth_actor);
+    let frozen_prefix = frozen_real_prefix(cfg, real_hand, root_state, within_round, auth_actor)?;
     let key = cache.as_ref().map(|_| {
         solve_cache_key(
             KEY_KIND_UNANCHORED,
@@ -4100,6 +4340,7 @@ fn subgame_search_unanchored_cached_inner(
             hand_seed,
             street_tag as u64,
             real_hand,
+            frozen_prefix,
         )
     });
     // 建树前规模闸（≥7 Active 才计数）：只在真要建树时跑——缓存命中不数；被拒过的 key 直接复用
@@ -4137,6 +4378,7 @@ fn subgame_search_unanchored_cached_inner(
             )
         };
         let sub = apply_real_hand(sub, real_hand);
+        let sub = apply_frozen_real_line(sub, &sub_abs, root_state, frozen_prefix, auth_actor)?;
         let trainer = solve_subgame(sub, cfg, master)?;
         Ok(SolvedSubgame {
             trainer,
@@ -4147,7 +4389,7 @@ fn subgame_search_unanchored_cached_inner(
     };
     let solved_fresh: SolvedSubgame;
     // 读数遥测槽（[`SubgameSolveCache::last_read_visits`]）：只有走缓存臂时有处可写。
-    let mut visits_slot: Option<&mut Option<u32>> = None;
+    let mut visits_slot: Option<ReadSlots<'_>> = None;
     let solved: &SolvedSubgame = match (cache, key) {
         (Some(c), Some(key)) => {
             // §4.5 跨街复用遥测：cache 存在（走本臂）+ cross_street=Some 即一次 attempt（hit 见
@@ -4166,7 +4408,11 @@ fn subgame_search_unanchored_cached_inner(
                 c.store(key, build_and_solve()?);
             }
             // 字段级借用：遥测槽与条目是 `*c` 的不相交字段，可同时持有。
-            visits_slot = Some(&mut c.last_read_visits);
+            visits_slot = Some(ReadSlots {
+                visits: &mut c.last_read_visits,
+                recency: &mut c.last_read_recency,
+                frozen: &mut c.last_read_frozen,
+            });
             &c.entry
                 .as_ref()
                 .filter(|(k, _)| *k == key)
@@ -4191,11 +4437,21 @@ fn subgame_search_unanchored_cached_inner(
         within_round,
         auth_actor,
     )?;
-    if let Some(slot) = visits_slot {
-        *slot = hero_visit_count(trainer, cur_node, auth);
+    if let Some(slot) = visits_slot.as_mut() {
+        *slot.visits = hero_visit_count(trainer, cur_node, auth);
+        *slot.recency = hero_avg_recency(trainer, cur_node, auth);
     }
-    let (avg, sub_legal) =
-        read_current_strategy(trainer, cur_node, auth, auth_actor, cfg.min_hero_visits)?;
+    let (avg, sub_legal, frozen) = read_current_strategy(
+        trainer,
+        cur_node,
+        auth,
+        auth_actor,
+        cfg.min_hero_visits,
+        cfg.frozen_avg_recency,
+    )?;
+    if let Some(slot) = visits_slot {
+        *slot.frozen = frozen;
+    }
     self_distribution(&sub_legal, &avg)
 }
 
@@ -4980,6 +5236,8 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            frozen_avg_recency: 0.0,
+            freeze_real_line: false,
             real_hand_q: None,
         };
         let node_id = flop.current_node_id;
@@ -5043,6 +5301,8 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            frozen_avg_recency: 0.0,
+            freeze_real_line: false,
             real_hand_q: None,
         };
         let r = subgame_search(
@@ -5519,6 +5779,8 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            frozen_avg_recency: 0.0,
+            freeze_real_line: false,
             real_hand_q: None,
         };
         let d9 = subgame_search(
@@ -6282,6 +6544,8 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            frozen_avg_recency: 0.0,
+            freeze_real_line: false,
             real_hand_q: None,
         };
         let run = |cfg: &SubgameSearchConfig| {
@@ -6359,6 +6623,8 @@ mod tests {
             solve_threads: 1,
             blueprint_max_street: StreetTag::River,
             min_hero_visits: 0,
+            frozen_avg_recency: 0.0,
+            freeze_real_line: false,
             real_hand_q: None,
         };
         let base = subgame_search(
@@ -9069,6 +9335,7 @@ mod tests {
                 7,
                 0,
                 None,
+                &[],
             )
         };
         let base = TableConfig::default_6max_100bb();
@@ -10217,7 +10484,7 @@ mod tests {
         // Fixture has no all-in collapse at the root → projection is the identity, so the
         // returned vector can be compared position by position.
         assert_eq!(legal.len(), n);
-        let read = |t: &SubgameTrainer| read_current_strategy(t, root, &auth, actor, 0);
+        let read = |t: &SubgameTrainer| read_current_strategy(t, root, &auth, actor, 0, 0.0);
         let uniform = vec![1.0 / n as f64; n];
 
         // Never visited at all: pre-existing guard.
@@ -10256,7 +10523,7 @@ mod tests {
         // A later accumulation of a non-uniform σ → the average carries a solved mix.
         let w: Vec<f64> = (1..=n).map(|i| i as f64).collect();
         trainer.tables_mut().accumulate_strategy(info, &w);
-        let (probs, _) = read(&trainer).expect("learned infoset must be readable");
+        let (probs, ..) = read(&trainer).expect("learned infoset must be readable");
         let sum: Vec<f64> = w.iter().map(|wi| wi + 0.6 / n as f64).collect();
         let total: f64 = sum.iter().sum();
         for (p, si) in probs.iter().zip(&sum) {
@@ -10299,17 +10566,86 @@ mod tests {
         assert_eq!(hero_visit_count(&tracked, root, &auth), Some(7));
         assert_eq!(hero_visit_count(&untracked, root, &auth), None);
 
-        let err = read_current_strategy(&tracked, root, &auth, actor, 8).unwrap_err();
+        let err = read_current_strategy(&tracked, root, &auth, actor, 8, 0.0).unwrap_err();
         assert!(is_low_hero_visits_err(&err), "unexpected err: {err}");
         assert!(err.contains("7<8"), "访问数写进原因：{err}");
-        let (at_gate, _) =
-            read_current_strategy(&tracked, root, &auth, actor, 7).expect("= 门槛放行");
-        let (no_gate, _) = read_current_strategy(&tracked, root, &auth, actor, 0).expect("门槛 0");
+        let (at_gate, ..) =
+            read_current_strategy(&tracked, root, &auth, actor, 7, 0.0).expect("= 门槛放行");
+        let (no_gate, ..) =
+            read_current_strategy(&tracked, root, &auth, actor, 0, 0.0).expect("门槛 0");
         assert_eq!(at_gate, no_gate, "门槛只决定读不读，不改读数");
         assert!(
-            read_current_strategy(&untracked, root, &auth, actor, u32::MAX).is_ok(),
+            read_current_strategy(&untracked, root, &auth, actor, u32::MAX, 0.0).is_ok(),
             "未开计数 → 不设门槛"
         );
+    }
+
+    /// 平均策略冻结（[`SubgameSearchConfig::frozen_avg_recency`]）：平均策略质量都在早期累计
+    /// （recency 0.01 < 门槛）→ 改读 regret matching 当前策略并标记 frozen；门槛 0 = 不检查、
+    /// 照读平均策略；质量在中段累计（recency 0.5）→ 照读平均策略；冻结且当前策略均匀 → `Err`
+    /// （前缀 [`FROZEN_AVG_ERR`]）。
+    #[test]
+    fn read_current_strategy_frozen_average_reads_current() {
+        let auth = nway_limped_flop_state(3, 12_100, 0x4652_4F5A_454E_4156); // "FROZENAV"
+        let (abs, rules) = deep_menu_for(&auth);
+        let sub = || {
+            SubgameNlheGame::new(
+                stub_table(),
+                auth.config().clone(),
+                abs.clone(),
+                rules,
+                auth.clone(),
+                live_entrants(&auth),
+                0,
+            )
+        };
+        let root_of = |t: &SubgameTrainer| t.game().subtree().root_id();
+        let actor = auth.current_player().expect("decision node").0 as PlayerId;
+        // 平均策略偏向最后一个动作，regret 只有第一个动作为正。
+        let staged = |t_mass: f64, regret_first: f64| {
+            let mut t = SubgameTrainer::new(sub());
+            let root = root_of(&t);
+            let (info, legal) = t.game().query_at(root, &auth);
+            let n = t.game().subtree().node(root).legal_actions.len();
+            assert!(
+                n >= 2 && legal.len() == n,
+                "root needs ≥2 actions without collapse"
+            );
+            let mut w = vec![1.0; n];
+            w[n - 1] = 7.0;
+            t.tables_mut().accumulate_strategy_at(info, &w, t_mass);
+            let mut r = vec![-1.0; n];
+            r[0] = regret_first;
+            t.tables_mut().accumulate_regret(info, &r);
+            t.set_update_count(1000);
+            (t, info, n)
+        };
+        let (t, info, n) = staged(10.0, 4.0);
+        let root = root_of(&t);
+        assert!((t.average_recency(&info).unwrap() - 0.01).abs() < 1e-12);
+        assert!((hero_avg_recency(&t, root, &auth).unwrap() - 0.01).abs() < 1e-12);
+        let (p, _, frozen) = read_current_strategy(&t, root, &auth, actor, 0, 0.25).unwrap();
+        assert!(frozen);
+        let mut want = vec![0.0; n];
+        want[0] = 1.0;
+        assert_eq!(p, want, "冻结 → 读 regret matching 当前策略");
+        let (p, _, frozen) = read_current_strategy(&t, root, &auth, actor, 0, 0.0).unwrap();
+        assert!(!frozen);
+        assert_eq!(p, t.average_strategy(&info), "门槛 0 → 照读平均策略");
+
+        let (t, info, _) = staged(500.0, 4.0);
+        assert!((t.average_recency(&info).unwrap() - 0.5).abs() < 1e-12);
+        let (p, _, frozen) = read_current_strategy(&t, root, &auth, actor, 0, 0.25).unwrap();
+        assert!(!frozen);
+        assert_eq!(
+            p,
+            t.average_strategy(&info),
+            "质量在中段累计 → 照读平均策略"
+        );
+
+        let (t, _, _) = staged(10.0, -1.0);
+        let err = read_current_strategy(&t, root, &auth, actor, 0, 0.25).unwrap_err();
+        assert!(err.starts_with(FROZEN_AVG_ERR), "unexpected err: {err}");
     }
 
     /// 生产求解（[`solve_subgame`]）开访问计数，经缓存读数后 [`SubgameSolveCache::last_read_visits`]
@@ -10354,6 +10690,8 @@ mod tests {
         // 同一份解（命中缓存）按更高门槛读 → 拒读，遥测照写。
         let gated = SubgameSearchConfig {
             min_hero_visits: v + 1,
+            frozen_avg_recency: 0.0,
+            freeze_real_line: false,
             ..solve_cfg
         };
         let err = run(&mut cache, &gated).unwrap_err();
@@ -10362,6 +10700,8 @@ mod tests {
         assert_eq!(cache.last_read_visits(), Some(v));
         let ok = SubgameSearchConfig {
             min_hero_visits: v,
+            frozen_avg_recency: 0.0,
+            freeze_real_line: false,
             ..solve_cfg
         };
         run(&mut cache, &ok).expect("= 门槛放行");
@@ -10447,5 +10787,168 @@ mod tests {
         .expect("prewarm");
         run(&mut cache, &with_q(Some(0.5))).expect("decide after prewarm");
         assert_eq!((cache.hits(), cache.misses()), (1, 1), "预热后决策命中");
+    }
+
+    /// [`frozen_real_prefix`]：功能开 + 真实手牌信息集 → 到 hero 最后一个动作为止（含）；hero 本轮还没
+    /// 行动 → 空；功能关 / 没开真实手牌 → 空。
+    #[test]
+    fn frozen_real_prefix_cuts_at_hero_last_action() {
+        let root = nway_limped_flop_state(3, 12_100, 0x4652_5A50_5245_4658); // "FRZPREFX"
+        let hero = root.current_player().unwrap().0 as PlayerId;
+        let on = SubgameSearchConfig {
+            real_hand_q: Some(0.5),
+            freeze_real_line: true,
+            ..SubgameSearchConfig::default()
+        };
+        let rh = real_hand_spec(&on, &root, hero);
+        assert!(rh.is_some());
+        let line = [
+            (
+                Action::Bet {
+                    to: ChipAmount::new(300),
+                },
+                false,
+            ),
+            (
+                Action::Raise {
+                    to: ChipAmount::new(1200),
+                },
+                false,
+            ),
+            (Action::Fold, false),
+        ];
+        assert_eq!(
+            frozen_real_prefix(&on, rh, &root, &line, hero).unwrap(),
+            &line[..1]
+        );
+        assert!(frozen_real_prefix(&on, rh, &root, &[], hero)
+            .unwrap()
+            .is_empty());
+        // 对手 = 第二个行动者：前缀到他的加注为止。
+        let opp = (hero + 1) % 3;
+        assert_eq!(
+            frozen_real_prefix(&on, rh, &root, &line, opp).unwrap(),
+            &line[..2]
+        );
+        let off = SubgameSearchConfig {
+            freeze_real_line: false,
+            ..on
+        };
+        assert!(frozen_real_prefix(&off, rh, &root, &line, hero)
+            .unwrap()
+            .is_empty());
+        assert!(frozen_real_prefix(&on, None, &root, &line, hero)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// 固定 hero 本轮已做动作，走真实搜索路径：hero 下注、被加注、第三人弃牌后再轮到 hero。
+    /// - 本轮首次决策没有已做动作 → 与不固定同 key（首次决策 / 街起点预热不受影响）；
+    /// - 第二次决策 key 带上 hero 的下注 → 另解；同请求再读命中；
+    /// - 解里真实手牌专用格在根上恒走下注（一热、不学 regret），读数点的平均策略一直在累计
+    ///   （累计时刻 ≈ 0.5，不冻结、不改读当前策略）。
+    #[test]
+    fn freeze_real_line_search_path() {
+        let root = nway_limped_flop_state(3, 12_100, 0x4652_5A53_4541_5243); // "FRZSEARC"
+        let hero = root.current_player().unwrap().0 as PlayerId;
+        let line = [
+            (
+                Action::Bet {
+                    to: ChipAmount::new(300),
+                },
+                false,
+            ),
+            (
+                Action::Raise {
+                    to: ChipAmount::new(1200),
+                },
+                false,
+            ),
+            (Action::Fold, false),
+        ];
+        let mut auth = root.clone();
+        for (a, _) in &line {
+            auth.apply(*a).expect("line legal");
+        }
+        assert_eq!(auth.current_player().unwrap().0 as PlayerId, hero);
+        let base = SubgameSearchConfig {
+            iterations: 6_000,
+            max_subtree_nodes: 1_000_000,
+            use_blueprint_range: false,
+            trigger: SearchTrigger::AllPostflop,
+            deep_menu: true,
+            live_traversers: true,
+            real_hand_q: Some(0.5),
+            frozen_avg_recency: 0.25,
+            ..SubgameSearchConfig::default()
+        };
+        let on = SubgameSearchConfig {
+            freeze_real_line: true,
+            ..base
+        };
+        let (abs, rules) = deep_menu_for(&root);
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            root.config().clone(),
+            abs,
+            rules,
+        )
+        .expect("game");
+        let run = |cache: &mut SubgameSolveCache,
+                   cfg: &SubgameSearchConfig,
+                   auth: &GameState,
+                   within: &[(Action, bool)]| {
+            subgame_search_unanchored_cached(
+                Some(cache),
+                auth,
+                &root,
+                &game,
+                within,
+                cfg,
+                None,
+                None,
+                0x5EED,
+            )
+        };
+        let mut cache = SubgameSolveCache::new();
+        run(&mut cache, &base, &root, &[]).expect("first, freeze off");
+        run(&mut cache, &on, &root, &[]).expect("first, freeze on");
+        assert_eq!(
+            (cache.hits(), cache.misses()),
+            (1, 1),
+            "首次决策：开关同 key"
+        );
+        run(&mut cache, &on, &auth, &line).expect("second decision");
+        assert_eq!(cache.misses(), 2, "第二次决策带上 hero 的下注另解");
+        let rec = cache.last_read_recency().expect("读数遥测");
+        assert!(rec > 0.45, "读数点累计时刻 {rec}");
+        assert!(!cache.last_read_frozen(), "不该冻结");
+        let solved = cache.current().expect("entry");
+        let t = &solved.trainer;
+        let sub_root = t.game().subtree().root_id();
+        let frozen = t.game().frozen_real_line().to_vec();
+        assert_eq!(frozen.len(), 1, "只固定 hero 的一次动作");
+        assert_eq!(frozen[0].0, sub_root);
+        let street = t.game().subtree().node(sub_root).street;
+        let info = pack_info_set_v2(t.game().real_hand_slot(street).unwrap(), sub_root, street);
+        let sigma = t.current_strategy(&info);
+        assert_eq!(sigma[frozen[0].1], 1.0, "专用格恒走实际动作：{sigma:?}");
+        assert!(t
+            .tables()
+            .regret_row(info)
+            .unwrap()
+            .iter()
+            .all(|&r| r == 0.0));
+        run(&mut cache, &on, &auth, &line).expect("same request");
+        assert_eq!(cache.hits(), 2, "同请求命中");
+        // 不开 real_hand_q：固定不生效，第二次决策与首次决策同 key（旧行为）。
+        let no_rh = SubgameSearchConfig {
+            real_hand_q: None,
+            ..on
+        };
+        let mut cache = SubgameSolveCache::new();
+        run(&mut cache, &no_rh, &root, &[]).expect("first");
+        let _ = run(&mut cache, &no_rh, &auth, &line);
+        assert_eq!(cache.misses(), 1, "没有专用信息集就不固定");
     }
 }

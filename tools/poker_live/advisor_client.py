@@ -172,6 +172,11 @@ def add_advisor_args(p, default_seats, debug_help):
     # hero 真实手牌单独信息集 + 强制发牌（advisor 默认关）：hero 当遍历者时以比例 q 直接发真实底牌，
     # 0 = 只开专用信息集。不传 = 关。
     p.add_argument("--search-real-hand-q", type=float, default=None)
+    # 固定 hero 真实手牌本轮已做的动作（advisor 默认关，须配 --search-real-hand-q）：求解里真实手牌恒走
+    # 实际那条线，读数点的平均策略不会冻结。不传 = 关。
+    p.add_argument("--search-freeze-real-line", choices=["on", "off"], default=None)
+    # 平均策略冻结门槛（advisor 默认 0.25，0 = 关）：读数点平均策略的累计时刻低于它就改读当前策略。
+    p.add_argument("--search-frozen-avg-recency", type=float, default=None)
     # 弱牌押上全部筹码护栏（advisor 默认 on）：翻后弱牌不全下、不做投入过半剩余筹码的加注。
     # 不传 = 吃 advisor 默认（ON）。
     p.add_argument("--search-weak-commit-guard", choices=["on", "off"], default=None)
@@ -261,6 +266,14 @@ def validate_advisor_args(args):
         raise SystemExit("--search-real-hand-q 需配 --search（它只管搜索求解）")
     if args.search_real_hand_q is not None and not 0.0 <= args.search_real_hand_q <= 1.0:
         raise SystemExit("--search-real-hand-q 须在 [0, 1]")
+    if args.search_freeze_real_line is not None and not args.search:
+        raise SystemExit("--search-freeze-real-line 需配 --search（它只管搜索求解）")
+    if args.search_freeze_real_line == "on" and args.search_real_hand_q is None:
+        raise SystemExit("--search-freeze-real-line on 需配 --search-real-hand-q（只固定真实手牌专用信息集）")
+    if args.search_frozen_avg_recency is not None and not args.search:
+        raise SystemExit("--search-frozen-avg-recency 需配 --search（它只管搜索读数）")
+    if args.search_frozen_avg_recency is not None and not 0.0 <= args.search_frozen_avg_recency < 1.0:
+        raise SystemExit("--search-frozen-avg-recency 须在 [0, 1)")
     for name in ("search_iterations_turn", "search_iterations_river"):
         value = getattr(args, name)
         flag = "--" + name.replace("_", "-")
@@ -317,6 +330,10 @@ def advisor_extra_args(args, warm_profile_hh=None):
             extra += ["--search-min-hero-visits", str(args.search_min_hero_visits)]
         if args.search_real_hand_q is not None:
             extra += ["--search-real-hand-q", repr(args.search_real_hand_q)]
+        if args.search_freeze_real_line is not None:
+            extra += ["--search-freeze-real-line", args.search_freeze_real_line]
+        if args.search_frozen_avg_recency is not None:
+            extra += ["--search-frozen-avg-recency", repr(args.search_frozen_avg_recency)]
         if args.search_weak_commit_guard is not None:
             extra += ["--search-weak-commit-guard", args.search_weak_commit_guard]
         if args.search_deep_menu:

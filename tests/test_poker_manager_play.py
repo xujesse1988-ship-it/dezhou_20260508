@@ -361,6 +361,30 @@ class ManagerTests(unittest.TestCase):
                 ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin",
                  "--search-iterations-river", "5"]))
 
+    def test_freeze_real_line_pass_through(self):
+        import argparse
+        from poker_live.advisor_client import (add_advisor_args, advisor_extra_args,
+                                               validate_advisor_args)
+        parser = argparse.ArgumentParser()
+        add_advisor_args(parser, default_seats=6, debug_help="")
+        base = ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin", "--search"]
+        args = parser.parse_args(base)
+        self.assertNotIn("--search-freeze-real-line", advisor_extra_args(args))
+        self.assertNotIn("--search-frozen-avg-recency", advisor_extra_args(args))
+        args = parser.parse_args(base + ["--search-real-hand-q", "0.5",
+                                         "--search-freeze-real-line", "on",
+                                         "--search-frozen-avg-recency", "0.2"])
+        validate_advisor_args(args)
+        extra = advisor_extra_args(args)
+        i = extra.index("--search-freeze-real-line")
+        self.assertEqual(extra[i:i + 4], ["--search-freeze-real-line", "on",
+                                          "--search-frozen-avg-recency", "0.2"])
+        for bad in (["--search-freeze-real-line", "on"],
+                    ["--search-frozen-avg-recency", "1.0"]):
+            err = io.StringIO()
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+                validate_advisor_args(parser.parse_args(base + bad))
+
     def test_exploit_4bet_state_requires_main_switch(self):
         from poker_manager_play import main
         err = io.StringIO()

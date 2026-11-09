@@ -97,6 +97,8 @@ k=6/7/8/9 = 557k / 3.07M / 15.5M / 72.6M 节点,单加注池 9-way 1.47M;≥7 �
 拒读:锚定 flop 退回 blueprint 同一节点(`source=blueprint:low_hero_visits`,真码深闸不过则兜底),转牌 / 河牌 /
 脱锚走 `search_giveup:*:low_hero_visits`。每次搜索读数的访问数写进响应 `hero_visits`。200 来自本机近似实验
 (9 座测试 blueprint + 500 桶 + 生产搜索参数):访问 ≤ 150 的读数几乎都一边倒,**生产值待按实盘 `hero_visits` 标定**。
+平均策略冻结:`SubgameSearchConfig::frozen_avg_recency`(advisor `--search-frozen-avg-recency`,默认 0.25,0 = 关),hero 落点平均策略累计时刻 ÷ 总更新数低于它 → 改读 regret matching 当前策略(`:frozen_rm`),当前策略均匀 → `frozen_avg` 放弃。
+固定真实手牌已做动作:`SubgameSearchConfig::freeze_real_line`(advisor `--search-freeze-real-line on|off`,默认 off,须配 `--search-real-hand-q`),本轮 hero 已做动作在真实手牌专用格上固定(`SubgameNlheGame::with_frozen_real_line`),进缓存 key;本轮首次决策 key 不变。
 ② `--search-weak-commit-guard on|off`(默认 on):翻后弱牌(坚果度 < 0.75 且顺子 / 同花出牌 < 8)时,把全下和
 「新投入 ≥ 一半剩余筹码」的下注 / 加注的概率按比例挪给过牌 / 跟注 / 弃牌,`source` 追加 `:weak_commit_guard`,
 `probs` 仍记原分布。**面对下注、分布里没有 `call` 这一档时(2026-10-22 修)**挪走的概率整份给真实跟注:对手的注在树里被映成全下,

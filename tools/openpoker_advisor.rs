@@ -176,6 +176,8 @@ const DEFAULT_SEARCH_UNANCHORED_CROSS_STREET: bool = true;
 /// 锚定之外还须过真码深闸（[`flop_blueprint_stack_gate`]）：100BB 影子按对称 100BB 重放，短码
 /// all-in 在影子里就是 100BB all-in、照样同步，光看锚定会让 blueprint 用错底池赔率 / SPR 出牌。
 /// 还须过尺寸闸（[`flop_blueprint_size_gate`]）：本街每次下注的映射误差都在 0.75–1.33 内。
+/// 还须过底池闸（[`flop_blueprint_pot_gate`]）：翻牌开始时真实底池 ÷ 影子底池在 0.75–1.33 内——
+/// 翻前映射让影子底池偏了，blueprint 就是在别的底池上出牌，整条翻牌都改实时搜索。
 const DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT: bool = false;
 /// 搜索一律走脱锚路径的默认（`--search-force-unanchored`）：**默认关**（旧行为 byte-equal）。
 /// `on` = lockstep 同步、命中触发面、本该走锚定搜索的决策也改走 [`decide_search_unanchored`]：
@@ -214,6 +216,10 @@ const DEFAULT_SEARCH_MAX_NODES: usize = 200_000;
 /// 到上千不等（取决于解里对手走这条线的频率），所以门槛管的是「这一次解」而不是节点本身。生产
 /// 范围更窄，实际分布要看决策日志的 `hero_visits` 再定。
 const DEFAULT_SEARCH_MIN_HERO_VISITS: u32 = 200;
+/// 平均策略冻结门槛的 advisor 默认（`--search-frozen-avg-recency`，
+/// [`SubgameSearchConfig::frozen_avg_recency`]）：hero 落点平均策略的累计时刻（0..1，稳定的线 ≈ 0.5）
+/// 低于它 → 认为冻结，改读 regret matching 当前策略，`source` 带 `:frozen_rm`。`0` = 关。
+const DEFAULT_SEARCH_FROZEN_AVG_RECENCY: f64 = 0.25;
 /// Default of `--preflop-commit-min-visits` ([`PreflopVisitGate`]): below this cumulative strategy weight
 /// of hero's own preflop row the blueprint's all-in and committing raises are not used. `0` = off.
 ///
@@ -248,6 +254,12 @@ const FLOP_BLUEPRINT_EFF_STACK_PCT_MAX: u64 = 140;
 /// c-bet 就会用「面对满池注」的弃牌频率（`openpoker_code_review_findings_2026_10_16.md` §3）。
 const FLOP_BLUEPRINT_SIZE_RATIO_MILLI_MIN: u64 = 750;
 const FLOP_BLUEPRINT_SIZE_RATIO_MILLI_MAX: u64 = 1333;
+/// flop 优先 blueprint 的翻牌起点底池偏差区间（[`flop_blueprint_pot_gate`]）：翻牌开始时真实底池 ÷
+/// blueprint 树（影子）里的底池，须落在 [MIN, MAX]/1000 内（含端点），否则整个 flop 照常实时搜索。
+/// 翻前映射（大尺寸开池映射成小开池、平跟当弃牌）会让影子底池偏小：ante-table:hand:002211 真实 1710、
+/// 影子约 870，blueprint 在别的底池上出牌；尺寸闸只看本街下注、查不到这类偏差。
+const FLOP_BLUEPRINT_POT_RATIO_MILLI_MIN: u64 = 750;
+const FLOP_BLUEPRINT_POT_RATIO_MILLI_MAX: u64 = 1333;
 /// 搜索墙钟告警阈的建树余量（ms）：最坏单线程建树 ≈ 4-way@20× 宽档 ~2.7s，留 3s。
 const SEARCH_WALL_BUILD_MARGIN_MS: u128 = 3000;
 /// 无 `time_budget`（固定迭代）时的告警阈回落（ms）。
@@ -411,6 +423,10 @@ struct Response {
     /// 搜索走到读数的决策才填（含因访问不足被拒的那次）；blueprint / 其余兜底恒 `None`（serde skip）。
     #[serde(skip_serializing_if = "Option::is_none")]
     hero_visits: Option<u32>,
+    /// 搜索读数遥测：hero 落点平均策略的累计时刻（[`SubgameSolveCache::last_read_recency`]，0..1，
+    /// 稳定的线 ≈ 0.5、冻结 ≈ 0）。填写时机同 `hero_visits`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avg_recency: Option<f64>,
     /// Cumulative strategy weight of hero's preflop blueprint row ([`PreflopVisitGate`]). Filled on every
     /// preflop blueprint decision when the gate is wired up, whether or not it fired; a firing shows as
     /// `:low_visits_no_commit` in `source`. `None` elsewhere (serde skip).
@@ -772,7 +788,8 @@ struct SearchRuntime {
     /// `--search-flop-prefer-blueprint`（[`DEFAULT_SEARCH_FLOP_PREFER_BLUEPRINT`]）：`on` = 仅 flop
     /// 街，锚定面（lockstep Ok / 100BB 影子同步）且过真码深闸（[`flop_blueprint_stack_gate`]：无人
     /// all-in、有效码深 60–140BB）和尺寸闸（[`flop_blueprint_size_gate`]：本街下注映射误差
-    /// 0.75–1.33）时即使命中 trigger 也走 blueprint、不实时搜索；不过闸 / 脱影子
+    /// 0.75–1.33）和底池闸（[`flop_blueprint_pot_gate`]：翻牌起点真实 / 影子底池 0.75–1.33）
+    /// 时即使命中 trigger 也走 blueprint、不实时搜索；不过闸 / 脱影子
     /// flop（lockstep 失同步）照常实时搜索（[`decide_search_unanchored`] 不经此旗）。**默认关**
     /// （`false`，旧行为 byte-equal）。turn/river 锚定面不受影响。预热（[`prewarm`]）同源 skip 锚定
     /// flop 子树（不 build+solve），否则 advisor 单线程下 hero 决策白等一个 time_budget 才拿 blueprint。
@@ -948,13 +965,15 @@ fn prewarm_inner(
     // 白等一个 time_budget 才拿到 blueprint。故锚定 flop 直接 skip，hero 决策即时返回。脱影子 flop
     // （lockstep Err：off-stack all-in / limp 线）decide 照常搜索、不受此旗影响 → 不在此 skip，照常预热。
     // 真码深闸同 decide（[`flop_blueprint_stack_gate`]，街起点视角）：不过闸 = decide 会搜索 → 照常预热。
+    // 底池闸同 decide（[`flop_blueprint_pot_gate`]，翻牌起点底池，整条街不变）。
     // 尺寸闸同 decide（[`flop_blueprint_size_gate`]，看到目前为止的本街下注）。街内此后才出现的
     // all-in / 偏离菜单的下注预热看不到 → 那次 decide 现解（MISS），只慢不错。
     if rt.flop_prefer_blueprint
         && round_start.street() == poker::Street::Flop
-        && lockstep.as_ref().is_ok_and(|(.., sizes)| {
+        && lockstep.as_ref().is_ok_and(|(real, abs, _, sizes)| {
             flop_blueprint_stack_gate(req, &solver_cfg, scale, &smap, &round_start, my_seat_solver)
                 .and_then(|()| flop_blueprint_size_gate(sizes, poker::Street::Flop))
+                .and_then(|()| flop_blueprint_pot_gate(real, &abs.game_state))
                 .is_ok()
         })
     {
@@ -3143,7 +3162,8 @@ fn decide_with(
     // should_search 只读街 + 本街是否已起注（与码深无关）→ 在 100BB `real` 上判等价真栈 auth。
     // `--search-flop-prefer-blueprint` on（[`SearchRuntime`] doc）：仅 flop 锚定面（此处 lockstep Ok）
     // 且过真码深闸（[`flop_blueprint_stack_gate`]：无人 all-in + 有效码深在区间内）和尺寸闸
-    // （[`flop_blueprint_size_gate`]：本街下注映射误差在区间内）才抑制搜索回 blueprint；真栈建不出
+    // （[`flop_blueprint_size_gate`]：本街下注映射误差在区间内）和底池闸（[`flop_blueprint_pot_gate`]：
+    // 翻牌起点真实 / 影子底池在区间内）才抑制搜索回 blueprint；真栈建不出
     // 视同不过闸。脱影子 flop 走上面 `decide_search_unanchored`，不经此 gating。
     let flop_bp_gate = match search {
         Some(rt) if rt.flop_prefer_blueprint && street == poker::Street::Flop => Some(
@@ -3160,7 +3180,8 @@ fn decide_with(
             .and_then(|(auth, ..)| {
                 flop_blueprint_stack_gate(req, &solver_cfg, scale, &smap, &auth, my_seat_solver)
             })
-            .and_then(|()| flop_blueprint_size_gate(&sizes, street)),
+            .and_then(|()| flop_blueprint_size_gate(&sizes, street))
+            .and_then(|()| flop_blueprint_pot_gate(&real, &abs.game_state)),
         ),
         _ => None,
     };
@@ -3259,6 +3280,8 @@ fn decide_with(
     let mut deep_abs_holder: Option<StreetActionAbstraction> = None;
     let mut solve_updates: Option<u64> = None;
     let mut hero_visits: Option<u32> = None;
+    let mut avg_recency: Option<f64> = None;
+    let mut frozen_rm = false;
     // 子树当前街的下注菜单（[`subtree_menu_label`]），搜索路径的 resp 都带上。
     let mut search_menu: Option<String> = None;
     // 搜索读数因 hero 信息集访问不足被拒、flop 退回 blueprint 同一节点出牌（source 标
@@ -3382,6 +3405,8 @@ fn decide_with(
                 let hit = solve_cache.misses() == misses_before;
                 solve_updates = solve_cache.entry_update_count();
                 hero_visits = solve_cache.last_read_visits();
+                avg_recency = solve_cache.last_read_recency();
+                frozen_rm = solve_cache.last_read_frozen();
                 log_search_wall(
                     "",
                     street,
@@ -3403,6 +3428,7 @@ fn decide_with(
             // crop 缺后验（补解不成）单独分桶 `search_giveup:crop_no_posterior:*`。
             Err(reason) => {
                 hero_visits = solve_cache.last_read_visits();
+                avg_recency = solve_cache.last_read_recency();
                 // 访问量门槛拒读（SubgameSearchConfig::min_hero_visits）：flop 上 blueprint 保留了
                 // 这个节点、训练量远大于一次搜索 → 退回它（真码深闸不过 = 100BB 影子的底池赔率 /
                 // SPR 不可信 → 不退，走下面兜底）。转牌 / 河牌 blueprint 已裁掉，只能兜底。
@@ -3452,6 +3478,7 @@ fn decide_with(
                         resp.range_equity = range_eq.map(|r| r.eq);
                         resp.range_equity_opps = range_eq.map(|r| r.opps);
                         resp.hero_visits = hero_visits;
+                        resp.avg_recency = avg_recency;
                         resp.menu = Some(menu);
                         return resp;
                     }
@@ -3612,7 +3639,7 @@ fn decide_with(
         // 合法动作：填 source（search / blueprint）+ 诊断。不合法时 action_to_response 已产
         // safe_fallback（source = fallback:...），不覆盖。bet/raise 退成 call/check 时追加降级标记。
         resp.source = format!(
-            "{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}",
             if low_visits_bp {
                 "blueprint:low_hero_visits"
             } else if placeholder_search {
@@ -3622,6 +3649,7 @@ fn decide_with(
             } else {
                 "blueprint"
             },
+            if frozen_rm { ":frozen_rm" } else { "" },
             if limp_first_bp && limp.mapped() {
                 ":limp_first"
             } else {
@@ -3655,6 +3683,7 @@ fn decide_with(
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates; // blueprint 路径恒 None（serde skip，byte-equal）。
         resp.hero_visits = hero_visits;
+        resp.avg_recency = avg_recency;
         resp.bp_row_weight = bp_row_weight;
         resp.menu = search_menu;
         resp.fourbet = fourbet_tel;
@@ -5324,6 +5353,40 @@ fn flop_blueprint_size_gate(sizes: &[BetSizeMap], street: poker::Street) -> Resu
     Ok(())
 }
 
+/// 本街开始时的底池：全部投入减去本轮投入（[`poker::GameState::pot`] 含本轮投入）。
+fn street_start_pot(state: &poker::GameState) -> u64 {
+    let this_round: u64 = state
+        .players()
+        .iter()
+        .map(|p| p.committed_this_round.as_u64())
+        .sum();
+    state.pot().as_u64().saturating_sub(this_round)
+}
+
+/// `--search-flop-prefer-blueprint` 的底池闸：翻牌开始时真实底池 ÷ 影子底池须落在
+/// [[`FLOP_BLUEPRINT_POT_RATIO_MILLI_MIN`], [`FLOP_BLUEPRINT_POT_RATIO_MILLI_MAX`]]/1000 内，blueprint
+/// 才算在打真实的底池；`real` / `shadow` = lockstep 重放的真实态与影子态（同为 solver 单位、都在 flop
+/// 街内任一点——翻牌起点底池在整条街上不变，所以同一手翻牌的每次决策结论一致）。
+/// `Err(pot:<真实>/<影子>)` = 须实时搜索。决策路径与预热共用（[`decide`] / [`prewarm`]）。
+fn flop_blueprint_pot_gate(
+    real: &poker::GameState,
+    shadow: &poker::GameState,
+) -> Result<(), String> {
+    flop_pot_ratio_band(street_start_pot(real), street_start_pot(shadow))
+}
+
+/// [`flop_blueprint_pot_gate`] 的比值判定：`r` / `s` = 真实 / 影子翻牌起点底池。
+fn flop_pot_ratio_band(r: u64, s: u64) -> Result<(), String> {
+    let x = r.saturating_mul(1000);
+    if s == 0
+        || x < s.saturating_mul(FLOP_BLUEPRINT_POT_RATIO_MILLI_MIN)
+        || x > s.saturating_mul(FLOP_BLUEPRINT_POT_RATIO_MILLI_MAX)
+    {
+        return Err(format!("pot:{r}/{s}"));
+    }
+    Ok(())
+}
+
 /// 一个对手座本手**翻前**的入池方式（[`preflop_entry_kinds`] 重放判定）：决定画像修正用哪种宽度形状，
 /// 或这一座干脆不修正。画像只有全局 VPIP / PFR，只能描述「非盲位平跟 / 平跟一次加注」和「开池加注」
 /// 两类线；盲位的过牌 / 补齐 / 防守、3bet 及以上的线它都描述不了，套上去方向是错的
@@ -5692,6 +5755,8 @@ fn decide_search_unanchored(
         search_result.is_ok(),
     );
     let hero_visits = solve_cache.last_read_visits();
+    let avg_recency = solve_cache.last_read_recency();
+    let frozen_rm = solve_cache.last_read_frozen();
     let dist = match search_result {
         Ok(d) => d,
         Err(reason) => {
@@ -5721,6 +5786,7 @@ fn decide_search_unanchored(
             resp.range_equity = range_eq.map(|r| r.eq);
             resp.range_equity_opps = range_eq.map(|r| r.opps);
             resp.hero_visits = hero_visits;
+            resp.avg_recency = avg_recency;
             resp.menu = Some(menu);
             return resp;
         }
@@ -5774,7 +5840,8 @@ fn decide_search_unanchored(
     let (mut resp, degrade) = action_to_response(solver_action, scale, &req.valid);
     if resp.source.is_empty() {
         resp.source = format!(
-            "search:unanchored{}{}{coef_mismatch_tag}",
+            "search:unanchored{}{}{}{coef_mismatch_tag}",
+            if frozen_rm { ":frozen_rm" } else { "" },
             if guarded.is_some() {
                 ":weak_commit_guard"
             } else {
@@ -5787,6 +5854,7 @@ fn decide_search_unanchored(
         resp.probs = Some(probs_log(&dist));
         resp.solve_updates = solve_updates;
         resp.hero_visits = hero_visits;
+        resp.avg_recency = avg_recency;
         resp.menu = Some(menu.clone());
         // 叠加剥削遥测：本决策实际剥削了哪些对手座（已收敛）+ 其 VPIP。无收敛对手 / 跨街后验命中
         // （subgame 不再叠加）→ None（serde skip → byte-equal）。
@@ -6960,8 +7028,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} iters_turn={} iters_river={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} force_unanchored={} limp_as_fold={} min_hero_visits={} real_hand_q={:?} weak_commit_guard={} bucket_table={}",
-            scfg.trigger, scfg.iterations, rt.cfg_for(poker::Street::Turn).iterations, rt.cfg_for(poker::Street::River).iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.force_unanchored, rt.limp_as_fold, scfg.min_hero_visits, scfg.real_hand_q, rt.weak_commit_guard,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} iters_turn={} iters_river={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} force_unanchored={} limp_as_fold={} min_hero_visits={} frozen_avg_recency={} freeze_real_line={} real_hand_q={:?} weak_commit_guard={} bucket_table={}",
+            scfg.trigger, scfg.iterations, rt.cfg_for(poker::Street::Turn).iterations, rt.cfg_for(poker::Street::River).iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.force_unanchored, rt.limp_as_fold, scfg.min_hero_visits, scfg.frozen_avg_recency, scfg.freeze_real_line, scfg.real_hand_q, rt.weak_commit_guard,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
         if let Some(cell) = &rt.exploit {
@@ -7222,6 +7290,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_limp_as_fold: Option<bool> = None;
     let mut search_limp_first_blueprint: Option<bool> = None;
     let mut search_min_hero_visits: Option<u32> = None;
+    let mut search_frozen_avg_recency: Option<f64> = None;
+    let mut search_freeze_real_line: Option<bool> = None;
     let mut search_real_hand_q: Option<f64> = None;
     let mut search_weak_commit_guard: Option<bool> = None;
     // 叠加剥削（--exploit*，仅 --search 开时生效）。
@@ -7467,6 +7537,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                         .map_err(|e| format!("bad search-min-hero-visits: {e}"))?,
                 )
             }
+            "--search-frozen-avg-recency" => {
+                let r: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad search-frozen-avg-recency: {e}"))?;
+                if !(0.0..1.0).contains(&r) {
+                    return Err(format!("search-frozen-avg-recency 须在 [0, 1) 内，得 {r}"));
+                }
+                search_frozen_avg_recency = Some(r);
+            }
             "--search-real-hand-q" => {
                 let q: f64 = next_val(&mut it, &arg)?
                     .parse()
@@ -7475,6 +7554,16 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     return Err(format!("--search-real-hand-q 须在 [0, 1]，得 {q}"));
                 }
                 search_real_hand_q = Some(q);
+            }
+            "--search-freeze-real-line" => {
+                let v = next_val(&mut it, &arg)?;
+                search_freeze_real_line = Some(match v.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(format!("--search-freeze-real-line 须 on|off，得 {other}"))
+                    }
+                });
             }
             "--search-weak-commit-guard" => {
                 let v = next_val(&mut it, &arg)?;
@@ -7593,6 +7682,13 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     }
     // --search-* flag 仅在 --search 开时生效，避免「设了参数却忘开搜索」静默跑 blueprint。
     let search = if search_on {
+        if search_freeze_real_line == Some(true) && search_real_hand_q.is_none() {
+            return Err(
+                "--search-freeze-real-line on 须同时传 --search-real-hand-q（只固定真实手牌专用信息集，\
+                 不能固定整个桶）"
+                    .to_string(),
+            );
+        }
         // 设了 time_budget 而未显式给 --search-iterations → iterations 抬到 u64::MAX 当纯安全
         // 上界、求解全由墙钟截断（老默认 1000 在 ~10–30ms 处先撞迭代上限，预算永远绑不上 =
         // 静默失效；2026-06-11 live searchon50 实撞）。LCFR period 不随之爆炸：solve_subgame
@@ -7623,8 +7719,14 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             solve_threads: search_solve_threads.unwrap_or(1),
             // 读数门槛（SubgameSearchConfig::min_hero_visits doc）：hero 信息集访问不足就不用这份解。
             min_hero_visits: search_min_hero_visits.unwrap_or(DEFAULT_SEARCH_MIN_HERO_VISITS),
+            // 平均策略冻结门槛（SubgameSearchConfig::frozen_avg_recency doc）。
+            frozen_avg_recency: search_frozen_avg_recency
+                .unwrap_or(DEFAULT_SEARCH_FROZEN_AVG_RECENCY),
             // hero 真实手牌单独信息集 + 强制发牌（SubgameSearchConfig::real_hand_q doc）：不传 = 关。
             real_hand_q: search_real_hand_q,
+            // 固定 hero 真实手牌本轮已做动作（SubgameSearchConfig::freeze_real_line doc）：默认关；
+            // 要真实手牌专用信息集，上面已校验须同时传 --search-real-hand-q。
+            freeze_real_line: search_freeze_real_line.unwrap_or(false),
             // 解到终局（深码 / 多人 §2.1）：depth_limit / biased_leaf 均 false（默认）；
             // resolve_root / use_blueprint_range / seed 用默认（RoundStart / true / 固定基）。
             ..SubgameSearchConfig::default()
@@ -7648,6 +7750,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_limp_as_fold.is_some()
             || search_limp_first_blueprint.is_some()
             || search_min_hero_visits.is_some()
+            || search_frozen_avg_recency.is_some()
+            || search_freeze_real_line.is_some()
             || search_real_hand_q.is_some()
             || search_weak_commit_guard.is_some()
         {
@@ -13389,6 +13493,113 @@ mod tests {
         }
     }
 
+    /// 底池闸边界：真实 / 影子 ∈ [0.75, 1.333]（含端点）才过；影子底池为 0 必拒。
+    #[test]
+    fn flop_pot_ratio_band_edges() {
+        assert_eq!(flop_pot_ratio_band(1000, 1000), Ok(()));
+        assert_eq!(flop_pot_ratio_band(750, 1000), Ok(()));
+        assert_eq!(flop_pot_ratio_band(1333, 1000), Ok(()));
+        assert_eq!(flop_pot_ratio_band(749, 1000), Err("pot:749/1000".into()));
+        assert_eq!(flop_pot_ratio_band(1334, 1000), Err("pot:1334/1000".into()));
+        // ante-table:hand:002211：真实 1710、影子约 870。
+        assert!(flop_pot_ratio_band(1710, 870).is_err());
+        assert!(flop_pot_ratio_band(10, 0).is_err());
+    }
+
+    /// 底池闸端到端：翻前 UTG 开池加到 `open_to`，其余弃、BB 跟，翻牌 hero=BB 首个行动、未起注，
+    /// `--search-flop-prefer-blueprint` on + AllPostflop。测试树翻前菜单 {1pot}（开池到 70）：开到 70
+    /// （底池一致）/ 80（真实 170 ÷ 影子 150 = 1.13）→ 仍走 blueprint，与 search=None byte-equal；
+    /// 开到 200（真实 410 ÷ 影子 150 = 2.73）→ 本街虽无下注、尺寸闸恒过，仍改走锚定搜索。
+    #[test]
+    fn flop_prefer_blueprint_pot_gate_routes_mismatched_pot_to_search() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        };
+        let opened = |open_to: u64| {
+            let mut req = flop_first_unraised_req(vec![2000; 6]);
+            req.my_seat = 2;
+            req.actions = vec![
+                hist(3, "raise", Some(open_to)),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+                hist(0, "fold", None),
+                hist(1, "fold", None),
+                hist(2, "call", Some(open_to)),
+            ];
+            req.valid = ValidActions {
+                can_check: true,
+                can_call: false,
+                can_raise: true,
+                min_raise: Some(20),
+                max_raise: Some(2000 - open_to),
+            };
+            req
+        };
+        let run = |req: &Request, rt: Option<&SearchRuntime>| {
+            decide(
+                &game,
+                &abs,
+                &uniform,
+                req,
+                0xB1DE,
+                rt,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        for (open_to, real_pot, blueprint) in [(70, 150, true), (80, 170, true), (200, 410, false)]
+        {
+            let req = opened(open_to);
+            let smap = seat_map(&req, 6).unwrap();
+            let (real, ab, _, sizes) = lockstep_replay(
+                &game,
+                game.table_config(),
+                &smap,
+                &req,
+                5,
+                3,
+                Some(SeatId(smap.tree_seat(2).unwrap())),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("open_to={open_to}: 应锚定，得 {}", e.reason));
+            assert_eq!(real.street(), poker::Street::Flop, "open_to={open_to}");
+            assert!(flop_blueprint_size_gate(&sizes, poker::Street::Flop).is_ok());
+            // solver 单位 = 真实筹码 × scale(5)；影子开池恒映射到 1pot（70）。
+            assert_eq!(street_start_pot(&real), real_pot * 5, "open_to={open_to}");
+            assert_eq!(
+                street_start_pot(&ab.game_state),
+                150 * 5,
+                "open_to={open_to}"
+            );
+            assert_eq!(
+                flop_blueprint_pot_gate(&real, &ab.game_state).is_ok(),
+                blueprint,
+                "open_to={open_to}"
+            );
+            let prefer = run(&req, Some(&rt_flop_prefer_blueprint(scfg)));
+            assert!(
+                is_legal(&prefer, &req.valid),
+                "open_to={open_to}: {prefer:?}"
+            );
+            if blueprint {
+                assert_eq!(
+                    prefer,
+                    run(&req, None),
+                    "open_to={open_to}: 底池偏差在区间内须走 blueprint"
+                );
+            } else {
+                assert!(
+                    prefer.source.starts_with("search"),
+                    "open_to={open_to}: 底池偏差超区间须改走搜索，得 {prefer:?}"
+                );
+            }
+        }
+    }
+
     /// 尺寸闸的预热同源：hero=SB 面对 BB 下注时预热，误差在区间内（1pot）→ skip；超区间（1.5pot）
     /// → 照常预热（decide 会搜索，不预热就白等一次现解）。
     #[test]
@@ -13417,6 +13628,44 @@ mod tests {
                 &mut cache,
             );
             assert_eq!(p.source, expect, "bet_to={bet_to}: {p:?}");
+        }
+    }
+
+    /// 底池闸的预热同源：翻前 UTG 开池到 `open_to`、BB 跟，hero=UTG 在翻牌街起点（BB 先行动）预热。
+    /// 底池一致（70）→ skip；影子底池偏小（200）→ 照常预热（decide 会搜索）。
+    #[test]
+    fn prewarm_flop_prefer_blueprint_pot_gate() {
+        let game = nolimp_game();
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let scfg = SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            ..SubgameSearchConfig::default()
+        };
+        for (open_to, expect) in [
+            (70, "prewarm:skip:flop_prefer_blueprint"),
+            (200, "prewarm:stored"),
+        ] {
+            let mut req = flop_first_unraised_req(vec![2000; 6]);
+            req.my_seat = 3;
+            req.actions = vec![
+                hist(3, "raise", Some(open_to)),
+                hist(4, "fold", None),
+                hist(5, "fold", None),
+                hist(0, "fold", None),
+                hist(1, "fold", None),
+                hist(2, "call", Some(open_to)),
+            ];
+            let mut cache = SubgameSolveCache::new();
+            let p = prewarm(
+                &game,
+                &uniform,
+                &req,
+                0xF10B,
+                Some(&rt_flop_prefer_blueprint(scfg)),
+                &mut cache,
+            );
+            assert_eq!(p.source, expect, "open_to={open_to}: {p:?}");
         }
     }
 
@@ -18449,6 +18698,65 @@ mod tests {
         assert!(parse(&["--search", "--search-weak-commit-guard", "maybe"]).is_err());
         assert!(parse(&["--search-min-hero-visits", "200"]).is_err());
         assert!(parse(&["--search-weak-commit-guard", "on"]).is_err());
+    }
+
+    /// `--search-frozen-avg-recency`：默认 [`DEFAULT_SEARCH_FROZEN_AVG_RECENCY`]；`0` = 关；[0, 1) 外 /
+    /// 坏值拒收；未开 --search 拒收。
+    #[test]
+    fn parse_args_frozen_avg_recency() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        let a = parse(&["--search"]).unwrap();
+        assert_eq!(
+            a.search.unwrap().frozen_avg_recency,
+            DEFAULT_SEARCH_FROZEN_AVG_RECENCY
+        );
+        let a = parse(&["--search", "--search-frozen-avg-recency", "0"]).unwrap();
+        assert_eq!(a.search.unwrap().frozen_avg_recency, 0.0);
+        let a = parse(&["--search", "--search-frozen-avg-recency", "0.1"]).unwrap();
+        assert_eq!(a.search.unwrap().frozen_avg_recency, 0.1);
+        assert!(parse(&["--search", "--search-frozen-avg-recency", "1"]).is_err());
+        assert!(parse(&["--search", "--search-frozen-avg-recency", "-0.1"]).is_err());
+        assert!(parse(&["--search", "--search-frozen-avg-recency", "x"]).is_err());
+        assert!(parse(&["--search-frozen-avg-recency", "0.25"]).is_err());
+    }
+
+    /// `--search-freeze-real-line`：默认关；on 须同时传 `--search-real-hand-q`；坏值 / 未开 --search 拒收。
+    #[test]
+    fn parse_args_freeze_real_line() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        assert!(
+            !parse(&["--search"])
+                .unwrap()
+                .search
+                .unwrap()
+                .freeze_real_line
+        );
+        let a = parse(&[
+            "--search",
+            "--search-real-hand-q",
+            "0.5",
+            "--search-freeze-real-line",
+            "on",
+        ])
+        .unwrap();
+        assert!(a.search.unwrap().freeze_real_line);
+        assert!(parse(&["--search", "--search-freeze-real-line", "on"]).is_err());
+        let a = parse(&["--search", "--search-freeze-real-line", "off"]).unwrap();
+        assert!(!a.search.unwrap().freeze_real_line);
+        assert!(parse(&["--search", "--search-freeze-real-line", "maybe"]).is_err());
+        assert!(parse(&["--search-freeze-real-line", "off"]).is_err());
     }
 
     /// `--search-real-hand-q`：不传 = 关（`None`）；`[0, 1]` 内收（含 0 = 只开专用信息集）；越界 / 坏值
