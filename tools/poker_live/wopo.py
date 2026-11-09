@@ -24,9 +24,24 @@ _KNOWN_TYPES = ("hand_start", "hole_cards", "table_state", "player_action",
                 "community_cards", "hand_result")
 
 
-def fmt_equity(eq, opps):
-    """play log 决策行的胜率文字：「胜率 42%（对 3 家搜索范围）」。"""
-    return f"胜率 {eq * 100:.0f}%（对 {opps} 家搜索范围）"
+def max_invest(eq, pot):
+    """按胜率不亏的最多再投入：再投 X 后按胜率赢走 pot + X，eq × (pot + X) ≥ X → X ≤ eq × pot / (1 − eq)（向下取整）。
+    pot = 桌上全部筹码（含本街已下的注，hero 自己投过的也算——已经是底池的了）。只按摊牌胜率算：不含抽水、
+    后面街的下注、身后还没行动的人再加注。胜率 100% → None（不限）。"""
+    if eq >= 1.0:
+        return None
+    return int(eq * pot / (1.0 - eq))
+
+
+def fmt_equity(eq, opps, invest, stack):
+    """play log 决策行的胜率文字：「胜率 42%（对 3 家搜索范围）  最多再投入 834」；够 hero 剩余筹码时注明全下也不亏。"""
+    if invest is None:
+        tail = "不限"
+    elif invest >= stack:
+        tail = f"{invest}（≥ 剩余 {stack}，全下也不亏）"
+    else:
+        tail = str(invest)
+    return f"胜率 {eq * 100:.0f}%（对 {opps} 家搜索范围）  最多再投入 {tail}"
 
 
 def equity_of(resp):
@@ -609,7 +624,7 @@ class WopoSession:
         ctx = {"hand": hand, "key": key, "table_seq": msg.get("table_seq"),
                "street": hand.street, "pot": hand.pot, "to_call": hand.to_call(hand.hero),
                "board": list(hand.board), "valid": valid, "t_wall": time.time(),
-               "chip_div": div, "chip_prior": prior}
+               "chip_div": div, "chip_prior": prior, "stack": hand.stack[hand.hero]}
         self._dbg(f"your_turn street={hand.street} hole={''.join(hand.hole)} "
                   f"board={' '.join(hand.board)} valid={valid}")
         self._play(f">> 轮到 hero（{_STREET_CN[hand.street]}，底池 {hand.pot}，跟 {ctx['to_call']}）",
@@ -624,6 +639,7 @@ class WopoSession:
             self.counters["decisions"] += 1
             # 范围胜率（advisor 搜索路径才有）：和动作无关，legalize 拒掉非法动作时也照样显示。
             eq, eq_opps = equity_of(resp)
+            invest = max_invest(eq, ctx["pot"]) if eq is not None else None
             if ctx["chip_div"] > 1:
                 resp = upscale_response(resp, ctx["chip_div"], ctx["chip_prior"], ctx["valid"],
                                         req["valid"])
@@ -662,7 +678,7 @@ class WopoSession:
                        + (f"  已过期（{_STALE_CN.get(stale.split(':', 1)[0], stale)}），未写入行动文件"
                           if stale else "")
                        + (f"  {fmt_probs(rec['probs'])}" if rec["probs"] else "")
-                       + (f"  {fmt_equity(eq, eq_opps)}" if eq is not None else "")
+                       + (f"  {fmt_equity(eq, eq_opps, invest, ctx['stack'])}" if eq is not None else "")
                        + f"  建议 {advice}", "decision", hand_id=ctx["key"][0],
                        turn=ctx["key"][1], street=ctx["street"], pot=ctx["pot"],
                        to_call=ctx["to_call"], valid=dict(ctx["valid"]), action=rec["action"],
@@ -674,7 +690,8 @@ class WopoSession:
                        source=rec["source"], decide_ms=ms, stale=stale,
                        stale_kind=stale.split(":", 1)[0] if stale else None,
                        written=stale is None, rejected=resp.get("rejected"),
-                       equity=eq, equity_opps=eq_opps)
+                       equity=eq, equity_opps=eq_opps, max_invest=invest,
+                       hero_stack=ctx["stack"])
             if self.action_log:
                 # req = advisor 实际收到的（chip_div > 1 时是缩小后的筹码）；resp 已还原成桌面筹码。
                 self.action_log.write(json.dumps({"req": req, "resp": resp, "decide_ms": ms,

@@ -75,7 +75,8 @@ from poker_live.aliases import DEFAULT_PATH as DEFAULT_ALIASES, AliasError, Name
 from poker_live.decision import DecisionWorker
 from poker_live.table import HandEngine, HandInvalid, observe_from_hh
 from poker_live.wopo import (_STALE_CN, _STREET_CN, ActionFile, WopoSession, _fmt_act, advice_matches,
-                             equity_of, fmt_equity, fmt_probs, fmt_shown, legalize, shown_opponents)
+                             equity_of, fmt_equity, fmt_probs, fmt_shown, legalize, max_invest,
+                             shown_opponents)
 from poker_live.wslog import WsLog
 
 HERO_SEAT = 0
@@ -358,10 +359,12 @@ def _selftest_full_replay():
            and len(lines) == 3 * n_type("hand_start") + 2 * c["decisions"] + len(hero_acts)
            + n_type("community_cards") + opp_acts + c["hands_complete"],
            "play log 行数不对:\n" + play.getvalue())
-    _check(all(re.search(r"=\(100\)  (胜率 \d+%（对 \d 家搜索范围）  )?建议 [^ ]", ln) for ln in lines
+    _check(all(re.search(r"=\(100\)  (胜率 \d+%（对 \d 家搜索范围）  最多再投入 [^ ]+  )?建议 [^ ]", ln)
+               for ln in lines
                if ln.startswith(">> 决策")), "play log 决策行应带策略分布（stub 给 100%）")
     dec = [ln for ln in lines if ln.startswith(">> 决策")]
-    _check(dec and all(("  胜率 42%（对 1 家搜索范围）  建议 " in ln) == ("翻前" not in prev)
+    _check(dec and all(bool(re.search(r"  胜率 42%（对 1 家搜索范围）  最多再投入 \d+  建议 ", ln))
+                       == ("翻前" not in prev)
                        for ln, prev in zip(dec, [ln for ln in lines if ln.startswith(">> 轮到 hero")])),
            "play log 决策行：翻牌后带范围胜率，翻前（stub 不给）不带")
     _check(equity_of({"range_equity": 0.5, "range_equity_opps": 2}) == (0.5, 2)
@@ -369,6 +372,12 @@ def _selftest_full_replay():
            and equity_of({"range_equity": 0.5, "range_equity_opps": 0}) == (None, None)
            and equity_of({"range_equity": True, "range_equity_opps": 1}) == (None, None)
            and equity_of({}) == (None, None), "范围胜率字段校验")
+    # 最多再投入：胜率 40%、底池 600 → 0.4 × 600 / 0.6 = 400（跟 400 正好不亏）；100% 不限；够剩余筹码注明全下。
+    _check(max_invest(0.4, 600) == 400 and max_invest(0.0, 600) == 0 and max_invest(1.0, 600) is None
+           and fmt_equity(0.4, 2, 400, 1000) == "胜率 40%（对 2 家搜索范围）  最多再投入 400"
+           and fmt_equity(0.4, 2, 400, 300) == "胜率 40%（对 2 家搜索范围）  最多再投入 400（≥ 剩余 300，全下也不亏）"
+           and fmt_equity(1.0, 1, None, 300) == "胜率 100%（对 1 家搜索范围）  最多再投入 不限",
+           "最多再投入的算法和文字")
     _check(fmt_probs([["fold", 0.0184], ["call", 0.9151], ["raise1pot", 0.0665], ["allin", 0.0]])
            == "(fold,call,1pot,allin)=(2,92,7,0)"
            and fmt_probs([["check", 0.4428], ["bet0.5pot", 0.5566], ["bet1pot", 0.0002]])
@@ -1031,7 +1040,7 @@ EVENT_KEYS = {
     "hero_turn": {"turn", "street", "pot", "to_call", "valid", "hole", "board", "table_seq"},
     "decision": {"turn", "street", "pot", "to_call", "valid", "action", "amount", "all_in", "advice",
                  "probs", "chosen", "source", "decide_ms", "stale", "stale_kind", "written",
-                 "rejected", "equity", "equity_opps"},
+                 "rejected", "equity", "equity_opps", "max_invest", "hero_stack"},
     "shown": {"seats"},
     "result": {"stacks", "pot", "board", "winners", "shown", "notes", "server_ts"},
 }
@@ -1084,7 +1093,8 @@ def _render_event(e):
         return (f">> 决策  来源 {e['source']}  {e['decide_ms']}ms"
                 + (f"  已过期（{_STALE_CN.get(e['stale_kind'], stale)}），未写入行动文件" if stale else "")
                 + (f"  {fmt_probs(e['probs'])}" if e["probs"] else "")
-                + (f"  {fmt_equity(e['equity'], e['equity_opps'])}" if e["equity"] is not None else "")
+                + (f"  {fmt_equity(e['equity'], e['equity_opps'], e['max_invest'], e['hero_stack'])}"
+                   if e["equity"] is not None else "")
                 + f"  建议 {advice}")
     if t == "shown":
         return "亮牌 " + " | ".join(f"{who(x['seat'], x['name'])} {' '.join(x['cards'])}"
