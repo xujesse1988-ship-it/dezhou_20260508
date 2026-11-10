@@ -47,12 +47,17 @@ done
 [ -f "$KEY" ] || { echo "找不到密钥：$KEY" >&2; exit 1; }
 [ -d opponent_analysis ] || { echo "请在仓库根目录跑（要用 opponent_analysis/）" >&2; exit 1; }
 command -v rsync >/dev/null || { echo "缺 rsync" >&2; exit 1; }
+# macOS ships rsync 2.6.9 / openrsync; --inplace + filter rules here are only tested with 3.x.
+RSYNC_VER=$(rsync --version 2>&1 | sed -n 1p)
+[[ "$RSYNC_VER" =~ rsync\ +version\ +([3-9]|[1-9][0-9])\. ]] \
+  || { echo "要 rsync 3.x（现在是：${RSYNC_VER}）；macOS 用 brew install rsync，并让它排在 PATH 前面" >&2; exit 1; }
 
 REMOTE=ubuntu@$IP
 SRC=dezhou_20260508/artifacts
 A=$DEST/artifacts
 mkdir -p "$A"
-CTL=$(mktemp -d "${TMPDIR:-/tmp}/wopo_mirror_ssh.XXXXXX")
+# Short fixed base: macOS $TMPDIR is long and a unix socket path must stay under 104 bytes.
+CTL=$(mktemp -d /tmp/wm.XXXXXX)
 # One shared SSH connection for every rsync / check (ControlMaster), closed on exit.
 SSH=(ssh -i "$KEY" -o ControlMaster=auto -o "ControlPath=$CTL/%C" -o ControlPersist=120
      -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
@@ -64,7 +69,7 @@ cleanup() {
   [ -n "$LIVE_PID" ] && kill "$LIVE_PID" 2>/dev/null && wait "$LIVE_PID" 2>/dev/null || true
   "${SSH[@]}" -O exit "$REMOTE" >/dev/null 2>&1 || true
   rm -rf "$CTL"
-  echo "已停（镜像留在 $DEST）"
+  echo "已停（镜像留在 ${DEST}）"
 }
 trap cleanup EXIT INT TERM
 
@@ -108,7 +113,7 @@ if [ "$SERVE" = 1 ]; then
     --play-events "$A/wopo_ante200_*_live_*/wopo_play_events.jsonl" --hero hero \
     >> "$DEST/live.log" 2>&1 &
   LIVE_PID=$!
-  echo "== 网页服务 pid $LIVE_PID（日志 $DEST/live.log），加载完打开 http://127.0.0.1:$PORT/"
+  echo "== 网页服务 pid ${LIVE_PID}（日志 ${DEST}/live.log），加载完打开 http://127.0.0.1:$PORT/"
 fi
 
 echo "== 每 ${INTERVAL} 秒同步一次，Ctrl-C 停"
