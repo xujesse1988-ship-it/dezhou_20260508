@@ -317,6 +317,12 @@ def range_event(rec) -> Optional[dict]:
 
 
 PID_NAME = "driver.pid"  # written by each run directory's start.sh right after it launches the driver
+# Written next to driver.pid by scripts/wopo_mirror.sh on a machine that mirrors a remote run directory:
+# {"pid": <remote driver pid>, "alive": <bool>, "checked": <unix time of the remote check>}. The pid
+# lives on the remote machine, so it overrides the local process check; older than this many seconds
+# (the mirror stopped syncing) → liveness unknown.
+MIRROR_ALIVE_NAME = "driver.alive"
+MIRROR_ALIVE_MAX_AGE = 30.0
 SESSION_TYPES = ("hand_start", "result", "dead")
 # Hero's own preflop actions, for the session's VPIP / PFR (same rule as the profile, spots.py):
 # denominator = hands hero acted in preflop (walks excluded); VPIP = a preflop call / raise / all_in
@@ -343,6 +349,23 @@ def _pid_alive(pid: int, marker: str = "wopo_play") -> bool:
     except OSError:
         return False
     return True
+
+
+def _session_alive(run_dir: str, pid: int) -> Optional[bool]:
+    """Liveness of the driver behind run_dir's driver.pid: from the mirror's MIRROR_ALIVE_NAME file when
+    there is one (None if it is stale, unreadable or for another pid), else the local process."""
+    try:
+        with open(os.path.join(run_dir, MIRROR_ALIVE_NAME), encoding="utf-8") as f:
+            rec = json.load(f)
+    except FileNotFoundError:
+        return _pid_alive(pid)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(rec, dict) or rec.get("pid") != pid or not isinstance(rec.get("alive"), bool)
+            or not isinstance(rec.get("checked"), (int, float))
+            or abs(time.time() - rec["checked"]) > MIRROR_ALIVE_MAX_AGE):
+        return None
+    return rec["alive"]
 
 
 class SessionInfo:
@@ -420,7 +443,7 @@ class SessionInfo:
         info = {"path": path, "started": start if start is not None else self.first_ts,
                 "hero_pre": len(self.pre_hands), "hero_vpip": len(self.vpip_hands), "hero_pfr": len(self.pfr_hands),
                 "start_src": "driver.pid" if start is not None else "first_event",
-                "pid": pid, "alive": _pid_alive(pid) if pid is not None else None,
+                "pid": pid, "alive": _session_alive(os.path.dirname(path), pid) if pid is not None else None,
                 "hands": self.counts["hand_start"], "settled": self.counts["result"], "dead": self.counts["dead"]}
         changed, self.info = info != self.info, info
         return changed

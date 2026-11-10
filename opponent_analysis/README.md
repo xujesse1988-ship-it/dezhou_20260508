@@ -114,6 +114,15 @@ setsid nohup python3 -m opponent_analysis live --db artifacts/opponent_db_ante10
 
 画像服务和 driver 谁先启动都行；driver 重启后接着往同一个事件文件追加。
 
+### 在别的机器上看（不用隧道）
+
+`scripts/wopo_mirror.sh <实盘机 IP>`（在仓库根目录跑）：把实盘机所有牌局目录的 `wopo_hh.jsonl` / `wopo_play_events.jsonl` /
+`wopo_ranges.jsonl` / `driver.pid` 和画像库同步到本地 `~/wopo_mirror/artifacts/`，在本地起画像服务（缺省 8780），之后每 3 秒
+补一次差额，Ctrl-C 全停。同步用 `rsync --inplace`（文件编号不变，服务只读新增部分）；画像库只在启动时同步一次。
+driver 是否在跑由脚本每轮到实盘机查，写进镜像目录的 `driver.alive`（`{"pid", "alive", "checked"}`），服务看到它就不再
+查本机进程；超过 30 秒没更新显示「进程状态未知」。实盘机换 IP 后带新 IP 重跑，镜像目录接着用。需要本地 python3、
+rsync 3.x、ssh 和实盘机密钥（`--key`，缺省 `~/northeast-3.pem`）。其余参数见脚本开头。
+
 ### 事件格式
 
 每行一个 JSON 对象。所有事件都有：`ts`（driver 机器的 Unix 秒，3 位小数，与 play.log 行首时间同一时刻）、

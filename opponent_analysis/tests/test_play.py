@@ -117,6 +117,40 @@ class SessionInfoTest(unittest.TestCase):
         self.assertEqual(self.session(feed)[1], self.counts(self.events))
         self.assertEqual(self.counts(self.events), (8, 7, 1))
 
+    def test_mirror_alive_file_overrides_local_pid_check(self):
+        """A mirrored run directory (scripts/wopo_mirror.sh): the pid is the remote driver's, so liveness comes
+        from driver.alive; stale, for another pid or unreadable → unknown; removed → local check again."""
+        import time
+        self.write(self.events)
+        start = self.events[0]["ts"]
+        remote_pid = 999999  # no such local process
+        self.pid_file(remote_pid, start)
+        alive_path = os.path.join(self.run_dir, "driver.alive")
+
+        def mirror(**rec):
+            with open(alive_path, "w", encoding="utf-8") as f:
+                json.dump(rec, f)
+
+        feed = PlayFeed([self.path], max_hands=3)
+        cases = [
+            (dict(pid=remote_pid, alive=True, checked=time.time()), True),
+            (dict(pid=remote_pid, alive=False, checked=time.time()), False),
+            (dict(pid=remote_pid, alive=True, checked=time.time() - 120), None),  # mirror stopped syncing
+            (dict(pid=remote_pid + 1, alive=True, checked=time.time()), None),  # pid file not synced yet
+            (dict(pid=remote_pid, alive="yes", checked=time.time()), None),
+        ]
+        for rec, want in cases:
+            mirror(**rec)
+            feed.step()
+            self.assertIs(self.session(feed)[0]["alive"], want, rec)
+        with open(alive_path, "w") as f:
+            f.write("{half")
+        feed.step()
+        self.assertIsNone(self.session(feed)[0]["alive"])
+        os.remove(alive_path)
+        feed.step()
+        self.assertIs(self.session(feed)[0]["alive"], False)  # back to the local check: no such process
+
     def test_pid_file_sets_start_liveness_and_counts_only_later_hands(self):
         self.write(self.events)
         start = [e["ts"] for e in self.events if e["type"] == "hand_start"][3]  # a restart before hand 4
