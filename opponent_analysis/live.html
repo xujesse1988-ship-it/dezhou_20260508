@@ -657,7 +657,7 @@ $('tables').addEventListener('click', e => { const b = e.target.closest('.seat:n
 
 async function poll() {
   try {
-    const r = await fetch('/api/snapshot' + (snap ? '?since=' + snap.version : ''), { cache: 'no-store', signal: AbortSignal.timeout(10000) });
+    const r = await fetch('/api/snapshot' + (snap ? '?since=' + snap.version : ''), { cache: 'no-store', signal: AbortSignal.timeout(15000) });
     if (!r.ok) throw new Error('http ' + r.status);
     const d = await r.json();
     failures = 0;
@@ -917,7 +917,7 @@ $('guide').addEventListener('click', e => {
 
 async function pollPlay() {
   try {
-    const r = await fetch('/api/play' + (play ? '?since=' + play.version : ''), { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+    const r = await fetch('/api/play' + (play ? '?since=' + play.version : ''), { cache: 'no-store', signal: AbortSignal.timeout(15000) });
     if (!r.ok) throw new Error('http ' + r.status);
     const d = await r.json();
     playFailures = 0;
