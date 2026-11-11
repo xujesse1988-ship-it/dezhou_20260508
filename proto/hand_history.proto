@@ -28,6 +28,7 @@ message TableConfig {
     uint32 button_seat = 6;
     uint32 ante_exempt = 7;           // 不交 ante 的座位 bitmask（bit i = 座 i；0 = 人人都交）
     uint32 live_posts = 8;            // 开局补 live 大盲的座位 bitmask（非盲注座；0 = 没人补）
+    uint64 straddle = 9;              // UTG 强制 straddle 额（0 = 没有；非 0 须 ≥ big_blind 且 n_seats ≥ 3）
 }
 
 message RecordedAction {

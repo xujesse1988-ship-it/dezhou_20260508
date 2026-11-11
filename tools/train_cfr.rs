@@ -73,6 +73,12 @@ struct Args {
     /// 建树代码不用改。两个 profile 都生效；dense checkpoint 指纹含 ante，resume / crop /
     /// 对局加载须传同一值。
     ante: u64,
+    /// UTG 强制 straddle 额（chips，BB = 100；默认 0 = 没有 straddle，与历史 byte-equal）。仅
+    /// `--profile six-max`。发完盲注后大盲下家（3 座桌即按钮）强制交，算本轮下注；翻前从 straddle
+    /// 下家开始说话、straddle 座有过牌选择权，翻前最小加注额 = straddle（[`TableConfig::straddle`]）。
+    /// 1/2/4 (1) 桌 = `--ante 50 --straddle 200`。dense checkpoint 指纹含 straddle，resume / crop /
+    /// 对局加载须传同一值。
+    straddle: u64,
     trainer: String,
     updates: u64,
     seed: u64,
@@ -121,6 +127,7 @@ impl Default for Args {
             stack_bb: 100,
             seats: None,
             ante: 0,
+            straddle: 0,
             trainer: "es-mccfr".to_string(),
             updates: 0,
             seed: 0,
@@ -288,6 +295,20 @@ fn run() -> Result<(), String> {
         ));
     }
     let ante = ChipAmount::new(args.ante);
+    // straddle：0 或 1BB..4BB（再大多半是把 BB 数误当 chips 传）；HU 没有 straddle。
+    if args.straddle != 0 && !(100..=400).contains(&args.straddle) {
+        return Err(format!(
+            "--straddle is in chips (BB = 100) and must be 0 or in [100, 400], got {}",
+            args.straddle
+        ));
+    }
+    if args.straddle != 0 && args.profile != "six-max" {
+        return Err(format!(
+            "--straddle is only valid with --profile six-max (got --profile {})",
+            args.profile
+        ));
+    }
+    let straddle = ChipAmount::new(args.straddle);
     // profile 分派：hu = 历史默认（byte-equal）；six-max = A3×A4 first-small N-cap 游戏。
     // 两条路都产 `SimplifiedNlheGame`，下游 dense/HashMap 后端 + drive 主循环不分流。
     let game = match args.profile.as_str() {
@@ -321,21 +342,27 @@ fn run() -> Result<(), String> {
             // 3/4pot 一档：栈不超过开池额时
             // 退化成开池 all-in 又被 drop_preflop_open_allin 删掉 →
             // 开池位只剩 Fold，树塌成几十个节点。拒绝而非静默训。ante=0 时 1pot 即历史的 stack_bb < 4。
-            let pot_after_call = 250 + u64::from(seats) * args.ante;
+            // 有 straddle 时要跟的是 straddle：底池多一份 straddle、跟注额 = straddle。
+            let blind = if args.straddle > 0 {
+                args.straddle
+            } else {
+                100
+            };
+            let pot_after_call = 150 + args.straddle + blind + u64::from(seats) * args.ante;
             let single_open = match args.reshape.as_str() {
-                "all-1pot" | "flop2-1pot" => Some(100 + pot_after_call),
+                "all-1pot" | "flop2-1pot" => Some(blind + pot_after_call),
                 "ante-flop2" | "ante-flop2-3bet" | "ante-flop2-3bet-open2" => {
-                    Some(100 + (pot_after_call * 333).div_ceil(1000))
+                    Some(blind + (pot_after_call * 333).div_ceil(1000))
                 }
-                "ante-flop2-3bet-o75" => Some(100 + (pot_after_call * 750).div_ceil(1000)),
+                "ante-flop2-3bet-o75" => Some(blind + (pot_after_call * 750).div_ceil(1000)),
                 _ => None,
             };
             if let Some(open) = single_open {
                 if u64::from(args.stack_bb) * 100 <= open {
                     return Err(format!(
                         "--reshape {} requires stack > its single open size ({open} chips with \
-                         --ante {}), got --stack-bb {}",
-                        args.reshape, args.ante, args.stack_bb
+                         --ante {} --straddle {}), got --stack-bb {}",
+                        args.reshape, args.ante, args.straddle, args.stack_bb
                     ));
                 }
             }
@@ -348,7 +375,9 @@ fn run() -> Result<(), String> {
                 })?;
             SimplifiedNlheGame::new_with_abstraction(
                 Arc::clone(&table),
-                TableConfig::n_max_at_bb(seats, args.stack_bb).with_ante(ante),
+                TableConfig::n_max_at_bb(seats, args.stack_bb)
+                    .with_ante(ante)
+                    .with_straddle(straddle),
                 abs,
                 rules,
             )
@@ -378,6 +407,12 @@ fn run() -> Result<(), String> {
             "[train_cfr] ante             = {} chips per seat (BB = 100)",
             args.ante
         );
+        if args.straddle > 0 {
+            train_log!(
+                "[train_cfr] straddle         = {} chips, UTG forced (BB = 100)",
+                args.straddle
+            );
+        }
         train_log!("[train_cfr] n_players        = {}", game.n_players());
         train_log!("[train_cfr] tree_nodes       = {}", game.tree().num_nodes());
     }
@@ -620,6 +655,7 @@ fn parse_args() -> Result<Args, String> {
                     Some(u8::try_from(raw).map_err(|_| format!("--seats {raw} out of range"))?);
             }
             "--ante" => out.ante = parse_u64(&next_value(&mut args, "--ante")?)?,
+            "--straddle" => out.straddle = parse_u64(&next_value(&mut args, "--straddle")?)?,
             "--trainer" => out.trainer = next_value(&mut args, "--trainer")?,
             "--updates" => out.updates = parse_u64(&next_value(&mut args, "--updates")?)?,
             "--iter" => {
@@ -761,6 +797,7 @@ fn print_usage() {
          \t--stack-bb <N>          (six-max only; per-seat starting stack in BB, default 100; pair with --reshape preopen-1pot)\n\
          \t--seats <3..=9>         (six-max only; number of seats, default 6; e.g. 9 = 9-handed table)\n\
          \t--ante <chips>          (per-seat ante in chips, BB = 100, default 0, max 100; both profiles)\n\
+         \t--straddle <chips>      (six-max only; UTG forced straddle in chips, BB = 100, default 0, 100..=400; 1/2/4 (1) = --ante 50 --straddle 200)\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>\n\
          \t--batch-per-worker <N>  (default 16; trajectories per worker per step_parallel dispatch)\n\

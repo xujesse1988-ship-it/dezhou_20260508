@@ -119,6 +119,18 @@ impl DenseLayoutFingerprint {
         bucket_table_blake3: [u8; 32],
         ante: u64,
     ) -> Self {
+        Self::from_indexer_with_straddle(indexer, bucket_table_blake3, ante, 0)
+    }
+
+    /// 同 [`from_indexer`](Self::from_indexer)，另把 `straddle`（`TableConfig::straddle` chips）算进
+    /// 指纹：≠ 0 时在 ante 之后再 feed `b"straddle"` + straddle LE（理由同 ante：straddle 只改底池 /
+    /// 行动顺序，树形状可能一样）。straddle == 0 时与 [`from_indexer`](Self::from_indexer) 逐位相同。
+    pub fn from_indexer_with_straddle(
+        indexer: &NlheDenseIndexer,
+        bucket_table_blake3: [u8; 32],
+        ante: u64,
+        straddle: u64,
+    ) -> Self {
         let mut hasher = Hasher::new();
         for id in 0..indexer.num_nodes() as NodeId {
             let m = indexer.node_meta(id);
@@ -129,6 +141,10 @@ impl DenseLayoutFingerprint {
         if ante != 0 {
             hasher.update(b"ante");
             hasher.update(&ante.to_le_bytes());
+        }
+        if straddle != 0 {
+            hasher.update(b"straddle");
+            hasher.update(&straddle.to_le_bytes());
         }
         Self {
             bucket_table_blake3,
@@ -397,8 +413,8 @@ pub(crate) fn parse_header(
             format!(
                 "layout fingerprint mismatch: file(nodes={}, rows={}, slots={}) \
                  action_hash={} vs expected(nodes={}, rows={}, slots={}) \
-                 (action_hash covers per-node actions and the table ante: \
-                 check reshape / seats / stack / --ante)",
+                 (action_hash covers per-node actions and the table ante / straddle: \
+                 check reshape / seats / stack / --ante / --straddle)",
                 num_nodes,
                 total_rows,
                 total_slots,
@@ -768,6 +784,34 @@ mod tests {
             "ante 不符应被拒，got {err:?}"
         );
         load_dense_checkpoint(&path, &fp_10, idx).expect("同 ante 应能加载");
+    }
+
+    /// straddle 进指纹：straddle≠0 与 0 不同、与 ante 也互不相同；straddle=0 与只传 ante 的旧
+    /// 构造逐位相同（既有 checkpoint / crop 不失效）。
+    #[test]
+    fn dense_checkpoint_fingerprint_distinguishes_straddle() {
+        let specs = [spec(StreetTag::Preflop, 4, 3), spec(StreetTag::Flop, 5, 6)];
+        let idx = Arc::new(NlheDenseIndexer::from_node_specs(specs.iter().copied()));
+        let bucket = fake_bucket_blake3(0x5A);
+        let plain = DenseLayoutFingerprint::from_indexer(&idx, bucket, 50);
+        assert_eq!(
+            DenseLayoutFingerprint::from_indexer_with_straddle(&idx, bucket, 50, 0)
+                .action_count_blake3,
+            plain.action_count_blake3,
+            "straddle=0 须与旧公式相同"
+        );
+        let s200 = DenseLayoutFingerprint::from_indexer_with_straddle(&idx, bucket, 50, 200);
+        let s300 = DenseLayoutFingerprint::from_indexer_with_straddle(&idx, bucket, 50, 300);
+        let h = |fp: &DenseLayoutFingerprint| fp.action_count_blake3;
+        assert_ne!(h(&s200), h(&plain));
+        assert_ne!(h(&s200), h(&s300));
+        assert_ne!(
+            h(&DenseLayoutFingerprint::from_indexer_with_straddle(
+                &idx, bucket, 0, 200
+            )),
+            h(&s200),
+            "ante 与 straddle 各自进指纹"
+        );
     }
 
     /// trailer：翻一个 body byte → BLAKE3 mismatch → Corrupted。

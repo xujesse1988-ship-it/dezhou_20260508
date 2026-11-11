@@ -26,6 +26,11 @@ pub struct TableConfig {
     /// 补盲：补的 `big_blind` 算本轮下注（跟注额照扣、没人加注时轮到他可以过牌，同大盲的选择权），
     /// 行动顺序不变（不是 straddle）。只能标非盲注座（构造 [`crate::GameState`] 时校验）。
     pub live_posts: u16,
+    /// 强制 straddle 额（chips），默认 0 = 没有 straddle。非 0 时大盲下家（UTG，3 座桌即按钮）每手
+    /// 发盲注后再强制交这一份，算本轮下注；翻前从 straddle 下家开始说话，straddle 座最后说话、没人
+    /// 加注时可过牌（同大盲的选择权）；翻前最小加注额 = straddle（1/2/4 桌最小加注到 8），翻后最小
+    /// 下注仍是大盲。须 ≥ 大盲，只能用于 3 座以上（构造 [`crate::GameState`] 时校验）。
+    pub straddle: ChipAmount,
     /// 起始按钮位（默认 `SeatId(0)`，由 D-022b 推出 SB=1 / BB=2）。
     pub button_seat: SeatId,
 }
@@ -58,8 +63,49 @@ impl TableConfig {
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
             live_posts: 0,
+            straddle: ChipAmount::ZERO,
             button_seat: SeatId(0),
         }
+    }
+
+    /// 把 `straddle`（UTG 强制 straddle 额，chips）换成给定值，其余字段不变。`train_cfr --straddle
+    /// <chips>` 用它在 `n_max_at_bb(..).with_ante(..)` 之上叠 straddle。
+    pub fn with_straddle(mut self, straddle: ChipAmount) -> TableConfig {
+        self.straddle = straddle;
+        self
+    }
+
+    /// straddle 座（大盲下家）；没有 straddle（`straddle == 0`）或不足 3 座时返回 `None`。
+    pub fn straddle_seat(&self) -> Option<SeatId> {
+        if self.straddle == ChipAmount::ZERO || self.n_seats < 3 {
+            return None;
+        }
+        let (_, bb) = self.blind_seats();
+        Some(SeatId((bb.0 + 1) % self.n_seats))
+    }
+
+    /// 翻前「一份大盲」的额：有 straddle 时是 straddle，否则是大盲。翻前开局要跟的额、最小加注
+    /// 额，以及「没人加注」（最高注 == 这个额）的判定都按它。
+    pub fn preflop_blind(&self) -> ChipAmount {
+        if self.straddle > ChipAmount::ZERO {
+            self.straddle
+        } else {
+            self.big_blind
+        }
+    }
+
+    /// 座 `seat` 开局是否交了算本轮下注的强制注（SB / BB / straddle / 补盲）。
+    pub fn posts_blind(&self, seat: SeatId) -> bool {
+        let (sb, bb) = self.blind_seats();
+        seat == sb
+            || seat == bb
+            || self.straddle_seat() == Some(seat)
+            || self.posts_live_blind(seat)
+    }
+
+    /// `straddle` 是否合法：0（没有），或 ≥ 大盲且座位数 ≥ 3。
+    pub fn straddle_valid(&self) -> bool {
+        self.straddle == ChipAmount::ZERO || (self.straddle >= self.big_blind && self.n_seats >= 3)
     }
 
     /// 把 `ante`（每座 chips，发盲注前人人都交、计入底池但不算本轮下注）换成给定值，其余字段
@@ -92,12 +138,15 @@ impl TableConfig {
         (sb, next(sb))
     }
 
-    /// `live_posts` 是否合法：不越过 `n_seats`、不标盲注座。
+    /// `live_posts` 是否合法：不越过 `n_seats`、不标盲注座（含 straddle 座）。
     pub fn live_posts_valid(&self) -> bool {
         let (sb, bb) = self.blind_seats();
         self.live_posts >> self.n_seats == 0
             && !self.posts_live_blind(sb)
             && !self.posts_live_blind(bb)
+            && self
+                .straddle_seat()
+                .map_or(true, |s| !self.posts_live_blind(s))
     }
 
     /// 6-max 100BB 的默认配置：6 座、起始 100BB、SB=50、BB=100、ante=0、按钮在座位 0。
@@ -120,6 +169,7 @@ impl TableConfig {
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
             live_posts: 0,
+            straddle: ChipAmount::ZERO,
             button_seat: SeatId(0),
         }
     }

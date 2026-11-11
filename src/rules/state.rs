@@ -229,7 +229,9 @@ impl GameState {
                 showdown_order: Vec::new(),
             },
             raise_option_open: smallvec![true; n],
-            last_full_raise_size: config.big_blind,
+            // 翻前最小加注额 = 一份「大盲」：有 straddle 时是 straddle（straddle 本身是一次盲注
+            // 加注，下一个加注至少再加一份 straddle；与 PokerKit 翻前 min bet = straddle 同口径）。
+            last_full_raise_size: config.preflop_blind(),
             last_aggressor: None,
             track_history,
         };
@@ -238,7 +240,11 @@ impl GameState {
         for idx in 0..state.players.len() {
             state.raise_option_open[idx] = state.players[idx].status == PlayerStatus::Active;
         }
-        let first = state.next_seat(state.big_blind_seat());
+        // 翻前从最后一个盲注（BB，或 straddle）的下家开始说话。
+        let last_blind = config
+            .straddle_seat()
+            .unwrap_or_else(|| state.big_blind_seat());
+        let first = state.next_seat(last_blind);
         state.current_player = state.next_player_needing_action_from(first);
         state
     }
@@ -1223,6 +1229,10 @@ impl GameState {
             self.config.big_blind,
             true,
         );
+        // UTG 强制 straddle（validate_config 已保证 ≥ 大盲、3 座以上）：算本轮下注。
+        if let Some(seat) = self.config.straddle_seat() {
+            self.post_forced_amount(seat.0 as usize, self.config.straddle, true);
+        }
         // 补盲（validate_config 已保证只标非盲注座）：live 大盲，算本轮下注。
         for idx in 0..self.players.len() {
             if self.config.posts_live_blind(SeatId(idx as u8)) {
@@ -1538,6 +1548,13 @@ fn validate_config(config: &TableConfig) {
     assert!(
         config.ante_exempt >> config.n_seats == 0,
         "ante_exempt has bits beyond n_seats"
+    );
+    assert!(
+        config.straddle_valid(),
+        "straddle {} must be 0 or >= big_blind {} with n_seats >= 3 (got {})",
+        config.straddle.as_u64(),
+        config.big_blind.as_u64(),
+        config.n_seats
     );
     assert!(
         config.live_posts_valid(),
@@ -1927,6 +1944,7 @@ mod legal_action_tests {
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
             live_posts: 0,
+            straddle: ChipAmount::ZERO,
             button_seat: SeatId(0),
         }
     }
@@ -2082,6 +2100,7 @@ mod legal_action_tests {
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
             live_posts: 0,
+            straddle: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         let mut s = GameState::new(&cfg, 0x5117_u64);

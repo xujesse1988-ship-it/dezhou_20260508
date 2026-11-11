@@ -331,6 +331,7 @@ fn encode_request_json(cfg: &TableConfig, seed: u64, hh: &Option<HandHistory>) -
         "big_blind": cfg.big_blind.as_u64(),
         "ante": cfg.ante.as_u64(),
         "ante_exempt": cfg.ante_exempt,
+        "straddle": cfg.straddle.as_u64(),
         "button_seat": cfg.button_seat.0,
         "seed": seed,
         "hole_cards": h.hole_cards.iter().map(|hole| {
@@ -582,6 +583,66 @@ fn cross_validation_pokerkit_ante_exempt_200_hands() {
             "PokerKit 未定义的手不该这么多: {pokerkit_undefined}"
         );
     }
+}
+
+/// straddle 变体随机桌：在 [`random_ante_config`] 之上（3..=9 座、随机 ante、等栈 2BB..200BB）叠
+/// UTG 强制 straddle ∈ {1BB, 2BB, 3BB}，约 1/5 的桌 ante = 0。覆盖：straddle 座（3 座桌是按钮）、
+/// 翻前首个行动者 = straddle 下家、straddle 座的过牌选择权、翻前最小加注 = straddle、翻后最小下注
+/// 回到大盲，以及交 straddle 就全下的浅码。PokerKit 侧按 (SB, BB, straddle) 三个盲注、翻前
+/// min bet = straddle 建局（`tools/pokerkit_replay.py`）。
+fn random_straddle_config(seed: u64) -> TableConfig {
+    let mut rng = ChaCha20Rng::from_seed(seed ^ 0x5742_ADD1_E000_0000);
+    let straddle = [100u64, 200, 300][(rng.next_u64() % 3) as usize];
+    let mut cfg = random_ante_config(seed).with_straddle(ChipAmount::new(straddle));
+    if rng.next_u64() % 5 == 0 {
+        cfg.ante = ChipAmount::ZERO;
+    }
+    cfg
+}
+
+/// straddle + ante 路径与 PokerKit 一致：6-max 100BB、ante 50、straddle 200（= 1/2/4 (1) 桌）。
+#[test]
+fn cross_validation_pokerkit_straddle_6max_100_hands() {
+    assert_cross_validation_clean("xvalidate-straddle-6max", 100, |_| {
+        TableConfig::default_6max_100bb()
+            .with_ante(ChipAmount::new(50))
+            .with_straddle(ChipAmount::new(200))
+    });
+}
+
+/// straddle 路径与 PokerKit 一致：随机座位数 / ante / straddle / 栈深（见 [`random_straddle_config`]）。
+#[test]
+fn cross_validation_pokerkit_straddle_random_tables_200_hands() {
+    assert_cross_validation_clean("xvalidate-straddle-random", 200, random_straddle_config);
+}
+
+/// straddle 随机桌长跑版（默认 10,000 手，`XV_TOTAL` 覆盖）。PokerKit 缺失时 fail（不许静默 skip）。
+#[test]
+#[ignore = "long — needs PokerKit; ~0.4s/hand"]
+fn cross_validation_pokerkit_straddle_random_tables_10k() {
+    let total: u64 = std::env::var("XV_TOTAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    let mut report = CrossValidationReport::default();
+    for seed in 0..total {
+        report.record(
+            seed,
+            validate_one_hand_with(seed, random_straddle_config(seed)),
+        );
+        if (seed + 1) % 1_000 == 0 {
+            eprintln!("[xvalidate-straddle-10k] progress {}/{}", seed + 1, total);
+        }
+    }
+    eprintln!("[xvalidate-straddle-10k] final {report:?}");
+    assert_eq!(report.our_panics, 0);
+    assert_eq!(report.harness_errors, 0);
+    assert_eq!(
+        report.diverged, 0,
+        "first divergence: {:?}",
+        report.first_diverged
+    );
+    assert_eq!(report.skipped, 0, "PokerKit unavailable");
 }
 
 /// ante 随机桌长跑版（默认 10,000 手，`XV_TOTAL` 覆盖）。PokerKit 缺失时 fail（不许静默 skip）。

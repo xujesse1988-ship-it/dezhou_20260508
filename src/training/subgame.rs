@@ -2716,6 +2716,11 @@ fn solve_cache_key(
         h.update(b"lp");
         h.update(&rc.live_posts.to_le_bytes());
     }
+    if rc.straddle > ChipAmount::ZERO {
+        // 带前缀（可选追加，0 不掺 → 无 straddle 的 key 不变）。
+        h.update(b"st");
+        h.update(&rc.straddle.as_u64().to_le_bytes());
+    }
     h.update(&[rc.button_seat.0]);
     h.update(&[root_state.street() as u8]);
     h.update(&[root_state.board().len() as u8]);
@@ -6756,6 +6761,7 @@ mod tests {
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
             live_posts: 0,
+            straddle: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         SimplifiedNlheGame::new_with_abstraction(
@@ -6784,6 +6790,7 @@ mod tests {
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
             live_posts: 0,
+            straddle: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(seed);
@@ -6829,6 +6836,7 @@ mod tests {
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
             live_posts: 0,
+            straddle: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(seed);
@@ -7677,6 +7685,7 @@ mod tests {
             ante: ChipAmount::new(100),
             ante_exempt: 0,
             live_posts: 0,
+            straddle: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         let mut st = GameState::new(&cfg, 0x0011_3100);
@@ -9345,12 +9354,20 @@ mod tests {
         let mut post = base.clone();
         post.live_posts = 1 << 4;
         assert_ne!(key(&base), key(&post));
-        let mut exempt = base.with_ante(ChipAmount::new(10));
+        let mut exempt = base.clone().with_ante(ChipAmount::new(10));
         exempt.ante_exempt = 1 << 4;
         let mut exempt_post = exempt.clone();
         exempt_post.ante_exempt = 0;
         exempt_post.live_posts = 1 << 4;
         assert_ne!(key(&exempt), key(&exempt_post));
+        // straddle：0 不掺；非 0 与无 straddle、不同额之间都不同。
+        let mut no_straddle = base.clone();
+        no_straddle.straddle = ChipAmount::ZERO;
+        assert_eq!(key(&base), key(&no_straddle));
+        let s200 = base.clone().with_straddle(ChipAmount::new(200));
+        let s300 = base.clone().with_straddle(ChipAmount::new(300));
+        assert_ne!(key(&base), key(&s200));
+        assert_ne!(key(&s200), key(&s300));
     }
 
     #[test]

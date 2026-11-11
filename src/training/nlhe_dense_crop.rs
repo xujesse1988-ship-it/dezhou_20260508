@@ -169,10 +169,11 @@ fn full_indexer_and_fingerprint(
     game: &SimplifiedNlheGame,
 ) -> (NlheDenseIndexer, DenseLayoutFingerprint) {
     let indexer = NlheDenseIndexer::from_tree(game.tree(), bucket_count_by_street(game));
-    let fp = DenseLayoutFingerprint::from_indexer(
+    let fp = DenseLayoutFingerprint::from_indexer_with_straddle(
         &indexer,
         game.bucket_table_blake3(),
         game.table_config().ante.as_u64(),
+        game.table_config().straddle.as_u64(),
     );
     (indexer, fp)
 }
@@ -827,6 +828,19 @@ impl CropStrategyReader {
         ante: u64,
         street: StreetTag,
     ) -> Result<Self, CheckpointError> {
+        Self::open_with_straddle(path, tree, bucket_count_by_street, ante, 0, street)
+    }
+
+    /// 同 [`open`](Self::open)，另带训练时的 `straddle`（进指纹，见
+    /// [`DenseLayoutFingerprint::from_indexer_with_straddle`]）。
+    pub fn open_with_straddle(
+        path: &Path,
+        tree: &PublicBettingTree,
+        bucket_count_by_street: [u32; 4],
+        ante: u64,
+        straddle: u64,
+        street: StreetTag,
+    ) -> Result<Self, CheckpointError> {
         let indexer = NlheDenseIndexer::from_tree(tree, bucket_count_by_street);
         let mut reader = open_reader(path)?;
         let mut h = Hasher::new();
@@ -836,7 +850,12 @@ impl CropStrategyReader {
         let file_bucket_blake3: [u8; 32] = header[OFF_BUCKET_BLAKE3..OFF_ACTION_BLAKE3]
             .try_into()
             .unwrap();
-        let expected = DenseLayoutFingerprint::from_indexer(&indexer, file_bucket_blake3, ante);
+        let expected = DenseLayoutFingerprint::from_indexer_with_straddle(
+            &indexer,
+            file_bucket_blake3,
+            ante,
+            straddle,
+        );
         let CropHeader {
             keep_through,
             has_regret,
@@ -1324,6 +1343,76 @@ mod tests {
         assert!(DenseNlheEsMccfrTrainer::load_checkpoint(&ckpt, small_game()).is_err());
         assert!(crop_dense_checkpoint(&ckpt, &dir.join("x.crop"), &no_ante, opts).is_err());
         assert!(CroppedBlueprint::load(&out, &no_ante).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// straddle 进 layout 指纹：3 座 20BB（straddle 座 = 按钮）ante 10 straddle 200 训出的 ckpt / crop，
+    /// 同 straddle 的 game 照常 resume / crop / 加载（`CropStrategyReader::open_with_straddle` 也能开），
+    /// straddle 300 或没有 straddle 的 game 三条路都拒。
+    #[test]
+    fn straddle_mismatch_rejected() {
+        let game_with = |straddle: u64| {
+            let table = Arc::new(BucketTable::stub_for_postflop(
+                BucketConfig::new(200, 200, 200).expect("200/200/200"),
+            ));
+            let (abs, rules) = all_1pot_6max(2);
+            let cfg = TableConfig::n_max_at_bb(3, 20)
+                .with_ante(ChipAmount::new(10))
+                .with_straddle(ChipAmount::new(straddle));
+            SimplifiedNlheGame::new_with_abstraction(table, cfg, abs, rules).expect("straddle game")
+        };
+        let mut trainer = DenseNlheEsMccfrTrainer::new(game_with(200), 13);
+        let mut rng = ChaCha20Rng::from_seed(0x5742);
+        for _ in 0..300 {
+            trainer.step(&mut rng).expect("step");
+        }
+        let dir = tmpdir("straddle");
+        let ckpt = dir.join("straddle.ckpt");
+        trainer.save_checkpoint(&ckpt).expect("save");
+        let opts = CropOptions {
+            keep_through: StreetTag::Flop,
+            keep_regret: false,
+        };
+        let out = dir.join("straddle.crop");
+        crop_dense_checkpoint(&ckpt, &out, trainer.game(), opts).expect("crop (same straddle)");
+        CroppedBlueprint::load(&out, &game_with(200)).expect("load crop (same straddle)");
+        DenseNlheEsMccfrTrainer::load_checkpoint(&ckpt, game_with(200))
+            .expect("resume (same straddle)");
+        let g = game_with(200);
+        let buckets = bucket_count_by_street(&g);
+        CropStrategyReader::open_with_straddle(
+            &out,
+            g.tree(),
+            buckets,
+            10,
+            200,
+            StreetTag::Preflop,
+        )
+        .expect("reader (same straddle)");
+        assert!(
+            CropStrategyReader::open(&out, g.tree(), buckets, 10, StreetTag::Preflop).is_err(),
+            "reader 不带 straddle 须拒"
+        );
+
+        let no_straddle = || {
+            let table = Arc::new(BucketTable::stub_for_postflop(
+                BucketConfig::new(200, 200, 200).expect("200/200/200"),
+            ));
+            let (abs, rules) = all_1pot_6max(2);
+            let cfg = TableConfig::n_max_at_bb(3, 20).with_ante(ChipAmount::new(10));
+            SimplifiedNlheGame::new_with_abstraction(table, cfg, abs, rules).expect("ante game")
+        };
+        let others: [&dyn Fn() -> SimplifiedNlheGame; 2] = [&|| game_with(300), &no_straddle];
+        for other in others {
+            let straddle = other().table_config().straddle.as_u64();
+            assert!(
+                DenseNlheEsMccfrTrainer::load_checkpoint(&ckpt, other()).is_err(),
+                "resume straddle {straddle} 须拒"
+            );
+            assert!(crop_dense_checkpoint(&ckpt, &dir.join("x.crop"), &other(), opts).is_err());
+            assert!(CroppedBlueprint::load(&out, &other()).is_err());
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

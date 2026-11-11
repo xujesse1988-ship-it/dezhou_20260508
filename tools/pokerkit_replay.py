@@ -28,6 +28,7 @@ JSON 通信。
       "small_blind": 50,
       "big_blind": 100,
       "ante": 0,
+      "straddle": 0,          # 可选；UTG 强制 straddle 额（0 / 缺省 = 没有）
       "button_seat": 0,
       "hole_cards": [
         ["As","Ks"], ["2c","3c"], ...
@@ -241,7 +242,8 @@ def _replay_with_pokerkit(request: dict[str, Any], pokerkit: Any) -> dict[str, A
         for i in range(n_seats)
     ]
 
-    state = pokerkit.NoLimitTexasHoldem.create_state(
+    straddle = request.get("straddle", 0)
+    game = pokerkit.NoLimitTexasHoldem(
         (
             pokerkit.Automation.ANTE_POSTING,
             pokerkit.Automation.BET_COLLECTION,
@@ -262,11 +264,21 @@ def _replay_with_pokerkit(request: dict[str, Any], pokerkit: Any) -> dict[str, A
             else request["ante"]
             for i in range(n_seats)
         ),
-        (request["small_blind"], request["big_blind"]),
+        # UTG straddle = third forced blind (ref index 2 = seat after BB).
+        (request["small_blind"], request["big_blind"])
+        + ((straddle,) if straddle else ()),
         request["big_blind"],
-        tuple(ref_stacks),
-        n_seats,
     )
+    if straddle:
+        # Preflop min raise = one straddle (raise to 2x straddle); postflop min bet stays BB.
+        import dataclasses
+
+        game.streets = (
+            dataclasses.replace(
+                game.streets[0], min_completion_betting_or_raising_amount=straddle
+            ),
+        ) + tuple(game.streets[1:])
+    state = game(tuple(ref_stacks), n_seats)
 
     for ref_index in range(n_seats):
         seat = _ref_to_seat(ref_index, button_seat, n_seats)

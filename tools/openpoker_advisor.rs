@@ -339,6 +339,11 @@ struct Request {
     /// （[`apply_real_table`]）。
     #[serde(default)]
     ante: u64,
+    /// UTG 强制 straddle 额（OpenPoker 单位；缺省 0 = 本手没有 straddle）。须按同一 scale 对上
+    /// blueprint 的 straddle（`train_cfr --straddle`），否则兜底 `straddle_mismatch`。只有本手实际交了
+    /// straddle 才带（driver 侧判定）；straddle 座 = 发牌座里大盲的下家（[`seat_map`]）。
+    #[serde(default)]
+    straddle: u64,
     #[serde(default)]
     actions: Vec<HistAction>,
     valid: ValidActions,
@@ -664,6 +669,12 @@ impl SeatMap {
 /// `[3..n, 0]` 先 fold，preflop 行动序严格吻合）；postflop 由 caller 显式兜底
 /// `short_hu_postflop`（实测顺序错位必被重放 seat 校验拦下、0 漏网，门只是把原因标清楚）。
 ///
+/// **straddle**（`req.straddle > 0`）：straddle 座（真实 BB 的下家）也必须交盲注，树上同样没有它
+/// 「交盲注前 fold」的节点 → 真实 BTN/SB/BB/straddle → 树座 0/1/2/3，其余按环序占靠后位置（ring 序
+/// j≥4 → 树座 j+n−k），幻影座 = 树座 4..4+n−k（straddle 之后最早行动的位置）。k<4 时真实桌的
+/// straddle 座落在按钮或更前（3 人桌按钮 straddle），与 N 座树的 straddle 座 = UTG 映不上 → `Err`
+/// （`straddle_short_table`）。满桌（k=n）与无 straddle 同一恒等映射。
+///
 /// 脏输入（button 越界 / dealt 非升序、越界、个数不在 [2,n]、缺 button 或我）→ `Err`（caller
 /// 安全兜底），绝不静默错映射。
 fn seat_map(req: &Request, n: usize) -> Result<SeatMap, String> {
@@ -704,6 +715,22 @@ fn seat_map(req: &Request, n: usize) -> Result<SeatMap, String> {
         .position(|&s| s == req.button_seat)
         .expect("上面 contains 已校验");
     let mut m = vec![None; n];
+    if req.straddle > 0 {
+        // 盲注位 = BTN/SB/BB/straddle 四个，都要对齐到树座 0..=3。
+        if k < 4 {
+            return Err("straddle_short_table".into());
+        }
+        for j in 0..k {
+            let op = dealt[(btn_idx + j) % k] as usize;
+            let tree = if j < 4 { j } else { j + (n - k) };
+            m[op] = Some(tree as u8);
+        }
+        return Ok(SeatMap {
+            to_tree: m,
+            phantoms: (4..4 + (n - k) as u8).collect(),
+            hu: false,
+        });
+    }
     if k == 2 {
         m[req.button_seat as usize] = Some(2); // OpenPoker HU：button 发 BB → 树座 2。
         m[dealt[1 - btn_idx] as usize] = Some(1); // 非 button 发 SB 先动 → 树座 1。
@@ -891,6 +918,9 @@ fn prewarm_inner(
     }
     if req.ante.checked_mul(scale) != Some(solver_cfg.ante.as_u64()) {
         return mk("prewarm:skip:ante_mismatch".into());
+    }
+    if req.straddle.checked_mul(scale) != Some(solver_cfg.straddle.as_u64()) {
+        return mk("prewarm:skip:straddle_mismatch".into());
     }
     let hole = match (parse_card(&req.hole[0]), parse_card(&req.hole[1])) {
         (Ok(a), Ok(b)) => [a, b],
@@ -1819,7 +1849,7 @@ fn hero_limp_coef(
         return out; // 脏底牌（decide 早已兜底，防御）。
     };
     let holes = all_hole_combos();
-    let pos = limp_pos(hero.0, solver_cfg.n_seats);
+    let pos = limp_pos(hero.0, solver_cfg.n_seats, req.straddle > 0);
     for (i, h) in req.actions.iter().enumerate() {
         if smap.tree_seat(h.seat) != Ok(hero.0) {
             continue;
@@ -2642,7 +2672,7 @@ fn exploit_tilt(
                     start,
                     solver_cfg.big_blind.as_u64(),
                     open,
-                    limp_pos(seat, solver_cfg.n_seats),
+                    limp_pos(seat, solver_cfg.n_seats, req.straddle > 0),
                 );
                 dlog!("exploit_tilt: seat={op_seat}(tree {seat}) idx={i} shove start={start} open={open} width={width:.3}");
                 mul(&mut coef, &shove_coef(width));
@@ -2959,6 +2989,11 @@ fn decide_with(
     // ante 同理按 scale 对上 blueprint 的 ante（blueprint 无 ante 时请求也须无 ante）。
     if req.ante.checked_mul(scale) != Some(solver_cfg.ante.as_u64()) {
         return safe_fallback(&req.valid, "ante_mismatch");
+    }
+    // straddle 同理（blueprint 无 straddle 时请求也须无 straddle；有 straddle 的 blueprint 遇到本手
+    // 没交 straddle 也拦——行动顺序 / 底池都不同，影子对不上）。
+    if req.straddle.checked_mul(scale) != Some(solver_cfg.straddle.as_u64()) {
+        return safe_fallback(&req.valid, "straddle_mismatch");
     }
 
     let hole = match (parse_card(&req.hole[0]), parse_card(&req.hole[1])) {
@@ -3559,7 +3594,8 @@ fn decide_with(
                 &prune_for_sampling(adjusted, postflop_spr(outgoing_state)),
                 outgoing_state,
                 &legal_abs,
-                solver_cfg.big_blind,
+                // 「没人加注」的跟注额：有 straddle 时是 straddle（跟 straddle 不是面对加注）。
+                solver_cfg.preflop_blind(),
                 &|a| {
                     commits_share_of_stack(outgoing_state, outgoing_abs, a, behind, g.commit_share)
                 },
@@ -3588,7 +3624,7 @@ fn decide_with(
                 let d = deep_preflop_no_allin(
                     adjusted,
                     outgoing_state,
-                    solver_cfg.big_blind,
+                    solver_cfg.preflop_blind(),
                     &goes_allin,
                 );
                 dlog!(
@@ -4396,12 +4432,28 @@ enum LimpPos {
     BeforeBtn(u8),
 }
 
-fn limp_pos(tree_seat: u8, n_seats: u8) -> LimpPos {
+///
+/// `straddle`（本手有 UTG straddle）：straddle 座（树座 3）是最后一个盲注、没人加注时有过牌选择权 →
+/// 按 `Bb`；BB 面对 straddle 要补齐，和无 straddle 时的 SB 同一处境 → 按 `Sb`。其余位置不变
+/// （`BeforeBtn` 按离按钮的距离算，与 straddle 无关）。
+fn limp_pos(tree_seat: u8, n_seats: u8, straddle: bool) -> LimpPos {
     match tree_seat {
         0 => LimpPos::Btn,
         1 => LimpPos::Sb,
+        2 if straddle => LimpPos::Sb,
         2 => LimpPos::Bb,
+        3 if straddle => LimpPos::Bb,
         t => LimpPos::BeforeBtn(n_seats.saturating_sub(t).max(1)),
+    }
+}
+
+/// 翻前「一份大盲」的额（OpenPoker 单位）：本手有 straddle 时是 straddle，否则是大盲。平跟池启发式
+/// 的隔离尺寸、ante 程度都按它算（[`TableConfig::preflop_blind`] 的请求侧版本）。
+fn preflop_unit(req: &Request) -> u64 {
+    if req.straddle > 0 {
+        req.straddle
+    } else {
+        req.big_blind
     }
 }
 
@@ -4468,7 +4520,7 @@ fn limp_call_width(ante_level: f64) -> f64 {
 /// [`LIMP_ANTE_REF_DEAD_BB`]，超过参照点按 1（没有更大 ante 的数据，不外推）。无 ante = 0。
 /// 发牌座位数取 `dealt_seats`（短桌幻影座不交 ante），缺省按满桌。
 fn limp_ante_level(req: &Request) -> f64 {
-    let ref_chips = LIMP_ANTE_REF_DEAD_BB * req.big_blind;
+    let ref_chips = LIMP_ANTE_REF_DEAD_BB * preflop_unit(req);
     if req.ante == 0 || ref_chips == 0 {
         return 0.0;
     }
@@ -4603,8 +4655,10 @@ fn limp_heuristic(
                     // OpenPoker raise amount = 总 to 额；脏区间（min>max）走下面被动分支。
                     let oop = u64::from(matches!(pos, LimpPos::Sb | LimpPos::Bb));
                     // ante 加的部分跟开池尺寸走（ante_level = 0 → 0，逐位同无 ante）。
-                    let ante_extra = (ante_level * req.big_blind as f64).round() as u64;
-                    let to = (3 + limps + oop) * req.big_blind + ante_extra;
+                    // 有 straddle 时尺寸单位是 straddle（[`preflop_unit`]；无 straddle 逐位同旧）。
+                    let unit = preflop_unit(req);
+                    let ante_extra = (ante_level * unit as f64).round() as u64;
+                    let to = (3 + limps + oop) * unit + ante_extra;
                     return Some(mk("raise", Some(to.clamp(min, max)), "raise"));
                 }
             }
@@ -4646,7 +4700,7 @@ fn limp_preflop_response(
     smap: &SeatMap,
     my_seat_solver: SeatId,
 ) -> Option<Response> {
-    let pos = limp_pos(my_seat_solver.0, solver_cfg.n_seats);
+    let pos = limp_pos(my_seat_solver.0, solver_cfg.n_seats, req.straddle > 0);
     let pot_odds = preflop_pot_odds(req, solver_cfg, scale, smap, my_seat_solver, hole);
     limp_heuristic(req, hole, pos, pot_odds)
 }
@@ -5011,7 +5065,8 @@ fn low_visits_call_hand(hole: [Card; 2]) -> bool {
 ///
 /// - `legal_abs` (the node's menu) has no `Call` while hero faces a raise: the tree folded the call into
 ///   `AllIn`, so the mass goes to the real call, unless that call commits (then as below, in proportion).
-///   Unopened nodes with no limp in the tree also lack `Call`; `big_blind` tells them apart.
+///   Unopened nodes with no limp in the tree also lack `Call`; `big_blind` (the unopened call level: the
+///   straddle when there is one, [`TableConfig::preflop_blind`]) tells them apart.
 /// - `call_hand` ([`low_visits_call_hand`]) facing a raise: the mass goes to `Call`, its fold share stays,
 ///   even when the call commits. In proportion, AKo would fold at least half the time on 83 of 134
 ///   sampled low-weight rows, while well-sampled siblings almost never fold these hands.
@@ -5167,7 +5222,7 @@ fn preflop_allin_response(
         spot.shover_start,
         spot.big_blind,
         spot.open_shove,
-        limp_pos(spot.shover, n_seats),
+        limp_pos(spot.shover, n_seats, req.straddle > 0),
     );
     let caller_width = width * ALLIN_CALLER_RANGE_FACTOR;
     let mut ranges: Vec<&[[Card; 2]]> = vec![allin_range(width)];
@@ -5949,6 +6004,10 @@ fn hand_seed_for(req: &Request, base_seed: u64, n_seats: usize) -> u64 {
     if req.ante != 0 {
         hasher.update(&req.ante.to_le_bytes()); // 无 ante 不掺、保旧 seed。
     }
+    if req.straddle != 0 {
+        hasher.update(b"straddle"); // 无 straddle 不掺、保旧 seed。
+        hasher.update(&req.straddle.to_le_bytes());
+    }
     if !req.dealt_seats.is_empty() && req.dealt_seats.len() != n_seats {
         // 短桌：占座不同 = 不同局面（满桌不掺、保旧 seed byte-equal）。
         hasher.update(&req.dealt_seats);
@@ -6494,6 +6553,10 @@ struct Args {
     /// `train_cfr --ante` 相同（不符 → layout 指纹不符 → 加载报错）；决策请求的 ante 按盲注同一
     /// scale 须对上它（否则 `fallback:ante_mismatch`）。
     ante: u64,
+    /// `--straddle <chips>`：blueprint 的 UTG 强制 straddle（solver 单位，BB = 100；默认 0 = 没有）。
+    /// 须与训练时的 `train_cfr --straddle` 相同（不符 → layout 指纹不符 → 加载报错）；决策请求的
+    /// straddle 按盲注同一 scale 须对上它（否则 `fallback:straddle_mismatch`）。
+    straddle: u64,
     /// `--stack-bb <N>`：blueprint 的起始码深（BB，默认 [`DEFAULT_SOLVER_STACK_BB`] = 100）。须与训练时
     /// 的 `train_cfr --stack-bb` 相同（不符 → layout 指纹不符 → 加载报错）。
     stack_bb: u32,
@@ -6577,6 +6640,9 @@ struct ReadyLine {
     /// blueprint 的每座 ante（solver 单位，BB = 100）；0 不写（ready 行与旧版逐字节相同）。
     #[serde(skip_serializing_if = "is_zero")]
     ante: u64,
+    /// blueprint 的 UTG 强制 straddle（solver 单位，BB = 100）；0 不写（ready 行与旧版逐字节相同）。
+    #[serde(skip_serializing_if = "is_zero")]
+    straddle: u64,
     /// blueprint 起始码深（BB）；= 100 不写（ready 行与旧版逐字节相同）。
     #[serde(skip_serializing_if = "is_default_stack_bb")]
     stack_bb: u32,
@@ -6610,6 +6676,7 @@ fn reshape_profile(
 /// 桶表）：桌面 = `TableConfig::n_max_at_bb(seats, stack_bb).with_ante(ante)`，与 `train_cfr --profile
 /// six-max --seats <N> --stack-bb <stack_bb> --ante <ante>` 同一定义（6 座 100BB 无 ante == 旧
 /// `default_6max_100bb()`）。
+#[cfg(test)]
 fn build_game(
     table: Arc<BucketTable>,
     reshape: &str,
@@ -6618,10 +6685,27 @@ fn build_game(
     ante: u64,
     stack_bb: u32,
 ) -> Result<SimplifiedNlheGame, String> {
+    build_game_with_straddle(table, reshape, cap, seats, ante, 0, stack_bb)
+}
+
+/// 同 [`build_game`]，另叠 UTG 强制 straddle（`--straddle`，solver chips；0 = 没有，与 [`build_game`]
+/// 逐节点相同）：桌面 = `n_max_at_bb(seats, stack_bb).with_ante(ante).with_straddle(straddle)`，与
+/// `train_cfr --straddle` 同一定义。
+fn build_game_with_straddle(
+    table: Arc<BucketTable>,
+    reshape: &str,
+    cap: u8,
+    seats: u8,
+    ante: u64,
+    straddle: u64,
+    stack_bb: u32,
+) -> Result<SimplifiedNlheGame, String> {
     let (abs, rules) = reshape_profile(reshape, cap)?;
     SimplifiedNlheGame::new_with_abstraction(
         table,
-        TableConfig::n_max_at_bb(seats, stack_bb).with_ante(ChipAmount::new(ante)),
+        TableConfig::n_max_at_bb(seats, stack_bb)
+            .with_ante(ChipAmount::new(ante))
+            .with_straddle(ChipAmount::new(straddle)),
         abs,
         rules,
     )
@@ -6961,21 +7045,22 @@ fn run() -> Result<(), String> {
     // solver 桌面 = `--seats` 座 `--stack-bb` 码深（缺省 6 座 100BB：`n_max_at_bb(6, 100)` == 旧
     // `default_6max_100bb()`，逐字段相同）。blueprint 是用某个座位数 / 码深训练的：不同 → 树不同 →
     // 下面 load 的 layout 指纹校验拒绝（与 blueprint 不符即报错退出，不会静默按错的树重放）。
-    let game = build_game(
+    let game = build_game_with_straddle(
         Arc::clone(&table),
         &args.reshape,
         args.postflop_cap,
         args.seats,
         args.ante,
+        args.straddle,
         args.stack_bb,
     )?;
     // blueprint 访问面（Blueprint doc）：完整 ckpt 或 crop 文件，二者都用同一 game 校验 layout 指纹。
     let blueprint = load_blueprint(&args.checkpoint, game, args.cropped).map_err(|e| {
         format!(
-            "{e}\n（若 blueprint 训练时的座位数与 --seats {} 不同、ante 与 --ante {} 不同、码深与 \
-             --stack-bb {} 不同、或 --reshape / --postflop-cap / --bucket-table 不同，树的 layout 指纹不符，\
-             必然加载失败）",
-            args.seats, args.ante, args.stack_bb
+            "{e}\n（若 blueprint 训练时的座位数与 --seats {} 不同、ante 与 --ante {} 不同、straddle 与 \
+             --straddle {} 不同、码深与 --stack-bb {} 不同、或 --reshape / --postflop-cap / --bucket-table \
+             不同，树的 layout 指纹不符，必然加载失败）",
+            args.seats, args.ante, args.straddle, args.stack_bb
         )
     })?;
     let game = blueprint.game();
@@ -7033,6 +7118,7 @@ fn run() -> Result<(), String> {
         blueprint_keep_through: matches!(blueprint, Blueprint::Cropped { .. })
             .then(|| format!("{:?}", blueprint.keep_through())),
         ante: game.table_config().ante.as_u64(),
+        straddle: game.table_config().straddle.as_u64(),
         stack_bb: args.stack_bb,
     };
     if let Some(rt) = &search_rt {
@@ -7278,6 +7364,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut postflop_cap = 3u8;
     let mut seats = DEFAULT_SEATS;
     let mut ante = 0u64;
+    let mut straddle = 0u64;
     let mut stack_bb = DEFAULT_SOLVER_STACK_BB;
     let mut seed: u64 = 0;
     // 缺口② 实时搜索 flag（仅 --search 开时打包成 SubgameSearchConfig）。
@@ -7359,6 +7446,18 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     ));
                 }
                 ante = v;
+            }
+            "--straddle" => {
+                let v: u64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad straddle: {e}"))?;
+                // 与 train_cfr --straddle 同口径（solver chips，BB = 100）同范围。
+                if v != 0 && !(100..=400).contains(&v) {
+                    return Err(format!(
+                        "--straddle 是 solver 筹码（BB = 100），须为 0 或在 [100, 400]，得 {v}"
+                    ));
+                }
+                straddle = v;
             }
             "--stack-bb" => {
                 let v: u32 = next_val(&mut it, &arg)?
@@ -7868,6 +7967,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         postflop_cap,
         seats,
         ante,
+        straddle,
         stack_bb,
         seed,
         search,
@@ -8124,6 +8224,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -8243,6 +8344,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -8310,6 +8412,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![HistAction {
                 seat: 3,
                 action: "call".into(),
@@ -8381,6 +8484,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: (0..limps).map(|k| hist(3 + k, "call", Some(20))).collect(),
             valid: ValidActions {
                 can_check,
@@ -8449,13 +8553,19 @@ mod tests {
         let r = limp_heuristic(&raised, h("Ah", "Ad"), LimpPos::Btn, None).unwrap();
         assert_eq!(r.source, src("call"));
         // 位置映射：6 座 tree seat 0..6 = BTN SB BB UTG HJ CO；9 座 tree 8 = CO、3 = UTG。
-        assert_eq!(limp_pos(0, 6), LimpPos::Btn);
-        assert_eq!(limp_pos(1, 6), LimpPos::Sb);
-        assert_eq!(limp_pos(2, 6), LimpPos::Bb);
-        assert_eq!(limp_pos(5, 6), LimpPos::BeforeBtn(1));
-        assert_eq!(limp_pos(3, 6), LimpPos::BeforeBtn(3));
-        assert_eq!(limp_pos(8, 9), LimpPos::BeforeBtn(1));
-        assert_eq!(limp_pos(3, 9), LimpPos::BeforeBtn(6));
+        assert_eq!(limp_pos(0, 6, false), LimpPos::Btn);
+        assert_eq!(limp_pos(1, 6, false), LimpPos::Sb);
+        assert_eq!(limp_pos(2, 6, false), LimpPos::Bb);
+        assert_eq!(limp_pos(5, 6, false), LimpPos::BeforeBtn(1));
+        assert_eq!(limp_pos(3, 6, false), LimpPos::BeforeBtn(3));
+        assert_eq!(limp_pos(8, 9, false), LimpPos::BeforeBtn(1));
+        assert_eq!(limp_pos(3, 9, false), LimpPos::BeforeBtn(6));
+        // straddle：BB 按 SB（补齐）、straddle 座按 BB（选择权），其余不变。
+        assert_eq!(limp_pos(1, 8, true), LimpPos::Sb);
+        assert_eq!(limp_pos(2, 8, true), LimpPos::Sb);
+        assert_eq!(limp_pos(3, 8, true), LimpPos::Bb);
+        assert_eq!(limp_pos(4, 8, true), LimpPos::BeforeBtn(4));
+        assert_eq!(limp_pos(0, 8, true), LimpPos::Btn);
     }
 
     /// 平跟池里有人加注时的 ante 放宽（2026-10-31）：无 ante 只有 P 档跟；满 ante 另加 Chen 序前 8.9%
@@ -8472,6 +8582,7 @@ mod tests {
             small_blind: 50,
             big_blind: 100,
             ante,
+            straddle: 0,
             actions: vec![hist(3, "call", Some(100)), hist(5, "raise", Some(450))],
             valid: full_valid(),
             stacks: vec![],
@@ -8549,6 +8660,7 @@ mod tests {
             small_blind: 50,
             big_blind: 100,
             ante,
+            straddle: 0,
             actions: vec![hist(3, "call", Some(100))],
             valid: full_valid(),
             stacks: vec![],
@@ -8649,6 +8761,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions,
             valid: if board.is_empty() {
                 full_valid()
@@ -9755,7 +9868,7 @@ mod tests {
             Err(e) => e.synced_node,
         };
         let t = exploit_tilt(&game, &sigma, &cfg, 5, &smap, &req, synced, 2, &prof);
-        let width = allin_range_width(1500, 100, true, limp_pos(3, 6));
+        let width = allin_range_width(1500, 100, true, limp_pos(3, 6, false));
         assert_eq!(t.coefs[3].as_deref(), Some(shove_coef(width).as_slice()));
     }
 
@@ -9994,6 +10107,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: acts,
             valid: ValidActions {
                 can_check: false,
@@ -10630,6 +10744,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -11421,6 +11536,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 hist(3, "fold", None),
                 hist(4, "raise", Some(50)),
@@ -11479,6 +11595,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![],
             valid: ValidActions {
                 can_check: true,
@@ -11517,6 +11634,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -12230,6 +12348,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions,
             valid: ValidActions {
                 can_check: false,
@@ -12644,6 +12763,7 @@ mod tests {
             small_blind: 50,
             big_blind: 100,
             ante: 100,
+            straddle: 0,
             actions,
             valid: ValidActions {
                 can_check: false,
@@ -13152,6 +13272,7 @@ mod tests {
             small_blind: 20,
             big_blind: 50,
             ante: 50,
+            straddle: 0,
             actions: vec![
                 hist(0, "raise", Some(225)),
                 hist(1, "call", None),
@@ -14566,6 +14687,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -14815,6 +14937,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![HistAction {
                 seat: 3,
                 action: "call".into(),
@@ -14877,6 +15000,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -14962,6 +15086,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -15073,6 +15198,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![hist(3, "fold", None), hist(4, "fold", None)],
             valid: full_valid(),
             stacks: vec![],
@@ -15099,6 +15225,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             valid: full_valid(),
             stacks: vec![],
         };
@@ -15127,6 +15254,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             valid: full_valid(),
             stacks: vec![],
         };
@@ -15173,6 +15301,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             valid: full.valid.clone(),
             stacks: vec![],
         };
@@ -15254,6 +15383,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 hist(3, "fold", None),
                 hist(4, "fold", None),
@@ -15284,6 +15414,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             valid: full_valid(),
             stacks: vec![],
         };
@@ -15312,6 +15443,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             valid: ValidActions {
                 can_check: true,
                 ..full_valid()
@@ -15334,6 +15466,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![],
             valid: full_valid(),
             stacks: vec![],
@@ -15356,6 +15489,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             valid: full_valid(),
             stacks: vec![],
         };
@@ -15376,6 +15510,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![],
             valid: full_valid(),
             stacks: vec![],
@@ -15399,6 +15534,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 hist(5, "fold", None),
                 hist(0, "fold", None),
@@ -15704,6 +15840,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 HistAction {
                     seat: 3,
@@ -16370,6 +16507,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions,
             valid,
             stacks: vec![],
@@ -16955,6 +17093,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![],
             valid: full_valid(),
             stacks: vec![],
@@ -16984,8 +17123,16 @@ mod tests {
     /// **每一步**断言 `solver.current_player == tree_seat(真实行动者的 OpenPoker 座)`——preflop +
     /// 三条 postflop 街的行动序全部对上，即位置语义与 solver 的 `(seat − button) % n` 一致。
     fn verify_seat_map_by_replay(n: u8, button: u8, dealt: &[u8]) {
-        let req = n_req(n, button, button, dealt.to_vec());
+        verify_seat_map_by_replay_straddle(n, button, dealt, 0);
+    }
+
+    /// 同 [`verify_seat_map_by_replay`]，真实桌与 solver 树都带 UTG straddle（solver chips，0 = 没有；
+    /// 请求的 straddle 按 scale 5 换算成 OpenPoker 单位）。
+    fn verify_seat_map_by_replay_straddle(n: u8, button: u8, dealt: &[u8], straddle: u64) {
+        let mut req = n_req(n, button, button, dealt.to_vec());
+        req.straddle = straddle / 5;
         let smap = seat_map(&req, n as usize).expect("合法占座应可映射");
+        let with_s = |cfg: TableConfig| cfg.with_straddle(ChipAmount::new(straddle));
         let k = if dealt.is_empty() {
             n as usize
         } else {
@@ -16993,18 +17140,18 @@ mod tests {
         };
         // OpenPoker 座 ↔ 真实牌局座。
         let (mut real, real_to_op): (GameState, Vec<u8>) = if k == n as usize {
-            let mut cfg = TableConfig::n_max_at_bb(n, 100);
+            let mut cfg = with_s(TableConfig::n_max_at_bb(n, 100));
             cfg.button_seat = SeatId(button);
             (GameState::new(&cfg, 1), (0..n).collect())
         } else {
             let bi = dealt.iter().position(|&s| s == button).unwrap();
             let ring: Vec<u8> = (0..k).map(|j| dealt[(bi + j) % k]).collect();
             (
-                GameState::new(&TableConfig::n_max_at_bb(k as u8, 100), 1),
+                GameState::new(&with_s(TableConfig::n_max_at_bb(k as u8, 100)), 1),
                 ring,
             )
         };
-        let mut solver = GameState::new(&TableConfig::n_max_at_bb(n, 100), 1);
+        let mut solver = GameState::new(&with_s(TableConfig::n_max_at_bb(n, 100)), 1);
         for &t in &smap.phantoms {
             assert_eq!(solver.current_player(), Some(SeatId(t)), "幻影 fold 顺序");
             solver.apply(Action::Fold).unwrap();
@@ -17082,6 +17229,47 @@ mod tests {
                 }
             }
             assert!(cases > 0);
+        }
+    }
+
+    /// straddle 桌（6 / 9 座）：满桌恒等映射；短桌 k∈[4,n−1] 的全部占座子集 × 每个发牌 button，
+    /// 幻影 = 树座 4..4+n−k，真实 BTN/SB/BB/straddle 对齐树座 0..=3，引擎重放逐步行动者一致（真实
+    /// 桌和树都带 straddle、翻前 straddle 座有选择权、翻后从 SB 起）；k=3 / 2 → `straddle_short_table`。
+    #[test]
+    fn seat_map_straddle_positions_match_engine() {
+        for n in [6u8, 9] {
+            for b in 0..n {
+                let mut r = n_req(n, b, b, vec![]);
+                r.straddle = 40;
+                let m = seat_map(&r, n as usize).unwrap();
+                let expect: Vec<Option<u8>> = (0..n).map(|op| Some((op + n - b) % n)).collect();
+                assert_eq!(m.to_tree, expect, "straddle 满桌 = 恒等映射");
+                verify_seat_map_by_replay_straddle(n, b, &[], 200);
+            }
+            let mut cases = 0;
+            for k in 4..n as usize {
+                for dealt in subsets(n, k) {
+                    for &b in &dealt {
+                        let mut r = n_req(n, b, b, dealt.clone());
+                        r.straddle = 40;
+                        let m = seat_map(&r, n as usize).unwrap();
+                        let expect_ph: Vec<u8> = (4..4 + n - k as u8).collect();
+                        assert_eq!(m.phantoms, expect_ph);
+                        verify_seat_map_by_replay_straddle(n, b, &dealt, 200);
+                        cases += 1;
+                    }
+                }
+            }
+            assert!(cases > 0);
+            for k in [2usize, 3] {
+                let dealt: Vec<u8> = (0..k as u8).collect();
+                let mut r = n_req(n, 0, 0, dealt);
+                r.straddle = 40;
+                assert_eq!(
+                    seat_map(&r, n as usize).err().as_deref(),
+                    Some("straddle_short_table")
+                );
+            }
         }
     }
 
@@ -17279,6 +17467,152 @@ mod tests {
         assert!(is_legal(&r, &flop.valid), "{r:?}");
     }
 
+    /// straddle + ante（1/2/4 (1) 桌按 OpenPoker 10/20/40 (10) 发、scale 5 → solver 50/100/200 (50)）：
+    /// ① `--straddle` 解析（0 或 [100, 400]）；② 请求 straddle 按盲注同一 scale 须对上 blueprint，
+    /// 否则 `straddle_mismatch`（两个方向都拦）；③ 满桌 straddle 下家（op 4）首个行动，全压最后一档 →
+    /// 1pot 开到 230（= 40 + 底池 150 + 跟注 40；solver 1150）；④ 弃到 SB / BB 补齐后 straddle 座能
+    /// 过牌、照常走 blueprint；⑤ 5 人桌映射幻影后照常走 blueprint，3 人桌 `straddle_short_table`；
+    /// ⑥ 单挑 straddle 座的翻牌实时搜索照常锚定、动作合法。
+    #[test]
+    fn straddle_request_mapping_and_search() {
+        let parse = |extra: &[&str]| {
+            parse_args_from(
+                ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                    .iter()
+                    .chain(extra)
+                    .map(|s| s.to_string()),
+            )
+        };
+        assert_eq!(parse(&[]).unwrap().straddle, 0);
+        assert_eq!(parse(&["--straddle", "200"]).unwrap().straddle, 200);
+        assert!(parse(&["--straddle", "50"]).is_err());
+        assert!(parse(&["--straddle", "500"]).is_err());
+
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let g_s = build_game_with_straddle(
+            Arc::clone(&table),
+            "all-1pot",
+            2,
+            8,
+            50,
+            200,
+            DEFAULT_SOLVER_STACK_BB,
+        )
+        .expect("8-max straddle game");
+        let g_plain = build_game(table, "all-1pot", 2, 8, 50, DEFAULT_SOLVER_STACK_BB)
+            .expect("8-max ante game");
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let last = |_i: &InfoSetId, n: usize| {
+            let mut p = vec![0.0; n];
+            p[n - 1] = 1.0;
+            p
+        };
+        let req_s = |straddle: u64, my: u8, dealt: Vec<u8>| Request {
+            ante: 10,
+            straddle,
+            ..n_req(8, 0, my, dealt)
+        };
+        let run = |g: &SimplifiedNlheGame,
+                   strat: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+                   req: &Request| {
+            decide(
+                g,
+                &g.abstraction().clone(),
+                strat,
+                req,
+                0,
+                None,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        assert_eq!(
+            run(&g_s, &uniform, &req_s(0, 4, vec![])).source,
+            "fallback:straddle_mismatch"
+        );
+        assert_eq!(
+            run(&g_s, &uniform, &req_s(60, 4, vec![])).source,
+            "fallback:straddle_mismatch"
+        );
+        assert_eq!(
+            run(&g_plain, &uniform, &req_s(40, 4, vec![])).source,
+            "fallback:straddle_mismatch"
+        );
+
+        // ③ 满桌：straddle 下家 op 4 首个行动。
+        let r = run(&g_s, &last, &req_s(40, 4, vec![]));
+        assert_eq!(r.source, "blueprint", "{r:?}");
+        assert_eq!((r.action.as_str(), r.amount), ("raise", Some(230)), "{r:?}");
+
+        // ④ 弃到 SB / BB 补齐 → straddle 座（op 3）有选择权。
+        let mut opt = req_s(40, 3, vec![]);
+        opt.actions = [4u8, 5, 6, 7, 0]
+            .iter()
+            .map(|&s| hist(s, "fold", None))
+            .chain([hist(1, "call", None), hist(2, "call", None)])
+            .collect();
+        opt.valid = ValidActions {
+            can_check: true,
+            can_call: false,
+            can_raise: true,
+            min_raise: Some(80),
+            max_raise: Some(2000 - 10),
+        };
+        let r = run(&g_s, &uniform, &opt);
+        assert_eq!(r.source, "blueprint", "{r:?}");
+        assert!(is_legal(&r, &opt.valid), "{r:?}");
+
+        // ⑤ 5 人桌（op 0..=4，button 0）：幻影 = 树座 4..=6，op 4 → 树座 7 首个行动；3 人桌兜底。
+        let short = req_s(40, 4, vec![0, 1, 2, 3, 4]);
+        let smap = seat_map(&short, 8).expect("seat_map");
+        assert_eq!(smap.phantoms, vec![4, 5, 6]);
+        assert_eq!(smap.tree_seat(3), Ok(3));
+        assert_eq!(smap.tree_seat(4), Ok(7));
+        let r = run(&g_s, &uniform, &short);
+        assert_eq!(r.source, "blueprint", "{r:?}");
+        assert_eq!(
+            run(&g_s, &uniform, &req_s(40, 2, vec![0, 1, 2])).source,
+            "fallback:straddle_short_table"
+        );
+
+        // ⑥ 翻牌：op 4 开 1pot 到 230，其余弃到 straddle 座（op 3，hero）跟 → 翻牌 hero 先动。
+        let mut flop = req_s(40, 3, vec![]);
+        flop.hole = vec!["Qs".into(), "Qd".into()];
+        flop.board = vec!["7h".into(), "2c".into(), "Ks".into()];
+        flop.actions = std::iter::once(hist(4, "raise", Some(230)))
+            .chain([5u8, 6, 7, 0, 1, 2].iter().map(|&s| hist(s, "fold", None)))
+            .chain(std::iter::once(hist(3, "call", Some(230))))
+            .collect();
+        flop.valid = ValidActions {
+            can_check: true,
+            can_call: false,
+            can_raise: true,
+            min_raise: Some(20),
+            max_raise: Some(2000 - 10 - 230),
+        };
+        let rt_s = rt(SubgameSearchConfig {
+            iterations: 200,
+            trigger: SearchTrigger::AllPostflop,
+            max_subtree_nodes: 1_000_000,
+            ..SubgameSearchConfig::default()
+        });
+        let r = decide(
+            &g_s,
+            &g_s.abstraction().clone(),
+            &uniform,
+            &flop,
+            0x57AD,
+            Some(&rt_s),
+            &mut SubgameSolveCache::new(),
+        );
+        assert!(
+            r.source == "search" || r.source.starts_with("search_giveup:unsolved"),
+            "{r:?}"
+        );
+        assert!(is_legal(&r, &flop.valid), "{r:?}");
+    }
+
     /// `ante-flop2`（8 座、每人 1BB ante、开池只有 1/3pot）在 advisor 侧可用：盲注 10/20、ante 20
     /// （scale 5）。① hero 在 UTG 首个行动、策略全压最后一档 → 开池到 90 = 4.5BB（solver 450 / 5）；
     /// ② 真实 UTG 开 2.5BB（50）→ 影子映到 1/3pot 开池档，下一位 hero 照常走 blueprint、动作合法。
@@ -17420,7 +17754,7 @@ mod tests {
         };
         let smap = seat_map(&req, 8).unwrap();
         let my = SeatId(smap.tree_seat(5).unwrap());
-        assert_eq!(limp_pos(my.0, 8), LimpPos::BeforeBtn(1), "座 5 = CO");
+        assert_eq!(limp_pos(my.0, 8, false), LimpPos::BeforeBtn(1), "座 5 = CO");
         let (_, _, limp, _) =
             lockstep_replay(&game, &solver_cfg, &smap, &req, 1, 0, Some(my), true)
                 .expect("平跟当弃牌映射");
@@ -18025,6 +18359,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions,
             valid,
             stacks: vec![],
@@ -18577,6 +18912,7 @@ mod tests {
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
             live_posts: 0,
+            straddle: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(0x47_5541_5244);
@@ -18898,6 +19234,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 ha(0, "fold", None),
                 ha(1, "raise", Some(50)),
@@ -19049,6 +19386,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions: vec![
                 hist(3, "fold", None),
                 hist(4, "fold", None),
@@ -19259,6 +19597,7 @@ mod tests {
             small_blind: 10,
             big_blind: 20,
             ante: 0,
+            straddle: 0,
             actions,
             valid: ValidActions {
                 can_check: false,

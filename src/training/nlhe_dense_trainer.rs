@@ -354,10 +354,11 @@ impl DenseNlheEsMccfrTrainer {
 
     /// dense 表布局指纹（save / load 共用：从持有的 indexer + game bucket hash 算）。
     fn layout_fingerprint(&self) -> DenseLayoutFingerprint {
-        DenseLayoutFingerprint::from_indexer(
+        DenseLayoutFingerprint::from_indexer_with_straddle(
             self.regret.indexer(),
             self.game.bucket_table_blake3(),
             self.game.table_config().ante.as_u64(),
+            self.game.table_config().straddle.as_u64(),
         )
     }
 
@@ -384,10 +385,11 @@ impl DenseNlheEsMccfrTrainer {
             game.tree(),
             bucket_count_by_street(&game),
         ));
-        let expected = DenseLayoutFingerprint::from_indexer(
+        let expected = DenseLayoutFingerprint::from_indexer_with_straddle(
             &indexer,
             game.bucket_table_blake3(),
             game.table_config().ante.as_u64(),
+            game.table_config().straddle.as_u64(),
         );
         let (meta, regret, strategy_sum) =
             load_dense_checkpoint(path, &expected, Arc::clone(&indexer))?;

@@ -19,7 +19,7 @@ use crate::abstraction::action::{
 };
 use crate::abstraction::info::StreetTag;
 use crate::core::rng::ChaCha20Rng;
-use crate::core::{ChipAmount, PlayerStatus, Street};
+use crate::core::{ChipAmount, PlayerStatus, SeatId, Street};
 use crate::rules::config::TableConfig;
 use crate::rules::state::GameState;
 use crate::training::game::PlayerId;
@@ -809,9 +809,11 @@ fn node_allowed_actions(
     entrants: u16,
     raises_on_street: u32,
 ) -> SmallVec<[AbstractAction; 8]> {
-    // no_open_limp：preflop 未被加注（max committed == BB）且 actor 非 SB（rp != 1）→
-    // 该节点的 `Call` 是 open-limp，删之（强制 raise-or-fold）。BB（rp==2）此局面是
-    // free-check 无 Call，moot；SB（rp==1）的 complete 保留（GTO 合理）。rules 关时恒 false。
+    // no_open_limp：preflop 未被加注（max committed == 翻前一份大盲：BB，有 straddle 时是
+    // straddle）且 actor 开局没交算本轮下注的盲注 → 该节点的 `Call` 是 open-limp，删之（强制
+    // raise-or-fold）。交了盲注的座位：最后一个盲注（BB / straddle）此局面是 free-check 无 Call，
+    // moot；前面的盲注（SB，有 straddle 时还有 BB）的补齐保留（GTO 合理）。无 straddle、无补盲
+    // 时与旧口径「rp != 1」逐节点相同。rules 关时恒 false。
     let drop_open_limp = rules.no_open_limp && state.street() == Street::Preflop && {
         let cfg = state.config();
         let max_committed = state
@@ -820,9 +822,7 @@ fn node_allowed_actions(
             .map(|p| p.committed_this_round)
             .max()
             .unwrap_or(ChipAmount::ZERO);
-        let n = cfg.n_seats;
-        let rp = (actor + n - cfg.button_seat.0) % n; // BTN=0 SB=1 BB=2 UTG=3..
-        max_committed == cfg.big_blind && rp != 1
+        max_committed == cfg.preflop_blind() && !cfg.posts_blind(SeatId(actor))
     };
 
     // A4 redirect 不变量（closing-action 精确收口）：postflop 在场恒 ≤ N。>N 只可能
@@ -2111,6 +2111,90 @@ mod tests {
         }
     }
 
+    /// straddle 桌位置结构守门（8 座 100BB、ante 50、UTG straddle 200 = 1/2/4 (1) 桌，o75 菜单）：
+    /// 首行动 = straddle 下家（seat 4），seat 4..7 + BTN 开池无 limp Call、无开池 AllIn、只有一个
+    /// 加注档且开到 200 + 0.75 × (底池 750 + 跟注 200) ≈ 913；fold 到 SB / BB 都保留补齐 Call；
+    /// BB 补齐后 straddle 座 = {Check, 0.75pot}；全弃到 straddle 座 → walk 终局。
+    #[test]
+    fn straddle_positions_no_open_limp() {
+        let cfg = TableConfig::n_max_at_bb(8, 100)
+            .with_ante(ChipAmount::new(50))
+            .with_straddle(ChipAmount::new(200));
+        let (abs, rules) = ante_flop2_3bet_o75_6max(2);
+        let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+        let child = |id: NodeId, tag: AbstractActionTag| -> Child {
+            let node = t.node(id);
+            let i = node
+                .legal_actions
+                .iter()
+                .position(|a| *a == tag)
+                .unwrap_or_else(|| panic!("node {id} 缺 {tag:?}: {:?}", node.legal_actions));
+            node.children[i]
+        };
+        let step = |id: NodeId, tag: AbstractActionTag| match child(id, tag) {
+            Child::Decision(next) => next,
+            Child::Terminal => panic!("node {id} {tag:?} 不应终局"),
+        };
+        let o75 = BetRatio::from_f64(0.75).expect("0.75 合法");
+
+        // 开池额：从根节点的规则状态算（与建树同一 GameState 路径）。
+        let mut rng = ChaCha20Rng::from_seed(TREE_BUILD_RNG_SEED);
+        let root_state = GameState::with_rng(&cfg, 0, &mut rng);
+        assert_eq!(root_state.pot(), ChipAmount::new(750));
+        let opens: Vec<u64> = abs
+            .abstract_actions(&root_state)
+            .iter()
+            .filter_map(|a| match a {
+                AbstractAction::Raise { to, ratio_label } if *ratio_label == o75 => {
+                    Some(to.as_u64())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opens, vec![913], "0.75pot 开池 = 200 + 0.75 × 950 向上取整");
+
+        let mut id = t.root_id();
+        for seat in [4u8, 5, 6, 7, 0] {
+            let node = t.node(id);
+            assert_eq!(node.street, StreetTag::Preflop);
+            assert_eq!(node.player_acting, seat, "fold-chain 行动顺序错");
+            assert_eq!(
+                node.legal_actions.to_vec(),
+                vec![AbstractActionTag::Fold, AbstractActionTag::Raise(o75)],
+                "seat {seat} 开池只应有 Fold / 0.75pot"
+            );
+            id = step(id, AbstractActionTag::Fold);
+        }
+        let sb = t.node(id);
+        assert_eq!(sb.player_acting, 1, "fold 到 SB");
+        assert!(
+            sb.legal_actions.contains(&AbstractActionTag::Call),
+            "SB 补齐保留"
+        );
+        // SB 弃、BB 补齐（width_redirect = 2：再多一个进池者 straddle 座就只能加注或弃牌）。
+        let bb = step(id, AbstractActionTag::Fold);
+        assert_eq!(t.node(bb).player_acting, 2);
+        assert!(
+            t.node(bb).legal_actions.contains(&AbstractActionTag::Call),
+            "有 straddle 时 BB 补齐保留"
+        );
+        let strad = t.node(step(bb, AbstractActionTag::Call));
+        assert_eq!(strad.player_acting, 3, "BB 补齐后轮到 straddle 座");
+        assert_eq!(
+            strad.legal_actions.to_vec(),
+            vec![AbstractActionTag::Check, AbstractActionTag::Raise(o75)],
+            "straddle 座的选择权"
+        );
+        let bb_after_sb_fold = step(id, AbstractActionTag::Fold);
+        assert!(
+            matches!(
+                child(bb_after_sb_fold, AbstractActionTag::Fold),
+                Child::Terminal
+            ),
+            "全弃到 straddle 座 → walk 终局"
+        );
+    }
+
     /// 默认全街 `{0.5,1,2}` 树节点数 = 240,096（与 `nlhe_betting_tree_sizing` 工具
     /// 独立 walk 测得一致）。守住 `build` 路由经 `StreetActionAbstraction::default_6_action`
     /// 后行为不变（前置 P byte-equal 默认路径）。
@@ -2137,6 +2221,7 @@ mod tests {
             ante: ChipAmount::ZERO,
             ante_exempt: 0,
             live_posts: 0,
+            straddle: ChipAmount::ZERO,
             button_seat: crate::core::SeatId(0),
         };
         let (abs, rules) = deep_single_pot();

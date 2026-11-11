@@ -375,6 +375,7 @@ pub fn hh_to_multiway_input(rec: &HhRecord) -> Result<HhConverted, String> {
         ante: ChipAmount::ZERO,
         ante_exempt: 0,
         live_posts: 0,
+        straddle: ChipAmount::ZERO,
         button_seat: SeatId(engine_btn as u8),
     };
 

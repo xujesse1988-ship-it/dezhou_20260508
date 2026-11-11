@@ -27,6 +27,7 @@ fn cfg_3max_sidepot() -> TableConfig {
         ante: ChipAmount::ZERO,
         ante_exempt: 0,
         live_posts: 0,
+        straddle: ChipAmount::ZERO,
         button_seat: SeatId(0),
     }
 }

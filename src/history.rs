@@ -261,6 +261,7 @@ fn config_to_proto(config: &TableConfig) -> proto::TableConfig {
         button_seat: config.button_seat.0 as u32,
         ante_exempt: u32::from(config.ante_exempt),
         live_posts: u32::from(config.live_posts),
+        straddle: config.straddle.as_u64(),
     }
 }
 
@@ -309,8 +310,15 @@ fn config_from_proto(config: &proto::TableConfig) -> Result<TableConfig, History
         // 上面已校验高位为 0（n_seats ≤ 9）→ 截到 u16 无损。
         ante_exempt: config.ante_exempt as u16,
         live_posts: config.live_posts as u16,
+        straddle: ChipAmount::new(config.straddle),
         button_seat: seat_from_u32(config.button_seat, "button_seat")?,
     };
+    if !out.straddle_valid() {
+        return Err(HistoryError::Corrupted(format!(
+            "straddle {} must be 0 or >= big_blind {} with n_seats >= 3",
+            config.straddle, config.big_blind
+        )));
+    }
     if !out.live_posts_valid() {
         return Err(HistoryError::Corrupted(format!(
             "live_posts {:#x} marks a blind seat",
@@ -472,6 +480,9 @@ mod proto {
         /// 开局补 live 大盲的座位 bitmask（0 = 没人补；默认值不编码 → 旧 history 字节不变）。
         #[prost(uint32, tag = "8")]
         pub live_posts: u32,
+        /// UTG 强制 straddle 额（0 = 没有 straddle；默认值不编码 → 旧 history 字节不变）。
+        #[prost(uint64, tag = "9")]
+        pub straddle: u64,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]
