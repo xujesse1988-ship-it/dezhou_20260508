@@ -2721,6 +2721,12 @@ fn solve_cache_key(
         h.update(b"st");
         h.update(&rc.straddle.as_u64().to_le_bytes());
     }
+    if rc.rake_bps > 0 {
+        // 带前缀（可选追加，0 不掺 → 不抽水的 key 不变）。抽水改终局收益，解不能跨抽水设置复用。
+        h.update(b"rk");
+        h.update(&rc.rake_bps.to_le_bytes());
+        h.update(&rc.rake_cap.as_u64().to_le_bytes());
+    }
     h.update(&[rc.button_seat.0]);
     h.update(&[root_state.street() as u8]);
     h.update(&[root_state.board().len() as u8]);
@@ -2778,6 +2784,13 @@ fn solve_cache_key(
     // Only when on, so keys of every pre-existing reshape stay byte-equal.
     if sub_rules.preflop_half_3bet {
         h.update(b"half3bet");
+    }
+    if sub_rules.preflop_half_open {
+        h.update(b"halfopen");
+    }
+    if sub_rules.limp_line_width != BettingAbstractionRules::WIDTH_REDIRECT_OFF {
+        h.update(b"limpwidth");
+        h.update(&[sub_rules.limp_line_width]);
     }
     *h.finalize().as_bytes()
 }
@@ -6762,6 +6775,8 @@ mod tests {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         SimplifiedNlheGame::new_with_abstraction(
@@ -6791,6 +6806,8 @@ mod tests {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(seed);
@@ -6837,6 +6854,8 @@ mod tests {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(seed);
@@ -7686,6 +7705,8 @@ mod tests {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         let mut st = GameState::new(&cfg, 0x0011_3100);
@@ -9368,6 +9389,114 @@ mod tests {
         let s300 = base.clone().with_straddle(ChipAmount::new(300));
         assert_ne!(key(&base), key(&s200));
         assert_ne!(key(&s200), key(&s300));
+    }
+
+    /// `preflop_half_open` 进求解缓存 key（只在开着时追加，既有 reshape 的 key 不变）。
+    #[test]
+    fn preflop_half_open_enters_solve_cache_key() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let table = stub_table();
+        let cfg = SubgameSearchConfig::default();
+        let st = GameState::new(&TableConfig::default_6max_100bb(), 1);
+        let key = |rules: &BettingAbstractionRules| {
+            solve_cache_key(
+                KEY_KIND_ANCHORED,
+                &table,
+                &st,
+                0,
+                0,
+                None,
+                game.abstraction(),
+                rules,
+                &cfg,
+                7,
+                0,
+                None,
+                &[],
+            )
+        };
+        let base = game.rules();
+        let mut on = base;
+        on.preflop_half_open = true;
+        assert_ne!(key(&base), key(&on));
+        let mut off = base;
+        off.preflop_half_open = false;
+        assert_eq!(key(&base), key(&off));
+    }
+
+    /// `limp_line_width` 进求解缓存 key（只在开着时追加，既有 reshape 的 key 不变）；不同上限各自区分。
+    #[test]
+    fn limp_line_width_enters_solve_cache_key() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let table = stub_table();
+        let cfg = SubgameSearchConfig::default();
+        let st = GameState::new(&TableConfig::default_6max_100bb(), 1);
+        let key = |rules: &BettingAbstractionRules| {
+            solve_cache_key(
+                KEY_KIND_ANCHORED,
+                &table,
+                &st,
+                0,
+                0,
+                None,
+                game.abstraction(),
+                rules,
+                &cfg,
+                7,
+                0,
+                None,
+                &[],
+            )
+        };
+        let base = game.rules();
+        assert_eq!(
+            base.limp_line_width,
+            BettingAbstractionRules::WIDTH_REDIRECT_OFF
+        );
+        let mut three = base;
+        three.limp_line_width = 3;
+        let mut two = base;
+        two.limp_line_width = 2;
+        assert_ne!(key(&base), key(&three));
+        assert_ne!(key(&three), key(&two));
+        assert_eq!(key(&base), key(&game.rules()));
+    }
+
+    /// 抽水进求解缓存 key（只在抽水时追加，不抽水的 key 不变）；比例、封顶各自区分。
+    #[test]
+    fn rake_enters_solve_cache_key() {
+        let game = SimplifiedNlheGame::new(stub_table()).expect("HU game");
+        let table = stub_table();
+        let cfg = SubgameSearchConfig::default();
+        let rules = game.rules();
+        let key = |tc: TableConfig| {
+            let st = GameState::new(&tc, 1);
+            solve_cache_key(
+                KEY_KIND_ANCHORED,
+                &table,
+                &st,
+                0,
+                0,
+                None,
+                game.abstraction(),
+                &rules,
+                &cfg,
+                7,
+                0,
+                None,
+                &[],
+            )
+        };
+        let base = TableConfig::default_6max_100bb();
+        let plain = key(base.clone());
+        assert_eq!(plain, key(base.clone().with_rake(0, ChipAmount::ZERO)));
+        let raked = key(base.clone().with_rake(400, ChipAmount::new(1000)));
+        assert_ne!(plain, raked);
+        assert_ne!(
+            raked,
+            key(base.clone().with_rake(400, ChipAmount::new(500)))
+        );
+        assert_ne!(raked, key(base.with_rake(300, ChipAmount::new(1000))));
     }
 
     #[test]

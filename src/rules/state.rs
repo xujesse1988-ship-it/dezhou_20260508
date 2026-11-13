@@ -1371,8 +1371,13 @@ impl GameState {
             pots.push((amount, contenders));
         }
 
+        // 每座从独赢的池里拿到的筹码（抽水基数；平分的池不抽，见 `TableConfig::rake_bps`）。
+        let mut sole_awards = vec![0u64; self.players.len()];
         for (amount, contenders) in pots {
             let winners = self.pot_winners(&contenders);
+            if let [only] = winners[..] {
+                sole_awards[only] += amount;
+            }
             let base = amount / winners.len() as u64;
             let remainder = amount % winners.len() as u64;
             for &winner in &winners {
@@ -1385,6 +1390,12 @@ impl GameState {
                     // (D-039-rev1).
                     awards[*winner] += remainder;
                 }
+            }
+        }
+        if self.config.rake_bps > 0 {
+            for (award, &sole) in awards.iter_mut().zip(&sole_awards) {
+                // rake_on(sole) ≤ sole ≤ award（rake_valid 保证比例 ≤ 100%）。
+                *award -= self.config.rake_on(sole);
             }
         }
 
@@ -1560,6 +1571,11 @@ fn validate_config(config: &TableConfig) {
         config.live_posts_valid(),
         "live_posts {:#x} has bits beyond n_seats or marks a blind seat",
         config.live_posts
+    );
+    assert!(
+        config.rake_valid(),
+        "rake_bps {} must be <= 10000",
+        config.rake_bps
     );
 }
 
@@ -1945,6 +1961,8 @@ mod legal_action_tests {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: SeatId(0),
         }
     }
@@ -2101,6 +2119,8 @@ mod legal_action_tests {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         let mut s = GameState::new(&cfg, 0x5117_u64);

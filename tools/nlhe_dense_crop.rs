@@ -1,7 +1,7 @@
 //! dense blueprint 按街裁切 CLI（见 [`poker::training::nlhe_dense_crop`]）。
 //!
 //! 把 `train_cfr --dense` 产出的 checkpoint 裁成只含前若干街（默认翻前 + 翻牌）的 crop 文件。
-//! 游戏参数（`--profile/--seats/--reshape/--postflop-cap/--stack-bb/--ante/--straddle/--bucket-table`）必须与
+//! 游戏参数（`--profile/--seats/--reshape/--postflop-cap/--stack-bb/--ante/--straddle/--rake-bps/--rake-cap/--bucket-table`）必须与
 //! 训练时一致——用它重建全树 layout 指纹与 checkpoint 比对，不符直接拒绝。全程流式，内存
 //! ≈ 全树 indexer + touched bitset（9-max cap4 500 桶 < 2 GiB），可与训练同机并行跑。
 //!
@@ -42,6 +42,9 @@ struct Args {
     ante: u64,
     /// UTG 强制 straddle（chips），须与 `train_cfr --straddle` 相同（straddle 进 layout 指纹）。
     straddle: u64,
+    /// 抽水万分比 / 每座封顶（chips），须与 `train_cfr --rake-bps` / `--rake-cap` 相同（抽水进 layout 指纹）。
+    rake_bps: u32,
+    rake_cap: u64,
     keep_through: StreetTag,
     strategy_only: bool,
     verify: bool,
@@ -53,6 +56,7 @@ fn usage() -> &'static str {
      \t[--reshape <name> (default none)] [--postflop-cap <N> (default 3)] [--stack-bb <N> (default 100)]\n\
      \t[--ante <chips> (default 0)]\n\
      \t[--straddle <chips> (default 0; six-max only)]\n\
+     \t[--rake-bps <n> (default 0)] [--rake-cap <chips> (default 0)]\n\
      \t[--keep-through preflop|flop|turn (default flop)] [--strategy-only] [--verify]\n\
      game args must match the ones used by train_cfr (layout fingerprint is checked)."
 }
@@ -70,6 +74,8 @@ fn parse_args() -> Result<Args, String> {
         stack_bb: 100,
         ante: 0,
         straddle: 0,
+        rake_bps: 0,
+        rake_cap: 0,
         keep_through: StreetTag::Flop,
         strategy_only: false,
         verify: false,
@@ -110,6 +116,12 @@ fn parse_args() -> Result<Args, String> {
             }
             "--ante" => a.ante = num(it.next(), "--ante")?,
             "--straddle" => a.straddle = num(it.next(), "--straddle")?,
+            "--rake-bps" => {
+                let v = num(it.next(), "--rake-bps")?;
+                a.rake_bps =
+                    u32::try_from(v).map_err(|_| format!("--rake-bps {v} out of range"))?;
+            }
+            "--rake-cap" => a.rake_cap = num(it.next(), "--rake-cap")?,
             "--keep-through" => {
                 a.keep_through = match it.next().as_deref() {
                     Some("preflop") => StreetTag::Preflop,
@@ -157,7 +169,9 @@ fn build_game(a: &Args, table: Arc<BucketTable>) -> Result<SimplifiedNlheGame, S
     match a.profile.as_str() {
         "hu" => SimplifiedNlheGame::new_hu_with_config(
             table,
-            TableConfig::default_hu_200bb().with_ante(ante),
+            TableConfig::default_hu_200bb()
+                .with_ante(ante)
+                .with_rake(a.rake_bps, ChipAmount::new(a.rake_cap)),
         )
         .map_err(|e| format!("build hu game: {e:?}")),
         "six-max" => {
@@ -171,7 +185,8 @@ fn build_game(a: &Args, table: Arc<BucketTable>) -> Result<SimplifiedNlheGame, S
                 table,
                 TableConfig::n_max_at_bb(a.seats, a.stack_bb)
                     .with_ante(ante)
-                    .with_straddle(ChipAmount::new(a.straddle)),
+                    .with_straddle(ChipAmount::new(a.straddle))
+                    .with_rake(a.rake_bps, ChipAmount::new(a.rake_cap)),
                 abs,
                 rules,
             )

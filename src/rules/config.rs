@@ -31,6 +31,13 @@ pub struct TableConfig {
     /// 加注时可过牌（同大盲的选择权）；翻前最小加注额 = straddle（1/2/4 桌最小加注到 8），翻后最小
     /// 下注仍是大盲。须 ≥ 大盲，只能用于 3 座以上（构造 [`crate::GameState`] 时校验）。
     pub straddle: ChipAmount,
+    /// 抽水比例（万分之几），默认 0 = 不抽水（终局收益零和，与历史逐位相同）。非 0 时终局结算里，
+    /// 每个座位从**独赢**的底池（主池 / 边池，平分的不算）拿到的筹码合计按这个比例向下取整扣一份，
+    /// 每座封顶 [`rake_cap`](Self::rake_cap)；没人跟的注先退回、不计入。收益不再零和。
+    /// wopo ante 桌实测 = 400（4%）、封顶 10BB（见 `tools/wopo_rake_check.py`）。
+    pub rake_bps: u32,
+    /// 每座抽水封顶（chips），0 = 不封顶。`rake_bps == 0` 时不起作用。
+    pub rake_cap: ChipAmount,
     /// 起始按钮位（默认 `SeatId(0)`，由 D-022b 推出 SB=1 / BB=2）。
     pub button_seat: SeatId,
 }
@@ -64,6 +71,8 @@ impl TableConfig {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: SeatId(0),
         }
     }
@@ -73,6 +82,33 @@ impl TableConfig {
     pub fn with_straddle(mut self, straddle: ChipAmount) -> TableConfig {
         self.straddle = straddle;
         self
+    }
+
+    /// 把抽水换成给定值（`rake_bps` 万分比、`rake_cap` 每座封顶 chips，0 = 不封顶），其余字段不变。
+    /// `train_cfr --rake-bps <n> --rake-cap <chips>` 用它叠在 `n_max_at_bb(..).with_ante(..)` 之上。
+    pub fn with_rake(mut self, rake_bps: u32, rake_cap: ChipAmount) -> TableConfig {
+        self.rake_bps = rake_bps;
+        self.rake_cap = rake_cap;
+        self
+    }
+
+    /// 独赢 `amount` chips 要交的抽水：`amount × rake_bps / 10000` 向下取整，封顶 `rake_cap`
+    /// （0 = 不封顶）。`rake_bps == 0` 恒为 0。
+    pub fn rake_on(&self, amount: u64) -> u64 {
+        if self.rake_bps == 0 {
+            return 0;
+        }
+        let raw = amount * u64::from(self.rake_bps) / 10_000;
+        if self.rake_cap > ChipAmount::ZERO {
+            raw.min(self.rake_cap.as_u64())
+        } else {
+            raw
+        }
+    }
+
+    /// `rake_bps` 是否合法：不超过 10000（100%）。
+    pub fn rake_valid(&self) -> bool {
+        self.rake_bps <= 10_000
     }
 
     /// straddle 座（大盲下家）；没有 straddle（`straddle == 0`）或不足 3 座时返回 `None`。
@@ -170,6 +206,8 @@ impl TableConfig {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: SeatId(0),
         }
     }

@@ -18913,6 +18913,8 @@ mod tests {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: SeatId(0),
         };
         let mut rng = ChaCha20Rng::from_seed(0x47_5541_5244);

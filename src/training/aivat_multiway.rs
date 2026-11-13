@@ -441,6 +441,8 @@ mod tests {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: SeatId(0),
         }
     }

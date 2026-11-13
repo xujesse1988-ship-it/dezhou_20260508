@@ -137,6 +137,16 @@ path = "tools/preflop_viewer.rs"
 name = "six_max_eval"
 path = "tools/six_max_eval.rs"
 
+# 抽水对照：同一棵树上不抽水 / 带抽水两份 dense checkpoint 的打法统计 + 交叉对打（成对差）。
+[[bin]]
+name = "nlhe_rake_ab"
+path = "tools/nlhe_rake_ab.rs"
+
+# 针对牌池训练的效果：普通 blueprint 与带 --pool-model 训的候选，对「牌池 / 混合 / 普通」三种对手的成对差。
+[[bin]]
+name = "nlhe_pool_ab"
+path = "tools/nlhe_pool_ab.rs"
+
 # S5① 相对强度：6-max blueprint 跨抽象互评（off-tree 自对弈，blueprint_advisor 引擎）。
 # 加载 ≥2 个不同 betting tree 的 dense blueprint，跑有序对 (hero,field) 的 mbb/g + desync 计数。
 [[bin]]

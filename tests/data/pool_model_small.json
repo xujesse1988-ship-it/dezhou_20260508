@@ -1,0 +1,918 @@
+{
+ "families": {
+  "pf_limper_vs_raise": {
+   "cells": {
+    "": {
+     "call": 29,
+     "fold": 25,
+     "raise": 5
+    },
+    "0.42-0.62": {
+     "call": 3,
+     "fold": 1,
+     "raise": 1
+    },
+    "0.62-0.87": {
+     "call": 5,
+     "fold": 4,
+     "raise": 2
+    },
+    "0.87-1.2": {
+     "call": 18,
+     "fold": 19,
+     "raise": 2
+    },
+    "<=0.42": {
+     "call": 2
+    },
+    ">2.0": {
+     "call": 1,
+     "fold": 1
+    }
+   },
+   "dims": [
+    "size"
+   ],
+   "size_cells": {
+    "": {
+     "0.62-0.87": 2,
+     "0.87-1.2": 3
+    }
+   },
+   "size_dims": []
+  },
+  "pf_option": {
+   "cells": {
+    "": {
+     "check": 28,
+     "raise": 10
+    },
+    "0-1": {
+     "check": 15,
+     "raise": 3
+    },
+    "2+": {
+     "check": 13,
+     "raise": 7
+    }
+   },
+   "dims": [
+    "limpers"
+   ],
+   "size_cells": {
+    "": {
+     "0.42-0.62": 2,
+     "0.62-0.87": 2,
+     "0.87-1.2": 5,
+     "allin": 1
+    }
+   },
+   "size_dims": []
+  },
+  "pf_other_vs_3bet": {
+   "cells": {
+    "": {
+     "call": 7,
+     "fold": 81,
+     "raise": 3
+    },
+    "no": {
+     "call": 2,
+     "fold": 54,
+     "raise": 1
+    },
+    "yes": {
+     "call": 5,
+     "fold": 27,
+     "raise": 2
+    }
+   },
+   "dims": [
+    "entered"
+   ],
+   "size_cells": {
+    "": {
+     "0.42-0.62": 1,
+     "0.87-1.2": 1,
+     "allin": 1
+    }
+   },
+   "size_dims": []
+  },
+  "pf_raiser_vs_3bet": {
+   "cells": {
+    "": {
+     "call": 15,
+     "fold": 19,
+     "raise": 1
+    },
+    "0.62-0.87": {
+     "call": 4,
+     "fold": 5
+    },
+    "0.87-1.2": {
+     "call": 8,
+     "fold": 12,
+     "raise": 1
+    },
+    "1.2-2.0": {
+     "call": 2,
+     "fold": 2
+    },
+    ">2.0": {
+     "call": 1
+    }
+   },
+   "dims": [
+    "size"
+   ],
+   "size_cells": {
+    "": {
+     "0.62-0.87": 1
+    }
+   },
+   "size_dims": []
+  },
+  "pf_unopened": {
+   "cells": {
+    "": {
+     "call": 55,
+     "fold": 182,
+     "raise": 69
+    },
+    "BTN": {
+     "call": 1,
+     "fold": 5,
+     "raise": 6
+    },
+    "CO": {
+     "call": 4,
+     "fold": 10,
+     "raise": 6
+    },
+    "EP": {
+     "call": 33,
+     "fold": 112,
+     "raise": 33
+    },
+    "MP": {
+     "call": 14,
+     "fold": 55,
+     "raise": 22
+    },
+    "SB": {
+     "call": 3,
+     "raise": 2
+    }
+   },
+   "dims": [
+    "pos"
+   ],
+   "size_cells": {
+    "": {
+     "0.42-0.62": 5,
+     "0.62-0.87": 20,
+     "0.87-1.2": 39,
+     "1.2-2.0": 1,
+     "<=0.42": 3,
+     ">2.0": 1
+    },
+    "BTN": {
+     "0.42-0.62": 1,
+     "0.62-0.87": 1,
+     "0.87-1.2": 3,
+     "<=0.42": 1
+    },
+    "CO": {
+     "0.42-0.62": 1,
+     "0.62-0.87": 2,
+     "0.87-1.2": 3
+    },
+    "EP": {
+     "0.42-0.62": 2,
+     "0.62-0.87": 8,
+     "0.87-1.2": 20,
+     "1.2-2.0": 1,
+     "<=0.42": 1,
+     ">2.0": 1
+    },
+    "MP": {
+     "0.42-0.62": 1,
+     "0.62-0.87": 8,
+     "0.87-1.2": 12,
+     "<=0.42": 1
+    },
+    "SB": {
+     "0.62-0.87": 1,
+     "0.87-1.2": 1
+    }
+   },
+   "size_dims": [
+    "pos"
+   ]
+  },
+  "pf_vs_4bet": {
+   "cells": {
+    "": {
+     "call": 3,
+     "fold": 10,
+     "raise": 2
+    },
+    "no": {
+     "call": 2,
+     "fold": 5
+    },
+    "yes": {
+     "call": 1,
+     "fold": 5,
+     "raise": 2
+    }
+   },
+   "dims": [
+    "raised"
+   ],
+   "size_cells": {
+    "": {
+     "allin": 2
+    }
+   },
+   "size_dims": []
+  },
+  "pf_vs_limp": {
+   "cells": {
+    "": {
+     "call": 59,
+     "fold": 70,
+     "raise": 31
+    },
+    "BTN": {
+     "call": 11,
+     "fold": 12,
+     "raise": 10
+    },
+    "CO": {
+     "call": 13,
+     "fold": 15,
+     "raise": 3
+    },
+    "EP": {
+     "call": 5,
+     "fold": 7,
+     "raise": 3
+    },
+    "MP": {
+     "call": 19,
+     "fold": 28,
+     "raise": 10
+    },
+    "SB": {
+     "call": 11,
+     "fold": 8,
+     "raise": 5
+    }
+   },
+   "dims": [
+    "pos"
+   ],
+   "size_cells": {
+    "": {
+     "0.42-0.62": 4,
+     "0.62-0.87": 7,
+     "0.87-1.2": 15,
+     "<=0.42": 4,
+     "allin": 1
+    },
+    "1": {
+     "0.42-0.62": 3,
+     "0.62-0.87": 6,
+     "0.87-1.2": 7,
+     "<=0.42": 3,
+     "allin": 1
+    },
+    "2+": {
+     "0.42-0.62": 1,
+     "0.62-0.87": 1,
+     "0.87-1.2": 8,
+     "<=0.42": 1
+    }
+   },
+   "size_dims": [
+    "limpers"
+   ]
+  },
+  "pf_vs_raise": {
+   "cells": {
+    "": {
+     "call": 84,
+     "fold": 275,
+     "raise": 33
+    },
+    "BB": {
+     "call": 25,
+     "fold": 45,
+     "raise": 6
+    },
+    "BB|0.42-0.62": {
+     "call": 4,
+     "fold": 1
+    },
+    "BB|0.62-0.87": {
+     "call": 11,
+     "fold": 6,
+     "raise": 1
+    },
+    "BB|0.87-1.2": {
+     "call": 9,
+     "fold": 31,
+     "raise": 4
+    },
+    "BB|1.2-2.0": {
+     "fold": 1
+    },
+    "BB|<=0.42": {
+     "call": 1,
+     "fold": 3,
+     "raise": 1
+    },
+    "BB|>2.0": {
+     "fold": 3
+    },
+    "SB": {
+     "call": 18,
+     "fold": 51,
+     "raise": 9
+    },
+    "SB|0.42-0.62": {
+     "call": 2,
+     "fold": 3,
+     "raise": 2
+    },
+    "SB|0.62-0.87": {
+     "call": 4,
+     "fold": 13,
+     "raise": 3
+    },
+    "SB|0.87-1.2": {
+     "call": 10,
+     "fold": 28,
+     "raise": 2
+    },
+    "SB|1.2-2.0": {
+     "fold": 1
+    },
+    "SB|<=0.42": {
+     "call": 2,
+     "fold": 3,
+     "raise": 2
+    },
+    "SB|>2.0": {
+     "fold": 3
+    },
+    "field": {
+     "call": 41,
+     "fold": 179,
+     "raise": 18
+    },
+    "field|0.42-0.62": {
+     "call": 5,
+     "fold": 10,
+     "raise": 3
+    },
+    "field|0.62-0.87": {
+     "call": 17,
+     "fold": 40,
+     "raise": 6
+    },
+    "field|0.87-1.2": {
+     "call": 17,
+     "fold": 111,
+     "raise": 9
+    },
+    "field|1.2-2.0": {
+     "fold": 5
+    },
+    "field|<=0.42": {
+     "call": 2,
+     "fold": 9
+    },
+    "field|>2.0": {
+     "fold": 4
+    }
+   },
+   "dims": [
+    "seat",
+    "size"
+   ],
+   "size_cells": {
+    "": {
+     "0.62-0.87": 8,
+     "0.87-1.2": 20,
+     "1.2-2.0": 4,
+     "allin": 1
+    },
+    "BB": {
+     "0.87-1.2": 2,
+     "1.2-2.0": 4
+    },
+    "SB": {
+     "0.62-0.87": 2,
+     "0.87-1.2": 6,
+     "allin": 1
+    },
+    "field": {
+     "0.62-0.87": 6,
+     "0.87-1.2": 12
+    }
+   },
+   "size_dims": [
+    "seat"
+   ]
+  },
+  "po_lead": {
+   "cells": {
+    "": {
+     "bet": 128,
+     "check": 259
+    },
+    "aggr": {
+     "bet": 55,
+     "check": 55
+    },
+    "aggr|early": {
+     "bet": 33,
+     "check": 30
+    },
+    "aggr|early|2": {
+     "bet": 22,
+     "check": 15
+    },
+    "aggr|early|2|flop": {
+     "bet": 10,
+     "check": 5
+    },
+    "aggr|early|2|river": {
+     "bet": 6,
+     "check": 3
+    },
+    "aggr|early|2|turn": {
+     "bet": 6,
+     "check": 7
+    },
+    "aggr|early|3+": {
+     "bet": 11,
+     "check": 15
+    },
+    "aggr|early|3+|flop": {
+     "bet": 9,
+     "check": 11
+    },
+    "aggr|early|3+|river": {
+     "bet": 1,
+     "check": 3
+    },
+    "aggr|early|3+|turn": {
+     "bet": 1,
+     "check": 1
+    },
+    "aggr|last": {
+     "bet": 22,
+     "check": 25
+    },
+    "aggr|last|2": {
+     "bet": 18,
+     "check": 20
+    },
+    "aggr|last|2|flop": {
+     "bet": 9,
+     "check": 11
+    },
+    "aggr|last|2|river": {
+     "bet": 2,
+     "check": 3
+    },
+    "aggr|last|2|turn": {
+     "bet": 7,
+     "check": 6
+    },
+    "aggr|last|3+": {
+     "bet": 4,
+     "check": 5
+    },
+    "aggr|last|3+|flop": {
+     "bet": 4,
+     "check": 5
+    },
+    "none": {
+     "bet": 45,
+     "check": 97
+    },
+    "none|early": {
+     "bet": 33,
+     "check": 77
+    },
+    "none|early|2": {
+     "bet": 11,
+     "check": 18
+    },
+    "none|early|2|flop": {
+     "bet": 1,
+     "check": 1
+    },
+    "none|early|2|river": {
+     "bet": 6,
+     "check": 7
+    },
+    "none|early|2|turn": {
+     "bet": 4,
+     "check": 10
+    },
+    "none|early|3+": {
+     "bet": 22,
+     "check": 59
+    },
+    "none|early|3+|flop": {
+     "bet": 6,
+     "check": 36
+    },
+    "none|early|3+|river": {
+     "bet": 3,
+     "check": 5
+    },
+    "none|early|3+|turn": {
+     "bet": 13,
+     "check": 18
+    },
+    "none|last": {
+     "bet": 12,
+     "check": 20
+    },
+    "none|last|2": {
+     "bet": 10,
+     "check": 8
+    },
+    "none|last|2|flop": {
+     "check": 1
+    },
+    "none|last|2|river": {
+     "bet": 4,
+     "check": 3
+    },
+    "none|last|2|turn": {
+     "bet": 6,
+     "check": 4
+    },
+    "none|last|3+": {
+     "bet": 2,
+     "check": 12
+    },
+    "none|last|3+|flop": {
+     "check": 7
+    },
+    "none|last|3+|river": {
+     "bet": 1,
+     "check": 1
+    },
+    "none|last|3+|turn": {
+     "bet": 1,
+     "check": 4
+    },
+    "other": {
+     "bet": 28,
+     "check": 107
+    },
+    "other|early": {
+     "bet": 14,
+     "check": 92
+    },
+    "other|early|2": {
+     "bet": 6,
+     "check": 38
+    },
+    "other|early|2|flop": {
+     "bet": 4,
+     "check": 20
+    },
+    "other|early|2|river": {
+     "bet": 1,
+     "check": 5
+    },
+    "other|early|2|turn": {
+     "bet": 1,
+     "check": 13
+    },
+    "other|early|3+": {
+     "bet": 8,
+     "check": 54
+    },
+    "other|early|3+|flop": {
+     "bet": 7,
+     "check": 47
+    },
+    "other|early|3+|river": {
+     "check": 5
+    },
+    "other|early|3+|turn": {
+     "bet": 1,
+     "check": 2
+    },
+    "other|last": {
+     "bet": 14,
+     "check": 15
+    },
+    "other|last|2": {
+     "bet": 9,
+     "check": 6
+    },
+    "other|last|2|flop": {
+     "bet": 3,
+     "check": 2
+    },
+    "other|last|2|river": {
+     "bet": 2,
+     "check": 1
+    },
+    "other|last|2|turn": {
+     "bet": 4,
+     "check": 3
+    },
+    "other|last|3+": {
+     "bet": 5,
+     "check": 9
+    },
+    "other|last|3+|flop": {
+     "bet": 3,
+     "check": 6
+    },
+    "other|last|3+|river": {
+     "bet": 2,
+     "check": 2
+    },
+    "other|last|3+|turn": {
+     "check": 1
+    }
+   },
+   "dims": [
+    "role",
+    "seat",
+    "players",
+    "street"
+   ],
+   "size_cells": {
+    "": {
+     "0.42-0.62": 33,
+     "0.62-0.87": 30,
+     "0.87-1.2": 10,
+     "1.2-2.0": 5,
+     "<=0.42": 41,
+     "allin": 9
+    },
+    "flop": {
+     "0.42-0.62": 18,
+     "0.62-0.87": 14,
+     "0.87-1.2": 5,
+     "<=0.42": 18,
+     "allin": 1
+    },
+    "flop|aggr": {
+     "0.42-0.62": 10,
+     "0.62-0.87": 7,
+     "0.87-1.2": 2,
+     "<=0.42": 13
+    },
+    "flop|none": {
+     "0.42-0.62": 2,
+     "0.62-0.87": 2,
+     "0.87-1.2": 1,
+     "<=0.42": 2
+    },
+    "flop|other": {
+     "0.42-0.62": 6,
+     "0.62-0.87": 5,
+     "0.87-1.2": 2,
+     "<=0.42": 3,
+     "allin": 1
+    },
+    "river": {
+     "0.42-0.62": 3,
+     "0.62-0.87": 6,
+     "0.87-1.2": 1,
+     "1.2-2.0": 4,
+     "<=0.42": 9,
+     "allin": 5
+    },
+    "river|aggr": {
+     "0.42-0.62": 2,
+     "1.2-2.0": 1,
+     "<=0.42": 4,
+     "allin": 2
+    },
+    "river|none": {
+     "0.42-0.62": 1,
+     "0.62-0.87": 4,
+     "0.87-1.2": 1,
+     "1.2-2.0": 2,
+     "<=0.42": 4,
+     "allin": 2
+    },
+    "river|other": {
+     "0.62-0.87": 2,
+     "1.2-2.0": 1,
+     "<=0.42": 1,
+     "allin": 1
+    },
+    "turn": {
+     "0.42-0.62": 12,
+     "0.62-0.87": 10,
+     "0.87-1.2": 4,
+     "1.2-2.0": 1,
+     "<=0.42": 14,
+     "allin": 3
+    },
+    "turn|aggr": {
+     "0.42-0.62": 2,
+     "0.62-0.87": 1,
+     "0.87-1.2": 2,
+     "<=0.42": 7,
+     "allin": 2
+    },
+    "turn|none": {
+     "0.42-0.62": 8,
+     "0.62-0.87": 8,
+     "0.87-1.2": 1,
+     "1.2-2.0": 1,
+     "<=0.42": 6
+    },
+    "turn|other": {
+     "0.42-0.62": 2,
+     "0.62-0.87": 1,
+     "0.87-1.2": 1,
+     "<=0.42": 1,
+     "allin": 1
+    }
+   },
+   "size_dims": [
+    "street",
+    "role"
+   ]
+  },
+  "po_vs_bet": {
+   "cells": {
+    "": {
+     "call": 66,
+     "fold": 114,
+     "raise": 16
+    },
+    "2": {
+     "call": 37,
+     "fold": 53,
+     "raise": 9
+    },
+    "2|0.42-0.62": {
+     "call": 7,
+     "fold": 17,
+     "raise": 2
+    },
+    "2|0.62-0.87": {
+     "call": 9,
+     "fold": 12,
+     "raise": 2
+    },
+    "2|0.87-1.2": {
+     "call": 3,
+     "fold": 6
+    },
+    "2|1.2-2.0": {
+     "call": 1,
+     "fold": 3
+    },
+    "2|<=0.42": {
+     "call": 14,
+     "fold": 13,
+     "raise": 5
+    },
+    "2|>2.0": {
+     "call": 3,
+     "fold": 2
+    },
+    "3+": {
+     "call": 29,
+     "fold": 61,
+     "raise": 7
+    },
+    "3+|0.42-0.62": {
+     "call": 6,
+     "fold": 17,
+     "raise": 3
+    },
+    "3+|0.62-0.87": {
+     "call": 12,
+     "fold": 17,
+     "raise": 1
+    },
+    "3+|0.87-1.2": {
+     "call": 1,
+     "fold": 6
+    },
+    "3+|1.2-2.0": {
+     "call": 2,
+     "fold": 4
+    },
+    "3+|<=0.42": {
+     "call": 8,
+     "fold": 15,
+     "raise": 3
+    },
+    "3+|>2.0": {
+     "fold": 2
+    }
+   },
+   "dims": [
+    "players",
+    "size"
+   ],
+   "size_cells": {
+    "": {
+     "0.42-0.62": 1,
+     "0.62-0.87": 2,
+     "0.87-1.2": 2,
+     "1.2-2.0": 1,
+     "<=0.42": 5,
+     "allin": 5
+    },
+    "flop": {
+     "0.62-0.87": 2,
+     "1.2-2.0": 1,
+     "<=0.42": 3,
+     "allin": 3
+    },
+    "river": {
+     "0.87-1.2": 1
+    },
+    "turn": {
+     "0.42-0.62": 1,
+     "0.87-1.2": 1,
+     "<=0.42": 2,
+     "allin": 2
+    }
+   },
+   "size_dims": [
+    "street"
+   ]
+  },
+  "po_vs_raise": {
+   "cells": {
+    "": {
+     "call": 14,
+     "fold": 12,
+     "raise": 6
+    },
+    "no": {
+     "call": 1,
+     "fold": 9,
+     "raise": 1
+    },
+    "yes": {
+     "call": 13,
+     "fold": 3,
+     "raise": 5
+    }
+   },
+   "dims": [
+    "was_bettor"
+   ],
+   "size_cells": {
+    "": {
+     "0.42-0.62": 2,
+     "allin": 4
+    }
+   },
+   "size_dims": []
+  }
+ },
+ "hands": 125,
+ "k": 10.0,
+ "observations": 1711,
+ "players": 8,
+ "shown": {},
+ "size_edges": [
+  0.42,
+  0.62,
+  0.87,
+  1.2,
+  2.0
+ ],
+ "size_labels": [
+  "<=0.42",
+  "0.42-0.62",
+  "0.62-0.87",
+  "0.87-1.2",
+  "1.2-2.0",
+  ">2.0",
+  "allin"
+ ],
+ "ts_range": [
+  1793441444.874937,
+  1794328349.194841
+ ],
+ "version": 1
+}

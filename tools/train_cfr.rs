@@ -13,6 +13,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use poker::training::nlhe::SimplifiedNlheGame;
 use poker::training::nlhe_betting_tree::{six_max_reshape, SIX_MAX_RESHAPE_NAMES};
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
+use poker::training::pool_model::PoolModel;
+use poker::training::pool_strategy::{PoolPreflopStrategy, PoolStrategyParams};
 use poker::training::{ConvergenceMonitor, EsMccfrTrainer, Game, StrategySnapshot, Trainer};
 use poker::{
     BucketTable, ChaCha20Rng, CheckpointError, ChipAmount, InfoSetId, RngSource, TableConfig,
@@ -55,7 +57,10 @@ struct Args {
     /// 0.5pot 的 3bet 档（4bet+ 仍 1pot；8 座 ante 1BB cap4 两表 32.7 GiB），见 `ante_flop2_3bet_6max`。
     /// `ante-flop2-3bet-open2` = `ante-flop2-3bet` 再加 1pot 开池档（8 座 ante 1BB = 4.5BB / 11.5BB），
     /// 见 `ante_flop2_3bet_open2_6max`。`ante-flop2-3bet-o75` = `ante-flop2-3bet` 把开池档换成 3/4pot
-    /// （8 座 ante 1BB = 8.88BB），见 `ante_flop2_3bet_o75_6max`。
+    /// （8 座 ante 1BB = 8.88BB），见 `ante_flop2_3bet_o75_6max`。`ante-flop2-3bet-o50` = 开池档换成 1/2pot、3bet
+    /// 仍 {0.5,1}pot（1/2/4 (1) 桌 = 6.75BB），见 `ante_flop2_3bet_o50_6max`。
+    /// `ante-flop2-3bet-o75-limp` = `-o75` 放开非盲注位平跟，平跟线见 flop 最多 3 人（8 座 200BB cap4
+    /// 两表 62.9 GiB），见 `ante_flop2_3bet_o75_limp_6max`。
     /// 名字 → 树定义的分派见 [`six_max_reshape`]。
     reshape: String,
     /// 仅 `--profile six-max`：起始码深（每座大盲数，对称）。默认 100（== 历史
@@ -79,6 +84,22 @@ struct Args {
     /// 1/2/4 (1) 桌 = `--ante 50 --straddle 200`。dense checkpoint 指纹含 straddle，resume / crop /
     /// 对局加载须传同一值。
     straddle: u64,
+    /// 抽水万分比（默认 0 = 不抽水，与历史 byte-equal）。终局每座从独赢的池拿到的筹码按这个比例向下
+    /// 取整扣一份、每座封顶 `--rake-cap`，平分的池不抽（[`TableConfig::rake_bps`]）。两个 profile 都
+    /// 生效。wopo ante 桌实测 = `--rake-bps 400 --rake-cap 1000`（4%、封顶 10BB）。dense checkpoint
+    /// 指纹含抽水，resume / crop / 加载要带同样的值。
+    rake_bps: u32,
+    /// 每座抽水封顶（chips，BB = 100；默认 0 = 不封顶）。只在 `--rake-bps` 非 0 时有意义。
+    rake_cap: u64,
+    /// `--pool-model <pool_model.json>`：牌池模型（`python3 -m opponent_analysis pool-model` 的输出）。
+    /// 给了之后，训练时其余座位在翻前每个决策点以该节点的置信度概率按牌池的打法行动
+    /// （[`PoolPreflopStrategy`] / `DenseNlheEsMccfrTrainer::set_pool_strategy`），学到的是对
+    /// 「一部分牌池 + 一部分自己」的应对。需要 `--dense --lockfree --threads >= 2`。checkpoint 目录里
+    /// 记一份策略表哈希（`pool_strategy.blake3`），同一目录续训时牌池模型或下面四个参数变了就拒绝。
+    pool_model: Option<PathBuf>,
+    /// `--pool-noise` / `--pool-conf-k` / `--pool-conf-scale` / `--pool-conf-max`：见
+    /// [`PoolStrategyParams`]（按牌力分牌的模糊程度；置信度 = min(max, scale × n / (n + k))）。
+    pool_params: PoolStrategyParams,
     trainer: String,
     updates: u64,
     seed: u64,
@@ -128,6 +149,10 @@ impl Default for Args {
             seats: None,
             ante: 0,
             straddle: 0,
+            rake_bps: 0,
+            rake_cap: 0,
+            pool_model: None,
+            pool_params: PoolStrategyParams::default(),
             trainer: "es-mccfr".to_string(),
             updates: 0,
             seed: 0,
@@ -309,12 +334,25 @@ fn run() -> Result<(), String> {
         ));
     }
     let straddle = ChipAmount::new(args.straddle);
+    // 抽水：比例上限 10%（再大多半是把百分数误当万分比传）；封顶只在有抽水时才有意义。
+    if args.rake_bps > 1000 {
+        return Err(format!(
+            "--rake-bps is in basis points (400 = 4%) and must be <= 1000, got {}",
+            args.rake_bps
+        ));
+    }
+    if args.rake_bps == 0 && args.rake_cap != 0 {
+        return Err(format!("--rake-cap {} needs --rake-bps > 0", args.rake_cap));
+    }
+    let rake_cap = ChipAmount::new(args.rake_cap);
     // profile 分派：hu = 历史默认（byte-equal）；six-max = A3×A4 first-small N-cap 游戏。
     // 两条路都产 `SimplifiedNlheGame`，下游 dense/HashMap 后端 + drive 主循环不分流。
     let game = match args.profile.as_str() {
         "hu" => SimplifiedNlheGame::new_hu_with_config(
             Arc::clone(&table),
-            TableConfig::default_hu_200bb().with_ante(ante),
+            TableConfig::default_hu_200bb()
+                .with_ante(ante)
+                .with_rake(args.rake_bps, rake_cap),
         )
         .map_err(|e| format!("SimplifiedNlheGame::new_hu_with_config failed: {e:?}"))?,
         "six-max" => {
@@ -354,7 +392,10 @@ fn run() -> Result<(), String> {
                 "ante-flop2" | "ante-flop2-3bet" | "ante-flop2-3bet-open2" => {
                     Some(blind + (pot_after_call * 333).div_ceil(1000))
                 }
-                "ante-flop2-3bet-o75" => Some(blind + (pot_after_call * 750).div_ceil(1000)),
+                "ante-flop2-3bet-o75" | "ante-flop2-3bet-o75-limp" => {
+                    Some(blind + (pot_after_call * 750).div_ceil(1000))
+                }
+                "ante-flop2-3bet-o50" => Some(blind + (pot_after_call * 500).div_ceil(1000)),
                 _ => None,
             };
             if let Some(open) = single_open {
@@ -377,7 +418,8 @@ fn run() -> Result<(), String> {
                 Arc::clone(&table),
                 TableConfig::n_max_at_bb(seats, args.stack_bb)
                     .with_ante(ante)
-                    .with_straddle(straddle),
+                    .with_straddle(straddle)
+                    .with_rake(args.rake_bps, rake_cap),
                 abs,
                 rules,
             )
@@ -413,6 +455,13 @@ fn run() -> Result<(), String> {
                 args.straddle
             );
         }
+        if args.rake_bps > 0 {
+            train_log!(
+                "[train_cfr] rake             = {} bps of each solely-won pot, cap {} chips per seat (0 = none)",
+                args.rake_bps,
+                args.rake_cap
+            );
+        }
         train_log!("[train_cfr] n_players        = {}", game.n_players());
         train_log!("[train_cfr] tree_nodes       = {}", game.tree().num_nodes());
     }
@@ -426,7 +475,9 @@ fn run() -> Result<(), String> {
     // doc），训练主循环共用 `drive`——只构造入口不同。dense 路径下 --lockfree 进一步
     // 切到 lock-free atomic CAS（详 Args.lockfree doc / DenseBackend）。
     if args.dense {
-        let inner = build_dense(&args, game)?;
+        let pool = build_pool_strategy(&args, &game)?;
+        let mut inner = build_dense(&args, game)?;
+        inner.set_pool_strategy(pool);
         let mut trainer = DenseBackend {
             inner,
             lockfree: args.lockfree,
@@ -438,6 +489,9 @@ fn run() -> Result<(), String> {
         };
         drive(&mut trainer, &args, &table_hash, label, monitor)
     } else {
+        if args.pool_model.is_some() {
+            return Err("--pool-model requires --dense --lockfree and --threads >= 2".to_string());
+        }
         let mut trainer = build_hashmap(&args, game)?;
         drive(&mut trainer, &args, &table_hash, "es-mccfr", monitor)
     }
@@ -468,6 +522,83 @@ fn build_hashmap(
             None => base,
         })
     }
+}
+
+/// `--pool-model`：建牌池的翻前策略表，并核对 / 写入 checkpoint 目录里的哈希。没给 `--pool-model`
+/// 而目录里有哈希文件（之前带牌池训的）同样拒绝——两种训练目标不能在一个目录里混着续。
+fn build_pool_strategy(
+    args: &Args,
+    game: &SimplifiedNlheGame,
+) -> Result<Option<Arc<PoolPreflopStrategy>>, String> {
+    let marker = args.checkpoint_dir.join("pool_strategy.blake3");
+    let recorded = match fs::read_to_string(&marker) {
+        Ok(text) => Some(text.trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("read {} failed: {e}", marker.display())),
+    };
+    let Some(path) = args.pool_model.as_ref() else {
+        return match recorded {
+            None => Ok(None),
+            Some(_) => Err(format!(
+                "{} exists: this checkpoint dir was trained with --pool-model; pass the same \
+                 --pool-model and --pool-* values or use another --checkpoint-dir",
+                marker.display()
+            )),
+        };
+    };
+    if !args.lockfree || args.threads < 2 {
+        return Err("--pool-model requires --dense --lockfree and --threads >= 2".to_string());
+    }
+    let model = PoolModel::load(path)?;
+    let pool = PoolPreflopStrategy::build(game, &model, args.pool_params)?;
+    let hash = pool
+        .hash()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    match recorded {
+        Some(old) if old != hash => {
+            return Err(format!(
+                "{} holds {old} but --pool-model {} with these --pool-* values gives {hash}",
+                marker.display(),
+                path.display()
+            ))
+        }
+        Some(_) => {}
+        None => {
+            let has_ckpt = fs::read_dir(&args.checkpoint_dir)
+                .map_err(|e| format!("read checkpoint dir failed: {e}"))?
+                .filter_map(Result::ok)
+                .any(|e| e.path().extension().is_some_and(|x| x == "ckpt"));
+            if has_ckpt {
+                return Err(format!(
+                    "{} already holds checkpoints trained without --pool-model",
+                    args.checkpoint_dir.display()
+                ));
+            }
+            fs::write(&marker, format!("{hash}\n"))
+                .map_err(|e| format!("write {} failed: {e}", marker.display()))?;
+        }
+    }
+    if !args.quiet {
+        let nodes = pool.nodes();
+        let mean_conf = nodes.iter().map(|n| n.confidence).sum::<f64>() / nodes.len() as f64;
+        train_log!(
+            "[train_cfr] pool model       = {} (k = {}); noise {} conf_k {} conf_scale {} conf_max {}",
+            path.display(),
+            model.k(),
+            args.pool_params.noise,
+            args.pool_params.conf_k,
+            args.pool_params.conf_scale,
+            args.pool_params.conf_max
+        );
+        train_log!(
+            "[train_cfr] pool strategy    = {} preflop nodes, mean confidence {:.3}, blake3 {hash}",
+            nodes.len(),
+            mean_conf
+        );
+    }
+    Ok(Some(Arc::new(pool)))
 }
 
 /// 构造 dense 后端。resume 走 dense raw v3 ckpt（`DenseNlheEsMccfrTrainer::load_checkpoint`
@@ -656,6 +787,28 @@ fn parse_args() -> Result<Args, String> {
             }
             "--ante" => out.ante = parse_u64(&next_value(&mut args, "--ante")?)?,
             "--straddle" => out.straddle = parse_u64(&next_value(&mut args, "--straddle")?)?,
+            "--rake-bps" => {
+                let raw = parse_u64(&next_value(&mut args, "--rake-bps")?)?;
+                out.rake_bps =
+                    u32::try_from(raw).map_err(|_| format!("--rake-bps {raw} out of range"))?;
+            }
+            "--rake-cap" => out.rake_cap = parse_u64(&next_value(&mut args, "--rake-cap")?)?,
+            "--pool-model" => {
+                out.pool_model = Some(PathBuf::from(next_value(&mut args, "--pool-model")?))
+            }
+            "--pool-noise" => {
+                out.pool_params.noise = parse_f64(&next_value(&mut args, "--pool-noise")?)?
+            }
+            "--pool-conf-k" => {
+                out.pool_params.conf_k = parse_f64(&next_value(&mut args, "--pool-conf-k")?)?
+            }
+            "--pool-conf-scale" => {
+                out.pool_params.conf_scale =
+                    parse_f64(&next_value(&mut args, "--pool-conf-scale")?)?
+            }
+            "--pool-conf-max" => {
+                out.pool_params.conf_max = parse_f64(&next_value(&mut args, "--pool-conf-max")?)?
+            }
             "--trainer" => out.trainer = next_value(&mut args, "--trainer")?,
             "--updates" => out.updates = parse_u64(&next_value(&mut args, "--updates")?)?,
             "--iter" => {
@@ -705,6 +858,11 @@ fn parse_args() -> Result<Args, String> {
 fn next_value(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
     args.next()
         .ok_or_else(|| format!("{name} requires a value"))
+}
+
+fn parse_f64(raw: &str) -> Result<f64, String> {
+    raw.parse::<f64>()
+        .map_err(|e| format!("invalid number {raw}: {e}"))
 }
 
 fn parse_u64(raw: &str) -> Result<u64, String> {
@@ -793,11 +951,16 @@ fn print_usage() {
          options:\n\
          \t--profile <hu|six-max>  (default hu; six-max = 6-max 100BB A3×A4 first-small)\n\
          \t--postflop-cap <2|3|4>  (six-max only; A3×A4 width-redirect N, default 3; N=4 = 48 GiB tables)\n\
-         \t--reshape <none|nolimp|preopen|preopen-small|preopen-1pot|all-1pot|flop2-1pot|ante-flop2|ante-flop2-3bet|ante-flop2-3bet-open2|ante-flop2-3bet-o75>  (six-max only; preopen-1pot = preopen preflop + {{1pot}} postflop, for depth grid; all-1pot = {{1pot}} on all streets incl. preflop; flop2-1pot = all-1pot but flop {{0.5,1}}pot; ante-flop2 = flop2-1pot but preflop open 1/3pot only; ante-flop2-3bet = ante-flop2 plus a 0.5pot 3bet; ante-flop2-3bet-open2 = ante-flop2-3bet plus a 1pot open)\n\
+         \t--reshape <none|nolimp|preopen|preopen-small|preopen-1pot|all-1pot|flop2-1pot|ante-flop2|ante-flop2-3bet|ante-flop2-3bet-open2|ante-flop2-3bet-o75|ante-flop2-3bet-o50|ante-flop2-3bet-o75-limp>  (six-max only; preopen-1pot = preopen preflop + {{1pot}} postflop, for depth grid; all-1pot = {{1pot}} on all streets incl. preflop; flop2-1pot = all-1pot but flop {{0.5,1}}pot; ante-flop2 = flop2-1pot but preflop open 1/3pot only; ante-flop2-3bet = ante-flop2 plus a 0.5pot 3bet; ante-flop2-3bet-open2 = ante-flop2-3bet plus a 1pot open; -o75 / -o50 = ante-flop2-3bet with the single open at 3/4 / 1/2 pot; -o75-limp = -o75 with open limps allowed, limped lines capped at 3 players to the flop)\n\
          \t--stack-bb <N>          (six-max only; per-seat starting stack in BB, default 100; pair with --reshape preopen-1pot)\n\
          \t--seats <3..=9>         (six-max only; number of seats, default 6; e.g. 9 = 9-handed table)\n\
          \t--ante <chips>          (per-seat ante in chips, BB = 100, default 0, max 100; both profiles)\n\
          \t--straddle <chips>      (six-max only; UTG forced straddle in chips, BB = 100, default 0, 100..=400; 1/2/4 (1) = --ante 50 --straddle 200)\n\
+         \t--rake-bps <n>          (rake in basis points on each solely-won pot, default 0 = none, max 1000; wopo = 400)\n\
+         \t--rake-cap <chips>      (per-seat rake cap in chips, BB = 100, default 0 = no cap; wopo = 1000)\n\
+         \t--pool-model <json>     (pool model from `python3 -m opponent_analysis pool-model`: other seats play the pool's preflop action with the node's confidence; needs --dense --lockfree --threads >= 2)\n\
+         \t--pool-noise <x>        (blur of the strength cut that assigns hands to actions, log-odds of the strength percentile, default 0.75)\n\
+         \t--pool-conf-k <n> --pool-conf-scale <s> --pool-conf-max <m>  (confidence = min(m, s * n_obs / (n_obs + n)); defaults 50, 1, 0.9)\n\
          \t--seed <N|0xHEX>\n\
          \t--threads <N>\n\
          \t--batch-per-worker <N>  (default 16; trajectories per worker per step_parallel dispatch)\n\

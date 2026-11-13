@@ -48,6 +48,8 @@ pub mod nlhe_eval;
 pub mod nlhe_replay;
 pub mod openpoker_hh;
 pub mod opponent_profile;
+pub mod pool_model;
+pub mod pool_strategy;
 pub mod regret;
 pub mod sampling;
 pub mod subgame;

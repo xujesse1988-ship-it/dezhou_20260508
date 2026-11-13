@@ -123,11 +123,50 @@ pub struct BettingAbstractionRules {
     /// （`raises >= 2`）照常删。配 preflop `{1/3,0.5,1}` 菜单（见 [`ante_flop2_3bet_6max`]）；
     /// postflop 不碰。`false` = 关（默认，既有 reshape 逐节点不变）。
     pub preflop_half_3bet: bool,
+    /// 配合 `preflop_half_3bet`：开池时**也保留** `Raise{0.5pot}`（不删），3bet 照样保留、4bet+ 照常删。
+    /// 配 preflop `{0.5,1}` 菜单 + `preflop_open_small_only` = 开池只有 0.5pot、3bet {0.5,1}pot
+    /// （见 [`ante_flop2_3bet_o50_6max`]）。`preflop_half_3bet` 关时空转。`false` = 关（默认，既有
+    /// reshape 逐节点不变）。
+    pub preflop_half_open: bool,
+    /// 平跟线单独的 width redirect：这手牌里有非盲注位 open-limp（preflop 未被加注时不交盲注的座位
+    /// `Call`）之后，见 flop 人数上限 = `min(width_redirect, limp_line_width)`；没有 open-limp 的线
+    /// 仍按 `width_redirect`。[`WIDTH_REDIRECT_OFF`](Self::WIDTH_REDIRECT_OFF) = 关（默认：平跟线与
+    /// 其它线同一上限，既有 reshape 逐节点不变）。`no_open_limp` 开时没有平跟线，本字段空转。
+    ///
+    /// 动机（wopo 2026-11-11 实测）：对手非盲注位平跟出现在 44% 的手，但 8 座 200BB cap 4 全开平跟
+    /// 两表约 6 倍（o75 46.6 → 271 GiB），膨胀主要来自 4 人深码的平跟池翻后子树；平跟后被加注的手
+    /// 87% 见 flop 不超过 3 人。平跟线收到 3 人后 o75 是 62.9 GiB。
+    ///
+    /// **给最后一个盲注留位**：本字段开时，preflop 未被加注期间要补钱才能进场的座位（平跟者、补齐的
+    /// 小盲）按「已进场人数 + 自己 + 1」和上限比——最后一个盲注（BB，有 straddle 时是 straddle）没人
+    /// 加注就能免费看 flop，位置先给它留着。否则名额被平跟者占满后，BB 既不能过牌（被 gate 删）
+    /// 又没有 Fold（free-check 局面不发 Fold），只剩加注。于是上限 3 时未加注的平跟池 = 最多 2 个
+    /// 补钱进场的 + BB。没有 open-limp 的线上唯一的此类进场是小盲补齐（1 + 1 ≤ 任何 ≥ 2 的上限），
+    /// 所以那些线不受影响。
+    ///
+    /// 「这条线有没有 open-limp」由建树 DFS 记在 `entrants` 的
+    /// [`ENTRANTS_LIMP_LINE`](Self::ENTRANTS_LIMP_LINE) 位上（仅本字段开时才置位）。
+    pub limp_line_width: u8,
 }
 
 impl BettingAbstractionRules {
     /// `width_redirect` 关闭哨兵（n_seats ≤ 9 < 255，永不触发 gate）。
     pub const WIDTH_REDIRECT_OFF: u8 = 255;
+
+    /// `entrants` bitmask 里标记「这条线有过非盲注位 open-limp」的位（座位只用低 9 位）。只在
+    /// `limp_line_width` 开时由建树 DFS 置位，并只在 **preflop** 被读（width gate 只拦 preflop 的
+    /// 被动进场）。调用方从 postflop 中途态建子树（实时搜索）不需要置它；从 preflop 中途态建带
+    /// `limp_line_width` 的子树则必须按真实动作线置位。
+    pub const ENTRANTS_LIMP_LINE: u16 = 1 << 15;
+
+    /// width gate 在这条线上的人数上限（见 `limp_line_width`）。
+    fn width_for(&self, entrants: u16) -> u8 {
+        if entrants & Self::ENTRANTS_LIMP_LINE != 0 {
+            self.width_redirect.min(self.limp_line_width)
+        } else {
+            self.width_redirect
+        }
+    }
 }
 
 impl Default for BettingAbstractionRules {
@@ -139,6 +178,8 @@ impl Default for BettingAbstractionRules {
             preflop_open_small_only: false,
             drop_preflop_open_allin: false,
             preflop_half_3bet: false,
+            preflop_half_open: false,
+            limp_line_width: Self::WIDTH_REDIRECT_OFF,
         }
     }
 }
@@ -159,6 +200,8 @@ pub fn first_small_6max(width_redirect: u8) -> (StreetActionAbstraction, Betting
         preflop_open_small_only: false,
         drop_preflop_open_allin: false,
         preflop_half_3bet: false,
+        preflop_half_open: false,
+        limp_line_width: BettingAbstractionRules::WIDTH_REDIRECT_OFF,
     };
     (abs, rules)
 }
@@ -185,6 +228,8 @@ pub fn first_small_preopen_6max(
         preflop_open_small_only: false,
         drop_preflop_open_allin: true,
         preflop_half_3bet: false,
+        preflop_half_open: false,
+        limp_line_width: BettingAbstractionRules::WIDTH_REDIRECT_OFF,
     };
     (abs, rules)
 }
@@ -353,6 +398,50 @@ pub fn ante_flop2_3bet_o75_6max(
     (abs, rules)
 }
 
+/// [`ante_flop2_3bet_6max`] 把唯一的开池档从 1/3pot 换成 **1/2pot**：preflop 菜单 `{0.5, 1}`，另开
+/// `preflop_half_open`。开池只有 0.5pot（1pot 由 `preflop_open_small_only` 删、开池全下由
+/// `drop_preflop_open_allin` 删）；3bet = {0.5pot, 1pot}（`preflop_half_3bet` 保留 0.5pot）；4bet+ 只有
+/// 1pot（均另有 all-in）；postflop 同 `ante-flop2`。1/2/4 (1) 桌（8 座 ante 0.5BB、straddle 2BB）：UTG+1–BTN
+/// 开池 6.75BB，SB 6.5BB，BB 6.25BB。8 座 200BB cap4 约 407 万节点 / 两表 61.9 GiB（同桌 old9b 523 万）。
+///
+/// 同 [`first_small_preopen_1pot_6max`] 的理由另立一档、不改既有 reshape。
+pub fn ante_flop2_3bet_o50_6max(
+    width_redirect: u8,
+) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let (_, mut rules) = ante_flop2_3bet_6max(width_redirect);
+    debug_assert!(rules.preflop_open_small_only && rules.preflop_half_3bet);
+    rules.preflop_half_open = true;
+    let pre = ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("preflop {0.5,1.0} 合法");
+    let one = || ActionAbstractionConfig::new(vec![1.0]).expect("{1.0} 单档合法");
+    let flop = ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("flop {0.5,1.0} 合法");
+    let abs = StreetActionAbstraction::per_street([pre, flop, one(), one()]);
+    (abs, rules)
+}
+
+/// 平跟线的见 flop 人数上限（[`ante_flop2_3bet_o75_limp_6max`]）。
+pub const O75_LIMP_LINE_WIDTH: u8 = 3;
+
+/// [`ante_flop2_3bet_o75_6max`] **放开非盲注位 open-limp**，平跟线的见 flop 人数收到
+/// [`O75_LIMP_LINE_WIDTH`]（3）人：`no_open_limp` 关、`limp_line_width = 3`，其余规则和菜单不变。
+/// 没有 open-limp 的线与 `ante-flop2-3bet-o75` 逐节点相同（见 flop 人数仍是 `width_redirect`）；
+/// 平跟之后的首个加注（隔离加注）走开池档 0.75pot，之后 3bet {0.5,1}pot、4bet+ 1pot。
+/// 未加注的平跟池给大盲留位（见 [`BettingAbstractionRules::limp_line_width`]）：最多 2 个补钱进场的
+/// （平跟者、补齐的小盲）+ 大盲。8 座 200BB `width_redirect` 4：414 万节点、两表 62.9 GiB
+/// （`ante-flop2-3bet-o75` 309 万 / 46.6 GiB）。
+///
+/// 动机见 [`BettingAbstractionRules::limp_line_width`]：对手池首入平跟和首入加注一样多（各约 20%），
+/// 树里没有这条线时 hero 31% 的翻前决策只能走启发式，牌池模型里平跟这部分也放不进求解。
+///
+/// 同 [`first_small_preopen_1pot_6max`] 的理由另立一档、不改既有 reshape。
+pub fn ante_flop2_3bet_o75_limp_6max(
+    width_redirect: u8,
+) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let (abs, mut rules) = ante_flop2_3bet_o75_6max(width_redirect);
+    rules.no_open_limp = false;
+    rules.limp_line_width = O75_LIMP_LINE_WIDTH;
+    (abs, rules)
+}
+
 /// `--profile six-max` 的 `--reshape <name>` → `(abstraction, rules)`。`train_cfr` 与
 /// `nlhe_dense_crop` 共用，保证裁切 / 加载时重建的树与训练时**同一**定义（dense ckpt 的
 /// layout 指纹仍会兜底校验）。未知名返回 `None`。
@@ -376,6 +465,8 @@ pub fn six_max_reshape(
         "ante-flop2-3bet" => ante_flop2_3bet_6max(width_redirect),
         "ante-flop2-3bet-open2" => ante_flop2_3bet_open2_6max(width_redirect),
         "ante-flop2-3bet-o75" => ante_flop2_3bet_o75_6max(width_redirect),
+        "ante-flop2-3bet-o50" => ante_flop2_3bet_o50_6max(width_redirect),
+        "ante-flop2-3bet-o75-limp" => ante_flop2_3bet_o75_limp_6max(width_redirect),
         _ => return None,
     })
 }
@@ -383,7 +474,8 @@ pub fn six_max_reshape(
 /// `six_max_reshape` 接受的名字（错误提示用）。
 pub const SIX_MAX_RESHAPE_NAMES: &str =
     "none | nolimp | preopen | preopen-small | preopen-1pot | all-1pot | flop2-1pot | ante-flop2 \
-     | ante-flop2-3bet | ante-flop2-3bet-open2 | ante-flop2-3bet-o75";
+     | ante-flop2-3bet | ante-flop2-3bet-open2 | ante-flop2-3bet-o75 | ante-flop2-3bet-o50 \
+     | ante-flop2-3bet-o75-limp";
 
 /// S6 实时搜索深码档（`realtime_search_openpoker_exec` §2.1 / 缺口③）：**全街单一 {1pot}**
 /// 下注菜单——每决策点只剩 `{fold, check/call, bet/raise 1pot, all-in}`。fold/check/call/all-in
@@ -699,11 +791,8 @@ impl PublicBettingTree {
                 .expect("action abstraction must emit legal Actions for current state");
             // entrants 累积（A4 redirect）：Fold 清 actor 位，其它（含 Check）置位；
             // 跨街不清零（entrant = 谁还在这手牌里）。rules 关时不被读，零影响。
-            let next_entrants = if matches!(action, AbstractAction::Fold) {
-                entrants & !(1u16 << actor)
-            } else {
-                entrants | (1u16 << actor)
-            };
+            let next_entrants =
+                advance_entrants(&state, actor, &action, rules, entrants, raises_on_street);
             // raises_on_street（A3 raises-aware）：切街清零；本街进攻（Bet/Raise/AllIn）+1；
             // 被动（Check/Call/Fold）不变。下一节点据此判 0.5 是开池(raises==0)还是 re-raise。
             // 用 `as u8` 比街（next 可能是 terminal Showdown，不能过 street_to_tag）。
@@ -798,6 +887,49 @@ fn street_to_tag(s: Street) -> StreetTag {
     }
 }
 
+/// `state`（preflop）是不是「未被加注、行动者没交算本轮下注的盲注」的局面：此处的 `Call` 就是
+/// open-limp。max committed == 翻前一份大盲（BB，有 straddle 时是 straddle）。交了盲注的座位：最后
+/// 一个盲注此局面是 free-check 无 Call；前面的盲注（SB，有 straddle 时还有 BB）的补齐不算 open-limp。
+fn is_open_limp_spot(state: &GameState, actor: PlayerId) -> bool {
+    if state.street() != Street::Preflop {
+        return false;
+    }
+    let cfg = state.config();
+    let max_committed = state
+        .players()
+        .iter()
+        .map(|p| p.committed_this_round)
+        .max()
+        .unwrap_or(ChipAmount::ZERO);
+    max_committed == cfg.preflop_blind() && !cfg.posts_blind(SeatId(actor))
+}
+
+/// 建树 DFS 里 `entrants` 的推进（[`PublicBettingTree::walk`] 与 [`dfs_decision_nodes`] 共用）：Fold 清
+/// actor 位，其它（含 Check）置位，跨街不清零。`limp_line_width` 开时，非盲注位 open-limp 另置
+/// [`BettingAbstractionRules::ENTRANTS_LIMP_LINE`]（之后整条线都带着，Fold 不清）。
+fn advance_entrants(
+    state: &GameState,
+    actor: PlayerId,
+    action: &AbstractAction,
+    rules: &BettingAbstractionRules,
+    entrants: u16,
+    raises_on_street: u32,
+) -> u16 {
+    let mut next = if matches!(action, AbstractAction::Fold) {
+        entrants & !(1u16 << actor)
+    } else {
+        entrants | (1u16 << actor)
+    };
+    if rules.limp_line_width != BettingAbstractionRules::WIDTH_REDIRECT_OFF
+        && raises_on_street == 0
+        && matches!(action, AbstractAction::Call { .. })
+        && is_open_limp_spot(state, actor)
+    {
+        next |= BettingAbstractionRules::ENTRANTS_LIMP_LINE;
+    }
+    next
+}
+
 /// 决策节点 `state`（行动者 `actor`）的抽象动作集：`abs.abstract_actions` 后套 A3×A4 规则过滤
 /// （[`filter_actions`]）。[`PublicBettingTree::walk`] 建树与 [`count_subtree_nodes_capped`] 计数
 /// 共用这一份，保证计数口径 = 建树口径。
@@ -814,16 +946,7 @@ fn node_allowed_actions(
     // raise-or-fold）。交了盲注的座位：最后一个盲注（BB / straddle）此局面是 free-check 无 Call，
     // moot；前面的盲注（SB，有 straddle 时还有 BB）的补齐保留（GTO 合理）。无 straddle、无补盲
     // 时与旧口径「rp != 1」逐节点相同。rules 关时恒 false。
-    let drop_open_limp = rules.no_open_limp && state.street() == Street::Preflop && {
-        let cfg = state.config();
-        let max_committed = state
-            .players()
-            .iter()
-            .map(|p| p.committed_this_round)
-            .max()
-            .unwrap_or(ChipAmount::ZERO);
-        max_committed == cfg.preflop_blind() && !cfg.posts_blind(SeatId(actor))
-    };
+    let drop_open_limp = rules.no_open_limp && is_open_limp_spot(state, actor);
 
     // A4 redirect 不变量（closing-action 精确收口）：postflop 在场恒 ≤ N。>N 只可能
     // 是多人 all-in 跑马（无 postflop 下注，不进 walk）。debug 建树即验（= probe
@@ -836,6 +959,11 @@ fn node_allowed_actions(
         live_count(state),
         rules.width_redirect
     );
+    debug_assert!(
+        rules.limp_line_width == BettingAbstractionRules::WIDTH_REDIRECT_OFF
+            || rules.width_redirect != BettingAbstractionRules::WIDTH_REDIRECT_OFF,
+        "limp_line_width 只在 width_redirect 开时有意义"
+    );
 
     // preflop_open_small_only：preflop 开池（raises==0 = 越过 BB 的首个 Raise）只留
     // 0.5pot 开池档，删 1.0pot（见 filter_actions）。仅 preflop 开池生效（re-raise 由
@@ -846,10 +974,16 @@ fn node_allowed_actions(
         rules.drop_preflop_open_allin && state.street() == Street::Preflop && raises_on_street == 0;
     // preflop_half_3bet：0.5pot 只留给首次再加注（3bet）。rules 关时两者恒 false。
     let half_3bet = rules.preflop_half_3bet && state.street() == Street::Preflop;
-    let drop_half_open = half_3bet && raises_on_street == 0;
+    let drop_half_open = half_3bet && raises_on_street == 0 && !rules.preflop_half_open;
     let keep_half_3bet = half_3bet && raises_on_street == 1;
 
     let legal_set = abs.abstract_actions(state);
+    // limp_line_width：preflop 未被加注、行动者要补钱才能进场（没有 Check）时，给最后一个盲注留一个
+    // 名额（见字段文档）。rules 关时恒 false。
+    let reserve_last_blind = rules.limp_line_width != BettingAbstractionRules::WIDTH_REDIRECT_OFF
+        && state.street() == Street::Preflop
+        && raises_on_street == 0
+        && !legal_set.iter().any(|a| matches!(a, AbstractAction::Check));
     // A3×A4 过滤（drop_small_reraise + redirect 禁被动进场）。filter 后的集合同时
     // 决定 node.legal_actions 与 children → child 下标恒对齐 legal_actions（D-209）。
     filter_actions(
@@ -858,6 +992,7 @@ fn node_allowed_actions(
         entrants,
         rules,
         raises_on_street,
+        reserve_last_blind,
         drop_open_limp,
         drop_large_open,
         drop_open_allin,
@@ -890,11 +1025,8 @@ fn dfs_decision_nodes(
             continue;
         }
         // entrants / raises_on_street 推进与 walk 逐字一致。
-        let next_entrants = if matches!(action, AbstractAction::Fold) {
-            entrants & !(1u16 << actor)
-        } else {
-            entrants | (1u16 << actor)
-        };
+        let next_entrants =
+            advance_entrants(state, actor, &action, rules, entrants, raises_on_street);
         let next_raises = if next.street() as u8 != state.street() as u8 {
             0
         } else if is_aggression(&action) {
@@ -1008,6 +1140,8 @@ fn is_aggression(a: &AbstractAction) -> bool {
 ///   开池 `AllIn`，但保留 3bet+ / all-in call / postflop `AllIn`。
 /// - `drop_half_open` / `keep_half_3bet`（`preflop_half_3bet`，已在 walk 算好 preflop 且
 ///   raises==0 / raises==1）：开池删 `Raise{0.5pot}`；3bet 时 0.5pot 不受 drop_small_reraise 删。
+/// - `reserve_last_blind`（`limp_line_width`，已在 walk 算好「preflop 未加注 + 行动者要补钱」）：
+///   width gate 比较时多算一个名额，留给还没行动、可以免费过牌的最后一个盲注。
 /// - width redirect：第 (N+1) 个 entrant 留下 → 删 `Check`/`Call`（fold 或 squeeze）。
 ///   `e` = 当前 entrant 数；actor 已是 entrant → 留下 E 不变，否则 E+1；留下后 > N 即 gate。
 ///
@@ -1022,6 +1156,7 @@ fn filter_actions(
     entrants: u16,
     rules: &BettingAbstractionRules,
     raises_on_street: u32,
+    reserve_last_blind: bool,
     drop_open_limp: bool,
     drop_large_open: bool,
     drop_open_allin: bool,
@@ -1029,10 +1164,11 @@ fn filter_actions(
     keep_half_3bet: bool,
 ) -> SmallVec<[AbstractAction; 8]> {
     let block_passive = if rules.width_redirect != BettingAbstractionRules::WIDTH_REDIRECT_OFF {
-        let e = entrants.count_ones();
+        // 座位位以外只有 ENTRANTS_LIMP_LINE 一个标记位，数人数前去掉。
+        let e = (entrants & !BettingAbstractionRules::ENTRANTS_LIMP_LINE).count_ones();
         let actor_in = (entrants >> actor) & 1 == 1;
         let stay_e = if actor_in { e } else { e + 1 };
-        stay_e > u32::from(rules.width_redirect)
+        stay_e + u32::from(reserve_last_blind) > u32::from(rules.width_for(entrants))
     } else {
         false
     };
@@ -1700,6 +1836,182 @@ mod tests {
         );
     }
 
+    /// `ante-flop2-3bet-o75-limp`（6 座 ante 1BB，`width_redirect` 4、平跟线 3）：
+    /// ① 非盲注位开局可以平跟，平跟后的加注档是开池档 0.75pot；
+    /// ② 平跟线给大盲留位：两个座位补钱进场后，第三个（含小盲）只能弃牌或加注，大盲照常可以过牌，
+    ///    未加注的平跟池 3 人见 flop；一个平跟者时小盲还能补齐；
+    /// ③ 平跟后被加注：加注者是第 3 个进场的，之后的座位（含大盲）不能跟注，两个平跟者可以跟；
+    /// ④ 没有 open-limp 的线不受影响：开池 + 两家跟注后，第 4 个进场者仍可跟注（上限 4）；
+    /// ⑤ 平跟线上 postflop 在场人数 ≤ 3，其它线 ≤ 4；
+    /// ⑥ 去掉平跟线后，逐街节点数、动作数与 `ante-flop2-3bet-o75` 相同；
+    /// ⑦ `count_tree_layout` 与物化树一致；`six_max_reshape` 分派到本函数。
+    #[test]
+    fn reshape_o75_limp_line_width() {
+        use AbstractActionTag as T;
+        let o75 = T::Raise(BetRatio::from_f64(0.75).expect("0.75 合法"));
+        let cfg = TableConfig::n_max_at_bb(6, 30).with_ante(ChipAmount::new(100));
+        let (abs, rules) = ante_flop2_3bet_o75_limp_6max(4);
+        assert!(!rules.no_open_limp);
+        assert_eq!(rules.limp_line_width, 3);
+        let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+        let step = |id: NodeId, tag: T| -> NodeId {
+            let n = t.node(id);
+            let i = n
+                .legal_actions
+                .iter()
+                .position(|a| *a == tag)
+                .unwrap_or_else(|| panic!("node {id} 没有 {tag:?}：{:?}", n.legal_actions));
+            match n.children[i] {
+                Child::Decision(c) => c,
+                Child::Terminal => panic!("node {id} --{tag:?}--> 终局"),
+            }
+        };
+        let la = |id: NodeId| t.node(id).legal_actions.to_vec();
+
+        // ① UTG（seat 3）：Fold / Call / 0.75pot。
+        let root = t.root_id();
+        assert_eq!(t.node(root).player_acting, 3);
+        assert_eq!(la(root), vec![T::Fold, T::Call, o75]);
+
+        // ② UTG、HJ 平跟 → CO 是第三个补钱进场的：不能平跟。
+        let hj = step(root, T::Call);
+        assert_eq!(t.node(hj).player_acting, 4);
+        assert_eq!(
+            la(hj),
+            vec![T::Fold, T::Call, o75],
+            "一个平跟者后还能再平跟一个"
+        );
+        let co = step(hj, T::Call);
+        assert_eq!(t.node(co).player_acting, 5);
+        assert_eq!(la(co), vec![T::Fold, o75], "两个平跟者后只能弃牌或加注");
+        let btn = step(co, T::Fold);
+        assert_eq!(la(btn), vec![T::Fold, o75]);
+        let sb = step(btn, T::Fold);
+        assert_eq!(t.node(sb).player_acting, 1);
+        assert_eq!(la(sb), vec![T::Fold, o75], "名额满了，小盲不能补齐");
+        let bb = step(sb, T::Fold);
+        assert_eq!(t.node(bb).player_acting, 2);
+        assert_eq!(la(bb), vec![T::Check, o75], "大盲照常可以过牌");
+        let flop = step(bb, T::Check);
+        assert_eq!(t.node(flop).street, StreetTag::Flop);
+        // 一个平跟者 + 小盲补齐 + 大盲。
+        let mut id = step(hj, T::Fold);
+        id = step(id, T::Fold); // CO
+        id = step(id, T::Fold); // BTN
+        assert_eq!(t.node(id).player_acting, 1);
+        assert_eq!(
+            la(id),
+            vec![T::Fold, T::Call, o75],
+            "一个平跟者时小盲还能补齐"
+        );
+        let bb1 = step(id, T::Call);
+        assert_eq!(la(bb1), vec![T::Check, o75]);
+
+        // ③ UTG、HJ 平跟，CO 加注：BTN / SB / BB 不能跟注，UTG、HJ 可以。
+        let mut id = step(co, o75);
+        for seat in [0u8, 1, 2] {
+            assert_eq!(t.node(id).player_acting, seat);
+            assert!(
+                !la(id).contains(&T::Call) && la(id).contains(&T::Fold),
+                "平跟线 3 人已满，seat {seat} 不能跟注 {:?}",
+                la(id)
+            );
+            id = step(id, T::Fold);
+        }
+        assert_eq!(t.node(id).player_acting, 3);
+        assert!(la(id).contains(&T::Call), "平跟者可以跟隔离加注");
+        id = step(id, T::Call);
+        assert_eq!(t.node(id).player_acting, 4);
+        assert!(la(id).contains(&T::Call));
+
+        // ④ 没有平跟：UTG 开池，HJ、CO 跟 → BTN 是第 4 个进场者，仍可跟注；SB 是第 5 个，不行。
+        let mut id = step(root, o75);
+        id = step(id, T::Call);
+        id = step(id, T::Call);
+        assert_eq!(t.node(id).player_acting, 0);
+        assert!(la(id).contains(&T::Call), "没有平跟的线上限仍是 4");
+        id = step(id, T::Call);
+        assert_eq!(t.node(id).player_acting, 1);
+        assert!(!la(id).contains(&T::Call));
+
+        // ⑤⑥ 逐节点判是不是平跟线（祖先里有「preflop 未加注时不交盲注的座位 Call」）。
+        let on_limp_line = |id: NodeId| -> bool {
+            let mut chain = vec![];
+            let mut cur = id;
+            while let Some(p) = t.node(cur).parent {
+                chain.push((p, t.node(cur).action_from_parent.expect("非根有来边")));
+                cur = p;
+            }
+            let mut raised = false;
+            for (p, tag) in chain.into_iter().rev() {
+                let n = t.node(p);
+                if n.street != StreetTag::Preflop {
+                    break;
+                }
+                if tag == T::Call && !raised && !cfg.posts_blind(SeatId(n.player_acting)) {
+                    return true;
+                }
+                if matches!(tag, T::Raise(_) | T::AllIn) {
+                    raised = true;
+                }
+            }
+            false
+        };
+        // 在场人数 = 这条线上没弃牌的座位数（沿祖先链数 Fold）。
+        let live_at = |id: NodeId| -> usize {
+            let mut folded = 0;
+            let mut cur = id;
+            while let Some(p) = t.node(cur).parent {
+                if t.node(cur).action_from_parent == Some(T::Fold) {
+                    folded += 1;
+                }
+                cur = p;
+            }
+            6 - folded
+        };
+        let mut plain = TreeLayoutCounts::default();
+        let mut limp_nodes = 0usize;
+        for id in 0..t.num_nodes() as NodeId {
+            let n = t.node(id);
+            let limp = on_limp_line(id);
+            if n.street != StreetTag::Preflop {
+                let cap = if limp { 3 } else { 4 };
+                assert!(
+                    live_at(id) <= cap,
+                    "node {id} postflop 在场 {} > {cap}",
+                    live_at(id)
+                );
+            }
+            if limp {
+                limp_nodes += 1;
+            } else {
+                plain.nodes_by_street[n.street as usize] += 1;
+                // 非平跟线上、非盲注位未加注节点多出来的那个 Call 是平跟线的入口，不算进对照。
+                let entry = n.street == StreetTag::Preflop
+                    && n.legal_actions.contains(&T::Call)
+                    && !cfg.posts_blind(SeatId(n.player_acting))
+                    && !n.legal_actions.contains(&T::Raise(BetRatio::HALF_POT))
+                    && n.legal_actions.contains(&o75);
+                plain.actions_by_street[n.street as usize] +=
+                    n.legal_actions.len() as u64 - u64::from(entry);
+            }
+        }
+        assert!(limp_nodes > 0);
+        let (o_abs, o_rules) = ante_flop2_3bet_o75_6max(4);
+        assert_eq!(
+            plain,
+            count_tree_layout(&cfg, &o_abs, o_rules),
+            "去掉平跟线后应与 ante-flop2-3bet-o75 逐街相同"
+        );
+
+        // ⑦
+        let got = count_tree_layout(&cfg, &abs, rules);
+        assert_eq!(got.total_nodes(), t.num_nodes() as u64);
+        let (d_abs, d_rules) = six_max_reshape("ante-flop2-3bet-o75-limp", 4).expect("已注册");
+        assert_eq!(count_tree_layout(&cfg, &d_abs, d_rules), got);
+        assert!(SIX_MAX_RESHAPE_NAMES.contains("ante-flop2-3bet-o75-limp"));
+    }
+
     /// 结构守门：`ante-flop2-3bet-o75`（[`ante_flop2_3bet_o75_6max`]，8 座 100BB 每人 1BB ante；cap 2
     /// 只为树小，翻前菜单与 cap 无关）。① preflop 档位 ⊆ {0.5,0.75,1}，有 0.75pot 的节点（开池）只有它
     /// 一个加注档、无全下，0.5pot 只出现在面对加注的节点；② fold-chain 每座开池 = Fold / 0.75pot，SB =
@@ -1842,6 +2154,182 @@ mod tests {
             "six_max_reshape 分派须指向 ante_flop2_3bet_o75_6max"
         );
         assert!(SIX_MAX_RESHAPE_NAMES.contains("ante-flop2-3bet-o75"));
+    }
+
+    /// 结构守门：`ante-flop2-3bet-o50`（[`ante_flop2_3bet_o50_6max`]，1/2/4 (1) 桌 = 8 座 100BB、ante 50、
+    /// straddle 200；cap 2 只为树小）。① preflop 档位 ⊆ {0.5,1}；开池节点（前面没人加注）只有 0.5pot 一个
+    /// 加注档、无 1pot / 全下；面对开池的 3bet 节点 0.5pot / 1pot 并存；面对 3bet 只有 1pot；② fold-chain
+    /// 每座开池 = Fold / 0.5pot，SB、BB 另有补齐；BB 补齐后 straddle 座 = Check / 0.5pot；③ UTG+1 开池弃到
+    /// BB：BB = {Fold, Call, 0.5pot, 1pot, AllIn}，BB 0.5pot 3bet 后 UTG+1 = {Fold, Call, 1pot, AllIn}；
+    /// ④ postflop 同 `ante-flop2`；⑤ 不开 `preflop_half_open` 时开池档会被删光（证明新开关在起作用）；
+    /// ⑥ 分派与错误提示名单都有它。
+    #[test]
+    fn reshape_ante_flop2_3bet_o50_half_open_and_two_3bets() {
+        let half = AbstractActionTag::Raise(BetRatio::HALF_POT);
+        let full = AbstractActionTag::Raise(BetRatio::FULL_POT);
+        let cfg = TableConfig::n_max_at_bb(8, 100)
+            .with_ante(ChipAmount::new(50))
+            .with_straddle(ChipAmount::new(200));
+        let (abs, rules) = ante_flop2_3bet_o50_6max(2);
+        let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+
+        // 每个节点的本街加注次数（沿父链数 Raise / AllIn）。
+        let raises_before = |mut id: NodeId| -> usize {
+            let street = t.node(id).street;
+            let mut n = 0;
+            while let Some(p) = t.node(id).parent {
+                let pn = t.node(p);
+                if pn.street != street {
+                    break;
+                }
+                let i = pn
+                    .children
+                    .iter()
+                    .position(|c| matches!(c, Child::Decision(x) if *x == id))
+                    .expect("child 在父节点里");
+                n += usize::from(matches!(
+                    pn.legal_actions[i],
+                    AbstractActionTag::Raise(_) | AbstractActionTag::AllIn
+                ));
+                id = p;
+            }
+            n
+        };
+        let (mut opens, mut threebets_both) = (0usize, 0usize);
+        for id in 0..t.num_nodes() as NodeId {
+            let node = t.node(id);
+            let la = &node.legal_actions;
+            match node.street {
+                StreetTag::Preflop => {
+                    assert!(
+                        la.iter().all(|a| !matches!(a, AbstractActionTag::Bet(_))
+                            && (!matches!(a, AbstractActionTag::Raise(_)) || *a == half || *a == full)),
+                        "o50：preflop node {id} 档位越出 {{0.5,1}} {la:?}"
+                    );
+                    match raises_before(id) {
+                        0 => {
+                            assert!(
+                                !la.contains(&full) && !la.contains(&AbstractActionTag::AllIn),
+                                "o50：开池节点 {id} 只应有 0.5pot {la:?}"
+                            );
+                            opens += usize::from(la.contains(&half));
+                        }
+                        1 => threebets_both += usize::from(la.contains(&half) && la.contains(&full)),
+                        _ => assert!(!la.contains(&half), "o50：4bet+ 节点 {id} 不应有 0.5pot {la:?}"),
+                    }
+                }
+                StreetTag::Flop => assert!(
+                    la.iter().all(|a| match a {
+                        AbstractActionTag::Raise(x) => *x == BetRatio::FULL_POT,
+                        AbstractActionTag::Bet(x) =>
+                            *x == BetRatio::HALF_POT || *x == BetRatio::FULL_POT,
+                        _ => true,
+                    }),
+                    "o50：flop node {id} 档位错 {la:?}"
+                ),
+                StreetTag::Turn | StreetTag::River => assert!(
+                    la.iter().all(|a| !matches!(a, AbstractActionTag::Bet(x) | AbstractActionTag::Raise(x) if *x != BetRatio::FULL_POT)),
+                    "o50：{:?} node {id} 出现非 1pot 档 {la:?}",
+                    node.street
+                ),
+            }
+        }
+        assert!(
+            opens > 0 && threebets_both > 0,
+            "o50：0.5pot 开池和两档 3bet 都应出现"
+        );
+
+        let step = |id: NodeId, tag: AbstractActionTag| -> NodeId {
+            let n = t.node(id);
+            let i = n
+                .legal_actions
+                .iter()
+                .position(|a| *a == tag)
+                .unwrap_or_else(|| panic!("node {id} 无 {tag:?}：{:?}", n.legal_actions));
+            match n.children[i] {
+                Child::Decision(next) => next,
+                Child::Terminal => panic!("node {id} {tag:?} 后终局"),
+            }
+        };
+        let mut id = t.root_id();
+        for seat in [4u8, 5, 6, 7, 0] {
+            assert_eq!(t.node(id).player_acting, seat);
+            assert_eq!(
+                t.node(id).legal_actions.to_vec(),
+                vec![AbstractActionTag::Fold, half],
+                "o50：seat {seat} 开池只应有 Fold / 0.5pot"
+            );
+            id = step(id, AbstractActionTag::Fold);
+        }
+        assert_eq!(t.node(id).player_acting, 1, "fold 到 SB");
+        assert_eq!(
+            t.node(id).legal_actions.to_vec(),
+            vec![AbstractActionTag::Fold, AbstractActionTag::Call, half],
+            "o50：SB 应可补齐 / 0.5pot"
+        );
+        let bb = step(id, AbstractActionTag::Fold);
+        assert_eq!(
+            t.node(bb).legal_actions.to_vec(),
+            vec![AbstractActionTag::Fold, AbstractActionTag::Call, half],
+            "o50：BB 应可补齐 / 0.5pot"
+        );
+        let strad = t.node(step(bb, AbstractActionTag::Call));
+        assert_eq!(strad.player_acting, 3);
+        assert_eq!(
+            strad.legal_actions.to_vec(),
+            vec![AbstractActionTag::Check, half],
+            "o50：BB 补齐后 straddle 座 = 过牌 / 0.5pot"
+        );
+
+        let mut id = step(t.root_id(), half);
+        for _ in 0..5 {
+            id = step(id, AbstractActionTag::Fold);
+        }
+        assert_eq!(t.node(id).player_acting, 2, "UTG+1 开池后弃到 BB");
+        assert_eq!(
+            t.node(id).legal_actions.to_vec(),
+            vec![
+                AbstractActionTag::Fold,
+                AbstractActionTag::Call,
+                half,
+                full,
+                AbstractActionTag::AllIn
+            ],
+            "o50：BB 面对开池应有 0.5pot / 1pot 两档 3bet"
+        );
+        let mut id = step(id, half);
+        id = step(id, AbstractActionTag::Fold); // straddle 座弃
+        let opener = t.node(id);
+        assert_eq!(opener.player_acting, 4);
+        assert_eq!(
+            opener.legal_actions.to_vec(),
+            vec![
+                AbstractActionTag::Fold,
+                AbstractActionTag::Call,
+                full,
+                AbstractActionTag::AllIn
+            ],
+            "o50：面对 3bet 的 4bet 只应有 1pot"
+        );
+
+        // 不开 preflop_half_open：开池的 0.5pot 被 preflop_half_3bet 删、1pot 被 open_small_only 删 →
+        // 开池位只剩 Fold。
+        let mut off = rules;
+        off.preflop_half_open = false;
+        let t_off = PublicBettingTree::build_with_rules(&cfg, &abs, off);
+        assert_eq!(
+            t_off.node(t_off.root_id()).legal_actions.to_vec(),
+            vec![AbstractActionTag::Fold],
+            "关掉 preflop_half_open 开池档应被删光"
+        );
+
+        let (d_abs, d_rules) = six_max_reshape("ante-flop2-3bet-o50", 2).expect("已注册");
+        assert_eq!(
+            PublicBettingTree::build_with_rules(&cfg, &d_abs, d_rules).num_nodes(),
+            t.num_nodes(),
+            "six_max_reshape 分派须指向 ante_flop2_3bet_o50_6max"
+        );
+        assert!(SIX_MAX_RESHAPE_NAMES.contains("ante-flop2-3bet-o50"));
     }
 
     /// 结构守门：`ante-flop2-3bet-open2`（[`ante_flop2_3bet_open2_6max`]，8 座 100BB 每人 1BB
@@ -2222,6 +2710,8 @@ mod tests {
             ante_exempt: 0,
             live_posts: 0,
             straddle: ChipAmount::ZERO,
+            rake_bps: 0,
+            rake_cap: ChipAmount::ZERO,
             button_seat: crate::core::SeatId(0),
         };
         let (abs, rules) = deep_single_pot();

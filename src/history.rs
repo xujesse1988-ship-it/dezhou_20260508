@@ -262,6 +262,8 @@ fn config_to_proto(config: &TableConfig) -> proto::TableConfig {
         ante_exempt: u32::from(config.ante_exempt),
         live_posts: u32::from(config.live_posts),
         straddle: config.straddle.as_u64(),
+        rake_bps: config.rake_bps,
+        rake_cap: config.rake_cap.as_u64(),
     }
 }
 
@@ -311,8 +313,16 @@ fn config_from_proto(config: &proto::TableConfig) -> Result<TableConfig, History
         ante_exempt: config.ante_exempt as u16,
         live_posts: config.live_posts as u16,
         straddle: ChipAmount::new(config.straddle),
+        rake_bps: config.rake_bps,
+        rake_cap: ChipAmount::new(config.rake_cap),
         button_seat: seat_from_u32(config.button_seat, "button_seat")?,
     };
+    if !out.rake_valid() {
+        return Err(HistoryError::Corrupted(format!(
+            "rake_bps {} must be <= 10000",
+            config.rake_bps
+        )));
+    }
     if !out.straddle_valid() {
         return Err(HistoryError::Corrupted(format!(
             "straddle {} must be 0 or >= big_blind {} with n_seats >= 3",
@@ -483,6 +493,12 @@ mod proto {
         /// UTG 强制 straddle 额（0 = 没有 straddle；默认值不编码 → 旧 history 字节不变）。
         #[prost(uint64, tag = "9")]
         pub straddle: u64,
+        /// 抽水万分比（0 = 不抽水；默认值不编码 → 旧 history 字节不变）。
+        #[prost(uint32, tag = "10")]
+        pub rake_bps: u32,
+        /// 每座抽水封顶 chips（0 = 不封顶；默认值不编码）。
+        #[prost(uint64, tag = "11")]
+        pub rake_cap: u64,
     }
 
     #[derive(Clone, PartialEq, prost::Message)]

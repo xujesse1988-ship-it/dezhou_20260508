@@ -1,4 +1,4 @@
-"""CLI: python3 -m opponent_analysis {ingest,report,live,history} ..."""
+"""CLI: python3 -m opponent_analysis {ingest,report,live,history,pool-model} ..."""
 
 from __future__ import annotations
 
@@ -80,13 +80,23 @@ def main(argv=None) -> int:
                     help="同时在 /preflop/ 提供 blueprint 翻前策略查看（拉起 target/release/preflop_viewer，"
                          "加载约 30 秒、峰值约 1.6 GiB）")
 
+    pl = sub.add_parser("pool-model", help="牌池模型：全体对手在各局面的动作频率和尺度（带次数），含样本外检验")
+    pl.add_argument("--db", required=True)
+    pl.add_argument("--platform", required=True, choices=sorted(PLATFORMS))
+    pl.add_argument("--out", required=True, help="输出目录：pool_model.json（给求解器读）和 pool_model.md（给人看）")
+    pl.add_argument("--hero", nargs="*", default=[],
+                    help="另外算作我方的名字（日志没被导入的我方 bot），不计入牌池")
+    pl.add_argument("--aliases", default=None, help="对手别名表（JSON）；只影响「一半玩家 → 另一半玩家」这项检验怎么分人")
+    pl.add_argument("--k", type=float, default=None, help="细格往粗格收缩的强度（缺省用模块默认值）")
+    pl.add_argument("--since", default=None, help="只用这一天（UTC，YYYY-MM-DD）及之后的手")
+
     a = ap.parse_args(argv)
     if a.cmd == "live" and a.play_hands < 1:
         ap.error("--play-hands 须 ≥ 1")  # exits with status 2 and the usage line
     if a.cmd == "live" and a.platform != "wopo" and (a.history_run or a.preflop):
         ap.error("--history-run / --preflop 只有 --platform wopo 能用")
     a.alias_table = None
-    if a.cmd in ("report", "live"):
+    if a.cmd in ("report", "live", "pool-model"):
         try:
             a.alias_table = aliases_mod.load(a.aliases)
         except (OSError, ValueError) as e:
@@ -132,6 +142,27 @@ def _run(a) -> int:
     if not hands:
         print(f"{a.platform}: 数据库里没有手牌", file=sys.stderr)
         return 1
+    if a.cmd == "pool-model":
+        import datetime
+        import os
+
+        from . import pool_model
+
+        if a.since:
+            t0 = datetime.datetime.strptime(a.since, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc).timestamp()
+            hands = [h for h in hands if h.ts is not None and h.ts >= t0]
+            if not hands:
+                print(f"{a.platform}: {a.since} 之后没有手牌", file=sys.stderr)
+                return 1
+        model, val = pool_model.build(hands, a.hero, pool_model.DEFAULT_K if a.k is None else a.k)
+        os.makedirs(a.out, exist_ok=True)
+        js, md = os.path.join(a.out, "pool_model.json"), os.path.join(a.out, "pool_model.md")
+        pool_model.save(model, js)
+        with open(md, "w") as f:
+            f.write(pool_model.render_markdown(model, val))
+        print(js)
+        print(md)
+        return 0
     cfg = Config(min_hands=a.min_hands, min_opps=a.min_opps, bluff_pct=a.bluff_pct, recent_hands=a.recent_hands)
     res = analyze(hands, a.platform, db.load_rejected(a.db, a.platform), cfg, a.hero)
     md, js = write_report(res, a.out)

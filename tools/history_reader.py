@@ -79,6 +79,8 @@ TABLE_CONFIG_SCHEMA = {
     7: ("ante_exempt", "varint", "u32"),
     8: ("live_posts", "varint", "u32"),
     9: ("straddle", "varint", "u64"),
+    10: ("rake_bps", "varint", "u32"),
+    11: ("rake_cap", "varint", "u64"),
 }
 
 RECORDED_ACTION_SCHEMA = {
@@ -237,6 +239,8 @@ def _normalize_history(decoded: dict[str, Any]) -> dict[str, Any]:
             **({"ante_exempt": cfg["ante_exempt"]} if cfg.get("ante_exempt") else {}),
             **({"live_posts": cfg["live_posts"]} if cfg.get("live_posts") else {}),
             **({"straddle": cfg["straddle"]} if cfg.get("straddle") else {}),
+            **({"rake_bps": cfg["rake_bps"]} if cfg.get("rake_bps") else {}),
+            **({"rake_cap": cfg["rake_cap"]} if cfg.get("rake_cap") else {}),
         },
         "seed": decoded.get("seed", 0),
         "actions": normalized_actions,

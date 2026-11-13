@@ -779,8 +779,9 @@ mod tests {
     use crate::core::rng::{ChaCha20Rng, RngSource};
     use crate::core::ChipAmount;
     use crate::training::nlhe_betting_tree::{
-        all_1pot_6max, ante_flop2_3bet_6max, ante_flop2_3bet_o75_6max, ante_flop2_3bet_open2_6max,
-        ante_flop2_6max, first_small_6max, first_small_preopen_1pot_6max,
+        all_1pot_6max, ante_flop2_3bet_6max, ante_flop2_3bet_o50_6max, ante_flop2_3bet_o75_6max,
+        ante_flop2_3bet_open2_6max, ante_flop2_6max, first_small_6max,
+        first_small_preopen_1pot_6max,
     };
 
     fn stub_table() -> Arc<BucketTable> {
@@ -944,6 +945,80 @@ mod tests {
         };
         assert_eq!(open_to(0), 350);
         assert_eq!(open_to(10), 410);
+    }
+
+    /// 抽水只改终局收益：同一棵树、同一串随机动作下，带抽水（4%、封顶 10BB）和不抽水两局逐步同构；
+    /// 每座收益只会少不会多、少的部分不超过封顶；只有一个座位拿到筹码时（没有平分 / 边池另归他人），
+    /// 少的正好是「退回没人跟的注之后的总底池 × 4% 向下取整、封顶」；全桌收益之和 = −抽水合计。
+    #[test]
+    fn rake_only_lowers_winner_payoff_by_the_formula() {
+        let game_with = |rake_bps: u32| {
+            let (abs, rules) = all_1pot_6max(2);
+            SimplifiedNlheGame::new_with_abstraction(
+                stub_table(),
+                TableConfig::default_6max_100bb()
+                    .with_ante(ChipAmount::new(10))
+                    .with_rake(rake_bps, ChipAmount::new(1000)),
+                abs,
+                rules,
+            )
+            .expect("6-max all-1pot game")
+        };
+        let (plain, raked) = (game_with(0), game_with(400));
+        let cfg = raked.table_config().clone();
+        let mut rng_a = ChaCha20Rng::from_seed(0x4A4B_0001);
+        let mut rng_b = ChaCha20Rng::from_seed(0x4A4B_0001);
+        let mut pick = ChaCha20Rng::from_seed(0x4A4B_0002);
+        let (rng_a, rng_b): (&mut dyn RngSource, &mut dyn RngSource) = (&mut rng_a, &mut rng_b);
+        let (mut single, mut capped, mut total_rake) = (0usize, 0usize, 0i64);
+        for _ in 0..400 {
+            let mut a = plain.root(rng_a);
+            let mut b = raked.root(rng_b);
+            while let NodeKind::Player(_) = SimplifiedNlheGame::current(&a) {
+                let actions = SimplifiedNlheGame::legal_actions(&a);
+                assert_eq!(actions, SimplifiedNlheGame::legal_actions(&b));
+                let idx = (pick.next_u64() % actions.len() as u64) as usize;
+                a = SimplifiedNlheGame::next(a, actions[idx], rng_a);
+                b = SimplifiedNlheGame::next(b, actions[idx], rng_b);
+            }
+            assert!(matches!(
+                SimplifiedNlheGame::current(&b),
+                NodeKind::Terminal
+            ));
+            let pay = |s: &SimplifiedNlheState| -> Vec<i64> {
+                (0..6)
+                    .map(|p| SimplifiedNlheGame::payoff(s, p as PlayerId) as i64)
+                    .collect()
+            };
+            let (pa, pb) = (pay(&a), pay(&b));
+            assert_eq!(pa.iter().sum::<i64>(), 0, "不抽水应守恒");
+            let committed: Vec<i64> = a
+                .game_state
+                .players()
+                .iter()
+                .map(|p| p.committed_total.as_u64() as i64)
+                .collect();
+            let pot: i64 = committed.iter().sum();
+            let awarded: Vec<usize> = (0..6).filter(|&i| pa[i] + committed[i] > 0).collect();
+            let mut hand_rake = 0i64;
+            for i in 0..6 {
+                let cut = pa[i] - pb[i];
+                assert!((0..=1000).contains(&cut), "座 {i} 少了 {cut}");
+                assert!(cut == 0 || awarded.contains(&i), "没拿到筹码的座位不该被抽");
+                hand_rake += cut;
+            }
+            if let [only] = awarded[..] {
+                let want = cfg.rake_on(pot as u64) as i64;
+                assert_eq!(pa[only] - pb[only], want, "独赢 {pot} 应抽 {want}");
+                single += 1;
+                capped += usize::from(want == 1000);
+            }
+            assert_eq!(pb.iter().sum::<i64>(), -hand_rake);
+            total_rake += hand_rake;
+        }
+        assert!(single > 100, "应有足够多的独赢局面，实得 {single}");
+        assert!(capped > 0, "应有触到封顶的局面");
+        assert!(total_rake > 0);
     }
 
     /// `ante-flop2`（8 座 100BB、每人 1BB ante）的开池额：UTG 开池只有 1/3pot 一档，
@@ -1198,6 +1273,77 @@ mod tests {
         let three_bet = pick(&state, 500);
         state = SimplifiedNlheGame::next(state, three_bet, rng);
         assert_eq!(state.game_state.current_player(), Some(SeatId(3)));
+        assert_eq!(
+            raises(&state).iter().map(|r| r.1).collect::<Vec<_>>(),
+            vec![1000]
+        );
+    }
+
+    /// `ante-flop2-3bet-o50` 在 1/2/4 (1) 桌（8 座 100BB、ante 50、straddle 200；cap 2 只为树小）：
+    /// ① UTG+1 开池只有 0.5pot 675（200 + 950 / 2）；② 弃到 SB：650（200 + 900 / 2）；③ SB 也弃、BB：625；
+    /// ④ UTG+1 开池、弃到 BB：3bet = 0.5pot 1675（675 + 2000 / 2，2000 = 底池 1425 + 跟注 575）/ 1pot 2675；
+    /// ⑤ BB 0.5pot 3bet、straddle 座弃后，开池者的 4bet 只有 1pot。
+    #[test]
+    fn ante_flop2_3bet_o50_straddle_sizes() {
+        let (abs, rules) = ante_flop2_3bet_o50_6max(2);
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::n_max_at_bb(8, 100)
+                .with_ante(ChipAmount::new(50))
+                .with_straddle(ChipAmount::new(200)),
+            abs,
+            rules,
+        )
+        .expect("8-max o50 straddle game");
+        let mut rng = ChaCha20Rng::from_seed(0xA17E_0050);
+        let rng: &mut dyn RngSource = &mut rng;
+        let raises = |state: &SimplifiedNlheState| -> Vec<(u64, u32)> {
+            SimplifiedNlheGame::legal_actions(state)
+                .into_iter()
+                .filter_map(|a| match a {
+                    AbstractAction::Raise { to, ratio_label } => {
+                        Some((to.as_u64(), ratio_label.as_milli()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let pick = |state: &SimplifiedNlheState, milli: u32| -> AbstractAction {
+            SimplifiedNlheGame::legal_actions(state)
+                .into_iter()
+                .find(|a| matches!(a, AbstractAction::Raise { ratio_label, .. } if ratio_label.as_milli() == milli))
+                .unwrap_or_else(|| panic!("无 {milli} 档"))
+        };
+        let root = game.root(rng);
+        assert_eq!(root.game_state.pot().as_u64(), 750);
+        assert_eq!(root.game_state.current_player(), Some(SeatId(4)));
+        assert_eq!(raises(&root), vec![(675, 500)], "UTG+1 开池单档 0.5pot");
+
+        let mut state = root.clone();
+        for _ in 0..5 {
+            state = SimplifiedNlheGame::next(state, AbstractAction::Fold, rng);
+        }
+        assert_eq!(state.game_state.current_player(), Some(SeatId(1)));
+        assert_eq!(raises(&state), vec![(650, 500)], "SB 开池");
+        state = SimplifiedNlheGame::next(state, AbstractAction::Fold, rng);
+        assert_eq!(state.game_state.current_player(), Some(SeatId(2)));
+        assert_eq!(raises(&state), vec![(625, 500)], "BB 开池");
+
+        let mut state = SimplifiedNlheGame::next(root.clone(), pick(&root, 500), rng);
+        for _ in 0..5 {
+            state = SimplifiedNlheGame::next(state, AbstractAction::Fold, rng);
+        }
+        assert_eq!(
+            state.game_state.current_player(),
+            Some(SeatId(2)),
+            "弃到 BB"
+        );
+        assert_eq!(raises(&state), vec![(1675, 500), (2675, 1000)]);
+        let three_bet = pick(&state, 500);
+        state = SimplifiedNlheGame::next(state, three_bet, rng);
+        assert_eq!(state.game_state.current_player(), Some(SeatId(3)));
+        state = SimplifiedNlheGame::next(state, AbstractAction::Fold, rng);
+        assert_eq!(state.game_state.current_player(), Some(SeatId(4)));
         assert_eq!(
             raises(&state).iter().map(|r| r.1).collect::<Vec<_>>(),
             vec![1000]

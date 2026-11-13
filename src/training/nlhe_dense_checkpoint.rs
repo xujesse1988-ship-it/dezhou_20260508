@@ -131,6 +131,22 @@ impl DenseLayoutFingerprint {
         ante: u64,
         straddle: u64,
     ) -> Self {
+        Self::from_indexer_with_rake(indexer, bucket_table_blake3, ante, straddle, 0, 0)
+    }
+
+    /// 同 [`from_indexer_with_straddle`](Self::from_indexer_with_straddle)，另把抽水
+    /// （`TableConfig::rake_bps` / `rake_cap`）算进指纹：`rake_bps` ≠ 0 时在 straddle 之后再 feed
+    /// `b"rake"` + rake_bps LE + rake_cap LE。抽水只改终局收益、完全不改树形状，不 feed 的话带抽水
+    /// 训出的数组能被不抽水的 game 静默续训 / 读进来。`rake_bps == 0` 时与旧公式逐位相同（此时
+    /// `rake_cap` 不起作用，也不进指纹）。
+    pub fn from_indexer_with_rake(
+        indexer: &NlheDenseIndexer,
+        bucket_table_blake3: [u8; 32],
+        ante: u64,
+        straddle: u64,
+        rake_bps: u32,
+        rake_cap: u64,
+    ) -> Self {
         let mut hasher = Hasher::new();
         for id in 0..indexer.num_nodes() as NodeId {
             let m = indexer.node_meta(id);
@@ -145,6 +161,11 @@ impl DenseLayoutFingerprint {
         if straddle != 0 {
             hasher.update(b"straddle");
             hasher.update(&straddle.to_le_bytes());
+        }
+        if rake_bps != 0 {
+            hasher.update(b"rake");
+            hasher.update(&rake_bps.to_le_bytes());
+            hasher.update(&rake_cap.to_le_bytes());
         }
         Self {
             bucket_table_blake3,
@@ -413,8 +434,8 @@ pub(crate) fn parse_header(
             format!(
                 "layout fingerprint mismatch: file(nodes={}, rows={}, slots={}) \
                  action_hash={} vs expected(nodes={}, rows={}, slots={}) \
-                 (action_hash covers per-node actions and the table ante / straddle: \
-                 check reshape / seats / stack / --ante / --straddle)",
+                 (action_hash covers per-node actions and the table ante / straddle / rake: \
+                 check reshape / seats / stack / --ante / --straddle / --rake-bps / --rake-cap)",
                 num_nodes,
                 total_rows,
                 total_slots,
@@ -784,6 +805,31 @@ mod tests {
             "ante 不符应被拒，got {err:?}"
         );
         load_dense_checkpoint(&path, &fp_10, idx).expect("同 ante 应能加载");
+    }
+
+    /// 抽水进指纹：`rake_bps`≠0 时比例和封顶都进；`rake_bps`=0 与旧公式逐位相同（封顶此时不进）。
+    #[test]
+    fn dense_checkpoint_fingerprint_distinguishes_rake() {
+        let specs = [spec(StreetTag::Preflop, 4, 3), spec(StreetTag::Flop, 5, 6)];
+        let idx = Arc::new(NlheDenseIndexer::from_node_specs(specs.iter().copied()));
+        let bucket = fake_bucket_blake3(0x5B);
+        let fp = |bps: u32, cap: u64| {
+            DenseLayoutFingerprint::from_indexer_with_rake(&idx, bucket, 100, 0, bps, cap)
+                .action_count_blake3
+        };
+        let plain = DenseLayoutFingerprint::from_indexer(&idx, bucket, 100).action_count_blake3;
+        assert_eq!(fp(0, 0), plain, "不抽水须与旧公式相同");
+        assert_eq!(fp(0, 1000), plain, "比例为 0 时封顶不进指纹");
+        assert_ne!(fp(400, 1000), plain);
+        assert_ne!(fp(400, 1000), fp(400, 500), "封顶进指纹");
+        assert_ne!(fp(400, 1000), fp(300, 1000), "比例进指纹");
+        assert_ne!(fp(400, 0), fp(400, 1000));
+        // 与 straddle 互不相同（各带前缀）。
+        assert_ne!(
+            fp(400, 1000),
+            DenseLayoutFingerprint::from_indexer_with_straddle(&idx, bucket, 100, 400)
+                .action_count_blake3
+        );
     }
 
     /// straddle 进指纹：straddle≠0 与 0 不同、与 ante 也互不相同；straddle=0 与只传 ante 的旧

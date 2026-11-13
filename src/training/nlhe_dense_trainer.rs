@@ -44,6 +44,7 @@ use crate::training::nlhe_dense::{DenseLocalDelta, DenseNlheTable, NlheDenseInde
 use crate::training::nlhe_dense_checkpoint::{
     load_dense_checkpoint, save_dense_checkpoint, DenseCheckpointMeta, DenseLayoutFingerprint,
 };
+use crate::training::pool_strategy::PoolPreflopStrategy;
 use crate::training::regret::SigmaVec;
 use crate::training::sampling::{derive_substream_seed, sample_discrete};
 
@@ -63,6 +64,9 @@ pub struct DenseNlheEsMccfrTrainer {
     lcfr_period_size: Option<u64>,
     lcfr_periods_completed: u64,
     lcfr_rescale_regret: bool,
+    /// 牌池的翻前策略（[`Self::set_pool_strategy`]）；`None` = 普通自对弈。不进 checkpoint：续训时
+    /// 由调用方重新挂上同一份（`train_cfr` 在 checkpoint 目录里记它的哈希防止混用）。
+    pool: Option<Arc<PoolPreflopStrategy>>,
 }
 
 impl DenseNlheEsMccfrTrainer {
@@ -88,7 +92,28 @@ impl DenseNlheEsMccfrTrainer {
             lcfr_period_size: None,
             lcfr_periods_completed: 0,
             lcfr_rescale_regret: true,
+            pool: None,
         }
+    }
+
+    /// 挂上（或摘掉）牌池的翻前策略。挂上后，**非 traverser** 座位在翻前每个决策点以该节点的置信度
+    /// 概率改按牌池的动作打（「被强制」），否则照常按自己的当前策略 σ 打；traverser 永远按 σ。于是 σ
+    /// 学到的是：其余座位是「一部分牌池 + 一部分我们自己」时的最优应对。
+    ///
+    /// **平均策略**：非 traverser 节点往 strategy_sum 里记 σ 的前提是「到这里为止这个座位都是按 σ 打
+    /// 的」。某座位这手牌里一旦被强制过，它之后的节点就不再记。这样一个信息集被记到的次数正比于
+    /// σ 自己的到达概率 × ∏(1 − 途经自己各节点的置信度)，后一项对同一个信息集是常数（置信度只跟
+    /// 节点有关，途经哪些自己的节点由信息集决定），归一化时约掉，平均策略不偏。
+    ///
+    /// 只有 [`Self::step_parallel_lockfree`] 实现了这条路径；挂上后调 [`Self::step`] /
+    /// [`Self::step_parallel`] 会 panic。
+    pub fn set_pool_strategy(&mut self, pool: Option<Arc<PoolPreflopStrategy>>) {
+        self.pool = pool;
+    }
+
+    /// 当前挂着的牌池翻前策略。
+    pub fn pool_strategy(&self) -> Option<&Arc<PoolPreflopStrategy>> {
+        self.pool.as_ref()
     }
 
     /// 启用 LCFR-MCCFR period rescale（Brown & Sandholm 2018）；语义同
@@ -129,6 +154,10 @@ impl DenseNlheEsMccfrTrainer {
     ///
     /// 与 [`crate::training::trainer::EsMccfrTrainer::step`] 逐步对应，仅存储后端不同。
     pub fn step(&mut self, rng: &mut dyn RngSource) -> Result<(), TrainerError> {
+        assert!(
+            self.pool.is_none(),
+            "pool strategy is only implemented on step_parallel_lockfree"
+        );
         let n_players = self.game.n_players() as u64;
         let traverser = (self.update_count % n_players) as PlayerId;
         let root = self.game.root(rng);
@@ -186,6 +215,10 @@ impl DenseNlheEsMccfrTrainer {
         n_threads: usize,
         batch_per_worker: usize,
     ) -> Result<(), TrainerError> {
+        assert!(
+            self.pool.is_none(),
+            "pool strategy is only implemented on step_parallel_lockfree"
+        );
         let n_active = n_threads.min(rng_pool.len());
         if n_active == 0 || batch_per_worker == 0 {
             return Ok(());
@@ -277,6 +310,7 @@ impl DenseNlheEsMccfrTrainer {
         let game = &self.game;
         let regret: &DenseNlheTable = &self.regret;
         let strategy_sum: &DenseNlheTable = &self.strategy_sum;
+        let pool: Option<&PoolPreflopStrategy> = self.pool.as_deref();
 
         active_pool
             .par_iter_mut()
@@ -288,7 +322,7 @@ impl DenseNlheEsMccfrTrainer {
                     let traverser =
                         ((base_update_count + trajectory_index) % n_players) as PlayerId;
                     let root = game.root(rng);
-                    recurse_es_dense_lockfree(root, traverser, regret, strategy_sum, rng);
+                    recurse_es_dense_lockfree(root, traverser, regret, strategy_sum, pool, 0, rng);
                 }
             });
 
@@ -354,11 +388,14 @@ impl DenseNlheEsMccfrTrainer {
 
     /// dense 表布局指纹（save / load 共用：从持有的 indexer + game bucket hash 算）。
     fn layout_fingerprint(&self) -> DenseLayoutFingerprint {
-        DenseLayoutFingerprint::from_indexer_with_straddle(
+        let cfg = self.game.table_config();
+        DenseLayoutFingerprint::from_indexer_with_rake(
             self.regret.indexer(),
             self.game.bucket_table_blake3(),
-            self.game.table_config().ante.as_u64(),
-            self.game.table_config().straddle.as_u64(),
+            cfg.ante.as_u64(),
+            cfg.straddle.as_u64(),
+            cfg.rake_bps,
+            cfg.rake_cap.as_u64(),
         )
     }
 
@@ -385,11 +422,13 @@ impl DenseNlheEsMccfrTrainer {
             game.tree(),
             bucket_count_by_street(&game),
         ));
-        let expected = DenseLayoutFingerprint::from_indexer_with_straddle(
+        let expected = DenseLayoutFingerprint::from_indexer_with_rake(
             &indexer,
             game.bucket_table_blake3(),
             game.table_config().ante.as_u64(),
             game.table_config().straddle.as_u64(),
+            game.table_config().rake_bps,
+            game.table_config().rake_cap.as_u64(),
         );
         let (meta, regret, strategy_sum) =
             load_dense_checkpoint(path, &expected, Arc::clone(&indexer))?;
@@ -402,6 +441,7 @@ impl DenseNlheEsMccfrTrainer {
             lcfr_period_size: meta.lcfr_period_size,
             lcfr_periods_completed: meta.lcfr_periods_completed,
             lcfr_rescale_regret: meta.lcfr_rescale_regret,
+            pool: None,
         })
     }
 
@@ -661,11 +701,17 @@ fn recurse_es_dense_parallel(
 /// traverser 分支递归子节点后再写 regret。`last-iteration move`（前 n-1 次 `state.clone()` / 最后一次
 /// move）保持，对齐并行同型；本路径 byte-equal 本就不成立（CAS race 顺序不定），
 /// 但 rng 消费序列与 deterministic 路径一致，便于做 LBR / avg_strategy 统计对照。
+///
+/// `pool` / `forced`：牌池的翻前策略和「这手牌里哪些座位已经被牌池强制过」的位掩码，语义见
+/// [`DenseNlheEsMccfrTrainer::set_pool_strategy`]。`pool == None` 时不多消费 rng、`forced` 恒 0，
+/// 与没有这两个参数时逐步相同。
 fn recurse_es_dense_lockfree(
     state: SimplifiedNlheState,
     traverser: PlayerId,
     regret: &DenseNlheTable,
     strategy_sum: &DenseNlheTable,
+    pool: Option<&PoolPreflopStrategy>,
+    forced: u16,
     rng: &mut dyn RngSource,
 ) -> f64 {
     match SimplifiedNlheGame::current(&state) {
@@ -690,34 +736,257 @@ fn recurse_es_dense_lockfree(
                 let last_idx = n - 1;
                 for &action in &actions[..last_idx] {
                     let next_state = SimplifiedNlheGame::next(state.clone(), action, rng);
-                    let cfv =
-                        recurse_es_dense_lockfree(next_state, traverser, regret, strategy_sum, rng);
+                    let cfv = recurse_es_dense_lockfree(
+                        next_state,
+                        traverser,
+                        regret,
+                        strategy_sum,
+                        pool,
+                        forced,
+                        rng,
+                    );
                     cfvs.push(cfv);
                 }
                 let last_state = SimplifiedNlheGame::next(state, actions[last_idx], rng);
-                let cfv_last =
-                    recurse_es_dense_lockfree(last_state, traverser, regret, strategy_sum, rng);
+                let cfv_last = recurse_es_dense_lockfree(
+                    last_state,
+                    traverser,
+                    regret,
+                    strategy_sum,
+                    pool,
+                    forced,
+                    rng,
+                );
                 cfvs.push(cfv_last);
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
                 let delta: SigmaVec = cfvs.iter().map(|c| c - sigma_value).collect();
                 regret.accumulate_by_slot(slot.slot_start, slot.row_index, &delta);
                 sigma_value
             } else {
-                strategy_sum.accumulate_by_slot(slot.slot_start, slot.row_index, &sigma);
-                let nonzero_dist: SmallVec<[(SimplifiedNlheAction, f64); 8]> = actions
-                    .iter()
-                    .copied()
-                    .zip(sigma.iter().copied())
-                    .filter(|(_, p)| *p > 0.0)
-                    .collect();
-                debug_assert!(
-                    !nonzero_dist.is_empty(),
-                    "non-traverser σ all-zero impossible: current_strategy 退化局面回退均匀分布"
-                );
-                let sampled = sample_discrete(&nonzero_dist, rng);
+                let actor_bit = 1u16 << actor;
+                if forced & actor_bit == 0 {
+                    strategy_sum.accumulate_by_slot(slot.slot_start, slot.row_index, &sigma);
+                }
+                let pool_row = pool.and_then(|p| p.lookup(state.current_node_id, info.bucket_id()));
+                let (sampled, was_forced) = sample_opponent_action(&actions, &sigma, pool_row, rng);
+                let forced = if was_forced {
+                    forced | actor_bit
+                } else {
+                    forced
+                };
                 let next_state = SimplifiedNlheGame::next(state, sampled, rng);
-                recurse_es_dense_lockfree(next_state, traverser, regret, strategy_sum, rng)
+                recurse_es_dense_lockfree(
+                    next_state,
+                    traverser,
+                    regret,
+                    strategy_sum,
+                    pool,
+                    forced,
+                    rng,
+                )
             }
         }
+    }
+}
+
+/// 非 traverser 座位的动作：`pool_row = Some((置信度, 牌池在这手牌上的各动作概率))` 且置信度 > 0 时，
+/// 先掷一次币，以置信度概率按牌池的分布抽（返回 `true` = 被强制），否则按自己的 σ 抽。`pool_row`
+/// 为 `None` 或置信度为 0 时不掷币，rng 消费与原来只按 σ 抽时相同。
+fn sample_opponent_action(
+    actions: &[SimplifiedNlheAction],
+    sigma: &[f64],
+    pool_row: Option<(f32, &[f32])>,
+    rng: &mut dyn RngSource,
+) -> (SimplifiedNlheAction, bool) {
+    if let Some((confidence, row)) = pool_row {
+        debug_assert_eq!(row.len(), actions.len(), "pool row 与节点动作数不符");
+        if confidence > 0.0 {
+            let u = (rng.next_u64() >> 11) as f64 / ((1u64 << 53) as f64);
+            if u < f64::from(confidence) {
+                let total: f64 = row.iter().map(|p| f64::from(*p)).sum();
+                let dist: SmallVec<[(SimplifiedNlheAction, f64); 8]> = actions
+                    .iter()
+                    .copied()
+                    .zip(row.iter().map(|p| f64::from(*p) / total))
+                    .filter(|(_, p)| *p > 0.0)
+                    .collect();
+                return (sample_discrete(&dist, rng), true);
+            }
+        }
+    }
+    let nonzero_dist: SmallVec<[(SimplifiedNlheAction, f64); 8]> = actions
+        .iter()
+        .copied()
+        .zip(sigma.iter().copied())
+        .filter(|(_, p)| *p > 0.0)
+        .collect();
+    debug_assert!(
+        !nonzero_dist.is_empty(),
+        "non-traverser σ all-zero impossible: current_strategy 退化局面回退均匀分布"
+    );
+    (sample_discrete(&nonzero_dist, rng), false)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use crate::abstraction::bucket_table::{BucketConfig, BucketTable};
+    use crate::abstraction::preflop::PreflopLossless169;
+    use crate::core::rng::ChaCha20Rng;
+    use crate::core::ChipAmount;
+    use crate::rules::config::TableConfig;
+    use crate::training::nlhe_betting_tree::ante_flop2_3bet_o75_limp_6max;
+    use crate::training::pool_model::PoolModel;
+    use crate::training::pool_strategy::PoolStrategyParams;
+
+    fn limp_game() -> SimplifiedNlheGame {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::default_500_500_500(),
+        ));
+        let cfg = TableConfig::n_max_at_bb(6, 30).with_ante(ChipAmount::new(100));
+        let (abs, rules) = ante_flop2_3bet_o75_limp_6max(2);
+        SimplifiedNlheGame::new_with_abstraction(table, cfg, abs, rules).expect("game")
+    }
+
+    fn pool_for(game: &SimplifiedNlheGame, conf_scale: f64) -> Arc<PoolPreflopStrategy> {
+        let model = PoolModel::from_json(include_str!("../../tests/data/pool_model_small.json"))
+            .expect("model");
+        let params = PoolStrategyParams {
+            conf_scale,
+            ..PoolStrategyParams::default()
+        };
+        Arc::new(PoolPreflopStrategy::build(game, &model, params).expect("pool"))
+    }
+
+    /// 置信度 0.9、σ 全在第一个动作、牌池全在第三个：约九成抽到第三个并标记被强制，一成抽到第一个。
+    /// 没有牌池行或置信度为 0 时只按 σ 抽，且消费的随机数与原来一样（一次）。
+    #[test]
+    fn opponent_action_mixes_pool_and_own_strategy() {
+        let game = limp_game();
+        let mut rng = ChaCha20Rng::from_seed(7);
+        let root = game.root(&mut rng);
+        let actions = SimplifiedNlheGame::legal_actions(&root);
+        assert_eq!(actions.len(), 3);
+        let sigma = [1.0, 0.0, 0.0];
+        let row = [0.0f32, 0.0, 1.0];
+        let (mut forced_n, mut third, n) = (0u32, 0u32, 20_000u32);
+        for _ in 0..n {
+            let (a, forced) = sample_opponent_action(&actions, &sigma, Some((0.9, &row)), &mut rng);
+            forced_n += u32::from(forced);
+            third += u32::from(a == actions[2]);
+            assert_eq!(forced, a == actions[2]);
+        }
+        assert_eq!(forced_n, third);
+        let share = f64::from(third) / f64::from(n);
+        assert!((share - 0.9).abs() < 0.01, "{share}");
+
+        let mut a = ChaCha20Rng::from_seed(11);
+        let mut b = ChaCha20Rng::from_seed(11);
+        let mut c = ChaCha20Rng::from_seed(11);
+        for _ in 0..50 {
+            let x = sample_opponent_action(&actions, &[0.2, 0.3, 0.5], None, &mut a);
+            let y = sample_opponent_action(&actions, &[0.2, 0.3, 0.5], Some((0.0, &row)), &mut b);
+            assert_eq!(x, y);
+            assert!(!x.1);
+            // The plain σ draw consumes exactly one random number.
+            let _ = c.next_u64();
+        }
+        assert_eq!(a.next_u64(), c.next_u64());
+    }
+
+    /// 翻前信息集的 bucket_id 就是起手牌的 169 类编号（牌池策略表按它查行）。
+    /// 被强制过的座位不再往平均策略里记；没被强制过的照常记。
+    #[test]
+    fn forced_seats_do_not_feed_the_average_strategy() {
+        let game = limp_game();
+        let mut rng = ChaCha20Rng::from_seed(3);
+        for _ in 0..20 {
+            let root = game.root(&mut rng);
+            let actor = match SimplifiedNlheGame::current(&root) {
+                NodeKind::Player(a) => a,
+                _ => panic!("root is a decision"),
+            };
+            assert_eq!(actor, 3, "UTG acts first");
+            let info = SimplifiedNlheGame::info_set(&root, actor);
+            let hole = root.game_state.players()[actor as usize]
+                .hole_cards
+                .expect("dealt");
+            assert_eq!(
+                info.bucket_id(),
+                u32::from(PreflopLossless169::new().hand_class(hole))
+            );
+
+            let trainer = DenseNlheEsMccfrTrainer::new(limp_game(), 1);
+            let row = trainer.regret.indexer().locate(info).row_index;
+            // Traverser 0: the root (seat 3) is an opponent node.
+            recurse_es_dense_lockfree(
+                root.clone(),
+                0,
+                &trainer.regret,
+                &trainer.strategy_sum,
+                None,
+                u16::MAX,
+                &mut rng,
+            );
+            assert!(
+                !trainer.strategy_sum.touched_row(row),
+                "a forced seat must not be recorded"
+            );
+            recurse_es_dense_lockfree(
+                root,
+                0,
+                &trainer.regret,
+                &trainer.strategy_sum,
+                None,
+                0,
+                &mut rng,
+            );
+            assert!(trainer.strategy_sum.touched_row(row));
+        }
+    }
+
+    /// 单线程 lock-free 是确定性的：挂一份置信度全为 0 的牌池策略，和不挂逐位相同（不多消费随机数）；
+    /// 置信度正常时能跑、结果不同，且 step / step_parallel 拒绝。
+    #[test]
+    fn zero_confidence_pool_changes_nothing() {
+        let run = |pool: Option<Arc<PoolPreflopStrategy>>| -> Vec<Vec<f64>> {
+            let game = limp_game();
+            let root_id = game.tree().root_id();
+            let mut t = DenseNlheEsMccfrTrainer::new(limp_game(), 5);
+            t.set_pool_strategy(pool);
+            let mut rngs: Vec<Box<dyn RngSource>> = vec![Box::new(ChaCha20Rng::from_seed(99))];
+            for _ in 0..40 {
+                t.step_parallel_lockfree(&mut rngs, 1, 50).expect("step");
+            }
+            assert_eq!(t.update_count(), 2000);
+            (0..52u8)
+                .step_by(5)
+                .map(|c| {
+                    let hole = [
+                        crate::core::Card::from_u8(c).expect("card"),
+                        crate::core::Card::from_u8((c + 17) % 52).expect("card"),
+                    ];
+                    let info = game.preflop_info_set_for_hand(root_id, hole);
+                    let mut v = t.average_strategy(info);
+                    v.extend(t.current_strategy(info));
+                    v
+                })
+                .collect()
+        };
+        let game = limp_game();
+        let plain = run(None);
+        assert_eq!(plain, run(Some(pool_for(&game, 0.0))));
+        assert_ne!(plain, run(Some(pool_for(&game, 1.0))));
+    }
+
+    #[test]
+    #[should_panic(expected = "only implemented on step_parallel_lockfree")]
+    fn pool_rejects_the_single_thread_step() {
+        let game = limp_game();
+        let pool = pool_for(&game, 1.0);
+        let mut t = DenseNlheEsMccfrTrainer::new(game, 5);
+        t.set_pool_strategy(Some(pool));
+        let mut rng = ChaCha20Rng::from_seed(1);
+        let _ = t.step(&mut rng);
     }
 }

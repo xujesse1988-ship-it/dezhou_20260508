@@ -169,11 +169,13 @@ fn full_indexer_and_fingerprint(
     game: &SimplifiedNlheGame,
 ) -> (NlheDenseIndexer, DenseLayoutFingerprint) {
     let indexer = NlheDenseIndexer::from_tree(game.tree(), bucket_count_by_street(game));
-    let fp = DenseLayoutFingerprint::from_indexer_with_straddle(
+    let fp = DenseLayoutFingerprint::from_indexer_with_rake(
         &indexer,
         game.bucket_table_blake3(),
         game.table_config().ante.as_u64(),
         game.table_config().straddle.as_u64(),
+        game.table_config().rake_bps,
+        game.table_config().rake_cap.as_u64(),
     );
     (indexer, fp)
 }
@@ -841,6 +843,28 @@ impl CropStrategyReader {
         straddle: u64,
         street: StreetTag,
     ) -> Result<Self, CheckpointError> {
+        Self::open_with_rake(
+            path,
+            tree,
+            bucket_count_by_street,
+            ante,
+            straddle,
+            (0, 0),
+            street,
+        )
+    }
+
+    /// 同 [`open_with_straddle`](Self::open_with_straddle)，另带训练时的抽水 `rake` =
+    /// (`rake_bps`, `rake_cap` chips)（进指纹，见 [`DenseLayoutFingerprint::from_indexer_with_rake`]）。
+    pub fn open_with_rake(
+        path: &Path,
+        tree: &PublicBettingTree,
+        bucket_count_by_street: [u32; 4],
+        ante: u64,
+        straddle: u64,
+        rake: (u32, u64),
+        street: StreetTag,
+    ) -> Result<Self, CheckpointError> {
         let indexer = NlheDenseIndexer::from_tree(tree, bucket_count_by_street);
         let mut reader = open_reader(path)?;
         let mut h = Hasher::new();
@@ -850,11 +874,13 @@ impl CropStrategyReader {
         let file_bucket_blake3: [u8; 32] = header[OFF_BUCKET_BLAKE3..OFF_ACTION_BLAKE3]
             .try_into()
             .unwrap();
-        let expected = DenseLayoutFingerprint::from_indexer_with_straddle(
+        let expected = DenseLayoutFingerprint::from_indexer_with_rake(
             &indexer,
             file_bucket_blake3,
             ante,
             straddle,
+            rake.0,
+            rake.1,
         );
         let CropHeader {
             keep_through,
@@ -1412,6 +1438,70 @@ mod tests {
             );
             assert!(crop_dense_checkpoint(&ckpt, &dir.join("x.crop"), &other(), opts).is_err());
             assert!(CroppedBlueprint::load(&out, &other()).is_err());
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 抽水进 layout 指纹：3 座 20BB ante 10、抽水 4% 封顶 1000 训出的 ckpt / crop，同抽水的 game 照常
+    /// resume / crop / 加载（`CropStrategyReader::open_with_rake` 也能开）；封顶不同、比例不同或不抽水
+    /// 的 game 三条路都拒（抽水完全不改树形状，只靠指纹区分）。
+    #[test]
+    fn rake_mismatch_rejected() {
+        let game_with = |rake_bps: u32, rake_cap: u64| {
+            let table = Arc::new(BucketTable::stub_for_postflop(
+                BucketConfig::new(200, 200, 200).expect("200/200/200"),
+            ));
+            let (abs, rules) = all_1pot_6max(2);
+            let cfg = TableConfig::n_max_at_bb(3, 20)
+                .with_ante(ChipAmount::new(10))
+                .with_rake(rake_bps, ChipAmount::new(rake_cap));
+            SimplifiedNlheGame::new_with_abstraction(table, cfg, abs, rules).expect("rake game")
+        };
+        let mut trainer = DenseNlheEsMccfrTrainer::new(game_with(400, 1000), 13);
+        let mut rng = ChaCha20Rng::from_seed(0x5243);
+        for _ in 0..300 {
+            trainer.step(&mut rng).expect("step");
+        }
+        let dir = tmpdir("rake");
+        let ckpt = dir.join("rake.ckpt");
+        trainer.save_checkpoint(&ckpt).expect("save");
+        let opts = CropOptions {
+            keep_through: StreetTag::Flop,
+            keep_regret: false,
+        };
+        let out = dir.join("rake.crop");
+        crop_dense_checkpoint(&ckpt, &out, trainer.game(), opts).expect("crop (same rake)");
+        CroppedBlueprint::load(&out, &game_with(400, 1000)).expect("load crop (same rake)");
+        DenseNlheEsMccfrTrainer::load_checkpoint(&ckpt, game_with(400, 1000))
+            .expect("resume (same rake)");
+        let g = game_with(400, 1000);
+        let buckets = bucket_count_by_street(&g);
+        CropStrategyReader::open_with_rake(
+            &out,
+            g.tree(),
+            buckets,
+            10,
+            0,
+            (400, 1000),
+            StreetTag::Preflop,
+        )
+        .expect("reader (same rake)");
+        assert!(
+            CropStrategyReader::open(&out, g.tree(), buckets, 10, StreetTag::Preflop).is_err(),
+            "reader 不带抽水须拒"
+        );
+
+        for (bps, cap) in [(400, 500), (300, 1000), (400, 0), (0, 0)] {
+            assert!(
+                DenseNlheEsMccfrTrainer::load_checkpoint(&ckpt, game_with(bps, cap)).is_err(),
+                "resume 抽水 {bps}/{cap} 须拒"
+            );
+            assert!(
+                crop_dense_checkpoint(&ckpt, &dir.join("x.crop"), &game_with(bps, cap), opts)
+                    .is_err()
+            );
+            assert!(CroppedBlueprint::load(&out, &game_with(bps, cap)).is_err());
         }
 
         std::fs::remove_dir_all(&dir).ok();
