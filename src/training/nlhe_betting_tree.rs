@@ -442,6 +442,37 @@ pub fn ante_flop2_3bet_o75_limp_6max(
     (abs, rules)
 }
 
+/// [`ante_flop2_3bet_o75_limp_6max`] plus a **second, small open size (1/3 pot)**: preflop menu
+/// `{1/3, 0.5, 0.75, 1}`, rules unchanged. Open and isolation raise = {1/3 pot, 0.75 pot} (0.5 pot
+/// dropped by `preflop_half_3bet`, 1 pot by `preflop_open_small_only`, open all-in by
+/// `drop_preflop_open_allin`); 3bet = {0.5 pot, 1 pot} and 4bet+ = 1 pot as before
+/// (`drop_small_reraise` drops every sub-pot size but the 0.5 pot 3bet); postflop unchanged.
+/// 8 seats, 1BB ante each: UTG-BTN open 4.5BB / 8.88BB. 8 seats 200BB `width_redirect` 4:
+/// 10.78M nodes, two tables 165.3 GiB (`ante-flop2-3bet-o75-limp` 4.14M / 62.9 GiB).
+///
+/// Why: with the 0.75 pot open only, the 10B `-o75-limp` blueprint trained against the pool
+/// limps first-in 80%+ from CO / BTN and raises 2.5-8%. The 4-seat A/B of 2026-11-14 (same dead
+/// money, limp line capped the same way) put the single expensive open size at about 20 points
+/// of that limp rate: with the 1/3 pot open added, CO first-in went from limp 81% / raise 6% to
+/// limp 61% / raise 18.5%, and almost every raise used the small size. The limp cap accounted
+/// for about 10 points. The 0.75 pot open stays because it is where the pool's opens land
+/// (median 9BB).
+///
+/// A separate entry for the same reason as [`first_small_preopen_1pot_6max`]: existing reshapes
+/// stay untouched.
+pub fn ante_flop2_3bet_o75_limp_open2_6max(
+    width_redirect: u8,
+) -> (StreetActionAbstraction, BettingAbstractionRules) {
+    let (_, rules) = ante_flop2_3bet_o75_limp_6max(width_redirect);
+    debug_assert!(rules.preflop_open_small_only && rules.preflop_half_3bet);
+    let pre = ActionAbstractionConfig::new(vec![1.0 / 3.0, 0.5, 0.75, 1.0])
+        .expect("preflop {1/3,0.5,0.75,1.0}");
+    let one = || ActionAbstractionConfig::new(vec![1.0]).expect("{1.0}");
+    let flop = ActionAbstractionConfig::new(vec![0.5, 1.0]).expect("flop {0.5,1.0}");
+    let abs = StreetActionAbstraction::per_street([pre, flop, one(), one()]);
+    (abs, rules)
+}
+
 /// `--profile six-max` 的 `--reshape <name>` → `(abstraction, rules)`。`train_cfr` 与
 /// `nlhe_dense_crop` 共用，保证裁切 / 加载时重建的树与训练时**同一**定义（dense ckpt 的
 /// layout 指纹仍会兜底校验）。未知名返回 `None`。
@@ -467,6 +498,7 @@ pub fn six_max_reshape(
         "ante-flop2-3bet-o75" => ante_flop2_3bet_o75_6max(width_redirect),
         "ante-flop2-3bet-o50" => ante_flop2_3bet_o50_6max(width_redirect),
         "ante-flop2-3bet-o75-limp" => ante_flop2_3bet_o75_limp_6max(width_redirect),
+        "ante-flop2-3bet-o75-limp-open2" => ante_flop2_3bet_o75_limp_open2_6max(width_redirect),
         _ => return None,
     })
 }
@@ -475,7 +507,7 @@ pub fn six_max_reshape(
 pub const SIX_MAX_RESHAPE_NAMES: &str =
     "none | nolimp | preopen | preopen-small | preopen-1pot | all-1pot | flop2-1pot | ante-flop2 \
      | ante-flop2-3bet | ante-flop2-3bet-open2 | ante-flop2-3bet-o75 | ante-flop2-3bet-o50 \
-     | ante-flop2-3bet-o75-limp";
+     | ante-flop2-3bet-o75-limp | ante-flop2-3bet-o75-limp-open2";
 
 /// S6 实时搜索深码档（`realtime_search_openpoker_exec` §2.1 / 缺口③）：**全街单一 {1pot}**
 /// 下注菜单——每决策点只剩 `{fold, check/call, bet/raise 1pot, all-in}`。fold/check/call/all-in
@@ -2010,6 +2042,153 @@ mod tests {
         let (d_abs, d_rules) = six_max_reshape("ante-flop2-3bet-o75-limp", 4).expect("已注册");
         assert_eq!(count_tree_layout(&cfg, &d_abs, d_rules), got);
         assert!(SIX_MAX_RESHAPE_NAMES.contains("ante-flop2-3bet-o75-limp"));
+    }
+
+    /// `ante-flop2-3bet-o75-limp-open2` (6 seats, 1BB ante, `width_redirect` 4, limp line 3):
+    /// 1. every unraised preflop node that can raise offers exactly the two open sizes (1/3 pot,
+    ///    0.75 pot) and no all-in; first-in and after a limp alike;
+    /// 2. facing an open of either size: 3bet = {0.5 pot, 1 pot}; facing a 3bet: 1 pot only;
+    /// 3. the limp-line cap is the one of `-o75-limp` (third paid entry cannot limp, BB checks);
+    /// 4. dropping the 1/3 pot open edges leaves the `-o75-limp` tree, node for node;
+    /// 5. `count_tree_layout` agrees with the built tree; the name is registered.
+    #[test]
+    fn reshape_o75_limp_open2_two_open_sizes() {
+        use AbstractActionTag as T;
+        let o33 = T::Raise(BetRatio::from_f64(1.0 / 3.0).expect("1/3"));
+        let o75 = T::Raise(BetRatio::from_f64(0.75).expect("0.75"));
+        let half = T::Raise(BetRatio::HALF_POT);
+        let full = T::Raise(BetRatio::FULL_POT);
+        let cfg = TableConfig::n_max_at_bb(6, 30).with_ante(ChipAmount::new(100));
+        let (abs, rules) = ante_flop2_3bet_o75_limp_open2_6max(4);
+        assert!(!rules.no_open_limp);
+        assert_eq!(rules.limp_line_width, O75_LIMP_LINE_WIDTH);
+        let t = PublicBettingTree::build_with_rules(&cfg, &abs, rules);
+        let step = |id: NodeId, tag: T| -> NodeId {
+            let n = t.node(id);
+            let i = n
+                .legal_actions
+                .iter()
+                .position(|a| *a == tag)
+                .unwrap_or_else(|| panic!("node {id} has no {tag:?}: {:?}", n.legal_actions));
+            match n.children[i] {
+                Child::Decision(c) => c,
+                Child::Terminal => panic!("node {id} --{tag:?}--> terminal"),
+            }
+        };
+        let la = |id: NodeId| t.node(id).legal_actions.to_vec();
+        // Raises on the preflop line leading to `id`.
+        let raises_before = |id: NodeId| -> usize {
+            let (mut n, mut cur) = (0, id);
+            while let Some(p) = t.node(cur).parent {
+                let tag = t.node(cur).action_from_parent.expect("edge");
+                if t.node(p).street == StreetTag::Preflop && matches!(tag, T::Raise(_) | T::AllIn) {
+                    n += 1;
+                }
+                cur = p;
+            }
+            n
+        };
+
+        // 1 + 2: menu by the number of raises so far, on every preflop node.
+        let (mut open_nodes, mut three_bet_nodes) = (0usize, 0usize);
+        for id in 0..t.num_nodes() as NodeId {
+            let n = t.node(id);
+            if n.street != StreetTag::Preflop {
+                continue;
+            }
+            let sizes: Vec<T> = n
+                .legal_actions
+                .iter()
+                .copied()
+                .filter(|a| matches!(a, T::Raise(_)))
+                .collect();
+            match raises_before(id) {
+                0 => {
+                    assert_eq!(sizes, vec![o33, o75], "node {id}: open sizes");
+                    assert!(
+                        !n.legal_actions.contains(&T::AllIn),
+                        "node {id}: open all-in"
+                    );
+                    open_nodes += 1;
+                }
+                1 => {
+                    assert!(
+                        sizes.iter().all(|a| *a == half || *a == full),
+                        "node {id}: 3bet sizes {sizes:?}"
+                    );
+                    three_bet_nodes += usize::from(sizes == vec![half, full]);
+                }
+                _ => assert!(
+                    sizes.iter().all(|a| *a == full),
+                    "node {id}: 4bet+ sizes {sizes:?}"
+                ),
+            }
+        }
+        assert!(open_nodes > 0 && three_bet_nodes > 0);
+
+        let root = t.root_id();
+        assert_eq!(la(root), vec![T::Fold, T::Call, o33, o75]);
+        // Facing either open: 0.5 pot 3bet, then 1 pot and / or all-in (at 30BB the 1 pot 3bet
+        // over the 0.75 pot open is already all-in), never an open size.
+        for open in [o33, o75] {
+            let menu = la(step(root, open));
+            assert_eq!(menu[..3], [T::Fold, T::Call, half], "facing {open:?}");
+            assert!(
+                menu.len() > 3 && menu[3..].iter().all(|a| *a == full || *a == T::AllIn),
+                "facing {open:?}: {menu:?}"
+            );
+        }
+        assert_eq!(
+            la(step(root, o33)),
+            vec![T::Fold, T::Call, half, full, T::AllIn]
+        );
+
+        // 3: UTG, HJ limp -> CO is the third paid entry.
+        let hj = step(root, T::Call);
+        assert_eq!(la(hj), vec![T::Fold, T::Call, o33, o75]);
+        let co = step(hj, T::Call);
+        assert_eq!(la(co), vec![T::Fold, o33, o75]);
+        let mut id = step(co, T::Fold);
+        id = step(id, T::Fold); // BTN
+        assert_eq!(t.node(id).player_acting, 1);
+        assert_eq!(la(id), vec![T::Fold, o33, o75], "SB cannot complete");
+        let bb = step(id, T::Fold);
+        assert_eq!(la(bb), vec![T::Check, o33, o75]);
+
+        // 4: without the 1/3 pot open edges (and what hangs below them) it is `-o75-limp`.
+        let under_small_open = |id: NodeId| -> bool {
+            let mut cur = id;
+            while let Some(p) = t.node(cur).parent {
+                if t.node(p).street == StreetTag::Preflop
+                    && t.node(cur).action_from_parent == Some(o33)
+                {
+                    return true;
+                }
+                cur = p;
+            }
+            false
+        };
+        let mut rest = TreeLayoutCounts::default();
+        for id in 0..t.num_nodes() as NodeId {
+            if under_small_open(id) {
+                continue;
+            }
+            let n = t.node(id);
+            rest.nodes_by_street[n.street as usize] += 1;
+            let small = n.street == StreetTag::Preflop && n.legal_actions.contains(&o33);
+            rest.actions_by_street[n.street as usize] +=
+                n.legal_actions.len() as u64 - u64::from(small);
+        }
+        let (l_abs, l_rules) = ante_flop2_3bet_o75_limp_6max(4);
+        assert_eq!(rest, count_tree_layout(&cfg, &l_abs, l_rules));
+
+        // 5
+        let got = count_tree_layout(&cfg, &abs, rules);
+        assert_eq!(got.total_nodes(), t.num_nodes() as u64);
+        let (d_abs, d_rules) =
+            six_max_reshape("ante-flop2-3bet-o75-limp-open2", 4).expect("registered");
+        assert_eq!(count_tree_layout(&cfg, &d_abs, d_rules), got);
+        assert!(SIX_MAX_RESHAPE_NAMES.contains("ante-flop2-3bet-o75-limp-open2"));
     }
 
     /// 结构守门：`ante-flop2-3bet-o75`（[`ante_flop2_3bet_o75_6max`]，8 座 100BB 每人 1BB ante；cap 2
