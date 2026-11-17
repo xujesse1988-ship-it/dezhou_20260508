@@ -169,6 +169,15 @@ def add_advisor_args(p, default_seats, debug_help):
     p.add_argument("--preflop-commit-min-visits", type=int, default=None)
     # 上面「押上大半筹码」的比例（advisor 默认 0.5）：加注新投入 ≥ 还能输的筹码 × 这个比例。
     p.add_argument("--preflop-commit-share", type=float, default=None)
+    # 平跟线上的大额全下不用（advisor 默认关）：这手有非盲注位平跟、hero 的全下超过这么多倍底池时，
+    # 按样本少的行同样处理（全下那份概率挪走）。针对牌池训练的 blueprint 用 2。不依赖 --search。
+    p.add_argument("--preflop-limp-jam-max-pot", type=float, default=None)
+    # blueprint 训练时的抽水（= train_cfr --rake-bps / --rake-cap；万分比、每座封顶 solver 筹码，BB = 100）。
+    # 缺省 0 = 不抽水，不透传。不符 → advisor 加载 blueprint 时指纹对不上、直接报错。
+    p.add_argument("--rake-bps", type=int, default=0)
+    p.add_argument("--rake-cap", type=int, default=0)
+    # crop 的策略表按 f32 存（advisor 默认 off = f64）：内存减半，概率差约 1e-7。只对 --cropped-checkpoint。
+    p.add_argument("--crop-f32", choices=["on", "off"], default=None)
     # hero 真实手牌单独信息集 + 强制发牌（advisor 默认关）：hero 当遍历者时以比例 q 直接发真实底牌，
     # 0 = 只开专用信息集。不传 = 关。
     p.add_argument("--search-real-hand-q", type=float, default=None)
@@ -262,6 +271,14 @@ def validate_advisor_args(args):
         raise SystemExit("--preflop-commit-min-visits 须 ≥ 0")
     if args.preflop_commit_share is not None and not 0.0 < args.preflop_commit_share <= 1.0:
         raise SystemExit("--preflop-commit-share 须在 (0, 1]")
+    if args.preflop_limp_jam_max_pot is not None and not args.preflop_limp_jam_max_pot > 0.0:
+        raise SystemExit("--preflop-limp-jam-max-pot 须 > 0（底池倍数）")
+    if not 0 <= args.rake_bps <= 10000 or args.rake_cap < 0:
+        raise SystemExit("--rake-bps 须在 [0, 10000]，--rake-cap 须 ≥ 0")
+    if args.rake_cap and not args.rake_bps:
+        raise SystemExit("--rake-cap 需配 --rake-bps（不抽水时封顶不起作用）")
+    if args.crop_f32 is not None and args.cropped_checkpoint is None:
+        raise SystemExit("--crop-f32 只对 --cropped-checkpoint 有意义")
     if args.search_real_hand_q is not None and not args.search:
         raise SystemExit("--search-real-hand-q 需配 --search（它只管搜索求解）")
     if args.search_real_hand_q is not None and not 0.0 <= args.search_real_hand_q <= 1.0:
@@ -296,6 +313,14 @@ def advisor_extra_args(args, warm_profile_hh=None):
         extra += ["--preflop-commit-min-visits", str(args.preflop_commit_min_visits)]
     if args.preflop_commit_share is not None:
         extra += ["--preflop-commit-share", str(args.preflop_commit_share)]
+    if args.preflop_limp_jam_max_pot is not None:
+        extra += ["--preflop-limp-jam-max-pot", repr(args.preflop_limp_jam_max_pot)]
+    if args.rake_bps:
+        extra += ["--rake-bps", str(args.rake_bps)]
+        if args.rake_cap:
+            extra += ["--rake-cap", str(args.rake_cap)]
+    if args.crop_f32 is not None:
+        extra += ["--crop-f32", args.crop_f32]
     if args.search:
         extra.append("--search")
         if args.search_iterations is not None:

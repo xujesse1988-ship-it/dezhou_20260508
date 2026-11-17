@@ -337,6 +337,37 @@ class ManagerTests(unittest.TestCase):
                          ["--exploit-4bet", "on", "--exploit-4bet-state",
                           os.path.abspath("state/fourbet.json")])
 
+    def test_blueprint_rake_f32_and_limp_jam_gate_pass_through(self):
+        import argparse
+        from poker_live.advisor_client import (add_advisor_args, advisor_extra_args,
+                                               validate_advisor_args)
+        parser = argparse.ArgumentParser()
+        add_advisor_args(parser, default_seats=6, debug_help="")
+        base = ["--cropped-checkpoint", "x.crop", "--bucket-table", "t.bin", "--search",
+                "--search-trigger", "all-postflop"]
+        args = parser.parse_args(base)
+        validate_advisor_args(args)
+        extra = advisor_extra_args(args)
+        for flag in ("--rake-bps", "--rake-cap", "--crop-f32", "--preflop-limp-jam-max-pot"):
+            self.assertNotIn(flag, extra)
+        args = parser.parse_args(base + ["--rake-bps", "400", "--rake-cap", "1000",
+                                         "--crop-f32", "on",
+                                         "--preflop-limp-jam-max-pot", "2"])
+        validate_advisor_args(args)
+        extra = advisor_extra_args(args)
+        i = extra.index("--rake-bps")
+        self.assertEqual(extra[i:i + 4], ["--rake-bps", "400", "--rake-cap", "1000"])
+        self.assertEqual(extra[extra.index("--crop-f32") + 1], "on")
+        self.assertEqual(extra[extra.index("--preflop-limp-jam-max-pot") + 1], "2.0")
+        err = io.StringIO()
+        for bad in (["--rake-cap", "1000"], ["--rake-bps", "10001"],
+                    ["--preflop-limp-jam-max-pot", "0"]):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+                validate_advisor_args(parser.parse_args(base + bad))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            validate_advisor_args(parser.parse_args(
+                ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin", "--crop-f32", "on"]))
+
     def test_street_iterations_pass_through(self):
         import argparse
         from poker_live.advisor_client import (add_advisor_args, advisor_extra_args,

@@ -69,6 +69,9 @@
 //!   blueprint 的 100BB config（10000 筹码）近似，driver 靠买入锁 2000 + 栈漂出 [80,125]BB leave/rejoin 兜。
 //! - 对手 open-limp：no-limp blueprint 无对应节点 → preflop 走 [`limp_heuristic`] 矩阵
 //!   （好牌 iso-raise / 顶级面对加注 call / 其余免费 check 或 fold）；postflop 由脱锚搜索接管。
+//!   带平跟的树（`-limp` 系 reshape，`limp_line_width`）：名额内的平跟（含 hero 自己的）就是树里的节点，
+//!   翻前翻后都照常走 blueprint / 锚定搜索；只有树里没有节点的跟注（名额满之后的平跟、加注后的冷跟）
+//!   才走上面的映射和启发式。
 //! - 短桌手（N 座只发 k<N 家）：driver 送 `dealt_seats`（`table_state.seats[].in_hand` 推断）时
 //!   走**幻影座映射**（[`seat_map`]：k 人局映成 N-max 树「UTG 侧前 N−k 位先 fold」的真实节点、
 //!   盲注对齐；k=2 按 OpenPoker 实测 HU 约定 button=BB 映 SB/BB→树座 1/2）；占座不可判
@@ -98,7 +101,7 @@ use poker::training::nlhe_betting_tree::{
     deep_menu_for, six_max_reshape, AbstractActionTag, Child, NodeId, PublicBettingTree,
     SIX_MAX_RESHAPE_NAMES,
 };
-use poker::training::nlhe_dense_crop::CroppedBlueprint;
+use poker::training::nlhe_dense_crop::{CropPrecision, CroppedBlueprint};
 use poker::training::nlhe_dense_trainer::DenseNlheEsMccfrTrainer;
 use poker::training::openpoker_hh::{hh_record_to_observe, hist_to_concrete, HhRecord};
 use poker::training::opponent_profile::{
@@ -2945,6 +2948,17 @@ struct PreflopVisitGate<'a> {
     /// See [`DEFAULT_PREFLOP_COMMIT_SHARE`].
     commit_share: f64,
     row_weight: &'a dyn Fn(&InfoSetId) -> Option<f64>,
+    /// `--preflop-limp-jam-max-pot <x>`: on a limp line ([`has_open_limp`]) hero's all-in raising more than
+    /// `x` pots ([`hero_jam_pots`]) is not used; the row is handled like one with too few samples
+    /// ([`low_visits_no_commit`]). `None` = off.
+    ///
+    /// Why: a blueprint trained against the pool model (`train_cfr --pool-model`) learned these all-ins
+    /// against opponents who call a 200BB shove as often as any 3bet: the pool model's cell for a player
+    /// who already entered and faces a 3bet has no raise-size dimension. In the 22B `-limp-open2` blueprint,
+    /// after two limps and a small raise the seats still to act shove 77+ / ATo+ / KJs+ almost always, and
+    /// against the blueprint's own replies about 60% of that range loses to folding (audit of 2026-11-17).
+    /// The model's size-aware cells stop at "more than 2 pots", where the pool folded 15 times out of 17.
+    limp_jam_max_pot: Option<f64>,
 }
 
 /// [`decide`] + PM-17 识别器（`fourbet`，`--exploit-4bet on` 时为 `Some`）。`None` 时与 [`decide`]
@@ -3577,7 +3591,7 @@ fn decide_with(
     let bp_row_weight = visit_gate
         .filter(|_| board.is_empty() && !want_search)
         .and_then(|g| (g.row_weight)(&info));
-    let low_visits_no_commit = match (visit_gate, bp_row_weight) {
+    let low_visits_gate = match (visit_gate, bp_row_weight) {
         (Some(g), Some(w))
             if w < g.min_visits as f64 && allin_spot.is_none() && req.valid.can_raise =>
         {
@@ -3606,16 +3620,63 @@ fn decide_with(
         }
         _ => None,
     };
-    let adjusted: &[(AbstractAction, f64)] = low_visits_no_commit.as_deref().unwrap_or(adjusted);
+    let adjusted: &[(AbstractAction, f64)] = low_visits_gate.as_deref().unwrap_or(adjusted);
+    let goes_allin = |a: AbstractAction| raise_goes_allin(outgoing_state, outgoing_abs, a);
+    let has_allin = |d: &[(AbstractAction, f64)]| {
+        d.iter()
+            .any(|&(a, p)| p > 0.0 && (matches!(a, AbstractAction::AllIn { .. }) || goes_allin(a)))
+    };
+    // Limp line: an all-in far over the pot is not used ([`PreflopVisitGate::limp_jam_max_pot`]); the row
+    // goes through the same redistribution as a low-weight row. Same exemptions: hero can only call.
+    let limp_jam_gate = match visit_gate.and_then(|g| g.limp_jam_max_pot.map(|x| (g, x))) {
+        Some((g, max_pot))
+            if board.is_empty()
+                && !want_search
+                && allin_spot.is_none()
+                && req.valid.can_raise
+                // What would be sampled: an all-in under the sampling floor is dropped anyway.
+                && has_allin(&prune_for_sampling(adjusted, postflop_spr(outgoing_state)))
+                && has_open_limp(req, &smap) =>
+        {
+            hero_jam_pots(req, &solver_cfg, scale, &smap, my_seat_solver, hole)
+                .filter(|&pots| pots > max_pot)
+                .and_then(|pots| {
+                    let behind = low_visits_stack_behind(
+                        req,
+                        &solver_cfg,
+                        scale,
+                        &smap,
+                        my_seat_solver,
+                        hole,
+                        outgoing_state,
+                    );
+                    let d = low_visits_no_commit(
+                        &prune_for_sampling(adjusted, postflop_spr(outgoing_state)),
+                        outgoing_state,
+                        &legal_abs,
+                        solver_cfg.preflop_blind(),
+                        &|a| {
+                            commits_share_of_stack(
+                                outgoing_state,
+                                outgoing_abs,
+                                a,
+                                behind,
+                                g.commit_share,
+                            )
+                        },
+                        low_visits_call_hand(hole),
+                    );
+                    dlog!("limp line all-in of {pots:.2} pots: {adjusted:?} → {d:?}");
+                    d
+                })
+        }
+        _ => None,
+    };
+    let adjusted: &[(AbstractAction, f64)] = limp_jam_gate.as_deref().unwrap_or(adjusted);
     // 翻前深码：hero 实际押上的码深超过 blueprint 码深 140% → 不按 blueprint 全下
     // （[`deep_preflop_no_allin`]）。分布里没有全下（含发出去是全下的加注档）时不重放真栈（不多花时间，
     // 旧路径 byte-equal）。
-    let goes_allin = |a: AbstractAction| raise_goes_allin(outgoing_state, outgoing_abs, a);
-    let deep_no_allin = if board.is_empty()
-        && adjusted
-            .iter()
-            .any(|&(a, p)| p > 0.0 && (matches!(a, AbstractAction::AllIn { .. }) || goes_allin(a)))
-    {
+    let deep_no_allin = if board.is_empty() && has_allin(adjusted) {
         preflop_hero_eff_stack(req, &solver_cfg, scale, &smap, my_seat_solver, hole)
             .filter(|&eff| {
                 eff * 100 > solver_cfg.starting_stacks[0].as_u64() * PREFLOP_BLUEPRINT_MAX_EFF_PCT
@@ -3679,7 +3740,7 @@ fn decide_with(
         // 合法动作：填 source（search / blueprint）+ 诊断。不合法时 action_to_response 已产
         // safe_fallback（source = fallback:...），不覆盖。bet/raise 退成 call/check 时追加降级标记。
         resp.source = format!(
-            "{}{}{}{}{}{}{}{}",
+            "{}{}{}{}{}{}{}{}{}",
             if low_visits_bp {
                 "blueprint:low_hero_visits"
             } else if placeholder_search {
@@ -3705,8 +3766,13 @@ fn decide_with(
             } else {
                 ""
             },
-            if low_visits_no_commit.is_some() {
+            if low_visits_gate.is_some() {
                 ":low_visits_no_commit"
+            } else {
+                ""
+            },
+            if limp_jam_gate.is_some() {
+                ":limp_jam_gate"
             } else {
                 ""
             },
@@ -5045,6 +5111,46 @@ fn commits_share_of_stack(
         Ok(Action::Call) => state.legal_actions().call.is_some_and(reaches),
         _ => false,
     }
+}
+
+/// Whether the hand is on the tree's limp line (`BettingAbstractionRules::limp_line_width`): before the
+/// first raise, a seat that posted no blind called.
+fn has_open_limp(req: &Request, smap: &SeatMap) -> bool {
+    // Tree seats: 0 = button, 1 = SB, 2 = BB, 3 = the straddle when there is one.
+    let last_blind = if req.straddle > 0 { 3 } else { 2 };
+    req.actions
+        .iter()
+        .take_while(|h| !matches!(h.action.as_str(), "raise" | "all_in" | "bet"))
+        .any(|h| {
+            h.action == "call"
+                && smap
+                    .tree_seat(h.seat)
+                    .is_ok_and(|t| t == 0 || t > last_blind)
+        })
+}
+
+/// How far over the pot hero's preflop all-in is, in pots, at real stacks: hero puts in the effective stack
+/// ([`preflop_hero_eff_stack`]), measured like the abstraction's raise sizes ([`raise_pot_milli`]: the part
+/// above the call, over the pot after the call). `None`: the real-stack replay fails, or the all-in does
+/// not raise.
+fn hero_jam_pots(
+    req: &Request,
+    solver_cfg: &TableConfig,
+    scale: u64,
+    smap: &SeatMap,
+    hero: SeatId,
+    hole: [Card; 2],
+) -> Option<f64> {
+    let (auth, ..) = build_real_auth(req, solver_cfg, scale, smap, hero, hole, &[], true).ok()?;
+    let real_cfg = real_stacks_config(req, solver_cfg, scale, smap).ok()?;
+    let eff = preflop_hero_eff_stack(req, solver_cfg, scale, smap, hero, hole)?;
+    let h = hero.0 as usize;
+    let p = &auth.players()[h];
+    let put_in = real_cfg.starting_stacks[h]
+        .as_u64()
+        .saturating_sub(p.stack.as_u64());
+    let to = p.committed_this_round.as_u64() + eff.saturating_sub(put_in);
+    raise_pot_milli(raise_geometry(&auth)?, to).map(|m| m as f64 / 1000.0)
 }
 
 /// QQ+ and AK: on a low-weight row their committing mass goes to the call ([`low_visits_no_commit`]).
@@ -6458,6 +6564,7 @@ fn load_blueprint(
     path: &std::path::Path,
     game: SimplifiedNlheGame,
     cropped: bool,
+    crop_precision: CropPrecision,
 ) -> Result<Blueprint, String> {
     let hint = match (cropped, sniff_magic(path)) {
         (false, Some(m)) if &m == b"PLDNCROP" => "（这是 crop 文件，请改用 --cropped-checkpoint）",
@@ -6467,7 +6574,7 @@ fn load_blueprint(
         _ => "",
     };
     if cropped {
-        let bp = CroppedBlueprint::load(path, &game).map_err(|e| {
+        let bp = CroppedBlueprint::load_with(path, &game, crop_precision).map_err(|e| {
             format!(
                 "load cropped blueprint {} failed{hint}: {e:?}",
                 path.display()
@@ -6560,6 +6667,16 @@ struct Args {
     /// `--stack-bb <N>`：blueprint 的起始码深（BB，默认 [`DEFAULT_SOLVER_STACK_BB`] = 100）。须与训练时
     /// 的 `train_cfr --stack-bb` 相同（不符 → layout 指纹不符 → 加载报错）。
     stack_bb: u32,
+    /// `--rake-bps <n>` / `--rake-cap <chips>`: the rake the blueprint was trained with (`train_cfr`
+    /// flags of the same names; bps of a pot won outright, cap per winner in solver chips, BB = 100, 0 = no
+    /// cap). Default 0 / 0 = no rake. It is part of the layout fingerprint (a mismatch fails the load) and
+    /// of the game the advisor plays: the real-stack replay and the real-time search both pay out with it.
+    rake_bps: u32,
+    rake_cap: u64,
+    /// `--crop-f32 on|off`: keep the crop's value tables as `f32` ([`CropPrecision::F32`]), half the memory
+    /// (probabilities move by about 1e-7). Default off = `f64`, bit-identical to the trainer. Only with
+    /// `--cropped-checkpoint`.
+    crop_f32: bool,
     seed: u64,
     /// 缺口②实时搜索：`Some` = `--search` 开（postflop 触发面 re-solve 真码深子博弈）；`None`
     /// （默认）= 纯 blueprint（旧行为 byte-equal）。其余 search 字段由 `--search-*` flag 填。
@@ -6617,6 +6734,9 @@ struct Args {
     /// `--preflop-commit-share <0..=1>` ([`DEFAULT_PREFLOP_COMMIT_SHARE`]): a raise on a low-weight row
     /// adding at least this share of what hero can still lose counts as committing.
     preflop_commit_share: f64,
+    /// `--preflop-limp-jam-max-pot <x>` ([`PreflopVisitGate::limp_jam_max_pot`]). Default off (`None`).
+    /// Does not need `--search`.
+    preflop_limp_jam_max_pot: Option<f64>,
     /// `--debug-log`：打印决策流水线 + range / solve 中间数据到 **stderr**（与 `--search` 正交，
     /// blueprint 路径也打）。`false`（默认）= 静默、零开销；on 也不动 stdout（IPC byte-equal）。
     debug_log: bool,
@@ -6646,9 +6766,19 @@ struct ReadyLine {
     /// blueprint 起始码深（BB）；= 100 不写（ready 行与旧版逐字节相同）。
     #[serde(skip_serializing_if = "is_default_stack_bb")]
     stack_bb: u32,
+    /// Blueprint rake (bps) and cap (solver chips); not written when there is no rake (the ready line
+    /// stays byte-identical to older versions).
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    rake_bps: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    rake_cap: u64,
 }
 
 fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
@@ -6685,12 +6815,14 @@ fn build_game(
     ante: u64,
     stack_bb: u32,
 ) -> Result<SimplifiedNlheGame, String> {
-    build_game_with_straddle(table, reshape, cap, seats, ante, 0, stack_bb)
+    build_game_with_straddle(table, reshape, cap, seats, ante, 0, stack_bb, (0, 0))
 }
 
 /// 同 [`build_game`]，另叠 UTG 强制 straddle（`--straddle`，solver chips；0 = 没有，与 [`build_game`]
 /// 逐节点相同）：桌面 = `n_max_at_bb(seats, stack_bb).with_ante(ante).with_straddle(straddle)`，与
-/// `train_cfr --straddle` 同一定义。
+/// `train_cfr --straddle` 同一定义。`rake` = (`--rake-bps`, `--rake-cap` chips), same as `train_cfr`;
+/// `(0, 0)` = no rake, the same game as before.
+#[allow(clippy::too_many_arguments)]
 fn build_game_with_straddle(
     table: Arc<BucketTable>,
     reshape: &str,
@@ -6699,13 +6831,15 @@ fn build_game_with_straddle(
     ante: u64,
     straddle: u64,
     stack_bb: u32,
+    rake: (u32, u64),
 ) -> Result<SimplifiedNlheGame, String> {
     let (abs, rules) = reshape_profile(reshape, cap)?;
     SimplifiedNlheGame::new_with_abstraction(
         table,
         TableConfig::n_max_at_bb(seats, stack_bb)
             .with_ante(ChipAmount::new(ante))
-            .with_straddle(ChipAmount::new(straddle)),
+            .with_straddle(ChipAmount::new(straddle))
+            .with_rake(rake.0, ChipAmount::new(rake.1)),
         abs,
         rules,
     )
@@ -7053,16 +7187,23 @@ fn run() -> Result<(), String> {
         args.ante,
         args.straddle,
         args.stack_bb,
+        (args.rake_bps, args.rake_cap),
     )?;
     // blueprint 访问面（Blueprint doc）：完整 ckpt 或 crop 文件，二者都用同一 game 校验 layout 指纹。
-    let blueprint = load_blueprint(&args.checkpoint, game, args.cropped).map_err(|e| {
-        format!(
+    let crop_precision = if args.crop_f32 {
+        CropPrecision::F32
+    } else {
+        CropPrecision::F64
+    };
+    let blueprint = load_blueprint(&args.checkpoint, game, args.cropped, crop_precision)
+        .map_err(|e| {
+            format!(
             "{e}\n（若 blueprint 训练时的座位数与 --seats {} 不同、ante 与 --ante {} 不同、straddle 与 \
-             --straddle {} 不同、码深与 --stack-bb {} 不同、或 --reshape / --postflop-cap / --bucket-table \
-             不同，树的 layout 指纹不符，必然加载失败）",
-            args.seats, args.ante, args.straddle, args.stack_bb
+             --straddle {} 不同、码深与 --stack-bb {} 不同、抽水与 --rake-bps {} / --rake-cap {} 不同、\
+             或 --reshape / --postflop-cap / --bucket-table 不同，树的 layout 指纹不符，必然加载失败）",
+            args.seats, args.ante, args.straddle, args.stack_bb, args.rake_bps, args.rake_cap
         )
-    })?;
+        })?;
     let game = blueprint.game();
     let abstraction = game.abstraction().clone();
 
@@ -7103,10 +7244,11 @@ fn run() -> Result<(), String> {
     if let Blueprint::Cropped { bp, .. } = &blueprint {
         validate_crop_runtime(bp.keep_through(), search_rt.as_ref())?;
         eprintln!(
-            "[openpoker_advisor] cropped blueprint: keep_through={:?} has_regret={}（被裁街全部实时搜索；\
+            "[openpoker_advisor] cropped blueprint: keep_through={:?} has_regret={} values={}（被裁街全部实时搜索；\
              river 先验 = 上一街子树后验，缺失时按需补解上一街）",
             bp.keep_through(),
-            bp.has_regret()
+            bp.has_regret(),
+            if args.crop_f32 { "f32" } else { "f64" }
         );
     }
     let ready = ReadyLine {
@@ -7120,6 +7262,8 @@ fn run() -> Result<(), String> {
         ante: game.table_config().ante.as_u64(),
         straddle: game.table_config().straddle.as_u64(),
         stack_bb: args.stack_bb,
+        rake_bps: game.table_config().rake_bps,
+        rake_cap: game.table_config().rake_cap.as_u64(),
     };
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
@@ -7215,6 +7359,7 @@ fn run() -> Result<(), String> {
         min_visits: args.preflop_commit_min_visits,
         commit_share: args.preflop_commit_share,
         row_weight: &row_weight_fn,
+        limp_jam_max_pot: args.preflop_limp_jam_max_pot,
     };
 
     // within-round solve 缓存（进程常驻，跨请求）：同手同街第二次决策命中 → 复用 solve 只重
@@ -7366,6 +7511,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut ante = 0u64;
     let mut straddle = 0u64;
     let mut stack_bb = DEFAULT_SOLVER_STACK_BB;
+    let mut rake_bps = 0u32;
+    let mut rake_cap = 0u64;
+    let mut crop_f32: Option<bool> = None;
     let mut seed: u64 = 0;
     // 缺口② 实时搜索 flag（仅 --search 开时打包成 SubgameSearchConfig）。
     let mut search_on = false;
@@ -7409,6 +7557,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut exploit_4bet_state: Option<PathBuf> = None;
     let mut preflop_commit_min_visits = DEFAULT_PREFLOP_COMMIT_MIN_VISITS;
     let mut preflop_commit_share = DEFAULT_PREFLOP_COMMIT_SHARE;
+    let mut preflop_limp_jam_max_pot: Option<f64> = None;
     let mut debug_log = false;
     let mut range_log: Option<PathBuf> = None;
     while let Some(arg) = it.next() {
@@ -7468,6 +7617,28 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     return Err(format!("--stack-bb 须在 [2,1000]，得 {v}"));
                 }
                 stack_bb = v;
+            }
+            "--rake-bps" => {
+                let v: u32 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad rake-bps: {e}"))?;
+                // Same range as train_cfr --rake-bps (TableConfig::rake_valid).
+                if v > 10_000 {
+                    return Err(format!("--rake-bps 是万分比，须 ≤ 10000，得 {v}"));
+                }
+                rake_bps = v;
+            }
+            "--rake-cap" => {
+                rake_cap = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad rake-cap: {e}"))?;
+            }
+            "--crop-f32" => {
+                crop_f32 = Some(match next_val(&mut it, &arg)?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => return Err(format!("--crop-f32 须为 on|off，得 {other}")),
+                });
             }
             "--seed" => {
                 let raw = next_val(&mut it, &arg)?;
@@ -7638,6 +7809,17 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                         "preflop-commit-share must be in (0, 1], got {preflop_commit_share}"
                     ));
                 }
+            }
+            "--preflop-limp-jam-max-pot" => {
+                let v: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad preflop-limp-jam-max-pot: {e}"))?;
+                if !(v.is_finite() && v > 0.0) {
+                    return Err(format!(
+                        "preflop-limp-jam-max-pot must be a positive number of pots, got {v}"
+                    ));
+                }
+                preflop_limp_jam_max_pot = Some(v);
             }
             "--search-min-hero-visits" => {
                 search_min_hero_visits = Some(
@@ -7946,6 +8128,12 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         }
         (None, None) => return Err("缺 --checkpoint（或 --cropped-checkpoint）".to_string()),
     };
+    if crop_f32.is_some() && !cropped {
+        return Err("--crop-f32 只对 --cropped-checkpoint 有意义（拒绝静默忽略）".to_string());
+    }
+    if rake_cap != 0 && rake_bps == 0 {
+        return Err("--rake-cap 需要 --rake-bps（不抽水时封顶不起作用，拒绝静默忽略）".to_string());
+    }
     let exploit = exploit_on.then(|| {
         let d = ExploitConfig::default();
         ExploitConfig {
@@ -7969,6 +8157,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         ante,
         straddle,
         stack_bb,
+        rake_bps,
+        rake_cap,
+        crop_f32: crop_f32.unwrap_or(false),
         seed,
         search,
         search_street_iters,
@@ -7978,6 +8169,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         exploit_4bet_state,
         preflop_commit_min_visits,
         preflop_commit_share,
+        preflop_limp_jam_max_pot,
         // 默认开（§5.1 实测拍板）；--search-unanchored-prefix-reach off 显式关。
         search_unanchored_prefix_reach: search_unanchored_prefix_reach
             .unwrap_or(DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH),
@@ -12751,6 +12943,7 @@ mod tests {
                     min_visits: 50_000,
                     commit_share: DEFAULT_PREFLOP_COMMIT_SHARE,
                     row_weight: &row_weight,
+                    limp_jam_max_pot: None,
                 }),
             )
         };
@@ -13260,6 +13453,7 @@ mod tests {
                     min_visits,
                     commit_share: DEFAULT_PREFLOP_COMMIT_SHARE,
                     row_weight: &row_weight,
+                    limp_jam_max_pot: None,
                 }),
             )
         };
@@ -16594,8 +16788,10 @@ mod tests {
     #[test]
     fn cropped_blueprint_preflop_flop_bitwise_equal() {
         let (_dir, full_p, crop_p) = crop_fixture("eq");
-        let full = load_blueprint(&full_p, crop_test_game(), false).expect("load full");
-        let crop = load_blueprint(&crop_p, crop_test_game(), true).expect("load crop");
+        let full = load_blueprint(&full_p, crop_test_game(), false, CropPrecision::F64)
+            .expect("load full");
+        let crop =
+            load_blueprint(&crop_p, crop_test_game(), true, CropPrecision::F64).expect("load crop");
         assert_eq!(crop.keep_through(), StreetTag::Flop);
         assert_eq!(full.update_count(), crop.update_count());
         let game = full.game();
@@ -16785,11 +16981,11 @@ mod tests {
         assert!(!full.strategy(&turn_info).is_empty() || full.cropped_queries() == 0);
 
         // 错用 flag：crop 文件走 --checkpoint / 完整 ckpt 走 --cropped-checkpoint → 拒绝 + 提示。
-        let e = load_blueprint(&crop_p, crop_test_game(), false)
+        let e = load_blueprint(&crop_p, crop_test_game(), false, CropPrecision::F64)
             .err()
             .expect("crop 当完整加载须失败");
         assert!(e.contains("--cropped-checkpoint"), "{e}");
-        let e = load_blueprint(&full_p, crop_test_game(), true)
+        let e = load_blueprint(&full_p, crop_test_game(), true, CropPrecision::F64)
             .err()
             .expect("完整当 crop 加载须失败");
         assert!(e.contains("--checkpoint"), "{e}");
@@ -16809,8 +17005,10 @@ mod tests {
     #[test]
     fn cropped_blueprint_turn_river_search_only() {
         let (_dir, full_p, crop_p) = crop_fixture("tr");
-        let full = load_blueprint(&full_p, crop_test_game(), false).expect("load full");
-        let crop = load_blueprint(&crop_p, crop_test_game(), true).expect("load crop");
+        let full = load_blueprint(&full_p, crop_test_game(), false, CropPrecision::F64)
+            .expect("load full");
+        let crop =
+            load_blueprint(&crop_p, crop_test_game(), true, CropPrecision::F64).expect("load crop");
         let game = crop.game();
         let abs = game.abstraction().clone();
         let sf = |i: &InfoSetId, _n: usize| full.strategy(i);
@@ -17044,8 +17242,10 @@ mod tests {
     #[test]
     fn cropped_blueprint_unanchored_river() {
         let (_dir, full_p, crop_p) = crop_fixture("un");
-        let full = load_blueprint(&full_p, crop_test_game(), false).expect("load full");
-        let crop = load_blueprint(&crop_p, crop_test_game(), true).expect("load crop");
+        let full = load_blueprint(&full_p, crop_test_game(), false, CropPrecision::F64)
+            .expect("load full");
+        let crop =
+            load_blueprint(&crop_p, crop_test_game(), true, CropPrecision::F64).expect("load crop");
         let game = crop.game();
         let abs = game.abstraction().clone();
         let sf = |i: &InfoSetId, _n: usize| full.strategy(i);
@@ -17499,6 +17699,7 @@ mod tests {
             50,
             200,
             DEFAULT_SOLVER_STACK_BB,
+            (0, 0),
         )
         .expect("8-max straddle game");
         let g_plain = build_game(table, "all-1pot", 2, 8, 50, DEFAULT_SOLVER_STACK_BB)
@@ -18037,6 +18238,380 @@ mod tests {
         }
     }
 
+    /// `ante-flop2-3bet-o75-limp-open2` (6 seats, 30BB, cap 4 so the limp line holds three players;
+    /// blinds 10/20, ante 20, scale 5; button 0, SB 1, BB 2, UTG 3, HJ 4, CO 5). Real open-limps land on the tree's own limp nodes while the limp line has room,
+    /// and only the ones the tree has no node for go through the limp-as-fold mapping:
+    /// 1. hero first in: the node has a limp, the decision is the blueprint's;
+    /// 2. one limper: synced, no mapping, hero (CO) may limp behind, raise either open size or fold;
+    /// 3. two limpers: synced, no mapping, hero has no call left (fold or raise), blueprint decides;
+    /// 4. a third limper has no node: structural gap, or one mapped fold with limp-as-fold on;
+    /// 5. limp, raise, one cold call: all in the tree (three players), hero as the fourth cannot call;
+    /// 6. two limps, raise, cold call: the cold call has no node (the line is full), mapped like a limp;
+    /// 7. limp, SB completes, BB checks: the flop is reached in sync, hero (SB) is on a blueprint node.
+    #[test]
+    fn limp_open2_tree_takes_real_limps() {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let game = build_game(table, "ante-flop2-3bet-o75-limp-open2", 4, 6, 100, 30)
+            .expect("6-max limp-open2 game");
+        let abs = game.abstraction().clone();
+        let solver_cfg = game.table_config().clone();
+        let req_with = |my: u8, actions: Vec<HistAction>| Request {
+            ante: 20,
+            actions,
+            ..n_req(6, 0, my, vec![])
+        };
+        let replay = |req: &Request, limp_as_fold: bool| {
+            let smap = seat_map(req, 6).expect("seat_map");
+            let my = SeatId(smap.tree_seat(req.my_seat).unwrap());
+            lockstep_replay(
+                &game,
+                &solver_cfg,
+                &smap,
+                req,
+                5,
+                req.board.len(),
+                Some(my),
+                limp_as_fold,
+            )
+        };
+        let tags = |abs_state: &SimplifiedNlheState| -> Vec<AbstractActionTag> {
+            game.tree()
+                .node(abs_state.current_node_id)
+                .legal_actions
+                .to_vec()
+        };
+        let has = |t: &[AbstractActionTag], tag: AbstractActionTag| t.contains(&tag);
+        let raises = |t: &[AbstractActionTag]| -> Vec<u32> {
+            t.iter()
+                .filter_map(|t| match t {
+                    AbstractActionTag::Raise(r) => Some(r.as_milli()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let bp = |req: &Request| {
+            decide(
+                &game,
+                &abs,
+                &uniform,
+                req,
+                0,
+                None,
+                &mut SubgameSolveCache::new(),
+            )
+        };
+        let folds = |seats: &[u8]| -> Vec<HistAction> {
+            seats.iter().map(|&s| hist(s, "fold", None)).collect()
+        };
+
+        // 1. hero UTG first in.
+        let req = req_with(3, vec![]);
+        let (_, st, limp, _) = replay(&req, true).expect("first in");
+        assert!(!limp.mapped());
+        let t = tags(&st);
+        assert!(has(&t, AbstractActionTag::Call) && has(&t, AbstractActionTag::Fold));
+        assert_eq!(raises(&t), vec![333, 750], "{t:?}");
+        assert!(!has(&t, AbstractActionTag::AllIn));
+        let r = bp(&req);
+        assert_eq!(r.source, "blueprint", "{r:?}");
+
+        // 2. one limper, hero CO.
+        let mut acts = vec![hist(3, "call", None)];
+        acts.extend(folds(&[4]));
+        let req = req_with(5, acts);
+        let (_, st, limp, _) = replay(&req, true).expect("one limper");
+        assert!(!limp.mapped(), "{limp:?}");
+        let t = tags(&st);
+        assert!(has(&t, AbstractActionTag::Call), "{t:?}");
+        assert_eq!(raises(&t), vec![333, 750], "{t:?}");
+        let r = bp(&req);
+        assert_eq!(r.source, "blueprint", "{r:?}");
+        assert!(is_legal(&r, &req.valid), "{r:?}");
+
+        // 3. two limpers, hero CO: the line is full.
+        let req = req_with(5, vec![hist(3, "call", None), hist(4, "call", None)]);
+        let (_, st, limp, _) = replay(&req, true).expect("two limpers");
+        assert!(!limp.mapped(), "{limp:?}");
+        let t = tags(&st);
+        assert!(!has(&t, AbstractActionTag::Call), "{t:?}");
+        assert!(has(&t, AbstractActionTag::Fold) && !raises(&t).is_empty());
+        for seed in 0..8 {
+            let r = decide(
+                &game,
+                &abs,
+                &uniform,
+                &req,
+                seed,
+                None,
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(r.source, "blueprint", "{r:?}");
+            assert_ne!(r.action, "call", "{r:?}");
+        }
+
+        // 4. three limpers, hero BTN.
+        let req = req_with(0, [3, 4, 5].map(|s| hist(s, "call", None)).into());
+        let e = replay(&req, false).expect_err("third limper has no node");
+        assert_eq!(e.reason, "structural_gap");
+        let (_, _, limp, _) = replay(&req, true).expect("third limper mapped");
+        let smap = seat_map(&req, 6).unwrap();
+        let tree5 = smap.tree_seat(5).unwrap() as PlayerId;
+        assert_eq!(limp.folds.len(), 1, "{limp:?}");
+        assert_eq!(limp.folds[0].1, tree5);
+
+        // 5. limp, raise, cold call: three players, all in the tree; hero cannot be the fourth caller.
+        let acts = vec![
+            hist(3, "call", None),
+            hist(4, "raise", Some(85)),
+            hist(5, "call", None),
+        ];
+        let req = req_with(0, acts);
+        let (_, st, limp, _) = replay(&req, true).expect("limp, raise, call");
+        assert!(!limp.mapped(), "{limp:?}");
+        let t = tags(&st);
+        assert!(!has(&t, AbstractActionTag::Call), "{t:?}");
+        let r = bp(&req);
+        assert_eq!(r.source, "blueprint", "{r:?}");
+
+        // 6. two limps, raise, cold call: no node for the cold call.
+        let acts = vec![
+            hist(3, "call", None),
+            hist(4, "call", None),
+            hist(5, "raise", Some(90)),
+            hist(0, "call", None),
+        ];
+        let req = req_with(1, acts);
+        let e = replay(&req, false).expect_err("cold call has no node");
+        assert_eq!(e.reason, "structural_gap");
+        let (_, _, limp, _) = replay(&req, true).expect("cold call mapped");
+        let tree0 = smap.tree_seat(0).unwrap() as PlayerId;
+        assert_eq!(limp.folds.len(), 1, "{limp:?}");
+        assert_eq!(limp.folds[0].1, tree0);
+
+        // 7. limped pot reaches the flop in sync; hero (SB) acts first on a blueprint node.
+        let mut acts = vec![hist(3, "call", None)];
+        acts.extend(folds(&[4, 5, 0]));
+        acts.push(hist(1, "call", None));
+        acts.push(hist(2, "check", None));
+        let mut req = req_with(1, acts);
+        req.board = vec!["2c".into(), "7d".into(), "Js".into()];
+        req.valid = ValidActions {
+            can_check: true,
+            can_call: false,
+            can_raise: true,
+            min_raise: Some(20),
+            max_raise: Some(560),
+        };
+        let (real, st, limp, _) = replay(&req, true).expect("limped pot flop");
+        assert!(!limp.mapped(), "{limp:?}");
+        assert_eq!(real.street(), poker::Street::Flop);
+        assert_eq!(game.tree().node(st.current_node_id).street, StreetTag::Flop);
+        let r = bp(&req);
+        assert_eq!(r.source, "blueprint", "{r:?}");
+        assert!(is_legal(&r, &req.valid), "{r:?}");
+    }
+
+    /// `--preflop-limp-jam-max-pot` on the limp tree (6 seats, 30BB, uniform strategy; blinds 10/20, ante
+    /// 20): two limps, CO raises, hero in the SB can only fold or re-raise in the tree, and his all-in is
+    /// 1.36 pots over the pot.
+    /// - threshold below that: never an all-in, source tagged `:limp_jam_gate`, the blueprint dist still
+    ///   logged; the all-in mass goes to the real call (the node has none);
+    /// - threshold above it, gate off, or no gate: the plain blueprint response, which does shove;
+    /// - same raise without the limps: untouched whatever the threshold;
+    /// - [`has_open_limp`]: a blind completing is not a limp, the button's call is.
+    #[test]
+    fn limp_line_jam_gate() {
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let uniform = |_i: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let game = build_game(table, "ante-flop2-3bet-o75-limp-open2", 4, 6, 100, 30)
+            .expect("6-max limp-open2 game");
+        let abs = game.abstraction().clone();
+        let solver_cfg = game.table_config().clone();
+        let run = |r: &Request, seed: u64, max_pot: Option<f64>| {
+            let row_weight = |_i: &InfoSetId| Some(1e9);
+            decide_with(
+                &game,
+                &abs,
+                &uniform,
+                r,
+                seed,
+                None,
+                &mut SubgameSolveCache::new(),
+                None,
+                Some(PreflopVisitGate {
+                    min_visits: DEFAULT_PREFLOP_COMMIT_MIN_VISITS,
+                    commit_share: DEFAULT_PREFLOP_COMMIT_SHARE,
+                    row_weight: &row_weight,
+                    limp_jam_max_pot: max_pot,
+                }),
+            )
+        };
+        let req_with = |actions: Vec<HistAction>| Request {
+            ante: 20,
+            actions,
+            valid: ValidActions {
+                can_check: false,
+                can_call: true,
+                can_raise: true,
+                min_raise: Some(160),
+                max_raise: Some(580),
+            },
+            ..n_req(6, 0, 1, vec![])
+        };
+        let limped = req_with(vec![
+            hist(3, "call", None),
+            hist(4, "call", None),
+            hist(5, "raise", Some(90)),
+            hist(0, "fold", None),
+        ]);
+        let unlimped = req_with(vec![
+            hist(3, "fold", None),
+            hist(4, "fold", None),
+            hist(5, "raise", Some(90)),
+            hist(0, "fold", None),
+        ]);
+        let smap = seat_map(&limped, 6).unwrap();
+        assert!(has_open_limp(&limped, &smap));
+        assert!(!has_open_limp(&unlimped, &smap));
+        let sb_completes = req_with(vec![
+            hist(3, "fold", None),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "fold", None),
+            hist(1, "call", None),
+        ]);
+        assert!(!has_open_limp(&sb_completes, &smap));
+        let btn_limps = req_with(vec![
+            hist(3, "fold", None),
+            hist(4, "fold", None),
+            hist(5, "fold", None),
+            hist(0, "call", None),
+        ]);
+        assert!(has_open_limp(&btn_limps, &smap));
+
+        let hole = [parse_card("Ah").unwrap(), parse_card("Kd").unwrap()];
+        let pots = hero_jam_pots(&limped, &solver_cfg, 5, &smap, SeatId(1), hole).expect("pots");
+        // Pot 120 + 30 + 40 + 90 = 280, 360 after the call; the all-in goes to 580, 490 over the raise.
+        assert!((pots - 490.0 / 360.0).abs() < 2e-3, "{pots}");
+
+        let (mut shoved, mut called) = (0, 0);
+        for seed in 0..40u64 {
+            let plain = decide(
+                &game,
+                &abs,
+                &uniform,
+                &limped,
+                seed,
+                None,
+                &mut SubgameSolveCache::new(),
+            );
+            assert_eq!(plain.source, "blueprint", "{plain:?}");
+            shoved += usize::from(plain.chosen.as_deref() == Some("allin"));
+            for off in [None, Some(1.5)] {
+                let mut g = run(&limped, seed, off);
+                assert_eq!(g.bp_row_weight.take(), Some(1e9));
+                assert_eq!(g, plain, "seed {seed} {off:?}");
+            }
+            let g = run(&limped, seed, Some(1.0));
+            assert_eq!(g.source, "blueprint:limp_jam_gate", "{g:?}");
+            assert_ne!(g.chosen.as_deref(), Some("allin"), "{g:?}");
+            assert_ne!(g.action, "all_in", "{g:?}");
+            assert_ne!(g.amount, Some(580), "{g:?}");
+            let probs = g.probs.as_ref().expect("probs keep the blueprint dist");
+            assert!(probs.iter().any(|(l, p)| l == "allin" && *p > 0.0), "{g:?}");
+            called += usize::from(g.action == "call");
+
+            let plain = decide(
+                &game,
+                &abs,
+                &uniform,
+                &unlimped,
+                seed,
+                None,
+                &mut SubgameSolveCache::new(),
+            );
+            let mut g = run(&unlimped, seed, Some(1.0));
+            assert_eq!(g.bp_row_weight.take(), Some(1e9));
+            assert_eq!(g, plain, "no limp, seed {seed}");
+        }
+        assert!(shoved > 0, "the uniform dist samples the all-in");
+        assert!(called > 0, "the all-in mass went to the real call");
+
+        let parse = |extra: &[&str]| {
+            parse_args_from(
+                ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                    .iter()
+                    .chain(extra)
+                    .map(|s| s.to_string()),
+            )
+        };
+        assert_eq!(parse(&[]).unwrap().preflop_limp_jam_max_pot, None);
+        let a = parse(&["--preflop-limp-jam-max-pot", "2"]).unwrap();
+        assert_eq!(a.preflop_limp_jam_max_pot, Some(2.0));
+        for bad in ["0", "-1", "NaN", "inf", "x"] {
+            assert!(
+                parse(&["--preflop-limp-jam-max-pot", bad]).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// `--rake-bps` / `--rake-cap` / `--crop-f32`: parsing, and the rake reaches the game config (and so
+    /// the layout fingerprint and every real-stack replay built from it).
+    #[test]
+    fn rake_and_crop_f32_args() {
+        let parse = |base: &[&str], extra: &[&str]| {
+            parse_args_from(base.iter().chain(extra).map(|s| s.to_string()))
+        };
+        let full = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"];
+        let crop = [
+            "--cropped-checkpoint",
+            "c.crop",
+            "--bucket-table",
+            "b.bin",
+            "--search",
+            "--search-trigger",
+            "all-postflop",
+        ];
+        let a = parse(&full, &[]).unwrap();
+        assert_eq!((a.rake_bps, a.rake_cap, a.crop_f32), (0, 0, false));
+        let a = parse(&full, &["--rake-bps", "400", "--rake-cap", "1000"]).unwrap();
+        assert_eq!((a.rake_bps, a.rake_cap), (400, 1000));
+        assert!(parse(&full, &["--rake-bps", "10001"]).is_err());
+        assert!(
+            parse(&full, &["--rake-cap", "1000"]).is_err(),
+            "cap without rake"
+        );
+        assert!(parse(&full, &["--crop-f32", "on"]).is_err(), "needs a crop");
+        assert!(parse(&crop, &["--crop-f32", "on"]).unwrap().crop_f32);
+        assert!(!parse(&crop, &["--crop-f32", "off"]).unwrap().crop_f32);
+        assert!(parse(&crop, &["--crop-f32", "yes"]).is_err());
+
+        let table = Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::new(200, 200, 200).expect("200/200/200"),
+        ));
+        let g = build_game_with_straddle(
+            table,
+            "all-1pot",
+            2,
+            8,
+            100,
+            0,
+            DEFAULT_SOLVER_STACK_BB,
+            (400, 1000),
+        )
+        .expect("raked game");
+        let cfg = g.table_config();
+        assert_eq!((cfg.rake_bps, cfg.rake_cap.as_u64()), (400, 1000));
+        assert_eq!(cfg.rake_on(50_000), 1000);
+        assert_eq!(cfg.rake_on(10_000), 400);
+    }
+
     /// `--stack-bb`：① 解析（缺省 100，范围 [2,1000]）；② 建出的 blueprint 桌面按它定起始码深；
     /// ③ 两道码深闸按 blueprint 码深的比例走：100BB 时与改成比例前逐位相同（翻前全下 60BB、翻牌
     /// 60–140BB），200BB 时翻前全下 120BB、翻牌 120–280BB。
@@ -18412,7 +18987,7 @@ mod tests {
 
         // ① 座位数错配必拒（完整 + crop）。
         for wrong in [6u8, 8] {
-            let e = load_blueprint(&full_p, n_seat_test_game(wrong), false)
+            let e = load_blueprint(&full_p, n_seat_test_game(wrong), false, CropPrecision::F64)
                 .err()
                 .unwrap_or_else(|| panic!("{wrong} 座 game 加载 9 座 ckpt 须失败"));
             assert!(
@@ -18420,12 +18995,14 @@ mod tests {
                 "{e}"
             );
             assert!(
-                load_blueprint(&crop_p, n_seat_test_game(wrong), true).is_err(),
+                load_blueprint(&crop_p, n_seat_test_game(wrong), true, CropPrecision::F64).is_err(),
                 "{wrong} 座 game 加载 9 座 crop 须失败"
             );
         }
-        let full = load_blueprint(&full_p, nine_max_test_game(), false).expect("load full");
-        let crop = load_blueprint(&crop_p, nine_max_test_game(), true).expect("load crop");
+        let full = load_blueprint(&full_p, nine_max_test_game(), false, CropPrecision::F64)
+            .expect("load full");
+        let crop = load_blueprint(&crop_p, nine_max_test_game(), true, CropPrecision::F64)
+            .expect("load crop");
         let game = full.game();
         assert_eq!(game.table_config().n_seats, 9);
         let abs = game.abstraction().clone();
@@ -18570,7 +19147,8 @@ mod tests {
     #[test]
     fn nine_max_crop_flop_prefer_blueprint_deep_menu() {
         let (_dir, _full_p, crop_p) = nine_max_fixture("prefer");
-        let crop = load_blueprint(&crop_p, nine_max_test_game(), true).expect("load crop");
+        let crop = load_blueprint(&crop_p, nine_max_test_game(), true, CropPrecision::F64)
+            .expect("load crop");
         let game = crop.game();
         let abs = game.abstraction().clone();
         let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);
@@ -19207,7 +19785,8 @@ mod tests {
     #[test]
     fn nine_max_weak_commit_guard_and_visit_gate() {
         let (_dir, _full_p, crop_p) = nine_max_fixture("guard");
-        let crop = load_blueprint(&crop_p, nine_max_test_game(), true).expect("load crop");
+        let crop = load_blueprint(&crop_p, nine_max_test_game(), true, CropPrecision::F64)
+            .expect("load crop");
         let game = crop.game();
         let abs = game.abstraction().clone();
         let sc = |i: &InfoSetId, _n: usize| crop.strategy(i);

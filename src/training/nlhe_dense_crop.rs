@@ -657,13 +657,81 @@ pub struct CroppedBlueprint {
     update_count: u64,
     regret_touched: Vec<u64>,
     strategy_touched: Vec<u64>,
-    regret: Option<Vec<f64>>,
-    strategy: Vec<f64>,
+    regret: Option<CropValues>,
+    strategy: CropValues,
+}
+
+/// How [`CroppedBlueprint`] keeps the value tables in memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CropPrecision {
+    /// As on disk. Queries are bit-identical to the source trainer.
+    #[default]
+    F64,
+    /// Each value narrowed to `f32` while the file is read: half the memory, and the full `f64` table
+    /// is never held. The file's BLAKE3 trailer is still checked on the bytes as read. Every value
+    /// keeps a relative error of at most 2^-24 (cumulative strategy weights are far below `f32::MAX`),
+    /// so a row's probabilities and its total move by about 1e-7 relative; rows that are exactly
+    /// uniform on disk stay exactly uniform.
+    F32,
+}
+
+/// A value table of a loaded crop ([`CropPrecision`]).
+enum CropValues {
+    F64(Vec<f64>),
+    F32(Vec<f32>),
+}
+
+impl CropValues {
+    fn read<R: Read>(
+        r: &mut R,
+        h: &mut Hasher,
+        n: u64,
+        precision: CropPrecision,
+    ) -> std::io::Result<Self> {
+        Ok(match precision {
+            CropPrecision::F64 => Self::F64(read_f64s_hashed(r, h, n)?),
+            CropPrecision::F32 => Self::F32(read_f32s_hashed(r, h, n)?),
+        })
+    }
+
+    /// Normalized row (see [`normalize_strategy`]).
+    fn normalized(&self, start: usize, n: usize) -> Vec<f64> {
+        match self {
+            Self::F64(v) => normalize_strategy(&v[start..start + n]),
+            Self::F32(v) => {
+                let row: Vec<f64> = v[start..start + n].iter().map(|&x| f64::from(x)).collect();
+                normalize_strategy(&row)
+            }
+        }
+    }
+
+    fn row_sum(&self, start: usize, n: usize) -> f64 {
+        match self {
+            Self::F64(v) => v[start..start + n].iter().sum(),
+            Self::F32(v) => v[start..start + n].iter().map(|&x| f64::from(x)).sum(),
+        }
+    }
+
+    fn row(&self, start: usize, n: usize) -> Vec<f64> {
+        match self {
+            Self::F64(v) => v[start..start + n].to_vec(),
+            Self::F32(v) => v[start..start + n].iter().map(|&x| f64::from(x)).collect(),
+        }
+    }
 }
 
 impl CroppedBlueprint {
     /// 从 crop 文件加载。`game` 须与训练源 ckpt 时同一（全树指纹不符即拒绝）。
     pub fn load(path: &Path, game: &SimplifiedNlheGame) -> Result<Self, CheckpointError> {
+        Self::load_with(path, game, CropPrecision::F64)
+    }
+
+    /// Same as [`load`](Self::load), keeping the value tables at `precision` ([`CropPrecision`]).
+    pub fn load_with(
+        path: &Path,
+        game: &SimplifiedNlheGame,
+        precision: CropPrecision,
+    ) -> Result<Self, CheckpointError> {
         let (indexer, expected) = full_indexer_and_fingerprint(game);
         let mut reader = open_reader(path)?;
         let mut h = Hasher::new();
@@ -686,12 +754,15 @@ impl CroppedBlueprint {
         let strategy_touched =
             read_words_hashed(&mut reader, &mut h, n_words).map_err(rerr("strategy touched"))?;
         let regret = if has_regret {
-            Some(read_f64s_hashed(&mut reader, &mut h, layout.kept_slots).map_err(rerr("regret"))?)
+            Some(
+                CropValues::read(&mut reader, &mut h, layout.kept_slots, precision)
+                    .map_err(rerr("regret"))?,
+            )
         } else {
             None
         };
-        let strategy =
-            read_f64s_hashed(&mut reader, &mut h, layout.kept_slots).map_err(rerr("strategy"))?;
+        let strategy = CropValues::read(&mut reader, &mut h, layout.kept_slots, precision)
+            .map_err(rerr("strategy"))?;
         verify_trailer_and_eof(&mut reader, h, "crop file")?;
 
         Ok(Self {
@@ -748,14 +819,14 @@ impl CroppedBlueprint {
         if !(bit_get(&self.strategy_touched, row) || bit_get(&self.regret_touched, row)) {
             return Some(Vec::new());
         }
-        Some(normalize_strategy(&self.strategy[start..start + n]))
+        Some(self.strategy.normalized(start, n))
     }
 
     /// Sum of the row's cumulative strategy values, same as [`CropNodeRows::row_total`]. `None` = the
     /// infoset's street was cropped away; an unvisited row on a kept street gives `0.0`.
     pub fn strategy_row_total(&self, info: InfoSetId) -> Option<f64> {
         let (_, start, n) = self.locate(info)?;
-        Some(self.strategy[start..start + n].iter().sum())
+        Some(self.strategy.row_sum(start, n))
     }
 
     /// 逐动作累计 regret（与 dense trainer `regret_for` 同约定：未 touch → 空 Vec）。
@@ -764,7 +835,7 @@ impl CroppedBlueprint {
         let regret = self.regret.as_ref()?;
         let (row, start, n) = self.locate(info)?;
         Some(if bit_get(&self.regret_touched, row) {
-            regret[start..start + n].to_vec()
+            regret.row(start, n)
         } else {
             Vec::new()
         })
@@ -991,6 +1062,21 @@ fn read_f64s_hashed<R: Read>(r: &mut R, h: &mut Hasher, n: u64) -> std::io::Resu
     Ok(vals)
 }
 
+/// Same stream as [`read_f64s_hashed`] (the hash covers the bytes as read), each value narrowed to
+/// `f32` chunk by chunk.
+fn read_f32s_hashed<R: Read>(r: &mut R, h: &mut Hasher, n: u64) -> std::io::Result<Vec<f32>> {
+    let mut vals = vec![0f32; n as usize];
+    let mut buf = vec![0u8; COPY_BUF_BYTES];
+    for chunk in vals.chunks_mut(COPY_BUF_BYTES / 8) {
+        let nbytes = chunk.len() * 8;
+        read_hashed(r, h, &mut buf[..nbytes])?;
+        for (v, b) in chunk.iter_mut().zip(buf[..nbytes].chunks_exact(8)) {
+            *v = f64::from_le_bytes(b.try_into().unwrap()) as f32;
+        }
+    }
+    Ok(vals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1182,6 +1268,87 @@ mod tests {
                 }
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// [`CropPrecision::F32`] against the `f64` load of the same file, over every kept row: same
+    /// touched / untouched / cropped answer, probabilities within 1e-6, row totals and regrets within
+    /// 1e-6 relative, exactly-uniform rows still exactly uniform. A flipped trailer byte is rejected.
+    #[test]
+    fn f32_load_matches_f64_within_rounding() {
+        let trainer = trained(3_000);
+        let game = trainer.game();
+        let dir = tmpdir("f32");
+        let ckpt = dir.join("src.ckpt");
+        trainer.save_checkpoint(&ckpt).expect("save");
+        let out = dir.join("crop.bin");
+        let opts = CropOptions {
+            keep_through: StreetTag::Flop,
+            keep_regret: true,
+        };
+        crop_dense_checkpoint(&ckpt, &out, game, opts).expect("crop");
+        let wide = CroppedBlueprint::load(&out, game).expect("load f64");
+        let narrow = CroppedBlueprint::load_with(&out, game, CropPrecision::F32).expect("load f32");
+        assert_eq!(narrow.keep_through(), wide.keep_through());
+        assert_eq!(narrow.update_count(), wide.update_count());
+        assert!(narrow.has_regret());
+        let tree = game.tree();
+        let buckets = bucket_count_by_street(game);
+        let rel = |a: f64, b: f64| (a - b).abs() <= 1e-6 * a.abs().max(b.abs());
+        let (mut visited, mut uniform) = (0u64, 0u64);
+        for id in 0..tree.num_nodes() as NodeId {
+            let street = tree.node(id).street;
+            for b in 0..buckets[street as usize] {
+                let info = pack_info_set_v2(b, id, street);
+                let (w, n) = (wide.average_strategy(info), narrow.average_strategy(info));
+                let (Some(w), Some(n)) = (w, n) else {
+                    assert!(wide.average_strategy(info).is_none());
+                    assert!(narrow.average_strategy(info).is_none());
+                    assert!(narrow.strategy_row_total(info).is_none());
+                    assert!(narrow.regret_for(info).is_none());
+                    continue;
+                };
+                assert_eq!(w.len(), n.len(), "node {id} bucket {b}");
+                assert!(
+                    w.iter().zip(&n).all(|(x, y)| (x - y).abs() <= 1e-6),
+                    "avg @ node {id} bucket {b}: {w:?} vs {n:?}"
+                );
+                if !w.is_empty() {
+                    visited += 1;
+                    let first = w[0];
+                    if w.iter().all(|&x| x == first) {
+                        uniform += 1;
+                        let first = n[0];
+                        assert!(n.iter().all(|&x| x == first), "uniform row drifted: {n:?}");
+                    }
+                }
+                let (tw, tn) = (
+                    wide.strategy_row_total(info).expect("kept"),
+                    narrow.strategy_row_total(info).expect("kept"),
+                );
+                assert!(
+                    rel(tw, tn),
+                    "row total @ node {id} bucket {b}: {tw} vs {tn}"
+                );
+                let (rw, rn) = (
+                    wide.regret_for(info).expect("kept"),
+                    narrow.regret_for(info).expect("kept"),
+                );
+                assert_eq!(rw.len(), rn.len());
+                assert!(rw.iter().zip(&rn).all(|(&x, &y)| rel(x, y)));
+            }
+        }
+        assert!(
+            visited > 0 && uniform > 0,
+            "visited {visited}, uniform {uniform}"
+        );
+
+        let mut bytes = std::fs::read(&out).expect("read crop");
+        let n = bytes.len();
+        bytes[n - 40] ^= 1;
+        let bad = dir.join("bad.bin");
+        std::fs::write(&bad, bytes).expect("write");
+        assert!(CroppedBlueprint::load_with(&bad, game, CropPrecision::F32).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
