@@ -108,6 +108,7 @@ use poker::training::opponent_profile::{
     preflop_spots, ExploitConfig, HandSeats, ObserveHand, OpponentProfile, PreflopSpot, Profiler,
     SpotAct, SpotActInput, SpotDecision,
 };
+use poker::training::pool_model::PostflopTracker;
 use poker::training::sampling::sample_discrete;
 use poker::training::subgame::{
     all_hole_combos, chen_score, current_street_ranges, is_blueprint_cropped_err,
@@ -117,6 +118,7 @@ use poker::training::subgame::{
     ExploitPrior, ExploitShape, PrefixReach, ResolveRoot, SearchTrigger, SolveView,
     SubgameSearchConfig, SubgameSolveCache,
 };
+use poker::training::subgame_pool::{tracker_from_history, PoolSearch, PoolSearchParams};
 use poker::{
     AbstractAction, Action, BucketTable, Card, ChaCha20Rng, ChipAmount, GameState, HandEvaluator,
     InfoSetId, OffTreeRounding, SeatId, StreetActionAbstraction, StreetTag, TableConfig,
@@ -949,7 +951,7 @@ fn prewarm_inner(
     };
     // 真栈轮起点快照（require_my_turn=false：预热正是在 hero 行动前）。`prev_within` = 紧前一街
     // 完整动作线（档二′-跨街复用，仅脱影子预热分支读）。
-    let (_auth, round_start, _within, prev_within) = match build_real_auth(
+    let (_auth, round_start, _within, prev_within, pool_root) = match build_real_auth(
         req,
         &solver_cfg,
         scale,
@@ -963,7 +965,10 @@ fn prewarm_inner(
         Err(reason) => return mk(format!("prewarm:err:build:{reason}")),
     };
     // 按街迭代次数（[`SearchRuntime::cfg_for`]，与决策同一函数 → 同 key）。
-    let scfg = &rt.cfg_for(round_start.street());
+    let scfg = &SubgameSearchConfig {
+        pool_root,
+        ..rt.cfg_for(round_start.street())
+    };
     // gating：街起点视角（真栈快照；should_search 只读街 + 本街是否已起注——街起点恒未起注，
     // FlopFirstUnraised 即「仅 flop 预热」）。街内后续是否起注未知 → 可能白预热，无害。
     if !should_search(&round_start, scfg.trigger) {
@@ -3347,7 +3352,7 @@ fn decide_with(
         // 真码深 auth + round_start（真栈重放 + 注入真实牌）。建不了 = §2.3「建不了树」→ 安全降级。
         // 锚定搜索路径（lockstep Ok）：`prev_within` = 紧前一街完整动作线，档二′-跨街复用沿它在上一街
         // 已解子树（anchored/unanchored 皆可，turn_blueprint_trim §2.1）读 σ 算本街后验 range。
-        let (auth, round_start, within, prev_within) = match build_real_auth(
+        let (auth, round_start, within, prev_within, pool_root) = match build_real_auth(
             req,
             &solver_cfg,
             scale,
@@ -3369,6 +3374,12 @@ fn decide_with(
                     format!("search_giveup:build:{reason}"),
                 );
             }
+        };
+        // The pool-constrained search needs the betting state of the subtree root; `pool_root` is
+        // that of the round start.
+        let scfg = &SubgameSearchConfig {
+            pool_root: pool_root.filter(|_| matches!(scfg.resolve_root, ResolveRoot::RoundStart)),
+            ..*scfg
         };
         let root_state: &GameState = match scfg.resolve_root {
             ResolveRoot::RoundStart => &round_start,
@@ -4237,7 +4248,7 @@ fn preflop_pot_odds(
         true,
     )
     .ok()
-    .and_then(|(auth, _, _, _)| pot_odds_from_auth(&auth, solver_cfg))
+    .and_then(|(auth, ..)| pot_odds_from_auth(&auth, solver_cfg))
 }
 
 /// 范围胜率 floor 的折扣，**每个在手对手乘一次**（2026-11-02，实盘 000754：转牌顶对 + 同花听牌面对全下，搜索因
@@ -5390,6 +5401,7 @@ fn build_real_auth(
         GameState,
         Vec<(Action, bool)>,
         Vec<(Action, bool)>,
+        Option<PostflopTracker>,
     ),
     String,
 > {
@@ -5450,10 +5462,13 @@ fn build_real_auth(
     if auth.is_terminal() || auth.current_player().is_none() {
         return Err("auth_terminal".into()); // 预热路径防御（决策路径被上一检查覆盖）。
     }
+    // Where the betting stands at the round start (last bettor of the street before), for the
+    // pool-constrained search: taken here because injecting the cards drops the history.
+    let pool_root = tracker_from_history(&round_start);
     // 注入真实牌（hero hole + board）到当前点 + 街起点（subgame solve / query_at 读真牌）。
     let auth = auth.inject_external_cards(my_seat_solver, hole, board)?;
     let round_start = round_start.inject_external_cards(my_seat_solver, hole, board)?;
-    Ok((auth, round_start, within, prev_within))
+    Ok((auth, round_start, within, prev_within, pool_root))
 }
 
 /// `--search-flop-prefer-blueprint` 的真码深闸：flop 锚定面只有在真实码深与 blueprint 的
@@ -5761,7 +5776,7 @@ fn decide_search_unanchored(
     let scfg = &rt.cfg;
     // 真栈重放（auth / 轮起点快照 / 当前街真实动作序 / 紧前一街完整动作线）。建不了 = §2.3「建不了
     // 树」→ 安全降级。`prev_within` = 档二′-跨街复用沿它在上一街子树读 σ（默认关）。
-    let (auth, round_start, within, prev_within) = match build_real_auth(
+    let (auth, round_start, within, prev_within, pool_root) = match build_real_auth(
         req,
         solver_cfg,
         scale,
@@ -5815,7 +5830,10 @@ fn decide_search_unanchored(
         );
     }
     // 按街迭代次数（[`SearchRuntime::cfg_for`]，与预热同一函数 → 同 key）。gating 只读 trigger，不受影响。
-    let scfg = &rt.cfg_for(auth.street());
+    let scfg = &SubgameSearchConfig {
+        pool_root,
+        ..rt.cfg_for(auth.street())
+    };
     let n_seats = solver_cfg.n_seats as usize;
     let hand_seed = hand_seed_for(req, base_seed, n_seats);
     // 子树当前街的下注菜单（脱锚子树根 = round_start，[`subtree_menu_label`]）。
@@ -6686,6 +6704,13 @@ struct Args {
     /// `--search-bucket-table`：子树 solve 用的独立桶表路径（[`SearchRuntime`] doc；`None` =
     /// 沿用 `--bucket-table`）。仅 `--search` 开时可设（同其余 `--search-*` 的拒静默 guard）。
     search_bucket_table: Option<PathBuf>,
+    /// `--search-pool-model <pool_model.json>`: opponents in the postflop search act with the pool's
+    /// frequencies ([`poker::training::subgame_pool`]). `None` = off. Needs `--search`.
+    search_pool_model: Option<PathBuf>,
+    /// `--search-pool-conf-scale` / `--search-pool-conf-k` / `--search-pool-conf-max` /
+    /// `--search-pool-temp`: how far the pool is trusted ([`PoolSearchParams`]); only with
+    /// `--search-pool-model`.
+    search_pool_params: PoolSearchParams,
     /// `--search-unanchored-prefix-reach on|off`（档一，[`SearchRuntime`] doc）：脱影子搜索 range
     /// 先验从 uniform 升级为已同步前缀 reach。**默认 `true`**（[`DEFAULT_SEARCH_UNANCHORED_PREFIX_REACH`]，
     /// §5.1 实测拍板）；`off` 显式关（A/B 对照臂 / 回退）。
@@ -6772,6 +6797,10 @@ struct ReadyLine {
     rake_bps: u32,
     #[serde(skip_serializing_if = "is_zero")]
     rake_cap: u64,
+    /// `--search-pool-model`: first 8 bytes of the hash of model + trust parameters; not written
+    /// when off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_pool: Option<String>,
 }
 
 fn is_zero(v: &u64) -> bool {
@@ -7217,12 +7246,28 @@ fn run() -> Result<(), String> {
                 })?)),
                 None => None,
             };
+            // --search-pool-model: loaded once and kept for the life of the process (the search
+            // config is `Copy` and carries a `&'static`).
+            let pool: Option<&'static PoolSearch> = match &args.search_pool_model {
+                Some(p) => Some(Box::leak(Box::new(PoolSearch::load(
+                    p,
+                    args.search_pool_params,
+                )?))),
+                None => None,
+            };
+            if let Some(pool) = pool {
+                eprintln!(
+                    "[openpoker_advisor] search-pool-model ON: {:?}（翻后搜索里对手按牌池频率行动）",
+                    pool
+                );
+            }
             Some(SearchRuntime {
                 street_iters: args.search_street_iters,
                 // blueprint σ 覆盖街：完整 = River（默认值，行为不变）；crop = keep_through
                 // （range 先验不得查被裁街，SubgameSearchConfig::blueprint_max_street doc）。
                 cfg: SubgameSearchConfig {
                     blueprint_max_street: blueprint.keep_through(),
+                    pool,
                     ..cfg
                 },
                 bucket_table,
@@ -7264,6 +7309,10 @@ fn run() -> Result<(), String> {
         stack_bb: args.stack_bb,
         rake_bps: game.table_config().rake_bps,
         rake_cap: game.table_config().rake_cap.as_u64(),
+        search_pool: search_rt
+            .as_ref()
+            .and_then(|rt| rt.cfg.pool)
+            .map(|p| p.hash_hex()),
     };
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
@@ -7527,6 +7576,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_max_nodes: Option<usize> = None;
     let mut search_range_uniform_mix: Option<f64> = None;
     let mut search_bucket_table: Option<PathBuf> = None;
+    let mut search_pool_model: Option<PathBuf> = None;
+    let mut search_pool_conf_scale: Option<f64> = None;
+    let mut search_pool_conf_k: Option<f64> = None;
+    let mut search_pool_conf_max: Option<f64> = None;
+    let mut search_pool_temp: Option<f64> = None;
     let mut search_solve_threads: Option<usize> = None;
     let mut search_unanchored_prefix_reach: Option<bool> = None;
     let mut search_unanchored_cross_street: Option<bool> = None;
@@ -7837,6 +7891,23 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                 }
                 search_frozen_avg_recency = Some(r);
             }
+            "--search-pool-model" => {
+                search_pool_model = Some(PathBuf::from(next_val(&mut it, &arg)?));
+            }
+            "--search-pool-conf-scale"
+            | "--search-pool-conf-k"
+            | "--search-pool-conf-max"
+            | "--search-pool-temp" => {
+                let v: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad {arg}: {e}"))?;
+                *match arg.as_str() {
+                    "--search-pool-conf-scale" => &mut search_pool_conf_scale,
+                    "--search-pool-conf-k" => &mut search_pool_conf_k,
+                    "--search-pool-conf-max" => &mut search_pool_conf_max,
+                    _ => &mut search_pool_temp,
+                } = Some(v);
+            }
             "--search-real-hand-q" => {
                 let q: f64 = next_val(&mut it, &arg)?
                     .parse()
@@ -8045,10 +8116,32 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_freeze_real_line.is_some()
             || search_real_hand_q.is_some()
             || search_weak_commit_guard.is_some()
+            || search_pool_model.is_some()
         {
             return Err("设了 --search-* 参数但未开 --search（拒绝静默跑 blueprint）".to_string());
         }
         None
+    };
+    // --search-pool-*: the trust parameters only mean something with a model.
+    let pool_param_set = search_pool_conf_scale.is_some()
+        || search_pool_conf_k.is_some()
+        || search_pool_conf_max.is_some()
+        || search_pool_temp.is_some();
+    if pool_param_set && search_pool_model.is_none() {
+        return Err(
+            "--search-pool-conf-* / --search-pool-temp 需要 --search-pool-model".to_string(),
+        );
+    }
+    let search_pool_params = {
+        let d = PoolSearchParams::default();
+        let p = PoolSearchParams {
+            conf_k: search_pool_conf_k.unwrap_or(d.conf_k),
+            conf_scale: search_pool_conf_scale.unwrap_or(d.conf_scale),
+            conf_max: search_pool_conf_max.unwrap_or(d.conf_max),
+            temp: search_pool_temp.unwrap_or(d.temp),
+        };
+        p.validate()?;
+        p
     };
     // --exploit* guard：子旗需 --exploit on|vpip；--exploit on|vpip 需 --search（剥削仅作用脱锚
     // 搜索路径）。pfr_shape 现由 --exploit 取值派生（off 时恒 false），不再单列入此 guard。
@@ -8164,6 +8257,8 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
         search,
         search_street_iters,
         search_bucket_table,
+        search_pool_model,
+        search_pool_params,
         exploit,
         exploit_4bet,
         exploit_4bet_state,
@@ -11497,7 +11592,7 @@ mod tests {
             // 同一缓存直接取：本手种子 → 有；换一手 → 没有。
             let (cfg, smap, hero, hole) = coef_ctx(&req);
             let board: Vec<Card> = req.board.iter().map(|c| parse_card(c).unwrap()).collect();
-            let (_, round_start, within, _) =
+            let (_, round_start, within, ..) =
                 build_real_auth(&req, &cfg, 5, &smap, hero, hole, &board, true).unwrap();
             let seed = hand_seed_for(&req, 0x754, 6);
             let ranges =
@@ -18563,6 +18658,135 @@ mod tests {
 
     /// `--rake-bps` / `--rake-cap` / `--crop-f32`: parsing, and the rake reaches the game config (and so
     /// the layout fingerprint and every real-stack replay built from it).
+    /// Pool-constrained search end to end (`--search-pool-model`): SB opens, BB (hero) calls, flop.
+    /// Prewarm and decision build the same constrained solve (one miss, one hit), the solve has
+    /// opponent nodes acting with the pool's frequencies, and its key differs from the plain
+    /// solve's; without the model nothing is constrained.
+    #[test]
+    fn search_pool_model_constrains_the_solve() {
+        let game = nolimp_game();
+        let abs = game.abstraction().clone();
+        let sigma = top15_sigma();
+        let pool: &'static PoolSearch = Box::leak(Box::new(
+            PoolSearch::load(
+                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/data/pool_model_small.json"),
+                PoolSearchParams::default(),
+            )
+            .expect("pool model"),
+        ));
+        let rt_with = |pool: Option<&'static PoolSearch>| {
+            rt_prefix_reach(SubgameSearchConfig {
+                iterations: 2000,
+                trigger: SearchTrigger::AllPostflop,
+                range_uniform_mix: 0.25,
+                pool,
+                ..SubgameSearchConfig::default()
+            })
+        };
+        let mut pre = flop_first_unraised_req(vec![2000; 6]);
+        pre.my_seat = 2;
+        pre.hole = vec!["Qs".into(), "Qd".into()];
+        pre.actions[4] = HistAction {
+            seat: 1,
+            action: "raise".into(),
+            to: Some(60),
+        };
+        pre.actions[5] = HistAction {
+            seat: 2,
+            action: "call".into(),
+            to: None,
+        };
+        pre.valid.max_raise = Some(1940);
+        let mut req = pre.clone();
+        req.actions.push(HistAction {
+            seat: 1,
+            action: "check".into(),
+            to: None,
+        });
+        let run = |rt: &SearchRuntime| {
+            let mut cache = SubgameSolveCache::new();
+            let p = prewarm(&game, &sigma, &pre, 0xE7B3, Some(rt), &mut cache);
+            assert_eq!(p.source, "prewarm:stored", "得 {p:?}");
+            let r = decide(&game, &abs, &sigma, &req, 0xE7B3, Some(rt), &mut cache);
+            assert_eq!(r.source, "search", "得 {r:?}");
+            assert_eq!((cache.misses(), cache.hits()), (1, 1), "预热须被决策命中");
+            let solve = cache.current_solve().expect("solve");
+            (solve.key, solve.pool_fitted)
+        };
+        let (key_on, fitted_on) = run(&rt_with(Some(pool)));
+        let (key_off, fitted_off) = run(&rt_with(None));
+        assert!(fitted_on > 0, "对手决策点须带上牌池约束");
+        assert_eq!(fitted_off, 0);
+        assert_ne!(key_on, key_off, "牌池约束须进 solve 缓存 key");
+    }
+
+    /// `--search-pool-model` and its trust parameters: off by default, need `--search` and a
+    /// model, out-of-range values rejected.
+    #[test]
+    fn search_pool_args() {
+        let parse = |extra: &[&str]| {
+            let base = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"];
+            parse_args_from(base.iter().chain(extra).map(|s| s.to_string()))
+        };
+        let a = parse(&["--search"]).unwrap();
+        assert_eq!(a.search_pool_model, None);
+        assert_eq!(a.search_pool_params, PoolSearchParams::default());
+        assert!(a.search.unwrap().pool.is_none());
+        let a = parse(&["--search", "--search-pool-model", "pool.json"]).unwrap();
+        assert_eq!(a.search_pool_model, Some(PathBuf::from("pool.json")));
+        assert_eq!(a.search_pool_params, PoolSearchParams::default());
+        let a = parse(&[
+            "--search",
+            "--search-pool-model",
+            "pool.json",
+            "--search-pool-conf-scale",
+            "0.25",
+            "--search-pool-conf-k",
+            "20",
+            "--search-pool-conf-max",
+            "0.8",
+            "--search-pool-temp",
+            "0.1",
+        ])
+        .unwrap();
+        assert_eq!(
+            a.search_pool_params,
+            PoolSearchParams {
+                conf_k: 20.0,
+                conf_scale: 0.25,
+                conf_max: 0.8,
+                temp: 0.1
+            }
+        );
+        assert!(
+            parse(&["--search-pool-model", "pool.json"]).is_err(),
+            "needs --search"
+        );
+        assert!(
+            parse(&["--search", "--search-pool-conf-scale", "0.5"]).is_err(),
+            "needs a model"
+        );
+        for bad in [
+            ["--search-pool-conf-scale", "1.5"],
+            ["--search-pool-conf-k", "0"],
+            ["--search-pool-temp", "0"],
+            ["--search-pool-conf-max", "x"],
+        ] {
+            assert!(
+                parse(&[
+                    "--search",
+                    "--search-pool-model",
+                    "pool.json",
+                    bad[0],
+                    bad[1]
+                ])
+                .is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
     #[test]
     fn rake_and_crop_f32_args() {
         let parse = |base: &[&str], extra: &[&str]| {

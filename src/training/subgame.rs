@@ -1265,6 +1265,16 @@ pub struct SubgameSearchConfig {
     /// 遍历者时以概率 `q ∈ [0, 1]` 直接发真实底牌；`Some(0.0)` = 只开专用信息集不强制发牌（验证用
     /// 的慢参照）。进 [`solve_cache_key`]，读数和访问量门槛读的就是专用信息集。
     pub real_hand_q: Option<f64>,
+    /// 对手按牌池的频率行动（[`crate::training::subgame_pool`]）。`None`（默认）= 关，既有行为逐位
+    /// 不变。`Some`：子树根在翻后且带牌局历史时，hero 以外的座位在每个翻后决策点以该格的置信度
+    /// 按牌池的过牌 / 下注、弃 / 跟 / 加注频率行动（哪些牌做哪个动作由求解自己定），其余时候照常
+    /// 求解；hero 的策略是对这个混合的最优应对。进 solve 缓存 key（模型 + 参数的哈希 + hero 座位）。
+    pub pool: Option<&'static crate::training::subgame_pool::PoolSearch>,
+    /// [`Self::pool`] 用的子树根下注状态（上一条街最后的主动方、根在街中途时本街已有的下注）。调用方
+    /// 在把牌局历史丢掉之前（`GameState::inject_external_cards` 会丢）用
+    /// [`crate::training::subgame_pool::tracker_from_history`] 从根状态算好传进来；`None` = 求解时
+    /// 试着从根状态自带的历史算，算不出就不加约束。同一手同一条街只有一个取值，不单独进缓存 key。
+    pub pool_root: Option<crate::training::pool_model::PostflopTracker>,
 }
 
 /// [`SubgameSearchConfig::min_hero_visits`] 拒读时 `Err` 字符串的前缀。调用方用
@@ -1301,6 +1311,8 @@ impl Default for SubgameSearchConfig {
             frozen_avg_recency: 0.0,
             freeze_real_line: false,
             real_hand_q: None,
+            pool: None,
+            pool_root: None,
         }
     }
 }
@@ -2287,6 +2299,8 @@ pub struct SolveView<'a> {
     pub meta: &'a SolveRangeMeta,
     /// 子博弈根各座范围（下标 = 树座，内层对齐 [`all_hole_combos`]，弃牌座为空）；`None` = 均匀。
     pub ranges: Option<&'a [Vec<f64>]>,
+    /// 按牌池频率行动的对手决策点个数（[`SubgameSearchConfig::pool`]；没开 / 没加上约束 = 0）。
+    pub pool_fitted: usize,
 }
 
 impl SolvedSubgame {
@@ -2473,6 +2487,7 @@ impl SubgameSolveCache {
             key: *key,
             meta: &s.meta,
             ranges: s.trainer.game().ranges(),
+            pool_fitted: s.trainer.pool_fitted_nodes(),
         })
     }
 
@@ -2792,6 +2807,20 @@ fn solve_cache_key(
         h.update(b"limpwidth");
         h.update(&[sub_rules.limp_line_width]);
     }
+    *h.finalize().as_bytes()
+}
+
+/// 开了牌池约束（[`SubgameSearchConfig::pool`]）的 solve 还取决于牌池模型和 hero 是哪个座位：把两者
+/// 折进 key。关着时原样返回（key 与改动前逐位相同）。
+fn pool_cache_key(key: [u8; 32], cfg: &SubgameSearchConfig, hero: PlayerId) -> [u8; 32] {
+    let Some(pool) = cfg.pool else {
+        return key;
+    };
+    let mut h = blake3::Hasher::new();
+    h.update(b"pool-search");
+    h.update(&key);
+    h.update(pool.hash());
+    h.update(&[hero]);
     *h.finalize().as_bytes()
 }
 
@@ -3265,7 +3294,7 @@ fn subgame_search_cached_inner(
         auth_actor,
     )?;
     let key = cache.as_ref().map(|_| {
-        solve_cache_key(
+        let key = solve_cache_key(
             KEY_KIND_ANCHORED,
             &sub_table,
             root_state,
@@ -3279,7 +3308,8 @@ fn subgame_search_cached_inner(
             seed_ordinal,
             real_hand,
             frozen_prefix,
-        )
+        );
+        pool_cache_key(key, cfg, auth_actor)
     });
     // 建 subgame + 求解（仅 miss / 无缓存时跑）：bucket 表 + 上面选定的 action 抽象
     // （sub_abs/sub_rules），从 root_state 为根。6b depth-limit → 子树街边界截断 + 叶子查
@@ -3340,7 +3370,7 @@ fn subgame_search_cached_inner(
         };
         let sub = apply_real_hand(sub, real_hand);
         let sub = apply_frozen_real_line(sub, &sub_abs, root_state, frozen_prefix, auth_actor)?;
-        let trainer = solve_subgame(sub, cfg, master)?;
+        let trainer = solve_subgame(sub, cfg, master, auth_actor)?;
         Ok(SolvedSubgame {
             trainer,
             sub_abs,
@@ -3491,6 +3521,7 @@ fn solve_subgame(
     sub: SubgameNlheGame,
     cfg: &SubgameSearchConfig,
     master: u64,
+    hero: PlayerId,
 ) -> Result<SubgameTrainer, String> {
     let n_nodes = sub.subtree().num_nodes();
     if n_nodes == 0 || n_nodes > cfg.max_subtree_nodes {
@@ -3526,6 +3557,32 @@ fn solve_subgame(
     };
     if let Some(rot) = rotation {
         trainer = trainer.with_traverser_rotation(rot);
+    }
+    // 对手按牌池频率行动（[`SubgameSearchConfig::pool`]）：根不在翻后 / 没有牌局历史 → 不加约束。
+    if let Some(pool) = cfg.pool {
+        let template = trainer.game().template();
+        let constraint = cfg
+            .pool_root
+            .or_else(|| crate::training::subgame_pool::tracker_from_history(template))
+            // The tracker must describe this root: same street.
+            .filter(|t| t.street() as usize == template.street() as usize)
+            .map(|root| {
+                crate::training::subgame_pool::PoolConstraint::new(pool, hero, root, n_nodes)
+            });
+        if subgame_debug_on() {
+            eprintln!(
+                "[dbg-subgame] pool constraint: {} (hero seat {hero}, model {})",
+                if constraint.is_some() {
+                    "on"
+                } else {
+                    "off (root not postflop / no betting history)"
+                },
+                pool.hash_hex()
+            );
+        }
+        if let Some(c) = constraint {
+            trainer = trainer.with_pool(c);
+        }
     }
     // 缺口①本体（§2.3）：time_budget=Some → 墙钟 anytime（跑到 iterations 上限或 wall 达预算就停，
     // 此时 iterations 退为安全上界）；None → 跑满固定 iterations（既有行为，byte-equal）。budgeted
@@ -3588,8 +3645,51 @@ fn solve_subgame(
         // blueprint）。够不够*有用*迭代由「当前桶未被访问 → Err」（read_current_strategy）继续兜。
         return Err("time_budget 内连一轮 CFR 迭代都未完成（→ fold）".to_string());
     }
+    // 牌池约束：按最终的 regret 再校准一次，读数和跨街后验用的对手策略才对得上牌池频率。
+    trainer.fit_pool();
     // 根所在街的精确平均补上最后一次扫描之后的迭代（读数和跨街后验只读这条街）。
     trainer.flush_exact_average();
+    if cfg.pool.is_some() && subgame_debug_on() {
+        let report = trainer.pool_report();
+        let total: f64 = report.iter().map(|r| r.weight).sum();
+        let off = |f: &dyn Fn(&crate::training::subgame_pool::PoolNodeReport) -> [f64; 3]| {
+            report
+                .iter()
+                .map(|r| {
+                    let x = f(r);
+                    r.weight * (0..3).map(|c| (x[c] - r.target[c]).abs()).sum::<f64>() / 2.0
+                })
+                .sum::<f64>()
+                / total.max(1e-300)
+        };
+        eprintln!(
+            "[dbg-subgame] pool summary: updates={done} fitted_nodes={} free_off={:.4} played_off={:.4}",
+            report.len(),
+            off(&|r| r.free),
+            off(&|r| r.played),
+        );
+        for r in report.iter().take(16) {
+            let dims: Vec<String> = r
+                .spot
+                .dims
+                .iter()
+                .map(|(d, v)| format!("{d}={v}"))
+                .collect();
+            eprintln!(
+                "[dbg-subgame] pool node={} seat={} family={} dims={} n={} conf={:.3} weight={:.0} target={:.3?} free={:.3?} played={:.3?}",
+                r.node,
+                r.seat,
+                r.spot.family,
+                dims.join(","),
+                r.n,
+                r.confidence,
+                r.weight,
+                r.target,
+                r.free,
+                r.played
+            );
+        }
+    }
     Ok(trainer)
 }
 
@@ -4345,7 +4445,7 @@ fn subgame_search_unanchored_cached_inner(
     let real_hand = real_hand_spec(cfg, auth, auth_actor);
     let frozen_prefix = frozen_real_prefix(cfg, real_hand, root_state, within_round, auth_actor)?;
     let key = cache.as_ref().map(|_| {
-        solve_cache_key(
+        let key = solve_cache_key(
             KEY_KIND_UNANCHORED,
             &sub_table,
             root_state,
@@ -4359,7 +4459,8 @@ fn subgame_search_unanchored_cached_inner(
             street_tag as u64,
             real_hand,
             frozen_prefix,
-        )
+        );
+        pool_cache_key(key, cfg, auth_actor)
     });
     // 建树前规模闸（≥7 Active 才计数）：只在真要建树时跑——缓存命中不数；被拒过的 key 直接复用
     // 拒绝原因、不重数（`SubgameSolveCache::oversize`）。`build_and_solve` 会 move 走 `sub_abs`，
@@ -4397,7 +4498,7 @@ fn subgame_search_unanchored_cached_inner(
         };
         let sub = apply_real_hand(sub, real_hand);
         let sub = apply_frozen_real_line(sub, &sub_abs, root_state, frozen_prefix, auth_actor)?;
-        let trainer = solve_subgame(sub, cfg, master)?;
+        let trainer = solve_subgame(sub, cfg, master, auth_actor)?;
         Ok(SolvedSubgame {
             trainer,
             sub_abs,
@@ -5257,6 +5358,8 @@ mod tests {
             frozen_avg_recency: 0.0,
             freeze_real_line: false,
             real_hand_q: None,
+            pool: None,
+            pool_root: None,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -5322,6 +5425,8 @@ mod tests {
             frozen_avg_recency: 0.0,
             freeze_real_line: false,
             real_hand_q: None,
+            pool: None,
+            pool_root: None,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, None, 0, 0,
@@ -5800,6 +5905,8 @@ mod tests {
             frozen_avg_recency: 0.0,
             freeze_real_line: false,
             real_hand_q: None,
+            pool: None,
+            pool_root: None,
         };
         let d9 = subgame_search(
             &auth,
@@ -6565,6 +6672,8 @@ mod tests {
             frozen_avg_recency: 0.0,
             freeze_real_line: false,
             real_hand_q: None,
+            pool: None,
+            pool_root: None,
         };
         let run = |cfg: &SubgameSearchConfig| {
             subgame_search(
@@ -6644,6 +6753,8 @@ mod tests {
             frozen_avg_recency: 0.0,
             freeze_real_line: false,
             real_hand_q: None,
+            pool: None,
+            pool_root: None,
         };
         let base = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &none_cfg, None, None, 0x55, 4,
@@ -11090,6 +11201,8 @@ mod tests {
         // 不开 real_hand_q：固定不生效，第二次决策与首次决策同 key（旧行为）。
         let no_rh = SubgameSearchConfig {
             real_hand_q: None,
+            pool: None,
+            pool_root: None,
             ..on
         };
         let mut cache = SubgameSolveCache::new();

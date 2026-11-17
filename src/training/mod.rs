@@ -54,6 +54,7 @@ pub mod regret;
 pub mod sampling;
 pub mod subgame;
 pub mod subgame_leaf_value;
+pub mod subgame_pool;
 pub mod subgame_trainer;
 pub mod trainer;
 

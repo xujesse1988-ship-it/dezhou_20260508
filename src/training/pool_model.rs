@@ -3,13 +3,13 @@
 //! The Python package fits how the opponents of one platform play on average (frequencies with
 //! counts, per situation) from hand logs and writes `pool_model.json`. This module loads that file,
 //! answers the same queries with the same back-off arithmetic ([`PoolModel::predict`] mirrors
-//! `pool_model.predict`), and classifies a preflop decision into the model's situation and cell
-//! ([`PreflopTracker`] mirrors the preflop half of `pool_model.hand_obs`).
+//! `pool_model.predict`), and classifies a decision into the model's situation and cell
+//! ([`PreflopTracker`] / [`PostflopTracker`] mirror the two halves of `pool_model.hand_obs`).
 //!
 //! The two sides must agree decision by decision, otherwise frequencies measured in one situation
-//! get applied in another. `tests/pool_model_vectors.rs` replays real preflop action sequences
-//! exported by `tools/pool_model_vectors.py` through [`PreflopTracker`] and compares every
-//! situation, cell and prediction with what Python produced.
+//! get applied in another. `tests/pool_model_vectors.rs` replays real action sequences exported by
+//! `tools/pool_model_vectors.py` through the trackers and compares every situation, cell and
+//! prediction with what Python produced.
 //!
 //! Sizes are pot fractions, the unit of the betting tree:
 //! (chips raised above the call) / (pot before the action + the call).
@@ -409,6 +409,211 @@ impl PreflopTracker {
     }
 }
 
+/// Most seats a table can have; fixed-size state keeps [`PostflopTracker`] `Copy`.
+pub const POOL_MAX_SEATS: usize = 10;
+
+/// Follows the postflop betting of one hand and names the situation of the seat about to act
+/// (the postflop half of `pool_model.hand_obs`). Seats are indices clockwise from the button
+/// (0 = the button), so the postflop acting order is 1, 2, .., n-1, 0. Chips are in any one unit.
+///
+/// The caller says who has folded and who is all-in at the start of each street (it knows the
+/// stacks); the tracker follows the bets in between.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PostflopTracker {
+    n_seats: u8,
+    /// 1 = flop, 2 = turn, 3 = river.
+    street: u8,
+    contrib: [u64; POOL_MAX_SEATS],
+    pot: u64,
+    current_bet: u64,
+    /// Bets + raises made on this street.
+    raises: u32,
+    /// Pot fraction of the last bet / raise on this street.
+    last_frac: f64,
+    /// Seats that bet or raised on this street (bit per seat).
+    bettors: u16,
+    folded: u16,
+    /// Last bettor / raiser of this street so far.
+    cur_aggr: Option<u8>,
+    /// Last bettor / raiser of the previous street (preflop: the last raiser).
+    prev_aggr: Option<u8>,
+    /// The seat that acts last on this street: the last one in acting order that had neither
+    /// folded nor gone all-in when the street began.
+    last_seat: Option<u8>,
+}
+
+const POSTFLOP_STREETS: [&str; 3] = ["flop", "turn", "river"];
+
+impl PostflopTracker {
+    /// Tracker at the start of `street` (1 = flop, 2 = turn, 3 = river). `pot` = all chips in the
+    /// middle; `folded` / `all_in` = bit per seat; `prev_aggr` = last bettor / raiser of the
+    /// street before, if there was one.
+    pub fn start(
+        n_seats: usize,
+        street: u8,
+        pot: u64,
+        folded: u16,
+        all_in: u16,
+        prev_aggr: Option<usize>,
+    ) -> PostflopTracker {
+        assert!(
+            (2..=POOL_MAX_SEATS).contains(&n_seats),
+            "PostflopTracker: 2..={POOL_MAX_SEATS} seats, got {n_seats}"
+        );
+        assert!((1..=3).contains(&street), "postflop street 1..=3");
+        let mut t = PostflopTracker {
+            n_seats: n_seats as u8,
+            street,
+            contrib: [0; POOL_MAX_SEATS],
+            pot,
+            current_bet: 0,
+            raises: 0,
+            last_frac: 0.0,
+            bettors: 0,
+            folded,
+            cur_aggr: None,
+            prev_aggr: prev_aggr.map(|s| s as u8),
+            last_seat: None,
+        };
+        t.set_last_seat(all_in);
+        t
+    }
+
+    fn set_last_seat(&mut self, all_in: u16) {
+        let n = self.n_seats as usize;
+        let out = self.folded | all_in;
+        // Acting order 1, .., n-1, 0: the button is last if it can act, then n-1, ..
+        self.last_seat = std::iter::once(0)
+            .chain((1..n).rev())
+            .find(|s| out & (1 << s) == 0)
+            .map(|s| s as u8);
+    }
+
+    /// The betting moved on to the next street. `prev_aggr` becomes this street's last bettor.
+    pub fn next_street(&mut self, pot: u64, folded: u16, all_in: u16) {
+        assert!(self.street < 3, "no street after the river");
+        self.street += 1;
+        self.contrib = [0; POOL_MAX_SEATS];
+        self.pot = pot;
+        self.current_bet = 0;
+        self.raises = 0;
+        self.last_frac = 0.0;
+        self.bettors = 0;
+        self.folded = folded;
+        self.prev_aggr = self.cur_aggr.take();
+        self.set_last_seat(all_in);
+    }
+
+    /// 1 = flop, 2 = turn, 3 = river.
+    pub fn street(&self) -> u8 {
+        self.street
+    }
+
+    /// Highest street contribution so far.
+    pub fn current_bet(&self) -> u64 {
+        self.current_bet
+    }
+
+    /// All chips in the middle.
+    pub fn pot(&self) -> u64 {
+        self.pot
+    }
+
+    /// Seats still in the hand (all-in seats included).
+    pub fn n_live(&self) -> usize {
+        self.n_seats as usize - self.folded.count_ones() as usize
+    }
+
+    /// Situation and features of `seat`, who is about to act.
+    pub fn spot(&self, seat: usize) -> PoolSpot {
+        let street = POSTFLOP_STREETS[self.street as usize - 1];
+        let players = if self.n_live() == 2 { "2" } else { "3+" };
+        let (family, dims) = match self.raises {
+            0 => (
+                "po_lead",
+                vec![
+                    ("street", street),
+                    (
+                        "role",
+                        match self.prev_aggr {
+                            Some(a) if a as usize == seat => "aggr",
+                            Some(_) => "other",
+                            None => "none",
+                        },
+                    ),
+                    ("players", players),
+                    (
+                        "seat",
+                        if self.last_seat == Some(seat as u8) {
+                            "last"
+                        } else {
+                            "early"
+                        },
+                    ),
+                ],
+            ),
+            1 => (
+                "po_vs_bet",
+                vec![
+                    ("size", size_bucket(self.last_frac)),
+                    ("street", street),
+                    ("players", players),
+                ],
+            ),
+            _ => (
+                "po_vs_raise",
+                vec![
+                    ("street", street),
+                    (
+                        "was_bettor",
+                        if self.bettors & (1 << seat) != 0 {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                    ),
+                ],
+            ),
+        };
+        PoolSpot { family, dims }
+    }
+
+    /// Record `seat` folding.
+    pub fn fold(&mut self, seat: usize) -> PreflopKind {
+        self.folded |= 1 << seat;
+        PreflopKind::Fold
+    }
+
+    /// Record `seat` putting chips in until its street total is `to_total` (unchanged total =
+    /// check). Above the current bet it is a bet / raise ([`PreflopKind::Raise`] with its pot
+    /// fraction), whatever its size; at or below, a call.
+    pub fn put(&mut self, seat: usize, to_total: u64) -> PreflopKind {
+        let before = self.contrib[seat];
+        assert!(to_total >= before, "street total cannot go down");
+        let kind = if to_total > self.current_bet {
+            let frac = raise_fraction(
+                to_total,
+                self.current_bet,
+                self.pot,
+                self.current_bet - before,
+            );
+            self.current_bet = to_total;
+            self.raises += 1;
+            self.last_frac = frac;
+            self.bettors |= 1 << seat;
+            self.cur_aggr = Some(seat as u8);
+            PreflopKind::Raise(frac)
+        } else if to_total > before {
+            PreflopKind::Call
+        } else {
+            PreflopKind::Check
+        };
+        self.pot += to_total - before;
+        self.contrib[seat] = to_total;
+        kind
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +656,72 @@ mod tests {
             position_labels(9),
             vec!["BTN", "SB", "BB", "UTG", "UTG1", "UTG2", "LJ", "HJ", "CO"]
         );
+    }
+
+    /// 6 seats, flop three-handed (seats 1, 4, 0 live; preflop raiser = seat 4), pot 300.
+    /// Check, bet 150, raise to 600, fold, call; then the turn two-handed.
+    #[test]
+    fn postflop_tracker_names_each_situation() {
+        let folded = (1 << 2) | (1 << 3) | (1 << 5);
+        let mut t = PostflopTracker::start(6, 1, 300, folded, 0, Some(4));
+        let s = t.spot(1);
+        assert_eq!(s.family, "po_lead");
+        assert_eq!(
+            (
+                s.dim("street"),
+                s.dim("role"),
+                s.dim("players"),
+                s.dim("seat")
+            ),
+            (Some("flop"), Some("other"), Some("3+"), Some("early"))
+        );
+        assert_eq!(t.put(1, 0), PreflopKind::Check);
+        assert_eq!(t.spot(4).dim("role"), Some("aggr"));
+        // Bet 150 into 300 = half pot.
+        match t.put(4, 150) {
+            PreflopKind::Raise(f) => assert!((f - 0.5).abs() < 1e-12),
+            other => panic!("{other:?}"),
+        }
+        let s = t.spot(0);
+        assert_eq!(
+            (s.family, s.dim("size"), s.dim("players")),
+            ("po_vs_bet", Some("0.42-0.62"), Some("3+"))
+        );
+        // Raise to 600 over 150: 450 above the call, pot 450 + the 150 call.
+        match t.put(0, 600) {
+            PreflopKind::Raise(f) => assert!((f - 0.75).abs() < 1e-12),
+            other => panic!("{other:?}"),
+        }
+        let s = t.spot(1);
+        assert_eq!((s.family, s.dim("was_bettor")), ("po_vs_raise", Some("no")));
+        t.fold(1);
+        let s = t.spot(4);
+        assert_eq!(
+            (s.family, s.dim("was_bettor")),
+            ("po_vs_raise", Some("yes"))
+        );
+        assert_eq!(t.put(4, 600), PreflopKind::Call);
+        assert_eq!(t.n_live(), 2);
+
+        // Turn: the flop raiser (the button) is now the previous aggressor and acts last.
+        t.next_street(1500, folded | (1 << 1), 0);
+        let s = t.spot(4);
+        assert_eq!(
+            (
+                s.dim("street"),
+                s.dim("role"),
+                s.dim("players"),
+                s.dim("seat")
+            ),
+            (Some("turn"), Some("other"), Some("2"), Some("early"))
+        );
+        t.put(4, 0);
+        let s = t.spot(0);
+        assert_eq!((s.dim("role"), s.dim("seat")), (Some("aggr"), Some("last")));
+        // An all-in button no longer counts as the seat acting last.
+        let u = PostflopTracker::start(6, 1, 300, folded, 1 << 0, None);
+        assert_eq!(u.spot(4).dim("seat"), Some("last"));
+        assert_eq!(u.spot(4).dim("role"), Some("none"));
     }
 
     /// 6 seats (button 0), blinds 10 / 20, no ante. Seat 3 limps, seat 4 raises to 100, seats 5 / 0 /

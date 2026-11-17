@@ -368,6 +368,37 @@ class ManagerTests(unittest.TestCase):
             validate_advisor_args(parser.parse_args(
                 ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin", "--crop-f32", "on"]))
 
+    def test_search_pool_model_pass_through(self):
+        import argparse
+        from poker_live.advisor_client import (add_advisor_args, advisor_extra_args,
+                                               validate_advisor_args)
+        parser = argparse.ArgumentParser()
+        add_advisor_args(parser, default_seats=6, debug_help="")
+        base = ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin", "--search"]
+        args = parser.parse_args(base)
+        validate_advisor_args(args)
+        self.assertFalse(any(x.startswith("--search-pool") for x in advisor_extra_args(args)))
+        args = parser.parse_args(base + ["--search-pool-model", "pool.json"])
+        validate_advisor_args(args)
+        extra = advisor_extra_args(args)
+        self.assertEqual(extra[extra.index("--search-pool-model") + 1], "pool.json")
+        self.assertEqual(sum(x.startswith("--search-pool") for x in extra), 1)
+        args = parser.parse_args(base + ["--search-pool-model", "pool.json",
+                                         "--search-pool-conf-scale", "0.25",
+                                         "--search-pool-temp", "0.1"])
+        validate_advisor_args(args)
+        extra = advisor_extra_args(args)
+        self.assertEqual(extra[extra.index("--search-pool-conf-scale") + 1], "0.25")
+        self.assertEqual(extra[extra.index("--search-pool-temp") + 1], "0.1")
+        self.assertNotIn("--search-pool-conf-k", extra)
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            validate_advisor_args(parser.parse_args(
+                ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin",
+                 "--search-pool-model", "pool.json"]))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            validate_advisor_args(parser.parse_args(base + ["--search-pool-temp", "0.1"]))
+
     def test_street_iterations_pass_through(self):
         import argparse
         from poker_live.advisor_client import (add_advisor_args, advisor_extra_args,

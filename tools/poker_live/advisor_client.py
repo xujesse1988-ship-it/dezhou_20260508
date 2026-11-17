@@ -178,6 +178,14 @@ def add_advisor_args(p, default_seats, debug_help):
     p.add_argument("--rake-cap", type=int, default=0)
     # crop 的策略表按 f32 存（advisor 默认 off = f64）：内存减半，概率差约 1e-7。只对 --cropped-checkpoint。
     p.add_argument("--crop-f32", choices=["on", "off"], default=None)
+    # 翻后搜索里对手按牌池的频率行动（advisor 默认关）：给 opponent_analysis 的 pool-model 命令写出的
+    # pool_model.json。置信度 = min(conf-scale × n / (n + conf-k), conf-max)，n = 该格观察次数；
+    # temp = 牌池型对手区分牌的锐度（占底池的比例）。四个参数不传 = advisor 默认（0.5 / 50 / 0.9 / 0.05）。
+    p.add_argument("--search-pool-model", default=None)
+    p.add_argument("--search-pool-conf-scale", type=float, default=None)
+    p.add_argument("--search-pool-conf-k", type=float, default=None)
+    p.add_argument("--search-pool-conf-max", type=float, default=None)
+    p.add_argument("--search-pool-temp", type=float, default=None)
     # hero 真实手牌单独信息集 + 强制发牌（advisor 默认关）：hero 当遍历者时以比例 q 直接发真实底牌，
     # 0 = 只开专用信息集。不传 = 关。
     p.add_argument("--search-real-hand-q", type=float, default=None)
@@ -279,6 +287,12 @@ def validate_advisor_args(args):
         raise SystemExit("--rake-cap 需配 --rake-bps（不抽水时封顶不起作用）")
     if args.crop_f32 is not None and args.cropped_checkpoint is None:
         raise SystemExit("--crop-f32 只对 --cropped-checkpoint 有意义")
+    pool_params = (args.search_pool_conf_scale, args.search_pool_conf_k,
+                   args.search_pool_conf_max, args.search_pool_temp)
+    if args.search_pool_model is not None and not args.search:
+        raise SystemExit("--search-pool-model 需配 --search（它只管搜索求解）")
+    if args.search_pool_model is None and any(x is not None for x in pool_params):
+        raise SystemExit("--search-pool-conf-* / --search-pool-temp 需配 --search-pool-model")
     if args.search_real_hand_q is not None and not args.search:
         raise SystemExit("--search-real-hand-q 需配 --search（它只管搜索求解）")
     if args.search_real_hand_q is not None and not 0.0 <= args.search_real_hand_q <= 1.0:
@@ -335,6 +349,14 @@ def advisor_extra_args(args, warm_profile_hh=None):
             extra += ["--search-time-budget-ms", str(args.search_time_budget_ms)]
         if args.search_lcfr:
             extra.append("--search-lcfr")
+        if args.search_pool_model is not None:
+            extra += ["--search-pool-model", args.search_pool_model]
+            for flag, value in (("--search-pool-conf-scale", args.search_pool_conf_scale),
+                                ("--search-pool-conf-k", args.search_pool_conf_k),
+                                ("--search-pool-conf-max", args.search_pool_conf_max),
+                                ("--search-pool-temp", args.search_pool_temp)):
+                if value is not None:
+                    extra += [flag, repr(value)]
         if args.search_max_nodes is not None:
             extra += ["--search-max-nodes", str(args.search_max_nodes)]
         if args.search_range_uniform_mix is not None:

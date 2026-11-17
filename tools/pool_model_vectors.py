@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Export cross-check vectors for the Rust side of the pool model (`src/training/pool_model.rs`).
 
-Takes every N-th stored hand, and for each preflop decision writes what
+Takes every N-th stored hand, and for each decision writes what
 `opponent_analysis.pool_model.hand_obs` made of it (situation, features, action kind, pot fraction)
-next to the bare betting sequence (seat index from the button, fold or new street total). It also
-fits a model on those hands and writes it with its answer for every cell seen. The Rust test
+next to the bare betting sequence (seat index from the button, fold or new street total); preflop
+and postflop decisions go to separate files. It also fits a model on those hands and writes it with
+its answer for every cell seen. The Rust test
 `tests/pool_model_vectors.rs` replays the sequences and must reproduce all of it.
 
 No names, cards or hand ids are written.
@@ -54,16 +55,25 @@ def hand_vector(h):
     obs = pool_model.hand_obs(anon)
     if len(obs) != len(h.decisions):
         return None
-    acts = []
+    acts, post = [], []
     for d, o in zip(h.decisions, obs):
         if d.street != "preflop":
-            break
+            post.append({
+                "street": d.street, "seat": idx[d.seat], "fold": d.kind == "fold", "to": d.to_total,
+                "all_in": d.all_in, "pot": d.pot_before,
+                "family": o.family, "dims": o.dims, "kind": d.kind, "frac": o.size,
+            })
+            continue
         acts.append({
-            "seat": idx[d.seat], "fold": d.kind == "fold", "to": d.to_total,
+            "seat": idx[d.seat], "fold": d.kind == "fold", "to": d.to_total, "all_in": d.all_in,
             "family": o.family, "dims": o.dims, "kind": d.kind, "frac": o.size,
         })
-    return {"labels": [h.positions[s] for s in ring], "contrib": [contrib[s] for s in ring],
-            "pot": pre[0].pot_before, "actions": acts}, [o for o in obs]
+    return ({"labels": [h.positions[s] for s in ring], "contrib": [contrib[s] for s in ring],
+             "pot": pre[0].pot_before, "actions": acts},
+            {"n": len(ring), "preflop": [{"seat": a["seat"], "fold": a["fold"], "raise": a["kind"] == "raise",
+                                          "all_in": a["all_in"]} for a in acts],
+             "actions": post},
+            [o for o in obs])
 
 
 def main() -> int:
@@ -74,30 +84,38 @@ def main() -> int:
     ap.add_argument("--every", type=int, default=15)
     a = ap.parse_args()
     hands = sorted(db.load_hands(a.db, a.platform), key=lambda h: h.hand_id)[:: a.every]
-    vectors, all_obs = [], []
+    vectors, post_vectors, all_obs = [], [], []
     for h in hands:
         got = hand_vector(h)
         if got is None:
             continue
         vectors.append(got[0])
-        all_obs.extend(got[1])
+        if got[1]["actions"]:
+            post_vectors.append(got[1])
+        all_obs.extend(got[2])
     model = pool_model.fit(all_obs)
     model["shown"] = {}
-    cells = {}
-    for v in vectors:
-        for act in v["actions"]:
-            key = (act["family"], tuple(sorted(act["dims"].items())))
-            if key not in cells:
-                cells[key] = {"family": act["family"], "dims": act["dims"],
-                              **pool_model.predict(model, act["family"], act["dims"])}
+
+    def cells_of(vs):
+        cells = {}
+        for v in vs:
+            for act in v["actions"]:
+                key = (act["family"], tuple(sorted(act["dims"].items())))
+                if key not in cells:
+                    cells[key] = {"family": act["family"], "dims": act["dims"],
+                                  **pool_model.predict(model, act["family"], act["dims"])}
+        return cells
+
     os.makedirs(a.out, exist_ok=True)
     pool_model.save(model, os.path.join(a.out, "pool_model_small.json"))
-    with open(os.path.join(a.out, "pool_model_preflop_vectors.json"), "w") as f:
-        json.dump({"hands": vectors, "predictions": list(cells.values())}, f, ensure_ascii=False,
-                  separators=(",", ":"), sort_keys=True)
-        f.write("\n")
-    n_act = sum(len(v["actions"]) for v in vectors)
-    print(f"{len(vectors)} hands, {n_act} preflop decisions, {len(cells)} cells")
+    for name, vs in (("preflop", vectors), ("postflop", post_vectors)):
+        cells = cells_of(vs)
+        with open(os.path.join(a.out, f"pool_model_{name}_vectors.json"), "w") as f:
+            json.dump({"hands": vs, "predictions": list(cells.values())}, f, ensure_ascii=False,
+                      separators=(",", ":"), sort_keys=True)
+            f.write("\n")
+        n_act = sum(len(v["actions"]) for v in vs)
+        print(f"{len(vs)} hands, {n_act} {name} decisions, {len(cells)} cells")
     return 0
 
 

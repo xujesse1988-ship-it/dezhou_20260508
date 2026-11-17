@@ -31,6 +31,7 @@ use crate::training::nlhe_betting_tree::{Child, NodeId};
 use crate::training::regret::{LocalRegretDelta, SigmaVec};
 use crate::training::sampling::sample_discrete;
 use crate::training::subgame::SubgameNlheGame;
+use crate::training::subgame_pool::{PoolConstraint, PoolNodeReport, PoolParent, PoolRow};
 
 type ShortVec<T> = SmallVec<[T; 8]>;
 
@@ -70,6 +71,12 @@ pub struct SubgameTables {
     strategy_time: Vec<f64>,
     /// `(row, action)` of every [`FROZEN`] row (a handful: hero's earlier decisions this round).
     frozen: Vec<(u32, u8)>,
+    /// Per row: visits with the row's actor not traversing, counted only at nodes under a pool
+    /// constraint ([`PoolConstraint`]); the bucket weights its offsets are fitted with.
+    pool_w: Vec<f32>,
+    /// Per row: number of regret updates, rescaled with the regrets (LCFR), so that
+    /// `regret / regret_w` is the row's average regret per update in chips.
+    regret_w: Vec<f32>,
 }
 
 impl SubgameTables {
@@ -87,6 +94,8 @@ impl SubgameTables {
             strategy: Vec::new(),
             strategy_time: Vec::new(),
             frozen: Vec::new(),
+            pool_w: Vec::new(),
+            regret_w: Vec::new(),
         }
     }
 
@@ -150,6 +159,8 @@ impl SubgameTables {
             .push(u8::try_from(n_actions).expect("action count exceeds u8"));
         self.flags.push(0);
         self.visits.push(0);
+        self.pool_w.push(0.0);
+        self.regret_w.push(0.0);
         self.strategy_time.push(0.0);
         self.regret.resize(off + n_actions, 0.0);
         self.strategy.resize(off + n_actions, 0.0);
@@ -247,6 +258,7 @@ impl SubgameTables {
     pub(crate) fn accumulate_regret(&mut self, info: InfoSetId, delta: &[f64]) -> usize {
         let row = self.find_or_insert(info, delta.len());
         self.flags[row] |= REGRET_PRESENT;
+        self.regret_w[row] += 1.0;
         let range = self.range(row);
         for (slot, &d) in self.regret[range].iter_mut().zip(delta) {
             *slot += d;
@@ -285,12 +297,69 @@ impl SubgameTables {
         self.visits[row] = self.visits[row].saturating_add(1);
     }
 
+    /// Count `visits` visits of `row` with its actor not traversing ([`Self::pool_w`]).
+    fn add_pool_visits(&mut self, row: usize, visits: f32) {
+        self.pool_w[row] += visits;
+    }
+
+    /// 1 / number of regret updates of `row` (0 when it has none).
+    #[inline]
+    fn inv_regret_w(&self, row: usize) -> f64 {
+        let w = self.regret_w[row];
+        if w > 0.0 {
+            1.0 / f64::from(w)
+        } else {
+            0.0
+        }
+    }
+
+    /// Every bucket of `node` with a positive pool weight.
+    pub(crate) fn pool_rows(&self, node: NodeId) -> Vec<PoolRow<'_>> {
+        let base = self.node_block[node as usize];
+        if base == NONE {
+            return Vec::new();
+        }
+        let base = base as usize;
+        self.row_ids[base..base + self.node_buckets[node as usize] as usize]
+            .iter()
+            .filter(|&&r| r != NONE)
+            .filter_map(|&r| {
+                let row = r as usize;
+                let w = self.pool_w[row];
+                (w > 0.0).then(|| {
+                    (
+                        f64::from(w),
+                        &self.regret[self.range(row)],
+                        self.inv_regret_w(row),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Regret sums of `info`'s row and 1 / its number of regret updates; `None` if the row does
+    /// not exist.
+    fn regret_avg(&self, info: InfoSetId) -> Option<(&[f64], f64)> {
+        self.find(info)
+            .map(|row| (&self.regret[self.range(row)], self.inv_regret_w(row)))
+    }
+
+    /// LCFR rescale of the pool weights (they follow the strategy sums).
+    fn rescale_pool(&mut self, factor: f64) {
+        for w in &mut self.pool_w {
+            *w *= factor as f32;
+        }
+    }
+
     /// LCFR rescale. Values of rows without the matching flag are 0 and stay 0, so this equals
     /// the HashMap path's per-entry `*v *= factor`.
     fn rescale(&mut self, factor: f64, regret: bool) {
         if regret {
             for v in &mut self.regret {
                 *v *= factor;
+            }
+            for w in &mut self.regret_w {
+                *w *= factor as f32;
             }
         }
         for v in &mut self.strategy {
@@ -374,6 +443,7 @@ struct ExactAverage {
 
 /// [`ExactAverage`] sweep below node `id`. `reach[seat]` = the (bucket, own reach) pairs of `seat`
 /// still alive on the path from the root to `id`.
+#[allow(clippy::too_many_arguments)]
 fn exact_sweep(
     tree: &crate::training::nlhe_betting_tree::PublicBettingTree,
     id: NodeId,
@@ -382,6 +452,7 @@ fn exact_sweep(
     t_mid: f64,
     reach: &mut [Vec<(u32, f64)>],
     tables: &mut SubgameTables,
+    pool: Option<&PoolConstraint>,
 ) {
     let node = tree.node(id);
     if node.depth_limit_leaf || node.street != street {
@@ -389,6 +460,12 @@ fn exact_sweep(
     }
     let seat = node.player_acting as usize;
     let n = node.legal_actions.len();
+    // A pool-constrained opponent's average is the average of what it plays.
+    let constrained = pool.and_then(|p| {
+        p.get(id)
+            .and_then(|pn| pn.constraint.as_ref())
+            .map(|c| (p, c))
+    });
     let mine = std::mem::take(&mut reach[seat]);
     let mut live: Vec<(u32, f64, SigmaVec)> = Vec::with_capacity(mine.len());
     for &(bucket, pi) in &mine {
@@ -400,6 +477,10 @@ fn exact_sweep(
             continue;
         }
         let sigma = tables.current_strategy_smallvec(info, n);
+        let sigma = match constrained {
+            Some((p, c)) => p.played(id, c, tables.regret_avg(info), &sigma),
+            None => sigma,
+        };
         let scale = weight * pi;
         let weighted: ShortVec<f64> = sigma.iter().map(|s| scale * s).collect();
         tables.accumulate_strategy_at(info, &weighted, t_mid);
@@ -414,7 +495,7 @@ fn exact_sweep(
                     (next_pi > 0.0).then_some((*bucket, next_pi))
                 })
                 .collect();
-            exact_sweep(tree, next, street, weight, t_mid, reach, tables);
+            exact_sweep(tree, next, street, weight, t_mid, reach, tables, pool);
         }
     }
     reach[seat] = mine;
@@ -432,6 +513,39 @@ pub struct SubgameTrainer {
     track_visits: bool,
     /// `None` only for an empty subtree.
     exact: Option<ExactAverage>,
+    /// Opponents act with the pool's frequencies ([`Self::with_pool`]); `None` = plain solve.
+    pool: Option<PoolConstraint>,
+    /// `update_count` at which the pool offsets are refitted next.
+    pool_next_fit: u64,
+}
+
+/// Updates before the first pool-offset fit; later fits are spaced by an eighth of the updates
+/// done so far.
+const POOL_FIT_FIRST: u64 = 256;
+
+/// The parallel workers report one in this many of their visits to pool-constrained nodes (each
+/// standing for this many): with several opponents there are a few such visits per regret update,
+/// and all of them are merged on one thread.
+const POOL_VISIT_STRIDE: u64 = 4;
+
+/// A parallel worker's visits to pool-constrained nodes with the actor not traversing, thinned to
+/// one in [`POOL_VISIT_STRIDE`]. Which ones are kept is decided by a hash of a running count and
+/// the infoset, so that no node is skipped systematically and no random number is consumed.
+#[derive(Default)]
+struct PoolVisits {
+    seen: u64,
+    kept: Vec<(InfoSetId, u8)>,
+}
+
+impl PoolVisits {
+    #[inline]
+    fn record(&mut self, info: InfoSetId, n_actions: usize) {
+        self.seen = self.seen.wrapping_add(1);
+        let h = (self.seen ^ info.raw().rotate_left(17)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        if (h >> 32) % POOL_VISIT_STRIDE == 0 {
+            self.kept.push((info, n_actions as u8));
+        }
+    }
 }
 
 impl SubgameTrainer {
@@ -473,7 +587,57 @@ impl SubgameTrainer {
             traverser_rotation: None,
             track_visits: false,
             exact,
+            pool: None,
+            pool_next_fit: POOL_FIT_FIRST,
         }
+    }
+
+    /// Opponents act with the pool's frequencies ([`crate::training::subgame_pool`]).
+    pub fn with_pool(mut self, pool: PoolConstraint) -> Self {
+        assert_eq!(
+            self.update_count, 0,
+            "the pool constraint must be configured before any step"
+        );
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Number of opponent nodes acting with the pool's frequencies (0 without [`Self::with_pool`]).
+    pub fn pool_fitted_nodes(&self) -> usize {
+        self.pool.as_ref().map_or(0, PoolConstraint::fitted_nodes)
+    }
+
+    /// Fitted pool-constrained nodes with the frequencies of the free and the played strategies
+    /// (empty without [`Self::with_pool`]).
+    pub fn pool_report(&self) -> Vec<PoolNodeReport> {
+        let tree = self.game.subtree();
+        self.pool.as_ref().map_or_else(Vec::new, |p| {
+            p.report(
+                |node| self.tables.pool_rows(node),
+                |node| tree.node(node).player_acting,
+            )
+        })
+    }
+
+    /// Refit the pool offsets now (the solve does it on a schedule; call once more before reading
+    /// so that the strategies read are fitted to the final regrets).
+    pub fn fit_pool(&mut self) {
+        if let Some(pool) = self.pool.as_mut() {
+            let tables = &self.tables;
+            pool.fit(true, |node| tables.pool_rows(node));
+        }
+    }
+
+    fn maybe_fit_pool(&mut self) {
+        let Some(pool) = self.pool.as_mut() else {
+            return;
+        };
+        if self.update_count < self.pool_next_fit {
+            return;
+        }
+        self.pool_next_fit = self.update_count + (self.update_count / 8).max(POOL_FIT_FIRST);
+        let tables = &self.tables;
+        pool.fit(false, |node| tables.pool_rows(node));
     }
 
     /// Cap on updates between two exact-average sweeps ([`ExactAverage`]); `1` = sweep after every
@@ -521,6 +685,7 @@ impl SubgameTrainer {
             t_mid,
             &mut reach,
             &mut self.tables,
+            self.pool.as_ref(),
         );
     }
 
@@ -591,6 +756,11 @@ impl SubgameTrainer {
             let n = self.lcfr_periods_completed + 1;
             let factor = (n as f64) / ((n + 1) as f64);
             self.tables.rescale(factor, true);
+            if let Some(pool) = self.pool.as_mut() {
+                // The offsets are in chips per update and need no rescale.
+                self.tables.rescale_pool(factor);
+                pool.rescale(factor);
+            }
             self.lcfr_periods_completed = n;
         }
     }
@@ -601,8 +771,17 @@ impl SubgameTrainer {
         let traverser = self.traverser_at(self.update_count);
         let root = self.game.root_for_traverser(traverser, rng);
         let track = self.track_visits;
-        recurse(root, traverser, &mut self.tables, track, rng);
+        recurse(
+            root,
+            traverser,
+            &mut self.tables,
+            track,
+            self.pool.as_ref(),
+            None,
+            rng,
+        );
         self.update_count += 1;
+        self.maybe_fit_pool();
         self.maybe_sweep();
         self.maybe_lcfr_rescale();
         Ok(())
@@ -625,11 +804,14 @@ impl SubgameTrainer {
         let shared = &self.tables;
         let rotation = self.traverser_rotation.as_deref();
         let n_players = game.n_players() as u64;
-        let deltas: Vec<LocalRegretDelta<InfoSetId>> = rng_pool[..n_active]
+        let pool = self.pool.as_ref();
+        type Local = (LocalRegretDelta<InfoSetId>, PoolVisits);
+        let deltas: Vec<Local> = rng_pool[..n_active]
             .par_iter_mut()
             .enumerate()
             .map(|(tid, rng_slot)| {
                 let mut local_regret = LocalRegretDelta::new();
+                let mut local_pool = PoolVisits::default();
                 let rng = rng_slot.as_mut();
                 for batch_idx in 0..batch_per_worker {
                     let t = base + batch_idx as u64 * n_active as u64 + tid as u64;
@@ -638,12 +820,21 @@ impl SubgameTrainer {
                         None => (t % n_players) as PlayerId,
                     };
                     let root = game.root_for_traverser(traverser, rng);
-                    recurse_parallel(root, traverser, shared, &mut local_regret, rng);
+                    recurse_parallel(
+                        root,
+                        traverser,
+                        shared,
+                        &mut local_regret,
+                        pool,
+                        &mut local_pool,
+                        None,
+                        rng,
+                    );
                 }
-                local_regret
+                (local_regret, local_pool)
             })
             .collect();
-        for local_regret in deltas {
+        for (local_regret, local_pool) in deltas {
             for (info, delta) in local_regret.into_entries() {
                 // One regret push = one traverser visit.
                 let row = self.tables.accumulate_regret(info, &delta);
@@ -651,8 +842,13 @@ impl SubgameTrainer {
                     self.tables.add_visit(row);
                 }
             }
+            for (info, n_actions) in local_pool.kept {
+                let row = self.tables.find_or_insert(info, n_actions as usize);
+                self.tables.add_pool_visits(row, POOL_VISIT_STRIDE as f32);
+            }
         }
         self.update_count += (n_active as u64) * (batch_per_worker as u64);
+        self.maybe_fit_pool();
         self.maybe_sweep();
         self.maybe_lcfr_rescale();
         Ok(())
@@ -750,13 +946,27 @@ impl SubgameTrainer {
     }
 }
 
+/// Uniform draw in [0, 1) (53 bits), one `next_u64`.
+#[inline]
+fn unit_f64(rng: &mut dyn RngSource) -> f64 {
+    (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+}
+
 /// Single-thread ES-MCCFR recursion; line for line `trainer::recurse_es` (subgames have no
 /// in-game chance nodes) minus the average-strategy accumulation, which [`ExactAverage`] does.
+///
+/// With a pool constraint (`pool`), a constrained opponent node plays the mixture of its free
+/// and pool-type strategies ([`PoolConstraint::played`]): when the actor is not traversing, a
+/// coin with the node's confidence picks which of the two the action is drawn from; when it is,
+/// the node is worth the mixture's value while the regrets stay those of the free strategy.
+/// `parent` = the step that led to `state`.
 fn recurse(
     state: <SubgameNlheGame as Game>::State,
     traverser: PlayerId,
     tables: &mut SubgameTables,
     track_visits: bool,
+    pool: Option<&PoolConstraint>,
+    parent: Option<PoolParent<'_>>,
     rng: &mut dyn RngSource,
 ) -> f64 {
     match SubgameNlheGame::current(&state) {
@@ -767,38 +977,86 @@ fn recurse(
             let actions = SubgameNlheGame::legal_actions(&state);
             let n = actions.len();
             let row = tables.init_regret(info, n);
+            let pool_node = pool.map(|p| p.node(&state, actor, &actions, parent));
+            let step = |a: usize| pool_node.map(|pn| PoolParent::new(pn, actor, &actions[a]));
             if let Some(a) = tables.frozen_action(row) {
                 // Frozen (hero's real hand already took this action this round): follow it, learn
                 // nothing here, as traverser and as non-traverser alike.
                 let next_state = SubgameNlheGame::next(state, actions[a], rng);
-                return recurse(next_state, traverser, tables, track_visits, rng);
+                return recurse(
+                    next_state,
+                    traverser,
+                    tables,
+                    track_visits,
+                    pool,
+                    step(a),
+                    rng,
+                );
             }
             let sigma = tables.current_strategy_smallvec(info, n);
+            let cons = pool.zip(pool_node.and_then(|pn| pn.constraint.as_ref()));
+            let node_id = state.current_node_id;
 
             if actor == traverser {
                 if track_visits {
                     tables.add_visit(row);
                 }
                 let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
-                for action in &actions {
+                for (i, action) in actions.iter().enumerate() {
                     let next_state = SubgameNlheGame::next(state.clone(), *action, rng);
-                    cfvs.push(recurse(next_state, traverser, tables, track_visits, rng));
+                    cfvs.push(recurse(
+                        next_state,
+                        traverser,
+                        tables,
+                        track_visits,
+                        pool,
+                        step(i),
+                        rng,
+                    ));
                 }
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
+                // The node is worth what is played there; the regrets are the free strategy's.
+                let node_value = match cons {
+                    Some((p, c)) => {
+                        let regrets = (&tables.regret[tables.range(row)], tables.inv_regret_w(row));
+                        let played = p.played(node_id, c, Some(regrets), &sigma);
+                        played.iter().zip(&cfvs).map(|(s, c)| s * c).sum()
+                    }
+                    None => sigma_value,
+                };
                 let delta: ShortVec<f64> = cfvs.iter().map(|c| c - sigma_value).collect();
                 tables.accumulate_regret(info, &delta);
-                sigma_value
+                node_value
             } else {
-                let nonzero_dist: ShortVec<(<SubgameNlheGame as Game>::Action, f64)> = actions
+                // Data-biased response: with probability `confidence` this decision is the
+                // pool-type player's, otherwise the free one's.
+                let pool_sigma = cons.and_then(|(p, c)| {
+                    tables.add_pool_visits(row, 1.0);
+                    (p.is_fitted(node_id) && unit_f64(rng) < c.confidence).then(|| {
+                        let regrets = (&tables.regret[tables.range(row)], tables.inv_regret_w(row));
+                        p.pool_strategy(node_id, c, Some(regrets))
+                    })
+                });
+                let nonzero_dist: ShortVec<(usize, f64)> = pool_sigma
+                    .as_ref()
+                    .unwrap_or(&sigma)
                     .iter()
                     .copied()
-                    .zip(sigma.iter().copied())
+                    .enumerate()
                     .filter(|(_, p)| *p > 0.0)
                     .collect();
                 debug_assert!(!nonzero_dist.is_empty(), "non-traverser σ all-zero");
                 let sampled = sample_discrete(&nonzero_dist, rng);
-                let next_state = SubgameNlheGame::next(state, sampled, rng);
-                recurse(next_state, traverser, tables, track_visits, rng)
+                let next_state = SubgameNlheGame::next(state, actions[sampled], rng);
+                recurse(
+                    next_state,
+                    traverser,
+                    tables,
+                    track_visits,
+                    pool,
+                    step(sampled),
+                    rng,
+                )
             }
         }
     }
@@ -806,11 +1064,16 @@ fn recurse(
 
 /// Parallel worker recursion; line for line `trainer::recurse_es_parallel` (σ from the shared
 /// pre-dispatch tables, regret deltas pushed locally) minus the average-strategy accumulation.
+/// Pool constraint as in [`recurse`]; visits of constrained nodes go to `local_pool`.
+#[allow(clippy::too_many_arguments)]
 fn recurse_parallel(
     state: <SubgameNlheGame as Game>::State,
     traverser: PlayerId,
     shared: &SubgameTables,
     local_regret: &mut LocalRegretDelta<InfoSetId>,
+    pool: Option<&PoolConstraint>,
+    local_pool: &mut PoolVisits,
+    parent: Option<PoolParent<'_>>,
     rng: &mut dyn RngSource,
 ) -> f64 {
     match SubgameNlheGame::current(&state) {
@@ -820,24 +1083,40 @@ fn recurse_parallel(
             let info = SubgameNlheGame::info_set(&state, actor);
             let actions = SubgameNlheGame::legal_actions(&state);
             let n = actions.len();
+            let pool_node = pool.map(|p| p.node(&state, actor, &actions, parent));
+            let step = |a: usize| pool_node.map(|pn| PoolParent::new(pn, actor, &actions[a]));
             if let Some(a) = shared.frozen_action_of(info) {
                 // Frozen: same as `recurse` (no sampling draw, no regret).
                 let next_state = SubgameNlheGame::next(state, actions[a], rng);
-                return recurse_parallel(next_state, traverser, shared, local_regret, rng);
+                return recurse_parallel(
+                    next_state,
+                    traverser,
+                    shared,
+                    local_regret,
+                    pool,
+                    local_pool,
+                    step(a),
+                    rng,
+                );
             }
             let sigma = shared.current_strategy_smallvec(info, n);
+            let cons = pool.zip(pool_node.and_then(|pn| pn.constraint.as_ref()));
+            let node_id = state.current_node_id;
 
             if actor == traverser {
                 debug_assert!(n > 0, "traverser node must have a legal action");
                 let mut cfvs: ShortVec<f64> = ShortVec::with_capacity(n);
                 let last_idx = n - 1;
-                for &action in &actions[..last_idx] {
+                for (i, &action) in actions[..last_idx].iter().enumerate() {
                     let next_state = SubgameNlheGame::next(state.clone(), action, rng);
                     cfvs.push(recurse_parallel(
                         next_state,
                         traverser,
                         shared,
                         local_regret,
+                        pool,
+                        local_pool,
+                        step(i),
                         rng,
                     ));
                 }
@@ -847,23 +1126,48 @@ fn recurse_parallel(
                     traverser,
                     shared,
                     local_regret,
+                    pool,
+                    local_pool,
+                    step(last_idx),
                     rng,
                 ));
                 let sigma_value: f64 = sigma.iter().zip(&cfvs).map(|(s, c)| s * c).sum();
                 let delta: SigmaVec = cfvs.iter().map(|c| c - sigma_value).collect();
                 local_regret.push(info, delta);
-                sigma_value
+                match cons {
+                    Some((p, c)) => {
+                        let played = p.played(node_id, c, shared.regret_avg(info), &sigma);
+                        played.iter().zip(&cfvs).map(|(s, c)| s * c).sum()
+                    }
+                    None => sigma_value,
+                }
             } else {
-                let nonzero_dist: ShortVec<(<SubgameNlheGame as Game>::Action, f64)> = actions
+                let pool_sigma = cons.and_then(|(p, c)| {
+                    local_pool.record(info, n);
+                    (p.is_fitted(node_id) && unit_f64(rng) < c.confidence)
+                        .then(|| p.pool_strategy(node_id, c, shared.regret_avg(info)))
+                });
+                let nonzero_dist: ShortVec<(usize, f64)> = pool_sigma
+                    .as_ref()
+                    .unwrap_or(&sigma)
                     .iter()
                     .copied()
-                    .zip(sigma.iter().copied())
+                    .enumerate()
                     .filter(|(_, p)| *p > 0.0)
                     .collect();
                 debug_assert!(!nonzero_dist.is_empty(), "non-traverser σ all-zero");
                 let sampled = sample_discrete(&nonzero_dist, rng);
-                let next_state = SubgameNlheGame::next(state, sampled, rng);
-                recurse_parallel(next_state, traverser, shared, local_regret, rng)
+                let next_state = SubgameNlheGame::next(state, actions[sampled], rng);
+                recurse_parallel(
+                    next_state,
+                    traverser,
+                    shared,
+                    local_regret,
+                    pool,
+                    local_pool,
+                    step(sampled),
+                    rng,
+                )
             }
         }
     }
@@ -1003,6 +1307,12 @@ mod tests {
 
     /// Same limped pot checked down to the river (three live, first to act decides).
     fn three_way_river_sub() -> SubgameNlheGame {
+        three_way_river_sub_on(Arc::new(BucketTable::stub_for_postflop(
+            BucketConfig::default_500_500_500(),
+        )))
+    }
+
+    fn three_way_river_sub_on(table: Arc<BucketTable>) -> SubgameNlheGame {
         let cfg = TableConfig::six_max_at_bb(100);
         let mut st = GameState::new(&cfg, 0x3_3A7);
         for _ in 0..3 {
@@ -1022,10 +1332,175 @@ mod tests {
             .enumerate()
             .filter(|(_, p)| matches!(p.status, PlayerStatus::Active | PlayerStatus::AllIn))
             .fold(0u16, |e, (i, _)| e | (1 << i));
-        let table = Arc::new(BucketTable::stub_for_postflop(
-            BucketConfig::default_500_500_500(),
-        ));
         SubgameNlheGame::new(table, cfg, abs, rules, st, entrants, 0)
+    }
+
+    /// 40 hand buckets per street (hands grouped by a hash, not by strength): the pool tests need
+    /// a node's frequencies to be a mix over buckets, and few enough buckets for each to be
+    /// visited often in a short solve. About 0.5 GiB, hence `#[ignore]` on its users.
+    fn hashed_bucket_table() -> Arc<BucketTable> {
+        Arc::new(BucketTable::synthetic_v3_for_tests(
+            BucketConfig::new(40, 40, 40).expect("bucket config"),
+            0xB0C4E7,
+        ))
+    }
+
+    /// Full trust in the pool (confidence ≈ 1): after the solve every well-visited opponent node
+    /// acts with the pool's frequencies, on the root's street and (three-way flop) on later ones,
+    /// single-threaded and in parallel; hero's nodes are left alone.
+    #[test]
+    #[ignore = "builds a 0.5 GiB synthetic bucket table"]
+    fn pool_constraint_matches_target_frequencies() {
+        use crate::training::subgame_pool::{
+            test_pool, tracker_from_history, PoolConstraint, PoolSearchParams, CLASS_AGGRESSIVE,
+            CLASS_FOLD, CLASS_PASSIVE,
+        };
+        let params = PoolSearchParams {
+            conf_k: 1e-6,
+            conf_scale: 1.0,
+            conf_max: 1.0,
+            temp: 0.05,
+        };
+        // Check 85 / bet 15; facing a bet fold 70 / call 25 / raise 5; facing a raise 50 / 40 / 10.
+        let pool = test_pool([850, 150], [700, 250, 50], [500, 400, 100], params);
+        let hero: PlayerId = 1; // SB, first to act
+        let table = hashed_bucket_table();
+        for parallel in [false, true] {
+            let sub = three_way_river_sub_on(Arc::clone(&table));
+            let n_nodes = sub.subtree().num_nodes();
+            let root_tracker = tracker_from_history(sub.template()).expect("river root");
+            let constraint = PoolConstraint::new(pool, hero, root_tracker, n_nodes);
+            let mut trainer = SubgameTrainer::new(sub).with_pool(constraint);
+            if parallel {
+                let mut rngs: Vec<Box<dyn RngSource>> = (0..2u64)
+                    .map(|t| Box::new(ChaCha20Rng::from_seed(0x9001 + t)) as Box<dyn RngSource>)
+                    .collect();
+                for _ in 0..150 {
+                    trainer.step_parallel(&mut rngs, 2, 100).expect("step");
+                }
+            } else {
+                let mut rng = ChaCha20Rng::from_seed(0x9001);
+                for _ in 0..30_000 {
+                    trainer.step(&mut rng).expect("step");
+                }
+            }
+            trainer.fit_pool();
+            let report = trainer.pool_report();
+            // Weighted by how often each node was reached: how far the played frequencies are from
+            // the pool's, and how far the free strategy would have been.
+            let (mut miss, mut free_miss, mut total) = (0.0, 0.0, 0.0);
+            let mut families = std::collections::BTreeSet::new();
+            for r in &report {
+                assert_ne!(r.seat, hero, "hero is never constrained");
+                families.insert(r.spot.family);
+                for c in [CLASS_FOLD, CLASS_PASSIVE, CLASS_AGGRESSIVE] {
+                    miss += r.weight * (r.played[c] - r.target[c]).abs() / 2.0;
+                    free_miss += r.weight * (r.free[c] - r.target[c]).abs() / 2.0;
+                }
+                total += r.weight;
+            }
+            let (miss, free_miss) = (miss / total, free_miss / total);
+            eprintln!(
+                "parallel {parallel}: {} fitted nodes, played off by {miss:.3}, free off by {free_miss:.3}",
+                report.len()
+            );
+            assert!(report.len() >= 20, "parallel {parallel}: {}", report.len());
+            assert_eq!(families.len(), 3, "parallel {parallel}: {families:?}");
+            assert!(
+                miss < 0.01 && free_miss > 0.3,
+                "parallel {parallel}: played off by {miss:.3}, free off by {free_miss:.3}"
+            );
+            // The most visited nodes one by one.
+            for r in report.iter().take(4) {
+                for c in [CLASS_FOLD, CLASS_PASSIVE, CLASS_AGGRESSIVE] {
+                    assert!(
+                        (r.played[c] - r.target[c]).abs() < 0.02,
+                        "parallel {parallel} node {} {:?}: played {:?} target {:?} (free {:?}, weight {})",
+                        r.node,
+                        r.spot,
+                        r.played,
+                        r.target,
+                        r.free,
+                        r.weight
+                    );
+                }
+            }
+        }
+    }
+
+    /// Hero answers the pool. Real hand buckets (the test is skipped without the bucket table
+    /// file): against opponents who fold nine times in ten to a bet he bets almost always; against
+    /// opponents who call nine times in ten he bets far less, having few hands worth a value bet.
+    #[test]
+    #[ignore = "needs the real bucket table (artifacts/ or POOL_TEST_BUCKET_TABLE)"]
+    fn pool_constraint_moves_hero_the_right_way() {
+        use crate::training::subgame_pool::{
+            test_pool, tracker_from_history, PoolConstraint, PoolSearchParams,
+        };
+        let path = std::env::var("POOL_TEST_BUCKET_TABLE").unwrap_or_else(|_| {
+            "artifacts/bucket_table_default_500_500_500_seed_cafebabe_schemav4.bin".to_string()
+        });
+        let table = match BucketTable::open(std::path::Path::new(&path)) {
+            Ok(t) => Arc::new(t),
+            Err(e) => {
+                eprintln!("skipped: cannot open bucket table {path}: {e:?}");
+                return;
+            }
+        };
+        let params = PoolSearchParams {
+            conf_k: 1e-6,
+            conf_scale: 1.0,
+            conf_max: 1.0,
+            temp: 0.05,
+        };
+        let hero: PlayerId = 1;
+        // Share of hero's root decisions that are a bet, weighted by how often each bucket came up.
+        let hero_bet = |vs_bet: [u64; 3]| -> f64 {
+            let pool = test_pool([850, 150], vs_bet, [500, 400, 100], params);
+            let sub = three_way_river_sub_on(Arc::clone(&table));
+            let n_nodes = sub.subtree().num_nodes();
+            let root = sub.subtree().root_id();
+            let root_tracker = tracker_from_history(sub.template()).expect("river root");
+            let constraint = PoolConstraint::new(pool, hero, root_tracker, n_nodes);
+            let mut trainer = SubgameTrainer::new(sub)
+                .with_visit_counts()
+                .with_pool(constraint);
+            let mut rng = ChaCha20Rng::from_seed(0x9002);
+            for _ in 0..150_000 {
+                trainer.step(&mut rng).expect("step");
+            }
+            trainer.flush_exact_average();
+            let node = trainer.game().subtree().node(root);
+            assert_eq!(node.player_acting, hero);
+            let buckets = trainer.tables.bucket_count_by_street[street_index(StreetTag::River)];
+            let (mut bet, mut visits, mut rows) = (0.0, 0.0, 0);
+            for b in 0..buckets {
+                let info = pack_info_set_v2(b, root, StreetTag::River);
+                let v = f64::from(trainer.visit_count(&info).unwrap_or(0));
+                if v == 0.0 {
+                    continue;
+                }
+                let avg = trainer.average_strategy(&info);
+                let p_bet: f64 = node
+                    .legal_actions
+                    .iter()
+                    .zip(&avg)
+                    .filter(|(t, _)| !matches!(t, AbstractActionTag::Check))
+                    .map(|(_, p)| p)
+                    .sum();
+                bet += v * p_bet;
+                visits += v;
+                rows += 1;
+            }
+            assert!(rows >= 10, "{rows} hero buckets at the root");
+            bet / visits
+        };
+        let vs_folders = hero_bet([900, 80, 20]);
+        let vs_callers = hero_bet([50, 900, 50]);
+        assert!(
+            vs_folders > 0.85 && vs_folders > vs_callers + 0.25,
+            "hero bets {vs_folders:.3} vs folders, {vs_callers:.3} vs callers"
+        );
     }
 
     /// Regrets, visit counts and current strategies bit-identical on every row; `b` has averages

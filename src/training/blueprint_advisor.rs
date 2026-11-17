@@ -1225,6 +1225,8 @@ mod tests {
             frozen_avg_recency: 0.0,
             freeze_real_line: false,
             real_hand_q: None,
+            pool: None,
+            pool_root: None,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;
