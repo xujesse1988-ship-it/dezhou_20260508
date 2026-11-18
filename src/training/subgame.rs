@@ -340,13 +340,56 @@ impl SubgameNlheGame {
             !template.is_terminal() && template.current_player().is_some(),
             "SubgameNlheGame::new: template 须是非终局 decision 节点"
         );
-        let subtree = Arc::new(PublicBettingTree::build_subtree(
+        let subtree =
+            PublicBettingTree::build_subtree(&template, &abs, rules, entrants, raises_on_street);
+        Self::from_subtree(bucket_table, config, abs, template, subtree)
+    }
+
+    /// [`new`](Self::new) (`ranges` `None`) / [`new_with_ranges`](Self::new_with_ranges) with a
+    /// node cap: the same game when the subtree has at most `max_nodes` nodes, otherwise `Err`
+    /// ([`subtree_oversize_err`]) as soon as the build goes over the cap. Live search builds its
+    /// subtrees through this, so an oversized pot is refused after `max_nodes` nodes instead of
+    /// after the whole tree (a 6-way 200BB flop pot: 5M nodes, 5+ s) has been built.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_capped(
+        bucket_table: Arc<BucketTable>,
+        config: TableConfig,
+        abs: StreetActionAbstraction,
+        rules: BettingAbstractionRules,
+        template: GameState,
+        entrants: u16,
+        raises_on_street: u32,
+        ranges: Option<Vec<Vec<f64>>>,
+        max_nodes: usize,
+    ) -> Result<Self, String> {
+        debug_assert!(
+            !template.is_terminal() && template.current_player().is_some(),
+            "SubgameNlheGame::new_capped: template must be a non-terminal decision node"
+        );
+        let subtree = PublicBettingTree::build_subtree_capped(
             &template,
             &abs,
             rules,
             entrants,
             raises_on_street,
-        ));
+            max_nodes,
+        )
+        .ok_or_else(|| subtree_oversize_err(max_nodes))?;
+        let mut g = Self::from_subtree(bucket_table, config, abs, template, subtree);
+        if let Some(ranges) = ranges {
+            g.attach_ranges(ranges);
+        }
+        Ok(g)
+    }
+
+    fn from_subtree(
+        bucket_table: Arc<BucketTable>,
+        config: TableConfig,
+        abs: StreetActionAbstraction,
+        template: GameState,
+        subtree: PublicBettingTree,
+    ) -> Self {
+        let subtree = Arc::new(subtree);
         Self {
             config,
             subtree,
@@ -1409,8 +1452,10 @@ fn active_count(state: &GameState) -> usize {
 /// 依据（`openpoker_advisor` 的 `nine_max_search_subtree_sizing`，9-max 100BB flop 根、{1pot} 菜单
 /// 解到终局）：limp 池 k=2..9 = 460 / 5.4k / 45k / 140k / 557k / **3.07M / 15.5M / 72.6M**，单加注池
 /// （3.5BB）k=5..9 = 32k / 65k / 106k / 399k / 1.47M。≤6 人最坏 557k；≥7 人 limp 池陡增到千万级——
-/// [`solve_subgame`] 的 cap 是**建完树后**才查的，72.6M 节点的树要先吃掉 ~13 GB 内存（`TreeNode`
-/// 184 字节）/ 几分钟建树才被拒。6 座桌最多 6 个 Active → 此闸在 6-max 下恒不触发（逐位不变）。
+/// 这道闸加的时候 cap 是**建完树后**才查的，72.6M 节点的树要先吃掉 ~13 GB 内存（`TreeNode`
+/// 184 字节）/ 几分钟建树才被拒。现在建树本身数到 cap 就停（[`SubgameNlheGame::new_capped`]，
+/// 200BB 平跟树 6 人翻牌也有 500 万节点），这道闸剩下的作用是 ≥7 人时连 cap 个节点都不物化。
+/// 6 座桌最多 6 个 Active → 此闸在 6-max 下恒不触发（逐位不变）。
 pub const SUBTREE_PRECOUNT_MIN_ACTIVE: usize = 7;
 
 /// 脱锚子树建树前规模闸：根 Active < [`SUBTREE_PRECOUNT_MIN_ACTIVE`] → `Ok`（不计数）；否则用与
@@ -1431,6 +1476,16 @@ fn unanchored_precount_gate(
         Some(_) => Ok(()),
         None => Err(format!("subtree_precount:{n_active}way>{cap}")),
     }
+}
+
+/// Every "subtree over the node cap" refusal starts with this ([`subtree_oversize_err`], the
+/// post-build check in [`solve_subgame`]); [`SubgameSolveCache::note_oversize`] keys on it.
+const SUBTREE_OVERSIZE_PREFIX: &str = "subtree 节点数 ";
+
+/// Refusal of a subtree whose build went over `cap` nodes (the build stops there, so the real
+/// size is not known).
+fn subtree_oversize_err(cap: usize) -> String {
+    format!("{SUBTREE_OVERSIZE_PREFIX}>{cap} 越界（cap {cap}）")
 }
 
 /// tag 是否进攻动作（推进 `raises_on_street`）：`Bet` / `Raise` / `AllIn`（同
@@ -2346,9 +2401,10 @@ pub struct SubgameSolveCache {
     /// 命中）正交。caller 按街 delta（river 决策前后差）归因——cache 不知街（同 misses_before 口径）。
     cross_attempts: u64,
     cross_hits: u64,
-    /// 最近一次被 [`unanchored_precount_gate`] 拒绝（子树超 `max_subtree_nodes`）的 solve key +
-    /// 拒绝原因。同手同街后续决策 / 预热 key 相同 → 直接返回同一 `Err`、不再重数（计数本身要数到
-    /// cap 才停，cap 百万级时每次数秒）。只记最近一个：key 覆盖 solve 全部输入，旧值不可能误配。
+    /// 最近一次因子树超 `max_subtree_nodes` 被拒（[`unanchored_precount_gate`] 计数闸，或建树时超限
+    /// [`SubgameNlheGame::new_capped`]）的 solve key + 拒绝原因。同手同街后续决策 / 预热 key 相同 →
+    /// 直接返回同一 `Err`、不再重数 / 重建（都要走到 cap 才停，cap 百万级时每次约一秒）。只记最近
+    /// 一个：key 覆盖 solve 全部输入，旧值不可能误配。
     oversize: Option<([u8; 32], String)>,
     /// 最近一次决策读数时，hero 实际底牌在落点信息集的遍历者访问次数（遥测，
     /// [`Self::last_read_visits`]）。每次经缓存的搜索调用开始时清成 `None`，导航到落点后写入。
@@ -2503,6 +2559,19 @@ impl SubgameSolveCache {
             .as_ref()
             .filter(|(k, _)| *k == key)
             .map(|(_, r)| r.as_str())
+    }
+
+    /// Pass a build-and-solve result through; a "subtree over the node cap" refusal
+    /// ([`SUBTREE_OVERSIZE_PREFIX`]) is remembered for `key`, so the next request with the same
+    /// key (the decision after its prewarm, a later decision of the round) gets the same answer
+    /// at once instead of building up to the cap again.
+    fn note_oversize<T>(&mut self, key: [u8; 32], result: Result<T, String>) -> Result<T, String> {
+        if let Err(reason) = &result {
+            if reason.starts_with(SUBTREE_OVERSIZE_PREFIX) {
+                self.oversize = Some((key, reason.clone()));
+            }
+        }
+        result
     }
 }
 
@@ -3346,19 +3415,8 @@ fn subgame_search_cached_inner(
                 Arc::clone(values),
                 cont_policy,
             )?
-        } else if let Some(ranges) = ranges_opt {
-            SubgameNlheGame::new_with_ranges(
-                Arc::clone(&sub_table),
-                root_state.config().clone(),
-                sub_abs.clone(),
-                sub_rules,
-                root_state.clone(),
-                entrants,
-                raises_on_street,
-                ranges,
-            )
         } else {
-            SubgameNlheGame::new(
+            SubgameNlheGame::new_capped(
                 Arc::clone(&sub_table),
                 root_state.config().clone(),
                 sub_abs.clone(),
@@ -3366,7 +3424,9 @@ fn subgame_search_cached_inner(
                 root_state.clone(),
                 entrants,
                 raises_on_street,
-            )
+                ranges_opt,
+                cfg.max_subtree_nodes,
+            )?
         };
         let sub = apply_real_hand(sub, real_hand);
         let sub = apply_frozen_real_line(sub, &sub_abs, root_state, frozen_prefix, auth_actor)?;
@@ -3388,8 +3448,12 @@ fn subgame_search_cached_inner(
             if cross_street.is_some() {
                 c.record_cross(cross_hit);
             }
+            if let Some(reason) = c.oversize_reason(key) {
+                return Err(reason.to_string());
+            }
             if !c.lookup(key) {
-                c.store(key, build_and_solve()?);
+                let solved = c.note_oversize(key, build_and_solve())?;
+                c.store(key, solved);
             }
             // 字段级借用：遥测槽与条目是 `*c` 的不相交字段，可同时持有。
             visits_slot = Some(ReadSlots {
@@ -3526,7 +3590,7 @@ fn solve_subgame(
     let n_nodes = sub.subtree().num_nodes();
     if n_nodes == 0 || n_nodes > cfg.max_subtree_nodes {
         return Err(format!(
-            "subtree 节点数 {n_nodes} 越界（cap {}）",
+            "{SUBTREE_OVERSIZE_PREFIX}{n_nodes} 越界（cap {}）",
             cfg.max_subtree_nodes
         ));
     }
@@ -4463,7 +4527,8 @@ fn subgame_search_unanchored_cached_inner(
         pool_cache_key(key, cfg, auth_actor)
     });
     // 建树前规模闸（≥7 Active 才计数）：只在真要建树时跑——缓存命中不数；被拒过的 key 直接复用
-    // 拒绝原因、不重数（`SubgameSolveCache::oversize`）。`build_and_solve` 会 move 走 `sub_abs`，
+    // 拒绝原因、不重数（`SubgameSolveCache::oversize`）。<7 Active 不先数：建树本身数到 cap 就停
+    // （[`SubgameNlheGame::new_capped`]），同样记进 `oversize`。`build_and_solve` 会 move 走 `sub_abs`，
     // 故闸用的菜单先复制一份——<7 Active（含全部 6-max）不复制、不计数。
     let precount_abs =
         (active_count(root_state) >= SUBTREE_PRECOUNT_MIN_ACTIVE).then(|| sub_abs.clone());
@@ -4474,28 +4539,17 @@ fn subgame_search_unanchored_cached_inner(
         }
     };
     let build_and_solve = move || -> Result<SolvedSubgame, String> {
-        let sub = if let Some(ranges) = ranges_opt {
-            SubgameNlheGame::new_with_ranges(
-                Arc::clone(&sub_table),
-                root_state.config().clone(),
-                sub_abs.clone(), // 真栈导航还要同一抽象现算 tag
-                sub_rules,
-                root_state.clone(),
-                entrants,
-                0,
-                ranges,
-            )
-        } else {
-            SubgameNlheGame::new(
-                Arc::clone(&sub_table),
-                root_state.config().clone(),
-                sub_abs.clone(),
-                sub_rules,
-                root_state.clone(),
-                entrants,
-                0,
-            )
-        };
+        let sub = SubgameNlheGame::new_capped(
+            Arc::clone(&sub_table),
+            root_state.config().clone(),
+            sub_abs.clone(), // 真栈导航还要同一抽象现算 tag
+            sub_rules,
+            root_state.clone(),
+            entrants,
+            0,
+            ranges_opt,
+            cfg.max_subtree_nodes,
+        )?;
         let sub = apply_real_hand(sub, real_hand);
         let sub = apply_frozen_real_line(sub, &sub_abs, root_state, frozen_prefix, auth_actor)?;
         let trainer = solve_subgame(sub, cfg, master, auth_actor)?;
@@ -4524,7 +4578,8 @@ fn subgame_search_unanchored_cached_inner(
                     c.oversize = Some((key, reason.clone()));
                     return Err(reason);
                 }
-                c.store(key, build_and_solve()?);
+                let solved = c.note_oversize(key, build_and_solve())?;
+                c.store(key, solved);
             }
             // 字段级借用：遥测槽与条目是 `*c` 的不相交字段，可同时持有。
             visits_slot = Some(ReadSlots {
@@ -11209,5 +11264,80 @@ mod tests {
         run(&mut cache, &no_rh, &root, &[]).expect("first");
         let _ = run(&mut cache, &no_rh, &auth, &line);
         assert_eq!(cache.misses(), 1, "没有专用信息集就不固定");
+    }
+
+    /// A subtree over the node cap is refused while it is being built (at the cap, not after the
+    /// whole tree), and the refusal is remembered: the decision that follows its prewarm — same
+    /// key — gets the same error without building again (one miss in total). A cap the tree fits
+    /// under leaves the solve as it was.
+    #[test]
+    fn oversize_subtree_is_refused_at_the_cap_and_remembered() {
+        let root = nway_limped_flop_state(3, 12_100, 0x4652_5A53_4541_5243);
+        let hero = root.current_player().unwrap().0 as PlayerId;
+        let (abs, rules) = deep_menu_for(&root);
+        let n_nodes = PublicBettingTree::build_subtree(&root, &abs, rules, live_entrants(&root), 0)
+            .num_nodes();
+        assert!(n_nodes > 1_000, "3-way flop subtree: {n_nodes} nodes");
+        let cfg_with_cap = |cap: usize| SubgameSearchConfig {
+            iterations: 200,
+            max_subtree_nodes: cap,
+            use_blueprint_range: false,
+            trigger: SearchTrigger::AllPostflop,
+            deep_menu: true,
+            live_traversers: true,
+            ..SubgameSearchConfig::default()
+        };
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            root.config().clone(),
+            abs,
+            rules,
+        )
+        .expect("game");
+        let prewarm = |cache: &mut SubgameSolveCache, cfg: &SubgameSearchConfig| {
+            subgame_search_unanchored_prewarm(cache, hero, &root, &game, None, cfg, None, 0x5EED)
+        };
+        let decide = |cache: &mut SubgameSolveCache, cfg: &SubgameSearchConfig| {
+            subgame_search_unanchored_cached(
+                Some(cache),
+                &root,
+                &root,
+                &game,
+                &[],
+                cfg,
+                None,
+                None,
+                0x5EED,
+            )
+        };
+
+        let small = cfg_with_cap(n_nodes - 1);
+        let mut cache = SubgameSolveCache::new();
+        let err = prewarm(&mut cache, &small).expect_err("one node over the cap");
+        assert_eq!(err, subtree_oversize_err(n_nodes - 1));
+        assert!(err.starts_with(SUBTREE_OVERSIZE_PREFIX), "{err}");
+        assert_eq!((cache.hits(), cache.misses()), (0, 1));
+        assert!(cache.current().is_none());
+        let again = decide(&mut cache, &small).expect_err("remembered refusal");
+        assert_eq!(again, err);
+        assert_eq!(
+            (cache.hits(), cache.misses()),
+            (0, 1),
+            "the remembered refusal answers before the cache lookup: nothing is rebuilt"
+        );
+        // Another cap is another key: not answered from the remembered refusal.
+        let fits = cfg_with_cap(n_nodes);
+        decide(&mut cache, &fits).expect("fits exactly");
+        assert_eq!((cache.hits(), cache.misses()), (0, 2));
+        assert_eq!(
+            cache
+                .current()
+                .unwrap()
+                .trainer
+                .game()
+                .subtree()
+                .num_nodes(),
+            n_nodes
+        );
     }
 }

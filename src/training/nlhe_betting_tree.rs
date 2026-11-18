@@ -693,7 +693,7 @@ impl PublicBettingTree {
         );
         // root entrants = 0：盲注是强制投入、非 voluntary（probe 同口径）。raises_on_street = 0
         // （preflop BB 是强制盲注、非 walk 动作，不计进攻 → preflop 首个 raise 见 raises==0）。
-        tree.root_id = tree.walk(state, None, None, abs, &rules, 0, 0, None);
+        tree.root_id = tree.walk(state, None, None, abs, &rules, 0, 0, None, usize::MAX);
         tree
     }
 
@@ -736,8 +736,43 @@ impl PublicBettingTree {
             entrants,
             raises_on_street,
             None,
+            usize::MAX,
         );
         tree
+    }
+
+    /// [`build_subtree`](Self::build_subtree) with a node cap: the same tree when it has at most
+    /// `cap` nodes, `None` as soon as the build goes over (the partial tree is dropped). Live
+    /// search uses it so an oversized subtree is refused after `cap` nodes, not after the whole
+    /// tree (millions of nodes, seconds) has been built.
+    pub fn build_subtree_capped(
+        root_state: &GameState,
+        abs: &StreetActionAbstraction,
+        rules: BettingAbstractionRules,
+        entrants: u16,
+        raises_on_street: u32,
+        cap: usize,
+    ) -> Option<PublicBettingTree> {
+        debug_assert!(
+            !root_state.is_terminal() && root_state.current_player().is_some(),
+            "build_subtree_capped root must be a Player decision node"
+        );
+        let mut tree = PublicBettingTree {
+            nodes: Vec::new(),
+            root_id: 0,
+        };
+        tree.root_id = tree.walk(
+            root_state.clone(),
+            None,
+            None,
+            abs,
+            &rules,
+            entrants,
+            raises_on_street,
+            None,
+            cap,
+        );
+        (tree.nodes.len() <= cap).then_some(tree)
     }
 
     /// 同 [`build_subtree`](Self::build_subtree)，但 **depth-limit 截断**（S6 6b）：任何动作把
@@ -779,6 +814,7 @@ impl PublicBettingTree {
             entrants,
             raises_on_street,
             Some(limit_street),
+            usize::MAX,
         );
         tree
     }
@@ -794,6 +830,7 @@ impl PublicBettingTree {
         entrants: u16,
         raises_on_street: u32,
         depth_limit: Option<StreetTag>,
+        node_cap: usize,
     ) -> NodeId {
         let actor = state
             .current_player()
@@ -817,6 +854,11 @@ impl PublicBettingTree {
 
         let mut children: SmallVec<[Child; 8]> = SmallVec::new();
         for action in allowed.iter().copied() {
+            // Over the cap: the tree is going to be thrown away, stop expanding (every level of
+            // the recursion leaves its loop here, so the build unwinds at once).
+            if self.nodes.len() > node_cap {
+                break;
+            }
             let mut next_state = state.clone();
             next_state
                 .apply(action.to_concrete())
@@ -871,6 +913,7 @@ impl PublicBettingTree {
                     next_entrants,
                     next_raises,
                     depth_limit,
+                    node_cap,
                 ))
             };
             children.push(child);
@@ -3454,5 +3497,47 @@ mod tests {
             count_subtree_nodes_capped(&st, &abs, rules, 0, 0, usize::MAX),
             Some(sub.num_nodes())
         );
+    }
+
+    /// [`PublicBettingTree::build_subtree_capped`]: at or above the node count it is the plain
+    /// build node for node; one below (and far below) it refuses.
+    #[test]
+    fn build_subtree_capped_matches_build_or_refuses() {
+        let cfg = TableConfig::n_max_at_bb(9, 30);
+        let mut st = GameState::new(&cfg, 1);
+        let mut folds = 4;
+        while st.street() == Street::Preflop {
+            let seat = st.current_player().unwrap().0;
+            let a = if folds > 0 && seat >= 3 {
+                folds -= 1;
+                crate::rules::action::Action::Fold
+            } else if st.legal_actions().check {
+                crate::rules::action::Action::Check
+            } else {
+                crate::rules::action::Action::Call
+            };
+            st.apply(a).unwrap();
+        }
+        let (abs, rules) = deep_single_pot();
+        let full = PublicBettingTree::build_subtree(&st, &abs, rules, 0, 0);
+        let n = full.num_nodes();
+        assert!(n > 1000, "5-way subtree should be non-trivial");
+        for cap in [n, n + 1, usize::MAX] {
+            let capped = PublicBettingTree::build_subtree_capped(&st, &abs, rules, 0, 0, cap)
+                .expect("within the cap");
+            assert_eq!(capped.num_nodes(), n);
+            for i in 0..n as NodeId {
+                assert!(
+                    nodes_structurally_equal(capped.node(i), full.node(i)),
+                    "node {i} differs (cap {cap})"
+                );
+            }
+        }
+        for cap in [n - 1, n / 2, 1, 0] {
+            assert!(
+                PublicBettingTree::build_subtree_capped(&st, &abs, rules, 0, 0, cap).is_none(),
+                "cap {cap} < {n} nodes must refuse"
+            );
+        }
     }
 }
