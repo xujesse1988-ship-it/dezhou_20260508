@@ -192,6 +192,9 @@ def add_advisor_args(p, default_seats, debug_help):
     # 固定 hero 真实手牌本轮已做的动作（advisor 默认关，须配 --search-real-hand-q）：求解里真实手牌恒走
     # 实际那条线，读数点的平均策略不会冻结。不传 = 关。
     p.add_argument("--search-freeze-real-line", choices=["on", "off"], default=None)
+    # hero 过去的动作里有多大比例是玩家自己拿的主意、不是策略的（advisor 默认 0 = 关：估 hero 范围时
+    # 认定每一步都照策略打）。取值 (0, 1)；实盘日志里没弃牌的动作约 0.2 没按建议。
+    p.add_argument("--search-hero-deviation", type=float, default=None)
     # 平均策略冻结门槛（advisor 默认 0.25，0 = 关）：读数点平均策略的累计时刻低于它就改读当前策略。
     p.add_argument("--search-frozen-avg-recency", type=float, default=None)
     # 弱牌押上全部筹码护栏（advisor 默认 on）：翻后弱牌不全下、不做投入过半剩余筹码的加注。
@@ -299,6 +302,10 @@ def validate_advisor_args(args):
         raise SystemExit("--search-real-hand-q 须在 [0, 1]")
     if args.search_freeze_real_line is not None and not args.search:
         raise SystemExit("--search-freeze-real-line 需配 --search（它只管搜索求解）")
+    if args.search_hero_deviation is not None and not args.search:
+        raise SystemExit("--search-hero-deviation 需配 --search（它只管搜索求解）")
+    if args.search_hero_deviation is not None and not 0.0 < args.search_hero_deviation < 1.0:
+        raise SystemExit("--search-hero-deviation 须在 (0, 1) 内")
     if args.search_freeze_real_line == "on" and args.search_real_hand_q is None:
         raise SystemExit("--search-freeze-real-line on 需配 --search-real-hand-q（只固定真实手牌专用信息集）")
     if args.search_frozen_avg_recency is not None and not args.search:
@@ -379,6 +386,8 @@ def advisor_extra_args(args, warm_profile_hh=None):
             extra += ["--search-real-hand-q", repr(args.search_real_hand_q)]
         if args.search_freeze_real_line is not None:
             extra += ["--search-freeze-real-line", args.search_freeze_real_line]
+        if args.search_hero_deviation is not None:
+            extra += ["--search-hero-deviation", repr(args.search_hero_deviation)]
         if args.search_frozen_avg_recency is not None:
             extra += ["--search-frozen-avg-recency", repr(args.search_frozen_avg_recency)]
         if args.search_weak_commit_guard is not None:

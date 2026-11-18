@@ -1227,6 +1227,7 @@ mod tests {
             real_hand_q: None,
             pool: None,
             pool_root: None,
+            hero_deviation: 0.0,
         };
         let cfg = TableConfig::default_6max_100bb();
         let n = cfg.n_seats as usize;

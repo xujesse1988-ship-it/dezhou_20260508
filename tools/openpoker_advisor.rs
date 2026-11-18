@@ -7317,8 +7317,8 @@ fn run() -> Result<(), String> {
     if let Some(rt) = &search_rt {
         let scfg = &rt.cfg;
         eprintln!(
-            "[openpoker_advisor] search ON: trigger={:?} iters={} iters_turn={} iters_river={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} force_unanchored={} limp_as_fold={} min_hero_visits={} frozen_avg_recency={} freeze_real_line={} real_hand_q={:?} weak_commit_guard={} bucket_table={}",
-            scfg.trigger, scfg.iterations, rt.cfg_for(poker::Street::Turn).iterations, rt.cfg_for(poker::Street::River).iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.force_unanchored, rt.limp_as_fold, scfg.min_hero_visits, scfg.frozen_avg_recency, scfg.freeze_real_line, scfg.real_hand_q, rt.weak_commit_guard,
+            "[openpoker_advisor] search ON: trigger={:?} iters={} iters_turn={} iters_river={} time_budget={:?} lcfr={} deep_menu={} live_traversers={} max_nodes={} range_mix={} solve_threads={} unanchored_prefix_reach={} unanchored_cross_street={} flop_prefer_blueprint={} force_unanchored={} limp_as_fold={} min_hero_visits={} frozen_avg_recency={} freeze_real_line={} real_hand_q={:?} hero_deviation={} weak_commit_guard={} bucket_table={}",
+            scfg.trigger, scfg.iterations, rt.cfg_for(poker::Street::Turn).iterations, rt.cfg_for(poker::Street::River).iterations, scfg.time_budget, scfg.lcfr, scfg.deep_menu, scfg.live_traversers, scfg.max_subtree_nodes, scfg.range_uniform_mix, scfg.solve_threads, rt.unanchored_prefix_reach, rt.unanchored_cross_street, rt.flop_prefer_blueprint, rt.force_unanchored, rt.limp_as_fold, scfg.min_hero_visits, scfg.frozen_avg_recency, scfg.freeze_real_line, scfg.real_hand_q, scfg.hero_deviation, rt.weak_commit_guard,
             args.search_bucket_table.as_ref().map_or_else(|| "blueprint".to_string(), |p| p.display().to_string())
         );
         if let Some(cell) = &rt.exploit {
@@ -7592,6 +7592,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
     let mut search_frozen_avg_recency: Option<f64> = None;
     let mut search_freeze_real_line: Option<bool> = None;
     let mut search_real_hand_q: Option<f64> = None;
+    let mut search_hero_deviation: Option<f64> = None;
     let mut search_weak_commit_guard: Option<bool> = None;
     // 叠加剥削（--exploit*，仅 --search 开时生效）。
     let mut exploit_on = false;
@@ -7927,6 +7928,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
                     }
                 });
             }
+            "--search-hero-deviation" => {
+                let d: f64 = next_val(&mut it, &arg)?
+                    .parse()
+                    .map_err(|e| format!("bad search-hero-deviation: {e}"))?;
+                if !(d > 0.0 && d < 1.0) {
+                    return Err(format!("--search-hero-deviation 须在 (0, 1) 内，得 {d}"));
+                }
+                search_hero_deviation = Some(d);
+            }
             "--search-weak-commit-guard" => {
                 let v = next_val(&mut it, &arg)?;
                 search_weak_commit_guard = Some(match v.as_str() {
@@ -8089,6 +8099,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             // 固定 hero 真实手牌本轮已做动作（SubgameSearchConfig::freeze_real_line doc）：默认关；
             // 要真实手牌专用信息集，上面已校验须同时传 --search-real-hand-q。
             freeze_real_line: search_freeze_real_line.unwrap_or(false),
+            // Share of hero's past actions that were the player's own choice
+            // (SubgameSearchConfig::hero_deviation doc): 0 = off unless given.
+            hero_deviation: search_hero_deviation.unwrap_or(0.0),
             // 解到终局（深码 / 多人 §2.1）：depth_limit / biased_leaf 均 false（默认）；
             // resolve_root / use_blueprint_range / seed 用默认（RoundStart / true / 固定基）。
             ..SubgameSearchConfig::default()
@@ -8115,6 +8128,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>) -> Result<Args, String>
             || search_frozen_avg_recency.is_some()
             || search_freeze_real_line.is_some()
             || search_real_hand_q.is_some()
+            || search_hero_deviation.is_some()
             || search_weak_commit_guard.is_some()
             || search_pool_model.is_some()
         {
@@ -19971,6 +19985,30 @@ mod tests {
         assert!(!a.search.unwrap().freeze_real_line);
         assert!(parse(&["--search", "--search-freeze-real-line", "maybe"]).is_err());
         assert!(parse(&["--search-freeze-real-line", "off"]).is_err());
+    }
+
+    /// `--search-hero-deviation`: off (`0`) unless given; a share strictly between 0 and 1; bad
+    /// values and use without `--search` are refused.
+    #[test]
+    fn parse_args_hero_deviation() {
+        let parse = |extra: &[&str]| {
+            let argv = ["--checkpoint", "c.ckpt", "--bucket-table", "b.bin"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string());
+            parse_args_from(argv)
+        };
+        let off = parse(&["--search"]).unwrap();
+        assert_eq!(off.search.unwrap().hero_deviation, 0.0);
+        let on = parse(&["--search", "--search-hero-deviation", "0.2"]).unwrap();
+        assert_eq!(on.search.unwrap().hero_deviation, 0.2);
+        for bad in ["0", "1", "-0.1", "1.5", "x", "NaN"] {
+            assert!(
+                parse(&["--search", "--search-hero-deviation", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse(&["--search-hero-deviation", "0.2"]).is_err());
     }
 
     /// `--search-real-hand-q`：不传 = 关（`None`）；`[0, 1]` 内收（含 0 = 只开专用信息集）；越界 / 坏值

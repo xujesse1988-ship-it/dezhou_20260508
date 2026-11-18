@@ -1318,6 +1318,18 @@ pub struct SubgameSearchConfig {
     /// [`crate::training::subgame_pool::tracker_from_history`] 从根状态算好传进来；`None` = 求解时
     /// 试着从根状态自带的历史算，算不出就不加约束。同一手同一条街只有一个取值，不单独进缓存 key。
     pub pool_root: Option<crate::training::pool_model::PostflopTracker>,
+    /// Share of hero's own past actions that were the player's choice, not the strategy's
+    /// (`0` = off: hero is taken to have played every past step by the strategy, bit for bit the
+    /// old behaviour). The root range of hero is "the hands that get here by hero's actions"; when
+    /// a human plays the hand and overrules the advice now and then (wopo logs: 18% of postflop
+    /// decisions), the strategy's range for a line it rarely takes is a thin, arbitrary set that
+    /// has little to do with what the player holds there. With a share `d` every past hero action
+    /// counts as `(1 − d)·σ(action | hand) + d / n_actions` ([`hero_action_likelihood`]): the
+    /// player's own choices are taken to be the same for every hand. Applied where the root range
+    /// is estimated from earlier streets (blueprint estimate, prefix reach, the previous street's
+    /// solve); hero's actions of the round being solved are part of the solve and not touched.
+    /// Opponents' ranges are not affected.
+    pub hero_deviation: f64,
 }
 
 /// [`SubgameSearchConfig::min_hero_visits`] 拒读时 `Err` 字符串的前缀。调用方用
@@ -1356,6 +1368,7 @@ impl Default for SubgameSearchConfig {
             real_hand_q: None,
             pool: None,
             pool_root: None,
+            hero_deviation: 0.0,
         }
     }
 }
@@ -1667,6 +1680,7 @@ pub fn synced_prefix_decisions(
 /// 「100BB 全栈 shove」，off-100BB 真栈下撒谎最狠（blueprint RFI 在 100BB 几乎不开池 shove，
 /// 真 30BB shove 的 range 宽得多）——乘进去会把 shover 错收成「100BB shove range」，比 uniform
 /// 更糟。`false`（anchored 路径，栈≈100BB、AllIn = 真 100BB shove）= 不跳，逐位 byte-equal。
+#[cfg(test)]
 fn estimate_range(
     game: &SimplifiedNlheGame,
     strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
@@ -1675,6 +1689,44 @@ fn estimate_range(
     seat: PlayerId,
     holes: &[[Card; 2]],
     skip_all_in: bool,
+) -> Vec<f64> {
+    estimate_range_with_deviation(
+        game,
+        strategy,
+        decisions,
+        board,
+        seat,
+        holes,
+        skip_all_in,
+        0.0,
+    )
+}
+
+/// What one of hero's own past actions says about a hand: the strategy takes the action with
+/// probability `p` with this hand, the node has `n` legal actions, and with probability
+/// `deviation` the action was the player's own choice — the same for every hand, any of the `n`
+/// actions alike ([`SubgameSearchConfig::hero_deviation`]). `deviation == 0` returns `p` itself.
+fn hero_action_likelihood(p: f64, n: usize, deviation: f64) -> f64 {
+    if deviation > 0.0 {
+        (1.0 - deviation) * p + deviation / n as f64
+    } else {
+        p
+    }
+}
+
+/// [`estimate_range`] where every action of `seat` counts by [`hero_action_likelihood`] with
+/// `deviation` (callers pass [`SubgameSearchConfig::hero_deviation`] for the hero seat and `0`
+/// for everyone else; `0` is [`estimate_range`] bit for bit). Skipped all-in steps stay skipped.
+#[allow(clippy::too_many_arguments)]
+fn estimate_range_with_deviation(
+    game: &SimplifiedNlheGame,
+    strategy: &dyn Fn(&InfoSetId, usize) -> Vec<f64>,
+    decisions: &[(NodeId, AbstractActionTag, PlayerId)],
+    board: &[Card],
+    seat: PlayerId,
+    holes: &[[Card; 2]],
+    skip_all_in: bool,
+    deviation: f64,
 ) -> Vec<f64> {
     let board_set: BTreeSet<u8> = board.iter().map(|c| c.to_u8()).collect();
     let tree = game.tree();
@@ -1704,7 +1756,7 @@ fn estimate_range(
                 Some(i) if sigma.len() == n && sigma[i].is_finite() && sigma[i] >= 0.0 => sigma[i],
                 _ => 1.0 / n as f64,
             };
-            reach *= p;
+            reach *= hero_action_likelihood(p, n, deviation);
             if reach == 0.0 {
                 break;
             }
@@ -1737,6 +1789,15 @@ fn mix_lambda_for_seat(seat: PlayerId, hero: PlayerId, lambda: f64) -> f64 {
         0.0
     } else {
         lambda
+    }
+}
+
+/// [`SubgameSearchConfig::hero_deviation`] for the hero seat, `0` for everyone else.
+fn hero_deviation_for_seat(seat: PlayerId, hero: PlayerId, cfg: &SubgameSearchConfig) -> f64 {
+    if seat == hero {
+        cfg.hero_deviation
+    } else {
+        0.0
     }
 }
 
@@ -2129,6 +2190,7 @@ fn subtree_decisions_on_real_line(
 ///
 /// `hero` = range 平滑「不混」座（[`mix_lambda_for_seat`]，对手座按 `lambda` 混 uniform）。`holes` =
 /// [`all_hole_combos`]（与 `prev_root_range` 下标对齐）。
+#[cfg(test)]
 fn cross_street_posterior_range(
     prev: &SolvedSubgame,
     prev_within: &[(Action, bool)],
@@ -2136,6 +2198,32 @@ fn cross_street_posterior_range(
     holes: &[[Card; 2]],
     lambda: f64,
     hero: PlayerId,
+    hand_seed: u64,
+) -> Option<Vec<Vec<f64>>> {
+    cross_street_posterior_range_with_deviation(
+        prev,
+        prev_within,
+        next_root_state,
+        holes,
+        lambda,
+        hero,
+        0.0,
+        hand_seed,
+    )
+}
+
+/// [`cross_street_posterior_range`] where hero's own actions on the previous street count by
+/// [`hero_action_likelihood`] with `hero_deviation` ([`SubgameSearchConfig::hero_deviation`];
+/// `0` is [`cross_street_posterior_range`] bit for bit).
+#[allow(clippy::too_many_arguments)]
+fn cross_street_posterior_range_with_deviation(
+    prev: &SolvedSubgame,
+    prev_within: &[(Action, bool)],
+    next_root_state: &GameState,
+    holes: &[[Card; 2]],
+    lambda: f64,
+    hero: PlayerId,
+    hero_deviation: f64,
     hand_seed: u64,
 ) -> Option<Vec<Vec<f64>>> {
     // —— 身份验证 ——
@@ -2163,7 +2251,16 @@ fn cross_street_posterior_range(
         .map(|p| p.hole_cards.is_some())
         .collect();
     // 导航失配 → None（退档一）。
-    condition_on_line(prev, prev_within, next_board, &live, holes, lambda, hero)
+    condition_on_line(
+        prev,
+        prev_within,
+        next_board,
+        &live,
+        holes,
+        lambda,
+        hero,
+        hero_deviation,
+    )
 }
 
 /// 沿 `solved` 子树上的真实动作线 `line` 对它的 root range 做贝叶斯条件化：各座 reach = 子树解所条件化的
@@ -2171,6 +2268,8 @@ fn cross_street_posterior_range(
 /// 的牌 reach 0；`live[seat] = false` 的座返回空向量；整列 σ 塌零（< [`CROSS_STREET_DEAD_COLUMN_EPS`]）跳过该列；
 /// 归一后对手座按 `lambda` 混均匀（hero 不混，[`mix_lambda_for_seat`]）。动作线在子树上走不通 → `None`。
 /// [`cross_street_posterior_range`]（上一街整条线 → 下一街先验）与 [`current_street_ranges`]（本街到当前点）共用。
+/// `hero_deviation`：hero 座沿线每个动作按 [`hero_action_likelihood`] 计（`0` = 原样乘 σ）。
+#[allow(clippy::too_many_arguments)]
 fn condition_on_line(
     solved: &SolvedSubgame,
     line: &[(Action, bool)],
@@ -2179,6 +2278,7 @@ fn condition_on_line(
     holes: &[[Card; 2]],
     lambda: f64,
     hero: PlayerId,
+    hero_deviation: f64,
 ) -> Option<Vec<Vec<f64>>> {
     let prev = solved;
     let prev_game = prev.trainer.game();
@@ -2253,8 +2353,16 @@ fn condition_on_line(
                 if max_p < CROSS_STREET_DEAD_COLUMN_EPS {
                     continue; // 整列塌零（ε 地板）→ 跳过该列（因子 1），保其余列信号。
                 }
+                let deviation = if seat as PlayerId == hero {
+                    hero_deviation
+                } else {
+                    0.0
+                };
                 for hi in 0..holes.len() {
-                    reach[hi] *= col[hi];
+                    // Pruned combos (board collision / an earlier zero) stay at zero.
+                    if reach[hi] > 0.0 {
+                        reach[hi] *= hero_action_likelihood(col[hi], n, deviation);
+                    }
                 }
             }
             // 归一 + 对手座 λ 混 uniform（hero 不混）。全塌（sum==0）→ 全零（下游退均匀）。
@@ -2304,6 +2412,7 @@ pub fn current_street_ranges(
         &all_hole_combos(),
         0.0,
         0,
+        0.0,
     )
 }
 
@@ -2774,6 +2883,7 @@ fn solve_cache_key(
             .to_le_bytes(),
     );
     h.update(&cfg.range_uniform_mix.to_le_bytes());
+    h.update(&cfg.hero_deviation.to_le_bytes());
     // 生效线程数（0 与 1 都走单线程 step、solve 输出相同 → 同 key 不丢命中）。
     h.update(&(cfg.solve_threads.max(1) as u64).to_le_bytes());
     // blueprint 覆盖街（不直接影响 solve——它只决定 range 先验能否算出，而 ranges 已逐位入 key；
@@ -3236,7 +3346,7 @@ fn subgame_search_cached_inner(
             (0..players.len())
                 .map(|seat| {
                     if players[seat].hole_cards.is_some() {
-                        let mut r = estimate_range(
+                        let mut r = estimate_range_with_deviation(
                             game,
                             strategy,
                             &range_decisions,
@@ -3244,6 +3354,7 @@ fn subgame_search_cached_inner(
                             seat as PlayerId,
                             &holes,
                             false, // anchored：栈≈100BB，AllIn = 真 100BB shove，不跳过（byte-equal）。
+                            hero_deviation_for_seat(seat as PlayerId, auth_actor, cfg),
                         );
                         if let Some(coef) = tilt
                             .as_ref()
@@ -3284,13 +3395,14 @@ fn subgame_search_cached_inner(
             let holes = all_hole_combos();
             let try_slot = |prev: Option<&SolvedSubgame>| {
                 prev.and_then(|p| {
-                    cross_street_posterior_range(
+                    cross_street_posterior_range_with_deviation(
                         p,
                         prev_within,
                         root_state,
                         &holes,
                         cfg.range_uniform_mix,
                         auth_actor,
+                        cfg.hero_deviation,
                         hand_seed,
                     )
                 })
@@ -4312,13 +4424,14 @@ fn subgame_search_unanchored_cached_inner(
             let holes = all_hole_combos();
             let try_slot = |prev: Option<&SolvedSubgame>| {
                 prev.and_then(|p| {
-                    cross_street_posterior_range(
+                    cross_street_posterior_range_with_deviation(
                         p,
                         prev_within,
                         root_state,
                         &holes,
                         cfg.range_uniform_mix,
                         auth_actor,
+                        cfg.hero_deviation,
                         hand_seed,
                     )
                 })
@@ -4389,7 +4502,7 @@ fn subgame_search_unanchored_cached_inner(
                     (0..players.len())
                         .map(|seat| {
                             if players[seat].hole_cards.is_some() {
-                                let mut r = estimate_range(
+                                let mut r = estimate_range_with_deviation(
                                     game,
                                     pr.strategy,
                                     &prior,
@@ -4397,6 +4510,7 @@ fn subgame_search_unanchored_cached_inner(
                                     seat as PlayerId,
                                     &holes,
                                     true, // 档一：跳过 AllIn-tag（100BB shove 语义，off-100BB 撒谎）。
+                                    hero_deviation_for_seat(seat as PlayerId, auth_actor, cfg),
                                 );
                                 if seat as PlayerId == auth_actor {
                                     if let Some(coef) = pr.hero_coef {
@@ -5415,6 +5529,7 @@ mod tests {
             real_hand_q: None,
             pool: None,
             pool_root: None,
+            hero_deviation: 0.0,
         };
         let node_id = flop.current_node_id;
         let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
@@ -5482,6 +5597,7 @@ mod tests {
             real_hand_q: None,
             pool: None,
             pool_root: None,
+            hero_deviation: 0.0,
         };
         let r = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &tiny, None, None, 0, 0,
@@ -5962,6 +6078,7 @@ mod tests {
             real_hand_q: None,
             pool: None,
             pool_root: None,
+            hero_deviation: 0.0,
         };
         let d9 = subgame_search(
             &auth,
@@ -6729,6 +6846,7 @@ mod tests {
             real_hand_q: None,
             pool: None,
             pool_root: None,
+            hero_deviation: 0.0,
         };
         let run = |cfg: &SubgameSearchConfig| {
             subgame_search(
@@ -6810,6 +6928,7 @@ mod tests {
             real_hand_q: None,
             pool: None,
             pool_root: None,
+            hero_deviation: 0.0,
         };
         let base = subgame_search(
             &auth, &auth, &game, &legal_abs, node_id, &strat, &none_cfg, None, None, 0x55, 4,
@@ -11264,6 +11383,222 @@ mod tests {
         run(&mut cache, &no_rh, &root, &[]).expect("first");
         let _ = run(&mut cache, &no_rh, &auth, &line);
         assert_eq!(cache.misses(), 1, "没有专用信息集就不固定");
+    }
+
+    /// [`hero_action_likelihood`] / [`estimate_range_with_deviation`]: share 0 is
+    /// [`estimate_range`] bit for bit; with a share `d` the range is the product over the seat's
+    /// actions of `(1 − d)·σ + d / n`, recomputed here hand by hand — hands the strategy never
+    /// plays this way (σ = 0) come back into the range, hands on the board do not.
+    #[test]
+    fn hero_deviation_floors_the_likelihood_in_estimate_range() {
+        assert_eq!(hero_action_likelihood(0.37, 4, 0.0), 0.37);
+        assert!((hero_action_likelihood(0.0, 4, 0.2) - 0.05).abs() < 1e-15);
+        assert!((hero_action_likelihood(1.0, 4, 0.2) - 0.85).abs() < 1e-15);
+        // The likelihoods of a node's actions still sum to one.
+        let ps = [0.7, 0.3, 0.0];
+        let total: f64 = ps.iter().map(|p| hero_action_likelihood(*p, 3, 0.2)).sum();
+        assert!((total - 1.0).abs() < 1e-12);
+
+        let (a, mut r) = first_small_6max(2);
+        r.no_open_limp = true;
+        let game = SimplifiedNlheGame::new_with_abstraction(
+            stub_table(),
+            TableConfig::default_6max_100bb(),
+            a,
+            r,
+        )
+        .expect("6max game");
+        let mut rng = ChaCha20Rng::from_seed(0x4845_524F_4445_5631);
+        let drng: &mut dyn RngSource = &mut rng;
+        let mut abs = game.root(drng);
+        let utg = abs.game_state.current_player().expect("decision").0 as PlayerId;
+        let raise = SimplifiedNlheGame::legal_actions(&abs)
+            .into_iter()
+            .find(|x| matches!(AbstractActionTag::of(x), AbstractActionTag::Raise(_)))
+            .expect("UTG can raise");
+        abs = SimplifiedNlheGame::next(abs, raise, drng);
+        let next = abs.game_state.current_player().expect("decision").0 as PlayerId;
+        let decisions = synced_prefix_decisions(&game, abs.current_node_id);
+        assert_eq!(decisions.len(), 1);
+        let (node_id, tag, _) = decisions[0];
+        // Preflop infosets are per hand class: a strategy keyed on the infoset differs by hand.
+        // A third of the infosets never take the first non-fold action... whichever index the
+        // raise has, some classes get exactly zero for it.
+        let strat = |i: &InfoSetId, n: usize| {
+            let r = i.raw();
+            let mut v: Vec<f64> = (0..n)
+                .map(|k| {
+                    let h = (r ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) % 7;
+                    if h < 2 {
+                        0.0
+                    } else {
+                        h as f64
+                    }
+                })
+                .collect();
+            let s: f64 = v.iter().sum();
+            if s > 0.0 {
+                v.iter_mut().for_each(|x| *x /= s);
+            } else {
+                v.iter_mut().for_each(|x| *x = 1.0 / n as f64);
+            }
+            v
+        };
+        let holes = all_hole_combos();
+        let board: Vec<Card> = Vec::new();
+        let d = 0.2;
+        let plain = estimate_range(&game, &strat, &decisions, &board, utg, &holes, true);
+        let zero = estimate_range_with_deviation(
+            &game, &strat, &decisions, &board, utg, &holes, true, 0.0,
+        );
+        assert_eq!(plain, zero, "share 0 = the old estimate, bit for bit");
+        let got =
+            estimate_range_with_deviation(&game, &strat, &decisions, &board, utg, &holes, true, d);
+
+        let node = game.tree().node(node_id);
+        let n = node.legal_actions.len();
+        let idx = node.legal_actions.iter().position(|t| *t == tag).unwrap();
+        let sigma: Vec<f64> = holes
+            .iter()
+            .map(|h| strat(&game.info_set_for_cards(node_id, *h, &board), n)[idx])
+            .collect();
+        let never = sigma.iter().filter(|p| **p == 0.0).count();
+        assert!(
+            never > 50 && never < 1276,
+            "fixture: some hands never raise, some do ({never} of 1326 never)"
+        );
+        let want: Vec<f64> = sigma.iter().map(|p| (1.0 - d) * p + d / n as f64).collect();
+        let total: f64 = want.iter().sum();
+        for hi in 0..holes.len() {
+            assert!(
+                (got[hi] - want[hi] / total).abs() < 1e-12,
+                "hand {hi}: {} vs {}",
+                got[hi],
+                want[hi] / total
+            );
+            assert_eq!(plain[hi] == 0.0, sigma[hi] == 0.0);
+            assert!(
+                got[hi] > 0.0,
+                "every hand is possible once the player may deviate"
+            );
+        }
+        // A seat with no action on the path is not touched by the share.
+        let other_plain = estimate_range(&game, &strat, &decisions, &board, next, &holes, true);
+        let other =
+            estimate_range_with_deviation(&game, &strat, &decisions, &board, next, &holes, true, d);
+        assert_eq!(other_plain, other);
+        // The search passes the share for the hero seat only.
+        let cfg = SubgameSearchConfig {
+            hero_deviation: d,
+            ..SubgameSearchConfig::default()
+        };
+        assert_eq!(hero_deviation_for_seat(utg, utg, &cfg), d);
+        assert_eq!(hero_deviation_for_seat(next, utg, &cfg), 0.0);
+        assert_eq!(SubgameSearchConfig::default().hero_deviation, 0.0);
+    }
+
+    /// The previous street's solve as the next street's prior
+    /// ([`cross_street_posterior_range_with_deviation`]): share 0 is the old posterior bit for
+    /// bit; with a share `d` hero's range is prior × `(1 − d)·σ + d / n` over hero's actions of
+    /// that street (recomputed here from the solve), and every other seat is unchanged.
+    #[test]
+    fn hero_deviation_floors_the_likelihood_across_streets() {
+        let game = nolimp_6max_game();
+        let cfg = SubgameSearchConfig {
+            iterations: 300,
+            max_subtree_nodes: 1_000_000,
+            real_hand_q: Some(0.5),
+            ..SubgameSearchConfig::default()
+        };
+        let strat = |_: &InfoSetId, n: usize| vec![1.0 / n as f64; n];
+        let decisions = offstack_synced_prefix(&game);
+        let hand_seed = 0xC505_C505;
+        let (flop, turn_root, flop_within) = offstack_turn_after_flop_checks();
+        let hero = flop.current_player().unwrap().0 as PlayerId;
+        let cache = cache_with_flop_solve(&game, &flop, &cfg, &strat, &decisions, hand_seed);
+        let holes = all_hole_combos();
+        let prev = cache.current().expect("flop solve");
+        let d = 0.3;
+        let run = |dev: f64| {
+            cross_street_posterior_range_with_deviation(
+                prev,
+                &flop_within,
+                &turn_root,
+                &holes,
+                0.25,
+                hero,
+                dev,
+                hand_seed,
+            )
+            .expect("posterior")
+        };
+        let plain = cross_street_posterior_range(
+            prev,
+            &flop_within,
+            &turn_root,
+            &holes,
+            0.25,
+            hero,
+            hand_seed,
+        )
+        .expect("posterior");
+        assert_eq!(plain, run(0.0), "share 0 = the old posterior, bit for bit");
+        let got = run(d);
+        for seat in 0..plain.len() {
+            if seat as PlayerId != hero {
+                assert_eq!(plain[seat], got[seat], "seat {seat} is not hero");
+            }
+        }
+
+        // Hero's range, recomputed: prior × Π over hero's flop actions of (1 − d)·σ + d / n.
+        let prev_game = prev.trainer.game();
+        let line = subtree_decisions_on_real_line(
+            prev_game.subtree(),
+            &prev.sub_abs,
+            prev_game.template(),
+            &flop_within,
+            hero,
+        )
+        .expect("line");
+        let hero_steps: Vec<_> = line.iter().filter(|(_, _, s)| *s == hero).collect();
+        assert_eq!(hero_steps.len(), 1, "hero checked once on the flop");
+        let flop_board: Vec<Card> = prev_game.template().board().to_vec();
+        let turn_board: BTreeSet<u8> = turn_root.board().iter().map(|c| c.to_u8()).collect();
+        let prior = prev_game.ranges().expect("prefix-reach prior");
+        let mut want = vec![0.0_f64; holes.len()];
+        let mut sigmas = BTreeSet::new();
+        for (hi, h) in holes.iter().enumerate() {
+            if turn_board.contains(&h[0].to_u8()) || turn_board.contains(&h[1].to_u8()) {
+                continue;
+            }
+            let mut w = prior[hero as usize][hi];
+            for (node, tag, _) in &hero_steps {
+                let legal = &prev_game.subtree().node(*node).legal_actions;
+                let idx = legal.iter().position(|t| t == tag).unwrap();
+                let sigma = prev.trainer.average_strategy(&prev_game.info_set_for_cards(
+                    *node,
+                    *h,
+                    &flop_board,
+                ));
+                assert_eq!(sigma.len(), legal.len());
+                sigmas.insert(sigma[idx].to_bits());
+                w *= (1.0 - d) * sigma[idx] + d / legal.len() as f64;
+            }
+            want[hi] = w;
+        }
+        let total: f64 = want.iter().sum();
+        for hi in 0..holes.len() {
+            assert!(
+                (got[hero as usize][hi] - want[hi] / total).abs() < 1e-12,
+                "hand {hi}: {} vs {}",
+                got[hero as usize][hi],
+                want[hi] / total
+            );
+        }
+        eprintln!(
+            "[hero-deviation] distinct σ(check | hand) over hero's hands: {}",
+            sigmas.len()
+        );
     }
 
     /// A subtree over the node cap is refused while it is being built (at the cap, not after the

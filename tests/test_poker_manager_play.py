@@ -447,6 +447,28 @@ class ManagerTests(unittest.TestCase):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
                 validate_advisor_args(parser.parse_args(base + bad))
 
+    def test_search_hero_deviation_pass_through(self):
+        import argparse
+        from poker_live.advisor_client import (add_advisor_args, advisor_extra_args,
+                                               validate_advisor_args)
+        parser = argparse.ArgumentParser()
+        add_advisor_args(parser, default_seats=6, debug_help="")
+        base = ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin", "--search"]
+        self.assertNotIn("--search-hero-deviation", advisor_extra_args(parser.parse_args(base)))
+        args = parser.parse_args(base + ["--search-hero-deviation", "0.2"])
+        validate_advisor_args(args)
+        extra = advisor_extra_args(args)
+        i = extra.index("--search-hero-deviation")
+        self.assertEqual(extra[i:i + 2], ["--search-hero-deviation", "0.2"])
+        for bad in ("0", "1", "1.5"):
+            err = io.StringIO()
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+                validate_advisor_args(parser.parse_args(base + ["--search-hero-deviation", bad]))
+        no_search = ["--checkpoint", "x.ckpt", "--bucket-table", "t.bin", "--search-hero-deviation", "0.2"]
+        err = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            validate_advisor_args(parser.parse_args(no_search))
+
     def test_exploit_4bet_state_requires_main_switch(self):
         from poker_manager_play import main
         err = io.StringIO()
